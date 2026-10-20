@@ -1,6 +1,6 @@
 # Implementation MVP Contract
 
-Status: acceptance contract for the first complete playable integration. No implementation or gameplay result is established by this document. The [release PRD](prds/gameharness-v1.0-prd.md) remains authoritative for full product scope, including the full-game objective.
+Status: acceptance contract for the first complete playable integration; this gate has not passed. The preceding [integration spike](integration-spike.md) has a runnable application and real OAuth, model, Minecraft, viewer, and policy-effect evidence, with remaining safety and gameplay limitations recorded separately. Those results do not waive any criterion below. The [release PRD](prds/gameharness-v1.0-prd.md) remains authoritative for full product scope, including the full-game objective.
 
 The first gate is one real Minecraft session with one supported strategic connection: filtered observation → OMP strategic tool call → admitted game action → observed feedback → next autonomous strategic turn. It must also exercise a model-authored policy in real play while execution continues during inference. Build this vertical slice before completing every provider, recovery path, or evaluation feature.
 

@@ -54,6 +54,14 @@ Effect capabilities declare cancellation as either `acknowledged_neutralization`
 
 The runtime's cancellation request, action state and run lifecycle stay identical for every adapter. An adapter cannot reinterpret `cancelled` as “a stop message was sent,” weaken stale-response gates, or keep an old emitter alive while issuing a new lease.
 
+For the Minecraft bridge, a forced camera setpoint retains its action owner until the actual SDK promise settles. Cancellation releases held controls immediately, then waits for that continuation; a completion timeout fences the connection before ownership can transfer. Other inventory and interaction operations without a confirmed cancellation path still require fencing. A lost bridge reply leaves the action outcome unknown. Closing an owned bridge child can succeed after its confirmed exit, without claiming that its earlier game effects were reversed or verified.
+
+Digging has a separate cancellation lifecycle. Before a FINISH input has been submitted, cancellation retains the owner until the real SDK task settles and its local channels are neutral. If START was submitted, it also requires a current-connection server acknowledgement covering the ABORT input. The bridge assigns monotonic connection-wide sequences to acknowledgement-bearing interactions; an old, malformed, future, or other-connection acknowledgement cannot establish cancellation. A cancelled initial look must not emit a late START. Deadlines, undrained continuations, missing acknowledgements, transport loss, and an unconfirmed submitted FINISH still yield `unknown` and fencing.
+
+Confirmed stopping does not establish the preceding game result. START can break a block instantly or cause other effects, and a cancellation acknowledgement is not a block-state snapshot. A confirmed cancelled dig therefore records `cancellation_confirmed: true` and `prior_effects: "unverified"` without claiming removal, unchanged state, rollback, or a policy-effect credit. Actual server removal evidence may establish successful completion instead. Raw protocol sequence values stay private. No old command is automatically replayed, and historical unknown records are not rewritten.
+
+A long dig may retain the visibility proof captured at admission only while the eye, supported pose, relevant chunk revisions, ray dependencies, block identity, and reach remain valid. Unrelated chunk arrivals do not revoke that proof; unloading or replacing a depended-on chunk, resetting the world, or losing revision history does. This proof does not refresh an observation or authorize a new target. Dig success still requires a subsequent server block update; local SDK completion is insufficient.
+
 ### Run manifests and compatibility
 
 Before bootstrap, a run manifest fixes `game_id`, `game_version`, `adapter_id`, `adapter_version`, selected observation profile/schema identities and versions, descriptor/schema hashes, enabled capability versions, verifier identity, state-support declarations, run/world/epoch, task, model/connection references, configuration and immutable library snapshot. Capture the actual negotiated support, not just a library's advertised features. Reconnection verifies these identities; an incompatible change requires an explicit migration/new attempt rather than silent continuation.
@@ -282,8 +290,8 @@ Revising an action means cancelling it and submitting a new ID with `supersedes_
 | `cancel_requested` | `cancelled`, `succeeded`, `failed`, `unknown`. A completion may win the race; evidence determines the result. |
 | `succeeded` | Terminal: declared completion evidence was observed. It does not prove the larger task succeeded. |
 | `failed` | Terminal: known failure with partial effects recorded. Failure does not imply zero effects. |
-| `cancelled` | Terminal: no more effects can be emitted by that action; controls are neutralized. Prior effects remain recorded. |
-| `unknown` | Terminal uncertainty: evidence cannot establish the effect outcome or safe cancellation. Recovery fences the emitter; uncertainty remains in the ledger. |
+| `cancelled` | Terminal: the declared cancellation procedure established that no emitter remains and controls are neutralized. Prior effects remain recorded, including explicit unverified effects; cancellation is not successful completion or rollback. |
+| `unknown` | Terminal uncertainty: declared completion or safe cancellation could not be established, or a submitted completion remains unresolved. Recovery fences the emitter; uncertainty remains in the ledger. |
 
 Cancelling a queued action can move through `cancel_requested` to `cancelled` without a game effect. Cancelling a running action invokes the capability's declared neutralization or fence/recovery procedure. The next lease is unavailable until positive neutralization acknowledgement or a recovery fence has removed the old emitter. A timeout does not manufacture `cancelled`. Reobservation after a disconnect may establish current domain state, but cannot invent an exactly-once history; attach reconciliation evidence to the original `unknown` record and issue any new action under a new ID.
 

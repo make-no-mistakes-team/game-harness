@@ -1,24 +1,36 @@
 # Operations and security
 
-GameHarness is currently a documentation-only project. This document specifies the future local operating procedure and release checks; it is not evidence that installation, provider access, gameplay, isolation, or rendering works today. There is no application command to run yet. Minecraft is the first planned complete integration, not the boundary of the adapter-based product.
+GameHarness has a runnable local [integration spike](integration-spike.md). The implementation status below describes its current operating boundary. The remaining sections specify acceptance and release obligations; their presence is not evidence that every procedure or check has passed. Minecraft is the first integration, not the boundary of the adapter-based product.
 
 The [PRD](prds/gameharness-v1.0-prd.md) owns scope and acceptance. The [architecture](architecture/overview.md) assigns trusted modules; [runtime contracts](runtime-contracts.md) define identifiers, effects and state transitions; [learning and evaluation](learning-and-evaluation.md) defines experimental integrity. [Upstream reuse](upstream-reuse.md) records dependency, authentication and license evidence.
 
-## Supported local reference deployment
+## Current implementation
 
-The planned reference deployment targets a documented Linux x64 environment. Operators should receive understandable setup and operating instructions with actual supported runtime/dependency versions. This is not a universal-platform promise: arbitrary Linux distributions, other operating systems, public hosting, guest access and multiuser account administration are not established support.
+The [integration guide](integration-spike.md) owns executable setup, UI workflow, configuration, evidence, and known limitations. The current application uses Bun 1.3.14+, a separate Node.js 24+ Mineflayer bridge, and Docker on Linux x64. `bun run build` builds the bridge and Vite frontend; `bun run start` serves the local application at `http://127.0.0.1:4317` by default. `bun run dev` runs the backend and Vite development server.
+
+The spike implements app-owned OMP OpenAI Codex OAuth, account model discovery, real strategic requests, a local vanilla Minecraft Java 1.21.4 Normal Survival server/player, a human-only live viewer, SQLite run/action/event storage, and immutable model-authored local-JS policies. OAuth, actual inference, rendered terrain, and an attributable policy movement effect have been exercised. Browser and device authorization are available UI flows; successful OAuth does not establish separate verification of both. These facts do not establish the [complete playable gate](implementation-mvp.md#first-complete-playable-gate).
+
+Generated policies run in private Docker containers with no network, an unprivileged user, read-only root, dropped capabilities, and finite resource/evaluation limits. Ship both `sandbox/worker.mjs` and the detached host `sandbox/guardian.mjs` alongside the source-based application; the bridge/frontend build alone is not a deployable application. The guardian removes its owned container after backend loss and keeps cleanup pending if Docker cannot confirm removal. Sandbox preparation requires the pinned Node image to be present; it never pulls it automatically.
+
+The UI/API use local operator sessions, Host/Origin checks, and CSRF protection for mutations. The viewer uses a separate loopback origin and private cookie, with an outbound-only game stream; it is not an agent capability. Authorized policy source is returned in run snapshots and displayed as inert text. See the guide for exact routes and fields. Runtime credentials and worlds stay in protected local storage, outside version control.
+
+Run stop and world stop are different operations. Run stop must cancel/fence work and confirm player disconnection; the server can keep ticking. Uncertain effects are retained rather than replayed. Selected real-server cases have exercised composite-control cancellation, held-item release, pre-FINISH dig cancellation, and death fencing. Their evidence and limits are recorded in the [integration guide](integration-spike.md#stop-disconnect-and-uncertainty); they do not establish a full-suite pass. Keep failed shutdown pending and follow the UI's retry/reconnect instructions. The broader safety, durable skill-admission, recovery, and release scenarios below remain obligations, not completed claims.
+
+## Reference deployment requirements
+
+The reference deployment targets Linux x64. Arbitrary Linux distributions, other operating systems, public hosting, guest access, and multiuser account administration are not established support. Current setup is documented in the integration guide; this table separates that implementation from remaining release work.
 
 | Item | Current evidence | Required future procedure |
 |---|---|---|
-| Application | No application, package manifest, implemented endpoints, or game integration exists in this repository. | Publish real installation/start/stop instructions only after those interfaces exist. Keep prerequisite checks separate from gameplay claims. |
-| Backend | Bun 1.3.14+ is the chosen target with selected published OMP packages, initially exact 18.12.3 candidates. A prior temporary smoke imported selected packages and exercised a no-provider gate. | Pin actual package artifacts and native dependencies; establish their runtime/host compatibility and distribution notices. |
-| GameAdapter | Descriptor/interfaces, observation profiles and capability schemas are specified, not implemented. | Pin game/adapter/profile/schema versions, enforce declared permissions, and establish connect/effect/cancel/recovery conformance before enabling effects. |
-| Game environment | Acquisition, supported versions, privileges and operating requirements are adapter-specific. | Document legitimate acquisition/account/terms requirements and verify the selected profile. See the first Minecraft integration below. |
-| Live view | Supplied by the adapter; no renderer has been exercised here. | Establish actual viewpoint/fidelity, transport, authorization and stale-view signaling without exposing backing data to the agent. |
-| Model access | API-key and supported subscription/OAuth flows are planned. A prior package smoke made no provider request. | Verify each operator's entitlement and supported connection flow; exercise real Jev inference separately from package import success. |
-| Security and persistence | OS-isolated generated workers, trusted brokers, SQLite and immutable artifacts are design requirements. | Establish isolation, recovery, redaction and observation permissions before trusting generated programs with gameplay. |
+| Application | Runnable Bun backend, Vite UI, and Node bridge with local operator endpoints. | Complete the playable gate and retain correlated end-to-end evidence. |
+| Backend | Bun 1.3.14+ and exact OMP 18.12.3 dependencies in the package manifest. | Establish supported-host coverage and complete distribution notices. |
+| GameAdapter | Real player connection, filtered structured observations, bounded actions, and conservative geometry-only navigation. | Complete observation, effect, cancellation, and recovery conformance evidence. |
+| Game environment | UI preparation/start/new-world flow for a pinned vanilla 1.21.4 server and Java 21 Docker runtime; explicit EULA consent. | Exercise declared save/backup/restore and account/deployment variants separately. |
+| Live view | Actual terrain rendered in an independent Chrome session without a CSP bypass. | Complete fidelity, stale-view, and transport-failure coverage. |
+| Model access | Real OMP-backed OpenAI OAuth, model discovery, and inference. | Establish API-key, Jev, and cross-provider acceptance independently. |
+| Security and persistence | Docker policy isolation, host guardian, SQLite ledger, and immutable policy artifacts implemented; isolation and cleanup scenarios exercised. | Complete safety, durable skill admission, recovery, and the remaining release scenarios below. |
 
-The future setup guide must identify actual installed versions, required local ports and persistent locations, permission requirements, provider/account setup, game acquisition and terms, and a real minimal smoke workflow. Do not replace missing implementation with invented executable commands or downloadable game/account credentials.
+Keep prerequisite checks separate from gameplay claims. Never distribute account credentials or treat an available endpoint as proof that its acceptance scenario passed.
 
 ## Early real-integration proof
 

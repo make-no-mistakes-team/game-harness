@@ -1,0 +1,691 @@
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+import { z } from "zod";
+import { AuthManager } from "./auth.ts";
+import { GameBridgeClient } from "./game-bridge.ts";
+import { MinecraftServer } from "./minecraft-server.ts";
+import { Runtime, GOALS } from "./runtime.ts";
+import { SandboxService } from "./sandbox.ts";
+import { Store } from "./store.ts";
+import {
+  APP_PORT,
+  APP_ORIGIN,
+  BOT_USERNAME,
+  DATA_DIR,
+  MINECRAFT_VERSION,
+  OPERATOR_ORIGINS,
+  PROJECT_ROOT,
+} from "./config.ts";
+import { goalSchema } from "../shared/validation.ts";
+import type { AppSnapshot, RunView } from "../shared/contracts.ts";
+
+if (process.env.GAMEHARNESS_LOCK_HELD !== "1")
+  throw new Error(
+    "Start GameHarness with bun run start or bun run dev so the local data lock is held",
+  );
+mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+
+const changes = new Set<() => void>();
+const onChange = () => {
+  for (const listener of changes) {
+    try {
+      listener();
+    } catch {
+      changes.delete(listener);
+    }
+  }
+};
+const store = new Store(DATA_DIR);
+const auth = await AuthManager.create(DATA_DIR, onChange);
+const game = new GameBridgeClient(PROJECT_ROOT);
+const sandbox = new SandboxService(PROJECT_ROOT, onChange);
+const minecraft = new MinecraftServer(onChange, (type, summary, details) =>
+  store.event(null, type, summary, details ?? null),
+);
+const runtime = new Runtime(store, auth, game, sandbox, onChange);
+const viewerToken = randomBytes(32).toString("hex");
+const sessions = new Map<string, { csrf: string; expires: number }>();
+const controls = new Map<
+  string,
+  { fingerprint: string; result: Promise<RunView>; settled: boolean }
+>();
+let gameEpoch = 0;
+let operationGeneration = 0;
+let gameOperation: Promise<void> | null = null;
+let closing = false;
+let initialized = false;
+let lastGameStatus = "disconnected";
+let connectionAdmission: Promise<void> = Promise.resolve();
+
+function admitConnection<T>(operation: () => Promise<T>): Promise<T> {
+  const result = connectionAdmission.then(operation);
+  connectionAdmission = result.then(
+    () => {},
+    () => {},
+  );
+  return result;
+}
+
+function assertGameOperation(generation: number): void {
+  if (generation !== operationGeneration || closing)
+    throw new Error("Game operation was cancelled");
+}
+
+game.subscribe((notice) => {
+  if (notice.type === "state") {
+    const state = game.snapshot();
+    if (state.status !== lastGameStatus) {
+      lastGameStatus = state.status;
+      store.event(null, "game.connection", `Minecraft player ${state.status}`, {
+        status: state.status,
+        epoch: state.epoch,
+      });
+    }
+  }
+  onChange();
+});
+
+const headers: Record<string, string> = {
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "no-referrer",
+  "X-Frame-Options": "DENY",
+  "Content-Security-Policy":
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-src http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+};
+class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+function json(value: unknown, status = 200): Response {
+  return Response.json(value, { status, headers });
+}
+function snapshot(): AppSnapshot {
+  return {
+    auth: auth.snapshot(),
+    server: minecraft.snapshot(),
+    game: game.snapshot(),
+    sandbox: sandbox.snapshot(),
+    run: runtime.snapshot(),
+    goals: GOALS,
+    events: store.events(null, 0, 150),
+  };
+}
+function cookie(request: Request, name: string): string | undefined {
+  for (const entry of (request.headers.get("cookie") ?? "").split(";")) {
+    const equal = entry.indexOf("=");
+    if (equal > 0 && entry.slice(0, equal).trim() === name)
+      return entry.slice(equal + 1).trim();
+  }
+  return undefined;
+}
+function secureEqual(left: string, right: string): boolean {
+  const a = Buffer.from(left),
+    b = Buffer.from(right);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+function requestSession(
+  request: Request,
+): { csrf: string; expires: number } | undefined {
+  const key = cookie(request, "gh_session");
+  if (!key || !/^[a-f0-9]{64}$/.test(key)) return undefined;
+  const session = sessions.get(key);
+  if (session && session.expires > Date.now()) return session;
+  sessions.delete(key);
+  return undefined;
+}
+async function body<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
+  let value: unknown;
+  try {
+    value = await request.json();
+  } catch {
+    throw new HttpError(400, "invalid_request", "Request body must be JSON");
+  }
+  const result = schema.safeParse(value);
+  if (!result.success)
+    throw new HttpError(
+      400,
+      "invalid_request",
+      "Request fields are invalid or exceed their allowed bounds",
+    );
+  return result.data;
+}
+function safeServiceMessage(error: unknown): string {
+  if (!(error instanceof Error))
+    return "The requested operation could not complete";
+  const message = error.message
+    .replace(/(?:Bearer\s+)[^\s]+/gi, "Bearer [redacted]")
+    .replace(
+      /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g,
+      "[redacted]",
+    )
+    .replace(/\bsk-[A-Za-z0-9_-]+\b/g, "[redacted]")
+    .replace(/https?:\/\/[^\s]+/g, "[connection address]")
+    .replace(/[\r\n\x00-\x1f]/g, " ");
+  return message.slice(0, 400) || "The requested operation could not complete";
+}
+async function stopRun(): Promise<void> {
+  const current = runtime.snapshot();
+  if (current && !["stopped", "completed", "failed"].includes(current.status))
+    await runtime.control(current.run_id, "stop");
+}
+async function connectPlayer(generation: number): Promise<void> {
+  const server = minecraft.snapshot();
+  assertGameOperation(generation);
+  if (server.status !== "running" || !server.world_id)
+    throw new Error("Start the Minecraft server first");
+  if (
+    game.snapshot().status === "connected" &&
+    game.snapshot().world_id === server.world_id
+  )
+    return;
+  await game.connect({
+    host: "127.0.0.1",
+    port: server.port,
+    username: BOT_USERNAME,
+    version: MINECRAFT_VERSION,
+    world_id: server.world_id,
+    epoch: ++gameEpoch,
+    viewer_token: viewerToken,
+    operator_origins: OPERATOR_ORIGINS,
+  });
+  if (generation !== operationGeneration || closing) {
+    await game.disconnect();
+    throw new Error("Game operation was cancelled");
+  }
+}
+function launchGameOperation(
+  operation: (generation: number) => Promise<void>,
+): void {
+  if (gameOperation)
+    throw new HttpError(
+      409,
+      "busy",
+      "A Minecraft operation is already in progress",
+    );
+  const generation = ++operationGeneration;
+  const pending = operation(generation)
+    .catch((error) => {
+      store.event(null, "game.operation_failed", safeServiceMessage(error));
+    })
+    .finally(() => {
+      if (gameOperation === pending) gameOperation = null;
+      onChange();
+    });
+  gameOperation = pending;
+  onChange();
+}
+
+const emptyBody = z.object({}).strict();
+const controlBody = z
+  .object({
+    command: z.enum(["start", "pause", "resume", "stop"]),
+    request_id: z.string().min(1).max(128),
+  })
+  .strict();
+const runBody = z
+  .object({
+    task: z.string().trim().min(3).max(4000),
+    goal: goalSchema,
+    model_id: z.string().min(1).max(160),
+  })
+  .strict();
+
+const server = Bun.serve({
+  hostname: "127.0.0.1",
+  port: APP_PORT,
+  maxRequestBodySize: 64 * 1024,
+  idleTimeout: 120,
+  async fetch(request) {
+    try {
+      const url = new URL(request.url);
+      const expectedHosts = [`127.0.0.1:${APP_PORT}`, `localhost:${APP_PORT}`];
+      if (!expectedHosts.includes(request.headers.get("host") ?? ""))
+        throw new HttpError(
+          403,
+          "forbidden",
+          "This service only accepts its configured local host",
+        );
+      const origin = request.headers.get("origin");
+      if (origin && !OPERATOR_ORIGINS.includes(origin))
+        throw new HttpError(
+          403,
+          "forbidden",
+          "This request origin is not authorized",
+        );
+      const isApi = url.pathname.startsWith("/v1/");
+      if (isApi && request.headers.get("sec-fetch-site") === "cross-site")
+        throw new HttpError(
+          403,
+          "forbidden",
+          "Cross-site API access is not allowed",
+        );
+      if (request.method === "GET" && url.pathname === "/v1/session") {
+        let key = cookie(request, "gh_session");
+        let session = requestSession(request);
+        if (!key || !session) {
+          if (sessions.size >= 32)
+            for (const [id, candidate] of sessions)
+              if (candidate.expires <= Date.now()) sessions.delete(id);
+          if (sessions.size >= 32)
+            throw new HttpError(429, "busy", "Too many local browser sessions");
+          key = randomBytes(32).toString("hex");
+          session = {
+            csrf: randomBytes(32).toString("hex"),
+            expires: Date.now() + 8 * 60 * 60_000,
+          };
+          sessions.set(key, session);
+        }
+        const response = json({ csrf_token: session.csrf });
+        response.headers.append(
+          "Set-Cookie",
+          `gh_session=${key}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`,
+        );
+        response.headers.append(
+          "Set-Cookie",
+          `gh_viewer=${viewerToken}; HttpOnly; SameSite=Strict; Path=/viewer/; Max-Age=28800`,
+        );
+        return response;
+      }
+      if (isApi) {
+        const session = requestSession(request);
+        if (!session)
+          throw new HttpError(
+            401,
+            "unauthorized",
+            "Open GameHarness in this browser to create a local session",
+          );
+        if (
+          !["GET", "HEAD"].includes(request.method) &&
+          !secureEqual(request.headers.get("x-csrf-token") ?? "", session.csrf)
+        )
+          throw new HttpError(
+            403,
+            "forbidden",
+            "The local request token is missing or expired",
+          );
+        if (closing)
+          throw new HttpError(
+            503,
+            "unavailable",
+            "GameHarness is shutting down",
+          );
+        if (!initialized && request.method !== "GET")
+          throw new HttpError(
+            503,
+            "unavailable",
+            "Local services are still initializing",
+          );
+        if (request.method === "GET" && url.pathname === "/v1/state")
+          return json(snapshot());
+        if (request.method === "GET" && url.pathname === "/v1/events") {
+          const encoder = new TextEncoder();
+          let dispose = () => {};
+          let pump = () => {};
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              let ended = false;
+              let dirty = true;
+              const requested = Number(request.headers.get("last-event-id"));
+              let cursor =
+                request.headers.has("last-event-id") &&
+                Number.isSafeInteger(requested) &&
+                requested >= 0
+                  ? requested
+                  : store.lastEventSeq();
+              pump = () => {
+                if (ended || (controller.desiredSize ?? 0) <= 0) return;
+                try {
+                  const batch = store.eventsAfter(null, cursor, 10);
+                  if (batch.length) {
+                    const message = batch
+                      .map(
+                        (event) =>
+                          `id: ${event.event_seq}\nevent: activity\ndata: ${JSON.stringify(event)}\n\n`,
+                      )
+                      .join("");
+                    controller.enqueue(encoder.encode(message));
+                    cursor = batch[batch.length - 1]!.event_seq;
+                  } else if (dirty) {
+                    dirty = false;
+                    controller.enqueue(
+                      encoder.encode("event: changed\ndata: {}\n\n"),
+                    );
+                  }
+                } catch {
+                  dispose();
+                }
+              };
+              const off = store.subscribe(pump);
+              const changed = () => {
+                dirty = true;
+                pump();
+              };
+              changes.add(changed);
+              const timer = setInterval(() => {
+                if (session.expires <= Date.now()) {
+                  dispose();
+                  return;
+                }
+                if (!ended && (controller.desiredSize ?? 0) > 0) {
+                  try {
+                    controller.enqueue(
+                      encoder.encode("event: heartbeat\ndata: {}\n\n"),
+                    );
+                  } catch {
+                    dispose();
+                  }
+                }
+              }, 15_000);
+              dispose = () => {
+                if (ended) return;
+                ended = true;
+                clearInterval(timer);
+                off();
+                changes.delete(changed);
+                request.signal.removeEventListener("abort", dispose);
+                try {
+                  controller.close();
+                } catch {}
+              };
+              request.signal.addEventListener("abort", dispose, { once: true });
+              if (request.signal.aborted) dispose();
+              else pump();
+            },
+            pull() {
+              pump();
+            },
+            cancel() {
+              dispose();
+            },
+          });
+          return new Response(stream, {
+            headers: {
+              ...headers,
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache, no-transform",
+              "X-Accel-Buffering": "no",
+            },
+          });
+        }
+        if (request.method === "POST" && url.pathname === "/v1/auth/login") {
+          const input = await body(
+            request,
+            z.object({ mode: z.enum(["browser", "device"]) }).strict(),
+          );
+          return json(
+            await admitConnection(async () => {
+              const current = runtime.snapshot();
+              if (
+                current &&
+                !["stopped", "completed", "failed", "created"].includes(
+                  current.status,
+                )
+              )
+                throw new HttpError(
+                  409,
+                  "busy",
+                  "Stop the current run before changing authorization",
+                );
+              return await auth.startLogin(input.mode);
+            }),
+            202,
+          );
+        }
+        if (request.method === "POST" && url.pathname === "/v1/auth/input") {
+          const input = await body(
+            request,
+            z
+              .object({
+                login_id: z.string().min(1).max(100),
+                value: z.string().max(8192),
+              })
+              .strict(),
+          );
+          auth.submitInput(input.login_id, input.value);
+          return json(auth.snapshot());
+        }
+        if (request.method === "POST" && url.pathname === "/v1/auth/cancel") {
+          const input = await body(
+            request,
+            z.object({ login_id: z.string().min(1).max(100) }).strict(),
+          );
+          await auth.cancelLogin(input.login_id);
+          return json(auth.snapshot());
+        }
+        if (request.method === "POST" && url.pathname === "/v1/auth/logout") {
+          await body(request, emptyBody);
+          const stopping = stopRun();
+          return json(
+            await admitConnection(async () => {
+              await stopping;
+              await stopRun();
+              await auth.logout();
+              return auth.snapshot();
+            }),
+          );
+        }
+        if (request.method === "POST" && url.pathname === "/v1/auth/refresh") {
+          await body(request, emptyBody);
+          await auth.refreshModels();
+          return json(auth.snapshot());
+        }
+        if (request.method === "POST" && url.pathname === "/v1/game/prepare") {
+          const input = await body(
+            request,
+            z.object({ accept_eula: z.boolean() }).strict(),
+          );
+          launchGameOperation(async () => {
+            await minecraft.prepare(input.accept_eula);
+            if (sandbox.snapshot().status !== "ready") await sandbox.prepare();
+          });
+          return json({ accepted: true }, 202);
+        }
+        if (request.method === "POST" && url.pathname === "/v1/game/start") {
+          await body(request, emptyBody);
+          launchGameOperation(async (generation) => {
+            await minecraft.start();
+            await connectPlayer(generation);
+          });
+          return json({ accepted: true }, 202);
+        }
+        if (request.method === "POST" && url.pathname === "/v1/game/stop") {
+          await body(request, emptyBody);
+          ++operationGeneration;
+          await stopRun();
+          await game.disconnect();
+          await minecraft.stop();
+          return json(snapshot());
+        }
+        if (
+          request.method === "POST" &&
+          url.pathname === "/v1/game/new-world"
+        ) {
+          await body(request, z.object({ confirm: z.literal(true) }).strict());
+          launchGameOperation(async (generation) => {
+            await stopRun();
+            assertGameOperation(generation);
+            await game.disconnect();
+            assertGameOperation(generation);
+            await minecraft.newWorld();
+            assertGameOperation(generation);
+            await minecraft.start();
+            await connectPlayer(generation);
+          });
+          return json({ accepted: true }, 202);
+        }
+        if (request.method === "POST" && url.pathname === "/v1/runs") {
+          const input = await body(request, runBody);
+          return json(await runtime.createRun(input), 201);
+        }
+        const runMatch = /^\/v1\/runs\/([a-f0-9-]{36})$/.exec(url.pathname);
+        if (request.method === "GET" && runMatch?.[1]) {
+          const run = runtime.getRun(runMatch[1]);
+          if (!run) throw new HttpError(404, "not_found", "Run not found");
+          return json(run);
+        }
+        const controlMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/controls$/.exec(
+          url.pathname,
+        );
+        if (request.method === "POST" && controlMatch?.[1]) {
+          const input = await body(request, controlBody),
+            runId = controlMatch[1];
+          const key = `${runId}:${input.request_id}`,
+            fingerprint = input.command;
+          const existing = controls.get(key);
+          if (existing) {
+            if (existing.fingerprint !== fingerprint)
+              throw new HttpError(
+                409,
+                "conflict",
+                "Control request ID has different content",
+              );
+            return json(await existing.result);
+          }
+          if (controls.size >= 1024) {
+            for (const [id, entry] of controls) {
+              if (entry.settled) {
+                controls.delete(id);
+                break;
+              }
+            }
+            if (controls.size >= 1024)
+              throw new HttpError(
+                429,
+                "busy",
+                "Too many pending control requests",
+              );
+          }
+          const operation = async () => {
+            if (input.command === "resume") {
+              const current = runtime.snapshot();
+              if (current?.run_id !== runId || current.status !== "paused")
+                throw new HttpError(
+                  409,
+                  "conflict",
+                  "Only the current paused run can be resumed",
+                );
+              if (game.snapshot().status !== "connected")
+                await connectPlayer(operationGeneration);
+            }
+            return await runtime.control(runId, input.command);
+          };
+          const result =
+            input.command === "start" || input.command === "resume"
+              ? admitConnection(operation)
+              : operation();
+          const entry = { fingerprint, result, settled: false };
+          controls.set(key, entry);
+          void result.then(
+            () => {
+              entry.settled = true;
+            },
+            () => {
+              entry.settled = true;
+            },
+          );
+          return json(await result);
+        }
+        throw new HttpError(404, "not_found", "API route not found");
+      }
+      if (request.method !== "GET" && request.method !== "HEAD")
+        throw new HttpError(405, "method_not_allowed", "Method not allowed");
+      const relative =
+        decodeURIComponent(url.pathname).replace(/^\/+/, "") || "index.html";
+      const webRoot = path.join(PROJECT_ROOT, "dist/web");
+      const target = path.resolve(webRoot, relative);
+      if (!target.startsWith(webRoot + path.sep) || relative.includes("\0"))
+        throw new HttpError(404, "not_found", "File not found");
+      const file = Bun.file(target);
+      if (!(await file.exists())) {
+        if (relative === "index.html")
+          return new Response(
+            "Build the browser UI with bun run build, then reload.",
+            { status: 503, headers },
+          );
+        throw new HttpError(404, "not_found", "File not found");
+      }
+      return new Response(request.method === "HEAD" ? null : file, {
+        headers: {
+          ...headers,
+          "Content-Type": file.type,
+          "Cache-Control": relative.startsWith("assets/")
+            ? "private, max-age=86400"
+            : "no-store",
+        },
+      });
+    } catch (error) {
+      if (error instanceof HttpError)
+        return json(
+          { error: { code: error.code, message: error.message } },
+          error.status,
+        );
+      return json(
+        {
+          error: {
+            code: "operation_failed",
+            message: safeServiceMessage(error),
+          },
+        },
+        409,
+      );
+    }
+  },
+});
+
+let shutdown: Promise<void> | null = null;
+async function closeApplication(): Promise<void> {
+  if (shutdown) return shutdown;
+  closing = true;
+  ++operationGeneration;
+  shutdown = (async () => {
+    const cleanup = await Promise.allSettled([runtime.close(), auth.close()]);
+    await game.close().catch(() => {});
+    await minecraft.close().catch(() => {});
+    await sandbox.close().catch(() => {});
+    if (gameOperation) await gameOperation;
+    server.stop(true);
+    sessions.clear();
+    controls.clear();
+    changes.clear();
+    store.close();
+    if (cleanup.some((result) => result.status === "rejected"))
+      console.error(
+        "Some run/auth shutdown work failed; inspect the recorded lifecycle before restarting.",
+      );
+  })();
+  return shutdown;
+}
+process.once("SIGINT", () => {
+  void closeApplication().finally(() => process.exit(0));
+});
+process.once("SIGTERM", () => {
+  void closeApplication().finally(() => process.exit(0));
+});
+
+console.log(`GameHarness listening at ${APP_ORIGIN}`);
+try {
+  await minecraft.initialize();
+  await runtime.initialize();
+  await sandbox.prepare();
+  initialized = true;
+  store.event(null, "application.ready", "Local services initialized", {
+    sandbox: sandbox.snapshot().status,
+    server: minecraft.snapshot().status,
+  });
+  onChange();
+} catch {
+  store.event(
+    null,
+    "application.error",
+    "Local service initialization failed. Restart after resolving Docker or storage readiness.",
+  );
+  initialized = true;
+  onChange();
+}

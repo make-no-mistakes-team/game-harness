@@ -2,6 +2,11 @@ import type { ActivityEvent } from "../shared/contracts.ts";
 
 const MAX_EVENTS = 200;
 const MAX_BYTES = 262144;
+/** Summary budget in UTF-8 bytes before JSON escaping; longer summaries are cut. */
+export const MAX_SUMMARY_BYTES = 16384;
+const MAX_RUN_ID_LENGTH = 128;
+const MAX_TYPE_LENGTH = 256;
+const MAX_AT_LENGTH = 64;
 
 /** Page reader. Callers bind Store methods; this module does not open a database. */
 export interface EventExportReader {
@@ -40,6 +45,15 @@ export type EventExportResult =
  * Project one run's events to NDJSON.
  * Dropping details does not redact summary text. A future route must authorize
  * run_id at the operator boundary before calling this.
+ *
+ * through_seq is a snapshot watermark: the first page reads it from the store,
+ * later pages echo it back. A supplied value is clamped to the store's current
+ * watermark, so events written after the snapshot are never exported.
+ *
+ * Summaries longer than MAX_SUMMARY_BYTES are cut at a code point boundary and
+ * the line carries summary_truncated: true. Every valid record therefore fits
+ * in MAX_BYTES, and record_too_large always clears by retrying with
+ * max_bytes = MAX_BYTES.
  */
 export function exportEventPage(
   reader: EventExportReader,
@@ -48,8 +62,7 @@ export function exportEventPage(
   if (!validOptions(options)) return { ok: false, code: "invalid_options" };
   const through = watermark(reader, options);
   if (through === null) return { ok: false, code: "invalid_reader_result" };
-  if (through <= options.after)
-    return emptyPage(options.after, through);
+  if (through <= options.after) return emptyPage(options.after, through);
   let raw: unknown;
   try {
     raw = reader.eventsAfter(
@@ -72,7 +85,11 @@ export function exportEventPage(
 
 function validOptions(options: EventExportOptions): boolean {
   if (options === null || typeof options !== "object") return false;
-  if (typeof options.run_id !== "string" || options.run_id.length === 0)
+  if (
+    typeof options.run_id !== "string" ||
+    options.run_id.length === 0 ||
+    options.run_id.length > MAX_RUN_ID_LENGTH
+  )
     return false;
   if (!safeCursor(options.after)) return false;
   if (options.through_seq !== null && !safeCursor(options.through_seq))
@@ -80,14 +97,12 @@ function validOptions(options: EventExportOptions): boolean {
   if (options.through_seq !== null && options.through_seq < options.after)
     return false;
   if (
-    typeof options.max_events !== "number" ||
     !Number.isSafeInteger(options.max_events) ||
     options.max_events < 1 ||
     options.max_events > MAX_EVENTS
   )
     return false;
   if (
-    typeof options.max_bytes !== "number" ||
     !Number.isSafeInteger(options.max_bytes) ||
     options.max_bytes < 1 ||
     options.max_bytes > MAX_BYTES
@@ -106,14 +121,15 @@ function watermark(
   reader: EventExportReader,
   options: EventExportOptions,
 ): number | null {
-  if (options.through_seq !== null) return options.through_seq;
   let value: unknown;
   try {
     value = reader.lastEventSeq();
   } catch {
     return null;
   }
-  return safeCursor(value) ? value : null;
+  if (!safeCursor(value)) return null;
+  if (options.through_seq === null) return value;
+  return Math.min(options.through_seq, value);
 }
 
 function emptyPage(after: number, through: number): EventExportResult {
@@ -148,10 +164,17 @@ function acceptedEvents(
       sequence <= previous
     )
       return null;
+    if (!boundedString(event.at, MAX_AT_LENGTH)) return null;
+    if (!boundedString(event.type, MAX_TYPE_LENGTH)) return null;
+    if (typeof event.summary !== "string") return null;
     previous = sequence;
     events.push(event);
   }
   return events;
+}
+
+function boundedString(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.length <= maxLength;
 }
 
 function pack(
@@ -185,15 +208,30 @@ function pack(
 }
 
 function projectLine(event: ActivityEvent): string {
-  return (
-    JSON.stringify({
-      event_seq: event.event_seq,
-      run_id: event.run_id,
-      at: event.at,
-      type: event.type,
-      summary: event.summary,
-    }) + "\n"
-  );
+  const summary = truncateUtf8(event.summary, MAX_SUMMARY_BYTES);
+  const record: Record<string, unknown> = {
+    event_seq: event.event_seq,
+    run_id: event.run_id,
+    at: event.at,
+    type: event.type,
+    summary,
+  };
+  if (summary.length !== event.summary.length) record.summary_truncated = true;
+  return JSON.stringify(record) + "\n";
+}
+
+/** Longest prefix of text that fits in maxBytes of UTF-8, never splitting a code point. */
+export function truncateUtf8(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let used = 0;
+  let end = 0;
+  for (const char of text) {
+    const size = Buffer.byteLength(char, "utf8");
+    if (used + size > maxBytes) break;
+    used += size;
+    end += char.length;
+  }
+  return text.slice(0, end);
 }
 
 function page(

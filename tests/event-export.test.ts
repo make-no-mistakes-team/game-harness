@@ -4,8 +4,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   exportEventPage,
-  MAX_SUMMARY_BYTES,
-  truncateUtf8,
   type EventExportOptions,
   type EventExportReader,
   type EventExportResult,
@@ -48,13 +46,6 @@ function makeRun(store: Store, task: string): StoredRun {
   };
   store.saveRun(run);
   return run;
-}
-
-function adapter(store: Store): EventExportReader {
-  return {
-    eventsAfter: store.eventsAfter.bind(store),
-    lastEventSeq: store.lastEventSeq.bind(store),
-  };
 }
 
 function counting(store: Store) {
@@ -237,7 +228,7 @@ describe("event export", () => {
     expect(raw).not.toContain("hidden-secret-token");
     expect(raw).not.toContain("481516");
     expect(raw).not.toContain("late-primary");
-    expect(probe.watermarks()).toBe(pages);
+    expect(probe.watermarks()).toBe(1);
     expect(probe.calls).toHaveLength(pages);
     for (const call of probe.calls)
       expect(call).toEqual({
@@ -302,7 +293,7 @@ describe("event export", () => {
       has_more: false,
     });
     expect(sequences(rest)).toEqual([seqs[2]!]);
-    expect(extra.watermarks()).toBe(2);
+    expect(extra.watermarks()).toBe(1);
   });
 
   test("empty database and empty run do not invent events", () => {
@@ -402,7 +393,7 @@ describe("event export", () => {
       details_omitted: true,
     });
     expect(explicit.calls).toHaveLength(0);
-    expect(explicit.watermarks()).toBe(1);
+    expect(explicit.watermarks()).toBe(0);
   });
 
   test("rejects invalid options without reading", () => {
@@ -586,7 +577,7 @@ describe("event export", () => {
       pageOptions(runId, { through_seq: 9, max_events: 10 }),
     );
     expect(sequences(gapPage)).toEqual([2, 5, 9]);
-    expect(gapped.watermarks()).toBe(1);
+    expect(gapped.watermarks()).toBe(0);
 
     const mixed = fixedReader([
       event(1, runId, "in"),
@@ -726,7 +717,7 @@ describe("event export", () => {
     if (!continued.ok) return;
     expect(continued.ndjson.startsWith(retainedLine)).toBe(true);
     expect(sequences(continued)).toEqual([7, 8]);
-    expect(reader.watermarks()).toBe(2);
+    expect(reader.watermarks()).toBe(0);
     expect(reader.calls.map((call) => call.after)).toEqual([0, 4]);
 
     const huge = event(1, runId, "я".repeat(50));
@@ -781,151 +772,71 @@ describe("event export", () => {
     expect(page.details_omitted).toBe(true);
   });
 
-  test("an oversized summary is cut and flagged, so one record cannot block the run", () => {
-    const store = openStore();
-    const run = makeRun(store, "Huge");
-    const huge = "я".repeat(200000);
-    const big = store.event(run.run_id, "note", huge, null).event_seq;
-    const next = store.event(run.run_id, "note", "after huge", null).event_seq;
-
-    const narrow = exportEventPage(
-      adapter(store),
-      pageOptions(run.run_id, { max_bytes: 1024 }),
-    );
-    expect(narrow).toEqual({ ok: false, code: "record_too_large" });
-
-    const page = exportEventPage(
-      adapter(store),
-      pageOptions(run.run_id, { max_bytes: 262144 }),
-    );
-    expect(page).toMatchObject({
-      ok: true,
-      exported_count: 2,
-      next_after: next,
-      has_more: false,
-    });
-    if (!page.ok) return;
-    const [first, second] = page.ndjson
-      .slice(0, -1)
-      .split("\n")
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
-    expect(first!.event_seq).toBe(big);
-    expect(first!.summary_truncated).toBe(true);
-    const summary = first!.summary as string;
-    expect(Buffer.byteLength(summary, "utf8")).toBeLessThanOrEqual(
-      MAX_SUMMARY_BYTES,
-    );
-    expect(Buffer.byteLength(summary, "utf8")).toBeGreaterThan(
-      MAX_SUMMARY_BYTES - 2,
-    );
-    expect(huge.startsWith(summary)).toBe(true);
-    expect(second).toEqual({
-      event_seq: next,
-      run_id: run.run_id,
-      at: expect.any(String),
-      type: "note",
-      summary: "after huge",
-    });
-  });
-
-  test("the worst-case record still fits in the maximum byte budget", () => {
-    const runId = "r".repeat(128);
-    const record = event(1, runId, "\u0000".repeat(MAX_SUMMARY_BYTES * 4));
-    record.type = "\u0001".repeat(256);
-    record.at = "\u0002".repeat(64);
-    const page = exportEventPage(
-      fixedReader([record]).reader,
-      pageOptions(runId, { max_bytes: 262144, through_seq: 1 }),
-    );
-    expect(page).toMatchObject({ ok: true, exported_count: 1 });
-    if (!page.ok) return;
-    const parsed = JSON.parse(page.ndjson) as Record<string, unknown>;
-    expect((parsed.summary as string).length).toBe(MAX_SUMMARY_BYTES);
-    expect(parsed.summary_truncated).toBe(true);
-  });
-
-  test("truncation never splits a code point", () => {
-    expect(truncateUtf8("short", 5)).toBe("short");
-    expect(truncateUtf8("a😀b", 4)).toBe("a");
-    expect(truncateUtf8("a😀b", 5)).toBe("a😀");
-    expect(truncateUtf8("яяя", 5)).toBe("яя");
-    expect(truncateUtf8("😀", 3)).toBe("");
-  });
-
-  test("a supplied through_seq is clamped to the store watermark", () => {
-    const store = openStore();
-    const run = makeRun(store, "Clamp");
-    const seqs = [1, 2].map(
-      (index) =>
-        store.event(run.run_id, "note", `n-${index}`, null).event_seq,
-    );
-    const watermark = store.lastEventSeq();
-    const first = exportEventPage(
-      adapter(store),
-      pageOptions(run.run_id, {
-        through_seq: Number.MAX_SAFE_INTEGER,
-        max_events: 1,
-      }),
-    );
-    expect(first).toMatchObject({
-      ok: true,
-      exported_count: 1,
-      next_after: seqs[0],
-      through_seq: watermark,
-      has_more: true,
-    });
-    store.event(run.run_id, "note", "late-primary", null);
-    const rest = exportEventPage(
-      adapter(store),
-      pageOptions(run.run_id, {
-        after: seqs[0]!,
-        through_seq: watermark,
-        max_events: 10,
-      }),
-    );
-    expect(sequences(rest)).toEqual([seqs[1]!]);
-    if (rest.ok) expect(rest.ndjson).not.toContain("late-primary");
-
-    const forged = fixedReader(
-      [event(1, "r"), event(2, "r"), event(99, "r")],
-      2,
-    );
-    const page = exportEventPage(
-      forged.reader,
-      pageOptions("r", { through_seq: Number.MAX_SAFE_INTEGER }),
-    );
-    expect(page).toMatchObject({ ok: true, through_seq: 2, has_more: false });
-    expect(sequences(page)).toEqual([1, 2]);
-  });
-
-  test("rejects records whose exported fields are missing or mistyped", () => {
+  test("a supplied through_seq is the bound and is not refreshed", () => {
     const runId = "run-a";
-    const broken: Array<Record<string, unknown>> = [
-      { summary: undefined },
-      { summary: 42 },
-      { summary: null },
-      { type: 42 },
-      { type: undefined },
-      { type: "t".repeat(257) },
-      { at: null },
-      { at: "2".repeat(65) },
-    ];
-    for (const patch of broken) {
-      const bad = { ...event(2, runId), ...patch } as unknown as ActivityEvent;
-      const reader = fixedReader([event(1, runId), bad]);
-      expect(
-        exportEventPage(reader.reader, pageOptions(runId, { through_seq: 5 })),
-      ).toEqual({ ok: false, code: "invalid_reader_result" });
-    }
-    const edge = event(1, runId, "");
-    edge.type = "t".repeat(256);
-    edge.at = "2".repeat(64);
+    const ceiling = fixedReader(
+      [event(1, runId), event(2, runId), event(3, runId)],
+      1,
+    );
+    const page = exportEventPage(
+      ceiling.reader,
+      pageOptions(runId, { through_seq: 3, max_events: 10 }),
+    );
+    expect(sequences(page)).toEqual([1, 2, 3]);
+    expect(page).toMatchObject({ through_seq: 3, has_more: false });
+    expect(ceiling.watermarks()).toBe(0);
+
+    const above = fixedReader(
+      [event(1, runId, "in"), event(4, runId, "later")],
+      99,
+    );
     expect(
       exportEventPage(
-        fixedReader([edge]).reader,
-        pageOptions(runId, { through_seq: 5 }),
+        above.reader,
+        pageOptions(runId, { through_seq: 2, max_events: 10 }),
       ),
-    ).toMatchObject({ ok: true, exported_count: 1 });
+    ).toMatchObject({
+      exported_count: 1,
+      next_after: 1,
+      through_seq: 2,
+      has_more: false,
+    });
+    expect(above.watermarks()).toBe(0);
+  });
+
+  test("run_id is forwarded unchanged, including a long value", () => {
+    const runId = `  ${"r".repeat(300)}`;
+    const row = event(1, runId, "model said go north");
+    row.at = "t".repeat(80);
+    row.type = `note-${"x".repeat(300)}`;
+    const line = lineOf(row);
+    const seen: { id: string | null } = { id: null };
+    const page = exportEventPage(
+      {
+        eventsAfter(id, after, limit) {
+          seen.id = id;
+          expect(after).toBe(0);
+          expect(limit).toBe(2);
+          return [row];
+        },
+        lastEventSeq() {
+          throw new Error("watermark");
+        },
+      },
+      pageOptions(runId, {
+        through_seq: 1,
+        max_events: 1,
+        max_bytes: Buffer.byteLength(line, "utf8"),
+      }),
+    );
+    expect(seen.id).toBe(runId);
+    expect(page).toMatchObject({
+      ok: true,
+      ndjson: line,
+      exported_count: 1,
+      through_seq: 1,
+      has_more: false,
+    });
   });
 
   test("reader failures become invalid_reader_result", () => {
@@ -941,22 +852,36 @@ describe("event export", () => {
       code: "invalid_reader_result",
     });
 
-    for (const through_seq of [null, 5]) {
-      let reads = 0;
-      const throwingWatermark: EventExportReader = {
-        eventsAfter() {
-          reads += 1;
-          return [];
-        },
-        lastEventSeq() {
-          throw new Error("database is locked");
-        },
-      };
-      expect(
-        exportEventPage(throwingWatermark, pageOptions(runId, { through_seq })),
-      ).toEqual({ ok: false, code: "invalid_reader_result" });
-      expect(reads).toBe(0);
-    }
+    let reads = 0;
+    const throwingWatermark: EventExportReader = {
+      eventsAfter() {
+        reads += 1;
+        return [];
+      },
+      lastEventSeq() {
+        throw new Error("database is locked");
+      },
+    };
+    expect(exportEventPage(throwingWatermark, pageOptions(runId))).toEqual({
+      ok: false,
+      code: "invalid_reader_result",
+    });
+    expect(reads).toBe(0);
+    expect(
+      exportEventPage(
+        throwingWatermark,
+        pageOptions(runId, { through_seq: 5 }),
+      ),
+    ).toEqual({
+      ok: true,
+      ndjson: "",
+      exported_count: 0,
+      next_after: 0,
+      through_seq: 5,
+      has_more: false,
+      details_omitted: true,
+    });
+    expect(reads).toBe(1);
 
     for (const value of [[], "rows", null, { length: 0 }]) {
       const reader: EventExportReader = {
@@ -969,36 +894,51 @@ describe("event export", () => {
         expect(result).toEqual({ ok: false, code: "invalid_reader_result" });
     }
 
-    let summaryReads = 0;
-    const flaky = event(1, runId);
-    Object.defineProperty(flaky, "summary", {
+    const fields = ["event_seq", "run_id", "at", "type", "summary"] as const;
+    for (const field of fields) {
+      const row = event(1, runId);
+      Object.defineProperty(row, field, {
+        enumerable: true,
+        get() {
+          throw new Error(`${field} boom`);
+        },
+      });
+      let result: EventExportResult | undefined;
+      expect(() => {
+        result = exportEventPage(
+          { eventsAfter: () => [row], lastEventSeq: () => 5 },
+          pageOptions(runId, { through_seq: 5 }),
+        );
+      }).not.toThrow();
+      expect(result).toEqual({ ok: false, code: "invalid_reader_result" });
+    }
+
+    const good = event(1, runId, "keep");
+    const bad = event(2, runId, "later");
+    Object.defineProperty(bad, "summary", {
       enumerable: true,
       get() {
-        summaryReads += 1;
-        if (summaryReads > 1) throw new Error("row changed under us");
-        return "first read";
+        throw new Error("summary boom");
       },
     });
     expect(
       exportEventPage(
-        fixedReader([flaky]).reader,
+        { eventsAfter: () => [good, bad], lastEventSeq: () => 5 },
+        pageOptions(runId, { through_seq: 5, max_bytes: 262144 }),
+      ),
+    ).toEqual({ ok: false, code: "invalid_reader_result" });
+
+    const rows = new Proxy([event(1, runId)], {
+      get(target, prop, receiver) {
+        if (prop === "length") throw new Error("length boom");
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    expect(
+      exportEventPage(
+        { eventsAfter: () => rows, lastEventSeq: () => 5 },
         pageOptions(runId, { through_seq: 5 }),
       ),
     ).toEqual({ ok: false, code: "invalid_reader_result" });
-    expect(summaryReads).toBe(2);
-  });
-
-  test("run_id length is bounded", () => {
-    const reader = sealedReader();
-    expect(
-      exportEventPage(reader, pageOptions("r".repeat(129))),
-    ).toEqual({ ok: false, code: "invalid_options" });
-    const runId = "r".repeat(128);
-    expect(
-      exportEventPage(
-        fixedReader([event(1, runId)], 1).reader,
-        pageOptions(runId),
-      ),
-    ).toMatchObject({ ok: true, exported_count: 1 });
   });
 });

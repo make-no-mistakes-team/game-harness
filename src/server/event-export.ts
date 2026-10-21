@@ -150,31 +150,27 @@ function acceptedEvents(
   after: number,
   limit: number,
 ): ActivityEvent[] | null {
-  try {
-    if (!Array.isArray(value) || value.length > limit) return null;
-    const events: ActivityEvent[] = [];
-    let previous = after;
-    for (const item of value) {
-      if (item === null || typeof item !== "object") return null;
-      const event = item as ActivityEvent;
-      const sequence = event.event_seq;
-      if (event.run_id !== runId) return null;
-      if (
-        typeof sequence !== "number" ||
-        !Number.isSafeInteger(sequence) ||
-        sequence <= previous
-      )
-        return null;
-      if (!boundedString(event.at, MAX_AT_LENGTH)) return null;
-      if (!boundedString(event.type, MAX_TYPE_LENGTH)) return null;
-      if (typeof event.summary !== "string") return null;
-      previous = sequence;
-      events.push(event);
-    }
-    return events;
-  } catch {
-    return null;
+  if (!Array.isArray(value) || value.length > limit) return null;
+  const events: ActivityEvent[] = [];
+  let previous = after;
+  for (const item of value) {
+    if (item === null || typeof item !== "object") return null;
+    const event = item as ActivityEvent;
+    const sequence = event.event_seq;
+    if (event.run_id !== runId) return null;
+    if (
+      typeof sequence !== "number" ||
+      !Number.isSafeInteger(sequence) ||
+      sequence <= previous
+    )
+      return null;
+    if (!boundedString(event.at, MAX_AT_LENGTH)) return null;
+    if (!boundedString(event.type, MAX_TYPE_LENGTH)) return null;
+    if (typeof event.summary !== "string") return null;
+    previous = sequence;
+    events.push(event);
   }
+  return events;
 }
 
 function boundedString(value: unknown, maxLength: number): value is string {
@@ -186,28 +182,29 @@ function pack(
   options: EventExportOptions,
   through: number,
 ): EventExportResult {
-  try {
-    const lines: string[] = [];
-    let used = 0;
-    let exported = 0;
-    let nextAfter = options.after;
-    for (const event of events) {
-      if (event.event_seq > through) break;
-      const line = projectLine(event);
-      const size = Buffer.byteLength(line, "utf8");
-      if (exported === options.max_events || used + size > options.max_bytes) {
-        if (exported === 0) return { ok: false, code: "record_too_large" };
-        return page(lines, exported, nextAfter, through, true);
-      }
-      lines.push(line);
-      used += size;
-      exported += 1;
-      nextAfter = event.event_seq;
+  const lines: string[] = [];
+  let used = 0;
+  let exported = 0;
+  let nextAfter = options.after;
+  for (const event of events) {
+    if (event.event_seq > through) break;
+    let line: string;
+    try {
+      line = projectLine(event);
+    } catch {
+      return { ok: false, code: "invalid_reader_result" };
     }
-    return page(lines, exported, nextAfter, through, false);
-  } catch {
-    return { ok: false, code: "invalid_reader_result" };
+    const size = Buffer.byteLength(line, "utf8");
+    if (exported === options.max_events || used + size > options.max_bytes) {
+      if (exported === 0) return { ok: false, code: "record_too_large" };
+      return page(lines, exported, nextAfter, through, true);
+    }
+    lines.push(line);
+    used += size;
+    exported += 1;
+    nextAfter = event.event_seq;
   }
+  return page(lines, exported, nextAfter, through, false);
 }
 
 function projectLine(event: ActivityEvent): string {

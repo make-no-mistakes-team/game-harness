@@ -13,34 +13,17 @@ import type { AuthManager } from "./auth.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import type { Store, StoredRun } from "./store.ts";
 import { recordCall, recordUsage } from "./usage.ts";
-import { isSpeculativeTool, type SpeculativePlanning } from "./speculative-planning.ts";
+import type { SpeculativePlanning } from "./speculative-planning.ts";
+import { isToolAllowed } from "../shared/tool-policy.ts";
+import { ProgramWorkspace, type ModelReviewContext } from "./program-workspace.ts";
 
 const COALESCE_MS = 100;
 const EMPTY_COOLDOWN_MS = 5_000;
 const MAX_EMPTY_TURNS = 3;
 const TURN_MS = 120_000;
-const BOOTSTRAP_MS = 60_000;
 const TURN_CALLS = 12;
-const BOOTSTRAP_CALLS = 3;
 const TOOL_CALLS = 48;
 const FEEDBACK_BYTES = 8 * 1024;
-const REVIEW_TOOLS: Record<string, true> = {
-  capabilities_read: true,
-  observation_read: true,
-  skill_read: true,
-  skill_register: true,
-  skill_revise: true,
-  skill_history: true,
-  skill_get: true,
-  feedback_read: true,
-  action_get: true,
-  recipes_read: true,
-  improvement_feedback: true,
-  improvement_resolve: true,
-  version_compare: true,
-  trace_read: true,
-  planning_read: true,
-};
 const PROGRAM_PENDING =
   "A program is meaningful pending work; strategy waits for its outcome";
 const PROVIDER_FAILURE =
@@ -52,6 +35,7 @@ const MEANINGFUL_WAKES: Record<string, true> = {
   trial_decision_due: true,
   selected_attention: true,
   skill_outcome: true,
+  planning_continuation: true,
   speculative_lookahead: true,
   death: true,
   uncertainty: true,
@@ -91,9 +75,8 @@ export interface StrategicHost {
   persist(summary?: string): void;
   pause(message: string): void;
   terminal(status: "completed" | "failed", message: string): void;
-  finishBootstrap(): void;
   speculation?(): SpeculativePlanning;
-  reviewContext?(): Json;
+  reviewContext?(): ModelReviewContext;
   reviewComplete?(): void;
 }
 
@@ -103,7 +86,7 @@ interface RequestAttempt {
   index: number;
   planId: string | null;
   review: boolean;
-  role: "bootstrap" | "speculative" | "review" | "recovery" | "planning";
+  role: "speculative" | "review" | "recovery" | "planning";
 }
 
 function inventoryCounts(observation: Observation): Record<string, number> {
@@ -119,20 +102,14 @@ function record(value: Json): { [key: string]: Json } | null {
     : null;
 }
 
-function feedbackEntry(event: ActivityEvent): Json {
+function feedbackEntry(event: ActivityEvent, workspace: ProgramWorkspace): Json {
   // Durable evidence may include full observations, program arguments or action
   // results. Ordinary strategy receives references and selected scalar facts;
-  // feedback_read remains the authorized route to the original record.
+  // Named evidence inspection remains the authorized route to original records.
   const details = record(event.details);
   const selected: { [key: string]: Json } = {};
   for (const key of [
-    "execution_id",
-    "root_execution_id",
-    "skill_id",
-    "policy_id",
     "version",
-    "action_id",
-    "evaluation_id",
     "status",
     "kind",
     "reason",
@@ -141,22 +118,28 @@ function feedbackEntry(event: ActivityEvent): Json {
     "evaluations",
     "effects",
     "tool",
-    "tool_call_id",
     "goal",
-    "session_id",
-    "life_id",
     "observation_seq",
     "neutralized",
     "workers_closed",
     "no_replay",
     "summary",
-    "plan_id",
-    "attempt_id",
   ]) {
     const value = details?.[key];
     if (typeof value === "string") selected[key] = value.slice(0, 300);
     else if (typeof value === "number" || typeof value === "boolean")
       selected[key] = value;
+  }
+  const executionId = typeof details?.execution_id === "string" ? details.execution_id :
+    typeof details?.root_execution_id === "string" ? details.root_execution_id : null;
+  const reference = executionId ? workspace.executionReference(executionId) : null;
+  if (reference) {
+    selected.name = reference.name;
+    selected.version = reference.version;
+    selected.execution_ordinal = reference.execution_ordinal;
+  } else if (typeof details?.skill_id === "string" && typeof details.version === "number") {
+    const program = workspace.programReference({ skill_id: details.skill_id, version: details.version });
+    if (program.name !== null) selected.name = program.name;
   }
   const error = details && record(details.error ?? null);
   if (error) {
@@ -189,8 +172,6 @@ export class StrategicPlanner {
   private turnCalls = 0;
   private turnToolCalls = 0;
   private turnDeadline = 0;
-  private bootstrapCalls = 0;
-  private bootstrapDeadline = 0;
   private providerFailed = false;
   private providerAborted = false;
   private gateReason: string | null = null;
@@ -225,8 +206,6 @@ export class StrategicPlanner {
     this.turnCalls = 0;
     this.turnToolCalls = 0;
     this.turnDeadline = 0;
-    this.bootstrapCalls = 0;
-    this.bootstrapDeadline = 0;
     this.providerFailed = false;
     this.providerAborted = false;
     this.gateReason = null;
@@ -253,13 +232,11 @@ export class StrategicPlanner {
       );
     const run = this.host.assertCurrent(generation);
     this.fenced = false;
-    if (run.status === "bootstrapping" && !this.bootstrapDeadline)
-      this.bootstrapDeadline = Date.now() + BOOTSTRAP_MS;
     const opening = (async () => {
       const agent = await this.auth.createAgent({
         modelId: run.model_id,
         systemPrompt: [this.host.rootPrompt()],
-        tools: this.host.tools(generation),
+        tools: this.host.tools(generation).filter((tool) => isToolAllowed(run.status === "reviewing" ? "review" : "ordinary", tool.name)),
       });
       this.agent = agent;
       if (!this.current(run, generation))
@@ -280,25 +257,22 @@ export class StrategicPlanner {
         } catch {
           return stop("Run authority revoked");
         }
-        const bootstrap = run.status === "bootstrapping";
         const review = run.status === "reviewing";
+        const toolRole = this.speculativeTurn ? "speculative" : review ? "review" : "ordinary";
+        agent.setTools(this.host.tools(generation).filter((tool) => isToolAllowed(toolRole, tool.name)));
         if (this.speculativeTurn && !this.host.speculation?.().requestCall())
           return stop("Finite lookahead request authority reached");
-        if (!bootstrap && !review && !this.speculativeTurn && this.host.programPending() && !this.pendingAllowance)
+        if (!review && !this.speculativeTurn && this.host.programPending() && !this.pendingAllowance)
           return stop(PROGRAM_PENDING);
         if (
           this.turnCalls >= (review ? 3 : TURN_CALLS) ||
           this.turnToolCalls >= (review ? 12 : TOOL_CALLS) ||
-          Date.now() >= this.turnDeadline ||
-          (bootstrap &&
-            (this.bootstrapCalls >= BOOTSTRAP_CALLS ||
-              Date.now() >= this.bootstrapDeadline))
+          Date.now() >= this.turnDeadline
         )
           return stop("Finite strategic call allowance reached");
-        if (!bootstrap && !this.speculativeTurn && this.host.programPending()) this.pendingAllowance--;
+        if (!this.speculativeTurn && this.host.programPending()) this.pendingAllowance--;
         this.gateReason = null;
         this.turnCalls++;
-        if (bootstrap) this.bootstrapCalls++;
         run.turns++;
         this.request = {
           id: randomUUID(),
@@ -316,7 +290,6 @@ export class StrategicPlanner {
           {
             turn: run.turns,
             generation,
-            bootstrap,
             request_id: this.request.id,
             request_id_source: "host",
             request_index: this.request.index,
@@ -349,8 +322,9 @@ export class StrategicPlanner {
           this.host.assertCurrent(generation);
           if (this.speculativeTurn)
             this.host.speculation?.().assertToolAuthority(context.tool.name);
-          if (run.status === "reviewing" && !Object.hasOwn(REVIEW_TOOLS, context.tool.name))
-            throw new RuntimeFault("invalid_request", "Post-goal review permits evidence and source authoring only");
+          const role = this.speculativeTurn ? "speculative" : run.status === "reviewing" ? "review" : "ordinary";
+          if (!isToolAllowed(role, context.tool.name))
+            throw new RuntimeFault("invalid_request", "Tool is not authorized for the current role");
         } catch {
           return {
             block: true,
@@ -448,7 +422,7 @@ export class StrategicPlanner {
     if (!run || !this.current(run, this.host.generation())) return;
     if (this.host.programPending() && !Object.hasOwn(MEANINGFUL_WAKES, reason))
       return;
-    if (this.speculativeTurn && reason !== "speculative_lookahead" &&
+    if (this.speculativeTurn && reason !== "speculative_lookahead" && reason !== "planning_continuation" &&
         Object.hasOwn(MEANINGFUL_WAKES, reason)) {
       // Ordinary outcome/replan demand is never held behind optional lookahead.
       // Drain the cancelled request through the same serialized agent owner.
@@ -529,7 +503,7 @@ export class StrategicPlanner {
       !this.fenced &&
       this.host.run() === run &&
       generation === this.host.generation() &&
-      (run.status === "running" || run.status === "bootstrapping" || run.status === "reviewing")
+      (run.status === "running" || run.status === "reviewing")
     );
   }
 
@@ -577,13 +551,19 @@ export class StrategicPlanner {
     generation: number,
     agent: Agent,
   ): Promise<void> {
-    const bootstrap = run.status === "bootstrapping";
     const review = run.status === "reviewing";
     const reasons = [...this.wakeReasons];
     this.wakeReasons.clear();
+    const lookaheadOnly = reasons.length > 0 && reasons.every((reason) => reason === "speculative_lookahead");
+    if (!review && !lookaheadOnly) {
+      const continuation = await this.host.speculation?.().pendingActivation();
+      if (!this.current(run, generation)) return;
+      if (continuation?.state === "activated" && reasons.every((reason) => reason === "planning_continuation"))
+        return;
+    }
     // Replans/outcomes always win; overlap is one intentional independent path,
     // never an extra ordinary pending-work inference allowance.
-    const speculative = !bootstrap && !review &&
+    const speculative = !review &&
       reasons.includes("speculative_lookahead") &&
       reasons.every((reason) => reason === "speculative_lookahead")
       ? this.host.speculation?.().begin() ?? null
@@ -591,9 +571,9 @@ export class StrategicPlanner {
     if (reasons.includes("speculative_lookahead") && !speculative) {
       this.host.speculation?.().invalidate("cancelled");
       if (reasons.every((reason) => reason === "speculative_lookahead")) {
-        this.store.event(run.run_id, "scheduler.lookahead_skipped", "Optional lookahead demand had no eligible flight; ordinary bootstrap and replan allowances are unchanged", {
+        this.store.event(run.run_id, "scheduler.lookahead_skipped", "Optional lookahead demand had no eligible flight; ordinary replan allowances are unchanged", {
           phase: run.status,
-          reason: bootstrap ? "bootstrap" : review ? "review" : "draft_not_available",
+          reason: review ? "review" : "draft_not_available",
         });
         return;
       }
@@ -608,12 +588,12 @@ export class StrategicPlanner {
       ? this.attentionReason
       : null;
     if (attention !== null) this.attentionReason = null;
-    this.role = review ? "review" : speculative ? "speculative" : bootstrap ? "bootstrap"
+    this.role = review ? "review" : speculative ? "speculative"
       : reasons.some((reason) => ["policy_replan", "policy_interrupt", "policy_error", "death", "uncertainty"].includes(reason))
         ? "recovery" : "planning";
     this.purpose = review
       ? "improvement"
-      : speculative ? "planning" : bootstrap ? "authoring"
+      : speculative ? "planning"
         : this.role === "recovery" ? "replanning" : "planning";
     const turnId = randomUUID();
     const revision = this.workRevision;
@@ -623,9 +603,7 @@ export class StrategicPlanner {
     this.providerAborted = false;
     this.gateReason = null;
     this.request = null;
-    this.turnDeadline = bootstrap
-      ? this.bootstrapDeadline
-      : speculative
+    this.turnDeadline = speculative
         ? Date.now() + (this.host.speculation?.().remainingMs() ?? 0)
         : Date.now() + (review ? 30_000 : TURN_MS);
     run.model_status = "thinking";
@@ -638,7 +616,6 @@ export class StrategicPlanner {
         turn_id: turnId,
         generation,
         reasons,
-        bootstrap,
         speculative_plan_id: speculative?.plan_id ?? null,
         read_only_review: review,
       },
@@ -653,7 +630,6 @@ export class StrategicPlanner {
           "Host strategic time allowance reached; provider cancellation requested",
           {
             turn_id: turnId,
-            bootstrap,
           },
         );
         agent.abort();
@@ -662,7 +638,6 @@ export class StrategicPlanner {
     );
     let through = this.contextCursor;
     let inventory: Record<string, number> | null = null;
-    let originalTools: AgentTool[] | null = null;
     try {
       const observation = await this.host.observe();
       if (!this.current(run, generation)) return;
@@ -688,11 +663,12 @@ export class StrategicPlanner {
       through =
         candidates[candidates.length - 1]?.event_seq ?? this.contextCursor;
       const feedback: Json[] = [];
+      const workspace = new ProgramWorkspace(this.store, run.run_id);
       const omitted: number[] = [];
       let bytes = 0;
       for (const event of candidates) {
         if (!Object.hasOwn(FEEDBACK_TYPES, event.type)) continue;
-        const entry = feedbackEntry(event);
+        const entry = feedbackEntry(event, workspace);
         const size = Buffer.byteLength(JSON.stringify(entry));
         if (bytes + size > FEEDBACK_BYTES) omitted.push(event.event_seq);
         else {
@@ -713,7 +689,7 @@ export class StrategicPlanner {
       this.store.event(
         run.run_id,
         "scheduler.context_selected",
-        "Bounded filtered evidence selected; omitted records remain available through feedback_read",
+        "Bounded filtered evidence selected; omitted records remain available through program_inspect",
         {
           turn_id: turnId,
           observation_seq: observation.observation_seq,
@@ -723,11 +699,12 @@ export class StrategicPlanner {
         },
       );
       const action = this.host.action();
+      const reviewContext = review ? this.host.reviewContext?.() ?? null : null;
       if (!deadlineReached) {
+        const selectedTools = this.host.tools(generation)
+          .filter((tool) => isToolAllowed(speculative ? "speculative" : review ? "review" : "ordinary", tool.name));
+        agent.setTools(selectedTools);
         if (speculative) {
-          originalTools = this.host.tools(generation);
-          const selectedTools = originalTools.filter((tool) => isSpeculativeTool(tool.name));
-          agent.setTools(selectedTools);
           this.store.event(run.run_id, "scheduler.speculative_tools_selected", "Configured the actual speculative agent catalog to read-only evidence and staging; dispatch authority is checked independently", {
             plan_id: speculative.plan_id,
             tools: selectedTools.map((tool) => tool.name),
@@ -738,13 +715,12 @@ export class StrategicPlanner {
             reason: reasons,
             attention,
             phase: run.status,
-            run_id: run.run_id,
-            epoch: run.epoch,
+            role: this.role,
             task: run.task,
-            session_id: observation.session_id,
-            life: observation.life,
-            speculative_plan: speculative,
-            improvement_review: review ? this.host.reviewContext?.() ?? null : null,
+            life: { status: observation.life.status, can_respawn: observation.life.can_respawn,
+              death: observation.life.death ? { at: observation.life.death.at, message: observation.life.death.message } : null },
+            speculative_plan: workspace.planningView(speculative),
+            improvement_review: reviewContext ? workspace.feedbackView(reviewContext) : null,
             player: {
               position: observation.player.position,
               yaw: observation.player.yaw,
@@ -759,11 +735,9 @@ export class StrategicPlanner {
             },
             current_action: action
               ? {
-                  action_id: action.action_id,
                   kind: action.kind,
                   status: action.status,
                   origin: action.origin,
-                  execution_id: action.execution_id,
                   summary: action.summary.slice(0, 500),
                 }
               : null,
@@ -774,7 +748,6 @@ export class StrategicPlanner {
                   policy.state === "trial" || policy.state === "active",
               )
               .map((policy) => ({
-                policy_id: policy.policy_id,
                 version: policy.version,
                 backend: policy.backend,
                 name: policy.name.slice(0, 160),
@@ -783,42 +756,18 @@ export class StrategicPlanner {
                 effects: policy.effects,
                 last_error: policy.last_error?.slice(0, 300) ?? null,
               })),
-            skills: this.store
-              .skills(run.run_id)
-              .slice(-12)
-              .map((skill) => ({
-                skill_id: skill.skill_id,
-                version: skill.version,
-                name: skill.name.slice(0, 160),
-                purpose: skill.card.purpose.slice(0, 200),
-                dependencies: skill.dependencies,
-                state: skill.state,
-              })),
-            executions: this.store
-              .skillExecutions(run.run_id)
-              .slice(0, 8)
-              .map((execution) => ({
-                execution_id: execution.execution_id,
-                skill_id: execution.skill_id,
-                version: execution.version,
-                status: execution.status,
-                actions: execution.actions,
-                calls: execution.calls,
-                summary:
-                  (execution.result?.summary ?? execution.error)?.slice(
-                    0,
-                    500,
-                  ) ?? null,
-              })),
+            programs: workspace.catalog(0, 12),
+            executions: this.store.skillExecutions(run.run_id).slice(0, 8).map((execution) => ({
+              ...workspace.executionSummary(execution),
+              summary: (execution.result?.summary ?? execution.error)?.slice(0, 500) ?? null,
+            })),
             feedback,
             omitted_event_refs: omitted,
             through_event_seq: through,
             instruction: review
-              ? "The operator goal is already verified. Perform one bounded effect-free evidence review: inspect objective traces/opportunities, choose revise/keep/insufficient evidence, and optionally author an exact linked source revision. A revision is an unmeasured candidate, not proven improvement. Do not start skills, policies, gameplay trials, or any effects. Completion follows this review automatically."
+              ? "The goal is verified. Perform one bounded effect-free review: inspect evidence, record keep/insufficient_evidence, or program_write a linked revision with reason. A candidate is not proven improvement. No gameplay trials or effects. Completion follows automatically."
               : speculative
-                ? "This is the single explicitly selected independent lookahead while the predecessor program continues. Only read-only evidence tools and planning_stage are available. Select an already registered candidate by exact skill_id and version and stage it using this plan_id. The host pins its immutable source hash and dependencies; do not supply a hash. Author precondition_source as async function BODY statements with the supplied context and state bindings, returning a boolean, without an enclosing function or arrow wrapper. A syntax/compactness rejection permits your explicit correction only within this same remaining request/tool/time budget. No registration, revision, starts, activation, effects, target-ID replay, or request polling. Activation later requires a fresh observation and successful exact predecessor."
-                : bootstrap
-              ? "Prepare compact model-authored skills and optional reactions within bootstrap allowance. Effects open automatically after bootstrap."
+                ? "This is the one authorized independent planning flight. Observe, inspect, help and prepare_next only. Select an existing named candidate; optionally author guard_source BODY(observation,args) returning strict boolean. Omission adds no game constraint. No source writes, starts, activation, effects or polling. Corrections share the original finite deadline. Main's captured permission and all host invariants govern activation."
               : this.host.programPending()
                 ? "A program is still meaningful authorized work. This is one bounded attention/outcome/replan request, not permission to poll or duplicate it. Use tools for any necessary detailed evidence."
                 : "Advance the task using current evidence. Choose useful bounded work, react to trial evidence, or explain a genuine obstacle. No human continuation is needed.",
@@ -833,7 +782,8 @@ export class StrategicPlanner {
       clearTimeout(timer);
       this.finishUnsettledRequest(run);
       if (speculative) this.host.speculation?.().finish(speculative.plan_id);
-      if (originalTools) agent.setTools(originalTools);
+      if (speculative) agent.setTools(this.host.tools(generation)
+        .filter((tool) => isToolAllowed(run.status === "reviewing" ? "review" : "ordinary", tool.name)));
       this.speculativeTurn = false;
       // prompt has settled, including all paired tool results. Do not retain
       // raw observations/source/tool echoes while a pending program runs.
@@ -861,10 +811,9 @@ export class StrategicPlanner {
       this.host.persist();
       return;
     }
-    const bootstrapExpired = bootstrap && Date.now() >= this.bootstrapDeadline;
     if (
       this.providerFailed ||
-      (!bootstrapExpired && (deadlineReached || this.providerAborted))
+      deadlineReached || this.providerAborted
     ) {
       run.model_status = "error";
       this.store.event(
@@ -883,19 +832,15 @@ export class StrategicPlanner {
     }
     // A host gate can reject the initial request after observation/admission.
     // Nothing was delivered in that case, so do not consume selected evidence.
-    if (this.turnCalls && !bootstrapExpired) {
+    if (this.turnCalls) {
       this.contextCursor = through;
       this.previousInventory = inventory;
     }
     run.model_status = "idle";
     this.store.event(
       run.run_id,
-      bootstrapExpired
-        ? "scheduler.bootstrap_expired"
-        : "scheduler.turn_finished",
-      bootstrapExpired
-        ? "Bootstrap time allowance expired; selected feedback remains unconsumed and gameplay readiness is retained"
-        : "Strategic turn settled with complete tool-result groups",
+      "scheduler.turn_finished",
+      "Strategic turn settled with complete tool-result groups",
       {
         turn_id: turnId,
         calls: this.turnCalls,
@@ -904,11 +849,6 @@ export class StrategicPlanner {
         consumed_event_seq: this.contextCursor,
       },
     );
-    if (bootstrap) {
-      this.host.finishBootstrap();
-      this.wake("bootstrap_completed");
-      return;
-    }
     this.host.persist();
     if (this.workRevision !== revision) this.emptyTurns = 0;
     if (this.host.busy() || this.host.programPending()) return;
@@ -988,18 +928,21 @@ export class StrategicPlanner {
       if (!hostYield && request) {
         // Host workflow roles outrank visible requested tool categories. This is
         // accounting classification, never a claim about hidden intent or cause.
-        const toolNames = [...new Set(message.content
-          .filter((content) => content.type === "toolCall")
-          .map((content) => content.name))];
+        const toolCalls = message.content.filter((content) => content.type === "toolCall");
+        const toolNames = [...new Set(toolCalls.map((content) => content.name))];
+        const improvement = toolCalls.some((call) => call.name === "program_review" ||
+          call.name === "program_write" && call.arguments && typeof call.arguments === "object" && "based_on" in call.arguments ||
+          call.name === "program_inspect" && call.arguments && typeof call.arguments === "object" &&
+            (call.arguments.view === "feedback" || call.arguments.view === "comparison"));
         const provisionalPurpose = request.purpose;
         const purpose: UsagePurpose = request.role === "review" ? "improvement"
           : request.role === "speculative" ? "planning"
             : request.role === "recovery" ? "replanning"
-              : toolNames.some((name) => ["skill_revise", "improvement_feedback", "improvement_resolve", "version_compare"].includes(name))
+              : improvement
                 ? "improvement"
-                : toolNames.some((name) => name === "skill_register" || name === "policy_register")
+                : toolNames.some((name) => name === "program_write" || name === "reflex")
                   ? "authoring"
-                  : request.role === "bootstrap" ? "authoring" : "planning";
+                  : "planning";
         if (purpose !== provisionalPurpose) {
           const previous = run.usage.by_purpose[provisionalPurpose];
           const classified = run.usage.by_purpose[purpose];

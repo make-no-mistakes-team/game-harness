@@ -5,6 +5,7 @@ import { realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type {
   Json,
+  Observation,
   PolicyContext,
   PolicyDecision,
   PolicySpec,
@@ -14,6 +15,7 @@ import {
   gameActionSchema,
   policyDecisionSchema,
   policySpecSchema,
+  namedProgramRefSchema,
 } from "../shared/validation.ts";
 import { MAX_SKILL_LIMITS } from "../shared/programs.ts";
 import type {
@@ -197,7 +199,7 @@ class DockerPolicyWorker implements PolicyWorker {
     this.name = `gameharness-policy-${owner}-${randomUUID()}`;
   }
 
-  async start(source?: string): Promise<void> {
+  async start(source?: string, binding: "policy" | "guard" = "policy"): Promise<void> {
     try {
       if (this.closing) throw new Error("Sandbox worker is closed.");
       const ready = this.waitFor("ready", STARTUP_MS);
@@ -238,7 +240,7 @@ class DockerPolicyWorker implements PolicyWorker {
       });
       await ready;
       if (source !== undefined)
-        await this.request("compiled", { type: "init", source }, STARTUP_MS);
+        await this.request("compiled", { type: "init", source, binding }, STARTUP_MS);
     } catch (error) {
       await this.terminate(
         error instanceof Error
@@ -544,20 +546,12 @@ function skillCapability(value: unknown): SkillCapabilityRequest {
         return { kind: "recipes", item: request.item };
       break;
     case "call": {
-      const ref = request.skill;
+      const ref = namedProgramRefSchema.safeParse(request.skill);
       if (
         exactKeys(request, ["kind", "skill", "args"]) &&
-        ref &&
-        typeof ref === "object" &&
-        !Array.isArray(ref) &&
-        exactKeys(ref as Reply, ["skill_id", "version"]) &&
-        typeof (ref as Reply).skill_id === "string" &&
-        ((ref as Reply).skill_id as string).length > 0 &&
-        ((ref as Reply).skill_id as string).length <= 256 &&
-        Number.isSafeInteger((ref as Reply).version) &&
-        ((ref as Reply).version as number) > 0
+        ref.success
       )
-        return request as unknown as SkillCapabilityRequest;
+        return { kind: "call", skill: ref.data, args: request.args as Json };
       break;
     }
     case "progress":
@@ -993,19 +987,21 @@ export class SandboxService {
   }
 
   /** Effect-free, one-shot predicate in the same externally watched Docker profile. */
-  async evaluatePrecondition(
+  async evaluateGameGuard(
     source: string,
-    context: Json,
+    observation: Observation,
+    args: Json,
     signal: AbortSignal,
   ): Promise<boolean> {
     if (this.closed || this.state.status !== "ready")
       throw new Error("Prepare the Docker sandbox before evaluating a precondition.");
-    await validateProgramSource(source, "policy");
+    await validateProgramSource(source, "guard");
+    const context = { observation, args } as unknown as Json;
     encode(context, INPUT_BYTES);
     if (signal.aborted) throw new Error("Precondition evaluation was cancelled.");
     const worker = this.allocate();
     try {
-      await worker.start(source);
+      await worker.start(source, "guard");
       return await worker.evaluateBoolean(context, signal);
     } finally {
       await worker.close();

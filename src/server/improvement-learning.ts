@@ -23,10 +23,12 @@ export function exactVersion(store: Store, ref: ProgramVersionEvidence) {
 export class ImprovementLearning {
   constructor(private readonly store: Store) {}
   feedback(runId: string, after: ImprovementFeedbackCursor = { opportunity_seq: 0, execution_seq: 0 }, limit = 32) {
-    if (!Number.isSafeInteger(after.opportunity_seq) || after.opportunity_seq < 0 ||
-      !Number.isSafeInteger(after.execution_seq) || after.execution_seq < 0 ||
-      !Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid improvement feedback cursor or limit");
+    this.assertFeedbackCursor(after, limit);
     this.detect(runId);
+    return this.readFeedback(runId, after, limit);
+  }
+  readFeedback(runId: string, after: ImprovementFeedbackCursor = { opportunity_seq: 0, execution_seq: 0 }, limit = 32) {
+    this.assertFeedbackCursor(after, limit);
     const opportunities = this.store.evidenceObjects<ImprovementOpportunity>(runId, "opportunity");
     const metrics = objectiveMetrics(this.store, runId);
     const cap = Math.min(limit, 100);
@@ -65,6 +67,11 @@ export class ImprovementLearning {
     page.has_more = opportunityRows.some((row) => row.seq > page.next_after.opportunity_seq) ||
       executionRows.some((row) => row.seq > page.next_after.execution_seq);
     return page;
+  }
+  private assertFeedbackCursor(after: ImprovementFeedbackCursor, limit: number): void {
+    if (!Number.isSafeInteger(after.opportunity_seq) || after.opportunity_seq < 0 ||
+      !Number.isSafeInteger(after.execution_seq) || after.execution_seq < 0 ||
+      !Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid improvement feedback cursor or limit");
   }
   private detect(runId: string): void {
     const executions = this.store.allSkillExecutions(runId);

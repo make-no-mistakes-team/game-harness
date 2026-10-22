@@ -20,7 +20,7 @@ import type {
   SkillStartRequest,
   WorkingProgramMode,
 } from "./programs.ts";
-import { DEFAULT_SKILL_LIMITS, MAX_SKILL_LIMITS } from "./programs.ts";
+import { DEFAULT_SKILL_LIMITS, MAX_SKILL_LIMITS, SKILL_API_VERSION } from "./programs.ts";
 import type { LookaheadConfig, LookaheadRequest } from "./planning.ts";
 
 export const sessionIdSchema = z.string().min(1).max(160);
@@ -231,6 +231,11 @@ export const skillRefSchema = z
   })
   .strict();
 
+export const namedProgramRefSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  version: z.number().int().positive().optional(),
+}).strict();
+
 export const skillLimitsSchema = z
   .object({
     duration_ms: z.number().int().min(100).max(MAX_SKILL_LIMITS.duration_ms),
@@ -243,6 +248,9 @@ export const skillLimitsSchema = z
 export const lookaheadConfigSchema = z
   .object({
     after_ms: z.number().int().min(0).max(600000),
+    activation: z.enum(["manual", "on_predecessor_success"]).default("manual").describe(
+      "Main root-start authorization for manual activation or one automatic continuation after the exact predecessor succeeds and drains. Speculative staging cannot mint or expand this permit.",
+    ),
     reason: z.string().min(1).max(300).refine((reason) => reason.trim().length > 0, {
       message: "Lookahead reason must not be blank",
     }),
@@ -251,14 +259,14 @@ export const lookaheadConfigSchema = z
         calls: z.number().int().min(1).max(4),
         tools: z.number().int().min(1).max(16),
         duration_ms: z.number().int().min(1000).max(30000).describe(
-          "Total flight/draft lifetime in milliseconds starting after after_ms; includes model/tool work, waiting for predecessor, fresh observation/precondition validation and activation admission. All must fit before this same deadline; no separate staged lifetime.",
+          "Total flight/draft lifetime in milliseconds starting after after_ms; includes model/tool work, waiting for predecessor, fresh observation, optional game guard and activation admission. All must fit before this same deadline; no separate staged lifetime.",
         ),
       })
       .strict(),
   })
   .strict()
   .describe(
-    "Explicit bounded one-shot speculative planning opt-in for this skill root. Omission creates no request. The host binds the newly admitted root identity; matching start retries do not create another lookahead. Staging never authorizes activation without fresh session/life/task/source/precondition validation.",
+    "Explicit bounded one-shot speculative planning opt-in for this skill root. Omission creates no request. The host binds the newly admitted root identity; matching start retries do not create another lookahead. Activation defaults to manual. Automatic continuation requires this Main root-start authorization plus fresh observation, host session/life/task/source checks and any optional game guard.",
   ) satisfies z.ZodType<LookaheadConfig>;
 
 export const lookaheadRequestSchema = lookaheadConfigSchema
@@ -398,7 +406,7 @@ export const skillCapabilitySchema: z.ZodType<SkillCapabilityRequest> =
     z
       .object({
         kind: z.literal("call"),
-        skill: skillRefSchema,
+        skill: namedProgramRefSchema,
         args: jsonSchema,
       })
       .strict(),
@@ -414,6 +422,7 @@ export const skillCapabilitySchema: z.ZodType<SkillCapabilityRequest> =
 function createGameAPIReference() {
   return {
     binding: "game",
+    runtime_version: SKILL_API_VERSION,
     asynchronous: true,
     concurrent_calls: false,
     methods: {
@@ -429,7 +438,7 @@ function createGameAPIReference() {
       },
       call: {
         parameters: [
-          { name: "skill", type: "SkillRef" },
+          { name: "skill", type: "NamedProgramRef" },
           { name: "args", type: "Json" },
         ],
         result: "SkillResult",
@@ -454,7 +463,7 @@ function createGameAPIReference() {
       PlayerLife: z.toJSONSchema(playerLifeSchema),
       GameAction: z.toJSONSchema(gameActionSchema),
       GameActionResult: z.toJSONSchema(gameActionResultSchema),
-      SkillRef: z.toJSONSchema(skillRefSchema),
+      NamedProgramRef: z.toJSONSchema(namedProgramRefSchema),
       SkillResult: z.toJSONSchema(skillResultSchema),
       Json: z.toJSONSchema(jsonSchema),
     },

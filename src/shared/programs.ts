@@ -12,6 +12,13 @@ export interface SkillRef {
   version: number;
 }
 
+export const SKILL_API_VERSION = 3;
+
+export interface NamedProgramRef {
+  name: string;
+  version?: number;
+}
+
 /** Selects same-session, same-model definitions only, never prior execution state. */
 export type WorkingProgramMode = "continue" | "fresh";
 
@@ -53,6 +60,7 @@ export interface SkillView extends SkillRef {
   state: "validated" | "quarantined" | "retired";
   validation: {
     fingerprint: string;
+    runtime_version?: number;
     formatted_lines: number;
     complexity: number;
     nesting: number;
@@ -73,7 +81,7 @@ export interface GameAPI {
   /** Explicit vanilla request through the same exclusive action arbiter. */
   respawn(): Promise<GameActionResult>;
   recipes(item: string): Promise<Json>;
-  call(skill: SkillRef, args: Json): Promise<SkillResult>;
+  call(skill: NamedProgramRef, args: Json): Promise<SkillResult>;
   progress(summary: string, details: Json): Promise<null>;
 }
 
@@ -123,5 +131,5 @@ export type SkillCapabilityRequest =
   | { kind: "respawn" }
   | { kind: "action"; action: GameAction }
   | { kind: "recipes"; item: string }
-  | { kind: "call"; skill: SkillRef; args: Json }
+  | { kind: "call"; skill: NamedProgramRef; args: Json }
   | { kind: "progress"; summary: string; details: Json };

@@ -115,7 +115,7 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>) {
       if (
         generation !== state.generation ||
         (epoch !== undefined && epoch !== run.epoch) ||
-        !["running", "bootstrapping"].includes(run.status)
+        run.status !== "running"
       )
         throw new RuntimeFault("stale_context", "Fixture authority revoked");
       return run;
@@ -138,10 +138,6 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>) {
       run.status = status;
       run.error = message;
       planner.fence();
-    },
-    finishBootstrap: () => {
-      run.status = "running";
-      store.saveRun(run);
     },
   };
   const auth = {
@@ -166,6 +162,7 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>) {
         setBeforeModelCall: (gate: Gate) => {
           fake.gate = gate;
         },
+        setTools: () => {},
         subscribe: (callback: (event: AgentEvent) => void) => {
           listener = callback;
           return () => {
@@ -376,43 +373,24 @@ test("replacement waits for the old request to settle and its auth scope to rele
   expect(fixture.state.pauses).toEqual([]);
 });
 
-test("bootstrap's finite call gate is a normal host stop and opens gameplay once", async () => {
-  const fixture = setup(async (text, agent) => {
-    const context: unknown = JSON.parse(text);
-    const bootstrap =
-      context !== null &&
-      typeof context === "object" &&
-      "phase" in context &&
-      context.phase === "bootstrapping";
-    for (let index = 0; index < (bootstrap ? 3 : 1); index++) {
-      expect(await callGate(agent)).toBeUndefined();
-      agent.emit({});
-    }
-    if (!bootstrap) {
-      fixture.state.pending = true;
-      fixture.planner.admitted();
-    }
+test("host-ready first planning request can admit work without a separate model bootstrap", async () => {
+  const fixture = setup(async (_text, agent) => {
+    expect(await callGate(agent)).toBeUndefined();
+    agent.emit({});
+    fixture.state.pending = true;
+    fixture.planner.admitted();
     const stopped = await callGate(agent);
     expect(stopped?.stop).toBe(true);
     gated(agent, stopped?.reason);
   });
-  fixture.run.status = "bootstrapping";
   await fixture.planner.start(1);
-  const runningTurn = Promise.withResolvers<void>();
-  const unsubscribe = fixture.store.subscribe((event) => {
-    if (
-      event.type === "scheduler.turn_finished" &&
-      fixture.state.prompts === 2
-    ) {
-      unsubscribe();
-      runningTurn.resolve();
-    }
-  });
-  fixture.planner.wake("bootstrap");
-  await runningTurn.promise;
+  const finished = fixture.event("scheduler.turn_finished");
+  fixture.planner.wake("preflight_ready");
+  await finished;
   expect(fixture.run).toMatchObject({ status: "running" });
-  expect(fixture.run.usage.calls).toBe(4);
-  expect(fixture.run.usage.by_purpose.authoring.calls).toBe(3);
+  expect(fixture.run.usage.calls).toBe(1);
+  expect(fixture.state.prompts).toBe(1);
+  expect(fixture.state.pending).toBe(true);
   expect(fixture.run.usage.by_purpose.planning.calls).toBe(1);
   expect(fixture.state.pauses).toEqual([]);
 });

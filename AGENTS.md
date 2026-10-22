@@ -46,6 +46,22 @@
 - Before editing agent instruction files, also read and apply
   `writing-for-agents`.
 
+## Verification and live evaluation
+
+Before selecting checks, diagnosing a live model failure, changing evaluation
+limits or models, or reporting cost/results, read and follow the canonical
+[verification and live-evaluation policy](docs/learning-and-evaluation.md#verification-and-live-evaluation-policy).
+
+- Workers hand off edits without running checks, builds, providers or services.
+  The parent runs the smallest affected checks after handoff and a combined final
+  regression/build only when relevant inputs changed.
+- Preserve platform results and agent outcomes independently. After two
+  unsuccessful live attempts on one technical hypothesis, stop unless concrete
+  new platform evidence authorizes another attempt; a prompt/model change alone
+  does not reset the limit.
+- Record finite limits and actual usage before making claims. Retain failed
+  attempts and unknown costs; never repeat a paid control just to obtain a pass.
+
 ## Animation references
 
 When designing or changing UI animations, strongly consider browsing
@@ -86,6 +102,17 @@ the integration. Use another method only if I request it.
 Before integrating or pushing, fetch `origin/main` and verify fast-forward
 ancestry. If history has diverged, stop and discuss how to proceed rather than
 rewriting or force-pushing shared history.
+
+Before every push, review the exact commit tree and every outgoing commit for
+private files, secrets, and personal information, including newly added files,
+reports, machine-specific paths, and Git author/committer metadata. Keep local
+plans, credentials, auth databases, worlds, raw run evidence, and generated
+artifacts out of the publication; include reports only after reviewing their
+contents as intentionally public. Inspect the staged diff and run a secret
+scanner; `.gitignore` and a clean scan alone are not sufficient. Repeat the
+review if the publication changes. Resolve confirmed findings before pushing;
+if safe publication is uncertain, stop and report the blocker without exposing
+the sensitive data or rewriting shared history.
 
 Delivery is complete only after the push succeeds, including any required Git
 LFS uploads. Report the branch, commit hash, and push result. If publication is

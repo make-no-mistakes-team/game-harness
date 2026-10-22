@@ -1,8 +1,55 @@
 # Learning and evaluation
 
-This document specifies retained experience, useful-play measurement and cold/warm comparisons across game adapters. The repository has program/runtime implementation and old-spike gameplay evidence; the [integration guide](integration-spike.md) separates those results from outstanding native-client, effectiveness and comparison proof. Requirements below are not completed experiment claims. Additional games need their own adapters and evaluation profiles.
+This document specifies retained experience, useful-play measurement and cold/warm comparisons across game adapters. The [integration guide](integration-spike.md) separates scoped native and old-spike evidence from outstanding interface, effectiveness and comparison proof. Requirements below are not completed experiment claims. Additional games need their own adapters and evaluation profiles.
 
-The [PRD](prds/gameharness-v1.0-prd.md) owns product scope and acceptance. The [runtime contracts](runtime-contracts.md) own identifiers, lifecycle states, scheduling, policy activation, observations, and action semantics. [Operations and security](operations-and-security.md) owns isolation, credentials, recovery, and release verification. This document defines the evidence collected through those contracts; it does not create a second control API.
+The [PRD](prds/gameharness-v1.0-prd.md) owns product scope and acceptance. The [runtime contracts](runtime-contracts.md) own identifiers, lifecycle states, scheduling, policy activation, observations, and action semantics. [Operations and security](operations-and-security.md) owns isolation, credentials and recovery. This document owns verification policy and the evidence collected through those contracts; it does not create a second control API.
+
+## Verification and live-evaluation policy
+
+Choose the lowest tier that can answer the changed contract. Higher tiers add evidence; they do not replace cheaper checks or erase earlier failures.
+
+| Tier | Boundary and when to use it | What it cannot establish |
+| --- | --- | --- |
+| Unit | Pure/local deterministic contracts: parsing, schemas, name resolution, policy decisions, accounting and result classification. Use after a change to those rules. | Real storage, isolation, game effects or model behavior. |
+| Integration | Real storage/runtime/sandbox protocol, with external dependencies substituted only at their actual seam. Use for admission, persistence, cancellation, role authority and broker changes. | Native Minecraft behavior or natural-task effectiveness. |
+| Native game | Real Minecraft with production Docker isolation and zero inference. Use for game mechanics, native receipts, lifecycle fences and real planning/admission integration. Mark a synthetic strategic caller explicitly. | Actual model decisions or ordinary gameplay efficacy. |
+| Agent acceptance | An actual selected model receives a natural task through the production interface. Use only when the question requires model behavior, under predeclared finite limits. | General improvement, release readiness or causal savings from one technical control. |
+
+Workers do not run tests, typechecks, formatters, builds, providers or services while edits are in flight. After handoff, the parent runs the smallest affected check. Run one combined final regression/build when relevant source changed; documentation-only work does not require it. Rebuild Java or the UI only when their inputs changed. A previously reported failure is evidence to diagnose, not a reason to rerun the same check for confirmation.
+
+Report `platform_status` independently of `agent_status`, provider status and semantic goal verification, with classification reasons. Correct admission, isolation, cancellation and evidence can pass while the agent fails its task. A failed goal alone is not a platform defect. Conversely, a successful game action does not excuse a platform failure.
+
+### Attempt admission and stopping
+
+Before inference, freeze the discovered model, purpose, technical hypothesis ID, platform-evidence revision, request/time limits, scenario/verifier and source/configuration provenance. All evaluator entry points share durable finite admission limits. Reserve an attempt atomically before inference and settle it with platform and agent outcomes, actual usage and evidence. Interrupted or unresolved reservations remain auditable; a fresh output directory must not reset the ledger.
+
+After **two unsuccessful real live attempts on the same technical hypothesis**, stop and preserve the outcome unless there is **new concrete platform evidence**. A different prompt, model, run directory or fresh conversation alone does not reset the count. An explicit evidence revision needs a reason and a concrete source/schema correction, native artifact or reproducible platform result; it preserves the preceding failures. Inspect existing evidence and use lower tiers before authorizing another live attempt. Do not loop until a preferred PASS appears.
+
+The ledger checks new evidence hashes against the initial baseline and all earlier revisions; moving a report or restoring old bytes is not novelty. A reproduction reference uses a typed platform-failure finding with a reproduction command and hash-matched supporting files, as defined in `policy.ts`. Attribution of a real platform defect remains the operator's judgment; schema/hash checks cannot prove causality. Settle or explicitly interrupt in-flight reservations before authorizing a new revision.
+
+Before changing activation semantics, the parent must complete the deterministic real Fabric/Docker/Runtime/Store manual-planning baseline, with an explicitly synthetic strategic caller and a real isolated guard. Only the parent's baseline result opens the integration-edit gate; a prepared fixture or source inspection does not.
+
+### Model choice, usage and cost-to-result
+
+Luna is the conservative default for ordinary acceptance. GPT-6.1-Sol is authorized for an explicit API-control, comparison or justified higher-capability acceptance question with finite recorded bounds; no silent model fallback is permitted. Select on cost-to-result and the evidence needed, not token price alone. Include unsuccessful attempts when reporting time, requests, usage and estimated cost per result.
+
+Record host request admissions and provider-reported usage messages separately. Actual wire-attempt counts remain unknown when the SDK/provider does not expose them; do not equate admissions or usage messages with transport attempts. Preserve uncached input, cache read/write and output as reported, missing categories, actual action receipts/counts, monotonic measured intervals, overlapping spans, unclassified waiting and omissions.
+
+Catalogue prices are labeled estimates with their source and model descriptor. They are not an invoice, and actual subscription money remains unknown. Missing pricing is unknown, not zero. A cheaper token price does not establish a cheaper successful result.
+
+The single authorized Sol control passed the **old model interface**, not natural gameplay efficacy or current-interface acceptance; its exact scope is in the [integration evidence](integration-spike.md#verification-scope-after-the-published-checkpoint). Do not repeat it automatically. Historical unsuccessful Luna attempts retain their original outcomes.
+
+The later plain wood comparison consumed one Luna and one Sol attempt under one hypothesis; both goals remained unverified and incomplete usage stayed incomplete. That series exhausted the two-unsuccessful-attempt allowance, with no third live attempt authorized. Its [retained outcomes and transport uncertainty](integration-spike.md#bounded-natural-wood-comparison) must not be relabeled after a source correction or used to claim post-fix efficacy.
+
+### Evaluation code and evidence ownership
+
+Reusable evaluation modules live in [`src/evaluation`](../src/evaluation/); runnable entry points belong in `scripts`. `config.ts` freezes actual discovered-model selection and finite caps. `policy.ts` owns durable reservations, settlement and explicit evidence revisions; `paths.ts` keeps that governance state separate from per-run runtime data and compact reports. `scenarios.ts` declares natural tasks/verifiers, `results.ts` classifies outcomes and measured usage/timing, and `tiers.ts` classifies verification and native-artifact freshness. Generated help/entry-point usage and these schemas are authoritative; this guide does not reproduce their DTOs.
+
+`bun run check` now selects typechecking only. `bun run check unit <test-file>` and `bun run check integration <test-file>` select classified narrow suites; omit the file only when the whole tier is relevant. `bun test` remains the broad local aggregation. None of these commands builds Java/UI or grants permission to start a game/provider.
+
+Read `bun run evaluate --help` for tier entry points and explicit native/inference opt-ins. Native tiers require an existing fresh built JAR and stop on a stale artifact rather than rebuilding it. `authorize-evidence` records a justified concrete evidence revision; it is not permission to rename a hypothesis after a prompt/model change.
+
+Native helper/proof code is infrastructure, not a model gameplay library. A synthetic caller or privileged fixture must remain identified in its report. Keep [private evaluation storage](operations-and-security.md#private-evaluation-storage) separate from compact reports; a report does not authorize publishing its private evidence tree.
 
 ## What learning means here
 
@@ -60,9 +107,11 @@ An incompatible artifact is reported as rejected, not silently replaced. Changed
 
 ### Selective retrieval and autonomous promotion
 
-Current program-library tools are `experience_read`, `experience_promote` and `experience_load`, with optional `experience_id` at run creation; their exact boundary is in the [runtime contracts](runtime-contracts.md#current-compact-program-interface). The dotted interfaces in this section specify broader release retrieval/knowledge/history obligations, not callable aliases or a claim of full delivery. At a task/improvement boundary, bounded metadata/card/performance search should precede selective exact-source retrieval. A vector database is not required. Reads stay within the selected compatible model/game/adapter/profile/capability scope and current run-private branch, never another comparison arm or evaluator data.
+Qualified program experience is an on-demand `memory` module disclosed through `help`, not part of the six ordinary verbs. It supports compatible snapshot catalog, fresh named load and explicit evidence-qualified promotion; run creation can separately select an exact experience snapshot. The [runtime contracts](runtime-contracts.md#current-compact-program-interface) and generated help own the interface. Dotted names below describe broader release retrieval/knowledge/history obligations, not callable aliases or completed delivery. At a task/improvement boundary, bounded metadata/card/performance search should precede selective exact-source retrieval. A vector database is not required. Reads stay within selected model/game/adapter/profile/capability scope and the current private branch, never another comparison arm or evaluator data.
 
-The implemented native gate pins trusted `run.adapter` identity (`fabric-owned-client`, game 1.21.4, observation schema 1, profile/preset and skill protocol 1), rejects promotion from old runs lacking that marker, and revalidates canonical source/validator fingerprints on hydration. It does not negotiate native-build or capability hashes. Retain that limitation when reporting compatibility; the fuller manifest requirements below are not an implemented arbitrary-schema protocol.
+Memory catalog pages select the latest durable version per name; named load can request an exact version or resolve latest once. Duplicate names retain their separate immutable snapshot versions rather than forcing a copied opaque ID or silently replacing old payloads.
+
+The native compatibility gate pins trusted `run.adapter` provenance and revalidates canonical source/validator fingerprints on hydration; the [runtime contract](runtime-contracts.md#current-compact-program-interface) owns the current versions. Early native promotion evidence used observation schema 1 and skill protocol 1. Preserve those cohort identities rather than presenting them as current compatibility proof. Native-build/capability-hash negotiation is not implemented; the fuller manifest requirements below do not establish an arbitrary-schema protocol.
 
 The [integration evidence](integration-spike.md#accepted-coherent-root-result-and-useful-promotion) records one actual portable promotion qualified by same-root effects after earlier rejections. A subsequent exact-source warm hydration/invocation blocked with no observable eligible log; a newly authored program later ended in death. Retain that [unfavorable warm attempt](integration-spike.md#exact-warm-attempt-with-blocked-prerequisite-and-death). Promotion plus exact import is limited evidence, not warm task success, generalization or a controlled cold/warm benefit.
 
@@ -92,17 +141,17 @@ An eligible proposal creates a new immutable per-model library snapshot **withou
 
 ## Bootstrap and policy revision
 
-### Equal bootstrap for cold and warm runs
+### Equal startup capabilities for cold and warm runs
 
 Both conditions receive the same task, capability descriptions, permitted reference access, policy-authoring tools, and explanation of inference latency. The explanation may describe runtime behavior; it must not supply game tactics. Cold does not disable programming, documentation, Jev, or any policy tool.
 
-The initial configurable engineering default is a maximum of **3 strategic calls or 60 seconds elapsed, whichever comes first**. This is a reliability bound, not measured sufficiency, a user-imposed threshold, or a financial cap. Count a new strategic decision as one logical call; retain every provider attempt and retry separately. Retries do not reset the elapsed cap. A request still pending at expiration cannot extend bootstrap or activate a late result without the normal runtime admission rules.
+Host preflight owns readiness and fresh authoritative state before ordinary scheduling; there is no mandatory multi-request model bootstrap. Earlier cohorts' three-call/60-second phase remains historical evidence, not a current quota. Freeze actual finite request/time limits equally across comparison arms. Retain logical requests and exposed provider attempts separately; retries do not reset an allowance.
 
 A warm snapshot may contain a model-authored startup bundle naming exact compatible policy versions, task/profile applicability, and required capabilities. The host checks source hashes, compatibility, isolation, and present applicability, then rehydrates eligible entries through the ordinary fenced activation path. Reuse cached validation only when source, runtime, isolation, adapter, profile/version/configuration fingerprint, interface/schema, and relevant server permissions/configuration match; otherwise reassess compatibility, revalidate, and record the result. Already evidenced tactics need not be regenerated or retrialed merely because the process restarted under unchanged conditions. Activation permits no effects until current observations and preconditions allow them.
 
-Startup context contains a bounded index, selected bundle, and summaries; unselected programs stay behind selective `experience.search`/`experience.get` retrieval. The bundle selection was authored by the model, not by a handwritten tactical runtime rule. A compatible bundle can activate with **zero strategic authoring calls**. Missing or inapplicable entries visibly use normal bootstrap, with no silently swapped library or developer fallback.
+Startup context contains a bounded index and applicable selected summaries; unselected programs stay behind selective retrieval. The broader release bundle selection is model-authored, not a handwritten tactical rule. Compatible selections can need **zero strategic authoring calls**. Missing or inapplicable entries visibly use ordinary authoring, without a silently swapped library or developer fallback.
 
-A cold run starts with an empty inherited library and may create candidates within the same allowance. Warm may inspect, select, or revise inherited artifacts. Per-model allowances may be calibrated in practice, then frozen equally across matched arms; three calls/60 seconds is not a universal adequacy claim. Log snapshot/bundle identities, actual logical calls and provider attempts, retrievals, validation/cache decisions, rehydration, activation, first effect, rejected entries, and elapsed time. Validation failures and retries do not restart the allowance. If no usable runtime-valid policy exists at expiration, gameplay starts visibly with no policies.
+A cold run starts with an empty inherited library and may create candidates; warm may inspect, select or revise inherited artifacts. Per-model allowances may be calibrated in practice, then frozen equally across matched arms. Log snapshot/bundle identities, logical calls and exposed attempts, retrieval, validation/cache, hydration, activation, first effect, rejected entries and elapsed time. Policy absence is explicit and does not prevent ordinary program gameplay.
 
 ### Runtime validity is not behavioral success
 
@@ -191,9 +240,9 @@ Use canonical event fields from the [runtime contracts](runtime-contracts.md): U
 
 | Metric | Start and end | Reporting rule |
 | --- | --- | --- |
-| Startup elapsed | Accepted start request to connected, observed, control-ready player session immediately before bootstrap | Include actual launch/connect/setup delay; identify already-running services and exclude one-time installation from this metric |
-| Bootstrap elapsed | Entry into `bootstrapping` to entry into gameplay `running` | Include inference, validation, and any idle within the bootstrap allowance; report calls and attempts alongside time |
-| Time to gameplay | Accepted start request to first gameplay `running` | Startup plus bootstrap and any intervening lifecycle delay; do not double-count these intervals |
+| Startup elapsed | Accepted start request to connected, observed, control-ready player session | Include actual launch/connect/setup/preflight delay; identify already-running services and exclude one-time installation |
+| Bootstrap elapsed, historical/explicit phase only | Actual entry into `bootstrapping` to entry into `running` | Retain the earlier phase's inference/validation/idle and request evidence; do not fabricate it for current host-preflight runs |
+| Time to gameplay | Accepted start request to first `running` | Include actual startup and any distinct preparation/lifecycle interval without double counting; first confirmed effect remains separate |
 | Strategic decision latency | Admission of one logical strategic request to usable final output or terminal failure | Report queue time separately from provider attempts; retain attempt start, first token if available, final result, retry, and failure timing |
 | Runtime dispatch latency | Eligible action proposal received by executor to first corresponding adapter effect dispatch | Separate lease/cancellation wait from executable dispatch; do not count an entire long action as dispatch latency |
 | Policy reaction latency | Relevant observation admitted for policy evaluation to executor admission of its usable proposal | Report local-code and Jev/AI backends separately; retain provider and executor components and rejected/expired responses |
@@ -224,9 +273,9 @@ Classify apparent pauses from measured `native_action`, `dispatch`, `receipt`, `
 
 Compare actual confirmed block removals, receipted own inventory deltas, target-ID and target-position switches, sampled/receipted travel and rotation, timings, outcomes and sample counts. Extra blocks are not categorically waste: enabling access, movement and other legitimate work can require them. Do not infer tree membership from unrelated target handles or label a target change mistaken without authorized evidence.
 
-Durable deduplicated death/failure/outcome opportunities reach the same strategic model. The model selects `revise`, `keep` or `insufficient_evidence` with source-event references, authors code itself and links exact parent/candidate versions. A changed version is an unmeasured candidate until execution evidence exists. `version_compare` exposes actual source/card differences and before/after raw samples with `descriptive_only_no_causal_improvement_claim`; even measured candidates are not automatically proven better. Missing samples and trace omissions remain visible.
+Durable deduplicated death/failure/outcome opportunities reach the same strategic model. It inspects named source/feedback/trace through `program_inspect`, authors its own candidate and uses `program_write` with exact `based_on` plus a bounded experiment `reason` to link the actual revision to matching parent feedback. The host supplies exact evidence identities. If no revision is chosen, `program_review` records `keep` or `insufficient_evidence` with the reason; no bookkeeping-only second inference is required for a performed revision.
 
-The generic current procedure is to retrieve the opportunity and exact parent evidence, author a candidate through `skill_revise`, optionally conduct a bounded trial while the goal is unsatisfied, and inspect available version-comparison samples. Resolve a chosen/performed candidate experiment with `decision:"revise"` and its exact revision reference; the reason may explicitly say efficacy is unproven and identify it as measured or unmeasured. If no revision is chosen, use `keep` or `insufficient_evidence` with `revision:null`. These decision values encode the disposition, not confidence in improvement. Eligibility and promotion remain separate; invalid combinations return actionable errors rather than being coerced or persisted.
+A changed version is an unmeasured candidate until execution evidence exists. The comparison view exposes actual source/card differences and before/after raw samples with `descriptive_only_no_causal_improvement_claim`; even measured candidates are not automatically proven better. Decisions record experimental disposition, not confidence in improvement. Eligibility and promotion remain separate; missing samples, invalid linkage and trace omissions remain explicit.
 
 If the task remains unsatisfied, the model may revise and retry through ordinary bounded admission. After verified goal success, a single bounded effect-free review can inspect evidence and author linked candidates before completion, but cannot conduct extra gameplay trials. Goal closure retains the healthy game session. Optional bounded lookahead records actual overlap, validation/rejection/activation and usage; only fresh session/life/task/predecessor/source checks can activate it. Neither overlap nor the historical 31/13/7-call receipts establishes controlled efficiency or causal savings.
 
@@ -300,6 +349,18 @@ For each revision, report matched, predeclared before/after windows with observa
 
 Use real end-to-end play under the selected profile's ordinary starting conditions to discover whether skills and policies help. Declare bounded tasks, sustained progression, and any long-horizon objective separately. A game need not have a single terminal completion state. Report workflow readiness and verified task outcomes independently; successful orchestration does not establish game completion, and an unfinished long-horizon objective does not erase evidence of a working workflow.
 
+The bounded natural-task definitions live in [`src/evaluation/scenarios.ts`](../src/evaluation/scenarios.ts):
+
+| Scenario | Model task | Predeclared semantic evidence |
+| --- | --- | --- |
+| `collect_wood` | Collect wood. | Fresh alive own-inventory gain of an eligible wood/log/stem/hyphae item over the run baseline. |
+| `craft_crafting_table` | Craft a crafting table. | A successful craft with a confirmed positive native inventory receipt, plus a fresh alive observation retaining the table. Possession alone is insufficient. |
+| `obtain_stone` | Obtain a stone or cobblestone item. | Fresh alive own-inventory gain of stone or cobblestone over the run baseline. A visible block or removal alone is insufficient. |
+
+Each case starts in its own ordinary isolated Normal Survival world with ordinary terrain/inventory, without console cheats, a flat arena, supplied resources or evaluator-authored gameplay code. Tasks do not prescribe a program count, planner/tool sequence, predicate, fixed sleep or copied IDs. Declare verifier and finite limits before inference, retain the bounded sample including failures, and do not tune the backend merely to win. Cross-model comparisons retain declared conditions and label any uncontrolled differences. These scenario definitions are implementation, not new run results.
+
+[`scripts/agent-acceptance.ts`](../scripts/agent-acceptance.ts) uses actual `AuthManager` discovery and an existing private application auth store opened in place, without login/logout, credential copying, account fallback or a synthetic strategic caller. It requires explicit native/inference permission, hypothesis and evidence revision; nonordinary model selection also requires purpose/justification. Natural goals are not an `api_control` purpose. Full evidence stays in external private runtime storage and compact evaluation reports remain private by default. The entry point and `evaluate --help` own current arguments.
+
 Practice and gameplay-effect experiments use fresh ordinary environments, not staged training arenas. Controlled security fixtures and synthetic/replayed event fixtures may check infrastructure correctness, such as observation filtering or stale-result rejection. They do not demonstrate tactical effectiveness, transferred learning, or end-to-end task completion, and their coordinates/tactics cannot enter reusable experience. The [structured-observation and navigation proof](operations-and-security.md#structured-observation-and-navigation) covers behind-camera/range behavior, hidden then legitimately revealed ore with Anti-Xray disabled, hidden/revealed/reconcealed entities and stale memory, legitimate coarse audio, generated-code/alternate-endpoint bypass attempts, private local navigation reads/effects, unknown-target probes, and path/error/count leakage. Keep privileged raw diagnostics evaluator-only; optionally repeat on a pinned Paper configuration with its changed raw-data expectations recorded. Video/event replay is evidence playback; deterministic environment rewind exists only if an adapter explicitly supports and establishes it.
 
 ### Environment separation and leakage controls
@@ -368,7 +429,7 @@ Practice and evaluation start from fresh ordinary spawn with ordinary starting i
 
 The trusted Minecraft verifier establishes these predicates from authoritative game evidence, isolated from agent observations. If the dragon is not defeated, report the furthest verified milestone, elapsed exposure, deaths, interventions, failure causes, and remaining objective. A bounded task does not substitute for the Dragon objective; workflow readiness and full-completion status must remain separately reportable.
 
-Use evaluator-owned seed groups for practice, comparison, and held-out evaluation under the separation rules above. The initial engineering sampling setting is **3 comparison seeds and 3 fresh repetitions per seed per condition** for the early-progression task. This gives **9 cold and 9 warm attempts**; it is a small engineering comparison, not a statistical-power claim. Freeze actual seed values, order, and per-run horizon before execution. Hidden seed values may remain withheld during held-out evaluation, but retain them for later reproducibility.
+Use evaluator-owned seed groups for practice, comparison and held-out evaluation under the separation rules above. An eventual release comparison must predeclare its sample, seed groups, order and per-run horizon; no historical sampling proposal authorizes an immediate live batch. Current engineering acceptance follows the [shared attempt and stopping policy](#attempt-admission-and-stopping). Hidden seed values may remain withheld during held-out evaluation, but retain them privately for reproducibility.
 
 A seed reproduces starting terrain, not model outputs, spawn-time scheduling, entity behavior, or every game event. Preserve the clean initial save and environment manifest for each pair. The evaluator may copy the initial ordinary spawn state; it must not stage items, mobs, prepared combat encounters, or favorable terrain. Each restored comparison copy is a new run/world lineage. Neither seed lookup nor maps from another world may enter the agent's tools, retrieval, or reusable library.
 

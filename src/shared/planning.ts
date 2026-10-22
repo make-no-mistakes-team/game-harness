@@ -23,6 +23,8 @@ export interface PlanningContext extends PlanningScope {
 export interface LookaheadConfig {
   after_ms: number;
   reason: string;
+  /** Only the Main root-start decision can authorize a one-use automatic continuation. */
+  activation?: "manual" | "on_predecessor_success";
   budget: {
     calls: number;
     tools: number;
@@ -38,8 +40,8 @@ export interface StagePlanRequest {
   skill: SkillRef;
   args: Json;
   limits: SkillLimits;
-  /** Original model-authored async(context,state) body; must return boolean. */
-  precondition_source: string;
+  /** Optional model-authored async(observation,args) body; must return a strict boolean. */
+  guard_source?: string;
 }
 export interface StageCorrection {
   plan_id: string;
@@ -50,7 +52,7 @@ export interface StageCorrection {
   deadline_at: string;
 }
 export type PlanState = "armed" | "planning" | "staged" | "validating" | "activated" | "rejected" | "invalidated" | "expired" | "empty";
-export type PlanRejectReason = "session_changed" | "life_changed" | "task_changed" | "predecessor_changed" | "predecessor_unsuccessful" | "predecessor_pending" | "predecessor_already_settled" | "source_changed" | "precondition_failed" | "precondition_error" | "budget_exhausted" | "deadline" | "cancelled" | "already_activated" | "not_staged" | "admission_failed";
+export type PlanRejectReason = "session_changed" | "life_changed" | "task_changed" | "predecessor_changed" | "predecessor_unsuccessful" | "predecessor_pending" | "predecessor_already_settled" | "source_changed" | "guard_failed" | "guard_error" | "budget_exhausted" | "deadline" | "cancelled" | "already_activated" | "not_staged" | "admission_failed";
 export interface PlanProjection {
   plan_id: string;
   state: PlanState;
@@ -59,7 +61,14 @@ export interface PlanProjection {
   intent: string;
   basis: PlanningContext;
   candidate: PlanningSource | null;
-  precondition_hash: string | null;
+  guard_hash: string | null;
+  /** Omission is not a fabricated successful guard evaluation. */
+  guard_status: "omitted" | "pending" | "passed" | "failed" | "error";
+  activation: "manual" | "on_predecessor_success";
+  activation_permit: "not_authorized" | "available" | "consumed" | "revoked";
+  activation_trigger: "manual" | "automatic" | null;
+  /** Set only by the trusted post-worker/action-drain closure notification. */
+  predecessor_closed: boolean;
   deadline_at: string;
   budget: LookaheadRequest["budget"];
   calls: number;

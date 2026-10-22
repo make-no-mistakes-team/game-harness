@@ -4,7 +4,7 @@ import { parse, version as acornVersion } from "acorn";
 import { format, version as prettierVersion } from "prettier";
 import { z } from "zod";
 import type { SkillLimits, SkillSpec, SkillView } from "../shared/programs.ts";
-import { MAX_SKILL_LIMITS } from "../shared/programs.ts";
+import { MAX_SKILL_LIMITS, SKILL_API_VERSION } from "../shared/programs.ts";
 
 export const PROGRAM_LIMITS = Object.freeze({
   source_bytes: 16384,
@@ -241,8 +241,8 @@ function identifierIsReference(
   return node.type === "Identifier";
 }
 
-function parseBody(source: string, kind: "skill" | "policy") {
-  const parameters = kind === "skill" ? "game, args" : "context, state";
+function parseBody(source: string, kind: "skill" | "policy" | "guard") {
+  const parameters = kind === "skill" ? "game, args" : kind === "guard" ? "observation, args" : "context, state";
   const prefix = `async function __gameharness_program(${parameters}) {\n"use strict";\n`;
   const wrapped = `${prefix}${source}\n}\n`;
   const locate = (position: number) => {
@@ -306,7 +306,7 @@ function parseBody(source: string, kind: "skill" | "policy") {
   return { fn, body: fn.body, wrapped, locate };
 }
 
-function analyze(source: string, kind: "skill" | "policy") {
+function analyze(source: string, kind: "skill" | "policy" | "guard") {
   const parsed = parseBody(source, kind);
   const issues: ProgramValidationIssue[] = [];
   let maximumComplexity = 1;
@@ -417,9 +417,9 @@ function analyze(source: string, kind: "skill" | "policy") {
 // Static admission checks do not replace the isolated execution sandbox.
 export async function validateProgramSource(
   source: unknown,
-  kind: "skill" | "policy",
+  kind: "skill" | "policy" | "guard",
 ): Promise<ValidatedProgramSource> {
-  if (kind !== "skill" && kind !== "policy") {
+  if (kind !== "skill" && kind !== "policy" && kind !== "guard") {
     throw new ProgramValidationError([
       issue("invalid_kind", "Unsupported program kind."),
     ]);
@@ -523,6 +523,7 @@ export async function validateProgramSource(
     JSON.stringify({
       validator: 1,
       kind,
+      ...(kind === "skill" ? { skill_api: SKILL_API_VERSION } : {}),
       parser: acornVersion,
       formatter: prettierVersion,
       formatterOptions,
@@ -537,6 +538,7 @@ export async function validateProgramSource(
     hash,
     validation: {
       fingerprint,
+      ...(kind === "skill" ? { runtime_version: SKILL_API_VERSION } : {}),
       formatted_lines: lines,
       complexity: analysis.complexity,
       nesting: analysis.nesting,

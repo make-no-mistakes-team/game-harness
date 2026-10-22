@@ -20,7 +20,12 @@ afterEach(async () => {
   }
 });
 
-test("a real running root continues during read-only lookahead selecting a preregistered candidate, then fresh plan passes real admission", async () => {
+for (const scenario of [
+  { activation: "manual", order: "stage_first" },
+  { activation: "on_predecessor_success", order: "stage_first" },
+  { activation: "on_predecessor_success", order: "closure_first" },
+] as const) {
+test(`real durable ${scenario.activation} admission after ${scenario.order} preserves running predecessor and fresh game guard`, async () => {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-plan-admission-"));
   const store = new Store(directory);
   const run: StoredRun = {
@@ -95,8 +100,11 @@ test("a real running root continues during read-only lookahead selecting a prere
       } : null;
     },
     skill: (ref) => store.skill(run.run_id, ref), observe,
-    evaluatePrecondition: async (_source, context) => {
-      expect(context).toMatchObject({ observation: { observation_seq: 2 }, predecessor: { execution_id: rootId, status: "succeeded" } });
+    evaluateGuard: async (_source, observation, args) => {
+      expect(observation.observation_seq).toBe(2);
+      expect(args).toBeNull();
+      expect(observation).not.toHaveProperty("predecessor");
+      expect(observation).not.toHaveProperty("task");
       return true;
     },
     admit: async (request, permit) => { permit.assertCurrent(); return manager.start(run.run_id, request); },
@@ -113,7 +121,7 @@ test("a real running root continues during read-only lookahead selecting a prere
     skill_id: rootSource.skill_id, version: rootSource.version, start_key: "predecessor",
     session_id: "session", life_id: 1, epoch: 1, args: "predecessor",
     limits: { duration_ms: 10_000, max_actions: 1, max_calls: 2, max_depth: 1 },
-    lookahead: { after_ms: 0, reason: "Independent follow-up", budget: { calls: 2, tools: 4, duration_ms: 10_000 } },
+    lookahead: { after_ms: 0, reason: "Independent follow-up", activation: scenario.activation, budget: { calls: 2, tools: 4, duration_ms: 10_000 } },
   };
   expect(() => manager.start(run.run_id, {
     ...rootRequest,
@@ -134,16 +142,25 @@ test("a real running root continues during read-only lookahead selecting a prere
   continueRoot.resolve(); await continued.promise;
   expect(manager.get(run.run_id, { execution_id: rootId })?.status).toBe("running");
   expect(sequence).toBe(1);
+  const rootClosed = Promise.withResolvers<void>(); closed.set(rootId, rootClosed.resolve);
+  if (scenario.order === "closure_first") {
+    finishRoot.resolve(); await rootClosed.promise;
+    expect(planner.projection()).toMatchObject({ predecessor_closed: true, state: "planning", planning_active: true });
+    expect(store.skillExecutions(run.run_id)).toHaveLength(1);
+  }
   await planner.stage({
     plan_id: draft.plan_id, skill: { skill_id: candidate.skill_id, version: candidate.version },
     args: null, limits: { duration_ms: 10_000, max_actions: 1, max_calls: 2, max_depth: 1 },
-    precondition_source: 'return context.observation.life.status === "alive";',
+    guard_source: 'return observation.life.status === "alive";',
   });
   planner.finish(draft.plan_id);
-  expect(store.skillExecutions(run.run_id)).toHaveLength(1);
-  const rootClosed = Promise.withResolvers<void>(); closed.set(rootId, rootClosed.resolve);
-  finishRoot.resolve(); await rootClosed.promise;
-  const activated = await planner.activate(draft.plan_id);
+  if (scenario.order === "stage_first") {
+    expect(store.skillExecutions(run.run_id)).toHaveLength(1);
+    finishRoot.resolve(); await rootClosed.promise;
+  }
+  const activated = scenario.activation === "manual"
+    ? await planner.activate(draft.plan_id)
+    : (await planner.pendingActivation(rootId))!;
   expect(activated).toMatchObject({ state: "activated", observation_seq: 2 });
   const nextId = activated.activation_execution_id!;
   const next = manager.get(run.run_id, { execution_id: nextId });
@@ -151,3 +168,4 @@ test("a real running root continues during read-only lookahead selecting a prere
   expect(store.skillExecutions(run.run_id)).toHaveLength(2);
   expect(unsafe).toEqual([]);
 });
+}

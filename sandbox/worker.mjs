@@ -104,9 +104,10 @@ function runPolicyThread() {
   const post = parentPort.postMessage.bind(parentPort);
   const exit = process.exit.bind(process);
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+  const guard = workerData.binding === "guard";
   const evaluate = new AsyncFunction(
-    "context",
-    "state",
+    guard ? "observation" : "context",
+    guard ? "args" : "state",
     '"use strict";\n' + workerData.source,
   );
   let busy = false;
@@ -116,7 +117,9 @@ function runPolicyThread() {
     Promise.resolve()
       .then(async () => {
         const state = message.state;
-        const decision = await evaluate(message.context, state);
+        const decision = guard
+          ? await evaluate(message.context.observation, message.context.args)
+          : await evaluate(message.context, state);
         // Serialization also runs off the supervisor thread: getters/toJSON can loop.
         const encodedState = stringify(state);
         if (encodedState === undefined || byteLength(encodedState) > MAX_STATE)
@@ -439,7 +442,7 @@ function runSupervisor() {
       expected = "compiled";
       watchdog = setTimeout(fail, 1000);
       thread = new Worker(new URL(import.meta.url), {
-        workerData: { source: message.source },
+        workerData: { source: message.source, binding: message.binding },
         stdout: true,
         stderr: true,
         resourceLimits: { maxOldGenerationSizeMb: 48, stackSizeMb: 2 },

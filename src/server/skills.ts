@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { z } from "zod";
 import type {
   GameAction,
   GameActionResult,
@@ -21,14 +20,12 @@ import {
   skillResultSchema,
 } from "../shared/validation.ts";
 import { validateSkill } from "./program-validation.ts";
+import { SKILL_API_VERSION } from "../shared/programs.ts";
 import { SkillCleanupError, type SandboxService } from "./sandbox.ts";
 import type { Store } from "./store.ts";
 import type { LookaheadConfig } from "../shared/planning.ts";
 import { ExecutionTrace } from "./execution-trace.ts";
-export const skillLookupSchema = z.union([
-  z.object({ execution_id: z.string().min(1).max(160) }).strict(),
-  z.object({ start_key: z.string().min(1).max(160) }).strict(),
-]);
+import { RuntimeFault } from "./runtime-fault.ts";
 export interface SkillHost {
   authorize(runId: string, epoch: number, sessionId: string, lifeId: number): void;
   observe(): Promise<Observation>;
@@ -145,6 +142,8 @@ export class SkillManager {
       const dependency = this.store.skill(runId, ref);
       if (dependency.state !== "validated")
         throw new Error("Dependency is not validated");
+      if (dependency.validation.runtime_version !== SKILL_API_VERSION)
+        throw new RuntimeFault("precondition_failed", "Dependency uses an incompatible skill API; retained source is inspectable but cannot execute");
       for (const nested of dependency.dependencies) visit(nested, depth + 1);
     };
     for (const dependency of dependencies) visit(dependency, 2);
@@ -162,6 +161,9 @@ export class SkillManager {
       throw new Error("This program host does not provide speculative planning");
     const skill = this.store.skill(runId, parsed);
     if (skill.state !== "validated") throw new Error("Skill is not validated");
+    if (skill.validation.runtime_version !== SKILL_API_VERSION)
+      throw new RuntimeFault("precondition_failed", "Program uses an incompatible skill API; retained source is inspectable but cannot execute");
+    this.validateDependencies(runId, skill.dependencies);
     const admitted = this.store.admitSkill(runId, parsed);
     if (admitted.created) {
       const live = this.dispatch(admitted.view, skill, null);
@@ -338,11 +340,11 @@ export class SkillManager {
         );
         this.live.delete(view.execution_id);
         parent?.children.delete(live);
-        this.host.changed(live.root === live, view);
         if (live.cleanupFailure) throw live.cleanupFailure;
       }
     });
-    void live.done.catch(() => this.host.unsafe());
+    void live.done.then(() => this.host.changed(live.root === live, view))
+      .catch(() => this.host.unsafe());
     this.host.changed(false);
     return live;
   }
@@ -480,23 +482,23 @@ export class SkillManager {
           result = null;
           break;
         case "call": {
-          if (
-            !skill.dependencies.some(
-              (ref) =>
-                ref.skill_id === request.skill.skill_id &&
-                ref.version === request.skill.version,
-            )
-          )
-            throw new Error("Undeclared exact dependency");
+          const declared = skill.dependencies.map((ref) => this.store.skill(live.view.run_id, ref))
+            .filter((dependency) => dependency.name === request.skill.name &&
+              (request.skill.version === undefined || dependency.version === request.skill.version));
+          if (declared.length !== 1)
+            throw new Error("Undeclared or ambiguous named dependency; calls resolve only the parent's pinned exact declarations");
           if (live.depth >= live.root.view.limits.max_depth)
             throw new Error("Root composition depth exhausted");
-          const dependency = this.store.skill(live.view.run_id, request.skill);
+          const dependency = declared[0]!;
           if (dependency.state !== "validated")
             throw new Error("Dependency no longer validated");
+          if (dependency.validation.runtime_version !== SKILL_API_VERSION)
+            throw new Error("Dependency skill API is incompatible");
           const admitted = this.store.admitSkill(
             live.view.run_id,
             {
-              ...request.skill,
+              skill_id: dependency.skill_id,
+              version: dependency.version,
               start_key: `child_${randomUUID()}`,
               epoch: live.view.epoch,
               session_id: live.view.session_id!,

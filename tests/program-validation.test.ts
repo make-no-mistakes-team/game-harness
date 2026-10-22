@@ -77,13 +77,13 @@ test("all executable line, block and template-expression comments are rejected w
   }
 });
 
-test("async bodies can observe, await local helpers, and compose exact skill references", async () => {
+test("async bodies can observe, await local helpers, and compose named dependencies", async () => {
   const admitted = await validateSkill(
     specification(`
 async function inspect() { return await game.observe(); }
 const observation = await inspect();
 await game.progress("Observed", {present: Boolean(observation)});
-return await game.call({skill_id: "child-skill", version: 3}, args);
+return await game.call({name: "child", version: 3}, args);
 `),
   );
   expect(admitted.source).toContain("await game.observe()");

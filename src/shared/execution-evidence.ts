@@ -57,7 +57,7 @@ export interface ImprovementFeedbackCursor {
   execution_seq: number;
 }
 export const IMPROVEMENT_RESOLUTION_HELP =
-  "Use revise to record a chosen or performed model-authored candidate experiment or code change, with its exact revision reference. Revise does not claim verified improvement, adoption, or promotion. Candidates may be unmeasured; measured trials can remain inconclusive. Keep and insufficient_evidence require revision:null. Explain uncertainty in reason and link actual evidence event IDs.";
+  "Use program_review to record keep or insufficient_evidence for a named version's latest matching outcome. Link an actual direct-child code-change experiment through program_write with based_on and reason; the host captures exact source and evidence references. An internal revise assessment records that candidate experiment, not verified improvement, adoption or promotion. Candidates may be unmeasured and measured trials may remain inconclusive. Explain the evidence limits in reason.";
 export interface ImprovementOpportunity {
   opportunity_id: string;
   run_id: string;

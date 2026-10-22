@@ -17,10 +17,9 @@ The current reference host is Linux x64 with:
 
 On the reference Linux host the official Launcher keeps the selected account's bearer in the unlocked GNOME Secret Service, while its account JSON may intentionally contain a blank token. A one-shot system-Python helper selects `activeAccountLocalId` and its exact `localId` token key through a private pipe; the trusted launcher verifies that the official Minecraft profile matches that account. It does not fall back to another account, unlock the keyring, read unrelated applications' secrets or print/store bearer values. Refresh the official Launcher login if the legitimate grant is unavailable. This narrow OS-keyring helper is not part of gameplay or the agent runtime.
 
-Before the first launch, add `/local/` to this checkout's `.git/info/exclude`. This is a local exclusion, deliberately not a change to the shared `.gitignore`:
+Before the first launch, keep private application data outside public source and locally exclude any retained in-checkout private data.
 
 ```sh
-printf '\n/local/\n' >> .git/info/exclude
 bun install --frozen-lockfile
 docker pull node:24-bookworm-slim@sha256:a5f4366e834695d5f363b920c104953a535d3a9864d1bdf74566a0ebe01daee5
 bun run build
@@ -73,11 +72,11 @@ The native adapter also uses authenticated own-inventory receipts after vanilla 
 
 The promotion gate requires `inventory_receipt_confirmed:true` with trusted own before/after counts, and the useful predicate event must fall inside the closed root's bounded interval. Trusted task verification can attribute delayed pickup to an exact craft/dig target within that interval; later pickup cannot retroactively qualify an ended root. Trusted-goal cancellation can close an eligible root without pretending self-completion. Model assertions/local prediction are insufficient. Warm hydration preserves exact refs/source and freshly matching canonical-validation fingerprints.
 
-For program authoring, `capabilities_read.game_api` supplies the lazy host-validator-derived method/schema reference; the canonical `GameAPI` lives in [`src/shared/programs.ts`](../src/shared/programs.ts). Inventory fields are `name`, `display_name`, `count`, `slot`, not `.item`. Static syntax/compactness validation does not prove DTO field correctness. See the [runtime contract](runtime-contracts.md#current-compact-program-interface) rather than maintaining a second copied API declaration.
+For program authoring, `help` topic `game` supplies the lazy host-validator-derived API reference, and topic `programs` supplies named workspace contracts. The canonical `GameAPI` lives in [`src/shared/programs.ts`](../src/shared/programs.ts). Inventory fields are `name`, `display_name`, `count`, `slot`, not `.item`. Static syntax/compactness validation does not prove DTO field correctness. See the [runtime contract](runtime-contracts.md#current-compact-program-interface) rather than maintaining a second copied API declaration. Host preflight checks readiness and captures authoritative state; the model need not spend several requests confirming host-known facts.
 
 ## Local data and configuration
 
-Desktop storage defaults to Electron's `userData/runtime`. `GAMEHARNESS_DATA_DIR` explicitly selects another root, including a retained old-spike directory. The direct backend's default is `local/runtime/`. Keep the whole tree private:
+Desktop storage defaults to Electron's `userData/runtime`. `GAMEHARNESS_DATA_DIR` explicitly selects another root, including a retained old-spike directory. Set it to a private external directory for direct-backend operation; the implementation's legacy checkout-local default is not a share directory. Keep the whole tree private:
 
 | Location relative to the data root | Contents |
 | --- | --- |
@@ -94,11 +93,13 @@ Configuration is read from the launching process:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GAMEHARNESS_DATA_DIR` | Electron `userData/runtime`; direct backend `local/runtime` | Trusted private storage root; prefer an absolute override. |
+| `GAMEHARNESS_DATA_DIR` | Electron `userData/runtime`; legacy checkout-local direct-backend default | Trusted private storage root; use an absolute external override for direct-backend operation. |
 | `GAMEHARNESS_PORT` | Desktop `0` (dynamic); direct backend `4317` | Owned loopback backend port. |
 | `GAMEHARNESS_MINECRAFT_PORT` | `25565` | Managed server's loopback listening port. |
 
 If you choose another in-repository data directory, exclude it locally before launch too. An exclusion does not untrack files already committed, secure a backup, or redact an export. Never publish auth databases, device codes, login URLs, tokens, raw server logs, worlds, or privileged evaluator records. Do not move an open SQLite database by copying only its main file; WAL sidecars may hold live data.
+
+Evaluation commands use a separate [external runtime/governance and compact-report layout](operations-and-security.md#private-evaluation-storage); they do not silently change application storage. Preserve historical worlds/reports unchanged and keep private evidence out of public source.
 
 ## Inspecting source and live evidence
 
@@ -165,7 +166,53 @@ Policy containers have a separate cleanup owner: the detached host `sandbox/guar
 
 ## Recorded integration results and remaining gates
 
-Everything in this history retains its original cohort and outcome. The schema-2/r2 cutover supersedes terminal-death, client-exit-on-run-stop and saved-dead startup respawn behavior in the older reports. Their source/build/fixture/gameplay numbers do not certify the new lifecycle, motor, trace, learning or planning paths. The 31/13/7-call receipts and the operator's slow-camera, roughly five-second-pause and target-switch observations are not a controlled efficiency comparison or an explanation of model intent; exact unprovided run details remain unknown.
+Everything in this history retains its original cohort and outcome. References to work or runs pending at an earlier stage describe that stage, not current instructions or authorization to repeat it. The schema-2/r2 cutover supersedes terminal-death, client-exit-on-run-stop and saved-dead startup respawn behavior in the older reports. Their source/build/fixture/gameplay numbers do not certify the new lifecycle, motor, trace, learning or planning paths. The 31/13/7-call receipts and the operator's slow-camera, roughly five-second-pause and target-switch observations are not a controlled efficiency comparison or an explanation of model intent; exact unprovided run details remain unknown.
+
+### Verification scope after the published checkpoint
+
+The named-program interface cutover is separate from the published `915c85c` checkpoint. Implementation and prepared fixtures do not establish a new full proof. Use the canonical [four-tier verification, model and stopping policy](learning-and-evaluation.md#verification-and-live-evaluation-policy), and report exact parent-owned results for the new source cohort before claiming it passed.
+
+The single authorized GPT-6.1-Sol control subsequently passed the **old interface**: **10 host admissions / 10 reported usage messages**, real predecessor work during inference, staging, fresh validation, explicit main activation and successful follow-up. Cleanup was confirmed and the custom goal remained unverified. This is a technical API-control result, not ordinary gameplay efficacy, promotion, causal efficiency or acceptance of the new interface. It does not erase the unsuccessful Luna attempts, and it must not be repeated automatically.
+
+Before the continuation cutover, the parent verified the real Fabric/Docker/Runtime/Store **manual-planning baseline** in **86.41 seconds**. All three cases passed: `current_manual_planning_positive`, `false_predicate` and `stop_revokes`; report, resource cleanup and runtime cleanup were true, with no cleanup errors and `baseline_gate:BASELINE_PASS`. The fixture used an explicitly synthetic strategic caller, a real isolated predicate, **zero provider/Jev calls and no experience**, with the unchanged `f376…` native artifact. This opens the integration-edit gate; it proves the exercised old manual path, not the new named interface, automatic continuation or gameplay efficacy.
+
+The parent reported these focused evaluation checks, all with zero failures:
+
+| Exercised boundary | Tests / assertions | Scope and elapsed |
+| --- | --- | --- |
+| Policy/config/tiers | 17 / 143 | Three files, 925 ms; precedes the pagination-cap correction. |
+| Pagination-cap boundary | 6 / 96 | Config 500/501 boundary, 147 ms. |
+| Results/scenarios/evidence/world seed | 22 / 106 | Four files, 424 ms; semantic goals, receipts, metrics, classification, pagination and seed contracts. |
+| Tier command smoke | 5 / 92 | Actual CLI help and selected config unit command, 11 ms for the tests. |
+| Program-interface consumer regressions | 14 / 120 | 2.98 s after correcting the three independently reproduced projection defects; whole typecheck also passed, 3.71 s combined. The original three consumer tests first failed in 847 ms and passed after production fixes without weakened expectations. |
+| Frontend build | — | Vite built 111 modules in 86 ms after the actual web projection-parser change. No Gradle/JAR rebuild; `f376…` remained unchanged. |
+| Combined Bun regression, before strictness correction | 294 / 1,815 | All 28 files passed in 45.51 s, 45.55 s wall time, after the projection fixes. This does not verify the later provider-strictness correction. |
+| Final combined Bun regression, explicit strictness | 295 / 1,827 | All 28 files passed in 45.53 s after the one-setting provider correction; whole typecheck also passed. The parent verification sequence took 46.95 s. |
+
+These results cover local contracts, whole typecheck, the affected frontend build and the final combined Bun regression. They do not establish actual natural-model acceptance or require rebuilding unchanged Java.
+
+Before the provider-strictness correction, the parent verified the public native-planning suite in **104.05 seconds** on real Fabric/Docker/Runtime/Store, using the existing `f376…` artifact without a rebuild. All **eight cases passed**: manual positive, false guard and Stop revocation; automatic staging before predecessor closure and predecessor closure before staging; automatic false guard, omitted guard and Stop revocation while a request was held. The actual report recorded `cleanup:true`, `runtime_cleanup:true`, no cleanup errors and **zero actual provider/Jev calls**. This establishes those exercised manual/automatic admission and lifecycle paths with a synthetic strategic caller, not natural-model decisions, gameplay efficacy or promotion. The old three-case baseline retains its separate pre-cutover scope.
+
+The parent also inspected the actual isolated Electron UI, signed out with no world/run and Start disabled. Trusted History, Settings, Escape dismissal and focus return worked at **1440×900** and **1000×650**, with no observed clipping, global scrolling or interaction exceptions. Normal window-manager close exited **0**, after which both owned service ports refused connections. An initial diagnostic CDP port mistake was corrected without restarting the app; a nonfatal Mesa permission warning remained separate. This is a startup/history/settings/shutdown smoke, not live-game UI or provider evidence.
+
+#### Bounded natural wood comparison
+
+The parent completed one plain wood-collection attempt each with Luna and Sol under the same technical hypothesis. **Both retained `platform_status:pass`, `agent_status:goal_not_verified` and `provider_status:unknown`**, with zero durable actions, registered sources or executions. All five cleanup resources were confirmed and neither evaluator recorded a terminal failure. Only wood ran live; crafting-table and stone scenarios remain implemented/tested definitions, not live results.
+
+| Model | Wall elapsed | Host admissions / usage messages | Reported subtotals: uncached / cache-read / output |
+| --- | --- | --- | --- |
+| Luna | 109.15 s | 12 / 11 | 40,586 / 55,936 / 2,896 |
+| Sol | 176.52 s | 12 / 11 | 15,148 / 106,624 / 3,352 |
+
+Reported cache-write subtotals were zero. **Usage coverage is incomplete**: the table contains only the 11 reported messages in each attempt; full token totals and subscription cost remain null. These unsuccessful attempts support no invoice, savings or cost-per-success claim. The parent inspected the durable governance ledger: exactly two settled rows and two unsuccessful attempts under the same hypothesis, with no additional hidden attempt. The shared allowance is exhausted; no third live attempt or budget reset is authorized.
+
+Luna received five new-program conflicts after supplying `based_on:1`; Sol received six across two new names. Read-only SDK inspection confirmed that local JSON schemas made `based_on` optional and the host correctly rejected revision metadata for a new name. The actual SDK transport omitted `strict`; the effective remote grammar was not captured, so neither a strictness cause nor sole model fault is established.
+
+The [official function-calling guide](https://developers.openai.com/api/docs/guides/function-calling#strict-mode) says Responses may normalize an omitted strict setting where compatible, with best-effort fallback otherwise; explicit `strict:false` opts out. A zero-network regression using the actual SDK request builder and a local model of that documented normalization first failed: **0 passed / 1 failed in 62.37 ms**, because initial program creation could not omit `based_on`. This is local transport-contract evidence, not captured remote grammar or proof of either live failure's cause.
+
+The production correction was only an explicit `AgentTool.strict:false` setting, with host Zod/conflict/authority/source/ownership/lifecycle/isolation fences unchanged. The exact zero-network SDK-boundary test then passed **1 test / 12 assertions in 616 ms**, followed by the whole typecheck and **295-test final regression** recorded above. No model/native/UI rerun or build followed this provider-only setting; the native and desktop evidence retains its preceding scope.
+
+Post-setting gameplay is **untested** and the remote grammar's causal role remains unknown. The two original reports remain immutable negative outcomes; no third live attempt or budget reset is authorized.
 
 ### Current native build and pure-controller proof
 
@@ -341,7 +388,7 @@ That single Luna attempt subsequently failed overall, reporting **24 requests / 
 
 No engine patch or budget relaxation followed. The user authorized one separate GPT-6.1 Sol control under the same scenario, 30-request/five-minute bounds and no automatic rerun; it was running without a result. Parent typecheck/full Bun regressions were also running without rebuilding unchanged Java/UI artifacts. Neither pending operation supplies a new pass.
 
-The final post-resumption typecheck and Bun regression run then passed **177 tests, 0 failures and 1,355 assertions across 20 files in 44.21 seconds** (**44.86 seconds** including typecheck). No Java or UI rebuild ran: their unchanged artifacts retain the separate earlier native/build evidence, alongside this resumption's actual comparison/normal-close checks. The single authorized Sol control remained unsettled, with no further automatic model run or production change planned.
+The final post-resumption typecheck and Bun regression run then passed **177 tests, 0 failures and 1,355 assertions across 20 files in 44.21 seconds** (**44.86 seconds** including typecheck). No Java or UI rebuild ran: their unchanged artifacts retain the separate earlier native/build evidence, alongside this resumption's actual comparison/normal-close checks. These are old-interface cohort results; the later Sol control is scoped above, and neither establishes verification of the named-program cutover.
 
 ### Historical spike model and movement result
 

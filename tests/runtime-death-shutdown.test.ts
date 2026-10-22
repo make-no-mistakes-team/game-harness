@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import type { AuthState, BridgeNotice, GameActionResult, GameBridge, GameState, Observation } from "../src/shared/contracts.ts";
-import type { SkillCapabilityRequest, SkillRef } from "../src/shared/programs.ts";
+import type { SkillCapabilityRequest } from "../src/shared/programs.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import { Runtime } from "../src/server/runtime.ts";
 import { Store } from "../src/server/store.ts";
@@ -29,7 +29,7 @@ test("a genuine transport fault pauses only after native and isolated emitters c
   const death = "The native control transport ended unexpectedly.";
   const unknown: GameActionResult = {
     status: "unknown",
-    summary: "Death interrupted the action; its effects remain unknown",
+    summary: "Transport loss interrupted the action; its effects remain unknown",
     evidence: { effect_confirmed: false, neutralized_effect: false, connection_cause: death },
     requires_reconnect: true,
   };
@@ -63,8 +63,8 @@ test("a genuine transport fault pauses only after native and isolated emitters c
     disconnect: async () => {
       disconnectRequested.resolve();
       await nativeClosed.promise;
-      // The actual native bridge intentionally keeps its first death diagnostic
-      // after the owned process exits. Error status is not an open emitter.
+      // Preserve the first transport diagnostic after the owned emitter exits.
+      // An error snapshot does not itself mean an emitter remains open.
     },
     snapshot: () => state,
     observe: async () => observation,
@@ -75,22 +75,22 @@ test("a genuine transport fault pauses only after native and isolated emitters c
     recipes: async () => [],
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
   };
-  let tools: AgentTool[] = [], gate: Parameters<Agent["setBeforeModelCall"]>[0], skill: SkillRef | null = null;
+  let tools: AgentTool[] = [], gate: Parameters<Agent["setBeforeModelCall"]>[0], initialized = false;
   const agent = {
     setBeforeModelCall: (hook: typeof gate) => { gate = hook; },
+    setTools: (next: AgentTool[]) => { tools = next; },
     subscribe: () => () => {}, replaceMessages: () => {}, abort: () => {}, waitForIdle: async () => {},
     prompt: async (text: string) => {
       prompts++;
       const context = JSON.parse(text) as { phase: string };
       await gate?.({ systemPrompt: [], messages: [], tools: [] });
-      if (context.phase === "bootstrapping") {
-        const registered = await tools.find(tool => tool.name === "skill_register")!.execute("register", {
-          epoch: 1,
-          spec: { name: "Neutral drain fixture", source: 'const result = await game.action({kind:"look",yaw:0,pitch:0}); return {status:"completed",summary:"Neutral result inspected",result};', card: { purpose: "Exercise cancellation", applicability: "Connected fixture", method: "Await one bounded neutral effect", reason: "Prove teardown barriers", limitations: "No gameplay claim" }, dependencies: [] },
+      if (!initialized) {
+        initialized = true;
+        expect(context.phase).toBe("running");
+        await tools.find(tool => tool.name === "program_write")!.execute("register", {
+          name: "Neutral drain fixture", source: 'const result = await game.action({kind:"look",yaw:0,pitch:0}); return {status:"completed",summary:"Neutral result inspected",result};', card: { purpose: "Exercise cancellation", applicability: "Connected fixture", method: "Await one bounded neutral effect", reason: "Prove teardown barriers", limitations: "No gameplay claim" }, dependencies: [],
         });
-        skill = { skill_id: registered.details.skill_id, version: registered.details.version };
-      } else {
-        await tools.find(tool => tool.name === "skill_start")!.execute("start", { ...skill, start_key: "death-drain", epoch: 1, session_id: observation.session_id, life_id: observation.life.life_id, args: null, limits: { ...DEFAULT_SKILL_LIMITS } });
+        await tools.find(tool => tool.name === "program_run")!.execute("start", { operation: "start", name: "Neutral drain fixture", args: null, limits: { ...DEFAULT_SKILL_LIMITS } });
         expect((await gate?.({ systemPrompt: [], messages: [], tools: [] }))?.stop).toBe(true);
       }
     },
@@ -123,7 +123,7 @@ test("a genuine transport fault pauses only after native and isolated emitters c
   const created = await runtime.createRun({ task: "Observe neutral cancellation", goal: "custom", model_id: "fixture-model" });
   store.subscribe(event => {
     if (event.run_id !== created.run_id) return;
-    if (event.type === "scheduler.turn_finished" && prompts === 2) plannerSettled.resolve();
+    if (event.type === "scheduler.turn_finished" && prompts === 1) plannerSettled.resolve();
     if (event.type === "action.cancellation_settled") cancellationSettled.resolve();
   });
   await runtime.control(created.run_id, "start");
@@ -152,7 +152,7 @@ test("a genuine transport fault pauses only after native and isolated emitters c
   expect(runtime.snapshot()?.status).toBe("stopped");
   expect(runtime.snapshot()?.error).toBe(death);
   expect(runtime.snapshot()?.action?.status).toBe("unknown");
-  expect(prompts).toBe(2);
+  expect(prompts).toBe(1);
   expect(agentCreations).toBe(1);
   expect(connections).toBe(0);
 });

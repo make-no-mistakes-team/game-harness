@@ -171,7 +171,8 @@ export class Runtime {
         catch { return null; }
       },
       observe: () => this.refreshObservation(),
-      evaluatePrecondition: (source, context, signal) => sandbox.evaluatePrecondition(source, context, signal),
+      evaluateGuard: (source, observation, args, signal) =>
+        sandbox.evaluateGameGuard(source, observation, args, signal),
       admit: async (request, permit) => {
         permit.assertCurrent();
         if (permit.signal.aborted) throw new RuntimeFault("stale_context", "Plan admission cancelled");
@@ -180,7 +181,9 @@ export class Runtime {
         return view;
       },
       evidence: (type, details) => { store.event(this.run?.run_id ?? null, type, "Bounded speculative planning evidence", details); },
-      wake: () => this.strategic.wake("speculative_lookahead"),
+      wake: (reason) => this.strategic.wake(
+        reason === "lookahead" ? "speculative_lookahead" : "planning_continuation",
+      ),
     });
     this.actions = new ActionArbiter(store, game, {
       run: () => this.run,
@@ -270,8 +273,10 @@ export class Runtime {
       changed: (outcome, execution) => {
         this.onChange();
         if (outcome) {
-          if (execution) this.planning.predecessorSettled(execution.execution_id);
-          this.strategic.wake("skill_outcome");
+          if (execution) this.learning.feedback(execution.run_id);
+          const continuationOwnsOutcome = execution
+            ? this.planning.predecessorSettled(execution.execution_id) : false;
+          if (!continuationOwnsOutcome) this.strategic.wake("skill_outcome");
         }
       },
       unsafe: () => {
@@ -334,15 +339,9 @@ export class Runtime {
       persist: (summary) => this.persist(summary),
       pause: (message) => this.requestSafetyPause(message, false),
       terminal: (status, message) => this.requestTerminal(status, message),
-      finishBootstrap: () => {
-        if (this.run?.status !== "bootstrapping") return;
-        this.run.status = "running";
-        this.persist("Bootstrap ended; game effects opened");
-        this.reactions.scheduleAll();
-      },
       speculation: () => this.planning,
       reviewComplete: () => this.finishReview(),
-      reviewContext: () => this.learning.feedback(this.run!.run_id) as unknown as Json,
+      reviewContext: () => this.learning.feedback(this.run!.run_id),
     });
     this.catalog = new RuntimeTools(
       store,
@@ -354,8 +353,6 @@ export class Runtime {
         assertCurrent: (generation, epoch) =>
           this.assertCurrent(generation, epoch),
         observe: () => this.refreshObservation(),
-        action: () =>
-          this.actions.active?.entry.stored.view ?? this.actions.view,
         recipes: (item) => game.recipes(item),
         attentionAfter: (ms, reason) =>
           this.strategic.attentionAfter(ms, reason),
@@ -396,7 +393,7 @@ export class Runtime {
         void this.refreshObservation().catch(() => {});
       else if (
         notice.type === "state" &&
-        (this.run.status === "running" || this.run.status === "bootstrapping" || this.run.status === "reviewing")
+        (this.run.status === "running" || this.run.status === "reviewing")
       ) {
         const state = this.game.snapshot();
         const sameContext =
@@ -490,7 +487,7 @@ export class Runtime {
     command: "start" | "pause" | "resume" | "stop",
   ): Promise<RunView> {
     if (command === "pause" && this.run?.run_id === id &&
-      ["running", "bootstrapping", "reviewing"].includes(this.run.status)) {
+      ["running", "reviewing"].includes(this.run.status)) {
       this.run.status = "pausing";
       this.fenceAuthority("Operator paused the run; effect admission revoked immediately");
       this.persist("Pause admission revoked before waiting for drain");
@@ -514,7 +511,6 @@ export class Runtime {
       } else if (command === "pause") {
         if (
           this.run.status === "running" ||
-          this.run.status === "bootstrapping" ||
           this.run.status === "reviewing" ||
           this.run.status === "pausing"
         )
@@ -563,7 +559,7 @@ export class Runtime {
     if (
       !run ||
       generation !== this.generation ||
-      (run.status !== "running" && run.status !== "bootstrapping" && run.status !== "reviewing")
+      (run.status !== "running" && run.status !== "reviewing")
     )
       throw new RuntimeFault(
         "stale_context",
@@ -891,11 +887,16 @@ export class Runtime {
       observation.session_id !== run.session_id ||
       current.status !== "connected" ||
       current.world_id !== run.world_id ||
-      current.epoch !== run.epoch
+      current.epoch !== run.epoch ||
+      current.session_id !== run.session_id ||
+      current.error !== null ||
+      current.life?.life_id !== observation.life.life_id ||
+      current.life?.status !== observation.life.status ||
+      !["alive", "dead"].includes(observation.life.status)
     )
       throw new RuntimeFault(
         "stale_epoch",
-        "The game connection changed during startup",
+        "Game readiness or player life changed during host preflight",
       );
     this.observation = observation;
     run.life_id = observation.life.life_id;
@@ -903,12 +904,12 @@ export class Runtime {
       run.baseline = inventoryCounts(observation);
       run.started_at = new Date().toISOString();
     }
-    run.status = resuming ? "running" : "bootstrapping";
+    run.status = "running";
     run.model_status = "idle";
     this.persist(
       resuming
         ? "Run resumed with fresh authority and worker state"
-        : "Bootstrap admitted; game effects remain closed",
+        : "Host preflight confirmed readiness and authoritative game state",
     );
     try {
       await this.strategic.start(generation);
@@ -921,7 +922,7 @@ export class Runtime {
           "Explicit resume prepared successfully; previous causal fault cleared",
         );
       }
-      this.strategic.wake(resuming ? "recovery_completed" : "bootstrap");
+      this.strategic.wake(resuming ? "recovery_completed" : "preflight_ready");
     } catch {
       if (generation !== this.generation || this.closed) return;
       const failure =
@@ -950,17 +951,18 @@ export class Runtime {
     const id = "skill_" + randomUUID(),
       completion = Promise.withResolvers<GameActionResult>();
     let unsubscribe = () => {};
+    let settling = false;
     const check = () => {
       const view = this.store.getAction(execution.run_id, id)?.view;
-      if (view && ACTION_TERMINAL.has(view.status)) {
+      if (view && ACTION_TERMINAL.has(view.status) && !settling) {
+        settling = true;
         unsubscribe();
+        if (view.result?.status === "unknown" || view.result?.requires_reconnect)
+          this.skills.fence("Leaf outcome is unknown; interrupted execution lineage retained", execution.execution_id);
         if (view.result) completion.resolve(view.result);
         else
           completion.reject(
-            new RuntimeFault(
-              "unknown_effect",
-              "Skill action has no confirmed result",
-            ),
+            new RuntimeFault("unknown_effect", "Skill action has no confirmed result"),
           );
       }
     };
@@ -983,6 +985,9 @@ export class Runtime {
       });
       check();
       const result = await completion.promise;
+      const active = this.actions.active;
+      if (active?.entry.stored.view.action_id === id)
+        await this.actions.awaitRetirement(active);
       this.trace.record(execution, "capability_result", result as unknown as Json, {
         call_id: callId, action_id: id, capability: action.kind === "respawn" ? "respawn" : "action",
         session_id: this.run!.session_id, life_id: this.store.getAction(execution.run_id, id)!.view.life_id,
@@ -1005,7 +1010,7 @@ export class Runtime {
     const run = this.run;
     const state = this.game.snapshot();
     const death = state.life?.death;
-    if (!run || !["running", "bootstrapping"].includes(run.status) ||
+    if (!run || run.status !== "running" ||
       !death || state.life?.status !== "dead" ||
       state.session_id !== run.session_id || state.epoch !== run.epoch) return;
     const deathKey = JSON.stringify([state.session_id, state.life.life_id, death.death_id]);

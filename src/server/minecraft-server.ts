@@ -25,6 +25,10 @@ interface OwnedServer {
   ready: boolean;
   expectedStop: boolean;
 }
+export interface MinecraftServerOptions {
+  /** Trusted host configuration for a new ordinary world, never a model capability. */
+  worldSeed?: string;
+}
 /** Host-only owner of one local Fabric process. No console or credentials cross the program API. */
 export class MinecraftServer {
   private state: GameServerState = {
@@ -45,6 +49,7 @@ export class MinecraftServer {
   private closing = false;
   private closePromise: Promise<void> | null = null;
   private active: AbortController | null = null;
+  private readonly worldSeed: string | undefined;
   constructor(
     private readonly onChange: () => void,
     private readonly onEvent: (
@@ -52,7 +57,13 @@ export class MinecraftServer {
       summary: string,
       details?: Json,
     ) => void,
-  ) {}
+    options: MinecraftServerOptions = {},
+  ) {
+    const seed = options.worldSeed;
+    if (seed !== undefined && (!seed || seed.length > 128 || seed.trim() !== seed || /[\x00-\x1f\x7f\\=:]/.test(seed)))
+      throw new Error("World seed must be one bounded property value without control characters or property escapes");
+    this.worldSeed = seed;
+  }
   snapshot(): GameServerState {
     return { ...this.state };
   }
@@ -166,6 +177,18 @@ export class MinecraftServer {
     });
   }
   private async configuration() {
+    if (this.worldSeed !== undefined) {
+      const existingWorld = await access(path.join(this.directory(), "world")).then(
+        () => true,
+        (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; },
+      );
+      if (existingWorld) {
+        const properties = await readFile(path.join(this.directory(), "server.properties"), "utf8");
+        const previousSeeds = properties.split(/\r?\n/).filter(line => line.startsWith("level-seed=")).map(line => line.slice("level-seed=".length));
+        if (previousSeeds.length !== 1 || previousSeeds[0] !== this.worldSeed)
+          throw new Error("An existing world cannot be silently reseeded; create a new world for the declared seed");
+      }
+    }
     await writeFile(path.join(this.directory(), "eula.txt"), "eula=true\n", {
       mode: 0o600,
     });
@@ -182,6 +205,7 @@ export class MinecraftServer {
         "hardcore=false",
         "level-name=world",
         "level-type=minecraft\\:normal",
+        ...(this.worldSeed === undefined ? [] : [`level-seed=${this.worldSeed}`]),
         "generate-structures=true",
         "view-distance=6",
         "simulation-distance=6",

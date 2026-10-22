@@ -232,12 +232,47 @@ test("self-report and confirmed movement do not qualify as verified inventory ef
   expect(measured.verified_event_seqs).toEqual([]);
 });
 
+test("persisted named memory revisions survive duplicate names, paging and SQLite compaction", async () => {
+  const { directory, store, library, run, manager } = fixture();
+  const qualify = async (programName: string, memoryName: string) => {
+    const skill = await authored(manager, run, programName);
+    const view = execution(store, run, skill);
+    action(store, run, view, { effect_confirmed: true, inventory_receipt_confirmed: true,
+      inventory_before: { stone: 0 }, inventory_after: { stone: 2 } });
+    const receipt = store.event(run.run_id, "observation.inventory", "Trusted fixture counts", {
+      world_id: run.world_id, epoch: run.epoch, observation_seq: 2, counts: { stone: 2 },
+    });
+    finish(store, view);
+    return library.promote(store, run.run_id, view, memoryName, declaration(receipt.event_seq));
+  };
+  const removedFixture = await qualify("temporary gap", "temporary gap");
+  const first = await qualify("first named source", "shared memory");
+  const second = await qualify("second named source", "shared memory");
+  const other = await qualify("other named source", "other memory");
+  const firstVersion = library.snapshotVersion(first.experience_id, run.model_id)!;
+  const secondVersion = library.snapshotVersion(second.experience_id, run.model_id)!;
+  const otherVersion = library.snapshotVersion(other.experience_id, run.model_id)!;
+  const db = new Database(join(directory, "library", "experience.sqlite"));
+  const original = db.query<{ payload: string }, [string]>("SELECT payload FROM bundles WHERE id=?").get(first.experience_id)!.payload;
+  db.query("DELETE FROM bundles WHERE id=?").run(removedFixture.experience_id);
+  db.exec("VACUUM");
+  expect(db.query<{ payload: string }, [string]>("SELECT payload FROM bundles WHERE id=?").get(first.experience_id)!.payload).toBe(original);
+  expect(library.named(run.model_id, run.world_id, "shared memory", firstVersion)?.experience_id).toBe(first.experience_id);
+  expect(library.named(run.model_id, run.world_id, "shared memory")?.experience_id).toBe(second.experience_id);
+  expect(library.snapshotVersion(second.experience_id, run.model_id)).toBe(secondVersion);
+  const page = library.catalog(run.model_id, run.world_id, 0, 1);
+  expect(page.records).toMatchObject([{ name: "other memory", version: otherVersion }]);
+  expect(page.has_more).toBe(true);
+  expect(library.catalog(run.model_id, run.world_id, page.next_after, 1).records).toMatchObject([{ name: "shared memory", version: secondVersion }]);
+  db.close();
+});
+
 test("portable exact snapshot accepts live coordinate reads but does not restore invocation coordinates", async () => {
   const { store, library, run, manager } = fixture();
   const child = await authored(manager, run, "child");
   const root = await manager.register(run.run_id, {
     name: "root",
-    source: `const result = await game.call({skill_id:${JSON.stringify(child.skill_id)},version:${child.version}}, \"dependency\"); return {status:\"completed\",summary:\"Composed exact dependency\",result};`,
+    source: `const result = await game.call({name:\"child\",version:${child.version}}, \"dependency\"); return {status:\"completed\",summary:\"Composed exact dependency\",result};`,
     card,
     dependencies: [{ skill_id: child.skill_id, version: child.version }],
   });
@@ -299,7 +334,7 @@ test("portable exact snapshot accepts live coordinate reads but does not restore
         if (args === "parent")
           await handle({
             kind: "call",
-            skill: { skill_id: child.skill_id, version: child.version },
+            skill: { name: "child", version: child.version },
             args: "dependency",
           });
         return {
@@ -884,9 +919,6 @@ test("invalid decision/revision pairs reject actionably without a record before 
   expect(rejection).toBeInstanceOf(RuntimeFault);
   if (!(rejection instanceof RuntimeFault)) throw new Error("Expected a typed semantic rejection");
   expect(rejection.code).toBe("invalid_request");
-  expect(rejection.message).toContain("revision:null");
-  expect(rejection.message).toContain("choose revise");
-  expect(rejection.message).toContain("does not claim verified improvement, adoption, or promotion");
   expect(store.lastEventSeq()).toBe(beforeSeq);
   expect(learning.feedback(run.run_id).opportunities.find((value) => value.opportunity_id === opportunity.opportunity_id)?.resolution).toBeNull();
   const corrected = { decision: "revise" as const, reason, revision, event_seqs: [evidence.event_seq] };
@@ -901,5 +933,4 @@ test("invalid decision/revision pairs reject actionably without a record before 
   expect(library.list(run.model_id, run.world_id)).toEqual([]);
   expect(store.skill(run.run_id, first).hash).toBe(first.hash);
   expect(store.skill(run.run_id, second).hash).toBe(second.hash);
-  expect(learning.feedback(run.run_id).decision_contract).toContain("measured trials can remain inconclusive");
 });

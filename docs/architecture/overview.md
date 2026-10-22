@@ -54,9 +54,10 @@ Decompose the runtime by responsibility: lifecycle/coordinator, strategic schedu
 | Module | Owns |
 | --- | --- |
 | Run coordinator — `runtime.ts` | Lifecycle and trusted observation/goal authority, configuration, pause/stop/recovery intent |
-| Speculative planning — `speculative-planning.ts` | Explicit one-flight lookahead, bounded drafts, exact predecessor/source identity, fresh read-only preconditions and guarded activation |
+| Speculative planning — `speculative-planning.ts` | One-flight preparation, pinned predecessor/source closure, optional isolated game guard and one-use Main-authorized continuation |
 | Strategic planner — `strategic.ts` | Authenticated Agent, serialized turns/wakes, compact context, one-shot attention, actual request purpose and usage |
-| Runtime tools — `runtime-tools.ts` | Tool schemas, run/epoch authorization and tool evidence; authoring instructions live separately in `runtime-prompt.ts` |
+| Runtime tools — `runtime-tools.ts` | Shared role/module registry enforcement, schema dispatch and trusted tool-call retry identity |
+| Program workspace — `program-operations.ts`, `program-workspace.ts` | Named immutable authoring/execution/review, pinned selection and bounded evidence; schemas/help live in `program-interface.ts`/`program-help.ts` |
 | Autonomous Improvement Loop | Game-neutral evidence triggers, deduplicated opportunities, delivery/acknowledgement/deferral, one bounded improvement trial per run and outcome-driven wakeups |
 | Reactive runtime — `reactive.ts` | Policy registry/selection, trials, workers, evaluation, real Jev and fenced preemption |
 | Action arbiter — `action-arbiter.ts` | Durable admission/deduplication, priority queue, exclusive leaf-effect lease, cancellation and emitter draining |
@@ -90,8 +91,8 @@ sequenceDiagram
     participant Worker as Isolated program worker
     participant Adapter as Game adapter
     participant Fast as Fast decision provider
-    Planner->>Runtime: Submit skill or policy version
-    Runtime-->>Planner: Return execution or policy identity
+    Planner->>Runtime: Select named program or optional reflex
+    Runtime-->>Planner: Return named version and admission status
     Runtime->>Worker: Start authorized bounded work
     par Strategic planning
         Planner->>Planner: Prepare the next model decision
@@ -117,9 +118,9 @@ Only the executor admits effects. Read-only observation and inference can overla
 
 Both cold and warm runs receive the same capability catalogue and game-independent explanation of inference latency and policy-authoring tools. Warm runs additionally receive a selected compatible immutable experience snapshot. Cold does not mean disabled programming, reference access, or fast-model support.
 
-Bootstrap uses the [runtime's configurable calibration defaults](../runtime-contracts.md#autonomous-improvement-loop), not a universal adequacy claim. Per-model settings are frozen equally across matched arms. Preparation, actual calls/attempts, retrieval, validation/cache, activation and first confirmed effect are measured; failures cannot restart the allowance. If no eligible version is selected before expiry, gameplay starts visibly without a policy; the runtime does not insert a hidden tactic.
+Host preflight checks readiness and fresh authoritative state before ordinary scheduling; it does not require several model calls to confirm those facts. Per-model bounds are frozen equally across matched arms. Preparation, actual requests/exposed attempts, retrieval, validation/cache, activation and first confirmed effect are measured; failures cannot reset an allowance. An absent reaction remains explicit and inserts no hidden tactic.
 
-A warm snapshot can carry a model-authored startup bundle selecting exact compatible policy/card versions for declared tasks/profiles. The host checks source, security, provenance, applicability and validation-cache identities, then rehydrates fresh run-local state and uses ordinary fenced activation. Eligible inherited selections need no source regeneration or repeated tactical trial and can activate with zero strategic authoring calls. No effects occur until current observations/preconditions and the normal action gate permit them. Missing/rejected entries are visible and use normal bootstrap with the remaining allowance. Unselected programs stay behind selective retrieval, not wholesale in model context.
+The broader release startup-bundle contract selects exact compatible model-authored policies/cards for declared tasks/profiles; it is distinct from the current named program snapshot load. The host checks source, security, provenance, applicability and validation-cache identities, rehydrates fresh state and uses ordinary fenced activation. Eligible selections need no source regeneration or repeated tactical trial and can need zero strategic authoring calls. Effects still require fresh state and the ordinary gate. Missing/rejected entries remain visible; ordinary authoring can choose alternatives within remaining limits. Unselected programs stay behind selective retrieval.
 
 The model creates local code or a typed AI configuration using the selected adapter's observation/action schemas. The host checks capabilities, output shape, isolation, and bounded execution. Real bounded trials provide behavioral evidence; schema validity alone cannot prove that a policy is effective.
 
@@ -129,7 +130,11 @@ The [Autonomous Improvement Loop](../runtime-contracts.md#autonomous-improvement
 
 Revisions create immutable source/card artifacts. Activation replaces a selected version at a scheduling boundary, and callbacks from revoked generations cannot issue new effects. Selection pointers, trial counters, evaluation generations and private state belong to `(run_id, policy_id)`, never to a shared inherited snapshot. A trial bound fences new proposals, restores its declared prior selection or no policy, and wakes the strategist to assess outcomes. Restoring an earlier policy changes future control; it does not restore the game's state. Useful current-run behavior requires real evidence, and before/after timing alone is not a causal result.
 
-Delivered death/failure/outcome opportunities, exact model-authored revisions and objective comparison are narrower than the broader release detector catalogue above. Trace records actual API requests/results, authorized snapshots, instrumented branches, intent and categorized spans with explicit byte/record omissions; it exposes no chain of thought or inferred reason for target selection. Same-session/model `working_candidate` definitions can persist across tasks without old args/state/observations, separately from evidence-qualified cross-session snapshots. Optional lookahead stages no effects and requires fresh session/life/task/predecessor/source checks before explicit activation. After verified goal, bounded `reviewing` is effect-free: candidates may be authored, but no extra gameplay trial occurs.
+Delivered death/failure/outcome opportunities, exact model-authored revisions and objective comparison are narrower than the broader release detector catalogue above. Trace records actual API requests/results, authorized snapshots, instrumented branches, intent and categorized spans with explicit byte/record omissions; it exposes no chain of thought or inferred reason for target selection. Same-session/model `working_candidate` definitions can persist across tasks without old args/state/observations, separately from evidence-qualified cross-session snapshots.
+
+Optional preparation stages no effects. Main can authorize a single successor at root start for manual activation or on successful predecessor closure. The restricted planner only selects/stages an existing program; the host owns the permit, full scope checks, drain and fresh ordinary admission. A model game guard is optional and receives only fresh observation/args, not task/control metadata; omission does not bypass host invariants. Either arrival order of staging and predecessor drain is supported by the host task, without another activation inference. The [continuation contract](../runtime-contracts.md#bounded-speculative-planning) links scoped native evidence separately from model/gameplay acceptance.
+
+After verified goal, bounded `reviewing` is effect-free: candidates may be authored, but no extra gameplay trial occurs.
 
 ## Observation permissions
 
@@ -163,7 +168,7 @@ OS isolation enforces filesystem, network, process, and resource restrictions. T
 
 Documentation and internet access use a trusted retrieval broker. Its output is untrusted content; it cannot grant capabilities, reach private host services, inspect renderer state, or obtain hidden game information. Provider requests use supported authentication flows in the trusted backend. A subscription, a valid token, and permission to invoke a particular model are distinct conditions.
 
-Usage reporting preserves provider attempts, available counters, pricing provenance, and unknown costs. An all-zero placeholder price is not evidence of free inference. Finite retries, concurrency limits, deadlines, and host stop protect execution correctness and availability independently of usage accounting.
+Usage reporting preserves host admissions, available provider counters, pricing provenance and unknown costs/transport attempts. An all-zero placeholder price is not evidence of free inference. Finite retries, concurrency limits, deadlines and host stop protect execution correctness and availability independently of usage accounting. Model acceptance and comparisons follow the [shared verification and live-evaluation policy](../learning-and-evaluation.md#verification-and-live-evaluation-policy).
 
 Jev can be disabled for a code-only run. Failure in a Jev-enabled run is recorded and exposed; a replacement provider or local result must not silently be labelled a successful Jev response. Details are in [upstream reuse](../upstream-reuse.md) and [operations and security](../operations-and-security.md).
 
@@ -176,6 +181,8 @@ Recovery fences old emitters, reconnects through the adapter, advances the execu
 Checkpoint/reset/restore support is adapter-specific. When restoration is available, record its effect on environment lineage and reconcile memory with the restored state. When it is unavailable, report that limitation rather than implying that restoring a conversation restores the game. Recovery must preserve downtime and intervention evidence.
 
 Cross-session reuse is different from resuming the same environment. A transferable program can move to a compatible new run; facts about an earlier world, map, level state, or inventory cannot become facts about a new one without fresh evidence.
+
+Evaluation has three separate storage owners: external private runtime material, durable external attempt governance and compact reports. Reports retain provenance without making worlds, credentials or full evidence public. The [storage boundary](../operations-and-security.md#private-evaluation-storage) preserves existing historical data unchanged.
 
 ## Operator surface
 

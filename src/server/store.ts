@@ -14,6 +14,7 @@ import {
 import path from "node:path";
 import type { DeathEpisode, SavedDeathEpisode, ImprovementOpportunity, TraceInput, TracePage, TraceRecord, WorkingProgram } from "../shared/execution-evidence.ts";
 import type { SkillManager } from "./skills.ts";
+import { RuntimeFault } from "./runtime-fault.ts";
 import type {
   ActionView,
   ActivityEvent,
@@ -30,6 +31,7 @@ import type {
   SkillStartRequest,
   SkillView,
 } from "../shared/programs.ts";
+import { SKILL_API_VERSION } from "../shared/programs.ts";
 
 export type StoredRun = Omit<
   RunView,
@@ -164,6 +166,7 @@ export class Store {
         CREATE TABLE IF NOT EXISTS skill_executions (
           run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
           execution_id TEXT NOT NULL,
+          admission_ordinal INTEGER NOT NULL CHECK(admission_ordinal > 0),
           start_key TEXT NOT NULL,
           skill_id TEXT NOT NULL,
           version INTEGER NOT NULL,
@@ -218,6 +221,12 @@ export class Store {
         ) STRICT;
         PRAGMA user_version=4;
       `);
+      const executionColumns = this.db.query<{ name: string }, []>("PRAGMA table_info(skill_executions)").all();
+      if (!executionColumns.some((column) => column.name === "admission_ordinal")) {
+        this.db.exec("ALTER TABLE skill_executions ADD COLUMN admission_ordinal INTEGER CHECK(admission_ordinal > 0)");
+        this.db.exec("UPDATE skill_executions SET admission_ordinal=rowid");
+      }
+      this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS skill_executions_ordinal ON skill_executions(admission_ordinal)");
       if (version < 2) this.migrateLegacyRows();
     })();
   }
@@ -491,6 +500,13 @@ export class Store {
           view: { session_id: null, life_id: null, ...JSON.parse(row.view) } as ActionView,
         }
       : null;
+  }
+
+  selectedAction(runId: string, target: "current" | "latest", executionId?: string): ActionView | null {
+    const row = this.db.query<{ view: string }, [string, string, string | null, string | null, string | null]>(
+      "SELECT a.view FROM actions a LEFT JOIN skill_executions e ON e.run_id=a.run_id AND e.execution_id=json_extract(a.view,'$.execution_id') WHERE a.run_id=? AND (?='latest' OR json_extract(a.view,'$.status') IN ('accepted','running','cancel_requested')) AND (? IS NULL OR e.execution_id=? OR e.root_execution_id=?) ORDER BY a.rowid DESC LIMIT 1",
+    ).get(runId, target, executionId ?? null, executionId ?? null, executionId ?? null);
+    return row ? { session_id: null, life_id: null, ...JSON.parse(row.view) } as ActionView : null;
   }
 
   admitAction(
@@ -893,6 +909,68 @@ export class Store {
       .map((row) => this.hydrateSkill(row));
   }
 
+  namedSkill(runId: string, name: string, version?: number, validated = false): SkillView | null {
+    const row = this.db.query<SkillRow, [string, string, number | null, number | null, number]>(
+      "SELECT run_id,skill_id,version,name,hash,metadata FROM skills WHERE run_id=? AND name=? AND (? IS NULL OR version=?) AND (?=0 OR json_extract(metadata,'$.state')='validated') ORDER BY version DESC LIMIT 1",
+    ).get(runId, name, version ?? null, version ?? null, validated ? 1 : 0);
+    return row ? this.hydrateSkill(row) : null;
+  }
+
+  programCatalog(runId: string, after: number, limit: number) {
+    const rows = this.db.query<SkillRow & { seq: number }, [string, string, number, number, number]>(
+      "SELECT s.rowid AS seq,s.run_id,s.skill_id,s.version,s.name,s.hash,s.metadata FROM skills s JOIN (SELECT name,MAX(version) AS version FROM skills WHERE run_id=? GROUP BY name) latest ON s.name=latest.name AND s.version=latest.version WHERE s.run_id=? AND (?=0 OR s.rowid<?) ORDER BY s.rowid DESC LIMIT ?",
+    ).all(runId, runId, after, after, limit + 1);
+    const selected = rows.slice(0, limit);
+    return { records: selected.map((row) => {
+      const value = JSON.parse(row.metadata) as SkillView;
+      return { name: row.name, version: row.version, purpose: value.card.purpose.slice(0, 200), state: value.state,
+        execution_compatible: value.validation.runtime_version === SKILL_API_VERSION, created_at: value.created_at,
+        ...(value.card.purpose.length > 200 ? { purpose_omission: { reason: "catalog_summary", original_characters: value.card.purpose.length } } : {}) };
+    }), next_after: selected.at(-1)?.seq ?? after, has_more: rows.length > limit, omissions: [] };
+  }
+
+  private toolCallRecord(runId: string, callId: string, kind: string): Json | null {
+    const row = this.db.query<{ payload: string }, [string, string, string]>(
+      "SELECT payload FROM evidence_objects WHERE run_id=? AND kind=? AND object_key=?",
+    ).get(runId, kind, callId);
+    return row ? JSON.parse(row.payload) as Json : null;
+  }
+
+  private assertToolCallInput(runId: string, callId: string, input: Json, capture: boolean): void {
+    const hash = createHash("sha256").update(canonical(input)).digest("hex");
+    const previous = this.toolCallRecord(runId, callId, "tool_identity");
+    if (previous !== null && previous !== hash)
+      throw new RuntimeFault("conflict", "A trusted tool-call identity cannot be reused for a different decision");
+    if (capture && previous === null) this.saveEvidenceObject(runId, "tool_identity", callId, hash);
+  }
+
+  bindToolCall(runId: string, callId: string, input: Json, create: () => Json): Json {
+    return this.db.transaction(() => {
+      this.assertToolCallInput(runId, callId, input, true);
+      const previous = this.toolCallRecord(runId, callId, "tool_binding");
+      if (previous !== null) return previous;
+      const value = create();
+      this.db.query("INSERT INTO evidence_objects(run_id,kind,object_key,payload) VALUES(?,'tool_binding',?,?)")
+        .run(runId, callId, canonical(value));
+      return value;
+    })();
+  }
+
+  completedToolCall(runId: string, callId: string, input: Json): Json | null {
+    this.assertToolCallInput(runId, callId, input, false);
+    return this.toolCallRecord(runId, callId, "tool_result");
+  }
+
+  completeToolCall(runId: string, callId: string, input: Json, result: Json): void {
+    this.db.transaction(() => {
+      this.assertToolCallInput(runId, callId, input, true);
+      const previous = this.toolCallRecord(runId, callId, "tool_result");
+      if (previous !== null && canonical(previous) !== canonical(result))
+        throw new RuntimeFault("conflict", "A completed tool call has an immutable result");
+      this.saveEvidenceObject(runId, "tool_result", callId, result);
+    })();
+  }
+
   skill(runId: string, ref: SkillRef): SkillView {
     const row = this.db
       .query<SkillRow, [string, string, number]>(
@@ -1031,13 +1109,17 @@ export class Store {
         result: null,
         error: null,
       };
+      const ordinal = this.db.query<{ value: number }, []>(
+        "SELECT COALESCE(MAX(admission_ordinal),0)+1 AS value FROM skill_executions",
+      ).get()!.value;
       this.db
         .query(
-          "INSERT INTO skill_executions(run_id,execution_id,start_key,skill_id,version,parent_execution_id,root_execution_id,fingerprint,request,view) VALUES(?,?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO skill_executions(run_id,execution_id,admission_ordinal,start_key,skill_id,version,parent_execution_id,root_execution_id,fingerprint,request,view) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
         )
         .run(
           runId,
           id,
+          ordinal,
           request.start_key,
           request.skill_id,
           request.version,
@@ -1104,6 +1186,19 @@ export class Store {
       "SELECT view FROM skill_executions WHERE run_id=? AND parent_execution_id IS NULL ORDER BY rowid DESC LIMIT 1",
     ).get(runId);
     return row ? ({ session_id: null, life_id: null, ...JSON.parse(row.view) } as SkillExecutionView) : null;
+  }
+
+  selectedSkillExecution(runId: string, target: "current" | "latest", skillId?: string, version?: number): SkillExecutionView | null {
+    const row = this.db.query<{ view: string }, [string, string | null, string | null, number | null, number | null, string]>(
+      "SELECT view FROM skill_executions WHERE run_id=? AND ((? IS NULL AND parent_execution_id IS NULL) OR skill_id=?) AND (? IS NULL OR version=?) AND (?='latest' OR json_extract(view,'$.status') IN ('accepted','running','cancel_requested')) ORDER BY rowid DESC LIMIT 1",
+    ).get(runId, skillId ?? null, skillId ?? null, version ?? null, version ?? null, target);
+    return row ? { session_id: null, life_id: null, ...JSON.parse(row.view) } as SkillExecutionView : null;
+  }
+
+  executionReferences(runId: string, executionId?: string) {
+    return this.db.query<{ execution_id: string; name: string; version: number; execution_ordinal: number }, [string, string | null, string | null]>(
+      "SELECT e.execution_id,s.name,e.version,e.admission_ordinal AS execution_ordinal FROM skill_executions e JOIN skills s ON s.run_id=e.run_id AND s.skill_id=e.skill_id AND s.version=e.version WHERE e.run_id=? AND (? IS NULL OR e.execution_id=?) ORDER BY e.admission_ordinal",
+    ).all(runId, executionId ?? null, executionId ?? null);
   }
 
   updateSkillExecution(
@@ -1279,6 +1374,13 @@ export class Store {
     return page;
   }
 
+  traceRecord(runId: string, sequence: number): TraceRecord | null {
+    const row = this.db.query<{ payload: string }, [string, number]>(
+      "SELECT payload FROM execution_trace WHERE run_id=? AND trace_seq=?",
+    ).get(runId, sequence);
+    return row ? { ...JSON.parse(row.payload), trace_seq: sequence } as TraceRecord : null;
+  }
+
   private saveEvidenceObject(runId: string, kind: string, key: string, value: unknown): boolean {
     const text = canonical(value);
     if (Buffer.byteLength(text) > 65536) throw new Error("Evidence object exceeds 64 KiB budget");
@@ -1363,7 +1465,7 @@ export class Store {
     const executions = this.allSkillExecutions(runId);
     const candidates: WorkingProgram[] = [];
     for (const root of this.skills(runId)) {
-      if (root.state !== "validated") continue;
+      if (root.state !== "validated" || root.validation.runtime_version !== SKILL_API_VERSION) continue;
       const skills: SkillView[] = [];
       const seen = new Set<string>();
       const visit = (ref: SkillRef): void => {
@@ -1397,11 +1499,18 @@ export class Store {
     const run = this.getRun(runId);
     if (!run || run.model_id !== modelId || run.session_id !== sessionId) throw new Error("Working library scope does not match run");
     const imported = new Map<string, SkillView>();
-    for (const candidate of this.workingPrograms(modelId, sessionId))
+    for (const candidate of this.workingPrograms(modelId, sessionId)) {
+      if (candidate.skills.some((skill) => skill.validation.runtime_version !== SKILL_API_VERSION)) {
+        this.event(runId, "skill.working_incompatible", "Retained working sources use an incompatible skill API and were not imported", {
+          source_run_id: candidate.source_run_id, skill_api: SKILL_API_VERSION,
+        });
+        continue;
+      }
       for (const skill of candidate.skills) {
         const key = `${skill.skill_id}:${skill.version}`;
         if (!imported.has(key)) imported.set(key, await manager.importSnapshot(runId, skill, beforeCommit));
       }
+    }
     return [...imported.values()];
   }
 

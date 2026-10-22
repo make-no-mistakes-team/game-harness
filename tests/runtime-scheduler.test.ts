@@ -11,7 +11,6 @@ import type {
   GameState,
   Observation,
 } from "../src/shared/contracts.ts";
-import type { SkillRef } from "../src/shared/programs.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import { Runtime } from "../src/server/runtime.ts";
 import { Store } from "../src/server/store.ts";
@@ -122,7 +121,7 @@ test("a pending program stays compact and unpolled, and native first-cause survi
   let tools: AgentTool[] = [],
     gate: Parameters<Agent["setBeforeModelCall"]>[0],
     listener: ((event: AgentEvent) => void) | null = null;
-  let skill: SkillRef | null = null,
+  let initialized = false,
     prompts = 0,
     failNextAgent = false;
   const running = Promise.withResolvers<void>(),
@@ -131,6 +130,9 @@ test("a pending program stays compact and unpolled, and native first-cause survi
   const fakeAgent = {
     setBeforeModelCall: (hook: typeof gate) => {
       gate = hook;
+    },
+    setTools: (selected: AgentTool[]) => {
+      tools = selected;
     },
     subscribe: (callback: (event: AgentEvent) => void) => {
       listener = callback;
@@ -146,22 +148,14 @@ test("a pending program stays compact and unpolled, and native first-cause survi
       const context = JSON.parse(text) as Record<string, unknown>;
       contexts.push(context);
       await gate?.({ systemPrompt: [], messages: [], tools: [] });
-      if (context.phase === "bootstrapping") {
-        expect(tools.some((tool) => tool.name === "action_submit")).toBe(false);
-        expect(tools.some((tool) => tool.name === "action_cancel")).toBe(false);
-        const capabilities = await tools
-          .find((tool) => tool.name === "capabilities_read")!
-          .execute("capabilities", {});
-        expect(capabilities.details.effects).toEqual({
-          admission: "closed",
-          owners: ["skill", "policy"],
-          strategic_direct: false,
-        });
-        const result = await tools
-          .find((tool) => tool.name === "skill_register")!
+      if (!initialized) {
+        initialized = true;
+        expect(context.phase).toBe("running");
+        const observed = await tools.find((tool) => tool.name === "observe")!.execute("observe", {});
+        expect(observed.details.player).toMatchObject({ health: 20 });
+        await tools
+          .find((tool) => tool.name === "program_write")!
           .execute("register", {
-            epoch: 1,
-            spec: {
               name: "Neutral observer",
               source:
                 'for (let step = 0; step < 2; step++) { await game.observe(); const result = await game.action({kind:"look",yaw:step * 0.1,pitch:0}); if (result.status !== "succeeded") return {status:"blocked",summary:"Neutral fixture action did not succeed",result}; } return {status:"completed",summary:"Bounded neutral flow settled",result:null};',
@@ -173,21 +167,12 @@ test("a pending program stays compact and unpolled, and native first-cause survi
                 limitations: "No gameplay effectiveness claim",
               },
               dependencies: [],
-            },
           });
-        skill = {
-          skill_id: result.details.skill_id,
-          version: result.details.version,
-        };
-      } else {
         await tools
-          .find((tool) => tool.name === "skill_start")!
+          .find((tool) => tool.name === "program_run")!
           .execute("start", {
-            ...skill,
-            start_key: "stable-program",
-            epoch: 1,
-            session_id: observation.session_id,
-            life_id: observation.life.life_id,
+            operation: "start",
+            name: "Neutral observer",
             args: null,
             limits: { ...DEFAULT_SKILL_LIMITS },
           });
@@ -202,8 +187,7 @@ test("a pending program stays compact and unpolled, and native first-cause survi
           message: {
             role: "assistant",
             stopReason: "aborted",
-            errorMessage:
-              "A program is meaningful pending work; strategy waits for its outcome",
+            errorMessage: stopped?.reason,
             content: [],
             usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           },
@@ -279,7 +263,7 @@ test("a pending program stays compact and unpolled, and native first-cause survi
     if (
       event.run_id === created.run_id &&
       event.type === "scheduler.turn_finished" &&
-      prompts === 2
+      prompts === 1
     )
       settled.resolve();
   });
@@ -289,7 +273,7 @@ test("a pending program stays compact and unpolled, and native first-cause survi
   await Promise.resolve();
   expect(runtime.snapshot()?.status).toBe("running");
   expect(runtime.snapshot()?.model_status).toBe("idle");
-  expect(prompts).toBe(2);
+  expect(prompts).toBe(1);
   expect(gameExecutions).toBe(2);
   expect(runtime.snapshot()?.executions[0]?.actions).toBe(2);
   const admittedEffects = store
@@ -318,12 +302,12 @@ test("a pending program stays compact and unpolled, and native first-cause survi
   };
   store.saveAction(created.run_id, historical);
   const diagnostic = await tools
-    .find((tool) => tool.name === "action_get")!
+    .find((tool) => tool.name === "program_inspect")!
     .execute("historical-read", {
-      action_id: historical.action_id,
+      view: "action",
     });
   expect(diagnostic.details.origin).toBe("strategist");
-  expect(diagnostic.details.execution_id).toBeNull();
+  expect(diagnostic.details).not.toHaveProperty("execution_id");
   expect(gameExecutions).toBe(2);
   expect(contexts[0]?.observation).toBeUndefined();
   expect(contexts[0]?.player).toBeDefined();
@@ -333,13 +317,13 @@ test("a pending program stays compact and unpolled, and native first-cause survi
       listener({ type: "observation", data: null });
   await Promise.resolve();
   await Promise.resolve();
-  expect(prompts).toBe(2);
+  expect(prompts).toBe(1);
   expect(
     store
       .eventsAfter(created.run_id, 0, 500)
       .filter((event) => event.type === "scheduler.backoff"),
   ).toEqual([]);
-  expect(runtime.snapshot()?.usage.calls).toBe(2);
+  expect(runtime.snapshot()?.usage.calls).toBe(1);
   const firstCause = "The native control transport failed";
   state = { ...state, status: "error", error: firstCause };
   for (const listener of gameListeners) listener({ type: "state", data: null });
@@ -359,8 +343,9 @@ test("a pending program stays compact and unpolled, and native first-cause survi
   expect(runtime.snapshot()?.status).toBe("paused");
   expect(runtime.snapshot()?.error).toBe(firstCause);
   expect(runtime.snapshot()?.executions[0]?.status).toBe("cancelled");
-  state = { ...state, status: "connected", epoch: 2, error: null };
+  state = { ...state, status: "connected", epoch: 2, session_id: "fixture-reconnected-session", error: null };
   observation.epoch = 2;
+  observation.session_id = "fixture-reconnected-session";
   failNextAgent = true;
   await runtime.control(created.run_id, "resume");
   expect(runtime.snapshot()?.status).toBe("paused");

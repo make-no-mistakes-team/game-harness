@@ -184,7 +184,7 @@ describe("durable program execution through host capabilities", () => {
       });
       const blocked = await handle({
         kind: "call",
-        skill: child,
+        skill: { name: "blocked-child", version: child.version },
         args: "blocked-child",
       });
       return {
@@ -321,8 +321,8 @@ describe("durable program execution through host capabilities", () => {
         });
         await handle({ kind: "observe" });
       } else {
-        await handle({ kind: "call", skill: child, args: "child" });
-        await handle({ kind: "call", skill: child, args: "child" });
+        await handle({ kind: "call", skill: { name: "child", version: child.version }, args: "child" });
+        await handle({ kind: "call", skill: { name: "child", version: child.version }, args: "child" });
       }
       return completed;
     };
@@ -362,10 +362,10 @@ describe("durable program execution through host capabilities", () => {
     }
   });
 
-  test("an undeclared exact dependency cannot acquire a child execution", async () => {
+  test("an undeclared named dependency cannot acquire a child execution", async () => {
     let dependency: SkillRef;
     const { store, run, manager } = fixture(async (_source, _args, handle) => {
-      await handle({ kind: "call", skill: dependency, args: null });
+      await handle({ kind: "call", skill: { name: "not-declared", version: dependency.version }, args: null });
       return completed;
     });
     dependency = await register(manager, run.run_id, "not-declared");

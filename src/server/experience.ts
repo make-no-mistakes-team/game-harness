@@ -11,6 +11,7 @@ import type {
 } from "../shared/programs.ts";
 import type { Store } from "./store.ts";
 import type { SkillManager } from "./skills.ts";
+import { SKILL_API_VERSION } from "../shared/programs.ts";
 import { confirmedRemoval, eligibleLog } from "./objective-metrics.ts";
 export const CURRENT_PROGRAM_COMPATIBILITY = Object.freeze({
   adapter_id: "fabric-owned-client" as const,
@@ -18,13 +19,13 @@ export const CURRENT_PROGRAM_COMPATIBILITY = Object.freeze({
   observation_schema: 2 as const,
   profile_id: "player-observable-structured" as const,
   preset_id: "minecraft-observable-initial-r2" as const,
-  skill_protocol: 2 as const,
+  skill_protocol: SKILL_API_VERSION,
 });
 export type ProgramCompatibility = typeof CURRENT_PROGRAM_COMPATIBILITY;
 type LegacyProgramCompatibility = Omit<ProgramCompatibility, "observation_schema" | "preset_id" | "skill_protocol"> & {
-  observation_schema: 1;
-  preset_id: "minecraft-observable-initial-r1";
-  skill_protocol: 1;
+  observation_schema: 1 | 2;
+  preset_id: "minecraft-observable-initial-r1" | "minecraft-observable-initial-r2";
+  skill_protocol: 1 | 2;
 };
 function compatible(
   value: unknown,
@@ -129,6 +130,14 @@ export class ExperienceLibrary {
     this.db.exec(
       "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS bundles(id TEXT PRIMARY KEY,model TEXT NOT NULL,payload TEXT NOT NULL CHECK(json_valid(payload))) STRICT;",
     );
+    this.db.transaction(() => {
+      const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(bundles)").all();
+      if (!columns.some((column) => column.name === "revision")) {
+        this.db.exec("ALTER TABLE bundles ADD COLUMN revision INTEGER");
+        this.db.exec("UPDATE bundles SET revision=rowid");
+      }
+      this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS bundles_revision ON bundles(revision)");
+    })();
   }
   list(modelId: string, worldId: string | null): ExperienceView[] {
     return this.db
@@ -145,6 +154,31 @@ export class ExperienceLibrary {
           compatible(view.compatibility, this.current) &&
           (view.portability === "portable" || view.source_world_id === worldId),
       );
+  }
+  catalog(modelId: string, worldId: string | null, after: number, limit: number) {
+    if (!this.current) return { records: [], next_after: after, has_more: false, omissions: [] };
+    const rows = this.db.query<{ version: number; payload: string }, [string, string | null, string, number, number, number]>(
+      "WITH compatible AS (SELECT revision AS version,payload FROM bundles WHERE model=? AND (json_extract(payload,'$.portability')='portable' OR json_extract(payload,'$.source_world_id')=?) AND NOT EXISTS (SELECT 1 FROM json_each(?) current WHERE json_extract(payload,'$.compatibility.'||current.key) IS NOT current.value)), latest AS (SELECT json_extract(payload,'$.name') AS name,MAX(version) AS version FROM compatible GROUP BY name) SELECT c.version,c.payload FROM compatible c JOIN latest l ON c.version=l.version WHERE (?=0 OR c.version<?) ORDER BY c.version DESC LIMIT ?",
+    ).all(modelId, worldId, JSON.stringify(this.current), after, after, limit + 1);
+    const selected = rows.slice(0, limit);
+    return { records: selected.map(({ version, payload }) => {
+      const { skills: _skills, ...view } = JSON.parse(payload) as Bundle;
+      return { ...view, version };
+    }), next_after: selected.at(-1)?.version ?? after, has_more: rows.length > limit, omissions: [] };
+  }
+  named(modelId: string, worldId: string | null, name: string, version?: number): (ExperienceView & { version: number }) | null {
+    if (!this.current) return null;
+    const row = this.db.query<{ version: number; payload: string }, [string, string, number | null, number | null, string | null, string]>(
+      "SELECT revision AS version,payload FROM bundles WHERE model=? AND json_extract(payload,'$.name')=? AND revision IS NOT NULL AND (? IS NULL OR revision=?) AND (json_extract(payload,'$.portability')='portable' OR json_extract(payload,'$.source_world_id')=?) AND NOT EXISTS (SELECT 1 FROM json_each(?) current WHERE json_extract(payload,'$.compatibility.'||current.key) IS NOT current.value) ORDER BY revision DESC LIMIT 1",
+    ).get(modelId, name, version ?? null, version ?? null, worldId, JSON.stringify(this.current));
+    if (!row) return null;
+    const { skills: _skills, ...view } = JSON.parse(row.payload) as Bundle;
+    return { ...view, version: row.version };
+  }
+  snapshotVersion(id: string, modelId: string): number | null {
+    return this.db.query<{ version: number }, [string, string]>(
+      "SELECT revision AS version FROM bundles WHERE id=? AND model=?",
+    ).get(id, modelId)?.version ?? null;
   }
   /** Historical snapshots stay inspectable without becoming executable-compatible. */
   inspect(id: string, modelId: string): ExperienceView | null {
@@ -307,6 +341,8 @@ export class ExperienceLibrary {
       const skill = store.skill(runId, ref);
       if (skill.state !== "validated")
         throw new Error("Promotion requires validated exact dependencies");
+      if (skill.validation.runtime_version !== SKILL_API_VERSION)
+        throw new Error("Promotion requires compatible skill API sources; retained incompatible history is inspectable only");
       for (const dependency of skill.dependencies) visit(dependency);
       skills.push(skill);
     };
@@ -333,13 +369,11 @@ export class ExperienceLibrary {
     const experience_id = createHash("sha256")
       .update(JSON.stringify(payload))
       .digest("hex");
-    this.db
-      .query("INSERT INTO bundles(id,model,payload) VALUES(?,?,?)")
-      .run(
-        experience_id,
-        run.model_id,
-        JSON.stringify({ ...payload, experience_id }),
-      );
+    this.db.transaction(() => {
+      const revision = this.db.query<{ revision: number }, []>("SELECT COALESCE(MAX(revision),0)+1 AS revision FROM bundles").get()!.revision;
+      this.db.query("INSERT INTO bundles(id,model,payload,revision) VALUES(?,?,?,?)")
+        .run(experience_id, run.model_id, JSON.stringify({ ...payload, experience_id }), revision);
+    })();
     const { skills: _skills, ...view } = { ...payload, experience_id };
     return view;
   }

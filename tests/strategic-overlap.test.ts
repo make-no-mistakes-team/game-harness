@@ -5,8 +5,9 @@ import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentEvent, AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import type { ToolCall } from "@oh-my-pi/pi-ai";
-import type { Observation } from "../src/shared/contracts.ts";
+import type { Json, Observation } from "../src/shared/contracts.ts";
 import type { PlanningContext } from "../src/shared/planning.ts";
+import { TOOL_POLICY } from "../src/shared/tool-policy.ts";
 import type { AuthManager } from "../src/server/auth.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
@@ -18,8 +19,9 @@ import { emptyRunUsage } from "../src/server/usage.ts";
 
 type Gate = Parameters<Agent["setBeforeModelCall"]>[0];
 type ToolGate = NonNullable<Agent["beforeToolCall"]>;
+type DeclaredCall = { name: string; arguments?: Record<string, unknown> };
 interface HarnessAgent {
-  call(toolNames?: string[]): Promise<boolean>;
+  call(tools?: DeclaredCall[]): Promise<boolean>;
   tool(name: string): Promise<boolean>;
   wait(promise: Promise<void>): Promise<void>;
   catalog(): string[];
@@ -27,436 +29,241 @@ interface HarnessAgent {
 const resources: { planner: StrategicPlanner; store: Store; directory: string }[] = [];
 const managers: SkillManager[] = [];
 afterEach(async () => {
-  vi.useRealTimers();
-  vi.restoreAllMocks();
+  vi.useRealTimers(); vi.restoreAllMocks();
   const failures: unknown[] = [];
   for (const manager of managers.splice(0)) {
-    try { await manager.closeAll("Test complete"); }
-    catch (error) { failures.push(error); }
+    try { await manager.closeAll("Test complete"); } catch (error) { failures.push(error); }
   }
   for (const { planner, store, directory } of resources.splice(0)) {
-    try { await planner.close(); }
-    catch (error) { failures.push(error); }
-    finally {
-      store.close();
-      rmSync(directory, { recursive: true, force: true });
-    }
+    try { await planner.close(); } catch (error) { failures.push(error); }
+    finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
   }
   if (failures.length) throw new AggregateError(failures, "Fixture owners did not drain cleanly");
 });
+function object(value: Json): { [key: string]: Json } | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
 function setup(onPrompt: (context: Record<string, unknown>, agent: HarnessAgent) => Promise<void>) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-overlap-"));
   const store = new Store(directory);
-  const run: StoredRun = {
-    run_id: crypto.randomUUID(), session_id: "session", life_id: 1,
+  const run: StoredRun = { run_id: crypto.randomUUID(), session_id: "session", life_id: 1,
     task: "Observe", goal: "custom", model_id: "fixture-model", world_id: "world", epoch: 1,
     status: "running", started_at: null, ended_at: null, turns: 0, model_status: "idle", error: null,
-    usage: emptyRunUsage(), baseline: {},
-  };
+    usage: emptyRunUsage(), baseline: {} };
   store.saveRun(run);
-  const observation: Observation = {
-    schema_version: 2, session_id: "session", world_id: "world", epoch: 1,
-    life: { life_id: 1, status: "alive", can_respawn: false, death: null },
-    observation_seq: 1, captured_at: new Date().toISOString(), profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r2",
+  const observation: Observation = { schema_version: 2, session_id: "session", world_id: "world", epoch: 1,
+    life: { life_id: 1, status: "alive", can_respawn: false, death: null }, observation_seq: 1,
+    captured_at: new Date().toISOString(), profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r2",
     player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: 20, food: 20, on_ground: true, in_water: false, inventory: [] },
-    blocks: [], entities: [], sounds: [], coverage: { partial: true, max_age_ms: 1000 },
-  };
-  const basis: PlanningContext = {
-    run_id: run.run_id, generation: 1, session_id: "session", world_id: "world", epoch: 1,
+    blocks: [], entities: [], sounds: [], coverage: { partial: true, max_age_ms: 1000 } };
+  const basis: PlanningContext = { run_id: run.run_id, generation: 1, session_id: "session", world_id: "world", epoch: 1,
     life_id: 1, life_status: "alive", task: run.task, goal: run.goal,
-    root: { execution_id: "root", skill_id: "skill", version: 1, hash: "exact", status: "running" },
-  };
-  const state = { pending: true, bootstrapFinishes: 0, reviews: 0, aborts: 0, pauses: [] as string[], contexts: [] as Record<string, unknown>[], catalogs: [] as string[][] };
-  const tools: AgentTool[] = [
-    "capabilities_read", "observation_read", "skill_read", "skill_history",
-    "planning_stage", "planning_read", "skill_start", "skill_register", "skill_revise",
-    "planning_activate", "policy_activate", "skill_cancel", "improvement_feedback",
-    "improvement_resolve", "version_compare", "trace_read",
-  ].map((name) => ({
-    name, label: name, description: "Fixture tool boundary", parameters: { type: "object", properties: {} },
-    execute: async () => ({ content: [], details: null }),
-  }));
+    root: { execution_id: "root", skill_id: "skill", version: 1, hash: "exact", status: "running" } };
+  const state = { pending: true, reviews: 0, aborts: 0, pauses: [] as string[], contexts: [] as Record<string, unknown>[], catalogs: [] as string[][] };
+  const tools: AgentTool[] = Object.keys(TOOL_POLICY).map((name) => ({ name, label: name,
+    description: "Injected model tool seam", parameters: { type: "object", properties: {} },
+    execute: async () => ({ content: [], details: null }) }));
   let planner: StrategicPlanner;
   const speculation = new SpeculativePlanning({
-    admissionContext: () => basis,
-    context: () => basis, skill: () => null, observe: async () => observation,
-    evaluatePrecondition: async () => { throw new Error("Not used in scheduler regression"); },
-    admit: async () => { throw new Error("Scheduler cannot admit a draft"); },
+    admissionContext: () => basis, context: () => basis, skill: () => null, observe: async () => observation,
+    evaluateGuard: async () => { throw new Error("No game guard evaluated by scheduler fixture"); },
+    admit: async () => { throw new Error("Scheduler fixture has no prepared successor"); },
     evidence: (type, details) => { store.event(run.run_id, type, type, details); },
-    wake: () => planner.wake("speculative_lookahead"),
+    wake: (reason) => planner.wake(reason === "lookahead" ? "speculative_lookahead" : "planning_continuation"),
   });
   const auth = {
-    createAgent: async (options: { tools: AgentTool[] }) => {
-      let activeTools = options.tools;
-      let gate: Gate | undefined;
-      let listener: ((event: AgentEvent) => void) | undefined;
-      let promptController: AbortController | null = null;
-      let activePrompt: Promise<void> | null = null;
+    createAgent: async (configuration: { tools: AgentTool[] }) => {
+      let activeTools = configuration.tools, gate: Gate | undefined, listener: ((event: AgentEvent) => void) | undefined;
+      let controller: AbortController | null = null, pending: Promise<void> | null = null;
       const agent = {
         beforeToolCall: undefined as Agent["beforeToolCall"],
         setBeforeModelCall: (value: Gate) => { gate = value; },
         subscribe: (value: (event: AgentEvent) => void) => { listener = value; return () => { listener = undefined; }; },
-        abort: () => { state.aborts++; promptController?.abort(); },
-        waitForIdle: async () => { await activePrompt; },
-        replaceMessages: () => {},
-        setTools: (selected: AgentTool[]) => {
-          activeTools = selected;
-          state.catalogs.push(selected.map((tool) => tool.name));
-        },
+        abort: () => { state.aborts++; controller?.abort(); },
+        waitForIdle: async () => { if (pending) await pending; }, replaceMessages: () => {},
+        setTools: (selected: AgentTool[]) => { activeTools = selected; state.catalogs.push(selected.map((entry) => entry.name)); },
         prompt: async (text: string) => {
-          const controller = new AbortController();
-          promptController = controller;
-          const context = JSON.parse(text);
-          state.contexts.push(context);
-          const prompt = onPrompt(context, {
-            call: async (toolNames = []) => {
-              if (controller.signal.aborted) return false;
-              const result = await gate?.({ systemPrompt: [], messages: [], tools: activeTools });
-              listener?.({
-                type: "message_end",
-                message: {
-                  role: "assistant",
-                  content: result?.stop ? [] : toolNames.map((name, index): ToolCall => ({
-                    type: "toolCall", id: `${name}-${index}`, name, arguments: {},
-                  })),
-                  api: "openai-responses",
-                  provider: "openai", model: "fixture-model", timestamp: Date.now(),
-                  stopReason: result?.stop ? "aborted" : "stop", errorMessage: result?.reason,
-                  usage: {
-                    input: 1, output: 1, cacheRead: 0, cacheWrite: 0,
-                    totalTokens: 2,
-                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-                  },
-                },
-              });
-              return !result?.stop;
+          const signal = new AbortController(); controller = signal;
+          const context = JSON.parse(text) as Record<string, unknown>; state.contexts.push(context);
+          const work = onPrompt(context, {
+            call: async (declared = []) => {
+              if (signal.signal.aborted) return false;
+              const admitted = await gate?.({ systemPrompt: [], messages: [], tools: activeTools });
+              listener?.({ type: "message_end", message: {
+                role: "assistant", content: admitted?.stop ? [] : declared.map((entry, index): ToolCall => ({ type: "toolCall", id: `${entry.name}-${index}`, name: entry.name, arguments: entry.arguments ?? {} })),
+                api: "openai-responses", provider: "openai", model: "fixture-model", timestamp: Date.now(),
+                stopReason: admitted?.stop ? "aborted" : "stop", errorMessage: admitted?.reason,
+                usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+              } });
+              return !admitted?.stop;
             },
-            tool: async (name) => !controller.signal.aborted && !(await agent.beforeToolCall?.({ tool: { name } } as Parameters<ToolGate>[0]))?.block,
-            wait: async (pending) => {
-              if (controller.signal.aborted) return;
-              const cancelled = Promise.withResolvers<void>();
-              const onAbort = () => cancelled.resolve();
-              controller.signal.addEventListener("abort", onAbort, { once: true });
-              try { await Promise.race([pending, cancelled.promise]); }
-              finally { controller.signal.removeEventListener("abort", onAbort); }
+            tool: async (name) => !signal.signal.aborted && !(await agent.beforeToolCall?.({ tool: { name } } as Parameters<ToolGate>[0]))?.block,
+            wait: async (promise) => {
+              const revoked = Promise.withResolvers<void>();
+              const onAbort = () => revoked.resolve(); signal.signal.addEventListener("abort", onAbort, { once: true });
+              try { await Promise.race([promise, revoked.promise]); } finally { signal.signal.removeEventListener("abort", onAbort); }
             },
-            catalog: () => activeTools.map((tool) => tool.name),
+            catalog: () => activeTools.map((entry) => entry.name),
           });
-          activePrompt = prompt;
-          try { await prompt; }
-          finally {
-            if (activePrompt === prompt) activePrompt = null;
-            if (promptController === controller) promptController = null;
-          }
+          pending = work;
+          try { await work; } finally { if (pending === work) pending = null; if (controller === signal) controller = null; }
         },
       };
       return agent as unknown as Agent;
-    },
-    releaseAgent: async () => {},
+    }, releaseAgent: async () => {},
   } as unknown as AuthManager;
   planner = new StrategicPlanner(store, auth, {
     run: () => run, generation: () => 1,
     assertCurrent: (generation, epoch) => {
-      if (generation !== 1 || (epoch !== undefined && epoch !== 1) || !["running", "bootstrapping", "reviewing"].includes(run.status)) throw new RuntimeFault("stale_context", "revoked");
+      if (generation !== 1 || epoch !== undefined && epoch !== run.epoch || !["running", "reviewing"].includes(run.status))
+        throw new RuntimeFault("stale_context", "Fixture authority revoked");
       return run;
     },
-    tools: () => tools, rootPrompt: () => "Fixture", observe: async () => observation,
-    policies: () => [], action: () => null, programPending: () => state.pending, busy: () => true,
-    persist: () => store.saveRun(run),
-    pause: (reason) => { state.pauses.push(reason); }, terminal: () => { throw new Error("Unexpected terminal transition"); },
-    finishBootstrap: () => { state.bootstrapFinishes++; run.status = "running"; },
-    speculation: () => speculation,
+    tools: () => tools, rootPrompt: () => "Neutral scheduler fixture", observe: async () => observation,
+    policies: () => [], action: () => null, programPending: () => state.pending, busy: () => state.pending,
+    persist: () => store.saveRun(run), pause: (reason) => { state.pauses.push(reason); },
+    terminal: () => { throw new Error("Unexpected terminal transition"); }, speculation: () => speculation,
     reviewContext: () => ({ opportunities: [], uncertainty: "unmeasured" }),
     reviewComplete: () => { state.reviews++; run.status = "completed"; planner.fence(); },
   });
   resources.push({ planner, store, directory });
   const event = (type: string) => {
     const done = Promise.withResolvers<void>();
-    const unsubscribe = store.subscribe((entry) => { if (entry.type === type && entry.run_id === run.run_id) { unsubscribe(); done.resolve(); } });
+    const off = store.subscribe((entry) => { if (entry.type === type && entry.run_id === run.run_id) { off(); done.resolve(); } });
     return done.promise;
   };
-  const optIn = () => speculation.optIn({ root_execution_id: "root", after_ms: 0, reason: "Independent follow-up", budget: { calls: 3, tools: 6, duration_ms: 5000 } });
+  const optIn = () => speculation.optIn({ root_execution_id: basis.root.execution_id, after_ms: 0, reason: "Independent follow-up", budget: { calls: 3, tools: 6, duration_ms: 5000 } });
   return { planner, speculation, run, state, event, optIn, store, basis };
 }
 
 for (const selectedKind of ["lookahead", "attention"] as const) {
-  test(`${selectedKind} timer survives a real root's next leaf admission before scheduler coalescing`, async () => {
-    const fixture = setup(async (context, agent) => {
+  test(`${selectedKind} survives the current root's next real capability admission`, async () => {
+    const f = setup(async (context, agent) => {
       expect(await agent.call()).toBe(true);
       if (selectedKind === "lookahead") expect(context.speculative_plan).not.toBeNull();
-      else {
-        expect(context.speculative_plan).toBeNull();
-        expect(context.attention).toBe("Independent selected attention");
-        expect(await agent.call()).toBe(false);
-      }
+      else { expect(context.speculative_plan).toBeNull(); expect(await agent.call()).toBe(false); }
     });
-    await fixture.planner.start(1);
-    const firstLeaf = Promise.withResolvers<void>();
-    const secondLeaf = Promise.withResolvers<void>();
-    const continueRoot = Promise.withResolvers<void>();
-    const finishRoot = Promise.withResolvers<void>();
-    const rootClosed = Promise.withResolvers<void>();
-    let leaves = 0;
-    let rootId = "";
-    const selected = Promise.withResolvers<void>();
-    const selectedReason = selectedKind === "lookahead" ? "speculative_lookahead" : "selected_attention";
-    const wake = fixture.planner.wake.bind(fixture.planner);
-    vi.spyOn(fixture.planner, "wake").mockImplementation((reason) => {
-      wake(reason);
-      if (reason === selectedReason) selected.resolve();
-    });
-    const finished = fixture.event(selectedKind === "lookahead" ? "scheduler.lookahead_finished" : "scheduler.turn_finished");
+    await f.planner.start(1);
+    const first = Promise.withResolvers<void>(), second = Promise.withResolvers<void>();
+    const proceed = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>(), closed = Promise.withResolvers<void>();
+    const selected = Promise.withResolvers<void>(); let leaves = 0, rootId = "";
+    const wake = f.planner.wake.bind(f.planner);
+    vi.spyOn(f.planner, "wake").mockImplementation((reason) => { wake(reason); if (reason === (selectedKind === "lookahead" ? "speculative_lookahead" : "selected_attention")) selected.resolve(); });
+    const finished = f.event(selectedKind === "lookahead" ? "scheduler.lookahead_finished" : "scheduler.turn_finished");
     const runner: SandboxService["runSkill"] = async (_source, _args, handle, _limits, signal) => {
-      const revoked = Promise.withResolvers<void>();
-      const onAbort = () => revoked.resolve();
-      signal?.addEventListener("abort", onAbort, { once: true });
+      const revoked = Promise.withResolvers<void>(), onAbort = () => revoked.resolve(); signal.addEventListener("abort", onAbort, { once: true });
       try {
-        await handle({ kind: "action", action: { kind: "look", yaw: 0, pitch: 0 } });
-        firstLeaf.resolve();
-        await Promise.race([continueRoot.promise, revoked.promise]);
-        if (!signal?.aborted) {
-          await handle({ kind: "action", action: { kind: "look", yaw: 1, pitch: 0 } });
-          secondLeaf.resolve();
-        }
-        await Promise.race([finishRoot.promise, revoked.promise]);
+        await handle({ kind: "action", action: { kind: "look", yaw: 0, pitch: 0 } }); first.resolve();
+        await Promise.race([proceed.promise, revoked.promise]);
+        if (!signal.aborted) { await handle({ kind: "action", action: { kind: "look", yaw: 1, pitch: 0 } }); second.resolve(); }
+        await Promise.race([finish.promise, revoked.promise]);
         return { status: "completed", summary: "Neutral root continued", result: null };
-      } finally {
-        signal?.removeEventListener("abort", onAbort);
-      }
+      } finally { signal.removeEventListener("abort", onAbort); }
     };
-    const manager = new SkillManager(fixture.store, { runSkill: runner }, {
-      authorize: (runId, epoch, sessionId, lifeId) => {
-        if (runId !== fixture.run.run_id || epoch !== 1 || sessionId !== "session" || lifeId !== 1)
-          throw new Error("Root authority revoked");
-      },
-      observe: async () => { throw new Error("No observation requested by neutral root"); },
-      action: async () => {
-        leaves++;
-        fixture.planner.admitted();
-        return { status: "succeeded", summary: "Neutral fixture leaf acknowledged", evidence: { effect_confirmed: true } };
-      },
-      recipes: async () => [],
-      recover: async () => { throw new Error("No recovery requested"); },
-      cancelActions: async () => {},
-      prepareLookahead: (config) => fixture.speculation.prepareOptIn(config),
-      changed: (_wake, execution) => {
-        fixture.state.pending = manager.pending;
-        const current = fixture.store.latestRootExecution(fixture.run.run_id);
-        if (current) fixture.basis.root = {
-          execution_id: current.execution_id, skill_id: current.skill_id,
-          version: current.version, hash: fixture.store.skill(fixture.run.run_id, current).hash,
-          status: current.status,
-        };
-        if (execution?.execution_id === rootId && execution.ended_at !== null) rootClosed.resolve();
-      },
-      unsafe: () => { fixture.state.pauses.push("Unconfirmed fixture cleanup"); },
+    const manager = new SkillManager(f.store, { runSkill: runner }, {
+      authorize: (runId, epoch, session, life) => { if (runId !== f.run.run_id || epoch !== 1 || session !== "session" || life !== 1) throw new Error("Revoked root"); },
+      observe: async () => { throw new Error("No observation requested"); }, recipes: async () => [],
+      action: async () => { leaves++; f.planner.admitted(); return { status: "succeeded", summary: "Confirmed neutral capability", evidence: { effect_confirmed: true } }; },
+      recover: async () => { throw new Error("No recovery requested"); }, cancelActions: async () => {},
+      prepareLookahead: (configuration) => f.speculation.prepareOptIn(configuration),
+      changed: (outcome, execution) => {
+        f.state.pending = manager.pending;
+        const root = f.store.latestRootExecution(f.run.run_id);
+        if (root) f.basis.root = { execution_id: root.execution_id, skill_id: root.skill_id, version: root.version, hash: f.store.skill(f.run.run_id, root).hash, status: root.status };
+        if (outcome && execution?.execution_id === rootId) closed.resolve();
+      }, unsafe: () => { f.state.pauses.push("Unconfirmed cleanup"); },
     });
     managers.push(manager);
-    const source = await manager.register(fixture.run.run_id, {
-      name: "continued-neutral-root",
-      source: 'await game.action({kind:"look",yaw:0,pitch:0}); await game.action({kind:"look",yaw:1,pitch:0}); return {status:"completed",summary:"Neutral root continued",result:null};',
-      card: { purpose: "Exercise continued root admission", applicability: "Neutral regression", method: "Two acknowledged leaf calls", reason: "Selected wake survives continuation", limitations: "No gameplay effectiveness claim" },
-      dependencies: [],
-    });
-    const root = manager.start(fixture.run.run_id, {
-      skill_id: source.skill_id, version: source.version, start_key: "continued_root",
-      epoch: 1, session_id: "session", life_id: 1, args: null,
-      limits: { duration_ms: 10_000, max_actions: 2, max_calls: 2, max_depth: 1 },
-      ...(selectedKind === "lookahead" ? {
-        lookahead: { after_ms: 0, reason: "Independent selected lookahead", budget: { calls: 1, tools: 2, duration_ms: 5000 } },
-      } : {}),
-    });
-    rootId = root.execution_id;
-    fixture.planner.admitted();
-    await firstLeaf.promise;
-    if (selectedKind === "attention") fixture.planner.attentionAfter(1000, "Independent selected attention");
-    await selected.promise;
-    continueRoot.resolve();
-    await secondLeaf.promise;
-    expect(leaves).toBe(2);
-    expect(manager.get(fixture.run.run_id, { execution_id: rootId })?.status).toBe("running");
-    await finished;
-    expect(fixture.state.contexts).toHaveLength(1);
-    expect(fixture.run.usage.calls).toBe(1);
-    expect(manager.pending).toBe(true);
-    finishRoot.resolve();
-    await rootClosed.promise;
-    expect(manager.get(fixture.run.run_id, { execution_id: rootId })).toMatchObject({ status: "succeeded", actions: 2 });
-    expect(fixture.state.pauses).toEqual([]);
+    const program = await manager.register(f.run.run_id, { name: "Neutral continued program", source: 'await game.action({kind:"look",yaw:0,pitch:0}); await game.action({kind:"look",yaw:1,pitch:0}); return {status:"completed",summary:"Neutral flow settled",result:null};',
+      card: { purpose: "Measure selected attention", applicability: "Neutral fixture", method: "Two authorized capabilities", reason: "Prove root handoff", limitations: "No gameplay claim" }, dependencies: [] });
+    const root = manager.start(f.run.run_id, { skill_id: program.skill_id, version: program.version, start_key: "continued", epoch: 1, session_id: "session", life_id: 1, args: null,
+      limits: { duration_ms: 10000, max_actions: 2, max_calls: 2, max_depth: 1 },
+      ...(selectedKind === "lookahead" ? { lookahead: { after_ms: 0, reason: "Independent selected follow-up", budget: { calls: 1, tools: 2, duration_ms: 5000 } } } : {}) });
+    rootId = root.execution_id; f.planner.admitted(); await first.promise;
+    if (selectedKind === "attention") f.planner.attentionAfter(1000, "Independent selected attention");
+    await selected.promise; proceed.resolve(); await second.promise;
+    expect(leaves).toBe(2); expect(manager.get(f.run.run_id, { execution_id: rootId })?.status).toBe("running");
+    await finished; expect(f.state.contexts).toHaveLength(1); expect(f.run.usage.calls).toBe(1); expect(manager.pending).toBe(true);
+    finish.resolve(); await closed.promise;
+    expect(manager.get(f.run.run_id, { execution_id: rootId })).toMatchObject({ status: "succeeded", actions: 2 });
+    expect(f.state.pauses).toEqual([]);
   });
 }
 
-test("intentional lookahead advertises bounded read-only planning while pending program continues", async () => {
-  const fixture = setup(async (context, agent) => {
-    expect(context.speculative_plan).not.toBeNull();
-    expect(agent.catalog()).toContain("planning_stage");
-    expect(agent.catalog()).toContain("skill_read");
-    for (const forbidden of ["skill_start", "skill_register", "skill_revise", "planning_activate", "policy_activate", "skill_cancel"])
-      expect(agent.catalog()).not.toContain(forbidden);
-    expect(await agent.call(["skill_register"])).toBe(true);
-    expect(await agent.tool("skill_register")).toBe(false);
-    expect(await agent.tool("skill_read")).toBe(true);
-    expect(await agent.call()).toBe(true);
-    expect(await agent.call()).toBe(true);
-    expect(await agent.call()).toBe(false);
-    expect(await agent.tool("skill_start")).toBe(false);
+test("restricted planning has a finite request budget and cannot dispatch ordinary execution controls", async () => {
+  const f = setup(async (_context, agent) => {
+    expect(agent.catalog()).toContain("prepare_next"); expect(agent.catalog()).not.toContain("program_run");
+    expect(agent.catalog()).not.toContain("program_write");
+    expect(await agent.call([{ name: "prepare_next" }])).toBe(true);
+    expect(await agent.tool("program_run")).toBe(false); expect(await agent.tool("program_write")).toBe(false);
+    expect(await agent.tool("program_inspect")).toBe(true);
+    expect(await agent.call()).toBe(true); expect(await agent.call()).toBe(true); expect(await agent.call()).toBe(false);
   });
-  await fixture.planner.start(1);
-  const finished = fixture.event("scheduler.lookahead_finished"); fixture.optIn(); await finished;
-  expect(fixture.state.pending).toBe(true);
-  expect(fixture.run.usage.calls).toBe(3);
-  expect(fixture.run.usage.by_purpose.planning.calls).toBe(3);
-  expect(fixture.run.usage.by_purpose.authoring.calls).toBe(0);
-  expect(fixture.state.contexts).toHaveLength(1);
-  expect(fixture.state.catalogs.at(-1)).toContain("skill_start");
-  expect(fixture.state.catalogs.at(-1)).toContain("skill_register");
-  expect(fixture.state.bootstrapFinishes).toBe(0);
-  expect(fixture.state.pauses).toEqual([]);
+  await f.planner.start(1); const done = f.event("scheduler.lookahead_finished"); f.optIn(); await done;
+  expect(f.run.usage.calls).toBe(3); expect(f.run.usage.by_purpose.planning.calls).toBe(3);
+  expect(f.state.contexts).toHaveLength(1); expect(f.state.catalogs.at(-1)).toContain("program_run"); expect(f.state.pauses).toEqual([]);
 });
 
 for (const sample of [
-  { wake: "recovery_completed", tools: ["skill_register"], purpose: "authoring" },
-  { wake: "recovery_completed", tools: ["policy_register"], purpose: "authoring" },
-  { wake: "recovery_completed", tools: ["skill_register", "skill_revise"], purpose: "improvement" },
-  { wake: "recovery_completed", tools: ["version_compare"], purpose: "improvement" },
-  { wake: "uncertainty", tools: ["skill_register", "skill_revise"], purpose: "replanning" },
-  { wake: "skill_outcome", tools: ["skill_register"], purpose: "replanning", failure: true },
+  { wake: "preflight_ready", calls: [{ name: "program_write", arguments: {} }], purpose: "authoring" },
+  { wake: "preflight_ready", calls: [{ name: "program_write", arguments: { based_on: 1 } }], purpose: "improvement" },
+  { wake: "preflight_ready", calls: [{ name: "program_inspect", arguments: { view: "comparison" } }], purpose: "improvement" },
+  { wake: "uncertainty", calls: [{ name: "program_write", arguments: { based_on: 1 } }], purpose: "replanning" },
+  { wake: "skill_outcome", calls: [{ name: "program_write", arguments: {} }], purpose: "replanning", failure: true },
 ] as const) {
-  test(`host classifies ${sample.wake}/${sample.tools.join("+")} without an extra telemetry request`, async () => {
-    const fixture = setup(async (_context, agent) => {
-      expect(await agent.call([...sample.tools])).toBe(true);
-    });
-    fixture.state.pending = false;
-    if ("failure" in sample) fixture.store.event(fixture.run.run_id, "action.unknown", "Fixture effect remains unconfirmed", {
-      action_id: "unconfirmed-effect", status: "unknown",
-    });
-    await fixture.planner.start(1);
-    const finished = fixture.event("scheduler.turn_finished");
-    fixture.planner.wake(sample.wake);
-    await finished;
-    expect(fixture.run.usage).toMatchObject({ calls: 1, uncached_input: 1, output: 1, known_cost: null });
-    expect(fixture.run.usage.by_purpose[sample.purpose].calls).toBe(1);
-    const callsByPurpose = Object.values(fixture.run.usage.by_purpose).map((usage) => usage.calls);
-    expect(callsByPurpose).not.toContain(null);
-    expect(callsByPurpose.reduce<number>((sum, calls) => sum + (calls ?? 0), 0)).toBe(1);
-    const events = fixture.store.eventsAfter(fixture.run.run_id, 0, 500);
-    expect(events.find((event) => event.type === "model.call")?.details)
-      .toMatchObject({ purpose_source: "host_turn_role_v1", purpose_final: false });
-    expect(events.find((event) => event.type === "model.purpose_classified")?.details)
-      .toMatchObject({ purpose: sample.purpose, purpose_source: "host_role_and_tools_v1", purpose_final: true });
-    expect(events.find((event) => event.type === "model.usage")?.details)
-      .toMatchObject({ purpose: sample.purpose, purpose_final: true });
-    expect(fixture.state.contexts).toHaveLength(1);
+  test(`host accounts ${sample.wake}/${sample.purpose} without a separate accounting request`, async () => {
+    const f = setup(async (_context, agent) => { expect(await agent.call([...sample.calls])).toBe(true); });
+    f.state.pending = false;
+    if ("failure" in sample) f.store.event(f.run.run_id, "action.unknown", "Past effects remain uncertain", { action_id: "unknown", status: "unknown" });
+    await f.planner.start(1); const done = f.event("scheduler.turn_finished"); f.planner.wake(sample.wake); await done;
+    expect(f.run.usage).toMatchObject({ calls: 1, uncached_input: 1, output: 1, known_cost: null });
+    expect(f.run.usage.by_purpose[sample.purpose].calls).toBe(1);
+    const count = Object.values(f.run.usage.by_purpose).reduce((sum, usage) => sum + (usage.calls ?? 0), 0); expect(count).toBe(1);
+    const usage = f.store.eventsAfter(f.run.run_id, 0, 500).find((event) => event.type === "model.usage");
+    expect(object(usage?.details ?? null)?.purpose).toBe(sample.purpose);
+    expect(f.state.contexts).toHaveLength(1);
   });
 }
 
-test("uncertainty recovery admits one fresh strategic request without relaxing pending-work quota", async () => {
-  const fixture = setup(async (context, agent) => {
+test("uncertainty recovery admits one fresh request while private raw context stays out of compact feedback", async () => {
+  const f = setup(async (context, agent) => {
     expect(context.reason).toEqual(["uncertainty"]);
-    expect(context.feedback).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        type: "runtime.uncertainty",
-        details: expect.objectContaining({
-          action_id: "unknown-action", execution_id: "root", root_execution_id: "root",
-          session_id: "session", life_id: 1, status: "unknown", no_replay: true,
-        }),
-      }),
-      expect.objectContaining({
-        type: "runtime.uncertainty_reconciled",
-        details: expect.objectContaining({
-          session_id: "session", life_id: 1, observation_seq: 1,
-          neutralized: true, workers_closed: true, no_replay: true,
-        }),
-      }),
-    ]));
+    expect(context.feedback).toEqual(expect.arrayContaining([expect.objectContaining({ type: "runtime.uncertainty_reconciled", details: expect.objectContaining({ neutralized: true, workers_closed: true, no_replay: true }) })]));
     expect(JSON.stringify(context.feedback)).not.toContain("private-context-marker");
-    expect(await agent.call()).toBe(true);
-    expect(await agent.call()).toBe(false);
+    expect(await agent.call()).toBe(true); expect(await agent.call()).toBe(false);
   });
-  fixture.store.event(fixture.run.run_id, "runtime.uncertainty", "Unconfirmed effect fenced", {
-    action_id: "unknown-action", execution_id: "root", root_execution_id: "root",
-    session_id: "session", life_id: 1, status: "unknown", summary: "Effect remains unconfirmed", no_replay: true,
-    raw_context: { observation: "private-context-marker" },
-  });
-  fixture.store.event(fixture.run.run_id, "runtime.uncertainty_reconciled", "Fresh same-life authority restored", {
-    action_id: "unknown-action", session_id: "session", life_id: 1, observation_seq: 1,
-    neutralized: true, workers_closed: true, no_replay: true,
-  });
-  await fixture.planner.start(1);
-  const finished = fixture.event("scheduler.turn_finished");
-  fixture.planner.wake("uncertainty");
-  await finished;
-  expect(fixture.run.usage.calls).toBe(1);
-  expect(fixture.state.contexts).toHaveLength(1);
-  expect(fixture.state.pending).toBe(true);
-  expect(fixture.state.pauses).toEqual([]);
+  f.store.event(f.run.run_id, "runtime.uncertainty", "Unconfirmed effect fenced", { action_id: "unknown", execution_id: "root", session_id: "session", life_id: 1, status: "unknown", no_replay: true, raw_context: { observation: "private-context-marker" } });
+  f.store.event(f.run.run_id, "runtime.uncertainty_reconciled", "Fresh same-life authority", { action_id: "unknown", session_id: "session", life_id: 1, observation_seq: 1, neutralized: true, workers_closed: true, no_replay: true });
+  await f.planner.start(1); const done = f.event("scheduler.turn_finished"); f.planner.wake("uncertainty"); await done;
+  expect(f.run.usage.calls).toBe(1); expect(f.state.pending).toBe(true); expect(f.state.pauses).toEqual([]);
 });
 
-test("normal replan queued during overlap is not consumed, blocked, or granted extra pending-work quota", async () => {
-  const started = Promise.withResolvers<void>(); const release = Promise.withResolvers<void>();
-  const fixture = setup(async (context, agent) => {
+test("an ordinary replan cancels optional overlap without consuming the new wake", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const f = setup(async (context, agent) => {
     expect(await agent.call()).toBe(true);
-    if (context.speculative_plan) { started.resolve(); await agent.wait(release.promise); }
+    if (context.speculative_plan) { entered.resolve(); await agent.wait(release.promise); }
     else expect(await agent.call()).toBe(false);
   });
-  await fixture.planner.start(1);
-  const done = fixture.event("scheduler.turn_finished"); fixture.optIn(); await started.promise;
-  const evidence = fixture.store.event(fixture.run.run_id, "action.failed", "Measured failed action", { action_id: "failure" });
-  fixture.planner.wake("policy_replan");
-  expect(fixture.state.aborts).toBe(1);
-  expect(fixture.speculation.projection()?.state).toBe("invalidated");
+  await f.planner.start(1); const done = f.event("scheduler.turn_finished"); f.optIn(); await entered.promise;
+  const receipt = f.store.event(f.run.run_id, "action.failed", "Measured failed action", { action_id: "failure" });
+  f.planner.wake("policy_replan"); expect(f.state.aborts).toBe(1); expect(f.speculation.projection()?.state).toBe("invalidated");
   release.resolve(); await done;
-  expect(fixture.state.contexts).toHaveLength(2);
-  expect(fixture.state.contexts[1]?.speculative_plan).toBeNull();
-  expect(fixture.state.contexts[1]?.feedback).toEqual(expect.arrayContaining([expect.objectContaining({ event_seq: evidence.event_seq })]));
-  expect(fixture.run.usage.calls).toBe(2);
-  expect(fixture.state.pauses).toEqual([]);
+  expect(f.state.contexts).toHaveLength(2); expect(f.state.contexts[1]?.speculative_plan).toBeNull();
+  expect(f.state.contexts[1]?.feedback).toEqual(expect.arrayContaining([expect.objectContaining({ event_seq: receipt.event_seq })]));
+  expect(f.run.usage.calls).toBe(2); expect(f.state.pauses).toEqual([]);
 });
 
-test("speculative wake cannot spend or finish bootstrap; ordinary bootstrap still runs its original allowance", async () => {
-  const fixture = setup(async (context, agent) => {
-    expect(context.speculative_plan).toBeNull();
-    if (context.phase === "bootstrapping") {
-      for (let index = 0; index < 3; index++) expect(await agent.call()).toBe(true);
-      expect(await agent.call()).toBe(false);
-    } else expect(await agent.call()).toBe(true);
-  });
-  fixture.state.pending = false;
-  fixture.run.status = "bootstrapping";
-  await fixture.planner.start(1);
-  const skipped = fixture.event("scheduler.lookahead_skipped");
-  fixture.planner.wake("speculative_lookahead");
-  await skipped;
-  expect(fixture.store.eventsAfter(fixture.run.run_id, 0, 500)
-    .find((entry) => entry.type === "scheduler.lookahead_skipped")?.details)
-    .toMatchObject({ phase: "bootstrapping", reason: "bootstrap" });
-  expect(fixture.state.contexts).toEqual([]);
-  expect(fixture.speculation.projection()).toBeNull();
-  expect(fixture.run.usage.calls).toBe(0);
-  expect(fixture.state.bootstrapFinishes).toBe(0);
-  expect(fixture.run.status).toBe("bootstrapping");
-  const finished = fixture.event("scheduler.turn_finished"); fixture.planner.wake("bootstrap"); await finished;
-  expect(fixture.state.bootstrapFinishes).toBe(1);
-  expect(fixture.run.usage.by_purpose.authoring.calls).toBe(3);
-});
-
-test("post-goal review is finite, improvement-attributed, effect-free, and completes once", async () => {
-  const fixture = setup(async (context, agent) => {
+test("post-goal review remains finite and effect-free while permitting source and assessment artifacts", async () => {
+  const f = setup(async (context, agent) => {
     expect(context.phase).toBe("reviewing");
-    expect(await agent.tool("skill_start")).toBe(false);
-    expect(await agent.tool("policy_activate")).toBe(false);
-    expect(await agent.tool("planning_activate")).toBe(false);
-    expect(await agent.tool("skill_revise")).toBe(true);
-    expect(await agent.tool("improvement_resolve")).toBe(true);
-    for (let index = 0; index < 3; index++) expect(await agent.call(index === 0 ? ["skill_register"] : [])).toBe(true);
+    expect(await agent.tool("program_run")).toBe(false); expect(await agent.tool("prepare_next")).toBe(false); expect(await agent.tool("reflex")).toBe(false);
+    expect(await agent.tool("program_write")).toBe(true); expect(await agent.tool("program_review")).toBe(true);
+    for (let index = 0; index < 3; index++) expect(await agent.call(index === 0 ? [{ name: "program_write" }] : [])).toBe(true);
     expect(await agent.call()).toBe(false);
   });
-  fixture.run.status = "reviewing"; fixture.state.pending = false;
-  await fixture.planner.start(1);
-  const finished = fixture.event("scheduler.review_finished"); fixture.planner.wake("goal_review"); await finished;
-  expect(fixture.state.reviews).toBe(1);
-  expect(String(fixture.run.status)).toBe("completed");
-  expect(fixture.run.usage.by_purpose.improvement.calls).toBe(3);
-  expect(fixture.state.bootstrapFinishes).toBe(0);
-  expect(fixture.state.pauses).toEqual([]);
+  f.run.status = "reviewing"; f.state.pending = false;
+  await f.planner.start(1); const done = f.event("scheduler.review_finished"); f.planner.wake("goal_review"); await done;
+  expect(f.state.reviews).toBe(1); expect(String(f.run.status)).toBe("completed");
+  expect(f.run.usage.by_purpose.improvement.calls).toBe(3); expect(f.state.pauses).toEqual([]);
 });

@@ -10,109 +10,92 @@ import "./styles.css";
 import type {
   ActivityEvent,
   AppSnapshot,
-  PolicyView,
+  ProgramEvidenceView,
   RunView,
+  TokenUsage,
 } from "../../src/shared/contracts.ts";
+import type {
+  SkillExecutionView,
+} from "../../src/shared/programs.ts";
+import type {
+  ExperienceView,
+  PromotionDeclaration,
+} from "../../src/server/experience.ts";
 import {
-  ApiError,
   createRun,
   eventSchema,
+  fetchExperience,
+  fetchHistory,
+  fetchJev,
+  fetchPerformance,
+  fetchRunEvents,
+  fetchSkillEvidence,
   fetchState,
   mutate,
   openSession,
+  promoteExperience,
+  removeJevKey,
+  setJevKey,
 } from "./api.ts";
+import type { PerformanceSnapshot } from "./api.ts";
+import { NativeVideo } from "./video.ts";
+import { EvidenceInspector } from "./evidence.ts";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("Application mount is missing.");
 root.innerHTML = `
-  <a class="skip-link" href="#run-controls">Skip to run controls</a>
-  <main class="workspace">
-    <header class="workspace-header">
-      <h1>GameHarness</h1>
-      <div class="header-state"><span id="connection" role="status">Connecting to local service…</span><button id="reconnect" type="button">Reconnect</button><button id="setup-toggle" type="button" aria-expanded="true" aria-controls="setup">Setup</button></div>
-    </header>
-    <div class="readiness" aria-label="Service readiness"><span id="auth-status">OpenAI · unknown</span><span id="server-status">World · unknown</span><span id="sandbox-status">Isolation · unknown</span></div>
-    <div class="notice error" id="request-error" role="alert" hidden></div>
-    <section class="setup" id="setup" aria-label="Connection and world setup">
-      <section class="setup-section" aria-labelledby="account-heading">
-        <h2 id="account-heading">OpenAI connection</h2>
-        <p id="account-description">Connect your own account to discover available models.</p>
-        <div class="button-row"><button id="login-browser" type="button">Connect in browser</button><button id="login-device" type="button">Use device code</button><button id="refresh-models" type="button" hidden>Refresh models</button><button id="logout" type="button" hidden>Disconnect account</button></div>
-        <div id="login-flow" hidden>
-          <p class="instructions" id="login-instructions"></p>
-          <a class="button primary" id="authorize-link" target="_blank" rel="noopener noreferrer" hidden>Continue in browser</a>
-          <p class="muted" id="authorization-wait">Waiting for provider authorization. This page does not complete login for you.</p>
-          <form id="auth-form" hidden><label id="auth-input-label" for="auth-input">Authorization response</label><div class="input-row"><input id="auth-input" type="text" autocomplete="off" spellcheck="false" maxlength="16000"><button id="auth-submit" type="submit">Submit response</button></div></form>
-          <button id="cancel-login" type="button">Cancel authorization</button>
-        </div>
-        <p id="auth-error" class="error" role="alert" hidden></p>
-      </section>
-      <section class="setup-section" aria-labelledby="world-heading">
-        <h2 id="world-heading">Local Minecraft world</h2>
-        <p id="world-description">Waiting for the local server state.</p>
-        <label class="check-row" id="eula-row" hidden><input id="eula" type="checkbox"><span>I accept the <a href="https://www.minecraft.net/eula" target="_blank" rel="noopener noreferrer">Minecraft EULA</a> for this local server.</span></label>
-        <div class="button-row"><button id="prepare-game" type="button">Prepare server</button><button id="start-game" type="button">Start world</button><button id="stop-game" type="button">Stop world</button></div>
-        <details id="new-world-details"><summary>World management</summary><p>New world replaces the current world lineage. Existing runs remain recorded. Stop the run and world first.</p><label class="check-row"><input id="confirm-world" type="checkbox"><span>Replace the current world with a new world.</span></label><button id="new-world" class="danger" type="button">Create new world</button></details>
-        <p id="game-error" class="error" role="alert" hidden></p><p id="sandbox-error" class="error" role="alert" hidden></p>
-      </section>
+<a class="skip-link" href="#run-controls">Skip to run controls</a>
+<main class="workspace">
+  <header class="workspace-header"><h1>GameHarness</h1><span id="connection" role="status">Connecting to local service…</span><nav aria-label="Workspace"><button id="reconnect" type="button">Reconnect</button><button id="history-open" type="button">History</button><button id="settings-open" type="button">Settings</button><button id="sidebar-toggle" type="button" aria-expanded="true" aria-controls="context-panel">Hide panel</button></nav></header>
+  <div id="request-error" class="notice error" role="alert" hidden></div>
+  <div class="work-area" id="work-area">
+    <section class="game-console" aria-label="Authentic Minecraft player video">
+      <div class="console-topline"><h2>Minecraft <span class="muted">/ player view</span></h2><span id="view-status" role="status">Waiting</span></div>
+      <div class="viewer" id="viewer" data-state="idle"><canvas id="game-video" aria-label="Read-only authentic Minecraft video, including the game HUD and player hand" hidden></canvas><div class="viewer-empty" id="viewer-empty"><h3 id="viewer-title">No live video</h3><p id="viewer-description">Connect the isolated Minecraft client in Settings. No simulated footage is displayed.</p><button id="viewer-settings" type="button">Open settings</button></div><p class="frame-warning" id="frame-warning" hidden></p></div>
+      <div class="viewer-foot"><span id="video-detail">Waiting for the local service.</span><button id="video-reconnect" type="button">Reconnect video</button></div>
     </section>
-    <div class="console-layout">
-      <div class="play-stack">
-        <section class="run-toolbar" id="run-controls" aria-labelledby="run-heading" tabindex="-1">
-          <div class="run-control-state"><h2 id="run-heading">Run controls</h2><span id="run-status" class="state" role="status">No run</span></div>
-          <div class="button-row" role="group" aria-label="Run actions"><button id="start-run" class="primary" type="button">Start</button><button id="pause-run" type="button">Pause</button><button id="resume-run" class="primary" type="button" hidden>Resume</button><button id="stop-run" class="danger" type="button">Stop run</button></div>
-        </section>
-        <section class="game-console" aria-labelledby="view-heading">
-          <div class="console-topline"><h2 id="view-heading">Minecraft <span class="muted">/ player view</span></h2><span id="view-status" class="state">Not connected</span></div>
-          <div class="viewer" id="viewer">
-            <div class="viewer-empty" id="viewer-empty"><h3 id="viewer-empty-title">No game connection</h3><p id="viewer-empty-copy">Start the local world in Setup to connect the player and renderer.</p><p id="viewer-interrupted-action" hidden></p><p id="viewer-recovery-hint" hidden></p><button id="open-setup" type="button">Open setup</button></div>
-          </div>
-          <div class="viewer-foot"><span id="viewer-note">Live view unavailable until the game connects.</span><button id="reload-viewer" type="button" hidden>Reload view</button></div>
-          <div class="player-strip" id="player-strip"><span id="player-vitals">Player state unavailable</span><span id="player-position"></span><span id="observation-time"></span></div>
-        </section>
-        <section class="run-console" aria-labelledby="task-heading">
-          <div class="section-heading"><h2 id="task-heading">Task and model</h2></div>
-          <form id="task-form">
-            <div class="task-options"><div class="field"><label for="goal">Goal</label><select id="goal" required><option value="">Waiting for goals</option></select></div><div class="field model-field"><label for="model">Strategic model</label><select id="model" required><option value="">Connect OpenAI first</option></select></div></div>
-            <div class="task-label"><label for="task">Task</label><button id="use-goal" class="text-button" type="button">Use goal prompt</button></div>
-            <textarea id="task" rows="3" maxlength="8000" placeholder="Describe what the agent should do in this world." required></textarea>
-            <div class="run-actions"><button id="create-run" type="submit">Create run</button></div>
-          </form>
-          <p id="run-hint" class="muted">Connect an account and start the world to create a run.</p>
-          <p id="run-error" class="error" role="alert" hidden></p>
-          <div class="current-run" id="current-run" hidden><p id="current-task"></p><dl class="run-facts"><div><dt>Model</dt><dd id="current-model"></dd></div><div><dt>Strategist</dt><dd id="model-status"></dd></div><div><dt>Turns</dt><dd id="turns"></dd></div><div><dt>Tokens · in / out</dt><dd id="tokens"></dd></div><div><dt>Cost</dt><dd id="cost"></dd></div></dl><p class="action-summary" id="action-summary"></p><details><summary>Run / action evidence</summary><pre id="run-evidence" tabindex="0"></pre></details></div>
-        </section>
-        <details class="inventory"><summary>Player inventory <span id="inventory-count"></span></summary><p id="inventory-empty">Inventory is unavailable until the player connects.</p><ul id="inventory-items"></ul></details>
+    <aside class="context-panel" id="context-panel" aria-label="Current goal and program">
+      <div class="context-overview">
+      <section><h2><button id="life-open" class="section-action" type="button"><span>Session / player life</span><span id="life-current" class="context-value">No game session.</span></button></h2></section>
+      <section><h2>Current goal</h2><p id="current-task">No run created.</p><button id="goal-more" type="button" hidden>Read full task</button></section>
+      <section><h2><button id="programs-open" class="section-action" type="button" aria-label="Inspect programs, model and action" title="Inspect programs, model and action"><span>Program / control</span><span id="program-current" class="context-value">No executing skill.</span><span id="program-status" class="context-value" hidden></span></button></h2></section>
+      <section><h2><button id="activity-open" class="section-action" type="button" aria-label="Inspect activity" title="Inspect activity"><span id="activity-heading">Latest activity</span><span id="latest-activity" class="context-value">No recorded activity yet.</span></button></h2></section>
       </div>
-      <aside class="tool-bay" aria-label="Activity and policy evidence">
-        <div class="bay-tabs" role="tablist" aria-label="Evidence type"><button type="button" id="activity-tab" role="tab" aria-selected="true" aria-controls="activity-panel" tabindex="0">Activity</button><button type="button" id="policies-tab" role="tab" aria-selected="false" aria-controls="policies-panel" tabindex="-1">Policies <span id="policy-count">0</span></button></div>
-        <div class="follow-bar"><span id="follow-state">Following live activity</span><button id="resume-live" type="button" hidden>Resume live</button></div>
-        <section id="activity-panel" role="tabpanel" aria-labelledby="activity-tab">
-          <p class="bay-empty" id="activity-empty">No recorded activity yet. Setup and run events will appear here.</p>
-          <ol id="activity-list" class="activity-list" aria-label="Recorded activity"></ol>
-          <section class="evidence" id="event-evidence" hidden aria-labelledby="event-evidence-heading"><h3 id="event-evidence-heading">Event evidence</h3><p id="event-summary"></p><pre id="event-details" tabindex="0"></pre></section>
-        </section>
-        <section id="policies-panel" role="tabpanel" aria-labelledby="policies-tab" hidden>
-          <p class="bay-empty" id="policies-empty">No model-authored policies in this run. Authored source, strategy cards, and effects appear here when registered.</p>
-          <ul id="policy-list" class="policy-list"></ul>
-          <section id="policy-evidence" class="evidence" hidden aria-labelledby="policy-name"><h3 id="policy-name"></h3><p id="policy-meta" class="mono"></p><p id="policy-error" class="error" hidden></p><dl id="strategy-card" class="strategy-card"></dl><details open><summary>Immutable policy source</summary><pre tabindex="0"><code id="policy-source"></code></pre></details></section>
-        </section>
-      </aside>
-    </div>
-    <footer><span>Local operator workspace · Minecraft Java 1.21.4</span><details><summary>Font licenses</summary><span>Jura and IBM Plex Mono are distributed under the SIL Open Font License 1.1. </span><a href="/licenses/Jura-LICENSE.txt" target="_blank" rel="noopener">Jura license</a> · <a href="/licenses/IBM-Plex-Mono-LICENSE.txt" target="_blank" rel="noopener">IBM Plex Mono license</a></details></footer>
-  </main>`;
+      <section class="usage-summary"><h2><button id="usage-open" class="section-action" type="button" aria-label="Usage details" title="Usage details">Actual usage</button></h2><dl id="usage-summary"></dl></section>
+      <p id="run-error" class="error" role="alert" hidden></p>
+    </aside>
+  </div>
+  <section class="run-toolbar" id="run-controls" aria-label="Run controls" tabindex="-1"><div class="run-control-state"><strong id="run-status" role="status">No run</strong><span id="run-hint">Configure a task in Settings.</span></div><div class="button-row"><button id="new-task" type="button">Task / model</button><button id="start-run" class="primary" type="button">Start</button><button id="pause-run" type="button">Pause</button><button id="resume-run" class="primary" type="button" hidden>Resume</button><button id="stop-run" class="danger" type="button">Stop run</button></div></section>
+  <footer><span id="readiness">World · unknown / Model · unknown / Isolation · unknown</span><button id="inventory-open" class="text-button" type="button">Inventory</button><span class="muted">Read-only video · no manual gameplay</span></footer>
+</main>
+<dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-header"><h2 id="settings-title">Settings & task</h2><button type="button" data-close="settings-dialog" aria-label="Close settings">Close</button></div><div class="dialog-body settings-grid">
+  <section class="settings-task"><h3>Game integration</h3><p>GameHarness runs model-authored game programs. Minecraft Java 1.21.4 is the first available integration; other game adapters are not available in this build.</p></section>
+  <section class="settings-task"><h3>Task and strategic model</h3><form id="task-form"><div class="form-row"><label>Goal<select id="goal" required><option value="">Waiting for goals</option></select></label><label>Strategic model<select id="model" required><option value="">Connect OpenAI first</option></select></label></div><div class="section-heading"><label for="task">Task</label><button id="use-goal" class="text-button" type="button">Use goal prompt</button></div><textarea id="task" rows="3" maxlength="8000" required placeholder="Describe what the agent should do in this world."></textarea><div class="button-row"><button id="create-run" type="submit" class="primary">Create run</button><span id="create-hint" class="muted">Create saves the task; Start begins inference.</span></div></form></section>
+  <section class="settings-task"><h3>Program libraries</h3><label for="working-programs">Working definitions for the next task</label><select id="working-programs"><option value="continue">Continue this session’s same-model working programs</option><option value="fresh">Fresh — omit working programs</option></select><p>Working candidates retain validated code, not arguments, observations or execution state. They are not qualified experience.</p><p>Separately, optionally load one exact evidence-backed startup bundle. Neither choice executes code; the new run still receives fresh permissions and validation.</p><label for="experience">Qualified compatible startup bundle</label><select id="experience"><option value="">No saved programs</option></select><p id="library-status" role="status">Choose a strategic model to load compatible bundles.</p><button id="library-refresh" type="button">Refresh compatible library</button><pre id="experience-detail" tabindex="0" hidden></pre></section>
+  <section><h3>OpenAI connection</h3><p id="account-description">Connect your own account to discover models.</p><div class="button-row"><button id="login-browser" type="button">Connect in browser</button><button id="login-device" type="button">Use device code</button><button id="refresh-models" type="button" hidden>Refresh models</button><button id="logout" type="button" hidden>Disconnect account</button></div><div id="login-flow" hidden><p id="login-instructions"></p><a id="authorize-link" class="button primary" target="_blank" rel="noopener noreferrer" hidden>Continue in browser</a><p class="muted">Complete authorization in your browser, then return here.</p><form id="auth-form" hidden><label id="auth-input-label" for="auth-input">Authorization response</label><div class="input-row"><input id="auth-input" autocomplete="off" spellcheck="false" maxlength="16000"><button id="auth-submit" type="submit">Submit response</button></div></form><button id="cancel-login" type="button">Cancel authorization</button></div><p id="auth-error" class="error" role="alert" hidden></p></section>
+  <section><h3>Isolated Minecraft world</h3><p id="world-description">Waiting for the local server.</p><p class="muted">Uses the authorized official Launcher account for this isolated client only. Personal worlds are not changed.</p><label id="eula-row" class="check-row" hidden><input id="eula" type="checkbox"><span>I accept the <a href="https://www.minecraft.net/eula" target="_blank" rel="noopener noreferrer">Minecraft EULA</a> for this local server.</span></label><div class="button-row"><button id="prepare-game" type="button">Prepare server</button><button id="start-game" type="button">Start world</button><button id="stop-game" type="button">Stop world</button></div><details><summary>New world</summary><p>Replaces this app’s world lineage, not your personal worlds. Recorded runs are retained. Stop the run and world first.</p><label class="check-row"><input id="confirm-world" type="checkbox"><span>Replace this app’s current world.</span></label><button id="new-world" class="danger" type="button">Create new world</button></details><p id="game-error" class="error" role="alert" hidden></p><p id="sandbox-error" class="error" role="alert" hidden></p></section>
+  <section><h3>Optional Jev connection</h3><p id="jev-status">Connection status not loaded.</p><p class="muted">JavaScript reactions need no Jev key. The key is sent only to the authenticated local service and is never returned.</p><form id="jev-form"><label for="jev-key">Jev API key</label><div class="input-row"><input id="jev-key" type="password" autocomplete="off" spellcheck="false" maxlength="4096"><button id="jev-save" type="submit">Set key</button></div></form><button id="jev-remove" class="danger" type="button">Remove key</button><p id="jev-error" class="error" role="alert" hidden></p></section>
+  <section><h3>Performance diagnostics</h3><p>Inspect measured backend CPU, memory, event-loop lag, observation and command timings, and native video state. Sampling requests run only while the diagnostics dialog is open.</p><button id="performance-open" type="button">Open performance diagnostics</button></section>
+  <section><h3>Motor profile</h3><p>Operator configuration applies live and persists independently of the model’s gameplay strategy. It does not move the player.</p><label for="motor-profile">Camera / movement profile</label><select id="motor-profile"><option value="precise">Precise</option><option value="balanced">Balanced</option><option value="fast">Fast</option></select><button id="motor-save" type="button">Apply profile</button><p id="motor-status" role="status">Waiting for current configuration.</p></section>
+  <section><h3>Control & licenses</h3><p>Pause and Stop run fence agent work; the world, client and live video continue. Stop world closes the game session. Death and respawn remain model-controlled; video receives no keyboard or mouse gameplay input.</p><p><a href="/licenses/Jura-LICENSE.txt" target="_blank" rel="noopener">Jura license</a> · <a href="/licenses/IBM-Plex-Mono-LICENSE.txt" target="_blank" rel="noopener">IBM Plex Mono license</a></p></section>
+</div><p id="settings-error" class="dialog-notice error" role="alert" hidden></p></dialog>
+<dialog id="performance-dialog" aria-labelledby="performance-title"><div class="dialog-header"><h2 id="performance-title">Performance diagnostics</h2><button type="button" data-close="performance-dialog" aria-label="Close performance diagnostics">Close</button></div><div class="dialog-body"><p id="performance-status" role="status">Waiting for measured diagnostics.</p><p id="performance-error" class="error" role="alert" hidden></p><dl id="performance-process" class="strategy-card"></dl><h3>Backend timing distributions</h3><p>Reported durations are in milliseconds. Action round trip includes intentional gameplay duration; it is not transport-only latency. Backend video forwarding is separate from the browser’s capture-to-draw measurement.</p><p id="performance-window" class="muted">Distribution window not loaded.</p><div class="table-scroll"><table><thead><tr><th scope="col">Measurement</th><th scope="col">Samples (total)</th><th scope="col">p50</th><th scope="col">p95</th><th scope="col">p99</th><th scope="col">Maximum</th></tr></thead><tbody id="performance-timings"></tbody></table></div><h3>Native video</h3><p id="performance-video">No measured video state loaded.</p><h3>Browser video</h3><p id="performance-browser" class="mono">No browser video measurements yet.</p><p class="muted">Capture-to-draw delay and capture age use this host’s wall clock. These are browser measurements, not native encoding or backend forwarding time.</p><details><summary>Video transport / backpressure</summary><p>Actual relay counters and per-client buffered bytes. Send attempts and queued sends do not prove delivery or drawn frames; these counters are not FPS.</p><pre id="performance-transport" tabindex="0">Not loaded.</pre></details><h3>Native diagnostics</h3><pre id="performance-native" tabindex="0">Not loaded.</pre></div></dialog>
+<dialog id="history-dialog" aria-labelledby="history-title"><div class="dialog-header"><h2 id="history-title">Run history</h2><button type="button" data-close="history-dialog" aria-label="Close history">Close</button></div><div class="dialog-body"><p id="history-status" role="status">Loading retained runs…</p><ol id="history-list" class="record-list"></ol><p class="muted">Inspecting a retained run does not resume it or change the current run.</p></div></dialog>
+<dialog id="evidence-dialog" aria-labelledby="evidence-title"><div class="dialog-header"><div><h2 id="evidence-title">Run evidence</h2><p id="evidence-run" class="muted"></p></div><button type="button" data-close="evidence-dialog" aria-label="Close evidence">Close</button></div><div class="evidence-tabs" role="tablist" aria-label="Evidence category">${["programs", "executions", "revisions", "trace", "comparison", "learning", "life", "planning", "usage", "activity", "inventory"].map((name, index) => `<button id="${name}-tab" type="button" role="tab" aria-selected="${index === 0}" aria-controls="evidence-content" tabindex="${index === 0 ? 0 : -1}">${name[0]!.toUpperCase() + name.slice(1)}</button>`).join("")}</div><div id="evidence-content" class="dialog-body" role="tabpanel" aria-labelledby="programs-tab" tabindex="0"></div></dialog>
+<dialog id="promotion-dialog" aria-labelledby="promotion-title"><div class="dialog-header"><h2 id="promotion-title">Save evidence-backed program</h2><button type="button" data-close="promotion-dialog" aria-label="Close program promotion">Close</button></div><div class="dialog-body"><p id="promotion-execution" class="mono"></p><p>Saving requires trusted evidence attributable to this execution, not its own success claim. Declare whether the exact code retains world-specific data; coordinates are not silently portable.</p><form id="promotion-form"><label for="promotion-name">Library name</label><input id="promotion-name" maxlength="120" required><div class="form-row"><label>Portability<select id="promotion-scope" required><option value="">Choose explicitly</option><option value="world_local">This world only</option><option value="portable">Portable to compatible worlds</option></select></label><label>Does this code retain world-specific data?<select id="promotion-world-data" required><option value="">Choose explicitly</option><option value="yes">Yes — retained world-specific data</option><option value="no">No — no retained world-specific data</option></select></label></div><label for="promotion-evidence">Trusted event in this execution interval</label><select id="promotion-evidence" required><option value="">Load and select actual evidence</option></select><p id="promotion-events-status" role="status"></p><button id="promotion-more" type="button">Load more retained events</button><div id="promotion-inventory" hidden><div class="form-row"><label>Observed item<select id="promotion-item"></select></label><label>Required attributable inventory gain<input id="promotion-gain" type="number" min="1" step="1" value="1"></label></div></div><pre id="promotion-event-detail" tabindex="0" hidden></pre><p id="promotion-scope-hint" class="muted">Choose scope and retained-data declarations before saving.</p><button id="promotion-save" class="primary" type="submit">Verify evidence & save</button></form><p id="promotion-result" role="status"></p><p id="promotion-error" class="error" role="alert" hidden></p></div></dialog>
+<dialog id="source-dialog" aria-labelledby="source-title"><div class="dialog-header"><h2 id="source-title">Program source</h2><button type="button" data-close="source-dialog" aria-label="Close source">Close</button></div><div class="dialog-body"><p id="source-meta" class="mono"></p><dl id="strategy-card" class="strategy-card"></dl><h3>Immutable source</h3><p class="muted">Displayed as inert text. This window does not execute source.</p><pre tabindex="0"><code id="source-code"></code></pre><h3>Artifact & linked evidence</h3><pre id="source-evidence" tabindex="0"></pre></div></dialog>`;
 
-function element<T extends HTMLElement = HTMLElement>(id: string): T {
+function el<T extends HTMLElement = HTMLElement>(id: string): T {
   const node = document.getElementById(id);
   if (!node) throw new Error(`Missing interface element: ${id}`);
   return node as T;
 }
 function text(id: string, value: string): void {
-  const node = element(id);
+  const node = el(id);
   if (node.textContent !== value) node.textContent = value;
 }
 function hidden(id: string, value: boolean): void {
-  element(id).hidden = value;
+  el(id).hidden = value;
 }
 function errorText(id: string, value: string | null): void {
   text(id, value ?? "");
@@ -121,251 +104,522 @@ function errorText(id: string, value: string | null): void {
 function label(value: string): string {
   return value.replaceAll("_", " ");
 }
-function when(value: string | null): string {
-  if (!value) return "unknown";
-  const date = new Date(value);
-  return Number.isNaN(date.valueOf())
-    ? "unknown time"
-    : date.toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      });
-}
 function json(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
-const task = element<HTMLTextAreaElement>("task");
-const goal = element<HTMLSelectElement>("goal");
-const model = element<HTMLSelectElement>("model");
-const authInput = element<HTMLInputElement>("auth-input");
+function when(value: string | null): string {
+  if (!value) return "unknown";
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? "unknown" : date.toLocaleString();
+}
+function count(value: number | null): string {
+  return value === null ? "Unknown" : value.toLocaleString();
+}
+function message(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : "Request failed. Reconnect to inspect current state.";
+}
+const task = el<HTMLTextAreaElement>("task"),
+  goal = el<HTMLSelectElement>("goal"),
+  model = el<HTMLSelectElement>("model"),
+  authInput = el<HTMLInputElement>("auth-input");
 let snapshot: AppSnapshot | null = null;
-let serviceReady = false;
-const pendingCommands = new Set<string>();
-let eventStream: EventSource | null = null;
-let refreshTimer: number | null = null;
-let fetching = false;
-let refreshAgain = false;
-let bootstrapGeneration = 0;
-let taskEdited = false;
-let setupTouched = false;
-let setupInitialized = false;
-let followLive = true;
-let selectedEvent: ActivityEvent | null = null;
-let selectedPolicy: PolicyView | null = null;
-let activeTab: "activity" | "policies" = "activity";
-let promptIdentity = "";
-let viewerUrl: string | null = null;
-let viewerFrame: HTMLIFrameElement | null = null;
-const events = new Map<string, ActivityEvent>();
-const eventRows = new Map<string, HTMLLIElement>();
-const policyRows = new Map<string, HTMLLIElement>();
-let goalSignature = "";
-let modelSignature = "";
-const streamFailure =
-  "Live activity is unavailable. Displayed state may be stale; reconnect to refresh the local session.";
-
-function setSetup(open: boolean): void {
-  hidden("setup", !open);
-  element("setup-toggle").setAttribute("aria-expanded", String(open));
-}
-function setTab(tab: "activity" | "policies", focus = false): void {
-  activeTab = tab;
-  for (const name of ["activity", "policies"] as const) {
-    const button = element<HTMLButtonElement>(`${name}-tab`);
-    button.setAttribute("aria-selected", String(name === tab));
-    button.tabIndex = name === tab ? 0 : -1;
-    hidden(`${name}-panel`, name !== tab);
-    if (name === tab && focus) button.focus();
+let serviceReady = false,
+  fetching = false,
+  refreshAgain = false,
+  taskEdited = false;
+let generation = 0,
+  refreshTimer = 0,
+  promptIdentity = "",
+  goalSignature = "",
+  modelSignature = "";
+let stream: EventSource | null = null;
+let selectedRun: RunView | null = null;
+let evidenceTab = "programs",
+  evidenceSignature = "";
+let library: ExperienceView[] = [];
+let libraryGeneration = 0;
+let libraryContext = "";
+let performanceTimer = 0;
+let performanceGeneration = 0;
+let performanceLastStarted = -Infinity;
+let performanceAbort: AbortController | null = null;
+let promotion: { run: RunView; execution: SkillExecutionView } | null = null;
+const archivedEvents = new Map<
+  string,
+  {
+    events: ActivityEvent[];
+    cursor: number;
+    more: boolean;
+    loading: boolean;
+    error: string | null;
+    omitted: number[];
   }
-}
-function eventKey(event: ActivityEvent): string {
-  return `${event.run_id ?? "system"}:${event.event_seq}`;
-}
-function policyKey(policy: PolicyView): string {
-  return `${policy.policy_id}:${policy.version}`;
-}
-function selectEvidence(): void {
-  text(
-    "follow-state",
-    followLive
-      ? "Following live activity"
-      : "Evidence selected · live follow paused",
-  );
-  hidden("resume-live", followLive);
-  for (const [key, row] of eventRows)
-    row
-      .querySelector("button")
-      ?.setAttribute(
-        "aria-pressed",
-        String(selectedEvent !== null && key === eventKey(selectedEvent)),
-      );
-  hidden("event-evidence", !selectedEvent);
-  if (selectedEvent) {
-    text("event-summary", selectedEvent.summary);
-    text("event-details", json(selectedEvent));
-  }
-  for (const [key, row] of policyRows)
-    row
-      .querySelector("button")
-      ?.setAttribute(
-        "aria-pressed",
-        String(selectedPolicy !== null && key === policyKey(selectedPolicy)),
-      );
-  hidden("policy-evidence", !selectedPolicy);
-  if (selectedPolicy) {
-    text("policy-name", selectedPolicy.name);
+>();
+const measuredEvidence = new Map<
+  string,
+  { items: ProgramEvidenceView[]; loading: boolean; error: string | null }
+>();
+const pending = new Set<string>(),
+  events = new Map<string, ActivityEvent>();
+const dialogOrigins = new Map<string, HTMLElement>();
+let browserVideoDetail = "No browser video measurements yet.";
+let motorEdited = false;
+const inspector = new EvidenceInspector({
+  openDialog,
+  measurements: (runId) => measuredEvidence.get(runId)?.items ?? [],
+  promote: (run, execution) => openPromotion(run, execution),
+  trace: (run, executionId) => {
+    selectedRun = run.run_id === snapshot?.run?.run_id ? null : run;
+    openDialog("evidence-dialog");
+    inspector.selectExecution(run.run_id, executionId);
+    setEvidenceTab("trace");
+  },
+});
+const video = new NativeVideo(
+  el<HTMLCanvasElement>("game-video"),
+  (state, detail, hasFrame) => {
+    el("viewer").dataset.state = state;
+    text("view-status", label(state));
+    browserVideoDetail = detail;
     text(
-      "policy-meta",
-      `${label(selectedPolicy.state)} · v${selectedPolicy.version}\n${selectedPolicy.policy_id}\nSHA ${selectedPolicy.hash}\n${selectedPolicy.evaluations} evaluations · ${selectedPolicy.effects} effects\n${selectedPolicy.interval_ms} ms interval · priority ${selectedPolicy.priority}`,
+      "video-detail",
+      state === "streaming"
+        ? detail.split(" · ", 2).join(" · ")
+        : state === "stale"
+          ? "Stale video · waiting for fresh frames"
+          : state === "error"
+            ? "Video unavailable · details in Settings diagnostics"
+            : state === "disconnected"
+              ? "Video disconnected · reconnecting"
+              : state === "idle"
+                ? "No live video"
+                : "Waiting for client frames",
     );
-    errorText("policy-error", selectedPolicy.last_error);
-    const card = element("strategy-card");
-    for (const [key, value] of Object.entries(selectedPolicy.card)) {
-      let dd = card.querySelector<HTMLElement>(`[data-card="${key}"]`);
-      if (!dd) {
-        const dt = document.createElement("dt");
-        dt.textContent = label(key);
-        dd = document.createElement("dd");
-        dd.dataset.card = key;
-        card.append(dt, dd);
-      }
-      if (dd.textContent !== value) dd.textContent = value;
+    if (el<HTMLDialogElement>("performance-dialog").open)
+      text("performance-browser", detail);
+    hidden("game-video", !hasFrame);
+    hidden("viewer-empty", hasFrame);
+    const interrupted = hasFrame && state !== "streaming";
+    hidden("frame-warning", !interrupted);
+    text(
+      "frame-warning",
+      `${label(state)} · last authentic frame, not current gameplay`,
+    );
+    if (!hasFrame) {
+      text(
+        "viewer-title",
+        state === "error"
+          ? "Video unavailable"
+          : state === "idle"
+            ? "No live video"
+            : "Waiting for client video",
+      );
+      text("viewer-description", detail);
     }
-    text("policy-source", selectedPolicy.source);
+  },
+);
+function openDialog(id: string): void {
+  const dialog = el<HTMLDialogElement>(id);
+  if (dialog.open) return;
+  if (document.activeElement instanceof HTMLElement)
+    dialogOrigins.set(id, document.activeElement);
+  dialog.showModal();
+}
+for (const button of document.querySelectorAll<HTMLButtonElement>(
+  "[data-close]",
+))
+  button.addEventListener("click", () =>
+    el<HTMLDialogElement>(button.dataset.close!).close(),
+  );
+for (const dialog of document.querySelectorAll<HTMLDialogElement>("dialog"))
+  dialog.addEventListener("close", () => {
+    if (dialog.id === "settings-dialog")
+      el<HTMLInputElement>("jev-key").value = "";
+    if (dialog.id === "performance-dialog") stopPerformance();
+    dialogOrigins.get(dialog.id)?.focus({ preventScroll: true });
+    dialogOrigins.delete(dialog.id);
+    if (dialog.id === "source-dialog" || dialog.id === "promotion-dialog")
+      renderEvidence(true);
+  });
+function active(run: RunView | null): boolean {
+  return !!run && !["stopped", "completed", "failed"].includes(run.status);
+}
+function canOperate(id?: string): boolean {
+  return (
+    serviceReady &&
+    !!snapshot &&
+    (pending.size === 0 || (id === "stop-run" && !pending.has(id)))
+  );
+}
+function buttons(): void {
+  const state = snapshot,
+    run = state?.run ?? null,
+    available = canOperate(),
+    hasRun = active(run);
+  const authBusy = ["authorizing", "discovering"].includes(
+    state?.auth.status ?? "",
+  );
+  const gameBusy = ["preparing", "starting"].includes(
+    state?.server.status ?? "",
+  );
+  const reconnect =
+    state?.server.status === "running" &&
+    ["disconnected", "error"].includes(state.game.status);
+  const prerequisites =
+    !!state?.auth.authenticated &&
+    !!state.auth.models.length &&
+    state.server.status === "running" &&
+    state.sandbox.status === "ready";
+  const ready = prerequisites && state?.game.status === "connected" &&
+    !!state.game.session_id && !!state.game.life;
+  const disabled: Record<string, boolean> = {
+    "login-browser": !available || authBusy || hasRun,
+    "login-device": !available || authBusy || hasRun,
+    "refresh-models":
+      !available || !state?.auth.authenticated || authBusy || hasRun,
+    logout: !available || !state?.auth.authenticated || authBusy || hasRun,
+    "auth-submit": !available || !state?.auth.login?.prompt,
+    "cancel-login": !available || !state?.auth.login,
+    "prepare-game":
+      !available ||
+      gameBusy ||
+      state?.server.status === "running" ||
+      hasRun ||
+      (!state?.server.eula_accepted && !el<HTMLInputElement>("eula").checked),
+    "start-game":
+      !available ||
+      gameBusy ||
+      (!reconnect && state?.server.status !== "stopped") ||
+      (hasRun && !(["created", "paused"].includes(run?.status ?? "") && reconnect)),
+    "stop-game":
+      !available ||
+      !["running", "starting", "error"].includes(state?.server.status ?? ""),
+    "new-world":
+      !available ||
+      hasRun ||
+      state?.server.status !== "stopped" ||
+      !el<HTMLInputElement>("confirm-world").checked,
+    "create-run":
+      !available ||
+      hasRun ||
+      !ready ||
+      !task.value.trim() ||
+      !goal.value ||
+      !model.value,
+    "start-run": !available || run?.status !== "created" || !ready,
+    "pause-run":
+      !available || !["running", "bootstrapping", "reviewing"].includes(run?.status ?? ""),
+    "resume-run": !available || run?.status !== "paused" || !ready,
+    "stop-run":
+      !canOperate("stop-run") ||
+      !hasRun ||
+      (run?.status === "stopping" && !run.error),
+    "use-goal": !available || !goal.value,
+    "jev-save":
+      !available || hasRun || !el<HTMLInputElement>("jev-key").value.trim(),
+    "jev-remove": !available || hasRun,
+    "motor-save": !available || !motorEdited,
+  };
+  for (const [id, value] of Object.entries(disabled)) {
+    const button = el<HTMLButtonElement>(id);
+    button.disabled = value;
+    button.setAttribute("aria-busy", String(pending.has(id)));
+  }
+  goal.disabled = !available || hasRun;
+  model.disabled = !available || hasRun || !state?.auth.models.length;
+  task.disabled = !serviceReady || hasRun;
+  el<HTMLSelectElement>("experience").disabled = !available || hasRun;
+  el<HTMLSelectElement>("working-programs").disabled = !available || hasRun;
+  el<HTMLSelectElement>("motor-profile").disabled = !available;
+  el<HTMLButtonElement>("library-refresh").disabled =
+    !available || hasRun || !model.value;
+  hidden("pause-run", run?.status === "paused");
+  hidden("resume-run", run?.status !== "paused");
+  text(
+    "stop-run",
+    run?.status === "stopping"
+      ? run.error
+        ? "Retry Stop"
+        : "Stopping"
+      : "Stop run",
+  );
+  text(
+    "start-game",
+    reconnect
+      ? "Reconnect client"
+      : gameBusy
+        ? "Starting…"
+        : state?.game.status === "connected"
+          ? "Client connected"
+          : "Start world",
+  );
+  text(
+    "create-hint",
+    hasRun
+      ? "Stop this run before creating another task."
+      : "Create saves the task; Start begins inference.",
+  );
+  promotionButtons();
+}
+
+function librarySelection(): void {
+  const selection = library.find(
+    (item) => item.experience_id === el<HTMLSelectElement>("experience").value,
+  );
+  hidden("experience-detail", !selection);
+  text("experience-detail", selection ? json(selection) : "");
+}
+
+async function loadLibrary(): Promise<void> {
+  const current = ++libraryGeneration;
+  const modelId = model.value;
+  libraryContext = json([modelId, snapshot?.server.world_id ?? null]);
+  const select = el<HTMLSelectElement>("experience");
+  const previous = select.value;
+  library = [];
+  select.replaceChildren(new Option("No saved programs", ""));
+  librarySelection();
+  if (!serviceReady || !modelId) {
+    text(
+      "library-status",
+      "Choose a strategic model to load compatible bundles.",
+    );
+    return;
+  }
+  text("library-status", "Loading model- and world-compatible saved bundles…");
+  try {
+    const items = await fetchExperience(modelId);
+    if (current !== libraryGeneration || model.value !== modelId) return;
+    library = items;
+    select.replaceChildren(
+      new Option("No saved programs", ""),
+      ...items.map(
+        (item) =>
+          new Option(
+            `${item.name} · ${label(item.portability)} · ${item.experience_id.slice(0, 12)}`,
+            item.experience_id,
+          ),
+      ),
+    );
+    if (items.some((item) => item.experience_id === previous))
+      select.value = previous;
+    text(
+      "library-status",
+      items.length
+        ? `${items.length} bundles listed by the service for this model and current world. Exact compatibility is rechecked on admission.`
+        : "No compatible saved bundles. New runs can still author their own programs.",
+    );
+    librarySelection();
+  } catch (error) {
+    if (current === libraryGeneration)
+      text(
+        "library-status",
+        `Library unavailable: ${message(error)} No saved bundle is selected.`,
+      );
   }
 }
-function mergeEvents(incoming: ActivityEvent[]): void {
-  for (const event of incoming) events.set(eventKey(event), event);
-  const ordered = [...events.values()]
-    .sort((a, b) => a.at.localeCompare(b.at) || a.event_seq - b.event_seq)
-    .slice(-200);
-  const keys = new Set(ordered.map(eventKey));
-  for (const key of events.keys()) if (!keys.has(key)) events.delete(key);
-  for (const [key, row] of eventRows)
-    if (!keys.has(key)) {
-      row.remove();
-      eventRows.delete(key);
-    }
-  const list = element("activity-list");
-  for (const event of ordered) {
-    const key = eventKey(event);
-    let row = eventRows.get(key);
-    if (!row) {
-      row = document.createElement("li");
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "activity-event";
-      const meta = document.createElement("span");
-      meta.className = "event-meta";
-      meta.textContent = `${when(event.at)} · ${label(event.type)}`;
-      const summary = document.createElement("span");
-      summary.className = "event-summary";
-      summary.textContent = event.summary;
-      button.append(meta, summary);
-      button.addEventListener("click", () => {
-        followLive = false;
-        selectedEvent = event;
-        selectEvidence();
-      });
-      row.append(button);
-      eventRows.set(key, row);
-      list.append(row);
-    }
+
+async function loadEventPage(runId: string): Promise<void> {
+  let archive = archivedEvents.get(runId);
+  if (!archive) {
+    archive = {
+      events: [],
+      cursor: 0,
+      more: true,
+      loading: false,
+      error: null,
+      omitted: [],
+    };
+    archivedEvents.set(runId, archive);
   }
-  hidden("activity-empty", ordered.length > 0);
-  if (followLive && ordered.length > 0) {
-    selectedEvent = ordered[ordered.length - 1]!;
-    list.scrollTop = list.scrollHeight;
+  if (archive.loading || !archive.more) return;
+  archive.loading = true;
+  archive.error = null;
+  renderEvidence(true);
+  renderPromotionEvents();
+  try {
+    const page = await fetchRunEvents(runId, archive.cursor);
+    archive.events.push(...page.events);
+    archive.cursor = page.next_cursor;
+    archive.more = page.has_more;
+    archive.omitted.push(...page.omitted_details);
+  } catch (error) {
+    archive.error = message(error);
+  } finally {
+    archive.loading = false;
+    renderEvidence(true);
+    renderPromotionEvents();
   }
-  selectEvidence();
 }
-function renderPolicies(run: RunView | null): void {
-  const policies = run?.policies ?? [];
-  text("policy-count", String(policies.length));
-  hidden("policies-empty", policies.length > 0);
-  const keys = new Set(policies.map(policyKey));
-  for (const [key, row] of policyRows)
-    if (!keys.has(key)) {
-      row.remove();
-      policyRows.delete(key);
-    }
-  for (const policy of policies) {
-    const key = policyKey(policy);
-    let row = policyRows.get(key);
-    if (!row) {
-      row = document.createElement("li");
-      const button = document.createElement("button");
-      button.type = "button";
-      button.dataset.policy = key;
-      button.addEventListener("click", () => {
-        followLive = false;
-        selectedPolicy =
-          snapshot?.run?.policies.find((item) => policyKey(item) === key) ??
-          policy;
-        selectEvidence();
-      });
-      row.append(button);
-      element("policy-list").append(row);
-      policyRows.set(key, row);
-    }
-    const button = row.querySelector("button")!;
-    const copy = `${policy.name} · v${policy.version}\n${label(policy.state)} · ${policy.effects} effects`;
-    if (button.textContent !== copy) button.textContent = copy;
+
+async function loadMeasurements(runId: string): Promise<void> {
+  if (measuredEvidence.get(runId)?.loading) return;
+  const measured = {
+    items: [] as ProgramEvidenceView[],
+    loading: true,
+    error: null as string | null,
+  };
+  measuredEvidence.set(runId, measured);
+  renderEvidence(true);
+  try {
+    measured.items = await fetchSkillEvidence(runId);
+  } catch (error) {
+    measured.error = message(error);
+  } finally {
+    measured.loading = false;
+    renderEvidence(true);
   }
-  if (followLive)
-    selectedPolicy =
-      policies.find((policy) => policy.state === "active") ??
-      policies.at(-1) ??
-      null;
-  selectEvidence();
+}
+
+function promotionButtons(): void {
+  if (!promotion) return;
+  const scope = el<HTMLSelectElement>("promotion-scope").value;
+  const worldData = el<HTMLSelectElement>("promotion-world-data").value;
+  const invalidPortable = scope === "portable" && worldData === "yes";
+  text(
+    "promotion-scope-hint",
+    invalidPortable
+      ? "Retained world-specific data cannot be declared portable. Choose this world only, or review the exact program before declaring no retained data."
+      : scope && worldData
+        ? "The service will check the exact execution, immutable dependencies, trusted event, and attributable effects."
+        : "Choose scope and retained-data declarations before saving.",
+  );
+  el<HTMLButtonElement>("promotion-save").disabled =
+    !canOperate() ||
+    invalidPortable ||
+    !scope ||
+    !worldData ||
+    !el<HTMLSelectElement>("promotion-evidence").value;
+}
+
+function renderPromotionEvent(): void {
+  const archive = promotion ? archivedEvents.get(promotion.run.run_id) : null;
+  const event = archive?.events.find(
+    (item) =>
+      String(item.event_seq) ===
+      el<HTMLSelectElement>("promotion-evidence").value,
+  );
+  const inventory = event?.type === "observation.inventory";
+  hidden("promotion-inventory", !inventory);
+  hidden("promotion-event-detail", !event);
+  text("promotion-event-detail", event ? json(event) : "");
+  const select = el<HTMLSelectElement>("promotion-item");
+  const previous = select.value;
+  const details = event?.details;
+  const counts =
+    details && typeof details === "object" && !Array.isArray(details)
+      ? details.counts
+      : null;
+  const items =
+    counts && typeof counts === "object" && !Array.isArray(counts)
+      ? Object.entries(counts).filter(
+          ([, value]) => typeof value === "number" && value > 0,
+        )
+      : [];
+  select.replaceChildren(
+    new Option("Choose observed item", ""),
+    ...items.map(
+      ([name, value]) => new Option(`${name} · observed ${value}`, name),
+    ),
+  );
+  if (items.some(([name]) => name === previous)) select.value = previous;
+  select.required = !!inventory;
+  promotionButtons();
+}
+
+function renderPromotionEvents(): void {
+  if (!promotion || !el<HTMLDialogElement>("promotion-dialog").open) return;
+  const { run, execution } = promotion;
+  const archive = archivedEvents.get(run.run_id);
+  const select = el<HTMLSelectElement>("promotion-evidence");
+  const previous = select.value;
+  const candidates = (archive?.events ?? []).filter(
+    (event) =>
+      ["goal.verified", "observation.inventory"].includes(event.type) &&
+      !!execution.started_at &&
+      !!execution.ended_at &&
+      event.at >= execution.started_at &&
+      event.at <= execution.ended_at &&
+      event.details !== null &&
+      !archive?.omitted.includes(event.event_seq),
+  );
+  select.replaceChildren(
+    new Option("Select actual trusted evidence", ""),
+    ...candidates.map(
+      (event) =>
+        new Option(
+          `#${event.event_seq} · ${label(event.type)} · ${event.summary}`,
+          String(event.event_seq),
+        ),
+    ),
+  );
+  if (candidates.some((event) => String(event.event_seq) === previous))
+    select.value = previous;
+  text(
+    "promotion-events-status",
+    archive?.error
+      ? `Evidence unavailable: ${archive.error}`
+      : `${archive?.events.length ?? 0} retained events loaded; ${candidates.length} trusted candidates in this execution interval.${archive?.loading ? " Loading…" : archive?.more ? " Load more to reach later evidence." : " End of retained events."}${archive?.omitted.length ? ` ${archive.omitted.length} oversized event details explicitly omitted by the service; omitted records cannot be selected.` : ""}`,
+  );
+  el<HTMLButtonElement>("promotion-more").disabled =
+    !!archive?.loading || archive?.more === false;
+  renderPromotionEvent();
+}
+
+function openPromotion(run: RunView, execution: SkillExecutionView): void {
+  promotion = { run, execution };
+  text(
+    "promotion-execution",
+    `${run.run_id}\n${execution.execution_id} · ${label(execution.status)}\n${execution.skill_id} · v${execution.version}`,
+  );
+  el<HTMLFormElement>("promotion-form").reset();
+  text("promotion-result", "");
+  errorText("promotion-error", null);
+  openDialog("promotion-dialog");
+  renderPromotionEvents();
+  if (!archivedEvents.has(run.run_id)) void loadEventPage(run.run_id);
 }
 function renderOptions(state: AppSnapshot): void {
-  const nextGoals = json(state.goals.map((item) => [item.id, item.label]));
-  if (nextGoals !== goalSignature) {
-    goalSignature = nextGoals;
-    const selected = goal.value;
-    const options = state.goals.map((item) => new Option(item.label, item.id));
+  const gs = json(state.goals);
+  if (gs !== goalSignature) {
+    goalSignature = gs;
+    const previous = goal.value;
     goal.replaceChildren(
-      ...(options.length ? options : [new Option("No goals available", "")]),
+      ...state.goals.map((item) => new Option(item.label, item.id)),
     );
-    if (state.goals.some((item) => item.id === selected)) goal.value = selected;
+    if (state.goals.some((item) => item.id === previous)) goal.value = previous;
     if (!taskEdited && !task.value)
       task.value =
         state.goals.find((item) => item.id === goal.value)?.prompt ?? "";
   }
-  const nextModels = json(
-    state.auth.models.map((item) => [item.id, item.name]),
-  );
-  if (nextModels !== modelSignature) {
-    modelSignature = nextModels;
-    const selected = model.value || state.run?.model_id;
-    const options = state.auth.models.map(
-      (item) => new Option(item.name, item.id),
-    );
+  const ms = json(state.auth.models);
+  if (ms !== modelSignature) {
+    modelSignature = ms;
+    const previous = model.value || state.run?.model_id;
     model.replaceChildren(
-      ...(options.length
-        ? options
-        : [
-            new Option(
-              state.auth.authenticated
-                ? "No available models"
-                : "Connect OpenAI first",
-              "",
-            ),
-          ]),
+      ...(state.auth.models.length
+        ? state.auth.models.map((item) => new Option(item.name, item.id))
+        : [new Option("No models available", "")]),
     );
-    if (selected && state.auth.models.some((item) => item.id === selected))
-      model.value = selected;
+    if (previous && state.auth.models.some((item) => item.id === previous))
+      model.value = previous;
   }
 }
-function safeExternalUrl(value: string | null): string | null {
+function safeOAuth(value: string | null): string | null {
   if (!value) return null;
   try {
     const url = new URL(value);
-    return url.protocol === "https:" ||
-      (url.protocol === "http:" &&
-        ["127.0.0.1", "localhost"].includes(url.hostname))
+    return url.protocol === "https:" &&
+      [
+        "auth.openai.com",
+        "auth0.openai.com",
+        "login.openai.com",
+        "platform.openai.com",
+      ].includes(url.hostname) &&
+      !url.username &&
+      !url.password
       ? url.href
       : null;
   } catch {
@@ -374,468 +628,568 @@ function safeExternalUrl(value: string | null): string | null {
 }
 function renderAuth(state: AppSnapshot): void {
   const auth = state.auth;
-  text("auth-status", `OpenAI · ${label(auth.status)}`);
-  element("auth-status").dataset.ready = String(
-    auth.authenticated && auth.models.length > 0,
-  );
   text(
     "account-description",
     auth.authenticated
-      ? `${auth.account_label ?? "Account connected"} · ${auth.models.length} available ${auth.models.length === 1 ? "model" : "models"}.`
-      : auth.status === "authorizing"
-        ? "Complete authorization with OpenAI. No credentials are imported from other apps."
-        : "Connect your own OpenAI account. Subscription access depends on your account entitlement.",
+      ? `${auth.account_label ?? "Account connected"} · ${auth.models.length} available models`
+      : `OpenAI · ${label(auth.status)}. Connect your own account.`,
   );
   hidden("logout", !auth.authenticated);
   hidden("refresh-models", !auth.authenticated);
   hidden("login-flow", !auth.login);
   errorText("auth-error", auth.error);
-  const login = auth.login;
-  const nextPrompt = login ? `${login.id}:${login.prompt?.label ?? ""}` : "";
-  if (nextPrompt !== promptIdentity) {
+  const login = auth.login,
+    identity = login ? `${login.id}:${login.prompt?.label ?? ""}` : "";
+  if (identity !== promptIdentity) {
     authInput.value = "";
-    promptIdentity = nextPrompt;
+    promptIdentity = identity;
   }
   hidden("auth-form", !login?.prompt);
-  if (login) {
-    text(
-      "login-instructions",
-      login.instructions ??
-        (login.mode === "device"
-          ? "Follow the provider’s device authorization instructions."
-          : "Open the provider link to authorize this local application."),
+  const url = safeOAuth(login?.url ?? null),
+    link = el<HTMLAnchorElement>("authorize-link");
+  hidden("authorize-link", !url);
+  if (url) link.href = url;
+  else link.removeAttribute("href");
+  text(
+    "login-instructions",
+    login?.instructions ??
+      "Open the provider link to authorize this local application.",
+  );
+  if (login?.url && !url)
+    errorText(
+      "auth-error",
+      "Unsupported provider authorization address. Cancel and retry authorization.",
     );
-    const url = safeExternalUrl(login.url);
-    const link = element<HTMLAnchorElement>("authorize-link");
-    hidden("authorize-link", !url);
-    if (url && link.href !== url) link.href = url;
-    if (!url) link.removeAttribute("href");
-    if (login.url && !url)
-      errorText(
-        "auth-error",
-        "The provider returned an unsupported authorization URL. Cancel and retry authorization.",
-      );
-    if (login.prompt) {
-      text("auth-input-label", login.prompt.label);
-      const type = login.prompt.secret ? "password" : "text";
-      if (authInput.type !== type) authInput.type = type;
-      authInput.required = !login.prompt.allow_empty;
-    }
-  } else {
-    element<HTMLAnchorElement>("authorize-link").removeAttribute("href");
-    text("login-instructions", "");
+  if (login?.prompt) {
+    text("auth-input-label", login.prompt.label);
+    authInput.type = login.prompt.secret ? "password" : "text";
+    authInput.required = !login.prompt.allow_empty;
   }
 }
-function renderViewer(state: AppSnapshot): void {
-  const game = state.game;
-  text("view-status", label(game.status));
-  let url: string | null = null;
-  if (game.viewer_ready && game.viewer_url) {
-    try {
-      const candidate = new URL(game.viewer_url);
-      if (
-        candidate.protocol === "http:" &&
-        candidate.hostname === "127.0.0.1" &&
-        candidate.pathname === "/viewer/" &&
-        !candidate.username &&
-        !candidate.password &&
-        !candidate.search &&
-        !candidate.hash
-      )
-        url = candidate.href;
-    } catch {
-      /* Invalid renderer address remains unavailable. */
-    }
-  }
-  if (url !== viewerUrl) {
-    viewerFrame?.remove();
-    viewerFrame = null;
-    viewerUrl = url;
-    if (url) {
-      const frame = document.createElement("iframe");
-      frame.title = "Live Minecraft player view";
-      frame.referrerPolicy = "no-referrer";
-      frame.allowFullscreen = true;
-      frame.setAttribute("allow", "fullscreen");
-      frame.src = url;
-      frame.addEventListener("error", () => {
-        text(
-          "viewer-note",
-          "Renderer service could not be loaded. Check the game connection, then reload the view.",
-        );
-      });
-      viewerFrame = frame;
-      element("viewer").append(frame);
-    }
-  }
-  hidden("viewer-empty", !!url);
-  hidden("reload-viewer", !url);
-  if (url)
-    text(
-      "viewer-note",
-      "Live renderer · read-only player view. If the frame is blank or disconnected, reload the view.",
-    );
-  else {
-    const samePausedConnection =
-      state.run?.status === "paused" &&
-      state.run.world_id === game.world_id &&
-      state.run.epoch === game.epoch &&
-      (game.status === "error" || game.status === "disconnected");
-    const interruptedAction =
-      samePausedConnection && state.run?.action?.status === "unknown"
-        ? state.run.action
-        : null;
-    text(
-      "viewer-empty-title",
-      game.status === "connecting"
-        ? "Connecting player…"
-        : game.status === "connected"
-          ? "Renderer unavailable"
-          : game.error
-            ? "Player connection ended"
-            : "No game connection",
-    );
-    const connectionHint =
-      game.status === "connected"
-        ? "The player is connected, but the rendering service has not provided a usable view."
-        : state.server.status === "running"
-          ? game.status === "connecting"
-            ? "The world is running. Waiting for the player and renderer to connect."
-            : state.run?.status === "paused"
-              ? "Resume reconnects the player and continues this run, including model requests."
-              : state.run?.status === "created"
-                ? "Your run is saved. In Setup, reconnect the player, then press Start. Reconnecting does not call the model."
-                : activeRun(state.run)
-                  ? "The player is disconnected. Stop the run, then reconnect the player in Setup."
-                  : "The world is running. Reconnect the player in Setup to restore the live view."
-          : "Start the local world in Setup to connect the player and renderer.";
-    text(
-      "viewer-empty-copy",
-      game.error ? `Connection event: ${game.error}` : connectionHint,
-    );
-    text(
-      "viewer-interrupted-action",
-      interruptedAction
-        ? `Interrupted ${interruptedAction.kind}: outcome unverified. This action result does not explain why the player disconnected. No action is automatically replayed.`
-        : "",
-    );
-    hidden("viewer-interrupted-action", !interruptedAction);
-    text("viewer-recovery-hint", game.error ? connectionHint : "");
-    hidden("viewer-recovery-hint", !game.error);
-    text(
-      "open-setup",
-      state.run?.status === "paused" && state.server.status === "running"
-        ? "Go to Resume"
-        : "Open setup",
-    );
-    text(
-      "viewer-note",
-      game.viewer_ready && !url
-        ? "The renderer returned an unsupported address. Check the local service."
-        : "No live renderer available. No simulated footage is displayed.",
-    );
-  }
-  const player = game.player;
-  text(
-    "player-vitals",
-    player
-      ? `Health ${player.health.toFixed(1)} / 20 · Food ${player.food} / 20`
-      : "Player state unavailable",
-  );
-  text(
-    "player-position",
-    player
-      ? `XYZ ${player.position.x.toFixed(1)} / ${player.position.y.toFixed(1)} / ${player.position.z.toFixed(1)}`
-      : "",
-  );
-  text(
-    "observation-time",
-    game.last_observation_at
-      ? `Observed ${when(game.last_observation_at)}`
-      : "No observation",
-  );
-  const inventory = player?.inventory ?? [];
-  text("inventory-count", player ? `(${inventory.length} occupied slots)` : "");
-  text(
-    "inventory-empty",
-    player
-      ? "Inventory is empty."
-      : "Inventory is unavailable until the player connects.",
-  );
-  hidden("inventory-empty", inventory.length > 0);
-  const list = element("inventory-items");
-  const signature = json(inventory);
-  if (list.dataset.signature !== signature) {
-    list.dataset.signature = signature;
-    list.replaceChildren(
-      ...inventory.map((item) => {
-        const li = document.createElement("li");
-        li.textContent = `${item.display_name} × ${item.count}`;
-        return li;
-      }),
-    );
+function usageList(node: HTMLElement, usage: TokenUsage | null): void {
+  node.replaceChildren();
+  for (const [name, value] of [
+    ["Uncached input", usage ? count(usage.uncached_input) : "Unknown"],
+    ["Cache read", usage ? count(usage.cache_read) : "Unknown"],
+    ["Cache write", usage ? count(usage.cache_write) : "Unknown"],
+    ["Output", usage ? count(usage.output) : "Unknown"],
+    ["Calls", usage ? count(usage.calls) : "Unknown"],
+  ]) {
+    const dt = document.createElement("dt"),
+      dd = document.createElement("dd");
+    dt.textContent = name!;
+    dd.textContent = value!;
+    node.append(dt, dd);
   }
 }
-function activeRun(run: RunView | null): boolean {
-  return !!run && !["stopped", "completed", "failed"].includes(run.status);
-}
-function canOperate(id?: string): boolean {
-  return (
-    serviceReady &&
-    !!snapshot &&
-    (pendingCommands.size === 0 ||
-      (id === "stop-run" && !pendingCommands.has(id)))
-  );
-}
-function updateButtons(): void {
-  const state = snapshot;
-  const available = canOperate();
-  const run = state?.run ?? null;
-  const active = activeRun(run);
-  const busyAuth =
-    state?.auth.status === "authorizing" ||
-    state?.auth.status === "discovering";
-  const gameBusy = ["preparing", "starting"].includes(
-    state?.server.status ?? "",
-  );
-  const canReconnect =
-    state?.server.status === "running" &&
-    ["disconnected", "error"].includes(state.game.status);
-  const runPrerequisitesReady =
-    state?.auth.authenticated &&
-    !!state.auth.models.length &&
-    state.server.status === "running" &&
-    state.sandbox.status === "ready";
-  const runReady = runPrerequisitesReady && state?.game.status === "connected";
-  const disabled: Record<string, boolean> = {
-    "login-browser": !available || !!busyAuth || active,
-    "login-device": !available || !!busyAuth || active,
-    "refresh-models":
-      !available || !state?.auth.authenticated || !!busyAuth || active,
-    logout: !available || !state?.auth.authenticated || !!busyAuth || active,
-    "auth-submit": !available || !state?.auth.login?.prompt,
-    "cancel-login": !available || !state?.auth.login,
-    "prepare-game":
-      !available ||
-      gameBusy ||
-      state?.server.status === "running" ||
-      active ||
-      (!state?.server.eula_accepted &&
-        !element<HTMLInputElement>("eula").checked),
-    "start-game":
-      !available ||
-      gameBusy ||
-      (state?.server.status !== "stopped" && !canReconnect) ||
-      (active && !(run?.status === "created" && canReconnect)),
-    "stop-game":
-      !available ||
-      !["running", "starting", "error"].includes(state?.server.status ?? "") ||
-      active,
-    "new-world":
-      !available ||
-      active ||
-      state?.server.status !== "stopped" ||
-      !element<HTMLInputElement>("confirm-world").checked,
-    "create-run":
-      !available ||
-      active ||
-      !runReady ||
-      !task.value.trim() ||
-      !model.value ||
-      !goal.value,
-    "start-run": !available || run?.status !== "created" || !runReady,
-    "pause-run":
-      !available || !["running", "bootstrapping"].includes(run?.status ?? ""),
-    "resume-run":
-      !available || run?.status !== "paused" || !runPrerequisitesReady,
-    "stop-run":
-      !canOperate("stop-run") ||
-      !active ||
-      (run?.status === "stopping" && !run.error),
-    "use-goal": !available || !goal.value,
-  };
-  for (const [id, value] of Object.entries(disabled)) {
-    const button = element<HTMLButtonElement>(id);
-    button.disabled = value;
-    button.setAttribute(
-      "aria-busy",
-      String(
-        pendingCommands.has(id) ||
-          (id === "stop-run" && run?.status === "stopping" && !run.error),
-      ),
-    );
-  }
+function mergeEvents(incoming: ActivityEvent[]): void {
+  for (const event of incoming)
+    events.set(`${event.run_id ?? "system"}:${event.event_seq}`, event);
+  const ordered = [...events.values()]
+    .sort((a, b) => a.at.localeCompare(b.at) || a.event_seq - b.event_seq)
+    .slice(-200);
+  events.clear();
+  for (const event of ordered)
+    events.set(`${event.run_id ?? "system"}:${event.event_seq}`, event);
+  const latest = ordered.at(-1);
+  const longActivity = !!latest &&
+    (latest.summary.length > 80 || /[\r\n]/.test(latest.summary));
+  text("activity-heading", longActivity ? "Activity · read full" : "Latest activity");
   text(
-    "stop-run",
-    run?.status === "stopping"
-      ? run.error && !pendingCommands.has("stop-run")
-        ? "Retry Stop"
-        : "Stopping"
-      : "Stop run",
-  );
-  text(
-    "start-game",
-    state?.server.status === "starting"
-      ? "Starting…"
-      : state?.server.status === "running"
-        ? state.game.status === "connecting" ||
-          pendingCommands.has("start-game")
-          ? "Connecting player…"
-          : state.game.status === "connected"
-            ? "Player connected"
-            : "Reconnect player"
-        : pendingCommands.has("start-game")
-          ? "Starting…"
-          : "Start world",
-  );
-  goal.disabled = !available || active;
-  model.disabled = !available || active || !state?.auth.models.length;
-  task.disabled = !serviceReady || active;
-  hidden("pause-run", run?.status === "paused");
-  hidden("resume-run", run?.status !== "paused");
-  element("task-form").setAttribute(
-    "aria-busy",
-    String(pendingCommands.has("create-run")),
+    "latest-activity",
+    latest
+      ? longActivity ? `${latest.summary.replace(/\s+/g, " ").trim().slice(0, 48).trimEnd()}…` : latest.summary
+      : "No recorded activity yet.",
   );
 }
 function render(state: AppSnapshot): void {
   snapshot = state;
   renderOptions(state);
   renderAuth(state);
-  renderViewer(state);
-  text("server-status", `World · ${label(state.server.status)}`);
-  element("server-status").dataset.ready = String(
-    state.server.status === "running",
+  mergeEvents(state.events);
+  video.setSourceState(state.game.video.status, state.game.video.error);
+  const context = json([model.value, state.server.world_id]);
+  if (libraryContext && libraryContext !== context) {
+    libraryContext = context;
+    libraryGeneration++;
+    library = [];
+    el<HTMLSelectElement>("experience").replaceChildren(
+      new Option("No saved programs", ""),
+    );
+    librarySelection();
+    text(
+      "library-status",
+      "Model or world changed. Refresh the compatible library before selecting a saved bundle.",
+    );
+    if (el<HTMLDialogElement>("settings-dialog").open) void loadLibrary();
+  }
+  const run = state.run;
+  const life = state.game.life;
+  const deadControl = ["bootstrapping", "running"].includes(run?.status ?? "")
+    ? "model may request respawn"
+    : run?.status === "paused"
+      ? "control paused"
+      : run?.status === "created"
+        ? "task not started"
+        : run?.status === "reviewing"
+          ? "effect-free review"
+          : ["pausing", "stopping"].includes(run?.status ?? "")
+            ? "control closing"
+            : "no active run";
+  text("life-current", state.game.status === "error"
+    ? "Connection fault · inspect Settings"
+    : state.game.status !== "connected"
+      ? `Client ${label(state.game.status)}`
+      : life
+        ? `Life ${life.life_id} · ${life.status}${life.status === "dead" ? life.can_respawn ? ` · ${deadControl}` : " · waiting for death-screen readiness" : life.status === "respawning" ? " · awaiting native confirmation" : ""}`
+        : "Connected · awaiting life readiness");
+  if (el<HTMLSelectElement>("motor-profile").value === state.game.motor_profile) motorEdited = false;
+  if (!motorEdited) el<HTMLSelectElement>("motor-profile").value = state.game.motor_profile;
+  text("motor-status", `Current profile: ${state.game.motor_profile}.${motorEdited ? " Selection not applied." : " Applies live without restarting the session."}`);
+  text("run-status", run ? label(run.status) : "No run");
+  const suppliedGoal = state.goals.find((item) => item.id === run?.goal);
+  const longTask = !!run && run.task !== suppliedGoal?.prompt &&
+    (run.task.length > 144 || /[\r\n]/.test(run.task));
+  text("current-task", run
+    ? longTask
+      ? `${suppliedGoal?.label ?? "Custom task"} · ${run.task.length.toLocaleString()} characters. Read the complete task below.`
+      : run.task
+    : "No run created.");
+  hidden("goal-more", !longTask);
+  const execution = run?.executions.find((item) => item.execution_id === run.action?.execution_id) ?? run?.executions.find((item) =>
+    ["running", "accepted", "cancel_requested"].includes(item.status),
   );
-  text("sandbox-status", `Isolation · ${label(state.sandbox.status)}`);
-  element("sandbox-status").dataset.ready = String(
-    state.sandbox.status === "ready",
+  const skill = run?.skills.find(
+    (item) =>
+      item.skill_id === execution?.skill_id &&
+      item.version === execution?.version,
+  );
+  text(
+    "program-current",
+    execution
+      ? skill && skill.name.length <= 32 && !/[\r\n]/.test(skill.name)
+        ? skill.name
+        : execution.skill_id
+      : "No executing skill.",
+  );
+  text("program-status", execution ? `v${execution.version} · ${label(execution.status)}` : "");
+  hidden("program-status", !execution);
+  usageList(el("usage-summary"), run?.usage ?? null);
+  errorText("run-error", run?.error ?? null);
+  text(
+    "readiness",
+    `World · ${label(state.server.status)} / OpenAI · ${label(state.auth.status)} / Isolation · ${label(state.sandbox.status)}`,
   );
   text(
     "world-description",
-    `Minecraft ${state.server.version} · ${state.server.host}:${state.server.port} · ${label(state.server.status)}${state.server.eula_accepted ? " · EULA accepted" : ""}`,
+    `Minecraft ${state.server.version} · ${state.server.host}:${state.server.port} · ${label(state.server.status)} · client ${label(state.game.status)}`,
   );
   hidden("eula-row", state.server.eula_accepted);
-  errorText("game-error", state.server.error ?? state.game.error);
   errorText(
-    "sandbox-error",
-    state.sandbox.error
-      ? `Policy isolation unavailable: ${state.sandbox.error}`
-      : null,
+    "game-error",
+    state.server.error ?? state.game.error ?? state.game.video.error,
   );
-  text(
-    "prepare-game",
-    state.server.status === "preparing" ? "Preparing…" : "Prepare server",
-  );
-  const run = state.run;
-  text("run-status", run ? label(run.status) : "No run");
-  hidden("current-run", !run);
-  errorText("run-error", run?.error ?? null);
-  if (run) {
-    text("current-task", run.task);
-    text("current-model", run.model_id);
-    text("model-status", label(run.model_status));
-    text("turns", String(run.turns));
-    text(
-      "tokens",
-      `${run.usage.input_tokens.toLocaleString()} / ${run.usage.output_tokens.toLocaleString()}`,
-    );
-    text(
-      "cost",
-      run.usage.known_cost === null
-        ? "Unknown / unmeasured"
-        : `$${run.usage.known_cost.toFixed(4)}`,
-    );
-    text(
-      "action-summary",
-      run.action
-        ? `${label(run.action.origin)} action · ${run.action.kind} · ${label(run.action.status)} — ${run.action.summary}`
-        : "No foreground action.",
-    );
-    text(
-      "run-evidence",
-      json({
-        run_id: run.run_id,
-        world_id: run.world_id,
-        epoch: run.epoch,
-        started_at: run.started_at,
-        ended_at: run.ended_at,
-        action: run.action,
-      }),
-    );
-  }
-  const hint = !state.auth.authenticated
-    ? "Connect OpenAI in Setup before creating a run."
-    : state.auth.models.length === 0
-      ? "No model is available. Refresh models or check your account entitlement."
-      : state.server.status !== "running"
-        ? "Start the local world in Setup."
-        : state.sandbox.status !== "ready"
-          ? "Policy isolation is not ready. The local Docker sandbox must be available before a run can start."
-          : run?.status === "paused"
-            ? "Run paused. Resume reconnects the player if needed and continues this task; Stop closes it and disconnects the player."
-            : state.game.status !== "connected"
-              ? state.game.status === "connecting"
-                ? "Waiting for a real player connection. Check Setup for connection errors."
-                : run?.status === "created"
-                  ? "Your task and model are saved. Reconnect the player in Setup, then press Start above; no new run or model request is needed to reconnect."
-                  : activeRun(run)
-                    ? "The player is disconnected. Stop the run, then reconnect the player in Setup."
-                    : "Reconnect the player in Setup before creating a run."
-              : run?.status === "created"
-                ? "Run created. Start above admits the first strategic turn."
-                : activeRun(run)
-                  ? "Pause fences new decisions and cancels the foreground action. Stop also disconnects the player; the world itself keeps running."
-                  : goal.value === "custom"
-                    ? "Custom goals do not self-certify success from model text. Stop when you have reviewed the result."
-                    : "Create a run, then Start. Completion requires actual inventory evidence.";
-  text(
-    "run-hint",
-    run?.status === "stopping"
-      ? run.error
-        ? "Stop cleanup failed. Retry Stop above to finish cleanup."
-        : "Stopping the run and disconnecting the player. The world itself keeps running."
-      : hint,
-  );
-  if (!setupInitialized) {
-    setupInitialized = true;
-    if (!setupTouched)
-      setSetup(
-        !state.auth.authenticated ||
-          state.server.status !== "running" ||
-          state.sandbox.status !== "ready",
-      );
-  }
-  mergeEvents(state.events);
-  renderPolicies(run);
-  updateButtons();
+  errorText("sandbox-error", state.sandbox.error);
+  let hint = "Configure a task in Settings.";
+  if (run?.status === "paused")
+    hint = "Paused control; world ticks continue. Resume continues this task.";
+  else if (run?.status === "stopping")
+    hint = run.error
+      ? "Cleanup failed. Retry Stop; effects may be unknown."
+      : "Fencing agent work; awaiting confirmed input neutralization.";
+  else if (run?.status === "created")
+    hint = life?.status === "dead" && life.can_respawn
+      ? "Task saved. Start lets the model inspect the death state and choose recovery."
+      : "Task saved. Start begins strategic inference.";
+  else if (run?.status === "reviewing")
+    hint = "Goal verified. Effect-free review; no additional gameplay trials.";
+  else if (active(run))
+    hint = life?.status === "dead"
+      ? "Player dead. The model chooses whether to respawn; native video continues."
+      : life?.status === "respawning"
+        ? "Model requested respawn. Awaiting authoritative new-life readiness."
+        : life?.status === "loading"
+          ? "Player loading. Ordinary effects wait for native readiness."
+          : "Pause and Stop fence agent work; the game session continues.";
+  else if (run)
+    hint = state.game.status === "connected"
+      ? "Run closed. Client remains connected; create the next task without reconnecting."
+      : `Run closed. Client ${label(state.game.status)}; inspect Settings before the next task.`;
+  else if (state.game.status === "connected" && life?.status === "dead" && life.can_respawn)
+    hint = state.auth.authenticated
+      ? "Player dead; no active run. Create a task and Start so the model can choose recovery."
+      : "Player dead; no active run. Connect OpenAI in Settings, create a task and Start.";
+  else if (!state.auth.authenticated)
+    hint = "Connect OpenAI and prepare the world in Settings.";
+  text("run-hint", hint);
+  buttons();
+  renderEvidence();
 }
-async function refreshState(): Promise<void> {
+function sectionHeading(parent: HTMLElement, title: string): void {
+  const h = document.createElement("h3");
+  h.textContent = title;
+  parent.append(h);
+}
+function paragraph(
+  parent: HTMLElement,
+  value: string,
+  className?: string,
+): void {
+  const p = document.createElement("p");
+  p.textContent = value;
+  if (className) p.className = className;
+  parent.append(p);
+}
+function recordButton(
+  parent: HTMLElement,
+  title: string,
+  detail: string,
+  key: string,
+  handler: () => void,
+): void {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "record";
+  button.dataset.key = key;
+  const strong = document.createElement("strong"),
+    span = document.createElement("span");
+  strong.textContent = title;
+  span.textContent = detail;
+  button.append(strong, span);
+  button.addEventListener("click", handler);
+  parent.append(button);
+}
+function pre(parent: HTMLElement, value: unknown): void {
+  const node = document.createElement("pre");
+  node.tabIndex = 0;
+  node.textContent = json(value);
+  parent.append(node);
+}
+function usageTable(parent: HTMLElement, run: RunView): void {
+  paragraph(
+    parent,
+    "Actual reported counters. Unknown means unreported; legacy aggregate input is not relabeled as uncached input. Known cost is not an estimate of unknown charges.",
+  );
+  const scroller = document.createElement("div");
+  scroller.className = "table-scroll";
+  const table = document.createElement("table");
+  const header = document.createElement("thead"),
+    tr = document.createElement("tr");
+  for (const name of [
+    "Purpose",
+    "Calls",
+    "Uncached input",
+    "Cache read",
+    "Cache write",
+    "Output",
+    "Legacy input",
+    "Known cost",
+  ]) {
+    const th = document.createElement("th");
+    th.scope = "col";
+    th.textContent = name;
+    tr.append(th);
+  }
+  header.append(tr);
+  table.append(header);
+  const body = document.createElement("tbody");
+  for (const [name, value] of [
+    ["Total", run.usage],
+    ...Object.entries(run.usage.by_purpose),
+  ] as [string, TokenUsage][]) {
+    const row = document.createElement("tr");
+    const heading = document.createElement("th");
+    heading.scope = "row";
+    heading.textContent = label(name);
+    row.append(heading);
+    for (const item of [
+      count(value.calls),
+      count(value.uncached_input),
+      count(value.cache_read),
+      count(value.cache_write),
+      count(value.output),
+      count(value.legacy_input),
+      value.known_cost === null ? "Unknown" : `$${value.known_cost.toFixed(4)}`,
+    ]) {
+      const td = document.createElement("td");
+      td.textContent = item;
+      row.append(td);
+    }
+    body.append(row);
+  }
+  table.append(body);
+  scroller.append(table);
+  parent.append(scroller);
+  paragraph(
+    parent,
+    "Token usage, code compactness, and measured gameplay effectiveness are separate evidence. No causal speedup is inferred.",
+    "muted",
+  );
+}
+function renderEvidence(force = false): void {
+  if (!el<HTMLDialogElement>("evidence-dialog").open) return;
+  if (
+    el<HTMLDialogElement>("source-dialog").open ||
+    el<HTMLDialogElement>("promotion-dialog").open
+  )
+    return;
+  const run = selectedRun ?? snapshot?.run ?? null;
+  const archive = run ? archivedEvents.get(run.run_id) : null;
+  const retained = new Map<string, ActivityEvent>();
+  for (const event of [...events.values(), ...(archive?.events ?? [])]) {
+    if (!run || !event.run_id || event.run_id === run.run_id)
+      retained.set(`${event.run_id ?? "system"}:${event.event_seq}`, event);
+  }
+  const relevantEvents = [...retained.values()].sort(
+    (a, b) => b.at.localeCompare(a.at) || b.event_seq - a.event_seq,
+  );
+  const signature = json([
+    evidenceTab,
+    run,
+    evidenceTab === "activity" ? [relevantEvents, archive] : null,
+    evidenceTab === "inventory" ? snapshot?.game.player : null,
+    evidenceTab === "life" ? snapshot?.game : null,
+    run ? measuredEvidence.get(run.run_id) : null,
+  ]);
+  if (!force && signature === evidenceSignature) return;
+  evidenceSignature = signature;
+  const node = el("evidence-content");
+  text(
+    "evidence-run",
+    run
+      ? `${selectedRun ? "Retained" : "Current"} run · ${run.run_id} · ${label(run.status)}`
+      : "No run selected",
+  );
+  if (inspector.render(evidenceTab, node, run, selectedRun ? null : snapshot?.game ?? null)) return;
+  const focused =
+    document.activeElement instanceof HTMLElement
+      ? document.activeElement.dataset.key
+      : undefined;
+  const openDetails = new Set(
+    [...node.querySelectorAll<HTMLDetailsElement>("details[open]")].map(
+      (item) => item.dataset.record,
+    ),
+  );
+  const scroll = node.scrollTop;
+  node.replaceChildren();
+  if (run) paragraph(node, run.task, "evidence-task");
+  if (evidenceTab === "activity") {
+    if (run) {
+      paragraph(
+        node,
+        archive?.error
+          ? `Retained activity unavailable: ${archive.error}`
+          : archive?.loading
+            ? "Loading retained activity…"
+            : `${archive?.events.length ?? 0} retained events loaded in bounded pages. Latest live events are also shown.`,
+      );
+      if (archive?.omitted.length)
+        paragraph(
+          node,
+          `Details explicitly omitted for oversized event sequences: ${archive.omitted.join(", ")}. These summaries do not establish a promotion predicate.`,
+          "muted",
+        );
+      if (!archive || archive.more) {
+        const more = document.createElement("button");
+        more.type = "button";
+        more.textContent = archive?.loading
+          ? "Loading…"
+          : "Load more retained activity";
+        more.disabled = !!archive?.loading;
+        more.addEventListener("click", () => void loadEventPage(run.run_id));
+        node.append(more);
+      }
+    }
+    if (!relevantEvents.length)
+      paragraph(node, "No recorded activity available in the loaded window.");
+    for (const event of relevantEvents) {
+      const details = document.createElement("details"),
+        summary = document.createElement("summary");
+      details.dataset.record = `event:${event.run_id ?? "system"}:${event.event_seq}`;
+      summary.dataset.key = details.dataset.record;
+      summary.textContent = `${when(event.at)} · ${label(event.type)} — ${event.summary}`;
+      details.append(summary);
+      pre(details, event);
+      node.append(details);
+    }
+  } else if (evidenceTab === "inventory") {
+    if (selectedRun) {
+      paragraph(
+        node,
+        "Live inventory belongs to the current client, not this retained run. Review linked result evidence for historical inventory observations.",
+      );
+    } else {
+      const player = snapshot?.game.player;
+      paragraph(
+        node,
+        player
+          ? `Observed ${when(snapshot?.game.last_observation_at ?? null)} · health ${player.health} / 20 · food ${player.food} / 20`
+          : "Player state is unavailable.",
+      );
+      if (player) {
+        paragraph(
+          node,
+          `XYZ ${player.position.x.toFixed(1)} / ${player.position.y.toFixed(1)} / ${player.position.z.toFixed(1)}`,
+          "mono",
+        );
+        if (!player.inventory.length) paragraph(node, "Inventory is empty.");
+        for (const item of player.inventory)
+          paragraph(
+            node,
+            `${item.display_name} × ${item.count} · slot ${item.slot}`,
+            "mono",
+          );
+      }
+    }
+  } else if (!run) {
+    paragraph(
+      node,
+      "Create a run in Settings. Model-authored programs, executions, revisions, and actual usage appear here when recorded.",
+    );
+  } else if (evidenceTab === "programs") {
+    sectionHeading(node, "Model & current control");
+    paragraph(node, `${run.model_id} · strategist ${label(run.model_status)} · ${run.turns} turns`);
+    for (const execution of run.executions.filter((item) =>
+      ["running", "accepted", "cancel_requested"].includes(item.status),
+    )) {
+      const skill = run.skills.find((item) =>
+        item.skill_id === execution.skill_id && item.version === execution.version,
+      );
+      paragraph(node, `${skill?.name ?? execution.skill_id} · ${execution.skill_id} · v${execution.version} · ${label(execution.status)} · ${execution.actions} actions / ${execution.calls} host calls`, "mono");
+    }
+    paragraph(node, run.action
+      ? `${label(run.action.origin)} · ${run.action.kind} · ${label(run.action.status)} — ${run.action.summary}`
+      : "No foreground action.");
+    sectionHeading(node, "Skills");
+    if (!run.skills.length)
+      paragraph(node, "No model-authored skills registered in this run.");
+    for (const skill of run.skills)
+      recordButton(
+        node,
+        `${skill.name} · v${skill.version}`,
+        `${label(skill.state)} · ${skill.validation.formatted_lines} canonical lines · ${skill.dependencies.length} exact dependencies`,
+        `${skill.skill_id}:${skill.version}`,
+        () => inspector.showSource(skill, run),
+      );
+    sectionHeading(node, "Reactive programs");
+    if (!run.policies.length)
+      paragraph(node, "No reactive programs registered.");
+    for (const policy of run.policies)
+      recordButton(
+        node,
+        `${policy.name} · v${policy.version}`,
+        `${policy.backend} · ${label(policy.state)} · ${policy.evaluations} evaluations / ${policy.effects} effects`,
+        `${policy.policy_id}:${policy.version}`,
+        () => inspector.showSource(policy, run),
+      );
+  } else if (evidenceTab === "executions") {
+    paragraph(
+      node,
+      "Program result status does not certify the run’s objective. Unknown actions are not automatically replayed.",
+      "muted",
+    );
+    const measured = measuredEvidence.get(run.run_id);
+    if (measured?.error)
+      paragraph(
+        node,
+        `Measured evidence unavailable: ${measured.error}`,
+        "error",
+      );
+    else if (measured?.loading)
+      paragraph(node, "Loading measured program evidence…");
+    const reload = document.createElement("button");
+    reload.type = "button";
+    reload.textContent = "Refresh measured evidence";
+    reload.disabled = !!measured?.loading;
+    reload.addEventListener("click", () => void loadMeasurements(run.run_id));
+    node.append(reload);
+    if (!run.executions.length)
+      paragraph(node, "No skill executions admitted in this run.");
+    for (const execution of [...run.executions].reverse())
+      inspector.executionDetails(node, execution, run);
+    if (run.action) {
+      sectionHeading(node, "Latest linked leaf action");
+      pre(node, run.action);
+    }
+  } else if (evidenceTab === "revisions") {
+    paragraph(
+      node,
+      "Immutable versions are shown with exact parent and dependency links. A newer version is not evidence of improved gameplay.",
+      "muted",
+    );
+    if (!run.skills.length && !run.policies.length)
+      paragraph(node, "No program revisions recorded.");
+    for (const skill of [...run.skills].sort(
+      (a, b) => a.skill_id.localeCompare(b.skill_id) || b.version - a.version,
+    ))
+      recordButton(
+        node,
+        `${skill.name} · v${skill.version}`,
+        `Parent ${skill.parent_version === null ? "none" : `v${skill.parent_version}`} · ${when(skill.created_at)} · SHA ${skill.hash}`,
+        `revision:${skill.skill_id}:${skill.version}`,
+        () => inspector.showSource(skill, run),
+      );
+    for (const policy of run.policies)
+      recordButton(
+        node,
+        `${policy.name} · v${policy.version}`,
+        `Reaction · ${policy.backend} · SHA ${policy.hash}`,
+        `revision:${policy.policy_id}:${policy.version}`,
+        () => inspector.showSource(policy, run),
+      );
+  } else if (evidenceTab === "usage") usageTable(node, run);
+  for (const details of node.querySelectorAll<HTMLDetailsElement>("details"))
+    details.open = openDetails.has(details.dataset.record);
+  node.scrollTop = scroll;
+  if (focused)
+    node
+      .querySelector<HTMLElement>(`[data-key="${CSS.escape(focused)}"]`)
+      ?.focus({ preventScroll: true });
+}
+function setEvidenceTab(name: string, focus = false): void {
+  evidenceTab = name;
+  for (const tab of document.querySelectorAll<HTMLButtonElement>(
+    ".evidence-tabs [role=tab]",
+  )) {
+    const selected = tab.id === `${name}-tab`;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+    if (selected && focus) tab.focus();
+  }
+  el("evidence-content").setAttribute("aria-labelledby", `${name}-tab`);
+  renderEvidence(true);
+  const run = selectedRun ?? snapshot?.run;
+  if (run && ["programs", "executions", "revisions"].includes(name) &&
+    !measuredEvidence.has(run.run_id)) void loadMeasurements(run.run_id);
+  if (run && name === "activity" && !archivedEvents.has(run.run_id))
+    void loadEventPage(run.run_id);
+}
+function openEvidence(name: string, run: RunView | null = null): void {
+  selectedRun = run;
+  openDialog("evidence-dialog");
+  setEvidenceTab(name);
+}
+async function refresh(): Promise<void> {
   if (!serviceReady) return;
   if (fetching) {
     refreshAgain = true;
     return;
   }
   fetching = true;
-  const generation = bootstrapGeneration;
+  const current = generation;
   try {
     const next = await fetchState();
-    if (generation === bootstrapGeneration) render(next);
+    if (current === generation) render(next);
   } catch (error) {
-    if (generation === bootstrapGeneration) {
+    if (current === generation) {
+      serviceReady = false;
+      stream?.close();
+      text("connection", "State unavailable · reconnect required");
       errorText(
         "request-error",
-        `${message(error)} Displayed evidence is retained; current state is unavailable.`,
+        `${message(error)} Displayed evidence may be stale.`,
       );
-      serviceReady = false;
-      eventStream?.close();
-      text(
-        "connection",
-        error instanceof ApiError && [401, 403].includes(error.status)
-          ? "Local session expired · reconnect required"
-          : "State unavailable · reconnect required",
-      );
-      updateButtons();
+      buttons();
     }
   } finally {
     fetching = false;
@@ -846,303 +1200,614 @@ async function refreshState(): Promise<void> {
   }
 }
 function scheduleRefresh(): void {
-  if (refreshTimer === null)
+  if (!refreshTimer)
     refreshTimer = window.setTimeout(() => {
-      refreshTimer = null;
-      void refreshState();
-    }, 150);
-}
-function message(error: unknown): string {
-  return error instanceof Error
-    ? error.message
-    : "The request failed. Reconnect to inspect the current state.";
+      refreshTimer = 0;
+      void refresh();
+    }, 180);
 }
 async function command(
   id: string,
   operation: () => Promise<void>,
 ): Promise<void> {
   if (!canOperate(id)) return;
-  pendingCommands.add(id);
+  pending.add(id);
   errorText("request-error", null);
-  updateButtons();
+  errorText("settings-error", null);
+  buttons();
   try {
     await operation();
-    await refreshState();
+    await refresh();
   } catch (error) {
     errorText("request-error", message(error));
+    if (el<HTMLDialogElement>("settings-dialog").open)
+      errorText("settings-error", message(error));
     scheduleRefresh();
   } finally {
-    pendingCommands.delete(id);
-    updateButtons();
+    pending.delete(id);
+    buttons();
   }
 }
 async function bootstrap(): Promise<void> {
-  const generation = ++bootstrapGeneration;
-  eventStream?.close();
-  eventStream = null;
+  const current = ++generation;
+  stream?.close();
+  video.disconnect();
   serviceReady = false;
-  updateButtons();
-  element<HTMLButtonElement>("reconnect").disabled = true;
+  buttons();
+  el<HTMLButtonElement>("reconnect").disabled = true;
   text("connection", "Connecting to local service…");
   errorText("request-error", null);
   try {
     await openSession();
     const next = await fetchState();
-    if (generation !== bootstrapGeneration) return;
+    if (current !== generation) return;
     serviceReady = true;
     render(next);
-    const stream = new EventSource("/v1/events", { withCredentials: true });
-    eventStream = stream;
-    stream.onopen = () => {
-      if (generation === bootstrapGeneration) {
-        text("connection", "Local service · live updates connected");
-        if (element("request-error").textContent === streamFailure)
-          errorText("request-error", null);
-        scheduleRefresh();
-      }
+    video.connect();
+    const source = new EventSource("/v1/events", { withCredentials: true });
+    stream = source;
+    source.onopen = () => {
+      if (current !== generation) return;
+      text("connection", "Local service connected");
+      scheduleRefresh();
     };
-    stream.onerror = () => {
-      if (generation === bootstrapGeneration) {
-        text("connection", "Live updates interrupted · reconnecting");
-        errorText("request-error", streamFailure);
-      }
+    source.onerror = () => {
+      if (current !== generation) return;
+      text("connection", "Live updates interrupted");
+      errorText(
+        "request-error",
+        "Live updates interrupted. Displayed state may be stale; reconnect to inspect authority. Stop remains available through the authenticated service.",
+      );
     };
     const activity = (event: MessageEvent<string>): void => {
+      if (current !== generation) return;
       try {
         const parsed = eventSchema.safeParse(JSON.parse(event.data));
         if (parsed.success) mergeEvents([parsed.data]);
         else
           errorText(
             "request-error",
-            "An unreadable activity event was received. Reconnect to refresh state.",
+            "Unreadable activity received. Reconnect to inspect state.",
           );
       } catch {
         errorText(
           "request-error",
-          "An unreadable activity event was received. Reconnect to refresh state.",
+          "Unreadable activity received. Reconnect to inspect state.",
         );
       }
       scheduleRefresh();
     };
-    stream.onmessage = activity;
-    stream.addEventListener("activity", activity as EventListener);
-    stream.addEventListener("changed", scheduleRefresh);
+    source.onmessage = activity;
+    source.addEventListener("activity", activity as EventListener);
+    source.addEventListener("changed", scheduleRefresh);
   } catch (error) {
-    if (generation === bootstrapGeneration) {
+    if (current === generation) {
       text("connection", "Local service unavailable");
       errorText("request-error", message(error));
     }
   } finally {
-    if (generation === bootstrapGeneration) {
-      element<HTMLButtonElement>("reconnect").disabled = false;
-      updateButtons();
+    if (current === generation) {
+      el<HTMLButtonElement>("reconnect").disabled = false;
+      buttons();
     }
   }
 }
-function onClick(id: string, handler: () => void): void {
-  element(id).addEventListener("click", handler);
+async function loadJev(): Promise<void> {
+  try {
+    const status = await fetchJev();
+    text(
+      "jev-status",
+      status.configured
+        ? `Key configured · ${status.state}. ${status.selection ? `TypeSafe judge ${status.selection.model_id} · request deadline ${status.selection.request_timeout_ms} ms.` : "No local judge selection."} Broker limits: ${status.limits.max_concurrent} concurrent / ${status.limits.requests_per_minute} requests per minute / ${status.limits.max_request_ms} ms maximum. Connectivity and entitlement are not established by a saved key.`
+        : `Jev ${status.state}; no judge selected. JavaScript mode remains available. A saved key would establish local configuration only, not connectivity or entitlement.`,
+    );
+    errorText("jev-error", null);
+  } catch (error) {
+    text("jev-status", "Jev status unavailable.");
+    errorText("jev-error", message(error));
+  }
 }
-onClick("reconnect", () => {
-  void bootstrap();
-});
-onClick("setup-toggle", () => {
-  setupTouched = true;
-  setSetup(element("setup").hidden !== false);
-});
-onClick("open-setup", () => {
+function settings(): void {
+  openDialog("settings-dialog");
+  if (serviceReady) {
+    void loadJev();
+    void loadLibrary();
+  }
+}
+function stopPerformance(): void {
+  performanceGeneration++;
+  window.clearTimeout(performanceTimer);
+  performanceTimer = 0;
+  performanceAbort?.abort();
+  performanceAbort = null;
+}
+
+function renderPerformance(data: PerformanceSnapshot): void {
+  const process = el("performance-process");
+  process.replaceChildren();
+  const backend = data.backend;
+  text(
+    "performance-window",
+    `Sample counts are lifetime totals. Percentiles and maximum use the latest up to ${backend.percentile_window_samples.toLocaleString()} retained samples per measurement, not every lifetime sample. The CPU sample window is separate.`,
+  );
+  const values = [
+    [
+      "Backend CPU",
+      backend.cpu_percent_of_one_core === null
+        ? "Unknown"
+        : `${backend.cpu_percent_of_one_core.toFixed(1)}% of one core`,
+    ],
+    ["Resident memory", `${(backend.rss_bytes / 1048576).toFixed(1)} MiB`],
+    [
+      "Reported CPU sample window",
+      backend.sample_window_ms === null
+        ? "Not sampled"
+        : `${backend.sample_window_ms.toLocaleString()} ms`,
+    ],
+  ];
+  for (const [name, value] of values) {
+    const dt = document.createElement("dt"),
+      dd = document.createElement("dd");
+    dt.textContent = name!;
+    dd.textContent = value!;
+    process.append(dt, dd);
+  }
+  const rows = el("performance-timings");
+  rows.replaceChildren();
+  const timings = [
+    ["Event-loop lag", backend.event_loop_lag_ms],
+    ["Observation read", backend.timings.observation_read_ms],
+    [
+      "Action round trip (includes gameplay)",
+      backend.timings.action_round_trip_ms,
+    ],
+    ["Video forwarding", backend.timings.video_forward_ms],
+  ] as const;
+  for (const [name, summary] of timings) {
+    const row = document.createElement("tr"),
+      heading = document.createElement("th");
+    heading.scope = "row";
+    heading.textContent = name;
+    row.append(heading);
+    const samples = document.createElement("td");
+    samples.textContent = summary.count.toLocaleString();
+    row.append(samples);
+    for (const value of [summary.p50, summary.p95, summary.p99, summary.max]) {
+      const cell = document.createElement("td");
+      cell.textContent =
+        summary.count === 0
+          ? "Not sampled"
+          : value === null
+            ? "Unknown"
+            : value.toFixed(2);
+      row.append(cell);
+    }
+    rows.append(row);
+  }
+  const video = data.video;
+  text(
+    "performance-video",
+    `${label(video.status)} · ${video.width} × ${video.height} · ${video.fps === null ? "unknown" : video.fps.toFixed(1)} reported native fps · ${video.frames.toLocaleString()} frames · last frame ${when(video.last_frame_at)}${video.error ? ` · ${video.error}` : ""}`,
+  );
+  text(
+    "performance-native",
+    data.native === null
+      ? "Native diagnostics unavailable. No native measurements reported."
+      : json(data.native),
+  );
+  text("performance-transport", json(data.video_transport));
+}
+
+async function pollPerformance(current: number): Promise<void> {
   if (
-    snapshot?.run?.status === "paused" &&
-    snapshot.server.status === "running"
-  ) {
-    const resume = element<HTMLButtonElement>("resume-run");
-    const target = resume.disabled ? element("run-controls") : resume;
-    target.scrollIntoView({ block: "center" });
-    target.focus();
+    current !== performanceGeneration ||
+    !el<HTMLDialogElement>("performance-dialog").open
+  )
+    return;
+  const delay = 1000 - (performance.now() - performanceLastStarted);
+  if (delay > 0) {
+    performanceTimer = window.setTimeout(
+      () => void pollPerformance(current),
+      delay,
+    );
     return;
   }
-  setupTouched = true;
-  setSetup(true);
-  if (snapshot?.auth.authenticated) {
-    element("world-heading").scrollIntoView({ block: "nearest" });
-    const connect = element<HTMLButtonElement>("start-game");
-    if (!connect.disabled) connect.focus();
-  } else {
-    element("account-heading").scrollIntoView({ block: "nearest" });
-    element("login-browser").focus();
+  performanceLastStarted = performance.now();
+  const controller = new AbortController();
+  performanceAbort = controller;
+  try {
+    const data = await fetchPerformance(controller.signal);
+    if (
+      current !== performanceGeneration ||
+      !el<HTMLDialogElement>("performance-dialog").open
+    )
+      return;
+    renderPerformance(data);
+    text(
+      "performance-status",
+      `Measured snapshot received ${when(new Date().toISOString())}. Requests run no more than once per second while this dialog is open.`,
+    );
+    errorText("performance-error", null);
+  } catch (error) {
+    if (current !== performanceGeneration || controller.signal.aborted) return;
+    text(
+      "performance-status",
+      "Diagnostics unavailable. Any displayed snapshot is retained, not current.",
+    );
+    errorText("performance-error", message(error));
+  } finally {
+    if (performanceAbort === controller) performanceAbort = null;
+    if (
+      current === performanceGeneration &&
+      el<HTMLDialogElement>("performance-dialog").open
+    ) {
+      performanceTimer = window.setTimeout(
+        () => void pollPerformance(current),
+        1000,
+      );
+    }
   }
+}
+
+function click(id: string, handler: () => void): void {
+  el(id).addEventListener("click", handler);
+}
+for (const id of ["settings-open", "viewer-settings", "new-task"])
+  click(id, settings);
+click("performance-open", () => {
+  stopPerformance();
+  text("performance-status", "Loading measured diagnostics…");
+  errorText("performance-error", null);
+  el("performance-process").replaceChildren();
+  el("performance-timings").replaceChildren();
+  text("performance-window", "Distribution window not loaded.");
+  text("performance-video", "No measured video state loaded.");
+  text("performance-browser", browserVideoDetail);
+  text("performance-native", "Not loaded.");
+  text("performance-transport", "Not loaded.");
+  openDialog("performance-dialog");
+  void pollPerformance(performanceGeneration);
 });
-onClick("login-browser", () => {
-  void command("login-browser", () =>
-    mutate("/v1/auth/login", { mode: "browser" }),
+click("reconnect", () => void bootstrap());
+click("video-reconnect", () => {
+  if (serviceReady) video.connect();
+  else void bootstrap();
+});
+click("sidebar-toggle", () => {
+  const panel = el("context-panel"),
+    hide = !panel.hidden;
+  panel.hidden = hide;
+  el("work-area").classList.toggle("panel-hidden", hide);
+  text("sidebar-toggle", hide ? "Show panel" : "Hide panel");
+  el("sidebar-toggle").setAttribute("aria-expanded", String(!hide));
+});
+for (const name of ["programs", "activity", "usage", "inventory", "life"])
+  click(`${name}-open`, () => openEvidence(name));
+click("goal-more", () => openEvidence("programs"));
+click("history-open", () => {
+  openDialog("history-dialog");
+  text("history-status", "Loading retained runs…");
+  el("history-list").replaceChildren();
+  void fetchHistory()
+    .then((runs) => {
+      text(
+        "history-status",
+        runs.length
+          ? `${runs.length} retained runs, latest first.`
+          : "No retained runs. Create a task in Settings.",
+      );
+      for (const run of runs) {
+        const li = document.createElement("li");
+        recordButton(
+          li,
+          run.task,
+          `${label(run.status)} · ${run.model_id} · ${when(run.started_at)} · ${run.run_id}`,
+          run.run_id,
+          () => openEvidence("programs", run),
+        );
+        el("history-list").append(li);
+      }
+    })
+    .catch((error) => text("history-status", message(error)));
+});
+for (const name of [
+  "programs",
+  "executions",
+  "revisions",
+  "trace",
+  "comparison",
+  "learning",
+  "life",
+  "planning",
+  "usage",
+  "activity",
+  "inventory",
+]) {
+  click(`${name}-tab`, () => setEvidenceTab(name));
+  el(`${name}-tab`).addEventListener("keydown", (event) => {
+    const names = [
+        "programs",
+        "executions",
+        "revisions",
+        "trace",
+        "comparison",
+        "learning",
+        "life",
+        "planning",
+        "usage",
+        "activity",
+        "inventory",
+      ],
+      index = names.indexOf(name);
+    let next: number | null = null;
+    if (event.key === "ArrowRight") next = (index + 1) % names.length;
+    if (event.key === "ArrowLeft")
+      next = (index + names.length - 1) % names.length;
+    if (event.key === "Home") next = 0;
+    if (event.key === "End") next = names.length - 1;
+    if (next !== null) {
+      event.preventDefault();
+      setEvidenceTab(names[next]!, true);
+    }
+  });
+}
+for (const mode of ["browser", "device"] as const)
+  click(
+    `login-${mode}`,
+    () =>
+      void command(`login-${mode}`, () => mutate("/v1/auth/login", { mode })),
   );
-});
-onClick("login-device", () => {
-  void command("login-device", () =>
-    mutate("/v1/auth/login", { mode: "device" }),
-  );
-});
-onClick("refresh-models", () => {
-  void command("refresh-models", () => mutate("/v1/auth/refresh"));
-});
-onClick("logout", () => {
-  void command("logout", () => mutate("/v1/auth/logout"));
-});
-onClick("cancel-login", () => {
-  const login = snapshot?.auth.login;
-  if (login)
+click(
+  "refresh-models",
+  () => void command("refresh-models", () => mutate("/v1/auth/refresh")),
+);
+click("logout", () => void command("logout", () => mutate("/v1/auth/logout")));
+click("cancel-login", () => {
+  if (snapshot?.auth.login)
     void command("cancel-login", () =>
-      mutate("/v1/auth/cancel", { login_id: login.id }),
+      mutate("/v1/auth/cancel", { login_id: snapshot!.auth.login!.id }),
     );
 });
-element("auth-form").addEventListener("submit", (event) => {
+el("auth-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const login = snapshot?.auth.login;
   if (!login?.prompt || (!login.prompt.allow_empty && !authInput.value)) return;
   const value = authInput.value;
-  void command("auth-submit", async () => {
-    await mutate("/v1/auth/input", { login_id: login.id, value });
-    authInput.value = "";
-  });
-});
-onClick("prepare-game", () => {
-  void command("prepare-game", () =>
-    mutate("/v1/game/prepare", {
-      accept_eula:
-        !!snapshot?.server.eula_accepted ||
-        element<HTMLInputElement>("eula").checked,
-    }),
+  authInput.value = "";
+  void command("auth-submit", () =>
+    mutate("/v1/auth/input", { login_id: login.id, value }),
   );
 });
-onClick("start-game", () => {
-  void command("start-game", () => mutate("/v1/game/start"));
-});
-onClick("stop-game", () => {
-  void command("stop-game", () => mutate("/v1/game/stop"));
-});
-onClick("new-world", () => {
-  if (element<HTMLInputElement>("confirm-world").checked)
+click(
+  "prepare-game",
+  () =>
+    void command("prepare-game", () =>
+      mutate("/v1/game/prepare", {
+        accept_eula:
+          !!snapshot?.server.eula_accepted ||
+          el<HTMLInputElement>("eula").checked,
+      }),
+    ),
+);
+click(
+  "start-game",
+  () => void command("start-game", () => mutate("/v1/game/start")),
+);
+click(
+  "stop-game",
+  () => void command("stop-game", () => mutate("/v1/game/stop")),
+);
+click("new-world", () => {
+  if (el<HTMLInputElement>("confirm-world").checked)
     void command("new-world", async () => {
       await mutate("/v1/game/new-world", { confirm: true });
-      element<HTMLInputElement>("confirm-world").checked = false;
+      el<HTMLInputElement>("confirm-world").checked = false;
     });
 });
 for (const id of ["eula", "confirm-world"])
-  element(id).addEventListener("change", updateButtons);
+  el(id).addEventListener("change", buttons);
 task.addEventListener("input", () => {
   taskEdited = true;
-  updateButtons();
+  buttons();
+});
+model.addEventListener("change", () => {
+  buttons();
+  void loadLibrary();
 });
 goal.addEventListener("change", () => {
   if (!taskEdited)
     task.value =
       snapshot?.goals.find((item) => item.id === goal.value)?.prompt ?? "";
-  updateButtons();
+  buttons();
 });
-model.addEventListener("change", updateButtons);
-onClick("use-goal", () => {
+click("use-goal", () => {
   task.value =
     snapshot?.goals.find((item) => item.id === goal.value)?.prompt ?? "";
   taskEdited = false;
   task.focus();
-  updateButtons();
+  buttons();
 });
-element("task-form").addEventListener("submit", (event) => {
+el("task-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  if (element<HTMLButtonElement>("create-run").disabled) return;
-  const initiatingElement = document.activeElement;
-  let createdRunId: string | null = null;
+  if (el<HTMLButtonElement>("create-run").disabled) return;
   void command("create-run", async () => {
+    const experienceId = el<HTMLSelectElement>("experience").value;
     const run = await createRun({
       task: task.value.trim(),
       goal: goal.value,
       model_id: model.value,
+      working_programs: el<HTMLSelectElement>("working-programs").value === "fresh" ? "fresh" : "continue",
+      ...(experienceId ? { experience_id: experienceId } : {}),
     });
-    createdRunId = run.run_id;
     if (snapshot) render({ ...snapshot, run });
+    el<HTMLDialogElement>("settings-dialog").close();
   }).then(() => {
-    const start = element<HTMLButtonElement>("start-run");
-    if (
-      createdRunId &&
-      snapshot?.run?.run_id === createdRunId &&
-      !start.disabled &&
-      (document.activeElement === document.body ||
-        document.activeElement === initiatingElement)
-    )
-      start.focus();
+    if (snapshot?.run?.status === "created") el("start-run").focus();
   });
 });
 for (const control of ["start", "pause", "resume", "stop"] as const)
-  onClick(`${control}-run`, () => {
+  click(`${control}-run`, () => {
     const run = snapshot?.run;
     if (!run) return;
-    const button = element<HTMLButtonElement>(`${control}-run`);
-    const hadFocus = document.activeElement === button;
-    const request_id = crypto.randomUUID();
+    const button = el<HTMLButtonElement>(`${control}-run`),
+      focused = document.activeElement === button;
     void command(`${control}-run`, () =>
       mutate(`/v1/runs/${encodeURIComponent(run.run_id)}/controls`, {
         command: control,
-        request_id,
+        request_id: crypto.randomUUID(),
       }),
     ).then(() => {
-      if (
-        !hadFocus ||
-        pendingCommands.size > 0 ||
-        (document.activeElement !== document.body &&
-          document.activeElement !== button)
-      )
-        return;
-      const status = snapshot?.run?.status;
-      const next = element<HTMLButtonElement>(
-        status === "paused"
-          ? "resume-run"
-          : status === "created"
-            ? "start-run"
-            : status === "running" || status === "bootstrapping"
-              ? "pause-run"
-              : "stop-run",
-      );
+      if (!focused) return;
+      const status = snapshot?.run?.status,
+        next = el<HTMLButtonElement>(
+          status === "paused"
+            ? "resume-run"
+            : status === "created"
+              ? "start-run"
+              : ["running", "bootstrapping"].includes(status ?? "")
+                ? "pause-run"
+                : "stop-run",
+        );
       if (!next.disabled && !next.hidden) next.focus({ preventScroll: true });
-      else element("run-controls").focus({ preventScroll: true });
+      else el("run-controls").focus({ preventScroll: true });
     });
   });
-onClick("reload-viewer", () => {
-  if (viewerFrame && viewerUrl) viewerFrame.src = viewerUrl;
+el<HTMLInputElement>("jev-key").addEventListener("input", buttons);
+el("jev-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (el<HTMLButtonElement>("jev-save").disabled) return;
+  const input = el<HTMLInputElement>("jev-key"),
+    key = input.value;
+  input.value = "";
+  void command("jev-save", async () => {
+    await setJevKey(key);
+    await loadJev();
+  });
 });
-onClick("activity-tab", () => setTab("activity"));
-onClick("policies-tab", () => setTab("policies"));
-for (const tab of ["activity", "policies"])
-  element(`${tab}-tab`).addEventListener("keydown", (event) => {
-    if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
-      event.preventDefault();
-      setTab(
-        event.key === "Home"
-          ? "activity"
-          : event.key === "End"
-            ? "policies"
-            : activeTab === "activity"
-              ? "policies"
-              : "activity",
-        true,
+click(
+  "jev-remove",
+  () =>
+    void command("jev-remove", async () => {
+      await removeJevKey();
+      el<HTMLInputElement>("jev-key").value = "";
+      await loadJev();
+    }),
+);
+click("library-refresh", () => void loadLibrary());
+el("motor-profile").addEventListener("change", () => {
+  motorEdited = el<HTMLSelectElement>("motor-profile").value !== snapshot?.game.motor_profile;
+  text("motor-status", `Current profile: ${snapshot?.game.motor_profile ?? "unknown"}.${motorEdited ? " Selection not applied." : " Selected profile is current."}`);
+  buttons();
+});
+click("motor-save", () => {
+  const profile = el<HTMLSelectElement>("motor-profile").value;
+  void command("motor-save", async () => {
+    await mutate("/v1/config", { motor_profile: profile });
+    motorEdited = false;
+  });
+});
+el("experience").addEventListener("change", librarySelection);
+click("promotion-more", () => {
+  if (promotion) void loadEventPage(promotion.run.run_id);
+});
+el("promotion-evidence").addEventListener("change", renderPromotionEvent);
+for (const id of [
+  "promotion-scope",
+  "promotion-world-data",
+  "promotion-item",
+  "promotion-gain",
+])
+  el(id).addEventListener("change", promotionButtons);
+el("promotion-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (!promotion || el<HTMLButtonElement>("promotion-save").disabled) return;
+  const scope = el<HTMLSelectElement>("promotion-scope").value;
+  const retained = el<HTMLSelectElement>("promotion-world-data").value;
+  const evidence = archivedEvents
+    .get(promotion.run.run_id)
+    ?.events.find(
+      (item) =>
+        String(item.event_seq) ===
+        el<HTMLSelectElement>("promotion-evidence").value,
+    );
+  if (
+    (scope !== "portable" && scope !== "world_local") ||
+    !["yes", "no"].includes(retained) ||
+    !evidence
+  )
+    return;
+  const item = el<HTMLSelectElement>("promotion-item").value;
+  const minGain = Number(el<HTMLInputElement>("promotion-gain").value);
+  if (
+    evidence.type === "observation.inventory" &&
+    (!item || !Number.isSafeInteger(minGain) || minGain < 1)
+  )
+    return;
+  const declaration: PromotionDeclaration = {
+    portability: scope,
+    retained_world_data: retained === "yes",
+    predicate:
+      evidence.type === "goal.verified"
+        ? { kind: "goal_verified", event_seq: evidence.event_seq }
+        : {
+            kind: "inventory_gain",
+            item,
+            min_gain: minGain,
+            event_seq: evidence.event_seq,
+          },
+  };
+  const target = promotion;
+  void command("promotion-save", async () => {
+    errorText("promotion-error", null);
+    text(
+      "promotion-result",
+      "Checking trusted attribution and immutable dependencies…",
+    );
+    try {
+      const saved = await promoteExperience(
+        target.run.run_id,
+        target.execution.execution_id,
+        el<HTMLInputElement>("promotion-name").value.trim(),
+        declaration,
       );
+      text(
+        "promotion-result",
+        `Saved exact bundle ${saved.name} · ${label(saved.portability)} · ${saved.experience_id}. Predicate verified by the service, not inferred from program status.`,
+      );
+      await loadMeasurements(target.run.run_id);
+      if (model.value === saved.model_id) await loadLibrary();
+    } catch (error) {
+      text("promotion-result", "Not saved.");
+      errorText("promotion-error", message(error));
+      throw error;
     }
   });
-onClick("resume-live", () => {
-  followLive = true;
-  mergeEvents([]);
-  renderPolicies(snapshot?.run ?? null);
 });
-window.addEventListener("online", scheduleRefresh);
-window.addEventListener("pagehide", () => eventStream?.close());
+for (const link of document.querySelectorAll<HTMLAnchorElement>(
+  'a[href^="/licenses/"]',
+))
+  link.addEventListener("click", (event) => {
+    event.preventDefault();
+    void fetch(link.pathname, { credentials: "same-origin" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Font license could not be loaded.");
+        const license = await response.text();
+        text("source-title", link.textContent ?? "Font license");
+        text("source-meta", "Bundled font license");
+        el("strategy-card").replaceChildren();
+        text("source-code", license);
+        text("source-evidence", "Font license text; no program was executed.");
+        openDialog("source-dialog");
+      })
+      .catch((error) => errorText("settings-error", message(error)));
+  });
+window.addEventListener("pagehide", () => {
+  stream?.close();
+  video.disconnect();
+  stopPerformance();
+});
 window.addEventListener("pageshow", (event) => {
   if (event.persisted) void bootstrap();
 });
-updateButtons();
-if (window.location.hostname === "localhost") {
-  // Cookie hosts do not include ports. The separate renderer uses 127.0.0.1,
-  // so canonicalize before creating an operator/viewer session on another host.
-  const canonical = new URL(window.location.href);
-  canonical.hostname = "127.0.0.1";
-  window.location.replace(canonical.href);
-} else {
-  void bootstrap();
-}
+buttons();
+void bootstrap();

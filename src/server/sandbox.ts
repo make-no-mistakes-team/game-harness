@@ -11,9 +11,44 @@ import type {
   SandboxState,
 } from "../shared/contracts.ts";
 import {
+  gameActionSchema,
   policyDecisionSchema,
   policySpecSchema,
 } from "../shared/validation.ts";
+import { MAX_SKILL_LIMITS } from "../shared/programs.ts";
+import type {
+  SkillCapabilityRequest,
+  SkillLimits,
+  SkillResult,
+} from "../shared/programs.ts";
+import type {
+  ProgramBranchTrace,
+  ProgramInstrumentation,
+  ProgramTraceLossReason,
+} from "../shared/program-trace.ts";
+import {
+  instrumentProgram,
+  ProgramTraceReceiver,
+  type InstrumentedProgram,
+} from "./program-instrumentation.ts";
+import { validateProgramSource } from "./program-validation.ts";
+
+export interface SkillSandboxHooks {
+  onInstrumentation?(instrumentation: ProgramInstrumentation): void;
+  onTrace?(trace: ProgramBranchTrace): void;
+  onCapabilityRequest?(event: {
+    sequence: number;
+    request: SkillCapabilityRequest;
+  }): void;
+  /** Values originate in the authorized host broker, never container assertions. */
+  onCapabilityResult?(event: {
+    sequence: number;
+    request: SkillCapabilityRequest;
+    ok: boolean;
+    value: Json;
+    duration_ms: number;
+  }): void;
+}
 
 export interface PolicyWorker {
   evaluate(
@@ -21,6 +56,13 @@ export interface PolicyWorker {
     signal?: AbortSignal,
   ): Promise<PolicyDecision>;
   close(): Promise<void>;
+}
+
+export class SkillCleanupError extends Error {
+  constructor() {
+    super("Docker could not confirm skill container cleanup.");
+    this.name = "SkillCleanupError";
+  }
 }
 
 const IMAGE =
@@ -34,6 +76,8 @@ const ENV = {
 };
 const INPUT_BYTES = 256 * 1024;
 const OUTPUT_BYTES = 64 * 1024;
+const SKILL_INPUT_BYTES = INPUT_BYTES + 512 * 1024;
+const SKILL_OUTPUT_BYTES = OUTPUT_BYTES + 20 * 1024;
 const STATE_BYTES = 16 * 1024;
 const MAX_DEPTH = 32;
 const MAX_WORKERS = 8;
@@ -350,6 +394,27 @@ class DockerPolicyWorker implements PolicyWorker {
     context: PolicyContext,
     signal?: AbortSignal,
   ): Promise<PolicyDecision> {
+    return await this.evaluateValue(context, signal, (reply) => {
+      const decision = policyDecisionSchema.safeParse(reply.decision);
+      if (!decision.success)
+        throw new Error("Policy returned an invalid decision.");
+      return decision.data;
+    });
+  }
+
+  async evaluateBoolean(context: Json, signal: AbortSignal): Promise<boolean> {
+    return await this.evaluateValue(context, signal, (reply) => {
+      if (typeof reply.decision !== "boolean")
+        throw new Error("Precondition must return a boolean.");
+      return reply.decision;
+    });
+  }
+
+  private async evaluateValue<T>(
+    context: PolicyContext | Json,
+    signal: AbortSignal | undefined,
+    decode: (reply: Reply) => T,
+  ): Promise<T> {
     if (this.closing) throw new Error("Sandbox worker is closed.");
     if (this.evaluating)
       throw new Error(
@@ -375,11 +440,9 @@ class DockerPolicyWorker implements PolicyWorker {
       if (!state || typeof state !== "object" || Array.isArray(state))
         throw new Error("Policy state must remain a JSON object.");
       const stateText = encode(state, STATE_BYTES + 1);
-      const decision = policyDecisionSchema.safeParse(reply.decision);
-      if (!decision.success)
-        throw new Error("Policy returned an invalid decision.");
+      const decision = decode(reply);
       this.state = JSON.parse(stateText) as Record<string, Json>;
-      return decision.data;
+      return decision;
     } catch (error) {
       const failure =
         error instanceof Error ? error : new Error("Policy evaluation failed.");
@@ -439,6 +502,385 @@ class DockerPolicyWorker implements PolicyWorker {
   }
 }
 
+function exactKeys(value: Reply, keys: string[]): boolean {
+  return (
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => Object.hasOwn(value, key))
+  );
+}
+
+function finiteJson(value: unknown): boolean {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (value === null || typeof value === "string" || typeof value === "boolean")
+    return true;
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value).every(finiteJson);
+}
+
+function skillCapability(value: unknown): SkillCapabilityRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("Skill returned an invalid capability request.");
+  const request = value as Reply;
+  switch (request.kind) {
+    case "observe":
+      if (exactKeys(request, ["kind"])) return { kind: "observe" };
+      break;
+    case "respawn":
+      if (exactKeys(request, ["kind"])) return { kind: "respawn" };
+      break;
+    case "action": {
+      const action = gameActionSchema.safeParse(request.action);
+      if (exactKeys(request, ["kind", "action"]) && action.success)
+        return { kind: "action", action: action.data };
+      break;
+    }
+    case "recipes":
+      if (
+        exactKeys(request, ["kind", "item"]) &&
+        typeof request.item === "string" &&
+        request.item.length > 0 &&
+        request.item.length <= 256
+      )
+        return { kind: "recipes", item: request.item };
+      break;
+    case "call": {
+      const ref = request.skill;
+      if (
+        exactKeys(request, ["kind", "skill", "args"]) &&
+        ref &&
+        typeof ref === "object" &&
+        !Array.isArray(ref) &&
+        exactKeys(ref as Reply, ["skill_id", "version"]) &&
+        typeof (ref as Reply).skill_id === "string" &&
+        ((ref as Reply).skill_id as string).length > 0 &&
+        ((ref as Reply).skill_id as string).length <= 256 &&
+        Number.isSafeInteger((ref as Reply).version) &&
+        ((ref as Reply).version as number) > 0
+      )
+        return request as unknown as SkillCapabilityRequest;
+      break;
+    }
+    case "progress":
+      if (
+        exactKeys(request, ["kind", "summary", "details"]) &&
+        typeof request.summary === "string" &&
+        request.summary.length > 0 &&
+        request.summary.length <= 2000
+      )
+        return request as unknown as SkillCapabilityRequest;
+      break;
+  }
+  throw new Error("Skill returned an invalid capability request.");
+}
+
+class DockerSkillWorker {
+  readonly name: string;
+  private child: ChildProcessWithoutNullStreams | null = null;
+  private exited: Promise<void> = Promise.resolve();
+  private exitCode: number | null = null;
+  private closing = false;
+  private cleanup: Promise<void> | null = null;
+  private output: Buffer[] = [];
+  private outputBytes = 0;
+  private phase: "ready" | "running" | "waiting" | "done" = "ready";
+  private sequence = 0;
+  private calls = 0;
+  private actions = 0;
+  private timer: NodeJS.Timeout | null = null;
+  private readonly completion = Promise.withResolvers<SkillResult>();
+  private traceReceiver: ProgramTraceReceiver | null = null;
+  private traceHooks: SkillSandboxHooks = {};
+
+  constructor(
+    private runner: string,
+    private guardian: string,
+    owner: string,
+    private onClosed: (worker: DockerSkillWorker) => void,
+  ) {
+    this.name = `gameharness-policy-${owner}-${randomUUID()}`;
+  }
+
+  async run(
+    initial: string,
+    privateHandle: (request: SkillCapabilityRequest) => Promise<Json>,
+    limits: SkillLimits,
+    signal: AbortSignal,
+    program: InstrumentedProgram,
+    hooks: SkillSandboxHooks,
+  ): Promise<SkillResult> {
+    const traceReceiver = new ProgramTraceReceiver(program);
+    this.traceReceiver = traceReceiver;
+    this.traceHooks = hooks;
+    const abort = () => this.fail(new Error("Skill execution was cancelled."), "cancelled");
+    signal.addEventListener("abort", abort, { once: true });
+    const deadline = Date.now() + limits.duration_ms;
+    this.timer = setTimeout(
+      () =>
+        this.fail(new Error("Skill execution exceeded its duration limit."), "duration_limit"),
+      limits.duration_ms,
+    );
+    try {
+      if (signal.aborted || this.closing) {
+        abort();
+        return await this.completion.promise;
+      }
+      const child = spawn(
+        process.execPath,
+        [
+          "--no-env-file",
+          this.guardian,
+          this.name,
+          this.runner,
+          IMAGE,
+          "skill",
+          String(Math.max(1, deadline - Date.now())),
+        ],
+        { env: ENV, stdio: ["pipe", "pipe", "pipe"], detached: true },
+      );
+      this.child = child;
+      const exited = Promise.withResolvers<void>();
+      this.exited = exited.promise;
+      child.once("close", (code) => {
+        this.exitCode = code;
+        exited.resolve();
+        if (!this.closing)
+          this.fail(
+            new Error(
+              "Skill worker exited or exceeded its computation deadline.",
+            ),
+            "worker_terminated",
+          );
+      });
+      child.on("error", () =>
+        this.fail(new Error("Docker skill sandbox could not be started."), "worker_terminated"),
+      );
+      child.stdin.on("error", () =>
+        this.fail(new Error("Skill sandbox input closed unexpectedly."), "worker_terminated"),
+      );
+      child.stderr.on("data", () =>
+        this.fail(new Error("Skill sandbox violated its output protocol."), "protocol_failure"),
+      );
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (this.closing) return;
+        this.outputBytes += chunk.length;
+        if (this.outputBytes > SKILL_OUTPUT_BYTES)
+          return this.fail(new Error("Skill exceeded its output size limit."), "protocol_failure");
+        this.output.push(chunk);
+        const end = chunk.indexOf(10);
+        if (end === -1) return;
+        try {
+          if (end !== chunk.length - 1) throw new Error("protocol");
+          const text = Buffer.concat(this.output).toString("utf8").slice(0, -1);
+          this.output = [];
+          checkJsonDepth(text);
+          const parsed: unknown = JSON.parse(text);
+          if (
+            !parsed ||
+            typeof parsed !== "object" ||
+            Array.isArray(parsed) ||
+            !finiteJson(parsed)
+          )
+            throw new Error("protocol");
+          const frame = parsed as Reply;
+          if (frame.v !== 1) throw new Error("protocol");
+          if (frame.type === "skill_call" || frame.type === "skill_result" ||
+            frame.type === "skill_failure") {
+            const { trace: _diagnostic, ...payload } = frame;
+            encode(payload, OUTPUT_BYTES);
+          }
+          if (
+            this.phase === "ready" &&
+            frame.type === "ready" &&
+            frame.id === 0 &&
+            exactKeys(frame, ["v", "type", "id"])
+          ) {
+            this.phase = "running";
+            this.outputBytes = 0;
+            child.stdin.write(initial);
+          } else if (
+            this.phase === "running" &&
+            frame.type === "skill_call" &&
+            frame.id === this.sequence + 1 &&
+            exactKeys(frame, ["v", "type", "id", "request", "trace"])
+          ) {
+            const trace = traceReceiver.accept(frame.trace);
+            const request = skillCapability(frame.request);
+            if (++this.calls > limits.max_calls)
+              return this.fail(
+                new Error("Skill exceeded its host-call budget."),
+              );
+            if (
+              (request.kind === "action" || request.kind === "respawn") &&
+              ++this.actions > limits.max_actions
+            )
+              return this.fail(new Error("Skill exceeded its action budget."));
+            this.sequence++;
+            this.phase = "waiting";
+            // This frame comes ONLY through the trusted guardian AFTER Docker
+            // confirms cgroup pause. Worker claims of "waiting" have no authority.
+            // Fence synchronously before invoking any user-supplied host callback.
+            if (this.closing || signal.aborted || Date.now() >= deadline) {
+              abort();
+              return;
+            }
+            if (trace.events.length || trace.omitted) hooks.onTrace?.(trace);
+            hooks.onCapabilityRequest?.({ sequence: this.sequence, request });
+            const callSequence = this.sequence;
+            const started = performance.now();
+            let call: Promise<Json>;
+            try {
+              call = Promise.resolve(privateHandle(request));
+            } catch {
+              call = Promise.reject(new Error("Skill capability failed."));
+            }
+            void call
+              .then(
+                (value) => {
+                  // Validate and detach the broker value before any diagnostic
+                  // callback can mutate it or any result reaches the container.
+                  const clean = JSON.parse(encode(value, INPUT_BYTES)) as Json;
+                  hooks.onCapabilityResult?.({ sequence: callSequence, request,
+                    ok: true, value: clean, duration_ms: performance.now() - started });
+                  this.reply(true, clean, signal, deadline);
+                },
+                () => {
+                  hooks.onCapabilityResult?.({ sequence: callSequence, request,
+                    ok: false, value: null, duration_ms: performance.now() - started });
+                  this.reply(false, null, signal, deadline);
+                },
+              )
+              .catch(() =>
+                this.fail(
+                  new Error("Skill capability exceeded its JSON limits."),
+                ),
+              );
+          } else if (
+            this.phase === "running" &&
+            frame.type === "skill_result" &&
+            frame.id === this.sequence &&
+            exactKeys(frame, ["v", "type", "id", "result", "trace"])
+          ) {
+            const trace = traceReceiver.accept(frame.trace);
+            const result = frame.result;
+            if (!result || typeof result !== "object" || Array.isArray(result))
+              throw new Error("result");
+            if (trace.events.length || trace.omitted) hooks.onTrace?.(trace);
+            const value = result as Reply;
+            if (
+              !exactKeys(value, ["status", "summary", "result"]) ||
+              !["completed", "blocked", "failed"].includes(
+                value.status as string,
+              ) ||
+              typeof value.summary !== "string" ||
+              value.summary.length < 1 ||
+              value.summary.length > 2000
+            )
+              throw new Error("result");
+            traceReceiver.finish(null);
+            this.phase = "done";
+            void this.terminate(null, value as unknown as SkillResult).catch(
+              () => {},
+            );
+          } else if (
+            this.phase === "running" &&
+            frame.type === "skill_failure" &&
+            frame.id === this.sequence &&
+            exactKeys(frame, ["v", "type", "id", "trace"])
+          ) {
+            const trace = traceReceiver.accept(frame.trace);
+            hooks.onTrace?.(trace);
+            traceReceiver.finish(null);
+            this.phase = "done";
+            void this.terminate(new Error("Skill program failed.")).catch(() => {});
+          } else throw new Error("protocol");
+        } catch {
+          this.fail(
+            new Error("Skill returned an invalid or oversized protocol frame."),
+            "protocol_failure",
+          );
+        }
+      });
+      return await this.completion.promise;
+    } finally {
+      signal.removeEventListener("abort", abort);
+      if (this.timer) clearTimeout(this.timer);
+    }
+  }
+
+  private reply(
+    ok: boolean,
+    value: Json,
+    signal: AbortSignal,
+    deadline: number,
+  ): void {
+    if (this.closing) return;
+    if (signal.aborted || Date.now() >= deadline) {
+      this.fail(
+        new Error(
+          "Skill execution was cancelled or exceeded its duration limit.",
+        ),
+        signal.aborted ? "cancelled" : "duration_limit",
+      );
+      return;
+    }
+    const line =
+      encode(
+        { v: 1, type: "skill_reply", id: this.sequence, ok, value },
+        INPUT_BYTES,
+      ) + "\n";
+    this.outputBytes = 0;
+    this.phase = "running";
+    this.child?.stdin.write(line);
+  }
+
+  private fail(error: Error, lossReason: ProgramTraceLossReason = "host_failure"): void {
+    void this.terminate(error, undefined, lossReason).catch(() => {});
+  }
+
+  private terminate(
+    reason: Error | null,
+    result?: SkillResult,
+    lossReason: ProgramTraceLossReason = "host_failure",
+  ): Promise<void> {
+    if (this.cleanup) return this.cleanup;
+    // First fence every future callback/resume, then ask the independent
+    // guardian to remove the container. Never kill or time out the guardian.
+    this.closing = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.cleanup = (async () => {
+      let failure = reason;
+      if (this.child) {
+        this.child.stdin.end();
+        await this.exited;
+        if (this.exitCode !== 0) failure = new SkillCleanupError();
+      }
+      this.output = [];
+      const loss = this.traceReceiver?.finish(
+        failure instanceof SkillCleanupError ? "cleanup_failure" : lossReason,
+      );
+      if (loss) {
+        try {
+          // Read-only old-life diagnostics settle before worker.done and hence
+          // before root closure; this never admits or resumes a capability.
+          this.traceHooks.onTrace?.(loss);
+        } catch {
+          failure ??= new Error("Skill trace loss could not be recorded.");
+        }
+      }
+      if (!this.child || this.exitCode === 0) this.onClosed(this);
+      if (failure) this.completion.reject(failure);
+      else if (result) this.completion.resolve(result);
+      else this.completion.reject(new Error("Skill execution was cancelled."));
+      if (this.child && this.exitCode !== 0) throw failure;
+    })();
+    return this.cleanup;
+  }
+
+  close(): Promise<void> {
+    return this.terminate(new Error("Skill execution was cancelled."), undefined, "cancelled");
+  }
+}
+
 export class SandboxService {
   private state: SandboxState = {
     status: "unavailable",
@@ -446,7 +888,7 @@ export class SandboxService {
     error: "Policy sandbox has not been prepared.",
   };
   private readonly owner = randomUUID();
-  private readonly workers = new Set<DockerPolicyWorker>();
+  private readonly workers = new Set<DockerPolicyWorker | DockerSkillWorker>();
   private preparing: Promise<SandboxState> | null = null;
   private closed = false;
   private runner: string | null = null;
@@ -543,9 +985,83 @@ export class SandboxService {
       throw new Error(
         "Policy specification is invalid or exceeds its source limit.",
       );
+    if (parsed.data.backend !== "javascript")
+      throw new Error("Docker policy workers require the JavaScript backend.");
     const worker = this.allocate();
     await worker.start(parsed.data.source);
     return worker;
+  }
+
+  /** Effect-free, one-shot predicate in the same externally watched Docker profile. */
+  async evaluatePrecondition(
+    source: string,
+    context: Json,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (this.closed || this.state.status !== "ready")
+      throw new Error("Prepare the Docker sandbox before evaluating a precondition.");
+    await validateProgramSource(source, "policy");
+    encode(context, INPUT_BYTES);
+    if (signal.aborted) throw new Error("Precondition evaluation was cancelled.");
+    const worker = this.allocate();
+    try {
+      await worker.start(source);
+      return await worker.evaluateBoolean(context, signal);
+    } finally {
+      await worker.close();
+    }
+  }
+
+  async runSkill(
+    source: string,
+    args: Json,
+    handle: (request: SkillCapabilityRequest) => Promise<Json>,
+    limits: SkillLimits,
+    signal: AbortSignal,
+    hooks: SkillSandboxHooks = {},
+  ): Promise<SkillResult> {
+    if (
+      this.closed ||
+      this.state.status !== "ready" ||
+      !this.runner ||
+      !this.guardian
+    )
+      throw new Error("Prepare the Docker sandbox before running a skill.");
+    if (typeof source !== "string" || Buffer.byteLength(source, "utf8") > 16384)
+      throw new Error("Skill source exceeds its size limit.");
+    for (const key of Object.keys(MAX_SKILL_LIMITS) as (keyof SkillLimits)[]) {
+      if (
+        !Number.isSafeInteger(limits[key]) ||
+        limits[key] < 1 ||
+        limits[key] > MAX_SKILL_LIMITS[key]
+      )
+        throw new Error("Skill limits must be finite and within host maxima.");
+    }
+    if (signal.aborted) throw new Error("Skill execution was cancelled.");
+    if (this.workers.size >= MAX_WORKERS)
+      throw new Error("The sandbox worker limit has been reached.");
+    // Validate input before reserving a slot; no unsandboxed execution fallback.
+    encode({ v: 1, type: "skill_init", id: 0, source, args }, INPUT_BYTES);
+    const program = instrumentProgram(source);
+    hooks.onInstrumentation?.({
+      source_hash: program.source_hash,
+      points: program.points.map((point) => ({ ...point })),
+    });
+    const initial =
+      encode({ v: 1, type: "skill_init", id: 0,
+        source: program.execution_source, args,
+        instrumentation: { hook_name: program.hook_name, scope: program.scope,
+          kinds: program.points.map((point) => point.kind) },
+      }, SKILL_INPUT_BYTES) +
+      "\n";
+    const worker = new DockerSkillWorker(
+      this.runner,
+      this.guardian,
+      this.owner,
+      (owned) => this.workers.delete(owned),
+    );
+    this.workers.add(worker);
+    return await worker.run(initial, handle, { ...limits }, signal, program, hooks);
   }
 
   async validate(spec: PolicySpec, context: PolicyContext): Promise<void> {

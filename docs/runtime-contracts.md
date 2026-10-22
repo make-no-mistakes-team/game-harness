@@ -1,16 +1,18 @@
 # Runtime contracts
 
-This is the interface specification for the planned GameHarness implementation. No tools, endpoints, or records below are implemented in this repository yet. The [PRD](prds/gameharness-v1.0-prd.md) defines product acceptance; the [architecture](architecture/overview.md) assigns modules; [learning and evaluation](learning-and-evaluation.md) defines artifact evidence and measurements. [Operations and security](operations-and-security.md) specifies enforcement and recovery. [Upstream reuse](upstream-reuse.md) distinguishes reusable OMP interfaces from project work.
+This document records implemented program interfaces and broader release requirements. The [current program interface](#current-compact-program-interface) uses underscore-separated model-tool names; the conceptual dotted catalogue below also describes release work and does not claim every listed tool is available. The [integration guide](integration-spike.md) owns operating commands, evidence and limitations. The [PRD](prds/gameharness-v1.0-prd.md), [architecture](architecture/overview.md), [evaluation](learning-and-evaluation.md), [operations](operations-and-security.md) and [upstream evidence](upstream-reuse.md) define the related boundaries.
 
 ## Ownership and vocabulary
 
-The trusted runtime owns scheduling, authorization, persistence, and the action ledger. A trusted GameAdapter owns game connection, observation filtering and effect admission. A generated program can propose actions through filtered capabilities; it cannot mutate the game directly. Strategic inference, action execution, and reactive evaluation proceed independently. A long action never holds a strategic model turn open. Minecraft is the first planned complete integration; no game adapter is implemented in this repository yet.
+The trusted runtime owns scheduling, authorization, persistence, and the action ledger. A trusted GameAdapter owns game connection, observation filtering and effect admission. A generated program requests bounded actions through filtered capabilities; it cannot mutate the game directly. Strategic inference, program execution, smooth motor control and reactive evaluation proceed independently. Minecraft is the first native integration; its proof boundary is separate from old-spike evidence.
 
 | Term | Contract |
 |---|---|
 | Run | One recorded attempt with a task, selected strategic model, world, initial library snapshot, and intervention history. Infrastructure recovery continues that run. |
+| Game session | One owned native connection, identified by public `session_id`, `world_id` and connection `epoch`. It outlives individual runs and player lives. |
+| Player life | An authoritative incarnation within a session: `life_id`, status, respawn readiness and optional death evidence. A confirmed new alive incarnation advances `life_id`, not the session or epoch. |
 | World | An environment lineage: a game world, level or session whose state and remembered facts share continuity. `world_id` remains the canonical identifier. Replacing the environment creates a new lineage; restoring an older checkpoint records a rollback branch within that lineage. |
-| Epoch | A durable fencing generation within a run. Recovery, reconnect, or world reset advances it before new effects are admitted. |
+| Epoch | A durable connection-fencing generation. Recovery, reconnect or world reset advances it before new effects; an ordinary new run or respawn on the same connection does not. |
 | Observation | A filtered profile-authorized view with capture time and provenance. An observation is evidence, not permission to inspect hidden state. |
 | Action | A bounded executor job with one stable identifier, explicit parameters, deadline, preconditions, and a recorded outcome. |
 | Lease | Exclusive authority to issue foreground effects for the controlled actor/session, called the avatar here. There is at most one effectful foreground lease. |
@@ -24,9 +26,105 @@ The trusted runtime owns scheduling, authorization, persistence, and the action 
 
 No module supplies handwritten game strategy. An adapter exposes bounded mechanics with explicit agent-selected parameters, not developer-authored task solutions. Skills, strategies and reactive conditions originate from the model. Game-specific examples and the first integration's permitted mechanics appear below.
 
+GameHarness must be language-agnostic at component boundaries. Performance-critical components may be implemented in native languages without modifying the agent runtime, skill format, or game adapter contracts. Versioned bounded data, explicit deadlines/cancellation and authority checks remain stable across language changes. TypeScript orchestration, Java Fabric perception/motors/capture and generated JavaScript skills are distinct responsibilities; an optional measured Rust optimization cannot introduce a second skill format or bypass the adapter.
+
+The implementation separates `Runtime` lifecycle/observation/goal authority from `ActionArbiter` (`action-arbiter.ts`), `ReactiveRuntime` (`reactive.ts`), `StrategicPlanner` (`strategic.ts`), `RuntimeTools` (`runtime-tools.ts`), `SkillManager` (`skills.ts`), `ExperienceLibrary` (`experience.ts`) and program evidence (`program-evidence.ts`). Each owns its state and enforcement responsibilities; `runtime-prompt.ts` holds authoring instructions. The public runtime API remains the composition seam, not a per-tick gameplay engine.
+
+## Current compact program interface
+
+Executable types live in [`src/shared/programs.ts`](../src/shared/programs.ts). Programs are immutable async JavaScript function bodies with parameters `game` and `args`, not modules or developer-authored gameplay routines. `SkillSpec` contains `name`, `source`, `card` and exact `dependencies: {skill_id,version}[]`. Revisions retain a parent version and canonical source hash.
+
+Registration requires `spec.name`. Revision input deliberately omits and forbids `name`: the host inherits the exact immutable parent name. `capabilities_read` advertises `skill_revision_spec_schema` and `skills.revise`; its canonical revision schema is derived from the registration schema without the name field, not a rename API or compatibility alias.
+
+The canonical `GameAPI` interface is in that same module. `capabilities_read` exposes a lazy `game_api` reference generated once from host validators through `getGameAPIReference()` in [`src/shared/validation.ts`](../src/shared/validation.ts). Method parameters are ordered `{name,type}` records; results name a schema or scalar. Public schemas cover `Observation`, `GameAction`, `GameActionResult`, `SkillRef`, `SkillResult` and `Json`, without internal broker framing. The reference describes asynchronous host-bound `game` calls and disallows concurrent capability calls. Retrieve it on demand rather than copying declarations into every turn.
+
+Public schemas come from `observationSchema`, `gameActionSchema`, `gameActionResultSchema`, `skillRefSchema`, `skillResultSchema` and `jsonSchema`; documentation defines no second validator. The authoritative action schema path is `game_api.schemas.GameAction`, not a separate top-level alias. `SkillCapabilityRequest` remains an internal broker contract, excluded from the public reference. Inventory uses `name`, `display_name`, `count`, `slot`, not `.item`. Syntax/compactness checks do not typecheck DTO fields or prove behavior. Host validation enforces the runtime contract; the permissive UI projection is not the full observation validator.
+
+| Model tool | Current input and effect |
+|---|---|
+| `skill_register` | `{epoch,spec}`; validates canonical source/dependencies before durable registration. No execution. |
+| `skill_read` | Exact skill reference; reads authorized immutable source/card/validation metadata. |
+| `skill_revise` | `{epoch,parent:{skill_id,version},spec:{source,card,dependencies}}`; name is forbidden and inherited from the exact latest parent. Author a new immutable version, never edit source in place or certify effectiveness. |
+| `skill_start` | `{skill_id,version,start_key,epoch,session_id,life_id,args,limits,lookahead?}`; optional explicit bounded start-time lookahead, omitted by default. Returns durable identity before dispatch. Omitted limits use the defaults below. New work requires real live lineage. |
+| `skill_get`, `skill_cancel` | Exactly one of `{execution_id}` or `{start_key}`; authorized lookup or fenced cancellation, never automatic replay. |
+| `action_get` | Read-only retained action lookup, including historical strategist-origin evidence. No submission or cancellation authority. |
+| `attention_after` | `{after_ms,reason}`, 1,000–600,000 ms; one model-selected wake, not recurring strategic polling. |
+| `experience_read` | Compatible model-scoped promoted snapshot metadata. |
+| `experience_promote` | Closed root execution, name and explicit portability/world-data/usefulness declaration; trusted useful-effect evidence decides eligibility, not its self-reported status. |
+| `experience_load` | Exact `experience_id`; freshly validates immutable dependencies into this run without executing them. Run creation can select that ID too. |
+| `planning_lookahead` | `{root_execution_id,after_ms,reason,budget}`; explicit bounded opt-in while that root continues. See [lookahead](#bounded-speculative-planning). |
+| `planning_stage`, `planning_activate`, `planning_read` | Stage an exact next program and read-only precondition, explicitly attempt fresh activation, or inspect the bounded planning record. Staging never grants effects. |
+| `trace_read` | Bounded persisted trace by cursor and optional execution/root filter; omissions remain explicit. |
+| `improvement_feedback`, `improvement_resolve` | Feedback accepts optional `after:{opportunity_seq,execution_seq}` (both default zero), `limit` (default 32), and returns the same structured `next_after`; numeric cursors are rejected. Resolution records an evidence-linked `revise`, `keep` or `insufficient_evidence` decision. |
+| `version_compare` | Exact before/after run/program/version/hash references with paged objective samples; trusted current-run/model scope is checked before source reads. Descriptive comparison only. |
+
+Revision checks the latest parent both before source validation and immediately before commit. A stale revision returns `error.issues[0]` with `{code:"stale_parent",path:"parent",latest_parent:{skill_id,version}}`; it never silently rebases. Compactness, dependency, capability and isolation gates remain unchanged. Rejected historical attempts remain retained rather than rewritten as accepted versions.
+
+Inside a program, capabilities are `await game.observe()`, `await game.action(action)` (final result), `await game.respawn()`, `await game.recipes(item)`, `await game.call({skill_id,version},args)` and `await game.progress(summary,details)`. `game.respawn()` uses the same exclusive arbiter as `game.action({kind:"respawn"})`; it is no privileged recovery shortcut. Every return path, including early blocked/failed exits, must provide `{status:"completed"|"blocked"|"failed",summary,result}`; use `result:null` when no payload exists. Supply only the async function body with host-bound `game,args`, never an enclosing function or arrow. Static validation does not prove every path returns correctly, and completion does not certify the operator's objective.
+
+Strategic `action_submit` and `action_cancel` tools and aliases are removed. All new game effects require an owning skill execution or model-authored reaction through the arbiter; ownerless admission is rejected. The root program must implement a bounded observe/action/check/recovery/composition task flow, not outsource each next step to another strategic call. Small leaf helpers remain valid declared dependencies. Historical `origin:"strategist"` records stay readable and are never relabeled.
+
+A safely settled failed action or blocked/failed child returns to the authored caller for its own correction. It does not automatically kill the root. Unknown effects, reconnect requirements, actual cancellation/preemption, death, pause and stop fence the execution tree; generated error handling cannot bypass that fence.
+
+The parser rejects executable line/block comments, imports/exports, dynamic imports, invalid syntax and forbidden ambient APIs; comment-like strings remain data. Source is at most 16,384 UTF-8 bytes and 80 canonical nonblank lines, with statement nesting at most four and per-function cyclomatic complexity twelve. Safe validation errors preserve structured issues/locations/limits and body-only authoring guidance; there is no wrapper-format alias or parser fallback. The host stores and executes exact canonical bytes/hash with a validation fingerprint. StrategyCards remain separate. Static validation is not OS isolation.
+
+Root defaults are 120,000 ms, 64 actions, 256 host calls and depth eight; hard maxima are 600,000 ms, 512 actions, 2,048 calls and depth eight. Child calls require declared exact dependencies and an acyclic bounded graph. The tree shares consumed budgets and deadline; children cannot reset them. One worker has at most one host capability outstanding. Parents never hold the avatar lease while awaiting children. Only leaf actions own effects, with `origin:"skill"` and their `execution_id`.
+
+Durable `(run_id,start_key)` admission commits the original request fingerprint and identity before dispatch. Identical retries return that identity even after epoch changes; changed requests conflict. Historical lookup grants no renewed authority. Pause, stop, death and recovery fence roots, descendants and leaf work before closure. Restart reconciles accepted-undispatched work as cancelled and dispatched unfinished work as unknown; it never restores JS stacks or replays programs.
+
+Each execution uses a dedicated restricted Docker container. Runnable computation has an external deadline; only a trusted host-known bounded capability wait suspends it. Worker heartbeats cannot extend authority. Cancellation fences capabilities first and waits for confirmed cleanup. Emitter closure cannot establish that prior game effects never occurred.
+
+Keep closure barriers separate from outcome classification. An action/root can remain `unknown` after confirmed input neutralization and sandbox cleanup; historical uncertainty alone is not a live writer. `GameBridge.neutralize(): Promise<void>` resolves only after the actual native input barrier and does not disconnect. Pause/Stop await native/worker/planner/action drain, including worker closure when cancellation fails, without rewriting unknown effects. A missing acknowledgement cannot manufacture safety; genuinely unconfirmable transport/emitter failure still closes the owned client fail-closed.
+
+A healthy, connected, alive session can reconcile an unknown effect autonomously rather than requiring operator Resume. Synchronously fence the affected root, planner, policies and leases; retain the unknown ledger without replay; await actual native neutralization and every worker's closure; then obtain a fresh authorized observation matching that session and life. Only after these gates pass create one new strategic generation and one `uncertainty` wake with compact outcome/reconciliation evidence. The model chooses whether to revise or admit new work; infrastructure never repeats the uncertain effect.
+
+If the barrier, worker closure or fresh observation cannot be confirmed, keep effects closed and enter paused/fail-closed handling without treating a healthy connection as an error merely because past effects are unknown. A real transport error still follows owned-emitter teardown. Death during reconciliation transfers to the existing once-per-death recovery path. Operator Pause/Stop intent takes precedence throughout.
+
+`RunView.skills` and `RunView.executions` expose immutable versions and linked execution history. `usage` and `usage.by_purpose` expose `uncached_input`, `cache_read`, `cache_write`, `output`, `calls`, nullable `known_cost` and explicit `legacy_input`. Historical aggregate-only input is not relabeled as known uncached usage. Compact default strategic context contains task/player/inventory changes, execution progress/closure and selected actionable failures; `observation_read` retains authorized detail on demand. Pending programs suppress idle/tick strategy polling.
+
+Request purpose is host accounting; no model tool or accounting-only inference request is required, and the old purpose-setting tool has no alias. At admission, `model.call` records the provisional role with `purpose_source:"host_turn_role_v1"` and `purpose_final:false`. After the assistant response, final accounting uses `purpose_source:"host_role_and_tools_v1"`; visible host facts and returned tool names determine the final label in this precedence:
+
+1. Effect-free post-goal review → `improvement`.
+2. Explicit speculative turn → `planning`, even if it authors a candidate.
+3. Recovery/replan wake (death, uncertainty, policy replan/interrupt/error, or an actual failed/blocked/unknown skill/action outcome) → `replanning`.
+4. Requested `skill_revise`, `improvement_feedback`, `improvement_resolve` or `version_compare` → `improvement`.
+5. Requested `skill_register` or `policy_register` → `authoring`.
+6. Bootstrap → `authoring`.
+7. Otherwise → `planning`.
+
+`model.purpose_classified`, usage and settled-request evidence retain the final classification. If it changes, reattribute the purpose buckets without changing total calls, token counts or cost; pricing/unknown-cost semantics remain unchanged. A request without an assistant response retains its explicitly non-final provisional role. Existing purpose enums and historical accounting stay readable; host-source attribution remains distinguishable from immutable historical model-declared events. Classification never inspects model prose, source semantics or hidden reasoning and is not a causal explanation of the request.
+
+Policies declare `backend:"javascript"|"jev"` and finite `choices:[{id,decision}]` or `null`. JavaScript source is a compact async body with `context,state`; Jev uses the real trusted OMP NativeJudge/TypeSafe broker. Missing credentials, failure and stale output remain explicit; local JS never impersonates Jev.
+
+Promoted snapshots retain exact source/cards/dependencies, model/profile and source-run/world provenance, and attributable useful gameplay evidence. Portable declarations cannot include retained world data; world-local snapshots require the same world. Fresh hydration excludes old invocation arguments, observations, worker state and stacks. These checks do not prove semantic portability or generalization. Broader knowledge/search/history and comparison obligations below remain release requirements.
+
+Current trusted `run.adapter` provenance records `adapter_id:"fabric-owned-client"`, `game_version:"1.21.4"`, `observation_schema:2`, `profile_id`, `preset_id:"minecraft-observable-initial-r2"` and `skill_protocol:2`. The parent supplies the concrete identity through `RuntimeOptions.adapter_id`, not a universal native requirement. Historical schema-1/protocol-1 artifacts remain inspectable; they are not silently imported into this incompatible contract. Mineflayer evidence cannot be relabeled native. Hydration imports authorized exact refs/source without rewriting dependency IDs or literal `game.call` references, and freshly validated parser/formatter/config fingerprints must match the snapshot exactly. Native-build/capability-hash negotiation is not implemented; these checks are narrower than the normative descriptor.
+
+Native inventory-gain promotion evidence requires `inventory_receipt_confirmed:true` and trusted own before/after counts. The trusted predicate event must occur within the closed root's bounded execution interval. Exact craft/dig `target_name` plus trusted task verification can qualify delayed pickup only within that interval; later gain cannot extend it retroactively. A trusted-goal cancellation can close an eligible root without pretending it self-completed; local predictions/assertions cannot qualify. These rules define evidence eligibility, not generalization.
+
+### Session, run and player-life gates
+
+Live `Observation` uses `schema_version:2` and requires `session_id` plus `life`. Before readiness, `GameState.session_id` and `GameState.life` may be null. Historical run/action/execution lineage may be null when not recorded; new admission never invents a legacy life identity.
+
+`PlayerLife` is `{life_id:number,status:"loading"|"alive"|"dead"|"respawning",can_respawn:boolean,death:{death_id,at,message}|null}`. Native evidence owns transitions. Death retains the deceased ID; a confirmed new physical incarnation advances it once, separately from the full readiness gate that permits gameplay. Respawn preserves session ID, world and connection epoch.
+
+While dead, actual vanilla DeathScreen readiness changes publish a normal life notice so `can_respawn` can become true without an observation call, action or reconnect. This preserves the same session, epoch, life, death episode and native generation; it neither duplicates the death event nor requests respawn. Saved-dead startup retains `death:null` when no new death episode was observed.
+
+On normal death, immediately revoke old-life commands and pending policy/planning results, clear target bindings, release held buttons/camera and drain affected workers. Interrupted unconfirmed effects remain `unknown`. Keep the client connected, `game.error:null` and authentic vanilla DeathScreen frames streaming. The run stays active and wakes the strategist once with compact death evidence and last authorized context; the runtime supplies no survival or respawn policy.
+
+Ordinary effects require an alive matching session/life. Observation, recipes and authorized read-only tools remain available while dead/loading/respawning. An explicit `game.respawn()` requests vanilla respawn at most once per admitted action, checks death-screen readiness and awaits authoritative new-life health/world readiness. Timeout preserves uncertainty and never replays. Only the recovery root correlated with its own confirmed successful respawn may atomically adopt the new life before continuing from fresh observations; every other old-life root/proposal stays fenced. A late authoritative new-life observation can update life status after an unknown respawn result but cannot rewrite or revive that unknown execution. Startup in a saved-dead world never respawns automatically.
+
+A confirmed player replacement with authoritative positive health and pose establishes a distinct incarnation even if it dies before the inventory-readiness receipt. Record that replacement as a new dead life, fence its generation/handles/inputs and retain the emitted respawn result as `unknown`; no successful alive admission or root adoption follows. Another explicitly authored recovery may target that new dead life. Player replacement invalidates receipts from the previous player instance, and a neutralization acknowledgement must bind the actual sent generation/session and owned process rather than falsely treating a later death generation as transport failure.
+
+Goal completion, Pause and Stop run close run authority and await actual neutralization/drain while retaining a healthy session and video. No effects are admitted while paused, stopped or reviewing. Stop world, world replacement and app close own explicit connection/process shutdown; unconfirmable control failure may require safe disconnection. Neither death nor an unknown historical effect alone is a reason to tear down a healthy session.
+
+Same-session working definitions are selected by `working_programs:"continue"|"fresh"` at run creation. Continue can import exact validated definitions/dependencies only for the same `session_id` and model; fresh omits them. These `working_candidate` records carry no old args, observations, private state or JS stacks and do not qualify cross-session experience.
+
+Retention keeps one coherent latest run snapshot and its exact dependency closure for that session/model. A freshly authored same-name definition with a new ID replaces the working selection coherently; it never edits original source or mixes incompatible closures.
+
 ## GameAdapter descriptor and interface
 
-The core handles typed envelopes, scheduling and authorization. Domain payloads remain opaque to core policy and scheduling logic: the adapter declares their schemas and performs domain validation. Payloads must be bounded serializable data, never raw engine objects or callbacks. Supporting another game changes its adapter, schemas, renderer and verifier; it must not require another scheduler or a game-specific branch in core policies.
+This section specifies the game-extension contract. The current shared `Observation` and `GameAction` schemas implement the first Minecraft profile; the full descriptor and arbitrary adapter-schema negotiation are not implemented. Additional supported games require real adapter/schema/view/verifier integration and evidence. The intended boundary keeps scheduling/authorization independent of domain payloads: adapters declare and validate bounded serializable data, never export raw objects/callbacks or require tactical branches in the scheduler. Language-agnostic component seams do not by themselves establish game-neutral schema support.
 
 | Descriptor field | Required declaration |
 |---|---|
@@ -54,13 +152,15 @@ Effect capabilities declare cancellation as either `acknowledged_neutralization`
 
 The runtime's cancellation request, action state and run lifecycle stay identical for every adapter. An adapter cannot reinterpret `cancelled` as “a stop message was sent,” weaken stale-response gates, or keep an old emitter alive while issuing a new lease.
 
-For the Minecraft bridge, a forced camera setpoint retains its action owner until the actual SDK promise settles. Cancellation releases held controls immediately, then waits for that continuation; a completion timeout fences the connection before ownership can transfer. Other inventory and interaction operations without a confirmed cancellation path still require fencing. A lost bridge reply leaves the action outcome unknown. Closing an owned bridge child can succeed after its confirmed exit, without claiming that its earlier game effects were reversed or verified.
+The native Minecraft motor retains one action owner across aiming, held inputs and any declared interaction. Cancellation releases controls and waits for the actual native neutralization barrier before authority transfers. Unknown earlier effects remain unknown even when neutralization succeeds and a healthy client is retained. Missing control or an unconfirmed live emitter requires fail-closed owned-client termination before renewed authority; a sent cancel request is not acknowledgement.
 
-Digging has a separate cancellation lifecycle. Before a FINISH input has been submitted, cancellation retains the owner until the real SDK task settles and its local channels are neutral. If START was submitted, it also requires a current-connection server acknowledgement covering the ABORT input. The bridge assigns monotonic connection-wide sequences to acknowledgement-bearing interactions; an old, malformed, future, or other-connection acknowledgement cannot establish cancellation. A cancelled initial look must not emit a late START. Deadlines, undrained continuations, missing acknowledgements, transport loss, and an unconfirmed submitted FINISH still yield `unknown` and fencing.
+Digging keeps cancellation separate from removal proof. Retain the owner until local motor channels are neutral and required native/server acknowledgement has settled; a cancelled initial look cannot emit a late dig. The effect gate checks current session/life, target dependencies and motor generation. Deadlines, missing effect acknowledgement or transport loss leave unconfirmed effects `unknown`; only actual server block-state evidence can establish removal. Historical SDK/ABORT fixture details belong to the integration history, not a second native API.
 
-Confirmed stopping does not establish the preceding game result. START can break a block instantly or cause other effects, and a cancellation acknowledgement is not a block-state snapshot. A confirmed cancelled dig therefore records `cancellation_confirmed: true` and `prior_effects: "unverified"` without claiming removal, unchanged state, rollback, or a policy-effect credit. Actual server removal evidence may establish successful completion instead. Raw protocol sequence values stay private. No old command is automatically replayed, and historical unknown records are not rewritten.
+Outcome classification distinguishes preparatory camera change from world/input emission. Native result evidence uses `world_effect_emitted` and `camera_changed`; aiming alone cannot turn a rejected interaction into an unknown world effect. Dig/place preflight checks target type and reach before aiming; attack/interact likewise check existing mechanical range. Actual matching outgoing block-action packets, not an attempted update or rotation, establish dig emission. Unconfirmed world/input emission still yields `unknown` on failure, cancellation or death. An interrupted standalone camera-only action may retain a known failed/cancelled status with its actual rotation evidence; neutralization proves closure, never reversal of that rotation or any prior world effect.
 
-A long dig may retain the visibility proof captured at admission only while the eye, supported pose, relevant chunk revisions, ray dependencies, block identity, and reach remain valid. Unrelated chunk arrivals do not revoke that proof; unloading or replacing a depended-on chunk, resetting the world, or losing revision history does. This proof does not refresh an observation or authorize a new target. Dig success still requires a subsequent server block update; local SDK completion is insufficient.
+Confirmed stopping does not establish the preceding game result. An input can break a block instantly or cause other effects, and a neutralization acknowledgement is not a block-state snapshot. Confirmed neutralization therefore claims no removal, unchanged state, rollback or policy-effect credit. Actual server removal evidence may establish successful completion instead. Raw protocol sequence values stay private. No old command is automatically replayed, and historical unknown records are not rewritten.
+
+A long dig may retain the visibility proof captured at admission only while session/life, eye, supported pose, relevant chunk revisions, ray dependencies, block identity and reach remain valid. Unrelated chunk arrivals do not revoke that proof; unloading or replacing a depended-on chunk, resetting the world, changing life or losing revision history does. This proof does not refresh an observation or authorize a new target. Dig success still requires a subsequent server block update; local motor completion is insufficient.
 
 ### Run manifests and compatibility
 
@@ -142,15 +242,13 @@ Human viewing is a separate permission. Renderer buffers, routes, protocol objec
 
 ## Tools and error results
 
-These are chosen interface names for implementation, not existing OMP tools. All inputs pass runtime schema validation and capability authorization. Tools return structured errors with `code`, safe `message`, `retryable`, and relevant IDs; they never expose raw game-engine objects, credentials, host stack dumps, or forbidden environment facts. Expected codes include `invalid_request`, `unauthorized`, `not_found`, `stale_epoch`, `stale_context`, `precondition_failed`, `conflict`, `busy`, `deadline_exceeded`, `backend_unavailable`, `unsupported`, and `unknown_effect`. A retryable error is permission to reconsider within a bounded retry policy, not an instruction to repeat an effect blindly.
+This catalogue specifies conceptual release interfaces, not OMP built-ins or callable compatibility aliases. Current model tools are listed above. Inputs require schema validation and capability authorization. Errors must not expose raw game objects, credentials, host stacks or forbidden facts. A retryable error permits bounded reconsideration, never blind effect replay.
 
 | Interface | Input / immediate result | Effect authority |
 |---|---|---|
 | `capabilities.read` | Versioned tools, parameter limits, model/backend availability, observation restrictions, current reliability limits, safe auth status. | Read-only. |
 | `observation.read` | Field selection and maximum age; filtered snapshot/delta with provenance. | Read-only. |
-| `action.submit` | Stable action ID, scope, adapter-declared effect capability, parameters, priority, deadline, basis and preconditions; returns accepted record or rejection promptly. | Admission only; executor later acquires lease. |
 | `action.get` | Action ID; current ledger state, known partial effects, outcome evidence. | Read-only. |
-| `action.cancel` | Action ID and reason; returns durable cancellation-request acknowledgement or current terminal record. | Requests neutralization; acknowledgement alone is not completion. |
 | `skill.register` | Source artifact, content hash, metadata, capability declaration, compatibility, provenance; returns immutable candidate/version and validation result. | No gameplay effect during registration. |
 | `skill.start` | Caller-stable `start_key`, run/world/manifest scope, compatible validated skill version, arguments, finite execution limits and admission preconditions; optional linked improvement `trial` descriptor. Returns the durably admitted execution record promptly, including `trial_id` when applicable. Matching retries return the original `execution_id` and current status. | Admission occurs once per run/key before worker dispatch; a retry never launches another execution. |
 | `skill.get` | `run_id` and exactly one of `start_key` or `execution_id`; returns the durable admission record, current status, child action references and closure/uncertainty evidence, or `not_found`. | Read-only authorized lookup; never starts or resumes work. |
@@ -167,9 +265,9 @@ These are chosen interface names for implementation, not existing OMP tools. All
 | `experience.getPerformanceHistory` | Exact artifact/version or trial ref, bounded filters and cursor; actual invocation/trial outcomes including failures and unknowns. | Read-only authorized history. |
 | `docs.retrieve`, `web.retrieve` | Public documentation query/URL through trusted retrieval broker; bounded attributed text. | No worker network or local-resource access. |
 
-The strategic model uses these tools without waiting for an action to finish. `skill.start` and `skill.cancel` are the only skill-execution path: a skill has a separate `execution_id` and does not acquire a foreground lease itself. Each child effect is submitted through `action.submit` under its own `action_id`, linked to that execution. This prevents a parent skill from holding the lease that its children need.
+The strategist registers/starts/cancels programs without holding a turn open for their effects; actual callable tools are the underscore-separated names above. A skill has its own `execution_id` and no foreground lease. `game.action` crosses the internal arbiter admission interface with a host-owned action ID linked to its execution. Admission/cancellation are internal executor operations, not strategic tools or compatibility aliases. Parent programs never hold the leaf lease their children need.
 
-Program revision cancels the previous execution through the same action/lease rules and starts an explicit new immutable version under a new `start_key`; an in-flight program is never mutated in place. Stopping a skill prevents new child submissions, cancels its outstanding child actions, and waits for confirmed neutralization or enters recovery. Per-execution limits cover elapsed time, steps, child submissions and concurrent outstanding work. Authorized checkpoint recovery creates a new fenced worker generation under the existing `execution_id`, after reconciling child effects; it does not reset execution limits or replay the skill from its beginning.
+Program revision cancels the previous execution through the same action/lease rules and starts an explicit new immutable version under a new `start_key`; an in-flight program is never mutated in place. Stopping a skill fences descendants and cancels outstanding leaf actions, waiting for neutralization or recovery. Tree-wide limits cover elapsed time, actions, calls and depth. Restart reconciles records without restoring JS stacks; later execution needs explicit new admission and cannot replay unknown effects.
 
 ### Idempotent skill admission and lost acknowledgements
 
@@ -177,7 +275,7 @@ The caller creates and retains `start_key` before sending a logical start. Trans
 
 After authenticating the caller's run scope, an existing key is compared with its original request. Identical content returns the original execution record without new dispatch, even if the first response was lost, the execution has finished, or recovery advanced the epoch. Different skill/version, arguments, limits, scope, or admission preconditions return `conflict`; they do not amend the original request. This historical lookup grants no current effect authority. A missing key must pass current epoch, lifecycle, compatibility, and precondition checks before new admission. An old-epoch request with no committed admission is rejected rather than dispatched after recovery.
 
-After a lost response, the caller uses `skill.get` with the same run/key or resends the unchanged start request. Concurrent matching starts converge on the same committed record. A crash before commit leaves no admitted execution and no dispatched work; a crash after commit leaves a discoverable admission for recovery. Recovery fences any previous worker generation and reconciles its children before deciding whether work can continue. Repeating `skill.start` itself never resumes, restarts, or extends an execution.
+After a lost response, lookup with the same run/key or an unchanged retry returns the committed identity. A pre-commit crash leaves no dispatched work; a post-commit crash leaves discoverable history. Recovery fences old generations and reconciles children, marking undispatched work cancelled and interrupted dispatched work unknown. It never restores stacks. A retry cannot resume, restart or extend execution.
 
 Retain start-key mappings for the lifetime of the durable run record, including terminal executions and compacted conversation history. If that record is retired or deleted, the old run must reject starts rather than accepting a forgotten key as new work. A deliberate fresh execution requires a new key and normal admission; it cannot bypass unresolved prior effects or the foreground lease.
 
@@ -187,7 +285,7 @@ Retain start-key mappings for the lifetime of the durable run record, including 
 | Concurrent identical starts | One durable admission and one execution identity; both callers observe that record. |
 | Same key, different request | `conflict`, with no new execution or change to the admitted one. |
 | Crash before admission commit | No execution is dispatched; any later admission still requires a current valid request. |
-| Crash after admission commit, before or after dispatch | Original identity remains discoverable. Only fenced recovery can continue it after reconciling possible child effects. |
+| Crash after admission commit, before or after dispatch | Original identity stays discoverable; reconcile cancelled/unknown without replay or stack continuation. Any later execution needs explicit new admission after fencing unresolved effects. |
 
 ### Selective experience interface
 
@@ -215,9 +313,10 @@ The Strategic Turn Scheduler is an internal trusted-backend module driving the e
 |---|---|
 | `bootstrap` | Start admitted; warm hydration results and current permitted observations are available. |
 | `task_changed` | Attributed task change has fenced prior strategic work. |
-| `work_decision_needed` | An action/skill completed or failed and no already-authorized skill/queue determines the next permitted step. Completion alone does not force a prompt. |
+| `work_decision_needed` | A root program closes or another meaningful outcome requires strategy. A leaf result inside a pending program returns to its authored caller, not a strategic prompt. |
 | `policy_replan` | A valid policy requests a strategic decision with source evidence. |
 | `recovery_completed` | Reconciliation permits decisions; old epoch work remains fenced. |
+| `uncertainty` | Same-session/alive unknown-effect reconciliation confirmed native neutralization, worker drain and fresh life-scoped observation; one new strategic generation may reconsider without replay. |
 | `no_runnable_work` | No authorized work or meaningful wait can proceed without a decision. A continuing empty queue is not a fresh signal every tick. |
 | `improvement_due` | A pending opportunity or bounded trial reaches its next eligible delivery/decision boundary. |
 
@@ -234,6 +333,8 @@ A successful turn with neither runnable work nor a declared meaningful wait incr
 #### Autonomous Improvement Loop
 
 The Autonomous Improvement Loop is another internal module of the same backend. It derives game-neutral opportunities from permitted timing/capability/error evidence and delivers them at the next eligible strategic turn; the strategist need not call `feedback.read` first. Runtime logic detects repetition and reports facts. It never chooses a game tactic or launches a second strategic model.
+
+The detailed detector settings and opportunity lifecycle in this subsection specify the broader release contract. Delivered death/failure/outcome opportunities and their narrower `improvement_feedback`/`improvement_resolve` decisions are described under [bounded trace and revision evidence](#bounded-execution-trace-and-revision-evidence); the broader dotted catalogue is not a second callable API.
 
 An opportunity records `opportunity_id`, `run_id`, `epoch`, `reason_code`, exact `artifact_refs` where present, `evidence_window_id`, `window_start_event_seq`, `window_end_event_seq`, `evidence_refs`, counts/timings/unknowns, `state`, `next_eligible_at`, delivery/decision turn refs and optional `trial_id`. Its deduplication key is `(run_id, epoch, reason_code, artifact_refs, evidence_window_id)`. Repeated evidence in that window updates the same opportunity. Capability sequences use ordered capability IDs/versions, never adapter-specific tactical labels; pattern/sequence signatures are part of the generic `reason_code` identity so unrelated patterns do not merge.
 
@@ -269,17 +370,49 @@ One validated candidate may enter a bounded real gameplay trial without already 
 
 At that decision turn, the model also considers cross-session reuse: submit `experience.proposePromotion` for an intended reusable artifact set/startup bundle, or record an evidence-linked ineligibility, rejection or deferral reason. The trusted gate returns its durable result without requiring a human prompt or approval; a later warm run can select the resulting snapshot through its ordinary start configuration. Promotion never mutates the current run's selected snapshot. The learning protocol governs eligibility, and a before/after change alone does not establish causality.
 
+### Bounded speculative planning
+
+Lookahead is opt-in, not observation polling or a replacement for obvious program substeps. `planning_lookahead({root_execution_id,after_ms,reason,budget})` selects a follow-up checkpoint while that root continues. `after_ms` is 0–600,000; budget is 1–4 calls, 1–16 tools and 1,000–30,000 ms. There is at most one flight/draft per root and 256 opt-ins per run. Ordinary replanning takes priority; the strategist's request stream remains serialized.
+
+After the selected `after_ms` delay, `budget.duration_ms` is one total flight/draft deadline, including authoring, staging, waiting for the predecessor, fresh precondition validation and activation. Its maximum remains 30 seconds. Staging or predecessor completion cannot reset it, and start-time opt-in grants no separate draft expiry or deadline exception. The selected checkpoint and root duration must leave enough time for fresh activation inside that same bound.
+
+`skill_start` may instead include `lookahead:{after_ms,reason,budget}` to arm the same planner before the root's start/handoff returns. All fields are required when present: integer `after_ms` 0–600,000, nonblank `reason` at most 300 characters, and the same integer budget bounds above. Omission means no lookahead, with no defaults or unsolicited provider calls. Canonical schemas are `lookaheadConfigSchema`/`lookaheadRequestSchema` in shared validation.
+
+Preparation validates the actual alive admission scope and single-draft bound before durable admission. After synchronous live-execution insertion, a one-use arm runs before return; the running transition precedes any timer. A matching `start_key` retry returns the original execution before preparing/arming anything again; changed lookahead configuration conflicts with the original fingerprint. Stop/death invalidate the same existing plan. This adds no alternate planning state or bypass of activation freshness and precondition gates.
+
+In the current implementation, the model preregisters candidate programs in an ordinary/bootstrap turn before admitting the source root. The speculative provider's actual tool catalogue contains authorized read-only evidence tools and `planning_stage`, not registration/revision/start, activation, policy mutation or game effects. It selects an existing exact candidate and authors a read-only activation predicate; hiding forbidden tools does not replace host-side enforcement.
+
+`planning_stage({plan_id,skill:{skill_id,version},args,limits,precondition_source})` grants no effects. Input `skill` is the ordinary strict `SkillRef`; a caller-supplied `hash` is forbidden, with no old-shape alias. The model selects the exact immutable ID/version. The host resolves and pins its canonical source hash and dependency closure; it neither chooses a candidate nor silently accepts a bad supplied digest. Internal `PlanProjection.candidate` retains ID/version/hash, and activation still repeats exact source/dependency-hash, life and freshness gates.
+
+Both tool and component validate that strict reference. Resolution stays within the current run/model and checks exact identity/version, validated state, actual SHA-256 source bytes and the bounded full dependency closure; the host never substitutes a latest version. Missing scoped refs return typed `not_found`, unvalidated/oversized closures `precondition_failed`, and wrong resolved identity/version or mutated bytes/hash `stale_context`. Source failures retain terminal plan reason `source_changed`, without a generic backend error. Activation re-resolves, hashes and compares the closure before and after the isolated predicate, then repeats guarded admission.
+
+`precondition_source` is an async **function body** supplied with `context,state`, returning a literal or computed Boolean. `state` is an empty one-shot local object. `context` contains fresh authorized `observation`, `task`, `goal`, the exact predecessor root including status, the host-pinned exact candidate skill/version/hash and `args`. Supply no outer function/arrow, import/export, policy object or SkillResult. For example, `return context.observation.life.status === "alive";` is a body; that simple predicate does not replace the host's mandatory life gate.
+
+`context.task` is the task string, not an object carrying session fields. Session/life evidence belongs to `context.observation`; a comparison against nonexistent task metadata can validly return false and must not be auto-corrected or bypassed.
+
+`context.predecessor.status` uses the execution-state enum: successful execution is `"succeeded"`, not the program-return `SkillResult.status:"completed"`. These are different records; the host's predecessor-success gate cannot be replaced by a returned summary.
+
+Syntax/compactness rejection remains `invalid_program` with `retryable:false`, but can include `stage_correction:{plan_id,correction_allowed,remaining_calls,remaining_tools,remaining_ms,deadline_at}` for an explicitly authored correction within the same flight. It does not automatically replay, reset counters, extend the deadline or edit original source. Unsafe/stale/expired plans remain terminal; preserve the rejected source hash and events. The model must choose any permitted corrected stage explicitly within the remaining allowance.
+
+Correction is available only for `ProgramValidationError` when every issue is in the syntax/empty-body/bytes/lines/complexity/nesting whitelist, with authority rechecked; unsafe ambient access and timeouts remain terminal. Candidate installation follows successful validation only. Current rejected source is retained in bounded `planning.precondition_source` chunks linked by `attempt_id`/`source_hash`; `stage_rejected` records candidate/error/issues and explicit omission counts. A truncated or absent historical source cannot be reconstructed from a reported syntax location or a later tool attempt.
+
+Outside the speculative catalogue, explicit `planning_activate({plan_id})` is single-use and requires the exact predecessor to have succeeded. Obtain a fresh authorized observation and recheck session/world/epoch/life, run and generation, task/goal, predecessor identity/outcome, root source identity and the candidate's exact validated source/dependency hashes. Evaluate the model-authored Boolean precondition in isolated read-only execution, then use guarded atomic ordinary admission.
+
+Death, cancellation, failed/stale predecessor, changed source, task or life, and operator Stop invalidate pending requests/timers/drafts. Never copy stale target handles into a follow-up action; programs resolve current targets from fresh observation. Rejection remains inspectable through `planning_read`; it does not auto-admit a stale alternative. Record actual requests, overlap, validation, rejection, activation and usage, but do not infer causal speedup from `overlap_ms`.
+
+After a verified goal, one bounded effect-free review can use at most three calls, twelve tools and 30,000 ms under the improvement request purpose. It can inspect evidence/source and author linked candidates before completion. It cannot start further gameplay trials after the user's goal is satisfied.
+
 ### Action admission and outcomes
 
 An action request records:
 
 - Identity and scope: schema version, manifest/game/adapter/profile identity, run/world/epoch and action ID.
-- Origin: strategic decision, skill execution, or policy/version/evaluation; declared capability ID/version and explicit schema-validated argument payload.
+- Origin: owning skill execution or policy/version/evaluation; declared capability/schema and explicit arguments. Historical strategist-origin records remain evidence only; new ownerless or direct-strategist effects are rejected.
 - Scheduling: bounded declared priority, submission order assigned by runtime, finite queue deadline, finite execution duration, and preemption/cancellation rules.
 - Basis: observation sequence, maximum basis age, relevant revision tokens, and typed preconditions.
 - Evidence: admission/start/end timestamps, lease generation, state, partial effects and result references.
 
-Each action invokes an adapter-declared effect capability; there is no universal game-action enum. Its capability catalog defines argument/result schemas, limits, mandatory dependencies, cancellation behavior and success evidence. Callers choose tactical parameters explicitly. Limits are mechanics/reliability constraints, not developer-authored decisions about when to use them. A skill invocation is a core program-execution operation whose child effects still use this catalog.
+Each internal action invokes a bounded effect capability. Current `GameAction` types implement Minecraft; the extension target delegates schemas to each adapter rather than imposing a universal enum. Limits, cancellation and success evidence belong to that contract; tactical parameters come from the authored program/reaction, not infrastructure. Skill invocation remains a distinct core operation whose leaf effects cross this internal interface.
 
 Revising an action means cancelling it and submitting a new ID with `supersedes_action_id`; the new job waits for safe lease transfer. Submitting the same ID and identical canonical request returns its existing ledger record without redispatch. Different content under that ID returns `conflict`. Retrying a lost submission first looks up that ID. Neither deduplication nor SQLite can guarantee exactly-once game effects across a crash.
 
@@ -312,11 +445,13 @@ Policies produce exactly one of `continue`, `interrupt`, `replace`, or `replan`:
 
 Every proposal names its target action or explicit idle state, the observed lease generation, policy/version, evaluation ID, basis and expiration. An idle replacement checks and acquires the lease atomically: if another action has acquired it since that observation, the proposal is stale, even if the avatar has since become idle again. It cannot cancel a newly started job. Interrupt storms are limited by per-policy evaluation cadence, one in-flight evaluation per version, finite proposal/action queues, rate limits, and finite retry/deadline rules. Overload returns `busy` or skips/coalesces an evaluation with evidence. It does not postpone host stop or silently install a universal gameplay fallback.
 
+Managed replacement waits beyond native cancellation and any owning worker drain: `ActionArbiter.awaitRetirement` observes the captured action pump actually clear `current` and advance its lease. Only then capture the settled lease, await final native neutralization and recheck generation, life, selected policy slot, worker state and lease before admission. The same retirement gate applies to direct policy-to-policy replacement without a skill worker. Cancellation itself must not await pump retirement, because the pump waits for cancellation; keeping these barriers ordered avoids a wait cycle. This is internal sequencing, not another GameAPI capability or a latency/effectiveness claim.
+
 ### Freshness at dispatch
 
 A response is eligible only when all of these hold at the final effect gate:
 
-1. Run, world and epoch still match the authorized live session.
+1. Run, session, world, connection epoch and player life still match the authorized live session; ordinary effects require `life.status:"alive"`.
 2. The originating policy version/execution is still authorized, and its evaluation or execution generation has not been revoked.
 3. The referenced action and lease generation still match the intended job, or the declared idle precondition still holds.
 4. The input age and proposal/action deadlines remain within their declared bounds, measured by the responsible process's local monotonic clock.
@@ -353,6 +488,10 @@ A trial occupies that lineage's selected-version slot during bounded gameplay us
 
 `FastDecisionProvider` is the seam for remote fast-model decisions, including required Jev support. Local JS evaluation is a separate policy backend, not an imitation provider response. Both return the same bounded proposal contract; the executor alone issues effects.
 
+The implemented Jev caller uses the broker's selected bundled TypeSafe judge, never the strategic run's model ID. Trusted `JevBrokerOptions.model_id` can select another supported bundled judge (`api:"typesafe"`, `kind:"judge"`, TypeSafe base URL). `GET /v1/jev` reports `state:"unavailable"|"configured"|"closed"`, redacted `models`, and `selection:{model_id,request_timeout_ms}|null`; selection is present only when configured. Configured means an app-owned key is stored, not verified service connectivity or entitlement.
+
+Current limits are two concurrent requests, 60 requests/minute, one actual attempt, no queue, broker maximum 10,000 ms and effective reactive deadline 2,000 ms (`selection.request_timeout_ms`). The maximum is not the effective policy timeout. Missing credentials fail `backend_unavailable` before sending; no local or fake-provider fallback is substituted. Cancelled requests retain their concurrency slot until actual transport settlement. Life changes synchronously fence and drain JS/Jev evaluations and execution state while preserving definitions, evidence and absolute trial budgets; old-life answers cannot activate after respawn.
+
 A fast-model configuration declares provider/model references, instruction artifact hash, authorized input projection, finite output choices referencing adapter capability schemas, maximum input/output size, maximum input age and response deadline, and bounded retry/attempt policy. A fast-provider request carries evaluation ID, policy/version and generation, filtered input, permitted choices, and a broker-enforced deadline. Its result contains selected choice and validated parameters, timing/attempt/usage metadata, or an explicit error. Provider output never supplies an arbitrary tool name, host command, network request, or direct game-engine call.
 
 | Capability record | Required meaning |
@@ -387,54 +526,61 @@ Every worker invocation, skill execution, action, provider request and trial has
 
 ## Run controls and UI events
 
-HTTP JSON controls and Server-Sent Events connect the local browser UI to the backend; the adapter-supplied live view has its own documented transport. The UI exposes task, run selection, provider connection status/selection, start, pause, resume and stop. Auth exchanges stay in trusted flows described in [operations](operations-and-security.md). Start captures the full game/adapter/profile manifest, task, world, model, capability/configuration versions and immutable library snapshot. Once started, a task edit is an attributed intervention that fences pending strategic work; it must not rewrite the original task history.
+Authenticated HTTP JSON/SSE connect the Electron renderer to its owned backend. A separate same-origin authenticated `/v1/video` WebSocket carries native binary frames, never game input. The UI exposes task, run selection, providers, start, pause, resume and stop. Auth stays in the trusted [operating flows](operations-and-security.md). Start captures game/adapter/profile, task, world, model, capabilities and immutable snapshot identities. Task edits are attributed interventions that fence obsolete work, never rewrite task history.
 
-Mutating controls carry a request ID for idempotency and the expected run/epoch/state. An authenticated local session is required; repeated identical requests return the prior acknowledgement. Conflicting payloads or stale state return a conflict and current safe status. Acknowledgement means admitted, not completed. Status and events establish when a transition actually finishes.
+Current controls require an authenticated local session, CSRF token and stable `request_id`. The host validates current lifecycle and fences effect generations. Matching retained request IDs return the same result; changed commands conflict. A sent request or pending acknowledgement does not establish safe completion.
 
-The chosen future HTTP surface is:
+Current HTTP interfaces include:
 
 | Method and route | Contract |
 |---|---|
-| `GET /v1/capabilities` | Safe capability catalog and supported connection modes; no secrets. |
-| `GET /v1/connections` | Opaque connection references, provider/model availability and redacted status. |
-| `POST /v1/connections` | Initiate a trusted supported connection flow; credentials or authorization exchanges remain outside run events and worker tools. |
-| `GET /v1/runs` | Local run selection/status summaries, including terminal attempts and recovery/intervention flags. |
-| `POST /v1/runs` | Create a `created` run from game/adapter/profile selection, task, world selection, strategic connection/model and compatible library snapshot. No game effects until start. |
-| `GET /v1/runs/{run_id}` | Authoritative safe status, manifest references and latest durable event cursor. |
-| `GET /v1/runs/{run_id}/improvements` | Bounded paginated improvement-card summaries for the authorized run, filtered by cursor/state; no other run or comparison-arm discovery. |
-| `GET /v1/runs/{run_id}/improvements/{opportunity_id}` | Exact opportunity, model decisions, actual version change, trial/measurement status and authorized StrategyCard/source-event refs. |
-| `GET /v1/runs/{run_id}/experience?ref=...` | Bounded read-only expansion of an exact authorized card, source or evidence ref under the same selected-library/run-private visibility rules as `experience.get`; no database browsing or privileged evaluator inputs. Authorized generated source is displayed only as escaped, inert text; this route grants no execution, installation or activation authority. |
-| `POST /v1/runs/{run_id}/controls` | Idempotent command: `start`, `pause`, `resume`, `stop`, or attributed `set_task`. Provider/model selection is frozen at start; reconnecting its trusted connection does not change model identity. |
-| `GET /v1/runs/{run_id}/events` | Authorized SSE stream, using `Last-Event-ID` for the durable cursor. |
+| `GET /v1/ready` | Loopback desktop readiness `{ready,instance}`; the shell compares its private nonce. No control or run data authority. |
+| `GET /v1/state` | Authenticated app snapshot including source/cards, skills, executions and usage. |
+| `GET /v1/performance` | Authenticated operator CPU/RSS/sample-window, event-loop/observation/action-round-trip/video-forward diagnostics and native metadata. Not an agent capability or dispatch-latency claim. |
+| `GET/POST /v1/config` | Persisted operator `{motor_profile:"precise"|"balanced"|"fast"}`; applies live independently of task/model gameplay. |
+| `GET /v1/runs` | `{runs}` retained run summaries. |
+| `POST /v1/runs` | `{task,goal,model_id,experience_id?,working_programs?}`; optional exact SHA-256 snapshot and same-session `"continue"|"fresh"` selection. Creates a run, not game effects. |
+| `GET /v1/runs/{run_id}` | Authorized retained run projection. |
+| `GET /v1/runs/{run_id}/events` | Bounded JSON history with cursor and explicit omitted details, not SSE. |
+| `GET /v1/runs/{run_id}/skill-evidence` | `{evidence}` linked program/execution/action results. |
+| `GET /v1/runs/{run_id}/trace` | Cursor `after`, `limit`, optional `execution_id`; bounded actual execution/root trace. |
+| `GET /v1/runs/{run_id}/improvements` | Independent `after_opportunity=0`, `after_execution=0`, `limit=32` cursors; opportunities and objective metrics with structured `next_after`. Legacy numeric `after` is rejected with 400. |
+| `GET /v1/runs/{run_id}/deaths` | Cursor `after`, `limit`; `{episodes,next_after,has_more}` with last authorized context. |
+| `GET /v1/runs/{run_id}/planning` | `{plan}` bounded lookahead projection. |
+| `POST /v1/program-comparisons` | Exact `before`/`after` `{run_id,skill_id,version,hash}`, optional `after_sample`, `limit`; `{comparison,next_after,has_more,omissions}`. Read-only evidence computation behind mutation authorization, not gameplay. |
+| `POST /v1/runs/{run_id}/controls` | `{command,request_id}` with command `start`, `pause`, `resume` or `stop`. |
+| `GET /v1/events` | Authenticated live SSE activity. |
+| `GET /v1/video` | Authenticated same-origin binary RGBA WebSocket; no input forwarding. |
+| `GET/POST/DELETE /v1/jev` | Private Jev configuration/status; existing keys never echoed. Configured is not connected. |
+| `GET /v1/experience?model_id=…` | Compatible snapshot metadata `{experience}`. |
+| `POST /v1/runs/{run_id}/experience` | Explicit evidence-gated promotion declaration, not arbitrary library mutation. |
 
-A control body has this documentary form:
+A current control body is:
 
 ```json
 {
-  "schema_version": 1,
   "request_id": "control_example",
-  "expected_epoch": 3,
-  "expected_state": "running",
   "command": "pause"
 }
 ```
 
-The route supplies `run_id`; a created run uses its manifest's initial epoch. `set_task` additionally supplies the new task text and intervention reason, is permitted only in nonterminal states outside `stopping`, and revokes outstanding strategic/evaluation generations before new decisions use the task. It neither rewrites the original task nor resets bootstrap limits. Start/resume return an admission acknowledgement, pause/stop remain pending until their safety conditions hold, and invalid state transitions return a conflict. Unknown run IDs do not create runs implicitly.
+The route supplies `run_id`. Invalid transitions conflict; unknown IDs do not create runs implicitly. Pause/stop remain pending until safety conditions hold. The broader release contracts still require attributed task changes, durable improvement disposition and selective knowledge/history; this table does not invent routes for undelivered behavior.
 
 | Run state | Permitted transitions |
 |---|---|
 | `created` | `bootstrapping` after admitted start establishes environment readiness; `stopping` on stop; `failed` on unrecoverable admission failure. |
 | `bootstrapping` | `running` on completion/expiry; `pausing`, `recovering`, `stopping`, `failed`. |
-| `running` | `pausing`, `recovering`, `stopping`, `completed`, `failed`. Completion requires objective evidence and no live effect lease. |
+| `running` | `pausing`, `recovering`, `stopping`, `reviewing`, `completed`, `failed`. Normal death changes player life, not run state. Completion requires objective evidence and no live effect lease. |
+| `reviewing` | Effect-free bounded model review after verified goal; `completed`, `stopping` or `failed`. No further gameplay trial is admitted. |
 | `pausing` | `paused` only after admission is fenced and controls neutralized or the declared adapter safety fence is established; otherwise `recovering`, `stopping`, `failed`. |
 | `paused` | `running` on deliberate resume after fresh observation; `recovering`, `stopping`, `failed`. Pausing during bootstrap ends that bootstrap; resume grants no new bootstrap allowance. |
 | `recovering` | `running` or `paused` after reconciliation; `stopping`, `failed`. Prior pause/stop intent is preserved. |
-| `stopping` | `stopped` after fencing/neutralization, confirmed adapter-session closure and durable closure; `recovering` if fencing certainty is lost; `failed` if recovery cannot establish safe closure. Stop intent survives recovery. |
+| `stopping` | `stopped` after confirmed input neutralization, worker/planner/action drain and durable run closure, retaining a healthy game session; `recovering` if fencing certainty is lost; `failed` if recovery cannot establish safe closure. Stop intent survives recovery. |
 | `stopped`, `completed`, `failed` | Terminal run records. A later new attempt has a new run ID; evidence can still be appended as reconciliation/intervention events without reopening effects. |
 
 Pause stops action admission, revokes pending inference/evaluations, cancels skill/action execution, establishes neutralization or the adapter's required safety fence, and records the operator intervention. `paused` describes agent-control safety, not a universal game-world freeze. The adapter declares whether the environment keeps running, disconnects, or supports an explicit world-pause operation; the UI displays the actual behavior and consequences. No hidden survival behavior is installed. An explicit world pause is an attributed intervention and must never hide inference latency or be used automatically during ordinary model waits. Resume reobserves authoritative game state, obtains new execution generations, and requires new decisions rather than replaying queued commands. Pausing during bootstrap records its early termination; subsequent policy authoring uses ordinary gameplay tools, without restarting the bootstrap allowance. Model latency during normal play is not recorded as manual pause.
 
-Stop has highest priority, closes admission, fences generated work and provider callbacks, establishes neutral controls or the declared safety fence, and closes the adapter's playing session with confirmation evidence. A transport disconnect or crashed emitter is recovery, not proof of immediate neutralization; the implementation must establish its fence/termination before claiming safe closure. Separately owned game processes or servers are not silently destroyed by stopping a run.
+Stop has highest priority, closes admission, fences generated work and provider callbacks, and confirms neutral controls plus run-emitter drain. It keeps a healthy playing session and video connected. A transport disconnect or crashed emitter is recovery, not proof of immediate neutralization; establish actual fence/termination before claiming safe closure. Explicit Stop world, world replacement and application close own session/process teardown; stopping a run does not silently destroy them.
 
 Required event families are run state/intervention, observation availability, action admission/state/outcome, skill execution, policy validation/trial/switch/quarantine, model decision/attempt, provider availability/auth status, runtime feedback, checkpoint/recovery/rollback and diagnostic status. Each event links to source records. The activity feed distinguishes queued, executing, awaiting inference, meaningful game wait, cancellation pending, disconnected/recovering and paused states. UI explanations cite plans, tool decisions and actual events; they do not claim access to hidden chain of thought.
 
@@ -446,6 +592,28 @@ SSE uses durable `event_seq` as its reconnect cursor and delivers at least once.
 
 ## Feedback and evidence
 
+### Bounded execution trace and revision evidence
+
+[`src/shared/execution-evidence.ts`](../src/shared/execution-evidence.ts) defines the implemented trace, death episode, improvement, working-program and comparison records. Trace attributes execution/root/parent, exact program/version/hash, session/life and available call/action/observation/event IDs. Kinds are `capability_request`, `capability_result`, `observation`, `branch`, `intent`, `span` and `omission`. Only profile-authorized public observation snapshots enter it.
+
+Branch records describe actual instrumented JavaScript condition decisions with source locations. Canonical model-authored source/hash remain immutable; instrumentation must preserve evaluation order, short-circuiting and await behavior and grants no authority. Trace is not chain of thought. `game.progress` produces labeled model-authored intent; neither intent nor a branch explains why the model chose a target or proves success.
+
+`Store.tracePage(runId,after,limit,executionId?)` pages execution/root records within 65,536 bytes. Payloads over 24,576 bytes become explicit omissions with original size. Per-run storage is bounded to 8,192 records/8 MiB; counters retain omitted records/bytes. Default page size is 100. Death episodes retain last authorized context and action/root/event references through their own bounded pages.
+
+Known source-branch omissions and uncertain `tail_incomplete`/`loss_reason` both mark diagnostics incomplete. Missing trace cannot erase independently confirmed gameplay receipts. Death episode and source event commit atomically before subscriber notification.
+
+Attributed spans distinguish `native_action`, `dispatch`, `receipt`, `readiness`, `sandbox`, `capability_wait`, `strategic_request`, `scheduler_handoff` and `life_recovery`. Same-process monotonic durations are measurements; cross-process correlation and absent spans require explicit uncertainty. A long action round trip is not automatically dispatch delay or LLM idle.
+
+Durable opportunities link death/failure/outcome evidence to exact versions. Current decisions are `revise`, `keep` and `insufficient_evidence`; revisions must be model-authored and link the same-model parent version/hash and source events. The current implementation bounds opportunities to 256 per run and feedback pages to 65,536 bytes. The broader detector/catalogue below remains a release requirement where not delivered.
+
+`decision:"revise"` requires an exact `revision` reference; `keep` and `insufficient_evidence` require `revision:null`. Here revise records a chosen/performed code change or candidate experiment, not verified improvement, adoption or promotion. `feedback.decision_contract` exposes the shared `IMPROVEMENT_RESOLUTION_HELP` from execution-evidence types. Invalid decision/reference combinations return actionable `invalid_request` through the existing typed RuntimeFault path and persist no resolution. A conflicting immutable resolution returns `conflict`. The exact parent/model/hash, scope, lineage and dispatch-qualification gates remain unchanged regardless of outcome uncertainty.
+
+`insufficient_evidence` limits the strength of an improvement claim, not permission to author and try a bounded candidate while the goal remains unsatisfied. Repeating an unchanged blocked program under unchanged conditions supplies no new outcome evidence. Generic experiment guidance does not supply game tactics, relax source limits, modify the model's historical source or permit effects after goal success.
+
+Objective comparison reports confirmed block removals by registry identity, receipted own-inventory deltas, target-ID/position switches, sampled and receipted travel/rotation, attributed timings, sample counts, outcomes and trace limitations. No generic rule labels every extra block unnecessary, infers tree identity or invents a reason for changing target. `VersionComparison` includes exact source/card differences and bounded sample pages; its conclusion is `descriptive_only_no_causal_improvement_claim`. Unmeasured revisions are candidates; measured observations still do not establish causal benefit.
+
+Measured status requires actual dispatch (`started_at`), not merely an accepted then cancelled execution. Sampled native yaw/pitch are converted from radians to degrees using shortest-angle deltas. Strategic comparisons use trusted current-run/model scope before source reads; the separately authorized operator route explicitly selects operator scope rather than trusting caller-supplied scope.
+
 `feedback.read` and UI events expose source-linked progress and failure, not inferred success from fluent explanation. Records distinguish model decision latency, provider attempts/retries, runtime dispatch and reaction latency, action duration/outcome, blocked planning, interrupts, meaningful game waits, LLM-induced idle time, queue pressure, backend errors and actual usage. Gameplay evidence includes objective/subgoal changes, failed actions, deaths and observed consequences. [Learning and evaluation](learning-and-evaluation.md) defines aggregation and Time to Fluidity.
 
 Record unavailable measurements as unknown. Include active policy/skill versions, action IDs, observation basis, evaluation rejection reasons, intervention/downtime intervals and unknown effects so investigators can reconstruct why a control was or was not issued. Diagnostics must not bypass observation permissions; privileged result verification remains separate from planner context, generated programs and reusable memory.
@@ -454,17 +622,17 @@ Timing evidence records accepted start, transition to running, strategic authori
 
 ## First integration: Minecraft Java Normal Survival
 
-This profile specifies the first complete integration target, not implemented compatibility or generic core fields. It targets Minecraft Java 1.21.4, Survival, Normal difficulty, one avatar, ordinary spawn/inventory/death rules, and no agent cheats or operator privileges. A trusted Node.js 24 Mineflayer bridge implements the adapter; it owns raw bot/protocol access and a filtered observation cache. prismarine-viewer supplies the planned live first-person view. Its actual fidelity and compatibility must be established on the target stack.
+The profile targets Minecraft Java 1.21.4 Normal Survival, one avatar, ordinary spawn/inventory/death rules and no agent cheats/operator privileges. An actual Java 21 Fabric client owns raw state, filtered perception, smooth motors and post-HUD video. The managed Fabric server requires session proof; matching names, offline whitelists or player caps are insufficient. Control binds private session/world/epoch authority separately from video. Transport loss fences effects and neutralizes controls before renewed authority. No old-adapter fallback is allowed.
 
 ### Player-observable structured profile v1
 
-The one required initial profile is `observation_profile_id: player-observable-structured`, `observation_profile_version: 1`, using a structured state/event observation interface. This is a chosen specification, not implemented support. It provides a declared structured-information advantage/approximation, not human-identical perception or a formal zero-leakage guarantee. A stricter camera-based profile may be explored later; it is not required for the first playable slice.
+The required profile is `observation_profile_id: player-observable-structured`, version `1`, delivered as structured state/events. Native conformance needs its own retained proof; old-adapter fixtures do not transfer automatically. It is a declared structured-information approximation, not human-identical perception or a zero-leakage guarantee. A stricter camera profile is optional.
 
 Nearby unobstructed blocks/objects and entities may be observed within the configured finite range, regardless of camera yaw/pitch. A nearby tree behind the camera is eligible; rotating the camera alone does not revoke it. Obstruction/occlusion, range, loaded-client availability and bounded sampling still apply. This permission neither reveals all loaded chunks nor removes walls. The initial sampling rules below have no camera cone.
 
-The profile also permits normal F3 position, own health/status, inventory and interaction UI, public recipes/docs and legitimately retained world-local memory. Hidden ore/resources, undiscovered structures, exact current state/coordinates/identity of occluded entities, seed, saves and privileged evaluator state remain unavailable to the agent. Raw Mineflayer bot/world/chunks, `findBlocks`/`blockAt` access and entity enumeration are not agent APIs. The trusted adapter may possess raw client state for perception and physics, but the strategist, generated skills/policies, retrieval, reusable library, agent-visible logs and errors receive only permitted projections. Renderer backing data and evaluator inputs remain separate.
+The profile permits normal F3 position, own health/status, inventory/UI, public recipes/docs and legitimate world-local memory. Hidden resources/structures, exact live concealed entity state, seeds, saves and evaluator state remain unavailable. Raw native world/chunk/entity collections and renderer buffers are not agent APIs. The trusted adapter's possession of client state for perception/physics grants no broader strategist, generated-program, retrieval, library, log or error access.
 
-| Profile configuration field | Initial preset: `minecraft-observable-initial-r1` |
+| Profile configuration field | Initial preset: `minecraft-observable-initial-r2` |
 |---|---|
 | `observation_radius_blocks` | `32`, Euclidean distance from the exact current avatar eye position |
 | `navigation_geometry_radius_blocks` | `8`, Euclidean controller-only bound from the current avatar feet position |
@@ -482,6 +650,8 @@ The profile also permits normal F3 position, own health/status, inventory and in
 | Private local planning | At most `4,913` distinct cells, `8,192` cell visits, `2,048` expanded nodes and `4,096` queued nodes per plan; minimum replan interval `100 ms`, elapsed guard `5 ms` |
 
 These are chosen engineering defaults, not measured performance or a claim of universal adequacy. Before bootstrap, expand the preset into the full effective `observation_profile_config`; fill omitted optional settings from this preset, never leave a limit unspecified. Record the preset ID, profile version, exact values and algorithms below, target game/registry and geometry-data revisions, and any explicit overrides. Fingerprint that expanded configuration with SHA-256 over RFC 8785 canonical JSON, and retain both configuration and fingerprint in the manifest. Overrides change the fingerprint and must remain fixed in matched comparisons; a changed algorithm needs a new preset revision. Loaded state and eligibility further restrict access; neither radius authorizes its whole volume.
+
+Revision r2 adds schema-2 session/life lineage and the permitted optional `item_name` on current eligible item entities. It preserves the camera-independent structured line-of-sight permission and all existing range/occlusion/age/output bounds; it does not introduce camera-frustum filtering. `item_name` is only the registry identity of a visibly represented nonempty ItemEntity stack. Other entities cannot carry it. Exact dropped-stack count, NBT, custom/lore data and concealed item identity remain unavailable.
 
 #### Sampling schedule and eligibility
 
@@ -506,7 +676,7 @@ The elapsed guards stop admission of more work; they neither preempt a slow indi
 
 #### Freshness, search and bounded output
 
-Current observations retain their capture time, eye position and target/read-cell dependencies. Recheck these dependencies before publishing a completed check and before returning a current record. An eye-position change, target-state change, relevant occluder update, dependent chunk unload or age over `1,000 ms` invalidates current eligibility immediately; camera-only rotation does not. Entity motion invalidates its current record without updating its last-seen position from raw tracking. Epoch/world/rollback-branch/profile changes invalidate current handles and partial scans. A new epoch/profile starts both scan cursors from the beginning; unavailable state, disconnected transport or uncertain dependency revisions remain unknown until freshly reconciled and sampled. Remembered facts retain only their last authorized projection and provenance. TTL expiry, record eviction or a missed sample is not evidence that an object disappeared.
+Current observations retain their capture time, eye position and target/read-cell dependencies. Recheck these dependencies before publishing a completed check and before returning a current record. An eye-position change, target-state change, relevant occluder update, dependent chunk unload or age over `1,000 ms` invalidates current eligibility immediately; camera-only rotation does not. Entity motion invalidates its current record without updating its last-seen position from raw tracking. Session/life/epoch/world/rollback-branch/profile changes invalidate current handles and partial scans. A new epoch/profile starts both scan cursors from the beginning; unavailable state, disconnected transport or uncertain dependency revisions remain unknown until freshly reconciled and sampled. Remembered facts retain only their last authorized projection and provenance. TTL expiry, record eviction or a missed sample is not evidence that an object disappeared.
 
 Publish current records only from completed eligible checks. Sampling is always partial: even a completed direction cycle spans time, samples only fixed rays and is not an absence certificate. Read/search report this safe limitation and the capture age of returned facts; raw scan counts, hidden matches and private coverage maps stay out of agent-visible completeness/cursor/truncation fields. If the caller's requested maximum age cannot be met, return unknown/stale coverage, not a newer timestamp on old facts.
 
@@ -534,7 +704,7 @@ A trusted low-level controller may read bounded client-loaded terrain geometry f
 - Apply the initial preset's per-plan caps before reads/expansions, counting cached/repeated cell lookups as visits. A cell is readable only if its center is within radius `8` and its integer offset from `floor(feet)` is in `[-8,8]³`; the `4,913`-cell cap is an upper bound, not permission to read that whole cube. No eager geometry prefetch outside an admitted plan. Replan at most once per `100 ms` during an authorized active movement, and discard a plan when its goal, pose/envelope or read dependencies cease to be valid. Pin the controller/physics revision in the effective configuration; for A*, order available neighbors by `(x,y,z)` and break open-set ties by `(f,g,x,y,z)` ascending. Stop before exceeding any read/node/queue cap or the `5 ms` admission guard; return only the safe coarse local-planning failure, never an unchecked route. Record actual reads, expansions, duration and exhaustion privately. These caps do not grant another effect lease, extend action duration or install autonomous replanning while no movement is authorized.
 - Return only permitted actual movement/outcome feedback and safe coarse failure categories. Never expose private maps, raw path nodes, reachability grids or resource-dependent diagnostics. Local steering/path choice/timing may still benefit from private collision geometry; this declared limitation must be fixed equally across matched comparisons and must not eliminate exploration.
 
-Stock mineflayer-pathfinder is not exempt. If its data path cannot enforce the geometry projection and local envelope/goal rules, wrap, constrain or replace it, or use bounded mechanical moves. Passing the full raw world and filtering only the returned route is insufficient. Conformance must audit internal reads and actual effects, including known-target movement without an all-voxels-observed map, same-geometry concealed ore/stone substitution, rejection of unknown-target probes before lookup, and refusal to choose a hidden cave/shortcut as a route. Controlled security fixtures are separate from ordinary-world gameplay evidence; fixture coordinates/tactics cannot enter reusable experience.
+Native pathfinding and every helper library must enforce geometry projection and local envelope/goal rules. Full raw-world access followed by filtering the returned route is insufficient. Conformance audits internal reads and real effects: known-target movement without an all-voxels-observed map, same-geometry concealed ore/stone substitution, unknown-target rejection before lookup, and refusal to select hidden caves/shortcuts as routes. Controlled fixtures are not gameplay evidence or reusable experience.
 
 Paper Anti-Xray is optional defense in depth, never the sole filter; these permissions must hold with it disabled. It does not protect entity information or every hidden-data channel. Record vanilla/Paper flavor, exact game/server build, enabled status and effective per-world/dimension Anti-Xray settings (mode, block lists, heights and update options applicable to that version), ideally with a configuration snapshot/hash, in experiment evidence outside agent permissions. Freeze those settings in matched comparisons; masked/false ores are not genuine discoveries. No Paper setup or tested compatibility is claimed here; see [upstream evidence](upstream-reuse.md#structured-observation-and-navigation-evidence) for version-specific limits.
 
@@ -542,9 +712,17 @@ Paper Anti-Xray is optional defense in depth, never the sole filter; these permi
 
 Initial capability schemas cover bounded movement/input/look, interaction, dig, place, craft, equip and navigation under the profile above. Parameters explicitly select targets, recipe/item identifiers, quantities, slots and other tactical choices. The bridge rechecks reach, profile-authorized target validity, inventory, UI session and terrain constraints immediately before effects; any game-required aiming is an action constraint, not a camera-cone observation filter. Coordinated movement/look/attack may be one bounded composite action, never independent foreground leases. An A* motor must obey the private local-geometry contract; it cannot discover hidden targets or higher-level routes. No handwritten collect-wood, explore, survive, fight or complete-game routine is supplied.
 
+Motor profiles are `precise`, `balanced` (default) and `fast`, configured by the operator independently of gameplay through `GameBridge.setMotorProfile(profile)`. Persisted selection applies live without restart. Balanced starts with yaw/pitch limits of 480°/s and 300°/s and adaptive large-turn/small-settle control; these are configured limits, not measured achieved speed. One render-monotonic integration clock avoids double tick/render integration, using shortest yaw and bounded settling without overshoot.
+
+`look` and `move.look` remain explicit free orientation. `navigate.gaze` is optional: `{kind:"navigation"}` by default, `{kind:"target",target_id}` or `{kind:"free",yaw,pitch}`. Default gaze samples bounded actual local route geometry, interpolates a near-route point and adds eye height so flat ground stays level and slopes affect pitch mechanically. Target interactions use target gaze. Movement gating uses yaw rather than pitch; free/target gaze must preserve world-direction travel through legal strafe synthesis. `navigate.range` allows 0.5–4 blocks for ordinary approach precision, not an automatic pickup tactic. Camera/navigation speed and useful-play improvements require new measured evidence.
+
+For native movement, release motor controls at the declared duration before one ordered own-server inventory receipt. Only an actual authenticated receipt can mark inventory confirmation. A missing receipt at the bounded three-second deadline leaves the effect `unknown`; it cannot be replaced by local prediction or a fabricated confirmation flag. A separately confirmed native neutralization barrier can retain a healthy session/video without claiming effect certainty. Only unconfirmable control/emitter safety requires fail-closed client closure before renewed authority.
+
 Cancellation stops the motor/navigation task, releases held inputs and obtains neutralization acknowledgement; if that cannot be established, the bridge emitter must be fenced/terminated and recovery entered before a new lease. A lost craft/place/consume result stays uncertain rather than triggering blind repetition. Domain revision examples include pose, target validity, inventory-slot contents, UI session and the authorized navigation goal/corridor plus controller envelope; unrelated observation updates do not invalidate every slow result.
 
-The default operator pause leaves the avatar connected and the world ticking; survival is not guaranteed. Stop confirms safe controls and avatar disconnect, without silently shutting down the operator's server. Minecraft save/flush, backups, reset and restoration require separately declared server support and consistency procedures in [operations](operations-and-security.md#first-integration-minecraft-server-and-saves). No universal atomic save or deterministic rewind is implied.
+The default operator pause, Stop run and verified goal closure leave a healthy avatar session connected with neutral controls while the world keeps ticking; survival is not guaranteed. Ordinary death uses the separate life gates above, never automatic respawn or a terminal client error. Explicit Stop world, world replacement and application close end owned session/processes. Minecraft save/flush, backups, reset and restoration require separately declared server support and consistency procedures in [operations](operations-and-security.md#first-integration-minecraft-server-and-saves). No universal atomic save or deterministic rewind is implied.
+
+The `break_log` goal requires one server-confirmed removal of an eligible log during the run. `collect_wood` requires own receipted wood inventory gain from that run's starting baseline; removal alone cannot satisfy it. Keep explicit verifier-evidence variants for block removal and inventory gain. Death does not reset the run-start inventory baseline; a new task/run creates its own baseline.
 
 The task verifier may evaluate declared Minecraft subgoals and the long-horizon Ender Dragon objective. Completion requires actual verifier evidence; a useful workflow, intermediate task or attractive view is not proof of Dragon completion. Any privileged evaluator state remains isolated from planner inputs and experience.
 

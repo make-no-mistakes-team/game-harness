@@ -2,13 +2,13 @@
 
 GameHarness is an extensible runtime for model-controlled games. A game adapter supplies observations, mechanics, a live view, task verification, and declared recovery capabilities. The core owns strategic model turns, generated programs, reactive policy execution, action arbitration, experience, and evidence.
 
-This is an implementation specification. No application or game integration is implemented in this checkout. Minecraft Java is the first planned complete integration, not a permanent restriction on the product. Supporting another game requires an adapter and validation; it does not follow automatically from having a generic interface.
+This document describes the desktop/native/program implementation direction and the broader release contracts. The repository contains implementation, but the [integration guide](../integration-spike.md) distinguishes old-spike results from current native proof. Minecraft Java is the first integration, not a permanent restriction on the product. Supporting another game requires an adapter and validation.
 
 The [product requirements](../prds/gameharness-v1.0-prd.md) define intended behavior. The [context view](c4-context.md) and [container view](c4-containers.md) show the system at different levels. [Runtime contracts](../runtime-contracts.md) are authoritative for adapter interfaces, records, and lifecycle transitions.
 
 ## Core and adapter responsibilities
 
-The core treats game observations and actions as adapter-declared schemas. It does not require blocks, enemies, recipes, health, a particular coordinate system, or a universal definition of winning. Those concepts belong to the selected game's observation profile and capability catalogue.
+The extension contract requires adapter-declared observations/actions rather than universal blocks, enemies, recipes, health, coordinates or victory conditions. Those concepts belong to a game's profile and capabilities. The current shared `Observation` and `GameAction` types still implement the first Minecraft profile; arbitrary schema negotiation and a second game adapter are not implemented. Generalizing those concrete types is implementation work for additional supported games, not behavior already supplied by the descriptor below.
 
 | Generic core responsibility | Adapter responsibility |
 | --- | --- |
@@ -20,7 +20,7 @@ The core treats game observations and actions as adapter-declared schemas. It do
 | Deliver run status and a truthful activity stream | Supply a live view and its freshness/availability information |
 | Reconcile durable records after interruption | Declare and implement supported reconnect, reset, checkpoint, and restore operations |
 
-The `GameAdapter` descriptor includes game, adapter, version, observation-profile, capability-schema, view-source, task-verifier, and recovery-support identities. Run manifests and reusable artifacts record the relevant identities, including the profile configuration fingerprint separately from its observation interface/schema. Incompatible permission/configuration changes invalidate cached validation and artifact applicability; they cannot silently relabel older evidence. A program written against one game's actions is not silently reusable in another game merely because both use JavaScript.
+The normative `GameAdapter` descriptor requires game, adapter, profile, capability-schema, view-source, verifier and recovery-support identities. It is the extension target, not an implemented arbitrary-schema plugin protocol. Manifests/artifacts must retain applicable compatibility identities and configuration fingerprints; permission changes cannot relabel old validation or evidence. Sharing JavaScript does not make programs portable between games.
 
 A game need not have a terminal victory state. Its tasks can instead define a verified objective such as reaching a location, producing an item, or completing a level. Optional save/reset/restore operations must advertise their actual support level. The core cannot promise a world rewind that the game does not provide.
 
@@ -32,13 +32,13 @@ The initial deployment is a local Linux application with one playing avatar. Its
 
 | Area | Selected design | Reason and verification boundary |
 | --- | --- | --- |
-| Trusted backend | TypeScript on Bun 1.3.14 or later | Matches the inspected OMP packages. Public interfaces were exercised locally; a real game/provider loop remains unverified. |
+| Trusted backend | TypeScript on Bun 1.3.14 or later | Owns authorization and durable evidence; old-spike provider results do not certify the new native loop. |
 | Strategic integration | Selected OMP `pi-ai` and `pi-agent-core` packages behind GameHarness-owned interfaces | Reuses provider and tool-calling behavior without adopting the full coding CLI. Exact initial package candidates are recorded in [upstream reuse](../upstream-reuse.md). |
 | Fast decisions | `FastDecisionProvider`, initially backed by the OMP TypeSafe/Jev client | Supplies typed choices independently of strategic turns. Game-specific meaning remains in the model-authored policy. |
-| Adapter host | A process implementing the declared `GameAdapter` contract | Keeps raw game access out of generated programs and permits game-specific runtimes. The first adapter uses Node.js 24 and Mineflayer. |
+| Adapter host | Actual Java 21 / Fabric 1.21.4 Minecraft client with trusted Bun bridge | Owns filtered native perception and bounded smooth motors; no Mineflayer compatibility path or automatic fallback. |
 | Generated programs | JavaScript in OS-isolated worker processes/containers | Enforces restricted capability access independently of model instructions. |
-| Browser UI | Small TypeScript application built with Vite | Displays the adapter-supplied view, activity, task/provider selection, and essential run controls. |
-| Control and events | HTTP JSON commands and Server-Sent Events | Separates operator control from game/viewer-specific transports. |
+| Desktop UI | Electron-owned window with Vite-built TypeScript renderer | Displays authentic native frames, compact controls and a hideable sidebar; setup/source/cards/history use dialogs. |
+| Control and events | Authenticated HTTP JSON/SSE and native control IPC | Keeps run control separate from the authenticated binary `/v1/video` WebSocket. |
 | Durable state | SQLite with WAL, foreign keys, and durable transactions; immutable content-addressed artifact files | Gives one owner for run metadata, ordered events, action evidence, and experience. Game saves remain adapter-owned. |
 
 These choices define an initial implementation, not a tested compatibility matrix. Runtime and package upgrades must be checked as a combination. No broader platform support follows from the diagram.
@@ -47,26 +47,38 @@ These choices define an initial implementation, not a tested compatibility matri
 
 A module's interface includes its ordering rules, cancellation behavior, failure modes, and resource limits as well as its methods.
 
+GameHarness must be language-agnostic at component boundaries. Performance-critical components may be implemented in native languages without modifying the agent runtime, skill format, or game adapter contracts. Bounded serializable messages, versioned schemas, ownership and cancellation semantics define those boundaries, not TypeScript object identity. Keep orchestration/providers/memory/evaluation in TypeScript, actual Fabric observation/motor/capture in Java, and generated skills in JavaScript. Consider Rust only after a measured bottleneck justifies it; do not add a speculative service.
+
+Decompose the runtime by responsibility: lifecycle/coordinator, strategic scheduling/context, program execution, policy arbitration, provider accounting, experience and evidence. Extract real owners rather than retaining a monolithic runtime behind forwarding wrappers. CPU, event-loop delay, observation/command latency, delivered FPS and program duration identify where optimization belongs; language changes do not establish token savings.
+
 | Module | Owns |
 | --- | --- |
-| Run coordinator | Lifecycle, configuration snapshots, bootstrap admission, pause/stop/recovery intent |
-| Strategic agent | One serialized model conversation, declared tools, context compaction, model-authored plans and program proposals |
-| Strategic Turn Scheduler | Durable wakeup cursors, coalesced reasons, bounded context batches, one strategic turn/request at a time, retry/backoff and explicit waiting |
+| Run coordinator — `runtime.ts` | Lifecycle and trusted observation/goal authority, configuration, pause/stop/recovery intent |
+| Speculative planning — `speculative-planning.ts` | Explicit one-flight lookahead, bounded drafts, exact predecessor/source identity, fresh read-only preconditions and guarded activation |
+| Strategic planner — `strategic.ts` | Authenticated Agent, serialized turns/wakes, compact context, one-shot attention, actual request purpose and usage |
+| Runtime tools — `runtime-tools.ts` | Tool schemas, run/epoch authorization and tool evidence; authoring instructions live separately in `runtime-prompt.ts` |
 | Autonomous Improvement Loop | Game-neutral evidence triggers, deduplicated opportunities, delivery/acknowledgement/deferral, one bounded improvement trial per run and outcome-driven wakeups |
-| Adaptive control | Policy evaluation, fenced run-local version selection, trial enforcement and feedback delivery |
-| Action executor | The avatar's foreground effect lease, priorities, cancellation acknowledgement, and final freshness checks |
+| Reactive runtime — `reactive.ts` | Policy registry/selection, trials, workers, evaluation, real Jev and fenced preemption |
+| Action arbiter — `action-arbiter.ts` | Durable admission/deduplication, priority queue, exclusive leaf-effect lease, cancellation and emitter draining |
 | Game adapter | Game-specific observation permissions, capability schemas, mechanics, view, and result verification |
-| Program broker and workers | Isolated execution and validated capability requests with explicit serializable state |
-| Experience registry | Selective metadata/source/evidence reads, idempotent knowledge/promotion mutations, immutable per-model snapshots and model-authored startup bundles |
-| Evidence and evaluation | Durable outcomes, timing, task-verifier results, and intervention records |
+| Skill manager — `skills.ts` | Durable program trees, shared budgets and checked capability broker; sandbox execution remains separate |
+| Experience library — `experience.ts` | Explicit model-scoped snapshots, useful-gameplay predicate gates, portability/world-local declarations and fresh exact-version hydration |
+| Program evidence — `program-evidence.ts` | Attributable execution/action outcomes and measured effectiveness, kept separate from compactness |
+| Trace, improvement and comparison | Bounded authorized execution evidence, durable opportunities, exact revision links and descriptive objective samples; DTOs in `src/shared/execution-evidence.ts` |
 | Credential/provider integration | Supported API/subscription flows, refresh, provider requests, and redacted connection status |
-| Browser delivery | A projection of authoritative run state and the adapter's current live view |
+| Desktop delivery | Owned backend lifecycle and a read-only projection of authoritative state and native video |
+
+These implementation modules live under `src/server/`; the public `Runtime` lifecycle API remains the composition boundary. Broader knowledge/search/history and autonomous-improvement requirements still need their own delivery evidence; the module split does not establish those gates. TypeScript contains no per-tick gameplay motor or speculative Rust service.
+
+The adapter owns a game session (`session_id`, `world_id`, connection `epoch`); the coordinator owns individual agent runs; native authoritative readiness owns player lives. Run completion, Pause and Stop revoke and drain run emitters through `GameBridge.neutralize()` without disconnecting a healthy session. Ordinary death fences old-life work and targets, preserves real DeathScreen video and an active run, and wakes one strategic decision. Only an explicit model-selected `game.respawn()` through the ordinary arbiter requests vanilla respawn. Confirmed new-life readiness advances life ID while preserving session/epoch; saved-dead startup never respawns automatically. Explicit Stop world, world replacement and desktop close own session/process teardown. Genuine unconfirmable control loss still fails closed.
 
 Infrastructure supplies mechanisms rather than game tactics. A model decides what to acquire, where to go, what to automate, and which policy backend to use. Generic execution code must not hide a developer-written strategy behind an otherwise generic tool name.
 
 ## Independent execution rates
 
 Strategic inference, action execution, and policy evaluation proceed independently. A model request must not hold the avatar's action lease while waiting for a provider. Authorized work can continue, and compatible policies can evaluate newer observations in parallel.
+
+Compact model-authored asynchronous programs are the main gameplay unit. Exact-version composition shares one root deadline and action/call/depth budgets. Parents do not own the avatar lease; only a leaf action does. Static parsing, canonical formatting and complexity limits govern source admission, while separate Docker controls isolate execution. Host-known capability waits can suspend the runnable CPU deadline; worker heartbeats cannot extend authority.
 
 Local code and Jev are different execution mechanisms. A JavaScript policy can react without a network request; a Jev policy asks a remote model to choose from declared alternatives before a deadline. Neither is guaranteed to meet a particular response time simply because it is called reactive.
 
@@ -97,7 +109,7 @@ sequenceDiagram
 
 One OMP `Agent` instance still has serialized strategic turns. Its tool-batch concurrency is not the game scheduler. GameHarness tools submit long-running work promptly and expose status/results separately.
 
-The internal [Strategic Turn Scheduler](../runtime-contracts.md#strategic-turn-scheduler) starts the next turn without an operator prompt: bootstrap, attributed task changes, action/skill outcomes requiring a decision, policy replans, recovery completion, no runnable work, and due improvement/trial feedback provide durable wake signals. An existing skill/queue can take its next permitted step without another model call. Coalescing, bounded event batches, consumed cursors and finite backoff prevent observation polling and completion bursts from becoming prompt storms. Signals arriving during inference join the next boundary; pause, stop, task changes and recovery fence obsolete output.
+The [Strategic Turn Scheduler](../runtime-contracts.md#strategic-turn-scheduler) wakes on bootstrap, root-program closure or other meaningful decision outcomes, policy replan, recovery, genuinely absent runnable work and due feedback. Leaf results inside a pending program return to its authored task flow, not a strategic prompt. One-shot attention remains explicit and bounded. Direct strategic action-submit/cancel tools and aliases are removed; programs/reactions alone own new effects through the arbiter. Coalescing and finite context/backoff prevent polling storms; lifecycle/task changes fence obsolete output.
 
 Only the executor admits effects. Read-only observation and inference can overlap; competing programs cannot independently write different control channels and evade the foreground lease. An adapter may expose a bounded composite mechanical action that coordinates several inputs under that one owner.
 
@@ -117,6 +129,8 @@ The [Autonomous Improvement Loop](../runtime-contracts.md#autonomous-improvement
 
 Revisions create immutable source/card artifacts. Activation replaces a selected version at a scheduling boundary, and callbacks from revoked generations cannot issue new effects. Selection pointers, trial counters, evaluation generations and private state belong to `(run_id, policy_id)`, never to a shared inherited snapshot. A trial bound fences new proposals, restores its declared prior selection or no policy, and wakes the strategist to assess outcomes. Restoring an earlier policy changes future control; it does not restore the game's state. Useful current-run behavior requires real evidence, and before/after timing alone is not a causal result.
 
+Delivered death/failure/outcome opportunities, exact model-authored revisions and objective comparison are narrower than the broader release detector catalogue above. Trace records actual API requests/results, authorized snapshots, instrumented branches, intent and categorized spans with explicit byte/record omissions; it exposes no chain of thought or inferred reason for target selection. Same-session/model `working_candidate` definitions can persist across tasks without old args/state/observations, separately from evidence-qualified cross-session snapshots. Optional lookahead stages no effects and requires fresh session/life/task/predecessor/source checks before explicit activation. After verified goal, bounded `reviewing` is effect-free: candidates may be authored, but no extra gameplay trial occurs.
+
 ## Observation permissions
 
 Every adapter defines an information-permission profile separately from its observation interface. Structured state/events and future images describe delivery, not fairness by themselves. The profile distinguishes current observation, remembered evidence, unknown state and any declared controller-only information. Agent-facing permissions apply to tools, action errors, generated programs, retrieved content and reusable memory; private controller permissions do not widen those APIs.
@@ -127,7 +141,7 @@ The human live view is a separate capability. Its renderer buffers and endpoints
 
 ### Minecraft reference profile
 
-The first complete integration targets Minecraft Java 1.21.4 in Normal Survival. Its trusted Node.js 24 host owns Mineflayer and serves a first-person prismarine-viewer view. A compatible Java 21 runtime is the initial server target. This combination has not yet been exercised as a game integration.
+The first complete integration uses a managed Minecraft Java 1.21.4 Normal Survival server and an actual Fabric client under Java 21. The server admits only the managed session through authenticated admission, not merely a matching name or player cap. The client suppresses ordinary physical gameplay/menu callbacks and polling; the human operates only GameHarness controls. A smooth bounded motor supplies shortest-angle aiming, held movement and permitted composite interaction under one owner.
 
 The required initial permission profile is [`player-observable-structured`, version 1](../runtime-contracts.md#player-observable-structured-profile-v1). Its canonical settings and finite bounds live in the runtime contract. Nearby unobstructed objects/entities are eligible regardless of camera yaw/pitch; an unobstructed tree behind the camera is observable. Range and obstruction still apply. Own inventory/status/UI, normal F3 position, public recipes/docs and legitimate world-local memory are allowed. Unobserved remains unknown. Hidden ore/resources, undiscovered structures, exact live state of occluded entities, seed, saves and raw chunks/entity enumeration remain protected.
 
@@ -137,7 +151,9 @@ Mechanical capabilities include bounded movement/look/input and explicitly chose
 
 Paper Anti-Xray is optional defense in depth, not required or sufficient filtering; the adapter must enforce the profile with it disabled. The runtime contract requires recorded server flavor/build and effective per-world/dimension configuration, frozen across matched comparisons. [Verified upstream evidence](../upstream-reuse.md#structured-observation-and-navigation-evidence) describes Mineflayer and Paper limits; a block-occlusion helper alone is not proof of this profile's permissions.
 
-The reference view must be checked for real motion, interaction fidelity, and freshness. A documented `firstPerson` flag is not evidence that the complete product has an adequate live view. Minecraft world saves and backups remain separate from the runtime's journal and follow the adapter-specific operating procedure.
+The client captures its final framebuffer after world, hand and HUD rendering. Bounded latest-frame transport is independent of control; stale/error video cannot be replaced with synthetic footage. Hidden/unfocused rendering, resize, input suppression and capture-to-draw latency need actual evidence. Minecraft world saves and backups remain separate from the runtime journal.
+
+Observation schema 2/preset r2 retain the same camera-independent structured line-of-sight permissions while adding session/life and optional eligible ItemEntity registry `item_name`; exact dropped-stack counts and NBT remain hidden. Live operator motor profiles (`precise`, default `balanced`, `fast`) are persisted mechanical configuration. Navigation gaze follows sampled actual local route geometry or an explicit target/free orientation, with yaw-based movement gating and legal strafe synthesis. `look` and `move.look` remain available. `break_log` verifies removal; `collect_wood` verifies receipted own-inventory gain, preserving its run baseline across death.
 
 ## Isolation and provider access
 
@@ -163,11 +179,13 @@ Cross-session reuse is different from resuming the same environment. A transfera
 
 ## Operator surface
 
-The browser sends authorized commands and subscribes to events with durable identities. Its activity feed reflects backend state rather than independently deciding that a task succeeded. Viewer freshness and disconnects are visible conditions.
+The standalone desktop sends authorized commands and subscribes to events with durable identities. Electron owns only its spawned backend and closes it through the shutdown path; it must not silently reuse or kill an unrelated service. Its sandboxed renderer has no raw Node or game-input authority. Gameplay occupies at least 75% of the main area with the sidebar visible and nearly all of it hidden, without main-window scrolling. Activity and source/cards/history dialogs reflect backend evidence rather than independently deciding success.
+
+Strategic context defaults to compact task/player/inventory changes, program progress/closure and selected actionable failures. Detailed authorized observations remain available on demand. A pending program is meaningful work, not a reason to poll the strategist. Actual purpose-tagged requests and uncached/cache-read/cache-write/output/call counts remain separate from program compactness, cache availability, measured task efficacy and known/unknown cost.
 
 The activity surface also shows an improvement card with the actual skill/policy version change, why it changed, semantic changes, and measured trial outcome or “not yet measured.” Authorized read routes expand the exact [StrategyCard](../learning-and-evaluation.md#human-readable-strategy-artifacts), source and evidence events without exposing another run's data, secrets or hidden evaluator inputs. The UI may display authorized generated source code as escaped, non-executable text. Viewing source grants no execution/capability authority and cannot install or activate a policy; model-authored markup/scripts must not execute in the operator origin. Proposal, effective activation and reverted/no-effect outcomes remain distinct. This requires neither a full library browser nor an editor/replay interface.
 
-Pause and stop follow the adapter's declared effect-neutralization and connection behavior. They must not silently freeze a game to conceal model inference latency. In the Minecraft profile, pause leaves the avatar connected with neutral controls while the world continues; survival is not guaranteed. Operator pauses are recorded separately from ordinary waits.
+Pause and Stop run await real effect-neutralization and complete run-emitter drain while keeping a healthy Minecraft session connected. They must not silently freeze the world to conceal model inference latency; survival is not guaranteed. Stop world and desktop close explicitly end owned processes. Operator pauses, native action/receipt/readiness waits, strategic requests and life recovery are attributed separately rather than inferred from an unexplained gap.
 
 The default deployment binds control and view surfaces to loopback with origin and command authorization. Public hosting requires a separate deployment/security design; it is not implied by an external-user-friendly local interface.
 

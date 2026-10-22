@@ -9,8 +9,9 @@
   },
   "scripts": {
     "dev": "bun scripts/dev.ts",
-    "build:bridge": "bun build src/bridge/index.ts --target=node --packages=external --outfile=dist/bridge/index.mjs",
-    "build": "bun run build:bridge && vite build",
+    "build:native": "sh native/minecraft/gradlew -p native/minecraft build",
+    "build:ui": "vite build",
+    "build": "bun run build:native && bun run build:ui",
     "start": "bun scripts/start.ts",
     "check": "tsc --noEmit",
     "test": "bun test"
@@ -22,15 +23,13 @@
     "@oh-my-pi/pi-ai": "18.12.3",
     "@oh-my-pi/pi-catalog": "18.12.3",
     "@oh-my-pi/pi-utils": "18.12.3",
-    "mineflayer": "4.39.0",
-    "prismarine-viewer": "1.33.0",
-    "socket.io": "4.8.4",
-    "vec3": "0.1.10",
+    "acorn": "8.15.0",
+    "electron": "45.0.0",
+    "prettier": "3.9.10",
     "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/bun": "1.4.3",
-    "prettier": "3.9.10",
     "typescript": "7.0.2",
     "vite": "8.3.4"
   }

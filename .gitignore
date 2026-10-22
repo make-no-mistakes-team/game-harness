@@ -2,3 +2,17 @@
 /dist/
 /coverage/
 *.tsbuildinfo
+/local/
+/PRODUCT.md
+/.impeccable/
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+/native/minecraft/.gradle/
+/native/minecraft/build/
+/native/minecraft/bin/

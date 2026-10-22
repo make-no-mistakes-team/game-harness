@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { AuthManager } from "./auth.ts";
@@ -8,17 +8,23 @@ import { MinecraftServer } from "./minecraft-server.ts";
 import { Runtime, GOALS } from "./runtime.ts";
 import { SandboxService } from "./sandbox.ts";
 import { Store } from "./store.ts";
+import { JevBroker } from "./jev.ts";
+import { VideoStream, type VideoSocketData } from "./video.ts";
+import { PerformanceMonitor } from "./performance.ts";
 import {
   APP_PORT,
   APP_ORIGIN,
-  BOT_USERNAME,
   DATA_DIR,
   MINECRAFT_VERSION,
   OPERATOR_ORIGINS,
   PROJECT_ROOT,
+  setListeningPort,
 } from "./config.ts";
-import { goalSchema } from "../shared/validation.ts";
+import { goalSchema, motorProfileSchema, workingProgramModeSchema, skillRefSchema } from "../shared/validation.ts";
 import type { AppSnapshot, RunView } from "../shared/contracts.ts";
+import { promotionDeclarationSchema } from "./experience.ts";
+import { ImprovementLearning } from "./improvement-learning.ts";
+import { compareProgramVersionsPage } from "./program-comparison.ts";
 
 if (process.env.GAMEHARNESS_LOCK_HELD !== "1")
   throw new Error(
@@ -38,19 +44,45 @@ const onChange = () => {
 };
 const store = new Store(DATA_DIR);
 const auth = await AuthManager.create(DATA_DIR, onChange);
-const game = new GameBridgeClient(PROJECT_ROOT);
+const performanceMonitor = new PerformanceMonitor();
+const motorSettingsPath = path.join(DATA_DIR, "motor-profile.json");
+let motorProfile = motorProfileSchema.parse("balanced");
+try {
+  motorProfile = motorProfileSchema.parse(JSON.parse(readFileSync(motorSettingsPath, "utf8")).motor_profile);
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+}
+const game = new GameBridgeClient(PROJECT_ROOT, {
+  onTiming: (name, milliseconds) =>
+    performanceMonitor.record(name, milliseconds),
+});
+await game.setMotorProfile(motorProfile);
+let profileUpdate: Promise<void> = Promise.resolve();
 const sandbox = new SandboxService(PROJECT_ROOT, onChange);
 const minecraft = new MinecraftServer(onChange, (type, summary, details) =>
   store.event(null, type, summary, details ?? null),
 );
-const runtime = new Runtime(store, auth, game, sandbox, onChange);
-const viewerToken = randomBytes(32).toString("hex");
+const jev = await JevBroker.create(DATA_DIR, { onChange });
+const runtime = new Runtime(store, auth, game, sandbox, onChange, {
+  experienceDirectory: DATA_DIR,
+  judge: jev,
+  adapter_id: "fabric-owned-client",
+});
+const video = new VideoStream((milliseconds) =>
+  performanceMonitor.record("video_forward_ms", milliseconds),
+);
+const offFrames = game.subscribeFrames((frame) => video.publish(frame));
+const desktopNonce = process.env.GAMEHARNESS_READY_NONCE ?? null;
+if (
+  process.env.GAMEHARNESS_DESKTOP === "1" &&
+  (!desktopNonce || !/^[a-f0-9]{32,64}$/.test(desktopNonce))
+)
+  throw new Error("The desktop backend requires its launcher instance nonce");
 const sessions = new Map<string, { csrf: string; expires: number }>();
 const controls = new Map<
   string,
   { fingerprint: string; result: Promise<RunView>; settled: boolean }
 >();
-let gameEpoch = 0;
 let operationGeneration = 0;
 let gameOperation: Promise<void> | null = null;
 let closing = false;
@@ -77,6 +109,8 @@ game.subscribe((notice) => {
     const state = game.snapshot();
     if (state.status !== lastGameStatus) {
       lastGameStatus = state.status;
+      if (state.status === "disconnected" || state.status === "error")
+        video.clear();
       store.event(null, "game.connection", `Minecraft player ${state.status}`, {
         status: state.status,
         epoch: state.epoch,
@@ -92,7 +126,7 @@ const headers: Record<string, string> = {
   "Referrer-Policy": "no-referrer",
   "X-Frame-Options": "DENY",
   "Content-Security-Policy":
-    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-src http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
 };
 class HttpError extends Error {
   constructor(
@@ -188,13 +222,14 @@ async function connectPlayer(generation: number): Promise<void> {
   await game.connect({
     host: "127.0.0.1",
     port: server.port,
-    username: BOT_USERNAME,
     version: MINECRAFT_VERSION,
     world_id: server.world_id,
-    epoch: ++gameEpoch,
-    viewer_token: viewerToken,
-    operator_origins: OPERATOR_ORIGINS,
+    epoch: store.nextGameEpoch(),
+    motor_profile: motorProfile,
   });
+  const profileApplied = profileUpdate.then(() => game.setMotorProfile(motorProfile));
+  profileUpdate = profileApplied.catch(() => {});
+  await profileApplied;
   if (generation !== operationGeneration || closing) {
     await game.disconnect();
     throw new Error("Game operation was cancelled");
@@ -234,18 +269,28 @@ const runBody = z
     task: z.string().trim().min(3).max(4000),
     goal: goalSchema,
     model_id: z.string().min(1).max(160),
+    experience_id: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+    working_programs: workingProgramModeSchema.optional(),
   })
   .strict();
+const comparisonVersion = skillRefSchema.extend({ run_id: z.uuid(), hash: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 
-const server = Bun.serve({
+const server = Bun.serve<VideoSocketData>({
   hostname: "127.0.0.1",
   port: APP_PORT,
   maxRequestBodySize: 64 * 1024,
   idleTimeout: 120,
-  async fetch(request) {
+  websocket: video.handlers,
+  async fetch(request, httpServer) {
     try {
       const url = new URL(request.url);
-      const expectedHosts = [`127.0.0.1:${APP_PORT}`, `localhost:${APP_PORT}`];
+      const expectedHosts = [
+        `127.0.0.1:${httpServer.port}`,
+        `localhost:${httpServer.port}`,
+      ];
       if (!expectedHosts.includes(request.headers.get("host") ?? ""))
         throw new HttpError(
           403,
@@ -266,6 +311,11 @@ const server = Bun.serve({
           "forbidden",
           "Cross-site API access is not allowed",
         );
+      if (request.method === "GET" && url.pathname === "/v1/ready")
+        return json({
+          ready: initialized && !closing,
+          instance: desktopNonce,
+        });
       if (request.method === "GET" && url.pathname === "/v1/session") {
         let key = cookie(request, "gh_session");
         let session = requestSession(request);
@@ -286,10 +336,6 @@ const server = Bun.serve({
         response.headers.append(
           "Set-Cookie",
           `gh_session=${key}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`,
-        );
-        response.headers.append(
-          "Set-Cookie",
-          `gh_viewer=${viewerToken}; HttpOnly; SameSite=Strict; Path=/viewer/; Max-Age=28800`,
         );
         return response;
       }
@@ -324,6 +370,101 @@ const server = Bun.serve({
           );
         if (request.method === "GET" && url.pathname === "/v1/state")
           return json(snapshot());
+        if (request.method === "GET" && url.pathname === "/v1/config")
+          return json({ motor_profile: motorProfile });
+        if (request.method === "POST" && url.pathname === "/v1/config") {
+          const input = await body(request, z.object({ motor_profile: motorProfileSchema }).strict());
+          const update = profileUpdate.then(async () => {
+            await game.setMotorProfile(input.motor_profile);
+            try {
+              const temporary = motorSettingsPath + ".tmp";
+              writeFileSync(temporary, JSON.stringify(input), { mode: 0o600 });
+              renameSync(temporary, motorSettingsPath);
+            } catch (error) {
+              await game.setMotorProfile(motorProfile);
+              throw error;
+            }
+            motorProfile = input.motor_profile;
+            onChange();
+          });
+          profileUpdate = update.catch(() => {});
+          await update;
+          return json({ motor_profile: motorProfile });
+        }
+        if (request.method === "POST" && url.pathname === "/v1/program-comparisons") {
+          const input = await body(request, z.object({
+            before: comparisonVersion, after: comparisonVersion,
+            after_sample: z.int().nonnegative().default(0),
+            limit: z.int().min(1).max(100).default(25),
+          }).strict());
+          return json(compareProgramVersionsPage(store, input.before, input.after,
+            { kind: "operator" }, input.after_sample, input.limit));
+        }
+        if (request.method === "GET" && url.pathname === "/v1/performance")
+          return json({
+            backend: performanceMonitor.snapshot(),
+            video: game.snapshot().video,
+            native: game.performanceMetrics(),
+            video_transport: video.snapshot(),
+          });
+        if (request.method === "GET" && url.pathname === "/v1/video") {
+          if (
+            httpServer.upgrade(request, {
+              data: { expires: session.expires, lastSequence: null },
+            })
+          )
+            return;
+          throw new HttpError(
+            426,
+            "upgrade_required",
+            "The game view requires a WebSocket connection",
+          );
+        }
+        if (request.method === "GET" && url.pathname === "/v1/jev")
+          return json(jev.status());
+        if (
+          (request.method === "POST" || request.method === "DELETE") &&
+          url.pathname === "/v1/jev"
+        ) {
+          const current = runtime.snapshot();
+          if (
+            current &&
+            !["created", "stopped", "completed", "failed"].includes(
+              current.status,
+            )
+          )
+            throw new HttpError(
+              409,
+              "busy",
+              "Stop the current run before changing the fast-model connection",
+            );
+          if (request.method === "POST") {
+            const input = await body(
+              request,
+              z.object({ key: z.string().min(1).max(8192) }).strict(),
+            );
+            return json(await jev.setKey(input.key));
+          }
+          await body(request, emptyBody);
+          return json(await jev.removeKey());
+        }
+        if (request.method === "GET" && url.pathname === "/v1/runs")
+          return json({
+            runs: store.runs(50).flatMap((saved) => {
+              const run = runtime.getRun(saved.run_id);
+              return run ? [run] : [];
+            }),
+          });
+        if (request.method === "GET" && url.pathname === "/v1/experience") {
+          const modelId = url.searchParams.get("model_id");
+          if (!modelId || modelId.length > 160)
+            throw new HttpError(
+              400,
+              "invalid_request",
+              "Choose a model before reading its compatible program library",
+            );
+          return json({ experience: runtime.listExperience(modelId) });
+        }
         if (request.method === "GET" && url.pathname === "/v1/events") {
           const encoder = new TextEncoder();
           let dispose = () => {};
@@ -530,6 +671,128 @@ const server = Bun.serve({
           if (!run) throw new HttpError(404, "not_found", "Run not found");
           return json(run);
         }
+        const skillEvidenceMatch =
+          /^\/v1\/runs\/([a-f0-9-]{36})\/skill-evidence$/.exec(url.pathname);
+        if (request.method === "GET" && skillEvidenceMatch?.[1]) {
+          if (!runtime.getRun(skillEvidenceMatch[1]))
+            throw new HttpError(404, "not_found", "Run not found");
+          return json({
+            evidence: runtime.skillEvidence(skillEvidenceMatch[1]),
+          });
+        }
+        const traceMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/trace$/.exec(url.pathname);
+        if (request.method === "GET" && traceMatch?.[1]) {
+          if (!runtime.getRun(traceMatch[1])) throw new HttpError(404, "not_found", "Run not found");
+          const after = Number(url.searchParams.get("after") ?? 0);
+          const limit = Number(url.searchParams.get("limit") ?? 64);
+          const executionId = url.searchParams.get("execution_id") ?? undefined;
+          if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100)
+            throw new HttpError(400, "invalid_request", "Invalid trace cursor or page size");
+          if (executionId && !z.uuid().safeParse(executionId).success)
+            throw new HttpError(400, "invalid_request", "Invalid execution identity");
+          return json(store.tracePage(traceMatch[1], after, limit, executionId));
+        }
+        const improvementMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/improvements$/.exec(url.pathname);
+        if (request.method === "GET" && improvementMatch?.[1]) {
+          if (!runtime.getRun(improvementMatch[1])) throw new HttpError(404, "not_found", "Run not found");
+          const opportunitySeq = Number(url.searchParams.get("after_opportunity") ?? 0);
+          const executionSeq = Number(url.searchParams.get("after_execution") ?? 0);
+          const limit = Number(url.searchParams.get("limit") ?? 32);
+          if (url.searchParams.has("after") ||
+            !Number.isSafeInteger(opportunitySeq) || opportunitySeq < 0 ||
+            !Number.isSafeInteger(executionSeq) || executionSeq < 0 ||
+            !Number.isInteger(limit) || limit < 1 || limit > 100)
+            throw new HttpError(400, "invalid_request", "Invalid feedback cursor or page size");
+          return json(new ImprovementLearning(store).feedback(improvementMatch[1],
+            { opportunity_seq: opportunitySeq, execution_seq: executionSeq }, limit));
+        }
+        const deathsMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/deaths$/.exec(url.pathname);
+        if (request.method === "GET" && deathsMatch?.[1]) {
+          if (!runtime.getRun(deathsMatch[1])) throw new HttpError(404, "not_found", "Run not found");
+          const after = Number(url.searchParams.get("after") ?? 0);
+          const limit = Number(url.searchParams.get("limit") ?? 32);
+          if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100)
+            throw new HttpError(400, "invalid_request", "Invalid death cursor or page size");
+          return json(store.deathEpisodesPage(deathsMatch[1], after, limit));
+        }
+        const planningMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/planning$/.exec(url.pathname);
+        if (request.method === "GET" && planningMatch?.[1])
+          return json({ plan: runtime.planningView(planningMatch[1]) });
+        const eventsMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/events$/.exec(
+          url.pathname,
+        );
+        if (request.method === "GET" && eventsMatch?.[1]) {
+          const runId = eventsMatch[1];
+          if (!runtime.getRun(runId))
+            throw new HttpError(404, "not_found", "Run not found");
+          const after = Number(url.searchParams.get("after") ?? 0);
+          const limit = Number(url.searchParams.get("limit") ?? 50);
+          if (
+            !Number.isSafeInteger(after) ||
+            after < 0 ||
+            !Number.isInteger(limit) ||
+            limit < 1 ||
+            limit > 50
+          )
+            throw new HttpError(
+              400,
+              "invalid_request",
+              "Invalid event cursor or page size",
+            );
+          const candidates = store.eventsAfter(runId, after, limit + 1);
+          const events = [];
+          const omittedDetails: number[] = [];
+          let bytes = 256;
+          let cursor = after;
+          for (const candidate of candidates.slice(0, limit)) {
+            let event = candidate;
+            let size = Buffer.byteLength(JSON.stringify(event), "utf8") + 1;
+            if (bytes + size > 64 * 1024) {
+              if (events.length) break;
+              event = { ...candidate, details: null };
+              size = Buffer.byteLength(JSON.stringify(event), "utf8") + 1;
+              if (bytes + size > 64 * 1024)
+                throw new HttpError(
+                  413,
+                  "record_too_large",
+                  "The retained event summary exceeds the page limit",
+                );
+              omittedDetails.push(candidate.event_seq);
+            }
+            events.push(event);
+            bytes += size;
+            cursor = candidate.event_seq;
+          }
+          return json({
+            events,
+            next_cursor: cursor,
+            has_more: candidates.some((event) => event.event_seq > cursor),
+            omitted_details: omittedDetails,
+          });
+        }
+        const experienceMatch =
+          /^\/v1\/runs\/([a-f0-9-]{36})\/experience$/.exec(url.pathname);
+        if (request.method === "POST" && experienceMatch?.[1]) {
+          const input = await body(
+            request,
+            z
+              .object({
+                execution_id: z.uuid(),
+                name: z.string().trim().min(1).max(100),
+                declaration: promotionDeclarationSchema,
+              })
+              .strict(),
+          );
+          return json(
+            runtime.promoteExperience(
+              experienceMatch[1],
+              input.execution_id,
+              input.name,
+              input.declaration,
+            ),
+            201,
+          );
+        }
         const controlMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/controls$/.exec(
           url.pathname,
         );
@@ -638,6 +901,7 @@ const server = Bun.serve({
     }
   },
 });
+setListeningPort(server.port!);
 
 let shutdown: Promise<void> | null = null;
 async function closeApplication(): Promise<void> {
@@ -645,29 +909,64 @@ async function closeApplication(): Promise<void> {
   closing = true;
   ++operationGeneration;
   shutdown = (async () => {
-    const cleanup = await Promise.allSettled([runtime.close(), auth.close()]);
-    await game.close().catch(() => {});
-    await minecraft.close().catch(() => {});
-    await sandbox.close().catch(() => {});
-    if (gameOperation) await gameOperation;
+    const cleanup = await Promise.allSettled([
+      runtime.close(),
+      auth.close(),
+      jev.close(),
+    ]);
+    for (const close of [
+      () => game.close(),
+      () => minecraft.close(),
+      () => sandbox.close(),
+      async () => {
+        if (gameOperation) await gameOperation;
+      },
+    ]) {
+      try {
+        await close();
+      } catch (reason) {
+        cleanup.push({ status: "rejected", reason });
+      }
+    }
+    if (cleanup.some((result) => result.status === "rejected")) {
+      store.event(
+        null,
+        "application.shutdown_pending",
+        "Shutdown is not confirmed. Admission remains closed; retry closing after resolving the local service failure.",
+      );
+      onChange();
+      throw new Error("Local process cleanup is not confirmed");
+    }
+    offFrames();
+    video.close();
+    performanceMonitor.close();
     server.stop(true);
     sessions.clear();
     controls.clear();
     changes.clear();
     store.close();
-    if (cleanup.some((result) => result.status === "rejected"))
-      console.error(
-        "Some run/auth shutdown work failed; inspect the recorded lifecycle before restarting.",
-      );
   })();
+  void shutdown.catch(() => {
+    shutdown = null;
+  });
   return shutdown;
 }
-process.once("SIGINT", () => {
-  void closeApplication().finally(() => process.exit(0));
-});
-process.once("SIGTERM", () => {
-  void closeApplication().finally(() => process.exit(0));
-});
+function requestApplicationClose(): void {
+  void closeApplication().then(
+    () => process.exit(0),
+    () =>
+      console.error(
+        "GameHarness cleanup is unconfirmed; admission is closed. Resolve the local service failure and retry closing.",
+      ),
+  );
+}
+process.on("SIGINT", requestApplicationClose);
+process.on("SIGTERM", requestApplicationClose);
+if (process.env.GAMEHARNESS_DESKTOP === "1") {
+  process.stdin.once("end", requestApplicationClose);
+  process.stdin.once("error", requestApplicationClose);
+  process.stdin.resume();
+}
 
 console.log(`GameHarness listening at ${APP_ORIGIN}`);
 try {
@@ -689,3 +988,10 @@ try {
   initialized = true;
   onChange();
 }
+if (desktopNonce)
+  console.log(
+    `GAMEHARNESS_READY ${JSON.stringify({
+      nonce: desktopNonce,
+      origin: APP_ORIGIN,
+    })}`,
+  );

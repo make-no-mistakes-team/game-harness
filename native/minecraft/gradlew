@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+BASE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+CACHE="${GAMEHARNESS_GRADLE_HOME:-$BASE/../../local/runtime/native-tools}"
+mkdir -p "$CACHE"
+if [ ! -x "$CACHE/gradle-8.11.1/bin/gradle" ]; then
+  curl --fail --location --proto '=https' --tlsv1.2 https://services.gradle.org/distributions/gradle-8.11.1-bin.zip -o "$CACHE/gradle-8.11.1-bin.zip"
+  curl --fail --location --proto '=https' --tlsv1.2 https://services.gradle.org/distributions/gradle-8.11.1-bin.zip.sha256 -o "$CACHE/gradle-8.11.1-bin.zip.sha256"
+  EXPECTED="$(cat "$CACHE/gradle-8.11.1-bin.zip.sha256")"
+  printf '%s  %s\n' "$EXPECTED" "$CACHE/gradle-8.11.1-bin.zip" | sha256sum --check --status
+  unzip -q "$CACHE/gradle-8.11.1-bin.zip" -d "$CACHE"
+fi
+export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
+exec "$CACHE/gradle-8.11.1/bin/gradle" --no-daemon "$@"

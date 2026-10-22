@@ -1,0 +1,36 @@
+plugins {
+    id 'fabric-loom' version '1.9.2'
+}
+version = '1.0.0'
+group = 'io.gameharness'
+base { archivesName = 'gameharness-native' }
+repositories { mavenCentral() }
+dependencies {
+    minecraft 'com.mojang:minecraft:1.21.4'
+    mappings 'net.fabricmc:yarn:1.21.4+build.8:v2'
+    modImplementation 'net.fabricmc:fabric-loader:0.16.10'
+    modImplementation 'net.fabricmc.fabric-api:fabric-api:0.119.4+1.21.4'
+}
+loom { splitEnvironmentSourceSets(); mods { gameharness { sourceSet sourceSets.main; sourceSet sourceSets.client } } }
+java { toolchain { languageVersion = JavaLanguageVersion.of(21) }; withSourcesJar() }
+tasks.withType(JavaCompile).configureEach { options.release = 21 }
+jar { from('LICENSE') }
+
+// These dependency-free main programs assert behavior directly; they are not JUnit tests.
+tasks.register('nativeBoundaryProof', JavaExec) {
+    group = 'verification'
+    description = 'Runs pure native observation, outcome and lifecycle behavior proofs.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'io.gameharness.nativeclient.BoundaryProof'
+}
+tasks.register('nativeMotorProof', JavaExec) {
+    group = 'verification'
+    description = 'Runs pure camera motion, route gaze and keyboard steering behavior proofs.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'io.gameharness.nativeclient.MotorProof'
+}
+tasks.named('check') {
+    dependsOn tasks.named('nativeBoundaryProof'), tasks.named('nativeMotorProof')
+}

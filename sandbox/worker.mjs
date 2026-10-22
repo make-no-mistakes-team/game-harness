@@ -17,6 +17,8 @@ const stringify = JSON.stringify;
 const byteLength = Buffer.byteLength.bind(Buffer);
 const MAX_INPUT = 256 * 1024;
 const MAX_OUTPUT = 64 * 1024;
+const MAX_SKILL_INPUT = MAX_INPUT + 512 * 1024;
+const MAX_SKILL_OUTPUT = MAX_OUTPUT + 20 * 1024;
 const MAX_STATE = 16 * 1024;
 const MAX_DEPTH = 32;
 
@@ -143,6 +145,232 @@ function runPolicyThread() {
       .catch(() => exit(1));
   });
   post('{"type":"compiled"}');
+}
+
+function runSkillThread() {
+  const post = parentPort.postMessage.bind(parentPort);
+  const exit = process.exit.bind(process);
+  let sequence = 0;
+  let pending = null;
+  const traceScope = workerData.instrumentation.scope;
+  const traceKinds = workerData.instrumentation.kinds;
+  const setPrototype = Object.setPrototypeOf.bind(Object);
+  let traceEvents = setPrototype([], null);
+  let traceCount = 0;
+  let traceBytes = 0;
+  let traceOmitted = 0;
+  const appendTrace = Function.prototype.call.bind(Array.prototype.push);
+  function trace(point, value) {
+    // Returning the exact value preserves &&/||/?? and does not inspect getters,
+    // call coercion hooks, await promises, or otherwise evaluate an operand twice.
+    if (traceCount < 256 && traceBytes < 16384) {
+      const event = {
+        __proto__: null,
+        point_id: point,
+        decision: traceKinds[point] === "logical_nullish"
+          ? value !== null && value !== undefined
+          : !!value,
+      };
+      // A fixed upper bound avoids calling user-installed toJSON/getters during
+      // condition evaluation. Numeric point IDs and booleans fit in 48 bytes.
+      const bytes = 48;
+      if (traceBytes + bytes <= 16384) {
+        appendTrace(traceEvents, event);
+        traceCount++;
+        traceBytes += bytes;
+        return value;
+      }
+    }
+    if (traceOmitted < 9007199254740991) traceOmitted++;
+    return value;
+  }
+  function send(frame) {
+    // Serialize the model payload exactly once, under its original limit.
+    // Diagnostic overhead has a separate bounded transport allowance.
+    const payload = stringify(frame);
+    if (!payload || byteLength(payload) + 1 > MAX_OUTPUT ||
+      !depthIsBounded(parse(payload)))
+      throw new Error("output_limit");
+    const diagnostic = stringify({
+      __proto__: null, scope: traceScope, events: traceEvents, omitted: traceOmitted,
+    });
+    const encoded = payload.slice(0, -1) + ',"trace":' + diagnostic + "}";
+    if (
+      !encoded ||
+      byteLength(encoded) + 1 > MAX_SKILL_OUTPUT ||
+      !depthIsBounded(parse(encoded))
+    )
+      throw new Error("output_limit");
+    post(encoded);
+    traceEvents = setPrototype([], null);
+    traceOmitted = 0;
+  }
+  function call(request) {
+    if (pending)
+      return Promise.reject(
+        new Error("Concurrent capabilities are forbidden."),
+      );
+    const completion = Promise.withResolvers();
+    const id = sequence + 1;
+    pending = { id, ...completion };
+    try {
+      send({ v: 1, type: "skill_call", id, request });
+      sequence = id;
+    } catch {
+      pending = null;
+      completion.reject(new Error("Capability exceeds its JSON limits."));
+    }
+    return completion.promise;
+  }
+  const game = Object.freeze({
+    observe: () => call({ kind: "observe" }),
+    action: (action) => call({ kind: "action", action }),
+    respawn: () => call({ kind: "respawn" }),
+    recipes: (item) => call({ kind: "recipes", item }),
+    call: (skill, args) => call({ kind: "call", skill, args }),
+    progress: (summary, details) =>
+      call({ kind: "progress", summary, details }),
+  });
+  parentPort.on("message", (frame) => {
+    if (!pending || frame.id !== pending.id || frame.type !== "skill_reply")
+      return exit(1);
+    const completion = pending;
+    pending = null;
+    if (frame.ok) completion.resolve(frame.value);
+    else completion.reject(new Error("Skill capability failed."));
+  });
+  Promise.resolve()
+    .then(async () => {
+      const AsyncFunction = Object.getPrototypeOf(
+        async function () {},
+      ).constructor;
+      const execute = new AsyncFunction(
+        "game",
+        "args",
+        workerData.instrumentation.hook_name,
+        '"use strict";\n' + workerData.source,
+      );
+      const result = await execute(game, workerData.args, trace);
+      if (pending) throw new Error("Unawaited capability.");
+      send({ v: 1, type: "skill_result", id: sequence, result });
+    })
+    .catch(async () => {
+      try {
+        // A capability already sent remains single-flight and must settle
+        // before a controlled failure can close this execution's trace.
+        if (pending) await pending.promise.catch(() => {});
+        send({ v: 1, type: "skill_failure", id: sequence });
+      } catch {
+        // No invented omitted count: the host marks an unknown unsent tail.
+        exit(1);
+      }
+    });
+}
+
+function runSkillSupervisor() {
+  const output = process.stdout.write.bind(process.stdout);
+  const exit = process.exit.bind(process);
+  let thread = null;
+  let closing = false;
+  let input = Buffer.alloc(0);
+  let pending = 0;
+  let sequence = 0;
+  let logs = 0;
+  const fail = () => {
+    if (closing) return;
+    closing = true;
+    // Local responsiveness is not authority: the host guardian still owns the
+    // cgroup freeze, all deadlines, EOF, and confirmed removal.
+    exit(1);
+  };
+  function send(frame) {
+    const encoded = stringify(frame) + "\n";
+    if (byteLength(encoded) > MAX_SKILL_OUTPUT) throw new Error("output_limit");
+    output(encoded);
+  }
+  function receive(frame) {
+    if (frame?.v !== 1 || !depthIsBounded(frame)) throw new Error("protocol");
+    if (!thread && frame.type === "skill_init" && frame.id === 0) {
+      if (typeof frame.source !== "string" || byteLength(frame.source) > MAX_SKILL_INPUT ||
+        !frame.instrumentation ||
+        !/^__trace_[a-f0-9]{32}$/.test(frame.instrumentation.hook_name) ||
+        typeof frame.instrumentation.scope !== "string" ||
+        !Array.isArray(frame.instrumentation.kinds))
+        throw new Error("source");
+      thread = new Worker(new URL(import.meta.url), {
+        workerData: { mode: "skill", source: frame.source, args: frame.args,
+          instrumentation: frame.instrumentation },
+        stdout: true,
+        stderr: true,
+        resourceLimits: { maxOldGenerationSizeMb: 48, stackSizeMb: 2 },
+      });
+      const consume = (chunk) => {
+        logs += chunk.length;
+        if (logs > MAX_OUTPUT) fail();
+      };
+      thread.stdout.on("data", consume);
+      thread.stderr.on("data", consume);
+      thread.on("error", fail);
+      thread.on("exit", fail);
+      thread.on("message", (encoded) => {
+        try {
+          if (
+            closing ||
+            pending ||
+            typeof encoded !== "string" ||
+            byteLength(encoded) + 1 > MAX_SKILL_OUTPUT
+          )
+            throw new Error("protocol");
+          const reply = parse(encoded);
+          if (reply?.v !== 1 || !depthIsBounded(reply))
+            throw new Error("protocol");
+          if (reply.type === "skill_call" && reply.id === sequence + 1) {
+            sequence = reply.id;
+            pending = reply.id;
+          } else if (
+            !["skill_result", "skill_failure"].includes(reply.type) ||
+            reply.id !== sequence
+          ) {
+            throw new Error("protocol");
+          }
+          send(reply);
+        } catch {
+          fail();
+        }
+      });
+      return;
+    }
+    if (
+      !thread ||
+      !pending ||
+      frame.type !== "skill_reply" ||
+      frame.id !== pending ||
+      typeof frame.ok !== "boolean"
+    )
+      throw new Error("protocol");
+    pending = 0;
+    thread.postMessage(frame);
+  }
+  process.stdin.on("data", (chunk) => {
+    if (closing) return;
+    if (input.length + chunk.length > MAX_SKILL_INPUT) return fail();
+    input = Buffer.concat([input, chunk]);
+    const end = input.indexOf(10);
+    if (end === -1) return;
+    if (end !== input.length - 1) return fail();
+    const line = input.subarray(0, end).toString("utf8");
+    input = Buffer.alloc(0);
+    try {
+      receive(parse(line));
+    } catch {
+      fail();
+    }
+  });
+  process.stdin.on("end", fail);
+  process.stdin.on("error", fail);
+  process.on("uncaughtException", fail);
+  process.on("unhandledRejection", fail);
+  send({ v: 1, type: "ready", id: 0 });
 }
 
 function runSupervisor() {
@@ -298,5 +526,8 @@ function runSupervisor() {
   send({ type: "ready" });
 }
 
-if (isMainThread) runSupervisor();
+if (isMainThread) {
+  if (process.argv[2] === "skill") runSkillSupervisor();
+  else runSupervisor();
+} else if (workerData.mode === "skill") runSkillThread();
 else runPolicyThread();

@@ -12,12 +12,22 @@ const ENV = {
 const INPUT_BYTES = 256 * 1024;
 const OUTPUT_BYTES = 64 * 1024;
 const STARTUP_MS = 15_000;
-const [name, runner, image] = process.argv.slice(2);
+const [name, runner, image, mode = "policy", lifetimeText] =
+  process.argv.slice(2);
+const skill = mode === "skill";
+// Only transport overhead changes; the backend/worker enforce original model
+// payload limits independently of private instrumentation and diagnostics.
+const inputLimit = skill ? INPUT_BYTES + 512 * 1024 : INPUT_BYTES;
+const outputLimit = skill ? OUTPUT_BYTES + 20 * 1024 : OUTPUT_BYTES;
+const lifetime = Number(lifetimeText);
 if (
   !/^gameharness-policy-[a-f0-9-]{73}$/.test(name ?? "") ||
   !runner?.startsWith("/") ||
   runner.includes(",") ||
-  !/^node:24-bookworm-slim@sha256:[a-f0-9]{64}$/.test(image ?? "")
+  !/^node:24-bookworm-slim@sha256:[a-f0-9]{64}$/.test(image ?? "") ||
+  !["policy", "skill"].includes(mode) ||
+  (skill &&
+    (!Number.isSafeInteger(lifetime) || lifetime < 1 || lifetime > 600000))
 )
   process.exit(1);
 
@@ -31,6 +41,10 @@ let output = Buffer.alloc(0);
 let outputBytes = 0;
 let timer = setTimeout(stop, STARTUP_MS);
 let creation = Promise.resolve();
+let skillPhase = "ready";
+let skillSequence = 0;
+// Neither container output nor a pending host call can extend this deadline.
+const lifetimeTimer = skill ? setTimeout(stop, lifetime) : null;
 
 function boundedJson(text) {
   let depth = 0;
@@ -121,6 +135,7 @@ function stop() {
   if (cleanup) return cleanup;
   closing = true;
   clearTimeout(timer);
+  clearTimeout(lifetimeTimer);
   process.stdin.pause();
   cleanup = (async () => {
     await creation.catch(() => {});
@@ -151,7 +166,11 @@ process.on("uncaughtException", stop);
 process.on("unhandledRejection", stop);
 process.stdin.on("data", (chunk) => {
   if (closing) return;
-  if (expected || !attached || input.length + chunk.length > INPUT_BYTES)
+  if (
+    (!skill && expected) ||
+    !attached ||
+    input.length + chunk.length > inputLimit
+  )
     return void stop();
   input = Buffer.concat([input, chunk]);
   const end = input.indexOf(10);
@@ -159,6 +178,39 @@ process.stdin.on("data", (chunk) => {
   if (end !== input.length - 1) return void stop();
   try {
     const request = boundedJson(input.subarray(0, end).toString("utf8"));
+    if (skill) {
+      const line = input;
+      input = Buffer.alloc(0);
+      if (request?.v !== 1) throw new Error("protocol");
+      if (
+        skillPhase === "init" &&
+        request.type === "skill_init" &&
+        request.id === 0
+      ) {
+        skillPhase = "running";
+        outputBytes = 0;
+        timer = setTimeout(stop, 500);
+        attached.stdin.write(line);
+      } else if (
+        skillPhase === "waiting" &&
+        request.type === "skill_reply" &&
+        request.id === skillSequence &&
+        typeof request.ok === "boolean"
+      ) {
+        skillPhase = "resuming";
+        outputBytes = 0;
+        // Start the runnable deadline BEFORE unpausing. Only this trusted host
+        // input path can resume the cgroup; no in-container message can do so.
+        timer = setTimeout(stop, 500);
+        attached.stdin.write(line);
+        void command(["unpause", name]).then((resumed) => {
+          if (closing) return;
+          if (resumed.code !== 0) return void stop();
+          if (skillPhase === "resuming") skillPhase = "running";
+        });
+      } else throw new Error("protocol");
+      return;
+    }
     if (request?.type === "init") expected = "compiled";
     else if (request?.type === "probe") expected = "proof";
     else if (request?.type === "evaluate") expected = "decision";
@@ -228,6 +280,7 @@ async function start() {
       "--disable-proto=throw",
       "--disable-sigusr1",
       "/runner.mjs",
+      mode,
     ],
     null,
   );
@@ -247,18 +300,60 @@ async function start() {
   attached.stdin.on("error", stop);
   attached.stderr.on("data", (chunk) => {
     outputBytes += chunk.length;
-    if (outputBytes > OUTPUT_BYTES) void stop();
+    if (outputBytes > outputLimit) void stop();
   });
   attached.stdout.on("data", (chunk) => {
     if (closing) return;
     outputBytes += chunk.length;
-    if (!expected || outputBytes > OUTPUT_BYTES) return void stop();
+    if ((!skill && !expected) || outputBytes > outputLimit) return void stop();
     output = Buffer.concat([output, chunk]);
     const end = output.indexOf(10);
     if (end === -1) return;
     if (end !== output.length - 1) return void stop();
     try {
       const reply = boundedJson(output.subarray(0, end).toString("utf8"));
+      if (skill) {
+        const line = output;
+        output = Buffer.alloc(0);
+        if (reply?.v !== 1) throw new Error("protocol");
+        if (
+          skillPhase === "ready" &&
+          reply.type === "ready" &&
+          reply.id === 0
+        ) {
+          clearTimeout(timer);
+          skillPhase = "init";
+          process.stdout.write(line);
+        } else if (
+          (skillPhase === "running" || skillPhase === "resuming") &&
+          reply.type === "skill_call" &&
+          Number.isSafeInteger(reply.id) &&
+          reply.id === skillSequence + 1 &&
+          reply.id <= 2048
+        ) {
+          skillSequence = reply.id;
+          skillPhase = "pausing";
+          // Keep the runnable timer armed until Docker confirms the ENTIRE
+          // container is frozen, including compromised supervisors/descendants.
+          void command(["pause", name]).then((paused) => {
+            if (closing) return;
+            if (paused.code !== 0 || skillPhase !== "pausing")
+              return void stop();
+            clearTimeout(timer);
+            skillPhase = "waiting";
+            process.stdout.write(line);
+          });
+        } else if (
+          (skillPhase === "running" || skillPhase === "resuming") &&
+          (reply.type === "skill_result" || reply.type === "skill_failure") &&
+          reply.id === skillSequence
+        ) {
+          clearTimeout(timer);
+          skillPhase = "done";
+          process.stdout.write(line);
+        } else throw new Error("protocol");
+        return;
+      }
       if (reply?.type !== expected) throw new Error("protocol");
       clearTimeout(timer);
       expected = null;

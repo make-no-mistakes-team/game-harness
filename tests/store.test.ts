@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -21,6 +22,8 @@ function fixture() {
   const run: StoredRun = {
     run_id: crypto.randomUUID(),
     world_id: crypto.randomUUID(),
+    session_id: crypto.randomUUID(),
+    life_id: 1,
     epoch: 1,
     task: "Observe the ordinary world",
     goal: "custom",
@@ -31,7 +34,62 @@ function fixture() {
     turns: 0,
     model_status: "idle",
     error: null,
-    usage: { input_tokens: 0, output_tokens: 0, known_cost: null },
+    usage: {
+      uncached_input: 0,
+      cache_read: 0,
+      cache_write: 0,
+      output: 0,
+      calls: 0,
+      known_cost: null,
+      legacy_input: null,
+      by_purpose: {
+        authoring: {
+          uncached_input: 0,
+          cache_read: 0,
+          cache_write: 0,
+          output: 0,
+          calls: 0,
+          known_cost: null,
+          legacy_input: null,
+        },
+        planning: {
+          uncached_input: 0,
+          cache_read: 0,
+          cache_write: 0,
+          output: 0,
+          calls: 0,
+          known_cost: null,
+          legacy_input: null,
+        },
+        replanning: {
+          uncached_input: 0,
+          cache_read: 0,
+          cache_write: 0,
+          output: 0,
+          calls: 0,
+          known_cost: null,
+          legacy_input: null,
+        },
+        improvement: {
+          uncached_input: 0,
+          cache_read: 0,
+          cache_write: 0,
+          output: 0,
+          calls: 0,
+          known_cost: null,
+          legacy_input: null,
+        },
+        other: {
+          uncached_input: 0,
+          cache_read: 0,
+          cache_write: 0,
+          output: 0,
+          calls: 0,
+          known_cost: null,
+          legacy_input: null,
+        },
+      },
+    },
     baseline: {},
   };
   store.saveRun(run);
@@ -43,6 +101,56 @@ const move: GameAction = {
   duration_ms: 200,
   controls: { forward: true },
 };
+
+test("connection epochs advance durably before any run exists and across restarts", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "gameharness-epochs-"));
+  directories.push(directory);
+  const store = new Store(directory);
+  stores.push(store);
+  expect(store.nextGameEpoch()).toBe(1);
+  expect(store.nextGameEpoch()).toBe(2);
+  expect(store.lastRun()).toBeNull();
+  store.close();
+  stores.splice(stores.indexOf(store), 1);
+  const reopened = new Store(directory);
+  stores.push(reopened);
+  expect(reopened.nextGameEpoch()).toBe(3);
+  const secondConnection = new Store(directory);
+  stores.push(secondConnection);
+  expect(secondConnection.nextGameEpoch()).toBe(4);
+  expect(reopened.nextGameEpoch()).toBe(5);
+  expect(reopened.lastRun()).toBeNull();
+});
+
+test("legacy connection epochs start above the largest retained run epoch", () => {
+  const { directory, store, run } = fixture();
+  store.saveRun({
+    ...run,
+    run_id: "older-high-epoch",
+    epoch: 73,
+    started_at: "2020-01-01T00:00:00.000Z",
+  });
+  store.saveRun({
+    ...run,
+    run_id: "newer-low-epoch",
+    epoch: 12,
+    started_at: "2030-01-01T00:00:00.000Z",
+  });
+  store.close();
+  stores.splice(stores.indexOf(store), 1);
+  const legacy = new Database(path.join(directory, "runs.sqlite"));
+  legacy.exec("DROP TABLE store_metadata; PRAGMA user_version=2;");
+  legacy.close();
+  const reopened = new Store(directory);
+  stores.push(reopened);
+  expect(reopened.nextGameEpoch()).toBe(74);
+  expect(reopened.getRun("older-high-epoch")?.epoch).toBe(73);
+  reopened.close();
+  stores.splice(stores.indexOf(reopened), 1);
+  const restored = new Store(directory);
+  stores.push(restored);
+  expect(restored.nextGameEpoch()).toBe(75);
+});
 
 describe("durable action admission", () => {
   test("lost acknowledgement preserves one action and rejects conflicting retry content", () => {
@@ -117,11 +225,34 @@ test("forward cursor drains old evidence before newer records across page bounda
   expect(store.lastEventSeq()).toBe(expected[expected.length - 1]!);
 });
 
+test("recent run history is newest first while older runs remain retrievable", () => {
+  const { store, run } = fixture();
+  for (let index = 0; index < 55; index++) {
+    store.saveRun({
+      ...run,
+      run_id: `history-${index}`,
+      started_at: new Date(Date.UTC(2030, 0, 1, 0, index)).toISOString(),
+    });
+  }
+  const recent = store.runs();
+  expect(recent).toHaveLength(50);
+  expect(recent[0]?.run_id).toBe("history-54");
+  expect(recent[49]?.run_id).toBe("history-5");
+  expect(store.runs(2).map((value) => value.run_id)).toEqual([
+    "history-54",
+    "history-53",
+  ]);
+  expect(store.getRun("history-0")?.run_id).toBe("history-0");
+  expect(store.getRun(run.run_id)).toEqual(run);
+});
+
 test("stored artifact tampering is rejected before source can be reused", () => {
   const { store, run, directory } = fixture();
   const spec: PolicySpec = {
     name: "fixture",
     source: 'return {kind:"continue"};',
+    backend: "javascript",
+    choices: null,
     priority: 0,
     interval_ms: 200,
     card: {

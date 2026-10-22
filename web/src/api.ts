@@ -4,10 +4,37 @@ import type {
   AppSnapshot,
   AuthState,
   Json,
+  ProgramEvidenceView,
   RunView,
 } from "../../src/shared/contracts.ts";
+import type {
+  ExperienceView,
+  PromotionDeclaration,
+} from "../../src/server/experience.ts";
+import type {
+  ImprovementFeedbackCursor,
+  ProgramVersionEvidence,
+  TracePage,
+  VersionComparison,
+} from "../../src/shared/execution-evidence.ts";
+import type { PlanProjection } from "../../src/shared/planning.ts";
 
 const nullableText = z.string().nullable();
+const lineage = {
+  session_id: nullableText,
+  life_id: z.number().int().nonnegative().nullable(),
+};
+const motorProfile = z.enum(["precise", "balanced", "fast"]);
+const life = z.object({
+  life_id: z.number().int().nonnegative(),
+  status: z.enum(["loading", "alive", "dead", "respawning"]),
+  can_respawn: z.boolean(),
+  death: z.object({
+    death_id: z.string(),
+    at: z.string(),
+    message: nullableText,
+  }).nullable(),
+});
 const vec = z.object({ x: z.number(), y: z.number(), z: z.number() });
 const inventory = z.object({
   name: z.string(),
@@ -87,12 +114,140 @@ const auth: z.ZodType<AuthState> = z.object({
     .nullable(),
   error: nullableText,
 });
+const skillRef = z.object({ skill_id: z.string(), version: z.number().int() });
+const limits = z.object({
+  duration_ms: z.number(),
+  max_actions: z.number(),
+  max_calls: z.number(),
+  max_depth: z.number(),
+});
+const skill = skillRef.extend({
+  name: z.string(),
+  source: z.string(),
+  hash: z.string(),
+  card,
+  dependencies: z.array(skillRef),
+  parent_version: z.number().nullable(),
+  state: z.enum(["validated", "quarantined", "retired"]),
+  validation: z.object({
+    fingerprint: z.string(),
+    formatted_lines: z.number(),
+    complexity: z.number(),
+    nesting: z.number(),
+  }),
+  created_at: z.string(),
+});
+const execution = skillRef.extend({
+  ...lineage,
+  execution_id: z.string(),
+  run_id: z.string(),
+  start_key: z.string(),
+  parent_execution_id: nullableText,
+  root_execution_id: z.string(),
+  epoch: z.number(),
+  args: json,
+  limits,
+  status: z.enum([
+    "accepted",
+    "running",
+    "cancel_requested",
+    "succeeded",
+    "blocked",
+    "failed",
+    "cancelled",
+    "unknown",
+  ]),
+  started_at: nullableText,
+  ended_at: nullableText,
+  deadline_at: z.string(),
+  actions: z.number(),
+  calls: z.number(),
+  result: z
+    .object({
+      status: z.enum(["completed", "blocked", "failed"]),
+      summary: z.string(),
+      result: json,
+    })
+    .nullable(),
+  error: nullableText,
+});
+const tokenUsage = z.object({
+  uncached_input: z.number().nullable(),
+  cache_read: z.number().nullable(),
+  cache_write: z.number().nullable(),
+  output: z.number(),
+  calls: z.number().nullable(),
+  known_cost: z.number().nullable(),
+  legacy_input: z.number().nullable(),
+});
+const actionInput = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("move"),
+    controls: z.partialRecord(
+      z.enum(["forward", "back", "left", "right", "jump", "sprint", "sneak"]),
+      z.boolean(),
+    ),
+    duration_ms: z.number(),
+    look: z.object({ yaw: z.number(), pitch: z.number() }).optional(),
+    interaction: z
+      .object({
+        kind: z.enum(["attack", "use"]),
+        target_id: z.string().optional(),
+      })
+      .optional(),
+  }),
+  z.object({ kind: z.literal("look"), yaw: z.number(), pitch: z.number() }),
+  z.object({ kind: z.literal("dig"), target_id: z.string() }),
+  z.object({
+    kind: z.literal("place"),
+    target_id: z.string(),
+    face: z.enum(["up", "down", "north", "south", "east", "west"]),
+    item: z.string(),
+  }),
+  z.object({
+    kind: z.literal("craft"),
+    item: z.string(),
+    executions: z.number(),
+    table_id: z.string().optional(),
+  }),
+  z.object({
+    kind: z.literal("equip"),
+    item: z.string(),
+    destination: z.enum(["hand", "off-hand", "head", "torso", "legs", "feet"]),
+  }),
+  z.object({ kind: z.literal("interact"), target_id: z.string() }),
+  z.object({ kind: z.literal("attack"), target_id: z.string() }),
+  z.object({
+    kind: z.literal("navigate"),
+    target_id: z.string(),
+    range: z.number(),
+    duration_ms: z.number(),
+    gaze: z.discriminatedUnion("kind", [
+      z.object({ kind: z.literal("navigation") }),
+      z.object({ kind: z.literal("target"), target_id: z.string() }),
+      z.object({ kind: z.literal("free"), yaw: z.number(), pitch: z.number() }),
+    ]).optional(),
+  }),
+  z.object({ kind: z.literal("respawn") }),
+]);
+const decision = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("continue"), reason: z.string().optional() }),
+  z.object({ kind: z.literal("replan"), reason: z.string() }),
+  z.object({ kind: z.literal("interrupt"), reason: z.string() }),
+  z.object({
+    kind: z.literal("replace"),
+    action: actionInput,
+    reason: z.string(),
+  }),
+]);
 const run: z.ZodType<RunView> = z.object({
+  ...lineage,
   run_id: z.string(),
   world_id: z.string(),
   epoch: z.number(),
   task: z.string(),
   goal: z.enum([
+    "break_log",
     "collect_wood",
     "craft_crafting_table",
     "craft_stone_pickaxe",
@@ -103,6 +258,7 @@ const run: z.ZodType<RunView> = z.object({
     "created",
     "bootstrapping",
     "running",
+    "reviewing",
     "pausing",
     "paused",
     "stopping",
@@ -116,6 +272,7 @@ const run: z.ZodType<RunView> = z.object({
   model_status: z.enum(["idle", "thinking", "waiting", "error"]),
   action: z
     .object({
+      ...lineage,
       action_id: z.string(),
       kind: z.enum([
         "move",
@@ -127,6 +284,7 @@ const run: z.ZodType<RunView> = z.object({
         "interact",
         "attack",
         "navigate",
+        "respawn",
       ]),
       status: z.enum([
         "accepted",
@@ -137,7 +295,8 @@ const run: z.ZodType<RunView> = z.object({
         "cancelled",
         "unknown",
       ]),
-      origin: z.enum(["strategist", "policy"]),
+      origin: z.enum(["strategist", "policy", "skill"]),
+      execution_id: nullableText,
       summary: z.string(),
       started_at: nullableText,
       ended_at: nullableText,
@@ -153,6 +312,8 @@ const run: z.ZodType<RunView> = z.object({
     .nullable(),
   policies: z.array(
     z.object({
+      backend: z.enum(["javascript", "jev"]),
+      choices: z.array(z.object({ id: z.string(), decision })).nullable(),
       policy_id: z.string(),
       version: z.number(),
       name: z.string(),
@@ -174,11 +335,17 @@ const run: z.ZodType<RunView> = z.object({
       last_error: nullableText,
     }),
   ),
+  skills: z.array(skill),
+  executions: z.array(execution),
   error: nullableText,
-  usage: z.object({
-    input_tokens: z.number(),
-    output_tokens: z.number(),
-    known_cost: z.number().nullable(),
+  usage: tokenUsage.extend({
+    by_purpose: z.object({
+      authoring: tokenUsage,
+      planning: tokenUsage,
+      replanning: tokenUsage,
+      improvement: tokenUsage,
+      other: tokenUsage,
+    }),
   }),
 });
 const snapshot: z.ZodType<AppSnapshot> = z.object({
@@ -206,8 +373,18 @@ const snapshot: z.ZodType<AppSnapshot> = z.object({
     version: z.string(),
     world_id: nullableText,
     epoch: z.number(),
-    viewer_ready: z.boolean(),
-    viewer_url: nullableText,
+    session_id: nullableText,
+    life: life.nullable(),
+    motor_profile: motorProfile,
+    video: z.object({
+      status: z.enum(["idle", "starting", "streaming", "stale", "error"]),
+      width: z.number(),
+      height: z.number(),
+      fps: z.number().nullable(),
+      frames: z.number(),
+      last_frame_at: nullableText,
+      error: nullableText,
+    }),
     last_observation_at: nullableText,
     player: player.nullable(),
     error: nullableText,
@@ -221,6 +398,7 @@ const snapshot: z.ZodType<AppSnapshot> = z.object({
   goals: z.array(
     z.object({
       id: z.enum([
+        "break_log",
         "collect_wood",
         "craft_crafting_table",
         "craft_stone_pickaxe",
@@ -245,7 +423,12 @@ export class ApiError extends Error {
 
 let csrfToken: string | null = null;
 
-async function request(path: string, body?: unknown): Promise<unknown> {
+async function request(
+  path: string,
+  body?: unknown,
+  method?: "POST" | "DELETE",
+  signal?: AbortSignal,
+): Promise<unknown> {
   const controller = new AbortController();
   const deadline = window.setTimeout(() => controller.abort(), 90_000);
   try {
@@ -256,9 +439,11 @@ async function request(path: string, body?: unknown): Promise<unknown> {
         "session_missing",
       );
     const response = await fetch(path, {
-      method: body === undefined ? "GET" : "POST",
+      method: body === undefined ? "GET" : (method ?? "POST"),
       credentials: "same-origin",
-      signal: controller.signal,
+      signal: signal
+        ? AbortSignal.any([controller.signal, signal])
+        : controller.signal,
       headers:
         body === undefined
           ? { Accept: "application/json" }
@@ -338,6 +523,8 @@ export async function createRun(body: {
   task: string;
   goal: string;
   model_id: string;
+  experience_id?: string;
+  working_programs: "continue" | "fresh";
 }): Promise<RunView> {
   const parsed = run.safeParse(await request("/v1/runs", body));
   if (!parsed.success)
@@ -347,4 +534,340 @@ export async function createRun(body: {
       "invalid_run",
     );
   return parsed.data;
+}
+
+export async function fetchHistory(): Promise<RunView[]> {
+  return z.object({ runs: z.array(run) }).parse(await request("/v1/runs")).runs;
+}
+
+export async function fetchJev() {
+  return z
+    .object({
+      configured: z.boolean(),
+      state: z.enum(["unavailable", "configured", "closed"]),
+      selection: z.object({
+        model_id: z.string(), request_timeout_ms: z.number(),
+      }).nullable(),
+      models: z.array(z.object({ id: z.string(), name: z.string() })),
+      active_requests: z.number(),
+      limits: z.object({
+        max_concurrent: z.number(), requests_per_minute: z.number(),
+        max_request_ms: z.number(), reactive_request_ms: z.number(), max_attempts: z.number(),
+      }),
+    })
+    .parse(await request("/v1/jev"));
+}
+
+export async function setJevKey(key: string): Promise<void> {
+  await request("/v1/jev", { key });
+}
+
+export async function removeJevKey(): Promise<void> {
+  await request("/v1/jev", {}, "DELETE");
+}
+
+const predicate = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("goal_verified"), event_seq: z.number().int() }),
+  z.object({
+    kind: z.literal("inventory_gain"),
+    item: z.string(),
+    min_gain: z.number(),
+    event_seq: z.number().int(),
+  }),
+]);
+const experienceSchema: z.ZodType<ExperienceView> = z.object({
+  experience_id: z.string(),
+  name: z.string(),
+  model_id: z.string(),
+  profile_id: z.literal("player-observable-structured"),
+  preset_id: z.literal("minecraft-observable-initial-r2"),
+  source_run_id: z.string(),
+  source_world_id: z.string(),
+  portability: z.enum(["portable", "world_local"]),
+  retained_world_data: z.boolean(),
+  root: skillRef,
+  created_at: z.string(),
+  evidence: z.object({
+    execution_id: z.string(),
+    action_ids: z.array(z.string()),
+    predicate,
+  }),
+  compatibility: z.object({
+    adapter_id: z.literal("fabric-owned-client"),
+    game_version: z.literal("1.21.4"),
+    observation_schema: z.literal(2),
+    profile_id: z.literal("player-observable-structured"),
+    preset_id: z.literal("minecraft-observable-initial-r2"),
+    skill_protocol: z.literal(2),
+  }),
+});
+
+export async function fetchExperience(
+  modelId: string,
+): Promise<ExperienceView[]> {
+  return z
+    .object({ experience: z.array(experienceSchema) })
+    .parse(
+      await request(`/v1/experience?model_id=${encodeURIComponent(modelId)}`),
+    ).experience;
+}
+
+export async function fetchRunEvents(
+  runId: string,
+  after: number,
+): Promise<{
+  events: ActivityEvent[];
+  next_cursor: number;
+  has_more: boolean;
+  omitted_details: number[];
+}> {
+  return z
+    .object({
+      events: z.array(eventSchema),
+      next_cursor: z.number().int(),
+      has_more: z.boolean(),
+      omitted_details: z.array(z.number().int()),
+    })
+    .parse(
+      await request(
+        `/v1/runs/${encodeURIComponent(runId)}/events?after=${after}&limit=50`,
+      ),
+    );
+}
+
+export async function promoteExperience(
+  runId: string,
+  executionId: string,
+  name: string,
+  declaration: PromotionDeclaration,
+): Promise<ExperienceView> {
+  return experienceSchema.parse(
+    await request(`/v1/runs/${encodeURIComponent(runId)}/experience`, {
+      execution_id: executionId,
+      name,
+      declaration,
+    }),
+  );
+}
+
+export async function fetchSkillEvidence(
+  runId: string,
+): Promise<ProgramEvidenceView[]> {
+  const item: z.ZodType<ProgramEvidenceView> = z.object({
+    execution_id: z.string(),
+    skill_id: z.string(),
+    version: z.number(),
+    root_execution_id: z.string(),
+    status: execution.shape.status,
+    duration_ms: z.number().nullable(),
+    actions: z.number(),
+    calls: z.number(),
+    strategic_requests: z.number(),
+    confirmed_effects: z.number(),
+    evidence_status: z.enum([
+      "verified_goal",
+      "verified_predicate",
+      "confirmed_effects",
+      "self_reported",
+      "unknown",
+    ]),
+    verified_event_seqs: z.array(z.number().int()),
+    compactness: skill.shape.validation,
+  });
+  return z
+    .object({ evidence: z.array(item) })
+    .parse(
+      await request(`/v1/runs/${encodeURIComponent(runId)}/skill-evidence`),
+    ).evidence;
+}
+
+const timingSummary = z.object({
+  count: z.number().int().nonnegative(),
+  p50: z.number().nullable(),
+  p95: z.number().nullable(),
+  p99: z.number().nullable(),
+  max: z.number().nullable(),
+});
+const performanceSchema = z.object({
+  backend: z.object({
+    sample_window_ms: z.number().nonnegative().nullable(),
+    percentile_window_samples: z.number().int().positive(),
+    cpu_percent_of_one_core: z.number().nullable(),
+    rss_bytes: z.number().nonnegative(),
+    event_loop_lag_ms: timingSummary,
+    timings: z.object({
+      observation_read_ms: timingSummary,
+      action_round_trip_ms: timingSummary,
+      video_forward_ms: timingSummary,
+    }),
+  }),
+  video: z.object({
+    status: z.enum(["idle", "starting", "streaming", "stale", "error"]),
+    width: z.number(),
+    height: z.number(),
+    fps: z.number().nullable(),
+    frames: z.number(),
+    last_frame_at: nullableText,
+    error: nullableText,
+  }),
+  video_transport: z.object({
+    published_frames: z.number().int().nonnegative(),
+    send_attempts: z.number().int().nonnegative(),
+    queued_sends: z.number().int().nonnegative(),
+    rejected_sends: z.number().int().nonnegative(),
+    backpressure_skips: z.number().int().nonnegative(),
+    drain_events: z.number().int().nonnegative(),
+    clients: z.array(
+      z.object({
+        ready_state: z.number().int(),
+        buffered_bytes: z.number().nonnegative(),
+        last_sequence: z.number().int().nullable(),
+      }),
+    ),
+  }),
+  native: json,
+});
+
+export type PerformanceSnapshot = z.infer<typeof performanceSchema>;
+
+export async function fetchPerformance(
+  signal: AbortSignal,
+): Promise<PerformanceSnapshot> {
+  return performanceSchema.parse(
+    await request("/v1/performance", undefined, undefined, signal),
+  );
+}
+
+const versionEvidence = skillRef.extend({ run_id: z.string(), hash: z.string() });
+const pauseCategory = z.enum(["native_action", "dispatch", "receipt", "readiness", "sandbox", "capability_wait", "strategic_request", "scheduler_handoff", "life_recovery"]);
+const objectiveMetrics = z.object({
+  execution_id: z.string(), root_execution_id: z.string(), outcome: z.string(),
+  confirmed_block_removals: z.number(), removed_blocks: z.record(z.string(), z.number()),
+  inventory_delta: z.record(z.string(), z.number()), inventory_receipts: z.number(),
+  target_switches: z.number(), target_position_switches: z.number(),
+  sampled_travel_distance: z.number(), sampled_rotation_degrees: z.number(),
+  receipted_travel_distance: z.number(), receipted_rotation_degrees: z.number(),
+  motion_receipts: z.number(),
+  observation_samples: z.number(),
+  spans_ms: z.partialRecord(pauseCategory, z.number()),
+  span_samples: z.partialRecord(pauseCategory, z.number()),
+  evidence_event_seqs: z.array(z.number()), trace_complete: z.boolean(),
+  limitations: z.array(z.string()),
+});
+const traceRecord = z.object({
+  ...lineage,
+  run_id: z.string(), execution_id: nullableText, root_execution_id: nullableText,
+  parent_execution_id: nullableText, skill_id: nullableText, version: z.number().nullable(),
+  hash: nullableText, call_id: nullableText.optional(), action_id: nullableText.optional(),
+  observation_seq: z.number().nullable().optional(), capability: nullableText.optional(),
+  event_seq: z.number().nullable().optional(),
+  kind: z.enum(["capability_request", "capability_result", "observation", "branch", "intent", "span", "omission"]),
+  payload: json, trace_seq: z.number(), at: z.string(),
+  omission: z.object({ reason: z.literal("record_byte_budget"), original_bytes: z.number() }).nullable(),
+});
+const tracePage: z.ZodType<TracePage> = z.object({
+  records: z.array(traceRecord), next_after: z.number(), has_more: z.boolean(),
+  budget: z.object({
+    max_records: z.number(), max_bytes: z.number(), recorded: z.number(), bytes: z.number(),
+    omitted_records: z.number(), omitted_bytes: z.number(),
+  }),
+});
+const feedbackSchema = z.object({
+  opportunities: z.array(z.object({
+    opportunity_id: z.string(), run_id: z.string(), kind: z.enum(["death", "failure", "outcome"]),
+    version: versionEvidence, execution_id: z.string(), event_seqs: z.array(z.number()),
+    created_at: z.string(),
+    resolution: z.object({
+      decision: z.enum(["revise", "keep", "insufficient_evidence"]), reason: z.string(),
+      revision: versionEvidence.nullable(), event_seqs: z.array(z.number()),
+      measured: z.boolean(), at: z.string(),
+    }).nullable(),
+  })),
+  metrics: z.array(objectiveMetrics),
+  next_after: z.object({
+    opportunity_seq: z.number().int().nonnegative(),
+    execution_seq: z.number().int().nonnegative(),
+  }) satisfies z.ZodType<ImprovementFeedbackCursor>,
+  has_more: z.boolean(),
+  omitted: z.array(z.object({
+    kind: z.string(), id: z.string(), reason: z.string(), original_bytes: z.number(),
+  })),
+  opportunity_budget: z.object({ max_records: z.number(), reached: z.boolean(), omission: z.string() }),
+  review: z.object({ effect_free: z.literal(true), max_decisions: z.number() }),
+});
+export type ImprovementFeedback = z.infer<typeof feedbackSchema>;
+const comparisonSchema: z.ZodType<VersionComparison> = z.object({
+  before: versionEvidence, after: versionEvidence,
+  source_diff: z.object({
+    common_prefix_lines: z.number(), common_suffix_lines: z.number(),
+    removed: z.array(z.string()), added: z.array(z.string()),
+  }),
+  card_diff: z.record(z.string(), z.object({ before: z.string(), after: z.string() })),
+  samples: z.object({ before: z.array(objectiveMetrics), after: z.array(objectiveMetrics) }),
+  sample_count: z.object({ before: z.number(), after: z.number() }),
+  controlled_conditions: json.nullable(),
+  conclusion: z.literal("descriptive_only_no_causal_improvement_claim"),
+});
+const planSchema: z.ZodType<PlanProjection> = z.object({
+  plan_id: z.string(),
+  state: z.enum(["armed", "planning", "staged", "validating", "activated", "rejected", "invalidated", "expired", "empty"]),
+  planning_active: z.boolean(),
+  reason: z.enum(["session_changed", "life_changed", "task_changed", "predecessor_changed", "predecessor_unsuccessful", "predecessor_pending", "predecessor_already_settled", "source_changed", "precondition_failed", "precondition_error", "budget_exhausted", "deadline", "cancelled", "already_activated", "not_staged", "admission_failed"]).nullable(),
+  intent: z.string(),
+  basis: z.object({
+    run_id: z.string(), generation: z.number(), session_id: z.string(), world_id: z.string(),
+    epoch: z.number(), life_id: z.number(), life_status: life.shape.status,
+    task: z.string(), goal: z.string(),
+    root: skillRef.extend({ hash: z.string(), execution_id: z.string(), status: execution.shape.status }),
+  }),
+  candidate: skillRef.extend({ hash: z.string() }).nullable(),
+  precondition_hash: nullableText, deadline_at: z.string(),
+  budget: z.object({ calls: z.number(), tools: z.number(), duration_ms: z.number() }),
+  calls: z.number(), tools: z.number(), observation_seq: z.number().nullable(),
+  activation_execution_id: nullableText, overlap_ms: z.number(),
+});
+
+export async function fetchTrace(runId: string, after = 0, executionId = ""): Promise<TracePage> {
+  const query = new URLSearchParams({ after: String(after), limit: "64" });
+  if (executionId) query.set("execution_id", executionId);
+  return tracePage.parse(await request(`/v1/runs/${encodeURIComponent(runId)}/trace?${query}`));
+}
+export async function fetchImprovementFeedback(
+  runId: string,
+  after: ImprovementFeedbackCursor = { opportunity_seq: 0, execution_seq: 0 },
+): Promise<ImprovementFeedback> {
+  const query = new URLSearchParams({
+    after_opportunity: String(after.opportunity_seq),
+    after_execution: String(after.execution_seq),
+    limit: "32",
+  });
+  return feedbackSchema.parse(await request(`/v1/runs/${encodeURIComponent(runId)}/improvements?${query}`));
+}
+export async function fetchPlanning(runId: string): Promise<PlanProjection | null> {
+  return z.object({ plan: planSchema.nullable() }).parse(
+    await request(`/v1/runs/${encodeURIComponent(runId)}/planning`),
+  ).plan;
+}
+export async function fetchDeaths(runId: string, after = 0) {
+  return z.object({ episodes: z.array(z.object({
+    death_id: z.string(), session_id: z.string(), life_id: z.number(),
+    last_observation: json.nullable(), current_root_execution_id: nullableText,
+    action_id: nullableText, event_seqs: z.array(z.number()),
+    last_authorized_player: player.nullable(),
+    observation_omission: json.nullable(),
+  })), next_after: z.number(), has_more: z.boolean() }).parse(
+    await request(`/v1/runs/${encodeURIComponent(runId)}/deaths?after=${after}&limit=32`),
+  );
+}
+export async function fetchComparison(
+  before: ProgramVersionEvidence, after: ProgramVersionEvidence, afterSample = 0,
+) {
+  return z.object({
+    comparison: comparisonSchema, next_after: z.number(), has_more: z.boolean(),
+    omissions: z.array(z.object({
+      field: z.string(), reason: z.string(), original_bytes: z.number(), reference: json,
+    })),
+  }).parse(await request("/v1/program-comparisons", {
+    before, after, after_sample: afterSample, limit: 25,
+  }));
 }

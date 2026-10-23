@@ -94,25 +94,29 @@ feature into `main` includes pushing the result to `origin/main`, unless I
 explicitly request a local-only operation. No separate push confirmation is
 needed for these requests.
 
-When asked to integrate a feature branch into `main`, default to preserving
-every commit: advance `main` to the branch tip by fast-forward only, without a
-merge commit or squash. Check the base of any open PR so its status reflects
-the integration. Use another method only if I request it.
+Keep `main` linear and preserve individual commits. Prefer fast-forward to
+preserve hashes when possible. If a PR or feature branch has diverged from
+`main`, **Rebase and merge** or a local rebase on a temporary integration branch
+is allowed without separate approval; preserve authorship and commit boundaries,
+but changed hashes are acceptable. Do not create merge commits or squash unless
+I explicitly request it.
 
-Before integrating or pushing, fetch `origin/main` and verify fast-forward
-ancestry. If history has diverged, stop and discuss how to proceed rather than
-rewriting or force-pushing shared history.
+Before integrating or pushing, fetch `origin/main` and check the final result
+against it. Never rewrite or force-push published `main`. Ask if local `main`
+has diverged from `origin/main` or rebase conflicts leave the intended behavior
+unclear. Check that the open PR's base and status reflect the integration.
 
 Before every push, review the exact commit tree and every outgoing commit for
 private files, secrets, and personal information, including newly added files,
-reports, machine-specific paths, and Git author/committer metadata. Keep local
+reports, machine-specific paths, and Git author/committer metadata, unless I
+explicitly ask to skip this pre-push review for that push. Keep local
 plans, credentials, auth databases, worlds, raw run evidence, and generated
 artifacts out of the publication; include reports only after reviewing their
-contents as intentionally public. Inspect the staged diff and run a secret
-scanner; `.gitignore` and a clean scan alone are not sufficient. Repeat the
-review if the publication changes. Resolve confirmed findings before pushing;
-if safe publication is uncertain, stop and report the blocker without exposing
-the sensitive data or rewriting shared history.
+contents as intentionally public. As part of this review, inspect the staged
+diff and run a secret scanner; `.gitignore` and a clean scan alone are not
+sufficient. Repeat the review if the publication changes. Resolve confirmed
+findings before pushing; if safe publication is uncertain, stop and report the
+blocker without exposing the sensitive data or rewriting shared history.
 
 Delivery is complete only after the push succeeds, including any required Git
 LFS uploads. Report the branch, commit hash, and push result. If publication is

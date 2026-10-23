@@ -9,6 +9,7 @@ import {
   type EventExportResult,
 } from "../src/server/event-export.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
+import { emptyRunUsage } from "../src/server/usage.ts";
 import type { ActivityEvent, Json } from "../src/shared/contracts.ts";
 
 const directories: string[] = [];
@@ -31,6 +32,8 @@ function makeRun(store: Store, task: string): StoredRun {
   const run: StoredRun = {
     run_id: crypto.randomUUID(),
     world_id: crypto.randomUUID(),
+    session_id: crypto.randomUUID(),
+    life_id: 1,
     epoch: 1,
     task,
     goal: "custom",
@@ -41,7 +44,7 @@ function makeRun(store: Store, task: string): StoredRun {
     turns: 0,
     model_status: "idle",
     error: null,
-    usage: { input_tokens: 0, output_tokens: 0, known_cost: null },
+    usage: emptyRunUsage(),
     baseline: {},
   };
   store.saveRun(run);

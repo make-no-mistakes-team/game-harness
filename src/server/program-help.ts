@@ -2,7 +2,7 @@ import { z } from "zod";
 import { getGameAPIReference, policyDecisionSchema } from "../shared/validation.ts";
 import { DEFAULT_SKILL_LIMITS } from "../shared/programs.ts";
 import { PROGRAM_LIMITS } from "./program-validation.ts";
-import { helpSchema, memorySchema, nextConfigSchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programWriteSchema, reflexSchema } from "./program-interface.ts";
+import { helpSchema, memorySchema, nextConfigSchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
 
 export function programHelp(topic: z.infer<typeof helpSchema>["topic"]) {
   const schema = (value: z.ZodType) => z.toJSONSchema(value, { unrepresentable: "any" });
@@ -10,6 +10,7 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"]) {
   if (topic === "programs") return {
     write: schema(programWriteSchema), run: schema(programRunSchema), inspect: schema(programInspectSchema), review: schema(programReviewSchema),
     body: "Write only an async JavaScript function BODY. Supplied bindings: game,args. No wrapper/import/export or comments. Await one capability at a time. Every return path must return {status:'completed'|'blocked'|'failed',summary:string,result:JSON}; result:null is allowed.",
+    completion: "A program's completed status is execution-only, not task success. For a custom task, call the separate ordinary-only task_finish lifecycle tool as soon as actual authorized evidence shows the whole task done; do not run another no-op/check or review loop. It stops the run with an unverified model report. Built-in goals still require independent trusted verification.",
     composition: "Declare named dependencies when writing. The host pins their exact validated versions. game.call({name,version?},args) selects only those captured dependencies, never a new latest version; version may be omitted only when the declared name is unambiguous.",
     revision: "A new name creates a family. An existing name requires based_on equal to its latest stored version; conflicts never silently rebase source. Optional reason links an actual direct-child code experiment to the latest unresolved matching outcome. A candidate is not proven improvement or promotion.",
     selection: "Start without version selects latest validated once before admission. Exact version remains exact. Transport retry identity is host-bound; repeat delivery of one tool call never starts new work. A new decision is a distinct call.",
@@ -32,6 +33,10 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"]) {
   };
   return {
     tools: ["observe", "program_write", "program_run", "program_inspect", "program_review", "help"],
+    lifecycle: {
+      task_finish: schema(taskFinishSchema),
+      contract: "Separate from the six gameplay/program verbs. Ordinary role and custom tasks only. As soon as actual authorized evidence shows the whole task complete, call task_finish with a brief evidence summary instead of more no-op/check programs or review. It immediately revokes admission and stops the run; completion is model-reported and unverified, never goal.verified. Program completed statuses are execution-only. Built-in goals cannot bypass their trusted verifier.",
+    },
     topics: ["game", "programs", "planning", "reflex", "memory"],
     advanced: "Request help topic reflex or memory to disclose that optional module for ordinary planning. Speculative and post-goal roles cannot acquire extra authority through help.",
     observation: "The observe tool returns authorized gameplay fields without host world/session/epoch/life/death identities. Program game.observe() and isolated guards retain the native Observation schema 2. Execution arguments, program results and detailed trace payloads preserve their original JSON keys and authorized game target IDs; explicit evidence byte-budget omissions remain identified.",

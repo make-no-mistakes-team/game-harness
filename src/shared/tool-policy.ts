@@ -8,6 +8,7 @@ export const TOOL_POLICY = Object.freeze({
   program_inspect: { roles: ["ordinary", "speculative", "review"], module: null },
   program_review: { roles: ["ordinary", "review"], module: null },
   help: { roles: ["ordinary", "speculative", "review"], module: null },
+  task_finish: { roles: ["ordinary"], module: null },
   prepare_next: { roles: ["speculative"], module: null },
   reflex: { roles: ["ordinary"], module: "reflex" },
   memory: { roles: ["ordinary"], module: "memory" },

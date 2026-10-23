@@ -13,7 +13,7 @@ import { ProgramValidationError } from "./program-validation.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { ProgramOperations } from "./program-operations.ts";
 import { programHelp } from "./program-help.ts";
-import { helpSchema, memorySchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programWriteSchema, reflexSchema } from "./program-interface.ts";
+import { helpSchema, memorySchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
 
 export interface RuntimeToolHost {
   run(): StoredRun;
@@ -26,6 +26,7 @@ export interface RuntimeToolHost {
   planning(): SpeculativePlanning;
   learning(): ImprovementLearning;
   toolAuthority(): () => void;
+  finishTask(summary: string, callId: string): void;
 }
 
 export class RuntimeTools {
@@ -54,7 +55,7 @@ export class RuntimeTools {
           const input = schema.parse(raw);
           const identity = { tool: name, input } as unknown as Json;
           const operation = input && typeof input === "object" && "operation" in input ? input.operation : null;
-          const mutation = name === "program_write" || name === "program_review" || name === "prepare_next" ||
+          const mutation = name === "task_finish" || name === "program_write" || name === "program_review" || name === "prepare_next" ||
             name === "program_run" && operation !== "inspect" || name === "reflex" && operation !== "inspect" ||
             name === "memory" && operation !== "catalog";
           const completed = mutation ? this.store.completedToolCall(run.run_id, callId, identity) : null;
@@ -72,8 +73,11 @@ export class RuntimeTools {
           const value = await handler(input, callId, signal, commit);
           if (mutation) this.store.completeToolCall(run.run_id, callId, identity, JSON.parse(JSON.stringify(value)) as Json);
           if (assessment) this.reviewDecisions.add(callId);
-          commit();
-          if (!replay) this.host.assertCurrent(generation);
+          // A successful finish deliberately consumes its own run authority.
+          if (name !== "task_finish") {
+            commit();
+            if (!replay) this.host.assertCurrent(generation);
+          }
           this.store.event(run.run_id, "model.tool_result", `Strategic tool ${name} returned service evidence`, {
             tool_call_id: callId, tool: name, result: JSON.parse(JSON.stringify(value)) as Json,
           });
@@ -105,6 +109,11 @@ export class RuntimeTools {
       tool("help", "Load generated game/program/planning reference, or disclose optional reflex/memory modules on demand.", helpSchema, (input) => {
         if ((input.topic === "reflex" || input.topic === "memory") && role() === "ordinary") this.modules.add(input.topic);
         return programHelp(input.topic);
+      }),
+      tool("task_finish", "Report the whole custom task complete from actual authorized evidence and stop the run immediately. This is unverified model reporting, not built-in goal verification.", taskFinishSchema, (input, callId) => {
+        if (run.goal !== "custom") throw new RuntimeFault("forbidden", "Only custom tasks permit model-reported completion; built-in goals require trusted verification");
+        this.host.finishTask(input.summary, callId);
+        return { status: "stopping", verification: "unverified" };
       }),
       tool("prepare_next", "Stage one existing named program for the current restricted planning flight. Optional guard_source binds only observation,args; omission adds no gameplay condition or effect authority.", prepareNextSchema, (input, callId) => operations.prepare(input, callId)),
       tool("reflex", "Manage optional named JavaScript/Jev reactions: write, inspect, effect-free validate, bounded activate, retire.", reflexSchema, (input, callId, signal) => operations.reflex(input, callId, generation, signal)),

@@ -20,7 +20,7 @@ const ROOT = "Neutral flow", FOLLOW = "Fresh follow-up", RECOVERY = "Explicit re
 const card = { purpose: "Exercise trusted lifecycle transitions", applicability: "Deterministic neutral fixture", method: "Await authorized bounded capabilities", reason: "Measure actual ownership transitions", limitations: "No gameplay effectiveness claim" };
 const ok: GameActionResult = { status: "succeeded", summary: "Confirmed neutral fixture effect", evidence: { effect_confirmed: true } };
 const cancelled: GameActionResult = { status: "cancelled", summary: "Fixture emitter neutralized", evidence: null };
-type Options = { goal?: GoalId; initialAction?: GameAction; childCalls?: number; next?: LookaheadConfig; repairGuard?: boolean; guardSource?: string; guardResult?: boolean; holdWorkerExit?: boolean };
+type Options = { goal?: GoalId; initialAction?: GameAction; childCalls?: number; next?: LookaheadConfig; repairGuard?: boolean; guardSource?: string; guardResult?: boolean; holdWorkerExit?: boolean; customCompletion?: "after-root" | "with-pending-root" };
 type PromptContext = { phase: string; role: string; reason: string[]; player: unknown; speculative_plan: { plan_id: string } | null };
 function eventDetails(value: Json): { [key: string]: Json } | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -35,6 +35,7 @@ async function fixture(options: Options = {}) {
   let failBarrier = false, failObservation = false, holdBarrier = false, holdRespawn = false, holdSpec = false;
   const firstEffect = Promise.withResolvers<GameActionResult>(), tailEffect = Promise.withResolvers<GameActionResult>();
   const nativeBarrier = Promise.withResolvers<void>(), workerExit = Promise.withResolvers<void>(), respawnProof = Promise.withResolvers<void>();
+  const barrierEntered = Promise.withResolvers<void>(), finishReturned = Promise.withResolvers<void>(), stopped = Promise.withResolvers<void>();
   const rootEntered = Promise.withResolvers<void>(), effectEntered = Promise.withResolvers<void>(), tailEntered = Promise.withResolvers<void>();
   const admissionSettled = Promise.withResolvers<void>();
   const childrenClosed = Promise.withResolvers<void>(), rootSourceFinished = Promise.withResolvers<void>(), rootDrained = Promise.withResolvers<void>();
@@ -59,7 +60,7 @@ async function fixture(options: Options = {}) {
     snapshot: (): GameState => ({ status: "connected", username: "Fixture", version: "1.21.4", world_id: world, epoch: 1, session_id: session, life: structuredClone(life), motor_profile: "balanced", player: observation(false).player, last_observation_at: null, error: null,
       video: { status: "streaming", width: 1, height: 1, fps: 30, frames: sequence + 1, last_frame_at: new Date().toISOString(), error: null } }),
     observe: async () => { observationReads++; if (failObservation) throw new Error("Fresh fixture observation unavailable"); return observation(); },
-    neutralize: async () => { barriers++; if (failBarrier) throw new Error("Native barrier unconfirmed"); if (holdBarrier) await nativeBarrier.promise; },
+    neutralize: async () => { barriers++; if (failBarrier) throw new Error("Native barrier unconfirmed"); if (holdBarrier) { barrierEntered.resolve(); await nativeBarrier.promise; } },
     cancel: async () => { if (holdBarrier) await nativeBarrier.promise; tailEffect.resolve(cancelled); },
     setMotorProfile: async () => {}, recipes: async () => [],
     execute: async (action) => {
@@ -77,14 +78,14 @@ async function fixture(options: Options = {}) {
       }
       effects++;
       if (effects === 1) { effectEntered.resolve(); return await firstEffect.promise; }
-      if ((options.next || options.childCalls) && effects === 2) { tailEntered.resolve(); return await tailEffect.promise; }
+      if ((options.next || options.childCalls || options.customCompletion === "with-pending-root") && effects === 2) { tailEntered.resolve(); return await tailEffect.promise; }
       return ok;
     },
     subscribe: (listener) => { notices.add(listener); return () => { notices.delete(listener); }; },
   };
   let activeTools: AgentTool[] = [], gate: Parameters<Agent["setBeforeModelCall"]>[0];
   const knownTools = new Map<string, AgentTool>();
-  let activeAgent: Agent | null = null, rootStarted = false, recoveryStarted = false;
+  let activeAgent: Agent | null = null, rootStarted = false, rootCompleted = false, completionRequested = false, recoveryStarted = false;
   let oldEffect: (() => Promise<Json>) | null = null;
   const rootArgs = { mode: "root", child_calls: options.childCalls ?? 0 };
   const rootRequest = { operation: "start", name: ROOT, args: rootArgs, limits: { ...DEFAULT_SKILL_LIMITS }, ...(options.next ? { next: options.next } : {}) };
@@ -163,6 +164,14 @@ async function fixture(options: Options = {}) {
               rootStarted = true;
               await required("program_run", rootRequest, "start-original");
               admissionSettled.resolve();
+            } else if (options.customCompletion && rootCompleted && !completionRequested) {
+              completionRequested = true;
+              if (options.customCompletion === "with-pending-root") {
+                await required("program_run", { operation: "start", name: FOLLOW, args: { mode: "follow-up" }, limits: DEFAULT_SKILL_LIMITS });
+                await tailEntered.promise;
+              }
+              await required("task_finish", { summary: "Collected one dirt block; fresh inventory contains dirt" });
+              finishReturned.resolve();
             } else if (life.status === "dead" && !recoveryStarted) {
               recoveryStarted = true;
               await required("program_run", { operation: "start", name: RECOVERY, args: { mode: "recovery" }, limits: DEFAULT_SKILL_LIMITS });
@@ -208,6 +217,8 @@ async function fixture(options: Options = {}) {
         await handle({ kind: "respawn" });
         await handle({ kind: "call", skill: { name: FOLLOW, version: 1 }, args: { mode: "follow-up" } });
       } else {
+        if (options.customCompletion === "with-pending-root" && mode === "follow-up")
+          oldEffect = () => handle({ kind: "action", action: { kind: "look", yaw: 1, pitch: 0 } });
         await handle({ kind: "observe" });
         await handle({ kind: "action", action: { kind: "look", yaw: 0.2, pitch: 0 } });
       }
@@ -241,6 +252,10 @@ async function fixture(options: Options = {}) {
       const execution = typeof details?.execution_id === "string" ? store.skillExecution(created.run_id, { execution_id: details.execution_id }) : null;
       if (execution?.parent_execution_id === null && execution.status === "succeeded") {
         const name = store.skill(created.run_id, execution).name;
+        if (name === ROOT && options.customCompletion) {
+          rootCompleted = true;
+          inventory = [{ name: "dirt", display_name: "Dirt", slot: 0, count: 1 }];
+        }
         if (name === RECOVERY) recoveryClosed.resolve();
         if (name === FOLLOW) successorClosed.resolve();
       }
@@ -253,6 +268,7 @@ async function fixture(options: Options = {}) {
       const status = store.getRun(created.run_id)?.status;
       if (status === "paused") paused.resolve();
       if (status === "completed") completed.resolve();
+      if (status === "stopped") stopped.resolve();
     }
   });
   await runtime.control(created.run_id, "start");
@@ -263,7 +279,7 @@ async function fixture(options: Options = {}) {
     runtime, store, created, game, contexts, failure, rootEntered, tailEntered, childrenClosed, rootSourceFinished, rootDrained,
     recoveryClosed, successorClosed, respawnEntered, specEntered, staged, paused, completed, reviewed, rejectedGuard,
     firstEffectReceipt, uncertaintyFenced, replanned, nativeBarrier, workerExit,
-    continuationSettled,
+    continuationSettled, barrierEntered, finishReturned, stopped,
     invoke, findExecution,
     originalRequest: rootRequest,
     counters: () => ({ disconnects, barriers, respawns, effects, agents, observationReads, guardCalls, prompts: contexts.length }),
@@ -440,6 +456,76 @@ test("verified completion allows only a linked candidate artifact review and pre
   expect(f.store.allSkillExecutions(f.created.run_id).some((entry) => entry.version === 2)).toBe(false);
   expect(f.counters()).toMatchObject({ effects: 1, respawns: 0, disconnects: 0 });
   expect(f.game.snapshot().video.status).toBe("streaming");
+});
+
+for (const customCompletion of ["after-root", "with-pending-root"] as const) {
+  test(`custom task_finish fences admission before draining ${customCompletion} without verification or post-goal inference`, async () => {
+    const f = await fixture({ customCompletion });
+    f.holdBarrier();
+    f.finishFirst();
+    // The ordinary tool must return while neutralization is still held. Awaiting
+    // strategic.close() inside that tool would deadlock on its own active prompt.
+    await reached(f, f.finishReturned.promise);
+    await reached(f, f.barrierEntered.promise);
+    expect(f.findExecution(ROOT)?.status).toBe("succeeded");
+    expect(f.runtime.snapshot()).toMatchObject({ status: "stopping", error: null });
+    expect(f.store.getRun(f.created.run_id)?.status).toBe("stopping");
+    expect(f.contexts).toHaveLength(2);
+    expect(f.contexts[1]).toMatchObject({
+      phase: "running", role: "planning", speculative_plan: null,
+      player: { inventory: { dirt: 1 } },
+    });
+    const reported = f.store.eventsAfter(f.created.run_id, 0, 500).filter((event) => event.type === "task.completion_reported");
+    expect(reported).toHaveLength(1);
+    expect(reported[0]!.details).toMatchObject({
+      summary: "Collected one dirt block; fresh inventory contains dirt", verification: "unverified",
+    });
+    const effects = customCompletion === "with-pending-root" ? 2 : 1;
+    expect(f.counters().effects).toBe(effects);
+    const executions = f.store.allSkillExecutions(f.created.run_id).length;
+    await expect(f.staleEffect()).rejects.toThrow();
+    const forbiddenStart = await f.invoke("program_run", { operation: "start", name: FOLLOW, args: { mode: "after-finish" }, limits: DEFAULT_SKILL_LIMITS });
+    expect(forbiddenStart.isError).toBe(true);
+    expect(f.store.allSkillExecutions(f.created.run_id)).toHaveLength(executions);
+    expect(f.runtime.snapshot()?.status).toBe("stopping");
+    expect(f.counters().effects).toBe(effects);
+
+    f.nativeBarrier.resolve();
+    await reached(f, f.stopped.promise);
+    expect(f.runtime.snapshot()).toMatchObject({
+      status: "stopped", error: null, session_id: f.created.session_id, epoch: 1, life_id: 1,
+    });
+    expect(f.store.getRun(f.created.run_id)).toMatchObject({ status: "stopped", error: null });
+    expect(f.store.getRun(f.created.run_id)?.ended_at).not.toBeNull();
+    if (customCompletion === "with-pending-root") expect(f.findExecution(FOLLOW)?.status).toBe("cancelled");
+    const events = f.store.eventsAfter(f.created.run_id, 0, 500);
+    const reports = events.filter((event) => event.type === "task.completion_reported");
+    expect(reports).toEqual(reported);
+    expect(events.some((event) => event.type === "goal.verified")).toBe(false);
+    expect(events.filter((event) => event.type === "model.call")).toHaveLength(2);
+    expect(events.some((event) => event.event_seq > reports[0]!.event_seq && event.type === "model.call")).toBe(false);
+    expect(f.contexts).toHaveLength(2);
+    expect(f.contexts.some((context) => context.phase === "reviewing" || context.role === "review")).toBe(false);
+    expect(f.counters()).toMatchObject({ effects, agents: 1, respawns: 0, disconnects: 0 });
+    expect(f.game.snapshot()).toMatchObject({
+      status: "connected", session_id: f.created.session_id, life: { status: "alive", life_id: 1 },
+      video: { status: "streaming", error: null },
+    });
+  });
+}
+
+test("task_finish cannot replace the trusted verifier for a built-in goal", async () => {
+  const f = await fixture({ goal: "collect_wood" });
+  const result = await f.invoke("task_finish", { summary: "Collected one dirt block; fresh inventory contains dirt" });
+  expect(result.isError).toBe(true);
+  expect(f.runtime.snapshot()).toMatchObject({ status: "running", error: null });
+  expect(f.store.getRun(f.created.run_id)?.status).toBe("running");
+  expect(f.findExecution(ROOT)?.status).toBe("running");
+  const events = f.store.eventsAfter(f.created.run_id, 0, 500);
+  expect(events.some((event) => event.type === "task.completion_reported" || event.type === "goal.verified")).toBe(false);
+  expect(f.counters()).toMatchObject({ effects: 1, disconnects: 0 });
+  f.finishFirst(); f.workerExit.resolve();
+  await f.runtime.control(f.created.run_id, "stop");
 });
 
 test("break_log uses a block-removal receipt without fabricating inventory gain", async () => {

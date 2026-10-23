@@ -66,7 +66,7 @@ export const GOALS: GoalChoice[] = [
     id: "custom",
     label: "Custom task",
     prompt:
-      "Pursue the supplied task. Custom-task completion is not automatically verified; the operator stops the run.",
+      "Pursue the supplied task. As soon as actual authorized evidence shows the whole task is done, call task_finish with a brief evidence summary. This stops the run as model-reported, unverified completion, not trusted goal verification.",
   },
 ];
 
@@ -361,6 +361,7 @@ export class Runtime {
         planning: () => this.planning,
         learning: () => this.learning,
         toolAuthority: () => this.strategic.speculativeToolAuthority(),
+        finishTask: (summary, callId) => this.finishTask(summary, callId),
       },
     );
   }
@@ -1159,6 +1160,23 @@ export class Runtime {
     this.run!.status = "stopping";
     this.fenceAuthority(message);
     this.persist(message);
+  }
+  private finishTask(summary: string, callId: string): void {
+    const run = this.run;
+    if (!run || run.goal !== "custom" || run.status !== "running")
+      throw new RuntimeFault("forbidden", "Only a running custom task permits model-reported completion");
+    this.store.event(run.run_id, "task.completion_reported", "Model reported custom task completion; not independently verified", {
+      source: "model", reported_outcome: "completed", verification: "unverified",
+      summary, tool_call_id: callId, goal: run.goal, task: run.task,
+    });
+    const message = "Custom task completion reported by model; unverified run stopped";
+    this.fenceStop(message);
+    const generation = this.generation;
+    // Never await the strategic prompt that is currently executing this tool.
+    void this.serialize(async () => {
+      if (this.run === run && generation === this.generation && run.status === "stopping")
+        await this.halt("stopped", message);
+    });
   }
   private requestSafetyPause(message: string, reconnect: boolean): void {
     if (!this.run || TERMINAL[this.run.status]) return;

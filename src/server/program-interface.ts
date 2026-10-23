@@ -37,6 +37,7 @@ export const programInspectSchema = z.discriminatedUnion("view", [
   z.object({ view: z.literal("recipes"), item: z.string().regex(/^[a-z][a-z0-9_]{0,79}$/) }).strict(),
 ]);
 export const programReviewSchema = programSelectorSchema.extend({ decision: z.enum(["keep", "insufficient_evidence"]), reason: z.string().trim().min(1).max(2000) }).strict();
+export const taskFinishSchema = z.object({ summary: z.string().trim().min(1).max(2000) }).strict();
 export const prepareNextSchema = programSelectorSchema.extend({ args: jsonSchema, limits: skillLimitsSchema.default({ ...DEFAULT_SKILL_LIMITS }), guard_source: z.string().min(1).max(16384).optional() }).strict();
 export const helpSchema = z.object({ topic: z.enum(["overview", "game", "programs", "planning", "reflex", "memory"]).default("overview") }).strict();
 const namedPolicy = { name: z.string().trim().min(1).max(80), version: z.int().positive().optional() };

@@ -47,6 +47,16 @@ Reusable evaluation modules live in [`src/evaluation`](../src/evaluation/); runn
 
 `bun run check` now selects typechecking only. `bun run check unit <test-file>` and `bun run check integration <test-file>` select classified narrow suites; omit the file only when the whole tier is relevant. `bun test` remains the broad local aggregation. None of these commands builds Java/UI or grants permission to start a game/provider.
 
+### Pull-request CI
+
+The [CI workflow](../.github/workflows/ci.yml) runs one status check, **CI checks**, for pull requests targeting `main` and pushes to `main`. It installs dependencies with the frozen lockfile, typechecks, runs the broad Bun suite and builds the UI. Pull requests use GitHub's default temporary merge snapshot to check compatibility with the base branch; this does not publish a merge commit. Superseded runs are cancelled.
+
+CI does not start Minecraft, Docker, Electron or model providers, and does not build Java. Tests use temporary storage, subprocesses and loopback connections. Native-game and live-agent evaluation remain separate, explicitly admitted tiers.
+
+The workflow does not configure branch protection: results are informational unless maintainers separately require **CI checks**. A green run covers its tested revision, not later changes to either branch. Inspect the failed step's log before review or integration; passing CI does not establish gameplay success or replace code review.
+
+### Evaluation entry points
+
 Read `bun run evaluate --help` for tier entry points and explicit native/inference opt-ins. Native tiers require an existing fresh built JAR and stop on a stale artifact rather than rebuilding it. `authorize-evidence` records a justified concrete evidence revision; it is not permission to rename a hypothesis after a prompt/model change.
 
 Native helper/proof code is infrastructure, not a model gameplay library. A synthetic caller or privileged fixture must remain identified in its report. Keep [private evaluation storage](operations-and-security.md#private-evaluation-storage) separate from compact reports; a report does not authorize publishing its private evidence tree.

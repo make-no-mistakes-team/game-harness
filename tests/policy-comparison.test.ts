@@ -8,7 +8,9 @@ import {
 } from "../web/src/policy-comparison.ts";
 
 function policy(overrides: Partial<PolicyView> = {}): PolicyView {
+  const defaults = { backend: "javascript", choices: null } as const;
   return {
+    ...defaults,
     policy_id: "gather-wood",
     version: 1,
     hash: "before-hash",

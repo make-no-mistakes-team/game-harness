@@ -51,7 +51,7 @@ Reusable evaluation modules live in [`src/evaluation`](../src/evaluation/); runn
 
 The [CI workflow](../.github/workflows/ci.yml) runs one status check, **CI checks**, for pull requests targeting `main` and pushes to `main`. It installs dependencies with the frozen lockfile, typechecks, runs the broad Bun suite and builds the UI. Pull requests use GitHub's default temporary merge snapshot to check compatibility with the base branch; this does not publish a merge commit. Superseded runs are cancelled.
 
-CI does not start Minecraft, Docker, Electron or model providers, and does not build Java. Tests use temporary storage, subprocesses and loopback connections. Native-game and live-agent evaluation remain separate, explicitly admitted tiers.
+CI does not start Minecraft, Docker, Electron or model providers, and does not build Java. Tests use temporary storage, subprocesses and loopback connections. Evidence-freshness fixtures set file times relative to the recorded baseline rather than relying on filesystem timestamp resolution or sleeps. Native-game and live-agent evaluation remain separate, explicitly admitted tiers.
 
 The workflow does not configure branch protection: results are informational unless maintainers separately require **CI checks**. A green run covers its tested revision, not later changes to either branch. Inspect the failed step's log before review or integration; passing CI does not establish gameplay success or replace code review.
 

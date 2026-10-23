@@ -95,7 +95,15 @@ test("a newly captured concrete platform-failure reproduction is evidence, not a
     reproductionCommand: "bun run check:integration game-bridge.test.ts",
     evidence: [{ path: receipt, sha256: createHash("sha256").update(receiptBytes).digest("hex") }],
   }));
-  ledger.authorizePlatformEvidence(config.hypothesisId, { revision: "protocol-repro", reason: "New captured transport reproduction explains the earlier incomplete platform evidence", references: [{ kind: "repro", path: repro }] });
+  const baseline = Date.parse(ledger.listPlatformEvidence(config.hypothesisId)[0]!.authorizedAt);
+  const stale = new Date(baseline - 1000), fresh = new Date(baseline + 1000);
+  // Fixture chronology must not depend on filesystem timestamp resolution.
+  utimesSync(repro, fresh, fresh);
+  utimesSync(receipt, stale, stale);
+  const authorization = { revision: "protocol-repro", reason: "New captured transport reproduction explains the earlier incomplete platform evidence", references: [{ kind: "repro" as const, path: repro }] };
+  expect(() => ledger.authorizePlatformEvidence(config.hypothesisId, authorization)).toThrow("has not changed");
+  utimesSync(receipt, fresh, fresh);
+  ledger.authorizePlatformEvidence(config.hypothesisId, authorization);
   expect(ledger.listPlatformEvidence(config.hypothesisId)[1]?.references[0]?.sha256).toMatch(/^[0-9a-f]{64}$/);
   expect(ledger.listAttempts(config.hypothesisId)).toHaveLength(2);
 });

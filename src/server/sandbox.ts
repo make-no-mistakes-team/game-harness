@@ -926,7 +926,11 @@ export class SandboxService {
       this.guardian = await realpath(
         resolve(this.projectRoot, "sandbox/guardian.mjs"),
       );
-      if (!(await stat(this.runner)).isFile() || this.runner.includes(","))
+      if (
+        !(await stat(this.runner)).isFile() ||
+        this.runner.includes(",") ||
+        this.runner.includes(":")
+      )
         throw new Error("The trusted sandbox runner file is unavailable.");
       if (!(await stat(this.guardian)).isFile())
         throw new Error("The trusted sandbox guardian file is unavailable.");

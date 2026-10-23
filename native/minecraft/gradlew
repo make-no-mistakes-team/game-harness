@@ -10,5 +10,4 @@ if [ ! -x "$CACHE/gradle-8.11.1/bin/gradle" ]; then
   printf '%s  %s\n' "$EXPECTED" "$CACHE/gradle-8.11.1-bin.zip" | sha256sum --check --status
   unzip -q "$CACHE/gradle-8.11.1-bin.zip" -d "$CACHE"
 fi
-export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
 exec "$CACHE/gradle-8.11.1/bin/gradle" --no-daemon "$@"

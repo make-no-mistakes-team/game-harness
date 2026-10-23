@@ -24,6 +24,7 @@ if (
   !/^gameharness-policy-[a-f0-9-]{73}$/.test(name ?? "") ||
   !runner?.startsWith("/") ||
   runner.includes(",") ||
+  runner.includes(":") ||
   !/^node:24-bookworm-slim@sha256:[a-f0-9]{64}$/.test(image ?? "") ||
   !["policy", "skill"].includes(mode) ||
   (skill &&
@@ -268,8 +269,8 @@ async function start() {
       "NODE_ENV=production",
       "--env",
       "LANG=C.UTF-8",
-      "--mount",
-      `type=bind,source=${runner},target=/runner.mjs,readonly`,
+      "--volume",
+      `${runner}:/runner.mjs:ro,z`,
       "--interactive",
       "--workdir",
       "/",

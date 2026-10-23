@@ -1,0 +1,3 @@
+[run]
+# Preserve the selected toolchain instead of loading host shell startup files.
+shell = "bun"

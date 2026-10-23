@@ -18,7 +18,7 @@ Run stop and world stop differ: run stop fences strategic/program/reaction gener
 
 ## Reference deployment requirements
 
-The reference deployment targets Linux x64. Arbitrary Linux distributions, other operating systems, public hosting, guest access, and multiuser account administration are not established support. Current setup is documented in the integration guide. This table retains evidence from earlier source cohorts, including superseded death/client-teardown behavior; it does not certify the schema-2/r2 cutover. Current integrated proof must be reported separately.
+The reference deployment targets Linux x64. Fedora 44 has a documented setup, scoped build/desktop/SELinux-enforcing Docker evidence and subsequent operator-reported manual acceptance in the [Fedora integration section](integration-spike.md#fedora-linux-x64). Arbitrary Linux distributions, other operating systems, public hosting, guest access, and multiuser account administration are not established support. Current setup is documented in the integration guide. This table retains evidence from earlier source cohorts, including superseded death/client-teardown behavior; it does not certify the schema-2/r2 cutover. Current integrated proof must be reported separately.
 
 | Item | Retained evidence and cohort scope | Required future procedure |
 |---|---|---|

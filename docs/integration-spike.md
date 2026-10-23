@@ -10,7 +10,7 @@ The 22 October 2026 schema-2/r2 source cutover separates game session, agent run
 
 The current reference host is Linux x64 with:
 
-- Bun 1.3.14+, Node.js 24+, Python 3 at `/usr/bin/python3` with the `python3-dbus` module for Linux Secret Service access, and Java 21. The launcher uses `/usr/lib/jvm/java-21-openjdk-amd64/bin/java`; the build wrapper defaults `JAVA_HOME` to that installation. This is the reference layout, not automatic arbitrary-distribution discovery.
+- Bun 1.3.14+, Node.js 24+, Python 3 at `/usr/bin/python3` with the `python3-dbus` module for Linux Secret Service access, and a Java 21 development kit. Set `JAVA_HOME` to the selected JDK, or select Java 21 through `PATH`; build and runtime no longer require a Debian installation path. The runtime resolves `PATH` Java before restricting child environments. Project package scripts use Bun's shell so host shell startup files cannot replace the exported toolchain.
 - `flock` and a running local Docker Engine. The application user must be able to use `/usr/bin/docker` without an interactive `sudo` prompt. The policy supervisor uses the local daemon with a restricted environment, not a custom remote Docker context.
 - Network access for package installation, pinned image/server acquisition, and OpenAI authorization/inference; an account with the required Codex entitlement.
 - A working graphical session and an official Minecraft Launcher account entitled to Java Edition, with installed 1.21.4 client artifacts/assets under `~/.minecraft`. The owned client uses those files read-only and launches with isolated data, not personal worlds/configuration. Its account token crosses private bootstrap stdin, not model context or process arguments.
@@ -44,6 +44,50 @@ sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
 ```
 
 The binary then reported `v45.0.0`. Apply privileged changes only to the trusted installed Electron helper under the host's security policy. Reinstallation may replace it. Never use `--no-sandbox`; renderer sandbox/context isolation remain enabled and Node integration disabled.
+
+### Fedora Linux x64
+
+Install the desktop and build prerequisites from Fedora's repositories:
+
+```sh
+sudo dnf install nodejs24 python3 python3-dbus curl unzip util-linux \
+  gtk3 nss alsa-lib libXScrnSaver moby-engine docker-cli
+sudo systemctl enable --now docker
+```
+
+The application user needs access to the local Docker daemon without interactive `sudo`. If group membership must change, log out and back in before continuing. Docker access grants substantial host authority. `podman-docker` is not a substitute for the implemented Docker isolation contract.
+
+Fedora can install a newer default JDK and keep another Node version selected. The following user-local toolchain leaves those defaults unchanged. These pinned archives come from [Bun](https://github.com/oven-sh/bun/releases/tag/bun-v1.3.14) and [Eclipse Temurin](https://github.com/adoptium/temurin21-binaries/releases/tag/jdk-21.0.13%2B9); verify their checksums before extraction:
+
+```sh
+TOOLS="$HOME/.local/share/gameharness-tools"
+mkdir -p "$TOOLS/bin"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun-linux-x64.zip \
+  -o "$TOOLS/bun-linux-x64.zip"
+printf '%s  %s\n' 951ee2aee855f08595aeec6225226a298d3fea83a3dcd6465c09cbccdf7e848f \
+  "$TOOLS/bun-linux-x64.zip" | sha256sum --check
+unzip -qo "$TOOLS/bun-linux-x64.zip" -d "$TOOLS"
+curl --fail --location --proto '=https' --tlsv1.2 \
+  'https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13%2B9/OpenJDK21U-jdk_x64_linux_hotspot_21.0.13_9.tar.gz' \
+  -o "$TOOLS/temurin21.tar.gz"
+printf '%s  %s\n' d7f5d5cf865a2902b70ff549b97586a7d3f234e016f041ab447ea740c7d66d1c \
+  "$TOOLS/temurin21.tar.gz" | sha256sum --check
+tar -xzf "$TOOLS/temurin21.tar.gz" -C "$TOOLS"
+ln -sfn /usr/bin/node-24 "$TOOLS/bin/node"
+export JAVA_HOME="$TOOLS/jdk-21.0.13+9"
+export PATH="$TOOLS/bun-linux-x64:$TOOLS/bin:$JAVA_HOME/bin:$PATH"
+```
+
+Keep these exports in the terminal used for the README commands. Confirm `bun --version`, `node --version`, `java -version` and `javac -version` select the required versions, then follow the README installation, build and start commands unchanged.
+
+For a separate verification installation, optionally set `GAMEHARNESS_DATA_DIR="$HOME/.local/share/gameharness/fedora-runtime"` before starting. This keeps its credentials, worlds and run records separate from an existing installation without copying them.
+
+Launch from the graphical desktop session. GNOME Wayland needs its working XWayland display for the native Minecraft client; retain the session's actual `DISPLAY`, `XAUTHORITY` and `XDG_RUNTIME_DIR`. Do not substitute another user's display or authority file. SELinux can remain Enforcing: Docker applies a shared label only to the trusted read-only sandbox runner, allowing concurrent workers without relabeling the checkout or disabling isolation.
+
+Fedora 44 x64 verification on 23 October 2026 used GNOME Wayland, Bun 1.3.14, Node 24.18.0, Temurin JDK 21.0.13 and Docker/Moby 29.8.2 with SELinux Enforcing. After the documented prerequisite selection, the README's frozen install, image pull and full native/UI build succeeded; both native proof tasks passed. Typechecking and all 304 Bun tests passed on Fedora. The actual 1440×900 Electron window loaded the connected workspace with renderer sandbox/context isolation enabled and Node integration disabled. Production sandbox readiness and two concurrent policy workers plus an isolated skill passed a synthetic, zero-provider Docker smoke.
+
+Initial checks exposed Debian-only Java selection, host shell startup replacing the selected JDK, and an unlabeled read-only runner mount rejected by SELinux. Those paths were corrected without disabling isolation. The successful build still emitted mapping/deprecation warnings. The operator subsequently confirmed successful manual acceptance of the requested Minecraft, OpenAI OAuth and agent-task trial on Fedora. That is operator-reported acceptance; the independently observed build, desktop and isolation evidence above does not establish controlled gameplay efficacy or a measured improvement.
 
 ### OpenAI authorization and proxies
 

@@ -15,7 +15,9 @@ import { DATA_DIR } from "./config.ts";
 import { z } from "zod";
 import type { MotorProfile } from "../shared/contracts.ts";
 
-export const JAVA = "/usr/lib/jvm/java-21-openjdk-amd64/bin/java";
+export const JAVA = process.env.JAVA_HOME
+  ? path.resolve(process.env.JAVA_HOME, "bin", "java")
+  : (Bun.which("java") ?? "java");
 export const LOADER = "0.16.10";
 export const FABRIC_API = "0.119.4+1.21.4";
 export interface NativeOptions {

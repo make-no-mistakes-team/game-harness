@@ -6,6 +6,7 @@ import type { VerificationTier } from "./contracts.ts";
 /** File-level classification: some files also contain smaller tests. No Docker claim is implied. */
 export const TEST_TIERS = Object.freeze({
   unit: Object.freeze([
+    "tests/java-runtime.test.ts", // Java name resolution with local executable sentinels; no JVM or native startup.
     "tests/native-transport.test.ts", // Native frame parser only; no native process.
     "tests/video.test.ts", // Frame/header inspection only.
     "web/src/video.test.ts", // Actual renderer frame classification; synthetic packets/timestamps only.

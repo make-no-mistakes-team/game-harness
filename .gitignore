@@ -3,6 +3,13 @@
 /coverage/
 *.tsbuildinfo
 /local/
+/.superpowers/
+__pycache__/
+*.py[cod]
+/policies/.venv/
+/policies/build/
+/policies/dist/
+/policies/*.egg-info/
 /PRODUCT.md
 /.impeccable/
 .env

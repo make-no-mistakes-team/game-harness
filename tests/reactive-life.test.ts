@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { FetchImpl } from "@oh-my-pi/pi-catalog/types";
-import type { ActionView, GameAction, GameActionResult, GameBridge, GameState, Observation, PolicyContext, PolicyDecision, PolicySpec } from "../src/shared/contracts.ts";
+import type { ActionView, GameAction, GameActionResult, GameBridge, GameState, ObservationV3, PolicyContext, PolicyDecision, PolicySpec } from "../src/shared/contracts.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import { ActionArbiter } from "../src/server/action-arbiter.ts";
 import { JevBroker } from "../src/server/jev.ts";
@@ -12,7 +12,10 @@ import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { SkillManager } from "../src/server/skills.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
-import { emptyRunUsage } from "../src/server/usage.ts";
+import { minecraftActionSchema } from "../src/shared/minecraft.ts";
+import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
+import { ModelProgramEvidence } from "../src/evaluation/model-evidence.ts";
+import { DEFAULT_EVALUATION_CAPS } from "../src/evaluation/config.ts";
 
 // Exercise the real asynchronous scheduler, worker, and arbiter handoffs. Await
 // their completion signals rather than advancing a process-global fake clock.
@@ -70,29 +73,20 @@ function specification(backend: PolicySpec["backend"] = "javascript"): PolicySpe
 }
 function fixture(judge?: JevBroker) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-reactive-life-"));
-  const store = new Store(directory);
+  const store = new Store(directory), adapter = minecraftTestAdapter();
   const sessionId = crypto.randomUUID();
-  const run: StoredRun = {
-    run_id: crypto.randomUUID(), world_id: crypto.randomUUID(), epoch: 1,
+  const run = minecraftRunFixture(adapter, {
+    world_id: crypto.randomUUID(),
     session_id: sessionId, life_id: 1,
-    task: "Neutral lifecycle fixture", goal: "custom", model_id: "strategic-not-a-typesafe-judge",
-    status: "running", started_at: new Date().toISOString(), ended_at: null,
-    turns: 0, model_status: "idle", error: null, usage: emptyRunUsage(), baseline: {},
-  };
+    task: "Neutral lifecycle fixture", model_id: "strategic-not-a-typesafe-judge",
+  });
   store.saveRun(run);
-  let observation: Observation = {
-    schema_version: 2, world_id: run.world_id, session_id: sessionId, epoch: 1,
-    life: { life_id: 1, status: "alive", can_respawn: false, death: null },
-    observation_seq: 1, captured_at: new Date().toISOString(),
-    profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r2",
-    player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: 20, food: 20, on_ground: true, in_water: false, inventory: [] },
-    blocks: [], entities: [], sounds: [], coverage: { partial: true, max_age_ms: 1000 },
-  };
+  let observation = minecraftObservationFixture(adapter, { world_id: run.world_id, session_id: sessionId });
   let state: GameState = {
     status: "connected", username: "Fixture", version: "1.21.4", world_id: run.world_id,
-    epoch: 1, session_id: sessionId, life: observation.life, motor_profile: "balanced",
+    epoch: 1, session_id: sessionId, life: observation.life, binding: minecraftTestBinding(adapter), space: observation.space, screen: null,
     video: { status: "idle", width: 0, height: 0, fps: null, frames: 0, last_frame_at: null, error: null },
-    last_observation_at: observation.captured_at, player: observation.player, error: null,
+    last_observation_at: observation.captured_at, presentation: adapter.projectObservation(observation), error: null,
   };
   let generation = 1;
   let disconnected = false;
@@ -102,7 +96,7 @@ function fixture(judge?: JevBroker) {
   let closePrograms = async () => {};
   let neutralize = async () => {};
   let cancel = async () => {};
-  let execute: GameBridge["execute"] = async () => ({
+  let execute: (action: GameAction, signal: AbortSignal) => Promise<GameActionResult> = async () => ({
     status: "succeeded", summary: "Neutral fixture action confirmed",
     evidence: { effect_confirmed: true },
   });
@@ -112,37 +106,42 @@ function fixture(judge?: JevBroker) {
   let workersClosed = 0;
   const game: GameBridge = {
     connect: async () => {}, disconnect: async () => { disconnected = true; },
-    neutralize: async () => { await neutralize(); }, setMotorProfile: async () => {},
+    neutralize: async () => { await neutralize(); }, emergencyStop: async () => { await neutralize(); }, adapter: () => adapter,
     snapshot: () => state, observe: async () => structuredClone(observation),
-    execute: async (action, signal) => {
+    execute: async (envelope, signal) => {
+      const action = minecraftActionSchema.parse(envelope.action);
       executed.push(action);
       for (const resolve of executions.get(executed.length) ?? []) resolve();
       executions.delete(executed.length);
       return await execute(action, signal);
     },
-    cancel: async () => { await cancel(); }, recipes: async () => [], subscribe: () => () => {},
+    cancel: async () => { await cancel(); }, subscribe: () => () => {},
   };
   const sandbox = {
     createWorker: async () => ({ evaluate: (context: PolicyContext, signal?: AbortSignal) => evaluate(context, signal), close: async () => { workersClosed++; } }),
   } as unknown as SandboxService;
   let reactive: ReactiveRuntime;
+  let skillAuthority: SkillManager | null = null;
   const actions = new ActionArbiter(store, game, {
     run: () => run, generation: () => generation, needsReconnect: () => false,
     changed: () => {}, wake: () => {}, pause: (message) => { throw new Error(message); },
     observe: async () => observation, admitted: () => {},
+    adapter: () => adapter, invocation: id => skillAuthority?.invocation(id) ?? null,
+    effectScope: id => skillAuthority?.effectScope(id) ?? null,
     effect: (policy, kind, evidence) => reactive.recordEffect(policy, kind, evidence),
-    succeeded: () => {},
+    settled: () => {},
     uncertain: (action) => uncertain(action),
   });
   reactive = new ReactiveRuntime(store, sandbox, actions, {
     run: () => run, generation: () => generation,
+    adapter: () => adapter, binding: () => state.binding,
     assertCurrent: (expected, epoch) => {
       if (expected !== generation || (epoch !== undefined && epoch !== run.epoch)) throw new RuntimeFault("stale_context", "Fixture generation revoked");
       return run;
     },
     context: async () => ({ observation: structuredClone(observation), action: actions.view, task: run.task }),
     gameState: () => state, needsReconnect: () => false, wake: () => {}, changed: () => {}, admitted: () => {},
-    closePrograms: async () => { await closePrograms(); }, neutralize: () => game.neutralize(),
+    closePrograms: async () => { await closePrograms(); }, neutralize: () => game.emergencyStop("Validated reactive fixture barrier"),
   }, judge);
   reactive.initialize(run.run_id);
   cleanups.push(async () => {
@@ -155,7 +154,8 @@ function fixture(judge?: JevBroker) {
     }
   });
   return {
-    reactive, actions, run, store, executed, game,
+    reactive, actions, run, store, executed, game, adapter,
+    bindManager: (manager: SkillManager) => { skillAuthority = manager; },
     execution: (count = 1) => {
       if (executed.length >= count) return Promise.resolve();
       const signal = Promise.withResolvers<void>();
@@ -171,11 +171,14 @@ function fixture(judge?: JevBroker) {
     setExecutor: (value: typeof execute) => { execute = value; },
     setUncertain: (value: typeof uncertain) => { uncertain = value; },
     nextGeneration: () => { generation++; },
-    transition: (life: Observation["life"], session = sessionId) => {
-      observation = { ...observation, session_id: session, life, observation_seq: observation.observation_seq + 1 };
-      state = { ...state, session_id: session, life };
+    transition: (life: ObservationV3["life"], session = sessionId) => {
+      const replaced = life.life_id !== observation.life.life_id || session !== observation.session_id;
+      const space = { ...observation.space, space_epoch: observation.space.space_epoch + (replaced ? 1 : 0) };
+      observation = { ...observation, session_id: session, life, space, observation_seq: observation.observation_seq + 1 };
+      state = { ...state, session_id: session, life, space };
       run.session_id = session;
       run.life_id = life.life_id;
+      run.space_epoch = space.space_epoch;
       store.saveRun(run);
     },
     disconnected: () => disconnected,
@@ -388,11 +391,13 @@ test("owned reactive cancellation preserves UNKNOWN action and root, drains the 
       }
     },
   }, {
-    authorize: (runId, epoch, sessionId, lifeId) => {
-      if (runId !== f.run.run_id || epoch !== f.run.epoch ||
-        sessionId !== f.run.session_id || lifeId !== f.run.life_id)
+    authorize: scope => {
+      if (scope.run_id !== f.run.run_id || scope.epoch !== f.run.epoch || scope.world_id !== f.run.world_id ||
+        scope.session_id !== f.run.session_id || scope.life_id !== f.run.life_id ||
+        scope.native_boot_id !== f.run.native_boot_id || scope.space_epoch !== f.run.space_epoch)
         throw new Error("Skill lineage revoked");
     },
+    adapter: () => f.adapter, binding: () => f.game.snapshot().binding,
     observe: () => f.game.observe(),
     action: async (execution, action, _signal, callId) => {
       const actionId = `skill_${callId}`;
@@ -410,12 +415,13 @@ test("owned reactive cancellation preserves UNKNOWN action and root, drains the 
       inspect();
       return await settled.promise;
     },
-    recipes: async () => [],
+    queryCapability: async () => [],
     cancelActions: (ids, reason) => f.actions.cancelOwned(ids, reason),
     changed: () => {},
     unsafe: () => { throw new Error("Unexpected skill cleanup failure"); },
     recover: async () => { throw new Error("No respawn in this preemption fixture"); },
   });
+  f.bindManager(manager);
   cleanups.push(async () => { await manager.closeAll("Fixture cleanup"); });
   const move = hold<GameActionResult>(interrupted);
   const cancellationAck = hold<void>(undefined);
@@ -449,7 +455,7 @@ test("owned reactive cancellation preserves UNKNOWN action and root, drains the 
   });
   const root = manager.start(f.run.run_id, {
     skill_id: skill.skill_id, version: skill.version, start_key: "managed-preemption",
-    epoch: f.run.epoch, session_id: f.run.session_id!, life_id: f.run.life_id!,
+    ...executionScopeFixture(f.run),
     args: null, limits: { ...DEFAULT_SKILL_LIMITS },
   });
   await f.execution();
@@ -527,6 +533,38 @@ function answer(choice: "wait" | "turn") {
     answers: { decision: { type: "choice", choice, confidence: 1, probabilities: { wait: choice === "wait" ? 1 : 0, turn: choice === "turn" ? 1 : 0 } } },
     usage: { input_tokens: 4, output_tokens: 1 },
   }), { headers: { "Content-Type": "application/json" } });
+}
+
+for (const sample of [
+  { name: "explicit wire usage without monetary cost", usage: { input_tokens: 4, output_tokens: 1 },
+    expected: { uncached_input: 4, cache_read: 0, cache_write: 0, output: 1 }, consumption: "known" },
+  { name: "missing wire usage", usage: undefined,
+    expected: { uncached_input: null, cache_read: null, cache_write: null, output: null }, consumption: "unknown" },
+  { name: "partial wire usage", usage: { input_tokens: 4 },
+    expected: { uncached_input: 4, cache_read: 0, cache_write: 0, output: null }, consumption: "partial" },
+]) {
+  test(`Jev ${sample.name} reaches evaluation through real broker, reactive producer and Store`, async () => {
+    const judge = await broker(async () => new Response(JSON.stringify({
+      answers: { decision: { type: "choice", choice: "wait", confidence: 1, probabilities: { wait: 1, turn: 0 } } },
+      ...(sample.usage === undefined ? {} : { usage: sample.usage }),
+    }), { headers: { "Content-Type": "application/json" } }));
+    await judge.setKey("JEV_ACCOUNTING_OFFLINE_CREDENTIAL");
+    const f = fixture(judge);
+    const evidenceRoot = mkdtempSync(join(tmpdir(), "gameharness-jev-accounting-"));
+    const observer = new ModelProgramEvidence(f.store, evidenceRoot, { ...DEFAULT_EVALUATION_CAPS,
+      hostRequestAdmissions: 30 }, "jev-accounting-fixture", () => {});
+    cleanups.push(async () => { await observer.close(); rmSync(evidenceRoot, { recursive: true, force: true }); });
+    const view = await f.reactive.register(specification("jev"), 1, 1);
+    await f.reactive.validate({ epoch: 1, policy_id: view.policy_id, version: view.version }, 1);
+    expect(observer.summary(f.run.run_id).usage).toMatchObject({ schema_version: 2, admissions: 1,
+      reported_messages: 1, event_coverage: "complete", consumption_coverage: sample.consumption,
+      ...sample.expected, subscription_cost: null, wire_attempts: null });
+    expect(f.run.usage.known_cost).toBeNull();
+    expect(f.run.usage.calls).toBe(1);
+    expect(JSON.stringify(f.store.eventsAfter(f.run.run_id, 0, 500))).not.toContain("JEV_ACCOUNTING_OFFLINE_CREDENTIAL");
+    if (sample.name === "explicit wire usage without monetary cost")
+      expect(observer.summary(f.run.run_id).usage.reported_subtotal).toEqual({ uncached_input: 4, cache_read: 0, cache_write: 0, output: 1 });
+  });
 }
 
 test("the actual Jev policy path admits a supported judge despite an unrelated strategic model ID", async () => {

@@ -1,5 +1,6 @@
-import type { ActionView, ActivityEvent, Json, Observation, PolicyView, ProgramEvidenceView } from "../shared/contracts.ts";
+import type { ActionView, ActivityEvent, Json, ObservationV3, PolicyView, ProgramEvidenceView } from "../shared/contracts.ts";
 import type { SkillExecutionView, SkillRef, SkillView } from "../shared/programs.ts";
+import type { AdapterActorProjection } from "../shared/observations.ts";
 import { SKILL_API_VERSION } from "../shared/programs.ts";
 import type { ImprovementOpportunity, ObjectiveMetrics, TracePage, VersionComparison } from "../shared/execution-evidence.ts";
 import type { PlanProjection } from "../shared/planning.ts";
@@ -69,17 +70,25 @@ export class ProgramWorkspace {
   }
 
   source(program: SkillView) {
+    const compatible = program.validation.runtime_version === 4 && program.validation.api_version === 4 && program.validation.validator_version === 4 &&
+      program.validation.compatibility_hash === this.store.getRun(this.runId)?.compatibility_hash;
     return { name: program.name, version: program.version, source: program.source, card: program.card,
       dependencies: program.dependencies.map((ref) => this.programReference(ref)),
-      parent_version: program.parent_version, state: program.state, execution_compatible: program.validation.runtime_version === SKILL_API_VERSION,
-      validation: { runtime_version: program.validation.runtime_version ?? null, formatted_lines: program.validation.formatted_lines, complexity: program.validation.complexity, nesting: program.validation.nesting }, created_at: program.created_at };
+      parent_version: program.parent_version, state: program.state, execution_compatible: compatible,
+      validation: { runtime_version: program.validation.runtime_version ?? null, api_version: program.validation.api_version ?? null,
+        validator_version: program.validation.validator_version ?? null, compatibility_hash: program.validation.compatibility_hash ?? null,
+        fingerprint: program.validation.fingerprint, formatted_lines: program.validation.formatted_lines, complexity: program.validation.complexity,
+        nesting: program.validation.nesting }, created_at: program.created_at };
   }
 
-  observationView(observation: Observation) {
-    const { world_id: _world, session_id: _session, epoch: _epoch, life, ...game } = observation;
+  observationView(observation: ObservationV3, projection?: AdapterActorProjection) {
+    const { life } = observation;
     const { life_id: _life, death, ...status } = life;
     const publicDeath = death ? { at: death.at, message: death.message } : null;
-    return { ...game, life: { ...status, death: publicDeath } };
+    return { schema_version: 3, profile_id: observation.profile_id, observation_seq: observation.observation_seq,
+      captured_at: observation.captured_at, space: observation.space, screen: observation.screen,
+      data: projection?.state ?? observation.data, metadata: projection?.metadata ?? {}, summary: projection?.summary ?? "",
+      freshness: observation.freshness, life: { ...status, death: publicDeath } };
   }
 
   executionView(execution: SkillExecutionView | null) {
@@ -93,7 +102,7 @@ export class ProgramWorkspace {
     };
     return { ...this.executionSummary(execution), parent: execution.parent_execution_id ? this.executionReference(execution.parent_execution_id) : null,
       root: this.executionReference(execution.root_execution_id), limits: execution.limits, started_at: execution.started_at,
-      ended_at: execution.ended_at, deadline_at: execution.deadline_at, args: field("args"), result: field("result"), error: execution.error, omissions };
+      ended_at: execution.ended_at, deadline_at: execution.deadline_at, args: field("args"), result: field("result"), error: execution.error, diagnostic: execution.diagnostic ?? null, omissions };
   }
 
   executionSummary(execution: SkillExecutionView) {

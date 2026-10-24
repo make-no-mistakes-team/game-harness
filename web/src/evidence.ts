@@ -1,7 +1,118 @@
-import type { GameState, PolicyView, ProgramEvidenceView, RunView } from "../../src/shared/contracts.ts";
+import type { ActivityEvent, GameState, Json, PolicyView, ProgramEvidenceView, RunView } from "../../src/shared/contracts.ts";
+import { effectScopeSchema, type EffectScope } from "../../src/shared/control.ts";
+import { minecraftObservationV3Schema } from "../../src/shared/minecraft.ts";
+import { verificationResultSchema } from "../../src/shared/validation.ts";
 import type { SkillExecutionView, SkillView } from "../../src/shared/programs.ts";
 import type { ImprovementFeedbackCursor, ObjectiveMetrics, ProgramVersionEvidence, TracePage } from "../../src/shared/execution-evidence.ts";
 import { fetchComparison, fetchDeaths, fetchHistory, fetchImprovementFeedback, fetchPlanning, fetchTrace } from "./api.ts";
+
+type PromotionRun = Pick<RunView, "run_id" | "world_id" | "epoch" | "session_id" | "native_boot_id" | "compatibility_hash" | "goal">;
+type PromotionEvidence = { kind: "goal_verified" } | { kind: "inventory_gain"; counts: Record<string, number> };
+const evidenceRecord = (value: Json | undefined): Record<string, Json> | null =>
+  value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+
+/** Follow only host-retained recovery transitions, never a changed live-run life field alone. */
+function adoptedPromotionScope(event: ActivityEvent, run: PromotionRun, execution: SkillExecutionView,
+  scope: EffectScope, history: readonly ActivityEvent[]): boolean {
+  let life = execution.life_id, space = execution.space_epoch;
+  const ordered = history.filter(record => record.run_id === run.run_id && record.event_seq < event.event_seq &&
+    !!execution.started_at && record.at >= execution.started_at && record.at <= event.at)
+    .sort((a, b) => a.event_seq - b.event_seq);
+  for (const adoption of ordered) {
+    if (adoption.type !== "skill.life_adopted") continue;
+    const details = evidenceRecord(adoption.details);
+    if (execution.parent_execution_id !== null || details?.execution_id !== execution.execution_id ||
+      details.root_execution_id !== execution.root_execution_id || details.session_id !== execution.session_id ||
+      details.previous_life_id !== life || typeof details.life_id !== "number" ||
+      !Number.isSafeInteger(details.life_id) || details.life_id <= (life ?? -1) ||
+      typeof details.respawn_action_id !== "string" || typeof details.observation_seq !== "number") continue;
+    const accepted = ordered.find(record => {
+      const value = evidenceRecord(record.details), request = evidenceRecord(value?.request);
+      if (!value) return false;
+      return record.type === "action.accepted" && record.event_seq < adoption.event_seq &&
+        value.action_id === details.respawn_action_id && value.origin === "skill" &&
+        value.execution_id === execution.execution_id && request?.kind === "respawn";
+    });
+    const succeeded = ordered.find(record => {
+      const value = evidenceRecord(record.details), result = evidenceRecord(value?.result), receipt = evidenceRecord(result?.evidence);
+      if (!value) return false;
+      return record.type === "action.succeeded" && record.event_seq < adoption.event_seq &&
+        !!accepted && record.event_seq > accepted.event_seq &&
+        value.action_id === details.respawn_action_id && value.origin === "skill" &&
+        value.execution_id === execution.execution_id && result?.status === "succeeded" && receipt?.effect_confirmed === true;
+    });
+    if (!accepted || !succeeded) continue;
+    const observation = ordered.find(record => {
+      if (record.type !== "adapter.evidence" || record.event_seq >= adoption.event_seq ||
+        record.event_seq <= succeeded.event_seq) return false;
+      const value = evidenceRecord(record.details), schema = evidenceRecord(value?.schema);
+      const data = minecraftObservationV3Schema.safeParse(value?.data), witnessScope = effectScopeSchema.safeParse(value?.scope);
+      return schema?.id === "observation_v3" && schema.version === 3 &&
+        typeof run.goal !== "string" && value?.adapter_id === run.goal.adapter_id &&
+        data.success && witnessScope.success && witnessScope.data.run_id === run.run_id &&
+        witnessScope.data.world_id === run.world_id && witnessScope.data.session_id === run.session_id &&
+        witnessScope.data.epoch === run.epoch && witnessScope.data.native_boot_id === run.native_boot_id &&
+        witnessScope.data.run_generation === execution.run_generation &&
+        witnessScope.data.life_id === details.life_id && witnessScope.data.space_epoch === data.data.space.space_epoch &&
+        data.data.observation_seq === details.observation_seq && data.data.life.life_id === details.life_id &&
+        data.data.life.status === "alive" && data.data.world_id === run.world_id && data.data.session_id === run.session_id &&
+        data.data.epoch === run.epoch && data.data.native_boot_id === run.native_boot_id &&
+        data.data.compatibility_hash === run.compatibility_hash;
+    });
+    if (!observation) continue;
+    const parsed = minecraftObservationV3Schema.safeParse(evidenceRecord(observation.details)?.data);
+    if (!parsed.success) continue;
+    life = parsed.data.life.life_id; space = parsed.data.space.space_epoch;
+  }
+  return scope.life_id === life && scope.space_epoch === space;
+}
+/** Presentation eligibility only; the service still proves baseline gain and attributable effects. */
+export function promotionEvidence(event: ActivityEvent, run: PromotionRun, execution: SkillExecutionView,
+  history: readonly ActivityEvent[]): PromotionEvidence | null {
+  if (event.run_id !== run.run_id || !execution.started_at || !execution.ended_at ||
+    event.at < execution.started_at || event.at > execution.ended_at) return null;
+  const details = evidenceRecord(event.details);
+  if (typeof run.goal === "string") {
+    if (event.type === "goal.verified" && typeof details?.goal === "string") return { kind: "goal_verified" };
+    if (event.type !== "observation.inventory") return null;
+    const historical = evidenceRecord(details?.counts);
+    if (!historical) return null;
+    const counts: Record<string, number> = Object.create(null);
+    for (const [item, count] of Object.entries(historical)) {
+      if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0) return null;
+      if (count > 0) counts[item] = count;
+    }
+    return { kind: "inventory_gain", counts };
+  }
+  if (event.type === "goal.verified") {
+    const verdict = verificationResultSchema.safeParse(event.details);
+    return verdict.success && verdict.data.status === "verified" && run.goal.verifier &&
+      verdict.data.adapter_id === run.goal.adapter_id && verdict.data.verifier_id === run.goal.verifier.id &&
+      verdict.data.verifier_version === run.goal.verifier.version ? { kind: "goal_verified" } : null;
+  }
+  const schema = evidenceRecord(details?.schema);
+  if (event.type !== "adapter.evidence" || details?.adapter_id !== run.goal.adapter_id ||
+    schema?.id !== "observation_v3" || schema.version !== 3) return null;
+  const decoded = minecraftObservationV3Schema.safeParse(details.data);
+  const scope = effectScopeSchema.safeParse(details.scope);
+  if (!decoded.success || !scope.success) return null;
+  const observation = decoded.data;
+  if (scope.data.run_id !== run.run_id || scope.data.world_id !== run.world_id || scope.data.session_id !== run.session_id ||
+    scope.data.epoch !== run.epoch || scope.data.native_boot_id !== run.native_boot_id ||
+    !adoptedPromotionScope(event, run, execution, scope.data, history) ||
+    scope.data.run_generation !== execution.run_generation ||
+    observation.world_id !== run.world_id || observation.session_id !== run.session_id || observation.epoch !== execution.epoch ||
+    observation.native_boot_id !== execution.native_boot_id || observation.compatibility_hash !== run.compatibility_hash ||
+    observation.life.life_id !== scope.data.life_id || observation.space.space_epoch !== scope.data.space_epoch ||
+    observation.life.status !== "alive") return null;
+  const counts: Record<string, number> = Object.create(null);
+  for (const item of observation.data.player.inventory) {
+    const count = (counts[item.name] ?? 0) + item.count;
+    if (!Number.isSafeInteger(count)) return null;
+    if (count > 0) counts[item.name] = count;
+  }
+  return { kind: "inventory_gain", counts };
+}
 
 function node<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string): HTMLElementTagNameMap[K] {
   const result = document.createElement(tag);
@@ -139,13 +250,13 @@ export class EvidenceInspector {
     }
     const gameSignature = JSON.stringify(game ? {
       status: game.status, session_id: game.session_id, epoch: game.epoch,
-      life: game.life, motor_profile: game.motor_profile, error: game.error,
+      life: game.life, binding: game.binding, space: game.space, screen: game.screen, error: game.error,
       run_status: run?.status ?? null,
     } : null);
     if (panel.game && panel.gameSignature !== gameSignature) {
       panel.gameSignature = gameSignature;
       panel.game.replaceChildren();
-      paragraph(panel.game, game ? `${game.status} · ${lineage(game.session_id, game.life?.life_id ?? null)} · motor ${game.motor_profile}` : "Retained run: live player state is not attributed to this historical run.", "mono");
+      paragraph(panel.game, game ? `${game.status} · ${lineage(game.session_id, game.life?.life_id ?? null)} · profile ${game.binding?.descriptor.observation.profile.id ?? "not negotiated"} · space ${game.space?.space_epoch ?? "unavailable"}` : "Retained run: live player state is not attributed to this historical run.", "mono");
       if (game) {
         const life = game.life;
         const deathControl = ["bootstrapping", "running"].includes(run?.status ?? "")

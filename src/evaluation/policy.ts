@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, type SQLQueryBindings, type Statement } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -35,6 +35,43 @@ type HypothesisRow = { revision: string; snapshot: string };
 type AttemptRow = { attempt_id: string; hypothesis_id: string; revision: string; state: AttemptRecord["state"]; reserved_at: string; finished_at: string | null; owner_pid: number; config: string; metadata: string; settlement: string | null; interruption: string | null; unsuccessful: number };
 type Snapshot = Record<string, string>;
 
+/** Own every fixed SQL statement, including Bun 1.3 query-cache overflow. */
+class GovernanceDatabase {
+  readonly #statements = new Map<string, Statement>();
+  constructor(private readonly database: Database) {}
+  query<Row = unknown, Params extends SQLQueryBindings[] = SQLQueryBindings[]>(sql: string): Statement<Row, Params> {
+    let statement = this.#statements.get(sql);
+    if (!statement) {
+      statement = this.database.prepare(sql);
+      this.#statements.set(sql, statement);
+    }
+    // Each fixed SQL string has one row/binding shape at its typed call sites.
+    return statement as Statement<Row, Params>;
+  }
+  exec(sql: string): void { this.database.exec(sql); }
+  transaction<T>(operation: () => T) { return this.database.transaction(operation); }
+  close(): void {
+    for (const statement of this.#statements.values()) statement.finalize();
+    this.#statements.clear();
+    this.database.close(true);
+  }
+}
+
+/** Shared private SQLite authority for diagnostics and immutable study admission. */
+export function openGovernanceDatabase(governanceRoot: string): GovernanceDatabase {
+  mkdirSync(governanceRoot, { recursive: true, mode: 0o700 });
+  const root = lstatSync(governanceRoot);
+  if (!root.isDirectory() || root.isSymbolicLink()) throw new Error("Governance storage must be a real private directory");
+  chmodSync(governanceRoot, 0o700);
+  const path = join(governanceRoot, "attempts.sqlite");
+  const fd = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
+  closeSync(fd);
+  chmodSync(path, 0o600);
+  const db = new Database(path, { create: true });
+  db.exec("PRAGMA busy_timeout=10000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
+  return new GovernanceDatabase(db);
+}
+
 function nonempty(value: string, label: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be concrete and nonempty`);
   return value.trim();
@@ -55,21 +92,12 @@ function record(row: AttemptRow): AttemptRecord {
 
 /** Private, cross-process ledger. Directory/model/prompt changes never create a new allowance. */
 export class AttemptLedger {
-  readonly #db: Database;
+  readonly #db: GovernanceDatabase;
   readonly #projectRoot: string;
 
   constructor(governanceRoot: string, options: { projectRoot?: string } = {}) {
     this.#projectRoot = realpathSync(options.projectRoot ?? process.cwd());
-    mkdirSync(governanceRoot, { recursive: true, mode: 0o700 });
-    const root = lstatSync(governanceRoot);
-    if (!root.isDirectory() || root.isSymbolicLink()) throw new Error("Governance storage must be a real private directory");
-    chmodSync(governanceRoot, 0o700);
-    const path = join(governanceRoot, "attempts.sqlite");
-    const fd = openSync(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
-    closeSync(fd);
-    chmodSync(path, 0o600);
-    this.#db = new Database(path, { create: true });
-    this.#db.exec("PRAGMA busy_timeout=10000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
+    this.#db = openGovernanceDatabase(governanceRoot);
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS hypotheses (hypothesis_id TEXT PRIMARY KEY, revision TEXT NOT NULL, snapshot TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS platform_evidence (

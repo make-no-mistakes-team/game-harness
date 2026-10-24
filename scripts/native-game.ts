@@ -9,7 +9,9 @@ import { assertNativeArtifactFresh, requireTierOptIn } from "../src/evaluation/t
 import type { Runtime } from "../src/server/runtime.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import type { Store } from "../src/server/store.ts";
-import type { GameAction, GameActionResult, Json, Observation } from "../src/shared/contracts.ts";
+import type { GameAction, GameActionResult, Json, ObservationV3 } from "../src/shared/contracts.ts";
+import type { EffectEnvelope } from "../src/shared/control.ts";
+import { gameActionSchema } from "../src/shared/validation.ts";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const args = process.argv.slice(2);
@@ -26,7 +28,7 @@ process.env.GAMEHARNESS_NATIVE_PROOF = "1";
 process.env.GAMEHARNESS_PROOF_EXPECTED_JAR_SHA256 = artifact.sha256;
 
 // Infrastructure-only evaluator sources. These bodies are never delivered to a model.
-const guard = 'return typeof context === "undefined" && typeof state === "undefined" && observation.life.status === "alive" && observation.player.health > 0 && args.allow === true;';
+const guard = 'return typeof context === "undefined" && typeof state === "undefined" && observation.life.status === "alive" && observation.data.player.health > 0 && args.allow === true;';
 const cases = [
   { name: "manual_positive", activation: "manual", allow: true, omitted: false, stop: false, late: false },
   { name: "manual_false_guard", activation: "manual", allow: false, omitted: false, stop: false, late: false },
@@ -44,8 +46,8 @@ let diagnostic: DiagnosticAgent | undefined, activeProbe: PlanningDiagnosticProb
 let failure: unknown;
 let activeEffects = 0, peakEffects = 0;
 const started = performance.now();
-interface NativeCall { run_id: string | null; request: GameAction; start_ms: number; end_ms: number | null; result: GameActionResult | null; error: string | null }
-interface GuardCall { run_id: string | null; start_ms: number; end_ms: number | null; source: string; source_sha256: string; input: { observation: Observation; args: Json }; result: boolean | null; error: string | null }
+interface NativeCall { run_id: string | null; request: GameAction; envelope: EffectEnvelope<GameAction>; start_ms: number; end_ms: number | null; result: GameActionResult | null; error: string | null }
+interface GuardCall { run_id: string | null; start_ms: number; end_ms: number | null; source: string; source_sha256: string; input: { observation: ObservationV3; args: Json }; result: boolean | null; error: string | null }
 interface ObservationReceipt { run_id: string | null; at_ms: number; observation_seq: number; session_id: string; life_id: number }
 const effects: NativeCall[] = [], guards: GuardCall[] = [], observations: ObservationReceipt[] = [];
 const runIds: string[] = [];
@@ -85,22 +87,23 @@ try {
   };
   const execute = fixture.bridge.execute.bind(fixture.bridge);
   fixture.bridge.execute = async (request, signal) => {
-    const receipt: NativeCall = { run_id: runtime?.snapshot()?.run_id ?? null, request: structuredClone(request), start_ms: performance.now() - started, end_ms: null, result: null, error: null };
+    const action = gameActionSchema.parse(request.action);
+    const receipt: NativeCall = { run_id: runtime?.snapshot()?.run_id ?? null, request: structuredClone(action), envelope: { ...structuredClone(request), action }, start_ms: performance.now() - started, end_ms: null, result: null, error: null };
     effects.push(receipt); activeEffects++; peakEffects = Math.max(peakEffects, activeEffects);
     try { receipt.result = await execute(request, signal); return receipt.result; }
     catch (error) { receipt.error = error instanceof Error ? error.message : String(error); throw error; }
     finally { activeEffects--; receipt.end_ms = performance.now() - started; }
   };
   const evaluateGuard = sandbox.evaluateGameGuard.bind(sandbox);
-  sandbox.evaluateGameGuard = async (source, observation, args, signal) => {
+  sandbox.evaluateGameGuard = async (source, observation, args, signal, contract) => {
     const receipt: GuardCall = { run_id: runtime?.snapshot()?.run_id ?? null, start_ms: performance.now() - started, end_ms: null,
       source, source_sha256: createHash("sha256").update(source).digest("hex"), input: structuredClone({ observation, args }), result: null, error: null };
     guards.push(receipt);
-    try { receipt.result = await evaluateGuard(source, observation, args, signal); return receipt.result; }
+    try { receipt.result = await evaluateGuard(source, observation, args, signal, contract); return receipt.result; }
     catch (error) { receipt.error = error instanceof Error ? error.message : String(error); throw error; }
     finally { receipt.end_ms = performance.now() - started; }
   };
-  runtime = new Runtime(store, diagnostic.auth(), fixture.bridge, sandbox, () => {}, { adapter_id: "fabric-owned-client" });
+  runtime = new Runtime(store, diagnostic.auth(), fixture.bridge, sandbox, () => {}, { adapter: () => fixture.bridge.adapter() });
   await runtime.initialize();
   for (const scenario of cases) {
     if (failure) break;
@@ -109,7 +112,9 @@ try {
       predecessor_first: scenario.late, stop_revokes: scenario.stop }, async entry => {
       await fixture.flat();
       const identity = fixture.identity(await fixture.bridge.observe());
-      const run = await runtime!.createRun({ task: "Zero-provider native continuation infrastructure diagnostic, not ordinary gameplay", goal: "custom", model_id: diagnostic!.model_id, working_programs: "fresh" });
+      const customGoal = fixture.bridge.adapter()?.goals.find(goal => goal.goal_id === "custom" && goal.verifier === null);
+      requireProof(customGoal, "Actual adapter does not expose the declared unverified custom task");
+      const run = await runtime!.createRun({ task: "Zero-provider native continuation infrastructure diagnostic, not ordinary gameplay", goal: customGoal, model_id: diagnostic!.model_id, working_programs: "fresh" });
       runIds.push(run.run_id); entry.run_id = run.run_id;
       activeProbe = diagnostic!.preparePlanning(run.run_id, scenario.omitted ? undefined : guard, scenario.allow, { activation: scenario.activation });
       const probe = activeProbe;

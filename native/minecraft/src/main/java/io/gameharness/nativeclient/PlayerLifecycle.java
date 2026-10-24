@@ -22,7 +22,7 @@ public final class PlayerLifecycle {
       // The replacement really lived and died, even if its custom readiness receipt lost the race.
       // It is a distinct dead incarnation, never resurrection or a replay of the prior request.
       if (replacementSeen && replacementHealth && replacementPosition && replacementDead) {
-        lifeId++;
+        lifeId = ContractIdentity.next(lifeId);
         status = Status.DEAD;
         return Decision.DIED;
       }
@@ -69,7 +69,7 @@ public final class PlayerLifecycle {
   public boolean confirmRespawn(boolean alive) {
     if (status != Status.RESPAWNING
         || !replacementSeen || !replacementHealth || !replacementPosition || replacementDead || !alive) return false;
-    lifeId++;
+    lifeId = ContractIdentity.next(lifeId);
     status = Status.ALIVE;
     return true;
   }

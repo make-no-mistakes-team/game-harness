@@ -663,6 +663,8 @@ export class AuthManager {
         id: model.id,
         name: model.name,
         provider: PROVIDER,
+        input_modalities: [...model.input],
+        capability_provenance: "discovered_sdk_descriptor_not_live_vision" as const,
         context_window: Number.isFinite(model.contextWindow)
           ? model.contextWindow
           : null,

@@ -1,0 +1,64 @@
+import { expect, test } from "bun:test";
+import { z } from "zod";
+import type { AdapterDescriptor, AdapterSchemaCatalog } from "../src/shared/contracts.ts";
+import { observationV3Schema } from "../src/shared/observations.ts";
+import { jsonSchema } from "../src/shared/validation.ts";
+import { contractHash } from "../src/server/adapter-contract.ts";
+import { RegisteredAdapterContract } from "../src/server/registered-adapter.ts";
+
+function fixture() {
+  const schemas: AdapterSchemaCatalog = { observation: jsonSchema.parse(z.toJSONSchema(observationV3Schema)),
+    payload: jsonSchema.parse(z.toJSONSchema(z.object({ counter: z.number().int(),
+      opaque_usage: z.object({ schema_version: z.literal(2) }).strict() }).strict())),
+    capabilities: { "contract.action@1": jsonSchema.parse(z.toJSONSchema(z.object({ kind: z.literal("press"),
+      scope: z.string(), epoch: z.number().int() }).strict())) } };
+  const configuration = { counter_visible: true };
+  const descriptor: AdapterDescriptor = { descriptor_schema: 1, game: { id: "contract-only", version: "1" },
+    adapter: { id: "contract-only", version: "1", build_hash: "a".repeat(64) },
+    observation: { schema_version: 3, schema_hash: contractHash(schemas.observation),
+      payload_schema: { id: "contract-payload", version: 1, hash: contractHash(schemas.payload) },
+      profile: { id: "contract-profile", version: 1, configuration, configuration_hash: contractHash(configuration) } },
+    capabilities: [{ id: "contract.action", version: 1, schema_hash: contractHash(schemas.capabilities["contract.action@1"]) }],
+    actuator: "native", executable: { api_version: 4, validator_version: 4, runtime_version: 4 } };
+  const registry = new RegisteredAdapterContract(descriptor, schemas);
+  const observation = { schema_version: 3, world_id: "world", session_id: "session", epoch: 2147483665, native_boot_id: "boot",
+    life: { life_id: 3, status: "alive", can_respawn: false, death: null }, space: { dimension_id: "contract-space", space_epoch: 4 },
+    screen: null, observation_seq: 1, captured_at: "2026-10-25T12:00:00Z", compatibility_hash: registry.compatibility.compatibility_hash,
+    profile_id: descriptor.observation.profile.id, profile_configuration_hash: descriptor.observation.profile.configuration_hash,
+    freshness: { max_age_ms: 1000, partial: true }, data: { counter: 7, opaque_usage: { schema_version: 2 } } };
+  return { registry, descriptor, schemas, observation };
+}
+
+test("trusted registered payload schemas admit non-Minecraft data without relabeling nested version namespaces", () => {
+  const f = fixture(), current = f.registry.parseObservation(f.observation);
+  expect(current.data).toEqual({ counter: 7, opaque_usage: { schema_version: 2 } });
+  expect(current).not.toHaveProperty("player");
+  expect(current).not.toHaveProperty("inventory");
+});
+
+test("actual registered payload constraints reject a native envelope's malformed or extra data", () => {
+  const f = fixture();
+  expect(() => f.registry.parseObservation({ ...f.observation, data: { counter: 0.5, opaque_usage: { schema_version: 2 } } })).toThrow();
+  expect(() => f.registry.parseObservation({ ...f.observation, data: { ...f.observation.data, player: {} } })).toThrow();
+});
+
+test("capability parsing preserves legitimate adapter data named scope/epoch without granting host authority", () => {
+  const f = fixture();
+  const value = f.registry.parseCapability("contract.action", 1, { kind: "press", scope: "local-mechanical-scope", epoch: 17 });
+  expect(value).toEqual({ kind: "press", scope: "local-mechanical-scope", epoch: 17 });
+  expect(() => f.registry.parseCapability("contract.action", 1, { kind: "press", scope: "local", epoch: 0.5 })).toThrow();
+  expect(() => f.registry.parseCapability("contract.action", 1, { kind: "press", scope: "local", epoch: 17,
+    source_hash: "a".repeat(64) })).toThrow();
+});
+
+test("a missing capability/schema version is rejected, never replaced by an empty successful result", () => {
+  const f = fixture();
+  expect(() => f.registry.parseCapability("unimplemented.gui", 1, {})).toThrow();
+  expect(() => f.registry.parseCapability("contract.action", 2, {})).toThrow();
+});
+
+test("agreeing hashes cannot register a tampered schema document", () => {
+  const f = fixture();
+  f.schemas.capabilities["contract.action@1"] = { type: "null" };
+  expect(() => new RegisteredAdapterContract(f.descriptor, f.schemas)).toThrow();
+});

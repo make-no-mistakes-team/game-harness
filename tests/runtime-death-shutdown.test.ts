@@ -4,13 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
-import type { AuthState, BridgeNotice, GameActionResult, GameBridge, GameState, Observation } from "../src/shared/contracts.ts";
+import type { AuthState, BridgeNotice, GameActionResult, GameBridge, GameState } from "../src/shared/contracts.ts";
 import type { SkillCapabilityRequest } from "../src/shared/programs.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import { Runtime } from "../src/server/runtime.ts";
 import { Store } from "../src/server/store.ts";
 import type { AuthManager } from "../src/server/auth.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
+import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 
 const resources: { runtime: Runtime; store: Store; directory: string; release(): void }[] = [];
 afterEach(async () => {
@@ -24,7 +25,7 @@ afterEach(async () => {
 
 test("a genuine transport fault pauses only after native and isolated emitters close, retaining unknown history and first cause", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-death-drain-"));
-  const store = new Store(directory);
+  const store = new Store(directory), adapter = minecraftTestAdapter();
   const worldId = crypto.randomUUID();
   const death = "The native control transport ended unexpectedly.";
   const unknown: GameActionResult = {
@@ -41,20 +42,13 @@ test("a genuine transport fault pauses only after native and isolated emitters c
   const disconnectRequested = Promise.withResolvers<void>();
   const cancellationSettled = Promise.withResolvers<void>();
   const paused = Promise.withResolvers<void>();
-  const observation: Observation = {
-    schema_version: 2, world_id: worldId, epoch: 1, observation_seq: 1,
-    session_id: "fixture-session",
-    life: { life_id: 1, status: "alive", can_respawn: false, death: null },
-    captured_at: new Date().toISOString(), profile_id: "player-observable-structured",
-    preset_id: "minecraft-observable-initial-r2",
-    player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: 20, food: 20, on_ground: true, in_water: false, inventory: [] },
-    blocks: [], entities: [], sounds: [], coverage: { partial: true, max_age_ms: 1000 },
-  };
+  const observation = minecraftObservationFixture(adapter, { world_id: worldId, session_id: "fixture-session" });
   let state: GameState = {
     status: "connected", username: "Fixture", version: "1.21.4", world_id: worldId, epoch: 1,
-    session_id: observation.session_id, life: observation.life, motor_profile: "balanced",
+    session_id: observation.session_id, life: observation.life, binding: minecraftTestBinding(adapter),
+    space: observation.space, screen: null, presentation: adapter.projectObservation(observation),
     video: { status: "idle", width: 0, height: 0, fps: null, frames: 0, last_frame_at: null, error: null },
-    last_observation_at: observation.captured_at, player: observation.player, error: null,
+    last_observation_at: observation.captured_at, error: null,
   };
   const listeners = new Set<(notice: BridgeNotice) => void>();
   let connections = 0, prompts = 0, agentCreations = 0;
@@ -71,8 +65,8 @@ test("a genuine transport fault pauses only after native and isolated emitters c
     execute: async () => { actionEntered.resolve(); return await action.promise; },
     cancel: async () => { await nativeClosed.promise; },
     neutralize: async () => { await nativeClosed.promise; },
-    setMotorProfile: async () => {},
-    recipes: async () => [],
+    emergencyStop: async () => { await nativeClosed.promise; },
+    adapter: () => adapter,
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
   };
   let tools: AgentTool[] = [], gate: Parameters<Agent["setBeforeModelCall"]>[0], initialized = false;
@@ -117,10 +111,10 @@ test("a genuine transport fault pauses only after native and isolated emitters c
   } as unknown as SandboxService;
   const runtime = new Runtime(store, auth, game, sandbox, () => {
     if (runtime.snapshot()?.status === "paused") paused.resolve();
-  });
+  }, { adapter });
   resources.push({ runtime, store, directory, release: () => { action.resolve(unknown); nativeClosed.resolve(); workerClosed.resolve(); } });
   await runtime.initialize();
-  const created = await runtime.createRun({ task: "Observe neutral cancellation", goal: "custom", model_id: "fixture-model" });
+  const created = await runtime.createRun({ task: "Observe neutral cancellation", goal: adapter.goals.find(goal => goal.goal_id === "custom")!, model_id: "fixture-model" });
   store.subscribe(event => {
     if (event.run_id !== created.run_id) return;
     if (event.type === "scheduler.turn_finished" && prompts === 1) plannerSettled.resolve();
@@ -129,7 +123,7 @@ test("a genuine transport fault pauses only after native and isolated emitters c
   await runtime.control(created.run_id, "start");
   await actionEntered.promise;
   await plannerSettled.promise;
-  state = { ...state, status: "error", player: null, error: death };
+  state = { ...state, status: "error", presentation: null, error: death };
   for (const listener of listeners) listener({ type: "state", data: null });
   action.resolve(unknown);
   await disconnectRequested.promise;

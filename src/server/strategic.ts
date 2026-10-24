@@ -5,17 +5,20 @@ import type {
   ActionView,
   ActivityEvent,
   Json,
-  Observation,
+  ObservationV3,
   PolicyView,
   UsagePurpose,
 } from "../shared/contracts.ts";
+import type { AdapterActorProjection } from "../shared/observations.ts";
 import type { AuthManager } from "./auth.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import type { Store, StoredRun } from "./store.ts";
 import { recordCall, recordUsage } from "./usage.ts";
+import { ProviderUsageCollector } from "./provider-usage.ts";
 import type { SpeculativePlanning } from "./speculative-planning.ts";
 import { isToolAllowed } from "../shared/tool-policy.ts";
 import { ProgramWorkspace, type ModelReviewContext } from "./program-workspace.ts";
+import type { ModelObservation } from "./actor-frames.ts";
 
 const COALESCE_MS = 100;
 const EMPTY_COOLDOWN_MS = 5_000;
@@ -61,13 +64,22 @@ const FEEDBACK_TYPES: Record<string, true> = {
   "runtime.uncertainty_blocked": true,
 };
 
+/** Optional host governance at the actual request/transport ownership boundary. */
+export interface StrategicRequestAdmission {
+  reserve(requestId: string, model: { id: string; provider: string; api: string }): void;
+  transportEnded(requestId: string, closed: boolean): void;
+  drained(requestIds: readonly string[]): void;
+}
+
 export interface StrategicHost {
   run(): StoredRun | null;
   generation(): number;
   assertCurrent(generation: number, epoch?: number): StoredRun;
   tools(generation: number): AgentTool[];
   rootPrompt(): string;
-  observe(): Promise<Observation>;
+  observe(): Promise<ObservationV3>;
+  modelObservation?(): Promise<ModelObservation>;
+  projectObservation(observation: ObservationV3, previous: ObservationV3 | null): AdapterActorProjection;
   policies(): PolicyView[];
   action(): ActionView | null;
   programPending(): boolean;
@@ -78,22 +90,17 @@ export interface StrategicHost {
   speculation?(): SpeculativePlanning;
   reviewContext?(): ModelReviewContext;
   reviewComplete?(): void;
+  requestAdmission?: StrategicRequestAdmission;
 }
 
 interface RequestAttempt {
   id: string;
+  usage: ProviderUsageCollector;
   purpose: UsagePurpose;
   index: number;
   planId: string | null;
   review: boolean;
   role: "speculative" | "review" | "recovery" | "planning";
-}
-
-function inventoryCounts(observation: Observation): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const item of observation.player.inventory)
-    counts[item.name] = (counts[item.name] ?? 0) + item.count;
-  return counts;
 }
 
 function record(value: Json): { [key: string]: Json } | null {
@@ -151,7 +158,10 @@ function feedbackEntry(event: ActivityEvent, workspace: ProgramWorkspace): Json 
           ? error.message.slice(0, 300)
           : "Tool rejected",
     };
+    if (Array.isArray(error.issues)) (selected.error as { [key: string]: Json }).issues = error.issues.slice(0, 8);
   }
+  const diagnostic = details?.diagnostic ?? (details ? record(details.details ?? null)?.diagnostic : null);
+  if (diagnostic) selected.diagnostic = diagnostic;
   return {
     event_seq: event.event_seq,
     type: event.type,
@@ -179,10 +189,13 @@ export class StrategicPlanner {
   private emptyTurns = 0;
   private workRevision = 0;
   private contextCursor = 0;
-  private previousInventory: Record<string, number> | null = null;
+  private previousObservation: ObservationV3 | null = null;
   private purpose: UsagePurpose = "planning";
   private role: RequestAttempt["role"] = "planning";
   private request: RequestAttempt | null = null;
+  private readonly responseOwners = new Map<string, string>();
+  private readonly admittedRequests = new Set<string>();
+  private readonly streamDrains = new Map<string, { drained: Promise<void>; close(): Promise<unknown> }>();
   private wakeReasons = new Set<string>();
   private wakeTimer: NodeJS.Timeout | undefined;
   private idleTimer: NodeJS.Timeout | undefined;
@@ -213,10 +226,11 @@ export class StrategicPlanner {
     this.emptyTurns = 0;
     this.workRevision = 0;
     this.contextCursor = 0;
-    this.previousInventory = null;
+    this.previousObservation = null;
     this.purpose = "planning";
     this.role = "planning";
     this.request = null;
+    this.responseOwners.clear();
   }
 
   async start(generation: number): Promise<void> {
@@ -245,6 +259,88 @@ export class StrategicPlanner {
           "Strategic startup authority was revoked",
         );
       this.host.assertCurrent(generation);
+      const stream = agent.streamFn;
+      // Agent snapshots its raw interceptor before the admission gate runs.
+      // Bind at the supported stream invocation boundary instead: this closure
+      // captures one admitted request, never a mutable latest-request pointer.
+      agent.streamFn = async (model, context, options) => {
+        const request = this.request;
+        if (!request) throw new RuntimeFault("stale_context", "No admitted strategic request owns this stream");
+        const events = await stream(model, context, { ...options, onSseEvent: (event, eventModel) => {
+          request.usage.observe(event, eventModel ?? model);
+          options?.onSseEvent?.(event, eventModel);
+        } });
+        const admission = this.host.requestAdmission;
+        if (admission) {
+          const iterator = events[Symbol.asyncIterator]();
+          const drained = Promise.withResolvers<void>();
+          void drained.promise.catch(() => {});
+          const finished = { done: true as const, value: undefined };
+          let exhausted = false, reported = false, closed = false, closing = false;
+          let pending: Awaited<ReturnType<typeof iterator.next>> | undefined;
+          let closeWork: Promise<typeof finished> | undefined;
+          const finish = (natural: boolean) => {
+            if (reported) return;
+            admission.transportEnded(request.id, natural);
+            reported = true;
+            drained.resolve();
+          };
+          const closeIterator = () => {
+            if (closeWork) return closeWork;
+            closing = true;
+            closeWork = (async () => {
+              try {
+                if (!exhausted) {
+                  if (!iterator.return) throw new RuntimeFault("backend_unavailable", "Strategic stream has no confirmable iterator closure");
+                  const termination = await iterator.return();
+                  if (!termination.done) throw new RuntimeFault("backend_unavailable", "Strategic iterator return did not confirm closure");
+                }
+                closed = true;
+                finish(false);
+                return finished;
+              } catch (error) { drained.reject(error); throw error; }
+            })();
+            return closeWork;
+          };
+          const ownedIterator = {
+            async next() {
+              if (closed || closing) return finished;
+              try {
+                const next = pending ?? await iterator.next();
+                pending = undefined;
+                if (next.done) {
+                  exhausted = true;
+                  closed = true;
+                  if (!closing) finish(true);
+                  return next;
+                }
+                if (!closing && (next.value.type === "done" || next.value.type === "error")) {
+                  // The SDK returns on a terminal event without requesting
+                  // next.done. Observe actual iterator exhaustion first.
+                  const tail = await iterator.next();
+                  if (tail.done) {
+                    exhausted = true;
+                    closed = true;
+                    if (!closing) finish(true);
+                  } else {
+                    pending = tail;
+                  }
+                }
+                return next;
+              } catch (error) {
+                await closeIterator();
+                throw error;
+              }
+            },
+            return: closeIterator,
+          };
+          // Ownership exists before next(): returning an unstarted lazy
+          // generator would otherwise skip its body and every finally block.
+          events[Symbol.asyncIterator] = () => ownedIterator;
+          this.streamDrains.set(request.id, { drained: drained.promise, close: closeIterator });
+        }
+        return events;
+      };
       agent.setBeforeModelCall((_context, signal) => {
         const stop = (reason: string) => {
           this.gateReason = reason;
@@ -272,10 +368,15 @@ export class StrategicPlanner {
           return stop("Finite strategic call allowance reached");
         if (!this.speculativeTurn && this.host.programPending()) this.pendingAllowance--;
         this.gateReason = null;
+        const requestId = randomUUID();
+        try { this.host.requestAdmission?.reserve(requestId, agent.state.model); }
+        catch { return stop("The finite registered study request allowance or ownership gate refused admission"); }
+        if (this.host.requestAdmission) this.admittedRequests.add(requestId);
         this.turnCalls++;
         run.turns++;
         this.request = {
-          id: randomUUID(),
+          id: requestId,
+          usage: new ProviderUsageCollector(requestId, this.responseOwners),
           purpose: this.purpose,
           index: this.turnCalls,
           planId: this.speculativeTurn ? this.host.speculation?.().projection()?.plan_id ?? null : null,
@@ -475,6 +576,9 @@ export class StrategicPlanner {
           // Keep ownership for a later Stop retry; never install a replacement.
         }
       }
+      const streamWork: Promise<unknown>[] = [];
+      for (const stream of this.streamDrains.values()) streamWork.push(stream.close(), stream.drained);
+      const streamSettlements = await Promise.allSettled(streamWork);
       if (released) {
         this.unsubscribeAgent?.();
         this.unsubscribeAgent = null;
@@ -482,12 +586,18 @@ export class StrategicPlanner {
       }
       if (
         !released ||
-        settlements.some((result) => result.status === "rejected")
+        settlements.some((result) => result.status === "rejected") ||
+        streamSettlements.some((result) => result.status === "rejected")
       )
         throw new RuntimeFault(
           "backend_unavailable",
           "Strategic request shutdown could not be confirmed; admission remains fenced",
         );
+      if (this.admittedRequests.size) {
+        this.host.requestAdmission?.drained([...this.admittedRequests]);
+        this.admittedRequests.clear();
+      }
+      this.streamDrains.clear();
     })();
     this.closing = closure;
     void closure
@@ -637,9 +747,12 @@ export class StrategicPlanner {
       Math.max(1, this.turnDeadline - Date.now()),
     );
     let through = this.contextCursor;
-    let inventory: Record<string, number> | null = null;
+    let projectedObservation: ObservationV3 | null = null;
+    let prompting = false;
     try {
-      const observation = await this.host.observe();
+      const selected = this.host.modelObservation ? await this.host.modelObservation() :
+        { observation: await this.host.observe(), images: [], image_metadata: { mode: "disabled" } };
+      const observation = selected.observation;
       if (!this.current(run, generation)) return;
       this.host.assertCurrent(generation, observation.epoch);
       if (observation.world_id !== run.world_id)
@@ -676,16 +789,8 @@ export class StrategicPlanner {
           bytes += size;
         }
       }
-      inventory = inventoryCounts(observation);
-      const previous = this.previousInventory ?? run.baseline;
-      const inventoryChange = Object.fromEntries(
-        [...new Set([...Object.keys(previous), ...Object.keys(inventory)])]
-          .filter((name) => (inventory![name] ?? 0) !== (previous[name] ?? 0))
-          .map((name) => [
-            name,
-            (inventory![name] ?? 0) - (previous[name] ?? 0),
-          ]),
-      );
+      const projection = this.host.projectObservation(observation, this.previousObservation);
+      projectedObservation = observation;
       this.store.event(
         run.run_id,
         "scheduler.context_selected",
@@ -710,6 +815,7 @@ export class StrategicPlanner {
             tools: selectedTools.map((tool) => tool.name),
           });
         }
+        prompting = true;
         await agent.prompt(
           JSON.stringify({
             reason: reasons,
@@ -717,22 +823,15 @@ export class StrategicPlanner {
             phase: run.status,
             role: this.role,
             task: run.task,
+            image_metadata: selected.image_metadata,
             life: { status: observation.life.status, can_respawn: observation.life.can_respawn,
               death: observation.life.death ? { at: observation.life.death.at, message: observation.life.death.message } : null },
             speculative_plan: workspace.planningView(speculative),
             improvement_review: reviewContext ? workspace.feedbackView(reviewContext) : null,
-            player: {
-              position: observation.player.position,
-              yaw: observation.player.yaw,
-              pitch: observation.player.pitch,
-              health: observation.player.health,
-              food: observation.player.food,
-              on_ground: observation.player.on_ground,
-              in_water: observation.player.in_water,
-              inventory,
-              inventory_change: inventoryChange,
-              observation_seq: observation.observation_seq,
-            },
+            adapter_state: projection.state,
+            adapter_metadata: projection.metadata,
+            observation_summary: projection.summary,
+            observation_seq: observation.observation_seq,
             current_action: action
               ? {
                   kind: action.kind,
@@ -771,13 +870,19 @@ export class StrategicPlanner {
               : this.host.programPending()
                 ? "A program is still meaningful authorized work. This is one bounded attention/outcome/replan request, not permission to poll or duplicate it. Use tools for any necessary detailed evidence."
                 : "Advance the task using current evidence. Choose useful bounded work, react to trial evidence, or explain a genuine obstacle. No human continuation is needed.",
-          }),
+          }), selected.images,
         );
       }
       if (Date.now() >= this.turnDeadline) deadlineReached = true;
     } catch {
-      if (this.current(run, generation) && !deadlineReached)
-        this.providerFailed = true;
+      if (this.current(run, generation) && !deadlineReached) {
+        if (prompting) this.providerFailed = true;
+        else {
+          this.store.event(run.run_id, "runtime.model_observation_failed", "Authorized model observation could not be prepared; no provider request was made", { provider_request_made: false });
+          run.model_status = "idle";
+          this.host.pause("Authorized model image/observation preparation failed; inspect platform evidence before resuming");
+        }
+      }
     } finally {
       clearTimeout(timer);
       this.finishUnsettledRequest(run);
@@ -834,7 +939,7 @@ export class StrategicPlanner {
     // Nothing was delivered in that case, so do not consume selected evidence.
     if (this.turnCalls) {
       this.contextCursor = through;
-      this.previousInventory = inventory;
+      this.previousObservation = projectedObservation;
     }
     run.model_status = "idle";
     this.store.event(
@@ -905,6 +1010,7 @@ export class StrategicPlanner {
         speculative_plan_id: request.planId,
         read_only_review: request.review,
         usage_reported: false,
+        usage_evidence: request.usage.finish(null) as unknown as Json,
       },
     );
     this.request = null;
@@ -947,6 +1053,12 @@ export class StrategicPlanner {
           const previous = run.usage.by_purpose[provisionalPurpose];
           const classified = run.usage.by_purpose[purpose];
           if (previous.calls !== null) previous.calls--;
+          if (classified.calls === 0 && classified.legacy_input === null) {
+            classified.uncached_input = null;
+            classified.cache_read = null;
+            classified.cache_write = null;
+            classified.output = null;
+          }
           if (classified.calls !== null) classified.calls++;
           request.purpose = purpose;
         }
@@ -960,18 +1072,21 @@ export class StrategicPlanner {
           requested_tools: toolNames.slice(0, TOOL_CALLS),
           omitted_tool_names: Math.max(0, toolNames.length - TOOL_CALLS),
         });
+        const evidence = request.usage.finish(message.usage);
         if (message.usage) {
           recordUsage(run.usage, request.purpose, message.usage);
-          this.store.event(
+        }
+        this.store.event(
             run.run_id,
             "model.usage",
-            "Provider-reported token usage recorded; subscription monetary cost is unknown",
+            "SDK-reported subtotal and separately observed terminal accounting evidence; subscription cost is unknown",
             {
-              input_tokens: message.usage.input,
-              uncached_input_tokens: message.usage.input,
-              output_tokens: message.usage.output,
-              cache_read_tokens: message.usage.cacheRead,
-              cache_write_tokens: message.usage.cacheWrite,
+              input_tokens: evidence.sdk_reported?.uncached_input ?? null,
+              uncached_input_tokens: evidence.sdk_reported?.uncached_input ?? null,
+              output_tokens: evidence.sdk_reported?.output ?? null,
+              cache_read_tokens: evidence.sdk_reported?.cache_read ?? null,
+              cache_write_tokens: evidence.sdk_reported?.cache_write ?? null,
+              usage_evidence: evidence as unknown as Json,
               request_id: request.id,
               provider_response_id: message.responseId ?? null,
               purpose: request.purpose,
@@ -981,7 +1096,6 @@ export class StrategicPlanner {
               read_only_review: request.review,
             },
           );
-        }
         this.store.event(
           run.run_id,
           "model.request_settled",

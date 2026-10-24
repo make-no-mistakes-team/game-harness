@@ -5,7 +5,7 @@ import { z } from "zod";
 import { AuthManager } from "./auth.ts";
 import { GameBridgeClient } from "./game-bridge.ts";
 import { MinecraftServer } from "./minecraft-server.ts";
-import { Runtime, GOALS } from "./runtime.ts";
+import { Runtime } from "./runtime.ts";
 import { SandboxService } from "./sandbox.ts";
 import { Store } from "./store.ts";
 import { JevBroker } from "./jev.ts";
@@ -66,7 +66,8 @@ const jev = await JevBroker.create(DATA_DIR, { onChange });
 const runtime = new Runtime(store, auth, game, sandbox, onChange, {
   experienceDirectory: DATA_DIR,
   judge: jev,
-  adapter_id: "fabric-owned-client",
+  adapter: () => game.adapter(),
+  actorFrames: game,
 });
 const video = new VideoStream((milliseconds) =>
   performanceMonitor.record("video_forward_ms", milliseconds),
@@ -147,7 +148,7 @@ function snapshot(): AppSnapshot {
     game: game.snapshot(),
     sandbox: sandbox.snapshot(),
     run: runtime.snapshot(),
-    goals: GOALS,
+    goals: runtime.goals(),
     events: store.events(null, 0, 150),
   };
 }

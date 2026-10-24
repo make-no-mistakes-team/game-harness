@@ -6,69 +6,45 @@ import type {
   GameActionResult,
   GameBridge,
   GoalChoice,
-  GoalId,
+  AdapterGoal,
+  AdapterEvidence,
+  RuntimeAdapter,
+  VerificationManifest,
+  ProgramCompatibility,
   Json,
-  Observation,
+  ObservationV3,
   PolicyContext,
   RunView,
 } from "../shared/contracts.ts";
 import type { SkillExecutionView } from "../shared/programs.ts";
-import { goalSchema } from "../shared/validation.ts";
+import { goalSchema, verificationResultSchema } from "../shared/validation.ts";
+import type { EffectContext, EffectScope } from "../shared/control.ts";
+import { sameScreen } from "../shared/control.ts";
+import { adapterCompatibility, canonicalContractJson } from "./adapter-contract.ts";
+import { RegisteredAdapterContract } from "./registered-adapter.ts";
+import { observationEvidence } from "./adapter-evidence.ts";
 import type { AuthManager } from "./auth.ts";
 import type { SandboxService } from "./sandbox.ts";
 import type { Store, StoredRun } from "./store.ts";
 import { SkillManager } from "./skills.ts";
 import { emptyRunUsage } from "./usage.ts";
 import {
-  CURRENT_PROGRAM_COMPATIBILITY,
   ExperienceLibrary,
   promotionDeclarationSchema as promotionSchema,
-  type ProgramCompatibility,
   type PromotionDeclaration,
 } from "./experience.ts";
 import type { FastJudgeBroker } from "./fast-provider.ts";
 import { programEvidence } from "./program-evidence.ts";
 import { ActionArbiter } from "./action-arbiter.ts";
 import { ReactiveRuntime } from "./reactive.ts";
-import { StrategicPlanner } from "./strategic.ts";
+import { StrategicPlanner, type StrategicRequestAdmission } from "./strategic.ts";
 import { RuntimeTools } from "./runtime-tools.ts";
 import { createRuntimePrompt } from "./runtime-prompt.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { SpeculativePlanning } from "./speculative-planning.ts";
 import { ImprovementLearning } from "./improvement-learning.ts";
 import { ExecutionTrace } from "./execution-trace.ts";
-
-export const GOALS: GoalChoice[] = [
-  {
-    id: "break_log",
-    label: "Break a log",
-    prompt: "Remove at least one eligible log, wood, stem or hyphae block during this run with a server-confirmed block-removal receipt. Inventory gain is not required.",
-  },
-  {
-    id: "collect_wood",
-    label: "Collect wood",
-    prompt:
-      "Acquire at least one additional wood log, wood block, stem, or hyphae item relative to the inventory at run start.",
-  },
-  {
-    id: "craft_crafting_table",
-    label: "Craft a crafting table",
-    prompt:
-      "Successfully craft a crafting table during this run and retain a crafting table in inventory.",
-  },
-  {
-    id: "craft_stone_pickaxe",
-    label: "Craft a stone pickaxe",
-    prompt:
-      "Successfully craft a stone pickaxe during this run and retain a stone pickaxe in inventory.",
-  },
-  {
-    id: "custom",
-    label: "Custom task",
-    prompt:
-      "Pursue the supplied task. As soon as actual authorized evidence shows the whole task is done, call task_finish with a brief evidence summary. This stops the run as model-reported, unverified completion, not trusted goal verification.",
-  },
-];
+import { ActorFrameSelector, type ModelObservation } from "./actor-frames.ts";
 
 const TERMINAL: Partial<Record<RunView["status"], true>> = {
   stopped: true,
@@ -83,23 +59,23 @@ const ACTION_TERMINAL = new Set([
 ]);
 const BRIDGE_FAILURE =
   "The game effect could not be safely reconciled. Reconnect the game before resuming; no uncertain action will be replayed.";
-function inventoryCounts(observation: Observation): Record<string, number> {
-  const counts: Record<string, number> = {};
-  for (const item of observation.player.inventory)
-    counts[item.name] = (counts[item.name] ?? 0) + item.count;
-  return counts;
-}
 export interface RuntimeOptions {
+  actorFrames?: { latestFrame(): Uint8Array | null; subscribeFrames(listener: (frame: Uint8Array) => void): () => void };
   experienceDirectory?: string;
   judge?: FastJudgeBroker;
-  adapter_id?: string;
+  adapter?: RuntimeAdapter | (() => RuntimeAdapter | null);
+  requestAdmission?: StrategicRequestAdmission;
 }
 
 /** Lifecycle and trusted observation/goal authority; execution modules own their scheduling. */
 export class Runtime {
+  private readonly actorFrames: ActorFrameSelector | null;
+  private readonly actorFrameSource: RuntimeOptions["actorFrames"];
+  private readonly imageAuthorityWaits = new Set<() => void>();
   private readonly skills: SkillManager;
   private readonly experience: ExperienceLibrary | null;
-  private readonly compatibility: ProgramCompatibility | null;
+  private readonly adapterSource: RuntimeOptions["adapter"];
+  private readonly registrations = new WeakMap<RuntimeAdapter, RegisteredAdapterContract>();
   private readonly actions: ActionArbiter;
   private readonly reactions: ReactiveRuntime;
   private readonly strategic: StrategicPlanner;
@@ -108,18 +84,65 @@ export class Runtime {
   private readonly learning: ImprovementLearning;
   private readonly trace: ExecutionTrace;
   private run: StoredRun | null = null;
-  private observation: Observation | null = null;
-  private observationRequest: Promise<Observation> | null = null;
-  private inventoryEvidence = "";
+  private observation: ObservationV3 | null = null;
+  private observationRequest: Promise<ObservationV3> | null = null;
+  private verificationManifest: VerificationManifest | null = null;
+  private verificationSnapshot: AdapterEvidence | null = null;
+  private verificationPending: AdapterEvidence[] = [];
+  private verificationKey = "";
   private generation = 0;
   private unsubscribeGame: (() => void) | null = null;
   private lifecycle: Promise<void> = Promise.resolve();
   private needsReconnect = false;
-  private completedCrafts = new Set<string>();
   private closed = false;
   private deathIds = new Set<string>();
   private lifeRecovery: Promise<void> | null = null;
   private uncertaintyRecovery: Promise<void> | null = null;
+
+  private context() {
+    const adapter = typeof this.adapterSource === "function" ? this.adapterSource() : this.adapterSource ?? this.game.adapter();
+    const binding = this.game.snapshot().binding;
+    if (!adapter || !binding?.ready) throw new RuntimeFault("precondition_failed", "A negotiated adapter contract is required");
+    let registration = this.registrations.get(adapter);
+    if (!registration) { registration = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas); this.registrations.set(adapter, registration); }
+    if (registration.compatibility.compatibility_hash !== binding.compatibility_hash)
+      throw new RuntimeFault("precondition_failed", "Runtime adapter and native negotiated descriptor do not match");
+    return { adapter, binding, registration };
+  }
+  private currentCompatibility(): ProgramCompatibility | null {
+    return this.game.snapshot().binding?.ready ? this.context().registration.compatibility : null;
+  }
+  goals(): GoalChoice[] {
+    if (!this.game.snapshot().binding?.ready) return [];
+    const adapter = this.context().adapter;
+    return adapter.goalChoices ? [...adapter.goalChoices] : adapter.goals.map(goal => ({
+      id: goal.goal_id, goal, label: goal.goal_id, prompt: goal.goal_id === "custom" ? "Pursue the supplied custom task; completion is model-reported and unverified." : goal.goal_id,
+    }));
+  }
+  private goalChoice(): GoalChoice {
+    if (!this.run || typeof this.run.goal === "string") throw new RuntimeFault("precondition_failed", "Historical goals are inspect-only");
+    const goal = this.run.goal;
+    return this.goals().find(choice => choice.id === goal.goal_id) ??
+      { id: goal.goal_id, goal, label: goal.goal_id, prompt: this.run.task };
+  }
+  private effectContext(): EffectContext {
+    const run = this.run, state = this.game.snapshot();
+    if (!run || !state.binding?.ready || !state.session_id || !state.life || !state.space)
+      throw new RuntimeFault("stale_context", "Current native lifecycle context is unavailable");
+    return { run_id: run.run_id, run_generation: this.generation, world_id: run.world_id, epoch: run.epoch,
+      session_id: state.session_id, native_boot_id: state.binding.native_boot_id, life_id: state.life.life_id, space_epoch: state.space.space_epoch };
+  }
+  private recordEffectEvidence(action: GameAction, result: GameActionResult, view: ActionView): void {
+    const run = this.run;
+    if (!run || run.status !== "running" || !view.scope || view.scope.run_id !== run.run_id || view.compatibility_hash !== run.compatibility_hash) return;
+    const adapter = this.context().adapter;
+    const events = adapter.effectEvidence?.(view.scope, view.action_id, action, result, view.ended_at ?? new Date().toISOString()) ?? [];
+    for (const evidence of events) {
+      this.store.event(run.run_id, "adapter.evidence", "Adapter-owned permitted effect evidence", evidence as unknown as Json);
+      this.verificationPending.push(evidence);
+    }
+    this.verifyGoal();
+  }
 
   constructor(
     private readonly store: Store,
@@ -129,32 +152,48 @@ export class Runtime {
     private readonly onChange: () => void,
     options: RuntimeOptions = {},
   ) {
-    this.compatibility =
-      options.adapter_id === "fabric-owned-client"
-        ? CURRENT_PROGRAM_COMPATIBILITY
-        : null;
+    this.adapterSource = options.adapter;
+    this.actorFrameSource = options.actorFrames;
+    this.actorFrames = options.actorFrames ? new ActorFrameSelector({
+      latestFrame: () => options.actorFrames!.latestFrame(),
+      scope: () => {
+        const run = this.run, state = this.game.snapshot();
+        if (!run || state.status !== "connected" || state.error || state.world_id !== run.world_id ||
+          state.session_id !== run.session_id || state.epoch !== run.epoch || state.life?.life_id !== run.life_id) return null;
+        if (!state.binding?.ready || !state.space || state.binding.native_boot_id !== run.native_boot_id ||
+          state.binding.compatibility_hash !== run.compatibility_hash) return null;
+        return { run_id: run.run_id, world_id: run.world_id, session_id: run.session_id!,
+          epoch: run.epoch, life_id: run.life_id!, generation: this.generation,
+          native_boot_id: state.binding.native_boot_id, compatibility_hash: state.binding.compatibility_hash,
+          space: state.space, screen: state.screen };
+      },
+    }) : null;
     this.experience = options.experienceDirectory
-      ? new ExperienceLibrary(options.experienceDirectory, this.compatibility)
+      ? new ExperienceLibrary(options.experienceDirectory, () => this.currentCompatibility())
       : null;
     this.learning = new ImprovementLearning(store);
     this.trace = new ExecutionTrace(store);
     this.planning = new SpeculativePlanning({
+      contract: () => this.context().adapter,
       admissionContext: () => {
         const run = this.run, state = game.snapshot();
         if (!run || run.status !== "running" || state.status !== "connected" || state.error !== null ||
           state.world_id !== run.world_id || state.epoch !== run.epoch || state.session_id !== run.session_id ||
           !state.session_id || !state.life || state.life.life_id !== run.life_id ||
-          this.lifeRecovery || this.uncertaintyRecovery) return null;
+          this.lifeRecovery || this.uncertaintyRecovery || typeof run.goal === "string" || !state.binding?.ready || !state.space) return null;
         return {
           run_id: run.run_id, world_id: run.world_id, generation: this.generation,
           session_id: state.session_id, epoch: state.epoch,
           life_id: state.life.life_id, life_status: state.life.status,
+          native_boot_id: state.binding.native_boot_id, space_epoch: state.space.space_epoch,
+          compatibility_hash: state.binding.compatibility_hash, screen: state.screen,
           task: run.task, goal: run.goal,
         };
       },
       context: () => {
         const run = this.run, state = game.snapshot();
-        if (!run || run.status !== "running" || !state.session_id || !state.life || this.lifeRecovery || this.uncertaintyRecovery) return null;
+        if (!run || run.status !== "running" || !state.session_id || !state.life || this.lifeRecovery || this.uncertaintyRecovery ||
+          typeof run.goal === "string" || !state.binding?.ready || !state.space) return null;
         const root = store.latestRootExecution(run.run_id);
         if (!root) return null;
         const source = store.skill(run.run_id, root);
@@ -162,6 +201,8 @@ export class Runtime {
           run_id: run.run_id, world_id: run.world_id, generation: this.generation,
           session_id: state.session_id, epoch: state.epoch,
           life_id: state.life.life_id, life_status: state.life.status,
+          native_boot_id: state.binding.native_boot_id, space_epoch: state.space.space_epoch,
+          compatibility_hash: state.binding.compatibility_hash, screen: state.screen,
           task: run.task, goal: run.goal,
           root: { execution_id: root.execution_id, skill_id: root.skill_id, version: root.version, hash: source.hash, status: root.status },
         };
@@ -172,7 +213,7 @@ export class Runtime {
       },
       observe: () => this.refreshObservation(),
       evaluateGuard: (source, observation, args, signal) =>
-        sandbox.evaluateGameGuard(source, observation, args, signal),
+        sandbox.evaluateGameGuard(source, observation, args, signal, this.context().adapter),
       admit: async (request, permit) => {
         permit.assertCurrent();
         if (permit.signal.aborted) throw new RuntimeFault("stale_context", "Plan admission cancelled");
@@ -185,10 +226,13 @@ export class Runtime {
         reason === "lookahead" ? "speculative_lookahead" : "planning_continuation",
       ),
     });
-    this.actions = new ActionArbiter(store, game, {
+    this.actions = ActionArbiter.attach(store, game, {
       run: () => this.run,
       generation: () => this.generation,
       needsReconnect: () => this.needsReconnect,
+      adapter: () => this.context().adapter,
+      invocation: (id) => this.skills.invocation(id),
+      effectScope: (id) => this.skills.effectScope(id),
       changed: onChange,
       wake: (reason) => this.strategic.wake(reason),
       pause: (message, reconnect) =>
@@ -198,52 +242,32 @@ export class Runtime {
       admitted: () => this.strategic.admitted(),
       effect: (policy, kind, evidence) =>
         this.reactions.recordEffect(policy, kind, evidence),
-      succeeded: (action, result, view) => {
-        if (action.kind === "craft") this.completedCrafts.add(action.item);
-        if (
-          this.run?.status === "running" &&
-          this.run.goal === "break_log" &&
-          action.kind === "dig" &&
-          result.evidence &&
-          typeof result.evidence === "object" &&
-          !Array.isArray(result.evidence) &&
-          result.evidence.effect_confirmed === true &&
-          result.evidence.source === "server_block_update" &&
-          typeof result.evidence.target_name === "string" &&
-          /_(log|wood|stem|hyphae)$/.test(result.evidence.target_name)
-        ) {
-          this.store.event(this.run.run_id, "goal.verified", "Trusted verifier confirmed an eligible block removal", {
-            kind: "block_removal",
-            goal: "break_log",
-            item: result.evidence.target_name,
-            action_id: view.action_id,
-            execution_id: view.execution_id,
-            session_id: view.session_id,
-            life_id: view.life_id,
-            evidence: result.evidence,
-          });
-          this.requestTerminal("completed", "Goal completed with verified block-removal evidence");
-        }
-      },
+      settled: (action, result, view) => this.recordEffectEvidence(action, result, view),
     });
     this.skills = new SkillManager(store, sandbox, {
       prepareLookahead: (config) => this.planning.prepareOptIn(config),
-      authorize: (runId, epoch, sessionId, lifeId) => {
-        if (this.run?.run_id !== runId || this.run.status !== "running")
+      adapter: () => this.context().adapter,
+      binding: () => this.game.snapshot().binding,
+      authorize: (scope) => {
+        if (this.run?.run_id !== scope.run_id || this.run.status !== "running")
           throw new RuntimeFault(
             "stale_context",
             "Skill effect authority is closed",
           );
-        this.assertCurrent(this.generation, epoch);
+        this.assertCurrent(scope.run_generation, scope.epoch);
         const state = this.game.snapshot();
-        if (this.lifeRecovery || this.uncertaintyRecovery || state.session_id !== sessionId || state.life?.life_id !== lifeId ||
+        if (this.lifeRecovery || this.uncertaintyRecovery || state.session_id !== scope.session_id || state.life?.life_id !== scope.life_id ||
+          state.binding?.native_boot_id !== scope.native_boot_id || state.space?.space_epoch !== scope.space_epoch ||
           !["alive", "dead"].includes(state.life.status))
           throw new RuntimeFault("stale_context", "Skill player-life authority is closed");
       },
       observe: () => this.refreshObservation(),
       action: (execution, action, signal, callId) =>
         this.skillAction(execution, action, signal, callId),
-      recipes: (item) => game.recipes(item),
+      queryCapability: async (id, version, args) => {
+        if (!game.queryCapability) throw new RuntimeFault("precondition_failed", "This adapter has no registered read capability");
+        return await game.queryCapability(id, version, args);
+      },
       recover: async (execution) => {
         const generation = this.generation;
         const respawn = this.actions.view;
@@ -256,6 +280,7 @@ export class Runtime {
           observation.life.life_id === execution.life_id)
           throw new RuntimeFault("stale_context", "Respawn did not establish a fresh authoritative player life");
         this.run!.life_id = observation.life.life_id;
+        this.run!.space_epoch = observation.space.space_epoch;
         this.store.event(execution.run_id, "skill.life_adopted", "Only the explicitly chosen recovery root adopted a confirmed new life", {
           execution_id: execution.execution_id,
           root_execution_id: execution.root_execution_id,
@@ -267,7 +292,9 @@ export class Runtime {
         });
         this.persist("Explicit recovery established a new player life in the same run");
         await this.reactions.resume(generation);
-        return observation.life.life_id;
+        const currentScope = this.skills.effectScope(execution.execution_id);
+        if (!currentScope) throw new RuntimeFault("stale_context", "Recovery invocation is no longer active");
+        return { ...currentScope, life_id: observation.life.life_id, space_epoch: observation.space.space_epoch };
       },
       cancelActions: (ids, reason) => this.actions.cancelOwned(ids, reason),
       changed: (outcome, execution) => {
@@ -296,6 +323,8 @@ export class Runtime {
       this.actions,
       {
         run: () => this.run,
+        adapter: () => this.context().adapter,
+        binding: () => this.game.snapshot().binding,
         generation: () => this.generation,
         assertCurrent: (generation, epoch) =>
           this.assertCurrent(generation, epoch),
@@ -311,7 +340,7 @@ export class Runtime {
         },
         neutralize: async () => {
           try {
-            await game.neutralize();
+            await game.emergencyStop("Trusted policy selection barrier");
           } catch (error) {
             this.requestSafetyPause("Native input neutralization could not be confirmed", true);
             throw error;
@@ -321,6 +350,7 @@ export class Runtime {
       options.judge,
     );
     this.strategic = new StrategicPlanner(store, auth, {
+      requestAdmission: options.requestAdmission,
       run: () => this.run,
       generation: () => this.generation,
       assertCurrent: (generation, epoch) =>
@@ -329,9 +359,11 @@ export class Runtime {
       rootPrompt: () =>
         createRuntimePrompt(
           this.run!,
-          GOALS.find((goal) => goal.id === this.run!.goal)!,
+          this.goalChoice(),
         ),
       observe: () => this.refreshObservation(),
+      modelObservation: () => this.modelObservation(),
+      projectObservation: (observation, previous) => this.context().adapter.projectObservation(observation, previous),
       policies: () => this.reactions.list,
       action: () => this.actions.active?.entry.stored.view ?? this.actions.view,
       programPending: () => this.skills.pending,
@@ -353,7 +385,9 @@ export class Runtime {
         assertCurrent: (generation, epoch) =>
           this.assertCurrent(generation, epoch),
         observe: () => this.refreshObservation(),
-        recipes: (item) => game.recipes(item),
+        modelObservation: () => this.modelObservation(),
+        adapter: () => this.context().adapter,
+        generation: () => this.generation,
         attentionAfter: (ms, reason) =>
           this.strategic.attentionAfter(ms, reason),
         admitted: () => this.strategic.admitted(),
@@ -365,9 +399,72 @@ export class Runtime {
       },
     );
   }
+  async modelObservation(): Promise<ModelObservation> {
+    const generation = this.generation;
+    const observation = await this.refreshObservation();
+    if (!this.actorFrames) return { observation, images: [], image_metadata: { mode: "disabled" } };
+    const run = this.assertCurrent(generation, observation.epoch);
+    const model = this.auth.snapshot().models.find(model => model.id === run.model_id);
+    if (!model?.input_modalities?.includes("image"))
+      throw new RuntimeFault("precondition_failed", "Image-enabled actor requires discovered SDK image input capability; this is not a live vision claim");
+    const selected = await this.prepareActorFrame(this.actorFrames, generation, observation);
+    this.assertCurrent(generation, observation.epoch);
+    return { observation, images: selected.images, image_metadata: selected.metadata };
+  }
+  private async prepareActorFrame(selector: ActorFrameSelector, generation: number, observation: ObservationV3) {
+    const source = this.actorFrameSource!;
+    const cancelled = Promise.withResolvers<never>();
+    let delivered = Promise.withResolvers<void>();
+    const assertAuthority = () => {
+      const run = this.assertCurrent(generation, observation.epoch);
+      const state = this.game.snapshot();
+      if (run.life_id !== observation.life.life_id || state.life?.life_id !== observation.life.life_id ||
+        state.session_id !== observation.session_id || state.binding?.native_boot_id !== observation.native_boot_id ||
+        state.binding.compatibility_hash !== observation.compatibility_hash || state.space?.space_epoch !== observation.space.space_epoch ||
+        !sameScreen(state.screen, observation.screen))
+        throw new RuntimeFault("stale_context", "Native image preparation life authority changed");
+    };
+    const recheck = () => { try { assertAuthority(); } catch (error) { cancelled.reject(error); } };
+    // One finite local preparation window, not another model request. An old
+    // buffer after resume/respawn must wait for a real delivery, never fallback.
+    const timer = setTimeout(() => {
+      try {
+        assertAuthority();
+        cancelled.reject(new RuntimeFault("backend_unavailable", "No current-scope native image arrived within the 1500 ms preparation bound"));
+      } catch (error) { cancelled.reject(error); }
+    }, 1500);
+    let unsubscribeFrames = () => {}, unsubscribeState = () => {};
+    this.imageAuthorityWaits.add(recheck);
+    try {
+      unsubscribeFrames = source.subscribeFrames(() => { recheck(); delivered.resolve(); });
+      unsubscribeState = this.game.subscribe(recheck);
+      for (;;) {
+        assertAuthority();
+        delivered = Promise.withResolvers<void>();
+        const packet = source.latestFrame();
+        try {
+          const selected = await Promise.race([selector.select(), cancelled.promise]);
+          assertAuthority();
+          return selected;
+        } catch (error) {
+          assertAuthority();
+          if (!(error instanceof RuntimeFault) || error.code !== "stale_context") throw error;
+        }
+        if (source.latestFrame() === packet)
+          await Promise.race([delivered.promise, cancelled.promise]);
+      }
+    } finally {
+      clearTimeout(timer);
+      unsubscribeFrames(); unsubscribeState();
+      this.imageAuthorityWaits.delete(recheck);
+    }
+  }
   async initialize(): Promise<void> {
     if (this.unsubscribeGame) return;
-    this.run = this.store.lastRun();
+    const retained = this.store.lastRun();
+    // Historical rows are exposed only through read APIs, never restored as a
+    // live controller or rewritten by current lifecycle/policy initialization.
+    this.run = retained && typeof retained.goal !== "string" && retained.native_boot_id && retained.compatibility_hash ? retained : null;
     if (this.run) {
       this.store.closeUnfinishedActions(this.run.run_id);
       this.store.reconcileSkillExecutions(this.run.run_id);
@@ -388,8 +485,10 @@ export class Runtime {
       if (!this.run || TERMINAL[this.run.status] || this.closed) return;
       if (notice.type === "game_event" && this.game.snapshot().life?.status === "dead") {
         this.handleDeath();
+        this.handleScopeChange();
         return;
       }
+      if (notice.type === "game_event" && this.run.status === "running") this.handleScopeChange();
       if (notice.type === "observation" && this.run.status === "running")
         void this.refreshObservation().catch(() => {});
       else if (
@@ -400,7 +499,9 @@ export class Runtime {
         const sameContext =
           state.world_id === this.run.world_id &&
           state.epoch === this.run.epoch &&
-          state.session_id === this.run.session_id;
+          state.session_id === this.run.session_id &&
+          state.binding?.native_boot_id === this.run.native_boot_id &&
+          state.binding?.compatibility_hash === this.run.compatibility_hash;
         if (
           state.status !== "connected" ||
           !sameContext ||
@@ -574,6 +675,8 @@ export class Runtime {
       state.epoch !== run.epoch ||
       state.world_id !== run.world_id ||
       state.session_id !== run.session_id ||
+      state.binding?.native_boot_id !== run.native_boot_id ||
+      state.binding?.compatibility_hash !== run.compatibility_hash ||
       this.lifeRecovery !== null ||
       this.uncertaintyRecovery !== null
     )
@@ -584,18 +687,19 @@ export class Runtime {
     return run;
   }
 
-  private async refreshObservation(): Promise<Observation> {
+  private async refreshObservation(): Promise<ObservationV3> {
     if (this.observationRequest) return await this.observationRequest;
     const generation = this.generation;
     const run = this.run;
     if (!run) throw new RuntimeFault("not_found", "No run exists");
     const request = (async () => {
-      const observation = await this.game.observe();
+      const observation = this.context().registration.parseObservation(await this.game.observe());
       if (
         generation !== this.generation ||
         observation.world_id !== run.world_id ||
         observation.epoch !== run.epoch ||
-        observation.session_id !== run.session_id
+        observation.session_id !== run.session_id || observation.native_boot_id !== run.native_boot_id ||
+        observation.compatibility_hash !== run.compatibility_hash
       )
         throw new RuntimeFault(
           "stale_epoch",
@@ -606,25 +710,12 @@ export class Runtime {
         observation.observation_seq >= this.observation.observation_seq
       )
         this.observation = observation;
-      const counts = inventoryCounts(this.observation);
-      const inventoryKey = JSON.stringify(counts);
-      if (inventoryKey !== this.inventoryEvidence) {
-        this.inventoryEvidence = inventoryKey;
-        this.store.event(
-          run.run_id,
-          "observation.inventory",
-          "Trusted authorized inventory counts changed",
-          {
-            world_id: run.world_id,
-            epoch: run.epoch,
-            observation_seq: this.observation.observation_seq,
-            counts,
-          },
-        );
-      }
       const accepted = this.observation;
+      const evidence = observationEvidence(this.context().adapter, this.effectContext(), accepted);
+      this.verificationSnapshot = evidence;
+      this.store.event(run.run_id, "adapter.evidence", "Fresh adapter-owned permitted observation", evidence as unknown as Json);
       if (observation.life.status === "dead") this.handleDeath();
-      this.verifyGoal(accepted);
+      this.verifyGoal();
       return accepted;
     })();
     this.observationRequest = request;
@@ -635,57 +726,33 @@ export class Runtime {
     }
   }
 
-  private verifyGoal(observation: Observation): void {
+  private verifyGoal(): void {
     const run = this.run;
-    if (
-      !run ||
-      run.status !== "running" ||
-      observation.world_id !== run.world_id ||
-      observation.epoch !== run.epoch ||
-      run.goal === "custom" ||
-      run.goal === "break_log" ||
-      observation.life.status !== "alive"
-    )
-      return;
-    const current = inventoryCounts(observation);
-    let item: string | undefined;
-    if (run.goal === "collect_wood")
-      item = Object.keys(current).find(
-        (name) =>
-          /_(log|wood|stem|hyphae)$/.test(name) &&
-          current[name]! > (run.baseline[name] ?? 0),
-      );
-    else {
-      const required =
-        run.goal === "craft_crafting_table"
-          ? "crafting_table"
-          : "stone_pickaxe";
-      if (this.completedCrafts.has(required) && (current[required] ?? 0) > 0)
-        item = required;
+    if (!run || run.status !== "running" || typeof run.goal === "string" || !run.goal.verifier || !this.verificationManifest) {
+      this.verificationPending.length = 0; return;
     }
-    if (!item) return;
-    this.store.event(
-      run.run_id,
-      "goal.verified",
-      "Trusted goal verifier confirmed the goal inventory condition and required execution evidence",
-      {
-        goal: run.goal,
-        kind: "inventory_gain",
-        item,
-        baseline_count: run.baseline[item] ?? 0,
-        current_count: current[item]!,
-        observation_seq: observation.observation_seq,
-        craft_succeeded: this.completedCrafts.has(item),
-      },
-    );
-    this.requestTerminal(
-      "completed",
-      "Goal completed with verified game evidence",
-    );
+    const events = this.verificationPending.splice(0), state = this.game.snapshot(), observation = this.observation;
+    if (observation && this.verificationSnapshot && state.binding?.native_boot_id === observation.native_boot_id &&
+      state.life?.life_id === observation.life.life_id && state.life.status === observation.life.status &&
+      state.space?.space_epoch === observation.space.space_epoch && sameScreen(state.screen, observation.screen)) events.push(this.verificationSnapshot);
+    const result = verificationResultSchema.parse(this.context().adapter.verifyCompletion(this.verificationManifest, events));
+    if (result.adapter_id !== run.goal.adapter_id || result.verifier_id !== run.goal.verifier.id || result.verifier_version !== run.goal.verifier.version)
+      throw new RuntimeFault("precondition_failed", "Adapter verdict does not match the registered goal verifier");
+    const key = JSON.stringify(result);
+    if (key !== this.verificationKey) {
+      this.verificationKey = key;
+      this.store.event(run.run_id, "goal.verification", "Adapter-owned goal verification result", result as unknown as Json);
+    }
+    if (result.status === "verified") {
+      this.store.event(run.run_id, "goal.verified", "Trusted adapter verifier confirmed the declared goal", result as unknown as Json);
+      this.requestTerminal("completed", "Goal completed with adapter-verified evidence");
+    } else if (result.status === "failed") {
+      this.requestTerminal("failed", "Adapter verifier confirmed the declared goal failed");
+    }
   }
   async createRun(input: {
     task: string;
-    goal: GoalId;
+    goal: AdapterGoal;
     model_id: string;
     experience_id?: string;
     working_programs?: "continue" | "fresh";
@@ -712,19 +779,16 @@ export class Runtime {
         .strict()
         .parse(input);
       const state = this.game.snapshot();
-      if (state.status !== "connected" || !state.world_id || !state.session_id || !state.life)
+      if (state.status !== "connected" || !state.world_id || !state.session_id || !state.life || !state.binding?.ready || !state.space)
         throw new RuntimeFault(
           "backend_unavailable",
           "Connect the game before creating a run",
         );
-      if (
-        this.compatibility &&
-        state.version !== this.compatibility.game_version
-      )
-        throw new RuntimeFault(
-          "precondition_failed",
-          "Native game version does not match program compatibility",
-        );
+      const context = this.context();
+      const declared = context.adapter.goals.find(goal => goal.goal_id === parsed.goal.goal_id);
+      const custom = parsed.goal.goal_id === "custom" && parsed.goal.verifier === null && parsed.goal.adapter_id === context.adapter.descriptor.adapter.id;
+      if (!custom && (!declared || canonicalContractJson(declared) !== canonicalContractJson(parsed.goal)))
+        throw new RuntimeFault("precondition_failed", "Select an actual registered adapter goal/verifier version");
       if (
         !this.auth
           .snapshot()
@@ -734,6 +798,8 @@ export class Runtime {
           "invalid_request",
           "Choose a model from the current authenticated model list",
         );
+      if (this.actorFrames && !this.auth.snapshot().models.find(model => model.id === parsed.model_id)?.input_modalities?.includes("image"))
+        throw new RuntimeFault("precondition_failed", "This actor requires discovered SDK image input capability; choose a currently discovered image-capable model");
       if (
         parsed.experience_id &&
         !this.experience
@@ -745,6 +811,7 @@ export class Runtime {
           "Choose a compatible available experience snapshot",
         );
       this.generation++;
+      for (const recheck of this.imageAuthorityWaits) recheck();
       this.actions.reset();
       this.strategic.reset();
       this.run = {
@@ -753,6 +820,9 @@ export class Runtime {
         epoch: state.epoch,
         session_id: state.session_id,
         life_id: state.life.life_id,
+        native_boot_id: state.binding.native_boot_id,
+        space_epoch: state.space.space_epoch,
+        compatibility_hash: state.binding.compatibility_hash,
         task: parsed.task,
         goal: parsed.goal,
         model_id: parsed.model_id,
@@ -767,17 +837,16 @@ export class Runtime {
       };
       this.observation = null;
       this.observationRequest = null;
-      this.inventoryEvidence = "";
-      this.completedCrafts.clear();
+      this.verificationManifest = null; this.verificationSnapshot = null;
+      this.verificationPending.length = 0; this.verificationKey = "";
       this.deathIds.clear();
       this.needsReconnect = false;
       this.store.saveRun(this.run, "Run created; no game effects admitted");
-      if (this.compatibility)
-        this.store.event(
+      this.store.event(
           this.run.run_id,
           "run.adapter",
           "Trusted current native adapter compatibility descriptor recorded",
-          this.compatibility as unknown as Json,
+          context.registration.compatibility as unknown as Json,
         );
       this.reactions.initialize(this.run.run_id);
       if (parsed.experience_id) {
@@ -851,6 +920,11 @@ export class Runtime {
   private async begin(resuming: boolean): Promise<void> {
     const run = this.run!,
       state = this.game.snapshot();
+    if (typeof run.goal === "string" || !run.native_boot_id || !run.compatibility_hash)
+      throw new RuntimeFault("precondition_failed", "Historical runs remain inspect-only; create a new run under the negotiated contract");
+    if (!state.binding?.ready || state.binding.native_boot_id !== run.native_boot_id ||
+      state.binding.compatibility_hash !== run.compatibility_hash || state.session_id !== run.session_id)
+      throw new RuntimeFault("precondition_failed", "A replaced native session/profile requires a new run; retained evidence is unchanged");
     if (state.status !== "connected" || state.world_id !== run.world_id)
       throw new RuntimeFault(
         "backend_unavailable",
@@ -879,7 +953,7 @@ export class Runtime {
     this.observation = null;
     this.observationRequest = null;
     this.needsReconnect = false;
-    const observation = await this.game.observe();
+    const observation = this.context().registration.parseObservation(await this.game.observe());
     if (generation !== this.generation || this.closed) return;
     const current = this.game.snapshot();
     if (
@@ -901,11 +975,16 @@ export class Runtime {
       );
     this.observation = observation;
     run.life_id = observation.life.life_id;
-    if (!resuming) {
-      run.baseline = inventoryCounts(observation);
+    run.space_epoch = observation.space.space_epoch;
+    if (!resuming || !this.verificationManifest) {
+      run.baseline = this.context().adapter.captureBaseline(run.goal, observation);
+      this.verificationManifest = { goal: run.goal, run_id: run.run_id, world_id: run.world_id, session_id: run.session_id!,
+        epoch: run.epoch, native_boot_id: run.native_boot_id, baseline: run.baseline };
       run.started_at = new Date().toISOString();
     }
     run.status = "running";
+    this.verificationSnapshot = observationEvidence(this.context().adapter, this.effectContext(), observation);
+    this.store.event(run.run_id, "adapter.evidence", "Run-start permitted adapter observation", this.verificationSnapshot as unknown as Json);
     run.model_status = "idle";
     this.persist(
       resuming
@@ -1001,11 +1080,51 @@ export class Runtime {
 
   private fenceAuthority(message: string, uncertainExecutionId?: string): void {
     this.generation++;
+    for (const recheck of this.imageAuthorityWaits) recheck();
     this.planning.invalidate(message.includes("life") ? "life_changed" : "cancelled");
     this.strategic.fence();
     this.reactions.fence();
     this.skills.fence(message, uncertainExecutionId);
     this.actions.fence(message);
+  }
+  private handleScopeChange(): void {
+    const run = this.run, state = this.game.snapshot();
+    if (!run || run.status !== "running" || this.lifeRecovery || this.uncertaintyRecovery) return;
+    if (!state.binding?.ready || state.binding.native_boot_id !== run.native_boot_id || state.binding.compatibility_hash !== run.compatibility_hash) {
+      this.requestSafetyPause("The negotiated native boot/profile changed; old authority is closed", true); return;
+    }
+    if (state.space?.space_epoch === run.space_epoch && state.life?.life_id === run.life_id) return;
+    const action = this.actions.active?.entry.stored.view;
+    if (action?.kind === "respawn" && action.origin === "skill" && action.execution_id && this.skills.effectScope(action.execution_id)) return;
+    this.fenceAuthority("Authoritative life/space scope changed; old work cannot act");
+    const generation = this.generation;
+    run.space_epoch = state.space?.space_epoch ?? null;
+    run.life_id = state.life?.life_id ?? null;
+    this.observation = null; this.observationRequest = null; this.verificationSnapshot = null;
+    this.store.event(run.run_id, "runtime.scope_changed", "Native scope changed without relabeling the previous life or effects", {
+      native_boot_id: state.binding.native_boot_id, life_id: run.life_id, space_epoch: run.space_epoch, no_replay: true,
+    });
+    this.persist("Old-scope emitters fenced before fresh observation");
+    const recovery = this.serialize(async () => {
+      const results = await Promise.allSettled([this.skills.closeAll("Native scope changed"), this.reactions.closeAll(true),
+        this.actions.close("Native scope changed"), this.strategic.close(), this.game.emergencyStop("Trusted scope recovery barrier")]);
+      if (generation !== this.generation || this.run !== run || this.closed) return;
+      this.lifeRecovery = null;
+      if (results.some(result => result.status === "rejected")) { this.requestSafetyPause("Native scope recovery drain is unconfirmed", true); return; }
+      try {
+        const observation = await this.refreshObservation();
+        run.life_id = observation.life.life_id; run.space_epoch = observation.space.space_epoch;
+        this.persist("Fresh authorized native scope established; old execution was not resumed");
+        this.assertCurrent(generation);
+        await this.strategic.start(generation);
+        if (observation.life.status === "alive") await this.reactions.resume(generation);
+        this.strategic.wake("scope_changed");
+      } catch {
+        if (generation === this.generation) this.requestSafetyPause("Fresh native scope is unavailable; run remains fenced", false);
+      }
+    });
+    this.lifeRecovery = recovery;
+    void recovery.finally(() => { if (this.lifeRecovery === recovery) this.lifeRecovery = null; }).catch(() => {});
   }
   private handleDeath(): void {
     const run = this.run;
@@ -1032,6 +1151,7 @@ export class Runtime {
     this.fenceAuthority("Player life ended; old-life effects permanently revoked");
     const generation = this.generation;
     run.life_id = state.life.life_id;
+    run.space_epoch = state.space?.space_epoch ?? null;
     this.observation = null;
     this.observationRequest = null;
     this.store.recordDeathEpisode(run.run_id, {
@@ -1050,7 +1170,7 @@ export class Runtime {
         this.reactions.lifeChanged(),
         this.actions.close("Player life ended"),
         this.strategic.close(),
-        this.game.neutralize(),
+        this.game.emergencyStop("Trusted death recovery barrier"),
       ]);
       if (generation !== this.generation || this.closed || this.run !== run) return;
       if (settlements.some((result) => result.status === "rejected")) {
@@ -1103,12 +1223,12 @@ export class Runtime {
         this.reactions.closeAll(true),
         this.actions.close("Uncertain action outcome"),
         this.strategic.close(),
-        this.game.neutralize(),
+        this.game.emergencyStop("Trusted uncertainty reconciliation barrier"),
       ]);
       if (generation !== this.generation || this.closed || this.run !== run || run.status !== "running") return;
       let failure = settlements.some((result) => result.status === "rejected")
         ? "Emitter closure or native neutralization could not be confirmed" : null;
-      let observation: Observation | null = null;
+      let observation: ObservationV3 | null = null;
       if (!failure) {
         try {
           observation = await this.refreshObservation();
@@ -1163,7 +1283,7 @@ export class Runtime {
   }
   private finishTask(summary: string, callId: string): void {
     const run = this.run;
-    if (!run || run.goal !== "custom" || run.status !== "running")
+    if (!run || typeof run.goal === "string" || run.goal.goal_id !== "custom" || run.goal.verifier !== null || run.status !== "running")
       throw new RuntimeFault("forbidden", "Only a running custom task permits model-reported completion");
     this.store.event(run.run_id, "task.completion_reported", "Model reported custom task completion; not independently verified", {
       source: "model", reported_outcome: "completed", verification: "unverified",
@@ -1209,7 +1329,7 @@ export class Runtime {
           this.reactions.closeAll(true),
           this.actions.close(message),
           this.strategic.close(),
-          this.game.neutralize(),
+          this.game.emergencyStop("Trusted post-goal effect-free barrier"),
         ]);
         if (generation !== this.generation || this.run?.status !== "reviewing") return;
         if (results.some((result) => result.status === "rejected")) {
@@ -1260,7 +1380,7 @@ export class Runtime {
     // Transport faults retain disconnect ownership as the fail-closed fallback.
     const barrier = this.needsReconnect
       ? this.game.disconnect()
-      : this.game.neutralize();
+      : this.game.emergencyStop(message);
     const settlements = await Promise.allSettled([
       this.skills.closeAll(message),
       this.reactions.closeAll(status === "paused"),

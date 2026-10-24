@@ -10,6 +10,10 @@ import type {
   SkillStartRequest,
   SkillView,
 } from "../src/shared/programs.ts";
+import { diagnosticAuthorityFixture, executionScopeFixture, minecraftTestAdapter, sha256, skillAuthorityFixture } from "./helpers/adapter-contract.ts";
+import { programFingerprint } from "../src/server/program-validation.ts";
+
+const adapter = minecraftTestAdapter(), compatibilityHash = sha256(adapter.descriptor);
 
 const directories: string[] = [];
 const stores = new Set<Store>();
@@ -40,9 +44,10 @@ function run(store: Store) {
     world_id: crypto.randomUUID(),
     session_id: crypto.randomUUID(),
     life_id: 1,
+    native_boot_id: "fixture-native-boot", space_epoch: 1, compatibility_hash: compatibilityHash,
     epoch: 1,
     task: "Storage fixture",
-    goal: "custom",
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")!,
     model_id: "fixture-model",
     status: "running",
     started_at: new Date().toISOString(),
@@ -58,6 +63,7 @@ function run(store: Store) {
       calls: 0,
       known_cost: null,
       legacy_input: null,
+      accounting_basis: "sdk_reported_subtotal",
       by_purpose: Object.fromEntries(
         ["authoring", "planning", "replanning", "improvement", "other"].map(
           (purpose) => [
@@ -96,7 +102,8 @@ function spec(
     },
     dependencies: [],
     validation: {
-      fingerprint: "fixture-validation",
+      fingerprint: programFingerprint(createHash("sha256").update('return {status:"completed",summary:"Storage fixture",result:null};').digest("hex"), "skill", compatibilityHash),
+      runtime_version: 4, api_version: 4, validator_version: 4, compatibility_hash: compatibilityHash,
       formatted_lines: 1,
       complexity: 1,
       nesting: 0,
@@ -112,9 +119,7 @@ function fixture() {
     skill_id: skill.skill_id,
     version: skill.version,
     start_key: "stable-start",
-    epoch: value.epoch,
-    session_id: value.session_id,
-    life_id: value.life_id,
+    ...executionScopeFixture(value),
     args: { target: "fixture", amount: 2 },
     limits: {
       duration_ms: 120000,
@@ -417,6 +422,7 @@ describe("durable skill admission", () => {
       action,
       "skill",
       execution.execution_id,
+      skillAuthorityFixture(storedRun, execution),
     );
     const restored = reopen(root, store);
     const retry = restored.admitAction(
@@ -425,6 +431,7 @@ describe("durable skill admission", () => {
       action,
       "skill",
       execution.execution_id,
+      skillAuthorityFixture(storedRun, execution),
     );
     expect(retry.created).toBe(false);
     expect(retry.action.view.origin).toBe("skill");
@@ -434,7 +441,7 @@ describe("durable skill admission", () => {
         storedRun.run_id,
         "owned-action",
         action,
-        "strategist",
+        "diagnostic", "fixture-diagnostic", diagnosticAuthorityFixture(storedRun),
       ),
     ).toThrow();
     const other = run(restored);
@@ -445,6 +452,7 @@ describe("durable skill admission", () => {
         action,
         "skill",
         execution.execution_id,
+        skillAuthorityFixture(storedRun, execution),
       ),
     ).toThrow();
   });
@@ -547,6 +555,11 @@ test("schema one migration retains legacy run, action, policy and evidence witho
   expect(restored.usage.output).toBe(7);
   expect(restored.usage.calls).toBeNull();
   expect(restored.usage.known_cost).toBe(0.25);
+  const retained = new Database(path.join(root, "runs.sqlite"), { readonly: true });
+  try {
+    expect(retained.query<{ payload: string }, [string]>("SELECT payload FROM runs WHERE run_id=?")
+      .get(legacy.run_id)?.payload).toBe(JSON.stringify(legacy));
+  } finally { retained.close(); }
   expect(store.events(legacy.run_id)[0]?.details).toEqual({ count: 2 });
   expect(
     store.getAction(legacy.run_id, "prior-action")?.view.execution_id,

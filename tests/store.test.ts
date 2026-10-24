@@ -5,6 +5,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import type { GameAction, PolicySpec } from "../src/shared/contracts.ts";
+import { diagnosticAuthorityFixture, minecraftTestAdapter, sha256 } from "./helpers/adapter-contract.ts";
+import { programFingerprint } from "../src/server/program-validation.ts";
+import { createHash } from "node:crypto";
+
+const adapter = minecraftTestAdapter(), compatibilityHash = sha256(adapter.descriptor);
 
 const directories: string[] = [];
 const stores: Store[] = [];
@@ -24,9 +29,10 @@ function fixture() {
     world_id: crypto.randomUUID(),
     session_id: crypto.randomUUID(),
     life_id: 1,
+    native_boot_id: "fixture-native-boot", space_epoch: 1, compatibility_hash: compatibilityHash,
     epoch: 1,
     task: "Observe the ordinary world",
-    goal: "custom",
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")!,
     model_id: "fixture-model",
     status: "running",
     started_at: new Date().toISOString(),
@@ -42,6 +48,7 @@ function fixture() {
       calls: 0,
       known_cost: null,
       legacy_input: null,
+      accounting_basis: "sdk_reported_subtotal",
       by_purpose: {
         authoring: {
           uncached_input: 0,
@@ -155,17 +162,12 @@ test("legacy connection epochs start above the largest retained run epoch", () =
 describe("durable action admission", () => {
   test("lost acknowledgement preserves one action and rejects conflicting retry content", () => {
     const { directory, store, run } = fixture();
-    store.admitAction(run.run_id, "stable-request", move, "strategist");
+    store.admitAction(run.run_id, "stable-request", move, "diagnostic", "fixture-diagnostic", diagnosticAuthorityFixture(run));
     store.close();
     stores.splice(stores.indexOf(store), 1);
     const reopened = new Store(directory);
     stores.push(reopened);
-    const retry = reopened.admitAction(
-      run.run_id,
-      "stable-request",
-      move,
-      "strategist",
-    );
+    const retry = reopened.admitAction(run.run_id, "stable-request", move, "diagnostic", "fixture-diagnostic", diagnosticAuthorityFixture(run));
     expect(retry.created).toBe(false);
     expect(retry.action.view.status).toBe("accepted");
     expect(
@@ -174,12 +176,7 @@ describe("durable action admission", () => {
         .filter((event) => event.type === "action.accepted"),
     ).toHaveLength(1);
     expect(() =>
-      reopened.admitAction(
-        run.run_id,
-        "stable-request",
-        { ...move, duration_ms: 400 },
-        "strategist",
-      ),
+      reopened.admitAction(run.run_id, "stable-request", { ...move, duration_ms: 400 }, "diagnostic", "fixture-diagnostic", diagnosticAuthorityFixture(run)),
     ).toThrow();
     expect(reopened.getAction(run.run_id, "stable-request")?.request).toEqual(
       move,
@@ -188,8 +185,8 @@ describe("durable action admission", () => {
 
   test("restart distinguishes never-dispatched admission from uncertain live effects", () => {
     const { store, run } = fixture();
-    store.admitAction(run.run_id, "queued", move, "strategist");
-    const live = store.admitAction(run.run_id, "live", move, "strategist")
+    store.admitAction(run.run_id, "queued", move, "diagnostic", "fixture-diagnostic", diagnosticAuthorityFixture(run));
+    const live = store.admitAction(run.run_id, "live", move, "diagnostic", "fixture-diagnostic", diagnosticAuthorityFixture(run))
       .action.view;
     live.status = "running";
     store.saveAction(run.run_id, live);
@@ -199,7 +196,7 @@ describe("durable action admission", () => {
     );
     expect(store.getAction(run.run_id, "live")?.view.status).toBe("unknown");
     expect(
-      store.admitAction(run.run_id, "live", move, "strategist").created,
+      store.admitAction(run.run_id, "live", move, "diagnostic", "fixture-diagnostic", diagnosticAuthorityFixture(run)).created,
     ).toBe(false);
     expect(store.getAction(run.run_id, "live")?.view.status).toBe("unknown");
   });
@@ -263,7 +260,9 @@ test("stored artifact tampering is rejected before source can be reused", () => 
       limitations: "Not gameplay evidence",
     },
   };
-  const policy = store.registerPolicy(run.run_id, spec, 0);
+  const hash = createHash("sha256").update(spec.source).digest("hex");
+  const policy = store.registerPolicy(run.run_id, spec, 0, { api_version: 4, validator_version: 4, runtime_version: 4,
+    compatibility_hash: compatibilityHash, fingerprint: programFingerprint(hash, "policy", compatibilityHash), formatted_lines: 1, complexity: 1, nesting: 0 });
   const filename = path.join(directory, "artifacts", `${policy.hash}.js`);
   expect(readFileSync(filename, "utf8")).toBe(spec.source);
   writeFileSync(filename, 'return {kind:"replan",reason:"modified"};');

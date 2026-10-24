@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Json, Observation } from "../shared/contracts.ts";
+import type { Json, ObservationV3 } from "../shared/contracts.ts";
 import type { PauseCategory, TraceContext, TraceKind } from "../shared/execution-evidence.ts";
 import type { SkillExecutionView } from "../shared/programs.ts";
 import type { Store } from "./store.ts";
@@ -21,7 +21,7 @@ export class ExecutionTrace {
       event_seq: context.event_seq ?? null, kind, payload,
     });
   }
-  observe(execution: SkillExecutionView, observation: Observation, context: TraceContext = {}) {
+  observe(execution: SkillExecutionView, observation: ObservationV3, context: TraceContext = {}) {
     return this.record(execution, "observation", observation as unknown as Json, { ...context, observation_seq: observation.observation_seq, session_id: observation.session_id, life_id: observation.life.life_id });
   }
   span(execution: SkillExecutionView, category: PauseCategory, startedMono: number, endedMono: number, context: TraceContext & { session_id?: string | null; life_id?: number | null } = {}) {

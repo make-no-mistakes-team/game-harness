@@ -3,13 +3,14 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { GameActionResult, Json, Observation } from "../src/shared/contracts.ts";
+import type { GameAction, GameActionResult, Json } from "../src/shared/contracts.ts";
+import type { MinecraftObservation } from "../src/shared/minecraft.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import type { SkillExecutionView, SkillRef } from "../src/shared/programs.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { SkillManager } from "../src/server/skills.ts";
 import {
-  CURRENT_PROGRAM_COMPATIBILITY,
+  HISTORICAL_PROGRAM_COMPATIBILITY_V3,
   ExperienceLibrary,
   type PromotionDeclaration,
 } from "../src/server/experience.ts";
@@ -20,6 +21,14 @@ import { compareProgramVersions, compareProgramVersionsPage } from "../src/serve
 import { objectiveMetrics } from "../src/server/objective-metrics.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { emptyRunUsage, recordCall, recordUsage } from "../src/server/usage.ts";
+import { jsonSchema } from "../src/shared/primitives.ts";
+import { observationEvidence } from "../src/server/adapter-evidence.ts";
+import { promotionEvidence } from "../web/src/evidence.ts";
+import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding, sha256 } from "./helpers/adapter-contract.ts";
+
+const adapter = minecraftTestAdapter();
+const currentCompatibility = { descriptor: adapter.descriptor, compatibility_hash: sha256(adapter.descriptor) };
+const customGoal = adapter.goals.find(goal => goal.goal_id === "custom")!;
 const resources: {
   directory: string;
   store: Store;
@@ -39,31 +48,26 @@ const card = {
   reason: "Retain verified execution evidence",
   limitations: "No stored world observations or call stack",
 };
-function observation(run: StoredRun): Observation {
-  return {
-    schema_version: 2, world_id: run.world_id, epoch: run.epoch,
+function observation(run: StoredRun): MinecraftObservation {
+  return minecraftObservationFixture(adapter, { world_id: run.world_id, epoch: run.epoch,
     session_id: run.session_id!, life: { life_id: run.life_id!, status: "alive", can_respawn: false, death: null },
     observation_seq: 1, captured_at: new Date().toISOString(),
-    profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r2",
-    player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: 20, food: 20, on_ground: true, in_water: false, inventory: [] },
-    blocks: [], entities: [], sounds: [], coverage: { partial: true, max_age_ms: 1000 },
-  };
+    native_boot_id: run.native_boot_id!, space: { dimension_id: "minecraft:overworld", space_epoch: run.space_epoch! },
+  });
 }
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-experience-"));
   const store = new Store(join(directory, "runs")),
     library = new ExperienceLibrary(
       join(directory, "library"),
-      CURRENT_PROGRAM_COMPATIBILITY,
+      currentCompatibility,
     );
-  const run: StoredRun = {
-    run_id: crypto.randomUUID(),
+  const run = minecraftRunFixture(adapter, {
     world_id: crypto.randomUUID(),
     epoch: 1,
     session_id: crypto.randomUUID(),
     life_id: 1,
     task: "Measure current inventory",
-    goal: "custom",
     model_id: "fixture-model",
     status: "running",
     started_at: new Date().toISOString(),
@@ -71,15 +75,14 @@ function fixture() {
     turns: 0,
     model_status: "idle",
     error: null,
-    usage: emptyRunUsage(),
-    baseline: { stone: 0 },
-  };
+  });
+  run.baseline = adapter.captureBaseline(customGoal, observation(run));
   store.saveRun(run);
   store.event(
     run.run_id,
     "run.adapter",
     "Explicit native descriptor fixture",
-    CURRENT_PROGRAM_COMPATIBILITY,
+    jsonSchema.parse(currentCompatibility),
   );
   const manager = new SkillManager(
     store,
@@ -92,13 +95,14 @@ function fixture() {
     },
     {
       authorize: () => {},
+      adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
       observe: async () => observation(run),
       action: async () => ({
         status: "unknown",
         summary: "Not called",
         evidence: null,
       }),
-      recipes: async () => null,
+      queryCapability: async () => null,
       cancelActions: async () => {},
       changed: () => {},
       unsafe: () => {},
@@ -117,7 +121,7 @@ async function authored(
   return await manager.register(run.run_id, {
     name,
     source:
-      'const state = await game.observe(); return {status:"completed",summary:"Current observation",result:state.player.position.x};',
+      'const state = await game.observe(); return {status:"completed",summary:"Current observation",result:state.data.player.position.x};',
     card,
     dependencies,
   });
@@ -131,9 +135,7 @@ function execution(
     skill_id: skill.skill_id,
     version: skill.version,
     start_key: crypto.randomUUID(),
-    epoch: run.epoch,
-    session_id: run.session_id!,
-    life_id: run.life_id!,
+    ...executionScopeFixture(run),
     args: { world_specific: { x: 123, y: 64, z: 456 } },
     limits: { ...DEFAULT_SKILL_LIMITS },
   }).view;
@@ -168,6 +170,7 @@ function action(
     { kind: "look", yaw: 0, pitch: 0 },
     "skill",
     owner.execution_id,
+    actionAuthority(run, owner),
   );
   const result: GameActionResult = {
     status: "succeeded",
@@ -179,6 +182,19 @@ function action(
   admitted.action.view.ended_at = new Date().toISOString();
   store.saveAction(run.run_id, admitted.action.view);
   return admitted.action.view;
+}
+function actionAuthority(run: StoredRun, owner: SkillExecutionView) {
+  return { scope: { run_id: run.run_id, world_id: run.world_id, epoch: owner.epoch, session_id: owner.session_id!, native_boot_id: owner.native_boot_id!,
+    run_generation: owner.run_generation!, life_id: owner.life_id!, space_epoch: owner.space_epoch!, execution_id: owner.execution_id, source_hash: owner.source_hash! },
+    invocation: { kind: "skill" as const, execution_id: owner.execution_id, source_hash: owner.source_hash! }, compatibility_hash: run.compatibility_hash! };
+}
+function inventoryObservation(store: Store, run: StoredRun, counts: Record<string, number>) {
+  const current = observation(run);
+  current.observation_seq = 2;
+  current.data.player.inventory = Object.entries(counts).map(([name, count], slot) => ({ name, display_name: name, count, slot }));
+  const evidence = observationEvidence(adapter, { run_id: run.run_id, world_id: run.world_id, session_id: run.session_id!, epoch: run.epoch,
+    native_boot_id: run.native_boot_id!, run_generation: 1, life_id: run.life_id!, space_epoch: run.space_epoch! }, current);
+  return store.event(run.run_id, "adapter.evidence", "Current registered own inventory observation fixture", jsonSchema.parse(evidence));
 }
 function declaration(
   event_seq: number,
@@ -205,17 +221,7 @@ test("self-report and confirmed movement do not qualify as verified inventory ef
     inventory_before: { stone: 0 },
     inventory_after: { stone: 0 },
   });
-  const evidence = store.event(
-    run.run_id,
-    "observation.inventory",
-    "Actual counts",
-    {
-      world_id: run.world_id,
-      epoch: run.epoch,
-      observation_seq: 2,
-      counts: { stone: 2 },
-    },
-  );
+  const evidence = inventoryObservation(store, run, { stone: 2 });
   finish(store, view);
   expect(() =>
     library.promote(
@@ -239,9 +245,7 @@ test("persisted named memory revisions survive duplicate names, paging and SQLit
     const view = execution(store, run, skill);
     action(store, run, view, { effect_confirmed: true, inventory_receipt_confirmed: true,
       inventory_before: { stone: 0 }, inventory_after: { stone: 2 } });
-    const receipt = store.event(run.run_id, "observation.inventory", "Trusted fixture counts", {
-      world_id: run.world_id, epoch: run.epoch, observation_seq: 2, counts: { stone: 2 },
-    });
+    const receipt = inventoryObservation(store, run, { stone: 2 });
     finish(store, view);
     return library.promote(store, run.run_id, view, memoryName, declaration(receipt.event_seq));
   };
@@ -283,17 +287,7 @@ test("portable exact snapshot accepts live coordinate reads but does not restore
     inventory_before: { stone: 0 },
     inventory_after: { stone: 2 },
   });
-  const evidence = store.event(
-    run.run_id,
-    "observation.inventory",
-    "Actual counts",
-    {
-      world_id: run.world_id,
-      epoch: run.epoch,
-      observation_seq: 2,
-      counts: { stone: 2 },
-    },
-  );
+  const evidence = inventoryObservation(store, run, { stone: 2 });
   finish(store, view);
   const promoted = library.promote(
     store,
@@ -346,13 +340,14 @@ test("portable exact snapshot accepts live coordinate reads but does not restore
     },
     {
       authorize: () => {},
+      adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
       observe: async () => observation(destination),
       action: async () => ({
         status: "unknown",
         summary: "Not used",
         evidence: null,
       }),
-      recipes: async () => null,
+      queryCapability: async () => null,
       cancelActions: async () => {},
       changed: () => {},
       unsafe: () => {},
@@ -364,9 +359,7 @@ test("portable exact snapshot accepts live coordinate reads but does not restore
     skill_id: hydrated.skill_id,
     version: hydrated.version,
     start_key: "warm-exact-composition",
-    epoch: destination.epoch,
-    session_id: destination.session_id!,
-    life_id: destination.life_id!,
+    ...executionScopeFixture(destination),
     args: "parent",
     limits: { ...DEFAULT_SKILL_LIMITS },
   });
@@ -409,12 +402,7 @@ test("world-bound declarations cannot masquerade as portable and world-local sna
     inventory_before: { stone: 0 },
     inventory_after: { stone: 2 },
   });
-  const evidence = store.event(
-    run.run_id,
-    "observation.inventory",
-    "Actual counts",
-    { epoch: run.epoch, counts: { stone: 2 } },
-  );
+  const evidence = inventoryObservation(store, run, { stone: 2 });
   finish(store, view);
   expect(() =>
     library.promote(store, run.run_id, view, "Invalid declaration", {
@@ -498,6 +486,18 @@ test("usage separates uncached input, read cache, written cache and explicit req
   expect(usage.by_purpose.planning.calls).toBe(0);
 });
 
+test("runtime subtotals keep missing first counters null and retain earlier contributions across later missing fields", () => {
+  const usage = emptyRunUsage();
+  recordCall(usage, "planning");
+  expect(usage).toMatchObject({ accounting_basis: "sdk_reported_subtotal",
+    uncached_input: null, cache_read: null, cache_write: null, output: null, calls: 1 });
+  recordUsage(usage, "planning", { input: 7, cacheRead: 3, cacheWrite: 0, output: null });
+  recordCall(usage, "planning");
+  recordUsage(usage, "planning", { input: null, cacheRead: null, cacheWrite: null, output: 4 });
+  expect(usage).toMatchObject({ uncached_input: 7, cache_read: 3, cache_write: 0, output: 4, calls: 2,
+    by_purpose: { planning: { uncached_input: 7, cache_read: 3, cache_write: 0, output: 4 } } });
+});
+
 test("new provider evidence never fabricates a breakdown for aggregate-only legacy usage", () => {
   const usage = emptyRunUsage();
   usage.uncached_input = null;
@@ -570,13 +570,14 @@ test("objective metrics separate removed blocks, receipted counts, measured moti
   const trace = new ExecutionTrace(store);
   trace.observe(view, observation(run));
   const next = observation(run);
-  next.observation_seq = 2; next.player.position.x = 3; next.player.yaw = Math.PI / 2;
+  next.observation_seq = 2; next.data.player.position.x = 3; next.data.player.yaw = Math.PI / 2;
   trace.observe(view, next);
   const newLife = observation(run);
-  newLife.observation_seq = 3; newLife.life.life_id = 2; newLife.player.position.x = 1000;
+  newLife.observation_seq = 3; newLife.life.life_id = 2; newLife.data.player.position.x = 1000;
   trace.observe(view, newLife);
   trace.span(view, "capability_wait", 100, 120);
-  const admitted = store.admitAction(run.run_id, crypto.randomUUID(), { kind: "dig", target_id: "observed-block" }, "skill", view.execution_id);
+  const admitted = store.admitAction(run.run_id, crypto.randomUUID(), { kind: "dig", target: { target_id: "observed-block", incarnation: 1,
+    life_id: run.life_id!, space: { dimension_id: "minecraft:overworld", space_epoch: run.space_epoch! } } }, "skill", view.execution_id, actionAuthority(run, view));
   const effect = admitted.action.view;
   effect.status = "succeeded"; effect.ended_at = new Date().toISOString();
   effect.result = { status: "succeeded", summary: "Server block update", evidence: { effect_confirmed: true, block_removed: true, source: "server_block_update", target_name: "oak_log", target_position: { x: 1, y: 64, z: 0 }, inventory_before: { oak_log: 0 }, inventory_after: { oak_log: 99 }, travel_distance: 2, rotation_yaw_radians: Math.PI / 2, rotation_pitch_radians: 0 } };
@@ -596,10 +597,11 @@ test("objective metrics separate removed blocks, receipted counts, measured moti
 
 test("break_log qualification never fabricates inventory and cross-root pickup cannot qualify the removing root", async () => {
   const { store, library, run, manager } = fixture();
-  run.goal = "collect_wood"; run.baseline = { oak_log: 0 }; store.saveRun(run);
+  run.goal = adapter.goals.find(goal => goal.goal_id === "collect_wood")!; store.saveRun(run);
   const skill = await authored(manager, run), remover = execution(store, run, skill);
   const look = action(store, run, remover, { effect_confirmed: true });
-  const admitted = store.admitAction(run.run_id, crypto.randomUUID(), { kind: "dig", target_id: "log" }, "skill", remover.execution_id);
+  const admitted = store.admitAction(run.run_id, crypto.randomUUID(), { kind: "dig", target: { target_id: "log", incarnation: 1,
+    life_id: run.life_id!, space: { dimension_id: "minecraft:overworld", space_epoch: run.space_epoch! } } }, "skill", remover.execution_id, actionAuthority(run, remover));
   const effect = admitted.action.view;
   effect.status = "succeeded"; effect.ended_at = new Date().toISOString();
   effect.result = { status: "succeeded", summary: "Confirmed removal without pickup", evidence: { effect_confirmed: true, block_removed: true, source: "server_block_update", target_name: "oak_log", inventory_before: { oak_log: 0 }, inventory_after: { oak_log: 0 }, inventory_receipt_confirmed: true } };
@@ -607,13 +609,22 @@ test("break_log qualification never fabricates inventory and cross-root pickup c
   finish(store, remover);
   const collector = execution(store, run, skill);
   const pickup = action(store, run, collector, { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: { oak_log: 0 }, inventory_after: { oak_log: 1 } });
-  const goal = store.event(run.run_id, "goal.verified", "Trusted pickup", { goal: "collect_wood", item: "oak_log", action_id: pickup.action_id });
+  const current = observation(run); current.observation_seq = 2; current.data.player.inventory = [{ name: "oak_log", display_name: "Oak Log", count: 1, slot: 0 }];
+  const read = observationEvidence(adapter, actionAuthority(run, collector).scope, current);
+  store.event(run.run_id, "adapter.evidence", "Retained own-player pickup observation", jsonSchema.parse(read));
+  const verdict = adapter.verifyCompletion({ goal: run.goal, run_id: run.run_id, world_id: run.world_id, session_id: run.session_id!,
+    epoch: run.epoch, native_boot_id: run.native_boot_id!, baseline: run.baseline }, [read]);
+  expect(verdict.status).toBe("verified");
+  const goal = store.event(run.run_id, "goal.verified", "Trusted pickup", jsonSchema.parse(verdict));
   finish(store, collector);
   expect(() => library.promote(store, run.run_id, remover, "Not a collection proof", { portability: "portable", retained_world_data: false, predicate: { kind: "goal_verified", event_seq: goal.event_seq } })).toThrow();
   const projections = programEvidence(store, run.run_id);
   expect(projections.find((value) => value.execution_id === remover.execution_id)?.evidence_status).toBe("confirmed_effects");
   expect(projections.find((value) => value.execution_id === remover.execution_id)?.goal_associations[0]?.relationship).toBe("block_removal_contributor");
   expect(projections.find((value) => value.execution_id === collector.execution_id)?.evidence_status).toBe("verified_goal");
+  expect(projections.find((value) => value.execution_id === collector.execution_id)?.goal_associations).toEqual([
+    { event_seq: goal.event_seq, relationship: "inventory_collector", action_id: pickup.action_id, causal_item_origin: "unknown" },
+  ]);
   const successEvents = store.eventsAfter(run.run_id, 0, 500).filter((event) => event.type === "action.succeeded");
   const lookEvent = successEvents.find((event) => event.details && typeof event.details === "object" && !Array.isArray(event.details) && event.details.action_id === look.action_id)!;
   expect(() => library.promote(store, run.run_id, remover, "Wrong declared action", { portability: "portable", retained_world_data: false, predicate: { kind: "break_log", event_seq: lookEvent.event_seq } })).toThrow();
@@ -622,6 +633,191 @@ test("break_log qualification never fabricates inventory and cross-root pickup c
   expect(promoted.evidence.predicate.kind).toBe("break_log");
   expect(promoted.evidence.action_ids).toEqual([effect.action_id]);
 });
+
+for (const goalId of ["break_log", "craft_crafting_table"] as const) {
+  test(`versioned ${goalId} evidence resolves its retained fact to the confirmed owning receipt`, async () => {
+    const { store, run, manager } = fixture();
+    run.goal = adapter.goals.find(goal => goal.goal_id === goalId)!;
+    store.saveRun(run);
+    const owner = execution(store, run, await authored(manager, run));
+    const request: GameAction = goalId === "break_log"
+      ? { kind: "dig" as const, target: { target_id: "log", incarnation: 1, life_id: run.life_id!,
+          space: { dimension_id: "minecraft:overworld", space_epoch: run.space_epoch! } } }
+      : { kind: "craft" as const, item: "crafting_table", executions: 1 };
+    const admitted = store.admitAction(run.run_id, crypto.randomUUID(), request, "skill", owner.execution_id, actionAuthority(run, owner));
+    const receipt = admitted.action.view;
+    receipt.status = "succeeded"; receipt.ended_at = new Date().toISOString();
+    receipt.result = { status: "succeeded", summary: "Confirmed fixture effect", evidence: goalId === "break_log"
+      ? { effect_confirmed: true, block_removed: true, source: "server_block_update", target_name: "oak_log" }
+      : { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: { crafting_table: 1 } } };
+    store.saveAction(run.run_id, receipt);
+    const facts = adapter.effectEvidence!(actionAuthority(run, owner).scope, receipt.action_id, request, receipt.result, receipt.ended_at);
+    expect(facts).toHaveLength(1);
+    for (const fact of facts) store.event(run.run_id, "adapter.evidence", "Retained adapter effect fact", jsonSchema.parse(fact));
+    const current = observation(run);
+    current.observation_seq = 2;
+    current.data.player.inventory = goalId === "break_log" ? [] : [{ name: "crafting_table", display_name: "Crafting Table", count: 1, slot: 0 }];
+    const read = observationEvidence(adapter, actionAuthority(run, owner).scope, current);
+    store.event(run.run_id, "adapter.evidence", "Retained possession observation", jsonSchema.parse(read));
+    const verdict = adapter.verifyCompletion({ goal: run.goal, run_id: run.run_id, world_id: run.world_id, session_id: run.session_id!,
+      epoch: run.epoch, native_boot_id: run.native_boot_id!, baseline: run.baseline }, [...facts, read]);
+    expect(verdict.status).toBe("verified");
+    const goal = store.event(run.run_id, "goal.verified", "Registered verifier result", jsonSchema.parse(verdict));
+    finish(store, owner);
+    const projected = programEvidence(store, run.run_id).find(entry => entry.execution_id === owner.execution_id)!;
+    expect(projected.evidence_status).toBe("verified_goal");
+    expect(projected.verified_event_seqs).toEqual([goal.event_seq]);
+    expect(projected.goal_associations).toEqual([
+      { event_seq: goal.event_seq, relationship: "direct_receipt", action_id: receipt.action_id, causal_item_origin: "unknown" },
+    ]);
+  });
+}
+
+test("combined goal resolves pre-consumption planks production separately from the final table receipt", async () => {
+  const { store, run, manager } = fixture();
+  run.goal = adapter.goals.find(goal => goal.goal_id === "collect_and_craft_table")!;
+  store.saveRun(run);
+  const owner = execution(store, run, await authored(manager, run));
+  const produced = (item: string, before: Record<string, number>, after: Record<string, number>) => {
+    const request: GameAction = { kind: "craft", item, executions: 1 };
+    const admitted = store.admitAction(run.run_id, crypto.randomUUID(), request, "skill", owner.execution_id, actionAuthority(run, owner));
+    const receipt = admitted.action.view;
+    receipt.status = "succeeded"; receipt.ended_at = new Date().toISOString();
+    receipt.result = { status: "succeeded", summary: "Confirmed helper fixture production", evidence: {
+      effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: before, inventory_after: after } };
+    store.saveAction(run.run_id, receipt);
+    const facts = adapter.effectEvidence!(actionAuthority(run, owner).scope, receipt.action_id, request, receipt.result, receipt.ended_at);
+    for (const fact of facts) store.event(run.run_id, "adapter.evidence", "Retained actual adapter production fact", jsonSchema.parse(fact));
+    return { receipt, facts };
+  };
+  const planks = produced("oak_planks", { oak_log: 1 }, { oak_planks: 4 });
+  const table = produced("crafting_table", { oak_planks: 4 }, { crafting_table: 1 });
+  const current = observation(run); current.observation_seq = 2;
+  current.data.player.inventory = [{ name: "crafting_table", display_name: "Crafting Table", count: 1, slot: 0 }];
+  const read = observationEvidence(adapter, actionAuthority(run, owner).scope, current);
+  store.event(run.run_id, "adapter.evidence", "Retained table possession after wood consumption", jsonSchema.parse(read));
+  const verdict = adapter.verifyCompletion({ goal: run.goal, run_id: run.run_id, world_id: run.world_id, session_id: run.session_id!,
+    epoch: run.epoch, native_boot_id: run.native_boot_id!, baseline: run.baseline }, [...planks.facts, ...table.facts, read]);
+  expect(verdict.status).toBe("verified");
+  expect(verdict.evidence_refs).toEqual([`${planks.receipt.action_id}:production`, `${table.receipt.action_id}:production`, read.evidence_id]);
+  const goal = store.event(run.run_id, "goal.verified", "Combined registered all-of verifier result", jsonSchema.parse(verdict));
+  finish(store, owner);
+  const projected = programEvidence(store, run.run_id)[0]!;
+  expect(projected.evidence_status).toBe("verified_goal");
+  expect(projected.verified_event_seqs).toEqual([goal.event_seq]);
+  expect(projected.goal_associations).toEqual([
+    { event_seq: goal.event_seq, relationship: "inventory_collector", action_id: planks.receipt.action_id, causal_item_origin: "unknown" },
+    { event_seq: goal.event_seq, relationship: "direct_receipt", action_id: table.receipt.action_id, causal_item_origin: "unknown" },
+  ]);
+  planks.receipt.result!.evidence = { effect_confirmed: false, inventory_receipt_confirmed: false };
+  store.saveAction(run.run_id, planks.receipt);
+  const missingAcquisition = programEvidence(store, run.run_id)[0]!;
+  expect(missingAcquisition.evidence_status).not.toBe("verified_goal");
+  expect(missingAcquisition.goal_associations).toEqual([]);
+});
+
+for (const invalid of ["missing retained reference", "wrong verifier version", "wrong adapter", "unconfirmed receipt"] as const) {
+  test(`versioned verifier projection refuses ${invalid} instead of inventing goal attribution`, async () => {
+    const { store, run, manager } = fixture();
+    run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!;
+    store.saveRun(run);
+    const owner = execution(store, run, await authored(manager, run));
+    const request = { kind: "craft" as const, item: "crafting_table", executions: 1 };
+    const admitted = store.admitAction(run.run_id, crypto.randomUUID(), request, "skill", owner.execution_id, actionAuthority(run, owner));
+    const receipt = admitted.action.view;
+    receipt.status = "succeeded"; receipt.ended_at = new Date().toISOString();
+    receipt.result = { status: "succeeded", summary: "Fixture production receipt", evidence: {
+      effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: { crafting_table: 1 } } };
+    store.saveAction(run.run_id, receipt);
+    const facts = adapter.effectEvidence!(actionAuthority(run, owner).scope, receipt.action_id, request, receipt.result, receipt.ended_at);
+    if (invalid !== "missing retained reference") for (const fact of facts)
+      store.event(run.run_id, "adapter.evidence", "Retained production fact", jsonSchema.parse(fact));
+    const current = observation(run); current.observation_seq = 2;
+    current.data.player.inventory = [{ name: "crafting_table", display_name: "Crafting Table", count: 1, slot: 0 }];
+    const read = observationEvidence(adapter, actionAuthority(run, owner).scope, current);
+    store.event(run.run_id, "adapter.evidence", "Retained observation", jsonSchema.parse(read));
+    const verdict = adapter.verifyCompletion({ goal: run.goal, run_id: run.run_id, world_id: run.world_id, session_id: run.session_id!,
+      epoch: run.epoch, native_boot_id: run.native_boot_id!, baseline: run.baseline }, [...facts, read]);
+    expect(verdict.status).toBe("verified");
+    if (invalid === "wrong verifier version") verdict.verifier_version++;
+    if (invalid === "wrong adapter") verdict.adapter_id = "another-adapter";
+    if (invalid === "unconfirmed receipt") {
+      receipt.result.evidence = { effect_confirmed: false, inventory_receipt_confirmed: false };
+      store.saveAction(run.run_id, receipt);
+    }
+    store.event(run.run_id, "goal.verified", "Unavailable or invalid reference boundary", jsonSchema.parse(verdict));
+    finish(store, owner);
+    const projected = programEvidence(store, run.run_id)[0]!;
+    expect(projected.evidence_status).not.toBe("verified_goal");
+    expect(projected.verified_event_seqs).toEqual([]);
+    expect(projected.goal_associations).toEqual([]);
+  });
+}
+
+test("historical v1 goal payload keeps its explicit receipt association without relabeling", async () => {
+  const { store, run, manager } = fixture();
+  run.goal = "collect_wood"; store.saveRun(run);
+  const owner = execution(store, run, await authored(manager, run));
+  const pickup = action(store, run, owner, { effect_confirmed: true, inventory_receipt_confirmed: true,
+    inventory_before: { oak_log: 0 }, inventory_after: { oak_log: 1 } });
+  const details = { goal: "collect_wood", item: "oak_log", action_id: pickup.action_id };
+  const goal = store.event(run.run_id, "goal.verified", "Historical v1 payload", details);
+  finish(store, owner);
+  expect(programEvidence(store, run.run_id)[0]!).toMatchObject({ evidence_status: "verified_goal",
+    verified_event_seqs: [goal.event_seq], goal_associations: [
+      { event_seq: goal.event_seq, relationship: "direct_receipt", action_id: pickup.action_id, causal_item_origin: "unknown" },
+    ] });
+  expect(store.eventsAfter(run.run_id, goal.event_seq - 1, 1)[0]?.details).toEqual(details);
+});
+
+test("custom-task typed inventory selection reaches actual qualification while preserving receipt attribution", async () => {
+  const { store, library, run, manager } = fixture();
+  const owner = execution(store, run, await authored(manager, run));
+  const pickup = action(store, run, owner, { effect_confirmed: true, inventory_receipt_confirmed: true,
+    inventory_before: { stone: 0 }, inventory_after: { stone: 2 } });
+  const observed = inventoryObservation(store, run, { stone: 2 });
+  finish(store, owner);
+  expect(promotionEvidence(observed, run, owner, store.eventsAfter(run.run_id, 0, 500))).toEqual({ kind: "inventory_gain", counts: { stone: 2 } });
+  const promoted = library.promote(store, run.run_id, owner, "Confirmed custom inventory gain", declaration(observed.event_seq));
+  expect(promoted.evidence.action_ids).toEqual([pickup.action_id]);
+  expect(promoted.evidence.predicate).toEqual({ kind: "inventory_gain", item: "stone", min_gain: 2, event_seq: observed.event_seq });
+  expect(store.eventsAfter(run.run_id, 0, 500).some(event => event.type === "goal.verified")).toBe(false);
+});
+
+test("historical inventory counts remain selectable as historical data, not current adapter qualification", async () => {
+  const { store, library, run, manager } = fixture();
+  const owner = execution(store, run, await authored(manager, run));
+  const historical = store.event(run.run_id, "observation.inventory", "Historical inventory payload", { counts: { stone: 2 } });
+  finish(store, owner);
+  expect(promotionEvidence(historical, { ...run, goal: "custom", native_boot_id: null, compatibility_hash: null }, owner, store.eventsAfter(run.run_id, 0, 500)))
+    .toEqual({ kind: "inventory_gain", counts: { stone: 2 } });
+  expect(promotionEvidence(historical, run, owner, store.eventsAfter(run.run_id, 0, 500))).toBeNull();
+  expect(() => library.promote(store, run.run_id, owner, "Not a current observation", declaration(historical.event_seq))).toThrow();
+  expect(store.eventsAfter(run.run_id, historical.event_seq - 1, 1)[0]?.details).toEqual({ counts: { stone: 2 } });
+});
+
+for (const invalid of ["other run", "other life", "other boot", "dead player", "wrong schema", "out of interval"] as const) {
+  test(`operator inventory candidate rejects ${invalid} before presenting typed evidence as selectable`, async () => {
+    const { store, library, run, manager } = fixture();
+    const owner = execution(store, run, await authored(manager, run));
+    action(store, run, owner, { effect_confirmed: true, inventory_receipt_confirmed: true,
+      inventory_before: { stone: 0 }, inventory_after: { stone: 2 } });
+    const current = observation(run); current.observation_seq = 2;
+    current.data.player.inventory = [{ name: "stone", display_name: "Stone", count: 2, slot: 0 }];
+    const read = observationEvidence(adapter, actionAuthority(run, owner).scope, current);
+    if (invalid === "other run") read.scope.run_id = "foreign-run";
+    if (invalid === "other life") { read.scope.life_id++; current.life.life_id++; read.data = jsonSchema.parse(current); }
+    if (invalid === "other boot") { read.scope.native_boot_id = "foreign-boot"; current.native_boot_id = "foreign-boot"; read.data = jsonSchema.parse(current); }
+    if (invalid === "dead player") { current.life.status = "dead"; read.data = jsonSchema.parse(current); }
+    if (invalid === "wrong schema") read.schema.version = 999;
+    const event = store.event(run.run_id, "adapter.evidence", "Nonselectable typed inventory boundary", jsonSchema.parse(read));
+    finish(store, owner);
+    if (invalid === "out of interval") event.at = new Date(Date.parse(owner.ended_at!) + 1000).toISOString();
+    expect(promotionEvidence(event, run, owner, store.eventsAfter(run.run_id, 0, 500))).toBeNull();
+    if (invalid === "other run" || invalid === "other boot" || invalid === "dead player")
+      expect(() => library.promote(store, run.run_id, owner, "Rejected typed inventory", declaration(event.event_seq))).toThrow();
+  });
+}
 
 test("death episodes and improvement decisions deduplicate and preserve exact candidate version evidence", async () => {
   const { store, run, manager } = fixture();
@@ -638,10 +834,10 @@ test("death episodes and improvement decisions deduplicate and preserve exact ca
   expect(feedback.opportunities.filter((value) => value.kind === "failure")).toHaveLength(1);
   expect(learning.feedback(run.run_id).opportunities).toHaveLength(2);
   expect(store.deathEpisodesPage(run.run_id).episodes).toHaveLength(1);
-  const second = await manager.register(run.run_id, { name: first.name, source: 'const state = await game.observe(); return {status:"blocked",summary:"Current state reported",result:state.player.health};', card, dependencies: [] });
+  const second = await manager.register(run.run_id, { name: first.name, source: 'const state = await game.observe(); return {status:"blocked",summary:"Current state reported",result:state.data.player.health};', card, dependencies: [] });
   const before = { run_id: run.run_id, skill_id: first.skill_id, version: first.version, hash: first.hash };
   const after = { run_id: run.run_id, skill_id: second.skill_id, version: second.version, hash: second.hash };
-  const undispatched = store.admitSkill(run.run_id, { ...after, start_key: "never-dispatched", epoch: run.epoch, session_id: run.session_id!, life_id: run.life_id!, args: null, limits: { ...DEFAULT_SKILL_LIMITS } }).view;
+  const undispatched = store.admitSkill(run.run_id, { ...after, start_key: "never-dispatched", ...executionScopeFixture(run), args: null, limits: { ...DEFAULT_SKILL_LIMITS } }).view;
   undispatched.status = "cancelled"; undispatched.ended_at = new Date().toISOString();
   store.updateSkillExecution(undispatched, "skill.closed", "Cancelled before dispatch");
   const chosen = feedback.opportunities[0]!;
@@ -652,7 +848,7 @@ test("death episodes and improvement decisions deduplicate and preserve exact ca
   const scope = { kind: "model" as const, run_id: run.run_id, model_id: run.model_id };
   const comparison = compareProgramVersions(store, before, after, scope);
   expect(comparison.sample_count).toEqual({ before: 1, after: 0 });
-  expect(comparison.source_diff.added.join("\\n")).toContain("state.player.health");
+  expect(comparison.source_diff.added.join("\\n")).toContain("state.data.player.health");
   expect(comparison.conclusion).toBe("descriptive_only_no_causal_improvement_claim");
   const page = compareProgramVersionsPage(store, before, after, scope, 0, 1);
   expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(65536);
@@ -686,14 +882,14 @@ test("legacy experience remains byte-identical and inspectable but cannot cross 
     experience_id: "legacy-immutable", name: "Historical fixture", model_id: run.model_id,
     profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r1",
     source_run_id: "old-run", source_world_id: run.world_id, portability: "portable", retained_world_data: false,
-    compatibility: { ...CURRENT_PROGRAM_COMPATIBILITY, observation_schema: 1, preset_id: "minecraft-observable-initial-r1", skill_protocol: 1 },
+    compatibility: { ...HISTORICAL_PROGRAM_COMPATIBILITY_V3, observation_schema: 1, preset_id: "minecraft-observable-initial-r1", skill_protocol: 1 },
     root: { skill_id: "old-source", version: 1 }, created_at: "2026-01-01T00:00:00.000Z",
     evidence: { execution_id: "old-execution", action_ids: ["old-action"], predicate: { kind: "goal_verified", event_seq: 1 } }, skills: [],
   });
   const db = new Database(join(directory, "library", "experience.sqlite"));
   try {
     db.query("INSERT INTO bundles(id,model,payload) VALUES(?,?,?)").run("legacy-immutable", run.model_id, historical);
-    expect(library.inspect("legacy-immutable", run.model_id)?.compatibility.observation_schema).toBe(1);
+    expect(library.inspect("legacy-immutable", run.model_id)?.compatibility).toMatchObject({ observation_schema: 1, skill_protocol: 1 });
     expect(library.list(run.model_id, run.world_id)).toEqual([]);
     await expect(library.hydrate("legacy-immutable", run.model_id, run.world_id, run.run_id, manager)).rejects.toThrow();
     expect(db.query<{ payload: string }, [string]>("SELECT payload FROM bundles WHERE id=?").get("legacy-immutable")?.payload).toBe(historical);
@@ -737,8 +933,8 @@ test("fresh same-session working definitions replace stale names with a coherent
 test("radian observation rotation uses shortest yaw across the pi seam", async () => {
   const { store, run, manager } = fixture();
   const skill = await authored(manager, run), view = execution(store, run, skill), trace = new ExecutionTrace(store);
-  const first = observation(run); first.player.yaw = 3 * Math.PI / 4;
-  const second = observation(run); second.observation_seq++; second.player.yaw = -3 * Math.PI / 4; second.player.pitch = Math.PI / 4;
+  const first = observation(run); first.data.player.yaw = 3 * Math.PI / 4;
+  const second = observation(run); second.observation_seq++; second.data.player.yaw = -3 * Math.PI / 4; second.data.player.pitch = Math.PI / 4;
   trace.observe(view, first); trace.observe(view, second);
   expect(objectiveMetrics(store, run.run_id)[0]!.sampled_rotation_degrees).toBeCloseTo(135);
 });
@@ -833,7 +1029,7 @@ test("feedback omission metadata cannot overfill a nearly full metrics page", as
   const counts = (length: number) => Object.fromEntries(Array.from({ length }, (_, index) => [`fixture_item_${index}`, 1]));
   action(store, run, first, { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: counts(1000) });
   action(store, run, oversized, { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: counts(10000) });
-  const admitted = store.admitAction(run.run_id, crypto.randomUUID(), { kind: "look", yaw: 0, pitch: 0 }, "skill", second.execution_id);
+  const admitted = store.admitAction(run.run_id, crypto.randomUUID(), { kind: "look", yaw: 0, pitch: 0 }, "skill", second.execution_id, actionAuthority(run, second));
   const learning = new ImprovementLearning(store);
   const baseline = learning.feedback(run.run_id);
   expect(baseline.omitted).toHaveLength(1);
@@ -871,7 +1067,7 @@ test("durable latest-root lookup survives more than 100 sequential children with
   for (let index = 0; index < 101; index++) {
     const child = store.admitSkill(run.run_id, {
       skill_id: skill.skill_id, version: skill.version, start_key: `child-${index}`,
-      epoch: run.epoch, session_id: run.session_id!, life_id: run.life_id!,
+      ...executionScopeFixture(run),
       args: null, limits: { ...DEFAULT_SKILL_LIMITS },
     }, { parent_execution_id: root.execution_id, root_execution_id: root.execution_id }).view;
     child.status = "running"; child.started_at = new Date().toISOString();
@@ -903,7 +1099,7 @@ test("invalid decision/revision pairs reject actionably without a record before 
   const opportunity = learning.feedback(run.run_id).opportunities.find((value) => value.execution_id === firstExecution.execution_id)!;
   const second = await manager.register(run.run_id, {
     name: first.name,
-    source: 'const state = await game.observe(); return {status:"completed",summary:"Candidate observation experiment",result:state.player.health};',
+    source: 'const state = await game.observe(); return {status:"completed",summary:"Candidate observation experiment",result:state.data.player.health};',
     card, dependencies: [],
   });
   const secondExecution = execution(store, run, second);

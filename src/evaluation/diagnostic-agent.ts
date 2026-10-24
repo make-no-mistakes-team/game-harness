@@ -8,7 +8,7 @@ import { bounded, requireProof } from "./native-game.ts";
 const MODEL = "zero-provider-native-diagnostic";
 const definitions = [
   { name: "Infrastructure predecessor", source: 'for (let step = 0; step < 2; step++) { await game.observe(); const result = await game.action({kind:"move",controls:{forward:true,sneak:true},duration_ms:1000}); if (result.status !== "succeeded") return {status:"blocked",summary:"Bounded infrastructure motor did not succeed",result}; } return {status:"completed",summary:"Two infrastructure motor probes completed; not a gameplay goal",result:null};' },
-  { name: "Infrastructure follow-up", source: 'const observation = await game.observe(); if (observation.life.status !== "alive") return {status:"blocked",summary:"Infrastructure probe requires an alive observation",result:null}; const result = await game.action({kind:"look",yaw:observation.player.yaw + 0.05,pitch:0}); return {status:result.status === "succeeded" ? "completed" : "blocked",summary:"One infrastructure gaze probe; not gameplay success",result};' },
+  { name: "Infrastructure follow-up", source: 'const observation = await game.observe(); if (observation.life.status !== "alive") return {status:"blocked",summary:"Infrastructure probe requires an alive observation",result:null}; const result = await game.action({kind:"look",yaw:observation.data.player.yaw + 0.05,pitch:0}); return {status:result.status === "succeeded" ? "completed" : "blocked",summary:"One infrastructure gaze probe; not gameplay success",result};' },
 ] as const;
 export const DIAGNOSTIC_PROGRAMS = Object.freeze({ predecessor: definitions[0].name, followup: definitions[1].name });
 type Resolvers<T> = ReturnType<typeof Promise.withResolvers<T>>;

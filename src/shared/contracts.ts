@@ -1,8 +1,117 @@
 import type { SkillView, SkillExecutionView } from "./programs.ts";
+import type { EffectOwnerRef, EffectScope, EffectEnvelope, EffectInvocation, SpaceRef, ScreenRef } from "./control.ts";
+import type { AdapterActorProjection, ObservationV3 } from "./observations.ts";
+export type { ObservationV3 } from "./observations.ts";
 
 export type Json =
   null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Vec3Data = { x: number; y: number; z: number };
+
+export type Sha256 = string;
+export interface SchemaIdentity {
+  id: string;
+  version: number;
+  hash: Sha256;
+}
+export interface AdapterDescriptor {
+  descriptor_schema: 1;
+  game: { id: string; version: string };
+  adapter: { id: string; version: string; build_hash: Sha256 };
+  observation: {
+    schema_version: 3;
+    schema_hash: Sha256;
+    payload_schema: SchemaIdentity;
+    profile: {
+      id: string;
+      version: number;
+      configuration: Json;
+      configuration_hash: Sha256;
+    };
+  };
+  capabilities: { id: string; version: number; schema_hash: Sha256 }[];
+  actuator: "native" | "desktop";
+  executable: { api_version: 4; validator_version: 4; runtime_version: 4 };
+}
+export interface AdapterBinding {
+  ready: boolean;
+  descriptor: AdapterDescriptor;
+  compatibility_hash: Sha256;
+  native_boot_id: string;
+}
+export type ProgramCompatibility = Pick<AdapterBinding, "descriptor" | "compatibility_hash">;
+/** Inspect-only pre-cutover cache metadata; never accepted by executable admission. */
+export interface HistoricalExecutableValidation {
+  runtime_version: 1 | 2 | 3;
+  fingerprint: string;
+  api_version?: number;
+  validator_version?: number;
+  compatibility_hash?: string;
+  formatted_lines?: number;
+  complexity?: number;
+  nesting?: number;
+}
+export interface ActiveExecutableValidation {
+  api_version: 4;
+  validator_version: 4;
+  runtime_version: 4;
+  compatibility_hash: Sha256;
+  fingerprint: Sha256;
+  formatted_lines: number;
+  complexity: number;
+  nesting: number;
+}
+/** Registered by trusted composition; never populated from a native hello or program arguments. */
+export interface AdapterSchemaCatalog {
+  observation: Json;
+  payload: Json;
+  capabilities: Record<string, Json>;
+  evidence?: Record<string, Json>;
+}
+export type AdapterGoal = {
+  adapter_id: string;
+  goal_id: string;
+  verifier: { id: string; version: number } | null;
+  parameters: Json;
+};
+export interface VerificationManifest {
+  goal: AdapterGoal;
+  run_id: string;
+  world_id: string;
+  session_id: string;
+  epoch: number;
+  native_boot_id: string;
+  baseline: Json;
+}
+export interface AdapterEvidence {
+  evidence_id: string;
+  adapter_id: string;
+  schema: SchemaIdentity;
+  scope: EffectScope;
+  observed_at: string;
+  data: Json;
+}
+export interface VerificationResult {
+  adapter_id: string;
+  verifier_id: string;
+  verifier_version: number;
+  status: "verified" | "failed" | "incomplete" | "unknown";
+  reason: string;
+  evidence_refs: string[];
+}
+export interface RuntimeAdapter {
+  readonly descriptor: AdapterDescriptor;
+  readonly schemas: AdapterSchemaCatalog;
+  readonly goals: readonly AdapterGoal[];
+  readonly goalChoices?: readonly GoalChoice[];
+  readonly action_capability: { id: string; version: number } | null;
+  readonly supports_respawn: boolean;
+  readonly bindings: readonly { name: string; capability_id: string; version: number; parameters: readonly string[] }[];
+  effectDeadlineMs(action: Json): number;
+  projectObservation(observation: ObservationV3, previous?: ObservationV3 | null): AdapterActorProjection;
+  captureBaseline(goal: AdapterGoal, observation: ObservationV3): Json;
+  verifyCompletion(manifest: VerificationManifest, events: readonly AdapterEvidence[]): VerificationResult;
+  effectEvidence?(scope: EffectScope, operationId: string, action: Json, result: GameActionResult, at: string): readonly AdapterEvidence[];
+}
 
 export interface ActivityEvent {
   event_seq: number;
@@ -18,6 +127,8 @@ export interface ModelChoice {
   name: string;
   provider: string;
   context_window: number | null;
+  input_modalities?: readonly string[];
+  capability_provenance?: "discovered_sdk_descriptor_not_live_vision";
 }
 
 export interface AuthState {
@@ -59,38 +170,6 @@ export interface GameServerState {
   error: string | null;
 }
 
-export interface InventoryItem {
-  name: string;
-  display_name: string;
-  count: number;
-  slot: number;
-}
-
-export interface ObservedBlock {
-  id: string;
-  name: string;
-  position: Vec3Data;
-  observed_at: string;
-  current: boolean;
-}
-
-export interface ObservedEntity {
-  id: string;
-  name: string;
-  /** Visible nonempty ItemEntity stack registry identity only, never stack data. */
-  item_name?: string;
-  position: Vec3Data;
-  observed_at: string;
-  current: boolean;
-}
-
-export interface SoundObservation {
-  category: "movement" | "interaction" | "combat" | "creature" | "weather";
-  direction: "here" | "N" | "NE" | "E" | "SE" | "S" | "SW" | "W" | "NW";
-  distance: "near" | "mid" | "far";
-  observed_at: string;
-}
-
 export interface PlayerLife {
   /** Native-confirmed incarnation within the session; death retains this ID. */
   life_id: number;
@@ -105,67 +184,8 @@ export interface PlayerLife {
 
 export type MotorProfile = "precise" | "balanced" | "fast";
 
-export interface Observation {
-  schema_version: 2;
-  world_id: string;
-  epoch: number;
-  session_id: string;
-  life: PlayerLife;
-  observation_seq: number;
-  captured_at: string;
-  profile_id: "player-observable-structured";
-  preset_id: "minecraft-observable-initial-r2";
-  player: {
-    position: Vec3Data;
-    yaw: number;
-    pitch: number;
-    health: number;
-    food: number;
-    on_ground: boolean;
-    in_water: boolean;
-    inventory: InventoryItem[];
-  };
-  blocks: ObservedBlock[];
-  entities: ObservedEntity[];
-  sounds: SoundObservation[];
-  coverage: { partial: true; max_age_ms: number };
-}
-
-export type ControlName =
-  "forward" | "back" | "left" | "right" | "jump" | "sprint" | "sneak";
-export type Face = "up" | "down" | "north" | "south" | "east" | "west";
-export type NavigationGaze =
-  | { kind: "navigation" }
-  | { kind: "target"; target_id: string }
-  | { kind: "free"; yaw: number; pitch: number };
-
-export type GameAction =
-  | {
-      kind: "move";
-      controls: Partial<Record<ControlName, boolean>>;
-      duration_ms: number;
-      look?: { yaw: number; pitch: number };
-      interaction?: { kind: "attack" | "use"; target_id?: string };
-    }
-  | { kind: "look"; yaw: number; pitch: number }
-  | { kind: "dig"; target_id: string }
-  | { kind: "place"; target_id: string; face: Face; item: string }
-  | { kind: "craft"; item: string; executions: number; table_id?: string }
-  | {
-      kind: "equip";
-      item: string;
-      destination: "hand" | "off-hand" | "head" | "torso" | "legs" | "feet";
-    }
-  | { kind: "interact"; target_id: string }
-  | { kind: "attack"; target_id: string }
-  | {
-      kind: "navigate";
-      target_id: string;
-      range: number;
-      duration_ms: number;
-      gaze?: NavigationGaze;
-    }
-  | { kind: "respawn" };
+/** Payload is validated by the selected adapter's registered capability schema. */
+export type GameAction = { kind: string; [key: string]: Json };
 
 export interface GameActionResult {
   status: "succeeded" | "failed" | "cancelled" | "unknown";
@@ -182,7 +202,9 @@ export interface GameState {
   epoch: number;
   session_id: string | null;
   life: PlayerLife | null;
-  motor_profile: MotorProfile;
+  binding: AdapterBinding | null;
+  space: SpaceRef | null;
+  screen: ScreenRef | null;
   video: {
     status: "idle" | "starting" | "streaming" | "stale" | "error";
     width: number;
@@ -193,14 +215,14 @@ export interface GameState {
     error: string | null;
   };
   last_observation_at: string | null;
-  player: Observation["player"] | null;
+  presentation: AdapterActorProjection | null;
   error: string | null;
 }
 
 export interface BridgeConnection {
   host: "127.0.0.1";
   port: number;
-  version: "1.21.4";
+  version: string;
   world_id: string;
   epoch: number;
   motor_profile?: MotorProfile;
@@ -215,6 +237,9 @@ export interface PlayerLifeEvent {
   life: PlayerLife;
   summary: string;
   neutralized: true;
+  native_boot_id: string;
+  space: SpaceRef | null;
+  screen: ScreenRef | null;
 }
 
 export interface BridgeNotice {
@@ -226,13 +251,14 @@ export interface GameBridge {
   connect(config: BridgeConnection): Promise<void>;
   disconnect(): Promise<void>;
   snapshot(): GameState;
-  observe(): Promise<Observation>;
-  execute(action: GameAction, signal: AbortSignal): Promise<GameActionResult>;
+  observe(): Promise<ObservationV3>;
+  execute(effect: EffectEnvelope, signal: AbortSignal): Promise<GameActionResult>;
   /** Resolves only after the native input barrier; uncertain outcomes stay unknown. */
-  neutralize(): Promise<void>;
-  cancel(reason: string): Promise<void>;
-  setMotorProfile(profile: MotorProfile): Promise<void>;
-  recipes(item: string): Promise<Json>;
+  neutralize(owner: EffectOwnerRef): Promise<void>;
+  cancel(reason: string, owner: EffectOwnerRef): Promise<void>;
+  emergencyStop(reason: string): Promise<void>;
+  adapter(): RuntimeAdapter | null;
+  queryCapability?(id: string, version: number, args: Json): Promise<Json>;
   subscribe(listener: (notice: BridgeNotice) => void): () => void;
 }
 
@@ -263,6 +289,7 @@ export interface PolicyView {
   hash: string;
   state: "draft" | "validated" | "trial" | "active" | "quarantined" | "retired";
   source: string;
+  validation?: ActiveExecutableValidation | HistoricalExecutableValidation;
   card: StrategyCard;
   priority: number;
   interval_ms: number;
@@ -278,7 +305,7 @@ export type PolicyDecision =
   | { kind: "replace"; action: GameAction; reason: string };
 
 export interface PolicyContext {
-  observation: Observation;
+  observation: ObservationV3;
   action: ActionView | null;
   task: string;
 }
@@ -288,6 +315,9 @@ export interface ActionView {
   /** Null only for historical records predating life attribution. */
   session_id: string | null;
   life_id: number | null;
+  scope: EffectScope | null;
+  invocation: EffectInvocation | null;
+  compatibility_hash: string | null;
   kind: GameAction["kind"];
   status:
     | "accepted"
@@ -297,7 +327,7 @@ export interface ActionView {
     | "failed"
     | "cancelled"
     | "unknown";
-  origin: "strategist" | "policy" | "skill";
+  origin: "strategist" | "policy" | "skill" | "diagnostic";
   execution_id: string | null;
   summary: string;
   started_at: string | null;
@@ -305,26 +335,44 @@ export interface ActionView {
   result: GameActionResult | null;
 }
 
-export type GoalId =
+export type HistoricalGoalId =
   "break_log" | "collect_wood" | "craft_crafting_table" | "craft_stone_pickaxe" | "custom";
 export interface GoalChoice {
-  id: GoalId;
+  id: string;
+  goal: AdapterGoal;
   label: string;
   prompt: string;
 }
 
 export type UsagePurpose =
   "authoring" | "planning" | "replanning" | "improvement" | "other";
-export interface TokenUsage {
+export interface ReportedUsage {
   uncached_input: number | null;
   cache_read: number | null;
   cache_write: number | null;
-  output: number;
+  output: number | null;
+}
+/** Request-bound, allowlisted accounting evidence; never a raw provider payload. */
+export interface RequestUsageEvidence {
+  schema_version: 1;
+  request_id: string;
+  sdk_reported: ReportedUsage | null;
+  provider_terminal: {
+    source: "openai_responses_terminal" | "openai_codex_responses_terminal" | "jev_response_usage";
+    response_id: string | null;
+    terminal_type: string;
+    counters: ReportedUsage;
+  } | null;
+  unaccounted_response_ids: string[];
+}
+export interface TokenUsage extends ReportedUsage {
   calls: number | null;
   known_cost: number | null;
   legacy_input: number | null;
 }
 export interface RunUsage extends TokenUsage {
+  /** These accumulators are observations, not qualified consumption totals. */
+  accounting_basis: "sdk_reported_subtotal";
   by_purpose: Record<UsagePurpose, TokenUsage>;
 }
 
@@ -357,7 +405,10 @@ export interface RunView {
   session_id: string | null;
   life_id: number | null;
   task: string;
-  goal: GoalId;
+  goal: AdapterGoal | HistoricalGoalId;
+  native_boot_id: string | null;
+  space_epoch: number | null;
+  compatibility_hash: string | null;
   model_id: string;
   status:
     | "created"

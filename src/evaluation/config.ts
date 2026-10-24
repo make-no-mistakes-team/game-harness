@@ -42,6 +42,21 @@ function freezeDeep<T>(value: T): T {
   return value;
 }
 
+/** Shared finite resource validation, independent of diagnostic/study identity. */
+export function createEvaluationCaps(input: Partial<EvaluationCaps> = {}): EvaluationCaps {
+  const caps = { ...DEFAULT_EVALUATION_CAPS, ...input };
+  for (const [key, value] of Object.entries(caps)) {
+    if (!(key in DEFAULT_EVALUATION_CAPS) || !Number.isSafeInteger(value) || value <= 0)
+      throw new Error(`Evaluation cap ${key} must be a finite positive integer`);
+  }
+  // Store clamps both APIs to 500; accepting larger requests can falsely imply a complete event page.
+  if (caps.eventPageRecords > 500) throw new Error("eventPageRecords cannot exceed the Store page limit of 500");
+  if (caps.tracePageRecords > 500) throw new Error("tracePageRecords cannot exceed the Store page limit of 500");
+  if (caps.runMs > caps.totalMs) throw new Error("Run deadline cannot exceed the entire evaluation deadline");
+  if (caps.pollMs > caps.runMs) throw new Error("Observation polling cannot exceed the run deadline");
+  return Object.freeze(caps);
+}
+
 export function createEvaluationConfig(input: EvaluationConfigInput): EvaluationConfig {
   const purposes: readonly string[] = ["ordinary_acceptance", "api_control", "comparison", "justified_acceptance"];
   if (!purposes.includes(input.purpose)) throw new Error("Choose an explicit evaluation purpose");
@@ -53,16 +68,7 @@ export function createEvaluationConfig(input: EvaluationConfigInput): Evaluation
     throw new Error("A non-Luna model requires an explicit discovered ID, control/comparison/justified-acceptance purpose and justification");
   if (input.purpose !== "ordinary_acceptance" && !justification)
     throw new Error("Control, comparison and justified acceptance require a recorded justification");
-  const caps = { ...DEFAULT_EVALUATION_CAPS, ...input.caps };
-  for (const [key, value] of Object.entries(caps)) {
-    if (!(key in DEFAULT_EVALUATION_CAPS) || !Number.isSafeInteger(value) || value <= 0)
-      throw new Error(`Evaluation cap ${key} must be a finite positive integer`);
-  }
-  // Store clamps both APIs to 500; accepting larger requests can falsely imply a complete event page.
-  if (caps.eventPageRecords > 500) throw new Error("eventPageRecords cannot exceed the Store page limit of 500");
-  if (caps.tracePageRecords > 500) throw new Error("tracePageRecords cannot exceed the Store page limit of 500");
-  if (caps.runMs > caps.totalMs) throw new Error("Run deadline cannot exceed the entire evaluation deadline");
-  if (caps.pollMs > caps.runMs) throw new Error("Observation polling cannot exceed the run deadline");
+  const caps = createEvaluationCaps(input.caps);
   return freezeDeep({
     model: structuredClone(discovered), purpose: input.purpose, justification,
     hypothesisId: evaluationIdentifier(input.hypothesisId, "hypothesisId"),

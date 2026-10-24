@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type {
   GameState,
@@ -6,6 +6,9 @@ import type {
   PolicyContext,
   PolicySpec,
   PolicyView,
+  ActiveExecutableValidation,
+  AdapterBinding,
+  RuntimeAdapter,
 } from "../shared/contracts.ts";
 import {
   policyDecisionSchema,
@@ -20,11 +23,17 @@ import type { FastJudgeBroker, FastJudgeSelection } from "./fast-provider.ts";
 import {
   ProgramValidationError,
   validateProgramSource,
+  programFingerprint,
 } from "./program-validation.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import type { PolicyWorker, SandboxService } from "./sandbox.ts";
 import type { Store, StoredRun } from "./store.ts";
 import { recordCall, recordUsage } from "./usage.ts";
+import type { ScreenRef } from "../shared/control.ts";
+import { sameScreen } from "../shared/control.ts";
+import { executableContractStamp } from "./adapter-contract.ts";
+import { assertExecutableCompatible } from "./effect-contract.ts";
+import { RegisteredAdapterContract } from "./registered-adapter.ts";
 
 const idSchema = z
   .string()
@@ -55,6 +64,8 @@ export interface ReactiveHost {
   context(): Promise<PolicyContext>;
   gameState(): GameState;
   needsReconnect(): boolean;
+  adapter(): RuntimeAdapter | null;
+  binding(): AdapterBinding | null;
   wake(reason: string): void;
   changed(): void;
   admitted(): void;
@@ -69,6 +80,10 @@ interface ContextIdentity {
   life_status: NonNullable<GameState["life"]>["status"];
   epoch: number;
   world_id: string;
+  native_boot_id: string;
+  space_epoch: number;
+  compatibility_hash: string;
+  screen: ScreenRef | null;
 }
 
 interface PolicySlot extends PolicyAuthority {
@@ -90,17 +105,7 @@ interface Validation {
   controller: AbortController;
   done: Promise<PolicyView>;
 }
-interface JudgeAccounting {
-  actual_calls: number;
-  usage: {
-    input: number;
-    cacheRead: number;
-    cacheWrite: number;
-    output: number;
-  } | null;
-  known_cost: number | null;
-  provider_request_id: string | null;
-}
+type JudgeAccounting = Omit<Awaited<ReturnType<FastJudgeBroker["evaluate"]>>, "choice_id">;
 const terminal: Partial<Record<string, true>> = {
   succeeded: true,
   failed: true,
@@ -121,6 +126,7 @@ const specOf = (view: PolicyView): PolicySpec => ({
 
 /** Owns immutable reaction selection, isolated workers and bounded evidence-producing trials. */
 export class ReactiveRuntime {
+  private readonly registrations = new WeakMap<RuntimeAdapter, RegisteredAdapterContract>();
   private policies: PolicyView[] = [];
   private slots = new Map<string, PolicySlot>();
   private validations = new Map<string, Validation>();
@@ -141,6 +147,21 @@ export class ReactiveRuntime {
 
   get list(): PolicyView[] {
     return this.policies;
+  }
+  private contract() {
+    const adapter = this.host.adapter(), binding = this.host.binding();
+    if (!adapter || !binding?.ready) throw new RuntimeFault("precondition_failed", "Reactive execution requires a negotiated adapter");
+    let registration = this.registrations.get(adapter);
+    if (!registration) { registration = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas); this.registrations.set(adapter, registration); }
+    if (registration.compatibility.compatibility_hash !== binding.compatibility_hash)
+      throw new RuntimeFault("precondition_failed", "Reactive and native executable contracts differ");
+    return { adapter, binding, registration, descriptor: adapter.descriptor, schemas: adapter.schemas };
+  }
+  private compatible(view: PolicyView): void {
+    const context = this.contract(), validation = assertExecutableCompatible(view.validation, context.binding);
+    if (validation.fingerprint !== programFingerprint(view.hash, view.backend === "jev" ? "jev" : "policy", context.binding.compatibility_hash,
+      view.backend === "jev" ? view.choices : undefined))
+      throw new RuntimeFault("precondition_failed", "Historical or incompatible policy validation is read-only");
   }
 
   initialize(runId: string): void {
@@ -184,11 +205,13 @@ export class ReactiveRuntime {
         "Policy metadata or finite choices are invalid",
       );
     const canonical = parsed.data;
+    const contract = this.contract();
+    let validation: ActiveExecutableValidation;
     if (canonical.backend === "javascript") {
       try {
-        canonical.source = (
-          await validateProgramSource(canonical.source, "policy")
-        ).source;
+        const result = await validateProgramSource(canonical.source, "policy", contract);
+        canonical.source = result.source;
+        validation = assertExecutableCompatible(result.validation, contract.binding);
       } catch (error) {
         if (error instanceof ProgramValidationError) {
           const fault = new RuntimeFault(
@@ -203,6 +226,15 @@ export class ReactiveRuntime {
           "Policy JavaScript could not be statically validated",
         );
       }
+    } else {
+      for (const choice of canonical.choices!) if (choice.decision.kind === "replace") {
+        if (!contract.adapter.action_capability) throw new RuntimeFault("precondition_failed", "This adapter has no effect capability");
+        contract.registration.parseCapability(contract.adapter.action_capability.id, contract.adapter.action_capability.version, choice.decision.action);
+      }
+      const hash = createHash("sha256").update(canonical.source).digest("hex");
+      validation = { ...executableContractStamp(contract.registration.compatibility),
+        fingerprint: programFingerprint(hash, "jev", contract.binding.compatibility_hash, canonical.choices),
+        formatted_lines: canonical.source.split("\n").length, complexity: 0, nesting: 0 };
     }
     const run = this.assertAuthority(generation, epoch, revision);
     this.assertIdentity(identity);
@@ -212,6 +244,7 @@ export class ReactiveRuntime {
       run.run_id,
       canonical,
       run.turns,
+      validation,
     );
     const existing = this.policies.find(
       (view) => keyOf(view) === keyOf(registered),
@@ -357,6 +390,7 @@ export class ReactiveRuntime {
     const identity = this.contextIdentity();
     this.assertAuthority(generation, input.epoch, revision, signal);
     const view = this.find(input);
+    this.compatible(view);
     const key = keyOf(view);
     if (this.validations.has(key))
       throw new RuntimeFault(
@@ -709,7 +743,7 @@ export class ReactiveRuntime {
 
   private contextIdentity(): ContextIdentity {
     const state = this.host.gameState();
-    if (!state.session_id || !state.life || !state.world_id)
+    if (!state.session_id || !state.life || !state.world_id || !state.binding?.ready || !state.space)
       throw new RuntimeFault(
         "stale_context",
         "A real game session and player life are required",
@@ -720,6 +754,8 @@ export class ReactiveRuntime {
       life_status: state.life.status,
       epoch: state.epoch,
       world_id: state.world_id,
+      native_boot_id: state.binding.native_boot_id, space_epoch: state.space.space_epoch,
+      compatibility_hash: state.binding.compatibility_hash, screen: state.screen,
     };
   }
 
@@ -730,7 +766,9 @@ export class ReactiveRuntime {
       state.epoch === identity.epoch &&
       state.world_id === identity.world_id &&
       state.life?.life_id === identity.life_id &&
-      state.life.status === identity.life_status
+      state.life.status === identity.life_status &&
+      state.binding?.native_boot_id === identity.native_boot_id && state.binding.compatibility_hash === identity.compatibility_hash &&
+      state.space?.space_epoch === identity.space_epoch && sameScreen(state.screen, identity.screen)
     );
   }
 
@@ -745,7 +783,9 @@ export class ReactiveRuntime {
           context.observation.epoch !== identity.epoch ||
           context.observation.world_id !== identity.world_id ||
           context.observation.life.life_id !== identity.life_id ||
-          context.observation.life.status !== identity.life_status))
+          context.observation.life.status !== identity.life_status ||
+          context.observation.native_boot_id !== identity.native_boot_id || context.observation.space.space_epoch !== identity.space_epoch ||
+          context.observation.compatibility_hash !== identity.compatibility_hash || !sameScreen(context.observation.screen, identity.screen)))
     )
       throw new RuntimeFault(
         "stale_context",
@@ -776,6 +816,7 @@ export class ReactiveRuntime {
     view: PolicyView,
     revision: number,
   ): Promise<PolicyWorker> {
+    this.compatible(view);
     const start = (async () => {
       let worker: PolicyWorker;
       try {
@@ -788,6 +829,7 @@ export class ReactiveRuntime {
             const validated = await validateProgramSource(
               view.source,
               "policy",
+              this.contract(),
             );
             if (validated.source !== view.source)
               throw new RuntimeFault(
@@ -924,6 +966,7 @@ export class ReactiveRuntime {
               actual_calls: result.actual_calls,
               usage: result.usage as unknown as Json,
               known_cost: result.known_cost,
+              usage_evidence: result.usage_evidence as unknown as Json,
             },
           );
           this.store.saveRun(run);
@@ -1131,6 +1174,11 @@ export class ReactiveRuntime {
       const decision = policyDecisionSchema.parse(
         await worker.evaluate(context, controller.signal),
       );
+      if (decision.kind === "replace") {
+        const registered = this.contract();
+        if (!registered.adapter.action_capability) throw new RuntimeFault("precondition_failed", "This adapter has no effect capability");
+        registered.registration.parseCapability(registered.adapter.action_capability.id, registered.adapter.action_capability.version, decision.action);
+      }
       if (
         !this.policyCurrent(
           slot,

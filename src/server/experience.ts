@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
-import type { Json } from "../shared/contracts.ts";
+import type { ProgramCompatibility } from "../shared/contracts.ts";
 import type {
   SkillExecutionView,
   SkillRef,
@@ -12,37 +12,37 @@ import type {
 import type { Store } from "./store.ts";
 import type { SkillManager } from "./skills.ts";
 import { SKILL_API_VERSION } from "../shared/programs.ts";
-import { confirmedRemoval, eligibleLog } from "./objective-metrics.ts";
-export const CURRENT_PROGRAM_COMPATIBILITY = Object.freeze({
+import { sameProgramCompatibility } from "./adapter-contract.ts";
+import { qualifyMinecraftExperience } from "./minecraft-qualification.ts";
+export const HISTORICAL_PROGRAM_COMPATIBILITY_V3 = Object.freeze({
   adapter_id: "fabric-owned-client" as const,
   game_version: "1.21.4" as const,
   observation_schema: 2 as const,
   profile_id: "player-observable-structured" as const,
   preset_id: "minecraft-observable-initial-r2" as const,
-  skill_protocol: SKILL_API_VERSION,
+  skill_protocol: 3 as const,
 });
-export type ProgramCompatibility = typeof CURRENT_PROGRAM_COMPATIBILITY;
-type LegacyProgramCompatibility = Omit<ProgramCompatibility, "observation_schema" | "preset_id" | "skill_protocol"> & {
+export interface LegacyProgramCompatibility {
+  adapter_id: string;
+  game_version: string;
   observation_schema: 1 | 2;
-  preset_id: "minecraft-observable-initial-r1" | "minecraft-observable-initial-r2";
-  skill_protocol: 1 | 2;
-};
+  profile_id: string;
+  preset_id: string;
+  skill_protocol: 1 | 2 | 3;
+}
 function compatible(
   value: unknown,
   current: ProgramCompatibility | null,
 ): boolean {
-  if (!current || !value || typeof value !== "object" || Array.isArray(value))
-    return false;
-  return Object.entries(current).every(
-    ([key, expected]) => (value as Record<string, unknown>)[key] === expected,
-  );
+  return current !== null && sameProgramCompatibility(value, current);
 }
 export interface ExperienceView {
   experience_id: string;
   name: string;
   model_id: string;
-  profile_id: "player-observable-structured";
-  preset_id: "minecraft-observable-initial-r1" | "minecraft-observable-initial-r2";
+  profile_id: string;
+  /** Historical display metadata only; no active preset alias is emitted. */
+  preset_id?: string;
   source_run_id: string;
   source_world_id: string;
   portability: "portable" | "world_local";
@@ -100,27 +100,12 @@ export const promotionDeclarationSchema: z.ZodType<PromotionDeclaration> = z
 interface Bundle extends ExperienceView {
   skills: SkillView[];
 }
-function record(value: Json | null | undefined): Record<string, Json> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value
-    : null;
-}
-function inventoryGain(evidence: Json, item: string): number {
-  const value = record(evidence);
-  if (value?.inventory_receipt_confirmed !== true) return 0;
-  const before = record(value?.inventory_before),
-    after = record(value?.inventory_after);
-  if (before && after && typeof after[item] === "number")
-    return after[item] - (typeof before[item] === "number" ? before[item] : 0);
-  const delta = record(value?.inventory_delta);
-  return delta && typeof delta[item] === "number" ? delta[item] : 0;
-}
 /** Explicit immutable model-scoped library. World observations and invocation args never travel. */
 export class ExperienceLibrary {
   private db: Database;
   constructor(
     directory: string,
-    private current: ProgramCompatibility | null = null,
+    private current: ProgramCompatibility | (() => ProgramCompatibility | null) | null = null,
   ) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     chmodSync(directory, 0o700);
@@ -139,7 +124,9 @@ export class ExperienceLibrary {
       this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS bundles_revision ON bundles(revision)");
     })();
   }
+  private compatibility(): ProgramCompatibility | null { return typeof this.current === "function" ? this.current() : this.current; }
   list(modelId: string, worldId: string | null): ExperienceView[] {
+    const current = this.compatibility();
     return this.db
       .query<{ payload: string }, [string]>(
         "SELECT payload FROM bundles WHERE model=? ORDER BY rowid DESC LIMIT 100",
@@ -151,28 +138,31 @@ export class ExperienceLibrary {
       })
       .filter(
         (view) =>
-          compatible(view.compatibility, this.current) &&
+          compatible(view.compatibility, current) &&
           (view.portability === "portable" || view.source_world_id === worldId),
       );
   }
   catalog(modelId: string, worldId: string | null, after: number, limit: number) {
-    if (!this.current) return { records: [], next_after: after, has_more: false, omissions: [] };
+    const current = this.compatibility();
+    if (!current) return { records: [], next_after: after, has_more: false, omissions: [] };
     const rows = this.db.query<{ version: number; payload: string }, [string, string | null, string, number, number, number]>(
-      "WITH compatible AS (SELECT revision AS version,payload FROM bundles WHERE model=? AND (json_extract(payload,'$.portability')='portable' OR json_extract(payload,'$.source_world_id')=?) AND NOT EXISTS (SELECT 1 FROM json_each(?) current WHERE json_extract(payload,'$.compatibility.'||current.key) IS NOT current.value)), latest AS (SELECT json_extract(payload,'$.name') AS name,MAX(version) AS version FROM compatible GROUP BY name) SELECT c.version,c.payload FROM compatible c JOIN latest l ON c.version=l.version WHERE (?=0 OR c.version<?) ORDER BY c.version DESC LIMIT ?",
-    ).all(modelId, worldId, JSON.stringify(this.current), after, after, limit + 1);
+      "WITH compatible AS (SELECT revision AS version,payload FROM bundles WHERE model=? AND (json_extract(payload,'$.portability')='portable' OR json_extract(payload,'$.source_world_id')=?) AND json_extract(payload,'$.compatibility.compatibility_hash')=?), latest AS (SELECT json_extract(payload,'$.name') AS name,MAX(version) AS version FROM compatible GROUP BY name) SELECT c.version,c.payload FROM compatible c JOIN latest l ON c.version=l.version WHERE (?=0 OR c.version<?) ORDER BY c.version DESC LIMIT ?",
+    ).all(modelId, worldId, current.compatibility_hash, after, after, limit + 1);
     const selected = rows.slice(0, limit);
     return { records: selected.map(({ version, payload }) => {
       const { skills: _skills, ...view } = JSON.parse(payload) as Bundle;
       return { ...view, version };
-    }), next_after: selected.at(-1)?.version ?? after, has_more: rows.length > limit, omissions: [] };
+    }).filter(view => compatible(view.compatibility, current)), next_after: selected.at(-1)?.version ?? after, has_more: rows.length > limit, omissions: [] };
   }
   named(modelId: string, worldId: string | null, name: string, version?: number): (ExperienceView & { version: number }) | null {
-    if (!this.current) return null;
+    const current = this.compatibility();
+    if (!current) return null;
     const row = this.db.query<{ version: number; payload: string }, [string, string, number | null, number | null, string | null, string]>(
-      "SELECT revision AS version,payload FROM bundles WHERE model=? AND json_extract(payload,'$.name')=? AND revision IS NOT NULL AND (? IS NULL OR revision=?) AND (json_extract(payload,'$.portability')='portable' OR json_extract(payload,'$.source_world_id')=?) AND NOT EXISTS (SELECT 1 FROM json_each(?) current WHERE json_extract(payload,'$.compatibility.'||current.key) IS NOT current.value) ORDER BY revision DESC LIMIT 1",
-    ).get(modelId, name, version ?? null, version ?? null, worldId, JSON.stringify(this.current));
+      "SELECT revision AS version,payload FROM bundles WHERE model=? AND json_extract(payload,'$.name')=? AND revision IS NOT NULL AND (? IS NULL OR revision=?) AND (json_extract(payload,'$.portability')='portable' OR json_extract(payload,'$.source_world_id')=?) AND json_extract(payload,'$.compatibility.compatibility_hash')=? ORDER BY revision DESC LIMIT 1",
+    ).get(modelId, name, version ?? null, version ?? null, worldId, current.compatibility_hash);
     if (!row) return null;
     const { skills: _skills, ...view } = JSON.parse(row.payload) as Bundle;
+    if (!compatible(view.compatibility, current)) return null;
     return { ...view, version: row.version };
   }
   snapshotVersion(id: string, modelId: string): number | null {
@@ -205,7 +195,8 @@ export class ExperienceLibrary {
     const provenance = store
       .eventsAfter(runId, 0, 100)
       .find((event) => event.type === "run.adapter");
-    if (!this.current || !compatible(provenance?.details, this.current))
+    const current = this.compatibility();
+    if (!current || !compatible(provenance?.details, current))
       throw new Error(
         "Native adapter provenance is absent or incompatible; legacy runs are not portable evidence",
       );
@@ -231,44 +222,6 @@ export class ExperienceLibrary {
       throw new Error(
         "Evidence must come from this bounded execution interval",
       );
-    const details = record(verified.details);
-    const predicateActionId = typeof details?.action_id === "string" ? details.action_id : null;
-    let item: string, minGain: number;
-    const removalPredicate = declaration.predicate.kind === "break_log" || (declaration.predicate.kind === "goal_verified" && run.goal === "break_log");
-    if (removalPredicate) {
-      if (
-        !((verified.type === "goal.verified" && details?.goal === "break_log") || (declaration.predicate.kind === "break_log" && verified.type === "action.succeeded")) ||
-        predicateActionId === null
-      ) throw new Error("Declared break_log predicate lacks a trusted block-removal event");
-      item = typeof details?.item === "string" ? details.item : typeof details?.target_name === "string" ? details.target_name : "";
-      minGain = 0;
-    } else if (declaration.predicate.kind === "goal_verified") {
-      if (
-        verified.type !== "goal.verified" ||
-        run.goal === "custom" ||
-        details?.goal !== run.goal ||
-        typeof details.item !== "string"
-      )
-        throw new Error(
-          "Declared goal lacks matching trusted verifier evidence",
-        );
-      item = details.item;
-      minGain = 1;
-    } else if (declaration.predicate.kind === "inventory_gain") {
-      item = declaration.predicate.item;
-      minGain = declaration.predicate.min_gain;
-      const counts = record(details?.counts);
-      const count = counts?.[item];
-      if (
-        verified.type !== "observation.inventory" ||
-        details?.epoch !== execution.epoch ||
-        typeof count !== "number" ||
-        count - (run.baseline[item] ?? 0) < minGain
-      )
-        throw new Error(
-          "Declared inventory predicate is not established by trusted counts",
-        );
-    } else throw new Error("Unsupported promotion predicate");
     if (
       execution.status !== "succeeded" &&
       !(execution.status === "cancelled" && verified.type === "goal.verified")
@@ -276,62 +229,9 @@ export class ExperienceLibrary {
       throw new Error(
         "Promotion requires completed execution or trusted objective closure",
       );
-    const actionIds: string[] = [];
-    const seenActions = new Set<string>();
-    let measuredGain = 0,
-      matchedGoal = false;
-    let cursor = 0;
-    while (true) {
-      const page = store.eventsAfter(runId, cursor, 500);
-      for (const event of page) {
-        if (
-          event.type !== "action.succeeded" ||
-          event.at < execution.started_at ||
-          event.at > execution.ended_at
-        )
-          continue;
-        const details = event.details;
-        if (
-          !details ||
-          typeof details !== "object" ||
-          Array.isArray(details) ||
-          typeof details.action_id !== "string"
-        )
-          continue;
-        if (seenActions.has(details.action_id)) continue;
-        seenActions.add(details.action_id);
-        const action = store.getAction(runId, details.action_id);
-        if (!action?.view.execution_id || action.view.status !== "succeeded")
-          continue;
-        const owner = store.skillExecution(runId, {
-          execution_id: action.view.execution_id,
-        });
-        if (owner?.root_execution_id !== execution.execution_id) continue;
-        const evidence = record(action.view.result?.evidence);
-        const crafted =
-          declaration.predicate.kind === "goal_verified" &&
-          action.request.kind === "craft" &&
-          action.request.item === item;
-        const removal = removalPredicate && confirmedRemoval(action) && typeof evidence?.target_name === "string" && eligibleLog(evidence.target_name) &&
-          (!item || evidence.target_name === item) &&
-          predicateActionId === action.view.action_id;
-        const gain = inventoryGain(action.view.result!.evidence, item);
-        if (
-          evidence?.effect_confirmed === true &&
-          (crafted || removal || (!removalPredicate && gain > 0))
-        ) {
-          actionIds.push(action.view.action_id);
-          measuredGain += Math.max(0, gain);
-          matchedGoal ||= crafted || removal;
-        }
-      }
-      if (page.length < 500) break;
-      cursor = page[page.length - 1]!.event_seq;
-    }
-    if (!actionIds.length || (removalPredicate ? !matchedGoal : !matchedGoal && measuredGain < minGain))
-      throw new Error(
-        "Promotion requires attributable predicate evidence, not generic effects or self-report",
-      );
+    if (current.descriptor.observation.payload_schema.id !== "minecraft_observation_v1")
+      throw new Error("This adapter has no registered experience qualification predicate implementation");
+    const actionIds = qualifyMinecraftExperience(store, run, execution, declaration);
     const skills: SkillView[] = [];
     const seen = new Set<string>();
     const visit = (ref: SkillRef): void => {
@@ -341,7 +241,8 @@ export class ExperienceLibrary {
       const skill = store.skill(runId, ref);
       if (skill.state !== "validated")
         throw new Error("Promotion requires validated exact dependencies");
-      if (skill.validation.runtime_version !== SKILL_API_VERSION)
+      if (skill.validation.runtime_version !== SKILL_API_VERSION || skill.validation.api_version !== 4 || skill.validation.validator_version !== 4 ||
+        skill.validation.compatibility_hash !== current.compatibility_hash)
         throw new Error("Promotion requires compatible skill API sources; retained incompatible history is inspectable only");
       for (const dependency of skill.dependencies) visit(dependency);
       skills.push(skill);
@@ -350,13 +251,12 @@ export class ExperienceLibrary {
     const payload: Omit<Bundle, "experience_id"> = {
       name,
       model_id: run.model_id,
-      profile_id: "player-observable-structured",
-      preset_id: "minecraft-observable-initial-r2",
+      profile_id: current.descriptor.observation.profile.id,
       source_run_id: runId,
       source_world_id: run.world_id,
       portability: declaration.portability,
       retained_world_data: declaration.retained_world_data,
-      compatibility: this.current,
+      compatibility: current,
       root: { skill_id: execution.skill_id, version: execution.version },
       created_at: new Date().toISOString(),
       evidence: {
@@ -392,7 +292,8 @@ export class ExperienceLibrary {
       .get(id, modelId);
     if (!row) throw new Error("No compatible model-scoped experience snapshot");
     const bundle = JSON.parse(row.payload) as Bundle;
-    if (!compatible(bundle.compatibility, this.current))
+    const current = this.compatibility();
+    if (!compatible(bundle.compatibility, current))
       throw new Error(
         "Snapshot adapter/game/profile/schema/protocol compatibility does not match",
       );
@@ -402,10 +303,7 @@ export class ExperienceLibrary {
       throw new Error(
         "Portable declaration conflicts with retained world data",
       );
-    if (
-      bundle.profile_id !== "player-observable-structured" ||
-      bundle.preset_id !== "minecraft-observable-initial-r2"
-    )
+    if (!current || bundle.profile_id !== current.descriptor.observation.profile.id)
       throw new Error("Observation profile incompatible");
     const imported = new Map<string, SkillView>();
     for (const skill of bundle.skills) {

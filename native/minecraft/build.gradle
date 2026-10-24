@@ -16,6 +16,25 @@ java { toolchain { languageVersion = JavaLanguageVersion.of(21) }; withSourcesJa
 tasks.withType(JavaCompile).configureEach { options.release = 21 }
 jar { from('LICENSE') }
 
+// Immutable actual build/schema/profile identity. Generated files are outputs,
+// never inputs to their own digest; final JAR byte hashes remain independent.
+def contractResources = layout.buildDirectory.dir('generated/nativeContract')
+def generateNativeContract = tasks.register('generateNativeContract', Exec) {
+    workingDir rootProject.projectDir.parentFile.parentFile
+    commandLine providers.environmentVariable('GAMEHARNESS_BUN').getOrElse('bun'),
+        'scripts/build-native-contract.ts'
+    inputs.files(fileTree('src/main'), fileTree('src/client'))
+    inputs.files('build.gradle', 'settings.gradle', 'gradlew')
+    inputs.files(file('../../package.json'), file('../../bun.lock'), file('../../scripts/build-native-contract.ts'))
+    inputs.files(fileTree('../../src/shared'), file('../../src/server/adapter-contract.ts'),
+        file('../../src/server/native-contract.ts'), file('../../src/server/minecraft-adapter.ts'),
+        file('../../src/server/actor-frames.ts'), file('../../src/server/video.ts'))
+    outputs.file(contractResources.map { it.file('gameharness-native-contract.json') })
+}
+sourceSets.main.resources.srcDir(contractResources)
+tasks.named('processResources') { dependsOn generateNativeContract }
+tasks.named('sourcesJar') { dependsOn generateNativeContract }
+
 // These dependency-free main programs assert behavior directly; they are not JUnit tests.
 tasks.register('nativeBoundaryProof', JavaExec) {
     group = 'verification'
@@ -31,6 +50,13 @@ tasks.register('nativeMotorProof', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'io.gameharness.nativeclient.MotorProof'
 }
+tasks.register('nativeContractProof', JavaExec) {
+    group = 'verification'
+    description = 'Runs exact safe-counter, queued scope, owner and target incarnation proofs.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'io.gameharness.nativeclient.ContractProof'
+}
 tasks.named('check') {
-    dependsOn tasks.named('nativeBoundaryProof'), tasks.named('nativeMotorProof')
+    dependsOn tasks.named('nativeBoundaryProof'), tasks.named('nativeMotorProof'), tasks.named('nativeContractProof')
 }

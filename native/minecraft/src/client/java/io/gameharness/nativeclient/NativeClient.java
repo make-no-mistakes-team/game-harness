@@ -30,17 +30,80 @@ public final class NativeClient implements ClientModInitializer {
   public static NativeClient INSTANCE;
   public static long blockedKeyboardCallbacks, blockedMouseCallbacks, suppressedPolls;
   private int receiptNonce;
-  private final Map<Integer, Integer> pendingObservations = new LinkedHashMap<>();
+  private final Map<Integer, Long> pendingObservations = new LinkedHashMap<>();
   private final PlayerLifecycle lifecycle = new PlayerLifecycle();
   private long deathNotified = -1;
   private JsonObject death;
   private boolean lifeWasAlive;
   private boolean lastPublishedCanRespawn;
-  private int respawnRequest, respawnReceipt;
+  private long respawnRequest;
+  private int respawnReceipt;
   private long respawnAdmissionDeadline;
   private long respawnAdmittedNanos, respawnEmittedNanos;
   private boolean issuingRespawn;
   private CameraMotion.Profile motorProfile = CameraMotion.Profile.BALANCED;
+  private EffectAuthority effectAuthority;
+  private ClientIncarnationSignals incarnationSignals;
+  private JsonObject descriptor;
+  private String compatibilityHash;
+  private final Map<Long, NativeEffectContract.Received> effectRequests = new HashMap<>();
+  private final TargetIncarnations<BlockPos> blockIncarnations = new TargetIncarnations<>(256);
+  private final TargetIncarnations<UUID> entityIncarnations = new TargetIncarnations<>(256);
+  private final ScreenIncarnations screenIncarnations = new ScreenIncarnations();
+
+  private int nextReceiptNonce() {
+    if (receiptNonce == Integer.MAX_VALUE) throw new IllegalStateException("Native receipt nonce range exhausted");
+    return ++receiptNonce;
+  }
+
+  private void fenceAuthority() {
+    effectAuthority.emergencyStop();
+    authority = effectAuthority.cancellationGeneration();
+  }
+
+  private void bindScopeIfReady() {
+    if (!effectAuthority.ready() && incarnationSignals.space() != null && lifecycle.status() != PlayerLifecycle.Status.LOADING) {
+      effectAuthority.bind(compatibilityHash, lifecycle.lifeId(), incarnationSignals.space(), incarnationSignals.screen());
+    }
+  }
+
+  private synchronized void publishScope() {
+    if (!connected) return;
+    JsonObject notice = new JsonObject(), message = new JsonObject();
+    notice.addProperty("type", "scope");
+    for (String key : List.of("world_id", "epoch", "session_id")) notice.add(key, config.get(key));
+    notice.addProperty("native_boot_id", effectAuthority.nativeBootId());
+    notice.addProperty("generation", authority);
+    notice.add("life", life());
+    notice.add("space", incarnationSignals.space() == null ? JsonNull.INSTANCE : NativeEffectContract.space(incarnationSignals.space()));
+    notice.add("screen", NativeEffectContract.screen(incarnationSignals.screen()));
+    notice.addProperty("neutralized", motor == null);
+    message.add("notice", notice);
+    try { output.write(message.toString()); output.newLine(); output.flush(); }
+    catch (IOException error) { connected = false; fenceAuthority(); neutralize(); client.scheduleStop(); }
+  }
+
+  public void spaceReceived() { incarnationSignals.authoritativeSpaceReceived(); }
+  public void scopeUnavailable() { if (incarnationSignals != null) incarnationSignals.loading(); }
+  public void screenReceived() { if (incarnationSignals != null) incarnationSignals.viewReceived(); }
+  public void screenTransactionReceived() { if (incarnationSignals != null) incarnationSignals.relevantTransactionReceived(); }
+  public void screenTransactionReceived(int syncId) {
+    if (client.player != null && (syncId <= 0 || syncId == client.player.currentScreenHandler.syncId)) screenTransactionReceived();
+  }
+  public void entityReplaced(Entity entity) { if (incarnationSignals != null) incarnationSignals.entityReplaced(entity); }
+
+  private NativeEffectContract.Received receivedEffect(long id) {
+    synchronized (effectRequests) { return effectRequests.get(id); }
+  }
+
+  private static JsonObject rejectedEffect(String stage, String reason) {
+    JsonObject result = new JsonObject(), evidence = new JsonObject();
+    result.addProperty("status", "failed"); result.addProperty("summary", "Native effect rejected before application: " + reason);
+    evidence.addProperty("effect_confirmed", false); evidence.addProperty("world_effect_emitted", false);
+    evidence.addProperty("neutralized_effect", false); evidence.addProperty("scope_rejection_stage", stage);
+    evidence.addProperty("scope_rejection_reason", reason);
+    result.add("evidence", evidence); return result;
+  }
 
   public void inventoryReceipt(int nonce, long generation, String contents) {
     if (generation != authority || client.player == null || client.world == null) return;
@@ -57,13 +120,13 @@ public final class NativeClient implements ClientModInitializer {
         return;
       }
       if (lifecycle.confirmRespawn(alive && !client.player.isDead())) {
-        int id = respawnRequest;
+        long id = respawnRequest;
         respawnRequest = 0;
         blocks.clear();
         entities.clear();
-        entityHandles.clear();
         death = null;
         lifeWasAlive = true;
+        incarnationSignals.authoritativeLifeChanged(lifecycle.lifeId());
         publishLife();
         if (id != 0) {
           JsonObject outcome = respawnResult("succeeded", "Vanilla respawn confirmed by new-player server health and inventory receipt", true);
@@ -76,12 +139,12 @@ public final class NativeClient implements ClientModInitializer {
     PlayerLifecycle.Decision decision =
         handleLifecycle(alive && client.player.getHealth() > 0 && !client.player.isDead(), true);
     if (decision == PlayerLifecycle.Decision.WAIT && lifecycle.status() == PlayerLifecycle.Status.LOADING) {
-      Integer waiting = pendingObservations.remove(nonce);
+      Long waiting = pendingObservations.remove(nonce);
       if (waiting != null)
         reply(waiting, null, "Waiting for authoritative player state");
       return;
     }
-    Integer observationId = pendingObservations.remove(nonce);
+    Long observationId = pendingObservations.remove(nonce);
     if (observationId != null) {
       JsonObject observation = observe();
       JsonArray inventory = new JsonArray();
@@ -101,13 +164,17 @@ public final class NativeClient implements ClientModInitializer {
                 .getString());
         inventory.add(item);
       }
-      observation.getAsJsonObject("player").add("inventory", inventory);
-      observation.getAsJsonObject("player").add("health", value.get("health"));
+      observation.getAsJsonObject("data").getAsJsonObject("player").add("inventory", inventory);
+      observation.getAsJsonObject("data").getAsJsonObject("player").add("health", value.get("health"));
       reply(observationId, observation, null);
       return;
     }
     if (motor == null || generation != motor.generation || nonce != motor.receiptNonce) return;
     if (!motor.ready) {
+      if (!motor.authorized(true)) {
+        motor.rejectApplication("game_thread_baseline");
+        return;
+      }
       motor.inventoryBefore = value.getAsJsonObject("counts");
       motor.receiptNonce = 0;
       motor.ready = true;
@@ -164,7 +231,7 @@ public final class NativeClient implements ClientModInitializer {
         && !e.isRemoved()
         && !e.isInvisibleTo(client.player)
         && client.player.canSee(e)
-        && e.squaredDistanceTo(client.player) <= 64
+        && e.squaredDistanceTo(client.player) <= NativeContractResource.RADIUS_SQUARED
         && clearLine(e.getBoundingBox().getCenter(), null);
   }
 
@@ -172,7 +239,7 @@ public final class NativeClient implements ClientModInitializer {
   private BufferedWriter output;
   private volatile boolean connected;
   private volatile long authority = 1;
-  private int lastRequestId;
+  private long lastRequestId;
   private final java.util.concurrent.atomic.AtomicInteger queued =
       new java.util.concurrent.atomic.AtomicInteger();
   private Motor motor;
@@ -190,6 +257,7 @@ public final class NativeClient implements ClientModInitializer {
   private long motorDispatchNanos, motorDispatchCount, motorDispatchMaxNanos;
 
   public void blockUpdated(BlockPos pos) {
+    blockIncarnations.replaced(pos);
     if (motor != null
         && motor.confirmationPosition != null
         && motor.confirmationPosition.equals(pos)) {
@@ -220,7 +288,6 @@ public final class NativeClient implements ClientModInitializer {
 
   private final Map<String, BlockPos> blocks = new HashMap<>();
   private final Map<String, Entity> entities = new HashMap<>();
-  private final LinkedHashMap<UUID, String> entityHandles = new LinkedHashMap<>();
   private final SoundProjection sounds = new SoundProjection();
   private static final String[]
       SOUND_CATEGORIES = {"movement", "interaction", "combat", "creature", "weather"},
@@ -246,11 +313,7 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   public static String hello(JsonObject config) {
-    JsonObject h = new JsonObject();
-    for (String key : List.of("secret", "world_id", "epoch", "session_id"))
-      h.add(key, config.get(key));
-    h.addProperty("protocol", 2);
-    return h.toString();
+    return NativeEffectContract.hello(config, INSTANCE.descriptor, INSTANCE.effectAuthority.nativeBootId()).toString();
   }
 
   public void onInitializeClient() {
@@ -263,6 +326,21 @@ public final class NativeClient implements ClientModInitializer {
               .getAsJsonObject();
       if (config.has("motor_profile"))
         motorProfile = CameraMotion.Profile.valueOf(config.get("motor_profile").getAsString().toUpperCase(Locale.ROOT));
+      effectAuthority = new EffectAuthority(NativeEffectContract.id(config, "session_id"),
+          NativeEffectContract.id(config, "world_id"), NativeEffectContract.counter(config, "epoch"));
+      descriptor = NativeContractResource.descriptor(motorProfile.name().toLowerCase(Locale.ROOT));
+      compatibilityHash = NativeContractResource.hash(descriptor);
+      incarnationSignals = new ClientIncarnationSignals(client, effectAuthority, blockIncarnations, entityIncarnations, screenIncarnations,
+          new ClientIncarnationSignals.Listener() {
+            public void scopeFenced() {
+              authority = effectAuthority.cancellationGeneration();
+              if (respawnRequest != 0 && lifecycle.status() == PlayerLifecycle.Status.RESPAWNING) {
+                blocks.clear(); entities.clear(); rejectObservations("Observation predates replacement space"); applyInput();
+              } else neutralize();
+              bindScopeIfReady(); publishScope();
+            }
+            public void screenChanged() { publishScope(); }
+          });
     } catch (Exception e) {
       throw new IllegalStateException("Private native configuration unavailable");
     }
@@ -301,19 +379,38 @@ public final class NativeClient implements ClientModInitializer {
           JsonObject request =
               JsonParser.parseString(line.toString(StandardCharsets.UTF_8)).getAsJsonObject();
           line.reset();
-          int requestId = request.get("id").getAsInt();
+          long requestId = NativeEffectContract.counter(request, "id");
           if (requestId <= lastRequestId || queued.incrementAndGet() > 32)
             throw new IOException("Invalid request sequence or pending bound");
           lastRequestId = requestId;
           if (!request.get("session_id").getAsString().equals(config.get("session_id").getAsString())
               || !request.get("world_id").getAsString().equals(config.get("world_id").getAsString())
-              || request.get("epoch").getAsInt() != config.get("epoch").getAsInt())
+              || NativeEffectContract.counter(request, "epoch") != NativeEffectContract.counter(config, "epoch")
+              || !NativeEffectContract.id(request, "native_boot_id").equals(effectAuthority.nativeBootId()))
             throw new IOException("Authority mismatch");
-          long generation = request.get("generation").getAsLong();
+          long generation = NativeEffectContract.counter(request, "generation");
           request.addProperty("received_ns", System.nanoTime());
           String method = request.get("method").getAsString();
-          if (method.equals("cancel") || method.equals("disconnect"))
-            authority = Math.max(authority + 1, generation);
+          if (method.equals("cancel") || method.equals("disconnect")) {
+            JsonObject params = request.getAsJsonObject("params");
+            boolean emergency = method.equals("disconnect") || params.has("emergency") && params.get("emergency").getAsBoolean();
+            boolean matched;
+            if (emergency) { fenceAuthority(); matched = true; }
+            else {
+              matched = effectAuthority.close(NativeEffectContract.owner(params.getAsJsonObject("expected_owner")));
+              authority = effectAuthority.cancellationGeneration();
+            }
+            request.addProperty("matched_owner", matched);
+          } else if (method.equals("execute")) {
+            NativeEffectContract.Received received = NativeEffectContract.effect(request.getAsJsonObject("params"), generation);
+            EffectAuthority.Rejection rejection = effectAuthority.grant(received.owner(), received.compatibilityHash(), received.expectedScreen());
+            if (rejection != EffectAuthority.Rejection.NONE) {
+              queued.decrementAndGet();
+              reply(requestId, NativeEffectContract.receipt(received, rejectedEffect("receive", rejection.name())), null);
+              continue;
+            }
+            synchronized (effectRequests) { effectRequests.put(requestId, received); }
+          }
           client.execute(
               () -> {
                 try {
@@ -330,7 +427,7 @@ public final class NativeClient implements ClientModInitializer {
     } catch (Exception ignored) {
     } finally {
       connected = false;
-      authority++;
+      fenceAuthority();
       client.execute(
           () -> {
             neutralize();
@@ -339,12 +436,15 @@ public final class NativeClient implements ClientModInitializer {
     }
   }
 
-  private synchronized void reply(int id, JsonElement data, String error) {
+  private synchronized void reply(long id, JsonElement data, String error) {
     if (!connected) return;
     JsonObject response = new JsonObject();
     response.addProperty("id", id);
     response.addProperty("ok", error == null);
-    if (error == null) response.add("data", data);
+    NativeEffectContract.Received received;
+    synchronized (effectRequests) { received = effectRequests.remove(id); }
+    if (received != null) effectAuthority.complete(received.owner());
+    if (error == null) response.add("data", received == null ? data : NativeEffectContract.receipt(received, data.getAsJsonObject()));
     else response.addProperty("error", error);
     try {
       output.write(response.toString());
@@ -352,7 +452,7 @@ public final class NativeClient implements ClientModInitializer {
       output.flush();
     } catch (IOException e) {
       connected = false;
-      authority++;
+      fenceAuthority();
       neutralize();
       client.scheduleStop();
     }
@@ -362,13 +462,14 @@ public final class NativeClient implements ClientModInitializer {
     if (!connected || client.player == null || client.world == null) return;
     handleLifecycle(health > 0 && !client.player.isDead(), true);
     if (lifecycle.status() == PlayerLifecycle.Status.RESPAWNING && respawnReceipt == 0) {
-      respawnReceipt = ++receiptNonce;
+      respawnReceipt = nextReceiptNonce();
       InventoryProofClient.request(respawnReceipt, authority);
     }
   }
 
   public void playerRespawned() {
     lifecycle.playerReplaced();
+    spaceReceived();
     if (lifecycle.status() == PlayerLifecycle.Status.RESPAWNING) {
       respawnReceipt = 0;
       rejectObservations("Observation predates the replacement player");
@@ -377,10 +478,11 @@ public final class NativeClient implements ClientModInitializer {
 
   public void playerPositionReceived() {
     lifecycle.positionReceived();
+    spaceReceived();
     if (client.player != null)
       handleLifecycle(client.player.getHealth() > 0 && !client.player.isDead(), false);
     if (lifecycle.status() == PlayerLifecycle.Status.RESPAWNING && respawnReceipt == 0) {
-      respawnReceipt = ++receiptNonce;
+      respawnReceipt = nextReceiptNonce();
       InventoryProofClient.request(respawnReceipt, authority);
     }
   }
@@ -396,7 +498,7 @@ public final class NativeClient implements ClientModInitializer {
     if (respawnRequest == 0 || lifecycle.status() != PlayerLifecycle.Status.DEAD) return;
     long now = System.nanoTime() / 1000000;
     if (now >= respawnAdmissionDeadline) {
-      int id = respawnRequest;
+      long id = respawnRequest;
       respawnRequest = 0;
       reply(id, respawnResult("failed", "Vanilla death screen did not become respawn-ready before the admission deadline", false), null);
       return;
@@ -441,6 +543,9 @@ public final class NativeClient implements ClientModInitializer {
     notice.addProperty("type", "life");
     for (String key : List.of("world_id", "epoch", "session_id")) notice.add(key, config.get(key));
     notice.addProperty("generation", authority);
+    notice.addProperty("native_boot_id", effectAuthority.nativeBootId());
+    notice.add("space", incarnationSignals.space() == null ? JsonNull.INSTANCE : NativeEffectContract.space(incarnationSignals.space()));
+    notice.add("screen", NativeEffectContract.screen(incarnationSignals.screen()));
     notice.addProperty("neutralized", true);
     JsonObject publishedLife = life();
     notice.add("life", publishedLife);
@@ -452,7 +557,7 @@ public final class NativeClient implements ClientModInitializer {
       lastPublishedCanRespawn = publishedLife.get("can_respawn").getAsBoolean();
     } catch (IOException error) {
       connected = false;
-      authority++;
+      fenceAuthority();
       neutralize();
       client.scheduleStop();
     }
@@ -463,13 +568,14 @@ public final class NativeClient implements ClientModInitializer {
     boolean replacing = lifecycle.status() == PlayerLifecycle.Status.RESPAWNING;
     PlayerLifecycle.Decision decision =
         lifecycle.update(alive, authoritative, System.nanoTime() / 1000000);
+    bindScopeIfReady();
     if (decision == PlayerLifecycle.Decision.READY) lifeWasAlive = true;
     if (decision == PlayerLifecycle.Decision.DIED) {
       if (replacing && lifecycle.lifeId() != previousLife) lifeWasAlive = true;
       fenceDeath();
     } else if (decision == PlayerLifecycle.Decision.RESPAWN_FAILED) {
-      int id = respawnRequest;
-      respawnRequest = respawnReceipt = 0;
+      long id = respawnRequest;
+      respawnRequest = 0; respawnReceipt = 0;
       publishLife();
       if (id != 0) reply(id, respawnResult("unknown", "Vanilla respawn outcome was not confirmed before its deadline; it will not be replayed", false), null);
     }
@@ -479,7 +585,8 @@ public final class NativeClient implements ClientModInitializer {
   private synchronized void fenceDeath() {
     if (deathNotified == lifecycle.lifeId()) return;
     deathNotified = lifecycle.lifeId();
-    authority++;
+    effectAuthority.lifeChanged(lifecycle.lifeId());
+    authority = effectAuthority.cancellationGeneration();
     // Fence locally before publishing the authoritative cause. It must precede generic action loss.
     applyInput();
     sounds.clear();
@@ -487,7 +594,7 @@ public final class NativeClient implements ClientModInitializer {
     if (client.player != null) client.player.stopUsingItem();
     blocks.clear();
     entities.clear();
-    entityHandles.clear();
+    blockIncarnations.invalidate(); entityIncarnations.invalidate();
     death = null;
     if (lifeWasAlive) {
       death = new JsonObject();
@@ -504,7 +611,7 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void dispatch(JsonObject request) {
-    int id = request.get("id").getAsInt();
+    long id = NativeEffectContract.counter(request, "id");
     try {
       long queued = System.nanoTime() - request.get("received_ns").getAsLong();
       dispatchQueueNanos += queued;
@@ -512,9 +619,11 @@ public final class NativeClient implements ClientModInitializer {
       dispatchQueueMaxNanos = Math.max(dispatchQueueMaxNanos, queued);
       String method = request.get("method").getAsString();
       if (method.equals("cancel")) {
-        neutralize();
+        boolean matched = request.get("matched_owner").getAsBoolean();
+        if (matched) neutralize();
         JsonObject result = new JsonObject();
         result.addProperty("neutralized", true);
+        result.addProperty("matched_owner", matched);
         result.addProperty("generation", authority);
         result.add("session_id", config.get("session_id"));
         result.addProperty("life_id", lifecycle.lifeId());
@@ -527,11 +636,6 @@ public final class NativeClient implements ClientModInitializer {
         client.scheduleStop();
         return;
       }
-      if (request.get("generation").getAsLong() != authority) {
-        if (method.equals("execute")) reply(id, result("failed", "Stale native effect authority", false), null);
-        else reply(id, null, "Stale native effect authority");
-        return;
-      }
       if (method.equals("ping")) {
         reply(id, new JsonObject(), null);
         return;
@@ -541,9 +645,17 @@ public final class NativeClient implements ClientModInitializer {
         return;
       }
       if (method.equals("motor_profile")) {
+        if (motor != null || respawnRequest != 0 || effectAuthority.owner() != null) {
+          reply(id, null, "Motor profile changes require a quiescent effect owner");
+          return;
+        }
         motorProfile = CameraMotion.Profile.valueOf(request.getAsJsonObject("params").get("profile").getAsString().toUpperCase(Locale.ROOT));
+        descriptor = NativeContractResource.descriptor(motorProfile.name().toLowerCase(Locale.ROOT));
+        compatibilityHash = NativeContractResource.hash(descriptor);
+        if (effectAuthority.ready()) effectAuthority.bind(compatibilityHash, lifecycle.lifeId(), incarnationSignals.space(), incarnationSignals.screen());
         JsonObject value = new JsonObject();
         value.addProperty("profile", motorProfile.name().toLowerCase(Locale.ROOT));
+        value.add("descriptor", descriptor);
         reply(id, value, null);
         return;
       }
@@ -556,7 +668,7 @@ public final class NativeClient implements ClientModInitializer {
           reply(id, null, "Observation receipt bound reached");
           return;
         }
-        int nonce = ++receiptNonce;
+        int nonce = nextReceiptNonce();
         pendingObservations.put(nonce, id);
         InventoryProofClient.request(nonce, authority);
         return;
@@ -572,11 +684,17 @@ public final class NativeClient implements ClientModInitializer {
         reply(id, null, "Unsupported native method");
         return;
       }
-      if (request.get("life_id").getAsLong() != lifecycle.lifeId()) {
-        reply(id, result("failed", "Stale player life authority", false), null);
+      NativeEffectContract.Received received = receivedEffect(id);
+      if (received == null) {
+        reply(id, null, "Effect request has no authenticated host owner");
         return;
       }
-      JsonObject action = request.getAsJsonObject("params");
+      EffectAuthority.Rejection rejection = effectAuthority.validateApplication(received.owner(), received.compatibilityHash(), received.expectedScreen());
+      if (rejection != EffectAuthority.Rejection.NONE) {
+        reply(id, rejectedEffect("game_thread", rejection.name()), null);
+        return;
+      }
+      JsonObject action = received.action();
       if (action.get("kind").getAsString().equals("respawn")) {
         if (respawnRequest != 0 || motor != null || lifecycle.status() != PlayerLifecycle.Status.DEAD) {
           reply(id, result("failed", "Vanilla death screen is not ready for this life respawn", false), null);
@@ -602,12 +720,11 @@ public final class NativeClient implements ClientModInitializer {
         reply(id, result("failed", "Player is dead", false), null);
         return;
       }
-      if (client.currentScreen instanceof HandledScreen<?>) client.player.closeHandledScreen();
       observe();
       motor =
           new Motor(
               id,
-              request.getAsJsonObject("params"),
+              received,
               authority,
               request.get("received_ns").getAsLong());
       motor.requestInventory();
@@ -727,19 +844,27 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private JsonObject observe() {
+    if (incarnationSignals.space() == null) throw new IllegalStateException("Authoritative player space is unavailable");
     long observationStarted = System.nanoTime();
-    JsonObject o = new JsonObject();
+    JsonObject o = new JsonObject(), data = new JsonObject();
     String now = Instant.now().toString();
-    o.addProperty("schema_version", 2);
+    o.addProperty("schema_version", 3);
     o.add("world_id", config.get("world_id"));
     o.add("epoch", config.get("epoch"));
     o.add("session_id", config.get("session_id"));
     o.add("life", life());
-    o.addProperty("observation_seq", ++observationSeq);
+    o.addProperty("native_boot_id", effectAuthority.nativeBootId());
+    o.add("space", NativeEffectContract.space(incarnationSignals.space()));
+    o.add("screen", NativeEffectContract.screen(incarnationSignals.screen()));
+    observationSeq = ContractIdentity.next(observationSeq);
+    o.addProperty("observation_seq", observationSeq);
     o.addProperty("captured_at", now);
-    o.addProperty("profile_id", "player-observable-structured");
-    o.addProperty("preset_id", "minecraft-observable-initial-r2");
-    o.add("player", player());
+    JsonObject profile = descriptor.getAsJsonObject("observation").getAsJsonObject("profile");
+    o.add("profile_id", profile.get("id"));
+    o.add("profile_configuration_hash", profile.get("configuration_hash"));
+    o.addProperty("compatibility_hash", compatibilityHash);
+    o.add("data", data);
+    data.add("player", player());
     JsonArray visible = new JsonArray();
     blocks.clear();
     entities.clear();
@@ -747,12 +872,12 @@ public final class NativeClient implements ClientModInitializer {
     Vec3d eye = client.player.getEyePos();
     // Resolve geometry first; hidden block material is never inspected before the visibility test.
     outer:
-    for (int r = 0; r <= 8; r++)
+    for (int r = 0; r <= NativeContractResource.RADIUS; r++)
       for (int y = -r; y <= r; y++)
         for (int x = -r; x <= r; x++)
           for (int z = -r; z <= r; z++) {
             if (Math.max(Math.abs(x), Math.max(Math.abs(y), Math.abs(z))) != r
-                || x * x + y * y + z * z > 64) continue;
+                || x * x + y * y + z * z > NativeContractResource.RADIUS_SQUARED) continue;
             BlockPos pos = center.add(x, y, z);
             if (!clearLine(pos.toCenterPos(), pos)) continue;
             BlockHitResult hit =
@@ -764,10 +889,11 @@ public final class NativeClient implements ClientModInitializer {
                         RaycastContext.FluidHandling.NONE,
                         client.player));
             if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(pos)) continue;
-            String id = "b:" + lifecycle.lifeId() + ":" + pos.getX() + ":" + pos.getY() + ":" + pos.getZ();
+            TargetIncarnations.Target reference = blockIncarnations.observe(pos, incarnationSignals.space(), lifecycle.lifeId());
+            String id = reference.targetId();
             blocks.put(id, pos);
             JsonObject item = new JsonObject();
-            item.addProperty("id", id);
+            item.add("target", NativeEffectContract.target(reference));
             item.addProperty(
                 "name",
                 Registries.BLOCK.getId(client.world.getBlockState(pos).getBlock()).getPath());
@@ -775,22 +901,17 @@ public final class NativeClient implements ClientModInitializer {
             item.addProperty("observed_at", now);
             item.addProperty("current", true);
             visible.add(item);
-            if (visible.size() >= 144) break outer;
+            if (visible.size() >= NativeContractResource.MAX_BLOCKS) break outer;
           }
     JsonArray seenEntities = new JsonArray();
     for (Entity e :
-        client.world.getOtherEntities(client.player, client.player.getBoundingBox().expand(8))) {
+        client.world.getOtherEntities(client.player, client.player.getBoundingBox().expand(NativeContractResource.RADIUS))) {
       if (!authorizedEntity(e)) continue;
-      String id = entityHandles.get(e.getUuid());
-      if (id == null) {
-        if (entityHandles.size() == 256)
-          entityHandles.remove(entityHandles.keySet().iterator().next());
-        id = "e:" + UUID.randomUUID();
-        entityHandles.put(e.getUuid(), id);
-      }
+      TargetIncarnations.Target reference = entityIncarnations.observe(e.getUuid(), incarnationSignals.space(), lifecycle.lifeId());
+      String id = reference.targetId();
       entities.put(id, e);
       JsonObject item = new JsonObject();
-      item.addProperty("id", id);
+      item.add("target", NativeEffectContract.target(reference));
       item.addProperty("name", Registries.ENTITY_TYPE.getId(e.getType()).getPath());
       item.add("position", position(e.getPos()));
       item.addProperty("observed_at", now);
@@ -798,10 +919,10 @@ public final class NativeClient implements ClientModInitializer {
       if (e instanceof ItemEntity dropped && !dropped.getStack().isEmpty())
         item.addProperty("item_name", Registries.ITEM.getId(dropped.getStack().getItem()).getPath());
       seenEntities.add(item);
-      if (seenEntities.size() >= 32) break;
+      if (seenEntities.size() >= NativeContractResource.MAX_ENTITIES) break;
     }
-    o.add("blocks", visible);
-    o.add("entities", seenEntities);
+    data.add("blocks", visible);
+    data.add("entities", seenEntities);
     JsonArray heard = new JsonArray();
     for (SoundProjection.Group group : sounds.drain(Instant.parse(now).toEpochMilli())) {
       JsonObject sound = new JsonObject();
@@ -811,11 +932,11 @@ public final class NativeClient implements ClientModInitializer {
       sound.addProperty("observed_at", now);
       heard.add(sound);
     }
-    o.add("sounds", heard);
+    data.add("sounds", heard);
     JsonObject coverage = new JsonObject();
     coverage.addProperty("partial", true);
-    coverage.addProperty("max_age_ms", 1000);
-    o.add("coverage", coverage);
+    coverage.addProperty("max_age_ms", NativeContractResource.MAX_AGE_MS);
+    o.add("freshness", coverage);
     long elapsed = System.nanoTime() - observationStarted;
     observationNanos += elapsed;
     observationMaxNanos = Math.max(observationMaxNanos, elapsed);
@@ -875,14 +996,14 @@ public final class NativeClient implements ClientModInitializer {
         publishLife();
       requestRespawnWhenReady();
       if (lifecycle.status() == PlayerLifecycle.Status.RESPAWNING && respawnReceipt == 0) {
-        respawnReceipt = ++receiptNonce;
+        respawnReceipt = nextReceiptNonce();
         InventoryProofClient.request(respawnReceipt, authority);
       }
       return;
     }
     if (motor != null) {
       long started = System.nanoTime();
-      if (motor.generation != authority)
+      if (motor.generation != authority || !motor.authorized(false))
         motor.finish("cancelled", "Effect authority fenced", false);
       else motor.tick();
       long elapsed = System.nanoTime() - started;
@@ -908,7 +1029,7 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private boolean pressed(JsonObject controls, String key) {
-    if (!connected || motor == null || motor.generation != authority
+    if (!connected || motor == null || motor.generation != authority || !motor.authorized(false)
         || motor.lifeId != lifecycle.lifeId() || !lifecycle.ready()) return false;
     boolean value;
     if (motor.kind.equals("navigate"))
@@ -929,10 +1050,10 @@ public final class NativeClient implements ClientModInitializer {
     sounds.clear();
     blocks.clear();
     entities.clear();
-    entityHandles.clear();
+    blockIncarnations.invalidate(); entityIncarnations.invalidate();
     if (respawnRequest != 0) {
-      int id = respawnRequest;
-      respawnRequest = respawnReceipt = 0;
+      long id = respawnRequest;
+      respawnRequest = 0; respawnReceipt = 0;
       boolean requested = respawnEmittedNanos != 0;
       reply(id, respawnResult(requested ? "unknown" : "cancelled",
           requested ? "Respawn request was fenced; its outcome is not confirmed and will not be replayed"
@@ -949,17 +1070,20 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void rejectObservations(String reason) {
-    for (int id : pendingObservations.values()) reply(id, null, reason);
+    for (long id : pendingObservations.values()) reply(id, null, reason);
     pendingObservations.clear();
   }
 
-  private BlockPos targetBlock(JsonObject action) {
-    return blocks.get(action.has("target_id") ? action.get("target_id").getAsString() : "");
+  private BlockPos targetBlock(TargetIncarnations.Target target) {
+    if (target == null) return null;
+    BlockPos position = blocks.get(target.targetId());
+    return position != null && blockIncarnations.current(position, target, incarnationSignals.space(), lifecycle.lifeId()) ? position : null;
   }
 
-  private Entity targetEntity(JsonObject action) {
-    Entity e = entities.get(action.has("target_id") ? action.get("target_id").getAsString() : "");
-    return authorizedEntity(e) ? e : null;
+  private Entity targetEntity(TargetIncarnations.Target target) {
+    if (target == null) return null;
+    Entity e = entities.get(target.targetId());
+    return authorizedEntity(e) && entityIncarnations.current(e.getUuid(), target, incarnationSignals.space(), lifecycle.lifeId()) ? e : null;
   }
 
   private boolean reachable(BlockPos pos) {
@@ -1021,7 +1145,9 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private final class Motor {
-    final int id;
+    final long id;
+    final NativeEffectContract.Received received;
+    final TargetIncarnations.Target targetReference, tableReference, gazeReference, interactionReference;
     final JsonObject action;
     final String kind;
     final long generation, receivedNanos;
@@ -1065,24 +1191,81 @@ public final class NativeClient implements ClientModInitializer {
     Vec3d initial, navigationGoal;
     long duration = 1000;
     long moveReceiptDeadline;
+    JsonObject applicationRejection;
 
-    Motor(int id, JsonObject action, long generation, long receivedNanos) {
+    Motor(long id, NativeEffectContract.Received received, long generation, long receivedNanos) {
       this.id = id;
-      this.action = action;
+      this.received = received;
+      this.action = received.action();
       this.generation = generation;
       this.receivedNanos = receivedNanos;
       kind = action.get("kind").getAsString();
+      targetReference = action.has("target") ? NativeEffectContract.target(action.getAsJsonObject("target")) : null;
+      tableReference = action.has("table") ? NativeEffectContract.target(action.getAsJsonObject("table")) : null;
+      JsonObject gaze = action.has("gaze") ? action.getAsJsonObject("gaze") : null;
+      gazeReference = gaze != null && gaze.has("target") ? NativeEffectContract.target(gaze.getAsJsonObject("target")) : null;
+      JsonObject interaction = action.has("interaction") ? action.getAsJsonObject("interaction") : null;
+      interactionReference = interaction != null && interaction.has("target") ? NativeEffectContract.target(interaction.getAsJsonObject("target")) : null;
+    }
+
+    boolean authorized(boolean checkScreen) {
+      return (checkScreen
+          ? effectAuthority.validateApplication(received.owner(), received.compatibilityHash(), received.expectedScreen())
+          : effectAuthority.validateApplication(received.owner(), received.compatibilityHash())) == EffectAuthority.Rejection.NONE;
+    }
+
+    boolean current(TargetIncarnations.Target reference) {
+      if (reference == null) return true;
+      BlockPos block = blocks.get(reference.targetId());
+      if (block != null) return blockIncarnations.current(block, reference, incarnationSignals.space(), lifecycle.lifeId());
+      Entity entity = entities.get(reference.targetId());
+      return entity != null && !entity.isRemoved()
+          && entityIncarnations.current(entity.getUuid(), reference, incarnationSignals.space(), lifecycle.lifeId());
+    }
+
+    boolean targetsCurrent() {
+      return current(targetReference) && current(tableReference) && current(gazeReference) && current(interactionReference);
+    }
+
+    void rejectApplication(String stage) {
+      EffectAuthority.Rejection rejection = effectAuthority.validateApplication(
+          received.owner(), received.compatibilityHash(), received.expectedScreen());
+      applicationRejection = new JsonObject();
+      applicationRejection.addProperty("stage", stage);
+      applicationRejection.addProperty("reason", rejection == EffectAuthority.Rejection.NONE ? "TARGET" : rejection.name());
+      applicationRejection.addProperty("targets_current", targetsCurrent());
+      applicationRejection.add("expected_scope", NativeEffectContract.scope(received.owner().scope()));
+      EffectAuthority.Owner activeOwner = effectAuthority.owner();
+      applicationRejection.add("current_owner_scope", activeOwner == null ? JsonNull.INSTANCE : NativeEffectContract.scope(activeOwner.scope()));
+      applicationRejection.addProperty("current_native_generation", authority);
+      applicationRejection.addProperty("current_life_id", lifecycle.lifeId());
+      applicationRejection.add("current_space", incarnationSignals.space() == null ? JsonNull.INSTANCE : NativeEffectContract.space(incarnationSignals.space()));
+      applicationRejection.add("expected_screen", NativeEffectContract.screen(received.expectedScreen()));
+      applicationRejection.add("current_screen", NativeEffectContract.screen(incarnationSignals.screen()));
+      if (targetReference != null) {
+        applicationRejection.add("target_reference", NativeEffectContract.target(targetReference));
+        applicationRejection.addProperty("target_current", current(targetReference));
+        applicationRejection.addProperty("target_in_current_observation", blocks.containsKey(targetReference.targetId()) || entities.containsKey(targetReference.targetId()));
+      }
+      finish("failed", "Scope, screen or target incarnation changed before game-thread application", false);
     }
 
     void start() {
+      if (!authorized(true) || !targetsCurrent()) {
+        rejectApplication("game_thread_start");
+        return;
+      }
+      // Expected screen is an apply-time precondition. Only after the actual
+      // baseline and target checks may this owner perform its own UI transition.
+      if (client.currentScreen instanceof HandledScreen<?>) client.player.closeHandledScreen();
       initial = client.player.getPos();
       sampledPosition = initial;
       sampledYaw = client.player.getYaw();
       sampledPitch = client.player.getPitch();
       startPose = pose();
       CameraMotion.reset(camera, sampledYaw, sampledPitch, System.nanoTime());
-      target = targetBlock(action);
-      entity = targetEntity(action);
+      target = targetBlock(targetReference);
+      entity = targetEntity(targetReference);
       if (target != null) {
         targetStateBefore = client.world.getBlockState(target);
         targetName = Registries.BLOCK.getId(targetStateBefore.getBlock()).getPath();
@@ -1115,8 +1298,8 @@ public final class NativeClient implements ClientModInitializer {
       } else if (kind.equals("craft")) {
         initialCount = beforeCount(action.get("item").getAsString());
         duration = 12000;
-        if (action.has("table_id")) {
-          target = blocks.get(action.get("table_id").getAsString());
+        if (tableReference != null) {
+          target = targetBlock(tableReference);
           if (!reachable(target)) {
             finish("failed", "Crafting table is not currently visible and reachable", false);
             return;
@@ -1168,7 +1351,11 @@ public final class NativeClient implements ClientModInitializer {
     }
 
     void rotate() {
-      if (!looking || generation != authority || lifeId != lifecycle.lifeId() || !lifecycle.ready() || client.player == null) return;
+      if (!looking || generation != authority || !authorized(false) || lifeId != lifecycle.lifeId() || !lifecycle.ready() || client.player == null) return;
+      if (!targetsCurrent()) {
+        if (!issued && !(kind.equals("dig") && serverBlockRemoved)) finish(EffectOutcome.deadline(emissions), "Target incarnation changed before camera/input application", false);
+        return;
+      }
       long now = System.nanoTime();
       float beforeYaw = client.player.getYaw(), beforePitch = client.player.getPitch();
       // Packet corrections are actual pose changes, not an alternate integration clock.
@@ -1260,8 +1447,8 @@ public final class NativeClient implements ClientModInitializer {
       if (mode.equals("navigation")) {
         yaw = (float) routeGaze.yaw; pitch = (float) routeGaze.pitch; looking = true;
       } else if (mode.equals("target")) {
-        BlockPos block = targetBlock(gaze);
-        Entity e = targetEntity(gaze);
+        BlockPos block = targetBlock(gazeReference);
+        Entity e = targetEntity(gazeReference);
         if (block != null && clearLine(block.toCenterPos(), block)) aim(block.toCenterPos());
         else if (e != null) aim(e.getBoundingBox().getCenter());
         else { finish("failed", "Navigation gaze target is no longer visible", false); return; }
@@ -1303,7 +1490,7 @@ public final class NativeClient implements ClientModInitializer {
 
     void requestInventory() {
       if (receiptNonce == 0) {
-        receiptNonce = ++NativeClient.this.receiptNonce;
+        receiptNonce = NativeClient.this.nextReceiptNonce();
         InventoryProofClient.request(receiptNonce, generation);
       }
     }
@@ -1356,6 +1543,13 @@ public final class NativeClient implements ClientModInitializer {
               EffectOutcome.deadline(emissions),
               "Action deadline reached without confirmed effect",
               false);
+        return;
+      }
+      boolean completionOnly = kind.equals("dig") && serverBlockRemoved
+          || issued && (kind.equals("place") || kind.equals("interact") || kind.equals("attack"))
+          || kind.equals("craft") && issued && Recipes.complete();
+      if (!targetsCurrent() && !completionOnly) {
+        finish(EffectOutcome.deadline(emissions), "Target incarnation changed before native effect application", false);
         return;
       }
       switch (kind) {
@@ -1440,7 +1634,7 @@ public final class NativeClient implements ClientModInitializer {
         case "craft" -> {
           if (!issued) {
             if (looking && !aligned()) return;
-            issued = Recipes.begin(client, action, blocks);
+            issued = Recipes.begin(client, action, target);
             if (!issued) {
               finish("failed", "No unlocked compatible recipe or reachable crafting grid", false);
               return;
@@ -1448,6 +1642,10 @@ public final class NativeClient implements ClientModInitializer {
             emissions |= EffectOutcome.WORLD_EFFECT;
           }
           Recipes.tick(client);
+          if (Recipes.invalidated()) {
+            finish(EffectOutcome.deadline(emissions), "Crafting handler instance was replaced; no further clicks applied", false);
+            return;
+          }
           if (Recipes.complete()) {
             requestInventory();
             if (serverInventoryAfter == null) return;
@@ -1496,7 +1694,7 @@ public final class NativeClient implements ClientModInitializer {
             } else if (authorizedEntity(entity) && entity.distanceTo(client.player) <= 4.5) {
               emissions |= EffectOutcome.WORLD_EFFECT;
               if (kind.equals("attack")) {
-                attackNonce = ++NativeClient.this.receiptNonce;
+                attackNonce = NativeClient.this.nextReceiptNonce();
                 AttackProofClient.arm(attackNonce, generation);
                 client.interactionManager.attackEntity(client.player, entity);
               } else
@@ -1563,8 +1761,8 @@ public final class NativeClient implements ClientModInitializer {
     void interactComposite(JsonObject interaction) {
       boolean attack = interaction.get("kind").getAsString().equals("attack");
       Entity e =
-          interaction.has("target_id")
-              ? targetEntity(interaction)
+          interactionReference != null
+              ? targetEntity(interactionReference)
               : client.crosshairTarget instanceof EntityHitResult hit ? hit.getEntity() : null;
       if (e != null && client.player.canSee(e) && e.distanceTo(client.player) <= 4.5) {
         emissions |= EffectOutcome.WORLD_EFFECT;
@@ -1573,8 +1771,8 @@ public final class NativeClient implements ClientModInitializer {
         return;
       }
       BlockPos pos =
-          interaction.has("target_id")
-              ? targetBlock(interaction)
+          interactionReference != null
+              ? targetBlock(interactionReference)
               : client.crosshairTarget instanceof BlockHitResult hit ? hit.getBlockPos() : null;
       if (pos != null && reachable(pos)) {
         emissions |= EffectOutcome.WORLD_EFFECT;
@@ -1590,7 +1788,7 @@ public final class NativeClient implements ClientModInitializer {
         else client.interactionManager.interactBlock(client.player, Hand.MAIN_HAND, hit);
         return;
       }
-      if (!attack && !interaction.has("target_id")) {
+      if (!attack && interactionReference == null) {
         emissions |= EffectOutcome.WORLD_EFFECT;
         client.interactionManager.interactItem(client.player, Hand.MAIN_HAND);
       }
@@ -1615,7 +1813,8 @@ public final class NativeClient implements ClientModInitializer {
       evidence.addProperty("native_generation", generation);
       evidence.addProperty("world_effect_emitted", (emissions & EffectOutcome.WORLD_EFFECT) != 0);
       evidence.addProperty("camera_changed", (emissions & EffectOutcome.CAMERA) != 0);
-      if (action.has("target_id")) evidence.add("target_id", action.get("target_id"));
+      if (applicationRejection != null) evidence.add("application_rejection", applicationRejection);
+      if (targetReference != null) evidence.add("target", NativeEffectContract.target(targetReference));
       evidence.addProperty("life_fenced", lifeId != lifecycle.lifeId() || !lifecycle.ready());
       evidence.addProperty("motor_profile", motorProfile.name().toLowerCase(Locale.ROOT));
       evidence.add("start_pose", startPose);

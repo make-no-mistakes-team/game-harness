@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
-import type { AuthState, BridgeNotice, GameAction, GameActionResult, GameBridge, GameState, GoalId, Json, Observation, PlayerLife } from "../src/shared/contracts.ts";
+import type { AuthState, BridgeNotice, GameAction, GameActionResult, GameBridge, GameState, Json, PlayerLife } from "../src/shared/contracts.ts";
+import type { MinecraftObservation } from "../src/shared/minecraft.ts";
+import { minecraftActionSchema } from "../src/shared/minecraft.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import type { ImprovementOpportunity } from "../src/shared/execution-evidence.ts";
 import type { LookaheadConfig } from "../src/shared/planning.ts";
@@ -13,6 +15,9 @@ import { Runtime } from "../src/server/runtime.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { Store } from "../src/server/store.ts";
 import { validateSkill } from "../src/server/program-validation.ts";
+import { qualifyMinecraftExperience } from "../src/server/minecraft-qualification.ts";
+import { promotionEvidence } from "../web/src/evidence.ts";
+import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
@@ -20,15 +25,16 @@ const ROOT = "Neutral flow", FOLLOW = "Fresh follow-up", RECOVERY = "Explicit re
 const card = { purpose: "Exercise trusted lifecycle transitions", applicability: "Deterministic neutral fixture", method: "Await authorized bounded capabilities", reason: "Measure actual ownership transitions", limitations: "No gameplay effectiveness claim" };
 const ok: GameActionResult = { status: "succeeded", summary: "Confirmed neutral fixture effect", evidence: { effect_confirmed: true } };
 const cancelled: GameActionResult = { status: "cancelled", summary: "Fixture emitter neutralized", evidence: null };
-type Options = { goal?: GoalId; initialAction?: GameAction; childCalls?: number; next?: LookaheadConfig; repairGuard?: boolean; guardSource?: string; guardResult?: boolean; holdWorkerExit?: boolean; customCompletion?: "after-root" | "with-pending-root" };
-type PromptContext = { phase: string; role: string; reason: string[]; player: unknown; speculative_plan: { plan_id: string } | null };
+type Options = { goal?: string; initialAction?: GameAction; childCalls?: number; next?: LookaheadConfig; repairGuard?: boolean; guardSource?: string; guardResult?: boolean; holdWorkerExit?: boolean; recoveryInventory?: boolean; customCompletion?: "after-root" | "with-pending-root" };
+type PromptContext = { phase: string; role: string; reason: string[]; adapter_state: unknown; speculative_plan: { plan_id: string } | null };
 function eventDetails(value: Json): { [key: string]: Json } | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 
 async function fixture(options: Options = {}) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-life-session-"));
-  const store = new Store(directory), world = crypto.randomUUID(), session = crypto.randomUUID();
+  const store = new Store(directory), world = crypto.randomUUID(), session = crypto.randomUUID(), adapter = minecraftTestAdapter();
+  let spaceEpoch = 1;
   let life: PlayerLife = { life_id: 1, status: "alive", can_respawn: false, death: null };
   let inventory = [{ name: "oak_log", display_name: "Oak Log", slot: 0, count: 3 }], sequence = 0;
   let disconnects = 0, barriers = 0, respawns = 0, effects = 0, agents = 0, observationReads = 0, guardCalls = 0;
@@ -48,37 +54,52 @@ async function fixture(options: Options = {}) {
   const continuationSettled = Promise.withResolvers<void>();
   const contexts: PromptContext[] = [];
   const notices = new Set<(notice: BridgeNotice) => void>();
-  const observation = (advance = true): Observation => ({
-    schema_version: 2, world_id: world, epoch: 1, session_id: session, life: structuredClone(life),
+  const observation = (advance = true): MinecraftObservation => minecraftObservationFixture(adapter, {
+    world_id: world, epoch: 1, session_id: session, life: structuredClone(life), space: { dimension_id: "minecraft:overworld", space_epoch: spaceEpoch },
     observation_seq: advance ? ++sequence : sequence, captured_at: new Date().toISOString(),
-    profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r2",
-    player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: life.status === "alive" ? 20 : 0, food: 20, on_ground: true, in_water: false, inventory: structuredClone(inventory) },
-    blocks: [], entities: [], sounds: [], coverage: { partial: true, max_age_ms: 1000 },
+    data: { player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: life.status === "alive" ? 20 : 0, food: 20, on_ground: true, in_water: false, inventory: structuredClone(inventory) },
+    blocks: [], entities: [], sounds: [] },
   });
+  const lifeNotice = (type: "life" | "death", summary: string): BridgeNotice => ({ type: "game_event", data: { type,
+    world_id: world, epoch: 1, session_id: session, native_boot_id: "fixture-native-boot", life,
+    space: { dimension_id: "minecraft:overworld", space_epoch: spaceEpoch }, screen: null, neutralized: true, summary } });
+  const barrier = async () => {
+    barriers++; if (failBarrier) throw new Error("Native barrier unconfirmed");
+    if (holdBarrier) { barrierEntered.resolve(); await nativeBarrier.promise; }
+  };
   const game: GameBridge = {
     connect: async () => {}, disconnect: async () => { disconnects++; },
-    snapshot: (): GameState => ({ status: "connected", username: "Fixture", version: "1.21.4", world_id: world, epoch: 1, session_id: session, life: structuredClone(life), motor_profile: "balanced", player: observation(false).player, last_observation_at: null, error: null,
+    snapshot: (): GameState => ({ status: "connected", username: "Fixture", version: "1.21.4", world_id: world, epoch: 1, session_id: session, life: structuredClone(life),
+      binding: minecraftTestBinding(adapter), space: { dimension_id: "minecraft:overworld", space_epoch: spaceEpoch }, screen: null,
+      presentation: adapter.projectObservation(observation(false)), last_observation_at: null, error: null,
       video: { status: "streaming", width: 1, height: 1, fps: 30, frames: sequence + 1, last_frame_at: new Date().toISOString(), error: null } }),
     observe: async () => { observationReads++; if (failObservation) throw new Error("Fresh fixture observation unavailable"); return observation(); },
-    neutralize: async () => { barriers++; if (failBarrier) throw new Error("Native barrier unconfirmed"); if (holdBarrier) { barrierEntered.resolve(); await nativeBarrier.promise; } },
+    neutralize: barrier,
+    emergencyStop: barrier,
     cancel: async () => { if (holdBarrier) await nativeBarrier.promise; tailEffect.resolve(cancelled); },
-    setMotorProfile: async () => {}, recipes: async () => [],
-    execute: async (action) => {
+    adapter: () => adapter,
+    execute: async envelope => {
+      const action = minecraftActionSchema.parse(envelope.action);
       if (action.kind === "respawn") {
         respawns++; respawnEntered.resolve();
         expect(life.status).toBe("dead");
         if (holdRespawn) await respawnProof.promise;
-        life = { life_id: 2, status: "alive", can_respawn: false, death: null }; inventory = [];
+        life = { life_id: 2, status: "alive", can_respawn: false, death: null }; inventory = []; spaceEpoch++;
         // Authoritative life notification deliberately precedes the RPC result.
         for (const listener of notices) {
           listener({ type: "state", data: null });
-          listener({ type: "game_event", data: { type: "life", world_id: world, epoch: 1, session_id: session, life, neutralized: true, summary: "Confirmed replacement player" } });
+          listener(lifeNotice("life", "Confirmed replacement player"));
         }
         return ok;
       }
       effects++;
       if (effects === 1) { effectEntered.resolve(); return await firstEffect.promise; }
       if ((options.next || options.childCalls || options.customCompletion === "with-pending-root") && effects === 2) { tailEntered.resolve(); return await tailEffect.promise; }
+      if (options.recoveryInventory && life.life_id === 2) {
+        inventory = [{ name: "stone", display_name: "Stone", count: 2, slot: 0 }];
+        return { status: "succeeded", summary: "Synthetic confirmed post-recovery own inventory receipt",
+          evidence: { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: { stone: 2 } } };
+      }
       return ok;
     },
     subscribe: (listener) => { notices.add(listener); return () => { notices.delete(listener); }; },
@@ -138,7 +159,7 @@ async function fixture(options: Options = {}) {
               }
               if (signal.signal.aborted) return;
               if (options.repairGuard) {
-                const rejected = await perform("prepare_next", { name: FOLLOW, args: { mode: "follow-up" }, guard_source: "return observation.player." });
+                const rejected = await perform("prepare_next", { name: FOLLOW, args: { mode: "follow-up" }, guard_source: "return observation.data.player." });
                 const plan = runtime.planningView(created.run_id)!;
                 rejectedGuard.resolve({ result: rejected.details, deadline_at: plan.deadline_at });
                 expect(rejected.isError).toBe(true);
@@ -221,6 +242,7 @@ async function fixture(options: Options = {}) {
           oldEffect = () => handle({ kind: "action", action: { kind: "look", yaw: 1, pitch: 0 } });
         await handle({ kind: "observe" });
         await handle({ kind: "action", action: { kind: "look", yaw: 0.2, pitch: 0 } });
+        if (options.recoveryInventory) await handle({ kind: "observe" });
       }
       return { status: "completed", summary: "Fresh neutral effect settled", result: null };
     },
@@ -231,7 +253,7 @@ async function fixture(options: Options = {}) {
       return options.guardResult ?? true;
     },
   } satisfies Pick<SandboxService, "snapshot" | "runSkill" | "evaluateGameGuard"> as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {});
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
   cleanups.push(async () => {
     failBarrier = false; failObservation = false;
     specReply.resolve(); firstEffect.resolve(cancelled); tailEffect.resolve(cancelled);
@@ -239,7 +261,7 @@ async function fixture(options: Options = {}) {
     await runtime.close(); store.close(); rmSync(directory, { recursive: true, force: true });
   });
   await runtime.initialize();
-  const created = await runtime.createRun({ task: "Measure bounded lifecycle transitions", goal: options.goal ?? "custom", model_id: "fixture-model" });
+  const created = await runtime.createRun({ task: "Measure bounded lifecycle transitions", goal: adapter.goals.find(goal => goal.goal_id === (options.goal ?? "custom"))!, model_id: "fixture-model" });
   const findExecution = (name: string) => {
     const program = store.namedSkill(created.run_id, name);
     return program ? store.allSkillExecutions(created.run_id).filter((entry) => entry.skill_id === program.skill_id && entry.parent_execution_id === null).at(-1) ?? null : null;
@@ -276,7 +298,7 @@ async function fixture(options: Options = {}) {
   await Promise.race([effectEntered.promise, failure.promise]);
   await Promise.race([admissionSettled.promise, failure.promise]);
   return {
-    runtime, store, created, game, contexts, failure, rootEntered, tailEntered, childrenClosed, rootSourceFinished, rootDrained,
+    runtime, store, created, game, adapter, contexts, failure, rootEntered, tailEntered, childrenClosed, rootSourceFinished, rootDrained,
     recoveryClosed, successorClosed, respawnEntered, specEntered, staged, paused, completed, reviewed, rejectedGuard,
     firstEffectReceipt, uncertaintyFenced, replanned, nativeBarrier, workerExit,
     continuationSettled, barrierEntered, finishReturned, stopped,
@@ -295,12 +317,12 @@ async function fixture(options: Options = {}) {
       holdBarrier = true;
       life = { life_id: 1, status: "dead", can_respawn: canRespawn, death: { death_id: "fixture-death", at: new Date().toISOString(), message: "Fixture death" } };
       for (const listener of notices) for (let duplicate = 0; duplicate < 2; duplicate++)
-        listener({ type: "game_event", data: { type: "death", world_id: world, epoch: 1, session_id: session, life, neutralized: true, summary: "Fixture death" } });
+        listener(lifeNotice("death", "Fixture death"));
       firstEffect.resolve({ status: "unknown", summary: "Death interrupted the old effect", evidence: null });
     },
     publishRespawnReady: () => {
       life = { ...life, can_respawn: true };
-      for (const listener of notices) listener({ type: "game_event", data: { type: "life", world_id: world, epoch: 1, session_id: session, life, neutralized: true, summary: "Vanilla readiness changed" } });
+      for (const listener of notices) listener(lifeNotice("life", "Vanilla readiness changed"));
     },
     collectGoal: () => { inventory[0]!.count = 4; firstEffect.resolve(ok); workerExit.resolve(); },
     removeLog: () => { firstEffect.resolve({ status: "succeeded", summary: "Server-confirmed removal", evidence: { source: "server_block_update", target_name: "oak_log", effect_confirmed: true } }); workerExit.resolve(); },
@@ -316,7 +338,8 @@ test("host preflight opens a fresh ordinary turn without a model bootstrap cerem
   const f = await fixture();
   expect(f.contexts).toHaveLength(1);
   expect(f.contexts[0]).toMatchObject({ phase: "running" });
-  expect(f.contexts[0]!.player).toBeDefined();
+  expect(f.contexts[0]!.adapter_state).toBeDefined();
+  expect(f.contexts[0]).not.toHaveProperty("player");
   expect(f.counters().observationReads).toBeGreaterThan(0);
   expect(f.findExecution(ROOT)).toMatchObject({ status: "running", epoch: 1, session_id: f.created.session_id });
   const pausing = f.runtime.control(f.created.run_id, "pause");
@@ -337,7 +360,7 @@ test("death drains old emitters then one explicit named recovery root adopts the
   expect(original.status).toBe("unknown");
   expect(recovery.life_id).toBe(1); expect(child.life_id).toBe(2);
   expect(f.runtime.snapshot()).toMatchObject({ run_id: f.created.run_id, session_id: f.created.session_id, epoch: 1, life_id: 2, error: null });
-  expect(f.store.getRun(f.created.run_id)?.baseline.oak_log).toBe(3);
+  expect(eventDetails(f.store.getRun(f.created.run_id)!.baseline)?.inventory).toMatchObject({ oak_log: 3 });
   await expect(f.staleEffect()).rejects.toThrow();
   const executions = f.store.allSkillExecutions(f.created.run_id).length;
   const retry = await f.retryRoot(); expect(retry.isError).not.toBe(true);
@@ -347,13 +370,63 @@ test("death drains old emitters then one explicit named recovery root adopts the
   expect(events.filter((event) => event.type === "learning.death_episode")).toHaveLength(1);
   expect(events.find((event) => event.type === "skill.life_adopted")?.details).toMatchObject({ previous_life_id: 1, life_id: 2 });
   await f.runtime.control(f.created.run_id, "stop");
-  const continued = await f.runtime.createRun({ task: "A new baseline", goal: "custom", model_id: "fixture-model" });
+  const continued = await f.runtime.createRun({ task: "A new baseline", goal: f.adapter.goals.find(goal => goal.goal_id === "custom")!, model_id: "fixture-model" });
   expect(continued.skills.length).toBeGreaterThan(0); expect(continued.executions).toEqual([]);
   await f.runtime.control(continued.run_id, "start");
-  expect(f.store.getRun(continued.run_id)?.baseline).toEqual({});
+  expect(eventDetails(f.store.getRun(continued.run_id)!.baseline)?.inventory).toEqual({});
   await f.runtime.control(continued.run_id, "stop");
-  const fresh = await f.runtime.createRun({ task: "Fresh definitions", goal: "custom", model_id: "fixture-model", working_programs: "fresh" });
+  const fresh = await f.runtime.createRun({ task: "Fresh definitions", goal: f.adapter.goals.find(goal => goal.goal_id === "custom")!, model_id: "fixture-model", working_programs: "fresh" });
   expect(fresh.skills).toEqual([]); expect(fresh.executions).toEqual([]);
+});
+
+test("promotion selection follows actual recovery-root adoption without rewriting its immutable admission lineage", async () => {
+  const f = await fixture({ recoveryInventory: true });
+  f.die(); f.nativeBarrier.resolve(); f.workerExit.resolve();
+  await reached(f, f.recoveryClosed.promise);
+  const recovery = f.findExecution(RECOVERY)!;
+  const run = f.store.getRun(f.created.run_id)!;
+  const events = f.store.eventsAfter(run.run_id, 0, 500);
+  const adopted = events.find(event => event.type === "skill.life_adopted")!;
+  expect(recovery.life_id).toBe(1); expect(recovery.space_epoch).toBe(1);
+  expect(run.life_id).toBe(2); expect(run.space_epoch).toBe(2);
+  expect(eventDetails(adopted.details)).toMatchObject({ execution_id: recovery.execution_id,
+    root_execution_id: recovery.execution_id, previous_life_id: 1, life_id: 2 });
+  const observed = events.filter(event => event.type === "adapter.evidence" &&
+    eventDetails(event.details)?.schema !== undefined).reverse().find(event => {
+      const observation = eventDetails(eventDetails(event.details)?.data ?? null);
+      const player = eventDetails(eventDetails(observation?.data ?? null)?.player ?? null);
+      return Array.isArray(player?.inventory) && player.inventory.some(item =>
+        eventDetails(item)?.name === "stone" && eventDetails(item)?.count === 2);
+    })!;
+  expect(observed).toBeDefined();
+  const actionIds = qualifyMinecraftExperience(f.store, run, recovery, { portability: "world_local", retained_world_data: false,
+    predicate: { kind: "inventory_gain", item: "stone", min_gain: 2, event_seq: observed.event_seq } });
+  expect(actionIds).toHaveLength(1);
+  expect(f.store.getAction(run.run_id, actionIds[0]!)?.view.scope).toMatchObject({ life_id: 2, space_epoch: 2 });
+  expect(promotionEvidence(observed, run, recovery, events))
+    .toEqual({ kind: "inventory_gain", counts: { stone: 2 } });
+  for (const invalid of ["absent adoption", "wrong root", "wrong previous life", "wrong observation", "missing respawn", "unconfirmed respawn"] as const) {
+    const context = structuredClone(events);
+    const adoption = context.find(event => event.event_seq === adopted.event_seq)!;
+    const details = eventDetails(adoption.details)!;
+    if (invalid === "absent adoption") context.splice(context.indexOf(adoption), 1);
+    if (invalid === "wrong root") details.execution_id = details.root_execution_id = "another-root";
+    if (invalid === "wrong previous life") details.previous_life_id = 99;
+    if (invalid === "wrong observation") details.observation_seq = 999999;
+    if (invalid === "missing respawn") {
+      const index = context.findIndex(event => event.type === "action.succeeded" &&
+        eventDetails(event.details)?.action_id === details.respawn_action_id);
+      expect(index).toBeGreaterThanOrEqual(0); context.splice(index, 1);
+    }
+    if (invalid === "unconfirmed respawn") {
+      const receipt = context.find(event => event.type === "action.succeeded" &&
+        eventDetails(event.details)?.action_id === details.respawn_action_id)!;
+      eventDetails(receipt.details)!.result = { status: "unknown", summary: "Unconfirmed recovery", evidence: null };
+    }
+    expect({ invalid, selected: promotionEvidence(observed, run, recovery, context) })
+      .toEqual({ invalid, selected: null });
+  }
+  await f.runtime.control(run.run_id, "stop");
 });
 
 test("cached respawn readiness does not block a chosen recovery or retrigger the same death", async () => {
@@ -407,7 +480,7 @@ test("named root opt-in overlaps actual local continuation without exposing ordi
 });
 
 test("explicit game-guard repair stays inside the same planning flight and does not create another root", async () => {
-  const f = await fixture({ next: next(), repairGuard: true, guardSource: "return observation.player.health > 0;" });
+  const f = await fixture({ next: next(), repairGuard: true, guardSource: "return observation.data.player.health > 0;" });
   const rejected = await reached(f, f.rejectedGuard.promise);
   expect(rejected.result).toMatchObject({ error: { code: "invalid_program", retryable: false, stage_correction: { correction_allowed: true, remaining_calls: 3 } } });
   await reached(f, f.staged.promise);
@@ -439,7 +512,7 @@ for (const order of ["stage-first", "closure-first"] as const) {
 }
 
 test("a false optional game guard blocks automatic effects without changing the user predicate", async () => {
-  const f = await fixture({ next: next("on_predecessor_success"), guardSource: "return observation.player.health > args.minimum;", guardResult: false });
+  const f = await fixture({ next: next("on_predecessor_success"), guardSource: "return observation.data.player.health > args.minimum;", guardResult: false });
   await reached(f, f.staged.promise); f.finishFirst(); await reached(f, f.tailEntered.promise); f.finishTail(); f.workerExit.resolve();
   await reached(f, f.rootDrained.promise);
   await reached(f, f.continuationSettled.promise);
@@ -473,7 +546,7 @@ for (const customCompletion of ["after-root", "with-pending-root"] as const) {
     expect(f.contexts).toHaveLength(2);
     expect(f.contexts[1]).toMatchObject({
       phase: "running", role: "planning", speculative_plan: null,
-      player: { inventory: { dirt: 1 } },
+      adapter_metadata: { inventory_counts: { dirt: 1 } },
     });
     const reported = f.store.eventsAfter(f.created.run_id, 0, 500).filter((event) => event.type === "task.completion_reported");
     expect(reported).toHaveLength(1);
@@ -529,12 +602,13 @@ test("task_finish cannot replace the trusted verifier for a built-in goal", asyn
 });
 
 test("break_log uses a block-removal receipt without fabricating inventory gain", async () => {
-  const f = await fixture({ goal: "break_log", initialAction: { kind: "dig", target_id: "authorized-fixture-log" } }); f.removeLog();
+  const f = await fixture({ goal: "break_log", initialAction: { kind: "dig", target: { target_id: "authorized-fixture-log", incarnation: 1,
+    space: { dimension_id: "minecraft:overworld", space_epoch: 1 }, life_id: 1 } } }); f.removeLog();
   await reached(f, f.completed.promise);
   const verified = f.store.eventsAfter(f.created.run_id, 0, 500).find((event) => event.type === "goal.verified")!;
-  expect(verified.details).toMatchObject({ kind: "block_removal", goal: "break_log" });
+  expect(verified.details).toMatchObject({ status: "verified", verifier_id: "minecraft_block_removal_v2", verifier_version: 2 });
   expect(verified.details).not.toHaveProperty("current_count");
-  expect(f.game.snapshot().player?.inventory[0]?.count).toBe(3);
+  expect(eventDetails(f.game.snapshot().presentation?.metadata ?? null)?.inventory_counts).toMatchObject({ oak_log: 3 });
 });
 
 test("healthy uncertainty drains and observes afresh before one new strategy generation, never replaying the effect", async () => {
@@ -579,7 +653,7 @@ test("death supersedes uncertainty and wakes only the explicit recovery generati
 test("named source and comparisons cannot read another model's workspace", async () => {
   const f = await fixture();
   const foreign = { ...f.store.getRun(f.created.run_id)!, run_id: crypto.randomUUID(), model_id: "other-model" }; f.store.saveRun(foreign);
-  await Promise.all([1, 2].map(async (version) => f.store.registerSkill(foreign.run_id, await validateSkill({ name: "Foreign private program", source: `return {status:"completed",summary:"PRIVATE_MODEL_B_${version}",result:null};`, card, dependencies: [] }))));
+  await Promise.all([1, 2].map(async (version) => f.store.registerSkill(foreign.run_id, await validateSkill({ name: "Foreign private program", source: `return {status:"completed",summary:"PRIVATE_MODEL_B_${version}",result:null};`, card, dependencies: [] }, f.adapter))));
   const skill = f.store.skill.bind(f.store); let foreignReads = 0;
   f.store.skill = (runId, ref) => { if (runId === foreign.run_id) foreignReads++; return skill(runId, ref); };
   const compared = await f.invoke("program_inspect", { view: "comparison", before: { name: "Foreign private program", version: 1 }, after: { name: "Foreign private program", version: 2 } });

@@ -20,6 +20,8 @@ public final class Recipes {
   private static int remaining, phase, ticks;
   private static boolean table;
   private static int expectedGain;
+  private static ScreenHandler ownerHandler;
+  private static boolean invalidated;
 
   public static int expectedGain() {
     return expectedGain;
@@ -72,12 +74,14 @@ public final class Recipes {
     return recipes;
   }
 
-  public static boolean begin(MinecraftClient c, JsonObject action, Map<String, BlockPos> visible) {
+  public static boolean begin(MinecraftClient c, JsonObject action, BlockPos selectedTable) {
     active = null;
+    ownerHandler = null;
+    invalidated = false;
     phase = 0;
     ticks = 0;
     remaining = action.get("executions").getAsInt();
-    table = action.has("table_id");
+    table = action.has("table");
     if (remaining < 1 || remaining > 64) return false;
     var context = SlotDisplayContexts.createParameters(c.world);
     for (var entry : entries(c)) {
@@ -99,7 +103,7 @@ public final class Recipes {
     }
     if (active == null) return false;
     if (table) {
-      BlockPos pos = visible.get(action.get("table_id").getAsString());
+      BlockPos pos = selectedTable;
       if (pos == null
           || c.player.getEyePos().squaredDistanceTo(pos.toCenterPos()) > 25
           || !Registries.BLOCK
@@ -127,22 +131,30 @@ public final class Recipes {
   }
 
   public static boolean complete() {
-    return active == null && remaining == 0;
+    return !invalidated && active == null && remaining == 0;
   }
+  public static boolean invalidated() { return invalidated; }
 
   public static void cancel() {
     active = null;
     remaining = 0;
+    ownerHandler = null;
   }
 
   public static void tick(MinecraftClient c) {
     if (active == null) return;
+    if (ownerHandler != null && c.player.currentScreenHandler != ownerHandler) {
+      invalidated = true;
+      active = null;
+      return;
+    }
     ticks++;
     if (ticks % 4 != 0) return;
     var handler = c.player.currentScreenHandler;
     if (table && !(handler instanceof CraftingScreenHandler)) return;
     if (!(handler instanceof CraftingScreenHandler) && !(handler instanceof PlayerScreenHandler))
       return;
+    if (ownerHandler == null) ownerHandler = handler;
     if (phase == 0) {
       c.interactionManager.clickRecipe(handler.syncId, active.id(), false);
       phase = 1;

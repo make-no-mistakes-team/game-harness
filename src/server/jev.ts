@@ -7,6 +7,7 @@ import type { FetchImpl } from "@oh-my-pi/pi-catalog/types";
 import { z } from "zod";
 import { policyDecisionSchema } from "../shared/validation.ts";
 import type { FastJudgeBroker, FastJudgeSelection } from "./fast-provider.ts";
+import { sdkReportedUsage, usageCounter } from "./provider-usage.ts";
 
 const ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const LIMITS = Object.freeze({
@@ -27,18 +28,8 @@ const MODEL_IDS = getBundledModels("typesafe")
   .map((model) => model.id);
 
 type Request = Parameters<FastJudgeBroker["evaluate"]>[0];
-type Usage = {
-  input: number;
-  cacheRead: number;
-  cacheWrite: number;
-  output: number;
-};
-type Accounting = {
-  usage: Usage | null;
-  known_cost: number | null;
-  actual_calls: number;
-  provider_request_id: string | null;
-};
+type Accounting = Omit<Awaited<ReturnType<FastJudgeBroker["evaluate"]>>, "choice_id">;
+type Usage = NonNullable<Accounting["usage"]>;
 export type JevErrorCode =
   | "unavailable"
   | "closed"
@@ -78,6 +69,7 @@ export class JevBrokerError extends Error implements Accounting {
   readonly known_cost: number | null;
   readonly actual_calls: number;
   readonly provider_request_id: string | null;
+  readonly usage_evidence: Accounting["usage_evidence"];
   constructor(
     readonly code: JevErrorCode,
     accounting?: Accounting,
@@ -88,6 +80,7 @@ export class JevBrokerError extends Error implements Accounting {
     this.known_cost = accounting?.known_cost ?? null;
     this.actual_calls = accounting?.actual_calls ?? 0;
     this.provider_request_id = accounting?.provider_request_id ?? null;
+    this.usage_evidence = accounting?.usage_evidence ?? null;
   }
 }
 
@@ -131,27 +124,6 @@ const savedKeySchema = z
     api_key: z.string().refine(validKey),
   })
   .strict();
-const usageEnvelopeSchema = z
-  .object({
-    usage: z
-      .object({
-        input_tokens: z
-          .number()
-          .int()
-          .nonnegative()
-          .max(Number.MAX_SAFE_INTEGER)
-          .optional(),
-        output_tokens: z
-          .number()
-          .int()
-          .nonnegative()
-          .max(Number.MAX_SAFE_INTEGER)
-          .optional(),
-        cost: z.number().nonnegative().optional(),
-      })
-      .loose(),
-  })
-  .loose();
 const choiceAnswerSchema = z
   .object({
     type: z.literal("choice"),
@@ -161,21 +133,21 @@ const choiceAnswerSchema = z
   })
   .strict();
 function captureUsage(payload: unknown, accounting: Accounting): void {
-  const parsed = usageEnvelopeSchema.safeParse(payload);
-  if (!parsed.success) return;
-  const usage = parsed.data.usage;
+  if (payload === null || typeof payload !== "object" || !("usage" in payload) ||
+    payload.usage === null || typeof payload.usage !== "object" || Array.isArray(payload.usage)) return;
+  const usage = payload.usage as Record<string, unknown>;
   // The System One wire has aggregate uncached input/output, no cache counters.
-  if (usage.input_tokens !== undefined && usage.output_tokens !== undefined) {
-    accounting.usage = {
-      input: usage.input_tokens,
-      output: usage.output_tokens,
-      cacheRead: 0,
-      cacheWrite: 0,
-    };
+  accounting.usage = { input: usageCounter(usage.input_tokens), output: usageCounter(usage.output_tokens),
+    cacheRead: 0, cacheWrite: 0 };
+  const counters = sdkReportedUsage(accounting.usage)!;
+  if (accounting.usage_evidence) {
+    accounting.usage_evidence.sdk_reported = counters;
+    accounting.usage_evidence.provider_terminal = { source: "jev_response_usage",
+      response_id: accounting.provider_request_id, terminal_type: "response.usage", counters };
   }
   // NativeJudge's tokenUsage defaults missing cost to zero. Inspect the real
   // wire field instead so an absent bill never becomes a known free request.
-  if (usage.cost !== undefined) accounting.known_cost = usage.cost;
+  if (typeof usage.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0) accounting.known_cost = usage.cost;
 }
 function validAnswer(
   answer: unknown,
@@ -409,6 +381,8 @@ export class JevBroker implements FastJudgeBroker {
       known_cost: null,
       actual_calls: 0,
       provider_request_id: null,
+      usage_evidence: { schema_version: 1, request_id: request.request_id,
+        sdk_reported: null, provider_terminal: null, unaccounted_response_ids: [] },
     };
     const timeout = setTimeout(
       () => controller.abort(new JevBrokerError("deadline")),

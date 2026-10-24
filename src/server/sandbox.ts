@@ -5,7 +5,7 @@ import { realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type {
   Json,
-  Observation,
+  ObservationV3,
   PolicyContext,
   PolicyDecision,
   PolicySpec,
@@ -16,6 +16,7 @@ import {
   policyDecisionSchema,
   policySpecSchema,
   namedProgramRefSchema,
+  skillCapabilitySchema,
 } from "../shared/validation.ts";
 import { MAX_SKILL_LIMITS } from "../shared/programs.ts";
 import type {
@@ -33,9 +34,12 @@ import {
   ProgramTraceReceiver,
   type InstrumentedProgram,
 } from "./program-instrumentation.ts";
-import { validateProgramSource } from "./program-validation.ts";
+import { validateProgramSource, type ExecutableValidationContext } from "./program-validation.ts";
+import type { SkillAPIManifest } from "../shared/programs.ts";
+import { capabilityFailure, ProgramExecutionError, readProgramDiagnostic } from "./program-diagnostics.ts";
 
 export interface SkillSandboxHooks {
+  api?: SkillAPIManifest;
   onInstrumentation?(instrumentation: ProgramInstrumentation): void;
   onTrace?(trace: ProgramBranchTrace): void;
   onCapabilityRequest?(event: {
@@ -536,15 +540,11 @@ function skillCapability(value: unknown): SkillCapabilityRequest {
         return { kind: "action", action: action.data };
       break;
     }
-    case "recipes":
-      if (
-        exactKeys(request, ["kind", "item"]) &&
-        typeof request.item === "string" &&
-        request.item.length > 0 &&
-        request.item.length <= 256
-      )
-        return { kind: "recipes", item: request.item };
+    case "adapter": {
+      const parsed = skillCapabilitySchema.safeParse(request);
+      if (parsed.success && parsed.data.kind === "adapter") return parsed.data;
       break;
+    }
     case "call": {
       const ref = namedProgramRefSchema.safeParse(request.skill);
       if (
@@ -737,10 +737,11 @@ class DockerSkillWorker {
                     ok: true, value: clean, duration_ms: performance.now() - started });
                   this.reply(true, clean, signal, deadline);
                 },
-                () => {
+                (error: unknown) => {
+                  const failure = capabilityFailure(error);
                   hooks.onCapabilityResult?.({ sequence: callSequence, request,
-                    ok: false, value: null, duration_ms: performance.now() - started });
-                  this.reply(false, null, signal, deadline);
+                    ok: false, value: failure, duration_ms: performance.now() - started });
+                  this.reply(false, failure, signal, deadline);
                 },
               )
               .catch(() =>
@@ -779,13 +780,13 @@ class DockerSkillWorker {
             this.phase === "running" &&
             frame.type === "skill_failure" &&
             frame.id === this.sequence &&
-            exactKeys(frame, ["v", "type", "id", "trace"])
+            exactKeys(frame, ["v", "type", "id", "trace", "diagnostic"])
           ) {
             const trace = traceReceiver.accept(frame.trace);
             hooks.onTrace?.(trace);
             traceReceiver.finish(null);
             this.phase = "done";
-            void this.terminate(new Error("Skill program failed.")).catch(() => {});
+            void this.terminate(new ProgramExecutionError(readProgramDiagnostic(frame.diagnostic, program.source_hash))).catch(() => {});
           } else throw new Error("protocol");
         } catch {
           this.fail(
@@ -819,7 +820,7 @@ class DockerSkillWorker {
     }
     const line =
       encode(
-        { v: 1, type: "skill_reply", id: this.sequence, ok, value },
+        { v: 1, type: "skill_reply", id: this.sequence, ok, ...(ok ? { value } : { error: value }) },
         INPUT_BYTES,
       ) + "\n";
     this.outputBytes = 0;
@@ -993,13 +994,14 @@ export class SandboxService {
   /** Effect-free, one-shot predicate in the same externally watched Docker profile. */
   async evaluateGameGuard(
     source: string,
-    observation: Observation,
+    observation: ObservationV3,
     args: Json,
     signal: AbortSignal,
+    contract: ExecutableValidationContext,
   ): Promise<boolean> {
     if (this.closed || this.state.status !== "ready")
       throw new Error("Prepare the Docker sandbox before evaluating a precondition.");
-    await validateProgramSource(source, "guard");
+    await validateProgramSource(source, "guard", contract);
     const context = { observation, args } as unknown as Json;
     encode(context, INPUT_BYTES);
     if (signal.aborted) throw new Error("Precondition evaluation was cancelled.");
@@ -1041,7 +1043,8 @@ export class SandboxService {
     if (this.workers.size >= MAX_WORKERS)
       throw new Error("The sandbox worker limit has been reached.");
     // Validate input before reserving a slot; no unsandboxed execution fallback.
-    encode({ v: 1, type: "skill_init", id: 0, source, args }, INPUT_BYTES);
+    if (!hooks.api || hooks.api.api_version !== 4) throw new Error("Skill execution requires the current host-bound API manifest.");
+    encode({ v: 1, type: "skill_init", id: 0, source, args, api: hooks.api }, INPUT_BYTES);
     const program = instrumentProgram(source);
     hooks.onInstrumentation?.({
       source_hash: program.source_hash,
@@ -1049,7 +1052,7 @@ export class SandboxService {
     });
     const initial =
       encode({ v: 1, type: "skill_init", id: 0,
-        source: program.execution_source, args,
+        source: program.execution_source, source_hash: program.source_hash, args, api: hooks.api,
         instrumentation: { hook_name: program.hook_name, scope: program.scope,
           kinds: program.points.map((point) => point.kind) },
       }, SKILL_INPUT_BYTES) +

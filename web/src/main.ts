@@ -7,6 +7,7 @@ import "@fontsource/ibm-plex-mono/latin-500.css";
 import "@fontsource/ibm-plex-mono/cyrillic-400.css";
 import "@fontsource/ibm-plex-mono/cyrillic-500.css";
 import "./styles.css";
+import { minecraftProfileConfigurationSchema } from "../../src/shared/minecraft.ts";
 import type {
   ActivityEvent,
   AppSnapshot,
@@ -39,7 +40,7 @@ import {
 } from "./api.ts";
 import type { PerformanceSnapshot } from "./api.ts";
 import { NativeVideo } from "./video.ts";
-import { EvidenceInspector } from "./evidence.ts";
+import { EvidenceInspector, promotionEvidence } from "./evidence.ts";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("Application mount is missing.");
@@ -166,6 +167,12 @@ const pending = new Set<string>(),
 const dialogOrigins = new Map<string, HTMLElement>();
 let browserVideoDetail = "No browser video measurements yet.";
 let motorEdited = false;
+function minecraftMotorProfile(state: AppSnapshot | null): string | null {
+  const descriptor = state?.game.binding?.descriptor;
+  if (descriptor?.game.id !== "minecraft") return null;
+  const configuration = minecraftProfileConfigurationSchema.safeParse(descriptor.observation.profile.configuration);
+  return configuration.success ? configuration.data.motor_profile : null;
+}
 const inspector = new EvidenceInspector({
   openDialog,
   measurements: (runId) => measuredEvidence.get(runId)?.items ?? [],
@@ -273,7 +280,9 @@ function buttons(): void {
     state.server.status === "running" &&
     state.sandbox.status === "ready";
   const ready = prerequisites && state?.game.status === "connected" &&
-    !!state.game.session_id && !!state.game.life;
+    !!state.game.session_id && !!state.game.life && state.game.binding?.ready === true && !!state.game.space;
+  const executableRun = !!run && typeof run.goal !== "string" && run.native_boot_id === state?.game.binding?.native_boot_id &&
+    run.compatibility_hash !== null && run.compatibility_hash === state?.game.binding?.compatibility_hash && run.session_id === state?.game.session_id;
   const disabled: Record<string, boolean> = {
     "login-browser": !available || authBusy || hasRun,
     "login-device": !available || authBusy || hasRun,
@@ -308,10 +317,10 @@ function buttons(): void {
       !task.value.trim() ||
       !goal.value ||
       !model.value,
-    "start-run": !available || run?.status !== "created" || !ready,
+    "start-run": !available || run?.status !== "created" || !ready || !executableRun,
     "pause-run":
       !available || !["running", "bootstrapping", "reviewing"].includes(run?.status ?? ""),
-    "resume-run": !available || run?.status !== "paused" || !ready,
+    "resume-run": !available || run?.status !== "paused" || !ready || !executableRun,
     "stop-run":
       !canOperate("stop-run") ||
       !hasRun ||
@@ -320,7 +329,7 @@ function buttons(): void {
     "jev-save":
       !available || hasRun || !el<HTMLInputElement>("jev-key").value.trim(),
     "jev-remove": !available || hasRun,
-    "motor-save": !available || !motorEdited,
+    "motor-save": !available || !motorEdited || minecraftMotorProfile(snapshot) === null,
   };
   for (const [id, value] of Object.entries(disabled)) {
     const button = el<HTMLButtonElement>(id);
@@ -501,23 +510,15 @@ function renderPromotionEvent(): void {
       String(item.event_seq) ===
       el<HTMLSelectElement>("promotion-evidence").value,
   );
-  const inventory = event?.type === "observation.inventory";
+  const candidate = event && promotion ? promotionEvidence(event, promotion.run, promotion.execution,
+    (archive?.events ?? []).filter(record => !archive?.omitted.includes(record.event_seq))) : null;
+  const inventory = candidate?.kind === "inventory_gain";
   hidden("promotion-inventory", !inventory);
   hidden("promotion-event-detail", !event);
   text("promotion-event-detail", event ? json(event) : "");
   const select = el<HTMLSelectElement>("promotion-item");
   const previous = select.value;
-  const details = event?.details;
-  const counts =
-    details && typeof details === "object" && !Array.isArray(details)
-      ? details.counts
-      : null;
-  const items =
-    counts && typeof counts === "object" && !Array.isArray(counts)
-      ? Object.entries(counts).filter(
-          ([, value]) => typeof value === "number" && value > 0,
-        )
-      : [];
+  const items = candidate?.kind === "inventory_gain" ? Object.entries(candidate.counts) : [];
   select.replaceChildren(
     new Option("Choose observed item", ""),
     ...items.map(
@@ -535,14 +536,10 @@ function renderPromotionEvents(): void {
   const archive = archivedEvents.get(run.run_id);
   const select = el<HTMLSelectElement>("promotion-evidence");
   const previous = select.value;
+  const history = (archive?.events ?? []).filter(event => !archive?.omitted.includes(event.event_seq));
   const candidates = (archive?.events ?? []).filter(
     (event) =>
-      ["goal.verified", "observation.inventory"].includes(event.type) &&
-      !!execution.started_at &&
-      !!execution.ended_at &&
-      event.at >= execution.started_at &&
-      event.at <= execution.ended_at &&
-      event.details !== null &&
+      promotionEvidence(event, run, execution, history) !== null &&
       !archive?.omitted.includes(event.event_seq),
   );
   select.replaceChildren(
@@ -669,10 +666,10 @@ function renderAuth(state: AppSnapshot): void {
 function usageList(node: HTMLElement, usage: TokenUsage | null): void {
   node.replaceChildren();
   for (const [name, value] of [
-    ["Uncached input", usage ? count(usage.uncached_input) : "Unknown"],
-    ["Cache read", usage ? count(usage.cache_read) : "Unknown"],
-    ["Cache write", usage ? count(usage.cache_write) : "Unknown"],
-    ["Output", usage ? count(usage.output) : "Unknown"],
+    ["Reported uncached subtotal", usage ? count(usage.uncached_input) : "Unknown"],
+    ["Reported cache-read subtotal", usage ? count(usage.cache_read) : "Unknown"],
+    ["Reported cache-write subtotal", usage ? count(usage.cache_write) : "Unknown"],
+    ["Reported output subtotal", usage ? count(usage.output) : "Unknown"],
     ["Calls", usage ? count(usage.calls) : "Unknown"],
   ]) {
     const dt = document.createElement("dt"),
@@ -743,11 +740,15 @@ function render(state: AppSnapshot): void {
       : life
         ? `Life ${life.life_id} · ${life.status}${life.status === "dead" ? life.can_respawn ? ` · ${deadControl}` : " · waiting for death-screen readiness" : life.status === "respawning" ? " · awaiting native confirmation" : ""}`
         : "Connected · awaiting life readiness");
-  if (el<HTMLSelectElement>("motor-profile").value === state.game.motor_profile) motorEdited = false;
-  if (!motorEdited) el<HTMLSelectElement>("motor-profile").value = state.game.motor_profile;
-  text("motor-status", `Current profile: ${state.game.motor_profile}.${motorEdited ? " Selection not applied." : " Applies live without restarting the session."}`);
+  const motorProfile = minecraftMotorProfile(state);
+  el<HTMLSelectElement>("motor-profile").disabled = motorProfile === null;
+  if (el<HTMLSelectElement>("motor-profile").value === motorProfile) motorEdited = false;
+  if (!motorEdited && motorProfile) el<HTMLSelectElement>("motor-profile").value = motorProfile;
+  text("motor-status", motorProfile ? `Current materialized profile: ${motorProfile}.${motorEdited ? " Selection not applied." : " Applies live without restarting the session; old executable validations cannot cross a changed profile."}` : "This adapter has no Minecraft motor-profile control.");
   text("run-status", run ? label(run.status) : "No run");
-  const suppliedGoal = state.goals.find((item) => item.id === run?.goal);
+  const suppliedGoal = state.goals.find(item => typeof run?.goal === "object" && item.goal.adapter_id === run.goal.adapter_id &&
+    item.goal.goal_id === run.goal.goal_id && item.goal.verifier?.id === run.goal.verifier?.id &&
+    item.goal.verifier?.version === run.goal.verifier?.version);
   const longTask = !!run && run.task !== suppliedGoal?.prompt &&
     (run.task.length > 144 || /[\r\n]/.test(run.task));
   text("current-task", run
@@ -868,7 +869,7 @@ function pre(parent: HTMLElement, value: unknown): void {
 function usageTable(parent: HTMLElement, run: RunView): void {
   paragraph(
     parent,
-    "Actual reported counters. Unknown means unreported; legacy aggregate input is not relabeled as uncached input. Known cost is not an estimate of unknown charges.",
+    "SDK/provider-message reported subtotals, not proven provider-consumption totals. Unknown means unreported; legacy aggregate input is not relabeled as uncached input. Reported monetary cost is a subtotal, not a subscription invoice.",
   );
   const scroller = document.createElement("div");
   scroller.className = "table-scroll";
@@ -883,7 +884,7 @@ function usageTable(parent: HTMLElement, run: RunView): void {
     "Cache write",
     "Output",
     "Legacy input",
-    "Known cost",
+    "Reported cost subtotal",
   ]) {
     const th = document.createElement("th");
     th.scope = "col";
@@ -894,7 +895,7 @@ function usageTable(parent: HTMLElement, run: RunView): void {
   table.append(header);
   const body = document.createElement("tbody");
   for (const [name, value] of [
-    ["Total", run.usage],
+    ["Reported subtotal", run.usage],
     ...Object.entries(run.usage.by_purpose),
   ] as [string, TokenUsage][]) {
     const row = document.createElement("tr");
@@ -947,7 +948,7 @@ function renderEvidence(force = false): void {
     evidenceTab,
     run,
     evidenceTab === "activity" ? [relevantEvents, archive] : null,
-    evidenceTab === "inventory" ? snapshot?.game.player : null,
+    evidenceTab === "inventory" ? snapshot?.game.presentation : null,
     evidenceTab === "life" ? snapshot?.game : null,
     run ? measuredEvidence.get(run.run_id) : null,
   ]);
@@ -1016,30 +1017,17 @@ function renderEvidence(force = false): void {
     if (selectedRun) {
       paragraph(
         node,
-        "Live inventory belongs to the current client, not this retained run. Review linked result evidence for historical inventory observations.",
+        "Live adapter state belongs to the current client, not this retained run. Review linked evidence for historical observations.",
       );
     } else {
-      const player = snapshot?.game.player;
+      const presentation = snapshot?.game.presentation;
       paragraph(
         node,
-        player
-          ? `Observed ${when(snapshot?.game.last_observation_at ?? null)} · health ${player.health} / 20 · food ${player.food} / 20`
-          : "Player state is unavailable.",
+        presentation
+          ? `Observed ${when(snapshot?.game.last_observation_at ?? null)} · ${presentation.summary}`
+          : "Adapter state is unavailable.",
       );
-      if (player) {
-        paragraph(
-          node,
-          `XYZ ${player.position.x.toFixed(1)} / ${player.position.y.toFixed(1)} / ${player.position.z.toFixed(1)}`,
-          "mono",
-        );
-        if (!player.inventory.length) paragraph(node, "Inventory is empty.");
-        for (const item of player.inventory)
-          paragraph(
-            node,
-            `${item.display_name} × ${item.count} · slot ${item.slot}`,
-            "mono",
-          );
-      }
+      if (presentation) paragraph(node, json(presentation.state), "mono");
     }
   } else if (!run) {
     paragraph(
@@ -1632,9 +1620,11 @@ el("task-form").addEventListener("submit", (event) => {
   if (el<HTMLButtonElement>("create-run").disabled) return;
   void command("create-run", async () => {
     const experienceId = el<HTMLSelectElement>("experience").value;
+    const selectedGoal = snapshot?.goals.find(choice => choice.id === goal.value);
+    if (!selectedGoal) throw new Error("Select a goal from the currently negotiated adapter");
     const run = await createRun({
       task: task.value.trim(),
-      goal: goal.value,
+      goal: selectedGoal.goal,
       model_id: model.value,
       working_programs: el<HTMLSelectElement>("working-programs").value === "fresh" ? "fresh" : "continue",
       ...(experienceId ? { experience_id: experienceId } : {}),
@@ -1695,8 +1685,9 @@ click(
 );
 click("library-refresh", () => void loadLibrary());
 el("motor-profile").addEventListener("change", () => {
-  motorEdited = el<HTMLSelectElement>("motor-profile").value !== snapshot?.game.motor_profile;
-  text("motor-status", `Current profile: ${snapshot?.game.motor_profile ?? "unknown"}.${motorEdited ? " Selection not applied." : " Selected profile is current."}`);
+  const current = minecraftMotorProfile(snapshot);
+  motorEdited = current !== null && el<HTMLSelectElement>("motor-profile").value !== current;
+  text("motor-status", `Current materialized profile: ${current ?? "unsupported"}.${motorEdited ? " Selection not applied." : " Selected profile is current."}`);
   buttons();
 });
 click("motor-save", () => {
@@ -1738,16 +1729,20 @@ el("promotion-form").addEventListener("submit", (event) => {
     return;
   const item = el<HTMLSelectElement>("promotion-item").value;
   const minGain = Number(el<HTMLInputElement>("promotion-gain").value);
+  const archive = archivedEvents.get(promotion.run.run_id);
+  const candidate = promotionEvidence(evidence, promotion.run, promotion.execution,
+    (archive?.events ?? []).filter(record => !archive?.omitted.includes(record.event_seq)));
+  if (!candidate) return;
   if (
-    evidence.type === "observation.inventory" &&
-    (!item || !Number.isSafeInteger(minGain) || minGain < 1)
+    candidate.kind === "inventory_gain" &&
+    (!item || !(item in candidate.counts) || !Number.isSafeInteger(minGain) || minGain < 1)
   )
     return;
   const declaration: PromotionDeclaration = {
     portability: scope,
     retained_world_data: retained === "yes",
     predicate:
-      evidence.type === "goal.verified"
+      candidate.kind === "goal_verified"
         ? { kind: "goal_verified", event_seq: evidence.event_seq }
         : {
             kind: "inventory_gain",

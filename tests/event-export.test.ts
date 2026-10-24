@@ -34,6 +34,8 @@ function makeRun(store: Store, task: string): StoredRun {
     world_id: crypto.randomUUID(),
     session_id: crypto.randomUUID(),
     life_id: 1,
+    // Read-only export coverage intentionally retains the historical run shape.
+    native_boot_id: null, space_epoch: null, compatibility_hash: null,
     epoch: 1,
     task,
     goal: "custom",

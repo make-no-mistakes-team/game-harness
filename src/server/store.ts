@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
-import type { DeathEpisode, SavedDeathEpisode, ImprovementOpportunity, TraceInput, TracePage, TraceRecord, WorkingProgram } from "../shared/execution-evidence.ts";
+import type { DeathEpisode, SavedDeathEpisode, ReadonlyDeathEpisode, ImprovementOpportunity, TraceInput, TracePage, TraceRecord, WorkingProgram } from "../shared/execution-evidence.ts";
 import type { SkillManager } from "./skills.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import type {
@@ -23,6 +23,7 @@ import type {
   PolicySpec,
   PolicyView,
   RunView,
+  ActiveExecutableValidation,
 } from "../shared/contracts.ts";
 import type {
   SkillExecutionView,
@@ -32,12 +33,14 @@ import type {
   SkillView,
 } from "../shared/programs.ts";
 import { SKILL_API_VERSION } from "../shared/programs.ts";
+import type { EffectInvocation, EffectScope } from "../shared/control.ts";
+import { effectInvocationSchema, effectScopeSchema } from "../shared/control.ts";
 
 export type StoredRun = Omit<
   RunView,
   "action" | "policies" | "skills" | "executions"
 > & {
-  baseline: Record<string, number>;
+  baseline: Json;
 };
 export interface StoredAction {
   request: GameAction;
@@ -93,10 +96,20 @@ const terminalExecutions = new Set<SkillExecutionView["status"]>([
   "unknown",
 ]);
 
+/** Historical records retain null authority; decoding never upgrades them into active invocations. */
+function readExecutionView(encoded: string): SkillExecutionView {
+  return { session_id: null, life_id: null, world_id: null, native_boot_id: null, run_generation: null,
+    space_epoch: null, source_hash: null, compatibility_hash: null, ...JSON.parse(encoded) };
+}
+function readActionView(encoded: string): ActionView {
+  return { session_id: null, life_id: null, scope: null, invocation: null, compatibility_hash: null, ...JSON.parse(encoded) };
+}
+
 export class Store {
   private readonly db: Database;
   private readonly artifactDir: string;
   private readonly listeners = new Set<(event: ActivityEvent) => void>();
+  private readonly traceObservers = new Set<(input: TraceInput) => void>();
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -257,6 +270,9 @@ export class Store {
     delete run.executions;
     run.session_id ??= null;
     run.life_id ??= null;
+    run.native_boot_id ??= null;
+    run.space_epoch ??= null;
+    run.compatibility_hash ??= null;
     const usage = run.usage as StoredRun["usage"] & {
       input_tokens?: number;
       output_tokens?: number;
@@ -266,7 +282,7 @@ export class Store {
         uncached_input: null,
         cache_read: null,
         cache_write: null,
-        output: 0,
+        output: null,
         calls: null,
         known_cost: null,
         legacy_input: null,
@@ -275,10 +291,11 @@ export class Store {
         uncached_input: null,
         cache_read: null,
         cache_write: null,
-        output: usage.output_tokens ?? 0,
+        output: usage.output_tokens ?? null,
         calls: null,
         known_cost: usage.known_cost ?? null,
         legacy_input: usage.input_tokens ?? null,
+        accounting_basis: "sdk_reported_subtotal",
         by_purpose: {
           authoring: unattributed(),
           planning: unattributed(),
@@ -288,18 +305,12 @@ export class Store {
         },
       };
     }
+    // Read-time qualification only: opening a Store must not rewrite historical usage.
+    run.usage.accounting_basis = "sdk_reported_subtotal";
     return run;
   }
 
   private migrateLegacyRows(): void {
-    const runs = this.db
-      .query<{ run_id: string; payload: string }, []>(
-        "SELECT run_id,payload FROM runs",
-      )
-      .all();
-    const saveRun = this.db.query("UPDATE runs SET payload=? WHERE run_id=?");
-    for (const row of runs)
-      saveRun.run(JSON.stringify(this.normalizeRun(row.payload)), row.run_id);
     const actions = this.db
       .query<{ run_id: string; action_id: string; view: string }, []>(
         "SELECT run_id,action_id,view FROM actions",
@@ -337,6 +348,12 @@ export class Store {
   subscribe(listener: (event: ActivityEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+  /** Trusted authorized trace tap BEFORE ordinary diagnostic truncation.
+   * Observers must only enqueue bounded private evidence; never mutate authority. */
+  subscribeTraceEvidence(listener: (input: TraceInput) => void): () => void {
+    this.traceObservers.add(listener);
+    return () => this.traceObservers.delete(listener);
   }
 
   private append(
@@ -497,7 +514,7 @@ export class Store {
       ? {
           request: JSON.parse(row.request) as GameAction,
           fingerprint: row.fingerprint,
-          view: { session_id: null, life_id: null, ...JSON.parse(row.view) } as ActionView,
+          view: readActionView(row.view),
         }
       : null;
   }
@@ -506,7 +523,7 @@ export class Store {
     const row = this.db.query<{ view: string }, [string, string, string | null, string | null, string | null]>(
       "SELECT a.view FROM actions a LEFT JOIN skill_executions e ON e.run_id=a.run_id AND e.execution_id=json_extract(a.view,'$.execution_id') WHERE a.run_id=? AND (?='latest' OR json_extract(a.view,'$.status') IN ('accepted','running','cancel_requested')) AND (? IS NULL OR e.execution_id=? OR e.root_execution_id=?) ORDER BY a.rowid DESC LIMIT 1",
     ).get(runId, target, executionId ?? null, executionId ?? null, executionId ?? null);
-    return row ? { session_id: null, life_id: null, ...JSON.parse(row.view) } as ActionView : null;
+    return row ? readActionView(row.view) : null;
   }
 
   admitAction(
@@ -515,13 +532,22 @@ export class Store {
     request: GameAction,
     origin: ActionView["origin"],
     executionId: string | null = null,
+    authority: { scope: EffectScope; invocation: EffectInvocation; compatibility_hash: string },
   ): { action: StoredAction; created: boolean } {
+    const scope = effectScopeSchema.parse(authority.scope), invocation = effectInvocationSchema.parse(authority.invocation);
+    const run = this.getRun(runId);
+    if (!run || run.status !== "running" || scope.run_id !== runId || scope.world_id !== run.world_id || scope.epoch !== run.epoch ||
+      scope.session_id !== run.session_id || scope.native_boot_id !== run.native_boot_id || scope.life_id !== run.life_id ||
+      scope.space_epoch !== run.space_epoch || authority.compatibility_hash !== run.compatibility_hash ||
+      invocation.execution_id !== scope.execution_id || invocation.source_hash !== scope.source_hash || invocation.kind !== origin ||
+      executionId !== invocation.execution_id) throw new RuntimeFault("invalid_authority", "Action admission requires the current host-created invocation scope");
     const requestText = JSON.stringify(request);
-    const fingerprint = createHash("sha256").update(requestText).digest("hex");
+    const fingerprint = createHash("sha256").update(canonical({ request, authority })).digest("hex");
     let event: ActivityEvent | undefined;
     const result = this.db.transaction(() => {
       const existing = this.getAction(runId, id);
       if (existing) {
+        if (existing.view.scope === null) throw new Error("Historical action identities are inspect-only");
         if (
           existing.fingerprint !== fingerprint ||
           existing.view.origin !== origin ||
@@ -536,8 +562,6 @@ export class Store {
           !this.skillExecution(runId, { execution_id: executionId })
         )
           throw new Error("Skill action requires an execution in this run");
-      } else if (executionId !== null) {
-        throw new Error("Only skill actions can link a skill execution");
       }
       const view: ActionView = {
         action_id: id,
@@ -547,6 +571,9 @@ export class Store {
         execution_id: executionId,
         session_id: this.getRun(runId)?.session_id ?? null,
         life_id: this.getRun(runId)?.life_id ?? null,
+        scope,
+        invocation,
+        compatibility_hash: authority.compatibility_hash,
         summary: `${request.kind} accepted`,
         started_at: null,
         ended_at: null,
@@ -651,6 +678,7 @@ export class Store {
     runId: string,
     spec: PolicySpec,
     authoringTurn: number,
+    validation: ActiveExecutableValidation,
   ): PolicyView {
     const hash = this.saveSource(spec.source);
     let event: ActivityEvent | undefined;
@@ -667,7 +695,8 @@ export class Store {
           previousView.backend === spec.backend &&
           canonical(previousView.choices) === canonical(spec.choices) &&
           previousView.priority === spec.priority &&
-          previousView.interval_ms === spec.interval_ms
+          previousView.interval_ms === spec.interval_ms &&
+          previousView.validation?.fingerprint === validation.fingerprint
         )
           return previousView;
       }
@@ -678,6 +707,7 @@ export class Store {
         hash,
         state: "draft",
         source: spec.source,
+        validation,
         backend: spec.backend,
         choices: spec.choices,
         card: spec.card,
@@ -1006,7 +1036,7 @@ export class Store {
             "Skill start key already exists with different content",
           );
         return {
-          view: { session_id: null, life_id: null, ...JSON.parse(existing.view) } as SkillExecutionView,
+          view: readExecutionView(existing.view),
           created: false,
         };
       }
@@ -1024,9 +1054,16 @@ export class Store {
         throw new Error("Skill start session or life is stale");
       if (run.status !== "running")
         throw new Error("Run is not accepting skill starts");
+      if (run.native_boot_id !== request.native_boot_id || run.space_epoch !== request.space_epoch ||
+        run.compatibility_hash !== request.compatibility_hash || !request.native_boot_id || !request.compatibility_hash ||
+        !Number.isSafeInteger(request.run_generation) || request.run_generation < 0)
+        throw new Error("Skill start does not match negotiated boot/space/profile authority");
       const skill = this.skill(runId, request);
       if (skill.state !== "validated")
         throw new Error("Skill is not validated");
+      if (skill.validation.runtime_version !== 4 || skill.validation.api_version !== 4 || skill.validation.validator_version !== 4 ||
+        skill.validation.compatibility_hash !== request.compatibility_hash)
+        throw new Error("Historical or incompatible executable validation is read-only");
       const limits = request.limits;
       if (
         !request.start_key ||
@@ -1090,12 +1127,18 @@ export class Store {
         version: request.version,
         execution_id: id,
         run_id: runId,
+        world_id: run.world_id,
         start_key: request.start_key,
         parent_execution_id: lineage?.parent_execution_id ?? null,
         root_execution_id: root?.execution_id ?? id,
         epoch: request.epoch,
         session_id: request.session_id,
         life_id: request.life_id,
+        native_boot_id: request.native_boot_id,
+        run_generation: request.run_generation,
+        space_epoch: request.space_epoch,
+        source_hash: skill.hash,
+        compatibility_hash: request.compatibility_hash,
         args: request.args,
         limits: root?.limits ?? request.limits,
         status: "accepted",
@@ -1168,7 +1211,7 @@ export class Store {
               "SELECT view FROM skill_executions WHERE run_id=? AND execution_id=?",
             )
             .get(runId, lookup.execution_id);
-    return row ? ({ session_id: null, life_id: null, ...JSON.parse(row.view) } as SkillExecutionView) : null;
+    return row ? readExecutionView(row.view) : null;
   }
 
   skillExecutions(runId: string): SkillExecutionView[] {
@@ -1177,7 +1220,7 @@ export class Store {
         "SELECT view FROM skill_executions WHERE run_id=? ORDER BY rowid DESC LIMIT 100",
       )
       .all(runId)
-      .map((row) => ({ session_id: null, life_id: null, ...JSON.parse(row.view) }) as SkillExecutionView);
+      .map((row) => readExecutionView(row.view));
   }
 
   /** Durable root identity, independent of the bounded presentation snapshot. */
@@ -1185,14 +1228,14 @@ export class Store {
     const row = this.db.query<{ view: string }, [string]>(
       "SELECT view FROM skill_executions WHERE run_id=? AND parent_execution_id IS NULL ORDER BY rowid DESC LIMIT 1",
     ).get(runId);
-    return row ? ({ session_id: null, life_id: null, ...JSON.parse(row.view) } as SkillExecutionView) : null;
+    return row ? readExecutionView(row.view) : null;
   }
 
   selectedSkillExecution(runId: string, target: "current" | "latest", skillId?: string, version?: number): SkillExecutionView | null {
     const row = this.db.query<{ view: string }, [string, string | null, string | null, number | null, number | null, string]>(
       "SELECT view FROM skill_executions WHERE run_id=? AND ((? IS NULL AND parent_execution_id IS NULL) OR skill_id=?) AND (? IS NULL OR version=?) AND (?='latest' OR json_extract(view,'$.status') IN ('accepted','running','cancel_requested')) ORDER BY rowid DESC LIMIT 1",
     ).get(runId, skillId ?? null, skillId ?? null, version ?? null, version ?? null, target);
-    return row ? { session_id: null, life_id: null, ...JSON.parse(row.view) } as SkillExecutionView : null;
+    return row ? readExecutionView(row.view) : null;
   }
 
   executionReferences(runId: string, executionId?: string) {
@@ -1224,6 +1267,11 @@ export class Store {
         epoch: value.epoch,
         session_id: value.session_id,
         life_id: value.life_id,
+        native_boot_id: value.native_boot_id,
+        run_generation: value.run_generation,
+        space_epoch: value.space_epoch,
+        source_hash: value.source_hash,
+        compatibility_hash: value.compatibility_hash,
         args: value.args,
         limits: value.limits,
         deadline_at: value.deadline_at,
@@ -1282,7 +1330,7 @@ export class Store {
         )
         .all(runId);
       for (const row of rows) {
-        const view = JSON.parse(row.view) as SkillExecutionView;
+        const view = readExecutionView(row.view);
         const neverDispatched =
           view.status === "accepted" && view.started_at === null;
         view.status = neverDispatched ? "cancelled" : "unknown";
@@ -1313,13 +1361,11 @@ export class Store {
   allSkillExecutions(runId: string): SkillExecutionView[] {
     return this.db.query<{ view: string }, [string]>(
       "SELECT view FROM skill_executions WHERE run_id=? ORDER BY rowid",
-    ).all(runId).map(({ view }) => {
-      const value = JSON.parse(view) as SkillExecutionView;
-      return { ...value, session_id: value.session_id ?? null, life_id: value.life_id ?? null };
-    });
+    ).all(runId).map(({ view }) => readExecutionView(view));
   }
 
   recordTrace(input: TraceInput): TraceRecord | null {
+    for (const observer of this.traceObservers) observer(input);
     return this.db.transaction(() => {
       this.db.query("INSERT OR IGNORE INTO trace_budgets(run_id) VALUES(?)").run(input.run_id);
       const budget = this.traceBudget(input.run_id);
@@ -1402,17 +1448,20 @@ export class Store {
   skillExecutionRows(runId: string, after: number, limit: number): { seq: number; value: SkillExecutionView }[] {
     return this.db.query<{ seq: number; view: string }, [string, number, number]>(
       "SELECT rowid AS seq,view FROM skill_executions WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?",
-    ).all(runId, after, limit).map((row) => ({ seq: row.seq, value: { session_id: null, life_id: null, ...JSON.parse(row.view) } as SkillExecutionView }));
+    ).all(runId, after, limit).map((row) => ({ seq: row.seq, value: readExecutionView(row.view) }));
   }
 
   recordDeathEpisode(runId: string, episode: DeathEpisode): void {
     const snapshot = JSON.stringify(episode.last_observation);
+    const state = episode.last_observation?.data ?? null;
+    const stateBytes = Buffer.byteLength(JSON.stringify(state));
     const references = [...new Set(episode.event_seqs)];
     const value: SavedDeathEpisode = {
       ...episode,
       event_seqs: references.slice(-256),
       last_observation: Buffer.byteLength(snapshot) <= 24576 ? episode.last_observation : null,
-      last_authorized_player: episode.last_observation?.player ?? null,
+      last_authorized_state: stateBytes <= 8192 ? state : null,
+      state_omission: stateBytes > 8192 ? { reason: "snapshot_byte_budget", original_bytes: stateBytes } : null,
       observation_omission: Buffer.byteLength(snapshot) > 24576 ? { reason: "snapshot_byte_budget", original_bytes: Buffer.byteLength(snapshot), observation_seq: episode.last_observation?.observation_seq } : null,
       event_reference_omission: references.length > 256 ? { reason: "event_reference_budget", omitted: references.length - 256 } : null,
     };
@@ -1426,8 +1475,8 @@ export class Store {
 
   deathEpisodesPage(runId: string, after = 0, limit = 32) {
     if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid death episode cursor or limit");
-    const all = this.evidenceObjects<SavedDeathEpisode>(runId, "death");
-    const page = { episodes: [] as SavedDeathEpisode[], next_after: after, has_more: false };
+    const all = this.evidenceObjects<ReadonlyDeathEpisode>(runId, "death");
+    const page = { episodes: [] as ReadonlyDeathEpisode[], next_after: after, has_more: false };
     for (const episode of all.slice(after, after + Math.min(limit, 100))) {
       const candidate = { episodes: [...page.episodes, episode], next_after: page.next_after + 1, has_more: false };
       if (Buffer.byteLength(JSON.stringify(candidate)) > 65536) break;
@@ -1465,7 +1514,8 @@ export class Store {
     const executions = this.allSkillExecutions(runId);
     const candidates: WorkingProgram[] = [];
     for (const root of this.skills(runId)) {
-      if (root.state !== "validated" || root.validation.runtime_version !== SKILL_API_VERSION) continue;
+      if (root.state !== "validated" || root.validation.runtime_version !== SKILL_API_VERSION || root.validation.api_version !== 4 ||
+        root.validation.validator_version !== 4 || root.validation.compatibility_hash !== run.compatibility_hash) continue;
       const skills: SkillView[] = [];
       const seen = new Set<string>();
       const visit = (ref: SkillRef): void => {
@@ -1473,7 +1523,9 @@ export class Store {
         if (seen.has(key)) return;
         seen.add(key);
         const skill = this.skill(runId, ref);
-        if (skill.state !== "validated") throw new Error("Working dependency is not validated");
+        if (skill.state !== "validated" || skill.validation.runtime_version !== 4 || skill.validation.api_version !== 4 ||
+          skill.validation.validator_version !== 4 || skill.validation.compatibility_hash !== run.compatibility_hash)
+          throw new Error("Working dependency has incompatible executable validation");
         for (const dependency of skill.dependencies) visit(dependency);
         skills.push(skill);
       };
@@ -1500,8 +1552,9 @@ export class Store {
     if (!run || run.model_id !== modelId || run.session_id !== sessionId) throw new Error("Working library scope does not match run");
     const imported = new Map<string, SkillView>();
     for (const candidate of this.workingPrograms(modelId, sessionId)) {
-      if (candidate.skills.some((skill) => skill.validation.runtime_version !== SKILL_API_VERSION)) {
-        this.event(runId, "skill.working_incompatible", "Retained working sources use an incompatible skill API and were not imported", {
+      if (candidate.skills.some((skill) => skill.validation.runtime_version !== SKILL_API_VERSION || skill.validation.api_version !== 4 ||
+        skill.validation.validator_version !== 4 || skill.validation.compatibility_hash !== run.compatibility_hash)) {
+        this.event(runId, "skill.working_incompatible", "Retained working sources use an incompatible API/schema/profile contract and were not imported", {
           source_run_id: candidate.source_run_id, skill_api: SKILL_API_VERSION,
         });
         continue;

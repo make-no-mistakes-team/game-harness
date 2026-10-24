@@ -4,6 +4,9 @@ import { Worker } from "node:worker_threads";
 import type { Json } from "../src/shared/contracts.ts";
 import type { ProgramBranchTrace, ProgramTraceLossReason } from "../src/shared/program-trace.ts";
 import { instrumentProgram, ProgramTraceReceiver } from "../src/server/program-instrumentation.ts";
+import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
+
+const adapter = minecraftTestAdapter();
 
 /** Exercise the real inner worker protocol, not a production isolation fallback. */
 async function execute(
@@ -16,9 +19,10 @@ async function execute(
   const traces: ProgramBranchTrace[] = [];
   const requests: Record<string, unknown>[] = [];
   let failure = false;
-  let terminalFrame: Record<string, unknown> | null = null;
+  const state: { terminalFrame: Record<string, unknown> | null } = { terminalFrame: null };
   const worker = new Worker(new URL("../sandbox/worker.mjs", import.meta.url), {
-    workerData: { mode: "skill", source: program.execution_source, args: null,
+    workerData: { mode: "skill", source: program.execution_source, source_hash: program.source_hash, args: null,
+      api: { api_version: 4, action_enabled: true, supports_respawn: true, bindings: adapter.bindings },
       instrumentation: { hook_name: program.hook_name, scope: program.scope,
         kinds: program.points.map((point) => point.kind) } },
     stdout: true, stderr: true,
@@ -77,11 +81,17 @@ async function execute(
           done.resolve(null);
           return;
         }
-        const value = await broker(frame.request);
-        worker.postMessage({ v: 1, type: "skill_reply", id: frame.id, ok: true, value });
+        try {
+          const value = await broker(frame.request);
+          worker.postMessage({ v: 1, type: "skill_reply", id: frame.id, ok: true, value });
+        } catch (error) {
+          const safe = error as { code: string; message: string };
+          worker.postMessage({ v: 1, type: "skill_reply", id: frame.id, ok: false,
+            error: { code: safe.code, message: safe.message } });
+        }
       } else if (frame.type === "skill_result" || frame.type === "skill_failure") {
         receiver.finish(null);
-        terminalFrame = frame;
+        state.terminalFrame = frame;
         failure = frame.type === "skill_failure";
         done.resolve(failure ? null : frame.result);
       }
@@ -90,7 +100,7 @@ async function execute(
   });
   try {
     const result = await done.promise;
-    return { result, traces, requests, program, failure, terminalFrame };
+    return { result, traces, requests, program, failure, terminalFrame: state.terminalFrame };
   } finally {
     watchdog.removeEventListener("abort", expired);
     try {
@@ -170,7 +180,8 @@ return { order, selected };
     await Promise.resolve();
     return request.kind === "observe" ? true : "recipe-value";
   });
-  expect(order).toEqual(["observe", "recipes"]);
+  expect(order).toEqual(["observe", "adapter"]);
+  expect(requests[1]).toEqual({ kind: "adapter", capability_id: "minecraft.recipes", version: 1, args: { item: "fixture" } });
   expect(requests).toHaveLength(2);
   expect(result).toEqual({ order: ["observed", "recipe", "microtask"], selected: 2 });
   expect(traces.map((trace) => trace.events.length)).toEqual([0, 1, 1]);
@@ -269,15 +280,42 @@ test("host rejects unknown points, wrong execution scope, injected authority and
   expect(() => receiver.accept({ ...frame, events: Array.from({ length: 256 }, () => frame.events[0]) })).toThrow();
 });
 
-test("controlled throw flushes actual branch decisions before failure without exposing error text", async () => {
-  const { failure, traces, terminalFrame } = await execute(`
-if (true) throw new Error("private fixture message and stack");
+test("real worker failure retains bounded generated exception and source identity without host stacks", async () => {
+  const { failure, traces, terminalFrame, program } = await execute(`
+if (true) throw new TypeError("Expected an observation object");
 return null;
 `);
   expect(failure).toBe(true);
   expect(traces.flatMap((trace) => trace.events).map((event) => event.decision)).toEqual([true]);
   expect(traces.every((trace) => !trace.tail_incomplete && trace.loss_reason === null)).toBe(true);
-  expect(Object.keys(terminalFrame!).sort()).toEqual(["id", "trace", "type", "v"]);
+  expect(terminalFrame?.diagnostic).toMatchObject({ type: "TypeError", message: "Expected an observation object", source_hash: program.source_hash });
+  const diagnostic = terminalFrame?.diagnostic as { location: { mapping: string; line?: number } };
+  expect(["canonical", "unmapped"]).toContain(diagnostic.location.mapping);
+  if (diagnostic.location.mapping === "canonical") expect(diagnostic.location.line).toBe(2);
+  expect(JSON.stringify(terminalFrame)).not.toContain("worker.mjs");
+  expect(JSON.stringify(terminalFrame)).not.toContain("node:internal");
+  expect(diagnostic).not.toHaveProperty("stack");
+});
+
+test("real worker capability rejection preserves trusted code and useful message", async () => {
+  const outcome = await execute(`
+try { await game.observe(); }
+catch (error) { return { code: error.code, message: error.message }; }
+return null;
+`, async () => { throw Object.assign(new Error("Observation authority belongs to an earlier life"), { code: "stale_context" }); });
+  expect(outcome.result).toEqual({ code: "stale_context", message: "Observation authority belongs to an earlier life" });
+});
+
+test("failure diagnostics neither serialize arbitrary thrown values nor retain unbounded text", async () => {
+  const object = await execute('throw { get message() { throw new Error("GETTER_MUST_NOT_RUN"); }, secret: "THROWN_OBJECT_SECRET", toJSON() { return "SERIALIZER_MUST_NOT_RUN"; } };');
+  expect(object.failure).toBe(true);
+  expect(object.terminalFrame?.diagnostic).toBeDefined();
+  const serialized = JSON.stringify(object.terminalFrame);
+  for (const privateValue of ["GETTER_MUST_NOT_RUN", "THROWN_OBJECT_SECRET", "SERIALIZER_MUST_NOT_RUN"]) expect(serialized).not.toContain(privateValue);
+  const large = await execute('throw new Error("x".repeat(10000));');
+  const diagnostic = large.terminalFrame?.diagnostic as { message: string };
+  expect(diagnostic.message.length).toBeGreaterThan(0);
+  expect(Buffer.byteLength(diagnostic.message)).toBeLessThanOrEqual(1000);
 });
 
 test("unhandled rejected await retains prior conditions but never invents the rejected condition", async () => {

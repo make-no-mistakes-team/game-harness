@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { createConnection } from "node:net";
+import { types } from "node:util";
 import {
   Worker,
   isMainThread,
@@ -157,6 +158,28 @@ function runSkillThread() {
   let pending = null;
   const traceScope = workerData.instrumentation.scope;
   const traceKinds = workerData.instrumentation.kinds;
+  const descriptor = Object.getOwnPropertyDescriptor;
+  const nativeError = types.isNativeError;
+  const prototypes = [[TypeError.prototype, "TypeError"], [RangeError.prototype, "RangeError"], [ReferenceError.prototype, "ReferenceError"], [SyntaxError.prototype, "SyntaxError"], [Error.prototype, "Error"]];
+  const getPrototype = Object.getPrototypeOf;
+  const slice = Function.prototype.call.bind(String.prototype.slice);
+  function boundedMessage(value) {
+    let text = slice(value, 0, 1000);
+    while (byteLength(text) > 1000) text = slice(text, 0, -1);
+    return text;
+  }
+  function diagnostic(error) {
+    let type = "ThrownValue", message = "Generated program threw a non-error value (not serialized)", code;
+    if (nativeError(error)) {
+      const proto = getPrototype(error);
+      type = prototypes.find(([value]) => value === proto)?.[1] ?? "Error";
+      const ownMessage = descriptor(error, "message")?.value;
+      message = typeof ownMessage === "string" ? boundedMessage(ownMessage) : "Generated program failed";
+      const ownCode = descriptor(error, "code")?.value;
+      if (typeof ownCode === "string") code = slice(ownCode, 0, 80);
+    }
+    return { type, message, ...(code ? { code } : {}), source_hash: workerData.source_hash, location: { mapping: "unmapped" } };
+  }
   const setPrototype = Object.setPrototypeOf.bind(Object);
   let traceEvents = setPrototype([], null);
   let traceCount = 0;
@@ -225,22 +248,41 @@ function runSkillThread() {
     }
     return completion.promise;
   }
-  const game = Object.freeze({
+  const api = workerData.api;
+  if (api?.api_version !== 4 || typeof api.action_enabled !== "boolean" || typeof api.supports_respawn !== "boolean" || !Array.isArray(api.bindings))
+    throw new Error("Missing active game API manifest.");
+  const methods = Object.assign(Object.create(null), {
     observe: () => call({ kind: "observe" }),
-    action: (action) => call({ kind: "action", action }),
-    respawn: () => call({ kind: "respawn" }),
-    recipes: (item) => call({ kind: "recipes", item }),
     call: (skill, args) => call({ kind: "call", skill, args }),
     progress: (summary, details) =>
       call({ kind: "progress", summary, details }),
   });
+  if (api.action_enabled) methods.action = (action) => call({ kind: "action", action });
+  if (api.action_enabled && api.supports_respawn) methods.respawn = () => call({ kind: "respawn" });
+  for (const binding of api.bindings) {
+    if (!/^[a-zA-Z][a-zA-Z0-9_]{0,79}$/.test(binding.name) || Object.hasOwn(methods, binding.name) ||
+      ["constructor", "prototype", "__proto__"].includes(binding.name) || typeof binding.capability_id !== "string" ||
+      !Number.isSafeInteger(binding.version) || binding.version < 1 || !Array.isArray(binding.parameters) || binding.parameters.length > 16 ||
+      binding.parameters.some(name => typeof name !== "string" || !/^[a-zA-Z][a-zA-Z0-9_]{0,79}$/.test(name)))
+      throw new Error("Invalid registered adapter API binding.");
+    methods[binding.name] = (...values) => {
+      const args = Object.create(null);
+      for (let index = 0; index < binding.parameters.length; index++) args[binding.parameters[index]] = values[index];
+      return call({ kind: "adapter", capability_id: binding.capability_id, version: binding.version, args });
+    };
+  }
+  const game = Object.freeze(methods);
   parentPort.on("message", (frame) => {
     if (!pending || frame.id !== pending.id || frame.type !== "skill_reply")
       return exit(1);
     const completion = pending;
     pending = null;
     if (frame.ok) completion.resolve(frame.value);
-    else completion.reject(new Error("Skill capability failed."));
+    else {
+      const error = new Error(typeof frame.error?.message === "string" ? frame.error.message.slice(0, 1000) : "Skill capability failed.");
+      if (typeof frame.error?.code === "string") error.code = frame.error.code.slice(0, 80);
+      completion.reject(error);
+    }
   });
   Promise.resolve()
     .then(async () => {
@@ -257,12 +299,12 @@ function runSkillThread() {
       if (pending) throw new Error("Unawaited capability.");
       send({ v: 1, type: "skill_result", id: sequence, result });
     })
-    .catch(async () => {
+    .catch(async (error) => {
       try {
         // A capability already sent remains single-flight and must settle
         // before a controlled failure can close this execution's trace.
         if (pending) await pending.promise.catch(() => {});
-        send({ v: 1, type: "skill_failure", id: sequence });
+        send({ v: 1, type: "skill_failure", id: sequence, diagnostic: diagnostic(error) });
       } catch {
         // No invented omitted count: the host marks an unknown unsent tail.
         exit(1);
@@ -296,12 +338,14 @@ function runSkillSupervisor() {
     if (!thread && frame.type === "skill_init" && frame.id === 0) {
       if (typeof frame.source !== "string" || byteLength(frame.source) > MAX_SKILL_INPUT ||
         !frame.instrumentation ||
+        frame.api?.api_version !== 4 || typeof frame.api.action_enabled !== "boolean" ||
+        typeof frame.api.supports_respawn !== "boolean" || !Array.isArray(frame.api.bindings) || frame.api.bindings.length > 32 ||
         !/^__trace_[a-f0-9]{32}$/.test(frame.instrumentation.hook_name) ||
         typeof frame.instrumentation.scope !== "string" ||
         !Array.isArray(frame.instrumentation.kinds))
         throw new Error("source");
       thread = new Worker(new URL(import.meta.url), {
-        workerData: { mode: "skill", source: frame.source, args: frame.args,
+        workerData: { mode: "skill", source: frame.source, source_hash: frame.source_hash, args: frame.args, api: frame.api,
           instrumentation: frame.instrumentation },
         stdout: true,
         stderr: true,

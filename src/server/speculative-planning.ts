@@ -1,18 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Json, Observation } from "../shared/contracts.ts";
+import type { Json, ObservationV3 } from "../shared/contracts.ts";
 import type { LookaheadConfig, LookaheadRequest, PlanningContext, PlanningScope, PlanningSource, PlanProjection, PlanRejectReason, StageCorrection, StagePlanRequest } from "../shared/planning.ts";
 import type { SkillExecutionView, SkillRef, SkillStartRequest, SkillView } from "../shared/programs.ts";
 import { lookaheadConfigSchema, skillLimitsSchema, skillRefSchema } from "../shared/validation.ts";
 import { isSpeculativeTool } from "../shared/tool-policy.ts";
-import { ProgramValidationError, validateProgramSource } from "./program-validation.ts";
+import { ProgramValidationError, programFingerprint, validateProgramSource, type ExecutableValidationContext } from "./program-validation.ts";
+import { canonicalContractJson } from "./adapter-contract.ts";
+import { sameScreen } from "../shared/control.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 
 export interface SpeculativeHost {
+  contract(): ExecutableValidationContext;
   admissionContext(): PlanningScope | null;
   context(): PlanningContext | null;
   skill(ref: SkillRef): SkillView | null;
-  observe(): Promise<Observation>;
-  evaluateGuard(source: string, observation: Observation, args: Json, signal: AbortSignal): Promise<boolean>;
+  observe(): Promise<ObservationV3>;
+  evaluateGuard(source: string, observation: ObservationV3, args: Json, signal: AbortSignal): Promise<boolean>;
   /** Recheck permit immediately before durable admission, including after awaits. */
   admit(request: SkillStartRequest, permit: { signal: AbortSignal; assertCurrent(): void }): Promise<SkillExecutionView>;
   evidence(type: string, details: Json): void;
@@ -33,7 +36,7 @@ const LIVE: Record<string, true> = { armed: true, planning: true, staged: true, 
 const TERMINAL_ROOT: Record<string, true> = { succeeded: true, blocked: true, failed: true, cancelled: true, unknown: true };
 const CORRECTABLE_SOURCE_ISSUES: Record<string, true> = {
   invalid_syntax: true, invalid_source: true, source_bytes_limit: true,
-  formatted_lines_limit: true, complexity_limit: true, nesting_limit: true,
+
 };
 
 /** A draft grants no effect authority. Only fresh guarded admission can start it. */
@@ -73,9 +76,11 @@ export class SpeculativePlanning {
       if (revision !== this.authorityRevision || !current ||
           current.life_status !== "alive")
         throw new RuntimeFault("stale_context", "Prepared lookahead admission was revoked");
-      for (const key of ["run_id", "generation", "session_id", "world_id", "epoch", "life_id", "task", "goal"] as const)
+      for (const key of ["run_id", "generation", "session_id", "world_id", "epoch", "life_id", "task", "native_boot_id", "space_epoch", "compatibility_hash"] as const)
         if (current[key] !== basis[key])
           throw new RuntimeFault("stale_context", "Prepared lookahead admission belongs to another scope");
+      if (canonicalContractJson(current.goal) !== canonicalContractJson(basis.goal) || !sameScreen(current.screen, basis.screen))
+        throw new RuntimeFault("stale_context", "Prepared lookahead goal or screen precondition changed");
       return this.arm({ ...configuration, root_execution_id: executionId });
     };
   }
@@ -207,7 +212,7 @@ export class SpeculativePlanning {
     let rejection: PlanRejectReason = "guard_error";
     try {
       const validated = stagedRequest.guard_source === undefined
-        ? null : await validateProgramSource(stagedRequest.guard_source, "guard");
+        ? null : await validateProgramSource(stagedRequest.guard_source, "guard", this.host.contract());
       authority();
       rejection = "source_changed";
       const sources = this.captureSources(stagedRequest.skill);
@@ -371,6 +376,8 @@ export class SpeculativePlanning {
         skill_id: request.skill.skill_id, version: request.skill.version,
         start_key: `plan_${draft.view.plan_id}`, epoch: basis.epoch,
         session_id: basis.session_id, life_id: basis.life_id,
+        native_boot_id: basis.native_boot_id, run_generation: basis.generation, space_epoch: basis.space_epoch,
+        compatibility_hash: basis.compatibility_hash,
         args: structuredClone(request.args), limits: { ...request.limits },
       }, { signal: draft.controller.signal, assertCurrent: () => this.assertActivation(draft) });
       // Admission changes current root; the permit, not a post-admission old-root
@@ -438,7 +445,10 @@ export class SpeculativePlanning {
     let reason: PlanRejectReason | null = null;
     if (!now || now.run_id !== basis.run_id || now.generation !== basis.generation || now.session_id !== basis.session_id || now.world_id !== basis.world_id || now.epoch !== basis.epoch) reason = "session_changed";
     else if (now.life_id !== basis.life_id || now.life_status !== "alive") reason = "life_changed";
-    else if (now.task !== basis.task || now.goal !== basis.goal) reason = "task_changed";
+    else if (now.native_boot_id !== basis.native_boot_id || now.space_epoch !== basis.space_epoch) reason = "space_changed";
+    else if (now.compatibility_hash !== basis.compatibility_hash) reason = "profile_changed";
+    else if (!sameScreen(now.screen, basis.screen)) reason = "screen_changed";
+    else if (now.task !== basis.task || canonicalContractJson(now.goal) !== canonicalContractJson(basis.goal)) reason = "task_changed";
     else if (performance.now() >= draft.deadline) reason = "deadline";
     if (reason) { this.reject(draft, reason); throw new RuntimeFault("stale_context", reason); }
   }
@@ -471,6 +481,11 @@ export class SpeculativePlanning {
       throw new RuntimeFault("stale_context", "Resolved program identity does not match the model-selected exact version");
     if (skill.state !== "validated")
       throw new RuntimeFault("precondition_failed", "Selected exact program version is not validated");
+    const scope = this.host.admissionContext();
+    if (!scope || skill.validation.runtime_version !== 4 || skill.validation.api_version !== 4 || skill.validation.validator_version !== 4 ||
+      skill.validation.compatibility_hash !== scope.compatibility_hash ||
+      skill.validation.fingerprint !== programFingerprint(skill.hash, "skill", scope.compatibility_hash))
+      throw new RuntimeFault("precondition_failed", "Selected cached executable contract is incompatible");
     if (createHash("sha256").update(skill.source).digest("hex") !== skill.hash)
       throw new RuntimeFault("stale_context", "Selected program source does not match its immutable hash");
     if (captured.size >= 64)

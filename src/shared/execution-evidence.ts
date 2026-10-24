@@ -1,5 +1,6 @@
-import type { Json, Observation } from "./contracts.ts";
+import type { Json, ObservationV3 } from "./contracts.ts";
 import type { SkillRef, SkillView } from "./programs.ts";
+import type { HistoricalObservationV2, MinecraftPlayer } from "./minecraft.ts";
 
 export type TraceKind = "capability_request" | "capability_result" | "observation" | "branch" | "intent" | "span" | "omission";
 export type PauseCategory = "native_action" | "dispatch" | "receipt" | "readiness" | "sandbox" | "capability_wait" | "strategic_request" | "scheduler_handoff" | "life_recovery";
@@ -38,16 +39,23 @@ export interface DeathEpisode {
   death_id: string;
   session_id: string;
   life_id: number;
-  last_observation: Observation | null;
+  last_observation: ObservationV3 | null;
   current_root_execution_id: string | null;
   action_id: string | null;
   event_seqs: number[];
 }
 export interface SavedDeathEpisode extends DeathEpisode {
-  last_authorized_player: Observation["player"] | null;
+  last_authorized_state: Json | null;
+  state_omission: { reason: "snapshot_byte_budget"; original_bytes: number } | null;
   observation_omission: { reason: "snapshot_byte_budget"; original_bytes: number; observation_seq: number | undefined } | null;
   event_reference_omission: { reason: "event_reference_budget"; omitted: number } | null;
 }
+/** Original schema2 snapshots remain explicit read-only historical records. */
+export type HistoricalSavedDeathEpisodeV2 = Omit<SavedDeathEpisode, "last_observation" | "last_authorized_state" | "state_omission"> & {
+  last_observation: HistoricalObservationV2 | null;
+  last_authorized_player: MinecraftPlayer | null;
+};
+export type ReadonlyDeathEpisode = SavedDeathEpisode | HistoricalSavedDeathEpisodeV2;
 export interface ProgramVersionEvidence extends SkillRef {
   run_id: string;
   hash: string;

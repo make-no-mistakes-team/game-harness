@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentEvent, AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import type { ToolCall } from "@oh-my-pi/pi-ai";
-import type { Json, Observation } from "../src/shared/contracts.ts";
+import type { Json, ObservationV3 } from "../src/shared/contracts.ts";
 import type { PlanningContext } from "../src/shared/planning.ts";
 import { TOOL_POLICY } from "../src/shared/tool-policy.ts";
 import type { AuthManager } from "../src/server/auth.ts";
@@ -15,7 +15,7 @@ import { SkillManager } from "../src/server/skills.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { StrategicPlanner } from "../src/server/strategic.ts";
-import { emptyRunUsage } from "../src/server/usage.ts";
+import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 
 type Gate = Parameters<Agent["setBeforeModelCall"]>[0];
 type ToolGate = NonNullable<Agent["beforeToolCall"]>;
@@ -45,19 +45,17 @@ function object(value: Json): { [key: string]: Json } | null {
 }
 function setup(onPrompt: (context: Record<string, unknown>, agent: HarnessAgent) => Promise<void>) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-overlap-"));
-  const store = new Store(directory);
-  const run: StoredRun = { run_id: crypto.randomUUID(), session_id: "session", life_id: 1,
-    task: "Observe", goal: "custom", model_id: "fixture-model", world_id: "world", epoch: 1,
+  const store = new Store(directory), adapter = minecraftTestAdapter();
+  const goal = adapter.goals.find(goal => goal.goal_id === "custom")!;
+  const run = minecraftRunFixture(adapter, { session_id: "session", life_id: 1,
+    task: "Observe", model_id: "fixture-model", world_id: "world", epoch: 1,
     status: "running", started_at: null, ended_at: null, turns: 0, model_status: "idle", error: null,
-    usage: emptyRunUsage(), baseline: {} };
+  });
   store.saveRun(run);
-  const observation: Observation = { schema_version: 2, session_id: "session", world_id: "world", epoch: 1,
-    life: { life_id: 1, status: "alive", can_respawn: false, death: null }, observation_seq: 1,
-    captured_at: new Date().toISOString(), profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r2",
-    player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: 20, food: 20, on_ground: true, in_water: false, inventory: [] },
-    blocks: [], entities: [], sounds: [], coverage: { partial: true, max_age_ms: 1000 } };
+  const observation = minecraftObservationFixture(adapter);
   const basis: PlanningContext = { run_id: run.run_id, generation: 1, session_id: "session", world_id: "world", epoch: 1,
-    life_id: 1, life_status: "alive", task: run.task, goal: run.goal,
+    life_id: 1, life_status: "alive", task: run.task, goal,
+    native_boot_id: run.native_boot_id!, space_epoch: run.space_epoch!, compatibility_hash: run.compatibility_hash!, screen: null,
     root: { execution_id: "root", skill_id: "skill", version: 1, hash: "exact", status: "running" } };
   const state = { pending: true, reviews: 0, aborts: 0, pauses: [] as string[], contexts: [] as Record<string, unknown>[], catalogs: [] as string[][] };
   const tools: AgentTool[] = Object.keys(TOOL_POLICY).map((name) => ({ name, label: name,
@@ -65,6 +63,7 @@ function setup(onPrompt: (context: Record<string, unknown>, agent: HarnessAgent)
     execute: async () => ({ content: [], details: null }) }));
   let planner: StrategicPlanner;
   const speculation = new SpeculativePlanning({
+    contract: () => adapter,
     admissionContext: () => basis, context: () => basis, skill: () => null, observe: async () => observation,
     evaluateGuard: async () => { throw new Error("No game guard evaluated by scheduler fixture"); },
     admit: async () => { throw new Error("Scheduler fixture has no prepared successor"); },
@@ -120,6 +119,7 @@ function setup(onPrompt: (context: Record<string, unknown>, agent: HarnessAgent)
       return run;
     },
     tools: () => tools, rootPrompt: () => "Neutral scheduler fixture", observe: async () => observation,
+    projectObservation: current => adapter.projectObservation(current),
     policies: () => [], action: () => null, programPending: () => state.pending, busy: () => state.pending,
     persist: () => store.saveRun(run), pause: (reason) => { state.pauses.push(reason); },
     terminal: () => { throw new Error("Unexpected terminal transition"); }, speculation: () => speculation,
@@ -133,7 +133,7 @@ function setup(onPrompt: (context: Record<string, unknown>, agent: HarnessAgent)
     return done.promise;
   };
   const optIn = () => speculation.optIn({ root_execution_id: basis.root.execution_id, after_ms: 0, reason: "Independent follow-up", budget: { calls: 3, tools: 6, duration_ms: 5000 } });
-  return { planner, speculation, run, state, event, optIn, store, basis };
+  return { planner, speculation, run, state, event, optIn, store, basis, adapter };
 }
 
 for (const selectedKind of ["lookahead", "attention"] as const) {
@@ -161,8 +161,10 @@ for (const selectedKind of ["lookahead", "attention"] as const) {
       } finally { signal.removeEventListener("abort", onAbort); }
     };
     const manager = new SkillManager(f.store, { runSkill: runner }, {
-      authorize: (runId, epoch, session, life) => { if (runId !== f.run.run_id || epoch !== 1 || session !== "session" || life !== 1) throw new Error("Revoked root"); },
-      observe: async () => { throw new Error("No observation requested"); }, recipes: async () => [],
+      authorize: scope => { if (scope.run_id !== f.run.run_id || scope.epoch !== 1 || scope.session_id !== "session" || scope.life_id !== 1 ||
+        scope.native_boot_id !== f.run.native_boot_id || scope.space_epoch !== f.run.space_epoch) throw new Error("Revoked root"); },
+      adapter: () => f.adapter, binding: () => minecraftTestBinding(f.adapter),
+      observe: async () => { throw new Error("No observation requested"); }, queryCapability: async () => [],
       action: async () => { leaves++; f.planner.admitted(); return { status: "succeeded", summary: "Confirmed neutral capability", evidence: { effect_confirmed: true } }; },
       recover: async () => { throw new Error("No recovery requested"); }, cancelActions: async () => {},
       prepareLookahead: (configuration) => f.speculation.prepareOptIn(configuration),
@@ -176,7 +178,7 @@ for (const selectedKind of ["lookahead", "attention"] as const) {
     managers.push(manager);
     const program = await manager.register(f.run.run_id, { name: "Neutral continued program", source: 'await game.action({kind:"look",yaw:0,pitch:0}); await game.action({kind:"look",yaw:1,pitch:0}); return {status:"completed",summary:"Neutral flow settled",result:null};',
       card: { purpose: "Measure selected attention", applicability: "Neutral fixture", method: "Two authorized capabilities", reason: "Prove root handoff", limitations: "No gameplay claim" }, dependencies: [] });
-    const root = manager.start(f.run.run_id, { skill_id: program.skill_id, version: program.version, start_key: "continued", epoch: 1, session_id: "session", life_id: 1, args: null,
+    const root = manager.start(f.run.run_id, { skill_id: program.skill_id, version: program.version, start_key: "continued", ...executionScopeFixture(f.run), args: null,
       limits: { duration_ms: 10000, max_actions: 2, max_calls: 2, max_depth: 1 },
       ...(selectedKind === "lookahead" ? { lookahead: { after_ms: 0, reason: "Independent selected follow-up", budget: { calls: 1, tools: 2, duration_ms: 5000 } } } : {}) });
     rootId = root.execution_id; f.planner.admitted(); await first.promise;

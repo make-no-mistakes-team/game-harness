@@ -3,7 +3,9 @@ import type {
   GameAction,
   GameActionResult,
   Json,
-  Observation,
+  ObservationV3,
+  AdapterBinding,
+  RuntimeAdapter,
 } from "../shared/contracts.ts";
 import type {
   SkillCapabilityRequest,
@@ -19,30 +21,36 @@ import {
   skillStartRequestSchema,
   skillResultSchema,
 } from "../shared/validation.ts";
-import { validateSkill } from "./program-validation.ts";
+import { programFingerprint, validateSkill } from "./program-validation.ts";
+import type { EffectContext, EffectInvocation, EffectScope } from "../shared/control.ts";
+import { assertExecutableCompatible } from "./effect-contract.ts";
+import { RegisteredAdapterContract } from "./registered-adapter.ts";
 import { SKILL_API_VERSION } from "../shared/programs.ts";
 import { SkillCleanupError, type SandboxService } from "./sandbox.ts";
 import type { Store } from "./store.ts";
 import type { LookaheadConfig } from "../shared/planning.ts";
 import { ExecutionTrace } from "./execution-trace.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
+import { capabilityFailure, programDiagnostic } from "./program-diagnostics.ts";
 export interface SkillHost {
-  authorize(runId: string, epoch: number, sessionId: string, lifeId: number): void;
-  observe(): Promise<Observation>;
+  authorize(scope: EffectContext): void;
+  adapter(): RuntimeAdapter | null;
+  binding(): AdapterBinding | null;
+  observe(): Promise<ObservationV3>;
   action(
     execution: SkillExecutionView,
     action: GameAction,
     signal: AbortSignal,
     callId: string,
   ): Promise<GameActionResult>;
-  recipes(item: string): Promise<Json>;
+  queryCapability(id: string, version: number, args: Json): Promise<Json>;
   cancelActions(
     executionIds: ReadonlySet<string>,
     reason: string,
   ): Promise<void>;
   changed(outcome: boolean, execution?: SkillExecutionView): void;
   unsafe(): void;
-  recover(execution: SkillExecutionView, result: GameActionResult): Promise<number>;
+  recover(execution: SkillExecutionView, result: GameActionResult): Promise<EffectScope>;
   prepareLookahead?(config: LookaheadConfig): (executionId: string) => void;
 }
 interface Live {
@@ -59,6 +67,8 @@ interface Live {
   cleanupFailure: Error | null;
   pending: boolean;
   lifeId: number;
+  scope: EffectScope;
+  invocation: EffectInvocation;
 }
 const terminal = new Set<SkillExecutionView["status"]>([
   "succeeded",
@@ -69,6 +79,7 @@ const terminal = new Set<SkillExecutionView["status"]>([
 ]);
 /** Durable identities and host-authorized capabilities; no worker owns the avatar lease. */
 export class SkillManager {
+  private readonly registrations = new WeakMap<RuntimeAdapter, RegisteredAdapterContract>();
   private live = new Map<string, Live>();
   private cleanupFailures = new Set<Error>();
   private trace: ExecutionTrace;
@@ -80,12 +91,34 @@ export class SkillManager {
   get pending(): boolean {
     return this.live.size > 0;
   }
+  private context() {
+    const adapter = this.host.adapter(), binding = this.host.binding();
+    if (!adapter || !binding?.ready) throw new RuntimeFault("precondition_failed", "A negotiated adapter contract is required");
+    let registration = this.registrations.get(adapter);
+    if (!registration) { registration = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas); this.registrations.set(adapter, registration); }
+    if (registration.compatibility.compatibility_hash !== binding.compatibility_hash)
+      throw new RuntimeFault("precondition_failed", "Executable and native adapter profiles do not match");
+    return { adapter, binding, registration, descriptor: adapter.descriptor, schemas: adapter.schemas };
+  }
+  private compatible(skill: SkillView): void {
+    const context = this.context(), validation = assertExecutableCompatible(skill.validation, context.binding);
+    if (validation.fingerprint !== programFingerprint(skill.hash, "skill", context.binding.compatibility_hash))
+      throw new RuntimeFault("precondition_failed", "Cached source validation is incompatible; retain history and create a fresh immutable revision");
+  }
+  effectScope(executionId: string): EffectScope | null {
+    const live = this.live.get(executionId);
+    return live && !live.controller.signal.aborted && !live.root.controller.signal.aborted && !terminal.has(live.view.status) &&
+      Date.now() < Date.parse(live.root.view.deadline_at) ? live.scope : null;
+  }
+  invocation(executionId: string): EffectInvocation | null {
+    return this.effectScope(executionId) ? this.live.get(executionId)!.invocation : null;
+  }
   async register(
     runId: string,
     spec: unknown,
     beforeCommit: () => void = () => {},
   ): Promise<SkillView> {
-    const validated = await validateSkill(spec);
+    const validated = await validateSkill(spec, this.context());
     this.validateDependencies(runId, validated.dependencies);
     beforeCommit();
     const view = this.store.registerSkill(runId, validated);
@@ -97,12 +130,13 @@ export class SkillManager {
     snapshot: SkillView,
     beforeCommit: () => void = () => {},
   ): Promise<SkillView> {
+    this.compatible(snapshot);
     const validated = await validateSkill({
       name: snapshot.name,
       source: snapshot.source,
       card: snapshot.card,
       dependencies: snapshot.dependencies,
-    });
+    }, this.context());
     if (
       validated.source !== snapshot.source ||
       createHash("sha256").update(snapshot.source).digest("hex") !==
@@ -140,6 +174,7 @@ export class SkillManager {
       if ((visited.get(key) ?? 0) >= depth) return;
       visited.set(key, depth);
       const dependency = this.store.skill(runId, ref);
+      this.compatible(dependency);
       if (dependency.state !== "validated")
         throw new Error("Dependency is not validated");
       if (dependency.validation.runtime_version !== SKILL_API_VERSION)
@@ -154,7 +189,13 @@ export class SkillManager {
       start_key: parsed.start_key,
     });
     if (existing) return this.store.admitSkill(runId, parsed).view;
-    this.host.authorize(runId, parsed.epoch, parsed.session_id, parsed.life_id);
+    const selected = this.store.skill(runId, parsed);
+    this.compatible(selected);
+    const run = this.store.getRun(runId);
+    if (!run) throw new RuntimeFault("not_found", "Run not found");
+    this.host.authorize({ session_id: parsed.session_id, world_id: run.world_id, epoch: parsed.epoch,
+      native_boot_id: parsed.native_boot_id, run_id: runId, run_generation: parsed.run_generation,
+      life_id: parsed.life_id, space_epoch: parsed.space_epoch });
     const armLookahead = parsed.lookahead
       ? this.host.prepareLookahead?.(parsed.lookahead) : undefined;
     if (parsed.lookahead && !armLookahead)
@@ -243,6 +284,10 @@ export class SkillManager {
       cleanupFailure: null,
       pending: false,
       lifeId: view.life_id!,
+      scope: { session_id: view.session_id!, world_id: view.world_id!, epoch: view.epoch, native_boot_id: view.native_boot_id!,
+        run_id: view.run_id, run_generation: view.run_generation!, life_id: view.life_id!, space_epoch: view.space_epoch!,
+        execution_id: view.execution_id, source_hash: skill.hash },
+      invocation: { kind: "skill", execution_id: view.execution_id, source_hash: skill.hash },
     };
     live.root = parent?.root ?? live;
     parent?.children.add(live);
@@ -284,6 +329,8 @@ export class SkillManager {
               onTrace: (trace) => {
                 this.trace.record(view, "branch", trace as unknown as Json, { life_id: live.lifeId });
               },
+              api: { api_version: 4, action_enabled: this.context().adapter.action_capability !== null,
+                supports_respawn: this.context().adapter.supports_respawn, bindings: this.context().adapter.bindings },
             },
           ),
         );
@@ -314,7 +361,8 @@ export class SkillManager {
             ),
           );
           view.status = live.cleanupFailure ? "unknown" : "failed";
-          view.error = "Skill execution or trusted capability failed";
+          view.diagnostic = programDiagnostic(error, skill.hash);
+          view.error = view.diagnostic.message;
           if (!live.cleanupFailure)
             view.result = {
               status: "failed",
@@ -337,6 +385,7 @@ export class SkillManager {
           live,
           "skill.closed",
           outcome?.summary ?? view.error ?? "Skill execution closed",
+          view.diagnostic ? { diagnostic: view.diagnostic as unknown as Json } : {},
         );
         this.live.delete(view.execution_id);
         parent?.children.delete(live);
@@ -374,7 +423,7 @@ export class SkillManager {
       Date.now() >= Date.parse(live.root.view.deadline_at)
     )
       throw new Error("Skill authority revoked");
-    this.host.authorize(live.view.run_id, live.view.epoch, live.view.session_id!, live.lifeId);
+    this.host.authorize(live.scope);
   }
   private consume(live: Live, action: boolean): void {
     const root = live.root;
@@ -428,12 +477,18 @@ export class SkillManager {
             this.trace.observe(live.view, observation, context);
           }
           break;
-        case "recipes":
-          result = await this.host.recipes(request.item);
+        case "adapter": {
+          const context = this.context();
+          if (!context.adapter.bindings.some(binding => binding.capability_id === request.capability_id && binding.version === request.version))
+            throw new RuntimeFault("precondition_failed", "This adapter read capability is not registered");
+          const args = context.registration.parseCapability(request.capability_id, request.version, request.args);
+          result = await this.host.queryCapability(request.capability_id, request.version, args);
           break;
+        }
         case "respawn":
         case "action": {
           const respawning = request.kind === "respawn" || request.action.kind === "respawn";
+          if (respawning && !this.context().adapter.supports_respawn) throw new RuntimeFault("precondition_failed", "This adapter has no respawn capability");
           if (respawning && live !== live.root)
             throw new Error("Only an explicitly selected recovery root can respawn");
           const action = await this.host.action(
@@ -445,7 +500,8 @@ export class SkillManager {
           if (respawning && action.status === "succeeded") {
             if (live.controller.signal.aborted)
               throw new Error("Recovery authority revoked");
-            live.lifeId = await this.host.recover(live.view, action);
+            live.scope = await this.host.recover(live.view, action);
+            live.lifeId = live.scope.life_id;
           }
           result = action as unknown as Json;
           this.trace.record(live.view, "capability_result", { ok: true, result }, { ...context, life_id: live.lifeId });
@@ -490,6 +546,7 @@ export class SkillManager {
           if (live.depth >= live.root.view.limits.max_depth)
             throw new Error("Root composition depth exhausted");
           const dependency = declared[0]!;
+          this.compatible(dependency);
           if (dependency.state !== "validated")
             throw new Error("Dependency no longer validated");
           if (dependency.validation.runtime_version !== SKILL_API_VERSION)
@@ -503,6 +560,10 @@ export class SkillManager {
               epoch: live.view.epoch,
               session_id: live.view.session_id!,
               life_id: live.lifeId,
+              native_boot_id: live.scope.native_boot_id,
+              run_generation: live.scope.run_generation,
+              space_epoch: live.scope.space_epoch,
+              compatibility_hash: this.context().binding.compatibility_hash,
               args: request.args,
               limits: live.root.view.limits,
             },
@@ -533,7 +594,7 @@ export class SkillManager {
       return result;
     } catch (error) {
       if (!resultRecorded)
-        this.trace.record(live.view, "capability_result", { ok: false, result: null }, { ...context, life_id: live.lifeId });
+        this.trace.record(live.view, "capability_result", { ok: false, result: capabilityFailure(error) }, { ...context, life_id: live.lifeId });
       throw error;
     } finally {
       this.trace.span(live.view, "capability_wait", started, performance.now(), { ...context, life_id: live.lifeId });

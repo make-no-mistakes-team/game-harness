@@ -2,13 +2,13 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Observation } from "../src/shared/contracts.ts";
+import type { ObservationV3 } from "../src/shared/contracts.ts";
 import type { SkillView } from "../src/shared/programs.ts";
 import { SkillManager } from "../src/server/skills.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
-import { emptyRunUsage } from "../src/server/usage.ts";
+import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 
 const resources: { manager: SkillManager; planner: SpeculativePlanning; store: Store; directory: string }[] = [];
 afterEach(async () => {
@@ -27,23 +27,12 @@ for (const scenario of [
 ] as const) {
 test(`real durable ${scenario.activation} admission after ${scenario.order} preserves running predecessor and fresh game guard`, async () => {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-plan-admission-"));
-  const store = new Store(directory);
-  const run: StoredRun = {
-    run_id: crypto.randomUUID(), session_id: "session", life_id: 1,
-    world_id: "world", epoch: 1, task: "Observe authorized state", goal: "custom", model_id: "fixture-model",
-    status: "running", started_at: new Date().toISOString(), ended_at: null,
-    turns: 0, model_status: "idle", error: null, usage: emptyRunUsage(), baseline: {},
-  };
+  const store = new Store(directory), adapter = minecraftTestAdapter();
+  const run = minecraftRunFixture(adapter, { task: "Observe authorized state" });
+  const goal = adapter.goals.find(goal => goal.goal_id === "custom")!;
   store.saveRun(run);
   let sequence = 0;
-  const observe = async (): Promise<Observation> => ({
-    schema_version: 2, session_id: "session", world_id: "world", epoch: 1,
-    life: { life_id: 1, status: "alive", can_respawn: false, death: null },
-    observation_seq: ++sequence, captured_at: new Date().toISOString(),
-    profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r2",
-    player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: 20, food: 20, on_ground: true, in_water: false, inventory: [] },
-    blocks: [], entities: [], sounds: [], coverage: { partial: true, max_age_ms: 1000 },
-  });
+  const observe = async (): Promise<ObservationV3> => minecraftObservationFixture(adapter, { observation_seq: ++sequence });
   const started = Promise.withResolvers<void>();
   const continueRoot = Promise.withResolvers<void>();
   const continued = Promise.withResolvers<void>();
@@ -69,12 +58,14 @@ test(`real durable ${scenario.activation} admission after ${scenario.order} pres
     } finally { signal?.removeEventListener("abort", onAbort); }
   };
   const manager = new SkillManager(store, { runSkill: runner }, {
-    authorize: (runId, epoch, sessionId, lifeId) => {
-      if (runId !== run.run_id || epoch !== 1 || sessionId !== "session" || lifeId !== 1 || run.status !== "running") throw new Error("Revoked admission");
+    authorize: scope => {
+      if (scope.run_id !== run.run_id || scope.epoch !== 1 || scope.session_id !== "session" || scope.life_id !== 1 ||
+        scope.native_boot_id !== run.native_boot_id || scope.space_epoch !== run.space_epoch || run.status !== "running") throw new Error("Revoked admission");
     },
+    adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
     observe,
     action: async () => { throw new Error("No effects are permitted in this regression"); },
-    recipes: async () => [],
+    queryCapability: async () => [],
     recover: async () => { throw new Error("No recovery in this regression"); },
     cancelActions: async () => {},
     prepareLookahead: (config) => planner.prepareOptIn(config),
@@ -87,15 +78,18 @@ test(`real durable ${scenario.activation} admission after ${scenario.order} pres
     unsafe: () => { unsafe.push("Unconfirmed cleanup"); },
   });
   planner = new SpeculativePlanning({
+    contract: () => adapter,
     admissionContext: () => ({
       run_id: run.run_id, generation: 1, session_id: "session", world_id: "world", epoch: 1,
-      life_id: 1, life_status: "alive", task: run.task, goal: run.goal,
+      life_id: 1, life_status: "alive", task: run.task, goal,
+      native_boot_id: run.native_boot_id!, space_epoch: run.space_epoch!, compatibility_hash: run.compatibility_hash!, screen: null,
     }),
     context: () => {
       const root = store.latestRootExecution(run.run_id);
       return root ? {
         run_id: run.run_id, generation: 1, session_id: "session", world_id: "world", epoch: 1,
-        life_id: 1, life_status: "alive", task: run.task, goal: run.goal,
+        life_id: 1, life_status: "alive", task: run.task, goal,
+        native_boot_id: run.native_boot_id!, space_epoch: run.space_epoch!, compatibility_hash: run.compatibility_hash!, screen: null,
         root: { execution_id: root.execution_id, skill_id: root.skill_id, version: root.version, hash: store.skill(run.run_id, root).hash, status: root.status },
       } : null;
     },
@@ -119,7 +113,7 @@ test(`real durable ${scenario.activation} admission after ${scenario.order} pres
   });
   const rootRequest = {
     skill_id: rootSource.skill_id, version: rootSource.version, start_key: "predecessor",
-    session_id: "session", life_id: 1, epoch: 1, args: "predecessor",
+    ...executionScopeFixture(run), args: "predecessor",
     limits: { duration_ms: 10_000, max_actions: 1, max_calls: 2, max_depth: 1 },
     lookahead: { after_ms: 0, reason: "Independent follow-up", activation: scenario.activation, budget: { calls: 2, tools: 4, duration_ms: 10_000 } },
   };

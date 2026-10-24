@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { GameActionResult, Json, Observation } from "../src/shared/contracts.ts";
+import { Worker } from "node:worker_threads";
+import type { GameActionResult, Json, ObservationV3 } from "../src/shared/contracts.ts";
 import type {
   SkillLimits,
   SkillRef,
@@ -15,7 +16,15 @@ import {
   SkillCleanupError,
   type SandboxService,
 } from "../src/server/sandbox.ts";
-import { emptyRunUsage } from "../src/server/usage.ts";
+import { RuntimeFault } from "../src/server/runtime-fault.ts";
+import { ProgramWorkspace } from "../src/server/program-workspace.ts";
+import { instrumentProgram, ProgramTraceReceiver } from "../src/server/program-instrumentation.ts";
+import { DEFAULT_EVALUATION_CAPS } from "../src/evaluation/config.ts";
+import { ModelProgramEvidence } from "../src/evaluation/model-evidence.ts";
+import { capabilityFailure } from "../src/server/program-diagnostics.ts";
+import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
+
+const adapter = minecraftTestAdapter();
 
 const resources: { directory: string; store: Store; manager: SkillManager }[] =
   [];
@@ -40,51 +49,79 @@ const success: GameActionResult = {
   evidence: { effect_confirmed: true },
 };
 type Runner = SandboxService["runSkill"];
-function authorizedObservation(): Observation {
-  return {
-    schema_version: 2, session_id: "fixture-session", world_id: "fixture-world",
-    epoch: 1, life: { life_id: 1, status: "alive", can_respawn: false, death: null },
-    observation_seq: 1, captured_at: new Date().toISOString(),
-    profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r2",
-    player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: 20, food: 20, on_ground: true, in_water: false, inventory: [] },
-    blocks: [], entities: [], sounds: [], coverage: { partial: true, max_age_ms: 1000 },
-  };
+// Real generated-worker protocol, without claiming Docker isolation or starting
+// an external service. Only the transport below SkillManager is substituted.
+const generatedWorker: Runner = async (source, args, handle, _limits, signal, hooks) => {
+  const program = instrumentProgram(source);
+  const receiver = new ProgramTraceReceiver(program);
+  hooks?.onInstrumentation?.(program);
+  const worker = new Worker(new URL("../sandbox/worker.mjs", import.meta.url), {
+    workerData: { mode: "skill", source: program.execution_source, source_hash: program.source_hash, args,
+      api: hooks!.api,
+      instrumentation: { hook_name: program.hook_name, scope: program.scope,
+        kinds: program.points.map(point => point.kind) } },
+    stdout: true, stderr: true,
+  });
+  const done = Promise.withResolvers<SkillResult>();
+  const watchdog = AbortSignal.timeout(3000);
+  const expired = () => done.reject(new Error("Generated worker did not complete its protocol"));
+  watchdog.addEventListener("abort", expired, { once: true });
+  signal?.addEventListener("abort", expired, { once: true });
+  worker.on("error", done.reject);
+  worker.on("exit", code => done.reject(new Error(`Generated worker exited before completion: ${code}`)));
+  worker.on("message", (encoded: string) => {
+    void (async () => {
+      const frame = JSON.parse(encoded);
+      hooks?.onTrace?.(receiver.accept(frame.trace));
+      if (frame.type === "skill_call") {
+        try {
+          const value = await handle(frame.request);
+          worker.postMessage({ v: 1, type: "skill_reply", id: frame.id, ok: true, value });
+        } catch (error) {
+          // Match the existing bounded public sandbox reply; never forward the
+          // host exception or its stack to generated code.
+          const failure = capabilityFailure(error);
+          worker.postMessage({ v: 1, type: "skill_reply", id: frame.id, ok: false, error: failure });
+        }
+      } else if (frame.type === "skill_result") {
+        receiver.finish(null);
+        done.resolve(frame.result);
+      } else done.reject(new Error("Generated worker failed instead of handling capability rejection"));
+    })().catch(done.reject);
+  });
+  try {
+    return await done.promise;
+  } finally {
+    watchdog.removeEventListener("abort", expired);
+    signal?.removeEventListener("abort", expired);
+    await worker.terminate();
+  }
+};
+function authorizedObservation(): ObservationV3 {
+  return minecraftObservationFixture(adapter, { session_id: "fixture-session", world_id: "fixture-world" });
 }
 function fixture(runner: Runner, overrides: Partial<SkillHost> = {}) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-skills-"));
   const store = new Store(directory);
-  const run: StoredRun = {
-    run_id: crypto.randomUUID(),
-    world_id: crypto.randomUUID(),
-    epoch: 1,
-    session_id: "fixture-session",
-    life_id: 1,
-    task: "Measure bounded neutral capabilities",
-    goal: "custom",
-    model_id: "fixture-model",
-    status: "running",
-    started_at: new Date().toISOString(),
-    ended_at: null,
-    turns: 0,
-    model_status: "idle",
-    error: null,
-    usage: emptyRunUsage(),
-    baseline: {},
-  };
+  const run = minecraftRunFixture(adapter, { world_id: "fixture-world", session_id: "fixture-session", task: "Measure bounded neutral capabilities" });
   store.saveRun(run);
   let unsafe = 0;
   const host: SkillHost = {
-    authorize: (runId, epoch) => {
+    authorize: context => {
       if (
-        runId !== run.run_id ||
-        epoch !== run.epoch ||
+        context.run_id !== run.run_id || context.world_id !== run.world_id ||
+        context.epoch !== run.epoch || context.session_id !== run.session_id ||
+        context.native_boot_id !== run.native_boot_id || context.life_id !== run.life_id ||
+        context.space_epoch !== run.space_epoch || context.run_generation !== 1 ||
         run.status !== "running"
       )
         throw new Error("Authority revoked");
     },
+    adapter: () => adapter,
+    binding: () => minecraftTestBinding(adapter),
     observe: async () => authorizedObservation(),
     action: async () => success,
-    recipes: async () => [],
+    queryCapability: async () => [],
     recover: async () => { throw new Error("No respawn in this fixture"); },
     cancelActions: async () => {},
     changed: () => {},
@@ -149,15 +186,103 @@ function start(
     skill_id: skill.skill_id,
     version: skill.version,
     start_key,
-    epoch: run.epoch,
-    session_id: run.session_id!,
-    life_id: run.life_id!,
+    ...executionScopeFixture(run),
     args,
     limits,
   };
 }
 
 describe("durable program execution through host capabilities", () => {
+  test("caught trusted capability failures survive successful real-worker execution in the finalized correlated private journal", async () => {
+    const trusted = new RuntimeFault("precondition_failed", "Observation is not available in the current life");
+    trusted.stack = "HOST_STACK_SECRET at /private/host/trusted-capability.ts:42";
+    const arbitrary = new Error("HOST_MESSAGE_SECRET /private/host/credentials.json");
+    arbitrary.stack = "HOST_STACK_SECRET at /private/host/backend.ts:99";
+    const { directory, store, run, manager } = fixture(generatedWorker, {
+      observe: async () => { throw trusted; },
+      queryCapability: async () => { throw arbitrary; },
+    });
+    const stops: string[] = [];
+    const observer = new ModelProgramEvidence(store, directory, DEFAULT_EVALUATION_CAPS,
+      "test-host-clock", (_runId, reason) => { stops.push(reason); });
+    try {
+      const skill = await manager.register(run.run_id, {
+        name: "caught capability failures", card, dependencies: [],
+        source: `
+let handled = 0;
+try { await game.observe(); }
+catch (error) {
+  if (error.code !== "precondition_failed" || error.message !== "Observation is not available in the current life") throw error;
+  handled++;
+}
+try { await game.recipes("crafting_table"); }
+catch (error) {
+  if (error.code !== "backend_unavailable" || error.message !== "Trusted capability could not complete safely") throw error;
+  handled++;
+}
+return {status:"completed", summary:"Continued after two safely handled rejections", result:{handled}};
+`,
+      });
+      const accepted = manager.start(run.run_id, start(run, skill, "caught-private-evidence"));
+      await closed(store, run.run_id, accepted.execution_id);
+      const outcome = manager.get(run.run_id, { execution_id: accepted.execution_id })!;
+      expect(outcome).toMatchObject({ status: "succeeded", result: {
+        status: "completed", result: { handled: 2 },
+      } });
+      expect(outcome).not.toHaveProperty("diagnostic");
+      const finalized = await observer.finalize(run.run_id, { status: "completed", reason: "caught_rejections" });
+      expect(finalized.evidence_complete).toBe(true);
+      expect(stops).toEqual([]);
+      const journal = readFileSync(join(directory, finalized.journal), "utf8");
+      const traces = journal.trim().split("\n").map(line => JSON.parse(line))
+        .filter(record => record.kind === "authorized_execution_evidence_before_trace_caps")
+        .map(record => record.value);
+      const requests = traces.filter(trace => trace.kind === "capability_request");
+      const failures = traces.filter(trace => trace.kind === "capability_result" && trace.payload.ok === false);
+      expect(requests).toHaveLength(2);
+      expect(failures).toHaveLength(2);
+      for (const [index, expected] of [
+        { code: "precondition_failed", message: "Observation is not available in the current life" },
+        { code: "backend_unavailable", message: "Trusted capability could not complete safely" },
+      ].entries()) {
+        expect(failures[index]).toMatchObject({
+          run_id: run.run_id, execution_id: accepted.execution_id, root_execution_id: accepted.execution_id,
+          hash: skill.hash, session_id: run.session_id, life_id: run.life_id,
+          call_id: requests[index].call_id, capability: requests[index].capability,
+          payload: { ok: false, result: expected },
+        });
+        expect(typeof failures[index].call_id).toBe("string");
+        expect(failures[index].call_id.length).toBeGreaterThan(0);
+      }
+      expect(failures[0].call_id).not.toBe(failures[1].call_id);
+      for (const secret of ["HOST_STACK_SECRET", "HOST_MESSAGE_SECRET", "/private/host/", "node:internal"])
+        expect(journal).not.toContain(secret);
+    } finally {
+      await observer.close();
+    }
+  });
+
+  test("trusted capability diagnostics survive failure cleanup, durable inspection and skill outcome evidence", async () => {
+    const { store, run, manager } = fixture(async (_source, _args, handle) => {
+      await handle({ kind: "observe" });
+      return completed;
+    }, { observe: async () => { throw new RuntimeFault("precondition_failed", "Observation is not available in the current life"); } });
+    const skill = await register(manager, run.run_id, "diagnostic reader");
+    const accepted = manager.start(run.run_id, start(run, skill, "diagnostic-reader"));
+    await closed(store, run.run_id, accepted.execution_id);
+    const outcome = manager.get(run.run_id, { execution_id: accepted.execution_id })!;
+    expect(outcome.status).toBe("failed");
+    const inspected = new ProgramWorkspace(store, run.run_id).executionView(outcome);
+    expect(inspected).toMatchObject({ diagnostic: {
+      code: "precondition_failed", message: "Observation is not available in the current life",
+      source_hash: store.skill(run.run_id, skill).hash,
+    } });
+    const event = store.eventsAfter(run.run_id, 0, 500).find(event => event.type === "skill.closed");
+    expect(JSON.stringify(event?.details)).toContain("Observation is not available in the current life");
+    expect(JSON.stringify(inspected)).not.toContain("skills.ts");
+    expect(JSON.stringify(inspected)).not.toContain("node:internal");
+  });
+
   test("safely failed leaf actions and blocked children remain structured results the parent can handle", async () => {
     let child: SkillRef,
       actions = 0,

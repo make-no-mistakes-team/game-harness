@@ -1,4 +1,4 @@
-import type { GameAction, GameActionResult } from "../shared/contracts.ts";
+import type { GameAction, GameActionResult, ReportedUsage, RequestUsageEvidence } from "../shared/contracts.ts";
 import { receiptedInventoryDelta } from "../server/objective-metrics.ts";
 import type { StoredAction } from "../server/store.ts";
 
@@ -44,42 +44,108 @@ export function classifyEvaluation(evidence: OutcomeEvidence): EvaluationOutcome
   };
 }
 
-export interface ReportedUsage {
-  uncached_input: number | null;
-  cache_read: number | null;
-  cache_write: number | null;
-  output: number | null;
-}
 export interface UsageMetrics extends ReportedUsage {
+  schema_version: 2;
   admissions: number;
   reported_messages: number;
   /** Actual reported subtotals remain useful even when the complete total is unknown. */
   reported_subtotal: ReportedUsage;
-  coverage: "complete" | "incomplete";
+  event_coverage: "complete" | "incomplete";
+  consumption_coverage: "known" | "partial" | "unknown";
+  consumption_scope: "observed_logical_admissions";
   wire_attempts: null;
   subscription_cost: null;
 }
 const tokenKeys = ["uncached_input", "cache_read", "cache_write", "output"] as const;
-const validCounter = (value: number | null): value is number => value !== null && Number.isSafeInteger(value) && value >= 0;
+const validCounter = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 
-export function usageMetrics(admissions: number, messages: readonly ReportedUsage[], allAdmissionsReported: boolean): UsageMetrics {
+export function usageMetrics(input: { admissions: number; admitted_request_ids: readonly string[];
+  messages: readonly RequestUsageEvidence[]; events_omitted: boolean;
+  /** Finalized terminal facts without an SDK usage-message event. */
+  additional_terminal_evidence?: readonly RequestUsageEvidence[] }): UsageMetrics {
+  const { admissions } = input;
   if (!validCounter(admissions)) throw new Error("Usage admissions must be a nonnegative safe integer");
-  const subtotal: ReportedUsage = { uncached_input: 0, cache_read: 0, cache_write: 0, output: 0 };
-  for (const key of tokenKeys) {
-    subtotal[key] = messages.every(message => validCounter(message[key]))
-      ? messages.reduce((sum, message) => sum + message[key]!, 0) : null;
+  const ids = new Set(input.admitted_request_ids);
+  const messages = new Map<string, RequestUsageEvidence>();
+  for (const message of input.messages) {
+    if (ids.has(message.request_id) && !messages.has(message.request_id)) messages.set(message.request_id, message);
   }
-  const complete = allAdmissionsReported && (admissions === 0 || messages.length > 0);
+  const eventComplete = !input.events_omitted && ids.size === admissions && messages.size === admissions;
+  const consumption = input.additional_terminal_evidence?.length ? new Map(messages) : messages;
+  for (const evidence of input.additional_terminal_evidence ?? []) {
+    if (!ids.has(evidence.request_id)) continue;
+    const prior = consumption.get(evidence.request_id);
+    consumption.set(evidence.request_id, prior === undefined ? evidence : {
+      ...prior, provider_terminal: prior.provider_terminal ?? evidence.provider_terminal,
+      unaccounted_response_ids: prior.unaccounted_response_ids.length ? prior.unaccounted_response_ids : evidence.unaccounted_response_ids,
+    });
+  }
+  const consumptionObserved = !input.events_omitted && ids.size === admissions && consumption.size === admissions;
+  const subtotal: ReportedUsage = { uncached_input: null, cache_read: null, cache_write: null, output: null };
+  const totals: ReportedUsage = { uncached_input: null, cache_read: null, cache_write: null, output: null };
+  for (const key of tokenKeys) {
+    for (const message of messages.values()) {
+      const value = message.sdk_reported?.[key];
+      if (validCounter(value)) subtotal[key] = (subtotal[key] ?? 0) + value;
+    }
+    if (admissions === 0) subtotal[key] = 0;
+    if (subtotal[key] !== null && !validCounter(subtotal[key])) subtotal[key] = null;
+    if (consumptionObserved) {
+      let sum = 0, known = true;
+      for (const message of consumption.values()) {
+        const value = message.provider_terminal?.counters[key];
+        if (message.unaccounted_response_ids.length || !validCounter(value)) { known = false; break; }
+        sum += value;
+      }
+      if (known && validCounter(sum)) totals[key] = sum;
+    }
+  }
   return {
-    admissions, reported_messages: messages.length,
-    uncached_input: complete ? subtotal.uncached_input : null,
-    cache_read: complete ? subtotal.cache_read : null,
-    cache_write: complete ? subtotal.cache_write : null,
-    output: complete ? subtotal.output : null,
+    schema_version: 2, admissions, reported_messages: messages.size, ...totals,
     reported_subtotal: subtotal,
-    coverage: complete && tokenKeys.every(key => subtotal[key] !== null) ? "complete" : "incomplete",
+    event_coverage: eventComplete ? "complete" : "incomplete",
+    consumption_coverage: tokenKeys.every(key => totals[key] !== null) ? "known"
+      : tokenKeys.some(key => totals[key] !== null) ? "partial" : "unknown",
+    consumption_scope: "observed_logical_admissions",
     wire_attempts: null, subscription_cost: null,
   };
+}
+
+/** Pure qualification; old event coverage never establishes terminal provenance.
+ * Historical objects and their original labels/bytes are not mutated.
+ */
+export function readUsageMetrics(value: unknown): UsageMetrics | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const data = value as Record<string, unknown>;
+  const counters = (input: unknown): ReportedUsage | null => {
+    if (input === null || typeof input !== "object" || Array.isArray(input)) return null;
+    const object = input as Record<string, unknown>;
+    if (!tokenKeys.every(key => object[key] === null || validCounter(object[key]))) return null;
+    return { uncached_input: object.uncached_input as number | null, cache_read: object.cache_read as number | null,
+      cache_write: object.cache_write as number | null, output: object.output as number | null };
+  };
+  const subtotal = counters(data.reported_subtotal), totals = counters(data);
+  if (!validCounter(data.admissions) || !validCounter(data.reported_messages) || subtotal === null || totals === null ||
+    data.wire_attempts !== null || data.subscription_cost !== null) return null;
+  if (data.schema_version === undefined) {
+    if (data.coverage !== "complete" && data.coverage !== "incomplete") return null;
+    const zero = data.admissions === 0 && data.reported_messages === 0;
+    return { schema_version: 2, admissions: data.admissions, reported_messages: data.reported_messages,
+      uncached_input: zero ? 0 : null, cache_read: zero ? 0 : null, cache_write: zero ? 0 : null, output: zero ? 0 : null,
+      reported_subtotal: subtotal, event_coverage: data.coverage, consumption_coverage: zero ? "known" : "unknown",
+      consumption_scope: "observed_logical_admissions", wire_attempts: null, subscription_cost: null };
+  }
+  if (data.schema_version !== 2 || Object.hasOwn(data, "coverage") ||
+    data.consumption_scope !== "observed_logical_admissions" ||
+    !["complete", "incomplete"].includes(String(data.event_coverage)) ||
+    !["known", "partial", "unknown"].includes(String(data.consumption_coverage)) ||
+    data.reported_messages > data.admissions ||
+    data.event_coverage === "complete" && data.reported_messages !== data.admissions) return null;
+  const derived = tokenKeys.every(key => totals[key] !== null) ? "known" : tokenKeys.some(key => totals[key] !== null) ? "partial" : "unknown";
+  if (derived !== data.consumption_coverage) return null;
+  return { schema_version: 2, admissions: data.admissions, reported_messages: data.reported_messages, ...totals,
+    reported_subtotal: subtotal, event_coverage: data.event_coverage as UsageMetrics["event_coverage"],
+    consumption_coverage: derived, consumption_scope: "observed_logical_admissions", wire_attempts: null, subscription_cost: null };
 }
 
 export interface ActionReceiptSample {
@@ -190,19 +256,32 @@ export function costToResult(attempts: readonly CostAttempt[]) {
   const totals: ReportedUsage = { uncached_input: 0, cache_read: 0, cache_write: 0, output: 0 };
   for (const key of tokenKeys) totals[key] = included.every(attempt => attempt.usage !== null && attempt.usage[key] !== null)
     ? included.reduce((sum, attempt) => sum + attempt.usage![key]!, 0) : null;
+  const subtotal: ReportedUsage = { uncached_input: null, cache_read: null, cache_write: null, output: null };
+  for (const key of tokenKeys) {
+    for (const attempt of included) {
+      const value = attempt.usage?.reported_subtotal[key];
+      if (validCounter(value)) subtotal[key] = (subtotal[key] ?? 0) + value;
+    }
+    if (!included.length) subtotal[key] = 0;
+    if (totals[key] !== null && !validCounter(totals[key])) totals[key] = null;
+    if (subtotal[key] !== null && !validCounter(subtotal[key])) subtotal[key] = null;
+  }
   return { result_observed: first >= 0, attempts_to_result: first >= 0 ? included.length : null,
     attempts_included: included.length, unsuccessful_attempts_included: included.filter(attempt => attempt.outcome.goal_verified !== true).length,
     admissions: included.every(attempt => attempt.usage !== null)
       ? included.reduce((sum, attempt) => sum + attempt.usage!.admissions, 0) : null, ...totals,
+    reported_subtotal: subtotal, consumption_scope: "observed_logical_admissions" as const,
     wire_attempts: null, subscription_cost: null,
     limitations: ["Includes all recorded attempts through the first verified result; no success means a censored sample, not zero cost.",
       "Actual subscription monetary cost and provider wire retries are unknown."] };
 }
 
-export function catalogEstimate(usage: ReportedUsage, prices: { uncached_input: number; cache_read: number; cache_write: number; output: number } | null) {
-  const known = prices !== null && tokenKeys.every(key => usage[key] !== null && Number.isFinite(prices[key]) && prices[key] >= 0);
+export function catalogEstimate(usage: UsageMetrics, prices: { uncached_input: number; cache_read: number; cache_write: number; output: number } | null) {
+  const known = usage.schema_version === 2 && usage.consumption_coverage === "known" && prices !== null &&
+    tokenKeys.every(key => validCounter(usage[key]) && Number.isFinite(prices[key]) && prices[key] >= 0);
+  const estimate = known ? tokenKeys.reduce((sum, key) => sum + usage[key]! * prices![key] / 1_000_000, 0) : null;
   return { kind: "catalog_token_price_estimate" as const,
-    estimate: known ? tokenKeys.reduce((sum, key) => sum + usage[key]! * prices![key] / 1_000_000, 0) : null,
+    estimate: estimate !== null && Number.isFinite(estimate) ? estimate : null,
     actual_subscription_cost: null,
     limitations: ["Catalog per-million-token arithmetic is an estimate, not an invoice or subscription allowance measurement."] };
 }

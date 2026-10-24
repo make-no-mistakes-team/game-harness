@@ -9,13 +9,15 @@ import type {
   BridgeNotice,
   GameBridge,
   GameState,
-  Observation,
+  ObservationV3,
 } from "../src/shared/contracts.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import { Runtime } from "../src/server/runtime.ts";
 import { Store } from "../src/server/store.ts";
 import type { AuthManager } from "../src/server/auth.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
+import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
+import type { Database } from "bun:sqlite";
 const resources: { runtime: Runtime; store: Store; directory: string }[] = [];
 afterEach(async () => {
   for (const resource of resources.splice(0)) {
@@ -25,43 +27,13 @@ afterEach(async () => {
   }
 });
 
-test("a pending program stays compact and unpolled, and native first-cause survives cleanup until successful explicit resume", async () => {
+test("a pending program stays unpolled and native first-cause remains immutable across a replacement-session new run", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-scheduler-")),
-    store = new Store(directory);
+    store = new Store(directory), adapter = minecraftTestAdapter();
   const worldId = crypto.randomUUID();
-  const observation: Observation = {
-    schema_version: 2,
-    session_id: "fixture-session",
-    life: { life_id: 1, status: "alive", can_respawn: false, death: null },
-    world_id: worldId,
-    epoch: 1,
-    observation_seq: 1,
-    captured_at: new Date().toISOString(),
-    profile_id: "player-observable-structured",
-    preset_id: "minecraft-observable-initial-r2",
-    player: {
-      position: { x: 0, y: 64, z: 0 },
-      yaw: 0,
-      pitch: 0,
-      health: 20,
-      food: 20,
-      on_ground: true,
-      in_water: false,
-      inventory: [],
-    },
-    blocks: [
-      {
-        id: "observed-block",
-        name: "stone",
-        position: { x: 0, y: 63, z: 0 },
-        observed_at: new Date().toISOString(),
-        current: true,
-      },
-    ],
-    entities: [],
-    sounds: [],
-    coverage: { partial: true, max_age_ms: 1000 },
-  };
+  const observation = minecraftObservationFixture(adapter, { world_id: worldId, session_id: "fixture-session" });
+  observation.data.blocks.push({ target: { target_id: "observed-block", incarnation: 1, space: observation.space, life_id: 1 },
+    name: "stone", position: { x: .5, y: 63.5, z: .5 }, observed_at: new Date().toISOString(), current: true });
   let state: GameState = {
     status: "connected",
     username: "Fixture",
@@ -70,7 +42,7 @@ test("a pending program stays compact and unpolled, and native first-cause survi
     epoch: 1,
     session_id: observation.session_id,
     life: observation.life,
-    motor_profile: "balanced",
+    binding: minecraftTestBinding(adapter), space: observation.space, screen: null, presentation: adapter.projectObservation(observation),
     video: {
       status: "idle",
       width: 0,
@@ -81,7 +53,6 @@ test("a pending program stays compact and unpolled, and native first-cause survi
       error: null,
     },
     last_observation_at: observation.captured_at,
-    player: observation.player,
     error: null,
   };
   const gameListeners = new Set<(notice: BridgeNotice) => void>();
@@ -109,8 +80,8 @@ test("a pending program stays compact and unpolled, and native first-cause survi
     },
     cancel: async () => {},
     neutralize: async () => {},
-    setMotorProfile: async () => {},
-    recipes: async () => [],
+    adapter: () => adapter,
+    emergencyStop: async () => {},
     subscribe: (listener) => {
       gameListeners.add(listener);
       return () => {
@@ -152,7 +123,7 @@ test("a pending program stays compact and unpolled, and native first-cause survi
         initialized = true;
         expect(context.phase).toBe("running");
         const observed = await tools.find((tool) => tool.name === "observe")!.execute("observe", {});
-        expect(observed.details.player).toMatchObject({ health: 20 });
+        expect(observed.details.data.player).toMatchObject({ health: 20 });
         await tools
           .find((tool) => tool.name === "program_write")!
           .execute("register", {
@@ -251,12 +222,12 @@ test("a pending program stays compact and unpolled, and native first-cause survi
       return await abort.promise;
     },
   } as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {});
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
   resources.push({ runtime, store, directory });
   await runtime.initialize();
   const created = await runtime.createRun({
     task: "Observe without gameplay effects",
-    goal: "custom",
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")!,
     model_id: "fixture-model",
   });
   store.subscribe((event) => {
@@ -287,20 +258,18 @@ test("a pending program stays compact and unpolled, and native first-cause survi
       execution_id: runtime.snapshot()?.executions[0]?.execution_id,
     });
   }
-  const historical = store.admitAction(
-    created.run_id,
-    "historical-strategist-evidence",
-    { kind: "look", yaw: 0.5, pitch: 0 },
-    "strategist",
-  ).action.view;
-  historical.status = "succeeded";
-  historical.ended_at = new Date().toISOString();
-  historical.result = {
+  const historical = { action_id: "historical-strategist-evidence", kind: "look", origin: "strategist", execution_id: null,
+    session_id: observation.session_id, life_id: 1, status: "succeeded", summary: "Retained historical fixture evidence",
+    started_at: null, ended_at: new Date().toISOString(), result: {
     status: "succeeded",
     summary: "Retained historical fixture evidence",
     evidence: null,
-  };
-  store.saveAction(created.run_id, historical);
+  } };
+  // Seed retained bytes, never use the current executable admission API to
+  // manufacture an obsolete strategist command.
+  const database: Database = Reflect.get(store, "db");
+  database.query("INSERT INTO actions(run_id,action_id,fingerprint,request,view) VALUES(?,?,?,?,?)").run(created.run_id,
+    historical.action_id, "historical-read-only", JSON.stringify({ kind: "look", yaw: .5, pitch: 0 }), JSON.stringify(historical));
   const diagnostic = await tools
     .find((tool) => tool.name === "program_inspect")!
     .execute("historical-read", {
@@ -310,8 +279,8 @@ test("a pending program stays compact and unpolled, and native first-cause survi
   expect(diagnostic.details).not.toHaveProperty("execution_id");
   expect(gameExecutions).toBe(2);
   expect(contexts[0]?.observation).toBeUndefined();
-  expect(contexts[0]?.player).toBeDefined();
-  expect(JSON.stringify(contexts)).not.toContain("observed-block");
+  expect(contexts[0]?.player).toBeUndefined();
+  expect(contexts[0]?.adapter_state).toMatchObject({ player: { health: 20 }, blocks: [{ target: { target_id: "observed-block" } }] });
   for (let index = 0; index < 10; index++)
     for (const listener of gameListeners)
       listener({ type: "observation", data: null });
@@ -343,15 +312,25 @@ test("a pending program stays compact and unpolled, and native first-cause survi
   expect(runtime.snapshot()?.status).toBe("paused");
   expect(runtime.snapshot()?.error).toBe(firstCause);
   expect(runtime.snapshot()?.executions[0]?.status).toBe("cancelled");
-  state = { ...state, status: "connected", epoch: 2, session_id: "fixture-reconnected-session", error: null };
+  state = { ...state, status: "connected", epoch: 2, session_id: "fixture-reconnected-session", binding: minecraftTestBinding(adapter, "replacement-native-boot"), error: null };
   observation.epoch = 2;
   observation.session_id = "fixture-reconnected-session";
+  observation.native_boot_id = "replacement-native-boot";
   failNextAgent = true;
-  await runtime.control(created.run_id, "resume");
+  await expect(runtime.control(created.run_id, "resume")).rejects.toMatchObject({ code: "precondition_failed" });
   expect(runtime.snapshot()?.status).toBe("paused");
   expect(runtime.snapshot()?.error).toBe(firstCause);
-  await runtime.control(created.run_id, "resume");
+  await runtime.control(created.run_id, "stop");
+  // Stop finishes the old transport owner. Only an explicit replacement
+  // connection after that drain can supply authority for the new run.
+  state = { ...state, status: "connected", epoch: 2, session_id: "fixture-reconnected-session", binding: minecraftTestBinding(adapter, "replacement-native-boot"), error: null };
+  const replacement = await runtime.createRun({ task: "Explicit new replacement-session authority", goal: adapter.goals.find(goal => goal.goal_id === "custom")!,
+    model_id: "fixture-model", working_programs: "fresh" });
+  await runtime.control(replacement.run_id, "start");
+  expect(runtime.snapshot()?.status).toBe("paused");
+  expect(store.getRun(created.run_id)?.error).toBe(firstCause);
+  await runtime.control(replacement.run_id, "resume");
   expect(runtime.snapshot()?.status).toBe("running");
   expect(runtime.snapshot()?.error).toBeNull();
-  await runtime.control(created.run_id, "stop");
+  await runtime.control(replacement.run_id, "stop");
 });

@@ -9,8 +9,11 @@ const cardSchema = z.object({
   method: z.string().trim().min(1).max(2000), reason: z.string().trim().min(1).max(1000), limitations: z.string().trim().min(1).max(1000),
 }).strict();
 export const programWriteSchema = z.object({
-  name: z.string().trim().min(1).max(80), source: z.string().min(1).max(16384), card: cardSchema,
-  dependencies: z.array(programSelectorSchema).max(32), based_on: z.int().positive().optional(),
+  name: z.string().trim().min(1).max(80), source: z.string().min(1).max(16384), card: cardSchema.default({
+    purpose: "Unspecified by author", applicability: "Unspecified by author", method: "See immutable source",
+    reason: "Unspecified by author", limitations: "Untested; no efficacy or applicability claim",
+  }),
+  dependencies: z.array(programSelectorSchema).max(32).default([]), based_on: z.int().positive().optional(),
   reason: z.string().trim().min(1).max(2000).optional(),
 }).strict();
 export const nextConfigSchema = lookaheadConfigSchema.extend({ activation: z.enum(["manual", "on_predecessor_success"]).default("manual") }).strict();
@@ -34,7 +37,6 @@ export const programInspectSchema = z.discriminatedUnion("view", [
   z.object({ view: z.literal("comparison"), before: programSelectorSchema, after: programSelectorSchema, after_sample: page.after, limit: page.limit }).strict(),
   z.object({ view: z.literal("planning") }).strict(),
   z.object({ view: z.literal("action"), ...executionSelection }).strict(),
-  z.object({ view: z.literal("recipes"), item: z.string().regex(/^[a-z][a-z0-9_]{0,79}$/) }).strict(),
 ]);
 export const programReviewSchema = programSelectorSchema.extend({ decision: z.enum(["keep", "insufficient_evidence"]), reason: z.string().trim().min(1).max(2000) }).strict();
 export const taskFinishSchema = z.object({ summary: z.string().trim().min(1).max(2000) }).strict();

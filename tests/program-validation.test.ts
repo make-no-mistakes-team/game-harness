@@ -2,7 +2,6 @@ import { expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import {
-  PROGRAM_LIMITS,
   ProgramValidationError,
   validateProgramSource,
   validateSkill,
@@ -13,6 +12,18 @@ import {
   MAX_SKILL_LIMITS,
 } from "../src/shared/programs.ts";
 import type { SkillSpec } from "../src/shared/programs.ts";
+import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
+import { policySpecSchema } from "../src/shared/validation.ts";
+
+const fixtureContract = minecraftTestAdapter();
+test("browser-safe policy source validation retains exact UTF-8 byte bounds", () => {
+  const spec = { backend: "javascript", choices: null, name: "UTF-8 schema boundary", priority: 0, interval_ms: 200,
+    card: { purpose: "Byte contract", applicability: "Schema-only", method: "Count actual UTF-8", reason: "No Node browser dependency", limitations: "No execution claim" } };
+  expect(policySpecSchema.safeParse({ ...spec, source: "😀".repeat(8192) }).success).toBe(true);
+  expect(policySpecSchema.safeParse({ ...spec, source: "😀".repeat(8192) + "x" }).success).toBe(false);
+  expect(policySpecSchema.safeParse({ ...spec, source: "é".repeat(16384) }).success).toBe(true);
+  expect(policySpecSchema.safeParse({ ...spec, source: "é".repeat(16384) + "x" }).success).toBe(false);
+});
 
 function specification(
   source = 'return {status:"completed",summary:"Finished",result:null};',
@@ -54,44 +65,41 @@ return { status: "completed", summary: text, result: [pattern.source, template] 
 `.replaceAll("\\`", "`");
   const spec = specification(source);
   spec.card.method = "Explain // and /* without changing executable source";
-  const admitted = await validateSkill(spec);
-  expect(admitted.source).toContain("https://example.test/*literal*/");
-  expect(admitted.source).toContain("// plain text /* still plain text */");
+  const admitted = await validateSkill(spec, fixtureContract);
+  expect(new Function(admitted.source)()).toMatchObject({
+    summary: "https://example.test/*literal*/",
+    result: [String.raw`\/\/|\/\*|\*\/`, "// plain text /* still plain text */"],
+  });
   expect(admitted.card).toEqual(spec.card);
 });
 
-test("all executable line, block and template-expression comments are rejected with locations", async () => {
+test("documented bodies admit executable comments without weakening body isolation", async () => {
   for (const source of [
     "return null; // trailing note",
     "/* leading note */ return null;",
     "return `text ${1 /* hidden */}`;",
     "return /x/;\n// note",
     "return null;\n<!-- legacy line comment",
+    "<!-- leading legacy comment\nreturn null;\n--> closing legacy comment",
+    'return "<!-- literal -->"; // keep literal markers',
   ]) {
-    const error = await rejection(
-      validateProgramSource(source, "skill"),
-      "comments_forbidden",
-    );
-    expect(error.issues[0]?.location?.line).toBeGreaterThanOrEqual(1);
-    expect(error.issues[0]?.location?.column).toBeGreaterThanOrEqual(1);
+    const admitted = await validateProgramSource(source, "skill", fixtureContract);
+    expect(admitted.hash).toBe(createHash("sha256").update(admitted.source).digest("hex"));
+    expect(await validateProgramSource(admitted.source, "skill", fixtureContract)).toEqual(admitted);
+    expect(new Function(admitted.source)()).toEqual(new Function(source)());
   }
 });
 
 test("async bodies can observe, await local helpers, and compose named dependencies", async () => {
-  const admitted = await validateSkill(
-    specification(`
-async function inspect() { return await game.observe(); }
-const observation = await inspect();
-await game.progress("Observed", {present: Boolean(observation)});
-return await game.call({name: "child", version: 3}, args);
-`),
-  );
-  expect(admitted.source).toContain("await game.observe()");
-  expect(admitted.source).toContain("await game.call(");
+  const admitted = await validateSkill(specification(`
+  async function inspect() { return await game.observe(); }
+  const observation = await inspect();
+  await game.progress("Observed", {present: Boolean(observation)});
+  return await game.call({name: "child", version: 3}, args);
+  `), fixtureContract);
   expect(admitted.dependencies).toEqual([
     { skill_id: "child-skill", version: 3 },
   ]);
-  expect(admitted.validation.complexity).toBe(1);
 });
 
 test("imports, exports and dynamic imports are prohibited in every function", async () => {
@@ -102,7 +110,7 @@ test("imports, exports and dynamic imports are prohibited in every function", as
     'async function nested() { return await import("node:fs"); } return nested();',
     "return import.meta;",
   ]) {
-    await rejection(validateProgramSource(source, "skill"), "forbidden_syntax");
+    await rejection(validateProgramSource(source, "skill", fixtureContract), "forbidden_syntax");
   }
 });
 
@@ -122,18 +130,15 @@ test("ambient APIs are forbidden but ordinary property names and literal text ar
       source.includes("this") || source.includes("import(")
         ? "forbidden_syntax"
         : "forbidden_api";
-    await rejection(validateProgramSource(source, "skill"), expected);
+    await rejection(validateProgramSource(source, "skill", fixtureContract), expected);
   }
-  await validateProgramSource(
-    'return {process:"fetch", require:"import", nested: args.process};',
-    "skill",
-  );
+  await validateProgramSource('return {process:"fetch", require:"import", nested: args.process};', "skill", fixtureContract);
   await rejection(
-    validateProgramSource("return {process};", "skill"),
+    validateProgramSource("return {process};", "skill", fixtureContract),
     "forbidden_api",
   );
   await rejection(
-    validateProgramSource('return args["x"] + globalThis;', "skill"),
+    validateProgramSource('return args["x"] + globalThis;', "skill", fixtureContract),
     "forbidden_api",
   );
 });
@@ -142,7 +147,7 @@ test("syntax errors and wrapper escapes return safe structured errors without so
   const secret = "PRIVATE_FIXTURE_VALUE";
   for (const source of [`const ${secret} = ;`, `} ${secret}(); {`]) {
     const error = await rejection(
-      validateProgramSource(source, "skill"),
+      validateProgramSource(source, "skill", fixtureContract),
       "invalid_syntax",
     );
     expect(JSON.stringify(error.issues)).not.toContain(secret);
@@ -152,133 +157,82 @@ test("syntax errors and wrapper escapes return safe structured errors without so
   }
 });
 
-test("canonical nonblank line limits cannot be bypassed with minification", async () => {
-  const accepted = await validateProgramSource(
-    "args;".repeat(PROGRAM_LIMITS.formatted_lines),
-    "skill",
-  );
-  expect(accepted.validation.formatted_lines).toBe(
-    PROGRAM_LIMITS.formatted_lines,
-  );
-  const error = await rejection(
-    validateProgramSource(
-      "args;".repeat(PROGRAM_LIMITS.formatted_lines + 1),
-      "skill",
-    ),
-    "formatted_lines_limit",
-  );
-  expect(error.issues[0]?.limit).toEqual({ maximum: 80, actual: 81 });
-  const whitespace = await validateProgramSource(
-    "\n\nargs;\n\nreturn null;\n\n",
-    "skill",
-  );
-  expect(whitespace.validation.formatted_lines).toBe(2);
+test("ordinary coherent bodies may exceed eighty canonical lines within the byte cap", async () => {
+  const body = `let total = 0;\n${"total += 1;\n".repeat(100)}return total;`;
+  const admitted = await validateProgramSource(body, "skill", fixtureContract);
+  expect(new Function(admitted.source)()).toBe(100);
 });
 
 test("source bounds count UTF-8 bytes and apply to exact canonical bytes as well", async () => {
+  const sourceBytes = 16 * 1024;
   const prefix = 'return "';
   const suffix = '";\n';
   const source =
     prefix +
     "x".repeat(
-      PROGRAM_LIMITS.source_bytes - Buffer.byteLength(prefix + suffix),
+      sourceBytes - Buffer.byteLength(prefix + suffix),
     ) +
     suffix;
-  const admitted = await validateProgramSource(source, "skill");
-  expect(Buffer.byteLength(admitted.source)).toBe(PROGRAM_LIMITS.source_bytes);
+  const admitted = await validateProgramSource(source, "skill", fixtureContract);
+  expect(Buffer.byteLength(admitted.source)).toBe(sourceBytes);
   await rejection(
-    validateProgramSource(source + " ", "skill"),
+    validateProgramSource(source + " ", "skill", fixtureContract),
     "source_bytes_limit",
   );
   await rejection(
-    validateProgramSource(`return "${"😀".repeat(5000)}";`, "skill"),
+    validateProgramSource(`return "${"😀".repeat(5000)}";`, "skill", fixtureContract),
     "source_bytes_limit",
   );
-  const canonicalExpansion = `return "${"x".repeat(PROGRAM_LIMITS.source_bytes - 10)}";`;
+  const canonicalExpansion = `return "${"x".repeat(sourceBytes - 10)}";`;
   expect(Buffer.byteLength(canonicalExpansion)).toBe(
-    PROGRAM_LIMITS.source_bytes,
+    sourceBytes,
   );
   await rejection(
-    validateProgramSource(canonicalExpansion, "skill"),
+    validateProgramSource(canonicalExpansion, "skill", fixtureContract),
     "source_bytes_limit",
   );
 });
 
-test("statement nesting accepts four levels and rejects five even on one line", async () => {
+test("ordinary nested control flow is admitted beyond four levels", async () => {
   const nested = (depth: number) =>
     "if (args) {".repeat(depth) + "return null;" + "}".repeat(depth);
-  const admitted = await validateProgramSource(nested(4), "skill");
-  expect(admitted.validation.nesting).toBe(4);
-  await rejection(validateProgramSource(nested(5), "skill"), "nesting_limit");
-  await rejection(
-    validateProgramSource("{".repeat(5) + "args;" + "}".repeat(5), "skill"),
-    "nesting_limit",
-  );
+  const admitted = await validateProgramSource(nested(7), "skill", fixtureContract);
+  expect(new Function("args", admitted.source)(true)).toBeNull();
 });
 
-test("cyclomatic complexity is bounded per function rather than aggregated across helpers", async () => {
-  const branches = (count: number) => "if (args) args;".repeat(count);
-  const admitted = await validateProgramSource(
-    branches(11) + "return null;",
-    "skill",
-  );
-  expect(admitted.validation.complexity).toBe(12);
-  await rejection(
-    validateProgramSource(branches(12), "skill"),
-    "complexity_limit",
-  );
-  const helpers = await validateProgramSource(
-    `function first() {${branches(7)}} function second() {${branches(7)}} return null;`,
-    "skill",
-  );
-  expect(helpers.validation.complexity).toBe(8);
-  await rejection(
-    validateProgramSource(
-      `function helper() {${branches(12)}} return null;`,
-      "skill",
-    ),
-    "complexity_limit",
-  );
-  await rejection(
-    validateProgramSource(
-      "return " + Array(13).fill("args").join(" && ") + ";",
-      "skill",
-    ),
-    "complexity_limit",
-  );
+test("helper bodies with more than twelve branches preserve ordinary results", async () => {
+  const source = `function count(value) {
+    let result = 0;
+    ${Array.from({ length: 20 }, (_, index) => `if (value > ${index}) result++;`).join("\n")}
+    return result;
+  }
+  return count(args);`;
+  const admitted = await validateProgramSource(source, "skill", fixtureContract);
+  expect(new Function("args", admitted.source)(17)).toBe(17);
 });
 
 test("canonical source, byte hash and source/config fingerprint are deterministic and idempotent", async () => {
-  const one = await validateProgramSource(
-    "const value=await game.observe();return value;",
-    "skill",
-  );
-  const two = await validateProgramSource(
-    "const value = await game.observe();\nreturn value;",
-    "skill",
-  );
-  const three = await validateProgramSource(one.source, "skill");
+  const one = await validateProgramSource("const value=await game.observe();return value;", "skill", fixtureContract);
+  const two = await validateProgramSource("const value = await game.observe();\nreturn value;", "skill", fixtureContract);
+  const three = await validateProgramSource(one.source, "skill", fixtureContract);
   expect(one).toEqual(two);
   expect(one).toEqual(three);
   expect(one.hash).toBe(createHash("sha256").update(one.source).digest("hex"));
   expect(one.validation.fingerprint).toMatch(/^[a-f0-9]{64}$/);
-  const skill = await validateProgramSource("return null;", "skill");
-  const policy = await validateProgramSource("return null;", "policy");
+  const skill = await validateProgramSource("return null;", "skill", fixtureContract);
+  const policy = await validateProgramSource("return null;", "policy", fixtureContract);
   expect(skill.source).toBe(policy.source);
   expect(skill.validation.fingerprint).not.toBe(policy.validation.fingerprint);
-  await validateProgramSource(
-    'const next = await Promise.resolve(state); return {kind:"continue", reason: context.reason};',
-    "policy",
-  );
+  await validateProgramSource('const next = await Promise.resolve(state); return {kind:"continue", reason: context.reason};', "policy", fixtureContract);
 });
 
 test("canonicalization preserves multiline template literal contents including leading spaces", async () => {
   const source = "return `first\n  indented\nplain\n    four spaces`;";
-  const admitted = await validateProgramSource(source, "skill");
+  const admitted = await validateProgramSource(source, "skill", fixtureContract);
   expect(new Function(admitted.source)()).toBe(
     "first\n  indented\nplain\n    four spaces",
   );
-  expect(await validateProgramSource(admitted.source, "skill")).toEqual(
+  expect(await validateProgramSource(admitted.source, "skill", fixtureContract)).toEqual(
     admitted,
   );
 });
@@ -294,7 +248,7 @@ test("canonicalization preserves ordinary locally tagged css, html and gql templ
     "gql`query Fixture{viewer{id name}}`",
     "];",
   ].join("\n");
-  const admitted = await validateProgramSource(source, "skill");
+  const admitted = await validateProgramSource(source, "skill", fixtureContract);
   expect(new Function(admitted.source)()).toEqual([
     "a{color:red; margin:0}",
     '<div   class="fixture"><span> value </span></div>',
@@ -304,7 +258,7 @@ test("canonicalization preserves ordinary locally tagged css, html and gql templ
 
 test("skill metadata requires a full strict StrategyCard and nonblank bounded name", async () => {
   const valid = specification();
-  await validateSkill(valid);
+  await validateSkill(valid, fixtureContract);
   for (const spec of [
     { ...valid, name: " " },
     { ...valid, name: "x".repeat(81) },
@@ -314,7 +268,7 @@ test("skill metadata requires a full strict StrategyCard and nonblank bounded na
     { ...valid, card: { ...valid.card, method: "x".repeat(2001) } },
     { ...valid, card: { ...valid.card, source: "Not a card field" } },
   ]) {
-    await rejection(validateSkill(spec), "invalid_metadata");
+    await rejection(validateSkill(spec, fixtureContract), "invalid_metadata");
   }
 });
 
@@ -331,7 +285,7 @@ test("dependencies require unique exact immutable positive safe integer versions
     [{ skill_id: "child-skill", version: 1, range: "*" }],
   ]) {
     await rejection(
-      validateSkill({ ...valid, dependencies }),
+      validateSkill({ ...valid, dependencies }, fixtureContract),
       "invalid_metadata",
     );
   }
@@ -339,10 +293,10 @@ test("dependencies require unique exact immutable positive safe integer versions
     validateSkill({
       ...valid,
       dependencies: [valid.dependencies[0], valid.dependencies[0]],
-    }),
+    }, fixtureContract),
     "invalid_dependencies",
   );
-  const admitted = await validateSkill(valid);
+  const admitted = await validateSkill(valid, fixtureContract);
   valid.dependencies[0]!.version = 99;
   expect(admitted.dependencies).toEqual([
     { skill_id: "child-skill", version: 3 },

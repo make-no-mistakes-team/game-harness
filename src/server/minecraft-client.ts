@@ -13,7 +13,9 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { DATA_DIR } from "./config.ts";
 import { z } from "zod";
-import type { MotorProfile } from "../shared/contracts.ts";
+import type { AdapterSchemaCatalog, MotorProfile, RuntimeAdapter } from "../shared/contracts.ts";
+import { readNativeArtifactContract, type NativeArtifactContract } from "./native-artifact.ts";
+import { assertNativeContractFresh } from "./native-contract.ts";
 
 export const JAVA = process.env.JAVA_HOME
   ? path.resolve(process.env.JAVA_HOME, "bin", "java")
@@ -24,6 +26,9 @@ export interface NativeOptions {
   dataDir?: string;
   java?: string;
   sourceMinecraft?: string;
+  descriptor?: unknown;
+  schemas?: AdapterSchemaCatalog;
+  adapter?: RuntimeAdapter;
   onTiming?: (
     name: "observation_read_ms" | "action_round_trip_ms",
     elapsedMs: number,
@@ -91,6 +96,7 @@ export async function prepareNativeMod(
   projectRoot: string,
   directory: string,
   signal?: AbortSignal,
+  prepared?: NativeArtifactContract,
 ) {
   const artifact = path.join(
     projectRoot,
@@ -100,8 +106,12 @@ export async function prepareNativeMod(
     throw new Error(
       "Build the pinned GameHarness Fabric mod before preparing Minecraft.",
     );
+  const actual = prepared ?? await readNativeArtifactContract(artifact);
+  if (!prepared) await assertNativeContractFresh(projectRoot, actual.resource);
   await mkdir(path.join(directory, "mods"), { recursive: true, mode: 0o700 });
   await copyFile(artifact, path.join(directory, "mods/gameharness-native.jar"));
+  const installedHash = createHash("sha256").update(await readFile(path.join(directory, "mods/gameharness-native.jar"))).digest("hex");
+  if (installedHash !== actual.artifact_sha256) throw new Error("Installed native artifact bytes differ from the prepared contract artifact");
   const api = path.join(directory, "mods/fabric-api.jar");
   if (!(await exists(api))) {
     const url = `https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/${FABRIC_API}/fabric-api-${FABRIC_API}.jar`;
@@ -210,6 +220,7 @@ export class MinecraftClient {
     controlPort: number,
     videoPort: number,
     signal: AbortSignal,
+    prepared?: NativeArtifactContract,
   ): Promise<NativeProcess> {
     signal.throwIfAborted();
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
@@ -218,6 +229,7 @@ export class MinecraftClient {
       this.projectRoot,
       this.directory,
       signal,
+      prepared,
     );
     const version = JSON.parse(
       await readFile(

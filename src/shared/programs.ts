@@ -2,7 +2,7 @@ import type {
   GameAction,
   GameActionResult,
   Json,
-  Observation,
+  ObservationV3,
   StrategyCard,
 } from "./contracts.ts";
 import type { LookaheadConfig } from "./planning.ts";
@@ -12,11 +12,17 @@ export interface SkillRef {
   version: number;
 }
 
-export const SKILL_API_VERSION = 3;
+export const SKILL_API_VERSION = 4;
 
 export interface NamedProgramRef {
   name: string;
   version?: number;
+}
+export interface SkillAPIManifest {
+  api_version: 4;
+  action_enabled: boolean;
+  supports_respawn: boolean;
+  bindings: readonly { name: string; capability_id: string; version: number; parameters: readonly string[] }[];
 }
 
 /** Selects same-session, same-model definitions only, never prior execution state. */
@@ -64,6 +70,9 @@ export interface SkillView extends SkillRef {
     formatted_lines: number;
     complexity: number;
     nesting: number;
+    api_version?: number;
+    validator_version?: number;
+    compatibility_hash?: string;
   };
   created_at: string;
 }
@@ -76,11 +85,10 @@ export interface SkillResult {
 
 /** Host-bound API supplied to skill bodies; await one call at a time. */
 export interface GameAPI {
-  observe(): Promise<Observation>;
+  observe(): Promise<ObservationV3>;
   action(action: GameAction): Promise<GameActionResult>;
   /** Explicit vanilla request through the same exclusive action arbiter. */
   respawn(): Promise<GameActionResult>;
-  recipes(item: string): Promise<Json>;
   call(skill: NamedProgramRef, args: Json): Promise<SkillResult>;
   progress(summary: string, details: Json): Promise<null>;
 }
@@ -90,6 +98,10 @@ export interface SkillStartRequest extends SkillRef {
   epoch: number;
   session_id: string;
   life_id: number;
+  native_boot_id: string;
+  run_generation: number;
+  space_epoch: number;
+  compatibility_hash: string;
   args: Json;
   limits: SkillLimits;
   /** Explicit one-shot lookahead opt-in; omission creates no planning request. */
@@ -99,6 +111,7 @@ export interface SkillStartRequest extends SkillRef {
 export interface SkillExecutionView extends SkillRef {
   execution_id: string;
   run_id: string;
+  world_id: string | null;
   start_key: string;
   parent_execution_id: string | null;
   root_execution_id: string;
@@ -106,6 +119,11 @@ export interface SkillExecutionView extends SkillRef {
   /** Null only for historical records predating life attribution. */
   session_id: string | null;
   life_id: number | null;
+  native_boot_id: string | null;
+  run_generation: number | null;
+  space_epoch: number | null;
+  source_hash: string | null;
+  compatibility_hash: string | null;
   args: Json;
   limits: SkillLimits;
   status:
@@ -124,12 +142,13 @@ export interface SkillExecutionView extends SkillRef {
   calls: number;
   result: SkillResult | null;
   error: string | null;
+  diagnostic?: { type: string; message: string; source_hash: string; location: { mapping: "unmapped" }; code?: string };
 }
 
 export type SkillCapabilityRequest =
   | { kind: "observe" }
   | { kind: "respawn" }
   | { kind: "action"; action: GameAction }
-  | { kind: "recipes"; item: string }
+  | { kind: "adapter"; capability_id: string; version: number; args: Json }
   | { kind: "call"; skill: NamedProgramRef; args: Json }
   | { kind: "progress"; summary: string; details: Json };

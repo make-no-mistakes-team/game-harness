@@ -40,9 +40,19 @@
   Preserve archived dialogues verbatim in their original language; write new
   summaries in English. Dialogue claims about third-party APIs or performance
   still require source evidence or actual measurements.
+- A user-designated research or design source takes precedence over conflicting
+  project design and workflow rules. Reconcile those rules when the user
+  authorizes the change; keep factual claims separate from requirements and
+  preserve private-source publication boundaries.
 - When a decision changes, reconcile affected documentation and examples instead
   of accumulating contradictory descriptions. Preserve useful historical
   evidence with its original scope; do not present it as current verification.
+- Keep the approved ordinary-module, disclosed-helper, RGB-profile, prepared
+  development-task, checkpoint-recovery and explicit compatible cross-model
+  reuse requirements distinct from the current compact-body implementation.
+  Jev is optional; the first complete autonomous chain must work without it.
+  Current limits and unavailable modes belong in implementation sections,
+  not as permanent reductions of the product requirements.
 - Before editing agent instruction files, also read and apply
   `writing-for-agents`.
 
@@ -55,10 +65,17 @@ limits or models, or reporting cost/results, read and follow the canonical
 - Workers hand off edits without running checks, builds, providers or services.
   The parent runs the smallest affected checks after handoff and a combined final
   regression/build only when relevant inputs changed.
-- Preserve platform results and agent outcomes independently. After two
-  unsuccessful live attempts on one technical hypothesis, stop unless concrete
-  new platform evidence authorizes another attempt; a prompt/model change alone
-  does not reset the limit.
+- Preserve platform results and agent outcomes independently. Diagnostic live
+  attempts stop after two unsuccessful attempts on one technical hypothesis
+  unless concrete new platform evidence authorizes another attempt; a
+  prompt/model change alone does not reset the limit. Predeclared finite
+  experimental cohorts use the separate study-admission rules in the canonical
+  policy, retaining every scheduled outcome rather than stopping at a preferred
+  result or relabeling diagnostic retries.
+- Use a registered immutable manifest and assigned slot for study execution.
+  Admission-only mode exercises governance without a model or game; initial
+  live study support is cold fresh-world whole-agent execution. Read the
+  canonical policy's capability limits before selecting another condition.
 - Record finite limits and actual usage before making claims. Retain failed
   attempts and unknown costs; never repeat a paid control just to obtain a pass.
 

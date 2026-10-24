@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
-import type { ActivityEvent } from "../shared/contracts.ts";
+import type { ActivityEvent, ObservationV3, ReportedUsage, RequestUsageEvidence } from "../shared/contracts.ts";
 import type { TraceRecord } from "../shared/execution-evidence.ts";
 import type { Store } from "../server/store.ts";
 import type { Runtime } from "../server/runtime.ts";
@@ -10,10 +10,33 @@ import type { AuthManager } from "../server/auth.ts";
 import { objectiveMetrics } from "../server/objective-metrics.ts";
 import type { EvaluationCaps } from "./contracts.ts";
 import type { GoalAction } from "./scenarios.ts";
-import { actionMetrics, usageMetrics, type ActionMetrics, type MeasuredInterval, type ReportedUsage, type UsageMetrics, type WaitCategory } from "./results.ts";
+import { actionMetrics, readUsageMetrics, usageMetrics, type ActionMetrics, type MeasuredInterval, type UsageMetrics, type WaitCategory } from "./results.ts";
+import { PrivateJournal, type JournalLimits } from "./private-journal.ts";
 
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const counter = (value: unknown): number | null => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+
+/** Append-only derived evidence. Never settles an attempt or changes admission governance. */
+export async function writeUsageQualification(input: { directory: string;
+  original: { attempt_id: string; report_path: string; sha256: string };
+  usage: UsageMetrics; reasons: readonly string[] }): Promise<string> {
+  if (!/^[a-zA-Z0-9_-]{1,200}$/.test(input.original.attempt_id) || !/^[a-f0-9]{64}$/.test(input.original.sha256) ||
+    !input.reasons.length || input.reasons.length > 32 || input.reasons.some(reason => !reason || reason.length > 500))
+    throw new Error("Qualification requires bounded original identity, SHA-256 and reasons");
+  const usage = readUsageMetrics(input.usage);
+  if (usage === null) throw new Error("Qualification requires valid version-2 usage metrics");
+  const original = await readFile(path.resolve(input.directory, input.original.report_path));
+  if (createHash("sha256").update(original).digest("hex") !== input.original.sha256)
+    throw new Error("Original report hash does not match qualification identity");
+  const name = `usage-qualification-${input.original.attempt_id}-${input.original.sha256}.json`;
+  await writeFile(path.join(input.directory, name), JSON.stringify({
+    schema_version: 1, kind: "derived_usage_qualification", original: input.original, usage,
+    reasons: [...input.reasons], limitations: ["Original report labels, outcomes, bytes and settled rows are unchanged.",
+      "Observed logical admission accounting is not all-wire consumption or a subscription invoice."],
+  }, null, 2), { mode: 0o600, flag: "wx" });
+  return name;
+}
+
 interface OpenSpan { run_id: string; start_ms: number; category: WaitCategory }
 interface ToolObservation { run_id: string; name: string; tool_call_id: string; arguments: unknown; arguments_sha256: string; omission: string | null }
 export interface EvidenceSummary {
@@ -49,9 +72,16 @@ export class ModelProgramEvidence {
   private readonly admissions = new Map<string, number>();
   private readonly actionCache = new Map<string, Map<string, GoalAction>>();
   private readonly providerFailures = new Set<string>();
+  private readonly modelObservationFailures = new Set<string>();
   private readonly stopRequested = new Set<string>();
+  private readonly journals = new Map<string, PrivateJournal>();
+  private readonly unsubscribeTrace: () => void;
   constructor(readonly store: Store, readonly directory: string, readonly caps: EvaluationCaps,
-    readonly clockId: string, private readonly stop: (runId: string, reason: string) => void) {
+    readonly clockId: string, private readonly stop: (runId: string, reason: string) => void,
+    private readonly options: { limits?: JournalLimits } = {}) {
+    this.unsubscribeTrace = store.subscribeTraceEvidence(input => {
+      this.journal(input.run_id).append("authorized_execution_evidence_before_trace_caps", input);
+    });
     this.unsubscribe = store.subscribe(event => {
       if (!event.run_id) return;
       try { this.observeEvent(event); }
@@ -61,10 +91,25 @@ export class ModelProgramEvidence {
       }
     });
   }
+  private journal(runId: string) {
+    let journal = this.journals.get(runId);
+    if (!journal) {
+      journal = new PrivateJournal(this.directory, runId, (id, why) => {
+        this.observerError = why; this.stop(id, why);
+      }, this.options.limits);
+      this.journals.set(runId, journal);
+    }
+    return journal;
+  }
   bindRuntime(runtime: Runtime) { this.runtime = runtime; }
+  recordObservation(runId: string, observation: ObservationV3) {
+    this.journal(runId).append("authorized_evaluation_observation", { observation });
+  }
   private omit(key: string) { this.omissions[key] = (this.omissions[key] ?? 0) + 1; }
   private observeEvent(event: ActivityEvent) {
     const runId = event.run_id!, data = object(event.details), now = performance.now();
+    this.journal(runId).append("store_event", event);
+    if (event.type === "runtime.model_observation_failed") this.modelObservationFailures.add(runId);
     if (event.type.startsWith("action.") && typeof data.action_id === "string") {
       const action = this.store.getAction(runId, data.action_id);
       if (action) {
@@ -113,7 +158,15 @@ export class ModelProgramEvidence {
     this.restoreAuthFactory = () => { auth.createAgent = original; };
   }
   private observeAgent(agent: Agent, runId: string) {
+    this.agentSubscriptions.push(agent.addBeforeModelCall(context => {
+      if (!this.journal(runId).append("final_sdk_visible_context_not_wire_payload", context))
+        return { stop: true, reason: "private_journal_evidence_unavailable" };
+    }));
     this.agentSubscriptions.push(agent.subscribe(event => {
+      // Only SDK-visible conversation/tool events. No launcher logs, API keys,
+      // transport options, auth database contents or hidden evaluator state.
+      if (["message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(event.type))
+        this.journal(runId).append("visible_agent_event", event);
       if (event.type === "tool_execution_end" && event.isError) {
         const details = object(object(event.result).details), error = object(details.error);
         this.toolFailures.push({ run_id: runId, tool: event.toolName, tool_call_id: event.toolCallId,
@@ -182,24 +235,47 @@ export class ModelProgramEvidence {
     const events = this.events(runId);
     const admitted = events.filter(event => event.type === "model.call");
     const reported = events.filter(event => event.type === "model.usage");
-    const messages: ReportedUsage[] = reported.map(event => {
+    const readMessage = (event: ActivityEvent): RequestUsageEvidence[] => {
       const data = object(event.details);
-      return { uncached_input: counter(data.uncached_input_tokens), cache_read: counter(data.cache_read_tokens),
-        cache_write: counter(data.cache_write_tokens), output: counter(data.output_tokens) };
-    });
-    const usageIds = new Set(reported.map(event => object(event.details).request_id).filter(id => typeof id === "string"));
+      if (typeof data.request_id !== "string") return [];
+      const evidence = object(data.usage_evidence), terminal = object(evidence.provider_terminal);
+      const readCounters = (value: unknown): ReportedUsage => {
+        const fields = object(value);
+        return { uncached_input: counter(fields.uncached_input), cache_read: counter(fields.cache_read),
+          cache_write: counter(fields.cache_write), output: counter(fields.output) };
+      };
+      const bound = evidence.schema_version === 1 && evidence.request_id === data.request_id &&
+        Array.isArray(evidence.unaccounted_response_ids) && evidence.unaccounted_response_ids.length <= 34 &&
+        evidence.unaccounted_response_ids.every(id => typeof id === "string" && id.length <= 200);
+      const source = terminal.source;
+      const supported = source === "openai_responses_terminal" || source === "openai_codex_responses_terminal" || source === "jev_response_usage";
+      const nested = object(data.usage);
+      const sdk = bound ? evidence.sdk_reported === null ? null : readCounters(evidence.sdk_reported)
+        : Object.hasOwn(data, "usage")
+          ? data.usage === null ? null : { uncached_input: counter(nested.input), cache_read: counter(nested.cacheRead),
+            cache_write: counter(nested.cacheWrite), output: counter(nested.output) }
+          : { uncached_input: counter(data.uncached_input_tokens), cache_read: counter(data.cache_read_tokens),
+            cache_write: counter(data.cache_write_tokens), output: counter(data.output_tokens) };
+      return [{ schema_version: 1, request_id: data.request_id, sdk_reported: sdk,
+        provider_terminal: bound && supported && typeof terminal.terminal_type === "string" &&
+          (terminal.response_id === null || typeof terminal.response_id === "string" && terminal.response_id.length <= 200)
+          ? { source, response_id: terminal.response_id, terminal_type: terminal.terminal_type, counters: readCounters(terminal.counters) } : null,
+        unaccounted_response_ids: bound ? evidence.unaccounted_response_ids as string[] : [] }];
+    };
+    const messages = reported.flatMap(readMessage);
+    const unsettled = events.filter(event => event.type === "model.request_unsettled" &&
+      object(event.details).usage_evidence !== undefined).flatMap(readMessage);
     const settlements = events.filter(event => event.type === "model.request_settled");
     const settledIds = new Set(settlements.filter(event => !["aborted", "error"].includes(String(object(event.details).stop_reason))).map(event => object(event.details).request_id));
-    const allReported = !this.omissions.events && admitted.every(event => {
-      const id = object(event.details).request_id;
-      return typeof id === "string" && usageIds.has(id);
-    });
     const failures = this.toolFailures.filter(failure => failure.run_id === runId);
-    const expected: Record<string, true> = { invalid_request: true, precondition_failed: true, stale_context: true,
+    const expected: Record<string, true> = { invalid_program: true, invalid_request: true, precondition_failed: true, stale_context: true,
       deadline_exceeded: true, not_found: true, conflict: true, validation_failed: true, budget_exceeded: true };
     const faults = failures.some(failure => failure.code === "backend_unavailable") ? ["tool_backend_unavailable"] : [];
+    if (this.modelObservationFailures.has(runId)) faults.push("model_observation_failed");
     const unclassified = failures.some(failure => failure.code === null || !Object.hasOwn(expected, failure.code) && failure.code !== "backend_unavailable");
-    return { usage: usageMetrics(this.count(runId), messages, allReported), actions: actionMetrics(this.actions(runId)),
+    return { usage: usageMetrics({ admissions: this.count(runId),
+      admitted_request_ids: admitted.flatMap(event => { const id = object(event.details).request_id; return typeof id === "string" ? [id] : []; }),
+      messages, additional_terminal_evidence: unsettled, events_omitted: Boolean(this.omissions.events) }), actions: actionMetrics(this.actions(runId)),
       tools: events.filter(event => event.type === "model.tool_started").flatMap(event => { const name = object(event.details).tool; return typeof name === "string" ? [{ name }] : []; }),
       provider_error: settlements.some(event => object(event.details).stop_reason === "error"),
       provider_settled: admitted.length > 0 && !this.omissions.events && admitted.every(event => settledIds.has(object(event.details).request_id)),
@@ -218,19 +294,29 @@ export class ModelProgramEvidence {
       summary: this.summary(runId), omissions: this.omissions,
       model_source_policy: "Actual provider tool calls only; evaluator never supplies gameplay or guard bodies",
       limitations: ["Host admissions are not wire attempts; subscription monetary cost is unknown.", "Only same-process monotonic spans are combined.",
-        "Full traces remain in the private durable Store if report bounds omit pages.", "No causal improvement, promotion or gameplay-efficiency claim is inferred."] };
+        "Store traces have independent omission caps; the private journal observes authorized capability data before those caps.",
+        "Private journal capacity/persistence failures are explicit and stop the attempt.", "No causal improvement, promotion or gameplay-efficiency claim is inferred."] };
     const text = JSON.stringify(value, null, 2);
     if (Buffer.byteLength(text) > this.caps.reportJsonBytes) {
-      // Preserve original evidence in Store; never silently truncate or rewrite model source.
-      await writeFile(path.join(this.directory, name), JSON.stringify({ run_id: runId, omission: "full_evidence_exceeds_declared_json_bound", durable_store_retains_originals: true, summary: this.summary(runId) }, null, 2), { mode: 0o600, flag: "wx" });
+      // Compact reports and complete permitted evidence have separate allowances.
+      await writeFile(path.join(this.directory, name), JSON.stringify({ run_id: runId, omission: "compact_evidence_exceeds_declared_json_bound",
+        private_journal: this.journal(runId).journal, limitation: "Store events/traces do not retain every argument or observation; use the separately bounded private journal and manifest.", summary: this.summary(runId) }, null, 2), { mode: 0o600, flag: "wx" });
     } else await writeFile(path.join(this.directory, name), text, { mode: 0o600, flag: "wx" });
     return name;
   }
-  close() {
+  finalize(runId: string, input: { status: string; reason: string }) {
+    const journal = this.journal(runId);
+    journal.append("immutable_source_snapshots", this.store.skills(runId));
+    journal.append("immutable_policy_snapshots", this.store.policies(runId));
+    return journal.finalize(input);
+  }
+  async close() {
     this.closed = true;
     this.unsubscribe();
+    this.unsubscribeTrace();
     for (const unsubscribe of this.agentSubscriptions) unsubscribe();
     this.restoreAuthFactory?.();
     this.restoreAuthFactory = null;
+    await Promise.all([...this.journals].map(([runId]) => this.finalize(runId, { status: "interrupted", reason: "observer_closed_without_prior_finalization" })));
   }
 }

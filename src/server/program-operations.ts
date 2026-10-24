@@ -72,6 +72,8 @@ export class ProgramOperations {
         const program = this.workspace.select(input, true);
         return { skill_id: program.skill_id, version: program.version, start_key: startKey,
           epoch: this.run.epoch, session_id: this.run.session_id!, life_id: this.run.life_id!,
+          native_boot_id: this.run.native_boot_id!, run_generation: this.host.generation(), space_epoch: this.run.space_epoch!,
+          compatibility_hash: this.run.compatibility_hash!,
           args: input.args, limits: input.limits, ...(input.next ? { lookahead: input.next } : {}) } as unknown as Json;
       }) as unknown as SkillStartRequest;
       const existing = this.skills.get(this.run.run_id, { start_key: startKey });
@@ -198,7 +200,6 @@ export class ProgramOperations {
         if (input.program && !execution) throw new RuntimeFault("not_found", "No matching execution is available");
         return workspace.actionView(this.store.selectedAction(this.run.run_id, input.target, execution?.execution_id));
       }
-      case "recipes": return await this.host.recipes(input.item);
     }
   }
 

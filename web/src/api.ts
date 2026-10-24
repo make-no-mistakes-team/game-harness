@@ -6,6 +6,7 @@ import type {
   Json,
   ProgramEvidenceView,
   RunView,
+  AdapterGoal,
 } from "../../src/shared/contracts.ts";
 import type {
   ExperienceView,
@@ -18,13 +19,16 @@ import type {
   VersionComparison,
 } from "../../src/shared/execution-evidence.ts";
 import type { PlanProjection } from "../../src/shared/planning.ts";
+import { adapterBindingSchema, activeExecutableValidationSchema, historicalExecutableValidationSchema, programCompatibilitySchema } from "../../src/shared/adapter.ts";
+import { effectInvocationSchema, effectScopeSchema, screenRefSchema, spaceRefSchema } from "../../src/shared/control.ts";
+import { adapterActorProjectionSchema } from "../../src/shared/observations.ts";
+import { goalSchema, gameActionSchema } from "../../src/shared/validation.ts";
 
 const nullableText = z.string().nullable();
 const lineage = {
   session_id: nullableText,
   life_id: z.number().int().nonnegative().nullable(),
 };
-const motorProfile = z.enum(["precise", "balanced", "fast"]);
 const life = z.object({
   life_id: z.number().int().nonnegative(),
   status: z.enum(["loading", "alive", "dead", "respawning"]),
@@ -34,23 +38,6 @@ const life = z.object({
     at: z.string(),
     message: nullableText,
   }).nullable(),
-});
-const vec = z.object({ x: z.number(), y: z.number(), z: z.number() });
-const inventory = z.object({
-  name: z.string(),
-  display_name: z.string(),
-  count: z.number(),
-  slot: z.number(),
-});
-const player = z.object({
-  position: vec,
-  yaw: z.number(),
-  pitch: z.number(),
-  health: z.number(),
-  food: z.number(),
-  on_ground: z.boolean(),
-  in_water: z.boolean(),
-  inventory: z.array(inventory),
 });
 const json: z.ZodType<Json> = z.lazy(() =>
   z.union([
@@ -95,6 +82,8 @@ const auth: z.ZodType<AuthState> = z.object({
       name: z.string(),
       provider: z.string(),
       context_window: z.number().nullable(),
+      input_modalities: z.array(z.string()).optional(),
+      capability_provenance: z.literal("discovered_sdk_descriptor_not_live_vision").optional(),
     }),
   ),
   login: z
@@ -134,11 +123,21 @@ const skill = skillRef.extend({
     formatted_lines: z.number(),
     complexity: z.number(),
     nesting: z.number(),
+    runtime_version: z.number().optional(),
+    api_version: z.literal(4).optional(),
+    validator_version: z.literal(4).optional(),
+    compatibility_hash: z.string().optional(),
   }),
   created_at: z.string(),
 });
 const execution = skillRef.extend({
   ...lineage,
+  world_id: nullableText,
+  native_boot_id: nullableText,
+  run_generation: z.number().nullable(),
+  space_epoch: z.number().nullable(),
+  source_hash: nullableText,
+  compatibility_hash: nullableText,
   execution_id: z.string(),
   run_id: z.string(),
   start_key: z.string(),
@@ -170,66 +169,19 @@ const execution = skillRef.extend({
     })
     .nullable(),
   error: nullableText,
+  diagnostic: z.object({ type: z.string(), message: z.string(), source_hash: z.string(),
+    location: z.object({ mapping: z.literal("unmapped") }), code: z.string().optional() }).optional(),
 });
 const tokenUsage = z.object({
   uncached_input: z.number().nullable(),
   cache_read: z.number().nullable(),
   cache_write: z.number().nullable(),
-  output: z.number(),
+  output: z.number().nullable(),
   calls: z.number().nullable(),
   known_cost: z.number().nullable(),
   legacy_input: z.number().nullable(),
 });
-const actionInput = z.discriminatedUnion("kind", [
-  z.object({
-    kind: z.literal("move"),
-    controls: z.partialRecord(
-      z.enum(["forward", "back", "left", "right", "jump", "sprint", "sneak"]),
-      z.boolean(),
-    ),
-    duration_ms: z.number(),
-    look: z.object({ yaw: z.number(), pitch: z.number() }).optional(),
-    interaction: z
-      .object({
-        kind: z.enum(["attack", "use"]),
-        target_id: z.string().optional(),
-      })
-      .optional(),
-  }),
-  z.object({ kind: z.literal("look"), yaw: z.number(), pitch: z.number() }),
-  z.object({ kind: z.literal("dig"), target_id: z.string() }),
-  z.object({
-    kind: z.literal("place"),
-    target_id: z.string(),
-    face: z.enum(["up", "down", "north", "south", "east", "west"]),
-    item: z.string(),
-  }),
-  z.object({
-    kind: z.literal("craft"),
-    item: z.string(),
-    executions: z.number(),
-    table_id: z.string().optional(),
-  }),
-  z.object({
-    kind: z.literal("equip"),
-    item: z.string(),
-    destination: z.enum(["hand", "off-hand", "head", "torso", "legs", "feet"]),
-  }),
-  z.object({ kind: z.literal("interact"), target_id: z.string() }),
-  z.object({ kind: z.literal("attack"), target_id: z.string() }),
-  z.object({
-    kind: z.literal("navigate"),
-    target_id: z.string(),
-    range: z.number(),
-    duration_ms: z.number(),
-    gaze: z.discriminatedUnion("kind", [
-      z.object({ kind: z.literal("navigation") }),
-      z.object({ kind: z.literal("target"), target_id: z.string() }),
-      z.object({ kind: z.literal("free"), yaw: z.number(), pitch: z.number() }),
-    ]).optional(),
-  }),
-  z.object({ kind: z.literal("respawn") }),
-]);
+const actionInput = gameActionSchema;
 const decision = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("continue"), reason: z.string().optional() }),
   z.object({ kind: z.literal("replan"), reason: z.string() }),
@@ -242,17 +194,20 @@ const decision = z.discriminatedUnion("kind", [
 ]);
 const run: z.ZodType<RunView> = z.object({
   ...lineage,
+  native_boot_id: nullableText,
+  space_epoch: z.number().nullable(),
+  compatibility_hash: nullableText,
   run_id: z.string(),
   world_id: z.string(),
   epoch: z.number(),
   task: z.string(),
-  goal: z.enum([
+  goal: z.union([goalSchema, z.enum([
     "break_log",
     "collect_wood",
     "craft_crafting_table",
     "craft_stone_pickaxe",
     "custom",
-  ]),
+  ])]),
   model_id: z.string(),
   status: z.enum([
     "created",
@@ -273,19 +228,11 @@ const run: z.ZodType<RunView> = z.object({
   action: z
     .object({
       ...lineage,
+      scope: effectScopeSchema.nullable(),
+      invocation: effectInvocationSchema.nullable(),
+      compatibility_hash: nullableText,
       action_id: z.string(),
-      kind: z.enum([
-        "move",
-        "look",
-        "dig",
-        "place",
-        "craft",
-        "equip",
-        "interact",
-        "attack",
-        "navigate",
-        "respawn",
-      ]),
+      kind: z.string(),
       status: z.enum([
         "accepted",
         "running",
@@ -295,7 +242,7 @@ const run: z.ZodType<RunView> = z.object({
         "cancelled",
         "unknown",
       ]),
-      origin: z.enum(["strategist", "policy", "skill"]),
+      origin: z.enum(["strategist", "policy", "skill", "diagnostic"]),
       execution_id: nullableText,
       summary: z.string(),
       started_at: nullableText,
@@ -333,12 +280,14 @@ const run: z.ZodType<RunView> = z.object({
       evaluations: z.number(),
       effects: z.number(),
       last_error: nullableText,
+      validation: z.union([activeExecutableValidationSchema, historicalExecutableValidationSchema]).optional(),
     }),
   ),
   skills: z.array(skill),
   executions: z.array(execution),
   error: nullableText,
   usage: tokenUsage.extend({
+    accounting_basis: z.literal("sdk_reported_subtotal"),
     by_purpose: z.object({
       authoring: tokenUsage,
       planning: tokenUsage,
@@ -375,7 +324,10 @@ const snapshot: z.ZodType<AppSnapshot> = z.object({
     epoch: z.number(),
     session_id: nullableText,
     life: life.nullable(),
-    motor_profile: motorProfile,
+    binding: adapterBindingSchema.nullable(),
+    space: spaceRefSchema.nullable(),
+    screen: screenRefSchema.nullable(),
+    presentation: adapterActorProjectionSchema.nullable(),
     video: z.object({
       status: z.enum(["idle", "starting", "streaming", "stale", "error"]),
       width: z.number(),
@@ -386,7 +338,6 @@ const snapshot: z.ZodType<AppSnapshot> = z.object({
       error: nullableText,
     }),
     last_observation_at: nullableText,
-    player: player.nullable(),
     error: nullableText,
   }),
   sandbox: z.object({
@@ -397,13 +348,8 @@ const snapshot: z.ZodType<AppSnapshot> = z.object({
   run: run.nullable(),
   goals: z.array(
     z.object({
-      id: z.enum([
-        "break_log",
-        "collect_wood",
-        "craft_crafting_table",
-        "craft_stone_pickaxe",
-        "custom",
-      ]),
+      id: z.string(),
+      goal: goalSchema,
       label: z.string(),
       prompt: z.string(),
     }),
@@ -521,7 +467,7 @@ export async function mutate(path: string, body: unknown = {}): Promise<void> {
 
 export async function createRun(body: {
   task: string;
-  goal: string;
+  goal: AdapterGoal;
   model_id: string;
   experience_id?: string;
   working_programs: "continue" | "fresh";
@@ -579,8 +525,8 @@ const experienceSchema: z.ZodType<ExperienceView> = z.object({
   experience_id: z.string(),
   name: z.string(),
   model_id: z.string(),
-  profile_id: z.literal("player-observable-structured"),
-  preset_id: z.literal("minecraft-observable-initial-r2"),
+  profile_id: z.string(),
+  preset_id: z.string().optional(),
   source_run_id: z.string(),
   source_world_id: z.string(),
   portability: z.enum(["portable", "world_local"]),
@@ -592,14 +538,10 @@ const experienceSchema: z.ZodType<ExperienceView> = z.object({
     action_ids: z.array(z.string()),
     predicate,
   }),
-  compatibility: z.object({
-    adapter_id: z.literal("fabric-owned-client"),
-    game_version: z.literal("1.21.4"),
-    observation_schema: z.literal(2),
-    profile_id: z.literal("player-observable-structured"),
-    preset_id: z.literal("minecraft-observable-initial-r2"),
-    skill_protocol: z.literal(2),
-  }),
+  compatibility: z.union([programCompatibilitySchema, z.object({
+    adapter_id: z.string(), game_version: z.string(), observation_schema: z.union([z.literal(1), z.literal(2)]),
+    profile_id: z.string(), preset_id: z.string(), skill_protocol: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+  }).strict()]),
 });
 
 export async function fetchExperience(
@@ -812,12 +754,13 @@ const planSchema: z.ZodType<PlanProjection> = z.object({
   plan_id: z.string(),
   state: z.enum(["armed", "planning", "staged", "validating", "activated", "rejected", "invalidated", "expired", "empty"]),
   planning_active: z.boolean(),
-  reason: z.enum(["session_changed", "life_changed", "task_changed", "predecessor_changed", "predecessor_unsuccessful", "predecessor_pending", "predecessor_already_settled", "source_changed", "guard_failed", "guard_error", "budget_exhausted", "deadline", "cancelled", "already_activated", "not_staged", "admission_failed"]).nullable(),
+  reason: z.enum(["session_changed", "life_changed", "space_changed", "profile_changed", "screen_changed", "task_changed", "predecessor_changed", "predecessor_unsuccessful", "predecessor_pending", "predecessor_already_settled", "source_changed", "guard_failed", "guard_error", "budget_exhausted", "deadline", "cancelled", "already_activated", "not_staged", "admission_failed"]).nullable(),
   intent: z.string(),
   basis: z.object({
     run_id: z.string(), generation: z.number(), session_id: z.string(), world_id: z.string(),
     epoch: z.number(), life_id: z.number(), life_status: life.shape.status,
-    task: z.string(), goal: z.string(),
+    native_boot_id: z.string(), space_epoch: z.number(), compatibility_hash: z.string(), screen: screenRefSchema.nullable(),
+    task: z.string(), goal: goalSchema,
     root: skillRef.extend({ hash: z.string(), execution_id: z.string(), status: execution.shape.status }),
   }),
   candidate: skillRef.extend({ hash: z.string() }).nullable(),
@@ -859,8 +802,12 @@ export async function fetchDeaths(runId: string, after = 0) {
     death_id: z.string(), session_id: z.string(), life_id: z.number(),
     last_observation: json.nullable(), current_root_execution_id: nullableText,
     action_id: nullableText, event_seqs: z.array(z.number()),
-    last_authorized_player: player.nullable(),
+    last_authorized_state: json.optional(),
+    state_omission: json.optional(),
+    // Retained schema2 evidence is displayed under its original historical key.
+    last_authorized_player: json.optional(),
     observation_omission: json.nullable(),
+    event_reference_omission: json.optional(),
   })), next_after: z.number(), has_more: z.boolean() }).parse(
     await request(`/v1/runs/${encodeURIComponent(runId)}/deaths?after=${after}&limit=32`),
   );

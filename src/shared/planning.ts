@@ -1,4 +1,5 @@
-import type { Json, PlayerLife } from "./contracts.ts";
+import type { AdapterGoal, Json, PlayerLife } from "./contracts.ts";
+import type { ScreenRef } from "./control.ts";
 import type { SkillExecutionView, SkillLimits, SkillRef } from "./programs.ts";
 
 export interface PlanningSource extends SkillRef { hash: string }
@@ -10,8 +11,12 @@ export interface PlanningScope {
   epoch: number;
   life_id: number;
   life_status: PlayerLife["status"];
+  native_boot_id: string;
+  space_epoch: number;
+  compatibility_hash: string;
+  screen: ScreenRef | null;
   task: string;
-  goal: string;
+  goal: AdapterGoal;
 }
 export interface PlanningContext extends PlanningScope {
   root: PlanningSource & {
@@ -52,7 +57,7 @@ export interface StageCorrection {
   deadline_at: string;
 }
 export type PlanState = "armed" | "planning" | "staged" | "validating" | "activated" | "rejected" | "invalidated" | "expired" | "empty";
-export type PlanRejectReason = "session_changed" | "life_changed" | "task_changed" | "predecessor_changed" | "predecessor_unsuccessful" | "predecessor_pending" | "predecessor_already_settled" | "source_changed" | "guard_failed" | "guard_error" | "budget_exhausted" | "deadline" | "cancelled" | "already_activated" | "not_staged" | "admission_failed";
+export type PlanRejectReason = "session_changed" | "life_changed" | "space_changed" | "profile_changed" | "screen_changed" | "task_changed" | "predecessor_changed" | "predecessor_unsuccessful" | "predecessor_pending" | "predecessor_already_settled" | "source_changed" | "guard_failed" | "guard_error" | "budget_exhausted" | "deadline" | "cancelled" | "already_activated" | "not_staged" | "admission_failed";
 export interface PlanProjection {
   plan_id: string;
   state: PlanState;

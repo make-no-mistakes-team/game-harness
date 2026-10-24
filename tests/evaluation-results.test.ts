@@ -1,8 +1,14 @@
 import { expect, test } from "bun:test";
 import { actionMetrics, catalogEstimate, classifyEvaluation, costToResult, usageMetrics, waitCoverage, type ActionReceiptSample } from "../src/evaluation/results.ts";
+import type { ReportedUsage, RequestUsageEvidence } from "../src/shared/contracts.ts";
 
 const outcome = (verified: boolean) => classifyEvaluation({ inferenceAdmitted: true, goalVerified: verified,
   platformChecksComplete: true, providerError: false, providerSettled: true });
+const terminalEvidence = (counters: ReportedUsage): RequestUsageEvidence => ({
+  schema_version: 1, request_id: "reported", sdk_reported: counters,
+  provider_terminal: { source: "openai_codex_responses_terminal", response_id: null,
+    terminal_type: "response.completed", counters }, unaccounted_response_ids: [],
+});
 
 test("model false guards, invalid arguments and expired deadlines do not imply a platform failure", () => {
   for (const reason of ["game_guard_false", "model_arguments_rejected", "model_program_deadline_expired"]) {
@@ -33,24 +39,30 @@ test("provider failure, platform evidence and absent inference remain independen
 });
 
 test("actual token subtotals do not turn missing settlements into zero usage or wire counts", () => {
-  const report = usageMetrics(2, [{ uncached_input: 5, cache_read: 10, cache_write: 0, output: 4 }], false);
+  const report = usageMetrics({ admissions: 2, admitted_request_ids: ["reported", "missing"], events_omitted: false,
+    messages: [terminalEvidence({ uncached_input: 5, cache_read: 10, cache_write: 0, output: 4 })] });
   expect(report.uncached_input).toBeNull();
   expect(report.output).toBeNull();
   expect(report.reported_subtotal).toEqual({ uncached_input: 5, cache_read: 10, cache_write: 0, output: 4 });
-  expect(report.coverage).toBe("incomplete");
+  expect(report.event_coverage).toBe("incomplete");
+  expect(report.consumption_coverage).toBe("unknown");
   expect(report.wire_attempts).toBeNull();
   expect(report.subscription_cost).toBeNull();
-  expect(usageMetrics(1, [{ uncached_input: null, cache_read: 0, cache_write: 0, output: 4 }], true).uncached_input).toBeNull();
+  expect(usageMetrics({ admissions: 1, admitted_request_ids: ["reported"], events_omitted: false,
+    messages: [terminalEvidence({ uncached_input: null, cache_read: 0, cache_write: 0, output: 4 })] }).uncached_input).toBeNull();
 });
 
 test("cost to first result includes unsuccessful attempts and propagates missing usage", () => {
-  const usage = usageMetrics(1, [{ uncached_input: 5, cache_read: 2, cache_write: 0, output: 4 }], true);
+  const usage = usageMetrics({ admissions: 1, admitted_request_ids: ["reported"], events_omitted: false,
+    messages: [terminalEvidence({ uncached_input: 5, cache_read: 2, cache_write: 0, output: 4 })] });
   const result = costToResult([{ outcome: outcome(false), usage }, { outcome: outcome(true), usage }, { outcome: outcome(false), usage }]);
   expect(result.attempts_to_result).toBe(2);
   expect(result.unsuccessful_attempts_included).toBe(1);
   expect(result.uncached_input).toBe(10);
   expect(result.admissions).toBe(2);
-  expect(costToResult([{ outcome: outcome(false), usage: usageMetrics(1, [], false) }])).toMatchObject({
+  expect(costToResult([{ outcome: outcome(false), usage: usageMetrics({
+    admissions: 1, admitted_request_ids: ["missing"], messages: [], events_omitted: false,
+  }) }])).toMatchObject({
     result_observed: false, attempts_to_result: null, attempts_included: 1, output: null, subscription_cost: null,
   });
   expect(costToResult([{ outcome: outcome(false), usage: null }, { outcome: outcome(true), usage }])).toMatchObject({

@@ -4,12 +4,17 @@ import { createServer } from "node:net";
 import { spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import path from "node:path";
 import { z } from "zod";
-import type { GameAction, GameActionResult, Observation } from "../shared/contracts.ts";
+import type { GameAction, GameActionResult, ObservationV3 } from "../shared/contracts.ts";
 import type { NativeProcess } from "../server/minecraft-client.ts";
 import type { GameBridgeClient } from "../server/game-bridge.ts";
 import type { MinecraftServer } from "../server/minecraft-server.ts";
 import type { EvaluationCaps } from "./contracts.ts";
 import type { WorldConditions } from "./scenarios.ts";
+import { minecraftObservationV3Schema, type MinecraftObservation, type MinecraftObservationData } from "../shared/minecraft.ts";
+import { Store, type StoredRun } from "../server/store.ts";
+import { ActionArbiter, type ActionArbiterHost } from "../server/action-arbiter.ts";
+import { emptyRunUsage } from "../server/usage.ts";
+import { jsonSchema } from "../shared/primitives.ts";
 import { DEFAULT_EVALUATION_CAPS } from "./config.ts";
 import { evaluationPaths, type EvaluationPaths } from "./paths.ts";
 
@@ -26,11 +31,12 @@ const diagnosticsSchema = z.object({
 }).passthrough();
 export type NativeDiagnostics = z.infer<typeof diagnosticsSchema>;
 export interface NeutralPoseSample {
-  elapsed_ms: number; position: Observation["player"]["position"]; yaw: number; diagnostics: NativeDiagnostics;
+  elapsed_ms: number; position: MinecraftObservationData["player"]["position"]; yaw: number; diagnostics: NativeDiagnostics;
 }
 export interface FixtureIdentity {
   world_id: string; session_id: string; epoch: number; life_id: number;
-  life_status: Observation["life"]["status"]; health: number; pid: number | undefined;
+  life_status: ObservationV3["life"]["status"]; health: number; pid: number | undefined;
+  native_boot_id: string; space_epoch: number;
 }
 export const pause = (ms: number) => {
   const delay = Promise.withResolvers<void>();
@@ -54,7 +60,7 @@ export async function until<T>(read: () => Promise<T>, accepts: (value: T) => bo
   throw new Error(message);
 }
 export function wrap(angle: number) { return Math.atan2(Math.sin(angle), Math.cos(angle)); }
-export function distance(a: Observation["player"]["position"], b: Observation["player"]["position"]) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
+export function distance(a: MinecraftObservationData["player"]["position"], b: MinecraftObservationData["player"]["position"]) { return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z); }
 export function evidence(result: GameActionResult): Record<string, unknown> {
   requireProof(result.evidence && typeof result.evidence === "object" && !Array.isArray(result.evidence), "Native result lacks structured evidence");
   return result.evidence;
@@ -67,6 +73,8 @@ export interface NativeFixtureOptions {
   authDirectory?: string;
   /** Omitted only for explicitly synthetic technical diagnostics. */
   conditions?: WorldConditions;
+  /** Trusted conformance label; exercises the actual checked Java long boundary. */
+  initialEpoch?: number;
 }
 
 /** Evaluator-only infrastructure, never a gameplay/source library or model API.
@@ -87,9 +95,12 @@ export class NativeFixture {
   private closed = false;
   private closePromise: Promise<{ closed: boolean }> | null = null;
   private nativeArtifactHash: string | null = null;
+  private diagnosticStore: Store | null = null;
+  private diagnosticSource: string | null = null;
   private readonly detach: Array<() => void> = [];
   private constructor(readonly project: string, readonly root: string, readonly port: number,
-    readonly caps: EvaluationCaps, private readonly authDirectory: string, private readonly conditions?: WorldConditions) {
+    readonly caps: EvaluationCaps, private readonly authDirectory: string, private readonly conditions?: WorldConditions,
+    private readonly initialEpoch = 1) {
     this.evidenceDirectory = path.join(root, "evidence");
     this.report = { root, port, started_at: new Date().toISOString(), pass: false, cleanup: false,
       classification: conditions ? "natural_normal_survival_actual_model_acceptance" : "synthetic_caller_privileged_evaluator_infrastructure_not_model_gameplay",
@@ -124,7 +135,8 @@ export class NativeFixture {
     // Test/evaluator module-loading boundary: production config captures these at import.
     process.env.GAMEHARNESS_DATA_DIR = root;
     process.env.GAMEHARNESS_MINECRAFT_PORT = String(port);
-    const fixture = new NativeFixture(project, root, port, options.caps ?? DEFAULT_EVALUATION_CAPS, authDirectory, options.conditions);
+    requireProof(Number.isSafeInteger(options.initialEpoch ?? 1) && (options.initialEpoch ?? 1) >= 0, "Native fixture epoch must be a nonnegative safe integer");
+    const fixture = new NativeFixture(project, root, port, options.caps ?? DEFAULT_EVALUATION_CAPS, authDirectory, options.conditions, options.initialEpoch ?? 1);
     await fixture.flush();
     return fixture;
   }
@@ -172,7 +184,7 @@ export class NativeFixture {
     this.report.fixture_server_pid = this.ownedServer().child.pid;
     this.report.server_stdout_artifact = `minecraft/worlds/${world}/gameharness-private.log`;
     if (this.conditions) await this.verifyWorldConditions(world);
-    await bounded(this.bridge.connect({ host: "127.0.0.1", port: this.port, version: "1.21.4", world_id: world, epoch: 1 }), this.caps.totalMs, "Owned native connection timed out");
+    await bounded(this.bridge.connect({ host: "127.0.0.1", port: this.port, version: "1.21.4", world_id: world, epoch: this.initialEpoch }), this.caps.totalMs, "Owned native connection timed out");
     this.clients.push(this.ownedClient());
     this.assertOpen();
     const installedArtifacts = [];
@@ -182,9 +194,9 @@ export class NativeFixture {
       requireProof(actual === hash, "A launched native artifact differs from the recorded build bytes");
     }
     this.report.launched_native_artifacts = installedArtifacts;
-    const observation = await bounded(this.bridge.observe(), this.caps.observationMs, "Initial authorized observation timed out");
-    requireProof(observation.schema_version === 2 && observation.preset_id === "minecraft-observable-initial-r2", "Native observation is not schema2/preset-r2");
-    requireProof(observation.life.status === "alive" && observation.player.health > 0, "Fresh world did not admit an authoritative alive player");
+    const observation = await bounded(this.observe(), this.caps.observationMs, "Initial authorized observation timed out");
+    requireProof(observation.schema_version === 3 && observation.profile_id === "minecraft_assisted_rgb_360_r8_v1", "Native observation is not the actual negotiated observation3/r8 profile");
+    requireProof(observation.epoch === this.initialEpoch && observation.life.status === "alive" && observation.data.player.health > 0, "Fresh world did not preserve the safe-long scope or admit an authoritative alive player");
     this.report.initial = this.identity(observation);
     const history = this.report.world_history as Array<Record<string, unknown>> | undefined;
     this.report.world_history = [...(history ?? []), { world_id: world, initial: this.identity(observation),
@@ -222,11 +234,16 @@ export class NativeFixture {
     requireProof(owner?.child.pid && owner.child.exitCode === null, "Evaluator no longer owns a live native client");
     return owner;
   }
-  identity(observation: Observation): FixtureIdentity { return { world_id: observation.world_id, session_id: observation.session_id, epoch: observation.epoch,
-    life_id: observation.life.life_id, life_status: observation.life.status, health: observation.player.health, pid: this.ownedClient().child.pid }; }
-  sameSession(previous: FixtureIdentity, observation: Observation) {
+  async observe(): Promise<MinecraftObservation> { return minecraftObservationV3Schema.parse(await this.bridge.observe()); }
+  identity(observation: ObservationV3): FixtureIdentity {
+    const current = minecraftObservationV3Schema.parse(observation);
+    return { world_id: current.world_id, session_id: current.session_id, epoch: current.epoch, native_boot_id: current.native_boot_id,
+      space_epoch: current.space.space_epoch, life_id: current.life.life_id, life_status: current.life.status,
+      health: current.data.player.health, pid: this.ownedClient().child.pid };
+  }
+  sameSession(previous: FixtureIdentity, observation: ObservationV3) {
     const now = this.identity(observation);
-    requireProof(now.world_id === previous.world_id && now.session_id === previous.session_id && now.epoch === previous.epoch && now.pid === previous.pid && this.bridge.snapshot().status === "connected" && this.bridge.snapshot().error === null, "Ordinary lifecycle replaced or damaged the owned native session");
+    requireProof(now.world_id === previous.world_id && now.session_id === previous.session_id && now.epoch === previous.epoch && now.native_boot_id === previous.native_boot_id && now.pid === previous.pid && this.bridge.snapshot().status === "connected" && this.bridge.snapshot().error === null, "Ordinary lifecycle replaced or damaged the owned native session");
     return now;
   }
   async diagnostics(): Promise<NativeDiagnostics> {
@@ -266,22 +283,58 @@ export class NativeFixture {
     const output = await this.console([`execute if block -12 239 -12 minecraft:stone if block -12 239 12 minecraft:stone if block 12 239 -12 minecraft:stone if block 12 239 12 minecraft:stone if block 0 239 0 minecraft:stone run say ${floor}`]);
     requireProof(output.includes(floor), "Evaluator platform did not confirm support blocks before teleport");
     await this.console(["tp @a 0.5 240 0.5 0 0", "spawnpoint @a 0 240 0"]);
-    await until(() => this.bridge.observe(), observation => Math.abs(observation.player.position.y - 240) < .05 && observation.player.on_ground, this.caps.observationMs, "Fixture player did not settle on platform");
+    await until(() => this.observe(), observation => Math.abs(observation.data.player.position.y - 240) < .05 && observation.data.player.on_ground, this.caps.observationMs, "Fixture player did not settle on platform");
   }
-  async action(action: GameAction, timeout = this.caps.observationMs) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeout);
-    try { return await bounded(this.bridge.execute(action, controller.signal), timeout + this.caps.cleanupMs, "Native action did not settle after cancellation"); }
-    finally { clearTimeout(timer); }
+  async action(action: GameAction, timeout = this.caps.observationMs, signal?: AbortSignal) {
+    requireProof(!this.conditions, "Natural acceptance has no trusted diagnostic effect authority");
+    this.assertOpen();
+    this.diagnosticSource ??= createHash("sha256").update(await readFile(new URL(import.meta.url))).digest("hex");
+    this.commands.push({ at: new Date().toISOString(), classification: "synthetic_evaluator_host_diagnostic_not_model_gameplay",
+      source_hash: this.diagnosticSource, action });
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), timeout);
+    const cancellation = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const invoke = (arbiter: ActionArbiter) => arbiter.diagnostic(action, this.diagnosticSource!, timeout, cancellation);
+    try {
+    const existing = ActionArbiter.current(this.bridge);
+    if (existing?.runningContext) {
+      return await bounded(invoke(existing), timeout + this.caps.cleanupMs, "Trusted native diagnostic did not drain");
+    }
+    this.diagnosticStore ??= new Store(path.join(this.root, "diagnostic-authority"));
+    const store = this.diagnosticStore, state = this.bridge.snapshot(), adapter = this.bridge.adapter();
+    requireProof(state.binding?.ready && state.space && state.life && state.session_id && state.world_id && adapter, "Diagnostic adapter/session has not negotiated");
+    const run: StoredRun = { run_id: randomUUID(), world_id: state.world_id, session_id: state.session_id, epoch: state.epoch,
+      native_boot_id: state.binding.native_boot_id, space_epoch: state.space.space_epoch, compatibility_hash: state.binding.compatibility_hash,
+      life_id: state.life.life_id, task: "Trusted native infrastructure diagnostic; no model gameplay claim",
+      goal: { adapter_id: adapter.descriptor.adapter.id, goal_id: "custom", parameters: {}, verifier: null },
+      model_id: "zero-provider-host-diagnostic", status: "running", started_at: new Date().toISOString(), ended_at: null,
+      turns: 0, model_status: "idle", error: null, usage: emptyRunUsage(), baseline: {} };
+    store.saveRun(run);
+    const event = (type: string, details: Record<string, import("../shared/contracts.ts").Json> = {}) =>
+      store.event(run.run_id, type, "Trusted diagnostic authority lifecycle", details);
+    const host: ActionArbiterHost = {
+      run: () => run, generation: () => 1, needsReconnect: () => this.bridge.snapshot().error !== null,
+      adapter: () => this.bridge.adapter(), invocation: () => null, effectScope: () => null,
+      observe: () => this.observe(), changed: () => event("diagnostic.authority_changed"),
+      admitted: () => event("diagnostic.effect_admitted"), wake: reason => event("diagnostic.wake", { reason }),
+      pause: (message, reconnect) => { run.status = "paused"; run.error = message; store.saveRun(run); event("diagnostic.paused", { message, reconnect }); },
+      uncertain: view => event("diagnostic.effect_uncertain", { action_id: view.action_id, status: view.status }),
+      effect: () => { throw new Error("A trusted diagnostic context has no policy authority"); },
+      settled: (_action, result, view) => event("diagnostic.effect_settled", { action_id: view.action_id, result: jsonSchema.parse(result) }),
+    };
+    const arbiter = existing ?? new ActionArbiter(store, this.bridge, host);
+    try {
+      return await bounded(arbiter.diagnosticContext(store, host, invoke), timeout + this.caps.cleanupMs, "Trusted native diagnostic did not drain");
+    } finally { run.status = "stopped"; run.ended_at = new Date().toISOString(); store.saveRun(run); }
+    } finally { clearTimeout(timer); controller.abort(); }
   }
   async waitForNeutralRest(samples: NeutralPoseSample[], timeoutMs = this.caps.diagnosticsMs) {
     const started = performance.now();
-    let previous: Observation | null = null, stableSince: number | null = null;
+    let previous: MinecraftObservation | null = null, stableSince: number | null = null;
     while (performance.now() - started < timeoutMs) {
-      const observation = await this.bridge.observe(), diagnostics = await this.diagnostics(), elapsed = performance.now() - started;
-      samples.push({ elapsed_ms: elapsed, position: observation.player.position, yaw: observation.player.yaw, diagnostics });
+      const observation = await this.observe(), diagnostics = await this.diagnostics(), elapsed = performance.now() - started;
+      samples.push({ elapsed_ms: elapsed, position: observation.data.player.position, yaw: observation.data.player.yaw, diagnostics });
       requireProof(diagnostics.controls_neutral && !diagnostics.motor_active, "Native emitter remained active after neutralization");
-      if (previous && distance(previous.player.position, observation.player.position) < .005 && Math.abs(wrap(previous.player.yaw - observation.player.yaw)) < .001) {
+      if (previous && distance(previous.data.player.position, observation.data.player.position) < .005 && Math.abs(wrap(previous.data.player.yaw - observation.data.player.yaw)) < .001) {
         stableSince ??= elapsed;
         if (elapsed - stableSince >= 200) return observation;
       } else stableSince = null;
@@ -289,6 +342,11 @@ export class NativeFixture {
       await pause(50);
     }
     throw new Error("Neutral player did not reach a sustained stable pose within the physical settling bound");
+  }
+  async drainEffects(reason: string): Promise<void> {
+    const arbiter = ActionArbiter.current(this.bridge);
+    requireProof(arbiter, "No real host diagnostic arbiter owns this fixture");
+    await arbiter.close(reason);
   }
   private async framePixels(name: string) {
     requireProof(/^[a-zA-Z0-9_-]+$/.test(name), "Frame artifact must have a bounded filename");
@@ -328,9 +386,11 @@ export class NativeFixture {
   private async closeOwned() {
     if (this.stoppedServer !== null) { try { process.kill(this.stoppedServer, "SIGCONT"); } catch {} this.stoppedServer = null; }
     const cleanup = await Promise.allSettled([
+      this.bridge ? bounded(ActionArbiter.current(this.bridge)?.close("Native fixture authority closed") ?? Promise.resolve(), this.caps.cleanupMs, "Diagnostic arbiter cleanup deadline") : Promise.resolve(),
       this.bridge ? bounded(this.bridge.close(), this.caps.cleanupMs, "Native cleanup deadline") : Promise.resolve(),
       this.server ? bounded(this.server.close(), this.caps.cleanupMs, "Server cleanup deadline") : Promise.resolve(),
     ]);
+    this.diagnosticStore?.close(); this.diagnosticStore = null;
     for (const unsubscribe of this.detach) unsubscribe();
     const exits = await Promise.all(this.clients.map(client => bounded(client.closed, this.caps.cleanupMs, "Native process exit not confirmed").then(() => true, () => false)));
     this.report.native_stdout_diagnostics = this.clients.map(client => ({ pid: client.child.pid, classes_and_redacted_causes: client.diagnostics }));

@@ -2,6 +2,8 @@
 
 GameHarness is an extensible runtime for model-controlled games. A game adapter supplies observations, mechanics, a live view, task verification, and declared recovery capabilities. The core owns strategic model turns, generated programs, reactive policy execution, action arbitration, experience, and evidence.
 
+The target is a coherent coding agent using ordinary JavaScript modules, disclosed bounded mechanical helpers, authorized RGB/own-state/UI observations and checkpoint-based recovery. The agent retains strategy and procedural repair. Jev is optional; a scoped prepared development task is valid when declared separately from fresh-world efficacy. Current compact bodies, unsynchronized actor PNGs and cold-only study execution remain narrower delivered contracts, not permanent product limits.
+
 This document describes the desktop/native/program implementation direction and the broader release contracts. The repository contains implementation, but the [integration guide](../integration-spike.md) distinguishes old-spike results from current native proof. Minecraft Java is the first integration, not a permanent restriction on the product. Supporting another game requires an adapter and validation.
 
 The [product requirements](../prds/gameharness-v1.0-prd.md) define intended behavior. The [context view](c4-context.md) and [container view](c4-containers.md) show the system at different levels. [Runtime contracts](../runtime-contracts.md) are authoritative for adapter interfaces, records, and lifecycle transitions.
@@ -29,6 +31,8 @@ A game need not have a terminal victory state. Its tasks can instead define a ve
 A trusted backend owns the strategic conversation, scheduling, credentials, event journal, and policy registry. An adapter host owns the game's raw connection and data. Generated programs execute behind an operating-system isolation boundary and affect the game only through checked capability calls.
 
 The initial deployment is a local Linux application with one playing avatar. Its backend is one application with internal modules, not a collection of independently deployed microservices. The adapter and generated-code workers are separate processes because they have different runtime and trust requirements.
+
+Study governance is another internal backend/evaluator responsibility, not a new service. `studies.ts` extends the existing private SQLite authority with immutable declarations/slots and separate request, outcome, cleanup and closure records. The evaluator reuses Runtime/strategic ownership through a narrow pre-transport gate. Auth discovery and native preparation follow durable slot admission; unknown ownership stays allocated until actual drain.
 
 | Area | Selected design | Reason and verification boundary |
 | --- | --- | --- |
@@ -79,7 +83,7 @@ Infrastructure supplies mechanisms rather than game tactics. A model decides wha
 
 Strategic inference, action execution, and policy evaluation proceed independently. A model request must not hold the avatar's action lease while waiting for a provider. Authorized work can continue, and compatible policies can evaluate newer observations in parallel.
 
-Compact model-authored asynchronous programs are the main gameplay unit. Exact-version composition shares one root deadline and action/call/depth budgets. Parents do not own the avatar lease; only a leaf action does. Static parsing, canonical formatting and complexity limits govern source admission, while separate Docker controls isolate execution. Host-known capability waits can suspend the runnable CPU deadline; worker heartbeats cannot extend authority.
+Coherent bounded model-authored asynchronous programs are the main gameplay unit. Exact-version composition shares one root deadline and action/call/depth budgets. Parents do not own the avatar lease; only a leaf action does. Source admission checks syntax, body boundaries, imports and forbidden ambient access, with separate 16,384-byte original and canonical UTF-8 caps. Comments and helpers are allowed; line count, nesting and complexity are descriptive. The [source contract](../runtime-contracts.md#current-compact-program-interface) is separate from Docker execution isolation. Host-known capability waits can suspend the runnable CPU deadline; worker heartbeats cannot extend authority.
 
 Local code and Jev are different execution mechanisms. A JavaScript policy can react without a network request; a Jev policy asks a remote model to choose from declared alternatives before a deadline. Neither is guaranteed to meet a particular response time simply because it is called reactive.
 
@@ -138,7 +142,7 @@ After verified goal, bounded `reviewing` is effect-free: candidates may be autho
 
 ## Observation permissions
 
-Every adapter defines an information-permission profile separately from its observation interface. Structured state/events and future images describe delivery, not fairness by themselves. The profile distinguishes current observation, remembered evidence, unknown state and any declared controller-only information. Agent-facing permissions apply to tools, action errors, generated programs, retrieved content and reusable memory; private controller permissions do not widen those APIs.
+Every adapter defines an information-permission profile separately from its observation interface. Structured state/events and authorized actor images describe delivery, not fairness by themselves. The application supplies [typed actor PNGs](../runtime-contracts.md#delivered-actor-images-and-recorded-episodes) on the initial strategic prompt and `observe`, with unsynchronized host-selection metadata; this does not establish `strict_visual` or full profiles/audio. The profile distinguishes current observation, remembered evidence, unknown state and any declared controller-only information. Agent-facing permissions apply to tools, action errors, generated programs, retrieved content and reusable memory; private controller permissions do not widen those APIs.
 
 A raw game client can possess data that the agent may not observe. The trusted adapter must filter it before it reaches the strategist or workers, including counts, ordering, pagination/truncation metadata, logs and errors. Agent searches use the authorized observation index, not raw discovery functions with a filtered prompt. Giving the model an unfiltered client object through generated code would violate the interface.
 
@@ -180,7 +184,11 @@ Recovery fences old emitters, reconnects through the adapter, advances the execu
 
 Checkpoint/reset/restore support is adapter-specific. When restoration is available, record its effect on environment lineage and reconcile memory with the restored state. When it is unavailable, report that limitation rather than implying that restoring a conversation restores the game. Recovery must preserve downtime and intervention evidence.
 
+Ordinary modules and durable serializable task checkpoints are required implementation work. Resume needs compatible artifacts/state, fresh permitted observations and closed prior owners; it cannot replay unknown effects. The current runtime fences prior work but does not restore a module continuation or matched initial save.
+
 Cross-session reuse is different from resuming the same environment. A transferable program can move to a compatible new run; facts about an earlier world, map, level state, or inventory cannot become facts about a new one without fresh evidence.
+
+Explicit cross-model product reuse must retain authoring provenance and recheck compatibility/applicability. Experimental arms still use sealed selected snapshots and private state; no latest-compatible or sibling catalog may cross that boundary. Current cold study execution exposes no inherited/global experience or promotion path, and later inherited/frozen/restored conditions are refused until implemented.
 
 Evaluation has three separate storage owners: external private runtime material, durable external attempt governance and compact reports. Reports retain provenance without making worlds, credentials or full evidence public. The [storage boundary](../operations-and-security.md#private-evaluation-storage) preserves existing historical data unchanged.
 
@@ -188,7 +196,7 @@ Evaluation has three separate storage owners: external private runtime material,
 
 The standalone desktop sends authorized commands and subscribes to events with durable identities. Electron owns only its spawned backend and closes it through the shutdown path; it must not silently reuse or kill an unrelated service. Its sandboxed renderer has no raw Node or game-input authority. Gameplay occupies at least 75% of the main area with the sidebar visible and nearly all of it hidden, without main-window scrolling. Activity and source/cards/history dialogs reflect backend evidence rather than independently deciding success.
 
-Strategic context defaults to compact task/player/inventory changes, program progress/closure and selected actionable failures. Detailed authorized observations remain available on demand. A pending program is meaningful work, not a reason to poll the strategist. Actual purpose-tagged requests and uncached/cache-read/cache-write/output/call counts remain separate from program compactness, cache availability, measured task efficacy and known/unknown cost.
+Strategic context defaults to compact task/player/inventory changes, program progress/closure and selected actionable failures, alongside the authorized actor PNG and separate image metadata. Detailed authorized observations remain available on demand. A pending program is meaningful work, not a reason to poll the strategist. Actual purpose-tagged requests and uncached/cache-read/cache-write/output/call counts remain separate from program compactness, cache availability, measured task efficacy and known/unknown cost.
 
 The activity surface also shows an improvement card with the actual skill/policy version change, why it changed, semantic changes, and measured trial outcome or “not yet measured.” Authorized read routes expand the exact [StrategyCard](../learning-and-evaluation.md#human-readable-strategy-artifacts), source and evidence events without exposing another run's data, secrets or hidden evaluator inputs. The UI may display authorized generated source code as escaped, non-executable text. Viewing source grants no execution/capability authority and cannot install or activate a policy; model-authored markup/scripts must not execute in the operator origin. Proposal, effective activation and reverted/no-effect outcomes remain distinct. This requires neither a full library browser nor an editor/replay interface.
 

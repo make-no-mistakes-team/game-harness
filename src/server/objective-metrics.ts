@@ -1,4 +1,5 @@
-import type { Json, Observation } from "../shared/contracts.ts";
+import type { Json } from "../shared/contracts.ts";
+import { historicalObservationV2Schema, minecraftObservationV3Schema, type MinecraftPlayer } from "../shared/minecraft.ts";
 import type { ObjectiveMetrics, PauseCategory, TraceRecord } from "../shared/execution-evidence.ts";
 import type { Store, StoredAction } from "./store.ts";
 export const evidenceObject = (value: unknown): Record<string, Json> | null => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, Json> : null;
@@ -82,13 +83,16 @@ export function objectiveMetrics(store: Store, runId: string): ObjectiveMetrics[
             metric.span_samples[category] = (metric.span_samples[category] ?? 0) + 1;
           }
         }
-        if ("target_id" in action.request) {
-          const target = action.request.target_id;
+        const targetRef = evidenceObject(action.request.target);
+        const target = targetRef ? JSON.stringify(targetRef) : typeof action.request.target_id === "string" ? `historical:${action.request.target_id}` : null;
+        if (target !== null) {
           if (previousTarget.has(id) && previousTarget.get(id) !== target) metric.target_switches++;
           previousTarget.set(id, target);
         }
         if (receipt?.target_position) {
-          const position = JSON.stringify(receipt.target_position);
+          const position = JSON.stringify({ scope: action.view.scope ? { world_id: action.view.scope.world_id, session_id: action.view.scope.session_id,
+            native_boot_id: action.view.scope.native_boot_id, space_epoch: action.view.scope.space_epoch } : { historical_session: action.view.session_id },
+            position: receipt.target_position });
           if (previousPosition.has(id) && previousPosition.get(id) !== position) metric.target_position_switches++;
           previousPosition.set(id, position);
         }
@@ -98,10 +102,25 @@ export function objectiveMetrics(store: Store, runId: string): ObjectiveMetrics[
     if (events.length < 500) break;
     cursor = events[events.length - 1]!.event_seq;
   }
-  const observations = new Map<string, Observation>();
+  const observations = new Map<string, { scope: string; sequence: number; player: MinecraftPlayer }>();
   const sampleIds = new Map<string, Set<string>>();
   const apply = (trace: TraceRecord): void => {
     const payload = evidenceObject(trace.payload);
+    // Minecraft owns this descriptive motion interpretation. Explicit history
+    // decoding never relabels schema2, and no travel is measured across spaces.
+    let sample: { scope: string; sequence: number; player: MinecraftPlayer } | null = null;
+    if (trace.kind === "observation" && payload?.schema_version === 3) {
+      const parsed = minecraftObservationV3Schema.safeParse(trace.payload);
+      if (parsed.success) {
+        const observation = parsed.data;
+        sample = { scope: JSON.stringify([3, observation.world_id, observation.session_id, observation.epoch,
+          observation.native_boot_id, observation.life.life_id, observation.space]), sequence: observation.observation_seq, player: observation.data.player };
+      }
+    } else if (trace.kind === "observation" && payload?.schema_version === 2) {
+      const parsed = historicalObservationV2Schema.safeParse(trace.payload);
+      if (parsed.success) sample = { scope: JSON.stringify([2, parsed.data.world_id, parsed.data.session_id, parsed.data.epoch, parsed.data.life.life_id]),
+        sequence: parsed.data.observation_seq, player: parsed.data.player };
+    }
     for (const id of new Set([trace.execution_id, trace.root_execution_id])) {
       const metric = id ? metrics.get(id) : null;
       if (!metric) continue;
@@ -116,21 +135,20 @@ export function objectiveMetrics(store: Store, runId: string): ObjectiveMetrics[
         const limitation = `Source-branch diagnostic tail is incomplete (${typeof payload.loss_reason === "string" ? payload.loss_reason : "unknown"}); missing decision count is unknown and gameplay receipt validity is unchanged.`;
         if (!metric.limitations.includes(limitation)) metric.limitations.push(limitation);
       }
-      if (trace.kind === "observation" && payload?.schema_version === 2) {
-        const observation = trace.payload as unknown as Observation;
-        const key = `${observation.session_id}:${observation.life.life_id}:${observation.observation_seq}`;
+      if (sample) {
+        const key = `${sample.scope}:${sample.sequence}`;
         const samples = sampleIds.get(id!) ?? new Set<string>();
         if (samples.has(key)) continue;
         samples.add(key); sampleIds.set(id!, samples);
         const previous = observations.get(id!);
         metric.observation_samples++;
-        if (previous && previous.session_id === observation.session_id && previous.life.life_id === observation.life.life_id) {
-          const a = previous.player, b = observation.player;
+        if (previous && previous.scope === sample.scope) {
+          const a = previous.player, b = sample.player;
           metric.sampled_travel_distance += Math.hypot(b.position.x - a.position.x, b.position.y - a.position.y, b.position.z - a.position.z);
           const yawDelta = b.yaw - a.yaw;
           metric.sampled_rotation_degrees += (Math.abs(Math.atan2(Math.sin(yawDelta), Math.cos(yawDelta))) + Math.abs(b.pitch - a.pitch)) * 180 / Math.PI;
         }
-        observations.set(id!, observation);
+        observations.set(id!, sample);
       } else if (trace.kind === "span" && payload?.clock === "same_process_monotonic" && typeof payload.category === "string" && typeof payload.duration_ms === "number" && payload.duration_ms >= 0) {
         const category = payload.category as PauseCategory;
         metric.spans_ms[category] = (metric.spans_ms[category] ?? 0) + payload.duration_ms;

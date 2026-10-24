@@ -1,4 +1,4 @@
-import type { PolicyContext, PolicyDecision } from "../shared/contracts.ts";
+import type { PolicyContext, PolicyDecision, RequestUsageEvidence } from "../shared/contracts.ts";
 export interface FastJudgeSelection {
   model_id: string;
   request_timeout_ms: number;
@@ -19,11 +19,12 @@ export interface FastJudgeBroker {
     known_cost: number | null;
     actual_calls: number;
     usage: {
-      input: number;
-      cacheRead: number;
-      cacheWrite: number;
-      output: number;
+      input: number | null;
+      cacheRead: number | null;
+      cacheWrite: number | null;
+      output: number | null;
     } | null;
     provider_request_id: string | null;
+    usage_evidence: RequestUsageEvidence | null;
   }>;
 }

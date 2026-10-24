@@ -1,11 +1,14 @@
 import { afterEach, expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
-import type { Json, Observation } from "../src/shared/contracts.ts";
+import type { Json, ObservationV3 } from "../src/shared/contracts.ts";
 import type { LookaheadRequest, PlanningContext, StagePlanRequest } from "../src/shared/planning.ts";
 import type { SkillExecutionView, SkillStartRequest, SkillView } from "../src/shared/programs.ts";
 import { skillStartRequestSchema } from "../src/shared/validation.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
-import { ProgramValidationError } from "../src/server/program-validation.ts";
+import { ProgramValidationError, programFingerprint } from "../src/server/program-validation.ts";
+import { minecraftObservationFixture, minecraftTestAdapter, sha256 } from "./helpers/adapter-contract.ts";
+
+const adapter = minecraftTestAdapter(), compatibilityHash = sha256(adapter.descriptor);
 
 const planners: SpeculativePlanning[] = [];
 afterEach(() => {
@@ -15,12 +18,14 @@ afterEach(() => {
 });
 function source(id: string): SkillView {
   const text = 'return { status: "completed", summary: "Observed", result: null };';
+  const hash = createHash("sha256").update(text).digest("hex");
   return {
     skill_id: id, version: 1, name: id, source: text,
-    hash: createHash("sha256").update(text).digest("hex"),
+    hash,
     card: { purpose: "Observe", applicability: "Authorized life", method: "Read fresh state", reason: "Independent follow-up", limitations: "No effects" },
     dependencies: [], parent_version: null, state: "validated",
-    validation: { fingerprint: "fixture", formatted_lines: 1, complexity: 1, nesting: 0 },
+    validation: { fingerprint: programFingerprint(hash, "skill", compatibilityHash), runtime_version: 4, api_version: 4,
+      validator_version: 4, compatibility_hash: compatibilityHash, formatted_lines: 1, complexity: 1, nesting: 0 },
     created_at: new Date().toISOString(),
   };
 }
@@ -29,23 +34,17 @@ function setup() {
   const predecessor = source("predecessor");
   const context: PlanningContext = {
     run_id: "run", generation: 1, session_id: "session", world_id: "world", epoch: 1,
-    life_id: 1, life_status: "alive", task: "Observe", goal: "custom",
+    life_id: 1, life_status: "alive", task: "Observe", goal: adapter.goals.find(goal => goal.goal_id === "custom")!,
+    native_boot_id: "fixture-native-boot", space_epoch: 1, compatibility_hash: compatibilityHash, screen: null,
     root: { execution_id: "root", skill_id: predecessor.skill_id, version: 1, hash: predecessor.hash, status: "running" },
   };
-  const observation: Observation = {
-    schema_version: 2, session_id: "session", world_id: "world", epoch: 1,
-    life: { life_id: 1, status: "alive", can_respawn: false, death: null },
-    observation_seq: 10, captured_at: new Date().toISOString(),
-    profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r2",
-    player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: 20, food: 20, on_ground: true, in_water: false, inventory: [] },
-    blocks: [], entities: [], sounds: [], coverage: { partial: true, max_age_ms: 1000 },
-  };
+  const observation = minecraftObservationFixture(adapter, { observation_seq: 10 });
   const events: { type: string; details: Json }[] = [];
   const admitted: SkillStartRequest[] = [];
   const reads: number[] = [];
-  const guards: { source: string; observation: Observation; args: Json }[] = [];
+  const guards: { source: string; observation: ObservationV3; args: Json }[] = [];
   const state = {
-    evaluate: async (_source: string, _observation: Observation, _args: Json, _signal: AbortSignal): Promise<boolean> => true,
+    evaluate: async (_source: string, _observation: ObservationV3, _args: Json, _signal: AbortSignal): Promise<boolean> => true,
     beforeObserve: async () => {},
     beforeAdmit: async () => {},
     afterAdmit: async () => {},
@@ -54,6 +53,7 @@ function setup() {
   };
   const sources = new Map([[candidate.skill_id, candidate], [predecessor.skill_id, predecessor]]);
   const planner = new SpeculativePlanning({
+    contract: () => adapter,
     admissionContext: () => context,
     context: () => state.hasRoot ? context : null,
     skill: (ref) => sources.get(ref.skill_id) ?? null,
@@ -70,7 +70,7 @@ function setup() {
       admitted.push(request);
       context.root = { execution_id: "next-root", skill_id: candidate.skill_id, version: candidate.version, hash: candidate.hash, status: state.admissionStatus };
       const execution: SkillExecutionView = {
-        ...request, run_id: "run", execution_id: "next-root", root_execution_id: "next-root", parent_execution_id: null,
+        ...request, run_id: "run", world_id: context.world_id, source_hash: candidate.hash, execution_id: "next-root", root_execution_id: "next-root", parent_execution_id: null,
         status: state.admissionStatus, started_at: null, ended_at: null, deadline_at: new Date().toISOString(),
         actions: 0, calls: 0, result: null, error: state.admissionStatus === "unknown" ? "Uncertain outcome" : null,
       };
@@ -88,12 +88,12 @@ function setup() {
       ? planner.prepareOptIn({ ...configuration, activation: "on_predecessor_success" })(root_execution_id)
       : planner.optIn(request);
   };
-  const input = (planId: string, guard: string | undefined = "return observation.player.health > 0;"): StagePlanRequest => ({
+  const input = (planId: string, guard: string | undefined = "return observation.data.player.health > 0;"): StagePlanRequest => ({
     plan_id: planId, skill: { skill_id: candidate.skill_id, version: candidate.version },
     args: { minimum: 1 }, limits: { duration_ms: 1000, max_actions: 1, max_calls: 2, max_depth: 1 },
     ...(guard === undefined ? {} : { guard_source: guard }),
   });
-  const stage = async (automatic = false, guard: string | undefined = "return observation.player.health > 0;") => {
+  const stage = async (automatic = false, guard: string | undefined = "return observation.data.player.health > 0;") => {
     const plan = arm(automatic); planner.begin();
     const staged = input(plan.plan_id, guard);
     if (guard === undefined) delete staged.guard_source;
@@ -253,7 +253,7 @@ for (const phase of ["observation", "guard", "neutral_barrier", "after_admission
       else if (mutation === "session") f.context.session_id = "new-session";
       else if (mutation === "epoch") f.context.epoch++;
       else if (mutation === "task") f.context.task = "New task";
-      else if (mutation === "goal") f.context.goal = "New goal";
+      else if (mutation === "goal") f.context.goal = { ...f.context.goal, parameters: { changed: true } };
       else if (mutation === "generation") f.context.generation++;
       else if (mutation === "root_hash") f.context.root.hash = "changed";
       else if (mutation === "candidate") f.candidate.source += "\nreturn null;";
@@ -326,9 +326,9 @@ for (const key of ["session", "world", "epoch", "life", "dead"] as const) {
 
 for (const failure of [
   { name: "syntax", source: "return (", code: "invalid_syntax" },
-  { name: "compactness", source: "return true;\n".repeat(81), code: "formatted_lines_limit" },
+  { name: "source bytes", source: "return true;\n".repeat(1400), code: "source_bytes_limit" },
 ]) {
-  test(`explicit ${failure.name} correction keeps failed source and original finite budget`, async () => {
+  test(`explicit ${failure.name} correction retains the original finite planning budget`, async () => {
     const f = setup(); const plan = f.arm(); f.planner.begin();
     expect(f.planner.requestCall()).toBe(true); f.planner.assertToolAuthority("prepare_next");
     let error: unknown;
@@ -336,7 +336,6 @@ for (const failure of [
     expect(error).toBeInstanceOf(ProgramValidationError);
     expect(error).toMatchObject({ issues: expect.arrayContaining([expect.objectContaining({ code: failure.code })]), stage_correction: { correction_allowed: true, remaining_calls: 2, remaining_tools: 7, deadline_at: plan.deadline_at } });
     expect(f.planner.projection()).toMatchObject({ state: "planning", planning_active: true, calls: 1, tools: 1, deadline_at: plan.deadline_at });
-    expect(f.events.find((event) => event.type === "planning.guard_source")?.details).toMatchObject({ source_chunk: failure.source, chunk_index: 0, chunk_count: 1 });
     expect(f.planner.requestCall()).toBe(true); f.planner.assertToolAuthority("prepare_next");
     await f.planner.stage(f.input(plan.plan_id)); f.planner.finish(plan.plan_id); f.succeed();
     expect(await f.planner.activate(plan.plan_id)).toMatchObject({ state: "activated", calls: 2, tools: 2, deadline_at: plan.deadline_at });

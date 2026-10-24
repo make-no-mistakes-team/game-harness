@@ -5,12 +5,16 @@ import { format, version as prettierVersion } from "prettier";
 import { z } from "zod";
 import type { SkillLimits, SkillSpec, SkillView } from "../shared/programs.ts";
 import { MAX_SKILL_LIMITS, SKILL_API_VERSION } from "../shared/programs.ts";
+import type { AdapterDescriptor, AdapterSchemaCatalog } from "../shared/contracts.ts";
+import { adapterCompatibility, contractHash, executableContractStamp } from "./adapter-contract.ts";
+
+export interface ExecutableValidationContext {
+  descriptor: AdapterDescriptor;
+  schemas: AdapterSchemaCatalog;
+}
 
 export const PROGRAM_LIMITS = Object.freeze({
   source_bytes: 16384,
-  formatted_lines: 80,
-  nesting: 4,
-  complexity: 12,
   dependencies: 32,
 });
 
@@ -245,6 +249,7 @@ function parseBody(source: string, kind: "skill" | "policy" | "guard") {
   const parameters = kind === "skill" ? "game, args" : kind === "guard" ? "observation, args" : "context, state";
   const prefix = `async function __gameharness_program(${parameters}) {\n"use strict";\n`;
   const wrapped = `${prefix}${source}\n}\n`;
+  const legacyComments: Array<{ start: number; length: number }> = [];
   const locate = (position: number) => {
     const before = source.slice(
       0,
@@ -253,21 +258,15 @@ function parseBody(source: string, kind: "skill" | "policy" | "guard") {
     const lines = before.split("\n");
     return { line: lines.length, column: (lines.at(-1)?.length ?? 0) + 1 };
   };
-  const comments: ProgramValidationIssue[] = [];
   let ast: SyntaxNode;
   try {
     ast = parse(wrapped, {
       ecmaVersion: "latest",
       sourceType: "script",
       allowImportExportEverywhere: true,
-      onComment: (_block, _value, start) => {
-        comments.push(
-          issue(
-            "comments_forbidden",
-            "Executable source must not contain comments.",
-            locate(start),
-          ),
-        );
+      onComment: (block, _text, start) => {
+        if (block || wrapped.startsWith("//", start)) return;
+        legacyComments.push({ start, length: wrapped.startsWith("<!--", start) ? 4 : 3 });
       },
     }) as unknown as SyntaxNode;
   } catch (error) {
@@ -286,7 +285,6 @@ function parseBody(source: string, kind: "skill" | "policy" | "guard") {
       ),
     ]);
   }
-  if (comments.length) throw new ProgramValidationError(comments);
   const top = nodes(ast.body);
   const fn = top[0];
   if (
@@ -303,7 +301,22 @@ function parseBody(source: string, kind: "skill" | "policy" | "guard") {
       ),
     ]);
   }
-  return { fn, body: fn.body, wrapped, locate };
+  // Acorn admits script-only HTML line comments. Give the formatter ordinary
+  // line-comment markers, using parser ranges so literal text is untouched.
+  // Keep marker widths and line terminators, including the wrapper's final
+  // newline: a trailing line comment must never swallow the closing brace.
+  let formatterSource = wrapped;
+  if (legacyComments.length) {
+    const parts: string[] = [];
+    let cursor = 0;
+    for (const comment of legacyComments) {
+      parts.push(wrapped.slice(cursor, comment.start), "//", " ".repeat(comment.length - 2));
+      cursor = comment.start + comment.length;
+    }
+    parts.push(wrapped.slice(cursor));
+    formatterSource = parts.join("");
+  }
+  return { fn, body: fn.body, formatterSource, locate };
 }
 
 function analyze(source: string, kind: "skill" | "policy" | "guard") {
@@ -371,29 +384,6 @@ function analyze(source: string, kind: "skill" | "policy" | "guard") {
     ) {
       complexity.value++;
       maximumComplexity = Math.max(maximumComplexity, complexity.value);
-      if (complexity.value === PROGRAM_LIMITS.complexity + 1) {
-        issues.push(
-          issue(
-            "complexity_limit",
-            "A function exceeds the cyclomatic complexity limit.",
-            parsed.locate(node.start),
-            { maximum: PROGRAM_LIMITS.complexity, actual: complexity.value },
-          ),
-        );
-      }
-    }
-    if (
-      nesting === PROGRAM_LIMITS.nesting + 1 &&
-      (nestedStatements[node.type] || bareBlock)
-    ) {
-      issues.push(
-        issue(
-          "nesting_limit",
-          "Source exceeds the statement nesting limit.",
-          parsed.locate(node.start),
-          { maximum: PROGRAM_LIMITS.nesting, actual: nesting },
-        ),
-      );
     }
     for (const [childKey, value] of Object.entries(node)) {
       if (isNode(value)) visit(value, node, childKey, nesting, complexity);
@@ -418,7 +408,9 @@ function analyze(source: string, kind: "skill" | "policy" | "guard") {
 export async function validateProgramSource(
   source: unknown,
   kind: "skill" | "policy" | "guard",
+  context: ExecutableValidationContext,
 ): Promise<ValidatedProgramSource> {
+  const compatibility = adapterCompatibility(context.descriptor, context.schemas);
   if (kind !== "skill" && kind !== "policy" && kind !== "guard") {
     throw new ProgramValidationError([
       issue("invalid_kind", "Unsupported program kind."),
@@ -446,7 +438,7 @@ export async function validateProgramSource(
   const analysis = analyze(source, kind);
   let canonical: string;
   try {
-    const formatted = await format(analysis.wrapped, formatterOptions);
+    const formatted = await format(analysis.formatterSource, formatterOptions);
     const formattedAst = parse(formatted, {
       ecmaVersion: "latest",
     }) as unknown as SyntaxNode;
@@ -497,16 +489,6 @@ export async function validateProgramSource(
     .filter((line) => line.trim().length > 0).length;
   const canonicalBytes = Buffer.byteLength(canonical, "utf8");
   const issues: ProgramValidationIssue[] = [];
-  if (lines > PROGRAM_LIMITS.formatted_lines) {
-    issues.push(
-      issue(
-        "formatted_lines_limit",
-        "Canonical source exceeds the nonblank line limit.",
-        null,
-        { maximum: PROGRAM_LIMITS.formatted_lines, actual: lines },
-      ),
-    );
-  }
   if (canonicalBytes > PROGRAM_LIMITS.source_bytes) {
     issues.push(
       issue(
@@ -519,26 +501,13 @@ export async function validateProgramSource(
   }
   if (issues.length) throw new ProgramValidationError(issues);
   const hash = digest(canonical);
-  const fingerprint = digest(
-    JSON.stringify({
-      validator: 1,
-      kind,
-      ...(kind === "skill" ? { skill_api: SKILL_API_VERSION } : {}),
-      parser: acornVersion,
-      formatter: prettierVersion,
-      formatterOptions,
-      limits: PROGRAM_LIMITS,
-      forbiddenAmbient: [...forbiddenAmbient],
-      forbiddenSyntax: Object.keys(forbiddenSyntax),
-      hash,
-    }),
-  );
+  const fingerprint = programFingerprint(hash, kind, compatibility.compatibility_hash);
   return {
     source: canonical,
     hash,
     validation: {
       fingerprint,
-      ...(kind === "skill" ? { runtime_version: SKILL_API_VERSION } : {}),
+      ...executableContractStamp(compatibility),
       formatted_lines: lines,
       complexity: analysis.complexity,
       nesting: analysis.nesting,
@@ -548,6 +517,7 @@ export async function validateProgramSource(
 
 export async function validateSkill(
   spec: unknown,
+  context: ExecutableValidationContext,
 ): Promise<SkillSpec & { validation: SkillView["validation"] }> {
   const parsed = skillSchema.safeParse(spec);
   if (!parsed.success)
@@ -568,10 +538,19 @@ export async function validateSkill(
     }
     dependencies.add(key);
   }
-  const program = await validateProgramSource(parsed.data.source, "skill");
+  const program = await validateProgramSource(parsed.data.source, "skill", context);
   return {
     ...parsed.data,
     source: program.source,
     validation: program.validation,
   };
+}
+
+/** Recheck cached validation without rerunning parsing/formatting or changing immutable history. */
+export function programFingerprint(hash: string, kind: "skill" | "policy" | "guard" | "jev", compatibilityHash: string, choices?: unknown): string {
+  return contractHash({ validator: 4, runtime: 4, skill_api: SKILL_API_VERSION,
+    comments: "permitted", structural_metrics: "descriptive_not_admission_limits", kind,
+    parser: acornVersion, formatter: prettierVersion, formatterOptions, limits: PROGRAM_LIMITS,
+    forbiddenAmbient: [...forbiddenAmbient], forbiddenSyntax: Object.keys(forbiddenSyntax), hash,
+    compatibility_hash: compatibilityHash, ...(choices === undefined ? {} : { choices }) });
 }

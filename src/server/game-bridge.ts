@@ -236,7 +236,11 @@ export class GameBridgeClient implements GameBridge {
       void owned.closed.then(() => { if (this.owned === owned && !this.closing) void this.terminate("Authenticated Minecraft client exited."); });
       const deadline = Date.now() + 120000; let observed = false;
       while (Date.now() < deadline && this.owned === owned && !controller.signal.aborted) {
-        if (this.control) { try { const current = await this.observe(); if (current.life.status === "alive" || current.life.status === "dead") { observed = true; break; } } catch {} }
+        if (this.control) { try {
+          const current = await this.observe();
+          // Joining can report an alive player before vanilla closes its loading screen.
+          if (current.life.status === "alive" && current.screen === null || current.life.status === "dead") { observed = true; break; }
+        } catch {} }
         const delay = Promise.withResolvers<void>(); setTimeout(delay.resolve, 250); await delay.promise;
       }
       if (this.owned !== owned || controller.signal.aborted) throw new Error("Native connection authority closed before ready.");
@@ -310,7 +314,8 @@ export class GameBridgeClient implements GameBridge {
     const abort = () => { cancelling = this.cancel("Action cancelled.", { operation_id: effect.operation_id, scope: effect.scope }); };
     signal.addEventListener("abort", abort, { once: true });
     try {
-      const reply = effectReplySchema.parse(await this.request("execute", effect, 45000));
+      const deadline = Math.max(45000, (this.runtimeAdapter?.effectDeadlineMs(effect.action) ?? 40000) + 5000);
+      const reply = effectReplySchema.parse(await this.request("execute", effect, deadline));
       if (reply.operation_id !== effect.operation_id || reply.compatibility_hash !== effect.compatibility_hash || !sameEffectScope(reply.scope, effect.scope)) throw new Error("Native effect receipt has stale authority");
       if (cancelling) await cancelling;
       return reply.result;

@@ -11,6 +11,7 @@ test("runtime history DTO retains SDK-subtotal basis and nullable legacy counter
     session_id: null, life_id: null, task: "Historical subtotal fixture", goal: "custom", model_id: "offline-only",
     status: "failed", started_at: null, ended_at: null, turns: 1, model_status: "idle", action: null,
     policies: [], skills: [], executions: [], error: null,
+    operator: { state: "failed", pause_cause: null, cleanup_error: null, completion: null, progress: null },
     usage: { ...bucket, accounting_basis: "sdk_reported_subtotal",
       by_purpose: { authoring: { ...bucket }, planning: { ...bucket }, replanning: { ...bucket },
         improvement: { ...bucket }, other: { ...bucket } } } };

@@ -15,13 +15,16 @@ import net.minecraft.client.gui.screen.DeathScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.ItemEntity;
+import net.minecraft.item.BlockItem;
+import net.minecraft.item.ItemPlacementContext;
 import net.minecraft.item.ItemStack;
 import net.minecraft.network.packet.Packet;
+import net.minecraft.network.packet.c2s.play.ClickSlotC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerActionC2SPacket;
 import net.minecraft.network.packet.c2s.play.PlayerInteractBlockC2SPacket;
 import net.minecraft.registry.Registries;
-import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.util.Hand;
+import net.minecraft.util.ActionResult;
 import net.minecraft.util.hit.*;
 import net.minecraft.util.math.*;
 import net.minecraft.world.RaycastContext;
@@ -193,7 +196,14 @@ public final class NativeClient implements ClientModInitializer {
         return;
       }
       motor.serverInventoryAfter = value;
-      if (motor.completingMove)
+      if (motor.completingPickup) {
+        boolean timely = System.nanoTime() < motor.pickupReceiptDeadline;
+        boolean gained = timely && motor.serverCount(motor.pickupItem) > motor.beforeCount(motor.pickupItem);
+        motor.finish(gained ? "succeeded" : "unknown",
+            gained ? "Selected drop disappeared nearby; own item gain confirmed by server inventory"
+                : "Selected drop disappeared; own pickup was not confirmed within its receipt bound",
+            gained);
+      } else if (motor.completingMove)
         motor.finish(
             "succeeded",
             "Movement interval completed; own inventory snapshot confirmed",
@@ -262,17 +272,25 @@ public final class NativeClient implements ClientModInitializer {
         && motor.confirmationPosition != null
         && motor.confirmationPosition.equals(pos)) {
       motor.blockConfirmed = true;
-      motor.serverBlockRemoved = client.world != null && client.world.getBlockState(pos).isAir();
+      motor.serverBlockRemoved = motor.sentSequence >= 0
+          && client.world != null && client.world.getBlockState(pos).isAir();
     }
   }
 
   public void sent(Packet<?> packet) {
+    if (motor != null && motor.kind.equals("place") && packet instanceof ClickSlotC2SPacket) {
+      motor.equipmentEffectEmitted = true;
+      motor.emissions |= EffectOutcome.WORLD_EFFECT;
+    }
     if (motor == null || motor.target == null) return;
     int sequence = -1;
     if (packet instanceof PlayerActionC2SPacket p && p.getPos().equals(motor.target))
       sequence = p.getSequence();
     if (packet instanceof PlayerInteractBlockC2SPacket p
-        && p.getBlockHitResult().getBlockPos().equals(motor.target)) sequence = p.getSequence();
+        && p.getBlockHitResult().getBlockPos().equals(motor.target)) {
+      sequence = p.getSequence();
+      if (motor.kind.equals("place")) motor.placementEffectEmitted = true;
+    }
     if (sequence >= 0) {
       motor.emissions |= EffectOutcome.WORLD_EFFECT;
       motor.sentSequence = sequence;
@@ -741,9 +759,23 @@ public final class NativeClient implements ClientModInitializer {
     m.add("life", life());
     m.addProperty("motor_profile", motorProfile.name().toLowerCase(Locale.ROOT));
     m.addProperty("screen_type", client.currentScreen == null ? null : client.currentScreen.getClass().getName());
+    if (client.player != null) {
+      var handler = client.player.currentScreenHandler;
+      JsonObject custody = new JsonObject();
+      custody.addProperty("sync_id", handler.syncId);
+      custody.addProperty("cursor_count", handler.getCursorStack().getCount());
+      int size = handler instanceof net.minecraft.screen.CraftingScreenHandler ? 9
+          : handler instanceof net.minecraft.screen.PlayerScreenHandler ? 4 : 0;
+      int grid = 0;
+      for (int i = 1; i <= size; i++) grid += handler.getSlot(i).getStack().getCount();
+      custody.addProperty("grid_count", grid);
+      m.add("current_inventory_custody", custody);
+    }
     m.addProperty("death_screen", client.currentScreen instanceof DeathScreen);
     m.addProperty("respawn_pending", respawnRequest != 0);
     m.addProperty("motor_active", motor != null);
+    m.addProperty("motor_world_effect_emitted", motor != null
+        && (motor.emissions & EffectOutcome.WORLD_EFFECT) != 0);
     var keys = client.options;
     m.addProperty("controls_neutral", keys == null || !(keys.forwardKey.isPressed()
         || keys.backKey.isPressed() || keys.leftKey.isPressed() || keys.rightKey.isPressed()
@@ -755,6 +787,8 @@ public final class NativeClient implements ClientModInitializer {
     m.addProperty("pitch_acceleration_degrees_per_second_squared", motorProfile.pitchAcceleration);
     m.addProperty("camera_integration_clock", "render_monotonic");
     if (motor != null) {
+      if (motor.inventorySession() != null)
+        m.add("native_inventory_ui", motor.inventorySession().diagnostics());
       m.addProperty("yaw_velocity_degrees_per_second", motor.yawVelocity);
       m.addProperty("pitch_velocity_degrees_per_second", motor.pitchVelocity);
       m.addProperty("target_yaw_degrees", motor.yaw);
@@ -1017,13 +1051,14 @@ public final class NativeClient implements ClientModInitializer {
     if (!managed() || client.options == null) return;
     var o = client.options;
     JsonObject controls = motor == null ? null : motor.controls;
-    o.forwardKey.setPressed(pressed(controls, "forward"));
-    o.backKey.setPressed(pressed(controls, "back"));
-    o.leftKey.setPressed(pressed(controls, "left"));
-    o.rightKey.setPressed(pressed(controls, "right"));
-    o.jumpKey.setPressed(pressed(controls, "jump"));
-    o.sprintKey.setPressed(pressed(controls, "sprint"));
-    o.sneakKey.setPressed(pressed(controls, "sneak"));
+    boolean targetsCurrent = motor != null && motor.targetsCurrent();
+    o.forwardKey.setPressed(targetsCurrent && pressed(controls, "forward"));
+    o.backKey.setPressed(targetsCurrent && pressed(controls, "back"));
+    o.leftKey.setPressed(targetsCurrent && pressed(controls, "left"));
+    o.rightKey.setPressed(targetsCurrent && pressed(controls, "right"));
+    o.jumpKey.setPressed(targetsCurrent && pressed(controls, "jump"));
+    o.sprintKey.setPressed(targetsCurrent && pressed(controls, "sprint"));
+    o.sneakKey.setPressed(targetsCurrent && pressed(controls, "sneak"));
     o.attackKey.setPressed(false);
     o.useKey.setPressed(false);
   }
@@ -1065,7 +1100,6 @@ public final class NativeClient implements ClientModInitializer {
     if (client.interactionManager != null) client.interactionManager.cancelBlockBreaking();
     if (client.player != null) {
       client.player.stopUsingItem();
-      if (client.currentScreen instanceof HandledScreen<?>) client.player.closeHandledScreen();
     }
   }
 
@@ -1083,7 +1117,8 @@ public final class NativeClient implements ClientModInitializer {
   private Entity targetEntity(TargetIncarnations.Target target) {
     if (target == null) return null;
     Entity e = entities.get(target.targetId());
-    return authorizedEntity(e) && entityIncarnations.current(e.getUuid(), target, incarnationSignals.space(), lifecycle.lifeId()) ? e : null;
+    return e != null && entityIncarnations.current(e.getUuid(), target, incarnationSignals.space(), lifecycle.lifeId())
+        && authorizedEntity(e) ? e : null;
   }
 
   private boolean reachable(BlockPos pos) {
@@ -1103,53 +1138,12 @@ public final class NativeClient implements ClientModInitializer {
             .equals(pos);
   }
 
-  private boolean equip(String name, String destination) {
-    var p = client.player;
-    int source = -1;
-    for (int i = 0; i < p.getInventory().size(); i++)
-      if (Registries.ITEM.getId(p.getInventory().getStack(i).getItem()).getPath().equals(name)) {
-        source = i;
-        break;
-      }
-    if (source < 0) return false;
-    int slot = source < 9 ? 36 + source : source < 36 ? source : source < 40 ? 44 - source : 45;
-    if (destination.equals("hand"))
-      client.interactionManager.clickSlot(
-          p.playerScreenHandler.syncId,
-          slot,
-          p.getInventory().selectedSlot,
-          SlotActionType.SWAP,
-          p);
-    else if (destination.equals("off-hand"))
-      client.interactionManager.clickSlot(
-          p.playerScreenHandler.syncId, slot, 40, SlotActionType.SWAP, p);
-    else {
-      int armor =
-          switch (destination) {
-            case "head" -> 5;
-            case "torso" -> 6;
-            case "legs" -> 7;
-            case "feet" -> 8;
-            default -> -1;
-          };
-      if (armor < 0) return false;
-      client.interactionManager.clickSlot(
-          p.playerScreenHandler.syncId, slot, 0, SlotActionType.PICKUP, p);
-      client.interactionManager.clickSlot(
-          p.playerScreenHandler.syncId, armor, 0, SlotActionType.PICKUP, p);
-      if (!p.currentScreenHandler.getCursorStack().isEmpty())
-        client.interactionManager.clickSlot(
-            p.playerScreenHandler.syncId, slot, 0, SlotActionType.PICKUP, p);
-    }
-    return true;
-  }
-
   private final class Motor {
     final long id;
     final NativeEffectContract.Received received;
     final TargetIncarnations.Target targetReference, tableReference, gazeReference, interactionReference;
     final JsonObject action;
-    final String kind;
+    final String kind, arrivalMode;
     final long generation, receivedNanos;
     final long admittedNanos = System.nanoTime();
     final long lifeId = lifecycle.lifeId();
@@ -1159,6 +1153,13 @@ public final class NativeClient implements ClientModInitializer {
     final double[] route = new double[39];
     int routePoints;
     long routeSampled;
+    long routeBlockedSince, navigationProgressSince;
+    double bestArrivalGap = Double.POSITIVE_INFINITY;
+    boolean navigationProgressArmed, positionRange;
+    String navigationStopReason;
+    double navigationStartDistanceSquared, navigationCurrentDistanceSquared;
+    String placementPreflightReason = "not_checked", placementLocalResult;
+    boolean equipmentEffectEmitted, placementEffectEmitted, movementStartOnGround;
     Vec3d sampledPosition;
     JsonObject startPose;
     double travelDistance, rotationYaw, rotationPitch;
@@ -1168,9 +1169,17 @@ public final class NativeClient implements ClientModInitializer {
     JsonObject inventoryBefore;
     JsonObject serverInventoryAfter;
     String targetName;
+    String pickupItem;
+    boolean completingPickup;
+    long pickupReceiptDeadline;
     net.minecraft.block.BlockState targetStateBefore;
     BlockPos target, confirmationPosition;
     Entity entity;
+    // Only this owner's successfully admitted bindings survive projection refreshes.
+    // The incarnation stores, not the bounded observation maps, revoke these bindings.
+    BlockPos targetBinding, tableBinding, gazeBinding, interactionBinding;
+    Entity targetEntityBinding, tableEntityBinding, gazeEntityBinding, interactionEntityBinding;
+    boolean bindingsResolved;
     float yaw, pitch;
     double yawVelocity, pitchVelocity;
     boolean looking,
@@ -1192,6 +1201,29 @@ public final class NativeClient implements ClientModInitializer {
     long duration = 1000;
     long moveReceiptDeadline;
     JsonObject applicationRejection;
+    VisibleInventory equipmentSession;
+
+    boolean inventoryAuthority() {
+      return motor == this && generation == authority && authorized(false)
+          && lifeId == lifecycle.lifeId() && lifecycle.ready();
+    }
+
+    VisibleInventory inventorySession() {
+      return kind.equals("craft") ? Recipes.session() : equipmentSession;
+    }
+
+    boolean startEquipment(String item, String destination) {
+      equipmentSession = new VisibleInventory(client, false, this::inventoryAuthority);
+      return equipmentSession.beginEquip(item, destination);
+    }
+
+    void inventoryEmissions() {
+      VisibleInventory session = inventorySession();
+      if (session != null && session.emitted()) {
+        emissions |= EffectOutcome.WORLD_EFFECT;
+        if (kind.equals("place")) equipmentEffectEmitted = true;
+      }
+    }
 
     Motor(long id, NativeEffectContract.Received received, long generation, long receivedNanos) {
       this.id = id;
@@ -1200,6 +1232,7 @@ public final class NativeClient implements ClientModInitializer {
       this.generation = generation;
       this.receivedNanos = receivedNanos;
       kind = action.get("kind").getAsString();
+      arrivalMode = action.has("arrival") ? action.get("arrival").getAsString() : "position";
       targetReference = action.has("target") ? NativeEffectContract.target(action.getAsJsonObject("target")) : null;
       tableReference = action.has("table") ? NativeEffectContract.target(action.getAsJsonObject("table")) : null;
       JsonObject gaze = action.has("gaze") ? action.getAsJsonObject("gaze") : null;
@@ -1216,11 +1249,47 @@ public final class NativeClient implements ClientModInitializer {
 
     boolean current(TargetIncarnations.Target reference) {
       if (reference == null) return true;
-      BlockPos block = blocks.get(reference.targetId());
+      BlockPos block = bindingsResolved ? boundBlock(reference) : blocks.get(reference.targetId());
       if (block != null) return blockIncarnations.current(block, reference, incarnationSignals.space(), lifecycle.lifeId());
-      Entity entity = entities.get(reference.targetId());
+      Entity entity = bindingsResolved ? boundEntity(reference) : entities.get(reference.targetId());
       return entity != null && !entity.isRemoved()
           && entityIncarnations.current(entity.getUuid(), reference, incarnationSignals.space(), lifecycle.lifeId());
+    }
+
+    BlockPos boundBlock(TargetIncarnations.Target reference) {
+      if (reference == targetReference) return targetBinding;
+      if (reference == tableReference) return tableBinding;
+      if (reference == gazeReference) return gazeBinding;
+      if (reference == interactionReference) return interactionBinding;
+      return null;
+    }
+
+    Entity boundEntity(TargetIncarnations.Target reference) {
+      if (reference == targetReference) return targetEntityBinding;
+      if (reference == tableReference) return tableEntityBinding;
+      if (reference == gazeReference) return gazeEntityBinding;
+      if (reference == interactionReference) return interactionEntityBinding;
+      return null;
+    }
+
+    void resolveBindings() {
+      if (targetReference != null) {
+        targetBinding = targetBlock(targetReference);
+        targetEntityBinding = targetEntity(targetReference);
+      }
+      if (tableReference != null) {
+        tableBinding = targetBlock(tableReference);
+        tableEntityBinding = targetEntity(tableReference);
+      }
+      if (gazeReference != null) {
+        gazeBinding = targetBlock(gazeReference);
+        gazeEntityBinding = targetEntity(gazeReference);
+      }
+      if (interactionReference != null) {
+        interactionBinding = targetBlock(interactionReference);
+        interactionEntityBinding = targetEntity(interactionReference);
+      }
+      bindingsResolved = true;
     }
 
     boolean targetsCurrent() {
@@ -1255,17 +1324,35 @@ public final class NativeClient implements ClientModInitializer {
         rejectApplication("game_thread_start");
         return;
       }
+      resolveBindings();
+      if (!targetsCurrent()) {
+        rejectApplication("game_thread_bindings");
+        return;
+      }
+      if (kind.equals("navigate") && arrivalMode.equals("interaction") && targetBinding == null) {
+        finish("failed", "Interaction arrival requires a block target; entity targets support position arrival only", false);
+        return;
+      }
       // Expected screen is an apply-time precondition. Only after the actual
       // baseline and target checks may this owner perform its own UI transition.
-      if (client.currentScreen instanceof HandledScreen<?>) client.player.closeHandledScreen();
+      if (client.currentScreen instanceof HandledScreen<?>) {
+        var handler = client.player.currentScreenHandler;
+        boolean custody = !handler.getCursorStack().isEmpty();
+        int grid = handler instanceof net.minecraft.screen.CraftingScreenHandler ? 9
+            : handler instanceof net.minecraft.screen.PlayerScreenHandler ? 4 : 0;
+        for (int i = 1; i <= grid; i++) custody |= !handler.getSlot(i).getStack().isEmpty();
+        if (custody) emissions |= EffectOutcome.WORLD_EFFECT;
+        client.player.closeHandledScreen();
+      }
       initial = client.player.getPos();
+      movementStartOnGround = client.player.isOnGround();
       sampledPosition = initial;
       sampledYaw = client.player.getYaw();
       sampledPitch = client.player.getPitch();
       startPose = pose();
       CameraMotion.reset(camera, sampledYaw, sampledPitch, System.nanoTime());
-      target = targetBlock(targetReference);
-      entity = targetEntity(targetReference);
+      target = targetBinding;
+      entity = targetEntityBinding;
       if (target != null) {
         targetStateBefore = client.world.getBlockState(target);
         targetName = Registries.BLOCK.getId(targetStateBefore.getBlock()).getPath();
@@ -1288,18 +1375,23 @@ public final class NativeClient implements ClientModInitializer {
           return;
         }
         navigationGoal = target != null ? target.toCenterPos() : entity.getPos();
+        navigationStartDistanceSquared = initial.squaredDistanceTo(navigationGoal);
+        navigationCurrentDistanceSquared = navigationStartDistanceSquared;
+        if (entity instanceof ItemEntity dropped && !dropped.getStack().isEmpty())
+          pickupItem = Registries.ITEM.getId(dropped.getStack().getItem()).getPath();
         duration = action.get("duration_ms").getAsLong();
         if (action.has("gaze") && action.getAsJsonObject("gaze").get("kind").getAsString().equals("free"))
           setLook(action.getAsJsonObject("gaze"));
       } else if (kind.equals("equip")) {
-        issued = equip(action.get("item").getAsString(), action.get("destination").getAsString());
-        if (issued) emissions |= EffectOutcome.WORLD_EFFECT;
-        duration = 1200;
+        duration = VisibleInventory.EQUIP_MS;
+        issued = startEquipment(action.get("item").getAsString(), action.get("destination").getAsString());
+        inventoryEmissions();
+        if (!issued) finish(EffectOutcome.deadline(emissions), "Equipment preflight refused", false);
       } else if (kind.equals("craft")) {
         initialCount = beforeCount(action.get("item").getAsString());
-        duration = 12000;
+        duration = VisibleInventory.craftMillis(action.get("executions").getAsInt());
         if (tableReference != null) {
-          target = targetBlock(tableReference);
+          target = tableBinding;
           if (!reachable(target)) {
             finish("failed", "Crafting table is not currently visible and reachable", false);
             return;
@@ -1312,6 +1404,7 @@ public final class NativeClient implements ClientModInitializer {
           return;
         }
         if ((kind.equals("dig") || kind.equals("place")) && !reachable(target)) {
+          if (kind.equals("place")) placementPreflightReason = "target_not_reachable";
           finish("failed", "Block target is not currently reachable and visible", false);
           return;
         }
@@ -1333,7 +1426,7 @@ public final class NativeClient implements ClientModInitializer {
                   ? target.toCenterPos()
                   : target.toCenterPos().add(Vec3d.of(face.getVector()).multiply(.5)));
         } else aim(entity.getBoundingBox().getCenter());
-        duration = kind.equals("dig") ? 30000 : 4000;
+        duration = kind.equals("dig") ? 30000 : kind.equals("place") ? VisibleInventory.PLACE_MS : 4000;
       }
     }
 
@@ -1352,7 +1445,10 @@ public final class NativeClient implements ClientModInitializer {
 
     void rotate() {
       if (!looking || generation != authority || !authorized(false) || lifeId != lifecycle.lifeId() || !lifecycle.ready() || client.player == null) return;
+      VisibleInventory session = inventorySession();
+      if (session != null && !session.closed()) return;
       if (!targetsCurrent()) {
+        if (reconcileNearbyPickup()) return;
         if (!issued && !(kind.equals("dig") && serverBlockRemoved)) finish(EffectOutcome.deadline(emissions), "Target incarnation changed before camera/input application", false);
         return;
       }
@@ -1431,31 +1527,31 @@ public final class NativeClient implements ClientModInitializer {
       }
     }
 
-    void navigate() {
+    boolean navigate() {
       long now = System.nanoTime();
       if (now - routeSampled >= 100000000L || routePoints == 0) {
         routeSampled = now;
         sampleRoute();
       }
       navForward = navBack = navLeft = navRight = navJump = false;
-      if (routePoints < 2) return;
+      if (routePoints < 2) return false;
       Vec3d p = client.player.getPos();
       double eyeHeight = client.player.getEyePos().y - p.y;
-      if (!NavigationGaze.sample(route, routePoints, p.x, p.y, p.z, eyeHeight, 1.5, routeGaze)) return;
+      if (!NavigationGaze.sample(route, routePoints, p.x, p.y, p.z, eyeHeight, 1.5, routeGaze)) return false;
       JsonObject gaze = action.has("gaze") ? action.getAsJsonObject("gaze") : null;
       String mode = gaze == null ? "navigation" : gaze.get("kind").getAsString();
       if (mode.equals("navigation")) {
         yaw = (float) routeGaze.yaw; pitch = (float) routeGaze.pitch; looking = true;
       } else if (mode.equals("target")) {
-        BlockPos block = targetBlock(gazeReference);
-        Entity e = targetEntity(gazeReference);
+        BlockPos block = gazeBinding;
+        Entity e = authorizedEntity(gazeEntityBinding) ? gazeEntityBinding : null;
         if (block != null && clearLine(block.toCenterPos(), block)) aim(block.toCenterPos());
         else if (e != null) aim(e.getBoundingBox().getCenter());
-        else { finish("failed", "Navigation gaze target is no longer visible", false); return; }
+        else { finish(EffectOutcome.deadline(emissions), "Navigation gaze target is no longer visible", false); return false; }
       }
       double desiredYaw = Math.toDegrees(Math.atan2(-(routeGaze.x - p.x), routeGaze.z - p.z));
       NavigationGaze.steer(desiredYaw, client.player.getYaw(), steering);
-      if (Math.abs(steering.yawError) > 35) return;
+      if (Math.abs(steering.yawError) > 35) return true;
       double radians = Math.toRadians(steering.worldYaw);
       double x = p.x - Math.sin(radians) * .55, z = p.z + Math.cos(radians) * .55;
       boolean level = supportedSpace(x, p.y, z);
@@ -1465,17 +1561,79 @@ public final class NativeClient implements ClientModInitializer {
       boolean descent = !level && !step
           && (supportedSpace(x, p.y - .5, z) || supportedSpace(x, p.y - 1, z))
           && client.world.isSpaceEmpty(client.player, client.player.getBoundingBox().offset(x - p.x, 0, z - p.z));
-      if (!level && !step && !descent) return;
+      if (!level && !step && !descent) return false;
       navForward = steering.forward > 0;
       navBack = steering.forward < 0;
       navLeft = steering.strafe > 0;
       navRight = steering.strafe < 0;
       navJump = step;
+      return true;
     }
 
     boolean aligned() {
       return Math.abs(MathHelper.wrapDegrees(yaw - client.player.getYaw())) < 3
           && Math.abs(pitch - client.player.getPitch()) < 3;
+    }
+
+    BlockHitResult placementPreflight() {
+      Direction face = Direction.byName(action.get("face").getAsString());
+      if (face == null) return refusePlacement("unknown_face");
+      if (!reachable(target)) return refusePlacement("target_not_reachable");
+      Vec3d surface = target.toCenterPos().add(Vec3d.of(face.getVector()).multiply(.499));
+      BlockHitResult hit = client.world.raycast(new RaycastContext(
+          client.player.getEyePos(), surface, RaycastContext.ShapeType.OUTLINE,
+          RaycastContext.FluidHandling.NONE, client.player));
+      if (hit.getType() != HitResult.Type.BLOCK
+          || !hit.getBlockPos().equals(target) || hit.getSide() != face)
+        return refusePlacement("requested_face_not_visible");
+      ItemStack stack = ItemStack.EMPTY;
+      String item = action.get("item").getAsString();
+      for (int i = 0; i < client.player.getInventory().size(); i++) {
+        ItemStack candidate = client.player.getInventory().getStack(i);
+        if (!candidate.isEmpty() && Registries.ITEM.getId(candidate.getItem()).getPath().equals(item)) {
+          stack = candidate;
+          break;
+        }
+      }
+      if (stack.isEmpty()) return refusePlacement("item_unavailable");
+      if (!(stack.getItem() instanceof BlockItem blockItem))
+        return refusePlacement("item_not_placeable_block");
+      if (client.player.isSpectator()) return refusePlacement("spectator");
+      if (!client.world.getWorldBorder().contains(target))
+        return refusePlacement("target_outside_world_border");
+      if (client.player.getItemCooldownManager().isCoolingDown(stack))
+        return refusePlacement("item_cooldown");
+      if (!blockItem.getBlock().isEnabled(client.world.getEnabledFeatures()))
+        return refusePlacement("block_feature_disabled");
+      ItemPlacementContext context = new ItemPlacementContext(client.player, Hand.MAIN_HAND, stack, hit);
+      if (!context.canPlace()) return refusePlacement("destination_not_replaceable");
+      context = blockItem.getPlacementContext(context);
+      if (context == null) return refusePlacement("vanilla_placement_context_rejected");
+      if (!client.world.isInBuildLimit(context.getBlockPos()))
+        return refusePlacement("destination_outside_build_limit");
+      if (!client.world.getWorldBorder().contains(context.getBlockPos()))
+        return refusePlacement("destination_outside_world_border");
+      // Invoke the actual BlockItem implementation, including subclass placement
+      // and collision rules, without calling useOnBlock/place or sending a packet.
+      var state = ((io.gameharness.nativeclient.mixin.BlockItemPlacementAccess) blockItem)
+          .gameharness$getPlacementState(context);
+      if (state == null) {
+        var candidate = blockItem.getBlock().getPlacementState(context);
+        if (candidate != null && !client.world.canPlace(
+            candidate, context.getBlockPos(), net.minecraft.block.ShapeContext.of(client.player)))
+          return refusePlacement("destination_collision");
+        return refusePlacement("vanilla_placement_state_rejected");
+      }
+      confirmationPosition = context.getBlockPos().toImmutable();
+      placementPreflightReason = "passed";
+      return hit;
+    }
+
+    BlockHitResult refusePlacement(String reason) {
+      placementPreflightReason = reason;
+      finish(EffectOutcome.deadline(emissions),
+          "Placement preflight refused: " + reason + "; no placement interaction dispatched", false);
+      return null;
     }
 
     int count(String item) {
@@ -1500,8 +1658,35 @@ public final class NativeClient implements ClientModInitializer {
       return counts.has(item) ? counts.get(item).getAsInt() : 0;
     }
 
+    boolean serverInventoryClean() {
+      return serverInventoryAfter != null && client.player != null
+          && serverInventoryAfter.get("screen_sync_id").getAsInt() == client.player.playerScreenHandler.syncId
+          && InventoryGestureFence.cleanCustody(serverInventoryAfter.get("cursor_count").getAsInt(),
+              serverInventoryAfter.get("crafting_grid_count").getAsInt());
+    }
+
     int beforeCount(String item) {
       return inventoryBefore.has(item) ? inventoryBefore.get(item).getAsInt() : 0;
+    }
+
+    // Collection can remove the selected entity before the requested range is
+    // sampled. Stop emitting immediately; only an owned server inventory gain
+    // can close this as success. Despawn/foreign collection remain unknown.
+    boolean reconcileNearbyPickup() {
+      if (completingPickup) return true;
+      if (!kind.equals("navigate") || pickupItem == null || entity == null
+          || current(targetReference) || !current(tableReference) || !current(gazeReference)
+          || !current(interactionReference) || !authorized(false)
+          || entity.getPos().distanceTo(client.player.getPos()) > 2
+          || (emissions & EffectOutcome.WORLD_EFFECT) == 0) return false;
+      completingPickup = true;
+      pickupReceiptDeadline = System.nanoTime() + 1500000000L;
+      navForward = navBack = navLeft = navRight = navJump = false;
+      looking = false;
+      yawVelocity = pitchVelocity = 0;
+      applyInput();
+      requestInventory();
+      return true;
     }
 
     void tick() {
@@ -1519,6 +1704,11 @@ public final class NativeClient implements ClientModInitializer {
               "unknown",
               "Movement completed, but its authoritative inventory receipt did not arrive",
               false);
+        return;
+      }
+      if (completingPickup) {
+        if (System.nanoTime() >= pickupReceiptDeadline)
+          finish("unknown", "Selected drop disappeared; authoritative pickup receipt timed out", false);
         return;
       }
       ticks++;
@@ -1547,8 +1737,9 @@ public final class NativeClient implements ClientModInitializer {
       }
       boolean completionOnly = kind.equals("dig") && serverBlockRemoved
           || issued && (kind.equals("place") || kind.equals("interact") || kind.equals("attack"))
-          || kind.equals("craft") && issued && Recipes.complete();
+          || kind.equals("craft") && issued && (Recipes.complete() || Recipes.ownsTableGrid(client));
       if (!targetsCurrent() && !completionOnly) {
+        if (reconcileNearbyPickup()) return;
         finish(EffectOutcome.deadline(emissions), "Target incarnation changed before native effect application", false);
         return;
       }
@@ -1567,16 +1758,59 @@ public final class NativeClient implements ClientModInitializer {
         case "navigate" -> {
           Vec3d goal = navigationGoal;
           double range = action.get("range").getAsDouble();
-          if (goal.distanceTo(client.player.getPos()) <= range) {
-            finish("succeeded", "Reached range of the last-authorized target location", true);
+          double positionDistanceSquared = goal.squaredDistanceTo(client.player.getPos());
+          navigationCurrentDistanceSquared = positionDistanceSquared;
+          positionRange = positionDistanceSquared <= range * range;
+          double arrivalDistanceSquared = positionDistanceSquared;
+          boolean arrived = positionRange;
+          if (arrivalMode.equals("interaction")) {
+            arrivalDistanceSquared = goal.squaredDistanceTo(client.player.getEyePos());
+            arrived = arrivalDistanceSquared <= range * range && reachable(target);
+          }
+          if (arrived) {
+            finish("succeeded", arrivalMode.equals("interaction")
+                ? "Block is visible and reachable within the requested eye-to-centre interaction range"
+                : "Reached range of the last-authorized target location", true);
             return;
           }
-          if (initial.distanceTo(goal) > 8
-              || goal.squaredDistanceTo(client.player.getPos()) > 100) {
-            finish("failed", "Navigation exceeds private bounded target geometry", false);
+          String envelopeRejection = NavigationEnvelope.rejection(
+              navigationStartDistanceSquared, positionDistanceSquared);
+          if (envelopeRejection != null) {
+            navigationStopReason = envelopeRejection;
+            finish("failed", String.format(Locale.ROOT,
+                "Navigation refused: %s; start feet-to-target-centre %.3f m (limit %.1f m), "
+                    + "current %.3f m (limit %.1f m). Observation block-lattice radius is not this distance bound",
+                envelopeRejection, Math.sqrt(navigationStartDistanceSquared), NavigationEnvelope.START_LIMIT,
+                Math.sqrt(positionDistanceSquared), NavigationEnvelope.CURRENT_LIMIT), false);
             return;
           }
-          navigate();
+          boolean feasibleRoute = navigate();
+          if (motor != this) return;
+          long now = System.nanoTime();
+          if (feasibleRoute) routeBlockedSince = 0;
+          else if (routeBlockedSince == 0) routeBlockedSince = now;
+          double gap = Math.max(0, Math.sqrt(arrivalDistanceSquared) - range);
+          if (bestArrivalGap - gap > .1) {
+            bestArrivalGap = gap;
+            navigationProgressSince = now;
+          }
+          // Grant one initial camera-settling interval, never a fresh interval
+          // for each turn. Travel around the target cannot reset best-gap progress.
+          if (!navigationProgressArmed && (!looking
+              || CameraMotion.isSettled(camera, yaw, pitch, 3, 5)
+              || now - started >= 750000000L)) {
+            navigationProgressArmed = true;
+            navigationProgressSince = now;
+          }
+          if (routeBlockedSince != 0 && now - routeBlockedSince >= 750000000L)
+            navigationStopReason = "blocked";
+          else if (navigationProgressArmed && now - navigationProgressSince >= 1500000000L)
+            navigationStopReason = "no_progress";
+          if (navigationStopReason != null)
+            finish(EffectOutcome.deadline(emissions),
+                navigationStopReason.equals("blocked")
+                    ? "No feasible supported local route; choose another visible approach"
+                    : "Navigation made no meaningful progress toward the requested arrival range", false);
         }
         case "dig" -> {
           if (client.world.getBlockState(target).isAir()) {
@@ -1601,7 +1835,13 @@ public final class NativeClient implements ClientModInitializer {
           }
         }
         case "equip" -> {
-          if (ticks >= 3) {
+          equipmentSession.tickEquip();
+          inventoryEmissions();
+          if (equipmentSession.failed()) {
+            finish(EffectOutcome.deadline(emissions), "Visible equipment interrupted: " + equipmentSession.reason(), false);
+            return;
+          }
+          if (equipmentSession.closed()) {
             requestInventory();
             if (serverInventoryAfter == null) return;
             String destination = action.get("destination").getAsString();
@@ -1617,6 +1857,9 @@ public final class NativeClient implements ClientModInitializer {
             JsonObject slots = serverInventoryAfter.getAsJsonObject("slots");
             boolean ok =
                 issued
+                    && serverInventoryClean()
+                    && (!destination.equals("hand")
+                        || serverInventoryAfter.get("selected_slot").getAsInt() == slot)
                     && slots.has(Integer.toString(slot))
                     && slots
                         .getAsJsonObject(Integer.toString(slot))
@@ -1624,7 +1867,7 @@ public final class NativeClient implements ClientModInitializer {
                         .getAsString()
                         .equals(action.get("item").getAsString());
             finish(
-                ok ? "succeeded" : "failed",
+                ok ? "succeeded" : EffectOutcome.deadline(emissions),
                 ok
                     ? "Equipped item confirmed by owned server inventory receipt"
                     : "Requested equipment not present in server inventory",
@@ -1634,26 +1877,27 @@ public final class NativeClient implements ClientModInitializer {
         case "craft" -> {
           if (!issued) {
             if (looking && !aligned()) return;
-            issued = Recipes.begin(client, action, target);
+            issued = Recipes.begin(client, action, target, this::inventoryAuthority);
             if (!issued) {
               finish("failed", "No unlocked compatible recipe or reachable crafting grid", false);
               return;
             }
-            emissions |= EffectOutcome.WORLD_EFFECT;
+            if (tableReference != null) emissions |= EffectOutcome.WORLD_EFFECT;
           }
           Recipes.tick(client);
+          inventoryEmissions();
           if (Recipes.invalidated()) {
-            finish(EffectOutcome.deadline(emissions), "Crafting handler instance was replaced; no further clicks applied", false);
+            finish(EffectOutcome.deadline(emissions), "Visible crafting interrupted: " + Recipes.session().reason(), false);
             return;
           }
           if (Recipes.complete()) {
             requestInventory();
             if (serverInventoryAfter == null) return;
             boolean gained =
-                serverCount(action.get("item").getAsString()) - initialCount
+                serverInventoryClean() && serverCount(action.get("item").getAsString()) - initialCount
                     >= Recipes.expectedGain();
             finish(
-                gained ? "succeeded" : "failed",
+                gained ? "succeeded" : EffectOutcome.deadline(emissions),
                 gained
                     ? "Requested craft quantity confirmed by owned server inventory receipt"
                     : "Requested crafted quantity not present in server inventory",
@@ -1663,35 +1907,45 @@ public final class NativeClient implements ClientModInitializer {
         case "place", "interact", "attack" -> {
           if (!aligned()) return;
           if (!issued) {
-            issued = true;
-            ticks = 0;
             if (kind.equals("place")) {
-              if (!reachable(target) || !equip(action.get("item").getAsString(), "hand")) {
-                finish("failed", "Placement item or visible reachable face unavailable", false);
+              if (equipmentSession == null) {
+                if (placementPreflight() == null) return;
+                if (!startEquipment(action.get("item").getAsString(), "hand")) {
+                  inventoryEmissions();
+                  placementPreflightReason = "item_unavailable_before_equipment";
+                  finish(EffectOutcome.deadline(emissions), "Placement item unavailable before equipment; no placement interaction dispatched", false);
+                  return;
+                }
+              }
+              // During a real transfer the item may be on the owned cursor,
+              // not in an inventory slot. Recheck placement only once that
+              // session has deposited it and closed with clean custody.
+              equipmentSession.tickEquip();
+              inventoryEmissions();
+              if (equipmentSession.failed()) {
+                finish(EffectOutcome.deadline(emissions), "Visible placement equipment interrupted: " + equipmentSession.reason(), false);
                 return;
               }
-              emissions |= EffectOutcome.WORLD_EFFECT;
+              if (!equipmentSession.closed()) return;
+              BlockHitResult faceHit = placementPreflight();
+              if (faceHit == null) return;
               initialCount = beforeCount(action.get("item").getAsString());
-              Direction face = Direction.byName(action.get("face").getAsString());
-              if (face == null) {
-                finish("failed", "Unknown face", false);
+              if (!Registries.ITEM.getId(client.player.getMainHandStack().getItem()).getPath()
+                  .equals(action.get("item").getAsString())) {
+                placementPreflightReason = "equipment_not_locally_ready";
+                finish("failed", "Placement equipment not locally ready; no placement interaction dispatched", false);
                 return;
               }
-              Vec3d surface = target.toCenterPos().add(Vec3d.of(face.getVector()).multiply(.499));
-              BlockHitResult faceHit =
-                  client.world.raycast(
-                      new RaycastContext(
-                          client.player.getEyePos(),
-                          surface,
-                          RaycastContext.ShapeType.OUTLINE,
-                          RaycastContext.FluidHandling.NONE,
-                          client.player));
-              if (!faceHit.getBlockPos().equals(target) || faceHit.getSide() != face) {
-                finish("failed", "Requested placement face is not currently visible", false);
-                return;
-              }
-              client.interactionManager.interactBlock(client.player, Hand.MAIN_HAND, faceHit);
+              // Vanilla sends a sequenced interaction even when local prediction
+              // returns PASS/FAIL. Neither result establishes authoritative no-effect.
+              emissions |= EffectOutcome.WORLD_EFFECT;
+              issued = true; ticks = 0;
+              ActionResult local = client.interactionManager.interactBlock(
+                  client.player, Hand.MAIN_HAND, faceHit);
+              placementLocalResult = local.isAccepted() ? "accepted"
+                  : local instanceof ActionResult.Fail ? "fail" : "pass";
             } else if (authorizedEntity(entity) && entity.distanceTo(client.player) <= 4.5) {
+              issued = true; ticks = 0;
               emissions |= EffectOutcome.WORLD_EFFECT;
               if (kind.equals("attack")) {
                 attackNonce = NativeClient.this.nextReceiptNonce();
@@ -1700,6 +1954,7 @@ public final class NativeClient implements ClientModInitializer {
               } else
                 client.interactionManager.interactEntity(client.player, entity, Hand.MAIN_HAND);
             } else if (target != null && reachable(target) && !kind.equals("attack")) {
+              issued = true; ticks = 0;
               emissions |= EffectOutcome.WORLD_EFFECT;
               client.interactionManager.interactBlock(
                   client.player,
@@ -1762,9 +2017,9 @@ public final class NativeClient implements ClientModInitializer {
       boolean attack = interaction.get("kind").getAsString().equals("attack");
       Entity e =
           interactionReference != null
-              ? targetEntity(interactionReference)
+              ? interactionEntityBinding
               : client.crosshairTarget instanceof EntityHitResult hit ? hit.getEntity() : null;
-      if (e != null && client.player.canSee(e) && e.distanceTo(client.player) <= 4.5) {
+      if (e != null && authorizedEntity(e) && e.distanceTo(client.player) <= 4.5) {
         emissions |= EffectOutcome.WORLD_EFFECT;
         if (attack) client.interactionManager.attackEntity(client.player, e);
         else client.interactionManager.interactEntity(client.player, e, Hand.MAIN_HAND);
@@ -1772,7 +2027,7 @@ public final class NativeClient implements ClientModInitializer {
       }
       BlockPos pos =
           interactionReference != null
-              ? targetBlock(interactionReference)
+              ? interactionBinding
               : client.crosshairTarget instanceof BlockHitResult hit ? hit.getBlockPos() : null;
       if (pos != null && reachable(pos)) {
         emissions |= EffectOutcome.WORLD_EFFECT;
@@ -1796,11 +2051,29 @@ public final class NativeClient implements ClientModInitializer {
 
     void finish(String status, String summary, boolean effect) {
       if (motor != this) return;
+      inventoryEmissions();
+      VisibleInventory inventorySession = inventorySession();
       status =
           EffectOutcome.close(
               status, emissions, serverInventoryAfter != null || authoritativeRejection);
+      boolean reportInteractionReach = kind.equals("navigate") && arrivalMode.equals("interaction")
+          && target != null && client.player != null && client.world != null
+          && generation == authority && lifeId == lifecycle.lifeId() && lifecycle.ready()
+          && authorized(false) && targetsCurrent();
+      // Arrival success already proved reach on this application. Negative
+      // feedback probes once at close, never on every out-of-range motor tick.
+      boolean interactionReachable = reportInteractionReach
+          && (status.equals("succeeded") && effect || reachable(target));
+      boolean reportMovement = (kind.equals("move") || kind.equals("navigate"))
+          && initial != null && client.player != null && client.world != null
+          && generation == authority && lifeId == lifecycle.lifeId() && lifecycle.ready()
+          && authorized(false);
+      if (reportMovement && navigationGoal != null)
+        navigationCurrentDistanceSquared = navigationGoal.squaredDistanceTo(client.player.getPos());
       motor = null;
-      Recipes.cancel();
+      if (equipmentSession != null) equipmentSession.cancel(true);
+      Recipes.cancel(true);
+      JsonObject inventoryUi = inventorySession == null ? null : inventorySession.diagnostics();
       controls = null;
       looking = false;
       applyInput();
@@ -1813,8 +2086,52 @@ public final class NativeClient implements ClientModInitializer {
       evidence.addProperty("native_generation", generation);
       evidence.addProperty("world_effect_emitted", (emissions & EffectOutcome.WORLD_EFFECT) != 0);
       evidence.addProperty("camera_changed", (emissions & EffectOutcome.CAMERA) != 0);
+      if (inventoryUi != null) evidence.add("native_inventory_ui", inventoryUi);
+      if (kind.equals("navigate")) {
+        evidence.addProperty("arrival_mode", arrivalMode);
+        evidence.addProperty("position_range", positionRange);
+        if (reportInteractionReach) evidence.addProperty("interaction_reachable", interactionReachable);
+        if (navigationStopReason != null) evidence.addProperty("navigation_stop_reason", navigationStopReason);
+        if (navigationGoal != null) {
+          evidence.addProperty("navigation_start_distance", Math.sqrt(navigationStartDistanceSquared));
+          evidence.addProperty("navigation_current_distance", Math.sqrt(navigationCurrentDistanceSquared));
+          evidence.addProperty("navigation_start_limit", NavigationEnvelope.START_LIMIT);
+          evidence.addProperty("navigation_current_limit", NavigationEnvelope.CURRENT_LIMIT);
+        }
+      }
+      if (kind.equals("place")) {
+        evidence.addProperty("placement_preflight_reason", placementPreflightReason);
+        evidence.addProperty("equipment_effect_emitted", equipmentEffectEmitted);
+        evidence.addProperty("placement_effect_emitted", placementEffectEmitted);
+        if (placementLocalResult != null) evidence.addProperty("placement_local_result", placementLocalResult);
+      }
+      if (reportMovement) {
+        Vec3d end = client.player.getPos();
+        evidence.addProperty("net_displacement", end.distanceTo(initial));
+        evidence.addProperty("horizontal_displacement", Math.hypot(end.x - initial.x, end.z - initial.z));
+        evidence.addProperty("height_change", end.y - initial.y);
+        evidence.addProperty("movement_start_on_ground", movementStartOnGround);
+        Box body = client.player.getBoundingBox();
+        JsonObject mechanical = new JsonObject();
+        mechanical.addProperty("on_ground", client.player.isOnGround());
+        mechanical.addProperty("support_within_0_15", !client.world.isSpaceEmpty(client.player,
+            new Box(body.minX, body.minY - .15, body.minZ, body.maxX, body.minY, body.maxZ)));
+        mechanical.addProperty("headroom_1m_clear",
+            client.world.isSpaceEmpty(client.player, body.stretch(0, 1, 0)));
+        mechanical.addProperty("body_space_clear", client.world.isSpaceEmpty(client.player, body));
+        mechanical.addProperty("horizontal_collision", client.player.horizontalCollision);
+        mechanical.addProperty("vertical_collision", client.player.verticalCollision);
+        evidence.add("movement_end", mechanical);
+      }
       if (applicationRejection != null) evidence.add("application_rejection", applicationRejection);
       if (targetReference != null) evidence.add("target", NativeEffectContract.target(targetReference));
+      if (targetReference != null && target != null) {
+        evidence.addProperty("target_in_observation_projection", blocks.containsKey(targetReference.targetId()));
+        evidence.addProperty("target_incarnation_current", blockIncarnations.current(
+            target, targetReference, incarnationSignals.space(), lifecycle.lifeId()));
+        evidence.addProperty("target_client_air", client.world != null && client.world.getBlockState(target).isAir());
+        evidence.addProperty("server_block_removed", serverBlockRemoved);
+      }
       evidence.addProperty("life_fenced", lifeId != lifecycle.lifeId() || !lifecycle.ready());
       evidence.addProperty("motor_profile", motorProfile.name().toLowerCase(Locale.ROOT));
       evidence.add("start_pose", startPose);
@@ -1838,6 +2155,16 @@ public final class NativeClient implements ClientModInitializer {
       if (serverInventoryAfter != null) {
         evidence.add("inventory_after", serverInventoryAfter.get("counts"));
         evidence.addProperty("inventory_receipt_confirmed", true);
+        if (inventoryUi != null) {
+          evidence.addProperty("inventory_custody_confirmed", serverInventoryClean());
+          evidence.add("inventory_selected_slot", serverInventoryAfter.get("selected_slot"));
+          evidence.add("inventory_cursor_count", serverInventoryAfter.get("cursor_count"));
+          evidence.add("inventory_crafting_grid_count", serverInventoryAfter.get("crafting_grid_count"));
+        }
+        if (completingPickup) {
+          evidence.addProperty("pickup_item", pickupItem);
+          evidence.addProperty("pickup_inventory_gain", Math.max(0, serverCount(pickupItem) - beforeCount(pickupItem)));
+        }
       } else if (client.player != null) evidence.add("inventory_after", inventoryCounts());
       reply(id, outcome, null);
     }

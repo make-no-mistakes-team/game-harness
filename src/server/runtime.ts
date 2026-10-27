@@ -15,9 +15,12 @@ import type {
   ObservationV3,
   PolicyContext,
   RunView,
+  RunPauseCause,
 } from "../shared/contracts.ts";
+import { projectRunOperator } from "./operator-state.ts";
 import type { SkillExecutionView } from "../shared/programs.ts";
 import { goalSchema, verificationResultSchema } from "../shared/validation.ts";
+import { taskTextSchema } from "../shared/tasks.ts";
 import type { EffectContext, EffectScope } from "../shared/control.ts";
 import { sameScreen } from "../shared/control.ts";
 import { adapterCompatibility, canonicalContractJson } from "./adapter-contract.ts";
@@ -287,6 +290,8 @@ export class Runtime {
           session_id: execution.session_id,
           previous_life_id: respawn.life_id,
           life_id: observation.life.life_id,
+          native_boot_id: observation.native_boot_id,
+          space_epoch: observation.space.space_epoch,
           respawn_action_id: respawn.action_id,
           observation_seq: observation.observation_seq,
         });
@@ -364,12 +369,13 @@ export class Runtime {
       observe: () => this.refreshObservation(),
       modelObservation: () => this.modelObservation(),
       projectObservation: (observation, previous) => this.context().adapter.projectObservation(observation, previous),
+      adapter: () => this.context().adapter,
       policies: () => this.reactions.list,
       action: () => this.actions.active?.entry.stored.view ?? this.actions.view,
       programPending: () => this.skills.pending,
       busy: () => this.actions.busy || this.skills.pending,
       persist: (summary) => this.persist(summary),
-      pause: (message) => this.requestSafetyPause(message, false),
+      pause: (message, cause) => this.requestSafetyPause(message, false, cause),
       terminal: (status, message) => this.requestTerminal(status, message),
       speculation: () => this.planning,
       reviewComplete: () => this.finishReview(),
@@ -489,9 +495,11 @@ export class Runtime {
         return;
       }
       if (notice.type === "game_event" && this.run.status === "running") this.handleScopeChange();
-      if (notice.type === "observation" && this.run.status === "running")
-        void this.refreshObservation().catch(() => {});
-      else if (
+      if (notice.type === "observation" && this.run.status === "running") {
+        // The bridge already supplied this authorized read. Refetching here
+        // echoes every external poll and persists a second full observation.
+        try { this.acceptObservation(notice.data, this.generation, this.run); } catch {}
+      } else if (
         notice.type === "state" &&
         (this.run.status === "running" || this.run.status === "reviewing")
       ) {
@@ -517,26 +525,30 @@ export class Runtime {
   }
   snapshot(): RunView | null {
     if (!this.run) return null;
-    const { baseline: _baseline, ...view } = this.run;
+    const { baseline: _baseline, control: _control, ...view } = this.run;
+    const executions = this.store.skillExecutions(this.run.run_id);
     return structuredClone({
       ...view,
       action: this.actions.view,
       policies: this.reactions.list,
       skills: this.store.skills(this.run.run_id),
-      executions: this.store.skillExecutions(this.run.run_id),
+      executions,
+      operator: projectRunOperator(this.store, this.run, this.actions.view, executions, !!(this.lifeRecovery || this.uncertaintyRecovery)),
     });
   }
   getRun(id: string): RunView | null {
     if (this.run?.run_id === id) return this.snapshot();
     const run = this.store.getRun(id);
     if (!run) return null;
-    const { baseline: _baseline, ...view } = run;
+    const { baseline: _baseline, control: _control, ...view } = run;
+    const executions = this.store.skillExecutions(id);
     return {
       ...view,
       action: null,
       policies: this.store.policies(id),
       skills: this.store.skills(id),
-      executions: this.store.skillExecutions(id),
+      executions,
+      operator: projectRunOperator(this.store, run, null, executions),
     };
   }
 
@@ -591,6 +603,7 @@ export class Runtime {
     if (command === "pause" && this.run?.run_id === id &&
       ["running", "reviewing"].includes(this.run.status)) {
       this.run.status = "pausing";
+      this.controlState().pause_cause = "operator";
       this.fenceAuthority("Operator paused the run; effect admission revoked immediately");
       this.persist("Pause admission revoked before waiting for drain");
     }
@@ -693,30 +706,7 @@ export class Runtime {
     const run = this.run;
     if (!run) throw new RuntimeFault("not_found", "No run exists");
     const request = (async () => {
-      const observation = this.context().registration.parseObservation(await this.game.observe());
-      if (
-        generation !== this.generation ||
-        observation.world_id !== run.world_id ||
-        observation.epoch !== run.epoch ||
-        observation.session_id !== run.session_id || observation.native_boot_id !== run.native_boot_id ||
-        observation.compatibility_hash !== run.compatibility_hash
-      )
-        throw new RuntimeFault(
-          "stale_epoch",
-          "The observation belongs to obsolete run authority",
-        );
-      if (
-        !this.observation ||
-        observation.observation_seq >= this.observation.observation_seq
-      )
-        this.observation = observation;
-      const accepted = this.observation;
-      const evidence = observationEvidence(this.context().adapter, this.effectContext(), accepted);
-      this.verificationSnapshot = evidence;
-      this.store.event(run.run_id, "adapter.evidence", "Fresh adapter-owned permitted observation", evidence as unknown as Json);
-      if (observation.life.status === "dead") this.handleDeath();
-      this.verifyGoal();
-      return accepted;
+      return this.acceptObservation(await this.game.observe(), generation, run);
     })();
     this.observationRequest = request;
     try {
@@ -724,6 +714,25 @@ export class Runtime {
     } finally {
       if (this.observationRequest === request) this.observationRequest = null;
     }
+  }
+
+  private acceptObservation(value: unknown, generation: number, run: StoredRun): ObservationV3 {
+    const observation = this.context().registration.parseObservation(value);
+    if (
+      generation !== this.generation || this.run !== run ||
+      observation.world_id !== run.world_id || observation.epoch !== run.epoch ||
+      observation.session_id !== run.session_id || observation.native_boot_id !== run.native_boot_id ||
+      observation.compatibility_hash !== run.compatibility_hash
+    )
+      throw new RuntimeFault("stale_epoch", "The observation belongs to obsolete run authority");
+    if (this.observation && observation.observation_seq <= this.observation.observation_seq) return this.observation;
+    this.observation = observation;
+    const evidence = observationEvidence(this.context().adapter, this.effectContext(), observation);
+    this.verificationSnapshot = evidence;
+    this.store.event(run.run_id, "adapter.evidence", "Fresh adapter-owned permitted observation", evidence as unknown as Json);
+    if (observation.life.status === "dead") this.handleDeath();
+    this.verifyGoal();
+    return observation;
   }
 
   private verifyGoal(): void {
@@ -767,7 +776,7 @@ export class Runtime {
         );
       const parsed = z
         .object({
-          task: z.string().trim().min(1).max(4000),
+          task: taskTextSchema,
           goal: goalSchema,
           model_id: z.string().min(1).max(200),
           experience_id: z
@@ -998,6 +1007,7 @@ export class Runtime {
       this.assertCurrent(generation);
       if (resuming) {
         run.error = null;
+        this.controlState().pause_cause = null;
         this.persist(
           "Explicit resume prepared successfully; previous causal fault cleared",
         );
@@ -1008,6 +1018,7 @@ export class Runtime {
       const failure =
         "The authenticated agent or isolated worker could not be prepared. Check readiness before resuming.";
       run.error ??= failure;
+      this.controlState().pause_cause ??= "preparation_failed";
       await this.halt("paused", failure);
     }
   }
@@ -1248,6 +1259,7 @@ export class Runtime {
         // Already fenced and drained: do not manufacture proof or destroy a
         // healthy session merely because reconciliation remains unavailable.
         run.status = "paused";
+        this.controlState().pause_cause = "safety";
         run.model_status = "idle";
         run.error ??= failure;
         this.store.event(run.run_id, "runtime.uncertainty_blocked", failure, {
@@ -1298,10 +1310,14 @@ export class Runtime {
         await this.halt("stopped", message);
     });
   }
-  private requestSafetyPause(message: string, reconnect: boolean): void {
+  private controlState() {
+    return this.run!.control ??= { pause_cause: null, cleanup_error: null };
+  }
+  private requestSafetyPause(message: string, reconnect: boolean, cause: RunPauseCause = "safety"): void {
     if (!this.run || TERMINAL[this.run.status]) return;
     if (reconnect) this.needsReconnect = true;
     this.run.error ??= message;
+    this.controlState().pause_cause ??= cause;
     if (["paused", "pausing", "stopping"].includes(this.run.status)) {
       this.persist();
       return;
@@ -1371,6 +1387,7 @@ export class Runtime {
   ): Promise<void> {
     const run = this.run!;
     run.status = status === "paused" ? "pausing" : "stopping";
+    this.controlState().cleanup_error = null;
     this.fenceAuthority(message);
     const generation = this.generation;
     this.persist(
@@ -1404,6 +1421,7 @@ export class Runtime {
     if (!disconnectConfirmed) this.needsReconnect = true;
     if (generation !== this.generation) return;
     if (!disconnectConfirmed || !cleanupConfirmed) {
+      this.controlState().cleanup_error = "Shutdown could not be confirmed. Retry Stop before reconnecting or starting another run.";
       run.error ??= BRIDGE_FAILURE;
       run.model_status = "error";
       this.persist("Shutdown remains unconfirmed; admission stays closed");

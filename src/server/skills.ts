@@ -19,7 +19,6 @@ import type {
 import {
   skillCapabilitySchema,
   skillStartRequestSchema,
-  skillResultSchema,
 } from "../shared/validation.ts";
 import { programFingerprint, validateSkill } from "./program-validation.ts";
 import type { EffectContext, EffectInvocation, EffectScope } from "../shared/control.ts";
@@ -31,7 +30,7 @@ import type { Store } from "./store.ts";
 import type { LookaheadConfig } from "../shared/planning.ts";
 import { ExecutionTrace } from "./execution-trace.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
-import { capabilityFailure, programDiagnostic } from "./program-diagnostics.ts";
+import { capabilityFailure, GeneratedResultValidationError, parseGeneratedSkillResult, programDiagnostic } from "./program-diagnostics.ts";
 export interface SkillHost {
   authorize(scope: EffectContext): void;
   adapter(): RuntimeAdapter | null;
@@ -117,11 +116,16 @@ export class SkillManager {
     runId: string,
     spec: unknown,
     beforeCommit: () => void = () => {},
+    registration?: { call_id: string; input: Json },
   ): Promise<SkillView> {
+    if (registration) {
+      const previous = this.store.completedToolCall(runId, registration.call_id, registration.input);
+      if (previous !== null) return this.store.skill(runId, previous as unknown as SkillRef);
+    }
     const validated = await validateSkill(spec, this.context());
     this.validateDependencies(runId, validated.dependencies);
     beforeCommit();
-    const view = this.store.registerSkill(runId, validated);
+    const view = this.store.registerSkill(runId, validated, registration);
     this.host.changed(false);
     return view;
   }
@@ -311,7 +315,7 @@ export class SkillManager {
           "skill.running",
           "Skill dispatched inside its isolated execution",
         );
-        outcome = skillResultSchema.parse(
+        outcome = parseGeneratedSkillResult(
           await this.sandbox.runSkill(
             skill.source,
             view.args,
@@ -332,7 +336,7 @@ export class SkillManager {
               api: { api_version: 4, action_enabled: this.context().adapter.action_capability !== null,
                 supports_respawn: this.context().adapter.supports_respawn, bindings: this.context().adapter.bindings },
             },
-          ),
+          ), skill.hash,
         );
         await Promise.all([...live.children].map((child) => child.done));
         if (!live.controller.signal.aborted) {
@@ -367,7 +371,8 @@ export class SkillManager {
             view.result = {
               status: "failed",
               summary: view.error,
-              result: null,
+              result: error instanceof GeneratedResultValidationError && error.rejectedResult !== null
+                ? { rejected_result: error.rejectedResult } : null,
             };
         }
       } finally {

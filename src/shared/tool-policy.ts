@@ -4,6 +4,7 @@ export type ToolModule = "reflex" | "memory";
 export const TOOL_POLICY = Object.freeze({
   observe: { roles: ["ordinary", "speculative", "review"], module: null },
   program_write: { roles: ["ordinary", "review"], module: null },
+  program_submit: { roles: ["ordinary"], module: null },
   program_run: { roles: ["ordinary"], module: null },
   program_inspect: { roles: ["ordinary", "speculative", "review"], module: null },
   program_review: { roles: ["ordinary", "review"], module: null },

@@ -5,8 +5,159 @@ import type { Json } from "../src/shared/contracts.ts";
 import type { ProgramBranchTrace, ProgramTraceLossReason } from "../src/shared/program-trace.ts";
 import { instrumentProgram, ProgramTraceReceiver } from "../src/server/program-instrumentation.ts";
 import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
+import { LOCAL_FEEDBACK_EXAMPLE } from "../src/server/program-help.ts";
+import { readProgramDiagnostic } from "../src/server/program-diagnostics.ts";
 
 const adapter = minecraftTestAdapter();
+
+test("a substantial procedure retains broker receipts while returning compact semantic facts", async () => {
+  const retained: Json[] = [];
+  const run = await execute(`
+let completed = 0;
+for (let i = 0; i < 56; i++) {
+  const receipt = await game.action({kind:"fixture_effect"});
+  if (receipt.status !== "succeeded") return {status:"blocked",summary:"Effect refused",result:{completed}};
+  completed++;
+}
+return {status:"completed",summary:"Bounded work finished",result:{completed}};
+`, async () => {
+    const receipt = { status: "succeeded", summary: "Confirmed fixture effect", evidence: { note: "x".repeat(1500), count: retained.length + 1 } };
+    retained.push(receipt); return receipt;
+  });
+  expect(run.failure).toBe(false);
+  expect(run.result).toEqual({ status: "completed", summary: "Bounded work finished", result: { completed: 56 } });
+  expect(retained).toHaveLength(56);
+  expect(Buffer.byteLength(JSON.stringify(retained))).toBeGreaterThan(65536);
+  expect(retained.at(-1)).toMatchObject({ evidence: { count: 56 } });
+});
+
+test("terminal UTF-8 overflow reports its own frame boundary without replaying completed effects", async () => {
+  let effects = 0;
+  const run = await execute(`
+await game.action({kind:"fixture_effect"});
+return {status:"completed",summary:"Effect finished",result:{text:"😀".repeat(16384)}};
+`, async () => { effects++; return { status: "succeeded", summary: "Applied", evidence: { effect_confirmed: true } }; });
+  expect(effects).toBe(1);
+  expect(run.failure).toBe(true);
+  expect(run.terminalFrame).toMatchObject({ type: "skill_failure", diagnostic: {
+    type: "ProgramOutputError", code: "program_output_limit",
+    output: { phase: "terminal_result", reason: "utf8_bytes", maximum_bytes: 65536, completed_capability_calls: 1 },
+  } });
+  const diagnostic = run.terminalFrame!.diagnostic as { output: { actual_bytes: number } };
+  expect(diagnostic.output.actual_bytes).toBeGreaterThan(65536);
+  expect(diagnostic.output.actual_bytes).toBeLessThan(66000);
+  expect(run.requests).toHaveLength(1);
+  expect(readProgramDiagnostic(run.terminalFrame!.diagnostic, run.program.source_hash)).toMatchObject({
+    output: { actual_bytes: diagnostic.output.actual_bytes, completed_capability_calls: 1 },
+  });
+});
+
+test("an authored output_limit string is not classified as a proven terminal serialization failure", async () => {
+  const run = await execute('throw new Error("output_limit");');
+  expect(run.failure).toBe(true);
+  expect(run.terminalFrame).toMatchObject({ diagnostic: { type: "Error", message: "output_limit" } });
+  expect((run.terminalFrame!.diagnostic as Record<string, unknown>).output).toBeUndefined();
+});
+
+for (const [reason, source] of [
+  ["json_depth", 'let value=null; for(let i=0;i<40;i++) value={child:value}; return {status:"completed",summary:"Deep",result:value};'],
+  ["json_serialization", 'const value={}; value.self=value; return {status:"completed",summary:"Cyclic",result:value};'],
+]) {
+  test(`terminal ${reason} failure is distinguished from earlier gameplay failure`, async () => {
+    const run = await execute(source!);
+    expect(run.failure).toBe(true);
+    expect(run.terminalFrame).toMatchObject({ diagnostic: { type: "ProgramOutputError",
+      output: { phase: "terminal_result", reason, completed_capability_calls: 0 } } });
+  });
+}
+
+test("the disclosed local example retains fresh refusal state and makes only one distinct authored selection", async () => {
+  const selections: unknown[] = [];
+  let reads = 0;
+  const run = await execute(LOCAL_FEEDBACK_EXAMPLE + `
+return await applyAndCheck({kind:"fixture_effect",selection:"old"},
+  observation => observation.data.done === true,
+  observation => ({kind:"fixture_effect",selection:observation.data.next}));
+`, async (request): Promise<Json> => {
+    if (request.kind === "observe") return { data: { done: ++reads === 3, next: reads === 1 ? "old" : "fresh" } };
+    selections.push(request.action);
+    return selections.length === 1
+      ? { status: "failed", summary: "Settled refusal", evidence: { world_effect_emitted: false, neutralized: true } }
+      : { status: "succeeded", summary: "Distinct authorized action completed", evidence: { effect_confirmed: true } };
+  });
+  expect(run.failure).toBe(false);
+  expect(selections).toEqual([{ kind: "fixture_effect", selection: "old" }, { kind: "fixture_effect", selection: "fresh" }]);
+  expect(run.result).toMatchObject({ status: "completed", result: { postcondition_met: true } });
+});
+
+test("the disclosed local example does not retry unknown application or reuse its prior observation as success", async () => {
+  let effects = 0, reads = 0;
+  const run = await execute(LOCAL_FEEDBACK_EXAMPLE + `
+return await applyAndCheck({kind:"fixture_effect"}, observation => observation.data.done,
+  () => ({kind:"fixture_other"}));
+`, async (request): Promise<Json> => {
+    if (request.kind === "observe") { reads++; return { data: { done: false } }; }
+    effects++; return { status: "unknown", summary: "Application unknown", evidence: { world_effect_emitted: true, neutralized: true } };
+  });
+  expect(run.failure).toBe(false);
+  expect({ effects, reads }).toEqual({ effects: 1, reads: 1 });
+  expect(run.result).toMatchObject({ status: "blocked", result: { postcondition_met: false, action_status: "unknown" } });
+});
+
+test("actionAndObserve lets an authored postcondition accept a settled refusal without repeating the effect", async () => {
+  let effects = 0;
+  const run = await execute(`
+const checked = await game.actionAndObserve({kind:"fixture_pickup"});
+const count = checked.observation?.data.player.inventory.find(i=>i.name==="fixture_material")?.count ?? 0;
+return {status:count===3?"completed":"blocked",summary:"Checked actual postcondition",result:{count,action:checked.action}};
+`, async (request): Promise<Json> => {
+    if (request.kind === "action") {
+      effects++;
+      return { status: "failed", summary: "Selected handle expired", evidence: {
+        world_effect_emitted: false, neutralized: true, effect_confirmed: false,
+      } };
+    }
+    return { data: { player: { inventory: [{ name: "fixture_material", count: 3 }] } } };
+  });
+  expect(run.failure).toBe(false);
+  expect(run.result).toMatchObject({ status: "completed", result: { count: 3, action: { status: "failed" } } });
+  expect(effects).toBe(1);
+});
+
+for (const outcome of [
+  { status: "unknown", evidence: { world_effect_emitted: true, neutralized: true } },
+  { status: "cancelled", evidence: { world_effect_emitted: false, neutralized: true } },
+  { status: "failed", requires_reconnect: true, evidence: { world_effect_emitted: false, neutralized: true } },
+  { status: "failed", evidence: { world_effect_emitted: true, neutralized: true } },
+  { status: "failed", evidence: {} },
+]) {
+  test(`actionAndObserve does not grant continuation for ${JSON.stringify(outcome)}`, async () => {
+    let observations = 0;
+    const run = await execute(`
+const checked = await game.actionAndObserve({kind:"fixture_effect"});
+return {status:"blocked",summary:"Outcome retained without continuation",result:checked};
+`, async request => {
+      if (request.kind === "observe") { observations++; throw new Error("Forbidden observation after non-continuable outcome"); }
+      return { ...outcome, summary: "Unconfirmed fixture outcome" } as Json;
+    });
+    expect(run.failure).toBe(false);
+    expect(run.result).toMatchObject({ status: "blocked", result: { action: outcome, observation: null } });
+    expect(observations).toBe(0);
+  });
+}
+
+test("actionAndObserve propagates revoked observation authority instead of returning stale state", async () => {
+  const run = await execute(`
+try { await game.actionAndObserve({kind:"fixture_effect"}); }
+catch (error) { return {status:"blocked",summary:"Fresh state authority revoked",result:{code:error.code}}; }
+return {status:"completed",summary:"Must not complete",result:null};
+`, async request => {
+    if (request.kind === "action")
+      return { status: "succeeded", summary: "Interval completed", evidence: { effect_confirmed: true } };
+    throw { code: "stale_context", message: "Current observation authority revoked" };
+  });
+  expect(run.result).toMatchObject({ status: "blocked", result: { code: "stale_context" } });
+});
 
 /** Exercise the real inner worker protocol, not a production isolation fallback. */
 async function execute(

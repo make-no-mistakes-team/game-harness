@@ -8,6 +8,7 @@ import type { GameAction, PolicySpec } from "../src/shared/contracts.ts";
 import { diagnosticAuthorityFixture, minecraftTestAdapter, sha256 } from "./helpers/adapter-contract.ts";
 import { programFingerprint } from "../src/server/program-validation.ts";
 import { createHash } from "node:crypto";
+import { projectRunOperator } from "../src/server/operator-state.ts";
 
 const adapter = minecraftTestAdapter(), compatibilityHash = sha256(adapter.descriptor);
 
@@ -108,6 +109,38 @@ const move: GameAction = {
   duration_ms: 200,
   controls: { forward: true },
 };
+
+test("operator projection uses concrete model and recovery state without classifying error text", () => {
+  const { store, run } = fixture();
+  run.error = "Provider outage words are not a typed failure signal";
+  expect(projectRunOperator(store, run, null, []).state).toBe("waiting");
+  run.model_status = "thinking";
+  expect(projectRunOperator(store, run, null, []).state).toBe("thinking");
+  expect(projectRunOperator(store, run, null, [], true).state).toBe("recovering");
+  run.status = "paused";
+  for (const cause of ["operator", "deadline", "provider_aborted", "observation_unavailable", "preparation_failed", "safety"] as const) {
+    run.control = { pause_cause: cause, cleanup_error: null };
+    expect(projectRunOperator(store, run, null, []).state).toBe("paused");
+  }
+  run.control = { pause_cause: "provider_failure", cleanup_error: null };
+  expect(projectRunOperator(store, run, null, []).state).toBe("provider_unavailable");
+});
+
+test("durable operator completion and pause cause survive a new Store reader", () => {
+  const { directory, store, run } = fixture();
+  run.status = "stopped";
+  run.control = { pause_cause: "provider_failure", cleanup_error: null };
+  store.saveRun(run);
+  store.event(run.run_id, "task.completion_reported", "Model claim, not verifier proof");
+  const reader = new Store(directory);
+  try {
+    expect(projectRunOperator(reader, reader.getRun(run.run_id)!, null, [])).toMatchObject({
+      state: "stopped", pause_cause: "provider_failure", completion: "model_reported_unverified",
+    });
+    store.event(run.run_id, "goal.verified", "Trusted verifier evidence");
+    expect(projectRunOperator(reader, reader.getRun(run.run_id)!, null, []).completion).toBe("verified");
+  } finally { reader.close(); }
+});
 
 test("connection epochs advance durably before any run exists and across restarts", () => {
   const directory = mkdtempSync(path.join(tmpdir(), "gameharness-epochs-"));

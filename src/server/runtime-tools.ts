@@ -1,4 +1,4 @@
-import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import type { AgentTool, BeforeToolCallContext } from "@oh-my-pi/pi-agent-core/types";
 import { z } from "zod";
 import type { Json, ObservationV3, ProgramEvidenceView, RuntimeAdapter } from "../shared/contracts.ts";
 import { toolCatalogAllows, type ToolModule, type ToolRole } from "../shared/tool-policy.ts";
@@ -14,7 +14,7 @@ import { RuntimeFault } from "./runtime-fault.ts";
 import type { ModelObservation } from "./actor-frames.ts";
 import { ProgramOperations } from "./program-operations.ts";
 import { programHelp } from "./program-help.ts";
-import { helpSchema, memorySchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
+import { helpSchema, memorySchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
 
 const faultIssuesSchema = z.array(z.object({
   code: z.string().max(80),
@@ -24,6 +24,23 @@ const faultIssuesSchema = z.array(z.object({
   limit: z.object({ maximum: z.number().finite(), actual: z.number().finite() }).nullable().optional(),
   latest_parent: z.object({ name: z.string().max(80), version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).nullable().optional(),
 })).max(32);
+
+const runtimeTools = new WeakSet<AgentTool>();
+/** The SDK may heal types/nulls before this supported hook. Preserve the actor's
+ * original input for our own strict validation, before identity or persistence. */
+export function preserveRuntimeToolArguments(context: BeforeToolCallContext): void {
+  if (!runtimeTools.has(context.tool) || context.args === context.toolCall.arguments) return;
+  const original = context.toolCall.arguments;
+  if (context.args === null || typeof context.args !== "object") return;
+  for (const key of Object.keys(context.args)) delete context.args[key];
+  if (original !== null && typeof original === "object" && !Array.isArray(original)) {
+    // Unknown JSON keys must remain own data properties for strict validation;
+    // Object.assign would invoke the legacy __proto__ setter instead.
+    for (const key of Object.keys(original))
+      Object.defineProperty(context.args, key, { value: original[key], enumerable: true, configurable: true, writable: true });
+  }
+  else context.args.__invalid_runtime_arguments = true;
+}
 
 export interface RuntimeToolHost {
   run(): StoredRun;
@@ -55,28 +72,54 @@ export class RuntimeTools {
     const role = (): ToolRole => run.status === "reviewing" ? "review" : this.host.planning().projection()?.planning_active ? "speculative" : "ordinary";
     const result = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value });
     const tool = <T>(name: string, description: string, schema: z.ZodType<T>,
-      handler: (input: T, callId: string, signal: AbortSignal | undefined, commit: () => void) => unknown | Promise<unknown>): AgentTool => ({
+      handler: (input: T, callId: string, signal: AbortSignal | undefined, commit: () => void) => unknown | Promise<unknown>): AgentTool => {
+      const registered: AgentTool = {
       name, label: name, description, intent: "omit", concurrency: "exclusive", strict: false,
+      // Only schema mismatches reach the host; malformed JSON remains SDK-owned.
+      lenientArgValidation: true,
       parameters: z.toJSONSchema(schema, { unrepresentable: "any", io: "input" }),
       execute: async (callId, raw, signal) => {
+        let argumentError: z.ZodError | null = null;
         try {
           if (this.host.run() !== run)
             throw new RuntimeFault("stale_context", "This tool call belongs to a different run");
           if (!toolCatalogAllows(role(), name, this.modules))
             throw new RuntimeFault("forbidden", "This tool is not authorized for the current role and disclosed modules");
-          const input = schema.parse(raw);
+          const parsed = schema.safeParse(raw);
+          if (!parsed.success) { argumentError = parsed.error; throw argumentError; }
+          const input = parsed.data;
           const identity = { tool: name, input } as unknown as Json;
           const operation = input && typeof input === "object" && "operation" in input ? input.operation : null;
-          const mutation = name === "task_finish" || name === "program_write" || name === "program_review" || name === "prepare_next" ||
+          const mutation = name === "task_finish" || name === "program_write" || name === "program_submit" || name === "program_review" || name === "prepare_next" ||
             name === "program_run" && operation !== "inspect" || name === "reflex" && operation !== "inspect" ||
             name === "memory" && operation !== "catalog";
           const completed = mutation ? this.store.completedToolCall(run.run_id, callId, identity) : null;
           if (completed !== null) return result(completed);
+          const submitted = name === "program_submit" ? operations.submissionReceipt(callId, identity) : null;
+          if (submitted !== null) {
+            // Recover the already immutable two-phase result, not execution
+            // authority. A cancelled/stale request cannot perform new work.
+            this.store.completeToolCall(run.run_id, callId, identity, submitted);
+            return result(submitted);
+          }
           const replay = name === "program_run" && operation === "start" &&
             this.skills.get(run.run_id, { start_key: operations.startKey(callId) }) !== null;
           if (signal?.aborted && !replay) throw new RuntimeFault("stale_context", "The strategic request was cancelled");
           if (!replay) this.host.assertCurrent(generation);
-          const commit = replay ? () => {} : this.host.toolAuthority();
+          const authority = replay ? () => {} : this.host.toolAuthority();
+          const submissionScope = () => JSON.stringify([run.task, run.goal, run.world_id, run.epoch, run.session_id, run.life_id,
+            run.native_boot_id, run.space_epoch, run.compatibility_hash]);
+          const originalScope = name === "program_submit" ? submissionScope() : null;
+          const commit = () => {
+            if (name === "program_submit") {
+              if (this.host.run() !== run || signal?.aborted || submissionScope() !== originalScope)
+                throw new RuntimeFault("stale_context", "Submission authority changed before admission");
+              this.host.assertCurrent(generation);
+              if (!toolCatalogAllows(role(), name, this.modules))
+                throw new RuntimeFault("forbidden", "Submission is not authorized for the current role");
+            }
+            authority();
+          };
           commit();
           const assessment = role() === "review" && (name === "program_review" ||
             name === "program_write" && input !== null && typeof input === "object" && "reason" in input);
@@ -88,8 +131,9 @@ export class RuntimeTools {
           const value = typed ? typed.value : handled;
           if (mutation) this.store.completeToolCall(run.run_id, callId, identity, JSON.parse(JSON.stringify(value)) as Json);
           if (assessment) this.reviewDecisions.add(callId);
-          // A successful finish deliberately consumes its own run authority.
-          if (name !== "task_finish") {
+          // Finish consumes authority; submit also reports persisted source
+          // when authority was revoked between persistence and admission.
+          if (name !== "task_finish" && name !== "program_submit") {
             commit();
             if (!replay) this.host.assertCurrent(generation);
           }
@@ -99,13 +143,17 @@ export class RuntimeTools {
           const response = result(value);
           return typed ? { ...response, content: [...response.content, ...typed.images] } : response;
         } catch (error) {
+          const invalidArguments = argumentError !== null && error === argumentError;
           const failure: Record<string, Json> = error instanceof ProgramValidationError
             ? { code: "invalid_program", message: name === "prepare_next" ? "Guard must be an async BODY using only observation,args bindings and returning a strict boolean; no wrapper/import/export." : "Program failed executable validation; supply an async BODY with game,args and no wrapper/import/export. Original and canonical source are limited to 16 KiB.", retryable: false, issues: JSON.parse(JSON.stringify(error.issues)) as Json }
             : error instanceof RuntimeFault
               ? { code: error.code, message: error.message, retryable: false }
-              : { code: error instanceof z.ZodError ? "invalid_request" : "backend_unavailable", message: error instanceof z.ZodError ? "Tool arguments do not match the advertised schema" : "The requested operation could not complete safely", retryable: false };
-          if (error instanceof z.ZodError)
-            failure.issues = JSON.parse(JSON.stringify(error.issues)) as Json;
+              : { code: invalidArguments ? "invalid_request" : "backend_unavailable", message: invalidArguments ? "Tool arguments do not match the advertised schema; no operation was admitted" : "The requested operation could not complete safely", retryable: false };
+          if (argumentError && invalidArguments)
+            failure.issues = argumentError.issues.slice(0, 16).map(issue => ({
+              code: issue.code, path: issue.path.map(String).join(".").slice(0, 160),
+              message: issue.code === "unrecognized_keys" ? "Unknown fields are not accepted" : issue.message.slice(0, 300),
+            }));
           if (error instanceof RuntimeFault && "issues" in error && Array.isArray(error.issues)) {
             const issues = faultIssuesSchema.safeParse(error.issues.slice(0, 32));
             if (issues.success) failure.issues = JSON.parse(JSON.stringify(issues.data)) as Json;
@@ -119,7 +167,10 @@ export class RuntimeTools {
           return { ...result({ error: failure }), isError: true };
         }
       },
-    });
+      };
+      runtimeTools.add(registered);
+      return registered;
+    };
     return [
       tool("observe", "Obtain a fresh authorized player observation and current typed actor image when enabled; no authority identities are caller supplied.", z.object({}).strict(), async () => {
         const selected = this.host.modelObservation ? await this.host.modelObservation() :
@@ -128,6 +179,7 @@ export class RuntimeTools {
         return { value: { ...operations.workspace.observationView(selected.observation, projection), image_metadata: selected.image_metadata }, images: selected.images };
       }),
       tool("program_write", "Create or revise a compact named JavaScript taskflow. Existing names require based_on. Optional reason links the actual revision to matching feedback, not proven efficacy.", programWriteSchema, (input, callId, _signal, commit) => operations.write(input, callId, commit)),
+      tool("program_submit", "Explicitly write one immutable program and start that exact version through ordinary admission. Returns persisted source separately from started/refused/unknown execution; never automatically retry an unknown start. Existing names require based_on.", programSubmitSchema, (input, callId, _signal, commit) => operations.submit(input, callId, commit)),
       tool("program_run", "Start a named exact or latest validated program once; inspect/stop current work, activate prepared next work, or select one finite attention wake. The host owns retry identity and authority.", programRunSchema, (input, callId, _signal, commit) => operations.runProgram(input, callId, commit)),
       tool("program_inspect", "Read named catalog/source/execution/trace/feedback/comparison/planning views without effects. Preserve page cursors and explicit omissions.", programInspectSchema, (input) => operations.inspect(input)),
       tool("program_review", "Record keep or insufficient_evidence for the latest matching outcome of a named version. A performed code experiment is linked directly through program_write.reason.", programReviewSchema, (input, callId) => operations.review(input, callId)),

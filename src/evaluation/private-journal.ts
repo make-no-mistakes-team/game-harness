@@ -100,7 +100,7 @@ export class PrivateJournal {
       const value = { ...input, run_id: this.runId, evidence_complete: !this.failures.length, failures: this.failures,
         journal: this.journal, image_artifacts: [...this.images.values()], text_bytes: this.text,
         limits: { max_text_bytes: this.maxText, max_pending_bytes: this.maxPending, max_image_bytes: 32 * 1024 ** 3, max_images: 12000 },
-        context_provenance: "Final SDK-visible context observed additively; not wire payload. Wire attempts remain unknown.",
+        context_provenance: "SDK-visible context retained before request assembly and at the final supplemented stream invocation; neither is wire payload. Wire attempts remain unknown.",
         reasoning: "Private/hidden provider reasoning is redacted, never evidence.",
         omissions: this.failures.length ? ["Evidence is incomplete; capacity or persistence failure stopped the attempt."] : [],
         scope: "Authorized observations, capability requests/results before ordinary trace caps, visible Agent events, immutable source snapshots and native receipts. No secret-store or hidden-evaluator capture." };

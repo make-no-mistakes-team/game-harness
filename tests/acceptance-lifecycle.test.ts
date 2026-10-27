@@ -18,13 +18,67 @@ async function acceptanceLifecycle(mode: string) {
     const [stdout, stderr, exit] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
     ]);
-    const expectedExit = mode === "deadline" || mode.startsWith("image-") ? 0 : mode === "sigterm" ? 143 : 130;
+    const expectedExit = mode === "deadline" || mode.startsWith("image-") || mode.startsWith("development-") ? 0 : mode === "sigterm" ? 143 : 130;
     if (exit !== expectedExit) throw new Error(`Isolated acceptance ${mode} failed (${exit}, expected ${expectedExit}): ${stderr}\n${stdout}`);
     const line = stdout.split("\n").find(value => value.startsWith("ACCEPTANCE_RESULT "));
     if (!line) throw new Error(`Missing actual acceptance lifecycle evidence: ${stderr}\n${stdout}`);
     return JSON.parse(await readFile(join(root, "fixture-result.json"), "utf8"));
   } finally { clearTimeout(deadline); }
 }
+
+test("a synthetic renderer exits when its fixture owner is hard-killed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "gameharness-acceptance-lifecycle-")); roots.push(root);
+  const child = Bun.spawn([process.execPath, "--no-env-file",
+    join(import.meta.dir, "helpers/acceptance-lifecycle.fixture.ts"), "orphan-parent-death", root], {
+    stdout: "ignore", stderr: "ignore", env: { ...process.env, GAMEHARNESS_DATA_DIR: join(root, "runtime") },
+  });
+  let rendererPid: number | undefined;
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  try {
+    const deadline = performance.now() + 8000;
+    while (performance.now() < deadline && rendererPid === undefined) {
+      try { rendererPid = Number(await readFile(join(root, "runtime/evidence/case-collect_wood-recording/renderer.pid"), "utf8")); }
+      catch { await Bun.sleep(10); }
+    }
+    expect(rendererPid).toBeDefined();
+    child.kill("SIGKILL"); await child.exited;
+    const closedBy = performance.now() + 1000;
+    while (alive(rendererPid!) && performance.now() < closedBy) await Bun.sleep(10);
+    expect(alive(rendererPid!)).toBe(false);
+  } finally {
+    child.kill("SIGKILL"); await child.exited;
+    if (rendererPid !== undefined && alive(rendererPid)) process.kill(rendererPid, "SIGKILL");
+  }
+}, 12000);
+
+test("Minecraft development retains a custom completion claim without inventing verification", async () => {
+  const result = await acceptanceLifecycle("development-custom-finish");
+  expect(result.report.results[0]).toMatchObject({
+    prompt: "Collect wood, make a table and keep four planks.",
+    verification: null, declared_verifier: null, completion_claim: "model_reported_unverified",
+    outcome: { goal_verified: null },
+  });
+  expect(result.attempts).toHaveLength(1);
+  expect(result.attempts[0].state).toBe("settled");
+  expect(result.fixtureConditions.seed).toBe("20261026");
+  expect(result.report.cleanup_confirmed).toBe(true);
+  expect({ unchanged: result.unchangedAfterReturn, changes: result.postReturnChanges }).toEqual({ unchanged: true, changes: [] });
+  expect(result.report.cost_to_result).toBeUndefined();
+  expect(result.report.diagnostic_history).toEqual([expect.objectContaining({
+    attempt_id: result.attempts[0].attemptId, goal_verified: null,
+  })]);
+}, 15000);
+
+test("Minecraft development bounds real SDK transport and keeps the stone criterion for the full request", async () => {
+  const result = await acceptanceLifecycle("development-request-cap-non-goal");
+  expect(result.providerCalls).toBe(1);
+  expect(result.report.development_host_admissions).toBe(1);
+  expect(result.report.development_request_ownership).toEqual([expect.objectContaining({ drained: true })]);
+  expect(result.report.results[0].verifier_manifest.goal.goal_id).toBe("craft_stone_pickaxe");
+  expect(result.report.results[0].outcome.goal_verified).toBe(false);
+  expect(result.attempts).toHaveLength(1);
+  expect(result.report.cleanup_confirmed).toBe(true);
+}, 15000);
 
 for (const mode of ["sigint", "sigterm", "deadline"]) {
   test(`${mode} while offline postprocessing is pending interrupts the durable attempt and joins all case work`, async () => {

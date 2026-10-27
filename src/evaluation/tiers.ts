@@ -12,6 +12,8 @@ export const TEST_TIERS = Object.freeze({
     "tests/video.test.ts", // Frame/header inspection only.
     "tests/actor-frames.test.ts", // Async PNG codec/independent decoder and host selection authority; no provider/native startup.
     "web/src/video.test.ts", // Actual renderer frame classification; synthetic packets/timestamps only.
+    "web/src/task-draft.test.ts", // Custom/preset draft transitions and whole-request binding; no browser/provider.
+    "tests/minecraft-development.test.ts", // Explicit task/seed/criterion declaration parsing; no game/provider.
     "tests/program-validation.test.ts", // Local schemas and JavaScript validation.
     "tests/speculative-planning.test.ts", // Planner state machine with substituted callbacks.
     "tests/evaluation-config.test.ts", // Pure model selection and cap contracts.
@@ -28,6 +30,7 @@ export const TEST_TIERS = Object.freeze({
   ]),
   integration: Object.freeze([
     "tests/auth-network.test.ts", // Worker subprocess and local proxy; no account/provider inference.
+    "tests/evaluation-inference.test.ts", // Actual SDK/Agent and loopback inference fixture; no real account/provider.
     "tests/game-bridge.test.ts", // Real sockets and owned subprocesses; substituted native emitter.
     "tests/adapter-contract.test.ts",
     "tests/adapter-scope.test.ts",
@@ -51,6 +54,7 @@ export const TEST_TIERS = Object.freeze({
     "tests/store.test.ts",
     "tests/strategic-overlap.test.ts", // Real planner coordination; synthetic provider boundary.
     "tests/strategic.test.ts",
+    "tests/strategic-context.test.ts", // Actual SDK request assembly and run-owned context; offline stream only.
     "tests/video-backpressure.test.ts", // Real TCP/WebSocket/subprocess backpressure.
     "tests/evaluation-policy.test.ts", // Durable SQLite, restart and cross-process reservations.
     "tests/evaluation-studies.test.ts", // Same private SQLite authority; study/request races, restart and ownership.
@@ -61,6 +65,7 @@ export const TEST_TIERS = Object.freeze({
     "tests/acceptance-lifecycle.test.ts", // Real runner/Runtime/Agent/ledger cancellation; isolated synthetic native/provider/encoder seams.
     "tests/private-journal-lifecycle.test.ts", // Real file handles and retained evidence under isolated marker/sync failures.
     "tests/native-recording-proof-lifecycle.test.ts", // Real proof/fixture finish and OS signals; synthetic native/encoder boundaries, zero inference.
+    "tests/native-minecraft-mechanics-lifecycle.test.ts", // Actual mechanics entry finalization/signals; substituted native/storage owners, zero inference.
     "tests/program-interface.test.ts", // Real tool/Store/worker seams and offline SDK request transformation; zero provider calls.
     "tests/event-export.test.ts", // Actual Store event projection/export privacy boundary.
     "tests/evaluation-tiers.test.ts", // Real artifact freshness boundary, zero native startup.

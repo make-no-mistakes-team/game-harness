@@ -91,7 +91,7 @@ try {
       const bin = join(directory, "bin"); await fs.mkdir(bin);
       // Real owned child, not an FFmpeg dependency. It deliberately never exits
       // until its owner cancels it; the pid marker proves execution began.
-      await fs.writeFile(join(bin, "ffmpeg"), `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\nwriteFileSync("renderer.pid", String(process.pid));\nsetInterval(() => {}, 1000);\n`, { mode: 0o700 });
+      await fs.writeFile(join(bin, "ffmpeg"), `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\nwriteFileSync("renderer.pid", String(process.pid));\nsetInterval(() => { if (process.ppid !== ${process.pid}) process.exit(1); }, 50);\n`, { mode: 0o700 });
       process.env.PATH = `${bin}:${process.env.PATH ?? ""}`;
       const abort = new AbortController();
       let settled: { status: string; closed: boolean; error: string | null } | null = null;

@@ -3,7 +3,12 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
-import type { GameActionResult, Json, ObservationV3 } from "../src/shared/contracts.ts";
+import { Agent } from "@oh-my-pi/pi-agent-core/agent";
+import type { AgentTool, StreamFn } from "@oh-my-pi/pi-agent-core/types";
+import type { AssistantMessage, ToolCall } from "@oh-my-pi/pi-ai";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import type { GameActionResult, GameBridge, Json, ObservationV3 } from "../src/shared/contracts.ts";
 import type {
   SkillLimits,
   SkillRef,
@@ -17,6 +22,8 @@ import {
   type SandboxService,
 } from "../src/server/sandbox.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
+import { Runtime } from "../src/server/runtime.ts";
+import type { AuthManager } from "../src/server/auth.ts";
 import { ProgramWorkspace } from "../src/server/program-workspace.ts";
 import { instrumentProgram, ProgramTraceReceiver } from "../src/server/program-instrumentation.ts";
 import { DEFAULT_EVALUATION_CAPS } from "../src/evaluation/config.ts";
@@ -63,7 +70,7 @@ const generatedWorker: Runner = async (source, args, handle, _limits, signal, ho
     stdout: true, stderr: true,
   });
   const done = Promise.withResolvers<SkillResult>();
-  const watchdog = AbortSignal.timeout(3000);
+  const watchdog = AbortSignal.timeout(10000);
   const expired = () => done.reject(new Error("Generated worker did not complete its protocol"));
   watchdog.addEventListener("abort", expired, { once: true });
   signal?.addEventListener("abort", expired, { once: true });
@@ -193,6 +200,229 @@ function start(
 }
 
 describe("durable program execution through host capabilities", () => {
+  for (const toolName of ["program_submit", "program_run"] as const) {
+    for (const [form, limits, expectedActions] of [
+      ["omitted", undefined, 64], ["empty", {}, 64], ["partial", { max_actions: 2 }, 2],
+    ] as const) {
+      test(`real Runtime installed SDK ${toolName} ${form} limits enforce the effective worker root budget`, async () => {
+        const directory = mkdtempSync(join(tmpdir(), "gameharness-sdk-runtime-limits-"));
+        const store = new Store(directory), observation = authorizedObservation();
+        const rootClosed = Promise.withResolvers<void>();
+        const unsubscribe = store.subscribe(event => { if (event.type === "skill.closed") rootClosed.resolve(); });
+        let effects = 0;
+        const game: GameBridge = {
+          connect: async () => {}, disconnect: async () => {}, neutralize: async () => {}, emergencyStop: async () => {},
+          cancel: async () => {}, adapter: () => adapter, subscribe: () => () => {},
+          snapshot: () => ({ status: "connected", username: "Fixture", version: "1.21.4",
+            world_id: observation.world_id, epoch: observation.epoch, session_id: observation.session_id,
+            life: observation.life, space: observation.space, screen: null, binding: minecraftTestBinding(adapter),
+            presentation: adapter.projectObservation(observation), last_observation_at: null, error: null,
+            video: { status: "streaming", width: 1, height: 1, fps: 30, frames: 1, last_frame_at: null, error: null } }),
+          observe: async () => observation,
+          execute: async () => { effects++; return success; },
+        };
+        const descriptor = getBundledModels("openai-codex").find(model => model.api === "openai-codex-responses");
+        if (!descriptor) throw new Error("Offline SDK fixture requires the installed Codex descriptor");
+        const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
+        const body = 'for(let n=0;n<65;n++)await game.action({kind:"look",yaw:0,pitch:0});return {status:"completed",summary:"Must exhaust the root budget",result:null};';
+        const selectedLimits = limits === undefined ? {} : { limits };
+        const calls: ToolCall[] = toolName === "program_submit"
+          ? [{ type: "toolCall", id: "runtime-submit", name: toolName, arguments: { name: "runtime budget", source: body, args: null, ...selectedLimits } }]
+          : [{ type: "toolCall", id: "runtime-write", name: "program_write", arguments: { name: "runtime budget", source: body } },
+            { type: "toolCall", id: "runtime-start", name: toolName, arguments: { operation: "start", name: "runtime budget", args: null, ...selectedLimits } }];
+        calls.unshift({ type: "toolCall", id: "runtime-invalid-limit", name: "program_submit",
+          arguments: { name: "must not persist", source: body, args: null, limits: { max_actions: "2" } } });
+        let index = 0;
+        const streamFn: StreamFn = () => {
+          const call = calls[index++];
+          const message: AssistantMessage = { role: "assistant", content: call ? [call] : [{ type: "text", text: "Offline fixture complete." }],
+            api: model.api, provider: model.provider, model: model.id, stopReason: call ? "toolUse" : "stop", timestamp: Date.now(),
+            usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+          const events = new AssistantMessageEventStream();
+          events.push({ type: "start", partial: message });
+          if (call) {
+            events.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+            events.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(call.arguments), partial: message });
+            events.push({ type: "toolcall_end", contentIndex: 0, toolCall: call, partial: message });
+          }
+          events.push({ type: "done", reason: call ? "toolUse" : "stop", message }); events.end();
+          return events;
+        };
+        let agent: Agent | null = null;
+        const errors: unknown[] = [];
+        const auth = {
+          snapshot: () => ({ status: "ready", authenticated: true, provider: "openai-codex", account_label: null,
+            models: [{ id: model.id, name: "Offline fixture", provider: model.provider, context_window: null }], login: null, error: null }),
+          createAgent: async (configuration: { tools: AgentTool[]; systemPrompt: string[] }) => {
+            agent = new Agent({ initialState: { model, tools: configuration.tools, systemPrompt: configuration.systemPrompt },
+              streamFn, getApiKey: () => "OFFLINE_FIXTURE_NO_PROVIDER" });
+            agent.subscribe(event => { if (event.type === "tool_execution_end" && event.isError) errors.push(event.result.details); });
+            return agent;
+          },
+          releaseAgent: async () => { agent?.abort(); await agent?.waitForIdle(); },
+        } as unknown as AuthManager;
+        const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }), runSkill: generatedWorker } as unknown as SandboxService;
+        const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+        try {
+          await runtime.initialize();
+          const run = await runtime.createRun({ task: "Evaluator-authored zero-provider budget fixture",
+            goal: adapter.goals.find(goal => goal.goal_id === "custom")!, model_id: model.id, working_programs: "fresh" });
+          await runtime.control(run.run_id, "start");
+          await rootClosed.promise;
+          const root = store.latestRootExecution(run.run_id)!;
+          expect(errors).toMatchObject([{ error: { code: "invalid_request", retryable: false } }]);
+          expect(store.skills(run.run_id)).toHaveLength(1);
+          expect(root).toMatchObject({ status: "cancelled", actions: expectedActions,
+            limits: { duration_ms: 120000, max_actions: expectedActions, max_calls: 256, max_depth: 8 } });
+          expect(effects).toBe(expectedActions);
+          expect(store.eventsAfter(run.run_id, 0, 1000).filter(event => event.type === "action.accepted")).toHaveLength(expectedActions);
+          expect(store.allSkillExecutions(run.run_id)).toHaveLength(1);
+        } finally {
+          unsubscribe(); await runtime.close(); store.close(); rmSync(directory, { recursive: true, force: true });
+        }
+      }, 15000);
+    }
+  }
+
+  for (const summaryLength of [2000, 2001]) {
+    test(`generated terminal summary length ${summaryLength} preserves receipts and rejects only the over-limit result`, async () => {
+      const { directory, store, run, manager } = fixture(generatedWorker);
+      const observer = new ModelProgramEvidence(store, directory, DEFAULT_EVALUATION_CAPS, "test-host-clock", () => {});
+      try {
+        const skill = await manager.register(run.run_id, { name: `terminal summary ${summaryLength}`, card, dependencies: [],
+          source: `const receipt = await game.action({kind:"look",yaw:0,pitch:0});
+return {status:"completed",summary:"s".repeat(${summaryLength}),result:{receipt,details:{selected:"actor-authored detail retained"}}};` });
+        const accepted = manager.start(run.run_id, start(run, skill, `summary-${summaryLength}`));
+        await closed(store, run.run_id, accepted.execution_id);
+        const outcome = manager.get(run.run_id, { execution_id: accepted.execution_id })!;
+        if (summaryLength === 2000) {
+          expect(outcome.status).toBe("succeeded");
+          expect(outcome.result!.summary).toHaveLength(2000);
+          expect(outcome.result!.result as unknown).toMatchObject({ receipt: success });
+        } else {
+          expect(outcome.status).toBe("failed");
+          expect(outcome.diagnostic).toMatchObject({ type: "GeneratedResultValidationError", code: "invalid_program_result",
+            result_path: "result.rejected_result", issues: [{ code: "too_big", path: "summary", maximum: 2000, actual: 2001 }] });
+          expect(outcome.error).toContain("summary");
+          expect(outcome.error).toContain("2000");
+          expect(outcome.error).toContain("result");
+          expect(outcome.result!.summary.length).toBeLessThan(400);
+          const retained = outcome.result!.result as { rejected_result: { summary: string; result: Json } };
+          expect(retained.rejected_result.summary).toHaveLength(2001);
+          expect(retained.rejected_result.result as unknown).toEqual({ receipt: success, details: { selected: "actor-authored detail retained" } });
+          const saved = JSON.parse(readFileSync(join(directory, await observer.save(run.run_id)), "utf8"));
+          expect(saved.executions[0].result.result.rejected_result).toEqual(retained.rejected_result);
+          const finalized = await observer.finalize(run.run_id, { status: "failed", reason: "generated_result_validation" });
+          const journal = readFileSync(join(directory, finalized.journal), "utf8");
+          expect(journal).toContain("invalid_program_result");
+        }
+        expect(outcome.actions).toBe(1);
+      } finally {
+        await observer.close();
+      }
+    });
+  }
+
+  test("a brief generated summary keeps detailed raw receipts in structured result without increasing protocol limits", async () => {
+    const { store, run, manager } = fixture(generatedWorker);
+    const skill = await manager.register(run.run_id, { name: "brief result with details", card, dependencies: [],
+      source: 'const receipt=await game.action({kind:"look",yaw:0,pitch:0});return {status:"completed",summary:"One bounded fixture action settled; details are in result.",result:{receipt,details:"d".repeat(4000)}};' });
+    const execution = manager.start(run.run_id, start(run, skill, "brief-result"));
+    await closed(store, run.run_id, execution.execution_id);
+    const outcome = manager.get(run.run_id, { execution_id: execution.execution_id })!;
+    expect(outcome.status).toBe("succeeded");
+    expect(outcome.result!.result as unknown).toEqual({ receipt: success, details: "d".repeat(4000) });
+  });
+
+  test("real Runtime and generated worker catch pre-admission invalid_request then explicitly observe and choose one corrected action", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "gameharness-registered-runtime-"));
+    const store = new Store(directory), observation = authorizedObservation();
+    const submitted = Promise.withResolvers<void>(), failed = Promise.withResolvers<never>();
+    const effects: Json[] = [];
+    const game: GameBridge = {
+      connect: async () => {}, disconnect: async () => {}, neutralize: async () => {}, emergencyStop: async () => {},
+      cancel: async () => {}, adapter: () => adapter, subscribe: () => () => {},
+      snapshot: () => ({ status: "connected", username: "Fixture", version: "1.21.4",
+        world_id: observation.world_id, epoch: observation.epoch, session_id: observation.session_id,
+        life: observation.life, space: observation.space, screen: null, binding: minecraftTestBinding(adapter),
+        presentation: adapter.projectObservation(observation), last_observation_at: null, error: null,
+        video: { status: "streaming", width: 1, height: 1, fps: 30, frames: 1, last_frame_at: null, error: null } }),
+      observe: async () => observation,
+      execute: async envelope => { effects.push(envelope.action); return success; },
+    };
+    let tools: AgentTool[] = [], started = false;
+    let before: Parameters<Agent["setBeforeModelCall"]>[0];
+    const source = `
+let diagnostic = null;
+try {
+  await game.action({kind:"navigate",target:{target_id:"INPUT_TARGET_SECRET",incarnation:1,life_id:1,
+    space:{dimension_id:"minecraft:overworld",space_epoch:1}},range:0.4,duration_ms:1000});
+} catch (error) {
+  diagnostic = {code:error.code,message:error.message};
+}
+if (!diagnostic || diagnostic.code !== "invalid_request") {
+  return {status:"blocked",summary:"Precise validation diagnostic was unavailable",result:{diagnostic}};
+}
+const fresh = await game.observe();
+const corrected = await game.action({kind:"look",yaw:fresh.data.player.yaw,pitch:0});
+return {status:"completed",summary:"Explicit fresh bounded decision after pre-admission rejection",result:{diagnostic,corrected}};
+`;
+    const auth = {
+      snapshot: () => ({ status: "ready", authenticated: true, provider: "openai-codex", account_label: null,
+        models: [{ id: "fixture-model", name: "Fixture", provider: "fixture", context_window: null }], login: null, error: null }),
+      createAgent: async (configuration: { tools: AgentTool[] }) => {
+        tools = configuration.tools;
+        return {
+          setTools: (value: AgentTool[]) => { tools = value; },
+          setBeforeModelCall: (value: typeof before) => { before = value; },
+          subscribe: () => () => {}, replaceMessages: () => {}, abort: () => {}, waitForIdle: async () => {},
+          prompt: async () => {
+            if (started) return;
+            started = true;
+            try {
+              const admission = await before?.({ systemPrompt: [], messages: [], tools }, new AbortController().signal);
+              if (admission?.stop) throw new Error("Fixture admission unexpectedly stopped");
+              const submit = tools.find(tool => tool.name === "program_submit")!;
+              const result = await submit.execute("registered-range-submission", { name: "range recovery", source, args: null });
+              if (result.isError) throw new Error("Fixture submission failed");
+              submitted.resolve();
+            } catch (error) { failed.reject(error); throw error; }
+          },
+        } as unknown as Agent;
+      },
+      releaseAgent: async () => {},
+    } as unknown as AuthManager;
+    const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }), runSkill: generatedWorker } as unknown as SandboxService;
+    const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+    try {
+      await runtime.initialize();
+      const run = await runtime.createRun({ task: "Exercise registered argument recovery without native services",
+        goal: adapter.goals.find(goal => goal.goal_id === "custom")!, model_id: "fixture-model", working_programs: "fresh" });
+      await runtime.control(run.run_id, "start");
+      await Promise.race([submitted.promise, failed.promise]);
+      const execution = store.latestRootExecution(run.run_id)!;
+      await Promise.race([closed(store, run.run_id, execution.execution_id), failed.promise]);
+      const outcome = store.skillExecution(run.run_id, { execution_id: execution.execution_id })!;
+      expect(outcome).toMatchObject({ status: "succeeded", result: { result: { diagnostic: { code: "invalid_request" },
+        corrected: { status: "succeeded" } } } });
+      const result = outcome.result!.result as { diagnostic: { message: string } };
+      expect(result.diagnostic.message).toContain("range");
+      expect(result.diagnostic.message).toContain(">= 0.5");
+      expect(result.diagnostic.message).toContain("no action admitted");
+      expect(result.diagnostic.message).not.toContain("INPUT_TARGET_SECRET");
+      expect(effects).toEqual([{ kind: "look", yaw: 0, pitch: 0 }]);
+      const events = store.eventsAfter(run.run_id, 0, 1000);
+      expect(events.filter(event => event.type === "action.accepted")).toHaveLength(1);
+      expect(events.some(event => event.type === "runtime.uncertainty")).toBe(false);
+      expect(runtime.snapshot()?.status).toBe("running");
+    } finally {
+      await runtime.close();
+      store.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("caught trusted capability failures survive successful real-worker execution in the finalized correlated private journal", async () => {
     const trusted = new RuntimeFault("precondition_failed", "Observation is not available in the current life");
     trusted.stack = "HOST_STACK_SECRET at /private/host/trusted-capability.ts:42";

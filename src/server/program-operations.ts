@@ -11,7 +11,7 @@ import type { ExperienceLibrary } from "./experience.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { ProgramWorkspace } from "./program-workspace.ts";
 import { compareProgramVersionsPage } from "./program-comparison.ts";
-import type { programInspectSchema, programReviewSchema, programRunSchema, programWriteSchema, memorySchema, prepareNextSchema, reflexSchema } from "./program-interface.ts";
+import type { programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, memorySchema, prepareNextSchema, reflexSchema } from "./program-interface.ts";
 import { programSelectorSchema } from "./program-interface.ts";
 import { skillRefSchema } from "../shared/validation.ts";
 import { policyRefSchema } from "./reactive.ts";
@@ -28,15 +28,18 @@ export class ProgramOperations {
   }
 
   async write(input: z.infer<typeof programWriteSchema>, callId: string, commit: () => void) {
-    const previous = this.store.namedSkill(this.run.run_id, input.name);
+    const registration = this.registration(input, callId);
+    const pinned = this.registered(input, callId);
+    const previous = pinned ? pinned.parent_version === null ? null : this.store.namedSkill(this.run.run_id, input.name, pinned.parent_version)
+      : this.store.namedSkill(this.run.run_id, input.name);
     const assertParent = () => {
       const latest = this.store.namedSkill(this.run.run_id, input.name);
       if ((latest?.version ?? undefined) !== input.based_on) throw Object.assign(new RuntimeFault("conflict", "Existing names require based_on equal to the latest version; new names must omit based_on. Source is never silently rebased."), {
         issues: [{ code: "stale_parent", path: "based_on", latest_parent: latest ? { name: latest.name, version: latest.version } : null }],
       });
     };
-    assertParent();
-    const dependencies = z.array(skillRefSchema).parse(this.store.bindToolCall(this.run.run_id, callId,
+    if (!pinned) assertParent();
+    const dependencies = pinned?.dependencies ?? z.array(skillRefSchema).parse(this.store.bindToolCall(this.run.run_id, callId,
       { tool: "program_write", input } as unknown as Json, () => {
         commit();
         return input.dependencies.map((selector) => {
@@ -47,18 +50,113 @@ export class ProgramOperations {
     if (input.reason && !previous) throw new RuntimeFault("invalid_request", "A candidate experiment reason requires an actual revision of an existing program");
     let opportunity: ImprovementOpportunity | null = null;
     if (input.reason && previous) {
-      this.host.learning().feedback(this.run.run_id);
-      opportunity = this.workspace.latestOpportunity(previous, true);
+      opportunity = this.store.bindToolCall(this.run.run_id, this.phaseKey(callId, "feedback"),
+        { tool: "program_write", input } as unknown as Json, () => {
+          this.host.learning().feedback(this.run.run_id);
+          return this.workspace.latestOpportunity(previous) as unknown as Json;
+        }) as unknown as ImprovementOpportunity;
     }
-    const program = await this.skills.register(this.run.run_id, { name: input.name, source: input.source, card: input.card, dependencies }, () => { commit(); assertParent(); });
-    const experiment = opportunity && input.reason ? this.host.learning().resolve(this.run.run_id, opportunity.opportunity_id, {
-      decision: "revise", reason: input.reason,
-      revision: { run_id: this.run.run_id, skill_id: program.skill_id, version: program.version, hash: program.hash }, event_seqs: opportunity.event_seqs,
-    }) : null;
+    const program = pinned ?? await this.skills.register(this.run.run_id, { name: input.name, source: input.source, card: input.card, dependencies },
+      () => { commit(); assertParent(); }, registration);
+    let experiment: { decision: "revise"; measured: boolean; reason: string } | null = null;
+    if (opportunity && input.reason) {
+      const selected = opportunity, reason = input.reason;
+      const revision = { run_id: this.run.run_id, skill_id: program.skill_id, version: program.version, hash: program.hash };
+      // Bind the linkage and its event/resolution in the same transaction.
+      // Replaying a persisted write cannot reselect a newer outcome, convert
+      // our own prior resolution to a candidate event, or append that event twice.
+      experiment = this.store.bindToolCall(this.run.run_id, this.phaseKey(callId, "feedback_link"),
+        { tool: "program_write", input, revision } as unknown as Json, () => {
+          const decision = { decision: "revise" as const, measured: false, reason };
+          if (selected.resolution === null) {
+            decision.measured = this.host.learning().resolve(this.run.run_id, selected.opportunity_id, {
+              decision: decision.decision, reason, revision, event_seqs: selected.event_seqs,
+            }).resolution!.measured;
+          } else {
+            this.store.event(this.run.run_id, "learning.candidate_written", "Recorded candidate revision without changing the prior outcome assessment", {
+              opportunity_id: selected.opportunity_id, execution_id: selected.execution_id,
+              parent: selected.version as unknown as Json, revision, event_seqs: selected.event_seqs,
+              ...decision, qualification: "candidate_not_proven_improvement",
+            });
+          }
+          return decision;
+        }) as unknown as { decision: "revise"; measured: boolean; reason: string };
+    }
     return { name: program.name, version: program.version, state: program.state, purpose: program.card.purpose,
       dependencies: input.dependencies.map((selector, index) => ({ name: selector.name, version: dependencies[index]!.version })),
-      experiment: experiment?.resolution ? { decision: experiment.resolution.decision, measured: experiment.resolution.measured,
-        qualification: "candidate_not_proven_improvement", reason: experiment.resolution.reason } : null };
+      experiment: experiment ? { ...experiment, qualification: "candidate_not_proven_improvement" } : null };
+  }
+
+  private phaseKey(callId: string, phase: string): string {
+    return `program_phase_${createHash("sha256").update(JSON.stringify([callId, phase])).digest("hex")}`;
+  }
+
+  private registration(input: z.infer<typeof programWriteSchema>, callId: string) {
+    return { call_id: this.phaseKey(callId, "registration"), input: { tool: "program_write", input } as unknown as Json };
+  }
+
+  private registered(input: z.infer<typeof programWriteSchema>, callId: string) {
+    const registration = this.registration(input, callId);
+    const ref = this.store.completedToolCall(this.run.run_id, registration.call_id, registration.input);
+    return ref === null ? null : this.store.skill(this.run.run_id, skillRefSchema.parse(ref));
+  }
+
+  submissionReceipt(callId: string, identity: Json): Json | null {
+    return this.store.completedToolCall(this.run.run_id, this.phaseKey(callId, "outcome"), identity);
+  }
+
+  async submit(input: z.infer<typeof programSubmitSchema>, callId: string, commit: () => void) {
+    const identity = { tool: "program_submit", input } as unknown as Json;
+    const outcomeKey = this.phaseKey(callId, "outcome");
+    const completed = this.submissionReceipt(callId, identity);
+    if (completed !== null) return completed;
+    const { args, limits, next, ...writeInput } = input;
+    const writeId = this.phaseKey(callId, "write"), startId = this.phaseKey(callId, "start");
+    let first = false;
+    this.store.bindToolCall(this.run.run_id, callId, identity, () => {
+      commit();
+      first = true;
+      return { write_call_id: writeId, start_call_id: startId };
+    });
+    const failure = (error: unknown) => error instanceof RuntimeFault
+      ? { code: error.code, message: error.message, retryable: false }
+      : { code: "backend_unavailable", message: "The operation could not be acknowledged safely; inspect the persisted source and execution before making a new decision", retryable: false };
+    const finish = (program: { name: string; version: number }, start: Json) => {
+      const previous = this.store.completedToolCall(this.run.run_id, outcomeKey, identity);
+      if (previous !== null) return previous;
+      const outcome = { source: { status: "persisted", name: program.name, version: program.version }, start };
+      this.store.completeToolCall(this.run.run_id, outcomeKey, identity, outcome);
+      return outcome;
+    };
+    // A redelivered interrupted operation is evidence lookup, never another
+    // write/start attempt. The atomic registration receipt is the only source
+    // selector; a newer catalog revision cannot substitute for it.
+    if (!first) {
+      const program = this.registered(writeInput, writeId);
+      if (!program) throw new RuntimeFault("conflict", "The original submission did not acknowledge source persistence; it cannot be retried automatically");
+      const execution = this.skills.get(this.run.run_id, { start_key: this.startKey(startId) });
+      return finish(program, execution ? { status: "started", execution: this.workspace.executionSummary(execution) }
+        : { status: "unknown", error: failure(null) });
+    }
+    let program: { name: string; version: number };
+    try {
+      program = await this.write(writeInput, writeId, commit);
+    } catch (error) {
+      const persisted = this.registered(writeInput, writeId);
+      if (!persisted) throw error;
+      return finish(persisted, { status: "refused", error: failure(error) });
+    }
+    try {
+      const interrupted = this.store.completedToolCall(this.run.run_id, outcomeKey, identity);
+      if (interrupted !== null) return interrupted;
+      commit();
+      const execution = await this.runProgram({ operation: "start", name: program.name, version: program.version, args, limits,
+        ...(next ? { next } : {}) }, startId, commit);
+      return finish(program, { status: "started", execution: execution as unknown as Json });
+    } catch (error) {
+      const existing = this.skills.get(this.run.run_id, { start_key: this.startKey(startId) });
+      return finish(program, { status: error instanceof RuntimeFault && !existing ? "refused" : "unknown", error: failure(error) });
+    }
   }
 
   startKey(callId: string): string { return `tool_${createHash("sha256").update(callId).digest("hex")}`; }

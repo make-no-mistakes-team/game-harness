@@ -134,7 +134,8 @@ export class ModelProgramEvidence {
       }
     } else if (["model.request_settled", "model.request_unsettled"].includes(event.type)) {
       if (typeof data.request_id === "string") close(`provider:${runId}:${data.request_id}`);
-      if (event.type === "model.request_unsettled" || data.stop_reason === "error") {
+      if (event.type === "model.request_unsettled" || data.stop_reason === "error" ||
+          object(data.recovered_failure).type === "stream_interrupted_after_content") {
         this.providerFailures.add(runId);
         this.stop(runId, "provider_failure_or_unsettled_no_repeat");
       }
@@ -159,9 +160,23 @@ export class ModelProgramEvidence {
   }
   private observeAgent(agent: Agent, runId: string) {
     this.agentSubscriptions.push(agent.addBeforeModelCall(context => {
-      if (!this.journal(runId).append("final_sdk_visible_context_not_wire_payload", context))
+      // Keep the early capacity gate, but do not label this as the assembled
+      // request: the strategist adds its run-owned supplement at stream time.
+      if (!this.journal(runId).append("sdk_context_before_request_assembly_not_wire_payload", context))
         return { stop: true, reason: "private_journal_evidence_unavailable" };
     }));
+    const stream = agent.streamFn;
+    if (typeof stream === "function") {
+      const observed: typeof stream = (model, context, options) => {
+        // Installed before StrategicPlanner wraps streamFn. Its outer wrapper
+        // passes the final supplemented context here before provider dispatch.
+        if (!this.closed && !this.journal(runId).append("final_sdk_visible_context_not_wire_payload", context))
+          throw new Error("private_journal_evidence_unavailable");
+        return stream(model, context, options);
+      };
+      agent.streamFn = observed;
+      this.agentSubscriptions.push(() => { if (agent.streamFn === observed) agent.streamFn = stream; });
+    }
     this.agentSubscriptions.push(agent.subscribe(event => {
       // Only SDK-visible conversation/tool events. No launcher logs, API keys,
       // transport options, auth database contents or hidden evaluator state.
@@ -277,7 +292,11 @@ export class ModelProgramEvidence {
       admitted_request_ids: admitted.flatMap(event => { const id = object(event.details).request_id; return typeof id === "string" ? [id] : []; }),
       messages, additional_terminal_evidence: unsettled, events_omitted: Boolean(this.omissions.events) }), actions: actionMetrics(this.actions(runId)),
       tools: events.filter(event => event.type === "model.tool_started").flatMap(event => { const name = object(event.details).tool; return typeof name === "string" ? [{ name }] : []; }),
-      provider_error: settlements.some(event => object(event.details).stop_reason === "error"),
+      provider_error: settlements.some(event => {
+        const details = object(event.details);
+        return details.stop_reason === "error" ||
+          object(details.recovered_failure).type === "stream_interrupted_after_content";
+      }),
       provider_settled: admitted.length > 0 && !this.omissions.events && admitted.every(event => settledIds.has(object(event.details).request_id)),
       confirmed_harness_faults: faults, unclassified_tool_failures: unclassified, observer_error: this.observerError, omissions: { ...this.omissions } };
   }

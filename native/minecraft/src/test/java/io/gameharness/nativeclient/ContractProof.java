@@ -19,6 +19,8 @@ public final class ContractProof {
   }
 
   public static void main(String[] ignored) throws Exception {
+    visibleInventoryCustody();
+    InventoryMotionProof.main(ignored);
     require(ContractIdentity.counter("2147483665") == 2147483665L, "epoch narrowed through signed int");
     require(ContractIdentity.counter("9007199254740991") == ContractIdentity.MAX_SAFE, "safe endpoint narrowed");
     require(ContractIdentity.counter("2.147483665e9") == 2147483665L, "exact JSON exponent lost identity");
@@ -144,7 +146,21 @@ public final class ContractProof {
     TargetIncarnations<Cell> targets = new TargetIncarnations<>(2);
     var oldTarget = targets.observe(cell, overworld, 3);
     require(targets.current(cell, oldTarget, overworld, 3), "fresh target missing");
+    // In-flight owners retain the admitted cell binding, not a later observation
+    // list entry. Observing other cells must not revoke that actual incarnation.
+    Cell neighbor = new Cell(1, 64, 0);
+    targets.observe(neighbor, overworld, 3);
+    require(targets.current(cell, oldTarget, overworld, 3),
+        "observation of a different cell revoked an admitted binding");
+    require(!targets.current(neighbor, oldTarget, overworld, 3),
+        "retained handle silently retargeted to a different cell");
+    require(!targets.current(cell, oldTarget, overworld, 4),
+        "retained admitted binding crossed a player life");
+    require(!targets.current(cell, oldTarget, new EffectAuthority.Space("minecraft:overworld", 5), 3),
+        "retained admitted binding crossed same-dimension relocation");
     targets.replaced(cell);
+    require(!targets.current(cell, oldTarget, overworld, 3),
+        "retained admitted binding survived actual removal before any re-observation");
     var newTarget = targets.observe(cell, overworld, 3);
     require(!oldTarget.equals(newTarget) && !targets.current(cell, oldTarget, overworld, 3),
         "replacement at identical coordinates retained old target incarnation");
@@ -154,6 +170,11 @@ public final class ContractProof {
         "identical coordinates crossed spaces as the same target");
     targets.invalidate();
     require(!targets.current(cell, dimensionTarget, nether, 3), "uncertainty did not fence handles");
+    var boundedTarget = targets.observe(cell, overworld, 3);
+    targets.observe(neighbor, overworld, 3);
+    targets.observe(new Cell(2, 64, 0), overworld, 3);
+    require(!targets.current(cell, boundedTarget, overworld, 3),
+        "owned binding bypassed bounded incarnation-store revocation");
 
     ScreenIncarnations screens = new ScreenIncarnations();
     Object viewA = new Object(), viewB = new Object();
@@ -171,5 +192,30 @@ public final class ContractProof {
     require(NativeContractResource.RADIUS == 8 && NativeContractResource.MAX_BLOCKS == 144
         && NativeContractResource.MAX_ENTITIES == 32, "compiled effective sampler is not the actual current condition");
     System.out.println("Native contract counter/queue/owner/target/screen/build-resource proof passed");
+  }
+
+  private static void visibleInventoryCustody() {
+    Object screen = new Object(), handler = new Object();
+    InventoryGestureFence fence = new InventoryGestureFence(screen, handler, 7);
+    require(fence.allows(screen, handler, 7, true), "owned matching layout/custody refused");
+    require(!fence.allows(screen, new Object(), 7, true), "replacement handler inherited gesture");
+    require(!fence.allows(new Object(), handler, 7, true), "replacement screen inherited gesture");
+    require(!fence.allows(screen, handler, 8, true), "changed sync ID inherited gesture");
+    require(!fence.allows(screen, handler, 7, false), "changed cursor/grid/slot custody admitted");
+    fence.press();
+    require(fence.held(), "press not retained until visible release");
+    fence.revoke();
+    require(!fence.held() && !fence.allows(screen, handler, 7, true),
+        "revocation retained a release capable of committing vanilla drag");
+    require(fence.cleanupOwns(screen, handler, 7), "trusted same-handler cleanup lost scope");
+    require(!fence.cleanupOwns(screen, new Object(), 7), "cleanup retargeted replacement handler");
+    InventoryGestureFence delayed = new InventoryGestureFence(screen, handler, 7);
+    delayed.press();
+    delayed.release();
+    delayed.revoke();
+    require(!delayed.allows(screen, handler, 7, true), "delayed correction replayed completed click");
+    require(!InventoryGestureFence.cleanCustody(1, 0)
+        && !InventoryGestureFence.cleanCustody(0, 1)
+        && InventoryGestureFence.cleanCustody(0, 0), "receipt ignored cursor/grid custody");
   }
 }

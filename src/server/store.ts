@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, type SQLQueryBindings, type Statement } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -23,6 +23,7 @@ import type {
   PolicySpec,
   PolicyView,
   RunView,
+  RunControlState,
   ActiveExecutableValidation,
 } from "../shared/contracts.ts";
 import type {
@@ -38,9 +39,10 @@ import { effectInvocationSchema, effectScopeSchema } from "../shared/control.ts"
 
 export type StoredRun = Omit<
   RunView,
-  "action" | "policies" | "skills" | "executions"
+  "action" | "policies" | "skills" | "executions" | "operator"
 > & {
   baseline: Json;
+  control?: RunControlState;
 };
 export interface StoredAction {
   request: GameAction;
@@ -105,8 +107,30 @@ function readActionView(encoded: string): ActionView {
   return { session_id: null, life_id: null, scope: null, invocation: null, compatibility_hash: null, ...JSON.parse(encoded) };
 }
 
+/** Own every fixed SQL statement, including Bun 1.3 query-cache overflow. */
+class StoreDatabase {
+  readonly #statements = new Map<string, Statement>();
+  constructor(private readonly database: Database) {}
+  query<Row = unknown, Params extends SQLQueryBindings[] = SQLQueryBindings[]>(sql: string): Statement<Row, Params> {
+    let statement = this.#statements.get(sql);
+    if (!statement) {
+      statement = this.database.prepare(sql);
+      this.#statements.set(sql, statement);
+    }
+    // Each fixed SQL string has one row/binding shape at its typed call sites.
+    return statement as Statement<Row, Params>;
+  }
+  exec(sql: string): void { this.database.exec(sql); }
+  transaction<T>(operation: () => T) { return this.database.transaction(operation); }
+  close(): void {
+    for (const statement of this.#statements.values()) statement.finalize();
+    this.#statements.clear();
+    this.database.close(true);
+  }
+}
+
 export class Store {
-  private readonly db: Database;
+  private readonly db: StoreDatabase;
   private readonly artifactDir: string;
   private readonly listeners = new Set<(event: ActivityEvent) => void>();
   private readonly traceObservers = new Set<(input: TraceInput) => void>();
@@ -117,7 +141,7 @@ export class Store {
     this.artifactDir = path.join(dataDir, "artifacts");
     mkdirSync(this.artifactDir, { recursive: true, mode: 0o700 });
     const filename = path.join(dataDir, "runs.sqlite");
-    this.db = new Database(filename, { create: true, strict: true });
+    this.db = new StoreDatabase(new Database(filename, { create: true, strict: true }));
     chmodSync(filename, 0o600);
     this.db.exec(
       "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;",
@@ -145,6 +169,7 @@ export class Store {
           details TEXT NOT NULL CHECK(json_valid(details))
         ) STRICT;
         CREATE INDEX IF NOT EXISTS events_run_seq ON events(run_id, event_seq);
+        CREATE INDEX IF NOT EXISTS events_run_type_seq ON events(run_id, type, event_seq);
         CREATE TABLE IF NOT EXISTS actions (
           run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE RESTRICT,
           action_id TEXT NOT NULL,
@@ -415,6 +440,13 @@ export class Store {
     return rows
       .reverse()
       .map((row) => ({ ...row, details: JSON.parse(row.details) as Json }));
+  }
+
+  latestEvent(runId: string, type: string): ActivityEvent | null {
+    const row = this.db.query<EventRow, [string, string]>(
+      "SELECT event_seq,run_id,at,type,summary,details FROM events WHERE run_id=? AND type=? ORDER BY event_seq DESC LIMIT 1",
+    ).get(runId, type);
+    return row ? { ...row, details: JSON.parse(row.details) as Json } : null;
   }
 
   eventsAfter(
@@ -790,10 +822,15 @@ export class Store {
   registerSkill(
     runId: string,
     spec: SkillSpec & { validation: SkillView["validation"] },
+    registration?: { call_id: string; input: Json },
   ): SkillView {
     const hash = this.saveSource(spec.source);
     let event: ActivityEvent | undefined;
     const view = this.db.transaction(() => {
+      if (registration) {
+        const previous = this.completedToolCall(runId, registration.call_id, registration.input);
+        if (previous !== null) return this.skill(runId, previous as unknown as SkillRef);
+      }
       if (!this.getRun(runId)) throw new Error("Run not found");
       for (const dependency of spec.dependencies) this.skill(runId, dependency);
       const previous = this.db
@@ -833,6 +870,8 @@ export class Store {
           hash,
           JSON.stringify(metadata),
         );
+      if (registration) this.completeToolCall(runId, registration.call_id, registration.input,
+        { skill_id: result.skill_id, version: result.version });
       event = this.append(
         runId,
         "skill.authored",
@@ -1569,6 +1608,7 @@ export class Store {
 
   close(): void {
     this.listeners.clear();
+    this.traceObservers.clear();
     this.db.close();
   }
 }

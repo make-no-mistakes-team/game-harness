@@ -249,6 +249,23 @@ test("Minecraft target references retain space and incarnation through the real 
   }
 });
 
+test("registered Minecraft navigation preserves explicit arrival mechanics and legacy omission", () => {
+  const target = { target_id: "opaque-block", incarnation: 2, life_id: 3,
+    space: { dimension_id: "minecraft:overworld", space_epoch: 4 } };
+  const navigation = { kind: "navigate" as const, target, range: 2.5, duration_ms: 5000 };
+  const registry = new RegisteredAdapterContract(adapterDescriptorSchema.parse(descriptor()), schemaCatalog());
+  expect(registry.parseCapability("minecraft.action", 1, navigation)).toEqual(navigation);
+  for (const arrival of ["position", "interaction"] as const) {
+    const request = { ...navigation, arrival };
+    expect(minecraftActionSchema.parse(request)).toEqual(request);
+    expect(registry.parseCapability("minecraft.action", 1, request)).toEqual(request);
+  }
+  for (const arrival of ["horizontal", "", null, true])
+    expect(() => registry.parseCapability("minecraft.action", 1, { ...navigation, arrival })).toThrow();
+  for (const range of [0.49, 4.01])
+    expect(() => registry.parseCapability("minecraft.action", 1, { ...navigation, arrival: "interaction", range })).toThrow();
+});
+
 function validate(source: string, kind: "skill" | "policy" | "guard", value = descriptor(), scope = effectScope(), schemas = schemaCatalog()) {
   return Reflect.apply(validateProgramSource, undefined, [source, kind, { descriptor: value, scope, schemas }]) as ReturnType<typeof validateProgramSource>;
 }

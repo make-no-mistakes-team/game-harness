@@ -36,7 +36,7 @@ import {
 } from "./program-instrumentation.ts";
 import { validateProgramSource, type ExecutableValidationContext } from "./program-validation.ts";
 import type { SkillAPIManifest } from "../shared/programs.ts";
-import { capabilityFailure, ProgramExecutionError, readProgramDiagnostic } from "./program-diagnostics.ts";
+import { capabilityFailure, GeneratedResultValidationError, parseGeneratedSkillResult, ProgramExecutionError, readProgramDiagnostic } from "./program-diagnostics.ts";
 
 export interface SkillSandboxHooks {
   api?: SkillAPIManifest;
@@ -756,24 +756,20 @@ class DockerSkillWorker {
             exactKeys(frame, ["v", "type", "id", "result", "trace"])
           ) {
             const trace = traceReceiver.accept(frame.trace);
-            const result = frame.result;
-            if (!result || typeof result !== "object" || Array.isArray(result))
-              throw new Error("result");
             if (trace.events.length || trace.omitted) hooks.onTrace?.(trace);
-            const value = result as Reply;
-            if (
-              !exactKeys(value, ["status", "summary", "result"]) ||
-              !["completed", "blocked", "failed"].includes(
-                value.status as string,
-              ) ||
-              typeof value.summary !== "string" ||
-              value.summary.length < 1 ||
-              value.summary.length > 2000
-            )
-              throw new Error("result");
+            let value: SkillResult;
+            try {
+              value = parseGeneratedSkillResult(frame.result, program.source_hash);
+            } catch (error) {
+              if (!(error instanceof GeneratedResultValidationError)) throw error;
+              traceReceiver.finish(null);
+              this.phase = "done";
+              void this.terminate(error).catch(() => {});
+              return;
+            }
             traceReceiver.finish(null);
             this.phase = "done";
-            void this.terminate(null, value as unknown as SkillResult).catch(
+            void this.terminate(null, value).catch(
               () => {},
             );
           } else if (

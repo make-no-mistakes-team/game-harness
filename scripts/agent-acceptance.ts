@@ -15,7 +15,8 @@ import { AttemptLedger, type AttemptRecord } from "../src/evaluation/policy.ts";
 import { evaluationPaths, type EvaluationPaths } from "../src/evaluation/paths.ts";
 import { classifyEvaluation, costToResult, readUsageMetrics, usageMetrics, waitCoverage, type EvaluationCaseReport, type EvaluationOutcome } from "../src/evaluation/results.ts";
 import { NATURAL_WORLD_CONDITIONS, type ScenarioId } from "../src/evaluation/scenarios.ts";
-import { NATURAL_SCENARIOS, selectNaturalScenarios, scenarioGoal, captureScenarioVerification, verifyScenarioCompletion, type NaturalScenario } from "../src/evaluation/adapter-scenarios.ts";
+import { NATURAL_SCENARIOS, selectNaturalScenarios, scenarioGoal, captureScenarioVerification, verifyScenarioCompletion, type NaturalScenario, type MinecraftAcceptanceTask } from "../src/evaluation/adapter-scenarios.ts";
+import { developmentTask, minecraftDevelopmentSchema, type MinecraftDevelopmentDeclaration } from "../src/evaluation/minecraft-development.ts";
 import { NativeFixture, bounded, pause, requireProof } from "../src/evaluation/native-game.ts";
 import { ModelProgramEvidence, type EvidenceSummary } from "../src/evaluation/model-evidence.ts";
 import { EpisodeRecorder } from "../src/server/recording.ts";
@@ -38,7 +39,11 @@ interface AcceptanceCommonOptions {
   paths?: Partial<EvaluationPaths>;
   caps?: Partial<EvaluationCaps>;
   admissionOnly?: boolean;
+  /** Disclosed diagnostic condition: SSE and at most one inference dispatch per admission. */
+  singleInferenceDispatch?: boolean;
   nativeJar?: string;
+  /** Explicit fresh-seeded Minecraft development; never a registered study. */
+  development?: MinecraftDevelopmentDeclaration;
 }
 export type AgentAcceptanceOptions = AcceptanceCommonOptions & (
   { study?: undefined; hypothesisId: string; platformEvidenceRevision: string }
@@ -58,13 +63,18 @@ function priorCosts(attempts: readonly AttemptRecord[]) {
 
 /** Explicitly opt-in, finite actual-provider sample. Negative goals never trigger repetition. */
 export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
+  requireProof(!options.singleInferenceDispatch || !options.study,
+    "Single-dispatch inference is a diagnostic condition, not an override of a frozen study");
+  const development = options.development ? minecraftDevelopmentSchema.parse(options.development) : undefined;
+  requireProof(!development || (!options.study && !options.scenario && !options.admissionOnly),
+    "Minecraft development cannot inherit study/scenario admission or restored starts");
   const executingRoot = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
   if (options.study && options.projectRoot !== undefined && realpathSync(path.resolve(options.projectRoot)) !== executingRoot)
     throw new Error("Study source authority must be the executing acceptance module tree; foreign projectRoot overrides are unsupported");
   const project = options.study ? executingRoot : path.resolve(options.projectRoot ?? process.cwd());
   const paths = evaluationPaths(project, options.paths);
   let studies: StudyLedger | undefined, studyManifest: StudyManifest | undefined, studyAttempt: AttemptReservation | undefined;
-  let caps: EvaluationCaps, selected: readonly NaturalScenario[];
+  let caps: EvaluationCaps, selected: readonly MinecraftAcceptanceTask[];
   let studyDeadlineAt: number | undefined;
   let conditions = NATURAL_WORLD_CONDITIONS;
   if (options.study) {
@@ -124,8 +134,12 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     } catch (error) { studies.close(); throw error; }
   } else {
     requireProof(!options.admissionOnly, "Admission-only execution requires a registered study manifest");
-    selected = selectNaturalScenarios(options.scenario);
+    // Resolve its exact registered criterion from the negotiated adapter before
+    // run creation/inference, not from a second task/verifier registry.
+    selected = development ? [{ id: "minecraft-development", prompt: development.task,
+      adapter_goal_id: development.criterion, verifier: null }] : selectNaturalScenarios(options.scenario);
     caps = createEvaluationCaps(options.caps);
+    if (development) conditions = Object.freeze({ ...NATURAL_WORLD_CONDITIONS, seed: development.seed });
   }
   requireProof(options.allowNative && options.allowInference, "Agent acceptance requires --allow-native AND --allow-inference");
   requireProof(options.purpose !== "api_control", "Natural scenarios are acceptance/comparison work, not an API-control diagnostic");
@@ -181,6 +195,9 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   let studySettled = false;
   let studyAdmissionFault: string | null = null;
   const studyRequests = new Map<string, { receipt: StudyRequestReservation; terminal: boolean; drained: boolean }>();
+  const developmentRequests = new Map<string, { transport_closed: boolean | null; drained: boolean }>();
+  let authenticatedProvider: string | null = null;
+  let developmentDeadline = Infinity;
   const requestAdmission: StrategicRequestAdmission | undefined = studies && studyAttempt ? {
     reserve(requestId, model) {
       const frozen = studyManifest!.arms.find(arm => arm.id === studyAttempt!.slot.arm)!.model!;
@@ -205,6 +222,29 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
         if (!owned.drained) { studies!.confirmStudyRequestDrain(owned.receipt, ["actual_agent_idle_turn_joined_and_auth_scope_released"]); owned.drained = true; }
       }
     },
+  } : development ? {
+    reserve(requestId, model) {
+      requireProof(activeReservation && !reservationInterrupted && !scope.signal.aborted &&
+        performance.now() < developmentDeadline, "Development attempt has no live finite reservation");
+      requireProof(config && model.id === config.model.id && model.provider === authenticatedProvider,
+        "Development transport mismatches its declared model/account provider");
+      requireProof(!developmentRequests.has(requestId) && developmentRequests.size < caps.hostRequestAdmissions,
+        "Development pre-transport request allowance exhausted");
+      developmentRequests.set(requestId, { transport_closed: null, drained: false });
+    },
+    transportEnded(requestId, closed) {
+      const owned = developmentRequests.get(requestId);
+      requireProof(owned, "Development transport has no admitted owner");
+      owned.transport_closed = closed;
+      owned.drained = closed;
+    },
+    drained(requestIds) {
+      for (const id of requestIds) {
+        const owned = developmentRequests.get(id);
+        requireProof(owned, "Development drain has no admitted owner");
+        owned.drained = true;
+      }
+    },
   } : undefined;
   let activeCase: Record<string, unknown> | null = null;
   let failure: unknown;
@@ -215,6 +255,12 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   const report: Record<string, unknown> = {
     schema_version: 1, batch_id: batchId, tier: "agent-acceptance", classification: "natural_normal_survival_finite_actual_provider_sample",
     conditions, declared_scenarios: selected, results: [],
+    inference_transport: options.singleInferenceDispatch
+      ? { condition: "single_dispatch_sse", max_host_inference_http_dispatches_per_admission: 1, redirects: "manual", authentication_replay: false }
+      : { condition: "ordinary_sdk_defaults", max_host_inference_http_dispatches_per_admission: null },
+    inference_reasoning: { condition: development?.reasoning ? "explicit_supported_effort" : "backend_default_unspecified",
+      requested_effort: development?.reasoning ?? null,
+      evidence: "Declaration only; actual serialization is recorded by the per-request SDK onPayload event, not inferred from motor profile." },
     credential_policy: "Existing GameHarness auth storage opened in place. No login/logout, copies, identity dumps, ambient account imports or fallback model.",
     comparison_scope: "Fixed seed/settings and fresh world per case. Vanilla timing and provider behavior are not controlled; no causal or cross-model improvement claim.",
     source_policy: "Only the actual provider authors gameplay and optional game guards. No supplied programs, targets, inventory, console commands or required tool sequence.",
@@ -224,6 +270,10 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   };
   if (studyAttempt) Object.assign(report, { study_id: studyAttempt.studyId, slot: studyAttempt.slot, reservation_id: studyAttempt.reservationId,
     manifest_sha256: studyAttempt.manifestSha256, isolation: { store: "fresh_fixture_private", working_programs: "fresh", experience: "disabled_cold_no_global_library", publication: "unavailable_until_cohort_closure" } });
+  if (development) Object.assign(report, { tier: "minecraft-development",
+    classification: "declared_fresh_seeded_minecraft_development_actual_provider",
+    development, comparison_scope: "Disclosed selected fresh seed; not an untouched generalization test or registered study",
+    development_host_admissions: developmentRequests.size });
   const caseReports: Array<Record<string, unknown>> = [];
   report.results = caseReports;
   let reportTail: Promise<void> = Promise.resolve();
@@ -307,7 +357,8 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     // Config-consuming production modules load only AFTER fixture isolation is established.
     const { AuthManager } = await import("../src/server/auth.ts");
     let changed = () => {};
-    await bounded(AuthManager.create(authDirectory, () => changed()).then(async manager => {
+    await bounded(AuthManager.create(authDirectory, () => changed(), { singleInferenceDispatch: options.singleInferenceDispatch,
+      reasoning: development?.reasoning }).then(async manager => {
       auth = manager;
       if (closing || abortReason) { await manager.close(); throw new Error("Authorization opened after scope closure"); }
     }), caps.authMs, "Opening existing auth storage timed out");
@@ -322,6 +373,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     changed = () => {};
     assertOpen();
     const state = auth!.snapshot();
+    authenticatedProvider = state.provider;
     if (studyManifest) {
       const selection = studyManifest.arms.find(arm => arm.id === studyAttempt!.slot.arm)!.model!;
       const model = state.models.find(model => model.id === selection.id);
@@ -341,7 +393,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     report.config = config;
     report.auth = { provider: state.provider, authenticated: state.authenticated, selected_model: config.model };
   }
-  async function runCase(scenario: NaturalScenario, index: number) {
+  async function runCase(scenario: MinecraftAcceptanceTask, index: number) {
     assertOpen();
     if (runtime) { await bounded(runtime.close(), caps.cleanupMs, "Previous run drain timed out"); runtime = undefined; }
     assertOpen();
@@ -363,6 +415,10 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     evidence!.bindRuntime(runtime);
     const adapter = fixture.bridge.adapter();
     requireProof(adapter, "No actual negotiated adapter is available before run creation");
+    if (development) {
+      scenario = developmentTask(development, adapter);
+      report.declared_scenarios = [scenario];
+    }
     const run = await bounded(runtime.createRun({ task: scenario.prompt, goal: scenarioGoal(adapter, scenario), model_id: config!.model.id, working_programs: "fresh" }), caps.startMs, "Run creation timed out");
     assertOpen();
     activeRun = run.run_id;
@@ -393,17 +449,18 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     const independentVerifier = captureScenarioVerification(adapter, scenario, run.run_id, initial, index + 1);
     const baseline = independentVerifier.manifest.baseline;
     report.active_verifier = { scenario_id: scenario.id, manifest: independentVerifier.manifest };
-    await fixture.writeJson(`case-${scenario.id}-declaration.json`, { scenario, baseline,
+    await fixture.writeJson(`case-${scenario.id}-declaration.json`, { scenario, baseline, development: development ?? null,
+      inference_reasoning: report.inference_reasoning,
       host_baseline_timing: "Captured once on trusted host-preflight running publication, before strategic transport",
       conditions: fixture.report.world_conditions, declared_before_inference: true });
     assertOpen();
     // Reservation is durable before Runtime.start can admit the first provider request.
     const reservation = studyAttempt ? { attemptId: studyAttempt.reservationId } :
-      ledger.admitAttempt(diagnosticConfig!, { reportDirectory: fixture.evidenceDirectory, promptRevision: scenario.verifier.revision, scenarioId: scenario.id });
+      ledger.admitAttempt(diagnosticConfig!, { reportDirectory: fixture.evidenceDirectory, promptRevision: scenario.verifier?.revision ?? "custom_unverified", scenarioId: scenario.id });
     activeReservation = reservation.attemptId;
     reservationInterrupted = false;
     const caseStart = performance.now();
-    let verification: VerificationResult = verifyScenarioCompletion(independentVerifier, null, []);
+    let verification: VerificationResult | null = scenario.verifier ? verifyScenarioCompletion(independentVerifier, null, []) : null;
     activeCase = { scenario_id: scenario.id, run_id: run.run_id, attempt_id: reservation.attemptId,
       baseline, verifier_manifest: independentVerifier.manifest, verification };
     report.active_case = activeCase;
@@ -411,6 +468,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     let caseFailure: unknown;
     let deadlineReached = false;
     const runTimer = setTimeout(() => { deadlineReached = true; stop(run.run_id, "finite_run_deadline"); }, caps.runMs);
+    developmentDeadline = performance.now() + caps.runMs;
     try {
       assertOpen();
       await bounded(runtime.control(run.run_id, "start"), caps.startMs, "Production run start timed out");
@@ -422,9 +480,9 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
         latest = await evidence!.measure(run.run_id, "observation", () => bounded(fixture.bridge.observe(), caps.observationMs, "Authorized observation timed out"));
         assertOpen();
         evidence!.recordObservation(run.run_id, latest);
-        verification = verifyScenarioCompletion(independentVerifier, latest, evidence!.actions(run.run_id));
+        verification = scenario.verifier ? verifyScenarioCompletion(independentVerifier, latest, evidence!.actions(run.run_id)) : null;
         activeCase.verification = verification;
-        if (verification.status === "verified") { stop(run.run_id, "declared_semantic_goal_verified"); break; }
+        if (verification?.status === "verified") { stop(run.run_id, "declared_semantic_goal_verified"); break; }
         if (stopping || deadlineReached || evidence!.hasProviderFailure(run.run_id)) { stop(run.run_id, "provider_failure_no_repeat"); break; }
         await pause(caps.pollMs);
       }
@@ -441,8 +499,8 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       latest = await evidence!.measure(run.run_id, "observation", () => bounded(fixture.bridge.observe(), caps.observationMs, "Final authorized observation timed out"));
       assertOpen();
       evidence!.recordObservation(run.run_id, latest);
-      const finalVerification = verifyScenarioCompletion(independentVerifier, latest, evidence!.actions(run.run_id));
-      if (verification.status !== "verified") verification = finalVerification;
+      const finalVerification = scenario.verifier ? verifyScenarioCompletion(independentVerifier, latest, evidence!.actions(run.run_id)) : null;
+      if (verification?.status !== "verified") verification = finalVerification;
       activeCase.verification = verification;
       const diagnostics = await bounded(fixture.diagnostics(), caps.diagnosticsMs, "Native neutralization diagnostics timed out");
       assertOpen();
@@ -484,7 +542,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     assertOpen();
     if (!journal.evidence_complete) harnessFaults.push("private_model_evidence_incomplete");
     const outcome = classifyEvaluation({ inferenceAdmitted: usage.admissions > 0,
-      goalVerified: verification.status === "verified" ? true : verification.status === "unknown" ? null : false,
+      goalVerified: verification?.status === "verified" ? true : !verification || verification.status === "unknown" ? null : false,
       platformChecksComplete: neutral && connected && baselinePreserved && summary.observer_error === null && !caseFailure && !summary.unclassified_tool_failures && !unclassifiedRuntimeFailure,
       confirmedHarnessFaults: harnessFaults, providerError: summary.provider_error, providerSettled: summary.provider_settled,
       reasons: [...(deadlineReached ? ["finite_run_deadline_reached"] : []), ...(caseFailure ? ["case_ended_with_unclassified_error"] : []),
@@ -502,12 +560,21 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       evidence: await evidence!.save(run.run_id),
       private_journal: journal, recording: { directory: recordingDirectory, manifest: "recording-manifest.json", replay,
         replay_inspection: "Parent must inspect offline replay; render success is not visual inspection." },
+      completion_claim: scenario.verifier ? "registered_independent_verifier" :
+        evidence!.events(run.run_id).some(event => event.type === "task.completion_reported")
+          ? "model_reported_unverified" : "custom_not_completed_unverified",
     };
     if (studyAttempt) Object.assign(entry, { study_id: studyAttempt.studyId, slot: studyAttempt.slot, reservation_id: studyAttempt.reservationId });
     assertOpen();
     const artifact = fixture.report.native_artifact;
     const nativeHash = artifact && typeof artifact === "object" && "sha256" in artifact && typeof artifact.sha256 === "string" ? artifact.sha256 : null;
-    const compact = compactReport(scenario, config!, outcome, summary, entry.evidence, nativeHash, studyAttempt);
+    const natural = NATURAL_SCENARIOS.find(candidate => candidate.id === scenario.id);
+    requireProof(development || natural, "Acceptance task lacks an explicit declaration");
+    const compact = development ? { schema_version: 1, tier: "minecraft-development", development,
+      inference_reasoning: report.inference_reasoning,
+      model_id: config!.model.id, hypothesis_id: config!.hypothesisId, outcome, usage,
+      verification, completion_claim: entry.completion_claim, evidence: entry.evidence } :
+      compactReport(natural!, config!, outcome, summary, entry.evidence, nativeHash, studyAttempt);
     const compactName = `${batchId}-${scenario.id}.json`;
     await writeFile(path.join(paths.reportsRoot, compactName), JSON.stringify(compact, null, 2), { mode: 0o600, flag: "wx" });
     assertOpen();
@@ -544,9 +611,9 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     requireProof(sandbox.snapshot().status === "ready", "Actual production sandbox isolation is unavailable");
     assertOpen();
     evidence = new ModelProgramEvidence(store, fixture.evidenceDirectory, caps, clockId, (runId, why) => {
-      // Study requests are denied transactionally BEFORE transport. Do not let
-      // the diagnostic after-admission observer cancel the final admitted call.
-      if (studyAttempt && why === "host_request_admission_bound_reached") {
+      // These routes deny requests BEFORE transport. The after-admission
+      // observer must not cancel the final admitted call.
+      if ((studyAttempt || development) && why === "host_request_admission_bound_reached") {
         report.host_request_allocation_fully_admitted = true;
         return;
       }
@@ -632,11 +699,28 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
         report.cleanup_state = report.cleanup_confirmed ? "closed" : "unconfirmed";
         report.failure = failure ? reason(failure) : null;
         report.elapsed_ms = performance.now() - started;
+        if (development) {
+          report.development_host_admissions = developmentRequests.size;
+          report.development_request_ownership = [...developmentRequests].map(([request_id, ownership]) => ({ request_id, ...ownership }));
+        }
         if (diagnosticConfig) {
           const history = ledger.listAttempts(diagnosticConfig.hypothesisId);
-          report.cost_to_result = Object.fromEntries(selected.map(scenario => [scenario.id,
-            priorCosts(history.filter(attempt => attempt.metadata.scenarioId === scenario.id))]));
-          report.cost_to_result_scope = "All durable attempts for this hypothesis, grouped by declared scenario, including unsuccessful attempts and unknown interrupted usage; model changes do not erase prior costs";
+          if (development) {
+            // A single development entry accepts different whole requests.
+            // Grouping them by its launcher name would invent task equivalence.
+            report.diagnostic_history = history.map(attempt => ({
+              attempt_id: attempt.attemptId, model_id: attempt.config.model.id,
+              evidence_revision: attempt.platformEvidenceRevision, state: attempt.state,
+              scenario_id: attempt.metadata.scenarioId ?? null,
+              goal_verified: attempt.settlement?.outcome.goal_verified ?? null,
+              outcome: attempt.settlement?.outcome ?? null, usage: attempt.settlement?.usage ?? null,
+            }));
+            report.cost_scope = "Per-attempt actual usage and complete diagnostic history; no cross-task cost-to-result aggregate";
+          } else {
+            report.cost_to_result = Object.fromEntries(selected.map(scenario => [scenario.id,
+              priorCosts(history.filter(attempt => attempt.metadata.scenarioId === scenario.id))]));
+            report.cost_to_result_scope = "All durable attempts for this hypothesis, grouped by declared scenario, including unsuccessful attempts and unknown interrupted usage; model changes do not erase prior costs";
+          }
         }
         if (studies && studyAttempt) report.study_usage = summarizeStudyUsage(studies.readStudy({ studyId: studyAttempt.studyId, manifestSha256: studyAttempt.manifestSha256 }));
         clearTimeout(cleanupTimer);
@@ -681,6 +765,7 @@ export function parseAgentAcceptanceArguments(args: readonly string[]): AgentAcc
     const flag = args[index];
     if (flag === "--allow-native") options.allowNative = true;
     else if (flag === "--allow-inference") options.allowInference = true;
+    else if (flag === "--single-inference-dispatch") options.singleInferenceDispatch = true;
     else if (flag === "--admission-only") options.admissionOnly = true;
     else if (flag === "--study") studyId = value(index++);
     else if (flag === "--manifest") manifestPath = value(index++);
@@ -712,6 +797,7 @@ export function parseAgentAcceptanceArguments(args: readonly string[]): AgentAcc
   }
   if (Object.keys(caps).length) options.caps = caps;
   if (studyId || manifestPath || slot || options.admissionOnly) {
+    requireProof(!options.singleInferenceDispatch, "Single-dispatch inference cannot override a frozen study");
     requireProof(studyId && manifestPath && slot, "Pass a registered --study, matching --manifest and declared JSON --slot");
     requireProof(!hypothesisId && !platformEvidenceRevision, "A study cannot mint or override a diagnostic hypothesis/evidence identity");
     return { ...options, study: { studyId, manifestPath, slot } };

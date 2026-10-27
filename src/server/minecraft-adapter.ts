@@ -100,7 +100,12 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
       const request = minecraftActionSchema.parse(action);
       if (request.kind === "move" || request.kind === "navigate") return request.duration_ms + 2000;
       if (request.kind === "respawn") return 15000;
-      return request.kind === "dig" || request.kind === "craft" ? 12000 : 5000;
+      // Native gestures keep world time advancing; include its bounded session
+      // deadline and receipt drain without extending the owning root budget.
+      if (request.kind === "craft") return 13000 + 35000 * request.executions;
+      if (request.kind === "equip") return 15000;
+      if (request.kind === "place") return 23000;
+      return request.kind === "dig" ? 12000 : 5000;
     },
     projectObservation(value, previous) {
       const current = observation(value);

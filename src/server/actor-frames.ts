@@ -45,7 +45,10 @@ export function encodeNativeFramePng(frame: Uint8Array, receivedAt = Date.now())
       for (let x = 0; x < stride; x += 4) rows[offset + x + 4] = 255;
     }
     const compression = Promise.withResolvers<Buffer>();
-    deflate(rows, (error, value) => error ? compression.reject(error) : compression.resolve(value));
+    // Bun's 16 KiB default needs a worker/event-loop round trip per output chunk.
+    // Amortize that under live raw-video I/O without enlarging the recording queue.
+    deflate(rows, { level: 1, chunkSize: 256 * 1024 },
+      (error, value) => error ? compression.reject(error) : compression.resolve(value));
     const compressed = await compression.promise;
     const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(header.width, 0); ihdr.writeUInt32BE(header.height, 4); ihdr[8] = 8; ihdr[9] = 6;
     const png = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", compressed), chunk("IEND", Buffer.alloc(0))]);

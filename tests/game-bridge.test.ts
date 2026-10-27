@@ -166,6 +166,38 @@ test("expected-owner barrier accepts its ACK before newer death notice without a
     await barrier; expect(f.child.killed).toBe(false); expect(f.bridge.snapshot().status).toBe("connected");
   } finally { await f.close(); }
 }, 10000);
+test("alive connection waits for the loading screen to close before publishing readiness", async () => {
+  const f = fixture(), methods: string[] = [], loading = { screen_id: "loading", incarnation: 1, revision: 1 };
+  const seenLoading = Promise.withResolvers<void>();
+  let screen: typeof loading | null = loading;
+  Reflect.set(f.bridge, "owned", null);
+  Reflect.set(Reflect.get(f.bridge, "launcher"), "launch", async (_config: unknown, controlPort: number) => {
+    const peer = createConnection({ host: "127.0.0.1", port: controlPort }); f.peers.push(peer); peer.on("error", () => {});
+    peer.once("connect", () => peer.write(JSON.stringify(hello(f.session)) + "\n"));
+    requests(peer, request => {
+      methods.push(request.method); if (request.method !== "observe") return;
+      const observation = minecraftObservationFixture(adapter, { world_id: f.session.world_id, session_id: f.session.session_id,
+        epoch: f.session.epoch });
+      observation.screen = screen;
+      reply(peer, request.id, observation);
+    });
+    return f.owned;
+  });
+  f.bridge.subscribe(notice => {
+    if (notice.type === "observation" && f.bridge.snapshot().screen?.screen_id === loading.screen_id) seenLoading.resolve();
+  });
+  try {
+    const connecting = f.bridge.connect({ host: "127.0.0.1", port: 25565, version: "1.21.4", world_id: f.session.world_id, epoch: f.session.epoch });
+    await seenLoading.promise;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(f.bridge.snapshot().status).toBe("connecting");
+    screen = null;
+    await connecting;
+    expect(f.bridge.snapshot().status).toBe("connected");
+    expect((await f.bridge.observe()).screen).toBeNull();
+    expect(methods.every(method => method === "observe")).toBe(true);
+  } finally { await f.close(); }
+}, 10000);
 test("saved-dead connection negotiates the real declared profile without execute or automatic respawn", async () => {
   const selected = minecraftTestAdapter("fast"), f = fixture(selected, true), methods: string[] = [];
   // Loading seam only: substitute launcher beneath actual connect/hello/observe.

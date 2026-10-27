@@ -13,11 +13,12 @@ import { buildTransformedCodexRequestBody } from "@oh-my-pi/pi-ai/providers/open
 import { adaptSchemaForStrict, validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
 import type { GameAPI } from "../src/shared/programs.ts";
 import type { ObservationV3 } from "../src/shared/contracts.ts";
+import type { ImprovementOpportunity } from "../src/shared/execution-evidence.ts";
 import type { MinecraftObservation } from "../src/shared/minecraft.ts";
 import { gameActionResultSchema, observationSchema, skillResultSchema } from "../src/shared/validation.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { SkillManager } from "../src/server/skills.ts";
-import { RuntimeTools, type RuntimeToolHost } from "../src/server/runtime-tools.ts";
+import { preserveRuntimeToolArguments, RuntimeTools, type RuntimeToolHost } from "../src/server/runtime-tools.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
@@ -64,6 +65,14 @@ function fixture(runner?: SandboxService["runSkill"]) {
     const [body, input, handle] = args;
     const game: GameAPI & { recipes(item: string): Promise<import("../src/shared/contracts.ts").Json> } = { observe: async () => observationSchema.parse(await handle({ kind: "observe" })),
       action: async (action) => gameActionResultSchema.parse(await handle({ kind: "action", action })),
+      actionAndObserve: async action => {
+        const result = await game.action(action);
+        const evidence = result.evidence && typeof result.evidence === "object" && !Array.isArray(result.evidence)
+          ? result.evidence : null;
+        const safe = !result.requires_reconnect && (result.status === "succeeded" ||
+          result.status === "failed" && evidence?.world_effect_emitted === false && evidence?.neutralized === true);
+        return { action: result, observation: safe ? await game.observe() : null };
+      },
       respawn: async () => gameActionResultSchema.parse(await handle({ kind: "respawn" })),
       recipes: async (item) => await handle({ kind: "adapter", capability_id: "minecraft.recipes", version: 1, args: { item } }),
       call: async (skill, args) => skillResultSchema.parse(await handle({ kind: "call", skill, args })),
@@ -129,7 +138,7 @@ function data(reply: AgentToolResult) {
   return JSON.parse(reply.content.filter((entry) => entry.type === "text").map((entry) => entry.text).join(""));
 }
 
-async function agentCalls(tools: AgentTool[], calls: ToolCall[]) {
+async function agentCalls(tools: AgentTool[], calls: ToolCall[], beforeToolCall?: Agent["beforeToolCall"]) {
   const descriptor = getBundledModels("openai-codex").find((model) => model.api === "openai-codex-responses");
   if (!descriptor) throw new Error("Installed catalog lacks an offline Codex descriptor");
   const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
@@ -153,7 +162,9 @@ async function agentCalls(tools: AgentTool[], calls: ToolCall[]) {
     events.end();
     return events;
   };
-  const agent = new Agent({ initialState: { model, tools }, streamFn, getApiKey: () => "OFFLINE_SYNTHETIC_STREAM_ONLY" });
+  const agent = new Agent({ initialState: { model, tools }, streamFn,
+    beforeToolCall: (context, signal) => { preserveRuntimeToolArguments(context); return beforeToolCall?.(context, signal); },
+    getApiKey: () => "OFFLINE_SYNTHETIC_STREAM_ONLY" });
   try {
     await agent.prompt("Exercise the supplied local tool invocations without a provider.");
     return agent.state.messages.filter((message) => message.role === "toolResult");
@@ -162,6 +173,165 @@ async function agentCalls(tools: AgentTool[], calls: ToolCall[]) {
     await agent.waitForIdle();
   }
 }
+
+for (const toolName of ["program_submit", "program_run"] as const) {
+  for (const [form, limits, expected] of [
+    ["omitted", undefined, { duration_ms: 120000, max_actions: 64, max_calls: 256, max_depth: 8 }],
+    ["empty", {}, { duration_ms: 120000, max_actions: 64, max_calls: 256, max_depth: 8 }],
+    ["partial", { max_actions: 2 }, { duration_ms: 120000, max_actions: 2, max_calls: 256, max_depth: 8 }],
+  ] as const) {
+    test(`installed Agent ${toolName} ${form} limits normalize before admission and enforce the actual action budget`, async () => {
+      const f = fixture();
+      const body = 'for(let n=0;n<65;n++) await game.action({kind:"look",yaw:0,pitch:0}); return {status:"completed",summary:"Must exhaust the finite budget",result:null};';
+      const name = `${toolName} ${form}`;
+      if (toolName === "program_run") await f.write(name, body);
+      const input = { name, args: null, ...(limits === undefined ? {} : { limits }),
+        ...(toolName === "program_submit" ? { source: body } : { operation: "start" }) };
+      const declaration = f.tools().find(tool => tool.name === toolName)!;
+      expect(validateJsonSchemaValue(declaration.parameters, input).success).toBe(true);
+      const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: `${toolName}-${form}`, name: toolName, arguments: input }]);
+      expect(replies[0]!.isError).toBe(false);
+      const execution = f.store.latestRootExecution(f.run.run_id)!;
+      expect(execution.limits).toEqual(expected);
+      expect(Date.parse(execution.deadline_at) - Date.parse(execution.started_at ?? execution.deadline_at)).toBeLessThanOrEqual(expected.duration_ms);
+      await waitClosed(f.store, f.run.run_id, execution.execution_id);
+      const closed = f.store.skillExecution(f.run.run_id, { execution_id: execution.execution_id })!;
+      expect(closed.status).toBe("cancelled");
+      expect(closed.actions).toBe(expected.max_actions);
+      expect(f.actions()).toBe(expected.max_actions);
+      expect(f.dispatches()).toBe(1);
+      const replay = await f.call(toolName, input, `${toolName}-${form}`);
+      expect(replay.isError).not.toBe(true);
+      expect(f.dispatches()).toBe(1);
+    });
+  }
+}
+
+for (const [form, limits, expectedActions] of [
+  ["omitted", undefined, 64], ["empty", {}, 64], ["partial", { max_actions: 2 }, 2],
+] as const) {
+  test(`installed Agent prepare_next ${form} limits retain defaults and bound the activated successor`, async () => {
+    const release = Promise.withResolvers<void>();
+    const f = fixture(async (_body, args, handle, _limits, signal) => {
+      if (args === "predecessor") {
+        await Promise.race([release.promise, aborted(signal)]);
+        return { status: "completed", summary: "Predecessor settled", result: null };
+      }
+      for (let index = 0; index < 65; index++)
+        await handle({ kind: "action", action: { kind: "look", yaw: 0, pitch: 0 } });
+      return { status: "completed", summary: "Must exhaust successor budget", result: null };
+    });
+    await f.write("limit predecessor"); await f.write("limit successor");
+    await f.call("program_run", { operation: "start", name: "limit predecessor", args: "predecessor",
+      next: { after_ms: 0, reason: "Exercise successor limits", budget: { calls: 1, tools: 8, duration_ms: 30000 } } });
+    const predecessor = f.store.latestRootExecution(f.run.run_id)!;
+    const flight = f.planning.begin()!;
+    const input = { name: "limit successor", args: null, ...(limits === undefined ? {} : { limits }) };
+    const tool = f.tools().find(tool => tool.name === "prepare_next")!;
+    expect(validateJsonSchemaValue(tool.parameters, input).success).toBe(true);
+    const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: `prepare-${form}`, name: "prepare_next", arguments: input }]);
+    expect(replies[0]!.isError).toBe(false);
+    f.planning.finish(flight.plan_id);
+    const settled = Promise.withResolvers<void>();
+    const unsubscribe = f.store.subscribe(event => {
+      if (event.run_id === f.run.run_id && event.type === "planning.predecessor_settled") {
+        unsubscribe(); settled.resolve();
+      }
+    });
+    release.resolve();
+    await waitClosed(f.store, f.run.run_id, predecessor.execution_id);
+    await settled.promise;
+    const activated = await f.call("program_run", { operation: "activate_next" });
+    expect({ isError: activated.isError ?? false, result: data(activated) }).toMatchObject({ isError: false, result: { state: "activated" } });
+    const successor = f.store.latestRootExecution(f.run.run_id)!;
+    expect(successor.execution_id).not.toBe(predecessor.execution_id);
+    expect(successor.limits).toEqual({ duration_ms: 120000, max_actions: expectedActions, max_calls: 256, max_depth: 8 });
+    await waitClosed(f.store, f.run.run_id, successor.execution_id);
+    expect(f.store.skillExecution(f.run.run_id, { execution_id: successor.execution_id })).toMatchObject({
+      status: "cancelled", actions: expectedActions,
+    });
+    expect(f.actions()).toBe(expectedActions);
+  });
+}
+
+test("installed Agent rejects explicit invalid actor limits without source persistence or execution", async () => {
+  const f = fixture();
+  const limitsCases = [null, [], 2, { duration_ms: 99 }, { max_actions: 0 }, { max_calls: 2049 },
+    { max_depth: 9 }, { duration_ms: 600001 }, { max_actions: "2" }, { max_actions: 1.5 }, { unknown: 1 }];
+  for (const [index, limits] of limitsCases.entries()) {
+    const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: `bad-limits-${index}`, name: "program_submit",
+      arguments: { name: `bad ${index}`, source, args: null, limits } }]);
+    expect(replies[0]!.isError).toBe(true);
+    expect(data(replies[0]!).error).toMatchObject({ code: "invalid_request", retryable: false });
+    expect(JSON.stringify(data(replies[0]!)).length).toBeLessThan(5000);
+  }
+  expect(f.store.skills(f.run.run_id)).toHaveLength(0);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+});
+
+test("installed Agent rejects invalid start and successor limits before durable admission or staging", async () => {
+  const f = fixture(async (_body, _args, _handle, _limits, signal) => {
+    await aborted(signal); return { status: "completed", summary: "Released", result: null };
+  });
+  await f.write("invalid limit candidate");
+  const limitsCases = [null, { max_actions: "2" }, { max_calls: false }, { max_depth: 9 }, { duration_ms: 0 }, { unknown: 1 }];
+  for (const [index, limits] of limitsCases.entries()) {
+    const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: `invalid-start-${index}`, name: "program_run",
+      arguments: { operation: "start", name: "invalid limit candidate", args: null, limits } }]);
+    expect(data(replies[0]!).error.code).toBe("invalid_request");
+  }
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  await f.call("program_run", { operation: "start", name: "invalid limit candidate", args: null,
+    next: { after_ms: 0, reason: "Invalid successor requests must not stage", budget: { calls: 1, tools: 8, duration_ms: 30000 } } });
+  const flight = f.planning.begin()!;
+  for (const [index, limits] of limitsCases.entries()) {
+    const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: `invalid-prepare-${index}`, name: "prepare_next",
+      arguments: { name: "invalid limit candidate", args: null, limits } }]);
+    expect(data(replies[0]!).error.code).toBe("invalid_request");
+    expect(f.planning.projection()).toMatchObject({ state: "planning", candidate: null });
+  }
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  f.planning.finish(flight.plan_id);
+});
+
+test("SDK raw invalid limits cannot replay a prior valid normalized submission identity", async () => {
+  const f = fixture();
+  const input = { name: "raw identity", source, args: null, limits: { max_actions: 2 } };
+  expect((await agentCalls(f.tools(), [{ type: "toolCall", id: "raw-identity", name: "program_submit", arguments: input }]))[0]!.isError).toBe(false);
+  const root = f.store.latestRootExecution(f.run.run_id)!;
+  await waitClosed(f.store, f.run.run_id, root.execution_id);
+  const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: "raw-identity", name: "program_submit",
+    arguments: { ...input, limits: { max_actions: "2" } } }]);
+  expect(data(replies[0]!).error.code).toBe("invalid_request");
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  expect(f.dispatches()).toBe(1);
+});
+
+test("SDK raw prototype keys cannot supply inherited start arguments", async () => {
+  const f = fixture();
+  const saved = await agentCalls(f.tools(), [{ type: "toolCall", id: "prototype-write", name: "program_write",
+    arguments: { name: "prototype target", source } }]);
+  expect(saved[0]!.isError).toBe(false);
+  const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: "prototype-start", name: "program_run",
+    arguments: JSON.parse('{"__proto__":{"operation":"start","name":"prototype target","args":null}}') }]);
+  expect(replies[0]!.isError).toBe(true);
+  expect(replies[0]!.details).toMatchObject({ error: { code: "invalid_request" } });
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+});
+
+test("malformed SDK argument JSON remains SDK-owned rather than a fabricated harmless host rejection", async () => {
+  const f = fixture();
+  const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: "malformed-sdk-json", name: "program_submit",
+    arguments: { __parseError: "Fixture truncated JSON", __rawJson: '{"name":' } }]);
+  expect(replies[0]!.isError).toBe(true);
+  expect(typeof (replies[0]!.details as { error?: unknown })?.error).toBe("string");
+  expect(replies[0]!.details).not.toMatchObject({ error: { code: "invalid_request" } });
+  expect(f.store.eventsAfter(f.run.run_id, 0, 100).some(event => event.type === "model.tool_rejected")).toBe(false);
+  expect(f.store.skills(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+});
 
 test("installed Agent registers minimal program_write input with real untested metadata and source", async () => {
   const f = fixture();
@@ -232,6 +402,276 @@ test("named writes use optimistic revisions and catalog pagination counts famili
   expect(data(await f.call("program_inspect", { view: "source", name: "zebra", version: 1 })).version).toBe(1);
 });
 
+test("program_submit persists and starts its exact version once and reports pending work to the host", async () => {
+  const entered = Promise.withResolvers<void>();
+  const f = fixture(async (_body, args, _handle, _limits, signal) => {
+    entered.resolve();
+    await aborted(signal);
+    return { status: "completed", summary: "Released", result: args };
+  });
+  let admissions = 0;
+  f.toolHost.admitted = () => { admissions++; };
+  const input = { name: "submitted", source, args: { chosen: true }, limits: { duration_ms: 10000, max_actions: 2, max_calls: 8, max_depth: 2 } };
+  const first = await f.call("program_submit", input, "submit-once");
+  expect(first.isError).not.toBe(true);
+  const outcome = data(first);
+  expect(outcome).toMatchObject({ source: { status: "persisted", name: "submitted", version: 1 }, start: { status: "started", execution: { name: "submitted", version: 1 } } });
+  await entered.promise;
+  const original = f.store.latestRootExecution(f.run.run_id)!;
+  expect(original.args).toEqual({ chosen: true });
+  expect(original.limits).toEqual(input.limits);
+  expect(f.manager.pending).toBe(true);
+  expect(admissions).toBe(1);
+  await f.write("submitted", source, { based_on: 1 });
+  expect(data(await f.call("program_submit", input, "submit-once"))).toEqual(outcome);
+  expect(f.store.skills(f.run.run_id)).toHaveLength(2);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  expect(f.dispatches()).toBe(1);
+  expect(admissions).toBe(1);
+  expect(data(await f.call("program_submit", { ...input, args: null }, "submit-once")).error.code).toBe("conflict");
+});
+
+test("program_submit rejects invalid source, lineage, dependencies and limits before starting", async () => {
+  const f = fixture();
+  await f.write("existing");
+  const cases = [
+    { input: { name: "bad syntax", source: "return {", args: null }, code: "invalid_program" },
+    { input: { name: "oversized", source: " ".repeat(16385), args: null }, code: "invalid_request" },
+    { input: { name: "existing", based_on: 2, source, args: null }, code: "conflict" },
+    { input: { name: "missing dependency", source, args: null, dependencies: [{ name: "absent" }] }, code: "not_found" },
+    { input: { name: "bad limit", source, args: null, limits: { duration_ms: 0, max_actions: 1, max_calls: 1, max_depth: 1 } }, code: "invalid_request" },
+  ];
+  for (const { input, code } of cases) {
+    expect(data(await f.call("program_submit", input)).error.code).toBe(code);
+  }
+  expect(f.store.skills(f.run.run_id)).toHaveLength(1);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+});
+
+test("program_submit pins source and dependencies even when a newer revision appears between phases", async () => {
+  const f = fixture();
+  await f.write("child", 'return {status:"completed",summary:"Original child",result:1};');
+  const input = { name: "submitted parent", source: 'return await game.call({name:"child"},args);', args: null, dependencies: [{ name: "child" }] };
+  const originalRegister = f.manager.register.bind(f.manager);
+  let interleave = true;
+  f.manager.register = async (...args) => {
+    const written = await originalRegister(...args);
+    if (interleave && written.name === input.name) {
+      interleave = false;
+      await f.write(input.name, 'return {status:"completed",summary:"Newer parent",result:99};', { based_on: 1 });
+      await f.write("child", 'return {status:"completed",summary:"Newer child",result:2};', { based_on: 1 });
+    }
+    return written;
+  };
+  expect(data(await f.call("program_submit", input)).start).toMatchObject({ status: "started", execution: { name: input.name, version: 1 } });
+  const root = f.store.latestRootExecution(f.run.run_id)!;
+  await waitClosed(f.store, f.run.run_id, root.execution_id);
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })!.result).toMatchObject({ result: 1 });
+  expect(f.store.allSkillExecutions(f.run.run_id).map(execution => execution.version)).toEqual([1, 1]);
+});
+
+for (const boundary of ["stop", "pause", "generation", "task", "owner"] as const) {
+  test(`program_submit preserves source but blocks ${boundary} authority changes between phases`, async () => {
+    const f = fixture();
+    const originalRegister = f.manager.register.bind(f.manager);
+    f.manager.register = async (...args) => {
+      const written = await originalRegister(...args);
+      if (boundary === "stop") f.run.status = "stopped";
+      if (boundary === "pause") f.run.status = "paused";
+      if (boundary === "generation") f.fence();
+      if (boundary === "task") f.run.task = "A different task must not inherit this decision";
+      if (boundary === "owner") f.toolHost.run = () => ({ ...f.run, run_id: "different-owner" });
+      f.store.saveRun(f.run);
+      return written;
+    };
+    const outcome = data(await f.call("program_submit", { name: "interrupted", source, args: null }, `submit-${boundary}`));
+    expect(outcome).toMatchObject({ source: { status: "persisted", name: "interrupted", version: 1 }, start: { status: "refused", error: { code: "stale_context", retryable: false } } });
+    expect(f.store.skills(f.run.run_id)).toHaveLength(1);
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+    expect(f.dispatches()).toBe(0);
+  });
+}
+
+test("program_submit returns and durably replays a refused start without retrying admission", async () => {
+  const f = fixture();
+  let attempts = 0;
+  f.manager.start = () => { attempts++; throw new RuntimeFault("conflict", "Another owner holds effect admission"); };
+  const input = { name: "saved but refused", source, args: null };
+  const first = data(await f.call("program_submit", input, "refused-submit"));
+  expect(first).toMatchObject({ source: { status: "persisted", version: 1 }, start: { status: "refused", error: { code: "conflict", retryable: false } } });
+  expect(data(await f.call("program_submit", input, "refused-submit"))).toEqual(first);
+  expect(attempts).toBe(1);
+  expect(f.store.skills(f.run.run_id)).toHaveLength(1);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
+test("program_submit lost final acknowledgement replays its original execution and never latest", async () => {
+  const f = fixture();
+  const db = new Database(join(f.directory, "runs.sqlite"));
+  const id = "lost-submit-final";
+  db.exec(`CREATE TRIGGER lose_submit_ack BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND NEW.object_key='${id}' BEGIN SELECT RAISE(ABORT,'lost acknowledgement'); END;`);
+  const input = { name: "lost final", source, args: { original: true } };
+  expect((await f.call("program_submit", input, id)).isError).toBe(true);
+  const root = f.store.latestRootExecution(f.run.run_id)!;
+  await waitClosed(f.store, f.run.run_id, root.execution_id);
+  db.exec("DROP TRIGGER lose_submit_ack;");
+  await f.write(input.name, source, { based_on: 1 });
+  f.run.epoch++; f.run.life_id!++; f.store.saveRun(f.run);
+  expect(data(await f.call("program_submit", input, id))).toMatchObject({
+    source: { status: "persisted", version: 1 }, start: { status: "started", execution: { version: 1 } },
+  });
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  expect(f.dispatches()).toBe(1);
+  expect(f.store.skills(f.run.run_id)).toHaveLength(2);
+  db.close();
+});
+
+for (const boundary of ["pause", "generation", "abort"] as const) {
+  for (const outcome of ["started", "refused"] as const) {
+    test(`program_submit recovers its ${outcome} inner receipt after lost outer acknowledgement and ${boundary}`, async () => {
+      const f = fixture();
+      const tool = f.tools().find(tool => tool.name === "program_submit")!;
+      const controller = new AbortController();
+      let starts = 0;
+      const originalStart = f.manager.start.bind(f.manager);
+      f.manager.start = (...args) => {
+        starts++;
+        if (outcome === "refused") throw new RuntimeFault("conflict", "Controlled admission refusal");
+        return originalStart(...args);
+      };
+      const db = new Database(join(f.directory, "runs.sqlite"));
+      const id = "recover-submit-receipt";
+      db.exec(`CREATE TRIGGER lose_submit_outer_ack BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND NEW.object_key='${id}' BEGIN SELECT RAISE(ABORT,'lost outer acknowledgement'); END;`);
+      const input = { name: "recover receipt", source, args: { original: true } };
+      expect((await tool.execute(id, input, controller.signal)).isError).toBe(true);
+      const receipt = JSON.parse(db.query<{ payload: string }, [string, string]>(
+        "SELECT payload FROM evidence_objects WHERE run_id=? AND kind='tool_result' AND json_extract(payload,'$.source.name')=?",
+      ).get(f.run.run_id, input.name)!.payload);
+      expect(receipt.start.status).toBe(outcome);
+      if (outcome === "started") {
+        const root = f.store.latestRootExecution(f.run.run_id)!;
+        await waitClosed(f.store, f.run.run_id, root.execution_id);
+      }
+      db.exec("DROP TRIGGER lose_submit_outer_ack;");
+      if (boundary === "pause") { f.run.status = "paused"; f.store.saveRun(f.run); }
+      if (boundary === "generation") f.fence();
+      if (boundary === "abort") controller.abort();
+      const replay = await tool.execute(id, input, controller.signal);
+      expect(replay.isError).not.toBe(true);
+      expect(data(replay)).toEqual(receipt);
+      expect(data(await tool.execute(id, { ...input, args: null }, controller.signal)).error.code).toBe("conflict");
+      expect((await tool.execute("a-new-submission", { name: "new decision", source, args: null }, controller.signal)).isError).toBe(true);
+      expect(starts).toBe(1);
+      expect(f.store.skills(f.run.run_id)).toHaveLength(1);
+      expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(outcome === "started" ? 1 : 0);
+      expect(f.dispatches()).toBe(outcome === "started" ? 1 : 0);
+      db.close();
+    });
+  }
+}
+
+test("program_submit persisted-source interruption cannot create another revision or silently start on duplicate", async () => {
+  const f = fixture();
+  const originalRegister = f.manager.register.bind(f.manager);
+  f.manager.register = async (...args) => {
+    await originalRegister(...args);
+    throw new Error("Lost acknowledgement immediately after immutable source commit");
+  };
+  const input = { name: "lost source acknowledgement", source, args: null };
+  const first = data(await f.call("program_submit", input, "lost-source-submit"));
+  expect(first).toMatchObject({ source: { status: "persisted", version: 1 }, start: { status: "refused", error: { retryable: false } } });
+  f.manager.register = originalRegister;
+  await f.write(input.name, source, { based_on: 1 });
+  expect(data(await f.call("program_submit", input, "lost-source-submit"))).toEqual(first);
+  expect(f.store.skills(f.run.run_id)).toHaveLength(2);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+});
+
+test("program_write lost source acknowledgement reuses the registered version rather than rechecking latest", async () => {
+  const f = fixture();
+  const originalRegister = f.manager.register.bind(f.manager);
+  f.manager.register = async (...args) => {
+    await originalRegister(...args);
+    throw new Error("Source committed but acknowledgement lost");
+  };
+  expect((await f.write("write replay", source, {}, "write-lost-source")).isError).toBe(true);
+  f.manager.register = originalRegister;
+  await f.write("write replay", source, { based_on: 1 });
+  expect(data(await f.write("write replay", source, {}, "write-lost-source"))).toMatchObject({ name: "write replay", version: 1 });
+  expect(f.store.skills(f.run.run_id)).toHaveLength(2);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
+test("program_submit never retries an ambiguous start without a durable execution receipt", async () => {
+  const f = fixture();
+  let attempts = 0;
+  f.manager.start = () => { attempts++; throw new Error("Admission acknowledgement unavailable"); };
+  const input = { name: "ambiguous", source, args: null };
+  const first = data(await f.call("program_submit", input, "ambiguous-submit"));
+  expect(first).toMatchObject({ source: { status: "persisted", version: 1 }, start: { status: "unknown", error: { retryable: false } } });
+  expect(data(await f.call("program_submit", input, "ambiguous-submit"))).toEqual(first);
+  expect(attempts).toBe(1);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
+test("program_submit duplicate during validation cannot create a second version or execution", async () => {
+  const f = fixture();
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const originalRegister = f.manager.register.bind(f.manager);
+  f.manager.register = async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return await originalRegister(...args);
+  };
+  const input = { name: "concurrent validation", source, args: null };
+  const first = f.call("program_submit", input, "concurrent-before-persist");
+  await entered.promise;
+  expect(data(await f.call("program_submit", input, "concurrent-before-persist")).error.code).toBe("conflict");
+  release.resolve();
+  expect(data(await first).start.status).toBe("started");
+  const root = f.store.latestRootExecution(f.run.run_id)!;
+  await waitClosed(f.store, f.run.run_id, root.execution_id);
+  expect(f.store.skills(f.run.run_id)).toHaveLength(1);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  expect(f.dispatches()).toBe(1);
+});
+
+test("program_submit duplicate after persistence fences the still-pending original start attempt", async () => {
+  const f = fixture();
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const originalRegister = f.manager.register.bind(f.manager);
+  f.manager.register = async (...args) => {
+    const program = await originalRegister(...args);
+    entered.resolve();
+    await release.promise;
+    return program;
+  };
+  const input = { name: "concurrent persisted", source, args: null };
+  const first = f.call("program_submit", input, "concurrent-after-persist");
+  await entered.promise;
+  const replay = data(await f.call("program_submit", input, "concurrent-after-persist"));
+  expect(replay).toMatchObject({ source: { status: "persisted", version: 1 }, start: { status: "unknown", error: { retryable: false } } });
+  release.resolve();
+  expect(data(await first)).toEqual(replay);
+  expect(f.store.skills(f.run.run_id)).toHaveLength(1);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+});
+
+test("program_submit rolls back version creation if its exact registration identity cannot persist", async () => {
+  const f = fixture();
+  const db = new Database(join(f.directory, "runs.sqlite"));
+  db.exec("CREATE TRIGGER lose_registration BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND json_extract(NEW.payload,'$.skill_id') IS NOT NULL BEGIN SELECT RAISE(ABORT,'registration receipt unavailable'); END;");
+  const reply = await f.call("program_submit", { name: "atomic source", source, args: null });
+  expect(reply.isError).toBe(true);
+  expect(f.store.skills(f.run.run_id)).toHaveLength(0);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+  db.close();
+});
+
 test("tool rejections preserve bounded trusted issues without exposing arbitrary host error fields", async () => {
   const f = fixture();
   const issues = [{ code: "invalid_syntax", message: "Invalid body", location: { line: 3, column: 7 }, limit: null,
@@ -250,6 +690,12 @@ test("tool rejections preserve bounded trusted issues without exposing arbitrary
   expect(data(rejected).error).toEqual({
     code: "backend_unavailable", message: "The requested operation could not complete safely", retryable: false,
   });
+  f.toolHost.observe = async () => { throw new z.ZodError([{ code: "custom", path: ["PRIVATE_HOST_PATH"], message: "PRIVATE_HOST_ZOD" }]); };
+  expect(data(await f.call("observe", {})).error).toEqual({
+    code: "backend_unavailable", message: "The requested operation could not complete safely", retryable: false,
+  });
+  f.toolHost.observe = async () => { throw null; };
+  expect(data(await f.call("observe", {})).error.code).toBe("backend_unavailable");
   expect(JSON.stringify(f.store.eventsAfter(f.run.run_id, 0, 500))).not.toContain("PRIVATE_HOST");
 });
 
@@ -321,6 +767,7 @@ test("actual catalogs and dispatch share ordinary, speculative, advanced-module 
   });
   const ordinary = f.tools();
   expect(ordinary.some((tool) => tool.name === "program_run")).toBe(true);
+  expect(ordinary.some((tool) => tool.name === "program_submit")).toBe(true);
   expect(ordinary.some((tool) => tool.name === "task_finish")).toBe(true);
   expect(ordinary.some((tool) => tool.name === "prepare_next" || tool.name === "reflex" || tool.name === "memory")).toBe(false);
   await f.call("help", { topic: "reflex" });
@@ -331,8 +778,9 @@ test("actual catalogs and dispatch share ordinary, speculative, advanced-module 
   expect(plan).not.toBeNull();
   const speculative = f.tools();
   expect(speculative.some((tool) => tool.name === "prepare_next")).toBe(true);
-  expect(speculative.some((tool) => tool.name === "program_run" || tool.name === "program_write" || tool.name === "task_finish")).toBe(false);
+  expect(speculative.some((tool) => tool.name === "program_run" || tool.name === "program_submit" || tool.name === "program_write" || tool.name === "task_finish")).toBe(false);
   expect((await f.call("program_write", { name: "forbidden", source, card, dependencies: [] }, "forbidden-write", ordinary)).isError).toBe(true);
+  expect(data(await f.call("program_submit", { name: "forbidden submit", source, args: null }, "forbidden-spec-submit", ordinary)).error.code).toBe("forbidden");
   expect(data(await f.call("task_finish", { summary: "Not authorized during speculation" }, "forbidden-spec-finish", ordinary)).error.code).toBe("forbidden");
   expect(data(await f.call("prepare_next", { name: "candidate", args: null })).guard_status).toBe("omitted");
   f.planning.finish(plan.plan_id); release.resolve();
@@ -340,8 +788,9 @@ test("actual catalogs and dispatch share ordinary, speculative, advanced-module 
   await waitClosed(f.store, f.run.run_id, root.execution_id);
   f.run.status = "reviewing";
   expect(f.tools().some((tool) => tool.name === "program_review")).toBe(true);
-  expect(f.tools().some((tool) => tool.name === "program_run" || tool.name === "prepare_next" || tool.name === "task_finish")).toBe(false);
+  expect(f.tools().some((tool) => tool.name === "program_run" || tool.name === "program_submit" || tool.name === "prepare_next" || tool.name === "task_finish")).toBe(false);
   expect((await f.call("program_run", { operation: "start", name: "candidate", args: null }, "forbidden-review-run", ordinary)).isError).toBe(true);
+  expect(data(await f.call("program_submit", { name: "forbidden submit", source, args: null }, "forbidden-review-submit", ordinary)).error.code).toBe("forbidden");
   expect(data(await f.call("task_finish", { summary: "Not authorized during review" }, "forbidden-review-finish", ordinary)).error.code).toBe("forbidden");
   await f.call("help", { topic: "memory" });
   expect(f.tools().some((tool) => tool.name === "memory")).toBe(false);
@@ -427,6 +876,132 @@ test("effect-free review links actual revisions to exact matching feedback and i
   expect(f.actions()).toBe(0);
   expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
 });
+
+for (const assessed of [false, true]) {
+  for (const newerOutcome of [false, true]) {
+    test(`program_write reason replay pins original feedback and does not duplicate linkage (assessed=${assessed}, newer=${newerOutcome})`, async () => {
+      const f = fixture();
+      const name = "feedback identity";
+      await f.write(name, 'throw new Error("Controlled original sample");');
+      await f.call("program_run", { operation: "start", name, version: 1, args: "outcome A" });
+      const firstRoot = f.store.latestRootExecution(f.run.run_id)!;
+      await waitClosed(f.store, f.run.run_id, firstRoot.execution_id);
+      f.learning.feedback(f.run.run_id);
+      const original = f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")[0]!;
+      if (assessed) await f.call("program_review", { name, version: 1, decision: "keep", reason: "Retain immutable assessment A" });
+      const db = new Database(join(f.directory, "runs.sqlite"));
+      const id = "lost-feedback-write-ack";
+      db.exec(`CREATE TRIGGER lose_feedback_ack BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND NEW.object_key='${id}' BEGIN SELECT RAISE(ABORT,'lost feedback acknowledgement'); END;`);
+      const options = { based_on: 1, reason: "A candidate specifically addressing outcome A" };
+      expect((await f.write(name, source, options, id)).isError).toBe(true);
+      const child = f.store.namedSkill(f.run.run_id, name, 2)!;
+      expect(child.parent_version).toBe(1);
+      db.exec("DROP TRIGGER lose_feedback_ack;");
+      if (newerOutcome) {
+        await f.call("program_run", { operation: "start", name, version: 1, args: "outcome B" });
+        const secondRoot = f.store.latestRootExecution(f.run.run_id)!;
+        await waitClosed(f.store, f.run.run_id, secondRoot.execution_id);
+        f.learning.feedback(f.run.run_id);
+        expect(secondRoot.execution_id).not.toBe(firstRoot.execution_id);
+      }
+      const opportunities = f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity");
+      const links = f.store.eventsAfter(f.run.run_id, 0, 500)
+        .filter(event => event.type === "learning.candidate_written" || event.type === "learning.resolved");
+      expect(links.some(event => event.details !== null && typeof event.details === "object" && !Array.isArray(event.details) &&
+        event.details.opportunity_id === original.opportunity_id)).toBe(true);
+      const replay = await f.write(name, source, options, id);
+      expect(replay.isError).not.toBe(true);
+      expect(data(replay)).toMatchObject({ name, version: 2, experiment: { decision: "revise", reason: options.reason } });
+      expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")).toEqual(opportunities);
+      expect(f.store.eventsAfter(f.run.run_id, 0, 500)
+        .filter(event => event.type === "learning.candidate_written" || event.type === "learning.resolved")).toEqual(links);
+      expect(f.store.skills(f.run.run_id)).toHaveLength(2);
+      expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(newerOutcome ? 2 : 1);
+      db.close();
+    });
+  }
+}
+
+for (const decision of ["insufficient_evidence", "keep"] as const) {
+  test(`a failed outcome assessed ${decision} still permits an immutable direct-child repair with stable retries`, async () => {
+    const f = fixture();
+    const name = "assessed repair";
+    await f.write(name);
+    const failedSource = 'throw new Error("Controlled neutral execution failure");';
+    expect(data(await f.write(name, failedSource, { based_on: 1 }))).toMatchObject({ name, version: 2 });
+    const parent = f.store.namedSkill(f.run.run_id, name, 2)!;
+    expect((await f.call("program_run", { operation: "start", name, version: 2, args: null })).isError).not.toBe(true);
+    const root = f.store.latestRootExecution(f.run.run_id)!;
+    await waitClosed(f.store, f.run.run_id, root.execution_id);
+    expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })!.status).toBe("failed");
+
+    const reviewInput = { name, version: 2, decision, reason: "This failed sample does not establish a better procedure" };
+    const reviewed = await f.call("program_review", reviewInput, "assess-parent");
+    expect(reviewed.isError).not.toBe(true);
+    expect(data(reviewed)).toMatchObject({ name, version: 2, decision });
+    const opportunities = f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity");
+    expect(opportunities).toHaveLength(1);
+    expect(opportunities[0]).toMatchObject({
+      execution_id: root.execution_id,
+      version: { skill_id: parent.skill_id, version: 2, hash: parent.hash },
+      resolution: { decision, reason: reviewInput.reason, revision: null, measured: false },
+    });
+    const assessmentHistory = f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "learning.resolved");
+    expect(assessmentHistory).toHaveLength(1);
+
+    const repairSource = 'return {status:"completed",summary:"Changed neutral procedure awaits measurement",result:null};';
+    const repairOptions = { based_on: 2, reason: "Replace the failing code path with a changed bounded candidate; no improvement claim" };
+    const repaired = await f.write(name, repairSource, repairOptions, "repair-reviewed-parent");
+    expect(repaired.isError).not.toBe(true);
+    expect(data(repaired)).toMatchObject({
+      name, version: 3, state: "validated",
+      experiment: { decision: "revise", measured: false, reason: repairOptions.reason, qualification: "candidate_not_proven_improvement" },
+    });
+    const child = f.store.namedSkill(f.run.run_id, name, 3)!;
+    expect(child).toMatchObject({ skill_id: parent.skill_id, parent_version: 2, version: 3 });
+    expect(child.hash).not.toBe(parent.hash);
+    expect(f.store.namedSkill(f.run.run_id, name, 2)).toEqual(parent);
+    expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")).toEqual(opportunities);
+    expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "learning.resolved")).toEqual(assessmentHistory);
+    const candidates = f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "learning.candidate_written");
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]!.details).toEqual({
+      opportunity_id: opportunities[0]!.opportunity_id, execution_id: root.execution_id,
+      parent: { run_id: f.run.run_id, skill_id: parent.skill_id, version: 2, hash: parent.hash },
+      revision: { run_id: f.run.run_id, skill_id: parent.skill_id, version: 3, hash: child.hash },
+      event_seqs: opportunities[0]!.event_seqs,
+      decision: "revise", measured: false, reason: repairOptions.reason, qualification: "candidate_not_proven_improvement",
+    });
+
+    const retried = await f.write(name, repairSource, repairOptions, "repair-reviewed-parent");
+    expect(retried.isError).not.toBe(true);
+    expect(data(retried)).toEqual(data(repaired));
+    const reviewRetry = await f.call("program_review", reviewInput, "assess-parent");
+    expect(reviewRetry.isError).not.toBe(true);
+    expect(data(reviewRetry)).toEqual(data(reviewed));
+    const changedRetry = await f.write(name, source, repairOptions, "repair-reviewed-parent");
+    expect(changedRetry.isError).toBe(true);
+    expect(data(changedRetry).error.code).toBe("conflict");
+
+    const stale = await f.write(name, repairSource, repairOptions, "stale-reviewed-parent");
+    expect(stale.isError).toBe(true);
+    expect(data(stale).error).toMatchObject({
+      code: "conflict", issues: [{ code: "stale_parent", latest_parent: { name, version: 3 } }],
+    });
+    const reassessed = await f.call("program_review", {
+      ...reviewInput, decision: decision === "keep" ? "insufficient_evidence" : "keep",
+    }, "conflicting-parent-assessment");
+    expect(reassessed.isError).toBe(true);
+    expect(data(reassessed).error.code).toBe("conflict");
+    expect(f.store.skills(f.run.run_id)).toHaveLength(3);
+    expect(f.store.namedSkill(f.run.run_id, name, 3)).toEqual(child);
+    expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")).toEqual(opportunities);
+    expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "learning.candidate_written")).toEqual(candidates);
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+    expect(f.dispatches()).toBe(1);
+    expect(f.actions()).toBe(0);
+  });
+}
 
 test("stop fences the actual named execution and stale tool closures cannot write", async () => {
   const f = fixture(async (_source, _args, _handle, _limits, signal) => {
@@ -653,6 +1228,8 @@ test("all default-bearing tool declarations accept omitted inputs without weaken
   const declarations = [...ordinary, ...f.tools()];
   const cases: { name: string; input: Record<string, unknown> }[] = [
     { name: "program_write", input: { name: "default candidate", source } },
+    { name: "program_submit", input: { name: "default submitted candidate", source, args: null } },
+    { name: "program_submit", input: { name: "default submitted candidate", source, args: null, next } },
     { name: "program_run", input: { operation: "start", name: "default predecessor", args: null } },
     { name: "program_run", input: { operation: "start", name: "default predecessor", args: null, next } },
     { name: "program_run", input: { operation: "inspect" } },

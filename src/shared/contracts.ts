@@ -397,6 +397,25 @@ export interface ProgramEvidenceView {
   compactness: SkillView["validation"];
 }
 
+export type RunPauseCause = "operator" | "provider_failure" | "provider_aborted" | "deadline" |
+  "observation_unavailable" | "preparation_failed" | "safety";
+export interface RunControlState {
+  pause_cause: RunPauseCause | null;
+  cleanup_error: string | null;
+}
+export interface RunOperatorView extends RunControlState {
+  state: RunView["status"] | "acting" | "executing" | "thinking" | "waiting" | "recovering" | "blocked" | "provider_unavailable";
+  completion: "verified" | "model_reported_unverified" | null;
+  progress: {
+    event_seq: number;
+    at: string;
+    summary: string;
+    execution_id: string | null;
+    source: "model_program";
+    verification: "unverified";
+  } | null;
+}
+
 export interface RunView {
   run_id: string;
   world_id: string;
@@ -430,6 +449,7 @@ export interface RunView {
   skills: SkillView[];
   executions: SkillExecutionView[];
   error: string | null;
+  operator: RunOperatorView;
   usage: RunUsage;
 }
 

@@ -5,7 +5,13 @@ import { verificationResultSchema } from "../shared/validation.ts";
 import { contractHash } from "../server/adapter-contract.ts";
 import type { ScenarioId } from "./scenarios.ts";
 
-export interface NaturalScenario {
+export interface MinecraftAcceptanceTask {
+  readonly id: string;
+  readonly prompt: string;
+  readonly adapter_goal_id: string;
+  readonly verifier: { readonly revision: string; readonly version: number; readonly description: string } | null;
+}
+export interface NaturalScenario extends MinecraftAcceptanceTask {
   readonly id: ScenarioId;
   readonly prompt: string;
   readonly adapter_goal_id: string;
@@ -25,9 +31,11 @@ export const NATURAL_SCENARIOS: readonly NaturalScenario[] = Object.freeze([
 export function selectNaturalScenarios(selector?: ScenarioId | "all"): readonly NaturalScenario[] {
   return NATURAL_SCENARIOS.filter(scenario => !selector || selector === "all" ? scenario.id !== "collect_and_craft_table" : scenario.id === selector);
 }
-export function scenarioGoal(adapter: RuntimeAdapter, scenario: NaturalScenario): AdapterGoal {
+export function scenarioGoal(adapter: RuntimeAdapter, scenario: MinecraftAcceptanceTask): AdapterGoal {
   const goal = adapter.goals.find(value => value.goal_id === scenario.adapter_goal_id);
-  if (!goal || goal.adapter_id !== adapter.descriptor.adapter.id || goal.verifier?.id !== scenario.verifier.revision || goal.verifier.version !== scenario.verifier.version)
+  if (!goal || goal.adapter_id !== adapter.descriptor.adapter.id ||
+    (goal.verifier?.id ?? null) !== (scenario.verifier?.revision ?? null) ||
+    (goal.verifier?.version ?? null) !== (scenario.verifier?.version ?? null))
     throw new Error("Actual adapter does not register the predeclared scenario goal/verifier version");
   return structuredClone(goal);
 }
@@ -39,7 +47,7 @@ export interface ScenarioVerification {
   readonly compatibility_hash: string;
   readonly consumed_actions: Set<string>;
 }
-export function captureScenarioVerification(adapter: RuntimeAdapter, scenario: NaturalScenario, runId: string, observation: ObservationV3, generation: number): ScenarioVerification {
+export function captureScenarioVerification(adapter: RuntimeAdapter, scenario: MinecraftAcceptanceTask, runId: string, observation: ObservationV3, generation: number): ScenarioVerification {
   if (!Number.isSafeInteger(generation) || generation < 0) throw new Error("Evaluator generation must be a safe counter");
   const goal = scenarioGoal(adapter, scenario);
   return { adapter, generation, compatibility_hash: contractHash(adapter.descriptor), consumed_actions: new Set(), manifest: Object.freeze({ goal,

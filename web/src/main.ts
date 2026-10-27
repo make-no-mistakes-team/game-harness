@@ -41,6 +41,9 @@ import {
 import type { PerformanceSnapshot } from "./api.ts";
 import { NativeVideo } from "./video.ts";
 import { EvidenceInspector, promotionEvidence } from "./evidence.ts";
+import { MAX_TASK_CHARACTERS, taskTextSchema } from "../../src/shared/tasks.ts";
+import { initialTaskDraft, editTaskPrompt, selectTaskChoice, taskSubmission } from "./task-draft.ts";
+import { currentTaskText, stopControl, operatorLabel, canRefreshModels } from "./operator-state.ts";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("Application mount is missing.");
@@ -59,8 +62,8 @@ root.innerHTML = `
       <div class="context-overview">
       <section><h2><button id="life-open" class="section-action" type="button"><span>Session / player life</span><span id="life-current" class="context-value">No game session.</span></button></h2></section>
       <section><h2>Current goal</h2><p id="current-task">No run created.</p><button id="goal-more" type="button" hidden>Read full task</button></section>
-      <section><h2><button id="programs-open" class="section-action" type="button" aria-label="Inspect programs, model and action" title="Inspect programs, model and action"><span>Program / control</span><span id="program-current" class="context-value">No executing skill.</span><span id="program-status" class="context-value" hidden></span></button></h2></section>
-      <section><h2><button id="activity-open" class="section-action" type="button" aria-label="Inspect activity" title="Inspect activity"><span id="activity-heading">Latest activity</span><span id="latest-activity" class="context-value">No recorded activity yet.</span></button></h2></section>
+      <section><h2><button id="programs-open" class="section-action" type="button" title="Inspect programs, model and action"><span>Program / control</span><span id="program-current" class="context-value">No executing skill.</span><span id="program-status" class="context-value" hidden></span></button></h2></section>
+      <section><h2><button id="activity-open" class="section-action" type="button" title="Inspect activity"><span id="activity-heading">Latest activity</span><span id="latest-activity" class="context-value">No recorded activity yet.</span></button></h2></section>
       </div>
       <section class="usage-summary"><h2><button id="usage-open" class="section-action" type="button" aria-label="Usage details" title="Usage details">Actual usage</button></h2><dl id="usage-summary"></dl></section>
       <p id="run-error" class="error" role="alert" hidden></p>
@@ -71,7 +74,7 @@ root.innerHTML = `
 </main>
 <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-header"><h2 id="settings-title">Settings & task</h2><button type="button" data-close="settings-dialog" aria-label="Close settings">Close</button></div><div class="dialog-body settings-grid">
   <section class="settings-task"><h3>Game integration</h3><p>GameHarness runs model-authored game programs. Minecraft Java 1.21.4 is the first available integration; other game adapters are not available in this build.</p></section>
-  <section class="settings-task"><h3>Task and strategic model</h3><form id="task-form"><div class="form-row"><label>Goal<select id="goal" required><option value="">Waiting for goals</option></select></label><label>Strategic model<select id="model" required><option value="">Connect OpenAI first</option></select></label></div><div class="section-heading"><label for="task">Task</label><button id="use-goal" class="text-button" type="button">Use goal prompt</button></div><textarea id="task" rows="3" maxlength="8000" required placeholder="Describe what the agent should do in this world."></textarea><div class="button-row"><button id="create-run" type="submit" class="primary">Create run</button><span id="create-hint" class="muted">Create saves the task; Start begins inference.</span></div></form></section>
+  <section class="settings-task"><h3>Task and strategic model</h3><form id="task-form"><div class="form-row"><label>Automatic success check<select id="goal" required aria-describedby="goal-condition"><option value="">Waiting for checks</option></select></label><label>Strategic model<select id="model" required><option value="">Connect OpenAI first</option></select></label></div><p id="goal-condition" role="status">Custom tasks have no automatic success check.</p><div class="section-heading"><label for="task">Task</label><button id="use-goal" class="text-button" type="button">Restore preset prompt</button></div><textarea id="task" rows="3" minlength="1" maxlength="${MAX_TASK_CHARACTERS}" required placeholder="Describe what the agent should do in this world."></textarea><div class="button-row"><button id="create-run" type="submit" class="primary">Create run</button><span id="create-hint" class="muted">Create saves the task; Start begins inference.</span></div></form></section>
   <section class="settings-task"><h3>Program libraries</h3><label for="working-programs">Working definitions for the next task</label><select id="working-programs"><option value="continue">Continue this session’s same-model working programs</option><option value="fresh">Fresh — omit working programs</option></select><p>Working candidates retain validated code, not arguments, observations or execution state. They are not qualified experience.</p><p>Separately, optionally load one exact evidence-backed startup bundle. Neither choice executes code; the new run still receives fresh permissions and validation.</p><label for="experience">Qualified compatible startup bundle</label><select id="experience"><option value="">No saved programs</option></select><p id="library-status" role="status">Choose a strategic model to load compatible bundles.</p><button id="library-refresh" type="button">Refresh compatible library</button><pre id="experience-detail" tabindex="0" hidden></pre></section>
   <section><h3>OpenAI connection</h3><p id="account-description">Connect your own account to discover models.</p><div class="button-row"><button id="login-browser" type="button">Connect in browser</button><button id="login-device" type="button">Use device code</button><button id="refresh-models" type="button" hidden>Refresh models</button><button id="logout" type="button" hidden>Disconnect account</button></div><div id="login-flow" hidden><p id="login-instructions"></p><a id="authorize-link" class="button primary" target="_blank" rel="noopener noreferrer" hidden>Continue in browser</a><p class="muted">Complete authorization in your browser, then return here.</p><form id="auth-form" hidden><label id="auth-input-label" for="auth-input">Authorization response</label><div class="input-row"><input id="auth-input" autocomplete="off" spellcheck="false" maxlength="16000"><button id="auth-submit" type="submit">Submit response</button></div></form><button id="cancel-login" type="button">Cancel authorization</button></div><p id="auth-error" class="error" role="alert" hidden></p></section>
   <section><h3>Isolated Minecraft world</h3><p id="world-description">Waiting for the local server.</p><p class="muted">Uses the authorized official Launcher account for this isolated client only. Personal worlds are not changed.</p><label id="eula-row" class="check-row" hidden><input id="eula" type="checkbox"><span>I accept the <a href="https://www.minecraft.net/eula" target="_blank" rel="noopener noreferrer">Minecraft EULA</a> for this local server.</span></label><div class="button-row"><button id="prepare-game" type="button">Prepare server</button><button id="start-game" type="button">Start world</button><button id="stop-game" type="button">Stop world</button></div><details><summary>New world</summary><p>Replaces this app’s world lineage, not your personal worlds. Recorded runs are retained. Stop the run and world first.</p><label class="check-row"><input id="confirm-world" type="checkbox"><span>Replace this app’s current world.</span></label><button id="new-world" class="danger" type="button">Create new world</button></details><p id="game-error" class="error" role="alert" hidden></p><p id="sandbox-error" class="error" role="alert" hidden></p></section>
@@ -128,8 +131,7 @@ const task = el<HTMLTextAreaElement>("task"),
 let snapshot: AppSnapshot | null = null;
 let serviceReady = false,
   fetching = false,
-  refreshAgain = false,
-  taskEdited = false;
+  refreshAgain = false;
 let generation = 0,
   refreshTimer = 0,
   promptIdentity = "",
@@ -276,6 +278,7 @@ function buttons(): void {
     ["disconnected", "error"].includes(state.game.status);
   const prerequisites =
     !!state?.auth.authenticated &&
+    state.auth.status === "ready" &&
     !!state.auth.models.length &&
     state.server.status === "running" &&
     state.sandbox.status === "ready";
@@ -287,7 +290,7 @@ function buttons(): void {
     "login-browser": !available || authBusy || hasRun,
     "login-device": !available || authBusy || hasRun,
     "refresh-models":
-      !available || !state?.auth.authenticated || authBusy || hasRun,
+      !available || !state?.auth.authenticated || authBusy || !canRefreshModels(run?.status),
     logout: !available || !state?.auth.authenticated || authBusy || hasRun,
     "auth-submit": !available || !state?.auth.login?.prompt,
     "cancel-login": !available || !state?.auth.login,
@@ -314,7 +317,7 @@ function buttons(): void {
       !available ||
       hasRun ||
       !ready ||
-      !task.value.trim() ||
+      !taskTextSchema.safeParse(task.value).success ||
       !goal.value ||
       !model.value,
     "start-run": !available || run?.status !== "created" || !ready || !executableRun,
@@ -324,7 +327,7 @@ function buttons(): void {
     "stop-run":
       !canOperate("stop-run") ||
       !hasRun ||
-      (run?.status === "stopping" && !run.error),
+      stopControl(run?.status, run?.operator.cleanup_error ?? null).draining,
     "use-goal": !available || !goal.value,
     "jev-save":
       !available || hasRun || !el<HTMLInputElement>("jev-key").value.trim(),
@@ -348,11 +351,7 @@ function buttons(): void {
   hidden("resume-run", run?.status !== "paused");
   text(
     "stop-run",
-    run?.status === "stopping"
-      ? run.error
-        ? "Retry Stop"
-        : "Stopping"
-      : "Stop run",
+    stopControl(run?.status, run?.operator.cleanup_error ?? null).label,
   );
   text(
     "start-game",
@@ -578,18 +577,24 @@ function openPromotion(run: RunView, execution: SkillExecutionView): void {
   renderPromotionEvents();
   if (!archivedEvents.has(run.run_id)) void loadEventPage(run.run_id);
 }
+function renderTaskCondition(): void {
+  const selected = snapshot?.goals.find(choice => choice.id === goal.value);
+  const preset = Boolean(selected?.goal.verifier);
+  text("goal-condition", preset
+    ? `Automatically stops when verified: ${selected!.prompt} Editing the task switches to Custom.`
+    : "Custom / natural language: no automatic success check. task_finish is model-reported and unverified.");
+  el<HTMLButtonElement>("use-goal").disabled = !preset;
+}
 function renderOptions(state: AppSnapshot): void {
   const gs = json(state.goals);
   if (gs !== goalSignature) {
     goalSignature = gs;
-    const previous = goal.value;
+    const draft = state.goals.length ? initialTaskDraft(state.goals, { choice_id: goal.value, task: task.value }) : null;
     goal.replaceChildren(
-      ...state.goals.map((item) => new Option(item.label, item.id)),
+      ...state.goals.map((item) => new Option(item.goal.verifier === null ? "Custom / natural language" : `Preset: ${item.label}`, item.id)),
     );
-    if (state.goals.some((item) => item.id === previous)) goal.value = previous;
-    if (!taskEdited && !task.value)
-      task.value =
-        state.goals.find((item) => item.id === goal.value)?.prompt ?? "";
+    if (draft) { goal.value = draft.choice_id; task.value = draft.task; }
+    renderTaskCondition();
   }
   const ms = json(state.auth.models);
   if (ms !== modelSignature) {
@@ -688,14 +693,18 @@ function mergeEvents(incoming: ActivityEvent[]): void {
   events.clear();
   for (const event of ordered)
     events.set(`${event.run_id ?? "system"}:${event.event_seq}`, event);
-  const latest = ordered.at(-1);
-  const longActivity = !!latest &&
-    (latest.summary.length > 80 || /[\r\n]/.test(latest.summary));
-  text("activity-heading", longActivity ? "Activity · read full" : "Latest activity");
+  const run = snapshot?.run;
+  const latest = run ? ordered.filter(event => event.run_id === run.run_id).at(-1) : ordered.at(-1);
+  const progress = run?.operator.progress;
+  const summary = progress?.summary ?? latest?.summary;
+  el("latest-activity").dataset.runId = run?.run_id ?? latest?.run_id ?? "";
+  el("latest-activity").dataset.eventSeq = String(progress?.event_seq ?? latest?.event_seq ?? "");
+  const longActivity = !!summary && (summary.length > 80 || /[\r\n]/.test(summary));
+  text("activity-heading", progress ? "Model progress · unverified" : longActivity ? "Activity · read full" : "Latest activity");
   text(
     "latest-activity",
-    latest
-      ? longActivity ? `${latest.summary.replace(/\s+/g, " ").trim().slice(0, 48).trimEnd()}…` : latest.summary
+    summary
+      ? longActivity ? `${summary.replace(/\s+/g, " ").trim().slice(0, 48).trimEnd()}…` : summary
       : "No recorded activity yet.",
   );
 }
@@ -745,18 +754,15 @@ function render(state: AppSnapshot): void {
   if (el<HTMLSelectElement>("motor-profile").value === motorProfile) motorEdited = false;
   if (!motorEdited && motorProfile) el<HTMLSelectElement>("motor-profile").value = motorProfile;
   text("motor-status", motorProfile ? `Current materialized profile: ${motorProfile}.${motorEdited ? " Selection not applied." : " Applies live without restarting the session; old executable validations cannot cross a changed profile."}` : "This adapter has no Minecraft motor-profile control.");
-  text("run-status", run ? label(run.status) : "No run");
+  text("run-status", run ? operatorLabel(run.operator.state, run.operator.completion) : "No run");
+  el("run-status").dataset.state = run?.operator.state ?? "none";
+  el("run-status").dataset.completion = run?.operator.completion ?? "none";
   const suppliedGoal = state.goals.find(item => typeof run?.goal === "object" && item.goal.adapter_id === run.goal.adapter_id &&
     item.goal.goal_id === run.goal.goal_id && item.goal.verifier?.id === run.goal.verifier?.id &&
     item.goal.verifier?.version === run.goal.verifier?.version);
-  const longTask = !!run && run.task !== suppliedGoal?.prompt &&
-    (run.task.length > 144 || /[\r\n]/.test(run.task));
-  text("current-task", run
-    ? longTask
-      ? `${suppliedGoal?.label ?? "Custom task"} · ${run.task.length.toLocaleString()} characters. Read the complete task below.`
-      : run.task
-    : "No run created.");
-  hidden("goal-more", !longTask);
+  const taskText = run ? currentTaskText(run.task, run.task === suppliedGoal?.prompt) : null;
+  text("current-task", taskText?.excerpt ?? "No run created.");
+  hidden("goal-more", !taskText?.showFull);
   const execution = run?.executions.find((item) => item.execution_id === run.action?.execution_id) ?? run?.executions.find((item) =>
     ["running", "accepted", "cancel_requested"].includes(item.status),
   );
@@ -771,12 +777,14 @@ function render(state: AppSnapshot): void {
       ? skill && skill.name.length <= 32 && !/[\r\n]/.test(skill.name)
         ? skill.name
         : execution.skill_id
-      : "No executing skill.",
+      : run ? operatorLabel(run.operator.state, run.operator.completion) : "No executing skill.",
   );
-  text("program-status", execution ? `v${execution.version} · ${label(execution.status)}` : "");
-  hidden("program-status", !execution);
+  const currentAction = run?.action && ["accepted", "running", "cancel_requested"].includes(run.action.status)
+    ? `${run.action.kind} · ${run.action.summary.replace(/\s+/g, " ").slice(0, 80)}` : null;
+  text("program-status", [execution ? `v${execution.version} · ${label(execution.status)}` : null, currentAction].filter(Boolean).join(" · "));
+  hidden("program-status", !execution && !currentAction);
   usageList(el("usage-summary"), run?.usage ?? null);
-  errorText("run-error", run?.error ?? null);
+  errorText("run-error", [...new Set([run?.error, run?.operator.cleanup_error].filter(Boolean))].join(" ") || null);
   text(
     "readiness",
     `World · ${label(state.server.status)} / OpenAI · ${label(state.auth.status)} / Isolation · ${label(state.sandbox.status)}`,
@@ -793,9 +801,15 @@ function render(state: AppSnapshot): void {
   errorText("sandbox-error", state.sandbox.error);
   let hint = "Configure a task in Settings.";
   if (run?.status === "paused")
-    hint = "Paused control; world ticks continue. Resume continues this task.";
+    hint = state.auth.status !== "ready"
+      ? "Control paused. Refresh models in Settings; Resume needs model readiness. Reauthorization requires Stop run first."
+      : run.operator.pause_cause === "deadline"
+        ? "Strategic time allowance reached. Resume explicitly continues this task with fresh observations."
+        : run.operator.pause_cause === "provider_aborted"
+          ? "Provider response aborted. Resume explicitly continues this task with fresh observations."
+          : "Paused control; world ticks continue. Resume explicitly continues this task with fresh observations.";
   else if (run?.status === "stopping")
-    hint = run.error
+    hint = run.operator.cleanup_error
       ? "Cleanup failed. Retry Stop; effects may be unknown."
       : "Fencing agent work; awaiting confirmed input neutralization.";
   else if (run?.status === "created")
@@ -813,7 +827,9 @@ function render(state: AppSnapshot): void {
           ? "Player loading. Ordinary effects wait for native readiness."
           : "Pause and Stop fence agent work; the game session continues.";
   else if (run)
-    hint = state.game.status === "connected"
+    hint = run.operator.completion === "model_reported_unverified"
+      ? "Model completion report retained; no independent success check. Agent control is closed."
+      : state.game.status === "connected"
       ? "Run closed. Client remains connected; create the next task without reconnecting."
       : `Run closed. Client ${label(state.game.status)}; inspect Settings before the next task.`;
   else if (state.game.status === "connected" && life?.status === "dead" && life.can_respawn)
@@ -958,7 +974,7 @@ function renderEvidence(force = false): void {
   text(
     "evidence-run",
     run
-      ? `${selectedRun ? "Retained" : "Current"} run · ${run.run_id} · ${label(run.status)}`
+      ? `${selectedRun ? "Retained" : "Current"} run · ${run.run_id} · ${operatorLabel(run.operator.state, run.operator.completion)}`
       : "No run selected",
   );
   if (inspector.render(evidenceTab, node, run, selectedRun ? null : snapshot?.game ?? null)) return;
@@ -973,7 +989,12 @@ function renderEvidence(force = false): void {
   );
   const scroll = node.scrollTop;
   node.replaceChildren();
-  if (run) paragraph(node, run.task, "evidence-task");
+  if (run) {
+    paragraph(node, run.task, "evidence-task");
+    const task = node.querySelector<HTMLElement>(".evidence-task")!;
+    task.tabIndex = -1;
+    task.dataset.key = "full-task";
+  }
   if (evidenceTab === "activity") {
     if (run) {
       paragraph(
@@ -1471,7 +1492,12 @@ click("sidebar-toggle", () => {
 });
 for (const name of ["programs", "activity", "usage", "inventory", "life"])
   click(`${name}-open`, () => openEvidence(name));
-click("goal-more", () => openEvidence("programs"));
+click("goal-more", () => {
+  openEvidence("programs");
+  const content = el("evidence-content");
+  content.scrollTop = 0;
+  content.querySelector<HTMLElement>(".evidence-task")?.focus({ preventScroll: true });
+});
 click("history-open", () => {
   openDialog("history-dialog");
   text("history-status", "Loading retained runs…");
@@ -1489,7 +1515,7 @@ click("history-open", () => {
         recordButton(
           li,
           run.task,
-          `${label(run.status)} · ${run.model_id} · ${when(run.started_at)} · ${run.run_id}`,
+          `${operatorLabel(run.operator.state, run.operator.completion)} · ${run.model_id} · ${when(run.started_at)} · ${run.run_id}`,
           run.run_id,
           () => openEvidence("programs", run),
         );
@@ -1595,7 +1621,8 @@ click("new-world", () => {
 for (const id of ["eula", "confirm-world"])
   el(id).addEventListener("change", buttons);
 task.addEventListener("input", () => {
-  taskEdited = true;
+  if (snapshot?.goals.length) goal.value = editTaskPrompt(task.value, snapshot.goals).choice_id;
+  renderTaskCondition();
   buttons();
 });
 model.addEventListener("change", () => {
@@ -1603,15 +1630,12 @@ model.addEventListener("change", () => {
   void loadLibrary();
 });
 goal.addEventListener("change", () => {
-  if (!taskEdited)
-    task.value =
-      snapshot?.goals.find((item) => item.id === goal.value)?.prompt ?? "";
+  if (snapshot) task.value = selectTaskChoice(goal.value, task.value, snapshot.goals).task;
+  renderTaskCondition();
   buttons();
 });
 click("use-goal", () => {
-  task.value =
-    snapshot?.goals.find((item) => item.id === goal.value)?.prompt ?? "";
-  taskEdited = false;
+  if (snapshot) task.value = selectTaskChoice(goal.value, task.value, snapshot.goals).task;
   task.focus();
   buttons();
 });
@@ -1620,11 +1644,10 @@ el("task-form").addEventListener("submit", (event) => {
   if (el<HTMLButtonElement>("create-run").disabled) return;
   void command("create-run", async () => {
     const experienceId = el<HTMLSelectElement>("experience").value;
-    const selectedGoal = snapshot?.goals.find(choice => choice.id === goal.value);
-    if (!selectedGoal) throw new Error("Select a goal from the currently negotiated adapter");
+    if (!snapshot) throw new Error("No currently negotiated adapter");
+    const submission = taskSubmission({ choice_id: goal.value, task: task.value }, snapshot.goals);
     const run = await createRun({
-      task: task.value.trim(),
-      goal: selectedGoal.goal,
+      ...submission,
       model_id: model.value,
       working_programs: el<HTMLSelectElement>("working-programs").value === "fresh" ? "fresh" : "continue",
       ...(experienceId ? { experience_id: experienceId } : {}),

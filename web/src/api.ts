@@ -170,7 +170,12 @@ const execution = skillRef.extend({
     .nullable(),
   error: nullableText,
   diagnostic: z.object({ type: z.string(), message: z.string(), source_hash: z.string(),
-    location: z.object({ mapping: z.literal("unmapped") }), code: z.string().optional() }).optional(),
+    location: z.object({ mapping: z.literal("unmapped") }), code: z.string().optional(),
+    output: z.object({ phase: z.literal("terminal_result"),
+      reason: z.enum(["utf8_bytes", "json_depth", "json_serialization"]),
+      maximum_bytes: z.literal(65536), actual_bytes: z.number().int().nonnegative().nullable(),
+      completed_capability_calls: z.number().int().nonnegative() }).optional(),
+  }).optional(),
 });
 const tokenUsage = z.object({
   uncached_input: z.number().nullable(),
@@ -225,6 +230,18 @@ const run: z.ZodType<RunView> = z.object({
   ended_at: nullableText,
   turns: z.number(),
   model_status: z.enum(["idle", "thinking", "waiting", "error"]),
+  operator: z.object({
+    state: z.enum(["created", "bootstrapping", "running", "reviewing", "pausing", "paused", "stopping",
+      "stopped", "completed", "failed", "acting", "executing", "thinking", "waiting", "recovering", "blocked", "provider_unavailable"]),
+    pause_cause: z.enum(["operator", "provider_failure", "provider_aborted", "deadline",
+      "observation_unavailable", "preparation_failed", "safety"]).nullable(),
+    cleanup_error: nullableText,
+    completion: z.enum(["verified", "model_reported_unverified"]).nullable(),
+    progress: z.object({
+      event_seq: z.number().int(), at: z.string(), summary: z.string(), execution_id: nullableText,
+      source: z.literal("model_program"), verification: z.literal("unverified"),
+    }).nullable(),
+  }),
   action: z
     .object({
       ...lineage,

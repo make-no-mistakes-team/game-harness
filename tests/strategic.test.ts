@@ -10,7 +10,7 @@ import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { ModelProgramEvidence } from "../src/evaluation/model-evidence.ts";
 import { DEFAULT_EVALUATION_CAPS } from "../src/evaluation/config.ts";
 import { catalogEstimate, classifyEvaluation, costToResult } from "../src/evaluation/results.ts";
-import type { ObservationV3 } from "../src/shared/contracts.ts";
+import type { ObservationV3, RunPauseCause } from "../src/shared/contracts.ts";
 import type { AuthManager } from "../src/server/auth.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
@@ -73,6 +73,7 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, stre
     creates: 0,
     releases: 0,
     pauses: [] as string[],
+    pauseCauses: [] as RunPauseCause[],
     replacements: [] as unknown[],
     contexts: [] as Record<string, unknown>[],
     images: [] as unknown[],
@@ -99,8 +100,9 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, stre
     programPending: () => state.pending,
     busy: () => state.busy,
     persist: (summary) => store.saveRun(run, summary),
-    pause: (message) => {
+    pause: (message, cause) => {
       state.pauses.push(message);
+      state.pauseCauses.push(cause);
       run.status = "paused";
       state.generation++;
       planner.fence();
@@ -237,6 +239,46 @@ async function accountingTurn(fixture: ReturnType<typeof accountingFixture>, fai
   await done;
   return fixture.observer.summary(fixture.run.run_id);
 }
+
+test("strategic request records actual payload effort and first provider event without payload or reasoning contents", async () => {
+  let invocation = 0;
+  const f = setup(async () => { throw new Error("Real Agent owns this offline fixture"); },
+    async (model, _context, options) => {
+      invocation++;
+      await options?.onPayload?.({ model: model.id, reasoning: { effort: "low" },
+        instructions: "PRIVATE_FIXTURE_PROMPT", input: [{ text: "PRIVATE_FIXTURE_INPUT" }] }, model);
+      options?.onSseEvent?.(rawEvent({ type: "response.create" }), model);
+      if (invocation === 2) options?.onSseEvent?.(terminal({
+        ...completeWireUsage, output_tokens_details: { reasoning_tokens: 999 },
+      }, "configuration-fixture-1"), model);
+      const id = `configuration-fixture-${invocation}`;
+      options?.onSseEvent?.(rawEvent({ type: "response.created", response: { id } }), model);
+      options?.onSseEvent?.(terminal({ ...completeWireUsage, output_tokens_details: { reasoning_tokens: 2 } }, id), model);
+      return settledStream(sdkSettlement());
+    });
+  await f.planner.start(1);
+  const done = f.event("scheduler.turn_finished");
+  f.planner.wake("policy_replan");
+  await done;
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  const configuration = events.find(event => event.type === "model.request_configuration");
+  expect(configuration?.details).toMatchObject({ reasoning_effort: "low", source: "sdk_transformed_payload" });
+  const first = events.filter(event => event.type === "model.first_response_event");
+  expect(first).toHaveLength(1);
+  expect(first[0]?.details).toMatchObject({ event_type: "response.created" });
+  expect(events.find(event => event.type === "model.response_usage_details")?.details)
+    .toMatchObject({ reasoning_tokens: 2, cached_input_tokens: 3 });
+  const metadata = JSON.stringify(events.filter(event => ["model.request_configuration",
+    "model.first_response_event", "model.response_usage_details"].includes(event.type)));
+  expect(metadata).not.toContain("PRIVATE_FIXTURE");
+  const next = f.event("scheduler.turn_finished");
+  f.planner.wake("policy_replan");
+  await next;
+  const all = f.store.eventsAfter(f.run.run_id, 0, 500);
+  expect(all.filter(event => event.type === "model.response_usage_details").map(event => event.details))
+    .toHaveLength(2);
+  expect(JSON.stringify(all.filter(event => event.type === "model.response_usage_details"))).not.toContain("999");
+});
 
 test("installed Agent snapshots raw observer before admission; replacing it in the gate cannot bind that invocation", async () => {
   const seen: string[] = [];
@@ -446,6 +488,7 @@ test("image encoding failure before prompt is not misclassified as provider fail
   expect(f.run.model_status).not.toBe("error");
   expect(f.run.status).toBe("paused");
   expect(f.state.pauses).toHaveLength(1);
+  expect(f.state.pauseCauses).toEqual(["observation_unavailable"]);
   expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event => event.type === "model.call" || event.type === "scheduler.turn_failed")).toBe(false);
 });
 
@@ -573,6 +616,7 @@ test("failed requests retain the feedback cursor, account actual usage, and retr
   fixture.planner.wake("recovery_completed");
   await done;
   expect(fixture.state.pauses).toHaveLength(1);
+  expect(fixture.state.pauseCauses).toEqual(["provider_failure"]);
   fixture.run.status = "running";
   await fixture.planner.start(fixture.state.generation);
   done = fixture.event("scheduler.turn_finished");

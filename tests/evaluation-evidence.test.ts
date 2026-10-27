@@ -15,7 +15,9 @@ import type { AuthManager } from "../src/server/auth.ts";
 import type { Runtime } from "../src/server/runtime.ts";
 import type { AgentEvent } from "@oh-my-pi/pi-agent-core/types";
 import { validateSkill } from "../src/server/program-validation.ts";
-import { diagnosticAuthorityFixture, executionScopeFixture, minecraftRunFixture, minecraftTestAdapter, skillAuthorityFixture } from "./helpers/adapter-contract.ts";
+import { StrategicPlanner } from "../src/server/strategic.ts";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { diagnosticAuthorityFixture, executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, skillAuthorityFixture } from "./helpers/adapter-contract.ts";
 
 const adapter = minecraftTestAdapter();
 
@@ -47,6 +49,15 @@ test("the observer uses the configured admission cap, not a private hardcoded li
   emit("model.call", { request_id: "request-1" });
   expect(stops).toEqual(["host_request_admission_bound_reached"]);
   expect(observer.summary(run.run_id).usage).toMatchObject({ admissions: 1, reported_messages: 0, uncached_input: null, output: null, wire_attempts: null });
+});
+
+test("SDK-promoted interrupted tool responses retain provider failure classification", () => {
+  const f = setup();
+  f.emit("model.call", {request_id:"recovered-failed-request"});
+  f.emit("model.request_settled", {request_id:"recovered-failed-request",stop_reason:"toolUse",
+    recovered_failure:{type:"stream_interrupted_after_content",explanation:"stream_read_error"}});
+  expect(f.observer.summary(f.run.run_id).provider_error).toBe(true);
+  expect(f.stops).toContain("provider_failure_or_unsettled_no_repeat");
 });
 
 async function observedAgent(f: ReturnType<typeof setup>) {
@@ -133,6 +144,47 @@ test("final SDK context is observed additively before a local gate stops all tra
   const manifest = readFileSync(path.join(f.root, finalized.manifest), "utf8");
   expect(manifest).toMatch(/sdk_visible|SDK.visible/i);
   expect(manifest).toMatch(/not.*wire|wire.*unknown/i);
+});
+
+test("private journal retains the supplemented context actually delivered to the SDK stream", async () => {
+  const f = setup();
+  const descriptor = getBundledModels("openai-codex").find(model=>model.api==="openai-codex-responses")!;
+  const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
+  let delivered: unknown;
+  const agent = new Agent({ initialState: { model }, getApiKey: () => "OFFLINE_EVIDENCE_ONLY",
+    streamFn: (_model, context) => {
+      delivered = JSON.parse(JSON.stringify(context));
+      const message = { role:"assistant" as const, content:[], api:model.api, provider:model.provider, model:model.id,
+        stopReason:"stop" as const, timestamp:0, usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,
+          cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}} };
+      const stream = new AssistantMessageEventStream();
+      stream.push({type:"start",partial:message}); stream.push({type:"done",reason:"stop",message}); stream.end(); return stream;
+    } });
+  const auth = { createAgent: async () => agent, releaseAgent: async () => {agent.abort();await agent.waitForIdle();} } as unknown as AuthManager;
+  f.observer.bindRuntime({snapshot:()=>f.run,getRun:()=>f.run} as unknown as Runtime);
+  f.observer.observeAuthAgents(auth);
+  const observation = minecraftObservationFixture(adapter,{world_id:f.run.world_id,session_id:f.run.session_id!});
+  const planner = new StrategicPlanner(f.store,auth,{
+    run:()=>f.run,generation:()=>1,assertCurrent:()=>f.run,tools:()=>[],rootPrompt:()=>"Evidence fixture",
+    adapter:()=>adapter,observe:async()=>observation,projectObservation:o=>adapter.projectObservation(o),
+    policies:()=>[],action:()=>null,programPending:()=>false,busy:()=>true,persist:()=>{},
+    pause:message=>{throw new Error(message);},terminal:()=>{},
+  });
+  try {
+    await planner.start(1);
+    const done=Promise.withResolvers<void>();
+    const off=f.store.subscribe(event=>{if(event.type==="scheduler.turn_finished"){off();done.resolve();}});
+    planner.wake("policy_replan");await done.promise;
+  } finally {await planner.close();}
+  const final=await f.observer.finalize(f.run.run_id,{status:"interrupted",reason:"offline_context_proof"});
+  const records=readFileSync(path.join(f.root,final.journal),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+  const recorded=records.filter(record=>record.kind==="final_sdk_visible_context_not_wire_payload");
+  expect(recorded).toHaveLength(1);
+  expect(recorded[0].value.systemPrompt).toEqual((delivered as {systemPrompt:string[]}).systemPrompt);
+  const supplement=recorded[0].value.systemPrompt.map((text:string)=>{try{return JSON.parse(text);}catch{return null;}})
+    .find((value:any)=>value?.strategic_context)?.strategic_context;
+  expect(supplement.objective).toBe(f.run.task);
+  expect(supplement.unresolved).toEqual([]);
 });
 
 test("typed image evidence is deduplicated as private artifacts, never base64 journal text", async () => {

@@ -17,6 +17,7 @@ import { Store } from "../src/server/store.ts";
 import { validateSkill } from "../src/server/program-validation.ts";
 import { qualifyMinecraftExperience } from "../src/server/minecraft-qualification.ts";
 import { promotionEvidence } from "../web/src/evidence.ts";
+import { projectRunOperator } from "../src/server/operator-state.ts";
 import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -25,7 +26,7 @@ const ROOT = "Neutral flow", FOLLOW = "Fresh follow-up", RECOVERY = "Explicit re
 const card = { purpose: "Exercise trusted lifecycle transitions", applicability: "Deterministic neutral fixture", method: "Await authorized bounded capabilities", reason: "Measure actual ownership transitions", limitations: "No gameplay effectiveness claim" };
 const ok: GameActionResult = { status: "succeeded", summary: "Confirmed neutral fixture effect", evidence: { effect_confirmed: true } };
 const cancelled: GameActionResult = { status: "cancelled", summary: "Fixture emitter neutralized", evidence: null };
-type Options = { goal?: string; initialAction?: GameAction; childCalls?: number; next?: LookaheadConfig; repairGuard?: boolean; guardSource?: string; guardResult?: boolean; holdWorkerExit?: boolean; recoveryInventory?: boolean; customCompletion?: "after-root" | "with-pending-root" };
+type Options = { goal?: string; initialAction?: GameAction; childCalls?: number; next?: LookaheadConfig; repairGuard?: boolean; guardSource?: string; guardResult?: boolean; holdWorkerExit?: boolean; recoveryInventory?: boolean; providerFailure?: boolean; blockedRoot?: boolean; customCompletion?: "after-root" | "with-pending-root" };
 type PromptContext = { phase: string; role: string; reason: string[]; adapter_state: unknown; speculative_plan: { plan_id: string } | null };
 function eventDetails(value: Json): { [key: string]: Json } | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -38,7 +39,7 @@ async function fixture(options: Options = {}) {
   let life: PlayerLife = { life_id: 1, status: "alive", can_respawn: false, death: null };
   let inventory = [{ name: "oak_log", display_name: "Oak Log", slot: 0, count: 3 }], sequence = 0;
   let disconnects = 0, barriers = 0, respawns = 0, effects = 0, agents = 0, observationReads = 0, guardCalls = 0;
-  let failBarrier = false, failObservation = false, holdBarrier = false, holdRespawn = false, holdSpec = false;
+  let failBarrier = false, failObservation = false, failDisconnect = false, failPreparation = false, holdBarrier = false, holdRespawn = false, holdSpec = false;
   const firstEffect = Promise.withResolvers<GameActionResult>(), tailEffect = Promise.withResolvers<GameActionResult>();
   const nativeBarrier = Promise.withResolvers<void>(), workerExit = Promise.withResolvers<void>(), respawnProof = Promise.withResolvers<void>();
   const barrierEntered = Promise.withResolvers<void>(), finishReturned = Promise.withResolvers<void>(), stopped = Promise.withResolvers<void>();
@@ -68,7 +69,7 @@ async function fixture(options: Options = {}) {
     if (holdBarrier) { barrierEntered.resolve(); await nativeBarrier.promise; }
   };
   const game: GameBridge = {
-    connect: async () => {}, disconnect: async () => { disconnects++; },
+    connect: async () => {}, disconnect: async () => { disconnects++; if (failDisconnect) throw new Error("Offline fixture disconnect unconfirmed"); },
     snapshot: (): GameState => ({ status: "connected", username: "Fixture", version: "1.21.4", world_id: world, epoch: 1, session_id: session, life: structuredClone(life),
       binding: minecraftTestBinding(adapter), space: { dimension_id: "minecraft:overworld", space_epoch: spaceEpoch }, screen: null,
       presentation: adapter.projectObservation(observation(false)), last_observation_at: null, error: null,
@@ -119,7 +120,7 @@ async function fixture(options: Options = {}) {
   const perform = async (name: string, input: unknown, callId?: string) => {
     const tool = activeTools.find((entry) => entry.name === name);
     if (!tool) throw new Error(`Fixture actor requested unavailable tool ${name}`);
-    const blocked = await activeAgent?.beforeToolCall?.({ tool } as Parameters<NonNullable<Agent["beforeToolCall"]>>[0]);
+    const blocked = await activeAgent?.beforeToolCall?.({ tool, toolCall: { arguments: input }, args: input } as Parameters<NonNullable<Agent["beforeToolCall"]>>[0]);
     if (blocked?.block) throw new Error(`Fixture actor was blocked: ${blocked.reason}`);
     return await invoke(name, input, callId);
   };
@@ -134,6 +135,7 @@ async function fixture(options: Options = {}) {
   const auth = {
     snapshot: () => authState,
     createAgent: async (configuration: { tools: AgentTool[] }) => {
+      if (failPreparation) throw new Error("Offline fixture agent preparation failed");
       agents++; selectTools(configuration.tools);
       let pending: Promise<void> | null = null;
       let controller: AbortController | null = null;
@@ -149,6 +151,8 @@ async function fixture(options: Options = {}) {
             const context = JSON.parse(text) as PromptContext; contexts.push(context);
             const admission = await gate?.({ systemPrompt: [], messages: [], tools: activeTools }, signal.signal);
             if (admission?.stop || signal.signal.aborted) return;
+            if (options.providerFailure && agents === 1 && rootCompleted)
+              throw new Error("Offline fixture provider response failed");
             if (context.reason.includes("uncertainty")) replanned.resolve();
             if (context.speculative_plan) {
               specEntered.resolve();
@@ -180,7 +184,7 @@ async function fixture(options: Options = {}) {
               const source = `const first = await game.action(${JSON.stringify(options.initialAction ?? { kind: "look", yaw: 0, pitch: 0 })}); if (first.status !== "succeeded") return {status:"blocked",summary:"First effect did not settle",result:first}; ` +
                 (options.childCalls ? 'for (let index = 0; index < args.child_calls; index++) await game.call({name:"Neutral child",version:1},{mode:"child"}); ' : "") +
                 (tail ? 'await game.observe(); const result = await game.action({kind:"look",yaw:0.1,pitch:0}); ' : 'const result = first; ') +
-                'return {status:"completed",summary:"Bounded neutral flow settled",result};';
+                `return {status:"${options.blockedRoot ? "blocked" : "completed"}",summary:"Bounded neutral flow settled",result};`;
               await write(ROOT, source, options.childCalls ? [{ name: CHILD, version: 1 }] : []);
               rootStarted = true;
               await required("program_run", rootRequest, "start-original");
@@ -199,7 +203,7 @@ async function fixture(options: Options = {}) {
             }
           })();
           pending = work;
-          try { await work; } catch (error) { failure.reject(error); throw error; }
+          try { await work; } catch (error) { if (!options.providerFailure) failure.reject(error); throw error; }
           finally { if (pending === work) pending = null; if (controller === signal) controller = null; }
         },
       };
@@ -227,7 +231,7 @@ async function fixture(options: Options = {}) {
           }
           rootSourceFinished.resolve();
           if (options.holdWorkerExit) await Promise.race([workerExit.promise, revoked.promise]);
-          return { status: "completed", summary: "Bounded neutral flow settled", result: null };
+          return { status: options.blockedRoot ? "blocked" : "completed", summary: "Bounded neutral flow settled", result: null };
         } catch (error) {
           if (signal.aborted) await workerExit.promise;
           throw error;
@@ -255,7 +259,7 @@ async function fixture(options: Options = {}) {
   } satisfies Pick<SandboxService, "snapshot" | "runSkill" | "evaluateGameGuard"> as unknown as SandboxService;
   const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
   cleanups.push(async () => {
-    failBarrier = false; failObservation = false;
+    failBarrier = false; failObservation = false; failDisconnect = false;
     specReply.resolve(); firstEffect.resolve(cancelled); tailEffect.resolve(cancelled);
     nativeBarrier.resolve(); workerExit.resolve(); respawnProof.resolve();
     await runtime.close(); store.close(); rmSync(directory, { recursive: true, force: true });
@@ -274,7 +278,7 @@ async function fixture(options: Options = {}) {
       const execution = typeof details?.execution_id === "string" ? store.skillExecution(created.run_id, { execution_id: details.execution_id }) : null;
       if (execution?.parent_execution_id === null && execution.status === "succeeded") {
         const name = store.skill(created.run_id, execution).name;
-        if (name === ROOT && options.customCompletion) {
+        if (name === ROOT && (options.customCompletion || options.providerFailure)) {
           rootCompleted = true;
           inventory = [{ name: "dirt", display_name: "Dirt", slot: 0, count: 1 }];
         }
@@ -312,6 +316,9 @@ async function fixture(options: Options = {}) {
     finishTail: () => tailEffect.resolve(ok),
     releaseSpec: () => specReply.resolve(), holdSpec: () => { holdSpec = true; },
     holdBarrier: () => { holdBarrier = true; }, failBarrier: () => { failBarrier = true; }, failObservation: () => { failObservation = true; },
+    failCleanup: () => { failBarrier = true; failDisconnect = true; },
+    restoreCleanup: () => { failBarrier = false; failDisconnect = false; },
+    failPreparation: () => { failPreparation = true; },
     holdRespawn: () => { holdRespawn = true; }, proveRespawn: () => respawnProof.resolve(),
     die: (canRespawn = true) => {
       holdBarrier = true;
@@ -342,6 +349,7 @@ test("host preflight opens a fresh ordinary turn without a model bootstrap cerem
   expect(f.contexts[0]).not.toHaveProperty("player");
   expect(f.counters().observationReads).toBeGreaterThan(0);
   expect(f.findExecution(ROOT)).toMatchObject({ status: "running", epoch: 1, session_id: f.created.session_id });
+  expect(f.runtime.snapshot()?.operator.state).toBe("acting");
   const pausing = f.runtime.control(f.created.run_id, "pause");
   f.finishFirst(); f.workerExit.resolve(); await pausing;
   expect(f.runtime.snapshot()?.status).toBe("paused");
@@ -352,6 +360,7 @@ test("death drains old emitters then one explicit named recovery root adopts the
   const f = await fixture(); f.die();
   expect(f.runtime.snapshot()?.status).toBe("running");
   expect(f.runtime.snapshot()?.error).toBeNull();
+  expect(f.runtime.snapshot()?.operator.state).toBe("recovering");
   f.nativeBarrier.resolve(); await Promise.resolve();
   expect(f.counters().respawns).toBe(0);
   f.workerExit.resolve(); await reached(f, f.recoveryClosed.promise);
@@ -453,6 +462,98 @@ test("ordinary pause and stop await native and isolated emitters but preserve th
   expect(f.game.snapshot().status).toBe("connected"); expect(f.game.snapshot().video.status).toBe("streaming");
   expect(f.counters().barriers).toBeGreaterThan(0); expect(f.counters().disconnects).toBe(0);
   expect(f.store.eventsAfter(f.created.run_id, 0, 500).some((event) => event.type === "planning.requested")).toBe(false);
+});
+
+test("provider-paused Stop drains without treating the retained provider cause as cleanup failure", async () => {
+  const f = await fixture({ providerFailure: true });
+  f.finishFirst(); f.workerExit.resolve(); await reached(f, f.paused.promise);
+  const paused = f.runtime.snapshot()!;
+  expect(paused.operator).toMatchObject({ state: "provider_unavailable", pause_cause: "provider_failure", cleanup_error: null });
+  expect(paused.error).not.toBeNull();
+  f.holdBarrier();
+  const stopping = f.runtime.control(f.created.run_id, "stop");
+  await reached(f, f.barrierEntered.promise);
+  expect(f.runtime.snapshot()).toMatchObject({ status: "stopping", error: paused.error,
+    operator: { state: "stopping", cleanup_error: null } });
+  f.nativeBarrier.resolve(); await stopping;
+  expect(f.runtime.snapshot()).toMatchObject({ status: "stopped", error: paused.error,
+    operator: { state: "stopped", cleanup_error: null } });
+  expect(f.runtime.getRun(f.created.run_id)?.operator.pause_cause).toBe("provider_failure");
+  expect(f.store.getRun(f.created.run_id)?.control).toEqual({ pause_cause: "provider_failure", cleanup_error: null });
+  expect(f.counters()).toMatchObject({ effects: 1, agents: 1, disconnects: 0 });
+});
+
+test("Stop exposes retry only after an actual failed cleanup and clears it while retrying", async () => {
+  const f = await fixture({ providerFailure: true });
+  f.finishFirst(); f.workerExit.resolve(); await reached(f, f.paused.promise);
+  const cause = f.runtime.snapshot()!.error;
+  f.failCleanup();
+  await expect(f.runtime.control(f.created.run_id, "stop")).rejects.toThrow("Shutdown could not be confirmed");
+  expect(f.runtime.snapshot()).toMatchObject({ status: "stopping", error: cause });
+  expect(f.runtime.snapshot()?.operator.cleanup_error).not.toBeNull();
+  expect(f.store.getRun(f.created.run_id)?.control?.cleanup_error).not.toBeNull();
+  f.restoreCleanup();
+  const retrying = f.runtime.control(f.created.run_id, "stop");
+  // Retry uses the fail-closed disconnect barrier rather than reopening effects.
+  await retrying;
+  expect(f.runtime.snapshot()).toMatchObject({ status: "stopped", error: cause,
+    operator: { cleanup_error: null } });
+  expect(f.counters()).toMatchObject({ effects: 1, agents: 1 });
+});
+
+test("explicit Resume keeps a provider-paused task and observes afresh without replaying its prior effect", async () => {
+  const f = await fixture({ providerFailure: true });
+  f.finishFirst(); f.workerExit.resolve(); await reached(f, f.paused.promise);
+  const reads = f.counters().observationReads;
+  await f.runtime.control(f.created.run_id, "resume");
+  expect(f.runtime.snapshot()).toMatchObject({ task: f.created.task, status: "running", error: null,
+    operator: { pause_cause: null, cleanup_error: null } });
+  expect(f.counters().observationReads).toBeGreaterThan(reads);
+  expect(f.counters()).toMatchObject({ effects: 1, agents: 2 });
+  await f.runtime.control(f.created.run_id, "stop");
+});
+
+test("failed explicit Resume preserves the provider cause and original task without replaying an effect", async () => {
+  const f = await fixture({ providerFailure: true });
+  f.finishFirst(); f.workerExit.resolve(); await reached(f, f.paused.promise);
+  const cause = f.runtime.snapshot()!.error;
+  f.failPreparation();
+  await f.runtime.control(f.created.run_id, "resume");
+  expect(f.runtime.snapshot()).toMatchObject({ task: f.created.task, status: "paused", error: cause,
+    operator: { pause_cause: "provider_failure", cleanup_error: null } });
+  expect(f.counters()).toMatchObject({ effects: 1, agents: 1 });
+  await f.runtime.control(f.created.run_id, "stop");
+});
+
+test("current-run progress survives unrelated events beyond the global event window", async () => {
+  const f = await fixture();
+  const progress = f.store.event(f.created.run_id, "skill.progress", "Returning with the second load", {
+    execution_id: f.findExecution(ROOT)!.execution_id,
+  });
+  for (let index = 0; index < 510; index++)
+    f.store.event(index % 2 ? null : f.created.run_id, "observation", "Unrelated observation");
+  f.store.event(null, "skill.progress", "Another run must not replace current progress");
+  expect(f.runtime.snapshot()?.operator.progress).toMatchObject({ event_seq: progress.event_seq,
+    summary: "Returning with the second load", source: "model_program", verification: "unverified" });
+  f.finishFirst(); f.workerExit.resolve();
+  await f.runtime.control(f.created.run_id, "stop");
+  expect(f.runtime.getRun(f.created.run_id)?.operator.progress?.event_seq).toBe(progress.event_seq);
+});
+
+test("blocked root remains an operator blockage without being relabeled as an active effect", async () => {
+  const f = await fixture({ blockedRoot: true });
+  const closed = Promise.withResolvers<void>();
+  const unsubscribe = f.store.subscribe(event => {
+    if (event.run_id === f.created.run_id && event.type === "skill.closed") closed.resolve();
+  });
+  f.finishFirst(); f.workerExit.resolve();
+  try { await reached(f, closed.promise); } finally { unsubscribe(); }
+  const root = f.findExecution(ROOT)!;
+  expect(root.status).toBe("blocked");
+  const run = f.store.getRun(f.created.run_id)!;
+  run.model_status = "idle";
+  expect(projectRunOperator(f.store, run, null, f.store.skillExecutions(run.run_id)).state).toBe("blocked");
+  await f.runtime.control(f.created.run_id, "stop");
 });
 
 const next = (activation: "manual" | "on_predecessor_success" = "manual"): LookaheadConfig => ({ after_ms: 0, reason: "One independent follow-up", budget: { calls: 4, tools: 16, duration_ms: 30000 }, activation });
@@ -567,6 +668,7 @@ for (const customCompletion of ["after-root", "with-pending-root"] as const) {
     await reached(f, f.stopped.promise);
     expect(f.runtime.snapshot()).toMatchObject({
       status: "stopped", error: null, session_id: f.created.session_id, epoch: 1, life_id: 1,
+      operator: { completion: "model_reported_unverified" },
     });
     expect(f.store.getRun(f.created.run_id)).toMatchObject({ status: "stopped", error: null });
     expect(f.store.getRun(f.created.run_id)?.ended_at).not.toBeNull();
@@ -606,6 +708,7 @@ test("break_log uses a block-removal receipt without fabricating inventory gain"
     space: { dimension_id: "minecraft:overworld", space_epoch: 1 }, life_id: 1 } } }); f.removeLog();
   await reached(f, f.completed.promise);
   const verified = f.store.eventsAfter(f.created.run_id, 0, 500).find((event) => event.type === "goal.verified")!;
+  expect(f.runtime.snapshot()?.operator.completion).toBe("verified");
   expect(verified.details).toMatchObject({ status: "verified", verifier_id: "minecraft_block_removal_v2", verifier_version: 2 });
   expect(verified.details).not.toHaveProperty("current_count");
   expect(eventDetails(f.game.snapshot().presentation?.metadata ?? null)?.inventory_counts).toMatchObject({ oak_log: 3 });
@@ -692,7 +795,7 @@ test("a revision reason links the exact candidate experiment without a bookkeepi
 test("planning retains the actual predecessor after more than one hundred sequential named child calls", async () => {
   // This real fsync-backed proof exceeded the suite's generic 5s allowance.
   const began = performance.now();
-  const f = await fixture({ childCalls: 101, next: next() });
+  const f = await fixture({ childCalls: 101, next: next(), holdWorkerExit: true });
   let phase = "startup";
   const phases: { phase: string; duration_ms: number }[] = [{ phase, duration_ms: performance.now() - began }];
   const stalled = Promise.withResolvers<never>();
@@ -715,7 +818,9 @@ test("planning retains the actual predecessor after more than one hundred sequen
     expect(f.store.skillExecutions(f.created.run_id).some((entry) => entry.execution_id === root.execution_id)).toBe(false);
     await step("stage exact candidate", f.staged.promise);
     expect(f.runtime.planningView(f.created.run_id)?.basis.root.execution_id).toBe(root.execution_id);
-    f.finishTail(); f.workerExit.resolve(); await step("actual predecessor drain", f.rootDrained.promise);
+    f.finishTail(); await step("source finished before worker drain", f.rootSourceFinished.promise);
+    expect(f.runtime.snapshot()?.operator.state).toBe("executing");
+    f.workerExit.resolve(); await step("actual predecessor drain", f.rootDrained.promise);
     const activated = await step("explicit named activation", f.invoke("program_run", { operation: "activate_next" }));
     expect(activated.isError).not.toBe(true); expect(f.runtime.planningView(f.created.run_id)?.state).toBe("activated");
     expect(f.findExecution(FOLLOW)).not.toBeNull();

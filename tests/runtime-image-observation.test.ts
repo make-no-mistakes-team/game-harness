@@ -20,8 +20,8 @@ async function fixture() {
   const notices = new Set<(notice: BridgeNotice) => void>();
   const frames = new Set<(frame: Uint8Array) => void>();
   const subscribed = Promise.withResolvers<void>();
-  let packet: Uint8Array | null = null, sequence = 0;
-  const observation = (): ObservationV3 => minecraftObservationFixture(adapter, { world_id: world, session_id: session, observation_seq: ++sequence });
+  let packet: Uint8Array | null = null, sequence = 0, observationReads = 0;
+  const observation = () => minecraftObservationFixture(adapter, { world_id: world, session_id: session, observation_seq: ++sequence });
   const game: GameBridge = {
     connect: async () => {}, disconnect: async () => {},
     snapshot: (): GameState => ({ status: "connected", username: "Image fixture", version: "1.21.4",
@@ -29,7 +29,7 @@ async function fixture() {
       binding: minecraftTestBinding(adapter), space: { dimension_id: "minecraft:overworld", space_epoch: 1 }, screen: null,
       presentation: null, last_observation_at: null, error: null,
       video: { status: "streaming", width: 2, height: 2, fps: 30, frames: packet ? 1 : 0, last_frame_at: null, error: null } }),
-    observe: async () => observation(), neutralize: async () => {}, cancel: async () => {},
+    observe: async () => { observationReads++; return observation(); }, neutralize: async () => {}, cancel: async () => {},
     adapter: () => adapter, emergencyStop: async () => {},
     execute: async () => { throw new Error("No game effects belong in the image-wait fixture"); },
     subscribe: listener => { notices.add(listener); return () => { notices.delete(listener); }; },
@@ -49,9 +49,33 @@ async function fixture() {
   await runtime.initialize();
   const run = await runtime.createRun({ task: "Image selection fixture only", goal: adapter.goals.find(goal => goal.goal_id === "custom")!, model_id: "fixture-image-model", working_programs: "fresh" });
   await runtime.control(run.run_id, "start");
-  return { runtime, store, run, subscribed: subscribed.promise, frameReaders: () => frames.size,
+  return { runtime, store, run, subscribed: subscribed.promise, frameReaders: () => frames.size, observationReads: () => observationReads,
+    freshObservation: observation,
+    publishObservation(value: ObservationV3) { for (const listener of notices) listener({ type: "observation", data: value }); },
     deliver(value: Uint8Array) { packet = value; for (const listener of frames) listener(value); } };
 }
+
+test("native observation delivery updates evidence once without issuing an echo read or accepting foreign state", async () => {
+  const f = await fixture();
+  f.deliver(nativeFrame({ sequence: 70 }));
+  await f.runtime.modelObservation();
+  const reads = f.observationReads(), current = f.freshObservation();
+  current.data.player.inventory = [{ name: "oak_log", display_name: "Oak Log", count: 2, slot: 0 }];
+  f.publishObservation(current);
+  await Bun.sleep(0);
+  const observations = () => f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "adapter.evidence")
+    .map(event => (event.details as unknown as { data: ObservationV3 }).data);
+  expect(observations().at(-1)).toMatchObject({ observation_seq: current.observation_seq,
+    data: { player: { inventory: [{ name: "oak_log", count: 2 }] } } });
+  expect(f.observationReads()).toBe(reads);
+  const accepted = observations().length;
+  f.publishObservation(current);
+  f.publishObservation({ ...current, observation_seq: current.observation_seq - 1 });
+  f.publishObservation({ ...current, world_id: crypto.randomUUID(), observation_seq: current.observation_seq + 100 });
+  await Bun.sleep(0);
+  expect(observations()).toHaveLength(accepted);
+  expect(f.observationReads()).toBe(reads);
+});
 
 test("a missing current image waits for an actual delivered frame without text fallback", async () => {
   const f = await fixture();

@@ -17,8 +17,19 @@ export const programWriteSchema = z.object({
   reason: z.string().trim().min(1).max(2000).optional(),
 }).strict();
 export const nextConfigSchema = lookaheadConfigSchema.extend({ activation: z.enum(["manual", "on_predecessor_success"]).default("manual") }).strict();
+// Actor input may override individual fields. Only this boundary supplies
+// defaults; the execution/planning schemas still require complete strict limits.
+const actorLimitsSchema = skillLimitsSchema.extend({
+  duration_ms: skillLimitsSchema.shape.duration_ms.default(DEFAULT_SKILL_LIMITS.duration_ms),
+  max_actions: skillLimitsSchema.shape.max_actions.default(DEFAULT_SKILL_LIMITS.max_actions),
+  max_calls: skillLimitsSchema.shape.max_calls.default(DEFAULT_SKILL_LIMITS.max_calls),
+  max_depth: skillLimitsSchema.shape.max_depth.default(DEFAULT_SKILL_LIMITS.max_depth),
+}).prefault({});
+export const programSubmitSchema = programWriteSchema.extend({
+  args: jsonSchema, limits: actorLimitsSchema, next: nextConfigSchema.optional(),
+}).strict();
 export const programRunSchema = z.discriminatedUnion("operation", [
-  programSelectorSchema.extend({ operation: z.literal("start"), args: jsonSchema, limits: skillLimitsSchema.default({ ...DEFAULT_SKILL_LIMITS }), next: nextConfigSchema.optional() }).strict(),
+  programSelectorSchema.extend({ operation: z.literal("start"), args: jsonSchema, limits: actorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
   z.object({ operation: z.literal("inspect"), target: z.enum(["current", "latest"]).default("current") }).strict(),
   z.object({ operation: z.literal("stop"), target: z.enum(["current", "latest"]).default("current") }).strict(),
   z.object({ operation: z.literal("activate_next") }).strict(),
@@ -40,7 +51,7 @@ export const programInspectSchema = z.discriminatedUnion("view", [
 ]);
 export const programReviewSchema = programSelectorSchema.extend({ decision: z.enum(["keep", "insufficient_evidence"]), reason: z.string().trim().min(1).max(2000) }).strict();
 export const taskFinishSchema = z.object({ summary: z.string().trim().min(1).max(2000) }).strict();
-export const prepareNextSchema = programSelectorSchema.extend({ args: jsonSchema, limits: skillLimitsSchema.default({ ...DEFAULT_SKILL_LIMITS }), guard_source: z.string().min(1).max(16384).optional() }).strict();
+export const prepareNextSchema = programSelectorSchema.extend({ args: jsonSchema, limits: actorLimitsSchema, guard_source: z.string().min(1).max(16384).optional() }).strict();
 export const helpSchema = z.object({ topic: z.enum(["overview", "game", "programs", "planning", "reflex", "memory"]).default("overview") }).strict();
 const namedPolicy = { name: z.string().trim().min(1).max(80), version: z.int().positive().optional() };
 export const reflexSchema = z.discriminatedUnion("operation", [

@@ -39,7 +39,8 @@ export type MinecraftAction =
   | { kind: "equip"; item: string; destination: "hand" | "off-hand" | "head" | "torso" | "legs" | "feet" }
   | { kind: "interact"; target: TargetRef }
   | { kind: "attack"; target: TargetRef }
-  | { kind: "navigate"; target: TargetRef; range: number; duration_ms: number; gaze?: MinecraftNavigationGaze }
+  | { kind: "navigate"; target: TargetRef; range: number; duration_ms: number;
+      arrival?: "position" | "interaction"; gaze?: MinecraftNavigationGaze }
   | { kind: "respawn" };
 
 const vector = z.object({ x: z.number().finite(), y: z.number().finite(), z: z.number().finite() }).strict();
@@ -93,16 +94,24 @@ export const minecraftActionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("move"), controls: z.object({ forward: z.boolean().optional(), back: z.boolean().optional(),
     left: z.boolean().optional(), right: z.boolean().optional(), jump: z.boolean().optional(), sprint: z.boolean().optional(),
     sneak: z.boolean().optional() }).strict(), duration_ms: z.number().int().min(50).max(2000), look: look.optional(),
-    interaction: z.object({ kind: z.enum(["attack", "use"]), target: targetRefSchema.optional() }).strict().optional() }).strict(),
+    interaction: z.object({ kind: z.enum(["attack", "use"]), target: targetRefSchema.optional() }).strict().optional() }).strict()
+    .describe("Raw held-input interval, not an arrival or task-progress promise. Success may include jumping in place. Receipts distinguish net/horizontal displacement, height change and own-body grounded/support/headroom/collision feedback from accumulated travel. For purposeful travel or ascent, compare fresh settled positions across a small bounded sequence; after at most three ineffective bursts, stop, reobserve and change the approach or return blocked. Allow bounded detours; jumping distance is not escape progress. A separate completed jump followed by observation/aim/equip may land before a later placement."),
   z.object({ kind: z.literal("look"), yaw, pitch }).strict(),
   z.object({ kind: z.literal("dig"), target: targetRefSchema }).strict(),
-  z.object({ kind: z.literal("place"), target: targetRefSchema, face: z.enum(["up", "down", "north", "south", "east", "west"]), item: itemName }).strict(),
-  z.object({ kind: z.literal("craft"), item: itemName, executions: z.number().int().min(1).max(16), table: targetRefSchema.optional() }).strict(),
-  z.object({ kind: z.literal("equip"), item: itemName, destination: z.enum(["hand", "off-hand", "head", "torso", "legs", "feet"]) }).strict(),
+  z.object({ kind: z.literal("place"), target: targetRefSchema, face: z.enum(["up", "down", "north", "south", "east", "west"]), item: itemName }).strict()
+    .describe("Place using a fresh support target and face; implicit equipment uses the same visible native inventory controller. Bounded native session up to 20 seconds, still limited by the owning program budget."),
+  z.object({ kind: z.literal("craft"), item: itemName, executions: z.number().int().min(1).max(16), table: targetRefSchema.optional() }).strict()
+    .describe("Manual visible native 2x2 crafting, or 3x3 with a fresh reachable table. One owned session places ingredients, retrieves output and clears custody. Native bound 10 seconds + 35 seconds per execution; owning program limits still apply."),
+  z.object({ kind: z.literal("equip"), item: itemName, destination: z.enum(["hand", "off-hand", "head", "torso", "legs", "feet"]) }).strict()
+    .describe("Select an existing hotbar item directly or visibly transfer equipment through the native inventory. Bounded native session up to 12 seconds; owning program limits still apply."),
   z.object({ kind: z.literal("interact"), target: targetRefSchema }).strict(),
   z.object({ kind: z.literal("attack"), target: targetRefSchema }).strict(),
-  z.object({ kind: z.literal("navigate"), target: targetRefSchema, range: z.number().finite().min(0.5).max(4),
-    duration_ms: z.number().int().min(100).max(10000), gaze: minecraftNavigationGazeSchema.optional() }).strict(),
+  z.object({ kind: z.literal("navigate"), target: targetRefSchema, range: z.number().finite().min(0.5).max(4)
+    .describe("Arrival distance in blocks. Position (default): full 3D distance from own feet to block centre or last-authorized entity origin. Interaction: eye-to-block-centre distance, also requiring current visibility and native mining reach; never increases reach. Unless already arrived, a separate helper envelope requires initial feet-to-target-centre distance <=8 blocks and current distance <=10. Observation samples integer block offsets around floor(feet) within radius 8, so a fresh observed centre can still exceed navigation's 8-block envelope. Refusal receipts give distances/limits. Reobserve and choose a permitted local approach, not the unchanged refused request."),
+    duration_ms: z.number().int().min(100).max(10000),
+    arrival: z.enum(["position", "interaction"]).optional()
+      .describe("Defaults to position; vertical separation counts. Choose interaction to approach a visible block for ordinary interaction/mining reach without mining it. Interaction requires a visible reachable block within range and rejects entity targets; position preserves entity/item navigation."),
+    gaze: minecraftNavigationGazeSchema.optional() }).strict(),
   z.object({ kind: z.literal("respawn") }).strict(),
 ]) satisfies z.ZodType<MinecraftAction>;
 export const minecraftRecipesRequestSchema = z.object({ item: itemName }).strict();

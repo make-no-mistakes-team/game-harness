@@ -14,6 +14,8 @@ export interface SkillRef {
 
 export const SKILL_API_VERSION = 4;
 
+export const PROGRAM_RESULT_GUIDANCE = "Return a brief summary (1–2000 characters) and compact semantic result: relevant counts, task facts, selected failure information and authored continuity notes. The entire serialized JSON frame plus newline, not only result or summary, must fit 65536 UTF-8 bytes and depth 32; leave room for its envelope. Raw observations and action receipts stay in host Store/trace/journal evidence: use program_inspect execution/action/trace/events with returned named/ordinal references and cursors. Do not return receipt/observation arrays, invent evidence IDs, or stringify them into summary. A terminal serialization failure does not roll back completed effects: inspect retained evidence and fresh state before deciding what remains.";
+
 export interface NamedProgramRef {
   name: string;
   version?: number;
@@ -83,10 +85,20 @@ export interface SkillResult {
   result: Json;
 }
 
+export interface ProgramOutputFailure {
+  phase: "terminal_result";
+  reason: "utf8_bytes" | "json_depth" | "json_serialization";
+  maximum_bytes: number;
+  actual_bytes: number | null;
+  completed_capability_calls: number;
+}
+
 /** Host-bound API supplied to skill bodies; await one call at a time. */
 export interface GameAPI {
   observe(): Promise<ObservationV3>;
   action(action: GameAction): Promise<GameActionResult>;
+  /** One ordinary action, then fresh state only when continuation is safe. Never retries or relabels the action. */
+  actionAndObserve(action: GameAction): Promise<{ action: GameActionResult; observation: ObservationV3 | null }>;
   /** Explicit vanilla request through the same exclusive action arbiter. */
   respawn(): Promise<GameActionResult>;
   call(skill: NamedProgramRef, args: Json): Promise<SkillResult>;
@@ -142,7 +154,8 @@ export interface SkillExecutionView extends SkillRef {
   calls: number;
   result: SkillResult | null;
   error: string | null;
-  diagnostic?: { type: string; message: string; source_hash: string; location: { mapping: "unmapped" }; code?: string };
+  diagnostic?: { type: string; message: string; source_hash: string; location: { mapping: "unmapped" }; code?: string;
+    output?: ProgramOutputFailure };
 }
 
 export type SkillCapabilityRequest =

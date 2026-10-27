@@ -17,6 +17,8 @@ import { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { fetchCodexModels } from "@oh-my-pi/pi-catalog/discovery/codex";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Model } from "@oh-my-pi/pi-catalog/types";
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import { setTransports } from "@oh-my-pi/pi-utils/logger";
@@ -28,6 +30,7 @@ import {
 } from "./auth-protocol.ts";
 import type { AuthWorkerMessage } from "./auth-protocol.ts";
 import { authWorkerEnvironment } from "./auth-network.ts";
+import { assertSingleDispatchEnvironment, singleDispatchCodexStream } from "./evaluation-inference.ts";
 
 const PROVIDER = "openai-codex";
 const LOGIN_FAILURE =
@@ -85,6 +88,8 @@ export class AuthManager {
   readonly #auth: AuthStorage;
   readonly #directory: string;
   readonly #onChange: () => void;
+  readonly #singleInferenceDispatch: boolean;
+  readonly #reasoning: "low" | undefined;
   #state: AuthState = {
     status: "signed_out",
     authenticated: false,
@@ -110,16 +115,22 @@ export class AuthManager {
     auth: AuthStorage,
     directory: string,
     onChange: () => void,
+    singleInferenceDispatch: boolean,
+    reasoning: "low" | undefined,
   ) {
     this.#auth = auth;
     this.#directory = directory;
     this.#onChange = onChange;
+    this.#singleInferenceDispatch = singleInferenceDispatch;
+    this.#reasoning = reasoning;
   }
 
   static async create(
     dataDir: string,
     onChange: () => void,
+    options: { singleInferenceDispatch?: boolean; reasoning?: "low" } = {},
   ): Promise<AuthManager> {
+    if (options.singleInferenceDispatch) assertSingleDispatchEnvironment();
     const directory = join(dataDir, "auth");
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await privateFiles(directory);
@@ -141,7 +152,7 @@ export class AuthManager {
     try {
       await auth.credentials.reload();
       await privateFiles(directory);
-      const manager = new AuthManager(auth, directory, onChange);
+      const manager = new AuthManager(auth, directory, onChange, options.singleInferenceDispatch === true, options.reasoning);
       const row = auth.credentials
         .list(PROVIDER)
         .filter(
@@ -343,6 +354,7 @@ export class AuthManager {
       throw new Error(
         "Choose a supported model from the authenticated account’s current discovery result",
       );
+    const thinkingLevel = this.#reasoning === undefined ? undefined : requireSupportedEffort(model, Effort.Low);
     const identity = resolveCredentialIdentityKey(PROVIDER, row.credential);
     if (!identity)
       throw new Error("This OAuth account has no routable identity");
@@ -367,11 +379,13 @@ export class AuthManager {
         sessionId,
         initialState: {
           model,
+          thinkingLevel,
           systemPrompt: [...options.systemPrompt],
           tools: [...options.tools],
           messages: [],
         },
         intentTracing: false,
+        streamFn: this.#singleInferenceDispatch ? singleDispatchCodexStream : undefined,
         getApiKey: (requested) => {
           this.#assertScope(epoch, credentialId, scope);
           if (
@@ -588,10 +602,9 @@ export class AuthManager {
     const login = this.#state.login;
     if (!login || login.id !== job.id) return;
     if (message.type === "auth") {
-      const full = validatedAuthUrl(message.url, job.mode);
-      login.url = message.launch_url
-        ? validatedAuthUrl(message.launch_url, job.mode, true)
-        : full;
+      // Renderer and desktop deliberately open only provider HTTPS links.
+      // The SDK's optional loopback shortcut is not an external browser URL.
+      login.url = validatedAuthUrl(message.url, job.mode);
       login.instructions =
         message.instructions ??
         (job.mode === "browser"

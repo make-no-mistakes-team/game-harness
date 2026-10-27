@@ -88,7 +88,12 @@ export function getGameAPIReference(adapter: RuntimeAdapter) {
     call: { parameters: [{ name: "skill", type: "NamedProgramRef" }, { name: "args", type: "Json" }], result: "SkillResult" },
     progress: { parameters: [{ name: "summary", type: "string" }, { name: "details", type: "Json" }], result: "null" },
   };
-  if (adapter.action_capability) methods.action = { parameters: [{ name: "action", type: "AdapterAction" }], result: "GameActionResult" };
+  if (adapter.action_capability) {
+    methods.action = { parameters: [{ name: "action", type: "AdapterAction" }], result: "GameActionResult" };
+    methods.actionAndObserve = { parameters: [{ name: "action", type: "AdapterAction" }],
+      result: "{action:GameActionResult,observation:ObservationV3|null}",
+      contract: "One ordinary action and, after success or an explicitly neutralized failed no-world-effect refusal, a fresh ordinary observation. Both calls consume the existing root budget. The original action status/evidence is unchanged; no retry or task-success inference. Check your own postcondition in observation before deciding to stop or freshly reselect within a small bound. Unknown/cancelled/reconnect outcomes remain fenced; other failures return observation:null. Validation exceptions remain catchable invalid_request, not completed actions. Scope revocation between calls throws; no stale state fallback." };
+  }
   if (adapter.supports_respawn) methods.respawn = { parameters: [], result: "GameActionResult" };
   for (const binding of adapter.bindings) methods[binding.name] = { capability_id: binding.capability_id, version: binding.version,
     parameters: binding.parameters.map(name => ({ name, type: "Json" })), result: "Json" };

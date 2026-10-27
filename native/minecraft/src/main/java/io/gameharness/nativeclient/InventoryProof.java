@@ -77,6 +77,15 @@ public final class InventoryProof implements ModInitializer {
                     }
                     result.add("counts", counts);
                     result.add("slots", slots);
+                    result.addProperty("selected_slot", player.getInventory().selectedSlot);
+                    var handler = player.currentScreenHandler;
+                    result.addProperty("screen_sync_id", handler.syncId);
+                    result.addProperty("cursor_count", handler.getCursorStack().getCount());
+                    int gridSize = handler instanceof net.minecraft.screen.CraftingScreenHandler ? 9
+                        : handler instanceof net.minecraft.screen.PlayerScreenHandler ? 4 : 0;
+                    int gridCount = 0;
+                    for (int i = 1; i <= gridSize; i++) gridCount += handler.getSlot(i).getStack().getCount();
+                    result.addProperty("crafting_grid_count", gridCount);
                     result.addProperty("alive", player.isAlive() && player.getHealth() > 0);
                     result.addProperty("health", player.getHealth());
                     ServerPlayNetworking.send(

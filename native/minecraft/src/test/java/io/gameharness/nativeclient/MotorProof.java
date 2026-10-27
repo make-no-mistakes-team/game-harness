@@ -197,6 +197,20 @@ public final class MotorProof {
         && movement.forward == 0 && movement.strafe == 0, "invalid steering retained keys");
   }
 
+  private static void navigationEnvelope() {
+    require(NavigationEnvelope.rejection(64, 100) == null,
+        "inclusive start/current navigation limits were narrowed");
+    require("start_distance_limit".equals(NavigationEnvelope.rejection(64.0001, 64)),
+        "initial feet-to-centre overflow lacks its own refusal reason");
+    require("current_distance_limit".equals(NavigationEnvelope.rejection(63, 100.0001)),
+        "current feet-to-centre overflow lacks its own refusal reason");
+    // A sampled block lattice offset (6,-1,5) is inside radius eight, but
+    // fractional player feet and block centres need not be within eight metres.
+    require("start_distance_limit".equals(
+        NavigationEnvelope.rejection(6.5 * 6.5 + .5 * .5 + 5.5 * 5.5, 64)),
+        "observation lattice membership incorrectly widened native navigation geometry");
+  }
+
   public static void main(String[] ignored) {
     long five = balancedNinety(5), ten = balancedNinety(10), twenty = balancedNinety(20);
     largeSmallAndWrap();
@@ -204,9 +218,11 @@ public final class MotorProof {
     targetReversal();
     routeGeometry();
     explicitGazeAndSteering();
+    navigationEnvelope();
     System.out.println("Native motor proof PASS: measured balanced 90-degree settling "
         + five + "/" + ten + "/" + twenty + " ms at 5/10/20-ms steps (100-ms hold); "
         + "speed/acceleration limits, shortest yaw, no overshoot, frame partition, monotonic "
-        + "clock/stall bounds, route eye-height/slope/bend interpolation, explicit gaze and keyboard steering.");
+        + "clock/stall bounds, route eye-height/slope/bend interpolation, explicit gaze, keyboard steering "
+        + "and distinct observation-lattice/navigation-envelope boundaries.");
   }
 }

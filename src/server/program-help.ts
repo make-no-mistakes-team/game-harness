@@ -1,24 +1,32 @@
 import { z } from "zod";
 import type { RuntimeAdapter } from "../shared/contracts.ts";
 import { getGameAPIReference, policyDecisionSchema } from "../shared/validation.ts";
-import { DEFAULT_SKILL_LIMITS } from "../shared/programs.ts";
+import { DEFAULT_SKILL_LIMITS, PROGRAM_RESULT_GUIDANCE } from "../shared/programs.ts";
 import { PROGRAM_LIMITS } from "./program-validation.ts";
-import { helpSchema, memorySchema, nextConfigSchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
+import { helpSchema, memorySchema, nextConfigSchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
 
 export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?: RuntimeAdapter) {
-  const schema = (value: z.ZodType) => z.toJSONSchema(value, { unrepresentable: "any" });
+  const schema = (value: z.ZodType) => z.toJSONSchema(value, { unrepresentable: "any", io: "input" });
   if (topic === "game") {
     if (!adapter) throw new Error("A negotiated adapter is required for the executable game reference");
     return getGameAPIReference(adapter);
   }
   if (topic === "programs") return {
-    write: schema(programWriteSchema), run: schema(programRunSchema), inspect: schema(programInspectSchema), review: schema(programReviewSchema),
+    write: schema(programWriteSchema), submit: schema(programSubmitSchema), run: schema(programRunSchema), inspect: schema(programInspectSchema), review: schema(programReviewSchema),
     body: "Write only an async JavaScript function BODY. Supplied bindings: game,args. No wrapper/import/export or ambient host access. Comments and coherent helper functions are permitted. Both original and canonical source are capped at 16 KiB UTF-8; structural metrics are descriptive. Ordinary program_write card and dependencies may be omitted: host defaults are unspecified/untested, not invented tactics. Await one capability at a time. Every return path must return {status:'completed'|'blocked'|'failed',summary:string,result:JSON}; result:null is allowed.",
+    result: PROGRAM_RESULT_GUIDANCE,
     completion: "A program's completed status is execution-only, not task success. For a custom task, call the separate ordinary-only task_finish lifecycle tool as soon as actual authorized evidence shows the whole task done; do not run another no-op/check or review loop. It stops the run with an unverified model report. Built-in goals still require independent trusted verification.",
     composition: "Declare named dependencies when writing. The host pins their exact validated versions. game.call({name,version?},args) selects only those captured dependencies, never a new latest version; version may be omitted only when the declared name is unambiguous.",
-    revision: "A new name creates a family. An existing name requires based_on equal to its latest stored version; conflicts never silently rebase source. Optional reason links an actual direct-child code experiment to the latest unresolved matching outcome. A candidate is not proven improvement or promotion.",
+    local_feedback: "game.actionAndObserve(action) composes one ordinary action and a fresh observation after success or safely settled no-world-effect/neutralized failure, preserving the raw action result. Evaluate your own intended postcondition from that observation: an already satisfied result need not become a new strategic turn; a fresh target may permit bounded reselection. It never retries or decides task success. Unknown/cancelled/reconnected effects still stop and reconcile. Both calls charge ordinary budgets.",
+    local_feedback_example: LOCAL_FEEDBACK_EXAMPLE,
+    revision: "A new name creates a family. An existing name requires based_on equal to its latest stored version; conflicts never silently rebase source. Optional reason links an actual direct-child code experiment to that parent's latest matching outcome. A prior keep or insufficient_evidence assessment stays immutable and does not block repair; the host records the candidate link separately. No review call is required before authoring. A candidate is not proven improvement or promotion.",
     selection: "Start without version selects latest validated once before admission. Exact version remains exact. Transport retry identity is host-bound; repeat delivery of one tool call never starts new work. A new decision is a distinct call.",
+    reuse: "Inspect each retained compatible program's last outcome and historical argument sample. Reuse a suitable exact version with new compact args, or repair its actual defect with based_on before reuse. A blocked version is not qualified by its name. One coherent body may reuse parameterized local functions; do not add model turns or child calls merely to manufacture reuse. Historical coordinates guide fresh reacquisition; old handles never authorize effects.",
+    submission: "Ordinary-only program_submit explicitly combines write arguments with args, limits and optional next. It registers one immutable version and starts only that exact version through normal admission. program_write still only saves; program_run still starts existing programs. source.status persisted reports the saved name/version even if start.status is refused or unknown. Refused means no execution was acknowledged; unknown must be inspected, never blindly retried. Duplicate delivery cannot create another revision or execution. Stop/Pause and task/generation/owner changes between phases block start. Review and speculative planning cannot submit.",
     inspection: "Views are read-only. Follow next_after/has_more and explicit omissions. current means unfinished execution; latest includes terminal outcomes. Trace continuation cursors pin the original execution even after newer work starts. Continue comparison pages using the exact named versions returned on page one. Review without version selects the latest matching outcome in that name family; an exact version stays exact. Named selection never rewrites captured execution/dependency references. Game-specific reads use the executable adapter bindings listed by help topic game, not additional program_inspect views.",
+    continuity: "At meaningful intent/recovery changes, game.progress(summary,{current_subgoal,worksite,resource_requirements,recovery_reason}) or explicit root-result fields retain compact authored notes. worksite is an actually observed task site: establish or deliberately relocate it, never replace it with current position during travel/recovery. Omission retains notes; null clears them. Current position/inventory come from fresh observation; keep temporary recovery_position separate. Life/session/boot/space changes clear current notes; explicitly authored worksite/subgoal and unresolved effects may remain separately labelled historical references with their original scope, never current authority. Reobserve/reacquire before continuation; containment does not prove an unknown effect did not happen. Fresh run/task/world clears experience. Pause/provider recovery requires explicit Resume and fresh state; Stop is terminal, not automatic resume. Durable events reconstruct supported references, not workers, JS stacks or world state. No mandatory per-turn summary or inferred strategy.",
+    movement_recovery: "Raw movement succeeded means the interval completed, not that the subgoal advanced. Compare sustained/net grounded standing-position changes, not cumulative travel/jump distance or transient airborne height. After at most three ineffective movement bursts, fresh-observe and change approach or return blocked with selected receipt evidence. Never reissue an unchanged refusal. Bounded purposeful detours may move away temporarily. Raw forward follows the current camera during move.look turning; in confined geometry await a completed look first, then move. Intentional stationary actions, looks and settling waits are valid; displacement is not a universal action-success rule. Unknown effects remain fenced and must not be replayed.",
+    execution_limits: "Omitted limits or {} uses documented defaults. Supply only fields to override; the host normalizes a complete strict object and records effective limits. Invalid values/types/unknown fields are rejected, never clamped. Maxima, remaining root/parent budgets, ownership and duplicate-delivery identity remain authoritative. This also applies to prepared successors.",
     limits: PROGRAM_LIMITS, default_execution_limits: DEFAULT_SKILL_LIMITS,
   };
   if (topic === "planning") return {
@@ -36,14 +44,37 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?
     contract: "Catalog latest compatible snapshot per name with durable numeric revisions and paging. Load {name,version?} pins one exact snapshot, latest when omitted, then freshly validates its captured dependencies without restoring observations,args,targets or worker state. qualify requires the existing trusted bounded goal/block/inventory evidence declaration. No self-rating or automatic promotion. Older same-name revisions remain selectable explicitly.",
   };
   return {
-    tools: ["observe", "program_write", "program_run", "program_inspect", "program_review", "help"],
+    tools: ["observe", "program_write", "program_submit", "program_run", "program_inspect", "program_review", "help"],
     lifecycle: {
       task_finish: schema(taskFinishSchema),
-      contract: "Separate from the six gameplay/program verbs. Ordinary role and custom tasks only. As soon as actual authorized evidence shows the whole task complete, call task_finish with a brief evidence summary instead of more no-op/check programs or review. It immediately revokes admission and stops the run; completion is model-reported and unverified, never goal.verified. Program completed statuses are execution-only. Built-in goals cannot bypass their trusted verifier.",
+      contract: "Separate from the gameplay/program verbs. Ordinary role and custom tasks only. As soon as actual authorized evidence shows the whole task complete, call task_finish with a brief evidence summary instead of more no-op/check programs or review. It immediately revokes admission and stops the run; completion is model-reported and unverified, never goal.verified. Program completed statuses are execution-only. Built-in goals cannot bypass their trusted verifier.",
     },
     topics: ["game", "programs", "planning", "reflex", "memory"],
     advanced: "Request help topic reflex or memory to disclose that optional module for ordinary planning. Speculative and post-goal roles cannot acquire extra authority through help.",
     observation: "The observe tool returns permitted adapter projection data/metadata without host authority identities. Program game.observe() and guards use ObservationV3 with adapter-owned data. Historical schema2 artifacts are read-only. Arguments, results and detailed traces retain opaque JSON keys; byte-budget omissions remain explicit.",
-    workflow: "Observe authorized state; write/revise compact named taskflow; start once and let it work. Inspect exact source/outcomes/trace/feedback only when useful. Assess keep or insufficient_evidence, or link a performed revision through write.reason. Host preflight owns readiness, not a mandatory model bootstrap ceremony.",
+    workflow: "Observe authorized state; explicitly submit a compact named taskflow to write and start it, or intentionally write without starting and later run an existing version. Let admitted work proceed. Inspect exact source/outcomes/trace/feedback only when useful. Assess keep or insufficient_evidence, or link a performed revision through write.reason. Host preflight owns readiness, not a mandatory model bootstrap ceremony.",
   };
 }
+
+// Reference source only, not an injected worker binding or a gameplay strategy.
+// The author supplies the intended predicate and a meaningful distinct choice.
+export const LOCAL_FEEDBACK_EXAMPLE = `async function applyAndCheck(action, postcondition, chooseAlternative) {
+  let observation = await game.observe();
+  if (postcondition(observation))
+    return {status:"completed",summary:"Postcondition already satisfied",result:{postcondition_met:true}};
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const checked = await game.actionAndObserve(action);
+    if (checked.observation) observation = checked.observation;
+    if (checked.observation && postcondition(observation))
+      return {status:"completed",summary:"Observed postcondition satisfied",result:{postcondition_met:true,action_status:checked.action.status}};
+    const evidence = checked.action.evidence;
+    const safe = checked.observation && checked.action.status === "failed" &&
+      !checked.action.requires_reconnect && evidence?.world_effect_emitted === false && evidence?.neutralized === true;
+    if (!safe || attempt === 1)
+      return {status:"blocked",summary:"Local postcondition not established",result:{postcondition_met:false,action_status:checked.action.status}};
+    const alternative = chooseAlternative(observation, action);
+    if (!alternative || JSON.stringify(alternative) === JSON.stringify(action))
+      return {status:"blocked",summary:"No meaningful fresh alternative",result:{postcondition_met:false,action_status:checked.action.status}};
+    action = alternative;
+  }
+}`;

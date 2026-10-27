@@ -21,6 +21,7 @@ import {
   setListeningPort,
 } from "./config.ts";
 import { goalSchema, motorProfileSchema, workingProgramModeSchema, skillRefSchema } from "../shared/validation.ts";
+import { taskTextSchema } from "../shared/tasks.ts";
 import type { AppSnapshot, RunView } from "../shared/contracts.ts";
 import { promotionDeclarationSchema } from "./experience.ts";
 import { ImprovementLearning } from "./improvement-learning.ts";
@@ -267,7 +268,7 @@ const controlBody = z
   .strict();
 const runBody = z
   .object({
-    task: z.string().trim().min(3).max(4000),
+    task: taskTextSchema,
     goal: goalSchema,
     model_id: z.string().min(1).max(160),
     experience_id: z

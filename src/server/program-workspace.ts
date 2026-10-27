@@ -58,14 +58,12 @@ export class ProgramWorkspace {
     catch { return { name: null, version: ref.version, reference_omission: "Program is outside the current named workspace" }; }
   }
 
-  latestOpportunity(program: SkillView, unresolved = false): ImprovementOpportunity {
+  latestOpportunity(program: SkillView): ImprovementOpportunity {
     const value = this.store.evidenceObjects<ImprovementOpportunity>(this.runId, "opportunity")
       .filter((opportunity) => opportunity.version.run_id === this.runId && opportunity.version.skill_id === program.skill_id &&
         opportunity.version.version === program.version && opportunity.version.hash === program.hash)
       .at(-1);
     if (!value) throw new RuntimeFault("not_found", "No matching outcome feedback is available for this exact named version");
-    if (unresolved && value.resolution !== null)
-      throw new RuntimeFault("conflict", "The latest matching outcome already has an immutable assessment");
     return value;
   }
 

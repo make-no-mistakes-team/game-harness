@@ -1,8 +1,47 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createServer } from "node:http";
 import type { Socket } from "node:net";
 import { fileURLToPath } from "node:url";
 import { authWorkerEnvironment } from "../src/server/auth-network.ts";
+import { AuthManager } from "../src/server/auth.ts";
+
+test("browser login exposes the provider HTTPS URL rather than the SDK loopback launch shortcut", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gameharness-browser-auth-"));
+  const spawn = Bun.spawn;
+  const intercepted = spyOn(Bun, "spawn").mockImplementation(((command: string[], options: object) => {
+    if (!command.some(part => part.endsWith("/auth-worker.ts")))
+      throw new Error("Only the isolated OAuth worker may start in this fixture");
+    // Substitute only the child/provider seam, keeping real IPC decoding,
+    // parent URL validation, state publication and owned cancellation.
+    return spawn([command[0]!, "--no-env-file", "-e", `
+process.stdout.write(JSON.stringify({type:"auth",
+  url:"https://auth.openai.com/oauth/authorize?state=synthetic&code_challenge=synthetic",
+  launch_url:"http://localhost:1455/launch",instructions:"Synthetic, no provider connection"})+"\\n");
+setInterval(()=>{},1000);
+`], options);
+  }) as typeof Bun.spawn);
+  let auth: AuthManager | undefined;
+  const published = Promise.withResolvers<string>();
+  const deadline = setTimeout(() => published.reject(new Error("No authorization URL published")), 5000);
+  try {
+    auth = await AuthManager.create(directory, () => {
+      const snapshot = auth?.snapshot();
+      if (snapshot?.login?.url) published.resolve(snapshot.login.url);
+      if (snapshot?.error) published.reject(new Error(snapshot.error));
+    });
+    await auth.startLogin("browser");
+    expect(await published.promise).toBe("https://auth.openai.com/oauth/authorize?state=synthetic&code_challenge=synthetic");
+    expect(auth.snapshot().authenticated).toBe(false);
+  } finally {
+    clearTimeout(deadline);
+    await auth?.close();
+    intercepted.mockRestore();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 10000);
 
 test("OAuth initiation reaches the configured proxy before account sign-in", async () => {
   const connected = Promise.withResolvers<string>();

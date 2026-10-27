@@ -163,12 +163,27 @@ function runSkillThread() {
   const prototypes = [[TypeError.prototype, "TypeError"], [RangeError.prototype, "RangeError"], [ReferenceError.prototype, "ReferenceError"], [SyntaxError.prototype, "SyntaxError"], [Error.prototype, "Error"]];
   const getPrototype = Object.getPrototypeOf;
   const slice = Function.prototype.call.bind(String.prototype.slice);
+  const outputFailures = new WeakMap();
+  const outputFailureGet = WeakMap.prototype.get.bind(outputFailures);
+  const outputFailureSet = WeakMap.prototype.set.bind(outputFailures);
+  function terminalOutputFailure(reason, actualBytes = null) {
+    const error = new Error("Program terminal result serialization failed");
+    outputFailureSet(error, { phase: "terminal_result", reason, maximum_bytes: MAX_OUTPUT,
+      actual_bytes: actualBytes, completed_capability_calls: sequence });
+    return error;
+  }
   function boundedMessage(value) {
     let text = slice(value, 0, 1000);
     while (byteLength(text) > 1000) text = slice(text, 0, -1);
     return text;
   }
   function diagnostic(error) {
+    const output = error && typeof error === "object" ? outputFailureGet(error) : null;
+    if (output) return {
+      type: "ProgramOutputError", code: "program_output_limit",
+      message: `Terminal result rejected (${output.reason}); the complete JSON frame plus newline must fit ${MAX_OUTPUT} UTF-8 bytes and depth ${MAX_DEPTH}. Completed effects remain applied. Return compact task facts; inspect host-retained receipts instead of replaying effects.`,
+      source_hash: workerData.source_hash, location: { mapping: "unmapped" }, output,
+    };
     let type = "ThrownValue", message = "Generated program threw a non-error value (not serialized)", code;
     if (nativeError(error)) {
       const proto = getPrototype(error);
@@ -213,10 +228,21 @@ function runSkillThread() {
   function send(frame) {
     // Serialize the model payload exactly once, under its original limit.
     // Diagnostic overhead has a separate bounded transport allowance.
-    const payload = stringify(frame);
-    if (!payload || byteLength(payload) + 1 > MAX_OUTPUT ||
-      !depthIsBounded(parse(payload)))
+    let payload;
+    try { payload = stringify(frame); }
+    catch (error) {
+      if (frame.type === "skill_result") throw terminalOutputFailure("json_serialization");
+      throw error;
+    }
+    const payloadBytes = payload ? byteLength(payload) + 1 : null;
+    if (!payload || payloadBytes > MAX_OUTPUT) {
+      if (frame.type === "skill_result") throw terminalOutputFailure("utf8_bytes", payloadBytes);
       throw new Error("output_limit");
+    }
+    if (!depthIsBounded(parse(payload))) {
+      if (frame.type === "skill_result") throw terminalOutputFailure("json_depth", payloadBytes);
+      throw new Error("output_limit");
+    }
     const diagnostic = stringify({
       __proto__: null, scope: traceScope, events: traceEvents, omitted: traceOmitted,
     });
@@ -257,7 +283,20 @@ function runSkillThread() {
     progress: (summary, details) =>
       call({ kind: "progress", summary, details }),
   });
-  if (api.action_enabled) methods.action = (action) => call({ kind: "action", action });
+  if (api.action_enabled) {
+    methods.action = (action) => call({ kind: "action", action });
+    methods.actionAndObserve = async (action) => {
+      const result = await call({ kind: "action", action });
+      const evidence = result?.evidence;
+      const safe = !result?.requires_reconnect &&
+        (result?.status === "succeeded" || result?.status === "failed" &&
+          evidence?.world_effect_emitted === false && evidence?.neutralized === true);
+      // No retry or task verdict. Unknown/cancelled effects are fenced by the
+      // host before reaching here; fail closed if a transport ever returns one.
+      const observation = safe ? await call({ kind: "observe" }) : null;
+      return { action: result, observation };
+    };
+  }
   if (api.action_enabled && api.supports_respawn) methods.respawn = () => call({ kind: "respawn" });
   for (const binding of api.bindings) {
     if (!/^[a-zA-Z][a-zA-Z0-9_]{0,79}$/.test(binding.name) || Object.hasOwn(methods, binding.name) ||

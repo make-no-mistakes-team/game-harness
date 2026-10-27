@@ -5,6 +5,8 @@ import { observationV3Schema } from "../src/shared/observations.ts";
 import { jsonSchema } from "../src/shared/validation.ts";
 import { contractHash } from "../src/server/adapter-contract.ts";
 import { RegisteredAdapterContract } from "../src/server/registered-adapter.ts";
+import { capabilityFailure, programDiagnostic } from "../src/server/program-diagnostics.ts";
+import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 
 function fixture() {
   const schemas: AdapterSchemaCatalog = { observation: jsonSchema.parse(z.toJSONSchema(observationV3Schema)),
@@ -61,4 +63,45 @@ test("agreeing hashes cannot register a tampered schema document", () => {
   const f = fixture();
   f.schemas.capabilities["contract.action@1"] = { type: "null" };
   expect(() => new RegisteredAdapterContract(f.descriptor, f.schemas)).toThrow();
+});
+
+test("registered navigation range rejection identifies its valid bound without echoing input or claiming native neutralization", () => {
+  const adapter = minecraftTestAdapter(), registry = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas);
+  const target = { target_id: "INPUT_TARGET_SECRET", incarnation: 1, life_id: 1,
+    space: { dimension_id: "minecraft:overworld", space_epoch: 1 } };
+  for (const [range, bound] of [[0.4, ">= 0.5"], [4.1, "<= 4"]] as const) {
+    let failure: unknown;
+    try { registry.parseCapability("minecraft.action", 1, { kind: "navigate", target, range, duration_ms: 1000 }); }
+    catch (error) { failure = error; }
+    const publicFailure = capabilityFailure(failure);
+    expect(publicFailure.code).toBe("invalid_request");
+    expect(publicFailure.message).toContain("range");
+    expect(publicFailure.message).toContain(bound);
+    expect(publicFailure.message).toContain("before effect admission");
+    expect(publicFailure.message).toContain("no action admitted");
+    expect(publicFailure.message.length).toBeLessThanOrEqual(1000);
+    expect(publicFailure.message).not.toContain(String(range));
+    expect(publicFailure.message).not.toContain("INPUT_TARGET_SECRET");
+    expect(publicFailure.message).not.toContain("neutralized");
+    expect(programDiagnostic(failure, "a".repeat(64))).toMatchObject({ code: "invalid_request", message: publicFailure.message });
+  }
+  expect(registry.parseCapability("minecraft.action", 1, { kind: "navigate", target, range: 0.5, duration_ms: 1000 }))
+    .toMatchObject({ range: 0.5 });
+});
+
+test("registered invalid argument diagnostics never echo unknown keys, values or arbitrary backend Zod errors", () => {
+  const f = fixture();
+  let failure: unknown;
+  try { f.registry.parseCapability("contract.action", 1, { kind: "INPUT_KIND_SECRET", INPUT_KEY_SECRET: "INPUT_VALUE_SECRET" }); }
+  catch (error) { failure = error; }
+  const publicFailure = capabilityFailure(failure);
+  expect(publicFailure.code).toBe("invalid_request");
+  for (const secret of ["INPUT_KIND_SECRET", "INPUT_KEY_SECRET", "INPUT_VALUE_SECRET"])
+    expect(JSON.stringify(publicFailure)).not.toContain(secret);
+  const arbitrary = new z.ZodError([{ code: "custom", path: ["HOST_PATH_SECRET"], message: "HOST_MESSAGE_SECRET" }]);
+  expect(capabilityFailure(arbitrary)).toEqual({ code: "backend_unavailable", message: "Trusted capability could not complete safely" });
+  expect(programDiagnostic(arbitrary, "a".repeat(64))).toEqual({
+    type: "ExecutionFailure", message: "Generated program or trusted capability failed; host exception details are not exposed",
+    source_hash: "a".repeat(64), location: { mapping: "unmapped" },
+  });
 });

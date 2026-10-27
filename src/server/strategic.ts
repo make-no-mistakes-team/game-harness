@@ -7,6 +7,8 @@ import type {
   Json,
   ObservationV3,
   PolicyView,
+  RuntimeAdapter,
+  RunPauseCause,
   UsagePurpose,
 } from "../shared/contracts.ts";
 import type { AdapterActorProjection } from "../shared/observations.ts";
@@ -19,6 +21,9 @@ import type { SpeculativePlanning } from "./speculative-planning.ts";
 import { isToolAllowed } from "../shared/tool-policy.ts";
 import { ProgramWorkspace, type ModelReviewContext } from "./program-workspace.ts";
 import type { ModelObservation } from "./actor-frames.ts";
+import { StrategicContext } from "./strategic-context.ts";
+import { jsonSchema } from "../shared/validation.ts";
+import { preserveRuntimeToolArguments } from "./runtime-tools.ts";
 
 const COALESCE_MS = 100;
 const EMPTY_COOLDOWN_MS = 5_000;
@@ -31,6 +36,10 @@ const PROGRAM_PENDING =
   "A program is meaningful pending work; strategy waits for its outcome";
 const PROVIDER_FAILURE =
   "The strategic model request could not complete. Check authorization and provider availability, then resume the paused run.";
+// The installed SDK can promote completed arguments from a transient failed
+// stream to toolUse. That recovery marker is still a failed provider response,
+// not permission to dispatch its tools or retain its requested knowledge.
+const RECOVERED_PROVIDER_FAILURE = "stream_interrupted_after_content";
 const MEANINGFUL_WAKES: Record<string, true> = {
   policy_replan: true,
   policy_interrupt: true,
@@ -77,6 +86,7 @@ export interface StrategicHost {
   assertCurrent(generation: number, epoch?: number): StoredRun;
   tools(generation: number): AgentTool[];
   rootPrompt(): string;
+  adapter?(): RuntimeAdapter;
   observe(): Promise<ObservationV3>;
   modelObservation?(): Promise<ModelObservation>;
   projectObservation(observation: ObservationV3, previous: ObservationV3 | null): AdapterActorProjection;
@@ -85,7 +95,7 @@ export interface StrategicHost {
   programPending(): boolean;
   busy(): boolean;
   persist(summary?: string): void;
-  pause(message: string): void;
+  pause(message: string, cause: RunPauseCause): void;
   terminal(status: "completed" | "failed", message: string): void;
   speculation?(): SpeculativePlanning;
   reviewContext?(): ModelReviewContext;
@@ -202,12 +212,17 @@ export class StrategicPlanner {
   private attentionTimer: NodeJS.Timeout | undefined;
   private attentionReason: string | null = null;
   private speculativeTurn = false;
+  private readonly retainedContext: StrategicContext;
+  private contextObservation: Pick<ObservationV3, "profile_id" | "profile_configuration_hash"> | null = null;
+  private readonly eligibleTools = new Map<string, { name: string; arguments: unknown }>();
 
   constructor(
     private readonly store: Store,
     private readonly auth: AuthManager,
     private readonly host: StrategicHost,
-  ) {}
+  ) {
+    this.retainedContext = new StrategicContext(store);
+  }
 
   reset(): void {
     if (this.agent || this.opening || this.turn || this.closing)
@@ -231,6 +246,9 @@ export class StrategicPlanner {
     this.role = "planning";
     this.request = null;
     this.responseOwners.clear();
+    this.retainedContext.reset();
+    this.contextObservation = null;
+    this.eligibleTools.clear();
   }
 
   async start(generation: number): Promise<void> {
@@ -266,10 +284,62 @@ export class StrategicPlanner {
       agent.streamFn = async (model, context, options) => {
         const request = this.request;
         if (!request) throw new RuntimeFault("stale_context", "No admitted strategic request owns this stream");
-        const events = await stream(model, context, { ...options, onSseEvent: (event, eventModel) => {
-          request.usage.observe(event, eventModel ?? model);
-          options?.onSseEvent?.(event, eventModel);
-        } });
+        const adapter = this.host.adapter?.();
+        this.retainedContext.synchronize(run, model, context, this.contextObservation, adapter);
+        // This is the final supported SDK stream boundary, including tool-loop
+        // continuations. Supplement the actual request, not the disposable
+        // Agent's history or a host-only reference cache.
+        const requestContext = {
+          ...context,
+          systemPrompt: [...(context.systemPrompt ?? []), this.retainedContext.assemble(run, adapter)],
+        };
+        let firstResponse = false;
+        const events = await stream(model, requestContext, { ...options,
+          onPayload: async (payload, payloadModel, signal) => {
+            const replacement = await options?.onPayload?.(payload, payloadModel, signal);
+            const sent = record((replacement ?? payload) as Json);
+            const reasoning = record(sent?.reasoning ?? null);
+            if (this.request?.id === request.id) this.store.event(run.run_id, "model.request_configuration",
+              "Supported SDK payload hook observed the final request configuration, not provider-effective reasoning",
+              { request_id: request.id, source: "sdk_transformed_payload",
+                model: typeof sent?.model === "string" ? sent.model.slice(0, 120) : null,
+                reasoning_effort: typeof reasoning?.effort === "string" &&
+                  /^(none|minimal|low|medium|high|xhigh|max)$/.test(reasoning.effort) ? reasoning.effort : null,
+                reasoning_field_present: sent !== null && Object.hasOwn(sent, "reasoning") });
+            return replacement;
+          },
+          onSseEvent: (event, eventModel) => {
+            request.usage.observe(event, eventModel ?? model);
+            if (this.request?.id === request.id) {
+              let payload: { [key: string]: Json } | null = null;
+              if (event.data.length <= 65536) {
+                try { payload = record(JSON.parse(event.data)); } catch { /* Provider text is not diagnostic content. */ }
+              }
+              const response = record(payload?.response ?? null);
+              const responseId = typeof response?.id === "string" ? response.id : null;
+              const owner = responseId === null ? undefined : this.responseOwners.get(responseId);
+              const outbound = payload?.type === "response.create" || event.raw.some(line => line.startsWith(": ws →"));
+              const received = !outbound && (owner === undefined || owner === request.id);
+              if (received && !firstResponse) {
+                firstResponse = true;
+                this.store.event(run.run_id, "model.first_response_event", "First received provider SSE event; internal latency components remain unknown",
+                  { request_id: request.id, event_type: typeof payload?.type === "string" &&
+                    /^[a-zA-Z0-9._-]{1,100}$/.test(payload.type) ? payload.type : null });
+              }
+              if (received && owner === request.id &&
+                ["response.completed", "response.done", "response.incomplete", "response.failed"].includes(String(payload?.type))) {
+                const usage = record(response?.usage ?? null);
+                if (usage) {
+                  const output = record(usage.output_tokens_details ?? null), input = record(usage.input_tokens_details ?? null);
+                  const counter = (value: Json | undefined) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+                  this.store.event(run.run_id, "model.response_usage_details", "Optional raw provider counters; absent counters remain unknown",
+                    { request_id: request.id, reasoning_tokens: counter(output?.reasoning_tokens),
+                      cached_input_tokens: counter(input?.cached_tokens) });
+                }
+              }
+            }
+            options?.onSseEvent?.(event, eventModel);
+          } });
         const admission = this.host.requestAdmission;
         if (admission) {
           const iterator = events[Symbol.asyncIterator]();
@@ -353,6 +423,8 @@ export class StrategicPlanner {
         } catch {
           return stop("Run authority revoked");
         }
+        if (this.providerFailed || this.providerAborted)
+          return stop("The previous provider response failed; no continuation is authorized");
         const review = run.status === "reviewing";
         const toolRole = this.speculativeTurn ? "speculative" : review ? "review" : "ordinary";
         agent.setTools(this.host.tools(generation).filter((tool) => isToolAllowed(toolRole, tool.name)));
@@ -406,7 +478,11 @@ export class StrategicPlanner {
         this.host.persist();
       });
       agent.beforeToolCall = (context, signal) => {
-        if (signal?.aborted || !this.current(run, generation))
+        preserveRuntimeToolArguments(context);
+        if (context.assistantMessage?.stopDetails?.type === RECOVERED_PROVIDER_FAILURE)
+          this.providerFailed = true;
+        if (signal?.aborted || !this.current(run, generation) || this.providerFailed || this.providerAborted ||
+          context.assistantMessage && !["stop", "toolUse"].includes(context.assistantMessage.stopReason))
           return {
             block: true,
             reason: "This strategic turn has no remaining tool authority",
@@ -646,7 +722,7 @@ export class StrategicPlanner {
       this.turn = turn;
       void turn
         .catch(() => {
-          if (this.current(run, generation)) this.host.pause(PROVIDER_FAILURE);
+          if (this.current(run, generation)) this.host.pause(PROVIDER_FAILURE, "safety");
         })
         .finally(() => {
           if (this.turn === turn) this.turn = null;
@@ -789,7 +865,12 @@ export class StrategicPlanner {
           bytes += size;
         }
       }
-      const projection = this.host.projectObservation(observation, this.previousObservation);
+      const previous = this.previousObservation;
+      const projection = this.host.projectObservation(observation,
+        previous && previous.world_id === observation.world_id && previous.session_id === observation.session_id &&
+          previous.life.life_id === observation.life.life_id && previous.epoch === observation.epoch &&
+          previous.space.space_epoch === observation.space.space_epoch ? previous : null);
+      this.contextObservation = { profile_id: observation.profile_id, profile_configuration_hash: observation.profile_configuration_hash };
       projectedObservation = observation;
       this.store.event(
         run.run_id,
@@ -880,7 +961,7 @@ export class StrategicPlanner {
         else {
           this.store.event(run.run_id, "runtime.model_observation_failed", "Authorized model observation could not be prepared; no provider request was made", { provider_request_made: false });
           run.model_status = "idle";
-          this.host.pause("Authorized model image/observation preparation failed; inspect platform evidence before resuming");
+          this.host.pause("Authorized model image/observation preparation failed; inspect platform evidence before resuming", "observation_unavailable");
         }
       }
     } finally {
@@ -890,8 +971,9 @@ export class StrategicPlanner {
       if (speculative) agent.setTools(this.host.tools(generation)
         .filter((tool) => isToolAllowed(run.status === "reviewing" ? "review" : "ordinary", tool.name)));
       this.speculativeTurn = false;
-      // prompt has settled, including all paired tool results. Do not retain
-      // raw observations/source/tool echoes while a pending program runs.
+      this.eligibleTools.clear();
+      // Keep no transcript or old effect authority. Compatible bounded docs
+      // and fresh Store projections are owned outside this temporary Agent.
       agent.replaceMessages([]);
     }
     if (!this.current(run, generation)) return;
@@ -920,6 +1002,7 @@ export class StrategicPlanner {
       this.providerFailed ||
       deadlineReached || this.providerAborted
     ) {
+      const pauseCause: RunPauseCause = deadlineReached ? "deadline" : this.providerAborted ? "provider_aborted" : "provider_failure";
       run.model_status = "error";
       this.store.event(
         run.run_id,
@@ -928,11 +1011,13 @@ export class StrategicPlanner {
         {
           turn_id: turnId,
           deadline_reached: deadlineReached,
+          provider_failed: this.providerFailed,
           provider_aborted: this.providerAborted,
+          pause_cause: pauseCause,
           consumed_event_seq: this.contextCursor,
         },
       );
-      this.host.pause(PROVIDER_FAILURE);
+      this.host.pause(PROVIDER_FAILURE, pauseCause);
       return;
     }
     // A host gate can reject the initial request after observation/admission.
@@ -1023,6 +1108,7 @@ export class StrategicPlanner {
   ): void {
     if (event.type === "message_end" && event.message.role === "assistant") {
       const message = event.message;
+      const recoveredFailure = message.stopDetails?.type === RECOVERED_PROVIDER_FAILURE;
       const hostYield =
         message.stopReason === "aborted" &&
         this.gateReason !== null &&
@@ -1031,13 +1117,19 @@ export class StrategicPlanner {
       const plan = request?.planId ? this.host.speculation?.().projection() : null;
       const obsolete = !this.current(run, generation) ||
         Boolean(request?.planId && (plan?.plan_id !== request.planId || !plan.planning_active));
+      this.eligibleTools.clear();
+      if (!obsolete && !hostYield && !recoveredFailure && ["stop", "toolUse"].includes(message.stopReason)) {
+        for (const content of message.content) {
+          if (content.type === "toolCall") this.eligibleTools.set(content.id, { name: content.name, arguments: content.arguments });
+        }
+      }
       if (!hostYield && request) {
         // Host workflow roles outrank visible requested tool categories. This is
         // accounting classification, never a claim about hidden intent or cause.
         const toolCalls = message.content.filter((content) => content.type === "toolCall");
         const toolNames = [...new Set(toolCalls.map((content) => content.name))];
         const improvement = toolCalls.some((call) => call.name === "program_review" ||
-          call.name === "program_write" && call.arguments && typeof call.arguments === "object" && "based_on" in call.arguments ||
+          (call.name === "program_write" || call.name === "program_submit") && call.arguments && typeof call.arguments === "object" && "based_on" in call.arguments ||
           call.name === "program_inspect" && call.arguments && typeof call.arguments === "object" &&
             (call.arguments.view === "feedback" || call.arguments.view === "comparison"));
         const provisionalPurpose = request.purpose;
@@ -1046,7 +1138,7 @@ export class StrategicPlanner {
             : request.role === "recovery" ? "replanning"
               : improvement
                 ? "improvement"
-                : toolNames.some((name) => name === "program_write" || name === "reflex")
+                : toolNames.some((name) => name === "program_write" || name === "program_submit" || name === "reflex")
                   ? "authoring"
                   : "planning";
         if (purpose !== provisionalPurpose) {
@@ -1106,6 +1198,11 @@ export class StrategicPlanner {
             provider_response_id: message.responseId ?? null,
             provider_retry_attempt: message.retryRecovery?.attempt ?? null,
             stop_reason: message.stopReason,
+            provider_failure: recoveredFailure || message.stopReason === "error",
+            recovered_failure: recoveredFailure ? {
+              type: RECOVERED_PROVIDER_FAILURE,
+              explanation: message.stopDetails?.explanation?.slice(0, 500) ?? null,
+            } : null,
             usage_reported: Boolean(message.usage),
             purpose: request.purpose,
             purpose_source: "host_role_and_tools_v1",
@@ -1118,7 +1215,7 @@ export class StrategicPlanner {
         this.request = null;
       }
       if (this.current(run, generation) && !hostYield) {
-        if (message.stopReason === "error") this.providerFailed = true;
+        if (message.stopReason === "error" || recoveredFailure) this.providerFailed = true;
         if (message.stopReason === "aborted") this.providerAborted = true;
       }
       if (message.stopReason !== "error" && message.stopReason !== "aborted") {
@@ -1149,6 +1246,24 @@ export class StrategicPlanner {
         },
       );
     } else if (event.type === "tool_execution_end") {
+      const eligible = this.eligibleTools.get(event.toolCallId);
+      this.eligibleTools.delete(event.toolCallId);
+      if (eligible?.name === event.toolName && !event.isError && this.current(run, generation)) {
+        const parsed = jsonSchema.safeParse(event.result?.details);
+        if (parsed.success) {
+          const value = record(parsed.data);
+          const input = eligible.arguments && typeof eligible.arguments === "object" && !Array.isArray(eligible.arguments)
+            ? eligible.arguments as Record<string, unknown> : null;
+          if (event.toolName === "help") {
+            const topic = typeof input?.topic === "string" ? input.topic : "overview";
+            this.retainedContext.rememberHelp(topic, parsed.data);
+          } else if (["program_write", "program_run", "program_inspect", "program_submit"].includes(event.toolName)) {
+            const selected = event.toolName === "program_submit" ? record(value?.source ?? null) : value;
+            if (typeof selected?.name === "string" && typeof selected.version === "number")
+              this.retainedContext.selectProgram(selected.name, selected.version);
+          }
+        }
+      }
       this.store.event(
         run.run_id,
         "model.tool_finished",

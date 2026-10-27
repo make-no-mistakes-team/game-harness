@@ -25,7 +25,9 @@ import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding
 // All replacements and environment changes live in this isolated subprocess.
 const [requestedMode, rootArg, ownershipArg] = process.argv.slice(2);
 const studyMode = requestedMode?.startsWith("study-") ?? false;
-const mode = studyMode ? requestedMode!.slice("study-".length) : requestedMode;
+const developmentMode = requestedMode?.startsWith("development-") ?? false;
+const mode = studyMode ? requestedMode!.slice("study-".length) : developmentMode ? requestedMode!.slice("development-".length) : requestedMode;
+const customFinish = developmentMode && mode === "custom-finish";
 const planningStalled = mode === "planning-stalled";
 const requestCapNonGoal = mode === "request-cap-non-goal";
 const cancelBeforeIterator = mode === "cancel-before-iterator";
@@ -43,7 +45,7 @@ await writeFile(join(authDirectory, "auth/gameharness.sqlite"), "synthetic facto
 process.env.GAMEHARNESS_DATA_DIR = join(root, "runtime");
 process.env.PATH = `${join(root, "bin")}:${process.env.PATH ?? ""}`;
 process.env.ACCEPTANCE_LIFECYCLE_RELEASE = join(root, "release-render");
-await writeFile(join(root, "bin/ffmpeg"), `#!${process.execPath}\nimport { writeFileSync, existsSync } from "node:fs";\nwriteFileSync("renderer.pid", String(process.pid));\nfunction complete() { writeFileSync("replay.mp4", "synthetic renderer, never visual proof"); process.exit(0); }\n${mode === "complete-persistence" || imageFailure || mode === "request-cap" || mode === "cold-isolation" || planningStalled || requestCapNonGoal ? "complete();" : 'setInterval(() => { if (existsSync(process.env.ACCEPTANCE_LIFECYCLE_RELEASE)) complete(); }, 5);'}\n`, { mode: 0o700 });
+await writeFile(join(root, "bin/ffmpeg"), `#!${process.execPath}\nimport { writeFileSync, existsSync } from "node:fs";\nwriteFileSync("renderer.pid", String(process.pid));\nfunction complete() { writeFileSync("replay.mp4", "synthetic renderer, never visual proof"); process.exit(0); }\n${customFinish || mode === "complete-persistence" || imageFailure || mode === "request-cap" || mode === "cold-isolation" || planningStalled || requestCapNonGoal ? "complete();" : `setInterval(() => { if (process.ppid !== ${process.pid}) process.exit(1); if (existsSync(process.env.ACCEPTANCE_LIFECYCLE_RELEASE)) complete(); }, 5);`}\n`, { mode: 0o700 });
 
 let providerCalls = 0, starts = 0, nextWorlds = 0, sequence = 0, returned = false, lateWrites = 0;
 let startupReservationSeen = false, authReservationSeen = false;
@@ -122,12 +124,14 @@ const stream: StreamFn = (_model, context, options) => {
   hasWood = !imageFailure && mode !== "cold-isolation" && !planningStalled && !requestCapNonGoal && !cancelBeforeIterator;
   const events = new AssistantMessageEventStream();
   const repair = mode === "cold-isolation" && providerCalls <= 2 || requestCapNonGoal && providerCalls === 1;
-  const message: AssistantMessage = { role: "assistant", content: repair ? [{ type: "toolCall", id: crypto.randomUUID(), name: "program_write",
+  const finishing = customFinish && providerCalls === 1;
+  const message: AssistantMessage = { role: "assistant", content: finishing ? [{ type: "toolCall", id: crypto.randomUUID(), name: "task_finish",
+    arguments: { summary: "Synthetic custom completion claim; not independently verified" } }] : repair ? [{ type: "toolCall", id: crypto.randomUUID(), name: "program_write",
     arguments: { name: "slot-private-repair", source: `return {status:"completed",summary:"Unexecuted local repair revision ${providerCalls}",result:null};`,
       card: { purpose: "Local study isolation fixture", applicability: "This isolated slot only", method: "Retain an unexecuted local source revision",
         reason: "Exercise actual run-private repair", limitations: "Not executed; no gameplay efficacy evidence" }, dependencies: [],
       ...(providerCalls === 2 ? { based_on: 1 } : {}) } }] : [{ type: "text", text: "Synthetic local lifecycle response; no network." }],
-    api: model.api, provider: model.provider, model: model.id, stopReason: repair ? "toolUse" : "stop", timestamp: Date.now(),
+    api: model.api, provider: model.provider, model: model.id, stopReason: repair || finishing ? "toolUse" : "stop", timestamp: Date.now(),
     usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
   events.push({ type: "start", partial: message });
   for (const content of message.content) {
@@ -139,7 +143,7 @@ const stream: StreamFn = (_model, context, options) => {
     events.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(content.arguments), partial: message });
     events.push({ type: "toolcall_end", contentIndex: 0, toolCall: content, partial: message });
   }
-  events.push({ type: "done", reason: repair ? "toolUse" : "stop", message }); events.end();
+  events.push({ type: "done", reason: repair || finishing ? "toolUse" : "stop", message }); events.end();
   if (earlyIterator) {
     // This is the actual external stream-acquisition seam. The real Agent's
     // signal is cancelled before its SDK asks the returned iterator for next().
@@ -251,7 +255,11 @@ const commonOptions = { allowNative: true, allowInference: true, authDirectory, 
     runMs: imageFailure ? 8000 : planningStalled ? 15000 : 1000, cleanupMs: 300, authMs: 1000, discoveryMs: 1000,
     startMs: 1000, observationMs: 500, diagnosticsMs: 500, pollMs: 5 } } as const;
 const acceptance = runAgentAcceptance(studySelection ? { ...commonOptions, study: studySelection } :
-  { ...commonOptions, hypothesisId: "synthetic-lifecycle", platformEvidenceRevision: "synthetic-baseline" });
+  { ...commonOptions, ...(developmentMode ? { scenario: undefined, development: {
+    task: customFinish ? "Collect wood, make a table and keep four planks." : "Make a stone pickaxe from the resources around you.",
+    criterion: customFinish ? "custom" as const : "craft_stone_pickaxe" as const, seed: "20261026",
+    start_description: "Synthetic local native seam; no real game/provider" } } : {}),
+    hypothesisId: "synthetic-lifecycle", platformEvidenceRevision: "synthetic-baseline" });
 const trigger = (async () => {
   if (earlyIterator) {
     await earlyIterator.entered.promise;
@@ -259,7 +267,7 @@ const trigger = (async () => {
     earlyIterator.release.resolve();
     return;
   }
-  if (imageFailure || mode === "startup-failure" || mode === "model-mismatch" || mode === "request-cap" || mode === "cold-isolation"
+  if (customFinish || imageFailure || mode === "startup-failure" || mode === "model-mismatch" || mode === "request-cap" || mode === "cold-isolation"
     || mode === "profile-motor-mismatch" || planningStalled || requestCapNonGoal) return;
   const deadline = performance.now() + 2500;
   while (performance.now() < deadline && !await exists(rendererPidFile)) await Bun.sleep(5);
@@ -322,7 +330,7 @@ async function observeResult() {
   await writeFile(join(root, "fixture-result.json"), JSON.stringify({ result, rendererStarted, rendererAlive, starts, nextWorlds, providerCalls,
     attempts, study, startupReservationSeen, authReservationSeen, fixtureConditions, coldIsolation, nextAdmission, report, manifests, journals, lateWrites, unhandled,
     originalIteratorReads, originalIteratorReturns, originalIteratorClosed, returnedBeforeTransportRelease, requestSignalAbortedBeforeRead,
-    postReturnChanges, unchangedAfterReturn: JSON.stringify(before) === JSON.stringify(after) }), { mode: 0o600 });
+    postReturnChanges, unchangedAfterReturn: postReturnChanges.length === 0 }), { mode: 0o600 });
   await Bun.write(Bun.stdout, "ACCEPTANCE_RESULT fixture-result.json\n");
  } finally {
   if (rendererPid === null && await exists(rendererPidFile)) rendererPid = Number(await readFile(rendererPidFile, "utf8"));

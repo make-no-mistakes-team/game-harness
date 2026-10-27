@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "tier": "minecraft-development",
+  "development": {
+    "task": "Place a crafting table as your worksite. After placing it, travel at least six horizontal blocks away, collect two new logs there from natural resources, and return within interaction reach of the table. Then make a second such trip to collect four more new logs and return again. Finish alive, standing on the surface within interaction reach of the table, with at least six logs in your inventory.",
+    "criterion": "custom",
+    "seed": "1",
+    "start_description": "Fresh disclosed curated seed 1, Normal Survival, ordinary fresh spawn, empty inventory and fresh programs/experience; not a restored matched save. Native assisted RGB/360 radius-8 observation, balanced motor and accepted refined visible inventory. No supplied resources, coordinates, programs, strategy or manual gameplay assistance.",
+    "reasoning": "low"
+  },
+  "inference_reasoning": {
+    "condition": "explicit_supported_effort",
+    "requested_effort": "low",
+    "evidence": "Declaration only; actual serialization is recorded by the per-request SDK onPayload event, not inferred from motor profile."
+  },
+  "model_id": "gpt-6-luna",
+  "hypothesis_id": "named-sdk3-natural-wood-20261022",
+  "outcome": {
+    "platform_status": "pass",
+    "agent_status": "unknown",
+    "provider_status": "ok",
+    "goal_verified": null,
+    "classification_reason": [
+      "goal_evidence_unavailable",
+      "planning_stalled"
+    ]
+  },
+  "usage": {
+    "schema_version": 2,
+    "admissions": 30,
+    "reported_messages": 30,
+    "uncached_input": 490559,
+    "cache_read": 261248,
+    "cache_write": 0,
+    "output": 20571,
+    "reported_subtotal": {
+      "uncached_input": 490559,
+      "cache_read": 261248,
+      "cache_write": 0,
+      "output": 20571
+    },
+    "event_coverage": "complete",
+    "consumption_coverage": "known",
+    "consumption_scope": "observed_logical_admissions",
+    "wire_attempts": null,
+    "subscription_cost": null
+  },
+  "verification": null,
+  "completion_claim": "custom_not_completed_unverified",
+  "evidence": "run-c14c3ac9-5e66-4a85-a2dc-07e360782ab8-evidence.json"
+}

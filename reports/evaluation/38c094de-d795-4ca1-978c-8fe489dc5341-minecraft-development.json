@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "tier": "minecraft-development",
+  "development": {
+    "task": "Make a stone pickaxe from nearby natural resources, and leave a crafting table placed on the ground.",
+    "criterion": "custom",
+    "seed": "1",
+    "start_description": "Fresh declared curated seed 1, Normal Survival, empty inventory, fresh programs and no inherited experience. Same selected Sol/account, balanced motor, disclosed assisted camera-independent local observation plus own-body mechanical receipt feedback. Updated native build/contracts frozen in g1-movement-followup-declaration-2026-10-26.json. No fixture solution, supplied resources, coordinates, night vision or manual assistance."
+  },
+  "model_id": "gpt-6.1-sol",
+  "hypothesis_id": "named-sdk3-natural-wood-20261022",
+  "outcome": {
+    "platform_status": "pass",
+    "agent_status": "unknown",
+    "provider_status": "ok",
+    "goal_verified": null,
+    "classification_reason": [
+      "goal_evidence_unavailable"
+    ]
+  },
+  "usage": {
+    "schema_version": 2,
+    "admissions": 13,
+    "reported_messages": 13,
+    "uncached_input": 214739,
+    "cache_read": 55936,
+    "cache_write": 0,
+    "output": 5626,
+    "reported_subtotal": {
+      "uncached_input": 214739,
+      "cache_read": 55936,
+      "cache_write": 0,
+      "output": 5626
+    },
+    "event_coverage": "complete",
+    "consumption_coverage": "known",
+    "consumption_scope": "observed_logical_admissions",
+    "wire_attempts": null,
+    "subscription_cost": null
+  },
+  "verification": null,
+  "completion_claim": "model_reported_unverified",
+  "evidence": "run-7f8202b2-2325-41c6-9e8d-361c357be803-evidence.json"
+}

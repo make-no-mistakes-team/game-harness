@@ -2,19 +2,17 @@
 
 - Write all repository documentation in English.
 - When creating or editing GitHub issues, write their descriptions in Russian.
-- Before creating or editing Markdown documentation, read and apply the `sepia` skill.
+- Before creating or editing Markdown documentation other than `AGENTS.md`,
+  read and apply the `sepia` skill.
 - For `README.md`, also read and apply `crafting-effective-readmes`.
 - These skill requirements are optional for Markdown files kept local and untracked.
 - Before writing or editing GitHub issue titles or descriptions, read and apply `sepia`.
+- Before editing agent instruction files, read and apply `writing-for-agents`.
+  For `AGENTS.md`, this is the only required writing skill; `sepia` is not required.
 - Keep useful instructions, requirements, and verified facts; remove repetition and material that does not help the reader.
 
-### Product framing and source boundaries
+### README scope
 
-- Describe GameHarness as an extensible harness for multiple supported games.
-  Minecraft is the first integration, not the product's permanent identity.
-  Keep game-specific setup, mechanics, rendering, and verification in explicitly
-  scoped adapter sections. Adding another game requires an adapter and evidence;
-  extensibility does not mean automatic support for arbitrary games.
 - Keep `README.md` a concise product entry point: purpose, essential prerequisites,
   installation and launch commands, and documentation links. Put interface
   walkthroughs, button behavior, lifecycle explanations, feature inventories, and
@@ -22,62 +20,21 @@
   Retain setup and safety instructions needed before the app can be used.
   Omit development progress, unfinished-feature lists, prototype history, and
   passed or unpassed MVP/release milestones.
-- Record implementation status, limitations, acceptance gates, and verification
-  evidence in the relevant technical documents. Distinguish requirements,
-  implemented behavior, observed results, and historical snapshots. A successful
-  build, selected fixture, or model response is not proof of gameplay success,
-  full-suite coverage, or a measured improvement.
-- Keep general architecture language-agnostic at component seams. Describe
-  concrete languages and game integrations in their own modules; replacing a
-  performance-critical implementation must not require changing the agent
-  runtime, skill format, or game-adapter contract.
+
+### Private material
+
 - Keep private plans, team/course details, credentials, worlds, and run evidence
   under locally excluded storage. Public documentation must not expose or link
   to `local/`. A checkout-local Git exclusion does not sanitize archives or
   already tracked files.
-- When the user designates a design dialogue as requirements, treat unchallenged
-  proposals as accepted and later replacements as superseding earlier proposals.
-  Preserve archived dialogues verbatim in their original language; write new
-  summaries in English. Dialogue claims about third-party APIs or performance
-  still require source evidence or actual measurements.
-- A user-designated research or design source takes precedence over conflicting
-  project design and workflow rules. Reconcile those rules when the user
-  authorizes the change; keep factual claims separate from requirements and
-  preserve private-source publication boundaries.
-- When a decision changes, reconcile affected documentation and examples instead
-  of accumulating contradictory descriptions. Preserve useful historical
-  evidence with its original scope; do not present it as current verification.
-- Keep the approved ordinary-module, disclosed-helper, RGB-profile, prepared
-  development-task, checkpoint-recovery and explicit compatible cross-model
-  reuse requirements distinct from the current compact-body implementation.
-  Jev is optional; the first complete autonomous chain must work without it.
-  Current limits and unavailable modes belong in implementation sections,
-  not as permanent reductions of the product requirements.
-- Before editing agent instruction files, also read and apply
-  `writing-for-agents`.
 
-## Verification and live evaluation
+## Manual gameplay review
 
-Before selecting checks, diagnosing a live model failure, changing evaluation
-limits or models, or reporting cost/results, read and follow the canonical
-[verification and live-evaluation policy](docs/learning-and-evaluation.md#verification-and-live-evaluation-policy).
-
-- Workers hand off edits without running checks, builds, providers or services.
-  The parent runs the smallest affected checks after handoff and a combined final
-  regression/build only when relevant inputs changed.
-- Preserve platform results and agent outcomes independently. Diagnostic live
-  attempts stop after two unsuccessful attempts on one technical hypothesis
-  unless concrete new platform evidence authorizes another attempt; a
-  prompt/model change alone does not reset the limit. Predeclared finite
-  experimental cohorts use the separate study-admission rules in the canonical
-  policy, retaining every scheduled outcome rather than stopping at a preferred
-  result or relabeling diagnostic retries.
-- Use a registered immutable manifest and assigned slot for study execution.
-  Admission-only mode exercises governance without a model or game; initial
-  live study support is cold fresh-world whole-agent execution. Read the
-  canonical policy's capability limits before selecting another condition.
-- Record finite limits and actual usage before making claims. Retain failed
-  attempts and unknown costs; never repeat a paid control just to obtain a pass.
+After each non-trivial change intended to improve an agent's in-game behavior,
+explicitly ask the user to manually review the resulting gameplay. You may
+inspect gameplay and compare metrics yourself, but treat your conclusions as
+provisional. The final judgment that the change improved behavior must be based
+on the user's manual visual review.
 
 ## Tooling and dependencies
 
@@ -124,8 +81,3 @@ diff and run a secret scanner; `.gitignore` and a clean scan alone are not
 sufficient. Repeat the review if the publication changes. Resolve confirmed
 findings before pushing; if safe publication is uncertain, stop and report the
 blocker without exposing the sensitive data or rewriting shared history.
-
-Delivery is complete only after the push succeeds, including any required Git
-LFS uploads. Report the branch, commit hash, and push result. If publication is
-blocked, state the blocker and that the changes remain local; a local commit
-alone does not make the work available to teammates.

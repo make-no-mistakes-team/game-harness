@@ -25,15 +25,189 @@ An authorized image/observation preparation failure is a confirmed platform faul
 
 The active adapter boundary selects an exact `{adapter_id,goal_id,parameters,verifier:{id,version}|null}`. Runtime and independent acceptance call the same registered `verifyCompletion(manifest,events)` interpreter with distinct manifest objects, accumulated evidence and authority; acceptance never reads Runtime's verdict as independent proof. Results retain the exact adapter/verifier version, `verified|failed|incomplete|unknown`, reason and evidence refs. Only `verified` establishes the goal. Custom `task_finish` remains explicitly model-reported/unverified.
 
-Minecraft current criteria are `minecraft_possession_v2`, `minecraft_collection_craft_v2` and `minecraft_block_removal_v2`. Crafting requires authoritative own production evidence and retained fresh alive possession, not universal `action.kind==="craft"` or possession alone. The current native recipe helper is one real evidence producer; this does not invent a GUI producer. The combined criterion preserves prior own wood acquisition through authoritative pre-consumption inventory when logs were consumed between independent polls. Baseline/world/session/epoch/boot, current life and observation freshness remain enforced. Original `natural_inventory_v1` / `natural_collection_craft_v1` schema2 reports and predicate readers remain explicitly historical and unchanged in meaning.
+Minecraft current criteria are `minecraft_possession_v2`, `minecraft_collection_craft_v2` and `minecraft_block_removal_v2`. Crafting requires authoritative own production evidence and retained fresh alive possession, not universal `action.kind==="craft"` or possession alone. Native recipe execution now uses visible inventory/crafting screens; its server-confirmed production evidence feeds the existing verifier. Visible gestures alone do not prove production. The combined criterion preserves prior own wood acquisition through authoritative pre-consumption inventory when logs were consumed between independent polls. Baseline/world/session/epoch/boot, current life and observation freshness remain enforced. Original `natural_inventory_v1` / `natural_collection_craft_v1` schema2 reports and predicate readers remain explicitly historical and unchanged in meaning.
 
 The registered whole-agent study profile is the actual observation3 descriptor with complete materialized configuration, schema/build/capability hashes and actual native motor settings; its verifier source is `src/server/minecraft-adapter.ts`. A changed profile/build/source is a new immutable declaration, not a rewritten earlier study. Released-policy-reference admission is a separate already-declared variant with its own original-RGB/schema1 profile; it does not inherit the Minecraft structured profile or weaken whole-agent provider/request gates.
 
 ### Current native verification
 
+The delivered workflow has three distinct evidence layers:
+
+| Layer | Exercised boundary | Limit |
+| --- | --- | --- |
+| Zero-provider native mechanics | Runtime → isolated worker → Minecraft: both crafting grids, held-stack distribution, transfers, hotbar/implicit placement equip, partial-distribution interruption and custody checks | Evaluator-authored setup and procedures, not autonomous gameplay |
+| Result and continuity integration | Real worker/native execution with compact terminal results; genuine terminal overflow after an effect; explicit Pause/Resume and a disclosed synthetic provider interruption with fresh observations | Supports these mechanisms, not a live-provider outage or transparent process/world restoration |
+| Reviewed actual-model task | Sol established its own table, collected two new distant logs and returned, then collected four additional distant logs and returned alive on the surface | One descriptive custom episode; independent clause assessment does not create an automatic verifier |
+
+The final 203.44-second episode used explicit supported low reasoning, fresh
+seed `1` Normal Survival, empty inventory and fresh programs/experience,
+`minecraft_assisted_rgb_360_r8_v1`, balanced motor, visible inventory and
+single-dispatch SSE. Its prospective caps were 30 logical admissions,
+360,000 ms gameplay and 900,000 ms total. It stopped through `task_finish`
+with platform pass/provider ok/custom model-reported-unverified and seven logs
+retained. Independent observations, native receipts, the stopped save and
+footage support each requested acquisition window and both original-site
+returns. The initial leftover setup log was excluded from the trip gains.
+
+All 6,082 delivered frames were retained. This is not every native render;
+capture/state are unsynchronized and audio is absent. All request owners
+drained and native processes closed. Earlier failed attempts remain retained.
+
+Compact results avoided the preceding terminal `output_limit`: five non-null
+results were 186–744 UTF-8 bytes before their envelopes. Reuse was narrower than
+intended: local walking helpers and two actual revisions were used, but the
+four-log trip received new source even though the successful two-log source,
+argument sample and outcome were present in the actual model request.
+Changed-quantity gathering reuse was not demonstrated.
+
+Two partially applied navigation operations remained unknown, fenced and
+reconciled before fresh model-authored approaches. No safely settled failed
+action exercised same-program refusal recovery; generated wrappers still
+checked status before adopting returned observations. The task-independent
+postcondition-first example is guidance and tested control flow, not proof that
+the gameplay model followed it.
+
+Pacing did not improve against the preceding accepted episode: 11 versus nine
+logical admissions, 100.825 versus 91.213 seconds in model-admission spans,
+and an 18.604 versus 16.586-second longest action-free interval. Seven source
+submissions occupied 84.481 seconds. Fresh canopy versus surface starts and
+different decisions prevent a controlled causal comparison. Provider queuing,
+reasoning, generation and network shares remain unclassified. Reported cache
+usage does not establish a caching improvement.
+
+The following snapshots retain earlier source/build cohorts and failures;
+their pending gates describe those dates, not current scheduling instructions.
+
 The current hello3/API4 eight-case Runtime/Store/Docker planning baseline passed with confirmed cleanup and zero provider calls. Real native checks exercised matching and incompatible descriptor negotiation, the JavaScript safe-integer endpoint through Java application/receipts, replacement-target rejection and dimension changes that preserve life. A selected continuation passed after correcting its fixtures: an actual player-relative one-block teleport fenced queued old-space work without erasing the preceding unknown effect, and distinct instances of the same screen class rejected stale view preconditions. Explicit null-screen admission was checked in host/Java regressions and in a live queue that began with the view closed. Earlier failed reports retain their original outcomes and build identities.
 
 The actual recording proof also passed with confirmed cleanup and no provider calls. Independent inspection found 139 indexed frames and 139 present PNGs with valid signatures, matching 139 delivered and stored frames. A preview of the 4.7-second replay showed the alive HUD, death menu and respawn HUD. Frame/state timing remains unsynchronized, audio is absent, and upstream renders may be omitted. These results establish the exercised native control, lifecycle and recording boundaries; they do not establish model gameplay efficacy, a general GUI input primitive, desktop control or another supported game.
+
+The 2026-10-26 delivery slice separately exercised empty-inventory wood-to-table, placement/wooden-pickaxe and stone-pickaxe mechanics through real Runtime/Docker/native execution. The stone fixture retained a stone pickaxe with independent production-and-possession verification. These procedures and their dry platform/resources were evaluator-authored and disclosed.
+
+Two bounded actual-model development episodes then used fresh curated natural starts, no supplied program or inventory, and continuous Survival time. Luna's wood/table task acquired neither wood nor a table before its five-minute limit. Sol's different custom request autonomously acquired wood, crafted planks and a table, placed the table, crafted/equipped a wooden pickaxe, and revised its own procedure after an uncertain approach. Fresh independent observations retained the wooden pickaxe and showed the placed table. Stone acquisition remained incomplete; a later provider rate-limit error ended the attempt. Custom completion stayed unverified. Both unsuccessful outcomes and uncut recordings remain retained; changed model/start conditions do not establish comparative improvement or generalization.
+
+A later single, legitimately admitted Sol follow-up used the corrected native
+build, the same selected account/assisted balanced profile, fresh seed `1` and the
+explicit single-dispatch SSE condition. An owned-server craft receipt confirmed
+stone-pickaxe production; fresh final evaluator observations retained that tool
+and the table placed on grass. The model called `task_finish`, but the declared
+custom goal remained model-reported/unverified: platform pass, provider ok,
+agent unknown, `goal_verified:null`. The run used 20 logical admissions and 42
+actions, including two unknown outcomes and one stale-target rejection. Sol
+authored recovery from a blocked excavation approach and volatile item handles;
+frequent pickup turns and roughly 23–37-second action-free gaps remained. This
+one episode does not establish general task competence, human-like movement or
+a measured improvement. The earlier Luna failure and provider-interrupted Sol
+partial result, including unknown consumption, are not replaced.
+
+The episodes exposed a repair-admission conflict after immutable outcome assessment and, in a quick custom-task integration check, lazy SQLite closure. The corrections permit separately linked immutable child revisions and explicitly finalize Store statements before strict close. They preserve prior assessments, usage uncertainty, effect fences and existing attempt counts.
+
+The subsequent pacing slice adds bounded run-owned context at the actual SDK
+stream boundary and an explicit ordinary-only immutable `program_submit`.
+Offline installed-Agent checks exercised next-turn and recreated-Agent requests,
+compatible source/help retention, fresh observations, incompatible-contract
+invalidation, cold-run isolation and failed-response tool ineligibility.
+Store/tool checks exercised exact-version submission, duplicate delivery,
+lost acknowledgements and authority loss between saving and starting.
+These checks establish request/admission behavior, not faster model decisions.
+The ordinary strategist also rejects the installed SDK's recovered
+`stream_interrupted_after_content` tool turn; completed streamed arguments
+from that failed response cannot become effects or retained documentation.
+Private journals distinguish preassembly context from the supplemented
+context actually delivered to the SDK stream. Neither record is a wire
+payload or evidence of provider-internal attempt counts.
+
+A selected zero-provider Runtime/Docker/native fixture then used `program_submit`
+for one root. The evaluator removed a prepared drop before application; native
+rejected its stale handle without camera/world effects and confirmed
+neutralization. The same root reobserved, selected a different prepared drop
+and received an authoritative one-cobblestone pickup receipt. Cleanup passed.
+This proves bounded recovery after a safely settled no-effect refusal, not
+recovery from unknown effects or autonomous task strategy. Native certainty,
+reach, inventory behavior and life/space/target checks were unchanged.
+
+The one finite pacing follow-up used the same Sol/account, seed, assisted
+balanced profile and unchanged native inventory behavior. It made a table
+and wooden pickaxe, collected stone, then failed to escape its excavation
+before the five-minute limit. No stone pickaxe was crafted; independent
+inspection of the stopped-server save retained the placed table. Platform
+passed with cleanup confirmed; custom goal and provider status stayed unknown
+after deadline cancellation. Thirteen admissions included one help and ten
+combined submissions, with no run-only request. First movement began at
+17.668 seconds versus 37.397 in the retained successful episode, and the
+longest measured action-free gap was 22.475 versus 37.397 seconds. Total
+admission time remained about 159 versus 156 seconds. These are descriptive
+observations from different fresh episodes, not causal improvement or task
+reliability evidence. The attempt is consumed; no automatic repeat follows.
+
+The subsequent focused movement correction preserves that failure. Native
+feedback now states the unchanged navigation envelope and distinguishes raw
+input completion from grounded/net progress. Placement preflight checks the
+requested face and vanilla collision/placement state before equipment or
+interaction dispatch; sent but unconfirmed effects still fence the owner.
+Bounded model-authored subgoal, worksite, resource and obstruction notes remain
+available across ordinary turns without restoring stale target authority.
+
+Selected zero-provider Runtime/Docker/native fixtures demonstrated ordinary
+one-block ascent, bounded termination under an own-column ceiling, underfoot
+and corner-collision placement refusals, an invisible-face refusal, permitted
+adjacent placement and an observed target outside navigation's initial bound.
+A translated minimal reproduction of the failed tunnel's final bottleneck
+first retained three ineffective jump bursts, then mined the observed
+own-column ceiling through ordinary controls and reached a stable standing
+position one block higher. It does not prove return from the entire shaft to
+the surface. The evaluator supplied the pickaxe; a separate readable recording
+used disclosed night vision without changing collision or movement rules.
+These are mechanical fixtures, not model intelligence or human gameplay approval.
+
+The first fixture continuation failed because forward input followed a turning
+camera after overhead mining; a completed ordinary `look` before movement
+corrected that fixture. Two navigation fixture preparations did not project
+their intended target; a separate observable-log case passed. Those failed
+captures remain evidence, not passing cases. Selected successful continuations
+do not convert the first combined report into a full-suite pass.
+
+One newly authorized prospective episode then retained a stone pickaxe and
+left its own crafting table on supported ground, independently checked through
+native receipts and the stopped world/player save. It ended through
+`task_finish`; runtime labels remain platform pass, provider ok and custom
+model-reported/unverified. The model entered another shaft, recognized its
+rim/reach problem, and later used model-authored jump/use with fresh settled
+height checks after an uncertain targeted interaction was fenced and
+reconciled. It reached a usable crafting position at Y68, not the original
+Y70 surface, and finished with an empty selected hand.
+
+The 188.560-second recording retains 13 admissions and 44 admitted actions.
+Admission spans total 122.572 seconds, but first movement took 22.644 seconds
+and the longest action-free gap was 32.147 seconds. These mixed descriptive
+results do not establish causal speedup or general recovery reliability. A
+generated navigation range below the declared minimum was rejected before
+native admission but misleadingly reported as a backend failure; offline
+schema/error-boundary reproduction confirms that remaining feedback defect.
+Both earlier outcomes and this consumed allocation remain retained. At that
+snapshot the gameplay review and visible-inventory work were still pending;
+later delivered behavior is described above.
+
+Earlier zero-provider M1 probes reproduced overhead travel circling and
+adjacent excavation failures through Runtime, Docker and native Minecraft with
+concurrent observation polling. Instrumented failures distinguished omitted
+projection membership from a still-current target incarnation while the client
+predicted air and the server-removal receipt had not arrived. The first corrected
+native proof passed nine cases: explicit interaction arrival and direct mining,
+unchanged full-3D position nonarrival, an out-of-reach overhead target, adjacent
+stone acquisition and grass/dirt mining during polling, blocked-route feedback,
+active replacement and a new action using the replaced handle. The stone case
+retained two cobblestone after two authoritative removals, with 70 observations
+spanning an active motor. All owners drained. These are prepared,
+evaluator-authored mechanics results, not model task success or human approval
+of the resulting camera behavior. A later selected continuation, after
+short-circuiting unnecessary reach probes, confirmed overhead arrival and
+out-of-reach rejection, rejected entity interaction arrival without movement or
+camera effects, and replaced a target only after observation-bracketed native
+diagnostics witnessed emitted world input. That interrupted dig remained
+`unknown`, the replacement remained intact, and a new action on the old handle
+was rejected. The selected continuation does not replace the earlier full proof
+or claim that every case was rerun on its artifact.
 
 The zero-inference entries are `GAMEHARNESS_NATIVE_PROOF=1 bun scripts/native-game.ts --allow-native`, `GAMEHARNESS_NATIVE_PROOF=1 bun scripts/native-contract-game.ts --allow-native`, and `GAMEHARNESS_NATIVE_PROOF=1 bun scripts/native-recording-proof.ts --allow-native --jar native/minecraft/build/libs/gameharness-native-1.0.0.jar`. They require an explicitly rebuilt, fresh Java21 artifact. The contract driver accepts exact `--case` selections for scoped continuations; a selected result does not replace a full earlier report. Pure Java proofs, synthetic transport tests and renderer preflight remain separate from live-hook evidence.
 
@@ -113,6 +287,42 @@ The workflow does not configure branch protection: results are informational unl
 ### Evaluation entry points
 
 Read `bun run evaluate --help` for tier entry points and explicit native/inference opt-ins. Native tiers require an existing fresh built JAR and stop on a stale artifact rather than rebuilding it. `authorize-evidence` records a justified concrete evidence revision; it is not permission to rename a hypothesis after a prompt/model change.
+
+`bun scripts/native-minecraft-mechanics.ts --allow-native --jar <fresh-built.jar>` exercises approach, mining, own pickup, planks and a retained crafting table through Runtime, a Docker worker and native effects, with zero inference. `--case tool` extends through table placement and a wooden pickaxe; `--case stone` adds a disclosed stone outcrop, equipment, cobblestone collection and a retained stone pickaxe. `--case repair` first assesses a blocked parent, then revises and executes its child through the same production tools. Setup supplies a dry platform and resources, clears inventory and fixes daylight; the evaluator authors every procedure. Recordings and consequences establish mechanics and repair plumbing only.
+
+`--case approach --mode baseline` retains observed approach/excavation faults
+without treating evidence capture as semantic success.
+`--case approach --mode fixed` asserts the corrected positive/negative
+cases with real parent-side observation polling during native effects.
+Optional `--stages <comma-separated names>` runs a disclosed selected
+continuation, not the full proof. Each stage retains receipts, polling witnesses
+and an uncut recording; privileged setup occurs between drained runs, except
+the explicitly declared active-replacement negative.
+The focused movement stages are `ascent`, `headroom`, `excavation`,
+`placement-collision`, `placement-corner`, `placement-face`,
+`placement-adjacent` and `navigation-envelope`. `excavation` discloses
+evaluator-only night vision for legible footage. Its three unsuccessful bursts
+and subsequent terrain change are authored by the evaluator and are never
+supplied to a model episode as a solution.
+
+`bun scripts/minecraft-development.ts --help` describes the thin finite Minecraft development entry. It reuses acceptance's Runtime, diagnostic AttemptLedger, pre-transport request admission, model evidence, episode recorder and cleanup. Declare plain task text, an optional registered `--criterion` (default `custom`), a fresh `--seed`, start disclosure, the existing account directory, an explicit image-capable model, and finite limits. It supports fresh Normal Survival with empty inventory and continuous time, not prepared/restored saves or setup commands. Seed curation must be disclosed. Custom `task_finish` remains model-reported/unverified; a stone-pickaxe request must explicitly select `craft_stone_pickaxe`, not the table criterion. This entry preserves existing diagnostic counts and does not create a study allowance.
+
+Diagnostic acceptance/development can explicitly select
+`--single-inference-dispatch`. This disclosed condition uses direct Codex SSE,
+one pre-response attempt and a request-owned fetch fence shared by SDK recovery
+and authentication replay. It rejects enabled `PI_CODEX_WEBSOCKET` and surfaces
+redirects without following them, while retaining selected-account authority
+and owned cleanup. The report records the condition before inference. SDK
+recovery may schedule before reaching the fence, but cannot make another host
+inference HTTP dispatch. Terminal errors retain the original SDK-parsed status,
+category and retry delay when available, including after partial output.
+Completed but unexecuted tool calls from a failed request are rejected rather
+than promoted by SDK transient-error recovery; their original streamed evidence
+remains in the private journal.
+Truncated streams without an error frame retain unknown provider status and
+consumption. Ordinary defaults and frozen studies remain unchanged. The limit
+covers host HTTP dispatches under standard fetch/manual-redirect semantics, not
+provider-internal attempts or independently retrying custom fetch implementations.
 
 Use `register-study --manifest <private-study.json>` before `study --study <id> --manifest <same-file> --slot '<JSON slot>'`. The slot names the registered study, arm, initial-state identity and repetition. Add `--admission-only` only for an admission-only declaration; it rejects native, inference, auth, JAR, model and budget flags. Live study execution requires both resource opt-ins and the existing auth directory, and checks the manifest, actual supported artifact and static compatibility before reserving the slot.
 
@@ -354,7 +564,7 @@ Classify apparent pauses from measured `native_action`, `dispatch`, `receipt`, `
 
 Compare actual confirmed block removals, receipted own inventory deltas, target-ID and target-position switches, sampled/receipted travel and rotation, timings, outcomes and sample counts. Extra blocks are not categorically waste: enabling access, movement and other legitimate work can require them. Do not infer tree membership from unrelated target handles or label a target change mistaken without authorized evidence.
 
-Durable deduplicated death/failure/outcome opportunities reach the same strategic model. It inspects named source/feedback/trace through `program_inspect`, authors its own candidate and uses `program_write` with exact `based_on` plus a bounded experiment `reason` to link the actual revision to matching parent feedback. The host supplies exact evidence identities. If no revision is chosen, `program_review` records `keep` or `insufficient_evidence` with the reason; no bookkeeping-only second inference is required for a performed revision.
+Durable deduplicated death/failure/outcome opportunities reach the same strategic model. It inspects named source/feedback/trace through `program_inspect`, authors its own candidate and uses `program_write` with exact `based_on` plus a bounded experiment `reason` to link the actual revision to matching parent feedback. The host supplies exact evidence identities. If no revision is chosen, `program_review` records `keep` or `insufficient_evidence` with the reason; no bookkeeping-only second inference is required for a performed revision. Either assessment permits a later repair: the original resolution stays immutable, and `learning.candidate_written` separately retains the new candidate's exact lineage, outcome evidence and reason. No review call is required before authoring.
 
 A changed version is an unmeasured candidate until execution evidence exists. The comparison view exposes actual source/card differences and before/after raw samples with `descriptive_only_no_causal_improvement_claim`; even measured candidates are not automatically proven better. Decisions record experimental disposition, not confidence in improvement. Eligibility and promotion remain separate; missing samples, invalid linkage and trace omissions remain explicit.
 
@@ -505,7 +715,7 @@ Finer JS-only versus Jev-only versus mixed-policy comparisons, or asynchronous-v
 
 ## Minecraft reference evaluation profile
 
-Minecraft Java **1.21.4**, **Normal Survival**, one avatar, ordinary death/inventory rules, and no agent cheats/operator powers are the first integration's compatibility target. These are planned conditions, not tested compatibility claims. Current implementation uses `player-observable-structured`, version 1, defined by the [runtime contracts](runtime-contracts.md#player-observable-structured-profile-v1); the required perception target distinguishes assisted RGB/frustum and assisted RGB/360 conditions from a later strict-visual condition. Information permission is independent of delivery: the application supplies [authorized typed actor PNGs](runtime-contracts.md#delivered-actor-images-and-recorded-episodes) alongside structured state. The current PNG/schema-2 path does not establish complete profiles/audio or capture alignment, and does not make the required assisted-profile work optional for the first-playable gate.
+Minecraft Java **1.21.4**, **Normal Survival**, one avatar, ordinary death/inventory rules, and no agent cheats/operator powers are the implemented first integration's tested conditions for the scoped episodes above. Its profile is `minecraft_assisted_rgb_360_r8_v1`, defined by the [runtime contracts](runtime-contracts.md#player-observable-structured-profile-v1), with observation envelope 3 and hash-bound effective configuration. The broader perception requirements also distinguish assisted RGB/frustum and strict-visual alternatives; those conditions remain separate from delivered support. Information permission is independent of delivery: the application supplies [authorized typed actor PNGs](runtime-contracts.md#delivered-actor-images-and-recorded-episodes) alongside structured state. Audio and synchronized capture are not implemented by this profile.
 
 The profile permits bounded nearby unobstructed objects independent of camera direction, own status/inventory/UI, normal F3 coordinates, public recipes/docs and world-local memory. Freeze actual finite observation/query limits in manifests. Hidden resources/structures, exact live concealed entity state, seeds, saves, evaluator state, raw native world/chunk/entity access and video buffers cannot enter agent observations, logs, errors, retrieval or libraries. Last-seen memory stays stale; only real audio yields coarse sound signals. Filter before counts, ordering, truncation and errors; unobserved means unknown.
 
@@ -521,7 +731,7 @@ Practice and evaluation start from fresh ordinary spawn with ordinary starting i
 | Sustained progression | In a declared longer horizon, remain operational and achieve the predeclared next prerequisite milestones toward full completion | Exposes repeated decisions, useful waits, adaptation, deaths, and policy revisions beyond one craft |
 | Full completion | Autonomous Ender Dragon defeat from fresh spawn, with evidence of the whole run and any interruptions | Retains a distinct long-horizon objective rather than treating an early tool as completion |
 
-The trusted Minecraft verifier establishes these predicates from authoritative game evidence, isolated from agent observations. If the dragon is not defeated, report the furthest verified milestone, elapsed exposure, deaths, interventions, failure causes, and remaining objective. A bounded task does not substitute for the Dragon objective; workflow readiness and full-completion status must remain separately reportable.
+Select an actually registered verifier for each supported predicate, or declare the task custom and retain model-reported completion separately from independent assessment. The current bounded verifiers do not establish sustained progression or Dragon defeat. If the dragon is not defeated, report the furthest verified milestone, elapsed exposure, deaths, interventions, failure causes, and remaining objective. A bounded task does not substitute for the Dragon objective; workflow readiness and full-completion status must remain separately reportable.
 
 Use evaluator-owned seed groups for practice, comparison and held-out evaluation under the separation rules above. An eventual release comparison must predeclare its sample, seed groups, order and per-run horizon; no historical sampling proposal authorizes an immediate live batch. Current engineering acceptance follows the [shared attempt and stopping policy](#attempt-admission-and-stopping). Hidden seed values may remain withheld during held-out evaluation, but retain them privately for reproducibility.
 

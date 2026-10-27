@@ -4,7 +4,7 @@ GameHarness is a desktop harness where AI agents write and improve their own gam
 
 ## Quickstart
 
-Requires Linux x64, Bun **1.3.14+**, Node.js **24+**, a selected **JDK 21**, `flock` and a local Docker Engine. Complete the [setup prerequisites](docs/integration-spike.md#install-and-start), including legitimate game access, before building. Fedora users should first follow the [Fedora setup](docs/integration-spike.md#fedora-linux-x64).
+Requires Linux x64, Bun **1.3.14+**, Node.js **24+**, a selected **JDK 21**, Python 3 with `python3-dbus`, `flock` and a local Docker Engine. Complete the [setup prerequisites](docs/integration-spike.md#install-and-start), including legitimate game access, before building. Fedora users should first follow the [Fedora setup](docs/integration-spike.md#fedora-linux-x64).
 
 From a fresh clone:
 

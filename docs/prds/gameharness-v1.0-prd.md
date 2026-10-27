@@ -1,6 +1,6 @@
 # GameHarness 1.0 product requirements
 
-Status: release acceptance specification for the implemented desktop/native/program direction. The [integration guide](../integration-spike.md) distinguishes current code, old-spike evidence and outstanding native gameplay proof. Unchecked criteria remain unpassed; implementation is not acceptance evidence.
+Status: release acceptance specification, broader than the delivered bounded Minecraft workflow. The [integration guide](../integration-spike.md) records supported setup, current gameplay evidence and historical cohorts. The reviewed two-trip custom task establishes a narrow end-to-end result, not completion of every release criterion below. Unchecked criteria remain open unless their full evidence requirement is met.
 
 ## Product goal
 
@@ -8,7 +8,7 @@ GameHarness is a standalone desktop application for configuring, watching and su
 
 The product supports game integrations through explicit adapters. An adapter supplies a game's observation profile, bounded action capabilities, live view, task verification, and supported lifecycle operations. Generic orchestration handles planning, scheduling, policy execution, persistence, providers, and operator controls. Adding another game requires an adapter and evidence that it conforms to those contracts; there is no claim of automatic or zero-configuration universal support.
 
-Minecraft is the first planned complete reference integration. Its concrete requirements appear in the [Minecraft profile](#first-reference-integration-minecraft). A second implemented game is not a prerequisite for this release, and Minecraft-specific mechanics must not become mandatory core schemas.
+Minecraft is the first implemented integration and the reference for the complete-integration requirements. Its concrete requirements appear in the [Minecraft profile](#first-reference-integration-minecraft). A second implemented game is not a prerequisite for this release, and Minecraft-specific mechanics must not become mandatory core schemas.
 
 There are two audiences: an operator who configures an installed adapter, providers, environment, and task on the supported Linux host; and a viewer who sees live play and an accurate activity feed. Setup must be understandable to an external user on that host. Hosted operation, multiuser accounts, and arbitrary cross-platform compatibility are outside the initial release.
 
@@ -97,7 +97,7 @@ Player-observable permission is interpreted by each adapter's observation profil
 
 ## Requirements and observable acceptance
 
-All items below require future evidence. None records an existing pass. Core workflow criteria and reference-profile outcomes must be reported independently.
+The checkboxes below track the full release criteria, not a claim that their component mechanisms lack evidence. Current scoped results belong in the integration guide. Core workflow criteria and reference-profile outcomes must be reported independently.
 
 ### Setup and operation
 
@@ -143,17 +143,17 @@ The implemented study gate currently supports only cold fresh seeded whole-agent
 
 ## First reference integration: Minecraft
 
-The first complete integration targets Minecraft Java 1.21.4, Survival, Normal difficulty, ordinary spawn/inventory and death rules, and no agent cheats or operator powers. These are chosen compatibility and gameplay targets, not verified support.
+The implemented Minecraft adapter uses Java Edition 1.21.4, Survival, Normal difficulty, ordinary spawn/inventory and death rules, and no agent cheats or operator powers. Bounded native and actual-model episodes exercise these conditions; the complete-integration and full-game criteria below remain separate.
 
 An actual Java 21 / Fabric 1.21.4 client owns filtered perception, smooth bounded aiming/held movement and legitimate interactions. It captures authentic frames after world/hand/HUD rendering and suppresses ordinary physical gameplay/menu callbacks and polling. A managed Fabric server requires session proof and rejects unrelated or same-name clients before they can displace the owned player. Control and binary video are separately authenticated; there is no automatic old-adapter fallback. Game access and server EULA consent remain operator responsibilities.
 
-The target perception profiles are `assisted_rgb_frustum_v1`, `assisted_rgb_360_v1` and a separately implemented `strict_visual_v1` condition. Actor RGB, useful own/inventory/visible-UI state, conservative occlusion and explicit bounds support the principal agent. Frustum versus camera-independent new-target permission and private navigation assistance are declared comparison conditions, not hidden defaults. The current schema-2/r2 structured path plus one unsynchronized typed PNG remains narrower delivered code; the complete new profiles, UI/space identity and aligned capture contract are not claimed.
+The implemented profile is `minecraft_assisted_rgb_360_r8_v1`: authorized structured state and one unsynchronized actor PNG, with camera-independent raycast sampling within eight blocks. Observation envelope 3 carries life, space and screen identity; the negotiated descriptor binds the effective profile configuration and capability schemas. Native semantic craft/equip operations use visible screens and one authoritative pointer. The broader profile target also includes assisted RGB/frustum and strict-visual conditions; those alternatives, audio and aligned capture are not delivered by this profile.
 
 Prepared development or mechanical tasks may use explicitly declared initialization and independent feasibility checks. Keep privileged setup/scoring outside actor feedback and report the condition separately. Ordinary fresh-world efficacy and full-game completion retain ordinary terrain/inventory requirements; no prepared result is relabeled to satisfy them.
 
 Hidden resources/structures, exact live concealed entity state, seeds, saves, evaluator state, raw native-client access and video backing data remain forbidden agent inputs. Last-seen memory receives no hidden live updates; real audio yields only coarse sound signals. Queries filter before counts/order/truncation/errors. Trusted raw client access grants no model/program/library world/chunk/entity shortcut.
 
-Schema 2/preset `minecraft-observable-initial-r2` add required session/life lineage without narrowing the camera-independent profile. Current eligible ItemEntity `item_name` exposes only represented registry identity, never exact dropped-stack count, NBT or custom hidden data. Motor profiles and route/target/free gaze remain bounded mechanical configuration, not hidden-world perception or authored tactics. `break_log` requires confirmed eligible removal; `collect_wood` separately requires receipted own-inventory gain, with the run baseline retained across death.
+Historical schema 2/preset `minecraft-observable-initial-r2` added session/life lineage; its original records retain that identity. Current eligible ItemEntity `item_name` exposes only represented registry identity, never exact dropped-stack count, NBT or custom hidden data. Motor profiles and route/target/free gaze remain bounded mechanical configuration, not hidden-world perception or authored tactics. `break_log` requires confirmed eligible removal; `collect_wood` separately requires receipted own-inventory gain, with the run baseline retained across death.
 
 Low-level navigation may privately read bounded client-loaded collision/passability/headroom geometry around the avatar toward an already authorized known target/waypoint, including bounded local detours through cells not individually observed. It cannot expose that map, identify hidden materials/resources/entities, or use a global loaded-world planner to select an undiscovered cave, shortcut, corridor, or exploration route. Route discovery outside the local execution envelope needs authorized observation/replanning or neutral bounded failure. Local steering/path choice/timing may benefit from this declared geometry; this is a structured-information approximation, not human-identical perception or a zero-leakage claim. Apply the same permission in comparisons and prove the boundary through [operations fixtures](../operations-and-security.md#structured-observation-and-navigation), without an all-voxels-observed map requirement.
 

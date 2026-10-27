@@ -79,16 +79,6 @@ limits or models, or reporting cost/results, read and follow the canonical
 - Record finite limits and actual usage before making claims. Retain failed
   attempts and unknown costs; never repeat a paid control just to obtain a pass.
 
-## Animation references
-
-When designing or changing UI animations, strongly consider browsing
-[Kinetics](https://kinetics.colorion.co/) for relevant references and inspiration.
-This is a recommendation, not a requirement; original animations are welcome.
-For desktop applications, these web animation references can still be useful:
-adapt the motion to the desktop frontend's language and UI framework.
-Adapt references to GameHarness's visual style, live game viewer, and session
-controls rather than copying them unchanged.
-
 ## Tooling and dependencies
 
 The agent may install any tooling or dependencies needed for the task without

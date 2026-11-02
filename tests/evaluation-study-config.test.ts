@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateStudyManifest, type StudyManifest } from "../src/evaluation/studies.ts";
@@ -11,6 +12,112 @@ function fixture() {
   const root = mkdtempSync(join(tmpdir(), "gameharness-study-config-")); roots.push(root);
   return { root, manifest: liveStudyManifest(root) };
 }
+
+function residentPlatformFixture() {
+  const { root, manifest } = fixture();
+  const checkedText = (path: string, bytes: string) => {
+    writeFileSync(join(root, path), bytes);
+    return { path, sha256: createHash("sha256").update(bytes).digest("hex") };
+  };
+  manifest.purpose = "Zero-provider native-platform declaration fixture; not agent competence or native execution evidence";
+  manifest.permission.record = checkedText("permission.txt", "Local fixture permission for evaluator-prepared native-platform study; no providers.");
+  manifest.task.text = "Measure resident continuity in one evaluator-prepared technical arena.";
+  manifest.task.identity = checkedText("task.txt", manifest.task.text);
+  manifest.task.success = "Technical native continuity only; never an agent completion";
+  manifest.identities.model = null;
+  manifest.identities.controller = manifest.identities.source[0]!;
+  manifest.execution.controller_mode = "resident_platform";
+  manifest.execution.adaptation = "none";
+  manifest.execution.start_mode = "evaluator_prepared_world";
+  manifest.execution.request_paths = [];
+  for (const arm of manifest.arms) arm.model = null;
+  for (const state of manifest.initial_states) {
+    state.mode = "evaluator_prepared_world"; state.seed = null;
+    state.settings = { difficulty: "normal", gamemode: "survival", cheats: true, level_type: "minecraft:flat",
+      structures: false, hardcore: false, supplied_inventory: true, console_commands: true, fresh_world_per_slot: false };
+  }
+  manifest.allowances.per_attempt.host_requests = 0;
+  manifest.allowances.per_attempt.concurrent_requests = 0;
+  manifest.allowances.cohort.host_requests = 0;
+  manifest.allowances.cohort.concurrent_requests = 0;
+  manifest.interventions.operator_setup = "Evaluator-owned technical arena with supplied inventory";
+  manifest.interventions.resets = "Reset the same owned arena between cells; not fresh seeded trials";
+  return { root, manifest };
+}
+
+test("resident platform admits checked materialized zero-provider declarations without relabelling the prepared arena as principal survival", () => {
+  const { root, manifest } = residentPlatformFixture();
+  const checked = validateStudyManifest(manifest, { projectRoot: root });
+  expect(checked.admission_mode).toBe("live");
+  expect(checked.execution).toMatchObject({ controller_mode: "resident_platform", adaptation: "none",
+    start_mode: "evaluator_prepared_world", sidecars: [], request_paths: [] });
+  expect(checked.identities.model).toBeNull();
+  expect(checked.arms.every(arm => arm.model === null)).toBe(true);
+  expect(checked.initial_states[0]).toMatchObject({ mode: "evaluator_prepared_world", seed: null, save: null,
+    settings: { cheats: true, supplied_inventory: true, console_commands: true, fresh_world_per_slot: false } });
+  expect(checked.allowances.per_attempt).toEqual({ host_requests: 0, concurrent_requests: 0, workers: 1, wall_ms: 1000 });
+  expect(Object.isFrozen(checked.initial_states[0]!.settings)).toBe(true);
+  expect(Object.isFrozen(checked.schedule[0]!.slot)).toBe(true);
+});
+
+const invalidResidentPlatform: { name: string; change: (manifest: StudyManifest) => void }[] = [
+  { name: "provider identity", change: manifest => { manifest.identities.model = { provider: "openai-codex", id: "exact", api: "openai-codex-responses", access: "oauth_subscription" }; } },
+  { name: "arm provider identity", change: manifest => { manifest.arms[0]!.model = { provider: "openai-codex", id: "exact", api: "openai-codex-responses", access: "oauth_subscription" }; } },
+  { name: "sidecar", change: manifest => { manifest.execution.sidecars = ["jev"]; } },
+  { name: "strategic request", change: manifest => { manifest.execution.request_paths = ["strategic"]; } },
+  { name: "multiple cloud request paths", change: manifest => { manifest.execution.request_paths = ["strategic", "jev"]; } },
+  { name: "per-attempt request allowance", change: manifest => { manifest.allowances.per_attempt.host_requests = 1; manifest.allowances.cohort.host_requests = 4; } },
+  { name: "cohort request allowance", change: manifest => { manifest.allowances.cohort.host_requests = 1; } },
+  { name: "per-attempt request concurrency", change: manifest => { manifest.allowances.per_attempt.concurrent_requests = 1; } },
+  { name: "cohort request concurrency", change: manifest => { manifest.allowances.cohort.concurrent_requests = 1; } },
+  { name: "missing controller", change: manifest => { manifest.identities.controller = null; } },
+  { name: "adaptation", change: manifest => { manifest.execution.adaptation = "whole_agent_run_private"; } },
+  { name: "admission-only native resources", change: manifest => { manifest.admission_mode = "admission_only"; manifest.permission.scope = "admission_only"; } },
+  { name: "principal fresh-world start", change: manifest => { manifest.execution.start_mode = "fresh_seeded_world"; } },
+  { name: "principal state mode", change: manifest => { manifest.initial_states[0]!.mode = "fresh_seeded_world"; } },
+  { name: "seed trial claim", change: manifest => { manifest.initial_states[0]!.seed = "17"; } },
+  { name: "restored-save claim", change: manifest => { manifest.initial_states[0]!.save = manifest.identities.source[0]!; } },
+  { name: "missing settings", change: manifest => { manifest.initial_states[0]!.settings = null; } },
+  { name: "cheats mislabelling", change: manifest => { manifest.initial_states[0]!.settings!.cheats = false; } },
+  { name: "inventory mislabelling", change: manifest => { manifest.initial_states[0]!.settings!.supplied_inventory = false; } },
+  { name: "console mislabelling", change: manifest => { manifest.initial_states[0]!.settings!.console_commands = false; } },
+  { name: "creative mode", change: manifest => { manifest.initial_states[0]!.settings!.gamemode = "creative"; } },
+  { name: "peaceful difficulty", change: manifest => { manifest.initial_states[0]!.settings!.difficulty = "peaceful"; } },
+  { name: "hardcore", change: manifest => { manifest.initial_states[0]!.settings!.hardcore = true; } },
+  { name: "historical observation schema", change: manifest => { manifest.identities.observation_schema = 2; } },
+  { name: "wrong adapter", change: manifest => { manifest.identities.adapter = "other"; } },
+  { name: "wrong game version", change: manifest => { manifest.identities.game!.version = "1.21.5"; } },
+  { name: "nonprivate store", change: manifest => { manifest.execution.isolation.store = "shared"; } },
+  { name: "inherited library", change: manifest => { manifest.identities.library.mode = "inherited"; } },
+  { name: "early feedback", change: manifest => { manifest.analysis.feedback_release = "immediate"; } },
+  { name: "early publication", change: manifest => { manifest.execution.isolation.publication = "immediate"; } },
+  { name: "multiple attempt owners", change: manifest => { manifest.allowances.per_attempt.workers = 2; manifest.allowances.cohort.workers = 2; } },
+];
+for (const { name, change } of invalidResidentPlatform) {
+  test(`resident platform rejects ${name} instead of broadening zero-provider authority`, () => {
+    const { root, manifest } = residentPlatformFixture(); change(manifest);
+    expect(() => validateStudyManifest(manifest, { projectRoot: root })).toThrow();
+  });
+}
+
+test("resident platform checks controller bytes and current complete profile, not merely declared labels", () => {
+  const { root, manifest } = residentPlatformFixture();
+  writeFileSync(join(root, manifest.identities.controller!.path), "changed controller bytes");
+  expect(() => validateStudyManifest(manifest, { projectRoot: root })).toThrow(/identity|hash/i);
+  for (const { profile } of invalidStudyProfiles()) {
+    const owned = residentPlatformFixture();
+    writeStudyProfile(owned.root, owned.manifest, profile);
+    expect(() => validateStudyManifest(owned.manifest, { projectRoot: owned.root })).toThrow();
+  }
+});
+
+test("resident zero-provider omissions do not exempt whole-agent or released-reference declarations", () => {
+  for (const controller_mode of ["whole_agent", "released_policy_reference", "resident_platform_typo"]) {
+    const { root, manifest } = residentPlatformFixture();
+    manifest.execution.controller_mode = controller_mode;
+    expect(() => validateStudyManifest(manifest, { projectRoot: root })).toThrow();
+  }
+});
 
 test("fresh seed/settings remain exact fresh-world identities, never a restored-save claim", () => {
   const { root, manifest } = fixture();

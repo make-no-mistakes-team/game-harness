@@ -13,10 +13,10 @@ const COMMANDS = [
   ["unit", "[test-file ...]", "Pure/local classified checks"],
   ["integration", "[test-file ...]", "Classified integration seams, no real game/provider"],
   ["native-game", "--allow-native --jar <fresh-built.jar>", "Actual native planning/continuation baseline"],
-  ["native-recording", "--allow-native --jar <fresh-built.jar>", "Actual zero-inference recording proof"],
-  ["agent-acceptance", "--allow-native --allow-inference --jar <fresh-built.jar> --auth-dir <existing-private-auth-root> --hypothesis <stable-id> --evidence-revision <revision> [acceptance options]", "Diagnostic admission; historical two-unsuccessful rule"],
+  ["native-recording", "--allow-native --jar <fresh-built.jar> [--duration-ms <1000..1800000>] [--evidence-profile <private-profile.json>]", "Actual zero-inference recording proof"],
+  ["agent-acceptance", "--allow-native --allow-inference --jar <fresh-built.jar> --auth-dir <existing-private-auth-root> --hypothesis <stable-id> --evidence-revision <revision> [--evidence-profile <private-profile.json>] [acceptance options]", "Diagnostic admission; historical two-unsuccessful rule"],
   ["register-study", "--manifest <private-study.json>", "Register a complete immutable finite declaration"],
-  ["study", "--study <registered-id> --manifest <same-private-study.json> --slot '<JSON StudySlot>' [--admission-only | --allow-native --allow-inference --auth-dir <existing-private-auth-root>]", "Reserve exactly one declared slot before external preparation"],
+  ["study", "--study <registered-id> --manifest <same-private-study.json> --slot '<JSON StudySlot>' [--admission-only | --allow-native --allow-inference --auth-dir <existing-private-auth-root> [--evidence-profile <frozen-private-profile.json>]]", "Reserve exactly one declared slot before external preparation"],
   ["authorize-evidence", "--hypothesis <id> --evidence-revision <new-id> --reason <reason> --reference <source|schema|native_artifact|repro>:<file> [...]", "Changed concrete platform evidence; never a prompt/model reset"],
 ] as const;
 

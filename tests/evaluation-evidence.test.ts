@@ -96,12 +96,12 @@ test("private journal survives rejected source, visible partials, compact limits
   agent.emitExternalEvent({ type: "message_end", message } as AgentEvent);
   agent.emitExternalEvent({ type: "tool_execution_end", toolCallId: "rejected-source", toolName: "program_write", isError: true,
     result: { content: [{ type: "text", text: "Rejected at line 1" }], details: { error: { code: "invalid_program", issues: [{ code: "invalid_syntax", location: { line: 1, column: 17 } }] } } } } as AgentEvent);
-  const authored = f.store.registerSkill(f.run.run_id, await validateSkill({ name: "immutable read-only source",
+  const authored = await f.store.registerSkill(f.run.run_id, await validateSkill({ entry: "run", name: "immutable read-only source",
     source: 'return {status:"completed",summary:"Private fixture source",result:null};', dependencies: [],
     card: { purpose: "Read-only evidence fixture", applicability: "Test only", method: "No effects", reason: "Retain source identity", limitations: "Untested in gameplay" } }, adapter));
   const { session_id, life_id } = f.run;
   if (session_id === null || life_id === null) throw new Error("Evidence fixture requires a live session and life");
-  const execution = f.store.admitSkill(f.run.run_id, { skill_id: authored.skill_id, version: authored.version,
+  const execution = f.store.admitSkill(f.run.run_id, { entry: "run", skill_id: authored.skill_id, version: authored.version,
     start_key: "private-evidence-execution", ...executionScopeFixture(f.run),
     args: {}, limits: { duration_ms: 10000, max_actions: 1, max_calls: 2, max_depth: 1 } }).view;
   const action = f.store.admitAction(f.run.run_id, "private-native-receipt", { kind: "craft", item: "crafting_table", executions: 1 }, "skill",

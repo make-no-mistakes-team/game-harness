@@ -68,9 +68,9 @@ export class ProgramWorkspace {
   }
 
   source(program: SkillView) {
-    const compatible = program.validation.runtime_version === 4 && program.validation.api_version === 4 && program.validation.validator_version === 4 &&
+    const compatible = !!program.entry && program.validation.runtime_version === 5 && program.validation.api_version === 5 && program.validation.validator_version === 5 &&
       program.validation.compatibility_hash === this.store.getRun(this.runId)?.compatibility_hash;
-    return { name: program.name, version: program.version, source: program.source, card: program.card,
+    return { name: program.name, version: program.version, entry: program.entry ?? null, source: program.source, card: program.card,
       dependencies: program.dependencies.map((ref) => this.programReference(ref)),
       parent_version: program.parent_version, state: program.state, execution_compatible: compatible,
       validation: { runtime_version: program.validation.runtime_version ?? null, api_version: program.validation.api_version ?? null,
@@ -99,14 +99,15 @@ export class ProgramWorkspace {
       return null;
     };
     return { ...this.executionSummary(execution), parent: execution.parent_execution_id ? this.executionReference(execution.parent_execution_id) : null,
-      root: this.executionReference(execution.root_execution_id), limits: execution.limits, started_at: execution.started_at,
+      root: this.executionReference(execution.root_execution_id), limits: execution.limits,
+      resident: execution.entry === "step" ? execution.resident : null, started_at: execution.started_at,
       ended_at: execution.ended_at, deadline_at: execution.deadline_at, args: field("args"), result: field("result"), error: execution.error, diagnostic: execution.diagnostic ?? null, omissions };
   }
 
   executionSummary(execution: SkillExecutionView) {
     const program = this.store.skill(this.runId, execution);
     return { name: program.name, version: execution.version, execution_ordinal: this.executionReference(execution.execution_id)?.execution_ordinal ?? null,
-      status: execution.status, target: Object.hasOwn(unfinished, execution.status) ? "current" : "latest",
+      entry: execution.entry, status: execution.status, target: Object.hasOwn(unfinished, execution.status) ? "current" : "latest",
       actions: execution.actions, calls: execution.calls,
       summary: (execution.result?.summary ?? execution.error)?.slice(0, 1000) ?? null };
   }
@@ -157,7 +158,8 @@ export class ProgramWorkspace {
       execution_ordinal: this.executionReference(execution_id)?.execution_ordinal ?? null,
       root_execution_ordinal: this.executionReference(root_execution_id)?.execution_ordinal ?? null,
       compactness: validation, ...(metrics ? { metrics: this.metricView(metrics) } : {}),
-      ...(goal_associations ? { goal_associations: goal_associations.map(({ action_id: _action, ...association }) => association) } : {}) };
+      ...(goal_associations ? { goal_associations: goal_associations.map(({ action_id: _action, controller_input, ...association }) =>
+        ({ ...association, ...(controller_input ? { controller_input: { generation: controller_input.generation, sequence: controller_input.sequence } } : {}) })) } : {}) };
   }
 
   comparisonView(page: ComparisonPage) {

@@ -15,6 +15,7 @@ const STARTUP_MS = 15_000;
 const [name, runner, image, mode = "policy", lifetimeText] =
   process.argv.slice(2);
 const skill = mode === "skill";
+const resident = mode === "resident";
 // Only transport overhead changes; the backend/worker enforce original model
 // payload limits independently of private instrumentation and diagnostics.
 const inputLimit = skill ? INPUT_BYTES + 512 * 1024 : INPUT_BYTES;
@@ -26,9 +27,11 @@ if (
   runner.includes(",") ||
   runner.includes(":") ||
   !/^node:24-bookworm-slim@sha256:[a-f0-9]{64}$/.test(image ?? "") ||
-  !["policy", "skill"].includes(mode) ||
+  !["policy", "skill", "resident"].includes(mode) ||
   (skill &&
-    (!Number.isSafeInteger(lifetime) || lifetime < 1 || lifetime > 600000))
+    (!Number.isSafeInteger(lifetime) || lifetime < 1 || lifetime > 600000)) ||
+  (resident &&
+    (!Number.isSafeInteger(lifetime) || lifetime < 1 || lifetime > 5000))
 )
   process.exit(1);
 
@@ -36,7 +39,7 @@ let closing = false;
 let cleanup = null;
 let attached = null;
 let attachedExited = Promise.resolve();
-let expected = "ready";
+let expected = resident ? "resident_ready" : "ready";
 let input = Buffer.alloc(0);
 let output = Buffer.alloc(0);
 let outputBytes = 0;
@@ -44,6 +47,10 @@ let timer = setTimeout(stop, STARTUP_MS);
 let creation = Promise.resolve();
 let skillPhase = "ready";
 let skillSequence = 0;
+let residentEntry = null;
+let residentSequence = 0;
+let residentInitialized = false;
+let residentEvaluation = null;
 // Neither container output nor a pending host call can extend this deadline.
 const lifetimeTimer = skill ? setTimeout(stop, lifetime) : null;
 
@@ -62,6 +69,11 @@ function boundedJson(text) {
     } else if (character === "}" || character === "]") depth--;
   }
   return JSON.parse(text);
+}
+
+function exactKeys(value, keys) {
+  return Object.keys(value).length === keys.length &&
+    keys.every(key => Object.hasOwn(value, key));
 }
 
 function command(args, timeout = 5_000) {
@@ -132,9 +144,21 @@ async function removeOwned() {
   );
 }
 
+function reportAnalysisEvaluation(outcome) {
+  const evaluation = residentEvaluation;
+  if (!evaluation) return;
+  residentEvaluation = null;
+  // This envelope is manufactured on the host, never forwarded from Docker.
+  // Both timing endpoints use this guardian's monotonic clock.
+  process.stdout.write(JSON.stringify({ v: 2, type: "guardian_analysis_evaluated",
+    id: evaluation.id, entry: "analyze",
+    elapsed_ms: Math.max(0, performance.now() - evaluation.started), outcome }) + "\n");
+}
+
 function stop() {
   if (cleanup) return cleanup;
   closing = true;
+  reportAnalysisEvaluation("terminated");
   clearTimeout(timer);
   clearTimeout(lifetimeTimer);
   process.stdin.pause();
@@ -179,6 +203,37 @@ process.stdin.on("data", (chunk) => {
   if (end !== input.length - 1) return void stop();
   try {
     const request = boundedJson(input.subarray(0, end).toString("utf8"));
+    if (resident) {
+      if (request?.v !== 1 || !Number.isSafeInteger(request.id) || request.id < 0)
+        throw new Error("protocol");
+      if (!residentInitialized) {
+        if (request.type !== "resident_init" || request.id !== 0 ||
+          !["step", "analyze"].includes(request.entry) ||
+          !exactKeys(request, ["v", "type", "id", "source", "entry"]) ||
+          typeof request.source !== "string" || Buffer.byteLength(request.source) > 16384)
+          throw new Error("protocol");
+        residentInitialized = true;
+        residentEntry = request.entry;
+        expected = "resident_compiled";
+      } else {
+        if (request.type !== `resident_${residentEntry}` ||
+          request.id !== residentSequence + 1 ||
+          !exactKeys(request, residentEntry === "step"
+            ? ["v", "type", "id", "frame", "state", "intent"] : ["v", "type", "id", "input"]))
+          throw new Error("protocol");
+        residentSequence = request.id;
+        expected = "resident_result";
+        if (residentEntry === "analyze")
+          residentEvaluation = { id: request.id, started: performance.now() };
+      }
+      outputBytes = 0;
+      // Only the trusted host dispatch can arm this finite compute budget.
+      // A container's output cannot change or renew it.
+      timer = setTimeout(stop, expected === "resident_result" ? lifetime : STARTUP_MS);
+      attached.stdin.write(input);
+      input = Buffer.alloc(0);
+      return;
+    }
     if (skill) {
       const line = input;
       input = Buffer.alloc(0);
@@ -282,6 +337,7 @@ async function start() {
       "--disable-sigusr1",
       "/runner.mjs",
       mode,
+      ...(resident ? [String(lifetime)] : []),
     ],
     null,
   );
@@ -313,6 +369,10 @@ async function start() {
     if (end !== output.length - 1) return void stop();
     try {
       const reply = boundedJson(output.subarray(0, end).toString("utf8"));
+      if (resident && (reply?.v !== 1 || reply.id !== residentSequence ||
+        !exactKeys(reply, expected === "resident_result"
+          ? ["v", "type", "id", "value"] : ["v", "type", "id"])))
+        throw new Error("protocol");
       if (skill) {
         const line = output;
         output = Buffer.alloc(0);
@@ -357,6 +417,8 @@ async function start() {
       }
       if (reply?.type !== expected) throw new Error("protocol");
       clearTimeout(timer);
+      if (resident && expected === "resident_result" && residentEntry === "analyze")
+        reportAnalysisEvaluation("result");
       expected = null;
       process.stdout.write(output);
       output = Buffer.alloc(0);

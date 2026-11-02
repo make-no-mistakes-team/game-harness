@@ -36,6 +36,7 @@ public final class VisibleInventory {
   public static final long EQUIP_MS = 12_000, PLACE_MS = 20_000;
   public static long craftMillis(int executions) { return 10_000L + 35_000L * executions; }
   private static VisibleInventory active;
+  public static boolean owned() { return active != null; }
   private final MinecraftClient client;
   private final BooleanSupplier authorized;
   private final boolean table;
@@ -65,7 +66,7 @@ public final class VisibleInventory {
   private boolean equipment, direct;
 
   public VisibleInventory(MinecraftClient client, boolean table, BooleanSupplier authorized) {
-    if (active != null) throw new IllegalStateException("Inventory session already owned");
+    if (active != null || VisibleScreen.owned()) throw new IllegalStateException("Inventory session already owned");
     this.client = client;
     this.table = table;
     this.authorized = authorized;

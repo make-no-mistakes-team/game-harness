@@ -7,7 +7,7 @@ import type { SkillExecutionView } from "../shared/programs.ts";
 import { z } from "zod";
 import { programCompatibilitySchema } from "../shared/adapter.ts";
 import { effectScopeSchema } from "../shared/control.ts";
-import { minecraftBlockRemovalFactSchema, minecraftObservationV3Schema, minecraftProductionFactSchema } from "../shared/minecraft.ts";
+import { confirmedMinecraftGuiTransactions, minecraftGuiTransactionFactSchema, minecraftBlockRemovalFactSchema, minecraftObservationV3Schema, minecraftProductionFactSchema } from "../shared/minecraft.ts";
 import { verificationResultSchema } from "../shared/validation.ts";
 import { jsonSchema } from "../shared/primitives.ts";
 import type { Store, StoredAction, StoredRun } from "./store.ts";
@@ -15,18 +15,22 @@ import { canonicalContractJson, contractHash } from "./adapter-contract.ts";
 import { minecraftGoalBaselineSchema, minecraftInventoryCounts } from "./minecraft-adapter.ts";
 import type { ObjectiveMetrics } from "../shared/execution-evidence.ts";
 import { confirmedRemoval, eligibleLog, objectiveMetrics, receiptedInventoryDelta } from "./objective-metrics.ts";
+import { residentReceiptSchema, type ResidentReceipt } from "./resident-evidence.ts";
 export type DetailedProgramEvidence = ProgramEvidenceView & {
   metrics: ObjectiveMetrics;
-  goal_associations: { event_seq: number; relationship: "direct_receipt" | "block_removal_contributor" | "inventory_collector"; action_id: string; causal_item_origin: "unknown" }[];
+  goal_associations: { event_seq: number; relationship: "direct_receipt" | "block_removal_contributor" | "inventory_collector"; action_id: string | null;
+    controller_input?: { input_id: string; generation: number; sequence: number }; causal_item_origin: "unknown" }[];
 };
 const object = (value: Json): Record<string, Json> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
     ? value
     : null;
 type GoalRelationship = DetailedProgramEvidence["goal_associations"][number]["relationship"];
-type ConfirmedAction = { owner: SkillExecutionView; action: StoredAction };
+type OwnedAction = { owner: SkillExecutionView; action: StoredAction };
+type OwnedController = { owner: SkillExecutionView; receipt: ResidentReceipt; event: ActivityEvent };
 const removalSchemaHash = contractHash(jsonSchema.parse(z.toJSONSchema(minecraftBlockRemovalFactSchema)));
 const productionSchemaHash = contractHash(jsonSchema.parse(z.toJSONSchema(minecraftProductionFactSchema)));
+const transactionSchemaHash = contractHash(jsonSchema.parse(z.toJSONSchema(minecraftGuiTransactionFactSchema)));
 
 /** Current verdicts link retained typed facts, never item-name guesses from a new event shape. */
 function currentGoalLinks(
@@ -34,7 +38,9 @@ function currentGoalLinks(
   event: ActivityEvent,
   retained: Map<string, ActivityEvent | null>,
   compatibility: z.infer<typeof programCompatibilitySchema> | null,
-  confirmed: Map<string, ConfirmedAction>,
+  confirmed: Map<string, OwnedAction>,
+  receipted: Map<string, OwnedAction>,
+  controllers: Map<string, OwnedController | null>,
 ): Map<string, GoalRelationship> | null {
   if (typeof run.goal === "string" || !run.goal.verifier || !compatibility ||
     compatibility.compatibility_hash !== run.compatibility_hash ||
@@ -53,6 +59,17 @@ function currentGoalLinks(
   const acquisitions: { life: number; at: number }[] = [];
   const productions: { life: number; at: number }[] = [];
   const possessions: { life: number; at: number }[] = [];
+  const recordTransaction = (fact: z.infer<typeof minecraftGuiTransactionFactSchema>, life: number, at: number, effectId: string) => {
+    const woodAcquisition = combined && [fact.inventory_before, fact.inventory_after].some(counts =>
+      Object.keys(counts).some(item => eligibleLog(item) && counts[item]! > (baseline.data.inventory[item] ?? 0)));
+    const finalProduct = fact.productions.some(production => production.production_confirmed &&
+      production.producer === "crafting" && production.item === product);
+    if (!woodAcquisition && !finalProduct) return false;
+    if (woodAcquisition) acquisitions.push({ life, at });
+    if (finalProduct) productions.push({ life, at });
+    links.set(effectId, finalProduct ? "direct_receipt" : "inventory_collector");
+    return true;
+  };
   for (const id of new Set(verdict.data.evidence_refs)) {
     const reference = retained.get(id);
     if (!reference || reference.event_seq >= event.event_seq || reference.at > event.at) return null;
@@ -104,9 +121,32 @@ function currentGoalLinks(
         ? minecraftBlockRemovalFactSchema.safeParse(evidence.data) : null;
       const production = schema?.id === "minecraft_item_production_v1" && schema.version === 1 && schema.hash === productionSchemaHash
         ? minecraftProductionFactSchema.safeParse(evidence.data) : null;
-      const fact = removal?.success ? removal.data : production?.success ? production.data : null;
+      const transaction = schema?.id === "minecraft_gui_transaction_v1" && schema.version === 1 && schema.hash === transactionSchemaHash
+        ? minecraftGuiTransactionFactSchema.safeParse(evidence.data) : null;
+      const fact = removal?.success ? removal.data : production?.success ? production.data : transaction?.success ? transaction.data : null;
       if (!fact) return null;
-      const entry = confirmed.get(fact.receipt_ref);
+      if (transaction?.success && typeof evidence.evidence_id === "string") {
+        const suffix = `:gui:${transaction.data.operation_index}`;
+        const inputId = evidence.evidence_id.endsWith(suffix) ? evidence.evidence_id.slice(0, -suffix.length) : "";
+        const streamed = controllers.get(inputId);
+        if (streamed) {
+          const { receipt, owner, event: retainedReceipt } = streamed;
+          if (retainedReceipt.event_seq >= event.event_seq || retainedReceipt.at > evidence.observed_at ||
+            !owner.started_at || retainedReceipt.at < owner.started_at || owner.ended_at && retainedReceipt.at > owner.ended_at ||
+            canonicalContractJson(receipt.scope) !== canonicalContractJson(scope.data) ||
+            receipt.input.kind !== "screen" ||
+            !confirmedMinecraftGuiTransactions({ kind: "screen_input", screen: receipt.input.screen, operations: receipt.input.operations },
+              receipt.update.result.evidence).some(value => canonicalContractJson(value) === canonicalContractJson(transaction.data)) ||
+            !recordTransaction(transaction.data, scope.data.life_id, Date.parse(evidence.observed_at), inputId)) return null;
+          continue;
+        }
+      }
+      const matched = transaction?.success ? [...receipted].find(([actionId, entry]) =>
+        evidence.evidence_id === `${actionId}:gui:${transaction.data.operation_index}` &&
+        confirmedMinecraftGuiTransactions(entry.action.request, entry.action.view.result?.evidence)
+          .some(receipt => canonicalContractJson(receipt) === canonicalContractJson(transaction.data)))
+        : [fact.receipt_ref, confirmed.get(fact.receipt_ref)] as const;
+      const actionId = matched?.[0], entry = matched?.[1];
       if (!entry || !entry.action.view.scope || entry.action.view.origin !== "skill" ||
         entry.action.view.compatibility_hash !== run.compatibility_hash ||
         entry.action.view.scope.source_hash !== entry.owner.source_hash ||
@@ -130,6 +170,8 @@ function currentGoalLinks(
         if (woodAcquisition) acquisitions.push({ life: scope.data.life_id, at: Date.parse(evidence.observed_at) });
         if (finalProduct) productions.push({ life: scope.data.life_id, at: Date.parse(evidence.observed_at) });
         links.set(fact.receipt_ref, finalProduct ? "direct_receipt" : "inventory_collector");
+      } else if (transaction?.success && actionId) {
+        if (!recordTransaction(transaction.data, scope.data.life_id, Date.parse(evidence.observed_at), actionId)) return null;
       }
     }
   }
@@ -182,7 +224,9 @@ export function programEvidence(
     event.at >= execution.started_at &&
     (!execution.ended_at || event.at <= execution.ended_at);
   const run = store.getRun(runId);
-  const confirmed = new Map<string, ConfirmedAction>();
+  const confirmed = new Map<string, OwnedAction>();
+  const receipted = new Map<string, OwnedAction>();
+  const controllers = new Map<string, OwnedController | null>();
   const retained = new Map<string, ActivityEvent | null>();
   let compatibility: z.infer<typeof programCompatibilitySchema> | null = null;
   const goals: ActivityEvent[] = [];
@@ -196,24 +240,34 @@ export function programEvidence(
         if (parsed.success && parsed.data.compatibility_hash === run?.compatibility_hash) compatibility = parsed.data;
       } else if (event.type === "adapter.evidence" && typeof details?.evidence_id === "string") {
         retained.set(details.evidence_id, retained.has(details.evidence_id) ? null : event);
+      } else if (event.type === "controller.receipted") {
+        const parsed = residentReceiptSchema.safeParse(event.details);
+        if (parsed.success) {
+          const receipt = parsed.data, scope = receipt.scope, owner = owners.get(scope.execution_id);
+          if (owner?.entry === "step" && owner.source_hash === scope.source_hash && owner.compatibility_hash === receipt.compatibility_hash &&
+            receipt.compatibility_hash === run?.compatibility_hash && owner.run_id === scope.run_id && owner.world_id === scope.world_id &&
+            owner.session_id === scope.session_id && owner.epoch === scope.epoch && owner.native_boot_id === scope.native_boot_id &&
+            owner.run_generation === scope.run_generation && owner.life_id === scope.life_id && owner.space_epoch === scope.space_epoch &&
+            scope.source_hash === store.skill(runId, owner).hash &&
+            receipt.input_id === `controller:${owner.execution_id}:${receipt.update.controller_generation}:${receipt.update.sequence}`) {
+            controllers.set(receipt.input_id, controllers.has(receipt.input_id) ? null : { owner, receipt, event });
+          }
+        }
       }
       if (event.type === "model.call" && details?.backend !== "jev") {
         for (const execution of executions)
           if (inInterval(execution, event))
             projections.get(execution.execution_id)!.strategic_requests++;
       } else if (
-        event.type === "action.succeeded" &&
+        ["action.succeeded", "action.failed", "action.cancelled", "action.unknown"].includes(event.type) &&
         typeof details?.action_id === "string" &&
-        !confirmed.has(details.action_id)
+        !receipted.has(details.action_id)
       ) {
         const action = store.getAction(runId, details.action_id);
-        if (
-          !action?.view.execution_id ||
-          action.view.status !== "succeeded" ||
-          object(action.view.result?.evidence ?? null)?.effect_confirmed !==
-            true
-        )
-          continue;
+        if (!action?.view.execution_id || event.type !== `action.${action.view.status}`) continue;
+        const wholeConfirmed = action.view.status === "succeeded" &&
+          object(action.view.result?.evidence ?? null)?.effect_confirmed === true;
+        if (!wholeConfirmed && !confirmedMinecraftGuiTransactions(action.request, action.view.result?.evidence).length) continue;
         let owner = owners.get(action.view.execution_id);
         if (!owner) {
           const loaded = store.skillExecution(runId, {
@@ -223,6 +277,9 @@ export function programEvidence(
           owners.set(loaded.execution_id, loaded);
           owner = loaded;
         }
+        receipted.set(details.action_id, { owner, action });
+        // Receipt-level GUI prefixes link goals without confirming the enclosing action or its suffix.
+        if (!wholeConfirmed) continue;
         confirmed.set(details.action_id, { owner, action });
         for (const id of new Set([
           owner.execution_id,
@@ -261,9 +318,9 @@ export function programEvidence(
     const details = object(event.details);
     const current = run && typeof run.goal !== "string";
     if (!current && (!run || typeof details?.goal !== "string" || details.goal !== run.goal)) continue;
-    const links = current ? currentGoalLinks(run, event, retained, compatibility, confirmed) : null;
+    const links = current ? currentGoalLinks(run, event, retained, compatibility, confirmed, receipted, controllers) : null;
     if (current && !links) continue;
-    for (const [actionId, { owner, action }] of confirmed) {
+    for (const [actionId, { owner, action }] of current ? receipted : confirmed) {
       const receipt = object(action.view.result?.evidence ?? null);
       const item = !current && typeof details?.item === "string" ? details.item : null;
       const delta = receiptedInventoryDelta(action);
@@ -280,6 +337,25 @@ export function programEvidence(
         associations.set(id, linked);
         if (direct || collector && run && typeof run.goal !== "string" &&
           (run.goal.goal_id === "collect_wood" || run.goal.goal_id === "obtain_stone")) {
+          projection.evidence_status = "verified_goal";
+          projection.verified_event_seqs.push(event.event_seq);
+        }
+      }
+    }
+    if (current && links) for (const [inputId, entry] of controllers) {
+      if (!entry) continue;
+      const relationship = links.get(inputId);
+      if (!relationship) continue;
+      const { owner, receipt } = entry;
+      for (const id of new Set([owner.execution_id, owner.root_execution_id])) {
+        const projection = projections.get(id);
+        if (!projection) continue;
+        const linked = associations.get(id) ?? [];
+        linked.push({ event_seq: event.event_seq, relationship, action_id: null,
+          controller_input: { input_id: inputId, generation: receipt.update.controller_generation, sequence: receipt.update.sequence },
+          causal_item_origin: "unknown" });
+        associations.set(id, linked);
+        if (relationship === "direct_receipt") {
           projection.evidence_status = "verified_goal";
           projection.verified_event_seqs.push(event.event_seq);
         }

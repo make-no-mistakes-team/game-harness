@@ -1,5 +1,5 @@
 import type { Json } from "../shared/contracts.ts";
-import { historicalObservationV2Schema, minecraftObservationV3Schema, type MinecraftPlayer } from "../shared/minecraft.ts";
+import { confirmedMinecraftGuiTransactions, historicalObservationV2Schema, minecraftObservationV3Schema, type MinecraftPlayer } from "../shared/minecraft.ts";
 import type { ObjectiveMetrics, PauseCategory, TraceRecord } from "../shared/execution-evidence.ts";
 import type { Store, StoredAction } from "./store.ts";
 export const evidenceObject = (value: unknown): Record<string, Json> | null => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, Json> : null;
@@ -10,6 +10,17 @@ export function confirmedRemoval(action: StoredAction): boolean {
 export const eligibleLog = (name: string): boolean => /^(?:stripped_)?[a-z0-9_]+_(?:log|wood|stem|hyphae)$/.test(name);
 export function receiptedInventoryDelta(action: StoredAction): Record<string, number> | null {
   const receipt = evidenceObject(action.view.result?.evidence);
+  if (action.request.kind === "screen_input") {
+    const transactions = confirmedMinecraftGuiTransactions(action.request, receipt);
+    if (!transactions.length) return null;
+    const delta: Record<string, number> = Object.create(null);
+    for (const fact of transactions) for (const item of new Set([...Object.keys(fact.inventory_before), ...Object.keys(fact.inventory_after)])) {
+      const count = (delta[item] ?? 0) + (fact.inventory_after[item] ?? 0) - (fact.inventory_before[item] ?? 0);
+      if (!Number.isSafeInteger(count)) return null;
+      delta[item] = count;
+    }
+    return delta;
+  }
   if (receipt?.inventory_receipt_confirmed !== true) return null;
   const before = evidenceObject(receipt.inventory_before), after = evidenceObject(receipt.inventory_after);
   const delta = evidenceObject(receipt.inventory_delta);

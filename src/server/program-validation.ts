@@ -56,6 +56,7 @@ const skillRefSchema = z
   .strict();
 const skillSchema: z.ZodType<SkillSpec> = z
   .object({
+    entry: z.enum(["run", "step", "analyze"]),
     name: text(80),
     source: z.string(),
     card: z
@@ -319,8 +320,37 @@ function parseBody(source: string, kind: "skill" | "policy" | "guard") {
   return { fn, body: fn.body, formatterSource, locate };
 }
 
-function analyze(source: string, kind: "skill" | "policy" | "guard") {
-  const parsed = parseBody(source, kind);
+type ProgramSourceKind = "skill" | "policy" | "guard" | "step" | "analyze";
+
+function parseModule(source: string, kind: "step" | "analyze") {
+  const locate = (position: number) => {
+    const lines = source.slice(0, position).split("\n");
+    return { line: lines.length, column: (lines.at(-1)?.length ?? 0) + 1 };
+  };
+  let ast: SyntaxNode;
+  try {
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" }) as unknown as SyntaxNode;
+  } catch (error) {
+    const position = typeof error === "object" && error !== null && "pos" in error && typeof error.pos === "number" ? error.pos : 0;
+    throw new ProgramValidationError([issue("invalid_syntax", "Source must be an ordinary JavaScript module.", locate(position))]);
+  }
+  const exports = nodes(ast.body).filter(node => node.type.startsWith("Export"));
+  const selected = exports[0];
+  const declaration = selected && isNode(selected.declaration) ? selected.declaration : null;
+  const parameters = declaration ? nodes(declaration.params) : [];
+  if (exports.length !== 1 || selected?.type !== "ExportNamedDeclaration" || !declaration ||
+    declaration.type !== "FunctionDeclaration" || !isNode(declaration.id) || declaration.id.name !== kind ||
+    declaration.async || declaration.generator || parameters.length !== (kind === "step" ? 3 : 1) ||
+    parameters.some(parameter => parameter.type !== "Identifier")) {
+    throw new ProgramValidationError([issue("invalid_entry",
+      `Module requires one named synchronous function export ${kind} with ${kind === "step" ? "three" : "one"} plain parameters.`)]);
+  }
+  return { fn: ast, body: ast, formatterSource: source, locate, selected };
+}
+
+function analyze(source: string, kind: ProgramSourceKind) {
+  const module = kind === "step" || kind === "analyze";
+  const parsed = module ? parseModule(source, kind) : parseBody(source, kind);
   const issues: ProgramValidationIssue[] = [];
   let maximumComplexity = 1;
   let maximumNesting = 0;
@@ -335,7 +365,8 @@ function analyze(source: string, kind: "skill" | "policy" | "guard") {
       complexity = { value: 1 };
       nesting = 0;
     }
-    if (forbiddenSyntax[node.type]) {
+    if ((forbiddenSyntax[node.type] && !(module && "selected" in parsed && node === parsed.selected)) ||
+      (module && node.type === "AwaitExpression")) {
       issues.push(
         issue(
           "forbidden_syntax",
@@ -407,11 +438,11 @@ function analyze(source: string, kind: "skill" | "policy" | "guard") {
 // Static admission checks do not replace the isolated execution sandbox.
 export async function validateProgramSource(
   source: unknown,
-  kind: "skill" | "policy" | "guard",
+  kind: ProgramSourceKind,
   context: ExecutableValidationContext,
 ): Promise<ValidatedProgramSource> {
   const compatibility = adapterCompatibility(context.descriptor, context.schemas);
-  if (kind !== "skill" && kind !== "policy" && kind !== "guard") {
+  if (kind !== "skill" && kind !== "policy" && kind !== "guard" && kind !== "step" && kind !== "analyze") {
     throw new ProgramValidationError([
       issue("invalid_kind", "Unsupported program kind."),
     ]);
@@ -439,6 +470,9 @@ export async function validateProgramSource(
   let canonical: string;
   try {
     const formatted = await format(analysis.formatterSource, formatterOptions);
+    if (kind === "step" || kind === "analyze") {
+      canonical = formatted;
+    } else {
     const formattedAst = parse(formatted, {
       ecmaVersion: "latest",
     }) as unknown as SyntaxNode;
@@ -476,6 +510,7 @@ export async function validateProgramSource(
           return !insideLiteral && line.startsWith("  ") ? line.slice(2) : line;
         })
         .join("\n") + "\n";
+    }
   } catch {
     throw new ProgramValidationError([
       issue(
@@ -538,7 +573,9 @@ export async function validateSkill(
     }
     dependencies.add(key);
   }
-  const program = await validateProgramSource(parsed.data.source, "skill", context);
+  if (parsed.data.entry !== "run" && parsed.data.dependencies.length)
+    throw new ProgramValidationError([{ ...issue("invalid_dependencies", "Pure step/analyze modules cannot call playing dependencies."), path: "dependencies" }]);
+  const program = await validateProgramSource(parsed.data.source, parsed.data.entry === "run" ? "skill" : parsed.data.entry, context);
   return {
     ...parsed.data,
     source: program.source,
@@ -547,8 +584,8 @@ export async function validateSkill(
 }
 
 /** Recheck cached validation without rerunning parsing/formatting or changing immutable history. */
-export function programFingerprint(hash: string, kind: "skill" | "policy" | "guard" | "jev", compatibilityHash: string, choices?: unknown): string {
-  return contractHash({ validator: 4, runtime: 4, skill_api: SKILL_API_VERSION,
+export function programFingerprint(hash: string, kind: ProgramSourceKind | "jev", compatibilityHash: string, choices?: unknown): string {
+  return contractHash({ validator: 5, runtime: 5, skill_api: SKILL_API_VERSION,
     comments: "permitted", structural_metrics: "descriptive_not_admission_limits", kind,
     parser: acornVersion, formatter: prettierVersion, formatterOptions, limits: PROGRAM_LIMITS,
     forbiddenAmbient: [...forbiddenAmbient], forbiddenSyntax: Object.keys(forbiddenSyntax), hash,

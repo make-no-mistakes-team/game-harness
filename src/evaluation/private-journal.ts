@@ -1,14 +1,17 @@
 import { createHash } from "node:crypto";
 import { mkdir, open, writeFile, type FileHandle } from "node:fs/promises";
 import path from "node:path";
+import { normalizeJournalLimits, type JournalLimits } from "../shared/evidence-limits.ts";
 
-export interface JournalLimits { maxTextBytes?: number; maxPendingBytes?: number }
 export interface JournalFinalization { journal: string; manifest: string; evidence_complete: boolean }
 /** Permitted SDK-visible evidence, not secret storage or a wire-transport tap. */
 export class PrivateJournal {
-  private readonly maxText; private readonly maxPending;
+  private readonly limits;
   private text = 0; private pending = 0; private imageBytes = 0;
+  private acceptedText = 0; private acceptedImageBytes = 0;
+  private peakPending = 0; private peakText = 0; private peakImageBytes = 0;
   private readonly images = new Map<string, { file: string; sha256: string; bytes: number; mime_type: string }>();
+  private readonly storedImages = new Set<string>();
   private readonly failures: string[] = [];
   private tail: Promise<void> = Promise.resolve();
   private readonly file: Promise<FileHandle>;
@@ -16,8 +19,8 @@ export class PrivateJournal {
   readonly journal: string; readonly manifest: string;
   private readonly artifactPrefix: string;
   constructor(private readonly directory: string, readonly runId: string,
-    private readonly stop: (runId: string, reason: string) => void, limits: JournalLimits = {}) {
-    this.maxText = limits.maxTextBytes ?? 256 * 1024 * 1024; this.maxPending = limits.maxPendingBytes ?? 16 * 1024 * 1024;
+    private readonly stop: (runId: string, reason: string) => void, limits: Partial<JournalLimits> = {}) {
+    this.limits = normalizeJournalLimits(limits);
     // Run IDs are host UUIDs, but keep path authority independent of a caller's spelling.
     const key = createHash("sha256").update(runId).digest("hex");
     this.artifactPrefix = `run-${key}`;
@@ -31,6 +34,7 @@ export class PrivateJournal {
   }
   private enqueue(bytes: number, operation: () => Promise<unknown>) {
     this.pending += bytes;
+    this.peakPending = Math.max(this.peakPending, this.pending);
     this.tail = this.tail.then(operation).then(() => {}, () => this.fail("private_journal_persistence_failed")).finally(() => { this.pending -= bytes; });
   }
   private sanitize(value: unknown, opaque = false): unknown {
@@ -43,16 +47,19 @@ export class PrivateJournal {
       const bytes = Buffer.from(data.data, "base64"), sha256 = createHash("sha256").update(bytes).digest("hex");
       let artifact = this.images.get(sha256);
       if (!artifact) {
-        if (bytes.length > 2 * 1024 * 1024 || this.imageBytes + bytes.length > 32 * 1024 ** 3 || this.images.size >= 12000 || this.pending + bytes.length > this.maxPending) {
+        if (bytes.length > 2 * 1024 * 1024 || this.acceptedImageBytes + bytes.length > this.limits.maxImageBytes ||
+          this.images.size >= this.limits.maxImages || this.pending + bytes.length > this.limits.maxPendingBytes) {
           this.fail("private_image_evidence_capacity_bound"); return { type: "image_omitted", reason: "private_image_evidence_capacity_bound", sha256 };
         }
         artifact = { file: `${this.artifactPrefix}-image-${sha256}.png`, sha256, bytes: bytes.length, mime_type: data.mimeType };
-        this.images.set(sha256, artifact); this.imageBytes += bytes.length;
+        this.images.set(sha256, artifact); this.acceptedImageBytes += bytes.length;
         const name = artifact.file;
         this.enqueue(bytes.length, async () => {
           await this.file;
           const artifact = await open(path.join(this.directory, name), "wx", 0o600);
           try { await artifact.writeFile(bytes); await artifact.sync(); } finally { await artifact.close(); }
+          this.storedImages.add(sha256); this.imageBytes += bytes.length;
+          this.peakImageBytes = Math.max(this.peakImageBytes, this.imageBytes);
         });
       }
       return { type: "image_artifact", ...artifact };
@@ -75,11 +82,14 @@ export class PrivateJournal {
       const record = { kind, run_id: this.runId, monotonic_ms: performance.now(), value: this.sanitize(value) };
       if (this.failures.length) return false;
       const line = JSON.stringify(record) + "\n", bytes = Buffer.byteLength(line);
-      if (this.text + bytes > this.maxText || this.pending + bytes > this.maxPending) {
-        this.fail(this.text + bytes > this.maxText ? "private_journal_text_capacity_bound" : "private_journal_pending_capacity_bound"); return false;
+      if (this.acceptedText + bytes > this.limits.maxTextBytes || this.pending + bytes > this.limits.maxPendingBytes) {
+        this.fail(this.acceptedText + bytes > this.limits.maxTextBytes ? "private_journal_text_capacity_bound" : "private_journal_pending_capacity_bound"); return false;
       }
-      this.text += bytes;
-      this.enqueue(bytes, async () => { const file = await this.file; await file.writeFile(line); });
+      this.acceptedText += bytes;
+      this.enqueue(bytes, async () => {
+        const file = await this.file; await file.writeFile(line);
+        this.text += bytes; this.peakText = Math.max(this.peakText, this.text);
+      });
       return true;
     } catch { this.fail("private_journal_serialization_failed"); return false; }
   }
@@ -92,14 +102,22 @@ export class PrivateJournal {
         const file = await this.file;
         try {
           // Reserved failure marker is independent of the exhausted ordinary allowance.
-          if (this.failures.length) await file.writeFile(JSON.stringify({ kind: "evidence_failure", run_id: this.runId,
-            monotonic_ms: performance.now(), failures: this.failures }) + "\n");
+          if (this.failures.length) {
+            const marker = JSON.stringify({ kind: "evidence_failure", run_id: this.runId,
+              monotonic_ms: performance.now(), failures: this.failures }) + "\n";
+            await file.writeFile(marker);
+            this.text += Buffer.byteLength(marker); this.peakText = Math.max(this.peakText, this.text);
+          }
           await file.sync();
         } finally { await file.close(); }
       } catch { this.fail("private_journal_flush_failed"); }
       const value = { ...input, run_id: this.runId, evidence_complete: !this.failures.length, failures: this.failures,
-        journal: this.journal, image_artifacts: [...this.images.values()], text_bytes: this.text,
-        limits: { max_text_bytes: this.maxText, max_pending_bytes: this.maxPending, max_image_bytes: 32 * 1024 ** 3, max_images: 12000 },
+        journal: this.journal, image_artifacts: [...this.images.values()].filter(image => this.storedImages.has(image.sha256)),
+        text_bytes: this.text, peak_text_bytes: this.peakText, pending_bytes: this.pending, peak_pending_bytes: this.peakPending,
+        image_bytes: this.imageBytes, peak_image_bytes: this.peakImageBytes, image_count: this.storedImages.size,
+        accepted_text_bytes: this.acceptedText, accepted_image_bytes: this.acceptedImageBytes, accepted_images: this.images.size,
+        limits: { max_text_bytes: this.limits.maxTextBytes, max_pending_bytes: this.limits.maxPendingBytes,
+          max_image_bytes: this.limits.maxImageBytes, max_images: this.limits.maxImages },
         context_provenance: "SDK-visible context retained before request assembly and at the final supplemented stream invocation; neither is wire payload. Wire attempts remain unknown.",
         reasoning: "Private/hidden provider reasoning is redacted, never evidence.",
         omissions: this.failures.length ? ["Evidence is incomplete; capacity or persistence failure stopped the attempt."] : [],

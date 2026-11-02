@@ -11,7 +11,9 @@ import { objectiveMetrics } from "../server/objective-metrics.ts";
 import type { EvaluationCaps } from "./contracts.ts";
 import type { GoalAction } from "./scenarios.ts";
 import { actionMetrics, readUsageMetrics, usageMetrics, type ActionMetrics, type MeasuredInterval, type UsageMetrics, type WaitCategory } from "./results.ts";
-import { PrivateJournal, type JournalLimits } from "./private-journal.ts";
+import { PrivateJournal } from "./private-journal.ts";
+import type { JournalLimits } from "../shared/evidence-limits.ts";
+import { HOST_MONOTONIC_CLOCK_ID } from "../server/performance.ts";
 
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const counter = (value: unknown): number | null => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -78,9 +80,15 @@ export class ModelProgramEvidence {
   private readonly unsubscribeTrace: () => void;
   constructor(readonly store: Store, readonly directory: string, readonly caps: EvaluationCaps,
     readonly clockId: string, private readonly stop: (runId: string, reason: string) => void,
-    private readonly options: { limits?: JournalLimits } = {}) {
+    private readonly options: { limits?: Partial<JournalLimits> } = {}) {
     this.unsubscribeTrace = store.subscribeTraceEvidence(input => {
       this.journal(input.run_id).append("authorized_execution_evidence_before_trace_caps", input);
+      const span = object(input.payload);
+      if (input.kind === "span" && span.clock_id === HOST_MONOTONIC_CLOCK_ID &&
+          span.lifecycle_barrier_confirmed === true &&
+          (span.category === "worker_start" || span.category === "worker_cleanup")) {
+        this.sameHostInterval(input.run_id, span.category, span.started_monotonic_ms, span.ended_monotonic_ms);
+      }
     });
     this.unsubscribe = store.subscribe(event => {
       if (!event.run_id) return;
@@ -106,6 +114,17 @@ export class ModelProgramEvidence {
     this.journal(runId).append("authorized_evaluation_observation", { observation });
   }
   private omit(key: string) { this.omissions[key] = (this.omissions[key] ?? 0) + 1; }
+  private sameHostInterval(runId: string, category: WaitCategory, start: unknown, end: unknown) {
+    if (typeof start !== "number" || typeof end !== "number" || !Number.isFinite(start) || !Number.isFinite(end) || end < start) {
+      this.omit("invalid_timing_interval");
+      return;
+    }
+    this.addInterval({ run_id: runId, category, start_ms: start, end_ms: end, clock_id: this.clockId });
+  }
+  private addInterval(span: MeasuredInterval & { run_id: string }) {
+    if (this.completed.length < this.caps.reportEventPages * this.caps.eventPageRecords) this.completed.push(span);
+    else this.omit("timing_interval_budget");
+  }
   private observeEvent(event: ActivityEvent) {
     const runId = event.run_id!, data = object(event.details), now = performance.now();
     this.journal(runId).append("store_event", event);
@@ -122,8 +141,11 @@ export class ModelProgramEvidence {
     else this.omit("event_monotonic_clocks");
     const close = (key: string) => {
       const span = this.open.get(key);
-      if (span) { this.completed.push({ ...span, end_ms: now, clock_id: this.clockId }); this.open.delete(key); }
+      if (span) { this.addInterval({ ...span, end_ms: now, clock_id: this.clockId }); this.open.delete(key); }
     };
+    if (event.type === "program.source_timing" && data.clock_id === HOST_MONOTONIC_CLOCK_ID)
+      this.sameHostInterval(runId, "source_validation", data.started_monotonic_ms,
+        data.validation_finished_monotonic_ms ?? data.ended_monotonic_ms);
     if (event.type === "model.call") {
       const count = (this.admissions.get(runId) ?? 0) + 1;
       this.admissions.set(runId, count);
@@ -239,7 +261,7 @@ export class ModelProgramEvidence {
   async measure<T>(runId: string, category: WaitCategory, operation: () => Promise<T>): Promise<T> {
     const start = performance.now();
     try { return await operation(); }
-    finally { this.completed.push({ run_id: runId, start_ms: start, end_ms: performance.now(), category, clock_id: this.clockId }); }
+    finally { this.addInterval({ run_id: runId, start_ms: start, end_ms: performance.now(), category, clock_id: this.clockId }); }
   }
   intervals(runId: string, endMs: number): MeasuredInterval[] {
     // An unclosed span is not attributed beyond observed settlement: that remainder is unknown.

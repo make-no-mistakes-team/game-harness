@@ -43,6 +43,11 @@ test("cached PNG never bypasses freshness checks on a later selection", async ()
 
 test("actor selection exposes typed image separately from honest unsynchronized metadata", async () => {
   const scope = frameScope(), packet = nativeFrame({ sequence: 73 });
+  const header = new DataView(packet.buffer);
+  header.setBigUint64(72, 41n, true);
+  header.setFloat64(96, 123.5, true);
+  header.setFloat32(132, 1, true);
+  header.setUint32(312, 1, true);
   const selector = new ActorFrameSelector({ latestFrame: () => packet, scope: () => scope });
   const selected = await selector.select();
   expect(selected.images).toHaveLength(1);
@@ -58,6 +63,8 @@ test("actor selection exposes typed image separately from honest unsynchronized 
   expect(selected.metadata).not.toHaveProperty("capture_space");
   expect(selected.metadata).not.toHaveProperty("capture_screen");
   expect(selected.metadata).not.toHaveProperty("synchronized");
+  expect(selected.metadata).not.toHaveProperty("capture");
+  expect(selected.metadata).not.toHaveProperty("render");
 });
 
 test("authority revoked during asynchronous encoding rejects rather than relabeling a prior-life image", async () => {

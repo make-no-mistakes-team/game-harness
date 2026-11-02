@@ -154,7 +154,7 @@ async function register(
   name = "fixture",
   dependencies: SkillRef[] = [],
 ) {
-  const view = await manager.register(runId, {
+  const view = await manager.register(runId, { entry: "run",
     name,
     source:
       'return {status:"completed",summary:"Fixture complete",result:null};',
@@ -163,6 +163,44 @@ async function register(
   });
   return { skill_id: view.skill_id, version: view.version };
 }
+
+test("source registration rechecks authority after artifact preparation before publishing a receipt", async () => {
+  const { store, run, manager } = fixture(async () => completed);
+  let authorized = true;
+  const registerSource = store.registerSkill.bind(store);
+  store.registerSkill = (...args) => {
+    const pending = registerSource(...args);
+    authorized = false;
+    return pending;
+  };
+  const registration = { call_id: "stopped-registration", input: { name: "stopped source" } };
+  await expect(manager.register(run.run_id, { entry: "run", name: "stopped source", card, dependencies: [],
+    source: 'return {status:"completed",summary:"Not published",result:null};' }, () => {
+    if (!authorized) throw new Error("Authority revoked during persistence");
+  }, registration)).rejects.toThrow("Authority revoked");
+  expect(store.skills(run.run_id)).toEqual([]);
+  expect(store.completedToolCall(run.run_id, registration.call_id, registration.input)).toBeNull();
+});
+
+test("snapshot import rechecks authority after artifact preparation before publishing into its destination", async () => {
+  const { store, run, manager } = fixture(async () => completed);
+  const ref = await register(manager, run.run_id), snapshot = store.skill(run.run_id, ref);
+  const destination = { ...run, run_id: crypto.randomUUID() };
+  store.saveRun(destination);
+  let authorized = true;
+  const importSource = store.importSkill.bind(store);
+  store.importSkill = (...args) => {
+    const pending = importSource(...args);
+    authorized = false;
+    return pending;
+  };
+  await expect(manager.importSnapshot(destination.run_id, snapshot, () => {
+    if (!authorized) throw new Error("Import authority revoked during persistence");
+  })).rejects.toThrow("Import authority revoked");
+  expect(store.skills(destination.run_id)).toEqual([]);
+  expect(store.events(destination.run_id).filter(event => event.type === "skill.revalidated_import")).toEqual([]);
+});
+
 function closed(
   store: Store,
   runId: string,
@@ -189,7 +227,7 @@ function start(
   args: Json = null,
   limits: SkillLimits = { ...DEFAULT_SKILL_LIMITS },
 ) {
-  return {
+  return { entry: "run" as const,
     skill_id: skill.skill_id,
     version: skill.version,
     start_key,
@@ -290,7 +328,7 @@ describe("durable program execution through host capabilities", () => {
       const { directory, store, run, manager } = fixture(generatedWorker);
       const observer = new ModelProgramEvidence(store, directory, DEFAULT_EVALUATION_CAPS, "test-host-clock", () => {});
       try {
-        const skill = await manager.register(run.run_id, { name: `terminal summary ${summaryLength}`, card, dependencies: [],
+        const skill = await manager.register(run.run_id, { entry: "run", name: `terminal summary ${summaryLength}`, card, dependencies: [],
           source: `const receipt = await game.action({kind:"look",yaw:0,pitch:0});
 return {status:"completed",summary:"s".repeat(${summaryLength}),result:{receipt,details:{selected:"actor-authored detail retained"}}};` });
         const accepted = manager.start(run.run_id, start(run, skill, `summary-${summaryLength}`));
@@ -326,7 +364,7 @@ return {status:"completed",summary:"s".repeat(${summaryLength}),result:{receipt,
 
   test("a brief generated summary keeps detailed raw receipts in structured result without increasing protocol limits", async () => {
     const { store, run, manager } = fixture(generatedWorker);
-    const skill = await manager.register(run.run_id, { name: "brief result with details", card, dependencies: [],
+    const skill = await manager.register(run.run_id, { entry: "run", name: "brief result with details", card, dependencies: [],
       source: 'const receipt=await game.action({kind:"look",yaw:0,pitch:0});return {status:"completed",summary:"One bounded fixture action settled; details are in result.",result:{receipt,details:"d".repeat(4000)}};' });
     const execution = manager.start(run.run_id, start(run, skill, "brief-result"));
     await closed(store, run.run_id, execution.execution_id);
@@ -335,7 +373,7 @@ return {status:"completed",summary:"s".repeat(${summaryLength}),result:{receipt,
     expect(outcome.result!.result as unknown).toEqual({ receipt: success, details: "d".repeat(4000) });
   });
 
-  test("real Runtime and generated worker catch pre-admission invalid_request then explicitly observe and choose one corrected action", async () => {
+  test("real Runtime and generated worker reject wire and semantic invalid requests before admission then permit one fresh corrected action", async () => {
     const directory = mkdtempSync(join(tmpdir(), "gameharness-registered-runtime-"));
     const store = new Store(directory), observation = authorizedObservation();
     const submitted = Promise.withResolvers<void>(), failed = Promise.withResolvers<never>();
@@ -364,9 +402,20 @@ try {
 if (!diagnostic || diagnostic.code !== "invalid_request") {
   return {status:"blocked",summary:"Precise validation diagnostic was unavailable",result:{diagnostic}};
 }
+let ordinaryDiagnostic = null;
+try {
+  await game.action({kind:"world_input",steps:[{ticks:1,
+    held:{forward:true,back:false,left:false,right:false,jump:false,sprint:false,sneak:false,attack:false,use:false},
+    edges:[],view:{kind:"unchanged"},selected_hotbar:null}]});
+} catch (error) {
+  ordinaryDiagnostic = {code:error.code,message:error.message};
+}
+if (!ordinaryDiagnostic || ordinaryDiagnostic.code !== "invalid_request") {
+  return {status:"blocked",summary:"Ordered input validation was unavailable",result:{diagnostic,ordinaryDiagnostic}};
+}
 const fresh = await game.observe();
 const corrected = await game.action({kind:"look",yaw:fresh.data.player.yaw,pitch:0});
-return {status:"completed",summary:"Explicit fresh bounded decision after pre-admission rejection",result:{diagnostic,corrected}};
+return {status:"completed",summary:"Explicit fresh bounded decision after pre-admission rejection",result:{diagnostic,ordinaryDiagnostic,corrected}};
 `;
     const auth = {
       snapshot: () => ({ status: "ready", authenticated: true, provider: "openai-codex", account_label: null,
@@ -405,6 +454,7 @@ return {status:"completed",summary:"Explicit fresh bounded decision after pre-ad
       await Promise.race([closed(store, run.run_id, execution.execution_id), failed.promise]);
       const outcome = store.skillExecution(run.run_id, { execution_id: execution.execution_id })!;
       expect(outcome).toMatchObject({ status: "succeeded", result: { result: { diagnostic: { code: "invalid_request" },
+        ordinaryDiagnostic: { code: "invalid_request" },
         corrected: { status: "succeeded" } } } });
       const result = outcome.result!.result as { diagnostic: { message: string } };
       expect(result.diagnostic.message).toContain("range");
@@ -436,7 +486,7 @@ return {status:"completed",summary:"Explicit fresh bounded decision after pre-ad
     const observer = new ModelProgramEvidence(store, directory, DEFAULT_EVALUATION_CAPS,
       "test-host-clock", (_runId, reason) => { stops.push(reason); });
     try {
-      const skill = await manager.register(run.run_id, {
+      const skill = await manager.register(run.run_id, { entry: "run",
         name: "caught capability failures", card, dependencies: [],
         source: `
 let handled = 0;

@@ -38,7 +38,7 @@ export function encodeNativeFramePng(frame: Uint8Array, receivedAt = Date.now())
     const stride = header.width * 4, rows = Buffer.allocUnsafe((stride + 1) * header.height);
     for (let y = 0; y < header.height; y++) {
       const offset = y * (stride + 1); rows[offset] = 0;
-      const source = 32 + (header.bottomUp ? header.height - 1 - y : y) * stride;
+      const source = header.headerBytes + (header.bottomUp ? header.height - 1 - y : y) * stride;
       rows.set(frame.subarray(source, source + stride), offset + 1);
       // Match the game viewer: framebuffer alpha is not display transparency.
       // Preserve every RGB byte while presenting each native pixel as opaque.

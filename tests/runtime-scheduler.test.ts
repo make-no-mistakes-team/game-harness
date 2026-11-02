@@ -18,12 +18,156 @@ import type { AuthManager } from "../src/server/auth.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 import type { Database } from "bun:sqlite";
+import { DEFAULT_RESIDENT_LIMITS, type ControllerStepResult } from "../src/shared/resident.ts";
+import { controllerFrameFixture } from "./helpers/controller-frame.ts";
+import { jsonSchema } from "../src/shared/primitives.ts";
 const resources: { runtime: Runtime; store: Store; directory: string }[] = [];
 afterEach(async () => {
   for (const resource of resources.splice(0)) {
     await resource.runtime.close();
     resource.store.close();
     rmSync(resource.directory, { recursive: true, force: true });
+  }
+});
+
+for (const backlog of [0, 501]) test(`Runtime resident attention reaches the real serialized strategist across ${backlog} unread progress events while diagnostics do not replan`, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gameharness-resident-attention-")), store = new Store(directory);
+  const adapter = minecraftTestAdapter(), observation = minecraftObservationFixture(adapter);
+  const state: GameState = { status: "connected", username: "Fixture", version: "1.21.4", world_id: observation.world_id,
+    epoch: observation.epoch, session_id: observation.session_id, life: observation.life,
+    binding: minecraftTestBinding(adapter), space: observation.space, screen: null, presentation: adapter.projectObservation(observation),
+    video: { status: "idle", width: 0, height: 0, fps: null, frames: 0, last_frame_at: null, error: null },
+    last_observation_at: observation.captured_at, error: null };
+  let sample = 0;
+  const game: GameBridge = {
+    connect: async () => {}, disconnect: async () => {}, snapshot: () => state, observe: async () => observation,
+    execute: async () => { throw new Error("Resident attention has no finite action"); },
+    cancel: async () => {}, neutralize: async () => {}, emergencyStop: async () => {},
+    adapter: () => adapter, subscribe: () => () => {},
+    openController: async (reservation, generation) => {
+      const owner = { operation_id: reservation.operation_id, generation: 1, scope: reservation.scope };
+      let retired = false;
+      return { owner, controllerGeneration: generation,
+        sample: async () => {
+          const frame = controllerFrameFixture(observation.life.life_id, observation.space.space_epoch);
+          frame.frame_seq = ++sample; frame.native_tick = sample; frame.captured_native_ns = String(sample * 50000000);
+          return jsonSchema.parse(frame);
+        },
+        submit: () => { throw new Error("Neutral resident must not submit input"); }, renew: async () => {},
+        revoke: async () => {
+          retired = true;
+          return { owner, controller_generation: generation, admission_revoked: true, last_applied_sequence: 0,
+            ordered_edge_prefix: 0, retirement_applied_native_tick: sample, retirement_applied_native_ns: String(sample * 50000000),
+            input_application: "confirmed", unresolved_operation_refs: [] };
+        },
+        snapshot: () => ({ fenced: retired, retired, submitted_sequence: 0, applied_sequence: 0, ordered_edge_prefix: 0,
+          pending_frames: 0, pending_edges: 0, last_input: null, reason: null }) };
+    },
+  };
+  let attentionReady = false, attentionEmitted = false;
+  const contexts: Record<string, any>[] = [];
+  const gates: ({ stop?: boolean; reason?: string } | undefined)[][] = [];
+  let written: unknown, started: unknown, promptFailure: unknown;
+  let tools: AgentTool[] = [], gate: Parameters<Agent["setBeforeModelCall"]>[0], creates = 0, active = 0, maximumActive = 0, steps = 0;
+  const fakeAgent = { setBeforeModelCall: (hook: typeof gate) => { gate = hook; },
+    setTools: (selected: AgentTool[]) => { tools = selected; }, subscribe: () => () => {},
+    replaceMessages: () => {}, abort: () => {}, waitForIdle: async () => {},
+    prompt: async (text: string) => {
+      active++; maximumActive = Math.max(maximumActive, active);
+      try {
+        contexts.push(JSON.parse(text));
+        const turnGates = [(await gate?.({ systemPrompt: [], messages: [], tools: [] })) ?? undefined];
+        gates.push(turnGates);
+        if (contexts.length === 1) {
+          written = (await tools.find(tool => tool.name === "program_write")!.execute("resident-write", {
+            entry: "step", name: "Attention resident", source: "export function step(frame,state,intent) { return {input:{kind:'world',held:{forward:false,back:false,left:false,right:false,jump:false,sprint:false,sneak:false,attack:false,use:false},edges:[],view:{kind:'unchanged'},selected_hotbar:null},next_state:state,status:'running',events:[]}; }",
+            dependencies: [], card: { purpose: "Authored attention", applicability: "Fixture", method: "Bounded event",
+              reason: "Strategic routing regression", limitations: "No gameplay claim" },
+          })).details;
+          started = (await tools.find(tool => tool.name === "program_run")!.execute("resident-start", { operation: "start", entry: "step",
+            name: "Attention resident", args: null, initial_state: null,
+            limits: { ...DEFAULT_RESIDENT_LIMITS, frequency_hz: 20, duration_ms: 10000 } })).details;
+        }
+        turnGates.push((await gate?.({ systemPrompt: [], messages: [], tools: [] })) ?? undefined);
+      } catch (error) {
+        promptFailure = error;
+        throw error;
+      } finally { active--; }
+    } };
+  const auth = { snapshot: () => ({ status: "ready", authenticated: true, provider: "openai-codex", account_label: null,
+    models: [{ id: "fixture-model", name: "Fixture", provider: "fixture", context_window: null }], login: null, error: null }),
+    createAgent: async (options: { tools: AgentTool[] }) => { creates++; tools = options.tools; return fakeAgent as unknown as Agent; },
+    releaseAgent: async () => {} } as unknown as AuthManager;
+  const neutral: ControllerStepResult["input"] = { kind: "world",
+    held: { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, attack: false, use: false },
+    edges: [], view: { kind: "unchanged" }, selected_hotbar: null };
+  const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }),
+    createResidentAnalysisWorker: async () => { throw new Error("Attention regression must not request analysis computation"); },
+    createResidentWorker: async () => ({
+      step: async (): Promise<ControllerStepResult> => {
+        const step = steps++;
+        const emitAttention = attentionReady && !attentionEmitted;
+        if (emitAttention) attentionEmitted = true;
+        return { input: neutral, next_state: null, status: "running", events: step === 0
+          ? [{ kind: "diagnostic", urgency: "urgent", summary: "Diagnostic is not replan demand", details: { marker: "diagnostic" } }]
+          : emitAttention ? [
+            { kind: "attention", urgency: "ordinary", summary: "Inventory changed near the workshop", details: { material: "oak_planks", count: 4 } },
+            { kind: "attention", urgency: "urgent", summary: "Need a new target", details: { reason: "observed obstruction" } },
+          ] : [] };
+      }, close: async () => {},
+    }) } as unknown as SandboxService;
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  resources.push({ runtime, store, directory });
+  const eventWaits: { promise: Promise<void>; cancel: () => void }[] = [];
+  const event = (type: string) => {
+    const done = Promise.withResolvers<void>();
+    const off = store.subscribe(entry => {
+      if (entry.type === type) { off(); done.resolve(); }
+      else if (entry.type === "scheduler.turn_failed" || entry.type === "skill.closed") {
+        off(); done.reject(new Error(`Waiting for ${type}, but fixture emitted ${entry.type}: ${entry.summary}; prompt failure: ${String(promptFailure)}; tool results: ${JSON.stringify({ written, started })}`));
+      }
+    });
+    void done.promise.catch(() => {});
+    eventWaits.push({ promise: done.promise, cancel: () => {
+      off(); done.reject(new Error(`Fixture finished before ${type}`));
+    } });
+    return done.promise;
+  };
+  try {
+  await runtime.initialize();
+  const run = await runtime.createRun({ task: "Observe bounded resident attention", goal: adapter.goals.find(goal => goal.goal_id === "custom")!,
+    model_id: "fixture-model" });
+  const initial = event("scheduler.turn_finished"), diagnostic = event("controller.event");
+  await runtime.control(run.run_id, "start"); await initial;
+  expect(written).toMatchObject({ entry: "step" });
+  expect(started).toMatchObject({ entry: "step" });
+  expect(gates[0]?.[0]?.stop).not.toBe(true);
+  expect(gates[0]?.[1]?.stop).toBe(true);
+  await diagnostic;
+  await new Promise(resolve => setTimeout(resolve, 150));
+  expect(contexts).toHaveLength(1);
+  for (let index = 0; index < backlog; index++)
+    store.event(run.run_id, "controller.progress", "Retained non-waking controller progress", { sample: index });
+  const replanned = event("scheduler.turn_finished"); attentionReady = true; await replanned;
+  expect(contexts).toHaveLength(2); expect(creates).toBe(1); expect(maximumActive).toBe(1);
+  expect(gates[1]?.[0]?.stop).not.toBe(true);
+  expect(gates[1]?.[1]?.stop).toBe(true);
+  expect(runtime.snapshot()?.executions[0]).toMatchObject({ entry: "step", status: "running" });
+  expect(contexts[1]!.reason).toContain("resident_attention");
+  expect(contexts[1]!.feedback).toEqual(expect.arrayContaining([
+    expect.objectContaining({ type: "controller.event", summary: "Inventory changed near the workshop", details:
+      expect.objectContaining({ event: { kind: "attention", urgency: "ordinary", summary: "Inventory changed near the workshop",
+        details: { material: "oak_planks", count: 4 } } }) }),
+    expect.objectContaining({ type: "controller.event", summary: "Need a new target", details:
+      expect.objectContaining({ event: { kind: "attention", urgency: "urgent", summary: "Need a new target",
+        details: { reason: "observed obstruction" } } }) }),
+  ]));
+  expect(Buffer.byteLength(JSON.stringify(contexts[1]!.feedback))).toBeLessThanOrEqual(8192);
+  await new Promise(resolve => setTimeout(resolve, 150));
+  expect(contexts).toHaveLength(2);
+  } finally {
+    for (const wait of eventWaits) wait.cancel();
+    await Promise.allSettled(eventWaits.map(wait => wait.promise));
   }
 });
 

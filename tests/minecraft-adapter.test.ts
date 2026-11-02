@@ -16,11 +16,13 @@ function fixture(goalId: string, initial: Record<string, number> = {}) {
     adapter: { id: "fabric-owned-client", version: "1.0.0", build_hash: "a".repeat(64) },
     observation: { schema_version: 3, schema_hash: contractHash(schemas.observation),
       payload_schema: { id: "minecraft_observation_v1", version: 1, hash: contractHash(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_360_r8_v1", version: 1, configuration, configuration_hash: contractHash(configuration) } },
+      profile: { id: "minecraft_assisted_rgb_360_r8_control_v4", version: 4, configuration, configuration_hash: contractHash(configuration) } },
     capabilities: [
-      { id: "minecraft.action", version: 1, schema_hash: contractHash(schemas.capabilities["minecraft.action@1"]) },
+      { id: "minecraft.action", version: 4, schema_hash: contractHash(schemas.capabilities["minecraft.action@4"]) },
       { id: "minecraft.recipes", version: 1, schema_hash: contractHash(schemas.capabilities["minecraft.recipes@1"]) },
-    ], actuator: "native", executable: { api_version: 4, validator_version: 4, runtime_version: 4 } };
+      { id: "minecraft.visible_screen", version: 1, schema_hash: contractHash(schemas.capabilities["minecraft.visible_screen@1"]) },
+      { id: "minecraft.controller_frame", version: 2, schema_hash: contractHash(schemas.capabilities["minecraft.controller_frame@2"]) },
+    ], actuator: "native", executable: { api_version: 5, validator_version: 5, runtime_version: 5 } };
   const adapter = createMinecraftAdapter(descriptor, { now: () => now });
   const scope: EffectScope = { world_id: "world", session_id: "session", epoch: 2147483665, native_boot_id: "boot",
     run_id: "run", run_generation: 7, life_id: 3, space_epoch: 4, execution_id: "own-invocation", source_hash: "b".repeat(64) };
@@ -28,7 +30,7 @@ function fixture(goalId: string, initial: Record<string, number> = {}) {
     return { schema_version: 3, world_id: scope.world_id, session_id: scope.session_id, epoch: scope.epoch,
       native_boot_id: scope.native_boot_id, life: { life_id: scope.life_id, status: "alive", can_respawn: false, death: null },
       space: { dimension_id: "minecraft:overworld", space_epoch: scope.space_epoch }, screen: null,
-      observation_seq: seq, captured_at: new Date(at).toISOString(), compatibility_hash: contractHash(descriptor),
+      observation_seq: seq, captured_at: new Date(at).toISOString(), compatibility_hash: contractHash(adapter.descriptor),
       profile_id: descriptor.observation.profile.id, profile_configuration_hash: descriptor.observation.profile.configuration_hash,
       freshness: { max_age_ms: 1000, partial: true }, data: {
         player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: 20, food: 20, on_ground: true, in_water: false,
@@ -136,4 +138,51 @@ test("custom completion is never promoted to trusted adapter verification", () =
   const f = fixture("custom");
   expect(f.adapter.verifyCompletion(f.manifest, [f.observed(f.observation({ crafting_table: 1 }))])).toMatchObject({
     status: "unknown", reason: "custom_completion_is_model_reported_unverified" });
+});
+
+const guiAction = { kind: "screen_input", screen: { screen_id: "visible", incarnation: 1, layout_revision: 1 },
+  operations: [{ kind: "slot", slot_id: 0, button: "left", mode: "ordinary", hotbar_slot: null,
+    expected_cursor: { item: null, count: 0 }, expected_slots: [{ slot_id: 0, value: { item: "crafting_table", count: 1 } }] }] };
+function guiFact(producer: "crafting" | "smelting" | "trading" | "anvil" | null) {
+  return { kind: "gui_transaction", mechanism: "visible_gui", operation_index: 0, receipt_ref: "native:3:17",
+    input_application: "confirmed", effect_status: "confirmed", inventory_before: { oak_planks: 4 }, inventory_after: {},
+    productions: producer ? [{ producer, item: "crafting_table", count: 1, source: "server_result_slot_take", production_confirmed: true }] : [] };
+}
+
+for (const producer of ["crafting", "smelting", "trading", "anvil", null] as const) {
+  test(`GUI ${producer ?? "transfer"} receipts do not confuse crafting mechanism with possession`, () => {
+    const f = fixture("craft_crafting_table");
+    const facts = f.adapter.effectEvidence!(f.scope, "gui-owned", guiAction,
+      { status: "succeeded", summary: "Native GUI transaction", evidence: { effect_confirmed: true, gui_transactions: [guiFact(producer)] } },
+      new Date(now - 500).toISOString());
+    expect(facts).toHaveLength(1);
+    expect(facts[0]!.schema.id).toBe("minecraft_gui_transaction_v1");
+    // The result was taken into cursor first; retention is independently observed later.
+    expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({ crafting_table: 1 }))]).status)
+      .toBe(producer === "crafting" ? "verified" : "incomplete");
+  });
+}
+
+test("lost GUI acknowledgement cannot invent production from acquired inventory and never projects helper facts", () => {
+  const f = fixture("craft_crafting_table");
+  const facts = f.adapter.effectEvidence!(f.scope, "lost-gui", guiAction,
+    { status: "unknown", summary: "ACK lost", evidence: { inventory_after: { crafting_table: 1 } } }, new Date(now - 500).toISOString());
+  expect(facts.map(fact => fact.schema.id)).toEqual(["minecraft_effect_uncertainty_v1"]);
+  expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({ crafting_table: 1 }))]).status).toBe("unknown");
+});
+
+test("GUI projection admits an independently confirmed prefix but rejects duplicate, out-of-range and unconfirmed receipts", () => {
+  const f = fixture("craft_crafting_table"), fact = guiFact("crafting");
+  const facts = f.adapter.effectEvidence!(f.scope, "partial-gui", guiAction, { status: "unknown", summary: "Second ACK lost",
+    evidence: { gui_transactions: [fact, fact, { ...fact, operation_index: 1, receipt_ref: "other" },
+      { ...fact, receipt_ref: "unconfirmed", effect_status: "unknown" }] } }, new Date(now - 500).toISOString());
+  expect(facts.map(fact => fact.schema.id)).toEqual(["minecraft_gui_transaction_v1", "minecraft_effect_uncertainty_v1"]);
+  expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({ crafting_table: 1 }))]).status).toBe("verified");
+});
+
+test("GUI effect bounds scale with actual operation count including legal empty persistence", () => {
+  const f = fixture("custom");
+  expect(f.adapter.effectDeadlineMs({ ...guiAction, operations: [] })).toBe(5000);
+  expect(f.adapter.effectDeadlineMs(guiAction)).toBe(9000);
+  expect(f.adapter.effectDeadlineMs({ ...guiAction, operations: Array.from({ length: 16 }, () => ({ kind: "close" })) })).toBe(69000);
 });

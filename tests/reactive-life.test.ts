@@ -194,6 +194,22 @@ async function select(f: { reactive: ReactiveRuntime }, backend: PolicySpec["bac
 }
 const replacement: PolicyDecision = { kind: "replace", action: { kind: "look", yaw: 0.2, pitch: 0 }, reason: "Neutral lifecycle test" };
 
+test("Stop during policy artifact preparation prevents durable policy publication", async () => {
+  const f = fixture();
+  const registerSource = f.store.registerPolicy.bind(f.store);
+  f.store.registerPolicy = (...args) => {
+    const pending = registerSource(...args);
+    f.run.status = "stopping";
+    f.store.saveRun(f.run);
+    f.nextGeneration();
+    return pending;
+  };
+  await expect(f.reactive.register(specification("javascript"), 1, 1)).rejects.toThrow();
+  expect(f.store.policies(f.run.run_id)).toEqual([]);
+  expect(f.store.events(f.run.run_id).filter(event => event.type === "policy.authored")).toEqual([]);
+  expect(f.executed).toEqual([]);
+});
+
 test("old-life completion cannot control a same-epoch respawn; selected definitions resume with fresh worker state", async () => {
   const f = fixture();
   const { view } = await select(f);
@@ -448,12 +464,12 @@ test("owned reactive cancellation preserves UNKNOWN action and root, drains the 
     uncertaintyFences++;
     f.reactive.fence();
   });
-  const skill = await manager.register(f.run.run_id, {
+  const skill = await manager.register(f.run.run_id, { entry: "run",
     name: "Interrupted movement",
     source: 'await game.action({kind:"move",controls:{forward:true},duration_ms:2000}); return {status:"completed",summary:"Movement settled",result:null};',
     dependencies: [], card: specification().card,
   });
-  const root = manager.start(f.run.run_id, {
+  const root = manager.start(f.run.run_id, { entry: "run",
     skill_id: skill.skill_id, version: skill.version, start_key: "managed-preemption",
     ...executionScopeFixture(f.run),
     args: null, limits: { ...DEFAULT_SKILL_LIMITS },

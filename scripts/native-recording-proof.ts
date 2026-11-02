@@ -6,10 +6,10 @@ import { fileURLToPath } from "node:url";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import { ActorFrameSelector, encodeNativeFramePng, type FrameScope } from "../src/server/actor-frames.ts";
 import { EpisodeRecorder } from "../src/server/recording.ts";
-import { NativeFixture, bounded, pause, requireProof, until } from "../src/evaluation/native-game.ts";
+import { NativeFixture, bounded, requireProof } from "../src/evaluation/native-game.ts";
 import { assertNativeArtifactFresh, requireTierOptIn } from "../src/evaluation/tiers.ts";
 import { NATURAL_WORLD_CONDITIONS } from "../src/evaluation/scenarios.ts";
-import { createEvaluationCaps } from "../src/evaluation/config.ts";
+import { createEvaluationCaps, DEFAULT_EVALUATION_CAPS, loadEvidenceProfile } from "../src/evaluation/config.ts";
 import type { Runtime } from "../src/server/runtime.ts";
 import type { Store } from "../src/server/store.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
@@ -21,35 +21,96 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 
 /** Separate privileged infrastructure exercise. NEVER imported by natural acceptance. */
 export async function runNativeRecordingProof(args: readonly string[], project = fileURLToPath(new URL("..", import.meta.url))) {
+  const seen = new Set<string>();
+  let jar: string | undefined, evidenceFilename: string | undefined, requestedDuration: number | undefined;
+  for (let index = 0; index < args.length; index++) {
+    const flag = args[index]!;
+    requireProof(!seen.has(flag), "Duplicate recorder proof argument");
+    seen.add(flag);
+    if (["--jar", "--duration-ms", "--evidence-profile"].includes(flag)) {
+      const value = args[++index];
+      requireProof(value && !value.startsWith("--"), `Missing value for ${flag}`);
+      if (flag === "--jar") jar = value;
+      else if (flag === "--evidence-profile") evidenceFilename = value;
+      else {
+        requestedDuration = Number(value);
+        requireProof(/^\d+$/.test(value) && Number.isSafeInteger(requestedDuration) &&
+          requestedDuration >= 1000 && requestedDuration <= 1800000, "--duration-ms must be an integer from 1000 through 1800000");
+      }
+    } else requireProof(["--allow-native", "--natural-start", "--runtime-load", "--result-contract"].includes(flag),
+      "Unknown recorder proof argument; no inference/auth/login flags are accepted");
+  }
   requireTierOptIn("native-game", { allowNative: args.includes("--allow-native") });
-  const flags = [...args], jarIndex = flags.indexOf("--jar");
-  requireProof(jarIndex >= 0 && flags[jarIndex + 1], "Pass --jar <fresh-built.jar>");
-  const artifact = assertNativeArtifactFresh(project, flags[jarIndex + 1]!);
-  if (process.env.GAMEHARNESS_PROOF_EXPECTED_JAR_SHA256)
-    requireProof(process.env.GAMEHARNESS_PROOF_EXPECTED_JAR_SHA256 === artifact.sha256, "Dispatcher and recorder proof disagree about the built native artifact");
-  flags.splice(jarIndex, 2);
-  const naturalStart = flags.includes("--natural-start");
-  const runtimeLoad = flags.includes("--runtime-load");
-  const resultContract = flags.includes("--result-contract");
+  requireProof(jar, "Pass --jar <fresh-built.jar>");
+  const naturalStart = seen.has("--natural-start"), runtimeLoad = seen.has("--runtime-load"), resultContract = seen.has("--result-contract");
   requireProof(!runtimeLoad || naturalStart, "--runtime-load requires --natural-start");
   requireProof(!resultContract || runtimeLoad, "--result-contract requires --runtime-load");
-  requireProof(flags.every(flag => flag === "--allow-native" || flag === "--natural-start" || flag === "--runtime-load" || flag === "--result-contract"), "Recorder proof accepts only --allow-native, --jar, --natural-start, --runtime-load and --result-contract; no inference/auth/login flags");
+  const sustainedRuntime = runtimeLoad && requestedDuration !== undefined;
+  requireProof((requestedDuration ?? 0) < 1200000 || evidenceFilename !== undefined,
+    "A 20–30 minute proof requires an explicit complete evidence profile");
+  const evidenceProfile = loadEvidenceProfile(project, evidenceFilename);
+  const finalHoldMs = requestedDuration === undefined ? 0 : 100;
+  const captureMs = requestedDuration === undefined ? (naturalStart ? 30000 : null) : Math.max(requestedDuration, resultContract ? 30000 : 0);
+  const runMs = (captureMs ?? 0) + finalHoldMs + DEFAULT_EVALUATION_CAPS.observationMs * 8;
+  const declaredCaps = requestedDuration === undefined
+    ? naturalStart ? createEvaluationCaps({ runMs: 60000, totalMs: 300000 }) : createEvaluationCaps()
+    : createEvaluationCaps({ runMs,
+    totalMs: DEFAULT_EVALUATION_CAPS.startMs * (runtimeLoad ? 2 : 1) + runMs +
+      DEFAULT_EVALUATION_CAPS.observationMs * 12 + evidenceProfile.profile.render_timeout_ms +
+      DEFAULT_EVALUATION_CAPS.diagnosticsMs + DEFAULT_EVALUATION_CAPS.cleanupMs });
+  // The recorder stays open through mandatory technical work, not only the
+  // requested wait. The existing run allowance includes phase work and final
+  // hold; use that same complete scope for duration and nominal frame admission.
+  const captureScopeMs = declaredCaps.runMs;
+  const minimumCaptureFrames = Math.ceil(captureScopeMs * 30 / 1000) + 1;
+  requireProof(evidenceProfile.profile.recording.maxDurationMs >= captureScopeMs &&
+    evidenceProfile.profile.recording.maxFrames >= minimumCaptureFrames,
+  "Evidence profile cannot cover the complete admitted capture scope, phase allowance, final hold and nominal 30 Hz frames");
+  const entireSampleStarted = performance.now();
+  const artifact = assertNativeArtifactFresh(project, jar);
+  if (process.env.GAMEHARNESS_PROOF_EXPECTED_JAR_SHA256)
+    requireProof(process.env.GAMEHARNESS_PROOF_EXPECTED_JAR_SHA256 === artifact.sha256, "Dispatcher and recorder proof disagree about the built native artifact");
   process.env.GAMEHARNESS_NATIVE_PROOF = "1";
   process.env.GAMEHARNESS_PROOF_EXPECTED_JAR_SHA256 = artifact.sha256;
-  const fixture = await NativeFixture.create("native-recording-proof", { projectRoot: project,
-    ...(naturalStart ? { conditions: { ...NATURAL_WORLD_CONDITIONS, seed: "1" },
-      caps: createEvaluationCaps({ runMs: 60000, totalMs: 300000 }) } : {}) });
+  const fixture = await NativeFixture.create("native-recording-proof", { projectRoot: project, caps: declaredCaps,
+    ...(naturalStart ? { conditions: { ...NATURAL_WORLD_CONDITIONS, seed: "1" } } : {}) });
+  fixture.report.native_artifact = artifact;
+  fixture.report.evidence_profile = evidenceProfile;
+  fixture.report.capture_declaration = { requested_duration_ms: requestedDuration ?? null, final_hold_ms: finalHoldMs,
+    minimum_capture_ms: captureMs,
+    admitted_capture_scope_ms: captureScopeMs, minimum_nominal_frames: minimumCaptureFrames,
+    explicit_capture_setup_and_phase_allowance_ms: requestedDuration === undefined ? null : DEFAULT_EVALUATION_CAPS.observationMs * 8,
+    natural_start_default_ms: naturalStart ? 30000 : null, caps: declaredCaps,
+    entire_sample_allowance_ms: declaredCaps.totalMs, timing: "One entire-sample deadline including setup, capture, renderer, probe and cleanup" };
   if (naturalStart) {
     fixture.report.classification = "zero_provider_natural_start_recording_infrastructure_not_autonomous_gameplay";
     fixture.report.provider_calls = 0;
   }
   let recorder: EpisodeRecorder | undefined, failure: unknown, endedAt = 0;
+  let captureTimer: ReturnType<typeof setTimeout> | undefined;
   let runtime: Runtime | undefined, store: Store | undefined, sandbox: SandboxService | undefined;
   let evidence: ModelProgramEvidence | undefined, runtimeRunId: string | undefined;
   const agents = new Set<Agent>();
   const requestContinuity: Array<{ observation_seq: number; subgoal: string | null; worksite: unknown }> = [];
-  let failSyntheticRequest: (() => void) | undefined, expectedProviderFailure = false;
+  let failSyntheticRequest: (() => void) | undefined, completeSyntheticRequest: (() => void) | undefined, expectedProviderFailure = false;
   const proofScope = new AbortController();
+  const pause = (ms: number) => new Promise<void>((resolve, reject) => {
+    if (proofScope.signal.aborted) { reject(proofScope.signal.reason); return; }
+    const aborted = () => { clearTimeout(timer); reject(proofScope.signal.reason); };
+    const timer = setTimeout(() => { proofScope.signal.removeEventListener("abort", aborted); resolve(); }, ms);
+    proofScope.signal.addEventListener("abort", aborted, { once: true });
+  });
+  const until = async <T>(read: () => T | Promise<T>, accepts: (value: T) => boolean, ms: number, message: string): Promise<T> => {
+    const end = performance.now() + ms;
+    while (performance.now() < end) {
+      proofScope.signal.throwIfAborted();
+      const value = await bounded(Promise.resolve().then(read), Math.max(1, end - performance.now()), message);
+      proofScope.signal.throwIfAborted();
+      if (accepts(value)) return value;
+      await pause(Math.min(50, Math.max(1, end - performance.now())));
+    }
+    throw new Error(message);
+  };
   const completed = Promise.withResolvers<void>();
   let nativeDrain: ReturnType<NativeFixture["close"]> | undefined;
   let cleanupDeadline = Infinity, cleanupTimer: ReturnType<typeof setTimeout> | undefined;
@@ -71,7 +132,8 @@ export async function runNativeRecordingProof(args: readonly string[], project =
   };
   const mark = (event: string, details?: unknown) => events.push({ event, wall_ms: Date.now(), monotonic_ms: performance.now(), details });
   const armCleanup = (signalExit = false) => {
-    const budget = Math.min(fixture.caps.cleanupMs, signalExit ? 9000 : fixture.caps.cleanupMs);
+    const budget = Math.max(1, Math.min(fixture.caps.cleanupMs, signalExit ? 9000 : fixture.caps.cleanupMs,
+      fixture.caps.totalMs - (performance.now() - entireSampleStarted)));
     const end = performance.now() + budget;
     if (end >= cleanupDeadline) return;
     cleanupDeadline = end; cleanup.budget_ms = budget; clearTimeout(cleanupTimer);
@@ -98,11 +160,13 @@ export async function runNativeRecordingProof(args: readonly string[], project =
     interrupted(why, true);
     return completed.promise;
   }, { exitOnly: true });
-  const deadline = setTimeout(() => interrupted("entire_sample_deadline"), fixture.caps.totalMs);
+  const deadline = setTimeout(() => interrupted("entire_sample_deadline"),
+    Math.max(1, fixture.caps.totalMs - (performance.now() - entireSampleStarted)));
   const assertOpen = () => requireProof(!proofScope.signal.aborted && !failure, "Recorder proof scope closed");
   try {
-    assertOpen(); await fixture.start(); assertOpen();
+    assertOpen(); await flush(); assertOpen(); await fixture.start(); assertOpen();
     if (!naturalStart) { await fixture.flat(); assertOpen(); }
+    fixture.report.native_configuration = await fixture.diagnostics();
     const initial = await fixture.bridge.observe();
     let runId: string = randomUUID();
     if (runtimeLoad) {
@@ -128,6 +192,16 @@ export async function runNativeRecordingProof(args: readonly string[], project =
           subgoal: retained?.current_subgoal ?? null, worksite: retained?.authored_state?.worksite ?? null });
         mark("synthetic_stream_entered", { images: context.messages.flatMap(message => Array.isArray(message.content)
           ? message.content.filter(part => part.type === "image") : []).length, provider_calls: 0 });
+        if (sustainedRuntime && !resultContract) {
+          requireProof(++syntheticCalls === 1, "Long recording scope cannot chain synthetic idle requests");
+          const message: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider,
+            model: model.id, stopReason: "stop", timestamp: Date.now(),
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+          events.push({ type: "start", partial: message });
+          events.push({ type: "done", reason: "stop", message }); events.end();
+          mark("synthetic_tool_free_stream_completed", { actual_provider_calls: 0 });
+          return events;
+        }
         if (resultContract && ++syntheticCalls <= 2) {
           const compact = syntheticCalls === 1;
           const source = compact
@@ -158,6 +232,14 @@ export async function runNativeRecordingProof(args: readonly string[], project =
             usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
           events.push({ type: "error", reason: "error", error: message }); events.end();
         };
+        completeSyntheticRequest = () => {
+          const message: AssistantMessage = { role: "assistant", content: [], api: model.api, provider: model.provider,
+            model: model.id, stopReason: "stop", timestamp: Date.now(),
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+          options?.signal?.removeEventListener("abort", abort);
+          events.push({ type: "done", reason: "stop", message }); events.end();
+          mark("synthetic_tool_free_stream_completed", { actual_provider_calls: 0 });
+        };
         if (options?.signal?.aborted) abort(); else options?.signal?.addEventListener("abort", abort, { once: true });
         return events;
       };
@@ -178,7 +260,8 @@ export async function runNativeRecordingProof(args: readonly string[], project =
         failure ??= new Error(why); proofScope.abort(failure);
         void runtime?.control(id, "stop").catch(() => {});
       };
-      evidence = new evidenceModule.ModelProgramEvidence(store, fixture.evidenceDirectory, fixture.caps, `offline-${randomUUID()}`, stop);
+      evidence = new evidenceModule.ModelProgramEvidence(store, fixture.evidenceDirectory, fixture.caps, `offline-${randomUUID()}`, stop,
+        { limits: evidenceProfile.profile.journal });
       evidence.observeAuthAgents(auth);
       runtime = new runtimeModule.Runtime(store, auth, fixture.bridge, sandbox, () => {}, { adapter: () => fixture.bridge.adapter(), actorFrames: fixture.bridge });
       await runtime.initialize(); evidence.bindRuntime(runtime);
@@ -188,6 +271,8 @@ export async function runNativeRecordingProof(args: readonly string[], project =
         goal, model_id: model.id, working_programs: "fresh" });
       runId = run.run_id; runtimeRunId = runId;
       fixture.report.runtime_load = { synthetic_provider_transport: true, actual_provider_calls: 0, real_sdk_runtime_store_journal: true,
+        scope: sustainedRuntime ? "Initial normally completed real SDK synthetic context (plus disclosed result-contract mechanics when requested); then explicitly paused Runtime with sustained authorized observation/journal/actor-image/PNG workload, not continuous thinking or gameplay"
+          : "Short real SDK/context workload with abortable synthetic transport",
         real_sandbox_prepared: true, worker_effects: resultContract ? "Evaluator-authored neutral look receipts, not gameplay" : 0,
         result_contract: resultContract, run_id: runId, model_descriptor_only: model.id };
     }
@@ -197,25 +282,40 @@ export async function runNativeRecordingProof(args: readonly string[], project =
     const selector = new ActorFrameSelector({ latestFrame: () => fixture.bridge.latestFrame(), scope: () => scope });
     const entry: Record<string, unknown> = { name: runtimeLoad ? "natural_start_runtime_capture_load" : naturalStart ? "natural_start_capture_actor_observation_load" : "delivered_frames_menu_wait_interrupt_respawn",
       conditions: { provider_calls: 0, model_inference: "disabled", replay_timing: replayTiming,
+        evidence_profile: evidenceProfile, requested_duration_ms: requestedDuration ?? null, final_hold_ms: finalHoldMs,
         classification: "Privileged evaluator-owned native recording/image infrastructure only; no natural gameplay or live vision claim" },
       status: "running", started_at: new Date().toISOString() };
     fixture.cases.push(entry);
     const caseStarted = performance.now();
     const encodingMs: number[] = [];
+    let firstCaptureReceivedAt: number | undefined;
+    const healthSamples: Array<{ elapsed_ms: number; health: ReturnType<EpisodeRecorder["health"]> }> = [];
+    entry.recorder_health_samples = healthSamples;
     entry.recording_encode_ms = encodingMs;
     // This proof owns its failure path. Do not enter NativeFixture.case's
     // synchronous failure-frame FFmpeg capture after the proof scope is revoked.
     try {
       assertOpen();
+      if (requestedDuration !== undefined)
+        captureTimer = setTimeout(() => interrupted("capture_scope_deadline"), fixture.caps.runMs);
       recorder = new EpisodeRecorder({ directory: path.join(fixture.evidenceDirectory, "recording"), bridge: fixture.bridge,
+        limits: evidenceProfile.profile.recording,
         identity: { episode_id: randomUUID(), run_id: runId, world_id: initial.world_id, session_id: initial.session_id },
         onIncomplete: why => { failure ??= new Error(why); proofScope.abort(); },
         encode: async (frame, receivedAt) => {
+          firstCaptureReceivedAt ??= performance.now();
           const started = performance.now();
           try { return await encodeNativeFramePng(frame, receivedAt); }
           finally { encodingMs.push(performance.now() - started); }
         } });
       if (runtimeLoad) await runtime!.control(runId, "start");
+      if (sustainedRuntime && !resultContract) {
+        await until(() => evidence!.events(runId),
+          events => events.some(event => event.type === "scheduler.turn_finished"), fixture.caps.observationMs,
+          "Initial tool-free SDK turn did not settle normally");
+        await runtime!.control(runId, "pause");
+        mark("long_runtime_explicit_idle_after_settled_turn");
+      }
       const image = async (name: string) => {
         const selected = await until(async () => {
           assertOpen();
@@ -231,13 +331,18 @@ export async function runNativeRecordingProof(args: readonly string[], project =
       if (!runtimeLoad) entry.alive_image = await image("actor-alive");
       if (naturalStart) {
         entry.conditions = { provider_calls: 0, model_inference: "disabled",
-          classification: runtimeLoad ? "Zero-provider real Runtime/SDK/context/journal capture load, no actions or console commands"
+          classification: resultContract ? "Zero-provider real Runtime/SDK/context/journal capture load with disclosed evaluator-authored neutral-look result/continuity mechanics, no gameplay or console commands"
+            : runtimeLoad ? "Zero-provider real Runtime/SDK/context/journal capture load, no actions or console commands"
             : "Zero-provider fresh seed1 capture/actor-image load, no actions or console commands",
-          capture_ms: 30000, observation_poll_ms: 100, actor_image_interval_ms: runtimeLoad ? null : 1000 };
+          capture_ms: captureMs, requested_duration_ms: requestedDuration ?? null, final_hold_ms: finalHoldMs,
+          evidence_profile: evidenceProfile, observation_poll_ms: 100, actor_image_interval_ms: runtimeLoad && !sustainedRuntime ? null : 1000 };
         const samples: unknown[] = [];
         entry.actor_samples = samples;
-        const untilAt = performance.now() + 30000;
+        if (requestedDuration !== undefined)
+          await until(() => firstCaptureReceivedAt, value => value !== undefined, fixture.caps.observationMs, "No first capture arrived");
+        const untilAt = requestedDuration === undefined ? performance.now() + 30000 : firstCaptureReceivedAt! + captureMs!;
         let imageAt = performance.now();
+        let healthAt = performance.now();
         let continuityChecked = false;
         while (performance.now() < untilAt) {
           assertOpen();
@@ -245,7 +350,11 @@ export async function runNativeRecordingProof(args: readonly string[], project =
           requireProof(observation.life.status === "alive", "Natural-start capture lost its alive observation scope");
           evidence?.recordObservation(runId, observation);
           scope = { ...scope, life_id: observation.life.life_id, space: observation.space, screen: observation.screen };
-          if (!runtimeLoad && performance.now() >= imageAt) {
+          if (performance.now() >= healthAt) {
+            healthSamples.push({ elapsed_ms: performance.now() - caseStarted, health: recorder.health() });
+            healthAt = performance.now() + 1000;
+          }
+          if ((!runtimeLoad || sustainedRuntime) && performance.now() >= imageAt) {
             samples.push(await image(`actor-sample-${samples.length}`));
             imageAt = performance.now() + 1000;
           }
@@ -278,6 +387,14 @@ export async function runNativeRecordingProof(args: readonly string[], project =
               no_replayed_execution: store!.allSkillExecutions(runId).length === 2, actual_provider_calls: 0 };
             requireProof(store!.allSkillExecutions(runId).length === 2, "Continuity replayed a completed execution");
             continuityChecked = true;
+            if (sustainedRuntime) {
+              const previousTurns = evidence!.events(runId).filter(event => event.type === "scheduler.turn_finished").length;
+              completeSyntheticRequest!();
+              await until(() => evidence!.events(runId).filter(event => event.type === "scheduler.turn_finished").length,
+                count => count > previousTurns, fixture.caps.observationMs, "Recovered synthetic SDK turn did not settle normally");
+              await runtime!.control(runId, "pause");
+              mark("long_runtime_explicit_idle_after_settled_turn");
+            }
           }
           await pause(100);
         }
@@ -336,12 +453,32 @@ export async function runNativeRecordingProof(args: readonly string[], project =
         entry.respawn_image = await image("actor-respawn");
         await pause(600); assertOpen();
       }
+      if (requestedDuration !== undefined) {
+        await until(() => firstCaptureReceivedAt, value => value !== undefined, fixture.caps.observationMs, "No first capture arrived");
+        const captureDeadline = firstCaptureReceivedAt! + requestedDuration;
+        let healthAt = performance.now();
+        while (performance.now() < captureDeadline) {
+          assertOpen();
+          const observation = await fixture.bridge.observe();
+          requireProof(observation.life.status === "alive", "Extended capture lost its alive observation scope");
+          evidence?.recordObservation(runId, observation);
+          if (performance.now() >= healthAt) {
+            healthSamples.push({ elapsed_ms: performance.now() - caseStarted, health: recorder.health() });
+            healthAt = performance.now() + 1000;
+          }
+          await pause(Math.min(100, Math.max(1, captureDeadline - performance.now())));
+        }
+        mark("requested_capture_window_completed", { requested_duration_ms: requestedDuration });
+        await pause(finalHoldMs); assertOpen();
+        mark("declared_final_hold_completed", { final_hold_ms: finalHoldMs });
+      }
       endedAt = Date.now(); mark("capture_finished");
+      clearTimeout(captureTimer);
       const recording = await recorder!.finish({ endedAt, reason: "declared_native_proof_completed" });
       entry.recording = recording;
       requireProof(recording.status === "complete", "Recording evidence is incomplete");
       assertOpen();
-      entry.replay = await recorder!.renderReplay({ signal: proofScope.signal });
+      entry.replay = await recorder!.renderReplay({ signal: proofScope.signal, timeoutMs: evidenceProfile.profile.render_timeout_ms });
       assertOpen();
       const records = (await readFile(path.join(fixture.evidenceDirectory, "recording/frames.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line)).filter(record => record.kind === "frame");
       assertOpen();
@@ -369,11 +506,19 @@ export async function runNativeRecordingProof(args: readonly string[], project =
       } finally {
         clearTimeout(probeTimer); proofScope.signal.removeEventListener("abort", abortProbe);
       }
+      requireProof(records.length > 0, "No captured frames were durably indexed");
       const expectedMs = endedAt - records[0]!.captured_at;
-      const interval = Math.max(0, ...records.slice(1).map((record, index) => record.captured_at - records[index]!.captured_at));
+      let interval = 0;
+      for (let index = 1; index < records.length; index++)
+        interval = Math.max(interval, records[index]!.captured_at - records[index - 1]!.captured_at);
       entry.replay_timing = { expected_ms: expectedMs, actual_ms: replayMs, ...replayTiming, maximum_observed_gap_ms: interval,
+        requested_duration_ms: requestedDuration ?? null, final_hold_ms: endedAt - records.at(-1)!.captured_at,
+        declared_final_hold_ms: finalHoldMs, indexed_frames: records.length, manifest_stored_frames: recording.stored_frames,
+        index_agrees_with_manifest: records.length === recording.stored_frames,
         events, audio: "not_recorded", visual_inspection: "Parent must inspect actual replay/menu/wait/interruption/respawn; duration alone is not visual proof" };
       requireProof(Number.isFinite(replayMs) && Math.abs(replayMs - expectedMs) <= replayTiming.tolerance_ms, "Replay compressed or stretched capture time beyond the predeclared nominal 30 Hz interval plus 100 ms");
+      requireProof(records.length === recording.stored_frames, "Durable frame index disagrees with recording manifest");
+      requireProof(requestedDuration === undefined || expectedMs >= requestedDuration, "Actual indexed capture is shorter than the requested duration");
       entry.status = "passed";
     } catch (error) {
       entry.status = "failed"; entry.error = error instanceof Error ? error.message : String(error);
@@ -381,7 +526,7 @@ export async function runNativeRecordingProof(args: readonly string[], project =
     } finally { entry.elapsed_ms = performance.now() - caseStarted; }
   } catch (error) { failure ??= error; }
   finally {
-    clearTimeout(deadline);
+    clearTimeout(deadline); clearTimeout(captureTimer);
     proofScope.abort(failure ?? new Error("Recorder proof scope closed"));
     armCleanup();
     try {

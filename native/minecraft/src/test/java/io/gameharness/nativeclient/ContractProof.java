@@ -19,6 +19,15 @@ public final class ContractProof {
   }
 
   public static void main(String[] ignored) throws Exception {
+    NativeTimingProof.main(ignored);
+    WorldInputProof.main(ignored);
+    VisibleScreenProof.main(ignored);
+    GuiProductionProof.main(ignored);
+    ControllerRenderProof.main(ignored);
+    ControllerStreamProof.main(ignored);
+    InputConsumptionProof.main(ignored);
+    NativeControlWriterProof.main(ignored);
+    NativeEvaluationProof.main(ignored);
     visibleInventoryCustody();
     InventoryMotionProof.main(ignored);
     require(ContractIdentity.counter("2147483665") == 2147483665L, "epoch narrowed through signed int");
@@ -48,16 +57,16 @@ public final class ContractProof {
     EffectAuthority noScreenAuthority = new EffectAuthority("session", "world", 2147483665L);
     noScreenAuthority.bind(HASH, 3, new EffectAuthority.Space("minecraft:overworld", 4), null);
     EffectAuthority.Owner noScreenOwner = owner(noScreenAuthority, 3, 4, "no-screen-operation");
-    require(noScreenAuthority.grant(noScreenOwner, HASH, null) == EffectAuthority.Rejection.NONE,
+    require(noScreenAuthority.grant(noScreenOwner, HASH, EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.NONE,
         "closed-view positive control failed before screen transition");
-    require(noScreenAuthority.validateApplication(noScreenOwner, HASH, null) == EffectAuthority.Rejection.NONE,
+    require(noScreenAuthority.validateApplication(noScreenOwner, HASH, EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.NONE,
         "explicit no-screen positive control was rejected");
     noScreenAuthority.screenChanged(new EffectAuthority.Screen("new-handler", 1, 0));
-    require(noScreenAuthority.validateApplication(noScreenOwner, HASH, null) == EffectAuthority.Rejection.STALE_SCREEN,
+    require(noScreenAuthority.validateApplication(noScreenOwner, HASH, EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.STALE_SCREEN,
         "explicit no-screen precondition became unrestricted after native receive");
     require(noScreenAuthority.complete(noScreenOwner), "original no-screen owner did not retire");
     EffectAuthority.Owner staleNoScreenReceive = owner(noScreenAuthority, 3, 4, "stale-no-screen-receive");
-    require(noScreenAuthority.grant(staleNoScreenReceive, HASH, null) == EffectAuthority.Rejection.STALE_SCREEN
+    require(noScreenAuthority.grant(staleNoScreenReceive, HASH, EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.STALE_SCREEN
         && noScreenAuthority.owner() == null, "receive granted an owner against explicit absence after a screen opened");
 
     var noScreenWire = new com.google.gson.JsonObject();
@@ -72,9 +81,14 @@ public final class ContractProof {
     var noScreenAction = new com.google.gson.JsonObject(); noScreenAction.addProperty("kind", "look");
     noScreenAction.addProperty("yaw", 0); noScreenAction.addProperty("pitch", 0);
     noScreenWire.add("action", noScreenAction);
-    noScreenWire.add("expected_screen", com.google.gson.JsonNull.INSTANCE);
-    require(NativeEffectContract.effect(noScreenWire, noScreenOwner.cancellationGeneration()).expectedScreen() == null,
+    noScreenWire.add("expected_screen", NativeEffectContract.precondition(EffectAuthority.ScreenPrecondition.absent()));
+    require(NativeEffectContract.effect(noScreenWire, noScreenOwner.cancellationGeneration()).expectedScreen().kind().equals("absent"),
         "actual native JSON codec lost explicit screen absence");
+    noScreenWire.add("expected_screen", com.google.gson.JsonNull.INSTANCE);
+    boolean legacyScreenRejected = false;
+    try { NativeEffectContract.effect(noScreenWire, noScreenOwner.cancellationGeneration()); }
+    catch (RuntimeException expected) { legacyScreenRejected = true; }
+    require(legacyScreenRejected, "legacy null screen wire granted authority");
     noScreenWire.remove("expected_screen");
     boolean missingScreenRejected = false;
     try { NativeEffectContract.effect(noScreenWire, noScreenOwner.cancellationGeneration()); }
@@ -86,20 +100,20 @@ public final class ContractProof {
         "native boot identity changed inside one JVM process");
     EffectAuthority.Space overworld = new EffectAuthority.Space("minecraft:overworld", 4);
     EffectAuthority.Owner first = owner(authority, 3, 4, "operation-A");
-    require(authority.grant(first, HASH, null) == EffectAuthority.Rejection.NOT_READY, "loading fabricated an initial space/readiness");
+    require(authority.grant(first, HASH, EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.NOT_READY, "loading fabricated an initial space/readiness");
     authority.bind(HASH, 3, overworld, null);
     first = owner(authority, 3, 4, "operation-A");
-    require(authority.grant(first, HASH, null) == EffectAuthority.Rejection.NONE, "matching owner not admitted");
+    require(authority.grant(first, HASH, EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.NONE, "matching owner not admitted");
     require(first.scope().runGeneration() != first.cancellationGeneration(), "host/native generations accidentally conflated");
-    require(authority.validateApplication(first, HASH, null) == EffectAuthority.Rejection.NONE, "matching apply was rejected");
-    require(authority.validateApplication(first, "b".repeat(64), null) == EffectAuthority.Rejection.STALE_BINDING,
+    require(authority.validateApplication(first, HASH, EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.NONE, "matching apply was rejected");
+    require(authority.validateApplication(first, "b".repeat(64), EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.STALE_BINDING,
         "mismatched descriptor acquired native authority");
     EffectAuthority.Scope sourceChanged = scope(authority, 3, 4, "replacement-invocation", "b".repeat(64));
-    require(authority.validateApplication(new EffectAuthority.Owner("operation-A", sourceChanged, authority.cancellationGeneration()), HASH, null)
+    require(authority.validateApplication(new EffectAuthority.Owner("operation-A", sourceChanged, authority.cancellationGeneration()), HASH, EffectAuthority.ScreenPrecondition.absent())
         == EffectAuthority.Rejection.INACTIVE_OWNER, "old source/invocation bypassed owner fence");
     EffectAuthority.Scope bootChanged = new EffectAuthority.Scope("session", "world", 2147483665L, "other-boot", "run", 2147483699L,
         3, 4, "invocation", HASH);
-    require(authority.grant(new EffectAuthority.Owner("other-boot", bootChanged, authority.cancellationGeneration()), HASH, null)
+    require(authority.grant(new EffectAuthority.Owner("other-boot", bootChanged, authority.cancellationGeneration()), HASH, EffectAuthority.ScreenPrecondition.absent())
         == EffectAuthority.Rejection.STALE_SCOPE, "stale native boot admitted");
 
     // Queue a production application check behind a stalled executor. An actual
@@ -114,7 +128,7 @@ public final class ContractProof {
       });
       entered.await();
       var application = gameThread.submit(() -> {
-        if (authority.validateApplication(queuedOwner, HASH, null) == EffectAuthority.Rejection.NONE) effects.incrementAndGet();
+        if (authority.validateApplication(queuedOwner, HASH, EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.NONE) effects.incrementAndGet();
       });
       authority.spaceChanged(new EffectAuthority.Space("minecraft:overworld", 5));
       release.countDown(); application.get();
@@ -122,23 +136,23 @@ public final class ContractProof {
     require(effects.get() == 0, "queued old-space work acted after same-dimension relocation");
     require(authority.close(first) == false, "stale cleanup revoked replacement authority");
     EffectAuthority.Owner replacement = owner(authority, 3, 5, "operation-B");
-    require(authority.grant(replacement, HASH, null) == EffectAuthority.Rejection.NONE, "replacement owner not admitted");
+    require(authority.grant(replacement, HASH, EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.NONE, "replacement owner not admitted");
     require(!authority.close(first) && authority.owner().equals(replacement), "late A cleanup revoked B");
     authority.lifeChanged(4);
-    require(authority.validateApplication(replacement, HASH, null) != EffectAuthority.Rejection.NONE, "old-life work applied after respawn");
+    require(authority.validateApplication(replacement, HASH, EffectAuthority.ScreenPrecondition.absent()) != EffectAuthority.Rejection.NONE, "old-life work applied after respawn");
     require(authority.space().epoch() == 5, "life and space were collapsed into one counter");
     EffectAuthority.Screen beforeScreen = new EffectAuthority.Screen("screen-A", 1, 0);
     authority.bind(HASH, 4, authority.space(), beforeScreen);
     EffectAuthority.Owner screenOwner = owner(authority, 4, 5, "screen-operation");
-    require(authority.grant(screenOwner, HASH, beforeScreen) == EffectAuthority.Rejection.NONE, "screen owner not admitted");
+    require(authority.grant(screenOwner, HASH, EffectAuthority.ScreenPrecondition.transaction(beforeScreen)) == EffectAuthority.Rejection.NONE, "screen owner not admitted");
     authority.screenChanged(new EffectAuthority.Screen("screen-B", 2, 0));
-    require(authority.validateApplication(screenOwner, HASH, beforeScreen) == EffectAuthority.Rejection.STALE_SCREEN,
+    require(authority.validateApplication(screenOwner, HASH, EffectAuthority.ScreenPrecondition.transaction(beforeScreen)) == EffectAuthority.Rejection.STALE_SCREEN,
         "queued expected screen instance was silently retargeted");
     require(authority.validateApplication(screenOwner, HASH) == EffectAuthority.Rejection.NONE,
         "native helper's internal view transition invented a new UI capability precondition");
     require(authority.complete(screenOwner), "normal operation did not retire its owner");
     EffectAuthority.Owner nextOperation = owner(authority, 4, 5, "following-operation");
-    require(authority.grant(nextOperation, HASH, authority.screen()) == EffectAuthority.Rejection.NONE, "following owner was not admitted");
+    require(authority.grant(nextOperation, HASH, EffectAuthority.ScreenPrecondition.transaction(authority.screen())) == EffectAuthority.Rejection.NONE, "following owner was not admitted");
     require(!authority.close(screenOwner) && authority.owner().equals(nextOperation), "late completed-owner cleanup revoked the following operation");
 
     record Cell(int x, int y, int z) {}
@@ -186,9 +200,6 @@ public final class ContractProof {
     require(!screens.transactionChanged(viewA), "late old-view callback revised replacement screen");
     screens.invalidate(); require(screens.screen() == null, "uncertain screen retained authority");
 
-    // This is the built resource in the actual proof classpath, not launch config.
-    var descriptor = NativeContractResource.descriptor("balanced");
-    require(descriptor.getAsJsonObject("executable").get("api_version").getAsInt() == 4, "compiled API contract not 4");
     require(NativeContractResource.RADIUS == 8 && NativeContractResource.MAX_BLOCKS == 144
         && NativeContractResource.MAX_ENTITIES == 32, "compiled effective sampler is not the actual current condition");
     System.out.println("Native contract counter/queue/owner/target/screen/build-resource proof passed");

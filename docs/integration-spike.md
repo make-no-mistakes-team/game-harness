@@ -12,6 +12,7 @@ The current reference host is Linux x64 with:
 
 - Bun 1.3.14+, Node.js 24+, Python 3 at `/usr/bin/python3` with the `python3-dbus` module for Linux Secret Service access, and a Java 21 development kit. Set `JAVA_HOME` to the selected JDK, or select Java 21 through `PATH`; build and runtime no longer require a Debian installation path. The runtime resolves `PATH` Java before restricting child environments. Project package scripts use Bun's shell so host shell startup files cannot replace the exported toolchain.
 - `flock` and a running local Docker Engine. The application user must be able to use `/usr/bin/docker` without an interactive `sudo` prompt. The policy supervisor uses the local daemon with a restricted environment, not a custom remote Docker context.
+- FFmpeg 6.1+ with `ffprobe` and the `libx264` encoder for recorded replay export, `bun test` and `bun run check:integration`. The unit-only tier does not require these codec tools; full verification does. See the [codec setup](#replay-codec-prerequisites).
 - Network access for package installation, pinned image/server acquisition, and OpenAI authorization/inference; an account with the required Codex entitlement.
 - A working graphical session and an official Minecraft Launcher account entitled to Java Edition, with installed 1.21.4 client artifacts/assets under `~/.minecraft`. The owned client uses those files read-only and launches with isolated data, not personal worlds/configuration. Its account token crosses private bootstrap stdin, not model context or process arguments.
 
@@ -33,6 +34,43 @@ The exact policy image is pinned in [`src/server/sandbox.ts`](../src/server/sand
 `bun run start` opens Electron 45.0.0. `bun run dev` builds once and opens the same desktop; it is not a watched Vite browser server. Keep the checkout, dependencies, built renderer/native artifacts and both sandbox files available.
 
 Electron spawns its own Bun backend, chooses a dynamic loopback port and verifies a private readiness nonce through stdout and `/v1/ready`. It neither reuses arbitrary services nor treats an occupied fixed port as its backend. Startup holds a nonblocking data-directory `flock`. Closing the window sends the owned backend SIGTERM; if cleanup exceeds 30 seconds the pending window remains, rather than claiming shutdown or force-killing unrelated processes.
+
+### Replay codec prerequisites
+
+On Ubuntu 24.04 or a newer supported Ubuntu host, install the distribution's
+FFmpeg package, which supplies both command-line tools and libx264:
+
+```sh
+sudo apt-get update
+sudo apt-get install --yes ffmpeg
+```
+
+On Fedora, use a full FFmpeg build with libx264 rather than `ffmpeg-free` alone.
+If the host's policy permits RPM Fusion, follow its
+[repository configuration](https://rpmfusion.org/Configuration) and
+[full FFmpeg instructions](https://rpmfusion.org/Howto/Multimedia).
+After repository setup, its documented replacement command is:
+
+```sh
+sudo dnf swap ffmpeg-free ffmpeg --allowerasing
+```
+
+Review the proposed package transaction before accepting it. RPM Fusion is a
+third-party source; do not bypass the host's repository policy. A different
+approved FFmpeg build is acceptable if it provides the required tools and encoder.
+
+After installing project dependencies, verify the tools and actual export path:
+
+```sh
+ffmpeg -version
+ffprobe -version
+bun test tests/replay-timing.test.ts
+```
+
+These mandatory integration tests use the real local encoder and probe without
+starting Minecraft, Docker or provider inference. Missing codec tools are setup
+errors, not a reason to skip or replace the regressions. CI installs the same
+Ubuntu package before running the default suite.
 
 ### Electron sandbox helper
 
@@ -164,7 +202,7 @@ Current authenticated read interfaces are bounded projections, not filesystem ac
 
 The application establishes its local session through `GET /v1/session`; renderer mutations require that session and CSRF token. Reads grant no filesystem, execution or activation authority. **Inspect programs** opens bounded source/card/execution evidence; **History** selects retained runs. Source uses inert text, including HTML/script-like content. A source file or successful validation does not prove invocation or effects.
 
-`GET /v1/video` upgrades to a same-origin WebSocket with `gh_session` and Host/Origin checks; no CSRF token appears in its URL. Each binary message has a validated 32-byte little-endian GHV1 header and tightly packed RGBA8 pixels. Frames come from native final-framebuffer capture after world/hand/HUD, independently of control IPC. Latest-frame buffering is bounded; target 1280×720 at 30 fps is not a measured guarantee. The renderer uses a read-only canvas, with explicit idle/starting/streaming/stale/error status. Neither generated programs nor model tools receive frames or raw buffers.
+`GET /v1/video` upgrades to a same-origin WebSocket with `gh_session` and Host/Origin checks; no CSRF token appears in its URL. Each live message has a validated 328-byte little-endian GHV2 header and tightly packed RGBA8 pixels. Frames come from native final-framebuffer capture after world/hand/HUD, independently of control IPC. Packet-bound render/scope diagnostics are described in the [capture contract](runtime-contracts.md#delivered-actor-images-and-recorded-episodes); actor PNG alignment with structured observations remains unsynchronized. Latest-frame buffering is bounded; target 1280×720 at 30 fps is not a measured guarantee. The renderer uses a read-only canvas, with explicit idle/starting/streaming/stale/error status. The structured controller-frame read does not expose raw video packets or pixel buffers.
 
 The removed prismarine renderer's height/section patches and narrowly scoped AJV worker CSP exception were old-spike mechanisms, not native prerequisites. Historical Chrome terrain rendering and an OMP-managed browser's blob-worker conflict remain evidence about that renderer only.
 
@@ -233,6 +271,246 @@ A GPT-6.1-Sol episode used explicit low reasoning, a fresh seed-1 Normal Surviva
 The runtime completion remains **`model_reported_unverified`**: independent episode review does not install a trusted automatic verifier. There were **11 admissions**, **100.825 seconds** in model-request spans and an **18.604-second** longest action-free gap. Cleanup was confirmed. This was not an improvement over the earlier 198.88-second episode and establishes no general reliability, latency or full-game claim.
 
 Two partial-navigation unknowns were fenced and reconciled before fresh replanning; neither was replayed or rewritten as success. Local walking helpers were reused, but the second gathering trip used new source despite prior full procedure, arguments and outcome being available. Changed-quantity gathering reuse was not demonstrated, and no safely refused action exercised local refusal recovery. Broader I01, real inference-overlap/reaction, useful cross-session reuse and release requirements remain separately assessed.
+
+### Current native planning baseline — 29 October 2026
+
+The parent reran the real Fabric/Docker/Runtime/Store continuation baseline
+before changing activation semantics. All eight cases passed: manual positive,
+false-guard and Stop-revocation cases; automatic staging before and after
+predecessor closure; automatic false/omitted guards; and Stop during a held
+independent request. Peak simultaneous native effect ownership was one.
+Runtime, sandbox and native cleanup were confirmed, with zero provider/Jev
+calls and no experience promotion.
+
+The first attempt failed before any program or native effect started: the
+synthetic caller supplied only a tool to the SDK's pre-dispatch hook, while
+the current raw-argument gate requires the full tool-call context. The caller
+now constructs that typed context without bypassing the production hook.
+A failing-before/passing-after regression exercises real named-source
+registration and execution through that boundary. The failed attempt remains
+separate from the successful repetition.
+
+The selected native build used Java 21 and passed the boundary, contract and
+motor proofs. The system-default Java 25 build had failed during Gradle Test
+task construction; selecting the documented JDK resolved it without changing
+the build system or system default. Existing mapping/deprecation warnings
+remain. This baseline proves the exercised continuation/ownership path, not
+resident tick-rate input, model-authored gameplay, learning or lower latency.
+
+### Native control and capture timing — 29 October 2026
+
+The GHV2 repetition passed the same eight continuation cases with confirmed
+cleanup and zero provider calls. It retained 385 request timing samples with
+no missing, invalid or omitted samples, 16 source timing events, and confirmed
+startup and cleanup spans for all 12 worker executions. Fifteen successful
+movement intervals joined actual native key sampling to their original
+operation, request and native clock.
+
+The separate recording proof retained all 132 delivered frames. Its replay
+lasted 4,480 ms against 4,414 ms expected, within the declared 134 ms tolerance.
+Inspected native images showed the live world, death menu and explicit respawn.
+The compiled browser renderer also displayed the real 1280×720 native feed
+through its WebGL path; the owned world and backend were stopped afterward.
+These are infrastructure checks, not model gameplay or a frame-rate benchmark.
+
+Applying the interval partitioner to a 56.374-second retained control window
+left 2.747 seconds in overlapping categories and 29.445 seconds unattributed.
+Neither value is measured idle time. A separate recording-process window
+identified its explicit 1.600-second deliberate wait without subtracting clocks
+between processes. The SDK's first complete received SSE event is observable;
+raw network-first-byte timing is not. No pause reduction or faithful ordinary
+attack/use semantics is established by this instrumentation.
+
+### Ordinary native input conformance — 29 October 2026
+
+The `minecraft.action@2` cutover adds bounded ordinary world-input clips while
+retaining the current assisted profile. Start with fresh working programs
+after this capability change; cached validation from action version 1 is not
+a current grant. Older source and executions remain history, not a live alias.
+The [ordinary input contract](runtime-contracts.md#ordinary-minecraft-world-input)
+separates counted presses, held keys, declarative selection and applied view.
+
+The rebuilt native artifact passed 24 zero-provider cases with confirmed
+cleanup and 24 complete recordings. Nine cases checked assisted camera
+settlement, small turns and yaw wrap in all three motor profiles. Ordinary
+cases covered held digging versus entity clicks, counted clicks and crosshair
+misses; main-hand PASS to an offhand shield; bow draw/turn/release with a later
+server projectile; completed/interrupted eating; bucket and boat fallback;
+hotbar/swap/single/all drop; simultaneous attack/use; cancellation and screen
+fencing.
+
+The real drop case exposed a production ordering defect: declarative selection
+had been queued until after vanilla synchronized the selected slot. Client
+prediction showed seven dirt while server-side consequences did not match.
+Selection now applies at step entry before normal synchronization. The repeated
+case independently confirmed seven dirt on the server, then an absent selected
+slot after drop-all. Explicit hotbar key edges retain vanilla ordering.
+
+The active-owner isolation case sent keyboard, Control, button and motion
+events only to the verified owned X11 window. Raw GLFW key states and blocked
+callback counters changed, but game polling, movement, view and attack/use did
+not follow physical input. The owned cursor override disappeared after release
+even while those raw keys remained held. A single authored drop stayed single
+with physical Control held; independent server state confirmed it. This
+evaluator uses `xdotool`, system Python and libX11, without focusing a window,
+warping the global pointer or injecting global input. Normal app operation
+does not depend on that evaluator helper.
+
+All 24 clips completed browser playback at rate 1 with no media errors.
+Selected native frames and bow, drop and camera sequences were inspected.
+These checks establish the exercised input mechanics and presentation, not
+equivalent visual smoothness, a model's skill acquisition or human-like
+gameplay. The cancelled bow retained an unknown partial outcome with actual
+use released. Inventory opening retained the visible screen and refused later
+world input rather than auto-closing it or replaying unfinished steps.
+
+### Persistent visible-screen checkpoint — 29 October 2026
+
+The initial checkpoint used native control protocol 4, `minecraft.action@3`,
+`minecraft.visible_screen@1` and the separate
+`minecraft_assisted_rgb_360_r8_gui_v2` profile. Earlier action-v2/r8-v1
+gameplay and conformance results keep their original identities. Fresh
+working programs are required across this cutover; old nullable or untagged
+screen grants are not accepted.
+
+A bounded zero-provider native smoke passed with confirmed cleanup. It
+opened the actual vanilla inventory, projected all 46 slots including empty
+slots and an empty cursor, and retained that screen across reads, a no-input
+operation and three ordinary pointer transfers. Left pickup carried four
+planks; right placement left one in the slot and three on the cursor; the
+last placement restored four with an empty cursor. Three matched server
+transaction receipts recorded those transfers without inventing production.
+Explicit close left no visible screen, and an independent server inventory
+check confirmed all four planks. The inspected native frame showed the
+persistent inventory. All 91 delivered frames were retained.
+
+This checked native startup, read/slot/cursor/persistence/close and receipt
+integration, not complete progression conformance. Chest and furnace
+work/return, recipe-book crafting, merchant trades, anvil text/results,
+resize/replacement races, delayed/lost acknowledgements and the corresponding
+production hooks were outside that smoke's evidence. Custom-drawn enchantment,
+beacon, loom and stonecutter choice regions rejected as unsupported in that
+artifact. The current [visible-screen contract](runtime-contracts.md#persistent-visible-minecraft-screens)
+uses action4 and includes rendered choices and targeted scrolling; the
+earlier smoke retains its action3 identity.
+
+### Complete visible-GUI conformance — 29 October 2026
+
+The rebuilt action4 artifact passed all 18 declared zero-provider cases with
+confirmed native, Runtime and Docker cleanup and one effect writer at a time.
+Coverage includes chest/cursor conservation, direct and recipe-book crafting,
+32/33/64-event shift-craft receipts, a conserved furnace top-up followed by
+nearby work and three retained ingots, merchant paging and stale-row refusal,
+anvil text, stonecutter, loom, enchanting and beacon controls. The isolated
+worker used the real API, server production evidence and builtin goal verifier;
+its verified run reached completed without promoting fixture source as experience.
+
+Local source/cursor conflicts, physical modifiers, Escape, held resize and
+handler replacement, delayed acknowledgement and lost/late acknowledgement
+cases also passed. Lost effects remained unknown and were not replayed.
+All 3,841 recorder-delivered frames were retained in 19 complete replay
+segments. The resize transition separately retained 21 original packets and
+PNGs across 1280×720 and 1024×640; no combined resize video was fabricated.
+All 19 segments completed playback at 1× with no media-element errors, and
+selected native GUI and resize frames were inspected. Audio was not recorded.
+These evaluator-authored checks establish mechanics, not autonomous gameplay
+quality or a model's ability to choose the demonstrated operations.
+
+### Basic feedback conformance — 29 October 2026
+
+Feedback profile v3 passed eight actual native cases and a separate isolated
+Runtime/Docker/SDK worker check, with confirmed cleanup and zero provider calls.
+The cases covered own body/equipment/status, vanilla block/entity/miss
+crosshair, a delivered GHV2 pose join after full turns, bow use/release,
+movement, water/air/lava/own vehicle, independent actual-heard priming cursors,
+expiry and life/space fences. During a stopped server inventory request,
+the own client effect duration decreased from 559 to 556 while the observation
+count stayed unchanged; the inventory observation settled only after resumption.
+That is a changing body-value witness, not just an advancing frame counter.
+
+The current host also rejects obsolete GUI feedback after a coalesced
+close/replacement notice. Three failing-before/passing-after parser regressions
+cover close, replacement and reincarnation; a same-view content-revision
+case remains accepted. The final bare suite passed 1,266 tests with no failures.
+All 792 delivered frames were retained across two complete recordings, both
+played at 1× with no media-element errors; selected priming, fluid, vehicle
+and worker GUI frames were inspected. Audio was not recorded. Mute and
+attenuation negatives have production-predicate proofs, not live mute-test credit.
+This establishes the basic read interface, not resident streaming, expanded
+visibility, multipart combat attribution or autonomous gameplay quality.
+
+### Native controller transport conformance — 30 October 2026
+
+Profile v4 and frame schema 2 passed eleven actual Fabric cases with confirmed
+cleanup and zero provider/Jev calls. The same owner held a bow through new
+turn snapshots and released a server-observed projectile. Ordinary
+selection/drop retained exactly six of seven source items on the server.
+A sixteen-operation visible-GUI sequence reached confirmed input application
+after 7,145 ms, then produced a separate successful server receipt and retained
+four planks. Its pointer/receipt timeline was not relabelled a 150 ms gesture.
+
+Review found and corrected premature GUI retirement, duplicate movement
+sample credit, a two-second deadline that truncated lawful GUI sequences,
+and lost partial counted-press evidence. The GUI race has an actual
+failing-before/passing-after witness: with FINISH stopped after application,
+retirement now retains the unknown receipt and drains the old driver before
+its ACK. A fresh controller can then acquire ownership while that server
+is still stopped. Repeated movement representations remain partial rather
+than inventing clicks; a counted inventory press retains its one consumed
+press when screen entry clears the suffix.
+
+A stopped native process also held retirement unresolved until resumption.
+The measured retirement was 604 ms after capture, not within the nominal
+250 ms lease; its stale queued attack was never credited. Separate writer
+proofs exercised a real non-reading TCP peer, controlled full message/byte
+queues, reserved ACK admission and cancellation without a game-thread
+socket wait. The recording retained all 962 delivered frames, without audio.
+
+The final cohort also passed all 24 finite-input cases and an isolated
+Runtime/Docker/SDK GUI/frame check. Java 21 native proofs and typechecking
+passed; the isolated bare Bun suite passed 1,299 tests with no failures.
+All 26 resulting replays completed at 1×, with 26 playing/ended pairs and
+no media-element errors. Selected bow, GUI and worker frames were inspected.
+These are transport and vanilla-input conformance results. They do not
+establish a generated resident scheduler, a 20 Hz performance benchmark
+or better autonomous gameplay.
+
+### Explicit recording profiles and a thirty-minute proof — 30 October 2026
+
+Recording and journal limits now come from a checked evidence profile rather
+than an implicit larger default. Profile admission precedes native preparation;
+manifests retain effective limits, durable bytes, pending peaks, capture times
+and incomplete outcomes. Ordinary short-run defaults remain unchanged.
+
+A zero-provider controlled technical sample retained every delivered frame,
+writing 10,023,045,412 durable PNG bytes. Peak pending raw storage was
+11,060,184 bytes; pending frames, encoders and queued work were empty after
+completion. Native, file and renderer cleanup was confirmed.
+
+| Evidence | Images | Duration, ms |
+|---|---:|---:|
+| Original PNGs and native index including final hold | 54,004 | 1,800,141 |
+| Initial MP4 projection | 45,006 | 1,800,240 |
+| Corrected MP4, including the final boundary repeat | 54,005 | 1,800,142 |
+
+Duration agreement alone did not establish frame-complete export: the initial
+PNG demuxer used a 25 FPS time base, and a separate terminal-gap case exposed
+an understated MP4 endpoint. The correction preserves millisecond presentation
+timestamps and every image without B-frame reordering. All encoded packet
+timestamps matched the original index; the unchanged 134 ms tolerance was met.
+Original PNGs, indexes and initial movies remain unchanged.
+
+The corrected full movie reached the end at 1× without seeking, rate changes
+or media-element errors. Recovered source-abort requests remain in the temporary
+viewer's browser log; the initial viewer's content-length errors are also
+retained. Neither result is presented as error-free HTTP delivery.
+
+The recording includes a deliberate wait, native effect interruption, the
+vanilla death menu and explicit respawn in an evaluator-prepared arena.
+It proves bounded evidence retention for this horizon, not autonomous survival,
+model competence or sixteen-hour durability. Audio was absent; structured
+observations and pixels remain unsynchronized, and upstream renders can be
+omitted even when every delivered frame is retained.
 
 ### Bounded native episode-recording proof
 

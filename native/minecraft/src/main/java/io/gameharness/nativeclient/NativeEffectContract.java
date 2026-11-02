@@ -3,7 +3,7 @@ package io.gameharness.nativeclient;
 import com.google.gson.*;
 import java.util.Set;
 
-/** API4 authority codec. Historical API3 JSON is never decoded as a grant. */
+/** Sealed authority codec. Historical unsealed JSON is never decoded as a grant. */
 public final class NativeEffectContract {
   private static final Set<String> SPACE_FIELDS = Set.of("dimension_id", "space_epoch");
   private static final Set<String> SCREEN_FIELDS = Set.of("screen_id", "incarnation", "revision");
@@ -15,7 +15,7 @@ public final class NativeEffectContract {
   private static final Set<String> POLICY_FIELDS = Set.of("kind", "execution_id", "source_hash", "policy_id", "version");
   private static final Set<String> OWNER_FIELDS = Set.of("operation_id", "scope", "generation");
   public record Received(EffectAuthority.Owner owner, String compatibilityHash,
-      EffectAuthority.Screen expectedScreen, JsonObject action) {}
+      EffectAuthority.ScreenPrecondition expectedScreen, JsonObject action, WorldInputPlan worldInput) {}
   private NativeEffectContract() {}
 
   public static long counter(JsonObject object, String key) {
@@ -41,6 +41,18 @@ public final class NativeEffectContract {
     fields(value, SCREEN_FIELDS);
     return new EffectAuthority.Screen(id(value, "screen_id"), counter(value, "incarnation"), counter(value, "revision"));
   }
+  public static EffectAuthority.VisibleScreenRef visibleScreen(JsonObject value) {
+    fields(value, Set.of("screen_id", "incarnation", "layout_revision"));
+    return new EffectAuthority.VisibleScreenRef(id(value, "screen_id"), counter(value, "incarnation"), counter(value, "layout_revision"));
+  }
+  public static EffectAuthority.ScreenPrecondition precondition(JsonObject value) {
+    String kind = id(value, "kind");
+    if (kind.equals("absent")) { fields(value, Set.of("kind")); return EffectAuthority.ScreenPrecondition.absent(); }
+    fields(value, Set.of("kind", "screen"));
+    if (kind.equals("transaction")) return EffectAuthority.ScreenPrecondition.transaction(screen(value.getAsJsonObject("screen")));
+    if (kind.equals("layout")) return EffectAuthority.ScreenPrecondition.layout(visibleScreen(value.getAsJsonObject("screen")));
+    throw new IllegalArgumentException("Unknown screen authority");
+  }
   public static TargetIncarnations.Target target(JsonObject value) {
     fields(value, TARGET_FIELDS);
     return new TargetIncarnations.Target(id(value, "target_id"), counter(value, "incarnation"),
@@ -56,7 +68,24 @@ public final class NativeEffectContract {
   public static Received effect(JsonObject params, long cancellationGeneration) {
     fields(params, EFFECT_FIELDS);
     EffectAuthority.Scope scope = scope(params.getAsJsonObject("scope"));
-    JsonObject invocation = params.getAsJsonObject("invocation");
+    validateInvocation(scope, params.getAsJsonObject("invocation"));
+    JsonObject action = params.getAsJsonObject("action");
+    WorldInputPlan worldInput = id(action, "kind").equals("world_input") ? WorldInputPlan.decode(action) : null;
+    EffectAuthority.ScreenPrecondition expectedScreen = precondition(params.getAsJsonObject("expected_screen"));
+    if (worldInput != null && !expectedScreen.kind().equals("absent"))
+      throw new IllegalArgumentException("World input requires explicit absence of a screen");
+    if (id(action, "kind").equals("screen_input")) {
+      VisibleScreenContract.operations(action);
+      if (!expectedScreen.kind().equals("layout") || !visibleScreen(action.getAsJsonObject("screen")).equals(expectedScreen.layout()))
+        throw new IllegalArgumentException("GUI input requires its exact layout precondition");
+    } else if (expectedScreen.kind().equals("layout")) throw new IllegalArgumentException("Layout authority requires GUI input");
+    return new Received(new EffectAuthority.Owner(id(params, "operation_id"), scope, cancellationGeneration),
+        ContractIdentity.hash(id(params, "compatibility_hash")),
+        expectedScreen,
+        action, worldInput);
+  }
+
+  static void validateInvocation(EffectAuthority.Scope scope, JsonObject invocation) {
     String kind = id(invocation, "kind");
     if (kind.equals("policy")) {
       fields(invocation, POLICY_FIELDS);
@@ -68,10 +97,6 @@ public final class NativeEffectContract {
     }
     if (!scope.executionId().equals(id(invocation, "execution_id")) || !scope.sourceHash().equals(id(invocation, "source_hash")))
       throw new IllegalArgumentException("Invocation identity does not match its host-created scope");
-    return new Received(new EffectAuthority.Owner(id(params, "operation_id"), scope, cancellationGeneration),
-        ContractIdentity.hash(id(params, "compatibility_hash")),
-        params.get("expected_screen").isJsonNull() ? null : screen(params.getAsJsonObject("expected_screen")),
-        params.getAsJsonObject("action"));
   }
   public static EffectAuthority.Owner owner(JsonObject value) {
     fields(value, OWNER_FIELDS);
@@ -87,6 +112,16 @@ public final class NativeEffectContract {
     JsonObject value = new JsonObject();
     value.addProperty("screen_id", screen.id()); value.addProperty("incarnation", screen.incarnation()); value.addProperty("revision", screen.revision());
     return value;
+  }
+  public static JsonObject visibleScreen(EffectAuthority.VisibleScreenRef screen) {
+    JsonObject value = new JsonObject();
+    value.addProperty("screen_id", screen.id()); value.addProperty("incarnation", screen.incarnation());
+    value.addProperty("layout_revision", screen.layoutRevision()); return value;
+  }
+  public static JsonObject precondition(EffectAuthority.ScreenPrecondition screen) {
+    JsonObject value = new JsonObject(); value.addProperty("kind", screen.kind());
+    if (screen.transaction() != null) value.add("screen", screen(screen.transaction()));
+    if (screen.layout() != null) value.add("screen", visibleScreen(screen.layout())); return value;
   }
   public static JsonObject target(TargetIncarnations.Target target) {
     JsonObject value = new JsonObject();
@@ -112,7 +147,7 @@ public final class NativeEffectContract {
   }
   public static JsonObject hello(JsonObject launch, JsonObject actualDescriptor, String nativeBootId) {
     JsonObject value = new JsonObject();
-    value.addProperty("protocol", 3); value.addProperty("secret", ContractIdentity.hash(id(launch, "secret")));
+    value.addProperty("protocol", 4); value.addProperty("secret", ContractIdentity.hash(id(launch, "secret")));
     value.addProperty("session_id", id(launch, "session_id")); value.addProperty("world_id", id(launch, "world_id"));
     value.addProperty("epoch", counter(launch, "epoch")); value.addProperty("native_boot_id", ContractIdentity.id(nativeBootId));
     value.add("descriptor", actualDescriptor);

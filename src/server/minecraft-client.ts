@@ -16,6 +16,7 @@ import { z } from "zod";
 import type { AdapterSchemaCatalog, MotorProfile, RuntimeAdapter } from "../shared/contracts.ts";
 import { readNativeArtifactContract, type NativeArtifactContract } from "./native-artifact.ts";
 import { assertNativeContractFresh } from "./native-contract.ts";
+import { normalizeNativeEvaluation, type NativeEvaluationOptions } from "./native-evaluation.ts";
 
 export const JAVA = process.env.JAVA_HOME
   ? path.resolve(process.env.JAVA_HOME, "bin", "java")
@@ -24,6 +25,7 @@ export const LOADER = "0.16.10";
 export const FABRIC_API = "0.119.4+1.21.4";
 export interface NativeOptions {
   dataDir?: string;
+  evaluation?: NativeEvaluationOptions;
   java?: string;
   sourceMinecraft?: string;
   descriptor?: unknown;
@@ -43,6 +45,7 @@ export interface NativeSession {
   port: number;
   control_port: number;
   video_port: number;
+  evaluation: NativeEvaluationOptions | null;
   motor_profile?: MotorProfile;
 }
 export interface NativeProcess {
@@ -199,10 +202,12 @@ export class MinecraftClient {
   readonly sessionFile: string;
   private readonly source: string;
   private readonly java: string;
+  private readonly evaluation: Readonly<NativeEvaluationOptions> | null;
   constructor(
     private readonly projectRoot: string,
     options: NativeOptions = {},
   ) {
+    this.evaluation = normalizeNativeEvaluation(options.evaluation ?? null, process.env.GAMEHARNESS_NATIVE_PROOF === "1");
     this.dataDir = options.dataDir ?? DATA_DIR;
     this.directory = path.join(this.dataDir, "native-client");
     this.sessionFile = path.join(this.dataDir, "native-session.json");
@@ -317,6 +322,7 @@ export class MinecraftClient {
       ...config,
       control_port: controlPort,
       video_port: videoPort,
+      evaluation: this.evaluation,
     };
     await privateJson(this.sessionFile, session);
     const profileUrl = `https://meta.fabricmc.net/v2/versions/loader/1.21.4/${LOADER}/profile/json`;
@@ -407,6 +413,8 @@ export class MinecraftClient {
       `${config.host}:${config.port}`,
     ];
     signal.throwIfAborted();
+    const silentAudio = process.env.GAMEHARNESS_NATIVE_AUDIO === "silent" ||
+      (process.env.GAMEHARNESS_NATIVE_PROOF === "1" && process.env.GAMEHARNESS_NATIVE_AUDIO !== "audible");
     const child = spawn(
       this.java,
       [
@@ -424,6 +432,8 @@ export class MinecraftClient {
           PATH: "/usr/bin:/bin",
           HOME: this.directory,
           LANG: "C.UTF-8",
+          // Keep source playback and sensing active without a physical output device.
+          ALSOFT_DRIVERS: silentAudio ? "null" : undefined,
           DISPLAY: process.env.DISPLAY ?? ":1",
           XAUTHORITY: process.env.XAUTHORITY ?? "/run/user/1000/gdm/Xauthority",
           XDG_RUNTIME_DIR:

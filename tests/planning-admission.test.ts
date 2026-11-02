@@ -107,11 +107,11 @@ test(`real durable ${scenario.activation} admission after ${scenario.order} pres
   });
   resources.push({ manager, planner, store, directory });
   const card = { purpose: "Observe", applicability: "Authorized state", method: "Fresh observation", reason: "Neutral mechanics regression", limitations: "No gameplay claim" };
-  rootSource = await manager.register(run.run_id, { name: "predecessor", source: 'await game.observe(); return {status:"completed",summary:"Observed",result:null};', card, dependencies: [] });
-  const candidate = await manager.register(run.run_id, {
+  rootSource = await manager.register(run.run_id, { entry: "run", name: "predecessor", source: 'await game.observe(); return {status:"completed",summary:"Observed",result:null};', card, dependencies: [] });
+  const candidate = await manager.register(run.run_id, { entry: "run",
     name: "follow-up", source: 'const fresh = await game.observe(); return {status:"completed",summary:"Fresh observation",result:fresh.observation_seq};', card, dependencies: [],
   });
-  const rootRequest = {
+  const rootRequest = { entry: "run" as const,
     skill_id: rootSource.skill_id, version: rootSource.version, start_key: "predecessor",
     ...executionScopeFixture(run), args: "predecessor",
     limits: { duration_ms: 10_000, max_actions: 1, max_calls: 2, max_depth: 1 },

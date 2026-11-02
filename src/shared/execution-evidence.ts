@@ -3,7 +3,7 @@ import type { SkillRef, SkillView } from "./programs.ts";
 import type { HistoricalObservationV2, MinecraftPlayer } from "./minecraft.ts";
 
 export type TraceKind = "capability_request" | "capability_result" | "observation" | "branch" | "intent" | "span" | "omission";
-export type PauseCategory = "native_action" | "dispatch" | "receipt" | "readiness" | "sandbox" | "capability_wait" | "strategic_request" | "scheduler_handoff" | "life_recovery";
+export type PauseCategory = "native_action" | "dispatch" | "receipt" | "readiness" | "sandbox" | "capability_wait" | "strategic_request" | "scheduler_handoff" | "life_recovery" | "worker_start" | "worker_cleanup";
 export interface TraceContext {
   call_id?: string | null;
   action_id?: string | null;

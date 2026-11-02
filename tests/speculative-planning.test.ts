@@ -20,12 +20,12 @@ function source(id: string): SkillView {
   const text = 'return { status: "completed", summary: "Observed", result: null };';
   const hash = createHash("sha256").update(text).digest("hex");
   return {
-    skill_id: id, version: 1, name: id, source: text,
+    entry: "run", skill_id: id, version: 1, name: id, source: text,
     hash,
     card: { purpose: "Observe", applicability: "Authorized life", method: "Read fresh state", reason: "Independent follow-up", limitations: "No effects" },
     dependencies: [], parent_version: null, state: "validated",
-    validation: { fingerprint: programFingerprint(hash, "skill", compatibilityHash), runtime_version: 4, api_version: 4,
-      validator_version: 4, compatibility_hash: compatibilityHash, formatted_lines: 1, complexity: 1, nesting: 0 },
+    validation: { fingerprint: programFingerprint(hash, "skill", compatibilityHash), runtime_version: 5, api_version: 5,
+      validator_version: 5, compatibility_hash: compatibilityHash, formatted_lines: 1, complexity: 1, nesting: 0 },
     created_at: new Date().toISOString(),
   };
 }
@@ -63,6 +63,7 @@ function setup() {
       return state.evaluate(text, fresh, args, signal);
     },
     admit: async (request, permit) => {
+      if (request.entry !== "run") throw new Error("Planner only admits run entries");
       skillStartRequestSchema.parse(request);
       await state.beforeAdmit();
       permit.assertCurrent();

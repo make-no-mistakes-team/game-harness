@@ -275,9 +275,10 @@ test("strategic request records actual payload effort and first provider event w
   f.planner.wake("policy_replan");
   await next;
   const all = f.store.eventsAfter(f.run.run_id, 0, 500);
-  expect(all.filter(event => event.type === "model.response_usage_details").map(event => event.details))
-    .toHaveLength(2);
-  expect(JSON.stringify(all.filter(event => event.type === "model.response_usage_details"))).not.toContain("999");
+  const usageDetails = all.filter(event => event.type === "model.response_usage_details").map(event => event.details);
+  expect(usageDetails).toHaveLength(2);
+  for (const detail of usageDetails)
+    expect(detail).toMatchObject({ reasoning_tokens: 2, cached_input_tokens: 3 });
 });
 
 test("installed Agent snapshots raw observer before admission; replacing it in the gate cannot bind that invocation", async () => {
@@ -510,6 +511,105 @@ test("next-turn feedback retains safe validation locations and generated failure
   expect(JSON.stringify(feedback)).toContain("Expected an observation object");
   expect(JSON.stringify(feedback)).toContain("c".repeat(64));
   expect(JSON.stringify(feedback)).toContain("unmapped");
+});
+
+test("resident attention overflow names its omitted range and does not replay delivered triggers", async () => {
+  const f = setup(async (_text, agent) => {
+    await callGate(agent);
+    agent.emit({ responseId: "attention-response" } as Partial<Assistant>);
+    const stopped = await callGate(agent);
+    gated(agent, stopped?.reason);
+  });
+  f.state.pending = true;
+  await f.planner.start(1);
+  const first = f.event("scheduler.turn_finished");
+  const sequences: number[] = [];
+  for (let index = 0; index < 34; index++) {
+    sequences.push(f.store.event(f.run.run_id, "controller.event", `Authored attention ${index}`, {
+      event: { kind: "attention", urgency: "ordinary", summary: `Authored attention ${index}`, details: { index } },
+    }).event_seq);
+    f.planner.wake("resident_attention");
+  }
+  await first;
+  const selected = f.state.contexts[0]!;
+  expect(selected.omitted_resident_attention).toEqual({
+    count: 2, after_event_seq: sequences[0]! - 1, through_event_seq: sequences[1],
+  });
+  const feedback = selected.feedback as { event_seq: number }[];
+  expect(feedback.some(event => event.event_seq === sequences[0] || event.event_seq === sequences[1])).toBe(false);
+  expect(feedback.map(event => event.event_seq)).toContain(sequences[33]!);
+  const second = f.event("scheduler.turn_finished");
+  const latest = f.store.event(f.run.run_id, "controller.event", "Fresh authored attention", {
+    event: { kind: "attention", urgency: "urgent", summary: "Fresh authored attention", details: { changed: true } },
+  });
+  f.planner.wake("resident_attention"); await second;
+  expect(f.state.contexts[1]?.omitted_resident_attention).toBeNull();
+  expect((f.state.contexts[1]?.feedback as { event_seq: number }[]).map(event => event.event_seq)).toEqual([latest.event_seq]);
+  expect(f.state.prompts).toBe(2);
+});
+
+for (const spec of [
+  { initial: 32, arrivals: 1, success: true, omitted: 0 },
+  { initial: 34, arrivals: 1, success: true, omitted: 0 },
+  { initial: 34, arrivals: 40, success: true, omitted: 8 },
+  { initial: 32, arrivals: 1, success: false, omitted: 1 },
+]) test(`resident in-flight overflow retains only unconsumed omissions: ${JSON.stringify(spec)}`, async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let calls = 0;
+  const f = setup(async (_text, agent) => {
+    await callGate(agent);
+    if (++calls === 1) {
+      entered.resolve(); await release.promise;
+      if (!spec.success) {
+        agent.emit({ stopReason: "error", errorMessage: "Controlled external request failure" } as Partial<Assistant>);
+        return;
+      }
+    }
+    agent.emit({ responseId: `attention-flight-${calls}` } as Partial<Assistant>);
+    const stopped = await callGate(agent); gated(agent, stopped?.reason);
+  });
+  f.state.pending = true;
+  await f.planner.start(1);
+  const append = (label: string) => {
+    const event = f.store.event(f.run.run_id, "controller.event", label, {
+      event: { kind: "attention", urgency: "ordinary", summary: label, details: null },
+    });
+    f.planner.wake("resident_attention"); return event.event_seq;
+  };
+  const initial: number[] = [], arrivals: number[] = [];
+  const first = f.event(spec.success ? "scheduler.turn_finished" : "scheduler.turn_failed");
+  for (let index = 0; index < spec.initial; index++) initial.push(append(`Initial ${index}`));
+  await entered.promise;
+  const second = new Promise<void>(resolve => {
+    let completed = 0;
+    const off = f.store.subscribe(event => {
+      if (event.run_id === f.run.run_id && event.type === "scheduler.turn_finished" &&
+          ++completed === (spec.success ? 2 : 1)) { off(); resolve(); }
+    });
+  });
+  try {
+    for (let index = 0; index < spec.arrivals; index++) arrivals.push(append(`Arriving ${index}`));
+  } finally { release.resolve(); }
+  await first;
+  if (!spec.success) {
+    f.run.status = "running";
+    await f.planner.start(f.state.generation);
+    f.planner.wake("resident_attention");
+  }
+  await second;
+  const selected = f.state.contexts[1]!;
+  if (!spec.omitted) expect(selected.omitted_resident_attention).toBeNull();
+  else expect(selected.omitted_resident_attention).toEqual(spec.success
+    ? { count: 8, after_event_seq: initial[33], through_event_seq: arrivals[7] }
+    : { count: 1, after_event_seq: initial[0]! - 1, through_event_seq: initial[0] });
+  const references = [
+    ...(selected.feedback as { event_seq: number }[]).map(event => event.event_seq),
+    ...(selected.omitted_event_refs as number[]),
+  ];
+  expect(references).toContain(arrivals.at(-1)!);
+  if (spec.success) expect(references.some(sequence => initial.includes(sequence))).toBe(false);
+  else expect(references).toContain(initial[1]!);
+  expect(f.state.prompts).toBe(2);
 });
 
 test("pending work admits one explicit meaningful request, never observation or after-tool polling", async () => {

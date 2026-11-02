@@ -23,11 +23,14 @@ public abstract class SoundMixin {
               ordinal = 1,
               shift = At.Shift.AFTER))
   private void tag(SoundInstance sound, CallbackInfo ci) {
-    int category = SoundProjection.category(sound.getId().toString());
-    if (category < 0) return;
+    int kind = SoundProjection.category(sound.getId().toString());
+    NativeClient client = NativeClient.INSTANCE;
+    if (kind < 0 || client == null) return;
+    String streamId = client.soundStreamId();
+    if (streamId == null) return;
     Channel.SourceManager manager = sources.get(sound);
     if (manager == null) return;
     Source source = ((SourceManagerAccess) manager).gameharness$source();
-    if (source != null) ((AudibleSource) source).gameharness$tag(category, listener);
+    if (source != null) ((AudibleSource) source).gameharness$tag(streamId, kind, listener);
   }
 }

@@ -48,6 +48,7 @@ import { SpeculativePlanning } from "./speculative-planning.ts";
 import { ImprovementLearning } from "./improvement-learning.ts";
 import { ExecutionTrace } from "./execution-trace.ts";
 import { ActorFrameSelector, type ModelObservation } from "./actor-frames.ts";
+import { retainResidentReceipt } from "./resident-evidence.ts";
 
 const TERMINAL: Partial<Record<RunView["status"], true>> = {
   stopped: true,
@@ -107,7 +108,7 @@ export class Runtime {
     const binding = this.game.snapshot().binding;
     if (!adapter || !binding?.ready) throw new RuntimeFault("precondition_failed", "A negotiated adapter contract is required");
     let registration = this.registrations.get(adapter);
-    if (!registration) { registration = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas); this.registrations.set(adapter, registration); }
+    if (!registration) { registration = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas, adapter.capabilityValidators); this.registrations.set(adapter, registration); }
     if (registration.compatibility.compatibility_hash !== binding.compatibility_hash)
       throw new RuntimeFault("precondition_failed", "Runtime adapter and native negotiated descriptor do not match");
     return { adapter, binding, registration };
@@ -248,6 +249,22 @@ export class Runtime {
       settled: (action, result, view) => this.recordEffectEvidence(action, result, view),
     });
     this.skills = new SkillManager(store, sandbox, {
+      openController: (execution, generation, deadline, applied, effect, lifecycle) =>
+        this.actions.reserveController(execution.execution_id, generation, deadline, applied, effect, lifecycle),
+      residentEvent: (_execution, event) => {
+        if (event.kind === "attention") this.strategic.wake("resident_attention");
+      },
+      residentEffect: (execution, input, event, adapter) => {
+        // Retirement may arrive after run/life authority was fenced. Retain the
+        // original owner's real prefix and unknown suffix without a new grant.
+        const facts = retainResidentReceipt(store, adapter, execution, input, event);
+        const run = this.run;
+        if (run?.run_id === execution.run_id && run.status === "running" &&
+          this.generation === execution.run_generation && run.compatibility_hash === execution.compatibility_hash) {
+          this.verificationPending.push(...facts);
+          this.verifyGoal();
+        }
+      },
       prepareLookahead: (config) => this.planning.prepareOptIn(config),
       adapter: () => this.context().adapter,
       binding: () => this.game.snapshot().binding,

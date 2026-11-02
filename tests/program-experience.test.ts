@@ -25,6 +25,9 @@ import { jsonSchema } from "../src/shared/primitives.ts";
 import { observationEvidence } from "../src/server/adapter-evidence.ts";
 import { promotionEvidence } from "../web/src/evidence.ts";
 import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding, sha256 } from "./helpers/adapter-contract.ts";
+import { retainResidentReceipt } from "../src/server/resident-evidence.ts";
+import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
+import type { ControllerInput, ControllerEffectUpdate } from "../src/shared/controller.ts";
 
 const adapter = minecraftTestAdapter();
 const currentCompatibility = { descriptor: adapter.descriptor, compatibility_hash: sha256(adapter.descriptor) };
@@ -118,7 +121,7 @@ async function authored(
   name = "fixture",
   dependencies: SkillRef[] = [],
 ) {
-  return await manager.register(run.run_id, {
+  return await manager.register(run.run_id, { entry: "run",
     name,
     source:
       'const state = await game.observe(); return {status:"completed",summary:"Current observation",result:state.data.player.position.x};',
@@ -131,7 +134,7 @@ function execution(
   run: StoredRun,
   skill: SkillRef,
 ): SkillExecutionView {
-  const view = store.admitSkill(run.run_id, {
+  const view = store.admitSkill(run.run_id, { entry: "run",
     skill_id: skill.skill_id,
     version: skill.version,
     start_key: crypto.randomUUID(),
@@ -163,11 +166,12 @@ function action(
   run: StoredRun,
   owner: SkillExecutionView,
   evidence: Json,
+  request: GameAction = { kind: "look", yaw: 0, pitch: 0 },
 ) {
   const admitted = store.admitAction(
     run.run_id,
     crypto.randomUUID(),
-    { kind: "look", yaw: 0, pitch: 0 },
+    request,
     "skill",
     owner.execution_id,
     actionAuthority(run, owner),
@@ -238,6 +242,230 @@ test("self-report and confirmed movement do not qualify as verified inventory ef
   expect(measured.verified_event_seqs).toEqual([]);
 });
 
+for (const producer of ["crafting", "trading", "anvil"] as const) {
+  test(`craft qualification attributes GUI ${producer} through actual production rather than transferred possession`, async () => {
+    const { store, library, run, manager } = fixture();
+    run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!; store.saveRun(run);
+    const owner = execution(store, run, await authored(manager, run));
+    const gui = action(store, run, owner, { effect_confirmed: true, gui_transactions: [{
+      kind: "gui_transaction", mechanism: "visible_gui", operation_index: 0, receipt_ref: "server:1:9",
+      input_application: "confirmed", effect_status: "confirmed", inventory_before: {}, inventory_after: {},
+      productions: [{ producer, item: "crafting_table", count: 1, source: "server_result_slot_take", production_confirmed: true }],
+    }] }, { kind: "screen_input", screen: { screen_id: "view", incarnation: 1, layout_revision: 1 },
+      operations: [{ kind: "slot", slot_id: 0, button: "left", mode: "ordinary", hotbar_slot: null,
+        expected_cursor: { item: null, count: 0 }, expected_slots: [{ slot_id: 0, value: { item: "crafting_table", count: 1 } }] }] });
+    const event = store.event(run.run_id, "goal.verified", "Trusted verifier fixture", {
+      status: "verified", adapter_id: run.goal.adapter_id, verifier_id: run.goal.verifier!.id, verifier_version: run.goal.verifier!.version,
+    });
+    finish(store, owner);
+    const promote = () => library.promote(store, run.run_id, owner, "Confirmed GUI crafting", {
+      portability: "portable", retained_world_data: false, predicate: { kind: "goal_verified", event_seq: event.event_seq },
+    });
+    if (producer === "crafting") expect(promote().evidence.action_ids).toEqual([gui.action_id]);
+    else expect(promote).toThrow();
+  });
+}
+
+test("confirmed GUI transfer qualifies inventory gain without being relabelled as helper production", async () => {
+  const { store, library, run, manager } = fixture(), owner = execution(store, run, await authored(manager, run));
+  const transfer = action(store, run, owner, { effect_confirmed: true, gui_transactions: [{
+    kind: "gui_transaction", mechanism: "visible_gui", operation_index: 0, receipt_ref: "server:1:10",
+    input_application: "confirmed", effect_status: "confirmed", inventory_before: {}, inventory_after: { stone: 2 }, productions: [],
+  }] }, { kind: "screen_input", screen: { screen_id: "view", incarnation: 1, layout_revision: 1 },
+    operations: [{ kind: "slot", slot_id: 0, button: "left", mode: "ordinary", hotbar_slot: null,
+      expected_cursor: { item: null, count: 0 }, expected_slots: [{ slot_id: 0, value: { item: "stone", count: 2 } }] }] });
+  const observed = inventoryObservation(store, run, { stone: 2 }); finish(store, owner);
+  expect(library.promote(store, run.run_id, owner, "Visible transfer", declaration(observed.event_seq)).evidence.action_ids).toEqual([transfer.action_id]);
+  expect(objectiveMetrics(store, run.run_id)[0]).toMatchObject({ inventory_delta: { stone: 2 }, inventory_receipts: 1 });
+});
+
+for (const retained of ["matching", "tampered", "missing"] as const) {
+  test(`retained GUI crafting ${retained} receipt links only actual server-confirmed production`, async () => {
+    const { store, run, manager } = fixture();
+    run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!; store.saveRun(run);
+    const owner = execution(store, run, await authored(manager, run));
+    const request: GameAction = { kind: "screen_input", screen: { screen_id: "view", incarnation: 1, layout_revision: 1 },
+      operations: [{ kind: "slot", slot_id: 0, button: "left", mode: "ordinary", hotbar_slot: null,
+        expected_cursor: { item: null, count: 0 }, expected_slots: [{ slot_id: 0, value: { item: "crafting_table", count: 1 } }] }] };
+    const receipt = action(store, run, owner, { effect_confirmed: true, gui_transactions: [{
+      kind: "gui_transaction", mechanism: "visible_gui", operation_index: 0, receipt_ref: "server:1:11",
+      input_application: "confirmed", effect_status: "confirmed", inventory_before: { oak_planks: 4 }, inventory_after: {},
+      productions: [{ producer: "crafting", item: "crafting_table", count: 1, source: "server_result_slot_take", production_confirmed: true }],
+    }] }, request);
+    const facts = adapter.effectEvidence!(actionAuthority(run, owner).scope, receipt.action_id, request, receipt.result!, receipt.ended_at!);
+    if (retained !== "missing") for (const fact of facts)
+      store.event(run.run_id, "adapter.evidence", "Retained native GUI transaction fixture", jsonSchema.parse(fact));
+    const current = observation(run); current.observation_seq = 2;
+    current.data.player.inventory = [{ name: "crafting_table", display_name: "Crafting Table", count: 1, slot: 0 }];
+    const read = observationEvidence(adapter, actionAuthority(run, owner).scope, current);
+    store.event(run.run_id, "adapter.evidence", "Independent later retention", jsonSchema.parse(read));
+    const verdict = adapter.verifyCompletion({ goal: run.goal, run_id: run.run_id, world_id: run.world_id, session_id: run.session_id!,
+      epoch: run.epoch, native_boot_id: run.native_boot_id!, baseline: run.baseline }, [...facts, read]);
+    expect(verdict.status).toBe("verified");
+    const goal = store.event(run.run_id, "goal.verified", "Registered GUI crafting verdict", jsonSchema.parse(verdict));
+    if (retained === "tampered") {
+      receipt.result = { status: "succeeded", summary: "Unconfirmed replacement diagnostic", evidence: {
+        effect_confirmed: true, gui_transactions: [], inventory_after: { crafting_table: 1 }, inventory_receipt_confirmed: true,
+      } };
+      store.saveAction(run.run_id, receipt);
+    }
+    finish(store, owner);
+    const projected = programEvidence(store, run.run_id)[0]!;
+    if (retained === "matching") {
+      expect(projected.verified_event_seqs).toEqual([goal.event_seq]);
+      expect(projected.goal_associations).toEqual([{ event_seq: goal.event_seq, relationship: "direct_receipt",
+        action_id: receipt.action_id, causal_item_origin: "unknown" }]);
+    } else {
+      expect(projected.verified_event_seqs).toEqual([]);
+      expect(projected.goal_associations).toEqual([]);
+    }
+    // Taking output into cursor is not an inventory gain; fake top-level inventory cannot replace native facts.
+    expect(objectiveMetrics(store, run.run_id)[0]!.inventory_delta).not.toHaveProperty("crafting_table");
+  });
+}
+
+for (const boundary of ["matching", "different retained input", "no retained receipt"] as const) {
+  test(`resident ${boundary} links a confirmed GUI prefix without inventing a finite action`, async () => {
+    const { directory, store, run, manager } = fixture();
+    run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!; store.saveRun(run);
+    const skill = await manager.register(run.run_id, { entry: "step", name: "resident-prefix",
+      source: "export function step(frame,state,intent) { return null; }", card, dependencies: [] });
+    const owner = store.admitSkill(run.run_id, { entry: "step", skill_id: skill.skill_id, version: skill.version,
+      start_key: crypto.randomUUID(), ...executionScopeFixture(run), args: null, initial_state: null, limits: { ...DEFAULT_RESIDENT_LIMITS } }).view;
+    owner.status = "running"; owner.started_at = new Date().toISOString(); store.updateSkillExecution(owner, "skill.running", "Resident admitted");
+    const input: ControllerInput = { kind: "screen", screen: { screen_id: "view", incarnation: 1, layout_revision: 1 }, operations: [
+      { kind: "slot", slot_id: 0, button: "left", mode: "ordinary", hotbar_slot: null,
+        expected_cursor: { item: null, count: 0 }, expected_slots: [{ slot_id: 0, value: { item: "crafting_table", count: 1 } }] },
+      { kind: "close" },
+    ] };
+    const update: ControllerEffectUpdate = { controller_generation: 1, sequence: 7, recorded_native_ns: "123456",
+      result: { status: "unknown", summary: "Confirmed first operation; suffix unknown", evidence: {
+        effect_confirmed: false, transaction_status: "unknown", gui_transactions: [{
+          kind: "gui_transaction", mechanism: "visible_gui", operation_index: 0, receipt_ref: "server:resident:1",
+          input_application: "confirmed", effect_status: "confirmed", inventory_before: { oak_planks: 4 }, inventory_after: {},
+          productions: [{ producer: "crafting", item: "crafting_table", count: 1, source: "server_result_slot_take", production_confirmed: true }],
+        }],
+      } } };
+    const facts = retainResidentReceipt(store, adapter, owner, input, update);
+    const db = new Database(join(directory, "runs", "runs.sqlite"));
+    expect(db.query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM actions WHERE run_id=?").get(run.run_id)!.count).toBe(0);
+    const current = observation(run); current.observation_seq = 2;
+    current.data.player.inventory = [{ name: "crafting_table", display_name: "Crafting Table", count: 1, slot: 0 }];
+    const read = observationEvidence(adapter, actionAuthority(run, owner).scope, current);
+    store.event(run.run_id, "adapter.evidence", "Retained possession", jsonSchema.parse(read));
+    const verdict = adapter.verifyCompletion({ goal: run.goal, run_id: run.run_id, world_id: run.world_id, session_id: run.session_id!,
+      epoch: run.epoch, native_boot_id: run.native_boot_id!, baseline: run.baseline }, [...facts, read]);
+    expect(verdict.status).toBe("verified");
+    const goal = store.event(run.run_id, "goal.verified", "Receipt prefix and independent possession", jsonSchema.parse(verdict));
+    if (boundary === "no retained receipt")
+      db.query("DELETE FROM events WHERE run_id=? AND type='controller.receipted'").run(run.run_id);
+    if (boundary === "different retained input")
+      db.query("UPDATE events SET details=json_set(details,'$.input.operations',json('[]')) WHERE run_id=? AND type='controller.receipted'").run(run.run_id);
+    db.close();
+    owner.status = "unknown"; owner.ended_at = new Date().toISOString(); owner.error = "Suffix unknown";
+    store.updateSkillExecution(owner, "skill.closed", "Resident retired with unknown suffix");
+    const projected = programEvidence(store, run.run_id).find(entry => entry.execution_id === owner.execution_id)!;
+    expect(projected.status).toBe("unknown");
+    if (boundary === "matching") {
+      expect(projected.verified_event_seqs).toEqual([goal.event_seq]);
+      expect(projected.goal_associations).toEqual([{ event_seq: goal.event_seq, relationship: "direct_receipt",
+        action_id: null, controller_input: { input_id: `controller:${owner.execution_id}:1:7`, generation: 1, sequence: 7 },
+        causal_item_origin: "unknown" }]);
+    } else expect(projected.verified_event_seqs).toEqual([]);
+  });
+}
+
+for (const boundary of ["matching", "no prefix", "source mismatch", "origin mismatch", "unrelated prefix"] as const) {
+  test(`retained unknown GUI action ${boundary} preserves only its own confirmed crafting prefix association`, async () => {
+    const { store, run, manager } = fixture();
+    run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!;
+    store.saveRun(run);
+    const owner = execution(store, run, await authored(manager, run));
+    const request: GameAction = { kind: "screen_input", screen: { screen_id: "view", incarnation: 1, layout_revision: 1 },
+      operations: [
+        { kind: "slot", slot_id: 0, button: "left", mode: "ordinary", hotbar_slot: null,
+          expected_cursor: { item: null, count: 0 }, expected_slots: [{ slot_id: 0, value: { item: "crafting_table", count: 1 } }] },
+        { kind: "slot", slot_id: 5, button: "left", mode: "ordinary", hotbar_slot: null,
+          expected_cursor: { item: "crafting_table", count: 1 }, expected_slots: [{ slot_id: 5, value: { item: null, count: 0 } }] },
+      ] };
+    const authority = actionAuthority(run, owner);
+    if (boundary === "source mismatch") {
+      authority.scope.source_hash = sha256("another program source");
+      authority.invocation.source_hash = authority.scope.source_hash;
+    }
+    const receipt = store.admitAction(run.run_id, crypto.randomUUID(), request, "skill", owner.execution_id, authority).action.view;
+    const prefix: Json = {
+      kind: "gui_transaction", mechanism: "visible_gui", operation_index: 0, receipt_ref: "server:1:12",
+      input_application: "confirmed", effect_status: "confirmed", inventory_before: { oak_planks: 4 }, inventory_after: {},
+      productions: [{ producer: "crafting", item: "crafting_table", count: 1, source: "server_result_slot_take", production_confirmed: true }],
+    };
+    receipt.status = "unknown";
+    receipt.ended_at = new Date().toISOString();
+    receipt.result = { status: "unknown", summary: "Second operation acknowledgement lost", evidence: {
+      effect_confirmed: false, transaction_status: "unknown", gui_transactions: [prefix],
+    } };
+    if (boundary === "origin mismatch") receipt.origin = "diagnostic";
+    store.saveAction(run.run_id, receipt);
+    const facts = adapter.effectEvidence!(authority.scope, receipt.action_id, request, receipt.result, receipt.ended_at);
+    expect(facts.map(fact => fact.schema.id)).toEqual(["minecraft_gui_transaction_v1", "minecraft_effect_uncertainty_v1"]);
+    for (const fact of facts)
+      store.event(run.run_id, "adapter.evidence", "Retained confirmed prefix and unresolved suffix", jsonSchema.parse(fact));
+    const current = observation(run);
+    current.observation_seq = 2;
+    current.data.player.inventory = [{ name: "crafting_table", display_name: "Crafting Table", count: 1, slot: 0 }];
+    const read = observationEvidence(adapter, actionAuthority(run, owner).scope, current);
+    store.event(run.run_id, "adapter.evidence", "Fresh retained possession after unknown GUI suffix", jsonSchema.parse(read));
+    const verdict = adapter.verifyCompletion({ goal: run.goal, run_id: run.run_id, world_id: run.world_id, session_id: run.session_id!,
+      epoch: run.epoch, native_boot_id: run.native_boot_id!, baseline: run.baseline }, [...facts, read]);
+    expect(verdict.status).toBe("verified");
+    expect(verdict.evidence_refs).toEqual([`${receipt.action_id}:gui:0`, read.evidence_id]);
+    const goal = store.event(run.run_id, "goal.verified", "Actual prefix production and retained possession verdict", jsonSchema.parse(verdict));
+    if (boundary === "unrelated prefix") {
+      const other = store.admitAction(run.run_id, crypto.randomUUID(), request, "skill", owner.execution_id,
+        actionAuthority(run, owner)).action.view;
+      other.status = "unknown";
+      other.ended_at = receipt.ended_at;
+      other.result = structuredClone(receipt.result);
+      store.saveAction(run.run_id, other);
+    }
+    if (boundary === "no prefix" || boundary === "unrelated prefix") {
+      receipt.result.evidence = { effect_confirmed: false, transaction_status: "unknown", gui_transactions: [] };
+      store.saveAction(run.run_id, receipt);
+    }
+    owner.status = "unknown";
+    owner.ended_at = new Date().toISOString();
+    owner.error = "Unresolved GUI suffix";
+    store.updateSkillExecution(owner, "skill.closed", "Unknown program effect tail retained");
+    const before = store.getAction(run.run_id, receipt.action_id)!.view;
+    const beforeSeq = store.lastEventSeq();
+    const projections = programEvidence(store, run.run_id);
+    const projected = projections.find(entry => entry.execution_id === owner.execution_id)!;
+    expect(projected.status).toBe("unknown");
+    expect(projected.confirmed_effects).toBe(0);
+    expect(projected.metrics.outcome).toBe("unknown");
+    expect(projected.metrics.inventory_delta).not.toHaveProperty("crafting_table");
+    if (boundary === "matching") {
+      expect(projected.evidence_status).toBe("verified_goal");
+      expect(projected.verified_event_seqs).toEqual([goal.event_seq]);
+      expect(projected.goal_associations).toEqual([{ event_seq: goal.event_seq, relationship: "direct_receipt",
+        action_id: receipt.action_id, causal_item_origin: "unknown" }]);
+      expect(projected.metrics.inventory_receipts).toBe(1);
+      expect(projected.metrics.inventory_delta).toEqual({ oak_planks: -4 });
+    } else {
+      expect(projections.every(entry => entry.goal_associations.length === 0 && entry.verified_event_seqs.length === 0)).toBe(true);
+      expect(projected.evidence_status).not.toBe("verified_goal");
+    }
+    expect(store.getAction(run.run_id, receipt.action_id)!.view).toEqual(before);
+    expect(store.getAction(run.run_id, receipt.action_id)!.view).toMatchObject({
+      status: "unknown", result: { status: "unknown", evidence: { effect_confirmed: false, transaction_status: "unknown" } },
+    });
+    expect(store.skillExecution(run.run_id, { execution_id: owner.execution_id })).toMatchObject({
+      status: "unknown", error: "Unresolved GUI suffix",
+    });
+    expect(store.lastEventSeq()).toBe(beforeSeq);
+  });
+}
+
 test("persisted named memory revisions survive duplicate names, paging and SQLite compaction", async () => {
   const { directory, store, library, run, manager } = fixture();
   const qualify = async (programName: string, memoryName: string) => {
@@ -274,7 +502,7 @@ test("persisted named memory revisions survive duplicate names, paging and SQLit
 test("portable exact snapshot accepts live coordinate reads but does not restore invocation coordinates", async () => {
   const { store, library, run, manager } = fixture();
   const child = await authored(manager, run, "child");
-  const root = await manager.register(run.run_id, {
+  const root = await manager.register(run.run_id, { entry: "run",
     name: "root",
     source: `const result = await game.call({name:\"child\",version:${child.version}}, \"dependency\"); return {status:\"completed\",summary:\"Composed exact dependency\",result};`,
     card,
@@ -355,7 +583,7 @@ test("portable exact snapshot accepts live coordinate reads but does not restore
     },
   );
   const settled = Promise.withResolvers<void>();
-  const admitted = reusedManager.start(destination.run_id, {
+  const admitted = reusedManager.start(destination.run_id, { entry: "run",
     skill_id: hydrated.skill_id,
     version: hydrated.version,
     start_key: "warm-exact-composition",
@@ -834,10 +1062,11 @@ test("death episodes and improvement decisions deduplicate and preserve exact ca
   expect(feedback.opportunities.filter((value) => value.kind === "failure")).toHaveLength(1);
   expect(learning.feedback(run.run_id).opportunities).toHaveLength(2);
   expect(store.deathEpisodesPage(run.run_id).episodes).toHaveLength(1);
-  const second = await manager.register(run.run_id, { name: first.name, source: 'const state = await game.observe(); return {status:"blocked",summary:"Current state reported",result:state.data.player.health};', card, dependencies: [] });
+  const second = await manager.register(run.run_id, { entry: "run", name: first.name, source: 'const state = await game.observe(); return {status:"blocked",summary:"Current state reported",result:state.data.player.health};', card, dependencies: [] });
   const before = { run_id: run.run_id, skill_id: first.skill_id, version: first.version, hash: first.hash };
   const after = { run_id: run.run_id, skill_id: second.skill_id, version: second.version, hash: second.hash };
-  const undispatched = store.admitSkill(run.run_id, { ...after, start_key: "never-dispatched", ...executionScopeFixture(run), args: null, limits: { ...DEFAULT_SKILL_LIMITS } }).view;
+  const undispatched = store.admitSkill(run.run_id, { entry: "run", skill_id: after.skill_id, version: after.version,
+    start_key: "never-dispatched", ...executionScopeFixture(run), args: null, limits: { ...DEFAULT_SKILL_LIMITS } }).view;
   undispatched.status = "cancelled"; undispatched.ended_at = new Date().toISOString();
   store.updateSkillExecution(undispatched, "skill.closed", "Cancelled before dispatch");
   const chosen = feedback.opportunities[0]!;
@@ -901,7 +1130,7 @@ test("same-model comparison authorization is enforced before either foreign sour
   const foreign: StoredRun = { ...run, run_id: crypto.randomUUID(), model_id: "other-model" };
   store.saveRun(foreign);
   const first = await authored(manager, foreign, "foreign");
-  const second = await manager.register(foreign.run_id, { name: first.name, source: 'return {status:"blocked",summary:"Foreign version",result:null};', card, dependencies: [] });
+  const second = await manager.register(foreign.run_id, { entry: "run", name: first.name, source: 'return {status:"blocked",summary:"Foreign version",result:null};', card, dependencies: [] });
   const ref = (skill: typeof first) => ({ run_id: foreign.run_id, skill_id: skill.skill_id, version: skill.version, hash: skill.hash });
   const read = store.skill.bind(store);
   let foreignReads = 0;
@@ -1065,7 +1294,7 @@ test("durable latest-root lookup survives more than 100 sequential children with
   const { store, run, manager } = fixture();
   const skill = await authored(manager, run), root = execution(store, run, skill);
   for (let index = 0; index < 101; index++) {
-    const child = store.admitSkill(run.run_id, {
+    const child = store.admitSkill(run.run_id, { entry: "run",
       skill_id: skill.skill_id, version: skill.version, start_key: `child-${index}`,
       ...executionScopeFixture(run),
       args: null, limits: { ...DEFAULT_SKILL_LIMITS },
@@ -1076,6 +1305,7 @@ test("durable latest-root lookup survives more than 100 sequential children with
   }
   root.calls = 101;
   store.updateSkillExecution(root, "skill.progress", "Sequential child calls settled");
+  if (root.entry !== "run") throw new Error("Expected the selected run root");
   expect(root.calls).toBeLessThan(root.limits.max_calls);
   const presentation = store.skillExecutions(run.run_id);
   expect(presentation).toHaveLength(100);
@@ -1097,7 +1327,7 @@ test("invalid decision/revision pairs reject actionably without a record before 
   finish(store, firstExecution);
   const learning = new ImprovementLearning(store);
   const opportunity = learning.feedback(run.run_id).opportunities.find((value) => value.execution_id === firstExecution.execution_id)!;
-  const second = await manager.register(run.run_id, {
+  const second = await manager.register(run.run_id, { entry: "run",
     name: first.name,
     source: 'const state = await game.observe(); return {status:"completed",summary:"Candidate observation experiment",result:state.data.player.health};',
     card, dependencies: [],

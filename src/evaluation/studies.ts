@@ -108,7 +108,8 @@ export function readStudyObservationProfile(manifest: StudyManifest, projectRoot
   const descriptor = validateAdapterDescriptor(JSON.parse(bytes), minecraftSchemaCatalog());
   minecraftProfileConfigurationSchema.parse(descriptor.observation.profile.configuration);
   requireCondition(descriptor.game.id === "minecraft" && descriptor.game.version === "1.21.4" && descriptor.adapter.id === "fabric-owned-client" &&
-    descriptor.actuator === "native" && descriptor.observation.profile.id === "minecraft_assisted_rgb_360_r8_v1",
+    descriptor.actuator === "native" && descriptor.observation.profile.id === "minecraft_assisted_rgb_360_r8_control_v4" &&
+    descriptor.observation.profile.version === 4,
     "Unsupported materialized native adapter/profile condition");
   return descriptor;
 }
@@ -166,11 +167,19 @@ export function validateStudyManifest(input: unknown, options: { projectRoot: st
   requireCondition(readFileSync(resolve(project, manifest.task.identity.path), "utf8").trim() === manifest.task.text, "Study task text identity mismatch");
   const execution = manifest.execution, isolation = execution.isolation;
   const reference = execution.controller_mode === "released_policy_reference";
+  const residentPlatform = execution.controller_mode === "resident_platform";
   requireCondition(identities.library.mode === "cold" && identities.library.snapshot === null, "Inherited library execution is unsupported");
   if (reference) validateReferenceStudyDeclaration(manifest, project);
-  else {
+  else if (residentPlatform) {
+    requireCondition(manifest.admission_mode === "live" && execution.adaptation === "none" && identities.controller !== null
+      && identities.model === null, "Resident platform requires live scoped permission, a checked controller, no adaptation and no model identity");
+    requireCondition(execution.sidecars.length === 0 && execution.request_paths.length === 0, "Resident platform cannot enable sidecars or provider request paths");
+    const per = manifest.allowances.per_attempt, cohort = manifest.allowances.cohort;
+    requireCondition(per.host_requests === 0 && cohort.host_requests === 0 && per.concurrent_requests === 0 && cohort.concurrent_requests === 0,
+      "Resident platform provider request and concurrency allowances must all be zero");
+  } else {
     requireCondition(execution.controller_mode === "whole_agent" && execution.adaptation === "whole_agent_run_private" && identities.controller === null,
-      "Frozen/policy controller execution is unsupported; only declared whole-agent run-private adaptation or the exact released reference variant is supported");
+      "Frozen/policy controller execution is unsupported; use declared whole-agent run-private adaptation, exact released reference or resident_platform");
     requireCondition(execution.sidecars.length === 0 && execution.request_paths.every(path => path === "strategic"), "Jev/sidecar/postprocessing request execution is unsupported");
     const per = manifest.allowances.per_attempt, cohort = manifest.allowances.cohort;
     requireCondition(per.host_requests > 0 && cohort.host_requests > 0 && per.concurrent_requests > 0 && cohort.concurrent_requests > 0,
@@ -185,6 +194,22 @@ export function validateStudyManifest(input: unknown, options: { projectRoot: st
     requireCondition(execution.start_mode === "none" && execution.request_paths.length === 0 && identities.model === null && identities.adapter === null && identities.game === null,
       "Admission-only declarations cannot enable inference or native resources");
     requireCondition(manifest.initial_states.every(state => state.mode === "none" && state.seed === null && state.settings === null && state.save === null), "Admission-only initial states cannot enable native resources");
+  } else if (residentPlatform) {
+    requireCondition(execution.start_mode === "evaluator_prepared_world", "Resident platform requires an explicitly evaluator-prepared world, not principal fresh survival");
+    requireCondition(identities.adapter === "fabric-owned-client" && identities.game?.id === "minecraft" && identities.game.version === "1.21.4",
+      "Unsupported resident platform adapter/game identity");
+    requireCondition(identities.observation_schema === 3, "Resident platform requires the current observation schema 3");
+    const descriptor = readStudyObservationProfile(manifest, project);
+    requireCondition(descriptor.adapter.id === identities.adapter && descriptor.game.id === identities.game.id &&
+      descriptor.game.version === identities.game.version, "Declared resident platform and materialized descriptor identities differ");
+    for (const state of manifest.initial_states) {
+      requireCondition(state.mode === "evaluator_prepared_world" && state.seed === null && state.save === null,
+        "Resident platform requires evaluator-prepared states without seeded-trial or restored-save claims");
+      const settings = state.settings;
+      requireCondition(settings && settings.difficulty === "normal" && settings.gamemode === "survival" && settings.cheats
+        && settings.supplied_inventory && settings.console_commands && !settings.hardcore,
+        "Resident platform settings must explicitly declare Normal Survival, cheats, supplied inventory and console setup without hardcore");
+    }
   } else if (!reference) {
     requireCondition(execution.start_mode === "fresh_seeded_world", "Restored/prepared/development-task execution is unsupported; only fresh seeded worlds are supported");
     requireCondition(identities.adapter === "fabric-owned-client" && identities.game?.id === "minecraft" && identities.game.version === "1.21.4", "Unsupported adapter/game identity");
@@ -206,9 +231,9 @@ export function validateStudyManifest(input: unknown, options: { projectRoot: st
   const armIds = new Set(manifest.arms.map(arm => arm.id)), stateIds = new Set(manifest.initial_states.map(state => state.id));
   requireCondition(armIds.size === manifest.arms.length && stateIds.size === manifest.initial_states.length, "Study arm/state identities must be unique");
   for (const arm of manifest.arms) {
-    if (manifest.admission_mode === "live" && !reference) requireCondition(arm.model && arm.model.provider === "openai-codex" && arm.model.api === "openai-codex-responses"
+    if (manifest.admission_mode === "live" && !reference && !residentPlatform) requireCondition(arm.model && arm.model.provider === "openai-codex" && arm.model.api === "openai-codex-responses"
       && arm.model.access === "oauth_subscription" && !/^(latest|default)$|[-/]latest$/.test(arm.model.id), "Each live arm requires an exact supported model/access identity; no fallback");
-    else requireCondition(arm.model === null, "Admission-only/reference arms cannot enable provider inference");
+    else requireCondition(arm.model === null, "Admission-only/reference/resident platform arms cannot enable provider inference");
     requireCondition(canonical(arm.helpers) === canonical(identities.helpers) && canonical(arm.profile) === canonical(identities.profile),
       "Unsupported helper/profile override; current arms share the exact implemented helper/profile configuration");
   }
@@ -379,6 +404,10 @@ export class StudyLedger {
       if (manifest.execution.controller_mode === "released_policy_reference")
         requireCondition(parsed.outcome.provider_status === "not_called" && (parsed.usage === null || readUsageMetrics(parsed.usage)?.admissions === 0),
           "Released reference settlement cannot fabricate provider execution or consumption");
+      if (manifest.execution.controller_mode === "resident_platform")
+        requireCondition(parsed.outcome.agent_status === "not_run" && parsed.outcome.provider_status === "not_called"
+          && parsed.outcome.goal_verified === null && parsed.usage === null && parsed.evidence.length > 0,
+          "Resident platform settlement requires separate technical evidence, agent not_run, provider not_called, null goal and null usage");
       requireCondition(parsed.outcome.platform_status === "pass" || parsed.stop_reason !== null, "Invalid/unknown platform settlement requires an explicit admission stop reason");
       this.#db.query("UPDATE study_attempts SET state='settled',settlement=? WHERE reservation_id=?").run(JSON.stringify(parsed), reservation.reservationId);
       if (parsed.stop_reason) this.#close(reservation.studyId, parsed.stop_reason);

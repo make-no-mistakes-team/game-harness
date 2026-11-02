@@ -9,14 +9,24 @@ import type {
   RuntimeAdapter,
 } from "../shared/contracts.ts";
 import { randomUUID } from "node:crypto";
-import type { EffectEnvelope, EffectInvocation, EffectScope, ScreenRef } from "../shared/control.ts";
-import { sameEffectScope, sameScreen } from "../shared/control.ts";
+import type { EffectEnvelope, EffectInvocation, EffectScope } from "../shared/control.ts";
+import { sameEffectScope, screenPreconditionMatches } from "../shared/control.ts";
 import { assertExecutableCompatible } from "./effect-contract.ts";
 import { RegisteredAdapterContract } from "./registered-adapter.ts";
 import { gameActionSchema } from "../shared/validation.ts";
 import type { PolicyWorker } from "./sandbox.ts";
 import type { Store, StoredAction, StoredRun } from "./store.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
+import type { ControllerEffectUpdate, ControllerInputChannel, ControllerReservation, InputAppliedAck, RevocationAck } from "../shared/controller.ts";
+import { revocationAckSchema } from "../shared/controller.ts";
+import { ResidentCleanupError, type ResidentLifecycle } from "../shared/resident.ts";
+interface ControllerLease {
+  executionId: string;
+  reservation: ControllerReservation;
+  opening: Promise<ControllerInputChannel> | null;
+  channel: ControllerInputChannel | null;
+  retirement: Promise<RevocationAck> | null;
+}
 export interface PolicyAuthority {
   view: PolicyView;
   generation: number;
@@ -32,7 +42,6 @@ export interface ActionEntry {
   deadline: number;
   order: number;
   envelope: EffectEnvelope;
-  screen: ScreenRef | null;
   policy: PolicyAuthority | null;
   policy_generation: number | null;
   runId: string;
@@ -87,6 +96,7 @@ export class ActionArbiter {
   private readonly registrations = new WeakMap<RuntimeAdapter, RegisteredAdapterContract>();
   private entries: ActionEntry[] = [];
   private current: OwnedActionExecution | null = null;
+  private controllerLease: ControllerLease | null = null;
   private pumping: Promise<void> | null = null;
   private preempting = false;
   private nextOrder = 0;
@@ -165,7 +175,131 @@ export class ActionArbiter {
     return this.latest;
   }
   get busy(): boolean {
-    return this.current !== null || this.entries.length > 0;
+    return this.controllerLease !== null || this.current !== null || this.entries.length > 0;
+  }
+  async reserveController(executionId: string, controllerGeneration: number, deadlineHostMs: number,
+    applied: (ack: InputAppliedAck) => void, effect: (update: ControllerEffectUpdate) => void,
+    lifecycle?: ResidentLifecycle): Promise<ControllerInputChannel> {
+    const run = this.host.run(), state = this.game.snapshot(), adapter = this.host.adapter();
+    const diagnostic = this.diagnostics.get(executionId);
+    const invocation = diagnostic?.invocation ?? this.host.invocation(executionId);
+    const scope = diagnostic?.scope ?? this.host.effectScope(executionId);
+    if (this.busy || this.pumping || this.preempting)
+      throw new RuntimeFault("busy", "Controller admission waits for the sole effect owner to drain");
+    if (!this.game.openController || !run || run.status !== "running" || this.host.needsReconnect() ||
+      !adapter || !state.binding?.ready || !state.space || state.life?.status !== "alive" ||
+      !invocation || !scope || invocation.source_hash !== scope.source_hash || invocation.execution_id !== scope.execution_id ||
+      invocation.execution_id !== executionId || scope.run_id !== run.run_id || scope.run_generation !== this.host.generation() ||
+      scope.session_id !== state.session_id || scope.world_id !== state.world_id || scope.epoch !== state.epoch ||
+      scope.native_boot_id !== state.binding.native_boot_id || scope.life_id !== state.life.life_id ||
+      scope.space_epoch !== state.space.space_epoch || run.compatibility_hash !== state.binding.compatibility_hash ||
+      !Number.isSafeInteger(controllerGeneration) || controllerGeneration < 1 || !Number.isFinite(deadlineHostMs) ||
+      deadlineHostMs <= performance.now() || deadlineHostMs - performance.now() > 16 * 60 * 60 * 1000)
+      throw new RuntimeFault("invalid_authority", "Controller requires an active exact source, live native scope and finite task deadline");
+    const reservation: ControllerReservation = { operation_id: `controller_${randomUUID()}`, scope: { ...scope },
+      invocation: { ...invocation }, compatibility_hash: state.binding.compatibility_hash,
+      expected_screen: state.screen ? { kind: "transaction", screen: { ...state.screen } } : { kind: "absent" } };
+    const lease: ControllerLease = { executionId, reservation, opening: null, channel: null, retirement: null };
+    this.controllerLease = lease;
+    this.leaseGeneration++;
+    try {
+      this.store.event(run.run_id, "controller.admitted", "Exact controller reservation persisted before native effects", {
+        operation_id: reservation.operation_id, scope: { ...scope }, invocation: { ...invocation },
+        controller_generation: controllerGeneration, deadline_host_monotonic_ms: deadlineHostMs,
+      });
+      this.host.admitted(); this.host.changed();
+      lease.opening = this.game.openController(reservation, controllerGeneration, deadlineHostMs, applied, update => {
+        this.store.event(run.run_id, "controller.effect_receipt", "Actual later controller receipt, independent of input application", {
+          operation_id: reservation.operation_id, ...update,
+        });
+        effect(update);
+      });
+      const native = await lease.opening;
+      const assertCurrent = () => {
+        const currentRun = this.host.run(), current = diagnostic?.scope ?? this.host.effectScope(executionId);
+        if (this.controllerLease !== lease || currentRun?.run_id !== run.run_id || currentRun.status !== "running" ||
+          this.host.needsReconnect() || this.host.generation() !== scope.run_generation || !current || !sameEffectScope(current, scope)) {
+          void channel.revoke().catch(() => {});
+          throw new RuntimeFault("stale_context", "Controller source/run authority changed before submission");
+        }
+      };
+      const channel: ControllerInputChannel = {
+        get owner() { return native.owner; }, controllerGeneration: native.controllerGeneration,
+        sample: cursor => { assertCurrent(); return native.sample(cursor); },
+        submit: (frame, input) => { assertCurrent(); return native.submit(frame, input); },
+        renew: frame => { assertCurrent(); return native.renew(frame); },
+        snapshot: () => native.snapshot(),
+        revoke: () => {
+          if (lease.retirement) return lease.retirement;
+          const completion = Promise.withResolvers<RevocationAck>();
+          lease.retirement = completion.promise;
+          // Publish the idempotent barrier before fencing: fence may reenter Stop.
+          let fenceFailure: unknown;
+          try { lifecycle?.fence("Controller admission revoked"); } catch (error) { fenceFailure = error; }
+          const drain = Promise.resolve().then(() => lifecycle?.drain());
+          // Attach immediately; a fast worker failure must not become unhandled
+          // while the independent native barrier is still in flight.
+          const drained = drain.then(() => ({ ok: true as const }), error => ({ ok: false as const, error }));
+          const retirement = (async () => {
+            let confirmed = false;
+            let acknowledged: RevocationAck | null = null;
+            try {
+              const ack = revocationAckSchema.parse(await native.revoke()), owner = native.owner;
+              if (ack.owner.operation_id !== owner.operation_id || ack.owner.generation !== owner.generation ||
+                !sameEffectScope(ack.owner.scope, reservation.scope) || ack.controller_generation !== controllerGeneration)
+                throw new RuntimeFault("unknown_effect", "Controller retirement names another writer");
+              confirmed = true;
+              acknowledged = ack;
+              this.store.event(run.run_id, "controller.retired", "Actual native input retirement acknowledged; prior effects are not reversed", {
+                operation_id: reservation.operation_id, ack: { ...ack },
+              });
+              return ack;
+            } catch (error) {
+              this.host.pause(BRIDGE_FAILURE, true);
+              await this.game.emergencyStop("Unconfirmed controller retirement requires emitter containment");
+              this.store.event(run.run_id, "controller.contained", "Emitter containment confirmed; input retirement and preceding world effects remain uncertain", {
+                operation_id: reservation.operation_id, input_application: "unknown",
+              });
+              throw error;
+            } finally {
+              // Concrete bridge Stop drains its actual emitter before resolving, including
+              // uncertain native retirement. Never turn containment into a retirement ACK.
+              const local = await drained;
+              if (!local.ok || fenceFailure) {
+                this.host.pause("Resident computation cleanup is unconfirmed; effect admission remains fenced", true);
+                throw new ResidentCleanupError(acknowledged);
+              }
+              if (confirmed || this.game.snapshot().binding === null) {
+                if (this.controllerLease === lease) this.controllerLease = null;
+                this.host.changed(); this.host.wake("Controller writer drained"); this.startPump();
+              }
+            }
+          })();
+          void retirement.then(completion.resolve, completion.reject);
+          return completion.promise;
+        },
+      };
+      lease.channel = channel;
+      return channel;
+    } catch (error) {
+      lifecycle?.fence("Controller admission failed");
+      this.host.pause(BRIDGE_FAILURE, true);
+      const cleanup = await Promise.allSettled([
+        this.game.emergencyStop("Unconfirmed controller admission requires emitter containment"),
+        Promise.resolve().then(() => lifecycle?.drain()),
+      ]);
+      const failure = cleanup.find(result => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+      if (this.controllerLease === lease && this.game.snapshot().binding === null) this.controllerLease = null;
+      throw error;
+    }
+  }
+  private async cancelController(reason: string): Promise<void> {
+    const lease = this.controllerLease;
+    if (!lease) return;
+    if (!lease.channel && lease.opening) await lease.opening;
+    if (lease.channel) await lease.channel.revoke();
+    else throw new RuntimeFault("unknown_effect", `Controller admission has not drained: ${reason}`);
   }
   reset(): void {
     if (this.busy || this.pumping)
@@ -193,6 +327,8 @@ export class ActionArbiter {
     policy: PolicyAuthority | null,
     executionId: string | null = null,
   ): ActionView {
+    if (this.controllerLease)
+      throw new RuntimeFault("busy", "Finite actions cannot overlap an admitted or retiring controller writer");
     if ((!policy && !executionId) || (policy && executionId))
       throw new RuntimeFault(
         "invalid_authority",
@@ -209,7 +345,7 @@ export class ActionArbiter {
     if (!adapter || !binding?.ready || !state.space || !adapter.action_capability)
       throw new RuntimeFault("precondition_failed", "Negotiated adapter effect admission is not ready");
     let registration = this.registrations.get(adapter);
-    if (!registration) { registration = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas); this.registrations.set(adapter, registration); }
+    if (!registration) { registration = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas, adapter.capabilityValidators); this.registrations.set(adapter, registration); }
     if (registration.compatibility.compatibility_hash !== binding.compatibility_hash || run.compatibility_hash !== binding.compatibility_hash)
       throw new RuntimeFault("precondition_failed", "Run and adapter executable contracts do not match");
     const parsedAction = registration.parseCapability(adapter.action_capability.id, adapter.action_capability.version, action);
@@ -249,7 +385,8 @@ export class ActionArbiter {
         throw new RuntimeFault("stale_context", "The host invocation scope is obsolete");
     }
     const envelope: EffectEnvelope = { operation_id: id, scope, invocation, compatibility_hash: binding.compatibility_hash,
-      action, expected_screen: state.screen ? { ...state.screen } : null };
+      action, expected_screen: adapter.screenPrecondition?.(action, state.screen) ??
+        (state.screen ? { kind: "transaction", screen: { ...state.screen } } : { kind: "absent" }) };
     const canonical = key(action);
     const matching =
       this.current && key(this.current.entry.stored.request) === canonical
@@ -332,7 +469,6 @@ export class ActionArbiter {
       deadline: Date.now() + (requestedDeadline ?? defaultMs),
       order: this.nextOrder++,
       envelope,
-      screen: state.screen ? { ...state.screen } : null,
       policy,
       policy_generation: policy?.generation ?? null,
       runId: run.run_id,
@@ -366,6 +502,7 @@ export class ActionArbiter {
     await this.cancelMatching((entry) => entry.policy === policy, reason);
   }
   async cancelOwned(ids: ReadonlySet<string>, reason: string): Promise<void> {
+    if (this.controllerLease && ids.has(this.controllerLease.executionId)) await this.cancelController(reason);
     await this.cancelMatching(
       (entry) =>
         !!entry.stored.view.execution_id &&
@@ -410,9 +547,11 @@ export class ActionArbiter {
     this.entries = [];
     for (const entry of queued) this.closeQueued(entry, reason);
     if (this.current) void this.cancelExecution(this.current, reason);
+    if (this.controllerLease) void this.cancelController(reason).catch(() => {});
   }
   async close(reason: string): Promise<void> {
     this.fence(reason);
+    if (this.controllerLease) await this.cancelController(reason);
     if (this.current) await this.cancelExecution(this.current, reason);
     const pumping = this.pumping;
     await pumping;
@@ -483,6 +622,7 @@ export class ActionArbiter {
   private startPump(): void {
     if (
       this.pumping ||
+      this.controllerLease ||
       this.preempting ||
       this.host.run()?.status !== "running" ||
       this.host.needsReconnect()
@@ -568,7 +708,7 @@ export class ActionArbiter {
       return false;
     const binding = state.binding, scope = entry.envelope.scope;
     if (!binding?.ready || binding.compatibility_hash !== entry.envelope.compatibility_hash || binding.native_boot_id !== scope.native_boot_id ||
-      !state.space || state.space.space_epoch !== scope.space_epoch || checkScreen && !sameScreen(entry.screen, state.screen)) return false;
+      !state.space || state.space.space_epoch !== scope.space_epoch || checkScreen && !screenPreconditionMatches(entry.envelope.expected_screen, state.screen)) return false;
     if (!entry.policy && checkInvocation) {
       const diagnostic = this.diagnostics.get(scope.execution_id);
       const current = diagnostic?.scope ?? this.host.effectScope(scope.execution_id), invocation = diagnostic?.invocation ?? this.host.invocation(scope.execution_id);

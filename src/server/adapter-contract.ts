@@ -78,7 +78,7 @@ export function negotiateAdapterDescriptor(expected: unknown, native: unknown, s
     throw new Error("Native build/schema/profile/capability/executable contract does not match the selected host contract");
   return actual;
 }
-export const nativeHelloSchema = z.object({ protocol: z.literal(3), secret: z.string().regex(/^[a-f0-9]{64}$/),
+export const nativeHelloSchema = z.object({ protocol: z.literal(4), secret: z.string().regex(/^[a-f0-9]{64}$/),
   session_id: identitySchema, world_id: identitySchema, epoch: safeCounterSchema, native_boot_id: identitySchema,
   descriptor: adapterDescriptorSchema,
 }).strict();
@@ -97,7 +97,7 @@ export function assertActiveObservation(value: unknown, binding: AdapterBinding)
   return observation;
 }
 export function executableContractStamp(compatibility: ProgramCompatibility) {
-  return { api_version: 4 as const, validator_version: 4 as const, runtime_version: 4 as const,
+  return { api_version: 5 as const, validator_version: 5 as const, runtime_version: 5 as const,
     compatibility_hash: compatibility.compatibility_hash };
 }
 

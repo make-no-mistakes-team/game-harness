@@ -206,7 +206,9 @@ export function actionMetrics(actions: readonly ActionReceiptSample[]): ActionMe
       "Action counts are durable admitted actions, not packets, ticks, successful goals or necessary work."] };
 }
 
-export type WaitCategory = "provider_request" | "game_action" | "tool" | "observation" | "cleanup";
+export type WaitCategory = "provider_request" | "game_action" | "tool" | "observation" | "cleanup" |
+  "source_validation" | "worker_start" | "worker_cleanup" | "game_required_wait" | "deliberate_wait" |
+  "observation_unavailable" | "infrastructure_stall";
 export interface MeasuredInterval {
   start_ms: number;
   end_ms: number;

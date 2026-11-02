@@ -1,11 +1,12 @@
 import { z } from "zod";
-import type { AdapterGoal, GameAction, GameActionResult, MotorProfile, PlayerLifeEvent, PolicyDecision, PolicySpec, RuntimeAdapter, VerificationResult } from "./contracts.ts";
+import type { AdapterGoal, GameAction, MotorProfile, PlayerLifeEvent, PolicyDecision, PolicySpec, RuntimeAdapter, VerificationResult } from "./contracts.ts";
 import type { SkillCapabilityRequest, SkillLimits, SkillResult, SkillStartRequest, WorkingProgramMode } from "./programs.ts";
 import { DEFAULT_SKILL_LIMITS, MAX_SKILL_LIMITS, SKILL_API_VERSION } from "./programs.ts";
 import type { LookaheadConfig, LookaheadRequest } from "./planning.ts";
 import { identitySchema, safeCounterSchema, screenRefSchema, sha256Schema, spaceRefSchema } from "./control.ts";
-import { jsonSchema, lifeIdSchema, playerLifeSchema, sessionIdSchema } from "./primitives.ts";
+import { gameActionResultSchema, jsonSchema, lifeIdSchema, playerLifeSchema, sessionIdSchema } from "./primitives.ts";
 import { observationV3Schema } from "./observations.ts";
+import { residentIntentSchema, residentLimitsSchema, residentStateSchema } from "./resident.ts";
 const utf8 = new TextEncoder();
 export { jsonSchema, lifeIdSchema, playerLifeSchema, sessionIdSchema } from "./primitives.ts";
 
@@ -19,9 +20,6 @@ export const observationSchema = observationV3Schema;
 
 /** Generic framing only. The selected registered adapter validates the action's real vocabulary and fields. */
 export const gameActionSchema = z.object({ kind: z.string().min(1).max(80) }).catchall(jsonSchema) satisfies z.ZodType<GameAction>;
-export const gameActionResultSchema = z.object({ status: z.enum(["succeeded", "failed", "cancelled", "unknown"]),
-  summary: z.string().max(2000), evidence: jsonSchema, requires_reconnect: z.boolean().optional(),
-}).strict() satisfies z.ZodType<GameActionResult>;
 
 export const skillRefSchema = z.object({ skill_id: z.string().regex(/^[a-zA-Z0-9_-]{1,160}$/),
   version: safeCounterSchema.min(1) }).strict();
@@ -37,11 +35,17 @@ export const lookaheadConfigSchema = z.object({ after_ms: z.number().int().min(0
     duration_ms: z.number().int().min(1000).max(30000) }).strict(),
 }).strict().describe("One host-bound speculative flight. The original deadline includes planning, predecessor drain, fresh observation, guard and durable admission; staging never extends it.") satisfies z.ZodType<LookaheadConfig>;
 export const lookaheadRequestSchema = lookaheadConfigSchema.extend({ root_execution_id: z.uuid() }).strict() satisfies z.ZodType<LookaheadRequest>;
-export const skillStartRequestSchema = skillRefSchema.extend({ start_key: z.string().regex(/^[a-zA-Z0-9_-]{1,160}$/),
+const skillStartBase = skillRefSchema.extend({ start_key: z.string().regex(/^[a-zA-Z0-9_-]{1,160}$/),
   epoch: safeCounterSchema, session_id: sessionIdSchema, life_id: lifeIdSchema, native_boot_id: identitySchema,
   space_epoch: safeCounterSchema, run_generation: safeCounterSchema, compatibility_hash: sha256Schema,
-  args: jsonSchema, limits: skillLimitsSchema.default({ ...DEFAULT_SKILL_LIMITS }), lookahead: lookaheadConfigSchema.optional(),
-}).strict() satisfies z.ZodType<SkillStartRequest>;
+  args: jsonSchema,
+}).strict();
+export const skillStartRequestSchema = z.discriminatedUnion("entry", [
+  skillStartBase.extend({ entry: z.literal("run"), limits: skillLimitsSchema,
+    lookahead: lookaheadConfigSchema.optional() }).strict(),
+  skillStartBase.extend({ entry: z.literal("step"), args: residentIntentSchema,
+    limits: residentLimitsSchema, initial_state: residentStateSchema }).strict(),
+]) satisfies z.ZodType<SkillStartRequest>;
 export const skillResultSchema = z.object({ status: z.enum(["completed", "blocked", "failed"]),
   summary: z.string().min(1).max(2000), result: jsonSchema }).strict() satisfies z.ZodType<SkillResult>;
 export const skillCapabilitySchema = z.discriminatedUnion("kind", [
@@ -96,10 +100,11 @@ export function getGameAPIReference(adapter: RuntimeAdapter) {
   }
   if (adapter.supports_respawn) methods.respawn = { parameters: [], result: "GameActionResult" };
   for (const binding of adapter.bindings) methods[binding.name] = { capability_id: binding.capability_id, version: binding.version,
-    parameters: binding.parameters.map(name => ({ name, type: "Json" })), result: "Json" };
+    parameters: binding.parameters.map(name => ({ name, type: "Json" })), result: binding.result?.type ?? "Json",
+    ...(binding.result ? { result_schema: binding.result.schema } : {}) };
   const value = { binding: "game", runtime_version: SKILL_API_VERSION, asynchronous: true, concurrent_calls: false, methods,
     adapter: adapter.descriptor,
-    validation: "Host validates actual registered capability schemas. Authority is host-attached, never copied from program arguments. Source validation is syntax/resource/safety validation, not a gameplay proof.",
+    validation: "Host validates actual registered capability schemas and trusted adapter-owned semantic constraints before effect admission. Semantic predicates run in-process and are not serialized schema fields. Authority is host-attached, never copied from program arguments. Source validation is syntax/resource/safety validation, not a gameplay proof.",
     lifecycle: "Sessions survive healthy Pause/Stop and ordinary death. Respawn is explicit and available only when the selected adapter implements it. Unknown effects stay unknown and are never replayed automatically. Post-goal review is effect-free.",
     progress: "Program-authored progress is intent, not objective completion evidence.",
     schemas: { ObservationV3: adapter.schemas.observation, AdapterData: adapter.schemas.payload,

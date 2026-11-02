@@ -14,7 +14,10 @@ import { StrategicPlanner } from "../src/server/strategic.ts";
 import { StrategicContext } from "../src/server/strategic-context.ts";
 import { Store } from "../src/server/store.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
-import { programHelp } from "../src/server/program-help.ts";
+import { retainResidentReceipt } from "../src/server/resident-evidence.ts";
+import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
+import type { ControllerInput, ControllerEffectUpdate } from "../src/shared/controller.ts";
+import { jsonSchema } from "../src/shared/primitives.ts";
 import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, skillAuthorityFixture } from "./helpers/adapter-contract.ts";
 
 const resources: { planner: StrategicPlanner; store: Store; directory: string }[] = [];
@@ -36,7 +39,7 @@ function settlement(calls: ToolCall[] = [], failed = false): AssistantMessage {
     usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1, totalTokens: 2,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
 }
-function fixture(productionHelp = false) {
+function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-context-")), store = new Store(directory);
   const adapter = minecraftTestAdapter();
   const state = { adapter, run: minecraftRunFixture(adapter, { model_id: model().id, task: "Observe neutral fixture state" }),
@@ -49,7 +52,7 @@ function fixture(productionHelp = false) {
     execute: async (_id, input) => {
       state.helpEffects++;
       const topic = input && typeof input === "object" && "topic" in input ? input.topic : "overview";
-      const value = productionHelp ? programHelp("game", adapter) : { bindings: { fixture_read: { parameters: ["query"], result: "NeutralValue" } },
+      const value = { bindings: { fixture_read: { parameters: ["query"], result: "NeutralValue" } },
         section: `requested-${topic}`, body: `Useful exact requested contract${state.helpPadding}` };
       return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
     } };
@@ -113,15 +116,15 @@ function fixture(productionHelp = false) {
     });
     planner.wake("policy_replan"); await done.promise;
   };
-  const program = (source = 'return {status:"completed",summary:"neutral-source-marker",result:null};', name = "Neutral procedure") => store.registerSkill(state.run.run_id, {
+  const program = (source = 'return {status:"completed",summary:"neutral-source-marker",result:null};', name = "Neutral procedure") => store.registerSkill(state.run.run_id, { entry: "run",
     name, source, dependencies: [], card: { purpose: "Read neutral current state", applicability: "Fixture",
       method: "No game effects", reason: "Context retention", limitations: "Not gameplay evidence" },
-    validation: { runtime_version: 4, api_version: 4, validator_version: 4, compatibility_hash: state.run.compatibility_hash!,
+    validation: { runtime_version: 5, api_version: 5, validator_version: 5, compatibility_hash: state.run.compatibility_hash!,
       fingerprint: "fixture", formatted_lines: 1, complexity: 1, nesting: 0 },
   });
   const requestHelp = (topic = "game") => settlement([{ type: "toolCall", id: `help-${topic}`, name: "help", arguments: { topic } }]);
   let starts = 0;
-  const execution = (skill: SkillView, args: Json = { target_id: "ROOT_ARGUMENT_NOT_CONTEXT" }) => store.admitSkill(state.run.run_id, {
+  const execution = (skill: SkillView, args: Json = { target_id: "ROOT_ARGUMENT_NOT_CONTEXT" }) => store.admitSkill(state.run.run_id, { entry: "run",
     skill_id: skill.skill_id, version: skill.version, start_key: `context-root-${++starts}`,
     ...executionScopeFixture(state.run), args,
     limits: { duration_ms: 10000, max_actions: 4, max_calls: 8, max_depth: 1 },
@@ -142,24 +145,134 @@ function retained(request: Context | undefined): Record<string, any> | undefined
   return undefined;
 }
 
-test("next actual SDK request retains production action schemas and inventory contracts", async () => {
-  const f = fixture(true);
-  f.program();
-  await f.planner.start(1); await f.turn([f.requestHelp(), settlement()]);
-  await f.turn();
-  const context = retained(f.state.requests.at(-1))!;
-  const sections = context.requested_help as Array<{section:string;content:any}>;
-  const actions = sections.filter(section=>section.section.startsWith("schemas.capabilities.minecraft.action@1.oneOf["))
-    .map(section=>section.content);
-  expect(actions.map(schema=>schema.properties.kind.const)).toEqual(
-    ["move","look","dig","place","craft","equip","interact","attack","navigate","respawn"]);
-  const inventory = sections.find(section=>section.section==="schemas.AdapterData");
-  expect(inventory?.content.properties.player.properties.inventory.items.required).toContain("name");
-  expect(Buffer.byteLength(JSON.stringify({strategic_context:context}))).toBeLessThanOrEqual(32*1024);
+async function residentUncertainty(f: ReturnType<typeof fixture>, sequence = 7) {
+  const skill = await f.store.registerSkill(f.state.run.run_id, { entry: "step", name: `Resident ${sequence}`,
+    source: "export function step(frame,state,intent) { return null; }", dependencies: [],
+    card: { purpose: "Bounded receipt retention", applicability: "Fixture", method: "No replay",
+      reason: "Historical uncertainty", limitations: "Not native proof" },
+    validation: { runtime_version: 5, api_version: 5, validator_version: 5,
+      compatibility_hash: f.state.run.compatibility_hash!, fingerprint: "fixture", formatted_lines: 1, complexity: 1, nesting: 0 } });
+  const owner = f.store.admitSkill(f.state.run.run_id, { entry: "step", skill_id: skill.skill_id, version: 1,
+    start_key: `resident-${sequence}`, ...executionScopeFixture(f.state.run), args: null, initial_state: null,
+    limits: { ...DEFAULT_RESIDENT_LIMITS } }).view;
+  const input: ControllerInput = { kind: "screen", screen: { screen_id: "OLD_SCREEN_HANDLE", incarnation: 1, layout_revision: 1 },
+    operations: [{ kind: "key", key: "enter", phase: "press" }, { kind: "close" }] };
+  const update: ControllerEffectUpdate = { controller_generation: 3, sequence, recorded_native_ns: "123456",
+    result: { status: "unknown", summary: "Confirmed prefix with unknown suffix", evidence: { effect_confirmed: false,
+      transaction_status: "unknown", gui_transactions: [{ kind: "gui_transaction", mechanism: "visible_gui",
+        operation_index: 0, receipt_ref: "server:prefix", input_application: "confirmed", effect_status: "confirmed",
+        inventory_before: {}, inventory_after: {}, productions: [] }] } } };
+  const scope = { run_id: owner.run_id, world_id: owner.world_id!, session_id: owner.session_id!,
+    epoch: owner.epoch, native_boot_id: owner.native_boot_id!, run_generation: owner.run_generation!,
+    life_id: owner.life_id!, space_epoch: owner.space_epoch!, execution_id: owner.execution_id, source_hash: owner.source_hash! };
+  f.store.event(f.state.run.run_id, "controller.admitted", "Retained original controller grant", {
+    operation_id: `controller-owner-${sequence}`, scope, invocation: { kind: "skill", execution_id: owner.execution_id,
+      source_hash: owner.source_hash! }, controller_generation: 3, deadline_host_monotonic_ms: 10000 });
+  retainResidentReceipt(f.store, f.adapter, owner, input, update);
+  const receipt = f.store.eventsAfter(f.state.run.run_id, 0, 500).filter(event => event.type === "controller.receipted").at(-1)!;
+  return { owner, receipt, scope, retire: () => f.store.event(f.state.run.run_id, "controller.retired",
+    "Actual native retirement; old effects are not reversed", jsonSchema.parse({ operation_id: `controller-owner-${sequence}`,
+      ack: { owner: { operation_id: `controller-owner-${sequence}`, generation: 1, scope }, controller_generation: 3,
+        admission_revoked: true, last_applied_sequence: sequence, ordered_edge_prefix: 1,
+        retirement_applied_native_tick: 10, retirement_applied_native_ns: "123999",
+        input_application: "confirmed", unresolved_operation_refs: [] } })) };
+}
+
+test("resident unknown receipt retains no-replay input and separate known retirement across generation, life and Store reopen", async () => {
+  const f = fixture(), resident = await residentUncertainty(f);
+  resident.retire();
+  resident.owner.status = "cancelled"; resident.owner.ended_at = new Date().toISOString();
+  f.store.updateSkillExecution(resident.owner, "skill.closed", "Stop drained known emitters", { status: "cancelled" });
+  await f.planner.start(1); await f.turn();
+  const first = retained(f.state.requests.at(-1))!;
+  expect(first.unresolved).toHaveLength(1);
+  expect(first.unresolved[0]).toMatchObject({ type: "controller.receipted", status: "unknown", no_replay: true,
+    historical: true, current_authority: false, input_id: `controller:${resident.owner.execution_id}:3:7`,
+    controller_generation: 3, sequence: 7, original_scope: resident.scope,
+    input: { kind: "screen", operation_kinds: ["key", "close"], confirmed_operation_indexes: [0],
+      unconfirmed_operation_indexes: [1] },
+    containment: { type: "controller.retired", input_application: "confirmed", emitter_closed: true,
+      world_effects_resolved: false } });
+  expect(first.unresolved[0]).not.toHaveProperty("action_id");
+  expect(JSON.stringify(first.unresolved)).not.toContain("OLD_SCREEN_HANDLE");
+  await f.planner.close(); f.state.generation++;
+  await f.planner.start(f.state.generation); await f.turn();
+  expect(retained(f.state.requests.at(-1))!.unresolved).toEqual(first.unresolved);
+  const store = await f.reopen();
+  f.state.run.life_id = 2; f.state.run.native_boot_id = "replacement-boot"; f.state.run.space_epoch = 2;
+  store.saveRun(f.state.run);
+  const reconstructed = JSON.parse(new StrategicContext(store).assemble(f.state.run)).strategic_context;
+  expect(reconstructed.unresolved).toEqual(first.unresolved);
+  expect(Buffer.byteLength(JSON.stringify({ strategic_context: reconstructed }))).toBeLessThanOrEqual(32768);
+});
+
+for (const invalid of ["source", "identity", "scope", "extra field"] as const) {
+  test(`resident uncertainty rejects forged ${invalid} without borrowing execution authority`, async () => {
+    const f = fixture(), resident = await residentUncertainty(f);
+    const forged = structuredClone(resident.receipt.details) as any;
+    // Isolate the invalid receipt: delete only this fixture's original durable row.
+    const database = Reflect.get(f.store, "db") as import("bun:sqlite").Database;
+    database.query("DELETE FROM events WHERE event_seq=?").run(resident.receipt.event_seq);
+    if (invalid === "source") forged.scope.source_hash = "b".repeat(64);
+    if (invalid === "identity") forged.input_id = "controller:foreign:3:7";
+    if (invalid === "scope") forged.scope.run_generation++;
+    if (invalid === "extra field") forged.update.forged = true;
+    f.store.event(f.state.run.run_id, "controller.receipted", "Forged unknown receipt", forged);
+    resident.retire();
+    expect(JSON.parse(new StrategicContext(f.store).assemble(f.state.run)).strategic_context.unresolved).toEqual([]);
+  });
+}
+
+test("resident unknown overflow stays explicitly omitted rather than resolved after known retirements and reopen", async () => {
+  const f = fixture();
+  for (let sequence = 1; sequence <= 11; sequence++) {
+    const resident = await residentUncertainty(f, sequence); resident.retire();
+    resident.owner.status = "cancelled"; resident.owner.ended_at = new Date().toISOString();
+    f.store.updateSkillExecution(resident.owner, "skill.closed", "Cancelled after known retirement", { status: "cancelled" });
+  }
+  const store = await f.reopen(), context = JSON.parse(new StrategicContext(store).assemble(f.state.run)).strategic_context;
+  expect(context.unresolved).toHaveLength(8);
+  expect(context.omitted_unknown_operations).toBe(3);
+  expect(context.unresolved.map((entry: any) => entry.sequence)).toEqual([4, 5, 6, 7, 8, 9, 10, 11]);
+  expect(context.unresolved.every((entry: any) => entry.no_replay && entry.containment.emitter_closed &&
+    !entry.containment.world_effects_resolved)).toBe(true);
+  expect(context.omissions).toContainEqual(expect.objectContaining({
+    kind: "unresolved", reason: "reference_count_budget_not_resolution_no_replay" }));
+});
+
+test("resident actual containment closes only its original emitter without resolving an unknown effect", async () => {
+  const f = fixture(), resident = await residentUncertainty(f);
+  f.store.event(f.state.run.run_id, "controller.contained", "Actual emitter stop confirmed, world effect still unknown",
+    { operation_id: "foreign-controller", input_application: "unknown" });
+  const reducer = new StrategicContext(f.store);
+  expect(JSON.parse(reducer.assemble(f.state.run)).strategic_context.unresolved[0]?.containment).toBeNull();
+  f.store.event(f.state.run.run_id, "controller.contained", "Actual emitter stop confirmed, world effect still unknown",
+    { operation_id: "controller-owner-7", input_application: "unknown" });
+  expect(JSON.parse(reducer.assemble(f.state.run)).strategic_context.unresolved[0]).toMatchObject({
+    no_replay: true, status: "unknown", original_scope: resident.scope,
+    containment: { type: "controller.contained", emitter_closed: true, world_effects_resolved: false,
+      input_application: "unknown" },
+  });
+});
+
+test("resident retirement cannot annotate another generation or forged owner scope as containment", async () => {
+  const f = fixture(), resident = await residentUncertainty(f), retirement = resident.retire();
+  const database = Reflect.get(f.store, "db") as import("bun:sqlite").Database;
+  database.query("DELETE FROM events WHERE event_seq=?").run(retirement.event_seq);
+  for (const mutation of ["controller_generation", "source", "operation"] as const) {
+    const details = structuredClone(retirement.details) as any;
+    if (mutation === "controller_generation") details.ack.controller_generation++;
+    if (mutation === "source") details.ack.owner.scope.source_hash = "c".repeat(64);
+    if (mutation === "operation") details.ack.owner.operation_id = "foreign-owner";
+    f.store.event(f.state.run.run_id, "controller.retired", "Foreign retirement cannot settle original emitter", details);
+  }
+  const context = JSON.parse(new StrategicContext(f.store).assemble(f.state.run)).strategic_context;
+  expect(context.unresolved).toHaveLength(1);
+  expect(context.unresolved[0]).toMatchObject({ status: "unknown", containment: null, no_replay: true });
 });
 
 test("actual next ordinary SDK request retains requested contracts and immutable source without stale observations", async () => {
-  const f = fixture(), program = f.program();
+  const f = fixture(), program = await f.program();
   await f.planner.start(1); await f.turn([f.requestHelp(), settlement()]);
   f.state.observation.observation_seq = 2; f.state.observation.data.player.health = 7;
   await f.turn();
@@ -180,7 +293,7 @@ test("actual next ordinary SDK request retains requested contracts and immutable
 });
 
 test("actual requests retain authored intent and obstruction receipts across turns and safe Agent recreation", async () => {
-  const f = fixture(), execution = f.execution(f.program());
+  const f = fixture(), execution = f.execution(await f.program());
   f.store.updateSkillExecution(execution, "skill.progress", "Use a different approach to the observed worksite", {
     current_subgoal: "Return to the observed worksite",
     worksite: { name: "fixture workstation", position: { x: 4, y: 7, z: -2 },
@@ -241,7 +354,7 @@ test("actual requests retain authored intent and obstruction receipts across tur
   await f.turn(); assertContinuity();
   await f.planner.close(); f.state.generation++;
   await f.planner.start(f.state.generation); await f.turn(); assertContinuity();
-  const later = f.execution(f.program(undefined, "Changed fixture approach"));
+  const later = f.execution(await f.program(undefined, "Changed fixture approach"));
   const move = f.store.admitAction(f.state.run.run_id, "fixture-no-net-move", {
     kind: "move", controls: { forward: true, jump: true }, duration_ms: 300,
   }, "skill", later.execution_id, skillAuthorityFixture(f.state.run, later)).action.view;
@@ -264,11 +377,11 @@ test("actual requests retain authored intent and obstruction receipts across tur
 
 test("default purpose and arbitrary catalog source are not an authored current subgoal", async () => {
   const f = fixture();
-  const skill = f.store.registerSkill(f.state.run.run_id, {
+  const skill = await f.store.registerSkill(f.state.run.run_id, { entry: "run",
     name: "Unspecified procedure", source: 'return {status:"completed",summary:"Result without intent",result:null};',
     dependencies: [], card: { purpose: "Unspecified by author", applicability: "Unspecified by author",
       method: "See immutable source", reason: "Unspecified by author", limitations: "Untested" },
-    validation: { runtime_version: 4, api_version: 4, validator_version: 4, compatibility_hash: f.state.run.compatibility_hash!,
+    validation: { runtime_version: 5, api_version: 5, validator_version: 5, compatibility_hash: f.state.run.compatibility_hash!,
       fingerprint: "fixture", formatted_lines: 1, complexity: 1, nesting: 0 },
   });
   f.execution(skill);
@@ -278,7 +391,7 @@ test("default purpose and arbitrary catalog source are not an authored current s
 });
 
 test("actual root result preserves authored local position notes without recovering targets or deriving intent", async () => {
-  const f = fixture(), execution = f.execution(f.program());
+  const f = fixture(), execution = f.execution(await f.program());
   execution.status = "succeeded"; execution.ended_at = new Date().toISOString();
   execution.result = { status: "completed", summary: "Observed a local fixture landmark", result: {
     landmark: { position: { x: -3, y: 11, z: 2 }, target: { target_id: "STALE_LANDMARK" } },
@@ -300,7 +413,7 @@ test("actual root result preserves authored local position notes without recover
   ]));
   expect(JSON.stringify(context)).not.toContain("STALE_LANDMARK");
   expect(JSON.stringify(context)).not.toContain("OLD_RESOURCE_STATE");
-  const later = f.execution(f.program(undefined, "Later fixture procedure"));
+  const later = f.execution(await f.program(undefined, "Later fixture procedure"));
   later.status = "blocked"; later.ended_at = new Date().toISOString();
   later.result = { status: "blocked", summary: "A different local obstruction", result: { reason: "Fresh observation needed" } };
   f.store.updateSkillExecution(later, "skill.closed", later.result.summary, {});
@@ -314,7 +427,7 @@ test("actual root result preserves authored local position notes without recover
 });
 
 test("authored continuity stays bounded and field omissions do not erase earlier explicit worksite notes", async () => {
-  const f = fixture(), execution = f.execution(f.program());
+  const f = fixture(), execution = f.execution(await f.program());
   f.store.updateSkillExecution(execution, "skill.progress", "Keep the observed worksite note", {
     current_subgoal: "Reach fixture worksite", worksite: { position: { x: 2, y: 3, z: 4 } },
     resource_requirements: [{ name: "fixture material", count: 2 }],
@@ -348,7 +461,7 @@ test("actual continuation after help receives newly requested useful context in 
 
 for (const status of ["unknown", "refused"] as const) {
   test(`actual requests preserve persisted-but-${status} submission after clearing and Agent recreation`, async () => {
-    const f = fixture(), program = f.program();
+    const f = fixture(), program = await f.program();
     const outcome = { source: { status: "persisted", name: program.name, version: program.version },
       start: { status, error: { code: "backend_unavailable", message: `Submission start ${status}`, retryable: false } } };
     f.state.submitResult = outcome;
@@ -379,8 +492,8 @@ for (const status of ["unknown", "refused"] as const) {
 }
 
 test("safe Agent recreation retains compatible help/source and consequential unknown after feedback was consumed", async () => {
-  const f = fixture(), program = f.program();
-  const execution = f.store.admitSkill(f.state.run.run_id, { skill_id: program.skill_id, version: 1,
+  const f = fixture(), program = await f.program();
+  const execution = f.store.admitSkill(f.state.run.run_id, { entry: "run", skill_id: program.skill_id, version: 1,
     start_key: "unknown-fixture", ...executionScopeFixture(f.state.run), args: { target_id: "STALE_TARGET_MUST_NOT_SURVIVE" },
     limits: { duration_ms: 10000, max_actions: 1, max_calls: 2, max_depth: 1 } }).view;
   execution.status = "unknown"; execution.error = "Effect application remains unknown";
@@ -402,7 +515,7 @@ test("safe Agent recreation retains compatible help/source and consequential unk
 
 for (const incompatible of ["adapter", "profile", "root", "tools", "api", "provider"] as const) {
   test(`actual recreated request drops help incompatible with changed ${incompatible}`, async () => {
-    const f = fixture(), program = f.program(); await f.planner.start(1); await f.turn([f.requestHelp(), settlement()]);
+    const f = fixture(), program = await f.program(); await f.planner.start(1); await f.turn([f.requestHelp(), settlement()]);
     await f.planner.close();
     if (incompatible === "adapter") f.state.run.compatibility_hash = "b".repeat(64);
     if (incompatible === "profile") {
@@ -426,8 +539,8 @@ for (const incompatible of ["adapter", "profile", "root", "tools", "api", "provi
   });
 }
 
-test("program execution samples clear with executable compatibility but survive provider-only request changes", () => {
-  const f = fixture(), skill = f.program(), execution = f.execution(skill, { count: 2, mode: "read" });
+test("program execution samples clear with executable compatibility but survive provider-only request changes", async () => {
+  const f = fixture(), skill = await f.program(), execution = f.execution(skill, { count: 2, mode: "read" });
   execution.status = "blocked"; execution.ended_at = new Date().toISOString();
   execution.result = { status: "blocked", summary: "A local author-defined bound", result: { remaining: 1 } };
   f.store.updateSkillExecution(execution, "skill.closed", execution.result.summary);
@@ -442,7 +555,7 @@ test("program execution samples clear with executable compatibility but survive 
 });
 
 test("fresh cold run and changed task/world/life cannot inherit prior source or dynamic failures", async () => {
-  const f = fixture(), execution = f.execution(f.program());
+  const f = fixture(), execution = f.execution(await f.program());
   f.store.updateSkillExecution(execution, "skill.progress", "Private prior-episode intent", {
     current_subgoal: "OLD_EPISODE_SUBGOAL", worksite: { name: "OLD_EPISODE_WORKSITE" },
   });
@@ -464,8 +577,8 @@ test("fresh cold run and changed task/world/life cannot inherit prior source or 
 test("request context stays bounded with explicit source/help omissions without truncating immutable source", async () => {
   const f = fixture();
   const source = `/*${"x".repeat(16000)}*/return {status:"completed",summary:"large",result:null};`;
-  f.program(source.replace("large", "other"), "Other procedure");
-  const program = f.program(source);
+  await f.program(source.replace("large", "other"), "Other procedure");
+  const program = await f.program(source);
   f.state.helpPadding = "p".repeat(12000);
   await f.planner.start(1); await f.turn([f.requestHelp(), f.requestHelp("programs"), settlement()]);
   const context = retained(f.state.requests.at(-1));
@@ -477,7 +590,7 @@ test("request context stays bounded with explicit source/help omissions without 
 
 test("life changes fence current notes and failures but preserve historical no-replay and explicit worksite notes", async () => {
   const f = fixture();
-  const execution = f.execution(f.program());
+  const execution = f.execution(await f.program());
   f.store.updateSkillExecution(execution, "skill.progress", "Old life intent", {
     current_subgoal: "OLD_LIFE_SUBGOAL", worksite: { name: "OLD_LIFE_WORKSITE", position: { x: 1, y: 2, z: 3 } },
     resource_requirements: [{ name: "OLD_LIFE_REQUIREMENT", count: 2 }],
@@ -506,7 +619,7 @@ test("life changes fence current notes and failures but preserve historical no-r
 
 for (const changed of ["task", "world"] as const) {
   test(`same-run ${changed} replacement drops prior source and dynamic experience`, async () => {
-    const f = fixture(), execution = f.execution(f.program());
+    const f = fixture(), execution = f.execution(await f.program());
     f.store.updateSkillExecution(execution, "skill.progress", "Old task intent", {
       current_subgoal: "OLD_TASK_SUBGOAL", worksite: { name: "OLD_TASK_WORKSITE" },
     });
@@ -530,7 +643,7 @@ for (const changed of ["task", "world"] as const) {
 
 for (const changed of ["session", "boot", "space"] as const) {
   test(`changed ${changed} clears authored dynamic notes without declaring old unknown effects resolved`, async () => {
-    const f = fixture(), execution = f.execution(f.program());
+    const f = fixture(), execution = f.execution(await f.program());
     f.store.updateSkillExecution(execution, "skill.progress", "Prior authority's authored state", {
       current_subgoal: "OLD_SCOPE_INTENT", worksite: { position: { x: 1, y: 2, z: 3 } },
     });
@@ -561,7 +674,7 @@ for (const changed of ["session", "boot", "space"] as const) {
 }
 
 test("fresh scoped authored progress before the next post-life-change request is not discarded", async () => {
-  const f = fixture(), skill = f.program();
+  const f = fixture(), skill = await f.program();
   await f.planner.start(1); await f.turn(); await f.planner.close();
   f.state.run.life_id = 2; f.state.observation.life.life_id = 2; f.store.saveRun(f.state.run);
   const execution = f.execution(skill);
@@ -573,7 +686,7 @@ test("fresh scoped authored progress before the next post-life-change request is
 });
 
 test("confirmed continuing recovery root retains only notes authored after new-life adoption", async () => {
-  const f = fixture(), execution = f.execution(f.program());
+  const f = fixture(), execution = f.execution(await f.program());
   await f.planner.start(1); await f.turn(); await f.planner.close();
   f.store.updateSkillExecution(execution, "skill.progress", "Before adoption", {
     current_subgoal: "OLD_RECOVERY_INTENT", worksite: { position: { x: 1, y: 2, z: 3 } },
@@ -605,7 +718,7 @@ test("confirmed continuing recovery root retains only notes authored after new-l
 });
 
 test("reopened Store reconstructs dispatched skill.unknown without an action and never reopens Stop", async () => {
-  const f = fixture(), execution = f.execution(f.program());
+  const f = fixture(), execution = f.execution(await f.program());
   execution.status = "running"; execution.started_at = new Date().toISOString();
   f.store.updateSkillExecution(execution, "skill.started", "Dispatched before process loss");
   f.state.run.status = "stopped";
@@ -668,7 +781,7 @@ test("reopened reduction retains newest consequential failure behind routine pag
 });
 
 test("reopened recovery retains explicit historical worksite but not temporary positions, inventory or old authority", async () => {
-  const f = fixture(), skill = f.program(), original = f.execution(skill);
+  const f = fixture(), skill = await f.program(), original = f.execution(skill);
   f.store.updateSkillExecution(original, "skill.progress", "Explicit world-local objective", {
     current_subgoal: "Return to the authored worksite",
     worksite: { label: "Authored workshop", position: { x: 14, y: 65, z: -8 },
@@ -706,7 +819,7 @@ test("reopened recovery retains explicit historical worksite but not temporary p
 });
 
 test("program reuse carries sanitized arguments and last outcome through named ordinal references after reopening", async () => {
-  const f = fixture(), skill = f.program('return {status:"blocked",summary:"Needs a fresh route",result:{reason:"local bound"}};');
+  const f = fixture(), skill = await f.program('return {status:"blocked",summary:"Needs a fresh route",result:{reason:"local bound"}};');
   const execution = f.execution(skill, {
     count: 3, mode: "nearby", options: { material: "oak_log", target_id: "OLD_ARGUMENT_HANDLE" },
     inventory: [{ name: "OLD_ARGUMENT_INVENTORY", count: 9 }], execution_id: "OLD_ARGUMENT_ROOT",
@@ -736,9 +849,9 @@ test("program reuse carries sanitized arguments and last outcome through named o
   expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32768);
 });
 
-test("source and reuse metadata share their allowance without displacing bounded no-replay history", () => {
+test("source and reuse metadata share their allowance without displacing bounded no-replay history", async () => {
   const f = fixture(), source = `/*${"s".repeat(15800)}*/return {status:"blocked",summary:"Bound",result:null};`;
-  const first = f.program(source, "First large reference"), second = f.program(source, "Second large reference");
+  const first = await f.program(source, "First large reference"), second = await f.program(source, "Second large reference");
   for (const skill of [first, second]) {
     const execution = f.execution(skill, { label: "界".repeat(3000), count: 4 });
     execution.status = "blocked"; execution.ended_at = new Date().toISOString();

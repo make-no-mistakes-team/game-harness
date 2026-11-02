@@ -46,7 +46,7 @@ for (const identity of ["boot", "space", "screen", "descriptor"] as const) {
   });
 }
 
-test("descriptor cutover leaves split GHV1, opaque PNGs, ordered recording/gaps and final hold intact", async () => {
+test("descriptor cutover leaves split GHV2, opaque PNGs, ordered recording/gaps and final hold intact", async () => {
   const directory = await mkdtemp(join(tmpdir(), "gameharness-adapter-media-")); directories.push(directory);
   const listeners = new Set<(frame: Uint8Array) => void>();
   const start = Date.now(); let now = start, latest: Uint8Array | null = null;

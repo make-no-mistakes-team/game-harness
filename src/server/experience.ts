@@ -241,7 +241,7 @@ export class ExperienceLibrary {
       const skill = store.skill(runId, ref);
       if (skill.state !== "validated")
         throw new Error("Promotion requires validated exact dependencies");
-      if (skill.validation.runtime_version !== SKILL_API_VERSION || skill.validation.api_version !== 4 || skill.validation.validator_version !== 4 ||
+      if (!skill.entry || skill.validation.runtime_version !== SKILL_API_VERSION || skill.validation.api_version !== 5 || skill.validation.validator_version !== 5 ||
         skill.validation.compatibility_hash !== current.compatibility_hash)
         throw new Error("Promotion requires compatible skill API sources; retained incompatible history is inspectable only");
       for (const dependency of skill.dependencies) visit(dependency);

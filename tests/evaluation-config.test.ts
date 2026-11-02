@@ -1,5 +1,81 @@
-import { expect, test } from "bun:test";
-import { createEvaluationConfig, DEFAULT_EVALUATION_CAPS } from "../src/evaluation/config.ts";
+import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createEvaluationConfig, DEFAULT_EVALUATION_CAPS, loadEvidenceProfile } from "../src/evaluation/config.ts";
+
+const roots: string[] = [];
+afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const profile = () => ({ schema_version: 1, recording: { maxPendingRawBytes: 134217728,
+  maxFrames: 60000, maxStoredFrameBytes: 34359738368, maxDurationMs: 2000000 },
+  journal: { maxTextBytes: 2147483648, maxPendingBytes: 16777216, maxImageBytes: 34359738368, maxImages: 12000 },
+  render_timeout_ms: 300000 });
+function project() { const root = mkdtempSync(join(tmpdir(), "evidence-profile-")); roots.push(root); return root; }
+
+test("evidence file loading preserves raw identity and freezes validated nested limits", () => {
+  const root = project(), bytes = ` ${JSON.stringify(profile(), null, 2)}\n`;
+  writeFileSync(join(root, "long.json"), bytes);
+  const loaded = loadEvidenceProfile(root, "long.json");
+  expect(loaded.source).toEqual({ path: "long.json", sha256: createHash("sha256").update(bytes).digest("hex") });
+  expect(loaded.profile.recording.maxFrames).toBe(60000);
+  expect(Object.isFrozen(loaded.profile.recording)).toBe(true);
+  expect(Object.isFrozen(loaded.profile.journal)).toBe(true);
+  expect(Object.isFrozen(loaded.profile)).toBe(true);
+});
+
+test("omitted evidence profile is local immutable identity and performs no file creation", () => {
+  const root = project(), loaded = loadEvidenceProfile(root);
+  expect(loaded.source.path).toBeNull();
+  expect(loaded.source.sha256).toMatch(/^[a-f0-9]{64}$/);
+  expect(Object.isFrozen(loaded.profile)).toBe(true);
+  expect(Object.isFrozen(loaded.profile.recording)).toBe(true);
+  expect(loadEvidenceProfile(root).source.sha256).toBe(loaded.source.sha256);
+});
+
+test("evidence profiles reject incomplete, unknown, unsafe and oversized declarations without exposing contents", () => {
+  const root = project();
+  for (const bad of [{ ...profile(), journal: {} }, { ...profile(), unexpected: "PRIVATE_MARKER" },
+    { ...profile(), recording: { ...profile().recording, maxFrames: 0.5 } },
+    { ...profile(), journal: { ...profile().journal, maxPendingBytes: 67108865 } }]) {
+    writeFileSync(join(root, "bad.json"), JSON.stringify(bad));
+    expect(() => loadEvidenceProfile(root, "bad.json")).toThrow("Evidence profile");
+    try { loadEvidenceProfile(root, "bad.json"); } catch (error) { expect(String(error)).not.toContain("PRIVATE_MARKER"); }
+  }
+  writeFileSync(join(root, "bad.json"), "PRIVATE_MARKER".repeat(2000));
+  expect(() => loadEvidenceProfile(root, "bad.json")).toThrow("Evidence profile");
+});
+
+test("evidence profiles never inspect foreign, symlinked, directory or secret paths", () => {
+  const root = project(), foreign = project();
+  writeFileSync(join(foreign, "foreign.json"), JSON.stringify(profile()));
+  writeFileSync(join(root, "valid.json"), JSON.stringify(profile()));
+  symlinkSync(join(root, "valid.json"), join(root, "alias.json"));
+  mkdirSync(join(root, "auth"));
+  for (const name of [".env", ".env.local", "gameharness.sqlite", "credentials.json", "auth/config.json"])
+    writeFileSync(join(root, name), JSON.stringify(profile()));
+  for (const name of [join(foreign, "foreign.json"), "alias.json", "auth", ".env", ".env.local",
+    "gameharness.sqlite", "credentials.json", "auth/config.json"])
+    expect(() => loadEvidenceProfile(root, name)).toThrow("Evidence profile");
+});
+
+test("acceptance admits an explicit evidence profile flag but never in admission-only mode", async () => {
+  const { parseAgentAcceptanceArguments } = await import("../scripts/agent-acceptance.ts");
+  expect(parseAgentAcceptanceArguments(["--hypothesis", "bounded", "--evidence-revision", "r1",
+    "--evidence-profile", "long.json"]).evidenceProfile).toBe("long.json");
+  expect(() => parseAgentAcceptanceArguments(["--admission-only", "--study", "study", "--manifest", "study.json",
+    "--slot", '{"arm":"a","initial_state_id":"b","repetition":1}', "--evidence-profile", "long.json"])).toThrow("Admission-only");
+});
+
+test("acceptance rejects a profile below the requested capture horizon before opening auth or native resources", async () => {
+  const { runAgentAcceptance } = await import("../scripts/agent-acceptance.ts");
+  const root = project();
+  writeFileSync(join(root, "small.json"), JSON.stringify({ ...profile(),
+    recording: { ...profile().recording, maxFrames: 30, maxDurationMs: 1000 } }));
+  await expect(runAgentAcceptance({ allowNative: true, allowInference: true,
+    authDirectory: join(root, "auth-does-not-exist"), projectRoot: root, evidenceProfile: "small.json",
+    hypothesisId: "bounded", platformEvidenceRevision: "r1" })).rejects.toThrow("Evidence profile");
+});
 
 const discoveredModels = [{ id: "gpt-6-luna", cost: null }, { id: "gpt-6.1-sol", cost: { input: 0, output: 0 } }];
 const base = { discoveredModels, purpose: "ordinary_acceptance" as const, hypothesisId: "natural-wood-r1", platformEvidenceRevision: "platform-r1" };

@@ -3,6 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { types } from "node:util";
 import type {
   Json,
   ObservationV3,
@@ -37,9 +38,19 @@ import {
 import { validateProgramSource, type ExecutableValidationContext } from "./program-validation.ts";
 import type { SkillAPIManifest } from "../shared/programs.ts";
 import { capabilityFailure, GeneratedResultValidationError, parseGeneratedSkillResult, ProgramExecutionError, readProgramDiagnostic } from "./program-diagnostics.ts";
+import { controllerStepResultSchema, residentIntentSchema, residentStateSchema,
+  type ControllerStepResult, type ResidentWorker, type ResidentAnalysisWorker, 
+  ResidentCleanupError, RESIDENT_STEP_RESPONSE_MS} from "../shared/resident.ts";
+import type { MinecraftControllerFrame } from "../shared/minecraft.ts";
 
 export interface SkillSandboxHooks {
   api?: SkillAPIManifest;
+  onTiming?(event: {
+    phase: "worker_start" | "worker_cleanup";
+    started_monotonic_ms: number;
+    ended_monotonic_ms: number;
+    confirmed: boolean;
+  }): void;
   onInstrumentation?(instrumentation: ProgramInstrumentation): void;
   onTrace?(trace: ProgramBranchTrace): void;
   onCapabilityRequest?(event: {
@@ -121,6 +132,44 @@ function encode(value: unknown, maxBytes: number): string {
   return text;
 }
 
+// Host callers normally supply validated data. Reject accessors/proxies before
+// any stringify/schema traversal nevertheless; authored hooks must never run here.
+function assertResidentInput(value: unknown): void {
+  const pending = [{ value, depth: 0 }];
+  let visited = 0;
+  while (pending.length) {
+    if (++visited > INPUT_BYTES) throw new Error("Resident input exceeds its JSON bound.");
+    const item = pending.pop()!;
+    const current = item.value;
+    if (current === null || typeof current === "boolean") continue;
+    if (typeof current === "string") {
+      if (Buffer.byteLength(current) > INPUT_BYTES) throw new Error("Resident input exceeds its JSON bound.");
+      continue;
+    }
+    if (typeof current === "number" && Number.isFinite(current)) continue;
+    if (!current || typeof current !== "object" || types.isProxy(current) || item.depth >= MAX_DEPTH)
+      throw new Error("Resident input requires bounded plain JSON data.");
+    const array = Array.isArray(current);
+    const prototype = Object.getPrototypeOf(current);
+    if (prototype !== (array ? Array.prototype : Object.prototype) && !(prototype === null && !array))
+      throw new Error("Resident input requires plain JSON data.");
+    const descriptors = Object.getOwnPropertyDescriptors(current);
+    const keys = Reflect.ownKeys(descriptors);
+    const length = array ? descriptors.length?.value : keys.length;
+    if (!Number.isSafeInteger(length) || length < 0 || length > INPUT_BYTES ||
+      (array && keys.length !== length + 1))
+      throw new Error("Resident input exceeds its JSON bound.");
+    for (const key of keys) {
+      if (array && key === "length") continue;
+      const descriptor = descriptors[key as string]!;
+      if (typeof key !== "string" || !descriptor.enumerable || !Object.hasOwn(descriptor, "value") ||
+        (array && (!/^(?:0|[1-9][0-9]*)$/.test(key) || Number(key) >= length)))
+        throw new Error("Resident input cannot contain JSON hooks or hidden fields.");
+      pending.push({ value: descriptor.value, depth: item.depth + 1 });
+    }
+  }
+}
+
 interface CommandResult {
   code: number | null;
   stdout: string;
@@ -175,12 +224,13 @@ async function docker(
 type Reply = Record<string, unknown>;
 interface Pending {
   type: string;
+  id?: number;
   resolve: (reply: Reply) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
 }
 
-class DockerPolicyWorker implements PolicyWorker {
+class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalysisWorker {
   readonly name: string;
   private child: ChildProcessWithoutNullStreams | null = null;
   private childExited: Promise<void> = Promise.resolve();
@@ -193,6 +243,11 @@ class DockerPolicyWorker implements PolicyWorker {
   private stderrBytes = 0;
   private evaluating = false;
   private state: Record<string, Json> = {};
+  private residentEntry: "step" | "analyze" | null = null;
+  private residentBudget = 0;
+  private sequence = 0;
+  private releaseSignal: (() => void) | null = null;
+  private analysisEvaluation: { id: number; started: number; reported: boolean; callback?: (elapsedMs: number) => void } | null = null;
 
   constructor(
     private runner: string,
@@ -203,15 +258,24 @@ class DockerPolicyWorker implements PolicyWorker {
     this.name = `gameharness-policy-${owner}-${randomUUID()}`;
   }
 
-  async start(source?: string, binding: "policy" | "guard" = "policy"): Promise<void> {
+  async start(source?: string, binding: "policy" | "guard" | "step" | "analyze" = "policy",
+    budget = 0, signal?: AbortSignal): Promise<void> {
     try {
       if (this.closing) throw new Error("Sandbox worker is closed.");
-      const ready = this.waitFor("ready", STARTUP_MS);
+      this.residentEntry = binding === "step" || binding === "analyze" ? binding : null;
+      this.residentBudget = budget;
+      if (signal?.aborted) throw new Error("Resident worker was cancelled.");
+      const abort = () => this.fail(new Error("Resident worker was cancelled."));
+      signal?.addEventListener("abort", abort, { once: true });
+      this.releaseSignal = () => signal?.removeEventListener("abort", abort);
+      const ready = this.waitFor(this.residentEntry ? "resident_ready" : "ready",
+        STARTUP_MS, this.residentEntry ? 0 : undefined);
       // The detached host guardian owns Docker from before creation until rm
       // confirms termination. No policy-accessible process owns this EOF pipe.
       const child = spawn(
         process.execPath,
-        ["--no-env-file", this.guardian, this.name, this.runner, IMAGE],
+        ["--no-env-file", this.guardian, this.name, this.runner, IMAGE,
+          ...(this.residentEntry ? ["resident", String(budget)] : [])],
         {
           env: ENV,
           stdio: ["pipe", "pipe", "pipe"],
@@ -243,8 +307,13 @@ class DockerPolicyWorker implements PolicyWorker {
           this.fail(new Error("Sandbox worker exited unexpectedly."));
       });
       await ready;
-      if (source !== undefined)
-        await this.request("compiled", { type: "init", source, binding }, STARTUP_MS);
+      if (source !== undefined) {
+        if (this.residentEntry)
+          await this.request("resident_compiled", { v: 1, type: "resident_init", id: 0,
+            source, entry: this.residentEntry }, STARTUP_MS, 0);
+        else await this.request("compiled", { type: "init", source, binding }, STARTUP_MS);
+      }
+      if (this.closing || signal?.aborted) throw new Error("Sandbox worker was cancelled during startup.");
     } catch (error) {
       await this.terminate(
         error instanceof Error
@@ -314,7 +383,7 @@ class DockerPolicyWorker implements PolicyWorker {
     }
   }
 
-  private waitFor(type: string, timeout: number): Promise<Reply> {
+  private waitFor(type: string, timeout: number, id?: number): Promise<Reply> {
     if (this.pending || this.closing)
       return Promise.reject(new Error("Sandbox worker is busy or closed."));
     this.stdout = [];
@@ -328,14 +397,18 @@ class DockerPolicyWorker implements PolicyWorker {
       () =>
         this.fail(
           new Error(
-            type === "decision"
+            type === "resident_result"
+              ? this.residentEntry === "step"
+                ? "Resident step response deadline expired."
+                : "Resident evaluation exceeded its guarded computation deadline."
+              : type === "decision"
               ? "Policy evaluation exceeded its 500 ms deadline."
               : "Sandbox worker startup timed out.",
           ),
         ),
       timeout,
     );
-    this.pending = { type, resolve: resolveReply, reject, timer };
+    this.pending = { type, id, resolve: resolveReply, reject, timer };
     return promise;
   }
 
@@ -343,34 +416,78 @@ class DockerPolicyWorker implements PolicyWorker {
     type: string,
     message: unknown,
     timeout: number,
+    id?: number,
+    onEvaluation?: (elapsedMs: number) => void,
   ): Promise<Reply> {
     const line = encode(message, INPUT_BYTES) + "\n";
-    const response = this.waitFor(type, timeout);
+    const response = this.waitFor(type, timeout, id);
     if (!this.child || this.closing)
       this.fail(new Error("Sandbox worker is closed."));
-    else this.child.stdin.write(line);
+    else {
+      if (this.residentEntry === "analyze" && type === "resident_result")
+        this.analysisEvaluation = { id: id!, started: performance.now(), reported: false, callback: onEvaluation };
+      this.child.stdin.write(line);
+    }
     return await response;
   }
 
   private receive(chunk: Buffer): void {
     if (this.closing) return;
     this.stdoutBytes += chunk.length;
-    if (!this.pending || this.stdoutBytes > OUTPUT_BYTES) {
+    if (!this.pending || this.stdoutBytes > OUTPUT_BYTES + (this.residentEntry === "analyze" ? 512 : 0)) {
       this.fail(
         new Error("Sandbox worker violated its output protocol or size limit."),
       );
       return;
     }
     this.stdout.push(chunk);
-    const end = chunk.indexOf(10);
-    if (end === -1) return;
     try {
-      if (end !== chunk.length - 1)
-        throw new Error("Sandbox worker returned multiple protocol messages.");
-      const line = Buffer.concat(this.stdout);
-      const text = line.subarray(0, line.length - 1).toString("utf8");
+      const buffer = Buffer.concat(this.stdout);
+      let offset = 0;
+      for (;;) {
+        const end = buffer.indexOf(10, offset);
+        if (end === -1) break;
+        // Only analysis has a trusted extra notification; all other protocols
+        // keep their original single-frame-per-flight framing.
+        if (this.residentEntry !== "analyze" && end !== buffer.length - 1)
+          throw new Error("Sandbox worker returned multiple protocol messages.");
+        if (end - offset + 1 > OUTPUT_BYTES)
+          throw new Error("Sandbox worker exceeded its frame limit.");
+        this.receiveReply(buffer.subarray(offset, end).toString("utf8"));
+        if (this.closing) return;
+        if (!this.pending && end !== buffer.length - 1)
+          throw new Error("Sandbox worker returned trailing protocol data.");
+        offset = end + 1;
+      }
+      this.stdout = offset < buffer.length ? [buffer.subarray(offset)] : [];
+    } catch {
+      this.fail(
+        new Error(
+          "Policy compilation or evaluation failed, or exceeded its JSON limits.",
+        ),
+      );
+    }
+  }
+
+  private receiveReply(text: string): void {
+      if (!this.pending) throw new Error("Sandbox worker returned an unsolicited frame.");
       checkJsonDepth(text);
       const reply: unknown = JSON.parse(text);
+      if (reply && typeof reply === "object" && !Array.isArray(reply) &&
+        "type" in reply && reply.type === "guardian_analysis_evaluated") {
+        const frame = reply as Reply, evaluation = this.analysisEvaluation;
+        if (this.residentEntry !== "analyze" || this.pending.type !== "resident_result" ||
+          !evaluation || evaluation.reported || frame.v !== 2 || frame.id !== evaluation.id ||
+          frame.id !== this.pending.id || frame.entry !== "analyze" ||
+          !exactKeys(frame, ["v", "type", "id", "entry", "elapsed_ms", "outcome"]) ||
+          typeof frame.elapsed_ms !== "number" || !Number.isFinite(frame.elapsed_ms) ||
+          frame.elapsed_ms < 0 || frame.elapsed_ms > Number.MAX_SAFE_INTEGER ||
+          !["result", "terminated"].includes(frame.outcome as string))
+          throw new Error("Invalid trusted analysis evaluation notification.");
+        this.reportAnalysisEvaluation(frame.elapsed_ms);
+        if (frame.outcome === "terminated") this.fail(new Error("Resident analysis evaluation failed or exceeded its guarded deadline."));
+        return;
+      }
       if (
         !reply ||
         typeof reply !== "object" ||
@@ -382,18 +499,28 @@ class DockerPolicyWorker implements PolicyWorker {
           "Policy compilation or evaluation failed, or returned an invalid protocol response.",
         );
       }
+      if (this.residentEntry) {
+        const frame = reply as Reply;
+        if (frame.v !== 1 || frame.id !== this.pending.id ||
+          !exactKeys(frame, frame.type === "resident_result"
+            ? ["v", "type", "id", "value"] : ["v", "type", "id"]) || !finiteJson(frame))
+          throw new Error("Resident worker returned an invalid protocol response.");
+        if (this.residentEntry === "analyze" && frame.type === "resident_result" &&
+          !this.analysisEvaluation?.reported)
+          throw new Error("Resident analysis result omitted trusted evaluation timing.");
+      }
       const pending = this.pending;
       this.pending = null;
       this.stdout = [];
       clearTimeout(pending.timer);
       pending.resolve(reply as Reply);
-    } catch {
-      this.fail(
-        new Error(
-          "Policy compilation or evaluation failed, or exceeded its JSON limits.",
-        ),
-      );
-    }
+  }
+
+  private reportAnalysisEvaluation(elapsedMs: number): void {
+    const evaluation = this.analysisEvaluation;
+    if (!evaluation || evaluation.reported) throw new Error("Analysis evaluation boundary was repeated.");
+    evaluation.reported = true;
+    evaluation.callback?.(elapsedMs);
   }
 
   async evaluate(
@@ -406,6 +533,49 @@ class DockerPolicyWorker implements PolicyWorker {
         throw new Error("Policy returned an invalid decision.");
       return decision.data;
     });
+  }
+
+  async step(frame: MinecraftControllerFrame, state: Json, intent: Json,
+    signal?: AbortSignal): Promise<ControllerStepResult> {
+    return await this.residentValue("step", { frame, state, intent }, signal, value =>
+      controllerStepResultSchema.parse(value));
+  }
+
+  async analyze(input: Json, signal?: AbortSignal, onEvaluation?: (elapsedMs: number) => void): Promise<Json> {
+    return await this.residentValue("analyze", { input }, signal, value => value as Json, onEvaluation);
+  }
+
+  private async residentValue<T>(entry: "step" | "analyze", payload: Reply,
+    signal: AbortSignal | undefined, decode: (value: unknown) => T, onEvaluation?: (elapsedMs: number) => void): Promise<T> {
+    if (this.closing || this.residentEntry !== entry)
+      throw new Error("Resident worker is closed or has the wrong selected entry.");
+    if (this.evaluating) throw new Error("Concurrent resident computation is not allowed.");
+    this.evaluating = true;
+    const abort = () => this.fail(new Error("Resident computation was cancelled."));
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      if (signal?.aborted) throw new Error("Resident computation was cancelled.");
+      assertResidentInput(payload);
+      if (entry === "step") {
+        residentStateSchema.parse(payload.state);
+        residentIntentSchema.parse(payload.intent);
+      }
+      if (!Number.isSafeInteger(this.sequence + 1)) throw new Error("Resident sequence exhausted.");
+      const id = ++this.sequence;
+      const reply = await this.request("resident_result",
+        { v: 1, type: `resident_${entry}`, id, ...payload },
+        entry === "step" ? RESIDENT_STEP_RESPONSE_MS : this.residentBudget, id, onEvaluation);
+      if (signal?.aborted || this.closing) throw new Error("Resident computation was cancelled.");
+      return decode(reply.value);
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error("Resident computation failed.");
+      await this.terminate(failure);
+      throw failure;
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      this.evaluating = false;
+      if (entry === "analyze") this.analysisEvaluation = null;
+    }
   }
 
   async evaluateBoolean(context: Json, signal: AbortSignal): Promise<boolean> {
@@ -469,6 +639,14 @@ class DockerPolicyWorker implements PolicyWorker {
 
   private terminate(reason: Error): Promise<void> {
     if (this.cleanup) return this.cleanup;
+    // Abort/deadline/transport failure can win the race with the guardian's
+    // notification. Capture that trusted host boundary BEFORE joining cleanup.
+    // This is guarded dispatch wall time, not pure CPU or cross-clock arithmetic.
+    const evaluation = this.analysisEvaluation;
+    if (evaluation && !evaluation.reported) {
+      try { this.reportAnalysisEvaluation(Math.max(0, performance.now() - evaluation.started)); }
+      catch { /* Instrumentation cannot release or bypass actual cleanup. */ }
+    }
     this.closing = true;
     this.cleanup = (async () => {
       let failure: Error | null = null;
@@ -484,10 +662,12 @@ class DockerPolicyWorker implements PolicyWorker {
             );
         }
       } catch {
-        failure = new Error(
+        failure = this.residentEntry ? new ResidentCleanupError() : new Error(
           "Docker could not confirm policy container cleanup. Check the Docker daemon before continuing.",
         );
       } finally {
+        this.releaseSignal?.();
+        this.releaseSignal = null;
         this.state = {};
         this.stdout = [];
         const pending = this.pending;
@@ -584,6 +764,8 @@ class DockerSkillWorker {
   private readonly completion = Promise.withResolvers<SkillResult>();
   private traceReceiver: ProgramTraceReceiver | null = null;
   private traceHooks: SkillSandboxHooks = {};
+  private startupStarted: number | null = null;
+  private startupReported = false;
 
   constructor(
     private runner: string,
@@ -605,6 +787,7 @@ class DockerSkillWorker {
     const traceReceiver = new ProgramTraceReceiver(program);
     this.traceReceiver = traceReceiver;
     this.traceHooks = hooks;
+    this.startupStarted = performance.now();
     const abort = () => this.fail(new Error("Skill execution was cancelled."), "cancelled");
     signal.addEventListener("abort", abort, { once: true });
     const deadline = Date.now() + limits.duration_ms;
@@ -688,6 +871,7 @@ class DockerSkillWorker {
             frame.id === 0 &&
             exactKeys(frame, ["v", "type", "id"])
           ) {
+            this.reportStartup(true);
             this.phase = "running";
             this.outputBytes = 0;
             child.stdin.write(initial);
@@ -828,6 +1012,15 @@ class DockerSkillWorker {
     void this.terminate(error, undefined, lossReason).catch(() => {});
   }
 
+  private reportStartup(confirmed: boolean): void {
+    if (this.startupReported || this.startupStarted === null) return;
+    this.startupReported = true;
+    this.traceHooks.onTiming?.({
+      phase: "worker_start", started_monotonic_ms: this.startupStarted,
+      ended_monotonic_ms: performance.now(), confirmed,
+    });
+  }
+
   private terminate(
     reason: Error | null,
     result?: SkillResult,
@@ -838,8 +1031,11 @@ class DockerSkillWorker {
     // guardian to remove the container. Never kill or time out the guardian.
     this.closing = true;
     if (this.timer) clearTimeout(this.timer);
+    const cleanupStarted = performance.now();
     this.cleanup = (async () => {
       let failure = reason;
+      try { this.reportStartup(false); }
+      catch { failure ??= new Error("Skill startup timing could not be recorded."); }
       if (this.child) {
         this.child.stdin.end();
         await this.exited;
@@ -858,6 +1054,12 @@ class DockerSkillWorker {
           failure ??= new Error("Skill trace loss could not be recorded.");
         }
       }
+      try {
+        this.traceHooks.onTiming?.({
+          phase: "worker_cleanup", started_monotonic_ms: cleanupStarted,
+          ended_monotonic_ms: performance.now(), confirmed: !this.child || this.exitCode === 0,
+        });
+      } catch { failure ??= new Error("Skill cleanup timing could not be recorded."); }
       if (!this.child || this.exitCode === 0) this.onClosed(this);
       if (failure) this.completion.reject(failure);
       else if (result) this.completion.resolve(result);
@@ -987,6 +1189,28 @@ export class SandboxService {
     return worker;
   }
 
+  async createResidentWorker(source: string, stepMs: number, signal: AbortSignal): Promise<ResidentWorker> {
+    return await this.createResident(source, "step", stepMs, signal);
+  }
+
+  async createResidentAnalysisWorker(source: string, jobMs: number, signal: AbortSignal): Promise<ResidentAnalysisWorker> {
+    return await this.createResident(source, "analyze", jobMs, signal);
+  }
+
+  private async createResident(source: string, entry: "step" | "analyze", budget: number,
+    signal: AbortSignal): Promise<DockerPolicyWorker> {
+    if (this.closed || this.state.status !== "ready")
+      throw new Error("Prepare the Docker sandbox before creating a resident worker.");
+    if (typeof source !== "string" || Buffer.byteLength(source, "utf8") > 16384)
+      throw new Error("Resident source exceeds its size limit.");
+    if (!Number.isSafeInteger(budget) || budget < 1 || budget > (entry === "step" ? 500 : 5000))
+      throw new Error("Resident computation budget must be finite and within its maximum.");
+    if (signal.aborted) throw new Error("Resident worker was cancelled.");
+    const worker = this.allocate();
+    await worker.start(source, entry, budget, signal);
+    return worker;
+  }
+
   /** Effect-free, one-shot predicate in the same externally watched Docker profile. */
   async evaluateGameGuard(
     source: string,
@@ -1039,7 +1263,7 @@ export class SandboxService {
     if (this.workers.size >= MAX_WORKERS)
       throw new Error("The sandbox worker limit has been reached.");
     // Validate input before reserving a slot; no unsandboxed execution fallback.
-    if (!hooks.api || hooks.api.api_version !== 4) throw new Error("Skill execution requires the current host-bound API manifest.");
+    if (!hooks.api || hooks.api.api_version !== 5) throw new Error("Skill execution requires the current host-bound API manifest.");
     encode({ v: 1, type: "skill_init", id: 0, source, args, api: hooks.api }, INPUT_BYTES);
     const program = instrumentProgram(source);
     hooks.onInstrumentation?.({

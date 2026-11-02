@@ -21,7 +21,7 @@ function fixture() {
       payload_schema: { id: "contract-payload", version: 1, hash: contractHash(schemas.payload) },
       profile: { id: "contract-profile", version: 1, configuration, configuration_hash: contractHash(configuration) } },
     capabilities: [{ id: "contract.action", version: 1, schema_hash: contractHash(schemas.capabilities["contract.action@1"]) }],
-    actuator: "native", executable: { api_version: 4, validator_version: 4, runtime_version: 4 } };
+    actuator: "native", executable: { api_version: 5, validator_version: 5, runtime_version: 5 } };
   const registry = new RegisteredAdapterContract(descriptor, schemas);
   const observation = { schema_version: 3, world_id: "world", session_id: "session", epoch: 2147483665, native_boot_id: "boot",
     life: { life_id: 3, status: "alive", can_respawn: false, death: null }, space: { dimension_id: "contract-space", space_epoch: 4 },
@@ -65,13 +65,25 @@ test("agreeing hashes cannot register a tampered schema document", () => {
   expect(() => new RegisteredAdapterContract(f.descriptor, f.schemas)).toThrow();
 });
 
+test("registered semantic admission preserves finite wire validation and applies to exposed capability schemas", () => {
+  const f = fixture();
+  const registry = new RegisteredAdapterContract(f.descriptor, f.schemas, {
+    "contract.action@1": value => value !== null && typeof value === "object" && !Array.isArray(value) && value.scope === "allowed",
+  });
+  expect(registry.parseCapability("contract.action", 1, { kind: "press", scope: "allowed", epoch: 1 }))
+    .toEqual({ kind: "press", scope: "allowed", epoch: 1 });
+  expect(() => registry.parseCapability("contract.action", 1, { kind: "press", scope: "other", epoch: 1 })).toThrow();
+  expect(registry.capabilitySchema("contract.action", 1).safeParse({ kind: "press", scope: "other", epoch: 1 }).success).toBe(false);
+  expect(() => registry.parseCapability("contract.action", 1, { kind: "press", scope: "allowed", epoch: 1, extra: true })).toThrow();
+});
+
 test("registered navigation range rejection identifies its valid bound without echoing input or claiming native neutralization", () => {
   const adapter = minecraftTestAdapter(), registry = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas);
   const target = { target_id: "INPUT_TARGET_SECRET", incarnation: 1, life_id: 1,
     space: { dimension_id: "minecraft:overworld", space_epoch: 1 } };
   for (const [range, bound] of [[0.4, ">= 0.5"], [4.1, "<= 4"]] as const) {
     let failure: unknown;
-    try { registry.parseCapability("minecraft.action", 1, { kind: "navigate", target, range, duration_ms: 1000 }); }
+    try { registry.parseCapability("minecraft.action", 4, { kind: "navigate", target, range, duration_ms: 1000 }); }
     catch (error) { failure = error; }
     const publicFailure = capabilityFailure(failure);
     expect(publicFailure.code).toBe("invalid_request");
@@ -85,7 +97,7 @@ test("registered navigation range rejection identifies its valid bound without e
     expect(publicFailure.message).not.toContain("neutralized");
     expect(programDiagnostic(failure, "a".repeat(64))).toMatchObject({ code: "invalid_request", message: publicFailure.message });
   }
-  expect(registry.parseCapability("minecraft.action", 1, { kind: "navigate", target, range: 0.5, duration_ms: 1000 }))
+  expect(registry.parseCapability("minecraft.action", 4, { kind: "navigate", target, range: 0.5, duration_ms: 1000 }))
     .toMatchObject({ range: 0.5 });
 });
 

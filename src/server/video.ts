@@ -1,64 +1,31 @@
 import type { ServerWebSocket, WebSocketHandler } from "bun";
+import { decodeNativeVideoHeader, MAX_NATIVE_VIDEO_FRAME_BYTES, type NativeVideoHeader } from "../shared/video.ts";
 
 export interface VideoSocketData {
   expires: number;
   lastSequence: number | null;
 }
 
-export interface VideoFrameHeader {
-  width: number;
-  height: number;
-  sequence: number;
-  bottomUp: boolean;
-  capturedAt: number;
-}
-
-const HEADER_BYTES = 32;
-const MAX_WIDTH = 1920;
-const MAX_HEIGHT = 1080;
-const MAX_FRAME_BYTES = HEADER_BYTES + MAX_WIDTH * MAX_HEIGHT * 4;
-
 export function inspectVideoFrame(
   frame: Uint8Array,
   now = Date.now(),
-): VideoFrameHeader | null {
-  if (frame.byteLength < HEADER_BYTES || frame.byteLength > MAX_FRAME_BYTES)
-    return null;
-  const view = new DataView(frame.buffer, frame.byteOffset, HEADER_BYTES);
-  if (view.getUint32(0, true) !== 0x47485631) return null;
-  const width = view.getUint32(4, true);
-  const height = view.getUint32(8, true);
-  const bytes = view.getUint32(12, true);
-  const flags = view.getUint32(20, true);
-  const capturedAt = view.getFloat64(24, true);
+): NativeVideoHeader | null {
+  const header = decodeNativeVideoHeader(frame);
   if (
-    width < 1 ||
-    width > MAX_WIDTH ||
-    height < 1 ||
-    height > MAX_HEIGHT ||
-    bytes !== width * height * 4 ||
-    frame.byteLength !== HEADER_BYTES + bytes ||
-    flags > 1 ||
-    !Number.isFinite(capturedAt) ||
-    capturedAt < 0 ||
-    capturedAt > now + 2000 ||
-    now - capturedAt > 5000
+    !header ||
+    frame.byteLength !== header.headerBytes + header.width * header.height * 4 ||
+    header.capturedAt > now + 2000 ||
+    now - header.capturedAt > 5000
   )
     return null;
-  return {
-    width,
-    height,
-    sequence: view.getUint32(16, true),
-    bottomUp: flags === 1,
-    capturedAt,
-  };
+  return header;
 }
 
 export class VideoStream {
   private readonly clients = new Set<ServerWebSocket<VideoSocketData>>();
   private readonly pendingDrains = new Set<ServerWebSocket<VideoSocketData>>();
   private frame: Uint8Array | null = null;
-  private header: VideoFrameHeader | null = null;
+  private header: NativeVideoHeader | null = null;
   private published = 0;
   private sends = 0;
   private queuedSends = 0;
@@ -70,7 +37,7 @@ export class VideoStream {
 
   readonly handlers: WebSocketHandler<VideoSocketData> = {
     maxPayloadLength: 1024,
-    backpressureLimit: MAX_FRAME_BYTES + 65536,
+    backpressureLimit: MAX_NATIVE_VIDEO_FRAME_BYTES + 65536,
     closeOnBackpressureLimit: true,
     idleTimeout: 60,
     sendPings: true,

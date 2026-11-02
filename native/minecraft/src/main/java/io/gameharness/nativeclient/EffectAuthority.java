@@ -11,6 +11,20 @@ public final class EffectAuthority {
   public record Screen(String id, long incarnation, long revision) {
     public Screen { ContractIdentity.id(id); ContractIdentity.checked(incarnation); ContractIdentity.checked(revision); }
   }
+  public record VisibleScreenRef(String id, long incarnation, long layoutRevision) {
+    public VisibleScreenRef { ContractIdentity.id(id); ContractIdentity.checked(incarnation); ContractIdentity.checked(layoutRevision); }
+  }
+  public record ScreenPrecondition(String kind, Screen transaction, VisibleScreenRef layout) {
+    public ScreenPrecondition {
+      if (!(kind.equals("absent") && transaction == null && layout == null
+          || kind.equals("transaction") && transaction != null && layout == null
+          || kind.equals("layout") && transaction == null && layout != null))
+        throw new IllegalArgumentException("Invalid screen precondition");
+    }
+    public static ScreenPrecondition absent() { return new ScreenPrecondition("absent", null, null); }
+    public static ScreenPrecondition transaction(Screen screen) { return new ScreenPrecondition("transaction", screen, null); }
+    public static ScreenPrecondition layout(VisibleScreenRef screen) { return new ScreenPrecondition("layout", null, screen); }
+  }
   public record Scope(String sessionId, String worldId, long epoch, String nativeBootId,
       String runId, long runGeneration, long lifeId, long spaceEpoch, String executionId, String sourceHash) {
     public Scope {
@@ -89,12 +103,12 @@ public final class EffectAuthority {
     cancellationGeneration = ContractIdentity.next(cancellationGeneration);
   }
 
-  public synchronized Rejection grant(Owner next, String compatibilityHash, Screen expectedScreen) {
+  public synchronized Rejection grant(Owner next, String compatibilityHash, ScreenPrecondition expectedScreen) {
     Rejection scope = validateScope(next.scope(), compatibilityHash);
     if (scope != Rejection.NONE) return scope;
     if (next.cancellationGeneration() != cancellationGeneration) return Rejection.INACTIVE_OWNER;
     if (owner != null) return Rejection.INACTIVE_OWNER;
-    if (!Objects.equals(expectedScreen, screen)) return Rejection.STALE_SCREEN;
+    if (!matchesScreen(expectedScreen)) return Rejection.STALE_SCREEN;
     owner = next;
     return Rejection.NONE;
   }
@@ -109,10 +123,22 @@ public final class EffectAuthority {
   }
 
   /** Called on receive AND again on the game thread immediately before effects, after queueing. */
-  public synchronized Rejection validateApplication(Owner expected, String compatibilityHash, Screen expectedScreen) {
+  public synchronized Rejection validateApplication(Owner expected, String compatibilityHash, ScreenPrecondition expectedScreen) {
     Rejection continuity = validateApplication(expected, compatibilityHash);
     if (continuity != Rejection.NONE) return continuity;
-    return Objects.equals(expectedScreen, screen) ? Rejection.NONE : Rejection.STALE_SCREEN;
+    return matchesScreen(expectedScreen) ? Rejection.NONE : Rejection.STALE_SCREEN;
+  }
+
+  /** Layout admission is identity only. The GUI writer rechecks actual layout/local values per effect. */
+  private boolean matchesScreen(ScreenPrecondition expected) {
+    Objects.requireNonNull(expected);
+    return switch (expected.kind()) {
+      case "absent" -> screen == null;
+      case "transaction" -> Objects.equals(expected.transaction(), screen);
+      case "layout" -> screen != null && screen.id().equals(expected.layout().id())
+          && screen.incarnation() == expected.layout().incarnation();
+      default -> false;
+    };
   }
 
   /** Continuing an already-applied helper may follow its own UI transitions. */

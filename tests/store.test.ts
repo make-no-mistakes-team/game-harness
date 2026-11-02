@@ -110,6 +110,34 @@ const move: GameAction = {
   controls: { forward: true },
 };
 
+test("event batches commit every row before observers can read the first notification", () => {
+  const { directory, store, run } = fixture();
+  const reader = new Store(directory), seen: unknown[] = [];
+  try {
+    store.subscribe(event => {
+      if (event.type.startsWith("batch.")) seen.push(reader.events(run.run_id).filter(row => row.type.startsWith("batch.")).map(row => row.details));
+    });
+    const events = store.appendEvents(run.run_id, [
+      { type: "batch.first", summary: "First durable fact", details: { index: 0 } },
+      { type: "batch.second", summary: "Second durable fact", details: { index: 1 } },
+    ]);
+    expect(events.map(event => event.details)).toEqual([{ index: 0 }, { index: 1 }]);
+    expect(seen).toEqual([[{ index: 0 }, { index: 1 }], [{ index: 0 }, { index: 1 }]]);
+  } finally { reader.close(); }
+});
+
+test("event batch failure rolls back preceding rows and publishes no notification", () => {
+  const { store, run } = fixture(), seen: string[] = [];
+  const before = store.lastEventSeq();
+  store.subscribe(event => { seen.push(event.type); });
+  expect(() => store.appendEvents(run.run_id, [
+    { type: "batch.first", summary: "Must roll back", details: null },
+    { type: "batch.second", summary: "Invalid second fact", get details(): never { throw new Error("Cannot serialize second fact"); } },
+  ])).toThrow("Cannot serialize second fact");
+  expect(store.eventsAfter(run.run_id, before, 10)).toEqual([]);
+  expect(seen).toEqual([]);
+});
+
 test("operator projection uses concrete model and recovery state without classifying error text", () => {
   const { store, run } = fixture();
   run.error = "Provider outage words are not a typed failure signal";
@@ -276,7 +304,7 @@ test("recent run history is newest first while older runs remain retrievable", (
   expect(store.getRun(run.run_id)).toEqual(run);
 });
 
-test("stored artifact tampering is rejected before source can be reused", () => {
+test("stored artifact tampering is rejected before source can be reused", async () => {
   const { store, run, directory } = fixture();
   const spec: PolicySpec = {
     name: "fixture",
@@ -294,7 +322,7 @@ test("stored artifact tampering is rejected before source can be reused", () => 
     },
   };
   const hash = createHash("sha256").update(spec.source).digest("hex");
-  const policy = store.registerPolicy(run.run_id, spec, 0, { api_version: 4, validator_version: 4, runtime_version: 4,
+  const policy = await store.registerPolicy(run.run_id, spec, 0, { api_version: 5, validator_version: 5, runtime_version: 5,
     compatibility_hash: compatibilityHash, fingerprint: programFingerprint(hash, "policy", compatibilityHash), formatted_lines: 1, complexity: 1, nesting: 0 });
   const filename = path.join(directory, "artifacts", `${policy.hash}.js`);
   expect(readFileSync(filename, "utf8")).toBe(spec.source);

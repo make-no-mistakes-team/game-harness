@@ -18,7 +18,7 @@ import { minecraftActionSchema } from "../../src/shared/minecraft.ts";
 const [signalArg, rootArg, phaseArg = "close"] = process.argv.slice(2);
 if (signalArg !== "SIGINT" && signalArg !== "SIGTERM") throw new Error("Expected a real shutdown signal");
 if (!rootArg) throw new Error("Missing isolated proof directory");
-if (phaseArg !== "close" && phaseArg !== "persistence") throw new Error("Unknown proof interruption phase");
+if (phaseArg !== "close" && phaseArg !== "persistence" && phaseArg !== "preflight" && phaseArg !== "capture") throw new Error("Unknown proof interruption phase");
 const signal = signalArg, root = rootArg, phase = phaseArg;
 const project = join(root, "project"), bin = join(root, "bin");
 await mkdir(join(project, "native/minecraft/src"), { recursive: true });
@@ -26,6 +26,8 @@ await mkdir(bin);
 const source = join(project, "native/minecraft/src/Synthetic.java"), jar = join(project, "synthetic-native.jar");
 await writeFile(source, "Synthetic freshness fixture only; never compiled or launched.\n");
 await writeFile(jar, "Synthetic local artifact; never supplied to a JVM.\n");
+if (process.env.PROOF_PROFILE_CONTENT !== undefined)
+  await writeFile(join(project, "evidence-profile.json"), process.env.PROOF_PROFILE_CONTENT);
 await utimes(source, new Date(1000), new Date(1000));
 await utimes(jar, new Date(2000), new Date(2000));
 delete process.env.GAMEHARNESS_PROOF_EXPECTED_JAR_SHA256;
@@ -34,6 +36,7 @@ await writeFile(join(bin, "ffmpeg"), `#!${process.execPath}\nimport { writeFileS
 await writeFile(join(bin, "ffprobe"), `#!${process.execPath}\nimport { readFileSync } from "node:fs";\nconst seconds = readFileSync("replay.ffconcat", "utf8").split("\\n").filter(line => line.startsWith("duration ")).reduce((total, line) => total + Number(line.slice(9)), 0);\nconsole.log(seconds);\n`, { mode: 0o700 });
 
 const closeEntered = Promise.withResolvers<void>(), releaseClose = Promise.withResolvers<void>();
+const captureEntered = Promise.withResolvers<void>();
 const finalWriteEntered = Promise.withResolvers<void>(), releaseFinalWrite = Promise.withResolvers<void>();
 const interruptionWriteEntered = Promise.withResolvers<void>(), releaseInterruptionWrite = Promise.withResolvers<void>();
 const interruptionWriteFinished = Promise.withResolvers<void>(), gatesObserved = Promise.withResolvers<void>();
@@ -75,6 +78,7 @@ const frames = new Set<(frame: Uint8Array) => void>();
 function frame() {
   const packet = nativeFrame({ sequence: ++frameSequence, capturedAt: Date.now() });
   for (const listener of frames) listener(packet);
+  if (frames.size) captureEntered.resolve();
   return packet;
 }
 const bridge: Pick<GameBridge, "observe" | "execute" | "neutralize" | "cancel" | "emergencyStop" | "adapter" | "snapshot"> & {
@@ -125,7 +129,7 @@ const bridge: Pick<GameBridge, "observe" | "execute" | "neutralize" | "cancel" |
   async close() {
     if (!fixture) throw new Error("Missing synthetic native owner");
     caseBeforeClose = structuredClone(fixture.cases[0]);
-    if (caseBeforeClose?.status !== "passed") throw new Error("Proof did not succeed before its native close gate");
+    if (phase !== "capture" && caseBeforeClose?.status !== "passed") throw new Error("Proof did not succeed before its native close gate");
     await fixture.flush();
     closeEntered.resolve();
     if (phase === "close") await releaseClose.promise;
@@ -135,9 +139,12 @@ const bridge: Pick<GameBridge, "observe" | "execute" | "neutralize" | "cancel" |
 };
 let fixture: native.NativeFixture | undefined;
 let caseBeforeClose: Record<string, unknown> | undefined;
+let nativeCreations = 0;
 const create = native.NativeFixture.create.bind(native.NativeFixture);
 mock.module(resolve(import.meta.dir, "../../src/evaluation/native-game.ts"), () => ({ ...native, NativeFixture: {
   create: async (name: string, options: native.NativeFixtureOptions = {}) => {
+    nativeCreations++;
+    if (phase === "preflight") throw new Error("External native preparation must not be reached");
     // Preserve the actual fixture instance and its finish/report implementation.
     // Only its native owner methods are replaced; no real server/client starts.
     const current = await create(name, { ...options, projectRoot: project,
@@ -167,7 +174,15 @@ mock.module(resolve(import.meta.dir, "../../src/evaluation/native-game.ts"), () 
 // Intentional loading boundary: import the proof after installing the isolated
 // native factory. Its real fixture.finish and SDK shutdown remain untouched.
 const { runNativeRecordingProof } = await import("../../scripts/native-recording-proof.ts");
-const proof = runNativeRecordingProof(["--allow-native", "--jar", jar], project);
+const extraArgs: string[] = JSON.parse(process.env.PROOF_EXTRA_ARGS ?? "[]");
+if (phase === "preflight") {
+  let error: string | null = null;
+  try { await runNativeRecordingProof(["--allow-native", "--jar", jar, ...extraArgs], project); }
+  catch (failure) { error = failure instanceof Error ? failure.message : String(failure); }
+  console.log(`PROOF_PREFLIGHT_RESULT ${JSON.stringify({ error, nativeCreations })}`);
+  process.exit(0);
+}
+const proof = runNativeRecordingProof(["--allow-native", "--jar", jar, ...extraArgs], project);
 void proof.then(() => { proofSettled = true; }, () => { proofSettled = true; });
 const observed = (async () => {
   const result = await proof;
@@ -190,7 +205,8 @@ const unregister = postmortem.register("synthetic-native-proof-result-observer",
   return observed;
 }, { exitOnly: true });
 const trigger = (async () => {
-  if (phase === "close") await closeEntered.promise;
+  if (phase === "capture") { await captureEntered.promise; await Bun.sleep(100); }
+  else if (phase === "close") await closeEntered.promise;
   else await finalWriteEntered.promise;
   nativeClosedBeforeSignal = fixture?.report.cleanup === true;
   process.kill(process.pid, signal);
@@ -199,7 +215,7 @@ const trigger = (async () => {
     throw new Error("SDK did not observe the requested real signal");
   // Release only after both production and observer callbacks see the signal,
   // well inside the declared cleanup budget: this is not a timeout failure.
-  if (phase === "close") releaseClose.resolve();
+  if (phase === "capture" || phase === "close") releaseClose.resolve();
   else {
     releaseFinalWrite.resolve();
     await interruptionWriteEntered.promise;

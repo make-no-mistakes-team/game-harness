@@ -9,6 +9,15 @@ export const TEST_TIERS = Object.freeze({
   unit: Object.freeze([
     "tests/java-runtime.test.ts", // Java name resolution with local executable sentinels; no JVM or native startup.
     "tests/native-transport.test.ts", // Native frame parser only; no native process.
+    "tests/control-timing.test.ts", // Bounded host/native monotonic correspondence; no native/provider startup.
+    "tests/controller-inputs.test.ts", // Strict ordinary world-input admission and registered deadlines; no gameplay claim.
+    "tests/controller-stream-inputs.test.ts", // Submitted/applied ledger, exact native age and bounded retirement; no gameplay.
+    "tests/controller-frame.test.ts", // Current permitted feedback and application/receipt projection boundaries.
+    "tests/resident-contract.test.ts", // Strict authored state/output and separate resident resource boundaries.
+    "tests/resident-controller.test.ts", // Absolute scheduling, independent budgets and truthful lifecycle at controlled seams.
+    "tests/resident-benchmark.test.ts", // Exact prespecified cohort/identity/finite evidence declaration, no native launch.
+    "tests/evidence-limits.test.ts", // Explicit finite recorder/journal profile boundaries; no filesystem or native startup.
+    "tests/visible-screen.test.ts", // Visible GUI DTO bounds/local predicates only; no native gameplay claim.
     "tests/video.test.ts", // Frame/header inspection only.
     "tests/actor-frames.test.ts", // Async PNG codec/independent decoder and host selection authority; no provider/native startup.
     "web/src/video.test.ts", // Actual renderer frame classification; synthetic packets/timestamps only.
@@ -44,6 +53,10 @@ export const TEST_TIERS = Object.freeze({
     "tests/planning-admission.test.ts", // Real Store/SkillManager/planner; substituted sandbox seam.
     "tests/program-experience.test.ts", // SQLite, evidence and experience services.
     "tests/program-instrumentation.test.ts", // Real inner worker protocol, not production Docker isolation.
+    "tests/resident-worker.test.ts", // Actual Node supervisor/module thread and protocol; Docker is a separate smoke gate.
+    "tests/resident-runtime.test.ts", // Real Store/SkillManager/ResidentController admission; controlled worker/native boundaries.
+    "tests/resident-benchmark-lifecycle.test.ts", // Real child-process/ledger deadline and OS-close ownership; no Minecraft.
+    "tests/native-resident-lifecycle.test.ts", // Original-owner retirement evidence and actual cleanup-promise joins; no Minecraft.
     "tests/reactive-life.test.ts", // Scheduler/arbiter/worker handoffs; substituted model/game seams.
     "tests/runtime-death-shutdown.test.ts", // Runtime with substituted game/auth/sandbox boundaries.
     "tests/runtime-life-session.test.ts",
@@ -62,6 +75,8 @@ export const TEST_TIERS = Object.freeze({
     "tests/evaluation-study-lifecycle.test.ts", // Real acceptance/Agent/Store ownership at explicit synthetic external seams.
     "tests/evaluation-evidence.test.ts", // Real Store and observer; synthetic provider-event seam only.
     "tests/recording.test.ts", // Real PNG/index/concat filesystem evidence; synthetic delivered packets, no FFmpeg/native dependency.
+    "tests/replay-timing.test.ts", // Real local FFmpeg/FFprobe frame cadence, terminal gaps and generated-manifest integrity; no Minecraft.
+    "tests/resident-benchmark-media.test.ts", // Real sealed PNG/FFmpeg derivation; substituted native closure metadata, no Minecraft.
     "tests/acceptance-lifecycle.test.ts", // Real runner/Runtime/Agent/ledger cancellation; isolated synthetic native/provider/encoder seams.
     "tests/private-journal-lifecycle.test.ts", // Real file handles and retained evidence under isolated marker/sync failures.
     "tests/native-recording-proof-lifecycle.test.ts", // Real proof/fixture finish and OS signals; synthetic native/encoder boundaries, zero inference.

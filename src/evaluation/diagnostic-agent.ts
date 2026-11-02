@@ -1,5 +1,6 @@
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { AuthManager } from "../server/auth.ts";
 import type { Store } from "../server/store.ts";
 import type { AuthState } from "../shared/contracts.ts";
@@ -73,7 +74,7 @@ export class DiagnosticAgent {
         let active: Promise<void> = Promise.resolve();
         let tools = [...options.tools];
         const api = {
-          beforeToolCall: undefined as ((context: { tool: AgentTool }, signal?: AbortSignal) => unknown) | undefined,
+          beforeToolCall: undefined as Agent["beforeToolCall"],
           setBeforeModelCall: (hook: Parameters<Agent["setBeforeModelCall"]>[0]) => { gate = hook; },
           subscribe: () => () => {}, replaceMessages: () => {},
           setTools: (selected: AgentTool[]) => { tools = [...selected]; this.transcript.push({ type: "synthetic_sdk_tools_set", tools: tools.map(tool => tool.name) }); },
@@ -97,9 +98,19 @@ export class DiagnosticAgent {
               const call = async (name: string, args: Record<string, unknown>) => {
                 const tool = tools.find(candidate => candidate.name === name);
                 requireProof(tool, `Production tool ${name} is unavailable`);
-                const accepted = await api.beforeToolCall?.({ tool });
+                const toolCall = { type: "toolCall" as const, id: `native-diagnostic-${crypto.randomUUID()}`, name, arguments: args };
+                const assistantMessage: AssistantMessage = {
+                  role: "assistant", content: [toolCall], api: "openai-codex-responses",
+                  provider: "private-diagnostic", model: MODEL, stopReason: "toolUse", timestamp: Date.now(),
+                  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+                    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+                };
+                const accepted = await api.beforeToolCall?.({
+                  tool, toolCall, args, assistantMessage,
+                  context: { systemPrompt: [], messages: [assistantMessage], tools },
+                });
                 requireProof(!cancelled && !(accepted && typeof accepted === "object" && "block" in accepted && accepted.block), `Production dispatch gate blocked diagnostic ${name}`);
-                const result = await tool.execute(`native-diagnostic-${crypto.randomUUID()}`, args);
+                const result = await tool.execute(toolCall.id, accepted?.args ?? args);
                 this.transcript.push(JSON.parse(JSON.stringify({ type: "synthetic_tool", run_id: runId, tool: name, args, result: result.details, isError: result.isError === true })));
                 return result;
               };

@@ -24,8 +24,11 @@ import type { ModelObservation } from "./actor-frames.ts";
 import { StrategicContext } from "./strategic-context.ts";
 import { jsonSchema } from "../shared/validation.ts";
 import { preserveRuntimeToolArguments } from "./runtime-tools.ts";
+import { HOST_MONOTONIC_CLOCK_ID } from "./performance.ts";
+import { controllerEventSchema } from "../shared/resident.ts";
 
 const COALESCE_MS = 100;
+type ResidentAttentionOmission = { count: number; after_event_seq: number; through_event_seq: number };
 const EMPTY_COOLDOWN_MS = 5_000;
 const MAX_EMPTY_TURNS = 3;
 const TURN_MS = 120_000;
@@ -46,6 +49,7 @@ const MEANINGFUL_WAKES: Record<string, true> = {
   policy_error: true,
   trial_decision_due: true,
   selected_attention: true,
+  resident_attention: true,
   skill_outcome: true,
   planning_continuation: true,
   speculative_lookahead: true,
@@ -56,6 +60,7 @@ const MEANINGFUL_WAKES: Record<string, true> = {
 const FEEDBACK_TYPES: Record<string, true> = {
   "skill.closed": true,
   "skill.progress": true,
+  "controller.event": true,
   "policy.trial_decision_due": true,
   "policy.effect": true,
   "policy.stale_result": true,
@@ -105,6 +110,7 @@ export interface StrategicHost {
 
 interface RequestAttempt {
   id: string;
+  startedMono: number;
   usage: ProviderUsageCollector;
   purpose: UsagePurpose;
   index: number;
@@ -125,6 +131,17 @@ function feedbackEntry(event: ActivityEvent, workspace: ProgramWorkspace): Json 
   // Named evidence inspection remains the authorized route to original records.
   const details = record(event.details);
   const selected: { [key: string]: Json } = {};
+  if (event.type === "controller.event") {
+    const authored = controllerEventSchema.safeParse(details?.event);
+    if (authored.success) {
+      // Preserve authored attention as data, never as the scheduler routing key.
+      // Large details remain inspectable in Store without displacing the
+      // summary or defeating the existing whole-turn feedback allowance.
+      const omitted = Buffer.byteLength(JSON.stringify(authored.data.details)) > 4096;
+      selected.event = { ...authored.data, details: omitted ? null : authored.data.details,
+        ...(omitted ? { details_omitted: true } : {}) };
+    }
+  }
   for (const key of [
     "version",
     "status",
@@ -199,6 +216,9 @@ export class StrategicPlanner {
   private emptyTurns = 0;
   private workRevision = 0;
   private contextCursor = 0;
+  private residentAttention = new Map<number, ActivityEvent>();
+  private residentAttentionConsumed = 0;
+  private residentAttentionOmitted: ResidentAttentionOmission | null = null;
   private previousObservation: ObservationV3 | null = null;
   private purpose: UsagePurpose = "planning";
   private role: RequestAttempt["role"] = "planning";
@@ -241,6 +261,9 @@ export class StrategicPlanner {
     this.emptyTurns = 0;
     this.workRevision = 0;
     this.contextCursor = 0;
+    this.residentAttention.clear();
+    this.residentAttentionConsumed = 0;
+    this.residentAttentionOmitted = null;
     this.previousObservation = null;
     this.purpose = "planning";
     this.role = "planning";
@@ -302,6 +325,7 @@ export class StrategicPlanner {
             if (this.request?.id === request.id) this.store.event(run.run_id, "model.request_configuration",
               "Supported SDK payload hook observed the final request configuration, not provider-effective reasoning",
               { request_id: request.id, source: "sdk_transformed_payload",
+                clock_id: HOST_MONOTONIC_CLOCK_ID, prepared_monotonic_ms: performance.now(),
                 model: typeof sent?.model === "string" ? sent.model.slice(0, 120) : null,
                 reasoning_effort: typeof reasoning?.effort === "string" &&
                   /^(none|minimal|low|medium|high|xhigh|max)$/.test(reasoning.effort) ? reasoning.effort : null,
@@ -322,9 +346,13 @@ export class StrategicPlanner {
               const received = !outbound && (owner === undefined || owner === request.id);
               if (received && !firstResponse) {
                 firstResponse = true;
+                const receivedMono = performance.now();
                 this.store.event(run.run_id, "model.first_response_event", "First received provider SSE event; internal latency components remain unknown",
                   { request_id: request.id, event_type: typeof payload?.type === "string" &&
-                    /^[a-zA-Z0-9._-]{1,100}$/.test(payload.type) ? payload.type : null });
+                    /^[a-zA-Z0-9._-]{1,100}$/.test(payload.type) ? payload.type : null,
+                    clock_id: HOST_MONOTONIC_CLOCK_ID, received_monotonic_ms: receivedMono,
+                    request_elapsed_ms: receivedMono - request.startedMono,
+                    observation_point: "complete_received_sse_event", raw_first_byte_monotonic_ms: null });
               }
               if (received && owner === request.id &&
                 ["response.completed", "response.done", "response.incomplete", "response.failed"].includes(String(payload?.type))) {
@@ -448,6 +476,7 @@ export class StrategicPlanner {
         run.turns++;
         this.request = {
           id: requestId,
+          startedMono: performance.now(),
           usage: new ProviderUsageCollector(requestId, this.responseOwners),
           purpose: this.purpose,
           index: this.turnCalls,
@@ -464,6 +493,8 @@ export class StrategicPlanner {
             turn: run.turns,
             generation,
             request_id: this.request.id,
+            clock_id: HOST_MONOTONIC_CLOCK_ID,
+            started_monotonic_ms: this.request.startedMono,
             request_id_source: "host",
             request_index: this.request.index,
             provider_request_id: null,
@@ -553,10 +584,10 @@ export class StrategicPlanner {
     this.idleTimer = undefined;
     if (this.host.programPending()) {
       // Ordinary queued planning demand is superseded by new work. Explicitly
-      // selected attention/lookahead must survive the current root's next leaf
+      // selected/resident attention and lookahead survive the root's next leaf
       // admission, including the scheduler's coalescing window.
       for (const reason of this.wakeReasons)
-        if (reason !== "selected_attention" && reason !== "speculative_lookahead")
+        if (reason !== "selected_attention" && reason !== "resident_attention" && reason !== "speculative_lookahead")
           this.wakeReasons.delete(reason);
       if (this.wakeReasons.size) this.schedule();
       else {
@@ -599,6 +630,26 @@ export class StrategicPlanner {
     if (!run || !this.current(run, this.host.generation())) return;
     if (this.host.programPending() && !Object.hasOwn(MEANINGFUL_WAKES, reason))
       return;
+    if (reason === "resident_attention") {
+      // SkillManager persists the authored event synchronously before waking us.
+      // Keep the trigger independently of the ordinary oldest-first Store page.
+      const event = this.store.latestEvent(run.run_id, "controller.event");
+      const authored = controllerEventSchema.safeParse(record(event?.details ?? null)?.event);
+      if (event && event.event_seq > this.residentAttentionConsumed &&
+          authored.success && authored.data.kind === "attention") {
+        this.residentAttention.set(event.event_seq, event);
+        if (this.residentAttention.size > 32) {
+          const first = this.residentAttention.keys().next().value!;
+          this.residentAttention.delete(first);
+          const omitted = this.residentAttentionOmitted;
+          this.residentAttentionOmitted = {
+            count: (omitted?.count ?? 0) + 1,
+            after_event_seq: omitted?.after_event_seq ?? first - 1,
+            through_event_seq: first,
+          };
+        }
+      }
+    }
     if (this.speculativeTurn && reason !== "speculative_lookahead" && reason !== "planning_continuation" &&
         Object.hasOwn(MEANINGFUL_WAKES, reason)) {
       // Ordinary outcome/replan demand is never held behind optional lookahead.
@@ -823,6 +874,8 @@ export class StrategicPlanner {
       Math.max(1, this.turnDeadline - Date.now()),
     );
     let through = this.contextCursor;
+    let selectedAttention: ActivityEvent[] = [];
+    let attentionOmission: ResidentAttentionOmission | null = null;
     let projectedObservation: ObservationV3 | null = null;
     let prompting = false;
     try {
@@ -851,12 +904,24 @@ export class StrategicPlanner {
       }
       through =
         candidates[candidates.length - 1]?.event_seq ?? this.contextCursor;
+      selectedAttention = [...this.residentAttention.values()];
+      attentionOmission = this.residentAttentionOmitted;
+      const selectedSequences = new Set(candidates.map(event => event.event_seq));
+      for (const event of selectedAttention)
+        if (!selectedSequences.has(event.event_seq)) candidates.push(event);
       const feedback: Json[] = [];
       const workspace = new ProgramWorkspace(this.store, run.run_id);
       const omitted: number[] = [];
       let bytes = 0;
       for (const event of candidates) {
         if (!Object.hasOwn(FEEDBACK_TYPES, event.type)) continue;
+        if (event.type === "controller.event") {
+          const authored = controllerEventSchema.safeParse(record(event.details)?.event);
+          if (!authored.success || authored.data.kind !== "attention" ||
+              event.event_seq <= this.residentAttentionConsumed ||
+              (attentionOmission && event.event_seq > attentionOmission.after_event_seq &&
+                event.event_seq <= attentionOmission.through_event_seq)) continue;
+        }
         const entry = feedbackEntry(event, workspace);
         const size = Buffer.byteLength(JSON.stringify(entry));
         if (bytes + size > FEEDBACK_BYTES) omitted.push(event.event_seq);
@@ -882,6 +947,7 @@ export class StrategicPlanner {
           through_event_seq: through,
           included_event_count: feedback.length,
           omitted_event_refs: omitted,
+          omitted_resident_attention: attentionOmission,
         },
       );
       const action = this.host.action();
@@ -943,6 +1009,7 @@ export class StrategicPlanner {
             })),
             feedback,
             omitted_event_refs: omitted,
+            omitted_resident_attention: attentionOmission,
             through_event_seq: through,
             instruction: review
               ? "The goal is verified. Perform one bounded effect-free review: inspect evidence, record keep/insufficient_evidence, or program_write a linked revision with reason. A candidate is not proven improvement. No gameplay trials or effects. Completion follows automatically."
@@ -1024,6 +1091,23 @@ export class StrategicPlanner {
     // Nothing was delivered in that case, so do not consume selected evidence.
     if (this.turnCalls) {
       this.contextCursor = through;
+      const attentionThrough = Math.max(this.residentAttentionConsumed,
+        selectedAttention.at(-1)?.event_seq ?? 0, attentionOmission?.through_event_seq ?? 0);
+      this.residentAttentionConsumed = attentionThrough;
+      for (const sequence of this.residentAttention.keys())
+        if (sequence <= attentionThrough) this.residentAttention.delete(sequence);
+      if (this.residentAttentionOmitted) {
+        const liveOmission = this.residentAttentionOmitted;
+        // Overflow can evict records already selected by this in-flight request.
+        // A successful request consumed those records too, not just the range
+        // that was already omitted when its context was selected.
+        const selectedEvictions = selectedAttention.reduce((count, event) => count +
+          Number(event.event_seq > liveOmission.after_event_seq && event.event_seq <= liveOmission.through_event_seq), 0);
+        const remaining = liveOmission.count - (attentionOmission?.count ?? 0) - selectedEvictions;
+        this.residentAttentionOmitted = remaining > 0
+          ? { ...liveOmission, count: remaining, after_event_seq: attentionThrough }
+          : null;
+      }
       this.previousObservation = projectedObservation;
     }
     run.model_status = "idle";
@@ -1081,12 +1165,17 @@ export class StrategicPlanner {
   private finishUnsettledRequest(run: StoredRun): void {
     const request = this.request;
     if (!request) return;
+    const endedMono = performance.now();
     this.store.event(
       run.run_id,
       "model.request_unsettled",
       "An admitted provider request ended without a final usage message; usage and provider attempt count remain unknown",
       {
         request_id: request.id,
+        clock_id: HOST_MONOTONIC_CLOCK_ID,
+        started_monotonic_ms: request.startedMono,
+        ended_monotonic_ms: endedMono,
+        duration_ms: endedMono - request.startedMono,
         request_index: request.index,
         purpose: request.purpose,
         purpose_source: "host_turn_role_v1",
@@ -1194,6 +1283,9 @@ export class StrategicPlanner {
           "Admitted strategic provider request settled",
           {
             request_id: request.id,
+            clock_id: HOST_MONOTONIC_CLOCK_ID,
+            started_monotonic_ms: request.startedMono,
+            ended_monotonic_ms: performance.now(),
             request_index: request.index,
             provider_response_id: message.responseId ?? null,
             provider_retry_attempt: message.retryRecovery?.attempt ?? null,

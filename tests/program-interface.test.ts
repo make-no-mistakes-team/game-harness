@@ -11,17 +11,20 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { buildTransformedCodexRequestBody } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { adaptSchemaForStrict, validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
-import type { GameAPI } from "../src/shared/programs.ts";
 import type { ObservationV3 } from "../src/shared/contracts.ts";
 import type { ImprovementOpportunity } from "../src/shared/execution-evidence.ts";
-import type { MinecraftObservation } from "../src/shared/minecraft.ts";
-import { gameActionResultSchema, observationSchema, skillResultSchema } from "../src/shared/validation.ts";
+import type { MinecraftGameAPI, MinecraftObservation } from "../src/shared/minecraft.ts";
+import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
+import { visibleScreenSnapshotSchema } from "../src/shared/control.ts";
+import { observationSchema, skillResultSchema } from "../src/shared/validation.ts";
+import { gameActionResultSchema } from "../src/shared/primitives.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { SkillManager } from "../src/server/skills.ts";
 import { preserveRuntimeToolArguments, RuntimeTools, type RuntimeToolHost } from "../src/server/runtime-tools.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
+import { DiagnosticAgent, DIAGNOSTIC_PROGRAMS } from "../src/evaluation/diagnostic-agent.ts";
 import type { ReactiveRuntime } from "../src/server/reactive.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
@@ -63,7 +66,7 @@ function fixture(runner?: SandboxService["runSkill"]) {
     dispatches++;
     if (runner) return await runner(...args);
     const [body, input, handle] = args;
-    const game: GameAPI & { recipes(item: string): Promise<import("../src/shared/contracts.ts").Json> } = { observe: async () => observationSchema.parse(await handle({ kind: "observe" })),
+    const game: MinecraftGameAPI = { observe: async () => observationSchema.parse(await handle({ kind: "observe" })),
       action: async (action) => gameActionResultSchema.parse(await handle({ kind: "action", action })),
       actionAndObserve: async action => {
         const result = await game.action(action);
@@ -75,6 +78,9 @@ function fixture(runner?: SandboxService["runSkill"]) {
       },
       respawn: async () => gameActionResultSchema.parse(await handle({ kind: "respawn" })),
       recipes: async (item) => await handle({ kind: "adapter", capability_id: "minecraft.recipes", version: 1, args: { item } }),
+      screen: async () => visibleScreenSnapshotSchema.nullable().parse(await handle({ kind: "adapter", capability_id: "minecraft.visible_screen", version: 1, args: {} })),
+      frame: async audio_cursor => minecraftControllerFrameSchema.parse(await handle({
+        kind: "adapter", capability_id: "minecraft.controller_frame", version: 2, args: { audio_cursor } })),
       call: async (skill, args) => skillResultSchema.parse(await handle({ kind: "call", skill, args })),
       progress: async (summary, details) => await handle({ kind: "progress", summary, details }) as null };
     const execute = new Function("game", "args", `return (async () => {${body}\n})();`);
@@ -85,7 +91,7 @@ function fixture(runner?: SandboxService["runSkill"]) {
       throw new RuntimeFault("stale_context", "Fixture authority revoked"); },
     adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
     observe: async () => observation(), action: async () => { actions++; return { status: "succeeded", summary: "Neutral receipt", evidence: { effect_confirmed: true } }; },
-    queryCapability: async () => [], cancelActions: async () => {}, recover: async () => { throw new Error("Fixture has no respawn"); },
+    queryCapability: async id => id === "minecraft.visible_screen" ? null : [], cancelActions: async () => {}, recover: async () => { throw new Error("Fixture has no respawn"); },
     changed: (outcome, execution) => { if (outcome && execution) { learning.feedback(run.run_id); planning.predecessorSettled(execution.execution_id); } },
     unsafe: () => {}, prepareLookahead: (config) => planning.prepareOptIn(config),
   });
@@ -172,6 +178,86 @@ async function agentCalls(tools: AgentTool[], calls: ToolCall[], beforeToolCall?
     agent.abort();
     await agent.waitForIdle();
   }
+}
+
+test("native diagnostic starts a real named program through the guarded SDK argument boundary", async () => {
+  const f = fixture();
+  const diagnostic = new DiagnosticAgent(f.store, { choiceTimeoutMs: 1000 });
+  diagnostic.preparePlanning(f.run.run_id, undefined, true);
+  const auth = diagnostic.auth();
+  const agent = await auth.createAgent({
+    modelId: diagnostic.model_id,
+    systemPrompt: [],
+    tools: f.tools(),
+  });
+  agent.beforeToolCall = context => { preserveRuntimeToolArguments(context); };
+  try {
+    const admitted = diagnostic.choose(f.run.run_id, "planning_root");
+    await Promise.all([
+      agent.prompt(JSON.stringify({ phase: "running", role: "planning" })),
+      admitted,
+    ]);
+    const execution = f.store.latestRootExecution(f.run.run_id)!;
+    expect(f.store.skill(f.run.run_id, execution).name).toBe(DIAGNOSTIC_PROGRAMS.predecessor);
+    await waitClosed(f.store, f.run.run_id, execution.execution_id);
+    expect(f.store.skillExecution(f.run.run_id, { execution_id: execution.execution_id })?.status).toBe("succeeded");
+    expect(f.actions()).toBe(2);
+    expect(f.store.skills(f.run.run_id).map(skill => skill.name).sort()).toEqual([
+      DIAGNOSTIC_PROGRAMS.followup,
+      DIAGNOSTIC_PROGRAMS.predecessor,
+    ].sort());
+  } finally {
+    await auth.releaseAgent(agent);
+  }
+});
+
+test("failed source validation remains timed without fabricating a published revision", async () => {
+  const f = fixture();
+  const result = await f.write("Invalid candidate", "const broken = ;");
+  expect(result.isError).toBe(true);
+  expect(f.store.skills(f.run.run_id)).toEqual([]);
+  const event = f.store.eventsAfter(f.run.run_id, 0, 500)
+    .find(event => event.type === "program.source_timing");
+  expect(event?.details).toMatchObject({
+    validation_succeeded: false, source_published: false, source_hash: null,
+    skill_id: null, version: null, clock: "same_process_monotonic",
+  });
+  const details = event!.details as Record<string, number>;
+  expect(details.ended_monotonic_ms).toBeGreaterThanOrEqual(details.started_monotonic_ms!);
+});
+
+for (const outcome of ["imported", "invalid_source", "revoked_before_commit"] as const) {
+  test(`snapshot source readiness remains timed when ${outcome}`, async () => {
+    const origin = fixture(), recipient = fixture();
+    const snapshot = await origin.manager.register(origin.run.run_id, { entry: "run",
+      name: "Portable neutral source", source, card, dependencies: [],
+    });
+    const input = outcome === "invalid_source" ? { ...snapshot, source: "const broken = ;" } : snapshot;
+    const importing = recipient.manager.importSnapshot(recipient.run.run_id, input, () => {
+      if (outcome === "revoked_before_commit") throw new Error("Import authority revoked");
+    });
+    if (outcome === "imported") {
+      const imported = await importing;
+      expect(imported.hash).toBe(snapshot.hash);
+      expect(imported.source).toBe(snapshot.source);
+    } else {
+      await expect(importing).rejects.toThrow();
+      expect(recipient.store.skills(recipient.run.run_id)).toEqual([]);
+    }
+    const timings = recipient.store.eventsAfter(recipient.run.run_id, 0, 500)
+      .filter(event => event.type === "program.source_timing");
+    expect(timings).toHaveLength(1);
+    expect(timings[0]!.details).toMatchObject({
+      validation_succeeded: outcome !== "invalid_source",
+      source_published: outcome === "imported",
+      source_hash: outcome === "imported" ? snapshot.hash : null,
+      skill_id: outcome === "imported" ? snapshot.skill_id : null,
+      version: outcome === "imported" ? snapshot.version : null,
+      clock: "same_process_monotonic",
+    });
+    const timing = timings[0]!.details as Record<string, number>;
+    expect(timing.ended_monotonic_ms).toBeGreaterThanOrEqual(timing.started_monotonic_ms!);
+  });
 }
 
 for (const toolName of ["program_submit", "program_run"] as const) {
@@ -1281,6 +1367,19 @@ test("retired generic recipe inspection rejects at the schema boundary without l
   await waitClosed(f.store, f.run.run_id, root.execution_id);
   const inspected = data(await f.call("program_inspect", { view: "execution", program: { name: "registered recipe reader" } }));
   expect(inspected).toMatchObject({ status: "succeeded", result: { result: { available: 0 } } });
+  expect(f.actions()).toBe(0);
+});
+
+test("registered visible-screen read is available to actual program bodies without opening a view or granting effects", async () => {
+  const f = fixture();
+  const written = await f.write("visible screen reader",
+    'const screen = await game.screen(); return {status:"completed",summary:"Read current visible screen",result:{open:screen !== null}};');
+  expect(written.isError).not.toBe(true);
+  await f.call("program_run", { operation: "start", name: "visible screen reader", args: null });
+  const root = f.store.latestRootExecution(f.run.run_id)!;
+  await waitClosed(f.store, f.run.run_id, root.execution_id);
+  const inspected = data(await f.call("program_inspect", { view: "execution", program: { name: "visible screen reader" } }));
+  expect(inspected).toMatchObject({ status: "succeeded", result: { result: { open: false } } });
   expect(f.actions()).toBe(0);
 });
 

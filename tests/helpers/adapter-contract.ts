@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import { minecraftActionSchema } from "../../src/shared/minecraft.ts";
+import { minecraftActionSchema, minecraftControllerFrameRequestSchema } from "../../src/shared/minecraft.ts";
 import { observationV3Schema } from "../../src/shared/observations.ts";
 import { jsonSchema } from "../../src/shared/validation.ts";
 import { minecraftProfileConfiguration, type MinecraftObservation } from "../../src/shared/minecraft.ts";
@@ -33,9 +33,11 @@ export function schemaCatalog() {
     payload: { type: "object", properties: { fixture_counter: { type: "integer" } },
       required: ["fixture_counter"], additionalProperties: false },
     capabilities: {
-      "minecraft.action@1": action,
+      "minecraft.action@4": action,
       "minecraft.recipes@1": { type: "object", properties: { item: { type: "string" } },
         required: ["item"], additionalProperties: false },
+      "minecraft.visible_screen@1": { type: "object", properties: {}, additionalProperties: false },
+      "minecraft.controller_frame@2": jsonSchema.parse(z.toJSONSchema(minecraftControllerFrameRequestSchema)),
     },
   };
 }
@@ -47,6 +49,14 @@ export function descriptor() {
     actor_image: { codec: "png", presentation: "opaque_rgb", alignment: "unsynchronized" },
     motor_profile: "balanced",
     assistance: { semantic_helpers: true },
+    visible_gui: { projection: "current_visible_layout", max_slots: 128, max_elements: 64, max_progress: 32, coordinates: "logical_gui" },
+    controller_feedback: { schema_version: 2, own_body: "current_client_state", inventory: "client_prediction",
+      screen: "current_visible_layout", visible_world: "last_authorized_observation",
+      render_capture: "capture_sequence_metadata_only", render_max_age_ms: 5000,
+      last_input: "actual_application_ack", effect_updates: "bounded_later_receipts", max_effect_updates: 8,
+      max_effect_update_bytes: 16384 },
+    audible: { source: "actually_delivered_allowlisted", capacity: 128, ttl_ms: 1000,
+      max_events_per_page: 8, cursors: "consumer_owned", creeper_primed: true },
   };
   return {
     descriptor_schema: 1,
@@ -55,15 +65,17 @@ export function descriptor() {
     observation: {
       schema_version: 3, schema_hash: sha256(schemas.observation),
       payload_schema: { id: "contract_test_payload_v1", version: 1, hash: sha256(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_360_r8_v1", version: 1, configuration,
+      profile: { id: "minecraft_assisted_rgb_360_r8_control_v4", version: 4, configuration,
         configuration_hash: sha256(configuration) },
     },
     capabilities: [
-      { id: "minecraft.action", version: 1, schema_hash: sha256(schemas.capabilities["minecraft.action@1"]) },
+      { id: "minecraft.action", version: 4, schema_hash: sha256(schemas.capabilities["minecraft.action@4"]) },
+      { id: "minecraft.controller_frame", version: 2, schema_hash: sha256(schemas.capabilities["minecraft.controller_frame@2"]) },
       { id: "minecraft.recipes", version: 1, schema_hash: sha256(schemas.capabilities["minecraft.recipes@1"]) },
+      { id: "minecraft.visible_screen", version: 1, schema_hash: sha256(schemas.capabilities["minecraft.visible_screen@1"]) },
     ],
     actuator: "native",
-    executable: { api_version: 4, validator_version: 4, runtime_version: 4 },
+    executable: { api_version: 5, validator_version: 5, runtime_version: 5 },
   };
 }
 export function effectScope() {

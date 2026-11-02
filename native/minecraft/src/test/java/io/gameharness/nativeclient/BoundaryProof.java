@@ -10,38 +10,8 @@ public final class BoundaryProof {
   }
 
   public static void main(String[] ignored) {
-    SoundProjection sounds = new SoundProjection();
-    long now = 10000;
-    sounds.accept("minecraft:entity.creeper.primed", 0, 0, 2, now);
-    require(sounds.drain(now).isEmpty(), "unapproved sound leaked");
-    for (int i = 0; i < 20; i++)
-      sounds.accept("minecraft:entity.zombie.ambient", 0, 0, -8, now - i);
-    var grouped = sounds.drain(now);
-    require(
-        grouped.size() == 1
-            && grouped.getFirst().category() == 3
-            && grouped.getFirst().direction() == 1
-            && grouped.getFirst().distance() == 1,
-        "duplicate grouping or exact boundary failed");
-    require(sounds.drain(now).isEmpty(), "sound group replayed");
-    sounds.accept("minecraft:block.grass.step", .5, 7, 0, now);
-    var here = sounds.drain(now);
-    require(
-        here.getFirst().direction() == 0 && here.getFirst().distance() == 0,
-        "horizontal here bin failed");
-    sounds.accept("minecraft:block.grass.step", 32, 0, 0, now);
-    require(sounds.drain(now).getFirst().distance() == 2, "far boundary failed");
-    sounds.accept("minecraft:block.grass.step", 32.001, 0, 0, now);
-    require(sounds.drain(now).isEmpty(), "out of range sound leaked");
-    sounds.accept("minecraft:block.grass.step", 1, 0, 0, now - 1001);
-    require(sounds.drain(now).isEmpty(), "expired sound replayed");
-    for (int category = 0; category < 5; category++)
-      for (int dir = 0; dir < 8; dir++)
-        sounds.accept(
-            category, 10 * Math.sin(dir * Math.PI / 4), 0, -10 * Math.cos(dir * Math.PI / 4), now);
-    require(
-        sounds.drain(now).size() == 8 && sounds.drain(now).isEmpty(),
-        "overflow not bounded/discarded");
+    VideoFrameQueueProof.main(ignored);
+    SoundProjectionProof.main(ignored);
     VoxelVisibility ray = new VoxelVisibility();
     VoxelVisibility.Cells air = (x, y, z) -> 0;
     require(ray.clear(.5, .5, .5, 3.5, .5, .5, 3, 0, 0, air), "clear ray blocked");

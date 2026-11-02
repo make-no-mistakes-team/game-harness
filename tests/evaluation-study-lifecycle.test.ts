@@ -1,11 +1,156 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { invalidStudyProfiles } from "./helpers/study-manifest.ts";
+import { StudyLedger, summarizeStudyUsage, type StudySettlement } from "../src/evaluation/studies.ts";
+import { invalidStudyProfiles, liveStudyManifest } from "./helpers/study-manifest.ts";
 import { isolatedStudyCheckout } from "./helpers/isolated-study-checkout.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
+
+function platformLedger() {
+  const root = mkdtempSync(join(tmpdir(), "gameharness-platform-ledger-")); roots.push(root);
+  const manifest = liveStudyManifest(root, "resident-platform-lifecycle");
+  const checkedText = (path: string, bytes: string) => {
+    writeFileSync(join(root, path), bytes);
+    return { path, sha256: createHash("sha256").update(bytes).digest("hex") };
+  };
+  manifest.permission.record = checkedText("permission.txt", "Local native-platform declaration fixture; zero providers. No native launch performed.");
+  manifest.purpose = "Native-platform ledger semantics only; not agent competence or actual native execution evidence";
+  manifest.task.text = "Measure resident continuity in a reused evaluator-prepared arena.";
+  manifest.task.identity = checkedText("task.txt", manifest.task.text);
+  manifest.task.success = "Separate technical platform outcome only";
+  manifest.identities.model = null; manifest.identities.controller = manifest.identities.source[0]!;
+  manifest.execution = { ...manifest.execution, controller_mode: "resident_platform", adaptation: "none",
+    start_mode: "evaluator_prepared_world", request_paths: [] };
+  for (const arm of manifest.arms) arm.model = null;
+  for (const state of manifest.initial_states) {
+    state.mode = "evaluator_prepared_world"; state.seed = null;
+    state.settings = { difficulty: "normal", gamemode: "survival", cheats: true, level_type: "minecraft:flat",
+      structures: false, hardcore: false, supplied_inventory: true, console_commands: true, fresh_world_per_slot: false };
+  }
+  manifest.allowances.per_attempt.host_requests = 0; manifest.allowances.per_attempt.concurrent_requests = 0;
+  manifest.allowances.cohort.host_requests = 0; manifest.allowances.cohort.concurrent_requests = 0;
+  manifest.interventions.operator_setup = "Evaluator-supplied technical arena and inventory";
+  manifest.interventions.resets = "Reset the same arena between slots";
+  let now = 1000;
+  const ledger = new StudyLedger(join(root, "governance"), { projectRoot: root, now: () => now });
+  return { root, manifest, ledger, advance: (ms: number) => { now += ms; } };
+}
+
+function platformSettlement(): StudySettlement {
+  return { outcome: { platform_status: "pass", agent_status: "not_run", provider_status: "not_called", goal_verified: null,
+    classification_reason: ["Local settlement fixture for separate technical native outcome; no actual native proof"] },
+    usage: null, evidence: ["private/technical-platform-result.json: expected_lease_expiry"], stop_reason: null };
+}
+const platformDrain = { requests_drained: true, runtime_closed: true, native_closed: true,
+  evidence: ["Local ledger fixture drain; no native resources launched"] };
+
+test("resident platform uses immutable scheduled slots, refuses every provider path and retains sequential ownership until actual drain confirmation", () => {
+  const { manifest, ledger } = platformLedger();
+  try {
+    const ref = ledger.registerStudy(manifest);
+    const changed = structuredClone(manifest); changed.purpose = "Changed after registration";
+    expect(() => ledger.registerStudy(changed)).toThrow(/immutable|mismatch/i);
+    const first = ledger.reserveStudyAttempt(ref, manifest.schedule[0]!.slot);
+    expect(Object.isFrozen(first.slot)).toBe(true);
+    for (const path of ["strategic", "jev", "offline_postprocessing"] as const)
+      expect(() => ledger.reserveStudyRequest(first, { requestId: `forbidden-${path}`, path })).toThrow(/undeclared|unsupported|allowance/i);
+    expect(ledger.readStudy(ref).attempts[0]!.requests).toEqual([]);
+    expect(() => ledger.confirmStudyResourceDrain(first, platformDrain)).toThrow(/live reserved/i);
+    ledger.settleStudyAttempt(first, platformSettlement());
+    expect(() => ledger.reserveStudyAttempt(ref, manifest.schedule[1]!.slot)).toThrow(/ownership|drain|worker/i);
+    ledger.confirmStudyResourceDrain(first, platformDrain);
+    expect(() => ledger.confirmStudyResourceDrain(first, platformDrain)).toThrow(/immutable/i);
+    expect(() => ledger.settleStudyAttempt(first, platformSettlement())).toThrow(/immutable/i);
+    expect(() => ledger.reserveStudyAttempt(ref, manifest.schedule[0]!.slot)).toThrow(/consumed|duplicate/i);
+    const second = ledger.reserveStudyAttempt(ref, manifest.schedule[1]!.slot);
+    expect(second.slot.repetition).toBe(2);
+    const state = ledger.readStudy(ref);
+    expect(state.attempts[0]).toMatchObject({ state: "settled", cleanup: { confirmed: true },
+      settlement: { usage: null, outcome: { platform_status: "pass", agent_status: "not_run", provider_status: "not_called", goal_verified: null } } });
+    expect(summarizeStudyUsage(state)).toMatchObject({ durable_host_request_admissions: 0, admissions: null,
+      uncached_input: null, output: null, unsuccessful_or_unknown_attempts: 2 });
+  } finally { ledger.close(); }
+});
+
+test("resident platform cannot settle as agent success, provider execution, SDK usage, or unevidenced technical pass", () => {
+  const { manifest, ledger } = platformLedger();
+  try {
+    const ref = ledger.registerStudy(manifest);
+    const attempt = ledger.reserveStudyAttempt(ref, manifest.schedule[0]!.slot);
+    const invalid: StudySettlement[] = [
+      { ...platformSettlement(), outcome: { ...platformSettlement().outcome, agent_status: "goal_verified", goal_verified: true } },
+      { ...platformSettlement(), outcome: { ...platformSettlement().outcome, agent_status: "goal_not_verified", goal_verified: false } },
+      { ...platformSettlement(), outcome: { ...platformSettlement().outcome, agent_status: "unknown" } },
+      { ...platformSettlement(), outcome: { ...platformSettlement().outcome, provider_status: "ok" } },
+      { ...platformSettlement(), outcome: { ...platformSettlement().outcome, goal_verified: false } },
+      { ...platformSettlement(), usage: { admissions: 0 } },
+      { ...platformSettlement(), evidence: [] },
+    ];
+    for (const settlement of invalid) {
+      expect(() => ledger.settleStudyAttempt(attempt, settlement)).toThrow(/resident|platform|provider|usage|evidence/i);
+      expect(ledger.readStudy(ref).attempts[0]!.state).toBe("reserved");
+    }
+    ledger.settleStudyAttempt(attempt, platformSettlement());
+    ledger.confirmStudyResourceDrain(attempt, platformDrain);
+  } finally { ledger.close(); }
+});
+
+test("resident platform keeps expected native expiry separate from agent success through whole-cohort closure and reopen", () => {
+  const { root, manifest, ledger } = platformLedger();
+  const ref = ledger.registerStudy(manifest);
+  try {
+    for (const entry of manifest.schedule) {
+      const attempt = ledger.reserveStudyAttempt(ref, entry.slot);
+      ledger.settleStudyAttempt(attempt, platformSettlement());
+      ledger.confirmStudyResourceDrain(attempt, platformDrain);
+    }
+    expect(ledger.readStudy(ref).closure).toMatchObject({ reason: "cohort_complete" });
+  } finally { ledger.close(); }
+  const reopened = new StudyLedger(join(root, "governance"), { projectRoot: root, now: () => 1000 });
+  try {
+    const state = reopened.readStudy(ref);
+    expect(state.slots.map(slot => slot.status)).toEqual(["settled", "settled", "settled", "settled"]);
+    expect(state.attempts.every(attempt => attempt.settlement?.outcome.goal_verified === null && attempt.settlement.usage === null)).toBe(true);
+    expect(state.attempts[0]!.settlement!.evidence).toEqual(["private/technical-platform-result.json: expected_lease_expiry"]);
+    expect(() => reopened.reserveStudyAttempt(ref, manifest.schedule[0]!.slot)).toThrow(/closed|consumed/i);
+  } finally { reopened.close(); }
+});
+
+test("resident platform retains invalid-native stop and interrupted outcomes without recycling slots or bypassing elapsed deadline", () => {
+  const failed = platformLedger();
+  try {
+    const ref = failed.ledger.registerStudy(failed.manifest);
+    const attempt = failed.ledger.reserveStudyAttempt(ref, failed.manifest.schedule[0]!.slot);
+    const settlement = platformSettlement(); settlement.outcome.platform_status = "fail";
+    expect(() => failed.ledger.settleStudyAttempt(attempt, settlement)).toThrow(/stop reason/i);
+    failed.ledger.settleStudyAttempt(attempt, { ...settlement, stop_reason: "invalid_platform" });
+    failed.ledger.confirmStudyResourceDrain(attempt, platformDrain);
+    expect(failed.ledger.readStudy(ref).closure).toMatchObject({ reason: "invalid_platform" });
+    expect(failed.ledger.readStudy(ref).slots.slice(1).map(slot => slot.status)).toEqual(["closed_unstarted", "closed_unstarted", "closed_unstarted"]);
+  } finally { failed.ledger.close(); }
+  const interrupted = platformLedger();
+  try {
+    const ref = interrupted.ledger.registerStudy(interrupted.manifest);
+    const attempt = interrupted.ledger.reserveStudyAttempt(ref, interrupted.manifest.schedule[0]!.slot);
+    interrupted.ledger.interruptStudyAttempt(attempt, "operator_interrupt");
+    interrupted.ledger.confirmStudyResourceDrain(attempt, platformDrain);
+    expect(interrupted.ledger.readStudy(ref).attempts[0]).toMatchObject({ state: "interrupted", settlement: null, cleanup: { confirmed: true } });
+    expect(() => interrupted.ledger.reserveStudyAttempt(ref, interrupted.manifest.schedule[1]!.slot)).toThrow(/closed/i);
+  } finally { interrupted.ledger.close(); }
+  const expired = platformLedger();
+  try {
+    const ref = expired.ledger.registerStudy(expired.manifest);
+    expired.advance(expired.manifest.allowances.cohort.elapsed_ms);
+    expect(() => expired.ledger.reserveStudyAttempt(ref, expired.manifest.schedule[0]!.slot)).toThrow(/elapsed|deadline/i);
+    expect(expired.ledger.readStudy(ref)).toMatchObject({ closure: { reason: "elapsed_deadline" }, attempts: [] });
+  } finally { expired.ledger.close(); }
+});
+
 async function lifecycle(mode: string) {
   const owned = isolatedStudyCheckout(); roots.push(owned.caseRoot);
   const root = join(owned.caseRoot, "lifecycle-state");

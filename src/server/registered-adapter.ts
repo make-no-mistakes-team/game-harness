@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { AdapterDescriptor, AdapterSchemaCatalog, Json, ProgramCompatibility } from "../shared/contracts.ts";
+import type { AdapterDescriptor, AdapterSchemaCatalog, Json, ProgramCompatibility, RuntimeAdapter } from "../shared/contracts.ts";
 import { observationV3Schema, type ObservationV3 } from "../shared/observations.ts";
 import { jsonSchema } from "../shared/primitives.ts";
 import { adapterCompatibility } from "./adapter-contract.ts";
@@ -88,12 +88,17 @@ export class RegisteredAdapterContract {
   readonly compatibility: ProgramCompatibility;
   private readonly observationSchema: z.ZodType<ObservationV3>;
   private readonly capabilities: Record<string, z.ZodType<Json>> = Object.create(null);
-  constructor(descriptor: AdapterDescriptor, schemas: AdapterSchemaCatalog) {
+  constructor(descriptor: AdapterDescriptor, schemas: AdapterSchemaCatalog, validators: RuntimeAdapter["capabilityValidators"] = {}) {
     this.compatibility = adapterCompatibility(descriptor, schemas);
     this.observationSchema = observationV3Schema.extend({ data: compileRegisteredSchema(schemas.payload) });
     for (const capability of this.compatibility.descriptor.capabilities) {
       const key = `${capability.id}@${capability.version}`;
-      this.capabilities[key] = compileRegisteredSchema(schemas.capabilities[key]!, true);
+      const schema = compileRegisteredSchema(schemas.capabilities[key]!, true);
+      const validate = validators[key];
+      // Some adapter invariants span ordered events and are not expressible in
+      // JSON Schema. Keep their trusted predicates outside serialized contracts.
+      this.capabilities[key] = validate ? schema.refine(validate,
+        { message: "arguments must match the registered semantic constraints" }) : schema;
     }
   }
   parseObservation(value: unknown): ObservationV3 {

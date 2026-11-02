@@ -10,7 +10,7 @@ import type { Store } from "../src/server/store.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import type { Json, ObservationV3, VerificationResult } from "../src/shared/contracts.ts";
 import type { EvaluationCaps, EvaluationConfig, EvaluationPurpose } from "../src/evaluation/contracts.ts";
-import { createEvaluationCaps, createEvaluationConfig, DEFAULT_EVALUATION_CAPS } from "../src/evaluation/config.ts";
+import { createEvaluationCaps, createEvaluationConfig, DEFAULT_EVALUATION_CAPS, loadEvidenceProfile } from "../src/evaluation/config.ts";
 import { AttemptLedger, type AttemptRecord } from "../src/evaluation/policy.ts";
 import { evaluationPaths, type EvaluationPaths } from "../src/evaluation/paths.ts";
 import { classifyEvaluation, costToResult, readUsageMetrics, usageMetrics, waitCoverage, type EvaluationCaseReport, type EvaluationOutcome } from "../src/evaluation/results.ts";
@@ -42,6 +42,7 @@ interface AcceptanceCommonOptions {
   /** Disclosed diagnostic condition: SSE and at most one inference dispatch per admission. */
   singleInferenceDispatch?: boolean;
   nativeJar?: string;
+  evidenceProfile?: string;
   /** Explicit fresh-seeded Minecraft development; never a registered study. */
   development?: MinecraftDevelopmentDeclaration;
 }
@@ -72,6 +73,13 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   if (options.study && options.projectRoot !== undefined && realpathSync(path.resolve(options.projectRoot)) !== executingRoot)
     throw new Error("Study source authority must be the executing acceptance module tree; foreign projectRoot overrides are unsupported");
   const project = options.study ? executingRoot : path.resolve(options.projectRoot ?? process.cwd());
+  requireProof(!options.admissionOnly || !options.evidenceProfile, "Admission-only mode forbids evidence profile resource flags");
+  const evidenceProfile = loadEvidenceProfile(project, options.evidenceProfile);
+  const requireCaptureHorizon = (horizonMs: number) => {
+    requireProof(evidenceProfile.profile.recording.maxDurationMs >= horizonMs &&
+      evidenceProfile.profile.recording.maxFrames >= Math.ceil(horizonMs * 30 / 1000) + 1,
+    "Evidence profile cannot cover the requested capture horizon and nominal 30 Hz final frame");
+  };
   const paths = evaluationPaths(project, options.paths);
   let studies: StudyLedger | undefined, studyManifest: StudyManifest | undefined, studyAttempt: AttemptReservation | undefined;
   let caps: EvaluationCaps, selected: readonly MinecraftAcceptanceTask[];
@@ -86,6 +94,10 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
         "Whole-agent acceptance does not execute released-reference controller studies; use their dedicated admitted entry");
       const admissionOnly = studyManifest.admission_mode === "admission_only";
       requireProof(Boolean(options.admissionOnly) === admissionOnly, "Study admission-only mode must match its immutable manifest");
+      if (evidenceProfile.source.path !== null)
+        requireProof(studyManifest.identities.preprocessing.some(identity => identity.path === evidenceProfile.source.path &&
+          identity.sha256 === evidenceProfile.source.sha256),
+        "Evidence profile override must be captured exactly in registered study preprocessing identities");
       if (admissionOnly) {
         requireProof(!options.allowNative && !options.allowInference && !options.authDirectory && !options.nativeJar && !options.modelId && !options.caps,
           "Admission-only mode forbids native/inference/auth/JAR/model/budget resource flags");
@@ -113,6 +125,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       requireProof(caps.hostRequestAdmissions === per.host_requests, "Study request-cap overrides must exactly match the immutable manifest allowance");
       requireProof(caps.runMs <= studyManifest.task.horizon_ms && caps.totalMs <= totalMs,
         "Budget override exceeds frozen study manifest allowance");
+      requireCaptureHorizon(caps.runMs);
       selected = NATURAL_SCENARIOS.filter(scenario => scenario.prompt === studyManifest!.task.text);
       requireProof(selected.length === 1 && (!options.scenario || options.scenario === selected[0]!.id),
         "Unsupported or mismatched study natural task/scenario; no implicit all expansion");
@@ -139,6 +152,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     selected = development ? [{ id: "minecraft-development", prompt: development.task,
       adapter_goal_id: development.criterion, verifier: null }] : selectNaturalScenarios(options.scenario);
     caps = createEvaluationCaps(options.caps);
+    requireCaptureHorizon(caps.runMs);
     if (development) conditions = Object.freeze({ ...NATURAL_WORLD_CONDITIONS, seed: development.seed });
   }
   requireProof(options.allowNative && options.allowInference, "Agent acceptance requires --allow-native AND --allow-inference");
@@ -264,7 +278,9 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     credential_policy: "Existing GameHarness auth storage opened in place. No login/logout, copies, identity dumps, ambient account imports or fallback model.",
     comparison_scope: "Fixed seed/settings and fresh world per case. Vanilla timing and provider behavior are not controlled; no causal or cross-model improvement claim.",
     source_policy: "Only the actual provider authors gameplay and optional game guards. No supplied programs, targets, inventory, console commands or required tool sequence.",
-    private_evidence_root: fixture.root, caps,
+    private_evidence_root: fixture.root, caps, evidence_profile: evidenceProfile,
+    capture_scope: { minimum_task_horizon_ms: caps.runMs, nominal_hz: 30, final_frame_margin: 1,
+      prelude_and_drain: "Recorder also covers actual prelude and drain; profile exhaustion remains explicit incomplete evidence" },
     native_evidence: "native-report.json",
     cleanup_confirmed: false, cleanup_state: "not_started",
   };
@@ -424,6 +440,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     activeRun = run.run_id;
     const recordingDirectory = `case-${scenario.id}-recording`;
     recorder = new EpisodeRecorder({ directory: path.join(fixture.evidenceDirectory, recordingDirectory), bridge: fixture.bridge,
+      limits: evidenceProfile.profile.recording,
       identity: { episode_id: randomUUID(), run_id: run.run_id, world_id: run.world_id, session_id: run.session_id! },
       onIncomplete: why => { report.recording_failure = why; stop(run.run_id, "recording_evidence_incomplete"); } });
     const initial = await bounded(fixture.bridge.observe(), caps.observationMs, "Run-start observation timed out");
@@ -450,6 +467,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     const baseline = independentVerifier.manifest.baseline;
     report.active_verifier = { scenario_id: scenario.id, manifest: independentVerifier.manifest };
     await fixture.writeJson(`case-${scenario.id}-declaration.json`, { scenario, baseline, development: development ?? null,
+      evidence_profile: evidenceProfile,
       inference_reasoning: report.inference_reasoning,
       host_baseline_timing: "Captured once on trusted host-preflight running publication, before strategic transport",
       conditions: fixture.report.world_conditions, declared_before_inference: true });
@@ -532,7 +550,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     if (recording.status !== "complete") harnessFaults.push("recording_evidence_incomplete");
     let replay: string | null = null;
     try {
-      replayWork = recorder.renderReplay({ signal: scope.signal });
+      replayWork = recorder.renderReplay({ signal: scope.signal, timeoutMs: evidenceProfile.profile.render_timeout_ms });
       replay = await replayWork;
     }
     catch { harnessFaults.push("offline_replay_render_failed"); }
@@ -558,6 +576,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       wait_coverage: waitCoverage({ start_ms: caseStart, end_ms: caseEnd, clock_id: clockId }, evidence!.intervals(run.run_id, caseEnd)),
       omissions: summary.omissions, failure: caseFailure ? reason(caseFailure) : null,
       evidence: await evidence!.save(run.run_id),
+      evidence_profile: evidenceProfile,
       private_journal: journal, recording: { directory: recordingDirectory, manifest: "recording-manifest.json", replay,
         replay_inspection: "Parent must inspect offline replay; render success is not visual inspection." },
       completion_claim: scenario.verifier ? "registered_independent_verifier" :
@@ -618,7 +637,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
         return;
       }
       stop(runId, why);
-    });
+    }, { limits: evidenceProfile.profile.journal });
     evidence.observeAuthAgents(auth!);
     await mkdir(paths.reportsRoot, { recursive: true, mode: 0o700 });
     assertOpen();
@@ -761,8 +780,11 @@ export function parseAgentAcceptanceArguments(args: readonly string[]): AgentAcc
   let slot: StudySlot | undefined;
   const value = (index: number) => { const result = args[index + 1]; if (!result || result.startsWith("--")) throw new Error(`Missing value for ${args[index]}`); return result; };
   const caps: { hostRequestAdmissions?: number; runMs?: number; totalMs?: number } = {};
+  const seen = new Set<string>();
   for (let index = 0; index < args.length; index++) {
     const flag = args[index];
+    requireProof(flag && !seen.has(flag), "Duplicate acceptance argument");
+    seen.add(flag);
     if (flag === "--allow-native") options.allowNative = true;
     else if (flag === "--allow-inference") options.allowInference = true;
     else if (flag === "--single-inference-dispatch") options.singleInferenceDispatch = true;
@@ -774,6 +796,7 @@ export function parseAgentAcceptanceArguments(args: readonly string[]): AgentAcc
       catch { throw new Error("Provide --slot as a JSON immutable study/arm/initial_state_id/repetition tuple"); }
     }
     else if (flag === "--jar") options.nativeJar = value(index++);
+    else if (flag === "--evidence-profile") options.evidenceProfile = value(index++);
     else if (flag === "--auth-dir") options.authDirectory = value(index++);
     else if (flag === "--hypothesis") hypothesisId = value(index++);
     else if (flag === "--evidence-revision") platformEvidenceRevision = value(index++);
@@ -796,6 +819,7 @@ export function parseAgentAcceptanceArguments(args: readonly string[]): AgentAcc
     } else throw new Error(`Unknown agent-acceptance argument ${flag}`);
   }
   if (Object.keys(caps).length) options.caps = caps;
+  requireProof(!options.admissionOnly || !options.evidenceProfile, "Admission-only mode forbids evidence profile resource flags");
   if (studyId || manifestPath || slot || options.admissionOnly) {
     requireProof(!options.singleInferenceDispatch, "Single-dispatch inference cannot override a frozen study");
     requireProof(studyId && manifestPath && slot, "Pass a registered --study, matching --manifest and declared JSON --slot");

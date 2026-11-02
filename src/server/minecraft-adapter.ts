@@ -1,9 +1,10 @@
 import { z } from "zod";
 import type { AdapterDescriptor, AdapterEvidence, AdapterGoal, Json, RuntimeAdapter, VerificationManifest, VerificationResult } from "../shared/contracts.ts";
-import { effectScopeSchema, safeCounterSchema } from "../shared/control.ts";
+import { effectScopeSchema, safeCounterSchema, screenPreconditionMatches, visibleScreenSnapshotSchema } from "../shared/control.ts";
+import { jsonSchema } from "../shared/primitives.ts";
 import type { ObservationV3 } from "../shared/observations.ts";
-import { minecraftActionSchema, minecraftBlockRemovalFactSchema, minecraftEffectUncertaintyFactSchema, minecraftObservationV3Schema,
-  minecraftProductionFactSchema, minecraftProfileConfigurationSchema, type MinecraftObservation, type MinecraftObservationData } from "../shared/minecraft.ts";
+import { minecraftActionSchema, minecraftBlockRemovalFactSchema, minecraftControllerFrameSchema, minecraftEffectUncertaintyFactSchema, minecraftObservationV3Schema,
+  minecraftProductionFactSchema, minecraftGuiTransactionFactSchema, confirmedMinecraftGuiTransactions, minecraftProfileConfigurationSchema, type MinecraftObservation, type MinecraftObservationData } from "../shared/minecraft.ts";
 import { adapterCompatibility, canonicalContractJson, contractHash } from "./adapter-contract.ts";
 import { minecraftSchemaCatalog } from "./native-contract.ts";
 
@@ -46,6 +47,8 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
   const schemas = minecraftSchemaCatalog();
   const compatibility = adapterCompatibility(descriptor, schemas);
   descriptor = compatibility.descriptor;
+  if (descriptor.observation.profile.id !== "minecraft_assisted_rgb_360_r8_control_v4" || descriptor.observation.profile.version !== 4)
+    throw new Error("Minecraft adapter requires its registered control-feedback profile");
   const configuration = minecraftProfileConfigurationSchema.parse(descriptor.observation.profile.configuration);
   const now = options.now ?? Date.now;
   const adapterId = descriptor.adapter.id;
@@ -85,6 +88,7 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
     return parsed;
   }
   const productionHash = contractHash(schemas.evidence!["minecraft_item_production_v1@1"]);
+  const transactionHash = contractHash(schemas.evidence!["minecraft_gui_transaction_v1@1"]);
   const removalHash = contractHash(schemas.evidence!["minecraft_block_removal_v1@1"]);
   const uncertaintyHash = contractHash(schemas.evidence!["minecraft_effect_uncertainty_v1@1"]);
   // Runtime and independent evaluation own distinct manifest objects. Retain only
@@ -92,12 +96,26 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
   const progress = new WeakMap<VerificationManifest, { lives: Map<number, VerifierLifeProgress>; removal: string | null }>();
   return {
     descriptor: compatibility.descriptor, schemas, goals: Object.values(catalog),
+    capabilityValidators: { "minecraft.action@4": action => minecraftActionSchema.safeParse(action).success },
     goalChoices: Object.entries(descriptions).map(([id, value]) => ({ id, goal: catalog[id]!, ...value })),
-    action_capability: { id: "minecraft.action", version: 1 },
+    action_capability: { id: "minecraft.action", version: 4 },
     supports_respawn: true,
-    bindings: [{ name: "recipes", capability_id: "minecraft.recipes", version: 1, parameters: ["item"] }],
+    bindings: [{ name: "recipes", capability_id: "minecraft.recipes", version: 1, parameters: ["item"] },
+      { name: "screen", capability_id: "minecraft.visible_screen", version: 1, parameters: [],
+        result: { type: "VisibleScreenSnapshot|null", schema: jsonSchema.parse(z.toJSONSchema(visibleScreenSnapshotSchema.nullable())) } },
+      { name: "frame", capability_id: "minecraft.controller_frame", version: 2, parameters: ["audio_cursor"],
+        result: { type: "MinecraftControllerFrame", schema: jsonSchema.parse(z.toJSONSchema(minecraftControllerFrameSchema)) } }],
+    screenPrecondition(action, screen) {
+      const request = minecraftActionSchema.parse(action);
+      if (request.kind !== "screen_input") return screen ? { kind: "transaction", screen: { ...screen } } : { kind: "absent" };
+      const expected = { kind: "layout" as const, screen: { ...request.screen } };
+      if (!screenPreconditionMatches(expected, screen)) throw new Error("Visible GUI identity/incarnation is stale");
+      return expected;
+    },
     effectDeadlineMs(action) {
       const request = minecraftActionSchema.parse(action);
+      if (request.kind === "screen_input") return 5000 + 4000 * request.operations.length;
+      if (request.kind === "world_input") return request.steps.reduce((ticks, step) => ticks + step.ticks, 0) * 50 + 2000;
       if (request.kind === "move" || request.kind === "navigate") return request.duration_ms + 2000;
       if (request.kind === "respawn") return 15000;
       // Native gestures keep world time advancing; include its bounded session
@@ -186,12 +204,21 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
             const previous = wood[event.scope.life_id];
             if (!previous || at < previous.at) wood[event.scope.life_id] = { at, ref: event.evidence_id };
           }
+        } else if (event.schema.id === "minecraft_gui_transaction_v1" && event.schema.version === 1 && event.schema.hash === transactionHash) {
+          const parsed = minecraftGuiTransactionFactSchema.safeParse(event.data);
+          if (!parsed.success) continue;
+          for (const production of parsed.data.productions) if (production.production_confirmed && production.producer === "crafting")
+            products.push({ life: event.scope.life_id, at, item: production.item, ref: event.evidence_id });
+          if (gain(parsed.data.inventory_before, initial.inventory, true) || gain(parsed.data.inventory_after, initial.inventory, true)) {
+            const previous = wood[event.scope.life_id];
+            if (!previous || at < previous.at) wood[event.scope.life_id] = { at, ref: event.evidence_id };
+          }
         } else if (event.schema.id === "minecraft_block_removal_v1" && event.schema.version === 1 && event.schema.hash === removalHash) {
           const fact = minecraftBlockRemovalFactSchema.safeParse(event.data);
           if (fact.success && eligibleMinecraftWood(fact.data.target_name)) removal = event.evidence_id;
         } else if (event.schema.id === "minecraft_effect_uncertainty_v1" && event.schema.version === 1 && event.schema.hash === uncertaintyHash) {
           const fact = minecraftEffectUncertaintyFactSchema.safeParse(event.data);
-          if (fact.success && fact.data.operation_kind === "craft") uncertainProduction[event.scope.life_id] = true;
+          if (fact.success && (fact.data.operation_kind === "craft" || fact.data.operation_kind === "screen_input")) uncertainProduction[event.scope.life_id] = true;
         }
       }
       if (latest) for (const life of retained.lives.keys()) if (life !== latest.life.life_id) retained.lives.delete(life);
@@ -238,6 +265,21 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
       if (!parsed.success) return [];
       const request = parsed.data;
       const evidence = result.evidence !== null && typeof result.evidence === "object" && !Array.isArray(result.evidence) ? result.evidence : null;
+      if (request.kind === "screen_input") {
+        const facts: AdapterEvidence[] = [];
+        // Confirmed prefix receipts remain real even when later application/ACK is unknown.
+        for (const fact of confirmedMinecraftGuiTransactions(request, evidence)) {
+          facts.push({ evidence_id: `${operationId}:gui:${fact.operation_index}`, adapter_id: adapterId,
+            schema: { id: "minecraft_gui_transaction_v1", version: 1, hash: transactionHash }, scope, observed_at: at, data: fact });
+        }
+        if (result.status === "unknown" || evidence?.transaction_status === "unknown") {
+          const data = minecraftEffectUncertaintyFactSchema.parse({ kind: "effect_uncertainty", actor: "own_player", mechanism: "visible_gui",
+            operation_kind: request.kind, effect_status: "unknown", receipt_ref: operationId, reason: "effect_unconfirmed" });
+          facts.push({ evidence_id: `${operationId}:uncertainty`, adapter_id: adapterId,
+            schema: { id: "minecraft_effect_uncertainty_v1", version: 1, hash: uncertaintyHash }, scope, observed_at: at, data });
+        }
+        return facts;
+      }
       if (result.status === "unknown" || request.kind === "craft" && result.status === "succeeded" &&
         (evidence?.effect_confirmed !== true || evidence?.inventory_receipt_confirmed !== true)) {
         const data = minecraftEffectUncertaintyFactSchema.parse({ kind: "effect_uncertainty", actor: "own_player", mechanism: "helper",
@@ -254,7 +296,6 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
           schema: { id: "minecraft_block_removal_v1", version: 1, hash: removalHash }, scope, observed_at: at, data: data.data }] : [];
       }
       // Current helpers are one factual producer, NOT a universal verifier rule.
-      // No GUI proof producer is invented or advertised here.
       if (request.kind !== "craft" || evidence.inventory_receipt_confirmed !== true) return [];
       const data = minecraftProductionFactSchema.safeParse({ kind: "item_production", item: request.item, actor: "own_player", mechanism: "helper",
         input_application: "confirmed", effect_status: "confirmed", inventory_before: evidence.inventory_before,

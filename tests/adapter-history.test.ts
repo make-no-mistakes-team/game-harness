@@ -97,11 +97,11 @@ test("browser experience history reads schema2/API3 without stripping or relabel
   }
 });
 
-test("schema2 observation/source/outcome bytes remain readable with their original identities", () => {
+test("schema2 observation/source/outcome bytes remain readable with their original identities", async () => {
   const f = fixture();
   const source = '// API3 retained bytes, not freshly canonicalized\nreturn {status:"blocked", summary:"original outcome", result:null};\n';
   const hash = createHash("sha256").update(source).digest("hex");
-  const old = f.store.registerSkill(f.run.run_id, { name: "Historical API3 source", source, card, dependencies: [],
+  const old = await f.store.registerSkill(f.run.run_id, { entry: "run", name: "Historical API3 source", source, card, dependencies: [],
     validation: { runtime_version: 3, fingerprint: "immutable-api3-validator", formatted_lines: 2, complexity: 1, nesting: 0 } });
   const event = f.store.event(f.run.run_id, "observation.historical", "Original observation", historicalObservation());
   const outcome = { status: "unknown", effect_confirmed: false, note: "original outcome" };

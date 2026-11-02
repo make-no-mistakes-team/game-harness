@@ -756,7 +756,7 @@ test("death supersedes uncertainty and wakes only the explicit recovery generati
 test("named source and comparisons cannot read another model's workspace", async () => {
   const f = await fixture();
   const foreign = { ...f.store.getRun(f.created.run_id)!, run_id: crypto.randomUUID(), model_id: "other-model" }; f.store.saveRun(foreign);
-  await Promise.all([1, 2].map(async (version) => f.store.registerSkill(foreign.run_id, await validateSkill({ name: "Foreign private program", source: `return {status:"completed",summary:"PRIVATE_MODEL_B_${version}",result:null};`, card, dependencies: [] }, f.adapter))));
+  await Promise.all([1, 2].map(async (version) => f.store.registerSkill(foreign.run_id, await validateSkill({ entry: "run", name: "Foreign private program", source: `return {status:"completed",summary:"PRIVATE_MODEL_B_${version}",result:null};`, card, dependencies: [] }, f.adapter))));
   const skill = f.store.skill.bind(f.store); let foreignReads = 0;
   f.store.skill = (runId, ref) => { if (runId === foreign.run_id) foreignReads++; return skill(runId, ref); };
   const compared = await f.invoke("program_inspect", { view: "comparison", before: { name: "Foreign private program", version: 1 }, after: { name: "Foreign private program", version: 2 } });
@@ -811,6 +811,7 @@ test("planning retains the actual predecessor after more than one hundred sequen
   try {
     f.finishFirst(); await step("101 durable named children", f.tailEntered.promise);
     const root = f.findExecution(ROOT)!;
+    if (root.entry !== "run") throw new Error("Expected the selected run root");
     expect(root.status).toBe("running"); expect(root.calls).toBeLessThan(root.limits.max_calls);
     const children = f.store.allSkillExecutions(f.created.run_id).filter((entry) => entry.parent_execution_id === root.execution_id);
     expect(children).toHaveLength(101); expect(children.every((entry) => entry.status === "succeeded")).toBe(true);

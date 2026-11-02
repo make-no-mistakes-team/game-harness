@@ -10,9 +10,9 @@ function fixture() {
   const invocation = { kind: "skill" as const, execution_id: scope.execution_id, source_hash: scope.source_hash };
   const screen = { screen_id: "visible-view", incarnation: 2, revision: 3 };
   const envelope = { operation_id: "host-operation", compatibility_hash: current.compatibility_hash, scope: { ...scope }, invocation,
-    action: { kind: "fixture_action", scope: "legitimate adapter data" }, expected_screen: screen };
+    action: { kind: "fixture_action", scope: "legitimate adapter data" }, expected_screen: { kind: "transaction" as const, screen } };
   const expected = { binding: current, scope, invocation, screen };
-  const validation: ActiveExecutableValidation = { api_version: 4, validator_version: 4, runtime_version: 4, compatibility_hash: current.compatibility_hash,
+  const validation: ActiveExecutableValidation = { api_version: 5, validator_version: 5, runtime_version: 5, compatibility_hash: current.compatibility_hash,
     fingerprint: "a".repeat(64), formatted_lines: 3, complexity: 1, nesting: 0 };
   return { envelope, expected, validation };
 }
@@ -25,11 +25,13 @@ test("current host source/scope passes without interpreting adapter-owned scope-
 
 test("explicit no-screen precondition rejects a newly opened view and omission is not an active wildcard", () => {
   const f = fixture();
-  const absent = { ...f.envelope, expected_screen: null };
+  const absent = { ...f.envelope, expected_screen: { kind: "absent" as const } };
   expect(assertCurrentEffect(absent, { ...f.expected, screen: null })).toEqual(absent);
   expect(() => assertCurrentEffect(absent, f.expected)).toThrow();
   const { expected_screen: _screen, ...omitted } = absent;
   expect(() => assertCurrentEffect(omitted, { ...f.expected, screen: null })).toThrow();
+  expect(() => assertCurrentEffect({ ...absent, expected_screen: null }, { ...f.expected, screen: null })).toThrow();
+  expect(() => assertCurrentEffect({ ...absent, expected_screen: f.expected.screen }, f.expected)).toThrow();
 });
 
 for (const key of ["session_id", "world_id", "native_boot_id", "run_id", "execution_id", "source_hash"] as const) {

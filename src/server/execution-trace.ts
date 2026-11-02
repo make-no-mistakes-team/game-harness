@@ -1,10 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { HOST_MONOTONIC_CLOCK_ID } from "./performance.ts";
 import type { Json, ObservationV3 } from "../shared/contracts.ts";
 import type { PauseCategory, TraceContext, TraceKind } from "../shared/execution-evidence.ts";
 import type { SkillExecutionView } from "../shared/programs.ts";
 import type { Store } from "./store.ts";
 
-const processId = randomUUID();
 /** Payloads must be authorized public data. Branches and intent never prove success. */
 export class ExecutionTrace {
   constructor(private readonly store: Store) {}
@@ -24,8 +23,12 @@ export class ExecutionTrace {
   observe(execution: SkillExecutionView, observation: ObservationV3, context: TraceContext = {}) {
     return this.record(execution, "observation", observation as unknown as Json, { ...context, observation_seq: observation.observation_seq, session_id: observation.session_id, life_id: observation.life.life_id });
   }
-  span(execution: SkillExecutionView, category: PauseCategory, startedMono: number, endedMono: number, context: TraceContext & { session_id?: string | null; life_id?: number | null } = {}) {
+  span(execution: SkillExecutionView, category: PauseCategory, startedMono: number, endedMono: number,
+    context: TraceContext & { session_id?: string | null; life_id?: number | null } = {}, confirmed?: boolean) {
     if (!Number.isFinite(startedMono) || !Number.isFinite(endedMono) || endedMono < startedMono) throw new Error("Span requires ordered same-process monotonic endpoints");
-    return this.record(execution, "span", { category, process_id: processId, started_monotonic_ms: startedMono, ended_monotonic_ms: endedMono, duration_ms: endedMono - startedMono, clock: "same_process_monotonic", overlapping_categories_are_not_additive: true }, context);
+    return this.record(execution, "span", { category, process_id: HOST_MONOTONIC_CLOCK_ID, clock_id: HOST_MONOTONIC_CLOCK_ID,
+      started_monotonic_ms: startedMono, ended_monotonic_ms: endedMono, duration_ms: endedMono - startedMono,
+      clock: "same_process_monotonic", overlapping_categories_are_not_additive: true,
+      ...(confirmed === undefined ? {} : { lifecycle_barrier_confirmed: confirmed }) }, context);
   }
 }

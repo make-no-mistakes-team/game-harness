@@ -152,7 +152,7 @@ export class ReactiveRuntime {
     const adapter = this.host.adapter(), binding = this.host.binding();
     if (!adapter || !binding?.ready) throw new RuntimeFault("precondition_failed", "Reactive execution requires a negotiated adapter");
     let registration = this.registrations.get(adapter);
-    if (!registration) { registration = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas); this.registrations.set(adapter, registration); }
+    if (!registration) { registration = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas, adapter.capabilityValidators); this.registrations.set(adapter, registration); }
     if (registration.compatibility.compatibility_hash !== binding.compatibility_hash)
       throw new RuntimeFault("precondition_failed", "Reactive and native executable contracts differ");
     return { adapter, binding, registration, descriptor: adapter.descriptor, schemas: adapter.schemas };
@@ -238,14 +238,18 @@ export class ReactiveRuntime {
     }
     const run = this.assertAuthority(generation, epoch, revision);
     this.assertIdentity(identity);
-    if (canonical.backend === "javascript")
-      this.canonicalSources.add(canonical.source);
-    const registered = this.store.registerPolicy(
+    const registered = await this.store.registerPolicy(
       run.run_id,
       canonical,
       run.turns,
       validation,
+      () => {
+        this.assertAuthority(generation, epoch, revision);
+        this.assertIdentity(identity);
+      },
     );
+    if (canonical.backend === "javascript")
+      this.canonicalSources.add(canonical.source);
     const existing = this.policies.find(
       (view) => keyOf(view) === keyOf(registered),
     );

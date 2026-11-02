@@ -2,6 +2,7 @@ import { z } from "zod";
 import { DEFAULT_SKILL_LIMITS } from "../shared/programs.ts";
 import { jsonSchema, lookaheadConfigSchema, namedProgramRefSchema, policySpecSchema, skillLimitsSchema } from "../shared/validation.ts";
 import { promotionDeclarationSchema } from "./experience.ts";
+import { residentActorLimitsSchema, residentAnalysisInputSchema, residentIntentSchema, residentStateSchema } from "../shared/resident.ts";
 
 export const programSelectorSchema = namedProgramRefSchema;
 const cardSchema = z.object({
@@ -9,6 +10,7 @@ const cardSchema = z.object({
   method: z.string().trim().min(1).max(2000), reason: z.string().trim().min(1).max(1000), limitations: z.string().trim().min(1).max(1000),
 }).strict();
 export const programWriteSchema = z.object({
+  entry: z.enum(["run", "step", "analyze"]).default("run"),
   name: z.string().trim().min(1).max(80), source: z.string().min(1).max(16384), card: cardSchema.default({
     purpose: "Unspecified by author", applicability: "Unspecified by author", method: "See immutable source",
     reason: "Unspecified by author", limitations: "Untested; no efficacy or applicability claim",
@@ -25,11 +27,24 @@ const actorLimitsSchema = skillLimitsSchema.extend({
   max_calls: skillLimitsSchema.shape.max_calls.default(DEFAULT_SKILL_LIMITS.max_calls),
   max_depth: skillLimitsSchema.shape.max_depth.default(DEFAULT_SKILL_LIMITS.max_depth),
 }).prefault({});
-export const programSubmitSchema = programWriteSchema.extend({
-  args: jsonSchema, limits: actorLimitsSchema, next: nextConfigSchema.optional(),
-}).strict();
+export const programSubmitSchema = z.discriminatedUnion("entry", [
+  programWriteSchema.extend({ entry: z.literal("run").default("run"), args: jsonSchema,
+    limits: actorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
+  programWriteSchema.extend({ entry: z.literal("step"), args: residentIntentSchema,
+    initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema }).strict(),
+]);
+const playingStartSchema = z.discriminatedUnion("entry", [
+  programSelectorSchema.extend({ operation: z.literal("start"), entry: z.literal("run").default("run"),
+    args: jsonSchema, limits: actorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
+  programSelectorSchema.extend({ operation: z.literal("start"), entry: z.literal("step"),
+    args: residentIntentSchema, initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema }).strict(),
+]);
 export const programRunSchema = z.discriminatedUnion("operation", [
-  programSelectorSchema.extend({ operation: z.literal("start"), args: jsonSchema, limits: actorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
+  playingStartSchema,
+  z.object({ operation: z.literal("update_intent"), target: z.literal("current").default("current"),
+    expected_version: z.int().nonnegative(), intent: residentIntentSchema }).strict(),
+  programSelectorSchema.extend({ operation: z.literal("analyze"), target: z.literal("current").default("current"),
+    expected_intent_version: z.int().nonnegative(), input: residentAnalysisInputSchema }).strict(),
   z.object({ operation: z.literal("inspect"), target: z.enum(["current", "latest"]).default("current") }).strict(),
   z.object({ operation: z.literal("stop"), target: z.enum(["current", "latest"]).default("current") }).strict(),
   z.object({ operation: z.literal("activate_next") }).strict(),

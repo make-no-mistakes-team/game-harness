@@ -237,6 +237,13 @@ Whole-agent live study support is cold, fresh seeded Minecraft Normal Survival t
 
 Before changing activation semantics, the parent must complete the deterministic real Fabric/Docker/Runtime/Store manual-planning baseline, with an explicitly synthetic strategic caller and a real isolated guard. Only the parent's baseline result opens the integration-edit gate; a prepared fixture or source inspection does not.
 
+The [29 October native planning baseline](integration-spike.md#current-native-planning-baseline--29-october-2026)
+passed all eight manual/automatic continuation cases with actual cleanup and
+zero provider/Jev calls after correcting the synthetic caller's SDK hook
+context. The initial failed attempt remains retained. This satisfies the
+baseline prerequisite for that source cohort, not a resident-control,
+gameplay-improvement or future changed-protocol acceptance result.
+
 ### Model choice, usage and cost-to-result
 
 Luna is the conservative default for ordinary acceptance. GPT-6.1-Sol is authorized for an explicit API-control, comparison or justified higher-capability acceptance question with finite recorded bounds; no silent model fallback is permitted. Select on cost-to-result and the evidence needed, not token price alone. Include unsuccessful attempts when reporting time, requests, usage and estimated cost per result.
@@ -290,6 +297,82 @@ Read `bun run evaluate --help` for tier entry points and explicit native/inferen
 
 `bun scripts/native-minecraft-mechanics.ts --allow-native --jar <fresh-built.jar>` exercises approach, mining, own pickup, planks and a retained crafting table through Runtime, a Docker worker and native effects, with zero inference. `--case tool` extends through table placement and a wooden pickaxe; `--case stone` adds a disclosed stone outcrop, equipment, cobblestone collection and a retained stone pickaxe. `--case repair` first assesses a blocked parent, then revises and executes its child through the same production tools. Setup supplies a dry platform and resources, clears inventory and fixes daylight; the evaluator authors every procedure. Recordings and consequences establish mechanics and repair plumbing only.
 
+`--case controller-stream` exercises the native streaming transport through
+the existing sole arbiter. Its eleven evaluator-authored cases cover held
+movement/view, continuous bow use, ordinary selection/drop with independent
+server retention, visible GUI application followed by a separate receipt,
+stale-frame refusal, a stopped native process with saturated ordinary RPCs
+and reserved retirement, and actual lease expiry. Additional cases exercise
+retirement after GUI application but before its server receipt, fresh owner
+admission after that barrier, truthful repeated movement/count consumption,
+and a sixteen-operation GUI sequence beyond two seconds. The stopped-process case
+records late physical retirement rather than claiming timely release.
+The fixture owns and resumes only its native child, records the full
+delivered feed, drains its writer and uses no provider. It does not run a
+generated resident worker or establish model-authored play.
+
+`--case resident` adds actual selected-module execution through the SDK,
+Runtime, Docker worker and native arbiter. Its evaluator-authored source
+holds a bow during a 15-second reasoning delay and inactive compilation,
+crafts a table through visible GUI receipts, fails before admission on a
+cold-module error, throws after applied input and exercises Stop during an
+outstanding infinite computation. It retains source, actual sequence/prefix
+and worker/native cleanup. This conformance fixture supplies no model
+competence or timing-cohort result.
+
+The resident fixture also injects declared death, same-life teleport and
+dimension changes after actual held-input admission. A separate case suspends
+the owned native process, loads the ordinary RPC lane and requests Runtime Stop.
+Exact evaluator commands and actual cleanup remain in the private report;
+these interventions are not agent decisions or natural gameplay.
+
+`scripts/native-resident-benchmark.ts --allow-native --manifest <registered-private-study.json>`
+uses the separate zero-provider `resident_platform` StudyLedger condition.
+Register the complete immutable declaration first with `evaluate register-study`.
+The runner checks source/build/profile/controller identities and reserves each
+sequential slot before a fresh native child process. A one-cell calibration
+cannot substitute for its prescribed 27-cell rate/delay cohort. Every cell
+retains the full 30-second warmup and 120-second measurement, expected lower-rate
+expiry, actual native application ages, logging/compile/capture load and
+original-speed evidence. The initial 4096-row nonplaying history corpus is
+committed in one durable Store transaction before warmup; its actual preparation
+time is retained separately from the recurring measured history reads.
+Failed/interrupted slots remain consumed; unknown
+cleanup retains ownership and closes admissions. Provider identities and
+allowances are null/zero, and a technical pass never becomes agent completion.
+A failed admission before native fixture creation can confirm that no native
+owner was acquired; it does not invent a native cleanup report. Once a fixture
+exists, confirmed drain requires its retained native report.
+
+The declaration must select normal generation and enabled structures; the
+runner checks the actual owned world's safe settings before admission.
+Latency populations include confirmed ACKs arriving after the measurement
+window and retain unconfirmed decisions explicitly. Native measurement and
+cleanup cannot extend the original slot deadline. The parent derives sealed
+replays only after all native owners close, under the separately stated
+[cohort derivation bounds](runtime-contracts.md#evaluation-governance).
+Neither a timeout nor a kill request confirms resource drain.
+Warmup, synthetic reasoning and scheduled load waits recheck their original
+monotonic deadlines rather than treating a timer notification as elapsed time.
+On failure, native fixture teardown follows resident drain settlement so it
+cannot destroy the channel still needed for retirement; an unknown resident
+drain remains unknown even if the fixture is later contained.
+
+Synthetic fault fixtures may explicitly select the trusted native evaluation
+configuration. The normal private session records `evaluation:null`; natural
+conditions reject fault configuration before setup, and the resident timing
+runner checks the actual launched disabled value. The configuration and its
+raw arm/status requests are not offered to models as game tools.
+
+GUI replacement proof must show a new same-class screen while the original
+gesture is still pending, not only after old-owner drain. Slow-reader proof
+must show actual native socket-write backpressure, not just unread replies or
+a nominal full host queue. Bounded owned-socket buffer controls, permitted
+reads and owned-JVM stack observations may establish that boundary without
+changing the production writer. Retain the actual reserved Stop/retirement
+ACK and pre-resume native capture clocks separately from prior world effects.
+Lease expiry during an intentionally held reader is not continuous control.
+
 `--case approach --mode baseline` retains observed approach/excavation faults
 without treating evidence capture as semantic success.
 `--case approach --mode fixed` asserts the corrected positive/negative
@@ -304,6 +387,23 @@ The focused movement stages are `ascent`, `headroom`, `excavation`,
 evaluator-only night vision for legible footage. Its three unsuccessful bursts
 and subsequent terrain change are authored by the evaluator and are never
 supplied to a model episode as a solution.
+
+`--case visible-gui` runs the complete 18-case persistent-screen conformance
+set, including real GUI production receipts, a Runtime/Docker worker and
+source/cursor, modifier, resize, replacement and acknowledgement races.
+`--stages chest,furnace` is an explicit debugging subset, not full acceptance.
+The fixture uses privileged setup and evaluator-authored choices; its source,
+worlds and recordings must remain unavailable to actor retrieval or experience.
+Resize evidence retains separate fixed-size replay segments and original
+transition packets rather than synthesizing a constant-size capture.
+
+`--case sensing` exercises eight basic-feedback cases: own state and vanilla
+crosshair, exact delivered capture-sequence joins, reads during a stopped
+server inventory request, use/movement, actual heard priming with independent
+cursors, fluids/air/vehicle and scope fences. The production-used native
+audibility proof separately covers mute, relative/stopped and attenuation
+boundaries; these are not represented as live mute tests. The visible-GUI
+`worker-api` stage also reads the new channel through the real isolated SDK.
 
 `bun scripts/minecraft-development.ts --help` describes the thin finite Minecraft development entry. It reuses acceptance's Runtime, diagnostic AttemptLedger, pre-transport request admission, model evidence, episode recorder and cleanup. Declare plain task text, an optional registered `--criterion` (default `custom`), a fresh `--seed`, start disclosure, the existing account directory, an explicit image-capable model, and finite limits. It supports fresh Normal Survival with empty inventory and continuous time, not prepared/restored saves or setup commands. Seed curation must be disclosed. Custom `task_finish` remains model-reported/unverified; a stone-pickaxe request must explicitly select `craft_stone_pickaxe`, not the table criterion. This entry preserves existing diagnostic counts and does not create a study allowance.
 
@@ -362,7 +462,7 @@ Understandable high-level strategies are sufficient. There is no requirement to 
 
 The default library is per strategic model, with artifacts scoped to compatible game, adapter, and observation profiles. A run selects an immutable library snapshot before starting; later changes in another run cannot silently change that selection. Shared experience is portable only when its environment and capability assumptions still hold. No cross-game or cross-adapter portability is implied by sharing an artifact format.
 
-Current compatibility is the negotiated descriptor/content hash: observation envelope 3, the registered payload schema, complete profile configuration, game/adapter build and capability hashes, and executable API/validator/runtime 4. Minecraft currently uses `minecraft_assisted_rgb_360_r8_v1`. Dynamic boot/session/run/life/space identities fence invocations without changing reusable source compatibility. Earlier schema2/r2 and API1–3 snapshots retain their original source and outcomes for read-only inspection; they cannot enter active execution without a new compatible validation identity.
+Current compatibility is the negotiated descriptor/content hash: observation envelope 3, the registered payload schema, complete profile configuration, game/adapter build and capability hashes, and executable API/validator/runtime 4. Minecraft currently uses `minecraft_assisted_rgb_360_r8_gui_v2`; earlier r8-v1 episodes retain their original declaration. Dynamic boot/session/run/life/space identities fence invocations without changing reusable source compatibility. Earlier schema2/r2 and API1–3 snapshots retain their original source and outcomes for read-only inspection; they cannot enter active execution without a new compatible validation identity.
 
 Same-session working definitions are a separate, weaker retention channel. `working_programs:"continue"` (default) imports exact validated definitions/dependencies only for the same session and strategic model; `"fresh"` omits them. No previous args, worker state, observations or JS stacks cross the task boundary. Their qualification remains `working_candidate`, even if they have measured execution references. Retaining or revalidating a definition does not establish usefulness, portability or cross-session promotion eligibility. Frozen comparison arms must explicitly omit uncontrolled working definitions.
 
@@ -498,7 +598,7 @@ The required live activity surface must display an improvement card: actual skil
 Freeze a run manifest containing:
 
 - The actual negotiated adapter descriptor: `game_id`/`game_version`, `adapter_id`/`adapter_version`, `observation_profile_id`/`observation_profile_version`, `observation_schema_id`/`observation_schema_version` and schema hash, and supported `capability_id`/version entries with schemas/hashes. Include runtime/dependency versions and relevant environment settings.
-- The full `observation_profile_config` and `observation_profile_fingerprint`, plus `observation_interface` for structured/image interface identity. Record radii, occlusion rules, sound coarsening, sampling/candidate/output bounds, private navigation geometry projection/envelope, and authorized-goal/higher-route rules using the canonical [runtime profile](runtime-contracts.md#player-observable-structured-profile-v1), without substituting a profile label for its effective settings.
+- The full `observation_profile_config` and `observation_profile_fingerprint`, plus `observation_interface` for structured/image interface identity. Record radii, occlusion rules, sound coarsening, sampling/candidate/output bounds, private navigation geometry projection/envelope, and authorized-goal/higher-route rules using the canonical [runtime profile](runtime-contracts.md#current-player-observable-structured-profile), without substituting a profile label for its effective settings.
 - For Minecraft, server flavor (vanilla/Paper or another declared implementation), exact game/server build, Anti-Xray enabled status, and effective per-world/dimension Anti-Xray configuration: mode, block lists, heights, update options, and other settings applicable to that pinned version. Retain an effective configuration snapshot/hash in evaluator-owned evidence; neither server configuration nor raw diagnostic evidence grants agent access to hidden state. Current Paper documentation does not by itself establish behavior for the pinned build; use the [upstream evidence](upstream-reuse.md) and adapter fixtures.
 - The task definition and versioned verifier, success/failure predicates, progress and non-regression predicates, horizon, stop conditions, and scoring rules.
 - The practice/comparison/held-out designation, initial-state identity and permitted initialization procedure, `world_id` lineage, any `rollback_branch_id`, and checkpoint or reset capability actually available through the adapter.
@@ -572,7 +672,7 @@ If the task remains unsatisfied, the model may revise and retry through ordinary
 
 ### Observation pipeline performance
 
-Measure perception independently of LLM inference. Materialize the actual settings in the [Minecraft observation contract](runtime-contracts.md#player-observable-structured-profile-v1) and retain their fingerprint with each result. The current native eight-block on-demand sampler and the documented future 32-block scheduled sampler are different configurations; the shared historical r2 label cannot certify equality. Do not substitute proposed defaults for unknown historical settings or claim the complete RGB/frustum profiles from a current PNG attachment.
+Measure perception independently of LLM inference. Materialize the actual settings in the [Minecraft observation contract](runtime-contracts.md#current-player-observable-structured-profile) and retain their fingerprint with each result. The current native eight-block on-demand sampler and the documented future 32-block scheduled sampler are different configurations; the shared historical r2 label cannot certify equality. Do not substitute proposed defaults for unknown historical settings or claim the complete RGB/frustum profiles from a current PNG attachment.
 
 | Measurement | Required evidence |
 | --- | --- |
@@ -657,13 +757,30 @@ For the combined case, eligible wood in a confirmed own native receipt's `invent
 
 Recorded acceptance now keeps a separately bounded private append-only journal as events occur. It observes final SDK-visible context through an additive `Agent.addBeforeModelCall` callback, visible assistant partials/messages, original tool arguments and results, authorized observations, source snapshots and native receipts. A trusted Store tap records authorized root observations/capability data before ordinary trace payload/aggregate caps; the compact report and ordinary Store are not complete substitutes. Typed images become deduplicated private artifacts. Private provider reasoning is explicitly redacted; credentials, auth headers and secret-store contents are outside the observer. SDK-visible context is not a wire payload or proof of hidden transport attempts.
 
-The text journal allows 256 MiB total and 16 MiB pending asynchronous writes. Capacity/persistence failures stop the attempt visibly. Normal completion and outer failure/interruption flush the journal and episode recorder before observer/Store closure; interrupted reservations and manifests remain evidence. A replay must be rendered and inspected for recorded acceptance. No automatic repeat seeks a passing result.
+The default text journal allows 256 MiB total and 16 MiB pending asynchronous writes. A complete checked `--evidence-profile` declares effective recording, text/image journal and renderer bounds; a registered study must pin that file's exact preprocessing identity. Manifests distinguish actual durable bytes/artifacts from accepted reservations and report pending peaks. Capacity/persistence failures stop the attempt visibly. Completion and interruption join the actual journal, recorder and handles before observer/Store closure. A replay must be rendered and inspected for recorded acceptance.
 
 `bun run evaluate native-recording --allow-native --jar <fresh-built.jar>` is a separate zero-inference infrastructure proof. It uses the existing private evaluation paths and fresh-artifact gate, records a deliberate wait, native effect interruption/neutralization, visible vanilla DeathScreen and explicit respawn, and compares replay duration against capture time within a predeclared 134 ms tolerance (one nominal 30 Hz interval plus 100 ms, rounded up). Observed frame gaps are diagnostic and cannot enlarge that tolerance. Actor and recorder PNGs preserve visible native RGB with opaque alpha, matching the actual game viewer rather than treating framebuffer alpha as display transparency. Inspect its replay and actor PNGs manually. Its privileged setup never enters a natural acceptance case; direct effect interruption is not a new proof of Runtime Stop. This entry point does not log in or replace account authority.
 
 [`scripts/agent-acceptance.ts`](../scripts/agent-acceptance.ts) uses actual `AuthManager` discovery and an existing private auth store opened in place, without login/logout, credential copying, account fallback or a synthetic strategic caller. Live execution requires both resource opt-ins. Diagnostics retain their hypothesis/evidence revision and justified nonordinary model selection; study execution binds the registered manifest/slot directly and confirms its exact arm model. Natural tasks are not `api_control` work. Full evidence and compact reports remain private by default; the entry point and generated help own current arguments.
 
-Ordinary-world efficacy and fresh-world completion use ordinary environments. A prepared development or mechanical task is allowed as a separately declared condition, with initialization, human feasibility preflight, interventions and claim limits retained; it cannot pass as ordinary fresh-world acquisition. Keep setup coordinates, scoring and privileged truth outside actor feedback and reusable experience. Current study execution refuses prepared/restored starts until their implementation lands.
+The recording proof accepts `--duration-ms` through 1,800,000 ms. A 20–30-minute
+sample requires an explicit complete profile with enough duration/frame
+capacity for the complete admitted capture scope, including existing technical
+phase allowances, not just the requested window. Duration and nominal frame
+capacity are checked before native preparation. Its declared window, final hold, actual index/replay duration,
+gaps and owner drain are checked; a short clip is not a long-run pass.
+The controlled technical arena and natural-start/runtime-load conditions
+remain separately labelled. Long synthetic SDK captures finish their
+initial request normally and retain the evidence workload while idle,
+without chaining requests or claiming continuous model reasoning.
+
+Replay verification checks frame inventory and presentation timestamps, not
+duration alone. The local FFmpeg/FFprobe integration tests cover 30 Hz capture,
+a large terminal gap, final hold and refusal of a changed finalized manifest.
+Keep an old render when deriving a corrected export from its original PNGs;
+label the new render's source and options rather than rewriting capture history.
+
+Ordinary-world efficacy and fresh-world completion use ordinary environments. A prepared development or mechanical task is allowed as a separately declared condition, with initialization, human feasibility preflight, interventions and claim limits retained; it cannot pass as ordinary fresh-world acquisition. Keep setup coordinates, scoring and privileged truth outside actor feedback and reusable experience. Whole-agent study execution still refuses prepared/restored starts; the dedicated resident-platform runner admits only declared technical timing fixtures.
 
 Controlled security and synthetic/replayed event fixtures establish infrastructure behavior, not tactical efficacy, transferred learning or end-to-end completion. The [observation/navigation proof](operations-and-security.md#structured-observation-and-navigation) exercises range/behind-camera permission in its current assisted condition, reveal/conceal, stale memory, coarse audio, alternate-route isolation, private geometry and unknown-target/error leakage. Retain raw diagnostics privately and record any optional Paper configuration separately. Event/video playback is not deterministic environment rewind.
 
@@ -715,7 +832,7 @@ Finer JS-only versus Jev-only versus mixed-policy comparisons, or asynchronous-v
 
 ## Minecraft reference evaluation profile
 
-Minecraft Java **1.21.4**, **Normal Survival**, one avatar, ordinary death/inventory rules, and no agent cheats/operator powers are the implemented first integration's tested conditions for the scoped episodes above. Its profile is `minecraft_assisted_rgb_360_r8_v1`, defined by the [runtime contracts](runtime-contracts.md#player-observable-structured-profile-v1), with observation envelope 3 and hash-bound effective configuration. The broader perception requirements also distinguish assisted RGB/frustum and strict-visual alternatives; those conditions remain separate from delivered support. Information permission is independent of delivery: the application supplies [authorized typed actor PNGs](runtime-contracts.md#delivered-actor-images-and-recorded-episodes) alongside structured state. Audio and synchronized capture are not implemented by this profile.
+Minecraft Java **1.21.4**, **Normal Survival**, one avatar, ordinary death/inventory rules, and no agent cheats/operator powers are the implemented first integration's tested conditions for the scoped episodes above. Those episodes used `minecraft_assisted_rgb_360_r8_v1`, with observation envelope 3 and hash-bound effective configuration; the [current GUI-v2 contract](runtime-contracts.md#current-player-observable-structured-profile) is a separate declaration, not a relabelled gameplay result. The broader perception requirements also distinguish assisted RGB/frustum and strict-visual alternatives; those conditions remain separate from delivered support. Information permission is independent of delivery: the application supplies [authorized typed actor PNGs](runtime-contracts.md#delivered-actor-images-and-recorded-episodes) alongside structured state. Audio and synchronized capture are not implemented by these profiles.
 
 The profile permits bounded nearby unobstructed objects independent of camera direction, own status/inventory/UI, normal F3 coordinates, public recipes/docs and world-local memory. Freeze actual finite observation/query limits in manifests. Hidden resources/structures, exact live concealed entity state, seeds, saves, evaluator state, raw native world/chunk/entity access and video buffers cannot enter agent observations, logs, errors, retrieval or libraries. Last-seen memory stays stale; only real audio yields coarse sound signals. Filter before counts, ordering, truncation and errors; unobserved means unknown.
 

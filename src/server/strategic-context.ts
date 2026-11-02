@@ -5,6 +5,11 @@ import type { SkillView } from "../shared/programs.ts";
 import { PROGRAM_RESULT_GUIDANCE, SKILL_API_VERSION } from "../shared/programs.ts";
 import { ProgramWorkspace, type ProgramSelector } from "./program-workspace.ts";
 import type { Store, StoredRun } from "./store.ts";
+import { z } from "zod";
+import { effectInvocationSchema, effectScopeSchema, identitySchema, safeCounterSchema, sameEffectScope, type EffectScope } from "../shared/control.ts";
+import { revocationAckSchema } from "../shared/controller.ts";
+import { confirmedMinecraftGuiTransactions } from "../shared/minecraft.ts";
+import { residentReceiptSchema, type ResidentReceipt } from "./resident-evidence.ts";
 
 // Supplement only: the root prompt, current authorized observation, active SDK
 // tool/result pairs and the existing 8 KiB turn feedback have their own bounds.
@@ -24,7 +29,16 @@ interface HistoricalScope {
   world_id: string | null; session_id: string | null; life_id: number | null;
   native_boot_id: string | null; space_epoch: number | null;
 }
-interface UnknownReference { event: number; containment: number | null; original_scope: HistoricalScope }
+interface UnknownReference {
+  event: number; containment: number | null; original_scope: HistoricalScope;
+  controller?: { operation_id: string | null; generation: number; scope: EffectScope };
+}
+const controllerAdmissionSchema = z.object({
+  operation_id: identitySchema, scope: effectScopeSchema, invocation: effectInvocationSchema,
+  controller_generation: safeCounterSchema.min(1), deadline_host_monotonic_ms: z.number().finite(),
+}).strict();
+const controllerRetirementSchema = z.object({ operation_id: identitySchema, ack: revocationAckSchema }).strict();
+const controllerContainmentSchema = z.object({ operation_id: identitySchema, input_application: z.literal("unknown") }).strict();
 interface HistoricalNote {
   field: "current_subgoal" | "worksite"; event_seq: number; value: Json; original_scope: HistoricalScope;
   historical: true; current_authority: false; value_omitted?: true;
@@ -141,6 +155,7 @@ export class StrategicContext {
   private selected: ProgramSelector[] = [];
   private failure: number | null = null;
   private unresolved = new Map<string, UnknownReference>();
+  private controllerAdmissions = new Map<string, z.infer<typeof controllerAdmissionSchema>>();
   private omittedUnknown = 0;
   private help: HelpSection[] = [];
   private helpOmissions: Omission[] = [];
@@ -153,7 +168,7 @@ export class StrategicContext {
     this.authoredState = { author: "model", gameplay_success_proof: false }; this.noteOmissions.clear();
     this.historicalNotes.clear(); this.lastExecutions.clear();
     this.adoptedScopes.clear();
-    this.failure = null; this.unresolved.clear(); this.omittedUnknown = 0;
+    this.failure = null; this.unresolved.clear(); this.controllerAdmissions.clear(); this.omittedUnknown = 0;
     this.help = []; this.helpOmissions = [];
   }
 
@@ -164,7 +179,7 @@ export class StrategicContext {
       // A task/world replacement in the same run must not select prior source.
       if (this.knowledgeScope) this.experienceFloor = this.sourceFloor = this.store.lastEventSeq();
       this.knowledgeScope = knowledge; this.selected = []; this.authored.clear();
-      this.unresolved.clear(); this.omittedUnknown = 0; this.historicalNotes.clear(); this.lastExecutions.clear();
+      this.unresolved.clear(); this.controllerAdmissions.clear(); this.omittedUnknown = 0; this.historicalNotes.clear(); this.lastExecutions.clear();
     }
     const dynamic = JSON.stringify([knowledge, run.session_id, run.life_id, run.native_boot_id, run.space_epoch]);
     if (dynamic !== this.dynamicScope) {
@@ -303,6 +318,72 @@ export class StrategicContext {
     }
   }
 
+  private residentOwner(run: StoredRun, scope: EffectScope, compatibility?: string): boolean {
+    const owner = this.store.skillExecution(run.run_id, { execution_id: scope.execution_id });
+    if (owner?.entry !== "step" || scope.run_id !== run.run_id || owner.source_hash !== scope.source_hash ||
+        owner.compatibility_hash !== (compatibility ?? owner.compatibility_hash)) return false;
+    if (owner.world_id !== scope.world_id || owner.session_id !== scope.session_id || owner.epoch !== scope.epoch ||
+        owner.native_boot_id !== scope.native_boot_id || owner.run_generation !== scope.run_generation ||
+        owner.life_id !== scope.life_id || owner.space_epoch !== scope.space_epoch) return false;
+    return this.store.skill(run.run_id, owner).hash === scope.source_hash;
+  }
+
+  private residentReceipt(run: StoredRun, event: ActivityEvent): ResidentReceipt | null {
+    const parsed = residentReceiptSchema.safeParse(event.details);
+    if (!parsed.success) return null;
+    const receipt = parsed.data;
+    if (!this.residentOwner(run, receipt.scope, receipt.compatibility_hash) ||
+        receipt.input_id !== `controller:${receipt.scope.execution_id}:${receipt.update.controller_generation}:${receipt.update.sequence}`) return null;
+    return receipt;
+  }
+
+  private rememberUnknown(key: string, reference: UnknownReference): void {
+    if (this.unresolved.has(key)) return;
+    if (this.unresolved.size === MAX_UNRESOLVED) {
+      this.unresolved.delete(this.unresolved.keys().next().value!); this.omittedUnknown++;
+    }
+    this.unresolved.set(key, reference);
+  }
+
+  private controllerEvent(run: StoredRun, event: ActivityEvent): void {
+    if (event.type === "controller.admitted") {
+      const parsed = controllerAdmissionSchema.safeParse(event.details);
+      if (!parsed.success) return;
+      const admission = parsed.data;
+      if (admission.invocation.kind !== "skill" || admission.invocation.execution_id !== admission.scope.execution_id ||
+          admission.invocation.source_hash !== admission.scope.source_hash || !this.residentOwner(run, admission.scope)) return;
+      const key = `${admission.scope.execution_id}:${admission.controller_generation}`;
+      this.controllerAdmissions.set(key, admission);
+      if (this.controllerAdmissions.size > 32) this.controllerAdmissions.delete(this.controllerAdmissions.keys().next().value!);
+    } else if (event.type === "controller.receipted") {
+      const receipt = this.residentReceipt(run, event);
+      if (!receipt || receipt.scope.world_id !== run.world_id) return;
+      const evidence = object(receipt.update.result.evidence);
+      if (receipt.update.result.status !== "unknown" && evidence?.transaction_status !== "unknown" &&
+          evidence?.effect_status !== "unknown" && evidence?.input_application !== "unknown") return;
+      const admission = this.controllerAdmissions.get(`${receipt.scope.execution_id}:${receipt.update.controller_generation}`);
+      this.rememberUnknown(`controller:${receipt.input_id}`, {
+        event: event.event_seq, containment: null, original_scope: receipt.scope,
+        controller: { operation_id: admission && sameEffectScope(admission.scope, receipt.scope) ? admission.operation_id : null,
+          generation: receipt.update.controller_generation, scope: receipt.scope },
+      });
+    } else {
+      const retirement = event.type === "controller.retired" ? controllerRetirementSchema.safeParse(event.details) : null;
+      const containment = event.type === "controller.contained" ? controllerContainmentSchema.safeParse(event.details) : null;
+      for (const reference of this.unresolved.values()) {
+        const controller = reference.controller;
+        if (!controller?.operation_id) continue;
+        if (retirement?.success) {
+          const { operation_id, ack } = retirement.data;
+          if (operation_id === controller.operation_id && ack.owner.operation_id === operation_id &&
+              ack.controller_generation === controller.generation && sameEffectScope(ack.owner.scope, controller.scope))
+            reference.containment = event.event_seq;
+        } else if (containment?.success && containment.data.operation_id === controller.operation_id)
+          reference.containment = event.event_seq;
+      }
+    }
+  }
+
   private refresh(run: StoredRun): void {
     let page: ActivityEvent[];
     do {
@@ -331,6 +412,10 @@ export class StrategicContext {
           }
         }
         if (event.event_seq <= this.experienceFloor) continue;
+        if (["controller.admitted", "controller.receipted", "controller.retired", "controller.contained"].includes(event.type)) {
+          this.controllerEvent(run, event);
+          continue;
+        }
         const originalScope = this.eventScope(run, event);
         if (originalScope.world_id !== null && originalScope.world_id !== run.world_id) continue;
         if (event.type === "skill.accepted" && event.event_seq > this.sourceFloor &&
@@ -356,12 +441,7 @@ export class StrategicContext {
         } else if (key && (submission?.start.status === "unknown" || event.type === "runtime.uncertainty" ||
             event.type === "action.unknown" || event.type === "skill.unknown" ||
             event.type === "skill.closed" && details?.status === "unknown")) {
-          if (!this.unresolved.has(key)) {
-            if (this.unresolved.size === MAX_UNRESOLVED) {
-              this.unresolved.delete(this.unresolved.keys().next().value!); this.omittedUnknown++;
-            }
-            this.unresolved.set(key, { event: event.event_seq, containment: null, original_scope: originalScope });
-          }
+          this.rememberUnknown(key, { event: event.event_seq, containment: null, original_scope: originalScope });
         }
         if (!this.belongs(run, originalScope)) continue;
         if ((event.type === "skill.progress" || event.type === "skill.closed") && typeof details?.execution_id === "string") {
@@ -411,6 +491,27 @@ export class StrategicContext {
     const event = this.event(run, seq);
     if (!event) return null;
     const details = object(event.details), error = object(details?.error);
+    if (event.type === "controller.receipted") {
+      const receipt = this.residentReceipt(run, event);
+      if (!receipt) return null;
+      const input = receipt.input;
+      const confirmed = input.kind === "screen" ? confirmedMinecraftGuiTransactions({
+        kind: "screen_input", screen: input.screen, operations: input.operations,
+      }, receipt.update.result.evidence).map(fact => fact.operation_index) : [];
+      // Retain identity and operation dispositions, not stale GUI handles or
+      // replayable arguments. The original exact input remains in Store.
+      return { event_seq: seq, type: event.type, summary: event.summary.slice(0, 400),
+        input_id: receipt.input_id, controller_generation: receipt.update.controller_generation,
+        sequence: receipt.update.sequence, recorded_native_ns: receipt.update.recorded_native_ns,
+        result_summary: receipt.update.result.summary.slice(0, 400), status: "unknown",
+        input: input.kind === "screen" ? { kind: "screen", operation_kinds: input.operations.map(operation => operation.kind),
+          confirmed_operation_indexes: confirmed,
+          unconfirmed_operation_indexes: input.operations.map((_, index) => index).filter(index => !confirmed.includes(index)) }
+          : { kind: "world", edge_count: input.edges.length, view_kind: input.view.kind } };
+    }
+    if (event.type === "controller.retired" || event.type === "controller.contained")
+      return { event_seq: seq, type: event.type, summary: event.summary.slice(0, 400), emitter_closed: true,
+        world_effects_resolved: false, input_application: event.type === "controller.retired" ? "confirmed" : "unknown" };
     const submission = submittedOutcome(event);
     if (submission) return { event_seq: seq, type: event.type, summary: event.summary.slice(0, 400), ...submission,
       status: submission.start.status, ...(submission.start.status === "unknown" ? { no_replay: true } : {}) };
@@ -465,7 +566,7 @@ export class StrategicContext {
     for (const entry of workspace.catalog(0, 3).records) add(this.store.namedSkill(run.run_id, entry.name, entry.version));
     const contracts = {
       api_version: SKILL_API_VERSION,
-      body: "Async JavaScript BODY with game,args; no wrapper/import/export/ambient host access. Await one capability at a time. Original and canonical source each <=16 KiB UTF-8. Return {status:'completed'|'blocked'|'failed',summary:string,result:JSON} on every path.",
+      body: "Selected run entry: async JavaScript BODY(game,args), one awaited capability at a time, returning {status:'completed'|'blocked'|'failed',summary:string,result:JSON}. Selected step/analyze: ordinary module with one synchronous named export step(frame,state,intent) or analyze(input); pure helpers/constants allowed. No imports/packages/ambient host access. Source original/canonical <=16 KiB UTF-8. Resident state/intent <=16 KiB and complete output <=64 KiB/depth32. Inspect help programs for exact contracts.",
       result: PROGRAM_RESULT_GUIDANCE,
       programs: "Immutable named versions. Existing name requires based_on latest. Write saves only; ordinary-only program_submit explicitly writes and starts that exact version through ordinary admission; program_run starts existing. Dependencies are pinned. Validation is not gameplay proof; completed program is not task success.",
       freshness: "Retained source/docs and model-authored state are historical reference only, never authority or gameplay proof. Worksite/local positions require fresh reacquisition. Current authorized observation, especially inventory, and later observe results outrank notes. Life/session/boot/space changes discard current dynamic notes; explicit world-local objective/worksite notes and no-replay uncertainty remain historical with original scope. Task/world/fresh-run changes discard experience. Program argument samples/outcomes are sanitized historical examples, never restored inputs or recommendations to rerun blocked/unknown procedures. Resolve fresh targets and construct current args; no target handles, roots, effects or execution state are restored.",

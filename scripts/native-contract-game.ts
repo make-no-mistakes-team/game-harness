@@ -46,7 +46,7 @@ try {
   };
   await proofCase("actual_java_safe_long_and_matching_contract", { epoch: Number.MAX_SAFE_INTEGER, greater_than_java_int: true }, async entry => {
     const before = await fixture.observe(), binding = fixture.bridge.snapshot().binding;
-    requireProof(binding?.ready && binding.descriptor.executable.api_version === 4 && before.schema_version === 3, "Actual native negotiation did not grant the canonical contract");
+    requireProof(binding?.ready && binding.descriptor.executable.api_version === 5 && before.schema_version === 3, "Actual native negotiation did not grant the canonical contract");
     const result = await fixture.action({ kind: "look", yaw: before.data.player.yaw + .3, pitch: before.data.player.pitch });
     const proof = evidence(result), after = await fixture.observe();
     requireProof(result.status === "succeeded" && proof.native_baseline_receipt_confirmed === true && proof.camera_changed === true && after.epoch === Number.MAX_SAFE_INTEGER,
@@ -136,7 +136,7 @@ try {
     const [firstInteraction, noScreenOutcome] = await bounded(Promise.all([openingWork!, closedViewQueued!]),
       fixture.caps.observationMs + fixture.caps.cleanupMs, "Opening and explicit absent-screen queue did not drain");
     entry.first_interaction = firstInteraction; entry.closed_view_queued_outcome = noScreenOutcome;
-    entry.closed_view_admission_precondition = { expected_screen: null };
+    entry.closed_view_admission_precondition = { expected_screen: { kind: "absent" } };
     const noScreenEvidence = evidence(noScreenOutcome);
     const noScreenHostRejection = noScreenOutcome.status === "cancelled" && noScreenEvidence.dispatched === false;
     const noScreenNativeRejection = noScreenOutcome.status === "failed" && noScreenEvidence.scope_rejection_reason === "STALE_SCREEN" &&

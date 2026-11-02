@@ -29,6 +29,7 @@ function specification(
   source = 'return {status:"completed",summary:"Finished",result:null};',
 ): SkillSpec {
   return {
+    entry: "run",
     name: "Composition fixture",
     source,
     card: {
@@ -55,6 +56,42 @@ async function rejection(work: Promise<unknown>, code: string) {
   }
   throw new Error("Expected program admission to fail");
 }
+
+test("selected resident modules preserve helpers and literal semantics without source-format guessing", async () => {
+  for (const kind of ["step", "analyze"] as const) {
+    const parameters = kind === "step" ? "frame, state, intent" : "input";
+    const source = `const label = \`first\n  literal indent\`;
+function helper(value) { return value + 1; }
+export function ${kind}(${parameters}) { return {label, count: helper(41)}; }`;
+    const admitted = await validateProgramSource(source, kind, fixtureContract);
+    const module = await import(`data:text/javascript;base64,${Buffer.from(admitted.source).toString("base64")}`);
+    expect(module[kind](null, null, null)).toEqual({ label: "first\n  literal indent", count: 42 });
+    expect(await validateProgramSource(admitted.source, kind, fixtureContract)).toEqual(admitted);
+    await rejection(validateProgramSource("return null;", kind, fixtureContract), "invalid_syntax");
+    await rejection(validateProgramSource(`export function ${kind === "step" ? "analyze" : "step"}() { return null; }`,
+      kind, fixtureContract), "invalid_entry");
+  }
+});
+
+test("resident module admission checks every helper and initializer and only one synchronous selected export", async () => {
+  for (const source of [
+    "export async function step(frame,state,intent) { return null; }",
+    "export function* step(frame,state,intent) { yield null; }",
+    "export default function step(frame,state,intent) { return null; }",
+    "export function step(frame,state,intent) { return null; } export const extra = 1;",
+    "const step = () => null; export {step};",
+  ]) await rejection(validateProgramSource(source, "step", fixtureContract), "invalid_entry");
+  for (const source of [
+    'import x from "node:fs"; export function step(frame,state,intent) { return x; }',
+    'function unused() { return import("node:fs"); } export function step(frame,state,intent) { return null; }',
+    "const x = import.meta; export function step(frame,state,intent) { return null; }",
+    "await Promise.resolve(); export function step(frame,state,intent) { return null; }",
+  ]) await rejection(validateProgramSource(source, "step", fixtureContract), "forbidden_syntax");
+  for (const source of [
+    "const x = process.env; export function step(frame,state,intent) { return null; }",
+    "function unused() { return fetch('https://example.test'); } export function step(frame,state,intent) { return null; }",
+  ]) await rejection(validateProgramSource(source, "step", fixtureContract), "forbidden_api");
+});
 
 test("comment-looking strings, regexes, template text and metadata are not executable comments", async () => {
   const source = String.raw`

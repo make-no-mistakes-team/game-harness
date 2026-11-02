@@ -8,16 +8,17 @@ const frameBinding = minecraftTestBinding(minecraftTestAdapter());
 /** Owned native packet. Pixels are supplied in wire order, not display order. */
 export function nativeFrame(options: { width?: number; height?: number; sequence?: number; capturedAt?: number; bottomUp?: boolean; pixels?: Uint8Array } = {}) {
   const { width = 2, height = 2, sequence = 1, capturedAt = Date.now(), bottomUp = false, pixels } = options;
-  const frame = new Uint8Array(32 + width * height * 4);
+  const frame = new Uint8Array(328 + width * height * 4);
   const header = new DataView(frame.buffer);
-  header.setUint32(0, 0x47485631, true);
+  header.setUint32(0, 0x47485632, true);
   header.setUint32(4, width, true);
   header.setUint32(8, height, true);
   header.setUint32(12, width * height * 4, true);
   header.setUint32(16, sequence, true);
   header.setUint32(20, Number(bottomUp), true);
   header.setFloat64(24, capturedAt, true);
-  if (pixels) frame.set(pixels, 32);
+  header.setUint32(316, 1, true);
+  if (pixels) frame.set(pixels, 328);
   return frame;
 }
 

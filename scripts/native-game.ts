@@ -4,13 +4,15 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DiagnosticAgent, DIAGNOSTIC_PROGRAMS, type PlanningDiagnosticProbe } from "../src/evaluation/diagnostic-agent.ts";
 import { DEFAULT_EVALUATION_CAPS } from "../src/evaluation/config.ts";
-import { NativeFixture, bounded, pause, requireProof, until } from "../src/evaluation/native-game.ts";
+import { NativeFixture, bounded, evidence, pause, requireProof, until } from "../src/evaluation/native-game.ts";
+import { HOST_MONOTONIC_CLOCK_ID } from "../src/server/performance.ts";
 import { assertNativeArtifactFresh, requireTierOptIn } from "../src/evaluation/tiers.ts";
 import type { Runtime } from "../src/server/runtime.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import type { Store } from "../src/server/store.ts";
 import type { GameAction, GameActionResult, Json, ObservationV3 } from "../src/shared/contracts.ts";
 import type { EffectEnvelope } from "../src/shared/control.ts";
+import type { TraceRecord } from "../src/shared/execution-evidence.ts";
 import { gameActionSchema } from "../src/shared/validation.ts";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -226,6 +228,58 @@ finally {
     fixture.report.runtime_cleanup = runtimeClosed && dockerClosed && activeEffects === 0;
     fixture.report.peak_simultaneous_native_effects = peakEffects;
     if (!fixture.report.runtime_cleanup) failure ??= new Error("Runtime/Docker/effect cleanup was not confirmed");
+    if (!failure && store && fixture.cases.length === cases.length && fixture.cases.every(entry => entry.status === "passed")) {
+      const control = fixture.bridge.performanceMetrics().control_timeline;
+      const sourceTimings = runIds.flatMap(id => store!.eventsAfter(id, 0, caps.eventPageRecords))
+        .filter(event => event.type === "program.source_timing");
+      const workerTimings: TraceRecord[] = [];
+      for (const id of runIds) {
+        let after = 0, complete = false;
+        for (let pageNumber = 0; pageNumber < caps.reportTracePages; pageNumber++) {
+          const page = store.tracePage(id, after, caps.tracePageRecords);
+          requireProof(page.budget.omitted_records === 0, "Native timing proof cannot claim complete worker evidence after trace omission");
+          workerTimings.push(...page.records.filter(trace => trace.kind === "span" && trace.payload !== null && typeof trace.payload === "object" &&
+            !Array.isArray(trace.payload) && ["worker_start", "worker_cleanup"].includes(String(trace.payload.category))));
+          if (!page.has_more) { complete = true; break; }
+          requireProof(page.next_after > after, "Native timing trace cursor did not advance");
+          after = page.next_after;
+        }
+        requireProof(complete, "Native timing proof exhausted its finite trace-page allowance");
+      }
+      requireProof(control.missing_clock_samples === 0 && control.invalid_clock_samples === 0 &&
+        control.samples.some(sample => sample.native_timing !== null), "Native control clock correspondence is missing or invalid");
+      requireProof(sourceTimings.length > 0 && workerTimings.length > 0 &&
+        sourceTimings.every(event => event.details !== null && typeof event.details === "object" && !Array.isArray(event.details) &&
+          event.details.clock_id === HOST_MONOTONIC_CLOCK_ID), "Source/worker timeline lacks correlated actual host-clock evidence");
+      for (const id of runIds) for (const execution of store.allSkillExecutions(id))
+        for (const phase of ["worker_start", "worker_cleanup"])
+          requireProof(workerTimings.some(trace => trace.execution_id === execution.execution_id && trace.payload !== null &&
+            typeof trace.payload === "object" && !Array.isArray(trace.payload) && trace.payload.category === phase &&
+            trace.payload.lifecycle_barrier_confirmed === true),
+            "Actual worker execution lacks its confirmed startup or cleanup timing");
+      const movement = effects.filter(call => call.request.kind === "move" && call.result?.status === "succeeded");
+      const joined = movement.map(call => {
+        const inputValue = evidence(call.result!).native_input_timing;
+        requireProof(inputValue !== null && typeof inputValue === "object" && !Array.isArray(inputValue), "Completed movement lacks native input sampling evidence");
+        const input = inputValue as Record<string, unknown>;
+        const sample = control.samples.find(sample => sample.operation_id === call.envelope.operation_id && sample.native_timing !== null);
+        requireProof(sample?.native_timing && input.operation_id === call.envelope.operation_id &&
+          input.request_id === sample.request_id && input.clock_id === sample.native_timing.clock_id,
+          "Native key sampling did not join its original input owner/request/clock");
+        const keysValue = input.key_sample;
+        requireProof(keysValue !== null && typeof keysValue === "object" && !Array.isArray(keysValue), "Native input lacks its key sampling interval");
+        const keys = keysValue as Record<string, unknown>;
+        requireProof(typeof keys.first_ns === "string" && typeof keys.last_ns === "string" &&
+          BigInt(keys.first_ns) >= BigInt(sample.native_timing.received_ns) &&
+          BigInt(keys.last_ns) <= BigInt(sample.native_timing.replied_ns),
+          "Actual sampled input falls outside its native request/reply interval");
+        return { operation_id: call.envelope.operation_id, request_id: sample.request_id, input };
+      });
+      requireProof(joined.length > 0, "No successful native movement exposed actual key sampling");
+      fixture.report.control_timing = { control, source_timings: sourceTimings, worker_timings: workerTimings,
+        joined_native_inputs: joined, overlapping_spans_are_not_additive: true,
+        claim: "Actual diagnostic sampling/correlation only; input/effect success and causal idle attribution remain distinct" };
+    }
     if (store) await writeFile(join(fixture.evidenceDirectory, "native-planning-ledger.json"), JSON.stringify({ classification: fixture.report.classification,
       runs: runIds.map(id => ({ run: store!.getRun(id), events: store!.eventsAfter(id, 0, caps.eventPageRecords), executions: store!.allSkillExecutions(id), planning: runtime!.planningView(id), trace: store!.tracePage(id) })), effects, guards, observations, marks }, null, 2), { mode: 0o600, flag: "wx" });
     if (diagnostic) {

@@ -10,21 +10,26 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(Source.class)
 public abstract class SourceMixin implements AudibleSource {
   @Unique private volatile int gameharness$category = -1;
+  @Unique private String gameharness$streamId;
   @Unique private SoundListener gameharness$listener;
   @Unique private double gameharness$x, gameharness$y, gameharness$z;
   @Unique private float gameharness$gain, gameharness$cutoff;
-  @Unique private boolean gameharness$relative, gameharness$linear;
+  @Unique private boolean gameharness$relative, gameharness$linear, gameharness$positioned;
 
-  public void gameharness$tag(int category, SoundListener listener) {
+  public void gameharness$tag(String streamId, int kind, SoundListener listener) {
+    gameharness$streamId = streamId;
     gameharness$listener = listener;
-    gameharness$category = category;
+    gameharness$positioned = false;
+    gameharness$category = kind;
   }
 
   @Inject(method = "setPosition", at = @At("TAIL"))
   private void position(Vec3d p, CallbackInfo ci) {
+    if (gameharness$category < 0) return;
     gameharness$x = p.x;
     gameharness$y = p.y;
     gameharness$z = p.z;
+    gameharness$positioned = true;
   }
 
   @Inject(method = "setVolume", at = @At("TAIL"))
@@ -51,26 +56,32 @@ public abstract class SourceMixin implements AudibleSource {
   @Inject(method = "close", at = @At("HEAD"))
   private void release(CallbackInfo ci) {
     gameharness$category = -1;
+    gameharness$streamId = null;
     gameharness$listener = null;
+    gameharness$x = gameharness$y = gameharness$z = 0;
+    gameharness$positioned = false;
   }
 
   @Inject(method = "play", at = @At("RETURN"))
   private void delivered(CallbackInfo ci) {
-    int category = gameharness$category;
+    int kind = gameharness$category;
     gameharness$category = -1;
+    String streamId = gameharness$streamId;
+    gameharness$streamId = null;
     SoundListener listener = gameharness$listener;
-    if (category < 0
-        || listener == null
-        || gameharness$relative
-        || gameharness$gain <= 0
-        || listener.getVolume() <= 0
-        || !((Source) (Object) this).isPlaying()
-        || NativeClient.INSTANCE == null) return;
+    gameharness$listener = null;
+    double x = gameharness$x, y = gameharness$y, z = gameharness$z;
+    gameharness$x = gameharness$y = gameharness$z = 0;
+    boolean positioned = gameharness$positioned;
+    gameharness$positioned = false;
+    NativeClient client = NativeClient.INSTANCE;
+    if (kind < 0 || streamId == null || listener == null || client == null || !positioned) return;
     Vec3d eye = listener.getTransform().position();
-    double dx = gameharness$x - eye.x, dy = gameharness$y - eye.y, dz = gameharness$z - eye.z;
-    if (gameharness$linear
-        && (!(gameharness$cutoff > 0)
-            || dx * dx + dy * dy + dz * dz >= gameharness$cutoff * gameharness$cutoff)) return;
-    NativeClient.INSTANCE.soundDelivered(category, dx, dy, dz, System.currentTimeMillis());
+    double dx = x - eye.x, dy = y - eye.y, dz = z - eye.z;
+    if (!SoundProjection.audible(
+        ((Source) (Object) this).isPlaying(), gameharness$gain, listener.getVolume(),
+        gameharness$relative, gameharness$linear, gameharness$cutoff, dx, dy, dz)) return;
+    long nativeNanos = System.nanoTime();
+    client.soundDelivered(streamId, kind, dx, dy, dz, System.currentTimeMillis(), nativeNanos);
   }
 }

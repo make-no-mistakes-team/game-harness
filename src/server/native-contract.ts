@@ -4,16 +4,16 @@ import path from "node:path";
 import { z } from "zod";
 import type { AdapterDescriptor, AdapterSchemaCatalog } from "../shared/contracts.ts";
 import { observationV3Schema } from "../shared/observations.ts";
-import { minecraftActionSchema, minecraftBlockRemovalFactSchema, minecraftEffectUncertaintyFactSchema, minecraftObservationDataSchema, minecraftProductionFactSchema,
-  minecraftProfileConfiguration, minecraftRecipesRequestSchema } from "../shared/minecraft.ts";
+import { minecraftActionSchema, minecraftBlockRemovalFactSchema, minecraftControllerFrameRequestSchema, minecraftEffectUncertaintyFactSchema, minecraftGuiTransactionFactSchema, minecraftObservationDataSchema, minecraftProductionFactSchema,
+  minecraftProfileConfiguration, minecraftRecipesRequestSchema, minecraftVisibleScreenRequestSchema } from "../shared/minecraft.ts";
 import { jsonSchema } from "../shared/primitives.ts";
 import { adapterCompatibility, contractHash } from "./adapter-contract.ts";
 
 export const NATIVE_CONTRACT_BUILD_INPUTS = [
   "native/minecraft/build.gradle", "native/minecraft/settings.gradle", "native/minecraft/gradlew",
   "package.json", "bun.lock", "scripts/build-native-contract.ts",
-  "src/shared/contracts.ts", "src/shared/control.ts", "src/shared/observations.ts", "src/shared/minecraft.ts", "src/shared/primitives.ts", "src/shared/adapter.ts",
-  "src/shared/validation.ts", "src/shared/programs.ts", "src/server/adapter-contract.ts", "src/server/native-contract.ts",
+  "src/shared/contracts.ts", "src/shared/control.ts", "src/shared/controller.ts", "src/shared/resident.ts", "src/shared/observations.ts", "src/shared/minecraft.ts", "src/shared/primitives.ts", "src/shared/adapter.ts",
+  "src/shared/validation.ts", "src/shared/programs.ts", "src/shared/video.ts", "src/server/adapter-contract.ts", "src/server/native-contract.ts",
   "src/server/minecraft-adapter.ts", "src/server/actor-frames.ts", "src/server/video.ts",
 ];
 export interface NativeBuildIdentity {
@@ -66,11 +66,14 @@ export function minecraftSchemaCatalog(): AdapterSchemaCatalog {
     observation: jsonSchema.parse(z.toJSONSchema(observationV3Schema)),
     payload: jsonSchema.parse(z.toJSONSchema(minecraftObservationDataSchema)),
     capabilities: {
-      "minecraft.action@1": jsonSchema.parse(z.toJSONSchema(minecraftActionSchema)),
+      "minecraft.action@4": jsonSchema.parse(z.toJSONSchema(minecraftActionSchema)),
       "minecraft.recipes@1": jsonSchema.parse(z.toJSONSchema(minecraftRecipesRequestSchema)),
+      "minecraft.visible_screen@1": jsonSchema.parse(z.toJSONSchema(minecraftVisibleScreenRequestSchema)),
+      "minecraft.controller_frame@2": jsonSchema.parse(z.toJSONSchema(minecraftControllerFrameRequestSchema)),
     },
     evidence: {
       "minecraft_item_production_v1@1": jsonSchema.parse(z.toJSONSchema(minecraftProductionFactSchema)),
+      "minecraft_gui_transaction_v1@1": jsonSchema.parse(z.toJSONSchema(minecraftGuiTransactionFactSchema)),
       "minecraft_block_removal_v1@1": jsonSchema.parse(z.toJSONSchema(minecraftBlockRemovalFactSchema)),
       "minecraft_effect_uncertainty_v1@1": jsonSchema.parse(z.toJSONSchema(minecraftEffectUncertaintyFactSchema)),
     },
@@ -85,13 +88,13 @@ export async function buildNativeContract(projectRoot: string): Promise<NativeCo
     adapter: { id: "fabric-owned-client", version: "1.0.0", build_hash: contractHash(buildInputs) },
     observation: { schema_version: 3, schema_hash: contractHash(schemas.observation),
       payload_schema: { id: "minecraft_observation_v1", version: 1, hash: contractHash(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_360_r8_v1", version: 1, configuration,
+      profile: { id: "minecraft_assisted_rgb_360_r8_control_v4", version: 4, configuration,
         configuration_hash: contractHash(configuration) } },
     capabilities: Object.entries(schemas.capabilities).map(([key, schema]) => {
       const separator = key.lastIndexOf("@");
       return { id: key.slice(0, separator), version: Number(key.slice(separator + 1)), schema_hash: contractHash(schema) };
     }),
-    actuator: "native", executable: { api_version: 4, validator_version: 4, runtime_version: 4 },
+    actuator: "native", executable: { api_version: 5, validator_version: 5, runtime_version: 5 },
   };
   const compatible = adapterCompatibility(descriptor, schemas);
   return { resource_schema: 1, build_inputs: buildInputs, descriptor: compatible.descriptor, schemas };

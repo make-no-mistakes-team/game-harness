@@ -2,15 +2,10 @@ import { Database, type SQLQueryBindings, type Statement } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
-  closeSync,
-  existsSync,
-  fsyncSync,
   mkdirSync,
-  openSync,
   readFileSync,
-  renameSync,
-  writeFileSync,
 } from "node:fs";
+import { open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { DeathEpisode, SavedDeathEpisode, ReadonlyDeathEpisode, ImprovementOpportunity, TraceInput, TracePage, TraceRecord, WorkingProgram } from "../shared/execution-evidence.ts";
 import type { SkillManager } from "./skills.ts";
@@ -36,6 +31,7 @@ import type {
 import { SKILL_API_VERSION } from "../shared/programs.ts";
 import type { EffectInvocation, EffectScope } from "../shared/control.ts";
 import { effectInvocationSchema, effectScopeSchema } from "../shared/control.ts";
+import { skillStartRequestSchema } from "../shared/validation.ts";
 
 export type StoredRun = Omit<
   RunView,
@@ -100,7 +96,7 @@ const terminalExecutions = new Set<SkillExecutionView["status"]>([
 
 /** Historical records retain null authority; decoding never upgrades them into active invocations. */
 function readExecutionView(encoded: string): SkillExecutionView {
-  return { session_id: null, life_id: null, world_id: null, native_boot_id: null, run_generation: null,
+  return { entry: null, session_id: null, life_id: null, world_id: null, native_boot_id: null, run_generation: null,
     space_epoch: null, source_hash: null, compatibility_hash: null, ...JSON.parse(encoded) };
 }
 function readActionView(encoded: string): ActionView {
@@ -134,6 +130,8 @@ export class Store {
   private readonly artifactDir: string;
   private readonly listeners = new Set<(event: ActivityEvent) => void>();
   private readonly traceObservers = new Set<(input: TraceInput) => void>();
+  private readonly sourcePreparations = new Map<string, Promise<void>>();
+  private closed = false;
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -424,6 +422,14 @@ export class Store {
     return event;
   }
 
+  appendEvents(runId: string | null, entries: readonly { type: string; summary: string; details: Json }[]): ActivityEvent[] {
+    const events = this.db.transaction(() =>
+      entries.map(entry => this.append(runId, entry.type, entry.summary, entry.details)),
+    )();
+    for (const event of events) this.notify(event);
+    return events;
+  }
+
   events(runId: string | null = null, after = 0, limit = 100): ActivityEvent[] {
     const cap = Math.max(1, Math.min(500, limit));
     const rows = runId
@@ -666,32 +672,72 @@ export class Store {
     }
   }
 
-  private saveSource(source: string): string {
+  private async saveSource(source: string): Promise<string> {
+    this.assertOpen();
     const hash = createHash("sha256").update(source).digest("hex");
+    const pending = this.sourcePreparations.get(hash);
+    if (pending) {
+      await pending;
+      return hash;
+    }
+    const preparation = this.prepareSource(hash, source);
+    this.sourcePreparations.set(hash, preparation);
+    try {
+      await preparation;
+      return hash;
+    } finally {
+      this.sourcePreparations.delete(hash);
+    }
+  }
+
+  private async prepareSource(hash: string, source: string): Promise<void> {
     const filename = path.join(this.artifactDir, `${hash}.js`);
-    if (existsSync(filename)) {
-      this.readSource(hash);
-    } else {
-      const temporary = path.join(
-        this.artifactDir,
-        `${hash}.${randomUUID()}.tmp`,
-      );
-      const fd = openSync(temporary, "wx", 0o600);
+    let existing: Buffer | undefined;
+    try {
+      existing = await readFile(filename);
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+    }
+    if (existing) {
+      if (createHash("sha256").update(existing).digest("hex") !== hash)
+        throw new Error("Stored artifact integrity check failed");
+      // A concurrent Store may have renamed these bytes but not yet synced the directory.
+      await this.syncArtifactDirectory();
+      return;
+    }
+    const temporary = path.join(this.artifactDir, `${hash}.${randomUUID()}.tmp`);
+    let temporaryCreated = false;
+    try {
+      const file = await open(temporary, "wx", 0o600);
+      temporaryCreated = true;
       try {
-        writeFileSync(fd, source, "utf8");
-        fsyncSync(fd);
+        await file.writeFile(source, "utf8");
+        await file.sync();
       } finally {
-        closeSync(fd);
+        await file.close();
       }
-      renameSync(temporary, filename);
-      const directory = openSync(this.artifactDir, "r");
-      try {
-        fsyncSync(directory);
-      } finally {
-        closeSync(directory);
+      await rename(temporary, filename);
+      await this.syncArtifactDirectory();
+    } finally {
+      if (temporaryCreated) {
+        await unlink(temporary).catch((error: unknown) => {
+          if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+        });
       }
     }
-    return hash;
+  }
+
+  private async syncArtifactDirectory(): Promise<void> {
+    const directory = await open(this.artifactDir, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  }
+
+  private assertOpen(): void {
+    if (this.closed) throw new Error("Store is closed");
   }
 
   private readSource(hash: string): string {
@@ -699,20 +745,25 @@ export class Store {
       throw new Error("Invalid stored artifact hash");
     const source = readFileSync(
       path.join(this.artifactDir, `${hash}.js`),
-      "utf8",
     );
     if (createHash("sha256").update(source).digest("hex") !== hash)
       throw new Error("Stored artifact integrity check failed");
-    return source;
+    return source.toString("utf8");
   }
 
-  registerPolicy(
+  async registerPolicy(
     runId: string,
     spec: PolicySpec,
     authoringTurn: number,
     validation: ActiveExecutableValidation,
-  ): PolicyView {
-    const hash = this.saveSource(spec.source);
+    beforeCommit?: () => void,
+  ): Promise<PolicyView> {
+    spec = structuredClone(spec);
+    validation = structuredClone(validation);
+    const hash = await this.saveSource(spec.source);
+    this.assertOpen();
+    beforeCommit?.();
+    this.assertOpen();
     let event: ActivityEvent | undefined;
     const policy = this.db.transaction(() => {
       const previous = this.db
@@ -819,12 +870,18 @@ export class Store {
     if (event) this.notify(event);
   }
 
-  registerSkill(
+  async registerSkill(
     runId: string,
     spec: SkillSpec & { validation: SkillView["validation"] },
     registration?: { call_id: string; input: Json },
-  ): SkillView {
-    const hash = this.saveSource(spec.source);
+    beforeCommit?: () => void,
+  ): Promise<SkillView> {
+    spec = structuredClone(spec);
+    if (registration) registration = structuredClone(registration);
+    const hash = await this.saveSource(spec.source);
+    this.assertOpen();
+    beforeCommit?.();
+    this.assertOpen();
     let event: ActivityEvent | undefined;
     const view = this.db.transaction(() => {
       if (registration) {
@@ -848,6 +905,7 @@ export class Store {
               .get(previous.skill_id)!.version + 1
           : 1,
         parent_version: previous?.version ?? null,
+        entry: spec.entry,
         name: spec.name,
         source: spec.source,
         hash,
@@ -892,12 +950,16 @@ export class Store {
     return view;
   }
 
-  importSkill(runId: string, view: SkillView): SkillView {
-    const hash = this.saveSource(view.source);
+  async importSkill(runId: string, view: SkillView, beforeCommit?: () => void): Promise<SkillView> {
+    view = structuredClone(view);
+    const hash = await this.saveSource(view.source);
     if (hash !== view.hash)
       throw new Error("Imported skill artifact hash does not match");
     if (view.state !== "validated")
       throw new Error("Imported skill must be freshly validated");
+    this.assertOpen();
+    beforeCommit?.();
+    this.assertOpen();
     let event: ActivityEvent | undefined;
     const imported = this.db.transaction(() => {
       if (!this.getRun(runId)) throw new Error("Run not found");
@@ -992,8 +1054,10 @@ export class Store {
     const selected = rows.slice(0, limit);
     return { records: selected.map((row) => {
       const value = JSON.parse(row.metadata) as SkillView;
-      return { name: row.name, version: row.version, purpose: value.card.purpose.slice(0, 200), state: value.state,
-        execution_compatible: value.validation.runtime_version === SKILL_API_VERSION, created_at: value.created_at,
+      return { name: row.name, version: row.version, entry: value.entry ?? null, purpose: value.card.purpose.slice(0, 200), state: value.state,
+        execution_compatible: !!value.entry && value.validation.runtime_version === SKILL_API_VERSION &&
+          value.validation.api_version === 5 && value.validation.validator_version === 5 &&
+          value.validation.compatibility_hash === this.getRun(runId)?.compatibility_hash, created_at: value.created_at,
         ...(value.card.purpose.length > 200 ? { purpose_omission: { reason: "catalog_summary", original_characters: value.card.purpose.length } } : {}) };
     }), next_after: selected.at(-1)?.seq ?? after, has_more: rows.length > limit, omissions: [] };
   }
@@ -1055,6 +1119,7 @@ export class Store {
     request: SkillStartRequest,
     lineage?: { parent_execution_id: string; root_execution_id: string },
   ): { view: SkillExecutionView; created: boolean } {
+    request = skillStartRequestSchema.parse(request);
     const requestText = canonical({
       run_id: runId,
       request,
@@ -1100,26 +1165,11 @@ export class Store {
       const skill = this.skill(runId, request);
       if (skill.state !== "validated")
         throw new Error("Skill is not validated");
-      if (skill.validation.runtime_version !== 4 || skill.validation.api_version !== 4 || skill.validation.validator_version !== 4 ||
+      if (skill.entry !== request.entry || (request.entry === "step" && lineage))
+        throw new Error("Selected entry cannot acquire this playing execution or child lineage");
+      if (skill.validation.runtime_version !== 5 || skill.validation.api_version !== 5 || skill.validation.validator_version !== 5 ||
         skill.validation.compatibility_hash !== request.compatibility_hash)
         throw new Error("Historical or incompatible executable validation is read-only");
-      const limits = request.limits;
-      if (
-        !request.start_key ||
-        !Number.isInteger(limits.duration_ms) ||
-        limits.duration_ms <= 0 ||
-        limits.duration_ms > 600000 ||
-        !Number.isInteger(limits.max_actions) ||
-        limits.max_actions <= 0 ||
-        limits.max_actions > 512 ||
-        !Number.isInteger(limits.max_calls) ||
-        limits.max_calls <= 0 ||
-        limits.max_calls > 2048 ||
-        !Number.isInteger(limits.max_depth) ||
-        limits.max_depth <= 0 ||
-        limits.max_depth > 8
-      )
-        throw new Error("Invalid skill start limits or key");
       const id = randomUUID();
       let root: SkillExecutionView | null = null;
       if (lineage) {
@@ -1132,6 +1182,9 @@ export class Store {
         if (
           !parent ||
           !root ||
+          request.entry !== "run" ||
+          parent.entry !== "run" ||
+          root.entry !== "run" ||
           parent.root_execution_id !== root.execution_id ||
           root.root_execution_id !== root.execution_id ||
           root.parent_execution_id !== null ||
@@ -1149,7 +1202,7 @@ export class Store {
           const next = this.skillExecution(runId, {
             execution_id: ancestor.parent_execution_id,
           });
-          if (!next || next.root_execution_id !== root.execution_id)
+          if (!next || next.entry !== "run" || next.root_execution_id !== root.execution_id)
             throw new Error("Invalid skill execution ancestry");
           ancestor = next;
           depth++;
@@ -1179,7 +1232,9 @@ export class Store {
         source_hash: skill.hash,
         compatibility_hash: request.compatibility_hash,
         args: request.args,
-        limits: root?.limits ?? request.limits,
+        ...(request.entry === "step"
+          ? { entry: "step" as const, limits: request.limits, initial_state: request.initial_state, resident: null }
+          : { entry: "run" as const, limits: root?.entry === "run" ? root.limits : request.limits }),
         status: "accepted",
         started_at: null,
         ended_at: null,
@@ -1296,6 +1351,8 @@ export class Store {
       });
       if (!previous) throw new Error("Skill execution not found in this run");
       const identity = (value: SkillExecutionView) => ({
+        entry: value.entry,
+        initial_state: value.entry === "step" ? value.initial_state : null,
         skill_id: value.skill_id,
         version: value.version,
         run_id: value.run_id,
@@ -1553,8 +1610,8 @@ export class Store {
     const executions = this.allSkillExecutions(runId);
     const candidates: WorkingProgram[] = [];
     for (const root of this.skills(runId)) {
-      if (root.state !== "validated" || root.validation.runtime_version !== SKILL_API_VERSION || root.validation.api_version !== 4 ||
-        root.validation.validator_version !== 4 || root.validation.compatibility_hash !== run.compatibility_hash) continue;
+      if (!root.entry || root.state !== "validated" || root.validation.runtime_version !== SKILL_API_VERSION || root.validation.api_version !== 5 ||
+        root.validation.validator_version !== 5 || root.validation.compatibility_hash !== run.compatibility_hash) continue;
       const skills: SkillView[] = [];
       const seen = new Set<string>();
       const visit = (ref: SkillRef): void => {
@@ -1562,8 +1619,8 @@ export class Store {
         if (seen.has(key)) return;
         seen.add(key);
         const skill = this.skill(runId, ref);
-        if (skill.state !== "validated" || skill.validation.runtime_version !== 4 || skill.validation.api_version !== 4 ||
-          skill.validation.validator_version !== 4 || skill.validation.compatibility_hash !== run.compatibility_hash)
+        if (!skill.entry || skill.state !== "validated" || skill.validation.runtime_version !== 5 || skill.validation.api_version !== 5 ||
+          skill.validation.validator_version !== 5 || skill.validation.compatibility_hash !== run.compatibility_hash)
           throw new Error("Working dependency has incompatible executable validation");
         for (const dependency of skill.dependencies) visit(dependency);
         skills.push(skill);
@@ -1591,8 +1648,8 @@ export class Store {
     if (!run || run.model_id !== modelId || run.session_id !== sessionId) throw new Error("Working library scope does not match run");
     const imported = new Map<string, SkillView>();
     for (const candidate of this.workingPrograms(modelId, sessionId)) {
-      if (candidate.skills.some((skill) => skill.validation.runtime_version !== SKILL_API_VERSION || skill.validation.api_version !== 4 ||
-        skill.validation.validator_version !== 4 || skill.validation.compatibility_hash !== run.compatibility_hash)) {
+      if (candidate.skills.some((skill) => !skill.entry || skill.validation.runtime_version !== SKILL_API_VERSION || skill.validation.api_version !== 5 ||
+        skill.validation.validator_version !== 5 || skill.validation.compatibility_hash !== run.compatibility_hash)) {
         this.event(runId, "skill.working_incompatible", "Retained working sources use an incompatible API/schema/profile contract and were not imported", {
           source_run_id: candidate.source_run_id, skill_api: SKILL_API_VERSION,
         });
@@ -1607,6 +1664,8 @@ export class Store {
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.listeners.clear();
     this.traceObservers.clear();
     this.db.close();

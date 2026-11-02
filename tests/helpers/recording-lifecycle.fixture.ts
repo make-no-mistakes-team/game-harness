@@ -1,4 +1,5 @@
 import { mock } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { fstatSync } from "node:fs";
 import * as processes from "node:child_process";
@@ -66,7 +67,8 @@ try {
     } }));
     // Intentional loading boundary: observe real owned spawn/handles only after
     // installing the subprocess-local seams; capture/encoding remain real.
-    const { EpisodeRecorder } = await import("../../src/server/recording.ts");
+    const recording = await import("../../src/server/recording.ts");
+    const { EpisodeRecorder } = recording;
     let deliver: ((frame: Uint8Array) => void) | undefined;
     const failures: string[] = [];
     const recorder = new EpisodeRecorder({ directory,
@@ -86,6 +88,17 @@ try {
       result = { manifest, durableManifest, finishError, failures, handles: handleState(),
         index: await fs.readFile(join(directory, "frames.jsonl"), "utf8"),
         png: [...(await fs.readFile(join(directory, "frame-000001.png"))).subarray(0, 8)] };
+    } else if (mode === "detached-replaced-concat") {
+      if (finishError) throw new Error(`Unexpected capture failure: ${finishError.message}`);
+      const concatSha256 = createHash("sha256").update(await fs.readFile(join(directory, "replay.ffconcat"))).digest("hex");
+      await fs.writeFile(join(directory, "replay.ffconcat"),
+        `ffconcat version 1.0\nfile '${join(directory, "frame-000001.png")}'\nduration 0.1\n`);
+      let error: string | null = null;
+      try { await recording.renderEpisodeReplay({ directory, concatSha256, timeoutMs: 1500 }); }
+      catch (failure) { error = String(failure); }
+      let replayExists = false;
+      try { await fs.access(join(directory, "replay.mp4")); replayExists = true; } catch {}
+      result = { error, spawned: child !== undefined, replayExists, manifest };
     } else {
       if (finishError) throw new Error(`Unexpected capture failure: ${finishError.message}`);
       const bin = join(directory, "bin"); await fs.mkdir(bin);

@@ -1,5 +1,5 @@
 import type { SkillView, SkillExecutionView } from "./programs.ts";
-import type { EffectOwnerRef, EffectScope, EffectEnvelope, EffectInvocation, SpaceRef, ScreenRef } from "./control.ts";
+import type { EffectOwnerRef, EffectScope, EffectEnvelope, EffectInvocation, EffectScreenPrecondition, SpaceRef, ScreenRef } from "./control.ts";
 import type { AdapterActorProjection, ObservationV3 } from "./observations.ts";
 export type { ObservationV3 } from "./observations.ts";
 
@@ -30,7 +30,7 @@ export interface AdapterDescriptor {
   };
   capabilities: { id: string; version: number; schema_hash: Sha256 }[];
   actuator: "native" | "desktop";
-  executable: { api_version: 4; validator_version: 4; runtime_version: 4 };
+  executable: { api_version: 5; validator_version: 5; runtime_version: 5 };
 }
 export interface AdapterBinding {
   ready: boolean;
@@ -41,7 +41,7 @@ export interface AdapterBinding {
 export type ProgramCompatibility = Pick<AdapterBinding, "descriptor" | "compatibility_hash">;
 /** Inspect-only pre-cutover cache metadata; never accepted by executable admission. */
 export interface HistoricalExecutableValidation {
-  runtime_version: 1 | 2 | 3;
+  runtime_version: 1 | 2 | 3 | 4;
   fingerprint: string;
   api_version?: number;
   validator_version?: number;
@@ -51,9 +51,9 @@ export interface HistoricalExecutableValidation {
   nesting?: number;
 }
 export interface ActiveExecutableValidation {
-  api_version: 4;
-  validator_version: 4;
-  runtime_version: 4;
+  api_version: 5;
+  validator_version: 5;
+  runtime_version: 5;
   compatibility_hash: Sha256;
   fingerprint: Sha256;
   formatted_lines: number;
@@ -101,12 +101,17 @@ export interface VerificationResult {
 export interface RuntimeAdapter {
   readonly descriptor: AdapterDescriptor;
   readonly schemas: AdapterSchemaCatalog;
+  /** Trusted in-process predicates after JSON Schema validation; never serialized into the descriptor/catalog. */
+  readonly capabilityValidators?: Readonly<Record<string, (args: Json) => boolean>>;
   readonly goals: readonly AdapterGoal[];
   readonly goalChoices?: readonly GoalChoice[];
   readonly action_capability: { id: string; version: number } | null;
   readonly supports_respawn: boolean;
-  readonly bindings: readonly { name: string; capability_id: string; version: number; parameters: readonly string[] }[];
+  readonly bindings: readonly { name: string; capability_id: string; version: number; parameters: readonly string[];
+    result?: { type: string; schema: Json } }[];
   effectDeadlineMs(action: Json): number;
+  /** Adapter-owned admission selection; application-time layout/local predicates remain native. */
+  screenPrecondition?(action: Json, screen: ScreenRef | null): EffectScreenPrecondition;
   projectObservation(observation: ObservationV3, previous?: ObservationV3 | null): AdapterActorProjection;
   captureBaseline(goal: AdapterGoal, observation: ObservationV3): Json;
   verifyCompletion(manifest: VerificationManifest, events: readonly AdapterEvidence[]): VerificationResult;
@@ -259,6 +264,13 @@ export interface GameBridge {
   emergencyStop(reason: string): Promise<void>;
   adapter(): RuntimeAdapter | null;
   queryCapability?(id: string, version: number, args: Json): Promise<Json>;
+  openController?(
+    reservation: import("./controller.ts").ControllerReservation,
+    controllerGeneration: number,
+    deadlineHostMs: number,
+    applied: (ack: import("./controller.ts").InputAppliedAck) => void,
+    effect: (update: import("./controller.ts").ControllerEffectUpdate) => void,
+  ): Promise<import("./controller.ts").ControllerInputChannel>;
   subscribe(listener: (notice: BridgeNotice) => void): () => void;
 }
 

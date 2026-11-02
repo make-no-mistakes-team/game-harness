@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EpisodeRecorder } from "../src/server/recording.ts";
@@ -50,6 +50,115 @@ test("recorder writes every delivered PNG and nonuniform capture timeline includ
   expect(manifest.limitations.join(" ")).toMatch(/upstream|producer/i);
 });
 
+test("invalid recording limits reject before subscribing or allocating artifacts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "gameharness-invalid-recording-")); roots.push(root);
+  for (const [ordinal, limits] of [
+    { maxFrames: 0 }, { maxFrames: -1 }, { maxFrames: 1.5 }, { maxFrames: Number.NaN },
+    { maxDurationMs: Infinity }, { maxStoredFrameBytes: Number.MAX_SAFE_INTEGER + 1 },
+    { maxPendingRawBytes: 512 * 1024 ** 2 + 1 }, { unexpected: 1 },
+  ].entries()) {
+    let subscriptions = 0;
+    const directory = join(root, String(ordinal));
+    let recorder: EpisodeRecorder | undefined;
+    try {
+      expect(() => {
+        recorder = new EpisodeRecorder({ directory, identity, onIncomplete() {}, limits,
+          bridge: { subscribeFrames() { subscriptions++; return () => {}; } } });
+      }).toThrow();
+      expect(subscriptions).toBe(0);
+      await expect(stat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (recorder) await recorder.finish({ endedAt: Date.now(), reason: "test_cleanup" });
+    }
+  }
+});
+
+test("health reports accepted raw backlog and peaks while two real PNG encodes are blocked", async () => {
+  const gate = Promise.withResolvers<void>(), bothEntered = Promise.withResolvers<void>();
+  let entered = 0;
+  const limits = { maxFrames: 3, maxPendingRawBytes: 1032, maxStoredFrameBytes: 4096, maxDurationMs: 5000 };
+  const f = await fixture({ limits, encode: async (frame: Uint8Array, receivedAt: number) => {
+    if (++entered === 2) bothEntered.resolve();
+    await gate.promise;
+    return await encodeNativeFramePng(frame, receivedAt);
+  } });
+  for (let sequence = 1; sequence <= 3; sequence++) f.emit(sequence, 10000 + (sequence - 1) * 50);
+  await bothEntered.promise;
+  let finished = false;
+  try {
+    expect(f.recorder.health()).toMatchObject({ accepting: true, delivered_frames: 3, stored_frames: 0,
+      pending_raw_bytes: 1032, peak_pending_raw_bytes: 1032, active_encoders: 2, queued_frames: 1, stored_png_bytes: 0, failures: [] });
+    const snapshot = f.recorder.health();
+    snapshot.failures.push("caller_mutation");
+    expect(f.recorder.health().failures).toEqual([]);
+    const finish = f.recorder.finish({ endedAt: 10800, reason: "operator_stop" })
+      .then(value => { finished = true; return value; });
+    await Promise.resolve();
+    expect(finished).toBe(false);
+    gate.resolve();
+    const manifest = await finish;
+    const pngNames = (await readdir(f.directory)).filter(name => name.endsWith(".png"));
+    let actualBytes = 0;
+    for (const name of pngNames) actualBytes += (await stat(join(f.directory, name))).size;
+    expect(actualBytes).toBeGreaterThan(0);
+    expect(manifest).toMatchObject({ schema_version: 1, limits,
+      timing: { first_capture_at: 10000, last_capture_at: 10100, ended_at: 10800,
+        capture_duration_ms: 100, final_hold_ms: 700 },
+      health: { accepting: false, delivered_frames: 3, stored_frames: 3, pending_raw_bytes: 0,
+        peak_pending_raw_bytes: 1032, active_encoders: 0, queued_frames: 0, stored_png_bytes: actualBytes, failures: [] } });
+    expect(f.recorder.health()).toEqual(manifest.health);
+    expect(JSON.parse(await readFile(join(f.directory, "recording-manifest.json"), "utf8"))).toEqual(manifest);
+  } finally {
+    gate.resolve();
+    await f.recorder.finish({ endedAt: 10800, reason: "operator_stop" });
+  }
+});
+
+test("stored PNG bytes count only successful durable files when artifact creation fails", async () => {
+  const gate = Promise.withResolvers<void>();
+  const f = await fixture({ encode: async (frame: Uint8Array, receivedAt: number) => {
+    await gate.promise;
+    return await encodeNativeFramePng(frame, receivedAt);
+  } });
+  // A pre-existing artifact makes the exclusive durable creation fail.
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(join(f.directory, "frame-000001.png"), "collision", { flag: "wx" });
+  f.emit(1, 10000);
+  gate.resolve();
+  const manifest = await f.recorder.finish({ endedAt: 10100, reason: "operator_stop" });
+  expect(manifest).toMatchObject({ status: "incomplete", stored_frames: 0,
+    health: { stored_png_bytes: 0, pending_raw_bytes: 0, active_encoders: 0 },
+    timing: { first_capture_at: null, last_capture_at: null, ended_at: 10100,
+      capture_duration_ms: null, final_hold_ms: null } });
+  expect(manifest.failures).toContain("frame_encoder_or_persistence_failed");
+});
+
+test("exact frame and stored byte limits admit the boundary before recording the first overrun", async () => {
+  const frame = nativeFrame({ sequence: 1, capturedAt: 10000 });
+  const pngBytes = (await encodeNativeFramePng(frame, 10010)).png.length;
+  for (const limits of [{ maxFrames: 1 }, { maxStoredFrameBytes: pngBytes }]) {
+    const f = await fixture({ limits });
+    f.emit(1, 10000, 10010, frame);
+    f.emit(2, 10010);
+    const manifest = await f.recorder.finish({ endedAt: 10100, reason: "operator_stop" });
+    expect(manifest).toMatchObject({ status: "incomplete", delivered_frames: 2, stored_frames: 1,
+      health: { pending_raw_bytes: 0, stored_png_bytes: pngBytes } });
+    expect(manifest.failures).toContain("maxFrames" in limits
+      ? "delivered_frame_count_bound_reached" : "stored_frame_byte_bound_reached");
+  }
+});
+
+test("capture duration admits the exact receipt boundary and rejects the next millisecond explicitly", async () => {
+  const f = await fixture({ limits: { maxDurationMs: 50 } });
+  f.emit(1, 10000, 10050);
+  f.emit(2, 10001, 10051);
+  const manifest = await f.recorder.finish({ endedAt: 10100, reason: "operator_stop" });
+  expect(manifest).toMatchObject({ status: "incomplete", delivered_frames: 2, stored_frames: 1,
+    health: { pending_raw_bytes: 0 } });
+  expect(manifest.failures).toContain("episode_duration_bound_reached");
+  expect((await index(f.directory, manifest.index)).filter(record => record.kind === "frame")).toHaveLength(1);
+});
+
 test("interruption drains accepted encodes before durable finalization without rendering replay", async () => {
   const gate = Promise.withResolvers<void>();
   const f = await fixture({ encode: async (frame: Uint8Array, receivedAt: number) => {
@@ -65,6 +174,27 @@ test("interruption drains accepted encodes before durable finalization without r
   expect(manifest.end_reason).toBe("interrupted");
   expect((await index(f.directory, manifest.index)).filter(record => record.kind === "frame")).toHaveLength(1);
   expect((await readdir(f.directory)).some(name => name.endsWith(".mp4"))).toBe(false);
+});
+
+test("recorder retains exact packet capture diagnostics without synchronizing actor observations", async () => {
+  const f = await fixture(), packet = nativeFrame({ capturedAt: 10000 });
+  const view = new DataView(packet.buffer);
+  view.setBigInt64(32, 9007199254740993n, true);
+  view.setBigInt64(40, 9007199254740999n, true);
+  view.setBigInt64(48, 9007199254740991n, true);
+  view.setBigUint64(72, 41n, true);
+  view.setFloat64(96, 12.5, true);
+  view.setFloat32(132, 1, true);
+  view.setUint32(312, 1, true);
+  f.emit(1, 10000, 10010, packet);
+  const manifest = await f.recorder.finish({ endedAt: 10100, reason: "operator_stop" });
+  const records = await index(f.directory, manifest.index);
+  expect(records.find(record => record.kind === "frame")).toMatchObject({
+    captured_at: 10000, png_orientation: "top_down",
+    capture: { schema_version: 1, readback_started_ns: "9007199254740993",
+      readback_finished_ns: "9007199254740999", life_id: 41,
+      render: { sampled_ns: "9007199254740991", position: { x: 12.5, y: 0, z: 0 } } },
+  });
 });
 
 test("finish drains a later delivery burst after the first burst has already persisted", async () => {
@@ -100,10 +230,10 @@ test("finish drains a later delivery burst after the first burst has already per
 
 test("queue overflow returns from delivery synchronously and fails the attempt visibly without silent drops", async () => {
   const gate = Promise.withResolvers<void>();
-  const f = await fixture({ limits: { maxPendingRawBytes: 48 }, encode: async (frame: Uint8Array, receivedAt: number) => {
+  const f = await fixture({ limits: { maxPendingRawBytes: 344 }, encode: async (frame: Uint8Array, receivedAt: number) => {
     await gate.promise; return await encodeNativeFramePng(frame, receivedAt);
   } });
-  // Each 2x2 packet owns 48 bytes including its header; accepting the next would exceed the queue bound.
+  // Each 2x2 packet owns 344 bytes including its header; accepting the next would exceed the queue bound.
   f.emit(1, 10000); f.emit(2, 10010);
   expect(f.incomplete.length).toBe(1);
   expect(f.incomplete[0]).toMatch(/queue|pending/i);

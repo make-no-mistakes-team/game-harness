@@ -9,16 +9,15 @@ import net.minecraft.client.gl.Framebuffer;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.opengl.*;
 
-/** Three fixed buffers: render never waits for the network; writer only consumes latest. */
+/** Three fixed buffers: brief stalls retain FIFO; saturation replaces only the oldest pending. */
 public final class Video {
-  private final ByteBuffer[] buffers = new ByteBuffer[3];
+  private final ByteBuffer[] buffers = new ByteBuffer[VideoFrameQueue.CAPACITY];
   private final byte[] transfer = new byte[65536];
-  private final Object lock = new Object();
-  private int ready = -1, writing = -1, sequence;
+  private final VideoFrameQueue queue = new VideoFrameQueue();
+  private int sequence;
   private long nextCapture, renderStarted, renderCalls;
   private volatile boolean running = true;
   private volatile long captured,
-      replaced,
       writeCount,
       readbackNanos,
       readbackMaxNanos,
@@ -32,20 +31,21 @@ public final class Video {
         "render_fps",
         renderStarted == 0 ? 0 : renderCalls * 1e9 / (System.nanoTime() - renderStarted));
     m.addProperty("captured_frames", captured);
-    m.addProperty("latest_queue_replacements", replaced);
+    m.addProperty("latest_queue_replacements", queue.replacements());
     m.addProperty("written_frames", writeCount);
     m.addProperty("readback_mean_ms", captured == 0 ? 0 : readbackNanos / 1e6 / captured);
     m.addProperty("readback_max_ms", readbackMaxNanos / 1e6);
     m.addProperty("write_mean_ms", writeCount == 0 ? 0 : writeNanos / 1e6 / writeCount);
     m.addProperty("write_max_ms", writeMaxNanos / 1e6);
-    m.addProperty("fixed_frame_buffer_bytes", 3L * (32 + 1920 * 1080 * 4));
+    m.addProperty("fixed_frame_buffer_bytes", (long) VideoFrameQueue.CAPACITY * (NativeRenderSnapshot.HEADER_BYTES + 1920 * 1080 * 4));
     return m;
   }
 
   public Video(JsonObject config) {
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < buffers.length; i++)
       buffers[i] =
-          BufferUtils.createByteBuffer(32 + 1920 * 1080 * 4).order(ByteOrder.LITTLE_ENDIAN);
+          BufferUtils.createByteBuffer(NativeRenderSnapshot.HEADER_BYTES + 1920 * 1080 * 4)
+              .order(ByteOrder.LITTLE_ENDIAN);
     Thread writer = new Thread(() -> write(config), "gameharness-video");
     writer.setDaemon(true);
     writer.start();
@@ -60,14 +60,8 @@ public final class Video {
       out.write(
           (NativeClient.hello(config) + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
       while (running) {
-        int index;
-        synchronized (lock) {
-          while (ready < 0 && running) lock.wait();
-          if (!running) return;
-          index = ready;
-          ready = -1;
-          writing = index;
-        }
+        int index = queue.take();
+        if (index < 0) return;
         ByteBuffer frame = buffers[index];
         frame.position(0);
         long writeStarted = System.nanoTime();
@@ -80,16 +74,18 @@ public final class Video {
         writeNanos += writeDuration;
         writeMaxNanos = Math.max(writeMaxNanos, writeDuration);
         writeCount++;
-        synchronized (lock) {
-          writing = -1;
-        }
+        queue.release(index);
       }
     } catch (Exception error) {
+      if (error instanceof InterruptedException) Thread.currentThread().interrupt();
+    } finally {
       running = false;
+      queue.close();
     }
   }
 
-  public void capture() {
+  public void capture(NativeRenderSnapshot snapshot, long clientTick, long lifeId, long spaceEpoch,
+      long generation, EffectAuthority.Screen tailScreen) {
     long now = System.nanoTime();
     if (!running) return;
     MinecraftClient client = MinecraftClient.getInstance();
@@ -104,26 +100,11 @@ public final class Video {
     Framebuffer f = client.getFramebuffer();
     int w = f.textureWidth, h = f.textureHeight;
     if (w < 1 || h < 1 || w > 1920 || h > 1080) return;
-    int index = -1;
-    synchronized (lock) {
-      for (int i = 0; i < 3; i++)
-        if (i != writing && i != ready) {
-          index = i;
-          break;
-        }
-    }
+    int index = queue.acquire();
     if (index < 0) return;
     ByteBuffer frame = buffers[index];
     frame.clear();
-    frame.limit(32 + w * h * 4);
-    frame
-        .putInt(0x47485631)
-        .putInt(w)
-        .putInt(h)
-        .putInt(w * h * 4)
-        .putInt(++sequence)
-        .putInt(1)
-        .putDouble(System.currentTimeMillis());
+    frame.limit(NativeRenderSnapshot.HEADER_BYTES + w * h * 4);
     int read = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING),
         pack = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING),
         align = GL11.glGetInteger(GL11.GL_PACK_ALIGNMENT),
@@ -131,6 +112,8 @@ public final class Video {
         skipRows = GL11.glGetInteger(GL11.GL_PACK_SKIP_ROWS),
         skipPixels = GL11.glGetInteger(GL11.GL_PACK_SKIP_PIXELS);
     long readbackStarted = System.nanoTime();
+    snapshot.header(frame, w, h, ++sequence, System.currentTimeMillis(), readbackStarted,
+        clientTick, lifeId, spaceEpoch, generation, tailScreen);
     try {
       GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, f.fbo);
       GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
@@ -147,15 +130,13 @@ public final class Video {
       GL11.glPixelStorei(GL11.GL_PACK_SKIP_ROWS, skipRows);
       GL11.glPixelStorei(GL11.GL_PACK_SKIP_PIXELS, skipPixels);
     }
-    long readbackDuration = System.nanoTime() - readbackStarted;
+    long readbackFinished = System.nanoTime();
+    snapshot.finished(frame, readbackFinished);
+    long readbackDuration = readbackFinished - readbackStarted;
     readbackNanos += readbackDuration;
     readbackMaxNanos = Math.max(readbackMaxNanos, readbackDuration);
     captured++;
     frame.position(0);
-    synchronized (lock) {
-      if (ready >= 0) replaced++;
-      ready = index;
-      lock.notifyAll();
-    }
+    queue.publish(index);
   }
 }

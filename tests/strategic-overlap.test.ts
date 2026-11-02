@@ -176,9 +176,9 @@ for (const selectedKind of ["lookahead", "attention"] as const) {
       }, unsafe: () => { f.state.pauses.push("Unconfirmed cleanup"); },
     });
     managers.push(manager);
-    const program = await manager.register(f.run.run_id, { name: "Neutral continued program", source: 'await game.action({kind:"look",yaw:0,pitch:0}); await game.action({kind:"look",yaw:1,pitch:0}); return {status:"completed",summary:"Neutral flow settled",result:null};',
+    const program = await manager.register(f.run.run_id, { entry: "run", name: "Neutral continued program", source: 'await game.action({kind:"look",yaw:0,pitch:0}); await game.action({kind:"look",yaw:1,pitch:0}); return {status:"completed",summary:"Neutral flow settled",result:null};',
       card: { purpose: "Measure selected attention", applicability: "Neutral fixture", method: "Two authorized capabilities", reason: "Prove root handoff", limitations: "No gameplay claim" }, dependencies: [] });
-    const root = manager.start(f.run.run_id, { skill_id: program.skill_id, version: program.version, start_key: "continued", ...executionScopeFixture(f.run), args: null,
+    const root = manager.start(f.run.run_id, { entry: "run", skill_id: program.skill_id, version: program.version, start_key: "continued", ...executionScopeFixture(f.run), args: null,
       limits: { duration_ms: 10000, max_actions: 2, max_calls: 2, max_depth: 1 },
       ...(selectedKind === "lookahead" ? { lookahead: { after_ms: 0, reason: "Independent selected follow-up", budget: { calls: 1, tools: 2, duration_ms: 5000 } } } : {}) });
     rootId = root.execution_id; f.planner.admitted(); await first.promise;

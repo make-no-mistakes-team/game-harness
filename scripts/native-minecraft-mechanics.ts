@@ -378,17 +378,55 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
   const selected = take("--case") ?? "basic";
   const mode = take("--mode") ?? "baseline";
   const stageSelection = take("--stages");
-  const probeStages = mode==="fixed" && stageSelection===undefined ? fixedMechanicalProbeStages : selectMechanicalProbeStages(stageSelection);
-  requireProof(["basic", "tool", "stone", "repair", "approach", "inventory"].includes(selected) && ["baseline","fixed"].includes(mode) &&
-    (selected === "approach" || !args.includes("--mode") && stageSelection === undefined) && flags.every(flag => flag === "--allow-native"),
-    "Only --allow-native --jar and --case basic|tool|stone|repair|approach|inventory are supported; approach accepts --mode baseline|fixed and --stages, no inference");
+  const probeStages = selected !== "approach" ? mechanicalProbeStages
+    : mode==="fixed" && stageSelection===undefined ? fixedMechanicalProbeStages : selectMechanicalProbeStages(stageSelection);
+  requireProof(["basic", "tool", "stone", "repair", "approach", "inventory", "world-input", "visible-gui", "sensing", "controller-stream", "resident"].includes(selected) && ["baseline","fixed"].includes(mode) &&
+    (selected === "approach" || !args.includes("--mode")) &&
+    (selected === "approach" || selected === "visible-gui" || stageSelection === undefined) &&
+    flags.every(flag => flag === "--allow-native"),
+    "Pass --allow-native --jar and --case basic|tool|stone|repair|approach|inventory|world-input|visible-gui|sensing|controller-stream|resident; approach accepts --mode and --stages, visible-gui accepts --stages, no inference");
   requireProof(mode==="fixed" || probeStages.every(stage => mechanicalProbeStages.some(known=>known===stage)), "Additional negative stages require --mode fixed");
   requireProof(!probeStages.includes("replacement-stale") || probeStages.includes("replacement"), "replacement-stale requires replacement in the same selected proof");
   const artifact = assertNativeArtifactFresh(project, jar);
   process.env.GAMEHARNESS_NATIVE_PROOF = "1";
   process.env.GAMEHARNESS_PROOF_EXPECTED_JAR_SHA256 = artifact.sha256;
-  const caps = createEvaluationCaps({ runMs: selected === "inventory" ? 180_000 : 90_000,
-    totalMs: selected === "inventory" ? 480_000 : 300_000, hostRequestAdmissions: 3 });
+  const caps = createEvaluationCaps({ runMs: selected === "inventory" || selected === "visible-gui" ? 180_000 : 90_000,
+    totalMs: selected === "visible-gui" ? 900_000 : selected === "inventory" ? 480_000 : 300_000, hostRequestAdmissions: 3 });
+  if (selected === "resident") {
+    const { runNativeResidentFixture } = await import("./native-resident.ts");
+    const fixture = await runNativeResidentFixture(project, caps);
+    console.log(JSON.stringify({ pass: fixture.report.pass, cleanup: fixture.report.cleanup,
+      report: path.join(fixture.evidenceDirectory, "report.json"), actual_provider_calls: 0 }, null, 2));
+    return;
+  }
+  if (selected === "controller-stream") {
+    const { runNativeControllerStreamFixture } = await import("./native-controller-stream.ts");
+    const fixture = await runNativeControllerStreamFixture(project, caps);
+    console.log(JSON.stringify({ pass: fixture.report.pass, cleanup: fixture.report.cleanup,
+      report: path.join(fixture.evidenceDirectory, "report.json"), actual_provider_calls: 0 }, null, 2));
+    return;
+  }
+  if (selected === "sensing") {
+    const { runNativeSensingFixture } = await import("./native-sensing.ts");
+    const fixture = await runNativeSensingFixture(project, caps);
+    console.log(JSON.stringify({ pass: fixture.report.pass, cleanup: fixture.report.cleanup,
+      report: path.join(fixture.evidenceDirectory, "report.json"), actual_provider_calls: 0 }, null, 2));
+    return;
+  }
+  if (selected === "visible-gui") {
+    const { runNativeVisibleGuiFixture, selectVisibleGuiCases } = await import("./native-visible-gui.ts");
+    const fixture = await runNativeVisibleGuiFixture(project, caps, selectVisibleGuiCases(stageSelection));
+    console.log(JSON.stringify({ pass: fixture.report.pass, cleanup: fixture.report.cleanup,
+      report: path.join(fixture.evidenceDirectory, "report.json"), actual_provider_calls: 0 }, null, 2));
+    return;
+  }
+  if (selected === "world-input") {
+    const { runNativeWorldInputFixture } = await import("./native-world-input.ts");
+    const fixture = await runNativeWorldInputFixture(project, caps);
+    console.log(JSON.stringify({ pass: fixture.report.pass, cleanup: fixture.report.cleanup,
+      report: path.join(fixture.evidenceDirectory, "report.json"), actual_provider_calls: 0 }, null, 2));
+    return;
+  }
   const fixture = await NativeFixture.create("native-minecraft-mechanics", { projectRoot: project, caps });
   let runtime: Runtime | undefined, store: Store | undefined, sandbox: SandboxService | undefined, recorder: EpisodeRecorder | undefined;
   let failure: unknown, runId: string | undefined;

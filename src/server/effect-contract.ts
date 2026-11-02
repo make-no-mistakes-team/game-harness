@@ -1,6 +1,6 @@
 import type { ActiveExecutableValidation, AdapterBinding, Json } from "../shared/contracts.ts";
 import type { EffectEnvelope, EffectInvocation, EffectScope, ScreenRef } from "../shared/control.ts";
-import { effectEnvelopeSchema, sameEffectScope, sameScreen } from "../shared/control.ts";
+import { effectEnvelopeSchema, sameEffectScope, screenPreconditionMatches } from "../shared/control.ts";
 import { activeExecutableValidationSchema } from "../shared/adapter.ts";
 import { jsonSchema } from "../shared/primitives.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
@@ -34,7 +34,7 @@ export function assertCurrentEffect(value: unknown, expected: {
     (envelope.invocation.kind === "policy" && (invocation.kind !== "policy" ||
       envelope.invocation.policy_id !== invocation.policy_id || envelope.invocation.version !== invocation.version)))
     throw new RuntimeFault("invalid_authority", "Effect invocation does not match the active host-created source owner");
-  if (!sameScreen(envelope.expected_screen, expected.screen))
+  if (!screenPreconditionMatches(envelope.expected_screen, expected.screen))
     throw new RuntimeFault("stale_context", "Effect expected a replaced or revised screen instance");
   return envelope;
 }

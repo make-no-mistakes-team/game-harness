@@ -1,6 +1,6 @@
 import type { Json } from "../shared/contracts.ts";
 import type { SkillExecutionView } from "../shared/programs.ts";
-import { minecraftObservationV3Schema } from "../shared/minecraft.ts";
+import { confirmedMinecraftGuiTransactions, minecraftObservationV3Schema } from "../shared/minecraft.ts";
 import type { PromotionDeclaration } from "./experience.ts";
 import type { Store, StoredAction, StoredRun } from "./store.ts";
 import { minecraftGoalBaselineSchema, minecraftInventoryCounts, eligibleMinecraftWood } from "./minecraft-adapter.ts";
@@ -8,7 +8,15 @@ import { minecraftGoalBaselineSchema, minecraftInventoryCounts, eligibleMinecraf
 function record(value: Json | undefined): Record<string, Json> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
+function guiTransactions(action: StoredAction) {
+  return confirmedMinecraftGuiTransactions(action.request, action.view.result?.evidence);
+}
 function inventoryGain(action: StoredAction, item: string): number {
+  if (action.request.kind === "screen_input") {
+    let gain = 0;
+    for (const fact of guiTransactions(action)) gain += (fact.inventory_after[item] ?? 0) - (fact.inventory_before[item] ?? 0);
+    return Number.isSafeInteger(gain) ? gain : 0;
+  }
   const evidence = record(action.view.result?.evidence);
   if (evidence?.inventory_receipt_confirmed !== true) return 0;
   const before = record(evidence.inventory_before), after = record(evidence.inventory_after);
@@ -25,6 +33,8 @@ export function qualifyMinecraftExperience(store: Store, run: StoredRun, executi
   if (baseline.world_id !== run.world_id || baseline.session_id !== run.session_id || baseline.epoch !== run.epoch ||
     baseline.native_boot_id !== run.native_boot_id) throw new Error("Qualification baseline does not match its actual run/session");
   const details = record(selected.details), baselineCounts = baseline.inventory;
+  const crafting = declaration.predicate.kind === "goal_verified" &&
+    ["craft_crafting_table", "craft_stone_pickaxe", "collect_and_craft_table"].includes(run.goal.goal_id);
   const removal = declaration.predicate.kind === "break_log" || declaration.predicate.kind === "goal_verified" && run.goal.goal_id === "break_log";
   let item = "", minGain = 1;
   if (declaration.predicate.kind === "goal_verified") {
@@ -69,10 +79,17 @@ export function qualifyMinecraftExperience(store: Store, run: StoredRun, executi
         typeof native.target_name === "string" && eligibleMinecraftWood(native.target_name) &&
         (declaration.predicate.kind !== "break_log" || id === details?.action_id);
       let gain = 0;
-      if (item) gain = inventoryGain(action, item);
+      if (crafting) {
+        if (action.request.kind === "craft" && action.request.item === item) gain = inventoryGain(action, item);
+        else if (action.request.kind === "screen_input") {
+          for (const fact of guiTransactions(action)) for (const production of fact.productions)
+            if (production.producer === "crafting" && production.production_confirmed && production.item === item) gain += production.count;
+        }
+      } else if (item) gain = inventoryGain(action, item);
       else {
-        const after = record(native.inventory_after);
-        for (const name of Object.keys(after ?? {})) if (run.goal.goal_id === "obtain_stone" ? name === "stone" || name === "cobblestone" : eligibleMinecraftWood(name))
+        const names = action.request.kind === "screen_input" ? new Set(guiTransactions(action).flatMap(fact => Object.keys(fact.inventory_after)))
+          : Object.keys(record(native.inventory_after) ?? {});
+        for (const name of names) if (run.goal.goal_id === "obtain_stone" ? name === "stone" || name === "cobblestone" : eligibleMinecraftWood(name))
           gain = Math.max(gain, inventoryGain(action, name));
       }
       if (removed || gain > 0) { actionIds.push(id); measured += Math.max(0, gain); matched ||= removed || gain >= minGain; }

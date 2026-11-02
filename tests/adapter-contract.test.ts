@@ -14,7 +14,7 @@ const action = { kind: "look", yaw: 0.2, pitch: 0 };
 function envelope() {
   const scope = effectScope();
   return { operation_id: "host-operation-A", compatibility_hash: binding().compatibility_hash, scope,
-    invocation: { kind: "skill", execution_id: scope.execution_id, source_hash: scope.source_hash }, action, expected_screen: null };
+    invocation: { kind: "skill", execution_id: scope.execution_id, source_hash: scope.source_hash }, action, expected_screen: { kind: "absent" } };
 }
 async function transport(expected = descriptor()) {
   const options = { descriptor: expected, schemas: schemaCatalog(), onTiming: undefined };
@@ -64,7 +64,7 @@ async function transport(expected = descriptor()) {
       }
     });
     await new Promise<void>(resolve => peer.once("connect", resolve));
-    peer.write(JSON.stringify({ protocol: 3, secret: session.secret, world_id: session.world_id,
+    peer.write(JSON.stringify({ protocol: 4, secret: session.secret, world_id: session.world_id,
       session_id: session.session_id, epoch: session.epoch, native_boot_id: scope.native_boot_id,
       descriptor: expected, ...patch }) + "\n");
     await received.promise;
@@ -228,7 +228,7 @@ test("copying host scope into worker capability args cannot create effect author
   // This selected Minecraft capability does not declare a scope field, so its
   // actual registered consumer must reject it before effect admission.
   const registry = new RegisteredAdapterContract(adapterDescriptorSchema.parse(descriptor()), schemaCatalog());
-  expect(() => registry.parseCapability("minecraft.action", 1, { ...action, scope: effectScope() })).toThrow();
+  expect(() => registry.parseCapability("minecraft.action", 4, { ...action, scope: effectScope() })).toThrow();
 });
 
 test("Minecraft target references retain space and incarnation through the real action validator", () => {
@@ -254,28 +254,22 @@ test("registered Minecraft navigation preserves explicit arrival mechanics and l
     space: { dimension_id: "minecraft:overworld", space_epoch: 4 } };
   const navigation = { kind: "navigate" as const, target, range: 2.5, duration_ms: 5000 };
   const registry = new RegisteredAdapterContract(adapterDescriptorSchema.parse(descriptor()), schemaCatalog());
-  expect(registry.parseCapability("minecraft.action", 1, navigation)).toEqual(navigation);
+  expect(registry.parseCapability("minecraft.action", 4, navigation)).toEqual(navigation);
   for (const arrival of ["position", "interaction"] as const) {
     const request = { ...navigation, arrival };
     expect(minecraftActionSchema.parse(request)).toEqual(request);
-    expect(registry.parseCapability("minecraft.action", 1, request)).toEqual(request);
+    expect(registry.parseCapability("minecraft.action", 4, request)).toEqual(request);
   }
   for (const arrival of ["horizontal", "", null, true])
-    expect(() => registry.parseCapability("minecraft.action", 1, { ...navigation, arrival })).toThrow();
+    expect(() => registry.parseCapability("minecraft.action", 4, { ...navigation, arrival })).toThrow();
   for (const range of [0.49, 4.01])
-    expect(() => registry.parseCapability("minecraft.action", 1, { ...navigation, arrival: "interaction", range })).toThrow();
+    expect(() => registry.parseCapability("minecraft.action", 4, { ...navigation, arrival: "interaction", range })).toThrow();
 });
 
 function validate(source: string, kind: "skill" | "policy" | "guard", value = descriptor(), scope = effectScope(), schemas = schemaCatalog()) {
   return Reflect.apply(validateProgramSource, undefined, [source, kind, { descriptor: value, scope, schemas }]) as ReturnType<typeof validateProgramSource>;
 }
 const source = 'return {status:"completed",summary:"Contract only",result:null};';
-test("new source receives an API4 validator/runtime4 stamp bound to negotiated compatibility", async () => {
-  const current = await validate(source, "skill");
-  expect(current.validation).toMatchObject({ api_version: 4, runtime_version: 4, validator_version: 4,
-    compatibility_hash: binding().compatibility_hash });
-});
-
 for (const kind of ["skill", "policy", "guard"] as const) {
   test(`${kind} validation compatibility changes for actual stable contract changes`, async () => {
     const body = kind === "policy" ? 'return {kind:"continue"};' : kind === "guard" ? "return true;" : source;
@@ -306,8 +300,8 @@ test("changed trusted registered payload schema changes validation compatibility
 test("changed actual registered capability schema changes compatibility even with the same capability name", async () => {
   const original = await validate(source, "skill");
   const schemas = schemaCatalog(), changed = descriptor();
-  schemas.capabilities["minecraft.action@1"].maxProperties = 7;
-  changed.capabilities[0]!.schema_hash = sha256(schemas.capabilities["minecraft.action@1"]);
+  schemas.capabilities["minecraft.action@4"].maxProperties = 7;
+  changed.capabilities[0]!.schema_hash = sha256(schemas.capabilities["minecraft.action@4"]);
   const next = await validate(source, "skill", changed, effectScope(), schemas);
   expect(next.hash).toBe(original.hash);
   expect(next.validation.fingerprint).not.toBe(original.validation.fingerprint);

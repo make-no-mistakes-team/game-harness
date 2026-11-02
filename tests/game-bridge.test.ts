@@ -13,16 +13,22 @@ import { z } from "zod";
 import { effectEnvelopeSchema } from "../src/shared/control.ts";
 import { gameActionSchema } from "../src/shared/validation.ts";
 import { jsonSchema } from "../src/shared/primitives.ts";
+import { controllerFrameFixture } from "./helpers/controller-frame.ts";
+import type { NativeControllerApplicationTiming, NativeControllerLeaseTiming } from "../src/server/performance.ts";
 
 const adapter = minecraftTestAdapter();
+const ordinaryInput: GameAction = { kind: "world_input", steps: [{ ticks: 1,
+  held: { forward: false, back: false, left: false, right: false, jump: false,
+    sprint: false, sneak: false, attack: false, use: false },
+  edges: [], view: { kind: "unchanged" }, selected_hotbar: null }] };
 function envelope(action: GameAction, session?: NativeSession, life = 1, space = 1, selected = adapter): EffectEnvelope<GameAction> {
   const scope = { ...effectScope(), ...(session ? { world_id: session.world_id, session_id: session.session_id, epoch: session.epoch } : {}),
     native_boot_id: "fixture-native-boot", life_id: life, space_epoch: space, execution_id: "transport-diagnostic" };
   return { operation_id: randomUUID(), compatibility_hash: sha256(selected.descriptor), scope,
-    invocation: { kind: "diagnostic", execution_id: scope.execution_id, source_hash: scope.source_hash }, action, expected_screen: null };
+    invocation: { kind: "diagnostic", execution_id: scope.execution_id, source_hash: scope.source_hash }, action, expected_screen: { kind: "absent" } };
 }
 function hello(session: NativeSession, selected = adapter) {
-  return { protocol: 3, secret: session.secret, session_id: session.session_id, world_id: session.world_id,
+  return { protocol: 4, secret: session.secret, session_id: session.session_id, world_id: session.world_id,
     epoch: session.epoch, native_boot_id: "fixture-native-boot", descriptor: selected.descriptor };
 }
 function fixture(selected = adapter, dead = false) {
@@ -32,7 +38,7 @@ function fixture(selected = adapter, dead = false) {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {},1000)"], { stdio: ["pipe", "pipe", "pipe"] });
   const closed = Promise.withResolvers<void>(); child.once("close", () => closed.resolve());
   const session: NativeSession = { secret: randomBytes(32).toString("hex"), session_id: randomUUID(), world_id: randomUUID(), epoch: 2 ** 31 + 7,
-    host: "127.0.0.1", port: 25565, control_port: 0, video_port: 0 };
+    host: "127.0.0.1", port: 25565, control_port: 0, video_port: 0, evaluation: null };
   const owned: NativeProcess = { child, closed: closed.promise, session, username: "fixture", diagnostics: [] };
   let life: PlayerLife = { life_id: 1, status: dead ? "dead" : "alive", can_respawn: false, death: null };
   Reflect.set(bridge, "owned", owned);
@@ -58,6 +64,13 @@ function fixture(selected = adapter, dead = false) {
   return { bridge, child, closed: closed.promise, session, owned, peers, channel, notice, close };
 }
 function reply(peer: Socket, id: number, data: unknown) { peer.write(JSON.stringify({ id, ok: true, data }) + "\n"); }
+function nativeFixtureNanos() { return String(1_000_000_000n + BigInt(Math.floor(performance.now() * 1e6))); }
+function timedReply(peer: Socket, id: number, data: unknown) {
+  const ns = nativeFixtureNanos();
+  peer.write(JSON.stringify({ id, ok: true, data, timing: {
+    schema_version: 1, clock_id: "fixture-native-boot", received_ns: ns, replied_ns: ns, client_tick: 10,
+  } }) + "\n");
+}
 const requestSchema = z.object({ id: z.number().int().positive(), method: z.string(), generation: z.number().int(),
   params: z.record(z.string(), jsonSchema) });
 type WireRequest = z.infer<typeof requestSchema>;
@@ -76,6 +89,208 @@ test("an unstarted native bridge closes idempotently without inventing video", a
   const bridge = new GameBridgeClient(); await bridge.close(); await bridge.close();
   expect(bridge.snapshot().status).toBe("disconnected"); expect(bridge.snapshot().video.status).toBe("idle"); expect(bridge.latestFrame()).toBeNull();
 });
+test("trusted timing subscribers receive correlated native lease deadlines even on a rejected heartbeat", async () => {
+  const f = fixture();
+  try {
+    const peer = await f.channel("control");
+    const samples: Array<ReturnType<GameBridgeClient["performanceMetrics"]>["control_timeline"]["samples"][number]> = [];
+    const off = f.bridge.subscribeControlTiming(sample => samples.push(sample));
+    const owner = { operation_id: "lease-proof", generation: 3, scope: effectScope() };
+    const lease: NativeControllerLeaseTiming = { schema_version: 1, event: "refused", owner, controller_generation: 1,
+      checked_native_ns: "-9007199254740993", requested_deadline_native_ns: "-9007199004740993",
+      previous_deadline_native_ns: "-9007199254741000", effective_deadline_native_ns: "-9007199254741000",
+      task_deadline_native_ns: "-9007198004740993", accepted: false,
+      first_fence_reason: "native_input_lease_expired", first_fence_native_ns: "-9007199254740993",
+      retirement_trigger: null, retirement_native_ns: null };
+    requests(peer, request => peer.write(JSON.stringify({ id: request.id, ok: false,
+      error: "Controller request rejected: native_input_lease_expired", timing: {
+        schema_version: 1, clock_id: "fixture-native-boot", received_ns: "-9007199254740994",
+        replied_ns: "-9007199254740992", client_tick: 10, controller_lease: lease,
+      } }) + "\n"));
+    await expect(Reflect.get(f.bridge, "request").call(f.bridge, "controller_heartbeat", {}, 1000))
+      .rejects.toThrow("native_input_lease_expired");
+    off();
+    expect(f.bridge.snapshot().binding?.ready).toBe(true);
+    expect(samples).toMatchObject([{ method: "controller_heartbeat", status: "error",
+      native_timing: { controller_lease: lease } }]);
+    const retained = f.bridge.performanceMetrics().control_timeline.samples.at(-1)!;
+    expect(retained.native_timing?.controller_lease).toEqual(lease);
+    expect(BigInt(retained.native_timing!.controller_lease!.effective_deadline_native_ns) -
+      BigInt(retained.native_timing!.controller_lease!.checked_native_ns)).toBe(-7n);
+  } finally { await f.close(); }
+});
+test("a successful native application retains exact queue and hook timing without expanding its receipt", async () => {
+  const f = fixture();
+  try {
+    const peer = await f.channel("control");
+    const application: NativeControllerApplicationTiming = {
+      schema_version: 1, owner: { operation_id: "application-proof", generation: 3, scope: effectScope() },
+      controller_generation: 1, sequence: 9, frame_seq: 19,
+      admitted_native_ns: "-9007199254740992", pending_ahead: 2, applying_ahead_sequence: 7,
+      admitted_preparation_ordinal: 4, began_native_ns: "-9007199254740990", began_native_tick: 10,
+      began_preparation_ordinal: 6, prepared_native_ns: "-9007199254740989",
+      consumed_native_ns: null, sampled_native_ns: null,
+      settled_native_ns: "-9007199254740985", settled_native_tick: 11,
+    };
+    requests(peer, request => peer.write(JSON.stringify({ id: request.id, ok: true, data: { original_receipt: true }, timing: {
+      schema_version: 1, clock_id: "fixture-native-boot", received_ns: "-9007199254740993",
+      replied_ns: "-9007199254740984", client_tick: 12, controller_application: application,
+    } }) + "\n"));
+    const result = await Reflect.get(f.bridge, "request").call(f.bridge, "controller_submit", {}, 1000);
+    expect(result).toEqual({ original_receipt: true });
+    const retained = f.bridge.performanceMetrics().control_timeline.samples.at(-1)!;
+    expect(retained.native_timing?.controller_application).toEqual(application);
+    expect(BigInt(retained.native_timing!.controller_application!.began_native_ns) -
+      BigInt(retained.native_timing!.controller_application!.admitted_native_ns)).toBe(2n);
+    expect(f.bridge.snapshot().binding?.ready).toBe(true);
+  } finally { await f.close(); }
+});
+
+test("reserved Stop reaches the native barrier while ordinary RPC capacity is saturated", async () => {
+  const f = fixture(), pending: Promise<unknown>[] = [];
+  try {
+    const peer = await f.channel("control"), received: WireRequest[] = [];
+    requests(peer, request => {
+      received.push(request);
+      if (request.method === "cancel") reply(peer, request.id, {
+        neutralized: true, matched_owner: true, generation: 2,
+        session_id: f.session.session_id, life_id: 1,
+      });
+    });
+    for (let index = 0; index < 16; index++)
+      pending.push(Reflect.get(f.bridge, "request").call(f.bridge, "ping").catch(() => null));
+    await f.bridge.emergencyStop("Saturated ordinary lane");
+    expect(f.child.killed).toBe(false);
+    expect(f.bridge.snapshot().status).toBe("connected");
+    expect(received.filter(request => request.method === "cancel")).toHaveLength(1);
+    for (const request of received) if (request.method === "ping") reply(peer, request.id, {});
+    await Promise.all(pending);
+  } finally { await f.close(); await Promise.all(pending); }
+});
+test("a controller retains the sole writer through submitted input and the actual retirement ACK", async () => {
+  const f = fixture();
+  try {
+    const peer = await f.channel("control"), applied = Promise.withResolvers<void>(), retiring = Promise.withResolvers<WireRequest>();
+    const submitted = Promise.withResolvers<WireRequest>();
+    let captureSequence = 0;
+    requests(peer, request => {
+      if (request.method === "controller_open")
+        timedReply(peer, request.id, { owner: request.params.owner, controller_generation: 1 });
+      else if (request.method === "controller_sample") timedReply(peer, request.id, {
+        ...controllerFrameFixture(1, 1), frame_seq: ++captureSequence, native_tick: 10, captured_native_ns: nativeFixtureNanos(),
+      });
+      else if (request.method === "controller_submit") submitted.resolve(request);
+      else if (request.method === "controller_revoke") retiring.resolve(request);
+      else if (request.method === "execute") timedReply(peer, request.id, effectReply(request, {
+        status: "succeeded", summary: "Finite input after actual retirement", evidence: { effect_confirmed: false },
+      }));
+      else timedReply(peer, request.id, {});
+    });
+    await Reflect.get(f.bridge, "request").call(f.bridge, "ping");
+    const effect = envelope(ordinaryInput, f.session), { action: _, ...reservation } = effect;
+    const channel = await f.bridge.openController(reservation, 1, performance.now() + 5000,
+      () => applied.resolve(), () => {});
+    const frame = await channel.sample(null);
+    const held = { forward: true, back: false, left: false, right: false, jump: false,
+      sprint: false, sneak: false, attack: false, use: false };
+    const submission = channel.submit(frame, { kind: "world", held,
+      edges: [{ kind: "button", button: "forward", phase: "press", count: 1 }],
+      view: { kind: "unchanged" }, selected_hotbar: null });
+    expect(submission.status).toBe("submitted");
+    expect(channel.snapshot().applied_sequence).toBe(0);
+    // A native response is deliberately absent: admission is not input application.
+    expect((await f.bridge.execute(envelope(ordinaryInput, f.session), new AbortController().signal)).status).toBe("failed");
+    timedReply(peer, (await submitted.promise).id, {
+      controller_generation: 1, sequence: 1, ordered_edge_prefix: 1, applied_native_tick: 11,
+      applied_native_ns: nativeFixtureNanos(), held, applied_pose: { yaw_radians: 0, pitch_radians: 0 },
+      input_application: "confirmed", reason: null,
+    });
+    await applied.promise;
+    expect(channel.snapshot().ordered_edge_prefix).toBe(1);
+    const retirement = channel.revoke(), request = await retiring.promise;
+    expect(channel.snapshot().retired).toBe(false);
+    expect((await f.bridge.execute(envelope(ordinaryInput, f.session), new AbortController().signal)).status).toBe("failed");
+    timedReply(peer, request.id, { generation: 2, ack: {
+      owner: channel.owner, controller_generation: 1, admission_revoked: true, last_applied_sequence: 1,
+      ordered_edge_prefix: 1, retirement_applied_native_tick: 12, retirement_applied_native_ns: nativeFixtureNanos(),
+      input_application: "confirmed", unresolved_operation_refs: [effect.operation_id],
+    } });
+    await retirement;
+    expect(channel.snapshot().retired).toBe(true);
+    expect((await f.bridge.execute(envelope(ordinaryInput, f.session), new AbortController().signal)).status).toBe("succeeded");
+  } finally { await f.close(); }
+});
+for (const [label, rootMs, applicationDelay, expected] of [
+  ["allows a lawful GUI sequence beyond two seconds", 10000, 2100, "applied"],
+  ["caps GUI application by immutable root authority", 350, 1000, "contained"],
+] as const) {
+  test(`controller transport ${label}`, async () => {
+    const f = fixture(), applied = Promise.withResolvers<"applied">();
+    let delayed: NodeJS.Timeout | undefined;
+    try {
+      const peer = await f.channel("control");
+      Reflect.set(f.bridge, "state", { ...f.bridge.snapshot(), screen: feedbackScreen });
+      requests(peer, request => {
+        if (request.method === "controller_open")
+          timedReply(peer, request.id, { owner: request.params.owner, controller_generation: 1 });
+        else if (request.method === "controller_sample") timedReply(peer, request.id, {
+          ...projectedFeedback(), frame_seq: 1, native_tick: 10, captured_native_ns: nativeFixtureNanos(),
+        });
+        else if (request.method === "controller_submit") delayed = setTimeout(() => timedReply(peer, request.id, {
+          controller_generation: 1, sequence: 1, ordered_edge_prefix: 16, applied_native_tick: 11,
+          applied_native_ns: nativeFixtureNanos(),
+          held: { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, attack: false, use: false },
+          applied_pose: { yaw_radians: 0, pitch_radians: 0 }, input_application: "confirmed", reason: null,
+        }), applicationDelay);
+        else timedReply(peer, request.id, {});
+      });
+      await Reflect.get(f.bridge, "request").call(f.bridge, "ping");
+      const { action: _, ...reservation } = envelope(ordinaryInput, f.session);
+      reservation.expected_screen = { kind: "transaction", screen: feedbackScreen };
+      const channel = await f.bridge.openController(reservation, 1, performance.now() + rootMs, () => applied.resolve("applied"), () => {});
+      const captured = await channel.sample(null);
+      const empty = { item: null, count: 0 }, planks = { item: "oak_planks", count: 4 };
+      const operations = Array.from({ length: 16 }, (_, index) => {
+        const half = index % 4, slot_id = half === 0 || half === 3 ? 36 : 37;
+        return { kind: "slot" as const, slot_id, button: "left" as const, mode: "ordinary" as const, hotbar_slot: null,
+          expected_cursor: half % 2 === 0 ? empty : planks,
+          expected_slots: [{ slot_id, value: half % 2 === 0 ? planks : empty }] };
+      });
+      expect(channel.submit(captured, { kind: "screen", screen: {
+        screen_id: feedbackScreen.screen_id, incarnation: feedbackScreen.incarnation, layout_revision: 7,
+      }, operations }).status).toBe("submitted");
+      const outcome = await Promise.race([applied.promise, f.closed.then(() => "contained" as const)]);
+      expect(outcome).toBe(expected);
+      expect(channel.snapshot().applied_sequence).toBe(expected === "applied" ? 1 : 0);
+    } finally { if (delayed) clearTimeout(delayed); await f.close(); }
+  });
+}
+test("resident renewal refuses an aged decision without disguising it as a fresh heartbeat", async () => {
+  const f = fixture();
+  let heartbeats = 0;
+  try {
+    const peer = await f.channel("control");
+    requests(peer, request => {
+      if (request.method === "controller_open")
+        timedReply(peer, request.id, { owner: request.params.owner, controller_generation: 1 });
+      else if (request.method === "controller_sample") timedReply(peer, request.id, {
+        ...controllerFrameFixture(1, 1), frame_seq: 1, native_tick: 10, captured_native_ns: nativeFixtureNanos(),
+      });
+      else { if (request.method === "controller_heartbeat") heartbeats++; timedReply(peer, request.id, {}); }
+    });
+    await Reflect.get(f.bridge, "request").call(f.bridge, "ping");
+    const { action: _, ...reservation } = envelope(ordinaryInput, f.session);
+    const channel = await f.bridge.openController(reservation, 1, performance.now() + 10000, () => {}, () => {});
+    const captured = await channel.sample(null);
+    await channel.renew(captured);
+    const aged = Promise.withResolvers<void>(); setTimeout(aged.resolve, 180); await aged.promise;
+    await expect(channel.renew(captured)).rejects.toThrow();
+    expect(heartbeats).toBe(1);
+    await channel.renew(null);
+    expect(heartbeats).toBe(2);
+    expect(channel.snapshot().submitted_sequence).toBe(0);
+  } finally { await f.close(); }
+});
 test("cancelled undispatched actions never claim a confirmed effect", async () => {
   const bridge = new GameBridgeClient(), controller = new AbortController(); controller.abort();
   const result = await bridge.execute(envelope({ kind: "move", controls: { forward: true }, duration_ms: 200 }), controller.signal);
@@ -86,6 +301,195 @@ test("an unnegotiated emitter refuses before dispatch without inventing another 
   const result = await bridge.execute(envelope({ kind: "look", yaw: 0, pitch: 0 }), new AbortController().signal);
   expect(result.status).toBe("failed"); expect(result.requires_reconnect).toBeUndefined(); expect(bridge.adapter()).toBeNull(); expect(bridge.latestFrame()).toBeNull(); await bridge.close();
 });
+test("ordinary world input refuses an open screen without dispatching or auto-closing it", async () => {
+  const f = fixture(), screen = { screen_id: "inventory", incarnation: 1, revision: 1 };
+  try {
+    const peer = await f.channel("control"), methods: string[] = [];
+    requests(peer, request => {
+      methods.push(request.method);
+      if (request.method === "execute") reply(peer, request.id, effectReply(request, {
+        status: "succeeded", summary: "Unexpected dispatch", evidence: { effect_confirmed: false },
+      }));
+    });
+    Reflect.set(f.bridge, "state", { ...f.bridge.snapshot(), screen });
+    const effect = { ...envelope(ordinaryInput, f.session), expected_screen: { kind: "transaction" as const, screen } };
+    const result = await f.bridge.execute(effect, new AbortController().signal);
+    expect(result.status).toBe("failed"); expect(methods).toEqual([]);
+    expect(f.bridge.snapshot().screen).toEqual(screen); expect(f.child.killed).toBe(false);
+    expect(result.evidence).toEqual({ effect_confirmed: false, neutralized_effect: false });
+  } finally { await f.close(); }
+});
+
+test("visible screen read uses only its registered route and validates complete native geometry without effects", async () => {
+  const f = fixture();
+  try {
+    const peer = await f.channel("control"), methods: string[] = [];
+    let projected: unknown = { identity: { screen_id: "view", incarnation: 1, layout_revision: 2 }, content_revision: 3,
+      screen_kind: "generic_container", viewport: { width: 320, height: 240, scale_factor: 2 },
+      slots: [{ slot_id: 0, value: { item: null, count: 0 }, bounds: { x: 10, y: 20, width: 16, height: 16 }, enabled: true }],
+      cursor: { item: null, count: 0 }, elements: [], progress: [] };
+    requests(peer, request => { methods.push(request.method); reply(peer, request.id, projected); });
+    const value = await f.bridge.queryCapability("minecraft.visible_screen", 1, {});
+    expect(value).toMatchObject({ cursor: { item: null, count: 0 }, slots: [{ slot_id: 0, value: { item: null, count: 0 } }] });
+    await expect(f.bridge.queryCapability("minecraft.visible_screen", 1, { hidden_offers: true })).rejects.toThrow();
+    await expect(f.bridge.queryCapability("arbitrary.world.query", 1, {})).rejects.toThrow();
+    projected = { ...projected as object, cursor: undefined };
+    await expect(f.bridge.queryCapability("minecraft.visible_screen", 1, {})).rejects.toThrow();
+    projected = null;
+    expect(await f.bridge.queryCapability("minecraft.visible_screen", 1, {})).toBeNull();
+    expect(methods).toEqual(["visible_screen", "visible_screen", "visible_screen"]);
+    expect(f.child.killed).toBe(false);
+  } finally { await f.close(); }
+});
+
+const feedbackScreen = { screen_id: "feedback-view-A", incarnation: 4, revision: 2 };
+function projectedFeedback() {
+  return { ...controllerFrameFixture(1, 1), screen: {
+    identity: { screen_id: feedbackScreen.screen_id, incarnation: feedbackScreen.incarnation, layout_revision: 7 },
+    content_revision: 2, screen_kind: "generic_container", viewport: { width: 320, height: 240, scale_factor: 2 },
+    slots: [], cursor: { item: null, count: 0 }, elements: [], progress: [],
+  } };
+}
+for (const [name, replacement] of [
+  ["close", null],
+  ["replacement", { screen_id: "feedback-view-B", incarnation: 5, revision: 1 }],
+  ["reincarnation", { screen_id: feedbackScreen.screen_id, incarnation: 5, revision: 1 }],
+] as const) {
+  test(`controller feedback refuses a coalesced ${name} notice that obsoletes its screen`, async () => {
+    const f = fixture();
+    try {
+      const peer = await f.channel("control"); let replace = false, sequence = 0;
+      Reflect.set(f.bridge, "state", { ...f.bridge.snapshot(), screen: feedbackScreen });
+      requests(peer, request => {
+        if (request.method !== "controller_frame") { reply(peer, request.id, {}); return; }
+        const data = { ...projectedFeedback(), frame_seq: ++sequence };
+        if (!replace) { reply(peer, request.id, data); return; }
+        const notice = { ...f.notice({ life_id: 1, status: "alive", can_respawn: false, death: null }, 2),
+          type: "scope", screen: replacement };
+        // One actual parser callback, not an assumption about TCP chunk coalescing.
+        const control = Reflect.get(f.bridge, "control") as Socket;
+        control.emit("data", Buffer.from(`${JSON.stringify({ id: request.id, ok: true, data })}\n${JSON.stringify({ notice })}\n`));
+      });
+      const args = { audio_cursor: { stream_id: "life1-space1", sequence: 9 } };
+      expect(await f.bridge.queryCapability("minecraft.controller_frame", 2, args)).toHaveProperty("frame_seq", 1);
+      replace = true;
+      await expect(f.bridge.queryCapability("minecraft.controller_frame", 2, args)).rejects.toThrow("screen");
+      expect(f.bridge.snapshot().screen).toEqual(replacement);
+    } finally { await f.close(); }
+  });
+}
+test("controller feedback retains the same screen across unrelated transaction revisions", async () => {
+  const f = fixture();
+  try {
+    const peer = await f.channel("control");
+    Reflect.set(f.bridge, "state", { ...f.bridge.snapshot(), screen: feedbackScreen });
+    requests(peer, request => {
+      if (request.method !== "controller_frame") { reply(peer, request.id, {}); return; }
+      const notice = { ...f.notice({ life_id: 1, status: "alive", can_respawn: false, death: null }, 2),
+        type: "scope", screen: { ...feedbackScreen, revision: 99 } };
+      const control = Reflect.get(f.bridge, "control") as Socket;
+      control.emit("data", Buffer.from(`${JSON.stringify({ id: request.id, ok: true, data: projectedFeedback() })}\n${JSON.stringify({ notice })}\n`));
+    });
+    const result = await f.bridge.queryCapability("minecraft.controller_frame", 2,
+      { audio_cursor: { stream_id: "life1-space1", sequence: 9 } });
+    expect(result).toHaveProperty("screen.identity.screen_id", "feedback-view-A");
+    expect(f.bridge.snapshot().screen?.revision).toBe(99);
+  } finally { await f.close(); }
+});
+
+test("GUI dispatch uses exact action layout authority rather than unrelated transaction revisions", async () => {
+  const f = fixture(), screen = { screen_id: "furnace", incarnation: 4, revision: 999 };
+  try {
+    const peer = await f.channel("control"), methods: string[] = [];
+    requests(peer, request => { methods.push(request.method); reply(peer, request.id,
+      effectReply(request, { status: "succeeded", summary: "Scoped persistence", evidence: { effect_confirmed: false } })); });
+    Reflect.set(f.bridge, "state", { ...f.bridge.snapshot(), screen });
+    const layout = { screen_id: screen.screen_id, incarnation: screen.incarnation, layout_revision: 1 };
+    const action = { kind: "screen_input", screen: layout, operations: [] };
+    const effect: EffectEnvelope = { ...envelope(action, f.session), expected_screen: { kind: "layout", screen: layout } };
+    expect((await f.bridge.execute(effect, new AbortController().signal)).status).toBe("succeeded");
+    expect(f.bridge.snapshot().screen).toEqual(screen);
+    expect((await f.bridge.execute({ ...effect, expected_screen: { kind: "layout", screen: { ...layout, layout_revision: 2 } } },
+      new AbortController().signal)).status).toBe("failed");
+    expect((await f.bridge.execute({ ...effect, expected_screen: { kind: "transaction", screen } },
+      new AbortController().signal)).status).toBe("failed");
+    expect(methods).toEqual(["execute"]);
+  } finally { await f.close(); }
+});
+
+test("a lost zero-operation GUI ACK has its finite scoped deadline without replay or implicit close", async () => {
+  const f = fixture(), layout = { screen_id: "persistent", incarnation: 1, layout_revision: 1 };
+  try {
+    const peer = await f.channel("control"), methods: string[] = [];
+    requests(peer, request => { methods.push(request.method); });
+    Reflect.set(f.bridge, "state", { ...f.bridge.snapshot(), screen: { screen_id: "persistent", incarnation: 1, revision: 200 } });
+    const effect: EffectEnvelope = { ...envelope({ kind: "screen_input", screen: layout, operations: [] }, f.session),
+      expected_screen: { kind: "layout", screen: layout } };
+    const started = performance.now(), result = await f.bridge.execute(effect, new AbortController().signal);
+    expect(performance.now() - started).toBeLessThan(8000);
+    expect(result).toMatchObject({ status: "unknown", requires_reconnect: true });
+    expect(methods).toEqual(["execute"]);
+    expect(f.child.killed).toBe(true);
+  } finally { await f.close(); }
+}, 10000);
+
+test("selected scroll preserves exact layout authority and native unhandled rejection without retry", async () => {
+  const f = fixture(), screen = { screen_id: "stonecutter", incarnation: 4, revision: 999 };
+  try {
+    const peer = await f.channel("control"), dispatched: unknown[] = [];
+    const operation = { kind: "scroll", element_id: "current-region", horizontal: 0.5, vertical: -1 };
+    const layout = { screen_id: screen.screen_id, incarnation: screen.incarnation, layout_revision: 7 };
+    const action = { kind: "screen_input", screen: layout, operations: [operation] };
+    const effect: EffectEnvelope = { ...envelope(action, f.session), expected_screen: { kind: "layout", screen: layout } };
+    requests(peer, request => {
+      dispatched.push(request.params);
+      reply(peer, request.id, effectReply(request, { status: "failed", summary: "Native region did not handle scroll.",
+        evidence: { effect_confirmed: false, neutralized_effect: true } }));
+    });
+    Reflect.set(f.bridge, "state", { ...f.bridge.snapshot(), screen });
+    const result = await f.bridge.execute(effect, new AbortController().signal);
+    expect(result).toMatchObject({ status: "failed", evidence: { effect_confirmed: false, neutralized_effect: true } });
+    expect(dispatched).toEqual([effect]);
+    expect(f.bridge.snapshot().screen).toEqual(screen);
+    expect((await f.bridge.execute({ ...effect, expected_screen: { kind: "layout",
+      screen: { ...layout, layout_revision: 8 } } }, new AbortController().signal)).status).toBe("failed");
+    Reflect.set(f.bridge, "state", { ...f.bridge.snapshot(), screen: { ...screen, incarnation: 5 } });
+    expect((await f.bridge.execute(effect, new AbortController().signal)).status).toBe("failed");
+    expect(dispatched).toEqual([effect]);
+    expect(f.child.killed).toBe(false);
+  } finally { await f.close(); }
+});
+
+test("a stalled ordinary input ACK closes the actual emitter on its own finite deadline without replay or neutralization claims", async () => {
+  const f = fixture();
+  try {
+    const peer = await f.channel("control"), methods: string[] = [];
+    requests(peer, request => { methods.push(request.method); });
+    const started = performance.now();
+    const result = await f.bridge.execute(envelope(ordinaryInput, f.session), new AbortController().signal);
+    expect(performance.now() - started).toBeLessThan(6000);
+    expect(result).toMatchObject({ status: "unknown", requires_reconnect: true,
+      evidence: { effect_confirmed: false, neutralized_effect: false } });
+    expect(methods).toEqual(["execute"]); expect(f.child.killed).toBe(true);
+    await f.closed; expect(f.bridge.snapshot().status).toBe("error");
+  } finally { await f.close(); }
+}, 10000);
+test("ordinary cancellation confirms emitter containment without inventing acknowledged native release or effect confirmation", async () => {
+  const f = fixture();
+  try {
+    const peer = await f.channel("control"), methods: string[] = [], emitted = Promise.withResolvers<void>();
+    requests(peer, request => { methods.push(request.method); if (request.method === "execute") emitted.resolve(); });
+    const effect = envelope(ordinaryInput, f.session);
+    const executing = f.bridge.execute(effect, new AbortController().signal);
+    await emitted.promise;
+    await f.bridge.cancel("Unacknowledged ordinary cancellation", {
+      operation_id: effect.operation_id, scope: effect.scope,
+    });
+    expect(await executing).toMatchObject({ status: "unknown",
+      evidence: { effect_confirmed: false, neutralized_effect: false } });
+    expect(methods).toEqual(["execute", "cancel"]); expect(f.child.killed).toBe(true);
+  } finally { await f.close(); }
+}, 10000);
 test("expected-owner cancellation still awaits already-owned terminal cleanup without a socket", async () => {
   const bridge = new GameBridgeClient(), exited = Promise.withResolvers<void>(), effect = envelope({ kind: "look", yaw: 0, pitch: 0 });
   Reflect.set(bridge, "closing", exited.promise); let returned = false;

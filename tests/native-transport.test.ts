@@ -1,17 +1,9 @@
 import { expect, test } from "bun:test";
 import { NativeFrameDecoder } from "../src/server/game-bridge.ts";
+import { nativeFrame } from "./helpers/native-frame.ts";
 
 function frame(sequence = 1) {
-  const b = Buffer.alloc(48);
-  b.writeUInt32LE(0x47485631, 0);
-  b.writeUInt32LE(2, 4);
-  b.writeUInt32LE(2, 8);
-  b.writeUInt32LE(16, 12);
-  b.writeUInt32LE(sequence, 16);
-  b.writeUInt32LE(1, 20);
-  b.writeDoubleLE(Date.now(), 24);
-  b.fill(127, 32);
-  return b;
+  return Buffer.from(nativeFrame({ sequence, bottomUp: true, pixels: new Uint8Array(16).fill(127) }));
 }
 
 test("split native headers and payloads emit only complete bounded messages", () => {
@@ -21,7 +13,11 @@ test("split native headers and payloads emit only complete bounded messages", ()
   decoder.push(b.subarray(0, 5));
   decoder.push(b.subarray(5, 33));
   expect(seen).toHaveLength(0);
-  decoder.push(b.subarray(33));
+  decoder.push(b.subarray(33, 327));
+  expect(seen).toHaveLength(0);
+  decoder.push(b.subarray(327, 329));
+  expect(seen).toHaveLength(0);
+  decoder.push(b.subarray(329));
   expect(seen).toHaveLength(1);
   expect(seen[0]).toEqual(b);
 });
@@ -38,7 +34,7 @@ test("oversized dimensions and mismatched payload are rejected before accepting 
     const b = frame();
     b.writeUInt32LE(0xffffffff, field);
     expect(() =>
-      new NativeFrameDecoder(() => {}).push(b.subarray(0, 32)),
+      new NativeFrameDecoder(() => {}).push(b.subarray(0, 328)),
     ).toThrow();
   }
 });
@@ -54,4 +50,35 @@ test("late frame sequence cannot replace newer native evidence", () => {
   const decoder = new NativeFrameDecoder(() => {});
   decoder.push(frame(10));
   expect(() => decoder.push(frame(9))).toThrow();
+});
+
+test("transport owns the full capture header and pixels after producer buffers are reused", () => {
+  const seen: Buffer[] = [], original = frame(5), expected = Buffer.from(original);
+  const decoder = new NativeFrameDecoder(packet => seen.push(packet));
+  decoder.push(original);
+  original.fill(0);
+  decoder.push(frame(6));
+  expect(seen[0]).toEqual(expected);
+  expect([...seen[0]!.subarray(328)]).toEqual(Array(16).fill(127));
+});
+
+test("invalid capture schema, time ordering and unsafe counters fail on the header before a body", () => {
+  const schema = frame(), ordering = frame(), counter = frame(), legacy = frame();
+  schema.writeUInt32LE(2, 316);
+  ordering.writeBigInt64LE(-1n, 40);
+  counter.writeBigUInt64LE(9007199254740992n, 88);
+  legacy.writeUInt32LE(0x47485631, 0);
+  for (const packet of [schema, ordering, counter, legacy])
+    expect(() => new NativeFrameDecoder(() => {}).push(packet.subarray(0, 328))).toThrow();
+});
+
+test("uint32 sequence wrap advances while duplicates and half-range-old packets fail closed", () => {
+  const seen: number[] = [];
+  const decoder = new NativeFrameDecoder(packet => seen.push(packet.readUInt32LE(16)));
+  decoder.push(Buffer.concat([frame(0xfffffffe), frame(0xffffffff), frame(0), frame(1)]));
+  expect(seen).toEqual([0xfffffffe, 0xffffffff, 0, 1]);
+  expect(() => decoder.push(frame(1))).toThrow();
+  const old = new NativeFrameDecoder(() => {});
+  old.push(frame(1));
+  expect(() => old.push(frame(0x80000001))).toThrow();
 });

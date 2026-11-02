@@ -23,6 +23,7 @@ import { adapterBindingSchema, activeExecutableValidationSchema, historicalExecu
 import { effectInvocationSchema, effectScopeSchema, screenRefSchema, spaceRefSchema } from "../../src/shared/control.ts";
 import { adapterActorProjectionSchema } from "../../src/shared/observations.ts";
 import { goalSchema, gameActionSchema } from "../../src/shared/validation.ts";
+import { residentLimitsSchema, residentSnapshotSchema, residentStateSchema } from "../../src/shared/resident.ts";
 
 const nullableText = z.string().nullable();
 const lineage = {
@@ -111,6 +112,7 @@ const limits = z.object({
   max_depth: z.number(),
 });
 const skill = skillRef.extend({
+  entry: z.enum(["run", "step", "analyze"]).optional(),
   name: z.string(),
   source: z.string(),
   hash: z.string(),
@@ -124,13 +126,13 @@ const skill = skillRef.extend({
     complexity: z.number(),
     nesting: z.number(),
     runtime_version: z.number().optional(),
-    api_version: z.literal(4).optional(),
-    validator_version: z.literal(4).optional(),
+    api_version: z.number().int().positive().optional(),
+    validator_version: z.number().int().positive().optional(),
     compatibility_hash: z.string().optional(),
   }),
   created_at: z.string(),
 });
-const execution = skillRef.extend({
+const executionBase = skillRef.extend({
   ...lineage,
   world_id: nullableText,
   native_boot_id: nullableText,
@@ -145,7 +147,6 @@ const execution = skillRef.extend({
   root_execution_id: z.string(),
   epoch: z.number(),
   args: json,
-  limits,
   status: z.enum([
     "accepted",
     "running",
@@ -177,6 +178,12 @@ const execution = skillRef.extend({
       completed_capability_calls: z.number().int().nonnegative() }).optional(),
   }).optional(),
 });
+const execution = z.discriminatedUnion("entry", [
+  executionBase.extend({ entry: z.literal("run"), limits }),
+  executionBase.extend({ entry: z.literal("step"), limits: residentLimitsSchema, initial_state: residentStateSchema,
+    resident: residentSnapshotSchema.nullable() }),
+  executionBase.extend({ entry: z.null(), limits }),
+]);
 const tokenUsage = z.object({
   uncached_input: z.number().nullable(),
   cache_read: z.number().nullable(),
@@ -617,7 +624,7 @@ export async function fetchSkillEvidence(
     skill_id: z.string(),
     version: z.number(),
     root_execution_id: z.string(),
-    status: execution.shape.status,
+    status: executionBase.shape.status,
     duration_ms: z.number().nullable(),
     actions: z.number(),
     calls: z.number(),
@@ -778,7 +785,7 @@ const planSchema: z.ZodType<PlanProjection> = z.object({
     epoch: z.number(), life_id: z.number(), life_status: life.shape.status,
     native_boot_id: z.string(), space_epoch: z.number(), compatibility_hash: z.string(), screen: screenRefSchema.nullable(),
     task: z.string(), goal: goalSchema,
-    root: skillRef.extend({ hash: z.string(), execution_id: z.string(), status: execution.shape.status }),
+    root: skillRef.extend({ hash: z.string(), execution_id: z.string(), status: executionBase.shape.status }),
   }),
   candidate: skillRef.extend({ hash: z.string() }).nullable(),
   guard_hash: nullableText,

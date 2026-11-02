@@ -8,6 +8,8 @@ import { Store, type StoredRun } from "../src/server/store.ts";
 import { validateSkill } from "../src/server/program-validation.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import type { GameAction, GameActionResult, GameBridge } from "../src/shared/contracts.ts";
+import type { ControllerInputChannel, RevocationAck } from "../src/shared/controller.ts";
+import { ControllerInputs } from "../src/server/controller-inputs.ts";
 import { effectScope, executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 
 const cleanup: Array<() => Promise<void>> = [];
@@ -23,11 +25,11 @@ async function fixture() {
   const run = minecraftRunFixture(adapter, { run_id: scope.run_id, world_id: scope.world_id, epoch: scope.epoch,
     session_id: scope.session_id, life_id: scope.life_id, native_boot_id: scope.native_boot_id, space_epoch: scope.space_epoch, task: "Scope conformance only", model_id: "contract-model" });
   store.saveRun(run);
-  const validated = await validateSkill({ name: "Scoped source", source:
+  const validated = await validateSkill({ entry: "run", name: "Scoped source", source:
     'return {status:"completed",summary:"Contract only",result:null};', card, dependencies: [] },
     adapter);
-  const skill = store.registerSkill(run.run_id, validated);
-  const execution = store.admitSkill(run.run_id, { skill_id: skill.skill_id, version: skill.version,
+  const skill = await store.registerSkill(run.run_id, validated);
+  const execution = store.admitSkill(run.run_id, { entry: "run", skill_id: skill.skill_id, version: skill.version,
     start_key: "host-start", ...executionScopeFixture(run, scope.run_generation),
     args: {}, limits: DEFAULT_SKILL_LIMITS }).view;
   const state = { status: "connected" as const, username: "fixture", version: "1.21.4", world_id: scope.world_id,
@@ -59,13 +61,59 @@ async function fixture() {
     effectScope: (id: string) => ({ ...scope, execution_id: id, source_hash: currentSource, run_generation: generation }) };
   const arbiter = new ActionArbiter(store, game, host);
   cleanup.push(async () => { await arbiter.close("Fixture cleanup"); store.close(); rmSync(directory, { recursive: true, force: true }); });
-  return { store, run, state, skill, execution, adapter, observe, arbiter, applied, emitted, cancellationOwners,
+  return { store, run, state, skill, execution, adapter, observe, arbiter, game, applied, emitted, cancellationOwners,
     setEmitter: (next: typeof emitter) => { emitter = next; },
     replaceSource: () => { currentSource = "f".repeat(64); },
     replaceGeneration: () => { generation++; },
     admit: (id = "scope-action", action: GameAction = { kind: "look", yaw: 0, pitch: 0 }) =>
       arbiter.admit(id, action, 0, undefined, null, execution.execution_id) };
 }
+
+test("resident reservation blocks finite admission until confirmed old-owner retirement", async () => {
+  const f = await fixture(), retired = Promise.withResolvers<RevocationAck>();
+  const drained = Promise.withResolvers<void>(), draining = Promise.withResolvers<void>();
+  let fenced = false, settled = false;
+  f.game.openController = async (reservation, generation) => {
+    const owner = { operation_id: reservation.operation_id, scope: reservation.scope, generation: 1 };
+    const ledger = new ControllerInputs(owner, generation);
+    const channel: ControllerInputChannel = {
+      owner, controllerGeneration: generation,
+      sample: async () => { throw new Error("No sensor in this isolated authority fixture"); },
+      submit: () => { throw new Error("No actuator in this isolated authority fixture"); },
+      renew: async (_frame) => { throw new Error("No native clock in this isolated authority fixture"); },
+      revoke: () => retired.promise, snapshot: () => ledger.snapshot(),
+    };
+    return channel;
+  };
+  const channel = await f.arbiter.reserveController(f.execution.execution_id, 1, performance.now() + 5000, () => {}, () => {}, {
+    fence: () => { fenced = true; }, drain: async () => { draining.resolve(); await drained.promise; },
+  });
+  cleanup.unshift(async () => { drained.resolve(); retired.resolve({ owner: channel.owner, controller_generation: 1,
+    admission_revoked: true, last_applied_sequence: 0, ordered_edge_prefix: 0,
+    retirement_applied_native_tick: 7, retirement_applied_native_ns: "123456",
+    input_application: "confirmed", unresolved_operation_refs: [] }); });
+  expect(f.arbiter.busy).toBe(true);
+  expect(() => f.admit("blocked-by-controller")).toThrow();
+  expect(f.store.getAction(f.run.run_id, "blocked-by-controller")).toBeNull();
+  const barrier = channel.revoke();
+  void barrier.then(() => { settled = true; });
+  expect(fenced).toBe(true);
+  expect(f.arbiter.busy).toBe(true);
+  expect(() => f.admit("blocked-by-retiring-controller")).toThrow();
+  retired.resolve({ owner: channel.owner, controller_generation: 1, admission_revoked: true,
+    last_applied_sequence: 0, ordered_edge_prefix: 0, retirement_applied_native_tick: 7,
+    retirement_applied_native_ns: "123456", input_application: "confirmed", unresolved_operation_refs: [] });
+  await draining.promise;
+  expect(settled).toBe(false);
+  expect(f.arbiter.busy).toBe(true);
+  expect(() => f.admit("native-retired-worker-still-live")).toThrow();
+  drained.resolve();
+  await barrier;
+  expect(f.arbiter.busy).toBe(false);
+  f.admit("after-controller-retirement");
+  await f.emitted.promise;
+  expect(f.store.getAction(f.run.run_id, "after-controller-retirement")?.view.status).not.toBe("cancelled");
+});
 
 // A positive control ensures stale tests cannot pass by globally closing effects.
 test("one current host invocation reaches the existing arbiter with its complete immutable scope", async () => {
@@ -82,12 +130,32 @@ test("one current host invocation reaches the existing arbiter with its complete
   });
 });
 
-test("closed-view admission sends explicit expected_screen:null rather than an unrestricted omission", async () => {
+test("closed-view admission sends explicit absent authority rather than an unrestricted omission", async () => {
   const f = await fixture();
   Reflect.set(f.state, "screen", null);
   f.admit("no-screen-operation");
   await f.emitted.promise;
-  expect(f.applied[0]).toHaveProperty("expected_screen", null);
+  expect(f.applied[0]).toHaveProperty("expected_screen", { kind: "absent" });
+});
+
+test("GUI layout admission survives unrelated transactional revision changes", async () => {
+  const f = await fixture();
+  f.admit("persistent-screen", { kind: "screen_input",
+    screen: { screen_id: f.state.screen.screen_id, incarnation: f.state.screen.incarnation, layout_revision: 1 }, operations: [] });
+  f.state.screen.revision++;
+  await f.emitted.promise;
+  expect(f.applied[0]).toHaveProperty("expected_screen", { kind: "layout",
+    screen: { screen_id: "visible-view", incarnation: 2, layout_revision: 1 } });
+});
+
+test("queued GUI layout cannot dispatch after its handler is replaced", async () => {
+  const f = await fixture();
+  f.admit("stale-screen", { kind: "screen_input",
+    screen: { screen_id: f.state.screen.screen_id, incarnation: f.state.screen.incarnation, layout_revision: 1 }, operations: [] });
+  f.state.screen.incarnation++;
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(f.applied).toEqual([]);
+  expect(f.store.getAction(f.run.run_id, "stale-screen")?.view.status).toBe("cancelled");
 });
 
 for (const transition of ["boot", "life", "dimension", "same-dimension relocation", "screen instance", "screen revision", "source", "run generation", "descriptor"] as const) {
@@ -163,7 +231,7 @@ test("API3 source and outcome remain inspectable but cannot allocate an active w
   const f = await fixture();
   const historical = { ...f.skill, skill_id: "retained-api3-source", name: "Retained API3 source",
     validation: { ...f.skill.validation, runtime_version: 3 } };
-  const snapshot = f.store.importSkill(f.run.run_id, historical);
+  const snapshot = await f.store.importSkill(f.run.run_id, historical);
   let allocations = 0;
   const manager = new SkillManager(f.store, { runSkill: async () => {
     allocations++; return { status: "completed", summary: "Should not allocate", result: null };
@@ -173,7 +241,7 @@ test("API3 source and outcome remain inspectable but cannot allocate an active w
     recover: async () => { throw new Error("No recovery in a historical read"); },
   });
   try {
-    expect(() => manager.start(f.run.run_id, { ...snapshot, start_key: "old-api-attempt", ...executionScopeFixture(f.run, effectScope().run_generation),
+    expect(() => manager.start(f.run.run_id, { ...snapshot, entry: "run", start_key: "old-api-attempt", ...executionScopeFixture(f.run, effectScope().run_generation),
       args: { scope: effectScope() }, limits: DEFAULT_SKILL_LIMITS })).toThrow();
     await new Promise<void>(resolve => setImmediate(resolve));
     expect(allocations).toBe(0);

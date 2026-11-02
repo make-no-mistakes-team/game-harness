@@ -12,15 +12,15 @@ export const adapterDescriptorSchema = z.object({ descriptor_schema: z.literal(1
       configuration_hash: sha256Schema }).strict() }).strict(),
   capabilities: z.array(z.object({ id: identitySchema, version: safeCounterSchema.min(1), schema_hash: sha256Schema }).strict()).max(32),
   actuator: z.enum(["native", "desktop"]),
-  executable: z.object({ api_version: z.literal(4), validator_version: z.literal(4), runtime_version: z.literal(4) }).strict(),
+  executable: z.object({ api_version: z.literal(5), validator_version: z.literal(5), runtime_version: z.literal(5) }).strict(),
 }).strict() satisfies z.ZodType<AdapterDescriptor>;
 export const programCompatibilitySchema = z.object({ descriptor: adapterDescriptorSchema, compatibility_hash: sha256Schema }).strict() satisfies z.ZodType<ProgramCompatibility>;
 export const adapterBindingSchema = programCompatibilitySchema.extend({ native_boot_id: identitySchema, ready: z.boolean() }).strict() satisfies z.ZodType<AdapterBinding>;
-export const activeExecutableValidationSchema = z.object({ api_version: z.literal(4), validator_version: z.literal(4), runtime_version: z.literal(4),
+export const activeExecutableValidationSchema = z.object({ api_version: z.literal(5), validator_version: z.literal(5), runtime_version: z.literal(5),
   compatibility_hash: sha256Schema, fingerprint: sha256Schema, formatted_lines: safeCounterSchema,
   complexity: safeCounterSchema, nesting: safeCounterSchema,
 }).strict() satisfies z.ZodType<ActiveExecutableValidation>;
-export const historicalExecutableValidationSchema = z.object({ runtime_version: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+export const historicalExecutableValidationSchema = z.object({ runtime_version: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
   fingerprint: z.string(), api_version: safeCounterSchema.optional(), validator_version: safeCounterSchema.optional(),
   compatibility_hash: z.string().optional(), formatted_lines: safeCounterSchema.optional(), complexity: safeCounterSchema.optional(),
   nesting: safeCounterSchema.optional(),

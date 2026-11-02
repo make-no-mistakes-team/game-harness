@@ -30,25 +30,28 @@
 
 ## Manual gameplay review
 
-After each non-trivial change intended to improve an agent's in-game behavior,
-explicitly ask the user to manually review the resulting gameplay. You may
-inspect gameplay and compare metrics yourself, but treat your conclusions as
-provisional. The final judgment that the change improved behavior must be based
-on the user's manual visual review.
+After changes likely to noticeably affect how the agent plays, show
+representative gameplay and explicitly ask the user for manual visual review.
+Pause development, including subagent work, until the user gives feedback on
+that gameplay.
+
+Small changes may be grouped to avoid frequent pauses. Briefly track gameplay
+changes since the last review and request another review when their combined
+effect could become noticeable to an ordinary user.
+
+Tests, metrics, and your own inspection are supporting evidence, not proof
+that gameplay improved. The user's visual judgment is decisive.
 
 ## Tooling and dependencies
 
-The agent may install any tooling or dependencies needed for the task without
-asking permission. This includes packages, libraries, CLIs, SDKs, and build or
-test dependencies, through apt, brew, npm, pnpm, yarn, pip, pipx, uv, cargo, go,
-gem, composer, or other package managers.
+Choose tools and programming languages based on what best serves the task, not
+on what is already installed. If a better implementation, investigation, or
+verification requires additional software, install it as part of the work
+without asking permission. This includes tools, applications, programming
+languages, runtimes, SDKs, libraries, and build or test dependencies.
 
-Missing dependencies are setup work. Install tools that improve correctness,
-performance, maintainability, or diagnostics rather than choosing a weaker
-implementation to avoid installation.
-
-Prefer project-local, temporary, or virtual-environment installs when practical.
-Use system-wide installation when needed. Report changes to tracked lockfiles,
+Prefer project-local, temporary, or virtual-environment installs when practical;
+use system-wide installation when needed. Report changes to tracked lockfiles,
 manifests, and configuration as part of the workspace changes.
 
 ## Committing and integrating into main

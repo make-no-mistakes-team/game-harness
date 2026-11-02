@@ -6,13 +6,16 @@ import type {
   StrategyCard,
 } from "./contracts.ts";
 import type { LookaheadConfig } from "./planning.ts";
+import type { ResidentLimits, ResidentSnapshot } from "./resident.ts";
+
+export type ProgramEntry = "run" | "step" | "analyze";
 
 export interface SkillRef {
   skill_id: string;
   version: number;
 }
 
-export const SKILL_API_VERSION = 4;
+export const SKILL_API_VERSION = 5;
 
 export const PROGRAM_RESULT_GUIDANCE = "Return a brief summary (1–2000 characters) and compact semantic result: relevant counts, task facts, selected failure information and authored continuity notes. The entire serialized JSON frame plus newline, not only result or summary, must fit 65536 UTF-8 bytes and depth 32; leave room for its envelope. Raw observations and action receipts stay in host Store/trace/journal evidence: use program_inspect execution/action/trace/events with returned named/ordinal references and cursors. Do not return receipt/observation arrays, invent evidence IDs, or stringify them into summary. A terminal serialization failure does not roll back completed effects: inspect retained evidence and fresh state before deciding what remains.";
 
@@ -21,7 +24,7 @@ export interface NamedProgramRef {
   version?: number;
 }
 export interface SkillAPIManifest {
-  api_version: 4;
+  api_version: 5;
   action_enabled: boolean;
   supports_respawn: boolean;
   bindings: readonly { name: string; capability_id: string; version: number; parameters: readonly string[] }[];
@@ -52,6 +55,7 @@ export const MAX_SKILL_LIMITS: Readonly<SkillLimits> = Object.freeze({
 });
 
 export interface SkillSpec {
+  entry: ProgramEntry;
   name: string;
   source: string;
   card: StrategyCard;
@@ -59,6 +63,8 @@ export interface SkillSpec {
 }
 
 export interface SkillView extends SkillRef {
+  /** Missing only on historical immutable rows; never inferred for execution. */
+  entry?: ProgramEntry;
   name: string;
   source: string;
   hash: string;
@@ -105,7 +111,7 @@ export interface GameAPI {
   progress(summary: string, details: Json): Promise<null>;
 }
 
-export interface SkillStartRequest extends SkillRef {
+interface SkillStartBase extends SkillRef {
   start_key: string;
   epoch: number;
   session_id: string;
@@ -115,12 +121,21 @@ export interface SkillStartRequest extends SkillRef {
   space_epoch: number;
   compatibility_hash: string;
   args: Json;
+}
+export interface RunSkillStartRequest extends SkillStartBase {
+  entry: "run";
   limits: SkillLimits;
   /** Explicit one-shot lookahead opt-in; omission creates no planning request. */
   lookahead?: LookaheadConfig;
 }
+export interface ResidentSkillStartRequest extends SkillStartBase {
+  entry: "step";
+  limits: ResidentLimits;
+  initial_state: Json;
+}
+export type SkillStartRequest = RunSkillStartRequest | ResidentSkillStartRequest;
 
-export interface SkillExecutionView extends SkillRef {
+interface SkillExecutionBase extends SkillRef {
   execution_id: string;
   run_id: string;
   world_id: string | null;
@@ -137,7 +152,6 @@ export interface SkillExecutionView extends SkillRef {
   source_hash: string | null;
   compatibility_hash: string | null;
   args: Json;
-  limits: SkillLimits;
   status:
     | "accepted"
     | "running"
@@ -157,6 +171,11 @@ export interface SkillExecutionView extends SkillRef {
   diagnostic?: { type: string; message: string; source_hash: string; location: { mapping: "unmapped" }; code?: string;
     output?: ProgramOutputFailure };
 }
+export type SkillExecutionView = SkillExecutionBase & (
+  | { entry: "run"; limits: SkillLimits }
+  | { entry: "step"; limits: ResidentLimits; initial_state: Json; resident: ResidentSnapshot | null }
+  | { entry: null; limits: SkillLimits }
+);
 
 export type SkillCapabilityRequest =
   | { kind: "observe" }

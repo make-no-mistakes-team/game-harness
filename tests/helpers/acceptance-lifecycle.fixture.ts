@@ -74,7 +74,7 @@ function frame() {
 }
 function actorFrame() {
   if (mode !== "image-before-first" && !(mode === "image-after-settled" && providerCalls > 0)) return frame();
-  // Valid GHV1/RGBA, but incompressible RGB makes the actual lossless PNG
+  // Valid GHV2/RGBA, but incompressible RGB makes the actual lossless PNG
   // exceed the actor's 2 MiB limit. Recorder deliveries remain valid 2x2
   // frames, isolating actor preparation from independent recorder failure.
   return nativeFrame({ width: 1024, height: 1024, sequence: ++frameSequence, capturedAt: Date.now(),
@@ -121,7 +121,8 @@ const stream: StreamFn = (_model, context, options) => {
   providerCalls++;
   actorContexts.push(JSON.stringify(context));
   // Inventory gain is a synthetic native observation, not a fake verifier.
-  hasWood = !imageFailure && mode !== "cold-isolation" && !planningStalled && !requestCapNonGoal && !cancelBeforeIterator;
+  hasWood = !imageFailure && mode !== "cold-isolation" && mode !== "request-cap" &&
+    !planningStalled && !requestCapNonGoal && !cancelBeforeIterator;
   const events = new AssistantMessageEventStream();
   const repair = mode === "cold-isolation" && providerCalls <= 2 || requestCapNonGoal && providerCalls === 1;
   const finishing = customFinish && providerCalls === 1;
@@ -174,6 +175,12 @@ mock.module(resolve(import.meta.dir, "../../src/server/auth.ts"), () => ({ AuthM
   createAgent: async (options: { systemPrompt: string[]; tools: Parameters<Agent["setTools"]>[0] }) => {
     const agent = new Agent({ initialState: { model, systemPrompt: options.systemPrompt, tools: options.tools }, streamFn: stream,
       getApiKey: () => "LOCAL_SYNTHETIC_PROVIDER_ONLY" });
+    // This case asserts a settled request followed by a verified goal. Publishing
+    // gain at acquisition instead races goal Stop against iterator exhaustion,
+    // correctly producing unknown consumption even before the run deadline.
+    if (mode === "request-cap") agent.subscribe(event => {
+      if (event.type === "agent_end") hasWood = true;
+    });
     agents.add(agent); return agent;
   },
   releaseAgent: async (agent: Agent) => { agent.abort(); await agent.waitForIdle(); agents.delete(agent); },

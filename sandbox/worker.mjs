@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { networkInterfaces } from "node:os";
 import { createConnection } from "node:net";
 import { types } from "node:util";
+import * as vm from "node:vm";
 import {
   Worker,
   isMainThread,
@@ -30,6 +31,13 @@ function depthIsBounded(value, depth = 0) {
       if (!depthIsBounded(entry, depth + 1)) return false;
   }
   return true;
+}
+
+function finiteJson(value) {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value).every(finiteJson);
 }
 
 async function probe() {
@@ -149,6 +157,90 @@ function runPolicyThread() {
       .catch(() => exit(1));
   });
   post('{"type":"compiled"}');
+}
+
+// Resident computation and all inspection/serialization of its return value
+// stay in the watched untrusted thread. Docker, not vm, is the isolation proof.
+async function runResidentThread() {
+  const post = parentPort.postMessage.bind(parentPort);
+  const exit = process.exit.bind(process);
+  const entry = workerData.entry;
+  const context = vm.createContext(Object.create(null), {
+    codeGeneration: { strings: false, wasm: false },
+  });
+  const realm = vm.runInContext("({ parse: JSON.parse, object: Object.prototype, array: Array.prototype })", context);
+  const module = new vm.SourceTextModule(workerData.source, {
+    context,
+    importModuleDynamically() { throw new Error("imports_unsupported"); },
+  });
+  await module.link(() => { throw new Error("imports_unsupported"); });
+  await module.evaluate();
+  const names = Object.getOwnPropertyNames(module.namespace);
+  const selected = module.namespace[entry];
+  if (names.length !== 1 || names[0] !== entry || typeof selected !== "function" ||
+    types.isAsyncFunction(selected) || types.isGeneratorFunction(selected) ||
+    selected.length !== (entry === "step" ? 3 : 1))
+    throw new Error("selected_export");
+
+  function cleanJson(value, depth = 0, active = new Set()) {
+    if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (!value || typeof value !== "object" || depth + 1 > MAX_DEPTH || active.has(value))
+      throw new Error("json");
+    const array = Array.isArray(value);
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== (array ? realm.array : realm.object) && !(prototype === null && !array))
+      throw new Error("json_prototype");
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const keys = Reflect.ownKeys(descriptors);
+    const length = array ? descriptors.length?.value : keys.length;
+    if (!Number.isSafeInteger(length) || length < 0 || length > MAX_OUTPUT ||
+      (array && keys.length !== length + 1))
+      throw new Error("json_size");
+    const clean = array ? [] : Object.create(null);
+    active.add(value);
+    for (const key of keys) {
+      if (array && key === "length") continue;
+      const descriptor = descriptors[key];
+      if (typeof key !== "string" || !descriptor.enumerable ||
+        !Object.hasOwn(descriptor, "value") ||
+        (array && (!/^(?:0|[1-9][0-9]*)$/.test(key) || Number(key) >= length)))
+        throw new Error("json_descriptor");
+      Object.defineProperty(clean, key, { value: cleanJson(descriptor.value, depth + 1, active),
+        enumerable: true, writable: true, configurable: true });
+    }
+    active.delete(value);
+    return clean;
+  }
+  let busy = false;
+  parentPort.on("message", message => {
+    if (busy) return exit(1);
+    busy = true;
+    try {
+      // Parse into the module's realm rather than exposing outer-realm object
+      // constructors through frame/state/input.
+      const input = realm.parse(stringify(message));
+      const value = cleanJson(entry === "step"
+        ? selected(input.frame, input.state, input.intent) : selected(input.input));
+      if (entry === "step") {
+        if (!value || Array.isArray(value) ||
+          !exactKeys(value, ["input", "next_state", "status", "events"]) ||
+          byteLength(stringify(value.next_state)) > MAX_STATE)
+          throw new Error("step_result");
+      }
+      const encoded = stringify({ v: 1, type: "resident_result", id: message.id, value });
+      if (byteLength(encoded) + 1 > MAX_OUTPUT || !depthIsBounded(parse(encoded)))
+        throw new Error("output_limit");
+      post(encoded);
+      busy = false;
+    } catch { exit(1); }
+  });
+  post('{"v":1,"type":"resident_compiled","id":0}');
+}
+
+function exactKeys(value, keys) {
+  return Object.keys(value).length === keys.length &&
+    keys.every(key => Object.hasOwn(value, key));
 }
 
 function runSkillThread() {
@@ -275,7 +367,7 @@ function runSkillThread() {
     return completion.promise;
   }
   const api = workerData.api;
-  if (api?.api_version !== 4 || typeof api.action_enabled !== "boolean" || typeof api.supports_respawn !== "boolean" || !Array.isArray(api.bindings))
+  if (api?.api_version !== 5 || typeof api.action_enabled !== "boolean" || typeof api.supports_respawn !== "boolean" || !Array.isArray(api.bindings))
     throw new Error("Missing active game API manifest.");
   const methods = Object.assign(Object.create(null), {
     observe: () => call({ kind: "observe" }),
@@ -377,7 +469,7 @@ function runSkillSupervisor() {
     if (!thread && frame.type === "skill_init" && frame.id === 0) {
       if (typeof frame.source !== "string" || byteLength(frame.source) > MAX_SKILL_INPUT ||
         !frame.instrumentation ||
-        frame.api?.api_version !== 4 || typeof frame.api.action_enabled !== "boolean" ||
+        frame.api?.api_version !== 5 || typeof frame.api.action_enabled !== "boolean" ||
         typeof frame.api.supports_respawn !== "boolean" || !Array.isArray(frame.api.bindings) || frame.api.bindings.length > 32 ||
         !/^__trace_[a-f0-9]{32}$/.test(frame.instrumentation.hook_name) ||
         typeof frame.instrumentation.scope !== "string" ||
@@ -471,6 +563,12 @@ function runSupervisor() {
   let outputBytes = 0;
   let logBytes = 0;
   let closing = false;
+  const resident = process.argv[2] === "resident";
+  const budget = resident ? Number(process.argv[3]) : 500;
+  let residentEntry = null;
+  let sequence = 0;
+  if (resident && (!Number.isSafeInteger(budget) || budget < 1 || budget > 5000))
+    return exit(1);
 
   async function shutdown(code) {
     if (closing) return;
@@ -507,6 +605,43 @@ function runSupervisor() {
   async function receive(message) {
     if (!message || typeof message !== "object" || !depthIsBounded(message))
       throw new Error("input");
+    if (resident) {
+      if (!finiteJson(message) || message.v !== 1 || !Number.isSafeInteger(message.id) || message.id < 0)
+        throw new Error("protocol");
+      if (!initialized) {
+        if (message.type !== "resident_init" || message.id !== 0 ||
+          !exactKeys(message, ["v", "type", "id", "entry", "source"]) ||
+          !["step", "analyze"].includes(message.entry) ||
+          typeof message.source !== "string" || byteLength(message.source) > 16384)
+          throw new Error("resident_init");
+        initialized = true;
+        residentEntry = message.entry;
+        expected = "resident_compiled";
+        watchdog = setTimeout(fail, 15_000);
+        thread = new Worker(new URL(import.meta.url), {
+          workerData: { mode: "resident", source: message.source, entry: residentEntry },
+          execArgv: ["--experimental-vm-modules"],
+          stdout: true, stderr: true,
+          resourceLimits: { maxOldGenerationSizeMb: 48, stackSizeMb: 2 },
+        });
+        attachThread();
+        return;
+      }
+      const step = residentEntry === "step";
+      if (!thread || message.type !== `resident_${residentEntry}` ||
+        message.id !== sequence + 1 ||
+        !exactKeys(message, step ? ["v", "type", "id", "frame", "state", "intent"]
+          : ["v", "type", "id", "input"]))
+        throw new Error("protocol");
+      if (step && (byteLength(stringify(message.state)) > MAX_STATE ||
+        byteLength(stringify(message.intent)) > MAX_STATE))
+        throw new Error("state_limit");
+      sequence = message.id;
+      expected = "resident_result";
+      watchdog = setTimeout(fail, budget);
+      thread.postMessage(message);
+      return;
+    }
     if (message.type === "probe" && !initialized) {
       initialized = true;
       watchdog = setTimeout(fail, 1000);
@@ -530,6 +665,26 @@ function runSupervisor() {
         stderr: true,
         resourceLimits: { maxOldGenerationSizeMb: 48, stackSizeMb: 2 },
       });
+      attachThread();
+      return;
+    }
+    if (
+      message.type !== "evaluate" ||
+      !thread ||
+      !message.state ||
+      Array.isArray(message.state) ||
+      typeof message.state !== "object"
+    )
+      throw new Error("protocol");
+    if (byteLength(stringify(message.state)) > MAX_STATE)
+      throw new Error("state_limit");
+    expected = "decision";
+    // Independent of the host timer and of the policy's own blocked event loop.
+    watchdog = setTimeout(fail, 500);
+    thread.postMessage({ context: message.context, state: message.state });
+  }
+
+  function attachThread() {
       const consumeLog = (chunk) => {
         logBytes += chunk.length;
         outputBytes += chunk.length;
@@ -553,6 +708,10 @@ function runSupervisor() {
           const reply = parse(encoded);
           if (!reply || !depthIsBounded(reply) || reply.type !== expected)
             throw new Error("protocol");
+          if (resident && (reply.v !== 1 || reply.id !== sequence ||
+            !exactKeys(reply, expected === "resident_compiled"
+              ? ["v", "type", "id"] : ["v", "type", "id", "value"])))
+            throw new Error("protocol");
           if (reply.type === "decision") {
             if (
               !reply.state ||
@@ -570,22 +729,6 @@ function runSupervisor() {
           fail();
         }
       });
-      return;
-    }
-    if (
-      message.type !== "evaluate" ||
-      !thread ||
-      !message.state ||
-      Array.isArray(message.state) ||
-      typeof message.state !== "object"
-    )
-      throw new Error("protocol");
-    if (byteLength(stringify(message.state)) > MAX_STATE)
-      throw new Error("state_limit");
-    expected = "decision";
-    // Independent of the host timer and of the policy's own blocked event loop.
-    watchdog = setTimeout(fail, 500);
-    thread.postMessage({ context: message.context, state: message.state });
   }
 
   process.stdin.on("data", (chunk) => {
@@ -609,11 +752,12 @@ function runSupervisor() {
   process.stdin.on("error", fail);
   process.on("uncaughtException", fail);
   process.on("unhandledRejection", fail);
-  send({ type: "ready" });
+  send(resident ? { v: 1, type: "resident_ready", id: 0 } : { type: "ready" });
 }
 
 if (isMainThread) {
   if (process.argv[2] === "skill") runSkillSupervisor();
   else runSupervisor();
 } else if (workerData.mode === "skill") runSkillThread();
+else if (workerData.mode === "resident") void runResidentThread().catch(() => process.exit(1));
 else runPolicyThread();

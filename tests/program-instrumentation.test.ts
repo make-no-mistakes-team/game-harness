@@ -173,7 +173,7 @@ async function execute(
   const state: { terminalFrame: Record<string, unknown> | null } = { terminalFrame: null };
   const worker = new Worker(new URL("../sandbox/worker.mjs", import.meta.url), {
     workerData: { mode: "skill", source: program.execution_source, source_hash: program.source_hash, args: null,
-      api: { api_version: 4, action_enabled: true, supports_respawn: true, bindings: adapter.bindings },
+      api: { api_version: 5, action_enabled: true, supports_respawn: true, bindings: adapter.bindings },
       instrumentation: { hook_name: program.hook_name, scope: program.scope,
         kinds: program.points.map((point) => point.kind) } },
     stdout: true, stderr: true,

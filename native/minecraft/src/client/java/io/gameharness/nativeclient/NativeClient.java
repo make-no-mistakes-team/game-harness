@@ -7,10 +7,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.Instant;
 import java.util.*;
+import java.util.function.Function;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
+import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
+import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.gui.screen.DeathScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.entity.Entity;
@@ -34,6 +38,12 @@ public final class NativeClient implements ClientModInitializer {
   public static long blockedKeyboardCallbacks, blockedMouseCallbacks, suppressedPolls;
   private int receiptNonce;
   private final Map<Integer, Long> pendingObservations = new LinkedHashMap<>();
+  private final Map<Long, Long> pendingGuiReads = new LinkedHashMap<>();
+  private record ControllerRead(SoundProjection.Cursor cursor, long deadline) {}
+  private final Map<Long, ControllerRead> pendingControllerReads = new LinkedHashMap<>();
+  private record ResidentRead(long id, SoundProjection.Cursor cursor, long deadline, StreamOwner stream) {}
+  private ResidentRead pendingResidentRead;
+  private final ControllerSamplePhase controllerSamples = new ControllerSamplePhase();
   private final PlayerLifecycle lifecycle = new PlayerLifecycle();
   private long deathNotified = -1;
   private JsonObject death;
@@ -46,6 +56,16 @@ public final class NativeClient implements ClientModInitializer {
   private boolean issuingRespawn;
   private CameraMotion.Profile motorProfile = CameraMotion.Profile.BALANCED;
   private EffectAuthority effectAuthority;
+  private NativeEvaluationConfig evaluationConfig;
+  private NativeEvaluationGate evaluationGate;
+  private volatile Integer actualControlSendBufferBytes;
+  private EffectAuthority.Owner evaluationOwner;
+  private long evaluationControllerGeneration, evaluationTriggerNanos;
+  private EffectAuthority.VisibleScreenRef evaluationOriginalScreen;
+  private EffectAuthority.Screen evaluationReplacementScreen;
+  private String evaluationOriginalType, evaluationReplacementType;
+  private String evaluationReplacementStatus = "not_armed";
+  private boolean evaluationTriggered, evaluationTriggerHeld;
   private ClientIncarnationSignals incarnationSignals;
   private JsonObject descriptor;
   private String compatibilityHash;
@@ -53,6 +73,34 @@ public final class NativeClient implements ClientModInitializer {
   private final TargetIncarnations<BlockPos> blockIncarnations = new TargetIncarnations<>(256);
   private final TargetIncarnations<UUID> entityIncarnations = new TargetIncarnations<>(256);
   private final ScreenIncarnations screenIncarnations = new ScreenIncarnations();
+  private final NativeReplyTiming replyTiming = new NativeReplyTiming();
+  private final NativeRenderSnapshot renderSnapshot = new NativeRenderSnapshot();
+  private volatile long clientTick;
+  private Motor keyboardSamplingOwner;
+  private NativeInputs ordinaryInput, lastOrdinaryInput, ordinarySamplingOwner;
+  private VisibleScreen visibleInput;
+  private VisibleScreenView visibleView;
+  private ControllerBody controllerBody;
+  private record StreamOwner(NativeControllerContract.Grant grant, ControllerInputQueue queue) {}
+  private record CapturedControllerFrame(long tick, long nanos, long life, EffectAuthority.Space space) {}
+  private volatile StreamOwner streamOwner;
+  private StreamInputs streamInputs;
+  private JsonObject lastStreamAck, streamRetirement;
+  private ControllerInputQueue.LeaseCheck streamRetirementLease;
+  private ControllerInputQueue.Entry streamGuiEntry;
+  private VisibleScreen streamGuiDriver;
+  private final Map<Long, CapturedControllerFrame> controllerCaptures = new LinkedHashMap<>();
+  private record ControllerEffect(JsonObject value, int bytes) {}
+  private final ArrayDeque<ControllerEffect> controllerEffects = new ArrayDeque<>(8);
+  private int controllerEffectBytes;
+  private long controllerEffectsOmitted;
+  private final java.util.concurrent.atomic.AtomicReference<JsonObject> controllerSamplePending =
+      new java.util.concurrent.atomic.AtomicReference<>();
+  private long controllerFrameSequence, cachedWorldNanos, cachedWorldLife;
+  private EffectAuthority.Space cachedWorldSpace;
+  private JsonObject cachedWorld;
+  private final Function<BlockPos, JsonElement> controllerBlockReference = this::controllerBlockReference;
+  private final Function<Entity, JsonElement> controllerEntityReference = this::controllerEntityReference;
 
   private int nextReceiptNonce() {
     if (receiptNonce == Integer.MAX_VALUE) throw new IllegalStateException("Native receipt nonce range exhausted");
@@ -60,7 +108,11 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void fenceAuthority() {
+    renderSnapshot.invalidate();
+    if (evaluationGate != null) evaluationGate.cancel(effectAuthority.owner());
     effectAuthority.emergencyStop();
+    StreamOwner stream = streamOwner;
+    if (stream != null) stream.queue().fence("native_authority_fenced");
     authority = effectAuthority.cancellationGeneration();
   }
 
@@ -80,15 +132,19 @@ public final class NativeClient implements ClientModInitializer {
     notice.add("life", life());
     notice.add("space", incarnationSignals.space() == null ? JsonNull.INSTANCE : NativeEffectContract.space(incarnationSignals.space()));
     notice.add("screen", NativeEffectContract.screen(incarnationSignals.screen()));
-    notice.addProperty("neutralized", motor == null);
+    notice.addProperty("neutralized", motor == null && ordinaryInput == null && visibleInput == null && streamInputs == null);
     message.add("notice", notice);
-    try { output.write(message.toString()); output.newLine(); output.flush(); }
-    catch (IOException error) { connected = false; fenceAuthority(); neutralize(); client.scheduleStop(); }
+    output.critical(message.toString());
   }
 
   public void spaceReceived() { incarnationSignals.authoritativeSpaceReceived(); }
   public void scopeUnavailable() { if (incarnationSignals != null) incarnationSignals.loading(); }
-  public void screenReceived() { if (incarnationSignals != null) incarnationSignals.viewReceived(); }
+  public void screenReceived() {
+    VisibleScreen.screenChanged();
+    if (ordinaryInput != null && client.currentScreen != null) ordinaryInput.screenChanged(clientTick);
+    if (streamInputs != null && client.currentScreen != null) streamInputs.screenChanged();
+    if (incarnationSignals != null) incarnationSignals.viewReceived();
+  }
   public void screenTransactionReceived() { if (incarnationSignals != null) incarnationSignals.relevantTransactionReceived(); }
   public void screenTransactionReceived(int syncId) {
     if (client.player != null && (syncId <= 0 || syncId == client.player.currentScreenHandler.syncId)) screenTransactionReceived();
@@ -246,7 +302,11 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private JsonObject config;
-  private BufferedWriter output;
+  private NativeControlWriter output;
+  private final java.util.concurrent.atomic.AtomicReference<JsonObject> retirementPending =
+      new java.util.concurrent.atomic.AtomicReference<>();
+  private final java.util.concurrent.atomic.AtomicBoolean retirementReserved = new java.util.concurrent.atomic.AtomicBoolean();
+  private final Map<Long, Boolean> retirementReplies = new java.util.concurrent.ConcurrentHashMap<>();
   private volatile boolean connected;
   private volatile long authority = 1;
   private long lastRequestId;
@@ -278,6 +338,13 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   public void sent(Packet<?> packet) {
+    if (ordinaryInput != null && (packet instanceof net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket
+        || packet instanceof net.minecraft.network.packet.c2s.play.PlayerInputC2SPacket
+        || packet instanceof net.minecraft.network.packet.c2s.play.PlayerInteractEntityC2SPacket
+        || packet instanceof net.minecraft.network.packet.c2s.play.PlayerInteractItemC2SPacket
+        || packet instanceof PlayerInteractBlockC2SPacket || packet instanceof PlayerActionC2SPacket
+        || packet instanceof net.minecraft.network.packet.c2s.play.ClientCommandC2SPacket))
+      ordinaryInput.packetEmitted();
     if (motor != null && motor.kind.equals("place") && packet instanceof ClickSlotC2SPacket) {
       motor.equipmentEffectEmitted = true;
       motor.emissions |= EffectOutcome.WORLD_EFFECT;
@@ -312,8 +379,14 @@ public final class NativeClient implements ClientModInitializer {
       SOUND_DIRECTIONS = {"here", "N", "NE", "E", "SE", "S", "SW", "W", "NW"},
       SOUND_BANDS = {"near", "mid", "far"};
 
-  public void soundDelivered(int category, double dx, double dy, double dz, long at) {
-    if (connected) sounds.accept(category, dx, dy, dz, at);
+  public String soundStreamId() {
+    return connected && incarnationSignals != null && incarnationSignals.space() != null
+        && (lifecycle.status() == PlayerLifecycle.Status.ALIVE || lifecycle.status() == PlayerLifecycle.Status.DEAD)
+        ? sounds.streamId() : null;
+  }
+
+  public void soundDelivered(String streamId, int kind, double dx, double dy, double dz, long wallMillis, long nativeNanos) {
+    if (connected) sounds.accept(streamId, kind, dx, dy, dz, wallMillis, nativeNanos);
   }
 
   public void attackReceipt(int nonce, long generation, int outcome) {
@@ -342,6 +415,8 @@ public final class NativeClient implements ClientModInitializer {
           JsonParser.parseString(
                   Files.readString(Path.of(System.getProperty("gameharness.session"))))
               .getAsJsonObject();
+      evaluationConfig = NativeEvaluationConfig.read(config.get("evaluation"));
+      if (evaluationConfig != null) evaluationGate = new NativeEvaluationGate(evaluationConfig);
       if (config.has("motor_profile"))
         motorProfile = CameraMotion.Profile.valueOf(config.get("motor_profile").getAsString().toUpperCase(Locale.ROOT));
       effectAuthority = new EffectAuthority(NativeEffectContract.id(config, "session_id"),
@@ -351,43 +426,89 @@ public final class NativeClient implements ClientModInitializer {
       incarnationSignals = new ClientIncarnationSignals(client, effectAuthority, blockIncarnations, entityIncarnations, screenIncarnations,
           new ClientIncarnationSignals.Listener() {
             public void scopeFenced() {
+              renderSnapshot.invalidate();
+              resetSensingScope();
               authority = effectAuthority.cancellationGeneration();
               if (respawnRequest != 0 && lifecycle.status() == PlayerLifecycle.Status.RESPAWNING) {
                 blocks.clear(); entities.clear(); rejectObservations("Observation predates replacement space"); applyInput();
               } else neutralize();
               bindScopeIfReady(); publishScope();
             }
-            public void screenChanged() { publishScope(); }
+            public void screenChanged() { renderSnapshot.invalidate(); publishScope(); }
           });
     } catch (Exception e) {
       throw new IllegalStateException("Private native configuration unavailable");
     }
     AdmissionClient.install();
     InventoryProofClient.install();
+    GuiTransactionProofClient.install();
+    visibleView = new VisibleScreenView(client, screenIncarnations);
+    controllerBody = new ControllerBody(client, renderSnapshot, lifecycle::lifeId, incarnationSignals::space);
     AttackProofClient.install();
     ClientTickEvents.START_CLIENT_TICK.register(c -> tick());
+    ClientTickEvents.END_CLIENT_TICK.register(c -> inputTickEnded());
+    WorldRenderEvents.START.register(this::worldRenderStarted);
     video = new Video(config);
     Thread control = new Thread(this::control, "gameharness-control");
     control.setDaemon(true);
     control.start();
   }
 
+  public void renderStarted() {
+    renderSnapshot.begin();
+  }
+
+  private void worldRenderStarted(WorldRenderContext context) {
+    if (client.world == null || client.player == null || context.world() != client.world
+        || lifecycle.status() == PlayerLifecycle.Status.LOADING) { renderSnapshot.invalidate(); return; }
+    var camera = context.camera();
+    if (!camera.isReady() || context.positionMatrix() == null || context.projectionMatrix() == null) {
+      renderSnapshot.invalidate(); return;
+    }
+    long sampled = System.nanoTime();
+    var position = camera.getPos();
+    var rotation = camera.getRotation();
+    context.positionMatrix().get(renderSnapshot.positionMatrix);
+    context.projectionMatrix().get(renderSnapshot.projectionMatrix);
+    EffectAuthority.Space space = incarnationSignals.space();
+    renderSnapshot.sample(sampled, lifecycle.lifeId(), space == null ? 0 : space.epoch(),
+        position.x, position.y, position.z, rotation.x(), rotation.y(), rotation.z(), rotation.w(),
+        Math.toRadians(camera.getYaw()), Math.toRadians(camera.getPitch()), camera.getLastTickDelta());
+  }
+
   public void render() {
-    if (motor != null) motor.rotate();
-    if (video != null) video.capture();
+    try {
+      EffectAuthority.Space space = incarnationSignals.space();
+      if (video != null) video.capture(renderSnapshot, clientTick, lifecycle.lifeId(),
+          space == null ? 0 : space.epoch(), authority, incarnationSignals.screen());
+      settleResidentSample(true);
+    } finally {
+      renderSnapshot.end();
+    }
+  }
+
+  private Socket controlSocket() throws IOException {
+    if (evaluationConfig == null || evaluationConfig.controlSendBufferBytes() == null)
+      return new Socket(InetAddress.getLoopbackAddress(), config.get("control_port").getAsInt());
+    Socket socket = new Socket();
+    try {
+      socket.setSendBufferSize(evaluationConfig.controlSendBufferBytes());
+      socket.connect(new InetSocketAddress(InetAddress.getLoopbackAddress(), config.get("control_port").getAsInt()));
+      return socket;
+    } catch (IOException | RuntimeException error) {
+      try { socket.close(); } catch (IOException ignored) {}
+      throw error;
+    }
   }
 
   private void control() {
-    try (Socket socket =
-        new Socket(InetAddress.getLoopbackAddress(), config.get("control_port").getAsInt())) {
+    try (Socket socket = controlSocket()) {
+      if (evaluationConfig != null) actualControlSendBufferBytes = socket.getSendBufferSize();
       socket.setTcpNoDelay(true);
       socket.setSoTimeout(15000);
-      output =
-          new BufferedWriter(
-              new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
-      output.write(hello(config));
-      output.newLine();
-      output.flush();
+      output = new NativeControlWriter(socket.getOutputStream(),
+          () -> { try { socket.close(); } catch (IOException ignored) {} }, error -> transportFailed());
+      if (!output.critical(hello(config))) throw new IOException("Native hello writer unavailable");
       connected = true;
       InputStream in = socket.getInputStream();
       ByteArrayOutputStream line = new ByteArrayOutputStream();
@@ -398,8 +519,7 @@ public final class NativeClient implements ClientModInitializer {
               JsonParser.parseString(line.toString(StandardCharsets.UTF_8)).getAsJsonObject();
           line.reset();
           long requestId = NativeEffectContract.counter(request, "id");
-          if (requestId <= lastRequestId || queued.incrementAndGet() > 32)
-            throw new IOException("Invalid request sequence or pending bound");
+          if (requestId <= lastRequestId) throw new IOException("Invalid request sequence");
           lastRequestId = requestId;
           if (!request.get("session_id").getAsString().equals(config.get("session_id").getAsString())
               || !request.get("world_id").getAsString().equals(config.get("world_id").getAsString())
@@ -407,19 +527,61 @@ public final class NativeClient implements ClientModInitializer {
               || !NativeEffectContract.id(request, "native_boot_id").equals(effectAuthority.nativeBootId()))
             throw new IOException("Authority mismatch");
           long generation = NativeEffectContract.counter(request, "generation");
-          request.addProperty("received_ns", System.nanoTime());
+          long receivedNanos = System.nanoTime();
+          request.addProperty("received_ns", receivedNanos);
+          replyTiming.received(requestId, receivedNanos);
           String method = request.get("method").getAsString();
-          if (method.equals("cancel") || method.equals("disconnect")) {
+          if (method.equals("controller_submit") || method.equals("controller_heartbeat")) {
+            receiveController(request);
+            continue;
+          }
+          if (method.equals("controller_sample")) {
+            requireStream(request.getAsJsonObject("params"));
+            if (!controllerSamplePending.compareAndSet(null, request)) throw new IOException("Controller sample lane occupied");
+            client.execute(this::drainControllerSample);
+            continue;
+          }
+          if (method.equals("cancel") || method.equals("disconnect") || method.equals("controller_revoke")) {
+            if (!retirementReserved.compareAndSet(false, true)) throw new IOException("Retirement slot already occupied");
             JsonObject params = request.getAsJsonObject("params");
             boolean emergency = method.equals("disconnect") || params.has("emergency") && params.get("emergency").getAsBoolean();
             boolean matched;
-            if (emergency) { fenceAuthority(); matched = true; }
+            if (method.equals("controller_revoke")) {
+              StreamOwner stream = requireStream(params);
+              controllerSamples.retirementRequested(stream);
+              stream.queue().fence("admission_revoked");
+              if (evaluationGate != null) evaluationGate.cancel(stream.grant().owner());
+              effectAuthority.close(stream.grant().owner()); authority = effectAuthority.cancellationGeneration();
+              matched = true;
+            } else if (emergency) { fenceAuthority(); matched = true; }
             else {
-              matched = effectAuthority.close(NativeEffectContract.owner(params.getAsJsonObject("expected_owner")));
+              EffectAuthority.Owner expected = NativeEffectContract.owner(params.getAsJsonObject("expected_owner"));
+              matched = effectAuthority.close(expected);
+              if (matched && evaluationGate != null) evaluationGate.cancel(expected);
               authority = effectAuthority.cancellationGeneration();
             }
             request.addProperty("matched_owner", matched);
-          } else if (method.equals("execute")) {
+            retirementReplies.put(requestId, method.equals("disconnect"));
+            if (!retirementPending.compareAndSet(null, request)) throw new IOException("Retirement queue already occupied");
+            client.execute(this::drainRetirement);
+            continue;
+          }
+          if (queued.incrementAndGet() > 32) throw new IOException("Ordinary pending bound reached");
+          if (method.equals("controller_open")) {
+            if (streamOwner != null) throw new IOException("Prior controller retirement has not drained");
+            NativeControllerContract.Grant grant = NativeControllerContract.grant(request.getAsJsonObject("params"), generation, receivedNanos);
+            EffectAuthority.Rejection rejection = effectAuthority.grant(grant.owner(), grant.compatibilityHash(), grant.expectedScreen());
+            if (rejection != EffectAuthority.Rejection.NONE) {
+              queued.decrementAndGet(); reply(requestId, null, "Controller receive grant rejected: " + rejection.name()); continue;
+            }
+            ControllerInputQueue queue = new ControllerInputQueue(grant.taskDeadline(), receivedNanos);
+            synchronized (queue) {
+              replyTiming.controllerLease(requestId, grant.owner(), grant.controllerGeneration(),
+                  queue.opened(System.nanoTime()));
+              streamOwner = new StreamOwner(grant, queue);
+            }
+          }
+          if (method.equals("execute")) {
             NativeEffectContract.Received received = NativeEffectContract.effect(request.getAsJsonObject("params"), generation);
             EffectAuthority.Rejection rejection = effectAuthority.grant(received.owner(), received.compatibilityHash(), received.expectedScreen());
             if (rejection != EffectAuthority.Rejection.NONE) {
@@ -446,12 +608,304 @@ public final class NativeClient implements ClientModInitializer {
     } finally {
       connected = false;
       fenceAuthority();
+      if (output != null) output.close();
       client.execute(
           () -> {
             neutralize();
             client.scheduleStop();
           });
     }
+  }
+
+  private void transportFailed() {
+    connected = false;
+    fenceAuthority();
+    client.execute(() -> { neutralize(); client.scheduleStop(); });
+  }
+
+  private void drainRetirement() {
+    JsonObject request = retirementPending.getAndSet(null);
+    if (request != null) dispatch(request);
+  }
+
+  private void drainControllerSample() {
+    JsonObject request = controllerSamplePending.getAndSet(null);
+    if (request != null) dispatch(request);
+  }
+
+  private StreamOwner requireStream(JsonObject params) {
+    StreamOwner stream = streamOwner;
+    if (stream == null) throw new IllegalArgumentException("No admitted controller owner");
+    NativeControllerContract.owner(params, stream.grant());
+    return stream;
+  }
+
+  /** Called only after a real mouse press and capture of the old driver's pending release values. */
+  void evaluationInventoryPressed(VisibleScreen driver, Object screen, Object handler,
+      EffectAuthority.VisibleScreenRef ref, int operationIndex) {
+    if (evaluationGate == null || !evaluationGate.armed() || operationIndex != 1) return;
+    StreamOwner stream = streamOwner;
+    if (stream == null || driver != streamGuiDriver || driver != visibleInput || !driver.evaluationPressed()
+        || !streamAuthorized() || stream.queue().expired(System.nanoTime())
+        || client.currentScreen != screen || !(screen instanceof InventoryScreen inventory)
+        || client.player.currentScreenHandler != handler || handler != client.player.playerScreenHandler
+        || inventory.getScreenHandler() != handler) return;
+    try {
+      if (!ref.equals(visibleView.currentLayout())) return;
+    } catch (RuntimeException unavailable) { return; }
+    if (!evaluationGate.consume(stream.grant().owner(), stream.grant().controllerGeneration(),
+        screen, handler, ref, operationIndex)) return;
+    // Consumption precedes allocation/setScreen: any exception or real scope change cannot retry.
+    evaluationTriggered = true; evaluationTriggerHeld = driver.evaluationPressed();
+    evaluationTriggerNanos = System.nanoTime(); evaluationReplacementStatus = "failed";
+    try {
+      InventoryScreen replacement = new InventoryScreen(client.player);
+      client.setScreen(replacement);
+      EffectAuthority.Screen identity = screenIncarnations.screen();
+      if (client.currentScreen != replacement || identity == null
+          || identity.id().equals(ref.id()) || identity.incarnation() == ref.incarnation()) return;
+      evaluationReplacementScreen = identity;
+      evaluationReplacementType = replacement.getClass().getName();
+      evaluationReplacementStatus = "replaced";
+    } catch (RuntimeException failed) {
+      // The already-consumed fault remains failed; ordinary driver cleanup owns the old gesture.
+    }
+  }
+
+  private JsonObject evaluationStatus() {
+    JsonObject out = new JsonObject();
+    out.addProperty("enabled", true);
+    out.addProperty("allow_inventory_replacement", evaluationConfig.allowInventoryReplacement());
+    out.addProperty("control_send_buffer_bytes", evaluationConfig.controlSendBufferBytes());
+    out.addProperty("actual_control_send_buffer_bytes", actualControlSendBufferBytes);
+    boolean armed = evaluationGate.armed(), consumed = evaluationGate.consumed();
+    out.addProperty("armed", armed); out.addProperty("consumed", consumed);
+    out.addProperty("replacement_status", !armed && !consumed && evaluationOwner != null ? "cancelled" : evaluationReplacementStatus);
+    out.add("owner", evaluationOwner == null ? JsonNull.INSTANCE : NativeControllerContract.owner(evaluationOwner));
+    if (evaluationOwner == null) out.add("controller_generation", JsonNull.INSTANCE);
+    else out.addProperty("controller_generation", evaluationControllerGeneration);
+    out.add("original_screen", evaluationOriginalScreen == null ? JsonNull.INSTANCE : NativeEffectContract.visibleScreen(evaluationOriginalScreen));
+    out.add("replacement_screen", NativeEffectContract.screen(evaluationReplacementScreen));
+    out.addProperty("original_screen_type", evaluationOriginalType);
+    out.addProperty("replacement_screen_type", evaluationReplacementType);
+    out.addProperty("trigger_phase", evaluationTriggered ? "pressed" : null);
+    out.addProperty("trigger_held", evaluationTriggerHeld);
+    if (evaluationTriggered) {
+      out.addProperty("operation_index", 1);
+      out.addProperty("trigger_native_ns", Long.toString(evaluationTriggerNanos));
+    } else {
+      out.add("operation_index", JsonNull.INSTANCE); out.add("trigger_native_ns", JsonNull.INSTANCE);
+    }
+    return out;
+  }
+
+  private void receiveController(JsonObject request) {
+    long id = NativeEffectContract.counter(request, "id"), now = System.nanoTime();
+    try {
+      JsonObject params = request.getAsJsonObject("params");
+      String method = NativeEffectContract.id(request, "method");
+      if (method.equals("controller_heartbeat")) {
+        NativeControllerContract.fields(params, Set.of("owner", "controller_generation", "deadline_native_ns"));
+        StreamOwner stream = requireStream(params);
+        synchronized (stream.queue()) {
+          long checked = System.nanoTime();
+          Long deadline = null;
+          ControllerInputQueue.LeaseCheck check;
+          try {
+            deadline = NativeControllerContract.nanos(params, "deadline_native_ns");
+            if (effectAuthority.validateApplication(stream.grant().owner(), stream.grant().compatibilityHash()) != EffectAuthority.Rejection.NONE)
+              throw new IllegalStateException("Controller heartbeat scope revoked");
+            check = stream.queue().heartbeat(deadline, checked);
+            check.requireAccepted();
+          } catch (RuntimeException error) {
+            stream.queue().fence("controller_receive_failed");
+            replyTiming.controllerLease(id, stream.grant().owner(), stream.grant().controllerGeneration(),
+                stream.queue().refused(deadline, checked));
+            throw error;
+          }
+          replyTiming.controllerLease(id, stream.grant().owner(), stream.grant().controllerGeneration(), check);
+        }
+        reply(id, new JsonObject(), null);
+        return;
+      }
+      NativeControllerContract.fields(params, Set.of("sequence", "frame", "ordered_edge_start", "ordered_edge_end"));
+      JsonObject frame = params.getAsJsonObject("frame");
+      NativeControllerContract.fields(frame, Set.of("context", "input"));
+      JsonObject context = frame.getAsJsonObject("context");
+      NativeControllerContract.fields(context, Set.of("owner", "controller_generation", "source_hash", "frame_seq",
+          "observed_native_tick", "captured_native_ns"));
+      StreamOwner stream = requireStream(context);
+      if (effectAuthority.validateApplication(stream.grant().owner(), stream.grant().compatibilityHash()) != EffectAuthority.Rejection.NONE
+          || !NativeEffectContract.id(context, "source_hash").equals(stream.grant().owner().scope().sourceHash()))
+        throw new IllegalArgumentException("Controller submitted source/scope differs");
+      long sequence = NativeEffectContract.counter(context, "frame_seq"), tick = NativeEffectContract.counter(context, "observed_native_tick");
+      long captured = NativeControllerContract.nanos(context, "captured_native_ns");
+      CapturedControllerFrame actual;
+      synchronized (controllerCaptures) { actual = controllerCaptures.get(sequence); }
+      if (actual == null || actual.tick() != tick || actual.nanos() != captured
+          || actual.life() != stream.grant().owner().scope().lifeId()
+          || actual.space().epoch() != stream.grant().owner().scope().spaceEpoch())
+        throw new IllegalArgumentException("Controller input does not name its actual permitted native capture");
+      stream.queue().admit(id, NativeEffectContract.counter(params, "sequence"), sequence, tick, captured,
+          NativeEffectContract.counter(params, "ordered_edge_start"), NativeEffectContract.counter(params, "ordered_edge_end"),
+          frame.getAsJsonObject("input"), now);
+    } catch (RuntimeException error) {
+      StreamOwner stream = streamOwner;
+      if (stream != null) stream.queue().fence("controller_receive_failed");
+      reply(id, null, "Controller request rejected: " + error.getMessage());
+    }
+  }
+
+  private boolean streamAuthorized() {
+    StreamOwner stream = streamOwner;
+    return stream != null && connected && client.isOnThread() && lifecycle.ready() && client.player != null
+        && client.world != null && client.player.getHealth() > 0 && !client.player.isDead()
+        && effectAuthority.validateApplication(stream.grant().owner(), stream.grant().compatibilityHash()) == EffectAuthority.Rejection.NONE;
+  }
+
+  private void prepareController() {
+    StreamOwner stream = streamOwner;
+    if (stream == null || streamRetirement != null) return;
+    long now = System.nanoTime();
+    if (!streamAuthorized() || stream.queue().expired(now)) {
+      retireController(stream.queue().reason() == null ? "controller_scope_changed" : stream.queue().reason());
+      return;
+    }
+    if (streamInputs == null || visibleInput != null || client.isPaused() || client.getOverlay() != null) return;
+    ControllerInputQueue.Entry entry = stream.queue().begin(now, clientTick);
+    if (entry != null) {
+      try {
+        if (entry.world() != null) {
+          if (client.currentScreen != null) throw new IllegalStateException("World stream input requires absent screen");
+          streamInputs.begin(entry);
+        } else {
+          streamInputs.screenChanged();
+          incarnationSignals.viewReceived();
+          streamGuiEntry = entry;
+          if (entry.edgeEnd() == entry.edgeStart()) {
+            if (!NativeEffectContract.visibleScreen(entry.screenAction().getAsJsonObject("screen")).equals(visibleView.currentLayout()))
+              throw new IllegalStateException("Empty GUI snapshot layout changed");
+            completeControllerGui(entry, 0, now, true, null);
+          } else {
+            streamGuiDriver = visibleInput = new VisibleScreen(client, visibleView, entry.screenAction(), authority, now,
+              effectAuthority.nativeBootId(), () -> streamAuthorized() && !stream.queue().expired(System.nanoTime()),
+              this::nextReceiptNonce, (prefix, appliedAt) -> {
+                if (prefix == entry.edgeEnd() - entry.edgeStart())
+                  completeControllerGui(entry, prefix, appliedAt, true, null);
+              }, outcome -> {
+                visibleInput = null; streamGuiDriver = null;
+                JsonObject evidence = outcome.getAsJsonObject("evidence");
+                if (streamGuiEntry == entry)
+                  completeControllerGui(entry, evidence.get("applied_prefix").getAsInt(), System.nanoTime(), false,
+                      evidence.get("stop_reason").getAsString());
+                publishControllerEffect(stream, entry.sequence(), outcome);
+              });
+            if (evaluationConfig != null && evaluationConfig.allowInventoryReplacement()) streamGuiDriver.evaluation(this);
+          }
+        }
+      } catch (RuntimeException error) {
+        stream.queue().fence("controller_application_rejected: " + error.getMessage());
+        retireController(stream.queue().reason());
+        return;
+      }
+    }
+    if (stream.queue().fenced()) { retireController(stream.queue().reason()); return; }
+    if (streamInputs != null && client.currentScreen == null && streamInputs.prepare(clientTick))
+      stream.queue().applicationStage(streamInputs.pending(), 1, System.nanoTime());
+  }
+
+  private void completeControllerGui(ControllerInputQueue.Entry entry, int prefix, long now, boolean confirmed, String reason) {
+    StreamOwner stream = streamOwner;
+    if (stream == null || streamGuiEntry != entry || streamInputs == null || client.player == null) return;
+    streamGuiEntry = null;
+    JsonObject ack = streamInputs.ack(stream.grant().controllerGeneration(), entry.sequence(),
+        entry.edgeStart() + prefix, clientTick, now, confirmed ? "confirmed" : "partial", reason);
+    completeControllerInput(stream, entry, ack);
+  }
+
+  private void completeControllerInput(StreamOwner stream, ControllerInputQueue.Entry entry, JsonObject ack) {
+    var application = stream.queue().complete(entry, NativeEffectContract.counter(ack, "ordered_edge_prefix"),
+        NativeEffectContract.counter(ack, "applied_native_tick"), NativeControllerContract.nanos(ack, "applied_native_ns"));
+    replyTiming.controllerApplication(entry.requestId(), stream.grant().owner(), stream.grant().controllerGeneration(), application);
+    if (lifecycle.ready() && stream.grant().owner().scope().lifeId() == lifecycle.lifeId()
+        && incarnationSignals.space() != null
+        && stream.grant().owner().scope().spaceEpoch() == incarnationSignals.space().epoch()) lastStreamAck = ack;
+    reply(entry.requestId(), ack, null);
+    if (!ack.get("input_application").getAsString().equals("confirmed")) stream.queue().fence("partial_input_application");
+  }
+
+  private void publishControllerEffect(StreamOwner stream, long sequence, JsonObject result) {
+    JsonObject event = new JsonObject(), message = new JsonObject();
+    event.add("owner", NativeControllerContract.owner(stream.grant().owner()));
+    event.addProperty("controller_generation", stream.grant().controllerGeneration());
+    event.addProperty("sequence", sequence); event.addProperty("recorded_native_ns", Long.toString(System.nanoTime()));
+    event.add("result", result);
+    JsonObject projected = new JsonObject();
+    projected.addProperty("controller_generation", stream.grant().controllerGeneration());
+    projected.addProperty("sequence", sequence); projected.add("recorded_native_ns", event.get("recorded_native_ns"));
+    projected.add("result", result);
+    int bytes = utf8Length(projected.toString());
+    boolean currentScope = lifecycle.ready() && stream.grant().owner().scope().lifeId() == lifecycle.lifeId()
+        && incarnationSignals.space() != null
+        && stream.grant().owner().scope().spaceEpoch() == incarnationSignals.space().epoch();
+    if (currentScope && bytes <= 16382) {
+      while (controllerEffects.size() == 8 || controllerEffectBytes + bytes + controllerEffects.size() + 2 > 16384) {
+        controllerEffectBytes -= controllerEffects.removeFirst().bytes();
+        controllerEffectsOmitted = ContractIdentity.next(controllerEffectsOmitted);
+      }
+      controllerEffects.addLast(new ControllerEffect(projected, bytes)); controllerEffectBytes += bytes;
+    } else if (currentScope) controllerEffectsOmitted = ContractIdentity.next(controllerEffectsOmitted);
+    message.add("controller_effect", event);
+    output.critical(message.toString());
+  }
+
+  private static int utf8Length(String value) {
+    int bytes = 0;
+    for (int index = 0; index < value.length(); index++) {
+      char unit = value.charAt(index);
+      if (unit < 0x80) bytes++;
+      else if (unit < 0x800) bytes += 2;
+      else if (Character.isHighSurrogate(unit) && index + 1 < value.length() && Character.isLowSurrogate(value.charAt(index + 1))) {
+        bytes += 4; index++;
+      } else bytes += Character.isSurrogate(unit) ? 1 : 3;
+    }
+    return bytes;
+  }
+
+  private void retireController(String reason) {
+    StreamOwner stream = streamOwner;
+    if (stream == null || streamRetirement != null) return;
+    synchronized (stream.queue()) {
+      streamRetirementLease = stream.queue().retired(reason, System.nanoTime());
+    }
+    if (evaluationGate != null) evaluationGate.cancel(stream.grant().owner());
+    effectAuthority.close(stream.grant().owner()); authority = effectAuthority.cancellationGeneration();
+    if (streamGuiDriver != null) streamGuiDriver.cancel();
+    if (streamInputs != null) streamInputs.release();
+    streamInputs = null;
+    controllerSamples.revoke(stream);
+    JsonObject ack = new JsonObject();
+    ack.add("owner", NativeControllerContract.owner(stream.grant().owner()));
+    ack.addProperty("controller_generation", stream.grant().controllerGeneration());
+    ack.addProperty("admission_revoked", true); ack.addProperty("last_applied_sequence", stream.queue().appliedSequence());
+    ack.addProperty("ordered_edge_prefix", stream.queue().edgePrefix());
+    ack.addProperty("retirement_applied_native_tick", clientTick);
+    ack.addProperty("retirement_applied_native_ns", Long.toString(System.nanoTime()));
+    ack.addProperty("input_application", "confirmed");
+    JsonArray unresolved = new JsonArray();
+    unresolved.add(stream.grant().owner().operationId());
+    ack.add("unresolved_operation_refs", unresolved);
+    streamRetirement = ack;
+    ControllerInputQueue.Entry pending;
+    while ((pending = stream.queue().drain()) != null)
+      reply(pending.requestId(), null, "Controller retired without confirmed application: " + reason);
+  }
+
+  private void recordControllerRetirement(long requestId) {
+    StreamOwner stream = streamOwner;
+    if (stream != null && streamRetirementLease != null)
+      replyTiming.controllerLease(requestId, stream.grant().owner(), stream.grant().controllerGeneration(),
+          streamRetirementLease);
   }
 
   private synchronized void reply(long id, JsonElement data, String error) {
@@ -464,16 +918,14 @@ public final class NativeClient implements ClientModInitializer {
     if (received != null) effectAuthority.complete(received.owner());
     if (error == null) response.add("data", received == null ? data : NativeEffectContract.receipt(received, data.getAsJsonObject()));
     else response.addProperty("error", error);
-    try {
-      output.write(response.toString());
-      output.newLine();
-      output.flush();
-    } catch (IOException e) {
-      connected = false;
-      fenceAuthority();
-      neutralize();
-      client.scheduleStop();
-    }
+    JsonObject timing = replyTiming.replied(id, effectAuthority.nativeBootId(), System.nanoTime(), clientTick);
+    if (timing != null) response.add("timing", timing);
+    Boolean stop = retirementReplies.remove(id);
+    if (stop == null) output.critical(response.toString());
+    else output.reserved(response.toString(), () -> {
+      retirementReserved.set(false);
+      if (stop) client.execute(client::scheduleStop);
+    });
   }
 
   public void healthUpdated(float health) {
@@ -568,17 +1020,8 @@ public final class NativeClient implements ClientModInitializer {
     JsonObject publishedLife = life();
     notice.add("life", publishedLife);
     message.add("notice", notice);
-    try {
-      output.write(message.toString());
-      output.newLine();
-      output.flush();
+    if (output.critical(message.toString()))
       lastPublishedCanRespawn = publishedLife.get("can_respawn").getAsBoolean();
-    } catch (IOException error) {
-      connected = false;
-      fenceAuthority();
-      neutralize();
-      client.scheduleStop();
-    }
   }
 
   private PlayerLifecycle.Decision handleLifecycle(boolean alive, boolean authoritative) {
@@ -602,12 +1045,13 @@ public final class NativeClient implements ClientModInitializer {
 
   private synchronized void fenceDeath() {
     if (deathNotified == lifecycle.lifeId()) return;
+    renderSnapshot.invalidate();
+    resetSensingScope();
     deathNotified = lifecycle.lifeId();
     effectAuthority.lifeChanged(lifecycle.lifeId());
     authority = effectAuthority.cancellationGeneration();
     // Fence locally before publishing the authoritative cause. It must precede generic action loss.
     applyInput();
-    sounds.clear();
     if (client.interactionManager != null) client.interactionManager.cancelBlockBreaking();
     if (client.player != null) client.player.stopUsingItem();
     blocks.clear();
@@ -638,7 +1082,7 @@ public final class NativeClient implements ClientModInitializer {
       String method = request.get("method").getAsString();
       if (method.equals("cancel")) {
         boolean matched = request.get("matched_owner").getAsBoolean();
-        if (matched) neutralize();
+        if (matched) { neutralize(); recordControllerRetirement(id); }
         JsonObject result = new JsonObject();
         result.addProperty("neutralized", true);
         result.addProperty("matched_owner", matched);
@@ -648,10 +1092,22 @@ public final class NativeClient implements ClientModInitializer {
         reply(id, result, null);
         return;
       }
+      if (method.equals("controller_revoke")) {
+        StreamOwner stream = requireStream(request.getAsJsonObject("params"));
+        retireController("admission_revoked");
+        recordControllerRetirement(id);
+        JsonObject result = new JsonObject(); result.add("ack", streamRetirement);
+        result.addProperty("generation", authority);
+        reply(id, result, null);
+        controllerSamples.retirementReplied(stream);
+        streamOwner = null; streamRetirement = null; streamRetirementLease = null; streamGuiEntry = null;
+        settleResidentSample(false);
+        return;
+      }
       if (method.equals("disconnect")) {
         neutralize();
+        recordControllerRetirement(id);
         reply(id, new JsonObject(), null);
-        client.scheduleStop();
         return;
       }
       if (method.equals("ping")) {
@@ -662,8 +1118,39 @@ public final class NativeClient implements ClientModInitializer {
         reply(id, diagnostics(), null);
         return;
       }
+      if (method.equals("evaluation_arm_inventory_replacement")) {
+        if (evaluationConfig == null || !evaluationConfig.allowInventoryReplacement())
+          throw new IllegalStateException("Native inventory evaluation is disabled");
+        JsonObject params = request.getAsJsonObject("params");
+        NativeControllerContract.fields(params, Set.of("owner", "controller_generation", "screen"));
+        StreamOwner stream = requireStream(params);
+        if (!streamAuthorized() || stream.queue().expired(System.nanoTime()) || streamInputs == null
+            || visibleInput != null || VisibleScreen.owned() || VisibleInventory.owned()
+            || motor != null || ordinaryInput != null || client.getOverlay() != null
+            || !(client.currentScreen instanceof InventoryScreen inventory)
+            || !(client.player.currentScreenHandler instanceof net.minecraft.screen.PlayerScreenHandler)
+            || client.player.currentScreenHandler != client.player.playerScreenHandler
+            || inventory.getScreenHandler() != client.player.playerScreenHandler)
+          throw new IllegalStateException("No live idle own-inventory controller view");
+        EffectAuthority.VisibleScreenRef ref = NativeEffectContract.visibleScreen(params.getAsJsonObject("screen"));
+        if (!ref.equals(visibleView.currentLayout())
+            || !evaluationGate.arm(stream.grant().owner(), stream.grant().controllerGeneration(),
+                inventory, inventory.getScreenHandler(), ref))
+          throw new IllegalStateException("Native inventory evaluation arm rejected");
+        evaluationOwner = stream.grant().owner(); evaluationControllerGeneration = stream.grant().controllerGeneration();
+        evaluationOriginalScreen = ref; evaluationOriginalType = inventory.getClass().getName();
+        evaluationReplacementStatus = "armed";
+        reply(id, evaluationStatus(), null);
+        return;
+      }
+      if (method.equals("evaluation_status")) {
+        if (evaluationConfig == null) throw new IllegalStateException("Native evaluation is disabled");
+        NativeControllerContract.fields(request.getAsJsonObject("params"), Set.of());
+        reply(id, evaluationStatus(), null);
+        return;
+      }
       if (method.equals("motor_profile")) {
-        if (motor != null || respawnRequest != 0 || effectAuthority.owner() != null) {
+        if (motor != null || ordinaryInput != null || visibleInput != null || respawnRequest != 0 || effectAuthority.owner() != null) {
           reply(id, null, "Motor profile changes require a quiescent effect owner");
           return;
         }
@@ -681,6 +1168,18 @@ public final class NativeClient implements ClientModInitializer {
         reply(id, null, "Minecraft player has not joined");
         return;
       }
+      if (method.equals("controller_open")) {
+        StreamOwner stream = streamOwner;
+        if (stream == null || !streamAuthorized() || stream.queue().expired(System.nanoTime())
+            || motor != null || ordinaryInput != null || visibleInput != null)
+          throw new IllegalStateException("Controller game-thread grant is unavailable");
+        streamInputs = new StreamInputs(client); lastStreamAck = streamRetirement = null; streamRetirementLease = null;
+        controllerSamples.open(stream, clientTick);
+        JsonObject result = new JsonObject();
+        result.add("owner", NativeControllerContract.owner(stream.grant().owner()));
+        result.addProperty("controller_generation", stream.grant().controllerGeneration());
+        reply(id, result, null); return;
+      }
       if (method.equals("observe")) {
         if (pendingObservations.size() >= 16) {
           reply(id, null, "Observation receipt bound reached");
@@ -689,6 +1188,46 @@ public final class NativeClient implements ClientModInitializer {
         int nonce = nextReceiptNonce();
         pendingObservations.put(nonce, id);
         InventoryProofClient.request(nonce, authority);
+        return;
+      }
+      if (method.equals("visible_screen")) {
+        if (!request.getAsJsonObject("params").keySet().isEmpty()) {
+          reply(id, null, "Visible screen read takes no arguments");
+          return;
+        }
+        incarnationSignals.viewReceived();
+        if (!visibleView.ready()) {
+          if (pendingGuiReads.size() >= 16) reply(id, null, "Visible screen read bound reached");
+          else pendingGuiReads.put(id, request.get("received_ns").getAsLong() + 2_000_000_000L);
+          return;
+        }
+        reply(id, visibleView.snapshot(), null);
+        return;
+      }
+      if (method.equals("controller_frame") || method.equals("controller_sample")) {
+        JsonObject params = request.getAsJsonObject("params");
+        StreamOwner sampleOwner = null;
+        if (method.equals("controller_sample")) {
+          NativeControllerContract.fields(params, Set.of("owner", "controller_generation", "audio_cursor"));
+          sampleOwner = requireStream(params);
+        } else if (!params.keySet().equals(Set.of("audio_cursor"))) throw new IllegalArgumentException("Controller frame requires one audio_cursor");
+        SoundProjection.Cursor cursor = controllerCursor(params.get("audio_cursor"));
+        incarnationSignals.viewReceived();
+        if (sampleOwner != null) {
+          if (!streamAuthorized() || streamInputs == null || streamRetirement != null || sampleOwner.queue().expired(System.nanoTime()))
+            throw new IllegalStateException("Resident sample owner is unavailable");
+          if (pendingResidentRead != null || pendingControllerReads.size() >= 4)
+            reply(id, null, "Controller frame rendered-source read bound reached");
+          else pendingResidentRead = new ResidentRead(id, cursor, request.get("received_ns").getAsLong() + 2_000_000_000L, sampleOwner);
+          return;
+        }
+        if (!visibleView.ready()) {
+          if (pendingControllerReads.size() + (pendingResidentRead == null ? 0 : 1) >= 4)
+            reply(id, null, "Controller frame rendered-source read bound reached");
+          else pendingControllerReads.put(id, new ControllerRead(cursor, request.get("received_ns").getAsLong() + 2_000_000_000L));
+          return;
+        }
+        reply(id, controllerFrame(cursor), null);
         return;
       }
       if (method.equals("recipes")) {
@@ -714,7 +1253,7 @@ public final class NativeClient implements ClientModInitializer {
       }
       JsonObject action = received.action();
       if (action.get("kind").getAsString().equals("respawn")) {
-        if (respawnRequest != 0 || motor != null || lifecycle.status() != PlayerLifecycle.Status.DEAD) {
+        if (respawnRequest != 0 || motor != null || ordinaryInput != null || visibleInput != null || lifecycle.status() != PlayerLifecycle.Status.DEAD) {
           reply(id, result("failed", "Vanilla death screen is not ready for this life respawn", false), null);
           return;
         }
@@ -730,12 +1269,31 @@ public final class NativeClient implements ClientModInitializer {
         reply(id, result("failed", "Minecraft player is not authoritatively alive and ready", false), null);
         return;
       }
-      if (motor != null) {
+      if (motor != null || ordinaryInput != null || visibleInput != null) {
         reply(id, result("failed", "An effect owner is already active", false), null);
         return;
       }
       if (client.player.isDead()) {
         reply(id, result("failed", "Player is dead", false), null);
+        return;
+      }
+      if (received.worldInput() != null) {
+        if (!received.expectedScreen().kind().equals("absent") || client.currentScreen != null) {
+          reply(id, rejectedEffect("game_thread", "World input requires no open screen"), null);
+          return;
+        }
+        ordinaryInput = new NativeInputs(client, id, received, request.get("received_ns").getAsLong());
+        if (ordinaryInput.expired(System.nanoTime())) finishOrdinary("expired");
+        return;
+      }
+      if (action.get("kind").getAsString().equals("screen_input")) {
+        incarnationSignals.viewReceived();
+        visibleInput = new VisibleScreen(client, visibleView, action, authority,
+            request.get("received_ns").getAsLong(), effectAuthority.nativeBootId(),
+            () -> connected && client.isOnThread() && lifecycle.ready() && client.player != null
+                && client.world != null && client.player.getHealth() > 0 && !client.player.isDead()
+                && effectAuthority.validateApplication(received.owner(), received.compatibilityHash()) == EffectAuthority.Rejection.NONE,
+            this::nextReceiptNonce, (prefix, appliedAt) -> {}, outcome -> { visibleInput = null; reply(id, outcome, null); });
         return;
       }
       observe();
@@ -756,9 +1314,16 @@ public final class NativeClient implements ClientModInitializer {
     m.add("capture", video.metrics());
     m.add("session_id", config.get("session_id"));
     m.addProperty("native_generation", authority);
+    m.addProperty("native_client_tick", clientTick);
+    m.addProperty("game_renderer_render_invocation", renderSnapshot.invocation());
     m.add("life", life());
     m.addProperty("motor_profile", motorProfile.name().toLowerCase(Locale.ROOT));
     m.addProperty("screen_type", client.currentScreen == null ? null : client.currentScreen.getClass().getName());
+    m.addProperty("overlay_present", client.getOverlay() != null);
+    // Pinned 1.21.4 MinecraftClient.tick calls handleInputEvents only under these two conditions.
+    // This is callback eligibility, not proof of consumption or permission to actuate a GUI.
+    m.addProperty("world_input_events_ready", client.getOverlay() == null && client.currentScreen == null);
+    m.add("visible_gui", VisibleScreen.diagnostics());
     if (client.player != null) {
       var handler = client.player.currentScreenHandler;
       JsonObject custody = new JsonObject();
@@ -774,6 +1339,8 @@ public final class NativeClient implements ClientModInitializer {
     m.addProperty("death_screen", client.currentScreen instanceof DeathScreen);
     m.addProperty("respawn_pending", respawnRequest != 0);
     m.addProperty("motor_active", motor != null);
+    NativeInputs diagnosticInput = ordinaryInput != null ? ordinaryInput : lastOrdinaryInput;
+    if (diagnosticInput != null) m.add("ordinary_input", diagnosticInput.diagnostics());
     m.addProperty("motor_world_effect_emitted", motor != null
         && (motor.emissions & EffectOutcome.WORLD_EFFECT) != 0);
     var keys = client.options;
@@ -785,7 +1352,7 @@ public final class NativeClient implements ClientModInitializer {
     m.addProperty("max_pitch_degrees_per_second", motorProfile.pitchSpeed);
     m.addProperty("yaw_acceleration_degrees_per_second_squared", motorProfile.yawAcceleration);
     m.addProperty("pitch_acceleration_degrees_per_second_squared", motorProfile.pitchAcceleration);
-    m.addProperty("camera_integration_clock", "render_monotonic");
+    m.addProperty("camera_integration_clock", ordinaryInput == null ? "client_tick_monotonic_assisted" : "client_simulation_tick_0.05_seconds");
     if (motor != null) {
       if (motor.inventorySession() != null)
         m.add("native_inventory_ui", motor.inventorySession().diagnostics());
@@ -828,8 +1395,13 @@ public final class NativeClient implements ClientModInitializer {
     m.addProperty("control_queue_max_ms", dispatchQueueMaxNanos / 1e6);
     m.addProperty("blocked_keyboard_callbacks", blockedKeyboardCallbacks);
     m.addProperty("blocked_mouse_callbacks", blockedMouseCallbacks);
+    m.addProperty("owned_input_cursor_locked", client.mouse.isCursorLocked());
     if (client.getWindow() != null) {
       long window = client.getWindow().getHandle();
+      m.addProperty(
+          "owned_window_glfw_control_pressed",
+          org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT_CONTROL)
+              == org.lwjgl.glfw.GLFW.GLFW_PRESS);
       m.addProperty(
           "owned_window_glfw_forward_pressed",
           org.lwjgl.glfw.GLFW.glfwGetKey(window, org.lwjgl.glfw.GLFW.GLFW_KEY_W)
@@ -958,12 +1530,12 @@ public final class NativeClient implements ClientModInitializer {
     data.add("blocks", visible);
     data.add("entities", seenEntities);
     JsonArray heard = new JsonArray();
-    for (SoundProjection.Group group : sounds.drain(Instant.parse(now).toEpochMilli())) {
+    for (SoundProjection.Group group : sounds.recent(System.nanoTime())) {
       JsonObject sound = new JsonObject();
       sound.addProperty("category", SOUND_CATEGORIES[group.category()]);
       sound.addProperty("direction", SOUND_DIRECTIONS[group.direction()]);
       sound.addProperty("distance", SOUND_BANDS[group.distance()]);
-      sound.addProperty("observed_at", now);
+      sound.addProperty("observed_at", Instant.ofEpochMilli(group.wallMillis()).toString());
       heard.add(sound);
     }
     data.add("sounds", heard);
@@ -971,6 +1543,12 @@ public final class NativeClient implements ClientModInitializer {
     coverage.addProperty("partial", true);
     coverage.addProperty("max_age_ms", NativeContractResource.MAX_AGE_MS);
     o.add("freshness", coverage);
+    cachedWorld = new JsonObject();
+    cachedWorld.addProperty("source", "last_authorized_observation");
+    cachedWorld.add("observation_seq", o.get("observation_seq")); cachedWorld.add("captured_at", o.get("captured_at"));
+    cachedWorld.addProperty("captured_native_ns", Long.toString(observationStarted));
+    cachedWorld.add("blocks", visible); cachedWorld.add("entities", seenEntities);
+    cachedWorldNanos = observationStarted; cachedWorldLife = lifecycle.lifeId(); cachedWorldSpace = incarnationSignals.space();
     long elapsed = System.nanoTime() - observationStarted;
     observationNanos += elapsed;
     observationMaxNanos = Math.max(observationMaxNanos, elapsed);
@@ -996,7 +1574,7 @@ public final class NativeClient implements ClientModInitializer {
     r.addProperty("summary", summary);
     e.addProperty("effect_confirmed", effect);
     e.addProperty("neutralized_effect", false);
-    e.addProperty("neutralized", motor == null);
+    e.addProperty("neutralized", motor == null && ordinaryInput == null && visibleInput == null);
     e.add("session_id", config.get("session_id"));
     e.addProperty("life_id", lifecycle.lifeId());
     if (client.player != null) e.add("player", player());
@@ -1005,10 +1583,17 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void tick() {
+    clientTick = ContractIdentity.next(clientTick);
+    drainRetirement();
     if (!connected) {
       neutralize();
       return;
     }
+    StreamOwner stream = streamOwner;
+    if (stream != null && streamRetirement == null && stream.queue().expired(System.nanoTime()))
+      retireController(stream.queue().reason());
+    settleGuiReads();
+    settleControllerReads();
     if (client.player == null || client.world == null) {
       if (motor != null) motor.finish("failed", "Player unavailable", false);
       neutralize();
@@ -1035,6 +1620,7 @@ public final class NativeClient implements ClientModInitializer {
       }
       return;
     }
+    if (visibleInput != null) visibleInput.tick();
     if (motor != null) {
       long started = System.nanoTime();
       if (motor.generation != authority || !motor.authorized(false))
@@ -1047,9 +1633,183 @@ public final class NativeClient implements ClientModInitializer {
     }
   }
 
+  private boolean ordinaryAuthorized() {
+    return ordinaryInput != null && connected && client.isOnThread()
+        && client.player != null && client.world != null && lifecycle.ready()
+        && client.player.getHealth() > 0 && !client.player.isDead()
+        && effectAuthority.validateApplication(ordinaryInput.received.owner(),
+            ordinaryInput.received.compatibilityHash(), EffectAuthority.ScreenPrecondition.absent()) == EffectAuthority.Rejection.NONE;
+  }
+
+  private boolean checkOrdinary() {
+    if (ordinaryInput == null) return false;
+    if (client.currentScreen != null) ordinaryInput.screenChanged(clientTick);
+    if (ordinaryInput.screenOpened()) return false;
+    if (ordinaryInput.expired(System.nanoTime())) { finishOrdinary("expired"); return false; }
+    if (!ordinaryAuthorized()) { finishOrdinary("stale"); return false; }
+    return true;
+  }
+
+  /** Pinned tick bytecode updates the crosshair before handleInputEvents. */
+  public void beforeCrosshair() {
+    drainRetirement();
+    prepareController();
+    if (ordinaryInput != null && checkOrdinary() && !client.isPaused() && client.getOverlay() == null)
+      ordinaryInput.prepare(clientTick, System.nanoTime());
+    if (motor != null) motor.rotate();
+  }
+
+  public void ordinaryConsumptionStarted() {
+    if (streamInputs != null && streamCanConsume())
+      streamInputs.beginConsumption();
+    if (checkOrdinary()) ordinaryInput.beginConsumption(clientTick);
+  }
+
+  public void ordinaryConsumptionEnded() {
+    if (streamInputs != null && streamInputs.endConsumption())
+      streamOwner.queue().applicationStage(streamInputs.pending(), 2, System.nanoTime());
+    if (ordinaryInput != null) ordinaryInput.endConsumption(clientTick);
+  }
+
+  public boolean ordinaryAttackEntry() {
+    if (streamInputs != null) return streamCanConsume() && client.currentScreen == null;
+    if (ordinaryInput == null) return true;
+    if (!checkOrdinary()) return false;
+    ordinaryInput.attackEntry();
+    return true;
+  }
+
+  public boolean ordinaryUseEntry() {
+    if (streamInputs != null) return streamCanConsume() && client.currentScreen == null;
+    if (ordinaryInput == null) return true;
+    if (!checkOrdinary()) return false;
+    ordinaryInput.useEntry();
+    return true;
+  }
+
+  public boolean ordinaryBlockEntry() {
+    if (streamInputs != null) return streamCanConsume() && client.currentScreen == null;
+    return ordinaryInput == null || checkOrdinary();
+  }
+
+  public boolean ownedWorldCursor() {
+    if (streamInputs != null) return streamAuthorized() && !streamOwner.queue().expired(System.nanoTime()) && client.currentScreen == null;
+    return ordinaryAuthorized() && !ordinaryInput.screenOpened()
+        && !ordinaryInput.expired(System.nanoTime()) && client.currentScreen == null;
+  }
+
+  public boolean ownedWorldModifier() {
+    if (streamInputs != null) return ownedWorldCursor() && streamInputs.consuming();
+    return ownedWorldCursor() && ordinaryInput.consuming();
+  }
+
+  public boolean ownedWorldDropAll() {
+    return ownedWorldModifier() && (streamInputs != null ? streamInputs.dropAll() : ordinaryInput.dropAll());
+  }
+
+  public void streamKeyConsumed(net.minecraft.client.option.KeyBinding key) {
+    if (client.isOnThread() && streamInputs != null) streamInputs.keyConsumed(key);
+  }
+  public void beforeStreamKeyConsumption() {
+    if (client.isOnThread() && streamInputs != null) streamCanConsume();
+  }
+  private boolean streamCanConsume() {
+    StreamOwner stream = streamOwner;
+    if (stream == null || streamInputs == null) return false;
+    long now = System.nanoTime();
+    ControllerInputQueue.Entry pending = streamInputs.pending();
+    if (!streamAuthorized() || stream.queue().expired(now) ||
+        pending != null && (now < pending.capturedNanos() || now - pending.capturedNanos() > ControllerInputQueue.FRAME_AGE_NS)) {
+      retireController("controller_input_expired_before_vanilla_consumption");
+      return false;
+    }
+    return true;
+  }
+
+  private void inputTickEnded() {
+    if (streamInputs != null && streamOwner != null) {
+      StreamOwner stream = streamOwner;
+      ControllerInputQueue.Entry pending = streamInputs.pending();
+      JsonObject ack = streamInputs.settle(stream.grant().controllerGeneration(), clientTick, System.nanoTime());
+      if (ack != null) completeControllerInput(stream, pending, ack);
+    }
+    publishControllerProgress();
+    // Life/space notices from this tick precede a pending read failure.
+    settleResidentSample(false);
+    if (ordinaryInput == null) return;
+    boolean complete = ordinaryInput.settle(clientTick);
+    if (ordinaryInput.screenOpened()) finishOrdinary("screen_opened");
+    else if (complete) finishOrdinary("completed");
+    else checkOrdinary();
+  }
+
+  private void publishControllerProgress() {
+    StreamOwner stream = streamOwner;
+    if (stream == null || streamRetirement != null || !connected) return;
+    JsonObject progress = new JsonObject(), message = new JsonObject();
+    progress.add("owner", NativeControllerContract.owner(stream.grant().owner()));
+    progress.addProperty("controller_generation", stream.grant().controllerGeneration());
+    progress.addProperty("sequence", stream.queue().appliedSequence());
+    progress.addProperty("native_tick", clientTick); progress.addProperty("captured_native_ns", Long.toString(System.nanoTime()));
+    progress.addProperty("telemetry_omitted", output.telemetryOmitted());
+    message.add("controller_progress", progress);
+    output.telemetry(message.toString());
+  }
+
+  private void finishOrdinary(String reason) {
+    NativeInputs finished = ordinaryInput;
+    if (finished == null) return;
+    // Retain this owner during actual vanilla release so its emitted packet is attributed.
+    JsonObject outcome = finished.finish(reason, clientTick, effectAuthority.nativeBootId());
+    ordinaryInput = null;
+    lastOrdinaryInput = finished;
+    reply(finished.requestId, outcome, null);
+  }
+
+  public void keyboardInputStarted() {
+    applyInput();
+    keyboardSamplingOwner = motor;
+    ordinarySamplingOwner = ordinaryInput;
+  }
+
+  public void keyboardInputSampled(boolean pressed) {
+    if (streamInputs != null && streamInputs.sampled())
+      streamOwner.queue().applicationStage(streamInputs.pending(), 4, System.nanoTime());
+    Motor sampledOwner = keyboardSamplingOwner;
+    keyboardSamplingOwner = null;
+    if (pressed && sampledOwner != null && motor == sampledOwner)
+      sampledOwner.inputTiming.keySample.record(System.nanoTime(), clientTick);
+    NativeInputs ordinary = ordinarySamplingOwner;
+    ordinarySamplingOwner = null;
+    if (ordinary != null && ordinaryInput == ordinary) ordinary.keySample(clientTick, pressed);
+  }
+
   public void applyInput() {
-    if (!managed() || client.options == null) return;
+    applyInput(motor);
+  }
+
+  private int keyMask() {
     var o = client.options;
+    return (o.forwardKey.isPressed() ? 1 : 0) | (o.backKey.isPressed() ? 2 : 0)
+        | (o.leftKey.isPressed() ? 4 : 0) | (o.rightKey.isPressed() ? 8 : 0)
+        | (o.jumpKey.isPressed() ? 16 : 0) | (o.sprintKey.isPressed() ? 32 : 0)
+        | (o.sneakKey.isPressed() ? 64 : 0);
+  }
+
+  private void applyInput(Motor releaseOwner) {
+    if (!managed() || client.options == null) return;
+    if (streamInputs != null) {
+      if (streamAuthorized() && !streamOwner.queue().expired(System.nanoTime())) {
+        if (client.currentScreen == null) streamInputs.applyHeld();
+        return;
+      }
+      retireController("stream_input_authority_unavailable");
+    }
+    if (ordinaryInput != null) {
+      if (checkOrdinary()) { ordinaryInput.applyHeld(); return; }
+    }
+    var o = client.options;
+    int before = keyMask();
     JsonObject controls = motor == null ? null : motor.controls;
     boolean targetsCurrent = motor != null && motor.targetsCurrent();
     o.forwardKey.setPressed(targetsCurrent && pressed(controls, "forward"));
@@ -1061,6 +1821,8 @@ public final class NativeClient implements ClientModInitializer {
     o.sneakKey.setPressed(targetsCurrent && pressed(controls, "sneak"));
     o.attackKey.setPressed(false);
     o.useKey.setPressed(false);
+    if (releaseOwner != null && (before & ~keyMask()) != 0)
+      releaseOwner.inputTiming.keyRelease.record(System.nanoTime(), clientTick);
   }
 
   private boolean pressed(JsonObject controls, String key) {
@@ -1082,7 +1844,7 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void neutralize() {
-    sounds.clear();
+    retireController("native_neutralization");
     blocks.clear();
     entities.clear();
     blockIncarnations.invalidate(); entityIncarnations.invalidate();
@@ -1095,6 +1857,11 @@ public final class NativeClient implements ClientModInitializer {
               : "Respawn cancelled before the vanilla request was emitted", false), null);
     }
     rejectObservations("Observation authority fenced");
+    for (long id : pendingGuiReads.keySet()) reply(id, null, "Visible screen read authority fenced");
+    pendingGuiReads.clear();
+    rejectControllerReads("Controller frame authority fenced");
+    if (ordinaryInput != null) finishOrdinary("cancelled");
+    if (visibleInput != null) visibleInput.cancel();
     if (motor != null) motor.finish("cancelled", "Native effect cancelled", false);
     applyInput();
     if (client.interactionManager != null) client.interactionManager.cancelBlockBreaking();
@@ -1106,6 +1873,172 @@ public final class NativeClient implements ClientModInitializer {
   private void rejectObservations(String reason) {
     for (long id : pendingObservations.values()) reply(id, null, reason);
     pendingObservations.clear();
+  }
+  private void settleGuiReads() {
+    var pending = pendingGuiReads.entrySet().iterator();
+    while (pending.hasNext()) {
+      var entry = pending.next();
+      if (System.nanoTime() >= entry.getValue()) {
+        long id = entry.getKey(); pending.remove(); reply(id, null, "Visible screen rendered-source timeout");
+      } else if (visibleView.ready()) {
+        long id = entry.getKey(); pending.remove();
+        try { incarnationSignals.viewReceived(); reply(id, visibleView.snapshot(), null); }
+        catch (RuntimeException error) { reply(id, null, "Visible screen projection rejected: " + error.getMessage()); }
+      }
+    }
+  }
+
+  private static SoundProjection.Cursor controllerCursor(JsonElement value) {
+    if (value == null) throw new IllegalArgumentException("audio_cursor is required");
+    if (value.isJsonNull()) return null;
+    JsonObject cursor = value.getAsJsonObject();
+    if (!cursor.keySet().equals(Set.of("stream_id", "sequence"))) throw new IllegalArgumentException("Invalid audible cursor fields");
+    return new SoundProjection.Cursor(NativeEffectContract.id(cursor, "stream_id"), NativeEffectContract.counter(cursor, "sequence"));
+  }
+
+  private void resetSensingScope() {
+    cachedWorld = null; cachedWorldSpace = null;
+    sounds.clear();
+    synchronized (controllerCaptures) { controllerCaptures.clear(); }
+    controllerEffects.clear(); controllerEffectBytes = 0; controllerEffectsOmitted = 0; lastStreamAck = null;
+    rejectControllerReads("Controller frame predates current life or space");
+  }
+
+  private void rejectControllerReads(String reason) {
+    var pending = pendingControllerReads.keySet().iterator();
+    while (pending.hasNext()) {
+      long id = pending.next(); pending.remove(); reply(id, null, reason);
+      if (!connected) { pendingControllerReads.clear(); break; }
+    }
+  }
+
+  private boolean residentReadCurrent(ResidentRead read, long now) {
+    return now < read.deadline() && read.stream() == streamOwner && streamRetirement == null
+        && streamInputs != null && streamAuthorized() && !read.stream().queue().expired(now);
+  }
+
+  private void rejectResidentSample(ResidentRead read, String reason) {
+    if (read.stream() == streamOwner && streamRetirement == null) {
+      // Receipt may have reserved revoke before publishing its game-thread request.
+      if (retirementReserved.get()) return;
+      retireController("resident_sample_authority_expired");
+    }
+    synchronized (controllerSamples) {
+      if (!controllerSamples.rejectionReady(read.stream())) return;
+      pendingResidentRead = null;
+      reply(read.id(), null, reason);
+    }
+  }
+
+  private void settleResidentSample(boolean rendered) {
+    ResidentRead read = pendingResidentRead;
+    if (read == null) return;
+    if (!residentReadCurrent(read, System.nanoTime())) {
+      rejectResidentSample(read, "Resident sample predates current authority or its deadline");
+      return;
+    }
+    if (!controllerSamples.ready(read.stream(), clientTick, rendered) || !visibleView.ready()) return;
+    try {
+      incarnationSignals.viewReceived();
+      if (!residentReadCurrent(read, System.nanoTime())) throw new IllegalStateException("Resident sample scope changed");
+      JsonObject frame = controllerFrame(read.cursor());
+      if (!residentReadCurrent(read, System.nanoTime()) || !controllerSamples.sampled(read.stream(), clientTick, rendered))
+        throw new IllegalStateException("Resident sample authority changed during capture");
+      pendingResidentRead = null;
+      reply(read.id(), frame, null);
+    } catch (RuntimeException error) {
+      String reason = "Controller frame rejected: " + error.getMessage();
+      if (!residentReadCurrent(read, System.nanoTime())) rejectResidentSample(read, reason);
+      else { pendingResidentRead = null; reply(read.id(), null, reason); }
+    }
+  }
+
+  private void settleControllerReads() {
+    if (pendingControllerReads.isEmpty()) return;
+    var pending = pendingControllerReads.entrySet().iterator();
+    while (connected && pending.hasNext()) {
+      var entry = pending.next();
+      if (System.nanoTime() >= entry.getValue().deadline()) {
+        long id = entry.getKey(); pending.remove(); reply(id, null, "Controller frame rendered-source timeout");
+      } else if (visibleView.ready()) {
+        long id = entry.getKey(); SoundProjection.Cursor cursor = entry.getValue().cursor(); pending.remove();
+        try { incarnationSignals.viewReceived(); reply(id, controllerFrame(cursor), null); }
+        catch (RuntimeException error) { reply(id, null, "Controller frame rejected: " + error.getMessage()); }
+      }
+    }
+  }
+
+  private JsonElement controllerBlockReference(BlockPos position) {
+    if (!reachable(position)) return JsonNull.INSTANCE;
+    var reference = blockIncarnations.observe(position, incarnationSignals.space(), lifecycle.lifeId());
+    retainControllerTarget(blocks, reference.targetId(), position.toImmutable());
+    return NativeEffectContract.target(reference);
+  }
+
+  private JsonElement controllerEntityReference(Entity entity) {
+    if (!authorizedEntity(entity)) return JsonNull.INSTANCE;
+    var reference = entityIncarnations.observe(entity.getUuid(), incarnationSignals.space(), lifecycle.lifeId());
+    retainControllerTarget(entities, reference.targetId(), entity);
+    return NativeEffectContract.target(reference);
+  }
+
+  private static <T> void retainControllerTarget(Map<String, T> targets, String id, T value) {
+    if (!targets.containsKey(id) && targets.size() >= 256) targets.remove(targets.keySet().iterator().next());
+    targets.put(id, value);
+  }
+
+  private static JsonObject audibleCursor(SoundProjection.Cursor cursor) {
+    JsonObject value = new JsonObject();
+    value.addProperty("stream_id", cursor.streamId()); value.addProperty("sequence", cursor.sequence());
+    return value;
+  }
+
+  private JsonObject controllerSounds(SoundProjection.Page page) {
+    JsonObject value = new JsonObject(); JsonArray events = new JsonArray();
+    value.addProperty("stream_id", page.streamId()); value.addProperty("after_sequence", page.afterSequence());
+    value.add("next_cursor", audibleCursor(page.nextCursor())); value.addProperty("gap", page.gap());
+    value.addProperty("omitted_before", page.omittedBefore()); value.addProperty("has_more", page.hasMore());
+    for (var event : page.events()) {
+      JsonObject row = new JsonObject();
+      row.addProperty("sequence", event.sequence()); row.addProperty("category", SOUND_CATEGORIES[event.category()]);
+      row.addProperty("cue", event.cue()); row.addProperty("direction", SOUND_DIRECTIONS[event.direction()]);
+      row.addProperty("distance", SOUND_BANDS[event.distance()]);
+      row.addProperty("heard_at", Instant.ofEpochMilli(event.wallMillis()).toString());
+      row.addProperty("heard_native_ns", Long.toString(event.nativeNanos())); events.add(row);
+    }
+    value.add("events", events); return value;
+  }
+
+  private JsonObject controllerFrame(SoundProjection.Cursor cursor) {
+    EffectAuthority.Space space = incarnationSignals.space();
+    if (client.player == null || client.world == null || space == null
+        || lifecycle.status() == PlayerLifecycle.Status.LOADING || lifecycle.status() == PlayerLifecycle.Status.RESPAWNING)
+      throw new IllegalStateException("Authoritative current player space is unavailable");
+    long now = System.nanoTime();
+    JsonObject body = controllerBody.capture(clientTick, now, controllerBlockReference, controllerEntityReference);
+    JsonObject value = new JsonObject(), profile = descriptor.getAsJsonObject("observation").getAsJsonObject("profile");
+    controllerFrameSequence = ContractIdentity.next(controllerFrameSequence);
+    synchronized (controllerCaptures) {
+      if (controllerCaptures.size() == 32) controllerCaptures.remove(controllerCaptures.keySet().iterator().next());
+      controllerCaptures.put(controllerFrameSequence, new CapturedControllerFrame(clientTick, now, lifecycle.lifeId(), space));
+    }
+    value.addProperty("schema_version", 2); value.addProperty("frame_seq", controllerFrameSequence);
+    value.addProperty("native_tick", clientTick); value.addProperty("captured_native_ns", Long.toString(now));
+    value.addProperty("captured_at", Instant.now().toString());
+    value.add("profile_id", profile.get("id")); value.add("profile_version", profile.get("version"));
+    value.addProperty("life_id", lifecycle.lifeId()); value.add("space", NativeEffectContract.space(space));
+    value.add("player", body.get("player")); value.add("inventory", body.get("inventory")); value.add("view", body.get("view"));
+    value.add("screen", visibleView.snapshot());
+    value.add("last_input", lastStreamAck == null ? JsonNull.INSTANCE : lastStreamAck);
+    JsonArray effects = new JsonArray();
+    for (ControllerEffect effect : controllerEffects) effects.add(effect.value());
+    value.add("effect_updates", effects); value.addProperty("effect_updates_omitted", controllerEffectsOmitted);
+    if (cachedWorld != null && cachedWorldLife == lifecycle.lifeId() && space.equals(cachedWorldSpace)) {
+      cachedWorld.addProperty("stale", now < cachedWorldNanos || now - cachedWorldNanos > NativeContractResource.MAX_AGE_MS * 1_000_000L);
+      value.add("visible_world", cachedWorld);
+    } else value.add("visible_world", JsonNull.INSTANCE);
+    value.add("audible", controllerSounds(sounds.page(cursor, System.nanoTime())));
+    return value;
   }
 
   private BlockPos targetBlock(TargetIncarnations.Target target) {
@@ -1148,6 +2081,7 @@ public final class NativeClient implements ClientModInitializer {
     final long admittedNanos = System.nanoTime();
     final long lifeId = lifecycle.lifeId();
     final CameraMotion.State camera = new CameraMotion.State();
+    final NativeInputTiming inputTiming = new NativeInputTiming();
     final NavigationGaze.Output routeGaze = new NavigationGaze.Output();
     final NavigationGaze.Movement steering = new NavigationGaze.Movement();
     final double[] route = new double[39];
@@ -1309,7 +2243,7 @@ public final class NativeClient implements ClientModInitializer {
       applicationRejection.addProperty("current_native_generation", authority);
       applicationRejection.addProperty("current_life_id", lifecycle.lifeId());
       applicationRejection.add("current_space", incarnationSignals.space() == null ? JsonNull.INSTANCE : NativeEffectContract.space(incarnationSignals.space()));
-      applicationRejection.add("expected_screen", NativeEffectContract.screen(received.expectedScreen()));
+      applicationRejection.add("expected_screen", NativeEffectContract.precondition(received.expectedScreen()));
       applicationRejection.add("current_screen", NativeEffectContract.screen(incarnationSignals.screen()));
       if (targetReference != null) {
         applicationRejection.add("target_reference", NativeEffectContract.target(targetReference));
@@ -1460,10 +2394,14 @@ public final class NativeClient implements ClientModInitializer {
       CameraMotion.advance(camera, yaw, pitch, motorProfile, now);
       yawVelocity = camera.yawVelocity;
       pitchVelocity = camera.pitchVelocity;
-      client.player.setYaw((float) camera.yaw);
-      client.player.setPitch((float) camera.pitch);
+      client.player.changeLookDirection(MathHelper.wrapDegrees(camera.yaw - beforeYaw) / .15,
+          (camera.pitch - beforePitch) / .15);
       if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - beforeYaw)) > .0001
-          || Math.abs(client.player.getPitch() - beforePitch) > .0001) emissions |= EffectOutcome.CAMERA;
+          || Math.abs(client.player.getPitch() - beforePitch) > .0001) {
+        emissions |= EffectOutcome.CAMERA;
+      }
+      if (client.player.getYaw() != beforeYaw || client.player.getPitch() != beforePitch)
+        inputTiming.cameraApply.record(System.nanoTime(), clientTick);
       samplePose();
     }
 
@@ -2076,7 +3014,7 @@ public final class NativeClient implements ClientModInitializer {
       JsonObject inventoryUi = inventorySession == null ? null : inventorySession.diagnostics();
       controls = null;
       looking = false;
-      applyInput();
+      applyInput(this);
       if (client.interactionManager != null) client.interactionManager.cancelBlockBreaking();
       if (client.player != null) client.player.stopUsingItem();
       JsonObject outcome = result(status, summary, effect);
@@ -2084,6 +3022,8 @@ public final class NativeClient implements ClientModInitializer {
       samplePose();
       evidence.addProperty("life_id", lifeId);
       evidence.addProperty("native_generation", generation);
+      evidence.add("native_input_timing", inputTiming.evidence(
+          effectAuthority.nativeBootId(), id, received.owner().operationId(), generation));
       evidence.addProperty("world_effect_emitted", (emissions & EffectOutcome.WORLD_EFFECT) != 0);
       evidence.addProperty("camera_changed", (emissions & EffectOutcome.CAMERA) != 0);
       if (inventoryUi != null) evidence.add("native_inventory_ui", inventoryUi);

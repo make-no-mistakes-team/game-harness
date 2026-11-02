@@ -56,7 +56,7 @@ export class ProgramOperations {
           return this.workspace.latestOpportunity(previous) as unknown as Json;
         }) as unknown as ImprovementOpportunity;
     }
-    const program = pinned ?? await this.skills.register(this.run.run_id, { name: input.name, source: input.source, card: input.card, dependencies },
+    const program = pinned ?? await this.skills.register(this.run.run_id, { entry: input.entry, name: input.name, source: input.source, card: input.card, dependencies },
       () => { commit(); assertParent(); }, registration);
     let experiment: { decision: "revise"; measured: boolean; reason: string } | null = null;
     if (opportunity && input.reason) {
@@ -82,7 +82,7 @@ export class ProgramOperations {
           return decision;
         }) as unknown as { decision: "revise"; measured: boolean; reason: string };
     }
-    return { name: program.name, version: program.version, state: program.state, purpose: program.card.purpose,
+    return { name: program.name, version: program.version, entry: program.entry, state: program.state, purpose: program.card.purpose,
       dependencies: input.dependencies.map((selector, index) => ({ name: selector.name, version: dependencies[index]!.version })),
       experiment: experiment ? { ...experiment, qualification: "candidate_not_proven_improvement" } : null };
   }
@@ -110,7 +110,9 @@ export class ProgramOperations {
     const outcomeKey = this.phaseKey(callId, "outcome");
     const completed = this.submissionReceipt(callId, identity);
     if (completed !== null) return completed;
-    const { args, limits, next, ...writeInput } = input;
+    const writeInput = { name: input.name, entry: input.entry, source: input.source, card: input.card,
+      dependencies: input.dependencies, ...(input.based_on === undefined ? {} : { based_on: input.based_on }),
+      ...(input.reason === undefined ? {} : { reason: input.reason }) };
     const writeId = this.phaseKey(callId, "write"), startId = this.phaseKey(callId, "start");
     let first = false;
     this.store.bindToolCall(this.run.run_id, callId, identity, () => {
@@ -150,8 +152,10 @@ export class ProgramOperations {
       const interrupted = this.store.completedToolCall(this.run.run_id, outcomeKey, identity);
       if (interrupted !== null) return interrupted;
       commit();
-      const execution = await this.runProgram({ operation: "start", name: program.name, version: program.version, args, limits,
-        ...(next ? { next } : {}) }, startId, commit);
+      const selection = { operation: "start" as const, name: program.name, version: program.version };
+      const execution = await this.runProgram(input.entry === "step"
+        ? { ...selection, entry: "step", args: input.args, limits: input.limits, initial_state: input.initial_state }
+        : { ...selection, entry: "run", args: input.args, limits: input.limits, ...(input.next ? { next: input.next } : {}) }, startId, commit);
       return finish(program, { status: "started", execution: execution as unknown as Json });
     } catch (error) {
       const existing = this.skills.get(this.run.run_id, { start_key: this.startKey(startId) });
@@ -168,11 +172,13 @@ export class ProgramOperations {
         commit();
         this.host.planning().assertOrdinaryAdmission();
         const program = this.workspace.select(input, true);
-        return { skill_id: program.skill_id, version: program.version, start_key: startKey,
+        if (program.entry !== input.entry) throw new RuntimeFault("precondition_failed", "Playing entry does not match the selected immutable source");
+        return { entry: input.entry, skill_id: program.skill_id, version: program.version, start_key: startKey,
           epoch: this.run.epoch, session_id: this.run.session_id!, life_id: this.run.life_id!,
           native_boot_id: this.run.native_boot_id!, run_generation: this.host.generation(), space_epoch: this.run.space_epoch!,
           compatibility_hash: this.run.compatibility_hash!,
-          args: input.args, limits: input.limits, ...(input.next ? { lookahead: input.next } : {}) } as unknown as Json;
+          args: input.args, limits: input.limits, ...(input.entry === "step" ? { initial_state: input.initial_state }
+            : input.next ? { lookahead: input.next } : {}) } as unknown as Json;
       }) as unknown as SkillStartRequest;
       const existing = this.skills.get(this.run.run_id, { start_key: startKey });
       if (!existing) { commit(); this.host.planning().assertOrdinaryAdmission(); }
@@ -181,6 +187,35 @@ export class ProgramOperations {
       return this.workspace.executionSummary(result);
     }
     commit();
+    if (input.operation === "update_intent") {
+      return this.store.bindToolCall(this.run.run_id, callId, { tool: "program_run", input } as unknown as Json, () => {
+        const execution = this.workspace.execution("current");
+        if (!execution || execution.entry !== "step") throw new RuntimeFault("not_found", "No current resident execution");
+        const version = this.skills.updateResidentIntent(this.run.run_id, execution.execution_id, input.intent, input.expected_version);
+        this.store.event(this.run.run_id, "controller.intent", "Authored intent updated without changing source, root deadline or budgets", {
+          execution_id: execution.execution_id, source_hash: execution.source_hash, previous_version: input.expected_version, intent_version: version,
+        });
+        return { ...this.workspace.executionSummary(execution), intent_version: version };
+      });
+    }
+    if (input.operation === "analyze") {
+      const identity = { tool: "program_run", input } as unknown as Json, resultKey = this.phaseKey(callId, "analysis_result");
+      const previous = this.store.completedToolCall(this.run.run_id, resultKey, identity);
+      if (previous !== null) return previous;
+      let first = false;
+      const selected = z.object({ execution_id: z.string(), source: skillRefSchema }).strict().parse(
+        this.store.bindToolCall(this.run.run_id, callId, identity, () => {
+          const execution = this.workspace.execution("current"), source = this.workspace.select(input, true);
+          if (!execution || execution.entry !== "step" || source.entry !== "analyze")
+            throw new RuntimeFault("precondition_failed", "Pure analysis requires a current resident and selected analyze source");
+          first = true;
+          return { execution_id: execution.execution_id, source: { skill_id: source.skill_id, version: source.version } };
+        }));
+      if (!first) return { status: "unknown", reason: "Original pure analysis result was not acknowledged; inspect retained analysis events. It is never dispatched again." };
+      const result = await this.skills.analyzeResident(this.run.run_id, selected.execution_id, selected.source, input.input, input.expected_intent_version);
+      this.store.completeToolCall(this.run.run_id, resultKey, identity, result as unknown as Json);
+      return result;
+    }
     if (input.operation === "activate_next") {
       const planId = z.string().parse(this.store.bindToolCall(this.run.run_id, callId,
         { tool: "program_run", input } as unknown as Json, () => {
@@ -216,7 +251,7 @@ export class ProgramOperations {
     }
     const execution = this.workspace.execution(input.target);
     if (!execution) throw new RuntimeFault("not_found", "No matching execution is available");
-    return this.workspace.executionSummary(execution);
+    return this.workspace.executionView(this.skills.get(this.run.run_id, { execution_id: execution.execution_id }));
   }
 
   async prepare(input: z.infer<typeof prepareNextSchema>, callId: string) {
@@ -240,7 +275,10 @@ export class ProgramOperations {
     switch (input.view) {
       case "catalog": return workspace.catalog(input.after, input.limit);
       case "source": return workspace.source(workspace.select(input));
-      case "execution": return workspace.executionView(workspace.execution(input.target, input.program));
+      case "execution": {
+        const selected = workspace.execution(input.target, input.program);
+        return workspace.executionView(selected ? this.skills.get(this.run.run_id, { execution_id: selected.execution_id }) : null);
+      }
       case "history": {
         const program = input.program ? workspace.select(input.program) : null;
         return workspace.page(this.host.evidence().filter((entry) => !program || entry.skill_id === program.skill_id && (input.program?.version === undefined || entry.version === program.version))

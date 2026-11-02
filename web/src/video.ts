@@ -1,33 +1,15 @@
+import { decodeNativeVideoHeader } from "../../src/shared/video.ts";
+
 const MAX_FRAME_AGE_MS = 10_000;
 
 export function classifyVideoFrame(
   data: unknown,
   now: number,
 ): "malformed" | "stale" | "fresh" {
-  if (
-    !(data instanceof ArrayBuffer) ||
-    data.byteLength < 32 ||
-    data.byteLength > 32 + 1920 * 1080 * 4
-  )
-    return "malformed";
-  const header = new DataView(data);
-  const width = header.getUint32(4, true);
-  const height = header.getUint32(8, true);
-  const payload = header.getUint32(12, true);
-  const timestamp = header.getFloat64(24, true);
-  if (
-    header.getUint32(0, true) !== 0x47485631 ||
-    width === 0 ||
-    height === 0 ||
-    width > 1920 ||
-    height > 1080 ||
-    payload !== width * height * 4 ||
-    data.byteLength !== 32 + payload ||
-    (header.getUint32(20, true) & ~1) !== 0 ||
-    !Number.isFinite(timestamp)
-  )
-    return "malformed";
-  return Math.abs(now - timestamp) >= MAX_FRAME_AGE_MS ? "stale" : "fresh";
+  if (!(data instanceof ArrayBuffer)) return "malformed";
+  const header = decodeNativeVideoHeader(new Uint8Array(data));
+  if (!header || data.byteLength !== header.headerBytes + header.width * header.height * 4) return "malformed";
+  return Math.abs(now - header.capturedAt) >= MAX_FRAME_AGE_MS ? "stale" : "fresh";
 }
 
 export class NativeVideo {
@@ -203,11 +185,11 @@ export class NativeVideo {
       gl = this.gl;
     this.pending = null;
     if (!buffer || !gl) return;
-    const header = new DataView(buffer),
-      width = header.getUint32(4, true),
-      height = header.getUint32(8, true);
+    const header = decodeNativeVideoHeader(new Uint8Array(buffer));
+    if (!header) return;
+    const { width, height } = header;
     if (
-      Math.abs(Date.now() - header.getFloat64(24, true)) >= MAX_FRAME_AGE_MS
+      Math.abs(Date.now() - header.capturedAt) >= MAX_FRAME_AGE_MS
     ) {
       if (this.state !== "stale") {
         this.state = "stale";
@@ -215,7 +197,7 @@ export class NativeVideo {
       }
       return;
     }
-    const pixels = new Uint8Array(buffer, 32);
+    const pixels = new Uint8Array(buffer, header.headerBytes);
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
     if (this.size.width !== width || this.size.height !== height) {
       this.canvas.width = width;
@@ -245,10 +227,10 @@ export class NativeVideo {
         gl.UNSIGNED_BYTE,
         pixels,
       );
-    gl.uniform1f(this.flip, header.getUint32(20, true) & 1);
+    gl.uniform1f(this.flip, Number(header.bottomUp));
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     this.lastDraw = performance.now();
-    this.capture = header.getFloat64(24, true);
+    this.capture = header.capturedAt;
     this.drawn++;
     this.captureToDraw = Date.now() - this.capture;
     this.state = "streaming";

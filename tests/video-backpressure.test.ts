@@ -7,7 +7,7 @@ import { VideoStream, type VideoSocketData } from "../src/server/video.ts";
 
 const WIDTH = 1280;
 const HEIGHT = 720;
-const FRAME_BYTES = 32 + WIDTH * HEIGHT * 4;
+const FRAME_BYTES = 328 + WIDTH * HEIGHT * 4;
 const WORKER_ARGUMENT = "--video-backpressure-worker";
 
 async function exerciseSlowReader() {
@@ -51,7 +51,7 @@ async function exerciseSlowReader() {
   // Streaming RFC6455 parsing retains only the framing and native headers,
   // never an unbounded collection of multi-megabyte RGBA payloads.
   const framing = Buffer.alloc(10);
-  const header = Buffer.alloc(32);
+  const header = Buffer.alloc(328);
   let framingUsed = 0;
   let framingNeeded = 2;
   let remaining = 0;
@@ -68,12 +68,13 @@ async function exerciseSlowReader() {
   function publish() {
     const frame = new Uint8Array(FRAME_BYTES);
     const view = new DataView(frame.buffer);
-    view.setUint32(0, 0x47485631, true);
+    view.setUint32(0, 0x47485632, true);
     view.setUint32(4, WIDTH, true);
     view.setUint32(8, HEIGHT, true);
     view.setUint32(12, WIDTH * HEIGHT * 4, true);
     view.setUint32(16, ++sequence, true);
     view.setFloat64(24, Date.now(), true);
+    view.setUint32(316, 1, true);
     video.publish(frame);
   }
 
@@ -113,12 +114,12 @@ async function exerciseSlowReader() {
         framingNeeded = 2;
       }
       const count = Math.min(remaining, chunk.length - offset);
-      if (payloadOffset < 32) {
+      if (payloadOffset < 328) {
         chunk.copy(
           header,
           payloadOffset,
           offset,
-          offset + Math.min(count, 32 - payloadOffset),
+          offset + Math.min(count, 328 - payloadOffset),
         );
       }
       offset += count;
@@ -126,10 +127,11 @@ async function exerciseSlowReader() {
       remaining -= count;
       if (remaining === 0) {
         if (
-          header.readUInt32LE(0) !== 0x47485631 ||
+          header.readUInt32LE(0) !== 0x47485632 ||
           header.readUInt32LE(4) !== WIDTH ||
           header.readUInt32LE(8) !== HEIGHT ||
-          header.readUInt32LE(12) !== WIDTH * HEIGHT * 4
+          header.readUInt32LE(12) !== WIDTH * HEIGHT * 4 ||
+          header.readUInt32LE(316) !== 1
         )
           throw new Error("Corrupted native video header");
         const next = header.readUInt32LE(16);

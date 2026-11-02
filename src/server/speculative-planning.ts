@@ -373,6 +373,7 @@ export class SpeculativePlanning {
       this.assertActivation(draft);
       phase = "admission_failed";
       const execution = await this.host.admit({
+        entry: "run",
         skill_id: request.skill.skill_id, version: request.skill.version,
         start_key: `plan_${draft.view.plan_id}`, epoch: basis.epoch,
         session_id: basis.session_id, life_id: basis.life_id,
@@ -482,7 +483,7 @@ export class SpeculativePlanning {
     if (skill.state !== "validated")
       throw new RuntimeFault("precondition_failed", "Selected exact program version is not validated");
     const scope = this.host.admissionContext();
-    if (!scope || skill.validation.runtime_version !== 4 || skill.validation.api_version !== 4 || skill.validation.validator_version !== 4 ||
+    if (!scope || skill.entry !== "run" || skill.validation.runtime_version !== 5 || skill.validation.api_version !== 5 || skill.validation.validator_version !== 5 ||
       skill.validation.compatibility_hash !== scope.compatibility_hash ||
       skill.validation.fingerprint !== programFingerprint(skill.hash, "skill", scope.compatibility_hash))
       throw new RuntimeFault("precondition_failed", "Selected cached executable contract is incompatible");

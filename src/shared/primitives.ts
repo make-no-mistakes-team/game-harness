@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Json, PlayerLife } from "./contracts.ts";
+import type { GameActionResult, Json, PlayerLife } from "./contracts.ts";
 import { identitySchema, safeCounterSchema } from "./control.ts";
 
 export const sessionIdSchema = identitySchema;
@@ -16,3 +16,7 @@ export const playerLifeSchema: z.ZodType<PlayerLife> = z.object({
 export const jsonSchema: z.ZodType<Json> = z.lazy(() => z.union([
   z.null(), z.boolean(), z.number().finite(), z.string(), z.array(jsonSchema), z.record(z.string(), jsonSchema),
 ]));
+
+export const gameActionResultSchema = z.object({ status: z.enum(["succeeded", "failed", "cancelled", "unknown"]),
+  summary: z.string().max(2000), evidence: jsonSchema, requires_reconnect: z.boolean().optional(),
+}).strict() satisfies z.ZodType<GameActionResult>;

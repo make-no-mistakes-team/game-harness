@@ -38,20 +38,22 @@ The agent can observe, write/edit, run, inspect and revise without filling out a
 
 Checkpoint recovery uses versioned serializable task state and unresolved operation references, not saved JavaScript stacks or promises. Resume requires compatible source/state, fresh authorized game state, fenced prior owners and actual neutralization/drain. Preserve explicit Pause/Stop and uncertain effects; restoring source or conversation never rewinds the game. Ordinary modules and checkpoint recovery remain later implementation work. The current body and restart contracts below remain the delivered interfaces until their cutover.
 
-The active perception profile is `minecraft_assisted_rgb_360_r8_v1`, with observation envelope 3 and a separate typed actor PNG. The broader perception target separates `assisted_rgb_frustum_v1`, an assisted 360-degree comparator and a later strict-visual condition. Those complete comparison profiles and capture-time synchronization remain undelivered; the current eight-block profile does not stand in for them.
+The active perception profile is `minecraft_assisted_rgb_360_r8_control_v4`, with observation envelope 3, current-visible-screen and controller-feedback reads, and a separate typed actor PNG. World sampling retains the prior eight-block permissions; controller feedback includes own-body, actual-heard events and input-application facts. The broader perception target separates `assisted_rgb_frustum_v1`, an assisted 360-degree comparator and a later strict-visual condition. Those complete comparison profiles and atomic capture-time synchronization remain undelivered; the current eight-block profile does not stand in for them.
 
 ## Current compact program interface
 
-Executable types live in [`src/shared/programs.ts`](../src/shared/programs.ts); model inputs in [`src/server/program-interface.ts`](../src/server/program-interface.ts). [`RuntimeTools`](../src/server/runtime-tools.ts) applies role/schema authority, [`ProgramOperations`](../src/server/program-operations.ts) owns use cases and [`ProgramWorkspace`](../src/server/program-workspace.ts) resolves names and bounded evidence. Programs are immutable async JavaScript bodies with host-bound `game,args`, not modules or developer-authored gameplay routines.
+Executable types live in [`src/shared/programs.ts`](../src/shared/programs.ts); model inputs in [`src/server/program-interface.ts`](../src/server/program-interface.ts). [`RuntimeTools`](../src/server/runtime-tools.ts) applies role/schema authority, [`ProgramOperations`](../src/server/program-operations.ts) owns use cases and [`ProgramWorkspace`](../src/server/program-workspace.ts) resolves names and bounded evidence. Each immutable program selects `run`, `step` or `analyze`. Actor authoring defaults an omitted entry to `run`; durable execution never infers a missing historical entry.
+
+`run` remains an async JavaScript body with host-bound `game,args`. `step` and `analyze` are ordinary modules with one synchronous named function export: `step(frame,state,intent)` or `analyze(input)`. Pure helpers and constants are allowed; imports, packages and ambient host access are rejected. Original and canonical source each have a 16 KiB UTF-8 bound. These formats share the existing artifact store and exact-version publication path.
 
 The ordinary default exposes these tools:
 
 | Model tool | Purpose |
 |---|---|
 | `observe` | Obtain fresh authorized game state, a typed actor PNG and separate image metadata without caller-supplied session/life/epoch. |
-| `program_write` | Create a named family or immutable revision with a JavaScript body; ordinary writes may omit the card and dependencies, with unspecified/untested card defaults. |
+| `program_write` | Create a named immutable `run`, `step` or `analyze` revision; omitted card/dependencies remain unspecified and untested. |
 | `program_submit` | Explicitly write an immutable version and request its exact-version start through ordinary admission; report persistence separately from a refused or uncertain start. |
-| `program_run` | Start, inspect or stop current/latest execution; deliberately activate prepared next work; select one finite attention wake. |
+| `program_run` | Start a matching `run`/`step`, inspect or stop it, version-update resident intent, run a pure analysis job, activate prepared run work or select a finite attention wake. |
 | `program_inspect` | Read catalog/source/execution/history/trace/feedback/comparison/planning and mechanical reference views. |
 | `program_review` | Record `keep` or `insufficient_evidence` for a named version's latest matching outcome, with reason. |
 | `help` | Load generated game/program/planning reference or disclose optional advanced modules on demand. |
@@ -73,7 +75,7 @@ For `program_submit`, `program_run` start and prepared successors, omitted `limi
 
 A new `name` creates a family and omits `based_on`. An existing name requires its exact latest `based_on` version. The host checks that parent before validation and before commit; stale-parent errors identify the current named version, never silently rebase. Revisions preserve the family name, canonical source/hash and parent lineage. An optional bounded `reason` links an actual revision to that parent's latest matching feedback without a second bookkeeping-only model call; it records a candidate experiment, not proven efficacy or promotion.
 
-`program_submit` accepts the write fields plus `args`, finite `limits` and optional `next`. It saves one validated version, then requests that exact version through the existing ordinary run admission. `program_write` remains save-only; `program_run` remains available for existing versions. Review and speculative roles cannot submit. The result separates `source:{status:"persisted",name,version}` from `start.status:"started"|"refused"|"unknown"`. A refused start does not roll back source. An unknown start requires inspection, not automatic resubmission.
+`program_submit` accepts a `run` or `step` definition with `args` and entry-specific finite limits. A step also accepts `initial_state`; only a run can select speculative `next`. It saves one validated version, then requests that exact version through ordinary admission. `program_write` remains save-only. Review and speculative roles cannot submit. The result separates `source:{status:"persisted",name,version}` from `start.status:"started"|"refused"|"unknown"`. A refused start does not roll back source. Inspect an unknown start rather than resubmitting it.
 
 Source registration and its exact-version receipt share one Store transaction. Submission phase identities retain the original source and execution across duplicate delivery or lost acknowledgements; replay never selects a newer catalog revision. An interrupted submission cannot automatically start on redelivery. Stop/Pause, task, owner, generation and negotiated scope are rechecked between persistence and admission. Successful admission retains the scheduler's pending-work behavior instead of requiring a separate run-only model request.
 
@@ -81,7 +83,7 @@ Review with an explicit version stays exact. Without one, `program_review` selec
 
 Model selectors use human names and optional exact versions; the host resolves IDs, hashes and authority scope. Starting without `version` pins latest validated once before admission. Catalog pages expose the latest stored revision per family with cursors; execution/history/source lookup never rewrites an already captured reference. Inspection preserves explicit omissions and independent feedback cursors.
 
-Write, run and prepare results are compact named status/experiment summaries, not repeated source/card dumps. Retrieve full source, card and validation details through the source inspection view when needed.
+Write, start and prepare results are compact named status/experiment summaries. Execution inspection includes effective limits and the resident's current bounded snapshot; source inspection supplies code, card and validation details.
 
 The strategist keeps a run-owned reference context outside its disposable Agent. Each actual SDK stream invocation, including tool-loop continuations, receives a supplement capped at 32 KiB serialized UTF-8: compact contracts, objective, model-authored recovery state, latest consequential obstruction, unresolved-operation references, relevant compatible immutable source and useful requested help. This is included in the actual request, not merely cached on the host. Source and its reuse metadata share an 18 KiB allowance; retained help has a 24 KiB ceiling. Both share the same 32 KiB request cap rather than additive reservations. Oversized documentation is split at schema/property boundaries; whole sources are either included or explicitly omitted, never truncated into executable fragments. This supplements, rather than replaces, bounded current observations, tool pairs and turn feedback.
 
@@ -99,7 +101,7 @@ The structured gameplay projection of strategic `observe` omits known host world
 
 `help` topics `reflex` and `memory` disclose optional lifecycle tools to the ordinary role. Reflex retains actual isolated JS and real Jev behavior; memory retains compatible snapshots, fresh load and explicit evidence-qualified promotion. [`src/shared/tool-policy.ts`](../src/shared/tool-policy.ts) is the single role/module registry for both provider catalog and dispatch. Speculation receives observe/read-only inspect/help plus `prepare_next` only. Post-goal review permits source/assessment artifacts and authorized reads, not gameplay or advanced mutation.
 
-Inside a program, capabilities are `await game.observe()`, `await game.action(action)` (final result), `await game.respawn()`, `await game.recipes(item)`, `await game.call({name,version?},args)` and `await game.progress(summary,details)`. Declared dependency names resolve to exact validated versions when the parent is written. A running child lookup uses **only that parent's pinned closure**, never current latest; omitted child version requires an unambiguous declared name. Internal `SkillRef` identities remain evidence/enforcement details. `game.respawn()` uses the same exclusive arbiter as `game.action({kind:"respawn"})`; it is no privileged recovery shortcut. Every return path, including early blocked/failed exits, supplies `{status:"completed"|"blocked"|"failed",summary,result}`; use `result:null` without a payload. Static validation does not prove every path returns correctly, and completion does not certify the operator's objective.
+Inside a program, capabilities are `await game.observe()`, `await game.action(action)` (final result), `await game.respawn()`, the registered Minecraft reads `await game.recipes(item)` and `await game.screen()`, `await game.call({name,version?},args)` and `await game.progress(summary,details)`. Declared dependency names resolve to exact validated versions when the parent is written. A running child lookup uses **only that parent's pinned closure**, never current latest; omitted child version requires an unambiguous declared name. Internal `SkillRef` identities remain evidence/enforcement details. `game.respawn()` uses the same exclusive arbiter as `game.action({kind:"respawn"})`; it is no privileged recovery shortcut. Every return path, including early blocked/failed exits, supplies `{status:"completed"|"blocked"|"failed",summary,result}`; use `result:null` without a payload. Static validation does not prove every path returns correctly, and completion does not certify the operator's objective.
 
 `game.actionAndObserve(action)` is a worker-local composition of one ordinary action and a fresh ordinary observation. It returns `{action,observation}` without changing the action result. Observation follows success, or a failed result with explicit `world_effect_emitted:false` and `neutralized:true`, provided reconnect is not required. Other outcomes return `observation:null`; unknown, cancellation and reconnect still encounter the host's execution fences. Validation and observation errors propagate; there is no stale fallback. Both calls consume existing budgets.
 
@@ -125,7 +127,19 @@ A transported generated value that violates `SkillResult` instead produces `inva
 
 ### Delivered actor images and recorded episodes
 
-The application and actual acceptance runner use `Runtime.modelObservation()` for strategic prompts and `observe`: authorized structured observation, one typed PNG image and separate metadata. Worker `game.observe()` remains JSON-only. The shared asynchronous actor/recorder PNG codec corrects native bottom-up rows and preserves every RGB byte without a per-observation subprocess. It sets PNG alpha to 255: native framebuffer alpha does not describe display transparency, and the actual game viewer renders sampled RGB as opaque. Actor metadata declares `pixel_presentation:"opaque_rgb"`; these PNGs preserve visible native RGB, not the source framebuffer's alpha channel. Actor PNGs have a 2 MiB cap and explicit stale/malformed/oversize failures. Selection rechecks run/session/life/generation authority after encoding. Metadata identifies the host selection scope and says `alignment:"unsynchronized"`: GHV1 provides no capture-time life, space or camera proof.
+The application and actual acceptance runner use `Runtime.modelObservation()` for strategic prompts and `observe`: authorized structured observation, one typed PNG image and separate metadata. Worker `game.observe()` remains JSON-only. The shared asynchronous actor/recorder PNG codec corrects native bottom-up rows and preserves every RGB byte without a per-observation subprocess. It sets PNG alpha to 255: native framebuffer alpha does not describe display transparency, and the actual game viewer renders sampled RGB as opaque. Actor metadata declares `pixel_presentation:"opaque_rgb"`; these PNGs preserve visible native RGB, not the source framebuffer's alpha channel. Actor PNGs have a 2 MiB cap and explicit stale/malformed/oversize failures. Selection rechecks run/session/life/generation authority after encoding. Actor metadata identifies host selection scope and retains `alignment:"unsynchronized"` with structured observations. Richer GHV2 capture diagnostics remain outside this actor metadata; they neither expand the sensory profile nor restore input authority.
+
+Live capture uses a fixed 328-byte little-endian GHV2 header and unchanged
+RGBA pixels. The canonical [packet decoder](../src/shared/video.ts) binds
+readback start/end, client tick, render invocation, capture life/space/native
+generation and capture-tail screen to that exact packet sequence. Available
+world-render metadata copies the actual camera, quaternion, position and
+projection matrices passed to Fabric world rendering; it is not reconstructed
+from later player pose. Missing, invalidated or different-invocation world
+samples remain explicitly unavailable. Capture-tail screen identity is not
+proof of the precise screen-render transaction. Recorders retain these
+diagnostics, while actor PNGs omit them. GHV1 is not a live compatibility path;
+retained historical artifacts are not rewritten.
 
 The codec uses fast lossless deflate with a bounded 256 KiB output chunk. In the pinned Bun runtime, exhausting its default 16 KiB output buffer schedules another [worker/event-loop continuation](https://github.com/oven-sh/bun/blob/bun-v1.3.14/src/js/node/zlib.ts#L458-L495); a large PNG can otherwise accumulate many continuations under live raw-video I/O. This changes compressed bytes and storage cost, not pixels, permissions, the actor image cap or recorder queue limits. The selected zero-provider `scripts/native-recording-proof.ts --allow-native --jar <fresh.jar> --natural-start` case captures ordinary seed-1 startup with concurrent observations/actor-image selection and no setup commands or gameplay effects. It is recording infrastructure evidence, not model gameplay or a general throughput guarantee.
 
@@ -135,9 +149,365 @@ Runtime accepts a bridge-delivered structured observation through its ordinary s
 
 Model choices project input modalities from actual discovered SDK descriptors. Image-enabled actors reject models without image input support before inference. Descriptor support is not a live vision result. Synthetic runtimes without an actor-frame source explicitly report image mode disabled. Store tool events contain metadata, not image binary.
 
-The bounded acceptance recorder subscribes directly to delivered bridge frames, independently of spectator latest-only backpressure. It retains PNGs, delivery-order index records, capture/receive times, identity and upstream sequence/time gaps. Bounds are 128 MiB pending raw packets, two concurrent asynchronous encodes, 12,000 frames, 32 GiB frame files and 600 seconds. Exhaustion or dimension/orientation changes stop capture as incomplete; the native producer can already omit renders. `finish()` drains durable frame evidence and writes a capture-time ffconcat timeline including the final hold. Separate offline FFmpeg rendering preserves waits; failure retains PNG/index/manifest evidence. Audio is not recorded. Replay rendering is not visual inspection.
+The acceptance recorder subscribes directly to delivered bridge frames, independently of spectator latest-only backpressure. It retains PNGs, delivery-order index records, capture/receive times, identity and upstream sequence/time gaps. The default short profile allows 128 MiB pending raw packets, two concurrent asynchronous encodes, 12,000 frames, 32 GiB frame files and 600 seconds. A complete checked evidence profile can declare a different finite duration/frame allowance; acceptance rejects a profile that cannot cover its requested task horizon before external preparation.
 
-The active boundary uses observation envelope **3**, executable API/validator/runtime **4**, and native hello **3**. Isolated worker framing remains **1**, login admission proof remains **1**, GHV1 binary capture is unchanged, SQLite remains **4**, usage metrics remain **2**, and request-usage evidence remains **1**. This cutover does not deliver larger-source modules, checkpoints, audio, general GUI control or another supported game. Study governance does not enlarge runtime capabilities.
+Native capture reuses three fixed framebuffers. The socket writer drains pending
+captures in order, retaining up to two successors while it owns a packet. If all
+buffers are occupied, capture replaces the oldest waiting packet and increments
+`latest_queue_replacements`; it never overwrites the socket-owned packet or
+waits for network output on the render thread. This absorbs brief write stalls
+at the cost of pending-image latency. Saturation and render stalls can still
+leave explicit recording gaps.
+
+Recorder and journal limits are defined in [`evidence-limits.ts`](../src/shared/evidence-limits.ts). Supplied profile files are regular project-local files, checked for size, identity and forbidden secret/database paths. Registered studies must pin a supplied profile's exact preprocessing identity. The selected profile and effective recorder/journal/renderer limits are retained before inference. Constructor overrides are normalized once; invalid or misspelled bounds never silently default or clamp.
+
+Exhaustion or dimension/orientation changes stop capture as incomplete; the native producer can already omit renders. `finish()` drains durable frame evidence and writes a capture-time ffconcat timeline including the final hold. Current recording manifests use schema 1 and retain effective limits, actual stored PNG bytes, pending/encoder peaks and capture/end timing; old manifests are unchanged. `health()` reads current counters without filesystem work. Separate bounded offline rendering preserves waits; failure retains PNG/index/manifest evidence. Audio is not recorded. Replay rendering is not visual inspection.
+
+Offline export preserves delivered images on a millisecond presentation time
+base, including large terminal gaps and the final hold. It does not impose a
+25 FPS image-demuxer grid or use B-frame reordering that can understate an MP4
+endpoint. The renderer verifies the finalized concat against the capture owner's
+sealed SHA256 before using per-image options and permits only local file
+protocols; it is not an arbitrary concat script importer. Historical PNGs,
+indexes and movies remain unchanged.
+
+The active boundary uses observation envelope **3**, executable API/validator/runtime **5**, native hello **4**, and `minecraft.action@4`. Isolated worker framing remains **1**; resident messages use their own version-1 namespace. Login admission proof remains **1**, live binary capture is **GHV2**, SQLite remains **4**, usage metrics remain **2**, and request-usage evidence remains **1**. Screen and controller-feedback reads use `minecraft.visible_screen@1` and `minecraft.controller_frame@2`. Semantic heard-event feedback is separate from audio recording, which remains absent. This cutover does not deliver larger source bundles, checkpoints or another supported game.
+
+### Ordinary Minecraft world input
+
+The registered action capability is `minecraft.action@4`. Its `world_input`
+action accepts a bounded sequence of ordinary held-key, counted-press,
+hotbar/swap/drop and view commands. The generated `help` game reference and
+[`control.ts`](../src/shared/control.ts) define the exact request; versions 1
+through 3 are not live aliases. Existing semantic actions remain separately disclosed
+assistance in the current profile.
+
+Each step declares all nine held movement/attack/use booleans. Ordered button
+transitions must agree with that state; holding attack does not manufacture a
+new entity click every tick. Declarative `selected_hotbar` applies at step
+entry before normal vanilla slot synchronization; explicit hotbar edges
+remain ordinary counted keys with vanilla consumption precedence.
+Inventory opening is edge-only. World input
+rejects an already open screen, and a screen opened by vanilla consumption
+ends the world clip without closing that screen or applying later steps.
+Arbitrary keys, chat/debug commands and generic GUI input are not admitted
+through this action.
+
+View commands are unchanged, a delta applied once at step entry, or a rate
+integrated once per consumed client simulation tick at 0.05 seconds. Units
+are radians or radians per second, with positive-up actor pitch. The native
+look path applies ordinary pitch and vehicle constraints; receipts return
+the actual pose. This is not the assisted target servo. Normal vanilla
+crosshair, both-hand fallback, item-use/release and attack/use precedence
+determine the interaction, rather than a stored observed target.
+
+An action has at most 64 steps, 100 total native ticks and 256 expanded
+edges. It has a finite tick-derived wall/receipt deadline independent of
+legacy helper timeouts. Application receipts distinguish consumed ticks,
+step/edge prefixes and actual native timestamps from later gameplay effects.
+A completed input clip does not confirm damage, a projectile, production or
+task success. Interrupted emitted work retains uncertainty and is never
+replayed. Confirmed emitter closure establishes containment, not a fabricated
+native release acknowledgement. The action is not resident streaming or an
+input lease; those remain separate runtime work.
+
+### Persistent visible Minecraft screens
+
+`game.screen()` reads the current visible layout through
+`minecraft.visible_screen@1`; it neither opens a container nor closes a screen
+to answer. The snapshot includes visible empty slots, cursor custody, actual
+logical-GUI bounds, current-page elements and visible progress. It does not
+enumerate hidden offers, recipes, closed containers or item NBT.
+
+`screen_input` requests bounded ordinary slot/button/key/text/scroll/close operations
+against a screen identity and layout revision. Local source/cursor assumptions
+are separate from content revision: an unrelated furnace-output update is
+not a reason to reject an unchanged input-slot operation. A no-input frame,
+read or normal operation settlement keeps the screen open. Explicit close
+uses vanilla custody behavior, not a rollback promise. Replaced layouts and
+handlers fence old presses/releases.
+
+The ordinary GUI pointer keeps its last position between requests and during
+idle frames on the same screen and handler. A new request moves from there,
+without a fixed return point in the inventory. Retained position grants no
+button or input ownership. Closing or replacing the screen, changing its
+handler/window/viewport, or another inventory writer invalidates it; a fresh
+context starts from the scaled vanilla mouse position.
+
+Rendered choices include stonecutter recipes, loom patterns, enchantment rows
+and beacon controls. Merchant offers expose at most seven rows on the
+rendered page. An active `scroll_region` accepts horizontal and vertical
+wheel components in `[-16,16]`, after moving the ordinary pointer to that
+region. Page, input binding and geometry changes retire old element ids.
+The projection does not enumerate off-page choices or expose enchantment
+seeds or undisplayed hints. An unavailable operation rejects explicitly.
+
+Effect envelopes now require a discriminated `expected_screen`: `absent`
+means strictly no screen; `transaction` preserves exact helper
+screen/incarnation/revision checks; `layout` carries visible-screen identity
+and layout revision. Host/receive identity admission is not complete GUI
+application validation: native layout and local values are checked again
+before effects. Old null, untagged or omitted preconditions are not accepted
+as live authority.
+
+GUI transaction evidence is separate from helper receipts. Matched server
+ARM/FINISH diagnostics and actual result-slot/furnace provenance can establish
+a confirmed transaction or production source. Client prediction, input
+acknowledgement and possession alone cannot. Unmatched acknowledgements stay
+unknown, and trades are not automatically repeated. The integration guide
+records the exercised verification scope; registering these interfaces does
+not establish every progression layout or a model's ability to use it.
+
+### Basic controller feedback
+
+`game.frame(audio_cursor)` reads current local own-body, vanilla crosshair,
+visible GUI and audible feedback without a server inventory request. Pass
+`null` initially, then retain the returned audible cursor independently for
+each consumer. This read is not `game.observe()`: its inventory is explicitly
+`client_prediction`, and cannot establish server-confirmed goal possession.
+Cached world rows keep their original authorized observation time and an
+explicit age flag; they are not a new live geometry sample.
+Known screen close/replacement rejects an in-flight frame instead of
+returning its obsolete GUI. Screen identity checks do not turn unrelated
+slot-content revisions into a whole-inventory read barrier. An unavailable
+view fails explicitly rather than pretending that its GUI is absent.
+
+Own feedback includes velocity in blocks per client tick, fluids and air,
+vehicle, active hand/use duration, equipment, status and attack indicator.
+Component sampling is not atomic. Inventory has its own native timestamp;
+render metadata names an actual GHV2 capture sequence and its original pose.
+Capture sequences use the unsigned 32-bit wire counter, including wrap to
+zero; camera yaw remains the actual unwrapped value. Native nanoseconds stay
+signed decimal strings. Unavailable, wrong-scope or older-than-five-second
+render metadata is null. The typed actor PNG remains unsynchronized.
+
+Audible pages retain at most 128 events for one second and deliver up to
+eight per read. Independent cursors do not drain each other's events;
+expiry and overflow have explicit gaps. Scope changes invalidate old
+cursors and queued old-scope playback. The original sound time is preserved
+in legacy grouped observations too. An actually delivered creeper priming
+sound may expose the `creeper_primed` cue and coarse direction/distance,
+never a hidden fuse or inferred threat. This channel supplies neither a
+subtitle-rendering feed nor recorded audio.
+
+Native proof launches use OpenAL's silent `null` output backend by default.
+The audio engine and in-game gains remain active, so permitted heard events
+still reach the agent without playing through the host's speakers or
+headphones. `GAMEHARNESS_NATIVE_AUDIO=silent` also selects this output for an
+ordinary launch; `audible` opts a proof launch back into normal output.
+Other applications and ordinary launches without that setting are unchanged.
+
+Frame schema 2 includes `last_input`, the last actual controller-stream ACK
+or null; finite actions retain their separate receipts. Its controller
+generation, sequence, consumed ordered prefix,
+actual tick/time, held keys and constrained pose describe input application.
+They do not establish damage, production or another world consequence.
+`effect_updates` retains up to eight later GUI receipts within 16 KiB,
+with original native times and an explicit omitted count. Receipts can
+remain unknown after confirmed input. Neither field exposes the private
+owner/scope grant. Distant/frustum sensing, incremental live geometry and
+multipart/nonliving effect attribution remain separate work.
+
+### Native controller input transport
+
+The host reserves the avatar through the same `ActionArbiter` used by finite
+actions. Reservation records the exact source and scope before native
+admission; no dummy action acquires a second writer. Finite actions and
+context replacement wait for retirement. A submitted snapshot is not an
+application ACK.
+
+The authenticated control socket has separate bounded lanes: sixteen
+ordinary host RPCs, four unresolved input frames, one controller sample,
+one mechanical heartbeat and one reserved retirement. Native ordinary
+dispatch remains bounded at 32 tasks. Stream admission does not enqueue a
+game-thread task for every nominal input. At most 256 expanded ordered
+edges remain unacknowledged. Only compatible unsent, edge-free held
+snapshots may coalesce; sent frames, ordered edges, relative view deltas
+and explicit selection are preserved.
+
+Each input names its actual native capture, source, owner and generation.
+New input must enter within 150 ms of that capture, including conservative
+clock uncertainty. A separate 250 ms native lease expires mechanical
+control; renewing it does not renew the task deadline or replay a decision.
+Held use survives later snapshots without a release/repress. Vanilla
+counted-press consumption and movement-key sampling establish the applied
+prefix; adding a press to a queue does not. A fresh GUI intent enters the
+existing bounded visible gesture driver. Its pointer travel and subsequent
+server receipt keep their own timing rather than claiming a 150 ms gesture.
+
+The game thread captures immutable replies and notices, then enqueues them
+without waiting on a socket. One writer retains at most 256 messages and
+1 MiB, including its in-flight message and reserved ACK headroom. Critical
+messages retain FIFO order. Replaceable diagnostic progress can coalesce
+with an omitted counter; it never confirms input or world effects.
+Critical overflow fences the connection and leaves unresolved effects
+unknown. Per-frame progress does not write Store events or fsync the disk.
+
+Retirement stops admission first and clears actual inputs on the game
+thread. The reserved ACK reports that thread's real tick and native time.
+A stopped native thread cannot release keys on time; after resumption,
+expired press backlog is rejected instead of burst-applied. Missing
+retirement closes the emitter and remains uncertain. Confirmed process
+containment is not a fabricated native retirement ACK, and never replays
+earlier effects. The generated resident worker and scheduler use this
+transport through the same arbiter.
+
+### Resident steps and pure analysis
+
+[`ResidentController`](../src/server/resident-controller.ts) runs one isolated
+worker at absolute 1, 5 or 20 Hz. It skips missed slots without catch-up and
+allows one step at a time. Compilation precedes native admission; the
+original monotonic root deadline includes startup and never renews.
+Every step returns `input`, explicit `next_state`, `status` and bounded
+`events`. State and intent each fit 16 KiB of JSON; the complete worker
+output, envelope and newline fit 64 KiB at depth 32.
+
+Resident sampling waits for a render and a client tick newer than the
+stream's last successful sample or grant. It constructs a fresh body with
+its actual capture time; it does not synchronize that body with RGB pixels.
+One pending resident read shares the native four-read bound with ordinary
+controller reads. Ordinary `controller_frame` reads keep their separate
+immediate/deferred behavior. Waiting retains the original two-second read
+deadline and can end earlier on lease or authority loss. An invalidated
+resident read waits for physical input release before its error; explicit
+revoke also queues its genuine retirement ACK first. Sampling waits and
+missed slots remain part of cadence evidence, not capture-to-applied latency.
+
+`step_ms` bounds isolated worker/guardian evaluation, including serialization.
+The host separately permits at most 500 ms for a step response, under the
+unchanged root deadline. Host scheduling and IPC delay are not computation
+time; the snapshot's `timings.step_ms` reports that round-trip wall interval,
+not CPU. Waiting sends no lease heartbeat. A returned running decision must
+still pass the original 150 ms native capture-age check before renewal or
+state publication; an expired lease cannot be revived by a late response.
+
+Fresh valid decisions renew the 250 ms native lease using their actual
+retained capture. A stale decision cannot renew it. At 1 Hz, expiry before
+the next step is expected. Empty visible-screen waits and unchanged neutral
+world waits can process feedback without submitting another input; stopping
+a prior view rate still requires a submission. Frames, steps, ordered edges,
+events and pure jobs have separate cumulative limits. Resident frames do not
+consume the legacy taskflow action/call allowance.
+
+Processed state, submitted sequence, actual applied prefix and later GUI
+receipts remain separate. GUI receipts retain their original controller
+sequence and source, including confirmed prefixes with unknown suffixes.
+They can contribute adapter-owned verification facts without a finite
+`ActionView` or a second input owner.
+
+`args` supplies initial intent; `initial_state` defaults to null at actor
+ingress. `update_intent` requires the current `expected_version` (initially
+zero), increments only that version and discards an in-flight old-intent
+result. `analyze` selects an immutable pure module and an expected intent
+version. Its isolated job can run beside steps, has a separate finite
+compute allowance and returns source/input/version provenance. Its output
+does not change controls or intent automatically.
+
+Analysis `elapsed_ms` and cumulative compute charges cover the trusted
+evaluation interval, not compilation or later worker removal. The host reports
+that boundary before joining teardown. Nullable `post_evaluation_ms` separately
+measures callback receipt through service settlement on one host clock; it
+includes delivery, cleanup and host delay, not pure CPU. Compilation that never
+evaluates has no post-evaluation interval. Root lifetime still includes all
+startup and cleanup.
+
+Attention events reach the existing serialized strategist through a recognized
+wake category, with bounded authored summaries and details. Diagnostic events
+alone do not request replanning. Up to 32 pending attention records remain
+available independently of the ordinary event page; overflow has an explicit
+count and event range, and delivered triggers are not replayed from later pages.
+Unknown controller receipts retain their input
+identity, sequence, generation and original scope in no-replay context.
+Confirmed retirement annotates emitter closure, not resolution of those effects.
+
+Blocked, yielded and completed steps retire their execution. Stop fences
+callbacks and input admission before draining the worker, jobs and native
+writer. The arbiter retains its reservation until all actual barriers settle.
+A confirmed native retirement can coexist with unknown computation cleanup;
+neither clears prior world-effect uncertainty. Playing child composition and
+prepared successors remain run-only.
+
+### Evaluator-only native fault configuration
+
+Normal launches serialize `NativeSession.evaluation:null`. The trusted launcher
+can accept a strict `NativeOptions.evaluation` declaration only with explicit
+native-proof authority; this is not a connection field, game capability or
+model tool. Natural fixtures reject it before setup, and resident timing
+studies require the actual launched session to remain disabled.
+
+The optional declaration permits one owner-bound inventory-screen replacement
+and/or a bounded native control-socket send buffer. Replacement is armed
+against the exact controller, original screen/handler objects and visible
+layout, then consumed once after the real second gesture enters its pressed
+phase. It uses ordinary screen installation and incarnation hooks, never a
+second input owner, fabricated GUI receipt or release into the new screen.
+Raw arm/status methods reject normal mode; their metadata is not actor
+perception. These facilities belong only in declared zero-provider fault
+fixtures, not real-provider gameplay studies.
+
+Trusted diagnostics separately report overlay presence and world-input callback
+eligibility. Eligibility is not proof that a key was consumed, and does not
+describe GUI gesture eligibility. The original application receipts, frame
+freshness, lease and source/scope guards remain authoritative.
+
+### Correlated control timing
+
+Ordinary native replies carry request-correlated receive/reply nanoseconds
+as decimal strings and a client-tick counter. Receive is the authenticated
+application receive point; reply is before serialization/socket writes, not
+flush completion. The host brackets each request on its own monotonic clock
+and retains native-minus-host offset bounds with uncertainty. Existing
+request traffic and diagnostics supply repeated samples without new
+observation polls. Clock correspondence is measurement evidence, not input
+permission or a guarantee against drift. It resets across native boots and
+is unavailable after its bounded age.
+
+Controller replies can also carry a trusted `controller_lease` timing record.
+It binds the actual queue check to its request, owner and controller generation,
+retaining requested, previous, effective and task deadlines. The first fence
+is stamped at its synchronized transition; an earlier validation timestamp is
+not its occurrence time. Retirement initiation and trigger remain separate
+from the post-release ACK and ordinary input application.
+
+Completed controller submissions can carry `controller_application` timing:
+actual admission and begin times, queue entries ahead at admission, preparation
+ordinals, and the first completed preparation, input-consumption and movement
+sampling hooks. Missing hooks remain null. The snapshot binds to the original
+request, owner, controller generation and frame. Its settlement timestamp
+records queue completion separately from the original ACK application time;
+an empty GUI snapshot can use an earlier ACK sample. GUI dwell remains part of
+application time. These records distinguish queue waiting from later input
+phases without changing FIFO ordering or treating progress telemetry as
+confirmed input.
+
+Trusted resident tracing optionally records the absolute slot anchor, scheduled
+deadline, actual wake, sample, worker return, validation, renewal and submission.
+An early timer notification re-arms the same slot; a result settling exactly at
+the next available boundary does not skip it. Trace sequence gaps, observer
+errors and finite-history omissions make evidence incomplete. Streamed timing
+subscribers can retain their own bounded population beyond the diagnostic ring;
+exported lease and application-stage snapshots are detached. These diagnostics
+grant no actor read or input authority.
+
+Operator diagnostics retain at most 512 request samples, with explicit
+omitted, missing and invalid counts. Source validation/publication, model
+admission/first response/settlement, capability waits and worker startup or
+cleanup have correlated host-clock endpoints. Worker startup witnesses the
+supervisor ready boundary, not completion of every source computation.
+The supported SDK exposes the prepared request and first complete received
+SSE event, not a raw network-first-byte hook; that unavailable endpoint is
+explicit rather than inferred from the event timestamp.
+Failed validation publishes no revision; unconfirmed cleanup is not a
+successful barrier. Source timing also covers exact-snapshot revalidation
+and import for working programs and experience; a refused import publishes
+no source identity. Native input receipts separately identify actual
+movement-key sampling, camera setter changes and retiring-owner key release;
+none proves a gameplay effect or that a camera update was rendered.
+
+Durations stay in their originating clock domain. Overlapping spans are not
+additive idle time. Required game waits, authored deliberate waits and
+infrastructure stalls are separate categories when supported by evidence;
+unclassified time is not automatically inference delay or wasted motion.
 
 Root defaults are 120,000 ms, 64 actions, 256 host calls and depth eight; hard maxima are 600,000 ms, 512 actions, 2,048 calls and depth eight. Child calls require declared exact dependencies and an acyclic bounded graph. The tree shares consumed budgets and deadline; children cannot reset them. One worker has at most one host capability outstanding. Parents never hold the avatar lease while awaiting children. Only leaf actions own effects, with `origin:"skill"` and their `execution_id`.
 
@@ -175,11 +545,47 @@ Explicit compatible cross-model product imports must preserve authoring provider
 
 Per-attempt request/wall allocations, summed cohort allocations, simultaneous requests/workers and elapsed cohort deadline are separate finite bounds. Unknown/interrupted reservations retain their slot and allocation. A terminal SDK event alone is not transport drain: the owner joins the actual stream iterator and later Agent/turn/auth scope closure. Confirmed resource release is a separate durable fact and never rewrites unknown consumption or an interrupted outcome. The database owner explicitly finalizes its fixed prepared statements before synchronous close.
 
-Current live study support is cold fresh seeded Normal Survival with fresh private Store/program state and no global experience/publication path. Seed/settings and actual profile/verifier/native/model identities are checked; seed equality does not establish a matched save. Unsupported restore/prepared-save, inherited-library, frozen/alternative-controller and Jev study conditions fail before external preparation. The admission-only CLI exercises real governance with no game/provider and cannot establish gameplay support.
+Whole-agent live studies use cold fresh seeded Normal Survival with private Store/program state and no global experience/publication path. Seed/settings and actual profile/verifier/native/model identities are checked; seed equality does not establish a matched save. That route rejects restored/prepared starts, inherited libraries, alternative controllers and Jev before external preparation. Admission-only runs exercise governance without a game or provider.
 
-Current `run.adapter` provenance records `{descriptor,compatibility_hash}` from the actually negotiated adapter. The immutable descriptor pins game/version, adapter/version/build-input hash, envelope/payload schema identities and hashes, complete materialized profile configuration/hash, actual capability schemas/hashes, actuator and executable API/validator/runtime4. The built JAR contains `gameharness-native-contract.json`; the host reads that actual ZIP entry and final artifact hash, checks actual build inputs, and compares the native process's descriptor rather than supplying an expected hash for it to echo. Runtime receives the registered adapter object/getter, never an adapter-id string heuristic.
+The separate `resident_platform` route admits checked evaluator-authored native
+timing fixtures. It requires an explicitly prepared Normal Survival arena,
+declared cheats/resources, null model identities and zero provider allowances.
+Immutable slots retain technical outcomes and actual resource drain;
+`agent_status:"not_run"` and null goal/usage prevent a platform pass from
+becoming a gameplay result. Its declared calibration and full E01 cohort
+remain separate.
 
-Historical schema2/API1–3 sources, observations, reports, outcomes and original identities remain read-only and are not relabeled, restored as live controllers or silently imported. Active source validation, dependency import, working libraries, experience hydration, policy activation and effect admission require the complete API4 stamp, stable compatibility hash and source/configuration fingerprint. Boot/session/run/life/space identities do not affect reusable source compatibility. Explicit revalidation creates a new immutable validation identity. There is no old active shim, child-calling alias or fallback adapter. Mineflayer and synthetic-adapter evidence cannot be relabeled native.
+New E01 declarations require capture-to-applied-input p95 <=50 ms and p99
+<=100 ms at 20 Hz during healthy native tick progress, with no
+infrastructure-caused gap >=1,000 ms while a valid fixture has input ready.
+Lower rates are exploratory but remain subject to load independence.
+Expiration does not establish continuity. Retain maxima, missed slots,
+expiries, native stalls and clock uncertainty, including failed or incomplete
+windows. A new frozen build and protocol gets a separate 27-slot series;
+earlier results cannot be pooled into it.
+
+The fixed E01 runner supports a normal generator with structures enabled,
+and checks selected safe properties from its actual owned server before task
+admission. Measurement-frame decisions retain late confirmed ACKs and explicit
+unconfirmed or censored dispositions; conditional latency quantiles do not
+claim those omitted decisions were confirmed. Before choosing its planned
+post-window Stop, the evaluator joins measured ACKs within the original root
+and work deadlines. It rechecks deadline, abort and original native scope after
+synchronous population reads and immediately before that Stop. Actual operator
+or authority Stop is never delayed by this wait. Later post-window submissions
+cancelled during Stop stay explicitly unconfirmed with unknown effects; they
+do not enter the fixed measured population. Each native child retains its
+240-second wall and 25-second cleanup reserve. A trusted finalizing transition
+does not extend that deadline; resource release requires actual process close
+and separately confirmed drain. After all native children close, the parent
+derives replays from their sealed captures, with at most 30 seconds per encoder
+clipped to the original registered cohort deadline. Derived-media records stay
+separate from immutable child outcomes. Missing or failed derivatives prevent
+technical cohort completion; full original-speed inspection remains required.
+
+Current `run.adapter` provenance records `{descriptor,compatibility_hash}` from the actually negotiated adapter. The immutable descriptor pins game/version, adapter/version/build-input hash, envelope/payload schema identities and hashes, complete materialized profile configuration/hash, actual capability schemas/hashes, actuator and executable API/validator/runtime5. The built JAR contains `gameharness-native-contract.json`; the host reads that actual ZIP entry and final artifact hash, checks actual build inputs, and compares the native process's descriptor rather than supplying an expected hash for it to echo. Runtime receives the registered adapter object/getter, never an adapter-id string heuristic.
+
+Historical schema2/API1–4 sources, observations, reports, outcomes and original identities remain read-only and are not relabeled, restored as live controllers or silently imported. Active source validation, dependency import, working libraries, experience hydration, policy activation and effect admission require the complete API5 stamp, selected entry where applicable, stable compatibility hash and source/configuration fingerprint. Boot/session/run/life/space identities do not affect reusable source compatibility. Explicit revalidation creates a new immutable validation identity. There is no old active shim, child-calling alias or fallback adapter. Mineflayer and synthetic-adapter evidence cannot be relabeled native.
 
 Native inventory-gain promotion evidence requires `inventory_receipt_confirmed:true` and trusted own before/after counts. The trusted predicate event must occur within the closed root's bounded execution interval. Exact craft/dig `target_name` plus trusted task verification can qualify delayed pickup only within that interval; later gain cannot extend it retroactively. A trusted-goal cancellation can close an eligible root without pretending it self-completed; local predictions/assertions cannot qualify. These rules define evidence eligibility, not generalization.
 
@@ -536,6 +942,17 @@ On restart, all old requests are fenced regardless of apparent timestamp freshne
 
 Artifact bytes are immutable and content-addressed; the trusted backend stores registry metadata and references. Registration stores JS source or declarative typed AI configuration, never only an unserializable closure. Metadata includes artifact ID/version and hash, kind, authoring model/decision references, source run/world where applicable, game/adapter/profile/schema compatibility and capability requirements as defined above, source compatibility, state schema, limits, and validation/evidence references. Skills and policies have separate identifiers and registries even if they share an artifact format.
 
+Source publication prepares durable artifact bytes asynchronously: verify an
+existing file, or write and sync a temporary file, rename it and sync the
+directory. Before the single synchronous SQLite publication transaction, the
+caller rechecks authority. A revoked call or closed Store cannot publish a
+revision or registration receipt after preparation; an unreferenced durable
+artifact may remain. Inputs are detached before preparation so concurrent
+caller mutation cannot change the published source, metadata or receipt.
+SQLite WAL/FULL durability is unchanged. This removes filesystem persistence
+from the control event loop; synchronous database commits and history reads
+still need separate timing evidence.
+
 Each reusable skill/policy version links its exact immutable StrategyCard version and source/configuration hash under the [required card schema](learning-and-evaluation.md#human-readable-strategy-artifacts). A revision appends linked source/card versions; it cannot leave a card describing different source bytes. Untested status and unknown outcomes remain explicit.
 
 Per-model libraries and pre-run immutable library snapshots follow [learning and evaluation](learning-and-evaluation.md). Compatibility is checked when selected and again when activated; a model/library mismatch is explicit, not silently repaired. Serializable private state belongs to one execution and can contain only authorized observations or derived information. Restoring it requires schema compatibility, world provenance checks and a new execution fence.
@@ -695,11 +1112,11 @@ Timing evidence records accepted start, transition to running, strategic authori
 
 The profile targets Minecraft Java 1.21.4 Normal Survival, one avatar, ordinary spawn/inventory/death rules and no agent cheats/operator privileges. An actual Java 21 Fabric client owns raw state, filtered perception, smooth motors and post-HUD video. The managed Fabric server requires session proof; matching names, offline whitelists or player caps are insufficient. Control binds private session/world/epoch authority separately from video. Transport loss fences effects and neutralizes controls before renewed authority. No old-adapter fallback is allowed.
 
-### Player-observable structured profile v1
+### Current player-observable structured profile
 
-The active profile is **`minecraft_assisted_rgb_360_r8_v1`**, version 1. The descriptor declares observation envelope **3** and payload schema **`minecraft_observation_v1@1`**, with separate schema hashes. Its materialized configuration is radius 8, at most 144 blocks/32 entities, maximum age 1,000 ms, camera-independent native raycast occlusion, opaque RGB PNG with unsynchronized alignment, the actual `balanced`/`precise`/`fast` motor setting and semantic helpers enabled. The payload additionally bounds own inventory to 64 entries, sounds to eight and all collections together to 256 entries. These identities and values come from [`native-contract.ts`](../src/server/native-contract.ts) and [`minecraft.ts`](../src/shared/minecraft.ts); the configuration and compatibility hashes bind the actual contract.
+The active profile is **`minecraft_assisted_rgb_360_r8_gui_v2`**, version 2. The descriptor declares observation envelope **3** and payload schema **`minecraft_observation_v1@1`**, with separate schema hashes. Its materialized configuration is radius 8, at most 144 blocks/32 entities, maximum age 1,000 ms, camera-independent native raycast occlusion, opaque RGB PNG with unsynchronized alignment, the actual `balanced`/`precise`/`fast` motor setting and semantic helpers enabled. The explicit visible-GUI read adds current visible layout with at most 128 slots, 64 elements and 32 progress entries in logical GUI coordinates. The world payload additionally bounds own inventory to 64 entries, sounds to eight and all collections together to 256 entries. These identities and values come from [`native-contract.ts`](../src/server/native-contract.ts) and [`minecraft.ts`](../src/shared/minecraft.ts); the configuration and compatibility hashes bind the actual contract. Earlier r8-v1 episodes retain their original profile and evidence.
 
-The active profile does not implement the 32-block scheduled sampler target below or a frustum/strict-visual condition. Images remain unsynchronized with capture-time camera/life/space; host selection scope is not capture metadata. Structured assistance is not human-identical perception, and older r2 history is not relabelled.
+The active profile does not implement the 32-block scheduled sampler target below or a frustum/strict-visual condition. Actor images remain unsynchronized with structured observations, and their host selection scope is not capture metadata. GHV2 packet render/scope diagnostics are retained separately rather than silently exposed through this profile. Structured assistance is not human-identical perception, and older r2 history is not relabelled.
 
 Nearby unobstructed blocks/objects and entities may be observed within the configured finite range, regardless of camera yaw/pitch. A nearby tree behind the camera is eligible; rotating the camera alone does not revoke it. Obstruction/occlusion, range, loaded-client availability and bounded sampling still apply. This permission neither reveals all loaded chunks nor removes walls. The initial sampling rules below have no camera cone.
 

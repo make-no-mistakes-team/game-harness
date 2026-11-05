@@ -86,7 +86,12 @@ export class ResidentController {
   }
 
   start(): Promise<void> {
-    this.startTask ??= this.open();
+    // Publish acquisition before an opening observer can synchronously Stop.
+    if (!this.startTask) {
+      const started = Promise.withResolvers<void>();
+      this.startTask = started.promise;
+      void this.open().then(started.resolve, started.reject);
+    }
     return this.startTask;
   }
 
@@ -187,7 +192,8 @@ export class ResidentController {
   stop(reason: string): Promise<void> {
     if (this.stopTask) return this.stopTask;
     this.fence(reason);
-    this.stopTask = this.retire(); return this.stopTask;
+    // Fencing notifications can reenter Stop and publish the owned drain.
+    this.stopTask ??= this.retire(); return this.stopTask;
   }
 
   private fence(reason: string): void {
@@ -299,8 +305,10 @@ export class ResidentController {
     if (this.options.trace) this.trace({ stage: "wake", slot, scheduled_slot: scheduledSlot,
       intended_host_ms: at, missed_slots: this.data.counters.missed_slots });
     if (this.flight) throw new Error("Resident scheduler overlapped a step");
-    const flight = this.process(slot); this.flight = flight;
-    void flight.catch(error => this.finish("failed", `resident_step: ${message(error)}`)).finally(() => {
+    // Publish the owned step before sampling or its observers can synchronously Stop.
+    const flight = Promise.withResolvers<void>(); this.flight = flight.promise;
+    void this.process(slot).then(flight.resolve, flight.reject);
+    void flight.promise.catch(error => this.finish("failed", `resident_step: ${message(error)}`)).finally(() => {
       this.flight = null; if (!this.fenced) { this.notify(false, false); this.schedule(); }
     });
   }
@@ -312,6 +320,7 @@ export class ResidentController {
     if (this.data.counters.steps >= limits.max_steps || this.data.counters.frames >= limits.max_frames) { this.finish("stopped", "resident_frame_budget"); return; }
     let wire: Json;
     if (this.options.trace) this.trace({ stage: "sample_request", slot });
+    if (!this.active()) { this.finish("stopped", "resident_not_current_or_expired"); return; }
     try {
       wire = await channel.sample(this.cursor);
       if (this.options.trace) this.trace({ stage: "sample_receipt", slot, outcome: "received" });
@@ -337,8 +346,13 @@ export class ResidentController {
     let timedOut = false;
     const timer = this.clock.setTimeout(() => { timedOut = true; this.finish("failed", "resident_step_response_deadline"); }, RESIDENT_STEP_RESPONSE_MS);
     let raw: unknown;
-    if (this.options.trace) this.trace({ stage: "worker_start", slot, frame_seq: frame.frame_seq });
     try {
+      if (this.options.trace) this.trace({ stage: "worker_start", slot, frame_seq: frame.frame_seq });
+      if (!this.active() || version !== this.data.intent_version || timedOut) {
+        this.data.counters.stale_results++;
+        if (!this.fenced && !this.options.current()) this.finish("stopped", "resident_source_changed");
+        return;
+      }
       raw = await this.options.worker.step(frame, structuredClone(this.data.state), structuredClone(this.intent), this.abort.signal);
       if (this.options.trace) this.trace({ stage: "worker_return", slot, frame_seq: frame.frame_seq, outcome: "returned" });
     }
@@ -376,9 +390,19 @@ export class ResidentController {
       throw error;
     }
     if (this.options.trace) this.trace({ stage: "result_validation", slot, frame_seq: frame.frame_seq, outcome: "accepted" });
+    if (!this.active() || version !== this.data.intent_version || timedOut) {
+      this.data.counters.stale_results++;
+      if (!this.fenced && !this.options.current()) this.finish("stopped", "resident_source_changed");
+      return;
+    }
     const input = result.input;
     if (result.status === "running") {
       if (this.options.trace) this.trace({ stage: "renewal_start", slot, frame_seq: frame.frame_seq });
+      if (!this.active() || version !== this.data.intent_version || timedOut) {
+        this.data.counters.stale_results++;
+        if (!this.fenced && !this.options.current()) this.finish("stopped", "resident_source_changed");
+        return;
+      }
       try {
         await channel.renew(wire);
         if (this.options.trace) this.trace({ stage: "renewal_end", slot, frame_seq: frame.frame_seq, outcome: "returned" });
@@ -397,6 +421,11 @@ export class ResidentController {
       this.data.events.push({ sequence: this.data.counters.events, host_monotonic_ms: this.clock.now(), event: structuredClone(event) });
       if (this.data.events.length > 128) this.data.events.shift();
       this.options.event(structuredClone(event));
+      if (!this.active() || version !== this.data.intent_version || timedOut) {
+        this.data.counters.stale_results++;
+        if (!this.fenced && !this.options.current()) this.finish("stopped", "resident_source_changed");
+        return;
+      }
     }
     if (result.status !== "running") { this.finish(result.status, `resident_${result.status}`); return; }
     const noInput = input.kind === "screen" ? input.operations.length === 0 && !this.runningViewRate : input.edges.length === 0 && input.selected_hotbar === null &&

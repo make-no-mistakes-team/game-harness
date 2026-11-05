@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import * as runner from '../scripts/native-resident-benchmark.ts';
 import { EpisodeRecorder } from '../src/server/recording.ts';
 import { nativeFrame } from './helpers/native-frame.ts';
+import { osMonotonicNs } from '../src/evaluation/os-monotonic.ts';
+import { P13_VOLUME_CLASSIFICATION } from '../src/evaluation/resident-volume.ts';
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -45,7 +47,7 @@ async function closedRawSlot(largeClip = false) {
     // This original native slot wall has already expired. It is not renewed by deriving media.
     deadlines: { original_deadline_epoch_ms: Date.now() - 1000 },
     cleanup: { confirmed: true, resident_worker_closed: true, resident_native_retired: true, sandbox_closed: true,
-      store_closed: true, runtime_closed: true, recorder_closed: true, journal_closed: true, native_closed: true },
+      history_reader_closed: true, store_closed: true, runtime_closed: true, recorder_closed: true, journal_closed: true, native_closed: true },
     media, offline_replay };
   const result = { study_id: reservation.studyId, reservation_id: reservation.reservationId, slot: reservation.slot,
     platform_status: 'pass' as const, cleanup_confirmed: true, report: join(directory, 'slot-report.json'),
@@ -78,7 +80,7 @@ async function probeTimes(file: string): Promise<number[]> {
 test('closed raw capture derives real full-timeline media after its slot wall, under the original cohort wall, without rewriting child evidence', async () => {
   const source = await closedRawSlot(), before = await source.snapshot();
   const cohortDeadline = Date.now() + 5000;
-  const derived = await runner.deriveResidentBenchmarkReplays({ observations: [source.observation], deadlineEpochMs: cohortDeadline });
+  const derived = await runner.deriveResidentBenchmarkReplays({ assay: "e01", observations: [source.observation], deadlineEpochMs: cohortDeadline });
   expect(derived.complete).toBe(true);
   expect(derived.records).toHaveLength(1);
   const record = derived.records[0]!;
@@ -102,7 +104,7 @@ for (const fault of ['missing_handoff', 'replaced_handoff', 'tampered_concat', '
     if (fault === 'incomplete_capture') source.report.recording.status = 'incomplete';
     await writeFile(source.observation.result.report, JSON.stringify(source.report));
     const before = await source.snapshot();
-    const derived = await runner.deriveResidentBenchmarkReplays({ observations: [source.observation], deadlineEpochMs: Date.now() + 5000 });
+    const derived = await runner.deriveResidentBenchmarkReplays({ assay: "e01", observations: [source.observation], deadlineEpochMs: Date.now() + 5000 });
     expect(derived.complete).toBe(false);
     expect(derived.records[0]!.status).not.toBe('rendered');
     expect(derived.records[0]!.error).toBeTruthy();
@@ -116,7 +118,7 @@ for (const fault of ['missing_handoff', 'replaced_handoff', 'tampered_concat', '
 for (const stop of ['expired_original_cohort', 'interrupted'] as const) test(`${stop} cannot start a fresh derivation allowance or complete raw success`, async () => {
   const source = await closedRawSlot(), before = await source.snapshot(), abort = new AbortController();
   if (stop === 'interrupted') abort.abort(new Error('Original cohort interrupted'));
-  const derived = await runner.deriveResidentBenchmarkReplays({ observations: [source.observation],
+  const derived = await runner.deriveResidentBenchmarkReplays({ assay: "e01", observations: [source.observation],
     deadlineEpochMs: Date.now() + (stop === 'expired_original_cohort' ? -1 : 5000), signal: abort.signal });
   expect(derived.complete).toBe(false);
   expect(derived.records[0]!.status).toBe('not_run');
@@ -131,7 +133,7 @@ test('a failed raw/native outcome stays failed even when its eligible complete c
   const failed = { ...source.observation, result: failedResult, platform_status: 'fail' as const };
   await writeFile(join(source.directory, 'platform-result.json'), JSON.stringify(failedResult));
   const before = await source.snapshot();
-  const derived = await runner.deriveResidentBenchmarkReplays({ observations: [failed], deadlineEpochMs: Date.now() + 5000 });
+  const derived = await runner.deriveResidentBenchmarkReplays({ assay: "e01", observations: [failed], deadlineEpochMs: Date.now() + 5000 });
   expect(derived.records[0]!.status).toBe('rendered');
   expect(derived.complete).toBe(false);
   expect(await source.snapshot()).toEqual(before);
@@ -142,7 +144,7 @@ test('one unknown owner blocks derivation of every otherwise closed raw capture'
   const safe = await closedRawSlot(), uncertain = await closedRawSlot();
   uncertain.observation.order = 1;
   uncertain.observation.cleanup_confirmed = false;
-  const derived = await runner.deriveResidentBenchmarkReplays({ observations: [safe.observation, uncertain.observation],
+  const derived = await runner.deriveResidentBenchmarkReplays({ assay: "e01", observations: [safe.observation, uncertain.observation],
     deadlineEpochMs: Date.now() + 5000 });
   expect(derived.complete).toBe(false);
   expect(derived.records).toHaveLength(2);
@@ -160,7 +162,7 @@ test('interruption during real parent encoding fails that derivative and never s
     if (filename === 'replay.mp4') abort.abort(new Error('Operator interrupted active parent encoder'));
   });
   try {
-    const derived = await runner.deriveResidentBenchmarkReplays({ observations: [current.observation, next.observation],
+    const derived = await runner.deriveResidentBenchmarkReplays({ assay: "e01", observations: [current.observation, next.observation],
       deadlineEpochMs: Date.now() + 10000, signal: abort.signal });
     expect(abort.signal.aborted).toBe(true);
     expect(derived.complete).toBe(false);
@@ -170,4 +172,49 @@ test('interruption during real parent encoding fails that derivative and never s
     await expect(access(join(next.recordingDirectory, 'replay.mp4'))).rejects.toThrow();
     expect(await current.snapshot()).toEqual(before);
   } finally { watcher.close(); }
+});
+
+test('P13 replay cannot renew its expired original OS-monotonic workflow clock despite later wall time', async () => {
+  const source = await closedRawSlot(), before = await source.snapshot();
+  const derived = await runner.deriveResidentBenchmarkReplays({
+    assay: 'p13_volume', observations: [source.observation],
+    deadlineEpochMs: Date.now() + 5000,
+    deadlineMonotonicNs: osMonotonicNs() - 1n,
+  });
+  expect(derived.complete).toBe(false);
+  expect(derived.records[0]).toMatchObject({ status: 'not_run', replay: null, budget_ms: 0 });
+  expect(await source.snapshot()).toEqual(before);
+  await expect(access(join(source.recordingDirectory, 'replay.mp4'))).rejects.toThrow();
+});
+
+test('a later persisted P13 drain loss blocks every encoder before the first otherwise eligible clip', async () => {
+  const safe = await closedRawSlot(), uncertain = await closedRawSlot();
+  uncertain.observation.order = 1;
+  for (const source of [safe, uncertain]) {
+    source.observation.result.classification = P13_VOLUME_CLASSIFICATION;
+    Object.assign(source.report, {
+      assay: 'p13_volume', classification: P13_VOLUME_CLASSIFICATION,
+      p13_volume_preparation_started: true,
+      p13_volume: { closed: true, learning_closed: true, reader_closed: true, tasks_joined: true,
+        reader_owner: { closed: true, active: false, queued: 0,
+          child: { pid: 123, exitObservedHostMs: 1, stdoutDrainObservedHostMs: 2, closedHostMs: 3 } } },
+    });
+    await writeFile(source.observation.result.report, JSON.stringify(source.report));
+    await writeFile(join(source.directory, 'platform-result.json'), JSON.stringify(source.observation.result));
+  }
+  Reflect.deleteProperty(uncertain.report, 'p13_volume');
+  await writeFile(uncertain.observation.result.report, JSON.stringify(uncertain.report));
+  await writeFile(join(uncertain.directory, 'platform-result.json'),
+    JSON.stringify({ ...uncertain.observation.result, cleanup_confirmed: false }));
+  const before = [await safe.snapshot(), await uncertain.snapshot()];
+  const derived = await runner.deriveResidentBenchmarkReplays({
+    assay: 'p13_volume', observations: [safe.observation, uncertain.observation],
+    deadlineEpochMs: Date.now() + 5000, deadlineMonotonicNs: osMonotonicNs() + 5_000_000_000n,
+  });
+  expect(derived.complete).toBe(false);
+  expect(derived.records.map(value => value.status)).toEqual(['refused', 'refused']);
+  expect(derived.records.every(value => value.budget_ms === 0)).toBe(true);
+  await expect(access(join(safe.recordingDirectory, 'replay.mp4'))).rejects.toThrow();
+  await expect(access(join(uncertain.recordingDirectory, 'replay.mp4'))).rejects.toThrow();
+  expect([await safe.snapshot(), await uncertain.snapshot()]).toEqual(before);
 });

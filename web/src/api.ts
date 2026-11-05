@@ -12,11 +12,14 @@ import type {
   ExperienceView,
   PromotionDeclaration,
 } from "../../src/server/experience.ts";
+import type { HistoryPage } from "../../src/server/history-protocol.ts";
 import type {
   ImprovementFeedbackCursor,
+  ObjectiveMetricUpdate,
   ProgramVersionEvidence,
   TracePage,
   VersionComparison,
+  VersionComparisonCursor,
 } from "../../src/shared/execution-evidence.ts";
 import type { PlanProjection } from "../../src/shared/planning.ts";
 import { adapterBindingSchema, activeExecutableValidationSchema, historicalExecutableValidationSchema, programCompatibilitySchema } from "../../src/shared/adapter.ts";
@@ -26,6 +29,11 @@ import { goalSchema, gameActionSchema } from "../../src/shared/validation.ts";
 import { residentLimitsSchema, residentSnapshotSchema, residentStateSchema } from "../../src/shared/resident.ts";
 
 const nullableText = z.string().nullable();
+const historyProjectionSchema = z.object({
+  generation: z.int().nonnegative(), source_through: z.int().nonnegative(),
+  source_available: z.int().nonnegative(), has_pending: z.boolean(),
+}).refine(value => value.source_available >= value.source_through &&
+  (value.has_pending || value.source_available === value.source_through));
 const lineage = {
   session_id: nullableText,
   life_id: z.number().int().nonnegative().nullable(),
@@ -616,9 +624,21 @@ export async function promoteExperience(
   );
 }
 
+export type SkillEvidencePage = HistoryPage<ProgramEvidenceView> & {
+  projection: z.infer<typeof historyProjectionSchema>;
+};
+
 export async function fetchSkillEvidence(
   runId: string,
-): Promise<ProgramEvidenceView[]> {
+  after = 0,
+  limit = 25,
+  signal?: AbortSignal,
+): Promise<SkillEvidencePage> {
+  const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+  const query = z.object({
+    after: count,
+    limit: z.number().int().min(1).max(100),
+  }).parse({ after, limit });
   const item: z.ZodType<ProgramEvidenceView> = z.object({
     execution_id: z.string(),
     skill_id: z.string(),
@@ -641,10 +661,29 @@ export async function fetchSkillEvidence(
     compactness: skill.shape.validation,
   });
   return z
-    .object({ evidence: z.array(item) })
+    .object({
+      records: z.array(item).max(query.limit),
+      next_after: count,
+      has_more: z.boolean(),
+      total: count,
+      projection: historyProjectionSchema,
+      omissions: z.array(z.object({
+        index: count,
+        reason: z.string(),
+        original_bytes: count,
+        reference: json.optional(),
+        url: z.string().optional(),
+      })).max(query.limit),
+    })
+    .refine(page => page.records.length + page.omissions.length <= query.limit)
     .parse(
-      await request(`/v1/runs/${encodeURIComponent(runId)}/skill-evidence`),
-    ).evidence;
+      await request(
+        `/v1/runs/${encodeURIComponent(runId)}/skill-evidence?after=${query.after}&limit=${query.limit}`,
+        undefined,
+        undefined,
+        signal,
+      ),
+    );
 }
 
 const timingSummary = z.object({
@@ -738,6 +777,20 @@ const tracePage: z.ZodType<TracePage> = z.object({
     omitted_records: z.number(), omitted_bytes: z.number(),
   }),
 });
+const feedbackCursorSchema: z.ZodType<ImprovementFeedbackCursor> = z.object({
+  schema_version: z.literal(2),
+  opportunity_change_seq: z.int().nonnegative(),
+  metric_change_seq: z.int().nonnegative(),
+  scope_hash: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+}).strict().refine(cursor => cursor.scope_hash !== null ||
+  cursor.opportunity_change_seq === 0 && cursor.metric_change_seq === 0);
+const comparisonCursorSchema: z.ZodType<VersionComparisonCursor> = z.object({
+  schema_version: z.literal(2),
+  before_generation: z.int().positive(),
+  after_generation: z.int().positive(),
+  offset: z.int().nonnegative(),
+  scope_hash: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict();
 const feedbackSchema = z.object({
   opportunities: z.array(z.object({
     opportunity_id: z.string(), run_id: z.string(), kind: z.enum(["death", "failure", "outcome"]),
@@ -749,18 +802,29 @@ const feedbackSchema = z.object({
       measured: z.boolean(), at: z.string(),
     }).nullable(),
   })),
-  metrics: z.array(objectiveMetrics),
-  next_after: z.object({
-    opportunity_seq: z.number().int().nonnegative(),
-    execution_seq: z.number().int().nonnegative(),
-  }) satisfies z.ZodType<ImprovementFeedbackCursor>,
+  metrics: z.array(z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("replace"), execution_id: z.string(), revision: z.int().nonnegative(),
+      generation: z.int().positive(), program: z.object({ name: z.string().min(1), version: z.int().positive() }),
+      execution_ordinal: z.int().positive(), metric: objectiveMetrics,
+    }).strict().refine(update => update.execution_id === update.metric.execution_id),
+    z.object({
+      kind: z.literal("retract"), execution_id: z.string(), revision: z.int().nonnegative(),
+      generation: z.int().positive(), program: z.object({ name: z.string().min(1), version: z.int().positive() }),
+      execution_ordinal: z.int().positive(), reason: z.literal("execution_removed"),
+    }).strict(),
+  ]) satisfies z.ZodType<ObjectiveMetricUpdate>).max(100),
+  next_after: feedbackCursorSchema,
   has_more: z.boolean(),
   omitted: z.array(z.object({
     kind: z.string(), id: z.string(), reason: z.string(), original_bytes: z.number(),
+    reference: json.optional(), url: z.string().optional(),
   })),
+  projection: historyProjectionSchema,
   opportunity_budget: z.object({ max_records: z.number(), reached: z.boolean(), omission: z.string() }),
   review: z.object({ effect_free: z.literal(true), max_decisions: z.number() }),
-});
+}).refine(page => page.opportunities.length + page.metrics.length + page.omitted.length <= 32 &&
+  page.metrics.every(update => update.generation <= page.projection.generation));
 export type ImprovementFeedback = z.infer<typeof feedbackSchema>;
 const comparisonSchema: z.ZodType<VersionComparison> = z.object({
   before: versionEvidence, after: versionEvidence,
@@ -807,14 +871,21 @@ export async function fetchTrace(runId: string, after = 0, executionId = ""): Pr
 }
 export async function fetchImprovementFeedback(
   runId: string,
-  after: ImprovementFeedbackCursor = { opportunity_seq: 0, execution_seq: 0 },
+  after: ImprovementFeedbackCursor = { schema_version: 2, opportunity_change_seq: 0, metric_change_seq: 0, scope_hash: null },
 ): Promise<ImprovementFeedback> {
+  const cursor = feedbackCursorSchema.parse(after);
   const query = new URLSearchParams({
-    after_opportunity: String(after.opportunity_seq),
-    after_execution: String(after.execution_seq),
+    after: JSON.stringify(cursor),
     limit: "32",
   });
-  return feedbackSchema.parse(await request(`/v1/runs/${encodeURIComponent(runId)}/improvements?${query}`));
+  const page = feedbackSchema.parse(await request(`/v1/runs/${encodeURIComponent(runId)}/improvements?${query}`));
+  if (cursor.scope_hash !== null && page.next_after.scope_hash !== cursor.scope_hash ||
+    page.next_after.opportunity_change_seq < cursor.opportunity_change_seq ||
+    page.next_after.metric_change_seq < cursor.metric_change_seq ||
+    page.has_more && page.next_after.opportunity_change_seq === cursor.opportunity_change_seq &&
+      page.next_after.metric_change_seq === cursor.metric_change_seq)
+    throw new Error("Improvement feedback returned an incompatible continuation");
+  return page;
 }
 export async function fetchPlanning(runId: string): Promise<PlanProjection | null> {
   return z.object({ plan: planSchema.nullable() }).parse(
@@ -837,14 +908,24 @@ export async function fetchDeaths(runId: string, after = 0) {
   );
 }
 export async function fetchComparison(
-  before: ProgramVersionEvidence, after: ProgramVersionEvidence, afterSample = 0,
+  before: ProgramVersionEvidence, after: ProgramVersionEvidence, afterSample: VersionComparisonCursor | null = null,
 ) {
-  return z.object({
-    comparison: comparisonSchema, next_after: z.number(), has_more: z.boolean(),
+  const cursor = comparisonCursorSchema.nullable().parse(afterSample);
+  const page = z.object({
+    comparison: comparisonSchema, next_after: comparisonCursorSchema, has_more: z.boolean(),
+    projection: z.object({ before: historyProjectionSchema, after: historyProjectionSchema }),
     omissions: z.array(z.object({
       field: z.string(), reason: z.string(), original_bytes: z.number(), reference: json,
     })),
   }).parse(await request("/v1/program-comparisons", {
-    before, after, after_sample: afterSample, limit: 25,
+    before, after, after_sample: cursor, limit: 25,
   }));
+  if (cursor !== null && (page.next_after.before_generation !== cursor.before_generation ||
+    page.next_after.after_generation !== cursor.after_generation || page.next_after.scope_hash !== cursor.scope_hash) ||
+    page.projection.before.generation !== page.next_after.before_generation ||
+    page.projection.after.generation !== page.next_after.after_generation ||
+    page.next_after.offset < (cursor?.offset ?? 0) ||
+    page.has_more && page.next_after.offset === (cursor?.offset ?? 0))
+    throw new Error("Comparison returned an incompatible snapshot continuation");
+  return page;
 }

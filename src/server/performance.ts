@@ -4,7 +4,9 @@ import type { ExpectedEffectOwner } from "../shared/control.ts";
 export const HOST_MONOTONIC_CLOCK_ID = randomUUID();
 
 export type TimingName =
-  "observation_read_ms" | "action_round_trip_ms" | "video_forward_ms";
+  | "observation_read_ms"
+  | "action_round_trip_ms"
+  | "video_forward_ms";
 
 export interface TimingSummary {
   count: number;
@@ -22,6 +24,119 @@ export interface NativeControlTiming {
   client_tick: number;
   controller_lease?: NativeControllerLeaseTiming;
   controller_application?: NativeControllerApplicationTiming;
+  controller_opportunities?:
+    | NativeControllerOpportunityBatch
+    | NativeControllerOpportunityUnavailable;
+}
+
+/** Passive native preparation/sample facts, never an input receipt or actor observation.
+ * Decimal counters are bounded safe integers; *_native_ns/native_ns remain signed Java longs.
+ * Null means the production branch did not supply that field, not a zero-valued observation. */
+export interface NativeControllerOpportunityEvent {
+  kind:
+    | "admission"
+    | "begin"
+    | "completion"
+    | "application_stage"
+    | "sample_ready"
+    | "prepare_entry"
+    | "prepare_exit"
+    | "prepare_branch"
+    | "sample_render";
+  outcome:
+    | "admitted"
+    | "admission_failed"
+    | "expired"
+    | "applying"
+    | "empty"
+    | "stale"
+    | "began"
+    | "completed"
+    | "stage"
+    | "not_rendered"
+    | "retired"
+    | "no_owner"
+    | "wrong_owner"
+    | "not_new_tick"
+    | "ready"
+    | "observed"
+    | "passed"
+    | "blocked";
+  eventseq: string;
+  native_ns: string;
+  checked_native_ns: string | null;
+  tick: string | null;
+  preparation_ordinal: string | null;
+  request_id: string | null;
+  sequence: string | null;
+  frame_sequence: string | null;
+  captured_native_ns: string | null;
+  pending_count: string | null;
+  head_request_id: string | null;
+  head_sequence: string | null;
+  head_frame_sequence: string | null;
+  predecessor_request_id: string | null;
+  predecessor_sequence: string | null;
+  predecessor_frame_sequence: string | null;
+  applying_request_id: string | null;
+  applying_sequence: string | null;
+  applying_frame_sequence: string | null;
+  last_completed_request_id: string | null;
+  last_completed_sequence: string | null;
+  last_completed_frame_sequence: string | null;
+  last_completed_tick: string | null;
+  last_applied_native_ns: string | null;
+  applied_native_ns: string | null;
+  diagnostic_completion_native_ns: string | null;
+  evaluated_mask: string | null;
+  value_mask: string | null;
+  last_sampled_tick: string | null;
+  state_mask: string | null;
+  stage: string | null;
+}
+
+/** At most 64 events from a 65,536-slot native ring. Counts describe the pre-commit
+ * snapshot, not socket delivery; a missing final carrier cannot establish completeness. */
+export interface NativeControllerOpportunityBatch {
+  schema_version: 1;
+  identity: {
+    owner_operation_id: string;
+    controller_generation: string;
+    native_boot_id: string;
+    source_hash: string;
+  };
+  counts: {
+    attempted: string;
+    accepted: string;
+    omitted: string;
+    contended: string;
+    exhausted: string;
+    closed_omitted: string;
+    drained: string;
+    retained: number;
+    sealed: boolean;
+  };
+  final_batch: boolean;
+  unattached_retained: number;
+  counts_consistent: boolean;
+  complete: boolean;
+  events: NativeControllerOpportunityEvent[];
+}
+
+/** Nonblocking attachment refusal is unknown, not an omitted event or input rejection. */
+export interface NativeControllerOpportunityUnavailable {
+  schema_version: 1;
+  identity: NativeControllerOpportunityBatch["identity"];
+  counts: null;
+  final_batch: false;
+  complete: false;
+  events: [];
+  unavailable:
+    | "busy"
+    | "committed_prefix_pending"
+    | "seal_pending"
+    | "owner_capacity"
+    | "serialization_oversize";
 }
 
 /** Request-owned diagnostic stages; the ordinary consumed-input ACK remains authoritative. */
@@ -77,9 +192,12 @@ export interface NativeClockCorrespondence {
 }
 
 function nativeNanoseconds(value: string): bigint | null {
-  if (typeof value !== "string" || !/^-?(?:0|[1-9]\d{0,18})$/.test(value)) return null;
+  if (typeof value !== "string" || !/^-?(?:0|[1-9]\d{0,18})$/.test(value))
+    return null;
   const parsed = BigInt(value);
-  return parsed >= -9223372036854775808n && parsed <= 9223372036854775807n ? parsed : null;
+  return parsed >= -9223372036854775808n && parsed <= 9223372036854775807n
+    ? parsed
+    : null;
 }
 
 function milliseconds(value: bigint): number {
@@ -93,28 +211,50 @@ export function correlateNativeClock(
   timing: NativeControlTiming,
   expectedBoot: string,
 ): NativeClockCorrespondence | null {
-  if (!Number.isFinite(hostSentMs) || !Number.isFinite(hostReceivedMs) || hostReceivedMs < hostSentMs ||
-      timing.schema_version !== 1 || timing.clock_id !== expectedBoot ||
-      !Number.isSafeInteger(timing.client_tick) || timing.client_tick < 0) return null;
-  const received = nativeNanoseconds(timing.received_ns), replied = nativeNanoseconds(timing.replied_ns);
+  if (
+    !Number.isFinite(hostSentMs) ||
+    !Number.isFinite(hostReceivedMs) ||
+    hostReceivedMs < hostSentMs ||
+    timing.schema_version !== 1 ||
+    timing.clock_id !== expectedBoot ||
+    !Number.isSafeInteger(timing.client_tick) ||
+    timing.client_tick < 0
+  )
+    return null;
+  const received = nativeNanoseconds(timing.received_ns),
+    replied = nativeNanoseconds(timing.replied_ns);
   if (received === null || replied === null || replied < received) return null;
   const processing = milliseconds(replied - received);
   const residual = hostReceivedMs - hostSentMs - processing;
   if (residual < 0) return null;
-  const nativeReceivedMs = milliseconds(received), nativeRepliedMs = milliseconds(replied);
+  const nativeReceivedMs = milliseconds(received),
+    nativeRepliedMs = milliseconds(replied);
   // The raw longs remain strings. Widen bounds for float conversion/subtraction,
   // including an arbitrary large or negative System.nanoTime origin.
-  const rounding = 4 * Number.EPSILON * Math.max(
-    1, Math.abs(nativeReceivedMs), Math.abs(nativeRepliedMs), Math.abs(hostSentMs), Math.abs(hostReceivedMs),
-  );
+  const rounding =
+    4 *
+    Number.EPSILON *
+    Math.max(
+      1,
+      Math.abs(nativeReceivedMs),
+      Math.abs(nativeRepliedMs),
+      Math.abs(hostSentMs),
+      Math.abs(hostReceivedMs),
+    );
   const lower = nativeRepliedMs - hostReceivedMs - rounding;
   const upper = nativeReceivedMs - hostSentMs + rounding;
   if (lower > upper) return null;
   return {
-    clock_id: timing.clock_id, host_sent_ms: hostSentMs, host_received_ms: hostReceivedMs,
-    native_received_ns: timing.received_ns, native_replied_ns: timing.replied_ns,
-    native_processing_ms: processing, residual_round_trip_ms: residual,
-    offset_lower_ms: lower, offset_upper_ms: upper, uncertainty_ms: (upper - lower) / 2,
+    clock_id: timing.clock_id,
+    host_sent_ms: hostSentMs,
+    host_received_ms: hostReceivedMs,
+    native_received_ns: timing.received_ns,
+    native_replied_ns: timing.replied_ns,
+    native_processing_ms: processing,
+    residual_round_trip_ms: residual,
+    offset_lower_ms: lower,
+    offset_upper_ms: upper,
+    uncertainty_ms: (upper - lower) / 2,
   };
 }
 
@@ -133,9 +273,15 @@ export interface NativeRequestSpan {
   native_timing: NativeControlTiming | null;
 }
 
-function detachedNativeTiming(value: NativeControlTiming | null): NativeControlTiming | null {
+function detachedNativeTiming(
+  value: NativeControlTiming | null,
+): NativeControlTiming | null {
   if (!value) return null;
-  return value.controller_lease || value.controller_application ? structuredClone(value) : { ...value };
+  return value.controller_lease ||
+    value.controller_application ||
+    value.controller_opportunities
+    ? structuredClone(value)
+    : { ...value };
 }
 
 /** Bounded diagnostic history; raw samples do not establish input or effect success. */
@@ -148,13 +294,25 @@ export class NativeControlTimeline {
   private invalid = 0;
   private boot: string | null = null;
   private correspondence: NativeClockCorrespondence | null = null;
-  private readonly observers = new Set<(sample: NativeRequestSpan, correspondence: NativeClockCorrespondence | null) => void>();
+  private readonly observers = new Set<
+    (
+      sample: NativeRequestSpan,
+      correspondence: NativeClockCorrespondence | null,
+    ) => void
+  >();
   private observerFailures = 0;
 
   /** Trusted diagnostic consumers own their finite retention; none of this reaches actor feedback. */
-  subscribe(observer: (sample: NativeRequestSpan, correspondence: NativeClockCorrespondence | null) => void): () => void {
+  subscribe(
+    observer: (
+      sample: NativeRequestSpan,
+      correspondence: NativeClockCorrespondence | null,
+    ) => void,
+  ): () => void {
     this.observers.add(observer);
-    return () => { this.observers.delete(observer); };
+    return () => {
+      this.observers.delete(observer);
+    };
   }
 
   bindBoot(boot: string | null): void {
@@ -165,44 +323,77 @@ export class NativeControlTimeline {
   }
 
   record(sample: NativeRequestSpan): void {
-    if (!Number.isFinite(sample.started_monotonic_ms) || !Number.isFinite(sample.ended_monotonic_ms) ||
-        sample.ended_monotonic_ms < sample.started_monotonic_ms) throw new Error("Native request requires ordered host-clock endpoints");
-    this.samples[this.cursor] = { ...sample, native_timing: detachedNativeTiming(sample.native_timing) };
+    if (
+      !Number.isFinite(sample.started_monotonic_ms) ||
+      !Number.isFinite(sample.ended_monotonic_ms) ||
+      sample.ended_monotonic_ms < sample.started_monotonic_ms
+    )
+      throw new Error("Native request requires ordered host-clock endpoints");
+    this.samples[this.cursor] = {
+      ...sample,
+      native_timing: detachedNativeTiming(sample.native_timing),
+    };
     this.cursor = (this.cursor + 1) % this.samples.length;
     this.size = Math.min(this.size + 1, this.samples.length);
     this.total++;
     if (sample.native_timing === null) {
       this.missing++;
     } else {
-      const mapping = sample.native_boot_id === this.boot
-        ? correlateNativeClock(sample.started_monotonic_ms, sample.ended_monotonic_ms, sample.native_timing, this.boot)
-        : null;
+      const mapping =
+        sample.native_boot_id === this.boot
+          ? correlateNativeClock(
+              sample.started_monotonic_ms,
+              sample.ended_monotonic_ms,
+              sample.native_timing,
+              this.boot,
+            )
+          : null;
       if (mapping) this.correspondence = mapping;
       else this.invalid++;
     }
     for (const observer of this.observers) {
-      try { observer(structuredClone(sample), this.currentCorrespondence(sample.ended_monotonic_ms)); }
-      catch { this.observerFailures++; }
+      try {
+        observer(
+          structuredClone(sample),
+          this.currentCorrespondence(sample.ended_monotonic_ms),
+        );
+      } catch {
+        this.observerFailures++;
+      }
     }
   }
 
-  currentCorrespondence(now = performance.now()): NativeClockCorrespondence | null {
-    const age = this.correspondence ? now - this.correspondence.host_received_ms : null;
-    return this.correspondence && age !== null && age >= 0 && age <= 10000 ? { ...this.correspondence } : null;
+  currentCorrespondence(
+    now = performance.now(),
+  ): NativeClockCorrespondence | null {
+    const age = this.correspondence
+      ? now - this.correspondence.host_received_ms
+      : null;
+    return this.correspondence && age !== null && age >= 0 && age <= 10000
+      ? { ...this.correspondence }
+      : null;
   }
 
   snapshot(now = performance.now()) {
     const samples: NativeRequestSpan[] = [];
-    const first = (this.cursor - this.size + this.samples.length) % this.samples.length;
+    const first =
+      (this.cursor - this.size + this.samples.length) % this.samples.length;
     for (let index = 0; index < this.size; index++) {
       const sample = this.samples[(first + index) % this.samples.length]!;
-      samples.push({ ...sample, native_timing: detachedNativeTiming(sample.native_timing) });
+      samples.push({
+        ...sample,
+        native_timing: detachedNativeTiming(sample.native_timing),
+      });
     }
     return {
-      clock_id: HOST_MONOTONIC_CLOCK_ID, native_boot_id: this.boot,
+      clock_id: HOST_MONOTONIC_CLOCK_ID,
+      native_boot_id: this.boot,
       correspondence: this.currentCorrespondence(now),
-      correspondence_max_age_ms: 10000, samples, omitted_samples: this.total - this.size,
-      missing_clock_samples: this.missing, invalid_clock_samples: this.invalid,
+      correspondence_max_age_ms: 10000,
+      samples,
+      omitted_samples: this.total - this.size,
+      missing_clock_samples: this.missing,
+      invalid_clock_samples: this.invalid,
       observer_failures: this.observerFailures,
       input_or_effect_confirmation: false,
     };

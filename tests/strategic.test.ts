@@ -13,12 +13,16 @@ import { catalogEstimate, classifyEvaluation, costToResult } from "../src/evalua
 import type { ObservationV3, RunPauseCause } from "../src/shared/contracts.ts";
 import type { AuthManager } from "../src/server/auth.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
+import { HistoryReader } from "../src/server/history-reader.ts";
+import { ImprovementLearning } from "../src/server/improvement-learning.ts";
+import type { HistoryQueryOptions } from "../src/server/history-protocol.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import {
   StrategicPlanner,
   type StrategicHost,
 } from "../src/server/strategic.ts";
 import { minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter } from "./helpers/adapter-contract.ts";
+import { finishHistoryExecution, historyExecution, historySpec } from "./helpers/history-fixture.ts";
 
 type Gate = Parameters<Agent["setBeforeModelCall"]>[0];
 type Assistant = Extract<AgentEvent, { type: "message_end" }>["message"];
@@ -30,12 +34,16 @@ const resources: {
   planner: StrategicPlanner;
   store: Store;
   directory: string;
+  history: HistoryReader;
+  learning: ImprovementLearning;
   observer?: ModelProgramEvidence;
 }[] = [];
 afterEach(async () => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   for (const resource of resources.splice(0)) {
     await resource.planner.close();
+    await resource.learning.close();
     await resource.observer?.close();
     resource.store.close();
     rmSync(resource.directory, { recursive: true, force: true });
@@ -45,6 +53,8 @@ afterEach(async () => {
 function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, streamFn?: StreamFn) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-strategic-"));
   const store = new Store(directory), adapter = minecraftTestAdapter();
+  const history = new HistoryReader(store.readLocation());
+  const learning = new ImprovementLearning(store, history);
   const sessionId = crypto.randomUUID();
   const lifeId = 1;
   const run = minecraftRunFixture(adapter, {
@@ -86,7 +96,7 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, stre
       if (
         generation !== state.generation ||
         (epoch !== undefined && epoch !== run.epoch) ||
-        run.status !== "running"
+        !["running", "reviewing"].includes(run.status)
       )
         throw new RuntimeFault("stale_context", "Fixture authority revoked");
       return run;
@@ -110,6 +120,15 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, stre
     terminal: (status, message) => {
       run.status = status;
       run.error = message;
+      planner.fence();
+    },
+    reviewContext: async (options) => {
+      await learning.prepareFeedback(run.run_id, options);
+      return await history.query({ kind: "review_context", run_id: run.run_id,
+        after: { schema_version: 2, opportunity_change_seq: 0, metric_change_seq: 0, scope_hash: null }, limit: 12 }, options);
+    },
+    reviewComplete: () => {
+      run.status = "completed";
       planner.fence();
     },
   };
@@ -162,7 +181,7 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, stre
     },
   } as unknown as AuthManager;
   planner = new StrategicPlanner(store, auth, host);
-  resources.push({ planner, store, directory });
+  resources.push({ planner, store, directory, history, learning });
   const event = (type: string) => {
     const ready = Promise.withResolvers<void>();
     const unsubscribe = store.subscribe((value) => {
@@ -173,8 +192,52 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, stre
     });
     return ready.promise;
   };
-  return { planner, store, run, state, event, host, observation };
+  return { planner, store, run, state, event, host, observation, history };
 }
+
+test("review prompts carry named metric replacements and a scoped V2 continuation from real published history", async () => {
+  const f = setup(async (_text, agent) => { await callGate(agent); agent.emit({}); });
+  const skill = await f.store.registerSkill(f.run.run_id, historySpec(f.run, "Named review evidence"));
+  const root = historyExecution(f.store, f.run, skill);
+  const child = historyExecution(f.store, f.run, skill, root);
+  finishHistoryExecution(f.store, child);
+  finishHistoryExecution(f.store, root);
+  f.run.status = "reviewing";
+  f.store.saveRun(f.run);
+  await f.planner.start(1);
+  const finished = f.event("scheduler.review_finished");
+  f.planner.wake("goal_review");
+  await finished;
+  const context = f.state.contexts[0]?.improvement_review as {
+    metrics: { kind: string; program: { name: string; version: number };
+      execution_ordinal: number; revision: number; generation: number;
+      metric: { name: string; version: number; execution_ordinal: number; root_execution_ordinal: number; outcome: string } }[];
+    next_after: { schema_version: 2; opportunity_change_seq: number; metric_change_seq: number; scope_hash: string };
+    projection: { generation: number };
+  };
+  const published = f.store.historyProjectionGeneration(f.run.run_id)!;
+  expect(context.metrics).toHaveLength(2);
+  for (const execution_ordinal of [1, 2]) {
+    expect(context.metrics.find(value => value.execution_ordinal === execution_ordinal)).toMatchObject({
+      kind: "replace", program: { name: skill.name, version: skill.version },
+      execution_ordinal, revision: published.revision, generation: published.generation,
+      metric: { name: skill.name, version: skill.version, execution_ordinal,
+        root_execution_ordinal: 1, outcome: "succeeded" },
+    });
+  }
+  expect(context.next_after.schema_version).toBe(2);
+  expect(context.next_after.opportunity_change_seq).toBeGreaterThan(0);
+  expect(context.next_after.metric_change_seq).toBeGreaterThan(0);
+  expect(context.next_after.scope_hash).toMatch(/^[a-f0-9]{64}$/);
+  expect(context.projection.generation).toBe(published.generation);
+  for (const id of [root.execution_id, child.execution_id, skill.skill_id]) expect(JSON.stringify(context)).not.toContain(id);
+  const continuation = await f.history.query({ kind: "review_context", run_id: f.run.run_id,
+    after: context.next_after, limit: 12 }, { deadlineHostMs: performance.now() + 10_000 });
+  if (!continuation || typeof continuation !== "object" || Array.isArray(continuation))
+    throw new Error("Expected a named review continuation page");
+  expect(continuation).toMatchObject({ metrics: [], opportunities: [], has_more: false });
+  expect(continuation.next_after).toEqual(context.next_after);
+});
 
 async function callGate(agent: FakeAgent) {
   return await agent.gate?.({ systemPrompt: [], messages: [], tools: [] });
@@ -187,6 +250,151 @@ function gated(agent: FakeAgent, reason?: string) {
     usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
   } as Partial<Assistant>);
 }
+
+for (const delivery of ["resolve", "reject"] as const)
+for (const revoke of ["fence", "generation", "phase"] as const)
+  test(`a ${revoke} change while real review history awaits ${delivery} delivery cannot prompt`, async () => {
+    const f = setup(async () => { throw new Error("Revoked review must not prompt"); });
+    f.run.status = "reviewing";
+    const entered = Promise.withResolvers<void>(), deliver = Promise.withResolvers<void>();
+    let options: HistoryQueryOptions | undefined;
+    const read = f.host.reviewContext!;
+    f.host.reviewContext = async (request) => {
+      options = request;
+      const context = await read(request);
+      entered.resolve();
+      await deliver.promise;
+      if (delivery === "reject") throw new Error("Readonly delivery rejected after authority changed");
+      return context;
+    };
+    await f.planner.start(f.state.generation);
+    f.planner.wake("goal_review");
+    await entered.promise;
+    expect(options?.signal?.aborted).toBe(false);
+    if (revoke === "fence") {
+      f.planner.fence();
+      expect(options?.signal?.aborted).toBe(true);
+    } else if (revoke === "generation") f.state.generation++;
+    else f.run.status = "running";
+    const turn = Reflect.get(f.planner, "turn") as Promise<void>;
+    deliver.resolve();
+    await turn;
+    expect(f.state.prompts).toBe(0);
+    expect(f.run.usage.calls).toBe(0);
+    expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event =>
+      event.type === "runtime.model_observation_failed" || event.type === "runtime.history_query_failed")).toBe(false);
+  });
+
+test("review fencing aborts the actual pending readonly query and close joins its drain", async () => {
+  const f = setup(async () => { throw new Error("Cancelled review must not prompt"); });
+  f.run.status = "reviewing";
+  const entered = Promise.withResolvers<void>();
+  const read = f.host.reviewContext!;
+  let options: HistoryQueryOptions | undefined, querySettled = false;
+  f.host.reviewContext = async (request) => {
+    options = request;
+    const pending = read(request);
+    entered.resolve();
+    try { return await pending; }
+    finally { querySettled = true; }
+  };
+  await f.planner.start(1);
+  f.planner.wake("goal_review");
+  await entered.promise;
+  let closed = false;
+  const closing = f.planner.close().then(() => { closed = true; });
+  expect(options?.signal?.aborted).toBe(true);
+  expect(closed).toBe(false);
+  expect(querySettled).toBe(false);
+  await closing;
+  expect(closed).toBe(true);
+  expect(querySettled).toBe(true);
+  expect(f.state.prompts).toBe(0);
+  expect(f.state.releases).toBe(1);
+});
+
+test("an expired original review horizon cancels history without a model request", async () => {
+  const f = setup(async () => { throw new Error("Expired review must not prompt"); });
+  f.run.status = "reviewing";
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const read = f.host.reviewContext!;
+  let deadline = 0, signal: AbortSignal | undefined;
+  f.host.reviewContext = async (options) => {
+    const context = await read(options);
+    deadline = options.deadlineHostMs;
+    signal = options.signal;
+    entered.resolve();
+    await release.promise;
+    return context;
+  };
+  await f.planner.start(1);
+  f.planner.wake("goal_review");
+  await entered.promise;
+  const now = Date.now();
+  vi.spyOn(Date, "now").mockReturnValue(now + 30_001);
+  release.resolve();
+  await f.event("scheduler.review_finished");
+  expect(deadline).toBeGreaterThan(0);
+  expect(signal?.aborted).toBe(true);
+  expect(f.state.prompts).toBe(0);
+  expect(f.run.usage.calls).toBe(0);
+  vi.restoreAllMocks();
+});
+
+test("real readonly review faults are history failures, not observations or provider calls", async () => {
+  const f = setup(async () => { throw new Error("Failed history must not prompt"); });
+  f.run.status = "reviewing";
+  await f.history.close();
+  const failed = f.event("runtime.history_query_failed");
+  await f.planner.start(1);
+  f.planner.wake("goal_review");
+  await failed;
+  await f.planner.close();
+  expect(f.state.prompts).toBe(0);
+  expect(f.state.pauseCauses).toEqual(["preparation_failed"]);
+  expect(f.run.usage.calls).toBe(0);
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  expect(events.some(event => event.type === "runtime.model_observation_failed")).toBe(false);
+  expect(events.some(event => event.type === "scheduler.review_finished")).toBe(false);
+});
+
+for (const clock of ["wall", "monotonic"] as const)
+test(`review history rejection at the original ${clock} horizon completes the goal before its timer callback runs`, async () => {
+  const f = setup(async () => { throw new Error("Expired review must not prompt"); });
+  f.run.status = "reviewing";
+  const entered = Promise.withResolvers<HistoryQueryOptions>(), reject = Promise.withResolvers<never>();
+  let requests = 0;
+  f.host.reviewContext = async options => {
+    requests++;
+    entered.resolve(options);
+    return await reject.promise;
+  };
+  await f.planner.start(1);
+  f.planner.wake("goal_review");
+  const options = await entered.promise;
+  const turn = Reflect.get(f.planner, "turn") as Promise<void>;
+  expect(options.signal?.aborted).toBe(false);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event => event.type === "model.deadline")).toBe(false);
+  if (clock === "wall") {
+    const deadline = Reflect.get(f.planner, "turnDeadline") as number;
+    vi.spyOn(Date, "now").mockReturnValue(deadline);
+  } else {
+    vi.spyOn(performance, "now").mockReturnValue(options.deadlineHostMs);
+  }
+  reject.reject(new Error("Readonly context rejected at its original finite horizon"));
+  await turn;
+  expect(requests).toBe(1);
+  expect(options.signal?.aborted).toBe(true);
+  expect(f.run).toHaveProperty("status", "completed");
+  expect(f.state.prompts).toBe(0);
+  expect(f.run.usage.calls).toBe(0);
+  expect(f.state.pauseCauses).toEqual([]);
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  expect(events.some(event => event.type === "model.deadline")).toBe(false);
+  expect(events.some(event => event.type === "runtime.history_query_failed" || event.type === "runtime.model_observation_failed")).toBe(false);
+  expect(events.find(event => event.type === "scheduler.review_finished")?.details)
+    .toMatchObject({ deadline_reached: true, provider_failed: false, calls: 0 });
+});
 
 function accountingModel() {
   const descriptor = getBundledModels("openai-codex").find(value => value.api === "openai-codex-responses");
@@ -306,7 +514,7 @@ test("real strategic accounting keeps SDK subtotal but cannot price three aborte
   await f.planner.start(1);
   const successfulUsage = (await accountingTurn(f)).usage;
   for (let index = 0; index < 3; index++) await accountingTurn(f, true);
-  const summary = f.observer.summary(f.run.run_id);
+  const summary = await f.observer.summary(f.run.run_id);
   expect(summary.usage).toMatchObject({ schema_version: 2, admissions: 4, reported_messages: 4,
     event_coverage: "complete", consumption_coverage: "unknown",
     consumption_scope: "observed_logical_admissions",
@@ -761,8 +969,6 @@ test("replacement waits for the old request to settle and its auth scope to rele
   fixture.planner.wake("recovery_completed");
   await requestStarted.promise;
   const replacement = fixture.planner.start(1);
-  await Promise.resolve();
-  await Promise.resolve();
   expect(fixture.state.creates).toBe(1);
   expect(fixture.state.releases).toBe(0);
   requestFinished.resolve();

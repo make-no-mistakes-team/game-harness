@@ -17,6 +17,10 @@ import {
 import { programEvidence } from "../src/server/program-evidence.ts";
 import { ExecutionTrace } from "../src/server/execution-trace.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
+import { HistoryReader } from "../src/server/history-reader.ts";
+import { dispatchHistoryQuery } from "../src/server/history-dispatch.ts";
+import { ProgramWorkspace } from "../src/server/program-workspace.ts";
+import { readImprovementFeedback } from "../src/server/program-feedback.ts";
 import { compareProgramVersions, compareProgramVersionsPage } from "../src/server/program-comparison.ts";
 import { objectiveMetrics } from "../src/server/objective-metrics.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
@@ -36,14 +40,33 @@ const resources: {
   directory: string;
   store: Store;
   library: ExperienceLibrary;
+  reader?: HistoryReader;
 }[] = [];
-afterEach(() => {
+afterEach(async () => {
+  const failures: unknown[] = [];
   for (const resource of resources.splice(0)) {
-    resource.library.close();
-    resource.store.close();
-    rmSync(resource.directory, { recursive: true, force: true });
+    try {
+      try {
+        await resource.reader?.close();
+      } finally {
+        try { resource.library.close(); }
+        finally {
+          try { resource.store.close(); }
+          finally { rmSync(resource.directory, { recursive: true, force: true }); }
+        }
+      }
+    } catch (error) { failures.push(error); }
   }
+  if (failures.length) throw new AggregateError(failures, "Experience fixture cleanup failed");
 });
+function learningFixture(store: Store): ImprovementLearning {
+  const resource = resources.find((value) => value.store === store)!;
+  resource.reader ??= new HistoryReader(store.readLocation());
+  return new ImprovementLearning(store, resource.reader);
+}
+function preparationOptions() {
+  return { deadlineHostMs: performance.now() + 30_000 };
+}
 const card = {
   purpose: "Measure a declared inventory predicate",
   applicability: "Current authorized observations",
@@ -1055,12 +1078,14 @@ test("death episodes and improvement decisions deduplicate and preserve exact ca
   store.recordDeathEpisode(run.run_id, episode); store.recordDeathEpisode(run.run_id, episode);
   view.status = "unknown"; view.ended_at = new Date().toISOString(); view.error = "Interrupted life";
   store.updateSkillExecution(view, "skill.closed", "Unknown interrupted effects");
-  const learning = new ImprovementLearning(store);
-  const feedback = learning.feedback(run.run_id);
+  const learning = learningFixture(store);
+  await learning.prepareFeedback(run.run_id, preparationOptions());
+  const feedback = readImprovementFeedback(store, run.run_id);
   expect(Buffer.byteLength(JSON.stringify(feedback))).toBeLessThanOrEqual(65536);
   expect(feedback.opportunities.filter((value) => value.kind === "death")).toHaveLength(1);
   expect(feedback.opportunities.filter((value) => value.kind === "failure")).toHaveLength(1);
-  expect(learning.feedback(run.run_id).opportunities).toHaveLength(2);
+  await learning.prepareFeedback(run.run_id, preparationOptions());
+  expect(readImprovementFeedback(store, run.run_id).opportunities).toHaveLength(2);
   expect(store.deathEpisodesPage(run.run_id).episodes).toHaveLength(1);
   const second = await manager.register(run.run_id, { entry: "run", name: first.name, source: 'const state = await game.observe(); return {status:"blocked",summary:"Current state reported",result:state.data.player.health};', card, dependencies: [] });
   const before = { run_id: run.run_id, skill_id: first.skill_id, version: first.version, hash: first.hash };
@@ -1074,12 +1099,13 @@ test("death episodes and improvement decisions deduplicate and preserve exact ca
   expect(learning.resolve(run.run_id, chosen.opportunity_id, decision).resolution?.measured).toBe(false);
   expect(learning.resolve(run.run_id, chosen.opportunity_id, decision).resolution?.decision).toBe("revise");
   expect(() => learning.resolve(run.run_id, chosen.opportunity_id, { decision: "keep", reason: "Conflict", revision: null, event_seqs: [] })).toThrow();
+  await learning.prepareFeedback(run.run_id, preparationOptions());
   const scope = { kind: "model" as const, run_id: run.run_id, model_id: run.model_id };
   const comparison = compareProgramVersions(store, before, after, scope);
   expect(comparison.sample_count).toEqual({ before: 1, after: 0 });
   expect(comparison.source_diff.added.join("\\n")).toContain("state.data.player.health");
   expect(comparison.conclusion).toBe("descriptive_only_no_causal_improvement_claim");
-  const page = compareProgramVersionsPage(store, before, after, scope, 0, 1);
+  const page = compareProgramVersionsPage(store, before, after, scope, null, 1);
   expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(65536);
   expect(page.comparison.sample_count).toEqual({ before: 1, after: 0 });
   expect(page.comparison.samples.before).toHaveLength(1);
@@ -1137,6 +1163,7 @@ test("same-model comparison authorization is enforced before either foreign sour
   store.skill = (runId, version) => { if (runId === foreign.run_id) foreignReads++; return read(runId, version); };
   expect(() => compareProgramVersionsPage(store, ref(first), ref(second), { kind: "model", run_id: run.run_id, model_id: run.model_id })).toThrow("requesting model scope");
   expect(foreignReads).toBe(0);
+  await learningFixture(store).prepareFeedback(foreign.run_id, preparationOptions());
   expect(compareProgramVersionsPage(store, ref(first), ref(second), { kind: "operator" }).comparison.after.hash).toBe(second.hash);
 });
 
@@ -1168,23 +1195,6 @@ test("radian observation rotation uses shortest yaw across the pi seam", async (
   expect(objectiveMetrics(store, run.run_id)[0]!.sampled_rotation_degrees).toBeCloseTo(135);
 });
 
-test("live improvement continuation has independent stable insertion cursors", async () => {
-  const { store, run, manager } = fixture();
-  const skill = await authored(manager, run), first = execution(store, run, skill), second = execution(store, run, skill);
-  finish(store, first);
-  store.event(run.run_id, "skill.closed", "First execution outcome", { execution_id: first.execution_id });
-  const learning = new ImprovementLearning(store);
-  const page = learning.feedback(run.run_id, undefined, 2);
-  expect(page.opportunities).toHaveLength(1);
-  expect(page.metrics.map((metric) => metric.execution_id)).toEqual([first.execution_id]);
-  second.status = "failed"; second.error = "Measured failure"; second.ended_at = new Date().toISOString();
-  store.updateSkillExecution(second, "skill.closed", "Second execution failure");
-  const next = learning.feedback(run.run_id, page.next_after, 2);
-  expect(next.opportunities.map((opportunity) => opportunity.execution_id)).toEqual([second.execution_id]);
-  expect(next.metrics.map((metric) => metric.execution_id)).toEqual([second.execution_id]);
-  expect(next.has_more).toBe(false);
-});
-
 test("death snapshot and detection event roll back together and commit before observers run", async () => {
   const { directory, store, run, manager } = fixture();
   const skill = await authored(manager, run), view = execution(store, run, skill);
@@ -1202,10 +1212,14 @@ test("death snapshot and detection event roll back together and commit before ob
     store.recordDeathEpisode(run.run_id, episode); unsubscribe();
     expect(notifiedWithBothCommitted).toBe(true);
     const reopened = new Store(join(directory, "runs"));
+    const reader = new HistoryReader(reopened.readLocation());
     try {
       reopened.recordDeathEpisode(run.run_id, episode);
-      expect(new ImprovementLearning(reopened).feedback(run.run_id).opportunities.filter((opportunity) => opportunity.kind === "death")).toHaveLength(1);
-    } finally { reopened.close(); }
+      await new ImprovementLearning(reopened, reader).prepareFeedback(run.run_id, preparationOptions());
+      expect(readImprovementFeedback(reopened, run.run_id).opportunities.filter((opportunity) => opportunity.kind === "death")).toHaveLength(1);
+    } finally {
+      try { await reader.close(); } finally { reopened.close(); }
+    }
   } finally { db.close(); }
 });
 
@@ -1257,38 +1271,94 @@ test("feedback omission metadata cannot overfill a nearly full metrics page", as
   const first = execution(store, run, skill), second = execution(store, run, skill), oversized = execution(store, run, skill);
   const counts = (length: number) => Object.fromEntries(Array.from({ length }, (_, index) => [`fixture_item_${index}`, 1]));
   action(store, run, first, { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: counts(1000) });
-  action(store, run, oversized, { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: counts(10000) });
+  const oversizedAction = action(store, run, oversized, { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: counts(10000) });
   const admitted = store.admitAction(run.run_id, crypto.randomUUID(), { kind: "look", yaw: 0, pitch: 0 }, "skill", second.execution_id, actionAuthority(run, second));
-  const learning = new ImprovementLearning(store);
-  const baseline = learning.feedback(run.run_id);
-  expect(baseline.omitted).toHaveLength(1);
-  const emptyMetric = objectiveMetrics(store, run.run_id).find((metric) => metric.execution_id === second.execution_id)!;
+  const learning = learningFixture(store);
   const delta: Record<string, number> = {};
-  const resultEventSeq = store.lastEventSeq() + 1;
-  const predictedBytes = () => Buffer.byteLength(JSON.stringify({
-    ...baseline, omitted: [], has_more: false,
-    metrics: [baseline.metrics[0], { ...emptyMetric, inventory_delta: delta, inventory_receipts: 1, evidence_event_seqs: [resultEventSeq] }],
-  }));
-  let index = 0;
-  while (predictedBytes() < 65400) delta[`fixture_gain_${index++}`] = 1;
-  const remaining = 65500 - predictedBytes();
-  expect(remaining).toBeGreaterThan(10);
-  delta[`p${"x".repeat(remaining - 6)}`] = 1;
-  expect(predictedBytes()).toBe(65500);
   admitted.action.view.status = "succeeded";
   admitted.action.view.ended_at = new Date().toISOString();
   admitted.action.view.result = { status: "succeeded", summary: "Receipt fixture", evidence: { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: delta } };
   store.saveAction(run.run_id, admitted.action.view);
-  const page = learning.feedback(run.run_id);
+  await learning.prepareFeedback(run.run_id, preparationOptions());
+  const baseline = readImprovementFeedback(store, run.run_id);
+  expect(baseline.omitted).toHaveLength(1);
+  const predictedBytes = () => Buffer.byteLength(JSON.stringify({
+    ...baseline, omitted: [], has_more: true,
+    metrics: baseline.metrics.map(value => value.kind === "replace" && value.execution_id === second.execution_id
+      ? { ...value, metric: { ...value.metric, inventory_delta: delta } } : value),
+  }));
+  let index = 0;
+  while (predictedBytes() < 65300) delta[`fixture_gain_${index++}`] = 1;
+  const remaining = 65400 - predictedBytes();
+  expect(remaining).toBeGreaterThan(10);
+  delta[`p${"x".repeat(remaining - 6)}`] = 1;
+  expect(predictedBytes()).toBe(65400);
+  // Change each actual contribution in order, then read only this generation's
+  // replacements rather than treating update sequences as insertion ordinals.
+  action(store, run, first, { effect_confirmed: true, inventory_receipt_confirmed: true,
+    inventory_before: {}, inventory_after: { x: 1 } });
+  store.saveAction(run.run_id, admitted.action.view);
+  oversizedAction.result!.evidence = { effect_confirmed: true, inventory_receipt_confirmed: true,
+    inventory_before: {}, inventory_after: counts(10000), native_action_ms: 1 };
+  store.saveAction(run.run_id, oversizedAction);
+  await learning.prepareFeedback(run.run_id, preparationOptions());
+  const checkpoint = store.historyProjectionCheckpoint(run.run_id);
+  const sourceThrough = store.historySourceHighwater(run.run_id), eventThrough = store.lastEventSeq();
+  const page = readImprovementFeedback(store, run.run_id, baseline.next_after);
   expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(65536);
-  expect(page.metrics).toHaveLength(2);
-  expect(page.omitted).toEqual([]);
   expect(page.has_more).toBe(true);
-  const last = learning.feedback(run.run_id, page.next_after);
-  expect(last.omitted.map((omission) => omission.id)).toEqual([oversized.execution_id]);
-  expect(last.has_more).toBe(false);
-  expect(Buffer.byteLength(JSON.stringify(last))).toBeLessThanOrEqual(65536);
-});
+  const delivered = [...page.metrics], omissions = [...page.omitted];
+  let last = page;
+  while (last.has_more) {
+    const next = readImprovementFeedback(store, run.run_id, last.next_after);
+    expect(Buffer.byteLength(JSON.stringify({ id: Number.MAX_SAFE_INTEGER, ok: true, value: next }) + "\n")).toBeLessThanOrEqual(65536);
+    expect(next.next_after.metric_change_seq).toBeGreaterThan(last.next_after.metric_change_seq);
+    delivered.push(...next.metrics); omissions.push(...next.omitted); last = next;
+  }
+  expect(delivered.filter(value => value.execution_id === first.execution_id)).toHaveLength(1);
+  const replacements = delivered.filter(value => value.execution_id === second.execution_id);
+  expect(replacements).toHaveLength(1);
+  expect(replacements[0]!.kind).toBe("replace");
+  if (replacements[0]!.kind !== "replace") throw new Error("Expected a retained metric replacement");
+  expect(replacements[0]!.metric.inventory_delta).toEqual(delta);
+  expect(omissions.map(omission => omission.id)).toEqual([oversized.execution_id]);
+  const reference = omissions[0]!.reference;
+  if (!reference || typeof reference !== "object" || Array.isArray(reference) ||
+    typeof reference.generation !== "number" || typeof reference.url !== "string")
+    throw new Error("Oversized feedback metric must retain an exact HTTP metric reference");
+  expect(reference.url).toContain(`/objective-metrics/${oversized.execution_id}?generation=${reference.generation}`);
+  const expected = objectiveMetrics(store, run.run_id).find(value => value.execution_id === oversized.execution_id)!;
+  let after = { record_index: 0, chunk_index: 0 };
+  const chunks: string[] = [];
+  const named = new ProgramWorkspace(store, run.run_id);
+  for (let pages = 0; ; pages++) {
+    expect(pages).toBeLessThan(1000);
+    const exported = dispatchHistoryQuery(store, { kind: "model_inspect", run_id: run.run_id,
+      input: { view: "metric", program: { name: skill.name, version: skill.version },
+        execution_ordinal: store.executionReferences(run.run_id, oversized.execution_id)[0]!.execution_ordinal,
+        generation: reference.generation, after, limit: 1 } });
+    if (!exported || typeof exported !== "object" || Array.isArray(exported) ||
+      !Array.isArray(exported.records) || !exported.next_after || typeof exported.next_after !== "object" || Array.isArray(exported.next_after))
+      throw new Error("Expected a named metric archive page");
+    for (const record of exported.records) {
+      if (!record || typeof record !== "object" || Array.isArray(record) || typeof record.text !== "string")
+        throw new Error("Oversized metric must remain losslessly chunked");
+      chunks.push(record.text);
+    }
+    expect(Buffer.byteLength(JSON.stringify({ id: Number.MAX_SAFE_INTEGER, ok: true, value: exported }) + "\n")).toBeLessThanOrEqual(65536);
+    if (!exported.has_more) {
+      expect(JSON.parse(chunks.join(""))).toEqual(named.metricView(expected));
+      break;
+    }
+    const next = exported.next_after;
+    if (typeof next.record_index !== "number" || typeof next.chunk_index !== "number")
+      throw new Error("Metric archive must return a logical continuation");
+    after = { record_index: next.record_index, chunk_index: next.chunk_index };
+  }
+  expect(store.historyProjectionCheckpoint(run.run_id)).toEqual(checkpoint);
+  expect(store.historySourceHighwater(run.run_id)).toBe(sourceThrough);
+  expect(store.lastEventSeq()).toBe(eventThrough);
+}, 180_000);
 
 test("durable latest-root lookup survives more than 100 sequential children without expanding presentation snapshots", async () => {
   const { store, run, manager } = fixture();
@@ -1325,8 +1395,9 @@ test("invalid decision/revision pairs reject actionably without a record before 
   const { store, library, run, manager } = fixture();
   const first = await authored(manager, run), firstExecution = execution(store, run, first);
   finish(store, firstExecution);
-  const learning = new ImprovementLearning(store);
-  const opportunity = learning.feedback(run.run_id).opportunities.find((value) => value.execution_id === firstExecution.execution_id)!;
+  const learning = learningFixture(store);
+  await learning.prepareFeedback(run.run_id, preparationOptions());
+  const opportunity = readImprovementFeedback(store, run.run_id).opportunities.find((value) => value.execution_id === firstExecution.execution_id)!;
   const second = await manager.register(run.run_id, { entry: "run",
     name: first.name,
     source: 'const state = await game.observe(); return {status:"completed",summary:"Candidate observation experiment",result:state.data.player.health};',
@@ -1346,7 +1417,7 @@ test("invalid decision/revision pairs reject actionably without a record before 
   if (!(rejection instanceof RuntimeFault)) throw new Error("Expected a typed semantic rejection");
   expect(rejection.code).toBe("invalid_request");
   expect(store.lastEventSeq()).toBe(beforeSeq);
-  expect(learning.feedback(run.run_id).opportunities.find((value) => value.opportunity_id === opportunity.opportunity_id)?.resolution).toBeNull();
+  expect(readImprovementFeedback(store, run.run_id).opportunities.find((value) => value.opportunity_id === opportunity.opportunity_id)?.resolution).toBeNull();
   const corrected = { decision: "revise" as const, reason, revision, event_seqs: [evidence.event_seq] };
   const accepted = learning.resolve(run.run_id, opportunity.opportunity_id, corrected);
   expect(accepted.resolution?.decision).toBe("revise");

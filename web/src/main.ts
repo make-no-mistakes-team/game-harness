@@ -38,7 +38,7 @@ import {
   removeJevKey,
   setJevKey,
 } from "./api.ts";
-import type { PerformanceSnapshot } from "./api.ts";
+import type { PerformanceSnapshot, SkillEvidencePage } from "./api.ts";
 import { NativeVideo } from "./video.ts";
 import { EvidenceInspector, promotionEvidence } from "./evidence.ts";
 import { MAX_TASK_CHARACTERS, taskTextSchema } from "../../src/shared/tasks.ts";
@@ -162,7 +162,18 @@ const archivedEvents = new Map<
 >();
 const measuredEvidence = new Map<
   string,
-  { items: ProgramEvidenceView[]; loading: boolean; error: string | null }
+  {
+    items: ProgramEvidenceView[];
+    after: number;
+    cursor: number;
+    more: boolean;
+    total: number | null;
+    projection: SkillEvidencePage["projection"] | null;
+    omissions: SkillEvidencePage["omissions"];
+    loading: boolean;
+    error: string | null;
+    controller: AbortController | null;
+  }
 >();
 const pending = new Set<string>(),
   events = new Map<string, ActivityEvent>();
@@ -462,22 +473,69 @@ async function loadEventPage(runId: string): Promise<void> {
   }
 }
 
-async function loadMeasurements(runId: string): Promise<void> {
-  if (measuredEvidence.get(runId)?.loading) return;
-  const measured = {
-    items: [] as ProgramEvidenceView[],
-    loading: true,
-    error: null as string | null,
-  };
-  measuredEvidence.set(runId, measured);
+async function loadMeasurements(runId: string, nextPage = false): Promise<void> {
+  let measured = measuredEvidence.get(runId);
+  if (nextPage && (!measured || measured.loading || !measured.more)) return;
+  for (const [id, cached] of measuredEvidence) {
+    if (id === runId) continue;
+    cached.controller?.abort();
+    measuredEvidence.delete(id);
+  }
+  if (!nextPage || !measured) {
+    measured?.controller?.abort();
+    measured = {
+      items: [],
+      after: 0,
+      cursor: 0,
+      more: false,
+      total: null,
+      projection: null,
+      omissions: [],
+      loading: false,
+      error: null,
+      controller: null,
+    };
+    measuredEvidence.set(runId, measured);
+  }
+  const after = measured.cursor;
+  const controller = new AbortController();
+  const focusKey = document.activeElement instanceof HTMLElement
+    ? document.activeElement.dataset.key
+    : undefined;
+  measured.loading = true;
+  measured.error = null;
+  measured.controller = controller;
   renderEvidence(true);
+  if (focusKey === "measurements-refresh" || focusKey === "measurements-next")
+    document.getElementById("measurements-status")?.focus({ preventScroll: true });
   try {
-    measured.items = await fetchSkillEvidence(runId);
+    const page = await fetchSkillEvidence(runId, after, 25, controller.signal);
+    if (measuredEvidence.get(runId) !== measured || controller.signal.aborted) return;
+    measured.items = page.records;
+    measured.after = after;
+    measured.cursor = page.next_after;
+    measured.more = page.has_more;
+    measured.total = page.total;
+    measured.projection = page.projection;
+    measured.omissions = page.omissions;
   } catch (error) {
-    measured.error = message(error);
+    if (measuredEvidence.get(runId) === measured && !controller.signal.aborted)
+      measured.error = message(error);
   } finally {
-    measured.loading = false;
-    renderEvidence(true);
+    if (measuredEvidence.get(runId) === measured && !controller.signal.aborted) {
+      const restoreFocus = (selectedRun ?? snapshot?.run)?.run_id === runId &&
+        document.activeElement?.id === "measurements-status";
+      measured.loading = false;
+      measured.controller = null;
+      renderEvidence(true);
+      if (restoreFocus && focusKey) {
+        const button = document.getElementById(focusKey);
+        const target = button instanceof HTMLButtonElement && !button.disabled
+          ? button
+          : document.getElementById("measurements-refresh");
+        target?.focus({ preventScroll: true });
+      }
+    }
   }
 }
 
@@ -1098,20 +1156,57 @@ function renderEvidence(force = false): void {
       "muted",
     );
     const measured = measuredEvidence.get(run.run_id);
-    if (measured?.error)
-      paragraph(
-        node,
-        `Measured evidence unavailable: ${measured.error}`,
-        "error",
-      );
-    else if (measured?.loading)
-      paragraph(node, "Loading measured program evidence…");
+    const status = document.createElement("p");
+    status.id = status.dataset.key = "measurements-status";
+    status.tabIndex = -1;
+    status.setAttribute("role", "status");
+    const displayedExecutions = new Set(run.executions.map(item => item.execution_id));
+    const matching = measured?.items.filter(item => displayedExecutions.has(item.execution_id)).length ?? 0;
+    status.textContent = measured && measured.total !== null
+      ? `${measured.items.length} measurements in this page · ${matching} linked to displayed executions · ${measured.total} retained in total.${measured.after > 0 || measured.more ? " Other pages are not loaded." : ""}${measured.projection?.has_pending ? " Newer measurements pending." : ""}`
+      : "No measurement page loaded.";
+    if (measured?.loading)
+      status.textContent = measured.total === null
+        ? "Loading measured program evidence…"
+        : `Loading next measurement page… ${status.textContent}`;
+    node.append(status);
+    if (measured?.error) {
+      const error = document.createElement("p");
+      error.className = "error";
+      error.setAttribute("role", "alert");
+      error.textContent = `Measured evidence unavailable: ${measured.error}${measured.total !== null ? " · Displayed measurements are from the previously loaded page." : ""}`;
+      node.append(error);
+    }
+    if (measured?.omissions.length) {
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      details.dataset.record = "measurement-omissions";
+      summary.dataset.key = details.dataset.record;
+      summary.textContent = `${measured.omissions.length} explicit measurement omission${measured.omissions.length === 1 ? "" : "s"} in this page`;
+      details.append(summary);
+      pre(details, measured.omissions);
+      node.append(details);
+    }
+    const paging = document.createElement("div");
+    paging.className = "button-row";
     const reload = document.createElement("button");
     reload.type = "button";
-    reload.textContent = "Refresh measured evidence";
+    reload.id = reload.dataset.key = "measurements-refresh";
+    reload.textContent = measured?.loading && measured.total === null
+      ? "Refreshing measured evidence…"
+      : "Refresh measured evidence";
     reload.disabled = !!measured?.loading;
     reload.addEventListener("click", () => void loadMeasurements(run.run_id));
-    node.append(reload);
+    const next = document.createElement("button");
+    next.type = "button";
+    next.id = next.dataset.key = "measurements-next";
+    next.textContent = measured?.loading && measured.total !== null
+      ? "Loading…"
+      : "Next measurement page";
+    next.disabled = !measured?.more || measured.loading;
+    next.addEventListener("click", () => void loadMeasurements(run.run_id, true));
+    paging.append(reload, next);
+    node.append(paging);
     if (!run.executions.length)
       paragraph(node, "No skill executions admitted in this run.");
     for (const execution of [...run.executions].reverse())

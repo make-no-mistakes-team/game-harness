@@ -3,7 +3,7 @@ import { effectScopeSchema, type EffectScope } from "../../src/shared/control.ts
 import { minecraftObservationV3Schema } from "../../src/shared/minecraft.ts";
 import { verificationResultSchema } from "../../src/shared/validation.ts";
 import type { SkillExecutionView, SkillView } from "../../src/shared/programs.ts";
-import type { ImprovementFeedbackCursor, ObjectiveMetrics, ProgramVersionEvidence, TracePage } from "../../src/shared/execution-evidence.ts";
+import type { ImprovementFeedbackCursor, ObjectiveMetrics, ProgramVersionEvidence, TracePage, VersionComparisonCursor } from "../../src/shared/execution-evidence.ts";
 import { fetchComparison, fetchDeaths, fetchHistory, fetchImprovementFeedback, fetchPlanning, fetchTrace } from "./api.ts";
 
 type PromotionRun = Pick<RunView, "run_id" | "world_id" | "epoch" | "session_id" | "native_boot_id" | "compatibility_hash" | "goal">;
@@ -196,7 +196,7 @@ export class EvidenceInspector {
       compactness: program.validation, created_at: program.created_at,
       measured_effectiveness: this.actions.measurements(run.run_id).filter(item => item.skill_id === program.skill_id && item.version === program.version),
       executions: run.executions.filter(item => item.skill_id === program.skill_id && item.version === program.version),
-      qualification: "No samples does not mean effective. Newer code is not proven better.",
+      qualification: "Only measurements in the loaded page are shown; see Executions for coverage and omissions. Missing measurements remain unknown. Newer code is not proven better.",
     } : {
       run_id: run.run_id, backend: program.backend, choices: program.choices,
       priority: program.priority, interval_ms: program.interval_ms,
@@ -218,7 +218,7 @@ export class EvidenceInspector {
       paragraph(details, `Evidence: ${measured.evidence_status.replaceAll("_", " ")} · ${measured.confirmed_effects} confirmed effects · ${measured.strategic_requests} strategic requests within interval · ${measured.duration_ms === null ? "unknown duration" : `${measured.duration_ms} ms`}.`);
       paragraph(details, `Code compactness (not effectiveness): ${measured.compactness.formatted_lines} canonical lines · complexity ${measured.compactness.complexity} · nesting ${measured.compactness.nesting}.`, "muted");
       pre(details, measured);
-    } else paragraph(details, "Measured effectiveness is unavailable or not yet recorded. Execution status is not objective verification.", "muted");
+    } else paragraph(details, "No measurement is loaded for this execution. Execution status is not objective verification.", "muted");
     pre(details, execution);
     button(details, "Inspect attributed trace / conditions", () => this.actions.trace(run, execution.execution_id));
     if (execution.parent_execution_id === null && ["succeeded", "cancelled"].includes(execution.status)) {
@@ -388,8 +388,8 @@ export class EvidenceInspector {
     void load(0);
   }
 
-  private metric(parent: HTMLElement, metric: ObjectiveMetrics): void {
-    const details = disclosure(parent, `${metric.execution_id} · ${metric.outcome} · ${metric.observation_samples} observation samples / ${metric.motion_receipts} motion receipts`, metric);
+  private metric(parent: HTMLElement, metric: ObjectiveMetrics, projection?: { generation: number; revision: number }): void {
+    const details = disclosure(parent, `${metric.execution_id} · ${metric.outcome} · ${metric.observation_samples} observation samples / ${metric.motion_receipts} motion receipts${projection ? ` · revision ${projection.revision}` : ""}`, projection ? { ...metric, projection } : metric);
     paragraph(details, `${metric.confirmed_block_removals} confirmed block removals · ${metric.inventory_receipts} inventory receipts · ${metric.target_switches} target-ID switches / ${metric.target_position_switches} position switches. Extra blocks and switches are not labelled mistakes without evidence.`);
     paragraph(details, `Sampled travel ${metric.sampled_travel_distance.toFixed(2)} blocks / rotation ${metric.sampled_rotation_degrees.toFixed(2)}°; receipted travel ${metric.receipted_travel_distance.toFixed(2)} blocks / rotation ${metric.receipted_rotation_degrees.toFixed(2)}°. Sampling does not prove a complete path.`, "mono");
     paragraph(details, `Trace ${metric.trace_complete ? "within retained budget" : "incomplete"}. ${metric.limitations.join(" ")}`, "muted");
@@ -400,7 +400,7 @@ export class EvidenceInspector {
     const status = paragraph(parent, "Loading bounded improvement feedback…");
     const content = node("div"); parent.append(content);
     const controls = node("div"); controls.className = "button-row"; parent.append(controls);
-    let after: ImprovementFeedbackCursor = { opportunity_seq: 0, execution_seq: 0 };
+    let after: ImprovementFeedbackCursor = { schema_version: 2, opportunity_change_seq: 0, metric_change_seq: 0, scope_hash: null };
     let nextAfter = after, busy = false;
     const cursors: ImprovementFeedbackCursor[] = [];
     const load = async (cursor: ImprovementFeedbackCursor): Promise<void> => {
@@ -410,7 +410,7 @@ export class EvidenceInspector {
         const data = await fetchImprovementFeedback(run.run_id, cursor);
         after = cursor; nextAfter = data.next_after;
         content.replaceChildren();
-        status.textContent = `${data.opportunities.length} opportunities / ${data.metrics.length} metric records in this page. ${data.review.effect_free ? "Post-goal review is effect-free" : ""}; at most ${data.review.max_decisions} decisions. Opportunity limit ${data.opportunity_budget.max_records}${data.opportunity_budget.reached ? " reached. " + data.opportunity_budget.omission : "."}`;
+        status.textContent = `${data.opportunities.length} opportunities / ${data.metrics.length} metric updates in this page. ${data.review.effect_free ? "Post-goal review is effect-free" : ""}; at most ${data.review.max_decisions} decisions. Opportunity limit ${data.opportunity_budget.max_records}${data.opportunity_budget.reached ? " reached. " + data.opportunity_budget.omission : "."}${data.projection.has_pending ? " Newer measurements pending." : ""}`;
         if (!data.opportunities.length && !data.metrics.length) paragraph(content, "No improvement or objective metric records in this page.");
         if (data.omitted.length) disclosure(content, "Explicit page omissions", data.omitted);
         for (const opportunity of data.opportunities) {
@@ -419,7 +419,10 @@ export class EvidenceInspector {
           paragraph(details, resolution ? `${resolution.reason} · ${resolution.measured ? "Measured, not causally proven" : "Unmeasured / insufficient trials"}` : "No model decision recorded. The UI does not revise or approve source.");
           button(details, "Inspect linked execution trace", () => this.actions.trace(run, opportunity.execution_id));
         }
-        for (const metric of data.metrics) this.metric(content, metric);
+        for (const update of data.metrics) {
+          if (update.kind === "replace") this.metric(content, update.metric, { generation: update.generation, revision: update.revision });
+          else disclosure(content, `${update.program.name} v${update.program.version} · execution ${update.execution_ordinal} · metric removed · revision ${update.revision}`, update);
+        }
         next.disabled = !data.has_more;
       } catch (error) { status.textContent = `Improvement evidence unavailable: ${errorMessage(error)}`; }
       finally { busy = false; previous.disabled = !cursors.length; refresh.disabled = false; }
@@ -427,7 +430,7 @@ export class EvidenceInspector {
     const previous = button(controls, "Previous page", () => { const cursor = cursors.pop(); if (cursor !== undefined) void load(cursor); });
     const next = button(controls, "Next feedback page", () => { cursors.push(after); void load(nextAfter); });
     const refresh = button(controls, "Refresh feedback", () => void load(after));
-    void load({ opportunity_seq: 0, execution_seq: 0 });
+    void load({ schema_version: 2, opportunity_change_seq: 0, metric_change_seq: 0, scope_hash: null });
   }
 
   private deathPanel(parent: HTMLElement, run: RunView): void {
@@ -496,9 +499,10 @@ export class EvidenceInspector {
     parent.append(form);
     const content = node("div"); parent.append(content);
     const paging = node("div"); paging.className = "button-row"; parent.append(paging);
-    let runs: RunView[] = [], after = 0, nextAfter = 0, busy = false;
+    let runs: RunView[] = [], busy = false;
+    let after: VersionComparisonCursor | null = null, nextAfter: VersionComparisonCursor | null = null;
     let active: { before: ProgramVersionEvidence; after: ProgramVersionEvidence } | null = null;
-    const cursors: number[] = [];
+    const cursors: (VersionComparisonCursor | null)[] = [];
     const source = (runSelect: HTMLSelectElement, skillSelect: HTMLSelectElement): { run: RunView; skill: SkillView } | null => {
       const run = runs.find(value => value.run_id === runSelect.value);
       const skill = run?.skills.find(value => `${value.skill_id}:${value.version}:${value.hash}` === skillSelect.value);
@@ -518,13 +522,14 @@ export class EvidenceInspector {
       if (!run?.skills.length) skillSelect.append(new Option("No retained skill versions", ""));
       enabled();
     };
-    const load = async (cursor: number): Promise<void> => {
+    const load = async (cursor: VersionComparisonCursor | null): Promise<void> => {
       if (!active || busy) return; busy = true; enabled(); previous.disabled = next.disabled = true;
       status.textContent = "Loading bounded exact-version comparison…";
       try {
         const data = await fetchComparison(active.before, active.after, cursor);
         const value = data.comparison; after = cursor; nextAfter = data.next_after; content.replaceChildren();
-        status.textContent = `Recorded samples: before ${value.sample_count.before} / after ${value.sample_count.after}. Page includes ${value.samples.before.length} / ${value.samples.after.length}. Descriptive only — no causal improvement claim.`;
+        const newerBefore = data.projection.before.has_pending, newerAfter = data.projection.after.has_pending;
+        status.textContent = `Recorded samples: before ${value.sample_count.before} / after ${value.sample_count.after}. Page includes ${value.samples.before.length} / ${value.samples.after.length}. Descriptive only — no causal improvement claim.${newerBefore || newerAfter ? " Newer evidence is not included in this snapshot." : ""}`;
         disclosure(content, "Exact references and controlled conditions (null means not established)", { before: value.before, after: value.after, controlled_conditions: value.controlled_conditions });
         if (data.omissions.length) disclosure(content, "Explicit comparison omissions — read exact source / cards above", data.omissions);
         content.append(node("h3", "Source changes"));
@@ -533,10 +538,10 @@ export class EvidenceInspector {
         disclosure(content, "Added source (inert text)", value.source_diff.added.join("\n"));
         disclosure(content, "StrategyCard changes", value.card_diff);
         content.append(node("h3", "Before measurements"));
-        if (!value.samples.before.length) paragraph(content, value.sample_count.before ? "No before samples in this page." : "No measured before executions. Unknown effectiveness.");
+        if (!value.samples.before.length) paragraph(content, value.sample_count.before ? "No before samples in this page." : newerBefore ? "No before measurements in this snapshot." : "No measured before executions. Unknown effectiveness.");
         for (const metric of value.samples.before) this.metric(content, metric);
         content.append(node("h3", "After measurements"));
-        if (!value.samples.after.length) paragraph(content, value.sample_count.after ? "No after samples in this page." : "No measured after executions. This version is an unmeasured candidate.");
+        if (!value.samples.after.length) paragraph(content, value.sample_count.after ? "No after samples in this page." : newerAfter ? "No after measurements in this snapshot." : "No measured after executions. This version is an unmeasured candidate.");
         for (const metric of value.samples.after) this.metric(content, metric);
         next.disabled = !data.has_more;
       } catch (error) { status.textContent = `Comparison unavailable: ${errorMessage(error)}`; }
@@ -553,7 +558,7 @@ export class EvidenceInspector {
         before: { run_id: a.run.run_id, skill_id: a.skill.skill_id, version: a.skill.version, hash: a.skill.hash },
         after: { run_id: b.run.run_id, skill_id: b.skill.skill_id, version: b.skill.version, hash: b.skill.hash },
       };
-      cursors.length = 0; void load(0);
+      cursors.length = 0; void load(null);
     });
     beforeRun.addEventListener("change", () => skills(beforeRun, beforeSkill));
     afterRun.addEventListener("change", () => skills(afterRun, afterSkill));

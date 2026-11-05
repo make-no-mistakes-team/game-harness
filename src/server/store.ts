@@ -1,13 +1,14 @@
-import { Database, type SQLQueryBindings, type Statement } from "bun:sqlite";
+import { Database } from "bun:sqlite";
+import { StoreDatabase, STORE_OPPORTUNITY_INDEXES, STORE_SCHEMA_VERSION } from "./store-database.ts";
+import { StoreReadQueries, type StoreReadLocation, type PolicyRow, type SkillRow } from "./store-read.ts";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   mkdirSync,
-  readFileSync,
 } from "node:fs";
 import { open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
-import type { DeathEpisode, SavedDeathEpisode, ReadonlyDeathEpisode, ImprovementOpportunity, TraceInput, TracePage, TraceRecord, WorkingProgram } from "../shared/execution-evidence.ts";
+import type { DeathEpisode, SavedDeathEpisode, ImprovementOpportunity, TraceInput, TraceRecord, WorkingProgram } from "../shared/execution-evidence.ts";
 import type { SkillManager } from "./skills.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import type {
@@ -32,6 +33,9 @@ import { SKILL_API_VERSION } from "../shared/programs.ts";
 import type { EffectInvocation, EffectScope } from "../shared/control.ts";
 import { effectInvocationSchema, effectScopeSchema } from "../shared/control.ts";
 import { skillStartRequestSchema } from "../shared/validation.ts";
+import { assertProjectionCheckpoint, assertProjectionRow, projectionRequestFits, HISTORY_PROJECTION_SCHEMA_SQL, PROJECTION_COLLECTIONS, type HistoryProjectionBatch, type ProjectionCheckpoint } from "./history-projection.ts";
+import { improvementOpportunityCandidate } from "./program-feedback.ts";
+import { HISTORY_SOURCE_KINDS, HISTORY_SOURCE_REGISTRY, HISTORY_SOURCE_SCHEMA_SQL, HISTORY_SOURCE_SCHEMA_VERSION, type HistorySourceKind } from "./history-source.ts";
 
 export type StoredRun = Omit<
   RunView,
@@ -44,30 +48,6 @@ export interface StoredAction {
   request: GameAction;
   fingerprint: string;
   view: ActionView;
-}
-interface EventRow {
-  event_seq: number;
-  run_id: string | null;
-  at: string;
-  type: string;
-  summary: string;
-  details: string;
-}
-interface PolicyRow {
-  policy_id: string;
-  run_id: string;
-  version: number;
-  name: string;
-  hash: string;
-  metadata: string;
-}
-interface SkillRow {
-  skill_id: string;
-  run_id: string;
-  version: number;
-  name: string;
-  hash: string;
-  metadata: string;
 }
 
 function canonical(value: unknown): string {
@@ -94,52 +74,25 @@ const terminalExecutions = new Set<SkillExecutionView["status"]>([
   "unknown",
 ]);
 
-/** Historical records retain null authority; decoding never upgrades them into active invocations. */
-function readExecutionView(encoded: string): SkillExecutionView {
-  return { entry: null, session_id: null, life_id: null, world_id: null, native_boot_id: null, run_generation: null,
-    space_epoch: null, source_hash: null, compatibility_hash: null, ...JSON.parse(encoded) };
-}
-function readActionView(encoded: string): ActionView {
-  return { session_id: null, life_id: null, scope: null, invocation: null, compatibility_hash: null, ...JSON.parse(encoded) };
-}
-
-/** Own every fixed SQL statement, including Bun 1.3 query-cache overflow. */
-class StoreDatabase {
-  readonly #statements = new Map<string, Statement>();
-  constructor(private readonly database: Database) {}
-  query<Row = unknown, Params extends SQLQueryBindings[] = SQLQueryBindings[]>(sql: string): Statement<Row, Params> {
-    let statement = this.#statements.get(sql);
-    if (!statement) {
-      statement = this.database.prepare(sql);
-      this.#statements.set(sql, statement);
-    }
-    // Each fixed SQL string has one row/binding shape at its typed call sites.
-    return statement as Statement<Row, Params>;
-  }
-  exec(sql: string): void { this.database.exec(sql); }
-  transaction<T>(operation: () => T) { return this.database.transaction(operation); }
-  close(): void {
-    for (const statement of this.#statements.values()) statement.finalize();
-    this.#statements.clear();
-    this.database.close(true);
-  }
-}
-
-export class Store {
+export class Store extends StoreReadQueries {
   private readonly db: StoreDatabase;
   private readonly artifactDir: string;
   private readonly listeners = new Set<(event: ActivityEvent) => void>();
   private readonly traceObservers = new Set<(input: TraceInput) => void>();
+  private readonly historyListeners = new Set<(runId: string) => void>();
   private readonly sourcePreparations = new Map<string, Promise<void>>();
   private closed = false;
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     chmodSync(dataDir, 0o700);
-    this.artifactDir = path.join(dataDir, "artifacts");
-    mkdirSync(this.artifactDir, { recursive: true, mode: 0o700 });
-    const filename = path.join(dataDir, "runs.sqlite");
-    this.db = new StoreDatabase(new Database(filename, { create: true, strict: true }));
+    const artifactDir = path.resolve(dataDir, "artifacts");
+    mkdirSync(artifactDir, { recursive: true, mode: 0o700 });
+    const filename = path.resolve(dataDir, "runs.sqlite");
+    const database = new StoreDatabase(new Database(filename, { create: true, strict: true }));
+    super(database, artifactDir);
+    this.artifactDir = artifactDir;
+    this.db = database;
     chmodSync(filename, 0o600);
     this.db.exec(
       "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;",
@@ -147,7 +100,7 @@ export class Store {
     const version =
       this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()
         ?.user_version ?? 0;
-    if (version > 4)
+    if (version > STORE_SCHEMA_VERSION)
       throw new Error(
         "The run database was created by a newer GameHarness version",
       );
@@ -219,6 +172,8 @@ export class Store {
         ) STRICT;
         CREATE INDEX IF NOT EXISTS skill_executions_parent ON skill_executions(run_id, parent_execution_id);
         CREATE INDEX IF NOT EXISTS skill_executions_root ON skill_executions(run_id, root_execution_id);
+        CREATE INDEX IF NOT EXISTS skill_executions_measured ON skill_executions(run_id,skill_id,version)
+          WHERE json_extract(view,'$.started_at') IS NOT NULL AND json_extract(view,'$.status') IN ('succeeded','blocked','failed','unknown','cancelled');
         CREATE TABLE IF NOT EXISTS store_metadata (
           key TEXT PRIMARY KEY,
           value INTEGER NOT NULL CHECK(value >= 0)
@@ -255,7 +210,6 @@ export class Store {
           payload TEXT NOT NULL CHECK(json_valid(payload)),
           PRIMARY KEY(session_id,model_id,skill_id,version)
         ) STRICT;
-        PRAGMA user_version=4;
       `);
       const executionColumns = this.db.query<{ name: string }, []>("PRAGMA table_info(skill_executions)").all();
       if (!executionColumns.some((column) => column.name === "admission_ordinal")) {
@@ -263,7 +217,95 @@ export class Store {
         this.db.exec("UPDATE skill_executions SET admission_ordinal=rowid");
       }
       this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS skill_executions_ordinal ON skill_executions(admission_ordinal)");
+      for (const index of STORE_OPPORTUNITY_INDEXES) this.db.exec(index.sql);
       if (version < 2) this.migrateLegacyRows();
+      if (version < HISTORY_SOURCE_SCHEMA_VERSION) {
+        this.db.exec(HISTORY_SOURCE_SCHEMA_SQL);
+        const registerBootstrap = this.db.query(
+          "INSERT INTO history_source_bootstrap(kind,through_ordinal,after_ordinal) VALUES(?,?,0)",
+        );
+        for (const kind of HISTORY_SOURCE_KINDS) {
+          const source = HISTORY_SOURCE_REGISTRY[kind];
+          const through = this.db.query<{ ordinal: number }, []>(
+            `SELECT COALESCE(MAX(rowid),0) AS ordinal FROM ${source.table}`,
+          ).get()!.ordinal;
+          if (!Number.isSafeInteger(through) || through < 0)
+            throw new Error(`Invalid history source bootstrap highwater for ${kind}`);
+          registerBootstrap.run(kind, through);
+        }
+      }
+      this.db.exec(HISTORY_PROJECTION_SCHEMA_SQL);
+      for (const row of this.db.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE 'improvement_%'").all()) {
+        this.db.exec(`DROP TRIGGER "${row.name.replace(/"/g, '""')}"`);
+      }
+      this.db.exec("DROP TABLE IF EXISTS improvement_work; DROP TABLE IF EXISTS improvement_checkpoints; DROP INDEX IF EXISTS events_improvement_run_seq; DROP INDEX IF EXISTS events_improvement_execution_seq;");
+      this.db.exec(`PRAGMA user_version=${STORE_SCHEMA_VERSION}`);
+    })();
+  }
+
+  readLocation(): StoreReadLocation {
+    return { database: path.join(path.dirname(this.artifactDir), "runs.sqlite"), artifacts: this.artifactDir };
+  }
+
+  /** Register only bounded baseline keys; bodies remain backed by canonical source rows. */
+  advanceHistorySourceBootstrap(limit = 128): { complete: boolean; processed: number } {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128)
+      throw new Error("History source bootstrap limit must be an integer from 1 to 128");
+    return this.db.transaction(() => {
+      const progress = this.db.query<{
+        kind: HistorySourceKind;
+        through_ordinal: number;
+        after_ordinal: number;
+      }, []>(
+        "SELECT kind,through_ordinal,after_ordinal FROM history_source_bootstrap",
+      ).all();
+      if (progress.length !== HISTORY_SOURCE_KINDS.length ||
+        new Set(progress.map((entry) => entry.kind)).size !== HISTORY_SOURCE_KINDS.length ||
+        progress.some((entry) =>
+          !Object.hasOwn(HISTORY_SOURCE_REGISTRY, entry.kind) ||
+          !Number.isSafeInteger(entry.through_ordinal) || entry.through_ordinal < 0 ||
+          !Number.isSafeInteger(entry.after_ordinal) || entry.after_ordinal < 0 ||
+          entry.after_ordinal > entry.through_ordinal))
+        throw new Error("Invalid history source bootstrap progress");
+      const register = this.db.query(
+        `INSERT INTO history_source_keys(run_id,kind,source_key,created_seq)
+          SELECT ?1,?2,?3,0
+          WHERE NOT EXISTS(SELECT 1 FROM history_source_keys WHERE run_id=?1 AND kind=?2 AND source_key=?3)`,
+      );
+      const advance = this.db.query(
+        "UPDATE history_source_bootstrap SET after_ordinal=? WHERE kind=?",
+      );
+      let processed = 0;
+      for (const kind of HISTORY_SOURCE_KINDS) {
+        const entry = progress.find((row) => row.kind === kind)!;
+        if (entry.after_ordinal === entry.through_ordinal || processed === limit) continue;
+        const source = HISTORY_SOURCE_REGISTRY[kind];
+        const rows = this.db.query<{
+          ordinal: number;
+          run_id: string | null;
+          source_key: string;
+        }, [number, number, number]>(
+          `SELECT rowid AS ordinal,${source.runSql} AS run_id,${source.keySql} AS source_key FROM ${source.table}
+            WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT ?`,
+        ).all(entry.after_ordinal, entry.through_ordinal, limit - processed);
+        for (const row of rows) {
+          if (!Number.isSafeInteger(row.ordinal) ||
+            row.ordinal <= entry.after_ordinal || row.ordinal > entry.through_ordinal)
+            throw new Error("Invalid history source bootstrap row ordinal");
+          if (row.run_id !== null) register.run(row.run_id, kind, row.source_key);
+          entry.after_ordinal = row.ordinal;
+          processed++;
+        }
+        const remaining = this.db.query<{ ordinal: number }, [number, number]>(
+          `SELECT rowid AS ordinal FROM ${source.table} WHERE rowid>? AND rowid<=? ORDER BY rowid LIMIT 1`,
+        ).get(entry.after_ordinal, entry.through_ordinal);
+        if (!remaining) entry.after_ordinal = entry.through_ordinal;
+        advance.run(entry.after_ordinal, kind);
+      }
+      return {
+        complete: progress.every((entry) => entry.after_ordinal === entry.through_ordinal),
+        processed,
+      };
     })();
   }
 
@@ -278,59 +320,6 @@ export class Store {
         throw new Error("Persistent game epoch is unavailable or exhausted");
       return row.value;
     })();
-  }
-
-  private normalizeRun(payload: string): StoredRun {
-    const run = JSON.parse(payload) as StoredRun & {
-      action?: unknown;
-      policies?: unknown;
-      skills?: unknown;
-      executions?: unknown;
-    };
-    delete run.action;
-    delete run.policies;
-    delete run.skills;
-    delete run.executions;
-    run.session_id ??= null;
-    run.life_id ??= null;
-    run.native_boot_id ??= null;
-    run.space_epoch ??= null;
-    run.compatibility_hash ??= null;
-    const usage = run.usage as StoredRun["usage"] & {
-      input_tokens?: number;
-      output_tokens?: number;
-    };
-    if ("input_tokens" in usage || "output_tokens" in usage) {
-      const unattributed = () => ({
-        uncached_input: null,
-        cache_read: null,
-        cache_write: null,
-        output: null,
-        calls: null,
-        known_cost: null,
-        legacy_input: null,
-      });
-      run.usage = {
-        uncached_input: null,
-        cache_read: null,
-        cache_write: null,
-        output: usage.output_tokens ?? null,
-        calls: null,
-        known_cost: usage.known_cost ?? null,
-        legacy_input: usage.input_tokens ?? null,
-        accounting_basis: "sdk_reported_subtotal",
-        by_purpose: {
-          authoring: unattributed(),
-          planning: unattributed(),
-          replanning: unattributed(),
-          improvement: unattributed(),
-          other: unattributed(),
-        },
-      };
-    }
-    // Read-time qualification only: opening a Store must not rewrite historical usage.
-    run.usage.accounting_basis = "sdk_reported_subtotal";
-    return run;
   }
 
   private migrateLegacyRows(): void {
@@ -379,6 +368,19 @@ export class Store {
     return () => this.traceObservers.delete(listener);
   }
 
+  subscribeHistoryChanges(listener: (runId: string) => void): () => void {
+    this.historyListeners.add(listener);
+    return () => this.historyListeners.delete(listener);
+  }
+
+  private notifyHistory(runId: string): void {
+    this.db.afterCommit(() => {
+      for (const listener of this.historyListeners) {
+        try { listener(runId); } catch { /* Durable source journal, not an observer, owns progress. */ }
+      }
+    });
+  }
+
   private append(
     runId: string | null,
     type: string,
@@ -402,6 +404,7 @@ export class Store {
   }
 
   private notify(event: ActivityEvent): void {
+    if (event.run_id !== null) this.notifyHistory(event.run_id);
     for (const listener of this.listeners) {
       try {
         listener(event);
@@ -430,64 +433,6 @@ export class Store {
     return events;
   }
 
-  events(runId: string | null = null, after = 0, limit = 100): ActivityEvent[] {
-    const cap = Math.max(1, Math.min(500, limit));
-    const rows = runId
-      ? this.db
-          .query<EventRow, [string, number, number]>(
-            "SELECT event_seq,run_id,at,type,summary,details FROM events WHERE run_id=? AND event_seq>? ORDER BY event_seq DESC LIMIT ?",
-          )
-          .all(runId, after, cap)
-      : this.db
-          .query<EventRow, [number, number]>(
-            "SELECT event_seq,run_id,at,type,summary,details FROM events WHERE event_seq>? ORDER BY event_seq DESC LIMIT ?",
-          )
-          .all(after, cap);
-    return rows
-      .reverse()
-      .map((row) => ({ ...row, details: JSON.parse(row.details) as Json }));
-  }
-
-  latestEvent(runId: string, type: string): ActivityEvent | null {
-    const row = this.db.query<EventRow, [string, string]>(
-      "SELECT event_seq,run_id,at,type,summary,details FROM events WHERE run_id=? AND type=? ORDER BY event_seq DESC LIMIT 1",
-    ).get(runId, type);
-    return row ? { ...row, details: JSON.parse(row.details) as Json } : null;
-  }
-
-  eventsAfter(
-    runId: string | null,
-    after: number,
-    limit: number,
-  ): ActivityEvent[] {
-    const cap = Math.max(1, Math.min(500, limit));
-    const rows = runId
-      ? this.db
-          .query<EventRow, [string, number, number]>(
-            "SELECT event_seq,run_id,at,type,summary,details FROM events WHERE run_id=? AND event_seq>? ORDER BY event_seq ASC LIMIT ?",
-          )
-          .all(runId, after, cap)
-      : this.db
-          .query<EventRow, [number, number]>(
-            "SELECT event_seq,run_id,at,type,summary,details FROM events WHERE event_seq>? ORDER BY event_seq ASC LIMIT ?",
-          )
-          .all(after, cap);
-    return rows.map((row) => ({
-      ...row,
-      details: JSON.parse(row.details) as Json,
-    }));
-  }
-
-  lastEventSeq(): number {
-    return (
-      this.db
-        .query<{ cursor: number }, []>(
-          "SELECT COALESCE(MAX(event_seq),0) AS cursor FROM events",
-        )
-        .get()?.cursor ?? 0
-    );
-  }
-
   saveRun(run: StoredRun, summary?: string): void {
     let event: ActivityEvent | undefined;
     this.db.transaction(() => {
@@ -507,61 +452,7 @@ export class Store {
         });
     })();
     if (event) this.notify(event);
-  }
-
-  lastRun(): StoredRun | null {
-    const row = this.db
-      .query<{ payload: string }, []>(
-        "SELECT payload FROM runs ORDER BY created_at DESC LIMIT 1",
-      )
-      .get();
-    return row ? this.normalizeRun(row.payload) : null;
-  }
-
-  runs(limit = 50): StoredRun[] {
-    const cap = Number.isFinite(limit)
-      ? Math.max(1, Math.min(500, Math.floor(limit)))
-      : 50;
-    return this.db
-      .query<{ payload: string }, [number]>(
-        "SELECT payload FROM runs ORDER BY created_at DESC,rowid DESC LIMIT ?",
-      )
-      .all(cap)
-      .map((row) => this.normalizeRun(row.payload));
-  }
-
-  getRun(id: string): StoredRun | null {
-    const row = this.db
-      .query<{ payload: string }, [string]>(
-        "SELECT payload FROM runs WHERE run_id=?",
-      )
-      .get(id);
-    return row ? this.normalizeRun(row.payload) : null;
-  }
-
-  getAction(runId: string, id: string): StoredAction | null {
-    const row = this.db
-      .query<
-        { request: string; fingerprint: string; view: string },
-        [string, string]
-      >(
-        "SELECT request,fingerprint,view FROM actions WHERE run_id=? AND action_id=?",
-      )
-      .get(runId, id);
-    return row
-      ? {
-          request: JSON.parse(row.request) as GameAction,
-          fingerprint: row.fingerprint,
-          view: readActionView(row.view),
-        }
-      : null;
-  }
-
-  selectedAction(runId: string, target: "current" | "latest", executionId?: string): ActionView | null {
-    const row = this.db.query<{ view: string }, [string, string, string | null, string | null, string | null]>(
-      "SELECT a.view FROM actions a LEFT JOIN skill_executions e ON e.run_id=a.run_id AND e.execution_id=json_extract(a.view,'$.execution_id') WHERE a.run_id=? AND (?='latest' OR json_extract(a.view,'$.status') IN ('accepted','running','cancel_requested')) AND (? IS NULL OR e.execution_id=? OR e.root_execution_id=?) ORDER BY a.rowid DESC LIMIT 1",
-    ).get(runId, target, executionId ?? null, executionId ?? null, executionId ?? null);
-    return row ? readActionView(row.view) : null;
+    else this.notifyHistory(run.run_id);
   }
 
   admitAction(
@@ -657,7 +548,7 @@ export class Store {
       )
       .all(runId);
     for (const row of rows) {
-      const view = JSON.parse(row.view) as ActionView;
+      const view = this.readActionView(row.view);
       if (!["accepted", "running", "cancel_requested"].includes(view.status))
         continue;
       view.status = view.status === "accepted" ? "cancelled" : "unknown";
@@ -740,17 +631,6 @@ export class Store {
     if (this.closed) throw new Error("Store is closed");
   }
 
-  private readSource(hash: string): string {
-    if (!/^[a-f0-9]{64}$/.test(hash))
-      throw new Error("Invalid stored artifact hash");
-    const source = readFileSync(
-      path.join(this.artifactDir, `${hash}.js`),
-    );
-    if (createHash("sha256").update(source).digest("hex") !== hash)
-      throw new Error("Stored artifact integrity check failed");
-    return source.toString("utf8");
-  }
-
   async registerPolicy(
     runId: string,
     spec: PolicySpec,
@@ -830,22 +710,6 @@ export class Store {
     })();
     if (event) this.notify(event);
     return policy;
-  }
-
-  private hydratePolicy(row: PolicyRow): PolicyView {
-    return {
-      ...(JSON.parse(row.metadata) as Omit<PolicyView, "source">),
-      source: this.readSource(row.hash),
-    };
-  }
-
-  policies(runId: string): PolicyView[] {
-    return this.db
-      .query<PolicyRow, [string]>(
-        "SELECT policy_id,run_id,version,name,hash,metadata FROM policies WHERE run_id=? ORDER BY name,version",
-      )
-      .all(runId)
-      .map((row) => this.hydratePolicy(row));
   }
 
   savePolicy(runId: string, view: PolicyView, summary?: string): void {
@@ -1020,48 +884,6 @@ export class Store {
     return imported;
   }
 
-  private hydrateSkill(row: SkillRow): SkillView {
-    return {
-      ...(JSON.parse(row.metadata) as Omit<SkillView, "source">),
-      skill_id: row.skill_id,
-      version: row.version,
-      name: row.name,
-      hash: row.hash,
-      source: this.readSource(row.hash),
-    };
-  }
-
-  skills(runId: string): SkillView[] {
-    return this.db
-      .query<SkillRow, [string]>(
-        "SELECT run_id,skill_id,version,name,hash,metadata FROM skills WHERE run_id=? ORDER BY name,version",
-      )
-      .all(runId)
-      .map((row) => this.hydrateSkill(row));
-  }
-
-  namedSkill(runId: string, name: string, version?: number, validated = false): SkillView | null {
-    const row = this.db.query<SkillRow, [string, string, number | null, number | null, number]>(
-      "SELECT run_id,skill_id,version,name,hash,metadata FROM skills WHERE run_id=? AND name=? AND (? IS NULL OR version=?) AND (?=0 OR json_extract(metadata,'$.state')='validated') ORDER BY version DESC LIMIT 1",
-    ).get(runId, name, version ?? null, version ?? null, validated ? 1 : 0);
-    return row ? this.hydrateSkill(row) : null;
-  }
-
-  programCatalog(runId: string, after: number, limit: number) {
-    const rows = this.db.query<SkillRow & { seq: number }, [string, string, number, number, number]>(
-      "SELECT s.rowid AS seq,s.run_id,s.skill_id,s.version,s.name,s.hash,s.metadata FROM skills s JOIN (SELECT name,MAX(version) AS version FROM skills WHERE run_id=? GROUP BY name) latest ON s.name=latest.name AND s.version=latest.version WHERE s.run_id=? AND (?=0 OR s.rowid<?) ORDER BY s.rowid DESC LIMIT ?",
-    ).all(runId, runId, after, after, limit + 1);
-    const selected = rows.slice(0, limit);
-    return { records: selected.map((row) => {
-      const value = JSON.parse(row.metadata) as SkillView;
-      return { name: row.name, version: row.version, entry: value.entry ?? null, purpose: value.card.purpose.slice(0, 200), state: value.state,
-        execution_compatible: !!value.entry && value.validation.runtime_version === SKILL_API_VERSION &&
-          value.validation.api_version === 5 && value.validation.validator_version === 5 &&
-          value.validation.compatibility_hash === this.getRun(runId)?.compatibility_hash, created_at: value.created_at,
-        ...(value.card.purpose.length > 200 ? { purpose_omission: { reason: "catalog_summary", original_characters: value.card.purpose.length } } : {}) };
-    }), next_after: selected.at(-1)?.seq ?? after, has_more: rows.length > limit, omissions: [] };
-  }
-
   private toolCallRecord(runId: string, callId: string, kind: string): Json | null {
     const row = this.db.query<{ payload: string }, [string, string, string]>(
       "SELECT payload FROM evidence_objects WHERE run_id=? AND kind=? AND object_key=?",
@@ -1080,13 +902,21 @@ export class Store {
   bindToolCall(runId: string, callId: string, input: Json, create: () => Json): Json {
     return this.db.transaction(() => {
       this.assertToolCallInput(runId, callId, input, true);
-      const previous = this.toolCallRecord(runId, callId, "tool_binding");
-      if (previous !== null) return previous;
+      const previous = this.lookupToolCallBinding(runId, callId, input);
+      if (previous.found) return previous.value;
       const value = create();
       this.db.query("INSERT INTO evidence_objects(run_id,kind,object_key,payload) VALUES(?,'tool_binding',?,?)")
         .run(runId, callId, canonical(value));
       return value;
     })();
+  }
+
+  lookupToolCallBinding(runId: string, callId: string, input: Json): { found: false } | { found: true; value: Json } {
+    this.assertToolCallInput(runId, callId, input, false);
+    const row = this.db.query<{ payload: string }, [string, string]>(
+      "SELECT payload FROM evidence_objects WHERE run_id=? AND kind='tool_binding' AND object_key=?",
+    ).get(runId, callId);
+    return row ? { found: true, value: JSON.parse(row.payload) as Json } : { found: false };
   }
 
   completedToolCall(runId: string, callId: string, input: Json): Json | null {
@@ -1102,16 +932,6 @@ export class Store {
         throw new RuntimeFault("conflict", "A completed tool call has an immutable result");
       this.saveEvidenceObject(runId, "tool_result", callId, result);
     })();
-  }
-
-  skill(runId: string, ref: SkillRef): SkillView {
-    const row = this.db
-      .query<SkillRow, [string, string, number]>(
-        "SELECT run_id,skill_id,version,name,hash,metadata FROM skills WHERE run_id=? AND skill_id=? AND version=?",
-      )
-      .get(runId, ref.skill_id, ref.version);
-    if (!row) throw new Error("Skill version not found in this run");
-    return this.hydrateSkill(row);
   }
 
   admitSkill(
@@ -1140,7 +960,7 @@ export class Store {
             "Skill start key already exists with different content",
           );
         return {
-          view: readExecutionView(existing.view),
+          view: this.readExecutionView(existing.view),
           created: false,
         };
       }
@@ -1289,55 +1109,6 @@ export class Store {
     return admitted;
   }
 
-  skillExecution(
-    runId: string,
-    lookup: { start_key: string } | { execution_id: string },
-  ): SkillExecutionView | null {
-    const row =
-      "start_key" in lookup
-        ? this.db
-            .query<{ view: string }, [string, string]>(
-              "SELECT view FROM skill_executions WHERE run_id=? AND start_key=?",
-            )
-            .get(runId, lookup.start_key)
-        : this.db
-            .query<{ view: string }, [string, string]>(
-              "SELECT view FROM skill_executions WHERE run_id=? AND execution_id=?",
-            )
-            .get(runId, lookup.execution_id);
-    return row ? readExecutionView(row.view) : null;
-  }
-
-  skillExecutions(runId: string): SkillExecutionView[] {
-    return this.db
-      .query<{ view: string }, [string]>(
-        "SELECT view FROM skill_executions WHERE run_id=? ORDER BY rowid DESC LIMIT 100",
-      )
-      .all(runId)
-      .map((row) => readExecutionView(row.view));
-  }
-
-  /** Durable root identity, independent of the bounded presentation snapshot. */
-  latestRootExecution(runId: string): SkillExecutionView | null {
-    const row = this.db.query<{ view: string }, [string]>(
-      "SELECT view FROM skill_executions WHERE run_id=? AND parent_execution_id IS NULL ORDER BY rowid DESC LIMIT 1",
-    ).get(runId);
-    return row ? readExecutionView(row.view) : null;
-  }
-
-  selectedSkillExecution(runId: string, target: "current" | "latest", skillId?: string, version?: number): SkillExecutionView | null {
-    const row = this.db.query<{ view: string }, [string, string | null, string | null, number | null, number | null, string]>(
-      "SELECT view FROM skill_executions WHERE run_id=? AND ((? IS NULL AND parent_execution_id IS NULL) OR skill_id=?) AND (? IS NULL OR version=?) AND (?='latest' OR json_extract(view,'$.status') IN ('accepted','running','cancel_requested')) ORDER BY rowid DESC LIMIT 1",
-    ).get(runId, skillId ?? null, skillId ?? null, version ?? null, version ?? null, target);
-    return row ? readExecutionView(row.view) : null;
-  }
-
-  executionReferences(runId: string, executionId?: string) {
-    return this.db.query<{ execution_id: string; name: string; version: number; execution_ordinal: number }, [string, string | null, string | null]>(
-      "SELECT e.execution_id,s.name,e.version,e.admission_ordinal AS execution_ordinal FROM skill_executions e JOIN skills s ON s.run_id=e.run_id AND s.skill_id=e.skill_id AND s.version=e.version WHERE e.run_id=? AND (? IS NULL OR e.execution_id=?) ORDER BY e.admission_ordinal",
-    ).all(runId, executionId ?? null, executionId ?? null);
-  }
-
   updateSkillExecution(
     view: SkillExecutionView,
     eventType: string,
@@ -1426,7 +1197,7 @@ export class Store {
         )
         .all(runId);
       for (const row of rows) {
-        const view = readExecutionView(row.view);
+        const view = this.readExecutionView(row.view);
         const neverDispatched =
           view.status === "accepted" && view.started_at === null;
         view.status = neverDispatched ? "cancelled" : "unknown";
@@ -1453,16 +1224,9 @@ export class Store {
     for (const event of notifications) this.notify(event);
   }
 
-  /** Complete ledger traversal; the UI snapshot's latest-100 cap is not evidence scope. */
-  allSkillExecutions(runId: string): SkillExecutionView[] {
-    return this.db.query<{ view: string }, [string]>(
-      "SELECT view FROM skill_executions WHERE run_id=? ORDER BY rowid",
-    ).all(runId).map(({ view }) => readExecutionView(view));
-  }
-
   recordTrace(input: TraceInput): TraceRecord | null {
     for (const observer of this.traceObservers) observer(input);
-    return this.db.transaction(() => {
+    const retained = this.db.transaction(() => {
       this.db.query("INSERT OR IGNORE INTO trace_budgets(run_id) VALUES(?)").run(input.run_id);
       const budget = this.traceBudget(input.run_id);
       const originalBytes = Buffer.byteLength(canonical(input));
@@ -1484,67 +1248,14 @@ export class Store {
         .run(bytes, record.omission ? 1 : 0, record.omission ? originalBytes : 0, input.run_id);
       return { ...record, trace_seq: Number(result.lastInsertRowid) };
     })();
-  }
-
-  private traceBudget(runId: string): TracePage["budget"] {
-    const row = this.db.query<{ recorded: number; bytes: number; omitted_records: number; omitted_bytes: number }, [string]>(
-      "SELECT recorded,bytes,omitted_records,omitted_bytes FROM trace_budgets WHERE run_id=?",
-    ).get(runId);
-    return { max_records: 8192, max_bytes: 8 * 1024 * 1024, recorded: 0, bytes: 0, omitted_records: 0, omitted_bytes: 0, ...row };
-  }
-
-  tracePage(runId: string, after = 0, limit = 100, executionId?: string): TracePage {
-    if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid trace cursor or limit");
-    const rows = executionId
-      ? this.db.query<{ trace_seq: number; payload: string }, [string, number, string, string, number]>(
-        "SELECT trace_seq,payload FROM execution_trace WHERE run_id=? AND trace_seq>? AND (json_extract(payload,'$.execution_id')=? OR json_extract(payload,'$.root_execution_id')=?) ORDER BY trace_seq LIMIT ?",
-      ).all(runId, after, executionId, executionId, Math.min(limit, 500) + 1)
-      : this.db.query<{ trace_seq: number; payload: string }, [string, number, number]>(
-        "SELECT trace_seq,payload FROM execution_trace WHERE run_id=? AND trace_seq>? ORDER BY trace_seq LIMIT ?",
-      ).all(runId, after, Math.min(limit, 500) + 1);
-    const page: TracePage = { records: [], next_after: after, has_more: false, budget: this.traceBudget(runId) };
-    for (const row of rows) {
-      const record = { ...JSON.parse(row.payload), trace_seq: row.trace_seq } as TraceRecord;
-      const candidate = { ...page, records: [...page.records, record], next_after: record.trace_seq, has_more: false };
-      if (page.records.length >= Math.min(limit, 500) || Buffer.byteLength(JSON.stringify(candidate)) > 65536) {
-        page.has_more = true;
-        break;
-      }
-      page.records.push(record);
-      page.next_after = record.trace_seq;
-    }
-    return page;
-  }
-
-  traceRecord(runId: string, sequence: number): TraceRecord | null {
-    const row = this.db.query<{ payload: string }, [string, number]>(
-      "SELECT payload FROM execution_trace WHERE run_id=? AND trace_seq=?",
-    ).get(runId, sequence);
-    return row ? { ...JSON.parse(row.payload), trace_seq: sequence } as TraceRecord : null;
+    this.notifyHistory(input.run_id);
+    return retained;
   }
 
   private saveEvidenceObject(runId: string, kind: string, key: string, value: unknown): boolean {
     const text = canonical(value);
     if (Buffer.byteLength(text) > 65536) throw new Error("Evidence object exceeds 64 KiB budget");
     return this.db.query("INSERT OR IGNORE INTO evidence_objects(run_id,kind,object_key,payload) VALUES(?,?,?,?)").run(runId, kind, key, text).changes > 0;
-  }
-
-  evidenceObjects<T>(runId: string, kind: "death" | "opportunity"): T[] {
-    return this.db.query<{ payload: string }, [string, string]>(
-      "SELECT payload FROM evidence_objects WHERE run_id=? AND kind=? ORDER BY rowid",
-    ).all(runId, kind).map(({ payload }) => JSON.parse(payload) as T);
-  }
-
-  evidenceObjectRows<T>(runId: string, kind: "opportunity", after: number, limit: number): { seq: number; value: T }[] {
-    return this.db.query<{ seq: number; payload: string }, [string, string, number, number]>(
-      "SELECT rowid AS seq,payload FROM evidence_objects WHERE run_id=? AND kind=? AND rowid>? ORDER BY rowid LIMIT ?",
-    ).all(runId, kind, after, limit).map((row) => ({ seq: row.seq, value: JSON.parse(row.payload) as T }));
-  }
-
-  skillExecutionRows(runId: string, after: number, limit: number): { seq: number; value: SkillExecutionView }[] {
-    return this.db.query<{ seq: number; view: string }, [string, number, number]>(
-      "SELECT rowid AS seq,view FROM skill_executions WHERE run_id=? AND rowid>? ORDER BY rowid LIMIT ?",
-    ).all(runId, after, limit).map((row) => ({ seq: row.seq, value: readExecutionView(row.view) }));
   }
 
   recordDeathEpisode(runId: string, episode: DeathEpisode): void {
@@ -1569,28 +1280,142 @@ export class Store {
     if (event) this.notify(event);
   }
 
-  deathEpisodesPage(runId: string, after = 0, limit = 32) {
-    if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid death episode cursor or limit");
-    const all = this.evidenceObjects<ReadonlyDeathEpisode>(runId, "death");
-    const page = { episodes: [] as ReadonlyDeathEpisode[], next_after: after, has_more: false };
-    for (const episode of all.slice(after, after + Math.min(limit, 100))) {
-      const candidate = { episodes: [...page.episodes, episode], next_after: page.next_after + 1, has_more: false };
-      if (Buffer.byteLength(JSON.stringify(candidate)) > 65536) break;
-      page.episodes.push(episode);
-      page.next_after++;
-    }
-    page.has_more = page.next_after < all.length;
-    return page;
-  }
-
   saveOpportunity(value: ImprovementOpportunity): ImprovementOpportunity {
     this.saveEvidenceObject(value.run_id, "opportunity", value.opportunity_id, value);
-    return this.evidenceObjects<ImprovementOpportunity>(value.run_id, "opportunity").find((item) => item.opportunity_id === value.opportunity_id)!;
+    return this.opportunity(value.run_id, value.opportunity_id)!;
+  }
+
+  /** A caller frontier is explicit and never chased by a preview or commit. */
+  beginHistoryProjection(runId: string, desiredThrough?: number): ProjectionCheckpoint {
+    return this.db.transaction(() => {
+      if (!this.getRun(runId)) throw new RuntimeFault("not_found", "Run not found");
+      const available = this.historySourceHighwater(runId), desired = desiredThrough ?? available;
+      if (!Number.isSafeInteger(desired) || desired < 0 || desired > available) throw new Error("Invalid history projection frontier");
+      const existing = this.historyProjectionCheckpoint(runId);
+      const checkpoint: ProjectionCheckpoint = existing ? structuredClone(existing) : {
+        schema_version: 1, revision: 0, generation: 0, published_revision: 0, source_through: 0,
+        target_through: desired, phase: "bootstrap", job: {}, metric_change_seq: 0, published_metric_change_seq: 0,
+      };
+      if (existing && desired > checkpoint.target_through && ["bootstrap", "index", "expand", "detect", "idle"].includes(checkpoint.phase)) {
+        checkpoint.target_through = desired;
+        if (checkpoint.phase !== "bootstrap") {
+          checkpoint.phase = "index";
+          checkpoint.job.index_after ??= checkpoint.source_through;
+          delete checkpoint.job.expand;
+        }
+        checkpoint.revision++;
+      }
+      assertProjectionCheckpoint(checkpoint);
+      if (!projectionRequestFits(runId, checkpoint))
+        throw new RuntimeFault("budget_exceeded", "History checkpoint cannot fit its next request");
+      if (!existing) this.db.query("INSERT INTO history_projection_checkpoints(run_id,payload) VALUES(?,?)").run(runId, canonical(checkpoint));
+      else if (canonical(existing) !== canonical(checkpoint)) this.db.query("UPDATE history_projection_checkpoints SET payload=? WHERE run_id=? AND payload=?").run(canonical(checkpoint), runId, canonical(existing));
+      return checkpoint;
+    }).immediate();
+  }
+
+  /** Persist only bounded trusted patches; expensive domain interpretation stays readonly. */
+  commitHistoryProjectionBatch(runId: string, batch: HistoryProjectionBatch): void {
+    assertProjectionCheckpoint(batch.before);
+    assertProjectionCheckpoint(batch.after);
+    if (!projectionRequestFits(runId, batch.after))
+      throw new RuntimeFault("budget_exceeded", "History checkpoint cannot fit its next request");
+    if (!Array.isArray(batch.patches) || batch.patches.length > 64 || !Array.isArray(batch.candidates) || batch.candidates.length > 16 ||
+      !Array.isArray(batch.opportunity_bootstrap) || batch.opportunity_bootstrap.length > 128 || Buffer.byteLength(JSON.stringify(batch)) > 64000)
+      throw new Error("History projection batch exceeds bounded envelope");
+    const changed = canonical(batch.before) !== canonical(batch.after) || batch.patches.length > 0 || batch.candidates.length > 0 || batch.opportunity_bootstrap.length > 0;
+    const publication = batch.after.generation === batch.before.generation + 1;
+    const phases = ["bootstrap", "index", "expand", "detect", "objective", "evidence", "publish", "idle"];
+    const phaseAdvance = phases.indexOf(batch.after.phase) - phases.indexOf(batch.before.phase);
+    if (batch.after.revision !== batch.before.revision + (changed ? 1 : 0) || batch.after.target_through !== batch.before.target_through ||
+      (phaseAdvance !== 0 && phaseAdvance !== 1) || (publication && batch.before.phase !== "publish") ||
+      batch.after.metric_change_seq < batch.before.metric_change_seq || batch.after.generation !== batch.before.generation + (publication ? 1 : 0) ||
+      batch.has_more !== (batch.after.phase !== "idle") ||
+      (!publication && (batch.after.source_through !== batch.before.source_through || batch.after.published_revision !== batch.before.published_revision || batch.after.published_metric_change_seq !== batch.before.published_metric_change_seq)) ||
+      (publication && (batch.after.phase !== "idle" || batch.after.source_through !== batch.before.target_through || batch.after.published_revision !== batch.after.revision || batch.after.published_metric_change_seq !== batch.after.metric_change_seq)))
+      throw new Error("Invalid history projection progress transition");
+    const identities = new Set<string>();
+    for (const patch of batch.patches) {
+      const collection = patch.type === "put" ? patch.row.collection : patch.collection, key = patch.type === "put" ? patch.row.key : patch.key;
+      if (!["put", "delete"].includes(patch.type) || !PROJECTION_COLLECTIONS.includes(collection) || typeof key !== "string" || !key) throw new Error("Invalid projection mutation scope");
+      if (patch.type === "put") assertProjectionRow(patch.row);
+      if (patch.type === "put" && collection === "pending_opportunity" &&
+        !batch.candidates.some(candidate => candidate.opportunity_id === key && canonical(candidate) === canonical(patch.row.value)))
+        throw new Error("Pending opportunity lacks an exact validated capture");
+      if (patch.type === "put" && collection === "metric_update" &&
+        (patch.row.order_seq <= batch.before.metric_change_seq || patch.row.order_seq > batch.after.metric_change_seq))
+        throw new Error("Metric replacement is outside the batch change frontier");
+      const identity = canonical([collection, key]);
+      if (identities.has(identity)) throw new Error("Duplicate projection mutation key");
+      identities.add(identity);
+    }
+    this.db.transaction(() => {
+      const saved = this.historyProjectionCheckpoint(runId);
+      if (!saved || canonical(saved) !== canonical(batch.before)) throw new RuntimeFault("conflict", "History projection checkpoint changed before persistence");
+      for (const candidate of batch.candidates) {
+        if (candidate.run_id !== runId || candidate.resolution !== null || candidate.event_seqs.length !== 1) throw new Error("Invalid staged opportunity scope");
+        const sequence = candidate.event_seqs[0]!;
+        const current = this.historySourceRecord(runId, "event", String(sequence), this.historySourceHighwater(runId));
+        const pinned = this.historySourceRecord(runId, "event", String(sequence), batch.before.target_through);
+        const exact = current ? improvementOpportunityCandidate(this, runId, this.decodeHistorySource("event", current)) : null;
+        const available = this.historySourceHighwater(runId);
+        const currentExecution = this.historySourceRecord(runId, "execution", candidate.execution_id, available);
+        const pinnedExecution = this.historySourceRecord(runId, "execution", candidate.execution_id, batch.before.target_through);
+        const skillKey = JSON.stringify([candidate.version.skill_id, candidate.version.version]);
+        const currentSkill = this.historySourceRecord(runId, "skill", skillKey, available);
+        const pinnedSkill = this.historySourceRecord(runId, "skill", skillKey, batch.before.target_through);
+        const patch = batch.patches.find(p => p.type === "put" && p.row.collection === "pending_opportunity" && p.row.key === candidate.opportunity_id);
+        if (!exact || canonical(current) !== canonical(pinned) || canonical(currentExecution) !== canonical(pinnedExecution) || canonical(currentSkill) !== canonical(pinnedSkill) ||
+          canonical(exact) !== canonical(candidate) || !patch || patch.type !== "put" || canonical(patch.row.value) !== canonical(candidate))
+          throw new RuntimeFault("conflict", "History opportunity candidate no longer matches exact current source");
+      }
+      for (const entry of batch.opportunity_bootstrap) {
+        const current = this.db.query<{ seq: number; payload: string }, [string, string]>("SELECT rowid AS seq,payload FROM evidence_objects WHERE run_id=? AND kind='opportunity' AND object_key=?").get(runId, entry.value.opportunity_id);
+        if (!current || current.seq !== entry.seq || canonical(JSON.parse(current.payload)) !== canonical(entry.value)) throw new RuntimeFault("conflict", "Opportunity bootstrap changed before persistence");
+        this.db.query(`INSERT INTO history_opportunity_updates(run_id,opportunity_id,generation,skill_id,version,payload)
+          SELECT ?1,?2,COALESCE((SELECT generation FROM history_opportunity_visibility WHERE run_id=?1 AND opportunity_id=?2),0),?3,?4,?5
+          WHERE NOT EXISTS(SELECT 1 FROM history_opportunity_updates WHERE run_id=?1 AND opportunity_id=?2)`)
+          .run(runId, entry.value.opportunity_id, entry.value.version.skill_id, entry.value.version.version, canonical(entry.value));
+      }
+      for (const patch of batch.patches) {
+        if (patch.type === "delete") {
+          if (patch.collection === "pending_opportunity") {
+            const pending = this.historyProjectionRow(runId, batch.before.revision, patch.collection, patch.key);
+            if (!pending || batch.before.phase !== "publish") throw new Error("Opportunity publication requires staged capture");
+            const candidate = pending.value as unknown as ImprovementOpportunity;
+            this.db.query(`INSERT OR IGNORE INTO history_opportunity_visibility(run_id,opportunity_id,generation)
+              SELECT ?1,?2,?3 WHERE NOT EXISTS(SELECT 1 FROM evidence_objects WHERE run_id=?1 AND kind='opportunity' AND object_key=?2)`).run(runId, patch.key, batch.before.generation + 1);
+            this.saveEvidenceObject(runId, "opportunity", patch.key, candidate);
+          }
+          this.db.query("INSERT INTO history_projection_rows(run_id,collection,object_key,revision,owner_id,source_id,order_seq,tag,payload,deleted) VALUES(?,?,?,?,NULL,NULL,0,NULL,NULL,1)").run(runId, patch.collection, patch.key, batch.after.revision);
+        } else {
+          const row = patch.row;
+          this.db.query("INSERT INTO history_projection_rows(run_id,collection,object_key,revision,owner_id,source_id,order_seq,tag,payload,deleted) VALUES(?,?,?,?,?,?,?,?,?,0)")
+            .run(runId, row.collection, row.key, batch.after.revision, row.owner_id, row.source_id, row.order_seq, row.tag, canonical(row.value));
+        }
+      }
+      if (publication) {
+        for (const collection of ["pending_opportunity", "dirty_detection", "dirty_outcome", "dirty_objective", "objective_job", "dirty_evidence", "evidence_job"] as const) {
+          if (this.historyProjectionCount(runId, batch.after.revision, { collection }) !== 0) throw new Error("Cannot publish a partial history generation");
+        }
+        this.db.query("INSERT INTO history_projection_generations(run_id,generation,revision,source_through,metric_change_seq) VALUES(?,?,?,?,?)")
+          .run(runId, batch.after.generation, batch.after.revision, batch.after.source_through, batch.after.published_metric_change_seq);
+      }
+      if (!changed) return;
+      const result = this.db.query("UPDATE history_projection_checkpoints SET payload=? WHERE run_id=? AND payload=?").run(canonical(batch.after), runId, canonical(batch.before));
+      if (result.changes !== 1) throw new RuntimeFault("conflict", "History projection checkpoint changed during persistence");
+    }).immediate();
+  }
+
+  hasMeasuredSkillExecution(runId: string, ref: SkillRef): boolean {
+    return this.db.query<{ measured: number }, [string, string, number]>(
+      "SELECT 1 AS measured FROM skill_executions WHERE run_id=? AND skill_id=? AND version=? AND json_extract(view,'$.started_at') IS NOT NULL AND json_extract(view,'$.status') IN ('succeeded','blocked','failed','unknown','cancelled') LIMIT 1",
+    ).get(runId, ref.skill_id, ref.version) !== null;
   }
 
   resolveOpportunity(runId: string, id: string, resolution: NonNullable<ImprovementOpportunity["resolution"]>): ImprovementOpportunity {
     return this.db.transaction(() => {
-      const value = this.evidenceObjects<ImprovementOpportunity>(runId, "opportunity").find((item) => item.opportunity_id === id);
+      const value = this.opportunity(runId, id);
       if (!value) throw new Error("Improvement opportunity not found");
       if (value.resolution) {
         const { at: _at, ...existing } = value.resolution;
@@ -1637,12 +1462,6 @@ export class Store {
     return candidates;
   }
 
-  workingPrograms(modelId: string, sessionId: string): WorkingProgram[] {
-    return this.db.query<{ payload: string }, [string, string, string, string]>(
-      "SELECT payload FROM working_programs WHERE model_id=? AND session_id=? AND json_extract(payload,'$.source_run_id')=(SELECT json_extract(payload,'$.source_run_id') FROM working_programs WHERE model_id=? AND session_id=? ORDER BY rowid DESC LIMIT 1) ORDER BY rowid",
-    ).all(modelId, sessionId, modelId, sessionId).map(({ payload }) => JSON.parse(payload) as WorkingProgram);
-  }
-
   async hydrateWorkingPrograms(modelId: string, sessionId: string, runId: string, manager: Pick<SkillManager, "importSnapshot">, beforeCommit: () => void = () => {}): Promise<SkillView[]> {
     const run = this.getRun(runId);
     if (!run || run.model_id !== modelId || run.session_id !== sessionId) throw new Error("Working library scope does not match run");
@@ -1667,6 +1486,7 @@ export class Store {
     if (this.closed) return;
     this.closed = true;
     this.listeners.clear();
+    this.historyListeners.clear();
     this.traceObservers.clear();
     this.db.close();
   }

@@ -158,6 +158,7 @@ export class StrategicContext {
   private controllerAdmissions = new Map<string, z.infer<typeof controllerAdmissionSchema>>();
   private omittedUnknown = 0;
   private help: HelpSection[] = [];
+  private readonly helpSchemas = new WeakSet<HelpSection>();
   private helpOmissions: Omission[] = [];
 
   constructor(private readonly store: Store) {}
@@ -219,22 +220,31 @@ export class StrategicContext {
     this.help = this.help.filter(section => section.topic !== topic);
     this.helpOmissions = this.helpOmissions.filter(entry => !entry.reference.startsWith(`${topic}.`));
     const sections: HelpSection[] = [];
-    const visit = (section: string, content: Json, depth: number) => {
+    const visit = (section: string, content: Json, depth: number, schema = false) => {
       const size = bytes(content);
-      if (size <= HELP_SECTION_BYTES) sections.push({ topic, section, content });
+      const fields = object(content);
+      schema ||= typeof fields?.$schema === "string";
+      if (size <= HELP_SECTION_BYTES) {
+        const entry = { topic, section, content };
+        sections.push(entry);
+        if (schema) this.helpSchemas.add(entry);
+      }
       else {
-        const fields = object(content);
         if (Array.isArray(content) && depth < 8)
-          content.forEach((child, index) => visit(`${section}[${index}]`, child, depth + 1));
-        else if (fields && depth < 8) for (const [name, child] of Object.entries(fields)) visit(`${section}.${name}`, child as Json, depth + 1);
+          content.forEach((child, index) => visit(`${section}[${index}]`, child, depth + 1, schema));
+        else if (fields && depth < 8) for (const [name, child] of Object.entries(fields)) visit(`${section}.${name}`, child as Json, depth + 1, schema);
         else this.helpOmissions.push({ kind: "help", reference: `${topic}.${section}`, reason: "section_byte_budget", original_bytes: size });
       }
     };
     const fields = object(value);
     if (fields) for (const [name, content] of Object.entries(fields)) visit(name, content as Json, 0);
     else visit("reference", value, 0);
-    // Latest requested topic wins; within it retain the generated section order.
-    this.help = [...sections, ...this.help];
+    // Generated schemas can exceed the whole allowance before later semantic
+    // contracts are visited. Preserve actually requested reference semantics
+    // across topics first, then use remaining space for schema sections.
+    // Stable order keeps the latest requested topic first within each class.
+    this.help = [...sections, ...this.help].sort((a, b) =>
+      Number(this.helpSchemas.has(a)) - Number(this.helpSchemas.has(b)));
     let used = 0;
     this.help = this.help.filter(section => {
       const size = bytes(section);

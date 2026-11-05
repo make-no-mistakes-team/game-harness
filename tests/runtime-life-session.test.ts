@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, vi } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -779,17 +779,72 @@ test("named revision pins the original running version and trusted call retries 
 });
 
 test("a revision reason links the exact candidate experiment without a bookkeeping-only model call", async () => {
-  const f = await fixture(); f.unknown(); await reached(f, f.replanned.promise);
+  const f = await fixture();
+  const original = f.store.namedSkill(f.created.run_id, ROOT, 1)!;
+  const published = Promise.withResolvers<void>(), commit = f.store.commitHistoryProjectionBatch.bind(f.store);
+  let through = Number.POSITIVE_INFINITY;
+  const publication = vi.spyOn(f.store, "commitHistoryProjectionBatch").mockImplementation((runId, batch) => {
+    commit(runId, batch);
+    if (runId === f.created.run_id && batch.after.phase === "idle" && batch.after.source_through >= through)
+      published.resolve();
+  });
+  try {
+    f.unknown(); await reached(f, f.replanned.promise);
+    // Replanning admits strategy, not history publication. Join the real
+    // background writer's fixed committed frontier; feedback remains readonly.
+    through = f.store.historySourceHighwater(f.created.run_id);
+    if ((f.store.historyProjectionGeneration(f.created.run_id)?.source_through ?? -1) >= through)
+      published.resolve();
+    await reached(f, published.promise);
+  } finally {
+    publication.mockRestore();
+  }
+  const execution = f.findExecution(ROOT)!;
+  const closed = f.store.eventsAfter(f.created.run_id, 0, 500).find(event =>
+    event.type === "skill.closed" && eventDetails(event.details)?.execution_id === execution.execution_id)!;
+  const parent = { run_id: f.created.run_id, skill_id: original.skill_id, version: original.version, hash: original.hash };
   const before = f.store.evidenceObjects<ImprovementOpportunity>(f.created.run_id, "opportunity");
-  expect(before.length).toBeGreaterThan(0);
+  expect(execution.status).toBe("unknown");
+  expect(before).toEqual([expect.objectContaining({
+    kind: "failure", version: parent, execution_id: execution.execution_id, event_seqs: [closed.event_seq], resolution: null,
+  })]);
+  const opportunity = before[0]!;
+  expect(f.store.latestOpportunityForVersion(parent)?.opportunity_id).toBe(opportunity.opportunity_id);
   const feedback = await f.invoke("program_inspect", { view: "feedback", program: { name: ROOT, version: 1 } });
   expect(feedback.isError).not.toBe(true);
-  expect(f.store.evidenceObjects<ImprovementOpportunity>(f.created.run_id, "opportunity")).toHaveLength(before.length);
-  const written = await f.invoke("program_write", { name: ROOT, based_on: 1, reason: "Choose this candidate experiment without claiming proven efficacy", source: 'await game.observe(); return {status:"blocked",summary:"Candidate awaiting independent measurement",result:null};', card, dependencies: [] });
+  expect(f.store.evidenceObjects<ImprovementOpportunity>(f.created.run_id, "opportunity")).toEqual(before);
+  const input = { name: ROOT, based_on: 1, reason: "Choose this candidate experiment without claiming proven efficacy", source: 'await game.observe(); return {status:"blocked",summary:"Candidate awaiting independent measurement",result:null};', card, dependencies: [] };
+  const written = await f.invoke("program_write", input, "write-candidate-experiment");
+  expect(written.isError).not.toBe(true);
   expect(written.details).toMatchObject({ name: ROOT, version: 2, experiment: { decision: "revise", measured: false, qualification: "candidate_not_proven_improvement" } });
-  expect(f.store.evidenceObjects<ImprovementOpportunity>(f.created.run_id, "opportunity").find((entry) => entry.resolution)?.resolution).toMatchObject({ decision: "revise", measured: false, revision: { version: 2 } });
-  expect(f.store.allSkillExecutions(f.created.run_id)).toHaveLength(1);
+  const candidate = f.store.namedSkill(f.created.run_id, ROOT, 2)!;
+  const resolved = f.store.evidenceObjects<ImprovementOpportunity>(f.created.run_id, "opportunity");
+  expect(resolved).toEqual([{ ...opportunity, resolution: {
+    decision: "revise", reason: input.reason, measured: false, event_seqs: opportunity.event_seqs, at: expect.any(String),
+    revision: { run_id: f.created.run_id, skill_id: candidate.skill_id, version: candidate.version, hash: candidate.hash },
+  } }]);
+  expect(candidate).toMatchObject({ skill_id: original.skill_id, parent_version: original.version });
+  const links = f.store.eventsAfter(f.created.run_id, 0, 500).filter(event =>
+    event.type === "learning.resolved" || event.type === "learning.candidate_written");
+  expect(links).toHaveLength(1);
+  expect(links[0]!.details).toMatchObject({ opportunity_id: opportunity.opportunity_id, decision: "revise" });
+  const replay = await f.invoke("program_write", input, "write-candidate-experiment");
+  expect(replay.isError).not.toBe(true);
+  expect(replay.details).toEqual(written.details);
+  expect(f.store.evidenceObjects<ImprovementOpportunity>(f.created.run_id, "opportunity")).toEqual(resolved);
+  expect(f.store.eventsAfter(f.created.run_id, 0, 500).filter(event =>
+    event.type === "learning.resolved" || event.type === "learning.candidate_written")).toEqual(links);
+  expect(f.store.namedSkill(f.created.run_id, ROOT)?.version).toBe(2);
+  expect(f.store.namedSkill(f.created.run_id, ROOT, 1)).toEqual(original);
+  expect(f.store.allSkillExecutions(f.created.run_id)).toEqual([execution]);
+  expect(f.runtime.snapshot()?.action?.status).toBe("unknown");
+  expect(f.counters()).toMatchObject({ effects: 1, agents: 2, prompts: 2, disconnects: 0 });
+  expect(f.store.eventsAfter(f.created.run_id, 0, 500).filter(event => event.type === "model.call")).toHaveLength(2);
+  await expect(f.staleEffect()).rejects.toThrow();
   await f.runtime.control(f.created.run_id, "stop");
+  expect(f.runtime.snapshot()?.status).toBe("stopped");
+  expect(f.store.allSkillExecutions(f.created.run_id)).toEqual([execution]);
+  expect(f.counters()).toMatchObject({ effects: 1, agents: 2, prompts: 2, disconnects: 0 });
 });
 
 test("planning retains the actual predecessor after more than one hundred sequential named child calls", async () => {

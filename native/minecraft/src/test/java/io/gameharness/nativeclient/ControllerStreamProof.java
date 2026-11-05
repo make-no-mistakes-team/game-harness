@@ -64,7 +64,241 @@ public final class ControllerStreamProof {
     emptyGuiSettlementChronology();
     freshPostRenderSamples();
     sampleRejectionAfterRetirement();
+    preparationTraceOpportunities();
+    preparationTraceBoundsAndOmissions();
+    preparationTraceReadiness();
+    preparationTraceHookIdentities();
+    preparationTraceStreamingAndCursor();
     System.out.println("Native controller queue/age/lease proof passed");
+  }
+  private static void preparationTraceHookIdentities() {
+    var trace = trace(4);
+    trace.hook(NativePreparationTrace.Kind.SAMPLE_RENDER, NativePreparationTrace.Outcome.OBSERVED,
+        1, 7, 3, 41, 0, 0, 3, 3, 20);
+    trace.hook(NativePreparationTrace.Kind.SAMPLE_RENDER, NativePreparationTrace.Outcome.PASSED,
+        2, 7, 3, 41, 0, 91, 1, 1, 24);
+    var batch = trace.batch(4);
+    var before = batch.events().get(0).wire();
+    var captured = batch.events().get(1).wire();
+    require(before.get("request_id").getAsString().equals("41")
+        && before.get("sequence").isJsonNull() && before.get("frame_sequence").isJsonNull()
+        && captured.get("request_id").getAsString().equals("41")
+        && captured.get("sequence").isJsonNull()
+        && captured.get("frame_sequence").getAsString().equals("91"),
+        "pending read fabricated a capture identity or successful capture lost its actual identity");
+    require(trace.batch(4) == batch && trace.finalBatch() == null,
+        "uncommitted writer prefix was replaced by a final snapshot");
+    require(trace.acknowledge(batch) && trace.seal(), "committed prefix could not retire");
+    var terminal = trace.finalBatch();
+    require(terminal.events().isEmpty() && terminal.counts().drained() == 2
+        && terminal.wire().get("complete").getAsBoolean(),
+        "later ordinary final carrier lost the already committed prefix");
+  }
+
+  private static void preparationTraceStreamingAndCursor() {
+    long now = 1_000_000_000L;
+    var queue = new ControllerInputQueue(now + 10_000_000_000L, now);
+    try {
+      require(!java.lang.reflect.Modifier.isSynchronized(ControllerInputQueue.class
+          .getMethod("preparationOrdinal").getModifiers())
+          && java.lang.reflect.Modifier.isVolatile(ControllerInputQueue.class
+              .getDeclaredField("preparationOrdinal").getModifiers()),
+          "observational cursor can block on the input queue monitor or lacks visibility");
+    } catch (ReflectiveOperationException error) {
+      throw new AssertionError("observational cursor contract unavailable", error);
+    }
+    require(queue.preparationOrdinal() == 0 && queue.preparationOrdinal() == 0,
+        "observing the cursor began a preparation opportunity");
+    require(queue.begin(now, 1) == null && queue.preparationOrdinal() == 1,
+        "actual empty queue opportunity did not advance the cursor exactly once");
+    var trace = trace(4096);
+    long received = 0;
+    // More than the entire collector capacity: existing ordinary reply commits recycle space.
+    for (int group = 0; group < 192; group++) {
+      for (int event = 0; event < 64; event++)
+        trace.hook(NativePreparationTrace.Kind.PREPARE_ENTRY, NativePreparationTrace.Outcome.OBSERVED,
+            group * 64L + event, group, group, 0, 0, 0, 0, 0, 1);
+      var batch = trace.batch(64);
+      require(batch.events().size() == 64 && batch.counts().omitted() == 0,
+          "streaming trace exhausted despite acknowledged ordinary carriers");
+      for (var event : batch.events())
+        require(event.eventseq() == ++received, "streaming collector evicted or duplicated an accepted prefix");
+      require(trace.batch(64) == batch && trace.acknowledge(batch),
+          "ordinary writer commit did not preserve and then acknowledge the exact prefix");
+    }
+    require(trace.seal(), "retired streaming collector did not seal");
+    var terminal = trace.finalBatch();
+    require(terminal.events().isEmpty() && terminal.counts().accepted() == received
+        && terminal.counts().drained() == received && terminal.wire().get("complete").getAsBoolean(),
+        "streaming final evidence concealed an omitted warmup prefix");
+  }
+
+  private static NativePreparationTrace trace(int capacity) {
+    return new NativePreparationTrace(new NativePreparationTrace.Identity("proof-owner", 7, "proof-boot", "a".repeat(64)),
+        capacity);
+  }
+  private static long field(NativePreparationTrace.Event event, String name) {
+    return Long.parseLong(event.wire().get(name).getAsString());
+  }
+  private static void preparationTraceOpportunities() {
+    long now = 1_000_000_000L;
+    var trace = trace(32);
+    var queue = new ControllerInputQueue(now + 1_000_000_000L, now);
+    queue.bindTrace(trace);
+    require(queue.begin(now, 1) == null, "empty traced opportunity invented an entry");
+    var first = queue.admit(101, 1, 11, 1, now, 0, 0, input(false, false), now);
+    require(queue.begin(now, 2) == first, "no-predecessor onset opportunity did not begin");
+    var second = queue.admit(102, 2, 12, 2, now, 0, 0, input(false, false), now);
+    queue.admit(103, 3, 13, 2, now, 0, 0, input(false, false), now);
+    require(queue.begin(now, 3) == null, "trace permitted applying overlap");
+    var completion = queue.complete(first, 0, 3, now);
+    require(queue.begin(now + 1, 4) == second, "trace changed FIFO after completion");
+    var batch = trace.batch(32);
+    var events = batch.events();
+    require(events.size() == 8 && events.get(0).outcome() == NativePreparationTrace.Outcome.EMPTY
+        && field(events.get(0), "preparation_ordinal") == 1
+        && field(events.get(0), "evaluated_mask") == 7
+        && events.get(0).wire().get("head_sequence").isJsonNull(),
+        "empty begin opportunity or its short-circuited freshness was lost");
+    require(events.get(1).wire().get("predecessor_sequence").isJsonNull()
+        && events.get(1).wire().get("applying_sequence").isJsonNull()
+        && field(events.get(2), "head_sequence") == 1
+        && field(events.get(2), "preparation_ordinal") == 2,
+        "onset facts were inferred from a later queued predecessor");
+    require(field(events.get(3), "applying_sequence") == 1
+        && events.get(3).wire().get("predecessor_sequence").isJsonNull()
+        && field(events.get(4), "predecessor_sequence") == 2
+        && field(events.get(4), "head_sequence") == 2
+        && field(events.get(5), "evaluated_mask") == 3,
+        "actual pending predecessor or applying short circuit was not retained");
+    require(field(events.get(6), "request_id") == 101 && field(events.get(6), "sequence") == 1
+        && field(events.get(6), "frame_sequence") == 11
+        && field(events.get(6), "applied_native_ns") == now
+        && field(events.get(6), "diagnostic_completion_native_ns") == completion.settledNanos()
+        && field(events.get(7), "last_completed_request_id") == 101
+        && field(events.get(7), "last_completed_frame_sequence") == 11
+        && field(events.get(7), "last_applied_native_ns") == now,
+        "completion trace borrowed identity or retimed the authoritative ACK");
+    require(trace.batch(1) == batch, "unacknowledged accepted prefix was silently replaced");
+    trace.acknowledge(batch);
+    var terminal = trace.finalBatch();
+    require(terminal.events().isEmpty() && terminal.counts().retained() == 0
+        && terminal.wire().get("complete").getAsBoolean(), "fully delivered terminal trace was not complete");
+  }
+  private static void preparationTraceBoundsAndOmissions() {
+    var trace = trace(2);
+    for (int i = 0; i < 4; i++) trace.hook(NativePreparationTrace.Kind.PREPARE_ENTRY,
+        NativePreparationTrace.Outcome.OBSERVED, Long.MIN_VALUE + i, i, i, 0, 0, 0, 0, 0, 0);
+    var batch = trace.batch(1);
+    require(batch.counts().attempted() == 4 && batch.counts().accepted() == 2
+        && batch.counts().omitted() == 2 && batch.counts().exhausted() == 2
+        && batch.events().get(0).eventseq() == 1
+        && field(batch.events().get(0), "native_ns") == Long.MIN_VALUE,
+        "finite trace evicted a prefix, lost omissions, or narrowed the signed native clock");
+    require(trace.finalBatch() == null, "final drain discarded an unacknowledged prefix");
+    trace.acknowledge(batch);
+    trace.hook(NativePreparationTrace.Kind.PREPARE_EXIT, NativePreparationTrace.Outcome.OBSERVED, 5, 5, 5,
+        0, 0, 0, 0, 0, 0);
+    var finalBatch = trace.finalBatch();
+    require(finalBatch.events().size() == 2 && finalBatch.events().get(0).eventseq() == 2
+        && finalBatch.events().get(1).eventseq() == 5 && finalBatch.counts().sealed()
+        && !finalBatch.wire().get("complete").getAsBoolean(), "trace hid an omission gap or failed to reuse drained capacity");
+    trace.acknowledge(finalBatch);
+    trace.hook(NativePreparationTrace.Kind.PREPARE_ENTRY, NativePreparationTrace.Outcome.OBSERVED, 6, 6, 6,
+        0, 0, 0, 0, 0, 0);
+    var sealed = trace.finalBatch();
+    require(sealed.counts().closedOmitted() == 1 && sealed.counts().omitted() == 3,
+        "late producer silently disappeared after sealing");
+
+    var suffix = trace(65);
+    for (int i = 0; i < 65; i++) suffix.hook(NativePreparationTrace.Kind.PREPARE_ENTRY,
+        NativePreparationTrace.Outcome.OBSERVED, i, i, i, 0, 0, 0, 0, 0, 0);
+    var bounded = suffix.finalBatch();
+    require(bounded.events().size() == 64 && bounded.wire().get("unattached_retained").getAsInt() == 1
+        && !bounded.wire().get("complete").getAsBoolean(), "bounded final reply concealed an undelivered accepted suffix");
+
+    long now = 1_000_000_000L;
+    var boundedQueue = new ControllerInputQueue(now + 1_000_000_000L, now);
+    boundedQueue.bindTrace(trace(1));
+    for (int i = 1; i <= 4; i++) boundedQueue.admit(i, i, i, 1, now, 0, 0, input(false, false), now);
+    rejected(() -> boundedQueue.admit(5, 5, 5, 1, now, 0, 0, input(false, false), now),
+        "trace overflow changed the original four-frame bound");
+    require(boundedQueue.fenced() && boundedQueue.begin(now, 2) == null,
+        "trace overflow changed the original one-way input fence");
+    var age = new ControllerInputQueue(now + 1_000_000_000L, now);
+    var ageTrace = trace(8);
+    age.bindTrace(ageTrace);
+    age.admit(1, 1, 1, 1, now, 0, 0, input(false, false), now);
+    require(age.begin(now + ControllerInputQueue.FRAME_AGE_NS + 1, 2) == null, "tracing relaxed 150ms freshness");
+    require(ageTrace.batch(8).events().get(1).outcome() == NativePreparationTrace.Outcome.STALE,
+        "stale original branch was not traced");
+    var exactAge = new ControllerInputQueue(now + 1_000_000_000L, now);
+    exactAge.bindTrace(trace(8));
+    var exact = exactAge.admit(1, 1, 1, 1, now, 0, 0, input(false, false), now);
+    require(exactAge.begin(now + ControllerInputQueue.FRAME_AGE_NS, 2) == exact,
+        "tracing rejected the exact 150ms freshness endpoint");
+    var lease = new ControllerInputQueue(now + 1_000_000_000L, now);
+    var leaseTrace = trace(8);
+    lease.bindTrace(leaseTrace);
+    require(lease.begin(now + ControllerInputQueue.LEASE_NS, 2) == null && lease.fenced(),
+        "tracing relaxed 250ms lease");
+    require(field(leaseTrace.batch(8).events().get(0), "evaluated_mask") == NativePreparationTrace.EXPIRED,
+        "expired begin invented skipped applying/head/freshness decisions");
+    var stopped = new ControllerInputQueue(now + 1_000_000_000L, now);
+    stopped.bindTrace(trace(8));
+    stopped.retired("explicit_retirement", now);
+    require(stopped.begin(now, 2) == null && stopped.fenced(), "tracing revived a stopped owner");
+    var detached = new ControllerInputQueue(now + 1_000_000_000L, now);
+    var detachedTrace = trace(8);
+    detached.bindTrace(detachedTrace);
+    require(detached.begin(now, 1) == null, "empty diagnostic queue fabricated input");
+    detached.bindTrace(null);
+    require(detached.begin(now, 2) == null && !detached.fenced() && detachedTrace.seal(),
+        "passive unbinding changed input authority or failed to seal");
+    var detachedFinal = detachedTrace.finalBatch();
+    require(detachedFinal.events().size() == 1 && detachedFinal.counts().attempted() == 1,
+        "detached queue continued producing into final evidence");
+  }
+  private static void preparationTraceReadiness() {
+    var trace = trace(16);
+    var phase = new ControllerSamplePhase();
+    Object owner = new Object(), foreign = new Object();
+    phase.open(owner, 4);
+    phase.bindTrace(owner, trace);
+    require(!phase.ready(owner, 5, false) && !phase.ready(foreign, 5, true)
+        && !phase.ready(owner, 4, true) && phase.ready(owner, 5, true)
+        && phase.sampled(owner, 5, true) && !phase.ready(owner, 5, true),
+        "traced readiness consumed an opportunity or changed original sampling");
+    phase.retirementRequested(owner);
+    phase.revoke(owner);
+    require(!phase.ready(owner, 6, false) && !phase.ready(owner, 6, true)
+        && !phase.rejectionReady(owner), "trace bypassed Stop or its explicit reply barrier");
+    var batch = trace.batch(16);
+    var events = batch.events();
+    require(events.size() == 8 && field(events.get(0), "evaluated_mask") == 1
+        && events.get(0).outcome() == NativePreparationTrace.Outcome.NOT_RENDERED
+        && field(events.get(1), "evaluated_mask") == 15
+        && events.get(1).outcome() == NativePreparationTrace.Outcome.WRONG_OWNER
+        && field(events.get(2), "evaluated_mask") == 31
+        && events.get(2).outcome() == NativePreparationTrace.Outcome.NOT_NEW_TICK,
+        "readiness trace replayed a skipped owner/progress predicate");
+    require(field(events.get(3), "last_sampled_tick") == 4
+        && field(events.get(4), "last_sampled_tick") == 4
+        && (field(events.get(4), "state_mask") & NativePreparationTrace.FROM_SAMPLED) != 0
+        && field(events.get(5), "last_sampled_tick") == 5,
+        "sampled's production second readiness call was removed or conflated with the first");
+    require(field(events.get(6), "evaluated_mask") == 1
+        && field(events.get(7), "evaluated_mask") == 3
+        && events.get(7).outcome() == NativePreparationTrace.Outcome.RETIRED,
+        "retired readiness traced unexecuted owner/tick predicates");
+    phase.retirementReplied(owner);
+    require(phase.rejectionReady(owner), "passive trace withheld the genuine retirement reply");
+    require(trace.acknowledge(batch), "single-threaded readiness batch failed to acknowledge");
+    phase.bindTrace(owner, null);
+    require(!phase.ready(owner, 6, true), "passive trace unbinding revived a retired owner");
+    phase.open(foreign, 0);
+    require(phase.ready(foreign, 1, true) && trace.seal() && trace.finalBatch().counts().attempted() == 8,
+        "replacement owner inherited the previous trace identity");
   }
   private static void sampleRejectionAfterRetirement() {
     var phase = new ControllerSamplePhase();

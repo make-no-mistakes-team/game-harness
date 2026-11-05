@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import type { GameAction, PolicySpec } from "../src/shared/contracts.ts";
-import { diagnosticAuthorityFixture, minecraftTestAdapter, sha256 } from "./helpers/adapter-contract.ts";
+import { diagnosticAuthorityFixture, minecraftRunFixture, minecraftTestAdapter, sha256 } from "./helpers/adapter-contract.ts";
 import { programFingerprint } from "../src/server/program-validation.ts";
 import { createHash } from "node:crypto";
 import { projectRunOperator } from "../src/server/operator-state.ts";
@@ -191,24 +191,25 @@ test("connection epochs advance durably before any run exists and across restart
 });
 
 test("legacy connection epochs start above the largest retained run epoch", () => {
-  const { directory, store, run } = fixture();
-  store.saveRun({
-    ...run,
-    run_id: "older-high-epoch",
-    epoch: 73,
-    started_at: "2020-01-01T00:00:00.000Z",
-  });
-  store.saveRun({
-    ...run,
-    run_id: "newer-low-epoch",
-    epoch: 12,
-    started_at: "2030-01-01T00:00:00.000Z",
-  });
-  store.close();
-  stores.splice(stores.indexOf(store), 1);
+  const directory = mkdtempSync(path.join(tmpdir(), "gameharness-legacy-epochs-"));
+  directories.push(directory);
   const legacy = new Database(path.join(directory, "runs.sqlite"));
-  legacy.exec("DROP TABLE store_metadata; PRAGMA user_version=2;");
-  legacy.close();
+  try {
+    // The original four-table schema predates durable connection-epoch metadata.
+    // Create it directly instead of relabelling a current writer's schema.
+    legacy.exec(`
+      CREATE TABLE runs (run_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, payload TEXT NOT NULL) STRICT;
+      CREATE TABLE events (event_seq INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT,at TEXT NOT NULL,type TEXT NOT NULL,summary TEXT NOT NULL,details TEXT NOT NULL) STRICT;
+      CREATE TABLE actions (run_id TEXT NOT NULL,action_id TEXT NOT NULL,fingerprint TEXT NOT NULL,request TEXT NOT NULL,view TEXT NOT NULL,PRIMARY KEY(run_id,action_id)) STRICT;
+      CREATE TABLE policies (policy_id TEXT NOT NULL,run_id TEXT NOT NULL,version INTEGER NOT NULL,name TEXT NOT NULL,hash TEXT NOT NULL,metadata TEXT NOT NULL,PRIMARY KEY(policy_id,version),UNIQUE(run_id,name,version)) STRICT;
+      PRAGMA user_version=1;
+    `);
+    const insert = legacy.query("INSERT INTO runs(run_id,created_at,payload) VALUES(?,?,?)");
+    for (const run of [
+      minecraftRunFixture(adapter, { run_id: "older-high-epoch", epoch: 73, started_at: "2020-01-01T00:00:00.000Z" }),
+      minecraftRunFixture(adapter, { run_id: "newer-low-epoch", epoch: 12, started_at: "2030-01-01T00:00:00.000Z" }),
+    ]) insert.run(run.run_id, run.started_at!, JSON.stringify(run));
+  } finally { legacy.close(); }
   const reopened = new Store(directory);
   stores.push(reopened);
   expect(reopened.nextGameEpoch()).toBe(74);

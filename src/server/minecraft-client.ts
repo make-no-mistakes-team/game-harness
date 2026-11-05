@@ -13,10 +13,21 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { DATA_DIR } from "./config.ts";
 import { z } from "zod";
-import type { AdapterSchemaCatalog, MotorProfile, RuntimeAdapter } from "../shared/contracts.ts";
-import { readNativeArtifactContract, type NativeArtifactContract } from "./native-artifact.ts";
+import type {
+  AdapterSchemaCatalog,
+  MotorProfile,
+  RuntimeAdapter,
+} from "../shared/contracts.ts";
+import {
+  readNativeArtifactContract,
+  type NativeArtifactContract,
+} from "./native-artifact.ts";
 import { assertNativeContractFresh } from "./native-contract.ts";
-import { normalizeNativeEvaluation, type NativeEvaluationOptions } from "./native-evaluation.ts";
+import {
+  normalizeNativeEvaluation,
+  type NativeEvaluationOptions,
+} from "./native-evaluation.ts";
+import { javaProxyArguments } from "./java-network.ts";
 
 export const JAVA = process.env.JAVA_HOME
   ? path.resolve(process.env.JAVA_HOME, "bin", "java")
@@ -109,12 +120,17 @@ export async function prepareNativeMod(
     throw new Error(
       "Build the pinned GameHarness Fabric mod before preparing Minecraft.",
     );
-  const actual = prepared ?? await readNativeArtifactContract(artifact);
+  const actual = prepared ?? (await readNativeArtifactContract(artifact));
   if (!prepared) await assertNativeContractFresh(projectRoot, actual.resource);
   await mkdir(path.join(directory, "mods"), { recursive: true, mode: 0o700 });
   await copyFile(artifact, path.join(directory, "mods/gameharness-native.jar"));
-  const installedHash = createHash("sha256").update(await readFile(path.join(directory, "mods/gameharness-native.jar"))).digest("hex");
-  if (installedHash !== actual.artifact_sha256) throw new Error("Installed native artifact bytes differ from the prepared contract artifact");
+  const installedHash = createHash("sha256")
+    .update(await readFile(path.join(directory, "mods/gameharness-native.jar")))
+    .digest("hex");
+  if (installedHash !== actual.artifact_sha256)
+    throw new Error(
+      "Installed native artifact bytes differ from the prepared contract artifact",
+    );
   const api = path.join(directory, "mods/fabric-api.jar");
   if (!(await exists(api))) {
     const url = `https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/${FABRIC_API}/fabric-api-${FABRIC_API}.jar`;
@@ -136,6 +152,7 @@ export async function prepareFabricServer(
   signal?: AbortSignal,
 ) {
   signal?.throwIfAborted();
+  const proxyArguments = javaProxyArguments(process.env);
   await prepareNativeMod(projectRoot, directory, signal);
   const launcher = path.join(directory, "fabric-server-launch.jar");
   if (!(await exists(launcher))) {
@@ -155,6 +172,7 @@ export async function prepareFabricServer(
     const child = spawn(
       java,
       [
+        ...proxyArguments,
         "-jar",
         installer,
         "server",
@@ -207,7 +225,10 @@ export class MinecraftClient {
     private readonly projectRoot: string,
     options: NativeOptions = {},
   ) {
-    this.evaluation = normalizeNativeEvaluation(options.evaluation ?? null, process.env.GAMEHARNESS_NATIVE_PROOF === "1");
+    this.evaluation = normalizeNativeEvaluation(
+      options.evaluation ?? null,
+      process.env.GAMEHARNESS_NATIVE_PROOF === "1",
+    );
     this.dataDir = options.dataDir ?? DATA_DIR;
     this.directory = path.join(this.dataDir, "native-client");
     this.sessionFile = path.join(this.dataDir, "native-session.json");
@@ -413,8 +434,10 @@ export class MinecraftClient {
       `${config.host}:${config.port}`,
     ];
     signal.throwIfAborted();
-    const silentAudio = process.env.GAMEHARNESS_NATIVE_AUDIO === "silent" ||
-      (process.env.GAMEHARNESS_NATIVE_PROOF === "1" && process.env.GAMEHARNESS_NATIVE_AUDIO !== "audible");
+    const silentAudio =
+      process.env.GAMEHARNESS_NATIVE_AUDIO === "silent" ||
+      (process.env.GAMEHARNESS_NATIVE_PROOF === "1" &&
+        process.env.GAMEHARNESS_NATIVE_AUDIO !== "audible");
     const child = spawn(
       this.java,
       [

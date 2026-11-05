@@ -3,8 +3,24 @@ import { DEFAULT_SKILL_LIMITS } from "../shared/programs.ts";
 import { jsonSchema, lookaheadConfigSchema, namedProgramRefSchema, policySpecSchema, skillLimitsSchema } from "../shared/validation.ts";
 import { promotionDeclarationSchema } from "./experience.ts";
 import { residentActorLimitsSchema, residentAnalysisInputSchema, residentIntentSchema, residentStateSchema } from "../shared/resident.ts";
+import type { ImprovementFeedbackCursor, VersionComparisonCursor } from "../shared/execution-evidence.ts";
 
 export const programSelectorSchema = namedProgramRefSchema;
+export const improvementFeedbackCursorSchema = z.object({
+  schema_version: z.literal(2),
+  opportunity_change_seq: z.int().nonnegative(),
+  metric_change_seq: z.int().nonnegative(),
+  scope_hash: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+}).strict().refine(cursor => cursor.scope_hash !== null ||
+  cursor.opportunity_change_seq === 0 && cursor.metric_change_seq === 0,
+{ message: "An unbound feedback cursor must start at zero" }) satisfies z.ZodType<ImprovementFeedbackCursor>;
+export const versionComparisonCursorSchema = z.object({
+  schema_version: z.literal(2),
+  before_generation: z.int().nonnegative(),
+  after_generation: z.int().nonnegative(),
+  offset: z.int().nonnegative(),
+  scope_hash: z.string().regex(/^[a-f0-9]{64}$/),
+}).strict() satisfies z.ZodType<VersionComparisonCursor>;
 const cardSchema = z.object({
   purpose: z.string().trim().min(1).max(1000), applicability: z.string().trim().min(1).max(1000),
   method: z.string().trim().min(1).max(2000), reason: z.string().trim().min(1).max(1000), limitations: z.string().trim().min(1).max(1000),
@@ -52,15 +68,26 @@ export const programRunSchema = z.discriminatedUnion("operation", [
 ]);
 const page = { after: z.int().nonnegative().default(0), limit: z.int().min(1).max(100).default(25) };
 const executionSelection = { program: programSelectorSchema.optional(), target: z.enum(["current", "latest"]).default("latest") };
+const pinnedExecutionSelection = {
+  program: programSelectorSchema.required({ version: true }),
+  execution_ordinal: z.int().positive(), generation: z.int().nonnegative(),
+  after: z.object({ record_index: z.int().nonnegative(), chunk_index: z.int().nonnegative() }).strict()
+    .default({ record_index: 0, chunk_index: 0 }), limit: page.limit,
+};
 export const programInspectSchema = z.discriminatedUnion("view", [
   z.object({ view: z.literal("catalog"), ...page }).strict(),
   programSelectorSchema.extend({ view: z.literal("source") }).strict(),
   z.object({ view: z.literal("execution"), ...executionSelection }).strict(),
   z.object({ view: z.literal("history"), program: programSelectorSchema.optional(), ...page }).strict(),
   z.object({ view: z.literal("trace"), ...executionSelection, ...page }).strict(),
-  z.object({ view: z.literal("feedback"), program: programSelectorSchema.optional(), after: z.object({ opportunity_seq: z.int().nonnegative(), execution_seq: z.int().nonnegative() }).strict().default({ opportunity_seq: 0, execution_seq: 0 }), limit: page.limit }).strict(),
+  z.object({ view: z.literal("feedback"), program: programSelectorSchema.optional(),
+    after: improvementFeedbackCursorSchema.default({ schema_version: 2, opportunity_change_seq: 0, metric_change_seq: 0, scope_hash: null }),
+    limit: page.limit }).strict(),
   z.object({ view: z.literal("events"), ...page }).strict(),
-  z.object({ view: z.literal("comparison"), before: programSelectorSchema, after: programSelectorSchema, after_sample: page.after, limit: page.limit }).strict(),
+  z.object({ view: z.literal("comparison"), before: programSelectorSchema, after: programSelectorSchema,
+    after_sample: versionComparisonCursorSchema.nullable().default(null), limit: page.limit }).strict(),
+  z.object({ view: z.literal("metric"), ...pinnedExecutionSelection }).strict(),
+  z.object({ view: z.literal("evidence"), ...pinnedExecutionSelection }).strict(),
   z.object({ view: z.literal("planning") }).strict(),
   z.object({ view: z.literal("action"), ...executionSelection }).strict(),
 ]);

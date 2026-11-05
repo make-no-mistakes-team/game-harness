@@ -33,7 +33,7 @@ class Clock implements ResidentClock {
     this.time = at; this.timers.delete(next[0]); next[1].callback(); await settle();
   }
 }
-function harness(limits: Partial<ResidentLimits> = {}, trace?: ResidentControllerOptions["trace"]) {
+function harness(limits: Partial<ResidentLimits> = {}, trace?: ResidentControllerOptions["trace"], event?: ResidentControllerOptions["event"]) {
   const clock = new Clock(); let active = true, seq = 0, reads = 0, refuses = false, workerClosed = 0;
   let frameSeq: number | null = null, step: ResidentControllerOptions["worker"]["step"] = async (_frame, state) => decision(world(), Number(state) + 1);
   let close: () => Promise<void> = async () => {}; let revoke: () => Promise<void> = async () => {};
@@ -73,7 +73,7 @@ function harness(limits: Partial<ResidentLimits> = {}, trace?: ResidentControlle
     async open(deadline, onApplied, onEffect, hooks) { if (deadline !== 10000) throw new Error("root deadline moved");
       await opening;
       applied = onApplied; effect = onEffect; lifecycle = hooks; armLease(); return channel; }, current: () => active,
-    event() {}, effect: (input, event) => effects.push({ input, event }), changed: (snapshot, terminal) => changes.push({ snapshot, terminal }),
+    event: event ?? (() => {}), effect: (input, event) => effects.push({ input, event }), changed: (snapshot, terminal) => changes.push({ snapshot, terminal }),
     analysis: (...args) => analysis(...args) };
   const controller = new ResidentController(options);
   return { controller, clock, channel, options, sent, renewals, changes, effects,
@@ -241,6 +241,197 @@ test("observer exceptions retain an explicit diagnostic gap without changing nat
   await h.controller.stop("test");
 });
 
+for (const stage of ["result_validation", "renewal_start"] as const) {
+  test(`Stop from running-step ${stage} refuses renewal and publication until actual owned retirement`, async () => {
+    const result = deferred<ControllerStepResult>(), worker = deferred<void>(), native = deferred<void>();
+    const events: string[] = [];
+    let stopping: Promise<void> | undefined, stopped = false, unfencedAtStop = false;
+    let h: ReturnType<typeof harness>;
+    h = harness({}, event => {
+      if (event.stage !== stage || (event.stage === "result_validation" && event.outcome !== "accepted")) return;
+      unfencedAtStop = !h.channel.snapshot().fenced;
+      stopping = h.controller.stop("timing journal refused").then(() => { stopped = true; });
+    }, event => events.push(event.summary));
+    h.step(() => result.promise); h.close(() => worker.promise); h.revoke(() => native.promise);
+    await begin(h);
+    expect(h.controller.snapshot().counters.steps).toBe(1);
+    expect(h.renewals).toEqual([]);
+    try {
+      result.resolve({ ...decision(world({ selected_hotbar: 1 }), { goal: "must not publish" }),
+        events: [{ kind: "attention", urgency: "urgent", summary: "must not publish", details: null }] });
+      await settle();
+      if (!stopping) throw new Error("Running-step observer did not enter Stop");
+      expect(unfencedAtStop).toBe(true);
+      expect(h.controller.snapshot().status).toBe("stopping");
+      expect(h.renewals).toEqual([]);
+      expect(h.sent).toEqual([]);
+      expect(events).toEqual([]);
+      expect(h.controller.snapshot().state).toBe(0);
+      expect(h.controller.snapshot().processed_frame_seq).toBeNull();
+      expect(h.controller.snapshot().counters.events).toBe(0);
+      expect(h.changes.every(change => change.snapshot.state === 0)).toBe(true);
+      expect(stopped).toBe(false);
+      expect(h.channel.snapshot().retired).toBe(false);
+      worker.resolve(); await settle();
+      expect(stopped).toBe(false);
+      expect(h.controller.snapshot().cleanup.worker).toBe("closed");
+      expect(h.channel.snapshot().retired).toBe(false);
+      native.resolve(); await stopping;
+      expect(h.controller.snapshot().cleanup).toEqual({ worker: "closed", native: "retired" });
+      expect(h.controller.snapshot().status).toBe("stopped");
+      expect(h.workerClosed).toBe(1);
+    } finally {
+      result.resolve(decision()); worker.resolve(); native.resolve();
+      await h.controller.stop("test containment");
+    }
+  });
+}
+
+test("Stop from accepted completed-result trace cannot publish completed state or goal events", async () => {
+  const result = deferred<ControllerStepResult>(), native = deferred<void>(), events: string[] = [];
+  let stopping: Promise<void> | undefined, h: ReturnType<typeof harness>;
+  h = harness({}, event => {
+    if (event.stage === "result_validation" && event.outcome === "accepted")
+      stopping = h.controller.stop("timing journal refused completed result");
+  }, event => events.push(event.summary));
+  h.step(() => result.promise); h.revoke(() => native.promise);
+  await begin(h);
+  try {
+    result.resolve({ ...decision(world({ selected_hotbar: 1 }), { goal: "completed" }), status: "completed",
+      events: [{ kind: "attention", urgency: "urgent", summary: "goal completed", details: null }] });
+    await settle();
+    if (!stopping) throw new Error("Completed-result observer did not enter Stop");
+    expect(h.controller.snapshot().state).toBe(0);
+    expect(h.controller.snapshot().processed_frame_seq).toBeNull();
+    expect(h.controller.snapshot().events).toEqual([]);
+    expect(events).toEqual([]);
+    expect(h.renewals).toEqual([]); expect(h.sent).toEqual([]);
+    native.resolve(); await stopping;
+    expect(h.controller.snapshot().status).toBe("stopped");
+    expect(h.changes.some(change => change.snapshot.status === "completed" || change.snapshot.state !== 0)).toBe(false);
+    expect(h.controller.snapshot().cleanup).toEqual({ worker: "closed", native: "retired" });
+  } finally {
+    result.resolve(decision()); native.resolve();
+    await h.controller.stop("test containment");
+  }
+});
+
+for (const stage of ["sample_request", "worker_start"] as const) {
+  test(`Stop from ${stage} cannot start fresh sample or worker work`, async () => {
+    let stopping: Promise<void> | undefined, calls = 0, h: ReturnType<typeof harness>;
+    const trace: ResidentTraceEvent[] = [];
+    h = harness({}, event => {
+      trace.push(event);
+      if (event.stage === stage) stopping = h.controller.stop("timing journal refused before dispatch");
+    });
+    h.step(async () => { calls++; return decision(world({ selected_hotbar: 1 }), 7); });
+    try {
+      await begin(h);
+      if (!stopping) throw new Error("Pre-dispatch observer did not enter Stop");
+      await stopping;
+      expect(h.reads).toBe(stage === "sample_request" ? 0 : 1);
+      expect(calls).toBe(0);
+      expect(h.renewals).toEqual([]); expect(h.sent).toEqual([]);
+      expect(h.controller.snapshot().state).toBe(0);
+      expect(trace.some(event => event.stage === "worker_return")).toBe(false);
+      expect(h.controller.snapshot().cleanup).toEqual({ worker: "closed", native: "retired" });
+    } finally { await h.controller.stop("test containment"); }
+  });
+}
+
+test("Stop entered synchronously by sampling owns the actual pending sample drain", async () => {
+  const h = harness(), sample = deferred<Json>();
+  let stopping: Promise<void> | undefined, stopped = false, calls = 0;
+  h.channel.sample = () => {
+    stopping = h.controller.stop("native timing observer refused during sample").then(() => { stopped = true; });
+    return sample.promise;
+  };
+  h.step(async () => { calls++; return decision(); });
+  try {
+    await begin(h);
+    if (!stopping) throw new Error("Sample observer did not enter Stop");
+    expect(h.controller.snapshot().cleanup.worker).toBe("closed");
+    expect(h.channel.snapshot().retired).toBe(true);
+    expect(stopped).toBe(false);
+    expect(h.controller.snapshot().status).toBe("stopping");
+    sample.resolve(controllerFrameFixture() as unknown as Json);
+    await stopping;
+    expect(calls).toBe(0);
+    expect(h.renewals).toEqual([]); expect(h.sent).toEqual([]);
+    expect(h.controller.snapshot().state).toBe(0);
+    expect(h.controller.snapshot().cleanup).toEqual({ worker: "closed", native: "retired" });
+    expect(h.controller.snapshot().status).toBe("stopped");
+  } finally {
+    sample.resolve(controllerFrameFixture() as unknown as Json);
+    await h.controller.stop("test containment");
+  }
+});
+
+for (const status of ["running", "completed"] as const) {
+  test(`Stop from the first ${status} result event prevents later events and input publication`, async () => {
+    const events: string[] = [];
+    let stopping: Promise<void> | undefined, h: ReturnType<typeof harness>;
+    h = harness({}, undefined, event => {
+      events.push(event.summary);
+      stopping = h.controller.stop("goal-event observer stopped resident");
+    });
+    h.step(async () => ({ ...decision(world({ selected_hotbar: 1 }), 7), status,
+      events: [{ kind: "attention", urgency: "urgent", summary: "first accepted event", details: null },
+        { kind: "attention", urgency: "urgent", summary: "must not publish", details: null }] }));
+    try {
+      await begin(h);
+      if (!stopping) throw new Error("Event observer did not enter Stop");
+      await stopping;
+      expect(events).toEqual(["first accepted event"]);
+      expect(h.controller.snapshot().events.map(entry => entry.event.summary)).toEqual(["first accepted event"]);
+      expect(h.controller.snapshot().state).toBe(7);
+      expect(h.renewals.length).toBe(status === "running" ? 1 : 0);
+      expect(h.sent).toEqual([]);
+      expect(h.controller.snapshot().status).toBe("stopped");
+      expect(h.controller.snapshot().cleanup).toEqual({ worker: "closed", native: "retired" });
+    } finally { await h.controller.stop("test containment"); }
+  });
+}
+
+test("Stop from worker-return trace preserves the actual invoked worker outcome without publishing its result", async () => {
+  const result = deferred<ControllerStepResult>(), trace: ResidentTraceEvent[] = [];
+  let stopping: Promise<void> | undefined, h: ReturnType<typeof harness>;
+  h = harness({}, event => {
+    trace.push(event);
+    if (event.stage === "worker_return") stopping = h.controller.stop("timing journal refused returned work");
+  });
+  h.step(() => result.promise); await begin(h);
+  try {
+    result.resolve(decision(world({ selected_hotbar: 1 }), 9)); await settle();
+    if (!stopping) throw new Error("Worker-return observer did not enter Stop");
+    await stopping;
+    expect(trace.find(event => event.stage === "worker_return")).toMatchObject({ outcome: "returned", frame_seq: 1 });
+    expect(h.controller.snapshot().state).toBe(0);
+    expect(h.renewals).toEqual([]); expect(h.sent).toEqual([]);
+    expect(h.controller.snapshot().cleanup).toEqual({ worker: "closed", native: "retired" });
+  } finally { result.resolve(decision()); await h.controller.stop("test containment"); }
+});
+
+test("Stop from submission trace retains the already-dispatched sequence and later ACK attribution", async () => {
+  let stopping: Promise<void> | undefined, h: ReturnType<typeof harness>;
+  h = harness({}, event => {
+    if (event.stage === "submission_dispatch") stopping = h.controller.stop("timing journal refused dispatched work");
+  });
+  h.step(async () => decision(world({ selected_hotbar: 1 }), 8));
+  try {
+    await begin(h);
+    if (!stopping) throw new Error("Submission observer did not enter Stop");
+    await stopping;
+    expect(h.sent.length).toBe(1);
+    expect(h.controller.snapshot().counters.submissions).toBe(1);
+    h.ack(1, "9000000");
+    expect(h.controller.snapshot().last_input?.sequence).toBe(1);
+    expect(h.controller.snapshot().counters.applied_sequence).toBe(1);
+    expect(h.controller.snapshot().timings.input_age_ms.p50).toBe(9);
+    expect(h.controller.snapshot().state).toBe(8);
+  } finally { await h.controller.stop("test containment"); }
+});
+
 test("stale worker delivery is traced as discarded and never renews or submits", async () => {
   const trace: ResidentTraceEvent[] = [], h = harness({}, event => trace.push(event)), worker = deferred<ControllerStepResult>();
   h.step(() => worker.promise); await begin(h); h.controller.updateIntent({ changed: true }, 0);
@@ -362,6 +553,54 @@ test("root deadline remains admission-time bound even when native open is slow",
   readiness.resolve(); await starting; await settle();
   expect(h.controller.snapshot().cleanup.worker).toBe("closed"); expect(h.controller.snapshot().status).toBe("stopped");
   expect(h.controller.snapshot().counters.steps).toBe(0); expect(h.controller.snapshot().cleanup.native).toBe("retired");
+});
+
+test("Stop reentered during native open waits for the acquired channel and its actual retirement", async () => {
+  const h = harness(), acquisition = deferred<void>(), retirement = deferred<void>();
+  const open = h.options.open, changed = h.options.changed;
+  let stopped = false, nestedStopped = false, revokes = 0;
+  let stopping: Promise<void> | undefined, nestedStopping: Promise<void> | undefined;
+  h.revoke(async () => { revokes++; await retirement.promise; });
+  const controller = new ResidentController({
+    ...h.options,
+    changed(snapshot, terminal) {
+      changed(snapshot, terminal);
+      if (snapshot.status === "stopping" && !nestedStopping)
+        nestedStopping = controller.stop("synchronous phase observer fencing").then(() => { nestedStopped = true; });
+    },
+    async open(...args) {
+      stopping = controller.stop("synchronous admission observer failure").then(() => { stopped = true; });
+      await acquisition.promise;
+      return open(...args);
+    },
+  });
+  const starting = controller.start();
+  try {
+    await settle();
+    if (!stopping || !nestedStopping) throw new Error("Native acquisition and phase observers did not enter their owned boundaries");
+    expect(stopped).toBe(false);
+    expect(nestedStopped).toBe(false);
+    expect(h.channel.snapshot().retired).toBe(false);
+    acquisition.resolve();
+    await starting; await settle();
+    expect(revokes).toBe(1);
+    expect(stopped).toBe(false);
+    expect(nestedStopped).toBe(false);
+    expect(h.channel.snapshot().retired).toBe(false);
+    retirement.resolve();
+    await Promise.all([stopping, nestedStopping]);
+    expect(stopped).toBe(true);
+    expect(nestedStopped).toBe(true);
+    expect(h.channel.snapshot().retired).toBe(true);
+    expect(controller.snapshot().cleanup).toEqual({ worker: "closed", native: "retired" });
+    expect(h.reads).toBe(0);
+    expect(h.sent).toEqual([]);
+    expect(h.renewals).toEqual([]);
+  } finally {
+    acquisition.resolve(); retirement.resolve();
+    await starting;
+    await controller.stop("test containment");
+  }
 });
 
 test("stop remains pending until actual worker and native retirement barriers", async () => {

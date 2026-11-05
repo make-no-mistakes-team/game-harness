@@ -10,7 +10,6 @@ import type { ReactiveRuntime } from "./reactive.ts";
 import type { ExperienceLibrary } from "./experience.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { ProgramWorkspace } from "./program-workspace.ts";
-import { compareProgramVersionsPage } from "./program-comparison.ts";
 import type { programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, memorySchema, prepareNextSchema, reflexSchema } from "./program-interface.ts";
 import { programSelectorSchema } from "./program-interface.ts";
 import { skillRefSchema } from "../shared/validation.ts";
@@ -27,7 +26,7 @@ export class ProgramOperations {
     this.workspace = new ProgramWorkspace(store, run.run_id);
   }
 
-  async write(input: z.infer<typeof programWriteSchema>, callId: string, commit: () => void) {
+  async write(input: z.infer<typeof programWriteSchema>, callId: string, commit: () => void, signal?: AbortSignal) {
     const registration = this.registration(input, callId);
     const pinned = this.registered(input, callId);
     const previous = pinned ? pinned.parent_version === null ? null : this.store.namedSkill(this.run.run_id, input.name, pinned.parent_version)
@@ -50,14 +49,22 @@ export class ProgramOperations {
     if (input.reason && !previous) throw new RuntimeFault("invalid_request", "A candidate experiment reason requires an actual revision of an existing program");
     let opportunity: ImprovementOpportunity | null = null;
     if (input.reason && previous) {
-      opportunity = this.store.bindToolCall(this.run.run_id, this.phaseKey(callId, "feedback"),
-        { tool: "program_write", input } as unknown as Json, () => {
-          this.host.learning().feedback(this.run.run_id);
-          return this.workspace.latestOpportunity(previous) as unknown as Json;
-        }) as unknown as ImprovementOpportunity;
+      const feedbackKey = this.phaseKey(callId, "feedback"), identity = { tool: "program_write", input } as unknown as Json;
+      const bound = this.store.lookupToolCallBinding(this.run.run_id, feedbackKey, identity);
+      if (!bound.found) {
+        await this.host.learning().prepareFeedback(this.run.run_id, { signal, deadlineHostMs: performance.now() + 10_000 });
+        commit();
+        if (!pinned) assertParent();
+      }
+      opportunity = (bound.found ? bound.value : this.store.bindToolCall(this.run.run_id, feedbackKey, identity, () => {
+        commit();
+        if (!pinned) assertParent();
+        return this.workspace.latestOpportunity(previous) as unknown as Json;
+      })) as unknown as ImprovementOpportunity;
     }
     const program = pinned ?? await this.skills.register(this.run.run_id, { entry: input.entry, name: input.name, source: input.source, card: input.card, dependencies },
       () => { commit(); assertParent(); }, registration);
+    commit();
     let experiment: { decision: "revise"; measured: boolean; reason: string } | null = null;
     if (opportunity && input.reason) {
       const selected = opportunity, reason = input.reason;
@@ -105,7 +112,7 @@ export class ProgramOperations {
     return this.store.completedToolCall(this.run.run_id, this.phaseKey(callId, "outcome"), identity);
   }
 
-  async submit(input: z.infer<typeof programSubmitSchema>, callId: string, commit: () => void) {
+  async submit(input: z.infer<typeof programSubmitSchema>, callId: string, commit: () => void, signal?: AbortSignal) {
     const identity = { tool: "program_submit", input } as unknown as Json;
     const outcomeKey = this.phaseKey(callId, "outcome");
     const completed = this.submissionReceipt(callId, identity);
@@ -142,7 +149,7 @@ export class ProgramOperations {
     }
     let program: { name: string; version: number };
     try {
-      program = await this.write(writeInput, writeId, commit);
+      program = await this.write(writeInput, writeId, commit, signal);
     } catch (error) {
       const persisted = this.registered(writeInput, writeId);
       if (!persisted) throw error;
@@ -270,7 +277,7 @@ export class ProgramOperations {
       guard_status: staged.guard_status, activation: staged.activation, deadline_at: staged.deadline_at };
   }
 
-  async inspect(input: z.infer<typeof programInspectSchema>) {
+  async inspect(input: z.infer<typeof programInspectSchema>, signal?: AbortSignal, commit?: () => void) {
     const workspace = this.workspace;
     switch (input.view) {
       case "catalog": return workspace.catalog(input.after, input.limit);
@@ -279,56 +286,17 @@ export class ProgramOperations {
         const selected = workspace.execution(input.target, input.program);
         return workspace.executionView(selected ? this.skills.get(this.run.run_id, { execution_id: selected.execution_id }) : null);
       }
-      case "history": {
-        const program = input.program ? workspace.select(input.program) : null;
-        return workspace.page(this.host.evidence().filter((entry) => !program || entry.skill_id === program.skill_id && (input.program?.version === undefined || entry.version === program.version))
-          .map((entry) => workspace.historyView(entry)), input.after, input.limit);
-      }
-      case "trace": {
-        let execution = workspace.execution(input.target, input.program);
-        if (input.after > 0) {
-          const cursor = this.store.traceRecord(this.run.run_id, input.after);
-          if (!cursor) throw new RuntimeFault("invalid_request", "Trace cursor is not retained in this run");
-          const selected = input.program ? workspace.select(input.program) : null;
-          const id = selected ? cursor.execution_id ?? cursor.root_execution_id : cursor.root_execution_id ?? cursor.execution_id;
-          execution = id ? this.store.skillExecution(this.run.run_id, { execution_id: id }) : null;
-          if (selected) {
-            while (execution && (execution.skill_id !== selected.skill_id ||
-              input.program?.version !== undefined && execution.version !== input.program.version))
-              execution = execution.parent_execution_id ? this.store.skillExecution(this.run.run_id, { execution_id: execution.parent_execution_id }) : null;
-          }
-          if (!execution) throw new RuntimeFault("conflict", "Trace cursor belongs to a different named execution scope");
-        }
-        if (!execution) throw new RuntimeFault("not_found", "No matching execution is available");
-        const program = this.store.skill(this.run.run_id, execution);
-        return { ...workspace.traceView(this.store.tracePage(this.run.run_id, input.after, input.limit, execution.execution_id)),
-          program: { name: program.name, version: program.version } };
-      }
-      case "feedback": {
-        const selected = input.program ? workspace.select(input.program) : null;
-        const page = this.host.learning().readFeedback(this.run.run_id, input.after, input.limit);
-        const executions = new Set(this.store.allSkillExecutions(this.run.run_id).filter((execution) => !selected ||
-          execution.skill_id === selected.skill_id && (input.program?.version === undefined || execution.version === selected.version))
-          .map((execution) => execution.execution_id));
-        return workspace.feedbackView({ ...page,
-          opportunities: page.opportunities.filter((entry) => !selected || entry.version.skill_id === selected.skill_id &&
-            (input.program?.version === undefined || entry.version.version === selected.version)),
-          metrics: page.metrics.filter((entry) => executions.has(entry.execution_id)),
-        });
-      }
-      case "events": {
-        const candidates = this.store.eventsAfter(this.run.run_id, input.after, input.limit + 1);
-        const page = workspace.page(candidates.slice(0, input.limit), 0, input.limit);
-        const through = candidates[page.next_after - 1]?.event_seq ?? input.after;
-        return { records: page.records.map((event) => workspace.eventView(event)), next_after: through,
-          has_more: page.has_more || candidates.length > input.limit, omissions: page.omissions };
-      }
+      case "history":
+      case "trace":
+      case "feedback":
+      case "events":
+      case "metric":
+      case "evidence":
       case "comparison": {
-        if (input.after_sample > 0 && (input.before.version === undefined || input.after.version === undefined))
-          throw new RuntimeFault("conflict", "Continue comparison pages with the exact named versions returned on the first page");
-        const before = workspace.select(input.before), after = workspace.select(input.after);
-        const ref = (program: typeof before) => ({ run_id: this.run.run_id, skill_id: program.skill_id, version: program.version, hash: program.hash });
-        return workspace.comparisonView(compareProgramVersionsPage(this.store, ref(before), ref(after), { kind: "model", run_id: this.run.run_id, model_id: this.run.model_id }, input.after_sample, input.limit));
+        const result = await this.host.history().query({ kind: "model_inspect", run_id: this.run.run_id, input },
+          { signal, deadlineHostMs: performance.now() + 10_000 });
+        commit?.();
+        return result;
       }
       case "planning": return workspace.planningView(this.host.planning().projection());
       case "action": {
@@ -339,17 +307,23 @@ export class ProgramOperations {
     }
   }
 
-  review(input: z.infer<typeof programReviewSchema>, callId: string) {
-    this.host.learning().feedback(this.run.run_id);
-    const opportunityId = z.string().parse(this.store.bindToolCall(this.run.run_id, callId,
-      { tool: "program_review", input } as unknown as Json, () => {
-        const selected = this.workspace.select(input);
-        const outcome = input.version === undefined ? this.store.evidenceObjects<ImprovementOpportunity>(this.run.run_id, "opportunity")
-          .filter((entry) => entry.version.skill_id === selected.skill_id).at(-1) : null;
-        return this.workspace.latestOpportunity(outcome ? this.store.skill(this.run.run_id, outcome.version) : selected).opportunity_id;
-      }));
-    const opportunity = this.store.evidenceObjects<ImprovementOpportunity>(this.run.run_id, "opportunity")
-      .find((entry) => entry.opportunity_id === opportunityId);
+  async review(input: z.infer<typeof programReviewSchema>, callId: string, commit: () => void, signal?: AbortSignal) {
+    const identity = { tool: "program_review", input } as unknown as Json;
+    const bound = this.store.lookupToolCallBinding(this.run.run_id, callId, identity);
+    if (!bound.found) {
+      await this.host.learning().prepareFeedback(this.run.run_id, { signal, deadlineHostMs: performance.now() + 10_000 });
+      commit();
+    }
+    const opportunityId = z.string().parse(bound.found ? bound.value : this.store.bindToolCall(this.run.run_id, callId, identity, () => {
+      commit();
+      const selected = this.workspace.select(input);
+      const outcome = input.version === undefined ? this.store.latestOpportunityForFamily(this.run.run_id, selected.skill_id)
+        : this.store.latestOpportunityForVersion({ run_id: this.run.run_id, skill_id: selected.skill_id, version: selected.version, hash: selected.hash });
+      if (!outcome) throw new RuntimeFault("not_found", "No matching outcome feedback is available for this named version");
+      return outcome.opportunity_id;
+    }));
+    commit();
+    const opportunity = this.store.opportunity(this.run.run_id, opportunityId);
     if (!opportunity) throw new RuntimeFault("not_found", "Pinned outcome feedback is not retained");
     const program = this.store.skill(this.run.run_id, opportunity.version);
     const assessment = this.host.learning().resolve(this.run.run_id, opportunity.opportunity_id,

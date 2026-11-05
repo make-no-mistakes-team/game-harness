@@ -28,6 +28,37 @@
   to `local/`. A checkout-local Git exclusion does not sanitize archives or
   already tracked files.
 
+## Gameplay delivery
+
+The product goal is purposeful, human-like play driven by model-authored
+behavior. Infrastructure milestones support that outcome; they do not replace it.
+
+- Keep a small end-to-end gameplay slice on the critical path. Within authorized
+  budgets and working safety boundaries, exercise it with a real model early,
+  before expanding supporting work. Escalate conflicting prerequisites rather
+  than silently bypassing gates or indefinitely postponing product feedback.
+- Verify the control path the model actually uses. A smooth alternate driver,
+  synthetic fixture, special prompt or evaluator assistance does not establish
+  the ordinary default experience. Declare those differences.
+- Check natural control transitions on that actual path. A high-frequency
+  stream can still snap between targets; continuous activity can still be
+  ineffective. Neither is a substitute for the requested gameplay quality.
+- Lead status reports with the observed user-facing outcome and what remains
+  failed or unproven. Under a deadline, reserve time for a representative run,
+  inspection, user review and handoff; report a missing demonstration early
+  instead of substituting more infrastructure or an easier task.
+
+## Model-run authorization
+
+The user grants standing permission for development and gameplay runs with
+`gpt-6-luna`; no per-run approval is needed. Use it for early real-model feedback,
+not only for last-minute demonstrations. For more expensive SOTA models,
+normally ask first unless the current request already authorizes their use.
+
+This permission does not override safety, finite run budgets, frozen experiment
+protocols or manual-review pauses. It does not permit silently substituting
+Luna for a different model in a declared experiment.
+
 ## Manual gameplay review
 
 After changes likely to noticeably affect how the agent plays, show
@@ -35,12 +66,19 @@ representative gameplay and explicitly ask the user for manual visual review.
 Pause development, including subagent work, until the user gives feedback on
 that gameplay.
 
+Inspect the actual rendered behavior at original speed before presenting it.
+Playback completion and sampled screenshots are not a visual-quality verdict.
+If available tools cannot support that assessment, state the limitation rather
+than claiming a visual review.
+Identify obvious defects yourself; label failed footage honestly rather than
+presenting it as improved gameplay for the user to discover the problem.
+
 Small changes may be grouped to avoid frequent pauses. Briefly track gameplay
 changes since the last review and request another review when their combined
 effect could become noticeable to an ordinary user.
 
-Tests, metrics, and your own inspection are supporting evidence, not proof
-that gameplay improved. The user's visual judgment is decisive.
+Tests, metrics, code volume and your own inspection are supporting evidence,
+not proof that gameplay improved. The user's visual judgment is decisive.
 
 ## Tooling and dependencies
 

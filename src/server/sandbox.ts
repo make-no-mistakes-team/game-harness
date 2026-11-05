@@ -1096,6 +1096,17 @@ export class SandboxService {
     return { ...this.state };
   }
 
+  /** Trusted evaluator namespace for independent guardian/container closure probes.
+   * Not part of SandboxState or any generated-program capability. */
+  ownershipSnapshot() {
+    return {
+      owner: this.owner,
+      container_name_prefix: `gameharness-policy-${this.owner}-`,
+      closed: this.closed,
+      active_workers: this.workers.size,
+    };
+  }
+
   private change(status: SandboxState["status"], error: string | null): void {
     this.state = { status, image: IMAGE, error };
     this.onChange();

@@ -1,7 +1,9 @@
 import type { Json } from "../shared/contracts.ts";
 import { confirmedMinecraftGuiTransactions, historicalObservationV2Schema, minecraftObservationV3Schema, type MinecraftPlayer } from "../shared/minecraft.ts";
 import type { ObjectiveMetrics, PauseCategory, TraceRecord } from "../shared/execution-evidence.ts";
-import type { Store, StoredAction } from "./store.ts";
+import type { StoredAction } from "./store.ts";
+import type { StoreReadQueries } from "./store-read.ts";
+export type ObjectiveMetricsReadStore = Pick<StoreReadQueries, "allSkillExecutions" | "eventsAfter" | "getAction" | "tracePage">;
 export const evidenceObject = (value: unknown): Record<string, Json> | null => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, Json> : null;
 export function confirmedRemoval(action: StoredAction): boolean {
   const receipt = evidenceObject(action.view.result?.evidence);
@@ -36,7 +38,7 @@ export function receiptedInventoryDelta(action: StoredAction): Record<string, nu
   return result;
 }
 /** Descriptive observed samples, never a gameplay-quality or causal score. */
-export function objectiveMetrics(store: Store, runId: string): ObjectiveMetrics[] {
+export function objectiveMetrics(store: ObjectiveMetricsReadStore, runId: string): ObjectiveMetrics[] {
   const executions = store.allSkillExecutions(runId);
   const metrics = new Map<string, ObjectiveMetrics>();
   for (const execution of executions) metrics.set(execution.execution_id, {

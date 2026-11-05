@@ -310,9 +310,12 @@ export async function runNativeRecordingProof(args: readonly string[], project =
         } });
       if (runtimeLoad) await runtime!.control(runId, "start");
       if (sustainedRuntime && !resultContract) {
-        await until(() => evidence!.events(runId),
-          events => events.some(event => event.type === "scheduler.turn_finished"), fixture.caps.observationMs,
+        const turnQueryOptions = { signal: proofScope.signal, deadlineHostMs: Math.min(
+          entireSampleStarted + fixture.caps.totalMs, performance.now() + fixture.caps.observationMs) };
+        await until(() => evidence!.eventCount(runId, "scheduler.turn_finished", undefined, turnQueryOptions),
+          count => count > 0, fixture.caps.observationMs,
           "Initial tool-free SDK turn did not settle normally");
+        assertOpen();
         await runtime!.control(runId, "pause");
         mark("long_runtime_explicit_idle_after_settled_turn");
       }
@@ -388,10 +391,14 @@ export async function runNativeRecordingProof(args: readonly string[], project =
             requireProof(store!.allSkillExecutions(runId).length === 2, "Continuity replayed a completed execution");
             continuityChecked = true;
             if (sustainedRuntime) {
-              const previousTurns = evidence!.events(runId).filter(event => event.type === "scheduler.turn_finished").length;
+              const turnQueryOptions = { signal: proofScope.signal, deadlineHostMs: Math.min(
+                entireSampleStarted + fixture.caps.totalMs, performance.now() + fixture.caps.observationMs) };
+              const previousTurns = await evidence!.eventCount(runId, "scheduler.turn_finished", undefined, turnQueryOptions);
+              assertOpen();
               completeSyntheticRequest!();
-              await until(() => evidence!.events(runId).filter(event => event.type === "scheduler.turn_finished").length,
+              await until(() => evidence!.eventCount(runId, "scheduler.turn_finished", undefined, turnQueryOptions),
                 count => count > previousTurns, fixture.caps.observationMs, "Recovered synthetic SDK turn did not settle normally");
+              assertOpen();
               await runtime!.control(runId, "pause");
               mark("long_runtime_explicit_idle_after_settled_turn");
             }
@@ -414,7 +421,9 @@ export async function runNativeRecordingProof(args: readonly string[], project =
             entry.result_contract = { compact, overflow, evaluator_authored: true, provider_calls: 0 };
           }
           await runtime!.control(runId, "stop");
-          entry.runtime_journal = await evidence!.finalize(runId, { status: "stopped", reason: "declared_zero_provider_capture_completed" });
+          entry.runtime_journal = await evidence!.finalize(runId, { status: "stopped", reason: "declared_zero_provider_capture_completed" },
+            { signal: proofScope.signal, deadlineHostMs: entireSampleStarted + fixture.caps.totalMs });
+          assertOpen();
         }
       } else {
         mark("deliberate_wait_started"); await pause(1600); assertOpen(); mark("deliberate_wait_ended");
@@ -533,9 +542,22 @@ export async function runNativeRecordingProof(args: readonly string[], project =
       await runtime?.close();
       for (const agent of agents) { agent.abort(); await agent.waitForIdle(); }
       agents.clear();
-      if (runtimeRunId && evidence) fixture.report.runtime_journal = await evidence.finalize(runtimeRunId,
-        { status: "stopped", reason: failure ? "capture_failed" : "declared_zero_provider_capture_completed" });
-      await evidence?.close();
+      const evidenceErrors: unknown[] = [];
+      try {
+        if (runtimeRunId && evidence) fixture.report.runtime_journal = await evidence.finalize(runtimeRunId,
+          { status: "stopped", reason: failure ? "capture_failed" : "declared_zero_provider_capture_completed" },
+          { deadlineHostMs: cleanupDeadline });
+      } catch (error) { evidenceErrors.push(error); }
+      finally {
+        // Runtime does not own the observer's independent readonly child.
+        try { await evidence?.close({ deadlineHostMs: cleanupDeadline }); }
+        catch (error) { evidenceErrors.push(error); }
+      }
+      if (evidenceErrors.length) {
+        fixture.report.runtime_evidence_failures = evidenceErrors.map(error => error instanceof Error ? error.message : String(error));
+        failure ??= evidenceErrors.length === 1 ? evidenceErrors[0] :
+          new AggregateError(evidenceErrors, "Runtime evidence finalization and closure failed");
+      }
       await sandbox?.close();
       store?.close();
       if (recorder) {
@@ -549,7 +571,8 @@ export async function runNativeRecordingProof(args: readonly string[], project =
       // deadline was met. The SDK can force signal exit with this still false.
       await fixture.finish(failure);
       if (performance.now() >= cleanupDeadline) cleanup.deadline_reached = true;
-      cleanup.confirmed = !cleanup.deadline_reached && !fixture.report.recorder_report_persistence_failed && fixture.report.cleanup === true;
+      cleanup.confirmed = !cleanup.deadline_reached && !fixture.report.recorder_report_persistence_failed &&
+        evidenceErrors.length === 0 && fixture.report.cleanup === true;
       // finish captured its argument before awaiting native close. A signal
       // during that await must still defeat its restored passing case result.
       if (failure || !cleanup.confirmed) { fixture.report.pass = false; process.exitCode = 1; }

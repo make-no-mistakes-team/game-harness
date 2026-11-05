@@ -18,6 +18,9 @@ import { emptyRunUsage } from "../../src/server/usage.ts";
 import { Store, type StoredRun } from "../../src/server/store.ts";
 import { StudyLedger, type StudyRef, type StudySlot } from "../../src/evaluation/studies.ts";
 import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding } from "./adapter-contract.ts";
+import { PrivateJournal } from "../../src/evaluation/private-journal.ts";
+import * as historyModule from "../../src/server/history-reader.ts";
+import type { HistoryQuery, HistoryQueryOptions, HistoryResult } from "../../src/server/history-protocol.ts";
 
 // Only native ownership, Docker provisioning and the authenticated provider
 // factory are substituted. Runner, Runtime, Agent/gates/events, Store, verifier,
@@ -34,6 +37,7 @@ const cancelBeforeIterator = mode === "cancel-before-iterator";
 if (!rootArg) throw new Error("Missing isolated acceptance root");
 const root = rootArg;
 const imageFailure = mode === "image-before-first" || mode === "image-after-settled";
+const manifestFailure = mode === "manifest-failure" || mode === "manifest-failure-sigint";
 const ownedRuntimeRoot = studyMode ? join(root, "runtime/owned-slot") : join(root, "runtime");
 const evidenceDirectory = join(ownedRuntimeRoot, "evidence"), governanceRoot = join(root, "governance");
 const isolatedCheckout: IsolatedStudyCheckout | undefined = studyMode ? JSON.parse(ownershipArg ?? "null") : undefined;
@@ -45,9 +49,50 @@ await writeFile(join(authDirectory, "auth/gameharness.sqlite"), "synthetic facto
 process.env.GAMEHARNESS_DATA_DIR = join(root, "runtime");
 process.env.PATH = `${join(root, "bin")}:${process.env.PATH ?? ""}`;
 process.env.ACCEPTANCE_LIFECYCLE_RELEASE = join(root, "release-render");
-await writeFile(join(root, "bin/ffmpeg"), `#!${process.execPath}\nimport { writeFileSync, existsSync } from "node:fs";\nwriteFileSync("renderer.pid", String(process.pid));\nfunction complete() { writeFileSync("replay.mp4", "synthetic renderer, never visual proof"); process.exit(0); }\n${customFinish || mode === "complete-persistence" || imageFailure || mode === "request-cap" || mode === "cold-isolation" || planningStalled || requestCapNonGoal ? "complete();" : `setInterval(() => { if (process.ppid !== ${process.pid}) process.exit(1); if (existsSync(process.env.ACCEPTANCE_LIFECYCLE_RELEASE)) complete(); }, 5);`}\n`, { mode: 0o700 });
+await writeFile(join(root, "bin/ffmpeg"), `#!${process.execPath}\nimport { writeFileSync, existsSync } from "node:fs";\nwriteFileSync("renderer.pid", String(process.pid));\nfunction complete() { writeFileSync("replay.mp4", "synthetic renderer, never visual proof"); process.exit(0); }\n${customFinish || mode === "complete-persistence" || imageFailure || manifestFailure || mode === "request-cap" || mode === "cold-isolation" || planningStalled || requestCapNonGoal ? "complete();" : `setInterval(() => { if (process.ppid !== ${process.pid}) process.exit(1); if (existsSync(process.env.ACCEPTANCE_LIFECYCLE_RELEASE)) complete(); }, 5);`}\n`, { mode: 0o700 });
 
 let providerCalls = 0, starts = 0, nextWorlds = 0, sequence = 0, returned = false, lateWrites = 0;
+const readerCloseEntered = Promise.withResolvers<void>(), releaseReaderClose = Promise.withResolvers<void>();
+let observerHistory: historyModule.HistoryReader | undefined;
+let blockedManifest: string | undefined, manifestPersistenceError: string | undefined;
+let storeClosedAt: number | null = null, storeClosedWhileReaderHeld: boolean | null = null;
+let returnedWhileReaderHeld: boolean | null = null, readerAliveWhileHeld = false;
+let readerBeforeClose: historyModule.HistoryReaderSnapshot | undefined;
+let readerAtStoreClose: historyModule.HistoryReaderSnapshot | undefined;
+if (manifestFailure) {
+  mock.module(resolve(import.meta.dir, "../../src/server/history-reader.ts"), () => ({
+    ...historyModule,
+    HistoryReader: class extends historyModule.HistoryReader {
+      override query<Q extends HistoryQuery>(query: Q, options: HistoryQueryOptions): Promise<HistoryResult<Q>> {
+        if (query.kind === "export_page") observerHistory = this;
+        return super.query(query, options);
+      }
+      override async close(): Promise<void> {
+        if (this === observerHistory) {
+          readerBeforeClose = this.snapshot();
+          readerCloseEntered.resolve();
+          await releaseReaderClose.promise;
+        }
+        await super.close();
+      }
+    },
+  }));
+  const finalize = PrivateJournal.prototype.finalize;
+  PrivateJournal.prototype.finalize = async function (input) {
+    // A real filesystem collision rejects PrivateJournal's own manifest
+    // write, after its journal has drained. Do not substitute finalization.
+    blockedManifest = this.manifest;
+    await mkdir(join(evidenceDirectory, this.manifest), { recursive: true });
+    try { return await finalize.call(this, input); }
+    catch (error) { manifestPersistenceError = String(error); throw error; }
+  };
+  const closeStore = Store.prototype.close;
+  Store.prototype.close = function () {
+    storeClosedAt = performance.now();
+    readerAtStoreClose = observerHistory?.snapshot();
+    return closeStore.call(this);
+  };
+}
 let startupReservationSeen = false, authReservationSeen = false;
 let fixtureConditions: unknown = null;
 let studySelection: { studyId: string; manifestPath: string; slot: StudySlot } | undefined;
@@ -255,7 +300,7 @@ if (studyMode) {
 }
 const commonOptions = { allowNative: true, allowInference: true, authDirectory, projectRoot: project,
   paths: { runtimeRoot: join(root, "runtime"), reportsRoot: join(root, "reports"), governanceRoot },
-  scenario: mode === "complete-persistence" || imageFailure || studyMode ? "collect_wood" as const : "all" as const, modelId: model.id,
+  scenario: mode === "complete-persistence" || imageFailure || manifestFailure || studyMode ? "collect_wood" as const : "all" as const, modelId: model.id,
   purpose: "justified_acceptance", justification: "Isolated local synthetic cancellation integration; never a provider or gameplay proof",
   caps: { hostRequestAdmissions: mode === "request-cap" || requestCapNonGoal ? 1 : 30,
     totalMs: imageFailure ? 10000 : planningStalled ? 20000 : mode === "deadline" ? 3000 : 6000,
@@ -268,6 +313,17 @@ const acceptance = runAgentAcceptance(studySelection ? { ...commonOptions, study
     start_description: "Synthetic local native seam; no real game/provider" } } : {}),
     hypothesisId: "synthetic-lifecycle", platformEvidenceRevision: "synthetic-baseline" });
 const trigger = (async () => {
+  if (manifestFailure) {
+    await readerCloseEntered.promise;
+    if (mode === "manifest-failure-sigint") process.kill(process.pid, "SIGINT");
+    await Bun.sleep(25);
+    storeClosedWhileReaderHeld = storeClosedAt !== null;
+    returnedWhileReaderHeld = returned;
+    const pid = readerBeforeClose?.child?.pid;
+    if (pid) { try { process.kill(pid, 0); readerAliveWhileHeld = true; } catch {} }
+    releaseReaderClose.resolve();
+    return;
+  }
   if (earlyIterator) {
     await earlyIterator.entered.promise;
     returnedBeforeTransportRelease = returned;
@@ -329,13 +385,14 @@ async function observeResult() {
     } finally { studies.close(); }
   }
   const files = await readdir(evidenceDirectory);
-  const manifests = await Promise.all(files.filter(file => file.endsWith("-manifest.json")).map(async file => JSON.parse(await readFile(join(evidenceDirectory, file), "utf8"))));
+  const manifests = await Promise.all(files.filter(file => file.endsWith("-manifest.json") && file !== blockedManifest).map(async file => JSON.parse(await readFile(join(evidenceDirectory, file), "utf8"))));
   const journals = await Promise.all(files.filter(file => file.endsWith("-journal.jsonl")).map(file => readFile(join(evidenceDirectory, file), "utf8")));
   // Full journals grow during the real five-second idle continuation. Keep
   // fixture IPC on disk instead of one large stdout pipe write that can block
   // fixture completion after the runner has already returned and drained.
   await writeFile(join(root, "fixture-result.json"), JSON.stringify({ result, rendererStarted, rendererAlive, starts, nextWorlds, providerCalls,
     attempts, study, startupReservationSeen, authReservationSeen, fixtureConditions, coldIsolation, nextAdmission, report, manifests, journals, lateWrites, unhandled,
+    manifestPersistenceError, storeClosedAt, storeClosedWhileReaderHeld, returnedWhileReaderHeld, readerAliveWhileHeld, readerBeforeClose, readerAtStoreClose,
     originalIteratorReads, originalIteratorReturns, originalIteratorClosed, returnedBeforeTransportRelease, requestSignalAbortedBeforeRead,
     postReturnChanges, unchangedAfterReturn: postReturnChanges.length === 0 }), { mode: 0o600 });
   await Bun.write(Bun.stdout, "ACCEPTANCE_RESULT fixture-result.json\n");

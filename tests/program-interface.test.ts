@@ -23,11 +23,13 @@ import { SkillManager } from "../src/server/skills.ts";
 import { preserveRuntimeToolArguments, RuntimeTools, type RuntimeToolHost } from "../src/server/runtime-tools.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
+import { HistoryReader, HistoryReaderError } from "../src/server/history-reader.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { DiagnosticAgent, DIAGNOSTIC_PROGRAMS } from "../src/evaluation/diagnostic-agent.ts";
 import type { ReactiveRuntime } from "../src/server/reactive.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
+import { historySpec } from "./helpers/history-fixture.ts";
 
 const card = { purpose: "Exercise named program lifecycle", applicability: "Authorized neutral fixture", method: "Read and compose bounded results", reason: "Verify the consumer contract", limitations: "No gameplay efficacy claim" };
 const source = 'return {status:"completed",summary:"Neutral result",result:args};';
@@ -60,7 +62,9 @@ function fixture(runner?: SandboxService["runSkill"]) {
       name: "item", item_name: "stone", position: { x: 1, y: 64, z: 0 }, observed_at: "2026-10-22T00:00:00Z", current: true }],
     sounds: [{ category: "movement", direction: "here", distance: "near", observed_at: "2026-10-22T00:00:00Z" }],
     } });
-  const learning = new ImprovementLearning(store);
+  const history = new HistoryReader(store.readLocation());
+  const learning = new ImprovementLearning(store, history);
+  const prepareFeedback = () => learning.prepareFeedback(run.run_id, { deadlineHostMs: performance.now() + 10_000 });
   let planning: SpeculativePlanning;
   const manager = new SkillManager(store, { runSkill: async (...args) => {
     dispatches++;
@@ -92,7 +96,7 @@ function fixture(runner?: SandboxService["runSkill"]) {
     adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
     observe: async () => observation(), action: async () => { actions++; return { status: "succeeded", summary: "Neutral receipt", evidence: { effect_confirmed: true } }; },
     queryCapability: async id => id === "minecraft.visible_screen" ? null : [], cancelActions: async () => {}, recover: async () => { throw new Error("Fixture has no respawn"); },
-    changed: (outcome, execution) => { if (outcome && execution) { learning.feedback(run.run_id); planning.predecessorSettled(execution.execution_id); } },
+    changed: (outcome, execution) => { if (outcome && execution) planning.predecessorSettled(execution.execution_id); },
     unsafe: () => {}, prepareLookahead: (config) => planning.prepareOptIn(config),
   });
   const scope = () => ({ run_id: run.run_id, world_id: run.world_id, generation, session_id: run.session_id!, epoch: run.epoch,
@@ -109,7 +113,7 @@ function fixture(runner?: SandboxService["runSkill"]) {
   const toolHost: RuntimeToolHost = {
     run: () => run, assertCurrent: (expected) => { if (expected !== generation || !["running", "reviewing"].includes(run.status)) throw new RuntimeFault("stale_context", "Fixture tool authority revoked"); return run; },
     observe: async () => observation(), adapter: () => adapter, generation: () => generation, attentionAfter: () => {}, admitted: () => {},
-    evidence: () => [], planning: () => planning, learning: () => learning,
+    history: () => history, planning: () => planning, learning: () => learning,
     toolAuthority: () => { const revision = generation; const permit = planning.projection()?.planning_active ? planning.authority() : null;
       return () => { if (generation !== revision || !["running", "reviewing"].includes(run.status)) throw new RuntimeFault("stale_context", "Fixture turn fenced"); permit?.(); }; },
     finishTask: () => { run.status = "stopping"; generation++; planning.invalidate("cancelled"); manager.fence("Custom completion fenced"); store.saveRun(run); },
@@ -121,9 +125,9 @@ function fixture(runner?: SandboxService["runSkill"]) {
     if (!tool) throw new Error(`Tool not in actual catalog: ${name}`);
     return await tool.execute(callId, input);
   };
-  const close = async () => { planning.invalidate("cancelled"); await manager.closeAll("Fixture complete"); store.close(); rmSync(directory, { recursive: true, force: true }); };
+  const close = async () => { planning.invalidate("cancelled"); await manager.closeAll("Fixture complete"); await history.close(); store.close(); rmSync(directory, { recursive: true, force: true }); };
   resources.push(close);
-  return { directory, store, run, manager, planning, learning, catalog, tools, call, toolHost, actions: () => actions, dispatches: () => dispatches,
+  return { directory, store, run, manager, planning, learning, history, prepareFeedback, catalog, tools, call, toolHost, actions: () => actions, dispatches: () => dispatches,
     observation, setLife: (value: ObservationV3["life"]) => { life = value; },
     fence: () => { generation++; manager.fence("Fixture fenced"); planning.invalidate("cancelled"); },
     write: (name: string, body = source, options: Record<string, unknown> = {}, id?: string) => call("program_write", { name, source: body, card, dependencies: [], ...options }, id),
@@ -785,6 +789,107 @@ test("tool rejections preserve bounded trusted issues without exposing arbitrary
   expect(JSON.stringify(f.store.eventsAfter(f.run.run_id, 0, 500))).not.toContain("PRIVATE_HOST");
 });
 
+test("actual history inspection preserves named-domain fault codes at the model boundary", async () => {
+  const f = fixture();
+  const missing = { name: "not retained" };
+  const cases = [
+    { input: { view: "source", ...missing }, code: "not_found" },
+    { input: { view: "history", program: missing }, code: "not_found" },
+    { input: { view: "trace", program: missing }, code: "not_found" },
+    { input: { view: "feedback", program: missing }, code: "not_found" },
+    { input: { view: "comparison", before: missing, after: missing }, code: "not_found" },
+    { input: { view: "trace" }, code: "not_found" },
+    { input: { view: "trace", after: 1 }, code: "invalid_request" },
+  ];
+  for (const { input, code } of cases) {
+    const reply = await f.call("program_inspect", input);
+    expect(reply.isError).toBe(true);
+    expect(data(reply)).toMatchObject({ error: { code, retryable: false } });
+    if (input.view !== "source") {
+      const snapshot = f.history.snapshot(), child = snapshot.child!;
+      expect(snapshot).toMatchObject({ active: false, queued: 0 });
+      expect(child.exitObservedHostMs).toBeNumber();
+      expect(child.stdoutDrainObservedHostMs).toBeNumber();
+      expect(child.closedHostMs).toBeNumber();
+      expect(child.closedHostMs!).toBeGreaterThanOrEqual(child.exitObservedHostMs!);
+      expect(child.closedHostMs!).toBeGreaterThanOrEqual(child.stdoutDrainObservedHostMs!);
+    }
+  }
+  const rejected = f.store.eventsAfter(f.run.run_id, 0, 100).filter(event => event.type === "model.tool_rejected");
+  expect(rejected.map(event => (event.details as { error: { code: string } }).error.code)).toEqual(cases.map(entry => entry.code));
+  expect(f.store.eventsAfter(f.run.run_id, 0, 100).some(event => event.type === "model.tool_result")).toBe(false);
+});
+
+test("an active domain fault does not attribute its result to undispatched queued model inspection", async () => {
+  const f = fixture();
+  const missing = f.call("program_inspect", { view: "history", program: { name: "not retained" } });
+  const queued = f.call("program_inspect", { view: "events" });
+  expect(f.history.snapshot()).toMatchObject({ active: true, queued: 1 });
+  const [missingReply, queuedReply] = await Promise.all([missing, queued]);
+  expect(missingReply.isError).toBe(true);
+  expect(data(missingReply).error).toEqual({ code: "not_found", message: "Named program version not found", retryable: false });
+  expect(queuedReply.isError).toBe(true);
+  expect(data(queuedReply).error).toEqual({
+    code: "backend_unavailable", message: "The requested operation could not complete safely", retryable: false,
+  });
+  const child = f.history.snapshot().child!;
+  expect(child.exitObservedHostMs).toBeNumber();
+  expect(child.stdoutDrainObservedHostMs).toBeNumber();
+  expect(child.closedHostMs).toBeNumber();
+  expect(f.store.eventsAfter(f.run.run_id, 0, 100).some(event => event.type === "model.tool_result")).toBe(false);
+});
+
+test("actual oversized history workload retains its domain budget fault after the owned worker drains", async () => {
+  const f = fixture();
+  // Store-only metadata deliberately bypasses authoring limits to reproduce a
+  // retained oversized workload, not a sandbox execution or a fake IPC reply.
+  await f.store.registerSkill(f.run.run_id, historySpec(f.run, "oversized retained source", `/*${"x".repeat(70000)}*/ return null;`));
+  f.store.event(f.run.run_id, "fixture.record", "Actual retained history record");
+  const failure = await f.history.query({ kind: "benchmark_history", run_id: f.run.run_id, minimum_records: 1 },
+    { deadlineHostMs: performance.now() + 10_000 }).then(() => null, error => error);
+  expect(failure).toBeInstanceOf(RuntimeFault);
+  expect(failure).not.toBeInstanceOf(HistoryReaderError);
+  expect(failure).toMatchObject({ code: "budget_exceeded", message: "History result cannot fit the complete response frame byte budget" });
+  const child = f.history.snapshot().child!;
+  expect(child.exitObservedHostMs).toBeNumber();
+  expect(child.stdoutDrainObservedHostMs).toBeNumber();
+  expect(child.closedHostMs).toBeNumber();
+  expect(child.closedHostMs!).toBeGreaterThanOrEqual(child.exitObservedHostMs!);
+  expect(child.closedHostMs!).toBeGreaterThanOrEqual(child.stdoutDrainObservedHostMs!);
+});
+
+test("actual worker artifact and readonly-schema faults stay infrastructure failures without private paths", async () => {
+  const artifact = fixture();
+  await artifact.write("private artifact");
+  const program = artifact.store.namedSkill(artifact.run.run_id, "private artifact")!;
+  rmSync(join(artifact.store.readLocation().artifacts, `${program.hash}.js`));
+  const artifactFailure = await artifact.history.query({ kind: "model_inspect", run_id: artifact.run.run_id,
+    input: { view: "history", program: { name: "private artifact" }, after: 0, limit: 25 } },
+    { deadlineHostMs: performance.now() + 10_000 }).then(() => null, error => error);
+  expect(artifactFailure).toBeInstanceOf(HistoryReaderError);
+  expect(artifactFailure).not.toBeInstanceOf(RuntimeFault);
+  expect(artifactFailure).toMatchObject({ code: "ENOENT", message: "History worker query failed" });
+  expect(String(artifactFailure)).not.toContain(artifact.directory);
+  const schema = fixture();
+  const db = new Database(schema.store.readLocation().database);
+  try { db.exec("PRAGMA user_version=0"); } finally { db.close(); }
+  for (const [f, input] of [
+    [artifact, { view: "history", program: { name: "private artifact" } }],
+    [schema, { view: "events" }],
+  ] as const) {
+    const reply = await f.call("program_inspect", input);
+    expect(reply.isError).toBe(true);
+    expect(data(reply).error).toEqual({
+      code: "backend_unavailable", message: "The requested operation could not complete safely", retryable: false,
+    });
+    expect(JSON.stringify(reply)).not.toContain(f.directory);
+    expect(JSON.stringify(f.store.eventsAfter(f.run.run_id, 0, 100))).not.toContain(f.directory);
+    expect(f.history.snapshot().child!.exitObservedHostMs).toBeNumber();
+    expect(f.history.snapshot().child!.stdoutDrainObservedHostMs).toBeNumber();
+    expect(f.history.snapshot().child!.closedHostMs).toBeNumber();
+  }
+});
+
 test("latest validated selection pins once and never follows newer catalog revisions", async () => {
   const f = fixture();
   await f.write("reader"); await f.write("reader", source, { based_on: 1 });
@@ -949,7 +1054,7 @@ test("effect-free review links actual revisions to exact matching feedback and i
   await f.call("program_run", { operation: "start", name: "reviewed", args: null });
   const root = f.store.latestRootExecution(f.run.run_id)!;
   await waitClosed(f.store, f.run.run_id, root.execution_id);
-  f.learning.feedback(f.run.run_id);
+  await f.prepareFeedback();
   f.run.status = "reviewing";
   const before = JSON.stringify(f.store.evidenceObjects(f.run.run_id, "opportunity"));
   await f.call("program_inspect", { view: "feedback", program: { name: "reviewed", version: 1 } });
@@ -972,7 +1077,7 @@ for (const assessed of [false, true]) {
       await f.call("program_run", { operation: "start", name, version: 1, args: "outcome A" });
       const firstRoot = f.store.latestRootExecution(f.run.run_id)!;
       await waitClosed(f.store, f.run.run_id, firstRoot.execution_id);
-      f.learning.feedback(f.run.run_id);
+      await f.prepareFeedback();
       const original = f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")[0]!;
       if (assessed) await f.call("program_review", { name, version: 1, decision: "keep", reason: "Retain immutable assessment A" });
       const db = new Database(join(f.directory, "runs.sqlite"));
@@ -987,7 +1092,7 @@ for (const assessed of [false, true]) {
         await f.call("program_run", { operation: "start", name, version: 1, args: "outcome B" });
         const secondRoot = f.store.latestRootExecution(f.run.run_id)!;
         await waitClosed(f.store, f.run.run_id, secondRoot.execution_id);
-        f.learning.feedback(f.run.run_id);
+        await f.prepareFeedback();
         expect(secondRoot.execution_id).not.toBe(firstRoot.execution_id);
       }
       const opportunities = f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity");
@@ -995,6 +1100,7 @@ for (const assessed of [false, true]) {
         .filter(event => event.type === "learning.candidate_written" || event.type === "learning.resolved");
       expect(links.some(event => event.details !== null && typeof event.details === "object" && !Array.isArray(event.details) &&
         event.details.opportunity_id === original.opportunity_id)).toBe(true);
+      f.learning.prepareFeedback = async () => { throw new Error("Pinned feedback retry must not prepare or reselect outcomes"); };
       const replay = await f.write(name, source, options, id);
       expect(replay.isError).not.toBe(true);
       expect(data(replay)).toMatchObject({ name, version: 2, experiment: { decision: "revise", reason: options.reason } });
@@ -1007,6 +1113,147 @@ for (const assessed of [false, true]) {
     });
   }
 }
+
+for (const view of ["events", "metric", "evidence"] as const) {
+ for (const boundary of ["abort", "generation", "role"] as const) {
+  test(`${view} inspection preserves delivery authority across a ${boundary} change after the actual readonly result`, async () => {
+    const f = fixture(), controller = new AbortController();
+    const callId = `history-${view}-${boundary}`;
+    let input: Record<string, unknown> = { view };
+    if (view !== "events") {
+      const program = { name: "delivery authority", version: 1 };
+      await f.write(program.name);
+      await f.call("program_run", { operation: "start", ...program, args: null });
+      await waitClosed(f.store, f.run.run_id, f.store.latestRootExecution(f.run.run_id)!.execution_id);
+      await f.prepareFeedback();
+      const feedback = data(await f.call("program_inspect", { view: "feedback", program, limit: 100 }));
+      const update = feedback.metrics[0];
+      expect(update).toBeDefined();
+      input = { view, program, execution_ordinal: update.execution_ordinal, generation: update.generation };
+    }
+    const query = f.history.query.bind(f.history);
+    f.history.query = async (input, options) => {
+      expect(options.signal).toBe(controller.signal);
+      expect(options.deadlineHostMs).toBeGreaterThan(performance.now());
+      expect(options.deadlineHostMs).toBeLessThanOrEqual(performance.now() + 10_000);
+      const result = await query(input, options);
+      if (boundary === "abort") controller.abort();
+      else if (boundary === "generation") f.fence();
+      else { f.run.status = "reviewing"; }
+      return result;
+    };
+    const tool = f.tools().find(entry => entry.name === "program_inspect")!;
+    // Inspect remains admitted during review, so a role change alone is not
+    // revocation; generation/cancellation still fence actual read delivery.
+    const reply = await tool.execute(callId, input, controller.signal);
+    if (boundary === "role") expect(reply.isError).not.toBe(true);
+    else {
+      expect(data(reply).error.code).toBe("stale_context");
+      expect(f.store.eventsAfter(f.run.run_id, 0, 100).some(event => event.type === "model.tool_result" &&
+        event.details !== null && typeof event.details === "object" && !Array.isArray(event.details) && event.details.tool_call_id === callId)).toBe(false);
+    }
+  });
+ }
+}
+
+for (const name of ["program_write", "program_submit", "program_review"] as const) {
+  for (const boundary of ["abort", "generation"] as const) {
+    test(`${name} cannot bind feedback or persist a decision after ${boundary} during preparation`, async () => {
+      const f = fixture(), controller = new AbortController();
+      await f.write("preparation parent");
+      await f.call("program_run", { operation: "start", name: "preparation parent", args: null });
+      await waitClosed(f.store, f.run.run_id, f.store.latestRootExecution(f.run.run_id)!.execution_id);
+      const prepare = f.learning.prepareFeedback.bind(f.learning);
+      f.learning.prepareFeedback = async (runId, options) => {
+        expect(options.signal).toBe(controller.signal);
+        await prepare(runId, options);
+        if (boundary === "abort") controller.abort();
+        else f.fence();
+      };
+      const input = name === "program_review"
+        ? { name: "preparation parent", version: 1, decision: "keep", reason: "Assess the exact original outcome" }
+        : { name: "preparation parent", based_on: 1, source, reason: "A changed candidate needs fresh authority", ...(name === "program_submit" ? { args: null } : {}) };
+      const tool = f.tools().find(entry => entry.name === name)!;
+      const reply = await tool.execute(`cancel-${name}-${boundary}`, input, controller.signal);
+      expect(data(reply).error.code).toBe("stale_context");
+      expect(f.store.namedSkill(f.run.run_id, "preparation parent")!.version).toBe(1);
+      expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity").every(entry => entry.resolution === null)).toBe(true);
+      if (name === "program_review") expect(f.store.lookupToolCallBinding(f.run.run_id, `cancel-${name}-${boundary}`,
+        { tool: name, input: { name: "preparation parent", version: 1, decision: "keep", reason: "Assess the exact original outcome" } })).toEqual({ found: false });
+      expect(f.dispatches()).toBe(1);
+      expect(f.actions()).toBe(0);
+    });
+  }
+}
+
+test("feedback preparation rechecks the original source parent before binding or registration", async () => {
+  const f = fixture();
+  await f.write("racing parent");
+  await f.call("program_run", { operation: "start", name: "racing parent", args: null });
+  await waitClosed(f.store, f.run.run_id, f.store.latestRootExecution(f.run.run_id)!.execution_id);
+  const prepare = f.learning.prepareFeedback.bind(f.learning);
+  f.learning.prepareFeedback = async (runId, options) => {
+    await prepare(runId, options);
+    expect((await f.write("racing parent", source, { based_on: 1 })).isError).not.toBe(true);
+  };
+  const reply = await f.write("racing parent", source, { based_on: 1, reason: "Do not rebase the original parent" }, "racing-feedback");
+  expect(data(reply).error).toMatchObject({ code: "conflict", issues: [{ code: "stale_parent", latest_parent: { name: "racing parent", version: 2 } }] });
+  expect(f.store.namedSkill(f.run.run_id, "racing parent")!.version).toBe(2);
+  expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity").every(entry => entry.resolution === null)).toBe(true);
+});
+
+test("review lost acknowledgement retries its exact outcome without preparation after newer source and outcome", async () => {
+  const f = fixture();
+  await f.write("review retry");
+  const execute = async () => {
+    await f.call("program_run", { operation: "start", name: "review retry", version: 1, args: null });
+    const execution = f.store.latestRootExecution(f.run.run_id)!;
+    await waitClosed(f.store, f.run.run_id, execution.execution_id);
+    return execution;
+  };
+  const original = await execute();
+  const input = { name: "review retry", decision: "keep", reason: "Keep only the original exact outcome assessment" };
+  const db = new Database(join(f.directory, "runs.sqlite"));
+  try {
+    db.exec("CREATE TRIGGER lose_review_ack BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND NEW.object_key='review-lost-ack' BEGIN SELECT RAISE(ABORT,'lost review acknowledgement'); END;");
+    expect((await f.call("program_review", input, "review-lost-ack")).isError).toBe(true);
+    db.exec("DROP TRIGGER lose_review_ack;");
+    await execute();
+    await f.write("review retry", source, { based_on: 1 });
+    await f.prepareFeedback();
+    const opportunities = f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity");
+    expect(opportunities.find(entry => entry.execution_id === original.execution_id)!.resolution).toMatchObject({ decision: "keep" });
+    expect(opportunities.filter(entry => entry.resolution === null)).toHaveLength(1);
+    f.learning.prepareFeedback = async () => { throw new Error("Pinned review retry must not prepare feedback"); };
+    const retried = await f.call("program_review", input, "review-lost-ack");
+    expect(retried.isError).not.toBe(true);
+    expect(data(retried)).toMatchObject({ name: "review retry", version: 1, decision: "keep", reason: input.reason });
+    expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")).toEqual(opportunities);
+    expect(data(await f.call("program_review", { ...input, reason: "Changed retry identity" }, "review-lost-ack")).error.code).toBe("conflict");
+  } finally { db.close(); }
+});
+
+test("reasoned revision finds its exact outcome beyond 256 prepared opportunities", async () => {
+  const f = fixture();
+  await f.write("many outcomes");
+  await f.write("exact late parent");
+  const execute = async (name: string) => {
+    expect((await f.call("program_run", { operation: "start", name, version: 1, args: null })).isError).not.toBe(true);
+    const execution = f.store.latestRootExecution(f.run.run_id)!;
+    await waitClosed(f.store, f.run.run_id, execution.execution_id);
+    return execution;
+  };
+  for (let index = 0; index < 256; index++) await execute("many outcomes");
+  const exact = await execute("exact late parent");
+  const written = await f.write("exact late parent", source, { based_on: 1, reason: "Change this exact parent, not a presentation-capped outcome" });
+  expect(written.isError).not.toBe(true);
+  expect(data(written)).toMatchObject({ name: "exact late parent", version: 2, experiment: { decision: "revise" } });
+  expect(f.store.opportunityCount(f.run.run_id)).toBe(257);
+  const parent = f.store.namedSkill(f.run.run_id, "exact late parent", 1)!;
+  expect(f.store.latestOpportunityForVersion({ run_id: f.run.run_id, skill_id: parent.skill_id, version: parent.version, hash: parent.hash }))
+    .toMatchObject({ execution_id: exact.execution_id, resolution: { revision: { version: 2 } } });
+  expect(f.actions()).toBe(0);
+}, 30_000);
 
 for (const decision of ["insufficient_evidence", "keep"] as const) {
   test(`a failed outcome assessed ${decision} still permits an immutable direct-child repair with stable retries`, async () => {
@@ -1142,7 +1389,7 @@ test("named keep assessment is exact, immutable and never authorizes effects", a
   const root = f.store.latestRootExecution(f.run.run_id)!;
   await waitClosed(f.store, f.run.run_id, root.execution_id);
   await f.write("kept", source, { based_on: 1 });
-  f.learning.feedback(f.run.run_id); f.run.status = "reviewing";
+  await f.prepareFeedback(); f.run.status = "reviewing";
   const choice = { name: "kept", decision: "keep", reason: "Retain this version without an efficacy claim" };
   expect(data(await f.call("program_review", choice, "keep-call"))).toMatchObject({ name: "kept", version: 1, decision: "keep" });
   expect(data(await f.call("program_review", choice, "keep-call"))).toMatchObject({ decision: "keep" });
@@ -1209,18 +1456,25 @@ test("feedback names every exact version and distinguishes neutral executions wi
   await f.write("measured A", source, { based_on: 1 });
   await execute("measured A");
   await f.write("measured B"); await execute("measured B");
-  f.learning.feedback(f.run.run_id);
+  await f.prepareFeedback();
   const feedback = data(await f.call("program_inspect", { view: "feedback", limit: 100 }));
-  expect(feedback.metrics.map((metric: { name: string; version: number }) => ({ name: metric.name, version: metric.version }))).toEqual([
-    { name: "measured A", version: 1 }, { name: "measured A", version: 1 }, { name: "measured A", version: 2 }, { name: "measured B", version: 1 },
+  expect(feedback.metrics.map((update: { metric: { name: string; version: number } }) =>
+    `${update.metric.name}@${update.metric.version}`).sort()).toEqual([
+    "measured A@1", "measured A@1", "measured A@2", "measured B@1",
   ]);
-  const ordinals = feedback.metrics.map((metric: { execution_ordinal: number }) => metric.execution_ordinal);
+  const ordinals = feedback.metrics.map((update: { execution_ordinal: number }) => update.execution_ordinal);
   expect(ordinals.every((ordinal: unknown) => typeof ordinal === "number" && Number.isSafeInteger(ordinal) && ordinal > 0)).toBe(true);
   expect(new Set(ordinals).size).toBe(4);
-  expect(feedback.metrics.every((metric: { evidence_event_seqs: number[] }) => metric.evidence_event_seqs.length === 0)).toBe(true);
-  expect(feedback.metrics.every((metric: { execution_id?: string; root_execution_id?: string }) => metric.execution_id === undefined && metric.root_execution_id === undefined)).toBe(true);
+  expect(feedback.metrics.every((update: { metric: { evidence_event_seqs: number[] } }) => update.metric.evidence_event_seqs.length === 0)).toBe(true);
+  expect(feedback.metrics.every((update: { execution_id?: string; revision: number; generation: number; metric: { execution_id?: string; root_execution_id?: string } }) =>
+    update.execution_id === undefined && update.metric.execution_id === undefined && update.metric.root_execution_id === undefined &&
+    Number.isSafeInteger(update.revision) && update.revision > 0 && Number.isSafeInteger(update.generation) && update.generation > 0)).toBe(true);
+  expect(feedback.next_after).toMatchObject({ schema_version: 2, opportunity_change_seq: expect.any(Number), metric_change_seq: expect.any(Number) });
+  expect(feedback.next_after.scope_hash).toMatch(/^[a-f0-9]{64}$/);
+  expect(feedback.projection).toMatchObject({ generation: expect.any(Number), source_through: expect.any(Number),
+    source_available: expect.any(Number), has_pending: expect.any(Boolean) });
   const again = data(await f.call("program_inspect", { view: "feedback", limit: 100 }));
-  expect(again.metrics.map((metric: { execution_ordinal: number }) => metric.execution_ordinal)).toEqual(ordinals);
+  expect(again.metrics.map((update: { execution_ordinal: number }) => update.execution_ordinal)).toEqual(ordinals);
 });
 
 test("ordinary and speculative observe project housekeeping only and retain authorized gameplay data", async () => {
@@ -1297,6 +1551,147 @@ test("Codex wire preserves optional program arguments and discriminants through 
   expect(data(await f.call("program_write", revision, "wire-revision"))).toMatchObject({ version: 2, state: "validated" });
   expect(data(await f.call("program_write", revision, "wire-stale-revision")).error.code).toBe("conflict");
   expect(data(await f.call("program_inspect", { view: "catalog" })).records).toMatchObject([{ name: "wire neutral", version: 2 }]);
+  await f.prepareFeedback();
+  const selected = { name: "wire neutral", version: 1 };
+  const inspectSchema = wireSchema("program_inspect");
+  const firstFeedback = { view: "feedback", program: selected, limit: 1 };
+  expect(validateJsonSchemaValue(inspectSchema, firstFeedback).success).toBe(true);
+  const opportunityPage = data(await f.call("program_inspect", firstFeedback));
+  expect(opportunityPage.next_after.schema_version).toBe(2);
+  expect(opportunityPage.opportunities).toHaveLength(1);
+  expect(opportunityPage.metrics).toEqual([]);
+  expect(opportunityPage.has_more).toBe(true);
+  expect(opportunityPage.next_after.opportunity_change_seq).toBeGreaterThan(0);
+  expect(opportunityPage.next_after.metric_change_seq).toBe(0);
+  const metricPageInput = { ...firstFeedback, after: opportunityPage.next_after };
+  expect(validateJsonSchemaValue(inspectSchema, metricPageInput).success).toBe(true);
+  const feedback = data(await f.call("program_inspect", metricPageInput));
+  for (const page of [opportunityPage, feedback])
+    expect(page.opportunities.length + page.metrics.length + page.omitted.length).toBeLessThanOrEqual(1);
+  expect(feedback.opportunities).toEqual([]);
+  expect(feedback.metrics).toHaveLength(1);
+  expect(feedback.next_after.opportunity_change_seq).toBe(opportunityPage.next_after.opportunity_change_seq);
+  expect(feedback.next_after.metric_change_seq).toBeGreaterThan(opportunityPage.next_after.metric_change_seq);
+  expect(feedback.next_after.scope_hash).toBe(opportunityPage.next_after.scope_hash);
+  // Keep the actual continuation values intact: Bun's asymmetric object matcher
+  // can replace matched properties with matcher objects.
+  for (const value of [feedback.metrics[0].execution_ordinal, feedback.metrics[0].revision, feedback.metrics[0].generation]) {
+    expect(Number.isSafeInteger(value)).toBe(true);
+    expect(value).toBeGreaterThanOrEqual(0);
+  }
+  expect(feedback.metrics[0].execution_ordinal).toBeGreaterThan(0);
+  expect(feedback.metrics[0].metric.name).toBe(selected.name);
+  expect(feedback.metrics[0].metric.version).toBe(selected.version);
+  const feedbackContinuation = { ...firstFeedback, after: feedback.next_after };
+  expect(validateJsonSchemaValue(inspectSchema, feedbackContinuation).success).toBe(true);
+  const continuedFeedback = await f.call("program_inspect", feedbackContinuation);
+  expect(continuedFeedback.isError).not.toBe(true);
+  expect(data(continuedFeedback).next_after.scope_hash).toBe(feedback.next_after.scope_hash);
+  expect(data(await f.call("program_inspect", { ...feedbackContinuation, program: { ...selected, version: 2 } })).error.code).toBe("conflict");
+  const firstComparison = { view: "comparison", before: selected, after: selected, limit: 1 };
+  expect(validateJsonSchemaValue(inspectSchema, firstComparison).success).toBe(true);
+  const comparison = data(await f.call("program_inspect", firstComparison));
+  expect(comparison.has_more).toBe(true);
+  expect(comparison.next_after.schema_version).toBe(2);
+  expect(comparison.next_after.offset).toBe(1);
+  for (const generation of [comparison.next_after.before_generation, comparison.next_after.after_generation]) {
+    expect(Number.isSafeInteger(generation)).toBe(true);
+    expect(generation).toBeGreaterThanOrEqual(0);
+  }
+  expect(comparison.next_after.scope_hash).toMatch(/^[a-f0-9]{64}$/);
+  const comparisonContinuation = { ...firstComparison, after_sample: comparison.next_after };
+  expect(validateJsonSchemaValue(inspectSchema, comparisonContinuation)).toEqual({ success: true, issues: [] });
+  const programHelp = data(await f.call("help", { topic: "programs" }));
+  expect(validateJsonSchemaValue(programHelp.inspect, feedbackContinuation).success).toBe(true);
+  expect(validateJsonSchemaValue(programHelp.inspect, comparisonContinuation).success).toBe(true);
+  const nullComparisonCursor = { ...firstComparison, after_sample: null };
+  expect(validateJsonSchemaValue(inspectSchema, nullComparisonCursor).success).toBe(true);
+  expect(validateJsonSchemaValue(programHelp.inspect, nullComparisonCursor).success).toBe(true);
+  expect(data(await f.call("program_inspect", nullComparisonCursor)).next_after).toEqual(comparison.next_after);
+  const pinnedMetricInput = { view: "metric", program: selected,
+    execution_ordinal: feedback.metrics[0].execution_ordinal, generation: feedback.metrics[0].generation };
+  expect(validateJsonSchemaValue(inspectSchema, pinnedMetricInput).success).toBe(true);
+  expect(validateJsonSchemaValue(programHelp.inspect, pinnedMetricInput).success).toBe(true);
+  const pinnedMetric = data(await f.call("program_inspect", pinnedMetricInput));
+  expect(pinnedMetric.records).toEqual([feedback.metrics[0].metric]);
+  expect(pinnedMetric.has_more).toBe(false);
+  expect(JSON.stringify(pinnedMetric.records)).not.toContain(root.execution_id);
+  const metricContinuation = { ...pinnedMetricInput, after: pinnedMetric.next_after };
+  expect(validateJsonSchemaValue(inspectSchema, metricContinuation).success).toBe(true);
+  expect(data(await f.call("program_inspect", metricContinuation)).records).toEqual([]);
+  const mismatchedMetric = await f.call("program_inspect", { ...pinnedMetricInput, program: { ...selected, version: 2 } });
+  expect(mismatchedMetric.isError).toBe(true);
+  for (const input of [
+    { ...pinnedMetricInput, program: { name: selected.name } },
+    { ...pinnedMetricInput, execution_id: root.execution_id },
+    { ...pinnedMetricInput, generation: -1 },
+    { ...pinnedMetricInput, after: { record_index: 0, chunk_index: -1 } },
+  ]) {
+    expect(validateJsonSchemaValue(inspectSchema, input).success).toBe(false);
+    expect(data(await f.call("program_inspect", input)).error.code).toBe("invalid_request");
+  }
+  const pinnedEvidenceInput = { ...pinnedMetricInput, view: "evidence" };
+  expect(validateJsonSchemaValue(inspectSchema, pinnedEvidenceInput).success).toBe(true);
+  expect(validateJsonSchemaValue(programHelp.inspect, pinnedEvidenceInput).success).toBe(true);
+  const pinnedEvidence = data(await f.call("program_inspect", pinnedEvidenceInput));
+  expect(pinnedEvidence.records).toHaveLength(1);
+  expect(pinnedEvidence.records[0]).toMatchObject({ name: selected.name, version: selected.version,
+    execution_ordinal: pinnedEvidenceInput.execution_ordinal });
+  expect(pinnedEvidence.has_more).toBe(false);
+  expect(JSON.stringify(pinnedEvidence.records)).not.toContain(root.execution_id);
+  const evidenceContinuation = { ...pinnedEvidenceInput, after: pinnedEvidence.next_after };
+  expect(validateJsonSchemaValue(inspectSchema, evidenceContinuation).success).toBe(true);
+  expect(data(await f.call("program_inspect", evidenceContinuation)).records).toEqual([]);
+  expect((await f.call("program_inspect", { ...pinnedEvidenceInput, program: { ...selected, version: 2 } })).isError).toBe(true);
+  for (const input of [
+    { ...pinnedEvidenceInput, program: { name: selected.name } },
+    { ...pinnedEvidenceInput, execution_id: root.execution_id },
+    { ...pinnedEvidenceInput, generation: -1 },
+    { ...pinnedEvidenceInput, after: { record_index: 0, chunk_index: -1 } },
+  ]) {
+    expect(validateJsonSchemaValue(inspectSchema, input).success).toBe(false);
+    expect(data(await f.call("program_inspect", input)).error.code).toBe("invalid_request");
+  }
+  f.store.event(f.run.run_id, "fixture.next_generation", "New retained evidence after the first comparison page");
+  await f.prepareFeedback();
+  expect(data(await f.call("program_inspect", pinnedMetricInput)).records).toEqual(pinnedMetric.records);
+  expect(data(await f.call("program_inspect", pinnedEvidenceInput)).records).toEqual(pinnedEvidence.records);
+  const continuedReply = await f.call("program_inspect", comparisonContinuation);
+  const continued = data(continuedReply);
+  expect(continued.error).toBeUndefined();
+  expect(continuedReply.isError).not.toBe(true);
+  expect(continued.comparison.samples.before).toEqual([]);
+  expect(continued.comparison.samples.after).toHaveLength(1);
+  expect(continued.next_after.before_generation).toBe(comparison.next_after.before_generation);
+  expect(continued.next_after.after_generation).toBe(comparison.next_after.after_generation);
+  expect(continued.next_after.scope_hash).toBe(comparison.next_after.scope_hash);
+  expect(data(await f.call("program_inspect", { ...comparisonContinuation, after: { ...selected, version: 2 } })).error.code).toBe("conflict");
+  for (const cursor of [
+    { ...comparison.next_after, scope_hash: comparison.next_after.scope_hash === "0".repeat(64) ? "1".repeat(64) : "0".repeat(64) },
+    { ...comparison.next_after, before_generation: Number.MAX_SAFE_INTEGER },
+    { ...comparison.next_after, after_generation: Number.MAX_SAFE_INTEGER },
+  ]) {
+    const input = { ...firstComparison, after_sample: cursor };
+    expect(validateJsonSchemaValue(inspectSchema, input).success).toBe(true);
+    expect(validateJsonSchemaValue(programHelp.inspect, input).success).toBe(true);
+    expect(data(await f.call("program_inspect", input)).error.code).toBe("conflict");
+  }
+  const retiredCursors = [
+    { ...firstFeedback, after: { opportunity_seq: 0, execution_seq: 0 } },
+    { ...firstFeedback, after: { schema_version: 1, opportunity_change_seq: 0, metric_change_seq: 0, scope_hash: null } },
+    { ...firstComparison, after_sample: 1 },
+    { ...firstComparison, after_sample: { ...comparison.next_after, unexpected: true } },
+    { ...firstComparison, after_sample: { ...comparison.next_after, before_generation: -1 } },
+    { ...firstComparison, after_sample: { ...comparison.next_after, after_generation: -1 } },
+    { ...firstComparison, after_sample: { ...comparison.next_after, scope_hash: "invalid" } },
+  ];
+  for (const input of retiredCursors) {
+    expect(validateJsonSchemaValue(inspectSchema, input).success).toBe(false);
+    expect(validateJsonSchemaValue(programHelp.inspect, input).success).toBe(false);
+    expect(data(await f.call("program_inspect", input)).error.code).toBe("invalid_request");
+  }
+  expect(data(await f.call("program_inspect", { ...firstFeedback,
+    after: { schema_version: 2, opportunity_change_seq: 0, metric_change_seq: 1, scope_hash: null } })).error.code).toBe("invalid_request");
 });
 
 test("all default-bearing tool declarations accept omitted inputs without weakening closed shapes", async () => {

@@ -1,4 +1,5 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, vi } from "bun:test";
+import { ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +22,8 @@ import type { Database } from "bun:sqlite";
 import { DEFAULT_RESIDENT_LIMITS, type ControllerStepResult } from "../src/shared/resident.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { jsonSchema } from "../src/shared/primitives.ts";
+import type { HistoryReader } from "../src/server/history-reader.ts";
+import type { HistoryProjectionOwner } from "../src/server/history-projection-owner.ts";
 const resources: { runtime: Runtime; store: Store; directory: string }[] = [];
 afterEach(async () => {
   for (const resource of resources.splice(0)) {
@@ -28,6 +31,231 @@ afterEach(async () => {
     resource.store.close();
     rmSync(resource.directory, { recursive: true, force: true });
   }
+});
+
+for (const recoveryKind of ["scope", "death"] as const)
+test(`${recoveryKind} recovery drains the actual old feedback reader before admitting a fresh root outcome`, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gameharness-history-recovery-")), store = new Store(directory);
+  const adapter = minecraftTestAdapter(), observation = minecraftObservationFixture(adapter);
+  const state: GameState = { status: "connected", username: "Fixture", version: "1.21.4", world_id: observation.world_id,
+    epoch: observation.epoch, session_id: observation.session_id, life: observation.life,
+    binding: minecraftTestBinding(adapter), space: observation.space, screen: null, presentation: adapter.projectObservation(observation),
+    video: { status: "idle", width: 0, height: 0, fps: null, frames: 0, last_frame_at: null, error: null },
+    last_observation_at: observation.captured_at, error: null };
+  const listeners = new Set<(notice: BridgeNotice) => void>();
+  const barrier = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>(),
+    killRequested = Promise.withResolvers<void>(), freshOutcome = Promise.withResolvers<void>(),
+    freshPreparation = Promise.withResolvers<{ done: Promise<void> }>();
+  let pid: number | null = null, holdKill = true, creates = 0, prompts = 0;
+  const game: GameBridge = {
+    connect: async () => {}, disconnect: async () => {}, snapshot: () => state, observe: async () => observation,
+    execute: async () => { throw new Error("History recovery fixture cannot issue game input"); },
+    cancel: async () => {}, neutralize: async () => {},
+    emergencyStop: async () => { if (pid !== null) barrier.resolve(); },
+    adapter: () => adapter, subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
+  };
+  let tools: AgentTool[] = [];
+  const agent = { setBeforeModelCall: () => {}, setTools: (value: AgentTool[]) => { tools = value; },
+    subscribe: () => () => {}, replaceMessages: () => {}, abort: () => {}, waitForIdle: async () => {},
+    prompt: async () => {
+      prompts++;
+      if (prompts > 2) return;
+      if (prompts === 1) await tools.find(tool => tool.name === "program_write")!.execute("write-history-root", {
+        name: "History recovery root", source: 'return {status:"blocked",summary:"Bounded retained root outcome",result:null};',
+        dependencies: [], card: { purpose: "Retain root outcomes", applicability: "Fixture",
+          method: "Return a bounded outcome", reason: "History recovery regression", limitations: "No gameplay claim" },
+      });
+      await tools.find(tool => tool.name === "program_run")!.execute(`history-root-${prompts}`, {
+        operation: "start", name: "History recovery root", args: null, limits: { ...DEFAULT_SKILL_LIMITS },
+      });
+    } };
+  const auth = {
+    snapshot: () => ({ status: "ready", authenticated: true, provider: "openai-codex", account_label: null,
+      models: [{ id: "fixture-model", name: "Fixture", provider: "fixture", context_window: null }], login: null, error: null }),
+    createAgent: async (options: { tools: AgentTool[] }) => { creates++; tools = options.tools; return agent as unknown as Agent; },
+    releaseAgent: async () => {},
+  } as unknown as AuthManager;
+  const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }),
+    runSkill: async () => ({ status: "blocked", summary: "Bounded retained root outcome", result: null }),
+  } as unknown as SandboxService;
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  resources.push({ runtime, store, directory });
+  const reader = runtime.historyQueries as HistoryReader, query = reader.query.bind(reader), kill = ChildProcess.prototype.kill;
+  const owner = Reflect.get(runtime, "historyOwner") as HistoryProjectionOwner;
+  let retiredChild: ReturnType<HistoryReader["snapshot"]>["child"] = null;
+  let freshOutcomeThrough = Number.POSITIVE_INFINITY, freshExecutionId: string | null = null;
+  const killSpy = vi.spyOn(ChildProcess.prototype, "kill").mockImplementation(function (this: ChildProcess, signal) {
+    if (this.pid === pid && signal === "SIGKILL" && holdKill) { killRequested.resolve(); return true; }
+    return kill.call(this, signal);
+  });
+  const querySpy = vi.spyOn(reader, "query").mockImplementation((request, options) => {
+    const previousChild = reader.snapshot().child;
+    if (previousChild?.pid === pid && previousChild.closedHostMs !== null) retiredChild = previousChild;
+    const pending = query(request, options);
+    if (request.kind === "projection_batch" && pid === null &&
+      store.eventsAfter(request.run_id, 0, 500).some(event => event.type === "skill.closed")) {
+      pid = reader.snapshot().child!.pid!;
+      process.kill(pid, "SIGSTOP");
+      entered.resolve();
+    }
+    if (request.kind === "projection_batch" && outcomes === 2 && request.checkpoint.target_through >= freshOutcomeThrough) {
+      const current = Reflect.get(owner, "current") as { runId: string; done: Promise<void> } | null;
+      if (current?.runId === request.run_id) freshPreparation.resolve({ done: current.done });
+    }
+    return pending;
+  });
+  let outcomes = 0;
+  const unsubscribe = store.subscribe(event => {
+    if (event.type === "skill.closed" && ++outcomes === 2) {
+      freshOutcomeThrough = store.historySourceHighwater(event.run_id!);
+      freshExecutionId = (event.details as { execution_id: string }).execution_id;
+      freshOutcome.resolve();
+    }
+  });
+  try {
+    await runtime.initialize();
+    const run = await runtime.createRun({ task: "Retain outcomes across scope recovery", model_id: "fixture-model",
+      goal: adapter.goals.find(goal => goal.goal_id === "custom")! });
+    await runtime.control(run.run_id, "start");
+    await entered.promise;
+    if (recoveryKind === "scope") {
+      observation.life = { ...observation.life, life_id: observation.life.life_id + 1 };
+      state.life = observation.life;
+    } else {
+      observation.life = { ...observation.life, status: "dead", death: {
+        death_id: "history-recovery-death", message: "Fixture death", at: new Date().toISOString(),
+      } };
+      state.life = observation.life;
+    }
+    for (const listener of listeners) listener({ type: "game_event", data: null });
+    await barrier.promise;
+    await killRequested.promise;
+    expect(creates).toBe(1);
+    expect(prompts).toBe(1);
+    expect(reader.snapshot().child?.closedHostMs).toBeNull();
+    holdKill = false;
+    process.kill(pid!, "SIGKILL");
+    await freshOutcome.promise;
+    // The durable terminal event precedes worker settlement and its outcome callback.
+    // Join the actual fresh query admission, not an assumed number of microtasks.
+    await (await freshPreparation.promise).done;
+    expect(retiredChild).toMatchObject({ exitObservedHostMs: expect.any(Number),
+      stdoutDrainObservedHostMs: expect.any(Number), closedHostMs: expect.any(Number) });
+    expect(creates).toBe(2);
+    expect(store.opportunityCount(run.run_id)).toBe(2);
+    const published = store.historyProjectionGeneration(run.run_id)!;
+    expect(published.generation).toBeGreaterThan(0);
+    expect(published.source_through).toBeGreaterThanOrEqual(freshOutcomeThrough);
+    const feedback = await reader.query({ kind: "operator_feedback", run_id: run.run_id,
+      after: { schema_version: 2, opportunity_change_seq: 0, metric_change_seq: 0, scope_hash: null }, limit: 100 },
+    { deadlineHostMs: performance.now() + 10_000 });
+    const latestMetrics = new Map<string, Extract<(typeof feedback.metrics)[number], { kind: "replace" }>>();
+    for (const update of feedback.metrics) {
+      if (update.kind === "replace") latestMetrics.set(update.execution_id, update);
+      else latestMetrics.delete(update.execution_id);
+    }
+    expect(latestMetrics.size).toBe(2);
+    expect(latestMetrics.get(freshExecutionId!)?.metric.outcome).toBe("blocked");
+    expect([...latestMetrics.values()].every(({ metric }) => metric.outcome === "blocked")).toBe(true);
+    expect(runtime.snapshot()?.status).toBe("running");
+    expect(store.eventsAfter(run.run_id, 0, 500).some(event => event.type === "runtime.history_preparation_failed")).toBe(false);
+  } finally {
+    holdKill = false;
+    if (pid !== null) { try { process.kill(pid, "SIGKILL"); } catch {} }
+    unsubscribe();
+    querySpy.mockRestore();
+    killSpy.mockRestore();
+  }
+});
+
+test("Pause and Stop start native neutralization before readonly joins, resume reopens history, and close drains idle queries", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gameharness-history-lifecycle-")), store = new Store(directory);
+  const adapter = minecraftTestAdapter(), observation = minecraftObservationFixture(adapter);
+  const state: GameState = { status: "connected", username: "Fixture", version: "1.21.4", world_id: observation.world_id,
+    epoch: observation.epoch, session_id: observation.session_id, life: observation.life,
+    binding: minecraftTestBinding(adapter), space: observation.space, screen: null, presentation: adapter.projectObservation(observation),
+    video: { status: "idle", width: 0, height: 0, fps: null, frames: 0, last_frame_at: null, error: null },
+    last_observation_at: observation.captured_at, error: null };
+  let querySettled = true;
+  const nativeHistoryStates: boolean[] = [];
+  const game: GameBridge = {
+    connect: async () => {}, disconnect: async () => {}, snapshot: () => state, observe: async () => observation,
+    execute: async () => { throw new Error("Readonly lifecycle test has no effects"); },
+    cancel: async () => {}, neutralize: async () => {},
+    emergencyStop: async () => { nativeHistoryStates.push(querySettled); },
+    adapter: () => adapter, subscribe: () => () => {},
+  };
+  const agent = { setBeforeModelCall: () => {}, setTools: () => {}, subscribe: () => () => {},
+    replaceMessages: () => {}, abort: () => {}, waitForIdle: async () => {},
+    prompt: async () => { throw new Error("Lifecycle is stopped before strategic demand is delivered"); } };
+  const auth = {
+    snapshot: () => ({ status: "ready", authenticated: true, provider: "openai-codex", account_label: null,
+      models: [{ id: "fixture-model", name: "Fixture", provider: "fixture", context_window: null }], login: null, error: null }),
+    createAgent: async () => agent as unknown as Agent, releaseAgent: async () => {},
+  } as unknown as AuthManager;
+  const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }) } as unknown as SandboxService;
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  resources.push({ runtime, store, directory });
+  await runtime.initialize();
+  const run = await runtime.createRun({ task: "Keep history effect-free", model_id: "fixture-model",
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")! });
+  const reader = runtime.historyQueries as HistoryReader;
+  const owner = Reflect.get(runtime, "historyOwner") as HistoryProjectionOwner;
+  const queryHistory = reader.query.bind(reader);
+  const sourcePreparation = Promise.withResolvers<{ done: Promise<void> }>();
+  let sourceThrough = Number.POSITIVE_INFINITY;
+  const sourceSpy = vi.spyOn(reader, "query").mockImplementation((request, options) => {
+    if (request.kind === "projection_batch" && request.run_id === run.run_id &&
+      request.checkpoint.target_through >= sourceThrough) {
+      const current = Reflect.get(owner, "current") as { runId: string; done: Promise<void> } | null;
+      if (current?.runId === run.run_id) sourcePreparation.resolve({ done: current.done });
+    }
+    return queryHistory(request, options);
+  });
+  try {
+    const eventsBefore = store.eventsAfter(run.run_id, 0, 500);
+    const retained = store.getRun(run.run_id)!;
+    store.saveRun({ ...retained, task: "Eventless retained metadata change" });
+    sourceThrough = store.historySourceHighwater(run.run_id);
+    await (await sourcePreparation.promise).done;
+    expect(store.historyProjectionGeneration(run.run_id)!.source_through).toBeGreaterThanOrEqual(sourceThrough);
+    expect(store.eventsAfter(run.run_id, 0, 500)).toEqual(eventsBefore);
+    expect(runtime.snapshot()?.executions).toEqual([]);
+  } finally {
+    sourceSpy.mockRestore();
+  }
+  await runtime.control(run.run_id, "start");
+  for (const command of ["pause", "stop"] as const) {
+    querySettled = false;
+    const query = runtime.skillEvidence(run.run_id).then(
+      value => { querySettled = true; return { ok: true as const, value }; },
+      error => { querySettled = true; return { ok: false as const, error }; },
+    );
+    const before = nativeHistoryStates.length;
+    await runtime.control(run.run_id, command);
+    expect(nativeHistoryStates[before]).toBe(false);
+    expect(querySettled).toBe(true);
+    expect(await query).toMatchObject({ ok: false, error: { code: "cancelled" } });
+    expect(runtime.snapshot()?.status).toBe(command === "pause" ? "paused" : "stopped");
+    if (command === "pause") {
+      const page = await runtime.skillEvidence(run.run_id, 0, 1);
+      expect(page).toMatchObject({ records: [], next_after: 0, has_more: false, total: 0, omissions: [] });
+      await runtime.control(run.run_id, "resume");
+    }
+  }
+  // Operator queries can remain active even when gameplay is already stopped.
+  querySettled = false;
+  const idleQuery = runtime.skillEvidence(run.run_id).then(
+    () => { querySettled = true; return "resolved"; },
+    () => { querySettled = true; return "cancelled"; },
+  );
+  const closing = runtime.close();
+  expect(runtime.close()).toBe(closing);
+  await closing;
+  expect(querySettled).toBe(true);
+  expect(await idleQuery).toBe("cancelled");
+  expect(store.eventsAfter(run.run_id, 0, 500).some(event => event.type === "runtime.history_preparation_failed")).toBe(false);
+  await expect(runtime.skillEvidence(run.run_id)).rejects.toMatchObject({ code: "closed" });
 });
 
 for (const backlog of [0, 501]) test(`Runtime resident attention reaches the real serialized strategist across ${backlog} unread progress events while diagnostics do not replan`, async () => {

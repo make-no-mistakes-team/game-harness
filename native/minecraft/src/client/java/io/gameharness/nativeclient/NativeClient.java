@@ -81,7 +81,22 @@ public final class NativeClient implements ClientModInitializer {
   private VisibleScreen visibleInput;
   private VisibleScreenView visibleView;
   private ControllerBody controllerBody;
-  private record StreamOwner(NativeControllerContract.Grant grant, ControllerInputQueue queue) {}
+  private static final class OpportunityTrace {
+    final NativePreparationTrace.Identity identity;
+    final NativePreparationTrace collector;
+    volatile boolean retired;
+    boolean serializationUnavailablePending;
+    NativePreparationTrace.Batch pending, committed;
+    OpportunityTrace(NativePreparationTrace.Identity identity, NativePreparationTrace collector) {
+      this.identity = identity; this.collector = collector;
+    }
+  }
+  private record StreamOwner(NativeControllerContract.Grant grant, ControllerInputQueue queue, OpportunityTrace trace) {}
+  // Reply synchronization owns consumers/tokens; producers only use their owner's collector.
+  private final ArrayDeque<OpportunityTrace> opportunityTraces = new ArrayDeque<>(4);
+  private OpportunityTrace unavailableOpportunityTrace;
+  private volatile OpportunityTrace preparingOpportunityTrace;
+  private volatile boolean opportunityRetirementDraining;
   private record CapturedControllerFrame(long tick, long nanos, long life, EffectAuthority.Space space) {}
   private volatile StreamOwner streamOwner;
   private StreamInputs streamInputs;
@@ -502,6 +517,8 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void control() {
+    long lastDecodedRequestId = 0;
+    String lastDecodedMethod = "unavailable";
     try (Socket socket = controlSocket()) {
       if (evaluationConfig != null) actualControlSendBufferBytes = socket.getSendBufferSize();
       socket.setTcpNoDelay(true);
@@ -531,12 +548,25 @@ public final class NativeClient implements ClientModInitializer {
           request.addProperty("received_ns", receivedNanos);
           replyTiming.received(requestId, receivedNanos);
           String method = request.get("method").getAsString();
+          lastDecodedRequestId = requestId;
+          lastDecodedMethod = switch (method) {
+            case "controller_submit", "controller_heartbeat", "controller_sample", "controller_revoke",
+                "controller_open", "controller_frame", "cancel", "disconnect", "execute", "ping",
+                "diagnostics", "evaluation_arm_inventory_replacement", "evaluation_status",
+                "motor_profile", "observe", "visible_screen", "recipes" -> method;
+            default -> "unrecognized";
+          };
           if (method.equals("controller_submit") || method.equals("controller_heartbeat")) {
             receiveController(request);
             continue;
           }
           if (method.equals("controller_sample")) {
-            requireStream(request.getAsJsonObject("params"));
+            try {
+              requireStream(request.getAsJsonObject("params"));
+            } catch (RuntimeException error) {
+              reply(requestId, null, "Controller sample rejected: " + error.getMessage());
+              continue;
+            }
             if (!controllerSamplePending.compareAndSet(null, request)) throw new IOException("Controller sample lane occupied");
             client.execute(this::drainControllerSample);
             continue;
@@ -575,10 +605,12 @@ public final class NativeClient implements ClientModInitializer {
               queued.decrementAndGet(); reply(requestId, null, "Controller receive grant rejected: " + rejection.name()); continue;
             }
             ControllerInputQueue queue = new ControllerInputQueue(grant.taskDeadline(), receivedNanos);
+            OpportunityTrace trace = openOpportunityTrace(grant);
+            queue.bindTrace(trace.collector);
             synchronized (queue) {
               replyTiming.controllerLease(requestId, grant.owner(), grant.controllerGeneration(),
                   queue.opened(System.nanoTime()));
-              streamOwner = new StreamOwner(grant, queue);
+              streamOwner = new StreamOwner(grant, queue, trace);
             }
           }
           if (method.equals("execute")) {
@@ -604,7 +636,12 @@ public final class NativeClient implements ClientModInitializer {
           line.write(b);
         }
       }
-    } catch (Exception ignored) {
+    } catch (Exception error) {
+      // Never log packets, params, parser excerpts or stack traces. These are the
+      // last successfully decoded envelope fields, not a claim about the cause.
+      com.mojang.logging.LogUtils.getLogger().error(
+          "Native control failure: last_decoded_request_id={}, last_decoded_method={}, exception={}, message={}",
+          lastDecodedRequestId, lastDecodedMethod, error.getClass().getSimpleName(), safeControlFailureMessage(error));
     } finally {
       connected = false;
       fenceAuthority();
@@ -615,6 +652,24 @@ public final class NativeClient implements ClientModInitializer {
             client.scheduleStop();
           });
     }
+  }
+
+  private static String safeControlFailureMessage(Exception error) {
+    String message = error.getMessage();
+    if (message == null) return "unavailable";
+    // Only fixed infrastructure/contract messages are safe to retain. Arbitrary
+    // Gson/JDK messages can quote request contents, filesystem paths or endpoints.
+    return switch (message) {
+      case "Native hello writer unavailable", "Invalid request sequence", "Authority mismatch",
+          "Controller sample lane occupied", "Retirement slot already occupied", "Retirement queue already occupied",
+          "Ordinary pending bound reached", "Prior controller retirement has not drained", "Control frame exceeded bound",
+          "No admitted controller owner", "Controller owner or generation differs",
+          "Unknown or missing controller fields", "Native time must be a signed decimal string",
+          "Invalid native time digits", "Controller native cancellation generation differs",
+          "Controller clock uncertainty required", "Controller time/clock authority invalid",
+          "Read timed out", "Socket closed", "Connection reset", "Broken pipe" -> message;
+      default -> "redacted_nonconstant_message";
+    };
   }
 
   private void transportFailed() {
@@ -765,13 +820,60 @@ public final class NativeClient implements ClientModInitializer {
 
   private void prepareController() {
     StreamOwner stream = streamOwner;
-    if (stream == null || streamRetirement != null) return;
+    OpportunityTrace trace = stream == null || stream.trace().retired ? null : stream.trace();
+    preparingOpportunityTrace = trace;
+    opportunityHook(stream, NativePreparationTrace.Kind.PREPARE_ENTRY, NativePreparationTrace.Outcome.OBSERVED, 0, 0, 0, 0, 1);
+    try {
+      prepareController(stream);
+    } finally {
+      opportunityHook(stream, NativePreparationTrace.Kind.PREPARE_EXIT, NativePreparationTrace.Outcome.OBSERVED, 0, 0, 0, 0, 1);
+      preparingOpportunityTrace = null;
+      if (trace != null && trace.retired && trace.collector != null) trace.collector.seal();
+    }
+  }
+
+  private void prepareController(StreamOwner stream) {
+    long evaluated = 1, values = stream == null ? 0 : 1;
+    boolean available = stream != null;
+    if (available) {
+      evaluated |= 2;
+      available = streamRetirement == null;
+      if (available) values |= 2;
+    }
+    opportunityBranch(stream, available, evaluated, values, 10);
+    if (!available) return;
     long now = System.nanoTime();
-    if (!streamAuthorized() || stream.queue().expired(now)) {
+    evaluated = 1; values = 0;
+    boolean authorized = streamAuthorized();
+    if (authorized) values |= 1;
+    boolean permitted = authorized;
+    if (authorized) {
+      evaluated |= 2;
+      permitted = !stream.queue().expired(now);
+      if (permitted) values |= 2;
+    }
+    opportunityBranch(stream, permitted, evaluated, values, 11);
+    if (!permitted) {
       retireController(stream.queue().reason() == null ? "controller_scope_changed" : stream.queue().reason());
       return;
     }
-    if (streamInputs == null || visibleInput != null || client.isPaused() || client.getOverlay() != null) return;
+    evaluated = 1; values = 0;
+    permitted = streamInputs != null;
+    if (permitted) {
+      values |= 1; evaluated |= 2;
+      permitted = visibleInput == null;
+      if (permitted) {
+        values |= 2; evaluated |= 4;
+        permitted = !client.isPaused();
+        if (permitted) {
+          values |= 4; evaluated |= 8;
+          permitted = client.getOverlay() == null;
+          if (permitted) values |= 8;
+        }
+      }
+    }
+    opportunityBranch(stream, permitted, evaluated, values, 12);
+    if (!permitted) return;
     ControllerInputQueue.Entry entry = stream.queue().begin(now, clientTick);
     if (entry != null) {
       try {
@@ -809,9 +911,50 @@ public final class NativeClient implements ClientModInitializer {
         return;
       }
     }
-    if (stream.queue().fenced()) { retireController(stream.queue().reason()); return; }
-    if (streamInputs != null && client.currentScreen == null && streamInputs.prepare(clientTick))
+    boolean unfenced = !stream.queue().fenced();
+    opportunityBranch(stream, unfenced, 1, unfenced ? 1 : 0, 14);
+    if (!unfenced) { retireController(stream.queue().reason()); return; }
+    evaluated = 1; values = 0;
+    boolean prepared = streamInputs != null;
+    if (prepared) {
+      values |= 1; evaluated |= 2;
+      prepared = client.currentScreen == null;
+      if (prepared) {
+        values |= 2; evaluated |= 4;
+        prepared = streamInputs.prepare(clientTick);
+        if (prepared) values |= 4;
+      }
+    }
+    opportunityBranch(stream, prepared, evaluated, values, 13);
+    if (prepared)
       stream.queue().applicationStage(streamInputs.pending(), 1, System.nanoTime());
+  }
+
+  /**
+   * Stable hook legend; value bits are positive production conditions, meaningful only if evaluated.
+   * PREPARE 1 brackets the invocation (cursor before/after actual queue.begin; it never advances it).
+   * 10: owner present, no retirement; 11: streamAuthorized, not expired;
+   * 12: inputs present, no visible driver, not paused, no overlay;
+   * 14: queue not fenced; 13: inputs present, no screen, actual inputs.prepare returned true.
+   * SAMPLE 20: rendered, read present; 21: deadline live, same owner, no retirement,
+   * inputs present, streamAuthorized, not expired (in original short-circuit order);
+   * 23: actual residentReadCurrent returned true;
+   * 22: actual visibleView.ready (only after phase.ready); 24: original capture succeeded;
+   * 25: actual post-capture residentReadCurrent, actual phase.sampled; 26: caught capture failure.
+   * Sequence is unknown for these hooks; request identifies the actual pending read, and frame is
+   * unknown until the original capture succeeds. No helper evaluates any production predicate.
+   */
+  private void opportunityHook(StreamOwner stream, NativePreparationTrace.Kind kind,
+      NativePreparationTrace.Outcome outcome, long request, long frame, long evaluated, long values, int stage) {
+    if (stream == null || stream.trace().collector == null || stream.trace().retired && preparingOpportunityTrace != stream.trace()) return;
+    stream.trace().collector.hook(kind, outcome, System.nanoTime(), clientTick,
+        stream.queue().preparationOrdinal(), request, 0, frame, evaluated, values, stage);
+  }
+
+  private void opportunityBranch(StreamOwner stream, boolean passed, long evaluated, long values, int stage) {
+    opportunityHook(stream, NativePreparationTrace.Kind.PREPARE_BRANCH,
+        passed ? NativePreparationTrace.Outcome.PASSED : NativePreparationTrace.Outcome.BLOCKED,
+        0, 0, evaluated, values, stage);
   }
 
   private void completeControllerGui(ControllerInputQueue.Entry entry, int prefix, long now, boolean confirmed, String reason) {
@@ -896,9 +1039,20 @@ public final class NativeClient implements ClientModInitializer {
     unresolved.add(stream.grant().owner().operationId());
     ack.add("unresolved_operation_refs", unresolved);
     streamRetirement = ack;
-    ControllerInputQueue.Entry pending;
-    while ((pending = stream.queue().drain()) != null)
-      reply(pending.requestId(), null, "Controller retired without confirmed application: " + reason);
+    // Physical release and the genuine ACK timestamp above precede passive detachment.
+    stream.queue().bindTrace(null);
+    controllerSamples.bindTrace(stream, null);
+    stream.trace().retired = true;
+    if (stream.trace().collector != null && preparingOpportunityTrace != stream.trace())
+      stream.trace().collector.seal();
+    opportunityRetirementDraining = true;
+    try {
+      ControllerInputQueue.Entry pending;
+      while ((pending = stream.queue().drain()) != null)
+        reply(pending.requestId(), null, "Controller retired without confirmed application: " + reason);
+    } finally {
+      opportunityRetirementDraining = false;
+    }
   }
 
   private void recordControllerRetirement(long requestId) {
@@ -906,6 +1060,89 @@ public final class NativeClient implements ClientModInitializer {
     if (stream != null && streamRetirementLease != null)
       replyTiming.controllerLease(requestId, stream.grant().owner(), stream.grant().controllerGeneration(),
           streamRetirementLease);
+  }
+
+  private synchronized OpportunityTrace openOpportunityTrace(NativeControllerContract.Grant grant) {
+    NativePreparationTrace.Identity identity = new NativePreparationTrace.Identity(grant.owner().operationId(),
+        grant.controllerGeneration(), effectAuthority.nativeBootId(), grant.owner().scope().sourceHash());
+    OpportunityTrace trace = new OpportunityTrace(identity, opportunityTraces.size() < 4
+        ? new NativePreparationTrace(identity, 4096) : null);
+    if (trace.collector != null) opportunityTraces.addLast(trace);
+    else unavailableOpportunityTrace = trace;
+    return trace;
+  }
+
+  private static JsonObject unavailableOpportunityTrace(OpportunityTrace trace, String reason) {
+    JsonObject result = new JsonObject(), identity = new JsonObject();
+    result.addProperty("schema_version", 1);
+    identity.addProperty("owner_operation_id", trace.identity.ownerOperationId());
+    identity.addProperty("controller_generation", Long.toString(trace.identity.controllerGeneration()));
+    identity.addProperty("native_boot_id", trace.identity.nativeBootId());
+    identity.addProperty("source_hash", trace.identity.sourceHash());
+    result.add("identity", identity); result.add("counts", JsonNull.INSTANCE);
+    result.addProperty("final_batch", false); result.addProperty("complete", false);
+    result.add("events", new JsonArray()); result.addProperty("unavailable", reason);
+    return result;
+  }
+
+  // Called only while holding existing reply synchronization, never by a producer.
+  private OpportunityTrace attachOpportunityTrace(JsonObject timing) {
+    if (unavailableOpportunityTrace != null) {
+      OpportunityTrace trace = unavailableOpportunityTrace;
+      timing.add("controller_opportunities", unavailableOpportunityTrace(trace, "owner_capacity"));
+      return trace;
+    }
+    OpportunityTrace trace = opportunityTraces.peekFirst();
+    if (trace == null) return null;
+    if (trace.serializationUnavailablePending) {
+      timing.add("controller_opportunities", unavailableOpportunityTrace(trace, "serialization_oversize"));
+      return trace;
+    }
+    if (trace.committed != null) {
+      if (!trace.collector.acknowledge(trace.committed)) {
+        timing.add("controller_opportunities", unavailableOpportunityTrace(trace, "committed_prefix_pending"));
+        return trace;
+      }
+      boolean terminal = trace.committed.finalBatch()
+          && trace.committed.counts().retained() == trace.committed.events().size();
+      trace.committed = trace.pending = null;
+      if (terminal) {
+        opportunityTraces.removeFirst();
+        trace = opportunityTraces.peekFirst();
+        if (trace == null) return null;
+      }
+    }
+    // Keep the seal guard and batch choice on the same retirement observation.
+    boolean retired = trace.retired;
+    if (retired && preparingOpportunityTrace == trace) {
+      timing.add("controller_opportunities", unavailableOpportunityTrace(trace, "seal_pending"));
+      return trace;
+    }
+    if (trace.pending == null)
+      trace.pending = retired ? trace.collector.finalBatch()
+          : trace.collector.batch(NativePreparationTrace.MAX_BATCH);
+    timing.add("controller_opportunities", trace.pending == null
+        ? unavailableOpportunityTrace(trace, "busy") : trace.pending.wire());
+    return trace;
+  }
+
+  private void opportunityTraceCommitted(OpportunityTrace trace, boolean batchAttached) {
+    if (trace.serializationUnavailablePending) {
+      trace.serializationUnavailablePending = false;
+      return;
+    }
+    if (trace == unavailableOpportunityTrace) {
+      unavailableOpportunityTrace = null;
+      return;
+    }
+    if (!batchAttached || trace.pending == null) return;
+    trace.committed = trace.pending;
+    if (trace.collector.acknowledge(trace.committed)) {
+      boolean terminal = trace.committed.finalBatch()
+          && trace.committed.counts().retained() == trace.committed.events().size();
+      trace.committed = trace.pending = null;
+      if (terminal) opportunityTraces.removeFirst();
+    }
   }
 
   private synchronized void reply(long id, JsonElement data, String error) {
@@ -921,7 +1158,27 @@ public final class NativeClient implements ClientModInitializer {
     JsonObject timing = replyTiming.replied(id, effectAuthority.nativeBootId(), System.nanoTime(), clientTick);
     if (timing != null) response.add("timing", timing);
     Boolean stop = retirementReplies.remove(id);
-    if (stop == null) output.critical(response.toString());
+    if (stop == null) {
+      OpportunityTrace trace = timing == null || opportunityRetirementDraining
+          ? null : attachOpportunityTrace(timing);
+      String line = response.toString();
+      boolean batchAttached = trace != null && trace.pending != null && trace.committed == null
+          && !timing.getAsJsonObject("controller_opportunities").has("unavailable");
+      if (trace != null && utf8Length(line) >= 131072) {
+        timing.add("controller_opportunities", unavailableOpportunityTrace(trace, "serialization_oversize"));
+        batchAttached = false;
+        line = response.toString();
+        if (utf8Length(line) >= 131072) {
+          // Do not turn a valid original reply into a control failure for diagnostics.
+          // Preserve the unavailable marker for the next existing ordinary carrier too.
+          trace.serializationUnavailablePending = true;
+          timing.remove("controller_opportunities");
+          line = response.toString();
+        }
+      }
+      if (output.critical(line) && trace != null && timing.has("controller_opportunities"))
+        opportunityTraceCommitted(trace, batchAttached);
+    }
     else output.reserved(response.toString(), () -> {
       retirementReserved.set(false);
       if (stop) client.execute(client::scheduleStop);
@@ -1175,6 +1432,7 @@ public final class NativeClient implements ClientModInitializer {
           throw new IllegalStateException("Controller game-thread grant is unavailable");
         streamInputs = new StreamInputs(client); lastStreamAck = streamRetirement = null; streamRetirementLease = null;
         controllerSamples.open(stream, clientTick);
+        controllerSamples.bindTrace(stream, stream.trace().collector);
         JsonObject result = new JsonObject();
         result.add("owner", NativeControllerContract.owner(stream.grant().owner()));
         result.addProperty("controller_generation", stream.grant().controllerGeneration());
@@ -1913,8 +2171,28 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private boolean residentReadCurrent(ResidentRead read, long now) {
-    return now < read.deadline() && read.stream() == streamOwner && streamRetirement == null
-        && streamInputs != null && streamAuthorized() && !read.stream().queue().expired(now);
+    long evaluated = 1, values = 0;
+    boolean current = now < read.deadline();
+    if (current) {
+      values |= 1; evaluated |= 2; current = read.stream() == streamOwner;
+      if (current) {
+        values |= 2; evaluated |= 4; current = streamRetirement == null;
+        if (current) {
+          values |= 4; evaluated |= 8; current = streamInputs != null;
+          if (current) {
+            values |= 8; evaluated |= 16; current = streamAuthorized();
+            if (current) {
+              values |= 16; evaluated |= 32; current = !read.stream().queue().expired(now);
+              if (current) values |= 32;
+            }
+          }
+        }
+      }
+    }
+    opportunityHook(read.stream(), NativePreparationTrace.Kind.SAMPLE_RENDER,
+        current ? NativePreparationTrace.Outcome.PASSED : NativePreparationTrace.Outcome.BLOCKED,
+        read.id(), 0, evaluated, values, 21);
+    return current;
   }
 
   private void rejectResidentSample(ResidentRead read, String reason) {
@@ -1932,21 +2210,49 @@ public final class NativeClient implements ClientModInitializer {
 
   private void settleResidentSample(boolean rendered) {
     ResidentRead read = pendingResidentRead;
+    opportunityHook(read == null ? streamOwner : read.stream(), NativePreparationTrace.Kind.SAMPLE_RENDER,
+        NativePreparationTrace.Outcome.OBSERVED, read == null ? 0 : read.id(), 0,
+        3, (rendered ? 1 : 0) | (read == null ? 0 : 2), 20);
     if (read == null) return;
     if (!residentReadCurrent(read, System.nanoTime())) {
       rejectResidentSample(read, "Resident sample predates current authority or its deadline");
       return;
     }
-    if (!controllerSamples.ready(read.stream(), clientTick, rendered) || !visibleView.ready()) return;
+    if (!controllerSamples.ready(read.stream(), clientTick, rendered)) return;
+    boolean visibleReady = visibleView.ready();
+    opportunityHook(read.stream(), NativePreparationTrace.Kind.SAMPLE_RENDER,
+        visibleReady ? NativePreparationTrace.Outcome.PASSED : NativePreparationTrace.Outcome.BLOCKED,
+        read.id(), 0, 1, visibleReady ? 1 : 0, 22);
+    if (!visibleReady) return;
     try {
       incarnationSignals.viewReceived();
-      if (!residentReadCurrent(read, System.nanoTime())) throw new IllegalStateException("Resident sample scope changed");
+      boolean current = residentReadCurrent(read, System.nanoTime());
+      opportunityHook(read.stream(), NativePreparationTrace.Kind.SAMPLE_RENDER,
+          current ? NativePreparationTrace.Outcome.PASSED : NativePreparationTrace.Outcome.BLOCKED,
+          read.id(), 0, 1, current ? 1 : 0, 23);
+      if (!current) throw new IllegalStateException("Resident sample scope changed");
       JsonObject frame = controllerFrame(read.cursor());
-      if (!residentReadCurrent(read, System.nanoTime()) || !controllerSamples.sampled(read.stream(), clientTick, rendered))
+      long capturedFrame = controllerFrameSequence;
+      opportunityHook(read.stream(), NativePreparationTrace.Kind.SAMPLE_RENDER,
+          NativePreparationTrace.Outcome.PASSED, read.id(), capturedFrame, 1, 1, 24);
+      current = residentReadCurrent(read, System.nanoTime());
+      long evaluated = 1, values = current ? 1 : 0;
+      boolean sampled = false;
+      if (current) {
+        evaluated |= 2;
+        sampled = controllerSamples.sampled(read.stream(), clientTick, rendered);
+        if (sampled) values |= 2;
+      }
+      opportunityHook(read.stream(), NativePreparationTrace.Kind.SAMPLE_RENDER,
+          sampled ? NativePreparationTrace.Outcome.PASSED : NativePreparationTrace.Outcome.BLOCKED,
+          read.id(), capturedFrame, evaluated, values, 25);
+      if (!current || !sampled)
         throw new IllegalStateException("Resident sample authority changed during capture");
       pendingResidentRead = null;
       reply(read.id(), frame, null);
     } catch (RuntimeException error) {
+      opportunityHook(read.stream(), NativePreparationTrace.Kind.SAMPLE_RENDER,
+          NativePreparationTrace.Outcome.BLOCKED, read.id(), 0, 1, 1, 26);
       String reason = "Controller frame rejected: " + error.getMessage();
       if (!residentReadCurrent(read, System.nanoTime())) rejectResidentSample(read, reason);
       else { pendingResidentRead = null; reply(read.id(), null, reason); }

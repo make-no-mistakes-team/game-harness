@@ -19,7 +19,8 @@ import { recordCall, recordUsage } from "./usage.ts";
 import { ProviderUsageCollector } from "./provider-usage.ts";
 import type { SpeculativePlanning } from "./speculative-planning.ts";
 import { isToolAllowed } from "../shared/tool-policy.ts";
-import { ProgramWorkspace, type ModelReviewContext } from "./program-workspace.ts";
+import { ProgramWorkspace } from "./program-workspace.ts";
+import type { HistoryQueryOptions } from "./history-protocol.ts";
 import type { ModelObservation } from "./actor-frames.ts";
 import { StrategicContext } from "./strategic-context.ts";
 import { jsonSchema } from "../shared/validation.ts";
@@ -103,7 +104,7 @@ export interface StrategicHost {
   pause(message: string, cause: RunPauseCause): void;
   terminal(status: "completed" | "failed", message: string): void;
   speculation?(): SpeculativePlanning;
-  reviewContext?(): ModelReviewContext;
+  reviewContext?(options: HistoryQueryOptions): Promise<Json>;
   reviewComplete?(): void;
   requestAdmission?: StrategicRequestAdmission;
 }
@@ -209,6 +210,7 @@ export class StrategicPlanner {
   private turnCalls = 0;
   private turnToolCalls = 0;
   private turnDeadline = 0;
+  private historyController: AbortController | null = null;
   private providerFailed = false;
   private providerAborted = false;
   private gateReason: string | null = null;
@@ -668,6 +670,7 @@ export class StrategicPlanner {
   fence(): void {
     this.fenced = true;
     this.fenceRevision++;
+    this.historyController?.abort();
     clearTimeout(this.wakeTimer);
     clearTimeout(this.idleTimer);
     clearTimeout(this.attentionTimer);
@@ -789,12 +792,13 @@ export class StrategicPlanner {
     agent: Agent,
   ): Promise<void> {
     const review = run.status === "reviewing";
+    const phase = run.status, fenceRevision = this.fenceRevision;
     const reasons = [...this.wakeReasons];
     this.wakeReasons.clear();
     const lookaheadOnly = reasons.length > 0 && reasons.every((reason) => reason === "speculative_lookahead");
     if (!review && !lookaheadOnly) {
       const continuation = await this.host.speculation?.().pendingActivation();
-      if (!this.current(run, generation)) return;
+      if (!this.current(run, generation) || run.status !== phase || this.fenceRevision !== fenceRevision) return;
       if (continuation?.state === "activated" && reasons.every((reason) => reason === "planning_continuation"))
         return;
     }
@@ -843,6 +847,12 @@ export class StrategicPlanner {
     this.turnDeadline = speculative
         ? Date.now() + (this.host.speculation?.().remainingMs() ?? 0)
         : Date.now() + (review ? 30_000 : TURN_MS);
+    const historyController = new AbortController();
+    this.historyController = historyController;
+    const historyOptions: HistoryQueryOptions = {
+      signal: historyController.signal,
+      deadlineHostMs: performance.now() + Math.max(0, this.turnDeadline - Date.now()),
+    };
     run.model_status = "thinking";
     this.host.persist();
     this.store.event(
@@ -861,6 +871,7 @@ export class StrategicPlanner {
     const timer = setTimeout(
       () => {
         deadlineReached = true;
+        historyController.abort();
         this.store.event(
           run.run_id,
           "model.deadline",
@@ -878,11 +889,12 @@ export class StrategicPlanner {
     let attentionOmission: ResidentAttentionOmission | null = null;
     let projectedObservation: ObservationV3 | null = null;
     let prompting = false;
+    let preparingHistory = false;
     try {
       const selected = this.host.modelObservation ? await this.host.modelObservation() :
         { observation: await this.host.observe(), images: [], image_metadata: { mode: "disabled" } };
       const observation = selected.observation;
-      if (!this.current(run, generation)) return;
+      if (!this.current(run, generation) || run.status !== phase || this.fenceRevision !== fenceRevision) return;
       this.host.assertCurrent(generation, observation.epoch);
       if (observation.world_id !== run.world_id)
         throw new RuntimeFault(
@@ -951,7 +963,17 @@ export class StrategicPlanner {
         },
       );
       const action = this.host.action();
-      const reviewContext = review ? this.host.reviewContext?.() ?? null : null;
+      let reviewContext: Json = null;
+      if (review && this.host.reviewContext && !deadlineReached) {
+        preparingHistory = true;
+        reviewContext = await this.host.reviewContext(historyOptions);
+        if (!this.current(run, generation) || run.status !== phase ||
+          this.fenceRevision !== fenceRevision || historyController.signal.aborted && !deadlineReached) return;
+        this.host.assertCurrent(generation, observation.epoch);
+        if (Date.now() >= this.turnDeadline || performance.now() >= historyOptions.deadlineHostMs)
+          deadlineReached = true;
+        preparingHistory = false;
+      }
       if (!deadlineReached) {
         const selectedTools = this.host.tools(generation)
           .filter((tool) => isToolAllowed(speculative ? "speculative" : review ? "review" : "ordinary", tool.name));
@@ -974,7 +996,7 @@ export class StrategicPlanner {
             life: { status: observation.life.status, can_respawn: observation.life.can_respawn,
               death: observation.life.death ? { at: observation.life.death.at, message: observation.life.death.message } : null },
             speculative_plan: workspace.planningView(speculative),
-            improvement_review: reviewContext ? workspace.feedbackView(reviewContext) : null,
+            improvement_review: reviewContext,
             adapter_state: projection.state,
             adapter_metadata: projection.metadata,
             observation_summary: projection.summary,
@@ -1022,9 +1044,22 @@ export class StrategicPlanner {
         );
       }
       if (Date.now() >= this.turnDeadline) deadlineReached = true;
-    } catch {
+    } catch (error) {
+      if (!this.current(run, generation) || run.status !== phase || this.fenceRevision !== fenceRevision) return;
+      if (Date.now() >= this.turnDeadline || performance.now() >= historyOptions.deadlineHostMs)
+        deadlineReached = true;
       if (this.current(run, generation) && !deadlineReached) {
         if (prompting) this.providerFailed = true;
+        else if (preparingHistory) {
+          this.store.event(run.run_id, "runtime.history_query_failed",
+            "Readonly review history could not be prepared; no provider request was made", {
+              provider_request_made: false,
+              error: error instanceof Error ? error.message.slice(0, 500) : "History query failed",
+            });
+          run.model_status = "idle";
+          this.host.pause("Readonly review history preparation failed; inspect retained evidence before resuming", "preparation_failed");
+          return;
+        }
         else {
           this.store.event(run.run_id, "runtime.model_observation_failed", "Authorized model observation could not be prepared; no provider request was made", { provider_request_made: false });
           run.model_status = "idle";
@@ -1033,6 +1068,8 @@ export class StrategicPlanner {
       }
     } finally {
       clearTimeout(timer);
+      historyController.abort();
+      if (this.historyController === historyController) this.historyController = null;
       this.finishUnsettledRequest(run);
       if (speculative) this.host.speculation?.().finish(speculative.plan_id);
       if (speculative) agent.setTools(this.host.tools(generation)

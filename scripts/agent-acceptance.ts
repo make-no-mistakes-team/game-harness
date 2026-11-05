@@ -529,13 +529,17 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     const baselinePreserved = hostBaseline !== null && JSON.stringify(hostBaseline) === JSON.stringify(store!.getRun(run.run_id)?.baseline);
     if (!baselinePreserved) harnessFaults.push("run_inventory_baseline_changed");
     if (fixture.commands.length) harnessFaults.push("ordinary_world_privileged_commands_used");
-    const summary = evidence!.summary(run.run_id);
+    const historyOptions = { signal: scope.signal, deadlineHostMs: studyDeadlineAt === undefined ? started + caps.totalMs :
+      performance.now() + Math.max(0, studyDeadlineAt - Date.now()) };
+    const summary = await evidence!.summary(run.run_id, historyOptions);
+    assertOpen();
     if (studyAdmissionFault) harnessFaults.push(studyAdmissionFault);
     harnessFaults.push(...summary.confirmed_harness_faults);
     const actualRun = runtime.getRun(run.run_id);
-    const ordinaryPlanningFailure = actualRun?.status === "failed" && evidence!.events(run.run_id).some(event => event.type === "scheduler.planning_stalled");
-    const ordinaryVerifierFailure = actualRun?.status === "failed" && evidence!.events(run.run_id).some(event => event.type === "goal.verification" &&
-      event.details !== null && typeof event.details === "object" && !Array.isArray(event.details) && event.details.status === "failed");
+    const ordinaryPlanningFailure = actualRun?.status === "failed" && await evidence!.eventCount(run.run_id, "scheduler.planning_stalled", undefined, historyOptions) > 0;
+    assertOpen();
+    const ordinaryVerifierFailure = actualRun?.status === "failed" && await evidence!.eventCount(run.run_id, "goal.verification", "failed", historyOptions) > 0;
+    assertOpen();
     const unclassifiedRuntimeFailure = actualRun?.status === "failed" && !ordinaryPlanningFailure && !ordinaryVerifierFailure && !summary.provider_error && harnessFaults.length === 0;
     const connected = fixture.bridge.snapshot().status === "connected" && fixture.bridge.snapshot().error === null;
     if (!connected) harnessFaults.push("native_session_unavailable");
@@ -556,7 +560,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     catch { harnessFaults.push("offline_replay_render_failed"); }
     assertOpen();
     const journal = await evidence!.finalize(run.run_id, { status: caseFailure ? "failed" : "finished",
-      reason: caseFailure ? "case_failure" : String(report.last_stop_reason ?? "case_ended") });
+      reason: caseFailure ? "case_failure" : String(report.last_stop_reason ?? "case_ended") }, historyOptions);
     assertOpen();
     if (!journal.evidence_complete) harnessFaults.push("private_model_evidence_incomplete");
     const outcome = classifyEvaluation({ inferenceAdmitted: usage.admissions > 0,
@@ -575,12 +579,12 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       host_baseline_preserved: baselinePreserved, runtime_status: actualRun?.status, usage, actions: summary.actions,
       wait_coverage: waitCoverage({ start_ms: caseStart, end_ms: caseEnd, clock_id: clockId }, evidence!.intervals(run.run_id, caseEnd)),
       omissions: summary.omissions, failure: caseFailure ? reason(caseFailure) : null,
-      evidence: await evidence!.save(run.run_id),
+      evidence: await evidence!.save(run.run_id, historyOptions),
       evidence_profile: evidenceProfile,
       private_journal: journal, recording: { directory: recordingDirectory, manifest: "recording-manifest.json", replay,
         replay_inspection: "Parent must inspect offline replay; render success is not visual inspection." },
       completion_claim: scenario.verifier ? "registered_independent_verifier" :
-        evidence!.events(run.run_id).some(event => event.type === "task.completion_reported")
+        await evidence!.eventCount(run.run_id, "task.completion_reported", undefined, historyOptions) > 0
           ? "model_reported_unverified" : "custom_not_completed_unverified",
     };
     if (studyAttempt) Object.assign(entry, { study_id: studyAttempt.studyId, slot: studyAttempt.slot, reservation_id: studyAttempt.reservationId });
@@ -697,8 +701,23 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
           }
         });
         await close("private_model_evidence", async () => {
-          if (activeRun && evidence) report.interrupted_evidence = await evidence.finalize(activeRun, { status: "interrupted", reason: abortReason ?? "outer_failure" });
-          await evidence?.close();
+          const historyOptions = { deadlineHostMs: cleanupDeadline };
+          const errors: unknown[] = [];
+          try {
+            if (activeRun && evidence) report.interrupted_evidence = await evidence.finalize(activeRun, { status: "interrupted", reason: abortReason ?? "outer_failure" }, historyOptions);
+          } catch (error) { errors.push(error); }
+          finally {
+            // The observer owns a reader independently of Runtime. A failed
+            // journal manifest must not bypass its actual child/pipe barrier.
+            try { await evidence?.close(historyOptions); }
+            catch (error) { errors.push(error); }
+          }
+          if (errors.length) {
+            report.private_model_evidence_failures = errors.map(reason);
+            const error = errors.length === 1 ? errors[0] : new AggregateError(errors, "Private model evidence finalization and closure failed");
+            failure ??= error;
+            throw error;
+          }
         });
         await close("auth_without_logout", () => auth?.close());
         await close("sandbox", () => sandbox?.close());
@@ -760,7 +779,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
 function compactReport(scenario: NaturalScenario, config: AcceptanceConfig, outcome: EvaluationOutcome,
   summary: EvidenceSummary, evidence: string, nativeHash: string | null, study?: AttemptReservation) {
   const tools = new Map<string, number>();
-  for (const tool of summary.tools) tools.set(tool.name, (tools.get(tool.name) ?? 0) + 1);
+  for (const tool of summary.tools) tools.set(tool.name, (tools.get(tool.name) ?? 0) + tool.count);
   const common = { schema_version: 1 as const, scenario_id: scenario.id,
     platform_evidence_revision: config.platformEvidenceRevision, model_id: config.model.id, purpose: config.purpose,
     verifier_revision: scenario.verifier.revision, outcome, usage: summary.usage,

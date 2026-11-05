@@ -24,8 +24,7 @@ import { goalSchema, motorProfileSchema, workingProgramModeSchema, skillRefSchem
 import { taskTextSchema } from "../shared/tasks.ts";
 import type { AppSnapshot, RunView } from "../shared/contracts.ts";
 import { promotionDeclarationSchema } from "./experience.ts";
-import { ImprovementLearning } from "./improvement-learning.ts";
-import { compareProgramVersionsPage } from "./program-comparison.ts";
+import { improvementFeedbackCursorSchema, versionComparisonCursorSchema } from "./program-interface.ts";
 
 if (process.env.GAMEHARNESS_LOCK_HELD !== "1")
   throw new Error(
@@ -396,11 +395,14 @@ const server = Bun.serve<VideoSocketData>({
         if (request.method === "POST" && url.pathname === "/v1/program-comparisons") {
           const input = await body(request, z.object({
             before: comparisonVersion, after: comparisonVersion,
-            after_sample: z.int().nonnegative().default(0),
+            after_sample: versionComparisonCursorSchema.nullable().default(null),
             limit: z.int().min(1).max(100).default(25),
           }).strict());
-          return json(compareProgramVersionsPage(store, input.before, input.after,
-            { kind: "operator" }, input.after_sample, input.limit));
+          return json(await runtime.historyQueries.query({
+            kind: "operator_comparison", run_id: input.before.run_id,
+            before: input.before, after: input.after,
+            after_sample: input.after_sample, limit: input.limit,
+          }, { signal: request.signal, deadlineHostMs: performance.now() + 10_000 }));
         }
         if (request.method === "GET" && url.pathname === "/v1/performance")
           return json({
@@ -678,9 +680,12 @@ const server = Bun.serve<VideoSocketData>({
         if (request.method === "GET" && skillEvidenceMatch?.[1]) {
           if (!runtime.getRun(skillEvidenceMatch[1]))
             throw new HttpError(404, "not_found", "Run not found");
-          return json({
-            evidence: runtime.skillEvidence(skillEvidenceMatch[1]),
-          });
+          const after = Number(url.searchParams.get("after") ?? 0);
+          const limit = Number(url.searchParams.get("limit") ?? 25);
+          if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100)
+            throw new HttpError(400, "invalid_request", "Invalid evidence cursor or page size");
+          return json(await runtime.skillEvidence(skillEvidenceMatch[1], after, limit,
+            { signal: request.signal, deadlineHostMs: performance.now() + 10_000 }));
         }
         const traceMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/trace$/.exec(url.pathname);
         if (request.method === "GET" && traceMatch?.[1]) {
@@ -692,21 +697,63 @@ const server = Bun.serve<VideoSocketData>({
             throw new HttpError(400, "invalid_request", "Invalid trace cursor or page size");
           if (executionId && !z.uuid().safeParse(executionId).success)
             throw new HttpError(400, "invalid_request", "Invalid execution identity");
-          return json(store.tracePage(traceMatch[1], after, limit, executionId));
+          return json(await runtime.historyQueries.query({
+            kind: "operator_trace", run_id: traceMatch[1], after, limit,
+            ...(executionId ? { execution_id: executionId } : {}),
+          }, { signal: request.signal, deadlineHostMs: performance.now() + 10_000 }));
+        }
+        const pinnedEvidenceMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/(objective-metrics|skill-evidence)\/([a-f0-9-]{36})$/.exec(url.pathname);
+        if (request.method === "GET" && pinnedEvidenceMatch?.[1] && pinnedEvidenceMatch[3]) {
+          const runId = pinnedEvidenceMatch[1], executionId = pinnedEvidenceMatch[3];
+          const collection = pinnedEvidenceMatch[2] === "objective-metrics" ? "objective_metrics" : "program_evidence";
+          if (!runtime.getRun(runId)) throw new HttpError(404, "not_found", "Run not found");
+          if (!z.uuid().safeParse(executionId).success)
+            throw new HttpError(400, "invalid_request", "Invalid execution identity");
+          const keys = ["generation", "record_index", "chunk_index", "limit"];
+          if ([...url.searchParams.keys()].some(key => !keys.includes(key)) ||
+            keys.some(key => url.searchParams.getAll(key).length > 1))
+            throw new HttpError(400, "invalid_request", "Invalid pinned evidence cursor or page size");
+          const values = {
+            generation: url.searchParams.get("generation"),
+            record_index: url.searchParams.get("record_index") ?? "0",
+            chunk_index: url.searchParams.get("chunk_index") ?? "0",
+            limit: url.searchParams.get("limit") ?? "25",
+          };
+          if (Object.values(values).some(value => value === null || !/^(0|[1-9][0-9]*)$/.test(value)))
+            throw new HttpError(400, "invalid_request", "Invalid pinned evidence cursor or page size");
+          const generation = Number(values.generation), recordIndex = Number(values.record_index),
+            chunkIndex = Number(values.chunk_index), limit = Number(values.limit);
+          if (![generation, recordIndex, chunkIndex, limit].every(Number.isSafeInteger) || limit < 1 || limit > 100)
+            throw new HttpError(400, "invalid_request", "Invalid pinned evidence cursor or page size");
+          return json(await runtime.historyQueries.query({
+            kind: "export_page", run_id: runId, collection, execution_id: executionId, generation,
+            after: { record_index: recordIndex, chunk_index: chunkIndex }, limit,
+          }, { signal: request.signal, deadlineHostMs: performance.now() + 10_000 }));
         }
         const improvementMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/improvements$/.exec(url.pathname);
         if (request.method === "GET" && improvementMatch?.[1]) {
           if (!runtime.getRun(improvementMatch[1])) throw new HttpError(404, "not_found", "Run not found");
-          const opportunitySeq = Number(url.searchParams.get("after_opportunity") ?? 0);
-          const executionSeq = Number(url.searchParams.get("after_execution") ?? 0);
-          const limit = Number(url.searchParams.get("limit") ?? 32);
-          if (url.searchParams.has("after") ||
-            !Number.isSafeInteger(opportunitySeq) || opportunitySeq < 0 ||
-            !Number.isSafeInteger(executionSeq) || executionSeq < 0 ||
-            !Number.isInteger(limit) || limit < 1 || limit > 100)
+          if ([...url.searchParams.keys()].some(key => key !== "after" && key !== "limit") ||
+            url.searchParams.getAll("after").length > 1 || url.searchParams.getAll("limit").length > 1)
             throw new HttpError(400, "invalid_request", "Invalid feedback cursor or page size");
-          return json(new ImprovementLearning(store).feedback(improvementMatch[1],
-            { opportunity_seq: opportunitySeq, execution_seq: executionSeq }, limit));
+          let after: z.infer<typeof improvementFeedbackCursorSchema>;
+          try {
+            after = improvementFeedbackCursorSchema.parse(url.searchParams.has("after")
+              ? JSON.parse(url.searchParams.get("after")!)
+              : { schema_version: 2, opportunity_change_seq: 0, metric_change_seq: 0, scope_hash: null });
+          } catch {
+            throw new HttpError(400, "invalid_request", "Invalid feedback cursor or page size");
+          }
+          const limitValue = url.searchParams.get("limit");
+          if (limitValue !== null && !/^[1-9][0-9]*$/.test(limitValue))
+            throw new HttpError(400, "invalid_request", "Invalid feedback cursor or page size");
+          const limit = Number(limitValue ?? 32);
+          if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+            throw new HttpError(400, "invalid_request", "Invalid feedback cursor or page size");
+          return json(await runtime.historyQueries.query({
+            kind: "operator_feedback", run_id: improvementMatch[1],
+            after, limit,
+          }, { signal: request.signal, deadlineHostMs: performance.now() + 10_000 }));
         }
         const deathsMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/deaths$/.exec(url.pathname);
         if (request.method === "GET" && deathsMatch?.[1]) {
@@ -715,7 +762,9 @@ const server = Bun.serve<VideoSocketData>({
           const limit = Number(url.searchParams.get("limit") ?? 32);
           if (!Number.isSafeInteger(after) || after < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100)
             throw new HttpError(400, "invalid_request", "Invalid death cursor or page size");
-          return json(store.deathEpisodesPage(deathsMatch[1], after, limit));
+          return json(await runtime.historyQueries.query({
+            kind: "operator_deaths", run_id: deathsMatch[1], after, limit,
+          }, { signal: request.signal, deadlineHostMs: performance.now() + 10_000 }));
         }
         const planningMatch = /^\/v1\/runs\/([a-f0-9-]{36})\/planning$/.exec(url.pathname);
         if (request.method === "GET" && planningMatch?.[1])

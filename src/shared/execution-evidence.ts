@@ -61,8 +61,17 @@ export interface ProgramVersionEvidence extends SkillRef {
   hash: string;
 }
 export interface ImprovementFeedbackCursor {
-  opportunity_seq: number;
-  execution_seq: number;
+  schema_version: 2;
+  opportunity_change_seq: number;
+  metric_change_seq: number;
+  scope_hash: string | null;
+}
+export interface VersionComparisonCursor {
+  schema_version: 2;
+  before_generation: number;
+  after_generation: number;
+  offset: number;
+  scope_hash: string;
 }
 export const IMPROVEMENT_RESOLUTION_HELP =
   "Use program_review to record keep or insufficient_evidence for a named version's latest matching outcome. Link an actual direct-child code-change experiment through program_write with based_on and reason; the host captures exact source and evidence references. An internal revise assessment records that candidate experiment, not verified improvement, adoption or promotion. Candidates may be unmeasured and measured trials may remain inconclusive. Explain the evidence limits in reason.";
@@ -107,6 +116,16 @@ export interface ObjectiveMetrics {
   trace_complete: boolean;
   limitations: string[];
 }
+export type ObjectiveMetricUpdate = {
+  execution_id: string;
+  program: { name: string; version: number };
+  execution_ordinal: number;
+  revision: number;
+  generation: number;
+} & (
+  | { kind: "replace"; metric: ObjectiveMetrics }
+  | { kind: "retract"; reason: "execution_removed"; metric?: never }
+);
 export interface WorkingProgram {
   session_id: string;
   model_id: string;

@@ -29,7 +29,10 @@ export const residentFrameContextSchema = z.object({
 export type ResidentFrameContext = z.infer<typeof residentFrameContextSchema>;
 
 export const controllerInputSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("world"), held: worldHeldSchema, edges: z.array(worldInputEdgeSchema).max(256),
+  z.object({ kind: z.literal("world"), held: worldHeldSchema
+    .describe("Final held state after applying edges to the previous submitted input, initially all false. A changed held boolean requires its matching button edge; held alone does not press or release a button. Track submitted state in next_state, not last_input: native acknowledgments may lag."),
+    edges: z.array(worldInputEdgeSchema).max(256)
+      .describe("Ordered button press/release transitions. Include a press edge when a held button becomes true and a release edge when it becomes false; release count is exactly one. Unchanged held buttons need no repeated edge. Inventory is edge-only. Preserve explicitly intended counted presses."),
     view: viewInputSchema, selected_hotbar: z.number().int().min(0).max(8).nullable() }).strict(),
   z.object({ kind: z.literal("screen"), screen: visibleScreenRefSchema,
     operations: z.array(visibleScreenOperationSchema).max(16) }).strict(),

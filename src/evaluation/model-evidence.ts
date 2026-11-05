@@ -1,22 +1,23 @@
 import { createHash } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { open, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
-import type { ActivityEvent, ObservationV3, ReportedUsage, RequestUsageEvidence } from "../shared/contracts.ts";
-import type { TraceRecord } from "../shared/execution-evidence.ts";
+import type { ActivityEvent, ObservationV3 } from "../shared/contracts.ts";
 import type { Store } from "../server/store.ts";
 import type { Runtime } from "../server/runtime.ts";
 import type { AuthManager } from "../server/auth.ts";
-import { objectiveMetrics } from "../server/objective-metrics.ts";
+import { HistoryReader } from "../server/history-reader.ts";
+import type { EvaluationPrefixSummary, HistoryExportCursor, HistoryExportPage, HistoryQuery, HistoryQueryOptions } from "../server/history-protocol.ts";
+import type { Json } from "../shared/contracts.ts";
 import type { EvaluationCaps } from "./contracts.ts";
 import type { GoalAction } from "./scenarios.ts";
-import { actionMetrics, readUsageMetrics, usageMetrics, type ActionMetrics, type MeasuredInterval, type UsageMetrics, type WaitCategory } from "./results.ts";
-import { PrivateJournal } from "./private-journal.ts";
+import { actionMetrics, readUsageMetrics, type ActionMetrics, type MeasuredInterval, type UsageMetrics, type WaitCategory } from "./results.ts";
+import { PrivateJournal, type JournalFinalization } from "./private-journal.ts";
 import type { JournalLimits } from "../shared/evidence-limits.ts";
 import { HOST_MONOTONIC_CLOCK_ID } from "../server/performance.ts";
+import type { ProjectionProgress } from "../server/program-feedback.ts";
 
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-const counter = (value: unknown): number | null => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 
 /** Append-only derived evidence. Never settles an attempt or changes admission governance. */
 export async function writeUsageQualification(input: { directory: string;
@@ -41,16 +42,76 @@ export async function writeUsageQualification(input: { directory: string;
 
 interface OpenSpan { run_id: string; start_ms: number; category: WaitCategory }
 interface ToolObservation { run_id: string; name: string; tool_call_id: string; arguments: unknown; arguments_sha256: string; omission: string | null }
+interface DerivedExportScope {
+  status: "not_observed" | "unavailable" | "published";
+  projection: ProjectionProgress | null;
+  source_available: number | null;
+  has_pending: boolean | null;
+  omission: string | null;
+  total: number | null;
+  pages: number;
+  complete: boolean;
+}
+const unknownDerivedScope = (): DerivedExportScope => ({ status: "not_observed", projection: null,
+  source_available: null, has_pending: null, omission: "projection_status_not_observed", total: null, pages: 0, complete: false });
 export interface EvidenceSummary {
   usage: UsageMetrics;
   actions: ActionMetrics;
-  tools: Array<{ name: string }>;
+  tools: Array<{ name: string; count: number }>;
   provider_error: boolean;
   provider_settled: boolean;
   confirmed_harness_faults: string[];
   unclassified_tool_failures: boolean;
   observer_error: string | null;
   omissions: Record<string, number>;
+}
+const expectedToolFailures = new Set(["invalid_program", "invalid_request", "precondition_failed", "stale_context",
+  "deadline_exceeded", "not_found", "conflict", "validation_failed", "budget_exceeded"]);
+
+/** Streaming transport validation holds only one hash and a possible UTF-16 surrogate. */
+class ArchiveRecordVerifier {
+  private chunk: { record: number; records: number; count: number; next: number; sha256: string;
+    originalBytes: number; bytes: number; hash: ReturnType<typeof createHash>; pending: string } | null = null;
+  constructor(private readonly collection: string) {}
+  accept(records: readonly Json[], total: number): void {
+    for (const raw of records) {
+      const record = object(raw);
+      if (record.kind !== "json_record_chunk") {
+        if (this.chunk) throw new Error("history_export_incomplete_record_chunk");
+        continue;
+      }
+      if (record.schema_version !== 1 || record.collection !== this.collection || record.encoding !== "json_text" ||
+          !Number.isSafeInteger(record.record_index) || !Number.isSafeInteger(record.record_count) ||
+          Number(record.record_index) < 0 || Number(record.record_index) >= Number(record.record_count) || record.record_count !== total ||
+          !Number.isSafeInteger(record.chunk_count) || Number(record.chunk_count) <= 0 ||
+          !Number.isSafeInteger(record.original_bytes) || Number(record.original_bytes) <= 0 ||
+          typeof record.text !== "string" || typeof record.sha256 !== "string")
+        throw new Error("history_export_invalid_record_chunk");
+      if (!this.chunk) {
+        if (record.chunk_index !== 0) throw new Error("history_export_missing_record_chunk");
+        this.chunk = { record: Number(record.record_index), records: Number(record.record_count), count: Number(record.chunk_count),
+          next: 0, sha256: record.sha256, originalBytes: Number(record.original_bytes), bytes: 0, hash: createHash("sha256"), pending: "" };
+      }
+      const chunk = this.chunk;
+      if (chunk.record !== record.record_index || chunk.records !== record.record_count || chunk.count !== record.chunk_count ||
+          chunk.next !== record.chunk_index || chunk.sha256 !== record.sha256 || chunk.originalBytes !== record.original_bytes)
+        throw new Error("history_export_record_chunk_identity_changed");
+      let text = chunk.pending + record.text;
+      const tail = text.charCodeAt(text.length - 1);
+      chunk.pending = tail >= 0xd800 && tail <= 0xdbff ? text.slice(-1) : "";
+      if (chunk.pending) text = text.slice(0, -1);
+      chunk.hash.update(text); chunk.bytes += Buffer.byteLength(text); chunk.next++;
+      if (chunk.next === chunk.count) {
+        chunk.hash.update(chunk.pending); chunk.bytes += Buffer.byteLength(chunk.pending);
+        if (chunk.hash.digest("hex") !== chunk.sha256 || chunk.bytes !== chunk.originalBytes)
+          throw new Error("history_export_record_chunk_hash_changed");
+        this.chunk = null;
+      }
+    }
+  }
+  finish(): void {
+    if (this.chunk) throw new Error("history_export_incomplete_record_chunk");
+  }
 }
 
 /** Transparent observer of the actual AuthManager Agents and durable production Store.
@@ -73,14 +134,27 @@ export class ModelProgramEvidence {
   private readonly omissions: Record<string, number> = {};
   private readonly admissions = new Map<string, number>();
   private readonly actionCache = new Map<string, Map<string, GoalAction>>();
+  private readonly actionSummaries = new Map<string, ActionMetrics>();
+  private readonly inventoryMetricKeys = new Map<string, Map<string, number>>();
+  private readonly prefixCounts = new Map<string, Map<string, { type: string; count: number; failed_verifications: number }>>();
+  private readonly retrospectiveRuns = new Set<string>();
+  private readonly initializedRuns = new Map<string, Promise<void>>();
+  private readonly toolFailureFlags = new Map<string, { backend: boolean; unclassified: boolean }>();
   private readonly providerFailures = new Set<string>();
   private readonly modelObservationFailures = new Set<string>();
+  private readonly historyQueryFailures = new Set<string>();
   private readonly stopRequested = new Set<string>();
   private readonly journals = new Map<string, PrivateJournal>();
+  private readonly history: HistoryReader;
+  private readonly observedEventSequences = new Map<string, number[]>();
+  private readonly finalizations = new Map<string, Promise<JournalFinalization>>();
+  private readonly exports = new Set<Promise<unknown>>();
+  private closing: Promise<void> | null = null;
   private readonly unsubscribeTrace: () => void;
   constructor(readonly store: Store, readonly directory: string, readonly caps: EvaluationCaps,
     readonly clockId: string, private readonly stop: (runId: string, reason: string) => void,
     private readonly options: { limits?: Partial<JournalLimits> } = {}) {
+    this.history = new HistoryReader(store.readLocation());
     this.unsubscribeTrace = store.subscribeTraceEvidence(input => {
       this.journal(input.run_id).append("authorized_execution_evidence_before_trace_caps", input);
       const span = object(input.payload);
@@ -128,12 +202,47 @@ export class ModelProgramEvidence {
   private observeEvent(event: ActivityEvent) {
     const runId = event.run_id!, data = object(event.details), now = performance.now();
     this.journal(runId).append("store_event", event);
+    let retained = this.observedEventSequences.get(runId);
+    if (!retained) { retained = []; this.observedEventSequences.set(runId, retained); }
+    if (retained.length < this.caps.reportEventPages * this.caps.eventPageRecords) {
+      retained.push(event.event_seq);
+      let counts = this.prefixCounts.get(runId);
+      if (!counts) { counts = new Map(); this.prefixCounts.set(runId, counts); }
+      const count = counts.get(event.type) ?? { type: event.type, count: 0, failed_verifications: 0 };
+      count.count++;
+      if (event.type === "goal.verification" && data.status === "failed") count.failed_verifications++;
+      counts.set(event.type, count);
+    }
     if (event.type === "runtime.model_observation_failed") this.modelObservationFailures.add(runId);
+    if (event.type === "runtime.history_query_failed") this.historyQueryFailures.add(runId);
     if (event.type.startsWith("action.") && typeof data.action_id === "string") {
       const action = this.store.getAction(runId, data.action_id);
       if (action) {
         let actions = this.actionCache.get(runId);
         if (!actions) { actions = new Map(); this.actionCache.set(runId, actions); }
+        let metrics = this.actionSummaries.get(runId);
+        if (!metrics) { metrics = actionMetrics([]); this.actionSummaries.set(runId, metrics); }
+        let inventoryKeys = this.inventoryMetricKeys.get(runId);
+        if (!inventoryKeys) { inventoryKeys = new Map(); this.inventoryMetricKeys.set(runId, inventoryKeys); }
+        const previous = actions.get(data.action_id);
+        for (const [sample, direction] of [[previous, -1], [action, 1]] as const) {
+          if (!sample) continue;
+          const delta = actionMetrics([sample]);
+          metrics.count += direction * delta.count;
+          metrics.confirmed_effects += direction * delta.confirmed_effects;
+          metrics.inventory_receipts += direction * delta.inventory_receipts;
+          metrics.uncertain_outcomes += direction * delta.uncertain_outcomes;
+          for (const [status, count] of Object.entries(delta.by_status)) {
+            metrics.by_status[status] = (metrics.by_status[status] ?? 0) + direction * count;
+            if (!metrics.by_status[status]) delete metrics.by_status[status];
+          }
+          for (const [item, count] of Object.entries(delta.inventory_delta)) {
+            metrics.inventory_delta[item] = (metrics.inventory_delta[item] ?? 0) + direction * count;
+            const present = (inventoryKeys.get(item) ?? 0) + direction;
+            if (present) inventoryKeys.set(item, present);
+            else { inventoryKeys.delete(item); delete metrics.inventory_delta[item]; }
+          }
+        }
         actions.set(data.action_id, { ...action, run_id: runId });
       }
     }
@@ -174,7 +283,7 @@ export class ModelProgramEvidence {
     const original = auth.createAgent;
     auth.createAgent = async options => {
       const agent = await original.call(auth, options);
-      const runId = this.runtime?.snapshot()?.run_id;
+      const runId = this.runtime?.currentRunId();
       if (runId && !this.closed) this.observeAgent(agent, runId);
       return agent;
     };
@@ -206,8 +315,13 @@ export class ModelProgramEvidence {
         this.journal(runId).append("visible_agent_event", event);
       if (event.type === "tool_execution_end" && event.isError) {
         const details = object(object(event.result).details), error = object(details.error);
+        const code = typeof error.code === "string" ? error.code : null;
         this.toolFailures.push({ run_id: runId, tool: event.toolName, tool_call_id: event.toolCallId,
-          code: typeof error.code === "string" ? error.code : null });
+          code });
+        const flags = this.toolFailureFlags.get(runId) ?? { backend: false, unclassified: false };
+        flags.backend ||= code === "backend_unavailable";
+        flags.unclassified ||= code === null || !expectedToolFailures.has(code) && code !== "backend_unavailable";
+        this.toolFailureFlags.set(runId, flags);
       }
       if (event.type !== "message_end" || event.message.role !== "assistant") return;
       for (const content of event.message.content) {
@@ -223,32 +337,42 @@ export class ModelProgramEvidence {
     }));
   }
   count(runId: string) { return this.admissions.get(runId) ?? 0; }
-  events(runId: string): ActivityEvent[] {
-    const events: ActivityEvent[] = [];
-    let cursor = 0;
-    for (let page = 0; page < this.caps.reportEventPages; page++) {
-      const batch = this.store.eventsAfter(runId, cursor, this.caps.eventPageRecords);
-      events.push(...batch);
-      if (batch.length < this.caps.eventPageRecords) return events;
-      const next = batch.at(-1)!.event_seq;
-      if (next <= cursor) throw new Error("Durable event cursor did not advance");
-      cursor = next;
-    }
-    this.omissions.events = this.store.eventsAfter(runId, cursor, 1).length ? 1 : 0;
-    return events;
+  initialize(runId: string, options?: HistoryQueryOptions): Promise<void> {
+    const existing = this.initializedRuns.get(runId);
+    if (existing) return existing;
+    const query = this.queryOptions(options);
+    const work = (async () => {
+      // Even the initial prefix probe is byte-bounded and parsed in the child.
+      const page = await this.exportPage(runId, "events", { record_index: 0, chunk_index: 0 }, 1, query);
+      const first = object(page.records[0]).event_seq;
+      if (page.omissions.length || object(page.records[0]).kind === "json_record_chunk" ||
+          typeof first === "number" && first !== this.observedEventSequences.get(runId)?.[0]) {
+        this.retrospectiveRuns.add(runId);
+        this.journal(runId).append("observer_durable_prefix_requires_retrospective_read", {
+          first_durable_event_seq: first ?? null, first_observed_event_seq: this.observedEventSequences.get(runId)?.[0] ?? null,
+          provenance: "Historical usage/count summaries are readonly child calculations; raw pre-observer SDK events and local clocks are not reconstructed.",
+          probe_omissions: page.omissions, chunked_probe: object(page.records[0]).kind === "json_record_chunk" });
+      }
+    })();
+    this.initializedRuns.set(runId, work);
+    return work;
   }
-  trace(runId: string): TraceRecord[] {
-    const traces: TraceRecord[] = [];
-    let cursor = 0;
-    for (let page = 0; page < this.caps.reportTracePages; page++) {
-      const value = this.store.tracePage(runId, cursor, this.caps.tracePageRecords);
-      traces.push(...value.records);
-      if (!value.has_more) return traces;
-      if (value.next_after <= cursor) throw new Error("Durable trace cursor did not advance");
-      cursor = value.next_after;
-    }
-    this.omissions.trace_pages = 1;
-    return traces;
+  private async prefix(runId: string, options?: HistoryQueryOptions): Promise<EvaluationPrefixSummary> {
+    const query = this.queryOptions(options);
+    await this.initialize(runId, query);
+    if (query.signal?.aborted || performance.now() >= query.deadlineHostMs) throw new Error("history_summary_cancelled_or_deadline");
+    const value = await this.history.query({ kind: "evaluation_prefix", run_id: runId,
+      event_limit: this.caps.reportEventPages * this.caps.eventPageRecords }, query);
+    if (query.signal?.aborted || performance.now() >= query.deadlineHostMs) throw new Error("history_summary_cancelled_or_deadline");
+    return value;
+  }
+  async eventCount(runId: string, type: string, status?: "failed", options?: HistoryQueryOptions): Promise<number> {
+    const query = this.queryOptions(options);
+    await this.initialize(runId, query);
+    if (query.signal?.aborted || performance.now() >= query.deadlineHostMs) throw new Error("history_summary_cancelled_or_deadline");
+    const entry = this.retrospectiveRuns.has(runId) ? (await this.prefix(runId, query)).event_counts.find(entry => entry.type === type) :
+      this.prefixCounts.get(runId)?.get(type);
+    return status === "failed" ? entry?.failed_verifications ?? 0 : entry?.count ?? 0;
   }
   actions(runId: string): GoalAction[] {
     // The observer is installed before run creation. Refresh only on real durable action events,
@@ -268,96 +392,295 @@ export class ModelProgramEvidence {
     this.omissions.unclosed_intervals = [...this.open.values()].filter(span => span.start_ms < endMs).length;
     return this.completed.filter(span => span.run_id === runId);
   }
-  summary(runId: string): EvidenceSummary {
-    const events = this.events(runId);
-    const admitted = events.filter(event => event.type === "model.call");
-    const reported = events.filter(event => event.type === "model.usage");
-    const readMessage = (event: ActivityEvent): RequestUsageEvidence[] => {
-      const data = object(event.details);
-      if (typeof data.request_id !== "string") return [];
-      const evidence = object(data.usage_evidence), terminal = object(evidence.provider_terminal);
-      const readCounters = (value: unknown): ReportedUsage => {
-        const fields = object(value);
-        return { uncached_input: counter(fields.uncached_input), cache_read: counter(fields.cache_read),
-          cache_write: counter(fields.cache_write), output: counter(fields.output) };
-      };
-      const bound = evidence.schema_version === 1 && evidence.request_id === data.request_id &&
-        Array.isArray(evidence.unaccounted_response_ids) && evidence.unaccounted_response_ids.length <= 34 &&
-        evidence.unaccounted_response_ids.every(id => typeof id === "string" && id.length <= 200);
-      const source = terminal.source;
-      const supported = source === "openai_responses_terminal" || source === "openai_codex_responses_terminal" || source === "jev_response_usage";
-      const nested = object(data.usage);
-      const sdk = bound ? evidence.sdk_reported === null ? null : readCounters(evidence.sdk_reported)
-        : Object.hasOwn(data, "usage")
-          ? data.usage === null ? null : { uncached_input: counter(nested.input), cache_read: counter(nested.cacheRead),
-            cache_write: counter(nested.cacheWrite), output: counter(nested.output) }
-          : { uncached_input: counter(data.uncached_input_tokens), cache_read: counter(data.cache_read_tokens),
-            cache_write: counter(data.cache_write_tokens), output: counter(data.output_tokens) };
-      return [{ schema_version: 1, request_id: data.request_id, sdk_reported: sdk,
-        provider_terminal: bound && supported && typeof terminal.terminal_type === "string" &&
-          (terminal.response_id === null || typeof terminal.response_id === "string" && terminal.response_id.length <= 200)
-          ? { source, response_id: terminal.response_id, terminal_type: terminal.terminal_type, counters: readCounters(terminal.counters) } : null,
-        unaccounted_response_ids: bound ? evidence.unaccounted_response_ids as string[] : [] }];
-    };
-    const messages = reported.flatMap(readMessage);
-    const unsettled = events.filter(event => event.type === "model.request_unsettled" &&
-      object(event.details).usage_evidence !== undefined).flatMap(readMessage);
-    const settlements = events.filter(event => event.type === "model.request_settled");
-    const settledIds = new Set(settlements.filter(event => !["aborted", "error"].includes(String(object(event.details).stop_reason))).map(event => object(event.details).request_id));
-    const failures = this.toolFailures.filter(failure => failure.run_id === runId);
-    const expected: Record<string, true> = { invalid_program: true, invalid_request: true, precondition_failed: true, stale_context: true,
-      deadline_exceeded: true, not_found: true, conflict: true, validation_failed: true, budget_exceeded: true };
-    const faults = failures.some(failure => failure.code === "backend_unavailable") ? ["tool_backend_unavailable"] : [];
+  async summary(runId: string, options?: HistoryQueryOptions): Promise<EvidenceSummary> {
+    const prefix = await this.prefix(runId, options);
+    this.omissions.events = prefix.events_omitted ? 1 : 0;
+    const flags = this.toolFailureFlags.get(runId);
+    const faults = flags?.backend ? ["tool_backend_unavailable"] : [];
     if (this.modelObservationFailures.has(runId)) faults.push("model_observation_failed");
-    const unclassified = failures.some(failure => failure.code === null || !Object.hasOwn(expected, failure.code) && failure.code !== "backend_unavailable");
-    return { usage: usageMetrics({ admissions: this.count(runId),
-      admitted_request_ids: admitted.flatMap(event => { const id = object(event.details).request_id; return typeof id === "string" ? [id] : []; }),
-      messages, additional_terminal_evidence: unsettled, events_omitted: Boolean(this.omissions.events) }), actions: actionMetrics(this.actions(runId)),
-      tools: events.filter(event => event.type === "model.tool_started").flatMap(event => { const name = object(event.details).tool; return typeof name === "string" ? [{ name }] : []; }),
-      provider_error: settlements.some(event => {
-        const details = object(event.details);
-        return details.stop_reason === "error" ||
-          object(details.recovered_failure).type === "stream_interrupted_after_content";
-      }),
-      provider_settled: admitted.length > 0 && !this.omissions.events && admitted.every(event => settledIds.has(object(event.details).request_id)),
-      confirmed_harness_faults: faults, unclassified_tool_failures: unclassified, observer_error: this.observerError, omissions: { ...this.omissions } };
+    if (this.historyQueryFailures.has(runId)) faults.push("history_query_failed");
+    const actions = this.actionSummaries.get(runId) ?? actionMetrics([]);
+    return { usage: prefix.usage, tools: prefix.tools, provider_error: prefix.provider_error, provider_settled: prefix.provider_settled,
+      actions: { ...actions, by_status: { ...actions.by_status }, inventory_delta: { ...actions.inventory_delta } },
+      confirmed_harness_faults: faults, unclassified_tool_failures: flags?.unclassified ?? false,
+      observer_error: this.observerError, omissions: { ...this.omissions } };
   }
-  async save(runId: string) {
-    const events = this.events(runId), traces = this.trace(runId), sources = this.store.skills(runId);
-    const name = `run-${runId}-evidence.json`;
-    const value = { classification: "private_actual_provider_evidence_not_gameplay_strategy", run: this.runtime?.getRun(runId), original_run_baseline: this.store.getRun(runId)?.baseline,
-      sources, policies: this.store.policies(runId), executions: this.store.allSkillExecutions(runId), events, traces,
-      trace_budget: this.store.tracePage(runId, 0, 1).budget, objective_metrics: objectiveMetrics(this.store, runId), actions: this.actions(runId),
-      actual_assistant_tool_calls: this.toolCalls.filter(call => call.run_id === runId),
-      actual_tool_failures: this.toolFailures.filter(failure => failure.run_id === runId),
-      measured_intervals: this.intervals(runId, performance.now()),
-      observed_event_monotonic_clocks: events.filter(event => this.clocks.has(event.event_seq)).map(event => ({ event_seq: event.event_seq, observed_monotonic_ms: this.clocks.get(event.event_seq), clock_id: this.clockId })),
-      summary: this.summary(runId), omissions: this.omissions,
-      model_source_policy: "Actual provider tool calls only; evaluator never supplies gameplay or guard bodies",
-      limitations: ["Host admissions are not wire attempts; subscription monetary cost is unknown.", "Only same-process monotonic spans are combined.",
+  private queryOptions(options?: HistoryQueryOptions): HistoryQueryOptions {
+    return options ?? { deadlineHostMs: performance.now() + this.caps.diagnosticsMs };
+  }
+  private async exportPage(runId: string, collection: Extract<HistoryQuery, { kind: "export_page" }>["collection"],
+    after: HistoryExportCursor, limit: number, options: HistoryQueryOptions, generation?: number): Promise<HistoryExportPage> {
+    const page = await this.history.query({ kind: "export_page", run_id: runId, collection, after, limit,
+      ...(generation === undefined ? {} : { generation }) }, options);
+    if (options.signal?.aborted || performance.now() >= options.deadlineHostMs)
+      throw new Error("history_export_cancelled_or_deadline");
+    const progress = page.next_after.record_index - after.record_index || page.next_after.chunk_index - after.chunk_index;
+    if (progress < 0 || page.has_more && progress === 0)
+      throw new Error("history_export_cursor_did_not_advance");
+    return page;
+  }
+  private async derivedScope(runId: string, options: HistoryQueryOptions): Promise<DerivedExportScope> {
+    const status = await this.history.query({ kind: "projection_status", run_id: runId }, options);
+    if (options.signal?.aborted || performance.now() >= options.deadlineHostMs)
+      throw new Error("history_export_cancelled_or_deadline");
+    return { status: status.published ? "published" : "unavailable", projection: status.published,
+      source_available: status.source_available, has_pending: status.published?.has_pending ?? true,
+      omission: status.published ? null : "projection_pending_first_publication", total: null, pages: 0, complete: false };
+  }
+  private acceptDerivedPage(scope: DerivedExportScope, page: HistoryExportPage): void {
+    if (!page.projection || page.projection.generation !== scope.projection?.generation ||
+        page.projection.source_through !== scope.projection.source_through ||
+        scope.total !== null && scope.total !== page.total)
+      throw new Error("history_export_projection_identity_changed");
+    scope.projection = page.projection;
+    scope.source_available = page.projection.source_available;
+    scope.has_pending = page.projection.has_pending;
+    scope.total = page.total;
+    scope.pages++;
+  }
+  private async refreshDerivedAvailability(runId: string, scope: DerivedExportScope, options: HistoryQueryOptions): Promise<void> {
+    const status = await this.history.query({ kind: "projection_status", run_id: runId }, options);
+    if (options.signal?.aborted || performance.now() >= options.deadlineHostMs)
+      throw new Error("history_export_cancelled_or_deadline");
+    scope.source_available = status.source_available;
+    scope.has_pending = scope.projection === null || scope.projection.source_through < status.source_available ||
+      status.published?.has_pending === true;
+    if (scope.projection) scope.projection = { ...scope.projection,
+      source_available: status.source_available, has_pending: scope.has_pending };
+  }
+  save(runId: string, queryOptions?: HistoryQueryOptions): Promise<string> {
+    if (this.closed) return Promise.reject(new Error("evidence_observer_closed"));
+    const work = this.saveCompact(runId, queryOptions);
+    this.exports.add(work);
+    void work.then(() => this.exports.delete(work), () => this.exports.delete(work));
+    return work;
+  }
+  private async saveCompact(runId: string, queryOptions?: HistoryQueryOptions) {
+    const options = this.queryOptions(queryOptions), name = `run-${runId}-evidence.json`;
+    const file = await open(path.join(this.directory, name), "wx", 0o600);
+    let bytes = 0, firstProperty = true;
+    const overflow = new Error("compact_evidence_exceeds_declared_json_bound");
+    const emit = async (text: string) => {
+      const size = Buffer.byteLength(text);
+      if (bytes + size > this.caps.reportJsonBytes) throw overflow;
+      await file.writeFile(text); bytes += size;
+    };
+    const property = async (key: string) => {
+      await emit(`${firstProperty ? "" : ","}${JSON.stringify(key)}:`);
+      firstProperty = false;
+    };
+    const scalar = async (key: string, value: unknown) => {
+      await property(key); await emit(JSON.stringify(value));
+    };
+    const array = async (key: string, values: Iterable<unknown>) => {
+      await property(key); await emit("[");
+      let first = true;
+      for (const value of values) { await emit(`${first ? "" : ","}${JSON.stringify(value)}`); first = false; }
+      await emit("]");
+    };
+    const pageMetadata: Record<string, unknown> = {};
+    let objectiveScope = unknownDerivedScope();
+    let unfinished: { collection: string; next_after: HistoryExportCursor; page_index: number; total: number | null } | null = null;
+    try {
+      await emit("{");
+      await scalar("classification", "private_actual_provider_evidence_not_gameplay_strategy");
+      unfinished = { collection: "run", next_after: { record_index: 0, chunk_index: 0 }, page_index: 0, total: null };
+      const run = await this.exportPage(runId, "run", unfinished.next_after, 1, options);
+      unfinished = { ...unfinished, total: run.total };
+      if (object(run.records[0]).kind === "json_record_chunk") throw overflow;
+      await scalar("run", run.records[0] ?? null);
+      await scalar("original_run_baseline", object(run.records[0]).baseline ?? null);
+      pageMetadata.run = { ...run, records: undefined };
+      unfinished = null;
+      for (const collection of ["sources", "policies", "executions", "objective_metrics", "events", "traces"] as const) {
+        if (collection === "objective_metrics") {
+          unfinished = { collection, next_after: { record_index: 0, chunk_index: 0 }, page_index: 0, total: null };
+          objectiveScope = await this.derivedScope(runId, options);
+          if (objectiveScope.status === "unavailable") {
+            await scalar(collection, null);
+            pageMetadata[collection] = { ...objectiveScope, next_after: { record_index: 0, chunk_index: 0 },
+              has_more: null, logical_records: null, omitted_records: null };
+            unfinished = null;
+            continue;
+          }
+        }
+        const verifier = new ArchiveRecordVerifier(collection);
+        await property(collection); await emit("[");
+        let after: HistoryExportCursor = { record_index: 0, chunk_index: 0 };
+        let logicalRecords = 0, first = true, pages = 0, omissions = 0, total = 0, hasMore = true;
+        const recordCap = collection === "events" ? this.caps.reportEventPages * this.caps.eventPageRecords :
+          collection === "traces" ? this.caps.reportTracePages * this.caps.tracePageRecords : Infinity;
+        // A permitted record counts only after its final chunk, so its continuation
+        // keeps the same allowance and deadline rather than stopping at a transport page.
+        while (hasMore && logicalRecords < recordCap) {
+          unfinished = { collection, next_after: after, page_index: pages, total: pages ? total : null };
+          const page = await this.exportPage(runId, collection, after, Math.min(100, recordCap - logicalRecords), options,
+            collection === "objective_metrics" ? objectiveScope.projection!.generation : undefined);
+          if (collection === "objective_metrics") this.acceptDerivedPage(objectiveScope, page);
+          unfinished = { ...unfinished, total: page.total };
+          verifier.accept(page.records, page.total);
+          for (const record of page.records) {
+            await emit(`${first ? "" : ","}${JSON.stringify(record)}`); first = false;
+            const chunk = object(record);
+            if (chunk.kind !== "json_record_chunk" || Number(chunk.chunk_index) + 1 === chunk.chunk_count) logicalRecords++;
+          }
+          after = page.next_after; hasMore = page.has_more; total = page.total; pages++; omissions += page.omissions.length;
+          unfinished = { collection, next_after: after, page_index: pages, total };
+        }
+        verifier.finish();
+        if (collection === "objective_metrics") objectiveScope.complete = !hasMore;
+        if (collection === "traces") this.omissions.trace_pages = hasMore ? 1 : 0;
+        pageMetadata[collection] = { ...(collection === "objective_metrics" ? objectiveScope : {}),
+          next_after: after, has_more: hasMore, total, pages, logical_records: logicalRecords, omitted_records: omissions,
+          omission_details: omissions ? "Cursor-indexed reasons and byte counts are in the separately bounded private journal export pages." : null };
+        await emit("]");
+        unfinished = null;
+      }
+      unfinished = { collection: "trace_budget", next_after: { record_index: 0, chunk_index: 0 }, page_index: 0, total: null };
+      const traceBudget = await this.exportPage(runId, "trace_budget", unfinished.next_after, 1, options);
+      unfinished = { ...unfinished, total: traceBudget.total };
+      if (object(traceBudget.records[0]).kind === "json_record_chunk") throw overflow;
+      await scalar("trace_budget", traceBudget.records[0] ?? null);
+      pageMetadata.trace_budget = { ...traceBudget, records: undefined };
+      unfinished = null;
+      await array("actions", this.actionCache.get(runId)?.values() ?? []);
+      await array("actual_assistant_tool_calls", this.toolCalls.filter(call => call.run_id === runId));
+      await array("actual_tool_failures", this.toolFailures.filter(failure => failure.run_id === runId));
+      await array("measured_intervals", this.intervals(runId, performance.now()));
+      await property("observed_event_monotonic_clocks"); await emit("[");
+      let firstClock = true;
+      for (const sequence of this.observedEventSequences.get(runId) ?? []) {
+        if (!this.clocks.has(sequence)) continue;
+        await emit(`${firstClock ? "" : ","}${JSON.stringify({ event_seq: sequence,
+          observed_monotonic_ms: this.clocks.get(sequence), clock_id: this.clockId })}`);
+        firstClock = false;
+      }
+      await emit("]");
+      await scalar("summary", await this.summary(runId, options));
+      await scalar("omissions", this.omissions);
+      await this.refreshDerivedAvailability(runId, objectiveScope, options);
+      Object.assign(pageMetadata.objective_metrics as object, objectiveScope);
+      await scalar("history_export", { schema_version: 1, collections: pageMetadata,
+        record_chunk_encoding: "Concatenate json_record_chunk.text by chunk_index, verify UTF-8 sha256, then JSON.parse; record_index/count identify logical collection records.",
+        consistency: "Raw collection pages are separate readonly snapshots, not a multi-page transaction. Objective metrics are pinned to the declared completed projection generation; pending source work is not included." });
+      await scalar("model_source_policy", "Actual provider tool calls only; evaluator never supplies gameplay or guard bodies");
+      await scalar("limitations", ["Host admissions are not wire attempts; subscription monetary cost is unknown.",
+        "Only same-process monotonic spans are combined.",
         "Store traces have independent omission caps; the private journal observes authorized capability data before those caps.",
-        "Private journal capacity/persistence failures are explicit and stop the attempt.", "No causal improvement, promotion or gameplay-efficiency claim is inferred."] };
-    const text = JSON.stringify(value, null, 2);
-    if (Buffer.byteLength(text) > this.caps.reportJsonBytes) {
-      // Compact reports and complete permitted evidence have separate allowances.
-      await writeFile(path.join(this.directory, name), JSON.stringify({ run_id: runId, omission: "compact_evidence_exceeds_declared_json_bound",
-        private_journal: this.journal(runId).journal, limitation: "Store events/traces do not retain every argument or observation; use the separately bounded private journal and manifest.", summary: this.summary(runId) }, null, 2), { mode: 0o600, flag: "wx" });
-    } else await writeFile(path.join(this.directory, name), text, { mode: 0o600, flag: "wx" });
+        "Compact omission and complete private journal allowances are separate; private evidence failures stop the attempt.",
+        "No causal improvement, promotion or gameplay-efficiency claim is inferred."]);
+      await emit("}");
+    } catch (error) {
+      if (error !== overflow) {
+        this.journal(runId).append("readonly_history_compact_export_failed", {
+          schema_version: 1, cursor: unfinished, reason: error instanceof Error ? error.message : "history_query_failed" });
+        this.journal(runId).markIncomplete("private_history_export_query_failed");
+        await file.truncate(0);
+        const failed = JSON.stringify({ run_id: runId, omission: "history_query_failed", cursor: unfinished,
+          private_journal: this.journal(runId).journal, history_export: { collections: { objective_metrics: objectiveScope } } });
+        if (Buffer.byteLength(failed) <= this.caps.reportJsonBytes) await file.write(failed, 0, "utf8");
+        throw error;
+      }
+      await file.truncate(0);
+      const fallback = JSON.stringify({ run_id: runId, omission: overflow.message, cursor: unfinished, private_journal: this.journal(runId).journal,
+        limitation: "Use the separately bounded private journal and manifest; this compact export is incomplete.",
+        history_export: { collections: { objective_metrics: objectiveScope } }, summary: await this.summary(runId, options) });
+      if (Buffer.byteLength(fallback) > this.caps.reportJsonBytes)
+        throw new Error("compact_evidence_summary_exceeds_declared_json_bound");
+      await file.write(fallback, 0, "utf8");
+    } finally { await file.close(); }
     return name;
   }
-  finalize(runId: string, input: { status: string; reason: string }) {
-    const journal = this.journal(runId);
-    journal.append("immutable_source_snapshots", this.store.skills(runId));
-    journal.append("immutable_policy_snapshots", this.store.policies(runId));
-    return journal.finalize(input);
+  finalize(runId: string, input: { status: string; reason: string }, queryOptions?: HistoryQueryOptions): Promise<JournalFinalization> {
+    const existing = this.finalizations.get(runId);
+    if (existing) return existing;
+    const journal = this.journal(runId), options = this.queryOptions(queryOptions);
+    const work = (async () => {
+      let unfinished: { collection: string; next_after: HistoryExportCursor; page_index: number; total: number | null } | null = null;
+      let objectiveScope = unknownDerivedScope();
+      try {
+        await this.initialize(runId, options);
+        for (const collection of ["run", "sources", "policies", "executions", "trace_budget", "objective_metrics", "events", "traces"] as const) {
+          if (collection === "objective_metrics") {
+            unfinished = { collection, next_after: { record_index: 0, chunk_index: 0 }, page_index: 0, total: null };
+            objectiveScope = await this.derivedScope(runId, options);
+            if (objectiveScope.status === "unavailable") {
+              if (!journal.append("readonly_history_export_collection", { schema_version: 1, collection,
+                ...objectiveScope, next_after: { record_index: 0, chunk_index: 0 }, has_more: null,
+                logical_records: null, omitted_records: null }))
+                throw new Error("private_history_export_append_failed");
+              await journal.drain();
+              unfinished = null;
+              continue;
+            }
+          }
+          let after: HistoryExportCursor = { record_index: 0, chunk_index: 0 };
+          let pages = 0, hasMore = true, total: number | null = null;
+          unfinished = { collection, next_after: after, page_index: 0, total };
+          const verifier = new ArchiveRecordVerifier(collection);
+          while (hasMore) {
+            const page = await this.exportPage(runId, collection, after, 100, options,
+              collection === "objective_metrics" ? objectiveScope.projection!.generation : undefined);
+            if (collection === "objective_metrics") this.acceptDerivedPage(objectiveScope, page);
+            unfinished = { collection, next_after: after, page_index: pages, total: page.total };
+            const before = after;
+            after = page.next_after; hasMore = page.has_more; total = page.total; pages++;
+            verifier.accept(page.records, page.total);
+            if (!journal.append("readonly_history_export_page", { schema_version: 1, collection,
+              after: before, page_index: pages - 1,
+              snapshot: collection === "objective_metrics" ? "pinned_completed_projection_generation" : "one_readonly_query_not_a_multi_page_transaction", payload: page }))
+              throw new Error("private_history_export_append_failed");
+            await journal.drain();
+            if (page.omissions.length) throw new Error("private_history_export_records_omitted");
+            unfinished = { collection, next_after: after, page_index: pages, total };
+          }
+          verifier.finish();
+          if (collection === "objective_metrics") objectiveScope.complete = !hasMore;
+          if (!journal.append("readonly_history_export_collection", { schema_version: 1, collection,
+            ...(collection === "objective_metrics" ? objectiveScope : {}),
+            pages, next_after: after, total, has_more: hasMore, complete: true }))
+            throw new Error("private_history_export_append_failed");
+          await journal.drain();
+        }
+        await this.refreshDerivedAvailability(runId, objectiveScope, options);
+      } catch (error) {
+        journal.append("readonly_history_export_incomplete", { schema_version: 1, cursor: unfinished,
+          reason: error instanceof Error ? error.message : "history_query_failed" });
+        journal.markIncomplete("private_history_export_incomplete");
+      }
+      const finalization = { ...input, history_export: { schema_version: 1,
+        collections: { objective_metrics: objectiveScope },
+        consistency: "Objective metrics describe only their declared completed projection generation, not pending source changes. Raw pages retain separate readonly snapshots." } };
+      return journal.finalize(finalization);
+    })();
+    this.finalizations.set(runId, work);
+    return work;
   }
-  async close() {
+  close(queryOptions?: HistoryQueryOptions): Promise<void> {
+    if (this.closing) return this.closing;
     this.closed = true;
     this.unsubscribe();
     this.unsubscribeTrace();
     for (const unsubscribe of this.agentSubscriptions) unsubscribe();
     this.restoreAuthFactory?.();
     this.restoreAuthFactory = null;
-    await Promise.all([...this.journals].map(([runId]) => this.finalize(runId, { status: "interrupted", reason: "observer_closed_without_prior_finalization" })));
+    const options = this.queryOptions(queryOptions);
+    this.closing = (async () => {
+      const failures: unknown[] = [];
+      try {
+        await Promise.allSettled(this.exports);
+        for (const [runId] of this.journals) {
+          try {
+            await this.finalize(runId, { status: "interrupted", reason: "observer_closed_without_prior_finalization" }, options);
+          } catch (error) { failures.push(error); }
+        }
+      } finally {
+        try { await this.history.close(); }
+        catch (error) { failures.push(error); }
+      }
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) throw new AggregateError(failures, "Evidence observer shutdown failed");
+    })();
+    return this.closing;
   }
 }

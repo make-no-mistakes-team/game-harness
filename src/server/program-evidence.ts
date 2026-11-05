@@ -10,12 +10,14 @@ import { effectScopeSchema } from "../shared/control.ts";
 import { confirmedMinecraftGuiTransactions, minecraftGuiTransactionFactSchema, minecraftBlockRemovalFactSchema, minecraftObservationV3Schema, minecraftProductionFactSchema } from "../shared/minecraft.ts";
 import { verificationResultSchema } from "../shared/validation.ts";
 import { jsonSchema } from "../shared/primitives.ts";
-import type { Store, StoredAction, StoredRun } from "./store.ts";
+import type { StoredAction, StoredRun } from "./store.ts";
+import type { StoreReadQueries } from "./store-read.ts";
 import { canonicalContractJson, contractHash } from "./adapter-contract.ts";
 import { minecraftGoalBaselineSchema, minecraftInventoryCounts } from "./minecraft-adapter.ts";
 import type { ObjectiveMetrics } from "../shared/execution-evidence.ts";
-import { confirmedRemoval, eligibleLog, objectiveMetrics, receiptedInventoryDelta } from "./objective-metrics.ts";
+import { confirmedRemoval, eligibleLog, objectiveMetrics, receiptedInventoryDelta, type ObjectiveMetricsReadStore } from "./objective-metrics.ts";
 import { residentReceiptSchema, type ResidentReceipt } from "./resident-evidence.ts";
+export type ProgramEvidenceReadStore = ObjectiveMetricsReadStore & Pick<StoreReadQueries, "skill" | "getRun" | "skillExecution">;
 export type DetailedProgramEvidence = ProgramEvidenceView & {
   metrics: ObjectiveMetrics;
   goal_associations: { event_seq: number; relationship: "direct_receipt" | "block_removal_contributor" | "inventory_collector"; action_id: string | null;
@@ -25,15 +27,15 @@ const object = (value: Json): Record<string, Json> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
     ? value
     : null;
-type GoalRelationship = DetailedProgramEvidence["goal_associations"][number]["relationship"];
-type OwnedAction = { owner: SkillExecutionView; action: StoredAction };
-type OwnedController = { owner: SkillExecutionView; receipt: ResidentReceipt; event: ActivityEvent };
+export type GoalRelationship = DetailedProgramEvidence["goal_associations"][number]["relationship"];
+export type OwnedAction = { owner: SkillExecutionView; action: StoredAction };
+export type OwnedController = { owner: SkillExecutionView; receipt: ResidentReceipt; event: ActivityEvent };
 const removalSchemaHash = contractHash(jsonSchema.parse(z.toJSONSchema(minecraftBlockRemovalFactSchema)));
 const productionSchemaHash = contractHash(jsonSchema.parse(z.toJSONSchema(minecraftProductionFactSchema)));
 const transactionSchemaHash = contractHash(jsonSchema.parse(z.toJSONSchema(minecraftGuiTransactionFactSchema)));
 
 /** Current verdicts link retained typed facts, never item-name guesses from a new event shape. */
-function currentGoalLinks(
+export function currentGoalLinks(
   run: StoredRun,
   event: ActivityEvent,
   retained: Map<string, ActivityEvent | null>,
@@ -181,7 +183,7 @@ function currentGoalLinks(
 }
 /** Measured counters, never a weighted efficiency score or source-length proxy. */
 export function programEvidence(
-  store: Store,
+  store: ProgramEvidenceReadStore,
   runId: string,
 ): DetailedProgramEvidence[] {
   const executions = store.allSkillExecutions(runId);

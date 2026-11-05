@@ -217,7 +217,17 @@ Before inference, freeze the model selection, purpose, diagnostic hypothesis or 
 
 The acceptance runner owns its work through postprocessing and shutdown. Interruption cancels replay rendering, durably interrupts an unsettled reservation, retains already-observed goal verification in `interrupted_case`, and prevents later normal settlement or another case. It joins the original work before closing evidence, Store and ledger; cleanup does not start a replacement renderer. Replay aborts and timeouts kill the owned encoder and await its actual process-close event, retaining PNG/index/timeline evidence. Recorder and private-journal finalization close their file handles even when storage fails; incomplete evidence remains explicit.
 
-Acceptance and the separate zero-inference native-recording proof register shutdown through the SDK's supported postmortem API. The SDK exits with 130/143 after SIGINT/SIGTERM cleanup and has a ten-second hard cleanup deadline. These entries budget at most nine seconds on signals, not 25 seconds for each resource. Their early report starts with cleanup unconfirmed; deadline expiry remains unconfirmed even if some resources later drain. If an owner cannot finish before forced exit, the interrupted reservation and retained partial evidence remain auditable rather than claiming clean shutdown. Ordinary return waits for owned drain; a timeout race alone does not establish closure. An outer interruption or failure makes overall platform completion false even when an earlier case passed.
+Acceptance and the separate zero-inference native-recording proof register shutdown through the SDK's supported postmortem API. The SDK exits with 130/143 after SIGINT/SIGTERM cleanup and has a ten-second hard cleanup deadline. These entries budget at most nine seconds on signals, not 25 seconds for each resource. Their early report starts with cleanup unconfirmed; deadline expiry remains unconfirmed even if some resources later drain.
+
+Resident benchmark slots also register before their first asynchronous operation and retain that registration through durable final-result publication. A signal fences work immediately and shortens active waits to a single, non-renewable horizon of at most nine seconds, clipped by the original slot and cleanup deadlines, with one second reserved inside it for publication. Pending startup or cleanup remains unconfirmed; a timeout does not cancel the actual owner or establish closure. A signal after the slot outcome snapshot has committed still joins final-result persistence, while the parent separately records the cohort interruption. If an owner cannot finish before forced exit, the interrupted reservation and retained partial evidence remain auditable rather than claiming clean shutdown. Ordinary return waits for owned drain. An outer interruption or failure makes overall platform completion false even when an earlier case passed.
+
+Before native resident admission, the benchmark checks that the full remaining warmup and measurement fit before both the original root deadline and the slot work cutoff. It checks again after asynchronous admission, before warmup, and before starting the full measurement. Equality refuses: cleanup time is not available for measurement. Refusal records the required and available budgets and fails the consumed slot without shortening a window or granting a replacement attempt. These are necessary-fit checks, not a guarantee that later work will finish in time.
+
+New technical E01 declarations use a 300-second overall slot allowance and a three-hour series limit including overhead. The 165-second root, 30-second warmup, 120-second measurement and 25-second overall cleanup reserve are unchanged; that reserve does not extend Stop or signal-cleanup deadlines. Earlier declarations and results retain their original limits. Preparation durations and failure stages remain part of the evidence; repeated slowdowns, growth across slots or preparation exceeding the allowance require investigation before another increase.
+
+New technical E01 declarations require protocol schema 3 and `timing_capture:"full_window_native_and_resident_streams"`. The bounded private journal streams native request spans and absolute-scheduler traces from source-bound subscription through Stop and actual native/controller-context drain. Reports retain stream references and `trace_integrity`: accepted/refused counts, sequence and anchor checks, observer failures, actual owner endpoints and journal completeness. A full-window pass requires complete capture; complete evidence of a partial lifecycle does not establish a full window. Missing native stages or clock correspondence remain unknown, and applied ACKs retain input authority. The 256 MiB journal text, 16 MiB pending and 32 MiB atomic-JSON bounds are unchanged. Earlier protocol 2 results keep their original declarations.
+
+Observer-triggered Stop fences immediately and joins pending acquisition, step and native-close ownership before claiming drain. A stopping timing callback cannot dispatch a fresh sample, worker step or lease renewal, or publish a later result event. Already-dispatched input and its later ACK remain attributable.
 
 For **diagnostic attempts**, after **two unsuccessful real live attempts on the same technical hypothesis**, stop and preserve the outcome unless there is **new concrete platform evidence**. A different prompt, model, run directory or fresh conversation alone does not reset the count. An explicit evidence revision needs a reason and a concrete source/schema correction, native artifact or reproducible platform result; it preserves the preceding failures. Inspect existing evidence and use lower tiers before authorizing another diagnostic attempt. Do not loop until a preferred PASS appears.
 
@@ -281,13 +291,39 @@ The later plain wood comparison consumed one Luna and one Sol attempt under one 
 
 Reusable evaluation modules live in [`src/evaluation`](../src/evaluation/); runnable entry points belong in `scripts`. `config.ts` validates finite caps and diagnostic model selection. `policy.ts` preserves diagnostic reservations/evidence revisions and the shared private database owner; `studies.ts` owns immutable declarations, slot/request accounting, outcomes and separate drain/closure records. `paths.ts` keeps governance independent of reports and runtime material. `scenarios.ts` declares natural tasks/verifiers, `results.ts` classifies outcomes and qualified usage/timing, and `tiers.ts` classifies checks and artifact freshness. Study execution reuses the actual acceptance lifecycle and narrow Runtime/strategic admission hook. Generated help and source schemas define the DTOs.
 
+Evaluation summaries use readonly child calculations over the original retained
+event prefix, including retrospective reads for a late observer. Tool frequencies
+are counted entries; admissions remain distinct from wire attempts. Compact
+exports stream sources, policies, executions, objective metrics, events and traces
+under their existing logical-record and JSON-byte allowances. Archive continuation
+uses `{record_index,chunk_index}`; `total` counts logical records rather than
+transport chunks. Oversized retained records use ordered JSON-text chunks with
+SHA-256 and byte-count verification. Raw collection pages have separate read
+snapshots; they do not form one multi-page transaction. Objective metrics instead
+pin one complete published generation and its exact source boundary across all
+pages, retaining pending-source provenance even if newer work becomes available.
+Before the first publication, compact exports report `objective_metrics:null`
+with an explicit unavailable/pending omission, never an empty completed array.
+A missing previously published generation conflicts as corruption.
+
+The separately bounded private journal retains complete permitted evidence even
+when the compact report omits it. Query, persistence and capacity failures remain
+explicit, prevent a false platform pass, and do not bypass reader cleanup.
+SQLite schema 7 incrementally materializes objective metrics and program evidence
+from source MVCC through bounded readonly previews and atomic writer commits.
+Only complete generations are visible; raw event/trace prefixes and usage
+qualification retain their own semantics. Host checks of this mechanism do not
+establish native-control timing, gameplay effectiveness, P06 acceptance or the
+full E01 cohort. Original failed, late, interrupted and unrun slots remain part
+of their original record.
+
 `bun run check` now selects typechecking only. `bun run check unit <test-file>` and `bun run check integration <test-file>` select classified narrow suites; omit the file only when the whole tier is relevant. `bun test` remains the broad local aggregation. None of these commands builds Java/UI or grants permission to start a game/provider.
 
 ### Pull-request CI
 
-The [CI workflow](../.github/workflows/ci.yml) runs one status check, **CI checks**, for pull requests targeting `main` and pushes to `main`. It installs dependencies with the frozen lockfile, typechecks, runs the broad Bun suite and Python 3.10.22 reference-contract/process-boundary tests, and builds the UI. The Python test extra includes NumPy for genuine observation-representation regressions; tests do not load Torch, MineRL, policy weights or the model stack. Pull requests use GitHub's default temporary merge snapshot to check compatibility with the base branch; this does not publish a merge commit. Superseded runs are cancelled.
+The [CI workflow](../.github/workflows/ci.yml) runs one status check, **CI checks**, for pull requests targeting `main` and pushes to `main`. Its 20-minute infrastructure ceiling covers dependency setup, typechecking, the complete Bun suite, Python 3.10.22 reference-contract/process-boundary tests and the UI build. It does not extend individual test deadlines or native-study limits. The Python test extra includes NumPy for genuine observation-representation regressions; tests do not load Torch, MineRL, policy weights or the model stack. Pull requests use GitHub's default temporary merge snapshot to check compatibility with the base branch; this does not publish a merge commit. Superseded runs are cancelled.
 
-CI does not start Minecraft, Docker, Electron or model providers, and does not build Java. Tests use temporary storage, subprocesses and loopback connections. Evidence-freshness fixtures set file times relative to the recorded baseline rather than relying on filesystem timestamp resolution or sleeps. Native-game and live-agent evaluation remain separate, explicitly admitted tiers.
+Dependencies install from the frozen lockfile. CI does not start Minecraft, Docker, Electron or model providers, and does not build Java. Tests use temporary storage, subprocesses and loopback connections. Evidence-freshness fixtures set file times relative to the recorded baseline rather than relying on filesystem timestamp resolution or sleeps. Native-game and live-agent evaluation remain separate, explicitly admitted tiers.
 
 The workflow does not configure branch protection: results are informational unless maintainers separately require **CI checks**. A green run covers its tested revision, not later changes to either branch. Inspect the failed step's log before review or integration; passing CI does not establish gameplay success or replace code review.
 
@@ -330,19 +366,60 @@ these interventions are not agent decisions or natural gameplay.
 uses the separate zero-provider `resident_platform` StudyLedger condition.
 Register the complete immutable declaration first with `evaluate register-study`.
 The runner checks source/build/profile/controller identities and reserves each
-sequential slot before a fresh native child process. A one-cell calibration
-cannot substitute for its prescribed 27-cell rate/delay cohort. Every cell
+sequential slot before a fresh native child process. The prospective one-cell
+calibration selects 20 Hz with a 30-second synthetic reasoning wait and logical
+repetition label 2, matching that cell's declared cohort workload. Its schedule
+contains one order-0 entry and permits one reservation, not two attempts.
+Calibration cannot substitute for the prescribed 27-cell rate/delay cohort. Every cell
 retains the full 30-second warmup and 120-second measurement, expected lower-rate
 expiry, actual native application ages, logging/compile/capture load and
 original-speed evidence. The initial 4096-row nonplaying history corpus is
 committed in one durable Store transaction before warmup; its actual preparation
 time is retained separately from the recurring measured history reads.
+Each scheduled history read uses the same readonly query service as application
+history: the original 500-row event pages, complete program-evidence reduction
+and immutable-source hydration execute in the child. Corpus size, scheduled
+measurement work and observation windows stay unchanged. Evidence retains query
+start/end/error, actual observed child-exit and pipe-drain timestamps, and the
+reader's cleanup barrier before Store closure. A host-only isolation check does
+not establish native continuity or satisfy E01 acceptance.
 Failed/interrupted slots remain consumed; unknown
 cleanup retains ownership and closes admissions. Provider identities and
 allowances are null/zero, and a technical pass never becomes agent completion.
 A failed admission before native fixture creation can confirm that no native
 owner was acquired; it does not invent a native cleanup report. Once a fixture
 exists, confirmed drain requires its retained native report.
+
+The same owned-slot runner also accepts a separately authorized P13 action-history
+volume assay: protocol 4, `mode:"p13_volume"`, with exactly 30, 300, 3,000,
+10,000 and 60,000 actions in five sequential slots. Each selects 20 Hz, a
+30-second synthetic wait and logical repetition label 2. This is not an E01
+mode or five relabelled calibrations; the strict protocol-3 E01 allocation,
+source, windows, acceptance and original history workload remain unchanged.
+P13 reports cannot establish E01 completion or model competence.
+
+Raw actions are admitted and saved through Store in a separate, explicitly
+synthetic nonplaying run before warmup. Preparation time is retained, not
+reported as measured ingestion. The first derived publication occurs during
+measurement, followed by five fixed receipt corrections and their separately
+captured preparation frontiers at 20, 40, 60, 80 and 100 seconds. Bounded reads
+and memory/queue samples retain pending work, misses and unknown values. Writer
+evidence distinguishes synchronous call spans from asynchronous settlement.
+The original 4,096-event run and its reader retain their declared work. Required
+P13 work that cannot finish within measurement fails; safe input expiration is
+not continuity.
+
+The P13 workflow binds its original authorization wall and OS-monotonic clocks,
+including preparation, registration, playback and final verification. Later
+registration cannot restart the allowance. On supported 64-bit Linux, the
+evaluator reads `clock_gettime(CLOCK_MONOTONIC)` directly: Bun 1.3.14's
+process-relative `hrtime` cannot bind independent processes or OS witnesses.
+These workflow clocks do not replace native capture-to-applied-input latency.
+The dedicated P13 Learning/reader owner must drain before Store closure, and
+every slot's owner is checked before any replay encoder starts. A trusted
+sandbox namespace snapshot permits independent read-only guardian/container
+release probes without exposing that identity to generated programs. Full
+original-speed media review and noticeable-gameplay review remain separate gates.
 
 The declaration must select normal generation and enabled structures; the
 runner checks the actual owned world's safe settings before admission.
@@ -666,7 +743,32 @@ Compare actual confirmed block removals, receipted own inventory deltas, target-
 
 Durable deduplicated death/failure/outcome opportunities reach the same strategic model. It inspects named source/feedback/trace through `program_inspect`, authors its own candidate and uses `program_write` with exact `based_on` plus a bounded experiment `reason` to link the actual revision to matching parent feedback. The host supplies exact evidence identities. If no revision is chosen, `program_review` records `keep` or `insufficient_evidence` with the reason; no bookkeeping-only second inference is required for a performed revision. Either assessment permits a later repair: the original resolution stays immutable, and `learning.candidate_written` separately retains the new candidate's exact lineage, outcome evidence and reason. No review call is required before authoring.
 
-A changed version is an unmeasured candidate until execution evidence exists. The comparison view exposes actual source/card differences and before/after raw samples with `descriptive_only_no_causal_improvement_claim`; even measured candidates are not automatically proven better. Decisions record experimental disposition, not confidence in improvement. Eligibility and promotion remain separate; missing samples, invalid linkage and trace omissions remain explicit.
+Feedback V2 delivers published opportunity/resolution updates and metric
+`replace` or `retract` updates, including corrections to previously returned
+executions. Removal from a named scope retracts the old metric with reason
+`execution_removed`; it does not imply that the execution was deleted everywhere.
+A family/version move atomically retracts the old scope and replaces the new
+scope, even for the same execution ID. Retraction never invents a metric value.
+Executions removed before their first publication are not emitted. Exact program,
+execution ordinal, revision and generation retain the update's provenance. Its
+independent change sequences and scope hash bind continuation to the selected
+run/family/version. Projection provenance distinguishes the published source
+boundary from available source work; `has_more:false` does not clear
+`has_pending:true`. Preparation follows committed source changes and bounded
+dependency work; an inspection read never advances publication.
+
+A changed version is an unmeasured candidate until execution evidence exists. The comparison view exposes actual source/card differences and before/after raw samples with `descriptive_only_no_causal_improvement_claim`; even measured candidates are not automatically proven better. Comparison V2 pins both complete published generations, selected immutable versions and caller scope across continuation and reopen. It includes executions that started and ended, including unknown outcomes, but excludes undispatched cancellations. Samples retain before-side then after-side insertion order. Decisions record experimental disposition, not confidence in improvement. Eligibility and promotion remain separate; missing samples, invalid linkage and trace omissions remain explicit.
+
+Page limits omit whole metric/evidence records with recoverable references,
+rather than truncating their fields. Retrieve a full authorized record through
+the actor's named `program_inspect` `metric` or `evidence` view using its exact
+version, execution ordinal and generation, or through the corresponding
+operator generation-pinned execution route in
+[runtime contracts](runtime-contracts.md#current-compact-program-interface).
+Retained prior generations remain readable by ordinal after live-ledger deletion.
+Continue archive chunks and verify the complete record before interpreting an
+omission as missing evidence or claiming a comparison population is complete.
+Generated help and source schemas own the callable DTOs.
 
 If the task remains unsatisfied, the model may revise and retry through ordinary bounded admission. After verified goal success, a single bounded effect-free review can inspect evidence and author linked candidates before completion, but cannot conduct extra gameplay trials. Goal closure retains the healthy game session. Optional bounded lookahead records actual overlap, validation/rejection/activation and usage; only fresh session/life/task/predecessor/source checks can activate it. Neither overlap nor the historical 31/13/7-call receipts establishes controlled efficiency or causal savings.
 

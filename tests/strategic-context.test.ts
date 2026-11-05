@@ -12,6 +12,7 @@ import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import type { AuthManager } from "../src/server/auth.ts";
 import { StrategicPlanner } from "../src/server/strategic.ts";
 import { StrategicContext } from "../src/server/strategic-context.ts";
+import { programHelp } from "../src/server/program-help.ts";
 import { Store } from "../src/server/store.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { retainResidentReceipt } from "../src/server/resident-evidence.ts";
@@ -45,14 +46,15 @@ function fixture() {
   const state = { adapter, run: minecraftRunFixture(adapter, { model_id: model().id, task: "Observe neutral fixture state" }),
     observation: minecraftObservationFixture(adapter), generation: 1, creates: 0, root: "Neutral context fixture",
     requests: [] as Context[], responses: [] as AssistantMessage[], toolEffects: 0, helpEffects: 0, toolSchema: "original",
-    helpPadding: "", selectedModel: model() as Model, submitResult: null as Json, completedToolEvents: false };
+    helpPadding: "", helpResults: {} as Record<string, Json>,
+    selectedModel: model() as Model, submitResult: null as Json, completedToolEvents: false };
   store.saveRun(state.run);
   const help: AgentTool = { name: "help", label: "help", description: "Load a requested contract section",
     parameters: { type: "object", properties: { topic: { type: "string" } } },
     execute: async (_id, input) => {
       state.helpEffects++;
       const topic = input && typeof input === "object" && "topic" in input ? input.topic : "overview";
-      const value = { bindings: { fixture_read: { parameters: ["query"], result: "NeutralValue" } },
+      const value = state.helpResults[String(topic)] ?? { bindings: { fixture_read: { parameters: ["query"], result: "NeutralValue" } },
         section: `requested-${topic}`, body: `Useful exact requested contract${state.helpPadding}` };
       return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
     } };
@@ -457,6 +459,39 @@ test("actual continuation after help receives newly requested useful context in 
   const f = fixture(); await f.planner.start(1); await f.turn([f.requestHelp(), settlement()]);
   expect(f.state.requests).toHaveLength(2);
   expect(JSON.stringify(retained(f.state.requests[1])?.requested_help)).toContain("fixture_read");
+});
+
+test("actual requested program references survive game schema pressure in the next ordinary request", async () => {
+  const f = fixture(), program = await f.program();
+  const programs = JSON.parse(JSON.stringify(programHelp("programs", f.adapter)));
+  const game = JSON.parse(JSON.stringify(programHelp("game", f.adapter)));
+  f.state.helpResults.programs = programs;
+  f.state.helpResults.game = game;
+  await f.planner.start(1);
+  await f.turn([f.requestHelp("programs"), f.requestHelp("game"), settlement()]);
+  await f.turn();
+  const assertRequestedReferences = () => {
+    const request = f.state.requests.at(-1)!, context = retained(request)!;
+    expect(request.messages).toHaveLength(1);
+    for (const [section, content] of [
+      ["resident.contract", programs.resident.contract],
+      ["resident.operations", programs.resident.operations],
+      ["resident.input_transitions", programs.resident.input_transitions],
+      ["resident.gui_completion", programs.resident.gui_completion],
+      ["resident.sensing", programs.resident.sensing],
+    ]) {
+      expect(context.requested_help).toContainEqual({ topic: "programs", section, content });
+    }
+    expect(context.requested_help).toContainEqual({ topic: "game", section: "methods.observe", content: game.methods.observe });
+    expect(context.programs).toContainEqual(expect.objectContaining({ name: program.name, source: program.source }));
+    expect(context.omissions).toContainEqual(expect.objectContaining({ kind: "help", reason: "retained_help_byte_budget" }));
+    expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32768);
+    expect(context.requested_help.reduce((sum: number, section: unknown) => sum + Buffer.byteLength(JSON.stringify(section)), 0)).toBeLessThanOrEqual(24576);
+  };
+  assertRequestedReferences();
+  await f.planner.close(); f.state.generation++;
+  await f.planner.start(f.state.generation); await f.turn();
+  assertRequestedReferences();
 });
 
 for (const status of ["unknown", "refused"] as const) {

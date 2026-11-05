@@ -54,7 +54,7 @@ The ordinary default exposes these tools:
 | `program_write` | Create a named immutable `run`, `step` or `analyze` revision; omitted card/dependencies remain unspecified and untested. |
 | `program_submit` | Explicitly write an immutable version and request its exact-version start through ordinary admission; report persistence separately from a refused or uncertain start. |
 | `program_run` | Start a matching `run`/`step`, inspect or stop it, version-update resident intent, run a pure analysis job, activate prepared run work or select a finite attention wake. |
-| `program_inspect` | Read catalog/source/execution/history/trace/feedback/comparison/planning and mechanical reference views. |
+| `program_inspect` | Read catalog/source/execution/history/metric/evidence/trace/feedback/comparison/planning and mechanical reference views. |
 | `program_review` | Record `keep` or `insufficient_evidence` for a named version's latest matching outcome, with reason. |
 | `help` | Load generated game/program/planning reference or disclose optional advanced modules on demand. |
 | `task_finish` | Request safe closure of a custom task with a model-authored completion summary; not independent goal verification. |
@@ -83,9 +83,99 @@ Review with an explicit version stays exact. Without one, `program_review` selec
 
 Model selectors use human names and optional exact versions; the host resolves IDs, hashes and authority scope. Starting without `version` pins latest validated once before admission. Catalog pages expose the latest stored revision per family with cursors; execution/history/source lookup never rewrites an already captured reference. Inspection preserves explicit omissions and independent feedback cursors.
 
+History, feedback, trace, comparison and review-context queries run in a trusted
+readonly child process. The child performs retrieval, bounded projection previews
+and paging within one short SQLite read snapshot per request. The host admits one
+active request and up to eight queued requests, with absolute deadlines and
+cancellation. Complete UTF-8 request and response frames, including their
+envelopes and newline, are capped at 8 KiB and 64 KiB. A cancelled active query
+settles only after the owned child exits and its output pipe drains. Stop fences
+input independently before joining that drain; no query can restore effect or
+provider authority.
+
+SQLite schema 7 retains writer-owned source MVCC and versioned derived history.
+Source changes to runs, actions, executions, events, traces, trace budgets and
+immutable program metadata receive durable change sequences. The writer seals
+prior raw values before mutation; an unchanged current value can remain backed
+by its original row. A source snapshot reads as of an explicit sequence boundary,
+preserving original ordinals, deletions and missing authority. Source-key
+bootstrap and indexed source pages are bounded to 128 rows.
+
+Preparation captures its desired source boundary once and never chases later
+mutations within that invocation. A readonly preview computes at most 64 patches
+and 16 opportunity captures within 128 work iterations. The writer validates
+scope, progress, bounds and the prior checkpoint, rechecks candidate captures
+against current evidence, then atomically commits patches and checkpoint progress.
+Failure rolls back the batch; reopen resumes the last committed checkpoint.
+Every continuation must fit the complete 8 KiB request frame, including its
+envelope and newline, before it can be committed; fitting the reply alone is
+insufficient.
+
+Only complete derived generations become public. Their retained mappings pin the
+derived revision and exact `source_through` across reopen; staged metrics and
+opportunities stay hidden until publication. Indexed dependencies select affected
+outcomes, action contributions, trace suffixes and goal links for bounded work.
+Action and trace removal jobs persist forward `(order_seq,key)` cursors with
+their patches, so later batches do not rescan a growing deleted prefix. Rollback,
+discarded previews and reopen preserve committed progress; removal cursors clear
+before contribution addition or replay.
+Goal link/dependency clearing also commits forward progress with deletions.
+Goal invalidation uses indexed dependencies and retained observation eligibility
+cutoffs; qualified action changes consider the earliest old/new cutoff. Candidate
+reads exclude executions ending after those observations, while evidence
+associations retain their original terminal order.
+Production reads use these materialized rows rather than rerunning whole-history
+reducers or rewriting unrelated dependencies.
+
+Preparation admits one active caller and eight FIFO waiters per run. Each keeps
+its own cancellation and original absolute deadline; a waiting caller's
+cancellation does not cancel the active caller. Its turn starts a separate pass,
+without retrying a failed pass or extending a deadline.
+
+Exact ID, version and family lookups are independent of presentation limits.
+Named projections select their population before hydrating only returned rows
+and explicit omission references. Feedback V2 uses independent
+`opportunity_change_seq` and `metric_change_seq` cursors bound by `scope_hash` to
+the run and selected family/version. It reports opportunity resolutions and
+metric `replace` or `retract` updates after earlier pages, with exact program,
+execution ordinal, revision and generation provenance. Removal from a named
+scope retracts the prior metric with reason `execution_removed`; the execution
+may still exist under another scope. A family/version move atomically retracts
+the old scope and replaces the new scope, even when the execution ID is unchanged.
+Executions removed before their first publication are not emitted.
+Retraction never fabricates a replacement metric. Named actor views retain
+program/ordinal references without exposing opaque execution IDs. These are live update streams,
+not insertion-only cursors.
+Comparison V2 instead pins both complete generations plus an offset and scope
+hash; continuation retains those populations despite later updates or reopen.
+Old cursor formats are rejected.
+
+Live pages expose `generation`, `source_through`, `source_available` and
+`has_pending`. Exhausting a page stream does not establish that pending source
+work is published; before the first complete publication, derived reads conflict
+rather than report empty success. Read-only inspection never starts preparation.
+Committed source notifications schedule effect-free preparation, including
+eventless changes and retained runs after reopen. Durable journals own progress;
+a failure audit alone cannot schedule a retry. Revision and review bindings retain
+their original outcome across retries.
+
+The operator's `GET /v1/runs/:id/skill-evidence` returns an insertion-offset page
+with records, continuation, omissions and projection provenance. It can include
+running executions. The desktop retains one requested measurement page and links
+records by execution ID. Oversized metrics and evidence are omitted as whole
+records, with recoverable references; DTO fields are not truncated. Actors use
+`program_inspect` views `metric` and `evidence` with an exact named version,
+execution ordinal and generation. A retained prior generation remains readable
+by that ordinal even after deletion from the live execution ledger. Operators use
+`GET /v1/runs/:id/objective-metrics/:executionId` or
+`GET /v1/runs/:id/skill-evidence/:executionId` with the required generation.
+Both expose lossless archive continuation through `{record_index,chunk_index}`;
+assemble ordered JSON-text chunks and verify their byte count and SHA-256.
+Generated help and source schemas define the callable DTOs.
+
 Write, start and prepare results are compact named status/experiment summaries. Execution inspection includes effective limits and the resident's current bounded snapshot; source inspection supplies code, card and validation details.
 
-The strategist keeps a run-owned reference context outside its disposable Agent. Each actual SDK stream invocation, including tool-loop continuations, receives a supplement capped at 32 KiB serialized UTF-8: compact contracts, objective, model-authored recovery state, latest consequential obstruction, unresolved-operation references, relevant compatible immutable source and useful requested help. This is included in the actual request, not merely cached on the host. Source and its reuse metadata share an 18 KiB allowance; retained help has a 24 KiB ceiling. Both share the same 32 KiB request cap rather than additive reservations. Oversized documentation is split at schema/property boundaries; whole sources are either included or explicitly omitted, never truncated into executable fragments. This supplements, rather than replaces, bounded current observations, tool pairs and turn feedback.
+The strategist keeps a run-owned reference context outside its disposable Agent. Each actual SDK stream invocation, including tool-loop continuations, receives a supplement capped at 32 KiB serialized UTF-8: compact contracts, objective, model-authored recovery state, latest consequential obstruction, unresolved-operation references, relevant compatible immutable source and useful requested help. This is included in the actual request, not merely cached on the host. Source and its reuse metadata share an 18 KiB allowance; retained help has a 24 KiB ceiling. Both share the same 32 KiB request cap rather than additive reservations. Requested semantic reference sections take precedence over generated JSON-schema sections, including nested schemas, so a large schema does not evict the resident's mechanical instructions first. Oversized documentation is split at schema/property boundaries; whole sources are either included or explicitly omitted, never truncated into executable fragments. This supplements, rather than replaces, bounded current observations, tool pairs and turn feedback.
 
 Programs can report `current_subgoal`, `worksite`, `resource_requirements` and `recovery_reason` through existing `game.progress` details or their returned result. Selected bounded notes and up to four explicitly returned positions survive ordinary turns and safe Agent recreation; an unspecified program card is not a current subgoal. These are labelled model-authored notes, not current inventory, target authority or success proof. Current observations must supply resources and freshly reacquired handles. Session/life/native-boot/space changes clear current dynamic notes. Explicit subgoal/worksite notes can remain separately labelled historical references with their original scope; a task/world/fresh-run change clears that retained experience. A generic execution closure does not hide its actual action obstruction; selected mechanical receipt fields remain available without restoring old target handles or full observations.
 
@@ -171,7 +261,7 @@ sealed SHA256 before using per-image options and permits only local file
 protocols; it is not an arbitrary concat script importer. Historical PNGs,
 indexes and movies remain unchanged.
 
-The active boundary uses observation envelope **3**, executable API/validator/runtime **5**, native hello **4**, and `minecraft.action@4`. Isolated worker framing remains **1**; resident messages use their own version-1 namespace. Login admission proof remains **1**, live binary capture is **GHV2**, SQLite remains **4**, usage metrics remain **2**, and request-usage evidence remains **1**. Screen and controller-feedback reads use `minecraft.visible_screen@1` and `minecraft.controller_frame@2`. Semantic heard-event feedback is separate from audio recording, which remains absent. This cutover does not deliver larger source bundles, checkpoints or another supported game.
+The active boundary uses observation envelope **3**, executable API/validator/runtime **5**, native hello **4**, and `minecraft.action@4`. Isolated worker framing remains **1**; resident messages use their own version-1 namespace. Login admission proof remains **1**, live binary capture is **GHV2**, SQLite uses schema **7**, usage metrics remain **2**, and request-usage evidence remains **1**. Screen and controller-feedback reads use `minecraft.visible_screen@1` and `minecraft.controller_frame@2`. Semantic heard-event feedback is separate from audio recording, which remains absent. This cutover does not deliver larger source bundles, checkpoints or another supported game.
 
 ### Ordinary Minecraft world input
 
@@ -362,6 +452,19 @@ Every step returns `input`, explicit `next_state`, `status` and bounded
 `events`. State and intent each fit 16 KiB of JSON; the complete worker
 output, envelope and newline fit 64 KiB at depth 32.
 
+Authoring guidance prefers useful persistent local taskflows over a new
+inference for each target or short input interval. Attention and explicit
+intent updates can preserve a useful controller during reasoning. This is
+an instruction to the model, not proof of natural gameplay or elimination
+of cold authoring time.
+
+World `held` is the final state after applying ordered `edges` to the
+previous submitted state, initially neutral. Every changed held boolean
+needs its matching press or release edge. Track submitted state separately
+from the potentially lagging `last_input` application acknowledgment.
+Before screen input, submit neutral world state with the required releases.
+A non-running result retires without submitting its returned input.
+
 Resident sampling waits for a render and a client tick newer than the
 stream's last successful sample or grant. It constructs a fresh body with
 its actual capture time; it does not synchronize that body with RGB pixels.
@@ -372,6 +475,10 @@ deadline and can end earlier on lease or authority loss. An invalidated
 resident read waits for physical input release before its error; explicit
 revoke also queues its genuine retirement ACK first. Sampling waits and
 missed slots remain part of cadence evidence, not capture-to-applied latency.
+A well-framed late sample received after retirement, or for a different
+controller owner, receives an explicit request error without closing the
+native connection or revoking a replacement owner. This does not admit
+stale input or change the separate occupied-lane and framing rules.
 
 `step_ms` bounds isolated worker/guardian evaluation, including serialization.
 The host separately permits at most 500 ms for a step response, under the
@@ -394,6 +501,11 @@ receipts remain separate. GUI receipts retain their original controller
 sequence and source, including confirmed prefixes with unknown suffixes.
 They can contribute adapter-owned verification facts without a finite
 `ActionView` or a second input owner.
+Visible cursor or slot changes can precede gesture completion. A dependent
+GUI operation waits for the matching application acknowledgment and terminal
+effect receipt; empty screen operations keep sampling while it is pending.
+An unknown result must not be replayed. Full execution inspection includes
+`resident.reason` when a generic execution summary omits the rejection cause.
 
 `args` supplies initial intent; `initial_state` defaults to null at actor
 ingress. `update_intent` requires the current `expected_version` (initially
@@ -479,6 +591,17 @@ an empty GUI snapshot can use an earlier ACK sample. GUI dwell remains part of
 application time. These records distinguish queue waiting from later input
 phases without changing FIFO ordering or treating progress telemetry as
 confirmed input.
+
+Ordinary replies can carry bounded `controller_opportunities` batches: actual
+preparation entry/exit, empty or skipped queue decisions, predecessor/completion
+state and sample/render readiness. Producers record evaluated decisions without
+replaying predicates; nonblocking buffers retain accepted prefixes and report
+omissions. Identity, event sequence, native tick and preparation ordinal remain
+distinct. Retirement ACKs keep their reserved size and ordering; final batches
+use later existing ordinary replies, never extra queries. Missing final carriers,
+unattached events and omissions leave coverage incomplete. These diagnostic
+hooks do not replace capture-to-applied age: authoritative ACK time minus the
+matching native capture time.
 
 Trusted resident tracing optionally records the absolute slot anchor, scheduled
 deadline, actual wake, sample, worker return, validation, renewal and submission.
@@ -1030,12 +1153,14 @@ Current HTTP interfaces include:
 | `POST /v1/runs` | `{task,goal,model_id,experience_id?,working_programs?}`; optional exact SHA-256 snapshot and same-session `"continue"|"fresh"` selection. Creates a run, not game effects. |
 | `GET /v1/runs/{run_id}` | Authorized retained run projection. |
 | `GET /v1/runs/{run_id}/events` | Bounded JSON history with cursor and explicit omitted details, not SSE. |
-| `GET /v1/runs/{run_id}/skill-evidence` | `{evidence}` linked program/execution/action results. |
+| `GET /v1/runs/{run_id}/skill-evidence` | Insertion-offset `after`, `limit`; records, continuation, omissions and published projection provenance. |
+| `GET /v1/runs/{run_id}/objective-metrics/{execution_id}` | Required `generation`; lossless full metric archive with `record_index`, `chunk_index`, `limit` continuation. |
+| `GET /v1/runs/{run_id}/skill-evidence/{execution_id}` | Required `generation`; lossless full evidence archive with the same chunk cursor. |
 | `GET /v1/runs/{run_id}/trace` | Cursor `after`, `limit`, optional `execution_id`; bounded actual execution/root trace. |
-| `GET /v1/runs/{run_id}/improvements` | Independent `after_opportunity=0`, `after_execution=0`, `limit=32` cursors; opportunities and objective metrics with structured `next_after`. Legacy numeric `after` is rejected with 400. |
+| `GET /v1/runs/{run_id}/improvements` | Optional JSON-encoded V2 `after`, `limit`; independent opportunity/metric update streams, structured `next_after`, omissions and projection provenance. Legacy insertion cursors are rejected. |
 | `GET /v1/runs/{run_id}/deaths` | Cursor `after`, `limit`; `{episodes,next_after,has_more}` with last authorized context. |
 | `GET /v1/runs/{run_id}/planning` | `{plan}` bounded lookahead projection. |
-| `POST /v1/program-comparisons` | Exact `before`/`after` `{run_id,skill_id,version,hash}`, optional `after_sample`, `limit`; `{comparison,next_after,has_more,omissions}`. Read-only evidence computation behind mutation authorization, not gameplay. |
+| `POST /v1/program-comparisons` | Exact `before`/`after` versions; nullable V2 `after_sample` pins both published generations, offset and caller scope. Returns comparison, continuation, omissions and projection provenance. Read-only computation behind mutation authorization, not gameplay. |
 | `POST /v1/runs/{run_id}/controls` | `{command,request_id}` with command `start`, `pause`, `resume` or `stop`. |
 | `GET /v1/events` | Authenticated live SSE activity. |
 | `GET /v1/video` | Authenticated same-origin binary RGBA WebSocket; no input forwarding. |
@@ -1061,7 +1186,7 @@ The route supplies `run_id`. Invalid transitions conflict; unknown IDs do not cr
 | `running` | `pausing`, `recovering`, `stopping`, `reviewing`, `completed`, `failed`. Normal death changes player life, not run state. Verified completion requires objective evidence and no live effect lease; model-reported custom completion instead requests `stopping` → `stopped`. |
 | `reviewing` | Effect-free bounded model review after verified goal; `completed`, `stopping` or `failed`. No further gameplay trial is admitted. |
 | `pausing` | `paused` only after admission is fenced and controls neutralized or the declared adapter safety fence is established; otherwise `recovering`, `stopping`, `failed`. |
-| `paused` | `running` on deliberate resume after fresh observation; `recovering`, `stopping`, `failed`. Resume restores neither old JS stacks nor a fresh evaluation allowance. |
+| `paused` | `running` on deliberate Resume after confirmed prior-owner drain and fresh observation; unconfirmed emitter/native drain also requires a fresh epoch. Otherwise `recovering`, `stopping`, `failed`. Resume restores neither old JS stacks nor a fresh evaluation allowance. |
 | `recovering` | `running` or `paused` after reconciliation; `stopping`, `failed`. Prior pause/stop intent is preserved. |
 | `stopping` | `stopped` after confirmed input neutralization, worker/planner/action drain and durable run closure, retaining a healthy game session. This includes operator stop and model-requested custom-task closure, not verified task success. `recovering` if fencing certainty is lost; `failed` if recovery cannot establish safe closure. Stop intent survives recovery. |
 | `stopped`, `completed`, `failed` | Terminal run records. A later new attempt has a new run ID; evidence can still be appended as reconciliation/intervention events without reopening effects. |

@@ -18,12 +18,43 @@ async function acceptanceLifecycle(mode: string) {
     const [stdout, stderr, exit] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
     ]);
-    const expectedExit = mode === "deadline" || mode.startsWith("image-") || mode.startsWith("development-") ? 0 : mode === "sigterm" ? 143 : 130;
+    const expectedExit = mode === "deadline" || mode === "manifest-failure" || mode.startsWith("image-") || mode.startsWith("development-") ? 0 : mode === "sigterm" ? 143 : 130;
     if (exit !== expectedExit) throw new Error(`Isolated acceptance ${mode} failed (${exit}, expected ${expectedExit}): ${stderr}\n${stdout}`);
     const line = stdout.split("\n").find(value => value.startsWith("ACCEPTANCE_RESULT "));
     if (!line) throw new Error(`Missing actual acceptance lifecycle evidence: ${stderr}\n${stdout}`);
     return JSON.parse(await readFile(join(root, "fixture-result.json"), "utf8"));
   } finally { clearTimeout(deadline); }
+}
+
+for (const mode of ["manifest-failure", "manifest-failure-sigint"]) {
+  test(`${mode} joins the actual observer reader before Store close despite a cached manifest rejection`, async () => {
+    const result = await acceptanceLifecycle(mode);
+    expect(result.manifestPersistenceError).toContain("EEXIST");
+    expect(result.result.failure).toContain("EEXIST");
+    expect(result.result.platform_complete).toBe(false);
+    expect(result.report.results).toHaveLength(0);
+    expect(result.attempts).toEqual([expect.objectContaining({ state: "interrupted", settlement: null })]);
+    expect(result.report.cleanup_confirmed).toBe(false);
+    expect(result.report.resource_cleanup).toContainEqual({ resource: "private_model_evidence", closed: false });
+    expect(result.report.resource_cleanup).toContainEqual({ resource: "store", closed: true });
+    expect(result.report.private_model_evidence_failures).toEqual([
+      expect.stringContaining("EEXIST"), expect.stringContaining("EEXIST"),
+    ]);
+    expect(result.readerBeforeClose.child.pid).toBeGreaterThan(0);
+    expect(result.readerBeforeClose.child.closedHostMs).toBeNull();
+    expect(result.readerAliveWhileHeld).toBe(true);
+    expect(result.storeClosedWhileReaderHeld).toBe(false);
+    expect(result.returnedWhileReaderHeld).toBe(false);
+    expect(result.readerAtStoreClose).toMatchObject({ closed: true, active: false, queued: 0 });
+    for (const stamp of ["exitObservedHostMs", "stdoutDrainObservedHostMs", "closedHostMs"]) {
+      expect(result.readerAtStoreClose.child[stamp]).toBeNumber();
+      expect(result.readerAtStoreClose.child[stamp]).toBeLessThanOrEqual(result.storeClosedAt);
+    }
+    expect(result.report.cleanup_budget_ms).toBe(300);
+    expect(result.nextWorlds).toBe(0);
+    expect(result.unchangedAfterReturn).toBe(true);
+    expect(result.unhandled).toEqual([]);
+  }, 15000);
 }
 
 test("a synthetic renderer exits when its fixture owner is hard-killed", async () => {

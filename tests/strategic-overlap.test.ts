@@ -123,7 +123,7 @@ function setup(onPrompt: (context: Record<string, unknown>, agent: HarnessAgent)
     policies: () => [], action: () => null, programPending: () => state.pending, busy: () => state.pending,
     persist: () => store.saveRun(run), pause: (reason) => { state.pauses.push(reason); },
     terminal: () => { throw new Error("Unexpected terminal transition"); }, speculation: () => speculation,
-    reviewContext: () => ({ opportunities: [], uncertainty: "unmeasured" }),
+    reviewContext: async () => ({ opportunities: [], uncertainty: "unmeasured" }),
     reviewComplete: () => { state.reviews++; run.status = "completed"; planner.fence(); },
   });
   resources.push({ planner, store, directory });

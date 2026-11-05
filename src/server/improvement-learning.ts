@@ -1,9 +1,10 @@
-import { createHash } from "node:crypto";
 import type { Json } from "../shared/contracts.ts";
-import type { ImprovementFeedbackCursor, ImprovementOpportunity, ProgramVersionEvidence } from "../shared/execution-evidence.ts";
+import type { ImprovementOpportunity, ProgramVersionEvidence } from "../shared/execution-evidence.ts";
 import { IMPROVEMENT_RESOLUTION_HELP } from "../shared/execution-evidence.ts";
 import type { Store } from "./store.ts";
-import { evidenceObject, objectiveMetrics } from "./objective-metrics.ts";
+import { projectionBatchSchema, type HistoryQueryClient, type HistoryQueryOptions } from "./history-protocol.ts";
+import type { ProjectionCheckpoint } from "./history-projection.ts";
+import { exactVersion } from "./program-feedback.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 
 export interface ImprovementResolution {
@@ -14,98 +15,218 @@ export interface ImprovementResolution {
   revision: ProgramVersionEvidence | null;
   event_seqs: number[];
 }
-export function exactVersion(store: Store, ref: ProgramVersionEvidence) {
-  const skill = store.skill(ref.run_id, ref);
-  if (skill.hash !== ref.hash) throw new Error("Version reference does not match immutable source hash");
-  return skill;
-}
 /** Reports actual failures/outcomes; the model alone supplies the change and rationale. */
 export class ImprovementLearning {
-  constructor(private readonly store: Store) {}
-  feedback(runId: string, after: ImprovementFeedbackCursor = { opportunity_seq: 0, execution_seq: 0 }, limit = 32) {
-    this.assertFeedbackCursor(after, limit);
-    this.detect(runId);
-    return this.readFeedback(runId, after, limit);
-  }
-  readFeedback(runId: string, after: ImprovementFeedbackCursor = { opportunity_seq: 0, execution_seq: 0 }, limit = 32) {
-    this.assertFeedbackCursor(after, limit);
-    const opportunities = this.store.evidenceObjects<ImprovementOpportunity>(runId, "opportunity");
-    const metrics = objectiveMetrics(this.store, runId);
-    const cap = Math.min(limit, 100);
-    const opportunityRows = this.store.evidenceObjectRows<ImprovementOpportunity>(runId, "opportunity", after.opportunity_seq, cap + 1);
-    const executionRows = this.store.skillExecutionRows(runId, after.execution_seq, cap + 1);
-    const all = [
-      ...opportunityRows.map((row) => ({ kind: "opportunity" as const, seq: row.seq, value: row.value })),
-      ...executionRows.map((row) => ({ kind: "metric" as const, seq: row.seq, value: metrics.find((metric) => metric.execution_id === row.value.execution_id)! })),
-    ];
-    const page = {
-      opportunities: [] as ImprovementOpportunity[],
-      metrics: [] as typeof metrics,
-      next_after: { ...after }, has_more: false,
-      omitted: [] as { kind: string; id: string; reason: string; original_bytes: number }[],
-      opportunity_budget: { max_records: 256, reached: opportunities.length >= 256, omission: "Further outcome events remain in the permanent event ledger when this budget is reached." },
-      decision_contract: IMPROVEMENT_RESOLUTION_HELP,
-      review: { effect_free: true as const, max_decisions: 4 },
+  private readonly preparing = new Map<string, { start(): void; cancel(): void }[]>();
+  private readonly admissions = new Map<string, {
+    epoch: number;
+    suspended: boolean;
+    active: Set<Promise<void>>;
+  }>();
+  private closed = false;
+
+  constructor(private readonly store: Store, private readonly reader: HistoryQueryClient) {}
+
+  /** Readonly work runs in bounded child pages; only current, exact candidates reach the writer. */
+  async prepareFeedback(runId: string, options: HistoryQueryOptions): Promise<void> {
+    this.assertPreparationActive(options);
+    let admission = this.admissions.get(runId);
+    if (!admission) {
+      admission = { epoch: 0, suspended: false, active: new Set() };
+      this.admissions.set(runId, admission);
+    }
+    const epoch = admission.epoch;
+    const assertActive = () => {
+      this.assertPreparationActive(options);
+      if (this.closed || admission.suspended || admission.epoch !== epoch)
+        throw new RuntimeFault("history_cancelled", "History preparation admission is closed");
     };
-    for (const entry of all.slice(0, cap)) {
-      const next = { ...page.next_after, [entry.kind === "opportunity" ? "opportunity_seq" : "execution_seq"]: entry.seq };
-      const size = Buffer.byteLength(JSON.stringify(entry.value));
-      if (size > 48000) {
-        const omission = { kind: entry.kind, id: "opportunity_id" in entry.value ? entry.value.opportunity_id : entry.value.execution_id, reason: "record_byte_budget", original_bytes: size };
-        if (Buffer.byteLength(JSON.stringify({ ...page, omitted: [...page.omitted, omission], next_after: next, has_more: false })) > 65536) break;
-        page.omitted.push(omission);
-        page.next_after = next;
-        continue;
+    assertActive();
+    // Capture before waiting: a queued invocation never chases mutations made
+    // after its caller's original request.
+    const desiredThrough = this.store.historySourceHighwater(runId);
+    const completion = Promise.withResolvers<void>();
+    admission.active.add(completion.promise);
+    let acquired = false;
+    try {
+      const waiting = this.acquirePreparation(runId, options);
+      if (waiting) await waiting;
+      acquired = true;
+      assertActive();
+      while (!this.store.advanceHistorySourceBootstrap(128).complete) {
+        const turn = Promise.withResolvers<void>();
+        setTimeout(turn.resolve, 0);
+        await turn.promise;
+        assertActive();
       }
-      const field = entry.kind === "opportunity" ? "opportunities" : "metrics";
-      const candidate = { ...page, [field]: [...page[field], entry.value], next_after: next, has_more: false };
-      if (Buffer.byteLength(JSON.stringify(candidate)) > 65536) break;
-      if (entry.kind === "opportunity") page.opportunities.push(entry.value);
-      else page.metrics.push(entry.value);
-      page.next_after = next;
-    }
-    page.has_more = opportunityRows.some((row) => row.seq > page.next_after.opportunity_seq) ||
-      executionRows.some((row) => row.seq > page.next_after.execution_seq);
-    return page;
-  }
-  private assertFeedbackCursor(after: ImprovementFeedbackCursor, limit: number): void {
-    if (!Number.isSafeInteger(after.opportunity_seq) || after.opportunity_seq < 0 ||
-      !Number.isSafeInteger(after.execution_seq) || after.execution_seq < 0 ||
-      !Number.isSafeInteger(limit) || limit < 1) throw new Error("Invalid improvement feedback cursor or limit");
-  }
-  private detect(runId: string): void {
-    const executions = this.store.allSkillExecutions(runId);
-    const existing = this.store.evidenceObjects<ImprovementOpportunity>(runId, "opportunity");
-    let count = existing.length;
-    let cursor = 0;
-    while (true) {
-      const events = this.store.eventsAfter(runId, cursor, 500);
-      for (const event of events) {
-        if (!["skill.closed", "skill.failed", "skill.blocked", "skill.unknown", "skill.succeeded", "learning.death_episode"].includes(event.type)) continue;
-        const details = evidenceObject(event.details);
-        const id = details?.execution_id ?? details?.root_execution_id;
-        if (typeof id !== "string") continue;
-        const execution = executions.find((value) => value.execution_id === id);
-        if (!execution) continue;
-        const kind = event.type === "learning.death_episode" ? "death" : execution.status === "succeeded" ? "outcome" : "failure";
-        const key = createHash("sha256").update(`${runId}:${id}:${kind}:${kind === "death" ? details?.death_id : execution.status}`).digest("hex");
-        if (existing.some((value) => value.opportunity_id === key)) continue;
-        if (count >= 256) return;
-        const skill = this.store.skill(runId, execution);
-        const opportunity = this.store.saveOpportunity({ opportunity_id: key, run_id: runId, kind, version: { run_id: runId, skill_id: skill.skill_id, version: skill.version, hash: skill.hash }, execution_id: id, event_seqs: [event.event_seq], created_at: event.at, resolution: null });
-        existing.push(opportunity); count++;
+      assertActive();
+      let checkpoint = this.store.beginHistoryProjection(runId, desiredThrough);
+      while (true) {
+        assertActive();
+        const response = await this.reader.query({
+          kind: "projection_batch", run_id: runId, checkpoint,
+        }, options);
+        assertActive();
+        const parsed = projectionBatchSchema.safeParse(response);
+        if (!parsed.success)
+          throw new RuntimeFault("history_protocol", "Invalid bounded history projection batch");
+        const batch = parsed.data;
+        if (!this.sameCheckpoint(batch.before, checkpoint) ||
+          (batch.has_more && batch.after.revision <= checkpoint.revision))
+          throw new RuntimeFault("history_protocol", "Invalid history projection checkpoint or progress");
+        // The writer validates scopes, limits, checkpoint CAS and exact current
+        // candidate sources in the same transaction as every derived patch.
+        assertActive();
+        this.store.commitHistoryProjectionBatch(runId, batch);
+        checkpoint = batch.after;
+        if (!batch.has_more) {
+          if (checkpoint.source_through >= desiredThrough) return;
+          const next = this.store.beginHistoryProjection(runId, desiredThrough);
+          if (this.sameCheckpoint(next, checkpoint))
+            throw new RuntimeFault("history_protocol", "History projection did not reach its fixed source frontier");
+          checkpoint = next;
+        }
       }
-      if (events.length < 500) break;
-      cursor = events[events.length - 1]!.event_seq;
+    } finally {
+      if (acquired) this.releasePreparation(runId);
+      admission.active.delete(completion.promise);
+      completion.resolve();
     }
   }
+
+  /** Revoke queued old-turn admissions before joining any asynchronous owner. */
+  suspendRun(runId: string): Promise<void> {
+    let admission = this.admissions.get(runId);
+    if (!admission) {
+      admission = { epoch: 0, suspended: false, active: new Set() };
+      this.admissions.set(runId, admission);
+    }
+    admission.suspended = true;
+    admission.epoch++;
+    for (const waiter of [...(this.preparing.get(runId) ?? [])]) waiter.cancel();
+    const active = [...admission.active];
+    const queryDrain = this.reader.cancelRun(runId);
+    return this.joinPreparations([queryDrain, ...active]);
+  }
+
+  resumeRun(runId: string): void {
+    if (!this.closed) {
+      const admission = this.admissions.get(runId);
+      if (admission) admission.suspended = false;
+    }
+  }
+
+  close(): Promise<void> {
+    this.closed = true;
+    const drains = [...this.admissions.keys()].map(runId => this.suspendRun(runId));
+    return this.joinPreparations([this.reader.close(), ...drains]);
+  }
+
+  private async joinPreparations(tasks: Promise<void>[]): Promise<void> {
+    const results = await Promise.allSettled(tasks);
+    const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failures.length) throw new AggregateError(failures.map(result => result.reason), "History preparation owners did not drain");
+  }
+
+  private sameCheckpoint(left: ProjectionCheckpoint, right: ProjectionCheckpoint): boolean {
+    return left.schema_version === right.schema_version &&
+      left.revision === right.revision &&
+      left.generation === right.generation &&
+      left.published_revision === right.published_revision &&
+      left.source_through === right.source_through &&
+      left.target_through === right.target_through &&
+      left.phase === right.phase &&
+      left.metric_change_seq === right.metric_change_seq &&
+      left.published_metric_change_seq === right.published_metric_change_seq &&
+      this.sameJobValue(left.job, right.job);
+  }
+
+  /** Jobs are byte-bounded by the checkpoint contract; object key order is not data. */
+  private sameJobValue(left: Json, right: Json): boolean {
+    if (left === right) return true;
+    if (left === null || right === null || typeof left !== "object" || typeof right !== "object")
+      return false;
+    if (Array.isArray(left)) {
+      if (!Array.isArray(right) || left.length !== right.length) return false;
+      return left.every((value, index) => this.sameJobValue(value, right[index]!));
+    }
+    if (Array.isArray(right)) return false;
+    const keys = Object.keys(left);
+    return keys.length === Object.keys(right).length && keys.every(key =>
+      Object.hasOwn(right, key) && this.sameJobValue(left[key]!, right[key]!));
+  }
+
+  private acquirePreparation(runId: string, options: HistoryQueryOptions): Promise<void> | void {
+    const queue = this.preparing.get(runId);
+    if (!queue) {
+      this.preparing.set(runId, []);
+      return;
+    }
+    if (queue.length >= 8)
+      throw new RuntimeFault("history_queue_full", "Improvement preparation queue is full for this run");
+
+    // Each bounded FIFO waiter owns only its signal and original absolute
+    // deadline. Activation starts a new pass, never a shared result or retry.
+    const completion = Promise.withResolvers<void>();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const cleanup = () => {
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      options.signal?.removeEventListener("abort", abort);
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      cleanup();
+      const index = queue.indexOf(waiter);
+      if (index >= 0) queue.splice(index, 1);
+      completion.reject(error);
+    };
+    const abort = () => fail(new RuntimeFault("history_cancelled", "Improvement preparation was cancelled"));
+    const armDeadline = () => {
+      timer = setTimeout(() => {
+        try {
+          this.assertPreparationActive(options);
+          armDeadline();
+        } catch (error) {
+          fail(error);
+        }
+      }, Math.max(1, Math.min(2_147_483_647, options.deadlineHostMs - performance.now())));
+    };
+    const waiter = {
+      cancel: abort,
+      start: () => {
+        cleanup();
+        completion.resolve();
+      },
+    };
+    queue.push(waiter);
+    options.signal?.addEventListener("abort", abort, { once: true });
+    armDeadline();
+    if (options.signal?.aborted) abort();
+    return completion.promise;
+  }
+
+  private releasePreparation(runId: string): void {
+    const queue = this.preparing.get(runId)!;
+    const next = queue.shift();
+    if (next) next.start();
+    else this.preparing.delete(runId);
+  }
+
+  private assertPreparationActive(options: HistoryQueryOptions): void {
+    if (options.signal?.aborted) throw new RuntimeFault("history_cancelled", "Improvement preparation was cancelled");
+    if (!Number.isFinite(options.deadlineHostMs) || performance.now() >= options.deadlineHostMs)
+      throw new RuntimeFault("history_deadline", "Improvement preparation deadline exceeded");
+  }
+
   resolve(runId: string, id: string, input: ImprovementResolution): ImprovementOpportunity {
     if (!["revise", "keep", "insufficient_evidence"].includes(input.decision) || !input.reason.trim() || input.reason.length > 4000 || input.event_seqs.length > 64) throw new Error("Invalid bounded improvement resolution");
     if (input.decision === "revise" && input.revision === null)
       throw new RuntimeFault("invalid_request", `Revise requires an exact revision reference. ${IMPROVEMENT_RESOLUTION_HELP}`);
     if (input.decision !== "revise" && input.revision !== null)
       throw new RuntimeFault("invalid_request", `Keep and insufficient_evidence require revision:null. To link the exact revision of a chosen or performed candidate experiment, choose revise. ${IMPROVEMENT_RESOLUTION_HELP}`);
-    const opportunity = this.store.evidenceObjects<ImprovementOpportunity>(runId, "opportunity").find((value) => value.opportunity_id === id);
+    const opportunity = this.store.opportunity(runId, id);
     if (!opportunity) throw new Error("Improvement opportunity not found");
     if (opportunity.resolution) {
       const previous = opportunity.resolution;
@@ -128,7 +249,7 @@ export class ImprovementLearning {
       const parent = exactVersion(this.store, opportunity.version);
       const sourceRun = this.store.getRun(opportunity.version.run_id), revisionRun = this.store.getRun(input.revision.run_id);
       if (!sourceRun || !revisionRun || sourceRun.model_id !== revisionRun.model_id || revision.skill_id !== parent.skill_id || revision.parent_version !== parent.version) throw new Error("Revision must name a same-model direct child version");
-      measured = this.store.allSkillExecutions(input.revision.run_id).some((execution) => execution.skill_id === revision.skill_id && execution.version === revision.version && execution.started_at !== null && ["succeeded", "blocked", "failed", "unknown", "cancelled"].includes(execution.status));
+      measured = this.store.hasMeasuredSkillExecution(input.revision.run_id, revision);
     }
     const value = this.store.resolveOpportunity(runId, id, { ...input, event_seqs: [...new Set(input.event_seqs)], measured, at: new Date().toISOString() });
     if (!opportunity.resolution) this.store.event(runId, "learning.resolved", "Recorded model-selected improvement decision", { opportunity_id: id, decision: input.decision, revision: input.revision as unknown as Json, measured, qualification: measured ? "measured_not_causally_proven" : "unmeasured_candidate" });

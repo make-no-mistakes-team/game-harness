@@ -166,6 +166,43 @@ export async function runNativeControllerStreamFixture(project: string, caps: Ev
         entry.frame = await fixture.frame("stream-gui");
       });
     });
+    await run("retired_controller_sample_rejects_without_transport_loss", async entry => {
+      await fixture.flat();
+      const originalSession = fixture.identity(await fixture.observe());
+      await owned(entry, async (channel, _effects, stopRenewals) => {
+        await read(channel);
+        const retiredIdentity = { owner: channel.owner, controller_generation: channel.controllerGeneration, audio_cursor: null };
+        await stopRenewals();
+        entry.retirement = await channel.revoke();
+        // Bypass the host channel's correct current-owner guard: this proof targets a
+        // late wire request racing native retirement, not host-side admission.
+        const request = Reflect.get(fixture.bridge, "request").bind(fixture.bridge);
+        const rejectedSample = async () => {
+          let rejection: string | null = null;
+          try { await request("controller_sample", retiredIdentity, 2000); }
+          catch (error) { rejection = error instanceof Error ? error.message : String(error); }
+          requireProof(rejection?.startsWith("Controller sample rejected: "),
+            `Late retired-owner sample did not receive an explicit native rejection: ${rejection}`);
+          return rejection;
+        };
+        entry.closed_owner_sample = await rejectedSample();
+        entry.ping_after_rejection = await request("ping", {}, 2000);
+        entry.same_session_after_rejection = fixture.sameSession(originalSession, await fixture.observe());
+        const arbiter = ActionArbiter.current(fixture.bridge);
+        requireProof(arbiter, "Rejected retired-owner sample destroyed the current native arbiter");
+        const replacement = await arbiter.reserveController(channel.owner.scope.execution_id, channel.controllerGeneration + 1,
+          performance.now() + 5000, () => {}, () => {});
+        try {
+          entry.foreign_owner_sample = await rejectedSample();
+          entry.replacement_frame = await read(replacement);
+          requireProof(replacement.snapshot().submitted_sequence === 0 && !replacement.snapshot().fenced,
+            "Late old-owner sample applied input or fenced its replacement");
+        } finally { entry.replacement_retirement = await replacement.revoke(); }
+        requireProof(fixture.bridge.snapshot().status === "connected",
+          "Explicit retired-owner sample rejection closed native control");
+      });
+      entry.same_session_after_replacement = fixture.sameSession(originalSession, await fixture.observe());
+    });
     await run("gui_retirement_drains_applied_pending_receipt", async entry => {
       await fixture.flat(); await fixture.console(["clear @a", "item replace entity @a hotbar.0 with minecraft:oak_planks 4"]);
       await owned(entry, async (channel, effects, stopRenewals) => {

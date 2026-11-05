@@ -572,14 +572,14 @@ for (const sample of [
     cleanups.push(async () => { await observer.close(); rmSync(evidenceRoot, { recursive: true, force: true }); });
     const view = await f.reactive.register(specification("jev"), 1, 1);
     await f.reactive.validate({ epoch: 1, policy_id: view.policy_id, version: view.version }, 1);
-    expect(observer.summary(f.run.run_id).usage).toMatchObject({ schema_version: 2, admissions: 1,
+    expect((await observer.summary(f.run.run_id)).usage).toMatchObject({ schema_version: 2, admissions: 1,
       reported_messages: 1, event_coverage: "complete", consumption_coverage: sample.consumption,
       ...sample.expected, subscription_cost: null, wire_attempts: null });
     expect(f.run.usage.known_cost).toBeNull();
     expect(f.run.usage.calls).toBe(1);
     expect(JSON.stringify(f.store.eventsAfter(f.run.run_id, 0, 500))).not.toContain("JEV_ACCOUNTING_OFFLINE_CREDENTIAL");
     if (sample.name === "explicit wire usage without monetary cost")
-      expect(observer.summary(f.run.run_id).usage.reported_subtotal).toEqual({ uncached_input: 4, cache_read: 0, cache_write: 0, output: 1 });
+      expect((await observer.summary(f.run.run_id)).usage.reported_subtotal).toEqual({ uncached_input: 4, cache_read: 0, cache_write: 0, output: 1 });
   });
 }
 

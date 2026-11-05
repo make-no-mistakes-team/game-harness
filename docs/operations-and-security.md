@@ -8,6 +8,8 @@ The [PRD](prds/gameharness-v1.0-prd.md) owns scope and acceptance. The [architec
 
 The generic desktop/runtime uses Electron 45.0.0, Bun 1.3.14+, TypeScript and local Docker on Linux x64. The first game adapter adds Java 21/Fabric 1.21.4. Additional supported-game integrations are planned and must declare their own dependencies and evidence; no second adapter is delivered. `bun run build` currently builds that native adapter and Vite renderer; `bun run start` owns the desktop/backend lifecycle. `bun run dev` builds once and opens the same desktop. See the first-integration guide for game-specific prerequisites and sandbox-helper setup.
 
+The trusted Fabric server installer translates `HTTP_PROXY` and `HTTPS_PROXY` into JVM proxy properties, with lowercase aliases and `ALL_PROXY` as a fallback. It supports HTTP proxy URLs without credentials and preserves the JVM's default loopback bypasses. Use `NO_PROXY` for additional destinations, including private or link-local addresses; supported forms are IP addresses, domain suffixes and `*`. Configured proxy credentials, unsupported proxy schemes, and port-specific or CIDR bypass rules are rejected before preparation rather than silently ignored. Without a configured proxy, unused bypass settings do not prevent installation. The child still receives only its restricted environment, not ambient JVM options or provider credentials.
+
 The runtime implements app-owned OMP OAuth/model discovery, durable compact program registration/execution/composition, SQLite evidence, immutable source/cards, local-JS policies and a real Jev broker. The native client/server replace the old Mineflayer/prismarine path without fallback. The reviewed two-trip custom task provides scoped useful-gameplay evidence; historical OAuth/inference/movement and Chrome rendering remain old-spike results. Neither establishes every criterion of the broader [playable gate](implementation-mvp.md#first-complete-playable-gate).
 
 Generated programs/policies run in private Docker containers with no network, an unprivileged user, read-only root, dropped capabilities and finite limits. Source admission checks syntax, body boundaries, imports and forbidden ambient access, with separate 16,384-byte original and canonical UTF-8 caps. Line count, nesting and complexity are descriptive, not rejection limits; comments and coherent helpers are allowed. These [source rules](runtime-contracts.md#current-compact-program-interface) are not sandboxing. Each program execution has its own container; the tree shares action/call/depth/deadline budgets. Only host-known bounded capability waits suspend runnable-computation timing. Ship `sandbox/worker.mjs` and the detached host `sandbox/guardian.mjs`; cleanup stays pending until Docker confirms removal. The pinned Node image must already be present.
@@ -182,7 +184,7 @@ Unknown past effects and live emitters are separate facts. `GameBridge.neutraliz
 
 Normal death changes player life, not game-session or run ownership. Revoke old-life commands/targets, drain affected roots and reactions, reject late JS/Jev/lookahead results, preserve last authorized context and wake the strategist once. Keep the healthy client/video connected and `game.error:null`, showing the actual vanilla DeathScreen. No saved-dead startup or death handler requests respawn. Only explicit model-selected `game.respawn()` or `{kind:"respawn"}` through the exclusive arbiter can request vanilla respawn; timeout remains uncertain without replay. Confirmed alive readiness advances life ID while preserving session UUID/epoch. Other old-life work stays fenced.
 
-Record operator pause intervals separately from LLM waits, meaningful game waits and infrastructure downtime. Resume requires an authoritative fresh observation and new execution generations. Do not replay pre-pause queued actions. Pause during bootstrap ends that bootstrap early; resume enters ordinary gameplay without a fresh bootstrap allowance, while normal policy-authoring tools remain available.
+Record operator pause intervals separately from LLM waits, meaningful game waits and infrastructure downtime. Explicit Resume requires an authoritative fresh observation, new execution generations and confirmed prior-owner drain. Unconfirmed emitter closure or native neutralization requires a fresh connection epoch before Resume; fresh observation alone does not repair that failure. A replaced native session/profile requires a new run. Do not replay pre-pause queued actions. Pause during bootstrap ends that bootstrap early; resume enters ordinary gameplay without a fresh bootstrap allowance, while normal policy-authoring tools remain available.
 
 Stop has highest priority. It closes admission, revokes generated work/provider callbacks, cancels actions, confirms neutral controls and worker/planner/action drain, then durably closes the run. A healthy playing session and authentic video remain connected. Stop world, world replacement and application close explicitly own session shutdown. If contact is lost and effect safety cannot be confirmed, fail closed and preserve stop intent during recovery. `stopped` means safe run closure, not merely a clicked button.
 
@@ -192,7 +194,7 @@ The emergency procedure must include a trusted path independent of generated wor
 
 ### Recovery without erasing the attempt
 
-Unknown past effects on a healthy alive connection do not automatically require a reconnect or human Resume. Fence affected roots/planner/policies/leases, retain unknown outcomes, await real native neutralization plus complete worker closure, and obtain fresh same-session/life authorized state. Confirmed reconciliation permits exactly one new strategic generation/`uncertainty` wake; the model chooses new work and no old effect is replayed. Unconfirmed barrier/drain/readiness instead keeps admission closed in paused/fail-closed handling. Death routes to the existing life-recovery path; real transport failure still requires owned-emitter fencing/teardown. The reconnect procedure below applies when the connection actually needs replacement.
+Unknown past effects on a healthy alive connection do not automatically require a reconnect or human Resume. Fence affected roots/planner/policies/leases, retain unknown outcomes, await real native neutralization plus complete worker and old-history-owner closure, and obtain fresh same-session/life authorized state. Confirmed reconciliation permits exactly one new strategic generation/`uncertainty` wake; the model chooses new work and no old effect is replayed. Unconfirmed barrier/drain/readiness instead keeps admission closed in paused/fail-closed handling until explicit Resume can establish safety. Failed emitter/native drain additionally requires a fresh epoch; a history-only failure grants neither input authority nor automatic reconciliation. Death routes to the existing life-recovery path; real transport failure still requires owned-emitter fencing/teardown. The reconnect procedure below applies when the connection actually needs replacement.
 
 The current application restart retains inspectable objective/events, immutable source and unresolved outcomes, reconciles unfinished records and closes an interrupted run without automatic replay. The operator creates a new run for subsequent gameplay; the interrupted history remains intact. This is not automatic whole-process continuation, restoration of a JavaScript stack or restoration of game state. Live Pause/Resume and fresh-state reconciliation within a surviving process have a different scope.
 
@@ -214,6 +216,56 @@ This section specifies required checkpoint/restoration semantics. The current co
 The backend owns local SQLite records for runs, events, action ledger and artifact metadata. Immutable source/configuration files use content hashes. Store source/event evidence independently of lossy conversation summaries. A runtime checkpoint identifies its game/adapter/profile/schema manifest, run/world/epoch/branch, durable event cursor, action-ledger state, selected artifact hashes and state-schema versions, and serializable memory references. It does not by itself capture game state. An incomplete checkpoint is not advertised as recoverable.
 
 Commit an artifact's durable immutable bytes before committing registry metadata that references them. Commit related run/action state and events in one database transaction. Conversation compaction can produce an additional derived artifact with provenance; it cannot replace the action ledger, source programs or world state. Avoid copying a live WAL database as if its main file alone were a backup; use an appropriate SQLite consistent-backup procedure and verify it as part of future release work.
+
+The trusted history reader opens only an existing writer-prepared database in
+SQLite readonly mode. It does not construct the writable Store, migrate or repair
+schema, create directories, change permissions or select arbitrary paths from a
+query. Startup checks schema and required index readiness. Source reads verify
+the stored hash against raw bytes before UTF-8 decoding; absent historical
+authority remains absent. Its fixed executable/module and storage paths are
+selected by the parent, with no inherited credential, proxy or preload settings.
+The query protocol exposes no SQL, mutation, game-input or provider endpoint.
+This is a trusted backend read service, not the Docker sandbox for generated code.
+
+The writer migrates run databases to schema 7 before readonly access. Lazy source
+MVCC preserves raw values as of a fixed source sequence, including late updates
+and deletions. Source-key bootstrap and reads use pages of at most 128 rows.
+Readonly previews produce bounded derived patches; only the writer can validate
+and atomically commit them with opportunity captures and checkpoint progress.
+Reopen resumes committed work, while readers retain the last complete published
+generation. The checkpoint is derived bookkeeping, not a game/runtime restoration
+point or authority to replay an effect. Opening a readonly connection never
+initializes, advances or repairs it.
+
+Each preview allows at most 64 patches, 16 candidate captures and 128 work
+iterations. Complete request and response frames, including envelope and newline,
+remain bounded to 8 KiB and 64 KiB. Before committing a continuation, the host
+checks that the next complete request fits; an otherwise valid reply cannot
+strand durable work behind an oversized request. Preparation retains one active
+caller and eight FIFO waiters per run, with each caller's original deadline and
+cancellation. Failure grants no automatic retry or deadline renewal.
+
+Each compound query releases its deferred read transaction before serialization
+or idle waiting, so an idle reader does not pin the WAL. Abort, timeout and
+shutdown retain process ownership until actual exit and pipe drain; a replacement
+can start only for a distinct request after that barrier. Query failure does not
+authorize a retry, a fabricated observation or an empty successful result.
+
+Pause and Stop fence native input before awaiting history preparation/query
+drain, so metadata work cannot delay revocation. Queued old-turn work is cancelled.
+Effect-free history may later resume under separate ownership, including after
+Stop; it never resumes gameplay or provider authority. Application close
+permanently closes history admission and joins all producers/readers before Store
+closure. Failed drain remains unconfirmed rather than being cleared by a timeout.
+
+Published pages disclose their generation, source boundary and pending work.
+Full-record byte omissions retain recovery references through the named actor
+metric/evidence views and the operator's generation-pinned execution routes
+defined in [runtime contracts](runtime-contracts.md#current-compact-program-interface).
+These remain authorized evidence reads, never SQL, arbitrary paths or effect
+capabilities. A missing first publication is pending; a missing generation that
+was already published is corruption and conflicts rather than becoming an empty
+or current-looking result.
 
 Game-state checkpoint, reset, restore and world pause are independent adapter capabilities, each declaring `unsupported`, `operator_assisted` or `adapter_managed` as defined in [runtime contracts](runtime-contracts.md#gameadapter-descriptor-and-interface). The UI and recovery procedure use actual negotiated support. A runtime checkpoint cannot upgrade an unsupported game save/restore mechanism. If a game requires an operator-controlled restart, that intervention and its confirmation remain pending until observed; no synthetic success or fake fallback is recorded.
 

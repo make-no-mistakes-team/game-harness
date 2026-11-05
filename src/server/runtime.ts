@@ -37,7 +37,8 @@ import {
   type PromotionDeclaration,
 } from "./experience.ts";
 import type { FastJudgeBroker } from "./fast-provider.ts";
-import { programEvidence } from "./program-evidence.ts";
+import { HistoryReader } from "./history-reader.ts";
+import type { HistoryQueryClient, HistoryQueryOptions } from "./history-protocol.ts";
 import { ActionArbiter } from "./action-arbiter.ts";
 import { ReactiveRuntime } from "./reactive.ts";
 import { StrategicPlanner, type StrategicRequestAdmission } from "./strategic.ts";
@@ -46,6 +47,7 @@ import { createRuntimePrompt } from "./runtime-prompt.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { SpeculativePlanning } from "./speculative-planning.ts";
 import { ImprovementLearning } from "./improvement-learning.ts";
+import { HistoryProjectionOwner } from "./history-projection-owner.ts";
 import { ExecutionTrace } from "./execution-trace.ts";
 import { ActorFrameSelector, type ModelObservation } from "./actor-frames.ts";
 import { retainResidentReceipt } from "./resident-evidence.ts";
@@ -73,6 +75,7 @@ export interface RuntimeOptions {
 
 /** Lifecycle and trusted observation/goal authority; execution modules own their scheduling. */
 export class Runtime {
+  readonly historyQueries: HistoryQueryClient;
   private readonly actorFrames: ActorFrameSelector | null;
   private readonly actorFrameSource: RuntimeOptions["actorFrames"];
   private readonly imageAuthorityWaits = new Set<() => void>();
@@ -86,6 +89,7 @@ export class Runtime {
   private readonly catalog: RuntimeTools;
   private readonly planning: SpeculativePlanning;
   private readonly learning: ImprovementLearning;
+  private readonly historyOwner: HistoryProjectionOwner;
   private readonly trace: ExecutionTrace;
   private run: StoredRun | null = null;
   private observation: ObservationV3 | null = null;
@@ -99,6 +103,8 @@ export class Runtime {
   private lifecycle: Promise<void> = Promise.resolve();
   private needsReconnect = false;
   private closed = false;
+  private closing: Promise<void> | null = null;
+  private historyDrain: Promise<void> = Promise.resolve();
   private deathIds = new Set<string>();
   private lifeRecovery: Promise<void> | null = null;
   private uncertaintyRecovery: Promise<void> | null = null;
@@ -175,7 +181,9 @@ export class Runtime {
     this.experience = options.experienceDirectory
       ? new ExperienceLibrary(options.experienceDirectory, () => this.currentCompatibility())
       : null;
-    this.learning = new ImprovementLearning(store);
+    this.historyQueries = new HistoryReader(store.readLocation());
+    this.learning = new ImprovementLearning(store, this.historyQueries);
+    this.historyOwner = new HistoryProjectionOwner(store, this.learning);
     this.trace = new ExecutionTrace(store);
     this.planning = new SpeculativePlanning({
       contract: () => this.context().adapter,
@@ -322,7 +330,6 @@ export class Runtime {
       changed: (outcome, execution) => {
         this.onChange();
         if (outcome) {
-          if (execution) this.learning.feedback(execution.run_id);
           const continuationOwnsOutcome = execution
             ? this.planning.predecessorSettled(execution.execution_id) : false;
           if (!continuationOwnsOutcome) this.strategic.wake("skill_outcome");
@@ -396,7 +403,24 @@ export class Runtime {
       terminal: (status, message) => this.requestTerminal(status, message),
       speculation: () => this.planning,
       reviewComplete: () => this.finishReview(),
-      reviewContext: () => this.learning.feedback(this.run!.run_id),
+      reviewContext: async (options) => {
+        const run = this.run!, generation = this.generation;
+        const assertReview = () => {
+          if (options.signal?.aborted || performance.now() >= options.deadlineHostMs ||
+            this.run !== run || run.status !== "reviewing")
+            throw new RuntimeFault("stale_context", "History review authority expired");
+          this.assertCurrent(generation);
+        };
+        assertReview();
+        await this.learning.prepareFeedback(run.run_id, options);
+        assertReview();
+        const context = await this.historyQueries.query({
+          kind: "review_context", run_id: run.run_id,
+          after: { schema_version: 2, opportunity_change_seq: 0, metric_change_seq: 0, scope_hash: null }, limit: 12,
+        }, options);
+        assertReview();
+        return context;
+      },
     });
     this.catalog = new RuntimeTools(
       store,
@@ -414,7 +438,7 @@ export class Runtime {
         attentionAfter: (ms, reason) =>
           this.strategic.attentionAfter(ms, reason),
         admitted: () => this.strategic.admitted(),
-        evidence: () => this.skillEvidence(this.run!.run_id),
+        history: () => this.historyQueries,
         planning: () => this.planning,
         learning: () => this.learning,
         toolAuthority: () => this.strategic.speculativeToolAuthority(),
@@ -540,6 +564,9 @@ export class Runtime {
     });
     this.onChange();
   }
+  currentRunId(): string | null {
+    return this.run?.run_id ?? null;
+  }
   snapshot(): RunView | null {
     if (!this.run) return null;
     const { baseline: _baseline, control: _control, ...view } = this.run;
@@ -573,10 +600,11 @@ export class Runtime {
     return this.experience?.list(modelId, this.game.snapshot().world_id) ?? [];
   }
 
-  skillEvidence(runId: string) {
+  async skillEvidence(runId: string, after = 0, limit = 25, options?: HistoryQueryOptions) {
     if (!this.store.getRun(runId))
       throw new RuntimeFault("not_found", "Run not found");
-    return programEvidence(this.store, runId);
+    return await this.historyQueries.query({ kind: "operator_evidence", run_id: runId, after, limit },
+      options ?? { deadlineHostMs: performance.now() + 10_000 });
   }
   planningView(runId: string) {
     if (!this.store.getRun(runId)) throw new RuntimeFault("not_found", "Run not found");
@@ -929,19 +957,32 @@ export class Runtime {
       return this.snapshot()!;
     });
   }
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closing) return this.closing;
     this.closed = true;
     if (this.run && !TERMINAL[this.run.status])
       this.fenceStop(
         "Application closing; effect admission revoked immediately",
       );
-    await this.serialize(async () => {
-      if (this.run && !TERMINAL[this.run.status])
-        await this.halt("stopped", "Application closed; work is not replayed");
-      this.unsubscribeGame?.();
-      this.unsubscribeGame = null;
-      this.experience?.close();
+    const historyClosing = this.historyOwner.close();
+    void historyClosing.catch(() => {});
+    this.closing = this.serialize(async () => {
+      try {
+        if (this.run && !TERMINAL[this.run.status])
+          await this.halt("stopped", "Application closed; work is not replayed");
+      } finally {
+        try {
+          const history = await Promise.allSettled([historyClosing, this.historyDrain]);
+          const failed = history.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+          if (failed.length) throw new AggregateError(failed.map(result => result.reason), "Readonly history owners did not drain");
+        } finally {
+          this.unsubscribeGame?.();
+          this.unsubscribeGame = null;
+          this.experience?.close();
+        }
+      }
     });
+    return this.closing;
   }
   private async begin(resuming: boolean): Promise<void> {
     const run = this.run!,
@@ -1018,6 +1059,13 @@ export class Runtime {
         : "Host preflight confirmed readiness and authoritative game state",
     );
     try {
+      if (resuming) {
+        await this.historyDrain;
+        this.assertCurrent(generation);
+        // Direct uncertainty pauses do not pass through halt's metadata
+        // reopening. Admit only new history work after fresh safe preflight.
+        this.historyOwner.resumeRun(run.run_id);
+      }
       await this.strategic.start(generation);
       this.assertCurrent(generation);
       if (observation.life.status === "alive") await this.reactions.resume(generation);
@@ -1114,6 +1162,16 @@ export class Runtime {
     this.reactions.fence();
     this.skills.fence(message, uncertainExecutionId);
     this.actions.fence(message);
+    // Native/effect authority is revoked first. Then synchronously close all
+    // old-turn history admissions, including independent FIFO waiters.
+    if (this.run) {
+      const drains = [this.historyDrain.catch(() => {}), this.historyOwner.suspendRun(this.run.run_id)];
+      this.historyDrain = Promise.allSettled(drains).then(results => {
+        const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (failures.length) throw new AggregateError(failures.map(result => result.reason), "History owner drain is unconfirmed");
+      });
+      void this.historyDrain.catch(() => {});
+    }
   }
   private handleScopeChange(): void {
     const run = this.run, state = this.game.snapshot();
@@ -1135,7 +1193,8 @@ export class Runtime {
     this.persist("Old-scope emitters fenced before fresh observation");
     const recovery = this.serialize(async () => {
       const results = await Promise.allSettled([this.skills.closeAll("Native scope changed"), this.reactions.closeAll(true),
-        this.actions.close("Native scope changed"), this.strategic.close(), this.game.emergencyStop("Trusted scope recovery barrier")]);
+        this.actions.close("Native scope changed"), this.strategic.close(), this.game.emergencyStop("Trusted scope recovery barrier"),
+        this.historyDrain]);
       if (generation !== this.generation || this.run !== run || this.closed) return;
       this.lifeRecovery = null;
       if (results.some(result => result.status === "rejected")) { this.requestSafetyPause("Native scope recovery drain is unconfirmed", true); return; }
@@ -1144,6 +1203,7 @@ export class Runtime {
         run.life_id = observation.life.life_id; run.space_epoch = observation.space.space_epoch;
         this.persist("Fresh authorized native scope established; old execution was not resumed");
         this.assertCurrent(generation);
+        this.historyOwner.resumeRun(run.run_id);
         await this.strategic.start(generation);
         if (observation.life.status === "alive") await this.reactions.resume(generation);
         this.strategic.wake("scope_changed");
@@ -1199,6 +1259,7 @@ export class Runtime {
         this.actions.close("Player life ended"),
         this.strategic.close(),
         this.game.emergencyStop("Trusted death recovery barrier"),
+        this.historyDrain,
       ]);
       if (generation !== this.generation || this.closed || this.run !== run) return;
       if (settlements.some((result) => result.status === "rejected")) {
@@ -1210,6 +1271,7 @@ export class Runtime {
       try {
         await this.refreshObservation();
         this.assertCurrent(generation);
+        this.historyOwner.resumeRun(run.run_id);
         await this.strategic.start(generation);
         this.assertCurrent(generation);
         this.strategic.wake("death");
@@ -1252,8 +1314,13 @@ export class Runtime {
         this.actions.close("Uncertain action outcome"),
         this.strategic.close(),
         this.game.emergencyStop("Trusted uncertainty reconciliation barrier"),
+        this.historyDrain,
       ]);
       if (generation !== this.generation || this.closed || this.run !== run || run.status !== "running") return;
+      // A failed old-authority drain is not repaired by a fresh observation.
+      // Preserve the existing fresh-epoch requirement for explicit Resume.
+      if (settlements.slice(0, 5).some((result) => result.status === "rejected"))
+        this.needsReconnect = true;
       let failure = settlements.some((result) => result.status === "rejected")
         ? "Emitter closure or native neutralization could not be confirmed" : null;
       let observation: ObservationV3 | null = null;
@@ -1273,8 +1340,8 @@ export class Runtime {
         failure = "Fresh reconciliation did not confirm the same healthy session and player life";
       this.uncertaintyRecovery = null;
       if (failure) {
-        // Already fenced and drained: do not manufacture proof or destroy a
-        // healthy session merely because reconciliation remains unavailable.
+        // Already fenced; retain unconfirmed drains above without manufacturing
+        // proof or destroying a healthy session for an unavailable observation.
         run.status = "paused";
         this.controlState().pause_cause = "safety";
         run.model_status = "idle";
@@ -1290,6 +1357,7 @@ export class Runtime {
         observation_seq: observation!.observation_seq, neutralized: true, workers_closed: true, no_replay: true,
       });
       try {
+        this.historyOwner.resumeRun(run.run_id);
         await this.strategic.start(generation);
         this.assertCurrent(generation);
         await this.reactions.resume(generation);
@@ -1363,12 +1431,14 @@ export class Runtime {
           this.actions.close(message),
           this.strategic.close(),
           this.game.emergencyStop("Trusted post-goal effect-free barrier"),
+          this.historyDrain,
         ]);
         if (generation !== this.generation || this.run?.status !== "reviewing") return;
         if (results.some((result) => result.status === "rejected")) {
           this.requestSafetyPause("Post-goal emitter neutralization could not be confirmed", true);
           return;
         }
+        this.historyOwner.resumeRun(this.run.run_id);
         await this.strategic.start(generation);
         this.strategic.wake("goal_review");
       }).catch(() => {
@@ -1421,6 +1491,7 @@ export class Runtime {
       this.actions.close(message),
       this.strategic.close(),
       barrier,
+      this.historyDrain,
     ]);
     const cleanupConfirmed = settlements.slice(0, 4).every(
       (result) => result.status === "fulfilled",
@@ -1437,6 +1508,12 @@ export class Runtime {
     }
     if (!disconnectConfirmed) this.needsReconnect = true;
     if (generation !== this.generation) return;
+    const historyConfirmed = settlements.slice(5).every((result) => result.status === "fulfilled");
+    if (!historyConfirmed) {
+      this.store.event(run.run_id, "runtime.history_shutdown_failed", "Readonly history owner drain could not be confirmed", {
+        native_neutralization_confirmed: disconnectConfirmed,
+      });
+    }
     if (!disconnectConfirmed || !cleanupConfirmed) {
       this.controlState().cleanup_error = "Shutdown could not be confirmed. Retry Stop before reconnecting or starting another run.";
       run.error ??= BRIDGE_FAILURE;
@@ -1447,6 +1524,11 @@ export class Runtime {
         "Shutdown could not be confirmed. Retry Stop before reconnecting or starting another run.",
       );
     }
+    if (!historyConfirmed) {
+      this.controlState().cleanup_error = "Readonly history shutdown could not be confirmed. Retry Stop before starting another run.";
+      this.persist("History owner drain remains unconfirmed; admission stays closed");
+      throw new RuntimeFault("backend_unavailable", this.controlState().cleanup_error!);
+    }
     run.status = status;
     run.model_status = "idle";
     if (status !== "paused") run.ended_at = new Date().toISOString();
@@ -1454,5 +1536,8 @@ export class Runtime {
     else if (this.needsReconnect) run.error ??= BRIDGE_FAILURE;
     if (run.session_id) this.store.retainWorkingPrograms(run.run_id, run.session_id);
     this.persist(message);
+    // This is new effect-free metadata ownership after the safe-stop barrier,
+    // never continuation of a cancelled turn or authority to emit game work.
+    if (!this.closed) this.historyOwner.resumeRun(run.run_id);
   }
 }

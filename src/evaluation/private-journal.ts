@@ -93,6 +93,10 @@ export class PrivateJournal {
       return true;
     } catch { this.fail("private_journal_serialization_failed"); return false; }
   }
+  /** Backpressure for bounded readonly export pages, not a new evidence allowance. */
+  async drain(): Promise<void> { await this.tail; }
+  /** Required archive omissions are evidence failures, just like persistence loss. */
+  markIncomplete(reason: string): void { this.fail(reason); }
   finalize(input: { status: string; reason: string }): Promise<JournalFinalization> {
     if (this.finalized) return this.finalized;
     this.append("finalization", input);

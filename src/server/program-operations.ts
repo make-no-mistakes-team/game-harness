@@ -59,7 +59,15 @@ export class ProgramOperations {
       opportunity = (bound.found ? bound.value : this.store.bindToolCall(this.run.run_id, feedbackKey, identity, () => {
         commit();
         if (!pinned) assertParent();
-        return this.workspace.latestOpportunity(previous) as unknown as Json;
+        try {
+          return this.workspace.latestOpportunity(previous) as unknown as Json;
+        } catch (error) {
+          if (!(error instanceof RuntimeFault) || error.code !== "not_found") throw error;
+          throw Object.assign(new RuntimeFault("precondition_failed",
+            "Top-level reason requires outcome feedback for the exact based_on version. For an ordinary revision, omit top-level reason and retain based_on; describe motivation in card.reason."), {
+            issues: [{ code: "missing_parent_outcome", path: "reason" }],
+          });
+        }
       })) as unknown as ImprovementOpportunity;
     }
     const program = pinned ?? await this.skills.register(this.run.run_id, { entry: input.entry, name: input.name, source: input.source, card: input.card, dependencies },

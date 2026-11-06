@@ -539,6 +539,80 @@ test("program_submit rejects invalid source, lineage, dependencies and limits be
   expect(f.dispatches()).toBe(0);
 });
 
+for (const toolName of ["program_write", "program_submit"] as const) {
+  test(`${toolName} distinguishes missing parent outcome from missing source and permits an ordinary revision`, async () => {
+    const f = fixture();
+    const name = "unexecuted revision";
+    await f.write(name);
+    await f.call("program_run", { operation: "start", name, version: 1, args: null });
+    await waitClosed(f.store, f.run.run_id, f.store.latestRootExecution(f.run.run_id)!.execution_id);
+    await f.prepareFeedback();
+    expect(data(await f.write(name, source, { based_on: 1 }))).toMatchObject({ version: 2, experiment: null });
+    const parent = f.store.namedSkill(f.run.run_id, name, 2)!;
+    const feedback = f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity");
+    expect(feedback).toHaveLength(1);
+    expect(feedback[0]!.version.version).toBe(1);
+    const revisionCard = { ...card, reason: "Repair the stored source before its first execution" };
+    const input = { name, source, card: revisionCard, based_on: 2,
+      ...(toolName === "program_submit" ? { args: null } : {}) };
+    const refused = await f.call(toolName, { ...input, reason: "Link a candidate to this exact parent's outcome" });
+    expect(refused.isError).toBe(true);
+    expect(data(refused).error).toMatchObject({
+      code: "precondition_failed", retryable: false,
+      issues: [{ code: "missing_parent_outcome", path: "reason" }],
+    });
+    expect(f.store.namedSkill(f.run.run_id, name)).toMatchObject({ version: 2, hash: parent.hash });
+    expect(f.store.skills(f.run.run_id)).toHaveLength(2);
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+    expect(f.dispatches()).toBe(1);
+    expect(f.actions()).toBe(0);
+    expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")).toEqual(feedback);
+
+    const ordinary = await f.call(toolName, input);
+    expect(ordinary.isError).not.toBe(true);
+    if (toolName === "program_submit") {
+      expect(data(ordinary)).toMatchObject({
+        source: { status: "persisted", name, version: 3 },
+        start: { status: "started", execution: { name, version: 3 } },
+      });
+      const execution = f.store.latestRootExecution(f.run.run_id)!;
+      expect(execution).toMatchObject({ version: 3, args: null });
+      await waitClosed(f.store, f.run.run_id, execution.execution_id);
+    } else expect(data(ordinary)).toMatchObject({ name, version: 3, experiment: null });
+    expect(f.store.namedSkill(f.run.run_id, name, 3)).toMatchObject({
+      skill_id: parent.skill_id, parent_version: 2, card: revisionCard,
+    });
+    expect(f.actions()).toBe(0);
+    expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")).toEqual(feedback);
+  });
+}
+
+test("program_submit requires explicit JSON args at the installed Agent boundary and accepts unused null", async () => {
+  const f = fixture();
+  const input = { name: "explicit unused arguments", source };
+  const missing = await agentCalls(f.tools(), [
+    { type: "toolCall", id: "missing-submit-args", name: "program_submit", arguments: input },
+  ]);
+  expect(missing[0]!.isError).toBe(true);
+  expect(data(missing[0]!).error).toMatchObject({
+    code: "invalid_request", issues: [{ path: "args" }],
+  });
+  expect(f.store.skills(f.run.run_id)).toHaveLength(0);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+  const submitted = await agentCalls(f.tools(), [
+    { type: "toolCall", id: "null-submit-args", name: "program_submit", arguments: { ...input, args: null } },
+  ]);
+  expect(submitted[0]!.isError).not.toBe(true);
+  expect(data(submitted[0]!)).toMatchObject({
+    source: { status: "persisted", version: 1 }, start: { status: "started" },
+  });
+  const execution = f.store.latestRootExecution(f.run.run_id)!;
+  expect(execution.args).toBeNull();
+  await waitClosed(f.store, f.run.run_id, execution.execution_id);
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: execution.execution_id })!.result).toMatchObject({ result: null });
+});
+
 test("program_submit pins source and dependencies even when a newer revision appears between phases", async () => {
   const f = fixture();
   await f.write("child", 'return {status:"completed",summary:"Original child",result:1};');

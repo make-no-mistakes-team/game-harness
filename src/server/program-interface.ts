@@ -23,7 +23,9 @@ export const versionComparisonCursorSchema = z.object({
 }).strict() satisfies z.ZodType<VersionComparisonCursor>;
 const cardSchema = z.object({
   purpose: z.string().trim().min(1).max(1000), applicability: z.string().trim().min(1).max(1000),
-  method: z.string().trim().min(1).max(2000), reason: z.string().trim().min(1).max(1000), limitations: z.string().trim().min(1).max(1000),
+  method: z.string().trim().min(1).max(2000),
+  reason: z.string().trim().min(1).max(1000).describe("Ordinary descriptive motivation for this source; does not link outcome feedback or require a prior execution."),
+  limitations: z.string().trim().min(1).max(1000),
 }).strict();
 export const programWriteSchema = z.object({
   entry: z.enum(["run", "step", "analyze"]).default("run"),
@@ -31,8 +33,9 @@ export const programWriteSchema = z.object({
     purpose: "Unspecified by author", applicability: "Unspecified by author", method: "See immutable source",
     reason: "Unspecified by author", limitations: "Untested; no efficacy or applicability claim",
   }),
-  dependencies: z.array(programSelectorSchema).max(32).default([]), based_on: z.int().positive().optional(),
-  reason: z.string().trim().min(1).max(2000).optional(),
+  dependencies: z.array(programSelectorSchema).max(32).default([]),
+  based_on: z.int().positive().optional().describe("Required for an existing name: its latest stored version, even if unexecuted; not the latest executed version. Omit for a new name. Stale parents conflict without rebasing."),
+  reason: z.string().trim().min(1).max(2000).optional().describe("Experimental revision link to actual outcome feedback for the exact based_on parent. Omit for an ordinary revision, including revising stored but unexecuted source; use card.reason for descriptive motivation. Missing parent feedback refuses the write/start."),
 }).strict();
 export const nextConfigSchema = lookaheadConfigSchema.extend({ activation: z.enum(["manual", "on_predecessor_success"]).default("manual") }).strict();
 // Actor input may override individual fields. Only this boundary supplies
@@ -44,9 +47,11 @@ const actorLimitsSchema = skillLimitsSchema.extend({
   max_depth: skillLimitsSchema.shape.max_depth.default(DEFAULT_SKILL_LIMITS.max_depth),
 }).prefault({});
 export const programSubmitSchema = z.discriminatedUnion("entry", [
-  programWriteSchema.extend({ entry: z.literal("run").default("run"), args: jsonSchema,
+  programWriteSchema.extend({ entry: z.literal("run").default("run"),
+    args: jsonSchema.describe("Required JSON execution arguments; pass null when unused."),
     limits: actorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
-  programWriteSchema.extend({ entry: z.literal("step"), args: residentIntentSchema,
+  programWriteSchema.extend({ entry: z.literal("step"),
+    args: residentIntentSchema.describe("Required JSON initial resident intent; pass null when unused."),
     initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema }).strict(),
 ]);
 const playingStartSchema = z.discriminatedUnion("entry", [

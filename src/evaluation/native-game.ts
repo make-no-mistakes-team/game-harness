@@ -89,6 +89,10 @@ export interface NativeFixtureOptions {
   conditions?: WorldConditions;
   /** Trusted conformance label; exercises the actual checked Java long boundary. */
   initialEpoch?: number;
+  /** Original caller-owned monotonic task deadline, including actual cleanup. */
+  deadlineHostMs?: number;
+  /** Original preparation deadline; never renewed by a nested startup stage. */
+  preparationDeadlineHostMs?: number;
 }
 
 /** Evaluator-only infrastructure, never a gameplay/source library or model API.
@@ -110,6 +114,7 @@ export class NativeFixture {
   private controllerGeneration = 0;
   private closed = false;
   private closePromise: Promise<{ closed: boolean }> | null = null;
+  private readonly startupOperations = new Set<Promise<unknown>>();
   private nativeArtifactHash: string | null = null;
   private diagnosticStore: Store | null = null;
   private diagnosticSource: string | null = null;
@@ -117,7 +122,8 @@ export class NativeFixture {
   private readonly detach: Array<() => void> = [];
   private constructor(readonly project: string, readonly root: string, readonly port: number,
     readonly caps: EvaluationCaps, private readonly authDirectory: string, private readonly conditions?: WorldConditions,
-    private readonly initialEpoch = 1, private readonly evaluation: Readonly<NativeEvaluationOptions> | null = null) {
+    private readonly initialEpoch = 1, private readonly evaluation: Readonly<NativeEvaluationOptions> | null = null,
+    private readonly deadlineHostMs = Infinity, private readonly preparationDeadlineHostMs = Infinity) {
     this.evidenceDirectory = path.join(root, "evidence");
     this.report = { root, port, started_at: new Date().toISOString(), pass: false, cleanup: false,
       classification: conditions ? "natural_normal_survival_actual_model_acceptance" : "synthetic_caller_privileged_evaluator_infrastructure_not_model_gameplay",
@@ -139,10 +145,14 @@ export class NativeFixture {
     const project = path.resolve(options.projectRoot ?? process.cwd());
     const paths = evaluationPaths(project, options.paths);
     const authDirectory = path.resolve(options.authDirectory ?? process.env.GAMEHARNESS_EVALUATION_AUTH_DIR ?? process.env.GAMEHARNESS_DATA_DIR ?? path.join(project, "local/runtime"));
+    const assertPreparation = () => requireProof(performance.now() < Math.min(options.deadlineHostMs ?? Infinity,
+      options.preparationDeadlineHostMs ?? Infinity), "Original native preparation deadline reached");
+    assertPreparation();
     await mkdir(paths.runtimeRoot, { recursive: true, mode: 0o700 });
     const root = path.join(paths.runtimeRoot, `${name}-${Date.now()}-${randomUUID().slice(0, 8)}`);
     await mkdir(root, { mode: 0o700 });
     await mkdir(path.join(root, "evidence"), { mode: 0o700 });
+    assertPreparation();
     const reservation = createServer();
     const portReady = Promise.withResolvers<number>();
     reservation.once("error", portReady.reject);
@@ -156,13 +166,26 @@ export class NativeFixture {
     process.env.GAMEHARNESS_DATA_DIR = root;
     process.env.GAMEHARNESS_MINECRAFT_PORT = String(port);
     requireProof(Number.isSafeInteger(options.initialEpoch ?? 1) && (options.initialEpoch ?? 1) >= 0, "Native fixture epoch must be a nonnegative safe integer");
-    const fixture = new NativeFixture(project, root, port, options.caps ?? DEFAULT_EVALUATION_CAPS, authDirectory, options.conditions, options.initialEpoch ?? 1, evaluation);
+    const fixture = new NativeFixture(project, root, port, options.caps ?? DEFAULT_EVALUATION_CAPS, authDirectory, options.conditions, options.initialEpoch ?? 1, evaluation,
+      options.deadlineHostMs, options.preparationDeadlineHostMs);
     await fixture.flush();
     return fixture;
   }
   private assertOpen() { requireProof(!this.closed, "Native fixture has closed"); }
-  async start() {
+  private assertPreparation() {
     this.assertOpen();
+    requireProof(performance.now() < Math.min(this.deadlineHostMs, this.preparationDeadlineHostMs), "Original native preparation deadline reached");
+  }
+  private async prepareWithin<T>(operation: () => Promise<T>, capMs: number, message: string): Promise<T> {
+    this.assertPreparation();
+    const work = operation();
+    this.startupOperations.add(work);
+    void work.finally(() => this.startupOperations.delete(work)).catch(() => {});
+    return await bounded(work, Math.min(capMs, Math.max(1, Math.min(this.deadlineHostMs,
+      this.preparationDeadlineHostMs) - performance.now())), message);
+  }
+  async start() {
+    this.assertPreparation();
     const consent = JSON.parse(await readFile(path.join(this.authDirectory, "provisioning-consent.json"), "utf8"));
     requireProof(consent.eulaAccepted === true && consent.minecraftVersion === "1.21.4" && consent.eulaUrl === "https://www.minecraft.net/en-us/eula", "Existing explicit provisioning consent is unavailable; this evaluator cannot grant consent");
     const copied = Object.fromEntries(["minecraftVersion", "eulaAccepted", "eulaUrl", "acceptedAt", "source", "deployment", "desktopClientRequired"].filter(key => Object.hasOwn(consent, key)).map(key => [key, consent[key]]));
@@ -178,7 +201,7 @@ export class NativeFixture {
     const config = await import("../server/config.ts");
     requireProof(config.DATA_DIR === this.root && config.MINECRAFT_PORT === this.port,
       "Native evaluation needs a fresh command process; production config was imported before fixture isolation");
-    this.assertOpen();
+    this.assertPreparation();
     this.server = new MinecraftServer(() => {}, (type, summary, details) => { this.timeline.push({ at: new Date().toISOString(), type, summary, details }); },
       this.conditions ? { worldSeed: this.conditions.seed } : {});
     this.bridge = new GameBridgeClient(this.project, { dataDir: this.root, evaluation: this.evaluation ?? undefined });
@@ -192,19 +215,17 @@ export class NativeFixture {
     await this.startWorld(hash, jar);
   }
   private async startWorld(hash: string, jar: string) {
-    await bounded(this.server.initialize(), this.caps.startMs, "Server initialization timed out");
-    this.assertOpen();
-    await bounded(this.server.prepare(false), this.caps.totalMs, "Pinned server preparation timed out");
-    this.assertOpen();
-    await bounded(this.server.start(), this.caps.totalMs, "Owned server readiness timed out");
-    this.assertOpen();
+    await this.prepareWithin(() => this.server.initialize(), this.caps.startMs, "Server initialization timed out");
+    await this.prepareWithin(() => this.server.prepare(false), this.caps.totalMs, "Pinned server preparation timed out");
+    await this.prepareWithin(() => this.server.start(), this.caps.totalMs, "Owned server readiness timed out");
+    this.assertPreparation();
     const world = this.server.snapshot().world_id;
     requireProof(world, "Owned server has no world ID");
     this.report.world_id = world;
     this.report.fixture_server_pid = this.ownedServer().child.pid;
     this.report.server_stdout_artifact = `minecraft/worlds/${world}/gameharness-private.log`;
     if (this.conditions) await this.verifyWorldConditions(world);
-    await bounded(this.bridge.connect({ host: "127.0.0.1", port: this.port, version: "1.21.4", world_id: world, epoch: this.initialEpoch }), this.caps.totalMs, "Owned native connection timed out");
+    await this.prepareWithin(() => this.bridge.connect({ host: "127.0.0.1", port: this.port, version: "1.21.4", world_id: world, epoch: this.initialEpoch }), this.caps.totalMs, "Owned native connection timed out");
     const client = this.ownedClient();
     this.clients.push(client);
     const actualEvaluation = normalizeNativeEvaluation(client.session.evaluation, true);
@@ -223,7 +244,7 @@ export class NativeFixture {
       requireProof(actual === hash, "A launched native artifact differs from the recorded build bytes");
     }
     this.report.launched_native_artifacts = installedArtifacts;
-    const observation = await bounded(this.observe(), this.caps.observationMs, "Initial authorized observation timed out");
+    const observation = await this.prepareWithin(() => this.observe(), this.caps.observationMs, "Initial authorized observation timed out");
     requireProof(observation.schema_version === 3 && observation.profile_id === "minecraft_assisted_rgb_360_r8_control_v4", "Native observation is not the actual negotiated observation3/r8/control-feedback profile");
     requireProof(observation.epoch === this.initialEpoch && observation.life.status === "alive" && observation.data.player.health > 0, "Fresh world did not preserve the safe-long scope or admit an authoritative alive player");
     this.report.initial = this.identity(observation);
@@ -495,16 +516,30 @@ export class NativeFixture {
       this.stoppedClient = null;
     }
     if (this.stoppedServer !== null) { try { process.kill(this.stoppedServer, "SIGCONT"); } catch {} this.stoppedServer = null; }
+    const cleanupDeadline = Math.min(this.deadlineHostMs, performance.now() + this.caps.cleanupMs);
+    if (performance.now() >= cleanupDeadline) this.report.cleanup_deadline_reached = true;
+    const join = async (work: Promise<unknown>, message: string) => {
+      try { await bounded(work, Math.max(1, cleanupDeadline - performance.now()), message); }
+      catch {
+        if (performance.now() >= cleanupDeadline) this.report.cleanup_deadline_reached = true;
+        // Revocation/timeout is not closure. Retain and join the original owner.
+        await work;
+      }
+    };
     const cleanup = await Promise.allSettled([
-      this.bridge ? bounded(ActionArbiter.current(this.bridge)?.close("Native fixture authority closed") ?? Promise.resolve(), this.caps.cleanupMs, "Diagnostic arbiter cleanup deadline") : Promise.resolve(),
-      this.bridge ? bounded(this.bridge.close(), this.caps.cleanupMs, "Native cleanup deadline") : Promise.resolve(),
-      this.server ? bounded(this.server.close(), this.caps.cleanupMs, "Server cleanup deadline") : Promise.resolve(),
+      join(this.bridge ? ActionArbiter.current(this.bridge)?.close("Native fixture authority closed") ?? Promise.resolve() : Promise.resolve(), "Diagnostic arbiter cleanup deadline"),
+      join(this.bridge ? this.bridge.close() : Promise.resolve(), "Native cleanup deadline"),
+      join(this.server ? this.server.close() : Promise.resolve(), "Server cleanup deadline"),
+      join(Promise.allSettled([...this.startupOperations]), "Native preparation drain deadline"),
     ]);
     this.diagnosticStore?.close(); this.diagnosticStore = null;
     for (const unsubscribe of this.detach) unsubscribe();
-    const exits = await Promise.all(this.clients.map(client => bounded(client.closed, this.caps.cleanupMs, "Native process exit not confirmed").then(() => true, () => false)));
+    const exits = await Promise.all(this.clients.map(client => join(client.closed, "Native process exit not confirmed").then(() => true, () => false)));
     this.report.native_stdout_diagnostics = this.clients.map(client => ({ pid: client.child.pid, classes_and_redacted_causes: client.diagnostics }));
     const closed = cleanup.every(value => value.status === "fulfilled") && exits.every(Boolean) && (!this.bridge || Reflect.get(this.bridge, "owned") === null) && (!this.server || Reflect.get(this.server, "process") === null);
+    if (performance.now() >= cleanupDeadline) this.report.cleanup_deadline_reached = true;
+    // Actual closure remains useful ownership evidence after a missed bound;
+    // it is not evidence of a timely successful sample.
     this.report.cleanup = closed;
     this.report.cleanup_errors = cleanup.flatMap(value => value.status === "rejected" ? [String(value.reason)] : []);
     await this.flush();
@@ -514,7 +549,8 @@ export class NativeFixture {
     if (error) { this.report.error = error instanceof Error ? error.message : String(error); process.exitCode = 1; }
     await this.close();
     this.report.ended_at = new Date().toISOString();
-    this.report.pass = !error && this.cases.length > 0 && this.cases.every(value => value.status === "passed") && this.report.cleanup === true;
+    this.report.pass = !error && this.cases.length > 0 && this.cases.every(value => value.status === "passed") &&
+      this.report.cleanup === true && this.report.cleanup_deadline_reached !== true;
     if (!this.report.pass) process.exitCode = 1;
     await this.flush();
     console.log(JSON.stringify({ pass: this.report.pass, cleanup: this.report.cleanup, private_report: path.basename(this.root) }, null, 2));

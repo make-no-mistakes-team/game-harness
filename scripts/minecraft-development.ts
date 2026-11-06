@@ -27,6 +27,7 @@ if (import.meta.main) {
   try {
     if (process.argv.includes("--help")) {
       console.log("Minecraft development: --allow-native --allow-inference --jar <fresh.jar> --auth-dir <existing-app-root> --hypothesis <existing-id> --evidence-revision <current> --model <discovered-image-model> --purpose <purpose> --justification <reason> --task <plain-text> [--criterion <registered-goal; default custom>] --seed <fresh-seed> --start-description <disclosure> [--max-requests N --run-ms N --total-ms N] [--reasoning low] [--single-inference-dispatch]. Reasoning defaults to the backend's unspecified effort; explicit low requires the discovered SDK model's supported effort and changes neither account nor model. The explicit single-dispatch condition uses SSE, rejects enabled PI_CODEX_WEBSOCKET, refuses inference redirects/replays and ends on provider error; it does not change the account/model or prove zero consumption. Fresh Normal Survival only; no prepared/restored saves, supplied inventory, setup commands, strategy injection or study allowance.");
+      console.log("Use --evidence-profile <complete-private-profile.json> when default retention cannot cover --total-ms. Development retention covers the full original total, including recording prelude and drain; a 625000 ms envelope needs at least 18751 frames at nominal 30 Hz, including the final-frame margin.");
     } else {
       const options = parseMinecraftDevelopmentArguments(process.argv.slice(2));
       const project = fileURLToPath(new URL("..", import.meta.url));

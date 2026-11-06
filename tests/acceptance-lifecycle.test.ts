@@ -18,13 +18,97 @@ async function acceptanceLifecycle(mode: string) {
     const [stdout, stderr, exit] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
     ]);
-    const expectedExit = mode === "deadline" || mode === "manifest-failure" || mode.startsWith("image-") || mode.startsWith("development-") ? 0 : mode === "sigterm" ? 143 : 130;
+    const expectedExit = mode === "native-close-late" ? 1 : mode === "deadline" || mode === "manifest-failure" || mode.startsWith("budget-") || mode.startsWith("image-") || mode.startsWith("development-") ? 0 : mode === "sigterm" ? 143 : 130;
     if (exit !== expectedExit) throw new Error(`Isolated acceptance ${mode} failed (${exit}, expected ${expectedExit}): ${stderr}\n${stdout}`);
     const line = stdout.split("\n").find(value => value.startsWith("ACCEPTANCE_RESULT "));
     if (!line) throw new Error(`Missing actual acceptance lifecycle evidence: ${stderr}\n${stdout}`);
     return JSON.parse(await readFile(join(root, "fixture-result.json"), "utf8"));
   } finally { clearTimeout(deadline); }
 }
+
+test("a real native fixture joins late owned closure but cannot pass a bounded sample", async () => {
+  const result = await acceptanceLifecycle("native-close-late");
+  expect(result.closeResult.closed).toBe(true);
+  expect(result.report.cleanup).toBe(true);
+  expect(result.report.cleanup_deadline_reached).toBe(true);
+  expect(result.closedAt).toBeNumber();
+  expect(result.closeReturnedAt).toBeGreaterThanOrEqual(result.closedAt);
+  expect(result.finishedAt).toBeGreaterThanOrEqual(result.closedAt);
+  expect(result.report.pass).toBe(false);
+}, 15000);
+
+test("a signal after early work expiry tightens its budget and joins the startup-to-main cleanup handoff", async () => {
+  const result = await acceptanceLifecycle("early-deadline-sigint");
+  expect(result.declaredCleanupMs).toBeGreaterThan(9000);
+  expect(result.signalAt).toBeGreaterThanOrEqual(result.workDeadline);
+  expect(result.report.failure).toContain("entire_sample_deadline");
+  expect(result.report.cleanup_budget_ms).toBeGreaterThan(0);
+  expect(result.report.cleanup_budget_ms).toBeLessThanOrEqual(9000);
+  expect(result.signalHandoffAt - result.signalAt + result.report.cleanup_budget_ms).toBeLessThanOrEqual(9000);
+  expect(result.earlyFinalizerSettledWhileNativeHeld).toBe(false);
+  expect(result.earlyFinalizerSettledAt).toBeGreaterThanOrEqual(result.nativeClosedAt);
+  expect(result.returnedAt).toBeGreaterThanOrEqual(result.nativeClosedAt);
+  expect(result.providerCalls).toBe(0);
+  expect(result.authCreates).toBe(0);
+  expect(result.result.platform_complete).toBe(false);
+  expect(result.unchangedAfterReturn).toBe(true);
+  expect(result.unhandled).toEqual([]);
+}, 15000);
+
+test("preparation consumes the original sample budget and late native ownership is joined without model admission", async () => {
+  const result = await acceptanceLifecycle("budget-preparation-expired");
+  expect(result.providerCalls).toBe(0);
+  expect(result.authCreates).toBe(0);
+  expect(result.starts).toBe(0);
+  expect(result.result.platform_complete).toBe(false);
+  expect(result.result.failure).not.toBeNull();
+  expect(result.report.elapsed_ms).toBeGreaterThanOrEqual(700);
+  expect(result.report.cleanup_deadline_reached).toBe(true);
+  expect(result.report.cleanup_confirmed).toBe(false);
+  expect(result.nativeClosedAt).toBeNumber();
+  expect(result.returnedAt).toBeGreaterThanOrEqual(result.nativeClosedAt);
+  expect(result.nextWorlds).toBe(0);
+  expect(result.unchangedAfterReturn).toBe(true);
+  expect(result.unhandled).toEqual([]);
+}, 15000);
+
+test("deadline-aware preparation refuses further admission and joins its original native owner", async () => {
+  const result = await acceptanceLifecycle("budget-preparation-bounded");
+  expect(result.providerCalls).toBe(0);
+  expect(result.authCreates).toBe(0);
+  expect(result.starts).toBe(0);
+  expect(result.result.platform_complete).toBe(false);
+  expect(result.result.failure).not.toBeNull();
+  expect(result.returnedAt).toBeGreaterThanOrEqual(result.nativeClosedAt);
+  expect(result.unchangedAfterReturn).toBe(true);
+  expect(result.unhandled).toEqual([]);
+}, 15000);
+
+test("required final verification cannot restart the original preparation-inclusive budget", async () => {
+  const result = await acceptanceLifecycle("budget-final-verification");
+  expect(result.providerCalls).toBeGreaterThan(0);
+  expect(result.finalDiagnosticsStartedAt).toBeNumber();
+  expect(result.result.platform_complete).toBe(false);
+  expect(result.result.failure).not.toBeNull();
+  expect(result.report.cleanup_deadline_reached).toBe(true);
+  expect(result.report.cleanup_confirmed).toBe(false);
+  expect(result.returnedAt).toBeGreaterThanOrEqual(result.finalDiagnosticsFinishedAt);
+  expect(result.returnedAt).toBeGreaterThanOrEqual(result.nativeClosedAt);
+  expect(result.nextWorlds).toBe(0);
+  expect(result.unchangedAfterReturn).toBe(true);
+  expect(result.unhandled).toEqual([]);
+}, 15000);
+
+test("required final report persistence remains inside the joined cleanup budget", async () => {
+  const result = await acceptanceLifecycle("budget-final-persistence");
+  expect(result.finalPersistenceStartedAt).toBeNumber();
+  expect(result.returnedAt).toBeGreaterThanOrEqual(result.finalPersistenceFinishedAt);
+  expect(result.report.cleanup_deadline_reached).toBe(true);
+  expect(result.report.cleanup_confirmed).toBe(false);
+  expect(result.result.platform_complete).toBe(false);
+  expect(result.unchangedAfterReturn).toBe(true);
+  expect(result.unhandled).toEqual([]);
+}, 15000);
 
 for (const mode of ["manifest-failure", "manifest-failure-sigint"]) {
   test(`${mode} joins the actual observer reader before Store close despite a cached manifest rejection`, async () => {
@@ -50,7 +134,6 @@ for (const mode of ["manifest-failure", "manifest-failure-sigint"]) {
       expect(result.readerAtStoreClose.child[stamp]).toBeNumber();
       expect(result.readerAtStoreClose.child[stamp]).toBeLessThanOrEqual(result.storeClosedAt);
     }
-    expect(result.report.cleanup_budget_ms).toBe(300);
     expect(result.nextWorlds).toBe(0);
     expect(result.unchangedAfterReturn).toBe(true);
     expect(result.unhandled).toEqual([]);
@@ -98,6 +181,75 @@ test("Minecraft development retains a custom completion claim without inventing 
   expect(result.report.diagnostic_history).toEqual([expect.objectContaining({
     attempt_id: result.attempts[0].attemptId, goal_verified: null,
   })]);
+}, 15000);
+
+test("idle development uses only production observations and Runtime verifies its built-in criterion without evaluator refreshes", async () => {
+  const result = await acceptanceLifecycle("development-observer-parity");
+  // Select the first request's quiet windows, not the scheduler's total turns.
+  // A normal idle wake may admit another request while goal Stop drains.
+  const firstRequestSnapshots = result.paritySnapshots.filter((snapshot: { request: number }) => snapshot.request === 1);
+  const window = (phase: string) => {
+    const snapshot = firstRequestSnapshots.find((snapshot: { phase: string }) => snapshot.phase === phase);
+    expect(snapshot).toBeDefined();
+    return snapshot;
+  };
+  const started = window("request_started"), held = window("request_held");
+  const settled = window("request_settled"), idle = window("idle");
+  expect(held.at - started.at).toBeGreaterThanOrEqual(100);
+  expect(idle.at - settled.at).toBeGreaterThanOrEqual(100);
+  expect(started.presentation.state.blocks).toEqual([expect.objectContaining({
+    target: expect.objectContaining({ target_id: "parity-visible-stone" }), name: "stone",
+  })]);
+  for (const snapshot of [held, settled, idle]) {
+    expect(snapshot.sequence).toBe(started.sequence);
+    expect(snapshot.presentation).toEqual(started.presentation);
+  }
+  expect(result.report.results[0]).toMatchObject({
+    runtime_status: "completed", host_baseline_preserved: true,
+    completion_claim: "registered_independent_verifier",
+    outcome: { platform_status: "pass", goal_verified: true },
+    verification: { status: "verified", reason: "own_inventory_gain" },
+  });
+  const records = result.journals.flatMap((journal: string) => journal.trim().split("\n").map(line => JSON.parse(line)));
+  const evaluatorReads = records.filter((record: { kind: string }) => record.kind === "authorized_evaluation_observation");
+  // Initial/final evaluator evidence is the contract; intervening evaluator
+  // reads would refresh actor geometry even if Runtime eventually completed.
+  expect(evaluatorReads).toHaveLength(2);
+  const initialObservation = evaluatorReads[0].value.observation;
+  const finalObservation = evaluatorReads[1].value.observation;
+  expect(initialObservation.observation_seq).toBeLessThan(started.sequence);
+  expect(initialObservation.data.player.inventory).toEqual([]);
+  expect(finalObservation.data.player.inventory).toEqual([
+    expect.objectContaining({ name: "oak_log", count: 1 }),
+  ]);
+  const events = records.filter((record: { kind: string }) => record.kind === "store_event")
+    .map((record: { value: any }) => record.value);
+  const runtimeReads = events.filter((event: { type: string }) => event.type === "adapter.evidence");
+  const verified = events.find((event: { type: string }) => event.type === "goal.verified");
+  expect(verified).toBeDefined();
+  expect(verified.details).toMatchObject({ status: "verified", reason: "own_inventory_gain" });
+  expect(records.findIndex((record: { kind: string; value: any }) => record.kind === "store_event" && record.value === verified))
+    .toBeLessThan(records.indexOf(evaluatorReads[1]));
+  expect(verified.details.evidence_refs.length).toBeGreaterThan(0);
+  for (const reference of verified.details.evidence_refs) {
+    const proof = runtimeReads.find((event: any) => event.details.evidence_id === reference);
+    expect(proof).toBeDefined();
+    const observation = proof.details.data;
+    expect(observation.observation_seq).toBeGreaterThan(idle.sequence);
+    expect(observation.data.player.inventory).toContainEqual(expect.objectContaining({ name: "oak_log", count: 1 }));
+    const nativeRead = result.observationReads.find((read: { sequence: number }) => read.sequence === observation.observation_seq);
+    expect(nativeRead).toMatchObject({ hasWood: true });
+    expect(nativeRead.at).toBeGreaterThanOrEqual(idle.at);
+    expect(events.indexOf(proof)).toBeLessThan(events.indexOf(verified));
+    expect(finalObservation.observation_seq).toBeGreaterThan(observation.observation_seq);
+  }
+  const backoff = events.find((event: { type: string }) => event.type === "scheduler.backoff");
+  expect(backoff).toBeDefined();
+  expect(events.indexOf(backoff)).toBeLessThan(events.indexOf(verified));
+  expect(result.result.platform_complete).toBe(true);
+  expect(result.report.cleanup_confirmed).toBe(true);
+  expect(result.unchangedAfterReturn).toBe(true);
+  expect(result.unhandled).toEqual([]);
 }, 15000);
 
 test("Minecraft development bounds real SDK transport and keeps the stone criterion for the full request", async () => {

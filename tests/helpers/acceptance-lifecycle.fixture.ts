@@ -31,13 +31,67 @@ const studyMode = requestedMode?.startsWith("study-") ?? false;
 const developmentMode = requestedMode?.startsWith("development-") ?? false;
 const mode = studyMode ? requestedMode!.slice("study-".length) : developmentMode ? requestedMode!.slice("development-".length) : requestedMode;
 const customFinish = developmentMode && mode === "custom-finish";
+const observerParity = developmentMode && mode === "observer-parity";
 const planningStalled = mode === "planning-stalled";
 const requestCapNonGoal = mode === "request-cap-non-goal";
 const cancelBeforeIterator = mode === "cancel-before-iterator";
 if (!rootArg) throw new Error("Missing isolated acceptance root");
 const root = rootArg;
+if (mode === "native-close-late") {
+  // Before mock registration: exercise the actual fixture's public ownership
+  // close and finish, with only the external bridge close held past its cap.
+  const { createEvaluationCaps } = await import("../../src/evaluation/config.ts");
+  process.env.GAMEHARNESS_NATIVE_PROOF = "1";
+  const fixture = await native.NativeFixture.create("late-close", {
+    projectRoot: root, authDirectory: root,
+    paths: { runtimeRoot: join(root, "runtime"), reportsRoot: join(root, "reports"), governanceRoot: join(root, "governance") },
+    caps: createEvaluationCaps({ cleanupMs: 20 }),
+  });
+  let closedAt: number | null = null;
+  const ownedBridge = {
+    owned: {},
+    async close() { await Bun.sleep(80); Reflect.set(this, "owned", null); closedAt = performance.now(); },
+  };
+  Reflect.set(fixture, "bridge", ownedBridge);
+  await fixture.case("owned-close-bound", {}, async () => {});
+  const closeResult = await fixture.close(), closeReturnedAt = performance.now();
+  await fixture.finish();
+  const finishedAt = performance.now();
+  await writeFile(join(root, "fixture-result.json"), JSON.stringify({
+    closeResult, closeReturnedAt, closedAt, finishedAt,
+    report: JSON.parse(await readFile(join(fixture.evidenceDirectory, "report.json"), "utf8")),
+  }));
+  await Bun.write(Bun.stdout, "ACCEPTANCE_RESULT fixture-result.json\n");
+  process.exit(process.exitCode ?? 0);
+}
+const earlyDeadlineSignal = mode === "early-deadline-sigint";
+const createEntered = Promise.withResolvers<void>(), releaseCreate = Promise.withResolvers<void>();
+const nativeCloseEntered = Promise.withResolvers<void>(), releaseNativeClose = Promise.withResolvers<void>();
+let workDeadline: number | null = null, signalAt: number | null = null, signalHandoffAt: number | null = null;
+let monotonicOffset = 0;
+let earlyFinalizerSettledAt: number | null = null, earlyFinalizerSettledWhileNativeHeld: boolean | null = null;
+if (earlyDeadlineSignal) {
+  const now = performance.now.bind(performance);
+  performance.now = () => now() + monotonicOffset;
+  const register = postmortem.register;
+  mock.module("@oh-my-pi/pi-utils/postmortem", () => ({
+    ...postmortem,
+    register: (...args: Parameters<typeof postmortem.register>) => {
+      const [name, callback, options] = args;
+      return register(name, name.startsWith("acceptance-startup-") ? async why => {
+        await callback(why);
+        earlyFinalizerSettledAt = performance.now();
+      } : callback, options);
+    },
+  }));
+}
 const imageFailure = mode === "image-before-first" || mode === "image-after-settled";
 const manifestFailure = mode === "manifest-failure" || mode === "manifest-failure-sigint";
+const preparationExpired = mode === "budget-preparation-expired";
+const preparationBounded = mode === "budget-preparation-bounded";
+const finalVerificationBudget = mode === "budget-final-verification";
+const finalPersistenceBudget = mode === "budget-final-persistence";
+const budgetMode = preparationExpired || preparationBounded || finalVerificationBudget || finalPersistenceBudget;
 const ownedRuntimeRoot = studyMode ? join(root, "runtime/owned-slot") : join(root, "runtime");
 const evidenceDirectory = join(ownedRuntimeRoot, "evidence"), governanceRoot = join(root, "governance");
 const isolatedCheckout: IsolatedStudyCheckout | undefined = studyMode ? JSON.parse(ownershipArg ?? "null") : undefined;
@@ -49,9 +103,12 @@ await writeFile(join(authDirectory, "auth/gameharness.sqlite"), "synthetic facto
 process.env.GAMEHARNESS_DATA_DIR = join(root, "runtime");
 process.env.PATH = `${join(root, "bin")}:${process.env.PATH ?? ""}`;
 process.env.ACCEPTANCE_LIFECYCLE_RELEASE = join(root, "release-render");
-await writeFile(join(root, "bin/ffmpeg"), `#!${process.execPath}\nimport { writeFileSync, existsSync } from "node:fs";\nwriteFileSync("renderer.pid", String(process.pid));\nfunction complete() { writeFileSync("replay.mp4", "synthetic renderer, never visual proof"); process.exit(0); }\n${customFinish || mode === "complete-persistence" || imageFailure || manifestFailure || mode === "request-cap" || mode === "cold-isolation" || planningStalled || requestCapNonGoal ? "complete();" : `setInterval(() => { if (process.ppid !== ${process.pid}) process.exit(1); if (existsSync(process.env.ACCEPTANCE_LIFECYCLE_RELEASE)) complete(); }, 5);`}\n`, { mode: 0o700 });
+await writeFile(join(root, "bin/ffmpeg"), `#!${process.execPath}\nimport { writeFileSync, existsSync } from "node:fs";\nwriteFileSync("renderer.pid", String(process.pid));\nfunction complete() { writeFileSync("replay.mp4", "synthetic renderer, never visual proof"); process.exit(0); }\n${budgetMode || customFinish || observerParity || mode === "complete-persistence" || imageFailure || manifestFailure || mode === "request-cap" || mode === "cold-isolation" || planningStalled || requestCapNonGoal ? "complete();" : `setInterval(() => { if (process.ppid !== ${process.pid}) process.exit(1); if (existsSync(process.env.ACCEPTANCE_LIFECYCLE_RELEASE)) complete(); }, 5);`}\n`, { mode: 0o700 });
 
 let providerCalls = 0, starts = 0, nextWorlds = 0, sequence = 0, returned = false, lateWrites = 0;
+let authCreates = 0, nativeClosedAt: number | null = null, returnedAt: number | null = null;
+let finalDiagnosticsStartedAt: number | null = null, finalDiagnosticsFinishedAt: number | null = null;
+let finalPersistenceStartedAt: number | null = null, finalPersistenceFinishedAt: number | null = null;
 const readerCloseEntered = Promise.withResolvers<void>(), releaseReaderClose = Promise.withResolvers<void>();
 let observerHistory: historyModule.HistoryReader | undefined;
 let blockedManifest: string | undefined, manifestPersistenceError: string | undefined;
@@ -103,6 +160,9 @@ async function reservationExists() {
   try { return ledger.readStudy(studyRef).attempts.length === 1; } finally { ledger.close(); }
 }
 let hasWood = false, frameSequence = 0;
+const observationReads: Array<{ sequence: number; at: number; hasWood: boolean }> = [];
+const paritySnapshots: Array<{ request: number; phase: string; at: number; sequence: number; presentation: GameState["presentation"] }> = [];
+const parityProbes: Promise<void>[] = [];
 const session = crypto.randomUUID(), world = crypto.randomUUID();
 const listeners = new Set<(frame: Uint8Array) => void>();
 const motorProfile = mode === "profile-motor-mismatch" ? "fast" : "balanced";
@@ -129,12 +189,16 @@ const bridge: GameBridge & { subscribeFrames(callback: (frame: Uint8Array) => vo
   connect: async () => {}, disconnect: async () => {}, snapshot: () => structuredClone(state),
   async observe(): Promise<ObservationV3> {
     frame();
+    const capturedAt = new Date().toISOString();
     const observation = minecraftObservationFixture(adapter, { session_id: session, life: state.life!, world_id: world, epoch: 1,
-      observation_seq: ++sequence, captured_at: new Date().toISOString(),
+      observation_seq: ++sequence, captured_at: capturedAt,
       data: { player: { position: { x: 0, y: 64, z: 0 }, yaw: 0, pitch: 0, health: 20, food: 20, on_ground: true, in_water: false,
         inventory: hasWood ? [{ name: "oak_log", display_name: "Oak Log", count: 1, slot: 0 }] : [] },
-      blocks: [], entities: [], sounds: [] } });
+      blocks: observerParity ? [{ target: { target_id: "parity-visible-stone", incarnation: 1, life_id: 1,
+        space: state.space! }, name: "stone", position: { x: 1, y: 63, z: 1 }, current: true, observed_at: capturedAt }] : [],
+      entities: [], sounds: [] } });
     state.presentation = adapter.projectObservation(observation); state.last_observation_at = observation.captured_at;
+    if (observerParity) observationReads.push({ sequence, at: performance.now(), hasWood });
     return observation;
   },
   execute: async () => { throw new Error("No gameplay effects belong in this lifecycle fixture"); },
@@ -142,6 +206,9 @@ const bridge: GameBridge & { subscribeFrames(callback: (frame: Uint8Array) => vo
   subscribe: () => () => {}, subscribeFrames(callback) { listeners.add(callback); return () => { listeners.delete(callback); }; },
   latestFrame: actorFrame,
 };
+function paritySnapshot(request: number, phase: string) {
+  paritySnapshots.push({ request, phase, at: performance.now(), sequence, presentation: bridge.snapshot().presentation });
+}
 const descriptor = getBundledModels("openai-codex").find(model => model.api === "openai-codex-responses" && model.input.includes("image"));
 if (!descriptor) throw new Error("Installed catalog lacks the offline image-capable descriptor");
 const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
@@ -164,9 +231,11 @@ let originalIteratorReads = 0, originalIteratorReturns = 0, originalIteratorClos
 let returnedBeforeTransportRelease: boolean | null = null, requestSignalAbortedBeforeRead = false;
 const stream: StreamFn = (_model, context, options) => {
   providerCalls++;
+  const request = providerCalls;
   actorContexts.push(JSON.stringify(context));
   // Inventory gain is a synthetic native observation, not a fake verifier.
-  hasWood = !imageFailure && mode !== "cold-isolation" && mode !== "request-cap" &&
+  // Parity gain belongs to the native idle probe and survives later requests.
+  if (!observerParity) hasWood = !imageFailure && mode !== "cold-isolation" && mode !== "request-cap" &&
     !planningStalled && !requestCapNonGoal && !cancelBeforeIterator;
   const events = new AssistantMessageEventStream();
   const repair = mode === "cold-isolation" && providerCalls <= 2 || requestCapNonGoal && providerCalls === 1;
@@ -179,17 +248,27 @@ const stream: StreamFn = (_model, context, options) => {
       ...(providerCalls === 2 ? { based_on: 1 } : {}) } }] : [{ type: "text", text: "Synthetic local lifecycle response; no network." }],
     api: model.api, provider: model.provider, model: model.id, stopReason: repair || finishing ? "toolUse" : "stop", timestamp: Date.now(),
     usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-  events.push({ type: "start", partial: message });
-  for (const content of message.content) {
-    if (content.type !== "toolCall") continue;
-    // The actual SDK discards unfinished streamed calls. Mirror the provider's
-    // completed tool sequence so real host dispatch, not fixture Store writes,
-    // creates and revises these local programs.
-    events.push({ type: "toolcall_start", contentIndex: 0, partial: message });
-    events.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(content.arguments), partial: message });
-    events.push({ type: "toolcall_end", contentIndex: 0, toolCall: content, partial: message });
-  }
-  events.push({ type: "done", reason: repair || finishing ? "toolUse" : "stop", message }); events.end();
+  const deliver = () => {
+    events.push({ type: "start", partial: message });
+    for (const content of message.content) {
+      if (content.type !== "toolCall") continue;
+      // The actual SDK discards unfinished streamed calls. Mirror the provider's
+      // completed tool sequence so real host dispatch, not fixture Store writes,
+      // creates and revises these local programs.
+      events.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+      events.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(content.arguments), partial: message });
+      events.push({ type: "toolcall_end", contentIndex: 0, toolCall: content, partial: message });
+    }
+    events.push({ type: "done", reason: repair || finishing ? "toolUse" : "stop", message }); events.end();
+  };
+  if (observerParity) {
+    paritySnapshot(request, "request_started");
+    parityProbes.push((async () => {
+      await Bun.sleep(150);
+      paritySnapshot(request, "request_held");
+      deliver();
+    })());
+  } else deliver();
   if (earlyIterator) {
     // This is the actual external stream-acquisition seam. The real Agent's
     // signal is cancelled before its SDK asks the returned iterator for next().
@@ -212,6 +291,7 @@ const stream: StreamFn = (_model, context, options) => {
 };
 const agents = new Set<Agent>();
 mock.module(resolve(import.meta.dir, "../../src/server/auth.ts"), () => ({ AuthManager: { create: async () => {
+  authCreates++;
   authReservationSeen = await reservationExists();
   return ({
   snapshot: () => ({ status: "ready", authenticated: true, provider: "openai-codex", account_label: null, login: null, error: null,
@@ -225,6 +305,18 @@ mock.module(resolve(import.meta.dir, "../../src/server/auth.ts"), () => ({ AuthM
     // correctly producing unknown consumption even before the run deadline.
     if (mode === "request-cap") agent.subscribe(event => {
       if (event.type === "agent_end") hasWood = true;
+    });
+    if (observerParity) agent.subscribe(event => {
+      if (event.type !== "agent_end" || providerCalls !== 1) return;
+      paritySnapshot(1, "request_settled");
+      parityProbes.push((async () => {
+        await Bun.sleep(150);
+        paritySnapshot(1, "idle");
+        // The native seam changes inventory only after both quiet windows.
+        // Runtime's normal idle wake must obtain and verify it; the fixture
+        // never publishes an observation notice or invokes a verifier.
+        hasWood = true;
+      })());
     });
     agents.add(agent); return agent;
   },
@@ -245,16 +337,45 @@ mock.module(resolve(import.meta.dir, "../../src/evaluation/native-game.ts"), () 
   startupReservationSeen = await reservationExists();
   fixtureConditions = options?.conditions ?? null;
   process.env.GAMEHARNESS_DATA_DIR = ownedRuntimeRoot;
+  if (earlyDeadlineSignal) {
+    workDeadline = options!.preparationDeadlineHostMs!;
+    createEntered.resolve();
+    await releaseCreate.promise;
+  }
+  if (preparationExpired) await Bun.sleep(700);
+  if (preparationBounded) await Bun.sleep(Math.min(700, Math.max(1,
+    (options?.preparationDeadlineHostMs ?? Infinity) - performance.now() + 5)));
+  if (finalVerificationBudget) await Bun.sleep(300);
   return ({
   root: ownedRuntimeRoot, evidenceDirectory, bridge, commands: [],
   report: { world_conditions: { synthetic: true }, native_artifact: { sha256: "synthetic-local-native-seam" } },
   start: async () => { starts++; if (mode === "startup-failure") throw new Error("Local synthetic native startup failure"); },
   nextWorld: async () => { nextWorlds++; throw new Error("Interrupted samples must not start another native world"); },
-  diagnostics: async () => ({ controls_neutral: true, motor_active: false, motor_profile: motorProfile }), close: async () => ({ closed: true }),
+  diagnostics: async () => {
+    if (finalVerificationBudget) {
+      finalDiagnosticsStartedAt = performance.now();
+      await Bun.sleep(1000);
+      finalDiagnosticsFinishedAt = performance.now();
+    }
+    return { controls_neutral: true, motor_active: false, motor_profile: motorProfile };
+  },
+  close: async () => {
+    if (earlyDeadlineSignal) { nativeCloseEntered.resolve(); await releaseNativeClose.promise; }
+    if (preparationExpired) await Bun.sleep(150);
+    if (preparationBounded) await Bun.sleep(25);
+    nativeClosedAt = performance.now();
+    return { closed: true };
+  },
   writeJson: async (name: string, value: unknown) => { if (returned) lateWrites++; await writeFile(join(evidenceDirectory, name), JSON.stringify(value), { mode: 0o600, flag: "wx" }); },
-  writeReport: async (value: { results?: unknown[]; resource_cleanup?: unknown }) => {
+  writeReport: async (value: { results?: unknown[]; resource_cleanup?: unknown; cleanup_confirmed?: boolean }) => {
     if (returned) lateWrites++;
     await writeFile(join(evidenceDirectory, "report.json"), JSON.stringify(value), { mode: 0o600 });
+    if (finalPersistenceBudget && !persistGateUsed && value.cleanup_confirmed) {
+      persistGateUsed = true;
+      finalPersistenceStartedAt = performance.now();
+      await Bun.sleep(190);
+      finalPersistenceFinishedAt = performance.now();
+    }
     if (mode === "complete-persistence" && !persistGateUsed && value.results?.length === 1 && !value.resource_cleanup) {
       persistGateUsed = true;
       // Pause real report persistence after all case facts have been committed.
@@ -300,19 +421,39 @@ if (studyMode) {
 }
 const commonOptions = { allowNative: true, allowInference: true, authDirectory, projectRoot: project,
   paths: { runtimeRoot: join(root, "runtime"), reportsRoot: join(root, "reports"), governanceRoot },
-  scenario: mode === "complete-persistence" || imageFailure || manifestFailure || studyMode ? "collect_wood" as const : "all" as const, modelId: model.id,
+  scenario: budgetMode || mode === "complete-persistence" || imageFailure || manifestFailure || studyMode ? "collect_wood" as const : "all" as const, modelId: model.id,
   purpose: "justified_acceptance", justification: "Isolated local synthetic cancellation integration; never a provider or gameplay proof",
   caps: { hostRequestAdmissions: mode === "request-cap" || requestCapNonGoal ? 1 : 30,
-    totalMs: imageFailure ? 10000 : planningStalled ? 20000 : mode === "deadline" ? 3000 : 6000,
-    runMs: imageFailure ? 8000 : planningStalled ? 15000 : 1000, cleanupMs: 300, authMs: 1000, discoveryMs: 1000,
-    startMs: 1000, observationMs: 500, diagnosticsMs: 500, pollMs: 5 } } as const;
+    totalMs: earlyDeadlineSignal ? 25200 : preparationExpired || preparationBounded ? 600 : finalVerificationBudget ? 1200 : finalPersistenceBudget ? 2500 : imageFailure || observerParity ? 10000 : planningStalled ? 20000 : mode === "deadline" ? 3000 : 6000,
+    runMs: budgetMode ? 500 : imageFailure || observerParity ? 8000 : planningStalled ? 15000 : 1000, cleanupMs: earlyDeadlineSignal ? 25000 : budgetMode ? 100 : 300, authMs: budgetMode ? 500 : 1000, discoveryMs: budgetMode ? 500 : 1000,
+    startMs: budgetMode ? 500 : 1000, observationMs: 500, diagnosticsMs: finalVerificationBudget ? 1100 : 500, pollMs: 5 } } as const;
+const submittedAt = performance.now();
 const acceptance = runAgentAcceptance(studySelection ? { ...commonOptions, study: studySelection } :
   { ...commonOptions, ...(developmentMode ? { scenario: undefined, development: {
-    task: customFinish ? "Collect wood, make a table and keep four planks." : "Make a stone pickaxe from the resources around you.",
-    criterion: customFinish ? "custom" as const : "craft_stone_pickaxe" as const, seed: "20261026",
+    task: customFinish ? "Collect wood, make a table and keep four planks." : observerParity ? "Collect wood." : "Make a stone pickaxe from the resources around you.",
+    criterion: customFinish ? "custom" as const : observerParity ? "collect_wood" as const : "craft_stone_pickaxe" as const, seed: "20261026",
     start_description: "Synthetic local native seam; no real game/provider" } } : {}),
     hypothesisId: "synthetic-lifecycle", platformEvidenceRevision: "synthetic-baseline" });
 const trigger = (async () => {
+  if (earlyDeadlineSignal) {
+    await createEntered.promise;
+    await Bun.sleep(Math.max(1, workDeadline! - performance.now() + 30));
+    signalAt = performance.now();
+    process.kill(process.pid, "SIGINT");
+    // Let the real signal handler enter the startup finalizer before creation
+    // hands ownership to the main runner. Hold actual cleanup across handoff.
+    await Bun.sleep(25);
+    // Advance only this isolated process's monotonic clock, not its timers:
+    // spending 8.5s of the signal allowance must not renew it at handoff.
+    monotonicOffset = 8500;
+    signalHandoffAt = performance.now();
+    releaseCreate.resolve();
+    await nativeCloseEntered.promise;
+    await Bun.sleep(25);
+    earlyFinalizerSettledWhileNativeHeld = earlyFinalizerSettledAt !== null;
+    releaseNativeClose.resolve();
+    return;
+  }
   if (manifestFailure) {
     await readerCloseEntered.promise;
     if (mode === "manifest-failure-sigint") process.kill(process.pid, "SIGINT");
@@ -330,7 +471,7 @@ const trigger = (async () => {
     earlyIterator.release.resolve();
     return;
   }
-  if (customFinish || imageFailure || mode === "startup-failure" || mode === "model-mismatch" || mode === "request-cap" || mode === "cold-isolation"
+  if (budgetMode || customFinish || observerParity || imageFailure || mode === "startup-failure" || mode === "model-mismatch" || mode === "request-cap" || mode === "cold-isolation"
     || mode === "profile-motor-mismatch" || planningStalled || requestCapNonGoal) return;
   const deadline = performance.now() + 2500;
   while (performance.now() < deadline && !await exists(rendererPidFile)) await Bun.sleep(5);
@@ -343,7 +484,9 @@ async function observeResult() {
  try {
   const result = await acceptance;
   returned = true;
+  returnedAt = performance.now();
   await trigger;
+  await Promise.all(parityProbes);
   rendererStarted = await exists(rendererPidFile);
   if (rendererStarted) rendererPid = Number(await readFile(rendererPidFile, "utf8"));
   const before = await snapshot(root);
@@ -391,6 +534,10 @@ async function observeResult() {
   // fixture IPC on disk instead of one large stdout pipe write that can block
   // fixture completion after the runner has already returned and drained.
   await writeFile(join(root, "fixture-result.json"), JSON.stringify({ result, rendererStarted, rendererAlive, starts, nextWorlds, providerCalls,
+    authCreates, nativeClosedAt, submittedAt, returnedAt, finalDiagnosticsStartedAt, finalDiagnosticsFinishedAt,
+    finalPersistenceStartedAt, finalPersistenceFinishedAt, observationReads, paritySnapshots,
+    declaredCleanupMs: commonOptions.caps.cleanupMs, workDeadline, signalAt, signalHandoffAt,
+    earlyFinalizerSettledAt, earlyFinalizerSettledWhileNativeHeld,
     attempts, study, startupReservationSeen, authReservationSeen, fixtureConditions, coldIsolation, nextAdmission, report, manifests, journals, lateWrites, unhandled,
     manifestPersistenceError, storeClosedAt, storeClosedWhileReaderHeld, returnedWhileReaderHeld, readerAliveWhileHeld, readerBeforeClose, readerAtStoreClose,
     originalIteratorReads, originalIteratorReturns, originalIteratorClosed, returnedBeforeTransportRelease, requestSignalAbortedBeforeRead,

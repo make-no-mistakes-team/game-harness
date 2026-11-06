@@ -64,6 +64,7 @@ function priorCosts(attempts: readonly AttemptRecord[]) {
 
 /** Explicitly opt-in, finite actual-provider sample. Negative goals never trigger repetition. */
 export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
+  const started = performance.now();
   requireProof(!options.singleInferenceDispatch || !options.study,
     "Single-dispatch inference is a diagnostic condition, not an override of a frozen study");
   const development = options.development ? minecraftDevelopmentSchema.parse(options.development) : undefined;
@@ -152,7 +153,9 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     selected = development ? [{ id: "minecraft-development", prompt: development.task,
       adapter_goal_id: development.criterion, verifier: null }] : selectNaturalScenarios(options.scenario);
     caps = createEvaluationCaps(options.caps);
-    requireCaptureHorizon(caps.runMs);
+    // Development recording begins before gameplay and drains afterwards.
+    // Its existing profile declaration must cover that complete bounded window.
+    requireCaptureHorizon(development ? caps.totalMs : caps.runMs);
     if (development) conditions = Object.freeze({ ...NATURAL_WORLD_CONDITIONS, seed: development.seed });
   }
   requireProof(options.allowNative && options.allowInference, "Agent acceptance requires --allow-native AND --allow-inference");
@@ -160,26 +163,40 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   requireProof(options.authDirectory, "Pass --auth-dir with the existing GameHarness data directory; credentials are never copied");
   const authDirectory = path.resolve(options.authDirectory);
   requireProof(selected.length > 0, "Choose collect_wood, craft_crafting_table, obtain_stone, collect_and_craft_table or all (original three cases)");
+  const taskDeadline = studyDeadlineAt === undefined ? started + caps.totalMs :
+    performance.now() + Math.max(0, studyDeadlineAt - Date.now());
+  const workDeadline = studyDeadlineAt === undefined ? taskDeadline - caps.cleanupMs : taskDeadline;
+  const preparationDeadline = development ? Math.min(workDeadline, started + 300_000) : workDeadline;
   process.env.GAMEHARNESS_NATIVE_PROOF = "1";
   let fixture: NativeFixture;
   let earlyInterruption: string | null = null;
+  let earlyCleanupDeadline = Infinity;
   const earlyDone = Promise.withResolvers<void>();
   const earlyInterrupt = (why: string) => {
-    if (!studies || !studyAttempt || earlyInterruption) return;
-    studies.interruptStudyAttempt(studyAttempt, why);
+    // A later signal tightens shutdown even when the original work deadline
+    // already supplied the interruption reason.
+    if (why === "operator_sigint" || why === "operator_sigterm")
+      earlyCleanupDeadline = Math.min(earlyCleanupDeadline, taskDeadline, performance.now() + Math.min(caps.cleanupMs, 9000));
+    if (earlyInterruption) return;
+    if (studies && studyAttempt) studies.interruptStudyAttempt(studyAttempt, why);
     earlyInterruption = why;
   };
-  const unregisterEarly = studies ? postmortem.register(`study-startup-${studyAttempt!.reservationId}`, why => {
+  const unregisterEarly = postmortem.register(`acceptance-startup-${studyAttempt?.reservationId ?? randomUUID()}`, why => {
     earlyInterrupt(why === postmortem.Reason.SIGINT ? "operator_sigint" : why === postmortem.Reason.SIGTERM ? "operator_sigterm" : `process_${why}`);
     return earlyDone.promise;
-  }, { exitOnly: true }) : undefined;
-  const earlyTimer = studyDeadlineAt === undefined ? undefined : setTimeout(() => earlyInterrupt("entire_sample_deadline"), Math.max(1, studyDeadlineAt - Date.now()));
+  }, { exitOnly: true });
+  const earlyTimer = setTimeout(() => earlyInterrupt("entire_sample_deadline"), Math.max(1, workDeadline - performance.now()));
   try {
+    if (performance.now() >= workDeadline) earlyInterrupt("entire_sample_deadline");
+    requireProof(!earlyInterruption, "Insufficient original sample budget before native preparation");
     const authFile = await lstat(path.join(authDirectory, "auth/gameharness.sqlite"));
     requireProof(authFile.isFile() && !authFile.isSymbolicLink(), "Existing GameHarness auth storage must be a regular file; this command never creates a replacement identity");
-    requireProof(!earlyInterruption, "Study startup was interrupted before native preparation");
-    fixture = await NativeFixture.create("agent-acceptance", { projectRoot: project, paths, caps, authDirectory, conditions });
-    if (earlyInterruption) {
+    requireProof(!earlyInterruption && performance.now() < preparationDeadline, "Original sample startup budget expired before native preparation");
+    // Creation remains owned until settlement. A timeout is not cancellation,
+    // and must never abandon a late fixture or admit a replacement.
+    fixture = await NativeFixture.create("agent-acceptance", { projectRoot: project, paths, caps, authDirectory, conditions,
+      deadlineHostMs: taskDeadline, preparationDeadlineHostMs: preparationDeadline });
+    if (earlyInterruption && studies) {
       const closed = await fixture.close();
       if (closed.closed) studies!.confirmStudyResourceDrain(studyAttempt!, { requests_drained: true, runtime_closed: true, native_closed: true,
         evidence: ["interrupted_native_fixture_creation_joined_before_any_auth_or_runtime_startup"] });
@@ -191,18 +208,20 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
         classification_reason: ["Scheduled startup failed before model inference; external resource ownership may be unconfirmed"] }, usage: null, evidence: [], stop_reason: "invalid_platform" });
       studies.close();
     }
+    earlyDone.resolve();
     throw error;
-  } finally { clearTimeout(earlyTimer); unregisterEarly?.(); earlyDone.resolve(); }
+  } finally { clearTimeout(earlyTimer); unregisterEarly?.(); }
   const ledger = new AttemptLedger(paths.governanceRoot, { projectRoot: project });
   const batchId = randomUUID();
   const clockId = `acceptance-${batchId}`;
-  const started = performance.now();
   let auth: AuthManager | undefined, store: Store | undefined, runtime: Runtime | undefined, sandbox: SandboxService | undefined;
   let evidence: ModelProgramEvidence | undefined;
   let recorder: EpisodeRecorder | undefined;
   let config: AcceptanceConfig | undefined, diagnosticConfig: EvaluationConfig | undefined;
   const scope = new AbortController();
-  const completed = Promise.withResolvers<void>();
+  // An already-running startup finalizer keeps this same completion barrier
+  // across handoff; fixture creation is not joined logical sample cleanup.
+  const completed = earlyDone;
   let closing = false, abortReason: string | null = null, activeRun: string | null = null;
   let stopping: Promise<unknown> | null = null;
   let activeReservation: string | null = studyAttempt?.reservationId ?? null, reservationInterrupted = false;
@@ -212,7 +231,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   const developmentRequests = new Map<string, { transport_closed: boolean | null; drained: boolean }>();
   let authenticatedProvider: string | null = null;
   let developmentDeadline = Infinity;
-  const requestAdmission: StrategicRequestAdmission | undefined = studies && studyAttempt ? {
+  const governedRequestAdmission: StrategicRequestAdmission | undefined = studies && studyAttempt ? {
     reserve(requestId, model) {
       const frozen = studyManifest!.arms.find(arm => arm.id === studyAttempt!.slot.arm)!.model!;
       if (model.id !== frozen.id || model.provider !== frozen.provider || model.api !== frozen.api) {
@@ -260,10 +279,26 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       }
     },
   } : undefined;
+  const requestAdmission: StrategicRequestAdmission = {
+    reserve(requestId, model) {
+      // Check the original clock at the actual pre-transport boundary as well
+      // as on timer callbacks; a delayed event loop cannot admit a late call.
+      assertOpen();
+      governedRequestAdmission?.reserve(requestId, model);
+    },
+    transportEnded: (requestId, closed) => governedRequestAdmission?.transportEnded(requestId, closed),
+    drained: requestIds => governedRequestAdmission?.drained(requestIds),
+  };
   let activeCase: Record<string, unknown> | null = null;
   let failure: unknown;
   let replayWork: Promise<string> | undefined;
   let ownedWork: Promise<void> | undefined;
+  const preparationWork = new Set<Promise<unknown>>();
+  function ownPreparation<T>(operation: Promise<T>): Promise<T> {
+    preparationWork.add(operation);
+    void operation.finally(() => preparationWork.delete(operation)).catch(() => {});
+    return operation;
+  }
   const cleanup: Array<{ resource: string; closed: boolean }> = [];
   let cleanupDeadline = Infinity, cleanupTimer: ReturnType<typeof setTimeout> | undefined;
   const report: Record<string, unknown> = {
@@ -279,7 +314,10 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     comparison_scope: "Fixed seed/settings and fresh world per case. Vanilla timing and provider behavior are not controlled; no causal or cross-model improvement claim.",
     source_policy: "Only the actual provider authors gameplay and optional game guards. No supplied programs, targets, inventory, console commands or required tool sequence.",
     private_evidence_root: fixture.root, caps, evidence_profile: evidenceProfile,
+    timing: { scope: "original_task_submission_through_actual_cleanup", preparation_allowance_ms: development ? 300_000 : null,
+      cleanup_reserved_ms: studyDeadlineAt === undefined ? caps.cleanupMs : 0 },
     capture_scope: { minimum_task_horizon_ms: caps.runMs, nominal_hz: 30, final_frame_margin: 1,
+      required_retention_horizon_ms: development ? caps.totalMs : caps.runMs,
       prelude_and_drain: "Recorder also covers actual prelude and drain; profile exhaustion remains explicit incomplete evidence" },
     native_evidence: "native-report.json",
     cleanup_confirmed: false, cleanup_state: "not_started",
@@ -300,12 +338,25 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     reportTail = write.catch(() => { report.report_persistence_failed = true; });
     return write;
   }
-  function assertOpen() { requireProof(!closing && !scope.signal.aborted && abortReason === null, "The finite acceptance scope is closed"); }
+  function assertOpen() {
+    if (!abortReason && performance.now() >= workDeadline) interrupt("entire_sample_deadline");
+    requireProof(!closing && !scope.signal.aborted && abortReason === null, "The finite acceptance scope is closed");
+  }
+  function assertPreparing() {
+    assertOpen();
+    requireProof(performance.now() < preparationDeadline, "Original preparation allowance expired before resource acquisition");
+  }
+  async function prepareWithin<T>(operation: () => Promise<T>, capMs: number, message: string): Promise<T> {
+    assertPreparing();
+    return await bounded(ownPreparation(operation()), Math.min(capMs,
+      Math.max(1, preparationDeadline - performance.now())), message);
+  }
   function armCleanup(signalExit = false) {
     // The SDK hard-exits signal cleanup after ten seconds. Reserve time for
     // durable truth rather than promising the normal 25 seconds per resource.
-    const budget = Math.min(caps.cleanupMs, signalExit ? 9000 : caps.cleanupMs);
-    const end = performance.now() + budget;
+    const now = performance.now();
+    const end = Math.min(taskDeadline, earlyCleanupDeadline, now + Math.min(caps.cleanupMs, signalExit ? 9000 : caps.cleanupMs));
+    const budget = Math.max(0, end - now);
     if (end >= cleanupDeadline) return;
     cleanupDeadline = end;
     clearTimeout(cleanupTimer);
@@ -351,7 +402,11 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   const expiry = Promise.withResolvers<never>();
   void expiry.promise.catch(() => {});
   const timer = setTimeout(() => { interrupt("entire_sample_deadline"); expiry.reject(new Error("Finite acceptance sample deadline reached")); },
-    studyDeadlineAt === undefined ? caps.totalMs : Math.max(1, studyDeadlineAt - Date.now()));
+    Math.max(1, workDeadline - performance.now()));
+  if (earlyInterruption || performance.now() >= workDeadline) {
+    interrupt(earlyInterruption ?? "entire_sample_deadline");
+    expiry.reject(failure);
+  }
   const unregisterCleanup = postmortem.register(`agent-acceptance-${batchId}`, why => {
     interrupt(why === postmortem.Reason.SIGINT ? "operator_sigint" :
       why === postmortem.Reason.SIGTERM ? "operator_sigterm" : `process_${why}`);
@@ -370,14 +425,16 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     }
   }
   async function authenticate() {
+    assertPreparing();
     // Config-consuming production modules load only AFTER fixture isolation is established.
     const { AuthManager } = await import("../src/server/auth.ts");
     let changed = () => {};
-    await bounded(AuthManager.create(authDirectory, () => changed(), { singleInferenceDispatch: options.singleInferenceDispatch,
+    assertPreparing();
+    await bounded(ownPreparation(AuthManager.create(authDirectory, () => changed(), { singleInferenceDispatch: options.singleInferenceDispatch,
       reasoning: development?.reasoning }).then(async manager => {
       auth = manager;
       if (closing || abortReason) { await manager.close(); throw new Error("Authorization opened after scope closure"); }
-    }), caps.authMs, "Opening existing auth storage timed out");
+    })), Math.min(caps.authMs, Math.max(1, preparationDeadline - performance.now())), "Opening existing auth storage timed out");
     const ready = Promise.withResolvers<void>();
     changed = () => {
       const state = auth!.snapshot();
@@ -385,7 +442,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       else if (["signed_out", "unavailable", "error"].includes(state.status)) ready.reject(new Error("Existing authorization is unavailable; no login or substitute account/model is permitted"));
     };
     changed();
-    await bounded(ready.promise, caps.discoveryMs, "Actual model discovery timed out");
+    await bounded(ready.promise, Math.min(caps.discoveryMs, Math.max(1, preparationDeadline - performance.now())), "Actual model discovery timed out");
     changed = () => {};
     assertOpen();
     const state = auth!.snapshot();
@@ -415,7 +472,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     assertOpen();
     if (index === 0) await fixture.start();
     else await fixture.nextWorld();
-    assertOpen();
+    assertPreparing();
     const { Runtime } = await import("../src/server/runtime.ts");
     assertOpen();
     let hostBaseline: Json | null = null;
@@ -426,7 +483,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       if (hostBaseline === null && active?.status === "running" && active.started_at)
         hostBaseline = structuredClone(store!.getRun(active.run_id)!.baseline);
     }, { adapter: () => fixture.bridge.adapter(), actorFrames: fixture.bridge, requestAdmission });
-    await bounded(runtime.initialize(), caps.startMs, "Production runtime initialization timed out");
+    await prepareWithin(() => runtime!.initialize(), caps.startMs, "Production runtime initialization timed out");
     assertOpen();
     evidence!.bindRuntime(runtime);
     const adapter = fixture.bridge.adapter();
@@ -435,7 +492,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       scenario = developmentTask(development, adapter);
       report.declared_scenarios = [scenario];
     }
-    const run = await bounded(runtime.createRun({ task: scenario.prompt, goal: scenarioGoal(adapter, scenario), model_id: config!.model.id, working_programs: "fresh" }), caps.startMs, "Run creation timed out");
+    const run = await prepareWithin(() => runtime!.createRun({ task: scenario.prompt, goal: scenarioGoal(adapter, scenario), model_id: config!.model.id, working_programs: "fresh" }), caps.startMs, "Run creation timed out");
     assertOpen();
     activeRun = run.run_id;
     const recordingDirectory = `case-${scenario.id}-recording`;
@@ -443,7 +500,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       limits: evidenceProfile.profile.recording,
       identity: { episode_id: randomUUID(), run_id: run.run_id, world_id: run.world_id, session_id: run.session_id! },
       onIncomplete: why => { report.recording_failure = why; stop(run.run_id, "recording_evidence_incomplete"); } });
-    const initial = await bounded(fixture.bridge.observe(), caps.observationMs, "Run-start observation timed out");
+    const initial = await prepareWithin(() => fixture.bridge.observe(), caps.observationMs, "Run-start observation timed out");
     assertOpen();
     if (studyManifest) {
       const profile = readStudyObservationProfile(studyManifest, project);
@@ -482,6 +539,11 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     activeCase = { scenario_id: scenario.id, run_id: run.run_id, attempt_id: reservation.attemptId,
       baseline, verifier_manifest: independentVerifier.manifest, verification };
     report.active_case = activeCase;
+    report.observation_policy = {
+      during_gameplay: development ? "production_runtime_only" : "evaluator_authorized_observation_polling",
+      initial_and_final_evaluator_observations: true,
+      evaluator_poll_refreshes_actor_geometry: !development,
+    };
     let latest: ObservationV3 | null = null;
     let caseFailure: unknown;
     let deadlineReached = false;
@@ -489,18 +551,20 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     developmentDeadline = performance.now() + caps.runMs;
     try {
       assertOpen();
-      await bounded(runtime.control(run.run_id, "start"), caps.startMs, "Production run start timed out");
+      await prepareWithin(() => runtime!.control(run.run_id, "start"), caps.startMs, "Production run start timed out");
       assertOpen();
       if (hostBaseline !== null) await fixture.writeJson(`case-${scenario.id}-host-baseline.json`, hostBaseline);
       while (!terminal(runtime)) {
         assertOpen();
         if (runtime.snapshot()?.status === "paused") { stop(run.run_id, "runtime_paused_no_automatic_resume"); break; }
-        latest = await evidence!.measure(run.run_id, "observation", () => bounded(fixture.bridge.observe(), caps.observationMs, "Authorized observation timed out"));
-        assertOpen();
-        evidence!.recordObservation(run.run_id, latest);
-        verification = scenario.verifier ? verifyScenarioCompletion(independentVerifier, latest, evidence!.actions(run.run_id)) : null;
-        activeCase.verification = verification;
-        if (verification?.status === "verified") { stop(run.run_id, "declared_semantic_goal_verified"); break; }
+        if (!development) {
+          latest = await evidence!.measure(run.run_id, "observation", () => bounded(fixture.bridge.observe(), caps.observationMs, "Authorized observation timed out"));
+          assertOpen();
+          evidence!.recordObservation(run.run_id, latest);
+          verification = scenario.verifier ? verifyScenarioCompletion(independentVerifier, latest, evidence!.actions(run.run_id)) : null;
+          activeCase.verification = verification;
+          if (verification?.status === "verified") { stop(run.run_id, "declared_semantic_goal_verified"); break; }
+        }
         if (stopping || deadlineReached || evidence!.hasProviderFailure(run.run_id)) { stop(run.run_id, "provider_failure_no_repeat"); break; }
         await pause(caps.pollMs);
       }
@@ -520,7 +584,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       const finalVerification = scenario.verifier ? verifyScenarioCompletion(independentVerifier, latest, evidence!.actions(run.run_id)) : null;
       if (verification?.status !== "verified") verification = finalVerification;
       activeCase.verification = verification;
-      const diagnostics = await bounded(fixture.diagnostics(), caps.diagnosticsMs, "Native neutralization diagnostics timed out");
+      const diagnostics = await bounded(ownPreparation(fixture.diagnostics()), caps.diagnosticsMs, "Native neutralization diagnostics timed out");
       assertOpen();
       neutral = diagnostics.controls_neutral && !diagnostics.motor_active;
       if (!neutral) harnessFaults.push("native_neutralization_failed");
@@ -529,8 +593,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     const baselinePreserved = hostBaseline !== null && JSON.stringify(hostBaseline) === JSON.stringify(store!.getRun(run.run_id)?.baseline);
     if (!baselinePreserved) harnessFaults.push("run_inventory_baseline_changed");
     if (fixture.commands.length) harnessFaults.push("ordinary_world_privileged_commands_used");
-    const historyOptions = { signal: scope.signal, deadlineHostMs: studyDeadlineAt === undefined ? started + caps.totalMs :
-      performance.now() + Math.max(0, studyDeadlineAt - Date.now()) };
+    const historyOptions = { signal: scope.signal, deadlineHostMs: workDeadline };
     const summary = await evidence!.summary(run.run_id, historyOptions);
     assertOpen();
     if (studyAdmissionFault) harnessFaults.push(studyAdmissionFault);
@@ -627,10 +690,10 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     assertOpen();
     const { Store } = await import("../src/server/store.ts");
     const { SandboxService } = await import("../src/server/sandbox.ts");
-    assertOpen();
+    assertPreparing();
     store = new Store(fixture.root);
     sandbox = new SandboxService(project, () => {});
-    await bounded(sandbox.prepare(), caps.startMs, "Production Docker sandbox preparation timed out");
+    await bounded(ownPreparation(sandbox.prepare()), Math.min(caps.startMs, Math.max(1, preparationDeadline - performance.now())), "Production Docker sandbox preparation timed out");
     requireProof(sandbox.snapshot().status === "ready", "Actual production sandbox isolation is unavailable");
     assertOpen();
     evidence = new ModelProgramEvidence(store, fixture.evidenceDirectory, caps, clockId, (runId, why) => {
@@ -687,9 +750,12 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       void runtimeDrain?.catch(() => {});
       const nativeDrain = failure ? fixture.close() : undefined;
       void nativeDrain?.catch(() => {});
+      const sandboxDrain = sandbox?.close();
+      void sandboxDrain?.catch(() => {});
       try {
         await writeReport().catch(() => {});
         await close("acceptance_work", async () => { await ownedWork?.catch(() => {}); });
+        await close("preparation", async () => { await Promise.allSettled([...preparationWork]); });
         await close("runtime", () => runtimeDrain);
         await close("recording", async () => {
           if (recorder) report.interrupted_recording = await recorder.finish({ endedAt: Date.now(), reason: abortReason ?? "outer_failure" });
@@ -720,7 +786,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
           }
         });
         await close("auth_without_logout", () => auth?.close());
-        await close("sandbox", () => sandbox?.close());
+        await close("sandbox", () => sandboxDrain ?? sandbox?.close());
         await close("native_game", async () => { const result = await (nativeDrain ?? fixture.close()); requireProof(result.closed, "Owned native cleanup was not confirmed"); });
         await close("store", () => store?.close());
         if (activeReservation && !reservationInterrupted) {
@@ -761,8 +827,18 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
           }
         }
         if (studies && studyAttempt) report.study_usage = summarizeStudyUsage(studies.readStudy({ studyId: studyAttempt.studyId, manifestSha256: studyAttempt.manifestSha256 }));
-        clearTimeout(cleanupTimer);
         await writeReport();
+        clearTimeout(cleanupTimer);
+        // Persistence is required work too. Its actual settlement can turn an
+        // otherwise timely drain into late, unconfirmed cleanup.
+        if (performance.now() >= cleanupDeadline) {
+          report.cleanup_deadline_reached = true;
+          report.cleanup_confirmed = false;
+          report.cleanup_state = "unconfirmed";
+          report.elapsed_ms = performance.now() - started;
+          await writeReport();
+        }
+        await reportTail;
       } finally { ledger.close(); studies?.close(); }
     }
     return { report_directory: fixture.evidenceDirectory, outcomes: caseReports.map(entry => entry.outcome),

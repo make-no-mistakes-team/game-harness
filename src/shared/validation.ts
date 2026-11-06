@@ -89,7 +89,8 @@ export function getGameAPIReference(adapter: RuntimeAdapter) {
   const existing = references.get(adapter); if (existing) return existing;
   const methods: Record<string, object> = {
     observe: { parameters: [], result: "ObservationV3" },
-    call: { parameters: [{ name: "skill", type: "NamedProgramRef" }, { name: "args", type: "Json" }], result: "SkillResult" },
+    call: { parameters: [{ name: "skill", type: "NamedProgramRef" }, { name: "args", type: "Json" }], result: "SkillResult",
+      contract: "game.call({name,version?},args) invokes only an already authored program captured in this parent's declared dependencies. The host pins exact versions at write/submit; omitted version requires an unambiguous captured name. It does not invoke native game bindings." },
     progress: { parameters: [{ name: "summary", type: "string" }, { name: "details", type: "Json" }], result: "null" },
   };
   if (adapter.action_capability) {
@@ -100,10 +101,12 @@ export function getGameAPIReference(adapter: RuntimeAdapter) {
   }
   if (adapter.supports_respawn) methods.respawn = { parameters: [], result: "GameActionResult" };
   for (const binding of adapter.bindings) methods[binding.name] = { capability_id: binding.capability_id, version: binding.version,
+    invocation: `await game.${binding.name}(${binding.parameters.join(", ")})`,
     parameters: binding.parameters.map(name => ({ name, type: "Json" })), result: binding.result?.type ?? "Json",
     ...(binding.result ? { result_schema: binding.result.schema } : {}) };
   const value = { binding: "game", runtime_version: SKILL_API_VERSION, asynchronous: true, concurrent_calls: false, methods,
     adapter: adapter.descriptor,
+    native_bindings: "Invoke registered native reads directly as shown by each method's invocation, with positional arguments in parameters order. capability_id and version are trusted binding metadata, not a NamedProgramRef or extra arguments. Native bindings need no program dependency declaration; program_write/program_submit dependencies list only already authored programs for game.call.",
     validation: "Host validates actual registered capability schemas and trusted adapter-owned semantic constraints before effect admission. Semantic predicates run in-process and are not serialized schema fields. Authority is host-attached, never copied from program arguments. Source validation is syntax/resource/safety validation, not a gameplay proof.",
     lifecycle: "Sessions survive healthy Pause/Stop and ordinary death. Respawn is explicit and available only when the selected adapter implements it. Unknown effects stay unknown and are never replayed automatically. Post-goal review is effect-free.",
     progress: "Program-authored progress is intent, not objective completion evidence.",

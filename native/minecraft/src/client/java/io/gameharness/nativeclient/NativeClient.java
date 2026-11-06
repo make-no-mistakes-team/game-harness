@@ -111,9 +111,8 @@ public final class NativeClient implements ClientModInitializer {
   private long controllerEffectsOmitted;
   private final java.util.concurrent.atomic.AtomicReference<JsonObject> controllerSamplePending =
       new java.util.concurrent.atomic.AtomicReference<>();
-  private long controllerFrameSequence, cachedWorldNanos, cachedWorldLife;
-  private EffectAuthority.Space cachedWorldSpace;
-  private JsonObject cachedWorld;
+  private long controllerFrameSequence;
+  private final ControllerWorldRefresh controllerWorld = new ControllerWorldRefresh(this::acquirePermittedWorld);
   private final Function<BlockPos, JsonElement> controllerBlockReference = this::controllerBlockReference;
   private final Function<Entity, JsonElement> controllerEntityReference = this::controllerEntityReference;
 
@@ -449,7 +448,7 @@ public final class NativeClient implements ClientModInitializer {
               } else neutralize();
               bindScopeIfReady(); publishScope();
             }
-            public void screenChanged() { renderSnapshot.invalidate(); publishScope(); }
+            public void screenChanged() { renderSnapshot.invalidate(); controllerWorld.invalidate(); publishScope(); }
           });
     } catch (Exception e) {
       throw new IllegalStateException("Private native configuration unavailable");
@@ -1710,8 +1709,9 @@ public final class NativeClient implements ClientModInitializer {
   private JsonObject observe() {
     if (incarnationSignals.space() == null) throw new IllegalStateException("Authoritative player space is unavailable");
     long observationStarted = System.nanoTime();
+    JsonObject world = controllerWorld.observe(observationStarted, lifecycle.lifeId(),
+        incarnationSignals.space(), incarnationSignals.screen());
     JsonObject o = new JsonObject(), data = new JsonObject();
-    String now = Instant.now().toString();
     o.addProperty("schema_version", 3);
     o.add("world_id", config.get("world_id"));
     o.add("epoch", config.get("epoch"));
@@ -1720,15 +1720,39 @@ public final class NativeClient implements ClientModInitializer {
     o.addProperty("native_boot_id", effectAuthority.nativeBootId());
     o.add("space", NativeEffectContract.space(incarnationSignals.space()));
     o.add("screen", NativeEffectContract.screen(incarnationSignals.screen()));
-    observationSeq = ContractIdentity.next(observationSeq);
-    o.addProperty("observation_seq", observationSeq);
-    o.addProperty("captured_at", now);
+    o.add("observation_seq", world.get("observation_seq"));
+    o.add("captured_at", world.get("captured_at"));
     JsonObject profile = descriptor.getAsJsonObject("observation").getAsJsonObject("profile");
     o.add("profile_id", profile.get("id"));
     o.add("profile_configuration_hash", profile.get("configuration_hash"));
     o.addProperty("compatibility_hash", compatibilityHash);
     o.add("data", data);
     data.add("player", player());
+    data.add("blocks", world.get("blocks"));
+    data.add("entities", world.get("entities"));
+    JsonArray heard = new JsonArray();
+    for (SoundProjection.Group group : sounds.recent(System.nanoTime())) {
+      JsonObject sound = new JsonObject();
+      sound.addProperty("category", SOUND_CATEGORIES[group.category()]);
+      sound.addProperty("direction", SOUND_DIRECTIONS[group.direction()]);
+      sound.addProperty("distance", SOUND_BANDS[group.distance()]);
+      sound.addProperty("observed_at", Instant.ofEpochMilli(group.wallMillis()).toString());
+      heard.add(sound);
+    }
+    data.add("sounds", heard);
+    JsonObject coverage = new JsonObject();
+    coverage.addProperty("partial", true);
+    coverage.addProperty("max_age_ms", NativeContractResource.MAX_AGE_MS);
+    o.add("freshness", coverage);
+    long elapsed = System.nanoTime() - observationStarted;
+    observationNanos += elapsed;
+    observationMaxNanos = Math.max(observationMaxNanos, elapsed);
+    observationCount++;
+    return o;
+  }
+
+  private JsonObject acquirePermittedWorld(long acquiredAt) {
+    String now = Instant.now().toString();
     JsonArray visible = new JsonArray();
     blocks.clear();
     entities.clear();
@@ -1785,33 +1809,14 @@ public final class NativeClient implements ClientModInitializer {
       seenEntities.add(item);
       if (seenEntities.size() >= NativeContractResource.MAX_ENTITIES) break;
     }
-    data.add("blocks", visible);
-    data.add("entities", seenEntities);
-    JsonArray heard = new JsonArray();
-    for (SoundProjection.Group group : sounds.recent(System.nanoTime())) {
-      JsonObject sound = new JsonObject();
-      sound.addProperty("category", SOUND_CATEGORIES[group.category()]);
-      sound.addProperty("direction", SOUND_DIRECTIONS[group.direction()]);
-      sound.addProperty("distance", SOUND_BANDS[group.distance()]);
-      sound.addProperty("observed_at", Instant.ofEpochMilli(group.wallMillis()).toString());
-      heard.add(sound);
-    }
-    data.add("sounds", heard);
-    JsonObject coverage = new JsonObject();
-    coverage.addProperty("partial", true);
-    coverage.addProperty("max_age_ms", NativeContractResource.MAX_AGE_MS);
-    o.add("freshness", coverage);
-    cachedWorld = new JsonObject();
-    cachedWorld.addProperty("source", "last_authorized_observation");
-    cachedWorld.add("observation_seq", o.get("observation_seq")); cachedWorld.add("captured_at", o.get("captured_at"));
-    cachedWorld.addProperty("captured_native_ns", Long.toString(observationStarted));
-    cachedWorld.add("blocks", visible); cachedWorld.add("entities", seenEntities);
-    cachedWorldNanos = observationStarted; cachedWorldLife = lifecycle.lifeId(); cachedWorldSpace = incarnationSignals.space();
-    long elapsed = System.nanoTime() - observationStarted;
-    observationNanos += elapsed;
-    observationMaxNanos = Math.max(observationMaxNanos, elapsed);
-    observationCount++;
-    return o;
+    JsonObject world = new JsonObject();
+    world.addProperty("source", "last_authorized_observation");
+    observationSeq = ContractIdentity.next(observationSeq);
+    world.addProperty("observation_seq", observationSeq);
+    world.addProperty("captured_at", now);
+    world.addProperty("captured_native_ns", Long.toString(acquiredAt));
+    world.add("blocks", visible); world.add("entities", seenEntities);
+    return world;
   }
 
   private JsonObject inventoryCounts() {
@@ -2155,7 +2160,7 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void resetSensingScope() {
-    cachedWorld = null; cachedWorldSpace = null;
+    controllerWorld.invalidate();
     sounds.clear();
     synchronized (controllerCaptures) { controllerCaptures.clear(); }
     controllerEffects.clear(); controllerEffectBytes = 0; controllerEffectsOmitted = 0; lastStreamAck = null;
@@ -2320,6 +2325,10 @@ public final class NativeClient implements ClientModInitializer {
     if (client.player == null || client.world == null || space == null
         || lifecycle.status() == PlayerLifecycle.Status.LOADING || lifecycle.status() == PlayerLifecycle.Status.RESPAWNING)
       throw new IllegalStateException("Authoritative current player space is unavailable");
+    long acquisitionStarted = System.nanoTime();
+    // No assisted-owner target-store eviction as a side effect of ordinary controller sensing.
+    if (motor == null)
+      controllerWorld.sample(acquisitionStarted, lifecycle.lifeId(), space, incarnationSignals.screen());
     long now = System.nanoTime();
     JsonObject body = controllerBody.capture(clientTick, now, controllerBlockReference, controllerEntityReference);
     JsonObject value = new JsonObject(), profile = descriptor.getAsJsonObject("observation").getAsJsonObject("profile");
@@ -2339,10 +2348,9 @@ public final class NativeClient implements ClientModInitializer {
     JsonArray effects = new JsonArray();
     for (ControllerEffect effect : controllerEffects) effects.add(effect.value());
     value.add("effect_updates", effects); value.addProperty("effect_updates_omitted", controllerEffectsOmitted);
-    if (cachedWorld != null && cachedWorldLife == lifecycle.lifeId() && space.equals(cachedWorldSpace)) {
-      cachedWorld.addProperty("stale", now < cachedWorldNanos || now - cachedWorldNanos > NativeContractResource.MAX_AGE_MS * 1_000_000L);
-      value.add("visible_world", cachedWorld);
-    } else value.add("visible_world", JsonNull.INSTANCE);
+    // Scan time belongs to the acquisition's age, not a new freshness timestamp.
+    JsonObject world = controllerWorld.retained(now, lifecycle.lifeId(), space, incarnationSignals.screen());
+    value.add("visible_world", world == null ? JsonNull.INSTANCE : world);
     value.add("audible", controllerSounds(sounds.page(cursor, System.nanoTime())));
     return value;
   }

@@ -24,7 +24,82 @@ public final class ControllerRenderProof {
     render.sample(sampled, life, space, x, 2.5, -3.75, 0, .5f, 0, .866f, yaw, pitch, .625);
   }
 
+  private static void worldRefresh() {
+    class Acquisition implements java.util.function.LongFunction<JsonObject> {
+      int calls;
+      boolean fail;
+      public JsonObject apply(long now) {
+        calls++;
+        if (fail) throw new IllegalStateException("projection unavailable");
+        JsonObject value = new JsonObject();
+        value.addProperty("observation_seq", calls);
+        value.addProperty("captured_native_ns", Long.toString(now));
+        return value;
+      }
+    }
+    Acquisition acquisition = new Acquisition();
+    ControllerWorldRefresh world = new ControllerWorldRefresh(acquisition);
+    var space = new EffectAuthority.Space("minecraft:overworld", 12);
+    long start = -9007199254740997L;
+    JsonObject first = world.sample(start, 8, space, null);
+    require(acquisition.calls == 1 && !first.get("stale").getAsBoolean(),
+        "ordinary sampling did not acquire its own permitted geometry");
+    require(world.sample(start + 499_999_999L, 8, space, null) == first && acquisition.calls == 1,
+        "controller sampling scanned geometry at the body sampling frequency");
+    require(first.get("observation_seq").getAsInt() == 1
+        && first.get("captured_native_ns").getAsString().equals(Long.toString(start)),
+        "reuse relabelled the acquisition sequence or signed monotonic time");
+    JsonObject second = world.sample(start + 500_000_000L, 8, space, null);
+    require(second != first && acquisition.calls == 2, "500ms controller acquisition boundary was skipped");
+    JsonObject strategic = world.observe(start + 500_000_001L, 8, space, null);
+    require(strategic != second && acquisition.calls == 3,
+        "controller throttle made an explicit strategic observation reuse old geometry");
+    require(world.sample(start + 1_000_000_000L, 8, space, null) == strategic && acquisition.calls == 3,
+        "explicit observation did not seed the shared controller acquisition cache");
+    require(!world.retained(start + 1_500_000_001L, 8, space, null).get("stale").getAsBoolean(),
+        "1000ms freshness endpoint rejected");
+    require(world.retained(start + 1_500_000_002L, 8, space, null).get("stale").getAsBoolean()
+        && acquisition.calls == 3, "assisted-owner retention refreshed or relabelled expired geometry");
+    require(world.sample(start + 1_500_000_002L, 8, space, null) != strategic && acquisition.calls == 4,
+        "ordinary acquisition did not resume after assisted-owner custody");
+
+    var screen = new EffectAuthority.Screen("visible-screen", 1, 0);
+    require(world.retained(start + 1_500_000_003L, 8, space, screen) == null,
+        "screen transition retained old geometry while acquisition was suppressed");
+    world.sample(start + 1_500_000_003L, 8, space, screen);
+    require(acquisition.calls == 5, "new screen scope inherited a previous scope's refresh delay");
+    world.sample(start + 1_500_000_004L, 9, space, screen);
+    require(acquisition.calls == 6, "new life inherited old geometry");
+    world.sample(start + 1_500_000_005L, 9, new EffectAuthority.Space("minecraft:overworld", 13), screen);
+    require(acquisition.calls == 7, "replacement space epoch inherited old geometry");
+    world.sample(start + 1_500_000_006L, 9, new EffectAuthority.Space("minecraft:the_nether", 13), screen);
+    require(acquisition.calls == 8, "replacement dimension inherited old geometry");
+    world.invalidate();
+    require(world.retained(start + 1_500_000_007L, 9, space, null) == null,
+        "explicit scope reset retained freshness");
+
+    long recovery = start + 2_000_000_000L;
+    JsonObject beforeFailure = world.sample(recovery, 9, space, null);
+    acquisition.fail = true;
+    boolean rejected = false;
+    try { world.sample(recovery + 500_000_000L, 9, space, null); }
+    catch (IllegalStateException expected) { rejected = true; }
+    require(rejected && acquisition.calls == 10, "failed acquisition was reported as a successful fresh scan");
+    require(world.sample(recovery + 999_999_999L, 9, space, null) == beforeFailure && acquisition.calls == 10,
+        "failed scan retried on every body sample");
+    require(world.retained(recovery + 1_000_000_001L, 9, space, null).get("stale").getAsBoolean()
+        && beforeFailure.get("captured_native_ns").getAsString().equals(Long.toString(recovery))
+        && beforeFailure.get("observation_seq").getAsInt() == 9,
+        "failed acquisition relabelled old geometry as fresh");
+    world.invalidate();
+    try { world.sample(recovery + 1_000_000_002L, 9, space, null); }
+    catch (IllegalStateException expected) { /* The next bounded read must remain unavailable. */ }
+    require(world.sample(recovery + 1_000_000_003L, 9, space, null) == null && acquisition.calls == 11,
+        "failed first acquisition fabricated geometry or lost its retry bound");
+  }
+
   public static void main(String[] ignored) {
+    worldRefresh();
     NativeRenderSnapshot render = new NativeRenderSnapshot();
     require(render.actorCapture(8, 12, 100).isJsonNull(), "unavailable capture fabricated zero camera");
     long sampled = -9007199254740997L, captured = sampled + 101;

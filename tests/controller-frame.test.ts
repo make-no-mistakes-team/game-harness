@@ -31,6 +31,18 @@ test("capture metadata preserves actual unwrapped camera yaw after several full 
   expect(parsed.view.render_capture?.yaw_radians).toBe(6 * Math.PI);
 });
 
+test("world acquisition cannot come from the future or relabel expired geometry as fresh", () => {
+  const f = frame(), captured = BigInt(f.captured_native_ns);
+  const worldAt = (age: bigint, stale: boolean) => ({ ...f, visible_world: { ...f.visible_world,
+    captured_native_ns: String(captured - age), stale } });
+  expect(minecraftControllerFrameSchema.safeParse(worldAt(0n, false)).success).toBe(true);
+  expect(minecraftControllerFrameSchema.safeParse(worldAt(1_000_000_000n, false)).success).toBe(true);
+  expect(minecraftControllerFrameSchema.safeParse(worldAt(1_000_000_001n, false)).success).toBe(false);
+  expect(minecraftControllerFrameSchema.safeParse(worldAt(1_000_000_001n, true)).success).toBe(true);
+  expect(minecraftControllerFrameSchema.safeParse(worldAt(-1n, false)).success).toBe(false);
+  expect(minecraftControllerFrameSchema.safeParse(worldAt(-1n, true)).success).toBe(false);
+});
+
 test("capture sequence follows the actual unsigned GHV2 counter including wrap to zero", () => {
   const f = frame();
   const withSequence = (capture_sequence: number) => ({ ...f,

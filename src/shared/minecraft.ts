@@ -216,7 +216,7 @@ export const minecraftControllerFrameSchema = z.object({
   visible_world: z.object({ source: z.literal("last_authorized_observation"), observation_seq: safeCounterSchema,
     captured_at: frameTimestamp, captured_native_ns: nativeNanoseconds, stale: z.boolean(),
     blocks: z.array(minecraftObservedBlockSchema).max(144), entities: z.array(minecraftObservedEntitySchema).max(32),
-  }).strict().nullable().describe("Last same-life/space authorized r8 observation with its original time, not current incremental geometry."),
+  }).strict().nullable().describe("Last same-life/space/screen authorized assisted r8 geometry acquisition, with its original observation sequence and time. Controller sampling may acquire it every 500ms; explicit observe always acquires fresh geometry. Sampling retains the prior cache while an assisted effect owner is active. Stale after 1000ms; no atomic body/image alignment."),
   audible: soundPageSchema,
   last_input: inputAppliedAckSchema.nullable(),
   effect_updates: z.array(controllerEffectUpdateSchema).max(8),
@@ -228,8 +228,14 @@ export const minecraftControllerFrameSchema = z.object({
       context.addIssue({ code: "custom", path: ["last_input"], message: "Input application cannot come from after this native capture" });
     if (frame.effect_updates.some(update => BigInt(update.recorded_native_ns) > BigInt(frame.captured_native_ns)))
       context.addIssue({ code: "custom", path: ["effect_updates"], message: "Later receipts cannot come from after this native capture" });
+    if (frame.visible_world) {
+      const age = BigInt(frame.captured_native_ns) - BigInt(frame.visible_world.captured_native_ns);
+      if (age < 0n || (age > 1_000_000_000n && !frame.visible_world.stale))
+        context.addIssue({ code: "custom", path: ["visible_world"],
+          message: "World acquisition cannot follow this capture or label geometry older than 1000ms as fresh" });
+    }
   } catch {
-    context.addIssue({ code: "custom", path: ["captured_native_ns"], message: "Application and receipt times require exact native decimal nanoseconds" });
+    context.addIssue({ code: "custom", path: ["captured_native_ns"], message: "Acquisition, application and receipt times require exact native decimal nanoseconds" });
   }
   if (new TextEncoder().encode(JSON.stringify(frame.effect_updates)).byteLength > 16384)
     context.addIssue({ code: "custom", path: ["effect_updates"], message: "Later receipts exceed the retained byte bound" });

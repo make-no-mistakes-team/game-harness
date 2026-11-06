@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { EvaluationCaps } from "../src/evaluation/contracts.ts";
 import { NativeFixture, bounded, pause, requireProof, until } from "../src/evaluation/native-game.ts";
 import { EpisodeRecorder } from "../src/server/recording.ts";
+import type { ControllerEffectUpdate, InputAppliedAck } from "../src/shared/controller.ts";
 import { gameActionSchema } from "../src/shared/validation.ts";
-import { minecraftControllerFrameSchema, type SoundCursor } from "../src/shared/minecraft.ts";
+import { minecraftControllerFrameSchema, type MinecraftControllerFrame, type SoundCursor } from "../src/shared/minecraft.ts";
 import { decodeNativeVideoHeader } from "../src/shared/video.ts";
 
 /** Privileged sensor conformance only. No model, learned policy or reusable experience. */
@@ -22,6 +25,28 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
   let detachFrames = () => {};
   const read = async (cursor: SoundCursor | null = null) => minecraftControllerFrameSchema.parse(
     await fixture.bridge.queryCapability("minecraft.controller_frame", 2, { audio_cursor: cursor }));
+  const worldProvenance = (frame: MinecraftControllerFrame, prior?: MinecraftControllerFrame) => {
+    const world = frame.visible_world, previous = prior?.visible_world;
+    if (!world) return;
+    const age = BigInt(frame.captured_native_ns) - BigInt(world.captured_native_ns);
+    requireProof(age >= 0n && world.stale === (age > 1_000_000_000n) &&
+      [...world.blocks, ...world.entities].every(item => item.target.life_id === frame.life_id &&
+        item.target.space.dimension_id === frame.space.dimension_id &&
+        item.target.space.space_epoch === frame.space.space_epoch),
+    "Geometry lost its original acquisition age or current life/space provenance");
+    if (!previous) return;
+    const sameScope = prior!.life_id === frame.life_id && prior!.space.dimension_id === frame.space.dimension_id &&
+      prior!.space.space_epoch === frame.space.space_epoch;
+    if (sameScope && world.observation_seq === previous.observation_seq) {
+      requireProof(world.captured_native_ns === previous.captured_native_ns && world.captured_at === previous.captured_at,
+        "Retained geometry was retimestamped without a new acquisition");
+    } else {
+      requireProof(world.observation_seq > previous.observation_seq &&
+        BigInt(world.captured_native_ns) > BigInt(previous.captured_native_ns) &&
+        (sameScope || BigInt(world.captured_native_ns) > BigInt(prior!.captured_native_ns)),
+      "Replacement geometry reused an old acquisition identity or time");
+    }
+  };
   const neutral = { forward: false, back: false, left: false, right: false, jump: false,
     sprint: false, sneak: false, attack: false, use: false };
   const clip = (held: typeof neutral, ticks: number, edges: unknown[], yaw = 0, pitch = 0, selected: number | null = null) =>
@@ -68,8 +93,12 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
         frame.inventory.source === "client_prediction", "Own current feedback omitted actual supplied equipment/status/selection or mislabelled inventory");
       requireProof(frame.view.crosshair.kind === "block" && frame.view.crosshair.block_position.z === 2 &&
         frame.view.crosshair.target !== null, "Vanilla crosshair did not expose its actually permitted block binding");
-      requireProof(frame.visible_world?.observation_seq === baseline.observation_seq && frame.visible_world.captured_at === baseline.captured_at,
-        "Cached world was not the original authorized observation");
+      worldProvenance(frame);
+      requireProof(frame.visible_world && frame.visible_world.observation_seq >= baseline.observation_seq &&
+        (frame.visible_world.observation_seq === baseline.observation_seq
+          ? frame.visible_world.captured_at === baseline.captured_at
+          : BigInt(frame.visible_world.captured_native_ns) <= BigInt(frame.captured_native_ns)),
+        "Controller geometry lost its authorized acquisition identity or time");
       entry.image = await fixture.frame("own-feedback");
     });
     await run("actual_capture_sequence_join", async entry => {
@@ -113,14 +142,158 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
         const during = await fixture.diagnostics(); entry.during = during;
         const firstEffect = frames[0]!.player.status_effects.find(effect => effect.id === "minecraft:water_breathing");
         const nextEffect = frames[1]!.player.status_effects.find(effect => effect.id === "minecraft:water_breathing");
+        worldProvenance(frames[0]!, original); worldProvenance(frames[1]!, frames[0]!);
         requireProof(!settled && during.observation_count === before.observation_count &&
           frames[1]!.frame_seq > frames[0]!.frame_seq && frames[1]!.native_tick > frames[0]!.native_tick &&
           firstEffect && nextEffect && firstEffect.duration_ticks > nextEffect.duration_ticks &&
-          frames.every(frame => frame.visible_world?.captured_at === original.visible_world?.captured_at),
-        "Local feedback waited for or fabricated a server inventory/world sample while its server was stopped");
+          frames.every(frame => frame.inventory.source === "client_prediction"),
+        "Local feedback waited for or fabricated a server inventory sample while its server was stopped");
+        entry.geometry_limit = "Independent permitted client geometry may refresh while the authoritative inventory request remains pending; it is not a server observation";
       });
       requireProof(observation, "Server inventory negative witness was not submitted");
       entry.resumed_observation = await observation; requireProof(settled, "Real inventory observation did not settle after server resume");
+    });
+    await run("ordinary_bounded_geometry_refresh_without_observe", async entry => {
+      const source = createHash("sha256").update(await readFile(new URL(import.meta.url))).digest("hex");
+      const preflightBefore = await fixture.diagnostics();
+      const newTiming = () => ({ requests: 0, observe_calls: 0, frame_reads: 0, owner_sample_reads: 0,
+        generic_frame_reads: 0, missing_native_timing: 0, failed_requests: 0,
+        frame_read_host_max_ms: 0, frame_read_native_max_ms: null as number | null });
+      const preflightTiming = newTiming(), timing = newTiming(), postflightTiming = newTiming();
+      let activeTiming = preflightTiming;
+      const acks: InputAppliedAck[] = [], effects: ControllerEffectUpdate[] = [];
+      const acquisitions = new Map<number, { observation_seq: number; captured_at: string; captured_native_ns: string;
+        first_frame_seq: number; first_age_ms: number; last_age_ms: number; samples: number; scan_time_proxy_ms: number | null }>();
+      const samples: Array<{ frame_seq: number; native_tick: number; observation_seq: number; age_ms: number;
+        host_read_ms: number; captured_native_ns: string }> = [];
+      const detachTiming = fixture.bridge.subscribeControlTiming(span => {
+        const target = activeTiming;
+        target.requests++;
+        if (span.method === "observe") target.observe_calls++;
+        if (span.status !== "ok") target.failed_requests++;
+        if (span.method !== "controller_frame" && span.method !== "controller_sample") return;
+        target.frame_reads++;
+        if (span.method === "controller_sample") target.owner_sample_reads++;
+        else target.generic_frame_reads++;
+        target.frame_read_host_max_ms = Math.max(target.frame_read_host_max_ms,
+          span.ended_monotonic_ms - span.started_monotonic_ms);
+        if (!span.native_timing) { target.missing_native_timing++; return; }
+        target.frame_read_native_max_ms = Math.max(target.frame_read_native_max_ms ?? 0,
+          Number(BigInt(span.native_timing.replied_ns) - BigInt(span.native_timing.received_ns)) / 1e6);
+      });
+      entry.timing = timing; entry.samples = samples;
+      entry.preflight = { before: preflightBefore, timing: preflightTiming };
+      entry.postflight = { timing: postflightTiming };
+      entry.application_acks = acks; entry.later_effect_receipts = effects;
+      entry.limits = { sample_cap: 64, acquisition_cap: 32, sampling_window_ms: 1800,
+        acquisition_interval_min_ms: 500, explicit_observe_allowed: false };
+      entry.measurement_limit = "The measurement window begins after controller ownership admission and its diagnostic baseline, and ends after the final diagnostic sample while still owned. Admission observations and reads are reported separately as preflight, not claimed absent. Every in-window frame read must be an owner-bound controller_sample. Acquisition-to-first-frame age is a scan-time proxy, not an isolated scan timer. Native request duration includes queue/service work; host read duration includes transport and parsing. Missing timing remains unknown. Sampling cannot see unreturned acquisitions or prove behavior outside this finite same-scope window. No E01, visual, naturalness or model-competence claim.";
+      try {
+        await fixture.withController(source, 12_000, ack => acks.push(ack), effect => effects.push(effect), async channel => {
+          entry.controller_owner = channel.owner; entry.controller_generation = channel.controllerGeneration;
+          let renewing = true, renewalFailure: unknown;
+          const renewals = track((async () => {
+            while (renewing && !scope.signal.aborted) {
+              await pause(80);
+              if (!renewing) break;
+              try { await channel.renew(null); } catch (error) { renewalFailure = error; break; }
+            }
+          })());
+          let first: MinecraftControllerFrame | undefined, previous: MinecraftControllerFrame | undefined;
+          let pressSequence: number | undefined, releaseSequence: number | undefined, retainedSamples = 0;
+          try {
+            // Native admission may legitimately observe; it is outside this ordinary sensing window.
+            const before = await fixture.diagnostics();
+            entry.preflight = { before: preflightBefore, after: before, timing: preflightTiming };
+            entry.before = before;
+            activeTiming = timing;
+            const started = performance.now();
+            entry.measurement_started_host_monotonic_ms = started;
+            do {
+              requireProof(samples.length < 64, "Ordinary refresh sampling exceeded its finite sample cap");
+              const readStarted = performance.now();
+              const frame: MinecraftControllerFrame = minecraftControllerFrameSchema.parse(await channel.sample(null));
+              const hostReadMs = performance.now() - readStarted;
+              first ??= frame;
+              requireProof(frame.life_id === first.life_id && frame.space.dimension_id === first.space.dimension_id &&
+                frame.space.space_epoch === first.space.space_epoch && frame.screen === null,
+              "Ordinary refresh proof left its original life/space/screen scope");
+              worldProvenance(frame, previous);
+              const world = frame.visible_world;
+              requireProof(world && !world.stale && world.blocks.length > 0,
+                "Ordinary production sensing did not supply fresh permitted geometry");
+              const ageMs = Number(BigInt(frame.captured_native_ns) - BigInt(world.captured_native_ns)) / 1e6;
+              const retained = acquisitions.get(world.observation_seq);
+              if (retained) {
+                requireProof(retained.captured_at === world.captured_at && retained.captured_native_ns === world.captured_native_ns &&
+                  ageMs > retained.last_age_ms, "Repeated geometry did not retain its original acquisition time and increasing age");
+                retained.last_age_ms = ageMs; retained.samples++; retainedSamples++;
+              } else {
+                requireProof(acquisitions.size < 32, "Ordinary refresh acquisitions exceeded their finite retention cap");
+                if (previous?.visible_world) requireProof(world.observation_seq === previous.visible_world.observation_seq + 1 &&
+                  BigInt(world.captured_native_ns) - BigInt(previous.visible_world.captured_native_ns) >= 500_000_000n,
+                "Ordinary sensing skipped an acquisition identity or acquired geometry faster than 2Hz");
+                acquisitions.set(world.observation_seq, { observation_seq: world.observation_seq, captured_at: world.captured_at,
+                  captured_native_ns: world.captured_native_ns, first_frame_seq: frame.frame_seq,
+                  first_age_ms: ageMs, last_age_ms: ageMs, samples: 1,
+                  scan_time_proxy_ms: previous && BigInt(world.captured_native_ns) > BigInt(previous.captured_native_ns) ? ageMs : null });
+              }
+              samples.push({ frame_seq: frame.frame_seq, native_tick: frame.native_tick, observation_seq: world.observation_seq,
+                age_ms: ageMs, host_read_ms: hostReadMs, captured_native_ns: frame.captured_native_ns });
+              if (pressSequence === undefined || (releaseSequence === undefined && performance.now() - started >= 300)) {
+                const pressing = pressSequence === undefined;
+                const submission = channel.submit(frame, { kind: "world", held: pressing ? { ...neutral, forward: true } : neutral,
+                  edges: [{ kind: "button", button: "forward", phase: pressing ? "press" : "release", count: 1 }],
+                  view: { kind: "unchanged" }, selected_hotbar: null });
+                requireProof(submission.status !== "rejected", `Ordinary refresh control input refused: ${submission.reason}`);
+                if (pressing) pressSequence = submission.sequence; else releaseSequence = submission.sequence;
+              }
+              previous = frame;
+              await pause(50);
+            } while (performance.now() - started < 1800);
+            const state = channel.snapshot();
+            const pressAck = acks.find(ack => ack.sequence === pressSequence);
+            const releaseAck = acks.find(ack => ack.sequence === releaseSequence);
+            requireProof(first && previous && BigInt(previous.captured_native_ns) - BigInt(first.captured_native_ns) >= 1_500_000_000n &&
+              previous.frame_seq > first.frame_seq && previous.native_tick > first.native_tick &&
+              Math.hypot(previous.player.position.x - first.player.position.x, previous.player.position.z - first.player.position.z) > .1 &&
+              pressSequence !== undefined && releaseSequence !== undefined && state.applied_sequence >= releaseSequence &&
+              state.last_input?.sequence === releaseSequence && state.last_input.input_application === "confirmed" &&
+              !state.last_input.held.forward && state.ordered_edge_prefix === 2 && !state.fenced &&
+              pressAck?.controller_generation === channel.controllerGeneration && pressAck.input_application === "confirmed" &&
+              pressAck.held.forward && pressAck.ordered_edge_prefix === 1 &&
+              releaseAck?.controller_generation === channel.controllerGeneration && releaseAck.input_application === "confirmed" &&
+              !releaseAck.held.forward && releaseAck.ordered_edge_prefix === 2 &&
+              releaseAck.applied_native_tick >= pressAck.applied_native_tick &&
+              BigInt(releaseAck.applied_native_ns) >= BigInt(pressAck.applied_native_ns),
+            "Geometry sampling did not preserve independent body progress and confirmed ordinary press/release application");
+            requireProof(acquisitions.size >= 3 && retainedSamples > 0,
+              "Ordinary sensing did not demonstrate repeated bounded acquisitions and original-age cache reuse");
+            entry.first = first; entry.last = previous; entry.final_input_state = state;
+            entry.press_ack = pressAck; entry.release_ack = releaseAck;
+            const after = await fixture.diagnostics();
+            entry.after = after;
+            const ended = performance.now();
+            entry.measurement_ended_host_monotonic_ms = ended; entry.elapsed_host_ms = ended - started;
+            activeTiming = postflightTiming;
+            requireProof(timing.observe_calls === 0 && after.observation_count === before.observation_count &&
+              timing.frame_reads === samples.length && timing.owner_sample_reads === samples.length &&
+              timing.generic_frame_reads === 0 && timing.failed_requests === 0,
+            "Ordinary geometry refresh issued an explicit observation or lost an owner-bound sampled native request");
+          } finally {
+            activeTiming = postflightTiming;
+            renewing = false; await renewals;
+            if (renewalFailure) throw renewalFailure;
+          }
+        });
+      } finally {
+        detachTiming();
+        entry.acquisitions = [...acquisitions.values()];
+        entry.maxima = { scan_time_proxy_ms: [...acquisitions.values()].reduce<number | null>((max, value) =>
+          value.scan_time_proxy_ms === null ? max : Math.max(max ?? 0, value.scan_time_proxy_ms), null),
+          sampled_acquisition_age_ms: samples.reduce((max, value) => Math.max(max, value.age_ms), 0),
+          host_frame_read_ms: samples.reduce((max, value) => Math.max(max, value.host_read_ms), 0) };
+      }
     });
     await run("actual_use_and_velocity", async entry => {
       const drawing = clip({ ...neutral, use: true }, 20, [{ kind: "button", button: "use", phase: "press", count: 1 }]);
@@ -169,7 +342,9 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
       await until(async () => fixture.bridge.snapshot(), state => (state.space?.space_epoch ?? 0) > oldEpoch,
         caps.observationMs, "Authoritative relocation did not advance observed space");
       const current = await read(); entry.prior = prior; entry.current = current;
-      requireProof(current.visible_world === null && current.audible.stream_id !== prior.audible.stream_id &&
+      worldProvenance(current, prior);
+      requireProof(current.space.space_epoch > prior.space.space_epoch &&
+        current.audible.stream_id !== prior.audible.stream_id &&
         (current.view.render_capture === null || current.view.render_capture.capture_sequence !== prior.view.render_capture?.capture_sequence),
       "Old-scope world, sound or capture was relabelled as current feedback");
       let refused = false;

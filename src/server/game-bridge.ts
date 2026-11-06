@@ -445,6 +445,7 @@ interface Pending {
   resolve(value: unknown): void;
   reject(error: Error): void;
   timer: NodeJS.Timeout;
+  receipt?: NativeRequestReceipt;
   timing: Omit<
     NativeRequestSpan,
     | "request_id"
@@ -454,6 +455,20 @@ interface Pending {
     | "native_timing"
   >;
 }
+interface NativeRequestReceipt {
+  request_id: number | null;
+  requested_host_monotonic_ms: number | null;
+  responded_host_monotonic_ms: number | null;
+}
+type ObservationAuthorityFence =
+  | "binding"
+  | "world_id"
+  | "epoch"
+  | "session_id"
+  | "life_id_regressed"
+  | "life_status_regressed"
+  | "space_epoch_regressed"
+  | "screen_identity";
 interface OwnedEffect {
   effect: EffectEnvelope;
   generation: number;
@@ -501,6 +516,7 @@ export class GameBridgeClient implements GameBridge {
   private controllerProgress: Json = null;
   private motorProfile: MotorProfile = "balanced";
   private scopeNoticeSeen = false;
+  private scopeNoticeGeneration: number | null = null;
   private state: GameState = {
     status: "disconnected",
     username: "",
@@ -759,6 +775,8 @@ export class GameBridgeClient implements GameBridge {
           this.pending.delete(message.id);
           this.pendingCounts[pending.lane]--;
           clearTimeout(pending.timer);
+          if (pending.receipt)
+            pending.receipt.responded_host_monotonic_ms = receivedAt;
           const data =
             message.ok &&
             message.data !== null &&
@@ -820,6 +838,7 @@ export class GameBridgeClient implements GameBridge {
       return;
     this.generation = Math.max(this.generation, notice.generation);
     this.scopeNoticeSeen = true;
+    this.scopeNoticeGeneration = notice.generation;
     this.state = {
       ...this.state,
       life: notice.life,
@@ -879,6 +898,7 @@ export class GameBridgeClient implements GameBridge {
     method: string,
     params: unknown = {},
     timeout = 10000,
+    receipt?: NativeRequestReceipt,
   ): Promise<unknown> {
     const socket = this.control,
       binding = this.state.binding;
@@ -927,11 +947,17 @@ export class GameBridgeClient implements GameBridge {
           ? this.controllerReservation
           : null;
     this.pendingCounts[lane]++;
+    const started = performance.now();
+    if (receipt) {
+      receipt.request_id = id;
+      receipt.requested_host_monotonic_ms = started;
+    }
     this.pending.set(id, {
       lane,
       resolve: reply.resolve,
       reject: reply.reject,
       timer,
+      receipt,
       timing: {
         method,
         operation_id: effect?.operation_id ?? null,
@@ -939,7 +965,7 @@ export class GameBridgeClient implements GameBridge {
         execution_id: effect?.scope.execution_id ?? null,
         source_hash: effect?.scope.source_hash ?? null,
         native_boot_id: binding.native_boot_id,
-        started_monotonic_ms: performance.now(),
+        started_monotonic_ms: started,
       },
     });
     socket.write(packet, (error) => {
@@ -978,6 +1004,7 @@ export class GameBridgeClient implements GameBridge {
     this.nativeMetrics = null;
     this.controlTimeline.bindBoot(null);
     this.scopeNoticeSeen = false;
+    this.scopeNoticeGeneration = null;
     this.state = {
       ...this.state,
       status: "connecting",
@@ -1108,24 +1135,53 @@ export class GameBridgeClient implements GameBridge {
     try {
       if (!this.state.binding || !this.registration)
         throw new Error("Native observation binding is unavailable.");
+      const receipt: NativeRequestReceipt = {
+        request_id: null,
+        requested_host_monotonic_ms: null,
+        responded_host_monotonic_ms: null,
+      };
       const observation = this.registration.parseObservation(
-        await this.request("observe"),
+        await this.request("observe", {}, 10000, receipt),
       );
-      const current = assertActiveObservation(observation, this.state.binding);
-      if (
-        current.world_id !== this.state.world_id ||
-        current.epoch !== this.state.epoch ||
-        current.session_id !== this.owned?.session.session_id ||
-        (this.state.life &&
-          (current.life.life_id < this.state.life.life_id ||
-            (current.life.life_id === this.state.life.life_id &&
-              current.life.status === "alive" &&
-              this.state.life.status !== "alive"))) ||
-        (this.state.space &&
-          current.space.space_epoch < this.state.space.space_epoch) ||
-        (this.scopeNoticeSeen && !sameScreen(current.screen, this.state.screen))
+      let current;
+      try {
+        current = assertActiveObservation(observation, this.state.binding);
+      } catch (error) {
+        this.emitObservationRejection(observation, receipt, "binding");
+        throw error;
+      }
+      // Preserve short-circuit order: later fences are not evaluated for diagnostics.
+      let failedFence: ObservationAuthorityFence | null = null;
+      if (current.world_id !== this.state.world_id) failedFence = "world_id";
+      else if (current.epoch !== this.state.epoch) failedFence = "epoch";
+      else if (current.session_id !== this.owned?.session.session_id)
+        failedFence = "session_id";
+      else if (
+        this.state.life &&
+        current.life.life_id < this.state.life.life_id
       )
+        failedFence = "life_id_regressed";
+      else if (
+        this.state.life &&
+        current.life.life_id === this.state.life.life_id &&
+        current.life.status === "alive" &&
+        this.state.life.status !== "alive"
+      )
+        failedFence = "life_status_regressed";
+      else if (
+        this.state.space &&
+        current.space.space_epoch < this.state.space.space_epoch
+      )
+        failedFence = "space_epoch_regressed";
+      else if (
+        this.scopeNoticeSeen &&
+        !sameScreen(current.screen, this.state.screen)
+      )
+        failedFence = "screen_identity";
+      if (failedFence) {
+        this.emitObservationRejection(current, receipt, failedFence);
         throw new Error("Native observation has stale authority.");
+      }
       const presentation = this.runtimeAdapter
         ? this.runtimeAdapter.projectObservation(current)
         : {
@@ -1155,6 +1211,26 @@ export class GameBridgeClient implements GameBridge {
         );
       } catch {}
     }
+  }
+  private emitObservationRejection(
+    observation: { observation_seq: number; captured_at: string },
+    receipt: NativeRequestReceipt,
+    failedFence: ObservationAuthorityFence,
+  ) {
+    this.emit({
+      type: "game_event",
+      data: {
+        type: "observation_authority_rejected",
+        schema_version: 1,
+        first_failed_fence: failedFence,
+        request_id: receipt.request_id,
+        requested_host_monotonic_ms: receipt.requested_host_monotonic_ms,
+        responded_host_monotonic_ms: receipt.responded_host_monotonic_ms,
+        observation_seq: observation.observation_seq,
+        observation_captured_at: new Date(observation.captured_at).toISOString(),
+        scope_notice_generation: this.scopeNoticeGeneration,
+      },
+    });
   }
   async queryCapability(
     id: string,

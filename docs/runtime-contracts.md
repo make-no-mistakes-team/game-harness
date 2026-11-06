@@ -892,6 +892,8 @@ This example is documentary data, not an observed event. State mutation and its 
 
 `observation.read` returns a bounded filtered snapshot or delta. A caller may select supported fields and a maximum age; it cannot request a broader authority. The selected adapter profile defines information permission for that game and supplies a domain payload validated against its declared schema. Core requires no position, health, blocks, entities, inventory or recipes. Previously observed facts may be returned as memory, explicitly marked with their last legitimate observation.
 
+Rejected native observation reads emit bounded host diagnostics identifying the first failed authority fence, correlated request/response monotonic times, observation sequence/capture time and last accepted scope-notice generation. They retain the original rejection and issue no extra native read. Raw observations, targets and credentials are not included.
+
 | Observation content | Required representation |
 |---|---|
 | Identity and timing | Manifest/game/adapter/profile/schema identity, run/world/epoch, observation sequence, capture time and local age, envelope schema version. |

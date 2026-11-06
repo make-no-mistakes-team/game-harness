@@ -338,6 +338,178 @@ test("an unstarted native bridge closes idempotently without inventing video", a
   expect(bridge.snapshot().video.status).toBe("idle");
   expect(bridge.latestFrame()).toBeNull();
 });
+for (const fence of [
+  "binding",
+  "world_id",
+  "epoch",
+  "session_id",
+  "life_id_regressed",
+  "life_status_regressed",
+  "space_epoch_regressed",
+  "screen_identity",
+  "life_before_space_and_screen",
+] as const) {
+  test(`observation rejection attributes ${fence} without rereading or accepting stale scope`, async () => {
+    const f = fixture();
+    try {
+      const peer = await f.channel("control"),
+        notices: BridgeNotice[] = [],
+        methods: string[] = [],
+        spans: Array<{
+          request_id: number;
+          started_monotonic_ms: number;
+          ended_monotonic_ms: number;
+        }> = [];
+      f.bridge.subscribe((notice) => notices.push(notice));
+      f.bridge.subscribeControlTiming((span) => {
+        if (span.method === "observe") spans.push(span);
+      });
+      const capturedAt = "2026-11-06T12:00:00.000Z";
+      let stale = false,
+        nativeRequests = 0,
+        responseHostTime = 0;
+      const changedLife = {
+        life_id:
+          fence === "life_id_regressed" ||
+          fence === "life_before_space_and_screen"
+            ? 2
+            : 1,
+        status:
+          fence === "life_status_regressed"
+            ? ("dead" as const)
+            : ("alive" as const),
+        can_respawn: false,
+        death: null,
+      };
+      const notice = {
+        ...f.notice(
+          changedLife,
+          2,
+          fence === "space_epoch_regressed" ||
+            fence === "life_before_space_and_screen"
+            ? 2
+            : 1,
+        ),
+        type: "scope",
+        screen:
+          fence === "screen_identity" || fence === "life_before_space_and_screen"
+            ? { screen_id: "private-screen", incarnation: 2, revision: 1 }
+            : null,
+      };
+      const hasNotice =
+        fence === "life_id_regressed" ||
+        fence === "life_status_regressed" ||
+        fence === "space_epoch_regressed" ||
+        fence === "screen_identity" ||
+        fence === "life_before_space_and_screen";
+      requests(peer, (request) => {
+        methods.push(request.method);
+        if (request.method !== "observe") return;
+        const data = minecraftObservationFixture(adapter, {
+          world_id: f.session.world_id,
+          session_id: f.session.session_id,
+          epoch: f.session.epoch,
+          observation_seq: ++nativeRequests,
+          captured_at: capturedAt,
+        });
+        if (!stale) {
+          reply(peer, request.id, data);
+          return;
+        }
+        if (fence === "binding") data.native_boot_id = "obsolete-native-boot";
+        if (fence === "world_id") data.world_id = "obsolete-world";
+        if (fence === "epoch") data.epoch--;
+        if (fence === "session_id") data.session_id = "obsolete-session";
+        responseHostTime = performance.now();
+        // Drive the real response/notice parser in one callback so the notice
+        // advances authority before the awaiting observation can resume.
+        const control = Reflect.get(f.bridge, "control") as Socket;
+        control.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({ id: request.id, ok: true, data })}\n${hasNotice ? `${JSON.stringify({ notice })}\n` : ""}`,
+          ),
+        );
+      });
+      await f.bridge.observe();
+      expect(notices.filter((notice) => notice.type === "game_event")).toEqual([]);
+      const accepted = f.bridge.snapshot();
+      stale = true;
+      await expect(f.bridge.observe()).rejects.toThrow(
+        fence === "binding"
+          ? "Observation does not belong to the negotiated native/profile binding"
+          : "Native observation has stale authority.",
+      );
+      const events = notices
+        .filter((notice) => notice.type === "game_event")
+        .map((notice) => notice.data);
+      const span = spans[1]!;
+      expect(events).toHaveLength(hasNotice ? 2 : 1);
+      expect(events.at(-1)).toEqual({
+        type: "observation_authority_rejected",
+        schema_version: 1,
+        first_failed_fence:
+          fence === "life_before_space_and_screen" ? "life_id_regressed" : fence,
+        request_id: span.request_id,
+        requested_host_monotonic_ms: span.started_monotonic_ms,
+        responded_host_monotonic_ms: span.ended_monotonic_ms,
+        observation_seq: 2,
+        observation_captured_at: capturedAt,
+        scope_notice_generation: hasNotice ? 2 : null,
+      });
+      expect(span.started_monotonic_ms).toBeLessThanOrEqual(responseHostTime);
+      expect(span.ended_monotonic_ms).toBeGreaterThanOrEqual(responseHostTime);
+      expect(JSON.stringify(events.at(-1)).length).toBeLessThan(768);
+      expect(methods).toEqual(["observe", "observe"]);
+      expect(
+        notices.filter((notice) => notice.type === "observation"),
+      ).toHaveLength(1);
+      expect(f.bridge.snapshot()).toMatchObject({
+        life: notice.life,
+        space: notice.space,
+        screen: notice.screen,
+        last_observation_at: accepted.last_observation_at,
+        presentation: accepted.presentation,
+      });
+      expect(f.child.killed).toBe(false);
+    } finally {
+      await f.close();
+    }
+  });
+}
+test("successful observation reads emit no host rejection diagnostics", async () => {
+  const f = fixture();
+  try {
+    const peer = await f.channel("control"),
+      notices: BridgeNotice[] = [],
+      methods: string[] = [];
+    f.bridge.subscribe((notice) => notices.push(notice));
+    let sequence = 0;
+    requests(peer, (request) => {
+      methods.push(request.method);
+      reply(
+        peer,
+        request.id,
+        minecraftObservationFixture(adapter, {
+          world_id: f.session.world_id,
+          session_id: f.session.session_id,
+          epoch: f.session.epoch,
+          observation_seq: ++sequence,
+        }),
+      );
+    });
+    for (let index = 1; index <= 3; index++)
+      expect((await f.bridge.observe()).observation_seq).toBe(index);
+    expect(methods).toEqual(["observe", "observe", "observe"]);
+    expect(notices.map((notice) => notice.type)).toEqual([
+      "observation",
+      "observation",
+      "observation",
+    ]);
+  } finally {
+    await f.close();
+  }
+});
 test("trusted timing subscribers receive correlated native lease deadlines even on a rejected heartbeat", async () => {
   const f = fixture();
   try {

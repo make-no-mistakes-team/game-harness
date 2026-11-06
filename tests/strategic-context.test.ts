@@ -483,6 +483,35 @@ test("actual requested program references survive game schema pressure in the ne
       expect(context.requested_help).toContainEqual({ topic: "programs", section, content });
     }
     expect(context.requested_help).toContainEqual({ topic: "game", section: "methods.observe", content: game.methods.observe });
+    const capability = f.adapter.action_capability!;
+    const actionSchema = game.schemas.capabilities[`${capability.id}@${capability.version}`];
+    const union = Array.isArray(actionSchema.oneOf) ? "oneOf" : "anyOf";
+    const alternatives = actionSchema[union];
+    expect(Array.isArray(alternatives)).toBe(true);
+    const moveIndex = alternatives.findIndex((branch: any) => branch.properties?.kind?.const === "move");
+    expect(moveIndex).toBeGreaterThanOrEqual(0);
+    // Accept a whole enclosing schema too, but never reconstruct an action
+    // from detached properties that may omit required fields or enum values.
+    const path = ["schemas", "capabilities", `${capability.id}@${capability.version}`, union, moveIndex];
+    let reference = "", retainedMove: unknown;
+    for (let index = 0; index < path.length; index++) {
+      const key = path[index]!;
+      reference += typeof key === "number" ? `[${key}]` : `${index ? "." : ""}${key}`;
+      const section = context.requested_help.find((entry: any) => entry.topic === "game" && entry.section === reference);
+      if (!section) continue;
+      retainedMove = path.slice(index + 1).reduce((value: any, child) => value?.[child], section.content);
+      if (retainedMove !== undefined) break;
+    }
+    expect(retainedMove).toEqual(alternatives[moveIndex]);
+    for (const [name, method] of Object.entries(game.methods) as [string, any][]) {
+      if (!method.result_schema) continue;
+      expect(context.requested_help).toContainEqual({
+        topic: "game", section: `methods.${name}.invocation`, content: method.invocation,
+      });
+      expect(context.requested_help).toContainEqual({
+        topic: "game", section: `methods.${name}.parameters`, content: method.parameters,
+      });
+    }
     expect(context.programs).toContainEqual(expect.objectContaining({ name: program.name, source: program.source }));
     expect(context.omissions).toContainEqual(expect.objectContaining({ kind: "help", reason: "retained_help_byte_budget" }));
     expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32768);
@@ -492,6 +521,46 @@ test("actual requested program references survive game schema pressure in the ne
   await f.planner.close(); f.state.generation++;
   await f.planner.start(f.state.generation); await f.turn();
   assertRequestedReferences();
+});
+
+test("action alternatives retain exact constraints under schema pressure and omit oversized alternatives atomically", async () => {
+  const f = fixture();
+  const source = `/*${"s".repeat(12000)}*/return {status:"completed",summary:"reference",result:null};`;
+  const program = await f.program(source);
+  const capability = f.adapter.action_capability!;
+  const actionSection = `schemas.capabilities.${capability.id}@${capability.version}`;
+  const branch = { type: "object", properties: {
+    kind: { const: "fixture_action" }, mode: { enum: ["first", "second"] },
+    duration_ms: { type: "integer", minimum: 50, maximum: 2000 },
+  }, required: ["kind", "mode", "duration_ms"], additionalProperties: false };
+  const oversized = { ...branch, description: "x".repeat(7000) };
+  f.state.helpResults.game = { schemas: {
+    ObservationV3: { $schema: "https://json-schema.org/draft/2020-12/schema",
+      ...Object.fromEntries(Array.from({ length: 6 }, (_, index) =>
+        [`reference_${index}`, { type: "string", description: "o".repeat(5000) }])) },
+    capabilities: { [`${capability.id}@${capability.version}`]: {
+      $schema: "https://json-schema.org/draft/2020-12/schema", anyOf: [branch, oversized],
+    } },
+  } };
+  await f.planner.start(1); await f.turn([f.requestHelp("game"), settlement()]);
+  await f.turn();
+  const context = retained(f.state.requests.at(-1))!;
+  expect(f.state.requests.at(-1)!.messages).toHaveLength(1);
+  expect(context.requested_help).toContainEqual({ topic: "game", section: `${actionSection}.anyOf[0]`, content: branch });
+  expect(context.requested_help.some((entry: any) => entry.section.startsWith(`${actionSection}.anyOf[1]`))).toBe(false);
+  expect(context.omissions).toContainEqual({ kind: "help", reference: `game.${actionSection}.anyOf[1]`,
+    reason: "section_byte_budget", original_bytes: Buffer.byteLength(JSON.stringify(oversized)) });
+  expect(context.omissions).toContainEqual(expect.objectContaining({
+    kind: "help", reference: expect.stringContaining("game.schemas.ObservationV3."), reason: "retained_help_byte_budget",
+  }));
+  expect(context.omissions).toContainEqual(expect.objectContaining({
+    kind: "help", reference: expect.stringContaining("game.schemas.ObservationV3."), reason: "request_byte_budget",
+  }));
+  expect(context.programs).toContainEqual(expect.objectContaining({ name: program.name, source }));
+  expect(context.objective).toBe(f.state.run.task);
+  expect(context.requested_help.reduce((sum: number, entry: unknown) => sum + Buffer.byteLength(JSON.stringify(entry)), 0))
+    .toBeLessThanOrEqual(24576);
+  expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32768);
 });
 
 for (const status of ["unknown", "refused"] as const) {

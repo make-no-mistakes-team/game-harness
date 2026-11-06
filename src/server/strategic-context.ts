@@ -159,6 +159,7 @@ export class StrategicContext {
   private omittedUnknown = 0;
   private help: HelpSection[] = [];
   private readonly helpSchemas = new WeakSet<HelpSection>();
+  private actionHelpSection: string | null = null;
   private helpOmissions: Omission[] = [];
 
   constructor(private readonly store: Store) {}
@@ -170,7 +171,7 @@ export class StrategicContext {
     this.historicalNotes.clear(); this.lastExecutions.clear();
     this.adoptedScopes.clear();
     this.failure = null; this.unresolved.clear(); this.controllerAdmissions.clear(); this.omittedUnknown = 0;
-    this.help = []; this.helpOmissions = [];
+    this.help = []; this.actionHelpSection = null; this.helpOmissions = [];
   }
 
   private scope(run: StoredRun): void {
@@ -206,6 +207,8 @@ export class StrategicContext {
       this.authored.clear(); this.selected = []; this.lastExecutions.clear();
     }
     this.sourceCompatibility = sourceKey;
+    this.actionHelpSection = adapter?.action_capability
+      ? `schemas.capabilities.${adapter.action_capability.id}@${adapter.action_capability.version}` : null;
     const key = createHash("sha256").update(JSON.stringify({ api: model.api, provider: model.provider, executable: SKILL_API_VERSION,
       compatibility_hash: run.compatibility_hash, adapter: adapter?.descriptor ?? null,
       profile: observation, root: context.systemPrompt,
@@ -220,31 +223,43 @@ export class StrategicContext {
     this.help = this.help.filter(section => section.topic !== topic);
     this.helpOmissions = this.helpOmissions.filter(entry => !entry.reference.startsWith(`${topic}.`));
     const sections: HelpSection[] = [];
-    const visit = (section: string, content: Json, depth: number, schema = false) => {
+    const visit = (section: string, content: Json, depth: number, schema = false, atomic = false) => {
       const size = bytes(content);
       const fields = object(content);
-      schema ||= typeof fields?.$schema === "string";
-      if (size <= HELP_SECTION_BYTES) {
+      schema ||= typeof fields?.$schema === "string" || topic === "game" && section.endsWith(".result_schema");
+      // A small native method can still bundle a large result DTO. Keep its
+      // invocation contract separate so that DTO cannot outrank action bounds.
+      const splitNativeMethod = topic === "game" && section.startsWith("methods.") && fields && "result_schema" in fields;
+      if (size <= HELP_SECTION_BYTES && !splitNativeMethod) {
         const entry = { topic, section, content };
         sections.push(entry);
         if (schema) this.helpSchemas.add(entry);
       }
       else {
-        if (Array.isArray(content) && depth < 8)
-          content.forEach((child, index) => visit(`${section}[${index}]`, child, depth + 1, schema));
-        else if (fields && depth < 8) for (const [name, child] of Object.entries(fields)) visit(`${section}.${name}`, child as Json, depth + 1, schema);
+        if (!atomic && Array.isArray(content) && depth < 8) {
+          const actionAlternatives = topic === "game" && this.actionHelpSection !== null &&
+            (section === `${this.actionHelpSection}.anyOf` || section === `${this.actionHelpSection}.oneOf`);
+          content.forEach((child, index) => visit(`${section}[${index}]`, child, depth + 1, schema, actionAlternatives));
+        }
+        else if (!atomic && fields && depth < 8) for (const [name, child] of Object.entries(fields)) visit(`${section}.${name}`, child as Json, depth + 1, schema);
         else this.helpOmissions.push({ kind: "help", reference: `${topic}.${section}`, reason: "section_byte_budget", original_bytes: size });
       }
     };
     const fields = object(value);
     if (fields) for (const [name, content] of Object.entries(fields)) visit(name, content as Json, 0);
     else visit("reference", value, 0);
-    // Generated schemas can exceed the whole allowance before later semantic
-    // contracts are visited. Preserve actually requested reference semantics
-    // across topics first, then use remaining space for schema sections.
+    // Keep authored-program semantics and native invocation contracts first.
+    // Action bounds precede adapter metadata and read/result DTOs, including
+    // schemas embedded in otherwise small native-method references.
+    // Action alternatives stay whole; oversized ones are explicitly omitted.
     // Stable order keeps the latest requested topic first within each class.
-    this.help = [...sections, ...this.help].sort((a, b) =>
-      Number(this.helpSchemas.has(a)) - Number(this.helpSchemas.has(b)));
+    const priority = (section: HelpSection) => {
+      if (section.topic === "game" && this.actionHelpSection !== null &&
+        (section.section === this.actionHelpSection || section.section.startsWith(`${this.actionHelpSection}.`))) return 1;
+      if (this.helpSchemas.has(section)) return 3;
+      return section.topic === "game" && (section.section === "adapter" || section.section.startsWith("adapter.")) ? 2 : 0;
+    };
+    this.help = [...sections, ...this.help].sort((a, b) => priority(a) - priority(b));
     let used = 0;
     this.help = this.help.filter(section => {
       const size = bytes(section);
@@ -581,6 +596,7 @@ export class StrategicContext {
       programs: "Immutable named versions. Existing name requires based_on latest. Write saves only; ordinary-only program_submit explicitly writes and starts that exact version through ordinary admission; program_run starts existing. Dependencies are pinned. Validation is not gameplay proof; completed program is not task success.",
       freshness: "Retained source/docs and model-authored state are historical reference only, never authority or gameplay proof. Worksite/local positions require fresh reacquisition. Current authorized observation, especially inventory, and later observe results outrank notes. Life/session/boot/space changes discard current dynamic notes; explicit world-local objective/worksite notes and no-replay uncertainty remain historical with original scope. Task/world/fresh-run changes discard experience. Program argument samples/outcomes are sanitized historical examples, never restored inputs or recommendations to rerun blocked/unknown procedures. Resolve fresh targets and construct current args; no target handles, roots, effects or execution state are restored.",
       recovery: "Settled failed no-effect rejection with valid current authority may fresh-observe and boundedly reselect within the same procedure. Unknown/cancelled/reconnected effects must stop and reconcile, never blind retry. Emitter closure and fresh observation do not prove an old unknown effect did not happen.",
+      requested_help: "Retained help is partial reference, not a complete schema. Omission references name missing sections; omitted_records counts notices/details that did not fit. Re-request help({topic:'game'}) or the corresponding topic for the full current contract before relying on missing fields or alternatives.",
       game: { binding: "game", methods: ["observe()", "call({name,version?},args)", "progress(summary,details)",
         ...(adapter?.action_capability ? ["action(action)", "actionAndObserve(action) -> {action,observation}"] : []), ...(adapter?.supports_respawn ? ["respawn()"] : [])],
         local_feedback: "actionAndObserve performs one ordinary action then fresh observation after success or settled failed no-world-effect/neutralized evidence. It preserves the raw action status, never retries, and charges both existing budgets. Use your own observed postcondition to decide completion or bounded fresh reselection. Unknown/cancelled/reconnect remain fenced; ineligible outcomes have observation:null. Observation failure propagates, never stale fallback.",

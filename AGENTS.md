@@ -61,10 +61,17 @@ Luna for a different model in a declared experiment.
 
 ## Manual gameplay review
 
-After changes likely to noticeably affect how the agent plays, show
-representative gameplay and explicitly ask the user for manual visual review.
-Pause development, including subagent work, until the user gives feedback on
-that gameplay.
+Request manual visual review only for gameplay runs you judge successful for
+their declared user-facing purpose. After a noticeable gameplay change produces
+such a run, show representative footage and explicitly ask for review. Pause
+development, including subagent work, until the user gives feedback.
+
+Failed runs, runtime errors and obvious gameplay defects do not require the
+user's visual review or a review pause. Preserve their complete evidence,
+safely stop and drain owned resources, then diagnose and fix the cause directly.
+Further runs still require finite declarations, valid admission and applicable
+authorization; this rule does not waive experiment freezes or stop rules.
+Do not relabel a failed or easier task as success to obtain review.
 
 Inspect the actual rendered behavior at original speed before presenting it.
 Playback completion and sampled screenshots are not a visual-quality verdict.
@@ -74,8 +81,8 @@ Identify obvious defects yourself; label failed footage honestly rather than
 presenting it as improved gameplay for the user to discover the problem.
 
 Small changes may be grouped to avoid frequent pauses. Briefly track gameplay
-changes since the last review and request another review when their combined
-effect could become noticeable to an ordinary user.
+changes since the last review and request another review when a successful run
+demonstrates their noticeable combined effect.
 
 Tests, metrics, code volume and your own inspection are supporting evidence,
 not proof that gameplay improved. The user's visual judgment is decisive.

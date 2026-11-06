@@ -16,6 +16,7 @@ import { PrivateJournal, type JournalFinalization } from "./private-journal.ts";
 import type { JournalLimits } from "../shared/evidence-limits.ts";
 import { HOST_MONOTONIC_CLOCK_ID } from "../server/performance.ts";
 import type { ProjectionProgress } from "../server/program-feedback.ts";
+import { classifyEvaluationRequest } from "./request-outcome.ts";
 
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 
@@ -265,8 +266,7 @@ export class ModelProgramEvidence {
       }
     } else if (["model.request_settled", "model.request_unsettled"].includes(event.type)) {
       if (typeof data.request_id === "string") close(`provider:${runId}:${data.request_id}`);
-      if (event.type === "model.request_unsettled" || data.stop_reason === "error" ||
-          object(data.recovered_failure).type === "stream_interrupted_after_content") {
+      if (classifyEvaluationRequest(event).provider_error) {
         this.providerFailures.add(runId);
         this.stop(runId, "provider_failure_or_unsettled_no_repeat");
       }

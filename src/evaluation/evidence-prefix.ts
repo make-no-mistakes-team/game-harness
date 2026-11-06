@@ -1,6 +1,7 @@
 import type { ActivityEvent, ReportedUsage, RequestUsageEvidence } from "../shared/contracts.ts";
 import type { EvaluationPrefixSummary } from "../server/history-protocol.ts";
 import { usageMetrics } from "./results.ts";
+import { classifyEvaluationRequest } from "./request-outcome.ts";
 
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const counter = (value: unknown): number | null => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -38,12 +39,16 @@ export function reduceEvaluationPrefix(events: readonly ActivityEvent[], admissi
   const messages = events.filter(event => event.type === "model.usage").flatMap(readMessage);
   const unsettled = events.filter(event => event.type === "model.request_unsettled" &&
     object(event.details).usage_evidence !== undefined).flatMap(readMessage);
-  const settlements = events.filter(event => event.type === "model.request_settled");
-  const settledIds = new Set(settlements.filter(event => !["aborted", "error"].includes(String(object(event.details).stop_reason)))
-    .map(event => object(event.details).request_id));
+  const settledIds = new Set<unknown>();
+  let providerError = false;
   const tools = new Map<string, number>();
   const counts = new Map<string, { type: string; count: number; failed_verifications: number }>();
   for (const event of events) {
+    if (event.type === "model.request_settled" || event.type === "model.request_unsettled") {
+      const outcome = classifyEvaluationRequest(event);
+      if (outcome.provider_error) providerError = true;
+      if (outcome.provider_settled) settledIds.add(object(event.details).request_id);
+    }
     const count = counts.get(event.type) ?? { type: event.type, count: 0, failed_verifications: 0 };
     count.count++;
     if (event.type === "goal.verification" && object(event.details).status === "failed") count.failed_verifications++;
@@ -55,8 +60,7 @@ export function reduceEvaluationPrefix(events: readonly ActivityEvent[], admissi
     admitted_request_ids: admitted.flatMap(event => { const id = object(event.details).request_id; return typeof id === "string" ? [id] : []; }),
     messages, additional_terminal_evidence: unsettled, events_omitted: eventsOmitted }),
     tools: [...tools].map(([name, count]) => ({ name, count })),
-    provider_error: settlements.some(event => object(event.details).stop_reason === "error" ||
-      object(object(event.details).recovered_failure).type === "stream_interrupted_after_content"),
+    provider_error: providerError,
     provider_settled: admitted.length > 0 && !eventsOmitted && admitted.every(event => settledIds.has(object(event.details).request_id)),
     event_counts: [...counts.values()], events_omitted: eventsOmitted };
 }

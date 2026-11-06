@@ -320,6 +320,8 @@ test("ordinary authoring shares one root budget across wakes, leaf admissions an
   expect(prompts).toBe(3); expect(f.run.usage.calls).toBe(3);
   const exited = f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "scheduler.authoring_exited");
   expect(exited).toHaveLength(1); expect(exited[0]?.details).toMatchObject({ reason: "calls", calls: 3, tools: 3 });
+  for (const event of f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "model.request_settled"))
+    expect(event.details).not.toHaveProperty("host_cancellation");
   vi.useFakeTimers();
   f.planner.admitted(); f.planner.wake("planning_continuation");
   vi.advanceTimersByTime(1000);
@@ -350,6 +352,8 @@ test("ordinary authoring admits exactly twelve tools and fences captured commits
   expect(f.run.usage.calls).toBe(1);
   expect(f.store.eventsAfter(f.run.run_id, 0, 500).find(event => event.type === "scheduler.authoring_exited")?.details)
     .toMatchObject({ reason: "tools", calls: 1, tools: 12 });
+  for (const event of f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "model.request_settled"))
+    expect(event.details).not.toHaveProperty("host_cancellation");
   expect(f.state.pauses).toEqual([]);
 });
 
@@ -479,20 +483,23 @@ test("root settlement queues ordinary outcome work behind the cancelled authorin
   expect(prompts).toBe(2); expect(f.run.usage.calls).toBe(2); expect(f.state.pauses).toEqual([]);
 });
 
-test("a late real SDK authoring response cannot publish a write after root settlement or manufacture terminal usage", async () => {
+test("real SDK root-settlement cancellation retains exact host provenance and permits ordinary continuation without stale writes", async () => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   let requests = 0, writes = 0;
   const f = await setup(async () => { throw new Error("Installed SDK owns this response"); }, async model => {
     const index = requests++;
-    if (index === 0) { entered.resolve(); await release.promise; }
     const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
       timestamp: Date.now(), stopReason: index === 0 ? "toolUse" : "stop",
       content: index === 0 ? [{ type: "toolCall", id: "late-authoring-write", name: "program_write", arguments: {} }] : [],
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
     const stream = new AssistantMessageEventStream();
-    stream.push({ type: "start", partial: message });
-    stream.push({ type: "done", reason: index === 0 ? "toolUse" : "stop", message }); stream.end();
+    stream[Symbol.asyncIterator] = async function* () {
+      yield { type: "start", partial: message };
+      if (index === 0) { entered.resolve(); await release.promise; }
+      stream.end(message);
+      yield { type: "done", reason: index === 0 ? "toolUse" : "stop", message };
+    };
     return stream;
   });
   f.tools.find(tool => tool.name === "program_write")!.execute = async () => { writes++; return { content: [], details: null }; };
@@ -510,9 +517,53 @@ test("a late real SDK authoring response cannot publish a write after root settl
   const first = events.find(event => event.type === "model.call");
   const requestId = object(first?.details ?? null)?.request_id;
   expect(events.find(event => event.type === "model.request_settled" && object(event.details)?.request_id === requestId)?.details)
-    .toMatchObject({ obsolete: true });
+    .toMatchObject({ role: "authoring", obsolete: true, stop_reason: "aborted", provider_failure: false,
+      recovered_failure: { type: "stream_interrupted_after_content" },
+      host_cancellation: { kind: "ordinary_authoring", request_id: requestId,
+        root_execution_id: f.root.execution_id, reason: "root_settled" } });
+  const ordinary = events.filter(event => event.type === "model.request_settled").at(-1);
+  expect(ordinary?.details).toMatchObject({ role: "planning", stop_reason: "stop", obsolete: false, provider_failure: false });
+  expect(ordinary?.details).not.toHaveProperty("host_cancellation");
+  expect(events.some(event => event.type === "scheduler.turn_failed")).toBe(false);
   const usage = events.find(event => event.type === "model.usage" && object(event.details)?.request_id === requestId);
   expect(usage?.details).toHaveProperty("usage_evidence.provider_terminal", null);
+});
+
+for (const stopReason of ["error", "aborted"] as const)
+test(`real SDK provider ${stopReason} remains a failure when root settlement makes its authoring response obsolete`, async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const f = await setup(async () => { throw new Error("Installed SDK owns this response"); }, async model => {
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason, errorMessage: "Unrecoverable provider failure",
+      content: [{ type: "toolCall", id: "failed-authoring-write", name: "program_write", arguments: {} }],
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      yield { type: "start", partial: message };
+      entered.resolve(); await release.promise;
+      stream.end(message);
+      yield { type: "error", reason: stopReason, error: message };
+    };
+    return stream;
+  });
+  await f.planner.start(1); f.planner.wake("planning_continuation"); await entered.promise;
+  finishHistoryExecution(f.store, f.root); f.state.pending = false;
+  const finished = new Promise<void>(resolve => {
+    const off = f.store.subscribe(event => {
+      if (event.run_id === f.run.run_id && ["scheduler.turn_failed", "scheduler.turn_finished"].includes(event.type)) {
+        off(); resolve();
+      }
+    });
+  });
+  release.resolve(); await finished;
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  const settled = events.find(event => event.type === "model.request_settled");
+  expect(settled?.details).toMatchObject({ role: "authoring", stop_reason: stopReason, obsolete: true, provider_failure: true,
+    recovered_failure: { type: "stream_interrupted_after_content" } });
+  expect(settled?.details).not.toHaveProperty("host_cancellation");
+  expect(f.state.pauses).toHaveLength(1);
+  expect(events.some(event => event.type === "model.tool_started")).toBe(false);
 });
 
 test("the real SDK continues after submit through evidence and inactive validated source while the foreground body advances", async () => {

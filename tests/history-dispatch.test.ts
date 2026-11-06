@@ -306,6 +306,24 @@ test("the benchmark retains the full original event and projection workload and 
     .toThrow("complete response frame byte budget");
 });
 
+test("readonly prefix only settles host cancellation inside its declared event boundary", () => {
+  const { store, run, reader } = fixture();
+  store.event(run.run_id, "model.call", "Authoring admission", { request_id: "cancelled-authoring", role: "authoring" });
+  store.event(run.run_id, "model.request_settled", "Host closed root-bound authoring", {
+    request_id: "cancelled-authoring", role: "authoring", stop_reason: "aborted", obsolete: true,
+    recovered_failure: { type: "stream_interrupted_after_content", explanation: "stream_read_error" },
+    host_cancellation: { kind: "ordinary_authoring", request_id: "cancelled-authoring",
+      root_execution_id: "foreground-root", reason: "root_settled" },
+  });
+  expect(dispatchHistoryQuery(reader, { kind: "evaluation_prefix", run_id: run.run_id, event_limit: 1 }))
+    .toMatchObject({ admissions: 1, provider_error: false, provider_settled: false, events_omitted: true });
+  const complete = dispatchHistoryQuery(reader, { kind: "evaluation_prefix", run_id: run.run_id, event_limit: 2 });
+  expect(complete).toMatchObject({ admissions: 1, provider_error: false, provider_settled: true, events_omitted: false,
+    usage: { reported_messages: 0, event_coverage: "incomplete", consumption_coverage: "unknown", output: null } });
+  expect(Buffer.byteLength(JSON.stringify({ id: Number.MAX_SAFE_INTEGER, ok: true, value: complete }) + "\n"))
+    .toBeLessThanOrEqual(HISTORY_LIMITS.responseBytes);
+});
+
 test("late evaluation summaries retain the actual original prefix while counting admissions beyond its cap", () => {
   const { store, run, reader } = fixture();
   store.event(run.run_id, "model.call", "First request", { request_id: "first" });

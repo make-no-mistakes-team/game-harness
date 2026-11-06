@@ -38,6 +38,7 @@ const TOOL_CALLS = 48;
 const AUTHORING_CALLS = 3;
 const AUTHORING_TOOLS = 12;
 const AUTHORING_MS = 60_000;
+const AUTHORING_CANCELLATION_REASONS = new Set(["root_settled", "scope_lost", "root_replaced", "deadline", "calls", "tools"]);
 const FEEDBACK_BYTES = 8 * 1024;
 const PROGRAM_PENDING =
   "A program is meaningful pending work; strategy waits for its outcome";
@@ -126,6 +127,12 @@ interface RequestAttempt {
   review: boolean;
   role: "speculative" | "review" | "recovery" | "planning" | "authoring";
   authoring: AuthoringWindow | null;
+  hostCancellation?: {
+    kind: "ordinary_authoring";
+    request_id: string;
+    root_execution_id: string;
+    reason: string;
+  };
 }
 
 interface AuthoringWindow {
@@ -720,7 +727,15 @@ export class StrategicPlanner {
     });
     if (this.turnAuthoring === window || this.request?.authoring === window) {
       this.authoringEnded = true;
-      if (abort) this.agent?.abort();
+      if (abort && this.agent) {
+        const request = this.request;
+        // Capture host authority before abort: SDK callbacks may settle this
+        // exact request synchronously and retain a raw interruption marker.
+        if (request?.authoring === window && AUTHORING_CANCELLATION_REASONS.has(reason))
+          request.hostCancellation = { kind: "ordinary_authoring", request_id: request.id,
+            root_execution_id: window.root, reason };
+        this.agent.abort();
+      }
     }
   }
 
@@ -1433,11 +1448,16 @@ export class StrategicPlanner {
         this.gateReason !== null &&
         message.errorMessage === this.gateReason;
       const request = this.request;
+      // Reconciliation below can itself abort a now-obsolete window. That
+      // cannot establish the cause of a terminal response already received.
+      const requestedCancellation = request?.hostCancellation;
       const plan = request?.planId ? this.host.speculation?.().projection() : null;
       const window = request?.authoring;
       const obsolete = !this.current(run, generation) ||
         Boolean(window && (this.reconcileAuthoring() !== window || window.closed)) ||
         Boolean(request?.planId && (plan?.plan_id !== request.planId || !plan.planning_active));
+      const hostCancellation = message.stopReason === "aborted" && request?.role === "authoring" && obsolete
+        ? requestedCancellation : undefined;
       this.eligibleTools.clear();
       if (!obsolete && !hostYield && !recoveredFailure && ["stop", "toolUse"].includes(message.stopReason)) {
         this.turnDelivered++;
@@ -1525,7 +1545,7 @@ export class StrategicPlanner {
             provider_response_id: message.responseId ?? null,
             provider_retry_attempt: message.retryRecovery?.attempt ?? null,
             stop_reason: message.stopReason,
-            provider_failure: recoveredFailure || message.stopReason === "error",
+            provider_failure: !hostCancellation && (recoveredFailure || message.stopReason === "error"),
             recovered_failure: recoveredFailure ? {
               type: RECOVERED_PROVIDER_FAILURE,
               explanation: message.stopDetails?.explanation?.slice(0, 500) ?? null,
@@ -1534,16 +1554,18 @@ export class StrategicPlanner {
             purpose: request.purpose,
             purpose_source: "host_role_and_tools_v1",
             purpose_final: true,
+            role: request.role,
             speculative_plan_id: request.planId,
             read_only_review: request.review,
             obsolete,
+            ...(hostCancellation ? { host_cancellation: hostCancellation } : {}),
           },
         );
         this.request = null;
       }
-      if (this.current(run, generation) && !hostYield && !obsolete) {
-        if (message.stopReason === "error" || recoveredFailure) this.providerFailed = true;
-        if (message.stopReason === "aborted" && !this.authoringEnded) this.providerAborted = true;
+      if (this.current(run, generation) && !hostYield) {
+        if (!hostCancellation && (message.stopReason === "error" || recoveredFailure)) this.providerFailed = true;
+        if (message.stopReason === "aborted" && !hostCancellation) this.providerAborted = true;
       }
       if (message.stopReason !== "error" && message.stopReason !== "aborted") {
         for (const content of message.content) {

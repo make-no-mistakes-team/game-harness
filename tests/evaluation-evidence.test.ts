@@ -502,10 +502,56 @@ test("SDK-promoted interrupted tool responses retain provider failure classifica
   const f = setup();
   f.emit("model.call", {request_id:"recovered-failed-request"});
   f.emit("model.request_settled", {request_id:"recovered-failed-request",stop_reason:"toolUse",
-    recovered_failure:{type:"stream_interrupted_after_content",explanation:"stream_read_error"}});
+    role:"authoring",obsolete:true,recovered_failure:{type:"stream_interrupted_after_content",explanation:"stream_read_error"}});
+  expect(f.observer.hasProviderFailure(f.run.run_id)).toBe(true);
   expect((await f.observer.summary(f.run.run_id)).provider_error).toBe(true);
   expect(f.stops).toContain("provider_failure_or_unsettled_no_repeat");
 });
+
+const authoringCancellation = { kind: "ordinary_authoring", request_id: "cancelled-authoring",
+  root_execution_id: "foreground-root", reason: "root_settled" };
+const abortedAuthoring: Record<string, Json> = { request_id: "cancelled-authoring", role: "authoring",
+  stop_reason: "aborted", usage_reported: false,
+  recovered_failure: { type: "stream_interrupted_after_content", explanation: "stream_read_error" } };
+const cancelledAuthoring: Record<string, Json> = { ...abortedAuthoring, obsolete: true, host_cancellation: authoringCancellation };
+const cancellationCases: Array<{ name: string; type?: string; details: Record<string, Json>;
+  providerError: boolean; providerSettled: boolean }> = [
+  { name: "confirmed host cancellation", details: cancelledAuthoring, providerError: false, providerSettled: true },
+  { name: "wrong request identity", details: { ...cancelledAuthoring,
+    host_cancellation: { ...authoringCancellation, request_id: "different-request" } }, providerError: true, providerSettled: false },
+  { name: "wrong role", details: { ...cancelledAuthoring, role: "strategic" }, providerError: true, providerSettled: false },
+  { name: "missing obsolete flag", details: { ...abortedAuthoring, host_cancellation: authoringCancellation }, providerError: true, providerSettled: false },
+  { name: "provider error instead of abort", details: { ...cancelledAuthoring, stop_reason: "error" }, providerError: true, providerSettled: false },
+  { name: "historical missing marker", details: { ...abortedAuthoring, obsolete: true }, providerError: true, providerSettled: false },
+  { name: "spoofed cancellation kind", details: { ...cancelledAuthoring,
+    host_cancellation: { ...authoringCancellation, kind: "worker" } }, providerError: true, providerSettled: false },
+  { name: "missing root identity", details: { ...cancelledAuthoring,
+    host_cancellation: { ...authoringCancellation, root_execution_id: "" } }, providerError: true, providerSettled: false },
+  { name: "unapproved close reason", details: { ...cancelledAuthoring,
+    host_cancellation: { ...authoringCancellation, reason: "fenced" } }, providerError: true, providerSettled: false },
+  { name: "recovered provider failure despite marker", details: { ...cancelledAuthoring, stop_reason: "toolUse" },
+    providerError: true, providerSettled: true },
+  { name: "unsettled request despite marker", type: "model.request_unsettled", details: cancelledAuthoring,
+    providerError: true, providerSettled: false },
+  { name: "unsettled request without SDK failure metadata", type: "model.request_unsettled",
+    details: { request_id: "cancelled-authoring", usage_reported: false }, providerError: true, providerSettled: false },
+];
+for (const scenario of cancellationCases) {
+  test(`live and readonly evaluation agree on ${scenario.name} without inventing usage`, async () => {
+    const f = setup(30);
+    f.emit("model.call", { request_id: "cancelled-authoring", role: "authoring" });
+    f.emit(scenario.type ?? "model.request_settled", scenario.details);
+    expect(f.observer.hasProviderFailure(f.run.run_id)).toBe(scenario.providerError);
+    expect(f.stops).toEqual(scenario.providerError ? ["provider_failure_or_unsettled_no_repeat"] : []);
+    const forbidden = () => { throw new Error("writer-side unbounded history read"); };
+    f.store.events = forbidden;
+    expect(await f.observer.summary(f.run.run_id)).toMatchObject({
+      provider_error: scenario.providerError, provider_settled: scenario.providerSettled,
+      usage: { admissions: 1, reported_messages: 0, event_coverage: "incomplete", consumption_coverage: "unknown",
+        uncached_input: null, cache_read: null, cache_write: null, output: null, wire_attempts: null },
+    });
+  });
+}
 
 async function observedAgent(f: ReturnType<typeof setup>) {
   const descriptor = getBundledModels("openai-codex").find(model => model.api === "openai-codex-responses" && model.input.includes("image"));
@@ -814,14 +860,14 @@ test("an unsettled request retains genuinely collected terminal counters without
   expect(events.filter(event => event.type === "model.request_settled")).toHaveLength(0);
   expect(evidence.sdk_reported).toBeNull();
   const summary = await observer.summary(run.run_id);
-  expect(summary).toMatchObject({ provider_settled: false, provider_error: false, usage: {
+  expect(summary).toMatchObject({ provider_settled: false, usage: {
     admissions: 1, reported_messages: 0, event_coverage: "incomplete", consumption_coverage: "known",
     uncached_input: 6, cache_read: 3, cache_write: 1, output: 4,
     reported_subtotal: { uncached_input: null, cache_read: null, cache_write: null, output: null },
     wire_attempts: null, subscription_cost: null } });
   expect(readUsageMetrics(summary.usage)).toEqual(summary.usage);
   const outcome = classifyEvaluation({ inferenceAdmitted: true, goalVerified: false,
-    platformChecksComplete: true, providerError: false, providerSettled: summary.provider_settled });
+    platformChecksComplete: true, providerError: summary.provider_error, providerSettled: summary.provider_settled });
   expect(costToResult([{ outcome, usage: summary.usage }])).toMatchObject({
     uncached_input: 6, cache_read: 3, cache_write: 1, output: 4,
     reported_subtotal: { uncached_input: null, cache_read: null, cache_write: null, output: null },

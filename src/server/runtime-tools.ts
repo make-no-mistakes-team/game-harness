@@ -55,6 +55,7 @@ export interface RuntimeToolHost {
   history(): HistoryQueryClient;
   planning(): SpeculativePlanning;
   learning(): ImprovementLearning;
+  toolRole?(): ToolRole;
   toolAuthority(): () => void;
   finishTask(summary: string, callId: string): void;
 }
@@ -70,7 +71,9 @@ export class RuntimeTools {
     const run = this.host.run();
     if (this.moduleRun !== run.run_id) { this.moduleRun = run.run_id; this.modules.clear(); this.reviewDecisions.clear(); }
     const operations = new ProgramOperations(this.store, this.skills, this.reactions, this.experience, this.host, run);
-    const role = (): ToolRole => run.status === "reviewing" ? "review" : this.host.planning().projection()?.planning_active ? "speculative" : "ordinary";
+    const role = (): ToolRole => run.status === "reviewing" ? "review" :
+      this.host.toolRole?.() ?? (this.host.planning().projection()?.planning_active ? "speculative" : "ordinary");
+    const writeSchema = role() === "authoring" ? programWriteSchema.omit({ reason: true }) : programWriteSchema;
     const result = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value });
     const tool = <T>(name: string, description: string, schema: z.ZodType<T>,
       handler: (input: T, callId: string, signal: AbortSignal | undefined, commit: () => void) => unknown | Promise<unknown>): AgentTool => {
@@ -84,11 +87,15 @@ export class RuntimeTools {
         try {
           if (this.host.run() !== run)
             throw new RuntimeFault("stale_context", "This tool call belongs to a different run");
-          if (!toolCatalogAllows(role(), name, this.modules))
+          const admittedRole = role();
+          if (!toolCatalogAllows(admittedRole, name, this.modules))
             throw new RuntimeFault("forbidden", "This tool is not authorized for the current role and disclosed modules");
           const parsed = schema.safeParse(raw);
           if (!parsed.success) { argumentError = parsed.error; throw argumentError; }
           const input = parsed.data;
+          if (admittedRole === "authoring" && name === "program_write" &&
+            input !== null && typeof input === "object" && "reason" in input)
+            throw new RuntimeFault("forbidden", "Pending-program authoring saves inactive source only; outcome assessments require an ordinary or review turn");
           const identity = { tool: name, input } as unknown as Json;
           const operation = input && typeof input === "object" && "operation" in input ? input.operation : null;
           const mutation = name === "task_finish" || name === "program_write" || name === "program_submit" || name === "program_review" || name === "prepare_next" ||
@@ -116,6 +123,8 @@ export class RuntimeTools {
               if (this.host.run() !== run || signal?.aborted || name === "program_submit" && submissionScope() !== originalScope)
                 throw new RuntimeFault("stale_context", "Tool authority changed before admission");
               this.host.assertCurrent(generation);
+              if (mutation && role() !== admittedRole)
+                throw new RuntimeFault("stale_context", "Tool role changed before admission");
               if (!toolCatalogAllows(role(), name, this.modules))
                 throw new RuntimeFault("forbidden", "Tool is not authorized for the current role");
             }
@@ -132,6 +141,7 @@ export class RuntimeTools {
           const value = typed ? typed.value : handled;
           // Finish consumes authority; submit also reports persisted source
           // when authority was revoked between persistence and admission.
+          // Authoring starts at the next SDK request, after these results.
           if (name !== "task_finish" && name !== "program_submit") {
             commit();
             if (!replay) this.host.assertCurrent(generation);
@@ -179,12 +189,17 @@ export class RuntimeTools {
         const projection = this.host.adapter().projectObservation(selected.observation);
         return { value: { ...operations.workspace.observationView(selected.observation, projection), image_metadata: selected.image_metadata }, images: selected.images };
       }),
-      tool("program_write", "Create or revise a compact named JavaScript taskflow. Existing names require based_on. Optional reason links the actual revision to matching feedback, not proven efficacy.", programWriteSchema, (input, callId, signal, commit) => operations.write(input, callId, commit, signal)),
+      tool("program_write", role() === "authoring"
+        ? "Validate and save an immutable inactive named JavaScript taskflow without starting or replacing foreground work. Existing names require based_on. card.reason is inert descriptive metadata."
+        : "Create or revise a compact named JavaScript taskflow. Existing names require based_on. Optional reason links the actual revision to matching feedback, not proven efficacy.",
+        writeSchema, (input, callId, signal, commit) => operations.write(input, callId, commit, signal)),
       tool("program_submit", "Explicitly write one immutable program and start that exact version through ordinary admission. Returns persisted source separately from started/refused/unknown execution; never automatically retry an unknown start. Existing names require based_on.", programSubmitSchema, (input, callId, signal, commit) => operations.submit(input, callId, commit, signal)),
       tool("program_run", "Start a matching named run/step entry once; inspect/stop current work, explicitly version-update resident intent, run a separately bounded pure analyze job, activate prepared run work, or select one finite attention wake. No automatic source replacement or analysis-to-control injection. Host owns retry identity and authority.", programRunSchema, (input, callId, _signal, commit) => operations.runProgram(input, callId, commit)),
       tool("program_inspect", "Read named catalog/source/execution/trace/feedback/comparison/planning views without effects. Preserve page cursors and explicit omissions.", programInspectSchema, (input, _callId, signal, commit) => operations.inspect(input, signal, commit)),
       tool("program_review", "Record keep or insufficient_evidence for the latest matching outcome of a named version. A performed code experiment is linked directly through program_write.reason.", programReviewSchema, (input, callId, signal, commit) => operations.review(input, callId, commit, signal)),
       tool("help", "Load generated game/program/planning reference, or disclose optional reflex/memory modules on demand.", helpSchema, (input) => {
+        if ((input.topic === "reflex" || input.topic === "memory") && role() === "authoring")
+          throw new RuntimeFault("forbidden", "Optional playing modules are unavailable during pending-program authoring");
         if ((input.topic === "reflex" || input.topic === "memory") && role() === "ordinary") this.modules.add(input.topic);
         return programHelp(input.topic, this.host.adapter());
       }),

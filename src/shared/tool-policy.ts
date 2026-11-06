@@ -1,14 +1,14 @@
-export type ToolRole = "ordinary" | "speculative" | "review";
+export type ToolRole = "ordinary" | "authoring" | "speculative" | "review";
 export type ToolModule = "reflex" | "memory";
 
 export const TOOL_POLICY = Object.freeze({
-  observe: { roles: ["ordinary", "speculative", "review"], module: null },
-  program_write: { roles: ["ordinary", "review"], module: null },
+  observe: { roles: ["ordinary", "authoring", "speculative", "review"], module: null },
+  program_write: { roles: ["ordinary", "authoring", "review"], module: null },
   program_submit: { roles: ["ordinary"], module: null },
   program_run: { roles: ["ordinary"], module: null },
-  program_inspect: { roles: ["ordinary", "speculative", "review"], module: null },
+  program_inspect: { roles: ["ordinary", "authoring", "speculative", "review"], module: null },
   program_review: { roles: ["ordinary", "review"], module: null },
-  help: { roles: ["ordinary", "speculative", "review"], module: null },
+  help: { roles: ["ordinary", "authoring", "speculative", "review"], module: null },
   task_finish: { roles: ["ordinary"], module: null },
   prepare_next: { roles: ["speculative"], module: null },
   reflex: { roles: ["ordinary"], module: "reflex" },

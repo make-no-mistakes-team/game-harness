@@ -1063,6 +1063,161 @@ test("actual catalogs and dispatch share ordinary, speculative, advanced-module 
   expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
 });
 
+test("installed Agent cannot use captured playing tools during authoring and saves exact inactive revisions", async () => {
+  const release = Promise.withResolvers<void>();
+  const f = fixture(async (_source, _args, _handle, _limits, signal) => {
+    await Promise.race([release.promise, aborted(signal)]);
+    return { status: "completed", summary: "Original foreground settled", result: null };
+  });
+  await f.write("foreground");
+  const original = f.store.namedSkill(f.run.run_id, "foreground")!;
+  await f.call("help", { topic: "reflex" });
+  await f.call("help", { topic: "memory" });
+  const ordinary = f.tools();
+  f.toolHost.toolRole = () => "speculative";
+  const prepared = f.tools().find(tool => tool.name === "prepare_next")!;
+  delete f.toolHost.toolRole;
+  const started = await agentCalls(ordinary, [
+    { type: "toolCall", id: "authoring-root", name: "program_run", arguments: { operation: "start", name: "foreground", version: 1, args: { original: true } } },
+  ]);
+  expect(started[0]!.isError).not.toBe(true);
+  const root = f.store.latestRootExecution(f.run.run_id)!;
+  f.toolHost.toolRole = () => "authoring";
+  expect(f.tools().map(tool => tool.name).sort()).toEqual(["help", "observe", "program_inspect", "program_write"]);
+  expect(f.tools().find(tool => tool.name === "program_write")!.parameters).not.toHaveProperty("properties.reason");
+  expect(f.tools().find(tool => tool.name === "program_write")!.parameters).toHaveProperty("properties.based_on");
+  const forbidden: ToolCall[] = [
+    ...["start", "stop", "update_intent", "analyze", "activate_next", "attention"].map((operation, index) => ({
+      type: "toolCall" as const, id: `blocked-control-${index}`, name: "program_run", arguments: { operation, name: "foreground", args: null },
+    })),
+    { type: "toolCall", id: "blocked-submit", name: "program_submit", arguments: { name: "unexpected playing source", source, args: null } },
+    { type: "toolCall", id: "blocked-finish", name: "task_finish", arguments: { summary: "Unauthorized completion" } },
+    { type: "toolCall", id: "blocked-reflex", name: "reflex", arguments: { operation: "activate", name: "unexpected" } },
+    { type: "toolCall", id: "blocked-memory", name: "memory", arguments: { operation: "load", name: "unexpected" } },
+    { type: "toolCall", id: "blocked-review", name: "program_review", arguments: { name: "foreground", decision: "keep", reason: "Unauthorized assessment" } },
+    { type: "toolCall", id: "blocked-prepare", name: "prepare_next", arguments: { name: "foreground", args: null } },
+    { type: "toolCall", id: "blocked-experiment", name: "program_write", arguments: { name: "foreground", based_on: 1, source, reason: "Unauthorized outcome linkage" } },
+  ];
+  const rejected = await agentCalls([...ordinary, prepared], forbidden);
+  expect(rejected).toHaveLength(forbidden.length);
+  for (const reply of rejected) {
+    expect(reply.isError).toBe(true);
+    expect(data(reply).error.code).toBe("forbidden");
+  }
+  const revised = 'return {status:"completed",summary:"Inactive candidate",result:2};';
+  const drafts = await agentCalls(f.tools(), [
+    { type: "toolCall", id: "inactive-revision", name: "program_write", arguments: { name: "foreground", based_on: 1, source: revised, card: { ...card, reason: "Inert candidate motivation" } } },
+    { type: "toolCall", id: "inactive-helper", name: "program_write", arguments: { name: "future helper", source } },
+    { type: "toolCall", id: "read-original", name: "program_inspect", arguments: { view: "source", name: "foreground", version: 1 } },
+    { type: "toolCall", id: "authoring-observe", name: "observe", arguments: {} },
+  ]);
+  expect(drafts.every(reply => !reply.isError)).toBe(true);
+  expect(data(drafts[0]!)).toMatchObject({ name: "foreground", version: 2, state: "validated", experiment: null });
+  expect(data(drafts[1]!)).toMatchObject({ name: "future helper", version: 1, state: "validated", experiment: null });
+  expect(data(drafts[2]!).source).toBe(original.source);
+  expect(f.store.namedSkill(f.run.run_id, "foreground", 1)).toEqual(original);
+  expect(f.store.namedSkill(f.run.run_id, "foreground", 2)).toMatchObject({ parent_version: 1, state: "validated" });
+  expect(f.store.namedSkill(f.run.run_id, "foreground", 2)!.source).toContain("Inactive candidate");
+  expect(f.store.namedSkill(f.run.run_id, "foreground", 2)!.card.reason).toBe("Inert candidate motivation");
+  expect(f.store.namedSkill(f.run.run_id, "foreground", 2)!.hash).not.toBe(original.hash);
+  expect(f.store.latestRootExecution(f.run.run_id)).toEqual(root);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  expect(f.dispatches()).toBe(1);
+  expect(f.actions()).toBe(0);
+  expect(f.run.status).toBe("running");
+  expect(f.store.policies(f.run.run_id)).toEqual([]);
+  expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")).toEqual([]);
+  f.run.status = "reviewing";
+  expect(f.tools().some(tool => tool.name === "program_review")).toBe(true);
+  expect(f.tools().find(tool => tool.name === "program_write")!.parameters).toHaveProperty("properties.reason");
+  const review = await agentCalls(f.tools(), [
+    { type: "toolCall", id: "review-precedence", name: "program_write", arguments: { name: "foreground", based_on: 2, source, reason: "Use review rather than authoring authority" } },
+  ]);
+  expect(data(review[0]!).error.code).toBe("precondition_failed");
+  release.resolve();
+  await waitClosed(f.store, f.run.run_id, root.execution_id);
+});
+
+test("authoring help cannot disclose or acquire optional playing modules", async () => {
+  const f = fixture();
+  f.toolHost.toolRole = () => "authoring";
+  const replies = await agentCalls(f.tools(), [
+    { type: "toolCall", id: "authoring-reflex-help", name: "help", arguments: { topic: "reflex" } },
+    { type: "toolCall", id: "authoring-memory-help", name: "help", arguments: { topic: "memory" } },
+    { type: "toolCall", id: "authoring-program-help", name: "help", arguments: { topic: "programs" } },
+  ]);
+  for (const reply of replies.slice(0, 2)) {
+    expect(reply.isError).toBe(true);
+    expect(data(reply).error.code).toBe("forbidden");
+    expect(data(reply).schema).toBeUndefined();
+  }
+  expect(replies[2]!.isError).not.toBe(true);
+  delete f.toolHost.toolRole;
+  expect(f.tools().some(tool => tool.name === "reflex" || tool.name === "memory")).toBe(false);
+  expect(f.store.skills(f.run.run_id)).toEqual([]);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toEqual([]);
+});
+
+for (const boundary of ["root_settlement", "stop", "role_change"] as const) {
+  test(`installed Agent cannot publish an async authoring draft after ${boundary}`, async () => {
+    const releaseRoot = Promise.withResolvers<void>();
+    const f = fixture(async (_source, _args, _handle, _limits, signal) => {
+      await Promise.race([releaseRoot.promise, aborted(signal)]);
+      return { status: "completed", summary: "Foreground settled", result: null };
+    });
+    await f.write("original owner");
+    await f.call("program_run", { operation: "start", name: "original owner", args: null });
+    const root = f.store.latestRootExecution(f.run.run_id)!;
+    f.toolHost.toolRole = () => "authoring";
+    const ordinaryAuthority = f.toolHost.toolAuthority.bind(f.toolHost);
+    f.toolHost.toolAuthority = () => {
+      const current = ordinaryAuthority();
+      // The planner supplies this captured authority in Runtime. Keep the
+      // role unchanged on settlement to exercise the async commit boundary.
+      return () => {
+        current();
+        const latest = f.store.latestRootExecution(f.run.run_id);
+        if (latest?.execution_id !== root.execution_id || !["accepted", "running"].includes(latest.status))
+          throw new RuntimeFault("stale_context", "Captured foreground authoring authority expired");
+      };
+    };
+    const validationReady = Promise.withResolvers<void>(), releasePublication = Promise.withResolvers<void>();
+    const register = f.store.registerSkill.bind(f.store);
+    f.store.registerSkill = async (...args) => {
+      validationReady.resolve();
+      await releasePublication.promise;
+      return await register(...args);
+    };
+    const pending = agentCalls(f.tools(), [
+      { type: "toolCall", id: `late-draft-${boundary}`, name: "program_write", arguments: { name: "late draft", source } },
+    ]);
+    await validationReady.promise;
+    if (boundary === "root_settlement") {
+      releaseRoot.resolve();
+      await waitClosed(f.store, f.run.run_id, root.execution_id);
+    } else if (boundary === "stop") {
+      f.run.status = "stopping";
+      f.fence();
+      await waitClosed(f.store, f.run.run_id, root.execution_id);
+    } else {
+      f.toolHost.toolRole = () => "ordinary";
+    }
+    releasePublication.resolve();
+    const replies = await pending;
+    expect(replies[0]!.isError).toBe(true);
+    expect(data(replies[0]!).error.code).toBe("stale_context");
+    expect(f.store.namedSkill(f.run.run_id, "late draft")).toBeNull();
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+    expect(f.dispatches()).toBe(1);
+    expect(f.actions()).toBe(0);
+    if (boundary === "role_change") {
+      expect(f.store.latestRootExecution(f.run.run_id)).toEqual(root);
+      releaseRoot.resolve();
+      await waitClosed(f.store, f.run.run_id, root.execution_id);
+    }
+  });
+}
+
 test("task_finish persists an immutable acknowledgement despite consuming its own authority", async () => {
   const entered = Promise.withResolvers<void>();
   const f = fixture(async (_source, _args, _handle, _limits, signal) => {

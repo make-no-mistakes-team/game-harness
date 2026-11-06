@@ -216,8 +216,12 @@ export async function renderEpisodeReplay({ directory, concatSha256, signal, tim
   // Concat per-file options require safe=0. Consume only the unchanged sealed
   // generated manifest, with no network protocols. B-frames can understate
   // MP4's decode duration across a large terminal presentation gap.
-  const child = spawn("ffmpeg", ["-nostdin", "-v", "error", "-n", "-f", "concat", "-safe", "0", "-protocol_whitelist", "file",
-    "-i", "replay.ffconcat", "-fps_mode", "passthrough", "-enc_time_base", "1/1000", "-c:v", "libx264", "-bf", "0",
+  // Prefer bounded encoding work over the default preset's compression effort;
+  // retain every input image, its millisecond timestamp and the final hold.
+  // Pixel conversion needs only a small pool, not one worker per host CPU.
+  // PNG decoding and x264 keep their independent threading defaults.
+  const child = spawn("ffmpeg", ["-nostdin", "-filter_threads", "1", "-v", "error", "-n", "-f", "concat", "-safe", "0", "-protocol_whitelist", "file",
+    "-i", "replay.ffconcat", "-fps_mode", "passthrough", "-enc_time_base", "1/1000", "-c:v", "libx264", "-preset", "veryfast", "-bf", "0",
     "-pix_fmt", "yuv420p", "replay.mp4"], { cwd: directory, stdio: "ignore" });
   let failure: Error | undefined;
   const terminate = (error: Error) => { failure ??= error; child.kill("SIGKILL"); };

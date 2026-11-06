@@ -265,6 +265,12 @@ sealed SHA256 before using per-image options and permits only local file
 protocols; it is not an arbitrary concat script importer. Historical PNGs,
 indexes and movies remain unchanged.
 
+Offline H.264 export uses the `veryfast` preset and one filter thread for pixel
+conversion. Decoder and encoder threading remain automatic. These throughput
+settings preserve every delivered frame, presentation timestamp, final hold and
+`yuv420p` output; they do not extend the declared render deadline. Abort or expiry
+kills the owned encoder and joins its process-close barrier before returning.
+
 The active boundary uses observation envelope **3**, executable API/validator/runtime **5**, native hello **4**, and `minecraft.action@4`. Isolated worker framing remains **1**; resident messages use their own version-1 namespace. Login admission proof remains **1**, live binary capture is **GHV2**, SQLite uses schema **7**, usage metrics remain **2**, and request-usage evidence remains **1**. Screen and controller-feedback reads use `minecraft.visible_screen@1` and `minecraft.controller_frame@2`. Semantic heard-event feedback is separate from audio recording, which remains absent. This cutover does not deliver larger source bundles, checkpoints or another supported game.
 
 ### Ordinary Minecraft world input

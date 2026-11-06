@@ -693,7 +693,8 @@ export class SkillManager {
             .filter((dependency) => dependency.name === request.skill.name &&
               (request.skill.version === undefined || dependency.version === request.skill.version));
           if (declared.length !== 1)
-            throw new Error("Undeclared or ambiguous named dependency; calls resolve only the parent's pinned exact declarations");
+            throw new RuntimeFault("precondition_failed",
+              "game.call requires exactly one matching named child in the parent's pinned program dependencies. Declare the child's exact reference and select its name/version. Native adapter bindings are direct game methods, not program dependencies.");
           if (live.depth >= live.root.view.limits.max_depth)
             throw new Error("Root composition depth exhausted");
           const dependency = declared[0]!;

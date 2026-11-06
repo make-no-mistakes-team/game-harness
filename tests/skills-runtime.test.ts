@@ -473,6 +473,72 @@ return {status:"completed",summary:"Explicit fresh bounded decision after pre-ad
     }
   });
 
+  test("real worker named-call refusals remain safe preconditions without admitting native bindings or children", async () => {
+    const queries: { id: string; version: number; args: Json }[] = [];
+    let effects = 0;
+    const { directory, store, run, manager } = fixture(generatedWorker, {
+      action: async () => { effects++; return success; },
+      queryCapability: async (id, version, args) => {
+        queries.push({ id, version, args });
+        return { direct_native_read: true };
+      },
+    });
+    const observer = new ModelProgramEvidence(store, directory, DEFAULT_EVALUATION_CAPS, "test-host-clock", () => {});
+    try {
+      const childSource = 'await game.action({kind:"look",yaw:0,pitch:0});return {status:"completed",summary:"Child executed",result:null};';
+      await manager.register(run.run_id, { entry: "run", name: "recipes", card, dependencies: [], source: childSource });
+      const first = await manager.register(run.run_id, { entry: "run", name: "ambiguous child", card, dependencies: [], source: childSource });
+      const second = await manager.register(run.run_id, { entry: "run", name: "ambiguous child", card, dependencies: [],
+        source: 'await game.action({kind:"look",yaw:0,pitch:0});return {status:"completed",summary:"Revised child executed",result:null};' });
+      const skill = await manager.register(run.run_id, { entry: "run", name: "invalid named calls", card,
+        dependencies: [first, second].map(({ skill_id, version }) => ({ skill_id, version })),
+        source: `
+const failures = [];
+for (const target of [{name:"missing child"}, {name:"recipes",version:1}, {name:"ambiguous child"}]) {
+  try { await game.call(target, {item:"iron_pickaxe"}); }
+  catch (error) { failures.push({code:error.code,message:error.message}); }
+}
+const direct = await game.recipes("iron_pickaxe");
+return {status:"completed",summary:"Named calls refused; direct native read completed",result:{failures,direct}};
+`,
+      });
+      const accepted = manager.start(run.run_id, start(run, skill, "named-call-refusals"));
+      await closed(store, run.run_id, accepted.execution_id);
+      const outcome = manager.get(run.run_id, { execution_id: accepted.execution_id })!;
+      expect(outcome).toMatchObject({ status: "succeeded", result: { result: {
+        failures: [{ code: "precondition_failed" }, { code: "precondition_failed" }, { code: "precondition_failed" }],
+        direct: { direct_native_read: true },
+      } } });
+      expect(effects).toBe(0);
+      expect(store.skillExecutions(run.run_id)).toHaveLength(1);
+      expect(queries).toEqual([{ id: "minecraft.recipes", version: 1, args: { item: "iron_pickaxe" } }]);
+      const finalized = await observer.finalize(run.run_id, { status: "completed", reason: "named_call_refusals" });
+      expect(finalized.evidence_complete).toBe(true);
+      const journal = readFileSync(join(directory, finalized.journal), "utf8");
+      const traces = journal.trim().split("\n").map(line => JSON.parse(line))
+        .filter(record => record.kind === "authorized_execution_evidence_before_trace_caps")
+        .map(record => record.value);
+      const requests = traces.filter(trace => trace.kind === "capability_request");
+      const results = traces.filter(trace => trace.kind === "capability_result");
+      expect(requests.map(trace => trace.capability)).toEqual(["call", "call", "call", "adapter"]);
+      expect(results).toHaveLength(4);
+      const returned = outcome.result!.result as { failures: { code: string; message: string }[] };
+      for (const [index, failure] of returned.failures.entries()) {
+        expect(failure.message.length).toBeGreaterThan(0);
+        expect(failure.message.length).toBeLessThanOrEqual(1000);
+        expect(results[index]).toMatchObject({
+          execution_id: accepted.execution_id, call_id: requests[index].call_id,
+          payload: { ok: false, result: failure },
+        });
+      }
+      expect(results[3]).toMatchObject({ payload: { ok: true, result: { direct_native_read: true } } });
+      for (const privateDetail of [directory, "node:internal", "skills.ts", "at SkillManager"])
+        expect(journal).not.toContain(privateDetail);
+    } finally {
+      await observer.close();
+    }
+  });
+
   test("caught trusted capability failures survive successful real-worker execution in the finalized correlated private journal", async () => {
     const trusted = new RuntimeFault("precondition_failed", "Observation is not available in the current life");
     trusted.stack = "HOST_STACK_SECRET at /private/host/trusted-capability.ts:42";

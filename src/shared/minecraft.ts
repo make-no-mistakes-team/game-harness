@@ -107,7 +107,8 @@ export const minecraftActionSchema = z.discriminatedUnion("kind", [
     interaction: z.object({ kind: z.enum(["attack", "use"]), target: targetRefSchema.optional() }).strict().optional() }).strict()
     .describe("Raw held-input interval, not an arrival or task-progress promise. Success may include jumping in place. Receipts distinguish net/horizontal displacement, height change and own-body grounded/support/headroom/collision feedback from accumulated travel. For purposeful travel or ascent, compare fresh settled positions across a small bounded sequence; after at most three ineffective bursts, stop, reobserve and change the approach or return blocked. Allow bounded detours; jumping distance is not escape progress. A separate completed jump followed by observation/aim/equip may land before a later placement."),
   z.object({ kind: z.literal("look"), yaw, pitch }).strict(),
-  z.object({ kind: z.literal("dig"), target: targetRefSchema }).strict(),
+  z.object({ kind: z.literal("dig"), target: targetRefSchema }).strict()
+    .describe("Stationary mining helper; does not move toward its target. Native preflight requires a current visible block, eye-to-centre distance at most 5 blocks and clear interaction line of sight. The observation radius is not mining reach. Passing preflight is not server-confirmed removal; inspect the actual result and fresh state."),
   z.object({ kind: z.literal("place"), target: targetRefSchema, face: z.enum(["up", "down", "north", "south", "east", "west"]), item: itemName }).strict()
     .describe("Place using a fresh support target and face; implicit equipment uses the same visible native inventory controller. Bounded native session up to 20 seconds, still limited by the owning program budget."),
   z.object({ kind: z.literal("craft"), item: recipeOutputItem, executions: z.number().int().min(1).max(16)

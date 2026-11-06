@@ -297,6 +297,13 @@ On Linux, the official Launcher's selected-account bearer may live in the unlock
 
 Native own-inventory verification uses authenticated receipts bound to the connection's session/world/epoch and the request nonce/motor generation, ordered after vanilla packets. Limit receipts to bounded own item counts/slot names; exclude NBT, other world/player data, admin access and action authority. They remain internal, not model capabilities. Local click prediction and packet acknowledgement alone cannot prove inventory gain, and receipt implementation alone is not a passed gameplay task.
 
+Native crafting reports grid/cursor custody, output capacity, supported recipe
+display and ingredient availability as distinct refusals. These reasons come
+from the existing transfer predicates; they do not choose substitute materials.
+A resource refusal after opening a table can still have an emitted interaction
+and an `unknown` outcome. Preserve that history and actual neutralization rather
+than relabel it as a no-effect failure or replay it blindly.
+
 The default pause, Stop run and goal completion leave a healthy session connected and the world ticking; warn that survival is not guaranteed. Cancellation stops motor/navigation work, releases held inputs and obtains real neutralization acknowledgement, or enters the declared fail-closed bridge fence/recovery path. Ordinary death retains the session and awaits an explicit model respawn decision. Stop world ends the owned session and server. Lost craft/place/consume/respawn results must never be blindly replayed.
 
 Current observation envelope 3 carries session/life/native-boot, space/screen and compatibility identity. Historical schema-2/r2 records retain their original lineage, including nulls where evidence is absent; never invent IDs for them. The current profile remains camera-independent structured line of sight. Optional current ItemEntity `item_name` exposes only the represented stack's registry kind after the existing range/occlusion/currentness gates, never dropped-stack counts, NBT or hidden item identity. Operator motor profiles persist through `/v1/config` and apply live; free look and gaze selection do not widen observation permissions or authorize navigation toward a hidden goal.

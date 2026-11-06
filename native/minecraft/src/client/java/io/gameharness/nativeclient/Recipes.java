@@ -193,9 +193,10 @@ public final class Recipes {
     ItemStack cursor = handler.getCursorStack();
     switch (phase) {
       case 0 -> {
-        if (!session.clean() || destination(c, output) < 0 || !plan(c)) {
-          session.fail("craft_resources_or_output_capacity"); invalidated = true; return;
-        }
+        if (!session.clean()) { fail("craft_grid_or_cursor_not_clear"); return; }
+        if (destination(c, output) < 0) { fail("craft_output_capacity_unavailable"); return; }
+        String planningRefusal = plan(c);
+        if (planningRefusal != null) { fail(planningRefusal); return; }
         ingredient = 0; placement = 0; phase = 1;
       }
       case 1 -> {
@@ -339,7 +340,7 @@ public final class Recipes {
   }
 
   /** Ingredient alternatives are only the already-disclosed unlocked recipe display data. */
-  private static boolean plan(MinecraftClient c) {
+  private static String plan(MinecraftClient c) {
     var context = SlotDisplayContexts.createParameters(c.world);
     List<SlotDisplay> ingredients;
     int width;
@@ -347,7 +348,7 @@ public final class Recipes {
       ingredients = shaped.ingredients(); width = shaped.width();
     } else if (active.display() instanceof ShapelessCraftingRecipeDisplay shapeless) {
       ingredients = shapeless.ingredients(); width = table ? 3 : 2;
-    } else return false;
+    } else return "craft_recipe_display_unsupported";
     Map<Integer, List<Integer>> selected = new LinkedHashMap<>();
     ScreenHandler handler = session.handler();
     int[] reserved = new int[handler.slots.size()];
@@ -364,7 +365,7 @@ public final class Recipes {
           if (slot.getStack().isOf(alternative.getItem())) { sourceSlot = slot.id; break; }
         if (sourceSlot >= 0) break;
       }
-      if (sourceSlot < 0) return false;
+      if (sourceSlot < 0) return "craft_ingredients_unavailable";
       reserved[sourceSlot]++;
       selected.computeIfAbsent(sourceSlot, ignored -> new ArrayList<>())
           .add(1 + i % width + i / width * (table ? 3 : 2));
@@ -374,7 +375,7 @@ public final class Recipes {
     for (var entry : selected.entrySet())
       groups[index++] = new IngredientGroup(entry.getKey(), handler.getSlot(entry.getKey()).getStack().copy(),
           entry.getValue().stream().mapToInt(Integer::intValue).toArray());
-    return groups.length > 0;
+    return groups.length > 0 ? null : "craft_recipe_has_no_supported_ingredients";
   }
 
   private static int destination(MinecraftClient c, ItemStack stack) {

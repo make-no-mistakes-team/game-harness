@@ -94,10 +94,17 @@ manifests, and configuration as part of the workspace changes.
 
 ## Committing and integrating into main
 
-In this shared repository, a request to commit changes to `main` or integrate a
-feature into `main` includes pushing the result to `origin/main`, unless I
-explicitly request a local-only operation. No separate push confirmation is
-needed for these requests.
+During a large implementation, make a focused local commit whenever a logical
+checkpoint or an independent feature/fix is complete and its relevant checks
+pass. Commit that result before accumulating unrelated work; do not wait for the
+entire plan. Stage only the intended repository changes and keep private local
+material excluded.
+
+These checkpoint commits are local-only, including on `main`, and need no
+separate approval. They do not authorize a push. An explicit request to commit
+changes to `main` or integrate a feature into `main` includes pushing the result
+to `origin/main`, unless I explicitly request a local-only operation. No separate
+push confirmation is needed for those explicit requests.
 
 Keep `main` linear and preserve individual commits. Prefer fast-forward to
 preserve hashes when possible. If a PR or feature branch has diverged from
@@ -114,11 +121,13 @@ unclear. Check that the open PR's base and status reflect the integration.
 Before every push, review the exact commit tree and every outgoing commit for
 private files, secrets, and personal information, including newly added files,
 reports, machine-specific paths, and Git author/committer metadata, unless I
-explicitly ask to skip this pre-push review for that push. Keep local
+explicitly ask to skip this pre-push review for that push. This publication review
+and its secret scan are required immediately before pushing, not before or after
+each local-only commit. Keep local
 plans, credentials, auth databases, worlds, raw run evidence, and generated
 artifacts out of the publication; include reports only after reviewing their
-contents as intentionally public. As part of this review, inspect the staged
-diff and run a secret scanner; `.gitignore` and a clean scan alone are not
-sufficient. Repeat the review if the publication changes. Resolve confirmed
+contents as intentionally public. As part of this review, inspect the outgoing
+commit diffs and any staged diff, and run a secret scanner; `.gitignore` and a
+clean scan alone are not sufficient. Repeat the review if the publication changes. Resolve confirmed
 findings before pushing; if safe publication is uncertain, stop and report the
 blocker without exposing the sensitive data or rewriting shared history.

@@ -549,6 +549,25 @@ Current compatibility is the negotiated descriptor/content hash: observation env
 
 Same-session working definitions are a separate, weaker retention channel. `working_programs:"continue"` (default) imports exact validated definitions/dependencies only for the same session and strategic model; `"fresh"` omits them. No previous args, worker state, observations or JS stacks cross the task boundary. Their qualification remains `working_candidate`, even if they have measured execution references. Retaining or revalidating a definition does not establish usefulness, portability or cross-session promotion eligibility. Frozen comparison arms must explicitly omit uncontrolled working definitions.
 
+The final strategic SDK supplement has a shared 32 KiB serialized UTF-8 cap,
+with at most 18 KiB of selected source records and 24 KiB of retained help.
+Those allowances are not additive. Bounded unknown-operation references retain
+their original scope, no-replay fence, containment identity and known confirmed
+GUI prefix before source and requested help are allocated. Optional historical
+receipt summaries, timestamps and sanitized evidence return only if space
+remains after that allocation. Old receipt bodies cannot displace selected
+action constraints. Action alternatives also precede secondary resident
+response-latency prose. This can leave less receipt detail in an otherwise useful
+request; authorized event inspection still exposes the full retained record.
+
+`detail_omitted:true` marks receipt detail excluded by the request cap, and
+`omitted_records` counts each excluded detail record. `evidence_omitted:true`
+also survives when the original sanitized evidence was already partial, even
+if that partial body fits. Neither flag resolves an unknown effect, erases
+confirmed prefix facts or turns unobserved outcomes into zero. Source hashes,
+historical execution provenance and the existing help omission notices remain
+separate from current observation authority.
+
 For each artifact version, retain:
 
 - Its content hash, artifact kind, parent version or source artifact, authoring model/provider identity, and creation run/event references. Record model identifiers as reported by the provider rather than claiming reproducibility of unavailable model internals.

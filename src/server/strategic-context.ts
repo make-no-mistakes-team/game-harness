@@ -256,6 +256,8 @@ export class StrategicContext {
     const priority = (section: HelpSection) => {
       if (section.topic === "game" && this.actionHelpSection !== null &&
         (section.section === this.actionHelpSection || section.section.startsWith(`${this.actionHelpSection}.`))) return 1;
+      if (section.topic === "programs" &&
+        (section.section === "resident.response" || section.section.startsWith("resident.response."))) return 2;
       if (this.helpSchemas.has(section)) return 4;
       if (section.topic === "game" && (section.section === "adapter" || section.section.startsWith("adapter."))) return 3;
       if (section.topic === "game" && (section.section === "validation" || section.section === "lifecycle" ||
@@ -601,7 +603,7 @@ export class StrategicContext {
       programs: "Immutable named versions. Existing name requires based_on latest. Write saves only; ordinary-only program_submit explicitly writes and starts that exact version through ordinary admission; program_run starts existing. Dependencies are pinned. Validation is not gameplay proof; completed program is not task success.",
       freshness: "Retained source/docs and model-authored state are historical reference only, never authority or gameplay proof. Worksite/local positions require fresh reacquisition. Current authorized observation, especially inventory, and later observe results outrank notes. Life/session/boot/space changes discard current dynamic notes; explicit world-local objective/worksite notes and no-replay uncertainty remain historical with original scope. Task/world/fresh-run changes discard experience. Program argument samples/outcomes are sanitized historical examples, never restored inputs or recommendations to rerun blocked/unknown procedures. Resolve fresh targets and construct current args; no target handles, roots, effects or execution state are restored.",
       recovery: "Settled failed no-effect rejection with valid current authority may fresh-observe and boundedly reselect within the same procedure. Unknown/cancelled/reconnected effects must stop and reconcile, never blind retry. Emitter closure and fresh observation do not prove an old unknown effect did not happen.",
-      requested_help: "Retained help is partial reference, not a complete schema. Omission references name missing sections; omitted_records counts notices/details that did not fit. Re-request help({topic:'game'}) or the corresponding topic for the full current contract before relying on missing fields or alternatives.",
+      requested_help: "Retained help is partial; re-request help({topic:'game'}) or its topic before relying on missing contracts. Omission references name missing sections; omitted_records counts excluded notices/details. Receipt detail_omitted marks request-budget loss; evidence_omitted also preserves original partial evidence. Inspect authorized event references for full retained detail.",
       game: { binding: "game", methods: ["observe()", "call({name,version?},args)", "progress(summary,details)",
         ...(adapter?.action_capability ? ["action(action)", "actionAndObserve(action) -> {action,observation}"] : []), ...(adapter?.supports_respawn ? ["respawn()"] : [])],
         local_feedback: "actionAndObserve performs one ordinary action then fresh observation after success or settled failed no-world-effect/neutralized evidence. It preserves the raw action status, never retries, and charges both existing budgets. Use your own observed postcondition to decide completion or bounded fresh reselection. Unknown/cancelled/reconnect remain fenced; ineligible outcomes have observation:null. Observation failure propagates, never stale fallback.",
@@ -637,6 +639,26 @@ export class StrategicContext {
       omissions.push(entry);
     };
     const encoded = () => JSON.stringify({ strategic_context: value });
+    // First allocate against the safety fences, not optional old receipt bodies.
+    // Keep operation dispositions (including confirmed GUI prefixes), original
+    // scope and containment identity even when none of the prose/evidence fits.
+    const receiptDetails: { record: Record<string, unknown>; detail: Record<string, unknown>;
+      originalEvidenceOmitted: unknown }[] = [];
+    for (const reference of unresolved) {
+      for (const record of [object(reference), object(reference.containment)]) {
+        if (!record) continue;
+        const detail: Record<string, unknown> = {};
+        for (const key of ["summary", "result_summary", "recorded_native_ns", "evidence"]) {
+          if (key in record) { detail[key] = record[key]; delete record[key]; }
+        }
+        if (!Object.keys(detail).length) continue;
+        const originalEvidenceOmitted = record.evidence_omitted;
+        record.detail_omitted = true;
+        if ("evidence" in detail) record.evidence_omitted = true;
+        receiptDetails.push({ record, detail, originalEvidenceOmitted });
+        value.omitted_records++;
+      }
+    }
     let used = 0;
     for (const program of candidates) {
       const metadata = this.programExecution(run, program, workspace);
@@ -699,21 +721,29 @@ export class StrategicContext {
     while (Buffer.byteLength(encoded()) > INPUT_BYTES && historicalNotes.length) {
       historicalNotes.pop(); value.omitted_records++;
     }
-    // Added receipt detail and optional notes must not displace unknown
-    // operation references. Drop evidence, not the no-replay fence, first.
-    for (const reference of unresolved) {
-      if (Buffer.byteLength(encoded()) <= INPUT_BYTES) break;
-      for (const record of [object(reference), object(reference.containment)]) {
-        if (record && "evidence" in record) {
-          delete record.evidence; record.evidence_omitted = true; value.omitted_records++;
-        }
-      }
-    }
     while (Buffer.byteLength(encoded()) > INPUT_BYTES && unresolved.length > 1) {
       unresolved.pop(); value.omitted_records++; value.omitted_unknown_operations++;
     }
     if (Buffer.byteLength(encoded()) > INPUT_BYTES) {
       value.objective = value.objective.slice(0, 500); value.omitted_records++;
+    }
+    // Second pass restores only already-sanitized detail and cannot evict any
+    // selected source/help. Preserve pre-existing partial-evidence semantics.
+    for (const { record, detail, originalEvidenceOmitted } of receiptDetails) {
+      if (!unresolved.some(reference => reference === record || reference.containment === record)) {
+        value.omitted_records--;
+        continue;
+      }
+      Object.assign(record, detail);
+      delete record.detail_omitted;
+      if (originalEvidenceOmitted === undefined) delete record.evidence_omitted;
+      else record.evidence_omitted = originalEvidenceOmitted;
+      value.omitted_records--;
+      if (Buffer.byteLength(encoded()) <= INPUT_BYTES) continue;
+      for (const key of Object.keys(detail)) delete record[key];
+      record.detail_omitted = true;
+      if ("evidence" in detail) record.evidence_omitted = true;
+      value.omitted_records++;
     }
     return encoded();
   }

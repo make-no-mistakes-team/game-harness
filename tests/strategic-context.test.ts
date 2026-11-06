@@ -147,7 +147,7 @@ function retained(request: Context | undefined): Record<string, any> | undefined
   return undefined;
 }
 
-async function residentUncertainty(f: ReturnType<typeof fixture>, sequence = 7) {
+async function residentUncertainty(f: ReturnType<typeof fixture>, sequence = 7, summaryPadding = "") {
   const skill = await f.store.registerSkill(f.state.run.run_id, { entry: "step", name: `Resident ${sequence}`,
     source: "export function step(frame,state,intent) { return null; }", dependencies: [],
     card: { purpose: "Bounded receipt retention", applicability: "Fixture", method: "No replay",
@@ -160,7 +160,7 @@ async function residentUncertainty(f: ReturnType<typeof fixture>, sequence = 7) 
   const input: ControllerInput = { kind: "screen", screen: { screen_id: "OLD_SCREEN_HANDLE", incarnation: 1, layout_revision: 1 },
     operations: [{ kind: "key", key: "enter", phase: "press" }, { kind: "close" }] };
   const update: ControllerEffectUpdate = { controller_generation: 3, sequence, recorded_native_ns: "123456",
-    result: { status: "unknown", summary: "Confirmed prefix with unknown suffix", evidence: { effect_confirmed: false,
+    result: { status: "unknown", summary: `Confirmed prefix with unknown suffix${summaryPadding}`, evidence: { effect_confirmed: false,
       transaction_status: "unknown", gui_transactions: [{ kind: "gui_transaction", mechanism: "visible_gui",
         operation_index: 0, receipt_ref: "server:prefix", input_application: "confirmed", effect_status: "confirmed",
         inventory_before: {}, inventory_after: {}, productions: [] }] } } };
@@ -173,7 +173,7 @@ async function residentUncertainty(f: ReturnType<typeof fixture>, sequence = 7) 
   retainResidentReceipt(f.store, f.adapter, owner, input, update);
   const receipt = f.store.eventsAfter(f.state.run.run_id, 0, 500).filter(event => event.type === "controller.receipted").at(-1)!;
   return { owner, receipt, scope, retire: () => f.store.event(f.state.run.run_id, "controller.retired",
-    "Actual native retirement; old effects are not reversed", jsonSchema.parse({ operation_id: `controller-owner-${sequence}`,
+    `Actual native retirement; old effects are not reversed${summaryPadding}`, jsonSchema.parse({ operation_id: `controller-owner-${sequence}`,
       ack: { owner: { operation_id: `controller-owner-${sequence}`, generation: 1, scope }, controller_generation: 3,
         admission_revoked: true, last_applied_sequence: sequence, ordered_edge_prefix: 1,
         retirement_applied_native_tick: 10, retirement_applied_native_ns: "123999",
@@ -562,6 +562,112 @@ test("action alternatives retain exact constraints under schema pressure and omi
   expect(context.requested_help.reduce((sum: number, entry: unknown) => sum + Buffer.byteLength(JSON.stringify(entry)), 0))
     .toBeLessThanOrEqual(24576);
   expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32768);
+});
+
+test("final SDK context allocates action contracts before historical unknown receipt detail", async () => {
+  const f = fixture();
+  const historical = [];
+  for (let sequence = 1; sequence <= 8; sequence++) {
+    const resident = await residentUncertainty(f, sequence, " historical-receipt-detail".repeat(20));
+    const retirement = resident.retire();
+    resident.owner.status = "cancelled"; resident.owner.ended_at = new Date().toISOString();
+    f.store.updateSkillExecution(resident.owner, "skill.closed", "Old owner terminal after retirement", { status: "cancelled" });
+    historical.push({ ...resident, retirement });
+  }
+  const program = await f.program(`/*${"s".repeat(2500)}*/return {status:"completed",summary:"retained-source",result:null};`);
+  const capability = f.adapter.action_capability!;
+  const branches = ["move", "craft"].map(kind => ({
+    type: "object", properties: { kind: { const: kind }, duration_ms: { type: "integer", minimum: 50, maximum: 2000 },
+      mode: { enum: ["first", "second"] } }, required: ["kind", "duration_ms", "mode"],
+    additionalProperties: false, description: `${kind} exact bounded contract ${"a".repeat(1700)}`,
+  }));
+  const programs = JSON.parse(JSON.stringify(programHelp("programs", f.adapter)));
+  f.state.helpResults.programs = programs;
+  f.state.helpResults.game = {
+    methods: { observe: { invocation: "await game.observe()", authority: "Fresh authorized observation only" } },
+    schemas: { capabilities: { [`${capability.id}@${capability.version}`]: {
+      $schema: "https://json-schema.org/draft/2020-12/schema", anyOf: branches,
+    } }, ObservationV3: { $schema: "https://json-schema.org/draft/2020-12/schema",
+      ...Object.fromEntries(Array.from({ length: 6 }, (_, index) => [`reference_${index}`, {
+        type: "string", description: "d".repeat(5000),
+      }])) } },
+  };
+  await f.planner.start(1);
+  await f.turn([f.requestHelp("programs"), f.requestHelp("game"), settlement()]);
+  await f.turn();
+  const request = f.state.requests.at(-1)!, context = retained(request)!;
+  expect(request.messages).toHaveLength(1);
+  expect(context.unresolved).toHaveLength(8);
+  expect(context.omitted_unknown_operations).toBe(0);
+  for (const [index, resident] of historical.entries()) {
+    expect(context.unresolved[index]).toMatchObject({
+      event_seq: resident.receipt.event_seq, status: "unknown", no_replay: true, historical: true, current_authority: false,
+      original_scope: resident.scope, input_id: `controller:${resident.owner.execution_id}:3:${index + 1}`,
+      input: { kind: "screen", operation_kinds: ["key", "close"],
+        confirmed_operation_indexes: [0], unconfirmed_operation_indexes: [1] },
+      containment: { event_seq: resident.retirement.event_seq, type: "controller.retired", emitter_closed: true,
+        world_effects_resolved: false, input_application: "confirmed" },
+    });
+  }
+  const omittedDetails = context.unresolved.flatMap((entry: any) => [entry, entry.containment])
+    .filter((entry: any) => entry.detail_omitted);
+  expect(omittedDetails.length).toBeGreaterThan(0);
+  expect(omittedDetails.every((entry: any) => !("summary" in entry) && !("result_summary" in entry))).toBe(true);
+  expect(context.omitted_records).toBeGreaterThanOrEqual(omittedDetails.length);
+  expect(JSON.stringify(context)).not.toContain("OLD_SCREEN_HANDLE");
+  expect(context.programs).toContainEqual(expect.objectContaining({ name: program.name, hash: program.hash, source: program.source }));
+  expect(context.programs).toContainEqual(expect.objectContaining({
+    name: "Resident 8", last_execution: expect.objectContaining({
+      historical: true, current_authority: false, status: "cancelled",
+      original_scope: expect.objectContaining({ world_id: historical[7]!.scope.world_id,
+        session_id: historical[7]!.scope.session_id, life_id: historical[7]!.scope.life_id }),
+    }),
+  }));
+  for (const [index, content] of branches.entries()) {
+    const path = ["schemas", "capabilities", `${capability.id}@${capability.version}`, "anyOf", index];
+    let reference = "", retainedAction: unknown;
+    for (let depth = 0; depth < path.length; depth++) {
+      const key = path[depth]!;
+      reference += typeof key === "number" ? `[${key}]` : `${depth ? "." : ""}${key}`;
+      const section = context.requested_help.find((entry: any) => entry.topic === "game" && entry.section === reference);
+      if (!section) continue;
+      retainedAction = path.slice(depth + 1).reduce((value: any, child) => value?.[child], section.content);
+      if (retainedAction !== undefined) break;
+    }
+    expect(retainedAction).toEqual(content);
+  }
+  for (const section of ["contract", "input_transitions", "gui_completion"])
+    expect(context.requested_help).toContainEqual({ topic: "programs", section: `resident.${section}`, content: programs.resident[section] });
+  expect(context.contracts.result).toContain("completed");
+  expect(context.contracts.freshness).toContain("historical reference only");
+  expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32 * 1024);
+  expect(context.programs.reduce((sum: number, entry: unknown) => sum + Buffer.byteLength(JSON.stringify(entry)), 0))
+    .toBeLessThanOrEqual(18 * 1024);
+  expect(context.requested_help.reduce((sum: number, entry: unknown) => sum + Buffer.byteLength(JSON.stringify(entry)), 0))
+    .toBeLessThanOrEqual(24 * 1024);
+  const stored = f.store.eventsAfter(f.state.run.run_id, historical[0]!.receipt.event_seq - 1, 1)[0]!;
+  expect((stored.details as any).update.result.summary).toContain("historical-receipt-detail");
+});
+
+test("low-pressure unknown evidence restoration retains original partial flags and known zero displacement", () => {
+  const f = fixture(), evidence = { navigation_stop_reason: "partial-reason".repeat(50), net_displacement: 0 };
+  const unknown = f.store.event(f.state.run.run_id, "runtime.uncertainty", "Historical operation with partial evidence", {
+    action_id: "partial-evidence-operation", result: { status: "unknown", evidence },
+  });
+  const containment = f.store.event(f.state.run.run_id, "runtime.uncertainty_blocked", "Emitter closed, effect unresolved", {
+    action_id: "partial-evidence-operation", result: { status: "unknown", evidence },
+  });
+  const context = JSON.parse(new StrategicContext(f.store).assemble(f.state.run)).strategic_context;
+  expect(context.unresolved[0]).toMatchObject({
+    event_seq: unknown.event_seq, no_replay: true, status: "unknown", evidence_omitted: true,
+    evidence: { navigation_stop_reason: evidence.navigation_stop_reason.slice(0, 400), net_displacement: 0 },
+    containment: { event_seq: containment.event_seq, evidence_omitted: true,
+      evidence: { navigation_stop_reason: evidence.navigation_stop_reason.slice(0, 400), net_displacement: 0 } },
+  });
+  expect(context.unresolved[0]).not.toHaveProperty("detail_omitted");
+  expect(context.unresolved[0].containment).not.toHaveProperty("detail_omitted");
+  expect(context.omitted_records).toBe(0);
+  expect((f.store.eventsAfter(f.state.run.run_id, unknown.event_seq - 1, 1)[0]!.details as any).result.evidence).toEqual(evidence);
 });
 
 for (const status of ["unknown", "refused"] as const) {

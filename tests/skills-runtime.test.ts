@@ -58,7 +58,7 @@ const success: GameActionResult = {
 type Runner = SandboxService["runSkill"];
 // Real generated-worker protocol, without claiming Docker isolation or starting
 // an external service. Only the transport below SkillManager is substituted.
-const generatedWorker: Runner = async (source, args, handle, _limits, signal, hooks) => {
+const generatedWorker: Runner = async (source, args, handle, limits, signal, hooks) => {
   const program = instrumentProgram(source);
   const receiver = new ProgramTraceReceiver(program);
   hooks?.onInstrumentation?.(program);
@@ -76,12 +76,21 @@ const generatedWorker: Runner = async (source, args, handle, _limits, signal, ho
   signal?.addEventListener("abort", expired, { once: true });
   worker.on("error", done.reject);
   worker.on("exit", code => done.reject(new Error(`Generated worker exited before completion: ${code}`)));
+  let calls = 0, actions = 0;
   worker.on("message", (encoded: string) => {
     void (async () => {
       const frame = JSON.parse(encoded);
       hooks?.onTrace?.(receiver.accept(frame.trace));
       if (frame.type === "skill_call") {
         try {
+          const action = frame.request.kind === "action" || frame.request.kind === "respawn";
+          // The real Docker transport can reject before the manager's broker:
+          // its independent local limits are the remaining root budget at start.
+          if (calls >= limits.max_calls || (action && actions >= limits.max_actions))
+            throw hooks?.onCapabilityBudgetExceeded?.(frame.request) ??
+              new Error("Worker transport capability budget exhausted");
+          calls++;
+          if (action) actions++;
           const value = await handle(frame.request);
           worker.postMessage({ v: 1, type: "skill_reply", id: frame.id, ok: true, value });
         } catch (error) {
@@ -311,7 +320,8 @@ describe("durable program execution through host capabilities", () => {
           const root = store.latestRootExecution(run.run_id)!;
           expect(errors).toMatchObject([{ error: { code: "invalid_request", retryable: false } }]);
           expect(store.skills(run.run_id)).toHaveLength(1);
-          expect(root).toMatchObject({ status: "cancelled", actions: expectedActions,
+          expect(root).toMatchObject({ status: "failed", actions: expectedActions,
+            diagnostic: { code: "budget_exceeded" },
             limits: { duration_ms: 120000, max_actions: expectedActions, max_calls: 256, max_depth: 8 } });
           expect(effects).toBe(expectedActions);
           expect(store.eventsAfter(run.run_id, 0, 1000).filter(event => event.type === "action.accepted")).toHaveLength(expectedActions);
@@ -832,6 +842,126 @@ return {status:"completed", summary:"Continued after two safely handled rejectio
       expect(execution.root_execution_id).toBe(result.execution_id);
     }
   });
+
+  for (const counter of ["actions", "calls"] as const) {
+    for (const composed of [false, true]) {
+      test(`aggregate root ${counter} exhaustion survives real-worker closure${composed ? " in a child" : ""}`, async () => {
+        let effects = 0, observations = 0, transportRejections = 0;
+        const failures: { code: string; message: string }[] = [];
+        const revoked: boolean[] = [];
+        const cleanupEntered = deferred<void>(), cleanup = deferred<void>();
+        const workerClosed = deferred<void>();
+        let workers = 0;
+        const runner: Runner = async (source, args, handle, limits, signal, hooks) => {
+          workers++;
+          try {
+            return await generatedWorker(source, args, async request => {
+              try { return await handle(request); }
+              catch (error) {
+                failures.push(capabilityFailure(error));
+                revoked.push(signal.aborted);
+                throw error;
+              }
+            }, limits, signal, {
+              ...hooks,
+              onCapabilityBudgetExceeded: request => {
+                transportRejections++;
+                const failure = hooks?.onCapabilityBudgetExceeded?.(request) ?? null;
+                if (failure) {
+                  failures.push(capabilityFailure(failure));
+                  revoked.push(signal.aborted);
+                }
+                return failure;
+              },
+            });
+          } finally {
+            if (--workers === 0) workerClosed.resolve();
+          }
+        };
+        const { store, run, manager } = fixture(runner, {
+          action: async () => { effects++; return success; },
+          observe: async () => { observations++; return authorizedObservation(); },
+          cancelActions: async () => { cleanupEntered.resolve(); await cleanup.promise; },
+        });
+        const body = `
+await game.action({kind:"look",yaw:0,pitch:0});
+await game.observe();
+try {
+  ${counter === "actions" ? 'await game.action({kind:"look",yaw:0,pitch:0});' : "await game.observe();"}
+} catch (error) {
+  await game.action({kind:"look",yaw:1,pitch:0});
+  await game.observe();
+}
+return {status:"completed",summary:"Must not override exhausted authority",result:null};
+`;
+        const child = composed ? await manager.register(run.run_id, {
+          entry: "run", name: "budget child", card, dependencies: [], source: body,
+        }) : null;
+        const root = await manager.register(run.run_id, {
+          entry: "run", name: "budget root", card,
+          dependencies: child ? [{ skill_id: child.skill_id, version: child.version }] : [],
+          source: child
+            ? 'await game.call({name:"budget child"},null);return {status:"completed",summary:"Must not complete after child exhaustion",result:null};'
+            : body,
+        });
+        const maxCalls = counter === "calls" ? (composed ? 3 : 2) : 10;
+        const accepted = manager.start(run.run_id, start(run, root, "worker-budget", null, {
+          duration_ms: 10000, max_actions: counter === "actions" ? 1 : 10,
+          max_calls: maxCalls, max_depth: 3,
+        }));
+        try {
+          await cleanupEntered.promise;
+          await workerClosed.promise;
+          expect(manager.pending).toBe(true);
+          const closing = manager.get(run.run_id, { execution_id: accepted.execution_id })!;
+          expect(closing.status).toBe("cancel_requested");
+          expect(manager.effectScope(accepted.execution_id)).toBeNull();
+          expect(failures[0]).toMatchObject({ code: "budget_exceeded" });
+          expect(transportRejections).toBe(1);
+          expect(revoked.every(Boolean)).toBe(true);
+          expect(failures[0]!.message).toContain(`max_${counter}`);
+          expect(failures[0]!.message).toContain(counter === "actions" ? "actions=1/1" : `calls=${maxCalls}/${maxCalls}`);
+          expect(failures[0]!.message).toContain("Inspect");
+          expect(effects).toBe(1);
+          expect(observations).toBe(1);
+        } finally {
+          cleanup.resolve();
+        }
+        await manager.closeAll("Join budget exhaustion");
+        const executions = store.skillExecutions(run.run_id);
+        expect(executions).toHaveLength(composed ? 2 : 1);
+        for (const execution of executions) {
+          expect(execution).toMatchObject({
+            status: "failed",
+            diagnostic: { type: "RuntimeFault", code: "budget_exceeded",
+              message: failures[0]!.message, source_hash: store.skill(run.run_id, execution).hash },
+            error: failures[0]!.message,
+            result: { status: "failed", summary: failures[0]!.message, result: null },
+          });
+          expect(manager.effectScope(execution.execution_id)).toBeNull();
+          const inspected = new ProgramWorkspace(store, run.run_id).executionView(execution);
+          expect(inspected!.diagnostic).toMatchObject({ code: "budget_exceeded", message: failures[0]!.message });
+        }
+        const outcome = manager.get(run.run_id, { execution_id: accepted.execution_id })!;
+        expect(outcome.calls).toBe(composed ? 3 : 2);
+        expect(outcome.actions).toBe(1);
+        if (composed)
+          expect(executions.find(execution => execution.parent_execution_id !== null)).toMatchObject({ calls: 2, actions: 1 });
+        const closures = store.eventsAfter(run.run_id, 0, 1000).filter(event => event.type === "skill.closed");
+        expect(closures).toHaveLength(executions.length);
+        for (const event of closures)
+          expect(event.details).toMatchObject({ details: {
+            diagnostic: { code: "budget_exceeded", message: failures[0]!.message },
+          } });
+        expect(manager.pending).toBe(false);
+        expect(effects).toBe(1);
+        expect(observations).toBe(1);
+        const publicEvidence = JSON.stringify({ executions, failures, closures });
+        for (const privateDetail of ["/private/", "node:internal", "skills.ts", "at SkillManager"])
+          expect(publicEvidence).not.toContain(privateDetail);
+      });
+    }
+  }
 
   test("an undeclared named dependency cannot acquire a child execution", async () => {
     let dependency: SkillRef;

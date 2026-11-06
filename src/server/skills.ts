@@ -382,6 +382,8 @@ export class SkillManager {
             this.remaining(live),
             live.controller.signal,
             {
+              onCapabilityBudgetExceeded: request =>
+                this.exhaustedBudget(live, request.kind === "action" || request.kind === "respawn"),
               onTiming: (event) => {
                 this.trace.span(view, event.phase, event.started_monotonic_ms, event.ended_monotonic_ms,
                   { life_id: live.lifeId }, event.confirmed);
@@ -453,7 +455,7 @@ export class SkillManager {
         this.save(
           live,
           "skill.closed",
-          outcome?.summary ?? view.error ?? "Skill execution closed",
+          view.diagnostic?.message ?? outcome?.summary ?? view.error ?? "Skill execution closed",
           view.diagnostic ? { diagnostic: view.diagnostic as unknown as Json } : {},
         );
         this.live.delete(view.execution_id);
@@ -574,19 +576,43 @@ export class SkillManager {
       throw new Error("Skill authority revoked");
     this.host.authorize(live.scope);
   }
-  private consume(live: Live, action: boolean): void {
+  private exhaustedBudget(live: Live, action: boolean): RuntimeFault | null {
     const root = live.root;
     if (root.view.entry !== "run") throw new Error("Resident entries cannot acquire finite capability authority");
     if (
       root.view.calls >= root.view.limits.max_calls ||
       (action && root.view.actions >= root.view.limits.max_actions)
     ) {
-      this.revoke(root, "Aggregate root skill budget exhausted");
-      void this.closeTree(root, "Aggregate root skill budget exhausted").catch(
+      const exhausted = [
+        ...(root.view.calls >= root.view.limits.max_calls ? ["max_calls"] : []),
+        ...(action && root.view.actions >= root.view.limits.max_actions ? ["max_actions"] : []),
+      ].join(" and ");
+      const failure = new RuntimeFault("budget_exceeded",
+        `Aggregate root skill budget exhausted: ${exhausted} (calls=${root.view.calls}/${root.view.limits.max_calls}, actions=${root.view.actions}/${root.view.limits.max_actions}). No additional capability admitted; execution authority revoked. Inspect execution evidence and adapt the bounded program flow before a new execution.`);
+      // Abort wins the sandbox's failure race. Retain this trusted cause before
+      // revocation so worker cancellation cannot replace it with a generic error.
+      const retain = (node: Live): void => {
+        if (!terminal.has(node.view.status)) {
+          node.abortStatus = "failed";
+          node.view.diagnostic = programDiagnostic(failure, node.scope.source_hash);
+          node.view.error = failure.message;
+          node.view.result = { status: "failed", summary: failure.message, result: null };
+        }
+        for (const child of node.children) retain(child);
+      };
+      retain(root);
+      this.revoke(root, failure.message);
+      void this.closeTree(root, failure.message).catch(
         () => this.host.changed(true),
       );
-      throw new Error("Aggregate root skill budget exhausted");
+      return failure;
     }
+    return null;
+  }
+  private consume(live: Live, action: boolean): void {
+    const failure = this.exhaustedBudget(live, action);
+    if (failure) throw failure;
+    const root = live.root;
     root.view.calls++;
     if (action) root.view.actions++;
     this.save(root, "skill.budget", "Root shared capability budget consumed", {

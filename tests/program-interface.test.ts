@@ -286,7 +286,7 @@ for (const toolName of ["program_submit", "program_run"] as const) {
       expect(Date.parse(execution.deadline_at) - Date.parse(execution.started_at ?? execution.deadline_at)).toBeLessThanOrEqual(expected.duration_ms);
       await waitClosed(f.store, f.run.run_id, execution.execution_id);
       const closed = f.store.skillExecution(f.run.run_id, { execution_id: execution.execution_id })!;
-      expect(closed.status).toBe("cancelled");
+      expect(closed).toMatchObject({ status: "failed", diagnostic: { code: "budget_exceeded" } });
       expect(closed.actions).toBe(expected.max_actions);
       expect(f.actions()).toBe(expected.max_actions);
       expect(f.dispatches()).toBe(1);
@@ -338,7 +338,7 @@ for (const [form, limits, expectedActions] of [
     expect(successor.limits).toEqual({ duration_ms: 120000, max_actions: expectedActions, max_calls: 256, max_depth: 8 });
     await waitClosed(f.store, f.run.run_id, successor.execution_id);
     expect(f.store.skillExecution(f.run.run_id, { execution_id: successor.execution_id })).toMatchObject({
-      status: "cancelled", actions: expectedActions,
+      status: "failed", actions: expectedActions, diagnostic: { code: "budget_exceeded" },
     });
     expect(f.actions()).toBe(expectedActions);
   });

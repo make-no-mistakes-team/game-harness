@@ -57,6 +57,8 @@ export interface SkillSandboxHooks {
     sequence: number;
     request: SkillCapabilityRequest;
   }): void;
+  /** Synchronous pre-broker rejection; the owner may retain a trusted aggregate cause. */
+  onCapabilityBudgetExceeded?(request: SkillCapabilityRequest): Error | null;
   /** Values originate in the authorized host broker, never container assertions. */
   onCapabilityResult?(event: {
     sequence: number;
@@ -885,13 +887,15 @@ class DockerSkillWorker {
             const request = skillCapability(frame.request);
             if (++this.calls > limits.max_calls)
               return this.fail(
-                new Error("Skill exceeded its host-call budget."),
+                hooks.onCapabilityBudgetExceeded?.(request) ??
+                  new Error("Skill exceeded its host-call budget."),
               );
             if (
               (request.kind === "action" || request.kind === "respawn") &&
               ++this.actions > limits.max_actions
             )
-              return this.fail(new Error("Skill exceeded its action budget."));
+              return this.fail(hooks.onCapabilityBudgetExceeded?.(request) ??
+                new Error("Skill exceeded its action budget."));
             this.sequence++;
             this.phase = "waiting";
             // This frame comes ONLY through the trusted guardian AFTER Docker

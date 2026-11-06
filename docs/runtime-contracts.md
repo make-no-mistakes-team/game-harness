@@ -214,6 +214,19 @@ Strategic `action_submit` and `action_cancel` tools and aliases are removed. All
 
 A safely settled failed action or blocked/failed child returns to the authored caller for its own correction. It does not automatically kill the root. Unknown effects, reconnect requirements, actual cancellation/preemption, death, pause and stop fence the execution tree; generated error handling cannot bypass that fence.
 
+Aggregate root action/call exhaustion records `RuntimeFault` / `budget_exceeded`
+with the exhausted `max_actions` or `max_calls` limit and exact root
+`calls=used/cap`, `actions=used/cap` counts. Children share those counters.
+The rejected capability consumes no additional call or action. The sandbox's
+independent local guard notifies the owner before closing, even when it rejects
+the request before broker dispatch. The owner confirms exhaustion from its
+aggregate counters and retains the trusted diagnostic before synchronously
+revoking the tree, then waits for
+worker and capability drain before closing it as failed; unconfirmed cleanup
+remains unknown. Generated error handling cannot restore authority or turn that
+failure into completion. Inspect execution evidence and adapt the bounded
+program flow before a new execution. Arbitrary host errors remain redacted.
+
 Registered capability schema rejection is `invalid_request` before action admission. Its bounded diagnostic names trusted schema parameters and numeric constraints where available, including a navigation range below its advertised minimum. This classification belongs to the registered request boundary; arbitrary backend validation exceptions remain redacted backend failures. Pre-admission rejection does not fabricate native neutralization or effect evidence.
 
 For a safely settled no-effect target rejection, the running procedure may obtain a fresh observation and select fresh work within its existing budgets. This grants no stale-target reuse or replay of an unknown effect. A disappearing drop and an inventory increase alone do not establish that a particular interrupted pickup was confirmed.

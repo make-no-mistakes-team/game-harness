@@ -252,15 +252,32 @@ test("idle development uses only production observations and Runtime verifies it
   expect(result.unhandled).toEqual([]);
 }, 15000);
 
-test("Minecraft development bounds real SDK transport and keeps the stone criterion for the full request", async () => {
+test("Minecraft development stops at the next denied request without cancelling the final response or inventing empty planning turns", async () => {
   const result = await acceptanceLifecycle("development-request-cap-non-goal");
   expect(result.providerCalls).toBe(1);
   expect(result.report.development_host_admissions).toBe(1);
-  expect(result.report.development_request_ownership).toEqual([expect.objectContaining({ drained: true })]);
+  expect(result.requestCapResponseAbortedBeforeDelivery).toBe(false);
+  expect(result.developmentCapPrograms).toEqual([{ name: "slot-private-repair", version: 1 }]);
+  expect(result.report.development_request_ownership).toEqual([expect.objectContaining({ transport_closed: true, drained: true })]);
+  expect(result.report.last_stop_reason).toBe("host_request_admission_bound_reached");
+  expect(result.report.development_host_request_admission_refused).toBe(true);
+  expect(result.report.results[0].runtime_status).toBe("stopped");
+  expect(result.report.results[0].outcome.classification_reason).toContain("host_request_admission_bound_reached");
   expect(result.report.results[0].verifier_manifest.goal.goal_id).toBe("craft_stone_pickaxe");
   expect(result.report.results[0].outcome.goal_verified).toBe(false);
+  const events = result.journals.flatMap((journal: string) => journal.trim().split("\n").map(line => JSON.parse(line)))
+    .filter((record: { kind: string }) => record.kind === "store_event").map((record: { value: any }) => record.value);
+  expect(events.filter((event: any) => event.type === "model.call")).toHaveLength(1);
+  expect(events.filter((event: any) => event.type === "model.tool_finished" && event.details.tool === "program_write"))
+    .toEqual([expect.objectContaining({ details: expect.objectContaining({ rejected: false }) })]);
+  expect(events.filter((event: any) => event.type === "scheduler.turn_finished" && event.details.calls === 0)).toEqual([]);
+  expect(events.filter((event: any) => event.type === "scheduler.planning_stalled")).toEqual([]);
   expect(result.attempts).toHaveLength(1);
+  expect(result.attempts[0].state).toBe("settled");
   expect(result.report.cleanup_confirmed).toBe(true);
+  expect(result.report.resource_cleanup.every((resource: { closed: boolean }) => resource.closed)).toBe(true);
+  expect(result.unchangedAfterReturn).toBe(true);
+  expect(result.unhandled).toEqual([]);
 }, 15000);
 
 for (const mode of ["sigint", "sigterm", "deadline"]) {

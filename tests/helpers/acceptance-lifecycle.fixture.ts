@@ -229,6 +229,7 @@ const actorContexts: string[] = [];
 const earlyIterator = cancelBeforeIterator ? { entered: Promise.withResolvers<void>(), release: Promise.withResolvers<void>() } : null;
 let originalIteratorReads = 0, originalIteratorReturns = 0, originalIteratorClosed = false;
 let returnedBeforeTransportRelease: boolean | null = null, requestSignalAbortedBeforeRead = false;
+let requestCapResponseAbortedBeforeDelivery: boolean | null = null;
 const stream: StreamFn = (_model, context, options) => {
   providerCalls++;
   const request = providerCalls;
@@ -268,6 +269,13 @@ const stream: StreamFn = (_model, context, options) => {
       paritySnapshot(request, "request_held");
       deliver();
     })());
+  } else if (developmentMode && requestCapNonGoal) {
+    // The last admitted response must retain authority through delivery and
+    // its real program_write. Only the following request may trigger Stop.
+    void Bun.sleep(25).then(() => {
+      requestCapResponseAbortedBeforeDelivery = options?.signal?.aborted === true;
+      deliver();
+    });
   } else deliver();
   if (earlyIterator) {
     // This is the actual external stream-acquisition seam. The real Agent's
@@ -424,8 +432,8 @@ const commonOptions = { allowNative: true, allowInference: true, authDirectory, 
   scenario: budgetMode || mode === "complete-persistence" || imageFailure || manifestFailure || studyMode ? "collect_wood" as const : "all" as const, modelId: model.id,
   purpose: "justified_acceptance", justification: "Isolated local synthetic cancellation integration; never a provider or gameplay proof",
   caps: { hostRequestAdmissions: mode === "request-cap" || requestCapNonGoal ? 1 : 30,
-    totalMs: earlyDeadlineSignal ? 25200 : preparationExpired || preparationBounded ? 600 : finalVerificationBudget ? 1200 : finalPersistenceBudget ? 2500 : imageFailure || observerParity ? 10000 : planningStalled ? 20000 : mode === "deadline" ? 3000 : 6000,
-    runMs: budgetMode ? 500 : imageFailure || observerParity ? 8000 : planningStalled ? 15000 : 1000, cleanupMs: earlyDeadlineSignal ? 25000 : budgetMode ? 100 : 300, authMs: budgetMode ? 500 : 1000, discoveryMs: budgetMode ? 500 : 1000,
+    totalMs: earlyDeadlineSignal ? 25200 : preparationExpired || preparationBounded ? 600 : finalVerificationBudget ? 1200 : finalPersistenceBudget ? 2500 : imageFailure || observerParity ? 10000 : planningStalled || developmentMode && requestCapNonGoal ? 20000 : mode === "deadline" ? 3000 : 6000,
+    runMs: budgetMode ? 500 : imageFailure || observerParity ? 8000 : planningStalled || developmentMode && requestCapNonGoal ? 15000 : 1000, cleanupMs: earlyDeadlineSignal ? 25000 : budgetMode ? 100 : 300, authMs: budgetMode ? 500 : 1000, discoveryMs: budgetMode ? 500 : 1000,
     startMs: budgetMode ? 500 : 1000, observationMs: 500, diagnosticsMs: finalVerificationBudget ? 1100 : 500, pollMs: 5 } } as const;
 const submittedAt = performance.now();
 const acceptance = runAgentAcceptance(studySelection ? { ...commonOptions, study: studySelection } :
@@ -501,6 +509,12 @@ async function observeResult() {
     .filter(path => before[path] !== after[path]).map(path => ({ path, before: before[path] ?? null, after: after[path] ?? null }));
   let rendererAlive = false; if (rendererPid !== null) { try { process.kill(rendererPid, 0); rendererAlive = true; } catch {} }
   const report = JSON.parse(await readFile(join(evidenceDirectory, "report.json"), "utf8"));
+  let developmentCapPrograms = null;
+  if (developmentMode && requestCapNonGoal) {
+    const owned = new Store(ownedRuntimeRoot);
+    try { developmentCapPrograms = owned.skills(report.results[0].run_id).map(program => ({ name: program.name, version: program.version })); }
+    finally { owned.close(); }
+  }
   let coldIsolation = null;
   if (mode === "cold-isolation") {
     const owned = new Store(ownedRuntimeRoot);
@@ -541,6 +555,7 @@ async function observeResult() {
     attempts, study, startupReservationSeen, authReservationSeen, fixtureConditions, coldIsolation, nextAdmission, report, manifests, journals, lateWrites, unhandled,
     manifestPersistenceError, storeClosedAt, storeClosedWhileReaderHeld, returnedWhileReaderHeld, readerAliveWhileHeld, readerBeforeClose, readerAtStoreClose,
     originalIteratorReads, originalIteratorReturns, originalIteratorClosed, returnedBeforeTransportRelease, requestSignalAbortedBeforeRead,
+    requestCapResponseAbortedBeforeDelivery, developmentCapPrograms,
     postReturnChanges, unchangedAfterReturn: postReturnChanges.length === 0 }), { mode: 0o600 });
   await Bun.write(Bun.stdout, "ACCEPTANCE_RESULT fixture-result.json\n");
  } finally {

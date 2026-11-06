@@ -261,8 +261,15 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
         performance.now() < developmentDeadline, "Development attempt has no live finite reservation");
       requireProof(config && model.id === config.model.id && model.provider === authenticatedProvider,
         "Development transport mismatches its declared model/account provider");
-      requireProof(!developmentRequests.has(requestId) && developmentRequests.size < caps.hostRequestAdmissions,
-        "Development pre-transport request allowance exhausted");
+      requireProof(!developmentRequests.has(requestId), "Development request already has an admitted owner");
+      if (developmentRequests.size >= caps.hostRequestAdmissions) {
+        // Refuse the NEXT call, after the last admitted response and its tools.
+        // Fence synchronously so the planner cannot count this host refusal as
+        // empty model work while the existing Stop owner joins actual drain.
+        report.development_host_request_admission_refused = true;
+        if (activeRun) stop(activeRun, "host_request_admission_bound_reached");
+        throw new Error("Development pre-transport request allowance exhausted");
+      }
       developmentRequests.set(requestId, { transport_closed: null, drained: false });
     },
     transportEnded(requestId, closed) {
@@ -631,6 +638,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       platformChecksComplete: neutral && connected && baselinePreserved && summary.observer_error === null && !caseFailure && !summary.unclassified_tool_failures && !unclassifiedRuntimeFailure,
       confirmedHarnessFaults: harnessFaults, providerError: summary.provider_error, providerSettled: summary.provider_settled,
       reasons: [...(deadlineReached ? ["finite_run_deadline_reached"] : []), ...(caseFailure ? ["case_ended_with_unclassified_error"] : []),
+        ...(report.development_host_request_admission_refused === true ? ["host_request_admission_bound_reached"] : []),
         ...(ordinaryPlanningFailure ? ["planning_stalled"] : []),
         ...(ordinaryVerifierFailure ? ["adapter_verifier_failed"] : []),
         ...(summary.unclassified_tool_failures ? ["tool_failure_requires_classification"] : []),

@@ -498,6 +498,8 @@ export class GameBridgeClient implements GameBridge {
   private heartbeat: NodeJS.Timeout | null = null;
   private closing: Promise<void> | null = null;
   private neutralizing: Promise<void> | null = null;
+  private emergencyStopping: Promise<void> | null = null;
+  private cancellationBarrierPending: Promise<void> | null = null;
   private frameStarted = 0;
   private nativeMetrics: Json = null;
   private readonly controlTimeline = new NativeControlTimeline();
@@ -1648,32 +1650,58 @@ export class GameBridgeClient implements GameBridge {
       if (this.neutralizing === barrier) this.neutralizing = null;
     }
   }
-  private async cancellationBarrier(params: unknown) {
-    if (!this.control || this.control.destroyed)
-      throw new Error(
-        "Native input barrier is unavailable; no neutralization proof exists.",
-      );
-    const minimum = this.generation,
-      owned = this.owned;
-    const ack = z
-      .object({
-        neutralized: z.literal(true),
-        matched_owner: z.boolean(),
-        generation: safeCounterSchema,
-        session_id: identitySchema,
-        life_id: safeCounterSchema,
-      })
-      .strict()
-      .parse(await this.request("cancel", params, 5000));
-    if (
-      !owned ||
-      this.owned !== owned ||
-      ack.session_id !== owned.session.session_id ||
-      ack.generation < minimum ||
-      (ack.matched_owner && ack.generation <= minimum)
-    )
-      throw new Error("Native input barrier has stale authority.");
-    this.generation = Math.max(this.generation, ack.generation);
+  private async cancellationBarrier(
+    params:
+      | { emergency: true }
+      | { expected_owner: EffectOwnerRef & { generation: number } },
+  ) {
+    const previous = this.cancellationBarrierPending,
+      owned = this.owned,
+      control = this.control;
+    // Native has one reserved retirement slot through its drained ACK.
+    // Callers coalesce to one owner cancellation and one emergency Stop;
+    // serialize that bounded pair without restarting the predecessor's timer.
+    const barrier = (async () => {
+      if (previous) await previous;
+      if (
+        !owned ||
+        this.owned !== owned ||
+        !control ||
+        this.control !== control ||
+        control.destroyed
+      )
+        throw new Error(
+          "Native input barrier is unavailable; no neutralization proof exists.",
+        );
+      const minimum = this.generation;
+      const ack = z
+        .object({
+          neutralized: z.literal(true),
+          matched_owner: z.boolean(),
+          generation: safeCounterSchema,
+          session_id: identitySchema,
+          life_id: safeCounterSchema,
+        })
+        .strict()
+        .parse(await this.request("cancel", params, 5000));
+      if (
+        this.owned !== owned ||
+        this.control !== control ||
+        ack.session_id !== owned.session.session_id ||
+        ack.generation < minimum ||
+        (ack.matched_owner && ack.generation <= minimum) ||
+        ("emergency" in params && !ack.matched_owner)
+      )
+        throw new Error("Native input barrier has stale authority.");
+      this.generation = Math.max(this.generation, ack.generation);
+    })();
+    this.cancellationBarrierPending = barrier;
+    try {
+      await barrier;
+    } finally {
+      if (this.cancellationBarrierPending === barrier)
+        this.cancellationBarrierPending = null;
+    }
   }
   async cancel(_reason: string, owner: EffectOwnerRef) {
     // Expected-owner cleanup cannot claim closure while a prior terminal owner
@@ -1707,10 +1735,19 @@ export class GameBridgeClient implements GameBridge {
       }
       return;
     }
+    if (this.emergencyStopping) return this.emergencyStopping;
+    const stopping = (async () => {
+      try {
+        await this.cancellationBarrier({ emergency: true });
+      } catch {
+        await this.terminate("Native emergency Stop could not be acknowledged.");
+      }
+    })();
+    this.emergencyStopping = stopping;
     try {
-      await this.cancellationBarrier({ emergency: true });
-    } catch {
-      await this.terminate("Native emergency Stop could not be acknowledged.");
+      await stopping;
+    } finally {
+      if (this.emergencyStopping === stopping) this.emergencyStopping = null;
     }
   }
   async disconnect() {

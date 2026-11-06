@@ -188,6 +188,14 @@ Record operator pause intervals separately from LLM waits, meaningful game waits
 
 Stop has highest priority. It closes admission, revokes generated work/provider callbacks, cancels actions, confirms neutral controls and worker/planner/action drain, then durably closes the run. A healthy playing session and authentic video remain connected. Stop world, world replacement and application close explicitly own session shutdown. If contact is lost and effect safety cannot be confirmed, fail closed and preserve stop intent during recovery. `stopped` means safe run closure, not merely a clicked button.
 
+The native retirement lane has one slot through its drained acknowledgement.
+Overlapping owner cancellation and global Stop are serialized; duplicate Stop
+requests share their pending barrier. Each successor uses the generation after
+the preceding acknowledgement, while expected-owner cleanup retains its original
+owner identity. Global Stop requires a matched-owner neutralization receipt.
+Invalid or unconfirmed receipts still fence the emitter; prior unknown effects
+remain unknown after safe drain.
+
 The operator view separates acting, program execution, model thinking, waiting, blocked work and recovery from paused/closing states. Progress records retain event sequence, time and execution identity with `model_program`/`unverified` provenance. **Model request failed · paused** reports a failed request, not a diagnosed provider-wide outage. Inspect its cause and connection state; refresh model discovery where appropriate before explicit Resume. Reauthorization requires Stop first. **Stopping** remains pending until cleanup is confirmed; **Retry Stop** retries cleanup after a recorded error, not gameplay. A stopped run cannot Resume.
 
 The emergency procedure must include a trusted path independent of generated workers and ordinary inference: fence adapter effect admission, terminate the emitting worker/adapter process if necessary, and establish session disconnect or neutralized controls according to the declared game protocol. Closing the browser is not this procedure. A graceful shutdown first requests normal stop, then closes trusted storage and owned processes. An abrupt process kill is recorded as a failure/recovery event; it is not evidence of cancellation.

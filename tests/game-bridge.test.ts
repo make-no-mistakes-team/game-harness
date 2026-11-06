@@ -1974,6 +1974,183 @@ test("authoritative death preserves session/video/unknown history; explicit resp
     await f.close();
   }
 }, 10000);
+for (const order of ["owner-first", "stop-first"] as const) {
+  test(`overlapping ${order} cancellation and Stop drain the single native retirement slot without closing a healthy session`, async () => {
+    const f = fixture();
+    try {
+      const peer = await f.channel("control"),
+        effect = envelope(
+          {
+            kind: "dig",
+            target: {
+              target_id: "deadline-dig",
+              incarnation: 1,
+              space: { dimension_id: "minecraft:overworld", space_epoch: 1 },
+              life_id: 1,
+            },
+          },
+          f.session,
+        ),
+        emitted = Promise.withResolvers<WireRequest>(),
+        firstBarrier = Promise.withResolvers<WireRequest>(),
+        barriers: WireRequest[] = [],
+        abort = new AbortController();
+      let nativeGeneration = 1;
+      const acknowledge = (request: WireRequest) => {
+        const matched = request.params.emergency === true || nativeGeneration === 1;
+        if (matched) nativeGeneration++;
+        reply(peer, request.id, {
+          neutralized: true,
+          matched_owner: matched,
+          generation: nativeGeneration,
+          session_id: f.session.session_id,
+          life_id: 1,
+        });
+      };
+      requests(peer, (request) => {
+        if (request.method === "execute") emitted.resolve(request);
+        if (request.method === "cancel") {
+          barriers.push(request);
+          if (barriers.length === 1) firstBarrier.resolve(request);
+          else acknowledge(request);
+        }
+        if (request.method === "ping") reply(peer, request.id, {});
+      });
+      const executing = f.bridge.execute(effect, abort.signal),
+        executeRequest = await emitted.promise;
+      let stopping: Promise<void>;
+      if (order === "owner-first") {
+        abort.abort();
+        await firstBarrier.promise;
+        stopping = f.bridge.emergencyStop("Finite gameplay deadline");
+      } else {
+        stopping = f.bridge.emergencyStop("Finite gameplay deadline");
+        await firstBarrier.promise;
+        abort.abort();
+      }
+      const duplicateStop = f.bridge.emergencyStop("Same finite deadline");
+      const first = await firstBarrier.promise;
+      // The game thread drains the old effect before publishing the reserved ACK.
+      reply(peer, executeRequest.id, {
+        operation_id: effect.operation_id,
+        compatibility_hash: effect.compatibility_hash,
+        scope: effect.scope,
+        result: {
+          status: "unknown",
+          summary: "The prior dig outcome remains unconfirmed.",
+          evidence: { effect_confirmed: false, neutralized_effect: false },
+        },
+      });
+      acknowledge(first);
+      await Promise.all([stopping, duplicateStop]);
+      expect(await executing).toMatchObject({
+        status: "unknown",
+        evidence: { effect_confirmed: false, neutralized_effect: false },
+      });
+      expect(f.child.killed).toBe(false);
+      expect(f.bridge.snapshot().status).toBe("connected");
+      expect(f.bridge.snapshot().error).toBeNull();
+      expect(barriers).toHaveLength(2);
+      expect(barriers[0]!.generation).toBe(1);
+      expect(barriers[1]!.generation).toBe(2);
+      const ownerRequest = barriers.find(
+        (request) => request.params.expected_owner,
+      )!;
+      expect(ownerRequest.params.expected_owner).toMatchObject({
+        operation_id: effect.operation_id,
+        scope: effect.scope,
+        generation: 1,
+      });
+      expect(nativeGeneration).toBe(order === "owner-first" ? 3 : 2);
+      await Reflect.get(f.bridge, "request").call(f.bridge, "ping", {}, 1000);
+      expect(Reflect.get(f.bridge, "generation")).toBe(nativeGeneration);
+    } finally {
+      await f.close();
+    }
+  }, 10000);
+}
+test("an emergency Stop cannot accept an unmatched-owner ACK as global neutralization", async () => {
+  const f = fixture();
+  try {
+    const peer = await f.channel("control");
+    requests(peer, (request) =>
+      reply(peer, request.id, {
+        neutralized: true,
+        matched_owner: false,
+        generation: request.generation,
+        session_id: f.session.session_id,
+        life_id: 1,
+      }),
+    );
+    await Promise.all([
+      f.bridge.emergencyStop("Invalid global ACK"),
+      f.bridge.emergencyStop("Same invalid global ACK"),
+    ]);
+    expect(f.child.killed).toBe(true);
+    expect(f.bridge.snapshot().status).toBe("error");
+    expect(f.bridge.snapshot().error).toBe(
+      "Native emergency Stop could not be acknowledged.",
+    );
+  } finally {
+    await f.close();
+  }
+}, 10000);
+for (const invalid of [
+  "stale-generation",
+  "foreign-session",
+  "not-neutralized",
+  "native-error",
+] as const) {
+  test(`overlapping Stop fails closed on ${invalid} owner ACK without replaying the unknown effect`, async () => {
+    const f = fixture();
+    try {
+      const peer = await f.channel("control"),
+        effect = envelope(ordinaryInput, f.session),
+        emitted = Promise.withResolvers<void>(),
+        received = Promise.withResolvers<WireRequest>(),
+        methods: string[] = [],
+        abort = new AbortController();
+      requests(peer, (request) => {
+        methods.push(request.method);
+        if (request.method === "execute") emitted.resolve();
+        if (request.method === "cancel") received.resolve(request);
+      });
+      const executing = f.bridge.execute(effect, abort.signal);
+      await emitted.promise;
+      abort.abort();
+      const request = await received.promise,
+        stopping = f.bridge.emergencyStop("Overlapping invalid owner ACK");
+      if (invalid === "native-error")
+        peer.write(
+          JSON.stringify({
+            id: request.id,
+            ok: false,
+            error: "Native retirement failed.",
+          }) + "\n",
+        );
+      else
+        reply(peer, request.id, {
+          neutralized: invalid !== "not-neutralized",
+          matched_owner: true,
+          generation: invalid === "stale-generation" ? 1 : 2,
+          session_id:
+            invalid === "foreign-session" ? randomUUID() : f.session.session_id,
+          life_id: 1,
+        });
+      await stopping;
+      expect(await executing).toMatchObject({
+        status: "unknown",
+        requires_reconnect: true,
+        evidence: { effect_confirmed: false, neutralized_effect: false },
+      });
+      expect(methods).toEqual(["execute", "cancel"]);
+      expect(f.child.killed).toBe(true);
+      expect(f.bridge.snapshot().status).toBe("error");
+    } finally {
+      await f.close();
+    }
+  }, 10000);
+}
 test("expected-owner barrier accepts its ACK before newer death notice without advancing the native clock speculatively", async () => {
   const f = fixture(adapter, true);
   try {

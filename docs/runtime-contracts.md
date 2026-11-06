@@ -1484,6 +1484,14 @@ same coordinates.
 
 For native movement, release motor controls at the declared duration before one ordered own-server inventory receipt. Only an actual authenticated receipt can mark inventory confirmation. A missing receipt at the bounded three-second deadline leaves the effect `unknown`; it cannot be replaced by local prediction or a fabricated confirmation flag. A separately confirmed native neutralization barrier can retain a healthy session/video without claiming effect certainty. Only unconfirmable control/emitter safety requires fail-closed client closure before renewed authority.
 
+`interact` refuses a current dropped `ItemEntity` before closing a handled screen,
+aiming or sending interaction packets, returning `failed` with no world effect or
+camera change. Vanilla collects dropped items through proximity, not right-click;
+ordinary movement or navigation can approach them, and collection requires a fresh
+own inventory receipt. The refusal does not select a target, perform movement or
+change historical unknown receipts. Block/entity interactions and raw held-use
+semantics otherwise retain their existing contracts.
+
 Navigation toward a selected visible item can outlive the entity when pickup removes it before the requested range is sampled. If it disappears within two blocks after movement was emitted, the native helper neutralizes immediately and allows at most 1,500 ms for an authoritative own inventory gain of the selected item type. That gain can confirm completion; disappearance alone, despawn, no gain or a late/missing receipt remains unknown. The helper does not select a resource or replay an uncertain effect.
 
 Once a requested table opens its crafting grid, recipe transfers bind to that exact `CraftingScreenHandler`. Vanilla interaction updates still revoke old block handles, but do not invalidate an already-owned open grid. Replacing the handler stops further recipe clicks; life, space, owner and finite action limits remain enforced.

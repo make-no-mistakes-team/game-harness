@@ -2581,6 +2581,13 @@ public final class NativeClient implements ClientModInitializer {
         finish("failed", "Interaction arrival requires a block target; entity targets support position arrival only", false);
         return;
       }
+      if (kind.equals("interact") && targetEntityBinding instanceof ItemEntity) {
+        finish("failed",
+            "Dropped items are proximity pickups, not right-click interactions. "
+                + "Approach with ordinary movement or navigation, then confirm collection from a fresh inventory receipt",
+            false);
+        return;
+      }
       // Expected screen is an apply-time precondition. Only after the actual
       // baseline and target checks may this owner perform its own UI transition.
       if (client.currentScreen instanceof HandledScreen<?>) {

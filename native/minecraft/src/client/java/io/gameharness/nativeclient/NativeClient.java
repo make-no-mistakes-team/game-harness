@@ -2640,8 +2640,23 @@ public final class NativeClient implements ClientModInitializer {
         duration = VisibleInventory.craftMillis(action.get("executions").getAsInt());
         if (tableReference != null) {
           target = tableBinding;
-          if (!reachable(target)) {
-            finish("failed", "Crafting table is not currently visible and reachable", false);
+          String tableRefusal = null;
+          if (target == null)
+            tableRefusal = "Supplied crafting table has no current target binding";
+          else if (!(client.player.getEyePos().squaredDistanceTo(target.toCenterPos()) <= 25))
+            tableRefusal = "Supplied crafting table is beyond interaction reach";
+          else if (!clearLine(target.toCenterPos(), target)
+              || !client.world.raycast(
+                  new RaycastContext(
+                      client.player.getEyePos(),
+                      target.toCenterPos(),
+                      RaycastContext.ShapeType.OUTLINE,
+                      RaycastContext.FluidHandling.NONE,
+                      client.player))
+                  .getBlockPos().equals(target))
+            tableRefusal = "Line of sight to supplied crafting table is blocked or unavailable";
+          if (tableRefusal != null) {
+            finish("failed", tableRefusal, false);
             return;
           }
           aim(target.toCenterPos());
@@ -3131,7 +3146,7 @@ public final class NativeClient implements ClientModInitializer {
             if (looking && !aligned()) return;
             issued = Recipes.begin(client, action, target, this::inventoryAuthority);
             if (!issued) {
-              finish("failed", "No unlocked compatible recipe or reachable crafting grid", false);
+              finish("failed", Recipes.beginRefusalReason(), false);
               return;
             }
             if (tableReference != null) emissions |= EffectOutcome.WORLD_EFFECT;

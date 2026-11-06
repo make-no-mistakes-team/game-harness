@@ -55,6 +55,7 @@ export type MinecraftAction =
 const vector = z.object({ x: z.number().finite(), y: z.number().finite(), z: z.number().finite() }).strict();
 const timestamp = z.string().min(1).max(40);
 const itemName = z.string().regex(/^[a-z][a-z0-9_]{0,79}$/);
+const recipeOutputItem = itemName.describe("Exact output item registry path without a namespace. Matching is literal, not a material family, tag, display name, ingredient name or alias.");
 const yawUnits = "Absolute world yaw in radians, not degrees or a relative turn: 0 faces +Z, +pi/2 faces -X, -pi/2 faces +X, +/-pi faces -Z.";
 const pitchUnits = "Absolute pitch in radians, positive up and negative down; 0 is level and +/-pi/2 is vertical.";
 export const minecraftInventoryItemSchema = z.object({ name: z.string().max(100), display_name: z.string().max(200),
@@ -109,8 +110,10 @@ export const minecraftActionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("dig"), target: targetRefSchema }).strict(),
   z.object({ kind: z.literal("place"), target: targetRefSchema, face: z.enum(["up", "down", "north", "south", "east", "west"]), item: itemName }).strict()
     .describe("Place using a fresh support target and face; implicit equipment uses the same visible native inventory controller. Bounded native session up to 20 seconds, still limited by the owning program budget."),
-  z.object({ kind: z.literal("craft"), item: itemName, executions: z.number().int().min(1).max(16), table: targetRefSchema.optional() }).strict()
-    .describe("Manual visible native 2x2 crafting, or 3x3 with a fresh reachable table. One owned session places ingredients, retrieves output and clears custody. Native bound 10 seconds + 35 seconds per execution; owning program limits still apply."),
+  z.object({ kind: z.literal("craft"), item: recipeOutputItem, executions: z.number().int().min(1).max(16)
+    .describe("Required number of recipe executions, not the number of output items. Each execution yields the recipe's output count."),
+    table: targetRefSchema.optional() }).strict()
+    .describe("Visible native crafting helper: selects a synchronized unlocked recipe matching the exact output item, then manually uses the 2x2 inventory grid or a fresh reachable 3x3 table. Missing helper recipe access does not prove that ordinary manual crafting is impossible. One owned session places ingredients, retrieves output and clears custody. Native bound 10 seconds + 35 seconds per execution; owning program limits still apply."),
   z.object({ kind: z.literal("equip"), item: itemName, destination: z.enum(["hand", "off-hand", "head", "torso", "legs", "feet"]) }).strict()
     .describe("Select an existing hotbar item directly or visibly transfer equipment through the native inventory. Bounded native session up to 12 seconds; owning program limits still apply."),
   z.object({ kind: z.literal("interact"), target: targetRefSchema }).strict(),
@@ -125,7 +128,7 @@ export const minecraftActionSchema = z.discriminatedUnion("kind", [
   worldInputActionSchema,
   screenInputActionSchema,
 ]) satisfies z.ZodType<MinecraftAction>;
-export const minecraftRecipesRequestSchema = z.object({ item: itemName }).strict();
+export const minecraftRecipesRequestSchema = z.object({ item: recipeOutputItem }).strict();
 export const minecraftVisibleScreenRequestSchema = z.object({}).strict()
   .describe("Read only the currently visible vanilla GUI, including empty slots, cursor and logical bounds, or null. Never opens/closes a screen; no hidden recipes/offers or synchronized image claim.");
 

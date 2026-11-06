@@ -22,6 +22,7 @@ public final class Recipes {
   private static boolean table;
   private static int expectedGain;
   private static boolean invalidated;
+  private static String beginRefusalReason;
   private static VisibleInventory session;
   private record IngredientGroup(int source, ItemStack stack, int[] grids) {}
   private static IngredientGroup[] groups;
@@ -31,6 +32,10 @@ public final class Recipes {
 
   public static int expectedGain() {
     return expectedGain;
+  }
+
+  public static String beginRefusalReason() {
+    return beginRefusalReason;
   }
 
   private static List<RecipeDisplayEntry> entries(MinecraftClient c) {
@@ -85,10 +90,15 @@ public final class Recipes {
     active = null;
     session = null;
     invalidated = false;
+    beginRefusalReason = null;
     phase = 0;
     remaining = action.get("executions").getAsInt();
     table = action.has("table");
-    if (remaining < 1 || remaining > 16) return false;
+    if (remaining < 1 || remaining > 16) {
+      beginRefusalReason = "Craft executions must be between 1 and 16";
+      return false;
+    }
+    boolean matchingOutput = false;
     var context = SlotDisplayContexts.createParameters(c.world);
     for (var entry : entries(c)) {
       var output = entry.display().result().getFirst(context);
@@ -97,6 +107,7 @@ public final class Recipes {
               .getId(output.getItem())
               .getPath()
               .equals(action.get("item").getAsString())) continue;
+      matchingOutput = true;
       boolean fits =
           entry.display() instanceof ShapedCraftingRecipeDisplay shaped
               ? shaped.width() <= 2 && shaped.height() <= 2
@@ -108,16 +119,25 @@ public final class Recipes {
       expectedGain = output.getCount() * remaining;
       break;
     }
-    if (active == null) return false;
+    if (active == null) {
+      beginRefusalReason = matchingOutput
+          ? "Unlocked recipe output matches, but no matching display fits the 2x2 inventory grid and no crafting table was supplied"
+          : "No unlocked recipe display matches the exact output item";
+      return false;
+    }
     session = new VisibleInventory(c, table, authorized);
     if (table) {
       BlockPos pos = selectedTable;
-      if (pos == null
-          || c.player.getEyePos().squaredDistanceTo(pos.toCenterPos()) > 25
-          || !Registries.BLOCK
+      if (pos == null)
+        beginRefusalReason = "Supplied crafting table target is missing";
+      else if (c.player.getEyePos().squaredDistanceTo(pos.toCenterPos()) > 25)
+        beginRefusalReason = "Supplied crafting table is beyond interaction reach";
+      else if (!Registries.BLOCK
               .getId(c.world.getBlockState(pos).getBlock())
               .getPath()
-              .equals("crafting_table")) {
+              .equals("crafting_table"))
+        beginRefusalReason = "Supplied target is not a crafting table";
+      if (beginRefusalReason != null) {
         session.cancel(false); active = null;
         return false;
       }
@@ -130,6 +150,7 @@ public final class Recipes {
                   RaycastContext.FluidHandling.NONE,
                   c.player));
       if (!hit.getBlockPos().equals(pos)) {
+        beginRefusalReason = "Line of sight to supplied crafting table is blocked or unavailable";
         session.cancel(false); active = null;
         return false;
       }

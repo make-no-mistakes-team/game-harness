@@ -203,6 +203,13 @@ Authored callers should adopt the returned fresh observation and evaluate their 
 
 The Minecraft recipe read is the registered adapter binding `game.recipes(item)` → `minecraft.recipes@1`, advertised by `help` topic `game`. It is not a generic game requirement. The former `program_inspect` recipes view is retired, not an alias; retired and unknown views reject as `invalid_request` before dispatch. Inspect recipes through a named executable program using the registered read binding.
 
+Recipe queries and semantic `craft.item` match an exact output item registry path
+without its namespace. They do not expand material families, tags, display names
+or ingredient names. `craft.executions` is the required number of recipe
+executions, not an output-item count; each execution yields the recipe's output
+count. The helper uses synchronized unlocked recipes. Missing helper access
+does not establish that ordinary manual crafting is impossible.
+
 Strategic `action_submit` and `action_cancel` tools and aliases are removed. All new game effects require an owning skill execution or model-authored reaction through the arbiter; ownerless admission is rejected. The root program must implement a bounded observe/action/check/recovery/composition task flow, not outsource each next step to another strategic call. Small leaf helpers remain valid declared dependencies. Historical `origin:"strategist"` records stay readable and are never relabeled.
 
 A safely settled failed action or blocked/failed child returns to the authored caller for its own correction. It does not automatically kill the root. Unknown effects, reconnect requirements, actual cancellation/preemption, death, pause and stop fence the execution tree; generated error handling cannot bypass that fence.

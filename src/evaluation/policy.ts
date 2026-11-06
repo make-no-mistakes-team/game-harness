@@ -7,6 +7,7 @@ import { createEvaluationConfig, evaluationIdentifier } from "./config.ts";
 import type { EvaluationOutcome } from "./results.ts";
 
 export const MAX_UNSUCCESSFUL_LIVE_ATTEMPTS = 2;
+const MAX_IN_FLIGHT_LIVE_ATTEMPTS = 2;
 export interface AttemptMetadata {
   readonly reportDirectory: string;
   readonly promptRevision?: string;
@@ -90,7 +91,7 @@ function record(row: AttemptRow): AttemptRecord {
   };
 }
 
-/** Private, cross-process ledger. Directory/model/prompt changes never create a new allowance. */
+/** Private, cross-process ledger. Non-Luna failures share a cap; every model shares the reservation limit. */
 export class AttemptLedger {
   readonly #db: GovernanceDatabase;
   readonly #projectRoot: string;
@@ -150,9 +151,18 @@ export class AttemptLedger {
       }
       if (hypothesis.revision !== checked.platformEvidenceRevision)
         throw new Error("Platform evidence revision is not current; explicitly authorize concrete changed platform evidence first");
-      const count = this.#db.query<{ count: number }, [string, string]>("SELECT COUNT(*) AS count FROM attempts WHERE hypothesis_id=? AND revision=? AND unsuccessful=1").get(checked.hypothesisId, hypothesis.revision)!.count;
-      if (count >= MAX_UNSUCCESSFUL_LIVE_ATTEMPTS)
-        throw new Error("Two unsuccessful or in-flight live attempts already exist for this hypothesis; new concrete platform evidence is required");
+      const reserved = this.#db.query<{ count: number }, [string, string]>("SELECT COUNT(*) AS count FROM attempts WHERE hypothesis_id=? AND revision=? AND state='reserved'").get(checked.hypothesisId, hypothesis.revision)!.count;
+      if (reserved >= MAX_IN_FLIGHT_LIVE_ATTEMPTS)
+        throw new Error("Two in-flight live attempts already exist for this hypothesis; settle or explicitly interrupt a reservation first");
+      if (checked.model.id !== "gpt-6-luna") {
+        const unsuccessful = this.#db.query<{ config: string }, [string, string]>("SELECT config FROM attempts WHERE hypothesis_id=? AND revision=? AND unsuccessful=1").all(checked.hypothesisId, hypothesis.revision);
+        let count = 0;
+        for (const attempt of unsuccessful) {
+          const previous: EvaluationConfig = JSON.parse(attempt.config);
+          if (previous.model.id !== "gpt-6-luna" && ++count >= MAX_UNSUCCESSFUL_LIVE_ATTEMPTS)
+            throw new Error("Two unsuccessful or in-flight non-Luna live attempts already exist for this hypothesis; new concrete platform evidence is required");
+        }
+      }
       const attemptId = crypto.randomUUID();
       const reservedAt = new Date().toISOString();
       this.#db.query("INSERT INTO attempts (attempt_id,hypothesis_id,revision,state,reserved_at,owner_pid,config,metadata) VALUES (?,?,?,'reserved',?,?,?,?)")

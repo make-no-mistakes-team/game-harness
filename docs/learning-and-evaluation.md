@@ -233,7 +233,9 @@ New technical E01 declarations require protocol schema 3 and `timing_capture:"fu
 
 Observer-triggered Stop fences immediately and joins pending acquisition, step and native-close ownership before claiming drain. A stopping timing callback cannot dispatch a fresh sample, worker step or lease renewal, or publish a later result event. Already-dispatched input and its later ACK remain attributable.
 
-For **diagnostic attempts**, after **two unsuccessful real live attempts on the same technical hypothesis**, stop and preserve the outcome unless there is **new concrete platform evidence**. A different prompt, model, run directory or fresh conversation alone does not reset the count. An explicit evidence revision needs a reason and a concrete source/schema correction, native artifact or reproducible platform result; it preserves the preceding failures. Inspect existing evidence and use lower tiers before authorizing another diagnostic attempt. Do not loop until a preferred PASS appears.
+Development and gameplay diagnostics with **`gpt-6-luna` have no cumulative run-count or unsuccessful-attempt limit** and need no per-run user approval. Keep finite budgets and complete evidence for each run, diagnose failures, and declare the purpose of the next attempt. Prior Luna failures require neither a new hypothesis nor a platform-evidence revision.
+
+For **non-Luna diagnostic attempts**, stop after **two unsuccessful non-Luna attempts on the same hypothesis and current evidence revision** unless there is **new concrete platform evidence**. Luna attempts do not consume this allowance. A different non-Luna model, prompt, run directory or fresh conversation alone does not reset it. An explicit evidence revision needs a reason and a concrete source/schema correction, native artifact or reproducible platform result; it preserves the preceding failures. All models share a maximum of two unresolved diagnostic reservations per hypothesis. Standing Luna permission changes neither frozen study allocations nor applicable permission for other models.
 
 The ledger checks new evidence hashes against the initial baseline and all earlier revisions; moving a report or restoring old bytes is not novelty. A reproduction reference uses a typed platform-failure finding with a reproduction command and hash-matched supporting files, as defined in `policy.ts`. Attribution of a real platform defect remains the operator's judgment; schema/hash checks cannot prove causality. Settle or explicitly interrupt in-flight reservations before authorizing a new revision.
 
@@ -260,7 +262,7 @@ gameplay-improvement or future changed-protocol acceptance result.
 
 ### Model choice, usage and cost-to-result
 
-Luna is the conservative default for ordinary acceptance. GPT-6.1-Sol is authorized for an explicit API-control, comparison or justified higher-capability acceptance question with finite recorded bounds; no silent model fallback is permitted. Select on cost-to-result and the evidence needed, not token price alone. Include unsuccessful attempts when reporting time, requests, usage and estimated cost per result.
+Luna is the conservative default for ordinary acceptance and has standing permission for any number of finite development/gameplay runs. More expensive models, including GPT-6.1-Sol, need user permission unless the current request already authorizes them. Record an explicit API-control, comparison or justified higher-capability acceptance purpose and finite bounds; no silent model fallback is permitted. Select on cost-to-result and the evidence needed, not token price alone. Include unsuccessful attempts when reporting time, requests, usage and estimated cost per result.
 
 Record host request admissions and provider-reported usage messages separately. Actual wire-attempt counts remain unknown when the SDK/provider does not expose them; do not equate admissions or usage messages with transport attempts. Preserve uncached input, cache read/write and output as reported, missing categories, actual action receipts/counts, monotonic measured intervals, overlapping spans, unclassified waiting and omissions.
 
@@ -289,7 +291,7 @@ Catalogue prices are labeled estimates with their source and model descriptor. T
 
 The single authorized Sol control passed the **old model interface**, not natural gameplay efficacy or current-interface acceptance; its exact scope is in the [integration evidence](integration-spike.md#verification-scope-after-the-published-checkpoint). Do not repeat it automatically. Historical unsuccessful Luna attempts retain their original outcomes.
 
-The later plain wood comparison consumed one Luna and one Sol attempt under one hypothesis; both goals remained unverified and incomplete usage stayed incomplete. That series exhausted the two-unsuccessful-attempt allowance, with no third live attempt authorized. Its [retained outcomes and transport uncertainty](integration-spike.md#bounded-natural-wood-comparison) must not be relabeled after a source correction or used to claim post-fix efficacy.
+The later plain wood comparison consumed one Luna and one Sol attempt under one hypothesis; both goals remained unverified and incomplete usage stayed incomplete. Under the policy then in force, that series exhausted the two-unsuccessful-attempt allowance, with no third live attempt authorized. The current Luna run-count policy does not rewrite those outcomes or reopen that comparison. Its [retained outcomes and transport uncertainty](integration-spike.md#bounded-natural-wood-comparison) must not be relabeled after a source correction or used to claim post-fix efficacy.
 
 ### Evaluation code and evidence ownership
 

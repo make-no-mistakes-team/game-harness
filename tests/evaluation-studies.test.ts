@@ -77,11 +77,12 @@ test("registration is immutable and detached from caller mutation, including aft
   expect(() => ledger.reserveStudyAttempt({ ...ref, manifestSha256: "0".repeat(64) }, manifest.schedule[1]!.slot)).toThrow(/manifest|identity|mismatch/i);
 });
 
-test("two ordinary study failures preserve remaining slots and cannot reset exhausted diagnostics in the same database", () => {
+test("two ordinary study failures preserve remaining slots and cannot reset exhausted non-Luna diagnostics in the same database", () => {
   const { root, governance, ledger, manifest } = fixture(true);
   const diagnostics = new AttemptLedger(governance, { projectRoot: root });
   try {
-    const config = createEvaluationConfig({ discoveredModels: [{ id: "gpt-6-luna" }], purpose: "ordinary_acceptance",
+    const config = createEvaluationConfig({ discoveredModels: [{ id: "gpt-6.1-sol" }], modelId: "gpt-6.1-sol", purpose: "comparison",
+      justification: "Synthetic local comparison admission fixture; no provider execution",
       hypothesisId: "preserved-diagnostic", platformEvidenceRevision: "initial" });
     for (let index = 0; index < 2; index++) {
       const attempt = diagnostics.admitAttempt(config, { reportDirectory: `old-${index}` });
@@ -100,6 +101,36 @@ test("two ordinary study failures preserve remaining slots and cannot reset exha
     const database = new Database(join(governance, "attempts.sqlite"), { readonly: true });
     try { expect(database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM hypotheses").get()!.count).toBe(1); }
     finally { database.close(); }
+  } finally { diagnostics.close(); }
+});
+
+test("unlimited ordinary Luna retries neither mutate frozen study evidence nor expand its request or worker allowances", () => {
+  const { root, governance, ledger, manifest } = fixture(true);
+  const ref = ledger.registerStudy(manifest);
+  const reservation = ledger.reserveStudyAttempt(ref, manifest.schedule[0]!.slot);
+  for (const requestId of ["one", "two"]) {
+    const request = ledger.reserveStudyRequest(reservation, { requestId, path: "strategic" });
+    ledger.settleStudyRequest(request, { status: "settled", evidence: ["local synthetic request settled"] });
+  }
+  const before = JSON.stringify(ledger.readStudy(ref));
+  const diagnostics = new AttemptLedger(governance, { projectRoot: root });
+  try {
+    const config = createEvaluationConfig({ discoveredModels: [{ id: "gpt-6-luna" }], purpose: "ordinary_acceptance",
+      hypothesisId: "unlimited-luna-development", platformEvidenceRevision: "initial" });
+    for (let index = 0; index < 4; index++) {
+      const attempt = diagnostics.admitAttempt(config, { reportDirectory: `luna-development-${index}` });
+      diagnostics.settleAttempt(attempt.attemptId, { outcome: failedStudyOutcome, usage: null, evidence: [] });
+    }
+    expect(diagnostics.listAttempts(config.hypothesisId)).toHaveLength(4);
+    expect(JSON.stringify(ledger.readStudy(ref))).toBe(before);
+    expect(() => ledger.reserveStudyRequest(reservation, { requestId: "three", path: "strategic" })).toThrow(/request|allowance|limit/i);
+    expect(() => ledger.reserveStudyAttempt(ref, manifest.schedule[1]!.slot)).toThrow(/worker|ownership|drain|concurr/i);
+    settle(ledger, reservation, failedStudyOutcome);
+    expect(() => ledger.reserveStudyAttempt(ref, manifest.schedule[0]!.slot)).toThrow(/reserved|consumed|duplicate/i);
+    const remaining = ledger.reserveStudyAttempt(ref, manifest.schedule[1]!.slot);
+    expect(remaining.slot.repetition).toBe(2);
+    expect(ledger.readStudy(ref).manifest.allowances).toEqual(manifest.allowances);
+    expect(diagnostics.listAttempts(config.hypothesisId)).toHaveLength(4);
   } finally { diagnostics.close(); }
 });
 

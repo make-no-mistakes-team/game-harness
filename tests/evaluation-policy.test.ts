@@ -14,8 +14,9 @@ afterEach(() => {
   for (const ledger of ledgers.splice(0)) ledger.close();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
-const discoveredModels = [{ id: "gpt-6-luna" }, { id: "gpt-6.1-sol" }];
+const discoveredModels = [{ id: "gpt-6-luna" }, { id: "gpt-6.1-sol" }, { id: "gpt-6-luna-preview" }];
 const base = { discoveredModels, purpose: "ordinary_acceptance" as const, hypothesisId: "wood-platform-contract", platformEvidenceRevision: "initial" };
+const nonLuna = { ...base, modelId: "gpt-6.1-sol", purpose: "comparison" as const, justification: "Compare the same declared hypothesis" };
 const failed: EvaluationOutcome = { platform_status: "pass", agent_status: "goal_not_verified", provider_status: "ok", goal_verified: false, classification_reason: ["Agent did not achieve the declared natural goal; no platform defect observed"] };
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "gameharness-governance-"));
@@ -34,25 +35,63 @@ function failTwice(ledger: AttemptLedger, config = createEvaluationConfig(base))
   }
 }
 
-test("two failures remain binding across report directories, prompt swaps and an explicit Sol comparison", () => {
+test("non-Luna failures share a cumulative cap across report directories, prompt swaps and model swaps", () => {
   const { ledger, config } = fixture();
-  failTwice(ledger, config);
-  expect(() => ledger.admitAttempt(config, { reportDirectory: "entirely-new-world", promptRevision: "rewritten-prompt" })).toThrow("Two unsuccessful");
-  const sol = createEvaluationConfig({ ...base, modelId: "gpt-6.1-sol", purpose: "comparison", justification: "Compare the same declared hypothesis" });
+  const sol = createEvaluationConfig(nonLuna);
+  const other = createEvaluationConfig({ ...nonLuna, modelId: "gpt-6-luna-preview" });
+  for (const [index, attemptConfig] of [sol, other].entries()) {
+    const attempt = ledger.admitAttempt(attemptConfig, { reportDirectory: `fresh-report-${index}`, promptRevision: `prompt-${index}` });
+    ledger.settleAttempt(attempt.attemptId, { outcome: failed, usage: null, evidence: [`report-${index}.json`] });
+  }
+  expect(() => ledger.admitAttempt(other, { reportDirectory: "entirely-new-world", promptRevision: "rewritten-prompt" })).toThrow("Two unsuccessful");
   expect(() => ledger.admitAttempt(sol, { reportDirectory: "fresh-sol-report" })).toThrow("Two unsuccessful");
   expect(() => ledger.admitAttempt(createEvaluationConfig({ ...base, platformEvidenceRevision: "pretend-new-revision" }), { reportDirectory: "fresh-report" })).toThrow("authorize concrete");
   expect(ledger.listAttempts(config.hypothesisId).map(attempt => attempt.settlement?.outcome.agent_status)).toEqual(["goal_not_verified", "goal_not_verified"]);
+  const luna = ledger.admitAttempt(config, { reportDirectory: "authorized-luna-development" });
+  expect(luna.config.model.id).toBe("gpt-6-luna");
+});
+
+test("sequential finite Luna failures remain admissible after restart without erasing their history or spending non-Luna allowance", () => {
+  const { root, governance, ledger, config } = fixture();
+  for (let index = 0; index < 4; index++) {
+    const attempt = ledger.admitAttempt(config, { reportDirectory: `luna-failure-${index}`, promptRevision: `prompt-${index}` });
+    ledger.settleAttempt(attempt.attemptId, { outcome: failed, usage: null, evidence: [`luna-report-${index}.json`] });
+  }
+  const history = [...ledger.listAttempts(config.hypothesisId)];
+  expect(history).toHaveLength(4);
+  expect(history.every(attempt => attempt.state === "settled" && attempt.settlement?.outcome.agent_status === "goal_not_verified")).toBe(true);
+  ledger.close();
+  ledgers.splice(ledgers.indexOf(ledger), 1);
+  const restarted = new AttemptLedger(governance, { projectRoot: root }); ledgers.push(restarted);
+  const next = restarted.admitAttempt(config, { reportDirectory: "luna-after-restart" });
+  restarted.settleAttempt(next.attemptId, { outcome: failed, usage: null, evidence: ["luna-after-restart.json"] });
+  failTwice(restarted, createEvaluationConfig(nonLuna));
+  expect(() => restarted.admitAttempt(createEvaluationConfig(nonLuna), { reportDirectory: "exhausted-non-luna" })).toThrow("Two unsuccessful");
+  expect(restarted.listAttempts(config.hypothesisId).slice(0, history.length)).toEqual(history);
+  const further = restarted.admitAttempt(config, { reportDirectory: "luna-after-non-luna-cap" });
+  expect(further.platformEvidenceRevision).toBe(config.platformEvidenceRevision);
+  expect(restarted.listAttempts(config.hypothesisId)).toHaveLength(8);
+  expect(restarted.listPlatformEvidence(config.hypothesisId)).toHaveLength(1);
+});
+
+test("unlimited Luna run count does not bypass finite per-run configuration validation", () => {
+  const { ledger, config } = fixture();
+  for (const hostRequestAdmissions of [0, -1, 0.5, Infinity, NaN]) {
+    expect(() => ledger.admitAttempt({ ...config, caps: { ...config.caps, hostRequestAdmissions } }, { reportDirectory: "invalid-budget" })).toThrow("finite positive integer");
+  }
+  expect(ledger.listAttempts(config.hypothesisId)).toHaveLength(0);
 });
 
 test("a real changed source plus reason authorizes one new revision without erasing old failures", () => {
-  const { root, ledger, config } = fixture();
+  const { root, ledger } = fixture();
+  const config = createEvaluationConfig(nonLuna);
   failTwice(ledger, config);
   const request = { revision: "changed-protocol", reason: "Corrected protocol admission after the preserved failures", references: [{ kind: "source" as const, path: "src/platform.ts" }] };
   expect(() => ledger.authorizePlatformEvidence(config.hypothesisId, request)).toThrow("has not changed");
   expect(() => ledger.authorizePlatformEvidence(config.hypothesisId, { ...request, reason: "" })).toThrow("reason");
   writeFileSync(join(root, "src/platform.ts"), "export const protocol = 2;\n");
   ledger.authorizePlatformEvidence(config.hypothesisId, request);
-  const next = createEvaluationConfig({ ...base, platformEvidenceRevision: request.revision });
+  const next = createEvaluationConfig({ ...nonLuna, platformEvidenceRevision: request.revision });
   const reserved = ledger.admitAttempt(next, { reportDirectory: "new-evidence-report" });
   expect(reserved.platformEvidenceRevision).toBe("changed-protocol");
   expect(ledger.listAttempts(config.hypothesisId)).toHaveLength(3);
@@ -108,17 +147,35 @@ test("a newly captured concrete platform-failure reproduction is evidence, not a
   expect(ledger.listAttempts(config.hypothesisId)).toHaveLength(2);
 });
 
-test("in-flight attempts count conservatively; interruptions and unknown pricing remain auditable and immutable", () => {
+test("only reserved attempts consume the shared two-in-flight cap; interruptions and unknown pricing remain immutable", () => {
   const { ledger, config } = fixture();
   const first = ledger.admitAttempt(config, { reportDirectory: "first" });
   ledger.interruptAttempt(first.attemptId, "SIGTERM after provider admission; effects and usage uncertain");
   const second = ledger.admitAttempt(config, { reportDirectory: "second" });
-  expect(() => ledger.admitAttempt(config, { reportDirectory: "third" })).toThrow("in-flight");
+  const sol = createEvaluationConfig(nonLuna);
+  const third = ledger.admitAttempt(sol, { reportDirectory: "third" });
+  expect(() => ledger.admitAttempt(config, { reportDirectory: "fourth-luna" })).toThrow("in-flight");
+  expect(() => ledger.admitAttempt(sol, { reportDirectory: "fourth-sol" })).toThrow("in-flight");
   const settled = ledger.settleAttempt(second.attemptId, { outcome: failed, usage: { actual_reported_usage: null, known_cost: null, subscription_monetary_cost: null }, evidence: [] });
   expect(settled.settlement?.usage).toEqual({ actual_reported_usage: null, known_cost: null, subscription_monetary_cost: null });
+  ledger.admitAttempt(config, { reportDirectory: "fourth-after-settlement" });
+  expect(ledger.listAttempts(config.hypothesisId).filter(attempt => attempt.state === "reserved").map(attempt => attempt.attemptId)).toContain(third.attemptId);
+  expect(ledger.listAttempts(config.hypothesisId).filter(attempt => attempt.state === "reserved")).toHaveLength(2);
+  expect(() => ledger.admitAttempt(config, { reportDirectory: "fifth" })).toThrow("in-flight");
   expect(ledger.listAttempts(config.hypothesisId)[0]).toMatchObject({ state: "interrupted", interruption: "SIGTERM after provider admission; effects and usage uncertain" });
   expect(() => ledger.settleAttempt(first.attemptId, { outcome: failed, usage: null, evidence: [] })).toThrow("history is immutable");
   expect(() => ledger.interruptAttempt(second.attemptId, "Rewrite a settled result")).toThrow("history is immutable");
+});
+
+test("non-Luna interruptions retain cumulative allowance consumption without remaining active reservations", () => {
+  const { ledger } = fixture();
+  const config = createEvaluationConfig(nonLuna);
+  const first = ledger.admitAttempt(config, { reportDirectory: "interrupted-non-luna" });
+  ledger.interruptAttempt(first.attemptId, "Unknown provider effects after interruption");
+  const second = ledger.admitAttempt(config, { reportDirectory: "failed-non-luna" });
+  ledger.settleAttempt(second.attemptId, { outcome: failed, usage: null, evidence: [] });
+  expect(ledger.listAttempts(config.hypothesisId).map(attempt => attempt.state)).toEqual(["interrupted", "settled"]);
+  expect(() => ledger.admitAttempt(config, { reportDirectory: "third-non-luna" })).toThrow("Two unsuccessful");
 });
 
 test("new evidence cannot hide or supersede another in-flight reservation", () => {
@@ -143,7 +200,7 @@ test("six independent processes atomically reserve only two attempts and restart
       const attempt = ledger.admitAttempt(${JSON.stringify(config)}, { reportDirectory: process.env.GAMEHARNESS_LEDGER_TEST_REPORT });
       console.log(JSON.stringify({ admitted: true, id: attempt.attemptId }));
     } catch (error) {
-      if (!String(error).includes("Two unsuccessful")) throw error;
+      if (!String(error).includes("in-flight")) throw error;
       console.log(JSON.stringify({ admitted: false }));
     } finally { ledger.close(); }
   `;

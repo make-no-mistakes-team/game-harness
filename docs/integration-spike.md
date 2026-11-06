@@ -568,7 +568,7 @@ The parent completed one plain wood-collection attempt each with Luna and Sol un
 | Luna | 109.15 s | 12 / 11 | 40,586 / 55,936 / 2,896 |
 | Sol | 176.52 s | 12 / 11 | 15,148 / 106,624 / 3,352 |
 
-Reported cache-write subtotals were zero. **Usage coverage is incomplete**: the table contains only the 11 reported messages in each attempt; full token totals and subscription cost remain null. These unsuccessful attempts support no invoice, savings or cost-per-success claim. The parent inspected the durable governance ledger: exactly two settled rows and two unsuccessful attempts under the same hypothesis, with no additional hidden attempt. The shared allowance is exhausted; no third live attempt or budget reset is authorized.
+Reported cache-write subtotals were zero. **Usage coverage is incomplete**: the table contains only the 11 reported messages in each attempt; full token totals and subscription cost remain null. These unsuccessful attempts support no invoice, savings or cost-per-success claim. The parent inspected the durable governance ledger: exactly two settled rows and two unsuccessful attempts under the same hypothesis, with no additional hidden attempt. Under the policy then in force, the shared allowance was exhausted and no third live attempt or budget reset was authorized.
 
 Luna received five new-program conflicts after supplying `based_on:1`; Sol received six across two new names. Read-only SDK inspection confirmed that local JSON schemas made `based_on` optional and the host correctly rejected revision metadata for a new name. The actual SDK transport omitted `strict`; the effective remote grammar was not captured, so neither a strictness cause nor sole model fault is established.
 
@@ -576,7 +576,7 @@ The [official function-calling guide](https://developers.openai.com/api/docs/gui
 
 The production correction was only an explicit `AgentTool.strict:false` setting, with host Zod/conflict/authority/source/ownership/lifecycle/isolation fences unchanged. The exact zero-network SDK-boundary test then passed **1 test / 12 assertions in 616 ms**, followed by the whole typecheck and **295-test final regression** recorded above. No model/native/UI rerun or build followed this provider-only setting; the native and desktop evidence retains its preceding scope.
 
-Post-setting gameplay is **untested** and the remote grammar's causal role remains unknown. The two original reports remain immutable negative outcomes; no third live attempt or budget reset is authorized.
+At that checkpoint, post-setting gameplay was **untested** and the remote grammar's causal role remained unknown. The two original reports remain immutable negative outcomes; no third live attempt or budget reset was authorized for that comparison. Later development follows the [current model and attempt policy](learning-and-evaluation.md#attempt-admission-and-stopping), not a reopening of this comparison.
 
 ### Current native build and pure-controller proof
 

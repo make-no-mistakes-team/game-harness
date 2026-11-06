@@ -51,13 +51,18 @@ behavior. Infrastructure milestones support that outcome; they do not replace it
 ## Model-run authorization
 
 The user grants standing permission for development and gameplay runs with
-`gpt-6-luna`; no per-run approval is needed. Use it for early real-model feedback,
-not only for last-minute demonstrations. For more expensive SOTA models,
-normally ask first unless the current request already authorizes their use.
+`gpt-6-luna`, with no cumulative limit on the number of runs, including after
+unsuccessful attempts. No per-run approval or new platform-evidence revision is
+required merely because earlier Luna runs failed. Use it for early real-model
+feedback, not only for last-minute demonstrations. For more expensive SOTA
+models, normally ask first unless the current request already authorizes their
+use; Luna's standing permission does not authorize those models.
 
-This permission does not override safety, finite run budgets, frozen experiment
-protocols or manual-review pauses. It does not permit silently substituting
-Luna for a different model in a declared experiment.
+Each run still needs finite request, time and evidence budgets, complete attempt
+history, and safe resource closure. Unlimited run count does not override
+safety, concurrency limits, frozen experiment protocols, explicit stop
+instructions or successful-run manual-review pauses. It does not permit
+silently substituting Luna for a different model in a declared experiment.
 
 ## Manual gameplay review
 

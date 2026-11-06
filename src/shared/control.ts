@@ -248,13 +248,14 @@ export const worldHeldSchema = z.object({
   sprint: z.boolean(), sneak: z.boolean(), attack: z.boolean(), use: z.boolean(),
 }).strict() satisfies z.ZodType<WorldHeld>;
 export const viewInputSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("unchanged") }).strict().describe("No rotation and no target servo."),
+  z.object({ kind: z.literal("unchanged") }).strict()
+    .describe("Requests no rotation. When applied, replaces any prior stream view rate; it does not restore an earlier pose or hold an absolute target."),
   z.object({ kind: z.literal("delta"), yaw_radians: delta.min(-2 * Math.PI).max(2 * Math.PI),
     pitch_radians: delta.min(-2 * Math.PI).max(2 * Math.PI) }).strict()
-    .describe("Relative radians applied once at step entry. Positive pitch is up; ordinary player/vehicle constraints determine the actual pose."),
+    .describe("Relative radians applied once at ordinary step entry or once when a stream snapshot begins, not spread over its duration. The full target error therefore turns immediately, not along a trajectory. Positive yaw turns right (0 faces +Z, +pi/2 faces -X); positive pitch is up. Actual pose feedback wraps yaw to [-pi,pi) and reports pitch clamped to [-pi/2,pi/2]; vanilla player/vehicle constraints determine the applied pose. Replaces any prior stream view rate."),
   z.object({ kind: z.literal("rate"), yaw_radians_per_second: delta.min(-20 * Math.PI).max(20 * Math.PI),
     pitch_radians_per_second: delta.min(-20 * Math.PI).max(20 * Math.PI) }).strict()
-    .describe("Radians per second integrated once per actual client simulation tick at 0.05 seconds, never render or wall time. Positive pitch is up."),
+    .describe("Radians per second; each actual client simulation tick applies rate * 0.05, never render or wall time. Positive yaw turns right (0 faces +Z, +pi/2 faces -X); positive pitch is up. Ordinary world_input applies for the step's ticks. A stream retains the rate between commands, even after its input ACK, until replaced, cleared by a screen transition or control retires/expires; no automatic target stop. Submit unchanged or zero rate to stop rotation. Neutral held alone does not stop a retained rate. Actual pose feedback wraps yaw to [-pi,pi) and reports pitch clamped to [-pi/2,pi/2] under vanilla constraints; no sub-tick interpolation is promised."),
 ]) satisfies z.ZodType<ViewInput>;
 export const worldInputEdgeSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("button"),

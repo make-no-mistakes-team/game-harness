@@ -465,6 +465,52 @@ from the potentially lagging `last_input` application acknowledgment.
 Before screen input, submit neutral world state with the required releases.
 A non-running result retires without submitting its returned input.
 
+### Authored view motion
+
+Ordinary `world_input` and resident world snapshots share the same raw
+`view` actuator. `delta` uses relative radians and applies once at step or
+snapshot entry. It is not divided across the step's duration. A delta
+equal to the entire target error therefore turns immediately; selecting a
+target does not create a trajectory.
+
+`rate` uses radians per second. Each actual client simulation tick applies
+`rate * 0.05`, independent of render frequency and elapsed wall time.
+An ordinary action applies the rate for the step's declared `ticks`,
+then applies the next step or releases control at action completion.
+A stream retains its rate on subsequent ticks without another command,
+including after the snapshot's application acknowledgment. It continues
+until a replacement view input applies, a screen transition clears it,
+or control retires or expires. There is no automatic stop at a target angle.
+The 150 ms capture-age check, 250 ms native lease and original root
+deadline remain separate bounds.
+
+Positive yaw turns right: yaw zero faces `+Z`, `+pi/2` faces `-X`,
+`-pi/2` faces `+X`, and `+/-pi` faces `-Z`. Positive pitch points up.
+Actual body and input-acknowledgment `applied_pose` wrap yaw to `[-pi,pi)`
+and report pitch clamped to `[-pi/2,pi/2]` under ordinary player and vehicle
+constraints. Read those applied values rather than treating a requested
+rotation as an achieved pose. Crossing the yaw wrap boundary does not
+mean that the player made a full turn.
+
+The common actor prompt and public program help require target transitions
+to unfold over authored time. The model chooses targets and the rotation
+schedule, using existing rates or successive small deltas to express
+bounded temporal turns. Raw input does not smooth full-error deltas,
+select targets or promise sub-tick interpolation.
+
+To end a stream view rate, submit `unchanged` or a zero rate.
+`unchanged` replaces the prior rate when applied; it does not restore an
+earlier pose. Neutral held state alone, an input acknowledgment or no new
+command does not stop a retained rate. Button releases still require the
+matching edges against the previous submitted held state; unchanged holds
+need no repeated edges, and intentional counted presses remain explicit.
+Stop and trusted retirement clear owned held input and pending presses
+and cease further authored rotation. They do not undo the applied pose or
+earlier world effects, and confirmed neutralization does not resolve an
+unknown effect.
+
+### Resident sampling and application
+
 Resident sampling waits for a render and a client tick newer than the
 stream's last successful sample or grant. It constructs a fresh body with
 its actual capture time; it does not synchronize that body with RGB pixels.

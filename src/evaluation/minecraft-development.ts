@@ -6,7 +6,7 @@ import type { MinecraftAcceptanceTask } from "./adapter-scenarios.ts";
 /** Fresh-world development only, not an extension of registered study support. */
 export const minecraftDevelopmentSchema = z.object({
   task: taskTextSchema,
-  criterion: z.enum(["custom", "break_log", "collect_wood", "obtain_stone", "craft_crafting_table", "collect_and_craft_table", "craft_stone_pickaxe"]).default("custom"),
+  criterion: z.enum(["custom", "break_log", "collect_wood", "obtain_stone", "craft_crafting_table", "collect_and_craft_table", "craft_stone_pickaxe", "craft_iron_pickaxe"]).default("custom"),
   seed: z.string().trim().min(1).max(100),
   start_description: z.string().trim().min(1).max(1000),
   reasoning: z.literal("low").optional(),

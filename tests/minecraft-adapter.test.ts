@@ -81,6 +81,128 @@ test("crafting consumes typed production facts and retained own possession, neve
   expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({}))]).status).toBe("incomplete");
 });
 
+test("iron crafting retains production across polls while independent evaluation must consume its own evidence", () => {
+  const f = fixture("craft_iron_pickaxe");
+  const facts = f.production("iron_pickaxe", {}, { iron_pickaxe: 1 });
+  const current = f.observed(f.observation({ iron_pickaxe: 1 }));
+  expect(f.adapter.verifyCompletion(f.manifest, facts)).toMatchObject({
+    status: "unknown", reason: "fresh_own_observation_unavailable" });
+  expect(f.adapter.verifyCompletion(f.manifest, [current])).toMatchObject({
+    status: "verified", verifier_id: "minecraft_possession_v2", verifier_version: 2,
+    reason: "own_production_and_retained_possession", evidence_refs: ["produce-iron_pickaxe:production", "observation-2"] });
+  const independent = { ...f.manifest };
+  expect(f.adapter.verifyCompletion(independent, [current]).status).toBe("incomplete");
+  expect(f.adapter.verifyCompletion(independent, [...facts, current]).status).toBe("verified");
+  expect(f.adapter.verifyCompletion(f.manifest, [f.observed(f.observation({}, 3))])).toMatchObject({
+    status: "incomplete", reason: "produced_item_not_retained" });
+});
+
+for (const preexisting of [false, true]) {
+  test(`${preexisting ? "preexisting" : "gifted"} iron possession cannot replace own iron production`, () => {
+    const f = fixture("craft_iron_pickaxe", preexisting ? { iron_pickaxe: 1 } : {});
+    const current = f.observed(f.observation({ iron_pickaxe: 1, stone_pickaxe: 1 }));
+    expect(f.adapter.verifyCompletion(f.manifest, [current])).toMatchObject({
+      status: "incomplete", reason: "authoritative_own_production_not_observed" });
+    expect(f.adapter.verifyCompletion(f.manifest, [...f.production("stone_pickaxe", {}, { stone_pickaxe: 1 }), current]).status)
+      .toBe("incomplete");
+  });
+}
+
+for (const field of ["run_id", "world_id", "session_id", "epoch", "native_boot_id", "life_id"] as const) {
+  test(`iron crafting rejects production from a different ${field}`, () => {
+    const f = fixture("craft_iron_pickaxe");
+    const facts = f.production("iron_pickaxe", {}, { iron_pickaxe: 1 }).map(event => ({
+      ...event, scope: { ...event.scope, [field]: typeof event.scope[field] === "number" ? Number(event.scope[field]) + 1 : "foreign" },
+    }));
+    expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({ iron_pickaxe: 1 }))])).toMatchObject({
+      status: "incomplete", reason: "authoritative_own_production_not_observed" });
+  });
+}
+
+for (const boundary of ["stale", "future", "dead", "baseline sequence", "foreign world", "foreign session"] as const) {
+  test(`iron crafting cannot use ${boundary} possession`, () => {
+    const f = fixture("craft_iron_pickaxe"), current = f.observation({ iron_pickaxe: 1 });
+    if (boundary === "stale") current.captured_at = new Date(now - 1001).toISOString();
+    if (boundary === "future") current.captured_at = new Date(now + 1001).toISOString();
+    if (boundary === "dead") current.life.status = "dead";
+    if (boundary === "baseline sequence") current.observation_seq = 1;
+    if (boundary === "foreign world") current.world_id = "foreign";
+    if (boundary === "foreign session") current.session_id = "foreign";
+    expect(f.adapter.verifyCompletion(f.manifest, [...f.production("iron_pickaxe", {}, { iron_pickaxe: 1 }), f.observed(current)]).status)
+      .not.toBe("verified");
+  });
+}
+
+for (const at of [now - 10001, now + 1, now + 1001]) {
+  test(`iron production at ${at - now}ms must occur within the run and no later than possession`, () => {
+    const f = fixture("craft_iron_pickaxe");
+    expect(f.adapter.verifyCompletion(f.manifest, [
+      ...f.production("iron_pickaxe", {}, { iron_pickaxe: 1 }, at), f.observed(f.observation({ iron_pickaxe: 1 })),
+    ]).status).toBe("incomplete");
+  });
+}
+
+test("iron production at the possession timestamp is eligible without an inventory gain over the baseline tool count", () => {
+  const f = fixture("craft_iron_pickaxe", { iron_pickaxe: 1 });
+  expect(f.adapter.verifyCompletion(f.manifest, [
+    ...f.production("iron_pickaxe", {}, { iron_pickaxe: 1 }, now), f.observed(f.observation({ iron_pickaxe: 1 })),
+  ]).status).toBe("verified");
+});
+
+for (const receipt of ["unknown", "unconfirmed effect", "unconfirmed inventory", "no production gain"] as const) {
+  test(`an iron ${receipt} receipt cannot certify possession`, () => {
+    const f = fixture("craft_iron_pickaxe");
+    const facts = f.adapter.effectEvidence!(f.scope, "iron-receipt", { kind: "craft", item: "iron_pickaxe", executions: 1 },
+      { status: receipt === "unknown" ? "unknown" : "succeeded", summary: "Contract-only iron receipt",
+        evidence: { effect_confirmed: receipt !== "unconfirmed effect", inventory_receipt_confirmed: receipt !== "unconfirmed inventory",
+          inventory_before: receipt === "no production gain" ? { iron_pickaxe: 1 } : {}, inventory_after: { iron_pickaxe: 1 } } },
+      new Date(now - 500).toISOString());
+    expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({ iron_pickaxe: 1 }))])).toMatchObject(
+      receipt === "no production gain" ? { status: "incomplete", reason: "authoritative_own_production_not_observed" }
+        : { status: "unknown", reason: "own_production_receipt_unconfirmed" });
+  });
+}
+
+for (const [field, value] of [["actor", "another_player"], ["input_application", "unknown"], ["effect_status", "unknown"]] as const) {
+  test(`iron production rejects native ${field}=${value}`, () => {
+    const f = fixture("craft_iron_pickaxe");
+    const facts = f.production("iron_pickaxe", {}, { iron_pickaxe: 1 }).map(event => {
+      const data = event.data;
+      return { ...event, data: { ...(data !== null && typeof data === "object" && !Array.isArray(data) ? data : {}), [field]: value } };
+    });
+    expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({ iron_pickaxe: 1 }))]).status).toBe("incomplete");
+  });
+}
+
+test("death and respawn require iron production in the new life, even with cumulative old receipts", () => {
+  const f = fixture("craft_iron_pickaxe"), facts = f.production("iron_pickaxe", {}, { iron_pickaxe: 1 });
+  expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({ iron_pickaxe: 1 }))]).status).toBe("verified");
+  const dead = f.observation({ iron_pickaxe: 1 }, 3);
+  dead.life.status = "dead";
+  expect(f.adapter.verifyCompletion(f.manifest, [f.observed(dead)])).toMatchObject({
+    status: "incomplete", reason: "own_alive_possession_not_observed" });
+  const respawned = f.observation({ iron_pickaxe: 1 }, 4);
+  respawned.life.life_id = 4;
+  const current = f.observed(respawned);
+  expect(f.adapter.verifyCompletion(f.manifest, [...facts, current]).status).toBe("incomplete");
+  expect(f.adapter.verifyCompletion(f.manifest, [current]).status).toBe("incomplete");
+  const newLifeProduction = facts.map(event => ({ ...event, evidence_id: "new-life-production",
+    observed_at: new Date(now).toISOString(), scope: { ...event.scope, life_id: 4 } }));
+  expect(f.adapter.verifyCompletion(f.manifest, [...newLifeProduction, current])).toMatchObject({
+    status: "verified", evidence_refs: ["new-life-production", "observation-4"] });
+});
+
+test("a reset iron baseline cannot inherit earlier production from the prior manifest", () => {
+  const f = fixture("craft_iron_pickaxe"), facts = f.production("iron_pickaxe", {}, { iron_pickaxe: 1 });
+  expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({ iron_pickaxe: 1 }))]).status).toBe("verified");
+  const reset = { ...f.manifest, baseline: f.adapter.captureBaseline(f.manifest.goal, f.observation({ iron_pickaxe: 1 }, 3, now - 250)) };
+  const current = f.observed(f.observation({ iron_pickaxe: 1 }, 4));
+  expect(f.adapter.verifyCompletion(reset, [...facts, current]).status).toBe("incomplete");
+  expect(f.adapter.verifyCompletion(reset, [
+    ...f.production("iron_pickaxe", {}, { iron_pickaxe: 1 }, now - 100), current,
+  ]).status).toBe("verified");
+});
+
 test("combined proof retains actual pre-consumption wood across independent polls without spare logs", () => {
   const f = fixture("collect_and_craft_table");
   const consumed = f.production("oak_planks", { oak_log: 1 }, { oak_planks: 4 }, now - 1000);
@@ -143,11 +265,37 @@ test("custom completion is never promoted to trusted adapter verification", () =
 const guiAction = { kind: "screen_input", screen: { screen_id: "visible", incarnation: 1, layout_revision: 1 },
   operations: [{ kind: "slot", slot_id: 0, button: "left", mode: "ordinary", hotbar_slot: null,
     expected_cursor: { item: null, count: 0 }, expected_slots: [{ slot_id: 0, value: { item: "crafting_table", count: 1 } }] }] };
-function guiFact(producer: "crafting" | "smelting" | "trading" | "anvil" | null) {
+function guiFact(producer: "crafting" | "smelting" | "trading" | "anvil" | null, item = "crafting_table") {
   return { kind: "gui_transaction", mechanism: "visible_gui", operation_index: 0, receipt_ref: "native:3:17",
     input_application: "confirmed", effect_status: "confirmed", inventory_before: { oak_planks: 4 }, inventory_after: {},
-    productions: producer ? [{ producer, item: "crafting_table", count: 1, source: "server_result_slot_take", production_confirmed: true }] : [] };
+    productions: producer ? [{ producer, item, count: 1, source: "server_result_slot_take", production_confirmed: true }] : [] };
 }
+
+for (const producer of ["crafting", "smelting", "trading", "anvil", null] as const) {
+  test(`iron GUI ${producer ?? "transfer"} receipts require confirmed crafting and separately retained possession`, () => {
+    const f = fixture("craft_iron_pickaxe");
+    const action = { ...guiAction, operations: [{ ...guiAction.operations[0]!,
+      expected_slots: [{ slot_id: 0, value: { item: "iron_pickaxe", count: 1 } }] }] };
+    const fact = { ...guiFact(producer, "iron_pickaxe"), inventory_before: {} };
+    const facts = f.adapter.effectEvidence!(f.scope, "gui-iron", action,
+      { status: "succeeded", summary: "Contract-only native GUI receipt", evidence: { effect_confirmed: true, gui_transactions: [fact] } },
+      new Date(now - 500).toISOString());
+    expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({}))]).status).toBe("incomplete");
+    expect(f.adapter.verifyCompletion(f.manifest, [f.observed(f.observation({ iron_pickaxe: 1 }, 3))]).status)
+      .toBe(producer === "crafting" ? "verified" : "incomplete");
+  });
+}
+
+test("unconfirmed iron GUI production stays unknown despite a later owned tool", () => {
+  const f = fixture("craft_iron_pickaxe");
+  const fact = { ...guiFact("crafting", "iron_pickaxe"), inventory_before: {},
+    productions: [{ ...guiFact("crafting", "iron_pickaxe").productions[0]!, production_confirmed: false }] };
+  const facts = f.adapter.effectEvidence!(f.scope, "gui-iron-unknown", guiAction,
+    { status: "unknown", summary: "GUI production unconfirmed", evidence: { gui_transactions: [fact] } },
+    new Date(now - 500).toISOString());
+  expect(f.adapter.verifyCompletion(f.manifest, [...facts, f.observed(f.observation({ iron_pickaxe: 1 }))])).toMatchObject({
+    status: "unknown", reason: "own_production_receipt_unconfirmed" });
+});
 
 for (const producer of ["crafting", "smelting", "trading", "anvil", null] as const) {
   test(`GUI ${producer ?? "transfer"} receipts do not confuse crafting mechanism with possession`, () => {

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
+import { effectScope, minecraftObservationFixture, minecraftTestAdapter } from "./helpers/adapter-contract.ts";
+import type { AdapterEvidence } from "../src/shared/contracts.ts";
 import { developmentTask } from "../src/evaluation/minecraft-development.ts";
 import { parseMinecraftDevelopmentArguments } from "../scripts/minecraft-development.ts";
 import { scenarioGoal } from "../src/evaluation/adapter-scenarios.ts";
@@ -13,6 +14,31 @@ test("development text and whole-request stone criterion never inherit a table s
   expect(task.prompt).toBe("Make a stone pickaxe from the resources around you.");
   expect(scenarioGoal(adapter, task)).toEqual(adapter.goals.find(goal => goal.goal_id === "craft_stone_pickaxe")!);
   expect(options.caps).toEqual({ hostRequestAdmissions: 12, runMs: 180000, totalMs: 600000 });
+});
+
+test("a plain iron development request selects independent production and possession without prescribing a route", () => {
+  const options = parseMinecraftDevelopmentArguments([...base.slice(0, -1), "Make an iron pickaxe.", "--criterion", "craft_iron_pickaxe"]);
+  const now = Date.parse("2026-11-06T12:00:00Z"), adapter = minecraftTestAdapter("balanced", { now: () => now });
+  const task = developmentTask(options.development!, adapter);
+  expect(task.prompt).toBe("Make an iron pickaxe.");
+  const goal = scenarioGoal(adapter, task);
+  const initial = minecraftObservationFixture(adapter, { captured_at: new Date(now - 1000).toISOString() });
+  const current = minecraftObservationFixture(adapter, { observation_seq: 2, captured_at: new Date(now).toISOString() });
+  current.data.player.inventory = [{ name: "iron_pickaxe", count: 1, slot: 0, display_name: "Iron Pickaxe" }];
+  const scope = { ...effectScope(), world_id: current.world_id, session_id: current.session_id, epoch: current.epoch,
+    native_boot_id: current.native_boot_id, life_id: current.life.life_id, space_epoch: current.space.space_epoch };
+  const manifest = { ...scope, goal, baseline: adapter.captureBaseline(goal, initial) };
+  const possession: AdapterEvidence = { evidence_id: "development-possession", adapter_id: adapter.descriptor.adapter.id,
+    schema: { id: "observation_v3", version: 3, hash: adapter.descriptor.observation.schema_hash },
+    scope, observed_at: current.captured_at, data: JSON.parse(JSON.stringify(current)) };
+  expect(adapter.verifyCompletion(manifest, [possession])).toMatchObject({
+    status: "incomplete", reason: "authoritative_own_production_not_observed" });
+  const production = adapter.effectEvidence!(scope, "development-production", { kind: "craft", item: "iron_pickaxe", executions: 1 },
+    { status: "succeeded", summary: "Contract-only confirmed iron craft", evidence: { effect_confirmed: true, inventory_receipt_confirmed: true,
+      inventory_before: {}, inventory_after: { iron_pickaxe: 1 } } }, new Date(now - 500).toISOString());
+  expect(adapter.verifyCompletion(manifest, [...production, possession])).toMatchObject({
+    status: "verified", evidence_refs: ["development-production:production", "development-possession"] });
+  expect(adapter.verifyCompletion({ ...manifest }, [possession]).status).toBe("incomplete");
 });
 
 test("arbitrary natural-language task defaults to custom and has no independent verifier", () => {

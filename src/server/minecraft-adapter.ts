@@ -60,6 +60,7 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
     obtain_stone: goal("obtain_stone", "minecraft_possession_v2", { criterion: "stone_or_cobblestone_inventory_gain" }),
     craft_crafting_table: goal("craft_crafting_table", "minecraft_possession_v2", { criterion: "produced_and_retained", item: "crafting_table" }),
     craft_stone_pickaxe: goal("craft_stone_pickaxe", "minecraft_possession_v2", { criterion: "produced_and_retained", item: "stone_pickaxe" }),
+    craft_iron_pickaxe: goal("craft_iron_pickaxe", "minecraft_possession_v2", { criterion: "produced_and_retained", item: "iron_pickaxe" }),
     collect_and_craft_table: goal("collect_and_craft_table", "minecraft_collection_craft_v2", { criterion: "prior_own_wood_then_produced_retained_table" }),
     custom: { adapter_id: adapterId, goal_id: "custom", verifier: null, parameters: {} },
   };
@@ -69,6 +70,7 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
     obtain_stone: { label: "Obtain stone", prompt: "Acquire additional own stone or cobblestone inventory relative to the run-start baseline." },
     craft_crafting_table: { label: "Craft a crafting table", prompt: "Produce a crafting table with authoritative own effect evidence and retain a table in fresh alive inventory." },
     craft_stone_pickaxe: { label: "Craft a stone pickaxe", prompt: "Produce a stone pickaxe with authoritative own effect evidence and retain it in fresh alive inventory." },
+    craft_iron_pickaxe: { label: "Craft an iron pickaxe", prompt: "Produce an iron pickaxe with authoritative own effect evidence and retain it in fresh alive inventory." },
     collect_and_craft_table: { label: "Collect wood and craft a table", prompt: "Establish own wood acquisition before producing a crafting table, then retain a table in fresh alive inventory." },
     custom: { label: "Custom task", prompt: "Pursue the supplied task; task_finish reports unverified model completion, never trusted verification." },
   };
@@ -231,7 +233,7 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
         return state;
       };
       for (const key of Object.keys(wood)) { const state = lifeProgress(Number(key)); if (state) state.wood = wood[key]!; }
-      for (const product of products) if (product.item === "crafting_table" || product.item === "stone_pickaxe") {
+      for (const product of products) if (product.item === "crafting_table" || product.item === "stone_pickaxe" || product.item === "iron_pickaxe") {
         const state = lifeProgress(product.life);
         if (state && (!state.products[product.item] || product.at > state.products[product.item]!.at)) state.products[product.item] = product;
       }
@@ -248,7 +250,7 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
       if (selected.goal_id === "collect_wood" || selected.goal_id === "obtain_stone")
         return gain(counts, initial.inventory, selected.goal_id === "collect_wood")
           ? verdict("verified", "own_inventory_gain", [latestRef]) : verdict("incomplete", "eligible_inventory_gain_not_observed");
-      const item = selected.goal_id === "craft_stone_pickaxe" ? "stone_pickaxe" : "crafting_table";
+      const item = selected.goal_id === "craft_stone_pickaxe" ? "stone_pickaxe" : selected.goal_id === "craft_iron_pickaxe" ? "iron_pickaxe" : "crafting_table";
       if ((counts[item] ?? 0) <= 0) return verdict("incomplete", "produced_item_not_retained");
       for (const product of products) {
         if (product.item !== item || product.life !== latest.life.life_id || product.at > capturedAt) continue;

@@ -13,6 +13,7 @@ import { gameActionSchema } from "../src/shared/validation.ts";
 import { targetRefSchema } from "../src/shared/control.ts";
 import type { TargetRef } from "../src/shared/control.ts";
 import { NativeFixture, bounded, evidence, pause, requireProof, until } from "../src/evaluation/native-game.ts";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import { createEvaluationCaps } from "../src/evaluation/config.ts";
 import { assertNativeArtifactFresh, requireTierOptIn } from "../src/evaluation/tiers.ts";
 import { NATURAL_SCENARIOS, captureScenarioVerification, verifyScenarioCompletion } from "../src/evaluation/adapter-scenarios.ts";
@@ -497,14 +498,17 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
       createAgent: async (options: { tools: AgentTool[] }) => {
         let gate: Parameters<Agent["setBeforeModelCall"]>[0] | undefined;
         let cancelled = false, tools = options.tools;
+        const hooks = new DiagnosticModelHooks();
         const api = {
           beforeToolCall: undefined as ((context: { tool: AgentTool; toolCall: { arguments: Record<string, unknown> }; args: Record<string, unknown> }) => unknown) | undefined,
+          addBeforeModelCallHook: hooks.add,
           setBeforeModelCall: (hook: Parameters<Agent["setBeforeModelCall"]>[0]) => { gate = hook; },
           subscribe: () => () => {}, replaceMessages: () => {}, setTools: (next: AgentTool[]) => { tools = next; },
           abort: () => { cancelled = true; release?.(); }, waitForIdle: async () => { await active.catch(() => {}); },
           prompt: () => {
             active = (async () => {
               if (cancelled) return;
+              await hooks.run(scope.signal, { systemPrompt: [], messages: [], tools });
               const receipt = await gate?.({ systemPrompt: [], messages: [], tools });
               if (receipt?.stop || cancelled) return;
               if (admitted) { const waiting = Promise.withResolvers<void>(); release = waiting.resolve; if (cancelled) release(); await waiting.promise; return; }

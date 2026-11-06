@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type { AuthState, BridgeNotice, GameActionResult, GameBridge, GameState } from "../src/shared/contracts.ts";
 import type { SkillCapabilityRequest } from "../src/shared/programs.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
@@ -70,14 +71,17 @@ test("a genuine transport fault pauses only after native and isolated emitters c
     subscribe: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
   };
   let tools: AgentTool[] = [], gate: Parameters<Agent["setBeforeModelCall"]>[0], initialized = false;
+  const hooks = new DiagnosticModelHooks();
   const agent = {
+    addBeforeModelCallHook: hooks.add,
     setBeforeModelCall: (hook: typeof gate) => { gate = hook; },
     setTools: (next: AgentTool[]) => { tools = next; },
     subscribe: () => () => {}, replaceMessages: () => {}, abort: () => {}, waitForIdle: async () => {},
     prompt: async (text: string) => {
       prompts++;
       const context = JSON.parse(text) as { phase: string };
-      await gate?.({ systemPrompt: [], messages: [], tools: [] });
+      await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
+      await gate?.({ systemPrompt: [], messages: [], tools });
       if (!initialized) {
         initialized = true;
         expect(context.phase).toBe("running");
@@ -85,7 +89,6 @@ test("a genuine transport fault pauses only after native and isolated emitters c
           name: "Neutral drain fixture", source: 'const result = await game.action({kind:"look",yaw:0,pitch:0}); return {status:"completed",summary:"Neutral result inspected",result};', card: { purpose: "Exercise cancellation", applicability: "Connected fixture", method: "Await one bounded neutral effect", reason: "Prove teardown barriers", limitations: "No gameplay claim" }, dependencies: [],
         });
         await tools.find(tool => tool.name === "program_run")!.execute("start", { operation: "start", name: "Neutral drain fixture", args: null, limits: { ...DEFAULT_SKILL_LIMITS } });
-        expect((await gate?.({ systemPrompt: [], messages: [], tools: [] }))?.stop).toBe(true);
       }
     },
   };

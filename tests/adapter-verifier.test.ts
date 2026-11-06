@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type { AuthManager } from "../src/server/auth.ts";
 import type { GameBridge, ObservationV3, RuntimeAdapter, VerificationManifest } from "../src/shared/contracts.ts";
 import { adapterDescriptorSchema } from "../src/shared/adapter.ts";
@@ -80,7 +81,8 @@ async function runtimeFixture(custom = false, unsupportedVerifier = false) {
     subscribe: () => () => {},
   } as unknown as GameBridge;
   const selectTools = (selected: AgentTool[]) => { for (const tool of selected) tools.set(tool.name, tool); };
-  const agent = { setBeforeModelCall: () => {}, setTools: selectTools, subscribe: () => () => {},
+  const hooks = new DiagnosticModelHooks();
+  const agent = { addBeforeModelCallHook: hooks.add, setBeforeModelCall: () => {}, setTools: selectTools, subscribe: () => () => {},
     replaceMessages: () => {}, prompt: async (text: string) => { contexts.push(JSON.parse(text)); prompted.resolve(); },
     abort: () => {}, waitForIdle: async () => {} } as unknown as Agent;
   const auth = { snapshot: () => ({ status: "ready", models: [{ id: "fixture-model", input_modalities: ["text"] }] }),

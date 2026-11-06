@@ -4,6 +4,7 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { AuthManager } from "../server/auth.ts";
 import type { Store } from "../server/store.ts";
 import type { AuthState } from "../shared/contracts.ts";
+import { DiagnosticModelHooks } from "./diagnostic-model-hooks.ts";
 import { bounded, requireProof } from "./native-game.ts";
 
 const MODEL = "zero-provider-native-diagnostic";
@@ -73,8 +74,10 @@ export class DiagnosticAgent {
         let cancelled = false;
         let active: Promise<void> = Promise.resolve();
         let tools = [...options.tools];
+        const hooks = new DiagnosticModelHooks();
         const api = {
           beforeToolCall: undefined as Agent["beforeToolCall"],
+          addBeforeModelCallHook: hooks.add,
           setBeforeModelCall: (hook: Parameters<Agent["setBeforeModelCall"]>[0]) => { gate = hook; },
           subscribe: () => () => {}, replaceMessages: () => {},
           setTools: (selected: AgentTool[]) => { tools = [...selected]; this.transcript.push({ type: "synthetic_sdk_tools_set", tools: tools.map(tool => tool.name) }); },
@@ -92,6 +95,7 @@ export class DiagnosticAgent {
               requireProof(probe && this.store.getRun(probe.run_id), "Synthetic planning request has no current infrastructure run");
               const runId = probe.run_id;
               this.transcript.push({ type: "synthetic_prompt", run_id: runId, phase: context.phase, role: context.role });
+              await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
               const admission = await gate?.({ systemPrompt: [], messages: [], tools });
               if (admission?.stop || cancelled) return;
               this.synthetic_gate_admissions++;

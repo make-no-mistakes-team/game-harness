@@ -6,6 +6,7 @@ import type { AuthManager } from "../src/server/auth.ts";
 import type { Runtime } from "../src/server/runtime.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { ActionArbiter } from "../src/server/action-arbiter.ts";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import { bounded, requireProof, until } from "../src/evaluation/native-game.ts";
 import { minecraftActionSchema } from "../src/shared/minecraft.ts";
 import type { VisibleGuiHarness } from "./native-visible-gui.ts";
@@ -106,8 +107,10 @@ export async function runVisibleGuiWorkerCase(entry: Record<string, unknown>, ct
     createAgent: async (options: { tools: AgentTool[] }) => {
       let gate: Parameters<Agent["setBeforeModelCall"]>[0] | undefined, cancelled = false;
       let tools = [...options.tools];
+      const hooks = new DiagnosticModelHooks();
       const api = {
         beforeToolCall: undefined as Agent["beforeToolCall"],
+        addBeforeModelCallHook: hooks.add,
         setBeforeModelCall: (hook: Parameters<Agent["setBeforeModelCall"]>[0]) => { gate = hook; },
         subscribe: () => () => {}, replaceMessages: () => {}, setTools: (next: AgentTool[]) => { tools = [...next]; },
         abort: () => { cancelled = true; for (const release of waiters) release(); waiters.clear(); },
@@ -117,6 +120,7 @@ export async function runVisibleGuiWorkerCase(entry: Record<string, unknown>, ct
           active = (async () => {
             const request = JSON.parse(text) as { phase?: string; role?: string };
             if (cancelled) return;
+            await hooks.run(ctx.signal, { systemPrompt: [], messages: [], tools });
             const permission = await gate?.({ systemPrompt: [], messages: [], tools });
             if (permission?.stop || cancelled) return;
             // Match the existing DiagnosticAgent: returning an effect-free

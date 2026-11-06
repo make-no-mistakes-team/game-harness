@@ -8,6 +8,7 @@ import type { AgentTool, StreamFn } from "@oh-my-pi/pi-agent-core/types";
 import type { AssistantMessage, ToolCall } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type { GameActionResult, GameBridge, Json, ObservationV3 } from "../src/shared/contracts.ts";
 import type {
   SkillLimits,
@@ -432,7 +433,9 @@ return {status:"completed",summary:"Explicit fresh bounded decision after pre-ad
         models: [{ id: "fixture-model", name: "Fixture", provider: "fixture", context_window: null }], login: null, error: null }),
       createAgent: async (configuration: { tools: AgentTool[] }) => {
         tools = configuration.tools;
+        const hooks = new DiagnosticModelHooks();
         return {
+          addBeforeModelCallHook: hooks.add,
           setTools: (value: AgentTool[]) => { tools = value; },
           setBeforeModelCall: (value: typeof before) => { before = value; },
           subscribe: () => () => {}, replaceMessages: () => {}, abort: () => {}, waitForIdle: async () => {},
@@ -440,7 +443,9 @@ return {status:"completed",summary:"Explicit fresh bounded decision after pre-ad
             if (started) return;
             started = true;
             try {
-              const admission = await before?.({ systemPrompt: [], messages: [], tools }, new AbortController().signal);
+              const signal = new AbortController().signal;
+              await hooks.run(signal, { systemPrompt: [], messages: [], tools });
+              const admission = await before?.({ systemPrompt: [], messages: [], tools }, signal);
               if (admission?.stop) throw new Error("Fixture admission unexpectedly stopped");
               const submit = tools.find(tool => tool.name === "program_submit")!;
               const result = await submit.execute("registered-range-submission", { name: "range recovery", source, args: null });

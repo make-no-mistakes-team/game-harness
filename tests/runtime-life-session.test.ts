@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type { AuthState, BridgeNotice, GameAction, GameActionResult, GameBridge, GameState, Json, PlayerLife } from "../src/shared/contracts.ts";
 import type { MinecraftObservation } from "../src/shared/minecraft.ts";
 import { minecraftActionSchema } from "../src/shared/minecraft.ts";
@@ -139,8 +140,10 @@ async function fixture(options: Options = {}) {
       agents++; selectTools(configuration.tools);
       let pending: Promise<void> | null = null;
       let controller: AbortController | null = null;
+      const hooks = new DiagnosticModelHooks();
       const agent = {
         beforeToolCall: undefined as Agent["beforeToolCall"],
+        addBeforeModelCallHook: hooks.add,
         setBeforeModelCall: (value: typeof gate) => { gate = value; }, setTools: selectTools,
         subscribe: () => () => {}, replaceMessages: () => {},
         abort: () => controller?.abort(),
@@ -149,6 +152,7 @@ async function fixture(options: Options = {}) {
           const signal = new AbortController(); controller = signal;
           const work = (async () => {
             const context = JSON.parse(text) as PromptContext; contexts.push(context);
+            await hooks.run(signal.signal, { systemPrompt: [], messages: [], tools: activeTools });
             const admission = await gate?.({ systemPrompt: [], messages: [], tools: activeTools }, signal.signal);
             if (admission?.stop || signal.signal.aborted) return;
             if (options.providerFailure && agents === 1 && rootCompleted)
@@ -167,6 +171,7 @@ async function fixture(options: Options = {}) {
                 const plan = runtime.planningView(created.run_id)!;
                 rejectedGuard.resolve({ result: rejected.details, deadline_at: plan.deadline_at });
                 expect(rejected.isError).toBe(true);
+                await hooks.run(signal.signal, { systemPrompt: [], messages: [], tools: activeTools });
                 const correction = await gate?.({ systemPrompt: [], messages: [], tools: activeTools }, signal.signal);
                 if (correction?.stop) throw new Error(`Explicit guard correction blocked: ${correction.reason}`);
               }

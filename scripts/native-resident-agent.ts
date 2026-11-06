@@ -3,6 +3,7 @@ import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type { AuthManager } from "../src/server/auth.ts";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import { requireProof } from "../src/evaluation/native-game.ts";
 
 // Evaluator-authored smoke programs. Never acquired/model-authored gameplay,
@@ -164,9 +165,11 @@ export class ResidentSdkCaller {
         models: [{ id: caller.modelId, name: caller.modelId, provider: "private-diagnostic", context_window: null }], login: null, error: null }),
       createAgent: async (options: { tools: AgentTool[] }) => {
         let gate: Parameters<Agent["setBeforeModelCall"]>[0] | undefined;
+        const hooks = new DiagnosticModelHooks();
         caller.tools = [...options.tools]; caller.stopped = false;
         const api = {
           beforeToolCall: undefined as Agent["beforeToolCall"],
+          addBeforeModelCallHook: hooks.add,
           setBeforeModelCall: (hook: Parameters<Agent["setBeforeModelCall"]>[0]) => { gate = hook; },
           subscribe: () => () => {}, replaceMessages: () => {},
           setTools: (tools: AgentTool[]) => { caller.tools = [...tools]; },
@@ -176,6 +179,7 @@ export class ResidentSdkCaller {
             caller.active = (async () => {
               const request = JSON.parse(text) as { role?: string; phase?: string };
               requireProof(gate, "Actual SDK before-model gate was not installed");
+              await hooks.run(undefined, { systemPrompt: [], messages: [], tools: caller.tools });
               const permission = await gate({ systemPrompt: [], messages: [], tools: caller.tools });
               caller.transcript.push({ kind: "synthetic_request", prompt: text, permission, at_host_ms: performance.now(),
                 offered_tools: caller.tools.map(tool => ({ name: tool.name, parameters: tool.parameters })) });

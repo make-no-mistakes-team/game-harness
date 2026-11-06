@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type { AuthState, BridgeNotice, GameBridge, GameState, ObservationV3 } from "../src/shared/contracts.ts";
 import type { AuthManager } from "../src/server/auth.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
@@ -37,7 +38,8 @@ async function fixture() {
   const authState: AuthState = { status: "ready", authenticated: true, provider: "openai-codex", account_label: null,
     models: [{ id: "fixture-image-model", name: "No provider fixture", provider: "fixture", context_window: null,
       input_modalities: ["text", "image"], capability_provenance: "discovered_sdk_descriptor_not_live_vision" }], login: null, error: null };
-  const agent = { setBeforeModelCall: () => {}, setTools: () => {}, subscribe: () => () => {},
+  const hooks = new DiagnosticModelHooks();
+  const agent = { addBeforeModelCallHook: hooks.add, setBeforeModelCall: () => {}, setTools: () => {}, subscribe: () => () => {},
     replaceMessages: () => {}, prompt: async () => {}, abort: () => {}, waitForIdle: async () => {} } as unknown as Agent;
   const auth = { snapshot: () => authState, createAgent: async () => agent, releaseAgent: async () => {} } as unknown as AuthManager;
   const sandbox = { snapshot: () => ({ status: "ready", error: null }) } as unknown as SandboxService;

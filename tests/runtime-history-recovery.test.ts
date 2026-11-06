@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core/types";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type {
   GameActionResult,
   GameBridge,
@@ -130,6 +131,7 @@ async function fixture(unconfirmedBarrier = false) {
       let tools = configuration.tools,
         pending: Promise<void> | null = null,
         prompted = false;
+      const hooks = new DiagnosticModelHooks();
       const select = (value: AgentTool[]) => {
         tools = value;
         if (ordinal === 1) firstTools = value;
@@ -143,6 +145,7 @@ async function fixture(unconfirmedBarrier = false) {
         return await selected.execute(crypto.randomUUID(), input);
       };
       return {
+        addBeforeModelCallHook: hooks.add,
         setBeforeModelCall: () => {},
         setTools: select,
         subscribe: () => () => {},
@@ -155,6 +158,7 @@ async function fixture(unconfirmedBarrier = false) {
           if (prompted) return;
           prompted = true;
           const work = (async () => {
+            await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
             if (ordinal === 1) {
               const written = await invoke("program_write", {
                 name,

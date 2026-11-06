@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentEvent, AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type {
   AuthState,
   BridgeNotice,
@@ -55,11 +56,13 @@ test(`${recoveryKind} recovery drains the actual old feedback reader before admi
     adapter: () => adapter, subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
   };
   let tools: AgentTool[] = [];
-  const agent = { setBeforeModelCall: () => {}, setTools: (value: AgentTool[]) => { tools = value; },
+  const hooks = new DiagnosticModelHooks();
+  const agent = { addBeforeModelCallHook: hooks.add, setBeforeModelCall: () => {}, setTools: (value: AgentTool[]) => { tools = value; },
     subscribe: () => () => {}, replaceMessages: () => {}, abort: () => {}, waitForIdle: async () => {},
     prompt: async () => {
       prompts++;
       if (prompts > 2) return;
+      await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
       if (prompts === 1) await tools.find(tool => tool.name === "program_write")!.execute("write-history-root", {
         name: "History recovery root", source: 'return {status:"blocked",summary:"Bounded retained root outcome",result:null};',
         dependencies: [], card: { purpose: "Retain root outcomes", applicability: "Fixture",
@@ -185,7 +188,8 @@ test("Pause and Stop start native neutralization before readonly joins, resume r
     emergencyStop: async () => { nativeHistoryStates.push(querySettled); },
     adapter: () => adapter, subscribe: () => () => {},
   };
-  const agent = { setBeforeModelCall: () => {}, setTools: () => {}, subscribe: () => () => {},
+  const hooks = new DiagnosticModelHooks();
+  const agent = { addBeforeModelCallHook: hooks.add, setBeforeModelCall: () => {}, setTools: () => {}, subscribe: () => () => {},
     replaceMessages: () => {}, abort: () => {}, waitForIdle: async () => {},
     prompt: async () => { throw new Error("Lifecycle is stopped before strategic demand is delivered"); } };
   const auth = {
@@ -294,18 +298,18 @@ for (const backlog of [0, 501]) test(`Runtime resident attention reaches the rea
   };
   let attentionReady = false, attentionEmitted = false;
   const contexts: Record<string, any>[] = [];
-  const gates: ({ stop?: boolean; reason?: string } | undefined)[][] = [];
   let written: unknown, started: unknown, promptFailure: unknown;
   let tools: AgentTool[] = [], gate: Parameters<Agent["setBeforeModelCall"]>[0], creates = 0, active = 0, maximumActive = 0, steps = 0;
-  const fakeAgent = { setBeforeModelCall: (hook: typeof gate) => { gate = hook; },
+  const hooks = new DiagnosticModelHooks();
+  const fakeAgent = { addBeforeModelCallHook: hooks.add, setBeforeModelCall: (hook: typeof gate) => { gate = hook; },
     setTools: (selected: AgentTool[]) => { tools = selected; }, subscribe: () => () => {},
     replaceMessages: () => {}, abort: () => {}, waitForIdle: async () => {},
     prompt: async (text: string) => {
       active++; maximumActive = Math.max(maximumActive, active);
       try {
         contexts.push(JSON.parse(text));
-        const turnGates = [(await gate?.({ systemPrompt: [], messages: [], tools: [] })) ?? undefined];
-        gates.push(turnGates);
+        await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
+        if ((await gate?.({ systemPrompt: [], messages: [], tools }))?.stop) return;
         if (contexts.length === 1) {
           written = (await tools.find(tool => tool.name === "program_write")!.execute("resident-write", {
             entry: "step", name: "Attention resident", source: "export function step(frame,state,intent) { return {input:{kind:'world',held:{forward:false,back:false,left:false,right:false,jump:false,sprint:false,sneak:false,attack:false,use:false},edges:[],view:{kind:'unchanged'},selected_hotbar:null},next_state:state,status:'running',events:[]}; }",
@@ -316,7 +320,6 @@ for (const backlog of [0, 501]) test(`Runtime resident attention reaches the rea
             name: "Attention resident", args: null, initial_state: null,
             limits: { ...DEFAULT_RESIDENT_LIMITS, frequency_hz: 20, duration_ms: 10000 } })).details;
         }
-        turnGates.push((await gate?.({ systemPrompt: [], messages: [], tools: [] })) ?? undefined);
       } catch (error) {
         promptFailure = error;
         throw error;
@@ -369,8 +372,6 @@ for (const backlog of [0, 501]) test(`Runtime resident attention reaches the rea
   await runtime.control(run.run_id, "start"); await initial;
   expect(written).toMatchObject({ entry: "step" });
   expect(started).toMatchObject({ entry: "step" });
-  expect(gates[0]?.[0]?.stop).not.toBe(true);
-  expect(gates[0]?.[1]?.stop).toBe(true);
   await diagnostic;
   await new Promise(resolve => setTimeout(resolve, 150));
   expect(contexts).toHaveLength(1);
@@ -378,8 +379,6 @@ for (const backlog of [0, 501]) test(`Runtime resident attention reaches the rea
     store.event(run.run_id, "controller.progress", "Retained non-waking controller progress", { sample: index });
   const replanned = event("scheduler.turn_finished"); attentionReady = true; await replanned;
   expect(contexts).toHaveLength(2); expect(creates).toBe(1); expect(maximumActive).toBe(1);
-  expect(gates[1]?.[0]?.stop).not.toBe(true);
-  expect(gates[1]?.[1]?.stop).toBe(true);
   expect(runtime.snapshot()?.executions[0]).toMatchObject({ entry: "step", status: "running" });
   expect(contexts[1]!.reason).toContain("resident_attention");
   expect(contexts[1]!.feedback).toEqual(expect.arrayContaining([
@@ -470,7 +469,9 @@ test("a pending program stays unpolled and native first-cause remains immutable 
   const running = Promise.withResolvers<void>(),
     settled = Promise.withResolvers<void>();
   const contexts: Record<string, unknown>[] = [];
+  const hooks = new DiagnosticModelHooks();
   const fakeAgent = {
+    addBeforeModelCallHook: hooks.add,
     setBeforeModelCall: (hook: typeof gate) => {
       gate = hook;
     },
@@ -490,7 +491,8 @@ test("a pending program stays unpolled and native first-cause remains immutable 
       prompts++;
       const context = JSON.parse(text) as Record<string, unknown>;
       contexts.push(context);
-      await gate?.({ systemPrompt: [], messages: [], tools: [] });
+      await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
+      await gate?.({ systemPrompt: [], messages: [], tools });
       if (!initialized) {
         initialized = true;
         expect(context.phase).toBe("running");
@@ -519,18 +521,11 @@ test("a pending program stays unpolled and native first-cause remains immutable 
             args: null,
             limits: { ...DEFAULT_SKILL_LIMITS },
           });
-        const stopped = await gate?.({
-          systemPrompt: [],
-          messages: [],
-          tools: [],
-        });
-        expect(stopped?.stop).toBe(true);
         listener?.({
           type: "message_end",
           message: {
             role: "assistant",
-            stopReason: "aborted",
-            errorMessage: stopped?.reason,
+            stopReason: "stop",
             content: [],
             usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           },

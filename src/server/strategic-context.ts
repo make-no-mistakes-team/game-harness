@@ -248,16 +248,21 @@ export class StrategicContext {
     const fields = object(value);
     if (fields) for (const [name, content] of Object.entries(fields)) visit(name, content as Json, 0);
     else visit("reference", value, 0);
-    // Keep authored-program semantics and native invocation contracts first.
-    // Action bounds precede adapter metadata and read/result DTOs, including
-    // schemas embedded in otherwise small native-method references.
+    // Keep executable mechanics and native invocation contracts first.
+    // Action bounds precede other reference prose, adapter metadata and DTOs;
+    // whole-source and unknown-effect custody compete for the same request cap.
     // Action alternatives stay whole; oversized ones are explicitly omitted.
     // Stable order keeps the latest requested topic first within each class.
     const priority = (section: HelpSection) => {
       if (section.topic === "game" && this.actionHelpSection !== null &&
         (section.section === this.actionHelpSection || section.section.startsWith(`${this.actionHelpSection}.`))) return 1;
-      if (this.helpSchemas.has(section)) return 3;
-      return section.topic === "game" && (section.section === "adapter" || section.section.startsWith("adapter.")) ? 2 : 0;
+      if (this.helpSchemas.has(section)) return 4;
+      if (section.topic === "game" && (section.section === "adapter" || section.section.startsWith("adapter."))) return 3;
+      if (section.topic === "game" && (section.section === "validation" || section.section === "lifecycle" ||
+        section.section === "progress")) return 2;
+      if (section.topic === "programs" && section.section !== "body" && section.section !== "world_view" &&
+        section.section !== "target_transitions" && section.section !== "resident" && !section.section.startsWith("resident.")) return 2;
+      return 0;
     };
     this.help = [...sections, ...this.help].sort((a, b) => priority(a) - priority(b));
     let used = 0;
@@ -624,6 +629,13 @@ export class StrategicContext {
       programs: [] as { name: string; version: number; hash: string; source?: string; source_omission?: string;
         last_execution?: NonNullable<ReturnType<StrategicContext["programExecution"]>> }[],
       omissions, omitted_records: 0, omitted_unknown_operations: this.omittedUnknown };
+    // Bound notices before allocation, not after they have displaced useful
+    // references. Notices that cannot be retained still contribute to the count.
+    while (omissions.length > 16) { omissions.shift(); value.omitted_records++; }
+    const omit = (entry: Omission) => {
+      if (omissions.length === 16) { omissions.shift(); value.omitted_records++; }
+      omissions.push(entry);
+    };
     const encoded = () => JSON.stringify({ strategic_context: value });
     let used = 0;
     for (const program of candidates) {
@@ -638,25 +650,25 @@ export class StrategicContext {
           source_omission: "Use program_inspect view source for this exact version", ...(metadata ? { last_execution: metadata } : {}) };
         if (metadata && (used + bytes(reference) > SOURCE_BYTES || Buffer.byteLength(encoded()) + bytes(reference) + 512 > INPUT_BYTES)) {
           delete reference.last_execution;
-          omissions.push({ kind: "program_execution", reference: `${program.name}@${program.version}`,
+          omit({ kind: "program_execution", reference: `${program.name}@${program.version}`,
             reason: "reuse_metadata_byte_budget_use_program_inspect" });
         }
         value.programs.push(reference); used += bytes(reference);
-        omissions.push({ kind: "source", reference: `${program.name}@${program.version}`, reason: "whole_source_byte_budget", original_bytes: size });
+        omit({ kind: "source", reference: `${program.name}@${program.version}`, reason: "whole_source_byte_budget", original_bytes: size });
       }
     }
     for (const section of this.help) {
       if (Buffer.byteLength(encoded()) + bytes(section) + 512 <= INPUT_BYTES) value.requested_help.push(section);
-      else omissions.push({ kind: "help", reference: `${section.topic}.${section.section}`, reason: "request_byte_budget", original_bytes: bytes(section) });
+      else omit({ kind: "help", reference: `${section.topic}.${section.section}`, reason: "request_byte_budget", original_bytes: bytes(section) });
     }
     // The only potentially adapter-sized mandatory field is the binding list.
     if (Buffer.byteLength(encoded()) > INPUT_BYTES) {
       contracts.game.adapter_bindings = [];
-      omissions.push({ kind: "bindings", reference: "game", reason: "request_byte_budget_use_help_game" });
+      omit({ kind: "bindings", reference: "game", reason: "request_byte_budget_use_help_game" });
     }
     // Metadata itself is bounded; never let many omission notices defeat the
     // input cap. Count what no longer fits rather than implying full recall.
-    while (omissions.length > 16 || Buffer.byteLength(encoded()) > INPUT_BYTES && omissions.length > 1) {
+    while (Buffer.byteLength(encoded()) > INPUT_BYTES && omissions.length > 1) {
       omissions.pop(); value.omitted_records++;
     }
     while (Buffer.byteLength(encoded()) > INPUT_BYTES && value.requested_help.length) {

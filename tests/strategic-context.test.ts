@@ -461,14 +461,14 @@ test("actual continuation after help receives newly requested useful context in 
   expect(JSON.stringify(retained(f.state.requests[1])?.requested_help)).toContain("fixture_read");
 });
 
-test("actual requested program references survive game schema pressure in the next ordinary request", async () => {
-  const f = fixture(), program = await f.program();
+for (const topics of [["programs", "game"], ["game", "programs"]]) test(`actual requested mechanics survive source pressure after help ${topics.join(" then ")}`, async () => {
+  const f = fixture(), program = await f.program(`/*${"s".repeat(9000)}*/return {status:"completed",summary:"reference",result:null};`);
   const programs = JSON.parse(JSON.stringify(programHelp("programs", f.adapter)));
   const game = JSON.parse(JSON.stringify(programHelp("game", f.adapter)));
   f.state.helpResults.programs = programs;
   f.state.helpResults.game = game;
   await f.planner.start(1);
-  await f.turn([f.requestHelp("programs"), f.requestHelp("game"), settlement()]);
+  await f.turn([...topics.map(topic => f.requestHelp(topic)), settlement()]);
   await f.turn();
   const assertRequestedReferences = () => {
     const request = f.state.requests.at(-1)!, context = retained(request)!;
@@ -488,21 +488,22 @@ test("actual requested program references survive game schema pressure in the ne
     const union = Array.isArray(actionSchema.oneOf) ? "oneOf" : "anyOf";
     const alternatives = actionSchema[union];
     expect(Array.isArray(alternatives)).toBe(true);
-    const moveIndex = alternatives.findIndex((branch: any) => branch.properties?.kind?.const === "move");
-    expect(moveIndex).toBeGreaterThanOrEqual(0);
-    // Accept a whole enclosing schema too, but never reconstruct an action
-    // from detached properties that may omit required fields or enum values.
-    const path = ["schemas", "capabilities", `${capability.id}@${capability.version}`, union, moveIndex];
-    let reference = "", retainedMove: unknown;
-    for (let index = 0; index < path.length; index++) {
-      const key = path[index]!;
-      reference += typeof key === "number" ? `[${key}]` : `${index ? "." : ""}${key}`;
-      const section = context.requested_help.find((entry: any) => entry.topic === "game" && entry.section === reference);
-      if (!section) continue;
-      retainedMove = path.slice(index + 1).reduce((value: any, child) => value?.[child], section.content);
-      if (retainedMove !== undefined) break;
+    for (const kind of ["move", "craft"]) {
+      const actionIndex = alternatives.findIndex((branch: any) => branch.properties?.kind?.const === kind);
+      expect(actionIndex).toBeGreaterThanOrEqual(0);
+      // Accept an enclosing schema, never detached properties with missing bounds.
+      const path = ["schemas", "capabilities", `${capability.id}@${capability.version}`, union, actionIndex];
+      let reference = "", retainedAction: unknown;
+      for (let index = 0; index < path.length; index++) {
+        const key = path[index]!;
+        reference += typeof key === "number" ? `[${key}]` : `${index ? "." : ""}${key}`;
+        const section = context.requested_help.find((entry: any) => entry.topic === "game" && entry.section === reference);
+        if (!section) continue;
+        retainedAction = path.slice(index + 1).reduce((value: any, child) => value?.[child], section.content);
+        if (retainedAction !== undefined) break;
+      }
+      expect(retainedAction).toEqual(alternatives[actionIndex]);
     }
-    expect(retainedMove).toEqual(alternatives[moveIndex]);
     for (const [name, method] of Object.entries(game.methods) as [string, any][]) {
       if (!method.result_schema) continue;
       expect(context.requested_help).toContainEqual({

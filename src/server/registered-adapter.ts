@@ -6,6 +6,11 @@ import { adapterCompatibility } from "./adapter-contract.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { isValidJsonSchema, validateJsonSchemaValue, type JsonSchemaValidationIssue } from "@oh-my-pi/pi-ai/utils/schema";
 
+const expectedJsonTypeConstraints: Readonly<Record<string, string>> = {
+  string: "must be a string", number: "must be a number", integer: "must be an integer",
+  boolean: "must be a boolean", object: "must be an object", array: "must be an array", null: "must be null",
+};
+
 function declaredParameters(document: Json, names = new Set<string>()): Set<string> {
   if (document && typeof document === "object") {
     if (!Array.isArray(document) && document.properties && typeof document.properties === "object" && !Array.isArray(document.properties))
@@ -25,7 +30,10 @@ function requestConstraint(issue: JsonSchemaValidationIssue, parameters: Readonl
   const numeric = ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"].includes(issue.keyword ?? "") &&
     /^must be (?:>=|<=|>|<) -?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(issue.message) && issue.message.length <= 100;
   if (issue.fromUnionBranch) return "arguments must match the registered capability schema";
-  return `${path} ${numeric ? issue.message : issue.keyword === "required" ? "is required" : "must match the registered constraint"}`;
+  const expectedType = issue.keyword === "type" && issue.expectedTypes?.length === 1 ? issue.expectedTypes[0] : undefined;
+  const typeConstraint = expectedType && Object.hasOwn(expectedJsonTypeConstraints, expectedType)
+    ? expectedJsonTypeConstraints[expectedType] : undefined;
+  return `${path} ${numeric ? issue.message : typeConstraint ?? (issue.keyword === "required" ? "is required" : "must match the registered constraint")}`;
 }
 
 function requestVariants(document: Json): { tags: [string, Json][]; document: Json }[] {

@@ -8,11 +8,11 @@ import { RegisteredAdapterContract } from "../src/server/registered-adapter.ts";
 import { capabilityFailure, programDiagnostic } from "../src/server/program-diagnostics.ts";
 import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 
-function fixture() {
+function fixture(capabilitySchema?: AdapterSchemaCatalog["capabilities"][string]) {
   const schemas: AdapterSchemaCatalog = { observation: jsonSchema.parse(z.toJSONSchema(observationV3Schema)),
     payload: jsonSchema.parse(z.toJSONSchema(z.object({ counter: z.number().int(),
       opaque_usage: z.object({ schema_version: z.literal(2) }).strict() }).strict())),
-    capabilities: { "contract.action@1": jsonSchema.parse(z.toJSONSchema(z.object({ kind: z.literal("press"),
+    capabilities: { "contract.action@1": capabilitySchema ?? jsonSchema.parse(z.toJSONSchema(z.object({ kind: z.literal("press"),
       scope: z.string(), epoch: z.number().int() }).strict())) } };
   const configuration = { counter_visible: true };
   const descriptor: AdapterDescriptor = { descriptor_schema: 1, game: { id: "contract-only", version: "1" },
@@ -116,4 +116,63 @@ test("registered invalid argument diagnostics never echo unknown keys, values or
     type: "ExecutionFailure", message: "Generated program or trusted capability failed; host exception details are not exposed",
     source_hash: "a".repeat(64), location: { mapping: "unmapped" },
   });
+});
+
+test("registered recipes argument diagnostics name the expected string without echoing a supplied object", () => {
+  const adapter = minecraftTestAdapter(), registry = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas);
+  let failure: unknown;
+  try { registry.parseCapability("minecraft.recipes", 1, { item: { item: "oak_planks", INPUT_KEY_SECRET: "INPUT_VALUE_SECRET" } }); }
+  catch (error) { failure = error; }
+  const publicFailure = capabilityFailure(failure);
+  expect(publicFailure.code).toBe("invalid_request");
+  expect(publicFailure.message).toContain("item");
+  expect(publicFailure.message).toMatch(/\bstring\b/);
+  for (const secret of ["oak_planks", "INPUT_KEY_SECRET", "INPUT_VALUE_SECRET"])
+    expect(JSON.stringify(publicFailure)).not.toContain(secret);
+  expect(registry.parseCapability("minecraft.recipes", 1, { item: "oak_planks" })).toEqual({ item: "oak_planks" });
+});
+
+test("registered type diagnostics use only static JSON types and redact caller-authored paths and schema metadata", () => {
+  for (const [type, value] of [
+    ["string", {}], ["number", "INPUT_VALUE_SECRET"],
+    ["integer", 0.5], ["boolean", {}],
+    ["object", []], ["array", {}], ["null", {}],
+  ] as const) {
+    const { registry } = fixture({ type: "object", additionalProperties: {
+      type, title: "SCHEMA_TITLE_SECRET", description: "SCHEMA_DESCRIPTION_SECRET",
+    } });
+    let failure: unknown;
+    try { registry.parseCapability("contract.action", 1, { INPUT_PATH_SECRET: value }); }
+    catch (error) { failure = error; }
+    const publicFailure = capabilityFailure(failure);
+    expect(publicFailure.code).toBe("invalid_request");
+    expect(publicFailure.message).toContain("arguments");
+    expect(publicFailure.message).toMatch(new RegExp(`\\b${type}\\b`));
+    for (const secret of ["INPUT_PATH_SECRET", "INPUT_VALUE_SECRET", "SCHEMA_TITLE_SECRET", "SCHEMA_DESCRIPTION_SECRET"])
+      expect(JSON.stringify(publicFailure)).not.toContain(secret);
+  }
+});
+
+test("ambiguous registered union type diagnostics never present a branch guess as the expected type", () => {
+  for (const keyword of ["anyOf", "oneOf"]) {
+    const { registry } = fixture({ type: "object", properties: { item: {
+      [keyword]: [{ type: "string" }, { type: "number" }],
+    } }, required: ["item"], additionalProperties: false });
+    let failure: unknown;
+    try { registry.parseCapability("contract.action", 1, { item: { INPUT_KEY_SECRET: "INPUT_VALUE_SECRET" } }); }
+    catch (error) { failure = error; }
+    const publicFailure = capabilityFailure(failure);
+    expect(publicFailure.code).toBe("invalid_request");
+    expect(publicFailure.message).toContain("registered capability schema");
+    expect(publicFailure.message).not.toMatch(/\b(?:string|number)\b/);
+    for (const secret of ["INPUT_KEY_SECRET", "INPUT_VALUE_SECRET"])
+      expect(JSON.stringify(publicFailure)).not.toContain(secret);
+  }
+  const { registry } = fixture({ type: "object", properties: { item: { type: ["string", "number"] } }, required: ["item"] });
+  let failure: unknown;
+  try { registry.parseCapability("contract.action", 1, { item: {} }); }
+  catch (error) { failure = error; }
+  const publicFailure = capabilityFailure(failure);
+  expect(publicFailure.code).toBe("invalid_request");
+  expect(publicFailure.message).not.toMatch(/\b(?:string|number)\b/);
 });

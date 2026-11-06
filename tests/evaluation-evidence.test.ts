@@ -517,6 +517,8 @@ const cancelledAuthoring: Record<string, Json> = { ...abortedAuthoring, obsolete
 const cancellationCases: Array<{ name: string; type?: string; details: Record<string, Json>;
   providerError: boolean; providerSettled: boolean }> = [
   { name: "confirmed host cancellation", details: cancelledAuthoring, providerError: false, providerSettled: true },
+  { name: "confirmed host containment fence", details: { ...cancelledAuthoring,
+    host_cancellation: { ...authoringCancellation, reason: "fenced" } }, providerError: false, providerSettled: true },
   { name: "wrong request identity", details: { ...cancelledAuthoring,
     host_cancellation: { ...authoringCancellation, request_id: "different-request" } }, providerError: true, providerSettled: false },
   { name: "wrong role", details: { ...cancelledAuthoring, role: "strategic" }, providerError: true, providerSettled: false },
@@ -528,7 +530,7 @@ const cancellationCases: Array<{ name: string; type?: string; details: Record<st
   { name: "missing root identity", details: { ...cancelledAuthoring,
     host_cancellation: { ...authoringCancellation, root_execution_id: "" } }, providerError: true, providerSettled: false },
   { name: "unapproved close reason", details: { ...cancelledAuthoring,
-    host_cancellation: { ...authoringCancellation, reason: "fenced" } }, providerError: true, providerSettled: false },
+    host_cancellation: { ...authoringCancellation, reason: "provider_lost" } }, providerError: true, providerSettled: false },
   { name: "recovered provider failure despite marker", details: { ...cancelledAuthoring, stop_reason: "toolUse" },
     providerError: true, providerSettled: true },
   { name: "unsettled request despite marker", type: "model.request_unsettled", details: cancelledAuthoring,

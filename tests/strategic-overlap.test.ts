@@ -483,7 +483,8 @@ test("root settlement queues ordinary outcome work behind the cancelled authorin
   expect(prompts).toBe(2); expect(f.run.usage.calls).toBe(2); expect(f.state.pauses).toEqual([]);
 });
 
-test("real SDK root-settlement cancellation retains exact host provenance and permits ordinary continuation without stale writes", async () => {
+for (const ending of ["root_settled", "fenced"] as const)
+test(`real SDK ${ending} cancellation retains exact host provenance without stale writes`, async () => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   let requests = 0, writes = 0;
   const f = await setup(async () => { throw new Error("Installed SDK owns this response"); }, async model => {
@@ -505,14 +506,19 @@ test("real SDK root-settlement cancellation retains exact host provenance and pe
   f.tools.find(tool => tool.name === "program_write")!.execute = async () => { writes++; return { content: [], details: null }; };
   await f.planner.start(1); f.planner.wake("planning_continuation"); await entered.promise;
   finishHistoryExecution(f.store, f.root); f.state.pending = false;
-  const completed = new Promise<void>(resolve => {
+  const completed = ending === "fenced" ? null : new Promise<void>(resolve => {
     let turns = 0;
     const off = f.store.subscribe(event => {
       if (event.run_id === f.run.run_id && event.type === "scheduler.turn_finished" && ++turns === 2) { off(); resolve(); }
     });
   });
-  f.planner.wake("skill_outcome"); release.resolve(); await completed;
-  expect(requests).toBe(2); expect(writes).toBe(0); expect(f.state.pauses).toEqual([]);
+  if (ending === "fenced") f.planner.fence();
+  else f.planner.wake("skill_outcome");
+  release.resolve();
+  if (ending === "fenced") await f.planner.close();
+  else await completed;
+  expect(requests).toBe(ending === "fenced" ? 1 : 2);
+  expect(writes).toBe(0); expect(f.state.pauses).toEqual([]);
   const events = f.store.eventsAfter(f.run.run_id, 0, 500);
   const first = events.find(event => event.type === "model.call");
   const requestId = object(first?.details ?? null)?.request_id;
@@ -520,10 +526,12 @@ test("real SDK root-settlement cancellation retains exact host provenance and pe
     .toMatchObject({ role: "authoring", obsolete: true, stop_reason: "aborted", provider_failure: false,
       recovered_failure: { type: "stream_interrupted_after_content" },
       host_cancellation: { kind: "ordinary_authoring", request_id: requestId,
-        root_execution_id: f.root.execution_id, reason: "root_settled" } });
-  const ordinary = events.filter(event => event.type === "model.request_settled").at(-1);
-  expect(ordinary?.details).toMatchObject({ role: "planning", stop_reason: "stop", obsolete: false, provider_failure: false });
-  expect(ordinary?.details).not.toHaveProperty("host_cancellation");
+        root_execution_id: f.root.execution_id, reason: ending } });
+  if (ending === "root_settled") {
+    const ordinary = events.filter(event => event.type === "model.request_settled").at(-1);
+    expect(ordinary?.details).toMatchObject({ role: "planning", stop_reason: "stop", obsolete: false, provider_failure: false });
+    expect(ordinary?.details).not.toHaveProperty("host_cancellation");
+  }
   expect(events.some(event => event.type === "scheduler.turn_failed")).toBe(false);
   const usage = events.find(event => event.type === "model.usage" && object(event.details)?.request_id === requestId);
   expect(usage?.details).toHaveProperty("usage_evidence.provider_terminal", null);

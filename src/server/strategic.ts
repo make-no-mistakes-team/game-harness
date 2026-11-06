@@ -38,7 +38,7 @@ const TOOL_CALLS = 48;
 const AUTHORING_CALLS = 3;
 const AUTHORING_TOOLS = 12;
 const AUTHORING_MS = 60_000;
-const AUTHORING_CANCELLATION_REASONS = new Set(["root_settled", "scope_lost", "root_replaced", "deadline", "calls", "tools"]);
+const AUTHORING_CANCELLATION_REASONS = new Set(["root_settled", "scope_lost", "root_replaced", "deadline", "calls", "tools", "fenced"]);
 const FEEDBACK_BYTES = 8 * 1024;
 const PROGRAM_PENDING =
   "A program is meaningful pending work; strategy waits for its outcome";

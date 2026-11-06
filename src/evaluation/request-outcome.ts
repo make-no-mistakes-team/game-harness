@@ -2,7 +2,7 @@ import type { ActivityEvent } from "../shared/contracts.ts";
 
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const authoringCloseReasons: Readonly<Record<string, true>> = {
-  root_settled: true, scope_lost: true, root_replaced: true, deadline: true, calls: true, tools: true,
+  root_settled: true, scope_lost: true, root_replaced: true, deadline: true, calls: true, tools: true, fenced: true,
 };
 
 /** Classifies host-owned lifecycle evidence without changing raw SDK failure or usage facts. */

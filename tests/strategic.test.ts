@@ -28,6 +28,7 @@ type Gate = Parameters<Agent["setBeforeModelCall"]>[0];
 type Assistant = Extract<AgentEvent, { type: "message_end" }>["message"];
 interface FakeAgent {
   gate: Gate;
+  synchronize?: () => void;
   emit(message: Partial<Assistant>): void;
 }
 const resources: {
@@ -156,6 +157,10 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, stre
         setBeforeModelCall: (gate: Gate) => {
           fake.gate = gate;
         },
+        addBeforeModelCallHook: (hook: Parameters<Agent["addBeforeModelCallHook"]>[0]) => {
+          fake.synchronize = () => { void hook(undefined, { systemPrompt: [], messages: [], tools: [] }); };
+          return () => { fake.synchronize = undefined; };
+        },
         setTools: () => {},
         subscribe: (callback: (event: AgentEvent) => void) => {
           listener = callback;
@@ -240,6 +245,7 @@ test("review prompts carry named metric replacements and a scoped V2 continuatio
 });
 
 async function callGate(agent: FakeAgent) {
+  agent.synchronize?.();
   return await agent.gate?.({ systemPrompt: [], messages: [], tools: [] });
 }
 
@@ -249,6 +255,13 @@ function gated(agent: FakeAgent, reason?: string) {
     errorMessage: reason,
     usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
   } as Partial<Assistant>);
+}
+
+async function pendingRoot(fixture: ReturnType<typeof setup>, name = "Continuing foreground root") {
+  const source = await fixture.store.registerSkill(fixture.run.run_id, historySpec(fixture.run, name));
+  const root = historyExecution(fixture.store, fixture.run, source);
+  fixture.state.pending = true;
+  return root;
 }
 
 for (const delivery of ["resolve", "reject"] as const)
@@ -725,10 +738,8 @@ test("resident attention overflow names its omitted range and does not replay de
   const f = setup(async (_text, agent) => {
     await callGate(agent);
     agent.emit({ responseId: "attention-response" } as Partial<Assistant>);
-    const stopped = await callGate(agent);
-    gated(agent, stopped?.reason);
   });
-  f.state.pending = true;
+  await pendingRoot(f);
   await f.planner.start(1);
   const first = f.event("scheduler.turn_finished");
   const sequences: number[] = [];
@@ -774,9 +785,8 @@ for (const spec of [
       }
     }
     agent.emit({ responseId: `attention-flight-${calls}` } as Partial<Assistant>);
-    const stopped = await callGate(agent); gated(agent, stopped?.reason);
   });
-  f.state.pending = true;
+  await pendingRoot(f);
   await f.planner.start(1);
   const append = (label: string) => {
     const event = f.store.event(f.run.run_id, "controller.event", label, {
@@ -800,6 +810,7 @@ for (const spec of [
   } finally { release.resolve(); }
   await first;
   if (!spec.success) {
+    f.state.pending = false;
     f.run.status = "running";
     await f.planner.start(f.state.generation);
     f.planner.wake("resident_attention");
@@ -820,25 +831,25 @@ for (const spec of [
   expect(f.state.prompts).toBe(2);
 });
 
-test("pending work admits one explicit meaningful request, never observation or after-tool polling", async () => {
+test("pending work shares three authoring calls across natural continuation, never observation polling", async () => {
   const fixture = setup(async (_text, agent) => {
-    expect(await callGate(agent)).toBeUndefined();
-    agent.emit({
-      responseId: "actual-provider-response",
-    } as Partial<Assistant>);
+    for (let index = 0; index < 3; index++) {
+      expect(await callGate(agent)).toBeUndefined();
+      agent.emit({ responseId: `actual-provider-response-${index}` } as Partial<Assistant>);
+    }
     const stopped = await callGate(agent);
     expect(stopped?.stop).toBe(true);
     expect(stopped?.reason).toBe(
-      "A program is meaningful pending work; strategy waits for its outcome",
+      "Finite root-bound authoring allowance reached",
     );
     gated(agent, stopped?.reason);
   });
-  fixture.state.pending = true;
+  await pendingRoot(fixture);
   await fixture.planner.start(1);
   expect(fixture.state.prompts).toBe(0);
   const done = fixture.event("scheduler.turn_finished");
-  fixture.planner.wake("policy_replan");
-  fixture.planner.wake("policy_replan");
+  fixture.planner.wake("planning_continuation");
+  fixture.planner.wake("planning_continuation");
   await done;
   vi.useFakeTimers();
   for (const reason of [
@@ -853,13 +864,13 @@ test("pending work admits one explicit meaningful request, never observation or 
   vi.useRealTimers();
   expect(fixture.state.prompts).toBe(1);
   expect(fixture.state.pauses).toEqual([]);
-  expect(fixture.run.usage.calls).toBe(1);
-  expect(fixture.run.usage.by_purpose.replanning).toMatchObject({
-    calls: 1,
-    uncached_input: 2,
-    cache_read: 3,
-    cache_write: 4,
-    output: 5,
+  expect(fixture.run.usage.calls).toBe(3);
+  expect(fixture.run.usage.by_purpose.authoring).toMatchObject({
+    calls: 3,
+    uncached_input: 6,
+    cache_read: 9,
+    cache_write: 12,
+    output: 15,
   });
   expect(fixture.run.usage.known_cost).toBeNull();
   expect(fixture.state.contexts[0]?.adapter_state).toMatchObject({ blocks: [{ target: { target_id: "detail-only-block" } }] });
@@ -869,23 +880,29 @@ test("pending work admits one explicit meaningful request, never observation or 
       .eventsAfter(fixture.run.run_id, 0, 500)
       .find((event) => event.type === "model.request_settled")?.details,
   ).toMatchObject({
-    provider_response_id: "actual-provider-response",
-    purpose: "replanning",
+    provider_response_id: "actual-provider-response-0",
+    purpose: "authoring",
   });
 });
 
-test("a skill admission immediately revokes the rest of the current request allowance", async () => {
-  let admit = () => {};
+test("a real root admission arms authoring without changing the original result group role", async () => {
+  let admit = async () => {};
   const fixture = setup(async (_text, agent) => {
     expect(await callGate(agent)).toBeUndefined();
     agent.emit({});
-    admit();
+    await admit();
+    expect(fixture.planner.toolRole()).toBe("ordinary");
+    for (let index = 0; index < 3; index++) {
+      expect(await callGate(agent)).toBeUndefined();
+      expect(fixture.planner.toolRole()).toBe("authoring");
+      agent.emit({});
+    }
     const stopped = await callGate(agent);
     expect(stopped?.stop).toBe(true);
     gated(agent, stopped?.reason);
   });
-  admit = () => {
-    fixture.state.pending = true;
+  admit = async () => {
+    await pendingRoot(fixture);
     fixture.planner.admitted();
   };
   await fixture.planner.start(1);
@@ -893,13 +910,69 @@ test("a skill admission immediately revokes the rest of the current request allo
   fixture.planner.wake("recovery_completed");
   await done;
   expect(fixture.state.pauses).toEqual([]);
-  expect(fixture.run.usage.calls).toBe(1);
+  expect(fixture.run.usage.calls).toBe(4);
   expect(fixture.run.model_status).toBe("idle");
   expect(
     fixture.store
       .eventsAfter(fixture.run.run_id, 0, 500)
       .filter((event) => event.type === "scheduler.backoff"),
   ).toEqual([]);
+});
+
+test("a pending boolean without an actual Store root cannot invent authoring authority", async () => {
+  const fixture = setup(async () => { throw new Error("No Store root may authorize this prompt"); });
+  fixture.state.pending = true;
+  await fixture.planner.start(1);
+  vi.useFakeTimers();
+  fixture.planner.wake("planning_continuation");
+  vi.advanceTimersByTime(1000);
+  expect(fixture.state.prompts).toBe(0);
+  expect(fixture.run.usage.calls).toBe(0);
+  expect(Reflect.get(fixture.planner, "contextCursor")).toBe(0);
+  expect(fixture.store.eventsAfter(fixture.run.run_id, 0, 500).some(event => event.type === "scheduler.authoring_entered")).toBe(false);
+  vi.useRealTimers();
+});
+
+test("zero-call request admission leaves resident evidence and context cursor available for a later real delivery", async () => {
+  let admitted = false;
+  const fixture = setup(async (_text, agent) => {
+    const result = await callGate(agent);
+    if (result?.stop) gated(agent, result.reason);
+    else agent.emit({});
+  });
+  await pendingRoot(fixture);
+  fixture.host.requestAdmission = { reserve: () => { if (!admitted) throw new Error("Finite external allowance refused"); },
+    transportEnded: () => {}, drained: () => {} };
+  // The subset Agent fixture only supplies the descriptor consumed by this
+  // admission seam; installed SDK transport behavior is covered separately.
+  await fixture.planner.start(1);
+  Reflect.set(Reflect.get(fixture.planner, "agent"), "state", { model: accountingModel() });
+  const attention = fixture.store.event(fixture.run.run_id, "controller.event", "Unconsumed resident attention", {
+    event: { kind: "attention", urgency: "ordinary", summary: "Retain until delivered", details: null },
+  });
+  let finished = fixture.event("scheduler.turn_finished"); fixture.planner.wake("resident_attention"); await finished;
+  expect(fixture.run.usage.calls).toBe(0);
+  expect(Reflect.get(fixture.planner, "contextCursor")).toBe(0);
+  admitted = true;
+  finished = fixture.event("scheduler.turn_finished"); fixture.planner.wake("resident_attention"); await finished;
+  expect(fixture.run.usage.calls).toBe(1);
+  expect((fixture.state.contexts[1]?.feedback as { event_seq: number }[]).map(event => event.event_seq)).toContain(attention.event_seq);
+  expect(fixture.state.pauses).toEqual([]);
+});
+
+test("a genuine provider abort on the third authoring call still pauses instead of becoming host budget expiry", async () => {
+  const fixture = setup(async (_text, agent) => {
+    for (let index = 0; index < 3; index++) {
+      expect(await callGate(agent)).toBeUndefined();
+      agent.emit({ stopReason: index === 2 ? "aborted" : "stop" } as Partial<Assistant>);
+    }
+  });
+  await pendingRoot(fixture);
+  await fixture.planner.start(1);
+  const failed = fixture.event("scheduler.turn_failed"); fixture.planner.wake("planning_continuation"); await failed;
+  expect(fixture.run.usage.calls).toBe(3);
+  expect(fixture.state.pauseCauses).toEqual(["provider_aborted"]);
+  expect(Reflect.get(fixture.planner, "contextCursor")).toBe(0);
 });
 
 test("failed requests retain the feedback cursor, account actual usage, and retry with compact evidence", async () => {
@@ -983,8 +1056,13 @@ test("host-ready first planning request can admit work without a separate model 
   const fixture = setup(async (_text, agent) => {
     expect(await callGate(agent)).toBeUndefined();
     agent.emit({});
-    fixture.state.pending = true;
+    await pendingRoot(fixture);
     fixture.planner.admitted();
+    expect(fixture.planner.toolRole()).toBe("ordinary");
+    for (let index = 0; index < 3; index++) {
+      expect(await callGate(agent)).toBeUndefined();
+      agent.emit({});
+    }
     const stopped = await callGate(agent);
     expect(stopped?.stop).toBe(true);
     gated(agent, stopped?.reason);
@@ -994,9 +1072,10 @@ test("host-ready first planning request can admit work without a separate model 
   fixture.planner.wake("preflight_ready");
   await finished;
   expect(fixture.run).toMatchObject({ status: "running" });
-  expect(fixture.run.usage.calls).toBe(1);
+  expect(fixture.run.usage.calls).toBe(4);
   expect(fixture.state.prompts).toBe(1);
   expect(fixture.state.pending).toBe(true);
   expect(fixture.run.usage.by_purpose.planning.calls).toBe(1);
+  expect(fixture.run.usage.by_purpose.authoring.calls).toBe(3);
   expect(fixture.state.pauses).toEqual([]);
 });

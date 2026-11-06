@@ -441,6 +441,7 @@ export class Runtime {
         history: () => this.historyQueries,
         planning: () => this.planning,
         learning: () => this.learning,
+        toolRole: () => this.strategic.toolRole(),
         toolAuthority: () => this.strategic.speculativeToolAuthority(),
         finishTask: (summary, callId) => this.finishTask(summary, callId),
       },

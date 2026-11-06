@@ -18,7 +18,7 @@ import type { Store, StoredRun } from "./store.ts";
 import { recordCall, recordUsage } from "./usage.ts";
 import { ProviderUsageCollector } from "./provider-usage.ts";
 import type { SpeculativePlanning } from "./speculative-planning.ts";
-import { isToolAllowed } from "../shared/tool-policy.ts";
+import { isToolAllowed, type ToolRole } from "../shared/tool-policy.ts";
 import { ProgramWorkspace } from "./program-workspace.ts";
 import type { HistoryQueryOptions } from "./history-protocol.ts";
 import type { ModelObservation } from "./actor-frames.ts";
@@ -35,6 +35,9 @@ const MAX_EMPTY_TURNS = 3;
 const TURN_MS = 120_000;
 const TURN_CALLS = 12;
 const TOOL_CALLS = 48;
+const AUTHORING_CALLS = 3;
+const AUTHORING_TOOLS = 12;
+const AUTHORING_MS = 60_000;
 const FEEDBACK_BYTES = 8 * 1024;
 const PROGRAM_PENDING =
   "A program is meaningful pending work; strategy waits for its outcome";
@@ -58,6 +61,10 @@ const MEANINGFUL_WAKES: Record<string, true> = {
   uncertainty: true,
   goal_review: true,
 };
+function pendingDecisionWake(reason: string): boolean {
+  return reason !== "planning_continuation" && reason !== "speculative_lookahead" &&
+    Object.hasOwn(MEANINGFUL_WAKES, reason);
+}
 const FEEDBACK_TYPES: Record<string, true> = {
   "skill.closed": true,
   "skill.progress": true,
@@ -117,7 +124,20 @@ interface RequestAttempt {
   index: number;
   planId: string | null;
   review: boolean;
-  role: "speculative" | "review" | "recovery" | "planning";
+  role: "speculative" | "review" | "recovery" | "planning" | "authoring";
+  authoring: AuthoringWindow | null;
+}
+
+interface AuthoringWindow {
+  run: StoredRun;
+  generation: number;
+  root: string;
+  scope: string;
+  source: string;
+  deadline: number;
+  calls: number;
+  tools: number;
+  closed: string | null;
 }
 
 function record(value: Json): { [key: string]: Json } | null {
@@ -208,13 +228,19 @@ export class StrategicPlanner {
   private fenced = true;
   private fenceRevision = 0;
   private turnCalls = 0;
+  private turnDelivered = 0;
   private turnToolCalls = 0;
   private turnDeadline = 0;
   private historyController: AbortController | null = null;
   private providerFailed = false;
   private providerAborted = false;
   private gateReason: string | null = null;
-  private pendingAllowance = 0;
+  private authoring: AuthoringWindow | null = null;
+  private authoringTimer: NodeJS.Timeout | undefined;
+  private turnAuthoring: AuthoringWindow | null = null;
+  private authoringEnded = false;
+  private authoringPhase = false;
+  private pendingDecision = false;
   private emptyTurns = 0;
   private workRevision = 0;
   private contextCursor = 0;
@@ -236,7 +262,7 @@ export class StrategicPlanner {
   private speculativeTurn = false;
   private readonly retainedContext: StrategicContext;
   private contextObservation: Pick<ObservationV3, "profile_id" | "profile_configuration_hash"> | null = null;
-  private readonly eligibleTools = new Map<string, { name: string; arguments: unknown }>();
+  private readonly eligibleTools = new Map<string, { name: string; arguments: unknown; authority?: () => void }>();
 
   constructor(
     private readonly store: Store,
@@ -254,12 +280,17 @@ export class StrategicPlanner {
       );
     this.fence();
     this.turnCalls = 0;
+    this.turnDelivered = 0;
     this.turnToolCalls = 0;
     this.turnDeadline = 0;
     this.providerFailed = false;
     this.providerAborted = false;
     this.gateReason = null;
-    this.pendingAllowance = 0;
+    this.authoring = null;
+    this.turnAuthoring = null;
+    this.authoringEnded = false;
+    this.authoringPhase = false;
+    this.pendingDecision = false;
     this.emptyTurns = 0;
     this.workRevision = 0;
     this.contextCursor = 0;
@@ -293,7 +324,7 @@ export class StrategicPlanner {
       const agent = await this.auth.createAgent({
         modelId: run.model_id,
         systemPrompt: [this.host.rootPrompt()],
-        tools: this.host.tools(generation).filter((tool) => isToolAllowed(run.status === "reviewing" ? "review" : "ordinary", tool.name)),
+        tools: this.host.tools(generation).filter((tool) => isToolAllowed(this.toolRole(), tool.name)),
       });
       this.agent = agent;
       if (!this.current(run, generation))
@@ -309,6 +340,7 @@ export class StrategicPlanner {
       agent.streamFn = async (model, context, options) => {
         const request = this.request;
         if (!request) throw new RuntimeFault("stale_context", "No admitted strategic request owns this stream");
+        if (request.authoring) this.assertAuthoring(request.authoring);
         const adapter = this.host.adapter?.();
         this.retainedContext.synchronize(run, model, context, this.contextObservation, adapter);
         // This is the final supported SDK stream boundary, including tool-loop
@@ -316,7 +348,7 @@ export class StrategicPlanner {
         // Agent's history or a host-only reference cache.
         const requestContext = {
           ...context,
-          systemPrompt: [...(context.systemPrompt ?? []), this.retainedContext.assemble(run, adapter)],
+          systemPrompt: [...(context.systemPrompt ?? []), this.retainedContext.assemble(run, adapter, this.authoringProjection())],
         };
         let firstResponse = false;
         const events = await stream(model, requestContext, { ...options,
@@ -441,6 +473,17 @@ export class StrategicPlanner {
         }
         return events;
       };
+      const selectPhase = () => {
+        this.authoringPhase = run.status !== "reviewing" && !this.speculativeTurn &&
+          this.host.programPending() && !this.pendingDecision;
+        agent.setTools(this.host.tools(generation).filter(tool => isToolAllowed(this.toolRole(), tool.name)));
+      };
+      // setTools inside the admission gate is too late for this SDK: its
+      // provider context has already been normalized. Refresh the live catalog
+      // at the supported synchronization hook, after the previous tool group.
+      const unsubscribePhase = agent.addBeforeModelCallHook((signal) => {
+        if (!signal?.aborted && this.current(run, generation)) selectPhase();
+      });
       agent.setBeforeModelCall((_context, signal) => {
         const stop = (reason: string) => {
           this.gateReason = reason;
@@ -456,35 +499,48 @@ export class StrategicPlanner {
         if (this.providerFailed || this.providerAborted)
           return stop("The previous provider response failed; no continuation is authorized");
         const review = run.status === "reviewing";
-        const toolRole = this.speculativeTurn ? "speculative" : review ? "review" : "ordinary";
-        agent.setTools(this.host.tools(generation).filter((tool) => isToolAllowed(toolRole, tool.name)));
+        // Admission may arm a window inside program_submit/run. Only the next
+        // SDK request boundary changes phase, after that tool group returned.
+        selectPhase();
+        const toolRole = this.toolRole();
         if (this.speculativeTurn && !this.host.speculation?.().requestCall())
           return stop("Finite lookahead request authority reached");
-        if (!review && !this.speculativeTurn && this.host.programPending() && !this.pendingAllowance)
+        const authoring = toolRole === "authoring" ? this.reconcileAuthoring() : null;
+        if (this.authoringEnded) return stop("The root-bound authoring window ended");
+        if (toolRole === "authoring" && (!authoring || authoring.closed))
           return stop(PROGRAM_PENDING);
+        if (authoring && (authoring.calls >= AUTHORING_CALLS || authoring.tools >= AUTHORING_TOOLS)) {
+          this.endAuthoring(authoring, authoring.calls >= AUTHORING_CALLS ? "calls" : "tools", false);
+          return stop("Finite root-bound authoring allowance reached");
+        }
         if (
           this.turnCalls >= (review ? 3 : TURN_CALLS) ||
           this.turnToolCalls >= (review ? 12 : TOOL_CALLS) ||
           Date.now() >= this.turnDeadline
         )
           return stop("Finite strategic call allowance reached");
-        if (!this.speculativeTurn && this.host.programPending()) this.pendingAllowance--;
         this.gateReason = null;
         const requestId = randomUUID();
         try { this.host.requestAdmission?.reserve(requestId, agent.state.model); }
         catch { return stop("The finite registered study request allowance or ownership gate refused admission"); }
         if (this.host.requestAdmission) this.admittedRequests.add(requestId);
+        if (authoring) {
+          authoring.calls++;
+          this.turnAuthoring = authoring;
+        }
+        this.pendingDecision = false;
         this.turnCalls++;
         run.turns++;
         this.request = {
           id: requestId,
           startedMono: performance.now(),
           usage: new ProviderUsageCollector(requestId, this.responseOwners),
-          purpose: this.purpose,
+          purpose: authoring ? "authoring" : this.purpose,
           index: this.turnCalls,
           planId: this.speculativeTurn ? this.host.speculation?.().projection()?.plan_id ?? null : null,
           review,
-          role: this.role,
+          role: authoring ? "authoring" : this.role,
+          authoring,
         };
         recordCall(run.usage, this.request.purpose);
         this.store.event(
@@ -512,9 +568,11 @@ export class StrategicPlanner {
       });
       agent.beforeToolCall = (context, signal) => {
         preserveRuntimeToolArguments(context);
-        if (context.assistantMessage?.stopDetails?.type === RECOVERED_PROVIDER_FAILURE)
+        const window = this.request?.authoring;
+        const obsoleteAuthoring = Boolean(window && (this.reconcileAuthoring() !== window || window.closed));
+        if (!obsoleteAuthoring && context.assistantMessage?.stopDetails?.type === RECOVERED_PROVIDER_FAILURE)
           this.providerFailed = true;
-        if (signal?.aborted || !this.current(run, generation) || this.providerFailed || this.providerAborted ||
+        if (signal?.aborted || !this.current(run, generation) || obsoleteAuthoring || this.authoringEnded || this.providerFailed || this.providerAborted ||
           context.assistantMessage && !["stop", "toolUse"].includes(context.assistantMessage.stopReason))
           return {
             block: true,
@@ -532,9 +590,22 @@ export class StrategicPlanner {
           this.host.assertCurrent(generation);
           if (this.speculativeTurn)
             this.host.speculation?.().assertToolAuthority(context.tool.name);
-          const role = this.speculativeTurn ? "speculative" : run.status === "reviewing" ? "review" : "ordinary";
+          const role = this.toolRole();
           if (!isToolAllowed(role, context.tool.name))
             throw new RuntimeFault("invalid_request", "Tool is not authorized for the current role");
+          if (this.authoringEnded)
+            throw new RuntimeFault("stale_context", "The root-bound authoring window ended");
+          if (role === "authoring") {
+            const window = this.reconcileAuthoring();
+            if (!window || window.closed)
+              throw new RuntimeFault("stale_context", "No live root-bound authoring authority");
+            if (window.tools >= AUTHORING_TOOLS) {
+              this.endAuthoring(window, "tools", false);
+              throw new RuntimeFault("stale_context", "Finite root-bound authoring tool allowance reached");
+            }
+            window.tools++;
+            this.turnAuthoring = window;
+          }
         } catch {
           return {
             block: true,
@@ -542,9 +613,10 @@ export class StrategicPlanner {
           };
         }
       };
-      this.unsubscribeAgent = agent.subscribe((event) =>
+      const unsubscribeEvents = agent.subscribe((event) =>
         this.agentEvent(event, run, generation),
       );
+      this.unsubscribeAgent = () => { unsubscribeEvents(); unsubscribePhase(); };
     })();
     this.opening = opening;
     try {
@@ -571,26 +643,122 @@ export class StrategicPlanner {
     const generation = this.host.generation();
     const speculation = this.speculativeTurn ? this.host.speculation?.() : undefined;
     const permit = speculation?.authority();
+    const authoring = this.authoringPhase && !speculation && run?.status !== "reviewing" && this.host.programPending()
+      ? this.reconcileAuthoring() : null;
+    const requiresAuthoring = this.authoringPhase && !speculation && run?.status !== "reviewing";
     return () => {
+      if (requiresAuthoring && (!authoring || this.reconcileAuthoring() !== authoring || authoring.closed))
+        throw new RuntimeFault("stale_context", "Root-bound authoring authority was revoked");
       if (!run || revision !== this.fenceRevision || Date.now() >= deadline || !this.current(run, generation))
         throw new RuntimeFault("stale_context", "Strategic tool authority was revoked");
       permit?.();
     };
   }
 
+  /** Shared catalog/dispatch phase; an exhausted pending root stays restricted. */
+  toolRole(): ToolRole {
+    if (this.host.run()?.status === "reviewing") return "review";
+    if (this.speculativeTurn) return "speculative";
+    this.reconcileAuthoring();
+    return this.authoringPhase && this.host.programPending() ? "authoring" : "ordinary";
+  }
+
+  private authoringScope(run: StoredRun): string {
+    return JSON.stringify([run.run_id, run.world_id, run.session_id, run.epoch, run.life_id,
+      run.native_boot_id, run.space_epoch, run.compatibility_hash]);
+  }
+
+  /** Query only at existing admission, request, tool, result and wake seams. */
+  private reconcileAuthoring(): AuthoringWindow | null {
+    const run = this.host.run(), generation = this.host.generation();
+    const root = run ? this.store.latestRootExecution(run.run_id) : null;
+    const previous = this.authoring;
+    const scope = run ? this.authoringScope(run) : "";
+    const valid = run && this.current(run, generation) && run.status === "running" && this.host.programPending() &&
+      root && root.entry !== null && root.parent_execution_id === null && root.root_execution_id === root.execution_id &&
+      ["accepted", "running"].includes(root.status) && root.run_generation === generation &&
+      root.world_id === run.world_id && root.session_id === run.session_id && root.epoch === run.epoch &&
+      root.life_id === run.life_id && root.native_boot_id === run.native_boot_id && root.space_epoch === run.space_epoch &&
+      root.compatibility_hash === run.compatibility_hash && root.source_hash !== null;
+    if (previous && !previous.closed) {
+      const reason = !valid ? (root && !["accepted", "running"].includes(root.status) ? "root_settled" : "scope_lost")
+        : previous.run !== run || previous.generation !== generation || previous.scope !== scope ? "scope_lost"
+          : previous.root !== root.execution_id || previous.source !== root.source_hash ? "root_replaced"
+            : Date.now() >= previous.deadline ? "deadline" : null;
+      if (reason) this.endAuthoring(previous, reason);
+    }
+    if (!valid) return null;
+    // Retain the latch for the same actual root even after a scope change,
+    // repeated leaf admissions, intent changes, or inactive source revisions.
+    if (previous?.run === run && previous.root === root.execution_id) return previous;
+    const window: AuthoringWindow = { run, generation, root: root.execution_id, scope, source: root.source_hash!,
+      deadline: Math.min(Date.now() + AUTHORING_MS,
+        Date.parse(root.deadline_at) - root.limits.duration_ms + AUTHORING_MS, Date.parse(root.deadline_at),
+        this.turn && this.turnDeadline ? this.turnDeadline : Infinity),
+      calls: 0, tools: 0, closed: null };
+    this.authoring = window;
+    this.store.event(run.run_id, "scheduler.authoring_entered", "Finite inactive authoring window bound to the current foreground root", {
+      root_execution_id: window.root, source_hash: window.source, generation,
+      max_calls: AUTHORING_CALLS, max_tools: AUTHORING_TOOLS, deadline_at: new Date(window.deadline).toISOString(),
+      calls: 0, tools: 0, reason: "foreground_root",
+    });
+    this.authoringTimer = setTimeout(() => this.endAuthoring(window, "deadline"), Math.max(1, window.deadline - Date.now()));
+    if (Date.now() >= window.deadline) this.endAuthoring(window, "deadline");
+    return window;
+  }
+
+  private endAuthoring(window: AuthoringWindow, reason: string, abort = true): void {
+    if (window.closed) return;
+    window.closed = reason;
+    if (this.authoring === window) {
+      clearTimeout(this.authoringTimer);
+      this.authoringTimer = undefined;
+    }
+    this.store.event(window.run.run_id, "scheduler.authoring_exited", "Root-bound authoring ended without changing foreground execution authority", {
+      root_execution_id: window.root, source_hash: window.source, generation: window.generation,
+      reason, calls: window.calls, tools: window.tools, remaining_ms: Math.max(0, window.deadline - Date.now()),
+    });
+    if (this.turnAuthoring === window || this.request?.authoring === window) {
+      this.authoringEnded = true;
+      if (abort) this.agent?.abort();
+    }
+  }
+
+  private assertAuthoring(window: AuthoringWindow): void {
+    if (this.reconcileAuthoring() !== window || window.closed)
+      throw new RuntimeFault("stale_context", "Root-bound authoring authority was revoked");
+  }
+
+  private finishAuthoringBudget(): void {
+    const window = this.turnAuthoring;
+    if (window && !window.closed && (window.calls >= AUTHORING_CALLS || window.tools >= AUTHORING_TOOLS))
+      this.endAuthoring(window, window.calls >= AUTHORING_CALLS ? "calls" : "tools", false);
+  }
+
+  private authoringProjection() {
+    if (this.toolRole() !== "authoring") return undefined;
+    const window = this.reconcileAuthoring();
+    const root = window ? this.store.skillExecution(window.run.run_id, { execution_id: window.root }) : null;
+    const source = root && window ? this.store.skill(window.run.run_id, root) : null;
+    return {
+      phase: "authoring" as const,
+      root: source ? { name: source.name, version: source.version, hash: window!.source } : null,
+      remaining_calls: window && !window.closed ? Math.max(0, AUTHORING_CALLS - window.calls) : 0,
+      remaining_tools: window && !window.closed ? Math.max(0, AUTHORING_TOOLS - window.tools) : 0,
+      remaining_ms: window && !window.closed ? Math.max(0, window.deadline - Date.now()) : 0,
+      instruction: "Foreground work continues unchanged. Within this one finite root-bound window, observe, help, program_inspect and program_write may prepare immutable inactive source. Write saves/validates only; no submit, run, activation, prepare_next, task_finish, reflex, memory or review. No polling or keepalive. Exhaustion waits for the root outcome; later wakes and leaf admissions do not renew this window.",
+    };
+  }
+
   admitted(): void {
     this.workRevision++;
     this.emptyTurns = 0;
-    this.pendingAllowance = 0;
+    this.reconcileAuthoring();
     clearTimeout(this.idleTimer);
     this.idleTimer = undefined;
     if (this.host.programPending()) {
-      // Ordinary queued planning demand is superseded by new work. Explicitly
-      // selected/resident attention and lookahead survive the root's next leaf
-      // admission, including the scheduler's coalescing window.
-      for (const reason of this.wakeReasons)
-        if (reason !== "selected_attention" && reason !== "resident_attention" && reason !== "speculative_lookahead")
-          this.wakeReasons.delete(reason);
+      // Leaf admission is progress within the same foreground root, not a new
+      // authoring allowance or permission to discard queued outcome/attention.
       if (this.wakeReasons.size) this.schedule();
       else {
         clearTimeout(this.wakeTimer);
@@ -630,6 +798,7 @@ export class StrategicPlanner {
   wake(reason: string): void {
     const run = this.host.run();
     if (!run || !this.current(run, this.host.generation())) return;
+    this.reconcileAuthoring();
     if (this.host.programPending() && !Object.hasOwn(MEANINGFUL_WAKES, reason))
       return;
     if (reason === "resident_attention") {
@@ -679,7 +848,9 @@ export class StrategicPlanner {
     this.attentionTimer = undefined;
     this.attentionReason = null;
     this.wakeReasons.clear();
-    this.pendingAllowance = 0;
+    if (this.authoring) this.endAuthoring(this.authoring, "fenced");
+    clearTimeout(this.authoringTimer);
+    this.authoringTimer = undefined;
     this.host.speculation?.().invalidate("cancelled");
     this.agent?.abort();
   }
@@ -757,6 +928,10 @@ export class StrategicPlanner {
       this.fenced
     )
       return;
+    const window = this.reconcileAuthoring();
+    if (this.host.programPending() && (!window || window.closed) &&
+        !this.wakeReasons.has("speculative_lookahead") && ![...this.wakeReasons].some(pendingDecisionWake))
+      return;
     this.wakeTimer = setTimeout(() => {
       this.wakeTimer = undefined;
       const run = this.host.run();
@@ -793,8 +968,11 @@ export class StrategicPlanner {
   ): Promise<void> {
     const review = run.status === "reviewing";
     const phase = run.status, fenceRevision = this.fenceRevision;
-    const reasons = [...this.wakeReasons];
-    this.wakeReasons.clear();
+    const window = this.reconcileAuthoring();
+    const reasons = this.host.programPending() && (!window || window.closed) && this.wakeReasons.has("speculative_lookahead") &&
+      ![...this.wakeReasons].some(pendingDecisionWake)
+      ? ["speculative_lookahead"] : [...this.wakeReasons];
+    for (const reason of reasons) this.wakeReasons.delete(reason);
     const lookaheadOnly = reasons.length > 0 && reasons.every((reason) => reason === "speculative_lookahead");
     if (!review && !lookaheadOnly) {
       const continuation = await this.host.speculation?.().pendingActivation();
@@ -820,15 +998,13 @@ export class StrategicPlanner {
       }
     }
     this.speculativeTurn = speculative !== null;
-    this.pendingAllowance = reasons.some((reason) =>
-      Object.hasOwn(MEANINGFUL_WAKES, reason),
-    )
-      ? 1
-      : 0;
+    this.pendingDecision = !review && !speculative && this.host.programPending() && reasons.some(pendingDecisionWake);
+    this.turnAuthoring = !this.pendingDecision && !review && !speculative && window && !window.closed ? window : null;
+    this.authoringEnded = false;
+    this.authoringPhase = false;
     const attention = reasons.includes("selected_attention")
       ? this.attentionReason
       : null;
-    if (attention !== null) this.attentionReason = null;
     this.role = review ? "review" : speculative ? "speculative"
       : reasons.some((reason) => ["policy_replan", "policy_interrupt", "policy_error", "death", "uncertainty"].includes(reason))
         ? "recovery" : "planning";
@@ -839,6 +1015,7 @@ export class StrategicPlanner {
     const turnId = randomUUID();
     const revision = this.workRevision;
     this.turnCalls = 0;
+    this.turnDelivered = 0;
     this.turnToolCalls = 0;
     this.providerFailed = false;
     this.providerAborted = false;
@@ -976,7 +1153,7 @@ export class StrategicPlanner {
       }
       if (!deadlineReached) {
         const selectedTools = this.host.tools(generation)
-          .filter((tool) => isToolAllowed(speculative ? "speculative" : review ? "review" : "ordinary", tool.name));
+          .filter((tool) => isToolAllowed(this.toolRole(), tool.name));
         agent.setTools(selectedTools);
         if (speculative) {
           this.store.event(run.run_id, "scheduler.speculative_tools_selected", "Configured the actual speculative agent catalog to read-only evidence and staging; dispatch authority is checked independently", {
@@ -996,6 +1173,8 @@ export class StrategicPlanner {
             life: { status: observation.life.status, can_respawn: observation.life.can_respawn,
               death: observation.life.death ? { at: observation.life.death.at, message: observation.life.death.message } : null },
             speculative_plan: workspace.planningView(speculative),
+            pending_decision: this.pendingDecision,
+            pending_authoring: this.authoringProjection(),
             improvement_review: reviewContext,
             adapter_state: projection.state,
             adapter_metadata: projection.metadata,
@@ -1038,7 +1217,9 @@ export class StrategicPlanner {
               : speculative
                 ? "This is the one authorized independent planning flight. Observe, inspect, help and prepare_next only. Select an existing named candidate; optionally author guard_source BODY(observation,args) returning strict boolean. Omission adds no game constraint. No source writes, starts, activation, effects or polling. Corrections share the original finite deadline. Main's captured permission and all host invariants govern activation."
               : this.host.programPending()
-                ? "A program is still meaningful authorized work. This is one bounded attention/outcome/replan request, not permission to poll or duplicate it. Use tools for any necessary detailed evidence."
+                ? this.pendingDecision
+                  ? "Respond to this explicit attention/outcome/recovery signal using ordinary decision authority, including any necessary current-root intent update or stop. This does not renew the root's inactive authoring allowance. Later natural SDK continuation while the root remains pending is restricted to the remaining pure authoring window; no polling or duplicate foreground work."
+                  : "The foreground program continues unchanged. Use only observe, help, program_inspect and pure program_write to prepare immutable inactive source within the remaining root-bound authoring allowance. No starts, activation, effects, polling or keepalive; repeated wakes do not renew the window."
                 : "Advance the task using current evidence. Choose useful bounded work, react to trial evidence, or explain a genuine obstacle. No human continuation is needed.",
           }), selected.images,
         );
@@ -1049,7 +1230,8 @@ export class StrategicPlanner {
       if (Date.now() >= this.turnDeadline || performance.now() >= historyOptions.deadlineHostMs)
         deadlineReached = true;
       if (this.current(run, generation) && !deadlineReached) {
-        if (prompting) this.providerFailed = true;
+        if (prompting && !this.authoringEnded) this.providerFailed = true;
+        else if (prompting) { /* Host authoring cancellation is not a provider outage. */ }
         else if (preparingHistory) {
           this.store.event(run.run_id, "runtime.history_query_failed",
             "Readonly review history could not be prepared; no provider request was made", {
@@ -1071,10 +1253,19 @@ export class StrategicPlanner {
       historyController.abort();
       if (this.historyController === historyController) this.historyController = null;
       this.finishUnsettledRequest(run);
+      this.finishAuthoringBudget();
+      // Confirm authoring transport release before the queued root outcome can
+      // obtain this single owner. This never touches the playing root.
+      if (this.authoringEnded) {
+        const drains = [...this.streamDrains.values()];
+        await Promise.all(drains.flatMap(stream => [stream.close(), stream.drained]));
+      }
       if (speculative) this.host.speculation?.().finish(speculative.plan_id);
-      if (speculative) agent.setTools(this.host.tools(generation)
-        .filter((tool) => isToolAllowed(run.status === "reviewing" ? "review" : "ordinary", tool.name)));
       this.speculativeTurn = false;
+      this.authoringPhase = false;
+      this.pendingDecision = false;
+      if (speculative) agent.setTools(this.host.tools(generation)
+        .filter((tool) => isToolAllowed(this.toolRole(), tool.name)));
       this.eligibleTools.clear();
       // Keep no transcript or old effect authority. Compatible bounded docs
       // and fresh Store projections are owned outside this temporary Agent.
@@ -1103,8 +1294,8 @@ export class StrategicPlanner {
       return;
     }
     if (
-      this.providerFailed ||
-      deadlineReached || this.providerAborted
+      this.providerFailed || this.providerAborted ||
+      !this.authoringEnded && deadlineReached
     ) {
       const pauseCause: RunPauseCause = deadlineReached ? "deadline" : this.providerAborted ? "provider_aborted" : "provider_failure";
       run.model_status = "error";
@@ -1126,7 +1317,8 @@ export class StrategicPlanner {
     }
     // A host gate can reject the initial request after observation/admission.
     // Nothing was delivered in that case, so do not consume selected evidence.
-    if (this.turnCalls) {
+    if (this.turnCalls && this.turnDelivered) {
+      if (attention !== null && this.attentionReason === attention) this.attentionReason = null;
       this.contextCursor = through;
       const attentionThrough = Math.max(this.residentAttentionConsumed,
         selectedAttention.at(-1)?.event_seq ?? 0, attentionOmission?.through_event_seq ?? 0);
@@ -1157,6 +1349,7 @@ export class StrategicPlanner {
         calls: this.turnCalls,
         tools: this.turnToolCalls,
         admitted_work: this.workRevision !== revision,
+        authoring_exit: this.authoringEnded ? this.turnAuthoring?.closed ?? "ended" : null,
         consumed_event_seq: this.contextCursor,
       },
     );
@@ -1241,12 +1434,16 @@ export class StrategicPlanner {
         message.errorMessage === this.gateReason;
       const request = this.request;
       const plan = request?.planId ? this.host.speculation?.().projection() : null;
+      const window = request?.authoring;
       const obsolete = !this.current(run, generation) ||
+        Boolean(window && (this.reconcileAuthoring() !== window || window.closed)) ||
         Boolean(request?.planId && (plan?.plan_id !== request.planId || !plan.planning_active));
       this.eligibleTools.clear();
       if (!obsolete && !hostYield && !recoveredFailure && ["stop", "toolUse"].includes(message.stopReason)) {
+        this.turnDelivered++;
         for (const content of message.content) {
-          if (content.type === "toolCall") this.eligibleTools.set(content.id, { name: content.name, arguments: content.arguments });
+          if (content.type === "toolCall") this.eligibleTools.set(content.id, { name: content.name, arguments: content.arguments,
+            ...(window ? { authority: () => this.assertAuthoring(window) } : {}) });
         }
       }
       if (!hostYield && request) {
@@ -1262,6 +1459,7 @@ export class StrategicPlanner {
         const purpose: UsagePurpose = request.role === "review" ? "improvement"
           : request.role === "speculative" ? "planning"
             : request.role === "recovery" ? "replanning"
+              : request.role === "authoring" ? "authoring"
               : improvement
                 ? "improvement"
                 : toolNames.some((name) => name === "program_write" || name === "program_submit" || name === "reflex")
@@ -1343,9 +1541,9 @@ export class StrategicPlanner {
         );
         this.request = null;
       }
-      if (this.current(run, generation) && !hostYield) {
+      if (this.current(run, generation) && !hostYield && !obsolete) {
         if (message.stopReason === "error" || recoveredFailure) this.providerFailed = true;
-        if (message.stopReason === "aborted") this.providerAborted = true;
+        if (message.stopReason === "aborted" && !this.authoringEnded) this.providerAborted = true;
       }
       if (message.stopReason !== "error" && message.stopReason !== "aborted") {
         for (const content of message.content) {
@@ -1377,7 +1575,9 @@ export class StrategicPlanner {
     } else if (event.type === "tool_execution_end") {
       const eligible = this.eligibleTools.get(event.toolCallId);
       this.eligibleTools.delete(event.toolCallId);
-      if (eligible?.name === event.toolName && !event.isError && this.current(run, generation)) {
+      let authority = true;
+      try { eligible?.authority?.(); } catch { authority = false; }
+      if (eligible?.name === event.toolName && !event.isError && authority && this.current(run, generation)) {
         const parsed = jsonSchema.safeParse(event.result?.details);
         if (parsed.success) {
           const value = record(parsed.data);

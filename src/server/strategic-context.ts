@@ -579,10 +579,13 @@ export class StrategicContext {
       ...(execution.error ? { error: execution.error.slice(0, 300) } : {}) };
   }
 
-  assemble(run: StoredRun, adapter?: RuntimeAdapter): string {
+  assemble(run: StoredRun, adapter?: RuntimeAdapter, pendingAuthoring?: Json): string {
     this.scope(run); this.refresh(run);
     const workspace = new ProgramWorkspace(this.store, run.run_id);
     const omissions: Omission[] = [...this.helpOmissions];
+    const pending = pendingAuthoring && bytes(pendingAuthoring) <= 2048 ? pendingAuthoring : undefined;
+    if (pendingAuthoring && !pending)
+      omissions.push({ kind: "pending_authoring", reference: "phase_contract", reason: "projection_byte_budget" });
     const latest = this.store.latestRootExecution(run.run_id);
     const candidates: SkillView[] = [];
     const add = (program: SkillView | null) => {
@@ -622,7 +625,9 @@ export class StrategicContext {
       latest.native_boot_id === run.native_boot_id && latest.space_epoch === run.space_epoch
       ? candidates.find(program => program.skill_id === latest.skill_id && program.version === latest.version) : null;
     const purpose = latestProgram?.card.purpose;
-    const value = { budget_bytes: INPUT_BYTES, contracts, requested_help: [] as HelpSection[], objective: run.task,
+    const value = { budget_bytes: INPUT_BYTES, contracts,
+      ...(pending ? { pending_authoring: pending } : {}),
+      requested_help: [] as HelpSection[], objective: run.task,
       current_subgoal: this.authoredState.current_subgoal !== undefined ? this.authoredState.current_subgoal
         : purpose && purpose !== "Unspecified by author" ? purpose.slice(0, 400) : null,
       authored_state: { ...this.authoredState },

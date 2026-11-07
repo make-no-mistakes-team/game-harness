@@ -385,9 +385,11 @@ Active/draining bundles, manual-review pins and frozen/user-world references
 are protected. Unknown historical runtime children and compact reports count
 toward occupancy but are never automatically adopted or deleted. Auth,
 governance and the official game installation are outside deletion ownership.
+Accounting uses entry metadata, not file contents; credential-shaped names in
+historical payloads still consume quota and remain forbidden deletion targets.
 Separate historical cleanup requires explicit operator authorization.
 
-Each development admission reserves 3 GiB for its complete bundle plus 512 MiB
+Each managed admission reserves 3 GiB for its complete bundle plus 512 MiB
 drain headroom, with a 1 GiB filesystem free-space floor. Nonoverlapping capacity
 checks run in an owned subprocess every five seconds, outside the gameplay
 event loop. A refused or failed check fences producers and joins cleanup.

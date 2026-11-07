@@ -329,7 +329,11 @@ export class ArtifactRetention {
     if (entry.isSymbolicLink()) { requireValue(!strict, "Artifact expiry refuses symlink payloads"); return entry.size; }
     if (!entry.isDirectory()) { requireValue(entry.isFile(), "Artifact accounting refuses special filesystem entries"); return entry.size; }
     requireValue(expectedDev === undefined || entry.dev === expectedDev, "Artifact accounting refuses mounted/escaped payloads");
-    requireValue(unsafeNames[path.basename(root).toLowerCase()] !== true, "Artifact accounting refuses credential/official/user-world directories");
+    // Accounting reads only entry metadata, never file contents. Historical
+    // credential-shaped names still occupy disk; they must not block all new
+    // admission or gain deletion authority merely by being counted.
+    requireValue(!strict || unsafeNames[path.basename(root).toLowerCase()] !== true,
+      "Artifact expiry refuses credential/official/user-world directories");
     let bytes = 0;
     for (const name of readdirSync(root)) bytes += this.#scan(path.join(root, name), strict, expectedDev ?? entry.dev);
     return finiteBytes(bytes, "recursive owned bytes");

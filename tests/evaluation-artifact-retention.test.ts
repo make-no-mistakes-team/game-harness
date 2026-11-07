@@ -214,6 +214,38 @@ test("free-space floor is a hard admission gate even with project quota availabl
   finally { f.dispose(); }
 });
 
+test("legacy protected-name directories count toward quota without acquiring deletion ownership", () => {
+  const f = fixture();
+  try {
+    const historical = path.join(f.options.runtimeRoot, "historical-fixture", "auth");
+    mkdirSync(historical, { recursive: true });
+    const payload = path.join(historical, "synthetic-state.sqlite");
+    writeFileSync(payload, Buffer.alloc(64));
+    const run = f.acquire();
+    expect(f.retention.inspect().occupancyBytes).toBe(64);
+    expect(f.retention.inspect().protectedBytes).toBe(64);
+    f.close(run.id); f.advance(1001);
+    expect(f.retention.rotate().expired).toEqual([run.id]);
+    expect(readFileSync(payload)).toEqual(Buffer.alloc(64));
+    expect(f.retention.inspect().occupancyBytes).toBe(64);
+  } finally { f.dispose(); }
+});
+
+test("a managed protected-name subtree remains ineligible for payload deletion", () => {
+  const f = fixture();
+  try {
+    const run = f.acquire();
+    mkdirSync(path.join(run.directory, "auth"));
+    writeFileSync(path.join(run.directory, "auth", "synthetic-state.sqlite"), Buffer.alloc(17));
+    f.close(run.id); f.advance(1001);
+    const result = f.retention.rotate();
+    expect(result.expired).toEqual([]);
+    expect(result.failed).toEqual([run.id]);
+    expect(existsSync(path.join(run.directory, "auth", "synthetic-state.sqlite"))).toBe(true);
+    expect(f.retention.inspect().occupancyBytes).toBe(17);
+  } finally { f.dispose(); }
+});
+
 test("independent processes cannot both spend the last admission reservation", async () => {
   const f = fixture({ budgetBytes: 100 });
   try {

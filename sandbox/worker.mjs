@@ -159,6 +159,66 @@ function runPolicyThread() {
   post('{"type":"compiled"}');
 }
 
+// This factory is evaluated as source inside the module's own realm. Never
+// inject this outer-realm function (or its returned objects) into authored code.
+function createMotionMath() {
+  const pi = Math.PI, tau = 2 * pi, halfPi = pi / 2;
+  const finite = value => typeof value === "number" && Number.isFinite(value);
+  const tick = value => Number.isSafeInteger(value) && value >= 0;
+  const wrap = value => value >= -pi && value < pi ? value : ((value + pi) % tau + tau) % tau - pi;
+  const clamp = (value, bound) => Math.max(-bound, Math.min(bound, value));
+  const orientation = value => value && finite(value.yaw_radians) && finite(value.pitch_radians);
+  const canonical = value => orientation(value) && value.yaw_radians >= -pi &&
+    value.yaw_radians < pi && Math.abs(value.pitch_radians) <= halfPi;
+  function turn(options, state = null) {
+    if (!options || !tick(options.native_tick) || !orientation(options.pose) ||
+      Math.abs(options.pose.pitch_radians) > halfPi || !orientation(options.target) ||
+      !Number.isSafeInteger(options.duration_ticks) || options.duration_ticks < 1 ||
+      !finite(options.max_rate) || options.max_rate <= 0 || options.max_rate > 20 * pi ||
+      (options.tolerance !== undefined &&
+        (!finite(options.tolerance) || options.tolerance < 0 || options.tolerance > pi)))
+      throw new RangeError("motion.turn requires actual native_tick/pose, a finite target, positive duration_ticks and max_rate <= 20*pi");
+    if (state !== null && (!state || !tick(state.start_tick) || !tick(state.last_tick) ||
+      state.last_tick < state.start_tick || !canonical(state.origin) || !canonical(state.target) ||
+      !Number.isSafeInteger(state.duration_ticks) || state.duration_ticks < 1))
+      throw new RangeError("motion.turn state must be null or a previous explicit turn state");
+    const yaw = wrap(options.target.yaw_radians);
+    const pitch = clamp(options.target.pitch_radians, halfPi);
+    if (state === null || options.native_tick < state.last_tick ||
+      state.target.yaw_radians !== yaw || state.target.pitch_radians !== pitch ||
+      state.duration_ticks !== options.duration_ticks) {
+      state = {
+        start_tick: options.native_tick, last_tick: options.native_tick,
+        origin: { yaw_radians: wrap(options.pose.yaw_radians), pitch_radians: options.pose.pitch_radians },
+        target: { yaw_radians: yaw, pitch_radians: pitch }, duration_ticks: options.duration_ticks,
+      };
+    } else if (state.last_tick !== options.native_tick) {
+      state = { ...state, last_tick: options.native_tick };
+    }
+    const errorYaw = wrap(yaw - options.pose.yaw_radians);
+    const errorPitch = pitch - options.pose.pitch_radians;
+    const tolerance = options.tolerance ?? 0.01;
+    const finished = options.native_tick - state.start_tick >= state.duration_ticks;
+    let yawRate = 0, pitchRate = 0;
+    if (!finished) {
+      // Cubic reference has zero endpoint velocity. Feedback closes only the
+      // next actual 50ms tick's error; a submitted rate is never assumed applied.
+      const t = Math.min(1, (options.native_tick - state.start_tick + 1) / state.duration_ticks);
+      const progress = t * t * (3 - 2 * t);
+      const desiredYaw = state.origin.yaw_radians + wrap(yaw - state.origin.yaw_radians) * progress;
+      const desiredPitch = state.origin.pitch_radians + (pitch - state.origin.pitch_radians) * progress;
+      yawRate = clamp(wrap(desiredYaw - options.pose.yaw_radians) / 0.05, options.max_rate);
+      pitchRate = clamp((desiredPitch - options.pose.pitch_radians) / 0.05, options.max_rate);
+    }
+    return {
+      view: { kind: "rate", yaw_radians_per_second: yawRate, pitch_radians_per_second: pitchRate },
+      state, finished, aligned: Math.abs(errorYaw) <= tolerance && Math.abs(errorPitch) <= tolerance,
+      error: { yaw_radians: errorYaw, pitch_radians: errorPitch },
+    };
+  }
+  return Object.freeze({ turn: Object.freeze(turn) });
+}
+
 // Resident computation and all inspection/serialization of its return value
 // stay in the watched untrusted thread. Docker, not vm, is the isolation proof.
 async function runResidentThread() {
@@ -168,6 +228,7 @@ async function runResidentThread() {
   const context = vm.createContext(Object.create(null), {
     codeGeneration: { strings: false, wasm: false },
   });
+  vm.runInContext(`const motion = (${createMotionMath.toString()})();`, context);
   const realm = vm.runInContext("({ parse: JSON.parse, object: Object.prototype, array: Array.prototype })", context);
   const module = new vm.SourceTextModule(workerData.source, {
     context,

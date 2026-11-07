@@ -5,8 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SandboxService } from "../src/server/sandbox.ts";
 import type { ResidentAnalysisWorker, ResidentWorker } from "../src/shared/resident.ts";
+import { controllerStepResultSchema } from "../src/shared/resident.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
+import { validateProgramSource } from "../src/server/program-validation.ts";
+import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
+import type { TemporalTurnOptions, TemporalTurnResult, TemporalTurnState } from "../src/shared/temporal-turn.ts";
 
 // This exercises the shipped supervisor and untrusted module thread, not Docker
 // isolation. The parent's Docker/profile proof remains a separate requirement.
@@ -107,6 +111,173 @@ test("analysis module is pure JSON computation without game or process capabilit
   const worker = await compile(`let jobs = 0; export function analyze(input) { return { total: input.values.reduce((a,b) => a+b, 0), jobs: ++jobs, api: typeof game, process: typeof process, fetch: typeof fetch }; }`);
   expect(await analyze(worker, 1, { values: [2, 5, 9] })).toEqual({ v: 1, type: "resident_result", id: 1, value: { total: 16, jobs: 1, api: "undefined", process: "undefined", fetch: "undefined" } });
   expect(await analyze(worker, 2, { values: [] })).toMatchObject({ value: { jobs: 2 } });
+});
+
+async function motionWorker() {
+  const source = await validateProgramSource(
+    "export function analyze(input) { return motion.turn(input.options, input.state); }",
+    "analyze", minecraftTestAdapter(),
+  );
+  return await compile(source.source);
+}
+async function turn(worker: ProcessWorker, id: number, options: TemporalTurnOptions, state: TemporalTurnState | null = null) {
+  const reply = await analyze(worker, id, { options, state }) as { value: TemporalTurnResult };
+  return reply.value;
+}
+const turnOptions: TemporalTurnOptions = {
+  native_tick: 100, pose: { yaw_radians: 0, pitch_radians: 0 },
+  target: { yaw_radians: 1, pitch_radians: 0.4 },
+  duration_ticks: 20, max_rate: 4,
+};
+
+test("admitted module math accelerates and brakes on native ticks and explicitly ends its rate", async () => {
+  const worker = await motionWorker();
+  let state: TemporalTurnState | null = null;
+  let pose = { ...turnOptions.pose };
+  const rates: number[] = [];
+  for (let tick = 0; tick <= 20; tick++) {
+    const result = await turn(worker, tick + 1, { ...turnOptions, native_tick: 100 + tick, pose }, state);
+    rates.push(result.view.yaw_radians_per_second);
+    expect(result.finished).toBe(tick === 20);
+    if (tick === 20) {
+      expect(result.view).toEqual({ kind: "rate", yaw_radians_per_second: 0, pitch_radians_per_second: 0 });
+      expect(result.aligned).toBe(true);
+      expect(pose.yaw_radians).toBeCloseTo(1, 10);
+      expect(pose.pitch_radians).toBeCloseTo(0.4, 10);
+    }
+    state = result.state;
+    pose = {
+      yaw_radians: pose.yaw_radians + result.view.yaw_radians_per_second * 0.05,
+      pitch_radians: pose.pitch_radians + result.view.pitch_radians_per_second * 0.05,
+    };
+  }
+  expect(rates[0]).toBeGreaterThan(0);
+  expect(rates[9]).toBeGreaterThan(rates[0]! * 5);
+  expect(rates[19]).toBeLessThan(rates[9]! / 5);
+});
+
+test("native clock stalls do not advance turns and actual pose overrides requested progress", async () => {
+  const worker = await motionWorker();
+  const first = await turn(worker, 1, turnOptions);
+  const repeated = await turn(worker, 2, turnOptions, first.state);
+  expect(repeated).toEqual(first);
+  const advanced = await turn(worker, 3, { ...turnOptions, native_tick: 110 }, first.state);
+  expect(advanced.view.yaw_radians_per_second).toBe(4);
+  // A request having been emitted does not establish alignment or applied motion.
+  const ended = await turn(worker, 4, { ...turnOptions, native_tick: 120 }, advanced.state);
+  expect(ended.finished).toBe(true);
+  expect(ended.aligned).toBe(false);
+  expect(ended.error.yaw_radians).toBe(1);
+  expect(ended.view.yaw_radians_per_second).toBe(0);
+  const stillEnded = await turn(worker, 5, { ...turnOptions, native_tick: 130 }, ended.state);
+  expect(stillEnded.finished).toBe(true);
+  expect(stillEnded.view.yaw_radians_per_second).toBe(0);
+  const reset = await turn(worker, 6, { ...turnOptions, native_tick: 1 }, stillEnded.state);
+  expect(reset.finished).toBe(false);
+  expect(reset.state.start_tick).toBe(1);
+});
+
+test("turn math chooses shortest wrapped yaw, clamps pitch and rebases explicit retargets", async () => {
+  const worker = await motionWorker();
+  const options = {
+    ...turnOptions, pose: { yaw_radians: Math.PI - 0.1, pitch_radians: 0 },
+    target: { yaw_radians: -Math.PI + 0.1, pitch_radians: 2 },
+  };
+  const first = await turn(worker, 1, options);
+  expect(first.error.yaw_radians).toBeCloseTo(0.2, 10);
+  expect(first.state.target.pitch_radians).toBe(Math.PI / 2);
+  expect(first.view.yaw_radians_per_second).toBeGreaterThan(0);
+  expect(first.view.yaw_radians_per_second).toBeLessThan(0.1);
+  const retargeted = await turn(worker, 2, {
+    ...options, native_tick: 107, pose: { yaw_radians: -Math.PI + 0.05, pitch_radians: 0.2 },
+    target: { yaw_radians: Math.PI - 0.2, pitch_radians: -0.3 },
+  }, first.state);
+  expect(retargeted.state.start_tick).toBe(107);
+  expect(retargeted.state.origin).toEqual({ yaw_radians: -Math.PI + 0.05, pitch_radians: 0.2 });
+  expect(retargeted.view.yaw_radians_per_second).toBeLessThan(0);
+  expect(retargeted.view.pitch_radians_per_second).toBeLessThan(0);
+});
+
+test("normal validated step can retain turn state and submit schema-valid raw view input", async () => {
+  const admitted = await validateProgramSource(`export function step(frame,state,intent) {
+    const turn = motion.turn({native_tick:frame.native_tick,pose:frame.view.applied_pose,
+      target:intent.target,duration_ticks:intent.duration_ticks,max_rate:intent.max_rate},state);
+    return {input:{...${JSON.stringify(neutralInput)},view:turn.view},
+      next_state:turn.state,status:"running",events:[]};
+  }`, "step", minecraftTestAdapter());
+  const worker = await compile(admitted.source, "step");
+  const frame = minecraftControllerFrameSchema.parse(controllerFrameFixture());
+  worker.send({ v: 1, type: "resident_step", id: 1, frame, state: null, intent: turnOptions });
+  const reply = await worker.read() as { value: { input: { view: TemporalTurnResult["view"] }; next_state: TemporalTurnState } };
+  expect(controllerStepResultSchema.safeParse(reply.value).success).toBe(true);
+  expect(reply.value.input.view.kind).toBe("rate");
+  expect(reply.value.input.view.yaw_radians_per_second).toBeGreaterThan(0);
+  expect(reply.value.next_state.start_tick).toBe(frame.native_tick);
+  worker.send({ v: 1, type: "resident_step", id: 2,
+    frame: { ...frame, native_tick: frame.native_tick + 20 },
+    state: reply.value.next_state, intent: turnOptions });
+  const ended = await worker.read() as { value: unknown };
+  const result = controllerStepResultSchema.parse(ended.value);
+  expect(result.input).toMatchObject({
+    kind: "world", view: { kind: "rate", yaw_radians_per_second: 0, pitch_radians_per_second: 0 },
+  });
+});
+
+test("math preserves caller state and does not claim alignment under a rate cap", async () => {
+  const admitted = await validateProgramSource(`export function analyze(input) {
+    const before = JSON.stringify(input);
+    const result = motion.turn(input.options,input.state);
+    return {result,unchanged:before===JSON.stringify(input)};
+  }`, "analyze", minecraftTestAdapter());
+  const worker = await compile(admitted.source);
+  const first = await analyze(worker, 1, {
+    options: { ...turnOptions, max_rate: 0.01, duration_ticks: 1 }, state: null,
+  }) as { value: { result: TemporalTurnResult; unchanged: boolean } };
+  expect(first.value.unchanged).toBe(true);
+  expect(first.value.result.view.yaw_radians_per_second).toBe(0.01);
+  const ended = await analyze(worker, 2, {
+    options: { ...turnOptions, native_tick: 101, max_rate: 0.01, duration_ticks: 1 },
+    state: first.value.result.state,
+  }) as { value: { result: TemporalTurnResult; unchanged: boolean } };
+  expect(ended.value.unchanged).toBe(true);
+  expect(ended.value.result.finished).toBe(true);
+  expect(ended.value.result.aligned).toBe(false);
+  expect(ended.value.result.view.yaw_radians_per_second).toBe(0);
+});
+
+for (const [label, options, state] of [
+  ["negative native clock", { ...turnOptions, native_tick: -1 }, null],
+  ["fractional duration", { ...turnOptions, duration_ticks: 0.5 }, null],
+  ["zero rate limit", { ...turnOptions, max_rate: 0 }, null],
+  ["out-of-contract rate limit", { ...turnOptions, max_rate: 100 }, null],
+  ["impossible applied pitch", { ...turnOptions, pose: { yaw_radians: 0, pitch_radians: 2 } }, null],
+  ["negative tolerance", { ...turnOptions, tolerance: -1 }, null],
+  ["malformed carried state", turnOptions, { start_tick: 100 }],
+] as const) test(`pure turn helper rejects ${label} without emitting a control result`, async () => {
+  const worker = await motionWorker();
+  worker.send({ v: 1, type: "resident_analyze", id: 1, input: { options, state } });
+  expect(await worker.closed).not.toBe(0);
+});
+
+test("pure math binding remains realm-local, immutable and cannot expose host constructors", async () => {
+  const source = await validateProgramSource(`export function analyze(input) {
+    let blocked = false;
+    try { motion.turn.constructor("return process")(); } catch { blocked = true; }
+    return {blocked,frozen:Object.isFrozen(motion),function_frozen:Object.isFrozen(motion.turn),
+      host:typeof process,game:typeof game};
+  }`, "analyze", minecraftTestAdapter()).catch(() => null);
+  // The validator still fences ambient APIs; direct worker probing independently
+  // exercises the runtime realm even if bypassing source admission.
+  expect(source).toBeNull();
+  const worker = await compile(`export function analyze(input) {
+    let blocked = false;
+    try { motion.turn.constructor("return process")(); } catch { blocked = true; }
+    return {blocked,frozen:Object.isFrozen(motion),function_frozen:Object.isFrozen(motion.turn),
+      host:typeof process,game:typeof game};
+  }`);
+  expect(await analyze(worker, 1, null)).toMatchObject({
+    value: { blocked: true, frozen: true, function_frozen: true, host: "undefined", game: "undefined" },
+  });
 });
 
 for (const [label, source] of [

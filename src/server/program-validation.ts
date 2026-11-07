@@ -587,6 +587,7 @@ export async function validateSkill(
 export function programFingerprint(hash: string, kind: ProgramSourceKind | "jev", compatibilityHash: string, choices?: unknown): string {
   return contractHash({ validator: 5, runtime: 5, skill_api: SKILL_API_VERSION,
     comments: "permitted", structural_metrics: "descriptive_not_admission_limits", kind,
+    ...((kind === "step" || kind === "analyze") ? { pure_math: "motion.turn/native-tick-cubic-v1" } : {}),
     parser: acornVersion, formatter: prettierVersion, formatterOptions, limits: PROGRAM_LIMITS,
     forbiddenAmbient: [...forbiddenAmbient], forbiddenSyntax: Object.keys(forbiddenSyntax), hash,
     compatibility_hash: compatibilityHash, ...(choices === undefined ? {} : { choices }) });

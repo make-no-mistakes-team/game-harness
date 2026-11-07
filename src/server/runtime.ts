@@ -209,6 +209,7 @@ export class Runtime {
         const root = store.latestRootExecution(run.run_id);
         if (!root) return null;
         const source = store.skill(run.run_id, root);
+        const current = root.entry === "step" ? this.skills.get(run.run_id, { execution_id: root.execution_id }) : root;
         return {
           run_id: run.run_id, world_id: run.world_id, generation: this.generation,
           session_id: state.session_id, epoch: state.epoch,
@@ -216,7 +217,8 @@ export class Runtime {
           native_boot_id: state.binding.native_boot_id, space_epoch: state.space.space_epoch,
           compatibility_hash: state.binding.compatibility_hash, screen: state.screen,
           task: run.task, goal: run.goal,
-          root: { execution_id: root.execution_id, skill_id: root.skill_id, version: root.version, hash: source.hash, status: root.status },
+          root: { execution_id: root.execution_id, skill_id: root.skill_id, version: root.version, hash: source.hash, status: root.status,
+            intent_version: current?.entry === "step" ? current.resident?.intent_version ?? 0 : null },
         };
       },
       skill: (ref) => {

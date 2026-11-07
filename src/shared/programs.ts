@@ -132,6 +132,8 @@ export interface ResidentSkillStartRequest extends SkillStartBase {
   entry: "step";
   limits: ResidentLimits;
   initial_state: Json;
+  /** One explicitly authorized prepared continuation after actual resident retirement. */
+  lookahead?: LookaheadConfig;
 }
 export type SkillStartRequest = RunSkillStartRequest | ResidentSkillStartRequest;
 

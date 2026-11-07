@@ -251,9 +251,9 @@ export class SkillManager {
     this.host.authorize({ session_id: parsed.session_id, world_id: run.world_id, epoch: parsed.epoch,
       native_boot_id: parsed.native_boot_id, run_id: runId, run_generation: parsed.run_generation,
       life_id: parsed.life_id, space_epoch: parsed.space_epoch });
-    const armLookahead = parsed.entry === "run" && parsed.lookahead
+    const armLookahead = parsed.lookahead
       ? this.host.prepareLookahead?.(parsed.lookahead) : undefined;
-    if (parsed.entry === "run" && parsed.lookahead && !armLookahead)
+    if (parsed.lookahead && !armLookahead)
       throw new Error("This program host does not provide speculative planning");
     const skill = this.store.skill(runId, parsed);
     if (skill.state !== "validated") throw new Error("Skill is not validated");

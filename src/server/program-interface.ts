@@ -4,6 +4,7 @@ import { jsonSchema, lookaheadConfigSchema, namedProgramRefSchema, policySpecSch
 import { promotionDeclarationSchema } from "./experience.ts";
 import { residentActorLimitsSchema, residentAnalysisInputSchema, residentIntentSchema, residentStateSchema } from "../shared/resident.ts";
 import type { ImprovementFeedbackCursor, VersionComparisonCursor } from "../shared/execution-evidence.ts";
+import { policyWatchSchema } from "./reactive.ts";
 
 export const programSelectorSchema = namedProgramRefSchema;
 export const improvementFeedbackCursorSchema = z.object({
@@ -52,13 +53,14 @@ export const programSubmitSchema = z.discriminatedUnion("entry", [
     limits: actorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
   programWriteSchema.extend({ entry: z.literal("step"),
     args: residentIntentSchema.describe("Required JSON initial resident intent; pass null when unused."),
-    initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema }).strict(),
+    initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
 ]);
 const playingStartSchema = z.discriminatedUnion("entry", [
   programSelectorSchema.extend({ operation: z.literal("start"), entry: z.literal("run").default("run"),
     args: jsonSchema, limits: actorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
   programSelectorSchema.extend({ operation: z.literal("start"), entry: z.literal("step"),
-    args: residentIntentSchema, initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema }).strict(),
+    args: residentIntentSchema, initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema,
+    next: nextConfigSchema.optional() }).strict(),
 ]);
 export const programRunSchema = z.discriminatedUnion("operation", [
   playingStartSchema,
@@ -98,14 +100,23 @@ export const programInspectSchema = z.discriminatedUnion("view", [
 ]);
 export const programReviewSchema = programSelectorSchema.extend({ decision: z.enum(["keep", "insufficient_evidence"]), reason: z.string().trim().min(1).max(2000) }).strict();
 export const taskFinishSchema = z.object({ summary: z.string().trim().min(1).max(2000) }).strict();
-export const prepareNextSchema = programSelectorSchema.extend({ args: jsonSchema, limits: actorLimitsSchema, guard_source: z.string().min(1).max(16384).optional() }).strict();
+const preparedBaseSchema = programSelectorSchema.extend({
+  args: jsonSchema, guard_source: z.string().min(1).max(16384).optional(),
+});
+export const prepareNextSchema = z.discriminatedUnion("entry", [
+  preparedBaseSchema.extend({ entry: z.literal("run").default("run"), limits: actorLimitsSchema }).strict(),
+  preparedBaseSchema.extend({ entry: z.literal("step"), args: residentIntentSchema,
+    initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema }).strict(),
+]);
 export const helpSchema = z.object({ topic: z.enum(["overview", "game", "programs", "planning", "reflex", "memory"]).default("overview") }).strict();
 const namedPolicy = { name: z.string().trim().min(1).max(80), version: z.int().positive().optional() };
 export const reflexSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("write"), spec: policySpecSchema }).strict(),
   z.object({ operation: z.literal("inspect"), ...namedPolicy }).strict(),
   z.object({ operation: z.literal("validate"), ...namedPolicy }).strict(),
-  z.object({ operation: z.literal("activate"), ...namedPolicy, mode: z.enum(["trial", "keep"]).default("trial"), max_ms: z.int().min(1000).max(120000).default(120000), max_actions: z.int().min(1).max(20).default(20), max_evaluations: z.int().min(1).max(100).default(100) }).strict(),
+  z.object({ operation: z.literal("activate"), ...namedPolicy, mode: z.enum(["trial", "keep"]).default("trial"), max_ms: z.int().min(1000).max(120000).default(120000), max_actions: z.int().min(1).max(20).default(20), max_evaluations: z.int().min(1).max(100).default(100),
+    watch: policyWatchSchema.optional() }).strict().refine(input => !input.watch || input.mode === "trial",
+    { message: "Passive watch is available only for a bounded trial", path: ["watch"] }),
   z.object({ operation: z.literal("retire"), ...namedPolicy }).strict(),
 ]);
 export const memorySchema = z.discriminatedUnion("operation", [

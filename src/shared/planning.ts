@@ -1,6 +1,7 @@
 import type { AdapterGoal, Json, PlayerLife } from "./contracts.ts";
 import type { ScreenRef } from "./control.ts";
 import type { SkillExecutionView, SkillLimits, SkillRef } from "./programs.ts";
+import type { ResidentLimits } from "./resident.ts";
 
 export interface PlanningSource extends SkillRef { hash: string }
 export interface PlanningScope {
@@ -23,6 +24,8 @@ export interface PlanningContext extends PlanningScope {
     execution_id: string;
     /** Execution lifecycle: success is "succeeded", never SkillResult's "completed"; not goal proof. */
     status: SkillExecutionView["status"];
+    /** Mutable resident intent identity; absent/null for finite predecessors. */
+    intent_version?: number | null;
   };
 }
 export interface LookaheadConfig {
@@ -40,14 +43,17 @@ export interface LookaheadConfig {
 export interface LookaheadRequest extends LookaheadConfig {
   root_execution_id: string;
 }
-export interface StagePlanRequest {
+interface StagePlanBase {
   plan_id: string;
   skill: SkillRef;
   args: Json;
-  limits: SkillLimits;
   /** Optional model-authored async(observation,args) body; must return a strict boolean. */
   guard_source?: string;
 }
+export type StagePlanRequest = StagePlanBase & (
+  | { entry?: "run"; limits: SkillLimits }
+  | { entry: "step"; limits: ResidentLimits; initial_state: Json }
+);
 export interface StageCorrection {
   plan_id: string;
   correction_allowed: boolean;

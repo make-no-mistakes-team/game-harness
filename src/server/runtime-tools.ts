@@ -73,7 +73,8 @@ export class RuntimeTools {
     const operations = new ProgramOperations(this.store, this.skills, this.reactions, this.experience, this.host, run);
     const role = (): ToolRole => run.status === "reviewing" ? "review" :
       this.host.toolRole?.() ?? (this.host.planning().projection()?.planning_active ? "speculative" : "ordinary");
-    const writeSchema = role() === "authoring" ? programWriteSchema.omit({ reason: true }) : programWriteSchema;
+    const inactiveWrite = () => role() === "authoring" || role() === "speculative";
+    const writeSchema = inactiveWrite() ? programWriteSchema.omit({ reason: true }) : programWriteSchema;
     const result = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value });
     const tool = <T>(name: string, description: string, schema: z.ZodType<T>,
       handler: (input: T, callId: string, signal: AbortSignal | undefined, commit: () => void) => unknown | Promise<unknown>): AgentTool => {
@@ -93,7 +94,7 @@ export class RuntimeTools {
           const parsed = schema.safeParse(raw);
           if (!parsed.success) { argumentError = parsed.error; throw argumentError; }
           const input = parsed.data;
-          if (admittedRole === "authoring" && name === "program_write" &&
+          if ((admittedRole === "authoring" || admittedRole === "speculative") && name === "program_write" &&
             input !== null && typeof input === "object" && "reason" in input)
             throw new RuntimeFault("forbidden", "Pending-program authoring saves inactive source only; outcome assessments require an ordinary or review turn");
           const identity = { tool: name, input } as unknown as Json;
@@ -189,7 +190,7 @@ export class RuntimeTools {
         const projection = this.host.adapter().projectObservation(selected.observation);
         return { value: { ...operations.workspace.observationView(selected.observation, projection), image_metadata: selected.image_metadata }, images: selected.images };
       }),
-      tool("program_write", role() === "authoring"
+      tool("program_write", inactiveWrite()
         ? "Validate and save an immutable inactive named JavaScript taskflow without starting or replacing foreground work. Existing names require based_on. card.reason is inert descriptive metadata."
         : "Create or revise a compact named JavaScript taskflow. Existing names require based_on. Optional reason links the actual revision to matching feedback, not proven efficacy.",
         writeSchema, (input, callId, signal, commit) => operations.write(input, callId, commit, signal)),

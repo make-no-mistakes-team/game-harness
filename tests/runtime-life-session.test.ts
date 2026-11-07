@@ -568,7 +568,12 @@ test("named root opt-in overlaps actual local continuation without exposing ordi
   const retry = await f.retryRoot(); expect(retry.isError).not.toBe(true);
   await reached(f, f.specEntered.promise);
   expect(f.advertised()).toContain("prepare_next");
-  expect(f.advertised()).not.toContain("program_run"); expect(f.advertised()).not.toContain("program_write");
+  expect(f.advertised()).not.toContain("program_run");
+  const written = await f.invoke("program_write", { name: "inactive prepared reference",
+    source: 'return {status:"completed",summary:"Inactive reference",result:null};' });
+  expect(written.isError).not.toBe(true);
+  expect(f.store.namedSkill(f.created.run_id, "inactive prepared reference")?.entry).toBe("run");
+  expect(f.store.allSkillExecutions(f.created.run_id)).toHaveLength(1);
   const forbidden = await f.invoke("program_run", { operation: "start", name: FOLLOW, args: { mode: "follow-up" } });
   expect(forbidden).toMatchObject({ isError: true, details: { error: { code: "forbidden" } } });
   const plan = f.runtime.planningView(f.created.run_id)!;

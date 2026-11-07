@@ -1043,11 +1043,18 @@ test("actual catalogs and dispatch share ordinary, speculative, advanced-module 
   expect(plan).not.toBeNull();
   const speculative = f.tools();
   expect(speculative.some((tool) => tool.name === "prepare_next")).toBe(true);
-  expect(speculative.some((tool) => tool.name === "program_run" || tool.name === "program_submit" || tool.name === "program_write" || tool.name === "task_finish")).toBe(false);
-  expect((await f.call("program_write", { name: "forbidden", source, card, dependencies: [] }, "forbidden-write", ordinary)).isError).toBe(true);
+  expect(speculative.some((tool) => tool.name === "program_run" || tool.name === "program_submit" || tool.name === "task_finish")).toBe(false);
+  const saved = await f.call("program_write", { name: "prepared during execution", source, card, dependencies: [] }, "inactive-spec-write", ordinary);
+  expect(saved.isError).not.toBe(true);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  const assessment = await f.call("program_write", { name: "candidate", based_on: 1, source,
+    reason: "Speculation cannot resolve an outcome" }, "forbidden-spec-assessment", ordinary);
+  expect(data(assessment).error.code).toBe("forbidden");
+  expect(f.store.namedSkill(f.run.run_id, "candidate")!.version).toBe(1);
   expect(data(await f.call("program_submit", { name: "forbidden submit", source, args: null }, "forbidden-spec-submit", ordinary)).error.code).toBe("forbidden");
   expect(data(await f.call("task_finish", { summary: "Not authorized during speculation" }, "forbidden-spec-finish", ordinary)).error.code).toBe("forbidden");
-  expect(data(await f.call("prepare_next", { name: "candidate", args: null })).guard_status).toBe("omitted");
+  expect(data(await f.call("prepare_next", { name: "prepared during execution", args: null })).guard_status).toBe("omitted");
+  expect(f.planning.projection()?.candidate?.skill_id).toBe(f.store.namedSkill(f.run.run_id, "prepared during execution")!.skill_id);
   f.planning.finish(plan.plan_id); release.resolve();
   const root = f.store.latestRootExecution(f.run.run_id)!;
   await waitClosed(f.store, f.run.run_id, root.execution_id);

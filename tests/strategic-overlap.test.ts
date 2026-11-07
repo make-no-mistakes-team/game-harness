@@ -214,9 +214,9 @@ for (const selectedKind of ["lookahead", "attention"] as const) {
 test("restricted planning has a finite request budget and cannot dispatch ordinary execution controls", async () => {
   const f = await setup(async (_context, agent) => {
     expect(agent.catalog()).toContain("prepare_next"); expect(agent.catalog()).not.toContain("program_run");
-    expect(agent.catalog()).not.toContain("program_write");
+    expect(agent.catalog()).toContain("program_write");
     expect(await agent.call([{ name: "prepare_next" }])).toBe(true);
-    expect(await agent.tool("program_run")).toBe(false); expect(await agent.tool("program_write")).toBe(false);
+    expect(await agent.tool("program_run")).toBe(false); expect(await agent.tool("program_write")).toBe(true);
     expect(await agent.tool("program_inspect")).toBe(true);
     expect(await agent.call()).toBe(true); expect(await agent.call()).toBe(true); expect(await agent.call()).toBe(false);
   });
@@ -388,7 +388,7 @@ test("exhausted ordinary authoring does not borrow or suppress the separate expl
     expect(await agent.call()).toBe(false);
     if (context.speculative_plan) {
       expect(agent.catalog()).toContain("prepare_next");
-      expect(agent.catalog()).not.toContain("program_write");
+      expect(agent.catalog()).toContain("program_write");
     }
   });
   await f.planner.start(1);

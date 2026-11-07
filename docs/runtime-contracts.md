@@ -65,7 +65,7 @@ The ordinary default exposes these tools:
 | `observe` | Obtain fresh authorized game state, a typed actor PNG and separate image metadata without caller-supplied session/life/epoch. |
 | `program_write` | Create a named immutable `run`, `step` or `analyze` revision; omitted card/dependencies remain unspecified and untested. |
 | `program_submit` | Explicitly write an immutable version and request its exact-version start through ordinary admission; report persistence separately from a refused or uncertain start. |
-| `program_run` | Start a matching `run`/`step`, inspect or stop it, version-update resident intent, run a pure analysis job, activate prepared run work or select a finite attention wake. |
+| `program_run` | Start a matching `run`/`step`, inspect or stop it, version-update resident intent, run a pure analysis job, activate prepared playing work or select a finite attention wake. |
 | `program_inspect` | Read catalog/source/execution/history/metric/evidence/trace/feedback/comparison/planning and mechanical reference views. |
 | `program_review` | Record `keep` or `insufficient_evidence` for a named version's latest matching outcome, with reason. |
 | `help` | Load generated game/program/planning reference or disclose optional advanced modules on demand. |
@@ -212,7 +212,7 @@ The context reconstructs supported references from durable Store events, reading
 
 The structured gameplay projection of strategic `observe` omits known host world/session/epoch/life/death identities while retaining authorized gameplay fields, target IDs, freshness and death reason. Separate `image_metadata.host_selection_scope` identifies host run/world/session/epoch/life/generation authority with `alignment:"unsynchronized"`; it does not prove capture-time life, camera, space or synchronization with gameplay state. See [delivered actor images](#delivered-actor-images-and-recorded-episodes). This does not change native/SDK `Observation` or isolated guard input. Typed evidence projections preserve execution arguments/results and trace/event payload JSON, subject to explicit byte omissions; arbitrary user JSON is not recursively stripped by key name. Feedback retains exact program names/versions and durable execution ordinals, separate from event-sequence references.
 
-`help` topics `reflex` and `memory` disclose optional lifecycle tools to the ordinary role. Reflex retains actual isolated JS and real Jev behavior; memory retains compatible snapshots, fresh load and explicit evidence-qualified promotion. [`src/shared/tool-policy.ts`](../src/shared/tool-policy.ts) is the single role/module registry for both provider catalog and dispatch. Pending-root authoring receives observe/read-only inspect/help and inactive `program_write` only. Speculation receives observe/read-only inspect/help plus `prepare_next` only. Post-goal review permits source/assessment artifacts and authorized reads, not gameplay or advanced mutation.
+`help` topics `reflex` and `memory` disclose optional lifecycle tools to the ordinary role. Reflex retains actual isolated JS and real Jev behavior; memory retains compatible snapshots, fresh load and explicit evidence-qualified promotion. [`src/shared/tool-policy.ts`](../src/shared/tool-policy.ts) is the single role/module registry for both provider catalog and dispatch. Pending-root authoring receives observe/read-only inspect/help and inactive `program_write` only. Speculation also receives inactive `program_write` and `prepare_next`, but no playing start. Both inactive roles exclude top-level `program_write.reason`, which resolves outcome feedback; `card.reason` remains inert source metadata. Post-goal review permits source/assessment artifacts and authorized reads, not gameplay or advanced mutation.
 
 Inside a `run` program, common methods are `await game.observe()`, `await game.call({name,version?},args)` and `await game.progress(summary,details)`. The selected adapter supplies its registered native reads as direct positional `await game.<binding>(...parameters)` methods. `help` topic `game` generates each binding's invocation from its actual name and ordered parameter list. Its `capability_id` and `version` identify the trusted binding; they are not a `NamedProgramRef` or extra positional arguments. Native reads require no authored dependency declaration. When supported, `game.action(action)` returns the final action result and `game.respawn()` uses the same exclusive arbiter as `game.action({kind:"respawn"})`; it is no privileged recovery shortcut.
 
@@ -1108,9 +1108,11 @@ An admitted foreground root opens one authoring window bound to its actual Store
 
 Authoring allows `observe`, `help`, read-only `program_inspect` and pure `program_write`. A successful write saves an immutable inactive version; it cannot submit, start, activate, stage a successor, finish the task, mutate memory/reflexes or record a review. The playing root and its effect lease continue under their original budgets. No polling timer, keepalive request, second actor or additional transport owner is introduced.
 
-Calls and tools share the root's allowance across selected/resident wakes, child/leaf admissions, inactive revisions and intent updates. Exhaustion stays latched until a genuinely new root or a new run; repeated admission does not reset counts or time. Root settlement, scope loss, Stop and the finite window timer fence captured asynchronous tool commits and late results. Host window expiry cancels/drains authoring transport without pausing a healthy body or labeling expiry as a provider outage. A genuine provider failure still follows normal pause handling; absent usage remains unknown. Entry/exit events retain the reason, root/source identity and counters.
+Calls and tools share the root's allowance across selected/resident wakes, child/leaf admissions, inactive revisions and intent updates. Exhaustion stays latched until a genuinely new root or a new run; repeated admission does not reset counts or time. An already admitted inactive turn may finish after ordinary predecessor settlement within its original window; settlement grants no new turn or effect authority. Scope loss, Stop and the finite window timer fence captured asynchronous tool commits and late results. Host window expiry cancels/drains authoring transport without pausing a healthy body or labeling expiry as a provider outage. A genuine provider failure still follows normal pause handling; absent usage remains unknown. Entry/exit events retain the reason, root/source identity and counters.
 
-Before deliberately aborting an in-flight authoring request, the host captures its exact request and root identity. Only its final SDK `aborted` settlement carries `host_cancellation:{kind:"ordinary_authoring",request_id,root_execution_id,reason}`, alongside `role:"authoring"` and `obsolete:true`. Root settlement, scope loss, root replacement, deadline cancellation and explicit authority fencing qualify; call/tool exhaustion without an abort does not. This settlement has `provider_failure:false` even if the SDK retains `recovered_failure`; raw stop reason, recovery evidence and unknown usage stay unchanged. Cancellation requested while processing an already received terminal response cannot establish its cause. An unsettled request has no cancellation exemption, and genuine provider errors remain failures even when their response is obsolete.
+Model-authored resident `attention` with `urgency:"urgent"` and a reactive `policy_interrupt` revoke inactive authoring immediately, including settlement grace and request-free publication seams. Already saved immutable drafts remain; late writes cannot commit. The exact admitted request drains before a fresh decision uses the single strategic owner. Repeated urgent wakes coalesce rather than repeatedly aborting the same SDK turn. Urgent diagnostic events are not attention. Ordinary attention preserves useful settlement grace. None of these scheduler events supplies a defensive action or changes the playing controller's input.
+
+Before deliberately aborting an in-flight authoring request, the host captures its exact request and root identity. Only its final SDK `aborted` settlement carries `host_cancellation:{kind:"ordinary_authoring",request_id,root_execution_id,reason}`, alongside `role:"authoring"` and `obsolete:true`. Root settlement, scope loss, root replacement, deadline cancellation, urgent attention and explicit authority fencing qualify; call/tool exhaustion without an abort does not. This settlement has `provider_failure:false` even if the SDK retains `recovered_failure`; raw stop reason, recovery evidence and unknown usage stay unchanged. Cancellation requested while processing an already received terminal response cannot establish its cause. An unsettled request has no cancellation exemption, and genuine provider errors remain failures even when their response is obsolete.
 
 Every strategic `Agent.abort()` uses one private request owner. Before invoking the SDK, it records the first cancellation intent against the exact active admitted request; repeated fence/close calls cannot replace that cause. A terminal-received latch prevents reconciliation or event subscribers from adding provenance after the terminal callback has begun. Actual root-bound authoring cancellation keeps the marker above. Cancellation of an ordinary planning, recovery or review request, or of a speculative request, instead uses `host_cancellation:{kind:"strategic_host",request_id,reason}` without a root field. Its reasons are `fenced` for lifecycle authority fencing, `speculative_preempted` for a meaningful wake that cancels optional lookahead, and `turn_deadline` for the existing finite turn timer. The settlement retains its admitted role. Fencing and speculative preemption make the response obsolete; a turn deadline can cancel a still-current request.
 
@@ -1122,13 +1124,15 @@ Root outcomes and attention remain queued behind the existing single-flight owne
 
 ### Bounded speculative planning
 
-Lookahead is explicit opt-in for independent preparation while a root continues, not observation polling or a replacement for ordinary program substeps. Main selects it in the root-start `next` configuration. `after_ms` is 0–600,000; the flight permits 1–4 calls, 1–16 tools and 1,000–30,000 ms. There is at most one flight/draft per root and 256 opt-ins per run. Ordinary replanning takes priority and strategic provider requests remain serialized. Generated planning help owns the input schema.
+Lookahead is explicit opt-in for independent preparation while a `run` or `step` root continues, not observation polling or a replacement for ordinary program substeps. Main selects it in the root-start `next` configuration. `after_ms` is 0–600,000; the flight permits 1–4 calls, 1–16 tools and 1,000–30,000 ms. There is at most one flight/draft per root and 256 opt-ins per run. Ordinary replanning takes priority and strategic provider requests remain serialized. Generated planning help owns the input schema.
 
 After the selected delay, `budget.duration_ms` is one total deadline covering preparation, staging, predecessor wait, fresh guard evaluation and admission. Staging, correction, predecessor closure or automatic activation cannot extend it. Main must select timing that leaves enough actual predecessor work and time for fresh admission.
 
 Root-start preparation checks live alive scope before durable admission, then arms once before execution handoff returns. Omission means no planning call or permit. A transport retry returns the original admitted execution without arming again. Internal late opt-in cannot mint automatic authority.
 
-The speculative role can observe, inspect authorized evidence, read help and `prepare_next`. It selects an existing named candidate and optional exact version; it cannot write/revise programs, activate a successor, change policies/memory or emit game effects. Main authors candidates before starting the predecessor. One shared role registry controls advertised tools and dispatch authorization; hiding tools alone is insufficient.
+The speculative role can observe, inspect authorized evidence, read help, save immutable inactive source and `prepare_next` one exact named candidate. It cannot submit/start programs, activate a successor, resolve outcome assessments, change policies/memory or emit game effects. Source preparation shares the original flight's call/tool/time budgets. One shared role registry controls advertised tools and dispatch authorization; hiding tools alone is insufficient.
+
+`prepare_next` defaults to entry `run` with finite-procedure limits. An explicit `entry:"step"` selects resident limits and an optional `initial_state` (default null); `args` supplies the new resident's intent. The selected immutable source must match that entry. A successor receives its explicitly authored state, never the predecessor's live stack, held inputs or lease. The predecessor's resident intent version is captured and rechecked: changing intent invalidates the old continuation even when source and execution identity stay the same. Routine parameter changes should use `update_intent` on suitable existing code rather than restart it.
 
 Staging pins the selected exact version's canonical source hash and full bounded dependency closure inside current run/model scope. Names never rebind an admitted candidate to today's latest version. Validation checks exact identity, validated state, SHA-256 bytes and dependency hashes; missing, invalid or changed sources produce inspectable typed rejection. The host repeats closure checks around fresh observation, guard evaluation and durable admission.
 
@@ -1147,6 +1151,33 @@ Stop, Pause, death, task/session/generation changes, failed/unknown/cancelled pr
 Recoverable guard source-validation errors may carry a bounded `stage_correction` allowance for an explicitly authored correction on the same flight. Only the whitelisted source-validation issues qualify; unsafe ambient access, stale authority and expiry remain terminal. Correction resets neither counters nor deadline. Rejected guard chunks/hashes, issues and omissions remain evidence; missing historical source cannot be reconstructed from a syntax location.
 
 `PlanProjection` retains guard omission/result, activation mode/permit/trigger, predecessor closure, pinned candidate, observation and activation evidence. Read it through planning inspection. Record requests, overlap, validation/rejection, admission and usage; `overlap_ms` is not causal speedup. The [integration evidence](integration-spike.md#verification-scope-after-the-published-checkpoint) separately scopes the old manual baseline that opened the edit gate and the later zero-inference native continuation proof; neither establishes natural-model efficacy.
+
+### Bounded passive reaction watch
+
+Local JavaScript reflex trial activation may include an explicit
+`watch:{duration_ms,evaluations}`. Both fields are positive integers, bounded
+by 1,800,000 ms and 100,000 checks. Omitting watch starts the ordinary trial
+immediately. Watch is unavailable for `keep` and cloud-backed Jev selection.
+
+During passive watch, `continue` decisions consume watch time and checks
+without consuming the short trial's relevant evaluation budget. The first
+valid, current non-continue decision starts that trial once; the triggering
+evaluation counts toward both phases. The trial retains its declared
+`max_ms`, `max_actions` and `max_evaluations`, and its deadline is clipped to
+the original watch deadline. Reselection, suspension, repeated triggers and
+ordinary reasoning do not replenish either allowance.
+
+Policy events expose `phase`, watch bounds and usage, and trial bounds and
+usage. `policy.selection_closed` records the final accounting after worker,
+evaluation and effect drain. Expiry closes admission even if no threat
+appeared; neutral checks are not evidence of defensive effectiveness.
+
+The model supplies every predicate and response. A selected policy may
+continue observing while strategic inference is pending; interruption or
+replacement still waits for exclusive cancellation, confirmed retirement
+and neutralization. Stop, life/scope changes and uncertain effects retain
+their fences. No shield, combat, retreat, eating or other survival policy
+is supplied by the runtime.
 
 After a verified goal, one bounded effect-free review can use at most three calls, twelve tools and 30,000 ms under the improvement request purpose. It can inspect evidence/source and author linked candidates before completion. It cannot start further gameplay trials after the user's goal is satisfied.
 

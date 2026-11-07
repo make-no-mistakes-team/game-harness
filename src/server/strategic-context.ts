@@ -265,11 +265,10 @@ export class StrategicContext {
       if (section.topic === "game" && (section.section === "validation" || section.section === "lifecycle" ||
         section.section === "progress")) return 2;
       if (section.topic === "programs" && section.section === "temporal_turn") return 0;
-      if (section.topic === "programs" && section.section !== "body" && section.section !== "world_view" &&
-        section.section !== "target_transitions" && section.section !== "resident" && !section.section.startsWith("resident.")) return 2;
-      // The mandatory supplement already supplies the body contract; the turn
-      // reference supplies target-transition mechanics without duplicate prose.
-      if (section.topic === "programs" && (section.section === "body" || section.section === "target_transitions")) return 2;
+      // Body and raw-view prose also live in the current root contract. Keep
+      // requested executable shapes ahead of those duplicates under pressure.
+      if (section.topic === "programs" && section.section !== "resident" &&
+        !section.section.startsWith("resident.")) return 2;
       return 0;
     };
     const candidates = [...sections, ...this.help];

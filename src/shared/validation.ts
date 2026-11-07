@@ -44,7 +44,7 @@ export const skillStartRequestSchema = z.discriminatedUnion("entry", [
   skillStartBase.extend({ entry: z.literal("run"), limits: skillLimitsSchema,
     lookahead: lookaheadConfigSchema.optional() }).strict(),
   skillStartBase.extend({ entry: z.literal("step"), args: residentIntentSchema,
-    limits: residentLimitsSchema, initial_state: residentStateSchema }).strict(),
+    limits: residentLimitsSchema, initial_state: residentStateSchema, lookahead: lookaheadConfigSchema.optional() }).strict(),
 ]) satisfies z.ZodType<SkillStartRequest>;
 export const skillResultSchema = z.object({ status: z.enum(["completed", "blocked", "failed"]),
   summary: z.string().min(1).max(2000), result: jsonSchema }).strict() satisfies z.ZodType<SkillResult>;

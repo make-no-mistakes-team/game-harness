@@ -169,7 +169,8 @@ export class ProgramOperations {
       commit();
       const selection = { operation: "start" as const, name: program.name, version: program.version };
       const execution = await this.runProgram(input.entry === "step"
-        ? { ...selection, entry: "step", args: input.args, limits: input.limits, initial_state: input.initial_state }
+        ? { ...selection, entry: "step", args: input.args, limits: input.limits, initial_state: input.initial_state,
+          ...(input.next ? { next: input.next } : {}) }
         : { ...selection, entry: "run", args: input.args, limits: input.limits, ...(input.next ? { next: input.next } : {}) }, startId, commit);
       return finish(program, { status: "started", execution: execution as unknown as Json });
     } catch (error) {
@@ -192,8 +193,8 @@ export class ProgramOperations {
           epoch: this.run.epoch, session_id: this.run.session_id!, life_id: this.run.life_id!,
           native_boot_id: this.run.native_boot_id!, run_generation: this.host.generation(), space_epoch: this.run.space_epoch!,
           compatibility_hash: this.run.compatibility_hash!,
-          args: input.args, limits: input.limits, ...(input.entry === "step" ? { initial_state: input.initial_state }
-            : input.next ? { lookahead: input.next } : {}) } as unknown as Json;
+          args: input.args, limits: input.limits, ...(input.entry === "step" ? { initial_state: input.initial_state } : {}),
+          ...(input.next ? { lookahead: input.next } : {}) } as unknown as Json;
       }) as unknown as SkillStartRequest;
       const existing = this.skills.get(this.run.run_id, { start_key: startKey });
       if (!existing) { commit(); this.host.planning().assertOrdinaryAdmission(); }
@@ -278,8 +279,13 @@ export class ProgramOperations {
         return { plan_id: plan.plan_id, skill: { skill_id: program.skill_id, version: program.version } };
       }));
     const program = this.store.skill(this.run.run_id, selected.skill);
+    if (program.entry !== input.entry)
+      throw new RuntimeFault("precondition_failed", "Prepared entry does not match the selected immutable source");
     const staged = await this.host.planning().stage({ plan_id: selected.plan_id,
-      skill: selected.skill, args: input.args, limits: input.limits,
+      skill: selected.skill, args: input.args,
+      ...(input.entry === "step"
+        ? { entry: "step" as const, initial_state: input.initial_state, limits: input.limits }
+        : { entry: "run" as const, limits: input.limits }),
       ...(input.guard_source === undefined ? {} : { guard_source: input.guard_source }) });
     return { state: staged.state, candidate: { name: program.name, version: program.version },
       guard_status: staged.guard_status, activation: staged.activation, deadline_at: staged.deadline_at };
@@ -361,7 +367,8 @@ export class ProgramOperations {
     if (input.operation === "validate") return this.workspace.policyView(await this.reactions.validate(ref, generation, signal));
     if (input.operation === "retire") return this.workspace.policyView(await this.reactions.retire(ref, generation));
     return this.workspace.policyView(await this.reactions.activate({ ...ref, mode: input.mode,
-      max_ms: input.max_ms, max_actions: input.max_actions, max_evaluations: input.max_evaluations }, generation, signal));
+      max_ms: input.max_ms, max_actions: input.max_actions, max_evaluations: input.max_evaluations,
+      ...(input.watch ? { watch: input.watch } : {}) }, generation, signal));
   }
 
   async memory(input: z.infer<typeof memorySchema>, callId: string, commit: () => void) {

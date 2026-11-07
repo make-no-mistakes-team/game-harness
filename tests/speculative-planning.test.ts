@@ -6,6 +6,7 @@ import type { SkillExecutionView, SkillStartRequest, SkillView } from "../src/sh
 import { skillStartRequestSchema } from "../src/shared/validation.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { ProgramValidationError, programFingerprint } from "../src/server/program-validation.ts";
+import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
 import { minecraftObservationFixture, minecraftTestAdapter, sha256 } from "./helpers/adapter-contract.ts";
 
 const adapter = minecraftTestAdapter(), compatibilityHash = sha256(adapter.descriptor);
@@ -63,18 +64,19 @@ function setup() {
       return state.evaluate(text, fresh, args, signal);
     },
     admit: async (request, permit) => {
-      if (request.entry !== "run") throw new Error("Planner only admits run entries");
       skillStartRequestSchema.parse(request);
       await state.beforeAdmit();
       permit.assertCurrent();
       if (permit.signal.aborted) throw new Error("revoked");
       admitted.push(request);
       context.root = { execution_id: "next-root", skill_id: candidate.skill_id, version: candidate.version, hash: candidate.hash, status: state.admissionStatus };
-      const execution: SkillExecutionView = {
-        ...request, run_id: "run", world_id: context.world_id, source_hash: candidate.hash, execution_id: "next-root", root_execution_id: "next-root", parent_execution_id: null,
+      const executionBase = {
+        run_id: "run", world_id: context.world_id, source_hash: candidate.hash, execution_id: "next-root", root_execution_id: "next-root", parent_execution_id: null,
         status: state.admissionStatus, started_at: null, ended_at: null, deadline_at: new Date().toISOString(),
         actions: 0, calls: 0, result: null, error: state.admissionStatus === "unknown" ? "Uncertain outcome" : null,
       };
+      const execution: SkillExecutionView = request.entry === "step"
+        ? { ...executionBase, ...request, resident: null } : { ...executionBase, ...request };
       await state.afterAdmit();
       return execution;
     },
@@ -151,6 +153,70 @@ test("succeeded status without the trusted drain notification grants neither aut
   f.planner.predecessorSettled("root"); expect((await f.planner.pendingActivation())?.state).toBe("activated");
 });
 
+test("prepared resident continuation retains exact intent, state and limits and waits for predecessor drain", async () => {
+  const f = setup();
+  f.candidate.entry = "step";
+  f.candidate.source = "export function step(frame,state,intent) { return {}; }";
+  f.candidate.hash = createHash("sha256").update(f.candidate.source).digest("hex");
+  f.candidate.validation.fingerprint = programFingerprint(f.candidate.hash, "step", compatibilityHash);
+  const plan = f.arm(true); f.planner.begin();
+  await f.planner.stage({
+    plan_id: plan.plan_id, entry: "step", skill: { skill_id: f.candidate.skill_id, version: f.candidate.version },
+    args: { destination: 7 }, initial_state: { stage: 2 }, limits: { ...DEFAULT_RESIDENT_LIMITS },
+  });
+  f.planner.finish(plan.plan_id);
+  f.context.root.status = "succeeded";
+  expect(await f.planner.pendingActivation()).toBeNull();
+  expect(f.admitted).toEqual([]);
+  f.planner.predecessorSettled("root");
+  expect(await f.planner.pendingActivation()).toMatchObject({ state: "activated" });
+  expect(f.admitted).toHaveLength(1);
+  expect(f.admitted[0]).toMatchObject({
+    entry: "step", args: { destination: 7 }, initial_state: { stage: 2 },
+    limits: { frequency_hz: 20, max_steps: 3600 },
+  });
+});
+
+test("prepared continuation refuses a resident/run entry mismatch without admitting effects", async () => {
+  const f = setup(), plan = f.arm(true); f.planner.begin();
+  await expect(f.planner.stage({
+    plan_id: plan.plan_id, entry: "step", skill: { skill_id: f.candidate.skill_id, version: f.candidate.version },
+    args: null, initial_state: null, limits: { ...DEFAULT_RESIDENT_LIMITS },
+  })).rejects.toThrow();
+  f.planner.finish(plan.plan_id); f.succeed();
+  await f.planner.pendingActivation();
+  expect(f.admitted).toEqual([]);
+});
+
+test("finite lookahead permits inactive source authoring but never foreground starts", () => {
+  const f = setup(); f.arm(); f.planner.begin();
+  expect(() => f.planner.assertToolAuthority("program_write")).not.toThrow();
+  expect(() => f.planner.assertToolAuthority("program_submit")).toThrow();
+  expect(() => f.planner.assertToolAuthority("program_run")).toThrow();
+  expect(f.admitted).toEqual([]);
+});
+
+for (const phase of ["staged", "activation_observation"] as const) {
+  test(`changed resident intent invalidates prepared continuation during ${phase}`, async () => {
+    const f = setup();
+    f.context.root.intent_version = 0;
+    const id = await f.stage(true);
+    const observed = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    if (phase === "activation_observation") {
+      f.state.beforeObserve = async () => { observed.resolve(); await release.promise; };
+      f.succeed(); await observed.promise;
+    }
+    f.context.root.intent_version = 1;
+    if (phase === "staged") f.succeed();
+    release.resolve();
+    await f.planner.pendingActivation();
+    expect(f.planner.projection()).toMatchObject({ state: "rejected", reason: "predecessor_changed" });
+    expect(f.admitted).toEqual([]);
+    expect(f.planner.projection()?.activation_permit).toBe("revoked");
+    expect(f.planner.projection()?.plan_id).toBe(id);
+  });
+}
+
 test("closure-first ownership waits for speculative finish and returns outcome authority on an empty flight", async () => {
   const f = setup(); const plan = f.arm(true); f.planner.begin(); f.context.root.status = "succeeded";
   expect(f.planner.predecessorSettled("root")).toBe(true);
@@ -177,7 +243,7 @@ test("only the Main root-start closure mints an automatic permit; speculative to
   f.state.hasRoot = true; f.context.root.status = "accepted";
   expect(arm("root")).toMatchObject({ activation_permit: "available" });
   expect(() => arm("root")).toThrow("already consumed"); f.planner.begin();
-  for (const tool of ["program_run", "program_write", "program_review", "reflex", "memory"])
+  for (const tool of ["program_run", "program_review", "reflex", "memory"])
     expect(() => f.planner.assertToolAuthority(tool)).toThrow("only permits");
   expect(f.admitted).toEqual([]);
 });

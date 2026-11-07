@@ -125,6 +125,7 @@ interface RequestAttempt {
   index: number;
   planId: string | null;
   review: boolean;
+  pendingDecision: boolean;
   role: "speculative" | "review" | "recovery" | "planning" | "authoring";
   authoring: AuthoringWindow | null;
   terminalReceived: boolean;
@@ -367,9 +368,24 @@ export class StrategicPlanner {
         // This is the final supported SDK stream boundary, including tool-loop
         // continuations. Supplement the actual request, not the disposable
         // Agent's history or a host-only reference cache.
+        const pendingAuthoring = this.authoringProjection();
         const requestContext = {
           ...context,
-          systemPrompt: [...(context.systemPrompt ?? []), this.retainedContext.assemble(run, adapter, this.authoringProjection())],
+          // The SDK keeps the original user message through its tool loop.
+          // Refresh that host projection as well as the supplement: otherwise
+          // a pure authoring request still claims ordinary decision authority.
+          messages: context.messages.map((message, index) => {
+            if (index !== 0 || message.role !== "user") return message;
+            const refresh = (text: string) => {
+              const projection = JSON.parse(text);
+              return JSON.stringify({ ...projection, phase: run.status, role: request.role,
+                pending_decision: request.pendingDecision, pending_authoring: pendingAuthoring ?? null,
+                ...(pendingAuthoring ? { instruction: pendingAuthoring.instruction } : {}) });
+            };
+            return { ...message, content: typeof message.content === "string" ? refresh(message.content) :
+              message.content.map(part => part.type === "text" ? { ...part, text: refresh(part.text) } : part) };
+          }),
+          systemPrompt: [...(context.systemPrompt ?? []), this.retainedContext.assemble(run, adapter, pendingAuthoring)],
         };
         let firstResponse = false;
         const events = await stream(model, requestContext, { ...options,
@@ -495,8 +511,10 @@ export class StrategicPlanner {
         return events;
       };
       const selectPhase = () => {
+        const settlingAuthoring = this.authoringPhase && this.turnAuthoring &&
+          this.reconcileAuthoring() === this.turnAuthoring && !this.turnAuthoring.closed;
         this.authoringPhase = run.status !== "reviewing" && !this.speculativeTurn &&
-          this.host.programPending() && !this.pendingDecision;
+          (Boolean(settlingAuthoring) || this.host.programPending() && !this.pendingDecision);
         agent.setTools(this.host.tools(generation).filter(tool => isToolAllowed(this.toolRole(), tool.name)));
       };
       // setTools inside the admission gate is too late for this SDK: its
@@ -549,6 +567,7 @@ export class StrategicPlanner {
           authoring.calls++;
           this.turnAuthoring = authoring;
         }
+        const pendingDecision = this.pendingDecision;
         this.pendingDecision = false;
         this.turnCalls++;
         run.turns++;
@@ -560,6 +579,7 @@ export class StrategicPlanner {
           index: this.turnCalls,
           planId: this.speculativeTurn ? this.host.speculation?.().projection()?.plan_id ?? null : null,
           review,
+          pendingDecision,
           role: authoring ? "authoring" : this.role,
           authoring,
           terminalReceived: false,
@@ -665,7 +685,7 @@ export class StrategicPlanner {
     const generation = this.host.generation();
     const speculation = this.speculativeTurn ? this.host.speculation?.() : undefined;
     const permit = speculation?.authority();
-    const authoring = this.authoringPhase && !speculation && run?.status !== "reviewing" && this.host.programPending()
+    const authoring = this.authoringPhase && !speculation && run?.status !== "reviewing"
       ? this.reconcileAuthoring() : null;
     const requiresAuthoring = this.authoringPhase && !speculation && run?.status !== "reviewing";
     return () => {
@@ -682,7 +702,7 @@ export class StrategicPlanner {
     if (this.host.run()?.status === "reviewing") return "review";
     if (this.speculativeTurn) return "speculative";
     this.reconcileAuthoring();
-    return this.authoringPhase && this.host.programPending() ? "authoring" : "ordinary";
+    return this.authoringPhase ? "authoring" : "ordinary";
   }
 
   private authoringScope(run: StoredRun): string {
@@ -703,11 +723,20 @@ export class StrategicPlanner {
       root.life_id === run.life_id && root.native_boot_id === run.native_boot_id && root.space_epoch === run.space_epoch &&
       root.compatibility_hash === run.compatibility_hash && root.source_hash !== null;
     if (previous && !previous.closed) {
-      const reason = !valid ? (root && !["accepted", "running"].includes(root.status) ? "root_settled" : "scope_lost")
-        : previous.run !== run || previous.generation !== generation || previous.scope !== scope ? "scope_lost"
-          : previous.root !== root.execution_id || previous.source !== root.source_hash ? "root_replaced"
-            : Date.now() >= previous.deadline ? "deadline" : null;
+      // The admitted inactive SDK loop owns settlement grace, not its current
+      // provider request: message_end releases that request before tools run.
+      // Keep the same turn and original budget across those request-free seams;
+      // no new turn, effect or activation authority is admitted.
+      const settling = this.authoringPhase && this.turnAuthoring === previous && previous.calls > 0 && this.turn !== null &&
+        root?.execution_id === previous.root && root.source_hash === previous.source &&
+        !["accepted", "running"].includes(root.status);
+      const reason = previous.run !== run || previous.generation !== generation || previous.scope !== scope ||
+          !run || !this.current(run, generation) || run.status !== "running" ? "scope_lost"
+        : root && (previous.root !== root.execution_id || previous.source !== root.source_hash) ? "root_replaced"
+          : Date.now() >= previous.deadline ? "deadline"
+            : !valid && !settling ? (root && !["accepted", "running"].includes(root.status) ? "root_settled" : "scope_lost") : null;
       if (reason) this.endAuthoring(previous, reason);
+      else return previous;
     }
     if (!valid) return null;
     // Retain the latch for the same actual root even after a scope change,
@@ -789,7 +818,8 @@ export class StrategicPlanner {
       remaining_calls: window && !window.closed ? Math.max(0, AUTHORING_CALLS - window.calls) : 0,
       remaining_tools: window && !window.closed ? Math.max(0, AUTHORING_TOOLS - window.tools) : 0,
       remaining_ms: window && !window.closed ? Math.max(0, window.deadline - Date.now()) : 0,
-      instruction: "Foreground work continues unchanged. Within this one finite root-bound window, observe, help, program_inspect and program_write may prepare immutable inactive source. Write saves/validates only; no submit, run, activation, prepare_next, task_finish, reflex, memory or review. No polling or keepalive. Exhaustion waits for the root outcome; later wakes and leaf admissions do not renew this window.",
+      predecessor_status: root?.status ?? null,
+      instruction: "Within this one finite root-bound window, observe, help, program_inspect and program_write may prepare immutable inactive source. Foreground work is not changed; if it has settled, only this already-running inactive authoring turn may finish before queued outcome work. Write saves/validates only; no submit, run, activation, prepare_next, task_finish, reflex, memory or review. No polling or keepalive. Later wakes and leaf admissions do not renew this window.",
     };
   }
 
@@ -1042,7 +1072,10 @@ export class StrategicPlanner {
     }
     this.speculativeTurn = speculative !== null;
     this.pendingDecision = !review && !speculative && this.host.programPending() && reasons.some(pendingDecisionWake);
-    this.turnAuthoring = !this.pendingDecision && !review && !speculative && window && !window.closed ? window : null;
+    // Only request admission below may bind this turn to settlement grace.
+    // A previous turn's consumed window budget cannot admit a new SDK loop.
+    // The SDK hook mutates this field across awaits in the remainder of the turn.
+    this.turnAuthoring = null as AuthoringWindow | null;
     this.authoringEnded = false;
     this.authoringPhase = false;
     const attention = reasons.includes("selected_attention")
@@ -1297,6 +1330,10 @@ export class StrategicPlanner {
       if (this.historyController === historyController) this.historyController = null;
       this.finishUnsettledRequest(run);
       this.finishAuthoringBudget();
+      const authoring = this.turnAuthoring;
+      if (authoring && !authoring.closed &&
+          !["accepted", "running"].includes(this.store.skillExecution(run.run_id, { execution_id: authoring.root })?.status ?? ""))
+        this.endAuthoring(authoring, "root_settled", false);
       // Confirm authoring transport release before the queued root outcome can
       // obtain this single owner. This never touches the playing root.
       if (this.authoringEnded) {

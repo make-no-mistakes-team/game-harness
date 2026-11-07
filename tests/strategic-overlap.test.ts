@@ -357,7 +357,8 @@ test("ordinary authoring admits exactly twelve tools and fences captured commits
   expect(f.state.pauses).toEqual([]);
 });
 
-test("the finite authoring timer cancels only authoring while its real Store root remains running", async () => {
+for (const predecessor of ["running", "settled"] as const)
+test(`the finite authoring timer cancels only authoring while its real Store root is ${predecessor}`, async () => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   let permit: (() => void) | undefined;
   const f = await setup(async (_context, agent) => {
@@ -369,10 +370,11 @@ test("the finite authoring timer cancels only authoring while its real Store roo
   await f.planner.start(1);
   const expired = f.event("scheduler.authoring_exited"), finished = f.event("scheduler.turn_finished");
   f.planner.wake("planning_continuation"); vi.advanceTimersByTime(100); await entered.promise;
+  if (predecessor === "settled") { finishHistoryExecution(f.store, f.root); f.state.pending = false; }
   vi.advanceTimersByTime(60_000);
   await expired; await finished; release.resolve();
   expect(() => permit!()).toThrow();
-  expect(f.store.skillExecution(f.run.run_id, { execution_id: f.root.execution_id })?.status).toBe("running");
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: f.root.execution_id })?.status).toBe(predecessor === "running" ? "running" : "succeeded");
   expect(f.state.pauses).toEqual([]);
   expect(f.store.eventsAfter(f.run.run_id, 0, 500).find(event => event.type === "scheduler.authoring_exited")?.details)
     .toMatchObject({ reason: "deadline", calls: 1, tools: 0 });
@@ -436,7 +438,7 @@ test("explicit resident and selected attention retain ordinary intent/stop autho
   expect(f.state.pauses).toEqual([]);
 });
 
-for (const ending of ["root_settled", "root_replaced", "deadline", "scope_lost", "stop"] as const)
+for (const ending of ["root_replaced", "deadline", "scope_lost", "stop"] as const)
   test(`captured authoring authority cannot commit after ${ending} in the same serialized owner`, async () => {
     const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
     let permit: (() => void) | undefined;
@@ -447,8 +449,7 @@ for (const ending of ["root_settled", "root_replaced", "deadline", "scope_lost",
     });
     await f.planner.start(1);
     const finished = f.event("scheduler.turn_finished"); f.planner.wake("planning_continuation"); await entered.promise;
-    if (ending === "root_settled") finishHistoryExecution(f.store, f.root);
-    else if (ending === "root_replaced") {
+    if (ending === "root_replaced") {
       finishHistoryExecution(f.store, f.root);
       const source = await f.store.registerSkill(f.run.run_id, historySpec(f.run, "Replacement foreground"));
       historyExecution(f.store, f.run, source);
@@ -462,28 +463,45 @@ for (const ending of ["root_settled", "root_replaced", "deadline", "scope_lost",
     else await finished;
     expect(f.state.pauses).toEqual([]);
     expect(f.run.usage.calls).toBe(1);
-    if (ending !== "root_settled" && ending !== "root_replaced")
+    if (ending !== "root_replaced")
       expect(f.store.skillExecution(f.run.run_id, { execution_id: f.root.execution_id })?.status).toBe("running");
   });
 
-test("root settlement queues ordinary outcome work behind the cancelled authoring transport", async () => {
+test("root settlement queues ordinary outcome work behind bounded inactive authoring without granting effects", async () => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   let prompts = 0;
   const f = await setup(async (_context, agent) => {
     prompts++;
     expect(await agent.call()).toBe(true);
-    if (prompts === 1) { entered.resolve(); await agent.wait(release.promise); }
+    if (prompts === 1) {
+      const permit = f.planner.speculativeToolAuthority();
+      entered.resolve(); await agent.wait(release.promise);
+      permit();
+      expect(f.state.aborts).toBe(0);
+      expect(f.planner.toolRole()).toBe("authoring");
+      expect(await agent.tool("program_write")).toBe(true);
+      for (const forbidden of ["program_run", "program_submit", "prepare_next", "task_finish", "reflex"])
+        expect(await agent.tool(forbidden)).toBe(false);
+      const candidate = await f.store.registerSkill(f.run.run_id, historySpec(f.run, "Post-root inactive candidate"));
+      permit();
+      expect(f.store.skillExecutions(f.run.run_id).some(execution => execution.skill_id === candidate.skill_id)).toBe(false);
+      expect(await agent.call()).toBe(true);
+      expect(await agent.call()).toBe(true);
+      expect(await agent.call()).toBe(false);
+    }
     else expect(f.planner.toolRole()).toBe("ordinary");
   });
   await f.planner.start(1); f.planner.wake("planning_continuation"); await entered.promise;
   finishHistoryExecution(f.store, f.root); f.state.pending = false;
   const next = f.event("scheduler.turn_started");
-  f.planner.wake("skill_outcome"); release.resolve(); await next;
+  f.planner.wake("skill_outcome");
+  expect(prompts).toBe(1); expect(f.state.aborts).toBe(0);
+  release.resolve(); await next;
   await f.event("scheduler.turn_finished");
-  expect(prompts).toBe(2); expect(f.run.usage.calls).toBe(2); expect(f.state.pauses).toEqual([]);
+  expect(prompts).toBe(2); expect(f.run.usage.calls).toBe(4); expect(f.state.pauses).toEqual([]);
 });
 
-for (const ending of ["root_settled", "fenced"] as const)
+for (const ending of ["fenced", "scope_lost"] as const)
 test(`real SDK ${ending} cancellation retains exact host provenance without stale writes`, async () => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   let requests = 0, writes = 0;
@@ -507,17 +525,16 @@ test(`real SDK ${ending} cancellation retains exact host provenance without stal
   await f.planner.start(1); f.planner.wake("planning_continuation"); await entered.promise;
   finishHistoryExecution(f.store, f.root); f.state.pending = false;
   const completed = ending === "fenced" ? null : new Promise<void>(resolve => {
-    let turns = 0;
     const off = f.store.subscribe(event => {
-      if (event.run_id === f.run.run_id && event.type === "scheduler.turn_finished" && ++turns === 2) { off(); resolve(); }
+      if (event.run_id === f.run.run_id && event.type === "scheduler.turn_finished") { off(); resolve(); }
     });
   });
   if (ending === "fenced") f.planner.fence();
-  else f.planner.wake("skill_outcome");
+  else { f.run.space_epoch = f.run.space_epoch! + 1; f.planner.toolRole(); }
   release.resolve();
   if (ending === "fenced") await f.planner.close();
   else await completed;
-  expect(requests).toBe(ending === "fenced" ? 1 : 2);
+  expect(requests).toBe(1);
   expect(writes).toBe(0); expect(f.state.pauses).toEqual([]);
   const events = f.store.eventsAfter(f.run.run_id, 0, 500);
   const first = events.find(event => event.type === "model.call");
@@ -527,11 +544,6 @@ test(`real SDK ${ending} cancellation retains exact host provenance without stal
       recovered_failure: { type: "stream_interrupted_after_content" },
       host_cancellation: { kind: "ordinary_authoring", request_id: requestId,
         root_execution_id: f.root.execution_id, reason: ending } });
-  if (ending === "root_settled") {
-    const ordinary = events.filter(event => event.type === "model.request_settled").at(-1);
-    expect(ordinary?.details).toMatchObject({ role: "planning", stop_reason: "stop", obsolete: false, provider_failure: false });
-    expect(ordinary?.details).not.toHaveProperty("host_cancellation");
-  }
   expect(events.some(event => event.type === "scheduler.turn_failed")).toBe(false);
   const usage = events.find(event => event.type === "model.usage" && object(event.details)?.request_id === requestId);
   expect(usage?.details).toHaveProperty("usage_evidence.provider_terminal", null);
@@ -692,7 +704,7 @@ test(`real SDK provider abort received before a ${role} host fence cannot acquir
 });
 
 for (const stopReason of ["error", "aborted"] as const)
-test(`real SDK provider ${stopReason} remains a failure when root settlement makes its authoring response obsolete`, async () => {
+test(`real SDK provider ${stopReason} remains a failure after root settlement during inactive authoring`, async () => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   const f = await setup(async () => { throw new Error("Installed SDK owns this response"); }, async model => {
     const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
@@ -721,7 +733,7 @@ test(`real SDK provider ${stopReason} remains a failure when root settlement mak
   release.resolve(); await finished;
   const events = f.store.eventsAfter(f.run.run_id, 0, 500);
   const settled = events.find(event => event.type === "model.request_settled");
-  expect(settled?.details).toMatchObject({ role: "authoring", stop_reason: stopReason, obsolete: true, provider_failure: true,
+  expect(settled?.details).toMatchObject({ role: "authoring", stop_reason: stopReason, obsolete: false, provider_failure: true,
     recovered_failure: { type: "stream_interrupted_after_content" } });
   expect(settled?.details).not.toHaveProperty("host_cancellation");
   expect(f.state.pauses).toHaveLength(1);
@@ -739,6 +751,15 @@ test("the real SDK continues after submit through evidence and inactive validate
       const supplement = context.systemPrompt?.at(-1)!;
       expect(Buffer.byteLength(supplement)).toBeLessThanOrEqual(32768);
       const retained = JSON.parse(supplement).strategic_context;
+      const projection = context.messages.find(message => message.role === "user")!;
+      expect(projection.role).toBe("user");
+      if (projection.role !== "user") throw new Error("Missing actual request projection");
+      const text = typeof projection.content === "string" ? projection.content :
+        projection.content.filter(part => part.type === "text").map(part => part.text).join("");
+      expect(JSON.parse(text)).toMatchObject({ role: "authoring", phase: "running", pending_decision: false,
+        pending_authoring: { phase: "authoring" } });
+      expect(JSON.parse(text).instruction).toContain("inactive source");
+      if (index > 1) expect(JSON.stringify(retained.requested_help)).toContain("Pure inactive source may be saved");
       expect(retained.pending_authoring).toMatchObject({ phase: "authoring", root: { name: "SDK foreground", version: 1 },
         remaining_calls: 3 - index, remaining_tools: index === 1 ? 12 : index === 2 ? 10 : 9 });
       expect(JSON.stringify(retained.pending_authoring)).not.toContain(f.store.latestRootExecution(f.run.run_id)!.execution_id);
@@ -810,4 +831,73 @@ test("the real SDK continues after submit through evidence and inactive validate
     expect(f.store.latestRootExecution(f.run.run_id)?.status).toBe("running");
     expect(f.state.pauses).toEqual([]);
   } finally { continueBody.resolve(); finishBody.resolve(); }
+});
+
+test("real SDK retains help ordinary-authoring-ordinary and publishes inactive source after root settlement without activation", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let requests = 0, writes = 0;
+  const f = await setup(async () => { throw new Error("Installed SDK owns this tool loop"); }, async (model, context) => {
+    const index = requests++;
+    if (index > 0) {
+      const retained = JSON.parse(context.systemPrompt!.at(-1)!).strategic_context;
+      expect(JSON.stringify(retained.requested_help)).toContain("Compatible read-only game mechanics");
+    }
+    if (index === 3) {
+      const user = context.messages.find(message => message.role === "user")!;
+      if (user.role !== "user") throw new Error("Missing ordinary outcome projection");
+      const text = typeof user.content === "string" ? user.content :
+        user.content.filter(part => part.type === "text").map(part => part.text).join("");
+      expect(JSON.parse(text)).toMatchObject({ role: "planning", pending_decision: false, pending_authoring: null });
+      expect(context.tools?.some(tool => tool.name === "program_run")).toBe(true);
+    }
+    if (index > 0 && index < 3) {
+      expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_inspect", "program_write"]);
+      const user = context.messages.find(message => message.role === "user")!;
+      if (user.role !== "user") throw new Error("Missing actual request projection");
+      const text = typeof user.content === "string" ? user.content :
+        user.content.filter(part => part.type === "text").map(part => part.text).join("");
+      expect(JSON.parse(text)).toMatchObject({ role: "authoring", pending_decision: false,
+        pending_authoring: { phase: "authoring" } });
+    }
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: index < 2 ? "toolUse" : "stop",
+      content: index < 2 ? [{ type: "toolCall", id: `retained-help-${index}`, name: index === 0 ? "help" : "program_write",
+        arguments: index === 0 ? { topic: "game" } : {} }] : [],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      yield { type: "start", partial: message };
+      if (index === 1) { entered.resolve(); await release.promise; }
+      stream.end(message); yield { type: "done", reason: index < 2 ? "toolUse" : "stop", message };
+    };
+    return stream;
+  });
+  f.tools.find(tool => tool.name === "help")!.execute = async () => ({
+    content: [], details: { mechanics: "Compatible read-only game mechanics" },
+  });
+  f.tools.find(tool => tool.name === "program_write")!.execute = async () => {
+    const permit = f.planner.speculativeToolAuthority();
+    const candidate = await f.store.registerSkill(f.run.run_id, historySpec(f.run, "Settled-root SDK candidate"));
+    permit(); writes++;
+    return { content: [], details: { name: candidate.name, version: candidate.version } };
+  };
+  await f.planner.start(1); f.planner.wake("policy_replan"); await entered.promise;
+  finishHistoryExecution(f.store, f.root); f.state.pending = false;
+  const finished = new Promise<void>(resolve => {
+    let turns = 0;
+    const off = f.store.subscribe(event => {
+      if (event.type === "scheduler.turn_finished" && event.run_id === f.run.run_id && ++turns === 2) { off(); resolve(); }
+    });
+  });
+  f.planner.wake("skill_outcome");
+  expect(requests).toBe(2); expect(writes).toBe(0);
+  release.resolve(); await finished;
+  expect(requests).toBe(4); expect(writes).toBe(1);
+  const candidate = f.store.namedSkill(f.run.run_id, "Settled-root SDK candidate")!;
+  expect(candidate.state).toBe("validated");
+  expect(f.store.skillExecutions(f.run.run_id).filter(execution => execution.skill_id === candidate.skill_id)).toEqual([]);
+  expect(f.state.pauses).toEqual([]);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "model.request_settled")
+    .every(event => !object(event.details)?.host_cancellation)).toBe(true);
 });

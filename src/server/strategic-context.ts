@@ -195,7 +195,7 @@ export class StrategicContext {
     }
   }
 
-  synchronize(run: StoredRun, model: Pick<Model, "api" | "provider">, context: Context,
+  synchronize(run: StoredRun, model: Pick<Model, "api" | "provider">, _context: Context,
     observation: ObservationIdentity | null, adapter?: RuntimeAdapter): void {
     this.scope(run);
     // Provider transport, root prose and tool-role changes do not change the
@@ -209,10 +209,12 @@ export class StrategicContext {
     this.sourceCompatibility = sourceKey;
     this.actionHelpSection = adapter?.action_capability
       ? `schemas.capabilities.${adapter.action_capability.id}@${adapter.action_capability.version}` : null;
+    // Requested help is read-only contract knowledge, not the current tool
+    // catalog or action authority. Ordinary/authoring role transitions and
+    // root prose must not discard an otherwise compatible game/API reference.
     const key = createHash("sha256").update(JSON.stringify({ api: model.api, provider: model.provider, executable: SKILL_API_VERSION,
       compatibility_hash: run.compatibility_hash, adapter: adapter?.descriptor ?? null,
-      profile: observation, root: context.systemPrompt,
-      tools: context.tools?.map(tool => ({ name: tool.name, description: tool.description, parameters: tool.parameters })) ?? [] })).digest("hex");
+      profile: observation })).digest("hex");
     if (key !== this.compatibility) {
       this.compatibility = key; this.help = []; this.helpOmissions = [];
     }
@@ -262,11 +264,34 @@ export class StrategicContext {
       if (section.topic === "game" && (section.section === "adapter" || section.section.startsWith("adapter."))) return 3;
       if (section.topic === "game" && (section.section === "validation" || section.section === "lifecycle" ||
         section.section === "progress")) return 2;
+      if (section.topic === "programs" && section.section === "temporal_turn") return 0;
       if (section.topic === "programs" && section.section !== "body" && section.section !== "world_view" &&
         section.section !== "target_transitions" && section.section !== "resident" && !section.section.startsWith("resident.")) return 2;
+      // The mandatory supplement already supplies the body contract; the turn
+      // reference supplies target-transition mechanics without duplicate prose.
+      if (section.topic === "programs" && (section.section === "body" || section.section === "target_transitions")) return 2;
       return 0;
     };
-    this.help = [...sections, ...this.help].sort((a, b) => priority(a) - priority(b));
+    const candidates = [...sections, ...this.help];
+    const actionKinds = new Map<HelpSection, string>();
+    const alternativesPerKind = new Map<string, number>();
+    for (const section of candidates) {
+      if (priority(section) !== 1) continue;
+      const kind = object(object(object(section.content)?.properties)?.kind)?.const;
+      if (typeof kind !== "string") continue;
+      actionKinds.set(section, kind);
+      alternativesPerKind.set(kind, (alternativesPerKind.get(kind) ?? 0) + 1);
+    }
+    this.help = candidates.sort((a, b) => {
+      const rank = priority(a) - priority(b);
+      // A discriminator may have several valid shapes. Preserve that complete
+      // family before single-shape actions, rather than silently teaching only
+      // one shape. Keep each alternative's properties/bounds wholly intact.
+      return rank || (priority(a) === 1
+        ? (alternativesPerKind.get(actionKinds.get(b) ?? "") ?? 1) -
+          (alternativesPerKind.get(actionKinds.get(a) ?? "") ?? 1)
+        : 0);
+    });
     let used = 0;
     this.help = this.help.filter(section => {
       const size = bytes(section);

@@ -488,9 +488,11 @@ for (const topics of [["programs", "game"], ["game", "programs"]]) test(`actual 
     const union = Array.isArray(actionSchema.oneOf) ? "oneOf" : "anyOf";
     const alternatives = actionSchema[union];
     expect(Array.isArray(alternatives)).toBe(true);
-    for (const kind of ["move", "craft"]) {
-      const actionIndex = alternatives.findIndex((branch: any) => branch.properties?.kind?.const === kind);
-      expect(actionIndex).toBeGreaterThanOrEqual(0);
+    const mechanics = alternatives.map((branch: any, index: number) => ({ branch, index }))
+      .filter(({ branch }: any) => ["move", "craft"].includes(branch.properties?.kind?.const));
+    expect(mechanics.filter(({ branch }: any) => branch.properties.kind.const === "move")).toHaveLength(1);
+    expect(mechanics.filter(({ branch }: any) => branch.properties.kind.const === "craft")).toHaveLength(2);
+    for (const { index: actionIndex } of mechanics) {
       // Accept an enclosing schema, never detached properties with missing bounds.
       const path = ["schemas", "capabilities", `${capability.id}@${capability.version}`, union, actionIndex];
       let reference = "", retainedAction: unknown;
@@ -504,6 +506,9 @@ for (const topics of [["programs", "game"], ["game", "programs"]]) test(`actual 
       }
       expect(retainedAction).toEqual(alternatives[actionIndex]);
     }
+    expect(context.requested_help).toContainEqual({
+      topic: "programs", section: "temporal_turn", content: programs.temporal_turn,
+    });
     for (const [name, method] of Object.entries(game.methods) as [string, any][]) {
       if (!method.result_schema) continue;
       expect(context.requested_help).toContainEqual({
@@ -722,7 +727,21 @@ test("safe Agent recreation retains compatible help/source and consequential unk
   expect(JSON.stringify(context)).not.toContain(execution.execution_id);
 });
 
-for (const incompatible of ["adapter", "profile", "root", "tools", "api", "provider"] as const) {
+for (const presentation of ["root", "tools"] as const) {
+  test(`actual recreated request retains bounded read-only help after changing ${presentation}`, async () => {
+    const f = fixture(); await f.planner.start(1); await f.turn([f.requestHelp(), settlement()]);
+    await f.planner.close();
+    if (presentation === "root") f.state.root = "Changed role and root prose";
+    else f.state.toolSchema = "Changed dispatch catalog";
+    f.state.generation++; await f.planner.start(f.state.generation); await f.turn();
+    const context = retained(f.state.requests.at(-1))!;
+    expect(JSON.stringify(context.requested_help)).toContain("Useful exact requested contract");
+    expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32768);
+    expect(f.state.toolEffects).toBe(0);
+  });
+}
+
+for (const incompatible of ["adapter", "profile", "api", "provider"] as const) {
   test(`actual recreated request drops help incompatible with changed ${incompatible}`, async () => {
     const f = fixture(), program = await f.program(); await f.planner.start(1); await f.turn([f.requestHelp(), settlement()]);
     await f.planner.close();
@@ -734,8 +753,6 @@ for (const incompatible of ["adapter", "profile", "root", "tools", "api", "provi
       f.state.observation = minecraftObservationFixture(f.state.adapter);
       f.state.run.compatibility_hash = f.state.observation.compatibility_hash;
     }
-    if (incompatible === "root") f.state.root = "Changed root contract";
-    if (incompatible === "tools") f.state.toolSchema = "changed";
     if (incompatible === "api") f.state.selectedModel = { ...f.state.selectedModel, api: "openai-responses" };
     if (incompatible === "provider") f.state.selectedModel = { ...f.state.selectedModel, provider: "openai" };
     f.state.generation++; await f.planner.start(f.state.generation); await f.turn();
@@ -962,8 +979,9 @@ test("reopened reduction retains newest consequential failure behind routine pag
   const failure = f.store.event(f.state.run.run_id, "action.failed", "Newest independent settled failure", {
     life_id: 1, result: { status: "failed", evidence: { world_effect_emitted: false } },
   });
-  for (let index = 0; index < 610; index++)
-    f.store.event(f.state.run.run_id, "scheduler.tick", "Routine bookkeeping", {});
+  f.store.appendEvents(f.state.run.run_id, Array.from({ length: 610 }, () => ({
+    type: "scheduler.tick", summary: "Routine bookkeeping", details: {},
+  })));
   const store = await f.reopen(), reducer = new StrategicContext(store);
   let context = JSON.parse(reducer.assemble(f.state.run)).strategic_context;
   expect(context.latest_failure).toMatchObject({ event_seq: failure.event_seq, summary: "Newest independent settled failure" });

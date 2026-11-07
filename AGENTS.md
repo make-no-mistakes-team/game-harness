@@ -72,8 +72,10 @@ such a run, show representative footage and explicitly ask for review. Pause
 development, including subagent work, until the user gives feedback.
 
 Failed runs, runtime errors and obvious gameplay defects do not require the
-user's visual review or a review pause. Preserve their complete evidence,
+user's visual review or a review pause. Capture their complete evidence,
 safely stop and drain owned resources, then diagnose and fix the cause directly.
+Later payload expiry follows the artifact-retention policy below; failed-attempt
+outcomes and accounting remain in history.
 Further runs still require finite declarations, valid admission and applicable
 authorization; this rule does not waive experiment freezes or stop rules.
 Do not relabel a failed or easier task as success to obtain review.
@@ -91,6 +93,21 @@ demonstrates their noticeable combined effect.
 
 Tests, metrics, code volume and your own inspection are supporting evidence,
 not proof that gameplay improved. The user's visual judgment is decisive.
+
+## Development artifact retention
+
+Use compressed live video for ordinary development recordings; retain exact
+model-visible images separately. Full lossless frame sequences require an
+explicit finite diagnostic or experiment declaration.
+
+Rotate explicitly managed, closed and confirmed-drained unpinned development
+runs, whether successful or failed: 20 GiB project budget, at most ten unpinned
+runs, and fourteen days. Preserve durable outcomes, usage and explicit payload
+expiry records. Active owners, user worlds, manual-review pins and frozen
+experiments override expiry. Refuse new admission when protected storage fills
+the budget. Existing unregistered material requires separate cleanup approval;
+credentials, governance history and the official game installation are outside
+artifact deletion ownership.
 
 ## Tooling and dependencies
 

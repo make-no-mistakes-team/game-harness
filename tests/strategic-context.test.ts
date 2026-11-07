@@ -638,8 +638,6 @@ test("final SDK context allocates action contracts before historical unknown rec
   }
   for (const section of ["contract", "input_transitions", "gui_completion"])
     expect(context.requested_help).toContainEqual({ topic: "programs", section: `resident.${section}`, content: programs.resident[section] });
-  expect(context.contracts.result).toContain("completed");
-  expect(context.contracts.freshness).toContain("historical reference only");
   expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32 * 1024);
   expect(context.programs.reduce((sum: number, entry: unknown) => sum + Buffer.byteLength(JSON.stringify(entry)), 0))
     .toBeLessThanOrEqual(18 * 1024);

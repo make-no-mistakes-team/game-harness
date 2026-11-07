@@ -17,7 +17,7 @@ export interface SkillRef {
 
 export const SKILL_API_VERSION = 5;
 
-export const PROGRAM_RESULT_GUIDANCE = "Return a brief summary (1–2000 characters) and compact semantic result: relevant counts, task facts, selected failure information and authored continuity notes. The entire serialized JSON frame plus newline, not only result or summary, must fit 65536 UTF-8 bytes and depth 32; leave room for its envelope. Raw observations and action receipts stay in host Store/trace/journal evidence: use program_inspect execution/action/trace/events with returned named/ordinal references and cursors. Do not return receipt/observation arrays, invent evidence IDs, or stringify them into summary. A terminal serialization failure does not roll back completed effects: inspect retained evidence and fresh state before deciding what remains.";
+export const PROGRAM_RESULT_GUIDANCE = "Return a 1–2000-character summary and compact result: counts, task facts, failures and authored notes. The whole JSON frame, including envelope and newline, must fit 65536 UTF-8 bytes and depth 32. Inspect raw host evidence through program_inspect execution/action/trace/events with returned named/ordinal references and cursors; never return receipt/observation arrays, invent evidence IDs or stringify records into summary. Serialization failure does not undo effects: inspect retained evidence and fresh state. Program/resident termination retires controls, not world time. Connected Minecraft keeps ticking during inference, authoring, validation, Pause and Stop run, without automatic survival or implied world pause.";
 
 export interface NamedProgramRef {
   name: string;

@@ -90,6 +90,7 @@ function fixture(judge?: JevBroker) {
   };
   let generation = 1;
   let disconnected = false;
+  let reconnect = false;
   const executed: GameAction[] = [];
   const executions = new Map<number, (() => void)[]>();
   let evaluate: (context: PolicyContext, signal?: AbortSignal) => Promise<PolicyDecision> = async () => ({ kind: "continue" });
@@ -123,7 +124,7 @@ function fixture(judge?: JevBroker) {
   let reactive: ReactiveRuntime;
   let skillAuthority: SkillManager | null = null;
   const actions = new ActionArbiter(store, game, {
-    run: () => run, generation: () => generation, needsReconnect: () => false,
+    run: () => run, generation: () => generation, needsReconnect: () => reconnect,
     changed: () => {}, wake: () => {}, pause: (message) => { throw new Error(message); },
     observe: async () => observation, admitted: () => {},
     adapter: () => adapter, invocation: id => skillAuthority?.invocation(id) ?? null,
@@ -140,7 +141,7 @@ function fixture(judge?: JevBroker) {
       return run;
     },
     context: async () => ({ observation: structuredClone(observation), action: actions.view, task: run.task }),
-    gameState: () => state, needsReconnect: () => false, wake: () => {}, changed: () => {}, admitted: () => {},
+    gameState: () => state, needsReconnect: () => reconnect, wake: () => {}, changed: () => {}, admitted: () => {},
     closePrograms: async () => { await closePrograms(); }, neutralize: () => game.emergencyStop("Validated reactive fixture barrier"),
   }, judge);
   reactive.initialize(run.run_id);
@@ -170,6 +171,7 @@ function fixture(judge?: JevBroker) {
     setCancel: (value: typeof cancel) => { cancel = value; },
     setExecutor: (value: typeof execute) => { execute = value; },
     setUncertain: (value: typeof uncertain) => { uncertain = value; },
+    setReconnect: (value: boolean) => { reconnect = value; },
     nextGeneration: () => { generation++; },
     transition: (life: ObservationV3["life"], session = sessionId) => {
       const replaced = life.life_id !== observation.life.life_id || session !== observation.session_id;
@@ -193,6 +195,185 @@ async function select(f: { reactive: ReactiveRuntime }, backend: PolicySpec["bac
   return { view, ref };
 }
 const replacement: PolicyDecision = { kind: "replace", action: { kind: "look", yaw: 0.2, pitch: 0 }, reason: "Neutral lifecycle test" };
+
+async function watch(f: ReturnType<typeof fixture>, options: {
+  duration_ms?: number; evaluations?: number; max_ms?: number; max_evaluations?: number; max_actions?: number;
+} = {}, backend: PolicySpec["backend"] = "javascript") {
+  const view = await f.reactive.register(specification(backend), 1, 1);
+  const ref = { epoch: 1, policy_id: view.policy_id, version: view.version };
+  await f.reactive.validate(ref, 1);
+  const input = activateSchema.parse({
+    ...ref, max_ms: options.max_ms ?? 1000,
+    max_evaluations: options.max_evaluations ?? 2, max_actions: options.max_actions ?? 1,
+    watch: { duration_ms: options.duration_ms ?? 10_000, evaluations: options.evaluations ?? 20 },
+  });
+  await f.reactive.activate(input, 1);
+  return { view, ref, input };
+}
+
+function policyDetails(f: ReturnType<typeof fixture>, type: string) {
+  return f.store.events(f.run.run_id).filter(value => value.type === type).map(value => value.details as {
+    phase: "watch" | "trial" | "active";
+    watch: { duration_ms: number; evaluations: number; started_at: number; deadline_at: number; evaluations_used: number } | null;
+    trial: { started_at: number | null; deadline_at: number | null; evaluations_used: number; actions_used: number };
+  });
+}
+
+test("passive watch preserves a fresh trial through neutral checks and preempts only through the exclusive barrier", async () => {
+  const f = fixture();
+  const { view } = await watch(f);
+  const drain = hold<void>(undefined), neutral = hold<void>(undefined);
+  const draining = Promise.withResolvers<void>(), neutralizing = Promise.withResolvers<void>();
+  f.setProgramDrain(async () => { draining.resolve(); await drain.promise; });
+  f.setNeutralize(async () => { neutralizing.resolve(); await neutral.promise; });
+  let checks = 0;
+  f.setEvaluator(async () => ++checks <= 6 ? { kind: "continue" } : replacement);
+  await draining.promise;
+  expect(checks).toBe(7);
+  expect(f.executed).toEqual([]);
+  const started = policyDetails(f, "policy.trial_started");
+  expect(started).toHaveLength(1);
+  expect(started[0]).toMatchObject({
+    phase: "trial", watch: { evaluations_used: 7 },
+    trial: { evaluations_used: 1, actions_used: 0 },
+  });
+  expect(policyDetails(f, "policy.evaluated").slice(0, 6)).toEqual(
+    Array.from({ length: 6 }, (_, index) => expect.objectContaining({
+      phase: "watch", watch: expect.objectContaining({ evaluations_used: index + 1 }),
+      trial: expect.objectContaining({ started_at: null, evaluations_used: 0, actions_used: 0 }),
+    })),
+  );
+  drain.resolve();
+  await neutralizing.promise;
+  expect(f.executed).toEqual([]);
+  const closed = event(f.store, "policy.trial_decision_due");
+  neutral.resolve();
+  await closed;
+  expect(f.executed).toEqual([{ kind: "look", yaw: 0.2, pitch: 0 }]);
+  expect(view.state).toBe("validated");
+  expect(policyDetails(f, "policy.trial_decision_due")[0]).toMatchObject({
+    phase: "trial", trial: { evaluations_used: 1, actions_used: 1 },
+  });
+});
+
+test("passive watch evaluation exhaustion closes without effect and cannot be rearmed", async () => {
+  const f = fixture();
+  const { view, input } = await watch(f, { evaluations: 3 });
+  let checks = 0;
+  f.setEvaluator(async () => { checks++; return { kind: "continue" }; });
+  const closed = event(f.store, "policy.trial_decision_due");
+  await closed;
+  expect(checks).toBe(3);
+  expect(f.executed).toEqual([]);
+  expect(view.effects).toBe(0);
+  expect(policyDetails(f, "policy.trial_started")).toEqual([]);
+  expect(policyDetails(f, "policy.trial_decision_due")[0]).toMatchObject({
+    phase: "watch", watch: { evaluations_used: 3 },
+    trial: { started_at: null, evaluations_used: 0, actions_used: 0 },
+  });
+  await expect(f.reactive.activate(input, 1)).rejects.toMatchObject({ code: "conflict" });
+  await expect(f.reactive.activate(activateSchema.parse({ ...input, watch: undefined, mode: "keep" }), 1))
+    .rejects.toMatchObject({ code: "precondition_failed" });
+});
+
+test("passive watch does not renew across reselection scheduling or life suspension", async () => {
+  const f = fixture();
+  const { view, input } = await watch(f, { duration_ms: 2000 });
+  const checked = event(f.store, "policy.evaluated");
+  await checked;
+  const original = policyDetails(f, "policy.evaluated")[0]!.watch!;
+  await f.reactive.activate(input, 1);
+  f.reactive.scheduleAll();
+  await f.reactive.lifeChanged();
+  setSystemTime(original.deadline_at + 1);
+  f.transition({ life_id: 2, status: "alive", can_respawn: false, death: null });
+  await f.reactive.resume(1);
+  expect(view.state).toBe("validated");
+  expect(f.executed).toEqual([]);
+  expect(policyDetails(f, "policy.trial_decision_due")[0]).toMatchObject({
+    phase: "watch", watch: { started_at: original.started_at, deadline_at: original.deadline_at, evaluations_used: 1 },
+  });
+});
+
+test("passive watch trigger starts trial evaluations once and continue or replan never replenishes them", async () => {
+  const f = fixture();
+  const { view, input } = await watch(f, { max_evaluations: 3, max_actions: 20 });
+  let checks = 0;
+  f.setEvaluator(async () => ++checks === 1 ? { kind: "replan", reason: "Fixture requests ordinary reasoning" } : { kind: "continue" });
+  const checked = event(f.store, "policy.evaluated");
+  await checked;
+  await f.reactive.activate(input, 1);
+  f.reactive.scheduleAll();
+  const closed = event(f.store, "policy.trial_decision_due");
+  await closed;
+  expect(checks).toBe(3);
+  expect(view.state).toBe("validated");
+  expect(f.executed).toEqual([]);
+  expect(policyDetails(f, "policy.trial_started")).toHaveLength(1);
+  expect(policyDetails(f, "policy.trial_decision_due")[0]).toMatchObject({
+    phase: "trial", watch: { evaluations_used: 1 }, trial: { evaluations_used: 3, actions_used: 0 },
+  });
+});
+
+test("passive watch original deadline still fences a triggered trial at its final native barrier", async () => {
+  const f = fixture();
+  const { view } = await watch(f, { duration_ms: 5000, max_ms: 120000 });
+  const barrier = hold<void>(undefined), reached = Promise.withResolvers<void>();
+  f.setNeutralize(async () => { reached.resolve(); await barrier.promise; });
+  f.setEvaluator(async () => replacement);
+  await reached.promise;
+  const original = policyDetails(f, "policy.trial_started")[0]!.watch!;
+  setSystemTime(original.deadline_at + 1);
+  const closed = event(f.store, "policy.trial_decision_due");
+  barrier.resolve();
+  await closed;
+  expect(view.state).toBe("validated");
+  expect(f.executed).toEqual([]);
+});
+
+for (const boundary of ["stop", "life", "scope", "unknown"] as const) {
+  test(`passive watch rejects a late triggering decision after ${boundary} fencing`, async () => {
+    const f = fixture();
+    const { view } = await watch(f);
+    const pending = hold<PolicyDecision>({ kind: "continue" }), started = Promise.withResolvers<void>();
+    f.setEvaluator(async () => { started.resolve(); return await pending.promise; });
+    await started.promise;
+    let drained: Promise<void> | undefined;
+    if (boundary === "stop") {
+      f.run.status = "stopping";
+      f.nextGeneration();
+      drained = f.reactive.closeAll(false);
+    } else if (boundary === "life") {
+      f.transition({ life_id: 1, status: "dead", can_respawn: false, death: null });
+      drained = f.reactive.lifeChanged();
+    } else if (boundary === "scope") {
+      f.transition({ life_id: 2, status: "alive", can_respawn: false, death: null });
+      drained = f.reactive.lifeChanged();
+    } else f.setReconnect(true);
+    const rejected = drained ?? event(f.store, "policy.stale_result");
+    pending.resolve(replacement);
+    await rejected;
+    expect(f.executed).toEqual([]);
+    expect(view.effects).toBe(0);
+    expect(policyDetails(f, "policy.trial_started")).toEqual([]);
+  });
+}
+
+test("passive watch requires finite explicit bounds and rejects keep or cloud judge combinations", async () => {
+  const ref = { epoch: 1, policy_id: "fixture", version: 1 };
+  for (const invalid of [
+    {}, { duration_ms: 1000 }, { evaluations: 10 }, { duration_ms: 0, evaluations: 1 },
+    { duration_ms: 1_800_001, evaluations: 1 }, { duration_ms: 1000, evaluations: 100_001 },
+    { duration_ms: Infinity, evaluations: 1 }, { duration_ms: 1000, evaluations: 1.5 },
+  ]) expect(activateSchema.safeParse({ ...ref, watch: invalid }).success).toBe(false);
+  expect(activateSchema.safeParse({ ...ref, mode: "keep", watch: { duration_ms: 1000, evaluations: 1 } }).success).toBe(false);
+  expect(activateSchema.parse({ ...ref, watch: { duration_ms: 1_800_000, evaluations: 100_000 } }).watch)
+    .toEqual({ duration_ms: 1_800_000, evaluations: 100_000 });
+  const judge = await broker(async () => answer("wait"));
+  await judge.setKey("unit-test-not-a-real-provider-key");
+  const f = fixture(judge);
+  await expect(watch(f, {}, "jev")).rejects.toMatchObject({ code: "invalid_input" });
+});
 
 test("Stop during policy artifact preparation prevents durable policy publication", async () => {
   const f = fixture();

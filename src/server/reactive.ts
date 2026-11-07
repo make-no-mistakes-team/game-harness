@@ -47,14 +47,23 @@ export const policyRefSchema = z
     version: z.number().int().positive(),
   })
   .strict();
+export const policyWatchSchema = z.object({
+  duration_ms: z.number().int().min(1).max(1_800_000),
+  evaluations: z.number().int().min(1).max(100_000),
+}).strict();
 export const activateSchema = policyRefSchema
   .extend({
     mode: z.enum(["trial", "keep"]).default("trial"),
     max_ms: z.number().int().min(1_000).max(120_000).default(120_000),
     max_actions: z.number().int().min(1).max(20).default(20),
     max_evaluations: z.number().int().min(1).max(100).default(100),
+    watch: policyWatchSchema.optional(),
   })
-  .strict();
+  .strict()
+  .refine(input => !input.watch || input.mode === "trial", {
+    message: "Passive watch is available only for a bounded trial",
+    path: ["watch"],
+  });
 type PolicyRef = z.infer<typeof policyRefSchema>;
 
 export interface ReactiveHost {
@@ -99,6 +108,10 @@ interface PolicySlot extends PolicyAuthority {
   trial_evaluations: number;
   max_ms: number;
   max_evaluations: number;
+  watch: z.infer<typeof policyWatchSchema> | null;
+  watch_started: number;
+  watch_deadline: number;
+  watch_evaluations: number;
   tried: boolean;
 }
 interface Validation {
@@ -394,6 +407,11 @@ export class ReactiveRuntime {
     const identity = this.contextIdentity();
     this.assertAuthority(generation, input.epoch, revision, signal);
     const view = this.find(input);
+    if (input.watch && (input.mode !== "trial" || view.backend !== "javascript"))
+      throw new RuntimeFault(
+        "invalid_input",
+        "Passive watch requires a bounded trial of model-authored local JavaScript",
+      );
     this.compatible(view);
     const key = keyOf(view);
     if (this.validations.has(key))
@@ -489,6 +507,10 @@ export class ReactiveRuntime {
         max_ms: input.max_ms,
         max_actions: input.max_actions,
         max_evaluations: input.max_evaluations,
+        watch: input.watch ? { ...input.watch } : null,
+        watch_started: 0,
+        watch_deadline: 0,
+        watch_evaluations: 0,
         tried: false,
       };
       this.slots.set(key, slot);
@@ -507,6 +529,10 @@ export class ReactiveRuntime {
       slot.max_ms = input.max_ms;
       slot.max_actions = input.max_actions;
       slot.max_evaluations = input.max_evaluations;
+      slot.watch = input.watch ? { ...input.watch } : null;
+      slot.watch_started = 0;
+      slot.watch_deadline = 0;
+      slot.watch_evaluations = 0;
     }
     this.store.event(
       slot.runId,
@@ -520,6 +546,7 @@ export class ReactiveRuntime {
         max_actions: slot.max_actions,
         max_evaluations: slot.max_evaluations,
         generation: policyGeneration,
+        ...this.accounting(slot),
       },
     );
     let worker: PolicyWorker | null = null;
@@ -728,6 +755,7 @@ export class ReactiveRuntime {
         version: slot.view.version,
         kind,
         evidence,
+        ...this.accounting(slot),
       },
     );
     this.host.changed();
@@ -1053,10 +1081,71 @@ export class ReactiveRuntime {
   private trialBound(slot: PolicySlot): boolean {
     return (
       slot.view.state === "trial" &&
-      slot.trial_started > 0 &&
-      (Date.now() >= slot.trial_deadline ||
-        slot.trial_actions >= slot.max_actions ||
-        slot.trial_evaluations >= slot.max_evaluations)
+      ((slot.watch_started > 0 && Date.now() >= slot.watch_deadline) ||
+        (slot.watch !== null && slot.trial_started === 0 &&
+          slot.watch_evaluations >= slot.watch.evaluations) ||
+        (slot.trial_started > 0 &&
+          (Date.now() >= slot.trial_deadline ||
+            slot.trial_actions >= slot.max_actions ||
+            slot.trial_evaluations >= slot.max_evaluations)))
+    );
+  }
+
+  private accounting(slot: PolicySlot): Record<string, Json> {
+    return {
+      phase: slot.view.state === "active" ? "active" : slot.watch && !slot.trial_started ? "watch" : "trial",
+      watch: slot.watch ? {
+        ...slot.watch,
+        started_at: slot.watch_started || null,
+        deadline_at: slot.watch_deadline || null,
+        evaluations_used: slot.watch_evaluations,
+      } : null,
+      trial: {
+        started_at: slot.trial_started || null,
+        deadline_at: slot.trial_deadline || null,
+        evaluations_used: slot.trial_evaluations,
+        actions_used: slot.trial_actions,
+        max_ms: slot.max_ms,
+        max_actions: slot.max_actions,
+        max_evaluations: slot.max_evaluations,
+      },
+    };
+  }
+
+  private startTrial(slot: PolicySlot): void {
+    if (slot.trial_started) return;
+    slot.trial_started = Date.now();
+    slot.trial_deadline = Math.min(
+      slot.trial_started + slot.max_ms,
+      slot.watch ? slot.watch_deadline : Infinity,
+    );
+    slot.tried = true;
+    // The first triggering watch evaluation is relevant trial exposure too.
+    if (slot.watch) slot.trial_evaluations++;
+    clearTimeout(slot.expiry);
+    slot.expiry = undefined;
+    this.armExpiry(slot);
+    this.store.event(
+      slot.runId,
+      "policy.trial_started",
+      "Gameplay trial clock started with a ready worker and running effect admission",
+      {
+        policy_id: slot.view.policy_id,
+        version: slot.view.version,
+        max_ms: slot.max_ms,
+        max_actions: slot.max_actions,
+        max_evaluations: slot.max_evaluations,
+        ...this.accounting(slot),
+      },
+    );
+  }
+
+  private armExpiry(slot: PolicySlot): void {
+    if (slot.view.state !== "trial" || slot.expiry) return;
+    const deadline = slot.trial_started ? slot.trial_deadline : slot.watch_deadline;
+    slot.expiry = setTimeout(
+      () => this.deferClose(() => this.finishTrial(slot, "elapsed_time"), slot),
+      Math.max(1, deadline - Date.now()),
     );
   }
 
@@ -1076,32 +1165,24 @@ export class ReactiveRuntime {
       return;
     if (slot.view.state !== "trial" && slot.view.state !== "active") return;
     if (slot.view.state === "trial" && slot.trial_started === 0) {
-      slot.trial_started = Date.now();
-      slot.trial_deadline = slot.trial_started + slot.max_ms;
-      slot.tried = true;
-      this.store.event(
-        slot.runId,
-        "policy.trial_started",
-        "Gameplay trial clock started with a ready worker and running effect admission",
-        {
-          policy_id: slot.view.policy_id,
-          version: slot.view.version,
-          max_ms: slot.max_ms,
-          max_actions: slot.max_actions,
-          max_evaluations: slot.max_evaluations,
-        },
-      );
+      if (!slot.watch) this.startTrial(slot);
+      else if (!slot.watch_started) {
+        slot.watch_started = Date.now();
+        slot.watch_deadline = slot.watch_started + slot.watch.duration_ms;
+        slot.tried = true;
+        this.store.event(slot.runId, "policy.watch_started",
+          "Explicit finite local watch armed without consuming relevant trial exposure", {
+            policy_id: slot.view.policy_id,
+            version: slot.view.version,
+            ...this.accounting(slot),
+          });
+      }
     }
     if (this.trialBound(slot)) {
       this.deferClose(() => this.finishTrial(slot, "trial_bound"), slot);
       return;
     }
-    if (slot.view.state === "trial" && !slot.expiry)
-      slot.expiry = setTimeout(
-        () =>
-          this.deferClose(() => this.finishTrial(slot, "elapsed_time"), slot),
-        Math.max(1, slot.trial_deadline - Date.now()),
-      );
+    this.armExpiry(slot);
     if (slot.timer || slot.evaluation) return;
     slot.timer = setTimeout(() => {
       slot.timer = undefined;
@@ -1157,7 +1238,10 @@ export class ReactiveRuntime {
       )
         return;
       slot.view.evaluations++;
-      if (slot.view.state === "trial") slot.trial_evaluations++;
+      if (slot.view.state === "trial") {
+        if (slot.watch && !slot.trial_started) slot.watch_evaluations++;
+        else slot.trial_evaluations++;
+      }
       this.store.savePolicy(slot.runId, slot.view);
       this.store.event(
         slot.runId,
@@ -1173,6 +1257,7 @@ export class ReactiveRuntime {
           run_generation: generation,
           lease_generation: lease,
           observation_seq: context.observation.observation_seq,
+          ...this.accounting(slot),
         },
       );
       const decision = policyDecisionSchema.parse(
@@ -1203,12 +1288,17 @@ export class ReactiveRuntime {
             evaluation_id: evaluationId,
             policy_id: slot.view.policy_id,
             version: slot.view.version,
+            ...this.accounting(slot),
           },
         );
         return;
       }
-      if (slot.view.state === "trial" && Date.now() >= slot.trial_deadline)
-        return;
+      if (slot.view.state === "trial") {
+        if (Date.now() >= (slot.trial_started ? slot.trial_deadline : slot.watch_deadline))
+          return;
+        if (slot.watch && !slot.trial_started && decision.kind !== "continue")
+          this.startTrial(slot);
+      }
       this.store.event(
         slot.runId,
         "policy.evaluated",
@@ -1218,6 +1308,7 @@ export class ReactiveRuntime {
           policy_id: slot.view.policy_id,
           version: slot.view.version,
           decision: decision as unknown as Json,
+          ...this.accounting(slot),
         },
       );
       if (decision.kind === "replan") this.host.wake("policy_replan");
@@ -1417,6 +1508,7 @@ export class ReactiveRuntime {
       evaluation_id: evaluationId,
       policy_id: slot.view.policy_id,
       version: slot.view.version,
+      ...this.accounting(slot),
     });
   }
 
@@ -1439,6 +1531,7 @@ export class ReactiveRuntime {
         actions: slot.trial_actions,
         evaluations: slot.trial_evaluations,
         effects: slot.view.effects,
+        ...this.accounting(slot),
       },
     );
     this.host.wake("trial_decision_due");
@@ -1478,6 +1571,14 @@ export class ReactiveRuntime {
           "unknown_effect",
           "Policy worker or effect shutdown could not be confirmed",
         );
+      this.store.event(slot.runId, "policy.selection_closed",
+        "Selected policy worker, evaluations and owned effects drained without renewing bounds", {
+          policy_id: slot.view.policy_id,
+          version: slot.view.version,
+          reason,
+          retained: retain,
+          ...this.accounting(slot),
+        });
       if (state) slot.view.state = state;
       this.store.savePolicy(slot.runId, slot.view, reason);
       this.host.changed();

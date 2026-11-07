@@ -22,12 +22,14 @@ import { PrivateJournal } from "../../src/evaluation/private-journal.ts";
 import * as historyModule from "../../src/server/history-reader.ts";
 import type { HistoryQuery, HistoryQueryOptions, HistoryResult } from "../../src/server/history-protocol.ts";
 import * as recording from "../../src/server/recording.ts";
+import { ArtifactRetention } from "../../src/evaluation/artifact-retention.ts";
 
 // Only native ownership, Docker provisioning and the authenticated provider
 // factory are substituted. Runner, Runtime, Agent/gates/events, Store, verifier,
-// recorder/codec/owned encoder child, private journal and ledger remain real.
+// explicit lossless recorder/codec/owned offline renderer, journal and ledger remain real.
 // All replacements and environment changes live in this isolated subprocess.
-// These offline-renderer ownership cases explicitly select lossless capture.
+// Live capture has separate real-FFmpeg and native smoke coverage. These cases
+// deliberately exercise the supported offline-renderer ownership boundary.
 mock.module(resolve(import.meta.dir, "../../src/server/recording.ts"), () => ({
   ...recording,
   EpisodeRecorder: class extends recording.EpisodeRecorder {
@@ -37,7 +39,26 @@ mock.module(resolve(import.meta.dir, "../../src/server/recording.ts"), () => ({
 const [requestedMode, rootArg, ownershipArg] = process.argv.slice(2);
 const studyMode = requestedMode?.startsWith("study-") ?? false;
 const developmentMode = requestedMode?.startsWith("development-") ?? false;
-const mode = studyMode ? requestedMode!.slice("study-".length) : developmentMode ? requestedMode!.slice("development-".length) : requestedMode;
+const retentionDrainFailure = requestedMode === "development-retention-drain-failure";
+const retentionCount = requestedMode === "development-retention-count";
+const retentionCloseLate = requestedMode === "development-retention-close-late";
+const mode = retentionDrainFailure ? "observer-parity" : retentionCount || retentionCloseLate ? "custom-finish" :
+  studyMode ? requestedMode!.slice("study-".length) : developmentMode ? requestedMode!.slice("development-".length) : requestedMode;
+let retentionDrainFaults = 0;
+if (retentionDrainFailure) {
+  ArtifactRetention.prototype.beginDrain = () => {
+    retentionDrainFaults++;
+    throw Object.assign(new Error("Synthetic artifact inventory persistence failure"), { code: "SQLITE_FULL" });
+  };
+}
+if (retentionCloseLate) {
+  const closeRun = ArtifactRetention.prototype.closeRun;
+  ArtifactRetention.prototype.closeRun = function (...args: Parameters<ArtifactRetention["closeRun"]>) {
+    closeRun.apply(this, args);
+    // Real synchronous metadata finalization can block timer delivery too.
+    Bun.sleepSync(500);
+  };
+}
 const customFinish = developmentMode && mode === "custom-finish";
 const observerParity = developmentMode && mode === "observer-parity";
 const planningStalled = mode === "planning-stalled";
@@ -443,6 +464,21 @@ const commonOptions = { allowNative: true, allowInference: true, authDirectory, 
     totalMs: earlyDeadlineSignal ? 25200 : preparationExpired || preparationBounded ? 600 : finalVerificationBudget ? 1200 : finalPersistenceBudget ? 2500 : imageFailure || observerParity ? 10000 : planningStalled || developmentMode && requestCapNonGoal ? 20000 : mode === "deadline" ? 3000 : 6000,
     runMs: budgetMode ? 500 : imageFailure || observerParity ? 8000 : planningStalled || developmentMode && requestCapNonGoal ? 15000 : 1000, cleanupMs: earlyDeadlineSignal ? 25000 : budgetMode ? 100 : 300, authMs: budgetMode ? 500 : 1000, discoveryMs: budgetMode ? 500 : 1000,
     startMs: budgetMode ? 500 : 1000, observationMs: 500, diagnosticsMs: finalVerificationBudget ? 1100 : 500, pollMs: 5 } } as const;
+const retentionOptions = { runtimeRoot: join(root, "runtime"), metadataRoot: join(root, "artifact-retention"),
+  protectedPaths: [authDirectory, governanceRoot], readOnlyRoots: [join(root, "reports")] };
+if (retentionCount) {
+  const inventory = new ArtifactRetention(retentionOptions);
+  try {
+    for (let index = 0; index < 10; index++) {
+      const previous = inventory.acquire({ reservationBytes: 1, headroomBytes: 0,
+        attempt: { purpose: "development", declaration: `Closed predecessor ${index}` } });
+      inventory.beginDrain(previous.id);
+      inventory.closeRun(previous.id, { drained: true,
+        outcome: { status: "failure", attemptIds: [], reasons: ["finite historical fixture"], evidenceRefs: [] },
+        drainEvidence: ["all fixture owners closed"] });
+    }
+  } finally { inventory.close(); }
+}
 const submittedAt = performance.now();
 const acceptance = runAgentAcceptance(studySelection ? { ...commonOptions, study: studySelection } :
   { ...commonOptions, ...(developmentMode ? { scenario: undefined, development: {
@@ -531,6 +567,15 @@ async function observeResult() {
       sibling_store_unchanged: siblingHash === createHash("sha256").update(await readFile(join(root, "runtime/runs.sqlite"))).digest("hex") }; }
     finally { owned.close(); }
   }
+  let retentionAfter = null;
+  if (retentionCount) {
+    const inventory = new ArtifactRetention(retentionOptions);
+    try {
+      const snapshot = inventory.inspect();
+      retentionAfter = { unpinned: snapshot.runs.filter(run => run.expiredAt === null && Object.keys(run.pins).length === 0).length,
+        expiryCompletions: snapshot.tombstones.filter(row => row.phase === "complete").length };
+    } finally { inventory.close(); }
+  }
   const ledger = new AttemptLedger(governanceRoot, { projectRoot: project });
   let attempts;
   try { attempts = ledger.listAttempts("synthetic-lifecycle"); } finally { ledger.close(); }
@@ -563,7 +608,7 @@ async function observeResult() {
     attempts, study, startupReservationSeen, authReservationSeen, fixtureConditions, coldIsolation, nextAdmission, report, manifests, journals, lateWrites, unhandled,
     manifestPersistenceError, storeClosedAt, storeClosedWhileReaderHeld, returnedWhileReaderHeld, readerAliveWhileHeld, readerBeforeClose, readerAtStoreClose,
     originalIteratorReads, originalIteratorReturns, originalIteratorClosed, returnedBeforeTransportRelease, requestSignalAbortedBeforeRead,
-    requestCapResponseAbortedBeforeDelivery, developmentCapPrograms,
+    requestCapResponseAbortedBeforeDelivery, developmentCapPrograms, retentionDrainFaults, retentionAfter,
     postReturnChanges, unchangedAfterReturn: postReturnChanges.length === 0 }), { mode: 0o600 });
   await Bun.write(Bun.stdout, "ACCEPTANCE_RESULT fixture-result.json\n");
  } finally {

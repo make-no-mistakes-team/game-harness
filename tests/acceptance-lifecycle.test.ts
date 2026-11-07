@@ -37,6 +37,39 @@ test("a real native fixture joins late owned closure but cannot pass a bounded s
   expect(result.report.pass).toBe(false);
 }, 15000);
 
+test("artifact inventory persistence failure cannot bypass actual resource drain", async () => {
+  const result = await acceptanceLifecycle("development-retention-drain-failure");
+  expect(result.retentionDrainFaults).toBe(1);
+  expect(result.result.platform_complete).toBe(false);
+  expect(result.result.failure).toContain("retention");
+  expect(result.report.artifact_retention_failure).toBe("begin_drain_persistence_failed");
+  expect(result.report.resource_cleanup.every((owner: { closed: boolean }) => owner.closed)).toBe(true);
+  expect(result.nativeClosedAt).toBeNumber();
+  expect(result.returnedAt).toBeGreaterThanOrEqual(result.nativeClosedAt);
+  expect(result.unchangedAfterReturn).toBe(true);
+  expect(result.unhandled).toEqual([]);
+}, 15000);
+
+test("development closure enforces ten retained unpinned runs without another admission", async () => {
+  const result = await acceptanceLifecycle("development-retention-count");
+  expect(result.report.cleanup_confirmed).toBe(true);
+  expect(result.retentionAfter).toEqual({ unpinned: 10, expiryCompletions: 1 });
+  expect(result.result.artifact_payload_state).toBe("retained");
+  expect(result.unchangedAfterReturn).toBe(true);
+  expect(result.unhandled).toEqual([]);
+}, 15000);
+
+test("late artifact metadata closure cannot turn timely resource drain into an in-budget success", async () => {
+  const result = await acceptanceLifecycle("development-retention-close-late");
+  expect(result.report.resource_cleanup.every((owner: { closed: boolean }) => owner.closed)).toBe(true);
+  expect(result.result.finalization_within_budget).toBe(false);
+  expect(result.result.platform_complete).toBe(false);
+  expect(result.result.failure).toContain("original cleanup deadline");
+  expect(result.returnedAt).toBeGreaterThanOrEqual(result.nativeClosedAt);
+  expect(result.unchangedAfterReturn).toBe(true);
+  expect(result.unhandled).toEqual([]);
+}, 15000);
+
 test("a signal after early work expiry tightens its budget and joins the startup-to-main cleanup handoff", async () => {
   const result = await acceptanceLifecycle("early-deadline-sigint");
   expect(result.declaredCleanupMs).toBeGreaterThan(9000);

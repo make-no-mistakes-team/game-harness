@@ -37,6 +37,7 @@ export const TEST_TIERS = Object.freeze({
     "tests/effect-contract.test.ts",
     "tests/registered-adapter.test.ts",
     "tests/minecraft-adapter.test.ts", // Actual registered possession/verifier logic; no gameplay support claim.
+    "tests/minecraft-craft.test.ts", // Ordered recipe quantities, partial server receipts and registered admission.
     "tests/adapter-scenarios.test.ts", // Independent manifest/progress uses the same registered interpreter, never Runtime's verdict.
     "tests/policy-comparison.test.ts", // Comparison policy/math; no provider or gameplay.
   ]),
@@ -91,11 +92,14 @@ export const TEST_TIERS = Object.freeze({
     "tests/strategic-context.test.ts", // Actual SDK request assembly and run-owned context; offline stream only.
     "tests/video-backpressure.test.ts", // Real TCP/WebSocket/subprocess backpressure.
     "tests/evaluation-policy.test.ts", // Durable SQLite, restart and cross-process reservations.
+    "tests/evaluation-artifact-retention.test.ts", // Real filesystem ownership, pins, expiry and durable tombstones.
+    "tests/evaluation-artifact-retention-async.test.ts", // Actual off-thread capacity checks and joined process cancellation.
     "tests/evaluation-studies.test.ts", // Same private SQLite authority; study/request races, restart and ownership.
     "tests/evaluation-study-cli.test.ts", // Real dispatcher subprocesses and admission-only SQLite; zero inference/native.
     "tests/evaluation-study-lifecycle.test.ts", // Real acceptance/Agent/Store ownership at explicit synthetic external seams.
     "tests/evaluation-evidence.test.ts", // Real Store and observer; synthetic provider-event seam only.
     "tests/recording.test.ts", // Real PNG/index/concat filesystem evidence; synthetic delivered packets, no FFmpeg/native dependency.
+    "tests/recording-live.test.ts", // Actual timestamped live encoder, segment/replay timing and failure/drain ownership.
     "tests/replay-timing.test.ts", // Real local FFmpeg/FFprobe frame cadence, terminal gaps and generated-manifest integrity; no Minecraft.
     "tests/resident-benchmark-media.test.ts", // Real sealed PNG/FFmpeg derivation; substituted native closure metadata, no Minecraft.
     "tests/acceptance-lifecycle.test.ts", // Real runner/Runtime/Agent/ledger cancellation; isolated synthetic native/provider/encoder seams.

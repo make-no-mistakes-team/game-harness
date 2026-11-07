@@ -230,9 +230,23 @@ Application restart retains inspectable run/events, immutable source and unresol
 
 ### Episode recording and retained evidence
 
-The evaluation recorder subscribes to delivered native frames independently of the desktop's latest-frame display. It retains PNGs, a timestamped index and a completion/incompleteness manifest; optional offline FFmpeg rendering produces a normal-speed review file without compressing waits. This is an evaluation evidence path, not a desktop replay browser or world rewind. Audio is not recorded; capture and state clocks are not proven synchronized, and upstream renders can be omitted even when all delivered frames are retained.
+The evaluation recorder subscribes to delivered native frames independently of
+the desktop's latest-frame display. Ordinary development writes live-compressed
+video segments, a timestamped index and a completion/incompleteness manifest,
+without a persistent PNG spool. MP4 assembly stream-copies those segments and
+preserves actual waits. Exact model-visible images remain separate PNGs.
+Frozen pixel-evidence protocols explicitly select lossless recording.
 
-Default bounds are 12,000 delivered frames, ten minutes, 128 MiB pending raw data and 32 GiB stored PNG data. Malformed/stale frames, changed dimensions/orientation, exhausted bounds or persistence/encoding failure make capture explicitly incomplete; the acceptance runner then requests Stop. Finalization drains queued encodes and closes the index. Replay failure retains original PNG/index evidence, and renderer timeout/abort waits for its owned process to close. Neither a rendered file nor a complete manifest alone proves visual quality, task success or resource cleanup.
+Default bounds are 12,000 delivered frames, ten minutes, 128 MiB pending raw data
+and 32 GiB encoded media, including segments and canonical replay. Invalid frames,
+changed dimensions/orientation, exhausted bounds or persistence/encoding failure
+make capture incomplete and request Stop. Finalization joins actual encoder/file
+owners. Audio is absent; capture/state clocks are not proven synchronized and
+upstream renders can be omitted. Encoding proves neither visual quality nor task
+success. See the [recording contract](runtime-contracts.md#delivered-actor-images-and-recorded-episodes)
+and [artifact-retention policy](operations-and-security.md#private-evaluation-storage)
+for fidelity, explicit lossless mode, pins and payload expiry. This is an
+evaluation evidence path, not a desktop replay browser or world rewind.
 
 ### Historical spike cancellation and death evidence
 

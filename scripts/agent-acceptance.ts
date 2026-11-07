@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import type { AuthManager } from "../src/server/auth.ts";
 import type { Runtime } from "../src/server/runtime.ts";
@@ -25,6 +26,8 @@ import { assertNativeArtifactFresh } from "../src/evaluation/tiers.ts";
 import { contractHash } from "../src/server/adapter-contract.ts";
 import { minecraftProfileConfigurationSchema } from "../src/shared/minecraft.ts";
 import type { StrategicRequestAdmission } from "../src/server/strategic.ts";
+import { ArtifactRetention, type ArtifactRetentionOptions, type ArtifactRun } from "../src/evaluation/artifact-retention.ts";
+import { checkArtifactCapacity } from "../src/evaluation/artifact-retention-monitor.ts";
 
 interface AcceptanceCommonOptions {
   allowNative: boolean;
@@ -169,6 +172,17 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   const preparationDeadline = development ? Math.min(workDeadline, started + 300_000) : workDeadline;
   process.env.GAMEHARNESS_NATIVE_PROOF = "1";
   let fixture: NativeFixture;
+  let retention: ArtifactRetention | undefined, artifactRun: ArtifactRun | undefined;
+  const artifactOptions: ArtifactRetentionOptions = {
+    runtimeRoot: paths.runtimeRoot,
+    metadataRoot: path.join(path.dirname(paths.governanceRoot), "artifact-retention"),
+    protectedPaths: [authDirectory, paths.governanceRoot, path.join(homedir(), ".minecraft"),
+      path.join(project, "local/runtime/minecraft")],
+    readOnlyRoots: [paths.reportsRoot],
+  };
+  const artifactAttemptIds: string[] = [];
+  const artifactEvidenceRefs: string[] = [];
+  let fixtureCreated = false, fixtureCreationStarted = false;
   let earlyInterruption: string | null = null;
   let earlyCleanupDeadline = Infinity;
   const earlyDone = Promise.withResolvers<void>();
@@ -192,10 +206,20 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     const authFile = await lstat(path.join(authDirectory, "auth/gameharness.sqlite"));
     requireProof(authFile.isFile() && !authFile.isSymbolicLink(), "Existing GameHarness auth storage must be a regular file; this command never creates a replacement identity");
     requireProof(!earlyInterruption && performance.now() < preparationDeadline, "Original sample startup budget expired before native preparation");
+    if (!studyManifest) {
+      retention = new ArtifactRetention(artifactOptions);
+      artifactRun = retention.acquire({ reservationBytes: 3 * 1024 ** 3, headroomBytes: 512 * 1024 ** 2,
+        attempt: { purpose: "development", declaration: JSON.stringify({ development, model: options.modelId ?? "gpt-6-luna",
+          tasks: selected.map(task => ({ id: task.id, prompt: task.prompt })),
+          hypothesis: options.hypothesisId, evidence_revision: options.platformEvidenceRevision, caps }) } });
+    }
     // Creation remains owned until settlement. A timeout is not cancellation,
     // and must never abandon a late fixture or admit a replacement.
-    fixture = await NativeFixture.create("agent-acceptance", { projectRoot: project, paths, caps, authDirectory, conditions,
+    fixtureCreationStarted = true;
+    fixture = await NativeFixture.create("agent-acceptance", { projectRoot: project,
+      paths: artifactRun ? { ...paths, runtimeRoot: artifactRun.directory } : paths, caps, authDirectory, conditions,
       deadlineHostMs: taskDeadline, preparationDeadlineHostMs: preparationDeadline });
+    fixtureCreated = true;
     if (earlyInterruption && studies) {
       const closed = await fixture.close();
       if (closed.closed) studies!.confirmStudyResourceDrain(studyAttempt!, { requests_drained: true, runtime_closed: true, native_closed: true,
@@ -203,6 +227,21 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       throw new Error("Study startup interrupted; no inference or replacement slot admitted");
     }
   } catch (error) {
+    // Storage bookkeeping cannot stand between a startup owner and its drain.
+    let drained = !fixtureCreationStarted;
+    if (fixtureCreated) {
+      try { drained = (await fixture!.close()).closed; } catch { drained = false; }
+    }
+    try {
+      if (retention && artifactRun) {
+        retention.beginDrain(artifactRun.id);
+        if (drained) retention.closeRun(artifactRun.id, { drained: true,
+          outcome: { status: "failure", attemptIds: [], reasons: ["startup_failed_before_model_admission"], evidenceRefs: [] },
+          drainEvidence: ["startup_preparation_owner_joined_before_model_admission"] });
+      }
+    } catch {
+      // The active/draining registration remains protected when persistence fails.
+    } finally { try { retention?.close(); } catch {} }
     if (studies && studyAttempt) {
       if (!earlyInterruption) studies.settleStudyAttempt(studyAttempt, { outcome: { platform_status: "fail", agent_status: "not_run", provider_status: "not_called", goal_verified: null,
         classification_reason: ["Scheduled startup failed before model inference; external resource ownership may be unconfirmed"] }, usage: null, evidence: [], stop_reason: "invalid_platform" });
@@ -219,6 +258,10 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   let recorder: EpisodeRecorder | undefined;
   let config: AcceptanceConfig | undefined, diagnosticConfig: EvaluationConfig | undefined;
   const scope = new AbortController();
+  const capacityScope = new AbortController();
+  let capacityTimer: ReturnType<typeof setTimeout> | undefined;
+  let capacityWork: Promise<void> | undefined;
+  let artifactDrainRegistered = false;
   // An already-running startup finalizer keeps this same completion barrier
   // across handoff; fixture creation is not joined logical sample cleanup.
   const completed = earlyDone;
@@ -321,6 +364,10 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     comparison_scope: "Fixed seed/settings and fresh world per case. Vanilla timing and provider behavior are not controlled; no causal or cross-model improvement claim.",
     source_policy: "Only the actual provider authors gameplay and optional game guards. No supplied programs, targets, inventory, console commands or required tool sequence.",
     private_evidence_root: fixture.root, caps, evidence_profile: evidenceProfile,
+    artifact_retention: artifactRun ? { bundle_id: artifactRun.id, directory: artifactRun.directory,
+      reservation_bytes: artifactRun.reservationBytes, headroom_bytes: artifactRun.headroomBytes,
+      project_budget_bytes: 20 * 1024 ** 3, max_unpinned_runs: 10, max_age_days: 14,
+      protected_legacy_payloads: true, capacity_check_interval_ms: 5000 } : null,
     timing: { scope: "original_task_submission_through_actual_cleanup", preparation_allowance_ms: development ? 300_000 : null,
       cleanup_reserved_ms: studyDeadlineAt === undefined ? caps.cleanupMs : 0 },
     capture_scope: { minimum_task_horizon_ms: caps.runMs, nominal_hz: 30, final_frame_margin: 1,
@@ -352,6 +399,18 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   function assertPreparing() {
     assertOpen();
     requireProof(performance.now() < preparationDeadline, "Original preparation allowance expired before resource acquisition");
+  }
+  function scheduleCapacityCheck() {
+    if (!artifactRun || closing || capacityScope.signal.aborted) return;
+    capacityTimer = setTimeout(() => {
+      if (closing || capacityScope.signal.aborted) return;
+      capacityWork = checkArtifactCapacity(artifactOptions, artifactRun!.id,
+        { timeoutMs: 10_000, signal: capacityScope.signal }).then(sample => {
+          report.artifact_capacity = sample;
+        }).catch(() => {
+          if (!closing && !capacityScope.signal.aborted) interrupt("artifact_capacity_check_failed");
+        }).finally(() => { if (!closing && !capacityScope.signal.aborted) scheduleCapacityCheck(); });
+    }, 5000);
   }
   async function prepareWithin<T>(operation: () => Promise<T>, capMs: number, message: string): Promise<T> {
     assertPreparing();
@@ -542,6 +601,10 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       ledger.admitAttempt(diagnosticConfig!, { reportDirectory: fixture.evidenceDirectory, promptRevision: scenario.verifier?.revision ?? "custom_unverified", scenarioId: scenario.id });
     activeReservation = reservation.attemptId;
     reservationInterrupted = false;
+    if (retention && artifactRun) {
+      artifactAttemptIds.push(reservation.attemptId);
+      retention.register(artifactRun.id, { attemptIds: [reservation.attemptId], evidenceRefs: [fixture.evidenceDirectory] });
+    }
     const caseStart = performance.now();
     let verification: VerificationResult | null = scenario.verifier ? verifyScenarioCompletion(independentVerifier, null, []) : null;
     activeCase = { scenario_id: scenario.id, run_id: run.run_id, attempt_id: reservation.attemptId,
@@ -674,6 +737,13 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     await writeFile(path.join(paths.reportsRoot, compactName), JSON.stringify(compact, null, 2), { mode: 0o600, flag: "wx" });
     assertOpen();
     const caseEvidence = [entry.evidence, journal.manifest, `${recordingDirectory}/recording-manifest.json`, compactName];
+    if (retention && artifactRun) {
+      artifactEvidenceRefs.push(...caseEvidence.slice(0, -1).map(file => path.join(fixture.evidenceDirectory, file)),
+        path.join(paths.reportsRoot, compactName));
+      retention.register(artifactRun.id, { attemptIds: [reservation.attemptId], evidenceRefs: artifactEvidenceRefs });
+      if (outcome.goal_verified === true)
+        retention.pin(artifactRun.id, "manual-review", "Verified goal candidate awaiting operator visual review");
+    }
     if (studies && studyAttempt) {
       studies.settleStudyAttempt(studyAttempt, { outcome, usage, evidence: caseEvidence, stop_reason: outcome.platform_status === "pass" ? null : "invalid_platform" });
       studySettled = true;
@@ -731,6 +801,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
   }
   try {
     try {
+      scheduleCapacityCheck();
       await writeReport();
       assertOpen();
       ownedWork = work();
@@ -739,6 +810,8 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     catch (error) { failure ??= error; }
     finally {
       closing = true;
+      clearTimeout(capacityTimer);
+      capacityScope.abort(new Error("Acceptance artifact producers are draining"));
       clearTimeout(timer);
       if (failure && !abortReason && studies && studyAttempt && !studySettled && !reservationInterrupted && studyRequests.size === 0) {
         studies.settleStudyAttempt(studyAttempt, { outcome: { platform_status: "fail", agent_status: "not_run", provider_status: "not_called", goal_verified: null,
@@ -762,9 +835,17 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       const sandboxDrain = sandbox?.close();
       void sandboxDrain?.catch(() => {});
       try {
+        if (retention && artifactRun) {
+          try { retention.beginDrain(artifactRun.id); artifactDrainRegistered = true; }
+          catch {
+            failure ??= new Error("Artifact retention could not persist draining state");
+            report.artifact_retention_failure = "begin_drain_persistence_failed";
+          }
+        }
         await writeReport().catch(() => {});
         await close("acceptance_work", async () => { await ownedWork?.catch(() => {}); });
         await close("preparation", async () => { await Promise.allSettled([...preparationWork]); });
+        await close("artifact_capacity_monitor", async () => { await capacityWork; });
         await close("runtime", () => runtimeDrain);
         await close("recording", async () => {
           if (recorder) report.interrupted_recording = await recorder.finish({ endedAt: Date.now(), reason: abortReason ?? "outer_failure" });
@@ -807,6 +888,13 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
           studies.confirmStudyResourceDrain(studyAttempt, { requests_drained: true, runtime_closed: true, native_closed: true,
             evidence: ["acceptance_owned_work_runtime_auth_recording_native_and_store_joined"] });
         }
+        if (retention && artifactRun && artifactDrainRegistered && cleanup.every(entry => entry.closed)) {
+          // Reconcile old eligible bundles while this one remains protected as
+          // draining. Include rotation in the original final-report deadline;
+          // never expire the result we are still publishing.
+          try { report.artifact_rotation = retention.rotate(); }
+          catch { failure ??= new Error("Artifact rotation failed after resource drain"); }
+        }
         if (performance.now() >= cleanupDeadline) report.cleanup_deadline_reached = true;
         report.cleanup_confirmed = !report.cleanup_deadline_reached && !report.report_persistence_failed && cleanup.every(entry => entry.closed);
         report.cleanup_state = report.cleanup_confirmed ? "closed" : "unconfirmed";
@@ -848,9 +936,35 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
           await writeReport();
         }
         await reportTail;
-      } finally { ledger.close(); studies?.close(); }
+        if (retention && artifactRun && artifactDrainRegistered && cleanup.every(entry => entry.closed)) {
+          try {
+            retention.closeRun(artifactRun.id, { drained: true,
+              outcome: { status: !failure && !abortReason && caseReports.length === selected.length &&
+                  caseReports.every(entry => (entry.outcome as EvaluationOutcome).goal_verified === true) ? "success" : "failure",
+                attemptIds: artifactAttemptIds,
+                reasons: [...caseReports.flatMap(entry => (entry.outcome as EvaluationOutcome).classification_reason),
+                  ...(failure ? [reason(failure)] : abortReason ? [abortReason] : [])],
+                evidenceRefs: [path.join(fixture.evidenceDirectory, "report.json"), ...artifactEvidenceRefs] },
+              drainEvidence: cleanup.map(entry => `${entry.resource}:closed`) });
+          } catch {
+            failure ??= new Error("Artifact retention finalization failed after resource drain");
+          }
+        }
+      } finally {
+        try { ledger.close(); }
+        finally {
+          try { studies?.close(); }
+          finally { retention?.close(); }
+        }
+      }
     }
-    return { report_directory: fixture.evidenceDirectory, outcomes: caseReports.map(entry => entry.outcome),
+    const finalizationWithinBudget = performance.now() < cleanupDeadline;
+    if (!finalizationWithinBudget) failure ??= new Error("Acceptance finalization exceeded its original cleanup deadline");
+    return { report_directory: fixture.evidenceDirectory,
+      artifact_payload_state: "retained",
+      artifact_bundle_id: artifactRun?.id ?? null,
+      finalization_within_budget: finalizationWithinBudget,
+      outcomes: caseReports.map(entry => entry.outcome),
       platform_complete: !failure && abortReason === null && report.cleanup_confirmed === true &&
         caseReports.length === selected.length && caseReports.every(entry => (entry.outcome as EvaluationOutcome).platform_status === "pass"),
       failure: failure ? reason(failure) : null };

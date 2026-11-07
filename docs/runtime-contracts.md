@@ -46,6 +46,18 @@ Executable types live in [`src/shared/programs.ts`](../src/shared/programs.ts); 
 
 `run` remains an async JavaScript body with host-bound `game,args`. `step` and `analyze` are ordinary modules with one synchronous named function export: `step(frame,state,intent)` or `analyze(input)`. Pure helpers and constants are allowed; imports, packages and ambient host access are rejected. Original and canonical source each have a 16 KiB UTF-8 bound. These formats share the existing artifact store and exact-version publication path.
 
+Pure modules also receive the realm-local, frozen `motion.turn(options,state)`
+math binding. The caller supplies actual `native_tick` and applied pose, its
+chosen target orientation, positive `duration_ticks` and `max_rate`, then retains
+the returned JSON state. The helper computes a cubic temporal reference with
+shortest-path yaw and valid pitch; it selects no game target and emits no input
+itself. Repeated callbacks on one tick do not advance time. Retargeting or a
+regressed clock rebases from actual pose. At the authored duration it returns
+zero rates even if the actual pose has not aligned; `finished` and `aligned`
+are separate results. The model must submit the returned view and decide what
+to do next. Raw `rate` and `delta` semantics remain unchanged. The helper's
+version participates in pure-module validation compatibility.
+
 The ordinary default exposes these tools:
 
 | Model tool | Purpose |
@@ -183,7 +195,16 @@ Programs can report `current_subgoal`, `worksite`, `resource_requirements` and `
 
 Keep location meanings distinct: `worksite` records an observed task site and changes only when establishing or deliberately relocating that site. Omit it during travel or recovery to retain it. Current position comes from fresh observation; a temporary `recovery_position` belongs under its own structured root-result label. Existing returned-position retention preserves that label without inferring a worksite. This is an authoring contract, not evidence that a model followed it.
 
-Requested documentation is invalidated when the actual request contract changes. Source selection checks executable/API/adapter/profile compatibility; a provider transport, root-prompt or tool-role change alone does not invalidate compatible source. Selected programs can include their last named/ordinal execution reference, bounded sanitized historical argument sample and outcome with original scope. These examples restore neither invocation inputs nor current targets and do not recommend rerunning blocked or unknown work. Construct current arguments from fresh observations.
+Requested documentation checks executable/API/adapter/profile and model
+API/provider compatibility. Changing root prose or switching between ordinary
+and inactive-authoring tool roles preserves compatible read-only help; it does
+not preserve old tool authority. Source selection checks executable/API/adapter/
+profile compatibility; a provider transport, root-prompt or tool-role change
+alone does not invalidate compatible source. Selected programs can include their
+last named/ordinal execution reference, bounded sanitized historical argument
+sample and outcome with original scope. These examples restore neither
+invocation inputs nor current targets and do not recommend rerunning blocked or
+unknown work. Construct current arguments from fresh observations.
 
 Unresolved operations have their own bounded no-replay references, separate from the latest failure. Up to eight are retained with original scope and any containment event; older omissions are counted, not treated as resolutions. Containment and fresh observation do not prove that an earlier unknown effect never happened. Task/world/fresh-run changes clear this retained experience; within that scope historical unknowns can survive life/session changes without regaining authority. Declared cold episodes with fresh programs do not inherit prior run-private programs or experience; explicit same-session working-definition continuation remains separate.
 
@@ -263,7 +284,17 @@ Runtime accepts a bridge-delivered structured observation through its ordinary s
 
 Model choices project input modalities from actual discovered SDK descriptors. Image-enabled actors reject models without image input support before inference. Descriptor support is not a live vision result. Synthetic runtimes without an actor-frame source explicitly report image mode disabled. Store tool events contain metadata, not image binary.
 
-The acceptance recorder subscribes directly to delivered bridge frames, independently of spectator latest-only backpressure. It retains PNGs, delivery-order index records, capture/receive times, identity and upstream sequence/time gaps. The default short profile allows 128 MiB pending raw packets, two concurrent asynchronous encodes, 12,000 frames, 32 GiB frame files and 600 seconds. A complete checked evidence profile can declare a different finite duration/frame allowance; acceptance rejects a profile that cannot cover its requested task horizon before external preparation.
+The acceptance recorder subscribes directly to delivered bridge frames,
+independently of spectator latest-only backpressure. Ordinary capture defaults
+to `live_compressed`: timestamped RGBA Matroska input feeds a live H.264 encoder
+without a durable PNG spool. Independently finalized segments close at the next
+capture boundary after five seconds. The delivery-order index retains original
+capture/receive times, identity, orientation, pose provenance and upstream gaps.
+The default short profile allows 128 MiB pending raw packets, 12,000 frames,
+32 GiB encoded media and 600 seconds. Pending bytes include the retained terminal
+frame; the media bound includes segments and the canonical replay. A checked
+profile can declare different finite bounds; admission rejects an insufficient
+capture horizon before external preparation.
 
 Native capture reuses three fixed framebuffers. The socket writer drains pending
 captures in order, retaining up to two successors while it owns a packet. If all
@@ -275,21 +306,39 @@ leave explicit recording gaps.
 
 Recorder and journal limits are defined in [`evidence-limits.ts`](../src/shared/evidence-limits.ts). Supplied profile files are regular project-local files, checked for size, identity and forbidden secret/database paths. Registered studies must pin a supplied profile's exact preprocessing identity. The selected profile and effective recorder/journal/renderer limits are retained before inference. Constructor overrides are normalized once; invalid or misspelled bounds never silently default or clamp.
 
-Exhaustion or dimension/orientation changes stop capture as incomplete; the native producer can already omit renders. `finish()` drains durable frame evidence and writes a capture-time ffconcat timeline including the final hold. Current recording manifests use schema 1 and retain effective limits, actual stored PNG bytes, pending/encoder peaks and capture/end timing; old manifests are unchanged. `health()` reads current counters without filesystem work. Separate bounded offline rendering preserves waits; failure retains PNG/index/manifest evidence. Audio is not recorded. Replay rendering is not visual inspection.
+Exhaustion or dimension/orientation changes stop capture as incomplete; the
+native producer can already omit renders. `finish()` drains the actual encoder,
+syncs finalized segments and closes the index before sealing the manifest.
+Schema 2 identifies compressed capture, segment hashes and status, effective
+limits, encoded bytes and capture/end timing. An interrupted active segment is
+not counted as durable frames. `health()` reads counters without filesystem work.
+Bounded replay assembly stream-copies sealed segments into MP4, preserving native
+millisecond timestamps, gaps and final holds. Failure retains the compressed
+segments and index. Audio is not recorded; encoding is not visual inspection.
+
+Explicit `lossless_png` capture retains schema 1 and its bounded PNG/index/concat
+pipeline. Registered studies and frozen resident benchmarks select this mode
+rather than silently changing their pixel-evidence contract. Model-visible
+images remain exact private PNGs in either mode; decoded H.264 frames are not
+pixel-exact replacements.
 
 Offline export preserves delivered images on a millisecond presentation time
 base, including large terminal gaps and the final hold. It does not impose a
 25 FPS image-demuxer grid or use B-frame reordering that can understate an MP4
 endpoint. The renderer verifies the finalized concat against the capture owner's
 sealed SHA256 before using per-image options and permits only local file
-protocols; it is not an arbitrary concat script importer. Historical PNGs,
-indexes and movies remain unchanged.
+protocols; it is not an arbitrary concat script importer. Export does not rewrite
+retained historical sources. Explicit retention or operator cleanup may expire
+payloads; expiry records, not an old capture manifest alone, describe their
+current availability.
 
-Offline H.264 export uses the `veryfast` preset and one filter thread for pixel
-conversion. Decoder and encoder threading remain automatic. These throughput
-settings preserve every delivered frame, presentation timestamp, final hold and
-`yuv420p` output; they do not extend the declared render deadline. Abort or expiry
-kills the owned encoder and joins its process-close barrier before returning.
+Live capture uses H.264 CRF 18, `veryfast`, no B-frames and bounded encoder
+threading. Bottom-up input is corrected before encoding; odd dimensions use
+`yuv444p`, otherwise `yuv420p`. These settings preserve timing, not original RGB
+bytes. Explicit lossless capture's offline H.264 derivative retains its existing
+`veryfast`/one-filter-thread path. Neither mode extends the declared deadline.
+Abort or expiry kills the owned encoder and joins its process-close barrier
+before returning.
 
 The active boundary uses observation envelope **3**, executable API/validator/runtime **5**, native hello **4**, and `minecraft.action@4`. Isolated worker framing remains **1**; resident messages use their own version-1 namespace. Login admission proof remains **1**, live binary capture is **GHV2**, SQLite uses schema **7**, usage metrics remain **2**, and request-usage evidence remains **1**. Screen and controller-feedback reads use `minecraft.visible_screen@1` and `minecraft.controller_frame@2`. Semantic heard-event feedback is separate from audio recording, which remains absent. This cutover does not deliver larger source bundles, checkpoints or another supported game.
 

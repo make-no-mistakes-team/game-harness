@@ -886,7 +886,7 @@ Recorded acceptance now keeps a separately bounded private append-only journal a
 
 The default text journal allows 256 MiB total and 16 MiB pending asynchronous writes. A complete checked `--evidence-profile` declares effective recording, text/image journal and renderer bounds; a registered study must pin that file's exact preprocessing identity. Manifests distinguish actual durable bytes/artifacts from accepted reservations and report pending peaks. Capacity/persistence failures stop the attempt visibly. Completion and interruption join the actual journal, recorder and handles before observer/Store closure. A replay must be rendered and inspected for recorded acceptance.
 
-`bun run evaluate native-recording --allow-native --jar <fresh-built.jar>` is a separate zero-inference infrastructure proof. It uses the existing private evaluation paths and fresh-artifact gate, records a deliberate wait, native effect interruption/neutralization, visible vanilla DeathScreen and explicit respawn, and compares replay duration against capture time within a predeclared 134 ms tolerance (one nominal 30 Hz interval plus 100 ms, rounded up). Observed frame gaps are diagnostic and cannot enlarge that tolerance. Actor and recorder PNGs preserve visible native RGB with opaque alpha, matching the actual game viewer rather than treating framebuffer alpha as display transparency. Inspect its replay and actor PNGs manually. Its privileged setup never enters a natural acceptance case; direct effect interruption is not a new proof of Runtime Stop. This entry point does not log in or replace account authority.
+`bun run evaluate native-recording --allow-native --jar <fresh-built.jar>` is a separate zero-inference infrastructure proof. It uses the existing private evaluation paths and fresh-artifact gate, records a deliberate wait, native effect interruption/neutralization, visible vanilla DeathScreen and explicit respawn, and compares replay duration against capture time within a predeclared 134 ms tolerance (one nominal 30 Hz interval plus 100 ms, rounded up). Observed frame gaps are diagnostic and cannot enlarge that tolerance. Actor PNGs preserve visible native RGB with opaque alpha. Default recording uses live compressed video; its decoded frames are not exact-pixel evidence. Explicit lossless mode preserves the original PNG sequence. Inspect replay and actor images manually. Its privileged setup never enters a natural acceptance case; direct effect interruption is not a new proof of Runtime Stop. This entry point does not log in or replace account authority.
 
 [`scripts/agent-acceptance.ts`](../scripts/agent-acceptance.ts) uses actual `AuthManager` discovery and an existing private auth store opened in place, without login/logout, credential copying, account fallback or a synthetic strategic caller. Live execution requires both resource opt-ins. Diagnostics retain their hypothesis/evidence revision and justified nonordinary model selection; study execution binds the registered manifest/slot directly and confirms its exact arm model. Natural tasks are not `api_control` work. Full evidence and compact reports remain private by default; the entry point and generated help own current arguments.
 
@@ -906,6 +906,14 @@ duration alone. The local FFmpeg/FFprobe integration tests cover 30 Hz capture,
 a large terminal gap, final hold and refusal of a changed finalized manifest.
 Keep an old render when deriving a corrected export from its original PNGs;
 label the new render's source and options rather than rewriting capture history.
+
+Ordinary development uses timestamped compressed capture without a persistent
+per-frame PNG spool. Registered studies and frozen resident benchmarks retain
+their explicit lossless mode. Exact model-visible images remain in the private
+journal. [Artifact retention](operations-and-security.md#private-evaluation-storage)
+may expire closed, unpinned successful or failed development payloads, but keeps
+attempt outcomes, usage and explicit expiry records. Missing-by-policy evidence
+does not remain replayable and must not be reported as fully retained.
 
 Ordinary-world efficacy and fresh-world completion use ordinary environments. A prepared development or mechanical task is allowed as a separately declared condition, with initialization, human feasibility preflight, interventions and claim limits retained; it cannot pass as ordinary fresh-world acquisition. Keep setup coordinates, scoring and privileged truth outside actor feedback and reusable experience. Whole-agent study execution still refuses prepared/restored starts; the dedicated resident-platform runner admits only declared technical timing fixtures.
 

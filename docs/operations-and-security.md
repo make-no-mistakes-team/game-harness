@@ -24,9 +24,29 @@ Custom natural-language tasks are the default. Optional presets bind exact adapt
 
 While a foreground program runs, its strategic SDK turn may continue in one bounded authoring window: at most three admitted model calls, twelve tools and 60 seconds, clipped to the original turn and root deadlines. The phase begins at the next SDK request after the starting tool's result group. It exposes only `observe`, `help`, `program_inspect` and `program_write`. Writes validate and save immutable inactive versions; they cannot replace the foreground source, start work, change resident intent, stage a successor or complete the task. Top-level write `reason` links outcome assessments and is unavailable in this phase; `card.reason` remains inert source metadata. Optional reflex/memory help cannot disclose or acquire those playing modules during authoring.
 
-Catalog filtering does not grant authority. Dispatch and asynchronous publication recheck the current role and captured window authority, including root settlement and Stop. Exhaustion, expiry and scope changes end authoring without extending the foreground program's lease or budget, or cancelling a healthy body. Wakes and source revisions do not replenish the window. Explicit speculative lookahead and post-goal review retain their separate permissions and allowances; review takes precedence over authoring.
+Catalog filtering does not grant authority. Dispatch and asynchronous publication
+recheck the current role and captured window authority. An already-admitted pure
+authoring request may finish after its predecessor settles, under the original
+window deadline and call/tool bounds, before queued ordinary outcome work.
+Its result remains inactive source; it inherits no gameplay or activation
+permission. Stop, scope loss, replacement roots, exhaustion and expiry still
+revoke authoring without extending the foreground program's lease or budget.
+Wakes and source revisions do not replenish the window. Every actual SDK request
+refreshes the host's role/phase projection. Explicit speculative lookahead and
+post-goal review retain separate permissions and allowances; review takes
+precedence over authoring.
 
 Native crafting uses visible vanilla 2×2/3×3 screens. Equip and placement's implicit hand preparation use the same exclusive inventory-session custody, with direct hotbar selection when possible. Gestures advance with real world time and remain subject to handler/cursor ownership, effect authority and cleanup fences. Cancellation does not roll back already applied transfers; it revokes pending gestures and may close only its still-owned handler. These disclosed mechanical helpers do not supply gameplay strategy or human-equivalent interaction.
+
+`craft` accepts either one `item`/`executions` pair or an explicit `sequence` of
+one to eight such stages, with at most sixteen recipe consumptions in total.
+The model chooses their order, quantities and optional observed table. One
+bounded session keeps screen/cursor ownership across the sequence. Repeated
+ingredients are loaded in bounded batches; ordinary result pickup still consumes
+one recipe execution at a time. Server-confirmed inventory and clean custody gate
+each next stage. Partial production remains attributable, later stages stop,
+and unknown effects are not retried. Final aggregate inventory alone cannot
+prove intermediate products that a later stage consumed.
 
 ## Reference deployment requirements
 
@@ -334,13 +354,53 @@ Keep privileged evaluator evidence apart from agent-visible logs. Source program
 
 Record interventions by kind: infrastructure restart/reconnect, manual pause, task change, world restore, account reconnection, and tactical human coaching. Coaching is separately labeled from ordinary infrastructure maintenance. Preserve wall-time, active gameplay and downtime as distinct intervals. A recovered run remains reportable with its full history; do not delete its failed segment or reset its metric origin. Retention/deletion choices must be explicit to the operator and must not silently remove evidence supporting a reported comparison.
 
-The evaluation recorder retains delivered native frames as private PNGs, an index and a completion manifest independently of the latest-frame desktop view. Its [finite recording bounds](integration-spike.md#episode-recording-and-retained-evidence) and persistence/encoding failures are explicit; incomplete recording requests run Stop rather than silently dropping evidence. Finalization drains queued work and closes the index. Optional offline rendering preserves original evidence on failure and awaits the owned renderer's actual exit on abort/deadline. A complete manifest means delivered-frame retention, not every native render, synchronized state/capture, audio, a trusted goal result or an in-app replay feature. Treat frames and review video as private until deliberately reviewed for sharing.
+The evaluation recorder retains private live-compressed segments, a frame index
+and completion manifest independently of the latest-frame desktop view. Explicit
+finite lossless mode retains PNGs instead. Its [recording contract](runtime-contracts.md#delivered-actor-images-and-recorded-episodes)
+defines timing, evidence fidelity and capacity bounds. Incompleteness requests
+run Stop rather than silently dropping evidence. Finalization joins actual
+encoder and file owners; replay failure retains source segments. A complete
+manifest establishes the declared delivered-frame representation, not every
+native render, synchronized state/capture, audio, a trusted goal or an in-app
+replay feature. Treat footage as private until reviewed for sharing.
 
 ### Private evaluation storage
 
 [`evaluationPaths`](../src/evaluation/paths.ts) separates compact reports, private runtime material and durable governance state. Reports default to `reports/evaluation` in the checkout. Runtime material defaults to the XDG cache root and governance to the XDG state root, each scoped by the checkout's canonical identity. `GAMEHARNESS_EVALUATION_REPORTS_ROOT`, `GAMEHARNESS_EVALUATION_RUNTIME_ROOT` and `GAMEHARNESS_EVALUATION_GOVERNANCE_ROOT` override those locations; explicit function options take precedence. The three roots must be separate and non-nested.
 
-New worlds, game JARs/JRE/libraries, client profiles, session/credential material and full private evidence belong in runtime storage, not compact reports. The [private journal and episode recorder](learning-and-evaluation.md#environments-and-tasks) retain separately bounded evidence; compact reports and ordinary capped Store traces do not contain everything those paths retain. The attempt ledger belongs in governance storage so creating a run directory cannot reset it. This evaluation layout does not change Electron's application storage or `GAMEHARNESS_DATA_DIR`. Existing historical evidence and worlds remain unchanged; relocating new output does not sanitize or migrate old bytes.
+New worlds, game JARs/JRE/libraries, client profiles, session material and full
+private evidence belong in runtime storage, not compact reports. Existing auth
+is opened in place, not copied into development bundles. The [private journal
+and episode recorder](learning-and-evaluation.md#environments-and-tasks) retain
+separately bounded evidence; compact reports and capped Store traces are not
+complete substitutes. The attempt ledger belongs in governance storage so a
+new run directory cannot reset it. This layout does not change Electron's
+application storage or `GAMEHARNESS_DATA_DIR`.
+
+New non-study agent acceptance, including Minecraft development, uses explicitly
+acquired artifact bundles.
+The project policy is 20 GiB, fourteen days and at most ten unpinned runs.
+Successful and failed payloads may expire only after confirmed owner drain.
+Active/draining bundles, manual-review pins and frozen/user-world references
+are protected. Unknown historical runtime children and compact reports count
+toward occupancy but are never automatically adopted or deleted. Auth,
+governance and the official game installation are outside deletion ownership.
+Separate historical cleanup requires explicit operator authorization.
+
+Each development admission reserves 3 GiB for its complete bundle plus 512 MiB
+drain headroom, with a 1 GiB filesystem free-space floor. Nonoverlapping capacity
+checks run in an owned subprocess every five seconds, outside the gameplay
+event loop. A refused or failed check fences producers and joins cleanup.
+These are accounting/reservation bounds, not kernel-enforced disk quotas.
+Protected occupancy that prevents admission is reported, not removed.
+
+The private retention inventory lives beside, not inside, governance and payload
+roots. SQLite serializes cross-process admission and expiry. Durable expiry
+intent precedes deletion; completion, failure and cancellation records remain
+alongside run outcomes and references after payload removal. Governance retains
+actual/unknown usage and all attempt outcomes. Expired-by-policy evidence is
+distinct from unexpected missing files or incomplete capture. Pins must be
+released explicitly after their consumer no longer needs the bundle.
 
 Diagnostics and immutable study declarations share the private governance database without sharing allowances or inventing hypothesis aliases. Study registration freezes permission, source/reference hashes, actual execution identities, scheduled slots and finite allocations. Reserve a live slot before opening authorization or preparing native resources; missing/mismatched/unsupported declarations fail first. Admission-only mode rejects external-resource flags and records `not_run`/`not_called` with no verified goal.
 
@@ -355,6 +415,12 @@ The finite acceptance launcher starts its non-study clock at task submission, be
 Development evidence profiles must cover the complete total window, including recording prelude and drain. A 625,000 ms declaration needs `recording.maxDurationMs` of at least 625,000 and `recording.maxFrames` of at least 18,751 at nominal 30 Hz with a final-frame margin. Supply a complete project-local JSON profile through the existing `evidenceProfile` option or `--evidence-profile`; the default 12,000-frame profile cannot cover that envelope.
 
 Expiry fences further resource and model admission. A timed-out create, preparation or close remains owned until its original operation settles; the launcher does not abandon it or start a replacement. If actual drain or final report persistence exceeds the original deadline, cleanup stays unconfirmed even after the owners eventually join. Native fixture reports separately retain actual closure in `cleanup` and any missed cleanup bound in `cleanup_deadline_reached`; late closure cannot produce `pass: true`. A signal during pending creation tightens shutdown even after work expiry, preserves the first interruption reason, and keeps the startup finalizer joined through main cleanup. A blocked owner can therefore delay return beyond the declared budget, but cannot turn that late return into a successful bounded sample. Registered studies keep their separately frozen registration/reservation deadlines and interrupted failure histories.
+
+The launcher result also checks final metadata/database closure through
+`finalization_within_budget`; an earlier resource-cleanup snapshot cannot turn
+late finalization into an in-budget success. Rotation considers only older
+eligible closed bundles while the result being published remains protected as
+draining. Its final report joins before that bundle is marked closed.
 
 Each currently admitted cold study slot uses a fresh fixture Store and fresh working programs, with global experience retrieval and promotion unavailable. Keep manifests, hidden initialization, verifier truth and sibling artifacts outside actor tools, prompts, logs and retrieval. Optional replication is a preregistered whole block with an immutable activation/decline record. Retain inactive slots separately from started outcomes; safety, authority/leakage and invalidating platform failures close further admission.
 

@@ -27,6 +27,7 @@ import { jsonSchema } from "../shared/validation.ts";
 import { preserveRuntimeToolArguments } from "./runtime-tools.ts";
 import { HOST_MONOTONIC_CLOCK_ID } from "./performance.ts";
 import { controllerEventSchema } from "../shared/resident.ts";
+import { AUTHORING_CANCELLATION_REASONS } from "../shared/strategic-cancellation.ts";
 
 const COALESCE_MS = 100;
 type ResidentAttentionOmission = { count: number; after_event_seq: number; through_event_seq: number };
@@ -38,7 +39,6 @@ const TOOL_CALLS = 48;
 const AUTHORING_CALLS = 3;
 const AUTHORING_TOOLS = 12;
 const AUTHORING_MS = 60_000;
-const AUTHORING_CANCELLATION_REASONS = new Set(["root_settled", "scope_lost", "root_replaced", "deadline", "calls", "tools", "fenced", "resident_attention", "policy_interrupt"]);
 const FEEDBACK_BYTES = 8 * 1024;
 const PROGRAM_PENDING =
   "A program is meaningful pending work; strategy waits for its outcome";
@@ -794,7 +794,7 @@ export class StrategicPlanner {
     // can replace the first actual cancellation cause.
     if (agent && request && !request.terminalReceived && !request.hostCancellation) {
       if (window && request.authoring === window && request.role === "authoring" &&
-          rootReason && AUTHORING_CANCELLATION_REASONS.has(rootReason))
+          rootReason && AUTHORING_CANCELLATION_REASONS[rootReason] === true)
         request.hostCancellation = { kind: "ordinary_authoring", request_id: request.id,
           root_execution_id: window.root, reason: rootReason };
       else if (intent.kind === "strategic_host" && !request.authoring)

@@ -767,8 +767,11 @@ public final class NativeClient implements ClientModInitializer {
           ControllerInputQueue.LeaseCheck check;
           try {
             deadline = NativeControllerContract.nanos(params, "deadline_native_ns");
-            if (effectAuthority.validateApplication(stream.grant().owner(), stream.grant().compatibilityHash()) != EffectAuthority.Rejection.NONE)
-              throw new IllegalStateException("Controller heartbeat scope revoked");
+            EffectAuthority.Rejection rejection = effectAuthority.validateApplication(stream.grant().owner(), stream.grant().compatibilityHash());
+            if (rejection != EffectAuthority.Rejection.NONE) {
+              String queueReason = stream.queue().reason();
+              throw new IllegalStateException((queueReason == null ? "Controller heartbeat scope revoked" : queueReason) + ": authority=" + rejection);
+            }
             check = stream.queue().heartbeat(deadline, checked);
             check.requireAccepted();
           } catch (RuntimeException error) {
@@ -1609,7 +1612,7 @@ public final class NativeClient implements ClientModInitializer {
     m.addProperty("max_pitch_degrees_per_second", motorProfile.pitchSpeed);
     m.addProperty("yaw_acceleration_degrees_per_second_squared", motorProfile.yawAcceleration);
     m.addProperty("pitch_acceleration_degrees_per_second_squared", motorProfile.pitchAcceleration);
-    m.addProperty("camera_integration_clock", ordinaryInput == null ? "client_tick_monotonic_assisted" : "client_simulation_tick_0.05_seconds");
+    m.addProperty("camera_integration_clock", ordinaryInput == null && streamInputs == null ? "client_tick_monotonic_assisted" : "client_simulation_tick_0.05_seconds");
     if (motor != null) {
       if (motor.inventorySession() != null)
         m.add("native_inventory_ui", motor.inventorySession().diagnostics());

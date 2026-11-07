@@ -97,6 +97,11 @@ export class ResidentController {
 
   private async open(): Promise<void> {
     if (!this.active()) { this.finish("stopped", "resident_not_current_or_expired"); return; }
+    // No independent heartbeat may carry old held input between authored decisions.
+    // Refuse a cadence that cannot reach even its next nominal slot within the lease.
+    if (1000 / this.options.limits.frequency_hz >= 250) {
+      this.finish("failed", "resident_frequency_exceeds_native_lease"); return;
+    }
     this.deadlineTimer = this.clock.setTimeout(() => this.finish("stopped", "resident_deadline"), Math.max(0, this.options.deadline_host_ms - this.clock.now()));
     try {
       this.channel = await this.options.open(this.options.deadline_host_ms, ack => this.applied(ack), event => this.effect(event), {

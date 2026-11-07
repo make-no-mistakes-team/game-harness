@@ -112,7 +112,7 @@ test("known native retirement stays distinct from an unconfirmed computation dra
   expect(h.controller.snapshot().cleanup).toEqual({ worker: "unknown", native: "retired" });
 });
 
-for (const [frequency_hz, period] of [[1, 1000], [5, 200], [20, 50]] as const) {
+for (const [frequency_hz, period] of [[5, 200], [20, 50]] as const) {
   test(`resident ${frequency_hz}Hz uses absolute slots and never queues catch-up steps`, async () => {
     const h = harness({ frequency_hz }); await begin(h); expect(h.controller.snapshot().counters.steps).toBe(1);
     await h.clock.late(period * 3 + 1); expect(h.controller.snapshot().counters.steps).toBe(2);
@@ -709,10 +709,31 @@ test("snapshots detach authored state and aggregate notifications", async () => 
   expect(h.changes.length).toBeLessThan(15); await h.controller.stop("test");
 });
 
-test("1Hz genuinely expires the short native lease instead of receiving host heartbeats", async () => {
-  const h = harness({ frequency_hz: 1 }); h.lease(); await begin(h); await h.clock.advance(1100);
-  expect(h.controller.snapshot().counters.steps).toBe(1); expect(h.renewals.length).toBe(1);
-  expect(h.controller.snapshot().reason).toBe("native_lease_expired"); expect(h.controller.snapshot().status).toBe("stopped");
+test("1Hz admission refuses impossible lease continuity before acquiring a native owner", async () => {
+  const h = harness({ frequency_hz: 1 });
+  let opened = false;
+  h.options.open = async () => { opened = true; return h.channel; };
+  const controller = new ResidentController(h.options);
+  await controller.start(); await settle();
+  expect(opened).toBe(false);
+  expect(controller.snapshot()).toMatchObject({ status: "failed", reason: "resident_frequency_exceeds_native_lease",
+    counters: { frames: 0, steps: 0, submissions: 0 }, cleanup: { worker: "closed", native: "retired" } });
+  expect(h.workerClosed).toBe(1);
+  await controller.stop("test");
+});
+
+test("5Hz permits fresh decisions but a genuinely late step cannot renew expired native input", async () => {
+  const h = harness({ frequency_hz: 5 }), late = deferred<ControllerStepResult>();
+  let calls = 0;
+  h.lease(); h.step(async () => ++calls === 1 ? decision(world({ selected_hotbar: 1 }), 1) : late.promise);
+  await begin(h); await h.clock.advance(200);
+  expect(h.controller.snapshot().counters.steps).toBe(2);
+  await h.clock.advance(51);
+  late.resolve(decision(world({ selected_hotbar: 2 }), 2)); await settle();
+  expect(h.controller.snapshot()).toMatchObject({ reason: "native_lease_expired", state: 1,
+    counters: { submissions: 1, stale_results: 1 }, cleanup: { worker: "closed", native: "retired" } });
+  expect(h.renewals).toHaveLength(1);
+  expect(h.sent.map(entry => entry.input)).toEqual([world({ selected_hotbar: 1 })]);
 });
 
 test("persistent read unavailability reaches native expiry without stale renewal", async () => {

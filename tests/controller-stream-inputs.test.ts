@@ -1,9 +1,12 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import type { ExpectedEffectOwner, WorldHeld, WorldInputEdge } from "../src/shared/control.ts";
+import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
 import { controllerInputFrameSchema, controllerInputSchema, inputAppliedAckSchema, inputSubmissionSchema,
   residentFrameContextSchema, revocationAckSchema,
   type ControllerInputFrame, type InputAppliedAck, type RevocationAck } from "../src/shared/controller.ts";
 import { ControllerInputs } from "../src/server/controller-inputs.ts";
+import { NativeControllerChannel, type ControllerChannelTransport } from "../src/server/controller-channel.ts";
+import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 
 const neutral: WorldHeld = { forward: false, back: false, left: false, right: false, jump: false,
   sprint: false, sneak: false, attack: false, use: false };
@@ -372,4 +375,166 @@ test("DTOs reject unsafe counters private actor ACK authority and malformed nati
   expect(revocationAckSchema.safeParse({ ...retirement(), input_application: "unknown" }).success).toBe(false);
   expect(revocationAckSchema.safeParse({ ...retirement(), unresolved_operation_refs: Array(257).fill("unknown") }).success).toBe(false);
   expect(() => new ControllerInputs(owner(), 0)).toThrow();
+});
+
+function nativeChannel(operationId = "resident-owner", generation = 3) {
+  const identity = { ...owner(), operation_id: operationId, generation };
+  const frame = controllerFrameFixture(identity.scope.life_id, identity.scope.space_epoch);
+  frame.frame_seq = 1; frame.native_tick = 10;
+  frame.captured_native_ns = frame.inventory.captured_native_ns = "1000000000";
+  const calls: string[] = [], applied: InputAppliedAck[] = [];
+  let retired = false;
+  let request: ControllerChannelTransport["request"] = async method => {
+    if (method === "controller_revoke") return { ack: retirement({ owner: identity,
+      last_applied_sequence: applied.at(-1)?.sequence ?? 0, ordered_edge_prefix: applied.at(-1)?.ordered_edge_prefix ?? 0 }), generation: generation + 1 };
+    if (method === "controller_submit") return ack(1);
+    return {};
+  };
+  const transport: ControllerChannelTransport = {
+    async request(...args) { calls.push(args[0]); return await request(...args); },
+    async sample() { return minecraftControllerFrameSchema.parse(structuredClone(frame)); },
+    clock: () => ({ clock_id: "native-test", host_sent_ms: 0, host_received_ms: 0,
+      native_received_ns: "1000000000", native_replied_ns: "1000000000", native_processing_ms: 0,
+      residual_round_trip_ms: 0, offset_lower_ms: 1000, offset_upper_ms: 1000, uncertainty_ms: 0 }),
+    assertCurrent() { if (retired) throw new Error("Controller owner has retired."); },
+    retired() { retired = true; }, async failed() { throw new Error("Unexpected unconfirmed retirement"); },
+  };
+  const channel = new NativeControllerChannel(identity, 7, 10000, transport, value => applied.push(value), () => {});
+  return { channel, calls, applied, frame, request(fn: typeof request) { request = fn; } };
+}
+async function settleChannel() { for (let turn = 0; turn < 30; turn++) await Promise.resolve(); }
+
+test.each([false, true])("partial GUI ACK retains its cause through queued rejection and retirement (contained=%s)", async contained => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  const first = Promise.withResolvers<unknown>(), queued = Promise.withResolvers<unknown>();
+  const retiring = Promise.withResolvers<unknown>();
+  const partial = ack(1, 1, { input_application: "partial", reason: "screen_incarnation_changed_during_application" });
+  h.request(async (method, params) => {
+    if (method === "controller_submit") {
+      const { sequence } = params as { sequence: number };
+      return await (sequence === 1 ? first.promise : queued.promise);
+    }
+    if (method === "controller_revoke") return await retiring.promise;
+    throw new Error(`Unexpected native request: ${method}`);
+  });
+  try {
+    const frame = await h.channel.sample(null);
+    expect(h.channel.submit(frame, screen(1, 2).input).status).toBe("submitted");
+    h.frame.frame_seq = 2;
+    const next = await h.channel.sample(null);
+    expect(h.channel.submit(next, screen(2).input).status).toBe("submitted");
+    await settleChannel();
+    expect(h.calls).toEqual(["controller_submit", "controller_submit"]);
+
+    if (contained) h.channel.contained();
+    first.resolve(partial);
+    await settleChannel();
+    expect(h.channel.snapshot()).toMatchObject({ fenced: true, retired: false, applied_sequence: 1,
+      pending_frames: 1, pending_edges: 2, reason: "screen_incarnation_changed_during_application", last_input: partial });
+    expect(h.applied).toEqual([partial]);
+    expect(h.calls).toEqual(["controller_submit", "controller_submit", "controller_revoke"]);
+    await expect(h.channel.renew(next)).rejects.toThrow(/screen_incarnation_changed_during_application/);
+
+    retiring.resolve({ ack: retirement({ last_applied_sequence: 1, ordered_edge_prefix: 1,
+      unresolved_operation_refs: ["screen-unknown"] }), generation: 4 });
+    await settleChannel();
+    let retired = false;
+    const retirementComplete = h.channel.revoke().then(() => { retired = true; });
+    await settleChannel();
+    expect(retired).toBe(false);
+
+    queued.reject(new Error("Controller retired without confirmed application: partial_input_application"));
+    await retirementComplete;
+    expect(h.channel.snapshot()).toMatchObject({ fenced: true, retired: true, applied_sequence: 1,
+      pending_frames: 0, pending_edges: 0, reason: "screen_incarnation_changed_during_application", last_input: partial });
+    await expect(h.channel.sample(null)).rejects.toThrow(/screen_incarnation_changed_during_application/);
+    expect(h.channel.submit(next, screen(2).input)).toMatchObject({ status: "rejected",
+      reason: "screen_incarnation_changed_during_application" });
+    await expect(h.channel.renew(next)).rejects.toThrow(/screen_incarnation_changed_during_application/);
+    expect(h.channel.snapshot().reason).toBe("screen_incarnation_changed_during_application");
+    expect(h.calls).toEqual(["controller_submit", "controller_submit", "controller_revoke"]);
+  } finally {
+    first.resolve(partial);
+    queued.resolve(ack(2, 3));
+    retiring.resolve({ ack: retirement({ last_applied_sequence: 1, ordered_edge_prefix: 1 }), generation: 4 });
+    await settleChannel();
+    clock.mockRestore();
+  }
+});
+
+test("native submission failure retains its actual phase and frame instead of becoming admission_revoked", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  h.request(async method => {
+    if (method === "controller_submit") throw new Error("Controller retired without confirmed application: queued_frame_expired_before_application");
+    return { ack: retirement(), generation: 4 };
+  });
+  try {
+    const frame = await h.channel.sample(null);
+    expect(h.channel.submit(frame, world(1).input).status).toBe("submitted");
+    await settleChannel();
+    expect(h.channel.snapshot()).toMatchObject({ fenced: true, retired: true, applied_sequence: 0, last_input: null });
+    expect(h.channel.snapshot().reason).toContain("controller_submit");
+    expect(h.channel.snapshot().reason).toContain("queued_frame_expired_before_application");
+    expect(h.channel.snapshot().reason).toContain("frame_seq=1");
+    await expect(h.channel.renew(frame)).rejects.toThrow(/queued_frame_expired_before_application/);
+    expect(h.calls.filter(method => method === "controller_heartbeat")).toEqual([]);
+    expect(h.applied).toEqual([]);
+  } finally { clock.mockRestore(); }
+});
+
+test("heartbeat failure retains native expiry and decision-clock evidence without reviving the owner", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  h.request(async method => {
+    if (method === "controller_heartbeat") throw new Error("Controller request rejected: native_input_lease_expired");
+    return { ack: retirement(), generation: 4 };
+  });
+  try {
+    const frame = await h.channel.sample(null);
+    clock.mockReturnValue(20);
+    await expect(h.channel.renew(frame)).rejects.toThrow(/native_input_lease_expired/);
+    await settleChannel();
+    expect(h.channel.snapshot()).toMatchObject({ fenced: true, retired: true, submitted_sequence: 0, applied_sequence: 0 });
+    expect(h.channel.snapshot().reason).toContain("controller_heartbeat");
+    expect(h.channel.snapshot().reason).toContain("frame_seq=1");
+    expect(h.channel.snapshot().reason).toContain("native_age_upper_ns=20000002");
+    await expect(h.channel.renew(frame)).rejects.toThrow(/native_input_lease_expired/);
+    expect(h.calls.filter(method => method === "controller_heartbeat")).toHaveLength(1);
+    const replacement = nativeChannel("replacement-owner", 4);
+    const fresh = await replacement.channel.sample(null);
+    await replacement.channel.renew(fresh);
+    expect(replacement.channel.submit(fresh, world(1).input).status).toBe("submitted");
+    await settleChannel();
+    expect(replacement.channel.snapshot()).toMatchObject({ fenced: false, applied_sequence: 1 });
+    expect(h.channel.snapshot()).toMatchObject({ fenced: true, retired: true, submitted_sequence: 0 });
+    await replacement.channel.revoke();
+  } finally { clock.mockRestore(); }
+});
+
+test("a delayed heartbeat cannot make the old decision fresh for submission or another renewal", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel(), heartbeat = Promise.withResolvers<unknown>();
+  h.request(async method => {
+    if (method === "controller_heartbeat") return await heartbeat.promise;
+    return { ack: retirement(), generation: 4 };
+  });
+  try {
+    const frame = await h.channel.sample(null);
+    const renewal = h.channel.renew(frame);
+    clock.mockReturnValue(161); heartbeat.resolve({});
+    await renewal;
+    const rejected = h.channel.submit(frame, world(1).input);
+    expect(rejected.status).toBe("rejected");
+    expect(rejected.reason).toContain("stale_native_frame");
+    expect(rejected.reason).toContain("native_age_upper_ns=161000002");
+    await expect(h.channel.renew(frame)).rejects.toThrow(/stale decision/);
+    expect(h.calls).toEqual(["controller_heartbeat"]);
+    expect(h.channel.snapshot()).toMatchObject({ submitted_sequence: 0, applied_sequence: 0 });
+    h.frame.frame_seq = 2; h.frame.native_tick = 11;
+    h.frame.captured_native_ns = h.frame.inventory.captured_native_ns = "1161000000";
+    const fresh = await h.channel.sample(null);
+    h.request(async () => ({}));
+    await h.channel.renew(fresh);
+    expect(h.calls).toEqual(["controller_heartbeat", "controller_heartbeat"]);
+    expect(h.channel.snapshot().fenced).toBe(false);
+    expect(h.applied).toEqual([]);
+  } finally { heartbeat.resolve({}); clock.mockRestore(); }
 });

@@ -731,7 +731,7 @@ export class StrategicPlanner {
       // no new turn, effect or activation authority is admitted.
       const settling = this.authoringPhase && this.turnAuthoring === previous && previous.calls > 0 && this.turn !== null &&
         root?.execution_id === previous.root && root.source_hash === previous.source &&
-        !["accepted", "running"].includes(root.status);
+        root.status === "succeeded";
       const reason = previous.run !== run || previous.generation !== generation || previous.scope !== scope ||
           !run || !this.current(run, generation) || run.status !== "running" ? "scope_lost"
         : root && (previous.root !== root.execution_id || previous.source !== root.source_hash) ? "root_replaced"
@@ -826,7 +826,7 @@ export class StrategicPlanner {
       remaining_tools: window && !window.closed ? Math.max(0, AUTHORING_TOOLS - window.tools) : 0,
       remaining_ms: window && !window.closed ? Math.max(0, window.deadline - Date.now()) : 0,
       predecessor_status: root?.status ?? null,
-      instruction: "Within this one finite root-bound window, observe, help, program_inspect and program_write may prepare immutable inactive source. Foreground work is not changed; if it has settled, only this already-running inactive authoring turn may finish before queued outcome work. Write saves/validates only; no submit, run, activation, prepare_next, task_finish, reflex, memory or review. No polling or keepalive. Later wakes and leaf admissions do not renew this window.",
+      instruction: "Within this one finite root-bound window, observe, help, program_inspect and program_write may prepare immutable inactive source. Foreground work is not changed; if it has succeeded, only this already-running inactive authoring turn may finish before queued outcome work. An unsuccessful predecessor revokes this lane so fresh ordinary strategy can handle its actual result. Write saves/validates only; no submit, run, activation, prepare_next, task_finish, reflex, memory or review. No polling or keepalive. Later wakes and leaf admissions do not renew this window.",
     };
   }
 
@@ -878,6 +878,7 @@ export class StrategicPlanner {
   wake(reason: string): void {
     const run = this.host.run();
     if (!run || !this.current(run, this.host.generation())) return;
+    // Unsuccessful outcomes revoke inactive authoring before fresh strategy.
     this.reconcileAuthoring();
     if (this.host.programPending() && !Object.hasOwn(MEANINGFUL_WAKES, reason))
       return;

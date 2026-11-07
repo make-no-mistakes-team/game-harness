@@ -502,6 +502,38 @@ test("root settlement queues ordinary outcome work behind bounded inactive autho
   expect(prompts).toBe(2); expect(f.run.usage.calls).toBe(4); expect(f.state.pauses).toEqual([]);
 });
 
+for (const status of ["blocked", "failed"] as const)
+test(`unsuccessful ${status} root preempts inactive authoring before fresh outcome handling`, async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), decided = Promise.withResolvers<void>();
+  let prompts = 0, permit: (() => void) | undefined;
+  const f = await setup(async (_context, agent) => {
+    if (++prompts === 1) {
+      expect(await agent.call()).toBe(true);
+      permit = f.planner.speculativeToolAuthority();
+      entered.resolve();
+      await agent.wait(release.promise);
+      expect(() => permit!()).toThrow();
+    } else {
+      expect(f.planner.toolRole()).toBe("ordinary");
+      expect(await agent.call()).toBe(true);
+      decided.resolve();
+    }
+  });
+  await f.planner.start(1); f.planner.wake("planning_continuation"); await entered.promise;
+  f.root.status = status; f.root.ended_at = new Date().toISOString();
+  f.root.result = { status, summary: "Current work could not continue", result: null };
+  f.store.updateSkillExecution(f.root, "skill.closed", f.root.result.summary);
+  f.state.pending = false;
+  f.planner.wake("skill_outcome");
+  try {
+    expect(f.state.aborts).toBe(1);
+    await decided.promise;
+    expect(prompts).toBe(2);
+    expect(f.state.pauses).toEqual([]);
+    expect(f.store.skillExecution(f.run.run_id, { execution_id: f.root.execution_id })?.status).toBe(status);
+  } finally { release.resolve(); }
+});
+
 for (const ending of ["fenced", "scope_lost"] as const)
 test(`real SDK ${ending} cancellation retains exact host provenance without stale writes`, async () => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();

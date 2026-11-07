@@ -1,6 +1,6 @@
 import type { Json } from "../shared/contracts.ts";
 import type { SkillExecutionView } from "../shared/programs.ts";
-import { confirmedMinecraftGuiTransactions, minecraftObservationV3Schema } from "../shared/minecraft.ts";
+import { confirmedMinecraftCraftStages, confirmedMinecraftGuiTransactions, minecraftObservationV3Schema } from "../shared/minecraft.ts";
 import type { PromotionDeclaration } from "./experience.ts";
 import type { Store, StoredAction, StoredRun } from "./store.ts";
 import { minecraftGoalBaselineSchema, minecraftInventoryCounts, eligibleMinecraftWood } from "./minecraft-adapter.ts";
@@ -80,7 +80,13 @@ export function qualifyMinecraftExperience(store: Store, run: StoredRun, executi
         (declaration.predicate.kind !== "break_log" || id === details?.action_id);
       let gain = 0;
       if (crafting) {
-        if (action.request.kind === "craft" && action.request.item === item) gain = inventoryGain(action, item);
+        if (action.request.kind === "craft") {
+          const stages = confirmedMinecraftCraftStages(action.request, action.view.result?.evidence);
+          for (const stage of stages)
+            if (stage.item === item) gain += stage.confirmed_executions * stage.output_per_execution;
+          if (native.craft_stages === undefined && "item" in action.request && action.request.item === item)
+            gain = inventoryGain(action, item);
+        }
         else if (action.request.kind === "screen_input") {
           for (const fact of guiTransactions(action)) for (const production of fact.productions)
             if (production.producer === "crafting" && production.production_confirmed && production.item === item) gain += production.count;

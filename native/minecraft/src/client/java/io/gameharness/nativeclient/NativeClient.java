@@ -2416,6 +2416,7 @@ public final class NativeClient implements ClientModInitializer {
     JsonObject controls;
     JsonObject inventoryBefore;
     JsonObject serverInventoryAfter;
+    JsonObject craftStageBefore;
     String targetName;
     String pickupItem;
     boolean completingPickup;
@@ -2643,8 +2644,8 @@ public final class NativeClient implements ClientModInitializer {
         inventoryEmissions();
         if (!issued) finish(EffectOutcome.deadline(emissions), "Equipment preflight refused", false);
       } else if (kind.equals("craft")) {
-        initialCount = beforeCount(action.get("item").getAsString());
-        duration = VisibleInventory.craftMillis(action.get("executions").getAsInt());
+        craftStageBefore = inventoryBefore;
+        duration = VisibleInventory.craftMillis(Recipes.totalExecutions(action));
         if (tableReference != null) {
           target = tableBinding;
           String tableRefusal = null;
@@ -3161,15 +3162,32 @@ public final class NativeClient implements ClientModInitializer {
           Recipes.tick(client);
           inventoryEmissions();
           if (Recipes.invalidated()) {
+            // Revoke pending gestures before server custody inspection; cleanup
+            // closes only the exact old handler and never releases a held drag.
+            if (Recipes.session() != null) Recipes.session().cancel(true);
+            if (Recipes.needsReceipt()) {
+              requestInventory();
+              if (serverInventoryAfter == null) return;
+              Recipes.receipt(client, craftStageBefore, serverInventoryAfter,
+                  received.owner().operationId() + ":craft:" + receiptNonce);
+            }
             finish(EffectOutcome.deadline(emissions), "Visible crafting interrupted: " + Recipes.session().reason(), false);
+            return;
+          }
+          if (Recipes.awaitingReceipt()) {
+            requestInventory();
+            if (serverInventoryAfter == null) return;
+            Recipes.receipt(client, craftStageBefore, serverInventoryAfter,
+                received.owner().operationId() + ":craft:" + receiptNonce);
+            craftStageBefore = serverInventoryAfter.getAsJsonObject("counts");
+            receiptNonce = 0;
+            serverInventoryAfter = null;
             return;
           }
           if (Recipes.complete()) {
             requestInventory();
             if (serverInventoryAfter == null) return;
-            boolean gained =
-                serverInventoryClean() && serverCount(action.get("item").getAsString()) - initialCount
-                    >= Recipes.expectedGain();
+            boolean gained = serverInventoryClean();
             finish(
                 gained ? "succeeded" : EffectOutcome.deadline(emissions),
                 gained
@@ -3327,6 +3345,7 @@ public final class NativeClient implements ClientModInitializer {
       if (motor != this) return;
       inventoryEmissions();
       VisibleInventory inventorySession = inventorySession();
+      JsonArray craftStages = kind.equals("craft") ? Recipes.stageEvidence() : null;
       status =
           EffectOutcome.close(
               status, emissions, serverInventoryAfter != null || authoritativeRejection);
@@ -3363,6 +3382,7 @@ public final class NativeClient implements ClientModInitializer {
       evidence.addProperty("world_effect_emitted", (emissions & EffectOutcome.WORLD_EFFECT) != 0);
       evidence.addProperty("camera_changed", (emissions & EffectOutcome.CAMERA) != 0);
       if (inventoryUi != null) evidence.add("native_inventory_ui", inventoryUi);
+      if (craftStages != null) evidence.add("craft_stages", craftStages);
       if (kind.equals("navigate")) {
         evidence.addProperty("arrival_mode", arrivalMode);
         evidence.addProperty("position_range", positionRange);

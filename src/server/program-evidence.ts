@@ -7,7 +7,7 @@ import type { SkillExecutionView } from "../shared/programs.ts";
 import { z } from "zod";
 import { programCompatibilitySchema } from "../shared/adapter.ts";
 import { effectScopeSchema } from "../shared/control.ts";
-import { confirmedMinecraftGuiTransactions, minecraftGuiTransactionFactSchema, minecraftBlockRemovalFactSchema, minecraftObservationV3Schema, minecraftProductionFactSchema } from "../shared/minecraft.ts";
+import { confirmedMinecraftCraftStages, confirmedMinecraftGuiTransactions, minecraftGuiTransactionFactSchema, minecraftBlockRemovalFactSchema, minecraftObservationV3Schema, minecraftProductionFactSchema } from "../shared/minecraft.ts";
 import { verificationResultSchema } from "../shared/validation.ts";
 import { jsonSchema } from "../shared/primitives.ts";
 import type { StoredAction, StoredRun } from "./store.ts";
@@ -56,7 +56,8 @@ export function currentGoalLinks(
   const links = new Map<string, GoalRelationship>();
   const collection = run.goal.goal_id === "collect_wood" || run.goal.goal_id === "obtain_stone";
   const wood = run.goal.goal_id === "collect_wood" || run.goal.goal_id === "collect_and_craft_table";
-  const product = run.goal.goal_id === "craft_stone_pickaxe" ? "stone_pickaxe" : "crafting_table";
+  const product = run.goal.goal_id === "craft_iron_pickaxe" ? "iron_pickaxe" :
+    run.goal.goal_id === "craft_stone_pickaxe" ? "stone_pickaxe" : "crafting_table";
   const combined = run.goal.goal_id === "collect_and_craft_table";
   const acquisitions: { life: number; at: number }[] = [];
   const productions: { life: number; at: number }[] = [];
@@ -143,11 +144,19 @@ export function currentGoalLinks(
           continue;
         }
       }
+      const staged = production?.success ? [...receipted].find(([actionId, entry]) =>
+        confirmedMinecraftCraftStages(entry.action.request, entry.action.view.result?.evidence).some(stage =>
+          evidence.evidence_id === `${actionId}:craft:${stage.stage_index}:production` &&
+          stage.receipt_ref === production.data.receipt_ref && stage.item === production.data.item &&
+          canonicalContractJson(stage.inventory_before) === canonicalContractJson(production.data.inventory_before) &&
+          canonicalContractJson(stage.inventory_after) === canonicalContractJson(production.data.inventory_after))) : undefined;
+      if (production?.success && typeof evidence.evidence_id === "string" &&
+        /:craft:[^:]+:production$/.test(evidence.evidence_id) && !staged) return null;
       const matched = transaction?.success ? [...receipted].find(([actionId, entry]) =>
         evidence.evidence_id === `${actionId}:gui:${transaction.data.operation_index}` &&
         confirmedMinecraftGuiTransactions(entry.action.request, entry.action.view.result?.evidence)
           .some(receipt => canonicalContractJson(receipt) === canonicalContractJson(transaction.data)))
-        : [fact.receipt_ref, confirmed.get(fact.receipt_ref)] as const;
+        : staged ?? [fact.receipt_ref, confirmed.get(fact.receipt_ref)] as const;
       const actionId = matched?.[0], entry = matched?.[1];
       if (!entry || !entry.action.view.scope || entry.action.view.origin !== "skill" ||
         entry.action.view.compatibility_hash !== run.compatibility_hash ||
@@ -161,17 +170,21 @@ export function currentGoalLinks(
           !eligibleLog(removal.data.target_name)) return null;
         links.set(fact.receipt_ref, run.goal.goal_id === "break_log" ? "direct_receipt" : "block_removal_contributor");
       } else if (production?.success) {
-        const delta = receiptedInventoryDelta(entry.action);
         const fact = production.data;
+        const delta = staged ? (fact.inventory_after[fact.item] ?? 0) - (fact.inventory_before[fact.item] ?? 0)
+          : receiptedInventoryDelta(entry.action)?.[fact.item] ?? 0;
         const woodAcquisition = combined && [fact.inventory_before, fact.inventory_after].some(counts =>
           Object.keys(counts).some(item => eligibleLog(item) && counts[item]! > (baseline.data.inventory[item] ?? 0)));
         const finalProduct = fact.item === product;
-        if ((!finalProduct && !woodAcquisition) || (delta?.[fact.item] ?? 0) <= 0 ||
-          canonicalContractJson(receipt?.inventory_before ?? null) !== canonicalContractJson(production.data.inventory_before) ||
-          canonicalContractJson(receipt?.inventory_after ?? null) !== canonicalContractJson(production.data.inventory_after)) return null;
+        if ((!finalProduct && !woodAcquisition) || delta <= 0 || !staged && (
+          entry.action.request.kind === "craft" && ("sequence" in entry.action.request || receipt?.craft_stages !== undefined) ||
+          canonicalContractJson(receipt?.inventory_before ?? null) !== canonicalContractJson(fact.inventory_before) ||
+          canonicalContractJson(receipt?.inventory_after ?? null) !== canonicalContractJson(fact.inventory_after))) return null;
         if (woodAcquisition) acquisitions.push({ life: scope.data.life_id, at: Date.parse(evidence.observed_at) });
         if (finalProduct) productions.push({ life: scope.data.life_id, at: Date.parse(evidence.observed_at) });
-        links.set(fact.receipt_ref, finalProduct ? "direct_receipt" : "inventory_collector");
+        if (!actionId) return null;
+        if (finalProduct || !links.has(actionId))
+          links.set(actionId, finalProduct ? "direct_receipt" : "inventory_collector");
       } else if (transaction?.success && actionId) {
         if (!recordTransaction(transaction.data, scope.data.life_id, Date.parse(evidence.observed_at), actionId)) return null;
       }
@@ -269,7 +282,9 @@ export function programEvidence(
         if (!action?.view.execution_id || event.type !== `action.${action.view.status}`) continue;
         const wholeConfirmed = action.view.status === "succeeded" &&
           object(action.view.result?.evidence ?? null)?.effect_confirmed === true;
-        if (!wholeConfirmed && !confirmedMinecraftGuiTransactions(action.request, action.view.result?.evidence).length) continue;
+        if (!wholeConfirmed &&
+          !confirmedMinecraftGuiTransactions(action.request, action.view.result?.evidence).length &&
+          !confirmedMinecraftCraftStages(action.request, action.view.result?.evidence).length) continue;
         let owner = owners.get(action.view.execution_id);
         if (!owner) {
           const loaded = store.skillExecution(runId, {
@@ -280,7 +295,7 @@ export function programEvidence(
           owner = loaded;
         }
         receipted.set(details.action_id, { owner, action });
-        // Receipt-level GUI prefixes link goals without confirming the enclosing action or its suffix.
+        // Receipt-level prefixes link goals without confirming the enclosing action or its suffix.
         if (!wholeConfirmed) continue;
         confirmed.set(details.action_id, { owner, action });
         for (const id of new Set([

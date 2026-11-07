@@ -4,7 +4,8 @@ import { effectScopeSchema, safeCounterSchema, screenPreconditionMatches, visibl
 import { jsonSchema } from "../shared/primitives.ts";
 import type { ObservationV3 } from "../shared/observations.ts";
 import { minecraftActionSchema, minecraftBlockRemovalFactSchema, minecraftControllerFrameSchema, minecraftEffectUncertaintyFactSchema, minecraftObservationV3Schema,
-  minecraftProductionFactSchema, minecraftGuiTransactionFactSchema, confirmedMinecraftGuiTransactions, minecraftProfileConfigurationSchema, type MinecraftObservation, type MinecraftObservationData } from "../shared/minecraft.ts";
+  minecraftProductionFactSchema, minecraftGuiTransactionFactSchema, confirmedMinecraftGuiTransactions, confirmedMinecraftCraftStages,
+  minecraftProfileConfigurationSchema, type MinecraftObservation, type MinecraftObservationData } from "../shared/minecraft.ts";
 import { adapterCompatibility, canonicalContractJson, contractHash } from "./adapter-contract.ts";
 import { minecraftSchemaCatalog } from "./native-contract.ts";
 
@@ -124,7 +125,8 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
       if (request.kind === "respawn") return 15000;
       // Native gestures keep world time advancing; include its bounded session
       // deadline and receipt drain without extending the owning root budget.
-      if (request.kind === "craft") return 13000 + 35000 * request.executions;
+      if (request.kind === "craft") return 13000 + 35000 * ("sequence" in request
+        ? request.sequence.reduce((total, stage) => total + stage.executions, 0) : request.executions);
       if (request.kind === "equip") return 15000;
       if (request.kind === "place") return 23000;
       return request.kind === "dig" ? 12000 : 5000;
@@ -284,6 +286,27 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
         }
         return facts;
       }
+      if (request.kind === "craft" && ("sequence" in request || evidence?.craft_stages !== undefined)) {
+        const requested = "sequence" in request ? request.sequence : [request];
+        const facts: AdapterEvidence[] = [];
+        const stages = confirmedMinecraftCraftStages(request, evidence);
+        const confirmedStages = stages.filter(stage => stage.status === "succeeded").length;
+        for (const stage of stages) {
+          const data = minecraftProductionFactSchema.parse({ kind: "item_production", item: stage.item, actor: "own_player",
+            mechanism: "helper", input_application: "confirmed", effect_status: "confirmed",
+            inventory_before: stage.inventory_before, inventory_after: stage.inventory_after, receipt_ref: stage.receipt_ref });
+          facts.push({ evidence_id: `${operationId}:craft:${stage.stage_index}:production`, adapter_id: adapterId,
+            schema: { id: "minecraft_item_production_v1", version: 1, hash: productionHash }, scope, observed_at: at, data });
+        }
+        if (result.status === "unknown" || result.status === "succeeded" && confirmedStages !== requested.length) {
+          const data = minecraftEffectUncertaintyFactSchema.parse({ kind: "effect_uncertainty", actor: "own_player", mechanism: "helper",
+            operation_kind: request.kind, effect_status: "unknown", receipt_ref: operationId,
+            reason: result.status === "unknown" ? "effect_unconfirmed" : "inventory_receipt_unconfirmed" });
+          facts.push({ evidence_id: `${operationId}:uncertainty`, adapter_id: adapterId,
+            schema: { id: "minecraft_effect_uncertainty_v1", version: 1, hash: uncertaintyHash }, scope, observed_at: at, data });
+        }
+        return facts;
+      }
       if (result.status === "unknown" || request.kind === "craft" && result.status === "succeeded" &&
         (evidence?.effect_confirmed !== true || evidence?.inventory_receipt_confirmed !== true)) {
         const data = minecraftEffectUncertaintyFactSchema.parse({ kind: "effect_uncertainty", actor: "own_player", mechanism: "helper",
@@ -300,7 +323,7 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
           schema: { id: "minecraft_block_removal_v1", version: 1, hash: removalHash }, scope, observed_at: at, data: data.data }] : [];
       }
       // Current helpers are one factual producer, NOT a universal verifier rule.
-      if (request.kind !== "craft" || evidence.inventory_receipt_confirmed !== true) return [];
+      if (request.kind !== "craft" || !("item" in request) || evidence.inventory_receipt_confirmed !== true) return [];
       const data = minecraftProductionFactSchema.safeParse({ kind: "item_production", item: request.item, actor: "own_player", mechanism: "helper",
         input_application: "confirmed", effect_status: "confirmed", inventory_before: evidence.inventory_before,
         inventory_after: evidence.inventory_after, receipt_ref: operationId });

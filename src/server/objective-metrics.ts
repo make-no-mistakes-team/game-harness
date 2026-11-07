@@ -1,5 +1,5 @@
 import type { Json } from "../shared/contracts.ts";
-import { confirmedMinecraftGuiTransactions, historicalObservationV2Schema, minecraftObservationV3Schema, type MinecraftPlayer } from "../shared/minecraft.ts";
+import { confirmedMinecraftCraftStages, confirmedMinecraftGuiTransactions, historicalObservationV2Schema, minecraftObservationV3Schema, type MinecraftPlayer } from "../shared/minecraft.ts";
 import type { ObjectiveMetrics, PauseCategory, TraceRecord } from "../shared/execution-evidence.ts";
 import type { StoredAction } from "./store.ts";
 import type { StoreReadQueries } from "./store-read.ts";
@@ -12,11 +12,15 @@ export function confirmedRemoval(action: StoredAction): boolean {
 export const eligibleLog = (name: string): boolean => /^(?:stripped_)?[a-z0-9_]+_(?:log|wood|stem|hyphae)$/.test(name);
 export function receiptedInventoryDelta(action: StoredAction): Record<string, number> | null {
   const receipt = evidenceObject(action.view.result?.evidence);
-  if (action.request.kind === "screen_input") {
-    const transactions = confirmedMinecraftGuiTransactions(action.request, receipt);
-    if (!transactions.length) return null;
+  const stages = action.request.kind === "craft" && ("sequence" in action.request || receipt?.craft_stages !== undefined);
+  if (action.request.kind === "screen_input" || stages) {
+    const facts = stages
+      ? confirmedMinecraftCraftStages(action.request, receipt)
+      : confirmedMinecraftGuiTransactions(action.request, receipt);
+    if (!facts.length) return null;
     const delta: Record<string, number> = Object.create(null);
-    for (const fact of transactions) for (const item of new Set([...Object.keys(fact.inventory_before), ...Object.keys(fact.inventory_after)])) {
+    // Stage receipts supersede the aggregate, including when a later stage is unknown.
+    for (const fact of facts) for (const item of new Set([...Object.keys(fact.inventory_before), ...Object.keys(fact.inventory_after)])) {
       const count = (delta[item] ?? 0) + (fact.inventory_after[item] ?? 0) - (fact.inventory_before[item] ?? 0);
       if (!Number.isSafeInteger(count)) return null;
       delta[item] = count;

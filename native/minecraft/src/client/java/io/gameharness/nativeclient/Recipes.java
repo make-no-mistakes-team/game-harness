@@ -20,7 +20,10 @@ public final class Recipes {
   private static RecipeDisplayEntry active;
   private static int remaining, phase, ingredient, remainder;
   private static boolean table;
-  private static int expectedGain;
+  private static CraftSequence sequence;
+  private static JsonObject[] stageReceipts;
+  private static boolean awaitingReceipt;
+  private static int batch, batchRemaining;
   private static boolean invalidated;
   private static String beginRefusalReason;
   private static VisibleInventory session;
@@ -30,8 +33,111 @@ public final class Recipes {
   private static ItemStack output, carried;
   private static long outputWait;
 
-  public static int expectedGain() {
-    return expectedGain;
+  public static int totalExecutions(JsonObject action) {
+    if (!action.has("sequence")) return action.get("executions").getAsBigDecimal().intValueExact();
+    int total = 0;
+    for (JsonElement stage : action.getAsJsonArray("sequence"))
+      total = Math.addExact(total, stage.getAsJsonObject().get("executions").getAsBigDecimal().intValueExact());
+    return total;
+  }
+
+  private static CraftSequence parseSequence(JsonObject action) {
+    List<CraftSequence.Stage> stages = new ArrayList<>();
+    if (action.has("sequence")) {
+      if (action.has("item") || action.has("executions")) throw new IllegalArgumentException("Ambiguous craft form");
+      JsonArray ordered = action.getAsJsonArray("sequence");
+      if (ordered.isEmpty() || ordered.size() > 8) throw new IllegalArgumentException("Unbounded craft sequence");
+      for (JsonElement value : ordered) {
+        JsonObject stage = value.getAsJsonObject();
+        if (stage.size() != 2) throw new IllegalArgumentException("Unexpected craft stage field");
+        stages.add(new CraftSequence.Stage(stage.get("item").getAsString(), stage.get("executions").getAsBigDecimal().intValueExact()));
+      }
+    } else stages.add(new CraftSequence.Stage(action.get("item").getAsString(), action.get("executions").getAsBigDecimal().intValueExact()));
+    return new CraftSequence(stages);
+  }
+
+  private static boolean selectStage(MinecraftClient c) {
+    active = null;
+    remaining = sequence.current().executions();
+    phase = 0;
+    boolean matchingOutput = false;
+    var context = SlotDisplayContexts.createParameters(c.world);
+    for (var entry : entries(c)) {
+      var result = entry.display().result().getFirst(context);
+      if (result.isEmpty() || !Registries.ITEM.getId(result.getItem()).getPath().equals(sequence.current().item())) continue;
+      matchingOutput = true;
+      boolean fits = entry.display() instanceof ShapedCraftingRecipeDisplay shaped
+          ? shaped.width() <= (table ? 3 : 2) && shaped.height() <= (table ? 3 : 2)
+          : entry.display() instanceof ShapelessCraftingRecipeDisplay shapeless
+              && shapeless.ingredients().size() <= (table ? 9 : 4);
+      if (!fits) continue;
+      active = entry; output = result.copy();
+      sequence.setOutputCount(output.getCount());
+      return true;
+    }
+    beginRefusalReason = matchingOutput
+        ? "Unlocked recipe output matches, but its display does not fit the selected crafting grid"
+        : "No unlocked recipe display matches the exact output item";
+    return false;
+  }
+
+  public static boolean awaitingReceipt() { return awaitingReceipt; }
+  public static boolean needsReceipt() {
+    return sequence != null && !sequence.stopped() && !sequence.complete()
+        && stageReceipts[sequence.index()] == null;
+  }
+
+  /** The native motor owns request nonce/generation; never advance on client prediction. */
+  public static void receipt(MinecraftClient c, JsonObject before, JsonObject after, String receiptRef) {
+    int index = sequence.index();
+    if (index >= sequence.stages().size() || stageReceipts[index] != null) return;
+    String item = sequence.current().item();
+    JsonObject counts = after.getAsJsonObject("counts");
+    int gain = (counts.has(item) ? counts.get(item).getAsInt() : 0) - (before.has(item) ? before.get(item).getAsInt() : 0);
+    boolean clean = after.get("cursor_count").getAsInt() == 0 && after.get("crafting_grid_count").getAsInt() == 0
+        && session != null && session.handler() != null
+        && after.get("screen_sync_id").getAsInt() ==
+            (session.closed() ? c.player.playerScreenHandler.syncId : session.handler().syncId);
+    boolean advanced = sequence.confirm(gain, clean);
+    JsonObject stage = stageEvidence(index);
+    stage.addProperty("inventory_receipt_confirmed", true);
+    stage.addProperty("inventory_custody_confirmed", clean);
+    stage.addProperty("receipt_ref", receiptRef);
+    stage.add("inventory_before", before.deepCopy()); stage.add("inventory_after", counts.deepCopy());
+    stage.addProperty("cursor_count", after.get("cursor_count").getAsInt());
+    stage.addProperty("grid_count", after.get("crafting_grid_count").getAsInt());
+    stageReceipts[index] = stage;
+    awaitingReceipt = false;
+    if (invalidated || !advanced) {
+      sequence.stop();
+      if (!invalidated) fail("craft_stage_server_receipt_mismatch");
+      return;
+    }
+    if (sequence.complete()) {
+      session.close();
+      if (session.failed()) invalidated = true;
+    } else if (!selectStage(c)) fail(beginRefusalReason);
+  }
+
+  private static JsonObject stageEvidence(int index) {
+    JsonObject stage = new JsonObject();
+    var requested = sequence.stages().get(index);
+    stage.addProperty("stage_index", index); stage.addProperty("item", requested.item());
+    stage.addProperty("executions", requested.executions());
+    stage.addProperty("output_per_execution", sequence.outputCount(index));
+    stage.addProperty("completed_executions", sequence.completed(index));
+    stage.addProperty("confirmed_executions", sequence.confirmed(index));
+    stage.addProperty("status", sequence.confirmed(index) == requested.executions() ? "succeeded"
+        : sequence.confirmed(index) > 0 ? "partial" : index > sequence.index() ? "not_started" : "unknown");
+    stage.addProperty("inventory_receipt_confirmed", false);
+    return stage;
+  }
+
+  public static JsonArray stageEvidence() {
+    JsonArray values = new JsonArray();
+    if (sequence != null) for (int i = 0; i < sequence.stages().size(); i++)
+      values.add(stageReceipts[i] == null ? stageEvidence(i) : stageReceipts[i].deepCopy());
+    return values;
   }
 
   public static String beginRefusalReason() {
@@ -91,40 +197,15 @@ public final class Recipes {
     session = null;
     invalidated = false;
     beginRefusalReason = null;
-    phase = 0;
-    remaining = action.get("executions").getAsInt();
     table = action.has("table");
-    if (remaining < 1 || remaining > 16) {
-      beginRefusalReason = "Craft executions must be between 1 and 16";
+    awaitingReceipt = false;
+    try { sequence = parseSequence(action); }
+    catch (RuntimeException error) {
+      beginRefusalReason = "Invalid bounded craft sequence: " + error.getMessage();
       return false;
     }
-    boolean matchingOutput = false;
-    var context = SlotDisplayContexts.createParameters(c.world);
-    for (var entry : entries(c)) {
-      var output = entry.display().result().getFirst(context);
-      if (output.isEmpty()
-          || !Registries.ITEM
-              .getId(output.getItem())
-              .getPath()
-              .equals(action.get("item").getAsString())) continue;
-      matchingOutput = true;
-      boolean fits =
-          entry.display() instanceof ShapedCraftingRecipeDisplay shaped
-              ? shaped.width() <= 2 && shaped.height() <= 2
-              : entry.display() instanceof ShapelessCraftingRecipeDisplay shapeless
-                  && shapeless.ingredients().size() <= 4;
-      if (!fits && !table) continue;
-      active = entry;
-      Recipes.output = output.copy();
-      expectedGain = output.getCount() * remaining;
-      break;
-    }
-    if (active == null) {
-      beginRefusalReason = matchingOutput
-          ? "Unlocked recipe output matches, but no matching display fits the 2x2 inventory grid and no crafting table was supplied"
-          : "No unlocked recipe display matches the exact output item";
-      return false;
-    }
+    stageReceipts = new JsonObject[sequence.stages().size()];
+    if (!selectStage(c)) return false;
     session = new VisibleInventory(c, table, authorized);
     if (table) {
       BlockPos pos = selectedTable;
@@ -160,7 +241,7 @@ public final class Recipes {
   }
 
   public static boolean complete() {
-    return !invalidated && active == null && remaining == 0 && session != null && session.closed();
+    return !invalidated && sequence != null && sequence.complete() && session != null && session.closed();
   }
   /** After the requested table opens, exact handler identity owns the transfer.
    * Vanilla may send a same-state block update for the interaction; that still
@@ -175,9 +256,12 @@ public final class Recipes {
 
   public static void cancel(boolean trustedCleanup) {
     if (session != null) session.cancel(trustedCleanup);
+    if (sequence != null && !sequence.complete()) sequence.stop();
     active = null;
     remaining = 0;
     session = null;
+    sequence = null;
+    stageReceipts = null;
   }
 
   public static void tick(MinecraftClient c) {
@@ -209,14 +293,14 @@ public final class Recipes {
         carried = group.stack();
         carriedCount = carried.getCount();
         placement = 0;
-        if (carriedCount < group.grids().length
+        if (carriedCount < group.grids().length * batch
             || !ItemStack.areEqual(handler.getSlot(source).getStack(), carried)
             || !handler.getSlot(source).canTakeItems(c.player)) {
           session.fail("ingredient_source_changed"); invalidated = true; return;
         }
         for (int grid : group.grids())
           if (!handler.getSlot(grid).canInsert(carried)
-              || handler.getSlot(grid).getMaxItemCount(carried) < 1) {
+              || handler.getSlot(grid).getMaxItemCount(carried) < batch) {
             fail("ingredient_grid_changed"); return;
           }
         session.beginIngredientGroup(source);
@@ -239,8 +323,8 @@ public final class Recipes {
           fail("ingredient_distribution_not_confirmed"); return;
         }
         placement++;
-        if (placement < groups[ingredient].grids().length) {
-          if (!session.click(groups[ingredient].grids()[placement], 1, VisibleInventory.Gesture.DISTRIBUTE))
+        if (placement < groups[ingredient].grids().length * batch) {
+          if (!session.click(groups[ingredient].grids()[placement / batch], 1, VisibleInventory.Gesture.DISTRIBUTE))
             fail("ingredient_distribution_not_started");
           return;
         }
@@ -278,6 +362,11 @@ public final class Recipes {
       }
       case 6 -> {
         if (!cursor.isEmpty()) { fail("craft_output_cursor_not_deposited"); return; }
+        sequence.deposited();
+        remaining--; batchRemaining--;
+        if (remaining > 0 && batchRemaining > 0 && loadedBatchMatches(handler)) {
+          phase = 4; outputWait = System.nanoTime(); return;
+        }
         remainder = 1; phase = 7;
       }
       case 7 -> {
@@ -285,11 +374,9 @@ public final class Recipes {
         while (remainder <= gridSize && handler.getSlot(remainder).getStack().isEmpty()) remainder++;
         if (remainder > gridSize) {
           if (!session.clean()) { fail("craft_grid_custody_not_clean"); return; }
-          remaining--;
           if (remaining == 0) {
-            session.close();
-            if (session.failed()) { invalidated = true; return; }
             active = null;
+            awaitingReceipt = true;
           }
           else phase = 0;
           return;
@@ -326,10 +413,17 @@ public final class Recipes {
   private static boolean ingredientsMatch(ScreenHandler handler, int placed) {
     for (int i = 0; i < groups.length; i++) {
       IngredientGroup group = groups[i];
-      for (int j = 0; j < group.grids().length; j++)
-        if (!stackMatches(handler.getSlot(group.grids()[j]).getStack(), group.stack(),
-            i < ingredient || i == ingredient && j < placed ? 1 : 0)) return false;
+      for (int j = 0; j < group.grids().length; j++) {
+        int count = i < ingredient ? batch : i == ingredient ? Math.clamp(placed - j * batch, 0, batch) : 0;
+        if (!stackMatches(handler.getSlot(group.grids()[j]).getStack(), group.stack(), count)) return false;
+      }
     }
+    return true;
+  }
+
+  private static boolean loadedBatchMatches(ScreenHandler handler) {
+    for (IngredientGroup group : groups) for (int grid : group.grids())
+      if (!stackMatches(handler.getSlot(grid).getStack(), group.stack(), batchRemaining)) return false;
     return true;
   }
 
@@ -341,6 +435,15 @@ public final class Recipes {
 
   /** Ingredient alternatives are only the already-disclosed unlocked recipe display data. */
   private static String plan(MinecraftClient c) {
+    for (int count = remaining; count >= 1; count--) {
+      String refusal = plan(c, count);
+      if (refusal == null) { batch = count; batchRemaining = count; return null; }
+      if (count == 1) return refusal;
+    }
+    return "craft_ingredients_unavailable";
+  }
+
+  private static String plan(MinecraftClient c, int count) {
     var context = SlotDisplayContexts.createParameters(c.world);
     List<SlotDisplay> ingredients;
     int width;
@@ -358,7 +461,7 @@ public final class Recipes {
       int sourceSlot = -1;
       for (Slot slot : handler.slots) {
         if (slot.inventory != c.player.getInventory() || slot.getIndex() >= 36
-            || slot.getStack().getCount() <= reserved[slot.id] || !slot.canTakeItems(c.player)) continue;
+            || slot.getStack().getCount() - reserved[slot.id] < count || !slot.canTakeItems(c.player)) continue;
         for (ItemStack alternative : alternatives)
           // Vanilla Ingredient tests registry item membership, not components.
           // Custody below still pins the actual source stack's exact components.
@@ -366,9 +469,13 @@ public final class Recipes {
         if (sourceSlot >= 0) break;
       }
       if (sourceSlot < 0) return "craft_ingredients_unavailable";
-      reserved[sourceSlot]++;
-      selected.computeIfAbsent(sourceSlot, ignored -> new ArrayList<>())
-          .add(1 + i % width + i / width * (table ? 3 : 2));
+      int grid = 1 + i % width + i / width * (table ? 3 : 2);
+      ItemStack sourceStack = handler.getSlot(sourceSlot).getStack();
+      if (!handler.getSlot(grid).canInsert(sourceStack) || handler.getSlot(grid).getMaxItemCount(sourceStack) < count)
+        return "craft_ingredient_grid_capacity";
+      reserved[sourceSlot] += count;
+      List<Integer> cells = selected.computeIfAbsent(sourceSlot, ignored -> new ArrayList<>());
+      cells.add(grid);
     }
     groups = new IngredientGroup[selected.size()];
     int index = 0;

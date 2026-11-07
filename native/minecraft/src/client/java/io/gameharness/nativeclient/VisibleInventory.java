@@ -59,6 +59,7 @@ public final class VisibleInventory {
   private JsonObject gestureEvent;
   private int gestureAttempts, ingredientGroup, groupSource = -1, resizeRetargets;
   private int originX, originY;
+  private int screenBindings, screenCloses;
   private boolean failed, closed, emitted;
   private boolean releaseTransfers;
   private String reason;
@@ -93,6 +94,7 @@ public final class VisibleInventory {
     } else if (!(client.currentScreen instanceof InventoryScreen)
         || !(client.player.currentScreenHandler instanceof PlayerScreenHandler)) return false;
     screen = (HandledScreen<?>) client.currentScreen;
+    screenBindings++;
     handler = client.player.currentScreenHandler;
     if (screen.getScreenHandler() != handler) { fail("screen_handler_mismatch"); return false; }
     fence = new InventoryGestureFence(screen, handler, handler.syncId);
@@ -313,6 +315,7 @@ public final class VisibleInventory {
     fence.revoke();
     revokeGesture();
     client.player.closeHandledScreen();
+    screenCloses++;
     closed = true;
     if (active == this) active = null;
   }
@@ -348,6 +351,7 @@ public final class VisibleInventory {
         && fence != null && fence.cleanupOwns(client.currentScreen, client.player.currentScreenHandler,
             client.player.currentScreenHandler.syncId)) {
       client.player.closeHandledScreen();
+      screenCloses++;
       closed = true;
     }
   }
@@ -355,6 +359,7 @@ public final class VisibleInventory {
   public JsonObject diagnostics() {
     JsonObject value = new JsonObject();
     value.addProperty("gestures", gestures); value.addProperty("phase", phase);
+    value.addProperty("screen_bindings", screenBindings); value.addProperty("screen_closes", screenCloses);
     value.addProperty("cursor_count", handler == null ? 0 : handler.getCursorStack().getCount());
     value.addProperty("grid_count", gridCount()); value.addProperty("closed", closed);
     value.addProperty("failed", failed); value.addProperty("held", fence != null && fence.held());

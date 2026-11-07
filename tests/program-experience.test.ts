@@ -289,6 +289,35 @@ for (const producer of ["crafting", "trading", "anvil"] as const) {
   });
 }
 
+for (const validReceipt of [true, false]) {
+  test(`craft-sequence qualification ${validReceipt ? "credits confirmed stages" : "rejects mismatched stage quantities"}`, async () => {
+    const { store, library, run, manager } = fixture();
+    run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!; store.saveRun(run);
+    const owner = execution(store, run, await authored(manager, run));
+    const stage = (stage_index: number, item: string, executions: number, output_per_execution: number,
+      inventory_before: Record<string, number>, inventory_after: Record<string, number>) => ({
+      stage_index, item, executions, output_per_execution, completed_executions: executions, confirmed_executions: executions,
+      status: "succeeded", inventory_receipt_confirmed: true, inventory_custody_confirmed: true,
+      cursor_count: 0, grid_count: 0, receipt_ref: `server:craft:${stage_index}`, inventory_before, inventory_after,
+    });
+    const crafted = action(store, run, owner, { effect_confirmed: true, inventory_receipt_confirmed: true,
+      inventory_before: { oak_log: 2 }, inventory_after: { oak_planks: 4, crafting_table: 1 },
+      craft_stages: [
+        stage(0, "oak_planks", 2, 4, { oak_log: 2 }, { oak_planks: 8 }),
+        stage(1, "crafting_table", 1, 1, { oak_planks: 8 }, { oak_planks: 4, crafting_table: validReceipt ? 1 : 2 }),
+      ] }, { kind: "craft", sequence: [{ item: "oak_planks", executions: 2 }, { item: "crafting_table", executions: 1 }] });
+    const event = store.event(run.run_id, "goal.verified", "Trusted verifier fixture", {
+      status: "verified", adapter_id: run.goal.adapter_id, verifier_id: run.goal.verifier!.id, verifier_version: run.goal.verifier!.version,
+    });
+    finish(store, owner);
+    const promote = () => library.promote(store, run.run_id, owner, "Confirmed recipe sequence", {
+      portability: "portable", retained_world_data: false, predicate: { kind: "goal_verified", event_seq: event.event_seq },
+    });
+    if (validReceipt) expect(promote().evidence.action_ids).toEqual([crafted.action_id]);
+    else expect(promote).toThrow();
+  });
+}
+
 test("confirmed GUI transfer qualifies inventory gain without being relabelled as helper production", async () => {
   const { store, library, run, manager } = fixture(), owner = execution(store, run, await authored(manager, run));
   const transfer = action(store, run, owner, { effect_confirmed: true, gui_transactions: [{

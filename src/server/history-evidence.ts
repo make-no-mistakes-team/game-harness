@@ -1,7 +1,7 @@
 import type { ActivityEvent, Json } from "../shared/contracts.ts";
 import type { SkillExecutionView } from "../shared/programs.ts";
 import { programCompatibilitySchema } from "../shared/adapter.ts";
-import { confirmedMinecraftGuiTransactions } from "../shared/minecraft.ts";
+import { confirmedMinecraftCraftStages, confirmedMinecraftGuiTransactions } from "../shared/minecraft.ts";
 import { verificationResultSchema } from "../shared/validation.ts";
 import {
   currentGoalLinks,
@@ -213,6 +213,10 @@ function qualifyAction(draft: ProjectionDraft, id: string): boolean {
     terminal &&
     (whole ||
       confirmedMinecraftGuiTransactions(
+        action.request,
+        action.view.result?.evidence,
+      ).length ||
+      confirmedMinecraftCraftStages(
         action.request,
         action.view.result?.evidence,
       ).length)
@@ -648,6 +652,12 @@ function goalContext(draft: ProjectionDraft, key: string): GoalContext {
     }
     const actionIds = new Set<string>();
     if (typeof body?.receipt_ref === "string") actionIds.add(body.receipt_ref);
+    if (schema?.id === "minecraft_item_production_v1") {
+      // Discover the explicit adapter stage identity, never a native receipt nonce.
+      // currentGoalLinks validates the action's ordered prefix, exact payload and scope.
+      const suffix = /:craft:[0-7]:production$/.exec(id)?.[0];
+      if (suffix) actionIds.add(id.slice(0, -suffix.length));
+    }
     if (
       schema?.id === "minecraft_gui_transaction_v1" &&
       typeof body?.operation_index === "number"

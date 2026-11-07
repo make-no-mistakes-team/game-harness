@@ -57,6 +57,14 @@ tasks.register('nativeContractProof', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'io.gameharness.nativeclient.ContractProof'
 }
+tasks.register('nativeCraftProof', JavaExec) {
+    group = 'verification'
+    description = 'Runs bounded ordered crafting quantity, receipt and partial-stop proofs.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'io.gameharness.nativeclient.CraftSequenceProof'
+}
 tasks.named('check') {
-    dependsOn tasks.named('nativeBoundaryProof'), tasks.named('nativeMotorProof'), tasks.named('nativeContractProof')
+    dependsOn tasks.named('nativeBoundaryProof'), tasks.named('nativeMotorProof'),
+        tasks.named('nativeContractProof'), tasks.named('nativeCraftProof')
 }

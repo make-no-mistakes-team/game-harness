@@ -30,6 +30,7 @@ import {
 } from "../src/server/program-evidence.ts";
 import { readProjectedProgramEvidence } from "../src/server/history-evidence.ts";
 import { objectiveMetrics } from "../src/server/objective-metrics.ts";
+import { actionMetrics } from "../src/evaluation/results.ts";
 import { observationEvidence } from "../src/server/adapter-evidence.ts";
 import { retainResidentReceipt } from "../src/server/resident-evidence.ts";
 import { ProgramWorkspace } from "../src/server/program-workspace.ts";
@@ -1748,6 +1749,199 @@ const residentUpdate: ControllerEffectUpdate = {
     },
   },
 };
+function craftStage(
+  stage_index: number,
+  item: string,
+  executions: number,
+  output_per_execution: number,
+  inventory_before: Record<string, number>,
+  inventory_after: Record<string, number>,
+  completed_executions = executions,
+) {
+  return {
+    stage_index, item, executions, output_per_execution, completed_executions,
+    confirmed_executions: completed_executions,
+    status: completed_executions === executions ? "succeeded" : "partial",
+    inventory_receipt_confirmed: true, inventory_custody_confirmed: true,
+    cursor_count: 0, grid_count: 0,
+    receipt_ref: `native-operation:craft:nonce-${stage_index}`,
+    inventory_before, inventory_after,
+  };
+}
+for (const product of ["crafting_table", "stone_pickaxe", "iron_pickaxe"]) {
+  test(`native single-stage ${product} production links its enclosing action`, async () => {
+    const goalId = product === "crafting_table" ? "craft_crafting_table" : `craft_${product}`;
+    const f = new EvidenceFixture(goalId),
+      owner = f.admit(await f.authored());
+    const request: GameAction = { kind: "craft", item: product, executions: 1 };
+    const receipt = f.action(owner, {
+      effect_confirmed: true,
+      craft_stages: [craftStage(0, product, 1, 1, {}, { [product]: 1 })],
+    }, 10, request);
+    const facts = f.effects(owner, receipt, request),
+      read = f.possession(owner, { [product]: 1 }),
+      goal = f.verdict([...facts, read]);
+    f.close(owner);
+    await f.prepare();
+    const projected = measured(await f.published(), owner);
+    expect(projected).toMatchObject({
+      evidence_status: "verified_goal", confirmed_effects: 1,
+      goal_associations: [directLink(goal.event_seq, receipt)],
+      verified_event_seqs: [goal.event_seq],
+    });
+    expect(projected.metrics.inventory_delta).toEqual({ [product]: 1 });
+    expect(projected.metrics.inventory_receipts).toBe(1);
+  });
+}
+for (const interrupted of [false, true]) {
+  test(`native combined craft ${interrupted ? "unknown prefix" : "full sequence"} retains consumed intermediate production`, async () => {
+    const f = new EvidenceFixture("collect_and_craft_table"),
+      owner = f.admit(await f.authored());
+    const request: GameAction = {
+      kind: "craft", sequence: [
+        { item: "oak_planks", executions: 1 },
+        { item: "crafting_table", executions: 1 },
+        ...(interrupted ? [{ item: "stick", executions: 1 }] : []),
+      ],
+    };
+    const stages = [
+      craftStage(0, "oak_planks", 1, 4, { oak_log: 1 }, { oak_planks: 4 }),
+      craftStage(1, "crafting_table", 1, 1, { oak_planks: 4 }, { crafting_table: 1 }),
+    ];
+    const receipt = f.action(owner, {
+      effect_confirmed: !interrupted, craft_stages: stages,
+      ...(!interrupted ? {
+        inventory_receipt_confirmed: true,
+        inventory_before: { oak_log: 1 }, inventory_after: { crafting_table: 1 },
+      } : {}),
+    }, 10, request, interrupted ? "unknown" : "succeeded");
+    const facts = f.effects(owner, receipt, request),
+      read = f.possession(owner, { crafting_table: 1 }),
+      goal = f.verdict([...facts, read]);
+    f.close(owner);
+    await f.prepare();
+    const original = measured(await f.published(), owner);
+    expect(original).toMatchObject({
+      status: "unknown", confirmed_effects: interrupted ? 0 : 1,
+      evidence_status: "verified_goal",
+      goal_associations: [directLink(goal.event_seq, receipt)],
+      verified_event_seqs: [goal.event_seq],
+    });
+    expect(original.metrics.inventory_delta).toEqual({ oak_log: -1, oak_planks: 0, crafting_table: 1 });
+    expect(original.metrics.inventory_receipts).toBe(1);
+    expect(actionMetrics([{ request, view: receipt }])).toMatchObject({
+      count: 1, inventory_receipts: 1,
+      inventory_delta: { oak_log: -1, oak_planks: 0, crafting_table: 1 },
+      uncertain_outcomes: interrupted ? 1 : 0,
+    });
+    await f.reopen();
+    receipt.result!.evidence = { effect_confirmed: !interrupted, craft_stages: [] };
+    at(50, () => f.store.saveAction(f.run.run_id, receipt));
+    await f.prepare();
+    const changed = measured(await f.published(), owner);
+    expect(changed).toMatchObject({
+      status: "unknown", confirmed_effects: interrupted ? 0 : 1,
+      evidence_status: interrupted ? "unknown" : "confirmed_effects",
+      goal_associations: [], verified_event_seqs: [],
+    });
+    expect(changed.metrics.inventory_delta).toEqual({});
+    expect(changed.metrics.inventory_receipts).toBe(0);
+    await f.reopen();
+    expect(measured(await f.published(), owner)).toEqual(changed);
+  });
+}
+for (const partialStage of [false, true]) {
+  test(`native ${partialStage ? "partially completed stage" : "completed first stage"} credits no unknown suffix`, async () => {
+    const f = new EvidenceFixture(),
+      owner = f.admit(await f.authored());
+    const request: GameAction = { kind: "craft", sequence: [
+      { item: "oak_planks", executions: partialStage ? 3 : 2 },
+      { item: "stick", executions: 1 },
+    ] };
+    const receipt = f.action(owner, {
+      effect_confirmed: false,
+      craft_stages: [
+        craftStage(0, "oak_planks", partialStage ? 3 : 2, 4, { oak_log: 3 }, { oak_log: 1, oak_planks: 8 }, 2),
+        ...(partialStage ? [{ stage_index: 1, item: "stick", inventory_after: { stick: 999 } }] : []),
+      ],
+      ...(partialStage ? {
+        inventory_receipt_confirmed: true,
+        inventory_before: { oak_log: 3 }, inventory_after: { stick: 999 },
+      } : {}),
+    }, 10, request, "unknown");
+    f.close(owner);
+    await f.prepare();
+    const projected = measured(await f.published(), owner);
+    expect(projected.confirmed_effects).toBe(0);
+    expect(projected.metrics.inventory_delta).toEqual({ oak_log: -2, oak_planks: 8 });
+    expect(projected.metrics.inventory_receipts).toBe(1);
+    expect(actionMetrics([{ request, view: receipt }])).toMatchObject({
+      count: 1, confirmed_effects: 0, inventory_receipts: 1,
+      inventory_delta: { oak_log: -2, oak_planks: 8 }, uncertain_outcomes: 1,
+    });
+  });
+}
+test("native final partial stage production links without confirming uncompleted executions", async () => {
+  const f = new EvidenceFixture("craft_crafting_table"),
+    owner = f.admit(await f.authored());
+  const request: GameAction = { kind: "craft", item: "crafting_table", executions: 2 };
+  const receipt = f.action(owner, {
+    effect_confirmed: false,
+    craft_stages: [craftStage(0, "crafting_table", 2, 1, { oak_planks: 8 }, { oak_planks: 4, crafting_table: 1 }, 1)],
+  }, 10, request, "unknown");
+  const facts = f.effects(owner, receipt, request),
+    read = f.possession(owner, { oak_planks: 4, crafting_table: 1 }),
+    goal = f.verdict([...facts, read]);
+  f.close(owner);
+  await f.prepare();
+  const projected = measured(await f.published(), owner);
+  expect(projected).toMatchObject({
+    status: "unknown", confirmed_effects: 0, evidence_status: "verified_goal",
+    goal_associations: [directLink(goal.event_seq, receipt)],
+    verified_event_seqs: [goal.event_seq],
+  });
+  expect(projected.metrics.inventory_delta).toEqual({ oak_planks: -4, crafting_table: 1 });
+  expect(projected.metrics.inventory_receipts).toBe(1);
+});
+for (const mutation of ["receipt", "scope", "payload", "stage identity", "order", "custody"] as const) {
+  test(`native stage association rejects mismatched ${mutation}`, async () => {
+    const f = new EvidenceFixture("craft_crafting_table"),
+      owner = f.admit(await f.authored());
+    const request: GameAction = { kind: "craft", sequence: [
+      { item: "oak_planks", executions: 1 }, { item: "crafting_table", executions: 1 },
+    ] };
+    const stages = [
+      craftStage(0, "oak_planks", 1, 4, { oak_log: 1 }, { oak_planks: 4 }),
+      craftStage(1, "crafting_table", 1, 1, { oak_planks: 4 }, { crafting_table: 1 }),
+    ];
+    const receipt = f.action(owner, { effect_confirmed: false, craft_stages: stages }, 10, request, "unknown");
+    const facts = f.effects(owner, receipt, request, false);
+    const production = facts.find(fact => fact.evidence_id.endsWith(":craft:1:production"))!;
+    if (mutation === "receipt") (production.data as Record<string, Json>).receipt_ref = "foreign-receipt";
+    if (mutation === "scope") production.scope.source_hash = sha256("foreign source");
+    if (mutation === "payload") (production.data as Record<string, Json>).inventory_before = { oak_planks: 5 };
+    if (mutation === "stage identity") production.evidence_id = `${receipt.action_id}:craft:0:production`;
+    for (const fact of facts)
+      at(11, () => f.store.event(f.run.run_id, "adapter.evidence", "Retained stage fixture", jsonSchema.parse(fact)));
+    const read = f.possession(owner, { crafting_table: 1 });
+    f.verdict([...facts, read]);
+    if (mutation === "order" || mutation === "custody") {
+      receipt.result!.evidence = {
+        effect_confirmed: false,
+        craft_stages: mutation === "order"
+          ? [stages[1]!, stages[0]!]
+          : [stages[0]!, { ...stages[1]!, cursor_count: 1 }],
+      };
+      at(35, () => f.store.saveAction(f.run.run_id, receipt));
+    }
+    f.close(owner);
+    await f.prepare();
+    expect(measured(await f.published(), owner)).toMatchObject({
+      status: "unknown", confirmed_effects: 0, evidence_status: "unknown",
+      goal_associations: [], verified_event_seqs: [],
+    });
+  });
+}
 for (const reopenBefore of [false, true]) {
   for (const duplicate of ["qualifying", "unqualified source"] as const) {
     test(`resident ${duplicate} duplicate does not invent finite actions (reopen=${reopenBefore})`, async () => {

@@ -45,6 +45,7 @@ export type MinecraftAction =
   | { kind: "dig"; target: TargetRef }
   | { kind: "place"; target: TargetRef; face: "up" | "down" | "north" | "south" | "east" | "west"; item: string }
   | { kind: "craft"; item: string; executions: number; table?: TargetRef }
+  | { kind: "craft"; sequence: { item: string; executions: number }[]; table?: TargetRef }
   | { kind: "equip"; item: string; destination: "hand" | "off-hand" | "head" | "torso" | "legs" | "feet" }
   | { kind: "interact"; target: TargetRef }
   | { kind: "attack"; target: TargetRef }
@@ -100,7 +101,10 @@ export const minecraftNavigationGazeSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("target"), target: targetRefSchema }).strict(),
   z.object({ kind: z.literal("free"), yaw, pitch }).strict(),
 ]);
-export const minecraftActionSchema = z.discriminatedUnion("kind", [
+const craftStage = z.object({ item: recipeOutputItem, executions: z.number().int().min(1).max(16)
+  .describe("Recipe executions/ingredient consumptions, not output items; multiply by the recipe output count.") }).strict();
+const craftDescription = "Visible unlocked-recipe helper. Model selects exact outputs, execution counts, explicit order and optional fresh reachable table for the whole session. Uses one owned inventory/table screen, places bounded ingredient batches without overcrafting, and stops on the first refusal or uncertain outcome. Per-stage server receipts retain actual partial production and cursor/grid custody. No implicit retry. At most 16 total executions; native bound 10 seconds + 35 seconds per execution, still limited by the owning program.";
+export const minecraftActionSchema = z.union([
   z.object({ kind: z.literal("move"), controls: z.object({ forward: z.boolean().optional(), back: z.boolean().optional(),
     left: z.boolean().optional(), right: z.boolean().optional(), jump: z.boolean().optional(), sprint: z.boolean().optional(),
     sneak: z.boolean().optional() }).strict(), duration_ms: z.number().int().min(50).max(2000), look: look.optional(),
@@ -111,10 +115,6 @@ export const minecraftActionSchema = z.discriminatedUnion("kind", [
     .describe("Stationary mining helper; does not move toward its target. Native preflight requires a current visible block, eye-to-centre distance at most 5 blocks and clear interaction line of sight. The observation radius is not mining reach. Passing preflight is not server-confirmed removal; inspect the actual result and fresh state."),
   z.object({ kind: z.literal("place"), target: targetRefSchema, face: z.enum(["up", "down", "north", "south", "east", "west"]), item: itemName }).strict()
     .describe("Place using a fresh support target and face; implicit equipment uses the same visible native inventory controller. Bounded native session up to 20 seconds, still limited by the owning program budget."),
-  z.object({ kind: z.literal("craft"), item: recipeOutputItem, executions: z.number().int().min(1).max(16)
-    .describe("Required number of recipe executions, not the number of output items. Each execution yields the recipe's output count."),
-    table: targetRefSchema.optional() }).strict()
-    .describe("Visible native crafting helper: selects a synchronized unlocked recipe matching the exact output item, then manually uses the 2x2 inventory grid or a fresh reachable 3x3 table. Missing helper recipe access does not prove that ordinary manual crafting is impossible. One owned session places ingredients, retrieves output and clears custody. Native bound 10 seconds + 35 seconds per execution; owning program limits still apply."),
   z.object({ kind: z.literal("equip"), item: itemName, destination: z.enum(["hand", "off-hand", "head", "torso", "legs", "feet"]) }).strict()
     .describe("Select an existing hotbar item directly or visibly transfer equipment through the native inventory. Bounded native session up to 12 seconds; owning program limits still apply."),
   z.object({ kind: z.literal("interact"), target: targetRefSchema }).strict()
@@ -129,6 +129,11 @@ export const minecraftActionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("respawn") }).strict(),
   worldInputActionSchema,
   screenInputActionSchema,
+  z.object({ kind: z.literal("craft"), ...craftStage.shape, table: targetRefSchema.optional() }).strict()
+  .describe(craftDescription),
+  z.object({ kind: z.literal("craft"), sequence: z.array(craftStage).min(1).max(8), table: targetRefSchema.optional() }).strict()
+    .refine(action => action.sequence.reduce((total, stage) => total + stage.executions, 0) <= 16,
+      { message: "Craft sequence exceeds 16 total recipe executions" }).describe(craftDescription),
 ]) satisfies z.ZodType<MinecraftAction>;
 export const minecraftRecipesRequestSchema = z.object({ item: recipeOutputItem }).strict();
 export const minecraftVisibleScreenRequestSchema = z.object({}).strict()
@@ -326,6 +331,42 @@ export const minecraftProductionFactSchema = z.object({
   mechanism: z.literal("helper"), input_application: z.literal("confirmed"), effect_status: z.literal("confirmed"),
   inventory_before: inventoryCountsSchema, inventory_after: inventoryCountsSchema, receipt_ref: identitySchema,
 }).strict();
+const craftReceiptSchema = z.object({
+  stage_index: z.number().int().min(0).max(7), item: itemName, executions: z.number().int().min(1).max(16),
+  output_per_execution: z.number().int().min(1).max(64), completed_executions: z.number().int().min(1).max(16),
+  confirmed_executions: z.number().int().min(1).max(16), status: z.enum(["succeeded", "partial"]),
+  inventory_receipt_confirmed: z.literal(true), inventory_custody_confirmed: z.literal(true),
+  cursor_count: z.literal(0), grid_count: z.literal(0), receipt_ref: identitySchema,
+  inventory_before: inventoryCountsSchema.refine(value => Object.keys(value).length <= 64),
+  inventory_after: inventoryCountsSchema.refine(value => Object.keys(value).length <= 64),
+}).strict();
+/** Only the actual ordered server-confirmed prefix, including a final partial stage. */
+export function confirmedMinecraftCraftStages(action: unknown, evidence: unknown) {
+  const request = minecraftActionSchema.safeParse(action);
+  const confirmed: z.infer<typeof craftReceiptSchema>[] = [];
+  if (!request.success || request.data.kind !== "craft" || evidence === null || typeof evidence !== "object" ||
+    !("craft_stages" in evidence) || !Array.isArray(evidence.craft_stages)) return confirmed;
+  const requested = "sequence" in request.data ? request.data.sequence : [request.data];
+  if (evidence.craft_stages.length > requested.length) return confirmed;
+  const receipts = new Set<string>();
+  let previousAfter: Record<string, number> | null = null;
+  for (let index = 0; index < evidence.craft_stages.length; index++) {
+    const parsed = craftReceiptSchema.safeParse(evidence.craft_stages[index]), selected = requested[index]!;
+    if (!parsed.success) break;
+    const stage = parsed.data;
+    const actual = (stage.inventory_after[stage.item] ?? 0) - (stage.inventory_before[stage.item] ?? 0);
+    if (stage.stage_index !== index || stage.item !== selected.item || stage.executions !== selected.executions ||
+      stage.completed_executions > selected.executions || stage.confirmed_executions !== stage.completed_executions ||
+      actual !== stage.confirmed_executions * stage.output_per_execution || receipts.has(stage.receipt_ref) ||
+      (stage.status === "succeeded") !== (stage.confirmed_executions === selected.executions) ||
+      previousAfter !== null && (Object.keys(previousAfter).length !== Object.keys(stage.inventory_before).length ||
+        Object.keys(previousAfter).some(item => previousAfter![item] !== stage.inventory_before[item]))) break;
+    receipts.add(stage.receipt_ref); confirmed.push(stage);
+    if (stage.status !== "succeeded") break;
+    previousAfter = stage.inventory_after;
+  }
+  return confirmed;
+}
 export const minecraftBlockRemovalFactSchema = z.object({
   kind: z.literal("block_removal"), actor: z.literal("own_player"), mechanism: z.literal("helper"),
   effect_status: z.literal("confirmed"), source: z.literal("server_block_update"), target_name: itemName,

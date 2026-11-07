@@ -537,6 +537,160 @@ test(`real SDK ${ending} cancellation retains exact host provenance without stal
   expect(usage?.details).toHaveProperty("usage_evidence.provider_terminal", null);
 });
 
+for (const role of ["planning", "recovery"] as const)
+test(`real SDK lifecycle fence retains trusted ${role} cancellation without stale tools`, async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let requests = 0, writes = 0;
+  const f = await setup(async () => { throw new Error("Installed SDK owns this response"); }, async model => {
+    requests++;
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: "toolUse",
+      content: [{ type: "toolCall", id: "late-ordinary-write", name: "program_write", arguments: {} }],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      yield { type: "start", partial: message };
+      entered.resolve(); await release.promise;
+      stream.end(message);
+      yield { type: "done", reason: "toolUse", message };
+    };
+    return stream;
+  });
+  f.state.pending = false;
+  f.tools.find(tool => tool.name === "program_write")!.execute = async () => { writes++; return { content: [], details: null }; };
+  await f.planner.start(1); f.planner.wake(role === "recovery" ? "death" : "planning_continuation"); await entered.promise;
+  f.planner.fence(); f.planner.fence();
+  const closing = f.planner.close(); release.resolve(); await closing;
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  const requestId = object(events.find(event => event.type === "model.call")?.details ?? null)?.request_id;
+  expect(events.find(event => event.type === "model.request_settled")?.details)
+    .toMatchObject({ request_id: requestId, role, obsolete: true, stop_reason: "aborted", provider_failure: false,
+      recovered_failure: { type: "stream_interrupted_after_content" },
+      host_cancellation: { kind: "strategic_host", request_id: requestId, reason: "fenced" } });
+  expect(object(events.find(event => event.type === "model.request_settled")?.details ?? null)?.host_cancellation)
+    .not.toHaveProperty("root_execution_id");
+  expect(events.find(event => event.type === "model.usage")?.details)
+    .toHaveProperty("usage_evidence.provider_terminal", null);
+  expect(requests).toBe(1); expect(writes).toBe(0); expect(f.state.pauses).toEqual([]);
+  expect(events.some(event => event.type === "model.tool_started" || event.type === "scheduler.turn_failed")).toBe(false);
+});
+
+test("real SDK speculative preemption preserves its first cancellation cause through a later fence", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let requests = 0, tools = 0;
+  const f = await setup(async () => { throw new Error("Installed SDK owns this response"); }, async model => {
+    requests++;
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: "toolUse",
+      content: [{ type: "toolCall", id: "late-speculative-observe", name: "observe", arguments: {} }],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      yield { type: "start", partial: message };
+      entered.resolve(); await release.promise;
+      stream.end(message);
+      yield { type: "done", reason: "toolUse", message };
+    };
+    return stream;
+  });
+  f.tools.find(tool => tool.name === "observe")!.execute = async () => { tools++; return { content: [], details: null }; };
+  await f.planner.start(1); f.optIn(); await entered.promise;
+  f.planner.wake("death");
+  expect(f.speculation.projection()?.state).toBe("invalidated");
+  f.planner.fence();
+  const closing = f.planner.close(); release.resolve(); await closing;
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  const requestId = object(events.find(event => event.type === "model.call")?.details ?? null)?.request_id;
+  expect(events.find(event => event.type === "model.request_settled")?.details)
+    .toMatchObject({ request_id: requestId, role: "speculative", obsolete: true, stop_reason: "aborted", provider_failure: false,
+      recovered_failure: { type: "stream_interrupted_after_content" },
+      host_cancellation: { kind: "strategic_host", request_id: requestId, reason: "speculative_preempted" } });
+  expect(requests).toBe(1); expect(tools).toBe(0); expect(f.state.pauses).toEqual([]);
+  expect(events.some(event => event.type === "model.tool_started")).toBe(false);
+});
+
+test("real SDK ordinary deadline is trusted host cancellation but still fails the current turn", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let writes = 0;
+  const f = await setup(async () => { throw new Error("Installed SDK owns this response"); }, async model => {
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: "toolUse",
+      content: [{ type: "toolCall", id: "late-deadline-write", name: "program_write", arguments: {} }],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      yield { type: "start", partial: message };
+      entered.resolve(); await release.promise;
+      stream.end(message);
+      yield { type: "done", reason: "toolUse", message };
+    };
+    return stream;
+  });
+  f.state.pending = false;
+  f.tools.find(tool => tool.name === "program_write")!.execute = async () => { writes++; return { content: [], details: null }; };
+  await f.planner.start(1);
+  const schedule = globalThis.setTimeout;
+  let expire: (() => void) | undefined;
+  const captureDeadline = (...[callback, delay, ...args]: Parameters<typeof setTimeout>) => {
+    if (delay !== undefined && delay > 119_000 && delay <= 120_000)
+      expire = () => callback(...args);
+    return schedule(callback, delay, ...args);
+  };
+  vi.spyOn(globalThis, "setTimeout").mockImplementation(Object.assign(captureDeadline, schedule));
+  const failed = f.event("scheduler.turn_failed");
+  f.planner.wake("uncertainty"); await entered.promise;
+  const deadline = Date.now() + 120_001;
+  vi.spyOn(Date, "now").mockReturnValue(deadline);
+  expect(expire).toBeDefined(); expire!();
+  release.resolve(); await failed;
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  const requestId = object(events.find(event => event.type === "model.call")?.details ?? null)?.request_id;
+  expect(events.find(event => event.type === "model.request_settled")?.details)
+    .toMatchObject({ request_id: requestId, role: "recovery", obsolete: false, stop_reason: "aborted", provider_failure: false,
+      recovered_failure: { type: "stream_interrupted_after_content" },
+      host_cancellation: { kind: "strategic_host", request_id: requestId, reason: "turn_deadline" } });
+  expect(events.find(event => event.type === "scheduler.turn_failed")?.details)
+    .toMatchObject({ deadline_reached: true, provider_failed: false, provider_aborted: false, pause_cause: "deadline" });
+  expect(events.some(event => event.type === "scheduler.turn_finished" || event.type === "model.tool_started")).toBe(false);
+  expect(f.run.usage.calls).toBe(1); expect(writes).toBe(0); expect(f.state.pauses).toHaveLength(1);
+});
+
+for (const role of ["planning", "recovery"] as const)
+test(`real SDK provider abort received before a ${role} host fence cannot acquire cancellation provenance`, async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const f = await setup(async () => { throw new Error("Installed SDK owns this response"); }, async model => {
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: "aborted", errorMessage: "Provider aborted before host intent",
+      content: [{ type: "toolCall", id: "provider-aborted-write", name: "program_write", arguments: {} }],
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      yield { type: "start", partial: message };
+      entered.resolve(); await release.promise;
+      stream.end(message);
+      yield { type: "error", reason: "aborted", error: message };
+    };
+    return stream;
+  });
+  f.state.pending = false;
+  await f.planner.start(1); f.planner.wake(role === "recovery" ? "death" : "planning_continuation"); await entered.promise;
+  const off = f.store.subscribe(event => {
+    if (event.run_id === f.run.run_id && event.type === "model.purpose_classified") f.planner.fence();
+  });
+  const settled = f.event("model.request_settled"); release.resolve(); await settled; off();
+  await f.planner.close();
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  const result = events.find(event => event.type === "model.request_settled");
+  expect(result?.details).toMatchObject({ role, stop_reason: "aborted", provider_failure: true,
+    recovered_failure: { type: "stream_interrupted_after_content" } });
+  expect(result?.details).not.toHaveProperty("host_cancellation");
+  expect(events.some(event => event.type === "model.tool_started")).toBe(false);
+});
+
 for (const stopReason of ["error", "aborted"] as const)
 test(`real SDK provider ${stopReason} remains a failure when root settlement makes its authoring response obsolete`, async () => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();

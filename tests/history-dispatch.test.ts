@@ -324,6 +324,32 @@ test("readonly prefix only settles host cancellation inside its declared event b
     .toBeLessThanOrEqual(HISTORY_LIMITS.responseBytes);
 });
 
+test("readonly prefix preserves strategic recovery cancellation and cannot close an unseen planning request", () => {
+  const { store, run, reader } = fixture();
+  store.event(run.run_id, "model.call", "Recovery admission", { request_id: "recovery", role: "recovery" });
+  const details = { request_id: "recovery", role: "recovery", stop_reason: "aborted", obsolete: true,
+    usage_reported: false, recovered_failure: { type: "stream_interrupted_after_content", explanation: "stream_read_error" },
+    host_cancellation: { kind: "strategic_host", request_id: "recovery", reason: "fenced" } };
+  const terminal = store.event(run.run_id, "model.request_settled", "Host fenced recovery", details);
+  store.event(run.run_id, "model.call", "Planning admission", { request_id: "planning", role: "planning" });
+  store.event(run.run_id, "model.request_settled", "Host turn deadline", {
+    request_id: "planning", role: "planning", stop_reason: "aborted", obsolete: false, usage_reported: false,
+    recovered_failure: { type: "stream_interrupted_after_content", explanation: "stream_read_error" },
+    host_cancellation: { kind: "strategic_host", request_id: "planning", reason: "turn_deadline" },
+  });
+  expect(dispatchHistoryQuery(reader, { kind: "evaluation_prefix", run_id: run.run_id, event_limit: 1 }))
+    .toMatchObject({ admissions: 2, provider_error: false, provider_settled: false, events_omitted: true });
+  expect(dispatchHistoryQuery(reader, { kind: "evaluation_prefix", run_id: run.run_id, event_limit: 3 }))
+    .toMatchObject({ admissions: 2, provider_error: false, provider_settled: false, events_omitted: true });
+  expect(dispatchHistoryQuery(reader, { kind: "evaluation_prefix", run_id: run.run_id, event_limit: 4 }))
+    .toMatchObject({ admissions: 2, provider_error: false, provider_settled: true, events_omitted: false,
+      usage: { reported_messages: 0, event_coverage: "incomplete", consumption_coverage: "unknown",
+        uncached_input: null, cache_read: null, cache_write: null, output: null, wire_attempts: null } });
+  const exported = dispatchHistoryQuery(reader, { kind: "export_page", run_id: run.run_id,
+    collection: "events", after: { record_index: 0, chunk_index: 0 }, limit: 10 });
+  expect(exported.records.find(record => object(record).event_seq === terminal.event_seq)).toMatchObject({ details });
+});
+
 test("late evaluation summaries retain the actual original prefix while counting admissions beyond its cap", () => {
   const { store, run, reader } = fixture();
   store.event(run.run_id, "model.call", "First request", { request_id: "first" });

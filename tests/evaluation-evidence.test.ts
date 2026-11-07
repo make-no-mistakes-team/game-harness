@@ -514,6 +514,9 @@ const abortedAuthoring: Record<string, Json> = { request_id: "cancelled-authorin
   stop_reason: "aborted", usage_reported: false,
   recovered_failure: { type: "stream_interrupted_after_content", explanation: "stream_read_error" } };
 const cancelledAuthoring: Record<string, Json> = { ...abortedAuthoring, obsolete: true, host_cancellation: authoringCancellation };
+const strategicCancellation = { kind: "strategic_host", request_id: "cancelled-strategic", reason: "fenced" };
+const cancelledRecovery: Record<string, Json> = { ...abortedAuthoring, request_id: "cancelled-strategic",
+  role: "recovery", obsolete: true, host_cancellation: strategicCancellation };
 const cancellationCases: Array<{ name: string; type?: string; details: Record<string, Json>;
   providerError: boolean; providerSettled: boolean }> = [
   { name: "confirmed host cancellation", details: cancelledAuthoring, providerError: false, providerSettled: true },
@@ -537,11 +540,52 @@ const cancellationCases: Array<{ name: string; type?: string; details: Record<st
     providerError: true, providerSettled: false },
   { name: "unsettled request without SDK failure metadata", type: "model.request_unsettled",
     details: { request_id: "cancelled-authoring", usage_reported: false }, providerError: true, providerSettled: false },
+  { name: "recovery fenced after player death", details: cancelledRecovery, providerError: false, providerSettled: true },
+  { name: "planning fenced by host", details: { ...cancelledRecovery, role: "planning" },
+    providerError: false, providerSettled: true },
+  { name: "review fenced by host", details: { ...cancelledRecovery, role: "review" },
+    providerError: false, providerSettled: true },
+  { name: "non-root authoring fenced by host", details: { ...cancelledRecovery, role: "authoring" },
+    providerError: false, providerSettled: true },
+  { name: "speculative request preempted by wake", details: { ...cancelledRecovery, role: "speculative",
+    host_cancellation: { ...strategicCancellation, reason: "speculative_preempted" } }, providerError: false, providerSettled: true },
+  { name: "current planning request cancelled at host turn deadline", details: { ...cancelledRecovery,
+    role: "planning", obsolete: false, host_cancellation: { ...strategicCancellation, reason: "turn_deadline" } },
+    providerError: false, providerSettled: true },
+  { name: "generic cancellation with unknown host role", details: { ...cancelledRecovery, role: "worker" },
+    providerError: true, providerSettled: false },
+  { name: "generic cancellation without role", details: { ...cancelledRecovery, role: null },
+    providerError: true, providerSettled: false },
+  { name: "generic cancellation with root-only reason", details: { ...cancelledRecovery,
+    host_cancellation: { ...strategicCancellation, reason: "root_settled" } }, providerError: true, providerSettled: false },
+  { name: "generic cancellation with mismatched request", details: { ...cancelledRecovery,
+    host_cancellation: { ...strategicCancellation, request_id: "another-request" } }, providerError: true, providerSettled: false },
+  { name: "generic cancellation with empty request", details: { ...cancelledRecovery, request_id: "",
+    host_cancellation: { ...strategicCancellation, request_id: "" } }, providerError: true, providerSettled: false },
+  { name: "generic cancellation with blank request", details: { ...cancelledRecovery, request_id: " ",
+    host_cancellation: { ...strategicCancellation, request_id: " " } }, providerError: true, providerSettled: false },
+  { name: "generic cancellation with root marker fields", details: { ...cancelledRecovery,
+    host_cancellation: { ...strategicCancellation, root_execution_id: "foreground-root" } }, providerError: true, providerSettled: false },
+  { name: "generic fence without obsolete evidence", details: { ...cancelledRecovery, obsolete: false },
+    providerError: true, providerSettled: false },
+  { name: "generic preemption with non-speculative role", details: { ...cancelledRecovery,
+    host_cancellation: { ...strategicCancellation, reason: "speculative_preempted" } }, providerError: true, providerSettled: false },
+  { name: "generic marker alongside genuine provider error", details: { ...cancelledRecovery, stop_reason: "error" },
+    providerError: true, providerSettled: false },
+  { name: "generic marker alongside recovered partial tool response", details: { ...cancelledRecovery, stop_reason: "toolUse" },
+    providerError: true, providerSettled: true },
+  { name: "generic marker on unsettled recovery", type: "model.request_unsettled", details: cancelledRecovery,
+    providerError: true, providerSettled: false },
+  { name: "obsolete recovery without cancellation provenance", details: { ...cancelledRecovery, host_cancellation: null },
+    providerError: true, providerSettled: false },
+  { name: "worker-authored cancellation inside recovered failure", details: { ...cancelledRecovery, host_cancellation: null,
+    recovered_failure: { type: "stream_interrupted_after_content", host_cancellation: strategicCancellation } },
+    providerError: true, providerSettled: false },
 ];
 for (const scenario of cancellationCases) {
   test(`live and readonly evaluation agree on ${scenario.name} without inventing usage`, async () => {
     const f = setup(30);
-    f.emit("model.call", { request_id: "cancelled-authoring", role: "authoring" });
+    f.emit("model.call", { request_id: scenario.details.request_id!, role: scenario.details.role ?? "authoring" });
     f.emit(scenario.type ?? "model.request_settled", scenario.details);
     expect(f.observer.hasProviderFailure(f.run.run_id)).toBe(scenario.providerError);
     expect(f.stops).toEqual(scenario.providerError ? ["provider_failure_or_unsettled_no_repeat"] : []);

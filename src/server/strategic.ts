@@ -127,13 +127,27 @@ interface RequestAttempt {
   review: boolean;
   role: "speculative" | "review" | "recovery" | "planning" | "authoring";
   authoring: AuthoringWindow | null;
+  terminalReceived: boolean;
   hostCancellation?: {
     kind: "ordinary_authoring";
     request_id: string;
     root_execution_id: string;
     reason: string;
+  } | {
+    kind: "strategic_host";
+    request_id: string;
+    reason: "fenced" | "speculative_preempted" | "turn_deadline";
   };
 }
+
+type AbortIntent = {
+  kind: "ordinary_authoring";
+  window: AuthoringWindow;
+  reason: string;
+} | {
+  kind: "strategic_host";
+  reason: "fenced" | "speculative_preempted" | "turn_deadline";
+};
 
 interface AuthoringWindow {
   run: StoredRun;
@@ -548,6 +562,7 @@ export class StrategicPlanner {
           review,
           role: authoring ? "authoring" : this.role,
           authoring,
+          terminalReceived: false,
         };
         recordCall(run.usage, this.request.purpose);
         this.store.event(
@@ -727,16 +742,29 @@ export class StrategicPlanner {
     });
     if (this.turnAuthoring === window || this.request?.authoring === window) {
       this.authoringEnded = true;
-      if (abort && this.agent) {
-        const request = this.request;
-        // Capture host authority before abort: SDK callbacks may settle this
-        // exact request synchronously and retain a raw interruption marker.
-        if (request?.authoring === window && AUTHORING_CANCELLATION_REASONS.has(reason))
-          request.hostCancellation = { kind: "ordinary_authoring", request_id: request.id,
-            root_execution_id: window.root, reason };
-        this.agent.abort();
-      }
+      if (abort) this.abortRequest({ kind: "ordinary_authoring", window, reason });
     }
+  }
+
+  private abortRequest(intent: AbortIntent, agent = this.agent): void {
+    const request = this.request;
+    const window = intent.kind === "ordinary_authoring" ? intent.window : request?.authoring;
+    const rootReason = intent.kind === "ordinary_authoring" ? intent.reason
+      : intent.reason === "turn_deadline" ? "deadline" : intent.reason === "fenced" ? "fenced" : null;
+    if (intent.kind === "strategic_host" && window && rootReason)
+      this.endAuthoring(window, rootReason, false);
+    // Own the exact admitted request before abort(), which may synchronously
+    // deliver its terminal callback. Neither repeats nor terminal reconciliation
+    // can replace the first actual cancellation cause.
+    if (agent && request && !request.terminalReceived && !request.hostCancellation) {
+      if (window && request.authoring === window && request.role === "authoring" &&
+          rootReason && AUTHORING_CANCELLATION_REASONS.has(rootReason))
+        request.hostCancellation = { kind: "ordinary_authoring", request_id: request.id,
+          root_execution_id: window.root, reason: rootReason };
+      else if (intent.kind === "strategic_host" && !request.authoring)
+        request.hostCancellation = { kind: "strategic_host", request_id: request.id, reason: intent.reason };
+    }
+    agent?.abort();
   }
 
   private assertAuthoring(window: AuthoringWindow): void {
@@ -841,7 +869,7 @@ export class StrategicPlanner {
       // Ordinary outcome/replan demand is never held behind optional lookahead.
       // Drain the cancelled request through the same serialized agent owner.
       this.host.speculation?.().invalidate("cancelled");
-      this.agent?.abort();
+      this.abortRequest({ kind: "strategic_host", reason: "speculative_preempted" });
     }
     if (this.wakeReasons.size < 32) this.wakeReasons.add(reason.slice(0, 160));
     if (Object.hasOwn(MEANINGFUL_WAKES, reason)) {
@@ -867,7 +895,7 @@ export class StrategicPlanner {
     clearTimeout(this.authoringTimer);
     this.authoringTimer = undefined;
     this.host.speculation?.().invalidate("cancelled");
-    this.agent?.abort();
+    this.abortRequest({ kind: "strategic_host", reason: "fenced" });
   }
 
   close(): Promise<void> {
@@ -1072,7 +1100,7 @@ export class StrategicPlanner {
             turn_id: turnId,
           },
         );
-        agent.abort();
+        this.abortRequest({ kind: "strategic_host", reason: "turn_deadline" }, agent);
       },
       Math.max(1, this.turnDeadline - Date.now()),
     );
@@ -1448,6 +1476,7 @@ export class StrategicPlanner {
         this.gateReason !== null &&
         message.errorMessage === this.gateReason;
       const request = this.request;
+      if (request) request.terminalReceived = true;
       // Reconciliation below can itself abort a now-obsolete window. That
       // cannot establish the cause of a terminal response already received.
       const requestedCancellation = request?.hostCancellation;
@@ -1456,7 +1485,8 @@ export class StrategicPlanner {
       const obsolete = !this.current(run, generation) ||
         Boolean(window && (this.reconcileAuthoring() !== window || window.closed)) ||
         Boolean(request?.planId && (plan?.plan_id !== request.planId || !plan.planning_active));
-      const hostCancellation = message.stopReason === "aborted" && request?.role === "authoring" && obsolete
+      const hostCancellation = message.stopReason === "aborted" &&
+        (requestedCancellation?.kind === "strategic_host" || request?.role === "authoring" && obsolete)
         ? requestedCancellation : undefined;
       this.eligibleTools.clear();
       if (!obsolete && !hostYield && !recoveredFailure && ["stop", "toolUse"].includes(message.stopReason)) {

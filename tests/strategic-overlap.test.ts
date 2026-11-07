@@ -16,7 +16,7 @@ import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { SkillManager } from "../src/server/skills.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
-import { StrategicPlanner } from "../src/server/strategic.ts";
+import { StrategicPlanner, type StrategicRequestAdmission } from "../src/server/strategic.ts";
 import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 import { finishHistoryExecution, historyExecution, historySpec } from "./helpers/history-fixture.ts";
 
@@ -46,7 +46,8 @@ afterEach(async () => {
 function object(value: Json): { [key: string]: Json } | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
-async function setup(onPrompt: (context: Record<string, unknown>, agent: HarnessAgent) => Promise<void>, streamFn?: StreamFn) {
+async function setup(onPrompt: (context: Record<string, unknown>, agent: HarnessAgent) => Promise<void>, streamFn?: StreamFn,
+  requestAdmission?: StrategicRequestAdmission) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-overlap-"));
   const store = new Store(directory), adapter = minecraftTestAdapter();
   const goal = adapter.goals.find(goal => goal.goal_id === "custom")!;
@@ -129,7 +130,7 @@ async function setup(onPrompt: (context: Record<string, unknown>, agent: Harness
     }, releaseAgent: async () => {},
   } as unknown as AuthManager;
   planner = new StrategicPlanner(store, auth, {
-    run: () => run, generation: () => 1,
+    run: () => run, generation: () => 1, requestAdmission,
     assertCurrent: (generation, epoch) => {
       if (generation !== 1 || epoch !== undefined && epoch !== run.epoch || !["running", "reviewing"].includes(run.status))
         throw new RuntimeFault("stale_context", "Fixture authority revoked");
@@ -738,6 +739,199 @@ test(`real SDK provider ${stopReason} remains a failure after root settlement du
   expect(settled?.details).not.toHaveProperty("host_cancellation");
   expect(f.state.pauses).toHaveLength(1);
   expect(events.some(event => event.type === "model.tool_started")).toBe(false);
+});
+
+test("urgent repeated attention cancels optional speculative authoring only once", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let prompts = 0;
+  const f = await setup(async (context, agent) => {
+    expect(await agent.call()).toBe(true);
+    if (++prompts === 1) { entered.resolve(); await agent.wait(release.promise); }
+    else expect(context.pending_decision).toBe(true);
+  });
+  try {
+    await f.planner.start(1); f.optIn(); await entered.promise;
+    f.store.event(f.run.run_id, "controller.event", "Urgent optional preemption", {
+      event: { kind: "attention", urgency: "urgent", summary: "Urgent optional preemption", details: null },
+    });
+    const finished = f.event("scheduler.turn_finished");
+    f.planner.wake("resident_attention"); f.planner.wake("resident_attention"); f.planner.wake("policy_interrupt");
+    expect(f.state.aborts).toBe(1);
+    await finished;
+    expect(prompts).toBe(2); expect(f.speculation.projection()?.state).toBe("invalidated");
+    expect(f.state.pauses).toEqual([]);
+  } finally { release.resolve(); }
+});
+
+for (const predecessor of ["running", "settled"] as const)
+for (const trigger of ["resident_attention", "policy_interrupt"] as const)
+test(`real SDK ${trigger} urgently drains held ${predecessor} authoring before fresh decision`, async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const reserved: string[] = [], transported: string[] = [], drained: string[] = [];
+  let requests = 0, writes = 0, starts = 0, aborted = 0, heldSignal: AbortSignal | undefined;
+  const f = await setup(async () => { throw new Error("Installed SDK owns the tool loop"); }, async (model, context, options) => {
+    const index = requests++;
+    if (index === 2) {
+      expect(transported).toEqual(reserved.slice(0, 2));
+      const user = context.messages.find(message => message.role === "user")!;
+      if (user.role !== "user") throw new Error("Missing fresh decision projection");
+      const text = typeof user.content === "string" ? user.content :
+        user.content.filter(part => part.type === "text").map(part => part.text).join("");
+      const projection = JSON.parse(text);
+      expect(projection.role).toBe(trigger === "policy_interrupt" ? "recovery" : "planning");
+      expect(projection.pending_decision).toBe(predecessor === "running");
+      if (trigger === "resident_attention") expect(JSON.stringify(projection)).toContain("Fresh urgent evidence");
+      expect(context.tools?.some(tool => tool.name === "program_run")).toBe(true);
+    }
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: index < 2 ? "toolUse" : "stop",
+      content: index < 2 ? [{ type: "toolCall", id: `urgent-write-${index}`, name: "program_write", arguments: {} },
+        ...(index === 1 ? [{ type: "toolCall" as const, id: "late-urgent-start", name: "program_run", arguments: {} }] : [])] : [],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      yield { type: "start", partial: message };
+      if (index === 1) {
+        heldSignal = options?.signal;
+        const cancelled = Promise.withResolvers<void>();
+        const onAbort = () => { aborted++; cancelled.resolve(); };
+        heldSignal?.addEventListener("abort", onAbort, { once: true });
+        entered.resolve();
+        try { await Promise.race([release.promise, cancelled.promise]); }
+        finally { heldSignal?.removeEventListener("abort", onAbort); }
+      }
+      stream.end(message); yield { type: "done", reason: index < 2 ? "toolUse" : "stop", message };
+    };
+    return stream;
+  }, { reserve: id => { reserved.push(id); }, transportEnded: id => { transported.push(id); },
+    drained: ids => { drained.push(...ids); } });
+  f.tools.find(tool => tool.name === "program_write")!.execute = async () => {
+    const authority = f.planner.speculativeToolAuthority();
+    const source = await f.store.registerSkill(f.run.run_id, historySpec(f.run, "Completed urgent draft"));
+    authority(); writes++;
+    return { content: [], details: { name: source.name, version: source.version } };
+  };
+  f.tools.find(tool => tool.name === "program_run")!.execute = async () => { starts++; return { content: [], details: null }; };
+  try {
+    await f.planner.start(1); f.planner.wake("planning_continuation"); await entered.promise;
+    expect(writes).toBe(1);
+    if (predecessor === "settled") { finishHistoryExecution(f.store, f.root); f.state.pending = false; f.planner.wake("skill_outcome"); }
+    if (trigger === "resident_attention") f.store.event(f.run.run_id, "controller.event", "Fresh urgent evidence", {
+      event: { kind: "attention", urgency: "urgent", summary: "Fresh urgent evidence", details: null },
+    });
+    const freshFinished = new Promise<void>(resolve => {
+      let finished = 0;
+      const off = f.store.subscribe(event => {
+        if (event.run_id === f.run.run_id && event.type === "scheduler.turn_finished" && ++finished === 2) { off(); resolve(); }
+      });
+    });
+    f.planner.wake(trigger); f.planner.wake(trigger); f.planner.wake(trigger);
+    expect(heldSignal?.aborted).toBe(true);
+    expect(aborted).toBe(1);
+    await freshFinished;
+    expect(requests).toBe(3); expect(writes).toBe(1); expect(starts).toBe(0);
+    expect(f.store.namedSkill(f.run.run_id, "Completed urgent draft")?.version).toBe(1);
+    expect(f.store.skillExecution(f.run.run_id, { execution_id: f.root.execution_id })?.status)
+      .toBe(predecessor === "running" ? "running" : "succeeded");
+    const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+    expect(events.find(event => event.type === "model.request_settled" && object(event.details)?.request_id === reserved[1])?.details)
+      .toMatchObject({ role: "authoring", obsolete: true, stop_reason: "aborted", provider_failure: false,
+        host_cancellation: { kind: "ordinary_authoring", request_id: reserved[1],
+          root_execution_id: f.root.execution_id, reason: trigger } });
+    expect(events.filter(event => event.type === "scheduler.authoring_entered")).toHaveLength(1);
+    expect(events.some(event => event.type === "scheduler.turn_failed")).toBe(false);
+    expect(f.run.usage.calls).toBe(3); expect(f.state.pauses).toEqual([]);
+  } finally {
+    release.resolve(); await f.planner.close();
+  }
+  expect(transported).toEqual(reserved); expect(drained).toEqual(reserved);
+});
+
+test("real SDK urgent attention revokes request-free inactive publication without discarding saved source", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let requests = 0, writes = 0, revoked = false;
+  const f = await setup(async () => { throw new Error("Installed SDK owns the tool loop"); }, async model => {
+    const index = requests++;
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: index < 2 ? "toolUse" : "stop",
+      content: index < 2 ? [{ type: "toolCall", id: `seam-write-${index}`, name: "program_write", arguments: {} }] : [],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream.push({ type: "start", partial: message }); stream.push({ type: "done", reason: index < 2 ? "toolUse" : "stop", message }); stream.end();
+    return stream;
+  });
+  f.tools.find(tool => tool.name === "program_write")!.execute = async () => {
+    const authority = f.planner.speculativeToolAuthority();
+    if (writes === 1) {
+      entered.resolve(); await release.promise;
+      try { authority(); } catch { revoked = true; return { content: [], details: null }; }
+    }
+    authority();
+    const source = await f.store.registerSkill(f.run.run_id, historySpec(f.run, writes ? "Revoked seam draft" : "Saved seam draft"));
+    writes++;
+    return { content: [], details: { name: source.name, version: source.version } };
+  };
+  try {
+    await f.planner.start(1); f.planner.wake("planning_continuation"); await entered.promise;
+    finishHistoryExecution(f.store, f.root); f.state.pending = false;
+    f.store.event(f.run.run_id, "controller.event", "Urgent publication seam", {
+      event: { kind: "attention", urgency: "urgent", summary: "Urgent publication seam", details: null },
+    });
+    f.planner.wake("resident_attention"); f.planner.wake("resident_attention");
+    const finished = new Promise<void>(resolve => {
+      let count = 0;
+      const off = f.store.subscribe(event => {
+        if (event.run_id === f.run.run_id && event.type === "scheduler.turn_finished" && ++count === 2) { off(); resolve(); }
+      });
+    });
+    release.resolve(); await finished;
+    expect(revoked).toBe(true); expect(writes).toBe(1); expect(requests).toBe(3);
+    expect(f.store.namedSkill(f.run.run_id, "Saved seam draft")?.version).toBe(1);
+    expect(f.store.namedSkill(f.run.run_id, "Revoked seam draft")).toBeNull();
+    expect(f.state.pauses).toEqual([]);
+    expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "model.request_settled")
+      .every(event => !object(event.details)?.host_cancellation)).toBe(true);
+  } finally { release.resolve(); }
+});
+
+for (const event of [
+  { kind: "attention", urgency: "ordinary" },
+  { kind: "diagnostic", urgency: "urgent" },
+] as const)
+test(`real SDK ${event.urgency} ${event.kind} retains useful settlement grace`, async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let requests = 0, writes = 0, signal: AbortSignal | undefined;
+  const f = await setup(async () => { throw new Error("Installed SDK owns the response"); }, async (model, _context, options) => {
+    const index = requests++;
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: index === 0 ? "toolUse" : "stop",
+      content: index === 0 ? [{ type: "toolCall", id: "nonurgent-write", name: "program_write", arguments: {} }] : [],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      yield { type: "start", partial: message };
+      if (index === 0) { signal = options?.signal; entered.resolve(); await release.promise; }
+      stream.end(message); yield { type: "done", reason: index === 0 ? "toolUse" : "stop", message };
+    };
+    return stream;
+  });
+  f.tools.find(tool => tool.name === "program_write")!.execute = async () => {
+    f.planner.speculativeToolAuthority()(); writes++; return { content: [], details: null };
+  };
+  try {
+    await f.planner.start(1); f.planner.wake("planning_continuation"); await entered.promise;
+    finishHistoryExecution(f.store, f.root); f.state.pending = false;
+    f.store.event(f.run.run_id, "controller.event", "Non-attention urgency is not urgent demand", {
+      event: { ...event, summary: "Non-preempting evidence", details: null },
+    });
+    f.planner.wake("resident_attention");
+    expect(signal?.aborted).toBe(false); expect(requests).toBe(1);
+    const finished = f.event("scheduler.turn_finished"); release.resolve(); await finished;
+    expect(writes).toBe(1); expect(f.state.pauses).toEqual([]);
+  } finally { release.resolve(); }
 });
 
 test("the real SDK continues after submit through evidence and inactive validated source while the foreground body advances", async () => {

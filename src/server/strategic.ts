@@ -38,7 +38,7 @@ const TOOL_CALLS = 48;
 const AUTHORING_CALLS = 3;
 const AUTHORING_TOOLS = 12;
 const AUTHORING_MS = 60_000;
-const AUTHORING_CANCELLATION_REASONS = new Set(["root_settled", "scope_lost", "root_replaced", "deadline", "calls", "tools", "fenced"]);
+const AUTHORING_CANCELLATION_REASONS = new Set(["root_settled", "scope_lost", "root_replaced", "deadline", "calls", "tools", "fenced", "resident_attention", "policy_interrupt"]);
 const FEEDBACK_BYTES = 8 * 1024;
 const PROGRAM_PENDING =
   "A program is meaningful pending work; strategy waits for its outcome";
@@ -262,6 +262,7 @@ export class StrategicPlanner {
   private turnAuthoring: AuthoringWindow | null = null;
   private authoringEnded = false;
   private authoringPhase = false;
+  private turnAbortRequested = false;
   private pendingDecision = false;
   private emptyTurns = 0;
   private workRevision = 0;
@@ -312,6 +313,7 @@ export class StrategicPlanner {
     this.turnAuthoring = null;
     this.authoringEnded = false;
     this.authoringPhase = false;
+    this.turnAbortRequested = false;
     this.pendingDecision = false;
     this.emptyTurns = 0;
     this.workRevision = 0;
@@ -782,6 +784,11 @@ export class StrategicPlanner {
       : intent.reason === "turn_deadline" ? "deadline" : intent.reason === "fenced" ? "fenced" : null;
     if (intent.kind === "strategic_host" && window && rootReason)
       this.endAuthoring(window, rootReason, false);
+    // One abort belongs to the serialized SDK loop, including the request-free
+    // tool/publication seam. Repeated wakes must not re-abort that same owner or
+    // overwrite its exact request's first host cancellation cause.
+    if (!agent || this.turnAbortRequested) return;
+    this.turnAbortRequested = true;
     // Own the exact admitted request before abort(), which may synchronously
     // deliver its terminal callback. Neither repeats nor terminal reconciliation
     // can replace the first actual cancellation cause.
@@ -793,7 +800,7 @@ export class StrategicPlanner {
       else if (intent.kind === "strategic_host" && !request.authoring)
         request.hostCancellation = { kind: "strategic_host", request_id: request.id, reason: intent.reason };
     }
-    agent?.abort();
+    agent.abort();
   }
 
   private assertAuthoring(window: AuthoringWindow): void {
@@ -874,6 +881,7 @@ export class StrategicPlanner {
     this.reconcileAuthoring();
     if (this.host.programPending() && !Object.hasOwn(MEANINGFUL_WAKES, reason))
       return;
+    let urgent = reason === "policy_interrupt";
     if (reason === "resident_attention") {
       // SkillManager persists the authored event synchronously before waking us.
       // Keep the trigger independently of the ordinary oldest-first Store page.
@@ -881,6 +889,7 @@ export class StrategicPlanner {
       const authored = controllerEventSchema.safeParse(record(event?.details ?? null)?.event);
       if (event && event.event_seq > this.residentAttentionConsumed &&
           authored.success && authored.data.kind === "attention") {
+        urgent = authored.data.urgency === "urgent";
         this.residentAttention.set(event.event_seq, event);
         if (this.residentAttention.size > 32) {
           const first = this.residentAttention.keys().next().value!;
@@ -893,6 +902,13 @@ export class StrategicPlanner {
           };
         }
       }
+    }
+    const authoring = this.turnAuthoring ?? this.request?.authoring;
+    if (urgent && authoring && (this.authoringPhase || this.request?.authoring === authoring)) {
+      // Urgent model-authored demand revokes inactive authoring, including its
+      // settlement grace. It never changes the playing root or renews budgets.
+      // Keep the wake and resident evidence queued until this owner has drained.
+      this.endAuthoring(authoring, reason);
     }
     if (this.speculativeTurn && reason !== "speculative_lookahead" && reason !== "planning_continuation" &&
         Object.hasOwn(MEANINGFUL_WAKES, reason)) {
@@ -1078,6 +1094,7 @@ export class StrategicPlanner {
     this.turnAuthoring = null as AuthoringWindow | null;
     this.authoringEnded = false;
     this.authoringPhase = false;
+    this.turnAbortRequested = false;
     const attention = reasons.includes("selected_attention")
       ? this.attentionReason
       : null;
@@ -1232,7 +1249,7 @@ export class StrategicPlanner {
           .filter((tool) => isToolAllowed(this.toolRole(), tool.name));
         agent.setTools(selectedTools);
         if (speculative) {
-          this.store.event(run.run_id, "scheduler.speculative_tools_selected", "Configured the actual speculative agent catalog to read-only evidence and staging; dispatch authority is checked independently", {
+          this.store.event(run.run_id, "scheduler.speculative_tools_selected", "Configured the actual speculative agent catalog to evidence, inactive source preparation and staging; dispatch authority is checked independently", {
             plan_id: speculative.plan_id,
             tools: selectedTools.map((tool) => tool.name),
           });

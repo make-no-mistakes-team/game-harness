@@ -1284,6 +1284,7 @@ export async function runResidentBenchmarkSlot(
       remaining();
       recorder = new EpisodeRecorder({
         directory: artifactPath("recording"),
+        captureMode: "lossless_png",
         bridge: fixture.bridge,
         identity: {
           episode_id: randomUUID(),

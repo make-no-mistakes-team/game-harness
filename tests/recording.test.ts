@@ -14,7 +14,7 @@ async function fixture(options: Record<string, unknown> = {}) {
   let listener: ((frame: Uint8Array) => void) | null = null, monotonic = 0;
   const incomplete: string[] = [];
   const bridge = { subscribeFrames(callback: (frame: Uint8Array) => void) { listener = callback; return () => { listener = null; }; } };
-  const recorder = new EpisodeRecorder({ directory, bridge, identity, now: () => 10000 + monotonic,
+  const recorder = new EpisodeRecorder({ directory, bridge, identity, captureMode: "lossless_png", now: () => 10000 + monotonic,
     monotonicNow: () => monotonic, onIncomplete: (reason: string) => incomplete.push(reason), ...options });
   return { recorder, directory, incomplete, subscribed: () => listener !== null,
     emit(sequence: number, capturedAt: number, receivedAt = capturedAt + 10, frame = nativeFrame({ sequence, capturedAt })) {
@@ -26,7 +26,7 @@ async function index(directory: string, name: string) {
   return (await readFile(join(directory, name), "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
 }
 
-test("recorder writes every delivered PNG and nonuniform capture timeline including final hold", async () => {
+test("explicit lossless recorder writes every delivered PNG and nonuniform capture timeline including final hold", async () => {
   const f = await fixture();
   f.emit(10, 10000); f.emit(11, 10050); f.emit(13, 10500);
   const manifest = await f.recorder.finish({ endedAt: 11200, reason: "operator_stop" });

@@ -51,7 +51,8 @@ test("descriptor cutover leaves split GHV2, opaque PNGs, ordered recording/gaps 
   const listeners = new Set<(frame: Uint8Array) => void>();
   const start = Date.now(); let now = start, latest: Uint8Array | null = null;
   const firstEncode = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-  const recorder = new EpisodeRecorder({ directory, identity: { episode_id: "contract", run_id: "run", world_id: "world", session_id: "session" },
+  const recorder = new EpisodeRecorder({ directory, captureMode: "lossless_png",
+    identity: { episode_id: "contract", run_id: "run", world_id: "world", session_id: "session" },
     bridge: { subscribeFrames(listener) { listeners.add(listener); return () => { listeners.delete(listener); }; } },
     now: () => now, monotonicNow: () => now - start, onIncomplete: () => {},
     encode: async (frame, receivedAt) => { firstEncode.resolve(); await release.promise; return await encodeNativeFramePng(frame, receivedAt); } });

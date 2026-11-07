@@ -504,6 +504,7 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
     activeRun = run.run_id;
     const recordingDirectory = `case-${scenario.id}-recording`;
     recorder = new EpisodeRecorder({ directory: path.join(fixture.evidenceDirectory, recordingDirectory), bridge: fixture.bridge,
+      captureMode: studyManifest ? "lossless_png" : "live_compressed",
       limits: evidenceProfile.profile.recording,
       identity: { episode_id: randomUUID(), run_id: run.run_id, world_id: run.world_id, session_id: run.session_id! },
       onIncomplete: why => { report.recording_failure = why; stop(run.run_id, "recording_evidence_incomplete"); } });

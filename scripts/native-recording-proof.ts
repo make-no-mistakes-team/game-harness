@@ -4,8 +4,8 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
-import { ActorFrameSelector, encodeNativeFramePng, type FrameScope } from "../src/server/actor-frames.ts";
-import { EpisodeRecorder } from "../src/server/recording.ts";
+import { ActorFrameSelector, type FrameScope } from "../src/server/actor-frames.ts";
+import { EpisodeRecorder, type RecorderHealth } from "../src/server/recording.ts";
 import { NativeFixture, bounded, requireProof } from "../src/evaluation/native-game.ts";
 import { assertNativeArtifactFresh, requireTierOptIn } from "../src/evaluation/tiers.ts";
 import { NATURAL_WORLD_CONDITIONS } from "../src/evaluation/scenarios.ts";
@@ -287,27 +287,26 @@ export async function runNativeRecordingProof(args: readonly string[], project =
       status: "running", started_at: new Date().toISOString() };
     fixture.cases.push(entry);
     const caseStarted = performance.now();
-    const encodingMs: number[] = [];
     let firstCaptureReceivedAt: number | undefined;
-    const healthSamples: Array<{ elapsed_ms: number; health: ReturnType<EpisodeRecorder["health"]> }> = [];
+    const healthSamples: Array<{ elapsed_ms: number; health: RecorderHealth }> = [];
     entry.recorder_health_samples = healthSamples;
-    entry.recording_encode_ms = encodingMs;
+    entry.recording_capture_mode = "live_compressed";
     // This proof owns its failure path. Do not enter NativeFixture.case's
     // synchronous failure-frame FFmpeg capture after the proof scope is revoked.
     try {
       assertOpen();
       if (requestedDuration !== undefined)
         captureTimer = setTimeout(() => interrupted("capture_scope_deadline"), fixture.caps.runMs);
-      recorder = new EpisodeRecorder({ directory: path.join(fixture.evidenceDirectory, "recording"), bridge: fixture.bridge,
+      recorder = new EpisodeRecorder({ directory: path.join(fixture.evidenceDirectory, "recording"),
+        bridge: { subscribeFrames(callback) {
+          return fixture.bridge.subscribeFrames(frame => {
+            firstCaptureReceivedAt ??= performance.now();
+            callback(frame);
+          });
+        } },
         limits: evidenceProfile.profile.recording,
         identity: { episode_id: randomUUID(), run_id: runId, world_id: initial.world_id, session_id: initial.session_id },
-        onIncomplete: why => { failure ??= new Error(why); proofScope.abort(); },
-        encode: async (frame, receivedAt) => {
-          firstCaptureReceivedAt ??= performance.now();
-          const started = performance.now();
-          try { return await encodeNativeFramePng(frame, receivedAt); }
-          finally { encodingMs.push(performance.now() - started); }
-        } });
+        onIncomplete: why => { failure ??= new Error(why); proofScope.abort(); } });
       if (runtimeLoad) await runtime!.control(runId, "start");
       if (sustainedRuntime && !resultContract) {
         const turnQueryOptions = { signal: proofScope.signal, deadlineHostMs: Math.min(

@@ -30,7 +30,7 @@ async function recordedReplay(offsets: readonly number[], endedOffset: number, v
   beforeRender?: (directory: string) => Promise<void>): Promise<ReplayProbe> {
   const directory = await mkdtemp(join(tmpdir(), "gameharness-replay-timing-")); roots.push(directory);
   let listener: ((frame: Uint8Array) => void) | undefined, now = 10000;
-  const recorder = new recording.EpisodeRecorder({ directory, identity: { episode_id: "episode", run_id: "run", world_id: "world", session_id: "session" },
+  const recorder = new recording.EpisodeRecorder({ directory, captureMode: "lossless_png", identity: { episode_id: "episode", run_id: "run", world_id: "world", session_id: "session" },
     bridge: { subscribeFrames(callback) { listener = callback; return () => { listener = undefined; }; } },
     now: () => now, monotonicNow: () => now - 10000, onIncomplete: reason => { throw new Error(reason); } });
   try {
@@ -53,7 +53,7 @@ async function recordedReplay(offsets: readonly number[], endedOffset: number, v
 async function finalizedCapture(offsets: readonly number[], endedOffset: number) {
   const directory = await mkdtemp(join(tmpdir(), "gameharness-detached-replay-")); roots.push(directory);
   let listener: ((frame: Uint8Array) => void) | undefined, now = 10000;
-  const recorder = new recording.EpisodeRecorder({ directory,
+  const recorder = new recording.EpisodeRecorder({ directory, captureMode: "lossless_png",
     identity: { episode_id: "episode", run_id: "run", world_id: "world", session_id: "session" },
     bridge: { subscribeFrames(callback) { listener = callback; return () => { listener = undefined; }; } },
     now: () => now, monotonicNow: () => now - 10000, onIncomplete: reason => { throw new Error(reason); } });

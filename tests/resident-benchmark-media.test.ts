@@ -18,7 +18,7 @@ async function closedRawSlot(largeClip = false) {
   const recordingDirectory = join(directory, 'recording');
   await mkdir(recordingDirectory);
   let listener: ((frame: Uint8Array) => void) | undefined, now = 10000;
-  const recorder = new EpisodeRecorder({ directory: recordingDirectory,
+  const recorder = new EpisodeRecorder({ directory: recordingDirectory, captureMode: "lossless_png",
     identity: { episode_id: 'episode', run_id: 'run', world_id: 'world', session_id: 'session' },
     bridge: { subscribeFrames(callback) { listener = callback; return () => { listener = undefined; }; } },
     now: () => now, monotonicNow: () => now - 10000, onIncomplete: reason => { throw new Error(reason); } });

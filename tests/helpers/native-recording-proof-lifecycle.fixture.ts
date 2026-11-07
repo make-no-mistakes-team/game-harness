@@ -13,16 +13,16 @@ import { sameEffectScope } from "../../src/shared/control.ts";
 import { minecraftActionSchema } from "../../src/shared/minecraft.ts";
 
 // Dedicated subprocess: real proof/selector/codec/recorder/finish/postmortem,
-// with only native game ownership and external encoder/probe made synthetic.
+// with only native game ownership synthetic. Actual FFmpeg/FFprobe exercise
+// live capture and canonical remux under the real proof's ownership.
 // The real NativeFixture.finish must retain its own close await and pass logic.
 const [signalArg, rootArg, phaseArg = "close"] = process.argv.slice(2);
 if (signalArg !== "SIGINT" && signalArg !== "SIGTERM") throw new Error("Expected a real shutdown signal");
 if (!rootArg) throw new Error("Missing isolated proof directory");
 if (phaseArg !== "close" && phaseArg !== "persistence" && phaseArg !== "preflight" && phaseArg !== "capture") throw new Error("Unknown proof interruption phase");
 const signal = signalArg, root = rootArg, phase = phaseArg;
-const project = join(root, "project"), bin = join(root, "bin");
+const project = join(root, "project");
 await mkdir(join(project, "native/minecraft/src"), { recursive: true });
-await mkdir(bin);
 const source = join(project, "native/minecraft/src/Synthetic.java"), jar = join(project, "synthetic-native.jar");
 await writeFile(source, "Synthetic freshness fixture only; never compiled or launched.\n");
 await writeFile(jar, "Synthetic local artifact; never supplied to a JVM.\n");
@@ -31,9 +31,6 @@ if (process.env.PROOF_PROFILE_CONTENT !== undefined)
 await utimes(source, new Date(1000), new Date(1000));
 await utimes(jar, new Date(2000), new Date(2000));
 delete process.env.GAMEHARNESS_PROOF_EXPECTED_JAR_SHA256;
-process.env.PATH = `${bin}:${process.env.PATH ?? ""}`;
-await writeFile(join(bin, "ffmpeg"), `#!${process.execPath}\nimport { writeFileSync } from "node:fs";\nwriteFileSync("replay.mp4", "Synthetic replay, not visual evidence");\n`, { mode: 0o700 });
-await writeFile(join(bin, "ffprobe"), `#!${process.execPath}\nimport { readFileSync } from "node:fs";\nconst seconds = readFileSync("replay.ffconcat", "utf8").split("\\n").filter(line => line.startsWith("duration ")).reduce((total, line) => total + Number(line.slice(9)), 0);\nconsole.log(seconds);\n`, { mode: 0o700 });
 
 const closeEntered = Promise.withResolvers<void>(), releaseClose = Promise.withResolvers<void>();
 const captureEntered = Promise.withResolvers<void>();

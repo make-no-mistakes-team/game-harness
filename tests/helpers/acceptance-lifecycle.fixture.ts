@@ -21,11 +21,19 @@ import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding
 import { PrivateJournal } from "../../src/evaluation/private-journal.ts";
 import * as historyModule from "../../src/server/history-reader.ts";
 import type { HistoryQuery, HistoryQueryOptions, HistoryResult } from "../../src/server/history-protocol.ts";
+import * as recording from "../../src/server/recording.ts";
 
 // Only native ownership, Docker provisioning and the authenticated provider
 // factory are substituted. Runner, Runtime, Agent/gates/events, Store, verifier,
 // recorder/codec/owned encoder child, private journal and ledger remain real.
 // All replacements and environment changes live in this isolated subprocess.
+// These offline-renderer ownership cases explicitly select lossless capture.
+mock.module(resolve(import.meta.dir, "../../src/server/recording.ts"), () => ({
+  ...recording,
+  EpisodeRecorder: class extends recording.EpisodeRecorder {
+    constructor(options: recording.RecordingOptions) { super({ ...options, captureMode: "lossless_png" }); }
+  },
+}));
 const [requestedMode, rootArg, ownershipArg] = process.argv.slice(2);
 const studyMode = requestedMode?.startsWith("study-") ?? false;
 const developmentMode = requestedMode?.startsWith("development-") ?? false;

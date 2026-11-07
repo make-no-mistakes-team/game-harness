@@ -71,7 +71,7 @@ try {
     const { EpisodeRecorder } = recording;
     let deliver: ((frame: Uint8Array) => void) | undefined;
     const failures: string[] = [];
-    const recorder = new EpisodeRecorder({ directory,
+    const recorder = new EpisodeRecorder({ directory, captureMode: "lossless_png",
       bridge: { subscribeFrames(callback) { deliver = callback; return () => { deliver = undefined; }; } },
       identity: { episode_id: "episode", run_id: "run", world_id: "world", session_id: "session" },
       onIncomplete: why => failures.push(why) });

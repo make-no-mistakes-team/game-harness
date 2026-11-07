@@ -5,31 +5,44 @@ import { spawn } from "node:child_process";
 import { encodeNativeFramePng } from "./actor-frames.ts";
 import { inspectVideoFrame } from "./video.ts";
 import { normalizeRecordingLimits, type RecordingLimits } from "../shared/evidence-limits.ts";
+import { LiveEpisodeRecorder, renderLiveReplay } from "./recording-live.ts";
 
 async function createDurableArtifact(directory: string, name: string, content: string | Uint8Array) {
   const file = await open(path.join(directory, name), "wx", 0o600);
   try { await file.writeFile(content); await file.sync(); } finally { await file.close(); }
 }
-interface Options {
+export interface RecordingOptions {
   directory: string; bridge: { subscribeFrames(callback: (frame: Uint8Array) => void): () => void };
   identity: { episode_id: string; run_id: string; world_id: string; session_id: string };
   now?: () => number; monotonicNow?: () => number; onIncomplete(reason: string): void;
   limits?: Partial<RecordingLimits>; encode?: typeof encodeNativeFramePng;
+  captureMode?: "live_compressed" | "lossless_png";
+  encoderDrainTimeoutMs?: number;
 }
 export interface RecorderHealth {
   accepting: boolean; delivered_frames: number; stored_frames: number;
   pending_raw_bytes: number; peak_pending_raw_bytes: number; active_encoders: number;
-  queued_frames: number; stored_png_bytes: number; failures: string[];
+  queued_frames: number; stored_png_bytes: number; stored_encoded_bytes: number; failures: string[];
 }
-export interface RecordingManifest {
+export interface LosslessRecordingManifest {
   schema_version: 1; limits: Readonly<RecordingLimits>; health: RecorderHealth;
   timing: { first_capture_at: number | null; last_capture_at: number | null; ended_at: number | null;
     capture_duration_ms: number | null; final_hold_ms: number | null };
   status: "complete" | "incomplete"; audio: "not_recorded"; delivered_frames: number; stored_frames: number;
   end_reason: string; index: string; concat: string; limitations: string[]; failures: string[];
 }
+export interface RecordingSegment {
+  file: string; status: "finalized" | "incomplete"; first_capture_at: number;
+  ended_at: number; frames: number; bytes: number; sha256: string;
+}
+export interface LiveRecordingManifest extends Omit<LosslessRecordingManifest, "schema_version"> {
+  schema_version: 2; capture_mode: "live_compressed"; codec: "h264";
+  video_orientation: "top_down"; nominal_capture_hz: 30; segments: RecordingSegment[];
+  concat_sha256: string;
+}
+export type RecordingManifest = LosslessRecordingManifest | LiveRecordingManifest;
 /** Direct delivered-frame subscription, independent of spectator backpressure/latest selection. */
-export class EpisodeRecorder {
+class LosslessEpisodeRecorder {
   private readonly limits; private readonly now; private readonly monotonic;
   private readonly started: number; private readonly unsubscribe: () => void;
   private readonly ready; private readonly timer;
@@ -43,10 +56,10 @@ export class EpisodeRecorder {
   private failures: string[] = [];
   private indexClosing = false;
   private drained = Promise.withResolvers<void>();
-  private finished: Promise<RecordingManifest> | null = null;
+  private finished: Promise<LosslessRecordingManifest> | null = null;
   private replay: Promise<string> | null = null;
   private concatDigest: string | null = null;
-  constructor(private readonly options: Options) {
+  constructor(private readonly options: RecordingOptions) {
     this.limits = normalizeRecordingLimits(options.limits); this.now = options.now ?? Date.now;
     this.monotonic = options.monotonicNow ?? (() => performance.now()); this.started = this.now();
     this.ready = mkdir(options.directory, { recursive: true, mode: 0o700 }).then(() => open(path.join(options.directory, "frames.jsonl"), "ax", 0o600));
@@ -59,7 +72,7 @@ export class EpisodeRecorder {
   health(): RecorderHealth {
     return { accepting: this.accepting, delivered_frames: this.delivered, stored_frames: this.stored,
       pending_raw_bytes: this.pending, peak_pending_raw_bytes: this.peakPending, active_encoders: this.encoders,
-      queued_frames: this.queue.length, stored_png_bytes: this.bytes, failures: [...this.failures] };
+      queued_frames: this.queue.length, stored_png_bytes: this.bytes, stored_encoded_bytes: 0, failures: [...this.failures] };
   }
   private append(value: unknown) {
     this.tail = this.tail.then(async () => { const file = await this.ready; await file.writeFile(JSON.stringify(value) + "\n"); })
@@ -124,12 +137,12 @@ export class EpisodeRecorder {
     this.commits = commit.catch(() => {});
     return commit;
   }
-  finish(input: { endedAt: number; reason: string }): Promise<RecordingManifest> {
+  finish(input: { endedAt: number; reason: string }): Promise<LosslessRecordingManifest> {
     if (this.finished) return this.finished;
     this.accepting = false; this.unsubscribe(); clearTimeout(this.timer);
     this.finished = this.finalize(input); return this.finished;
   }
-  private async finalize(input: { endedAt: number; reason: string }): Promise<RecordingManifest> {
+  private async finalize(input: { endedAt: number; reason: string }): Promise<LosslessRecordingManifest> {
     if (this.active || this.queue.length) await this.drained.promise;
     this.frames.sort((a, b) => a.ordinal - b.ordinal);
     // This finite (maxFrames) timeline is independent of an index-write failure,
@@ -170,7 +183,7 @@ export class EpisodeRecorder {
       catch (error) { persistenceFailure ??= error; this.fail("recording_index_flush_failed"); }
     }
     const firstCapture = this.frames[0]?.capturedAt ?? null, lastCapture = this.frames.at(-1)?.capturedAt ?? null;
-    const manifest: RecordingManifest = { schema_version: 1, limits: this.limits, health: this.health(),
+    const manifest: LosslessRecordingManifest = { schema_version: 1, limits: this.limits, health: this.health(),
       timing: { first_capture_at: firstCapture, last_capture_at: lastCapture, ended_at: input.endedAt,
         capture_duration_ms: firstCapture !== null && lastCapture !== null ? lastCapture - firstCapture : null,
         final_hold_ms: lastCapture !== null ? input.endedAt - lastCapture : null },
@@ -198,6 +211,24 @@ export class EpisodeRecorder {
   }
 }
 
+/** Live compressed capture by default; exact-pixel protocols must opt in explicitly. */
+export class EpisodeRecorder {
+  private readonly recorder: LosslessEpisodeRecorder | LiveEpisodeRecorder;
+  constructor(options: RecordingOptions) {
+    if (options.captureMode !== undefined && options.captureMode !== "live_compressed" && options.captureMode !== "lossless_png")
+      throw new RangeError("Unknown recording capture mode");
+    if (options.captureMode !== "lossless_png" && options.encode)
+      throw new Error("PNG encoder overrides require explicit lossless_png capture");
+    const timeout = options.encoderDrainTimeoutMs ?? 10000;
+    if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 120000)
+      throw new RangeError("Encoder drain timeout must be an integer from 1 through 120000 milliseconds");
+    this.recorder = options.captureMode === "lossless_png" ? new LosslessEpisodeRecorder(options) : new LiveEpisodeRecorder(options);
+  }
+  health(): RecorderHealth { return this.recorder.health(); }
+  finish(input: { endedAt: number; reason: string }): Promise<RecordingManifest> { return this.recorder.finish(input); }
+  renderReplay(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string> { return this.recorder.renderReplay(options); }
+}
+
 /** Render finalized disk evidence after capture ownership has ended. */
 export async function renderEpisodeReplay({ directory, concatSha256, signal, timeoutMs = 120000 }: {
   directory: string; concatSha256: string; signal?: AbortSignal; timeoutMs?: number;
@@ -210,6 +241,10 @@ export async function renderEpisodeReplay({ directory, concatSha256, signal, tim
   const concat = await readFile(path.join(directory, "replay.ffconcat"), { signal });
   if (createHash("sha256").update(concat).digest("hex") !== concatSha256)
     throw new Error("Recording concat changed after finalization; original evidence retained");
+  const manifest = JSON.parse(await readFile(path.join(directory, "recording-manifest.json"), "utf8")) as RecordingManifest;
+  if (manifest.schema_version === 2)
+    return renderLiveReplay({ directory, manifest, concatSha256, signal, timeoutMs: Math.max(1, deadline - performance.now()) });
+  if (manifest.schema_version !== 1) throw new Error("Unsupported recording manifest version");
   signal?.throwIfAborted();
   if (performance.now() >= deadline) throw new Error("Offline replay rendering deadline reached");
   const closed = Promise.withResolvers<number | null>();

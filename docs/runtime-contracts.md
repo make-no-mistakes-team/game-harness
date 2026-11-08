@@ -68,7 +68,7 @@ The ordinary default exposes these tools:
 | `program_run` | Start a matching `run`/`step`, inspect or stop it, version-update resident intent, run a pure analysis job, activate prepared playing work or select a finite attention wake. |
 | `program_inspect` | Read catalog/source/execution/history/metric/evidence/trace/feedback/comparison/planning and mechanical reference views. |
 | `program_review` | Record `keep` or `insufficient_evidence` for a named version's latest matching outcome, with reason. |
-| `help` | Load generated game/program/planning reference or disclose optional advanced modules on demand. |
+| `help` | Load controller, game, program or planning reference; disclose optional advanced modules on demand. |
 | `task_finish` | Request safe closure of a custom task with a model-authored completion summary; not independent goal verification. |
 
 For a custom task, Main calls `task_finish({summary})` once authorized observations and execution evidence show that the whole requested task is done. A successful program return, completion prose or `game.progress` alone never closes a task. Do not rerun already-satisfied work or wait for the empty-turn limit to stop inference.
@@ -188,6 +188,11 @@ assemble ordered JSON-text chunks and verify their byte count and SHA-256.
 Generated help and source schemas define the callable DTOs.
 
 Write, start and prepare results are compact named status/experiment summaries. Execution inspection includes effective limits and the resident's current bounded snapshot; source inspection supplies code, card and validation details.
+
+`help({topic:"controller"})` exposes the registered frame, resident input/output,
+limits, view motion and attention/intent contracts without the unrelated async
+action and crafting reference. The ordinary prompt asks for complete useful local
+behavior, not a placeholder controller or a new inference after each input burst.
 
 The strategist keeps a run-owned reference context outside its disposable Agent. Each actual SDK stream invocation, including tool-loop continuations, receives a supplement capped at 32 KiB serialized UTF-8: compact contracts, objective, model-authored recovery state, latest consequential obstruction, unresolved-operation references, relevant compatible immutable source and useful requested help. This is included in the actual request, not merely cached on the host. Source and its reuse metadata share an 18 KiB allowance; retained help has a 24 KiB ceiling. Both share the same 32 KiB request cap rather than additive reservations. Requested executable-format, temporal-view, resident and native-invocation mechanics take precedence, followed by complete native action alternatives, other reference prose, game-adapter metadata and observation/read/result schemas. Native method references keep their invocation fields separate from embedded result schemas. This ordering also applies when source and unresolved-effect history compete for the final request budget, independently of help-topic request order. Top-level action `anyOf`/`oneOf` alternatives stay whole: an alternative over the 6 KiB section bound is omitted, not split into detached properties. Other oversized documentation is split at schema/property boundaries. Retained help remains partial; omission references distinguish section, retained-help and final-request byte limits, while `omitted_records` counts details/notices that no longer fit. The supplement directs the model to re-request the corresponding `help` topic for the full current contract. Whole sources are either included or explicitly omitted, never truncated into executable fragments. This supplements, rather than replaces, bounded current observations, tool pairs and turn feedback.
 
@@ -537,12 +542,20 @@ intent updates can preserve a useful controller during reasoning. This is
 an instruction to the model, not proof of natural gameplay or elimination
 of cold authoring time.
 
-World `held` is the final state after applying ordered `edges` to the
-previous submitted state, initially neutral. Every changed held boolean
-needs its matching press or release edge. Track submitted state separately
-from the potentially lagging `last_input` application acknowledgment.
-Before screen input, submit neutral world state with the required releases.
-A non-running result retires without submitting its returned input.
+Actor world input requires all nine desired `held` booleans. When `edges`
+is omitted, the host derives one press/release per changed boolean from the
+last successfully submitted state, initially neutral. An unchanged attack
+or use hold never generates another click. Derived edges consume the same
+finite edge budgets and pass the same strict native validation as explicit
+ones; stale intent cannot update that submitted baseline.
+
+Explicit `edges`, including `[]`, retain exact ordered/counting semantics.
+Every held change then needs its matching press or release; inconsistent
+lists are rejected rather than repaired. Native input still requires a
+complete explicit list. Authors constructing explicit transitions must
+track submitted state separately from the potentially lagging `last_input`
+ACK. Before screen input, submit neutral held with omitted edges or exact
+releases. A non-running result retires without submitting its returned input.
 
 ### Authored view motion
 
@@ -629,8 +642,12 @@ They can contribute adapter-owned verification facts without a finite
 Visible cursor or slot changes can precede gesture completion. A dependent
 GUI operation waits for the matching application acknowledgment and terminal
 effect receipt; empty screen operations keep sampling while it is pending.
-An unknown result must not be replayed. Full execution inspection includes
-`resident.reason` when a generic execution summary omits the rejection cause.
+An unknown result must not be replayed. Applicable terminal non-success
+resident summaries include `resident:{status,reason}`, with reason capped
+at 300 code units. The next ordinary failure feedback and retained source
+outcome reuse that projection without another inspection request. Full
+execution inspection retains the complete snapshot; compact feedback adds
+no resident state, intent or raw execution exception object.
 
 `args` supplies initial intent; `initial_state` defaults to null at actor
 ingress. `update_intent` requires the current `expected_version` (initially
@@ -764,6 +781,11 @@ Durable `(run_id,start_key)` admission commits the original request fingerprint 
 Each execution uses a dedicated restricted Docker container. Runnable computation has an external deadline; only a trusted host-known bounded capability wait suspends it. Worker heartbeats cannot extend authority. Cancellation fences capabilities first and waits for confirmed cleanup. Emitter closure cannot establish that prior game effects never occurred.
 
 Keep closure barriers separate from outcome classification. An action/root can remain `unknown` after confirmed input neutralization and sandbox cleanup; historical uncertainty alone is not a live writer. `GameBridge.neutralize(expectedOwner): Promise<void>` compares the operation owner before requesting its native input barrier. Trusted lifecycle fences use the separate global `emergencyStop(reason)` operation. Pause/Stop await native/worker/planner/action drain, including worker closure when cancellation fails, without rewriting unknown effects. A missing acknowledgement cannot establish safety; unconfirmable transport/emitter failure still closes the owned client fail-closed.
+
+Acceptance finalization joins Runtime retirement before closing the native
+fixture, so a signal cannot destroy the emitter that must acknowledge
+release. A failed Runtime drain still proceeds to physical native
+containment under the original cleanup budget.
 
 A healthy, connected, alive session can reconcile an unknown effect autonomously rather than requiring operator Resume. Synchronously fence the affected root, planner, policies and leases; retain the unknown ledger without replay; await actual native neutralization and every worker's closure; then obtain a fresh authorized observation matching that session and life. Only after these gates pass create one new strategic generation and one `uncertainty` wake with compact outcome/reconciliation evidence. The model chooses whether to revise or admit new work; infrastructure never repeats the uncertain effect.
 
@@ -1104,11 +1126,11 @@ At that decision turn, the model also considers cross-session reuse: submit `exp
 
 ### Ordinary authoring while a root runs
 
-An admitted foreground root opens one authoring window bound to its actual Store execution, exact source hash and run/generation/session/life/boot/space scope. The next supported SDK request boundary selects the authoring catalog after the original submit/start tool group returns. The same strategic agent can then continue naturally for at most three admitted calls, twelve tools and 60,000 ms, within the original turn and root deadlines. The actual provider request receives the phase contract, named source/version/hash and remaining allowance inside the existing 32 KiB context supplement.
+An admitted foreground root opens one authoring window bound to its actual Store execution, exact source hash and run/generation/session/life/boot/space scope. Outside an explicit ordinary decision turn, the next supported SDK request boundary selects the authoring catalog after the original submit/start tool group returns. The same strategic agent can then continue naturally for at most three admitted calls, twelve tools and 60,000 ms, within the original turn and root deadlines. The actual provider request receives the phase contract, named source/version/hash and remaining allowance inside the existing 32 KiB context supplement.
 
 Authoring allows `observe`, `help`, read-only `program_inspect` and pure `program_write`. A successful write saves an immutable inactive version; it cannot submit, start, activate, stage a successor, finish the task, mutate memory/reflexes or record a review. The playing root and its effect lease continue under their original budgets. No polling timer, keepalive request, second actor or additional transport owner is introduced.
 
-Calls and tools share the root's allowance across selected/resident wakes, child/leaf admissions, inactive revisions and intent updates. Exhaustion stays latched until a genuinely new root or a new run; repeated admission does not reset counts or time. An already admitted inactive turn may finish after successful predecessor settlement within its original window; settlement grants no new turn or effect authority. An unsuccessful root outcome revokes that lane at the ordinary outcome wake rather than spending its remaining authoring calls before handling the failure. Saved drafts remain available, but late commits are fenced. Scope loss, Stop and the finite window timer also fence captured asynchronous tool commits and late results. Host window expiry cancels/drains authoring transport without pausing a healthy body or labeling expiry as a provider outage. A genuine provider failure still follows normal pause handling; absent usage remains unknown. Entry/exit events retain the reason, root/source identity and counters.
+Inactive authoring calls and tools share the root's allowance across passive continuations, child/leaf admissions, inactive revisions and intent updates. Exhaustion stays latched until a genuinely new root or a new run; repeated admission does not reset counts or time. Explicit decision turns use their ordinary limits without renewing this authoring allowance. An already admitted inactive turn may finish after successful predecessor settlement within its original window; settlement grants no new turn or effect authority. An unsuccessful root outcome revokes that lane at the ordinary outcome wake rather than spending its remaining authoring calls before handling the failure. Saved drafts remain available, but late commits are fenced. Scope loss, Stop and the finite window timer also fence captured asynchronous tool commits and late results. Host window expiry cancels/drains authoring transport without pausing a healthy body or labeling expiry as a provider outage. A genuine provider failure still follows normal pause handling; absent usage remains unknown. Entry/exit events retain the reason, root/source identity and counters.
 
 Model-authored resident `attention` with `urgency:"urgent"` and a reactive `policy_interrupt` revoke inactive authoring immediately, including settlement grace and request-free publication seams. Already saved immutable drafts remain; late writes cannot commit. The exact admitted request drains before a fresh decision uses the single strategic owner. Repeated urgent wakes coalesce rather than repeatedly aborting the same SDK turn. Urgent diagnostic events are not attention. Ordinary attention preserves useful settlement grace. None of these scheduler events supplies a defensive action or changes the playing controller's input.
 
@@ -1120,7 +1142,7 @@ Only a final SDK `aborted` response with intent captured before its callback qua
 
 An uncertainty fence cancels authoring without converting the preceding unknown action into failure or success. New strategy still waits for old emitters to drain, acknowledged native neutralization and a fresh same-life observation. Stop remains Stop; cancellation provenance cannot reopen admission or replay the interrupted action.
 
-Root outcomes and attention remain queued behind the existing single-flight owner. Explicit selected/resident attention and meaningful recovery/outcome signals retain their existing bounded ordinary decision request, including current-root intent updates and stop. That decision remains available after inactive authoring is exhausted; its later natural continuation must use the remaining authoring allowance and cannot renew it. A gate that admits zero calls does not consume the evidence cursor. Explicit speculative lookahead and post-goal review keep their own roles and finite allowances; neither renews or lends calls to ordinary authoring.
+Root outcomes and attention remain queued behind the existing single-flight owner. Explicit selected/resident attention and meaningful recovery/outcome signals admit an ordinary decision turn, including current-root intent updates and Stop. Intermediate inspection, help and observation requests do not consume all decision authority: it lasts until that turn ends, under the existing twelve-call, forty-eight-tool and 120-second limits. It remains available after inactive authoring is exhausted without renewing root deadlines or authoring budgets. Passive continuation cannot acquire this authority. A gate that admits zero calls does not consume the evidence cursor. Explicit speculative lookahead and post-goal review keep their own roles and finite allowances; neither renews or lends calls to ordinary authoring.
 
 ### Bounded speculative planning
 

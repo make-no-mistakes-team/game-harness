@@ -48,7 +48,7 @@ Executable types live in [`src/shared/programs.ts`](../src/shared/programs.ts); 
 
 Full native reader/result, observation and capability schemas remain available through `help {topic:"game"}`. Selected action families have distinct retained references, subject to the existing help/request byte caps and explicit omissions. A selected family's schema is retained whole or omitted whole, never split into a partial family that silently loses an alternative or bound. This reference routing changes neither playing authority nor observation permissions.
 
-`run` remains an async JavaScript body with host-bound `game,args`. `step` and `analyze` are ordinary modules with one synchronous named function export: `step(frame,state,intent)` or `analyze(input)`. Pure helpers and constants are allowed; imports, packages and ambient host access are rejected. Original and canonical source each have a 16 KiB UTF-8 bound. These formats share the existing artifact store and exact-version publication path.
+`run` remains an async JavaScript body with host-bound `game,args`. It can implement a finite procedure or an ongoing semantic feedback loop within its declared finite root limits; ongoing play does not require raw-input reimplementation. `step` and `analyze` are ordinary modules with one synchronous named function export: `step(frame,state,intent)` or `analyze(input)`. Pure helpers and constants are allowed; imports, packages and ambient host access are rejected. Original and canonical source each have a 16 KiB UTF-8 bound. These formats share the existing artifact store and exact-version publication path.
 
 Pure modules also receive the realm-local, frozen `motion.turn(options,state)`
 math binding. The caller supplies actual `native_tick` and applied pose, its
@@ -1686,6 +1686,12 @@ Accumulated jumping distance is not ascent. Forward input follows the camera
 while `move.look` turns; in confined geometry, an ordinary completed `look`
 can establish orientation before moving. A separate completed jump does not
 keep the player airborne through a later observation, aim and placement.
+
+`attack` sends one vanilla strike using the current main hand; it does not
+equip a weapon or select a combat strategy. `dig` also uses the held item and
+can wear or break it. An earlier successful equipment change does not establish
+that the item remains available later. Authored code must check its own current
+resource/equipment preconditions and choose what to do when they no longer hold.
 
 Placement preflight checks the requested visible face and vanilla block-item
 placement state, replacement and collision before equipping or dispatching

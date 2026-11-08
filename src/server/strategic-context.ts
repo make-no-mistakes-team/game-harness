@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Context, Model } from "@oh-my-pi/pi-ai";
 import type { ActivityEvent, Json, ObservationV3, RuntimeAdapter } from "../shared/contracts.ts";
-import type { SkillView } from "../shared/programs.ts";
+import type { SkillExecutionView, SkillView } from "../shared/programs.ts";
 import { PROGRAM_RESULT_GUIDANCE, SKILL_API_VERSION } from "../shared/programs.ts";
 import { ProgramWorkspace, type ProgramSelector } from "./program-workspace.ts";
 import type { Store, StoredRun } from "./store.ts";
@@ -62,7 +62,7 @@ function object(value: unknown): Record<string, unknown> | null {
 function bytes(value: unknown): number { return Buffer.byteLength(JSON.stringify(value)); }
 // Notes are model-authored JSON, not restored observations or executable
 // authority. Keep local positions, but discard handles, snapshots and traces.
-function boundedNote(value: unknown, limit = NOTE_BYTES): { value: Json; omitted: boolean } {
+function boundedNote(value: unknown, limit = NOTE_BYTES, executionArguments = false): { value: Json; omitted: boolean } {
   let omitted = false;
   const visit = (input: unknown, depth: number): Json => {
     if (input === null || typeof input === "boolean" || typeof input === "number" && Number.isFinite(input)) return input;
@@ -86,7 +86,8 @@ function boundedNote(value: unknown, limit = NOTE_BYTES): { value: Json; omitted
     for (const [key, child] of Object.entries(fields)) {
       if (key.length > 80 || /(?:^|_)(?:id|ids)$/.test(key) ||
         ["target", "targets", "incarnation", "scope", "args", "history", "blocks", "entities", "observation",
-          "player", "inventory", "inventory_before", "inventory_after", "space_epoch", "run_generation", "observation_seq"].includes(key)) {
+          "player", "inventory", "inventory_before", "inventory_after", "space_epoch", "run_generation", "observation_seq"].includes(key) ||
+        executionArguments && ["worker", "state", "initial_state", "intent", "authority", "controller", "resident"].includes(key)) {
         omitted = true; continue;
       }
       if (Object.keys(result).length === 32) { omitted = true; break; }
@@ -594,14 +595,15 @@ export class StrategicContext {
       ...(error ? { error: { code: String(error.code ?? "unknown").slice(0, 80), message: String(error.message ?? "").slice(0, 300) } } : {}) };
   }
 
-  private programExecution(run: StoredRun, program: SkillView, workspace: ProgramWorkspace) {
-    const id = this.lastExecutions.get(`${program.skill_id}:${program.version}`);
+  private programExecution(run: StoredRun, program: SkillView, workspace: ProgramWorkspace, executionId?: string) {
+    const id = executionId ?? this.lastExecutions.get(`${program.skill_id}:${program.version}`);
     const execution = id ? this.store.skillExecution(run.run_id, { execution_id: id }) : null;
     if (!execution || execution.world_id !== run.world_id || execution.compatibility_hash !== run.compatibility_hash) return null;
     const reference = workspace.executionReference(execution.execution_id);
     if (!reference) return null;
-    const { resident } = workspace.executionSummary(execution);
-    const args = boundedNote(execution.args, 1024);
+    const resident = execution.entry === "step" && execution.resident
+      ? { status: execution.resident.status, reason: execution.resident.reason?.slice(0, 300) ?? null } : null;
+    const args = boundedNote(execution.args, 1024, true);
     const result = execution.result ? boundedNote(execution.result.result, 1024) : null;
     return { ...reference, historical: true, current_authority: false, gameplay_success_proof: false,
       original_scope: { world_id: execution.world_id, session_id: execution.session_id, life_id: execution.life_id,
@@ -622,6 +624,7 @@ export class StrategicContext {
       omissions.push({ kind: "pending_authoring", reference: "phase_contract", reason: "projection_byte_budget" });
     const latest = this.store.latestRootExecution(run.run_id);
     const candidates: SkillView[] = [];
+    let recentResident: SkillExecutionView | null = null;
     const add = (program: SkillView | null) => {
       if (!program || candidates.some(value => value.skill_id === program.skill_id && value.version === program.version)) return;
       if (program.validation.runtime_version !== SKILL_API_VERSION || program.validation.api_version !== SKILL_API_VERSION ||
@@ -630,6 +633,25 @@ export class StrategicContext {
           !this.selected.some(selector => selector.name === program.name && selector.version === program.version)) return;
       candidates.push(program);
     };
+    // Keep one actually dispatched root resident before finite procedures and
+    // inactive drafts consume the source allowance. This is source knowledge,
+    // not a recommendation, recovered worker or permission to resume.
+    const seenResidents = new Set<string>();
+    for (const execution of this.store.skillExecutions(run.run_id)) {
+      if (execution.entry !== "step" || execution.parent_execution_id) continue;
+      const key = `${execution.skill_id}:${execution.version}`;
+      if (seenResidents.has(key)) continue;
+      // An undispatched admission does not supersede the executed example.
+      if (execution.started_at === null && execution.status !== "failed" && execution.status !== "unknown") continue;
+      seenResidents.add(key);
+      if (execution.started_at === null || execution.status === "failed" || execution.status === "unknown" ||
+          execution.resident?.status === "failed" || execution.resident?.status === "unknown" ||
+          execution.world_id !== run.world_id || execution.compatibility_hash !== run.compatibility_hash) continue;
+      const program = this.store.skill(run.run_id, execution);
+      if (program.hash !== execution.source_hash) continue;
+      add(program);
+      if (candidates.length) { recentResident = execution; break; }
+    }
     if (latest) add(this.store.skill(run.run_id, latest));
     for (const selector of this.selected) add(this.store.namedSkill(run.run_id, selector.name, selector.version));
     for (const entry of workspace.catalog(0, 3).records) add(this.store.namedSkill(run.run_id, entry.name, entry.version));
@@ -700,7 +722,9 @@ export class StrategicContext {
     }
     let used = 0;
     for (const program of candidates) {
-      const metadata = this.programExecution(run, program, workspace);
+      const metadata = this.programExecution(run, program, workspace,
+        recentResident?.skill_id === program.skill_id && recentResident.version === program.version
+          ? recentResident.execution_id : undefined);
       const entry = { name: program.name, version: program.version, hash: program.hash, source: program.source,
         ...(metadata ? { last_execution: metadata } : {}) };
       const size = bytes(entry);
@@ -714,7 +738,9 @@ export class StrategicContext {
           omit({ kind: "program_execution", reference: `${program.name}@${program.version}`,
             reason: "reuse_metadata_byte_budget_use_program_inspect" });
         }
-        value.programs.push(reference); used += bytes(reference);
+        if (used + bytes(reference) <= SOURCE_BYTES && Buffer.byteLength(encoded()) + bytes(reference) + 512 <= INPUT_BYTES) {
+          value.programs.push(reference); used += bytes(reference);
+        } else omit({ kind: "program", reference: `${program.name}@${program.version}`, reason: "reference_byte_budget_use_program_inspect" });
         omit({ kind: "source", reference: `${program.name}@${program.version}`, reason: "whole_source_byte_budget", original_bytes: size });
       }
     }

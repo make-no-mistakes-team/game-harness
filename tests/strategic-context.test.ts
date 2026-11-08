@@ -1204,6 +1204,203 @@ test("program reuse carries sanitized arguments and last outcome through named o
   expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32768);
 });
 
+function residentReferenceSource(revision: number) {
+  const modes = Array.from({ length: 80 }, (_, index) => ({
+    name: `bounded-observation-mode-${revision}-${index}`, max_frames: 40 + index,
+    minimum_health: index % 20, minimum_food: index % 21, forward: index % 2 === 0,
+  }));
+  return `const modes = ${JSON.stringify(modes)};
+export function step(frame,state,intent) {
+  const mode = modes.find(value => value.name === intent.mode) || modes[0];
+  const frames = (state?.frames || 0) + 1;
+  const permitted = frame.player.health >= mode.minimum_health && frame.player.food >= mode.minimum_food;
+  return {input:{kind:"world",held:{forward:permitted && mode.forward,back:false,left:false,right:false,jump:false,sprint:false,sneak:false,attack:false,use:false},
+    edges:[],view:{kind:"unchanged"},selected_hotbar:null},next_state:{frames},
+    status:frames >= mode.max_frames ? "completed" : "running",events:[]};
+}`;
+}
+
+async function residentReference(f: ReturnType<typeof fixture>, revision = 1) {
+  return f.store.registerSkill(f.state.run.run_id, { entry: "step", name: "Reusable resident",
+    source: residentReferenceSource(revision), dependencies: [],
+    card: { purpose: "Use an explicitly selected bounded observation mode", applicability: "Fixture",
+      method: "Apply the selected mode until its frame bound", reason: "Historical source retention",
+      limitations: "No gameplay efficacy established" },
+    validation: { runtime_version: 5, api_version: 5, validator_version: 5,
+      compatibility_hash: f.state.run.compatibility_hash!, fingerprint: "fixture", formatted_lines: 10, complexity: 4, nesting: 1 } });
+}
+
+function executeResidentReference(f: ReturnType<typeof fixture>, skill: SkillView,
+  status: "cancelled" | "succeeded" | "failed" | "unknown" = "cancelled") {
+  const execution = f.store.admitSkill(f.state.run.run_id, { entry: "step",
+    skill_id: skill.skill_id, version: skill.version, start_key: `resident-reference-${f.store.lastEventSeq()}`,
+    ...executionScopeFixture(f.state.run),
+    args: { mode: "bounded-observation-mode-1-3", count: 4, options: { distance: 3, target_id: "OLD_RESIDENT_TARGET" },
+      worker: "OLD_RESIDENT_WORKER", state: { secret: "OLD_RESIDENT_STATE" },
+      intent: { secret: "OLD_RESIDENT_INTENT" }, authority: "OLD_RESIDENT_AUTHORITY",
+      target: { id: "OLD_RESIDENT_TARGET" }, inventory: ["OLD_RESIDENT_INVENTORY"], padding: "界".repeat(1000) },
+    initial_state: { private: "OLD_RESIDENT_INITIAL_STATE" }, limits: { ...DEFAULT_RESIDENT_LIMITS },
+  }).view;
+  if (execution.entry !== "step") throw new Error("Expected a resident reference");
+  execution.status = "running"; execution.started_at = new Date().toISOString();
+  f.store.updateSkillExecution(execution, "skill.running", "Reference resident dispatched");
+  const timing = { count: 1, p50: 1, p95: 1, p99: 1, max: 1, omitted_samples: 0 };
+  execution.resident = {
+    execution_id: execution.execution_id, source_hash: skill.hash, controller_generation: 1,
+    host_clock_id: "OLD_RESIDENT_CLOCK", status: status === "succeeded" ? "completed" : status === "cancelled" ? "stopped" : status,
+    reason: status === "cancelled" ? "explicit_handoff" : `resident_${status}`, intent_version: 7,
+    state: { private: "OLD_RESIDENT_RUNTIME_STATE" }, processed_frame_seq: 4, processed_native_tick: 4, processed_native_ns: "4",
+    counters: { frames: 4, steps: 4, submissions: 4, applied_sequence: 4, ordered_edge_prefix: 0,
+      missed_slots: 0, stale_results: 0, stale_frames: 0, read_failures: 0, no_input_decisions: 0,
+      expanded_edges: 0, events: 0, analysis_jobs: 0, analysis_ms: 0 },
+    pending: { frames: 0, edges: 0, analysis: false }, last_input: null,
+    timings: { step_ms: timing, input_age_ms: timing }, events: [],
+    cleanup: { worker: "closed", native: "retired" },
+  };
+  execution.status = status; execution.ended_at = new Date().toISOString();
+  if (status === "succeeded") execution.result = { status: "completed", summary: "Authored frame bound reached", result: null };
+  f.store.updateSkillExecution(execution, "skill.closed", `Reference resident ${status}`, { status });
+  return execution;
+}
+
+function finishReferenceProcedure(f: ReturnType<typeof fixture>, skill: SkillView) {
+  const execution = f.execution(skill, { count: 1 });
+  execution.status = "running"; execution.started_at = new Date().toISOString();
+  f.store.updateSkillExecution(execution, "skill.running", "Finite reference procedure dispatched");
+  execution.status = "succeeded"; execution.ended_at = new Date().toISOString();
+  execution.result = { status: "completed", summary: "Finite procedure ended", result: null };
+  f.store.updateSkillExecution(execution, "skill.closed", execution.result.summary, { status: execution.status });
+}
+
+for (const status of ["cancelled", "succeeded"] as const)
+  test(`next SDK request retains exact ${status} resident source and historical arguments behind a finite procedure and inactive draft`, async () => {
+    const f = fixture();
+    await f.planner.start(1); await f.turn();
+    const skill = await residentReference(f), execution = executeResidentReference(f, skill, status);
+    finishReferenceProcedure(f, await f.program());
+    const draft = await residentReference(f, 2);
+    await f.program(undefined, "Other inactive procedure");
+    await f.program(undefined, "Newest inactive procedure");
+    await f.turn();
+    const request = f.state.requests.at(-1), context = retained(request)!;
+    const reference = context.programs.find((program: any) => program.name === skill.name && program.version === skill.version);
+    expect(reference).toMatchObject({ name: skill.name, version: skill.version, hash: skill.hash, source: skill.source,
+      last_execution: {
+        status, historical: true, current_authority: false, gameplay_success_proof: false,
+        original_scope: { world_id: execution.world_id, session_id: execution.session_id, life_id: execution.life_id,
+          native_boot_id: execution.native_boot_id, space_epoch: execution.space_epoch },
+        resident: { status: execution.resident!.status, reason: execution.resident!.reason },
+        argument_sample: { mode: "bounded-observation-mode-1-3", count: 4, options: { distance: 3 } },
+        argument_sample_omitted: true,
+      } });
+    expect(reference.last_execution.argument_sample).toEqual({ mode: "bounded-observation-mode-1-3", count: 4, options: { distance: 3 } });
+    expect(Buffer.byteLength(JSON.stringify(reference.last_execution.argument_sample))).toBeLessThanOrEqual(1024);
+    expect(context.programs.find((program: any) => program.name === draft.name && program.version === draft.version)?.source).toBeUndefined();
+    expect(context.omissions).toContainEqual(expect.objectContaining({ kind: "source", reference: `${draft.name}@${draft.version}` }));
+    expect(context.authored_state).not.toHaveProperty("state");
+    expect(context.authored_state).not.toHaveProperty("intent");
+    expect(Buffer.byteLength(context.programs.map((program: unknown) => JSON.stringify(program)).join(""))).toBeLessThanOrEqual(18432);
+    expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32768);
+    for (const program of context.programs) if (program.source !== undefined)
+      expect(program.source).toBe(f.store.namedSkill(f.state.run.run_id, program.name, program.version)!.source);
+    for (const marker of ["OLD_RESIDENT_TARGET", "OLD_RESIDENT_WORKER", "OLD_RESIDENT_STATE", "OLD_RESIDENT_INTENT",
+      "OLD_RESIDENT_AUTHORITY", "OLD_RESIDENT_INVENTORY", "OLD_RESIDENT_INITIAL_STATE", "OLD_RESIDENT_RUNTIME_STATE",
+      "OLD_RESIDENT_CLOCK", execution.execution_id])
+      expect(JSON.stringify(request)).not.toContain(marker);
+    expect(f.state.toolEffects).toBe(0);
+    expect(f.state.helpEffects).toBe(0);
+    const store = await f.reopen();
+    const reopened = JSON.parse(new StrategicContext(store).assemble(f.state.run)).strategic_context;
+    expect(reopened.programs.find((program: any) => program.name === skill.name && program.version === skill.version)).toEqual(reference);
+    expect(store.skillExecution(f.state.run.run_id, { execution_id: execution.execution_id })?.status).toBe(status);
+  });
+
+for (const status of ["failed", "unknown"] as const)
+  test(`newer ${status} resident source cannot displace the previous non-failed executed version`, async () => {
+    const f = fixture(), previous = await residentReference(f);
+    executeResidentReference(f, previous);
+    const newer = await residentReference(f, 2);
+    executeResidentReference(f, newer, status);
+    finishReferenceProcedure(f, await f.program());
+    await f.planner.start(1); await f.turn();
+    const context = retained(f.state.requests.at(-1))!;
+    expect(context.programs[0]).toMatchObject({ name: previous.name, version: previous.version, source: previous.source,
+      last_execution: { status: "cancelled", current_authority: false, gameplay_success_proof: false } });
+    expect(context.programs.find((program: any) => program.name === newer.name && program.version === newer.version)?.source).toBeUndefined();
+    expect(context.omissions).toContainEqual(expect.objectContaining({ kind: "source", reference: `${newer.name}@${newer.version}` }));
+    expect(f.state.toolEffects).toBe(0);
+  });
+
+test("an undispatched resident admission retains the actual previous execution sample instead of its new inputs", async () => {
+  const f = fixture(), skill = await residentReference(f), executed = executeResidentReference(f, skill);
+  finishReferenceProcedure(f, await f.program());
+  const admitted = f.store.admitSkill(f.state.run.run_id, { entry: "step",
+    skill_id: skill.skill_id, version: skill.version, start_key: "not-dispatched-reference",
+    ...executionScopeFixture(f.state.run), args: { mode: "UNEXECUTED_ARGUMENT_SAMPLE" },
+    initial_state: { private: "UNEXECUTED_INITIAL_STATE" }, limits: { ...DEFAULT_RESIDENT_LIMITS },
+  }).view;
+  await residentReference(f, 2);
+  await f.planner.start(1); await f.turn();
+  const context = retained(f.state.requests.at(-1))!;
+  expect(context.programs[0]).toMatchObject({ name: skill.name, version: skill.version, source: skill.source,
+    last_execution: { status: "cancelled", historical: true, current_authority: false, gameplay_success_proof: false,
+      argument_sample: { mode: "bounded-observation-mode-1-3", count: 4, options: { distance: 3 } } } });
+  const reference = new ProgramWorkspace(f.store, f.state.run.run_id).executionReference(executed.execution_id);
+  expect(context.programs[0].last_execution.execution_ordinal).toBe(reference!.execution_ordinal);
+  expect(JSON.stringify(context.programs[0])).not.toContain("UNEXECUTED");
+  expect(f.store.skillExecution(f.state.run.run_id, { execution_id: admitted.execution_id })).toMatchObject({
+    status: "accepted", started_at: null,
+  });
+  expect(f.state.toolEffects).toBe(0);
+});
+
+test("a newer failed execution of the same resident version prevents preferring its older non-failed execution", async () => {
+  const f = fixture(), skill = await residentReference(f);
+  executeResidentReference(f, skill);
+  executeResidentReference(f, skill, "failed");
+  const finite = await f.program(); finishReferenceProcedure(f, finite);
+  const draft = await residentReference(f, 2);
+  await f.planner.start(1); await f.turn();
+  const context = retained(f.state.requests.at(-1))!;
+  expect(context.programs[0]).toMatchObject({ name: finite.name, version: finite.version, source: finite.source });
+  expect(context.programs).not.toContainEqual(expect.objectContaining({ name: skill.name, version: skill.version }));
+  expect(context.programs).toContainEqual(expect.objectContaining({ name: draft.name, version: draft.version, source: draft.source }));
+  expect(f.state.toolEffects).toBe(0);
+});
+
+for (const changed of ["task", "world", "profile", "life", "session", "boot", "space"] as const)
+  test(`executed resident knowledge crosses ${changed} only under the existing historical source rules`, async () => {
+    const f = fixture(), skill = await residentReference(f), execution = executeResidentReference(f, skill);
+    finishReferenceProcedure(f, await f.program());
+    await residentReference(f, 2);
+    await f.planner.start(1); await f.turn(); await f.planner.close();
+    if (changed === "task") f.state.run.task = "Replacement resident reference task";
+    if (changed === "world") { f.state.run.world_id = "replacement-world"; f.state.observation.world_id = "replacement-world"; }
+    if (changed === "profile") {
+      f.state.adapter = minecraftTestAdapter("precise");
+      f.state.observation = minecraftObservationFixture(f.state.adapter);
+      f.state.run.compatibility_hash = f.state.observation.compatibility_hash;
+    }
+    if (changed === "life") { f.state.run.life_id = 2; f.state.observation.life.life_id = 2; }
+    if (changed === "session") { f.state.run.session_id = "replacement-session"; f.state.observation.session_id = "replacement-session"; }
+    if (changed === "boot") { f.state.run.native_boot_id = "replacement-boot"; f.state.observation.native_boot_id = "replacement-boot"; }
+    if (changed === "space") { f.state.run.space_epoch = 2; f.state.observation.space.space_epoch = 2; }
+    f.store.saveRun(f.state.run); f.state.generation++;
+    await f.planner.start(f.state.generation); await f.turn();
+    const context = retained(f.state.requests.at(-1))!;
+    if (changed === "task" || changed === "world" || changed === "profile") expect(context.programs).toEqual([]);
+    else {
+      expect(context.programs[0]).toMatchObject({ name: skill.name, version: skill.version, source: skill.source,
+        last_execution: { historical: true, current_authority: false, gameplay_success_proof: false,
+          original_scope: { world_id: execution.world_id, session_id: execution.session_id,
+            life_id: execution.life_id, native_boot_id: execution.native_boot_id, space_epoch: execution.space_epoch } } });
+      expect(context.authored_state).not.toHaveProperty("latest_root_result");
+      expect(context.latest_failure).toBeNull();
+    }
+    expect(f.state.toolEffects).toBe(0);
+    expect(f.store.skillExecution(f.state.run.run_id, { execution_id: execution.execution_id })?.status).toBe("cancelled");
+  });
+
 test("source and reuse metadata share their allowance without displacing bounded no-replay history", async () => {
   const f = fixture(), source = `/*${"s".repeat(15800)}*/return {status:"blocked",summary:"Bound",result:null};`;
   const first = await f.program(source, "First large reference"), second = await f.program(source, "Second large reference");

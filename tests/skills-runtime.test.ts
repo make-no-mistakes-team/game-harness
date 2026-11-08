@@ -11,6 +11,7 @@ import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type { GameActionResult, GameBridge, Json, ObservationV3 } from "../src/shared/contracts.ts";
 import type {
+  SkillCapabilityRequest,
   SkillLimits,
   SkillRef,
   SkillResult,
@@ -51,6 +52,19 @@ const completed: SkillResult = {
   summary: "Measured fixture finished",
   result: null,
 };
+function abortableRunner(body: Runner): Runner {
+  return async (source, args, handle, limits, signal, hooks) => {
+    const aborted = deferred<never>();
+    const abort = () => aborted.reject(new Error("Fixture worker authority revoked"));
+    signal.addEventListener("abort", abort, { once: true });
+    try {
+      if (signal.aborted) abort();
+      return await Promise.race([body(source, args, handle, limits, signal, hooks), aborted.promise]);
+    } finally {
+      signal.removeEventListener("abort", abort);
+    }
+  };
+}
 const success: GameActionResult = {
   status: "succeeded",
   summary: "Confirmed bounded fixture action",
@@ -1341,5 +1355,315 @@ return {status:"completed",summary:"Must not override exhausted authority",resul
         ?.status,
     ).toBe("unknown");
     expect(unsafe()).toBeGreaterThan(0);
+  });
+});
+
+describe("semantic handoff capability boundaries", () => {
+  const action: SkillCapabilityRequest = { kind: "action", action: { kind: "look", yaw: 0.1, pitch: 0 } };
+  const read: SkillCapabilityRequest = { kind: "adapter", capability_id: "minecraft.recipes", version: 1, args: { item: "crafting_table" } };
+
+  for (const boundary of ["action", "observe", "adapter"] as const)
+    for (const nested of [false, true])
+      test(`${nested ? "descendant" : "root"} ${boundary} settles before retirement without admitting any continuation`, async () => {
+        const entered = deferred<void>(), release = deferred<void>();
+        let effects = 0, reads = 0, cancellations = 0, wakes = 0, rejected = 0;
+        let leafId = "", leafSignal: AbortSignal | undefined;
+        const request: SkillCapabilityRequest = boundary === "action" ? action : boundary === "adapter" ? read : { kind: "observe" };
+        const { store, run, manager } = fixture(async (_source, args, handle, _limits, signal) => {
+          if (nested && args !== "leaf") {
+            await handle({ kind: "call", skill: { name: args === "middle" ? "boundary leaf" : "boundary middle" },
+              args: args === "middle" ? "leaf" : "middle" });
+            throw new Error("A retired parent must not resume");
+          }
+          leafSignal = signal;
+          await handle(request);
+          // A synthetic transport deliberately tries again even after abort.
+          // All capability kinds must fail before budgets or publication.
+          expect(signal.aborted).toBe(true);
+          const late: SkillCapabilityRequest[] = [
+            action, { kind: "observe" }, read,
+            { kind: "progress", summary: "Forbidden late progress", details: null },
+            { kind: "attention", attention: { urgency: "urgent", summary: "Forbidden late attention", details: null } },
+            { kind: "call", skill: { name: "boundary leaf" }, args: "leaf" },
+          ];
+          for (const capability of late) {
+            try { await handle(capability); } catch { rejected++; }
+          }
+          return completed;
+        }, {
+          action: async (execution, _action, signal) => {
+            effects++; leafId = execution.execution_id;
+            expect(signal.aborted).toBe(false);
+            entered.resolve(); await release.promise;
+            expect(signal.aborted).toBe(false);
+            expect(manager.effectScope(leafId)).not.toBeNull();
+            expect(manager.invocation(leafId)).toMatchObject({ execution_id: leafId });
+            return success;
+          },
+          observe: async () => { reads++; entered.resolve(); await release.promise; return authorizedObservation(); },
+          queryCapability: async () => { reads++; entered.resolve(); await release.promise; return []; },
+          cancelActions: async () => { cancellations++; },
+          programEvent: () => { wakes++; },
+        });
+        const leaf = await register(manager, run.run_id, "boundary leaf");
+        const middle = await register(manager, run.run_id, "boundary middle", [leaf]);
+        const root = nested ? await register(manager, run.run_id, "boundary root", [middle]) : leaf;
+        const successor = await register(manager, run.run_id, "boundary successor");
+        const accepted = manager.start(run.run_id, start(run, root, "boundary-predecessor", nested ? "root" : "leaf"));
+        await entered.promise;
+        const next = start(run, successor, "boundary-successor");
+        const retiring = manager.retireForHandoff(run.run_id, next, accepted.execution_id, undefined);
+        expect(leafSignal?.aborted).toBe(false);
+        expect(cancellations).toBe(0);
+        expect(manager.effectScope(accepted.execution_id)).not.toBeNull();
+        expect(() => manager.start(run.run_id, next)).toThrow();
+        await expect(manager.retireForHandoff(run.run_id, next, accepted.execution_id, undefined)).rejects.toMatchObject({ code: "busy" });
+        release.resolve();
+        const guard = await retiring;
+        guard();
+        expect(rejected).toBe(6);
+        expect(effects).toBe(boundary === "action" ? 1 : 0);
+        expect(reads).toBe(boundary === "action" ? 0 : 1);
+        expect(wakes).toBe(0);
+        expect(manager.get(run.run_id, { execution_id: accepted.execution_id })).toMatchObject({
+          status: "cancelled", calls: nested ? 3 : 1, actions: boundary === "action" ? 1 : 0,
+        });
+        expect(store.skillExecutions(run.run_id)).toHaveLength(nested ? 3 : 1);
+        expect(store.eventsAfter(run.run_id, 0, 1000).filter(event => event.type === "skill.progress")).toEqual([]);
+      });
+
+  for (const kind of ["action", "call"] as const)
+    test(`synchronous budget publication sees ${kind} admission before handoff`, async () => {
+      const release = deferred<void>(), entered = deferred<void>();
+      let effects = 0, invocations = 0, retiring: Promise<() => void> | undefined;
+      const { store, run, manager } = fixture(abortableRunner(async (_source, _args, handle) => {
+        invocations++;
+        await handle(kind === "action" ? action : { kind: "call", skill: { name: "publication child" }, args: null });
+        return completed;
+      }), {
+        action: async (_execution, _action, signal) => {
+          effects++; entered.resolve(); await release.promise;
+          expect(signal.aborted).toBe(false);
+          return success;
+        },
+      });
+      const child = await register(manager, run.run_id, "publication child");
+      const root = await register(manager, run.run_id, "publication root", [child]);
+      const successor = await register(manager, run.run_id, "publication successor");
+      const off = store.subscribe(event => {
+        if (event.type !== "skill.budget" || retiring) return;
+        const predecessor = store.latestRootExecution(run.run_id)!;
+        retiring = manager.retireForHandoff(run.run_id, start(run, successor, "publication-successor"), predecessor.execution_id, undefined);
+      });
+      try {
+        const accepted = manager.start(run.run_id, start(run, root, "publication-predecessor"));
+        if (kind === "action") { await entered.promise; expect(effects).toBe(1); release.resolve(); }
+        else await closed(store, run.run_id, accepted.execution_id);
+        (await retiring!)();
+        expect(invocations).toBe(1);
+        expect(effects).toBe(kind === "action" ? 1 : 0);
+        expect(store.skillExecutions(run.run_id)).toHaveLength(1);
+        expect(manager.get(run.run_id, { execution_id: accepted.execution_id })).toMatchObject({ status: "cancelled", calls: 1 });
+      } finally { off(); release.resolve(); }
+    });
+
+  for (const nested of [false, true])
+    test(`handoff does not grant an idle ${nested ? "child" : "root"} its first capability`, async () => {
+      const entered = deferred<void>(), never = deferred<SkillResult>();
+      let effects = 0;
+      const { store, run, manager } = fixture(abortableRunner(async (_source, args, handle) => {
+        if (nested && args !== "child") {
+          await handle({ kind: "call", skill: { name: "idle child" }, args: "child" });
+          return completed;
+        }
+        entered.resolve();
+        await never.promise;
+        await handle(action);
+        return completed;
+      }), { action: async () => { effects++; return success; } });
+      const child = await register(manager, run.run_id, "idle child");
+      const root = nested ? await register(manager, run.run_id, "idle root", [child]) : child;
+      const successor = await register(manager, run.run_id, "idle successor");
+      const accepted = manager.start(run.run_id, start(run, root, "idle-predecessor"));
+      await entered.promise;
+      (await manager.retireForHandoff(run.run_id, start(run, successor, "idle-successor"), accepted.execution_id, undefined))();
+      expect(effects).toBe(0);
+      expect(manager.get(run.run_id, { execution_id: accepted.execution_id })).toMatchObject({ status: "cancelled", calls: nested ? 1 : 0 });
+    });
+
+  for (const interruption of ["stop", "death", "unknown", "tool_abort", "deadline"] as const)
+    test(`${interruption} immediately preempts a handoff held at an action boundary`, async () => {
+      const entered = deferred<void>(), release = deferred<GameActionResult>(), workerAborted = deferred<void>();
+      const cancelled = deferred<void>();
+      let signal: AbortSignal | undefined, effects = 0;
+      const { store, run, manager } = fixture(abortableRunner(async (_source, _args, handle, _limits, workerSignal) => {
+        signal = workerSignal;
+        workerSignal.addEventListener("abort", () => workerAborted.resolve(), { once: true });
+        await handle(action);
+        await handle(action);
+        return completed;
+      }), {
+        action: async () => { effects++; entered.resolve(); return release.promise; },
+        cancelActions: async () => { cancelled.resolve(); },
+      });
+      const root = await register(manager, run.run_id, "preempted root");
+      const successor = await register(manager, run.run_id, "preempted successor");
+      const limits = { ...DEFAULT_SKILL_LIMITS, duration_ms: interruption === "deadline" ? 1000 : 10000 };
+      const accepted = manager.start(run.run_id, start(run, root, "preempted-predecessor", null, limits));
+      await entered.promise;
+      const controller = new AbortController();
+      const retiring = manager.retireForHandoff(run.run_id, start(run, successor, "preempted-successor"), accepted.execution_id, controller.signal);
+      const refused = retiring.then(() => null, error => error);
+      if (interruption === "stop") manager.cancel(run.run_id, { execution_id: accepted.execution_id });
+      else if (interruption === "death") { run.life_id = run.life_id! + 1; manager.fence("Player died"); }
+      else if (interruption === "unknown") manager.fence("Actual effect unknown", accepted.execution_id);
+      else if (interruption === "tool_abort") controller.abort();
+      await workerAborted.promise;
+      expect(signal?.aborted).toBe(true);
+      expect(manager.effectScope(accepted.execution_id)).toBeNull();
+      await cancelled.promise;
+      expect(await refused).toBeInstanceOf(Error);
+      await closed(store, run.run_id, accepted.execution_id);
+      expect(effects).toBe(1);
+      expect(store.skillExecutions(run.run_id)).toHaveLength(1);
+      expect(manager.get(run.run_id, { execution_id: accepted.execution_id })?.status).toBe(interruption === "unknown" ? "unknown" : "cancelled");
+      release.resolve({ status: "cancelled", summary: "Real interruption receipt", evidence: null });
+    });
+
+  for (const status of ["completed", "blocked", "failed"] as const)
+    test(`natural ${status} is retained rather than rewritten for handoff`, async () => {
+      const { store, run, manager } = fixture(async () => ({ status, summary: "Natural source outcome", result: null }));
+      const root = await register(manager, run.run_id, "natural predecessor");
+      const successor = await register(manager, run.run_id, "natural successor");
+      const accepted = manager.start(run.run_id, start(run, root, "natural-predecessor"));
+      await closed(store, run.run_id, accepted.execution_id);
+      const next = start(run, successor, "natural-successor");
+      if (status === "completed") (await manager.retireForHandoff(run.run_id, next, accepted.execution_id, undefined))();
+      else await expect(manager.retireForHandoff(run.run_id, next, accepted.execution_id, undefined)).rejects.toMatchObject({ code: "precondition_failed" });
+      expect(manager.get(run.run_id, { execution_id: accepted.execution_id })?.status).toBe(status === "completed" ? "succeeded" : status);
+    });
+
+  test("a caught held read failure retires before any recovery capability or child", async () => {
+    const entered = deferred<void>(), release = deferred<void>();
+    let effects = 0, refused = 0;
+    const { store, run, manager } = fixture(async (_source, _args, handle, _limits, signal) => {
+      try { await handle(read); } catch {}
+      expect(signal.aborted).toBe(true);
+      for (const request of [action, { kind: "call", skill: { name: "read fallback" }, args: null }] satisfies SkillCapabilityRequest[]) {
+        try { await handle(request); } catch { refused++; }
+      }
+      return completed;
+    }, {
+      queryCapability: async () => { entered.resolve(); await release.promise; throw new RuntimeFault("precondition_failed", "Read unavailable"); },
+      action: async () => { effects++; return success; },
+    });
+    const child = await register(manager, run.run_id, "read fallback");
+    const root = await register(manager, run.run_id, "read failure predecessor", [child]);
+    const next = start(run, child, "read-failure-successor");
+    const accepted = manager.start(run.run_id, start(run, root, "read-failure-predecessor"));
+    await entered.promise;
+    const retiring = manager.retireForHandoff(run.run_id, next, accepted.execution_id, undefined);
+    release.resolve();
+    (await retiring)();
+    expect(refused).toBe(2);
+    expect(effects).toBe(0);
+    expect(store.skillExecutions(run.run_id)).toHaveLength(1);
+    expect(manager.get(run.run_id, { execution_id: accepted.execution_id })).toMatchObject({ status: "cancelled", calls: 1 });
+  });
+
+  for (const status of ["failed", "unknown", "cancelled"] as const)
+    test(`a held action's real ${status} receipt is not relabeled as successful retirement`, async () => {
+      const entered = deferred<void>(), release = deferred<void>();
+      const receipt: GameActionResult = { status, summary: "Truthful native receipt", evidence: { effect_confirmed: false } };
+      let returned: Json | undefined, effects = 0, lateRefusals = 0;
+      const { store, run, manager } = fixture(async (_source, _args, handle) => {
+        try { returned = await handle(action); } catch {}
+        try { await handle(action); } catch { lateRefusals++; }
+        return completed;
+      }, { action: async () => { effects++; entered.resolve(); await release.promise; return receipt; } });
+      const root = await register(manager, run.run_id, "receipt predecessor");
+      const successor = await register(manager, run.run_id, "receipt successor");
+      const accepted = manager.start(run.run_id, start(run, root, "receipt-predecessor"));
+      await entered.promise;
+      const retiring = manager.retireForHandoff(run.run_id, start(run, successor, "receipt-successor"), accepted.execution_id, undefined);
+      if (status === "failed") {
+        release.resolve();
+        (await retiring)();
+        expect(returned).toEqual({ status, summary: receipt.summary, evidence: receipt.evidence });
+      } else {
+        const refused = retiring.then(() => null, error => error);
+        release.resolve();
+        expect(await refused).toBeInstanceOf(Error);
+        expect(returned).toBeUndefined();
+      }
+      expect(effects).toBe(1);
+      expect(lateRefusals).toBe(1);
+      expect(manager.get(run.run_id, { execution_id: accepted.execution_id })?.status).toBe(status === "unknown" ? "unknown" : "cancelled");
+      expect(store.skillExecutions(run.run_id)).toHaveLength(1);
+    });
+
+  test("scope mismatch refuses handoff without touching the admitted action", async () => {
+    const entered = deferred<void>(), release = deferred<void>();
+    let aborted = false;
+    const { store, run, manager } = fixture(async (_source, _args, handle) => {
+      await handle(action);
+      return completed;
+    }, { action: async (_execution, _action, signal) => {
+      entered.resolve(); await release.promise; aborted = signal.aborted; return success;
+    } });
+    const root = await register(manager, run.run_id, "scope predecessor");
+    const next = await register(manager, run.run_id, "scope successor");
+    const accepted = manager.start(run.run_id, start(run, root, "scope-predecessor"));
+    await entered.promise;
+    await expect(manager.retireForHandoff(run.run_id, { ...start(run, next, "scope-successor"), life_id: run.life_id! + 1 },
+      accepted.execution_id, undefined)).rejects.toThrow();
+    expect(manager.effectScope(accepted.execution_id)).not.toBeNull();
+    release.resolve();
+    await closed(store, run.run_id, accepted.execution_id);
+    expect(aborted).toBe(false);
+    expect(manager.get(run.run_id, { execution_id: accepted.execution_id })?.status).toBe("succeeded");
+  });
+
+  test("retired guards retain current scope, latest root, signal and lost-ack barriers", async () => {
+    let invocations = 0;
+    const { store, run, manager } = fixture(async () => { invocations++; return completed; });
+    const root = await register(manager, run.run_id, "guard predecessor");
+    const successor = await register(manager, run.run_id, "guard successor");
+    const accepted = manager.start(run.run_id, start(run, root, "guard-predecessor"));
+    await closed(store, run.run_id, accepted.execution_id);
+    const controller = new AbortController();
+    const request = start(run, successor, "guard-successor");
+    const guard = await manager.retireForHandoff(run.run_id, request, accepted.execution_id, controller.signal);
+    run.life_id = run.life_id! + 1;
+    expect(guard).toThrow();
+    run.life_id = accepted.life_id;
+    guard();
+    const next = manager.start(run.run_id, request);
+    expect(manager.start(run.run_id, request).execution_id).toBe(next.execution_id);
+    expect(guard).toThrow();
+    await closed(store, run.run_id, next.execution_id);
+    expect(invocations).toBe(2);
+    const nextGuard = await manager.retireForHandoff(run.run_id, start(run, root, "guard-third"), next.execution_id, controller.signal);
+    controller.abort();
+    expect(nextGuard).toThrow();
+    expect(store.skillExecutions(run.run_id)).toHaveLength(2);
+  });
+
+  test("unconfirmed leaf cleanup cannot acknowledge semantic retirement or a successor", async () => {
+    const entered = deferred<void>(), release = deferred<void>();
+    const { store, run, manager } = fixture(async (_source, _args, handle) => {
+      await handle(action);
+      throw new SkillCleanupError();
+    }, { action: async () => { entered.resolve(); await release.promise; return success; } });
+    const root = await register(manager, run.run_id, "unsafe predecessor");
+    const next = await register(manager, run.run_id, "unsafe successor");
+    const accepted = manager.start(run.run_id, start(run, root, "unsafe-predecessor"));
+    await entered.promise;
+    const retiring = manager.retireForHandoff(run.run_id, start(run, next, "unsafe-successor"), accepted.execution_id, undefined);
+    const refused = retiring.then(() => null, error => error);
+    release.resolve();
+    expect(await refused).toBeInstanceOf(Error);
+    expect(manager.get(run.run_id, { execution_id: accepted.execution_id })?.status).toBe("unknown");
+    expect(store.skillExecutions(run.run_id)).toHaveLength(1);
   });
 });

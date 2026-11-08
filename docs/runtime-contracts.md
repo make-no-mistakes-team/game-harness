@@ -98,14 +98,23 @@ For an intentional continuation or replacement, `program_submit` and `program_ru
 start accept optional `handoff:{name,version,execution_ordinal}` for the exact
 latest predecessor. Source authoring and validation leave live work running.
 Only after successor source, entry and limits pass preflight does the host
-revoke the pinned predecessor, join actual worker/native retirement, and admit
-the exact successor without another model request between Stop and Start.
+fence future capabilities throughout the pinned predecessor's tree. An already
+admitted semantic leaf action or read may settle under its original authority;
+retirement starts inside that completion boundary, before the worker can receive
+the result and issue another capability. Waiting on a child procedure does not
+permit the child to finish its remaining algorithm. With no admitted leaf, or
+for a resident predecessor, retirement starts immediately. The host joins actual
+worker/native retirement and admits the exact successor without another model
+request between Stop and Start.
 Ordinary decision authority is required; inactive source authoring gains no
 replacement permission. Omission does not replace existing work.
 
 Authorized observations bracket retirement. Task/generation/life/boot/space
 or screen changes, deliberate Stop, newer work and unconfirmed cleanup block
-successor admission. If that exact latest predecessor naturally succeeded while
+successor admission. Stop, tool/turn abort and root deadlines bypass semantic
+settlement and revoke immediately; they never wait for a graceful handoff or
+renew an allowance. A true unknown leaf outcome still fences its lineage.
+If that exact latest predecessor naturally succeeded while
 source was being authored, confirmed same-scope retirement also permits the new
 start without replaying or rewriting the completed execution. Blocked, failed,
 cancelled, unknown, mismatched or superseded predecessors are refused.

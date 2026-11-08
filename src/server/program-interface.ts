@@ -49,7 +49,7 @@ const actorLimitsSchema = skillLimitsSchema.extend({
 }).prefault({});
 const handoffSchema = programSelectorSchema.required({ version: true }).extend({
   execution_ordinal: z.int().positive(),
-}).strict().describe("Exact latest live or successfully completed predecessor in this scope; confirmed drain required. Blocked/cancelled/failed/unknown refused. Omit for an ordinary start.");
+}).strict().describe("Exact latest live or successfully completed predecessor in this scope. After successor preflight, future capabilities are fenced immediately; a run retires after its current admitted bounded semantic capability settles, not the whole procedure. Residents retire immediately. Stop/tool abort revoke immediately and refuse the successor. Confirmed retirement required; blocked/cancelled/failed/unknown refused. Omit for an ordinary start.");
 export const programSubmitSchema = z.discriminatedUnion("entry", [
   programWriteSchema.extend({ entry: z.literal("run").default("run"),
     args: jsonSchema.describe("Required JSON execution arguments; pass null when unused."),

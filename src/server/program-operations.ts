@@ -120,7 +120,7 @@ export class ProgramOperations {
     return this.store.completedToolCall(this.run.run_id, this.phaseKey(callId, "outcome"), identity);
   }
 
-  async submit(input: z.infer<typeof programSubmitSchema>, callId: string, commit: () => void, signal?: AbortSignal) {
+  async submit(input: z.infer<typeof programSubmitSchema>, callId: string, commit: () => void, signal: AbortSignal | undefined) {
     const identity = { tool: "program_submit", input } as unknown as Json;
     const outcomeKey = this.phaseKey(callId, "outcome");
     const completed = this.submissionReceipt(callId, identity);
@@ -177,7 +177,7 @@ export class ProgramOperations {
       const execution = await this.runProgram(input.entry === "step"
         ? { ...selection, ...handoff, entry: "step", args: input.args, limits: input.limits, initial_state: input.initial_state,
           ...(input.next ? { next: input.next } : {}) }
-        : { ...selection, ...handoff, entry: "run", args: input.args, limits: input.limits, ...(input.next ? { next: input.next } : {}) }, startId, startCommit);
+        : { ...selection, ...handoff, entry: "run", args: input.args, limits: input.limits, ...(input.next ? { next: input.next } : {}) }, startId, startCommit, signal);
       return finish(program, { status: "started", execution: execution as unknown as Json });
     } catch (error) {
       const existing = this.skills.get(this.run.run_id, { start_key: this.startKey(startId) });
@@ -187,7 +187,57 @@ export class ProgramOperations {
 
   startKey(callId: string): string { return `tool_${createHash("sha256").update(callId).digest("hex")}`; }
 
-  async runProgram(input: z.infer<typeof programRunSchema>, callId: string, commit: () => void) {
+  private async handoffStart(request: SkillStartRequest, predecessorId: string, callId: string, identity: Json,
+    first: boolean, commit: () => void, signal: AbortSignal | undefined): Promise<void> {
+    const outcomeKey = this.phaseKey(callId, "handoff_outcome");
+    const interrupted = () => this.store.completedToolCall(this.run.run_id, outcomeKey, identity) !== null;
+    const refuseReplay = () => new RuntimeFault("precondition_failed",
+      "Original handoff did not acknowledge a successor; inspect source and execution. It is never dispatched again.");
+    if (!first || interrupted()) {
+      if (!interrupted()) this.store.completeToolCall(this.run.run_id, outcomeKey, identity, { status: "unknown" });
+      throw refuseReplay();
+    }
+    const scope = () => JSON.stringify([this.host.generation(), this.run.task, this.run.goal, this.run.world_id,
+      this.run.epoch, this.run.session_id, this.run.life_id, this.run.native_boot_id, this.run.space_epoch, this.run.compatibility_hash]);
+    const selectedScope = scope();
+    const current = () => {
+      commit();
+      if (scope() !== selectedScope || interrupted())
+        throw new RuntimeFault("stale_context", "Handoff authority changed before successor admission");
+      this.host.planning().assertOrdinaryAdmission();
+    };
+    const observe = async () => {
+      const observation = await this.host.observe();
+      current();
+      if (observation.world_id !== this.run.world_id || observation.epoch !== request.epoch ||
+          observation.session_id !== request.session_id || observation.native_boot_id !== request.native_boot_id ||
+          observation.life.life_id !== request.life_id || observation.life.status !== "alive" ||
+          observation.space.space_epoch !== request.space_epoch || observation.compatibility_hash !== request.compatibility_hash)
+        throw new RuntimeFault("stale_context", "Handoff observation no longer matches the selected authority");
+      return observation;
+    };
+    try {
+      const before = await observe();
+      current();
+      // Fence future capabilities after preflight, but let the current admitted
+      // bounded capability settle before retiring its exact predecessor.
+      const retired = await this.skills.retireForHandoff(this.run.run_id, request, predecessorId, signal);
+      current();
+      const after = await observe();
+      retired();
+      if (JSON.stringify(before.screen) !== JSON.stringify(after.screen) ||
+          JSON.stringify(before.space) !== JSON.stringify(after.space))
+        throw new RuntimeFault("stale_context", "Handoff screen or space changed during retirement");
+      current();
+    } catch (error) {
+      if (!interrupted()) this.store.completeToolCall(this.run.run_id, outcomeKey, identity, {
+        status: error instanceof RuntimeFault ? "refused" : "unknown",
+      });
+      throw error;
+    }
+  }
+
+  async runProgram(input: z.infer<typeof programRunSchema>, callId: string, commit: () => void, signal: AbortSignal | undefined) {
     if (input.operation === "start") {
       const startKey = this.startKey(callId);
       const identity = { tool: "program_run", input } as unknown as Json;
@@ -216,52 +266,7 @@ export class ProgramOperations {
       const existing = this.skills.get(this.run.run_id, { start_key: startKey });
       if (input.handoff && !existing) {
         if (!predecessorId) throw new RuntimeFault("conflict", "Original handoff selection is unavailable");
-        const outcomeKey = this.phaseKey(callId, "handoff_outcome");
-        const interrupted = () => this.store.completedToolCall(this.run.run_id, outcomeKey, identity) !== null;
-        const refuseReplay = () => new RuntimeFault("precondition_failed",
-          "Original handoff did not acknowledge a successor; inspect source and execution. It is never dispatched again.");
-        if (!first || interrupted()) {
-          if (!interrupted()) this.store.completeToolCall(this.run.run_id, outcomeKey, identity, { status: "unknown" });
-          throw refuseReplay();
-        }
-        const scope = () => JSON.stringify([this.host.generation(), this.run.task, this.run.goal, this.run.world_id,
-          this.run.epoch, this.run.session_id, this.run.life_id, this.run.native_boot_id, this.run.space_epoch, this.run.compatibility_hash]);
-        const selectedScope = scope();
-        const current = () => {
-          commit();
-          if (scope() !== selectedScope || interrupted())
-            throw new RuntimeFault("stale_context", "Handoff authority changed before successor admission");
-          this.host.planning().assertOrdinaryAdmission();
-        };
-        const observe = async () => {
-          const observation = await this.host.observe();
-          current();
-          if (observation.world_id !== this.run.world_id || observation.epoch !== request.epoch ||
-              observation.session_id !== request.session_id || observation.native_boot_id !== request.native_boot_id ||
-              observation.life.life_id !== request.life_id || observation.life.status !== "alive" ||
-              observation.space.space_epoch !== request.space_epoch || observation.compatibility_hash !== request.compatibility_hash)
-            throw new RuntimeFault("stale_context", "Handoff observation no longer matches the selected authority");
-          return observation;
-        };
-        try {
-          const before = await observe();
-          current();
-          // This method validates without effects, then synchronously revokes
-          // only the pinned predecessor before its first retirement await.
-          const retired = await this.skills.retireForHandoff(this.run.run_id, request, predecessorId);
-          current();
-          const after = await observe();
-          retired();
-          if (JSON.stringify(before.screen) !== JSON.stringify(after.screen) ||
-              JSON.stringify(before.space) !== JSON.stringify(after.space))
-            throw new RuntimeFault("stale_context", "Handoff screen or space changed during retirement");
-          current();
-        } catch (error) {
-          if (!interrupted()) this.store.completeToolCall(this.run.run_id, outcomeKey, identity, {
-            status: error instanceof RuntimeFault ? "refused" : "unknown",
-          });
-          throw error;
-        }
+        await this.handoffStart(request, predecessorId, callId, identity, first, commit, signal);
       }
       if (!existing) { commit(); this.host.planning().assertOrdinaryAdmission(); }
       const result = this.skills.start(this.run.run_id, request);

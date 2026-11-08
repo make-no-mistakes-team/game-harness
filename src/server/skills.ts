@@ -74,7 +74,9 @@ interface Live {
   cleanupEffects: Promise<void> | null;
   abortStatus: "cancelled" | "failed" | "unknown";
   cleanupFailure: Error | null;
-  pending: boolean;
+  pending: SkillCapabilityRequest["kind"] | null;
+  handoff: boolean;
+  handoffRetired: boolean;
   lifeId: number;
   scope: EffectScope;
   invocation: EffectInvocation;
@@ -94,6 +96,7 @@ export class SkillManager {
   private live = new Map<string, Live>();
   private cleanupFailures = new Set<Error>();
   private handoffRevision = 0;
+  private handoffReservation: { predecessorId: string; revision: number } | null = null;
   private trace: ExecutionTrace;
   constructor(
     private store: Store,
@@ -284,8 +287,8 @@ export class SkillManager {
     this.validateDependencies(runId, skill.dependencies);
     return { skill, armLookahead };
   }
-  /** Retire live work or join its natural success; retain the guard until admission. */
-  async retireForHandoff(runId: string, request: SkillStartRequest, predecessorId: string): Promise<() => void> {
+  /** Fence new capabilities, settle the admitted leaf, then retain the admission guard. */
+  async retireForHandoff(runId: string, request: SkillStartRequest, predecessorId: string, signal: AbortSignal | undefined): Promise<() => void> {
     const parsed = skillStartRequestSchema.parse(request);
     this.prepareStart(runId, parsed);
     const selected = this.store.skillExecution(runId, { execution_id: predecessorId });
@@ -305,26 +308,64 @@ export class SkillManager {
       throw new RuntimeFault("precondition_failed", "Handoff requires the exact latest live or successfully completed predecessor in the current scope");
     const expectedStatus = completed ? "succeeded" : "cancelled";
     const revision = this.handoffRevision;
+    if (this.handoffReservation?.predecessorId === predecessorId && this.handoffReservation.revision === revision)
+      throw new RuntimeFault("busy", "The exact predecessor is already reserved for handoff");
+    const reservation = { predecessorId, revision };
+    this.handoffReservation = reservation;
     const assertRetired = () => {
-      if (revision !== this.handoffRevision || this.store.latestRootExecution(runId)?.execution_id !== predecessorId)
+      if (signal?.aborted || revision !== this.handoffRevision || this.handoffReservation !== reservation ||
+          this.store.latestRootExecution(runId)?.execution_id !== predecessorId)
         throw new RuntimeFault("stale_context", "Handoff was stopped or superseded");
       const retired = this.store.skillExecution(runId, { execution_id: predecessorId });
       if (this.cleanupFailures.size || !retired || !sameScope(retired, live?.scope ?? retired) ||
-          retired.status !== expectedStatus || !retired.ended_at || this.live.has(predecessorId) ||
+          retired.status !== expectedStatus || (expectedStatus === "cancelled" && !live?.handoffRetired) ||
+          !retired.ended_at || this.live.has(predecessorId) ||
           (retired.entry === "step" && (retired.resident?.cleanup.worker !== "closed" || retired.resident.cleanup.native !== "retired")))
         throw new RuntimeFault("precondition_failed", "Predecessor retirement was not safely confirmed");
       for (const candidate of this.live.values())
         if (candidate.view.run_id === runId && candidate.root === candidate)
           throw new RuntimeFault("precondition_failed", "Another foreground program owns current work");
+      this.host.authorize({
+        session_id: parsed.session_id, world_id: retired.world_id!, epoch: parsed.epoch,
+        native_boot_id: parsed.native_boot_id, run_id: runId, run_generation: parsed.run_generation,
+        life_id: parsed.life_id, space_epoch: parsed.space_epoch,
+      });
     };
-    // Natural completion during cloud authoring is already a valid retirement,
-    // not permission to replay its effects or restart a cancelled/unknown root.
-    if (live) {
-      if (expectedStatus === "succeeded") await live.done;
-      else await this.closeTree(live, "Exact predecessor retired for authored handoff");
+    const aborted = Promise.withResolvers<never>();
+    const abort = () => {
+      this.interruptHandoffs();
+      if (live)
+        void this.closeTree(live, "Authored handoff authority aborted").catch(() => this.host.changed(true));
+      aborted.reject(new RuntimeFault("stale_context", "Handoff authority aborted"));
+    };
+    if (live) live.handoff = true;
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      if (signal?.aborted) abort();
+      // A parent waiting on game.call is not a leaf boundary. With no admitted
+      // action/read anywhere in the tree, retirement must start immediately.
+      const hasLeaf = (node: Live): boolean => {
+        if (node.pending === "action" || node.pending === "respawn" ||
+            node.pending === "observe" || node.pending === "adapter") return true;
+        for (const child of node.children) if (hasLeaf(child)) return true;
+        return false;
+      };
+      const settle = async () => {
+        if (!live) return;
+        if (!completed && (live.view.entry === "step" || !hasLeaf(live))) {
+          live.handoffRetired = true;
+          await this.closeTree(live, "Exact predecessor retired for authored handoff");
+        } else {
+          await live.done;
+          await live.closing;
+        }
+      };
+      await Promise.race([settle(), aborted.promise]);
+      assertRetired();
+      return assertRetired;
+    } finally {
+      signal?.removeEventListener("abort", abort);
     }
-    assertRetired();
-    return assertRetired;
   }
   /** A deliberate Stop also revokes a handoff waiting on observation, not just a live worker. */
   interruptHandoffs(): void {
@@ -400,7 +441,9 @@ export class SkillManager {
       cleanupEffects: null,
       abortStatus: "cancelled",
       cleanupFailure: null,
-      pending: false,
+      pending: null,
+      handoff: false,
+      handoffRetired: false,
       lifeId: view.life_id!,
       scope: { session_id: view.session_id!, world_id: view.world_id!, epoch: view.epoch, native_boot_id: view.native_boot_id!,
         run_id: view.run_id, run_generation: view.run_generation!, life_id: view.life_id!, space_epoch: view.space_epoch!,
@@ -414,6 +457,7 @@ export class SkillManager {
     this.live.set(view.execution_id, live);
     live.timer = setTimeout(
       () => {
+        this.interruptHandoffs();
         void this.closeTree(live.root, "Root skill deadline reached").catch(
           () => this.host.changed(true),
         );
@@ -431,6 +475,7 @@ export class SkillManager {
           "skill.running",
           "Skill dispatched inside its isolated execution",
         );
+        this.authorize(live);
         outcome = view.entry === "step" ? await this.runResident(live, skill) : parseGeneratedSkillResult(
           await this.sandbox.runSkill(
             skill.source,
@@ -638,6 +683,8 @@ export class SkillManager {
   }
   private exhaustedBudget(live: Live, action: boolean): RuntimeFault | null {
     const root = live.root;
+    if (root.handoff)
+      return new RuntimeFault("stale_context", "Program capability admission retired for authored handoff");
     if (root.view.entry !== "run") throw new Error("Resident entries cannot acquire finite capability authority");
     if (
       root.view.calls >= root.view.limits.max_calls ||
@@ -691,19 +738,28 @@ export class SkillManager {
     raw: SkillCapabilityRequest,
   ): Promise<Json> {
     this.authorize(live);
+    if (live.root.handoff)
+      throw new RuntimeFault("stale_context", "Program capability admission retired for authored handoff");
     if (live.pending)
       throw new Error("Only one host capability may be outstanding");
     const request = skillCapabilitySchema.parse(raw);
     if (Buffer.byteLength(JSON.stringify(request)) > 64 * 1024)
       throw new Error("Capability request exceeds byte bound");
-    this.consume(live, request.kind === "action" || request.kind === "respawn");
     const callId = randomUUID();
     const started = performance.now();
     const context = { call_id: callId, capability: request.kind, life_id: live.lifeId };
-    this.trace.record(live.view, "capability_request", request as unknown as Json, context);
-    live.pending = true;
+    // Linearize admission before budget persistence synchronously notifies
+    // observers. A handoff in that notification must see this exact leaf.
+    live.pending = request.kind;
+    let requestRecorded = false;
     let resultRecorded = false;
     try {
+      this.consume(live, request.kind === "action" || request.kind === "respawn");
+      this.trace.record(live.view, "capability_request", request as unknown as Json, context);
+      requestRecorded = true;
+      // Stop/death/deadline may have revoked authority in either publication.
+      // The handoff latch alone intentionally preserves an admitted leaf scope.
+      this.authorize(live);
       let result: Json;
       switch (request.kind) {
         case "observe":
@@ -718,6 +774,7 @@ export class SkillManager {
           if (!context.adapter.bindings.some(binding => binding.capability_id === request.capability_id && binding.version === request.version))
             throw new RuntimeFault("precondition_failed", "This adapter read capability is not registered");
           const args = context.registration.parseCapability(request.capability_id, request.version, request.args);
+          this.authorize(live);
           result = await this.host.queryCapability(request.capability_id, request.version, args);
           break;
         }
@@ -727,6 +784,7 @@ export class SkillManager {
           if (respawning && !this.context().adapter.supports_respawn) throw new RuntimeFault("precondition_failed", "This adapter has no respawn capability");
           if (respawning && live !== live.root)
             throw new Error("Only an explicitly selected recovery root can respawn");
+          this.authorize(live);
           const action = await this.host.action(
             live.view,
             request.kind === "respawn" ? { kind: "respawn" } : request.action,
@@ -812,6 +870,9 @@ export class SkillManager {
             throw new Error("Dependency no longer validated");
           if (dependency.validation.runtime_version !== SKILL_API_VERSION)
             throw new Error("Dependency skill API is incompatible");
+          this.authorize(live);
+          if (live.root.handoff)
+            throw new RuntimeFault("stale_context", "Child admission retired for authored handoff");
           const admitted = this.store.admitSkill(
             live.view.run_id,
             {
@@ -835,6 +896,10 @@ export class SkillManager {
             },
           );
           const child = this.dispatch(admitted.view, dependency, live);
+          // Admission itself publishes synchronously. If its observers stopped
+          // the tree, close the admitted identity before its dispatch microtask.
+          if (live.root.handoff || live.root.controller.signal.aborted)
+            void this.closeTree(child, "Parent authority retired during child admission").catch(() => this.host.changed(true));
           await child.done;
           this.authorize(live);
           result = child.view.result as unknown as Json;
@@ -855,12 +920,21 @@ export class SkillManager {
         throw new Error("Capability result exceeds byte bound");
       return result;
     } catch (error) {
-      if (!resultRecorded)
+      if (requestRecorded && !resultRecorded)
         this.trace.record(live.view, "capability_result", { ok: false, result: capabilityFailure(error) }, { ...context, life_id: live.lifeId });
       throw error;
     } finally {
-      this.trace.span(live.view, "capability_wait", started, performance.now(), { ...context, life_id: live.lifeId });
-      live.pending = false;
+      if (requestRecorded)
+        this.trace.span(live.view, "capability_wait", started, performance.now(), { ...context, life_id: live.lifeId });
+      const leaf = live.pending === "action" || live.pending === "respawn" ||
+        live.pending === "observe" || live.pending === "adapter";
+      live.pending = null;
+      // Do this inside the broker completion path, before its promise can reply
+      // to/resume generated code. Joining here would deadlock on live.done.
+      if (leaf && live.root.handoff && !live.root.controller.signal.aborted) {
+        live.root.handoffRetired = true;
+        void this.closeTree(live.root, "Exact predecessor retired at capability boundary").catch(() => this.host.changed(true));
+      }
     }
   }
   private revoke(live: Live, reason: string): void {

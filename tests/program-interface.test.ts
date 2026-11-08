@@ -43,7 +43,7 @@ function aborted(signal: AbortSignal) {
   return ready.promise;
 }
 
-function fixture(runner?: SandboxService["runSkill"], hooks: { cancelActions?: SkillHost["cancelActions"] } = {}) {
+function fixture(runner?: SandboxService["runSkill"], hooks: { action?: SkillHost["action"]; cancelActions?: SkillHost["cancelActions"] } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-interface-"));
   const store = new Store(directory), adapter = minecraftTestAdapter();
   const run = minecraftRunFixture(adapter, { world_id: crypto.randomUUID(), session_id: "fixture-session", task: "Inspect neutral authorized state" });
@@ -96,7 +96,11 @@ function fixture(runner?: SandboxService["runSkill"], hooks: { cancelActions?: S
       scope.life_id !== run.life_id || scope.native_boot_id !== run.native_boot_id || scope.space_epoch !== run.space_epoch || scope.run_generation !== generation)
       throw new RuntimeFault("stale_context", "Fixture authority revoked"); },
     adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
-    observe: async () => observation(), action: async () => { actions++; return { status: "succeeded", summary: "Neutral receipt", evidence: { effect_confirmed: true } }; },
+    observe: async () => observation(), action: async (...args) => {
+      actions++;
+      return hooks.action ? await hooks.action(...args)
+        : { status: "succeeded", summary: "Neutral receipt", evidence: { effect_confirmed: true } };
+    },
     queryCapability: async id => id === "minecraft.visible_screen" ? null : [], cancelActions: hooks.cancelActions ?? (async () => {}), recover: async () => { throw new Error("Fixture has no respawn"); },
     changed: (outcome, execution) => { if (outcome && execution) planning.predecessorSettled(execution.execution_id); },
     unsafe: () => {}, prepareLookahead: (config) => planning.prepareOptIn(config),
@@ -150,7 +154,7 @@ function data(reply: AgentToolResult) {
   return JSON.parse(reply.content.filter((entry) => entry.type === "text").map((entry) => entry.text).join(""));
 }
 
-async function agentCalls(tools: AgentTool[], calls: ToolCall[], beforeToolCall?: Agent["beforeToolCall"]) {
+async function agentCalls(tools: AgentTool[], calls: ToolCall[], beforeToolCall?: Agent["beforeToolCall"], started?: (agent: Agent) => void) {
   const descriptor = getBundledModels("openai-codex").find((model) => model.api === "openai-codex-responses");
   if (!descriptor) throw new Error("Installed catalog lacks an offline Codex descriptor");
   const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
@@ -177,6 +181,7 @@ async function agentCalls(tools: AgentTool[], calls: ToolCall[], beforeToolCall?
   const agent = new Agent({ initialState: { model, tools }, streamFn,
     beforeToolCall: (context, signal) => { preserveRuntimeToolArguments(context); return beforeToolCall?.(context, signal); },
     getApiKey: () => "OFFLINE_SYNTHETIC_STREAM_ONLY" });
+  started?.(agent);
   try {
     await agent.prompt("Exercise the supplied local tool invocations without a provider.");
     return agent.state.messages.filter((message) => message.role === "toolResult");
@@ -614,6 +619,156 @@ test("program_submit requires explicit JSON args at the installed Agent boundary
   await waitClosed(f.store, f.run.run_id, execution.execution_id);
   expect(f.store.skillExecution(f.run.run_id, { execution_id: execution.execution_id })!.result).toMatchObject({ result: null });
 });
+
+for (const toolName of ["program_submit", "program_run"] as const) {
+  test(`${toolName} settles only the current emitted semantic capability before successor effects`, async () => {
+    const emitting = Promise.withResolvers<void>(), receipt = Promise.withResolvers<void>(), settling = Promise.withResolvers<void>();
+    const effects: string[] = [];
+    let oldSignal: AbortSignal | undefined, cancelled = 0;
+    const f = fixture(undefined, {
+      action: async (execution, _action, signal) => {
+        if (execution.args === "old") {
+          oldSignal = signal;
+          effects.push("old-emitted");
+          emitting.resolve();
+          await receipt.promise;
+          expect(signal.aborted).toBe(false);
+          expect(f.manager.effectScope(execution.execution_id)).not.toBeNull();
+          effects.push("old-confirmed");
+        } else {
+          expect(cancelled).toBe(1);
+          effects.push("successor-emitted");
+        }
+        return { status: "succeeded", summary: "Bounded emitted action confirmed", evidence: { effect_confirmed: true } };
+      },
+      cancelActions: async () => { cancelled++; effects.push("old-retired"); },
+    });
+    resources.unshift(async () => { receipt.resolve(); });
+    const movement = 'await game.action({kind:"move",controls:{forward:true},duration_ms:100});';
+    await f.write("emitting predecessor", `${movement}${movement}${source}`);
+    const old = data(await f.call("program_run", { operation: "start", name: "emitting predecessor", args: "old" }));
+    await emitting.promise;
+    const predecessor = f.store.latestRootExecution(f.run.run_id)!;
+    const deadline = predecessor.deadline_at;
+    const successorSource = `await game.action({kind:"look",yaw:0.1,pitch:0});${source}`;
+    if (toolName === "program_run") await f.write("bounded successor", successorSource);
+    const controller = new AbortController();
+    const retire = f.manager.retireForHandoff.bind(f.manager);
+    f.manager.retireForHandoff = (...args) => {
+      expect(args[3]).toBe(controller.signal);
+      const pending = retire(...args);
+      settling.resolve();
+      return pending;
+    };
+    const input = { name: "bounded successor", args: "new",
+      handoff: { name: old.name, version: old.version, execution_ordinal: old.execution_ordinal },
+      ...(toolName === "program_submit" ? { source: successorSource } : { operation: "start" }) };
+    const tool = f.tools().find(tool => tool.name === toolName)!;
+    const pending = tool.execute(`emitting-handoff-${toolName}`, input, controller.signal);
+    await settling.promise;
+    expect(oldSignal!.aborted).toBe(false);
+    expect(f.manager.effectScope(predecessor.execution_id)).not.toBeNull();
+    expect(f.dispatches()).toBe(1);
+    expect(f.actions()).toBe(1);
+    expect(cancelled).toBe(0);
+    expect(f.store.skillExecution(f.run.run_id, { execution_id: predecessor.execution_id })).toMatchObject({
+      status: "running", actions: 1, calls: 1, deadline_at: deadline,
+    });
+    receipt.resolve();
+    const result = data(await pending);
+    expect(toolName === "program_submit" ? result.start.status : result.name).toBe(
+      toolName === "program_submit" ? "started" : "bounded successor");
+    const successor = f.store.latestRootExecution(f.run.run_id)!;
+    await waitClosed(f.store, f.run.run_id, successor.execution_id);
+    expect(effects).toEqual(["old-emitted", "old-confirmed", "old-retired", "successor-emitted"]);
+    expect(oldSignal!.aborted).toBe(true);
+    expect(f.store.skillExecution(f.run.run_id, { execution_id: predecessor.execution_id })).toMatchObject({
+      status: "cancelled", actions: 1, calls: 1, deadline_at: deadline,
+    });
+    expect(f.actions()).toBe(2);
+    expect(f.dispatches()).toBe(2);
+    expect(data(await tool.execute(`emitting-handoff-${toolName}`, input, controller.signal))).toEqual(result);
+    expect(f.actions()).toBe(2);
+    expect(f.dispatches()).toBe(2);
+  });
+}
+
+for (const toolName of ["program_submit", "program_run"] as const) for (const boundary of ["abort", "stop"] as const) {
+  test(`${toolName} ${boundary} immediately revokes held semantic settling and refuses successor effects`, async () => {
+    const emitting = Promise.withResolvers<void>(), receipt = Promise.withResolvers<void>(), settling = Promise.withResolvers<void>();
+    const capabilitySettled = Promise.withResolvers<void>();
+    let oldSignal: AbortSignal | undefined, cancellations = 0;
+    const f = fixture(async (_body, args, handle, _limits, signal) => {
+      const capability = handle({ kind: "action", action: { kind: "move", controls: { forward: true }, duration_ms: 100 } });
+      void capability.then(() => capabilitySettled.resolve(), () => capabilitySettled.resolve());
+      await Promise.race([capability, aborted(signal)]);
+      return { status: "completed", summary: "Worker relinquished on immediate abort", result: args };
+    }, {
+      action: async (_execution, _action, signal) => {
+        oldSignal = signal;
+        emitting.resolve();
+        await receipt.promise;
+        return { status: "succeeded", summary: "Late receipt cannot restore revoked authority", evidence: { effect_confirmed: true } };
+      },
+      cancelActions: async () => { cancellations++; },
+    });
+    resources.unshift(async () => { receipt.resolve(); });
+    await f.write("preempted predecessor");
+    const old = data(await f.call("program_run", { operation: "start", name: "preempted predecessor", args: "old" }));
+    await emitting.promise;
+    const predecessor = f.store.latestRootExecution(f.run.run_id)!;
+    if (toolName === "program_run") await f.write("refused successor");
+    const controller = new AbortController();
+    let sdkAgent: Agent | undefined, toolSignal: AbortSignal | undefined = controller.signal;
+    const retire = f.manager.retireForHandoff.bind(f.manager);
+    f.manager.retireForHandoff = (...args) => {
+      expect(args[3]).toBe(toolSignal);
+      const pending = retire(...args);
+      settling.resolve();
+      return pending;
+    };
+    const input = { name: "refused successor", args: null,
+      handoff: { name: old.name, version: old.version, execution_ordinal: old.execution_ordinal },
+      ...(toolName === "program_submit" ? { source } : { operation: "start" }) };
+    const id = `preempt-held-${toolName}-${boundary}`;
+    const tools = f.tools(), tool = tools.find(tool => tool.name === toolName)!;
+    const execute = tool.execute.bind(tool);
+    tool.execute = async (...args) => { toolSignal = args[2]; return await execute(...args); };
+    const pending = boundary === "abort"
+      ? agentCalls(tools, [{ type: "toolCall", id, name: toolName, arguments: input }], undefined,
+        agent => { sdkAgent = agent; }).then(() => tool.execute(id, input))
+      : tool.execute(id, input, controller.signal);
+    await settling.promise;
+    expect(oldSignal!.aborted).toBe(false);
+    expect(cancellations).toBe(0);
+    expect(toolSignal).toBeInstanceOf(AbortSignal);
+    expect(toolSignal!.aborted).toBe(false);
+    if (boundary === "abort") sdkAgent!.abort();
+    else await f.call("program_run", { operation: "stop", target: "current" });
+    expect(oldSignal!.aborted).toBe(true);
+    expect(f.manager.effectScope(predecessor.execution_id)).toBeNull();
+    expect(cancellations).toBe(1);
+    await waitClosed(f.store, f.run.run_id, predecessor.execution_id);
+    const result = data(await pending);
+    if (toolName === "program_submit") expect(result).toMatchObject({
+      source: { status: "persisted", version: 1 }, start: { status: "refused" },
+    });
+    else expect(result.error.code).toBe(boundary === "abort" ? "precondition_failed" : "stale_context");
+    expect(f.store.skillExecution(f.run.run_id, { execution_id: predecessor.execution_id })).toMatchObject({
+      status: "cancelled", calls: 1, actions: 1,
+    });
+    expect(f.dispatches()).toBe(1);
+    expect(f.actions()).toBe(1);
+    receipt.resolve();
+    await capabilitySettled.promise;
+    const replay = data(await tool.execute(id, input));
+    if (toolName === "program_submit") expect(replay).toEqual(result);
+    else expect(replay.error.code).toBe("precondition_failed");
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+    expect(f.dispatches()).toBe(1);
+    expect(f.actions()).toBe(1);
+  });
+}
 
 for (const toolName of ["program_submit", "program_run"] as const) {
   test(`${toolName} cannot introduce a second run controller before the first fully drains`, async () => {

@@ -446,7 +446,8 @@ function runSkillThread() {
       const evidence = result?.evidence;
       const safe = !result?.requires_reconnect &&
         (result?.status === "succeeded" || result?.status === "failed" &&
-          evidence?.world_effect_emitted === false && evidence?.neutralized === true);
+          evidence?.neutralized === true && (evidence?.world_effect_emitted === false ||
+            evidence?.failure_outcome_confirmed === true));
       // No retry or task verdict. Unknown/cancelled effects are fenced by the
       // host before reaching here; fail closed if a transport ever returns one.
       const observation = safe ? await call({ kind: "observe" }) : null;

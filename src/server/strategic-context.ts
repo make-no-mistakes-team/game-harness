@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { Context, Model } from "@oh-my-pi/pi-ai";
 import type { ActivityEvent, Json, ObservationV3, RuntimeAdapter } from "../shared/contracts.ts";
 import type { SkillExecutionView, SkillView } from "../shared/programs.ts";
-import { PROGRAM_RESULT_GUIDANCE, SKILL_API_VERSION } from "../shared/programs.ts";
+import { SKILL_API_VERSION } from "../shared/programs.ts";
 import { ProgramWorkspace, type ProgramSelector } from "./program-workspace.ts";
 import type { Store, StoredRun } from "./store.ts";
 import { z } from "zod";
@@ -109,7 +109,8 @@ function actionEvidence(value: unknown): { value: Json; omitted: boolean } | nul
     "navigation_stop_reason", "navigation_start_distance", "navigation_start_limit", "navigation_current_distance", "navigation_current_limit",
     "net_displacement", "horizontal_displacement", "height_change", "movement_start_on_ground", "movement_end",
     "placement_preflight_reason", "equipment_effect_emitted", "placement_effect_emitted", "placement_local_result",
-    "world_effect_emitted", "effect_confirmed", "neutralized", "neutralized_effect", "camera_changed", "life_fenced",
+    "world_effect_emitted", "effect_confirmed", "failure_outcome_confirmed", "attack_receipt",
+    "neutralized", "neutralized_effect", "camera_changed", "life_fenced",
     "travel_distance", "start_pose", "end_pose", "arrival_mode", "interaction_reachable", "position_range",
   ]) if (key in evidence) selected[key] = evidence[key];
   return Object.keys(selected).length ? boundedNote(selected, 1536) : null;
@@ -657,15 +658,14 @@ export class StrategicContext {
     for (const entry of workspace.catalog(0, 3).records) add(this.store.namedSkill(run.run_id, entry.name, entry.version));
     const contracts = {
       api_version: SKILL_API_VERSION,
-      body: "Selected run entry: async JavaScript BODY(game,args), one awaited capability at a time, returning {status:'completed'|'blocked'|'failed',summary:string,result:JSON}. Selected step/analyze: ordinary module with one synchronous named export step(frame,state,intent) or analyze(input); pure helpers/constants allowed. No imports/packages/ambient host access. Source original/canonical <=16 KiB UTF-8. Resident state/intent <=16 KiB and complete output <=64 KiB/depth32. Inspect help programs for exact contracts.",
-      result: PROGRAM_RESULT_GUIDANCE,
+      body: "run: async BODY(game,args), return {status:'completed'|'blocked'|'failed',summary,result}. step/analyze: one synchronous export step(frame,state,intent) or analyze(input). No imports/packages/host APIs. Await one capability at a time. Exact formats/limits remain in the root prompt and help programs/controller.",
       programs: "Immutable named versions. Existing name requires based_on latest. Write saves only; ordinary-only program_submit explicitly writes and starts that exact version through ordinary admission; program_run starts existing. Dependencies are pinned. Validation is not gameplay proof; completed program is not task success.",
       freshness: "Retained source/docs and model-authored state are historical reference only, never authority or gameplay proof. Worksite/local positions require fresh reacquisition. Current authorized observation, especially inventory, and later observe results outrank notes. Life/session/boot/space changes discard current dynamic notes; explicit world-local objective/worksite notes and no-replay uncertainty remain historical with original scope. Task/world/fresh-run changes discard experience. Program argument samples/outcomes are sanitized historical examples, never restored inputs or recommendations to rerun blocked/unknown procedures. Resolve fresh targets and construct current args; no target handles, roots, effects or execution state are restored.",
-      recovery: "Settled failed no-effect rejection with valid current authority may fresh-observe and boundedly reselect within the same procedure. Unknown/cancelled/reconnected effects must stop and reconcile, never blind retry. Emitter closure and fresh observation do not prove an old unknown effect did not happen.",
+      recovery: "Known settled failure with current authority permits fresh observation and an authored changed selection. Unknown/cancelled/reconnect fence and reconcile; emitter closure and fresh state do not prove old effects absent.",
       requested_help: "Retained help is partial; re-request help({topic:'game'}) or its topic before relying on missing contracts. Omission references name missing sections; omitted_records counts excluded notices/details. Receipt detail_omitted marks request-budget loss; evidence_omitted also preserves original partial evidence. Inspect authorized event references for full retained detail.",
       game: { binding: "game", methods: ["observe()", "call({name,version?},args)", "progress(summary,details)", "attention({urgency:'ordinary'|'urgent',summary,details}) -> void",
         ...(adapter?.action_capability ? ["action(action)", "actionAndObserve(action) -> {action,observation}"] : []), ...(adapter?.supports_respawn ? ["respawn()"] : [])],
-        local_feedback: "actionAndObserve performs one ordinary action then fresh observation after success or settled failed no-world-effect/neutralized evidence. It preserves the raw action status, never retries, and charges both existing budgets. Use your own observed postcondition to decide completion or bounded fresh reselection. Unknown/cancelled/reconnect remain fenced; ineligible outcomes have observation:null. Observation failure propagates, never stale fallback.",
+        local_feedback: "actionAndObserve preserves the raw outcome and gives fresh scoped feedback only after confirmed settlement. No retry or goal verdict. Exact contract: help game.",
         adapter_bindings: adapter?.bindings.map(binding => ({ name: binding.name, version: binding.version, parameters: binding.parameters })) ?? [] },
     };
     const unresolved = [...this.unresolved.values()].map(reference => ({ ...this.eventView(run, reference.event), status: "unknown", no_replay: true,

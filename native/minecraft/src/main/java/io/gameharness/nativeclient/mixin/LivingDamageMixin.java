@@ -11,6 +11,12 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(LivingEntity.class)
 public abstract class LivingDamageMixin {
+  @Inject(method = "damage", at = @At("HEAD"))
+  private void before(
+      ServerWorld world, DamageSource source, float amount, CallbackInfoReturnable<Boolean> ci) {
+    AttackProof.beginDamage((Entity) (Object) this, source.getAttacker());
+  }
+
   @Inject(method = "damage", at = @At("RETURN"))
   private void result(
       ServerWorld world, DamageSource source, float amount, CallbackInfoReturnable<Boolean> ci) {

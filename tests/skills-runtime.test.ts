@@ -280,6 +280,48 @@ return {status:"completed",summary:"Unreachable",result:null};` });
   expect(producer.calls).toBe(1);
 });
 
+test("confirmed failed input cannot deliver a fresh observation after actual life authority changes", async () => {
+  const generated = Promise.withResolvers<SkillResult>();
+  void generated.promise.catch(() => {});
+  let observations = 0, effects = 0;
+  const f = fixture(async (...args) => {
+    try {
+      const output = await generatedWorker(...args);
+      generated.resolve(output);
+      return output;
+    } catch (error) { generated.reject(error); throw error; }
+  }, {
+    action: async () => {
+      effects++;
+      return { status: "failed", summary: "Owned server confirmed rejected input",
+        evidence: { world_effect_emitted: true, failure_outcome_confirmed: true, neutralized: true } };
+    },
+    observe: async () => {
+      observations++;
+      f.run.life_id = 2;
+      f.store.saveRun(f.run);
+      return authorizedObservation();
+    },
+  });
+  const skill = await f.manager.register(f.run.run_id, { entry: "run", name: "Revoked failure feedback", card, dependencies: [],
+    source: `let received=false;
+try {
+ const checked=await game.actionAndObserve({kind:"look",yaw:0,pitch:0});
+ received=checked.observation!==null;
+ if(received) await game.action({kind:"look",yaw:0.3,pitch:0});
+} catch {}
+return {status:"completed",summary:"Scoped failure feedback handled",result:{received_observation:received}};` });
+  const execution = f.manager.start(f.run.run_id, start(f.run, skill, "revoked-failure-feedback"));
+  const output = await generated.promise;
+  await closed(f.store, f.run.run_id, execution.execution_id);
+  expect(output.result).toEqual({ received_observation: false });
+  expect(observations).toBe(1);
+  expect(effects).toBe(1);
+  expect(f.manager.get(f.run.run_id, { execution_id: execution.execution_id })).toMatchObject({
+    status: "failed", actions: 1,
+  });
+});
+
 test("generated attention rejects invalid events without wake, effects or admitted calls", async () => {
   let wakes = 0, effects = 0;
   const { store, run, manager } = fixture(generatedWorker, {

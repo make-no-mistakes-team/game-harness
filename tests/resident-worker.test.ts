@@ -13,6 +13,8 @@ import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 import type { TemporalTurnOptions, TemporalTurnResult, TemporalTurnState } from "../src/shared/temporal-turn.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import type { SkillCapabilityRequest } from "../src/shared/programs.ts";
+import { Json } from "../src/shared/contracts.ts";
+import { RuntimeFault } from "../src/server/runtime-fault.ts";
 
 // This exercises the shipped supervisor and untrusted module thread, not Docker
 // isolation. The parent's Docker/profile proof remains a separate requirement.
@@ -446,9 +448,8 @@ async function hostResidentProtocol(frames: unknown[], result: boolean, stepDela
 }
 const evaluationFrame = { v: 2, type: "guardian_analysis_evaluated", id: 1, entry: "analyze", elapsed_ms: 7, outcome: "result" };
 
-for (const mode of ["valid", "invalid", "budget"] as const)
-test(`host skill transport ${mode} attention uses the shipped worker and existing capability admission`, async () => {
-  const directory = mkdtempSync(join(tmpdir(), "skill-attention-guardian-"));
+function hostSkillProtocol() {
+  const directory = mkdtempSync(join(tmpdir(), "skill-guardian-protocol-"));
   const guardian = join(directory, "guardian.mjs");
   // Replace the Docker/cgroup guardian only. DockerSkillWorker still parses
   // real authored frames, enforces budgets, replies and joins actual cleanup.
@@ -472,9 +473,17 @@ lines.on("line",line=>{
 });
 lines.on("close",async()=>{closing=true;if(worker)await worker.terminate();process.exit(0)});
 `);
-  const sandbox = new SandboxService(directory), adapter = minecraftTestAdapter();
+  const sandbox = new SandboxService(directory);
   Object.assign(sandbox, { state: { status: "ready", image: "controlled-guardian", error: null },
     runner: new URL("../sandbox/worker.mjs", import.meta.url).pathname, guardian });
+  return { sandbox, async close() {
+    await sandbox.close(); rmSync(directory, { recursive: true, force: true });
+  } };
+}
+
+for (const mode of ["valid", "invalid", "budget"] as const)
+test(`host skill transport ${mode} attention uses the shipped worker and existing capability admission`, async () => {
+  const fixture = hostSkillProtocol(), { sandbox } = fixture;
   const admitted: SkillCapabilityRequest[] = [];
   let budgetFailures = 0;
   const source = `const value=await game.attention({urgency:${JSON.stringify(mode === "invalid" ? "immediate" : "ordinary")},
@@ -498,7 +507,66 @@ return {status:"completed",summary:"Continued foreground after attention",result
       expect(admitted.map(request => request.kind)).toEqual(mode === "budget" ? ["attention"] : []);
     }
     expect(budgetFailures).toBe(mode === "budget" ? 1 : 0);
-  } finally { await sandbox.close(); rmSync(directory, { recursive: true, force: true }); }
+  } finally { await fixture.close(); }
+}, 10000);
+
+for (const mode of ["valid", "calls", "actions", "revoked"] as const)
+test(`confirmed emitted failure fresh feedback preserves ${mode} host admission`, async () => {
+  const fixture = hostSkillProtocol();
+  const requests: SkillCapabilityRequest[] = [];
+  let effects = 0, budgetFailures = 0;
+  const outcome = { status: "failed", summary: "Owned packet processed without target damage", evidence: {
+    world_effect_emitted: true, neutralized: true, failure_outcome_confirmed: true,
+  } };
+  const source = `
+try {
+  const checked=await game.actionAndObserve({kind:"look",yaw:0,pitch:0});
+  if(checked.action.status!=="failed" || checked.action.evidence.world_effect_emitted!==true)
+    return {status:"failed",summary:"Original attempted input was misrepresented",result:null};
+  if(!checked.observation || checked.observation.data.done)
+    return {status:"blocked",summary:"No new action selected",result:null};
+  const correction=checked.observation.data.offset>0?-0.4:0.4;
+  await game.action({kind:"look",yaw:correction,pitch:0});
+  return {status:"completed",summary:"Different authored action selected from fresh feedback",result:null};
+} catch(error) {
+  return {status:"blocked",summary:"Fresh authority revoked",result:{code:error.code}};
+}`;
+  try {
+    const result = fixture.sandbox.runSkill(source, null, async (request): Promise<Json> => {
+      requests.push(request);
+      if (request.kind === "action") {
+        effects++;
+        return effects === 1 ? outcome : { status: "succeeded", summary: "Different look applied", evidence: null };
+      }
+      if (mode === "revoked")
+        throw new RuntimeFault("stale_context", "Authority revoked after action");
+      return { data: { done: false, offset: 2 } };
+    }, { ...DEFAULT_SKILL_LIMITS, max_calls: mode === "calls" ? 1 : 3, max_actions: mode === "actions" ? 1 : 2 },
+    new AbortController().signal, {
+      api: { api_version: 5, action_enabled: true, supports_respawn: false, bindings: [] },
+      onCapabilityBudgetExceeded: () => { budgetFailures++; return new Error("Existing shared budget exhausted"); },
+    });
+    if (mode === "calls" || mode === "actions") {
+      await expect(result).rejects.toThrow("Existing shared budget exhausted");
+      expect(requests.map(request => request.kind)).toEqual(mode === "calls" ? ["action"] : ["action", "observe"]);
+      expect(effects).toBe(1);
+      expect(budgetFailures).toBe(1);
+    } else if (mode === "valid") {
+      expect((await result).status).toBe("completed");
+      expect(requests).toEqual([
+        { kind: "action", action: { kind: "look", yaw: 0, pitch: 0 } },
+        { kind: "observe" },
+        { kind: "action", action: { kind: "look", yaw: -0.4, pitch: 0 } },
+      ]);
+      expect(effects).toBe(2);
+      expect(budgetFailures).toBe(0);
+    } else {
+      expect(await result).toMatchObject({ status: "blocked", result: { code: "stale_context" } });
+      expect(requests.map(request => request.kind)).toEqual(["action", "observe"]);
+      expect(effects).toBe(1);
+      expect(budgetFailures).toBe(0);
+    }
+  } finally { await fixture.close(); }
 }, 10000);
 
 test("host step response delay is not charged to the independent isolated computation budget", async () => {

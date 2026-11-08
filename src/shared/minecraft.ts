@@ -119,7 +119,8 @@ export const minecraftActionSchema = z.union([
     .describe("Select an existing hotbar item directly or visibly transfer equipment through the native inventory. Bounded native session up to 12 seconds; owning program limits still apply."),
   z.object({ kind: z.literal("interact"), target: targetRefSchema }).strict()
     .describe("Right-click a current visible block or entity within native reach. Dropped items are proximity pickups, not right-click interactions: approach using ordinary movement or navigation and confirm collection from a fresh inventory receipt. Packet emission alone does not confirm an effect."),
-  z.object({ kind: z.literal("attack"), target: targetRefSchema }).strict(),
+  z.object({ kind: z.literal("attack"), target: targetRefSchema }).strict()
+    .describe("One entity attack with built-in mechanical aiming; no prior look is required. Does not approach, select equipment, repeat strikes or wait for cooldown. Caller chooses movement and timing. Success confirms owned server damage, not a kill."),
   z.object({ kind: z.literal("navigate"), target: targetRefSchema, range: z.number().finite().min(0.5).max(4)
     .describe("Arrival distance in blocks. Position (default): full 3D distance from own feet to block centre or last-authorized entity origin. Interaction: eye-to-block-centre distance, also requiring current visibility and native mining reach; never increases reach. Unless already arrived, a separate helper envelope requires initial feet-to-target-centre distance <=8 blocks and current distance <=10. Observation samples integer block offsets around floor(feet) within radius 8, so a fresh observed centre can still exceed navigation's 8-block envelope. Refusal receipts give distances/limits. Reobserve and choose a permitted local approach, not the unchanged refused request."),
     duration_ms: z.number().int().min(100).max(10000),

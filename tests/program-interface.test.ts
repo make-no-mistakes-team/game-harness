@@ -77,7 +77,8 @@ function fixture(runner?: SandboxService["runSkill"], hooks: { cancelActions?: S
         const evidence = result.evidence && typeof result.evidence === "object" && !Array.isArray(result.evidence)
           ? result.evidence : null;
         const safe = !result.requires_reconnect && (result.status === "succeeded" ||
-          result.status === "failed" && evidence?.world_effect_emitted === false && evidence?.neutralized === true);
+          result.status === "failed" && evidence?.neutralized === true &&
+            (evidence.world_effect_emitted === false || evidence.failure_outcome_confirmed === true));
         return { action: result, observation: safe ? await game.observe() : null };
       },
       respawn: async () => gameActionResultSchema.parse(await handle({ kind: "respawn" })),
@@ -613,6 +614,44 @@ test("program_submit requires explicit JSON args at the installed Agent boundary
   await waitClosed(f.store, f.run.run_id, execution.execution_id);
   expect(f.store.skillExecution(f.run.run_id, { execution_id: execution.execution_id })!.result).toMatchObject({ result: null });
 });
+
+for (const toolName of ["program_submit", "program_run"] as const) {
+  test(`${toolName} cannot introduce a second run controller before the first fully drains`, async () => {
+    const entered = Promise.withResolvers<void>(), retiring = Promise.withResolvers<void>(), retired = Promise.withResolvers<void>();
+    let oldSignal: AbortSignal | undefined;
+    const f = fixture(async (_body, args, handle, _limits, signal) => {
+      await handle({ kind: "action", action: { kind: "look", yaw: args === "old" ? 0.01 : 0.02, pitch: 0 } });
+      if (args === "old") { oldSignal = signal; entered.resolve(); await aborted(signal); }
+      return { status: "completed", summary: "Bounded controller settled", result: args };
+    }, { cancelActions: async () => { retiring.resolve(); await retired.promise; } });
+    resources.unshift(async () => { retired.resolve(); });
+    await f.write("single playing root");
+    expect((await f.call("program_run", { operation: "start", name: "single playing root", args: "old" })).isError).not.toBe(true);
+    await entered.promise;
+    const predecessor = f.store.latestRootExecution(f.run.run_id)!;
+    if (toolName === "program_run") await f.write("competing controller");
+    const input = { name: "competing controller", args: "new",
+      ...(toolName === "program_submit" ? { source } : { operation: "start" }) };
+    const refused = data(await f.call(toolName, input));
+    expect(toolName === "program_submit" ? refused.start.error.code : refused.error.code).toBe("busy");
+    expect(oldSignal!.aborted).toBe(false);
+    expect(f.store.latestRootExecution(f.run.run_id)!.execution_id).toBe(predecessor.execution_id);
+    expect(f.dispatches()).toBe(1);
+    expect(f.actions()).toBe(1);
+    expect(f.manager.effectScope(predecessor.execution_id)).not.toBeNull();
+    expect((await f.call("program_run", { operation: "stop", target: "current" })).isError).not.toBe(true);
+    await retiring.promise;
+    expect(data(await f.call("program_run", { operation: "start", name: "competing controller", args: "new" })).error.code).toBe("busy");
+    expect(f.dispatches()).toBe(1);
+    retired.resolve();
+    await waitClosed(f.store, f.run.run_id, predecessor.execution_id);
+    const next = data(await f.call("program_run", { operation: "start", name: "competing controller", args: "new" }));
+    await waitClosed(f.store, f.run.run_id, f.store.latestRootExecution(f.run.run_id)!.execution_id);
+    expect(next.name).toBe("competing controller");
+    expect(f.dispatches()).toBe(2);
+    expect(f.actions()).toBe(2);
+  });
+}
 
 test("one submission keeps old control through validation and waits actual retirement before the exact successor", async () => {
   const entered = Promise.withResolvers<void>(), validating = Promise.withResolvers<void>(), publish = Promise.withResolvers<void>();
@@ -1346,6 +1385,9 @@ test("lost acknowledgement retries compound trusted call identity with original 
   expect(f.dispatches()).toBe(1);
   expect(f.store.latestRootExecution(f.run.run_id)).toMatchObject({ execution_id: original.execution_id, epoch: 1, life_id: 1, version: 1 });
   expect(data(await f.call("program_run", { ...input, args: { changed: true } }, id)).error.code).toBe("conflict");
+  expect(data(await f.call("program_run", input, `${id}-before-drain`)).error.code).toBe("busy");
+  f.fence();
+  await f.manager.closeAll("Old-scope owner drained before a fresh decision");
   await f.call("program_run", input, `${id}0`);
   expect(f.store.latestRootExecution(f.run.run_id)).toMatchObject({ epoch: 2, life_id: 2, version: 2 });
   expect(new Set(f.store.allSkillExecutions(f.run.run_id).map((execution) => execution.start_key)).size).toBe(2);

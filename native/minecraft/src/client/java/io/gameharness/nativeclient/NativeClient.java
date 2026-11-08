@@ -409,6 +409,11 @@ public final class NativeClient implements ClientModInitializer {
         && generation == motor.generation
         && motor.attackNonce == nonce
         && motor.kind.equals("attack")
+        && motor.issued
+        && motor.damageOutcome == null
+        && motor.authorized(false)
+        && motor.lifeId == lifecycle.lifeId()
+        && lifecycle.ready()
         && outcome >= 0
         && outcome <= 2) motor.damageOutcome = outcome;
   }
@@ -3383,6 +3388,16 @@ public final class NativeClient implements ClientModInitializer {
       evidence.add("native_input_timing", inputTiming.evidence(
           effectAuthority.nativeBootId(), id, received.owner().operationId(), generation));
       evidence.addProperty("world_effect_emitted", (emissions & EffectOutcome.WORLD_EFFECT) != 0);
+      if (kind.equals("attack") && damageOutcome != null) {
+        JsonObject receipt = new JsonObject();
+        receipt.addProperty("nonce", attackNonce);
+        receipt.addProperty("generation", generation);
+        receipt.addProperty("outcome", damageOutcome);
+        evidence.add("attack_receipt", receipt);
+      }
+      if (kind.equals("attack") && status.equals("failed") && authoritativeRejection
+          && Integer.valueOf(0).equals(damageOutcome) && evidence.get("neutralized").getAsBoolean())
+        evidence.addProperty("failure_outcome_confirmed", true);
       evidence.addProperty("camera_changed", (emissions & EffectOutcome.CAMERA) != 0);
       if (inventoryUi != null) evidence.add("native_inventory_ui", inventoryUi);
       if (craftStages != null) evidence.add("craft_stages", craftStages);

@@ -367,6 +367,39 @@ test("installed Agent rejects explicit invalid actor limits without source persi
   expect(f.dispatches()).toBe(0);
 });
 
+test("unknown tool fields are named without their values and permit an explicit corrected non-admitted write", async () => {
+  const f = fixture(), id = "unknown-field-correction";
+  const rejected = await f.call("program_write", {
+    name: "field correction", source, budget: { private_value: "NOT_AN_ERROR_DIAGNOSTIC_VALUE" },
+  }, id);
+  expect(rejected.isError).toBe(true);
+  expect(data(rejected).error).toMatchObject({
+    code: "invalid_request", issues: [{ code: "unrecognized_keys", path: "", keys: ["budget"] }],
+  });
+  expect(JSON.stringify(data(rejected))).not.toContain("NOT_AN_ERROR_DIAGNOSTIC_VALUE");
+  expect(f.store.skills(f.run.run_id)).toHaveLength(0);
+  const corrected = await f.write("field correction", source, {}, id);
+  expect(corrected.isError).not.toBe(true);
+  expect(f.store.skills(f.run.run_id)).toHaveLength(1);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
+test("unknown nested tool fields retain their path and cap names with explicit omissions", async () => {
+  const f = fixture();
+  const extras = Object.fromEntries(Array.from({ length: 20 }, (_, index) =>
+    [`unknown_${index}_${"界".repeat(100)}`, "NOT_AN_ERROR_DIAGNOSTIC_VALUE"]));
+  const rejected = await f.call("program_submit", { name: "bounded hints", source, args: null, limits: extras });
+  const issue = data(rejected).error.issues.find((value: { code: string }) => value.code === "unrecognized_keys");
+  expect(issue.path).toBe("limits");
+  expect(issue.keys.length).toBeLessThanOrEqual(8);
+  expect(issue.keys.every((name: string) => name.length <= 80)).toBe(true);
+  expect(issue.omitted_keys).toBeGreaterThan(0);
+  expect(issue.key_names_truncated).toBe(true);
+  expect(JSON.stringify(data(rejected))).not.toContain("NOT_AN_ERROR_DIAGNOSTIC_VALUE");
+  expect(f.store.skills(f.run.run_id)).toHaveLength(0);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
 test("installed Agent rejects invalid start and successor limits before durable admission or staging", async () => {
   const f = fixture(async (_body, _args, _handle, _limits, signal) => {
     await aborted(signal); return { status: "completed", summary: "Released", result: null };

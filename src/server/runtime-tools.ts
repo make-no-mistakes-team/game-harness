@@ -166,10 +166,18 @@ export class RuntimeTools {
               ? { code: error.code, message: error.message, retryable: false }
               : { code: invalidArguments ? "invalid_request" : "backend_unavailable", message: invalidArguments ? "Tool arguments do not match the advertised schema; no operation was admitted" : "The requested operation could not complete safely", retryable: false };
           if (argumentError && invalidArguments)
-            failure.issues = argumentError.issues.slice(0, 16).map(issue => ({
-              code: issue.code, path: issue.path.map(String).join(".").slice(0, 160),
-              message: issue.code === "unrecognized_keys" ? "Unknown fields are not accepted" : issue.message.slice(0, 300),
-            }));
+            failure.issues = argumentError.issues.slice(0, 16).map(issue => {
+              const keys = issue.code === "unrecognized_keys" ? issue.keys.slice(0, 8) : null;
+              return {
+                code: issue.code, path: issue.path.map(String).join(".").slice(0, 160),
+                message: issue.code === "unrecognized_keys" ? "Unknown fields are not accepted" : issue.message.slice(0, 300),
+                ...(keys ? {
+                  keys: keys.map(key => key.slice(0, 80)),
+                  ...(issue.code === "unrecognized_keys" && issue.keys.length > keys.length ? { omitted_keys: issue.keys.length - keys.length } : {}),
+                  ...(keys.some(key => key.length > 80) ? { key_names_truncated: true } : {}),
+                } : {}),
+              };
+            });
           if (error instanceof RuntimeFault && "issues" in error && Array.isArray(error.issues)) {
             const issues = faultIssuesSchema.safeParse(error.issues.slice(0, 32));
             if (issues.success) failure.issues = JSON.parse(JSON.stringify(issues.data)) as Json;

@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { Store } from "../src/server/store.ts";
 import { SkillManager, type SkillHost } from "../src/server/skills.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
+import { RuntimeTools, type RuntimeToolHost } from "../src/server/runtime-tools.ts";
+import { HistoryReader } from "../src/server/history-reader.ts";
+import { ImprovementLearning } from "../src/server/improvement-learning.ts";
+import type { ReactiveRuntime } from "../src/server/reactive.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import type { LookaheadConfig } from "../src/shared/planning.ts";
 import { DEFAULT_RESIDENT_LIMITS, type ControllerStepResult, type ResidentAnalysisWorker, type ResidentLimits, type ResidentWorker } from "../src/shared/resident.ts";
@@ -53,11 +57,12 @@ async function fixture(analysisFactory?: (budget: number) => Promise<ResidentAna
       const owner = { operation_id: "controller", generation: 1, scope: { session_id: run.session_id!, epoch: run.epoch,
         life_id: run.life_id!, native_boot_id: run.native_boot_id!, run_generation: 1, space_epoch: run.space_epoch!,
         run_id: run.run_id, world_id: run.world_id, execution_id: execution.execution_id, source_hash: execution.source_hash! } };
-      let retired = false;
+      let retired = false, submitted = 0;
       return { owner, controllerGeneration: generation, async sample() { const frame = controllerFrameFixture(run.life_id!, run.space_epoch!); frame.frame_seq = ++sequence; frame.native_tick = sequence; frame.captured_native_ns = String(BigInt(sequence) * 50000000n); return jsonSchema.parse(frame); },
-        submit() { throw new Error("Completed neutral step must retire without input"); }, renew: async () => {},
+        submit() { if (output !== "running") throw new Error("Completed neutral step must retire without input");
+          return { sequence: ++submitted, status: "submitted", reason: null }; }, renew: async () => {},
         async revoke() { await hooks.retire?.(); lifecycle.fence("retire"); await lifecycle.drain(); retired = true; return { owner, controller_generation: generation, admission_revoked: true, last_applied_sequence: 0, ordered_edge_prefix: 0, retirement_applied_native_tick: sequence, retirement_applied_native_ns: String(BigInt(sequence) * 50000000n), input_application: "confirmed", unresolved_operation_refs: [] } satisfies RevocationAck; },
-        snapshot: () => ({ fenced: retired, retired, submitted_sequence: 0, applied_sequence: 0, ordered_edge_prefix: 0, pending_frames: 0, pending_edges: 0, last_input: null, reason: null }),
+        snapshot: () => ({ fenced: retired, retired, submitted_sequence: submitted, applied_sequence: 0, ordered_edge_prefix: 0, pending_frames: retired ? 0 : submitted, pending_edges: 0, last_input: null, reason: null }),
       } satisfies ControllerInputChannel;
     },
   });
@@ -66,6 +71,63 @@ async function fixture(analysisFactory?: (budget: number) => Promise<ResidentAna
   const start = (lookahead?: LookaheadConfig) => manager.start(run.run_id, {entry:"step", skill_id:program.skill_id, version:program.version, start_key:crypto.randomUUID(), ...executionScopeFixture(run), args:{goal:"wait"}, initial_state:0, limits:{...DEFAULT_RESIDENT_LIMITS, duration_ms:10000, ...limits}, ...(lookahead ? { lookahead } : {})});
   return { store, run, manager, program, start, compiled, finishCompile, firstStep, hold() {holdCompile=true;}, running() {output="running";}, get opened(){return opened;}, get closed(){return closed;}, get finiteCalls(){return finiteCalls;} };
 }
+
+test("ordinary named resident handoff holds admission until native retirement then starts exact step limits once", async () => {
+  const retiring = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  let nativeRetired = false;
+  const f = await fixture(undefined, {}, { retire: async () => {
+    retiring.resolve(); await release.promise; nativeRetired = true;
+  } });
+  cleanup.unshift(async () => { release.resolve(); });
+  const adapter = minecraftTestAdapter(), history = new HistoryReader(f.store.readLocation());
+  const learning = new ImprovementLearning(f.store, history);
+  cleanup.unshift(async () => { await history.close(); });
+  const scope = () => ({ run_id: f.run.run_id, generation: 1, session_id: f.run.session_id!, world_id: f.run.world_id!,
+    epoch: f.run.epoch, life_id: f.run.life_id!, life_status: "alive" as const, task: f.run.task,
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")!, native_boot_id: f.run.native_boot_id!,
+    space_epoch: f.run.space_epoch!, compatibility_hash: f.run.compatibility_hash!, screen: null });
+  const observation = () => minecraftObservationFixture(adapter, {
+    world_id: f.run.world_id, session_id: f.run.session_id!, epoch: f.run.epoch,
+    native_boot_id: f.run.native_boot_id!, life: { life_id: f.run.life_id!, status: "alive", can_respawn: false, death: null },
+  });
+  const planning = new SpeculativePlanning({ contract: () => adapter, admissionContext: scope, context: () => null,
+    skill: ref => f.store.skill(f.run.run_id, ref), observe: async () => observation(),
+    evaluateGuard: async () => { throw new Error("No speculative guard"); },
+    admit: async (request, permit) => { permit.assertCurrent(); return f.manager.start(f.run.run_id, request); },
+    evidence: () => {}, wake: () => {} });
+  const host: RuntimeToolHost = { run: () => f.run, assertCurrent: () => f.run, observe: async () => observation(),
+    adapter: () => adapter, generation: () => 1, attentionAfter: () => {}, admitted: () => {},
+    history: () => history, planning: () => planning, learning: () => learning, toolAuthority: () => () => {},
+    finishTask: () => { throw new Error("No task completion"); } };
+  const catalog = new RuntimeTools(f.store, f.manager, {} as ReactiveRuntime, null, host);
+  const tool = catalog.build(1).find(tool => tool.name === "program_run")!;
+  f.running();
+  const predecessor = f.start();
+  await f.firstStep.promise;
+  const successor = await f.manager.register(f.run.run_id, { entry: "step", name: "exact successor", source, card, dependencies: [] });
+  const limits = { ...DEFAULT_RESIDENT_LIMITS, duration_ms: 8000, max_steps: 17, max_frames: 11 };
+  const input = { operation: "start", entry: "step", name: successor.name, args: { goal: "new authored intent" }, initial_state: 0, limits,
+    handoff: { name: f.program.name, version: f.program.version, execution_ordinal: 1 } };
+  const pending = tool.execute("resident-handoff", input);
+  await retiring.promise;
+  expect(f.opened).toBe(1);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  expect(f.manager.effectScope(predecessor.execution_id)).toBeNull();
+  release.resolve();
+  const result = await pending;
+  expect(result.isError).not.toBe(true);
+  expect(nativeRetired).toBe(true);
+  const next = f.store.latestRootExecution(f.run.run_id)!;
+  expect(next).toMatchObject({ entry: "step", skill_id: successor.skill_id, version: successor.version, limits, args: input.args, initial_state: 0 });
+  await until(f.store, f.run.run_id, () => f.opened === 2);
+  expect(f.opened).toBe(2);
+  expect(f.closed).toBe(1);
+  expect(f.manager.get(f.run.run_id, { execution_id: predecessor.execution_id })!.status).toBe("cancelled");
+  expect(f.finiteCalls).toBe(0);
+  await tool.execute("resident-handoff", input);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(2);
+  expect(f.manager.effectScope(next.execution_id)).not.toBeNull();
+});
 
 test("resident prepared continuation cannot start until actual native retirement completes", async () => {
   const retiring = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(), rootClosed = Promise.withResolvers<void>();

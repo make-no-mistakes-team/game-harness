@@ -93,6 +93,7 @@ export class SkillManager {
   private readonly registrations = new WeakMap<RuntimeAdapter, RegisteredAdapterContract>();
   private live = new Map<string, Live>();
   private cleanupFailures = new Set<Error>();
+  private handoffRevision = 0;
   private trace: ExecutionTrace;
   constructor(
     private store: Store,
@@ -238,28 +239,9 @@ export class SkillManager {
       start_key: parsed.start_key,
     });
     if (existing) return this.store.admitSkill(runId, parsed).view;
-    const selected = this.store.skill(runId, parsed);
-    this.compatible(selected);
-    if (selected.entry !== parsed.entry)
-      throw new RuntimeFault("precondition_failed", "Playing entry does not match the immutable source");
-    if (parsed.entry === "step" && (!this.sandbox.createResidentWorker || !this.sandbox.createResidentAnalysisWorker || !this.host.openController))
-      throw new RuntimeFault("precondition_failed", "This host does not provide resident worker and native controller authority");
+    const { skill, armLookahead } = this.prepareStart(runId, parsed);
     if ([...this.live.values()].some(live => live.root === live && (parsed.entry === "step" || live.view.entry === "step")))
       throw new RuntimeFault("busy", "Playing resident admission waits for the previous root's actual drain");
-    const run = this.store.getRun(runId);
-    if (!run) throw new RuntimeFault("not_found", "Run not found");
-    this.host.authorize({ session_id: parsed.session_id, world_id: run.world_id, epoch: parsed.epoch,
-      native_boot_id: parsed.native_boot_id, run_id: runId, run_generation: parsed.run_generation,
-      life_id: parsed.life_id, space_epoch: parsed.space_epoch });
-    const armLookahead = parsed.lookahead
-      ? this.host.prepareLookahead?.(parsed.lookahead) : undefined;
-    if (parsed.lookahead && !armLookahead)
-      throw new Error("This program host does not provide speculative planning");
-    const skill = this.store.skill(runId, parsed);
-    if (skill.state !== "validated") throw new Error("Skill is not validated");
-    if (skill.validation.runtime_version !== SKILL_API_VERSION)
-      throw new RuntimeFault("precondition_failed", "Program uses an incompatible skill API; retained source is inspectable but cannot execute");
-    this.validateDependencies(runId, skill.dependencies);
     const admitted = this.store.admitSkill(runId, parsed);
     if (admitted.created) {
       const live = this.dispatch(admitted.view, skill, null);
@@ -274,6 +256,53 @@ export class SkillManager {
       }
     }
     return structuredClone(admitted.view);
+  }
+  private prepareStart(runId: string, parsed: SkillStartRequest) {
+    const selected = this.store.skill(runId, parsed);
+    this.compatible(selected);
+    if (selected.entry !== parsed.entry)
+      throw new RuntimeFault("precondition_failed", "Playing entry does not match the immutable source");
+    if (parsed.entry === "step" && (!this.sandbox.createResidentWorker || !this.sandbox.createResidentAnalysisWorker || !this.host.openController))
+      throw new RuntimeFault("precondition_failed", "This host does not provide resident worker and native controller authority");
+    const run = this.store.getRun(runId);
+    if (!run) throw new RuntimeFault("not_found", "Run not found");
+    this.host.authorize({ session_id: parsed.session_id, world_id: run.world_id, epoch: parsed.epoch,
+      native_boot_id: parsed.native_boot_id, run_id: runId, run_generation: parsed.run_generation,
+      life_id: parsed.life_id, space_epoch: parsed.space_epoch });
+    const armLookahead = parsed.lookahead
+      ? this.host.prepareLookahead?.(parsed.lookahead) : undefined;
+    if (parsed.lookahead && !armLookahead)
+      throw new Error("This program host does not provide speculative planning");
+    const skill = this.store.skill(runId, parsed);
+    if (skill.state !== "validated") throw new Error("Skill is not validated");
+    if (skill.validation.runtime_version !== SKILL_API_VERSION)
+      throw new RuntimeFault("precondition_failed", "Program uses an incompatible skill API; retained source is inspectable but cannot execute");
+    this.validateDependencies(runId, skill.dependencies);
+    return { skill, armLookahead };
+  }
+  /** Revoke synchronously; the returned guard remains required until admission. */
+  async retireForHandoff(runId: string, request: SkillStartRequest, predecessorId: string): Promise<() => void> {
+    this.prepareStart(runId, skillStartRequestSchema.parse(request));
+    const live = this.live.get(predecessorId);
+    if (!live || live.root !== live || live.view.run_id !== runId || live.controller.signal.aborted ||
+        !["accepted", "running"].includes(live.view.status) ||
+        this.store.latestRootExecution(runId)?.execution_id !== predecessorId)
+      throw new RuntimeFault("precondition_failed", "Handoff requires the exact still-live current predecessor");
+    const revision = this.handoffRevision;
+    const assertRetired = () => {
+      if (revision !== this.handoffRevision || this.store.latestRootExecution(runId)?.execution_id !== predecessorId)
+        throw new RuntimeFault("stale_context", "Handoff was stopped or superseded");
+      if (this.cleanupFailures.size || live.view.status !== "cancelled" || this.live.has(predecessorId) ||
+          [...this.live.values()].some(candidate => candidate.view.run_id === runId && candidate.root === candidate))
+        throw new RuntimeFault("precondition_failed", "Predecessor retirement was not safely confirmed");
+    };
+    await this.closeTree(live, "Exact predecessor retired for authored handoff");
+    assertRetired();
+    return assertRetired;
+  }
+  /** A deliberate Stop also revokes a handoff waiting on observation, not just a live worker. */
+  interruptHandoffs(): void {
+    this.handoffRevision++;
   }
   get(
     runId: string,
@@ -291,6 +320,7 @@ export class SkillManager {
     lookup: { execution_id: string } | { start_key: string },
     reason = "Skill cancellation requested",
   ): SkillExecutionView {
+    this.interruptHandoffs();
     const view = this.get(runId, lookup);
     if (!view) throw new Error("Skill execution not found");
     const live = this.live.get(view.execution_id);
@@ -299,6 +329,7 @@ export class SkillManager {
     return this.get(runId, lookup)!;
   }
   fence(reason: string, uncertainExecutionId?: string): void {
+    this.interruptHandoffs();
     let uncertain = uncertainExecutionId ? this.live.get(uncertainExecutionId) : undefined;
     while (uncertain) {
       uncertain.abortStatus = "unknown";
@@ -310,6 +341,7 @@ export class SkillManager {
         void this.closeTree(live, reason).catch(() => this.host.changed(true));
   }
   async closeAll(reason: string): Promise<void> {
+    this.interruptHandoffs();
     const roots = [...this.live.values()].filter((live) => live.root === live);
     for (const root of roots) this.revoke(root, reason);
     await Promise.all(roots.map((root) => this.closeTree(root, reason)));
@@ -526,7 +558,9 @@ export class SkillManager {
     } finally {
       live.controller.signal.removeEventListener("abort", abort);
       if (resident) await resident.stop("Resident execution closed");
-      else await worker.close();
+      else {
+        try { await worker.close(); } catch { throw new ResidentCleanupError(); }
+      }
     }
   }
   updateResidentIntent(runId: string, executionId: string, intent: Json, expectedVersion: number): number {

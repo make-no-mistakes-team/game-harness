@@ -47,20 +47,23 @@ const actorLimitsSchema = skillLimitsSchema.extend({
   max_calls: skillLimitsSchema.shape.max_calls.default(DEFAULT_SKILL_LIMITS.max_calls),
   max_depth: skillLimitsSchema.shape.max_depth.default(DEFAULT_SKILL_LIMITS.max_depth),
 }).prefault({});
+const handoffSchema = programSelectorSchema.required({ version: true }).extend({
+  execution_ordinal: z.int().positive(),
+}).strict().describe("Exact current predecessor to retire only after the successor is validated and saved. Omit for an ordinary start.");
 export const programSubmitSchema = z.discriminatedUnion("entry", [
   programWriteSchema.extend({ entry: z.literal("run").default("run"),
     args: jsonSchema.describe("Required JSON execution arguments; pass null when unused."),
-    limits: actorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
+    limits: actorLimitsSchema, next: nextConfigSchema.optional(), handoff: handoffSchema.optional() }).strict(),
   programWriteSchema.extend({ entry: z.literal("step"),
     args: residentIntentSchema.describe("Required JSON initial resident intent; pass null when unused."),
-    initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
+    initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema, next: nextConfigSchema.optional(), handoff: handoffSchema.optional() }).strict(),
 ]);
 const playingStartSchema = z.discriminatedUnion("entry", [
   programSelectorSchema.extend({ operation: z.literal("start"), entry: z.literal("run").default("run"),
-    args: jsonSchema, limits: actorLimitsSchema, next: nextConfigSchema.optional() }).strict(),
+    args: jsonSchema, limits: actorLimitsSchema, next: nextConfigSchema.optional(), handoff: handoffSchema.optional() }).strict(),
   programSelectorSchema.extend({ operation: z.literal("start"), entry: z.literal("step"),
     args: residentIntentSchema, initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema,
-    next: nextConfigSchema.optional() }).strict(),
+    next: nextConfigSchema.optional(), handoff: handoffSchema.optional() }).strict(),
 ]);
 export const programRunSchema = z.discriminatedUnion("operation", [
   playingStartSchema,

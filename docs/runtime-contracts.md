@@ -89,9 +89,26 @@ A new `name` creates a family and omits `based_on`. An existing name requires `b
 
 `card.reason` is ordinary descriptive motivation. Optional top-level `reason` on `program_write` or `program_submit` instead links an experimental revision to actual outcome feedback for that exact `based_on` parent. If that feedback is missing, the operation refuses before writing new source or starting execution with `precondition_failed` and issue `{code:"missing_parent_outcome",path:"reason"}`. To revise stored but unexecuted source normally, retain its latest `based_on` and omit top-level `reason`; motivation may remain in `card.reason`. No execution or review call is required to make that ordinary revision. An explicit experiment link is never silently discarded or attached to an older version's outcome; it records a candidate, not proven efficacy or promotion.
 
-`program_submit` accepts a `run` or `step` definition with required JSON `args` and entry-specific finite limits. Pass `args:null` when unused; omission is invalid before source persistence or execution. For a step, `args` supplies initial intent, and `initial_state` is also accepted; only a run can select speculative `next`. Submission saves one validated version, then requests that exact version through ordinary admission. `program_write` remains save-only. Review and speculative roles cannot submit. The result separates `source:{status:"persisted",name,version}` from `start.status:"started"|"refused"|"unknown"`. A refused start does not roll back source. Inspect an unknown start rather than resubmitting it.
+`program_submit` accepts a `run` or `step` definition with required JSON `args` and entry-specific finite limits. Pass `args:null` when unused; omission is invalid before source persistence or execution. For a step, `args` supplies initial intent, and `initial_state` is also accepted. Both playing entries may select speculative `next`. Submission saves one validated version, then requests that exact version through ordinary admission. `program_write` remains save-only. Review and speculative roles cannot submit. The result separates `source:{status:"persisted",name,version}` from `start.status:"started"|"refused"|"unknown"`. A refused start does not roll back source. Inspect an unknown start rather than resubmitting it.
 
 Source registration and its exact-version receipt share one Store transaction. Submission phase identities retain the original source and execution across duplicate delivery or lost acknowledgements; replay never selects a newer catalog revision. An interrupted submission cannot automatically start on redelivery. Stop/Pause, task, owner, generation and negotiated scope are rechecked between persistence and admission. Successful admission retains the scheduler's pending-work behavior instead of requiring a separate run-only model request.
+
+For an intentional live replacement, `program_submit` and `program_run`
+start accept optional `handoff:{name,version,execution_ordinal}` for the exact
+current predecessor. Source authoring and validation leave that work running.
+Only after successor source, entry and limits pass preflight does the host
+revoke the pinned predecessor, join actual worker/native retirement, and admit
+the exact successor without another model request between Stop and Start.
+Ordinary decision authority is required; inactive source authoring gains no
+replacement permission. Omission does not replace existing work.
+
+Authorized observations bracket retirement. Task/generation/life/boot/space
+or screen changes, deliberate Stop, newer work and unconfirmed cleanup block
+successor admission. An already ended or mismatched predecessor is refused
+before cancellation. Interrupted delivery cannot dispatch again; a duplicate
+acknowledged call returns its original selection without cancelling the
+successor. Each root keeps ordinary limits, and the run deadline is unchanged.
+Handoff supplies no behavior, state migration, fallback or replay of old effects.
 
 Review with an explicit version stays exact. Without one, `program_review` selects the family's latest matching outcome, not an unexecuted latest source revision. A write experiment still requires its exact latest direct parent's own feedback. A prior `keep` or `insufficient_evidence` assessment stays immutable but does not block repair. Authoring does not require a review call.
 

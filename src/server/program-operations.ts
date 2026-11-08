@@ -168,10 +168,16 @@ export class ProgramOperations {
       if (interrupted !== null) return interrupted;
       commit();
       const selection = { operation: "start" as const, name: program.name, version: program.version };
+      const handoff = input.handoff ? { handoff: input.handoff } : {};
+      const startCommit = () => {
+        commit();
+        if (input.handoff && this.store.completedToolCall(this.run.run_id, outcomeKey, identity) !== null)
+          throw new RuntimeFault("stale_context", "Submission delivery was interrupted before handoff admission");
+      };
       const execution = await this.runProgram(input.entry === "step"
-        ? { ...selection, entry: "step", args: input.args, limits: input.limits, initial_state: input.initial_state,
+        ? { ...selection, ...handoff, entry: "step", args: input.args, limits: input.limits, initial_state: input.initial_state,
           ...(input.next ? { next: input.next } : {}) }
-        : { ...selection, entry: "run", args: input.args, limits: input.limits, ...(input.next ? { next: input.next } : {}) }, startId, commit);
+        : { ...selection, ...handoff, entry: "run", args: input.args, limits: input.limits, ...(input.next ? { next: input.next } : {}) }, startId, startCommit);
       return finish(program, { status: "started", execution: execution as unknown as Json });
     } catch (error) {
       const existing = this.skills.get(this.run.run_id, { start_key: this.startKey(startId) });
@@ -184,19 +190,79 @@ export class ProgramOperations {
   async runProgram(input: z.infer<typeof programRunSchema>, callId: string, commit: () => void) {
     if (input.operation === "start") {
       const startKey = this.startKey(callId);
-      const request = this.store.bindToolCall(this.run.run_id, callId, { tool: "program_run", input } as unknown as Json, () => {
+      const identity = { tool: "program_run", input } as unknown as Json;
+      let first = false;
+      const bound = this.store.bindToolCall(this.run.run_id, callId, identity, () => {
         commit();
         this.host.planning().assertOrdinaryAdmission();
         const program = this.workspace.select(input, true);
         if (program.entry !== input.entry) throw new RuntimeFault("precondition_failed", "Playing entry does not match the selected immutable source");
+        const predecessor = input.handoff ? this.workspace.execution("current") : null;
+        const reference = predecessor ? this.workspace.executionReference(predecessor.execution_id) : null;
+        if (input.handoff && (!predecessor || !["accepted", "running"].includes(predecessor.status) ||
+            !reference || reference.name !== input.handoff.name || reference.version !== input.handoff.version ||
+            reference.execution_ordinal !== input.handoff.execution_ordinal))
+          throw new RuntimeFault("precondition_failed", "Handoff must name the exact current live predecessor");
+        first = true;
         return { entry: input.entry, skill_id: program.skill_id, version: program.version, start_key: startKey,
           epoch: this.run.epoch, session_id: this.run.session_id!, life_id: this.run.life_id!,
           native_boot_id: this.run.native_boot_id!, run_generation: this.host.generation(), space_epoch: this.run.space_epoch!,
           compatibility_hash: this.run.compatibility_hash!,
           args: input.args, limits: input.limits, ...(input.entry === "step" ? { initial_state: input.initial_state } : {}),
+          ...(predecessor ? { handoff_predecessor_id: predecessor.execution_id } : {}),
           ...(input.next ? { lookahead: input.next } : {}) } as unknown as Json;
-      }) as unknown as SkillStartRequest;
+      }) as unknown as SkillStartRequest & { handoff_predecessor_id?: string };
+      const { handoff_predecessor_id: predecessorId, ...request } = bound;
       const existing = this.skills.get(this.run.run_id, { start_key: startKey });
+      if (input.handoff && !existing) {
+        if (!predecessorId) throw new RuntimeFault("conflict", "Original handoff selection is unavailable");
+        const outcomeKey = this.phaseKey(callId, "handoff_outcome");
+        const interrupted = () => this.store.completedToolCall(this.run.run_id, outcomeKey, identity) !== null;
+        const refuseReplay = () => new RuntimeFault("precondition_failed",
+          "Original handoff did not acknowledge a successor; inspect source and execution. It is never dispatched again.");
+        if (!first || interrupted()) {
+          if (!interrupted()) this.store.completeToolCall(this.run.run_id, outcomeKey, identity, { status: "unknown" });
+          throw refuseReplay();
+        }
+        const scope = () => JSON.stringify([this.host.generation(), this.run.task, this.run.goal, this.run.world_id,
+          this.run.epoch, this.run.session_id, this.run.life_id, this.run.native_boot_id, this.run.space_epoch, this.run.compatibility_hash]);
+        const selectedScope = scope();
+        const current = () => {
+          commit();
+          if (scope() !== selectedScope || interrupted())
+            throw new RuntimeFault("stale_context", "Handoff authority changed before successor admission");
+          this.host.planning().assertOrdinaryAdmission();
+        };
+        const observe = async () => {
+          const observation = await this.host.observe();
+          current();
+          if (observation.world_id !== this.run.world_id || observation.epoch !== request.epoch ||
+              observation.session_id !== request.session_id || observation.native_boot_id !== request.native_boot_id ||
+              observation.life.life_id !== request.life_id || observation.life.status !== "alive" ||
+              observation.space.space_epoch !== request.space_epoch || observation.compatibility_hash !== request.compatibility_hash)
+            throw new RuntimeFault("stale_context", "Handoff observation no longer matches the selected authority");
+          return observation;
+        };
+        try {
+          const before = await observe();
+          current();
+          // This method validates without effects, then synchronously revokes
+          // only the pinned predecessor before its first retirement await.
+          const retired = await this.skills.retireForHandoff(this.run.run_id, request, predecessorId);
+          current();
+          const after = await observe();
+          retired();
+          if (JSON.stringify(before.screen) !== JSON.stringify(after.screen) ||
+              JSON.stringify(before.space) !== JSON.stringify(after.space))
+            throw new RuntimeFault("stale_context", "Handoff screen or space changed during retirement");
+          current();
+        } catch (error) {
+          if (!interrupted()) this.store.completeToolCall(this.run.run_id, outcomeKey, identity, {
+            status: error instanceof RuntimeFault ? "refused" : "unknown",
+          });
+          throw error;
+        }
+      }
       if (!existing) { commit(); this.host.planning().assertOrdinaryAdmission(); }
       const result = this.skills.start(this.run.run_id, request);
       if (!existing) this.host.admitted();
@@ -254,11 +320,16 @@ export class ProgramOperations {
       return input;
     }
     if (input.operation === "stop") {
+      let first = false;
       const selected = executionControlSchema.parse(this.store.bindToolCall(this.run.run_id, callId,
-        { tool: "program_run", input } as unknown as Json, () => ({
-          execution_id: this.workspace.execution(input.target)?.execution_id ?? null,
-          plan_id: this.host.planning().projection()?.plan_id ?? null,
-        })));
+        { tool: "program_run", input } as unknown as Json, () => {
+          first = true;
+          return {
+            execution_id: this.workspace.execution(input.target)?.execution_id ?? null,
+            plan_id: this.host.planning().projection()?.plan_id ?? null,
+          };
+        }));
+      if (first) this.skills.interruptHandoffs();
       const invalidated = selected.plan_id !== null && this.host.planning().projection()?.plan_id === selected.plan_id;
       if (invalidated) this.host.planning().invalidate("cancelled");
       const execution = selected.execution_id ? this.skills.get(this.run.run_id, { execution_id: selected.execution_id }) : null;

@@ -19,7 +19,7 @@ import { visibleScreenSnapshotSchema } from "../src/shared/control.ts";
 import { observationSchema, skillResultSchema } from "../src/shared/validation.ts";
 import { gameActionResultSchema } from "../src/shared/primitives.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
-import { SkillManager } from "../src/server/skills.ts";
+import { SkillManager, type SkillHost } from "../src/server/skills.ts";
 import { preserveRuntimeToolArguments, RuntimeTools, type RuntimeToolHost } from "../src/server/runtime-tools.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
@@ -43,7 +43,7 @@ function aborted(signal: AbortSignal) {
   return ready.promise;
 }
 
-function fixture(runner?: SandboxService["runSkill"]) {
+function fixture(runner?: SandboxService["runSkill"], hooks: { cancelActions?: SkillHost["cancelActions"] } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-interface-"));
   const store = new Store(directory), adapter = minecraftTestAdapter();
   const run = minecraftRunFixture(adapter, { world_id: crypto.randomUUID(), session_id: "fixture-session", task: "Inspect neutral authorized state" });
@@ -95,7 +95,7 @@ function fixture(runner?: SandboxService["runSkill"]) {
       throw new RuntimeFault("stale_context", "Fixture authority revoked"); },
     adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
     observe: async () => observation(), action: async () => { actions++; return { status: "succeeded", summary: "Neutral receipt", evidence: { effect_confirmed: true } }; },
-    queryCapability: async id => id === "minecraft.visible_screen" ? null : [], cancelActions: async () => {}, recover: async () => { throw new Error("Fixture has no respawn"); },
+    queryCapability: async id => id === "minecraft.visible_screen" ? null : [], cancelActions: hooks.cancelActions ?? (async () => {}), recover: async () => { throw new Error("Fixture has no respawn"); },
     changed: (outcome, execution) => { if (outcome && execution) planning.predecessorSettled(execution.execution_id); },
     unsafe: () => {}, prepareLookahead: (config) => planning.prepareOptIn(config),
   });
@@ -611,6 +611,231 @@ test("program_submit requires explicit JSON args at the installed Agent boundary
   expect(execution.args).toBeNull();
   await waitClosed(f.store, f.run.run_id, execution.execution_id);
   expect(f.store.skillExecution(f.run.run_id, { execution_id: execution.execution_id })!.result).toMatchObject({ result: null });
+});
+
+test("one submission keeps old control through validation and waits actual retirement before the exact successor", async () => {
+  const entered = Promise.withResolvers<void>(), validating = Promise.withResolvers<void>(), publish = Promise.withResolvers<void>();
+  const retiring = Promise.withResolvers<void>(), retired = Promise.withResolvers<void>(), successorEntered = Promise.withResolvers<void>();
+  let oldSignal: AbortSignal | undefined, nativeRetired = false;
+  const f = fixture(async (_body, args, _handle, _limits, signal) => {
+    if (args === "old") { oldSignal = signal; entered.resolve(); }
+    else { expect(nativeRetired).toBe(true); successorEntered.resolve(); }
+    await aborted(signal);
+    return { status: "completed", summary: "Owned worker drained", result: args };
+  }, { cancelActions: async () => { retiring.resolve(); await retired.promise; nativeRetired = true; } });
+  resources.unshift(async () => { publish.resolve(); retired.resolve(); });
+  await f.write("old controller");
+  const predecessor = data(await f.call("program_run", { operation: "start", name: "old controller", args: "old" }));
+  await entered.promise;
+  const originalRegister = f.manager.register.bind(f.manager);
+  f.manager.register = async (...args) => { validating.resolve(); await publish.promise; return await originalRegister(...args); };
+  const input = { name: "authored successor", source, args: { selected: "original" }, handoff: {
+    name: predecessor.name, version: predecessor.version, execution_ordinal: predecessor.execution_ordinal,
+  }, limits: { duration_ms: 9000, max_actions: 3, max_calls: 4, max_depth: 2 } };
+  const pending = f.call("program_submit", input, "single-handoff");
+  await validating.promise;
+  expect(oldSignal!.aborted).toBe(false);
+  expect(f.dispatches()).toBe(1);
+  publish.resolve();
+  await retiring.promise;
+  expect(oldSignal!.aborted).toBe(true);
+  expect(f.dispatches()).toBe(1);
+  expect(f.store.latestRootExecution(f.run.run_id)!.status).toBe("cancel_requested");
+  retired.resolve();
+  const result = data(await pending);
+  await successorEntered.promise;
+  expect(result).toMatchObject({ source: { status: "persisted", name: input.name, version: 1 },
+    start: { status: "started", execution: { name: input.name, version: 1 } } });
+  const root = f.store.latestRootExecution(f.run.run_id)!;
+  expect(root.args).toEqual(input.args);
+  expect(root.limits).toEqual(input.limits);
+  expect(Date.parse(root.deadline_at) - Date.parse(root.started_at!)).toBeLessThanOrEqual(9000);
+  expect(Date.parse(root.deadline_at)).toBeGreaterThan(Date.parse(root.started_at!));
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(2);
+  await f.write(input.name, source, { based_on: 1 });
+  expect(data(await f.call("program_submit", input, "single-handoff"))).toEqual(result);
+  expect(f.manager.effectScope(root.execution_id)).not.toBeNull();
+  expect(f.dispatches()).toBe(2);
+});
+
+test("handoff rejects a mismatched predecessor or invalid successor without cancelling useful work", async () => {
+  const entered = Promise.withResolvers<void>();
+  let signal: AbortSignal | undefined, cancellations = 0;
+  const f = fixture(async (_body, _args, _handle, _limits, current) => {
+    signal = current; entered.resolve(); await aborted(current);
+    return { status: "completed", summary: "Closed", result: null };
+  }, { cancelActions: async () => { cancellations++; } });
+  await f.write("useful predecessor");
+  const old = data(await f.call("program_run", { operation: "start", name: "useful predecessor", args: null }));
+  await entered.promise;
+  const handoff = { name: old.name, version: old.version, execution_ordinal: old.execution_ordinal };
+  await f.write("valid successor");
+  for (const mismatch of [{ ...handoff, name: "another root" }, { ...handoff, version: 2 }, { ...handoff, execution_ordinal: 2 }]) {
+    expect(data(await f.call("program_run", { operation: "start", name: "valid successor", args: null, handoff: mismatch })).error.code).toBe("precondition_failed");
+  }
+  expect(data(await f.call("program_submit", { name: "invalid successor", source: "const =", args: null, handoff })).error.code).toBe("invalid_program");
+  expect(data(await f.call("program_submit", { name: "invalid limits", source, args: null, limits: { duration_ms: 0 }, handoff })).error.code).toBe("invalid_request");
+  expect(data(await f.call("program_run", { operation: "start", entry: "step", name: "valid successor", args: null, handoff })).error.code).toBe("precondition_failed");
+  const unsupported = data(await f.call("program_submit", { entry: "step", name: "unsupported successor",
+    source: "export function step(frame,state,intent){return {input:null,next_state:state,status:'completed',events:[]};}",
+    args: null, handoff }));
+  expect(unsupported).toMatchObject({ source: { status: "persisted" }, start: { status: "refused", error: { code: "precondition_failed" } } });
+  expect(signal!.aborted).toBe(false);
+  expect(cancellations).toBe(0);
+  expect(f.dispatches()).toBe(1);
+});
+
+for (const boundary of ["task", "generation", "life", "boot", "space", "screen", "stop", "abort", "unknown"] as const) {
+  test(`handoff never starts after ${boundary} changes during held retirement`, async () => {
+    const entered = Promise.withResolvers<void>(), retiring = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const f = fixture(async (_body, _args, _handle, _limits, signal) => {
+      entered.resolve(); await aborted(signal); return { status: "completed", summary: "Drained", result: null };
+    }, { cancelActions: async () => { retiring.resolve(); await release.promise; if (boundary === "unknown") throw new Error("Unacknowledged native retirement"); } });
+    resources.unshift(async () => { release.resolve(); });
+    await f.write("held predecessor");
+    const old = data(await f.call("program_run", { operation: "start", name: "held predecessor", args: null }));
+    await entered.promise;
+    const controller = new AbortController();
+    const tool = f.tools().find(tool => tool.name === "program_submit")!;
+    const input = { name: "blocked successor", source, args: null,
+      handoff: { name: old.name, version: old.version, execution_ordinal: old.execution_ordinal } };
+    const pending = tool.execute(`held-handoff-${boundary}`, input, controller.signal);
+    await retiring.promise;
+    if (boundary === "task") f.run.task = "Different task";
+    if (boundary === "generation") f.fence();
+    if (boundary === "life") f.run.life_id!++;
+    if (boundary === "boot") f.run.native_boot_id = "new-native-boot";
+    if (boundary === "space") f.run.space_epoch!++;
+    if (boundary === "screen") f.toolHost.observe = async () => ({ ...f.observation(),
+      screen: { screen_id: "different-screen", incarnation: 1, revision: 1 } });
+    if (boundary === "stop") await f.call("program_run", { operation: "stop" });
+    if (boundary === "abort") controller.abort();
+    release.resolve();
+    const result = data(await pending);
+    expect(result.source).toMatchObject({ status: "persisted", name: input.name, version: 1 });
+    expect(["refused", "unknown"]).toContain(result.start.status);
+    expect(f.dispatches()).toBe(1);
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+    expect(data(await tool.execute(`held-handoff-${boundary}`, input))).toEqual(result);
+  });
+}
+
+for (const toolName of ["program_submit", "program_run"] as const) {
+  test(`${toolName} interrupted handoff is evidence-only and cannot resume or select a newer candidate`, async () => {
+    const entered = Promise.withResolvers<void>(), retiring = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const f = fixture(async (_body, _args, _handle, _limits, signal) => {
+      entered.resolve(); await aborted(signal); return { status: "completed", summary: "Drained", result: null };
+    }, { cancelActions: async () => { retiring.resolve(); await release.promise; } });
+    resources.unshift(async () => { release.resolve(); });
+    await f.write("original owner");
+    const old = data(await f.call("program_run", { operation: "start", name: "original owner", args: null }));
+    await entered.promise;
+    if (toolName === "program_run") await f.write("pinned candidate");
+    const input = { name: "pinned candidate", args: null, handoff: {
+      name: old.name, version: old.version, execution_ordinal: old.execution_ordinal,
+    }, ...(toolName === "program_submit" ? { source } : { operation: "start" }) };
+    const pending = f.call(toolName, input, `interrupted-${toolName}`);
+    await retiring.promise;
+    const duplicate = data(await f.call(toolName, input, `interrupted-${toolName}`));
+    if (toolName === "program_submit") expect(duplicate.start.status).toBe("unknown");
+    else expect(duplicate.error.code).toBe("precondition_failed");
+    await f.write("pinned candidate", 'return {status:"completed",summary:"New candidate",result:2};', { based_on: 1 });
+    release.resolve();
+    const original = data(await pending);
+    if (toolName === "program_submit") expect(original).toEqual(duplicate);
+    else expect(original.error.code).toBe("stale_context");
+    expect(f.store.namedSkill(f.run.run_id, "pinned candidate")!.version).toBe(2);
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+    expect(f.dispatches()).toBe(1);
+    const replay = data(await f.call(toolName, input, `interrupted-${toolName}`));
+    if (toolName === "program_submit") expect(replay).toEqual(duplicate);
+    else expect(replay.error.code).toBe("precondition_failed");
+  });
+}
+
+for (const toolName of ["program_submit", "program_run"] as const) {
+  test(`${toolName} lost handoff acknowledgement reuses its successor without cancelling or dispatching again`, async () => {
+    const entered = Promise.withResolvers<void>(), successorEntered = Promise.withResolvers<void>();
+    let cancellations = 0;
+    const f = fixture(async (_body, args, _handle, _limits, signal) => {
+      (args === "old" ? entered : successorEntered).resolve();
+      await aborted(signal); return { status: "completed", summary: "Drained", result: args };
+    }, { cancelActions: async () => { cancellations++; } });
+    await f.write("ack predecessor");
+    const old = data(await f.call("program_run", { operation: "start", name: "ack predecessor", args: "old" }));
+    await entered.promise;
+    if (toolName === "program_run") await f.write("ack successor");
+    const input = { name: "ack successor", args: "successor", handoff: {
+      name: old.name, version: old.version, execution_ordinal: old.execution_ordinal,
+    }, ...(toolName === "program_submit" ? { source } : { operation: "start" }) };
+    const id = `lost-handoff-${toolName}`, db = new Database(join(f.directory, "runs.sqlite"));
+    db.exec(`CREATE TRIGGER lose_handoff_ack BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND NEW.object_key='${id}' BEGIN SELECT RAISE(ABORT,'lost acknowledgement'); END;`);
+    expect((await f.call(toolName, input, id)).isError).toBe(true);
+    await successorEntered.promise;
+    const selected = f.store.latestRootExecution(f.run.run_id)!;
+    expect(selected.version).toBe(1);
+    db.exec("DROP TRIGGER lose_handoff_ack;");
+    await f.write("ack successor", source, { based_on: 1 });
+    const replay = data(await f.call(toolName, input, id));
+    expect(toolName === "program_submit" ? replay.start.execution : replay).toMatchObject({
+      name: "ack successor", version: 1,
+    });
+    expect(f.manager.effectScope(selected.execution_id)).not.toBeNull();
+    expect(f.store.latestRootExecution(f.run.run_id)!.execution_id).toBe(selected.execution_id);
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(2);
+    expect(f.dispatches()).toBe(2);
+    expect(cancellations).toBe(1);
+    db.close();
+  });
+}
+
+for (const boundary of ["newer_root", "stop_after_drain"] as const) {
+  test(`handoff cannot replace ${boundary} while its fresh post-retirement observation is pending`, async () => {
+    const entered = Promise.withResolvers<void>(), observing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const f = fixture(async (_body, _args, _handle, _limits, signal) => {
+      entered.resolve(); await aborted(signal); return { status: "completed", summary: "Closed", result: null };
+    });
+    resources.unshift(async () => { release.resolve(); });
+    await f.write("observation predecessor");
+    const old = data(await f.call("program_run", { operation: "start", name: "observation predecessor", args: null }));
+    await entered.promise;
+    let observations = 0;
+    f.toolHost.observe = async () => {
+      if (++observations === 2) { observing.resolve(); await release.promise; }
+      return f.observation();
+    };
+    const input = { name: "observation successor", source, args: null, handoff: {
+      name: old.name, version: old.version, execution_ordinal: old.execution_ordinal,
+    } };
+    const pending = f.call("program_submit", input);
+    await observing.promise;
+    expect(f.manager.pending).toBe(false);
+    if (boundary === "newer_root") {
+      await f.write("independently selected root");
+      await f.call("program_run", { operation: "start", name: "independently selected root", args: null });
+    } else {
+      expect(data(await f.call("program_run", { operation: "stop" })).status).toBe("idle");
+    }
+    const current = f.store.latestRootExecution(f.run.run_id)!;
+    release.resolve();
+    expect(data(await pending)).toMatchObject({ source: { status: "persisted", version: 1 }, start: { status: "refused" } });
+    expect(f.store.latestRootExecution(f.run.run_id)!.execution_id).toBe(current.execution_id);
+    expect(f.dispatches()).toBe(boundary === "newer_root" ? 2 : 1);
+    if (boundary === "newer_root") expect(f.manager.effectScope(current.execution_id)).not.toBeNull();
+  });
+}
+
+test("a predecessor settled before initial handoff selection is refused without implicit retry", async () => {
+  const f = fixture();
+  await f.write("already finished");
+  const old = data(await f.call("program_run", { operation: "start", name: "already finished", args: null }));
+  await waitClosed(f.store, f.run.run_id, f.store.latestRootExecution(f.run.run_id)!.execution_id);
+  expect(data(await f.call("program_submit", { name: "too late successor", source, args: null,
+    handoff: { name: old.name, version: old.version, execution_ordinal: old.execution_ordinal } }))).toMatchObject({
+    source: { status: "persisted", name: "too late successor", version: 1 },
+    start: { status: "refused", error: { code: "precondition_failed" } },
+  });
+  expect(f.dispatches()).toBe(1);
 });
 
 test("program_submit pins source and dependencies even when a newer revision appears between phases", async () => {

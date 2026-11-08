@@ -100,7 +100,9 @@ export interface ControllerInputChannel {
   readonly controllerGeneration: number;
   sample(audioCursor: Json): Promise<Json>;
   submit(frame: Json, input: ControllerInput): InputSubmission;
-  /** null is trusted mechanical renewal; a decision frame must still be genuinely fresh. */
+  /** A fresh decision returns after ordered heartbeat dispatch, not its ACK.
+   * null is trusted mechanical renewal and still awaits the actual response.
+   * All in-flight responses remain owned until retirement joins them. */
   renew(frame: Json | null): Promise<void>;
   revoke(): Promise<RevocationAck>;
   snapshot(): {

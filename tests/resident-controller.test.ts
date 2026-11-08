@@ -1,7 +1,9 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { ResidentController } from "../src/server/resident-controller.ts";
+import { NativeControllerChannel } from "../src/server/controller-channel.ts";
 import type { Json, Sha256 } from "../src/shared/contracts.ts";
 import type { ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck, RevocationAck } from "../src/shared/controller.ts";
+import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
 import { DEFAULT_RESIDENT_LIMITS, ResidentCleanupError, type ControllerStepResult, type ResidentClock, type ResidentControllerOptions, type ResidentLifecycle, type ResidentLimits, type ResidentSnapshot, type ResidentTraceEvent } from "../src/shared/resident.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 
@@ -93,6 +95,83 @@ function harness(limits: Partial<ResidentLimits> = {}, trace?: ResidentControlle
 }
 const analysisSource = { skill_id: "pure-analysis", version: 1, hash, source: "export function analyze(input) { return input; }" };
 async function begin(h: { controller: ResidentController; clock: Clock }) { await h.controller.start(); await h.clock.advance(0); }
+
+test("resident dispatches a fresh decision before a held heartbeat reply and Stop still joins that reply", async () => {
+  const host = vi.spyOn(performance, "now").mockReturnValue(0), h = harness();
+  const heartbeat = deferred<unknown>(), calls: { method: string; at: number }[] = [];
+  const open = h.options.open;
+  let retired = false, stopped = false, sequence = 0;
+  const held = { ...neutral, forward: true };
+  h.step(async () => decision(heldWorld(held), 1));
+  h.options.open = async (deadline, applied, effect, hooks) => {
+    await open(deadline, applied, effect, hooks);
+    return new NativeControllerChannel(h.channel.owner, 1, deadline, {
+      async sample(params) { return minecraftControllerFrameSchema.parse(await h.channel.sample(params as Json)); },
+      clock: () => ({ clock_id: "native-test", host_sent_ms: 0, host_received_ms: 0,
+        native_received_ns: "0", native_replied_ns: "0", native_processing_ms: 0,
+        residual_round_trip_ms: 0, offset_lower_ms: 0, offset_upper_ms: 0, uncertainty_ms: 0 }),
+      assertCurrent() { if (retired) throw new Error("Controller owner has retired."); },
+      retired() { retired = true; },
+      async failed() { throw new Error("Unexpected unconfirmed retirement"); },
+      async request(method, params) {
+        calls.push({ method, at: h.clock.now() });
+        if (method === "controller_heartbeat") return await heartbeat.promise;
+        if (method === "controller_submit") {
+          sequence = (params as { sequence: number }).sequence;
+          return { controller_generation: 1, sequence, ordered_edge_prefix: 1, applied_native_tick: 8,
+            applied_native_ns: "10000000", held, applied_pose: { yaw_radians: 0, pitch_radians: 0 },
+            input_application: "confirmed", reason: null } satisfies InputAppliedAck;
+        }
+        if (method === "controller_revoke") return { ack: {
+          owner: h.channel.owner, controller_generation: 1, admission_revoked: true, last_applied_sequence: sequence,
+          ordered_edge_prefix: 1, retirement_applied_native_tick: 9, retirement_applied_native_ns: "20000000",
+          input_application: "confirmed", unresolved_operation_refs: [],
+        } satisfies RevocationAck, generation: 2 };
+        throw new Error(`Unexpected native request: ${method}`);
+      },
+    }, applied, effect);
+  };
+  h.controller = new ResidentController(h.options);
+  try {
+    await begin(h);
+    expect(calls).toEqual([{ method: "controller_heartbeat", at: 0 }, { method: "controller_submit", at: 0 }]);
+    expect(h.controller.snapshot()).toMatchObject({ status: "running", state: 1,
+      counters: { submissions: 1, applied_sequence: 1 } });
+    expect(calls.find(call => call.method === "controller_submit")!.at).toBeLessThan(150);
+    const stopping = h.controller.stop("owned Stop").then(() => { stopped = true; });
+    await settle();
+    expect(calls.map(call => call.method)).toEqual(["controller_heartbeat", "controller_submit", "controller_revoke"]);
+    expect(stopped).toBe(false);
+    expect(retired).toBe(false);
+    expect(h.controller.snapshot().status).toBe("stopping");
+    heartbeat.resolve({});
+    await stopping;
+    expect(retired).toBe(true);
+    expect(h.controller.snapshot()).toMatchObject({ status: "stopped", cleanup: { worker: "closed", native: "retired" } });
+  } finally {
+    heartbeat.resolve({}); await h.controller.stop("test containment"); host.mockRestore();
+  }
+});
+
+test.each(["Stop", "intent"] as const)("decision renewal completion preserves the %s publication barrier", async change => {
+  const events: string[] = [];
+  let stopping: Promise<void> | undefined, h: ReturnType<typeof harness>;
+  h = harness({}, event => {
+    if (event.stage !== "renewal_end" || event.outcome !== "returned") return;
+    if (change === "Stop") stopping = h.controller.stop("owned Stop at renewal completion");
+    else h.controller.updateIntent({ replacement: true }, 0);
+  }, event => { events.push(event.summary); });
+  h.step(async () => ({ ...decision(world({ selected_hotbar: 1 }), { must_not_publish: true }),
+    events: [{ kind: "attention", urgency: "urgent", summary: "must not publish", details: null }] }));
+  try {
+    await begin(h);
+    expect(h.renewals).toHaveLength(1);
+    expect(h.sent).toEqual([]);
+    expect(events).toEqual([]);
+    expect(h.controller.snapshot()).toMatchObject({ state: 0, counters: { stale_results: 1, submissions: 0, events: 0 } });
+    if (stopping) await stopping;
+  } finally { await h.controller.stop("test containment"); }
+});
 
 test("unconfirmed analysis cleanup fences the resident and cannot release the local drain barrier as known", async () => {
   const h = harness(); h.analysis(async () => { throw new ResidentCleanupError(); }); await begin(h);

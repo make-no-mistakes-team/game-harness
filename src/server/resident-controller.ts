@@ -415,6 +415,8 @@ export class ResidentController {
         return;
       }
       try {
+        // Decision renewal admits ordered dispatch, not native lease confirmation.
+        // Keep the await and following intent barrier before state/events/input.
         await channel.renew(wire);
         if (this.options.trace) this.trace({ stage: "renewal_end", slot, frame_seq: frame.frame_seq, outcome: "returned" });
       } catch (error) {

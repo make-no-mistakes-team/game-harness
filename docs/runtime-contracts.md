@@ -626,8 +626,18 @@ not CPU. Waiting sends no lease heartbeat. A returned running decision must
 still pass the original 150 ms native capture-age check before renewal or
 state publication; an expired lease cannot be revived by a late response.
 
-Fresh valid decisions renew the 250 ms native lease using their actual
-retained capture. A stale decision cannot renew it. At 1 Hz, expiry before
+Fresh decision renewal validates the actual retained capture and dispatches
+its heartbeat before the following input, without waiting for the heartbeat
+response. The shared native receive loop checks that lease before admitting
+the ordered input; native capture-age and application checks remain unchanged.
+Only one heartbeat may be outstanding. New fresh decisions can reuse that
+request while its original host deadline remains future, without extending
+it or queuing a retry. An unanswered request reaching that deadline fences
+and drains the channel. A dispatch return is not a native lease or input ACK.
+Trusted `renew(null)` still waits for the actual response, and retirement
+joins every tracked heartbeat and application response.
+
+A stale decision cannot renew the 250 ms native lease. At 1 Hz, expiry before
 the next step is expected. Empty visible-screen waits and unchanged neutral
 world waits can process feedback without submitting another input; stopping
 a prior view rate still requires a submission. Frames, steps, ordered edges,

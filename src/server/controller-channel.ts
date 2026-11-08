@@ -9,6 +9,7 @@ import { ControllerInputs } from "./controller-inputs.ts";
 import type { NativeClockCorrespondence } from "./performance.ts";
 
 export interface ControllerChannelTransport {
+  /** Dispatches in call order, before returning; native heartbeat and submit share an ordered receiver. */
   request(method: string, params: unknown, timeout: number): Promise<unknown>;
   sample(params: unknown): Promise<MinecraftControllerFrame>;
   clock(): NativeClockCorrespondence | null;
@@ -45,6 +46,7 @@ export class NativeControllerChannel implements ControllerInputChannel {
   private readonly inputs: ControllerInputs;
   private readonly captures = new Map<number, { tick: number; nanos: string }>();
   private readonly inflight = new Set<Promise<unknown>>();
+  private heartbeat: { work: Promise<void>; deadlineHostMs: number } | null = null;
   private retirement: Promise<RevocationAck> | null = null;
   private lastEffectSequence = 0;
   private failureReason: string | null = null;
@@ -173,6 +175,18 @@ export class NativeControllerChannel implements ControllerInputChannel {
       if (age < 0n || age > 150000000n)
         throw new Error(`A stale decision cannot renew the native input lease; ${this.decisionDiagnostic("controller_heartbeat_admission", captured, now, nativeUpper)}`);
     }
+    if (this.heartbeat !== null) {
+      // The transport has one heartbeat slot. An unanswered request can cover a
+      // newer fresh decision only within its original lease, never extend it.
+      if (now >= this.heartbeat.deadlineHostMs) {
+        const reason = `Controller heartbeat response is pending past its original lease deadline; ` +
+          this.decisionDiagnostic("controller_heartbeat_admission", captured, now, nativeUpper);
+        this.failed(reason);
+        throw new Error(reason);
+      }
+      if (captured === null) await this.heartbeat.work;
+      return;
+    }
     const work = this.transport.request("controller_heartbeat", { ...this.identity(),
       deadline_native_ns: controllerNativeDeadline(this.transport.clock(), deadline, now) }, 1000).then(() => {
       this.transport.assertCurrent();
@@ -182,7 +196,15 @@ export class NativeControllerChannel implements ControllerInputChannel {
       this.failed(reason);
       throw new Error(reason);
     });
-    await this.track(work);
+    const pending = { work: this.track(work), deadlineHostMs: deadline };
+    this.heartbeat = pending;
+    const settled = () => { if (this.heartbeat === pending) this.heartbeat = null; };
+    void work.then(settled, settled);
+    // Decision admission is local, not a native heartbeat/application ACK.
+    // request() already ordered this heartbeat ahead of the subsequent submit;
+    // native receive validates its lease before it can admit that input. Keep
+    // the response tracked for failure fencing and the exact retirement join.
+    if (captured === null) await work;
   }
   acceptEffect(owner: ExpectedEffectOwner, value: ControllerEffectUpdate): void {
     if (owner.operation_id !== this.expectedOwner.operation_id || owner.generation !== this.expectedOwner.generation ||

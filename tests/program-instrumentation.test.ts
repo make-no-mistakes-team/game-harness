@@ -71,7 +71,7 @@ for (const [reason, source] of [
   });
 }
 
-test("the disclosed local example retains fresh refusal state and makes only one distinct authored selection", async () => {
+test("the disclosed local example retains confirmed emitted failure and makes only one distinct authored selection", async () => {
   const selections: unknown[] = [];
   let reads = 0;
   const run = await execute(LOCAL_FEEDBACK_EXAMPLE + `
@@ -82,7 +82,9 @@ return await applyAndCheck({kind:"fixture_effect",selection:"old"},
     if (request.kind === "observe") return { data: { done: ++reads === 3, next: reads === 1 ? "old" : "fresh" } };
     selections.push(request.action);
     return selections.length === 1
-      ? { status: "failed", summary: "Settled refusal", evidence: { world_effect_emitted: false, neutralized: true } }
+      ? { status: "failed", summary: "Processed rejection", evidence: {
+        world_effect_emitted: true, neutralized: true, failure_outcome_confirmed: true,
+      } }
       : { status: "succeeded", summary: "Distinct authorized action completed", evidence: { effect_confirmed: true } };
   });
   expect(run.failure).toBe(false);
@@ -125,16 +127,22 @@ return {status:count===3?"completed":"blocked",summary:"Checked actual postcondi
 });
 
 for (const outcome of [
-  { status: "unknown", evidence: { world_effect_emitted: true, neutralized: true } },
-  { status: "cancelled", evidence: { world_effect_emitted: false, neutralized: true } },
-  { status: "failed", requires_reconnect: true, evidence: { world_effect_emitted: false, neutralized: true } },
+  { status: "unknown", evidence: { world_effect_emitted: true, neutralized: true, failure_outcome_confirmed: true } },
+  { status: "cancelled", evidence: { world_effect_emitted: false, neutralized: true, failure_outcome_confirmed: true } },
+  { status: "failed", requires_reconnect: true, evidence: { world_effect_emitted: true, neutralized: true, failure_outcome_confirmed: true } },
   { status: "failed", evidence: { world_effect_emitted: true, neutralized: true } },
+  { status: "failed", evidence: { world_effect_emitted: true, neutralized: true, failure_outcome_confirmed: false } },
+  { status: "failed", evidence: { world_effect_emitted: true, neutralized: true, failure_outcome_confirmed: "true" } },
+  { status: "failed", evidence: { world_effect_emitted: true, neutralized: true, failure_outcome_confirmed: { confirmed: true } } },
+  { status: "failed", evidence: { world_effect_emitted: true, neutralized: true, failure_outcome_confirmed: [true] } },
+  { status: "failed", evidence: { world_effect_emitted: true, failure_outcome_confirmed: true } },
+  { status: "failed", evidence: { world_effect_emitted: true, neutralized: "true", failure_outcome_confirmed: true } },
   { status: "failed", evidence: {} },
 ]) {
   test(`actionAndObserve does not grant continuation for ${JSON.stringify(outcome)}`, async () => {
     let observations = 0;
     const run = await execute(`
-const checked = await game.actionAndObserve({kind:"fixture_effect"});
+const checked = await game.actionAndObserve({kind:"fixture_effect",failure_outcome_confirmed:true});
 return {status:"blocked",summary:"Outcome retained without continuation",result:checked};
 `, async request => {
       if (request.kind === "observe") { observations++; throw new Error("Forbidden observation after non-continuable outcome"); }
@@ -143,6 +151,7 @@ return {status:"blocked",summary:"Outcome retained without continuation",result:
     expect(run.failure).toBe(false);
     expect(run.result).toMatchObject({ status: "blocked", result: { action: outcome, observation: null } });
     expect(observations).toBe(0);
+    expect(run.requests.map(request => request.kind)).toEqual(["action"]);
   });
 }
 

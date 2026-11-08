@@ -37,6 +37,15 @@ test("a real native fixture joins late owned closure but cannot pass a bounded s
   expect(result.report.pass).toBe(false);
 }, 15000);
 
+test("signal cleanup joins runtime retirement before closing its native emitter", async () => {
+  const result = await acceptanceLifecycle("sigint-runtime-retirement");
+  expect(result.runtimeRetirementAt).toBeNumber();
+  expect(result.nativeClosedAt).toBeGreaterThanOrEqual(result.runtimeRetirementAt);
+  expect(result.report.cleanup_confirmed).toBe(true);
+  expect(result.report.resource_cleanup.every((owner: { closed: boolean }) => owner.closed)).toBe(true);
+  expect(result.unhandled).toEqual([]);
+}, 15000);
+
 test("artifact inventory persistence failure cannot bypass actual resource drain", async () => {
   const result = await acceptanceLifecycle("development-retention-drain-failure");
   expect(result.retentionDrainFaults).toBe(1);

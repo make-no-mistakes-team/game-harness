@@ -136,6 +136,7 @@ await writeFile(join(root, "bin/ffmpeg"), `#!${process.execPath}\nimport { write
 
 let providerCalls = 0, starts = 0, nextWorlds = 0, sequence = 0, returned = false, lateWrites = 0;
 let authCreates = 0, nativeClosedAt: number | null = null, returnedAt: number | null = null;
+let runtimeRetirementAt: number | null = null;
 let finalDiagnosticsStartedAt: number | null = null, finalDiagnosticsFinishedAt: number | null = null;
 let finalPersistenceStartedAt: number | null = null, finalPersistenceFinishedAt: number | null = null;
 const readerCloseEntered = Promise.withResolvers<void>(), releaseReaderClose = Promise.withResolvers<void>();
@@ -440,6 +441,17 @@ let rendererStarted = false;
 // Intentional loading boundary: runner imports config-consuming production
 // modules only after the isolated native/auth/Docker seams have been installed.
 const { runAgentAcceptance } = await import("../../scripts/agent-acceptance.ts");
+if (mode === "sigint-runtime-retirement") {
+  const { Runtime } = await import("../../src/server/runtime.ts");
+  const close = Runtime.prototype.close;
+  Runtime.prototype.close = async function () {
+    await close.call(this);
+    // Model the pending native retirement ACK, not a new controller or effect.
+    await Bun.sleep(50);
+    if (nativeClosedAt !== null) throw new Error("Native emitter closed before runtime retirement joined");
+    runtimeRetirementAt = performance.now();
+  };
+}
 if (studyMode) {
   const manifest = executionFixture!.manifest;
   manifest.identities.model = { provider: model.provider, id: model.id, api: model.api, access: "oauth_subscription" };
@@ -529,7 +541,8 @@ const trigger = (async () => {
   while (performance.now() < deadline && !await exists(rendererPidFile)) await Bun.sleep(5);
   rendererStarted = await exists(rendererPidFile);
   if (!rendererStarted) throw new Error("Acceptance never reached the actual replay child seam");
-  if (mode === "sigint" || mode === "sigterm") process.kill(process.pid, mode === "sigint" ? "SIGINT" : "SIGTERM");
+  if (mode === "sigint" || mode === "sigterm" || mode === "sigint-runtime-retirement")
+    process.kill(process.pid, mode === "sigterm" ? "SIGTERM" : "SIGINT");
 })();
 let rendererPid: number | null = null;
 async function observeResult() {
@@ -601,7 +614,7 @@ async function observeResult() {
   // fixture IPC on disk instead of one large stdout pipe write that can block
   // fixture completion after the runner has already returned and drained.
   await writeFile(join(root, "fixture-result.json"), JSON.stringify({ result, rendererStarted, rendererAlive, starts, nextWorlds, providerCalls,
-    authCreates, nativeClosedAt, submittedAt, returnedAt, finalDiagnosticsStartedAt, finalDiagnosticsFinishedAt,
+    authCreates, nativeClosedAt, runtimeRetirementAt, submittedAt, returnedAt, finalDiagnosticsStartedAt, finalDiagnosticsFinishedAt,
     finalPersistenceStartedAt, finalPersistenceFinishedAt, observationReads, paritySnapshots,
     declaredCleanupMs: commonOptions.caps.cleanupMs, workDeadline, signalAt, signalHandoffAt,
     earlyFinalizerSettledAt, earlyFinalizerSettledWhileNativeHeld,

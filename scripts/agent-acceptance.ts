@@ -830,7 +830,12 @@ export async function runAgentAcceptance(options: AgentAcceptanceOptions) {
       // Runtime Stop or native startup. Keep these exact owners for final join.
       const runtimeDrain = runtime?.close();
       void runtimeDrain?.catch(() => {});
-      const nativeDrain = failure ? fixture.close() : undefined;
+      // Runtime still owns the native retirement handshake. Killing its
+      // emitter concurrently destroys that ACK and turns Stop into unknown.
+      // A failed runtime drain still proceeds to physical native containment.
+      const nativeDrain = failure
+        ? (runtimeDrain ?? Promise.resolve()).then(() => fixture.close(), () => fixture.close())
+        : undefined;
       void nativeDrain?.catch(() => {});
       const sandboxDrain = sandbox?.close();
       void sandboxDrain?.catch(() => {});

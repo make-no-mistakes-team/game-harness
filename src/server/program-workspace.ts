@@ -121,9 +121,13 @@ export class ProgramWorkspace {
 
   executionSummary(execution: SkillExecutionView) {
     const program = this.store.skill(this.runId, execution);
+    const resident = execution.entry === "step" &&
+      (execution.status === "failed" || execution.status === "blocked" || execution.status === "unknown") &&
+      execution.resident && ["failed", "blocked", "stopped", "unknown"].includes(execution.resident.status)
+      ? { status: execution.resident.status, reason: execution.resident.reason?.slice(0, 300) ?? null } : null;
     return { name: program.name, version: execution.version, execution_ordinal: this.executionReference(execution.execution_id)?.execution_ordinal ?? null,
       entry: execution.entry, status: execution.status, target: Object.hasOwn(unfinished, execution.status) ? "current" : "latest",
-      actions: execution.actions, calls: execution.calls,
+      actions: execution.actions, calls: execution.calls, resident,
       summary: (execution.result?.summary ?? execution.error)?.slice(0, 1000) ?? null };
   }
 

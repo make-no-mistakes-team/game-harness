@@ -108,7 +108,7 @@ export const prepareNextSchema = z.discriminatedUnion("entry", [
   preparedBaseSchema.extend({ entry: z.literal("step"), args: residentIntentSchema,
     initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema }).strict(),
 ]);
-export const helpSchema = z.object({ topic: z.enum(["overview", "game", "programs", "planning", "reflex", "memory"]).default("overview") }).strict();
+export const helpSchema = z.object({ topic: z.enum(["overview", "controller", "game", "programs", "planning", "reflex", "memory"]).default("overview") }).strict();
 const namedPolicy = { name: z.string().trim().min(1).max(80), version: z.int().positive().optional() };
 export const reflexSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("write"), spec: policySpecSchema }).strict(),

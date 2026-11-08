@@ -3,6 +3,7 @@ import { controllerStepResultSchema, residentActorLimitsSchema, residentLimitsSc
   residentStateSchema, residentIntentSchema } from "../src/shared/resident.ts";
 import { programRunSchema, programSubmitSchema, programWriteSchema } from "../src/server/program-interface.ts";
 import { skillStartRequestSchema } from "../src/shared/validation.ts";
+import { controllerInputFrameSchema, controllerInputSchema } from "../src/shared/controller.ts";
 
 const neutral = { forward: false, back: false, left: false, right: false, jump: false,
   sprint: false, sneak: false, attack: false, use: false };
@@ -40,6 +41,34 @@ test("resident result requires explicit coherent input and JSON state rather tha
   }
   expect(controllerStepResultSchema.safeParse({ ...result(), action: { kind: "look", yaw: 0, pitch: 0 } }).success).toBe(false);
   expect(controllerStepResultSchema.safeParse({ ...result(), input: { ...result().input, target: "hidden-target" } }).success).toBe(false);
+});
+
+test("only actor world results admit omitted edges without weakening complete held or native input", () => {
+  const { edges: _edges, ...input } = result().input;
+  input.held.forward = true;
+  const parsed = controllerStepResultSchema.parse({ ...result(), input });
+  expect<unknown>(parsed.input).toEqual(input);
+  expect(Object.hasOwn(parsed.input, "edges")).toBe(false);
+  expect(controllerInputSchema.safeParse(input).success).toBe(false);
+  expect(controllerInputFrameSchema.shape.input.safeParse(input).success).toBe(false);
+  const { use: _use, ...incompleteHeld } = input.held;
+  for (const invalid of [
+    { ...input, held: incompleteHeld },
+    { ...input, edges: null },
+    { ...input, edges: undefined },
+    { ...input, target: "hidden-target" },
+    { kind: "screen", screen: { screen_id: "inventory", incarnation: 1, layout_revision: 1 } },
+  ]) expect(controllerStepResultSchema.safeParse({ ...result(), input: invalid }).success).toBe(false);
+});
+
+test("actor explicit edges retain native refinements rather than falling back to omission", () => {
+  for (const edges of [
+    [{ kind: "button", button: "forward", phase: "release", count: 2 }],
+    [{ kind: "button", button: "attack", phase: "press", count: 256 }, { kind: "hand_swap" }],
+    [{ kind: "hotbar", slot: 1 }, { kind: "hotbar", slot: 1 }],
+    [{ kind: "hotbar", slot: 1 }],
+    [{ kind: "drop", all: true }, { kind: "drop", all: false }],
+  ]) expect(controllerStepResultSchema.safeParse({ ...result(), input: { ...result().input, selected_hotbar: 2, edges } }).success).toBe(false);
 });
 
 test("resident states use actual JSON bytes and reject a nonserializable or too-deep state", () => {

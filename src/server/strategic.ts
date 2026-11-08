@@ -570,7 +570,10 @@ export class StrategicPlanner {
           this.turnAuthoring = authoring;
         }
         const pendingDecision = this.pendingDecision;
-        this.pendingDecision = false;
+        // A meaningful wake admits a bounded decision turn, not one provider
+        // message. Inspection/help may precede its actual intent or Stop.
+        // The ordinary turn's call/tool/deadline limits still apply; passive
+        // continuation never acquires this authority or a new authoring budget.
         this.turnCalls++;
         run.turns++;
         this.request = {
@@ -1312,9 +1315,9 @@ export class StrategicPlanner {
                 ? "This is the one authorized independent planning flight. Observe, inspect, help, pure program_write and prepare_next only. Prepare immutable inactive source if needed, then select one exact named candidate; optionally author guard_source BODY(observation,args) returning strict boolean. Omission adds no game constraint. No starts, activation, effects or polling. Source preparation and corrections share the original finite deadline and allowance. Main's captured permission and all host invariants govern activation."
               : this.host.programPending()
                 ? this.pendingDecision
-                  ? "Respond to this explicit attention/outcome/recovery signal using ordinary decision authority, including any necessary current-root intent update or stop. This does not renew the root's inactive authoring allowance. Later natural SDK continuation while the root remains pending is restricted to the remaining pure authoring window; no polling or duplicate foreground work."
+                  ? "Resolve this explicit attention/outcome/recovery signal within the ordinary bounded decision turn. Inspect current state or mechanics as needed, then choose the necessary current-root intent update, code change or stop. Decision authority survives those intermediate reads until this turn ends; it does not renew the root deadline or inactive-authoring allowance. Keep useful local control running; no polling or duplicate foreground work."
                   : "The foreground program continues unchanged. Use only observe, help, program_inspect and pure program_write to prepare immutable inactive source within the remaining root-bound authoring allowance. No starts, activation, effects, polling or keepalive; repeated wakes do not renew the window."
-                : "Advance the task using current evidence. Choose useful bounded work, react to trial evidence, or explain a genuine obstacle. No human continuation is needed.",
+                : "Advance the task with an autonomous local taskflow using current evidence. Keep short input intervals, fresh target selection and ordinary recovery inside your code. For ongoing world control use a resident step (help controller); keep useful control running through cloud decisions. Return blocked only when the local algorithm genuinely cannot continue, not merely because an input interval finished. Choose survival and combat responses yourself. No human continuation is needed.",
           }), selected.images,
         );
       }

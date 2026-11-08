@@ -256,6 +256,11 @@ export class StrategicContext {
     // Action alternatives stay whole; oversized ones are explicitly omitted.
     // Stable order keeps the latest requested topic first within each class.
     const priority = (section: HelpSection) => {
+      if (section.topic === "controller") {
+        if (section.section === "resident.result" || section.section.startsWith("resident.result.")) return 1;
+        if (this.helpSchemas.has(section)) return 2;
+        return 0;
+      }
       if (section.topic === "game" && this.actionHelpSection !== null &&
         (section.section === this.actionHelpSection || section.section.startsWith(`${this.actionHelpSection}.`))) return 1;
       if (section.topic === "programs" &&
@@ -571,6 +576,9 @@ export class StrategicContext {
     const submission = submittedOutcome(event);
     if (submission) return { event_seq: seq, type: event.type, summary: event.summary.slice(0, 400), ...submission,
       status: submission.start.status, ...(submission.start.status === "unknown" ? { no_replay: true } : {}) };
+    const execution = event.type === "skill.closed" && typeof details?.execution_id === "string"
+      ? this.store.skillExecution(run.run_id, { execution_id: details.execution_id }) : null;
+    const resident = execution ? new ProgramWorkspace(this.store, run.run_id).executionSummary(execution).resident : null;
     const action = typeof details?.action_id === "string" ? this.store.getAction(run.run_id, details.action_id)?.view
       : event.type === "skill.closed" && typeof details?.execution_id === "string"
         ? this.store.selectedAction(run.run_id, "latest", details.execution_id) : null;
@@ -579,6 +587,7 @@ export class StrategicContext {
     const status = details?.status ?? result?.status ?? (event.type === "skill.unknown" ? "unknown" : undefined);
     return { event_seq: seq, type: event.type, summary: event.summary.slice(0, 400),
       ...(typeof status === "string" ? { status: status.slice(0, 80) } : {}),
+      ...(resident ? { resident } : {}),
       ...(action ? { action_kind: action.kind, action_status: action.status } : {}),
       ...(evidence ? { evidence: evidence.value, ...(evidence.omitted ? { evidence_omitted: true } : {}) } : {}),
       ...(result?.requires_reconnect === true ? { requires_reconnect: true } : {}),
@@ -591,12 +600,13 @@ export class StrategicContext {
     if (!execution || execution.world_id !== run.world_id || execution.compatibility_hash !== run.compatibility_hash) return null;
     const reference = workspace.executionReference(execution.execution_id);
     if (!reference) return null;
+    const { resident } = workspace.executionSummary(execution);
     const args = boundedNote(execution.args, 1024);
     const result = execution.result ? boundedNote(execution.result.result, 1024) : null;
     return { ...reference, historical: true, current_authority: false, gameplay_success_proof: false,
       original_scope: { world_id: execution.world_id, session_id: execution.session_id, life_id: execution.life_id,
         native_boot_id: execution.native_boot_id, space_epoch: execution.space_epoch },
-      status: execution.status, actions: execution.actions, calls: execution.calls,
+      status: execution.status, actions: execution.actions, calls: execution.calls, ...(resident ? { resident } : {}),
       argument_sample: args.value, ...(args.omitted ? { argument_sample_omitted: true } : {}),
       outcome: execution.result ? { status: execution.result.status, summary: execution.result.summary.slice(0, 400),
         result: result!.value, ...(result!.omitted ? { result_omitted: true } : {}) } : null,

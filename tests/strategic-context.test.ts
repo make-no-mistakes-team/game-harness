@@ -12,14 +12,17 @@ import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import type { AuthManager } from "../src/server/auth.ts";
 import { StrategicPlanner } from "../src/server/strategic.ts";
 import { StrategicContext } from "../src/server/strategic-context.ts";
+import { ProgramWorkspace } from "../src/server/program-workspace.ts";
 import { programHelp } from "../src/server/program-help.ts";
 import { Store } from "../src/server/store.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
+import { ResidentController } from "../src/server/resident-controller.ts";
 import { retainResidentReceipt } from "../src/server/resident-evidence.ts";
-import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
-import type { ControllerInput, ControllerEffectUpdate } from "../src/shared/controller.ts";
+import { DEFAULT_RESIDENT_LIMITS, type ControllerStepResult, type ResidentSnapshot } from "../src/shared/resident.ts";
+import type { ControllerInput, ControllerEffectUpdate, ControllerInputChannel } from "../src/shared/controller.ts";
 import { jsonSchema } from "../src/shared/primitives.ts";
 import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, skillAuthorityFixture } from "./helpers/adapter-contract.ts";
+import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 
 const resources: { planner: StrategicPlanner; store: Store; directory: string }[] = [];
 afterEach(async () => {
@@ -146,6 +149,131 @@ function retained(request: Context | undefined): Record<string, any> | undefined
   }
   return undefined;
 }
+
+async function failedResident(f: ReturnType<typeof fixture>, failure: "held_transition" | "frame_scope" = "held_transition") {
+  const decision: ControllerStepResult = { input: { kind: "world", held: {
+    forward: true, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, attack: false, use: false,
+  }, edges: [], view: { kind: "unchanged" }, selected_hotbar: null }, next_state: null, status: "running", events: [] };
+  const skill = await f.store.registerSkill(f.state.run.run_id, { entry: "step", name: "Failing resident",
+    source: `export function step(frame,state,intent) { return ${JSON.stringify(decision)}; }`, dependencies: [],
+    card: { purpose: "Exercise resident failure feedback", applicability: "Fixture", method: "Invalid explicit transition",
+      reason: "Surface the actual terminal diagnostic", limitations: "Not gameplay evidence" },
+    validation: { runtime_version: 5, api_version: 5, validator_version: 5,
+      compatibility_hash: f.state.run.compatibility_hash!, fingerprint: "fixture", formatted_lines: 1, complexity: 1, nesting: 0 } });
+  const execution = f.store.admitSkill(f.state.run.run_id, { entry: "step", skill_id: skill.skill_id, version: skill.version,
+    start_key: "failing-resident", ...executionScopeFixture(f.state.run), args: { target_id: "PRIVATE_RESIDENT_INTENT" },
+    initial_state: { private_state: "PRIVATE_RESIDENT_STATE" }, limits: { ...DEFAULT_RESIDENT_LIMITS } }).view;
+  if (execution.entry !== "step") throw new Error("Fixture did not admit its resident entry");
+  const owner = { operation_id: "PRIVATE_CONTROLLER_OWNER", generation: 1, scope: {
+    run_id: execution.run_id, world_id: execution.world_id!, session_id: execution.session_id!, epoch: execution.epoch,
+    native_boot_id: execution.native_boot_id!, run_generation: execution.run_generation!, life_id: execution.life_id!,
+    space_epoch: execution.space_epoch!, execution_id: execution.execution_id, source_hash: skill.hash,
+  } };
+  let retired = false, timerId = 0;
+  const timers = new Map<number, { callback: () => void; delay: number }>();
+  const done = Promise.withResolvers<ResidentSnapshot>();
+  const channel: ControllerInputChannel = {
+    owner, controllerGeneration: 1,
+    sample: async () => controllerFrameFixture(execution.life_id! + (failure === "frame_scope" ? 1 : 0), execution.space_epoch!) as unknown as Json,
+    submit: () => { throw new Error("Invalid fixture input must not be submitted"); },
+    renew: async () => { throw new Error("Invalid fixture input must not renew authority"); },
+    revoke: async () => {
+      retired = true;
+      return { owner, controller_generation: 1, admission_revoked: true, last_applied_sequence: 0,
+        ordered_edge_prefix: 0, retirement_applied_native_tick: 1, retirement_applied_native_ns: "1",
+        input_application: "confirmed", unresolved_operation_refs: [] };
+    },
+    snapshot: () => ({ fenced: retired, retired, submitted_sequence: 0, applied_sequence: 0,
+      ordered_edge_prefix: 0, pending_frames: 0, pending_edges: 0, last_input: null, reason: null }),
+  };
+  const controller = new ResidentController({
+    execution_id: execution.execution_id, source_hash: skill.hash, controller_generation: 1,
+    limits: execution.limits, deadline_host_ms: 10000, initial_state: execution.initial_state, intent: execution.args,
+    clock: { id: "PRIVATE_RESIDENT_HOST_CLOCK", now: () => 0,
+      setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
+      clearTimeout: handle => { timers.delete(handle as number); } },
+    worker: { step: async () => structuredClone(decision), close: async () => {} },
+    open: async () => channel, current: () => true, event: () => {}, effect: () => {},
+    changed: (snapshot, terminal) => { if (terminal) done.resolve(snapshot); },
+    analysis: async () => { throw new Error("Fixture does not request analysis"); },
+  });
+  await controller.start();
+  const wake = [...timers].find(([, timer]) => timer.delay === 0);
+  if (!wake) throw new Error("Resident did not schedule its first decision");
+  timers.delete(wake[0]); wake[1].callback();
+  execution.resident = await done.promise;
+  execution.status = execution.resident.status === "failed" ? "failed" : "blocked";
+  execution.ended_at = new Date().toISOString();
+  execution.error = "Generated program or trusted capability failed";
+  execution.diagnostic = { type: "PRIVATE_RAW_EXCEPTION", message: "PRIVATE_RAW_EXCEPTION_MESSAGE",
+    source_hash: skill.hash, location: { mapping: "unmapped" } };
+  f.store.updateSkillExecution(execution, "skill.closed", execution.error, { status: execution.status });
+  return { skill, execution };
+}
+
+for (const [failure, status, reason] of [
+  ["held_transition", "failed", "resident_step: Invalid resident held transition"],
+  ["frame_scope", "stopped", "resident_frame_scope_changed"],
+] as const) {
+  test(`next ordinary SDK context exposes ${failure} without inspection or restored resident authority`, async () => {
+    const f = fixture();
+    await f.planner.start(1); await f.turn();
+    const { skill, execution } = await failedResident(f, failure);
+    await f.turn();
+    const request = f.state.requests.at(-1), context = retained(request)!;
+    const diagnostic = { status, reason };
+    expect(context.latest_failure).toMatchObject({ type: "skill.closed", resident: diagnostic });
+    expect(context.programs).toContainEqual(expect.objectContaining({
+      name: skill.name, version: skill.version, source: skill.source,
+      last_execution: expect.objectContaining({ historical: true, current_authority: false,
+        gameplay_success_proof: false, resident: diagnostic }),
+    }));
+    const turnInput = [...request!.messages].reverse().find(message => message.role === "user");
+    if (turnInput?.role !== "user") throw new Error("SDK context lacks its ordinary turn input");
+    const inputText = typeof turnInput.content === "string" ? turnInput.content
+      : turnInput.content.filter(part => part.type === "text").map(part => part.text).join("");
+    expect(JSON.parse(inputText).executions).toContainEqual(expect.objectContaining({
+      name: skill.name, resident: diagnostic,
+    }));
+    const serialized = JSON.stringify(request);
+    for (const marker of ["PRIVATE_RESIDENT_INTENT", "PRIVATE_RESIDENT_STATE", "PRIVATE_RESIDENT_HOST_CLOCK",
+      "PRIVATE_CONTROLLER_OWNER", "PRIVATE_RAW_EXCEPTION", execution.execution_id])
+      expect(serialized).not.toContain(marker);
+    expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32768);
+    expect(f.state.toolEffects).toBe(0);
+    expect(f.state.helpEffects).toBe(0);
+
+    await f.planner.close();
+    f.state.run.task = "Replacement task must not restore prior source";
+    f.store.saveRun(f.state.run); f.state.generation++;
+    await f.planner.start(f.state.generation); await f.turn();
+    const replaced = retained(f.state.requests.at(-1))!;
+    expect(replaced.programs).toEqual([]);
+    expect(replaced.latest_failure).toBeNull();
+    expect(JSON.stringify(replaced)).not.toContain(reason);
+    expect(f.store.skillExecution(f.state.run.run_id, { execution_id: execution.execution_id })?.status).toBe(execution.status);
+    expect(f.state.toolEffects).toBe(0);
+  });
+}
+
+test("compact resident diagnostics are bounded and omitted for successful or non-failure residents", async () => {
+  const f = fixture(), { execution } = await failedResident(f);
+  const workspace = new ProgramWorkspace(f.store, f.state.run.run_id);
+  const resident = { ...execution.resident!, reason: "界".repeat(1000) };
+  const summary = workspace.executionSummary({ ...execution, resident });
+  expect(summary.resident).toEqual({ status: "failed", reason: "界".repeat(300) });
+  expect(Object.keys(summary.resident!)).toEqual(["status", "reason"]);
+  expect(workspace.executionView({ ...execution, resident })?.resident).toEqual(resident);
+  for (const status of ["accepted", "running", "cancel_requested", "succeeded", "cancelled"] as const)
+    expect(workspace.executionSummary({ ...execution, status, resident }).resident).toBeNull();
+  for (const status of ["starting", "running", "yielded", "completed", "stopping"] as const)
+    expect(workspace.executionSummary({ ...execution, resident: { ...resident, status } }).resident).toBeNull();
+  for (const status of ["failed", "blocked", "unknown"] as const)
+    expect(workspace.executionSummary({ ...execution, status, resident: { ...resident, reason: null } }).resident)
+      .toEqual({ status: "failed", reason: null });
+  expect(workspace.executionSummary({ ...execution, resident: null }).resident).toBeNull();
+  expect(workspace.executionSummary({ ...f.execution(await f.program()), status: "failed" }).resident).toBeNull();
+});
 
 async function residentUncertainty(f: ReturnType<typeof fixture>, sequence = 7, summaryPadding = "") {
   const skill = await f.store.registerSkill(f.state.run.run_id, { entry: "step", name: `Resident ${sequence}`,

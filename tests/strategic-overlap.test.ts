@@ -246,23 +246,23 @@ for (const sample of [
   });
 }
 
-test("pending-root uncertainty shares bounded authoring while raw context stays out of compact feedback", async () => {
+test("pending-root uncertainty keeps a bounded decision turn while raw context stays out of compact feedback", async () => {
   const f = await setup(async (context, agent) => {
     expect(context.reason).toEqual(["uncertainty"]);
     expect(context.feedback).toEqual(expect.arrayContaining([expect.objectContaining({ type: "runtime.uncertainty_reconciled", details: expect.objectContaining({ neutralized: true, workers_closed: true, no_replay: true }) })]));
     expect(JSON.stringify(context.feedback)).not.toContain("private-context-marker");
     expect(await agent.call()).toBe(true);
     expect(await agent.tool("program_run")).toBe(true);
-    for (let index = 0; index < 3; index++) {
+    for (let index = 1; index < 12; index++) {
       expect(await agent.call()).toBe(true);
-      expect(await agent.tool("program_run")).toBe(false);
+      expect(await agent.tool("program_run")).toBe(true);
     }
     expect(await agent.call()).toBe(false);
   });
   f.store.event(f.run.run_id, "runtime.uncertainty", "Unconfirmed effect fenced", { action_id: "unknown", execution_id: "root", session_id: "session", life_id: 1, status: "unknown", no_replay: true, raw_context: { observation: "private-context-marker" } });
   f.store.event(f.run.run_id, "runtime.uncertainty_reconciled", "Fresh same-life authority", { action_id: "unknown", session_id: "session", life_id: 1, observation_seq: 1, neutralized: true, workers_closed: true, no_replay: true });
   await f.planner.start(1); const done = f.event("scheduler.turn_finished"); f.planner.wake("uncertainty"); await done;
-  expect(f.run.usage.calls).toBe(4); expect(f.state.pending).toBe(true); expect(f.state.pauses).toEqual([]);
+  expect(f.run.usage.calls).toBe(12); expect(f.state.pending).toBe(true); expect(f.state.pauses).toEqual([]);
 });
 
 test("an ordinary replan cancels optional overlap without consuming the new wake", async () => {
@@ -271,7 +271,7 @@ test("an ordinary replan cancels optional overlap without consuming the new wake
     expect(await agent.call()).toBe(true);
     if (context.speculative_plan) { entered.resolve(); await agent.wait(release.promise); }
     else {
-      for (let index = 0; index < 3; index++) expect(await agent.call()).toBe(true);
+      for (let index = 1; index < 12; index++) expect(await agent.call()).toBe(true);
       expect(await agent.call()).toBe(false);
     }
   });
@@ -281,7 +281,7 @@ test("an ordinary replan cancels optional overlap without consuming the new wake
   release.resolve(); await done;
   expect(f.state.contexts).toHaveLength(2); expect(f.state.contexts[1]?.speculative_plan).toBeNull();
   expect(f.state.contexts[1]?.feedback).toEqual(expect.arrayContaining([expect.objectContaining({ event_seq: receipt.event_seq })]));
-  expect(f.run.usage.calls).toBe(5); expect(f.state.pauses).toEqual([]);
+  expect(f.run.usage.calls).toBe(13); expect(f.state.pauses).toEqual([]);
 });
 
 test("post-goal review remains finite and effect-free while permitting source and assessment artifacts", async () => {
@@ -407,6 +407,7 @@ test("exhausted ordinary authoring does not borrow or suppress the separate expl
 
 test("explicit resident and selected attention retain ordinary intent/stop authority after inactive authoring is exhausted", async () => {
   const contexts: Record<string, unknown>[] = [];
+  let continued = false, canControl = false;
   const f = await setup(async (context, agent) => {
     contexts.push(context);
     if (contexts.length === 1) {
@@ -420,7 +421,10 @@ test("explicit resident and selected attention retain ordinary intent/stop autho
       expect(await agent.tool("program_run")).toBe(true);
       const authority = f.planner.speculativeToolAuthority();
       authority();
-      expect(await agent.call()).toBe(false);
+      // Reading current state must not consume the whole decision. The model
+      // still needs to interpret that result and select an intent or Stop.
+      continued = await agent.call();
+      canControl = await agent.tool("program_run");
     }
   });
   await f.planner.start(1);
@@ -431,11 +435,47 @@ test("explicit resident and selected attention retain ordinary intent/stop autho
   finished = f.event("scheduler.turn_finished");
   f.planner.wake("resident_attention"); f.planner.wake("selected_attention"); await finished;
   expect(contexts).toHaveLength(2);
+  expect(continued).toBe(true);
+  expect(canControl).toBe(true);
   expect(contexts[1]?.reason).toEqual(["resident_attention", "selected_attention"]);
   expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "scheduler.authoring_entered")).toHaveLength(1);
   expect(f.store.eventsAfter(f.run.run_id, 0, 500).find(event => event.type === "scheduler.authoring_exited")?.details)
     .toMatchObject({ calls: 3, reason: "calls" });
   expect(f.store.skillExecution(f.run.run_id, { execution_id: f.root.execution_id })?.status).toBe("running");
+  expect(f.state.pauses).toEqual([]);
+});
+
+test("real SDK attention can inspect, load mechanics and observe before stopping the current root", async () => {
+  let requests = 0, stopped = false;
+  const f = await setup(async () => { throw new Error("Installed SDK owns the decision loop"); }, async (model) => {
+    const index = requests++;
+    const operation = index === 0 ? "inspect" : "stop";
+    const name = index === 1 ? "help" : index === 2 ? "observe" : "program_run";
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: index < 4 ? "toolUse" : "stop",
+      content: index < 4 ? [{ type: "toolCall", id: `attention-${index}`, name,
+        arguments: name === "program_run" ? { operation, target: "current" } : name === "help" ? { topic: "controller" } : {} }] : [],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message }); stream.end();
+    return stream;
+  });
+  const control = f.tools.find(tool => tool.name === "program_run")!;
+  control.execute = async (_id, input) => {
+    if (input !== null && typeof input === "object" && "operation" in input && input.operation === "stop") {
+      stopped = true; f.root.status = "cancelled"; f.root.ended_at = new Date().toISOString(); f.state.pending = false;
+      f.store.updateSkillExecution(f.root, "skill.closed", "Selected decision stopped the current root");
+    }
+    return { content: [{ type: "text", text: JSON.stringify({ status: stopped ? "cancelled" : "running" }) }], details: null };
+  };
+  await f.planner.start(1);
+  const finished = f.event("scheduler.turn_finished");
+  f.planner.wake("selected_attention"); await finished;
+  expect(stopped).toBe(true);
+  expect(f.state.pending).toBe(false);
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: f.root.execution_id })?.status).toBe("cancelled");
+  expect(f.run.usage.by_purpose.authoring.calls).toBe(0);
   expect(f.state.pauses).toEqual([]);
 });
 
@@ -1059,15 +1099,11 @@ test("the real SDK continues after submit through evidence and inactive validate
   } finally { continueBody.resolve(); finishBody.resolve(); }
 });
 
-test("real SDK retains help ordinary-authoring-ordinary and publishes inactive source after root settlement without activation", async () => {
+test("real SDK publishes inactive source after root settlement without acquiring activation authority", async () => {
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   let requests = 0, writes = 0;
   const f = await setup(async () => { throw new Error("Installed SDK owns this tool loop"); }, async (model, context) => {
     const index = requests++;
-    if (index > 0) {
-      const retained = JSON.parse(context.systemPrompt!.at(-1)!).strategic_context;
-      expect(JSON.stringify(retained.requested_help)).toContain("Compatible read-only game mechanics");
-    }
     if (index === 3) {
       const user = context.messages.find(message => message.role === "user")!;
       if (user.role !== "user") throw new Error("Missing ordinary outcome projection");
@@ -1108,7 +1144,7 @@ test("real SDK retains help ordinary-authoring-ordinary and publishes inactive s
     permit(); writes++;
     return { content: [], details: { name: candidate.name, version: candidate.version } };
   };
-  await f.planner.start(1); f.planner.wake("policy_replan"); await entered.promise;
+  await f.planner.start(1); f.planner.wake("planning_continuation"); await entered.promise;
   finishHistoryExecution(f.store, f.root); f.state.pending = false;
   const finished = new Promise<void>(resolve => {
     let turns = 0;

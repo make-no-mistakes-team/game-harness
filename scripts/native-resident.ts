@@ -14,7 +14,7 @@ import type { GameAction, Json } from "../src/shared/contracts.ts";
 import { jsonSchema } from "../src/shared/primitives.ts";
 import type { MinecraftControllerFrame } from "../src/shared/minecraft.ts";
 import type { ControllerInput } from "../src/shared/controller.ts";
-import { revocationAckSchema, type RevocationAck } from "../src/shared/controller.ts";
+import { controllerInputSchema, revocationAckSchema, type RevocationAck } from "../src/shared/controller.ts";
 import { effectScopeSchema, expectedEffectOwnerSchema, sameEffectScope, type ExpectedEffectOwner } from "../src/shared/control.ts";
 import { ResidentSdkCaller, residentBowSource, residentGuiSource, residentThrowSource, residentStopSource,
   residentColdFailureSource, residentInactiveSource } from "./native-resident-agent.ts";
@@ -347,7 +347,7 @@ export async function runNativeResidentFixture(project: string, caps: Evaluation
           trace.steps.push(sample);
           try {
             const result = await worker.step(frame, state, intent, stepSignal);
-            sample.returned_host_ms = performance.now(); sample.input = result.input; sample.status = result.status;
+            sample.returned_host_ms = performance.now(); sample.input = controllerInputSchema.parse(result.input); sample.status = result.status;
             return result;
           } catch (error) { sample.failure = String(error); sample.returned_host_ms = performance.now(); throw error; }
         },

@@ -100,6 +100,19 @@ test("ordinary step module compiles once and reuses module state with explicit s
   expect(await worker.read()).toMatchObject({ value: { next_state: { count: 5, local: 2, intent: "second" } } });
 });
 
+test("ordinary step worker preserves omitted edges for host normalization without injecting controls", async () => {
+  const { edges: _edges, ...base } = neutralInput;
+  const input = { ...base, held: { ...base.held, forward: true } };
+  const worker = await compile(`export function step(frame,state,intent) {
+    return { input: ${JSON.stringify(input)}, next_state: null, status: "running", events: [] };
+  }`, "step");
+  worker.send({ v: 1, type: "resident_step", id: 1, frame: {}, state: null, intent: null });
+  const reply = await worker.read() as { value: unknown };
+  const result = controllerStepResultSchema.parse(reply.value);
+  expect<unknown>(result.input).toEqual(input);
+  expect(Object.hasOwn(result.input, "edges")).toBe(false);
+});
+
 test("selected step infinite computation is still killed by its isolated 25ms watchdog", async () => {
   const worker = await compile("export function step(frame,state,intent) { for (;;) {} }", "step", 25);
   worker.send({ v: 1, type: "resident_step", id: 1, frame: {}, state: null, intent: null });

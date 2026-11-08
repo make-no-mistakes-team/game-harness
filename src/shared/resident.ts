@@ -87,8 +87,17 @@ export const controllerEventSchema = z.object({ kind: z.enum(["diagnostic", "att
   urgency: z.enum(["ordinary", "urgent"]), summary: z.string().min(1).max(1000), details: jsonSchema }).strict();
 export type ControllerEvent = z.infer<typeof controllerEventSchema>;
 export type ControllerStatus = "running" | "blocked" | "yielded" | "completed";
+// Omission belongs only to the actor result, never to the native channel.
+// Explicit edges must still pass every native refinement without modification.
+const actorControllerInputSchema = z.union([
+  controllerInputSchema,
+  controllerInputSchema.options[0].omit({ edges: true })
+    .extend({ held: controllerInputSchema.options[0].shape.held
+      .describe("Complete desired held state. With edges omitted, changed booleans become single press/release transitions; unchanged attack/use never add counted presses.") })
+    .describe("With edges omitted, derive one press/release per changed held boolean from the last successfully submitted held state, initially neutral. Unchanged held controls add no presses."),
+]);
 export const controllerStepResultSchema = jsonBoundary(RESIDENT_OUTPUT_BYTES).pipe(z.object({
-  input: controllerInputSchema, next_state: residentStateSchema,
+  input: actorControllerInputSchema, next_state: residentStateSchema,
   status: z.enum(["running", "blocked", "yielded", "completed"]), events: z.array(controllerEventSchema).max(16),
 }).strict());
 export type ControllerStepResult = z.infer<typeof controllerStepResultSchema>;

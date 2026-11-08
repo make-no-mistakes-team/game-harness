@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Json } from "../shared/contracts.ts";
-import { sameEffectScope, type WorldHeld } from "../shared/control.ts";
-import { controllerEffectUpdateSchema, inputAppliedAckSchema, revocationAckSchema,
+import { sameEffectScope, type WorldHeld, type WorldInputEdge } from "../shared/control.ts";
+import { controllerEffectUpdateSchema, controllerInputSchema, inputAppliedAckSchema, revocationAckSchema,
   type ControllerEffectUpdate, type ControllerInput, type ControllerInputChannel, type InputAppliedAck } from "../shared/controller.ts";
 import { minecraftControllerFrameSchema } from "../shared/minecraft.ts";
 import { controllerStepResultSchema, ResidentCleanupError, RESIDENT_STEP_RESPONSE_MS, residentAnalysisInputSchema, residentAnalysisOutputSchema, residentIntentSchema, residentLimitsSchema, residentSourceIdentitySchema, residentStateSchema,
@@ -377,10 +377,17 @@ export class ResidentController {
       this.data.counters.stale_results++; if (!this.fenced && !this.options.current()) this.finish("stopped", "resident_source_changed"); return;
     }
     let result: ReturnType<typeof controllerStepResultSchema.parse>;
+    let input: ControllerInput;
     let expanded: number;
     try {
       result = controllerStepResultSchema.parse(raw);
-      const input = result.input;
+      const authored = result.input;
+      if (authored.kind === "world" && !("edges" in authored)) {
+        const edges: WorldInputEdge[] = [];
+        for (const button of heldKeys) if (authored.held[button] !== this.submittedHeld[button])
+          edges.push({ kind: "button", button, phase: authored.held[button] ? "press" : "release", count: 1 });
+        input = controllerInputSchema.parse({ ...authored, edges });
+      } else input = controllerInputSchema.parse(authored);
       expanded = input.kind === "screen" ? input.operations.length : input.edges.reduce((sum, edge) => sum + (edge.kind === "button" ? edge.count : 1), 0);
       while (this.edges.length && this.edges[0]!.at <= this.clock.now() - 1000) this.edges.shift();
       if (expanded > limits.max_edges - this.data.counters.expanded_edges || expanded + this.edges.reduce((sum, entry) => sum + entry.count, 0) > limits.max_edges_per_second ||
@@ -400,7 +407,6 @@ export class ResidentController {
       if (!this.fenced && !this.options.current()) this.finish("stopped", "resident_source_changed");
       return;
     }
-    const input = result.input;
     if (result.status === "running") {
       if (this.options.trace) this.trace({ stage: "renewal_start", slot, frame_seq: frame.frame_seq });
       if (!this.active() || version !== this.data.intent_version || timedOut) {

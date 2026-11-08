@@ -9,7 +9,9 @@ const hash = "a".repeat(64) as Sha256;
 const neutral = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, attack: false, use: false };
 const world = (overrides: Partial<Extract<ControllerInput, { kind: "world" }>> = {}): ControllerInput =>
   ({ kind: "world", held: { ...neutral }, edges: [], view: { kind: "unchanged" }, selected_hotbar: null, ...overrides });
-const decision = (input = world(), next_state: Json = null): ControllerStepResult => ({ input, next_state, status: "running", events: [] });
+const heldWorld = (held: typeof neutral): ControllerStepResult["input"] =>
+  ({ kind: "world", held, view: { kind: "unchanged" }, selected_hotbar: null });
+const decision = (input: ControllerStepResult["input"] = world(), next_state: Json = null): ControllerStepResult => ({ input, next_state, status: "running", events: [] });
 const deferred = <T>() => Promise.withResolvers<T>();
 async function settle() { for (let i = 0; i < 60; i++) await Promise.resolve(); }
 class Clock implements ResidentClock {
@@ -521,6 +523,95 @@ test("neutral world waits count observations but not submissions or applied inpu
   expect(snapshot.counters.submissions).toBe(0); expect(snapshot.counters.applied_sequence).toBe(0); expect(snapshot.last_input).toBeNull(); await h.controller.stop("test");
 });
 
+test("omitted edges derive one ordered press and release for every changed held boolean", async () => {
+  const h = harness();
+  const buttons = ["forward", "back", "left", "right", "jump", "sprint", "sneak", "attack", "use"] as const;
+  const held = { forward: true, back: true, left: true, right: true, jump: true, sprint: true, sneak: true, attack: true, use: true };
+  let calls = 0;
+  h.step(async () => decision(heldWorld(calls++ === 0 ? held : { ...neutral })));
+  await begin(h); await h.clock.advance(50);
+  expect(h.sent.map(entry => entry.input)).toEqual([
+    world({ held, edges: buttons.map(button => ({ kind: "button", button, phase: "press", count: 1 })) }),
+    world({ edges: buttons.map(button => ({ kind: "button", button, phase: "release", count: 1 })) }),
+  ]);
+  expect(h.controller.snapshot().counters.expanded_edges).toBe(18);
+  await h.controller.stop("test");
+});
+
+test("unchanged omitted held input never repeats attack or use presses while native ACKs lag", async () => {
+  const h = harness(), held = { ...neutral, forward: true, attack: true, use: true };
+  h.step(async () => decision(heldWorld(held)));
+  await begin(h);
+  // This older acknowledgment still reports neutral held controls.
+  h.ack(1, "1000000");
+  await h.clock.advance(100);
+  expect(h.sent.map(entry => entry.input)).toEqual([
+    world({ held, edges: [
+      { kind: "button", button: "forward", phase: "press", count: 1 },
+      { kind: "button", button: "attack", phase: "press", count: 1 },
+      { kind: "button", button: "use", phase: "press", count: 1 },
+    ] }),
+    world({ held }),
+    world({ held }),
+  ]);
+  expect(h.controller.snapshot().counters).toMatchObject({ expanded_edges: 3, submissions: 3, applied_sequence: 1 });
+  await h.controller.stop("test");
+});
+
+test("explicit counted presses remain exact and share the submitted baseline with omitted releases", async () => {
+  const h = harness(), held = { ...neutral, attack: true };
+  const inputs: ControllerStepResult["input"][] = [
+    world({ held, edges: [{ kind: "button", button: "attack", phase: "press", count: 3 }] }),
+    world({ held, edges: [{ kind: "button", button: "attack", phase: "press", count: 2 }] }),
+    heldWorld({ ...neutral }),
+  ];
+  let calls = 0;
+  h.step(async () => decision(inputs[calls++]!));
+  await begin(h); await h.clock.advance(100);
+  expect<unknown>(h.sent.map(entry => entry.input)).toEqual([
+    inputs[0], inputs[1], world({ edges: [{ kind: "button", button: "attack", phase: "release", count: 1 }] }),
+  ]);
+  expect(h.controller.snapshot().counters.expanded_edges).toBe(6);
+  await h.controller.stop("test");
+});
+
+for (const missing of ["press", "release"] as const) {
+  test(`explicit empty edges never repair a missing ${missing} transition`, async () => {
+    const h = harness(), held = { ...neutral, forward: true };
+    let calls = 0;
+    h.step(async () => decision(missing === "press" ? world({ held }) :
+      calls++ === 0 ? heldWorld(held) : world(), 99));
+    await begin(h);
+    if (missing === "release") await h.clock.advance(50);
+    expect(h.controller.snapshot()).toMatchObject({ status: "failed", reason: "resident_step: Invalid resident held transition",
+      counters: { submissions: missing === "press" ? 0 : 1, expanded_edges: missing === "press" ? 0 : 1 } });
+    expect(h.sent.length).toBe(missing === "press" ? 0 : 1);
+    await h.controller.stop("test");
+  });
+}
+
+test("an old-intent omitted release discarded during renewal cannot change the submitted held baseline", async () => {
+  const h = harness(), renewal = deferred<void>(), held = { ...neutral, forward: true };
+  h.step(async () => decision(heldWorld(held), 1));
+  await begin(h);
+  const renew = h.channel.renew;
+  h.channel.renew = async frame => { await renewal.promise; await renew(frame); };
+  h.step(async () => decision(heldWorld({ ...neutral }), 99));
+  await h.clock.advance(50);
+  h.controller.updateIntent({ replacement: true }, 0);
+  renewal.resolve(); await settle();
+  expect(h.controller.snapshot()).toMatchObject({ state: 1, counters: { stale_results: 1, expanded_edges: 1, submissions: 1 } });
+  h.channel.renew = renew;
+  h.step(async () => decision(heldWorld({ ...neutral }), 2));
+  await h.clock.advance(50);
+  expect(h.sent.map(entry => entry.input)).toEqual([
+    world({ held, edges: [{ kind: "button", button: "forward", phase: "press", count: 1 }] }),
+    world({ edges: [{ kind: "button", button: "forward", phase: "release", count: 1 }] }),
+  ]);
+  expect(h.controller.snapshot()).toMatchObject({ state: 2, counters: { expanded_edges: 2, submissions: 2 } });
+  await h.controller.stop("test");
+});
+
 test("empty GUI waits do not queue packets behind an unfinished gesture", async () => {
   const h = harness(); let calls = 0; const screen = { screen_id: "inventory", incarnation: 1, layout_revision: 1 };
   h.step(async () => decision({ kind: "screen", screen, operations: calls++ === 0 ? [{ kind: "close" }] : [] }));
@@ -630,7 +721,7 @@ for (const ordering of ["result-fence-stop", "fence-result-stop", "stop-result-f
     const admitted = ordering === "result-fence-stop" ? 1 : 0;
     expect(h.controller.snapshot().state).toEqual(admitted ? { accepted: true } : 0);
     expect(h.controller.snapshot().counters).toMatchObject({ submissions: admitted, expanded_edges: admitted, events: admitted });
-    expect(h.sent.map(entry => entry.input)).toEqual(admitted ? [output.input] : []);
+    expect<unknown>(h.sent.map(entry => entry.input)).toEqual(admitted ? [output.input] : []);
     expect(h.renewals.length).toBe(admitted);
     expect(stopped).toBe(false);
     // Neither barrier alone is sufficient, including native-before-worker.
@@ -672,6 +763,23 @@ test("event and edge budgets reject whole over-budget decisions before effects",
   const e = harness({ max_events: 0 }); e.step(async () => ({ ...decision(world(), 55), events: [{ kind: "diagnostic", urgency: "ordinary", summary: "event", details: null }] }));
   await begin(e); expect(e.controller.snapshot().state).toBe(0); expect(e.controller.snapshot().counters.events).toBe(0);
 });
+
+for (const limits of [{ max_edges: 1 }, { max_edges_per_second: 1 }]) {
+  test(`derived held transitions consume the finite ${Object.keys(limits)[0]} budget`, async () => {
+    const h = harness(limits);
+    let calls = 0;
+    h.step(async () => decision(heldWorld(calls++ === 0 ? { ...neutral, forward: true } : { ...neutral }), calls));
+    await begin(h); await h.clock.advance(50);
+    expect(h.controller.snapshot()).toMatchObject({ status: "failed",
+      reason: "resident_step: Resident cumulative edge/event budget exceeded", state: 1,
+      counters: { expanded_edges: 1, submissions: 1 } });
+    expect(h.sent.map(entry => entry.input)).toEqual([
+      world({ held: { ...neutral, forward: true }, edges: [{ kind: "button", button: "forward", phase: "press", count: 1 }] }),
+    ]);
+    expect(h.renewals.length).toBe(1);
+    await h.controller.stop("test");
+  });
+}
 
 test("analysis runs alongside stepping and stale intent results retain provenance", async () => {
   const h = harness(), job = deferred<Json>(); h.analysis(async (_s, _i, _b, _signal, report) => { const output = await job.promise; report(100); return output; }); await begin(h);

@@ -140,7 +140,7 @@ function fixture(judge?: JevBroker) {
       if (expected !== generation || (epoch !== undefined && epoch !== run.epoch)) throw new RuntimeFault("stale_context", "Fixture generation revoked");
       return run;
     },
-    context: async () => ({ observation: structuredClone(observation), action: actions.view, task: run.task }),
+    context: async () => ({ observation: structuredClone(observation), action: actions.view, program: null, task: run.task }),
     gameState: () => state, needsReconnect: () => reconnect, wake: () => {}, changed: () => {}, admitted: () => {},
     closePrograms: async () => { await closePrograms(); }, neutralize: () => game.emergencyStop("Validated reactive fixture barrier"),
   }, judge);

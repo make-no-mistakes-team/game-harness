@@ -1259,9 +1259,7 @@ test("actual catalogs and dispatch share ordinary, speculative, advanced-module 
   expect(ordinary.some((tool) => tool.name === "program_run")).toBe(true);
   expect(ordinary.some((tool) => tool.name === "program_submit")).toBe(true);
   expect(ordinary.some((tool) => tool.name === "task_finish")).toBe(true);
-  expect(ordinary.some((tool) => tool.name === "prepare_next" || tool.name === "reflex" || tool.name === "memory")).toBe(false);
-  await f.call("help", { topic: "reflex" });
-  expect(f.tools().some((tool) => tool.name === "reflex")).toBe(true);
+  expect(ordinary.some((tool) => tool.name === "prepare_next" || tool.name === "memory")).toBe(false);
   await f.write("predecessor"); await f.write("candidate");
   await f.call("program_run", { operation: "start", name: "predecessor", args: null, next: { after_ms: 0, reason: "Bounded neutral flight", budget: { calls: 1, tools: 8, duration_ms: 30000 } } });
   const plan = f.planning.begin()!;
@@ -1370,22 +1368,25 @@ test("installed Agent cannot use captured playing tools during authoring and sav
   await waitClosed(f.store, f.run.run_id, root.execution_id);
 });
 
-test("authoring help cannot disclose or acquire optional playing modules", async () => {
+test("reading reaction contracts during authoring grants no playing authority", async () => {
   const f = fixture();
+  const ordinary = f.tools();
   f.toolHost.toolRole = () => "authoring";
   const replies = await agentCalls(f.tools(), [
     { type: "toolCall", id: "authoring-reflex-help", name: "help", arguments: { topic: "reflex" } },
     { type: "toolCall", id: "authoring-memory-help", name: "help", arguments: { topic: "memory" } },
     { type: "toolCall", id: "authoring-program-help", name: "help", arguments: { topic: "programs" } },
   ]);
-  for (const reply of replies.slice(0, 2)) {
-    expect(reply.isError).toBe(true);
-    expect(data(reply).error.code).toBe("forbidden");
-    expect(data(reply).schema).toBeUndefined();
-  }
+  expect(replies[0]!.isError).not.toBe(true);
+  expect(data(replies[1]!).error.code).toBe("forbidden");
   expect(replies[2]!.isError).not.toBe(true);
+  const activation = await agentCalls(ordinary, [
+    { type: "toolCall", id: "authoring-reflex-activation", name: "reflex", arguments: { operation: "activate", name: "unwritten" } },
+  ]);
+  expect(data(activation[0]!).error.code).toBe("forbidden");
   delete f.toolHost.toolRole;
-  expect(f.tools().some(tool => tool.name === "reflex" || tool.name === "memory")).toBe(false);
+  expect(f.tools().some(tool => tool.name === "memory")).toBe(false);
+  expect(f.store.policies(f.run.run_id)).toEqual([]);
   expect(f.store.skills(f.run.run_id)).toEqual([]);
   expect(f.store.allSkillExecutions(f.run.run_id)).toEqual([]);
 });

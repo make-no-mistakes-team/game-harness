@@ -319,6 +319,9 @@ export type PolicyDecision =
 export interface PolicyContext {
   observation: ObservationV3;
   action: ActionView | null;
+  /** Own foreground software, not proof of an applied input or useful behavior.
+   * Resident input has no legacy ActionView; action:null alone is not idle. */
+  program: { name: string; version: number; entry: "run" | "step"; status: SkillExecutionView["status"] } | null;
   task: string;
 }
 

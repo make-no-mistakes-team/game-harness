@@ -1091,12 +1091,20 @@ export class Runtime {
     }
   }
   private async policyContext(): Promise<PolicyContext> {
+    const run = this.run!;
+    const observation = await this.refreshObservation();
+    const execution = this.store.latestRootExecution(run.run_id);
+    const program = execution && !execution.ended_at && (execution.entry === "run" || execution.entry === "step")
+      ? { name: this.store.skill(run.run_id, execution).name, version: execution.version,
+        entry: execution.entry, status: execution.status }
+      : null;
     return {
-      observation: await this.refreshObservation(),
+      observation,
       action: this.actions.active
         ? structuredClone(this.actions.active.entry.stored.view)
         : null,
-      task: this.run!.task,
+      program,
+      task: run.task,
     };
   }
   private async skillAction(

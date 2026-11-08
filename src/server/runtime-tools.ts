@@ -69,7 +69,9 @@ export class RuntimeTools {
 
   build(generation: number): AgentTool[] {
     const run = this.host.run();
-    if (this.moduleRun !== run.run_id) { this.moduleRun = run.run_id; this.modules.clear(); this.reviewDecisions.clear(); }
+    if (this.moduleRun !== run.run_id) {
+      this.moduleRun = run.run_id; this.modules.clear(); this.modules.add("reflex"); this.reviewDecisions.clear();
+    }
     const operations = new ProgramOperations(this.store, this.skills, this.reactions, this.experience, this.host, run);
     const role = (): ToolRole => run.status === "reviewing" ? "review" :
       this.host.toolRole?.() ?? (this.host.planning().projection()?.planning_active ? "speculative" : "ordinary");
@@ -198,10 +200,10 @@ export class RuntimeTools {
       tool("program_run", "Start exact named run/step; optional handoff:{name,version,execution_ordinal} replaces the current predecessor only after confirmed drain, without a separate cloud Stop/Start round. Inspect/stop, update resident intent, run pure analyze, activate a prepared successor, or select finite attention. No automatic replacement or analysis-to-control injection. Host owns retry identity and authority.", programRunSchema, (input, callId, _signal, commit) => operations.runProgram(input, callId, commit)),
       tool("program_inspect", "Read named catalog/source/execution/trace/feedback/comparison/planning views without effects. Preserve page cursors and explicit omissions.", programInspectSchema, (input, _callId, signal, commit) => operations.inspect(input, signal, commit)),
       tool("program_review", "Record keep or insufficient_evidence for the latest matching outcome of a named version. A performed code experiment is linked directly through program_write.reason.", programReviewSchema, (input, callId, signal, commit) => operations.review(input, callId, commit, signal)),
-      tool("help", "Load controller for persistent local frame/input control; game for async methods/actions/crafting; programs for detailed lifecycle; planning for prepared successors. Reflex/memory disclose optional modules.", helpSchema, (input) => {
-        if ((input.topic === "reflex" || input.topic === "memory") && role() === "authoring")
+      tool("help", "Load controller for persistent local frame/input control; game for async methods/actions/crafting; programs for lifecycle; planning for prepared successors; reflex for local reaction contracts. Memory discloses its optional module.", helpSchema, (input) => {
+        if (input.topic === "memory" && role() === "authoring")
           throw new RuntimeFault("forbidden", "Optional playing modules are unavailable during pending-program authoring");
-        if ((input.topic === "reflex" || input.topic === "memory") && role() === "ordinary") this.modules.add(input.topic);
+        if (input.topic === "memory" && role() === "ordinary") this.modules.add(input.topic);
         return programHelp(input.topic, this.host.adapter());
       }),
       tool("task_finish", "Report the whole custom task complete from actual authorized evidence and stop the run immediately. This is unverified model reporting, not built-in goal verification.", taskFinishSchema, (input, callId) => {
@@ -210,7 +212,7 @@ export class RuntimeTools {
         return { status: "stopping", verification: "unverified" };
       }),
       tool("prepare_next", "Stage one existing named program for the current restricted planning flight. Optional guard_source binds only observation,args; omission adds no gameplay condition or effect authority.", prepareNextSchema, (input, callId) => operations.prepare(input, callId)),
-      tool("reflex", "Manage optional named JavaScript/Jev reactions: write, inspect, effect-free validate, bounded activate, retire.", reflexSchema, (input, callId, signal) => operations.reflex(input, callId, generation, signal)),
+      tool("reflex", "Author local JavaScript reactions that can remain armed across cloud waits and program boundaries: write, inspect, effect-free validate, explicitly activate bounded watch/trial or qualified keep, retire. No policy or response is supplied automatically. Read help reflex for context/state and budgets. Jev requires separately configured provider access.", reflexSchema, (input, callId, signal) => operations.reflex(input, callId, generation, signal)),
       tool("memory", "Inspect, freshly load, or explicitly qualify compatible named exact experience snapshots using real bounded evidence.", memorySchema, (input, callId, _signal, commit) => operations.memory(input, callId, commit)),
     ].filter((entry) => toolCatalogAllows(role(), entry.name, this.modules));
   }

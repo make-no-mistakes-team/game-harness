@@ -2838,7 +2838,7 @@ public final class NativeClient implements ClientModInitializer {
         Entity e = authorizedEntity(gazeEntityBinding) ? gazeEntityBinding : null;
         if (block != null && clearLine(block.toCenterPos(), block)) aim(block.toCenterPos());
         else if (e != null) aim(e.getBoundingBox().getCenter());
-        else { finish(EffectOutcome.deadline(emissions), "Navigation gaze target is no longer visible", false); return false; }
+        else { navigationStopReason = "gaze_unavailable"; return false; }
       }
       double desiredYaw = Math.toDegrees(Math.atan2(-(routeGaze.x - p.x), routeGaze.z - p.z));
       NavigationGaze.steer(desiredYaw, client.player.getYaw(), steering);
@@ -3083,6 +3083,10 @@ public final class NativeClient implements ClientModInitializer {
           }
           boolean feasibleRoute = navigate();
           if (motor != this) return;
+          if (navigationStopReason != null) {
+            requestMovementCompletion();
+            return;
+          }
           long now = System.nanoTime();
           if (feasibleRoute) routeBlockedSince = 0;
           else if (routeBlockedSince == 0) routeBlockedSince = now;

@@ -1663,7 +1663,9 @@ without improving the best remaining arrival gap by more than 0.1 block. One
 initial camera-settling allowance is capped at 750 ms; circling cannot renew it.
 Results expose coarse `blocked`/`no_progress` feedback, the arrival mode and
 tested reach information, not private route geometry. Non-arrival at the finite
-duration adds `duration_exhausted`. These stops release movement and camera input
+duration adds `duration_exhausted`. Loss of visibility of an explicitly selected
+gaze target adds `gaze_unavailable`; navigation stops instead of silently choosing
+another gaze. These stops release movement and camera input
 before awaiting the same bounded own-inventory completion receipt used by `move`.
 With the target and authority still current, a timely receipt closes navigation
 as `failed`, with `failure_outcome_confirmed:true` and its actual partial effects.

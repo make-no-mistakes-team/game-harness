@@ -9,12 +9,16 @@ import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.t
 import type {
   AuthState,
   BridgeNotice,
+  GameAction,
+  GameActionResult,
   GameBridge,
   GameState,
+  Json,
   ObservationV3,
 } from "../src/shared/contracts.ts";
-import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
+import { DEFAULT_SKILL_LIMITS, type SkillCapabilityRequest } from "../src/shared/programs.ts";
 import { Runtime } from "../src/server/runtime.ts";
+import type { ActionArbiter } from "../src/server/action-arbiter.ts";
 import { Store } from "../src/server/store.ts";
 import type { AuthManager } from "../src/server/auth.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
@@ -25,6 +29,7 @@ import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { jsonSchema } from "../src/shared/primitives.ts";
 import type { HistoryReader } from "../src/server/history-reader.ts";
 import type { HistoryProjectionOwner } from "../src/server/history-projection-owner.ts";
+import { ProgramWorkspace } from "../src/server/program-workspace.ts";
 const resources: { runtime: Runtime; store: Store; directory: string }[] = [];
 afterEach(async () => {
   for (const resource of resources.splice(0)) {
@@ -32,6 +37,260 @@ afterEach(async () => {
     resource.store.close();
     rmSync(resource.directory, { recursive: true, force: true });
   }
+});
+
+async function repeatedNoEffectFixture() {
+  const directory = mkdtempSync(join(tmpdir(), "gameharness-no-effect-")), store = new Store(directory);
+  const adapter = minecraftTestAdapter(), observation = minecraftObservationFixture(adapter);
+  const state: GameState = { status: "connected", username: "Fixture", version: "1.21.4", world_id: observation.world_id,
+    epoch: observation.epoch, session_id: observation.session_id, life: observation.life,
+    binding: minecraftTestBinding(adapter), space: observation.space, screen: null, presentation: adapter.projectObservation(observation),
+    video: { status: "idle", width: 0, height: 0, fps: null, frames: 0, last_frame_at: null, error: null },
+    last_observation_at: observation.captured_at, error: null };
+  const ready = Promise.withResolvers<(request: SkillCapabilityRequest) => Promise<Json>>();
+  let result: GameActionResult = { status: "succeeded", summary: "Explicit neutral outcome",
+    evidence: { world_effect_emitted: false, neutralized: true, camera_changed: false } };
+  let settle: (() => Promise<GameActionResult>) | null = null, nativeCalls = 0, aborts = 0;
+  const game: GameBridge = {
+    connect: async () => {}, disconnect: async () => {}, snapshot: () => state, observe: async () => observation,
+    execute: async () => { nativeCalls++; return settle ? await settle() : result; },
+    cancel: async () => {}, neutralize: async () => {}, emergencyStop: async () => {},
+    adapter: () => adapter, subscribe: () => () => {},
+  };
+  const contexts: Record<string, any>[] = [];
+  let tools: AgentTool[] = [];
+  let listener: ((event: AgentEvent) => void) | null = null;
+  let promptWork: (() => Promise<void>) | null = null;
+  const hooks = new DiagnosticModelHooks();
+  const agent = { addBeforeModelCallHook: hooks.add, setBeforeModelCall: () => {}, setTools: (value: AgentTool[]) => { tools = value; },
+    subscribe: (value: (event: AgentEvent) => void) => { listener = value; return () => { listener = null; }; },
+    replaceMessages: () => {}, abort: () => { aborts++; }, waitForIdle: async () => {},
+    prompt: async (text: string) => {
+      contexts.push(JSON.parse(text));
+      await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
+      if (contexts.length === 1) {
+        await tools.find(tool => tool.name === "program_write")!.execute("no-effect-write", {
+          name: "Neutral repeated actions", source: 'for (let i=0;i<64;i++) { await game.action({kind:"look",yaw:0,pitch:0}); } return {status:"completed",summary:"Finite neutral observations",result:null};',
+          dependencies: [], card: { purpose: "Inspect repeated neutral outcomes", applicability: "Fixture",
+            method: "Finite identical neutral requests", reason: "Mechanical diagnostic regression", limitations: "No gameplay claim" },
+        });
+        await tools.find(tool => tool.name === "program_run")!.execute("no-effect-start", {
+          operation: "start", name: "Neutral repeated actions", args: null, limits: { ...DEFAULT_SKILL_LIMITS },
+        });
+      } else await promptWork?.();
+      listener?.({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } } as unknown as AgentEvent);
+    } };
+  const auth = { snapshot: () => ({ status: "ready", authenticated: true, provider: "openai-codex", account_label: null,
+    models: [{ id: "fixture-model", name: "Fixture", provider: "fixture", context_window: null }], login: null, error: null }),
+    createAgent: async (options: { tools: AgentTool[] }) => { tools = options.tools; return agent as unknown as Agent; },
+    releaseAgent: async () => {} } as unknown as AuthManager;
+  const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }),
+    runSkill: async (_source: unknown, _args: unknown, handle: (request: SkillCapabilityRequest) => Promise<Json>,
+      _limits: unknown, signal: AbortSignal) => {
+      ready.resolve(handle);
+      await new Promise<void>(resolve => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return { status: "completed", summary: "Neutral worker drained", result: null };
+    } } as unknown as SandboxService;
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  resources.push({ runtime, store, directory });
+  const finished = () => new Promise<void>(resolve => {
+    const off = store.subscribe(event => { if (event.type === "scheduler.turn_finished") { off(); resolve(); } });
+  });
+  await runtime.initialize();
+  const run = await runtime.createRun({ task: "Review explicit neutral outcomes without automatic recovery", model_id: "fixture-model",
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")! });
+  const initial = finished();
+  await runtime.control(run.run_id, "start");
+  const handle = await ready.promise;
+  await initial;
+  const diagnostics = () => {
+    const found: ReturnType<Store["eventsAfter"]> = [];
+    let after = 0;
+    for (;;) {
+      const page = store.eventsAfter(run.run_id, after, 500);
+      found.push(...page.filter(event => event.type === "program.repeated_no_effect"));
+      if (page.length < 500) return found;
+      after = page.at(-1)!.event_seq;
+    }
+  };
+  return { runtime, store, state, run, contexts, finished,
+    action: (action: GameAction = { kind: "look", yaw: 0, pitch: 0 }) => handle({ kind: "action", action }),
+    attention: () => handle({ kind: "attention", attention: { urgency: "ordinary", summary: "Fixture requests a bounded decision", details: null } }),
+    promptWork: (value: (() => Promise<void>) | null) => { promptWork = value; },
+    result: (value: GameActionResult) => { result = value; },
+    settlement: (value: (() => Promise<GameActionResult>) | null) => { settle = value; },
+    counts: () => ({ nativeCalls, aborts }),
+    diagnostics,
+    finishTask: () => tools.find(tool => tool.name === "task_finish")!.execute("fixture-finish", { summary: "Explicit terminal lifecycle fixture" }),
+  };
+}
+
+for (const backlog of [0, 501]) test(`three explicit identical neutral outcomes wake ordinary strategy with a live root across ${backlog} earlier events`, async () => {
+  const fixture = await repeatedNoEffectFixture();
+  const root = fixture.store.latestRootExecution(fixture.run.run_id)!;
+  const reference = new ProgramWorkspace(fixture.store, fixture.run.run_id).executionReference(root.execution_id)!;
+  await fixture.action();
+  await fixture.action({ pitch: 0, yaw: 0, kind: "look" });
+  expect(fixture.diagnostics()).toHaveLength(0);
+  for (let i = 0; i < backlog; i++)
+    fixture.store.event(fixture.run.run_id, "skill.progress", "Non-waking retained progress", { summary: "Neutral fixture" });
+  const decision = fixture.finished();
+  await fixture.action();
+  await decision;
+  expect(fixture.contexts).toHaveLength(2);
+  expect(fixture.contexts[1]).toMatchObject({ reason: ["program_no_effect"], role: "planning", pending_decision: true });
+  expect(fixture.contexts[1]!.feedback).toEqual(expect.arrayContaining([expect.objectContaining({
+    type: "program.repeated_no_effect", details: expect.objectContaining({
+      source: "runtime_mechanical", usefulness_inferred: false, count: 3, execution_ordinal: reference.execution_ordinal,
+    }),
+  })]));
+  expect(Buffer.byteLength(JSON.stringify(fixture.contexts[1]!.feedback))).toBeLessThanOrEqual(8192);
+  expect(fixture.diagnostics()).toHaveLength(1);
+  expect(fixture.diagnostics()[0]!.details).toMatchObject({
+    source: "runtime_mechanical", usefulness_inferred: false, root_execution_id: root.execution_id,
+    root_source_hash: root.source_hash, execution_id: root.execution_id, source_hash: root.source_hash,
+    count: 3, action_ids: expect.arrayContaining([expect.any(String)]),
+  });
+  for (let i = 0; i < 6; i++) await fixture.action();
+  await new Promise(resolve => setTimeout(resolve, 150));
+  expect(fixture.diagnostics()).toHaveLength(1);
+  expect(fixture.contexts).toHaveLength(2);
+  expect(fixture.store.latestRootExecution(fixture.run.run_id)).toMatchObject({ execution_id: root.execution_id, status: "running", ended_at: null });
+  expect(fixture.counts()).toEqual({ nativeCalls: 9, aborts: 0 });
+});
+
+test("mechanical advice coalesces behind an admitted ordinary decision without aborting its provider owner", async () => {
+  const fixture = await repeatedNoEffectFixture();
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  fixture.promptWork(async () => { entered.resolve(); await release.promise; });
+  await fixture.attention();
+  await entered.promise;
+  try {
+    await fixture.action(); await fixture.action(); await fixture.action();
+    expect(fixture.diagnostics()).toHaveLength(1);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(fixture.contexts).toHaveLength(2);
+    expect(fixture.counts()).toEqual({ nativeCalls: 3, aborts: 0 });
+    fixture.promptWork(null);
+    const decision = new Promise<void>(resolve => {
+      const off = fixture.store.subscribe(event => {
+        if (event.type === "scheduler.turn_finished" && fixture.contexts.length === 3) { off(); resolve(); }
+      });
+    });
+    release.resolve();
+    await decision;
+    expect(fixture.contexts[2]).toMatchObject({ reason: ["program_no_effect"], pending_decision: true });
+    expect(fixture.store.latestRootExecution(fixture.run.run_id)?.status).toBe("running");
+    expect(fixture.counts().aborts).toBe(0);
+  } finally { release.resolve(); }
+});
+
+test("trusted diagnostic actions never contribute to a model root's repeated-no-effect advice", async () => {
+  const fixture = await repeatedNoEffectFixture();
+  const arbiter = Reflect.get(fixture.runtime, "actions") as ActionArbiter;
+  for (let i = 0; i < 4; i++) {
+    await arbiter.diagnostic({ kind: "look", yaw: 0, pitch: 0 }, "a".repeat(64), 1000);
+    const active = arbiter.active;
+    if (active) await arbiter.awaitRetirement(active);
+  }
+  await new Promise(resolve => setTimeout(resolve, 150));
+  expect(fixture.diagnostics()).toHaveLength(0);
+  expect(fixture.contexts).toHaveLength(1);
+  expect(fixture.counts().nativeCalls).toBe(4);
+});
+
+test("advisory publication cannot wake strategy after a synchronous subscriber retires its root", async () => {
+  const fixture = await repeatedNoEffectFixture();
+  let stopping: Promise<unknown> | null = null;
+  const off = fixture.store.subscribe(event => {
+    if (event.type !== "program.repeated_no_effect") return;
+    stopping = fixture.runtime.control(fixture.run.run_id, "stop");
+  });
+  try {
+    await fixture.action(); await fixture.action(); await fixture.action().catch(() => null);
+    await stopping;
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(fixture.diagnostics()).toHaveLength(1);
+    expect(fixture.contexts.every(context => !context.reason.includes("program_no_effect"))).toBe(true);
+    expect(fixture.runtime.snapshot()?.status).toBe("stopped");
+    expect(fixture.counts().nativeCalls).toBe(3);
+  } finally { off(); }
+});
+
+test("different actions, actual effects and uncertain evidence reset rather than accumulate neutral diagnostics", async () => {
+  const fixture = await repeatedNoEffectFixture();
+  const neutral: GameActionResult = { status: "failed", summary: "Explicit neutral rejection",
+    evidence: { world_effect_emitted: false, neutralized: true, camera_changed: false } };
+  const notify = async () => {
+    const decision = fixture.finished();
+    await fixture.action(); await fixture.action(); await fixture.action(); await decision;
+  };
+  fixture.result(neutral);
+  await notify();
+  expect(fixture.diagnostics()).toHaveLength(1);
+  await fixture.action({ kind: "look", yaw: 0.1, pitch: 0 });
+  await fixture.action(); await fixture.action();
+  expect(fixture.diagnostics()).toHaveLength(1);
+  const next = fixture.finished(); await fixture.action(); await next;
+  expect(fixture.diagnostics()).toHaveLength(2);
+  const resets: Json[] = [
+    { world_effect_emitted: true, neutralized: true },
+    { world_effect_emitted: false, neutralized: true, camera_changed: true },
+    { world_effect_emitted: false, neutralized: true, camera_changed: "unknown" },
+    { world_effect_emitted: false, neutralized: true },
+    { world_effect_emitted: false, neutralized: false },
+    { neutralized: true },
+    { world_effect_emitted: false },
+    null,
+  ];
+  for (const evidence of resets) {
+    fixture.result({ status: "succeeded", summary: "Reset evidence", evidence });
+    await fixture.action();
+    fixture.result(neutral);
+    await fixture.action(); await fixture.action();
+    const before = fixture.diagnostics().length, decision = fixture.finished();
+    await fixture.action(); await decision;
+    expect(fixture.diagnostics()).toHaveLength(before + 1);
+  }
+});
+
+for (const loss of ["unknown", "cancelled", "reconnect", "scope", "terminal", "stale", "revoked", "publication"] as const)
+test(`${loss} settlement cannot publish late mechanical attention or schedule new effects`, async () => {
+  const fixture = await repeatedNoEffectFixture();
+  await fixture.action(); await fixture.action();
+  const root = fixture.store.latestRootExecution(fixture.run.run_id)!;
+  const release = Promise.withResolvers<GameActionResult>(), entered = Promise.withResolvers<void>();
+  fixture.settlement(async () => { entered.resolve(); return await release.promise; });
+  const pending = fixture.action().catch(() => null);
+  await entered.promise;
+  let off = () => {}, stopping: Promise<unknown> | null = null;
+  if (loss === "scope") fixture.state.space = { ...fixture.state.space!, space_epoch: fixture.state.space!.space_epoch + 1 };
+  if (loss === "terminal") stopping = fixture.finishTask();
+  if (loss === "stale") fixture.store.admitSkill(fixture.run.run_id, {
+    skill_id: root.skill_id, version: root.version, start_key: "newer-retained-root", entry: "run",
+    args: null, limits: { ...DEFAULT_SKILL_LIMITS },
+    epoch: root.epoch, session_id: root.session_id!, life_id: root.life_id!, native_boot_id: root.native_boot_id!,
+    run_generation: root.run_generation!, space_epoch: root.space_epoch!, compatibility_hash: root.compatibility_hash!,
+  });
+  if (loss === "publication") off = fixture.store.subscribe(event => {
+    if (event.type === "action.succeeded") stopping = fixture.runtime.control(fixture.run.run_id, "stop");
+  });
+  if (loss === "revoked") stopping = fixture.runtime.control(fixture.run.run_id, "stop");
+  release.resolve({ status: loss === "unknown" ? "unknown" : loss === "cancelled" ? "cancelled" : "succeeded",
+    summary: "Late neutral-looking result", evidence: { world_effect_emitted: false, neutralized: true, camera_changed: false },
+    ...(loss === "reconnect" ? { requires_reconnect: true } : {}) });
+  await pending;
+  await stopping;
+  if (loss === "terminal") await fixture.runtime.close();
+  off();
+  await new Promise(resolve => setTimeout(resolve, 150));
+  expect(fixture.diagnostics()).toHaveLength(0);
+  expect(fixture.contexts.every(context => !context.reason.includes("program_no_effect"))).toBe(true);
+  expect(fixture.counts().nativeCalls).toBe(3);
 });
 
 for (const recoveryKind of ["scope", "death"] as const)

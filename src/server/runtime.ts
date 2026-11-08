@@ -22,7 +22,7 @@ import type { SkillExecutionView } from "../shared/programs.ts";
 import { goalSchema, verificationResultSchema } from "../shared/validation.ts";
 import { taskTextSchema } from "../shared/tasks.ts";
 import type { EffectContext, EffectScope } from "../shared/control.ts";
-import { sameScreen } from "../shared/control.ts";
+import { sameEffectScope, sameScreen } from "../shared/control.ts";
 import { adapterCompatibility, canonicalContractJson } from "./adapter-contract.ts";
 import { RegisteredAdapterContract } from "./registered-adapter.ts";
 import { observationEvidence } from "./adapter-evidence.ts";
@@ -108,6 +108,10 @@ export class Runtime {
   private deathIds = new Set<string>();
   private lifeRecovery: Promise<void> | null = null;
   private uncertaintyRecovery: Promise<void> | null = null;
+  private repeatedNoEffect: {
+    root: string; rootSource: string; scope: EffectScope; signature: string;
+    count: number; notified: boolean; actionIds: string[];
+  } | null = null;
 
   private context() {
     const adapter = typeof this.adapterSource === "function" ? this.adapterSource() : this.adapterSource ?? this.game.adapter();
@@ -152,6 +156,79 @@ export class Runtime {
       this.verificationPending.push(evidence);
     }
     this.verifyGoal();
+  }
+
+  private noEffectAuthority(view: ActionView): SkillExecutionView | null {
+    const run = this.run, scope = view.scope, invocation = view.invocation, state = this.game.snapshot();
+    if (!run || run.status !== "running" || this.closed || this.needsReconnect || this.lifeRecovery || this.uncertaintyRecovery ||
+      !scope || view.origin !== "skill" || invocation?.kind !== "skill" || view.execution_id !== scope.execution_id ||
+      invocation.execution_id !== scope.execution_id || invocation.source_hash !== scope.source_hash ||
+      scope.run_id !== run.run_id || scope.run_generation !== this.generation ||
+      scope.world_id !== run.world_id || scope.epoch !== run.epoch || scope.session_id !== run.session_id ||
+      scope.native_boot_id !== run.native_boot_id || scope.life_id !== run.life_id || scope.space_epoch !== run.space_epoch ||
+      view.compatibility_hash !== run.compatibility_hash || state.status !== "connected" || state.error !== null ||
+      !state.binding?.ready || state.binding.compatibility_hash !== run.compatibility_hash ||
+      state.world_id !== scope.world_id || state.epoch !== scope.epoch || state.session_id !== scope.session_id ||
+      state.binding.native_boot_id !== scope.native_boot_id || state.life?.life_id !== scope.life_id ||
+      state.life.status !== "alive" || state.space?.space_epoch !== scope.space_epoch) return null;
+    // saveAction publishes synchronously before this callback. A subscriber may
+    // already have retired/revoked the producer or replaced its latest root.
+    const producerScope = this.skills.effectScope(scope.execution_id);
+    if (!producerScope || !sameEffectScope(producerScope, scope)) return null;
+    const producer = this.store.skillExecution(run.run_id, { execution_id: scope.execution_id });
+    const root = this.store.latestRootExecution(run.run_id);
+    if (!producer || !root || producer.root_execution_id !== root.execution_id ||
+      !["accepted", "running"].includes(producer.status) || producer.ended_at !== null ||
+      producer.source_hash !== scope.source_hash || !["accepted", "running"].includes(root.status) ||
+      root.ended_at !== null || (root.entry !== "run" && root.entry !== "step")) return null;
+    const rootScope = this.skills.effectScope(root.execution_id);
+    return rootScope && rootScope.run_generation === this.generation && rootScope.run_id === run.run_id &&
+      rootScope.world_id === scope.world_id && rootScope.epoch === scope.epoch &&
+      rootScope.source_hash === root.source_hash && rootScope.session_id === scope.session_id &&
+      rootScope.life_id === scope.life_id && rootScope.native_boot_id === scope.native_boot_id &&
+      rootScope.space_epoch === scope.space_epoch ? root : null;
+  }
+
+  private recordRepeatedNoEffect(action: GameAction, result: GameActionResult, view: ActionView): void {
+    const evidence = result.evidence;
+    if ((result.status !== "succeeded" && result.status !== "failed") || result.requires_reconnect ||
+      evidence === null || typeof evidence !== "object" || Array.isArray(evidence) ||
+      evidence.world_effect_emitted !== false || evidence.neutralized !== true || evidence.camera_changed !== false) {
+      this.repeatedNoEffect = null;
+      return;
+    }
+    const root = this.noEffectAuthority(view);
+    if (!root) { this.repeatedNoEffect = null; return; }
+    // Only eligible, normalized settled actions pay for canonical comparison.
+    const signature = canonicalContractJson(action), scope = view.scope!;
+    const rootScope = this.skills.effectScope(root.execution_id)!;
+    let slot = this.repeatedNoEffect;
+    if (!slot || slot.root !== root.execution_id || slot.rootSource !== root.source_hash ||
+      !sameEffectScope(slot.scope, rootScope) || slot.signature !== signature) {
+      slot = this.repeatedNoEffect = { root: root.execution_id, rootSource: root.source_hash!, scope: { ...rootScope },
+        signature, count: 0, notified: false, actionIds: [] };
+    }
+    slot.count = Math.min(3, slot.count + 1);
+    if (slot.actionIds.length < 3) slot.actionIds.push(view.action_id);
+    if (slot.count !== 3 || slot.notified) return;
+    slot.notified = true;
+    this.store.event(root.run_id, "program.repeated_no_effect",
+      "Advisory: three identical actions reported explicit neutral no-world-effect outcomes; stationary observation may be intentional", {
+        source: "runtime_mechanical", usefulness_inferred: false,
+        reason: "three_identical_explicit_neutral_outcomes", count: slot.count,
+        root_execution_id: root.execution_id, root_source_hash: root.source_hash,
+        root_skill_id: root.skill_id, root_version: root.version,
+        execution_id: scope.execution_id, source_hash: scope.source_hash,
+        action_id: view.action_id, action_ids: slot.actionIds,
+        status: result.status, world_effect_emitted: false, camera_changed: false, neutralized: true,
+        scope: { ...scope },
+      });
+    // Event publication is another synchronous external-callback boundary.
+    // Persisted advice grants no authority if its exact owner was just fenced.
+    const current = this.noEffectAuthority(view);
+    if (this.repeatedNoEffect === slot && current?.execution_id === root.execution_id &&
+      current.source_hash === root.source_hash) this.strategic.wake("program_no_effect");
+    else this.repeatedNoEffect = null;
   }
 
   constructor(
@@ -256,7 +333,10 @@ export class Runtime {
       admitted: () => this.strategic.admitted(),
       effect: (policy, kind, evidence) =>
         this.reactions.recordEffect(policy, kind, evidence),
-      settled: (action, result, view) => this.recordEffectEvidence(action, result, view),
+      settled: (action, result, view) => {
+        this.recordEffectEvidence(action, result, view);
+        this.recordRepeatedNoEffect(action, result, view);
+      },
     });
     this.skills = new SkillManager(store, sandbox, {
       openController: (execution, generation, deadline, applied, effect, lifecycle) =>
@@ -1166,6 +1246,7 @@ export class Runtime {
   }
 
   private fenceAuthority(message: string, uncertainExecutionId?: string): void {
+    this.repeatedNoEffect = null;
     this.generation++;
     for (const recheck of this.imageAuthorityWaits) recheck();
     this.planning.invalidate(message.includes("life") ? "life_changed" : "cancelled");

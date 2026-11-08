@@ -55,6 +55,7 @@ const MEANINGFUL_WAKES: Record<string, true> = {
   trial_decision_due: true,
   selected_attention: true,
   resident_attention: true,
+  program_no_effect: true,
   skill_outcome: true,
   planning_continuation: true,
   speculative_lookahead: true,
@@ -70,6 +71,7 @@ const FEEDBACK_TYPES: Record<string, true> = {
   "skill.closed": true,
   "skill.progress": true,
   "controller.event": true,
+  "program.repeated_no_effect": true,
   "policy.trial_decision_due": true,
   "policy.effect": true,
   "policy.stale_result": true,
@@ -185,6 +187,13 @@ function feedbackEntry(event: ActivityEvent, workspace: ProgramWorkspace): Json 
         ...(omitted ? { details_omitted: true } : {}) };
     }
   }
+  if (event.type === "program.repeated_no_effect") {
+    for (const key of ["source", "usefulness_inferred", "count", "world_effect_emitted", "neutralized"]) {
+      const value = details?.[key];
+      if (typeof value === "string") selected[key] = value.slice(0, 160);
+      else if (typeof value === "number" || typeof value === "boolean") selected[key] = value;
+    }
+  }
   for (const key of [
     "version",
     "status",
@@ -271,6 +280,8 @@ export class StrategicPlanner {
   private residentAttention = new Map<number, ActivityEvent>();
   private residentAttentionConsumed = 0;
   private residentAttentionOmitted: ResidentAttentionOmission | null = null;
+  private programNoEffect: ActivityEvent | null = null;
+  private programNoEffectConsumed = 0;
   private previousObservation: ObservationV3 | null = null;
   private purpose: UsagePurpose = "planning";
   private role: RequestAttempt["role"] = "planning";
@@ -323,6 +334,8 @@ export class StrategicPlanner {
     this.residentAttention.clear();
     this.residentAttentionConsumed = 0;
     this.residentAttentionOmitted = null;
+    this.programNoEffect = null;
+    this.programNoEffectConsumed = 0;
     this.previousObservation = null;
     this.purpose = "planning";
     this.role = "planning";
@@ -902,6 +915,12 @@ export class StrategicPlanner {
     this.reconcileAuthoring();
     if (this.host.programPending() && !Object.hasOwn(MEANINGFUL_WAKES, reason))
       return;
+    if (reason === "program_no_effect") {
+      // One mechanical advisory slot, independent of the oldest-first page.
+      // It is ordinary decision demand, never urgent provider cancellation.
+      const event = this.store.latestEvent(run.run_id, "program.repeated_no_effect");
+      if (event && event.event_seq > this.programNoEffectConsumed) this.programNoEffect = event;
+    }
     let urgent = reason === "policy_interrupt";
     if (reason === "resident_attention") {
       // SkillManager persists the authored event synchronously before waking us.
@@ -932,6 +951,7 @@ export class StrategicPlanner {
       this.endAuthoring(authoring, reason);
     }
     if (this.speculativeTurn && reason !== "speculative_lookahead" && reason !== "planning_continuation" &&
+        reason !== "program_no_effect" &&
         Object.hasOwn(MEANINGFUL_WAKES, reason)) {
       // Ordinary outcome/replan demand is never held behind optional lookahead.
       // Drain the cancelled request through the same serialized agent owner.
@@ -959,6 +979,7 @@ export class StrategicPlanner {
     this.idleTimer = undefined;
     this.attentionTimer = undefined;
     this.attentionReason = null;
+    this.programNoEffect = null;
     this.wakeReasons.clear();
     if (this.authoring) this.endAuthoring(this.authoring, "fenced");
     clearTimeout(this.authoringTimer);
@@ -1182,6 +1203,7 @@ export class StrategicPlanner {
     );
     let through = this.contextCursor;
     let selectedAttention: ActivityEvent[] = [];
+    let selectedNoEffect: ActivityEvent | null = null;
     let attentionOmission: ResidentAttentionOmission | null = null;
     let projectedObservation: ObservationV3 | null = null;
     let prompting = false;
@@ -1212,6 +1234,14 @@ export class StrategicPlanner {
       }
       through =
         candidates[candidates.length - 1]?.event_seq ?? this.contextCursor;
+      selectedNoEffect = reasons.includes("program_no_effect") ? this.programNoEffect : null;
+      if (selectedNoEffect) {
+        const existing = candidates.findIndex(event => event.event_seq === selectedNoEffect!.event_seq);
+        if (existing !== -1) candidates.splice(existing, 1);
+        // Preserve this bounded trigger before historical progress can consume
+        // the whole existing feedback byte allowance.
+        candidates.unshift(selectedNoEffect);
+      }
       selectedAttention = [...this.residentAttention.values()];
       attentionOmission = this.residentAttentionOmitted;
       const selectedSequences = new Set(candidates.map(event => event.event_seq));
@@ -1223,6 +1253,8 @@ export class StrategicPlanner {
       let bytes = 0;
       for (const event of candidates) {
         if (!Object.hasOwn(FEEDBACK_TYPES, event.type)) continue;
+        if (event.type === "program.repeated_no_effect" &&
+          (event.event_seq !== selectedNoEffect?.event_seq || event.event_seq <= this.programNoEffectConsumed)) continue;
         if (event.type === "controller.event") {
           const authored = controllerEventSchema.safeParse(record(event.details)?.event);
           if (!authored.success || authored.data.kind !== "attention" ||
@@ -1444,6 +1476,10 @@ export class StrategicPlanner {
     if (this.turnCalls && this.turnDelivered) {
       if (attention !== null && this.attentionReason === attention) this.attentionReason = null;
       this.contextCursor = through;
+      if (selectedNoEffect) {
+        this.programNoEffectConsumed = selectedNoEffect.event_seq;
+        if (this.programNoEffect?.event_seq === selectedNoEffect.event_seq) this.programNoEffect = null;
+      }
       const attentionThrough = Math.max(this.residentAttentionConsumed,
         selectedAttention.at(-1)?.event_seq ?? 0, attentionOmission?.through_event_seq ?? 0);
       this.residentAttentionConsumed = attentionThrough;

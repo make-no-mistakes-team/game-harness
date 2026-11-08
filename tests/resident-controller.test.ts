@@ -96,11 +96,12 @@ function harness(limits: Partial<ResidentLimits> = {}, trace?: ResidentControlle
 const analysisSource = { skill_id: "pure-analysis", version: 1, hash, source: "export function analyze(input) { return input; }" };
 async function begin(h: { controller: ResidentController; clock: Clock }) { await h.controller.start(); await h.clock.advance(0); }
 
-test("resident dispatches a fresh decision before a held heartbeat reply and Stop still joins that reply", async () => {
+test("resident keeps dispatching fresh decisions through held heartbeat replies and Stop joins every reply", async () => {
   const host = vi.spyOn(performance, "now").mockReturnValue(0), h = harness();
-  const heartbeat = deferred<unknown>(), calls: { method: string; at: number }[] = [];
+  host.mockImplementation(() => h.clock.now());
+  const heartbeats = Array.from({ length: 3 }, () => deferred<unknown>()), calls: { method: string; at: number }[] = [];
   const open = h.options.open;
-  let retired = false, stopped = false, sequence = 0;
+  let retired = false, stopped = false, sequence = 0, heartbeatCount = 0;
   const held = { ...neutral, forward: true };
   h.step(async () => decision(heldWorld(held), 1));
   h.options.open = async (deadline, applied, effect, hooks) => {
@@ -115,16 +116,16 @@ test("resident dispatches a fresh decision before a held heartbeat reply and Sto
       async failed() { throw new Error("Unexpected unconfirmed retirement"); },
       async request(method, params) {
         calls.push({ method, at: h.clock.now() });
-        if (method === "controller_heartbeat") return await heartbeat.promise;
+        if (method === "controller_heartbeat") return await heartbeats[heartbeatCount++]!.promise;
         if (method === "controller_submit") {
           sequence = (params as { sequence: number }).sequence;
           return { controller_generation: 1, sequence, ordered_edge_prefix: 1, applied_native_tick: 8,
-            applied_native_ns: "10000000", held, applied_pose: { yaw_radians: 0, pitch_radians: 0 },
+            applied_native_ns: String(BigInt(Math.round((h.clock.now() + 10) * 1e6))), held, applied_pose: { yaw_radians: 0, pitch_radians: 0 },
             input_application: "confirmed", reason: null } satisfies InputAppliedAck;
         }
         if (method === "controller_revoke") return { ack: {
           owner: h.channel.owner, controller_generation: 1, admission_revoked: true, last_applied_sequence: sequence,
-          ordered_edge_prefix: 1, retirement_applied_native_tick: 9, retirement_applied_native_ns: "20000000",
+          ordered_edge_prefix: 1, retirement_applied_native_tick: 9, retirement_applied_native_ns: "120000000",
           input_application: "confirmed", unresolved_operation_refs: [],
         } satisfies RevocationAck, generation: 2 };
         throw new Error(`Unexpected native request: ${method}`);
@@ -138,18 +139,32 @@ test("resident dispatches a fresh decision before a held heartbeat reply and Sto
     expect(h.controller.snapshot()).toMatchObject({ status: "running", state: 1,
       counters: { submissions: 1, applied_sequence: 1 } });
     expect(calls.find(call => call.method === "controller_submit")!.at).toBeLessThan(150);
+    await h.clock.advance(100);
+    expect(calls).toEqual([0, 50, 100].flatMap(at =>
+      [{ method: "controller_heartbeat", at }, { method: "controller_submit", at }]));
+    expect(h.controller.snapshot()).toMatchObject({ status: "running", counters: { submissions: 3, applied_sequence: 3 } });
     const stopping = h.controller.stop("owned Stop").then(() => { stopped = true; });
     await settle();
-    expect(calls.map(call => call.method)).toEqual(["controller_heartbeat", "controller_submit", "controller_revoke"]);
+    expect(calls.map(call => call.method)).toEqual([
+      "controller_heartbeat", "controller_submit", "controller_heartbeat", "controller_submit",
+      "controller_heartbeat", "controller_submit", "controller_revoke",
+    ]);
     expect(stopped).toBe(false);
     expect(retired).toBe(false);
     expect(h.controller.snapshot().status).toBe("stopping");
-    heartbeat.resolve({});
+    heartbeats[2]!.resolve({}); heartbeats[0]!.resolve({});
+    await settle();
+    expect(stopped).toBe(false);
+    expect(retired).toBe(false);
+    await h.clock.advance(100);
+    expect(calls).toHaveLength(7);
+    heartbeats[1]!.resolve({});
     await stopping;
     expect(retired).toBe(true);
     expect(h.controller.snapshot()).toMatchObject({ status: "stopped", cleanup: { worker: "closed", native: "retired" } });
   } finally {
-    heartbeat.resolve({}); await h.controller.stop("test containment"); host.mockRestore();
+    for (const heartbeat of heartbeats) heartbeat.resolve({});
+    await h.controller.stop("test containment"); host.mockRestore();
   }
 });
 

@@ -46,7 +46,8 @@ export class NativeControllerChannel implements ControllerInputChannel {
   private readonly inputs: ControllerInputs;
   private readonly captures = new Map<number, { tick: number; nanos: string }>();
   private readonly inflight = new Set<Promise<unknown>>();
-  private heartbeat: { work: Promise<void>; deadlineHostMs: number } | null = null;
+  private readonly heartbeats = new Set<Promise<void>>();
+  private latestHeartbeat: { work: Promise<void>; deadlineHostMs: number } | null = null;
   private retirement: Promise<RevocationAck> | null = null;
   private lastEffectSequence = 0;
   private failureReason: string | null = null;
@@ -175,17 +176,25 @@ export class NativeControllerChannel implements ControllerInputChannel {
       if (age < 0n || age > 150000000n)
         throw new Error(`A stale decision cannot renew the native input lease; ${this.decisionDiagnostic("controller_heartbeat_admission", captured, now, nativeUpper)}`);
     }
-    if (this.heartbeat !== null) {
-      // The transport has one heartbeat slot. An unanswered request can cover a
-      // newer fresh decision only within its original lease, never extend it.
-      if (now >= this.heartbeat.deadlineHostMs) {
-        const reason = `Controller heartbeat response is pending past its original lease deadline; ` +
+    if (this.latestHeartbeat !== null) {
+      // Only a newer dispatch can extend local admission, never a delayed ACK.
+      // The oldest response may still be pending after a lawful newer renewal.
+      if (now >= this.latestHeartbeat.deadlineHostMs) {
+        const reason = `Controller heartbeat admission is past its latest dispatched lease deadline; ` +
           this.decisionDiagnostic("controller_heartbeat_admission", captured, now, nativeUpper);
         this.failed(reason);
         throw new Error(reason);
       }
-      if (captured === null) await this.heartbeat.work;
-      return;
+      if (captured === null && this.heartbeats.has(this.latestHeartbeat.work)) {
+        await this.latestHeartbeat.work;
+        return;
+      }
+    }
+    if (this.heartbeats.size >= 8) {
+      const reason = `Controller heartbeat outstanding response bound reached; ` +
+        this.decisionDiagnostic("controller_heartbeat_admission", captured, now, nativeUpper);
+      this.failed(reason);
+      throw new Error(reason);
     }
     const work = this.transport.request("controller_heartbeat", { ...this.identity(),
       deadline_native_ns: controllerNativeDeadline(this.transport.clock(), deadline, now) }, 1000).then(() => {
@@ -196,9 +205,10 @@ export class NativeControllerChannel implements ControllerInputChannel {
       this.failed(reason);
       throw new Error(reason);
     });
-    const pending = { work: this.track(work), deadlineHostMs: deadline };
-    this.heartbeat = pending;
-    const settled = () => { if (this.heartbeat === pending) this.heartbeat = null; };
+    this.track(work);
+    this.heartbeats.add(work);
+    this.latestHeartbeat = { work, deadlineHostMs: deadline };
+    const settled = () => { this.heartbeats.delete(work); };
     void work.then(settled, settled);
     // Decision admission is local, not a native heartbeat/application ACK.
     // request() already ordered this heartbeat ahead of the subsequent submit;

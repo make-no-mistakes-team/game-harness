@@ -980,7 +980,7 @@ test("an internally matching opportunity boot still fails closed against the act
   }
 });
 
-test("reserved Stop reaches the native barrier while ordinary RPC capacity is saturated", async () => {
+test("reserved Stop reaches the native barrier while ordinary and eight-heartbeat lanes are saturated", async () => {
   const f = fixture(),
     pending: Promise<unknown>[] = [];
   try {
@@ -1003,18 +1003,138 @@ test("reserved Stop reaches the native barrier while ordinary RPC capacity is sa
           .call(f.bridge, "ping")
           .catch(() => null),
       );
+    for (let index = 0; index < 8; index++)
+      pending.push(
+        Reflect.get(f.bridge, "request")
+          .call(f.bridge, "controller_heartbeat", {}, 1000)
+          .catch(() => null),
+      );
+    await expect(
+      Reflect.get(f.bridge, "request").call(f.bridge, "controller_heartbeat", {}, 1000),
+    ).rejects.toThrow(/lane bound/);
     await f.bridge.emergencyStop("Saturated ordinary lane");
     expect(f.child.killed).toBe(false);
     expect(f.bridge.snapshot().status).toBe("connected");
     expect(
       received.filter((request) => request.method === "cancel"),
     ).toHaveLength(1);
+    expect(received.filter(request => request.method === "controller_heartbeat")).toHaveLength(8);
     for (const request of received)
-      if (request.method === "ping") reply(peer, request.id, {});
+      if (request.method !== "cancel") reply(peer, request.id, {});
     await Promise.all(pending);
   } finally {
     await f.close();
     await Promise.all(pending);
+  }
+});
+test.each([false, true])("socket controller writes overlapping heartbeats before inputs and Stop joins every held reply (failed=%s)", async failed => {
+  const f = fixture(), held: WireRequest[] = [], ordered: WireRequest[] = [];
+  const neutral = { forward: false, back: false, left: false, right: false, jump: false, sprint: false,
+    sneak: false, attack: false, use: false };
+  const retiredResponse = Promise.withResolvers<void>();
+  let stopped = false, captureSequence = 0, lastApplied = 0;
+  let nextApplied = Promise.withResolvers<void>();
+  const unsubscribe = f.bridge.subscribeControlTiming(span => {
+    if (span.method === "controller_revoke") retiredResponse.resolve();
+  });
+  try {
+    const peer = await f.channel("control");
+    requests(peer, request => {
+      if (request.method === "controller_open") {
+        lastApplied = 0;
+        timedReply(peer, request.id, {
+          owner: request.params.owner, controller_generation: request.params.controller_generation,
+        });
+      } else if (request.method === "controller_sample") {
+        const ns = nativeFixtureNanos(), frame = controllerFrameFixture(1, 1);
+        frame.inventory.captured_native_ns = ns;
+        timedReply(peer, request.id, {
+          ...frame, frame_seq: ++captureSequence, native_tick: 10 + captureSequence, captured_native_ns: ns,
+        });
+      } else if (request.method === "controller_heartbeat") {
+        ordered.push(request);
+        if (request.generation === 1) held.push(request);
+        else timedReply(peer, request.id, {});
+      } else if (request.method === "controller_submit") {
+        ordered.push(request);
+        lastApplied = request.params.sequence as number;
+        timedReply(peer, request.id, {
+          controller_generation: 1, sequence: lastApplied, ordered_edge_prefix: 0,
+          applied_native_tick: 20 + lastApplied, applied_native_ns: nativeFixtureNanos(),
+          held: neutral, applied_pose: { yaw_radians: 0, pitch_radians: 0 },
+          input_application: "confirmed", reason: null,
+        });
+      } else if (request.method === "controller_revoke") {
+        ordered.push(request);
+        timedReply(peer, request.id, {
+          generation: request.generation + 1,
+          ack: {
+            owner: request.params.owner, controller_generation: request.params.controller_generation,
+            admission_revoked: true, last_applied_sequence: lastApplied, ordered_edge_prefix: 0,
+            retirement_applied_native_tick: 30, retirement_applied_native_ns: nativeFixtureNanos(),
+            input_application: "confirmed", unresolved_operation_refs: [],
+          },
+        });
+      } else timedReply(peer, request.id, {});
+    });
+    await Reflect.get(f.bridge, "request").call(f.bridge, "ping");
+    const { action: _, ...reservation } = envelope(ordinaryInput, f.session);
+    const channel = await f.bridge.openController(reservation, 1, performance.now() + 10000,
+      () => nextApplied.resolve(), () => {});
+    let frame = await channel.sample(null);
+    for (let index = 0; index < 3; index++) {
+      if (index > 0) frame = await channel.sample(null);
+      nextApplied = Promise.withResolvers<void>();
+      await channel.renew(frame);
+      expect(channel.submit(frame, {
+        kind: "world", held: neutral, edges: [], view: { kind: "unchanged" }, selected_hotbar: null,
+      }).status).toBe("submitted");
+      await nextApplied.promise;
+    }
+    expect(held).toHaveLength(3);
+    expect(ordered.map(request => request.method)).toEqual(Array.from({ length: 3 }, () =>
+      ["controller_heartbeat", "controller_submit"]).flat());
+    for (const request of held) {
+      expect<unknown>(request.params.owner).toEqual(channel.owner);
+      expect(request.params.controller_generation).toBe(1);
+    }
+    expect(held.map(request => request.id)).toEqual([...held.map(request => request.id)].sort((a, b) => a - b));
+    const stopping = f.bridge.emergencyStop("Join overlapped heartbeat responses").then(() => { stopped = true; });
+    await retiredResponse.promise;
+    expect(stopped).toBe(false);
+    expect(channel.snapshot()).toMatchObject({ fenced: true, applied_sequence: 3 });
+    await expect(channel.renew(frame)).rejects.toThrow();
+    expect(() => f.bridge.openController(reservation, 2, performance.now() + 10000, () => {}, () => {}))
+      .toThrow(/sole native writer/);
+    timedReply(peer, held[2]!.id, {});
+    if (failed) peer.write(JSON.stringify({
+      id: held[0]!.id, ok: false, error: "native_input_lease_expired",
+    }) + "\n");
+    else timedReply(peer, held[0]!.id, {});
+    // This later response is a socket-order barrier for the two released replies.
+    await Reflect.get(f.bridge, "request").call(f.bridge, "ping");
+    expect(stopped).toBe(false);
+    expect(ordered.filter(request => request.method === "controller_revoke")).toHaveLength(1);
+    timedReply(peer, held[1]!.id, {});
+    await stopping;
+    if (failed) expect(channel.snapshot().reason).toContain("native_input_lease_expired");
+
+    const { action: _replacementAction, ...replacementReservation } = envelope(ordinaryInput, f.session);
+    const replacement = await f.bridge.openController(replacementReservation, 2, performance.now() + 10000, () => {}, () => {});
+    expect(replacement.owner.generation).toBe(2);
+    const fresh = await replacement.sample(null);
+    await replacement.renew(fresh);
+    await replacement.renew(null);
+    // An old channel cannot write or release the replacement owner.
+    expect(channel.submit(frame, {
+      kind: "world", held: neutral, edges: [], view: { kind: "unchanged" }, selected_hotbar: null,
+    }).status).toBe("rejected");
+    await channel.revoke();
+    expect(replacement.snapshot()).toMatchObject({ fenced: false, retired: false, submitted_sequence: 0 });
+    await replacement.revoke();
+  } finally {
+    unsubscribe();
+    await f.close();
   }
 });
 test("a controller retains the sole writer through submitted input and the actual retirement ACK", async () => {

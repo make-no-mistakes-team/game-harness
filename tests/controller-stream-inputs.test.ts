@@ -377,7 +377,7 @@ test("DTOs reject unsafe counters private actor ACK authority and malformed nati
   expect(() => new ControllerInputs(owner(), 0)).toThrow();
 });
 
-function nativeChannel(operationId = "resident-owner", generation = 3) {
+function nativeChannel(operationId = "resident-owner", generation = 3, deadlineHostMs = 10000) {
   const identity = { ...owner(), operation_id: operationId, generation };
   const frame = controllerFrameFixture(identity.scope.life_id, identity.scope.space_epoch);
   frame.frame_seq = 1; frame.native_tick = 10;
@@ -399,7 +399,7 @@ function nativeChannel(operationId = "resident-owner", generation = 3) {
     assertCurrent() { if (retired) throw new Error("Controller owner has retired."); },
     retired() { retired = true; }, async failed() { throw new Error("Unexpected unconfirmed retirement"); },
   };
-  const channel = new NativeControllerChannel(identity, 7, 10000, transport, value => applied.push(value), () => {});
+  const channel = new NativeControllerChannel(identity, 7, deadlineHostMs, transport, value => applied.push(value), () => {});
   return { channel, calls, applied, frame, request(fn: typeof request) { request = fn; } };
 }
 async function settleChannel() { for (let turn = 0; turn < 30; turn++) await Promise.resolve(); }
@@ -547,89 +547,191 @@ test("fresh input dispatch does not wait for the ordered heartbeat response or f
   }
 });
 
-test.each([false, true])("retirement joins a held heartbeat response (failed=%s)", async failed => {
+test.each([false, true])("retirement joins every out-of-order heartbeat response after its own ACK (failed=%s)", async failed => {
   const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
-  const heartbeat = Promise.withResolvers<unknown>();
+  const heartbeats = Array.from({ length: 3 }, () => Promise.withResolvers<unknown>());
+  let dispatched = 0;
   let stopped = false;
   h.request(async method => {
-    if (method === "controller_heartbeat") return await heartbeat.promise;
+    if (method === "controller_heartbeat") return await heartbeats[dispatched++]!.promise;
     return { ack: retirement(), generation: 4 };
   });
   try {
     const frame = await h.channel.sample(null);
-    void h.channel.renew(frame);
+    for (let index = 0; index < 3; index++) await h.channel.renew(frame);
     await settleChannel();
     const stopping = h.channel.revoke().then(() => { stopped = true; });
     await settleChannel();
-    expect(h.calls).toEqual(["controller_heartbeat", "controller_revoke"]);
+    expect(h.calls).toEqual([...Array(3).fill("controller_heartbeat"), "controller_revoke"]);
     expect(stopped).toBe(false);
-    if (failed) heartbeat.reject(new Error("Controller request rejected: native_input_lease_expired"));
-    else heartbeat.resolve({});
+    await expect(h.channel.renew(frame)).rejects.toThrow();
+    heartbeats[2]!.resolve({});
+    if (failed) heartbeats[0]!.reject(new Error("Controller request rejected: native_input_lease_expired"));
+    else heartbeats[0]!.resolve({});
+    await settleChannel();
+    expect(stopped).toBe(false);
+    expect(h.calls).toHaveLength(4);
+    heartbeats[1]!.resolve({});
     await stopping;
     expect(h.channel.snapshot()).toMatchObject({ fenced: true, retired: true, applied_sequence: 0 });
     if (failed) expect(h.channel.snapshot().reason).toContain("native_input_lease_expired");
     expect(h.applied).toEqual([]);
-  } finally { heartbeat.resolve({}); await settleChannel(); clock.mockRestore(); }
+  } finally { for (const heartbeat of heartbeats) heartbeat.resolve({}); await settleChannel(); clock.mockRestore(); }
 });
 
-test("an unanswered heartbeat stays single-flight without extending its original lease", async () => {
+test("fresh captures dispatch overlapping immutable leases without an oldest-response expiry fence", async () => {
   const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
-  const heartbeat = Promise.withResolvers<unknown>();
-  h.request(async method => {
-    if (method === "controller_heartbeat") return await heartbeat.promise;
+  const heartbeats = Array.from({ length: 4 }, () => Promise.withResolvers<unknown>());
+  const deadlines: string[] = [];
+  h.request(async (method, params) => {
+    if (method === "controller_heartbeat") {
+      deadlines.push((params as { deadline_native_ns: string }).deadline_native_ns);
+      return await heartbeats[deadlines.length - 1]!.promise;
+    }
     return { ack: retirement(), generation: 4 };
   });
   try {
     const frame = await h.channel.sample(null);
-    void h.channel.renew(frame); await settleChannel();
+    await h.channel.renew(frame);
     clock.mockReturnValue(100);
     await h.channel.renew(frame);
     const forged = structuredClone(h.frame); forged.captured_native_ns = "1100000000";
     await expect(h.channel.renew(forged)).rejects.toThrow(/actual host-retained/);
     clock.mockReturnValue(161);
     await expect(h.channel.renew(frame)).rejects.toThrow(/stale decision/);
-    expect(h.calls).toEqual(["controller_heartbeat"]);
+    expect(h.calls).toEqual(["controller_heartbeat", "controller_heartbeat"]);
 
-    // A new real capture may use the already ordered lease, not extend it.
+    // A new genuine capture writes a new lease despite both older held replies.
     h.frame.frame_seq = 2;
     h.frame.captured_native_ns = h.frame.inventory.captured_native_ns = "1161000000";
     const fresh = await h.channel.sample(null);
     await h.channel.renew(fresh);
-    expect(h.calls).toEqual(["controller_heartbeat"]);
+    expect(deadlines.map(BigInt)).toEqual([1249999998n, 1349999998n, 1410999998n]);
     clock.mockReturnValue(250);
-    await expect(h.channel.renew(fresh)).rejects.toThrow(/heartbeat response.*lease deadline/);
+    await h.channel.renew(fresh);
+    expect(h.calls).toEqual(Array(4).fill("controller_heartbeat"));
+    expect(deadlines.map(BigInt)).toEqual([1249999998n, 1349999998n, 1410999998n, 1499999998n]);
+    // Neither an out-of-order ACK nor an old success grants time at receipt.
+    heartbeats[2]!.resolve({}); heartbeats[0]!.resolve({}); await settleChannel();
+    clock.mockReturnValue(500);
+    h.frame.frame_seq = 3;
+    h.frame.captured_native_ns = h.frame.inventory.captured_native_ns = "1500000000";
+    const expired = await h.channel.sample(null);
+    await expect(h.channel.renew(expired)).rejects.toThrow(/latest dispatched lease deadline/);
     expect(h.channel.snapshot().fenced).toBe(true);
-    expect(h.calls).toEqual(["controller_heartbeat", "controller_revoke"]);
-    heartbeat.resolve({}); await h.channel.revoke();
+    expect(h.calls).toEqual([...Array(4).fill("controller_heartbeat"), "controller_revoke"]);
+    for (const heartbeat of heartbeats) heartbeat.resolve({});
+    await h.channel.revoke();
     expect(h.channel.snapshot().reason).toContain("lease deadline");
+  } finally { for (const heartbeat of heartbeats) heartbeat.resolve({}); await settleChannel(); clock.mockRestore(); }
+});
+
+test("eight held heartbeat responses fail closed on overflow while retirement remains dispatchable", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  const heartbeats = Array.from({ length: 8 }, () => Promise.withResolvers<unknown>());
+  let dispatched = 0, stopped = false;
+  h.request(async method => {
+    if (method === "controller_heartbeat") return await heartbeats[dispatched++]!.promise;
+    return { ack: retirement(), generation: 4 };
+  });
+  try {
+    const frame = await h.channel.sample(null);
+    for (let index = 0; index < 8; index++) await h.channel.renew(frame);
+    await expect(h.channel.renew(frame)).rejects.toThrow(/outstanding response bound/);
+    expect(h.calls).toEqual([...Array(8).fill("controller_heartbeat"), "controller_revoke"]);
+    expect(h.channel.snapshot().fenced).toBe(true);
+    const stopping = h.channel.revoke().then(() => { stopped = true; });
+    for (const heartbeat of heartbeats.slice(1)) heartbeat.resolve({});
+    await settleChannel();
+    expect(stopped).toBe(false);
+    heartbeats[0]!.resolve({});
+    await stopping;
+    expect(h.channel.snapshot().retired).toBe(true);
+  } finally { for (const heartbeat of heartbeats) heartbeat.resolve({}); await settleChannel(); clock.mockRestore(); }
+});
+
+test("overlapping heartbeat deadlines stay capped by the original root and late successes cannot revive it", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel("resident-owner", 3, 300);
+  const heartbeat = Promise.withResolvers<unknown>(), deadlines: bigint[] = [];
+  h.request(async (method, params) => {
+    if (method === "controller_heartbeat") {
+      deadlines.push(BigInt((params as { deadline_native_ns: string }).deadline_native_ns));
+      return await heartbeat.promise;
+    }
+    return { ack: retirement(), generation: 4 };
+  });
+  try {
+    await h.channel.renew(await h.channel.sample(null));
+    clock.mockReturnValue(200);
+    h.frame.frame_seq = 2;
+    h.frame.captured_native_ns = h.frame.inventory.captured_native_ns = "1200000000";
+    const frame = await h.channel.sample(null);
+    await h.channel.renew(frame);
+    expect(deadlines).toEqual([1249999998n, 1299999998n]);
+    clock.mockReturnValue(300); heartbeat.resolve({}); await settleChannel();
+    await expect(h.channel.renew(frame)).rejects.toThrow(/expired/);
+    expect(h.channel.submit(frame, world(1).input).status).toBe("rejected");
+    expect(h.calls.filter(method => method === "controller_heartbeat")).toHaveLength(2);
+    await h.channel.revoke();
   } finally { heartbeat.resolve({}); await settleChannel(); clock.mockRestore(); }
 });
 
-test("a rejected outstanding heartbeat fences subsequent dispatch and retains native failure provenance", async () => {
+test("an older rejected heartbeat fences dispatch despite a newer success and retirement joins the remaining response", async () => {
   const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
-  const heartbeat = Promise.withResolvers<unknown>(), retiring = Promise.withResolvers<unknown>();
+  const heartbeats = Array.from({ length: 3 }, () => Promise.withResolvers<unknown>());
+  const retiring = Promise.withResolvers<unknown>();
+  let dispatched = 0, stopped = false;
   h.request(async method => {
-    if (method === "controller_heartbeat") return await heartbeat.promise;
+    if (method === "controller_heartbeat") return await heartbeats[dispatched++]!.promise;
     if (method === "controller_revoke") return await retiring.promise;
     throw new Error(`Unexpected native request: ${method}`);
   });
   try {
     const frame = await h.channel.sample(null);
-    void h.channel.renew(frame); await settleChannel();
-    heartbeat.reject(new Error("Controller request rejected: native_input_lease_expired"));
+    for (let index = 0; index < 3; index++) await h.channel.renew(frame);
+    heartbeats[2]!.resolve({}); await settleChannel();
+    heartbeats[0]!.reject(new Error("Controller request rejected: native_input_lease_expired"));
     await settleChannel();
     expect(h.channel.submit(frame, world(1).input)).toMatchObject({ status: "rejected" });
     await expect(h.channel.renew(frame)).rejects.toThrow(/native_input_lease_expired/);
-    expect(h.calls).toEqual(["controller_heartbeat", "controller_revoke"]);
+    expect(h.calls).toEqual([...Array(3).fill("controller_heartbeat"), "controller_revoke"]);
     expect(h.channel.snapshot()).toMatchObject({ fenced: true, retired: false, submitted_sequence: 0, last_input: null });
     expect(h.channel.snapshot().reason).toContain("controller_heartbeat");
     retiring.resolve({ ack: retirement(), generation: 4 });
-    await h.channel.revoke();
+    const stopping = h.channel.revoke().then(() => { stopped = true; });
+    await settleChannel();
+    expect(stopped).toBe(false);
+    heartbeats[1]!.resolve({});
+    await stopping;
     expect(h.channel.snapshot().reason).toContain("native_input_lease_expired");
   } finally {
-    heartbeat.resolve({}); retiring.resolve({ ack: retirement(), generation: 4 });
+    for (const heartbeat of heartbeats) heartbeat.resolve({});
+    retiring.resolve({ ack: retirement(), generation: 4 });
     await settleChannel(); clock.mockRestore();
   }
+});
+
+test("mechanical renewal joins the newest actual pending heartbeat instead of returning on an older ACK", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  const heartbeats = Array.from({ length: 3 }, () => Promise.withResolvers<unknown>());
+  let dispatched = 0, settled = false;
+  h.request(async method => {
+    if (method === "controller_heartbeat") return await heartbeats[dispatched++]!.promise;
+    return { ack: retirement(), generation: 4 };
+  });
+  try {
+    const frame = await h.channel.sample(null);
+    for (let index = 0; index < 3; index++) await h.channel.renew(frame);
+    const renewal = h.channel.renew(null).then(() => { settled = true; });
+    heartbeats[0]!.resolve({}); heartbeats[1]!.resolve({});
+    await settleChannel();
+    expect(settled).toBe(false);
+    expect(dispatched).toBe(3);
+    heartbeats[2]!.resolve({});
+    await renewal;
+    expect(settled).toBe(true);
+    await h.channel.revoke();
+  } finally { for (const heartbeat of heartbeats) heartbeat.resolve({}); await settleChannel(); clock.mockRestore(); }
 });
 
 test.each([false, true])("trusted mechanical renewal still awaits its actual heartbeat response (failed=%s)", async failed => {

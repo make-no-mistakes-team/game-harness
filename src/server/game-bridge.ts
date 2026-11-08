@@ -425,7 +425,7 @@ const laneLimits: Record<ControlLane, number> = {
   ordinary: 16,
   input: 4,
   sample: 1,
-  heartbeat: 1,
+  heartbeat: 8,
   retirement: 1,
 };
 function controlLane(method: string): ControlLane {

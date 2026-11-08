@@ -538,7 +538,7 @@ application ACK.
 
 The authenticated control socket has separate bounded lanes: sixteen
 ordinary host RPCs, four unresolved input frames, one controller sample,
-one mechanical heartbeat and one reserved retirement. Native ordinary
+eight mechanical heartbeat requests and one reserved retirement. Native ordinary
 dispatch remains bounded at 32 tasks. Stream admission does not enqueue a
 game-thread task for every nominal input. At most 256 expanded ordered
 edges remain unacknowledged. Only compatible unsent, edge-free held
@@ -676,12 +676,16 @@ Fresh decision renewal validates the actual retained capture and dispatches
 its heartbeat before the following input, without waiting for the heartbeat
 response. The shared native receive loop checks that lease before admitting
 the ordered input; native capture-age and application checks remain unchanged.
-Only one heartbeat may be outstanding. New fresh decisions can reuse that
-request while its original host deadline remains future, without extending
-it or queuing a retry. An unanswered request reaching that deadline fences
-and drains the channel. A dispatch return is not a native lease or input ACK.
-Trusted `renew(null)` still waits for the actual response, and retirement
-joins every tracked heartbeat and application response.
+Up to eight heartbeat responses may remain outstanding. Each genuine fresh
+decision can dispatch a renewal without waiting for an older ACK; saturation
+fences the channel rather than creating an unbounded future-renewal queue.
+Every request keeps its original deadline, capped by the original root.
+Host expiry follows the latest dispatch-owned deadline, never an older
+flight's expiry or a later ACK time. Native expiry and actual rejection remain
+authoritative; a dispatch return is not a lease or input-application ACK.
+Trusted `renew(null)` still waits for an actual pending response. Retirement
+fences first, uses its reserved revoke lane and joins every heartbeat and
+application response before releasing the owner. It adds no survival timer.
 
 A stale decision cannot renew the 250 ms native lease. At 1 Hz, expiry before
 the next step is expected. Empty visible-screen waits and unchanged neutral

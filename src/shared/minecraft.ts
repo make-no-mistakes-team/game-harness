@@ -123,7 +123,8 @@ export const minecraftActionSchema = z.union([
     .describe("One entity attack with built-in mechanical aiming; no prior look is required. Does not approach, select equipment, repeat strikes or wait for cooldown. Caller chooses movement and timing. Success confirms owned server damage, not a kill."),
   z.object({ kind: z.literal("navigate"), target: targetRefSchema, range: z.number().finite().min(0.5).max(4)
     .describe("Arrival distance in blocks. Position (default): full 3D distance from own feet to block centre or last-authorized entity origin. Interaction: eye-to-block-centre distance, also requiring current visibility and native mining reach; never increases reach. Unless already arrived, a separate helper envelope requires initial feet-to-target-centre distance <=8 blocks and current distance <=10. Observation samples integer block offsets around floor(feet) within radius 8, so a fresh observed centre can still exceed navigation's 8-block envelope. Refusal receipts give distances/limits. Reobserve and choose a permitted local approach, not the unchanged refused request."),
-    duration_ms: z.number().int().min(100).max(10000),
+    duration_ms: z.number().int().min(100).max(10000)
+      .describe("Finite movement interval, not a promise to arrive. Non-arrival stops input and awaits the owned completion receipt; confirmed settlement returns failed with partial effects retained. Missing receipt, lost target or scope remains unknown. Check fresh feedback before choosing another action."),
     arrival: z.enum(["position", "interaction"]).optional()
       .describe("Defaults to position; vertical separation counts. Choose interaction to approach a visible block for ordinary interaction/mining reach without mining it. Interaction requires a visible reachable block within range and rejects entity targets; position preserves entity/item navigation."),
     gaze: minecraftNavigationGazeSchema.optional() }).strict(),

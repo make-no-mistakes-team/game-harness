@@ -273,11 +273,18 @@ public final class NativeClient implements ClientModInitializer {
             gained ? "Selected drop disappeared nearby; own item gain confirmed by server inventory"
                 : "Selected drop disappeared; own pickup was not confirmed within its receipt bound",
             gained);
-      } else if (motor.completingMove)
-        motor.finish(
-            "succeeded",
-            "Movement interval completed; own inventory snapshot confirmed",
-            motor.completedMovementEffect);
+      } else if (motor.completingMove) {
+        if (motor.kind.equals("navigate")) {
+          if (!motor.authorized(false) || !motor.targetsCurrent())
+            motor.finish("unknown", "Navigation stopped; target or scope changed before completion receipt", false);
+          else
+            motor.finish("failed", "Navigation stopped without arrival; own inventory snapshot confirmed", false);
+        } else
+          motor.finish(
+              "succeeded",
+              "Movement interval completed; own inventory snapshot confirmed",
+              motor.completedMovementEffect);
+      }
     }
   }
 
@@ -2972,6 +2979,20 @@ public final class NativeClient implements ClientModInitializer {
       return true;
     }
 
+    void requestMovementCompletion() {
+      completedMovementEffect = initial.squaredDistanceTo(client.player.getPos()) > .001;
+      completingMove = true;
+      moveReceiptDeadline = System.nanoTime() + 3000000000L;
+      controls = null;
+      navForward = navBack = navLeft = navRight = navJump = false;
+      looking = false;
+      yawVelocity = pitchVelocity = 0;
+      applyInput();
+      if (client.interactionManager != null)
+        client.interactionManager.cancelBlockBreaking();
+      requestInventory();
+    }
+
     void tick() {
       if (!ready) {
         if ((System.nanoTime() - started) / 1000000 > 3000)
@@ -2998,19 +3019,11 @@ public final class NativeClient implements ClientModInitializer {
       samplePose();
       long elapsed = (System.nanoTime() - started) / 1000000;
       if (elapsed > duration) {
-        if (kind.equals("move")) {
-          completedMovementEffect = initial.squaredDistanceTo(client.player.getPos()) > .001;
-          completingMove = true;
-          moveReceiptDeadline = System.nanoTime() + 3000000000L;
-          // End the held controls/camera at the requested duration, not after the receipt wait.
-          controls = null;
-          looking = false;
-          yawVelocity = 0;
-          pitchVelocity = 0;
-          applyInput();
-          if (client.interactionManager != null)
-            client.interactionManager.cancelBlockBreaking();
-          requestInventory();
+        if (kind.equals("move"))
+          requestMovementCompletion();
+        else if (kind.equals("navigate") && authorized(false) && targetsCurrent()) {
+          navigationStopReason = "duration_exhausted";
+          requestMovementCompletion();
         } else
           finish(
               EffectOutcome.deadline(emissions),
@@ -3090,10 +3103,7 @@ public final class NativeClient implements ClientModInitializer {
           else if (navigationProgressArmed && now - navigationProgressSince >= 1500000000L)
             navigationStopReason = "no_progress";
           if (navigationStopReason != null)
-            finish(EffectOutcome.deadline(emissions),
-                navigationStopReason.equals("blocked")
-                    ? "No feasible supported local route; choose another visible approach"
-                    : "Navigation made no meaningful progress toward the requested arrival range", false);
+            requestMovementCompletion();
         }
         case "dig" -> {
           if (client.world.getBlockState(target).isAir()) {
@@ -3369,8 +3379,11 @@ public final class NativeClient implements ClientModInitializer {
           && initial != null && client.player != null && client.world != null
           && generation == authority && lifeId == lifecycle.lifeId() && lifecycle.ready()
           && authorized(false);
-      if (reportMovement && navigationGoal != null)
+      if (reportMovement && navigationGoal != null) {
         navigationCurrentDistanceSquared = navigationGoal.squaredDistanceTo(client.player.getPos());
+        double range = action.get("range").getAsDouble();
+        positionRange = navigationCurrentDistanceSquared <= range * range;
+      }
       motor = null;
       if (equipmentSession != null) equipmentSession.cancel(true);
       Recipes.cancel(true);
@@ -3397,6 +3410,9 @@ public final class NativeClient implements ClientModInitializer {
       }
       if (kind.equals("attack") && status.equals("failed") && authoritativeRejection
           && Integer.valueOf(0).equals(damageOutcome) && evidence.get("neutralized").getAsBoolean())
+        evidence.addProperty("failure_outcome_confirmed", true);
+      if (kind.equals("navigate") && status.equals("failed") && completingMove
+          && serverInventoryAfter != null && evidence.get("neutralized").getAsBoolean())
         evidence.addProperty("failure_outcome_confirmed", true);
       evidence.addProperty("camera_changed", (emissions & EffectOutcome.CAMERA) != 0);
       if (inventoryUi != null) evidence.add("native_inventory_ui", inventoryUi);

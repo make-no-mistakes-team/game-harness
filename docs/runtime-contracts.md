@@ -260,7 +260,7 @@ This advisory requests an ordinary strategic decision while foreground work cont
 
 `program_write` and `program_submit` dependencies list only already authored named programs for `game.call`, never native binding names. The host resolves these declarations to exact validated versions when the parent is written. A running child lookup uses **only that parent's pinned closure**, never current latest; omitted child version requires an unambiguous declared name. A native read and an authored program with the same name remain separate authorities: the direct method invokes the binding, while `game.call` requires the captured authored dependency. Internal `SkillRef` identities remain evidence/enforcement details. Every return path, including early blocked/failed exits, supplies `{status:"completed"|"blocked"|"failed",summary,result}`; use `result:null` without a payload. Static validation does not prove every path returns correctly, and completion does not certify the operator's objective.
 
-`game.actionAndObserve(action)` composes one ordinary action with a fresh ordinary observation, returning `{action,observation}` without changing the action result. Without a reconnect requirement, observation follows success or a neutralized failure with explicit `world_effect_emitted:false` or `failure_outcome_confirmed:true`. The latter is native-owned evidence of a processed rejection, not an action argument or proof that nothing changed in the world. Other outcomes return `observation:null`; unknown, cancellation and reconnect retain the host's execution fences. Validation, observation and scope-revocation errors propagate without stale fallback. Both calls consume existing budgets.
+`game.actionAndObserve(action)` composes one ordinary action with a fresh ordinary observation, returning `{action,observation}` without changing the action result. Without a reconnect requirement, observation follows success or a neutralized failure with explicit `world_effect_emitted:false` or `failure_outcome_confirmed:true`. The latter is native-owned evidence of a settled failed outcome, not an action argument or proof that nothing changed in the world. Attempted input and partial movement remain recorded. Other outcomes return `observation:null`; unknown, cancellation and reconnect retain the host's execution fences. Validation, observation and scope-revocation errors propagate without stale fallback. Both calls consume existing budgets.
 
 Authored callers should adopt the fresh observation and check their intended postcondition before abandoning a procedure on a failed status. The generated help example checks before and after the first action, then permits at most one distinct author-chosen alternative after a safely settled failure. This disclosed example supplies no automatic strategy. The utility never retries an effect or decides task completion; unknown and cancelled work cannot bypass reconciliation.
 
@@ -1605,9 +1605,15 @@ The local motor stops after 750 ms without a supported route, or 1,500 ms
 without improving the best remaining arrival gap by more than 0.1 block. One
 initial camera-settling allowance is capped at 750 ms; circling cannot renew it.
 Results expose coarse `blocked`/`no_progress` feedback, the arrival mode and
-tested reach information, not private route geometry. A stop after emitted
-movement remains `unknown` unless independently confirmed; early termination
-does not make the movement safe to replay.
+tested reach information, not private route geometry. Non-arrival at the finite
+duration adds `duration_exhausted`. These stops release movement and camera input
+before awaiting the same bounded own-inventory completion receipt used by `move`.
+With the target and authority still current, a timely receipt closes navigation
+as `failed`, with `failure_outcome_confirmed:true` and its actual partial effects.
+It does not claim arrival or select another approach. Missing or late receipt,
+target loss, life/scope loss and unresolved pickup remain `unknown`; neither
+neutralization nor early termination authorizes replay. Receipt waiting cannot
+extend the host or root deadline.
 
 Raw `move` success means that its requested input interval completed, not that
 the player travelled or escaped. Receipts distinguish net/horizontal

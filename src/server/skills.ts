@@ -240,8 +240,12 @@ export class SkillManager {
     });
     if (existing) return this.store.admitSkill(runId, parsed).view;
     const { skill, armLookahead } = this.prepareStart(runId, parsed);
-    if ([...this.live.values()].some(live => live.root === live && (parsed.entry === "step" || live.view.entry === "step")))
-      throw new RuntimeFault("busy", "Playing resident admission waits for the previous root's actual drain");
+    for (const live of this.live.values()) {
+      if (live.root !== live || parsed.entry !== "step" && live.view.entry !== "step") continue;
+      throw new RuntimeFault("busy", live.closing || live.controller.signal.aborted
+        ? "Previous foreground work is retiring; new admission waits for confirmed worker/native drain"
+        : "A foreground program is still live; start does not replace it. Inspect target:'current' for its exact reference and pass handoff:{name,version,execution_ordinal} on start/submit to replace it. Stop is for a deliberate stop, not an automatic replacement.");
+    }
     const admitted = this.store.admitSkill(runId, parsed);
     if (admitted.created) {
       const live = this.dispatch(admitted.view, skill, null);

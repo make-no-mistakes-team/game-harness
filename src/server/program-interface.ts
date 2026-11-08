@@ -114,6 +114,11 @@ export const prepareNextSchema = z.discriminatedUnion("entry", [
 export const helpSchema = z.object({ topic: z.enum(["overview", "controller", "game", "programs", "planning", "reflex", "memory"]).default("overview") }).strict();
 const namedPolicy = { name: z.string().trim().min(1).max(80), version: z.int().positive().optional() };
 export const reflexSchema = z.discriminatedUnion("operation", [
+  z.object({ operation: z.literal("submit"), spec: policySpecSchema,
+    max_ms: z.int().min(1000).max(120000).default(120000),
+    max_actions: z.int().min(1).max(20).default(20),
+    max_evaluations: z.int().min(1).max(100).default(100),
+    watch: policyWatchSchema.optional() }).strict(),
   z.object({ operation: z.literal("write"), spec: policySpecSchema }).strict(),
   z.object({ operation: z.literal("inspect"), ...namedPolicy }).strict(),
   z.object({ operation: z.literal("validate"), ...namedPolicy }).strict(),

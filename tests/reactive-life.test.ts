@@ -16,6 +16,9 @@ import { minecraftActionSchema } from "../src/shared/minecraft.ts";
 import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 import { ModelProgramEvidence } from "../src/evaluation/model-evidence.ts";
 import { DEFAULT_EVALUATION_CAPS } from "../src/evaluation/config.ts";
+import { ProgramOperations } from "../src/server/program-operations.ts";
+import { reflexSchema } from "../src/server/program-interface.ts";
+import type { RuntimeToolHost } from "../src/server/runtime-tools.ts";
 
 // Exercise the real asynchronous scheduler, worker, and arbiter handoffs. Await
 // their completion signals rather than advancing a process-global fake clock.
@@ -71,6 +74,98 @@ function specification(backend: PolicySpec["backend"] = "javascript"): PolicySpe
     interval_ms: 200,
   };
 }
+
+function reflexOperations(f: ReturnType<typeof fixture>) {
+  // This slice exercises the actual policy use case, scheduler, Store and
+  // arbiter. Program/memory operations are not part of this fixture.
+  const operations = new ProgramOperations(f.store, {} as SkillManager, f.reactive, null, {} as RuntimeToolHost, f.run);
+  return (input: unknown, callId: string, signal?: AbortSignal) =>
+    operations.reflex(reflexSchema.parse(input), callId, 1, () => {
+      if (signal?.aborted) throw new RuntimeFault("stale_context", "Submission tool authority revoked");
+    }, signal);
+}
+
+test("one reflex submission arms an exact finite watch and redelivery cannot renew a spent trial", async () => {
+  const f = fixture(), submit = reflexOperations(f);
+  const input = { operation: "submit", spec: specification(), watch: { duration_ms: 9000, evaluations: 100 },
+    max_ms: 5000, max_actions: 1, max_evaluations: 20 };
+  const first = await submit(input, "single-reflex-submission");
+  const due = event(f.store, "policy.trial_decision_due");
+  f.setEvaluator(async () => replacement);
+  await f.execution();
+  await due;
+  const finished = f.reactive.list[0]!;
+  expect(finished.state).toBe("validated");
+  expect(finished.effects).toBe(1);
+  expect(await submit(input, "single-reflex-submission")).toEqual(first);
+  await Bun.sleep(250);
+  expect(f.executed).toHaveLength(1);
+  expect(f.store.policies(f.run.run_id)).toHaveLength(1);
+  expect(f.store.events(f.run.run_id).filter(value => value.type === "policy.watch_started")).toHaveLength(1);
+});
+
+test("interrupted reflex submission retains exact source without replaying validation or activation", async () => {
+  const f = fixture(), submit = reflexOperations(f), controller = new AbortController();
+  const entered = Promise.withResolvers<void>();
+  let evaluations = 0;
+  f.setEvaluator(async (_context, signal) => {
+    evaluations++;
+    entered.resolve();
+    await new Promise<void>(resolve => {
+      if (signal?.aborted) resolve();
+      else signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
+    throw new Error("Cancelled isolated validation");
+  });
+  const input = { operation: "submit", spec: specification(), watch: { duration_ms: 9000, evaluations: 100 },
+    max_ms: 5000, max_actions: 1, max_evaluations: 20 };
+  const pending = submit(input, "interrupted-reflex-submission", controller.signal);
+  await entered.promise;
+  controller.abort();
+  const first = await pending;
+  expect(f.store.policies(f.run.run_id)).toHaveLength(1);
+  expect(f.store.events(f.run.run_id).some(value => value.type === "policy.watch_started")).toBe(false);
+  expect(await submit(input, "interrupted-reflex-submission")).toEqual(first);
+  expect(evaluations).toBe(1);
+  expect(f.executed).toHaveLength(0);
+});
+
+test("invalid revised reflex submission leaves the prior selected guard able to act", async () => {
+  const f = fixture(), submit = reflexOperations(f);
+  const original = await watch(f, { max_ms: 5000, max_actions: 1, max_evaluations: 20 });
+  f.setEvaluator(async (context, _signal, spec) =>
+    await new Function("context", "state", `return (async()=>{${spec.source}})();`)(context, {}));
+  const result = await submit({ operation: "submit",
+    spec: { ...specification(), source: 'return {kind:"invalid-return"};' },
+    watch: { duration_ms: 9000, evaluations: 100 }, max_ms: 5000, max_actions: 1, max_evaluations: 20 },
+  "invalid-reflex-revision");
+  expect(result).toMatchObject({ source: { status: "persisted", version: 2 }, activation: { status: "refused" } });
+  expect(f.reactive.list.find(value => value.version === 2)?.state).toBe("quarantined");
+  expect(f.reactive.list.find(value => value.policy_id === original.view.policy_id && value.version === 1)?.state).toBe("trial");
+  f.setEvaluator(async () => replacement);
+  await f.execution();
+  expect(f.executed).toEqual([{ kind: "look", yaw: 0.2, pitch: 0 }]);
+});
+
+test("redelivery during reflex validation cannot select a later catalog revision or finish activation", async () => {
+  const f = fixture(), submit = reflexOperations(f);
+  const entered = Promise.withResolvers<void>(), release = hold<PolicyDecision>({ kind: "continue" });
+  f.setEvaluator(async () => { entered.resolve(); return await release.promise; });
+  const input = { operation: "submit", spec: specification(), watch: { duration_ms: 9000, evaluations: 100 },
+    max_ms: 5000, max_actions: 1, max_evaluations: 20 };
+  const pending = submit(input, "redelivered-reflex-submission");
+  await entered.promise;
+  const later = await f.reactive.register({ ...specification(), source: 'return {kind:"continue",reason:"Later source"};' }, 1, 1);
+  expect(later.version).toBe(2);
+  const redelivered = await submit(input, "redelivered-reflex-submission");
+  expect(redelivered).toMatchObject({ source: { status: "persisted", version: 1 }, activation: { status: "unknown" } });
+  release.resolve({ kind: "continue" });
+  expect(await pending).toEqual(redelivered);
+  expect(f.store.policies(f.run.run_id)).toHaveLength(2);
+  expect(f.store.events(f.run.run_id).some(value => value.type === "policy.watch_started")).toBe(false);
+  expect(f.executed).toHaveLength(0);
+});
+
 function fixture(judge?: JevBroker) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-reactive-life-"));
   const store = new Store(directory), adapter = minecraftTestAdapter();
@@ -93,7 +188,7 @@ function fixture(judge?: JevBroker) {
   let reconnect = false;
   const executed: GameAction[] = [];
   const executions = new Map<number, (() => void)[]>();
-  let evaluate: (context: PolicyContext, signal?: AbortSignal) => Promise<PolicyDecision> = async () => ({ kind: "continue" });
+  let evaluate: (context: PolicyContext, signal: AbortSignal | undefined, spec: PolicySpec) => Promise<PolicyDecision> = async () => ({ kind: "continue" });
   let closePrograms = async () => {};
   let neutralize = async () => {};
   let cancel = async () => {};
@@ -119,7 +214,7 @@ function fixture(judge?: JevBroker) {
     cancel: async () => { await cancel(); }, subscribe: () => () => {},
   };
   const sandbox = {
-    createWorker: async () => ({ evaluate: (context: PolicyContext, signal?: AbortSignal) => evaluate(context, signal), close: async () => { workersClosed++; } }),
+    createWorker: async (spec: PolicySpec) => ({ evaluate: (context: PolicyContext, signal?: AbortSignal) => evaluate(context, signal, spec), close: async () => { workersClosed++; } }),
   } as unknown as SandboxService;
   let reactive: ReactiveRuntime;
   let skillAuthority: SkillManager | null = null;

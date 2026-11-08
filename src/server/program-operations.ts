@@ -423,8 +423,72 @@ export class ProgramOperations {
       qualification: "assessment_not_promotion_or_causal_improvement" };
   }
 
-  async reflex(input: z.infer<typeof reflexSchema>, callId: string, generation: number, signal?: AbortSignal) {
+  async reflex(input: z.infer<typeof reflexSchema>, callId: string, generation: number,
+    commit: () => void, signal?: AbortSignal) {
     const identity = { tool: "reflex", input } as unknown as Json;
+    if (input.operation === "submit") {
+      const outcomeKey = this.phaseKey(callId, "reflex_outcome");
+      const receipt = () => this.store.completedToolCall(this.run.run_id, outcomeKey, identity);
+      const completed = receipt();
+      if (completed !== null) return completed;
+      let first = false;
+      const epoch = z.number().int().nonnegative().parse(this.store.bindToolCall(this.run.run_id, callId, identity, () => {
+        commit();
+        first = true;
+        return this.run.epoch;
+      }));
+      const registration = { call_id: this.phaseKey(callId, "reflex_registration"), input: identity };
+      const persisted = () => {
+        const value = this.store.completedToolCall(this.run.run_id, registration.call_id, identity);
+        return value === null ? null : policyRefSchema.parse({ epoch, ...z.object({
+          policy_id: z.string(), version: z.int().positive(),
+        }).strict().parse(value) });
+      };
+      const finish = (ref: z.infer<typeof policyRefSchema>, validation: Json, activation: Json) => {
+        const previous = receipt();
+        if (previous !== null) return previous;
+        const policy = this.store.policies(this.run.run_id).find(view => view.policy_id === ref.policy_id && view.version === ref.version);
+        if (!policy) throw new RuntimeFault("not_found", "Exact submitted reflex source is unavailable");
+        const value = { source: { status: "persisted", name: policy.name, version: policy.version }, validation, activation };
+        this.store.completeToolCall(this.run.run_id, outcomeKey, identity, value);
+        return value;
+      };
+      const failure = (error: unknown) => error instanceof RuntimeFault
+        ? { code: error.code, message: error.message, retryable: false }
+        : { code: "backend_unavailable", message: "Reflex submission could not be acknowledged safely; inspect exact source and policy events before making a new decision", retryable: false };
+      if (!first) {
+        const ref = persisted();
+        if (!ref) throw new RuntimeFault("conflict", "Original reflex source persistence was not acknowledged; redelivery cannot retry it");
+        return finish(ref, { status: "unknown" }, { status: "unknown", error: failure(null) });
+      }
+      let validated = false, activationAttempted = false;
+      try {
+        await this.reactions.register(input.spec, epoch, generation, {
+          beforeCommit: commit, signal, registration,
+        });
+        const interrupted = receipt();
+        if (interrupted !== null) return interrupted;
+        const ref = persisted();
+        if (!ref) throw new RuntimeFault("conflict", "Submitted reflex has no atomic source receipt");
+        commit();
+        await this.reactions.validate(ref, generation, signal);
+        validated = true;
+        const stopped = receipt();
+        if (stopped !== null) return stopped;
+        commit();
+        activationAttempted = true;
+        const selected = await this.reactions.activate({ ...ref, mode: "trial",
+          max_ms: input.max_ms, max_actions: input.max_actions, max_evaluations: input.max_evaluations,
+          ...(input.watch ? { watch: input.watch } : {}) }, generation, signal);
+        return finish(ref, { status: "passed" }, { status: "selected", state: selected.state });
+      } catch (error) {
+        const ref = persisted();
+        if (!ref) throw error;
+        return finish(ref, { status: validated ? "passed" : "unacknowledged" }, {
+          status: activationAttempted ? "unknown" : "refused", error: failure(error),
+        });
+      }
+    }
     if (input.operation === "write") {
       const epoch = z.number().int().nonnegative().parse(this.store.bindToolCall(this.run.run_id, callId, identity, () => this.run.epoch));
       const policy = await this.reactions.register(input.spec, epoch, generation);

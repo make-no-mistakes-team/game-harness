@@ -213,10 +213,12 @@ export class ReactiveRuntime {
     spec: PolicySpec,
     epoch: number,
     generation: number,
+    options: { beforeCommit?: () => void; signal?: AbortSignal;
+      registration?: { call_id: string; input: Json } } = {},
   ): Promise<PolicyView> {
     const revision = this.revision;
     const identity = this.contextIdentity();
-    this.assertAuthority(generation, epoch, revision);
+    this.assertAuthority(generation, epoch, revision, options.signal);
     const parsed = policySpecSchema.safeParse(spec);
     if (!parsed.success)
       throw new RuntimeFault(
@@ -255,7 +257,7 @@ export class ReactiveRuntime {
         fingerprint: programFingerprint(hash, "jev", contract.binding.compatibility_hash, canonical.choices),
         formatted_lines: canonical.source.split("\n").length, complexity: 0, nesting: 0 };
     }
-    const run = this.assertAuthority(generation, epoch, revision);
+    const run = this.assertAuthority(generation, epoch, revision, options.signal);
     this.assertIdentity(identity);
     const registered = await this.store.registerPolicy(
       run.run_id,
@@ -263,9 +265,11 @@ export class ReactiveRuntime {
       run.turns,
       validation,
       () => {
-        this.assertAuthority(generation, epoch, revision);
+        options.beforeCommit?.();
+        this.assertAuthority(generation, epoch, revision, options.signal);
         this.assertIdentity(identity);
       },
+      options.registration,
     );
     if (canonical.backend === "javascript")
       this.canonicalSources.add(canonical.source);

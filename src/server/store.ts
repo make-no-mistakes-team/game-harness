@@ -637,15 +637,33 @@ export class Store extends StoreReadQueries {
     authoringTurn: number,
     validation: ActiveExecutableValidation,
     beforeCommit?: () => void,
+    registration?: { call_id: string; input: Json },
   ): Promise<PolicyView> {
     spec = structuredClone(spec);
     validation = structuredClone(validation);
+    if (registration) registration = structuredClone(registration);
     const hash = await this.saveSource(spec.source);
     this.assertOpen();
     beforeCommit?.();
     this.assertOpen();
     let event: ActivityEvent | undefined;
     const policy = this.db.transaction(() => {
+      if (registration) {
+        const prior = this.completedToolCall(runId, registration.call_id, registration.input);
+        if (prior !== null) {
+          const ref = prior as unknown as { policy_id: string; version: number };
+          const row = this.db.query<PolicyRow, [string, string, number]>(
+            "SELECT policy_id,run_id,version,name,hash,metadata FROM policies WHERE run_id=? AND policy_id=? AND version=?",
+          ).get(runId, ref.policy_id, ref.version);
+          if (!row) throw new Error("Pinned policy registration is unavailable");
+          return this.hydratePolicy(row);
+        }
+      }
+      const pin = (view: PolicyView) => {
+        if (registration) this.completeToolCall(runId, registration.call_id, registration.input,
+          { policy_id: view.policy_id, version: view.version });
+        return view;
+      };
       const previous = this.db
         .query<PolicyRow, [string, string]>(
           "SELECT policy_id,run_id,version,name,hash,metadata FROM policies WHERE run_id=? AND name=? ORDER BY version DESC LIMIT 1",
@@ -661,7 +679,7 @@ export class Store extends StoreReadQueries {
           previousView.interval_ms === spec.interval_ms &&
           previousView.validation?.fingerprint === validation.fingerprint
         )
-          return previousView;
+          return pin(previousView);
       }
       const view: PolicyView = {
         policy_id: previous?.policy_id ?? randomUUID(),
@@ -706,7 +724,7 @@ export class Store extends StoreReadQueries {
           card: view.card as unknown as Json,
         },
       );
-      return view;
+      return pin(view);
     })();
     if (event) this.notify(event);
     return policy;

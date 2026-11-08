@@ -212,7 +212,7 @@ export class RuntimeTools {
         return { status: "stopping", verification: "unverified" };
       }),
       tool("prepare_next", "Stage one existing named program for the current restricted planning flight. Optional guard_source binds only observation,args; omission adds no gameplay condition or effect authority.", prepareNextSchema, (input, callId) => operations.prepare(input, callId)),
-      tool("reflex", "Author local JavaScript reactions that can remain armed across cloud waits and program boundaries: write, inspect, effect-free validate, explicitly activate bounded watch/trial or qualified keep, retire. No policy or response is supplied automatically. Read help reflex for context/state and budgets. Jev requires separately configured provider access.", reflexSchema, (input, callId, signal) => operations.reflex(input, callId, generation, signal)),
+      tool("reflex", "Submit your authored reaction in one call: operation:'submit' persists the exact source, validates in isolation and explicitly arms a finite trial/watch. Separate write/inspect/validate/activate/retire remain available; keep requires real trial evidence. No policy or response is supplied automatically. Read help reflex for context/state and budgets. Jev requires separately configured provider access.", reflexSchema, (input, callId, signal, commit) => operations.reflex(input, callId, generation, commit, signal)),
       tool("memory", "Inspect, freshly load, or explicitly qualify compatible named exact experience snapshots using real bounded evidence.", memorySchema, (input, callId, _signal, commit) => operations.memory(input, callId, commit)),
     ].filter((entry) => toolCatalogAllows(role(), entry.name, this.modules));
   }

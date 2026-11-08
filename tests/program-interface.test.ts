@@ -86,6 +86,7 @@ function fixture(runner?: SandboxService["runSkill"], hooks: { cancelActions?: S
       frame: async audio_cursor => minecraftControllerFrameSchema.parse(await handle({
         kind: "adapter", capability_id: "minecraft.controller_frame", version: 2, args: { audio_cursor } })),
       call: async (skill, args) => skillResultSchema.parse(await handle({ kind: "call", skill, args })),
+      attention: async attention => { await handle({ kind: "attention", attention }); },
       progress: async (summary, details) => await handle({ kind: "progress", summary, details }) as null };
     const execute = new Function("game", "args", `return (async () => {${body}\n})();`);
     return skillResultSchema.parse(await execute(game, input));

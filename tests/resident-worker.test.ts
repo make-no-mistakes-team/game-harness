@@ -11,6 +11,8 @@ import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
 import { validateProgramSource } from "../src/server/program-validation.ts";
 import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 import type { TemporalTurnOptions, TemporalTurnResult, TemporalTurnState } from "../src/shared/temporal-turn.ts";
+import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
+import type { SkillCapabilityRequest } from "../src/shared/programs.ts";
 
 // This exercises the shipped supervisor and untrusted module thread, not Docker
 // isolation. The parent's Docker/profile proof remains a separate requirement.
@@ -443,6 +445,61 @@ async function hostResidentProtocol(frames: unknown[], result: boolean, stepDela
   } };
 }
 const evaluationFrame = { v: 2, type: "guardian_analysis_evaluated", id: 1, entry: "analyze", elapsed_ms: 7, outcome: "result" };
+
+for (const mode of ["valid", "invalid", "budget"] as const)
+test(`host skill transport ${mode} attention uses the shipped worker and existing capability admission`, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "skill-attention-guardian-"));
+  const guardian = join(directory, "guardian.mjs");
+  // Replace the Docker/cgroup guardian only. DockerSkillWorker still parses
+  // real authored frames, enforces budgets, replies and joins actual cleanup.
+  writeFileSync(guardian, `
+import { createInterface } from "node:readline";
+import { Worker } from "node:worker_threads";
+const send=value=>process.stdout.write(value+"\\n");
+let worker=null,closing=false;
+const lines=createInterface({input:process.stdin});
+send(JSON.stringify({v:1,type:"ready",id:0}));
+lines.on("line",line=>{
+  const frame=JSON.parse(line);
+  if(frame.type==="skill_init") {
+    worker=new Worker(${JSON.stringify(new URL("../sandbox/worker.mjs", import.meta.url).pathname)},{
+      workerData:{mode:"skill",source:frame.source,source_hash:frame.source_hash,args:frame.args,
+        api:frame.api,instrumentation:frame.instrumentation},stdout:true,stderr:true
+    });
+    worker.on("message",send);
+    worker.on("error",()=>{if(!closing)process.exit(1)});
+  } else worker.postMessage(frame);
+});
+lines.on("close",async()=>{closing=true;if(worker)await worker.terminate();process.exit(0)});
+`);
+  const sandbox = new SandboxService(directory), adapter = minecraftTestAdapter();
+  Object.assign(sandbox, { state: { status: "ready", image: "controlled-guardian", error: null },
+    runner: new URL("../sandbox/worker.mjs", import.meta.url).pathname, guardian });
+  const admitted: SkillCapabilityRequest[] = [];
+  let budgetFailures = 0;
+  const source = `const value=await game.attention({urgency:${JSON.stringify(mode === "invalid" ? "immediate" : "ordinary")},
+summary:"Explicit cognition request",details:{marker:"host-transport"}});
+if(value!==undefined)throw new Error("Expected void");
+await game.action({kind:"look",yaw:0,pitch:0});
+return {status:"completed",summary:"Continued foreground after attention",result:null};`;
+  try {
+    const result = sandbox.runSkill(source, null, async request => {
+      admitted.push(request);
+      return request.kind === "action" ? { status: "succeeded", summary: "Neutral fixture action", evidence: null } : null;
+    }, { ...DEFAULT_SKILL_LIMITS, max_calls: mode === "budget" ? 1 : 2 }, new AbortController().signal, {
+      api: { api_version: 5, action_enabled: true, supports_respawn: false, bindings: [] },
+      onCapabilityBudgetExceeded: () => { budgetFailures++; return new Error("Existing transport budget exhausted"); },
+    });
+    if (mode === "valid") {
+      expect(await result).toMatchObject({ status: "completed", summary: "Continued foreground after attention" });
+      expect(admitted.map(request => request.kind)).toEqual(["attention", "action"]);
+    } else {
+      await expect(result).rejects.toThrow(mode === "budget" ? "Existing transport budget exhausted" : "invalid or oversized protocol frame");
+      expect(admitted.map(request => request.kind)).toEqual(mode === "budget" ? ["attention"] : []);
+    }
+    expect(budgetFailures).toBe(mode === "budget" ? 1 : 0);
+  } finally { await sandbox.close(); rmSync(directory, { recursive: true, force: true }); }
+}, 10000);
 
 test("host step response delay is not charged to the independent isolated computation budget", async () => {
   const f = await hostResidentProtocol([], true, 60);

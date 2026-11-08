@@ -6,7 +6,7 @@ import type {
   StrategyCard,
 } from "./contracts.ts";
 import type { LookaheadConfig } from "./planning.ts";
-import type { ResidentLimits, ResidentSnapshot } from "./resident.ts";
+import type { ControllerEvent, ResidentLimits, ResidentSnapshot } from "./resident.ts";
 
 export type ProgramEntry = "run" | "step" | "analyze";
 
@@ -99,6 +99,8 @@ export interface ProgramOutputFailure {
   completed_capability_calls: number;
 }
 
+export type ProgramAttention = Omit<ControllerEvent, "kind">;
+
 /** Host-bound API supplied to skill bodies; await one call at a time. */
 export interface GameAPI {
   observe(): Promise<ObservationV3>;
@@ -109,6 +111,8 @@ export interface GameAPI {
   respawn(): Promise<GameActionResult>;
   call(skill: NamedProgramRef, args: Json): Promise<SkillResult>;
   progress(summary: string, details: Json): Promise<null>;
+  /** Requests cognition without stopping the foreground program or adding effect authority. */
+  attention(request: ProgramAttention): Promise<void>;
 }
 
 interface SkillStartBase extends SkillRef {
@@ -185,4 +189,5 @@ export type SkillCapabilityRequest =
   | { kind: "action"; action: GameAction }
   | { kind: "adapter"; capability_id: string; version: number; args: Json }
   | { kind: "call"; skill: NamedProgramRef; args: Json }
-  | { kind: "progress"; summary: string; details: Json };
+  | { kind: "progress"; summary: string; details: Json }
+  | { kind: "attention"; attention: ProgramAttention };

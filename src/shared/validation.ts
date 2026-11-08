@@ -6,7 +6,7 @@ import type { LookaheadConfig, LookaheadRequest } from "./planning.ts";
 import { identitySchema, safeCounterSchema, screenRefSchema, sha256Schema, spaceRefSchema } from "./control.ts";
 import { gameActionResultSchema, jsonSchema, lifeIdSchema, playerLifeSchema, sessionIdSchema } from "./primitives.ts";
 import { observationV3Schema } from "./observations.ts";
-import { residentIntentSchema, residentLimitsSchema, residentStateSchema } from "./resident.ts";
+import { controllerEventSchema, residentIntentSchema, residentLimitsSchema, residentStateSchema } from "./resident.ts";
 const utf8 = new TextEncoder();
 export { jsonSchema, lifeIdSchema, playerLifeSchema, sessionIdSchema } from "./primitives.ts";
 
@@ -48,6 +48,7 @@ export const skillStartRequestSchema = z.discriminatedUnion("entry", [
 ]) satisfies z.ZodType<SkillStartRequest>;
 export const skillResultSchema = z.object({ status: z.enum(["completed", "blocked", "failed"]),
   summary: z.string().min(1).max(2000), result: jsonSchema }).strict() satisfies z.ZodType<SkillResult>;
+const programAttentionSchema = controllerEventSchema.omit({ kind: true });
 export const skillCapabilitySchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("observe") }).strict(),
   z.object({ kind: z.literal("respawn") }).strict(),
@@ -55,6 +56,7 @@ export const skillCapabilitySchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("adapter"), capability_id: identitySchema, version: safeCounterSchema.min(1), args: jsonSchema }).strict(),
   z.object({ kind: z.literal("call"), skill: namedProgramRefSchema, args: jsonSchema }).strict(),
   z.object({ kind: z.literal("progress"), summary: z.string().min(1).max(1000), details: jsonSchema }).strict(),
+  z.object({ kind: z.literal("attention"), attention: programAttentionSchema }).strict(),
 ]) satisfies z.ZodType<SkillCapabilityRequest>;
 
 export const policyDecisionSchema = z.discriminatedUnion("kind", [
@@ -92,6 +94,9 @@ export function getGameAPIReference(adapter: RuntimeAdapter) {
     call: { parameters: [{ name: "skill", type: "NamedProgramRef" }, { name: "args", type: "Json" }], result: "SkillResult",
       contract: "game.call({name,version?},args) invokes only an already authored program captured in this parent's declared dependencies. The host pins exact versions at write/submit; omitted version requires an unambiguous captured name. It does not invoke native game bindings." },
     progress: { parameters: [{ name: "summary", type: "string" }, { name: "details", type: "Json" }], result: "null" },
+    attention: { invocation: "await game.attention({urgency:'ordinary'|'urgent',summary,details})",
+      parameters: [{ name: "request", type: "ProgramAttention" }], result: "void",
+      contract: "Requests cognition while foreground work continues; urgent attention may revoke inactive authoring, not the actor. Charges existing shared root max_calls. No effects, playing authority, retries or extra budgets. Exact fields/limits: schemas.ProgramAttention." },
   };
   if (adapter.action_capability) {
     methods.action = { parameters: [{ name: "action", type: "AdapterAction" }], result: "GameActionResult" };
@@ -112,7 +117,8 @@ export function getGameAPIReference(adapter: RuntimeAdapter) {
     progress: "Program-authored progress is intent, not objective completion evidence.",
     schemas: { ObservationV3: adapter.schemas.observation, AdapterData: adapter.schemas.payload,
       capabilities: adapter.schemas.capabilities, GameActionResult: z.toJSONSchema(gameActionResultSchema),
-      NamedProgramRef: z.toJSONSchema(namedProgramRefSchema), SkillResult: z.toJSONSchema(skillResultSchema), Json: z.toJSONSchema(jsonSchema) },
+      NamedProgramRef: z.toJSONSchema(namedProgramRefSchema), SkillResult: z.toJSONSchema(skillResultSchema),
+      ProgramAttention: z.toJSONSchema(programAttentionSchema), Json: z.toJSONSchema(jsonSchema) },
   };
   references.set(adapter, value); return value;
 }

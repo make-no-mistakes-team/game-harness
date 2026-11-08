@@ -261,7 +261,7 @@ export class Runtime {
     this.skills = new SkillManager(store, sandbox, {
       openController: (execution, generation, deadline, applied, effect, lifecycle) =>
         this.actions.reserveController(execution.execution_id, generation, deadline, applied, effect, lifecycle),
-      residentEvent: (_execution, event) => {
+      programEvent: (_execution, event) => {
         if (event.kind === "attention") this.strategic.wake("resident_attention");
       },
       residentEffect: (execution, input, event, adapter) => {

@@ -727,6 +727,11 @@ function skillCapability(value: unknown): SkillCapabilityRequest {
       if (parsed.success && parsed.data.kind === "adapter") return parsed.data;
       break;
     }
+    case "attention": {
+      const parsed = skillCapabilitySchema.safeParse(request);
+      if (parsed.success && parsed.data.kind === "attention") return parsed.data;
+      break;
+    }
     case "call": {
       const ref = namedProgramRefSchema.safeParse(request.skill);
       if (

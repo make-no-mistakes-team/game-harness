@@ -247,6 +247,233 @@ function start(
   };
 }
 
+test("generated attention preserves root attribution, child producer and shared call limits without effects", async () => {
+  const wakes: { execution_id: string; source_hash: string | null; summary: string }[] = [];
+  let effects = 0;
+  const { store, run, manager } = fixture(generatedWorker, {
+    programEvent: (execution, event) => { wakes.push({ execution_id: execution.execution_id,
+      source_hash: execution.source_hash, summary: event.summary }); },
+    action: async () => { effects++; return success; },
+  });
+  const child = await manager.register(run.run_id, { entry: "run", name: "Attention child", card, dependencies: [],
+    source: `const returned = await game.attention({urgency:"ordinary",summary:"Child needs cognition",details:{producer:"child"}});
+if(returned !== undefined) throw new Error("Attention must return void");
+await game.attention({urgency:"urgent",summary:"Must not pass root budget",details:null});
+return {status:"completed",summary:"Unreachable",result:null};` });
+  const root = await manager.register(run.run_id, { entry: "run", name: "Attention root", card,
+    dependencies: [{ skill_id: child.skill_id, version: child.version }],
+    source: 'await game.call({name:"Attention child"},null);return {status:"completed",summary:"Unreachable",result:null};' });
+  const execution = manager.start(run.run_id, start(run, root, "child-attention", null,
+    { ...DEFAULT_SKILL_LIMITS, max_calls: 2 }));
+  await closed(store, run.run_id, execution.execution_id);
+  const event = store.eventsAfter(run.run_id, 0, 1000).filter(event => event.type === "controller.event");
+  expect(event).toHaveLength(1);
+  const producer = store.allSkillExecutions(run.run_id).find(view => view.parent_execution_id === execution.execution_id)!;
+  expect(event[0]!.details).toEqual({ execution_id: execution.execution_id, source_hash: root.hash, entry: "run",
+    producer_execution_id: producer.execution_id, producer_source_hash: child.hash, author: "model",
+    event: { kind: "attention", urgency: "ordinary", summary: "Child needs cognition", details: { producer: "child" } },
+    gameplay_success_proof: false });
+  expect(wakes).toEqual([{ execution_id: execution.execution_id, source_hash: root.hash, summary: "Child needs cognition" }]);
+  expect(effects).toBe(0);
+  expect(manager.get(run.run_id, { execution_id: execution.execution_id })).toMatchObject({
+    status: "failed", calls: 2, actions: 0, diagnostic: { code: "budget_exceeded" } });
+  expect(producer.calls).toBe(1);
+});
+
+test("generated attention rejects invalid events without wake, effects or admitted calls", async () => {
+  let wakes = 0, effects = 0;
+  const { store, run, manager } = fixture(generatedWorker, {
+    programEvent: () => { wakes++; }, action: async () => { effects++; return success; },
+  });
+  const skill = await manager.register(run.run_id, { entry: "run", name: "Invalid attention", card, dependencies: [],
+    source: `const invalid = [
+{urgency:"immediate",summary:"Invalid urgency",details:null},
+{urgency:"ordinary",summary:"",details:null},
+{urgency:"ordinary",summary:"s".repeat(1001),details:null},
+{kind:"progress",urgency:"ordinary",summary:"Cannot select another event kind",details:null},
+{urgency:"urgent",summary:"Missing details"},
+{urgency:"urgent",summary:"Unexpected fields",details:null,extra:true}
+];
+let rejected=0;
+for(const request of invalid) {
+  try { await game.attention(request); } catch { rejected++; }
+}
+return {status:"completed",summary:"Invalid attention handled",result:{rejected}};` });
+  const execution = manager.start(run.run_id, start(run, skill, "invalid-attention"));
+  await closed(store, run.run_id, execution.execution_id);
+  expect(manager.get(run.run_id, { execution_id: execution.execution_id })).toMatchObject({
+    status: "succeeded", calls: 0, actions: 0, result: { result: { rejected: 6 } } });
+  expect(store.eventsAfter(run.run_id, 0, 1000).filter(event => event.type === "controller.event")).toEqual([]);
+  expect({ wakes, effects }).toEqual({ wakes: 0, effects: 0 });
+});
+
+for (const fence of ["scope", "budget_observer", "unknown", "terminal"] as const)
+test(`${fence} authority cannot publish late program attention or wake cognition`, async () => {
+  let wakes = 0, late: Parameters<Runner>[2] | undefined;
+  const { store, run, manager } = fixture(async (_source, _args, handle) => {
+    late = handle;
+    if (fence === "terminal") return completed;
+    if (fence === "scope") run.status = "paused";
+    if (fence === "unknown") {
+      try { await handle({ kind: "action", action: { kind: "look", yaw: 0, pitch: 0 } }); } catch {}
+    }
+    await expect(handle({ kind: "attention", attention: { urgency: "urgent", summary: "No late wake", details: null } })).rejects.toThrow();
+    return completed;
+  }, {
+    programEvent: () => { wakes++; },
+    action: async () => ({ status: "unknown", summary: "Uncertain fixture effect", evidence: null, requires_reconnect: true }),
+  });
+  const skill = await register(manager, run.run_id, `Revoked attention ${fence}`);
+  const off = store.subscribe(event => {
+    if (fence === "budget_observer" && event.type === "skill.budget") manager.fence("Synchronous admission observer revoked root");
+  });
+  try {
+    const execution = manager.start(run.run_id, start(run, skill, `revoked-attention-${fence}`));
+    await closed(store, run.run_id, execution.execution_id);
+    if (fence === "terminal")
+      await expect(late!({ kind: "attention", attention: { urgency: "urgent", summary: "Terminal late wake", details: null } })).rejects.toThrow();
+    expect(wakes).toBe(0);
+    expect(store.eventsAfter(run.run_id, 0, 1000).filter(event => event.type === "controller.event")).toEqual([]);
+  } finally { off(); }
+});
+
+for (const urgency of ["ordinary", "urgent"] as const)
+test(`real Runtime and installed SDK consume ${urgency} async attention while the generated foreground keeps running`, async () => {
+  const directory = mkdtempSync(join(tmpdir(), "gameharness-sdk-run-attention-"));
+  const store = new Store(directory), observation = authorizedObservation();
+  const authoringEntered = deferred<void>(), releaseAuthoring = deferred<void>(), releaseForeground = deferred<void>(),
+    foregroundContinued = deferred<void>(), foregroundHeld = deferred<void>(), decisionFinished = deferred<void>(), attentionPublished = deferred<void>();
+  let reads = 0, effects = 0, requests = 0, cancellations = 0, heldSignal: AbortSignal | undefined;
+  const projections: Record<string, any>[] = [];
+  const game: GameBridge = {
+    connect: async () => {}, disconnect: async () => {}, neutralize: async () => {}, emergencyStop: async () => {},
+    cancel: async () => {}, adapter: () => adapter, subscribe: () => () => {},
+    snapshot: () => ({ status: "connected", username: "Fixture", version: "1.21.4",
+      world_id: observation.world_id, epoch: observation.epoch, session_id: observation.session_id,
+      life: observation.life, space: observation.space, screen: null, binding: minecraftTestBinding(adapter),
+      presentation: adapter.projectObservation(observation), last_observation_at: null, error: null,
+      video: { status: "streaming", width: 1, height: 1, fps: 30, frames: 1, last_frame_at: null, error: null } }),
+    observe: async () => {
+      reads++;
+      // Runtime performs its own observations too; the program's explicit
+      // adapter read below supplies the deterministic foreground barrier.
+      return observation;
+    },
+    execute: async () => { effects++; foregroundContinued.resolve(); return success; },
+    queryCapability: async () => {
+      if (effects === 0) await authoringEntered.promise;
+      else { foregroundHeld.resolve(); await releaseForeground.promise; }
+      return [];
+    },
+  };
+  const descriptor = getBundledModels("openai-codex").find(model => model.api === "openai-codex-responses");
+  if (!descriptor) throw new Error("Offline SDK fixture requires the installed Codex descriptor");
+  const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
+  const source = `await game.recipes("oak_planks");
+const returned=await game.attention({urgency:"${urgency}",summary:"Async body requests a decision",details:{marker:"run-attention"}});
+if(returned!==undefined) throw new Error("Attention must return void");
+await game.action({kind:"look",yaw:0,pitch:0});
+await game.recipes("oak_planks");
+return {status:"completed",summary:"Foreground settled after attention",result:null};`;
+  const streamFn: StreamFn = async (_model, context, options) => {
+    const index = requests++;
+    const user = context.messages.find(message => message.role === "user");
+    if (user?.role === "user") {
+      const text = typeof user.content === "string" ? user.content :
+        user.content.filter(part => part.type === "text").map(part => part.text).join("");
+      projections.push(JSON.parse(text));
+    }
+    const call: ToolCall | undefined = index === 0
+      ? { type: "toolCall", id: "attention-submit", name: "program_submit",
+        arguments: { name: "Async attention foreground", source, args: null,
+          limits: { duration_ms: 10000, max_calls: 8, max_actions: 1 } } }
+      : index === 1 ? { type: "toolCall", id: "obsolete-authoring-write", name: "program_write",
+        arguments: { name: "Late inactive draft", source: 'return {status:"completed",summary:"Draft only",result:null};' } } : undefined;
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: call ? "toolUse" : "stop", content: call ? [call] : [],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      yield { type: "start", partial: message };
+      if (index === 1) {
+        heldSignal = options?.signal;
+        const cancelled = deferred<void>();
+        const onAbort = () => { cancellations++; cancelled.resolve(); };
+        heldSignal?.addEventListener("abort", onAbort, { once: true });
+        authoringEntered.resolve();
+        try { await Promise.race([releaseAuthoring.promise, cancelled.promise]); }
+        finally { heldSignal?.removeEventListener("abort", onAbort); }
+      }
+      stream.end(message);
+      yield { type: "done", reason: call ? "toolUse" : "stop", message };
+    };
+    return stream;
+  };
+  let agent: Agent | undefined;
+  const auth = {
+    snapshot: () => ({ status: "ready", authenticated: true, provider: "openai-codex", account_label: null,
+      models: [{ id: model.id, name: "Offline fixture", provider: model.provider, context_window: null }], login: null, error: null }),
+    createAgent: async (configuration: { tools: AgentTool[]; systemPrompt: string[] }) => {
+      agent = new Agent({ initialState: { model, tools: configuration.tools, systemPrompt: configuration.systemPrompt },
+        streamFn, getApiKey: () => "OFFLINE_FIXTURE_NO_PROVIDER" });
+      return agent;
+    },
+    releaseAgent: async () => { agent?.abort(); await agent?.waitForIdle(); },
+  } as unknown as AuthManager;
+  const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }), runSkill: generatedWorker } as unknown as SandboxService;
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  const failures = deferred<never>();
+  void failures.promise.catch(() => {});
+  const off = store.subscribe(event => {
+    if (event.type === "controller.event") attentionPublished.resolve();
+    if (event.type === "scheduler.turn_finished" && projections.some(projection =>
+      projection.reason?.includes("resident_attention"))) decisionFinished.resolve();
+    if (event.type === "scheduler.turn_failed" || event.type === "skill.closed")
+      failures.reject(new Error(`Attention fixture ended early: ${event.type}: ${event.summary}`));
+  });
+  try {
+    await runtime.initialize();
+    const run = await runtime.createRun({ task: "Evaluator-authored zero-provider async attention fixture",
+      goal: adapter.goals.find(goal => goal.goal_id === "custom")!, model_id: model.id, working_programs: "fresh" });
+    await runtime.control(run.run_id, "start");
+    await Promise.race([attentionPublished.promise, failures.promise]);
+    await Promise.race([foregroundContinued.promise, failures.promise]);
+    await Promise.race([foregroundHeld.promise, failures.promise]);
+    expect(store.latestRootExecution(run.run_id)).toMatchObject({ entry: "run", status: "running", actions: 1, calls: 4 });
+    if (urgency === "ordinary") {
+      expect(heldSignal?.aborted).toBe(false);
+      expect(cancellations).toBe(0);
+      releaseAuthoring.resolve();
+    }
+    await Promise.race([decisionFinished.promise, failures.promise]);
+    const decision = projections.find(projection => projection.reason?.includes("resident_attention"))!;
+    expect(decision.pending_decision).toBe(true);
+    expect(decision.feedback).toEqual(expect.arrayContaining([expect.objectContaining({
+      type: "controller.event", summary: "Async body requests a decision", details: expect.objectContaining({
+        name: "Async attention foreground",
+        event: { kind: "attention", urgency, summary: "Async body requests a decision", details: { marker: "run-attention" } },
+      }),
+    })]));
+    expect(store.latestRootExecution(run.run_id)?.status).toBe("running");
+    expect(effects).toBe(1);
+    expect(reads).toBeGreaterThan(0);
+    if (urgency === "urgent") {
+      expect(cancellations).toBe(1);
+      expect(heldSignal?.aborted).toBe(true);
+      expect(store.namedSkill(run.run_id, "Late inactive draft")).toBeNull();
+      expect(store.eventsAfter(run.run_id, 0, 1000).find(event => event.type === "model.request_settled" &&
+        (event.details as Record<string, Json>).host_cancellation)?.details).toMatchObject({
+        role: "authoring", obsolete: true, provider_failure: false,
+        host_cancellation: { kind: "ordinary_authoring", reason: "resident_attention" },
+      });
+    }
+  } finally {
+    off(); releaseAuthoring.resolve(); releaseForeground.resolve(); authoringEntered.resolve();
+    await runtime.close(); store.close(); rmSync(directory, { recursive: true, force: true });
+  }
+}, 15000);
+
 describe("durable program execution through host capabilities", () => {
   for (const toolName of ["program_submit", "program_run"] as const) {
     for (const [form, limits, expectedActions] of [

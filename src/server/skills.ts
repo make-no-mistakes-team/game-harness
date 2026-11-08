@@ -59,7 +59,7 @@ export interface SkillHost {
   openController?(execution: SkillExecutionView, generation: number, deadlineHostMs: number,
     applied: (ack: InputAppliedAck) => void, effect: (event: ControllerEffectUpdate) => void,
     lifecycle: ResidentLifecycle): Promise<ControllerInputChannel>;
-  residentEvent?(execution: SkillExecutionView, event: import("../shared/resident.ts").ControllerEvent): void;
+  programEvent?(execution: SkillExecutionView, event: import("../shared/resident.ts").ControllerEvent): void;
   residentEffect?(execution: SkillExecutionView, input: ControllerInput, event: ControllerEffectUpdate, adapter: RuntimeAdapter): void;
 }
 interface Live {
@@ -525,7 +525,7 @@ export class SkillManager {
         event: event => {
           this.store.event(view.run_id, "controller.event", event.summary, { execution_id: view.execution_id,
             source_hash: skill.hash, author: "model", event: event as unknown as Json, gameplay_success_proof: false });
-          this.host.residentEvent?.(view, event);
+          this.host.programEvent?.(view, event);
         },
         effect: (input, event) => this.host.residentEffect?.(view, input, event, adapter),
         changed: (snapshot, done) => {
@@ -751,6 +751,28 @@ export class SkillManager {
           }, context);
           result = null;
           break;
+        case "attention": {
+          const root = live.root;
+          // Budget persistence can synchronously notify observers that revoke
+          // this tree. Recheck both producer and actual root before publication.
+          const current = () => {
+            this.authorize(live);
+            this.authorize(root);
+            if (this.live.get(live.view.execution_id) !== live || this.live.get(root.view.execution_id) !== root)
+              throw new Error("Program attention authority is no longer live");
+          };
+          current();
+          const event = { kind: "attention" as const, ...request.attention };
+          this.store.event(root.view.run_id, "controller.event", event.summary, {
+            execution_id: root.view.execution_id, source_hash: root.scope.source_hash, entry: root.view.entry,
+            ...(live !== root ? { producer_execution_id: live.view.execution_id, producer_source_hash: skill.hash } : {}),
+            author: "model", event: event as unknown as Json, gameplay_success_proof: false,
+          });
+          current();
+          this.host.programEvent?.(root.view, event);
+          result = null;
+          break;
+        }
         case "call": {
           if (live.root.view.entry !== "run") throw new Error("Only run roots can compose playing children");
           const declared = skill.dependencies.map((ref) => this.store.skill(live.view.run_id, ref))

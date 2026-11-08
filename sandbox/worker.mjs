@@ -435,6 +435,9 @@ function runSkillThread() {
     call: (skill, args) => call({ kind: "call", skill, args }),
     progress: (summary, details) =>
       call({ kind: "progress", summary, details }),
+    attention: async (attention) => {
+      await call({ kind: "attention", attention });
+    },
   });
   if (api.action_enabled) {
     methods.action = (action) => call({ kind: "action", action });

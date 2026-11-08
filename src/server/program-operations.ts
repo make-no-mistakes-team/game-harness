@@ -197,12 +197,12 @@ export class ProgramOperations {
         this.host.planning().assertOrdinaryAdmission();
         const program = this.workspace.select(input, true);
         if (program.entry !== input.entry) throw new RuntimeFault("precondition_failed", "Playing entry does not match the selected immutable source");
-        const predecessor = input.handoff ? this.workspace.execution("current") : null;
+        const predecessor = input.handoff ? this.store.latestRootExecution(this.run.run_id) : null;
         const reference = predecessor ? this.workspace.executionReference(predecessor.execution_id) : null;
-        if (input.handoff && (!predecessor || !["accepted", "running"].includes(predecessor.status) ||
+        if (input.handoff && (!predecessor || !["accepted", "running", "succeeded"].includes(predecessor.status) ||
             !reference || reference.name !== input.handoff.name || reference.version !== input.handoff.version ||
             reference.execution_ordinal !== input.handoff.execution_ordinal))
-          throw new RuntimeFault("precondition_failed", "Handoff must name the exact current live predecessor");
+          throw new RuntimeFault("precondition_failed", "Handoff must name the exact latest live or successfully completed predecessor");
         first = true;
         return { entry: input.entry, skill_id: program.skill_id, version: program.version, start_key: startKey,
           epoch: this.run.epoch, session_id: this.run.session_id!, life_id: this.run.life_id!,

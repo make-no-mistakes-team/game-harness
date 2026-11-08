@@ -94,9 +94,9 @@ A new `name` creates a family and omits `based_on`. An existing name requires `b
 
 Source registration and its exact-version receipt share one Store transaction. Submission phase identities retain the original source and execution across duplicate delivery or lost acknowledgements; replay never selects a newer catalog revision. An interrupted submission cannot automatically start on redelivery. Stop/Pause, task, owner, generation and negotiated scope are rechecked between persistence and admission. Successful admission retains the scheduler's pending-work behavior instead of requiring a separate run-only model request.
 
-For an intentional live replacement, `program_submit` and `program_run`
+For an intentional continuation or replacement, `program_submit` and `program_run`
 start accept optional `handoff:{name,version,execution_ordinal}` for the exact
-current predecessor. Source authoring and validation leave that work running.
+latest predecessor. Source authoring and validation leave live work running.
 Only after successor source, entry and limits pass preflight does the host
 revoke the pinned predecessor, join actual worker/native retirement, and admit
 the exact successor without another model request between Stop and Start.
@@ -105,8 +105,11 @@ replacement permission. Omission does not replace existing work.
 
 Authorized observations bracket retirement. Task/generation/life/boot/space
 or screen changes, deliberate Stop, newer work and unconfirmed cleanup block
-successor admission. An already ended or mismatched predecessor is refused
-before cancellation. Interrupted delivery cannot dispatch again; a duplicate
+successor admission. If that exact latest predecessor naturally succeeded while
+source was being authored, confirmed same-scope retirement also permits the new
+start without replaying or rewriting the completed execution. Blocked, failed,
+cancelled, unknown, mismatched or superseded predecessors are refused.
+Interrupted delivery cannot dispatch again; a duplicate
 acknowledged call returns its original selection without cancelling the
 successor. Each root keeps ordinary limits, and the run deadline is unchanged.
 Handoff supplies no behavior, state migration, fallback or replay of old effects.

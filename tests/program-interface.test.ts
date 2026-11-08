@@ -790,16 +790,20 @@ for (const toolName of ["program_submit", "program_run"] as const) {
   });
 }
 
-for (const boundary of ["newer_root", "stop_after_drain"] as const) {
-  test(`handoff cannot replace ${boundary} while its fresh post-retirement observation is pending`, async () => {
+for (const initial of ["live", "completed"] as const) for (const boundary of ["newer_root", "stop_after_drain"] as const) {
+  test(`handoff from ${initial} predecessor cannot replace ${boundary} during post-retirement observation`, async () => {
     const entered = Promise.withResolvers<void>(), observing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-    const f = fixture(async (_body, _args, _handle, _limits, signal) => {
-      entered.resolve(); await aborted(signal); return { status: "completed", summary: "Closed", result: null };
+    const f = fixture(async (_body, args, _handle, _limits, signal) => {
+      entered.resolve();
+      if (initial !== "completed" || args !== "old") await aborted(signal);
+      return { status: "completed", summary: "Closed", result: null };
     });
     resources.unshift(async () => { release.resolve(); });
     await f.write("observation predecessor");
-    const old = data(await f.call("program_run", { operation: "start", name: "observation predecessor", args: null }));
+    const old = data(await f.call("program_run", { operation: "start", name: "observation predecessor", args: "old" }));
     await entered.promise;
+    if (initial === "completed")
+      await waitClosed(f.store, f.run.run_id, f.store.latestRootExecution(f.run.run_id)!.execution_id);
     let observations = 0;
     f.toolHost.observe = async () => {
       if (++observations === 2) { observing.resolve(); await release.promise; }
@@ -826,18 +830,116 @@ for (const boundary of ["newer_root", "stop_after_drain"] as const) {
   });
 }
 
-test("a predecessor settled before initial handoff selection is refused without implicit retry", async () => {
+for (const toolName of ["program_submit", "program_run"] as const) test(`${toolName} hands off a successfully completed latest predecessor without replay`, async () => {
   const f = fixture();
   await f.write("already finished");
   const old = data(await f.call("program_run", { operation: "start", name: "already finished", args: null }));
-  await waitClosed(f.store, f.run.run_id, f.store.latestRootExecution(f.run.run_id)!.execution_id);
-  expect(data(await f.call("program_submit", { name: "too late successor", source, args: null,
-    handoff: { name: old.name, version: old.version, execution_ordinal: old.execution_ordinal } }))).toMatchObject({
-    source: { status: "persisted", name: "too late successor", version: 1 },
-    start: { status: "refused", error: { code: "precondition_failed" } },
+  const predecessor = f.store.latestRootExecution(f.run.run_id)!;
+  await waitClosed(f.store, f.run.run_id, predecessor.execution_id);
+  const closed = f.store.skillExecution(f.run.run_id, { execution_id: predecessor.execution_id })!;
+  if (toolName === "program_run") await f.write("authored continuation");
+  const handoff = { name: old.name, version: old.version, execution_ordinal: old.execution_ordinal };
+  const input = { ...(toolName === "program_run" ? { operation: "start" } : { source }),
+    name: "authored continuation", args: null, handoff };
+  const result = data(await f.call(toolName, input, "completed-handoff"));
+  expect(toolName === "program_submit" ? result.start.status : result.name).toBe(
+    toolName === "program_submit" ? "started" : "authored continuation");
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: predecessor.execution_id })).toMatchObject({
+    status: "succeeded", ended_at: closed.ended_at, actions: closed.actions, calls: closed.calls,
   });
-  expect(f.dispatches()).toBe(1);
+  expect(f.dispatches()).toBe(2);
+  const duplicate = data(await f.call(toolName, input, "completed-handoff"));
+  const originalSelection = toolName === "program_submit" ? result.start.execution : result;
+  const duplicateSelection = toolName === "program_submit" ? duplicate.start.execution : duplicate;
+  expect(duplicateSelection).toMatchObject({
+    name: originalSelection.name, version: originalSelection.version,
+    execution_ordinal: originalSelection.execution_ordinal,
+  });
+  const successor = f.store.latestRootExecution(f.run.run_id)!;
+  await waitClosed(f.store, f.run.run_id, successor.execution_id);
+  expect(data(await f.call("program_run", { operation: "start", name: "authored continuation", args: null, handoff })).error.code)
+    .toBe("precondition_failed");
+  expect(f.dispatches()).toBe(2);
 });
+
+test("natural completion while fresh handoff observation is pending remains a confirmed retirement", async () => {
+  const entered = Promise.withResolvers<void>(), finish = Promise.withResolvers<void>();
+  const observing = Promise.withResolvers<void>(), fresh = Promise.withResolvers<void>();
+  let cancellations = 0;
+  const f = fixture(async (_body, args) => {
+    if (args === "old") { entered.resolve(); await finish.promise; }
+    return { status: "completed", summary: "Naturally completed", result: null };
+  }, { cancelActions: async () => { cancellations++; } });
+  resources.unshift(async () => { finish.resolve(); fresh.resolve(); });
+  await f.write("finishing during authoring");
+  const old = data(await f.call("program_run", { operation: "start", name: "finishing during authoring", args: "old" }));
+  const predecessor = f.store.latestRootExecution(f.run.run_id)!;
+  await entered.promise;
+  let reads = 0;
+  f.toolHost.observe = async () => {
+    if (++reads === 1) { observing.resolve(); await fresh.promise; }
+    return f.observation();
+  };
+  const pending = f.call("program_submit", { name: "next authored work", source, args: null, handoff: {
+    name: old.name, version: old.version, execution_ordinal: old.execution_ordinal,
+  } });
+  await observing.promise;
+  finish.resolve();
+  await waitClosed(f.store, f.run.run_id, predecessor.execution_id);
+  fresh.resolve();
+  expect(data(await pending)).toMatchObject({ start: { status: "started" } });
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: predecessor.execution_id })!.status).toBe("succeeded");
+  expect(cancellations).toBe(0);
+  expect(f.dispatches()).toBe(2);
+});
+
+for (const status of ["blocked", "failed", "cancelled", "unknown"] as const) {
+  test(`completed handoff never reinterprets ${status} as natural success`, async () => {
+    const f = fixture(async (_body, _args, handle) => {
+      if (status === "failed") throw new Error("Actual source failure");
+      if (status === "cancelled" || status === "unknown") {
+        f.manager.fence("Explicitly revoked source", status === "unknown" ? f.store.latestRootExecution(f.run.run_id)!.execution_id : undefined);
+        // A revoked producer must not be allowed to publish further calls.
+        await handle({ kind: "observe" });
+      }
+      return { status: "blocked", summary: "Locally blocked", result: null };
+    });
+    await f.write("non-success predecessor");
+    const old = data(await f.call("program_run", { operation: "start", name: "non-success predecessor", args: null }));
+    const predecessor = f.store.latestRootExecution(f.run.run_id)!;
+    await waitClosed(f.store, f.run.run_id, predecessor.execution_id);
+    expect(f.store.skillExecution(f.run.run_id, { execution_id: predecessor.execution_id })!.status).toBe(status);
+    const result = data(await f.call("program_submit", { name: "must not implicitly recover", source, args: null, handoff: {
+      name: old.name, version: old.version, execution_ordinal: old.execution_ordinal,
+    } }));
+    expect(result).toMatchObject({ source: { status: "persisted" }, start: { status: "refused" } });
+    expect(f.dispatches()).toBe(1);
+  });
+}
+
+for (const boundary of ["world", "session", "epoch", "life", "boot", "space", "compatibility", "generation"] as const) {
+  test(`completed predecessor handoff cannot cross ${boundary} authority`, async () => {
+    const f = fixture();
+    await f.write("completed old scope");
+    const old = data(await f.call("program_run", { operation: "start", name: "completed old scope", args: null }));
+    await waitClosed(f.store, f.run.run_id, f.store.latestRootExecution(f.run.run_id)!.execution_id);
+    await f.write("new scoped continuation");
+    if (boundary === "world") f.run.world_id = crypto.randomUUID();
+    if (boundary === "session") f.run.session_id = "new-fixture-session";
+    if (boundary === "epoch") f.run.epoch++;
+    if (boundary === "life") f.run.life_id!++;
+    if (boundary === "boot") f.run.native_boot_id = "different-native-boot";
+    if (boundary === "space") f.run.space_epoch!++;
+    if (boundary === "compatibility") f.run.compatibility_hash = "a".repeat(64);
+    if (boundary === "generation") f.fence();
+    f.store.saveRun(f.run);
+    const result = await f.call("program_run", { operation: "start", name: "new scoped continuation", args: null, handoff: {
+      name: old.name, version: old.version, execution_ordinal: old.execution_ordinal,
+    } });
+    expect(result.isError).toBe(true);
+    expect(f.dispatches()).toBe(1);
+  });
+}
 
 test("program_submit pins source and dependencies even when a newer revision appears between phases", async () => {
   const f = fixture();

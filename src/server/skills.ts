@@ -284,23 +284,45 @@ export class SkillManager {
     this.validateDependencies(runId, skill.dependencies);
     return { skill, armLookahead };
   }
-  /** Revoke synchronously; the returned guard remains required until admission. */
+  /** Retire live work or join its natural success; retain the guard until admission. */
   async retireForHandoff(runId: string, request: SkillStartRequest, predecessorId: string): Promise<() => void> {
-    this.prepareStart(runId, skillStartRequestSchema.parse(request));
+    const parsed = skillStartRequestSchema.parse(request);
+    this.prepareStart(runId, parsed);
+    const selected = this.store.skillExecution(runId, { execution_id: predecessorId });
     const live = this.live.get(predecessorId);
-    if (!live || live.root !== live || live.view.run_id !== runId || live.controller.signal.aborted ||
-        !["accepted", "running"].includes(live.view.status) ||
+    const sameScope = (view: SkillExecutionView, scope: EffectScope | SkillExecutionView = view) =>
+      view.run_id === runId && view.parent_execution_id === null &&
+      view.world_id === this.store.getRun(runId)?.world_id && scope.world_id === view.world_id &&
+      scope.epoch === parsed.epoch && scope.session_id === parsed.session_id &&
+      scope.life_id === parsed.life_id && scope.native_boot_id === parsed.native_boot_id &&
+      scope.run_generation === parsed.run_generation && scope.space_epoch === parsed.space_epoch &&
+      view.compatibility_hash === parsed.compatibility_hash;
+    const completed = (live?.view.status ?? selected?.status) === "succeeded";
+    if (!selected || !sameScope(selected, live?.scope ?? selected) ||
+        (live && (live.root !== live || live.controller.signal.aborted)) ||
+        (!completed && (!live || !["accepted", "running"].includes(live.view.status))) ||
         this.store.latestRootExecution(runId)?.execution_id !== predecessorId)
-      throw new RuntimeFault("precondition_failed", "Handoff requires the exact still-live current predecessor");
+      throw new RuntimeFault("precondition_failed", "Handoff requires the exact latest live or successfully completed predecessor in the current scope");
+    const expectedStatus = completed ? "succeeded" : "cancelled";
     const revision = this.handoffRevision;
     const assertRetired = () => {
       if (revision !== this.handoffRevision || this.store.latestRootExecution(runId)?.execution_id !== predecessorId)
         throw new RuntimeFault("stale_context", "Handoff was stopped or superseded");
-      if (this.cleanupFailures.size || live.view.status !== "cancelled" || this.live.has(predecessorId) ||
-          [...this.live.values()].some(candidate => candidate.view.run_id === runId && candidate.root === candidate))
+      const retired = this.store.skillExecution(runId, { execution_id: predecessorId });
+      if (this.cleanupFailures.size || !retired || !sameScope(retired, live?.scope ?? retired) ||
+          retired.status !== expectedStatus || !retired.ended_at || this.live.has(predecessorId) ||
+          (retired.entry === "step" && (retired.resident?.cleanup.worker !== "closed" || retired.resident.cleanup.native !== "retired")))
         throw new RuntimeFault("precondition_failed", "Predecessor retirement was not safely confirmed");
+      for (const candidate of this.live.values())
+        if (candidate.view.run_id === runId && candidate.root === candidate)
+          throw new RuntimeFault("precondition_failed", "Another foreground program owns current work");
     };
-    await this.closeTree(live, "Exact predecessor retired for authored handoff");
+    // Natural completion during cloud authoring is already a valid retirement,
+    // not permission to replay its effects or restart a cancelled/unknown root.
+    if (live) {
+      if (expectedStatus === "succeeded") await live.done;
+      else await this.closeTree(live, "Exact predecessor retired for authored handoff");
+    }
     assertRetired();
     return assertRetired;
   }

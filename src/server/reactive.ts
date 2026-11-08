@@ -791,8 +791,9 @@ export class ReactiveRuntime {
     };
   }
 
-  private identityCurrent(identity: ContextIdentity): boolean {
-    const state = this.host.gameState();
+  // Selection outlives GUI transitions; each evaluation still captures and
+  // checks its own exact screen through identityCurrent before any effect.
+  private selectionScopeCurrent(identity: ContextIdentity, state = this.host.gameState()): boolean {
     return (
       state.session_id === identity.session_id &&
       state.epoch === identity.epoch &&
@@ -800,8 +801,13 @@ export class ReactiveRuntime {
       state.life?.life_id === identity.life_id &&
       state.life.status === identity.life_status &&
       state.binding?.native_boot_id === identity.native_boot_id && state.binding.compatibility_hash === identity.compatibility_hash &&
-      state.space?.space_epoch === identity.space_epoch && sameScreen(state.screen, identity.screen)
+      state.space?.space_epoch === identity.space_epoch
     );
+  }
+
+  private identityCurrent(identity: ContextIdentity): boolean {
+    const state = this.host.gameState();
+    return this.selectionScopeCurrent(identity, state) && sameScreen(state.screen, identity.screen);
   }
 
   private assertIdentity(
@@ -1158,7 +1164,7 @@ export class ReactiveRuntime {
       slot.closure ||
       run?.status !== "running" ||
       this.host.needsReconnect() ||
-      !this.identityCurrent(slot.identity) ||
+      !this.selectionScopeCurrent(slot.identity) ||
       slot.runGeneration !== this.host.generation() ||
       this.host.gameState().life?.status !== "alive"
     )
@@ -1192,7 +1198,7 @@ export class ReactiveRuntime {
         slot.closure ||
         this.host.run()?.status !== "running" ||
         this.fenced ||
-        !this.identityCurrent(slot.identity) ||
+        !this.selectionScopeCurrent(slot.identity) ||
         slot.runGeneration !== this.host.generation() ||
         this.host.gameState().life?.status !== "alive"
       )

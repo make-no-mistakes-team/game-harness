@@ -172,6 +172,10 @@ function fixture(judge?: JevBroker) {
     setExecutor: (value: typeof execute) => { execute = value; },
     setUncertain: (value: typeof uncertain) => { uncertain = value; },
     setReconnect: (value: boolean) => { reconnect = value; },
+    setScreen: (screen: GameState["screen"]) => {
+      observation = { ...observation, screen, observation_seq: observation.observation_seq + 1 };
+      state = { ...state, screen };
+    },
     nextGeneration: () => { generation++; },
     transition: (life: ObservationV3["life"], session = sessionId) => {
       const replaced = life.life_id !== observation.life.life_id || session !== observation.session_id;
@@ -218,6 +222,55 @@ function policyDetails(f: ReturnType<typeof fixture>, type: string) {
     trial: { started_at: number | null; deadline_at: number | null; evaluations_used: number; actions_used: number };
   });
 }
+
+test("selected local watch checks through GUI transitions without renewing its original bounds", async () => {
+  const f = fixture();
+  await watch(f);
+  const before = Promise.withResolvers<void>(), opened = Promise.withResolvers<void>(), closed = Promise.withResolvers<void>();
+  let sawOpen = false;
+  f.setEvaluator(async context => {
+    if (context.observation.screen) { sawOpen = true; opened.resolve(); }
+    else if (sawOpen) closed.resolve();
+    else before.resolve();
+    return { kind: "continue" };
+  });
+  await before.promise;
+  const original = policyDetails(f, "policy.watch_started")[0]!.watch!;
+  f.setScreen({ screen_id: "fixture-inventory", incarnation: 1, revision: 0 });
+  await opened.promise;
+  f.setScreen(null);
+  await closed.promise;
+  const evaluations = policyDetails(f, "policy.evaluation_started");
+  expect(evaluations.at(-1)!.watch).toMatchObject({
+    started_at: original.started_at, deadline_at: original.deadline_at,
+    duration_ms: original.duration_ms, evaluations: original.evaluations,
+  });
+  expect(evaluations.at(-1)!.watch!.evaluations_used).toBeGreaterThan(evaluations[0]!.watch!.evaluations_used);
+  expect(evaluations.at(-1)!.phase).toBe("watch");
+  expect(f.executed).toEqual([]);
+});
+
+test("GUI changes still reject an in-flight old-screen effect and permit fresh-screen checks", async () => {
+  const f = fixture();
+  await watch(f);
+  const entered = Promise.withResolvers<void>(), release = hold<PolicyDecision>({ kind: "continue" });
+  const freshScreen = Promise.withResolvers<void>();
+  let first = true;
+  f.setEvaluator(async context => {
+    if (first) { first = false; entered.resolve(); return await release.promise; }
+    if (context.observation.screen?.screen_id === "fixture-inventory") freshScreen.resolve();
+    return { kind: "continue" };
+  });
+  await entered.promise;
+  const stale = event(f.store, "policy.stale_result");
+  f.setScreen({ screen_id: "fixture-inventory", incarnation: 1, revision: 0 });
+  release.resolve(replacement);
+  await stale;
+  await freshScreen.promise;
+  expect(f.executed).toEqual([]);
+  expect(policyDetails(f, "policy.trial_started")).toEqual([]);
+  expect(policyDetails(f, "policy.evaluation_started").at(-1)!.phase).toBe("watch");
+});
 
 test("passive watch preserves a fresh trial through neutral checks and preempts only through the exclusive barrier", async () => {
   const f = fixture();

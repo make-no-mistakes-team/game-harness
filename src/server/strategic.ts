@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentEvent, AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import type {
   ActionView,
   ActivityEvent,
@@ -20,6 +21,8 @@ import { ProviderUsageCollector } from "./provider-usage.ts";
 import type { SpeculativePlanning } from "./speculative-planning.ts";
 import { isToolAllowed, type ToolRole } from "../shared/tool-policy.ts";
 import { ProgramWorkspace } from "./program-workspace.ts";
+import { compileToolArgumentBudget, type ToolArgumentOverrun } from "./tool-argument-budget.ts";
+import { createToolArgumentKeyBudget } from "./tool-argument-key-budget.ts";
 import type { HistoryQueryOptions } from "./history-protocol.ts";
 import type { ModelObservation } from "./actor-frames.ts";
 import { StrategicContext } from "./strategic-context.ts";
@@ -131,6 +134,8 @@ interface RequestAttempt {
   role: "speculative" | "review" | "recovery" | "planning" | "authoring";
   authoring: AuthoringWindow | null;
   terminalReceived: boolean;
+  argumentBudgets?: Map<string, ReturnType<typeof compileToolArgumentBudget>>;
+  argumentRejection?: { kind: "tool_argument_budget"; request_id: string; tool: string; path: (string | number)[]; limit: number; observed: number };
   hostCancellation?: {
     kind: "ordinary_authoring";
     request_id: string;
@@ -139,7 +144,7 @@ interface RequestAttempt {
   } | {
     kind: "strategic_host";
     request_id: string;
-    reason: "fenced" | "speculative_preempted" | "turn_deadline";
+    reason: "fenced" | "speculative_preempted" | "turn_deadline" | "tool_argument_budget";
   };
 }
 
@@ -286,6 +291,7 @@ export class StrategicPlanner {
   private purpose: UsagePurpose = "planning";
   private role: RequestAttempt["role"] = "planning";
   private request: RequestAttempt | null = null;
+  private rejectedResponse: RequestAttempt | null = null;
   private readonly responseOwners = new Map<string, string>();
   private readonly admittedRequests = new Set<string>();
   private readonly streamDrains = new Map<string, { drained: Promise<void>; close(): Promise<unknown> }>();
@@ -340,6 +346,7 @@ export class StrategicPlanner {
     this.purpose = "planning";
     this.role = "planning";
     this.request = null;
+    this.rejectedResponse = null;
     this.responseOwners.clear();
     this.retainedContext.reset();
     this.contextObservation = null;
@@ -379,6 +386,10 @@ export class StrategicPlanner {
       agent.streamFn = async (model, context, options) => {
         const request = this.request;
         if (!request) throw new RuntimeFault("stale_context", "No admitted strategic request owns this stream");
+        request.argumentBudgets = new Map(context.tools?.map(tool =>
+          [tool.name, compileToolArgumentBudget(tool.parameters)]));
+        const argumentSchemas = new Map(context.tools?.map(tool => [tool.name, tool.parameters]));
+        const argumentKeyBudgets = new Map<number, ReturnType<typeof createToolArgumentKeyBudget>>();
         if (request.authoring) this.assertAuthoring(request.authoring);
         const adapter = this.host.adapter?.();
         this.retainedContext.synchronize(run, model, context, this.contextObservation, adapter);
@@ -457,7 +468,7 @@ export class StrategicPlanner {
             options?.onSseEvent?.(event, eventModel);
           } });
         const admission = this.host.requestAdmission;
-        if (admission) {
+        {
           const iterator = events[Symbol.asyncIterator]();
           const drained = Promise.withResolvers<void>();
           void drained.promise.catch(() => {});
@@ -467,9 +478,10 @@ export class StrategicPlanner {
           let closeWork: Promise<typeof finished> | undefined;
           const finish = (natural: boolean) => {
             if (reported) return;
-            admission.transportEnded(request.id, natural);
+            admission?.transportEnded(request.id, natural);
             reported = true;
             drained.resolve();
+            this.streamDrains.delete(request.id);
           };
           const closeIterator = () => {
             if (closeWork) return closeWork;
@@ -488,6 +500,7 @@ export class StrategicPlanner {
             })();
             return closeWork;
           };
+          const planner = this;
           const ownedIterator = {
             async next() {
               if (closed || closing) return finished;
@@ -500,6 +513,21 @@ export class StrategicPlanner {
                   if (!closing) finish(true);
                   return next;
                 }
+                if (next.value.type === "toolcall_delta") {
+                  const event = next.value;
+                  const call = event.partial.content[event.contentIndex];
+                  // Partial JSON parsers omit an unterminated property name.
+                  // Its raw generated prefix still consumes the advertised
+                  // strict-root key budget; nested free JSON remains opaque.
+                  if (!argumentKeyBudgets.has(event.contentIndex))
+                    argumentKeyBudgets.set(event.contentIndex, call?.type === "toolCall"
+                      ? createToolArgumentKeyBudget(argumentSchemas.get(call.name)) : null);
+                  const overrun = argumentKeyBudgets.get(event.contentIndex)?.append(event.delta);
+                  if (overrun && call?.type === "toolCall")
+                    planner.rejectToolArgumentBudget(request, call.name, overrun, run, generation, agent);
+                }
+                if (next.value.type === "toolcall_delta" || next.value.type === "toolcall_end")
+                  planner.checkToolArgumentBudget(request, next.value.partial, run, generation, agent);
                 if (!closing && (next.value.type === "done" || next.value.type === "error")) {
                   // The SDK returns on a terminal event without requesting
                   // next.done. Observe actual iterator exhaustion first.
@@ -555,6 +583,8 @@ export class StrategicPlanner {
         }
         if (this.providerFailed || this.providerAborted)
           return stop("The previous provider response failed; no continuation is authorized");
+        if (this.rejectedResponse)
+          return stop("The interrupted response exceeded its advertised tool argument budget");
         const review = run.status === "reviewing";
         // Admission may arm a window inside program_submit/run. Only the next
         // SDK request boundary changes phase, after that tool group returned.
@@ -634,9 +664,9 @@ export class StrategicPlanner {
         preserveRuntimeToolArguments(context);
         const window = this.request?.authoring;
         const obsoleteAuthoring = Boolean(window && (this.reconcileAuthoring() !== window || window.closed));
-        if (!obsoleteAuthoring && context.assistantMessage?.stopDetails?.type === RECOVERED_PROVIDER_FAILURE)
+        if (!this.rejectedResponse && !obsoleteAuthoring && context.assistantMessage?.stopDetails?.type === RECOVERED_PROVIDER_FAILURE)
           this.providerFailed = true;
-        if (signal?.aborted || !this.current(run, generation) || obsoleteAuthoring || this.authoringEnded || this.providerFailed || this.providerAborted ||
+        if (this.rejectedResponse || signal?.aborted || !this.current(run, generation) || obsoleteAuthoring || this.authoringEnded || this.providerFailed || this.providerAborted ||
           context.assistantMessage && !["stop", "toolUse"].includes(context.assistantMessage.stopReason))
           return {
             block: true,
@@ -833,6 +863,49 @@ export class StrategicPlanner {
       else if (intent.kind === "strategic_host" && !request.authoring)
         request.hostCancellation = { kind: "strategic_host", request_id: request.id, reason: intent.reason };
     }
+    agent.abort();
+  }
+
+  private checkToolArgumentBudget(
+    request: RequestAttempt, message: AssistantMessage, run: StoredRun, generation: number, agent = this.agent,
+  ): void {
+    for (const call of message.content) {
+      if (call.type !== "toolCall") continue;
+      const overrun: ToolArgumentOverrun | null = request.argumentBudgets?.get(call.name)?.(call.arguments) ?? null;
+      if (overrun) {
+        this.rejectToolArgumentBudget(request, call.name, overrun, run, generation, agent);
+        return;
+      }
+    }
+  }
+
+  private rejectToolArgumentBudget(
+    request: RequestAttempt, tool: string, overrun: ToolArgumentOverrun,
+    run: StoredRun, generation: number, agent = this.agent,
+  ): void {
+    if (this.request !== request || request.terminalReceived || request.hostCancellation ||
+        this.turnAbortRequested || this.rejectedResponse || !agent || !this.current(run, generation)) return;
+    if (request.authoring && (this.reconcileAuthoring() !== request.authoring || request.authoring.closed)) return;
+    if (this.authoringEnded || request.planId &&
+        this.host.speculation?.().projection()?.planning_active !== true) return;
+    // This is an admitted string-prefix resource limit, not a prediction
+    // about final JSON validity (a later duplicate key could overwrite it).
+    // Latch this exact response before abort can deliver a terminal callback.
+    request.argumentRejection = {
+      kind: "tool_argument_budget",
+      request_id: request.id,
+      tool: tool.slice(0, 120),
+      path: overrun.path.slice(0, 16).map(part => typeof part === "string" ? part.slice(0, 80) : part),
+      limit: overrun.limit,
+      observed: overrun.observed,
+    };
+    request.hostCancellation = { kind: "strategic_host", request_id: request.id, reason: "tool_argument_budget" };
+    this.rejectedResponse = request;
+    this.eligibleTools.clear();
+    this.store.event(run.run_id, "model.response_budget_exceeded",
+      "Host rejected the entire response because a generated string prefix exceeded its advertised tool argument resource bound",
+      { ...request.argumentRejection });
+    this.host.persist();
     agent.abort();
   }
 
@@ -1161,6 +1234,7 @@ export class StrategicPlanner {
     this.providerAborted = false;
     this.gateReason = null;
     this.request = null;
+    this.rejectedResponse = null;
     this.turnDeadline = speculative
         ? Date.now() + (this.host.speculation?.().remainingMs() ?? 0)
         : Date.now() + (review ? 30_000 : TURN_MS);
@@ -1313,8 +1387,7 @@ export class StrategicPlanner {
           });
         }
         prompting = true;
-        await agent.prompt(
-          JSON.stringify({
+        const prompt = {
             reason: reasons,
             attention,
             phase: run.status,
@@ -1372,8 +1445,40 @@ export class StrategicPlanner {
                   ? "Resolve this explicit attention/outcome/recovery signal within the ordinary bounded decision turn. Inspect current state or mechanics as needed, then choose the necessary current-root intent update, code change or stop. Decision authority survives intermediate reads and inactive writes, then ends at the next request after a root/intent change or predecessor retirement. It does not renew the root deadline or inactive-authoring allowance. Keep useful local control running; no polling or duplicate foreground work."
                   : "The foreground program continues unchanged. Use only observe, help, program_inspect and pure program_write to prepare immutable inactive source within the remaining root-bound authoring allowance. No starts, activation, effects, polling or keepalive; repeated wakes do not renew the window."
                 : "Advance the task with an autonomous local taskflow using current evidence. Keep short input intervals, fresh target selection and ordinary recovery inside your code. For ongoing world control use a resident step (help controller); keep useful control running through cloud decisions. Return blocked only when the local algorithm genuinely cannot continue, not merely because an input interval finished. Choose survival and combat responses yourself. No human continuation is needed.",
-          }), selected.images,
-        );
+          };
+        for (;;) {
+          try {
+            await agent.prompt(JSON.stringify(prompt), selected.images);
+          } catch (error) {
+            if (!this.rejectedResponse) throw error;
+          }
+          const rejected = this.rejectedResponse as RequestAttempt | null;
+          if (!rejected) break;
+          // Join the interrupted transport before giving the same serialized
+          // turn a fresh request owner. No allowance or deadline is renewed.
+          await agent.waitForIdle();
+          const owned = this.streamDrains.get(rejected.id);
+          if (owned) await Promise.all([owned.close(), owned.drained]);
+          this.finishUnsettledRequest(run);
+          if (!this.current(run, generation) || run.status !== phase || this.fenceRevision !== fenceRevision ||
+              this.turnAbortRequested || this.authoringEnded || this.providerFailed || this.providerAborted ||
+              Date.now() >= this.turnDeadline || this.turnCalls >= (review ? 3 : TURN_CALLS) ||
+              this.turnToolCalls >= (review ? 12 : TOOL_CALLS)) break;
+          if (rejected.authoring &&
+              (this.reconcileAuthoring() !== rejected.authoring || rejected.authoring.closed)) break;
+          if (speculative && this.host.speculation?.().projection()?.planning_active !== true) break;
+          // The discarded group has no tool result. Keep its complete failed
+          // accounting in Store, but never feed partial arguments back as an
+          // assistant/tool exchange or as new effect authority.
+          agent.replaceMessages([]);
+          this.rejectedResponse = null;
+          const correction = {
+            type: "model.response_budget_exceeded",
+            ...rejected.argumentRejection!,
+            instruction: "The entire preceding response was rejected before tool dispatch. Generate a fresh complete correction within the currently advertised string bounds and strict-object property names. This is a generated-prefix resource budget, even if a later duplicate key could overwrite that prefix. Original authority, remaining allowances and deadline are unchanged.",
+          };
+          Object.assign(prompt, { response_budget_feedback: correction });
+        }
       }
       if (Date.now() >= this.turnDeadline) deadlineReached = true;
     } catch (error) {
@@ -1500,20 +1605,25 @@ export class StrategicPlanner {
       this.previousObservation = projectedObservation;
     }
     run.model_status = "idle";
+    // Stream callbacks may publish this while the SDK prompt is awaited.
+    const rejectedResponse = this.rejectedResponse as RequestAttempt | null;
     this.store.event(
       run.run_id,
       "scheduler.turn_finished",
-      "Strategic turn settled with complete tool-result groups",
+      rejectedResponse ? "Strategic turn ended after a host resource rejection exhausted its remaining admission authority"
+        : "Strategic turn settled with complete tool-result groups",
       {
         turn_id: turnId,
         calls: this.turnCalls,
         tools: this.turnToolCalls,
         admitted_work: this.workRevision !== revision,
         authoring_exit: this.authoringEnded ? this.turnAuthoring?.closed ?? "ended" : null,
+        ...(rejectedResponse ? { resource_rejection: rejectedResponse.argumentRejection! } : {}),
         consumed_event_seq: this.contextCursor,
       },
     );
     this.host.persist();
+    if (rejectedResponse) return;
     if (this.workRevision !== revision) this.emptyTurns = 0;
     if (this.host.busy() || this.host.programPending()) return;
     // Evidence arriving during inference is already queued for the next turn;
@@ -1575,6 +1685,8 @@ export class StrategicPlanner {
         read_only_review: request.review,
         usage_reported: false,
         usage_evidence: request.usage.finish(null) as unknown as Json,
+        ...(request.argumentRejection ? { resource_rejection: request.argumentRejection } : {}),
+        ...(request.hostCancellation ? { host_cancellation: request.hostCancellation } : {}),
       },
     );
     this.request = null;
@@ -1585,6 +1697,9 @@ export class StrategicPlanner {
     run: StoredRun,
     generation: number,
   ): void {
+    if (event.type === "message_update" && event.message.role === "assistant" &&
+        (event.assistantMessageEvent.type === "toolcall_delta" || event.assistantMessageEvent.type === "toolcall_end") && this.request)
+      this.checkToolArgumentBudget(this.request, event.message, run, generation);
     if (event.type === "message_end" && event.message.role === "assistant") {
       const message = event.message;
       const recoveredFailure = message.stopDetails?.type === RECOVERED_PROVIDER_FAILURE;
@@ -1602,11 +1717,12 @@ export class StrategicPlanner {
       const obsolete = !this.current(run, generation) ||
         Boolean(window && (this.reconcileAuthoring() !== window || window.closed)) ||
         Boolean(request?.planId && (plan?.plan_id !== request.planId || !plan.planning_active));
+      const resourceRejected = Boolean(request?.argumentRejection);
       const hostCancellation = message.stopReason === "aborted" &&
         (requestedCancellation?.kind === "strategic_host" || request?.role === "authoring" && obsolete)
         ? requestedCancellation : undefined;
       this.eligibleTools.clear();
-      if (!obsolete && !hostYield && !recoveredFailure && ["stop", "toolUse"].includes(message.stopReason)) {
+      if (!resourceRejected && !obsolete && !hostYield && !recoveredFailure && ["stop", "toolUse"].includes(message.stopReason)) {
         this.turnDelivered++;
         for (const content of message.content) {
           if (content.type === "toolCall") this.eligibleTools.set(content.id, { name: content.name, arguments: content.arguments,
@@ -1705,6 +1821,7 @@ export class StrategicPlanner {
             speculative_plan_id: request.planId,
             read_only_review: request.review,
             obsolete,
+            ...(resourceRejected ? { resource_rejection: request.argumentRejection! } : {}),
             ...(hostCancellation ? { host_cancellation: hostCancellation } : {}),
           },
         );
@@ -1714,7 +1831,7 @@ export class StrategicPlanner {
         if (!hostCancellation && (message.stopReason === "error" || recoveredFailure)) this.providerFailed = true;
         if (message.stopReason === "aborted" && !hostCancellation) this.providerAborted = true;
       }
-      if (message.stopReason !== "error" && message.stopReason !== "aborted") {
+      if (!resourceRejected && message.stopReason !== "error" && message.stopReason !== "aborted") {
         for (const content of message.content) {
           if (content.type === "text" && content.text.trim())
             this.store.event(

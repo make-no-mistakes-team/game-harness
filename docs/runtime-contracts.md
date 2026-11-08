@@ -1189,9 +1189,31 @@ Model-authored resident `attention` with `urgency:"urgent"` and a reactive `poli
 
 Before deliberately aborting an in-flight authoring request, the host captures its exact request and root identity. Only its final SDK `aborted` settlement carries `host_cancellation:{kind:"ordinary_authoring",request_id,root_execution_id,reason}`, alongside `role:"authoring"` and `obsolete:true`. Root settlement, scope loss, root replacement, deadline cancellation, urgent attention and explicit authority fencing qualify; call/tool exhaustion without an abort does not. This settlement has `provider_failure:false` even if the SDK retains `recovered_failure`; raw stop reason, recovery evidence and unknown usage stay unchanged. Cancellation requested while processing an already received terminal response cannot establish its cause. An unsettled request has no cancellation exemption, and genuine provider errors remain failures even when their response is obsolete.
 
-Every strategic `Agent.abort()` uses one private request owner. Before invoking the SDK, it records the first cancellation intent against the exact active admitted request; repeated fence/close calls cannot replace that cause. A terminal-received latch prevents reconciliation or event subscribers from adding provenance after the terminal callback has begun. Actual root-bound authoring cancellation keeps the marker above. Cancellation of an ordinary planning, recovery or review request, or of a speculative request, instead uses `host_cancellation:{kind:"strategic_host",request_id,reason}` without a root field. Its reasons are `fenced` for lifecycle authority fencing, `speculative_preempted` for a meaningful wake that cancels optional lookahead, and `turn_deadline` for the existing finite turn timer. The settlement retains its admitted role. Fencing and speculative preemption make the response obsolete; a turn deadline can cancel a still-current request.
+Every strategic `Agent.abort()` uses one private request owner. Before invoking the SDK, it records the first cancellation intent against the exact active admitted request; repeated fence/close calls cannot replace that cause. A terminal-received latch prevents reconciliation or event subscribers from adding provenance after the terminal callback has begun. Actual root-bound authoring cancellation keeps the marker above. Cancellation of an ordinary planning, recovery or review request, or of a speculative request, instead uses `host_cancellation:{kind:"strategic_host",request_id,reason}` without a root field. Lifecycle reasons are `fenced` for authority fencing, `speculative_preempted` for a meaningful wake that cancels optional lookahead, and `turn_deadline` for the existing finite turn timer. The settlement retains its admitted role. Fencing and speculative preemption make the response obsolete; a turn deadline can cancel a still-current request.
 
 Only a final SDK `aborted` response with intent captured before its callback qualifies as trusted host cancellation. The request owner and live/read-only evaluation consumers share the close-reason contract, including urgent resident attention and reactive interruption. This suppresses provider-outage classification while preserving raw recovery metadata, usage uncertainty and the complete request history. A generic turn deadline still fails and pauses the ordinary turn with cause `deadline`; it cannot count as successful progress or consume selected feedback. Provider errors, recovered non-abort responses, unmarked provider aborts, unsettled requests and unconfirmed transport drain retain their existing failure handling. Cancellation never grants tools or restores revoked effect authority.
+
+Each admitted request also bounds generated string prefixes against its actual
+advertised tool schemas. Strict root objects have a decoded property-name bound
+across their possible alternatives. Raw tool-argument deltas are checked before
+SDK parsing: an unfinished extra key cannot grow indefinitely while remaining
+absent from the SDK's partial object. Unknown or unbounded alternatives decline
+the corresponding guard; nested free JSON remains unrestricted. These are
+generation-prefix resource budgets, so later duplicate-key overwrites do not
+renew them. No argument is truncated, coerced or executed early.
+
+The first overrun latches its exact request and records
+`model.response_budget_exceeded` with only tool/schema path and numeric bounds,
+never argument content. Every tool in that response is refused, including a
+completed sibling or a group whose terminal event races cancellation. The host
+joins the actual interrupted owner before a fresh correction within the same
+turn's remaining calls, tools, role and original deadline. Foreground gameplay
+is not retired. An actual SDK abort may carry the matching
+`strategic_host` / `tool_argument_budget` cancellation and measured
+`resource_rejection`; a clean terminal race retains the rejection without
+inventing an abort. Real provider errors and recovered stream failures keep
+their failure classification. Stop, scope loss and exhausted authority prevent
+correction, and rejected output alone is not useful completed work.
 
 An uncertainty fence cancels authoring without converting the preceding unknown action into failure or success. New strategy still waits for old emitters to drain, acknowledged native neutralization and a fresh same-life observation. Stop remains Stop; cancellation provenance cannot reopen admission or replay the interrupted action.
 

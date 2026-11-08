@@ -517,6 +517,10 @@ const cancelledAuthoring: Record<string, Json> = { ...abortedAuthoring, obsolete
 const strategicCancellation = { kind: "strategic_host", request_id: "cancelled-strategic", reason: "fenced" };
 const cancelledRecovery: Record<string, Json> = { ...abortedAuthoring, request_id: "cancelled-strategic",
   role: "recovery", obsolete: true, host_cancellation: strategicCancellation };
+const argumentBudget = { kind: "tool_argument_budget", request_id: "cancelled-strategic",
+  tool: "program_run", path: ["reason"], limit: 300, observed: 301 };
+const cancelledArgumentBudget: Record<string, Json> = { ...cancelledRecovery, role: "planning", obsolete: false,
+  host_cancellation: { ...strategicCancellation, reason: "tool_argument_budget" }, resource_rejection: argumentBudget };
 const cancellationCases: Array<{ name: string; type?: string; details: Record<string, Json>;
   providerError: boolean; providerSettled: boolean }> = [
   { name: "confirmed host cancellation", details: cancelledAuthoring, providerError: false, providerSettled: true },
@@ -556,6 +560,22 @@ const cancellationCases: Array<{ name: string; type?: string; details: Record<st
   { name: "current planning request cancelled at host turn deadline", details: { ...cancelledRecovery,
     role: "planning", obsolete: false, host_cancellation: { ...strategicCancellation, reason: "turn_deadline" } },
     providerError: false, providerSettled: true },
+  { name: "current argument generation stopped at its declared field bound", details: cancelledArgumentBudget,
+    providerError: false, providerSettled: true },
+  { name: "argument budget cause without measured rejection", details: { ...cancelledArgumentBudget, resource_rejection: null },
+    providerError: true, providerSettled: false },
+  { name: "argument budget rejection for another request", details: { ...cancelledArgumentBudget,
+    resource_rejection: { ...argumentBudget, request_id: "another-request" } }, providerError: true, providerSettled: false },
+  { name: "argument budget cause without actual overrun", details: { ...cancelledArgumentBudget,
+    resource_rejection: { ...argumentBudget, observed: 300 } }, providerError: true, providerSettled: false },
+  { name: "clean completed response rejected at argument budget", details: { ...cancelledArgumentBudget,
+    stop_reason: "toolUse", host_cancellation: null, recovered_failure: null }, providerError: false, providerSettled: true },
+  { name: "argument budget marker alongside genuine provider error", details: { ...cancelledArgumentBudget,
+    stop_reason: "error" }, providerError: true, providerSettled: false },
+  { name: "argument budget marker alongside recovered tool response", details: { ...cancelledArgumentBudget,
+    stop_reason: "toolUse" }, providerError: true, providerSettled: true },
+  { name: "unsettled argument budget cancellation", type: "model.request_unsettled", details: cancelledArgumentBudget,
+    providerError: true, providerSettled: false },
   { name: "generic cancellation with unknown host role", details: { ...cancelledRecovery, role: "worker" },
     providerError: true, providerSettled: false },
   { name: "generic cancellation without role", details: { ...cancelledRecovery, role: null },

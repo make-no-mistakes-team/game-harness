@@ -6,6 +6,7 @@ import { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentEvent, AgentTool, StreamFn } from "@oh-my-pi/pi-agent-core/types";
 import type { AssistantMessage, ToolCall } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { z } from "zod";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import type { Json, ObservationV3 } from "../src/shared/contracts.ts";
 import type { PlanningContext } from "../src/shared/planning.ts";
@@ -18,6 +19,7 @@ import { SkillManager } from "../src/server/skills.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { StrategicPlanner, type StrategicRequestAdmission } from "../src/server/strategic.ts";
+import { programRunSchema, programWriteSchema } from "../src/server/program-interface.ts";
 import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 import { finishHistoryExecution, historyExecution, historySpec } from "./helpers/history-fixture.ts";
 
@@ -1310,3 +1312,280 @@ test("real SDK publishes inactive source after root settlement without acquiring
   expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "model.request_settled")
     .every(event => !object(event.details)?.host_cancellation)).toBe(true);
 });
+
+function budgetMessage(model: Parameters<StreamFn>[0], content: ToolCall[] = []): AssistantMessage {
+  return { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+    timestamp: Date.now(), stopReason: content.length ? "toolUse" : "stop", content,
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+}
+
+for (const terminal of ["held_until_abort", "queued_done"] as const)
+test(`real SDK rejects an oversized attention prefix and its completed sibling before ${terminal}, then corrects in the original turn`, async () => {
+  let requests = 0, writes = 0, attentions = 0, closed = false;
+  const correctionContexts: unknown[] = [], admitted: string[] = [];
+  const f = await setup(async () => { throw new Error("Installed SDK owns budget response"); }, async (model, context, options) => {
+    const index = requests++;
+    if (index > 0) {
+      expect(closed).toBe(true);
+      const first = context.messages[0];
+      const text = first?.role === "user" && Array.isArray(first.content)
+        ? first.content.find(part => part.type === "text")?.text : "";
+      correctionContexts.push(JSON.parse(text ?? ""));
+      expect(JSON.stringify(context.messages)).not.toContain("PRIVATE_ARGUMENT");
+      const message = budgetMessage(model, index === 1
+        ? [{ type: "toolCall", id: "fresh-attention", name: "program_run",
+          arguments: { operation: "attention", after_ms: 1000, reason: "Fresh bounded correction" } }] : []);
+      const stream = new AssistantMessageEventStream();
+      stream.push({ type: "done", reason: message.stopReason === "stop" ? "stop" : "toolUse", message }); stream.end();
+      return stream;
+    }
+    const message = budgetMessage(model);
+    const sibling: ToolCall = { type: "toolCall", id: "completed-but-rejected-write", name: "program_write",
+      arguments: { name: "Rejected sibling", source: "return null;" } };
+    const poison: ToolCall = { type: "toolCall", id: "oversized-attention", name: "program_run",
+      arguments: { operation: "attention", after_ms: 1000, reason: "" } };
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      try {
+        yield { type: "start", partial: message };
+        message.content.push(sibling);
+        yield { type: "toolcall_start", contentIndex: 0, partial: message };
+        yield { type: "toolcall_end", contentIndex: 0, toolCall: sibling, partial: message };
+        message.content.push(poison);
+        yield { type: "toolcall_start", contentIndex: 1, partial: message };
+        poison.arguments = { operation: "attention", after_ms: 1000, reason: "PRIVATE_ARGUMENT".padEnd(301, "x") };
+        yield { type: "toolcall_delta", contentIndex: 1, delta: "not host diagnostic content", partial: message };
+        if (terminal === "held_until_abort" && !options?.signal?.aborted)
+          await new Promise<void>(resolve => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+        message.stopReason = "toolUse";
+        stream.end(message);
+        yield { type: "done", reason: "toolUse", message };
+      } finally { closed = true; }
+    };
+    return stream;
+  }, { reserve: id => { admitted.push(id); }, transportEnded: () => {}, drained: () => {} });
+  f.tools.find(tool => tool.name === "program_run")!.parameters = z.toJSONSchema(programRunSchema, { unrepresentable: "any", io: "input" });
+  f.tools.find(tool => tool.name === "program_write")!.parameters = z.toJSONSchema(programWriteSchema, { unrepresentable: "any", io: "input" });
+  f.tools.find(tool => tool.name === "program_run")!.execute = async () => { attentions++; return { content: [], details: null }; };
+  f.tools.find(tool => tool.name === "program_write")!.execute = async () => { writes++; return { content: [], details: null }; };
+  const schedule = globalThis.setTimeout;
+  let turnTimers = 0;
+  const captureDeadline = (...[callback, delay, ...args]: Parameters<typeof setTimeout>) => {
+    if (delay !== undefined && delay > 119_000 && delay <= 120_000) turnTimers++;
+    return schedule(callback, delay, ...args);
+  };
+  vi.spyOn(globalThis, "setTimeout").mockImplementation(Object.assign(captureDeadline, schedule));
+  await f.planner.start(1);
+  const finished = f.event("scheduler.turn_finished");
+  f.planner.wake("selected_attention"); await finished;
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  expect(requests).toBe(3); expect(admitted).toHaveLength(3); expect(turnTimers).toBe(1);
+  expect(writes).toBe(0); expect(attentions).toBe(1);
+  expect(f.run.usage.calls).toBe(3); expect(f.state.pauses).toEqual([]);
+  expect(f.root.status).toBe("running");
+  expect(events.filter(event => event.type === "scheduler.turn_started")).toHaveLength(1);
+  expect(events.find(event => event.type === "scheduler.turn_finished")?.details).toMatchObject({ calls: 3, tools: 1 });
+  const rejection = events.find(event => event.type === "model.response_budget_exceeded");
+  expect(rejection?.details).toMatchObject({ kind: "tool_argument_budget", request_id: admitted[0],
+    tool: "program_run", path: ["reason"], limit: 300, observed: 301 });
+  expect(JSON.stringify(rejection)).not.toContain("PRIVATE_ARGUMENT");
+  expect(correctionContexts[0]).toMatchObject({ response_budget_feedback: {
+    request_id: admitted[0], tool: "program_run", path: ["reason"], limit: 300, observed: 301,
+  } });
+  expect(events.find(event => event.type === "model.request_settled")?.details).toMatchObject({
+    request_id: admitted[0], stop_reason: "aborted", provider_failure: false,
+    host_cancellation: { kind: "strategic_host", request_id: admitted[0], reason: "tool_argument_budget" },
+    resource_rejection: { kind: "tool_argument_budget", request_id: admitted[0] },
+  });
+}, 5000);
+
+test("real SDK budget correction cannot reset the original twelve-call allowance or revive a stopped owner", async () => {
+  for (const stop of [false, true]) {
+    let requests = 0;
+    const f = await setup(async () => { throw new Error("Installed SDK owns repeated resource rejection"); }, async model => {
+      requests++;
+      const message = budgetMessage(model, [{ type: "toolCall", id: `overrun-${requests}`, name: "program_run",
+        arguments: { operation: "attention", after_ms: 1000, reason: "x".repeat(301) } }]);
+      const stream = new AssistantMessageEventStream();
+      stream.push({ type: "start", partial: message });
+      stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "", partial: message });
+      stream.push({ type: "done", reason: "toolUse", message }); stream.end();
+      return stream;
+    });
+    f.tools.find(tool => tool.name === "program_run")!.parameters = z.toJSONSchema(programRunSchema, { unrepresentable: "any", io: "input" });
+    await f.planner.start(1);
+    const off = f.store.subscribe(event => {
+      if (stop && event.run_id === f.run.run_id && event.type === "model.response_budget_exceeded") f.planner.fence();
+    });
+    const settled = f.event(stop ? "model.request_settled" : "scheduler.turn_finished");
+    f.planner.wake("selected_attention"); await settled;
+    await f.planner.close(); off();
+    const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+    expect(requests).toBe(stop ? 1 : 12);
+    expect(f.run.usage.calls).toBe(stop ? 1 : 12);
+    expect(f.state.pauses).toEqual([]);
+    expect(events.some(event => event.type === "model.tool_started" || event.type === "scheduler.planning_stalled" ||
+      event.type === "scheduler.backoff")).toBe(false);
+    expect(f.root.status).toBe("running");
+    if (!stop) expect(events.find(event => event.type === "scheduler.turn_finished")?.details)
+      .toMatchObject({ calls: 12, tools: 0, resource_rejection: { kind: "tool_argument_budget" } });
+  }
+}, 5000);
+
+test("real SDK argument budget admits a 16KiB source, free JSON execution arguments and a bounded intentional wait", async () => {
+  let requests = 0, executed = 0;
+  const calls: ToolCall[] = [
+    { type: "toolCall", id: "legal-source", name: "program_write", arguments: { name: "Legal source", source: `/*${"x".repeat(16380)}*/` } },
+    { type: "toolCall", id: "free-json", name: "program_run", arguments: { operation: "start", entry: "run",
+      name: "Legal", version: 1, args: { ["nested free key ".repeat(100)]: "j".repeat(40000) } } },
+    { type: "toolCall", id: "intentional-wait", name: "program_run",
+      arguments: { operation: "attention", after_ms: 600000, reason: "w".repeat(300) } },
+  ];
+  const f = await setup(async () => { throw new Error("Installed SDK owns legal arguments"); }, async model => {
+    const message = budgetMessage(model, requests++ === 0 ? calls : []);
+    const stream = new AssistantMessageEventStream();
+    stream.push({ type: "start", partial: message });
+    for (let contentIndex = 0; contentIndex < message.content.length; contentIndex++) {
+      const call = message.content[contentIndex];
+      if (call?.type === "toolCall")
+        stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(call.arguments), partial: message });
+    }
+    stream.push({ type: "done", reason: message.stopReason === "stop" ? "stop" : "toolUse", message }); stream.end();
+    return stream;
+  });
+  for (const [name, schema] of [["program_run", programRunSchema], ["program_write", programWriteSchema]] as const) {
+    const tool = f.tools.find(tool => tool.name === name)!;
+    tool.parameters = z.toJSONSchema(schema, { unrepresentable: "any", io: "input" });
+    tool.execute = async () => { executed++; return { content: [], details: null }; };
+  }
+  await f.planner.start(1);
+  const finished = f.event("scheduler.turn_finished");
+  f.planner.wake("selected_attention"); await finished;
+  expect(executed).toBe(3); expect(requests).toBe(2); expect(f.state.pauses).toEqual([]);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event => event.type === "model.response_budget_exceeded")).toBe(false);
+}, 5000);
+
+test("real SDK resource corrections retain the three-call inactive authoring window and never retire its live root", async () => {
+  let requests = 0;
+  const f = await setup(async () => { throw new Error("Installed SDK owns inactive resource corrections"); }, async (model, context) => {
+    requests++;
+    expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_inspect", "program_write"]);
+    const message = budgetMessage(model, [{ type: "toolCall", id: `oversized-source-${requests}`, name: "program_write",
+      arguments: { name: "Overlong inactive source", source: "x".repeat(16385) } }]);
+    const stream = new AssistantMessageEventStream();
+    stream.push({ type: "start", partial: message });
+    stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "", partial: message });
+    stream.push({ type: "done", reason: "toolUse", message }); stream.end();
+    return stream;
+  });
+  f.tools.find(tool => tool.name === "program_write")!.parameters = z.toJSONSchema(programWriteSchema, { unrepresentable: "any", io: "input" });
+  await f.planner.start(1);
+  const finished = f.event("scheduler.turn_finished");
+  f.planner.wake("planning_continuation"); await finished;
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  expect(requests).toBe(3); expect(f.run.usage.calls).toBe(3);
+  expect(f.root.status).toBe("running"); expect(f.state.pauses).toEqual([]);
+  expect(events.find(event => event.type === "scheduler.authoring_exited")?.details).toMatchObject({ reason: "calls", calls: 3, tools: 0 });
+  expect(events.filter(event => event.type === "model.request_settled")).toHaveLength(3);
+  expect(events.filter(event => event.type === "model.request_settled").every(event =>
+    object(object(event.details)?.host_cancellation ?? null)?.kind === "strategic_host")).toBe(true);
+}, 5000);
+
+test("real SDK actual provider failure on a fresh budget correction still pauses instead of receiving another correction", async () => {
+  let requests = 0;
+  const f = await setup(async () => { throw new Error("Installed SDK owns correction failure"); }, async model => {
+    const first = requests++ === 0;
+    const message = budgetMessage(model, first ? [{ type: "toolCall", id: "resource-rejected", name: "program_run",
+      arguments: { operation: "attention", after_ms: 1000, reason: "x".repeat(301) } }] : []);
+    const stream = new AssistantMessageEventStream();
+    if (first) {
+      stream.push({ type: "start", partial: message });
+      stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "", partial: message });
+      stream.push({ type: "done", reason: "toolUse", message });
+    } else {
+      message.stopReason = "error"; message.errorMessage = "Actual fixture provider failure";
+      stream.push({ type: "error", reason: "error", error: message });
+    }
+    stream.end();
+    return stream;
+  });
+  f.tools.find(tool => tool.name === "program_run")!.parameters = z.toJSONSchema(programRunSchema, { unrepresentable: "any", io: "input" });
+  await f.planner.start(1);
+  const failed = f.event("scheduler.turn_failed");
+  f.planner.wake("selected_attention"); await failed;
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  expect(requests).toBe(2); expect(f.state.pauses).toHaveLength(1);
+  expect(events.find(event => event.type === "scheduler.turn_failed")?.details)
+    .toMatchObject({ provider_failed: true, provider_aborted: false, pause_cause: "provider_failure" });
+  expect(events.filter(event => event.type === "model.request_settled").at(-1)?.details)
+    .toMatchObject({ stop_reason: "error", provider_failure: true });
+  expect(events.some(event => event.type === "model.tool_started")).toBe(false);
+}, 5000);
+
+test("real SDK rejects a growing unterminated root key that the parsed attention arguments omit", async () => {
+  let requests = 0, effects = 0, keyChunks = 0, closed = false;
+  let correction: Record<string, unknown> | undefined;
+  const partialArguments = { operation: "attention", after_ms: 30000, reason: "r".repeat(127) };
+  const rawPrefix = `${JSON.stringify(partialArguments).slice(0, -1)},"`;
+  // Match the observed failed shape: the unclosed extra key begins at
+  // offset 181 while the decoded reason remains only 127 characters.
+  expect(rawPrefix.lastIndexOf('"')).toBe(181);
+  const f = await setup(async () => { throw new Error("Installed SDK owns unfinished-key response"); }, async (model, context) => {
+    if (requests++ > 0) {
+      expect(closed).toBe(true);
+      const first = context.messages[0];
+      const text = first?.role === "user" && Array.isArray(first.content)
+        ? first.content.find(part => part.type === "text")?.text : "";
+      correction = JSON.parse(text ?? "");
+      expect(JSON.stringify(context.messages)).not.toContain("PRIVATE_UNFINISHED_KEY");
+      const message = budgetMessage(model);
+      const stream = new AssistantMessageEventStream();
+      stream.push({ type: "done", reason: "stop", message }); stream.end();
+      return stream;
+    }
+    const sibling: ToolCall = { type: "toolCall", id: "unfinished-key-sibling", name: "program_write",
+      arguments: { name: "No sibling publication", source: "return null;" } };
+    const call: ToolCall = { type: "toolCall", id: "unfinished-key-attention", name: "program_run", arguments: partialArguments };
+    const message = budgetMessage(model, [sibling, call]);
+    const stream = new AssistantMessageEventStream();
+    stream[Symbol.asyncIterator] = async function* () {
+      try {
+        yield { type: "start", partial: message };
+        yield { type: "toolcall_start", contentIndex: 0, partial: message };
+        yield { type: "toolcall_end", contentIndex: 0, toolCall: sibling, partial: message };
+        yield { type: "toolcall_start", contentIndex: 1, partial: message };
+        yield { type: "toolcall_delta", contentIndex: 1, delta: rawPrefix, partial: message };
+        const unfinishedKey = "PRIVATE_UNFINISHED_KEY".padEnd(32509 - rawPrefix.length, "k");
+        for (let offset = 0; offset < unfinishedKey.length; offset += 8) {
+          keyChunks++;
+          // The SDK's incremental JSON projection keeps this same valid
+          // dictionary while the unterminated raw property name grows.
+          yield { type: "toolcall_delta", contentIndex: 1, delta: unfinishedKey.slice(offset, offset + 8), partial: message };
+        }
+        yield { type: "toolcall_end", contentIndex: 1, toolCall: call, partial: message };
+        stream.end(message);
+        yield { type: "done", reason: "toolUse", message };
+      } finally { closed = true; }
+    };
+    return stream;
+  });
+  f.tools.find(tool => tool.name === "program_run")!.parameters = z.toJSONSchema(programRunSchema, { unrepresentable: "any", io: "input" });
+  for (const name of ["program_run", "program_write"])
+    f.tools.find(tool => tool.name === name)!.execute = async () => { effects++; return { content: [], details: null }; };
+  await f.planner.start(1);
+  const finished = f.event("scheduler.turn_finished");
+  f.planner.wake("selected_attention"); await finished;
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  expect(requests).toBe(2); expect(effects).toBe(0); expect(keyChunks).toBeGreaterThan(0); expect(keyChunks).toBeLessThan(30);
+  expect(partialArguments).toEqual({ operation: "attention", after_ms: 30000, reason: "r".repeat(127) });
+  const rejection = events.find(event => event.type === "model.response_budget_exceeded");
+  expect(rejection?.details).toMatchObject({ kind: "tool_argument_budget", tool: "program_run", path: ["<argument_key>"] });
+  const details = object(rejection?.details ?? null)!;
+  expect(Number(details.observed)).toBeGreaterThan(Number(details.limit));
+  expect(Number(details.observed)).toBeLessThanOrEqual(Number(details.limit) + 8);
+  expect(JSON.stringify(rejection)).not.toContain("PRIVATE_UNFINISHED_KEY");
+  expect(correction).toMatchObject({ response_budget_feedback: { tool: "program_run", path: ["<argument_key>"] } });
+  expect(f.run.usage.calls).toBe(2); expect(f.state.pauses).toEqual([]); expect(f.root.status).toBe("running");
+  expect(events.filter(event => event.type === "scheduler.turn_started")).toHaveLength(1);
+}, 5000);

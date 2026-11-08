@@ -264,6 +264,7 @@ export class StrategicPlanner {
   private authoringPhase = false;
   private turnAbortRequested = false;
   private pendingDecision = false;
+  private decisionBasis: { root: string; intentVersion: number | null } | null = null;
   private emptyTurns = 0;
   private workRevision = 0;
   private contextCursor = 0;
@@ -315,6 +316,7 @@ export class StrategicPlanner {
     this.authoringPhase = false;
     this.turnAbortRequested = false;
     this.pendingDecision = false;
+    this.decisionBasis = null;
     this.emptyTurns = 0;
     this.workRevision = 0;
     this.contextCursor = 0;
@@ -513,6 +515,7 @@ export class StrategicPlanner {
         return events;
       };
       const selectPhase = () => {
+        this.reconcileDecision();
         const settlingAuthoring = this.authoringPhase && this.turnAuthoring &&
           this.reconcileAuthoring() === this.turnAuthoring && !this.turnAuthoring.closed;
         this.authoringPhase = run.status !== "reviewing" && !this.speculativeTurn &&
@@ -543,6 +546,8 @@ export class StrategicPlanner {
         // Admission may arm a window inside program_submit/run. Only the next
         // SDK request boundary changes phase, after that tool group returned.
         selectPhase();
+        if (this.decisionBasis && !this.pendingDecision && !this.host.programPending())
+          return stop("The primary control decision settled; fresh outcome evidence owns the next turn");
         const toolRole = this.toolRole();
         if (this.speculativeTurn && !this.host.speculation?.().requestCall())
           return stop("Finite lookahead request authority reached");
@@ -570,10 +575,9 @@ export class StrategicPlanner {
           this.turnAuthoring = authoring;
         }
         const pendingDecision = this.pendingDecision;
-        // A meaningful wake admits a bounded decision turn, not one provider
-        // message. Inspection/help may precede its actual intent or Stop.
-        // The ordinary turn's call/tool/deadline limits still apply; passive
-        // continuation never acquires this authority or a new authoring budget.
+        // Reads and inactive writes preserve the wake's decision authority.
+        // A changed root/intent or retired predecessor consumes it at the next
+        // SDK boundary, without renewing the root's inactive authoring budget.
         this.turnCalls++;
         run.turns++;
         this.request = {
@@ -713,6 +717,19 @@ export class StrategicPlanner {
   private authoringScope(run: StoredRun): string {
     return JSON.stringify([run.run_id, run.world_id, run.session_id, run.epoch, run.life_id,
       run.native_boot_id, run.space_epoch, run.compatibility_hash]);
+  }
+
+  /** Observe primary control changes only after the preceding SDK tool group. */
+  private reconcileDecision(): void {
+    const basis = this.decisionBasis;
+    if (!this.pendingDecision || !basis) return;
+    const run = this.host.run();
+    const root = run ? this.store.latestRootExecution(run.run_id) : null;
+    const intentVersion = root?.entry === "step" ? root.resident?.intent_version ?? 0 : null;
+    if (!root || root.execution_id !== basis.root || intentVersion !== basis.intentVersion ||
+        !["accepted", "running"].includes(root.status) ||
+        root.entry === "step" && root.resident && !["starting", "running"].includes(root.resident.status))
+      this.pendingDecision = false;
   }
 
   /** Query only at existing admission, request, tool, result and wake seams. */
@@ -932,6 +949,8 @@ export class StrategicPlanner {
   fence(): void {
     this.fenced = true;
     this.fenceRevision++;
+    this.pendingDecision = false;
+    this.decisionBasis = null;
     this.historyController?.abort();
     clearTimeout(this.wakeTimer);
     clearTimeout(this.idleTimer);
@@ -1092,6 +1111,9 @@ export class StrategicPlanner {
     }
     this.speculativeTurn = speculative !== null;
     this.pendingDecision = !review && !speculative && this.host.programPending() && reasons.some(pendingDecisionWake);
+    const decisionRoot = this.pendingDecision ? this.store.latestRootExecution(run.run_id) : null;
+    this.decisionBasis = decisionRoot ? { root: decisionRoot.execution_id,
+      intentVersion: decisionRoot.entry === "step" ? decisionRoot.resident?.intent_version ?? 0 : null } : null;
     // Only request admission below may bind this turn to settlement grace.
     // A previous turn's consumed window budget cannot admit a new SDK loop.
     // The SDK hook mutates this field across awaits in the remainder of the turn.
@@ -1315,7 +1337,7 @@ export class StrategicPlanner {
                 ? "This is the one authorized independent planning flight. Observe, inspect, help, pure program_write and prepare_next only. Prepare immutable inactive source if needed, then select one exact named candidate; optionally author guard_source BODY(observation,args) returning strict boolean. Omission adds no game constraint. No starts, activation, effects or polling. Source preparation and corrections share the original finite deadline and allowance. Main's captured permission and all host invariants govern activation."
               : this.host.programPending()
                 ? this.pendingDecision
-                  ? "Resolve this explicit attention/outcome/recovery signal within the ordinary bounded decision turn. Inspect current state or mechanics as needed, then choose the necessary current-root intent update, code change or stop. Decision authority survives those intermediate reads until this turn ends; it does not renew the root deadline or inactive-authoring allowance. Keep useful local control running; no polling or duplicate foreground work."
+                  ? "Resolve this explicit attention/outcome/recovery signal within the ordinary bounded decision turn. Inspect current state or mechanics as needed, then choose the necessary current-root intent update, code change or stop. Decision authority survives intermediate reads and inactive writes, then ends at the next request after a root/intent change or predecessor retirement. It does not renew the root deadline or inactive-authoring allowance. Keep useful local control running; no polling or duplicate foreground work."
                   : "The foreground program continues unchanged. Use only observe, help, program_inspect and pure program_write to prepare immutable inactive source within the remaining root-bound authoring allowance. No starts, activation, effects, polling or keepalive; repeated wakes do not renew the window."
                 : "Advance the task with an autonomous local taskflow using current evidence. Keep short input intervals, fresh target selection and ordinary recovery inside your code. For ongoing world control use a resident step (help controller); keep useful control running through cloud decisions. Return blocked only when the local algorithm genuinely cannot continue, not merely because an input interval finished. Choose survival and combat responses yourself. No human continuation is needed.",
           }), selected.images,
@@ -1365,6 +1387,7 @@ export class StrategicPlanner {
       this.speculativeTurn = false;
       this.authoringPhase = false;
       this.pendingDecision = false;
+      this.decisionBasis = null;
       if (speculative) agent.setTools(this.host.tools(generation)
         .filter((tool) => isToolAllowed(this.toolRole(), tool.name)));
       this.eligibleTools.clear();

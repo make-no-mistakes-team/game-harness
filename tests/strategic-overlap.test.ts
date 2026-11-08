@@ -10,6 +10,7 @@ import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import type { Json, ObservationV3 } from "../src/shared/contracts.ts";
 import type { PlanningContext } from "../src/shared/planning.ts";
 import { TOOL_POLICY } from "../src/shared/tool-policy.ts";
+import { DEFAULT_RESIDENT_LIMITS, type ResidentSnapshot } from "../src/shared/resident.ts";
 import type { AuthManager } from "../src/server/auth.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
@@ -446,14 +447,14 @@ test("explicit resident and selected attention retain ordinary intent/stop autho
 });
 
 test("real SDK attention can inspect, load mechanics and observe before stopping the current root", async () => {
-  let requests = 0, stopped = false;
+  let requests = 0, stopped = false, ungroundedStarts = 0;
   const f = await setup(async () => { throw new Error("Installed SDK owns the decision loop"); }, async (model) => {
     const index = requests++;
-    const operation = index === 0 ? "inspect" : "stop";
+    const operation = index === 0 ? "inspect" : index === 3 ? "stop" : "start";
     const name = index === 1 ? "help" : index === 2 ? "observe" : "program_run";
     const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
-      timestamp: Date.now(), stopReason: index < 4 ? "toolUse" : "stop",
-      content: index < 4 ? [{ type: "toolCall", id: `attention-${index}`, name,
+      timestamp: Date.now(), stopReason: index < 5 ? "toolUse" : "stop",
+      content: index < 5 ? [{ type: "toolCall", id: `attention-${index}`, name,
         arguments: name === "program_run" ? { operation, target: "current" } : name === "help" ? { topic: "controller" } : {} }] : [],
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
@@ -463,6 +464,8 @@ test("real SDK attention can inspect, load mechanics and observe before stopping
   });
   const control = f.tools.find(tool => tool.name === "program_run")!;
   control.execute = async (_id, input) => {
+    if (input !== null && typeof input === "object" && "operation" in input && input.operation === "start")
+      ungroundedStarts++;
     if (input !== null && typeof input === "object" && "operation" in input && input.operation === "stop") {
       stopped = true; f.root.status = "cancelled"; f.root.ended_at = new Date().toISOString(); f.state.pending = false;
       f.store.updateSkillExecution(f.root, "skill.closed", "Selected decision stopped the current root");
@@ -472,11 +475,155 @@ test("real SDK attention can inspect, load mechanics and observe before stopping
   await f.planner.start(1);
   const finished = f.event("scheduler.turn_finished");
   f.planner.wake("selected_attention"); await finished;
+  expect(requests).toBe(4);
+  expect(ungroundedStarts).toBe(0);
   expect(stopped).toBe(true);
   expect(f.state.pending).toBe(false);
   expect(f.store.skillExecution(f.run.run_id, { execution_id: f.root.execution_id })?.status).toBe("cancelled");
   expect(f.run.usage.by_purpose.authoring.calls).toBe(0);
   expect(f.state.pauses).toEqual([]);
+});
+
+for (const decision of ["start", "handoff", "intent"] as const)
+for (const budget of ["fresh", "exhausted"] as const)
+test(`real SDK ${decision} consumes one attention decision after reads and leaf admissions with ${budget} authoring`, async () => {
+  let requests = 0, decisions = 0, inactiveWrites = 0, inspections = 0;
+  const f = await setup(async () => { throw new Error("Installed SDK owns the decision loop"); }, async (model, context) => {
+    const index = requests++ - (budget === "exhausted" ? 3 : 0);
+    if (index >= 0 && index <= 4) expect(context.tools?.some(tool => tool.name === "program_run")).toBe(true);
+    else {
+      expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_inspect", "program_write"]);
+      expect(f.planner.toolRole()).toBe("authoring");
+    }
+    const name = index < 0 ? "program_inspect" : index === 0 || index === 4 ? "program_run" : index === 1 ? "help"
+      : index === 2 ? "observe" : index === 3 ? "program_write" : "program_inspect";
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: "toolUse",
+      content: [{ type: "toolCall", id: `decision-${index}`, name,
+        arguments: name === "program_run" ? { operation: index === 0 ? "inspect" : decision === "intent" ? "update_intent" : decision, target: "current" } : {} }],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream.push({ type: "done", reason: "toolUse", message }); stream.end();
+    return stream;
+  });
+  finishHistoryExecution(f.store, f.root);
+  const spec = await f.store.registerSkill(f.run.run_id, { ...historySpec(f.run, "Selected resident"), entry: "step" });
+  const root = f.store.admitSkill(f.run.run_id, { entry: "step", skill_id: spec.skill_id, version: spec.version,
+    start_key: "selected-resident", ...executionScopeFixture(f.run), args: null, initial_state: null,
+    limits: { ...DEFAULT_RESIDENT_LIMITS } }).view;
+  if (root.entry !== "step") throw new Error("Resident fixture admission lost its selected entry");
+  const snapshot = (version: number): ResidentSnapshot => ({
+    execution_id: root.execution_id, source_hash: root.source_hash!, controller_generation: 1, host_clock_id: "fixture-clock",
+    status: "running", reason: null, intent_version: version, state: null,
+    processed_frame_seq: null, processed_native_tick: null, processed_native_ns: null,
+    counters: { frames: 0, steps: 0, submissions: 0, applied_sequence: 0, ordered_edge_prefix: 0, missed_slots: 0,
+      stale_results: 0, stale_frames: 0, read_failures: 0, no_input_decisions: 0, expanded_edges: 0, events: 0,
+      analysis_jobs: 0, analysis_ms: 0 },
+    pending: { frames: 0, edges: 0, analysis: false }, last_input: null,
+    timings: { step_ms: { count: 0, p50: null, p95: null, p99: null, max: null, omitted_samples: 0 },
+      input_age_ms: { count: 0, p50: null, p95: null, p99: null, max: null, omitted_samples: 0 } },
+    events: [], cleanup: { worker: "open", native: "open" },
+  });
+  // Readiness is not a decision: an admitted resident has initial intent zero
+  // even before the worker publishes its first snapshot.
+  f.tools.find(tool => tool.name === "observe")!.execute = async () => {
+    root.status = "running"; root.started_at = new Date().toISOString(); root.resident = snapshot(0);
+    f.store.updateSkillExecution(root, "controller.ready", "Resident became ready without an intent decision");
+    f.planner.admitted();
+    return { content: [], details: null };
+  };
+  f.tools.find(tool => tool.name === "help")!.execute = async () => {
+    // The same admission callback reports foreground leaf effects, not just
+    // primary program starts. It cannot consume a control decision.
+    f.planner.admitted();
+    return { content: [], details: null };
+  };
+  f.tools.find(tool => tool.name === "program_write")!.execute = async () => {
+    await f.store.registerSkill(f.run.run_id, historySpec(f.run, "Pure inactive decision draft"));
+    inactiveWrites++;
+    return { content: [], details: null };
+  };
+  f.tools.find(tool => tool.name === "program_run")!.execute = async (_id, input) => {
+    if (input !== null && typeof input === "object" && "operation" in input && input.operation === "inspect")
+      return { content: [], details: { status: root.status } };
+    decisions++;
+    if (decision === "intent") {
+      root.resident = snapshot(1);
+      f.store.updateSkillExecution(root, "controller.intent", "Primary same-root intent selected");
+    } else {
+      root.status = "cancelled"; root.ended_at = new Date().toISOString();
+      f.store.updateSkillExecution(root, "skill.closed", "Primary root replacement selected");
+      const replacement = await f.store.registerSkill(f.run.run_id, historySpec(f.run, "New selected foreground"));
+      historyExecution(f.store, f.run, replacement);
+    }
+    f.planner.admitted();
+    return { content: [], details: null };
+  };
+  f.tools.find(tool => tool.name === "program_inspect")!.execute = async () => {
+    inspections++; return { content: [], details: null };
+  };
+  await f.planner.start(1);
+  if (budget === "exhausted") {
+    const exhausted = f.event("scheduler.turn_finished");
+    f.planner.wake("planning_continuation"); await exhausted;
+  }
+  const finished = f.event("scheduler.turn_finished");
+  f.planner.wake("selected_attention"); await finished;
+  const replaced = decision !== "intent";
+  const postDecisionCalls = budget === "fresh" || replaced ? 3 : 0;
+  expect(requests).toBe((budget === "exhausted" ? 3 : 0) + 5 + postDecisionCalls);
+  expect(decisions).toBe(1); expect(inactiveWrites).toBe(1);
+  expect(inspections).toBe((budget === "exhausted" ? 3 : 0) + postDecisionCalls);
+  expect(f.state.pending).toBe(true);
+  expect(f.state.pauses).toEqual([]);
+  const entered = f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "scheduler.authoring_entered");
+  expect(entered).toHaveLength(decision === "intent" ? 1 : 2);
+});
+
+for (const settlement of ["stop", "outcome"] as const)
+test(`real SDK ${settlement} retires the old decision without consuming its queued outcome wake`, async () => {
+  const projections: Record<string, unknown>[] = [];
+  let outcomeSequence = 0;
+  const f = await setup(async () => { throw new Error("Installed SDK owns the decision loop"); }, async (model, context) => {
+    const user = context.messages.find(message => message.role === "user")!;
+    if (user.role !== "user") throw new Error("Missing decision projection");
+    const text = typeof user.content === "string" ? user.content :
+      user.content.filter(part => part.type === "text").map(part => part.text).join("");
+    const index = projections.push(JSON.parse(text)) - 1;
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: index === 0 ? "toolUse" : "stop",
+      content: index === 0 ? [{ type: "toolCall", id: "settle-decision",
+        name: settlement === "stop" ? "program_run" : "observe", arguments: { operation: "stop", target: "current" } }] : [],
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream.push({ type: "done", reason: index === 0 ? "toolUse" : "stop", message }); stream.end();
+    return stream;
+  });
+  f.tools.find(tool => tool.name === (settlement === "stop" ? "program_run" : "observe"))!.execute = async () => {
+    f.root.status = settlement === "stop" ? "cancelled" : "succeeded";
+    f.root.ended_at = new Date().toISOString(); f.state.pending = false;
+    f.store.updateSkillExecution(f.root, "skill.closed", "Selected predecessor retired");
+    outcomeSequence = f.store.latestEvent(f.run.run_id, "skill.closed")!.event_seq;
+    f.planner.wake("skill_outcome");
+    return { content: [], details: null };
+  };
+  await f.planner.start(1);
+  const finished = new Promise<void>(resolve => {
+    let turns = 0;
+    const off = f.store.subscribe(event => {
+      if (event.run_id === f.run.run_id && event.type === "scheduler.turn_finished" && ++turns === 2) { off(); resolve(); }
+    });
+  });
+  f.planner.wake("selected_attention"); await finished;
+  expect(projections).toHaveLength(2);
+  expect(projections[0]?.pending_decision).toBe(true);
+  expect(projections[1]?.reason).toEqual(["skill_outcome"]);
+  expect(projections[1]?.feedback).toEqual(expect.arrayContaining([expect.objectContaining({ event_seq: outcomeSequence })]));
+  expect(f.state.pauses).toEqual([]);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "scheduler.turn_finished")
+    .map(event => object(event.details)?.calls)).toEqual([1, 1]);
 });
 
 for (const ending of ["root_replaced", "deadline", "scope_lost", "stop"] as const)

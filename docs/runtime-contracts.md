@@ -257,8 +257,6 @@ JavaScript reflex bodies receive `context={observation,action,program,task}` and
 
 An activated JavaScript reflex evaluates independently while an async program awaits a capability. Arm finite coverage in the ordinary role before long work; inactive authoring cannot activate it. Semantic program leaves have priority zero, so an unrelated reflex needs a strictly higher priority to preempt one. A replacement requests its authored action; interrupt and replan request cognition without themselves moving or defending the player.
 
-Trial action/evaluation count exhaustion stops further proposals. The last already admitted action may finish within the original time bound, including its exact emitter-retirement barrier. Time expiry, Stop, retirement and life loss still revoke effects immediately. Neither draining that action nor resuming after suspension replenishes any budget.
-
 Policy selection spans ordinary GUI opening and closing within its original run, session, life, boot, space and compatibility scope. Each evaluation captures a fresh exact screen and rechecks it before effects; a decision from a replaced screen is discarded. A GUI transition no longer silently stops the selected policy's timer. Selection, worker state and absolute watch/trial bounds are not renewed by opening or closing a screen.
 
 Inside a `run` program, common methods are `await game.observe()`, `await game.call({name,version?},args)` and `await game.progress(summary,details)`. The selected adapter supplies its registered native reads as direct positional `await game.<binding>(...parameters)` methods. `help` topic `game` generates each binding's invocation from its actual name and ordered parameter list. Its `capability_id` and `version` identify the trusted binding; they are not a `NamedProgramRef` or extra positional arguments. Native reads require no authored dependency declaration. When supported, `game.action(action)` returns the final action result and `game.respawn()` uses the same exclusive arbiter as `game.action({kind:"respawn"})`; it is no privileged recovery shortcut.
@@ -314,6 +312,8 @@ Terminal summaries contain 1–2,000 characters. Return compact semantic facts i
 A genuine terminal-frame failure produces typed `ProgramOutputError` / `program_output_limit` evidence with phase `terminal_result`, reason `utf8_bytes`, `json_depth` or `json_serialization`, the 65,536-byte maximum, a nullable actual byte count and completed capability-call count. An authored exception whose message happens to say `output_limit` does not become this typed failure. No production bound is raised and no arbitrary result is truncated to fit. Completed effects remain applied: inspect retained evidence and fresh state before deciding what remains; serialization failure never authorizes replay.
 
 A transported generated value that violates `SkillResult` instead produces `invalid_program_result`; a JSON-safe rejected payload up to 64 KiB can be retained at `result.rejected_result`. Malformed transport and other failures keep their own classifications. These diagnostics do not establish the exact cause of a historical failure whose rejected frame was not retained.
+
+A transported resident step return that violates `{input,next_state,status,events}` also produces `invalid_program_result`, after its worker and native owner retire. The diagnostic retains bounded public field paths and issue codes from the closest schema branch, without returned values or validator exception text. Omitted `edges` remain valid; a missing required `selected_hotbar` is reported as that field, not as a demand for explicit edges. Use `selected_hotbar:null` to keep the current slot. Malformed transport and arbitrary host failures retain their separate classifications.
 
 ### Delivered actor images and recorded episodes
 
@@ -512,7 +512,7 @@ eight per read. Independent cursors do not drain each other's events;
 expiry and overflow have explicit gaps. Scope changes invalidate old
 cursors and queued old-scope playback. The original sound time is preserved
 in ordinary grouped observations too. Each ordinary sound group has required
-nullable `cue`; `creeper_primed` is valid only with kind `combat`. That group
+nullable `cue`; `creeper_primed` is valid only with category `combat`. That group
 stays distinct from generic combat in the same direction/distance bin and
 precedes generic groups before the eight-group cap. Reading either view does
 not consume the ring. An actually delivered creeper priming sound may expose
@@ -1392,7 +1392,7 @@ Artifact bytes, card versions and validation reports are immutable shared record
 
 The registry has a selected-version pointer per `(run_id, policy_id)`. Activation uses an expected-current-version check in that run to prevent concurrent lost updates. At the next scheduling boundary, the runtime revokes the old evaluation generation, atomically commits the new pointer/state changes and `policy.activation_effective` event, and only then admits evaluations of the new version. Outstanding old provider responses are rejected. An action already running is not magically undone by a switch: it keeps its original recorded origin and bounded lease unless the switch explicitly requests normal cancellation. The replacement policy's evaluations see the current action.
 
-A trial occupies that lineage's selected-version slot during bounded gameplay use. At its declared elapsed/action/evaluation bound, the runtime stops new trial proposals, fences outstanding evaluations, and returns to a specifically selected compatible prior version or no policy; any necessary action cancellation uses the normal handshake. Promotion requires explicit evidence-linked selection; a policy's own claim of success is insufficient. Restoring a prior compatible version is an audited atomic switch, not a world rollback. Quarantine removes selection, fences evaluations, safely cancels affected execution where necessary, retains source/evidence, and notifies the strategist.
+A trial occupies that lineage's selected-version slot during bounded gameplay use. Action/evaluation count exhaustion stops new proposals and lets the last already admitted action settle, including its exact emitter-retirement barrier, within the original time bound. Time expiry, Stop, retirement and life loss still revoke effects immediately. Draining or resuming after suspension replenishes no budget. After safe closure, the runtime returns to a specifically selected compatible prior version or no policy; any necessary cancellation uses the normal handshake. Promotion requires explicit evidence-linked selection; a policy's own claim of success is insufficient. Restoring a prior compatible version is an audited atomic switch, not a world rollback. Quarantine removes selection, fences evaluations, safely cancels affected execution where necessary, retains source/evidence, and notifies the strategist.
 
 ## Fast decisions and model capabilities
 

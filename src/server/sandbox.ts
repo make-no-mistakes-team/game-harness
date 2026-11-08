@@ -37,8 +37,8 @@ import {
 } from "./program-instrumentation.ts";
 import { validateProgramSource, type ExecutableValidationContext } from "./program-validation.ts";
 import type { SkillAPIManifest } from "../shared/programs.ts";
-import { capabilityFailure, GeneratedResultValidationError, parseGeneratedSkillResult, ProgramExecutionError, readProgramDiagnostic } from "./program-diagnostics.ts";
-import { controllerStepResultSchema, residentIntentSchema, residentStateSchema,
+import { capabilityFailure, GeneratedResultValidationError, parseGeneratedControllerResult, parseGeneratedSkillResult, ProgramExecutionError, readProgramDiagnostic } from "./program-diagnostics.ts";
+import { residentIntentSchema, residentStateSchema,
   type ControllerStepResult, type ResidentWorker, type ResidentAnalysisWorker, 
   ResidentCleanupError, RESIDENT_STEP_RESPONSE_MS} from "../shared/resident.ts";
 import type { MinecraftControllerFrame } from "../shared/minecraft.ts";
@@ -540,7 +540,7 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
   async step(frame: MinecraftControllerFrame, state: Json, intent: Json,
     signal?: AbortSignal): Promise<ControllerStepResult> {
     return await this.residentValue("step", { frame, state, intent }, signal, value =>
-      controllerStepResultSchema.parse(value));
+      parseGeneratedControllerResult(value));
   }
 
   async analyze(input: Json, signal?: AbortSignal, onEvaluation?: (elapsedMs: number) => void): Promise<Json> {

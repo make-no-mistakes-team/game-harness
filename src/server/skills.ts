@@ -622,7 +622,7 @@ export class SkillManager {
       await resident.start();
       const final = await completed.promise;
       if (final.status === "unknown") throw new ResidentCleanupError();
-      if (final.status === "failed") throw new Error(final.reason ?? "Resident computation failed");
+      if (final.status === "failed") throw resident.failure ?? new Error(final.reason ?? "Resident computation failed");
       return { status: final.status === "completed" ? "completed" : "blocked",
         summary: final.reason ?? `Resident ${final.status}`, result: { state: final.state,
           processed_frame_seq: final.processed_frame_seq, counters: final.counters } };

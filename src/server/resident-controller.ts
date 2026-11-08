@@ -4,9 +4,10 @@ import { sameEffectScope, type WorldHeld, type WorldInputEdge } from "../shared/
 import { controllerEffectUpdateSchema, controllerInputSchema, inputAppliedAckSchema, revocationAckSchema,
   type ControllerEffectUpdate, type ControllerInput, type ControllerInputChannel, type InputAppliedAck } from "../shared/controller.ts";
 import { minecraftControllerFrameSchema } from "../shared/minecraft.ts";
-import { controllerStepResultSchema, ResidentCleanupError, RESIDENT_STEP_RESPONSE_MS, residentAnalysisInputSchema, residentAnalysisOutputSchema, residentIntentSchema, residentLimitsSchema, residentSourceIdentitySchema, residentStateSchema,
+import { ResidentCleanupError, RESIDENT_STEP_RESPONSE_MS, residentAnalysisInputSchema, residentAnalysisOutputSchema, residentIntentSchema, residentLimitsSchema, residentSourceIdentitySchema, residentStateSchema,
   type ResidentAnalysisResult, type ResidentAnalysisSource, type ResidentClock, type ResidentControllerOptions,
   type ResidentSnapshot, type ResidentTimingSummary, type ResidentTraceStage } from "../shared/resident.ts";
+import { GeneratedControllerResultValidationError, parseGeneratedControllerResult } from "./program-diagnostics.ts";
 
 const heldKeys: (keyof WorldHeld)[] = ["forward", "back", "left", "right", "jump", "sprint", "sneak", "attack", "use"];
 const neutral: WorldHeld = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, attack: false, use: false };
@@ -69,6 +70,9 @@ export class ResidentController {
   private finalStatus: ResidentSnapshot["status"] = "stopped";
   private traceSequence = 0;
   private observerErrors = 0;
+  private resultFailure: GeneratedControllerResultValidationError | null = null;
+
+  get failure(): GeneratedControllerResultValidationError | null { return this.resultFailure; }
 
   constructor(options: ResidentControllerOptions) {
     this.options = { ...options, limits: residentLimitsSchema.parse(options.limits) };
@@ -313,7 +317,10 @@ export class ResidentController {
     // Publish the owned step before sampling or its observers can synchronously Stop.
     const flight = Promise.withResolvers<void>(); this.flight = flight.promise;
     void this.process(slot).then(flight.resolve, flight.reject);
-    void flight.promise.catch(error => this.finish("failed", `resident_step: ${message(error)}`)).finally(() => {
+    void flight.promise.catch(error => {
+      if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
+      this.finish("failed", `resident_step: ${message(error)}`);
+    }).finally(() => {
       this.flight = null; if (!this.fenced) { this.notify(false, false); this.schedule(); }
     });
   }
@@ -376,11 +383,11 @@ export class ResidentController {
       if (this.options.trace) this.trace({ stage: "result_validation", slot, frame_seq: frame.frame_seq, outcome: "discarded" });
       this.data.counters.stale_results++; if (!this.fenced && !this.options.current()) this.finish("stopped", "resident_source_changed"); return;
     }
-    let result: ReturnType<typeof controllerStepResultSchema.parse>;
+    let result: ReturnType<typeof parseGeneratedControllerResult>;
     let input: ControllerInput;
     let expanded: number;
     try {
-      result = controllerStepResultSchema.parse(raw);
+      result = parseGeneratedControllerResult(raw);
       const authored = result.input;
       if (authored.kind === "world" && !("edges" in authored)) {
         const edges: WorldInputEdge[] = [];

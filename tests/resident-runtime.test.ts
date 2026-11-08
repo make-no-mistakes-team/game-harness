@@ -28,7 +28,8 @@ function until(store: Store, runId: string, predicate: () => boolean) {
 }
 async function fixture(analysisFactory?: (budget: number) => Promise<ResidentAnalysisWorker>, limits: Partial<ResidentLimits> = {},
   hooks: { prepareLookahead?: SkillHost["prepareLookahead"]; changed?: SkillHost["changed"];
-    retire?: () => Promise<void>; runSkill?: SandboxService["runSkill"] } = {}) {
+    retire?: () => Promise<void>; runSkill?: SandboxService["runSkill"];
+    workerOutput?: (result: ControllerStepResult) => void } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-resident-root-")), store = new Store(directory), adapter = minecraftTestAdapter();
   const run = minecraftRunFixture(adapter); store.saveRun(run);
   let opened = 0, closed = 0, finiteCalls = 0, sequence = 0;
@@ -41,7 +42,9 @@ async function fixture(analysisFactory?: (budget: number) => Promise<ResidentAna
       : state !== null && typeof state === "object" && !Array.isArray(state) && typeof state.visits === "number" ? state.visits : null;
     if (visits === null) throw new Error("Fixture received an invalid resident visit state");
     firstStep.resolve();
-    return { input: { kind: "world", held: {forward:false,back:false,left:false,right:false,jump:false,sprint:false,sneak:false,attack:false,use:false}, edges: [], view: {kind: "unchanged"}, selected_hotbar: null }, next_state: {visits: visits + 1}, status: output, events: [] };
+    const result: ControllerStepResult = { input: { kind: "world", held: {forward:false,back:false,left:false,right:false,jump:false,sprint:false,sneak:false,attack:false,use:false}, edges: [], view: {kind: "unchanged"}, selected_hotbar: null }, next_state: {visits: visits + 1}, status: output, events: [] };
+    hooks.workerOutput?.(result);
+    return result;
   }, async close() { closed++; } };
   const manager = new SkillManager(store, { runSkill: hooks.runSkill ?? (async () => { finiteCalls++; throw new Error("Resident must not dispatch legacy capability execution"); }),
     async createResidentWorker(_source, _budget, signal) { compiled.resolve(); if (holdCompile) await finishCompile.promise; if (signal.aborted) { await worker.close(); throw new Error("compile aborted"); } return worker; },
@@ -195,6 +198,38 @@ test("selected resident root persists state and cleanup without spending finite 
   if (final.entry !== "step") throw new Error("Wrong selected entry");
   expect(final.resident).toMatchObject({state:{visits:1}, cleanup:{worker:"closed",native:"retired"}, counters:{steps:1,submissions:0}});
   expect(final.calls).toBe(0); expect(final.actions).toBe(0); expect(f.finiteCalls).toBe(0); expect(f.opened).toBe(1); expect(f.closed).toBe(1);
+});
+
+for (const edges of ["explicit", "omitted"] as const)
+test(`invalid resident return with ${edges} edges reports its public field failure only after retirement`, async () => {
+  const f = await fixture(undefined, {}, { workerOutput: result => {
+    Reflect.deleteProperty(result.input, "selected_hotbar");
+    if (edges === "omitted") Reflect.deleteProperty(result.input, "edges");
+    result.next_state = { private_note: "not-a-diagnostic-value" };
+  } });
+  f.running();
+  const execution = f.start();
+  await until(f.store, f.run.run_id, () => !!f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!.ended_at);
+  const final = f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!;
+  expect(final.status).toBe("failed");
+  expect(final.diagnostic).toMatchObject({ type: "GeneratedControllerResultValidationError",
+    code: "invalid_program_result", source_hash: f.program.hash });
+  expect(final.error).toContain("input.selected_hotbar");
+  expect(final.error).not.toContain("input.edges");
+  expect(JSON.stringify(final.diagnostic)).not.toContain("not-a-diagnostic-value");
+  if (final.entry !== "step") throw new Error("Wrong selected entry");
+  expect(final.resident).toMatchObject({ cleanup: { worker: "closed", native: "retired" }, counters: { submissions: 0 } });
+  expect(f.closed).toBe(1);
+});
+
+test("arbitrary resident host failure diagnostics still hide exception messages", async () => {
+  const f = await fixture(undefined, {}, { workerOutput: () => { throw new Error("host-private-path-or-credential"); } });
+  const execution = f.start();
+  await until(f.store, f.run.run_id, () => !!f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!.ended_at);
+  const final = f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!;
+  expect(final.status).toBe("failed");
+  expect(final.diagnostic?.type).toBe("ExecutionFailure");
+  expect(JSON.stringify(final.diagnostic)).not.toContain("host-private-path-or-credential");
 });
 
 test("Stop during module readiness drains compiler ownership before any native grant", async () => {

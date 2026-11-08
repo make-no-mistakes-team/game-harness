@@ -56,7 +56,8 @@ export function descriptor() {
       last_input: "actual_application_ack", effect_updates: "bounded_later_receipts", max_effect_updates: 8,
       max_effect_update_bytes: 16384 },
     audible: { source: "actually_delivered_allowlisted", capacity: 128, ttl_ms: 1000,
-      max_events_per_page: 8, cursors: "consumer_owned", creeper_primed: true },
+      max_events_per_page: 8, cursors: "consumer_owned", creeper_primed: true,
+      ordinary_groups: { max_groups: 8, cue_distinct: true, cue_priority: true } },
   };
   return {
     descriptor_schema: 1,
@@ -65,7 +66,7 @@ export function descriptor() {
     observation: {
       schema_version: 3, schema_hash: sha256(schemas.observation),
       payload_schema: { id: "contract_test_payload_v1", version: 1, hash: sha256(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_360_r8_control_v4", version: 4, configuration,
+      profile: { id: "minecraft_assisted_rgb_360_r8_control_v5", version: 5, configuration,
         configuration_hash: sha256(configuration) },
     },
     capabilities: [
@@ -112,7 +113,7 @@ export function historicalObservation() {
 export function minecraftTestAdapter(motorProfile: "precise" | "balanced" | "fast" = "balanced", options: { now?: () => number } = {}) {
   const schemas = minecraftSchemaCatalog(), value = descriptor();
   value.observation.schema_hash = sha256(schemas.observation);
-  value.observation.payload_schema = { id: "minecraft_observation_v1", version: 1, hash: sha256(schemas.payload) };
+  value.observation.payload_schema = { id: "minecraft_observation_v1", version: 2, hash: sha256(schemas.payload) };
   value.observation.profile.configuration = minecraftProfileConfiguration(motorProfile);
   value.observation.profile.configuration_hash = sha256(value.observation.profile.configuration);
   value.capabilities = Object.entries(schemas.capabilities).map(([key, schema]) => {

@@ -60,7 +60,7 @@ function fixture(runner?: SandboxService["runSkill"], hooks: { action?: SkillHos
       name: "stone", position: { x: .5, y: 63.5, z: .5 }, observed_at: "2026-10-22T00:00:00Z", current: true }],
     entities: [{ target: { target_id: "authorized-item", incarnation: 1, life_id: run.life_id!, space: { dimension_id: "minecraft:overworld", space_epoch: 1 } },
       name: "item", item_name: "stone", position: { x: 1, y: 64, z: 0 }, observed_at: "2026-10-22T00:00:00Z", current: true }],
-    sounds: [{ category: "movement", direction: "here", distance: "near", observed_at: "2026-10-22T00:00:00Z" }],
+    sounds: [{ category: "movement", cue: null, direction: "here", distance: "near", observed_at: "2026-10-22T00:00:00Z" }],
     } });
   const history = new HistoryReader(store.readLocation());
   const learning = new ImprovementLearning(store, history);

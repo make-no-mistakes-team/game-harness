@@ -1749,6 +1749,7 @@ public final class NativeClient implements ClientModInitializer {
     for (SoundProjection.Group group : sounds.recent(System.nanoTime())) {
       JsonObject sound = new JsonObject();
       sound.addProperty("category", SOUND_CATEGORIES[group.category()]);
+      sound.addProperty("cue", group.cue());
       sound.addProperty("direction", SOUND_DIRECTIONS[group.direction()]);
       sound.addProperty("distance", SOUND_BANDS[group.distance()]);
       sound.addProperty("observed_at", Instant.ofEpochMilli(group.wallMillis()).toString());

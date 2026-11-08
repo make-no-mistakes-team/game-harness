@@ -87,8 +87,8 @@ export async function buildNativeContract(projectRoot: string): Promise<NativeCo
   const descriptor: AdapterDescriptor = { descriptor_schema: 1, game: { id: "minecraft", version: buildInputs.pins.minecraft },
     adapter: { id: "fabric-owned-client", version: "1.0.0", build_hash: contractHash(buildInputs) },
     observation: { schema_version: 3, schema_hash: contractHash(schemas.observation),
-      payload_schema: { id: "minecraft_observation_v1", version: 1, hash: contractHash(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_360_r8_control_v4", version: 4, configuration,
+      payload_schema: { id: "minecraft_observation_v1", version: 2, hash: contractHash(schemas.payload) },
+      profile: { id: "minecraft_assisted_rgb_360_r8_control_v5", version: 5, configuration,
         configuration_hash: contractHash(configuration) } },
     capabilities: Object.entries(schemas.capabilities).map(([key, schema]) => {
       const separator = key.lastIndexOf("@");

@@ -114,8 +114,10 @@ public final class SoundProjectionProof {
   private static void scopeFences() {
     SoundProjection sounds = new SoundProjection();
     String oldStream = sounds.streamId();
-    sounds.accept(oldStream, 0, 0, 0, 2, WALL, NOW);
+    sounds.accept(oldStream, 5, 0, 0, 2, WALL, NOW);
     var old = sounds.page(null, NOW).nextCursor();
+    require("creeper_primed".equals(sounds.recent(NOW).getFirst().cue()),
+        "ordinary projection lost the old scope's admitted cue");
     rejects(() -> sounds.page(new SoundProjection.Cursor(oldStream, 2), NOW),
         "future cursor was admitted");
     rejects(() -> sounds.page(new SoundProjection.Cursor(oldStream, -1), NOW),
@@ -125,13 +127,16 @@ public final class SoundProjectionProof {
     rejects(() -> sounds.page(old, NOW), "old-life cursor crossed a scope reset");
     rejects(() -> sounds.page(new SoundProjection.Cursor("foreign", 0), NOW),
         "foreign stream acquired history");
-    sounds.accept(oldStream, 0, 0, 0, 2, WALL, NOW);
-    sounds.accept((String) null, 0, 0, 0, 2, WALL, NOW);
+    sounds.accept(oldStream, 5, 0, 0, 2, WALL, NOW);
+    sounds.accept((String) null, 5, 0, 0, 2, WALL, NOW);
     var reset = sounds.page(null, NOW);
-    require(reset.events().isEmpty() && reset.nextCursor().sequence() == 0 && !reset.gap(),
+    require(reset.events().isEmpty() && reset.nextCursor().sequence() == 0 && !reset.gap()
+        && sounds.recent(NOW).isEmpty(),
         "late old-scope callback or unadmitted tag entered the new ring");
-    sounds.accept(sounds.streamId(), 0, 0, 0, 2, WALL, NOW);
-    require(sounds.page(null, NOW).events().getFirst().sequence() == 1,
+    sounds.accept(sounds.streamId(), 5, 0, 0, 2, WALL + 1, NOW + 1);
+    require(sounds.page(null, NOW + 1).events().getFirst().sequence() == 1
+        && sounds.recent(NOW + 1).size() == 1
+        && sounds.recent(NOW + 1).getFirst().wallMillis() == WALL + 1,
         "new scope did not start an independent sequence");
   }
 
@@ -175,6 +180,75 @@ public final class SoundProjectionProof {
         && manyGroups.page(null, NOW).events().size() == 8
         && manyGroups.page(null, NOW).hasMore(),
         "legacy group cap discarded ring events or consumed the next observer's presence");
+  }
+
+  private static void ordinaryCueGroups() {
+    for (boolean cueFirst : new boolean[] {true, false}) {
+      SoundProjection sounds = new SoundProjection();
+      sounds.accept(cueFirst ? 5 : 2, 0, 0, 2, WALL, NOW);
+      sounds.accept(cueFirst ? 2 : 5, 0, 0, 2, WALL + 7, NOW + 7);
+      var page = sounds.page(null, NOW + 7);
+      var groups = sounds.recent(NOW + 7);
+      require(groups.size() == 2, "same-bin generic combat and priming merged");
+      var cue = groups.getFirst();
+      var generic = groups.get(1);
+      require(cue.category() == 2 && "creeper_primed".equals(cue.cue())
+          && cue.wallMillis() == (cueFirst ? WALL : WALL + 7)
+          && generic.category() == 2 && generic.cue() == null
+          && generic.wallMillis() == (cueFirst ? WALL + 7 : WALL)
+          && cue.direction() == generic.direction() && cue.distance() == generic.distance(),
+          "ordinary groups lost cue priority, separate bins or original timestamps");
+      require(groups.equals(sounds.recent(NOW + 7))
+          && page.equals(sounds.page(null, NOW + 7))
+          && sounds.page(page.nextCursor(), NOW + 7).events().isEmpty()
+          && groups.equals(sounds.recent(NOW + 7)),
+          "ordinary and paged cue reads consumed each other's history");
+      try {
+        groups.clear();
+        throw new AssertionError("caller could mutate ordinary sound groups");
+      } catch (UnsupportedOperationException expected) {
+        // Groups are immutable snapshots, independent of the retained ring.
+      }
+    }
+
+    SoundProjection capped = new SoundProjection();
+    double[][] offsets = {{0, -2}, {2, -2}, {2, 0}, {2, 2}, {0, 2}, {-2, 2}, {-2, 0}, {-2, -2}};
+    for (int i = offsets.length - 1; i >= 0; i--)
+      capped.accept(0, offsets[i][0], 0, offsets[i][1], WALL + i, NOW + i);
+    capped.accept(5, 0, 0, 2, WALL + 8, NOW + 8);
+    var groups = capped.recent(NOW + 8);
+    require(groups.size() == 8 && "creeper_primed".equals(groups.getFirst().cue())
+        && groups.getFirst().wallMillis() == WALL + 8,
+        "eight generic bins masked a retained cue before the group cap");
+    for (int i = 1; i < groups.size(); i++)
+      require(groups.get(i).category() == 0 && groups.get(i).cue() == null
+          && groups.get(i).direction() == i && groups.get(i).wallMillis() == WALL + i - 1,
+          "generic remainder was not in deterministic bin order");
+    var first = capped.page(null, NOW + 8);
+    var last = capped.page(first.nextCursor(), NOW + 8);
+    require(first.events().size() == 8 && first.hasMore() && last.events().size() == 1
+        && "creeper_primed".equals(last.events().getFirst().cue())
+        && !last.hasMore() && groups.equals(capped.recent(NOW + 8)),
+        "ordinary cap discarded the paged cue or paged reads consumed ordinary groups");
+
+    SoundProjection expiry = new SoundProjection();
+    expiry.accept(5, 0, 0, 2, WALL, NOW);
+    expiry.accept(2, 0, 0, 2, WALL + 7, NOW + 7);
+    var boundary = expiry.recent(NOW + 1_000_000_000L);
+    require(boundary.size() == 2 && "creeper_primed".equals(boundary.getFirst().cue())
+        && boundary.getFirst().wallMillis() == WALL,
+        "ordinary cue expired at the exact TTL boundary or borrowed generic time");
+    var expired = expiry.recent(NOW + 1_000_000_001L);
+    require(expired.size() == 1 && expired.getFirst().cue() == null
+        && expired.getFirst().wallMillis() == WALL + 7,
+        "newer same-bin generic combat refreshed an expired cue");
+    var page = expiry.page(null, NOW + 1_000_000_001L);
+    require(page.gap() && page.omittedBefore() == 1 && page.events().size() == 1
+        && page.events().getFirst().cue() == null,
+        "ordinary expiry consumed the generic event or concealed the expired cue's page gap");
+    require(expiry.recent(NOW + 1_000_000_007L).size() == 1
+        && expiry.recent(NOW + 1_000_000_008L).isEmpty(),
+        "ordinary generic group lost its independent exact TTL boundary");
   }
 
   private static void allowlistAndAudibility() {
@@ -229,8 +303,10 @@ public final class SoundProjectionProof {
     overflowAndExpiry();
     scopeFences();
     binsAndLegacyPresence();
+    ordinaryCueGroups();
     allowlistAndAudibility();
     System.out.println("Sound projection proof PASS: independent cursors, bounded pages, explicit gaps,"
-        + " scope fencing, monotonic expiry, coarse bins, non-draining legacy presence and audibility gates.");
+        + " scope fencing, monotonic expiry, coarse bins, cue-distinct prioritized ordinary groups,"
+        + " non-draining presence and audibility gates.");
   }
 }

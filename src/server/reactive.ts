@@ -95,6 +95,11 @@ interface ContextIdentity {
   screen: ScreenRef | null;
 }
 
+interface TrialDrain {
+  controller: AbortController;
+  done: Promise<void>;
+}
+
 interface PolicySlot extends PolicyAuthority {
   runId: string;
   identity: ContextIdentity;
@@ -104,6 +109,7 @@ interface PolicySlot extends PolicyAuthority {
   expiry: NodeJS.Timeout | undefined;
   controller: AbortController | null;
   evaluation: Promise<void> | null;
+  trialDrain: TrialDrain | null;
   trial_started: number;
   trial_evaluations: number;
   max_ms: number;
@@ -500,6 +506,7 @@ export class ReactiveRuntime {
         expiry: undefined,
         controller: null,
         evaluation: null,
+        trialDrain: null,
         trial_started: 0,
         trial_deadline: 0,
         trial_actions: 0,
@@ -1518,8 +1525,82 @@ export class ReactiveRuntime {
     });
   }
 
+  private async waitForTrialActions(slot: PolicySlot, ids: ReadonlySet<string>, signal: AbortSignal): Promise<void> {
+    const complete = Promise.withResolvers<void>();
+    let joining = false;
+    const aborted = () => complete.resolve();
+    const check = () => {
+      if (joining || signal.aborted) return;
+      try {
+        for (const id of ids) {
+          const action = this.store.getAction(slot.runId, id);
+          if (!action) throw new RuntimeFault("unknown_effect", "Admitted trial action history is unavailable");
+          if (!terminal[action.view.status]) return;
+        }
+        joining = true;
+        const current = this.actions.active;
+        const retired = current && ids.has(current.entry.stored.view.action_id)
+          ? this.actions.awaitRetirement(current) : Promise.resolve();
+        void retired.then(complete.resolve, complete.reject);
+      } catch (error) {
+        complete.reject(error);
+      }
+    };
+    const off = this.store.subscribe(event => {
+      if (event.run_id === slot.runId && event.type.startsWith("action.")) check();
+    });
+    signal.addEventListener("abort", aborted, { once: true });
+    try {
+      if (signal.aborted) aborted();
+      else check();
+      await complete.promise;
+    } finally {
+      off();
+      signal.removeEventListener("abort", aborted);
+    }
+  }
+
   private async finishTrial(slot: PolicySlot, reason: string): Promise<void> {
     if (slot.view.state !== "trial" || slot.closure || !slot.selected) return;
+    const now = Date.now();
+    const timeExpired = slot.watch_started > 0 && now >= slot.watch_deadline ||
+      slot.trial_started > 0 && now >= slot.trial_deadline;
+    if (!timeExpired) {
+      const ids = new Set(this.actions.queue.filter(entry => entry.policy === slot)
+        .map(entry => entry.stored.view.action_id));
+      const active = this.actions.active;
+      if (active?.entry.policy === slot) ids.add(active.entry.stored.view.action_id);
+      if (ids.size) {
+        if (slot.trialDrain) return;
+        // Count exhaustion closes proposals, not the last already-admitted
+        // effect. Keep its original time fence and independent Stop path.
+        clearTimeout(slot.timer);
+        slot.timer = undefined;
+        this.armExpiry(slot);
+        const generation = slot.generation;
+        const complete = Promise.withResolvers<void>();
+        const drain: TrialDrain = { controller: new AbortController(), done: complete.promise };
+        slot.trialDrain = drain;
+        const work = (async () => {
+          try {
+            await this.waitForTrialActions(slot, ids, drain.controller.signal);
+            if (!drain.controller.signal.aborted && slot.selected && !slot.closure &&
+                slot.generation === generation && this.slots.get(keyOf(slot.view)) === slot)
+              this.deferClose(() => this.finishTrial(slot, reason), slot);
+          } finally {
+            if (slot.trialDrain === drain) slot.trialDrain = null;
+          }
+        })();
+        void work.then(complete.resolve, complete.reject);
+        void complete.promise.catch(() => {
+          if (slot.generation === generation && slot.selected) {
+            this.backgroundFailure(slot);
+            this.deferClose(() => this.closePolicy(slot, "quarantined", "Trial action retirement could not be confirmed"), slot);
+          }
+        });
+        return;
+      }
+    }
     slot.tried = true;
     await this.closePolicy(
       slot,
@@ -1558,6 +1639,9 @@ export class ReactiveRuntime {
         }
       });
     slot.generation++;
+    const trialDrain = slot.trialDrain;
+    slot.trialDrain = null;
+    trialDrain?.controller.abort();
     clearTimeout(slot.timer);
     clearTimeout(slot.expiry);
     slot.timer = undefined;
@@ -1571,6 +1655,7 @@ export class ReactiveRuntime {
         worker ? this.closeWorker(worker) : Promise.resolve(),
         this.actions.cancelPolicy(slot, reason),
         evaluation,
+        trialDrain?.done,
       ]);
       if (results.some((result) => result.status === "rejected"))
         throw new RuntimeFault(

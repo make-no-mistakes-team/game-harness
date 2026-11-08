@@ -70,7 +70,9 @@ export const policySpecSchema = z.object({ backend: z.enum(["javascript", "jev"]
   name: z.string().min(1).max(80), source: z.string().min(1).max(32768).refine(value => utf8.encode(value).length <= 32768, "Policy source exceeds 32 KiB"),
   card: z.object({ purpose: z.string().min(1).max(1000), applicability: z.string().min(1).max(1000), method: z.string().min(1).max(2000),
     reason: z.string().min(1).max(1000), limitations: z.string().min(1).max(1000) }).strict(),
-  priority: z.number().int().min(0).max(100), interval_ms: z.number().int().min(200).max(5000),
+  priority: z.number().int().min(0).max(100)
+    .describe("Author-selected lease priority. An unrelated policy must exceed the current action priority to preempt it; semantic program leaves use priority 0. Priority 0 cannot interrupt one."),
+  interval_ms: z.number().int().min(200).max(5000),
 }).strict().superRefine((spec, context) => {
   if (spec.backend === "javascript" && spec.choices !== null || spec.backend === "jev" && spec.choices === null)
     context.addIssue({ code: "custom", message: "JavaScript requires null choices; Jev requires finite choices" });

@@ -48,7 +48,7 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
   const schemas = minecraftSchemaCatalog();
   const compatibility = adapterCompatibility(descriptor, schemas);
   descriptor = compatibility.descriptor;
-  if (descriptor.observation.profile.id !== "minecraft_assisted_rgb_360_r8_control_v4" || descriptor.observation.profile.version !== 4)
+  if (descriptor.observation.profile.id !== "minecraft_assisted_rgb_360_r8_control_v5" || descriptor.observation.profile.version !== 5)
     throw new Error("Minecraft adapter requires its registered control-feedback profile");
   const configuration = minecraftProfileConfigurationSchema.parse(descriptor.observation.profile.configuration);
   const now = options.now ?? Date.now;

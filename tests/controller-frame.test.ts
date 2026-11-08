@@ -84,7 +84,7 @@ test("frame projection rejects hidden state, private scope and pretend atomic im
 });
 
 test("application feedback admits actual input ACK separately from a later uncertain GUI receipt", () => {
-  const value = { ...frame(), schema_version: 2, profile_id: "minecraft_assisted_rgb_360_r8_control_v4", profile_version: 4,
+  const value = { ...frame(),
     last_input: { controller_generation: 2, sequence: 4, ordered_edge_prefix: 1,
       applied_native_tick: 124, applied_native_ns: "-9007199254741000",
       held: { forward: false, back: false, left: false, right: false, jump: false,
@@ -216,8 +216,11 @@ test("registered frame request requires an explicit consumer cursor and generate
 test("feedback profile negotiation rejects old identities and omitted or inflated feedback permissions", () => {
   const adapter = minecraftTestAdapter(), descriptor = adapter.descriptor;
   for (const profile of [{ ...descriptor.observation.profile, id: "minecraft_assisted_rgb_360_r8_gui_v2", version: 2 },
+    { ...descriptor.observation.profile, id: "minecraft_assisted_rgb_360_r8_control_v4", version: 4 },
     { ...descriptor.observation.profile, version: 2 }])
     expect(() => createMinecraftAdapter({ ...descriptor, observation: { ...descriptor.observation, profile } })).toThrow();
+  expect(minecraftControllerFrameSchema.safeParse({ ...frame(),
+    profile_id: "minecraft_assisted_rgb_360_r8_control_v4", profile_version: 4 }).success).toBe(false);
   const configuration = descriptor.observation.profile.configuration;
   if (!configuration || typeof configuration !== "object" || Array.isArray(configuration)) throw new Error("Expected profile object");
   for (const invalid of [{ ...configuration, controller_feedback: undefined },
@@ -225,6 +228,23 @@ test("feedback profile negotiation rejects old identities and omitted or inflate
     { ...configuration, audible: { source: "all_sound_sources" } },
     { ...configuration, actor_image: { codec: "png", presentation: "opaque_rgb", alignment: "atomic" } }])
     expect(minecraftProfileConfigurationSchema.safeParse(invalid).success).toBe(false);
+});
+
+test("ordinary audible permissions require the exact bounded cue-distinct priority declaration", () => {
+  const adapter = minecraftTestAdapter(), descriptor = adapter.descriptor;
+  const configuration = minecraftProfileConfigurationSchema.parse(descriptor.observation.profile.configuration);
+  for (const ordinary_groups of [undefined, {}, { max_groups: 8, cue_distinct: true },
+    { max_groups: 9, cue_distinct: true, cue_priority: true },
+    { max_groups: 8, cue_distinct: false, cue_priority: true },
+    { max_groups: 8, cue_distinct: true, cue_priority: false },
+    { max_groups: 8, cue_distinct: true, cue_priority: true, hidden_fuse: true }]) {
+    const invalid = { ...configuration, audible: { ...configuration.audible, ordinary_groups } };
+    expect(minecraftProfileConfigurationSchema.safeParse(invalid).success).toBe(false);
+    const wireConfiguration = JSON.parse(JSON.stringify(invalid));
+    const profile = { ...descriptor.observation.profile, configuration: wireConfiguration,
+      configuration_hash: contractHash(wireConfiguration) };
+    expect(() => createMinecraftAdapter({ ...descriptor, observation: { ...descriptor.observation, profile } })).toThrow();
+  }
 });
 
 test("client-predicted controller inventory never becomes a server observation or a possession witness", () => {

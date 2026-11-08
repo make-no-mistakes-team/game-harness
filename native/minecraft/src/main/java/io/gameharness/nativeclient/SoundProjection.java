@@ -28,14 +28,15 @@ public final class SoundProjection {
       boolean hasMore,
       List<Event> events) {}
 
-  public record Group(int category, int direction, int distance, long wallMillis) {}
+  public record Group(int category, String cue, int direction, int distance, long wallMillis) {}
 
   private static final int CAPACITY = 128;
   private static final int PAGE_SIZE = 8;
   private static final long TTL_NANOS = 1_000_000_000L;
   private static final long MAX_SEQUENCE = 9_007_199_254_740_991L;
   private final Event[] retained = new Event[CAPACITY];
-  private final Event[] grouped = new Event[5 * 9 * 3];
+  // Cue bins precede the five generic categories so the result cap cannot hide a retained cue.
+  private final Event[] grouped = new Event[6 * 9 * 3];
   private String streamId = UUID.randomUUID().toString();
   private long sequence;
   private int head;
@@ -173,19 +174,21 @@ public final class SoundProjection {
         omitted, end < size, Collections.unmodifiableList(events));
   }
 
-  /** Bounded legacy presence, using original event wall time and never consuming the ring. */
+  /** Cue-first, bounded presence, using original event wall time and never consuming the ring. */
   public synchronized List<Group> recent(long nowNativeNanos) {
     expire(nowNativeNanos);
     Arrays.fill(grouped, null);
     for (int i = 0; i < size; i++) {
       Event event = at(i);
-      grouped[(event.category() * 9 + event.direction()) * 3 + event.distance()] = event;
+      int kind = event.cue() == null ? event.category() + 1 : 0;
+      grouped[(kind * 9 + event.direction()) * 3 + event.distance()] = event;
     }
     List<Group> result = null;
     for (Event event : grouped) {
       if (event == null) continue;
       if (result == null) result = new ArrayList<>(PAGE_SIZE);
-      result.add(new Group(event.category(), event.direction(), event.distance(), event.wallMillis()));
+      result.add(new Group(event.category(), event.cue(), event.direction(), event.distance(),
+          event.wallMillis()));
       if (result.size() == PAGE_SIZE) break;
     }
     Arrays.fill(grouped, null);

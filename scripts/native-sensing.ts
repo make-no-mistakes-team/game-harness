@@ -317,9 +317,10 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
       const second = await read(cursor); entry.first = first; entry.second = second;
       requireProof(second.audible.events.some(value => value.sequence === event.sequence && value.heard_at === event.heard_at && value.heard_native_ns === event.heard_native_ns),
         "One audible consumer consumed another's event or rewrote its heard time");
-      const legacy = await fixture.observe(); entry.legacy = legacy;
-      requireProof(legacy.data.sounds.some(sound => sound.category === "combat" && sound.observed_at === event.heard_at),
-        "Legacy observation drained the ring or relabelled original heard time");
+      const ordinary = await fixture.observe(); entry.ordinary = ordinary;
+      requireProof(ordinary.data.sounds.some(sound => sound.category === "combat" && sound.cue === "creeper_primed" &&
+        sound.observed_at === event.heard_at && sound.direction === event.direction && sound.distance === event.distance),
+        "Ordinary observation lost the actually heard cue, coarse bins or original heard time");
       requireProof(!(await read(first.audible.next_cursor)).audible.events.some(value => value.sequence === event.sequence), "A cursor replayed its prior event");
       await pause(1100); const expired = await read(cursor); entry.expired = expired;
       requireProof(expired.audible.gap && expired.audible.omitted_before > 0 && !expired.audible.events.some(value => value.sequence === event.sequence),

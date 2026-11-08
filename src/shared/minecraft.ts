@@ -17,10 +17,12 @@ export type MinecraftObservedBlock = {
 };
 export type MinecraftObservedEntity = MinecraftObservedBlock & { item_name?: string };
 export type MinecraftSoundObservation = {
-  category: "movement" | "interaction" | "combat" | "creature" | "weather";
   direction: "here" | "N" | "NE" | "E" | "SE" | "S" | "SW" | "W" | "NW";
   distance: "near" | "mid" | "far"; observed_at: string;
-};
+} & (
+  | { category: "movement" | "interaction" | "combat" | "creature" | "weather"; cue: null }
+  | { category: "combat"; cue: "creeper_primed" }
+);
 export type MinecraftObservationData = {
   player: MinecraftPlayer;
   blocks: MinecraftObservedBlock[];
@@ -74,12 +76,20 @@ export const minecraftObservedEntitySchema = minecraftObservedBlockSchema.extend
   position: vector.describe("Entity runtime origin, not bounding-box center or a block-cell index.") }).strict()
   .refine(entity => entity.item_name === undefined || entity.name === "item" || entity.name === "minecraft:item",
     { message: "Only visible ItemEntity observations may expose item registry identity" });
-export const minecraftSoundSchema = z.object({ category: z.enum(["movement", "interaction", "combat", "creature", "weather"]),
+const ordinarySoundFields = {
   direction: z.enum(["here", "N", "NE", "E", "SE", "S", "SW", "W", "NW"]), distance: z.enum(["near", "mid", "far"]),
-  observed_at: timestamp }).strict();
+  observed_at: timestamp.describe("Original actually heard event time, not the observation or grouping time."),
+};
+export const minecraftSoundSchema = z.union([
+  z.object({ ...ordinarySoundFields, category: z.enum(["movement", "interaction", "combat", "creature", "weather"]),
+    cue: z.null().describe("No distinct allowlisted cue was heard for this group.") }).strict(),
+  z.object({ ...ordinarySoundFields, category: z.literal("combat"),
+    cue: z.literal("creeper_primed").describe("Actually heard allowlisted creeper priming sound; not hidden fuse state, source identity or position.") }).strict(),
+]);
 export const minecraftObservationDataSchema = z.object({ player: minecraftPlayerSchema,
   blocks: z.array(minecraftObservedBlockSchema).max(144), entities: z.array(minecraftObservedEntitySchema).max(32),
-  sounds: z.array(minecraftSoundSchema).max(8),
+  sounds: z.array(minecraftSoundSchema).max(8)
+    .describe("Non-draining groups of actually delivered allowlisted sounds retained for 1000ms. Cue-distinct groups precede generic groups before the eight-group cap; groups retain original heard times."),
 }).strict().refine(data => data.blocks.length + data.entities.length + data.sounds.length + data.player.inventory.length <= 256,
   { message: "Minecraft observation exceeds combined item bound" }) satisfies z.ZodType<MinecraftObservationData>;
 function targetsMatchObservation(targets: readonly MinecraftObservedBlock[], observation: ObservationV3<unknown>) {
@@ -216,7 +226,7 @@ export const minecraftRenderCaptureSchema = z.object({
 export const minecraftControllerFrameSchema = z.object({
   schema_version: z.literal(2), frame_seq: safeCounterSchema.min(1), native_tick: safeCounterSchema,
   captured_native_ns: nativeNanoseconds, captured_at: frameTimestamp,
-  profile_id: z.literal("minecraft_assisted_rgb_360_r8_control_v4"), profile_version: z.literal(4),
+  profile_id: z.literal("minecraft_assisted_rgb_360_r8_control_v5"), profile_version: z.literal(5),
   life_id: safeCounterSchema, space: spaceRefSchema, player: minecraftOwnBodySchema,
   inventory: z.object({ source: z.literal("client_prediction"), captured_native_ns: nativeNanoseconds,
     items: z.array(minecraftInventoryItemSchema).max(64) }).strict()
@@ -283,7 +293,9 @@ export const minecraftProfileConfigurationSchema = z.object({
     max_effect_update_bytes: z.literal(16384) }).strict(),
   audible: z.object({ source: z.literal("actually_delivered_allowlisted"), capacity: z.literal(128),
     ttl_ms: z.literal(1000), max_events_per_page: z.literal(8), cursors: z.literal("consumer_owned"),
-    creeper_primed: z.literal(true) }).strict(),
+    creeper_primed: z.literal(true), ordinary_groups: z.object({
+      max_groups: z.literal(8), cue_distinct: z.literal(true), cue_priority: z.literal(true),
+    }).strict() }).strict(),
 }).strict();
 export function minecraftProfileConfiguration(motorProfile: "precise" | "balanced" | "fast" = "balanced") {
   return minecraftProfileConfigurationSchema.parse({
@@ -298,7 +310,8 @@ export function minecraftProfileConfiguration(motorProfile: "precise" | "balance
       last_input: "actual_application_ack", effect_updates: "bounded_later_receipts", max_effect_updates: 8,
       max_effect_update_bytes: 16384 },
     audible: { source: "actually_delivered_allowlisted", capacity: 128, ttl_ms: 1000,
-      max_events_per_page: 8, cursors: "consumer_owned", creeper_primed: true },
+      max_events_per_page: 8, cursors: "consumer_owned", creeper_primed: true,
+      ordinary_groups: { max_groups: 8, cue_distinct: true, cue_priority: true } },
   });
 }
 
@@ -380,6 +393,17 @@ export const minecraftEffectUncertaintyFactSchema = z.object({
   reason: z.enum(["effect_unconfirmed", "inventory_receipt_unconfirmed"]),
 }).strict();
 
+type HistoricalSoundObservationV2 = {
+  category: "movement" | "interaction" | "combat" | "creature" | "weather";
+  direction: "here" | "N" | "NE" | "E" | "SE" | "S" | "SW" | "W" | "NW";
+  distance: "near" | "mid" | "far"; observed_at: string;
+};
+const historicalSoundV2Schema = z.object({
+  category: z.enum(["movement", "interaction", "combat", "creature", "weather"]),
+  direction: z.enum(["here", "N", "NE", "E", "SE", "S", "SW", "W", "NW"]),
+  distance: z.enum(["near", "mid", "far"]), observed_at: timestamp,
+}).strict() satisfies z.ZodType<HistoricalSoundObservationV2>;
+
 /** Explicit read codec. This shape is never an active adapter observation. */
 export interface HistoricalObservationV2 {
   schema_version: 2; world_id: string; epoch: number; session_id: string; life: PlayerLife;
@@ -387,13 +411,13 @@ export interface HistoricalObservationV2 {
   preset_id: "minecraft-observable-initial-r2"; player: MinecraftPlayer;
   blocks: { id: string; name: string; position: Vec3Data; observed_at: string; current: boolean }[];
   entities: { id: string; name: string; position: Vec3Data; observed_at: string; current: boolean; item_name?: string }[];
-  sounds: MinecraftSoundObservation[]; coverage: { partial: true; max_age_ms: number };
+  sounds: HistoricalSoundObservationV2[]; coverage: { partial: true; max_age_ms: number };
 }
 const historicalBlock = z.object({ id: z.string().max(160), ...observedFields }).strict();
 export const historicalObservationV2Schema = z.object({ schema_version: z.literal(2), world_id: z.string().max(160),
   epoch: safeCounterSchema, session_id: identitySchema, life: playerLifeSchema, observation_seq: safeCounterSchema,
   captured_at: z.string().max(40), profile_id: z.literal("player-observable-structured"), preset_id: z.literal("minecraft-observable-initial-r2"),
   player: minecraftPlayerSchema, blocks: z.array(historicalBlock).max(200),
-  entities: z.array(historicalBlock.extend({ item_name: itemProjection }).strict()).max(32), sounds: z.array(minecraftSoundSchema).max(8),
+  entities: z.array(historicalBlock.extend({ item_name: itemProjection }).strict()).max(32), sounds: z.array(historicalSoundV2Schema).max(8),
   coverage: z.object({ partial: z.literal(true), max_age_ms: z.number().int().min(0).max(1000) }).strict(),
 }).strict().refine(value => value.blocks.length + value.entities.length + value.sounds.length + value.player.inventory.length <= 256) satisfies z.ZodType<HistoricalObservationV2>;

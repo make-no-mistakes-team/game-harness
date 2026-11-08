@@ -1,11 +1,15 @@
 import { expect, test } from "bun:test";
-import type { AdapterDescriptor, AdapterEvidence, GameActionResult, VerificationManifest } from "../src/shared/contracts.ts";
+import { validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
+import type { AdapterDescriptor, AdapterEvidence, GameActionResult, Json, VerificationManifest } from "../src/shared/contracts.ts";
 import type { EffectScope } from "../src/shared/control.ts";
-import type { MinecraftObservation } from "../src/shared/minecraft.ts";
-import { minecraftProfileConfiguration } from "../src/shared/minecraft.ts";
+import type { HistoricalObservationV2, MinecraftObservation, MinecraftSoundObservation } from "../src/shared/minecraft.ts";
+import { historicalObservationV2Schema, minecraftObservationV3Schema, minecraftProfileConfiguration } from "../src/shared/minecraft.ts";
+import { getGameAPIReference } from "../src/shared/validation.ts";
 import { contractHash } from "../src/server/adapter-contract.ts";
 import { createMinecraftAdapter } from "../src/server/minecraft-adapter.ts";
 import { minecraftSchemaCatalog } from "../src/server/native-contract.ts";
+import { RegisteredAdapterContract } from "../src/server/registered-adapter.ts";
+import { historicalObservation } from "./helpers/adapter-contract.ts";
 
 const now = Date.parse("2026-10-25T12:00:00Z");
 function fixture(goalId: string, initial: Record<string, number> = {}) {
@@ -15,8 +19,8 @@ function fixture(goalId: string, initial: Record<string, number> = {}) {
   const descriptor: AdapterDescriptor = { descriptor_schema: 1, game: { id: "minecraft", version: "1.21.4" },
     adapter: { id: "fabric-owned-client", version: "1.0.0", build_hash: "a".repeat(64) },
     observation: { schema_version: 3, schema_hash: contractHash(schemas.observation),
-      payload_schema: { id: "minecraft_observation_v1", version: 1, hash: contractHash(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_360_r8_control_v4", version: 4, configuration, configuration_hash: contractHash(configuration) } },
+      payload_schema: { id: "minecraft_observation_v1", version: 2, hash: contractHash(schemas.payload) },
+      profile: { id: "minecraft_assisted_rgb_360_r8_control_v5", version: 5, configuration, configuration_hash: contractHash(configuration) } },
     capabilities: [
       { id: "minecraft.action", version: 4, schema_hash: contractHash(schemas.capabilities["minecraft.action@4"]) },
       { id: "minecraft.recipes", version: 1, schema_hash: contractHash(schemas.capabilities["minecraft.recipes@1"]) },
@@ -55,6 +59,55 @@ function fixture(goalId: string, initial: Record<string, number> = {}) {
   }
   return { adapter, descriptor, scope, manifest, observation, observed, production };
 }
+
+test("ordinary sound cues survive registered admission and projection with combat-only wire semantics", () => {
+  const f = fixture("custom"), current = f.observation({});
+  const registry = new RegisteredAdapterContract(f.adapter.descriptor, f.adapter.schemas, f.adapter.capabilityValidators);
+  const helpPayload = Reflect.get(getGameAPIReference(f.adapter), "schemas").AdapterData;
+  const generic: MinecraftSoundObservation = {
+    category: "combat", cue: null, direction: "NE", distance: "near", observed_at: current.captured_at,
+  };
+  const primed: MinecraftSoundObservation = { ...generic, category: "combat", cue: "creeper_primed" };
+  const withSounds = (sounds: Json[]) => ({ ...current, data: { ...current.data, sounds } });
+  for (const category of ["movement", "interaction", "combat", "creature", "weather"] as const) {
+    const value = withSounds([{ ...generic, category }, primed]);
+    expect(minecraftObservationV3Schema.safeParse(value).success).toBe(true);
+    expect(validateJsonSchemaValue(helpPayload, value.data).success).toBe(true);
+    expect(registry.parseObservation(value).data).toEqual(value.data);
+  }
+  const { cue: _cue, ...missingCue } = generic;
+  for (const invalid of [
+    missingCue, { ...generic, cue: "creeper_fuse" },
+    { ...primed, category: "movement" }, { ...primed, category: "creature" },
+    { ...primed, source_position: { x: 1, y: 64, z: 1 } }, { ...primed, fuse_ticks: 20 },
+    { ...primed, entity_id: "hidden-source" },
+  ]) {
+    const value = withSounds([invalid]);
+    expect(minecraftObservationV3Schema.safeParse(value).success).toBe(false);
+    expect(validateJsonSchemaValue(helpPayload, value.data).success).toBe(false);
+    expect(() => registry.parseObservation(value)).toThrow();
+  }
+  for (const count of [8, 9]) {
+    const value = withSounds(Array.from({ length: count }, () => primed));
+    expect(minecraftObservationV3Schema.safeParse(value).success).toBe(count === 8);
+    expect(validateJsonSchemaValue(helpPayload, value.data).success).toBe(count === 8);
+    if (count === 8) expect(registry.parseObservation(value).data).toEqual(value.data);
+    else expect(() => registry.parseObservation(value)).toThrow();
+  }
+});
+
+test("historical schema2 sounds remain unchanged no-cue data, not active observation compatibility", () => {
+  const historical: HistoricalObservationV2 = { ...historicalObservation(), sounds: [
+    { category: "combat", direction: "NE", distance: "near", observed_at: "2026-10-22T00:00:00Z" },
+  ] };
+  expect(historicalObservationV2Schema.parse(historical)).toEqual(historical);
+  expect(historicalObservationV2Schema.safeParse({ ...historical,
+    sounds: historical.sounds.map(sound => ({ ...sound, cue: null })) }).success).toBe(false);
+  const f = fixture("custom"), current = f.observation({});
+  expect(minecraftObservationV3Schema.safeParse({ ...current,
+    data: { ...current.data, sounds: historical.sounds } }).success).toBe(false);
+  expect(minecraftObservationV3Schema.safeParse(historical).success).toBe(false);
+});
 
 test("own wood collection requires real gain over baseline, not existing wood, planks or visible blocks", () => {
   const f = fixture("collect_wood", { oak_log: 1 });

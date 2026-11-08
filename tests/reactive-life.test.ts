@@ -884,3 +884,86 @@ test("no key is explicitly unavailable and configured credentials do not prove s
   expect(other.run.usage.calls).toBe(1);
   expect(JSON.stringify(other.store.events(other.run.run_id))).not.toContain("unit-test-not-a-real-provider-key");
 });
+
+for (const allowance of ["action", "evaluation"] as const)
+test(`last admitted policy action settles before the exhausted ${allowance} allowance closes its selection`, async () => {
+  const f = fixture();
+  const result = hold<GameActionResult>({
+    status: "cancelled", summary: "Fixture cleanup", evidence: { world_effect_emitted: false, neutralized: true },
+  });
+  let signal: AbortSignal | undefined, evaluations = 0;
+  f.setExecutor(async (_action, current) => { signal = current; return await result.promise; });
+  const selected = await watch(f, { max_ms: 5000,
+    max_actions: allowance === "action" ? 1 : 4,
+    max_evaluations: allowance === "evaluation" ? 1 : 25 });
+  const decisionDue = event(f.store, "policy.trial_decision_due");
+  f.setEvaluator(async () => { evaluations++; return replacement; });
+  await f.execution();
+  await Bun.sleep(450);
+  expect(signal?.aborted).toBe(false);
+  expect(evaluations).toBe(1);
+  expect(f.executed).toHaveLength(1);
+  result.resolve({
+    status: "succeeded", summary: "Admitted camera action completed",
+    evidence: { effect_confirmed: true, camera_changed: true, world_effect_emitted: false, neutralized: true },
+  });
+  await decisionDue;
+  expect(f.actions.view?.status).toBe("succeeded");
+  expect(f.reactive.list.find(value => value.policy_id === selected.view.policy_id)).toMatchObject({
+    state: "validated", effects: 1,
+  });
+});
+
+for (const boundary of ["retire", "stop", "life", "deadline"] as const)
+test(`${boundary} still revokes the last admitted trial action without waiting for its natural result`, async () => {
+  const f = fixture();
+  const cancelled: GameActionResult = {
+    status: "cancelled", summary: "Actual fixture cancellation",
+    evidence: { world_effect_emitted: false, neutralized: true },
+  };
+  const result = hold<GameActionResult>(cancelled), aborted = Promise.withResolvers<void>();
+  let signal: AbortSignal | undefined;
+  f.setExecutor(async (_action, current) => {
+    signal = current;
+    const abort = () => { result.resolve(cancelled); aborted.resolve(); };
+    current.addEventListener("abort", abort, { once: true });
+    try { return await result.promise; }
+    finally { current.removeEventListener("abort", abort); }
+  });
+  const selected = await watch(f, { max_ms: boundary === "deadline" ? 1000 : 5000,
+    max_actions: 1, max_evaluations: 25 });
+  const due = boundary === "deadline" ? event(f.store, "policy.trial_decision_due") : undefined;
+  f.setEvaluator(async () => replacement);
+  await f.execution();
+  await Bun.sleep(250);
+  expect(signal?.aborted).toBe(false);
+  let closing: Promise<unknown> | undefined;
+  if (boundary === "retire") closing = f.reactive.retire(selected.ref, 1);
+  else if (boundary === "stop") {
+    f.run.status = "stopping"; f.store.saveRun(f.run); f.nextGeneration();
+    closing = f.reactive.closeAll(false);
+  } else if (boundary === "life") {
+    f.transition({ life_id: 1, status: "dead", can_respawn: true, death: null });
+    closing = f.reactive.lifeChanged();
+  }
+  if (boundary === "deadline") {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([aborted.promise, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Original trial time bound did not revoke the pending effect")), 1500);
+      })]);
+      await due;
+    } finally { clearTimeout(timer); }
+  } else {
+    expect(signal?.aborted).toBe(true);
+    await closing;
+  }
+  expect(f.executed).toHaveLength(1);
+  expect(f.actions.view?.status).toBe("cancelled");
+  if (boundary === "life") {
+    f.transition({ life_id: 2, status: "alive", can_respawn: false, death: null });
+    await f.reactive.resume(1);
+    await Bun.sleep(250);
+    expect(f.executed).toHaveLength(1);
+  }
+});

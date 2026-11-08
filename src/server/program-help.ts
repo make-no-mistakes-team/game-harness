@@ -6,6 +6,56 @@ import { PROGRAM_LIMITS } from "./program-validation.ts";
 import { controllerStepResultSchema, DEFAULT_RESIDENT_LIMITS, RESIDENT_STEP_RESPONSE_MS } from "../shared/resident.ts";
 import { helpSchema, memorySchema, nextConfigSchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
 
+// Shape reference only. Full generated JSON schemas remain in game/programs;
+// duplicating every constraint and description here evicts the callable shape
+// from the next bounded request as soon as the model has written useful code.
+function typeShape(value: unknown, references: ReadonlyMap<string, string>): string {
+  if (value === true) return "Json";
+  if (value === false) return "never";
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected a generated schema object");
+  const node = value as Record<string, unknown>;
+  if ("const" in node) {
+    const literal = JSON.stringify(node.const);
+    if (literal === undefined) throw new Error("Expected a JSON schema constant");
+    return literal;
+  }
+  if (Array.isArray(node.enum)) return node.enum.map(item => JSON.stringify(item)).join(" | ");
+  const union = node.anyOf ?? node.oneOf;
+  if (Array.isArray(union)) return union.map(child => typeShape(child, references)).join(" | ");
+  if (typeof node.$ref === "string") {
+    const reference = references.get(node.$ref);
+    if (!reference) throw new Error("Controller shape has an unresolved schema reference");
+    return reference;
+  }
+  if (Array.isArray(node.type)) return node.type.map(type => typeShape({ type }, references)).join(" | ");
+  if (node.type === "object") {
+    if (!node.properties || typeof node.properties !== "object" || Array.isArray(node.properties))
+      return node.additionalProperties === false ? "{}" : `Record<string, ${typeShape(node.additionalProperties ?? true, references)}>`;
+    const required = new Set(Array.isArray(node.required) ? node.required : []);
+    return `{ ${Object.entries(node.properties).map(([name, child]) =>
+      `${JSON.stringify(name)}${required.has(name) ? "" : "?"}: ${typeShape(child, references)}`).join("; ")} }`;
+  }
+  if (node.type === "array") return `Array<${typeShape(node.items ?? true, references)}>`;
+  if (node.type === "integer" || node.type === "number") return "number";
+  if (node.type === "string" || node.type === "boolean" || node.type === "null") return node.type;
+  if (Object.keys(node).every(key => ["$schema", "description", "title"].includes(key))) return "Json";
+  throw new Error("Unsupported generated controller shape");
+}
+
+function fieldShapes(value: unknown) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected generated controller fields");
+  const node = value as Record<string, unknown>;
+  if (!node.properties || typeof node.properties !== "object" || Array.isArray(node.properties))
+    throw new Error("Expected generated controller fields");
+  const definitions = node.$defs && typeof node.$defs === "object" && !Array.isArray(node.$defs) ? Object.entries(node.$defs) : [];
+  const references = new Map(definitions.map(([name], index) =>
+    [`#/$defs/${name.replaceAll("~", "~0").replaceAll("/", "~1")}`, `Data${index}`]));
+  return {
+    fields: Object.fromEntries(Object.entries(node.properties).map(([name, child]) => [name, typeShape(child, references)])),
+    types: Object.fromEntries(definitions.map(([, child], index) => [`Data${index}`, typeShape(child, references)])),
+  };
+}
+
 export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?: RuntimeAdapter) {
   const schema = (value: z.ZodType) => z.toJSONSchema(value, { unrepresentable: "any", io: "input" });
   if (topic === "game") {
@@ -40,7 +90,7 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?
         contract: "step_ms bounds isolated evaluation including serialization, not host IPC/scheduling delay. Host response wait never extends the original root deadline and sends no heartbeat. A returned running decision must still pass native150ms capture freshness and exact scope/intent checks before renewal/state publication. timings.step_ms is host round-trip wall time, not CPU.",
       },
       contract: "step has no game/native/provider/job capability. It receives the registered Minecraft controller frame, explicit JSON state and intent; args is initial intent, initial_state defaults null. Return one coherent input, next_state, status and events; never a Promise. State and intent <=16 KiB JSON UTF-8/depth32; complete result/envelope/newline <=64 KiB. Processed state is not submitted or applied input: frame.last_input and later effect_updates retain actual native acknowledgment and separate receipts. Fresh valid steps renew only the short native lease, never the original root deadline. Blocked/yielded/completed retires this execution; only a successful drained predecessor and explicit next permission may activate a prepared successor. No implicit rescue. Stop waits for worker/jobs and actual native retirement.",
-      operations: "program_run start entry step requires matching source and resident limits. Optional next authorizes one bounded source-preparation/continuation flight, just as for run. Inspect current execution for intent_version (initially0), state, counters and actual cleanup. update_intent with expected_version changes intent only; an in-flight old-intent result is discarded. analyze selects a named pure analyze source and expected_intent_version on the current resident. Its separate bounded job may run alongside step; output retains provenance/status and never changes intent or controls automatically. Only run sources can declare playing child dependencies.",
+      operations: "program_run start entry step requires matching source and resident limits. For a live replacement, optional handoff:{name,version,execution_ordinal} pins the exact current predecessor; submit/start validates successor before retirement and admits it only after confirmed release and fresh scope checks, without a cloud round between Stop and Start. Optional next prepares a successor after natural successful completion, not manual cancellation. Inspect intent_version (initially0) before update_intent; an in-flight old-intent result is discarded. Pure analyze never changes intent or input automatically. Only run sources can declare playing child dependencies.",
       input_transitions: "Supply all nine desired world held booleans and normally omit edges. The host derives one press/release per changed boolean from the last successfully submitted state, initially neutral, not the lagging native ACK. Unchanged held attack/use never adds another click. Explicit edges instead preserve exact counted presses and order: every held change then needs its matching press/release (release count one). An explicit inconsistent list, including [], is rejected, never repaired. Retain submitted held in next_state only when constructing explicit transitions; do not use frame.last_input as that baseline. Before screen input, submit neutral world held, with edges omitted or exact releases. A non-running result retires without submitting its input. Normal outcome feedback includes a bounded resident failure diagnostic; execution inspection retains full details.",
       gui_completion: "A visible GUI gesture can span several ticks. A changed cursor or slot is not proof that the preceding input finished. Keep the resident running with empty screen operations while awaiting its actual correlated input acknowledgment and terminal effect_updates receipt before submitting a dependent GUI operation. Receipts retain their input sequence; do not guess completion from a fixed sleep or replay an unknown operation. Fresh screen identity and local cursor/slot predicates remain required.",
       sensing: "Use the controller_frame capability schema in help topic game for frame contents. Input uses ordinary world held/edges/view/selection or current visible-screen operations, not tactical helpers. All source, life, native boot, space, screen and native-age checks remain host-owned.",
@@ -54,6 +104,7 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?
     selection: "Start without version selects latest validated once before admission. Exact version remains exact. Transport retry identity is host-bound; repeat delivery of one tool call never starts new work. A new decision is a distinct call.",
     reuse: "Inspect each retained compatible program's last outcome and historical argument sample. Reuse a suitable exact version with new compact args, or repair its actual defect with based_on before reuse. A blocked version is not qualified by its name. One coherent body may reuse parameterized local functions; do not add model turns or child calls merely to manufacture reuse. Historical coordinates guide fresh reacquisition; old handles never authorize effects.",
     submission: "Ordinary-only program_submit explicitly combines write arguments with required JSON args (pass null when unused), limits and optional next. It registers one immutable version and starts only that exact version through normal admission. program_write still only saves; program_run still starts existing programs. source.status persisted reports the saved name/version even if start.status is refused or unknown. Refused means no execution was acknowledged; unknown must be inspected, never blindly retried. Duplicate delivery cannot create another revision or execution. Stop/Pause and task/generation/owner changes between phases block start. Review and speculative planning cannot submit.",
+    handoff: "Optional handoff:{name,version,execution_ordinal} on submit or run start explicitly replaces the exact current live predecessor. Author/save source while the old work remains useful. Successor syntax, entry and limits are checked before cancellation; actual old worker/native retirement and fresh authorized observations bracket admission. Scope/screen changes, Stop, newer work or uncertain cleanup refuse new effects. Source persistence remains separate from start acknowledgment. Duplicate/interrupted delivery never cancels the successor or dispatches another. There is no automatic fallback, behavior migration, deadline extension or replay of old effects.",
     inspection: "Views are read-only. Follow next_after/has_more and explicit omissions. Feedback metrics carry kind replace with the complete metric, or retract with execution_removed and no metric; remove a retracted execution's current measurement, not its retained earlier generations. Both carry stable named program, execution_ordinal, revision and generation. current means unfinished execution; latest includes terminal outcomes. Trace continuation cursors pin the original execution even after newer work starts. Continue comparison pages using the exact named versions returned on page one. Review without version selects the latest matching outcome in that name family; an exact version stays exact. Named selection never rewrites captured execution/dependency references. Game-specific reads use the executable adapter bindings listed by help topic game, not additional program_inspect views.",
     continuity: "At meaningful intent/recovery changes, game.progress(summary,{current_subgoal,worksite,resource_requirements,recovery_reason}) or explicit root-result fields retain compact authored notes. worksite is an actually observed task site: establish or deliberately relocate it, never replace it with current position during travel/recovery. Omission retains notes; null clears them. Current position/inventory come from fresh observation; keep temporary recovery_position separate. Life/session/boot/space changes clear current notes; explicitly authored worksite/subgoal and unresolved effects may remain separately labelled historical references with their original scope, never current authority. Reobserve/reacquire before continuation; containment does not prove an unknown effect did not happen. Fresh run/task/world clears experience. Pause/provider recovery requires explicit Resume and fresh state; Stop is terminal, not automatic resume. Durable events reconstruct supported references, not workers, JS stacks or world state. No mandatory per-turn summary or inferred strategy.",
     movement_recovery: "Raw movement succeeded means the interval completed, not that the subgoal advanced. Compare sustained/net grounded standing-position changes relative to your selected destination or an observed postcondition, not cumulative travel/jump distance, arbitrary horizontal displacement, circling or transient airborne height. Bound the interval/distance you spend without reducing the relevant target error; after at most three ineffective bursts fresh-observe and change approach or return blocked with receipt evidence. Nearly vertical targets have unstable horizontal bearing: when horizontal separation is negligible, keep a deliberate yaw instead of chasing atan2 noise; yaw changes or horizontal circles do not solve height/reach mismatch. Bounded purposeful detours may move away temporarily. Never reissue an unchanged refusal. Raw forward follows the current camera during move.look turning; in confined geometry await a completed look first. Intentional stationary actions, looks and settling waits remain valid. Unknown effects stay fenced and must not be replayed.",
@@ -67,16 +118,25 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?
     const frame = adapter.bindings.find(binding => binding.capability_id === "minecraft.controller_frame");
     if (!frame?.result) throw new Error("This adapter has no registered resident controller frame");
     return {
-      launch: "program_submit({entry:'step',name,source,args:null}) writes and starts a resident; args is required JSON initial intent, not optional. Optional initial_state defaults null, limits accepts individual overrides. A new name omits based_on; revising uses its latest stored version. card and dependencies can be omitted. Source exports exactly one synchronous step(frame,state,intent); helpers/constants are allowed, imports and game calls are not.",
-      execution: "Each fresh frame invokes your local code without inference. Keep status:'running' while the algorithm can usefully continue; a short input interval, changed target or changed observation is not by itself a reason to retire. Put those decisions in local state transitions. Blocked means your local algorithm cannot continue, not 'one input finished'. Request attention before useful work runs out and keep handling the immediate situation while the cloud responds. No gameplay branches or tactics are supplied.",
-      frame: frame.result.schema,
-      resident: reference.resident,
+      reference: "Generated field shapes, not validators or executable TypeScript. Each section has fields and its own type aliases; Json means finite JSON data. Full exact schemas and constraints remain in help game (registered frame) and programs (resident result). These shapes contain no current target or execution authority.",
+      launch: "program_submit({entry:'step',name,source,args:null}) writes and starts exact source exporting one synchronous step(frame,state,intent). Required args is JSON initial intent. initial_state defaults null; limits accepts individual overrides. Helpers/constants are allowed; imports and game calls are not. Keep useful local transitions running while requesting attention; blocked means the algorithm cannot continue, not that one input finished.",
+      frame_fields: fieldShapes(frame.result.schema),
+      result_fields: fieldShapes(reference.resident.result),
+      sensing: "player.position is feet; velocity is blocks per client tick. visible_world is separately acquired assisted r8 geometry, normally refreshed every500ms and stale after1000ms, not a20Hz enemy tracker. Block positions are cell centers; entity positions are origins, not supplied body heights. Inventory is client prediction, not server-confirmed goal evidence. Current view/crosshair, audio cursor and later receipts have separate capture times; no atomic RGB alignment.",
+      input_transitions: reference.resident.input_transitions,
+      constraints: "Return all four fields. State/intent <=16KiB JSON; complete result/envelope/newline <=64KiB/depth32. All nine held booleans are required; selected_hotbar is null or an integer0..8. Omitted edges derive single held changes; explicit ordered edges remain exact, <=256 expanded presses/operations per input, release count1. Screen operations <=16. Events <=16 per step; summary1..1000characters, details JSON. Cumulative frame/step/edge/event limits still apply.",
       default_limits: reference.default_resident_limits,
       world_view: reference.world_view,
-      target_transitions: reference.target_transitions,
-      temporal_turn: reference.temporal_turn,
+      temporal_turn: {
+        signature: reference.temporal_turn.signature,
+        inputs: reference.temporal_turn.inputs,
+        timing: reference.temporal_turn.timing,
+        completion: reference.temporal_turn.completion,
+      },
+      operations: reference.resident.operations,
+      gui_completion: reference.resident.gui_completion,
+      response: reference.resident.response,
       buttons: "Ordinary vanilla semantics: held attack continues block breaking, but does not repeatedly strike entities. Each deliberate additional entity strike requires a fresh attack press edge; use/attack decisions, timing, view and equipment remain yours. Held use supports ongoing vanilla item/offhand use. Press counts are explicit, not inferred from a held boolean. A successful input ACK is not evidence of damage, a kill, block break or defense.",
-      result: reference.result,
     };
   }
   if (topic === "planning") return {
@@ -84,6 +144,7 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?
     authority: "Only main root start, run or step, authorizes one speculative flight and chooses manual or on_predecessor_success activation. The restricted planner can observe, inspect, help, write immutable inactive source and prepare one exact named candidate, but cannot start or submit playing work. prepare_next entry defaults run; step selects resident limits and optional initial_state, with fresh intent supplied by args. The original finite deadline includes authoring, planning, predecessor drain, fresh observation, optional guard and durable admission; staging never extends it.",
     guard: "Optional guard_source is an async BODY with only observation,args bindings and strict boolean return. No context/state/task/source/predecessor bindings. Omission adds no model gameplay constraint; fresh observation and all host invariants remain mandatory. False/error never authorizes effects. No automatic repair or retry.",
     activation: "Stop/Pause/death/task/session/generation changes invalidate authority. Only successful exact predecessor closure/drain permits a successor. Main can deliberately activate a manually prepared candidate. No replay of uncertain effects.",
+    finite_procedure: "To resume an existing resident after a finite procedure, authorize next activation:'on_predecessor_success' and prepare that exact named controller/args in the planning flight before useful procedure work ends. A manual Stop is cancellation, not success, and cannot trigger this path. Intentional live replacement instead uses ordinary submit/start handoff.",
   };
   if (topic === "reflex") return {
     tool: "reflex", schema: schema(reflexSchema), decisions: schema(policyDecisionSchema),

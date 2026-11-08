@@ -206,9 +206,13 @@ Generated help and source schemas define the callable DTOs.
 
 Write, start and prepare results are compact named status/experiment summaries. Execution inspection includes effective limits and the resident's current bounded snapshot; source inspection supplies code, card and validation details.
 
-`help({topic:"controller"})` exposes the registered frame, resident input/output,
-limits, view motion and attention/intent contracts without the unrelated async
-action and crafting reference. The ordinary prompt asks for complete useful local
+`help({topic:"controller"})` exposes generated frame/result field shapes,
+local recursive type aliases, limits, view motion and attention/intent contracts
+without the unrelated async action and crafting reference. Shapes describe
+structure, not validators or executable TypeScript. Full generated JSON schemas
+remain in `help game` for the registered frame and `help programs` for resident
+results; runtime validation is unchanged. Normal context byte bounds and explicit
+omissions still apply. The ordinary prompt asks for complete useful local
 behavior, not a placeholder controller or a new inference after each input burst.
 
 The strategist keeps a run-owned reference context outside its disposable Agent. Each actual SDK stream invocation, including tool-loop continuations, receives a supplement capped at 32 KiB serialized UTF-8: compact contracts, objective, model-authored recovery state, latest consequential obstruction, unresolved-operation references, relevant compatible immutable source and useful requested help. This is included in the actual request, not merely cached on the host. Source and its reuse metadata share an 18 KiB allowance; retained help has a 24 KiB ceiling. Both share the same 32 KiB request cap rather than additive reservations. Requested executable-format, temporal-view, resident and native-invocation mechanics take precedence, followed by complete native action alternatives, other reference prose, game-adapter metadata and observation/read/result schemas. Native method references keep their invocation fields separate from embedded result schemas. This ordering also applies when source and unresolved-effect history compete for the final request budget, independently of help-topic request order. Top-level action `anyOf`/`oneOf` alternatives stay whole: an alternative over the 6 KiB section bound is omitted, not split into detached properties. Other oversized documentation is split at schema/property boundaries. Retained help remains partial; omission references distinguish section, retained-help and final-request byte limits, while `omitted_records` counts details/notices that no longer fit. The supplement directs the model to re-request the corresponding `help` topic for the full current contract. Whole sources are either included or explicitly omitted, never truncated into executable fragments. This supplements, rather than replaces, bounded current observations, tool pairs and turn feedback.

@@ -120,6 +120,10 @@ export class ProgramOperations {
     return this.store.completedToolCall(this.run.run_id, this.phaseKey(callId, "outcome"), identity);
   }
 
+  reflexSubmissionReceipt(callId: string, identity: Json): Json | null {
+    return this.store.completedToolCall(this.run.run_id, this.phaseKey(callId, "reflex_outcome"), identity);
+  }
+
   async submit(input: z.infer<typeof programSubmitSchema>, callId: string, commit: () => void, signal: AbortSignal | undefined) {
     const identity = { tool: "program_submit", input } as unknown as Json;
     const outcomeKey = this.phaseKey(callId, "outcome");
@@ -428,7 +432,7 @@ export class ProgramOperations {
     const identity = { tool: "reflex", input } as unknown as Json;
     if (input.operation === "submit") {
       const outcomeKey = this.phaseKey(callId, "reflex_outcome");
-      const receipt = () => this.store.completedToolCall(this.run.run_id, outcomeKey, identity);
+      const receipt = () => this.reflexSubmissionReceipt(callId, identity);
       const completed = receipt();
       if (completed !== null) return completed;
       let first = false;

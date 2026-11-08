@@ -228,6 +228,7 @@ export class StrategicContext {
     this.helpOmissions = this.helpOmissions.filter(entry => !entry.reference.startsWith(`${topic}.`));
     const sections: HelpSection[] = [];
     const visit = (section: string, content: Json, depth: number, schema = false, atomic = false) => {
+      atomic ||= topic.startsWith("actions:") && section === "schema";
       const size = bytes(content);
       const fields = object(content);
       schema ||= typeof fields?.$schema === "string" || topic === "game" && section.endsWith(".result_schema");
@@ -258,6 +259,12 @@ export class StrategicContext {
     // Action alternatives stay whole; oversized ones are explicitly omitted.
     // Stable order keeps the latest requested topic first within each class.
     const priority = (section: HelpSection) => {
+      if (section.topic.startsWith("actions:")) return 0;
+      if (section.topic === "actions") {
+        if (section.section === "methods" || section.section.startsWith("methods.")) return 0;
+        if (section.section === "actions" || section.section.startsWith("actions.") || section.section === "types") return 1;
+        return 2;
+      }
       if (section.topic === "controller") {
         if (section.section === "resident.result" || section.section.startsWith("resident.result.")) return 1;
         if (this.helpSchemas.has(section)) return 2;
@@ -662,10 +669,10 @@ export class StrategicContext {
       programs: "Immutable named versions. Existing name requires based_on latest. Write saves only; ordinary-only program_submit explicitly writes and starts that exact version through ordinary admission; program_run starts existing. Dependencies are pinned. Validation is not gameplay proof; completed program is not task success.",
       freshness: "Retained source/docs and model-authored state are historical reference only, never authority or gameplay proof. Worksite/local positions require fresh reacquisition. Current authorized observation, especially inventory, and later observe results outrank notes. Life/session/boot/space changes discard current dynamic notes; explicit world-local objective/worksite notes and no-replay uncertainty remain historical with original scope. Task/world/fresh-run changes discard experience. Program argument samples/outcomes are sanitized historical examples, never restored inputs or recommendations to rerun blocked/unknown procedures. Resolve fresh targets and construct current args; no target handles, roots, effects or execution state are restored.",
       recovery: "Known settled failure with current authority permits fresh observation and an authored changed selection. Unknown/cancelled/reconnect fence and reconcile; emitter closure and fresh state do not prove old effects absent.",
-      requested_help: "Retained help is partial; re-request help({topic:'game'}) or its topic before relying on missing contracts. Omission references name missing sections; omitted_records counts excluded notices/details. Receipt detail_omitted marks request-budget loss; evidence_omitted also preserves original partial evidence. Inspect authorized event references for full retained detail.",
+      requested_help: "Retained help is partial. Use help({topic:'actions'}) for compact semantic contracts; add kind for one missing complete action family. Full game help is for missing native reader/result or observation schemas, not a routine reload each turn. Other topics remain separately selectable. Omission references name missing sections; omitted_records counts excluded notices/details. Receipt detail_omitted marks request-budget loss; evidence_omitted preserves original partial evidence. Inspect authorized event references for full retained detail.",
       game: { binding: "game", methods: ["observe()", "call({name,version?},args)", "progress(summary,details)", "attention({urgency:'ordinary'|'urgent',summary,details}) -> void",
         ...(adapter?.action_capability ? ["action(action)", "actionAndObserve(action) -> {action,observation}"] : []), ...(adapter?.supports_respawn ? ["respawn()"] : [])],
-        local_feedback: "actionAndObserve preserves the raw outcome and gives fresh scoped feedback only after confirmed settlement. No retry or goal verdict. Exact contract: help game.",
+        local_feedback: "actionAndObserve preserves the raw outcome and gives fresh scoped feedback only after confirmed settlement. No retry or goal verdict. Contract: help actions; full schemas: help game.",
         adapter_bindings: adapter?.bindings.map(binding => ({ name: binding.name, version: binding.version, parameters: binding.parameters })) ?? [] },
     };
     const unresolved = [...this.unresolved.values()].map(reference => ({ ...this.eventView(run, reference.event), status: "unknown", no_replay: true,

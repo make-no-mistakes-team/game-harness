@@ -106,7 +106,9 @@ export class RuntimeTools {
             name === "memory" && operation !== "catalog";
           const completed = mutation ? this.store.completedToolCall(run.run_id, callId, identity) : null;
           if (completed !== null) return result(completed);
-          const submitted = name === "program_submit" ? operations.submissionReceipt(callId, identity) : null;
+          const submission = name === "program_submit" || name === "reflex" && operation === "submit";
+          const submitted = name === "program_submit" ? operations.submissionReceipt(callId, identity)
+            : name === "reflex" && operation === "submit" ? operations.reflexSubmissionReceipt(callId, identity) : null;
           if (submitted !== null) {
             // Recover the already immutable two-phase result, not execution
             // authority. A cancelled/stale request cannot perform new work.
@@ -120,10 +122,10 @@ export class RuntimeTools {
           const authority = replay ? () => {} : this.host.toolAuthority();
           const submissionScope = () => JSON.stringify([run.task, run.goal, run.world_id, run.epoch, run.session_id, run.life_id,
             run.native_boot_id, run.space_epoch, run.compatibility_hash]);
-          const originalScope = name === "program_submit" ? submissionScope() : null;
+          const originalScope = submission ? submissionScope() : null;
           const commit = () => {
             if (!replay) {
-              if (this.host.run() !== run || signal?.aborted || name === "program_submit" && submissionScope() !== originalScope)
+              if (this.host.run() !== run || signal?.aborted || submission && submissionScope() !== originalScope)
                 throw new RuntimeFault("stale_context", "Tool authority changed before admission");
               this.host.assertCurrent(generation);
               if (mutation && role() !== admittedRole)
@@ -145,7 +147,7 @@ export class RuntimeTools {
           // Finish consumes authority; submit also reports persisted source
           // when authority was revoked between persistence and admission.
           // Authoring starts at the next SDK request, after these results.
-          if (name !== "task_finish" && name !== "program_submit") {
+          if (name !== "task_finish" && !submission) {
             commit();
             if (!replay) this.host.assertCurrent(generation);
           }
@@ -200,11 +202,11 @@ export class RuntimeTools {
       tool("program_run", "Start exact named run/step; optional handoff:{name,version,execution_ordinal} replaces only after confirmed retirement. After validation, future predecessor capabilities are fenced immediately; only its current admitted bounded semantic capability may settle. Residents retire immediately; Stop/tool abort revoke immediately. Inspect/stop, update resident intent, run pure analyze, activate a prepared successor, or select finite attention. No automatic replacement or analysis-to-control injection. Host owns retry identity and authority.", programRunSchema, (input, callId, signal, commit) => operations.runProgram(input, callId, commit, signal)),
       tool("program_inspect", "Read named catalog/source/execution/trace/feedback/comparison/planning views without effects. Preserve page cursors and explicit omissions.", programInspectSchema, (input, _callId, signal, commit) => operations.inspect(input, signal, commit)),
       tool("program_review", "Record keep or insufficient_evidence for the latest matching outcome of a named version. A performed code experiment is linked directly through program_write.reason.", programReviewSchema, (input, callId, signal, commit) => operations.review(input, callId, commit, signal)),
-      tool("help", "Load controller for persistent local frame/input control; game for async methods/actions/crafting; programs for lifecycle; planning for prepared successors; reflex for local reaction contracts. Memory discloses its optional module.", helpSchema, (input) => {
+      tool("help", "Load actions for compact async methods, action shapes/bounds and crafting. Add kind to topic actions for one complete exact action family. Controller covers local frame/input control; game has full registered schemas; programs covers lifecycle; planning covers prepared successors; reflex covers local reactions. Memory discloses its optional module.", helpSchema, (input) => {
         if (input.topic === "memory" && role() === "authoring")
           throw new RuntimeFault("forbidden", "Optional playing modules are unavailable during pending-program authoring");
         if (input.topic === "memory" && role() === "ordinary") this.modules.add(input.topic);
-        return programHelp(input.topic, this.host.adapter());
+        return programHelp(input.topic, this.host.adapter(), input.kind);
       }),
       tool("task_finish", "Report the whole custom task complete from actual authorized evidence and stop the run immediately. This is unverified model reporting, not built-in goal verification.", taskFinishSchema, (input, callId) => {
         if (typeof run.goal === "string" || run.goal.goal_id !== "custom" || run.goal.verifier !== null) throw new RuntimeFault("forbidden", "Only custom tasks permit model-reported completion; built-in goals require trusted verification");

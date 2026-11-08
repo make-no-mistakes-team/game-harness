@@ -8,6 +8,7 @@ import type { AssistantMessage, Context, Model, ToolCall } from "@oh-my-pi/pi-ai
 import type { Json } from "../src/shared/contracts.ts";
 import type { SkillView } from "../src/shared/programs.ts";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+import { validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import type { AuthManager } from "../src/server/auth.ts";
 import { StrategicPlanner } from "../src/server/strategic.ts";
@@ -53,11 +54,13 @@ function fixture() {
     selectedModel: model() as Model, submitResult: null as Json, completedToolEvents: false };
   store.saveRun(state.run);
   const help: AgentTool = { name: "help", label: "help", description: "Load a requested contract section",
-    parameters: { type: "object", properties: { topic: { type: "string" } } },
+    parameters: { type: "object", properties: { topic: { type: "string" }, kind: { type: "string" } } },
     execute: async (_id, input) => {
       state.helpEffects++;
       const topic = input && typeof input === "object" && "topic" in input ? input.topic : "overview";
-      const value = state.helpResults[String(topic)] ?? { bindings: { fixture_read: { parameters: ["query"], result: "NeutralValue" } },
+      const kind = input && typeof input === "object" && "kind" in input ? input.kind : undefined;
+      const reference = kind === undefined ? String(topic) : `${topic}:${kind}`;
+      const value = state.helpResults[reference] ?? state.helpResults[String(topic)] ?? { bindings: { fixture_read: { parameters: ["query"], result: "NeutralValue" } },
         section: `requested-${topic}`, body: `Useful exact requested contract${state.helpPadding}` };
       return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
     } };
@@ -127,7 +130,8 @@ function fixture() {
     validation: { runtime_version: 5, api_version: 5, validator_version: 5, compatibility_hash: state.run.compatibility_hash!,
       fingerprint: "fixture", formatted_lines: 1, complexity: 1, nesting: 0 },
   });
-  const requestHelp = (topic = "game") => settlement([{ type: "toolCall", id: `help-${topic}`, name: "help", arguments: { topic } }]);
+  const requestHelp = (topic = "game", kind?: string) => settlement([{ type: "toolCall", id: `help-${topic}${kind ? `-${kind}` : ""}`, name: "help",
+    arguments: { topic, ...(kind ? { kind } : {}) } }]);
   let starts = 0;
   const execution = (skill: SkillView, args: Json = { target_id: "ROOT_ARGUMENT_NOT_CONTEXT" }) => store.admitSkill(state.run.run_id, { entry: "run",
     skill_id: skill.skill_id, version: skill.version, start_key: `context-root-${++starts}`,
@@ -587,6 +591,34 @@ test("actual continuation after help receives newly requested useful context in 
   const f = fixture(); await f.planner.start(1); await f.turn([f.requestHelp(), settlement()]);
   expect(f.state.requests).toHaveLength(2);
   expect(JSON.stringify(retained(f.state.requests[1])?.requested_help)).toContain("fixture_read");
+});
+
+test("distinct selected action contracts remain usable after later help and Agent recreation", async () => {
+  const f = fixture();
+  await f.program(`/*${"s".repeat(9000)}*/return {status:"completed",summary:"Retained candidate",result:null};`);
+  for (const kind of ["craft", "attack"])
+    f.state.helpResults[`actions:${kind}`] = JSON.parse(JSON.stringify(programHelp("actions", f.adapter, kind)));
+  f.state.helpResults.actions = JSON.parse(JSON.stringify(programHelp("actions", f.adapter)));
+  await f.planner.start(1);
+  await f.turn([f.requestHelp("actions"), f.requestHelp("actions", "craft"), f.requestHelp("actions", "attack"), settlement()]);
+  const check = () => {
+    const context = retained(f.state.requests.at(-1))!;
+    const craft = context.requested_help.find((entry: any) => entry.topic === "actions:craft" && entry.section === "schema")?.content;
+    const attack = context.requested_help.find((entry: any) => entry.topic === "actions:attack" && entry.section === "schema")?.content;
+    expect(validateJsonSchemaValue(craft, { kind: "craft", item: "stick", executions: 1 }).success).toBe(true);
+    expect(validateJsonSchemaValue(craft, { kind: "craft", sequence: [{ item: "stick", executions: 1 }] }).success).toBe(true);
+    expect(validateJsonSchemaValue(craft, { kind: "craft", item: "stick", executions: 17 }).success).toBe(false);
+    const target = { target_id: "schema-only-not-issued-authority", incarnation: 1,
+      space: { dimension_id: "minecraft:overworld", space_epoch: 1 }, life_id: 1 };
+    expect(validateJsonSchemaValue(attack, { kind: "attack", target }).success).toBe(true);
+    expect(validateJsonSchemaValue(attack, { kind: "attack", target: { target_id: target.target_id } }).success).toBe(false);
+    expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32768);
+  };
+  check();
+  await f.planner.close(); f.state.generation++;
+  await f.planner.start(f.state.generation); await f.turn();
+  check();
+  expect(f.state.toolEffects).toBe(0);
 });
 
 for (const topics of [["programs", "game"], ["game", "programs"]]) test(`actual requested mechanics survive source pressure after help ${topics.join(" then ")}`, async () => {

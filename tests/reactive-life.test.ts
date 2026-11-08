@@ -16,9 +16,7 @@ import { minecraftActionSchema } from "../src/shared/minecraft.ts";
 import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 import { ModelProgramEvidence } from "../src/evaluation/model-evidence.ts";
 import { DEFAULT_EVALUATION_CAPS } from "../src/evaluation/config.ts";
-import { ProgramOperations } from "../src/server/program-operations.ts";
-import { reflexSchema } from "../src/server/program-interface.ts";
-import type { RuntimeToolHost } from "../src/server/runtime-tools.ts";
+import { RuntimeTools, type RuntimeToolHost } from "../src/server/runtime-tools.ts";
 
 // Exercise the real asynchronous scheduler, worker, and arbiter handoffs. Await
 // their completion signals rather than advancing a process-global fake clock.
@@ -76,13 +74,26 @@ function specification(backend: PolicySpec["backend"] = "javascript"): PolicySpe
 }
 
 function reflexOperations(f: ReturnType<typeof fixture>) {
-  // This slice exercises the actual policy use case, scheduler, Store and
-  // arbiter. Program/memory operations are not part of this fixture.
-  const operations = new ProgramOperations(f.store, {} as SkillManager, f.reactive, null, {} as RuntimeToolHost, f.run);
-  return (input: unknown, callId: string, signal?: AbortSignal) =>
-    operations.reflex(reflexSchema.parse(input), callId, 1, () => {
-      if (signal?.aborted) throw new RuntimeFault("stale_context", "Submission tool authority revoked");
-    }, signal);
+  // Exercise the actual SDK tool boundary, policy use case, scheduler, Store
+  // and arbiter; program/memory operations are not invoked by this fixture.
+  const current = () => {
+    if (f.run.status !== "running") throw new RuntimeFault("stale_context", "Submission tool authority revoked");
+    return f.run;
+  };
+  const unexpected = () => { throw new Error("Non-reflex fixture capability was unexpectedly used"); };
+  const host: RuntimeToolHost = {
+    run: () => f.run, adapter: () => f.adapter, toolRole: () => "ordinary",
+    assertCurrent: current, toolAuthority: () => () => { current(); },
+    observe: () => f.game.observe(), generation: () => 1, attentionAfter: unexpected, admitted: unexpected,
+    history: unexpected, planning: unexpected, learning: unexpected, finishTask: unexpected,
+  };
+  const catalog = new RuntimeTools(f.store, {} as SkillManager, f.reactive, null, host);
+  return async (input: unknown, callId: string, signal?: AbortSignal) => {
+    const tool = catalog.build(1).find(value => value.name === "reflex")!;
+    const result = await tool.execute(callId, input, signal);
+    expect(result.isError).not.toBe(true);
+    return result.details;
+  };
 }
 
 test("one reflex submission arms an exact finite watch and redelivery cannot renew a spent trial", async () => {
@@ -125,7 +136,7 @@ test("interrupted reflex submission retains exact source without replaying valid
   const first = await pending;
   expect(f.store.policies(f.run.run_id)).toHaveLength(1);
   expect(f.store.events(f.run.run_id).some(value => value.type === "policy.watch_started")).toBe(false);
-  expect(await submit(input, "interrupted-reflex-submission")).toEqual(first);
+  expect(await submit(input, "interrupted-reflex-submission", controller.signal)).toEqual(first);
   expect(evaluations).toBe(1);
   expect(f.executed).toHaveLength(0);
 });

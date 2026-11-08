@@ -5,6 +5,7 @@ import { DEFAULT_SKILL_LIMITS, PROGRAM_RESULT_GUIDANCE } from "../shared/program
 import { PROGRAM_LIMITS } from "./program-validation.ts";
 import { controllerStepResultSchema, DEFAULT_RESIDENT_LIMITS, RESIDENT_STEP_RESPONSE_MS } from "../shared/resident.ts";
 import { helpSchema, memorySchema, nextConfigSchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
+import { RuntimeFault } from "./runtime-fault.ts";
 
 // Shape reference only. Full generated JSON schemas remain in game/programs;
 // duplicating every constraint and description here evicts the callable shape
@@ -56,8 +57,90 @@ function fieldShapes(value: unknown) {
   };
 }
 
-export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?: RuntimeAdapter) {
+const actionReferences = new WeakMap<RuntimeAdapter, Map<string, object>>();
+const constraintKeys = ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+  "minLength", "maxLength", "pattern", "minItems", "maxItems", "description"];
+
+function actionNotes(value: Record<string, unknown>, prefix: string, output: Record<string, object>): void {
+  const notes = Object.fromEntries(constraintKeys.filter(key => key in value).map(key => [key, value[key]]));
+  if (Object.keys(notes).length) output[prefix || "<root>"] = notes;
+  const visit = (child: unknown, name: string) => {
+    if (child && typeof child === "object" && !Array.isArray(child))
+      actionNotes(child as Record<string, unknown>, name, output);
+  };
+  if (value.properties && typeof value.properties === "object" && !Array.isArray(value.properties))
+    for (const [name, child] of Object.entries(value.properties)) visit(child, prefix ? `${prefix}.${name}` : name);
+  if (value.items) visit(value.items, `${prefix}[]`);
+  for (const key of ["anyOf", "oneOf", "allOf"])
+    if (Array.isArray(value[key]))
+      value[key].forEach((child, index) => visit(child, `${prefix}.${key}[${index}]`));
+}
+
+function actionHelp(adapter: RuntimeAdapter, kind?: string): object {
+  let cached = actionReferences.get(adapter);
+  if (!cached) { cached = new Map(); actionReferences.set(adapter, cached); }
+  const previous = cached.get(kind ?? "");
+  if (previous) return previous;
+  const capability = adapter.action_capability;
+  if (!capability) throw new RuntimeFault("precondition_failed", "This adapter has no action capability");
+  const root = adapter.schemas.capabilities[`${capability.id}@${capability.version}`] as Record<string, unknown>;
+  const alternatives = root.anyOf ?? root.oneOf ?? [root];
+  if (!Array.isArray(alternatives)) throw new Error("Expected registered action alternatives");
+  const groups = new Map<string, Record<string, unknown>[]>();
+  for (const alternative of alternatives) {
+    const branch = alternative as Record<string, unknown>;
+    const properties = branch.properties as Record<string, Record<string, unknown>> | undefined;
+    const discriminator = properties?.kind?.const;
+    if (typeof discriminator !== "string") throw new Error("Action reference requires a registered kind discriminator");
+    const family = groups.get(discriminator);
+    if (family) family.push(branch); else groups.set(discriminator, [branch]);
+  }
+  let result: object;
+  if (kind !== undefined) {
+    const family = groups.get(kind);
+    if (!family) throw new RuntimeFault("not_found", "This action kind is not registered for the current adapter");
+    result = { kind, reference: "Complete registered input schema for this exact action family; adapter-owned semantic predicates and current authority still apply.",
+      schema: { ...root, anyOf: family } };
+  } else {
+    const full = getGameAPIReference(adapter);
+    const methods = Object.fromEntries(Object.entries(Reflect.get(full, "methods")).map(([name, value]) => {
+      const { result_schema: _result, ...method } = value as Record<string, unknown>;
+      return [name, method];
+    }));
+    const definitions = root.$defs && typeof root.$defs === "object" && !Array.isArray(root.$defs) ? Object.entries(root.$defs) : [];
+    const references = new Map(definitions.map(([name], index) =>
+      [`#/$defs/${name.replaceAll("~", "~0").replaceAll("/", "~1")}`, `Data${index}`]));
+    const actions: Record<string, object[]> = {};
+    for (const [name, family] of groups) {
+      if (name === "world_input" || name === "screen_input") continue;
+      actions[name] = family.map(branch => {
+        const constraints: Record<string, object> = {};
+        actionNotes(branch, "", constraints);
+        return { shape: typeShape(branch, references), constraints };
+      });
+    }
+    result = {
+      reference: "Compact semantic taskflow reference. Shapes are not validators. Each action family retains all alternatives; generated constraints retain scalar/collection bounds and descriptions. Request help({topic:'actions',kind:'craft'}) or another listed kind for its complete exact schema. Full native reader/result and observation schemas remain in help game; raw frame/input work uses help controller.",
+      binding: "game", asynchronous: true, concurrent_calls: false, methods,
+      available_kinds: [...groups.keys()], actions,
+      types: Object.fromEntries(definitions.map(([, child], index) => [`Data${index}`, typeShape(child, references)])),
+      observation_fields: fieldShapes(adapter.schemas.payload),
+      result_schemas: Object.fromEntries(["GameActionResult", "SkillResult", "ProgramAttention"].map(name =>
+        [name, Reflect.get(Reflect.get(full, "schemas"), name)])),
+      native_bindings: Reflect.get(full, "native_bindings"), validation: Reflect.get(full, "validation"),
+      lifecycle: Reflect.get(full, "lifecycle"),
+    };
+  }
+  cached.set(kind ?? "", result);
+  return result;
+}
+
+export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?: RuntimeAdapter, kind?: string) {
   const schema = (value: z.ZodType) => z.toJSONSchema(value, { unrepresentable: "any", io: "input" });
+  if (topic === "actions") {
+    if (!adapter) throw new Error("A negotiated adapter is required for the action reference");
+    return actionHelp(adapter, kind);
+  }
   if (topic === "game") {
     if (!adapter) throw new Error("A negotiated adapter is required for the executable game reference");
     return getGameAPIReference(adapter);
@@ -165,7 +248,7 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?
       task_finish: schema(taskFinishSchema),
       contract: "Separate from the gameplay/program verbs. Ordinary role and custom tasks only. As soon as actual authorized evidence shows the whole task complete, call task_finish with a brief evidence summary instead of more no-op/check programs or review. It immediately revokes admission and stops the run; completion is model-reported and unverified, never goal.verified. Program completed statuses are execution-only. Built-in goals cannot bypass their trusted verifier.",
     },
-    topics: ["controller", "game", "programs", "planning", "reflex", "memory"],
+    topics: ["actions", "controller", "game", "programs", "planning", "reflex", "memory"],
     advanced: "Reflex is available in ordinary planning; read its reference before authoring. Request help memory to disclose that optional module. Help never grants playing authority to authoring, speculative or post-goal roles.",
     observation: "The observe tool returns permitted adapter projection data/metadata without host authority identities. Program game.observe() and guards use ObservationV3 with adapter-owned data. Historical schema2 artifacts are read-only. Arguments, results and detailed traces retain opaque JSON keys; byte-budget omissions remain explicit.",
     workflow: "Observe authorized state; submit a compact named taskflow with required args (null if unused), or intentionally write without starting and later run an existing version. Let admitted work proceed. Inspect exact source/outcomes/trace/feedback when useful. Revise with based_on equal to the latest stored version. card.reason describes motivation; omit top-level reason for ordinary revisions, or supply it only to link an experiment to that exact parent's actual outcome. Assessments are optional. Host preflight owns readiness, not a mandatory model bootstrap ceremony.",

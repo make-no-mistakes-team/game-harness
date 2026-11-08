@@ -1871,7 +1871,8 @@ export class StrategicPlanner {
             ? eligible.arguments as Record<string, unknown> : null;
           if (event.toolName === "help") {
             const topic = typeof input?.topic === "string" ? input.topic : "overview";
-            this.retainedContext.rememberHelp(topic, parsed.data);
+            const reference = topic === "actions" && typeof input?.kind === "string" ? `actions:${input.kind}` : topic;
+            this.retainedContext.rememberHelp(reference, parsed.data);
           } else if (["program_write", "program_run", "program_inspect", "program_submit"].includes(event.toolName)) {
             const selected = event.toolName === "program_submit" ? record(value?.source ?? null) : value;
             if (typeof selected?.name === "string" && typeof selected.version === "number")

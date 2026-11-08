@@ -111,7 +111,12 @@ export const prepareNextSchema = z.discriminatedUnion("entry", [
   preparedBaseSchema.extend({ entry: z.literal("step"), args: residentIntentSchema,
     initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema }).strict(),
 ]);
-export const helpSchema = z.object({ topic: z.enum(["overview", "controller", "game", "programs", "planning", "reflex", "memory"]).default("overview") }).strict();
+export const helpSchema = z.object({
+  topic: z.enum(["overview", "actions", "controller", "game", "programs", "planning", "reflex", "memory"]).default("overview"),
+  kind: z.string().regex(/^[a-z][a-z0-9_]{0,79}$/).optional()
+    .describe("Only for topic actions: request the complete exact schema for this action kind, including all its alternatives."),
+}).strict().refine(input => input.kind === undefined || input.topic === "actions",
+{ message: "An action kind selector is available only for topic actions", path: ["kind"] });
 const namedPolicy = { name: z.string().trim().min(1).max(80), version: z.int().positive().optional() };
 export const reflexSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("submit"), spec: policySpecSchema,

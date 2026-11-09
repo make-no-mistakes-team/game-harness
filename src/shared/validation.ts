@@ -7,6 +7,7 @@ import { identitySchema, safeCounterSchema, screenRefSchema, sha256Schema, space
 import { gameActionResultSchema, jsonSchema, lifeIdSchema, playerLifeSchema, sessionIdSchema } from "./primitives.ts";
 import { observationV3Schema } from "./observations.ts";
 import { controllerEventSchema, residentIntentSchema, residentLimitsSchema, residentStateSchema } from "./resident.ts";
+import { controlSessionConfigSchema } from "./control-session.ts";
 const utf8 = new TextEncoder();
 export { jsonSchema, lifeIdSchema, playerLifeSchema, sessionIdSchema } from "./primitives.ts";
 
@@ -44,7 +45,8 @@ export const skillStartRequestSchema = z.discriminatedUnion("entry", [
   skillStartBase.extend({ entry: z.literal("run"), limits: skillLimitsSchema,
     lookahead: lookaheadConfigSchema.optional() }).strict(),
   skillStartBase.extend({ entry: z.literal("step"), args: residentIntentSchema,
-    limits: residentLimitsSchema, initial_state: residentStateSchema, lookahead: lookaheadConfigSchema.optional() }).strict(),
+    limits: residentLimitsSchema, initial_state: residentStateSchema, session: controlSessionConfigSchema.optional(),
+    lookahead: lookaheadConfigSchema.optional() }).strict(),
 ]) satisfies z.ZodType<SkillStartRequest>;
 export const skillResultSchema = z.object({ status: z.enum(["completed", "blocked", "failed"]),
   summary: z.string().min(1).max(2000), result: jsonSchema }).strict() satisfies z.ZodType<SkillResult>;

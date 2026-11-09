@@ -956,6 +956,7 @@ export class Store extends StoreReadQueries {
     runId: string,
     request: SkillStartRequest,
     lineage?: { parent_execution_id: string; root_execution_id: string },
+    originalDeadlineAt?: string,
   ): { view: SkillExecutionView; created: boolean } {
     request = skillStartRequestSchema.parse(request);
     const requestText = canonical({
@@ -1017,12 +1018,13 @@ export class Store extends StoreReadQueries {
         root = this.skillExecution(runId, {
           execution_id: lineage.root_execution_id,
         });
+        const sessionRoot = root?.entry === "step" && root.session !== undefined;
         if (
           !parent ||
           !root ||
           request.entry !== "run" ||
-          parent.entry !== "run" ||
-          root.entry !== "run" ||
+          (parent.entry !== "run" && !(parent.entry === "step" && parent.session)) ||
+          (root.entry !== "run" && !sessionRoot) ||
           parent.root_execution_id !== root.execution_id ||
           root.root_execution_id !== root.execution_id ||
           root.parent_execution_id !== null ||
@@ -1041,13 +1043,15 @@ export class Store extends StoreReadQueries {
             execution_id: ancestor.parent_execution_id,
           });
           if (!next || next.entry !== "run" || next.root_execution_id !== root.execution_id)
-            throw new Error("Invalid skill execution ancestry");
+            if (!(next?.entry === "step" && next.session && next.execution_id === root.execution_id))
+              throw new Error("Invalid skill execution ancestry");
+          if (!next) throw new Error("Invalid skill execution ancestry");
           ancestor = next;
           depth++;
-          if (depth >= root.limits.max_depth)
+          if (depth >= (root.entry === "run" ? root.limits.max_depth : root.entry === "step" ? root.session!.max_depth : 8))
             throw new Error("Skill execution depth limit reached");
         }
-        if (depth >= root.limits.max_depth)
+        if (depth >= (root.entry === "run" ? root.limits.max_depth : root.entry === "step" ? root.session!.max_depth : 8))
           throw new Error("Skill execution depth limit reached");
         if (Date.parse(root.deadline_at) <= Date.now())
           throw new Error("Skill execution deadline reached");
@@ -1071,14 +1075,16 @@ export class Store extends StoreReadQueries {
         compatibility_hash: request.compatibility_hash,
         args: request.args,
         ...(request.entry === "step"
-          ? { entry: "step" as const, limits: request.limits, initial_state: request.initial_state, resident: null }
+          ? { entry: "step" as const, limits: request.limits, initial_state: request.initial_state, resident: null,
+              ...(request.session ? { session: request.session } : {}) }
           : { entry: "run" as const, limits: root?.entry === "run" ? root.limits : request.limits }),
         status: "accepted",
         started_at: null,
         ended_at: null,
         deadline_at:
-          root?.deadline_at ??
-          new Date(Date.now() + request.limits.duration_ms).toISOString(),
+          new Date(Math.min(root ? Date.parse(root.deadline_at) : Infinity,
+            originalDeadlineAt === undefined ? Infinity : Date.parse(originalDeadlineAt),
+            Date.now() + request.limits.duration_ms)).toISOString(),
         actions: 0,
         calls: 0,
         result: null,
@@ -1142,6 +1148,7 @@ export class Store extends StoreReadQueries {
       const identity = (value: SkillExecutionView) => ({
         entry: value.entry,
         initial_state: value.entry === "step" ? value.initial_state : null,
+        session: value.entry === "step" ? value.session ?? null : null,
         skill_id: value.skill_id,
         version: value.version,
         run_id: value.run_id,

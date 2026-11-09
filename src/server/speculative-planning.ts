@@ -19,6 +19,8 @@ export interface SpeculativeHost {
   evaluateGuard(source: string, observation: ObservationV3, args: Json, signal: AbortSignal): Promise<boolean>;
   /** Recheck permit immediately before durable admission, including after awaits. */
   admit(request: SkillStartRequest, permit: { signal: AbortSignal; assertCurrent(): void }): Promise<SkillExecutionView>;
+  prepareReady?(request: SkillStartRequest, predecessorId: string, signal: AbortSignal, current: () => void):
+    Promise<{ assertCurrent(): void; close(): Promise<void> }>;
   evidence(type: string, details: Json): void;
   wake(reason: "lookahead" | "continuation"): void;
 }
@@ -32,6 +34,8 @@ interface Draft {
   timer: NodeJS.Timeout | undefined;
   automaticAttempt: Promise<PlanProjection> | null;
   continuationWoken: boolean;
+  prepared?: { assertCurrent(): void; close(): Promise<void> };
+  admission?: SkillStartRequest;
 }
 const LIVE: Record<string, true> = { armed: true, planning: true, staged: true, validating: true };
 const TERMINAL_ROOT: Record<string, true> = { succeeded: true, blocked: true, failed: true, cancelled: true, unknown: true };
@@ -199,7 +203,7 @@ export class SpeculativePlanning {
     const authority = this.authority();
     if (request.plan_id !== draft.view.plan_id || draft.request)
       throw new RuntimeFault("conflict", "A flight permits exactly one exact staged candidate");
-    if (Object.keys(request).some((key) => !["plan_id", "skill", "entry", "initial_state", "args", "limits", "guard_source"].includes(key)))
+    if (Object.keys(request).some((key) => !["plan_id", "skill", "entry", "initial_state", "session", "args", "limits", "guard_source"].includes(key)))
       throw new RuntimeFault("invalid_request", "Staging accepts only an exact candidate, arguments, limits and optional game guard");
     skillRefSchema.parse(request.skill);
     if (request.entry === "step") {
@@ -236,6 +240,25 @@ export class SpeculativePlanning {
       draft.view.guard_status = validated ? "pending" : "omitted";
       draft.view.state = "staged";
       draft.view.reason = null;
+      if (stagedRequest.entry === "step" && this.host.prepareReady) {
+        if (stagedRequest.guard_source !== undefined) {
+          const observation = await this.host.observe();
+          authority();
+          if (await this.host.evaluateGuard(stagedRequest.guard_source, observation, stagedRequest.args, draft.controller.signal) !== true)
+            throw new RuntimeFault("precondition_failed", "Candidate advisory guard refused during preparation");
+          authority(); draft.view.guard_status = "passed";
+        }
+        const basis = draft.view.basis;
+        draft.admission = { entry: "step", initial_state: stagedRequest.initial_state, limits: stagedRequest.limits,
+          ...(stagedRequest.session ? { session: stagedRequest.session } : {}),
+          skill_id: stagedRequest.skill.skill_id, version: stagedRequest.skill.version,
+          start_key: `plan_${draft.view.plan_id}`, epoch: basis.epoch, session_id: basis.session_id,
+          life_id: basis.life_id, native_boot_id: basis.native_boot_id, run_generation: basis.generation,
+          space_epoch: basis.space_epoch, compatibility_hash: basis.compatibility_hash, args: stagedRequest.args };
+        draft.prepared = await this.host.prepareReady(draft.admission, basis.root.execution_id,
+          draft.controller.signal, () => this.assertIdentity(draft));
+        authority();
+      }
       this.record(draft, "staged");
       return structuredClone(draft.view);
     } catch (error) {
@@ -370,7 +393,7 @@ export class SpeculativePlanning {
       if (observation.life.life_id !== basis.life_id || observation.life.status !== "alive") throw new Error("life_changed");
       draft.view.observation_seq = observation.observation_seq;
       const request = draft.request!;
-      if (request.guard_source !== undefined) {
+      if (request.guard_source !== undefined && !draft.prepared) {
         const allowed = await this.host.evaluateGuard(request.guard_source, structuredClone(observation), structuredClone(request.args), draft.controller.signal);
         this.assertActivation(draft);
         if (allowed !== true) {
@@ -383,9 +406,10 @@ export class SpeculativePlanning {
       this.record(draft, "guard_checked");
       this.assertActivation(draft);
       phase = "admission_failed";
-      const execution = await this.host.admit({
+      const execution = await this.host.admit(draft.admission ?? {
         ...(request.entry === "step"
-          ? { entry: "step" as const, initial_state: structuredClone(request.initial_state), limits: { ...request.limits } }
+          ? { entry: "step" as const, initial_state: structuredClone(request.initial_state), limits: { ...request.limits },
+              ...(request.session ? { session: request.session } : {}) }
           : { entry: "run" as const, limits: { ...request.limits } }),
         skill_id: request.skill.skill_id, version: request.skill.version,
         start_key: `plan_${draft.view.plan_id}`, epoch: basis.epoch,

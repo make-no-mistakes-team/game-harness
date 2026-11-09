@@ -11,11 +11,14 @@ public final class NativeEffectContract {
   private static final Set<String> SCOPE_FIELDS = Set.of("session_id", "world_id", "epoch", "native_boot_id",
       "run_id", "run_generation", "life_id", "space_epoch", "execution_id", "source_hash");
   private static final Set<String> EFFECT_FIELDS = Set.of("operation_id", "compatibility_hash", "scope", "invocation", "action", "expected_screen");
+  private static final Set<String> SUPERVISED_EFFECT_FIELDS =
+      Set.of("operation_id", "compatibility_hash", "scope", "invocation", "action", "expected_screen", "supervision");
   private static final Set<String> INVOCATION_FIELDS = Set.of("kind", "execution_id", "source_hash");
   private static final Set<String> POLICY_FIELDS = Set.of("kind", "execution_id", "source_hash", "policy_id", "version");
   private static final Set<String> OWNER_FIELDS = Set.of("operation_id", "scope", "generation");
   public record Received(EffectAuthority.Owner owner, String compatibilityHash,
-      EffectAuthority.ScreenPrecondition expectedScreen, JsonObject action, WorldInputPlan worldInput) {}
+      EffectAuthority.ScreenPrecondition expectedScreen, JsonObject action, WorldInputPlan worldInput,
+      ProducerSupervision supervision) {}
   private NativeEffectContract() {}
 
   public static long counter(JsonObject object, String key) {
@@ -66,7 +69,7 @@ public final class NativeEffectContract {
         ContractIdentity.hash(id(value, "source_hash")));
   }
   public static Received effect(JsonObject params, long cancellationGeneration) {
-    fields(params, EFFECT_FIELDS);
+    fields(params, params.has("supervision") ? SUPERVISED_EFFECT_FIELDS : EFFECT_FIELDS);
     EffectAuthority.Scope scope = scope(params.getAsJsonObject("scope"));
     validateInvocation(scope, params.getAsJsonObject("invocation"));
     JsonObject action = params.getAsJsonObject("action");
@@ -82,7 +85,7 @@ public final class NativeEffectContract {
     return new Received(new EffectAuthority.Owner(id(params, "operation_id"), scope, cancellationGeneration),
         ContractIdentity.hash(id(params, "compatibility_hash")),
         expectedScreen,
-        action, worldInput);
+        action, worldInput, params.has("supervision") ? new ProducerSupervision(params.getAsJsonObject("supervision")) : null);
   }
 
   static void validateInvocation(EffectAuthority.Scope scope, JsonObject invocation) {

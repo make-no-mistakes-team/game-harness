@@ -43,6 +43,47 @@ test("world acquisition cannot come from the future or relabel expired geometry 
   expect(minecraftControllerFrameSchema.safeParse(worldAt(-1n, true)).success).toBe(false);
 });
 
+test("dynamic entities have their own current tick, scope and geometry without retiming terrain", () => {
+  const f = frame();
+  const entity = { target, name: "husk", position, observed_at: at, current: true,
+    bounds: { min: position, max: { ...position, y: position.y + 2 } }, aim_position: position };
+  const dynamic = { ...f.dynamic_entities, entities: [entity] };
+  const parsed = minecraftControllerFrameSchema.parse({ ...f, dynamic_entities: dynamic });
+  expect(parsed.visible_world?.captured_at).toBe(f.visible_world.captured_at);
+  expect(parsed.dynamic_entities.entities[0]!.name).toBe("husk");
+  for (const invalid of [
+    { ...dynamic, native_tick: f.native_tick - 1 },
+    { ...dynamic, captured_native_ns: String(BigInt(f.captured_native_ns) + 1n) },
+    { ...dynamic, entities: [{ ...entity, target: { ...target, life_id: 99 } }] },
+    { ...dynamic, entities: [{ ...entity, health: 20 }] },
+    { ...dynamic, rejected_count: 100 },
+    { ...dynamic, entities: Array.from({ length: 33 }, () => entity) },
+  ]) expect(minecraftControllerFrameSchema.safeParse({ ...f, dynamic_entities: invalid }).success).toBe(false);
+});
+
+test("mechanical attack evidence distinguishes consumed keys from callbacks and damage", () => {
+  const f = frame();
+  const callback = { event_seq: 1, controller_generation: 2, sequence: 3, edge_ordinal: 4,
+    stage: "attack_callback", native_tick: f.native_tick, recorded_native_ns: f.captured_native_ns, crosshair: "entity" };
+  expect(minecraftControllerFrameSchema.parse({ ...f, mechanics: [callback] }).mechanics[0]!.edge_ordinal).toBe(4);
+  for (const invalid of [{ ...callback, damage: 5 }, { ...callback, stage: "accepted_damage" },
+    { ...callback, native_tick: f.native_tick + 1 }])
+    expect(minecraftControllerFrameSchema.safeParse({ ...f, mechanics: [invalid] }).success).toBe(false);
+});
+
+test("own blocking, selected durability and heard combat cues remain actor facts", () => {
+  const f = frame();
+  const player = { ...f.player, blocking: true,
+    active_use: { hand: "off", item: "shield", elapsed_ticks: 6, remaining_ticks: 71994 },
+    equipment: [{ slot: "main", item: "wooden_sword", count: 1, durability: { damage: 58, maximum: 59 } },
+      { slot: "off", item: "shield", count: 1, durability: { damage: 0, maximum: 336 } }] };
+  expect(minecraftControllerFrameSchema.parse({ ...f, player }).player.blocking).toBe(true);
+  expect(minecraftControllerFrameSchema.safeParse({ ...f, player: { ...player,
+    equipment: [{ ...player.equipment[0], durability: { damage: 60, maximum: 59 } }] } }).success).toBe(false);
+  for (const cue of ["shield_block", "shield_break", "item_break", "attack_nodamage", "mob_hurt", "mob_death"])
+    expect(soundPageSchema.safeParse({ ...page, events: [{ ...event, cue }] }).success).toBe(true);
+});
+
 test("capture sequence follows the actual unsigned GHV2 counter including wrap to zero", () => {
   const f = frame();
   const withSequence = (capture_sequence: number) => ({ ...f,
@@ -133,7 +174,7 @@ test("independently sampled inventory and earlier render metadata do not pretend
   const parsed = minecraftControllerFrameSchema.parse({ ...f, frame_seq: Number.MAX_SAFE_INTEGER,
     inventory: { ...f.inventory, captured_native_ns: "-9007199254740992" },
     player: { ...f.player, air_ticks: -2147483648, xp_progress: 1, active_use: null, vehicle_type: "minecraft:boat",
-      status_effects: [], equipment: [{ slot: "feet", item: "leather_boots", count: 1 }] },
+      status_effects: [], equipment: [{ slot: "feet", item: "leather_boots", count: 1, durability: { damage: 0, maximum: 65 } }] },
     screen: { identity: { screen_id: "actual-rendered-inventory", incarnation: 2, layout_revision: 1 },
       content_revision: 3, screen_kind: "inventory", viewport: { width: 320, height: 240, scale_factor: 2 },
       slots: [], cursor: { item: null, count: 0 }, elements: [], progress: [] } });

@@ -180,6 +180,7 @@ export class ProgramOperations {
       };
       const execution = await this.runProgram(input.entry === "step"
         ? { ...selection, ...handoff, entry: "step", args: input.args, limits: input.limits, initial_state: input.initial_state,
+          ...(input.session ? { session: input.session } : {}),
           ...(input.next ? { next: input.next } : {}) }
         : { ...selection, ...handoff, entry: "run", args: input.args, limits: input.limits, ...(input.next ? { next: input.next } : {}) }, startId, startCommit, signal);
       return finish(program, { status: "started", execution: execution as unknown as Json });
@@ -220,8 +221,12 @@ export class ProgramOperations {
         throw new RuntimeFault("stale_context", "Handoff observation no longer matches the selected authority");
       return observation;
     };
+    let prepared: Awaited<ReturnType<SkillManager["prepareResidentHandoff"]>> | null = null;
     try {
       const before = await observe();
+      current();
+      if (request.entry === "step")
+        prepared = await this.skills.prepareResidentHandoff(this.run.run_id, request, predecessorId, signal, current);
       current();
       // Fence future capabilities after preflight, but let the current admitted
       // bounded capability settle before retiring its exact predecessor.
@@ -234,6 +239,7 @@ export class ProgramOperations {
         throw new RuntimeFault("stale_context", "Handoff screen or space changed during retirement");
       current();
     } catch (error) {
+      await prepared?.close();
       if (!interrupted()) this.store.completeToolCall(this.run.run_id, outcomeKey, identity, {
         status: error instanceof RuntimeFault ? "refused" : "unknown",
       });
@@ -243,6 +249,9 @@ export class ProgramOperations {
 
   async runProgram(input: z.infer<typeof programRunSchema>, callId: string, commit: () => void, signal: AbortSignal | undefined) {
     if (input.operation === "start") {
+      if (this.run.control_mode === "executive" && (input.entry !== "step" || !input.session))
+        throw new RuntimeFault("precondition_failed",
+          "This run uses a life-scoped executive. Start entry:'step',session:{schema_version:1} with model-authored activate/step; select finite actions or pinned run dependencies through its nonblocking choice. Direct roots require a separately declared legacy run.");
       const startKey = this.startKey(callId);
       const identity = { tool: "program_run", input } as unknown as Json;
       let first = false;
@@ -262,7 +271,8 @@ export class ProgramOperations {
           epoch: this.run.epoch, session_id: this.run.session_id!, life_id: this.run.life_id!,
           native_boot_id: this.run.native_boot_id!, run_generation: this.host.generation(), space_epoch: this.run.space_epoch!,
           compatibility_hash: this.run.compatibility_hash!,
-          args: input.args, limits: input.limits, ...(input.entry === "step" ? { initial_state: input.initial_state } : {}),
+          args: input.args, limits: input.limits, ...(input.entry === "step" ? { initial_state: input.initial_state,
+            ...(input.session ? { session: input.session } : {}) } : {}),
           ...(predecessor ? { handoff_predecessor_id: predecessor.execution_id } : {}),
           ...(input.next ? { lookahead: input.next } : {}) } as unknown as Json;
       }) as unknown as SkillStartRequest & { handoff_predecessor_id?: string };
@@ -364,7 +374,8 @@ export class ProgramOperations {
     const staged = await this.host.planning().stage({ plan_id: selected.plan_id,
       skill: selected.skill, args: input.args,
       ...(input.entry === "step"
-        ? { entry: "step" as const, initial_state: input.initial_state, limits: input.limits }
+        ? { entry: "step" as const, initial_state: input.initial_state, limits: input.limits,
+            ...(input.session ? { session: input.session } : {}) }
         : { entry: "run" as const, limits: input.limits }),
       ...(input.guard_source === undefined ? {} : { guard_source: input.guard_source }) });
     return { state: staged.state, candidate: { name: program.name, version: program.version },

@@ -21,7 +21,7 @@ import { projectRunOperator } from "./operator-state.ts";
 import type { SkillExecutionView } from "../shared/programs.ts";
 import { goalSchema, verificationResultSchema } from "../shared/validation.ts";
 import { taskTextSchema } from "../shared/tasks.ts";
-import type { EffectContext, EffectScope } from "../shared/control.ts";
+import type { EffectContext, EffectScope, ProducerSupervision } from "../shared/control.ts";
 import { sameEffectScope, sameScreen } from "../shared/control.ts";
 import { adapterCompatibility, canonicalContractJson } from "./adapter-contract.ts";
 import { RegisteredAdapterContract } from "./registered-adapter.ts";
@@ -108,6 +108,9 @@ export class Runtime {
   private deathIds = new Set<string>();
   private lifeRecovery: Promise<void> | null = null;
   private uncertaintyRecovery: Promise<void> | null = null;
+  private readonly sessionChildren = new Map<string, {
+    handle: number; executionId: string; deadlineHostMs: number; supervision: ProducerSupervision;
+  }>();
   private repeatedNoEffect: {
     root: string; rootSource: string; scope: EffectScope; signature: string;
     count: number; notified: boolean; actionIds: string[];
@@ -305,9 +308,17 @@ export class Runtime {
       observe: () => this.refreshObservation(),
       evaluateGuard: (source, observation, args, signal) =>
         sandbox.evaluateGameGuard(source, observation, args, signal, this.context().adapter),
+      prepareReady: (request, predecessorId, signal, current) =>
+        this.skills.prepareResidentHandoff(this.run!.run_id, request, predecessorId, signal, current),
       admit: async (request, permit) => {
         permit.assertCurrent();
         if (permit.signal.aborted) throw new RuntimeFault("stale_context", "Plan admission cancelled");
+        if (request.entry === "step") {
+          const predecessor = this.store.latestRootExecution(this.run!.run_id);
+          if (!predecessor) throw new RuntimeFault("stale_context", "Prepared continuation lost its predecessor");
+          await this.skills.retireForHandoff(this.run!.run_id, request, predecessor.execution_id, permit.signal);
+          permit.assertCurrent();
+        }
         const view = this.skills.start(this.run!.run_id, request);
         this.strategic.admitted();
         return view;
@@ -339,6 +350,42 @@ export class Runtime {
       },
     });
     this.skills = new SkillManager(store, sandbox, {
+      sessionTask: async (execution, request, handle, deadline, signal, frame, behaviorGeneration) => {
+        if (!game.superviseProducer) throw new RuntimeFault("precondition_failed", "Native semantic supervision is required");
+        const selection = { handle, executionId: execution.execution_id, deadlineHostMs: deadline,
+          supervision: { session_id: execution.execution_id, behavior_generation: behaviorGeneration, frame_seq: frame.frame_seq } };
+        if (this.sessionChildren.has(execution.execution_id)) throw new RuntimeFault("busy", "Previous session child has not retired");
+        this.sessionChildren.set(execution.execution_id, selection);
+        try {
+          if (request.kind === "program")
+            return await this.skills.runSessionChild(execution, request.program, request.args,
+              Math.max(1, Math.floor(deadline - performance.now())), handle, signal);
+          this.skills.consumeSessionAction(execution);
+          return await this.skillAction(execution, request.action, signal, `session_${handle}`);
+        } finally {
+          if (this.sessionChildren.get(execution.execution_id) === selection) this.sessionChildren.delete(execution.execution_id);
+        }
+      },
+      superviseSessionTask: async (execution, handle, frame, behaviorGeneration) => {
+        const selection = this.sessionChildren.get(execution.execution_id);
+        if (!selection || selection.handle !== handle) return; // Normal completion/continue race.
+        if (performance.now() >= selection.deadlineHostMs) {
+          await this.actions.cancelOwned(new Set([selection.executionId]), "Session child original deadline reached"); return;
+        }
+        selection.supervision = { session_id: execution.execution_id, behavior_generation: behaviorGeneration, frame_seq: frame.frame_seq };
+        const active = this.actions.active;
+        if (active && active.entry.stored.view.scope &&
+          (active.entry.stored.view.execution_id === execution.execution_id ||
+            this.store.skillExecution(execution.run_id, { execution_id: active.entry.stored.view.execution_id! })?.root_execution_id === execution.execution_id)) {
+          selection.executionId = active.entry.stored.view.execution_id!;
+          await game.superviseProducer!(selection.executionId, selection.supervision);
+        }
+      },
+      retireSessionTask: async (execution, handle, reason) => {
+        const selection = this.sessionChildren.get(execution.execution_id);
+        await this.skills.retireSessionChild(execution, handle, reason);
+        await this.actions.cancelOwned(new Set([execution.execution_id, ...(selection ? [selection.executionId] : [])]), reason);
+      },
       openController: (execution, generation, deadline, applied, effect, lifecycle) =>
         this.actions.reserveController(execution.execution_id, generation, deadline, applied, effect, lifecycle),
       programEvent: (_execution, event) => {
@@ -445,6 +492,10 @@ export class Runtime {
         wake: (reason) => this.strategic.wake(reason),
         changed: onChange,
         admitted: () => this.strategic.admitted(),
+        executiveOwnsControl: () => {
+          const root = this.run ? this.store.latestRootExecution(this.run.run_id) : null;
+          return root?.entry === "step" && !!root.session && !root.ended_at;
+        },
         closePrograms: async (reason) => {
           this.skills.fence(reason);
           await this.skills.closeAll(reason);
@@ -893,6 +944,7 @@ export class Runtime {
     model_id: string;
     experience_id?: string;
     working_programs?: "continue" | "fresh";
+    control_mode?: "executive" | "legacy";
   }): Promise<RunView> {
     return await this.serialize(async () => {
       if (this.closed)
@@ -912,6 +964,7 @@ export class Runtime {
             .regex(/^[a-f0-9]{64}$/)
             .optional(),
           working_programs: z.enum(["continue", "fresh"]).default("continue"),
+          control_mode: z.enum(["executive", "legacy"]).default("legacy"),
         })
         .strict()
         .parse(input);
@@ -963,6 +1016,7 @@ export class Runtime {
         task: parsed.task,
         goal: parsed.goal,
         model_id: parsed.model_id,
+        control_mode: parsed.control_mode,
         status: "created",
         started_at: null,
         ended_at: null,
@@ -1176,7 +1230,8 @@ export class Runtime {
     const execution = this.store.latestRootExecution(run.run_id);
     const program = execution && !execution.ended_at && (execution.entry === "run" || execution.entry === "step")
       ? { name: this.store.skill(run.run_id, execution).name, version: execution.version,
-        entry: execution.entry, status: execution.status }
+        entry: execution.entry, status: execution.status,
+        ...(execution.entry === "step" && execution.session ? { executive: true } : {}) }
       : null;
     return {
       observation,
@@ -1204,7 +1259,8 @@ export class Runtime {
       if (view && ACTION_TERMINAL.has(view.status) && !settling) {
         settling = true;
         unsubscribe();
-        if (view.result?.status === "unknown" || view.result?.requires_reconnect)
+        const root = this.store.skillExecution(execution.run_id, { execution_id: execution.root_execution_id });
+        if ((view.result?.status === "unknown" && !(root?.entry === "step" && root.session)) || view.result?.requires_reconnect)
           this.skills.fence("Leaf outcome is unknown; interrupted execution lineage retained", execution.execution_id);
         if (view.result) completion.resolve(view.result);
         else
@@ -1218,13 +1274,16 @@ export class Runtime {
         check();
     });
     try {
+      const sessionChild = this.sessionChildren.get(execution.root_execution_id);
+      if (sessionChild) sessionChild.executionId = execution.execution_id;
       this.actions.admit(
         id,
         action,
         0,
-        undefined,
+        sessionChild ? Math.max(1, sessionChild.deadlineHostMs - performance.now()) : undefined,
         null,
         execution.execution_id,
+        sessionChild?.supervision,
       );
       this.trace.record(execution, "capability_request", { kind: "admitted_action", action: action as unknown as Json }, {
         call_id: callId, action_id: id, capability: action.kind === "respawn" ? "respawn" : "action",
@@ -1387,6 +1446,17 @@ export class Runtime {
     }
     const execution = action.execution_id
       ? this.store.skillExecution(run.run_id, { execution_id: action.execution_id }) : null;
+    const root = execution ? this.store.skillExecution(run.run_id, { execution_id: execution.root_execution_id }) : null;
+    if (root?.entry === "step" && root.session) {
+      // The session's exact child cannot yield new physical authority until
+      // skillAction/child cleanup joins the arbiter retirement barrier.
+      // Keep the unknown receipt; a later different choice is not its retry.
+      this.store.event(run.run_id, "session.child_unknown", "Unknown child effect retained; executive survives exact producer retirement", {
+        action_id: action.action_id, execution_id: action.execution_id, session_execution_id: root.execution_id,
+        source_hash: action.scope?.source_hash ?? null, no_replay: true,
+      });
+      return;
+    }
     const sessionId = state.session_id, lifeId = state.life.life_id;
     this.fenceAuthority("Uncertain past effect; prior work revoked without replay", action.execution_id ?? undefined);
     const generation = this.generation;

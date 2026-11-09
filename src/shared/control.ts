@@ -53,7 +53,17 @@ export interface EffectEnvelope<Action extends Json = Json> {
   invocation: EffectInvocation;
   action: Action;
   expected_screen: EffectScreenPrecondition;
+  supervision?: ProducerSupervision;
 }
+/** Only a fresh executive decision can renew this exact finite child. */
+export interface ProducerSupervision {
+  session_id: string;
+  behavior_generation: number;
+  frame_seq: number;
+}
+export const producerSupervisionSchema = z.object({
+  session_id: identitySchema, behavior_generation: safeCounterSchema.min(1), frame_seq: safeCounterSchema.min(1),
+}).strict() satisfies z.ZodType<ProducerSupervision>;
 export interface EffectOwnerRef {
   operation_id: string;
   scope: EffectScope;
@@ -142,6 +152,7 @@ export const expectedEffectOwnerSchema = z.object({ operation_id: identitySchema
 export function effectEnvelopeSchema<Action extends z.ZodType>(action: Action) {
   return z.object({ operation_id: identitySchema, compatibility_hash: sha256Schema,
     scope: effectScopeSchema, invocation: effectInvocationSchema, action, expected_screen: effectScreenPreconditionSchema,
+    supervision: producerSupervisionSchema.optional(),
   }).strict().refine(value => value.scope.execution_id === value.invocation.execution_id &&
     value.scope.source_hash === value.invocation.source_hash, { message: "Effect invocation must match its host scope" });
 }

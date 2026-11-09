@@ -4,7 +4,7 @@ import type { TargetRef, VisibleScreenOperation, VisibleScreenRef, VisibleScreen
 import type { GameAPI } from "./programs.ts";
 import { identitySchema, safeCounterSchema, screenInputActionSchema, spaceRefSchema, targetRefSchema, visibleScreenSnapshotSchema, worldInputActionSchema } from "./control.ts";
 import { adapterObservationSchema, type ObservationV3 } from "./observations.ts";
-import { playerLifeSchema } from "./primitives.ts";
+import { jsonSchema, playerLifeSchema } from "./primitives.ts";
 import { controllerEffectUpdateSchema, inputAppliedAckSchema, nativeNanosecondsSchema } from "./controller.ts";
 
 export type MinecraftInventoryItem = { name: string; display_name: string; count: number; slot: number };
@@ -21,7 +21,9 @@ export type MinecraftSoundObservation = {
   distance: "near" | "mid" | "far"; observed_at: string;
 } & (
   | { category: "movement" | "interaction" | "combat" | "creature" | "weather"; cue: null }
-  | { category: "combat"; cue: "creeper_primed" }
+  | { category: "combat"; cue: "creeper_primed" | "shield_block" | "shield_break" | "item_break"
+      | "attack_strong" | "attack_weak" | "attack_nodamage" | "attack_crit" | "attack_sweep" | "attack_knockback"
+      | "mob_hurt" | "mob_death" }
 );
 export type MinecraftObservationData = {
   player: MinecraftPlayer;
@@ -84,7 +86,9 @@ export const minecraftSoundSchema = z.union([
   z.object({ ...ordinarySoundFields, category: z.enum(["movement", "interaction", "combat", "creature", "weather"]),
     cue: z.null().describe("No distinct allowlisted cue was heard for this group.") }).strict(),
   z.object({ ...ordinarySoundFields, category: z.literal("combat"),
-    cue: z.literal("creeper_primed").describe("Actually heard allowlisted creeper priming sound; not hidden fuse state, source identity or position.") }).strict(),
+    cue: z.enum(["creeper_primed", "shield_block", "shield_break", "item_break", "attack_strong", "attack_weak",
+      "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback", "mob_hurt", "mob_death"])
+      .describe("Actually heard allowlisted combat sound; no damage attribution, hidden HP, source identity or position.") }).strict(),
 ]);
 export const minecraftObservationDataSchema = z.object({ player: minecraftPlayerSchema,
   blocks: z.array(minecraftObservedBlockSchema).max(144), entities: z.array(minecraftObservedEntitySchema).max(32),
@@ -166,11 +170,12 @@ export const soundCursorSchema = z.object({ stream_id: identitySchema, sequence:
 export type SoundCursor = z.infer<typeof soundCursorSchema>;
 export const soundEventSchema = z.object({
   sequence: safeCounterSchema.min(1), category: z.enum(["movement", "interaction", "combat", "creature", "weather"]),
-  cue: z.enum(["creeper_primed"]).nullable(),
+  cue: z.enum(["creeper_primed", "shield_block", "shield_break", "item_break", "attack_strong", "attack_weak",
+    "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback", "mob_hurt", "mob_death"]).nullable(),
   direction: z.enum(["here", "N", "NE", "E", "SE", "S", "SW", "W", "NW"]),
   distance: z.enum(["near", "mid", "far"]), heard_at: frameTimestamp, heard_native_ns: nativeNanoseconds,
-}).strict().refine(event => event.cue !== "creeper_primed" || event.category === "combat",
-  { message: "Creeper priming is an actually heard combat cue, not hidden fuse state" });
+}).strict().refine(event => event.cue === null || event.category === "combat",
+  { message: "Distinct allowlisted cues must be actually heard combat sounds" });
 export type SoundEvent = z.infer<typeof soundEventSchema>;
 export const soundPageSchema = z.object({
   stream_id: identitySchema, after_sequence: safeCounterSchema, next_cursor: soundCursorSchema,
@@ -201,9 +206,12 @@ export const minecraftOwnBodySchema = z.object({
   xp_level: nativeTicks, xp_progress: z.number().finite().min(0).max(1),
   active_use: z.object({ hand: z.enum(["main", "off"]), item: registryName,
     elapsed_ticks: nativeTicks, remaining_ticks: nativeTicks }).strict().nullable(),
+  blocking: z.boolean().describe("Actual vanilla blocking readiness, distinct from a newly active item use."),
   equipment: z.array(z.object({ slot: z.enum(["main", "off", "head", "torso", "legs", "feet"]),
-    item: registryName.nullable(), count: z.number().int().min(0).max(4096) }).strict()
-    .refine(entry => entry.item === null ? entry.count === 0 : entry.count > 0)).max(6),
+    item: registryName.nullable(), count: z.number().int().min(0).max(4096),
+    durability: z.object({ damage: nativeTicks, maximum: nativeTicks.min(1) }).strict().nullable(),
+  }).strict().refine(entry => (entry.item === null ? entry.count === 0 && entry.durability === null : entry.count > 0)
+      && (entry.durability === null || entry.durability.damage <= entry.durability.maximum))).max(6),
   status_effects: z.array(z.object({ id: registryName, amplifier: nativeTicks,
     duration_ticks: z.number().int().min(-1).max(2147483647) }).strict()).max(32),
 }).strict().refine(body => new Set(body.equipment.map(entry => entry.slot)).size === body.equipment.length,
@@ -224,9 +232,9 @@ export const minecraftRenderCaptureSchema = z.object({
   pitch_radians: framePitch,
 }).strict().describe("Scalars from this actual GHV2 capture sequence, not later render updates. Actor PNG remains unsynchronized with current body, world and GUI.");
 export const minecraftControllerFrameSchema = z.object({
-  schema_version: z.literal(2), frame_seq: safeCounterSchema.min(1), native_tick: safeCounterSchema,
+  schema_version: z.literal(3), frame_seq: safeCounterSchema.min(1), native_tick: safeCounterSchema,
   captured_native_ns: nativeNanoseconds, captured_at: frameTimestamp,
-  profile_id: z.literal("minecraft_assisted_rgb_360_r8_control_v5"), profile_version: z.literal(5),
+  profile_id: z.literal("minecraft_assisted_rgb_360_r8_control_v6"), profile_version: z.literal(6),
   life_id: safeCounterSchema, space: spaceRefSchema, player: minecraftOwnBodySchema,
   inventory: z.object({ source: z.literal("client_prediction"), captured_native_ns: nativeNanoseconds,
     items: z.array(minecraftInventoryItemSchema).max(64) }).strict()
@@ -237,12 +245,26 @@ export const minecraftControllerFrameSchema = z.object({
   screen: visibleScreenSnapshotSchema.nullable(),
   visible_world: z.object({ source: z.literal("last_authorized_observation"), observation_seq: safeCounterSchema,
     captured_at: frameTimestamp, captured_native_ns: nativeNanoseconds, stale: z.boolean(),
-    blocks: z.array(minecraftObservedBlockSchema).max(144), entities: z.array(minecraftObservedEntitySchema).max(32),
-  }).strict().nullable().describe("Last same-life/space/screen authorized assisted r8 geometry acquisition, with its original observation sequence and time. Controller sampling may acquire it every 500ms; explicit observe always acquires fresh geometry. Sampling retains the prior cache while an assisted effect owner is active. Stale after 1000ms; no atomic body/image alignment."),
+    blocks: z.array(minecraftObservedBlockSchema).max(144), entities: z.array(minecraftObservedEntitySchema).max(0),
+  }).strict().nullable().describe("Authorized r8 terrain cache with original acquisition sequence/time; 500ms controller cadence, explicit observe refresh, stale after 1000ms. Entities are exclusively in dynamic_entities."),
+  dynamic_entities: z.object({ source: z.literal("current_authorized_tick"), native_tick: safeCounterSchema,
+    captured_at: frameTimestamp, captured_native_ns: nativeNanoseconds, partial: z.literal(true),
+    entities: z.array(minecraftObservedEntitySchema.safeExtend({
+      bounds: z.object({ min: frameVector, max: frameVector }).strict(),
+      aim_position: frameVector,
+    })).max(32),
+  }).strict().describe("Current conservative optical r8 entities/projectiles, at most 128 candidates and 32 rows per native tick; no denied-candidate counts. Active mechanical custody does not suppress sensing."),
+  mechanics: z.array(z.object({ event_seq: safeCounterSchema.min(1), controller_generation: safeCounterSchema,
+    sequence: safeCounterSchema.min(1), edge_ordinal: safeCounterSchema.min(1),
+    stage: z.enum(["key_consumed", "attack_callback"]), native_tick: safeCounterSchema,
+    recorded_native_ns: nativeNanoseconds, crosshair: z.enum(["entity", "block", "miss", "unavailable"]),
+  }).strict()).max(32).describe("Ordinary stream attack key consumption and doAttack entry; neither proves a packet, accepted damage or a kill. Retained IDs are non-destructive, not new events on every frame."),
+  mechanics_omitted: safeCounterSchema,
   audible: soundPageSchema,
   last_input: inputAppliedAckSchema.nullable(),
   effect_updates: z.array(controllerEffectUpdateSchema).max(8),
   effect_updates_omitted: safeCounterSchema,
+  executive: jsonSchema.optional().describe("Trusted host-owned software status added after native capture; never world/evaluator evidence."),
 }).strict().superRefine((frame, context) => {
   try {
     if (frame.last_input && (frame.last_input.applied_native_tick > frame.native_tick ||
@@ -256,6 +278,12 @@ export const minecraftControllerFrameSchema = z.object({
         context.addIssue({ code: "custom", path: ["visible_world"],
           message: "World acquisition cannot follow this capture or label geometry older than 1000ms as fresh" });
     }
+    if (frame.dynamic_entities.native_tick !== frame.native_tick ||
+      BigInt(frame.dynamic_entities.captured_native_ns) > BigInt(frame.captured_native_ns))
+      context.addIssue({ code: "custom", path: ["dynamic_entities"], message: "Dynamic sensing must belong to this native tick and precede body capture" });
+    if (frame.mechanics.some(event => event.native_tick > frame.native_tick ||
+      BigInt(event.recorded_native_ns) > BigInt(frame.captured_native_ns)))
+      context.addIssue({ code: "custom", path: ["mechanics"], message: "Mechanical facts cannot follow their containing frame" });
   } catch {
     context.addIssue({ code: "custom", path: ["captured_native_ns"], message: "Acquisition, application and receipt times require exact native decimal nanoseconds" });
   }
@@ -270,6 +298,8 @@ export const minecraftControllerFrameSchema = z.object({
       if (items.some(item => !matches(item.target)))
         context.addIssue({ code: "custom", path: ["visible_world"], message: "Cached world target belongs to another life or space" });
   }
+  if (frame.dynamic_entities.entities.some(entity => !matches(entity.target)))
+    context.addIssue({ code: "custom", path: ["dynamic_entities"], message: "Dynamic target belongs to another life or space" });
 }).describe("Fresh local own-body/current-view feedback without a server inventory request. Last actual application ACK and bounded later GUI receipts have independent times; omitted receipt count is explicit. Distinct from authoritative game.observe(); no atomic PNG alignment or hidden state.");
 export type MinecraftControllerFrame = z.infer<typeof minecraftControllerFrameSchema>;
 export type ControllerFrame = MinecraftControllerFrame;
@@ -279,38 +309,43 @@ export const minecraftControllerFrameRequestSchema = z.object({ audio_cursor: so
 /** These values are compiled into the native resource and are the sampler's actual settings. */
 export const minecraftProfileConfigurationSchema = z.object({
   sampler: z.object({ radius_blocks: z.literal(8), max_blocks: z.literal(144), max_entities: z.literal(32),
-    max_age_ms: z.literal(1000), camera_independent: z.literal(true), occlusion_test: z.literal("native_raycast") }).strict(),
+    max_age_ms: z.literal(1000), camera_independent: z.literal(true), occlusion_test: z.literal("native_raycast"),
+    dynamic_interval_ticks: z.literal(1), dynamic_candidate_limit: z.literal(128),
+    entity_optical_gate: z.literal("air_water_bubble_only"), terrain_interval_ms: z.literal(500) }).strict(),
   actor_image: z.object({ codec: z.literal("png"), presentation: z.literal("opaque_rgb"), alignment: z.literal("unsynchronized") }).strict(),
   motor_profile: z.enum(["precise", "balanced", "fast"]),
   assistance: z.object({ semantic_helpers: z.literal(true) }).strict(),
   visible_gui: z.object({ projection: z.literal("current_visible_layout"), max_slots: z.literal(128),
     max_elements: z.literal(64), max_progress: z.literal(32), coordinates: z.literal("logical_gui") }).strict(),
-  controller_feedback: z.object({ schema_version: z.literal(2), own_body: z.literal("current_client_state"),
+  controller_feedback: z.object({ schema_version: z.literal(3), own_body: z.literal("current_client_state"),
     inventory: z.literal("client_prediction"), screen: z.literal("current_visible_layout"),
     visible_world: z.literal("last_authorized_observation"), render_capture: z.literal("capture_sequence_metadata_only"),
     render_max_age_ms: z.literal(5000), last_input: z.literal("actual_application_ack"),
     effect_updates: z.literal("bounded_later_receipts"), max_effect_updates: z.literal(8),
-    max_effect_update_bytes: z.literal(16384) }).strict(),
+    max_effect_update_bytes: z.literal(16384), mechanics: z.literal("ordinary_attack_entry"),
+    max_mechanics: z.literal(32), equipment_durability: z.literal(true), blocking: z.literal(true) }).strict(),
   audible: z.object({ source: z.literal("actually_delivered_allowlisted"), capacity: z.literal(128),
     ttl_ms: z.literal(1000), max_events_per_page: z.literal(8), cursors: z.literal("consumer_owned"),
-    creeper_primed: z.literal(true), ordinary_groups: z.object({
+    creeper_primed: z.literal(true), combat_cues: z.literal("hurt_death_shield_item_attack"), ordinary_groups: z.object({
       max_groups: z.literal(8), cue_distinct: z.literal(true), cue_priority: z.literal(true),
     }).strict() }).strict(),
 }).strict();
 export function minecraftProfileConfiguration(motorProfile: "precise" | "balanced" | "fast" = "balanced") {
   return minecraftProfileConfigurationSchema.parse({
     sampler: { radius_blocks: 8, max_blocks: 144, max_entities: 32, max_age_ms: 1000,
-      camera_independent: true, occlusion_test: "native_raycast" },
+      camera_independent: true, occlusion_test: "native_raycast", dynamic_interval_ticks: 1,
+      dynamic_candidate_limit: 128, entity_optical_gate: "air_water_bubble_only", terrain_interval_ms: 500 },
     actor_image: { codec: "png", presentation: "opaque_rgb", alignment: "unsynchronized" },
     motor_profile: motorProfile, assistance: { semantic_helpers: true },
     visible_gui: { projection: "current_visible_layout", max_slots: 128, max_elements: 64, max_progress: 32, coordinates: "logical_gui" },
-    controller_feedback: { schema_version: 2, own_body: "current_client_state", inventory: "client_prediction",
+    controller_feedback: { schema_version: 3, own_body: "current_client_state", inventory: "client_prediction",
       screen: "current_visible_layout", visible_world: "last_authorized_observation",
       render_capture: "capture_sequence_metadata_only", render_max_age_ms: 5000,
       last_input: "actual_application_ack", effect_updates: "bounded_later_receipts", max_effect_updates: 8,
-      max_effect_update_bytes: 16384 },
+      max_effect_update_bytes: 16384, mechanics: "ordinary_attack_entry", max_mechanics: 32,
+      equipment_durability: true, blocking: true },
     audible: { source: "actually_delivered_allowlisted", capacity: 128, ttl_ms: 1000,
-      max_events_per_page: 8, cursors: "consumer_owned", creeper_primed: true,
+      max_events_per_page: 8, cursors: "consumer_owned", creeper_primed: true, combat_cues: "hurt_death_shield_item_attack",
       ordinary_groups: { max_groups: 8, cue_distinct: true, cue_priority: true } },
   });
 }

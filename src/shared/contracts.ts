@@ -264,6 +264,8 @@ export interface GameBridge {
   emergencyStop(reason: string): Promise<void>;
   adapter(): RuntimeAdapter | null;
   queryCapability?(id: string, version: number, args: Json): Promise<Json>;
+  /** Renews only an exact current semantic producer from a fresh executive capture. */
+  superviseProducer?(executionId: string, supervision: import("./control.ts").ProducerSupervision): Promise<boolean>;
   openController?(
     reservation: import("./controller.ts").ControllerReservation,
     controllerGeneration: number,
@@ -321,7 +323,7 @@ export interface PolicyContext {
   action: ActionView | null;
   /** Own foreground software, not proof of an applied input or useful behavior.
    * Resident input has no legacy ActionView; action:null alone is not idle. */
-  program: { name: string; version: number; entry: "run" | "step"; status: SkillExecutionView["status"] } | null;
+  program: { name: string; version: number; entry: "run" | "step"; status: SkillExecutionView["status"]; executive?: boolean } | null;
   task: string;
 }
 
@@ -433,6 +435,8 @@ export interface RunOperatorView extends RunControlState {
 
 export interface RunView {
   run_id: string;
+  /** Omission is historical/embedded legacy mode, never an implicit session migration. */
+  control_mode?: "executive" | "legacy";
   world_id: string;
   epoch: number;
   /** Null only for historical records predating life attribution. */

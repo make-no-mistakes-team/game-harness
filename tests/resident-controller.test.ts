@@ -60,7 +60,9 @@ function harness(limits: Partial<ResidentLimits> = {}, trace?: ResidentControlle
     owner, controllerGeneration: 1,
     async sample() { reads++; if (refuses) throw new Error("screen transition"); const frame = controllerFrameFixture();
       frame.frame_seq = frameSeq ?? reads; frame.native_tick = reads; frame.captured_native_ns = String(BigInt(Math.round(clock.now() * 1e6)));
-      frame.inventory.captured_native_ns = frame.captured_native_ns; return transform(frame) as unknown as Json; },
+      frame.inventory.captured_native_ns = frame.captured_native_ns;
+      frame.dynamic_entities.native_tick = frame.native_tick; frame.dynamic_entities.captured_native_ns = frame.captured_native_ns;
+      return transform(frame) as unknown as Json; },
     submit(frame, input) { if (fenced) return { sequence: seq, status: "rejected", reason: "fenced" };
       sent.push({ sequence: ++seq, frame, input: structuredClone(input) }); return { sequence: seq, status: "submitted", reason: null }; },
     async renew(frame) { if (fenced || frame === null) throw new Error("invalid renewal"); renewals.push(frame); armLease(); },
@@ -1090,7 +1092,7 @@ test("invalid trusted evaluation accounting fails closed without poisoning finit
 
 test("increasing frame IDs cannot smuggle regressed native observation time", async () => {
   const h = harness(); let reads = 0; h.transform(frame => {
-    if (++reads > 1) frame.native_tick = 0;
+    if (++reads > 1) frame.native_tick = frame.dynamic_entities.native_tick = 0;
     return frame;
   });
   await begin(h); await h.clock.advance(50); expect(h.controller.snapshot().counters.steps).toBe(1);

@@ -2,6 +2,7 @@ import type { AdapterGoal, Json, PlayerLife } from "./contracts.ts";
 import type { ScreenRef } from "./control.ts";
 import type { SkillExecutionView, SkillLimits, SkillRef } from "./programs.ts";
 import type { ResidentLimits } from "./resident.ts";
+import type { ControlSessionConfig } from "./control-session.ts";
 
 export interface PlanningSource extends SkillRef { hash: string }
 export interface PlanningScope {
@@ -52,7 +53,7 @@ interface StagePlanBase {
 }
 export type StagePlanRequest = StagePlanBase & (
   | { entry?: "run"; limits: SkillLimits }
-  | { entry: "step"; limits: ResidentLimits; initial_state: Json }
+  | { entry: "step"; limits: ResidentLimits; initial_state: Json; session?: ControlSessionConfig }
 );
 export interface StageCorrection {
   plan_id: string;

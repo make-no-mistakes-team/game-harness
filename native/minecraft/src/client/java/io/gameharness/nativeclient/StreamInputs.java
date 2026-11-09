@@ -14,6 +14,7 @@ public final class StreamInputs {
   private WorldInputPlan.Step step;
   private ControllerInputQueue.Entry entry;
   private long preparedTick = -1;
+  private long attackEdgeOrdinal;
   private boolean entering, consuming, consumed, sampled, screenOpened;
 
   public StreamInputs(MinecraftClient client) {
@@ -27,6 +28,7 @@ public final class StreamInputs {
     if (this.entry != null || entry.world() == null) throw new IllegalStateException("Stream input application already pending");
     this.entry = entry; step = entry.world(); entering = true; consumed = sampled = screenOpened = false;
     consumption.reset(step);
+    attackEdgeOrdinal = 0;
   }
   public boolean prepare(long tick) {
     if (step == null || screenOpened || preparedTick == tick) return false;
@@ -70,8 +72,12 @@ public final class StreamInputs {
   public void keyConsumed(KeyBinding key) {
     if (!consuming || entry == null) return;
     for (int button = 0; button < keys.length; button++)
-      if (keys[button] == key) { consumption.counted(button); return; }
+      if (keys[button] == key) {
+        if (button == 7) attackEdgeOrdinal = consumption.nextOrdinal(button, entry.edgeStart());
+        consumption.counted(button); return;
+      }
   }
+  public long attackEdgeOrdinal() { return attackEdgeOrdinal; }
   /** Movement uses levels, not vanilla counted presses; multiple queued movement clicks remain unconfirmed. */
   public boolean sampled() {
     sampled = true;

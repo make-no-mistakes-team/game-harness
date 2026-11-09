@@ -81,6 +81,7 @@ export interface ReactiveHost {
   /** Resolves only after the native input emitter acknowledges neutralization. */
   neutralize(): Promise<void>;
   closePrograms(reason: string): Promise<void>;
+  executiveOwnsControl?(): boolean;
 }
 
 interface ContextIdentity {
@@ -1330,6 +1331,12 @@ export class ReactiveRuntime {
       );
       if (decision.kind === "replan") this.host.wake("policy_replan");
       else if (decision.kind === "interrupt" || decision.kind === "replace") {
+        if (this.host.executiveOwnsControl?.()) {
+          this.decisionEvent(slot, evaluationId, "executive_owns_control",
+            "Life-scoped executive owns child selection; independent reflex cannot replace its physical producer");
+          this.host.wake("policy_replan");
+          return;
+        }
         if (
           decision.kind === "replace" &&
           this.actions.isEquivalent(decision.action)
@@ -1343,6 +1350,7 @@ export class ReactiveRuntime {
           return;
         }
         await this.actions.withPreemption(async (current) => {
+          if (this.host.executiveOwnsControl?.()) return;
           if (
             !this.policyCurrent(
               slot,

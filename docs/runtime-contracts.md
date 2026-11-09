@@ -38,7 +38,7 @@ The agent can observe, write/edit, run, inspect and revise without filling out a
 
 Checkpoint recovery uses versioned serializable task state and unresolved operation references, not saved JavaScript stacks or promises. Resume requires compatible source/state, fresh authorized game state, fenced prior owners and actual neutralization/drain. Preserve explicit Pause/Stop and uncertain effects; restoring source or conversation never rewinds the game. Ordinary modules and checkpoint recovery remain later implementation work. The current body and restart contracts below remain the delivered interfaces until their cutover.
 
-The active perception profile is `minecraft_assisted_rgb_360_r8_control_v5`, with observation envelope 3, payload `minecraft_observation_v1@2`, current-visible-screen and controller-feedback reads, and a separate typed actor PNG. World sampling retains the prior eight-block permissions; controller feedback includes own-body, actual-heard events and input-application facts. Ordinary sound groups preserve an actually heard creeper priming cue. The broader perception target separates `assisted_rgb_frustum_v1`, an assisted 360-degree comparator and a later strict-visual condition. Those complete comparison profiles and atomic capture-time synchronization remain undelivered; the current eight-block profile does not stand in for them.
+The active perception profile is `minecraft_assisted_rgb_360_r8_control_v6`, with observation envelope 3, payload `minecraft_observation_v1@2`, controller frame 3 and a separate typed actor PNG. The eight-block permissions remain unchanged. Dynamic entity geometry is captured each native tick; terrain retains its original cached acquisition time. Feedback includes actual blocking, equipment durability, attack-key consumption/callback facts and actually heard combat cues. The broader frustum, strict-visual and atomically synchronized profiles remain separate targets.
 
 ## Current compact program interface
 
@@ -48,7 +48,7 @@ Executable types live in [`src/shared/programs.ts`](../src/shared/programs.ts); 
 
 Full native reader/result, observation and capability schemas remain available through `help {topic:"game"}`. Selected action families have distinct retained references, subject to the existing help/request byte caps and explicit omissions. A selected family's schema is retained whole or omitted whole, never split into a partial family that silently loses an alternative or bound. This reference routing changes neither playing authority nor observation permissions.
 
-`run` remains an async JavaScript body with host-bound `game,args`. It can implement a finite procedure or an ongoing semantic feedback loop within its declared finite root limits; ongoing play does not require raw-input reimplementation. `step` and `analyze` are ordinary modules with one synchronous named function export: `step(frame,state,intent)` or `analyze(input)`. Pure helpers and constants are allowed; imports, packages and ambient host access are rejected. Original and canonical source each have a 16 KiB UTF-8 bound. These formats share the existing artifact store and exact-version publication path.
+`run` remains an async JavaScript body with host-bound `game,args`. It can implement a finite procedure or semantic feedback loop. `step` exports synchronous `step(frame,state,intent)` and may also export `activate(frame,state,intent)`; executive mode requires both. `analyze` exports only synchronous `analyze(input)`. Pure helpers and constants are allowed; imports, packages and ambient host access are rejected. Original and canonical source each have a 16 KiB UTF-8 bound. These formats share the artifact store and exact-version publication path.
 
 Pure modules also receive the realm-local, frozen `motion.turn(options,state)`
 math binding. The caller supplies actual `native_tick` and applied pose, its
@@ -128,6 +128,97 @@ Interrupted delivery cannot dispatch again; a duplicate
 acknowledged call returns its original selection without cancelling the
 successor. Each root keeps ordinary limits, and the run deadline is unchanged.
 Handoff supplies no behavior, state migration, fallback or replay of old effects.
+
+A resident successor is prepared before retirement: the host pins the published
+source bytes and SHA-256, exact request, compatibility and authority scope,
+predecessor identity, intent version and original deadline. One disposable
+isolated shadow invocation checks the dynamic activation result. Its input,
+state, events and mutated module globals are discarded. After confirmed shadow
+closure, a separate worker compiles the same source without invoking it. This
+clean worker must be ready while the incumbent still runs; a saved source
+revision or an unused worker factory is not runtime readiness. Invalid results,
+refusal and startup failure leave a viable incumbent running.
+
+Only one successor preparation may be owned at a time. Individual worker startup
+keeps its finite bound; ready retention ends at the predecessor's original
+deadline. Stop, cancellation and scope/source/intent changes discard
+the candidate and join owned worker cleanup. A ready worker is consumed once
+after confirmed predecessor worker closure and native retirement. Its first live
+activation uses a fresh post-retirement frame; scope, intent, source, signal and
+deadline are checked again after computation. Neither the shadow result nor a
+discarded activation may emit or be replayed. The successor deadline is no later
+than the predecessor deadline or its own requested duration. No one-shot
+`evaluateGameGuard` worker is started on this resident handoff path.
+
+### Life-scoped control sessions
+
+The desktop HTTP run-creation route defaults to `control_mode:"executive"`.
+This mode admits only `entry:"step", session:{schema_version:1}` as its playing
+root. Direct `run` and raw-only `step` roots require an explicitly selected
+`legacy` run. Embedded Runtime callers retain legacy defaults unless they select
+executive mode; benchmark manifests must record the selected mode.
+
+The model exports synchronous `activate(frame,state,intent)` and
+`step(frame,state,intent)`. Both return `{choice,next_state,status,events}`;
+activation may instead refuse `{refused:true,reason}`. `help controller` derives
+the exact result, task, session and frame shapes from validators. The host
+supplies no target selection, combat cadence, escape rule or survival policy.
+
+| Choice | Host behavior |
+| --- | --- |
+| `raw` with `input` | Select the ordinary input producer. A switch first retires the prior producer; a later fresh computation supplies the first input. |
+| `ensure_task` with `key,request` | Start one finite semantic action or exact pinned `run` dependency. Repeating the same key/content returns its status; changed content conflicts. |
+| `continue` with `handle` | Renew only that active child's supervision from this fresh decision. A settled handle is a normal lookup. |
+| `cancel` with `handle` | Fence the exact child and await its physical retirement, preserving partial or unknown effects. |
+| `observe` | Commit an observation-only decision without renewing a semantic producer. |
+
+`frame.executive` describes software state: source generation, selected producer,
+task high-water mark, retained results, command errors and original deadline.
+It is not game truth. Keys advance by one; evicting settled detail never permits
+an old key to execute again. Unknown task detail remains retained. Exhausted
+detail or invocation budgets refuse additional conflicting work. Session
+task/action/call/depth limits are shared across children.
+
+Worker frames carry at most 24 KiB of active/recent task summaries. Oversized
+request/result detail stays in durable events under its original `history_ref`;
+`detail_omitted` and `tasks_omitted` disclose projection loss. Retaining many
+individually valid large receipts cannot expand the next worker message without
+bound. Pending input captures remain attributable until their own acknowledgment
+or retirement, including when a later input has already been submitted.
+
+Child completion, cancellation or a retired unknown effect leaves the executive
+alive. Unconfirmed emission/cleanup and reconnect requirements still contain the
+session. A child is not a saved async stack: resumption requires a fresh keyed
+invocation chosen from current observations. Source replacement, local recovery
+and child starts do not renew the original session deadline.
+
+Native supervision is separate from a child's hard deadline. An exact retained
+capture no older than 150 ms can renew the selected semantic producer for 250 ms
+from that capture. Expiry fences motor, input and deferred GUI emission; cleanup
+and receipt reconciliation remain allowed. A retiring or expired producer cannot
+renew. Raw input retains its existing short native lease. Independent reflex
+writers cannot preempt an executive session; the executive chooses interruptions.
+
+Optional `recovery:"reset_safe",max_restarts:N` permits bounded clean-invocation
+recovery after confirmed retirement and worker closure. The model's activation
+must reconsider fresh applicability. This resets explicit state; it does not
+restore a transactional checkpoint, replay edges or retry arbitrary source
+exceptions. Opaque and source faults remain quarantined.
+
+A malformed authored return is a result-validation failure, not evidence that
+native cleanup failed. The sandbox retains plain bounded returned data for the
+trusted decoder to report invalid fields. Joining a rejected computation is
+separate from confirming worker closure and exact native retirement. This keeps
+an invalid activation from falsely requiring a game disconnect. Shadow probes
+also validate the selected raw/executive contract before retiring an incumbent.
+
+Resident worker faults carry a typed origin: watchdog, source throw, transport,
+opaque failure or cleanup. Host/guardian timing and transport categories are
+separate from advisory in-container diagnostics; generated exception text cannot
+select a recovery category. Cleanup failure remains containment, and an opaque
+failure or source exception does not authorize a retry of the same invocation.
+Compile-once live workers retain their own module globals across decisions;
+explicit state is not an automatic rollback checkpoint.
 
 Review with an explicit version stays exact. Without one, `program_review` selects the family's latest matching outcome, not an unexecuted latest source revision. A write experiment still requires its exact latest direct parent's own feedback. A prior `keep` or `insufficient_evidence` assessment stays immutable but does not block repair. Authoring does not require a review call.
 
@@ -499,10 +590,10 @@ visible GUI and audible feedback without a server inventory request. Pass
 `null` initially, then retain the returned audible cursor independently for
 each consumer. This read is not `game.observe()`: its inventory is explicitly
 `client_prediction`, and cannot establish server-confirmed goal possession.
-Cached world rows keep their original authorized observation time and an
-explicit age flag. When no assisted owner holds the sampler, controller reads
-may acquire a new bounded geometry sample at most every 500 ms; otherwise they
-retain the authorized cache. Returning a cached row does not refresh its age.
+Cached terrain rows keep their original authorized observation time and an
+explicit age flag, with a 500 ms acquisition cadence. `dynamic_entities` is a
+separate current-tick projection and remains available during semantic work.
+Returning cached terrain does not refresh its age.
 Known screen close/replacement rejects an in-flight frame instead of
 returning its obsolete GUI. Screen identity checks do not turn unrelated
 slot-content revisions into a whole-inventory read barrier. An unavailable
@@ -1548,7 +1639,7 @@ The profile targets Minecraft Java 1.21.4 Normal Survival, one avatar, ordinary 
 
 ### Current player-observable structured profile
 
-The active profile is **`minecraft_assisted_rgb_360_r8_control_v5`**, version 5. The descriptor declares observation envelope **3** and payload schema **`minecraft_observation_v1@2`**, with separate schema hashes. Its materialized configuration is radius 8, at most 144 blocks/32 entities, maximum age 1,000 ms, camera-independent native raycast occlusion, opaque RGB PNG with unsynchronized alignment, the actual `balanced`/`precise`/`fast` motor setting and semantic helpers enabled. The explicit visible-GUI read adds current visible layout with at most 128 slots, 64 elements and 32 progress entries in logical GUI coordinates. The world payload additionally bounds own inventory to 64 entries, sounds to eight and all collections together to 256 entries. Ordinary sound groups declare cue-distinct grouping and cue-first truncation. These identities and values come from [`native-contract.ts`](../src/server/native-contract.ts) and [`minecraft.ts`](../src/shared/minecraft.ts); the configuration and compatibility hashes bind the actual contract. Earlier episodes retain their original profile, schema and evidence.
+The active profile is **`minecraft_assisted_rgb_360_r8_control_v6`**, version 6. The descriptor declares observation envelope **3**, payload schema **`minecraft_observation_v1@2`** and controller frame **3**. It retains radius 8, at most 144 terrain rows/32 entity rows, assisted camera-independent optical sensing, unsynchronized opaque RGB, the actual motor setting and disclosed semantic helpers. Dynamic acquisition runs each native tick, bounds candidate work to 128 and exposes visible bounds/aim points; terrain retains its 500 ms cadence and 1,000 ms stale threshold. Open water and bubble columns can pass the conservative entity optical gate; waterlogged solids, lava, opaque and unloaded cells do not. Own feedback adds blocking, equipment durability and a bounded 32-entry ordinary-attack mechanics ring. Actual-heard cues include mob hurt/death, shield, item-break and attack sounds without hidden source identity, HP or attribution. GUI limits remain 128 slots, 64 elements and 32 progress entries; inventory remains 64 entries. The configuration and schema hashes bind these declarations. Earlier episodes retain their original profile and evidence.
 
 The active profile does not implement the 32-block scheduled sampler target below or a frustum/strict-visual condition. Actor images remain unsynchronized with structured observations, and their host selection scope is not capture metadata. GHV2 packet render/scope diagnostics are retained separately rather than silently exposed through this profile. Structured assistance is not human-identical perception, and older r2 history is not relabelled.
 

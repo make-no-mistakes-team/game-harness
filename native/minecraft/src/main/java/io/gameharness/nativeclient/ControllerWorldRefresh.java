@@ -4,7 +4,7 @@ import com.google.gson.JsonObject;
 import java.util.Objects;
 import java.util.function.LongFunction;
 
-/** Game-thread owner of permitted geometry acquisition, independent of sound and strategic reads. */
+/** Game-thread terrain cache. Current dynamic sensing is a separate per-tick acquisition. */
 public final class ControllerWorldRefresh {
   private static final long INTERVAL_NS = 500_000_000L;
   private static final long MAX_AGE_NS = 1_000_000_000L;
@@ -34,7 +34,7 @@ public final class ControllerWorldRefresh {
     return current(now);
   }
 
-  /** Assisted effect owners keep custody of their targets; sampling must not acquire around them. */
+  /** Read the terrain cache without acquiring or relabelling its original time. */
   public JsonObject retained(long now, long life, EffectAuthority.Space space, EffectAuthority.Screen screen) {
     scope(life, space, screen);
     return current(now);

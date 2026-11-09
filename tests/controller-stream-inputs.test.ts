@@ -380,7 +380,7 @@ test("DTOs reject unsafe counters private actor ACK authority and malformed nati
 function nativeChannel(operationId = "resident-owner", generation = 3, deadlineHostMs = 10000) {
   const identity = { ...owner(), operation_id: operationId, generation };
   const frame = controllerFrameFixture(identity.scope.life_id, identity.scope.space_epoch);
-  frame.frame_seq = 1; frame.native_tick = 10;
+  frame.frame_seq = 1; frame.native_tick = frame.dynamic_entities.native_tick = 10;
   frame.captured_native_ns = frame.inventory.captured_native_ns = "1000000000";
   const calls: string[] = [], applied: InputAppliedAck[] = [];
   let retired = false;
@@ -798,7 +798,7 @@ test("a delayed heartbeat cannot make the old decision fresh for submission or a
     await expect(h.channel.renew(frame)).rejects.toThrow(/stale decision/);
     expect(h.calls).toEqual(["controller_heartbeat"]);
     expect(h.channel.snapshot()).toMatchObject({ submitted_sequence: 0, applied_sequence: 0 });
-    h.frame.frame_seq = 2; h.frame.native_tick = 11;
+    h.frame.frame_seq = 2; h.frame.native_tick = h.frame.dynamic_entities.native_tick = 11;
     h.frame.captured_native_ns = h.frame.inventory.captured_native_ns = "1161000000";
     const fresh = await h.channel.sample(null);
     h.request(async () => ({}));

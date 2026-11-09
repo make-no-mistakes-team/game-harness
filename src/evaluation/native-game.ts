@@ -245,7 +245,7 @@ export class NativeFixture {
     }
     this.report.launched_native_artifacts = installedArtifacts;
     const observation = await this.prepareWithin(() => this.observe(), this.caps.observationMs, "Initial authorized observation timed out");
-    requireProof(observation.schema_version === 3 && observation.profile_id === "minecraft_assisted_rgb_360_r8_control_v5", "Native observation is not the actual negotiated observation3/r8/control-feedback profile");
+    requireProof(observation.schema_version === 3 && observation.profile_id === "minecraft_assisted_rgb_360_r8_control_v6", "Native observation is not the actual negotiated observation3/r8/control-feedback profile");
     requireProof(observation.epoch === this.initialEpoch && observation.life.status === "alive" && observation.data.player.health > 0, "Fresh world did not preserve the safe-long scope or admit an authoritative alive player");
     this.report.initial = this.identity(observation);
     const history = this.report.world_history as Array<Record<string, unknown>> | undefined;

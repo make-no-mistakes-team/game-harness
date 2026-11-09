@@ -108,8 +108,8 @@ export function readStudyObservationProfile(manifest: StudyManifest, projectRoot
   const descriptor = validateAdapterDescriptor(JSON.parse(bytes), minecraftSchemaCatalog());
   minecraftProfileConfigurationSchema.parse(descriptor.observation.profile.configuration);
   requireCondition(descriptor.game.id === "minecraft" && descriptor.game.version === "1.21.4" && descriptor.adapter.id === "fabric-owned-client" &&
-    descriptor.actuator === "native" && descriptor.observation.profile.id === "minecraft_assisted_rgb_360_r8_control_v5" &&
-    descriptor.observation.profile.version === 5,
+    descriptor.actuator === "native" && descriptor.observation.profile.id === "minecraft_assisted_rgb_360_r8_control_v6" &&
+    descriptor.observation.profile.version === 6,
     "Unsupported materialized native adapter/profile condition");
   return descriptor;
 }

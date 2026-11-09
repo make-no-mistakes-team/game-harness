@@ -12,7 +12,7 @@ import { adapterCompatibility, contractHash } from "./adapter-contract.ts";
 export const NATIVE_CONTRACT_BUILD_INPUTS = [
   "native/minecraft/build.gradle", "native/minecraft/settings.gradle", "native/minecraft/gradlew",
   "package.json", "bun.lock", "scripts/build-native-contract.ts",
-  "src/shared/contracts.ts", "src/shared/control.ts", "src/shared/controller.ts", "src/shared/resident.ts", "src/shared/observations.ts", "src/shared/minecraft.ts", "src/shared/primitives.ts", "src/shared/adapter.ts",
+  "src/shared/contracts.ts", "src/shared/control.ts", "src/shared/controller.ts", "src/shared/resident.ts", "src/shared/control-session.ts", "src/shared/observations.ts", "src/shared/minecraft.ts", "src/shared/primitives.ts", "src/shared/adapter.ts",
   "src/shared/validation.ts", "src/shared/programs.ts", "src/shared/video.ts", "src/server/adapter-contract.ts", "src/server/native-contract.ts",
   "src/server/minecraft-adapter.ts", "src/server/actor-frames.ts", "src/server/video.ts",
 ];
@@ -88,7 +88,7 @@ export async function buildNativeContract(projectRoot: string): Promise<NativeCo
     adapter: { id: "fabric-owned-client", version: "1.0.0", build_hash: contractHash(buildInputs) },
     observation: { schema_version: 3, schema_hash: contractHash(schemas.observation),
       payload_schema: { id: "minecraft_observation_v1", version: 2, hash: contractHash(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_360_r8_control_v5", version: 5, configuration,
+      profile: { id: "minecraft_assisted_rgb_360_r8_control_v6", version: 6, configuration,
         configuration_hash: contractHash(configuration) } },
     capabilities: Object.entries(schemas.capabilities).map(([key, schema]) => {
       const separator = key.lastIndexOf("@");

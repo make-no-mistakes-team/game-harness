@@ -8,6 +8,7 @@ import { EpisodeRecorder } from "../src/server/recording.ts";
 import { NativeFixture, bounded, evidence, pause, requireProof, until, wrap } from "../src/evaluation/native-game.ts";
 import type { EvaluationCaps } from "../src/evaluation/contracts.ts";
 import { ownedWindowInput } from "../src/evaluation/owned-window-input.ts";
+import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
 
 const neutral: WorldHeld = { forward: false, back: false, left: false, right: false, jump: false,
   sprint: false, sneak: false, attack: false, use: false };
@@ -218,6 +219,57 @@ export async function runNativeWorldInputFixture(project: string, caps: Evaluati
       const settled = await result; entry.result = settled; completed(settled, 41);
       const released = await own(); entry.released = released;
       requireProof(!released.using_item && !released.blocking, "Shield remained active after ordinary release");
+    });
+    await runCase("active_shield_release_attack_same_tick", [target,
+      "item replace entity @a hotbar.0 with minecraft:stick",
+      "item replace entity @a weapon.offhand with minecraft:shield"], async entry => {
+      const result = await act([step(10, { use: true }, [press("use")]),
+        step(1, { attack: true }, [release("use"), press("attack")]),
+        step(1, {}, [release("attack")])]);
+      entry.result = result; completed(result, 12);
+      entry.server = await health("unchanged");
+      const actual = await own(); entry.consumption = actual;
+      requireProof(actual.attack_presses_consumed === 0 && !actual.using_item && !actual.blocking,
+        "An attack drained during active-use release was falsely reported as a vanilla callback");
+    });
+    await runCase("active_shield_release_then_later_attack", [target,
+      "item replace entity @a hotbar.0 with minecraft:stick",
+      "item replace entity @a weapon.offhand with minecraft:shield"], async entry => {
+      const result = await act([step(10, { use: true }, [press("use")]),
+        step(1, {}, [release("use")]), step(1, { attack: true }, [press("attack")]),
+        step(1, {}, [release("attack")])]);
+      entry.result = result; completed(result, 13);
+      entry.server = await health("damaged");
+      requireProof((await own()).attack_presses_consumed === 1, "Later ordinary strike did not invoke exactly one callback");
+    });
+    await runCase("selected_weapon_breakage_feedback", [target,
+      "item replace entity @a hotbar.0 with minecraft:wooden_sword[minecraft:damage=58]"], async entry => {
+      const before = minecraftControllerFrameSchema.parse(
+        await fixture.bridge.queryCapability("minecraft.controller_frame", 2, { audio_cursor: null }));
+      entry.before = before;
+      requireProof(before.player.equipment.some(item => item.slot === "main" &&
+        item.item === "wooden_sword" && item.durability?.damage === 58 && item.durability.maximum === 59),
+      "Selected weapon durability did not reflect actual own equipment");
+      const result = await act([step(1, { attack: true }, [press("attack")]), step(1, {}, [release("attack")])]);
+      entry.result = result; completed(result, 2);
+      entry.server = await server("unless data entity @a[limit=1] Inventory[{Slot:0b}]", "last-durability sword broke on actual ordinary attack");
+      entry.after_body = await until(async () => minecraftControllerFrameSchema.parse(
+        await fixture.bridge.queryCapability("minecraft.controller_frame", 2, { audio_cursor: null })),
+      frame => frame.player.equipment.some(item => item.slot === "main" && item.item === null && item.durability === null),
+      caps.observationMs, "Broken selected weapon persisted in current body feedback");
+    });
+    await runCase("ordinary_attack_cooldown_feedback", [target,
+      "item replace entity @a hotbar.0 with minecraft:iron_sword"], async entry => {
+      const read = async () => minecraftControllerFrameSchema.parse(
+        await fixture.bridge.queryCapability("minecraft.controller_frame", 2, { audio_cursor: null }));
+      entry.ready = await until(read, frame => frame.view.attack_indicator === 1, caps.observationMs,
+        "Ordinary own attack cooldown did not reach full readiness");
+      const result = await act([step(1, { attack: true }, [press("attack")]), step(1, {}, [release("attack")])]);
+      entry.result = result; completed(result, 2);
+      const after = await read(); entry.after = after;
+      requireProof(after.view.attack_indicator < 1, "Attack callback was not reflected by own vanilla cooldown");
+      entry.recovered = await until(read, frame => frame.view.attack_indicator === 1, caps.observationMs,
+        "Vanilla attack cooldown did not recover without host attack timing");
     });
     await runCase("bow_draw_turn_release", ["item replace entity @a hotbar.0 with minecraft:bow",
       "item replace entity @a inventory.0 with minecraft:arrow 8", "fill -5 240 8 5 244 8 minecraft:stone"], async entry => {

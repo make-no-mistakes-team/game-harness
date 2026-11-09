@@ -271,13 +271,26 @@ public final class SoundProjectionProof {
           && events.getFirst().cue() == null, "old allowlist event/category was lost: " + approved[i]);
     }
     sounds.accept("minecraft:entity.creeper.primed", 0, 0, 2, WALL, NOW);
-    sounds.accept("minecraft:entity.creeper.hurt", 0, 0, 2, WALL, NOW);
     sounds.accept("minecraft:entity.warden.heartbeat", 0, 0, 2, WALL, NOW);
-    sounds.accept(6, 0, 0, 2, WALL, NOW);
+    sounds.accept(17, 0, 0, 2, WALL, NOW);
     var primed = sounds.page(null, NOW).events();
     require(primed.size() == 1 && primed.getFirst().category() == 2
         && "creeper_primed".equals(primed.getFirst().cue())
         && primed.getFirst().nativeNanos() == NOW, "priming cue was absent or widened the allowlist");
+    String[] combatSounds = {"minecraft:item.shield.block", "minecraft:item.shield.break",
+      "minecraft:entity.item.break", "minecraft:entity.player.attack.strong", "minecraft:entity.player.attack.weak",
+      "minecraft:entity.player.attack.nodamage", "minecraft:entity.player.attack.crit",
+      "minecraft:entity.player.attack.sweep", "minecraft:entity.player.attack.knockback",
+      "minecraft:entity.creeper.hurt", "minecraft:entity.skeleton.death"};
+    String[] combatCues = {"shield_block", "shield_break", "item_break", "attack_strong", "attack_weak",
+      "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback", "mob_hurt", "mob_death"};
+    for (int i = 0; i < combatSounds.length; i++) {
+      var one = new SoundProjection();
+      one.accept(combatSounds[i], 0, 0, 2, WALL, NOW);
+      var heard = one.page(null, NOW).events();
+      require(heard.size() == 1 && heard.getFirst().category() == 2
+          && combatCues[i].equals(heard.getFirst().cue()), "actually heard combat cue omitted or misclassified");
+    }
     require(SoundProjection.audible(true, 1, 1, false, true, 16, 0, 0, 2),
         "actually playing audible source was excluded");
     require(!SoundProjection.audible(false, 1, 1, false, true, 16, 0, 0, 2),

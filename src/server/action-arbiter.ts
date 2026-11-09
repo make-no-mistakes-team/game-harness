@@ -9,7 +9,7 @@ import type {
   RuntimeAdapter,
 } from "../shared/contracts.ts";
 import { randomUUID } from "node:crypto";
-import type { EffectEnvelope, EffectInvocation, EffectScope } from "../shared/control.ts";
+import type { EffectEnvelope, EffectInvocation, EffectScope, ProducerSupervision } from "../shared/control.ts";
 import { sameEffectScope, screenPreconditionMatches } from "../shared/control.ts";
 import { assertExecutableCompatible } from "./effect-contract.ts";
 import { RegisteredAdapterContract } from "./registered-adapter.ts";
@@ -326,6 +326,7 @@ export class ActionArbiter {
     requestedDeadline: number | undefined,
     policy: PolicyAuthority | null,
     executionId: string | null = null,
+    supervision?: ProducerSupervision,
   ): ActionView {
     if (this.controllerLease)
       throw new RuntimeFault("busy", "Finite actions cannot overlap an admitted or retiring controller writer");
@@ -386,7 +387,8 @@ export class ActionArbiter {
     }
     const envelope: EffectEnvelope = { operation_id: id, scope, invocation, compatibility_hash: binding.compatibility_hash,
       action, expected_screen: adapter.screenPrecondition?.(action, state.screen) ??
-        (state.screen ? { kind: "transaction", screen: { ...state.screen } } : { kind: "absent" }) };
+        (state.screen ? { kind: "transaction", screen: { ...state.screen } } : { kind: "absent" }),
+      ...(supervision ? { supervision } : {}) };
     const canonical = key(action);
     const matching =
       this.current && key(this.current.entry.stored.request) === canonical

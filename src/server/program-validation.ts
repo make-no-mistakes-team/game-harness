@@ -335,17 +335,23 @@ function parseModule(source: string, kind: "step" | "analyze") {
     throw new ProgramValidationError([issue("invalid_syntax", "Source must be an ordinary JavaScript module.", locate(position))]);
   }
   const exports = nodes(ast.body).filter(node => node.type.startsWith("Export"));
-  const selected = exports[0];
-  const declaration = selected && isNode(selected.declaration) ? selected.declaration : null;
-  const parameters = declaration ? nodes(declaration.params) : [];
-  if (exports.length !== 1 || selected?.type !== "ExportNamedDeclaration" || !declaration ||
-    declaration.type !== "FunctionDeclaration" || !isNode(declaration.id) || declaration.id.name !== kind ||
-    declaration.async || declaration.generator || parameters.length !== (kind === "step" ? 3 : 1) ||
-    parameters.some(parameter => parameter.type !== "Identifier")) {
+  const permitted = kind === "step" ? [kind, "activate"] : [kind];
+  const names = new Set<string>();
+  const valid = exports.every(selected => {
+    const declaration = isNode(selected.declaration) ? selected.declaration : null;
+    const parameters = declaration ? nodes(declaration.params) : [];
+    const name = declaration && isNode(declaration.id) ? declaration.id.name : null;
+    if (selected.type !== "ExportNamedDeclaration" || !declaration || typeof name !== "string" ||
+      !permitted.includes(name) || names.has(name) || declaration.type !== "FunctionDeclaration" ||
+      declaration.async || declaration.generator || parameters.length !== (kind === "step" ? 3 : 1) ||
+      parameters.some(parameter => parameter.type !== "Identifier")) return false;
+    names.add(name); return true;
+  });
+  if (!valid || !names.has(kind)) {
     throw new ProgramValidationError([issue("invalid_entry",
-      `Module requires one named synchronous function export ${kind} with ${kind === "step" ? "three" : "one"} plain parameters.`)]);
+      `Module requires synchronous ${kind} with ${kind === "step" ? "three" : "one"} plain parameters; step may also export activate(frame,state,intent). No other exports are allowed.`)]);
   }
-  return { fn: ast, body: ast, formatterSource: source, locate, selected };
+  return { fn: ast, body: ast, formatterSource: source, locate, selected: exports };
 }
 
 function analyze(source: string, kind: ProgramSourceKind) {
@@ -365,7 +371,7 @@ function analyze(source: string, kind: ProgramSourceKind) {
       complexity = { value: 1 };
       nesting = 0;
     }
-    if ((forbiddenSyntax[node.type] && !(module && "selected" in parsed && node === parsed.selected)) ||
+    if ((forbiddenSyntax[node.type] && !(module && "selected" in parsed && Array.isArray(parsed.selected) && parsed.selected.includes(node))) ||
       (module && node.type === "AwaitExpression")) {
       issues.push(
         issue(
@@ -573,8 +579,8 @@ export async function validateSkill(
     }
     dependencies.add(key);
   }
-  if (parsed.data.entry !== "run" && parsed.data.dependencies.length)
-    throw new ProgramValidationError([{ ...issue("invalid_dependencies", "Pure step/analyze modules cannot call playing dependencies."), path: "dependencies" }]);
+  if (parsed.data.entry === "analyze" && parsed.data.dependencies.length)
+    throw new ProgramValidationError([{ ...issue("invalid_dependencies", "Pure analyze modules cannot call playing dependencies."), path: "dependencies" }]);
   const program = await validateProgramSource(parsed.data.source, parsed.data.entry === "run" ? "skill" : parsed.data.entry, context);
   return {
     ...parsed.data,

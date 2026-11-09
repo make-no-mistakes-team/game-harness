@@ -26,6 +26,10 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
   const read = async (cursor: SoundCursor | null = null) => minecraftControllerFrameSchema.parse(
     await fixture.bridge.queryCapability("minecraft.controller_frame", 2, { audio_cursor: cursor }));
   const worldProvenance = (frame: MinecraftControllerFrame, prior?: MinecraftControllerFrame) => {
+    requireProof(frame.dynamic_entities.native_tick === frame.native_tick &&
+      BigInt(frame.dynamic_entities.captured_native_ns) <= BigInt(frame.captured_native_ns) &&
+      frame.dynamic_entities.entities.length <= 32 && frame.dynamic_entities.partial,
+    "Dynamic sensing lost coherent tick, original time or bounded partial coverage");
     const world = frame.visible_world, previous = prior?.visible_world;
     if (!world) return;
     const age = BigInt(frame.captured_native_ns) - BigInt(world.captured_native_ns);
@@ -152,6 +156,95 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
       });
       requireProof(observation, "Server inventory negative witness was not submitted");
       entry.resumed_observation = await observation; requireProof(settled, "Real inventory observation did not settle after server resume");
+    });
+    await run("moving_dynamic_target_and_optical_occlusion", async entry => {
+      await fixture.flat();
+      await fixture.console(['summon minecraft:husk 0.5 240 4.5 {NoAI:1b,NoGravity:1b,Silent:1b,Tags:["gh_dynamic"]}']);
+      const first = await until(read, frame => frame.dynamic_entities.entities.some(entity => entity.name === "husk"),
+        caps.observationMs, "Dynamic local target was not projected");
+      const target = first.dynamic_entities.entities.find(entity => entity.name === "husk")!;
+      const moved: MinecraftControllerFrame[] = [];
+      for (const x of [1.5, 2.5, 3.5]) {
+        await fixture.console([`tp @e[tag=gh_dynamic] ${x} 240 4.5`]);
+        const current = await until(read, frame => frame.dynamic_entities.entities.some(entity =>
+          entity.target.target_id === target.target.target_id && Math.abs(entity.position.x - x) < .05),
+        caps.observationMs, "Moving target retained old geometry or changed mechanical identity");
+        moved.push(current);
+      }
+      entry.first = first; entry.moved = moved;
+      const motor = track(fixture.action({ kind: "move", controls: {}, duration_ms: 1000 }, 4000, scope.signal));
+      await until(() => fixture.diagnostics(), value => value.motor_active, caps.observationMs,
+        "Semantic motor did not acquire custody for independent dynamic sensing");
+      const underCustody = await read();
+      await fixture.console(["tp @e[tag=gh_dynamic] 2.5 240 4.5"]);
+      entry.semantic_custody = await until(read, frame => frame.native_tick > underCustody.native_tick &&
+        frame.dynamic_entities.entities.some(entity => entity.target.target_id === target.target.target_id &&
+          Math.abs(entity.position.x - 2.5) < .05), caps.observationMs,
+      "Semantic target custody suppressed current dynamic sensing");
+      entry.motor = await motor;
+      const freshness: MinecraftControllerFrame[] = [];
+      for (let sample = 0; sample < 8; sample++) {
+        freshness.push(await read()); await pause(50);
+      }
+      requireProof(new Set(freshness.map(frame => frame.dynamic_entities.native_tick)).size >= 6 &&
+        freshness.every(frame => frame.dynamic_entities.native_tick === frame.native_tick &&
+          BigInt(frame.captured_native_ns) - BigInt(frame.dynamic_entities.captured_native_ns) < 150_000_000n),
+      "Dynamic geometry retained the former 500ms acquisition cadence");
+      entry.dynamic_freshness = freshness;
+      await fixture.console(["fill -1 240 2 4 244 2 minecraft:stone"]);
+      entry.occluded = await until(read, frame => !frame.dynamic_entities.entities.some(entity =>
+        entity.target.target_id === target.target.target_id), caps.observationMs, "Opaque wall retained current hidden entity geometry");
+      await fixture.console(["fill -1 240 2 4 244 2 minecraft:air", "fill -1 240 -1 4 243 5 minecraft:water",
+        "effect give @a minecraft:water_breathing 30 0 true", "tp @e[tag=gh_dynamic] 0.5 240 4.5"]);
+      entry.water = await until(read, frame => frame.player.submerged_in_water &&
+        frame.dynamic_entities.entities.some(entity => entity.target.target_id === target.target.target_id),
+      caps.observationMs, "Open-water optical rays blinded a visible dynamic target");
+      await fixture.console(["fill -1 239 -1 4 239 5 minecraft:soul_sand",
+        "fill -1 240 -1 4 243 5 minecraft:bubble_column[drag=false]"]);
+      entry.bubbles = await until(read, frame => frame.dynamic_entities.entities.some(entity =>
+        entity.target.target_id === target.target.target_id), caps.observationMs,
+      "Bubble-column optical rays blinded a visible dynamic target");
+      await fixture.console(["fill -1 240 2 1 243 2 minecraft:oak_leaves[waterlogged=true]"]);
+      entry.waterlogged = await until(read, frame => !frame.dynamic_entities.entities.some(entity =>
+        entity.target.target_id === target.target.target_id), caps.observationMs, "Waterlogged solid became optically open water");
+      await fixture.console(["fill -1 240 2 1 243 2 minecraft:lava"]);
+      entry.lava = await until(read, frame => !frame.dynamic_entities.entities.some(entity =>
+        entity.target.target_id === target.target.target_id), caps.observationMs, "Lava became optically open water");
+      await fixture.console(["fill -1 240 -1 4 243 5 minecraft:air", "tp @e[tag=gh_dynamic] 0.5 240 9.5"]);
+      entry.out_of_range = await until(read, frame => !frame.dynamic_entities.entities.some(entity =>
+        entity.target.target_id === target.target.target_id), caps.observationMs, "Dynamic sensing expanded the declared radius");
+      await fixture.console(["tp @e[tag=gh_dynamic] 0.5 240 4.5", "effect give @e[tag=gh_dynamic] minecraft:invisibility 30 0 true"]);
+      entry.invisible = await until(read, frame => !frame.dynamic_entities.entities.some(entity =>
+        entity.target.target_id === target.target.target_id), caps.observationMs, "Dynamic sensing exposed an invisible entity");
+      await fixture.console(["tp @e[tag=gh_dynamic] 0 -60 0", "kill @e[tag=gh_dynamic]"]);
+      await fixture.flat();
+    });
+    await run("ordinary_stream_attack_callback_identity", async entry => {
+      await fixture.flat();
+      await fixture.console(['summon minecraft:husk 0.5 240 3.0 {NoAI:1b,Silent:1b,Tags:["gh_stream_attack"]}']);
+      const source = createHash("sha256").update("ordinary-stream-attack-callback-proof").digest("hex");
+      await fixture.withController(source, 8000, () => {}, () => {}, async channel => {
+        const first = minecraftControllerFrameSchema.parse(await channel.sample(null));
+        await channel.renew(null);
+        const submitted = channel.submit(first, { kind: "world", held: { ...neutral, attack: true },
+          edges: [{ kind: "button", button: "attack", phase: "press", count: 1 }],
+          view: { kind: "unchanged" }, selected_hotbar: null });
+        requireProof(submitted.status !== "rejected", "Stream attack was not admitted");
+        const frames: MinecraftControllerFrame[] = [];
+        for (let tick = 0; tick < 8; tick++) {
+          await pause(50); const current = minecraftControllerFrameSchema.parse(await channel.sample(null));
+          await channel.renew(null); frames.push(current);
+        }
+        const last = frames.at(-1)!;
+        const callbacks = last.mechanics.filter(event => event.controller_generation === channel.controllerGeneration &&
+          event.sequence === submitted.sequence && event.stage === "attack_callback");
+        const consumed = last.mechanics.filter(event => event.controller_generation === channel.controllerGeneration &&
+          event.sequence === submitted.sequence && event.stage === "key_consumed");
+        requireProof(callbacks.length === 1 && consumed.length === 1 && callbacks[0]!.edge_ordinal === consumed[0]!.edge_ordinal,
+          "Held attack repeated a callback or lost exact consumed-edge correlation");
+        entry.submission = submitted; entry.frames = frames;
+      });
+      await fixture.console(["tp @e[tag=gh_stream_attack] 0 -60 0", "kill @e[tag=gh_stream_attack]"]);
     });
     await run("ordinary_bounded_geometry_refresh_without_observe", async entry => {
       const source = createHash("sha256").update(await readFile(new URL(import.meta.url))).digest("hex");
@@ -325,6 +418,17 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
       await pause(1100); const expired = await read(cursor); entry.expired = expired;
       requireProof(expired.audible.gap && expired.audible.omitted_before > 0 && !expired.audible.events.some(value => value.sequence === event.sequence),
         "Expired heard event was replayed or silently omitted without a gap");
+      const actualCombat: MinecraftControllerFrame[] = [];
+      for (const [sound, cue] of [["minecraft:item.shield.block", "shield_block"],
+        ["minecraft:item.shield.break", "shield_break"], ["minecraft:entity.item.break", "item_break"],
+        ["minecraft:entity.player.attack.nodamage", "attack_nodamage"], ["minecraft:entity.husk.hurt", "mob_hurt"],
+        ["minecraft:entity.husk.death", "mob_death"]]) {
+        const after = (await read()).audible.next_cursor;
+        await fixture.console([`playsound ${sound} master @a 0.5 240 2.5 1 1`]);
+        actualCombat.push(await until(() => read(after), frame => frame.audible.events.some(event => event.cue === cue),
+          caps.observationMs, `Actually played ${cue} never reached actor sound feedback`));
+      }
+      entry.actual_heard_combat = actualCombat;
     });
     await run("actual_fluid_air_and_vehicle", async entry => {
       await fixture.flat(); await fixture.console(["effect clear @a", "fill -1 240 -1 1 242 1 minecraft:water"]);

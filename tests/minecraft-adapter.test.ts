@@ -20,7 +20,7 @@ function fixture(goalId: string, initial: Record<string, number> = {}) {
     adapter: { id: "fabric-owned-client", version: "1.0.0", build_hash: "a".repeat(64) },
     observation: { schema_version: 3, schema_hash: contractHash(schemas.observation),
       payload_schema: { id: "minecraft_observation_v1", version: 2, hash: contractHash(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_360_r8_control_v5", version: 5, configuration, configuration_hash: contractHash(configuration) } },
+      profile: { id: "minecraft_assisted_rgb_360_r8_control_v6", version: 6, configuration, configuration_hash: contractHash(configuration) } },
     capabilities: [
       { id: "minecraft.action", version: 4, schema_hash: contractHash(schemas.capabilities["minecraft.action@4"]) },
       { id: "minecraft.recipes", version: 1, schema_hash: contractHash(schemas.capabilities["minecraft.recipes@1"]) },

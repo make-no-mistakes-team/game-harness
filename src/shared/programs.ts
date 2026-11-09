@@ -7,6 +7,7 @@ import type {
 } from "./contracts.ts";
 import type { LookaheadConfig } from "./planning.ts";
 import type { ControllerEvent, ResidentLimits, ResidentSnapshot } from "./resident.ts";
+import type { ControlSessionConfig } from "./control-session.ts";
 
 export type ProgramEntry = "run" | "step" | "analyze";
 
@@ -136,6 +137,7 @@ export interface ResidentSkillStartRequest extends SkillStartBase {
   entry: "step";
   limits: ResidentLimits;
   initial_state: Json;
+  session?: ControlSessionConfig;
   /** One explicitly authorized prepared continuation after actual resident retirement. */
   lookahead?: LookaheadConfig;
 }
@@ -179,7 +181,7 @@ interface SkillExecutionBase extends SkillRef {
 }
 export type SkillExecutionView = SkillExecutionBase & (
   | { entry: "run"; limits: SkillLimits }
-  | { entry: "step"; limits: ResidentLimits; initial_state: Json; resident: ResidentSnapshot | null }
+  | { entry: "step"; limits: ResidentLimits; initial_state: Json; resident: ResidentSnapshot | null; session?: ControlSessionConfig }
   | { entry: null; limits: SkillLimits }
 );
 

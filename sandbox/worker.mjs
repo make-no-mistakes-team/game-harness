@@ -238,7 +238,10 @@ async function runResidentThread() {
   await module.evaluate();
   const names = Object.getOwnPropertyNames(module.namespace);
   const selected = module.namespace[entry];
-  if (names.length !== 1 || names[0] !== entry || typeof selected !== "function" ||
+  const activation = entry === "step" && Object.hasOwn(module.namespace, "activate") ? module.namespace.activate : selected;
+  if (!names.includes(entry) || names.some(name => name !== entry && !(entry === "step" && name === "activate")) ||
+    typeof activation !== "function" || types.isAsyncFunction(activation) || types.isGeneratorFunction(activation) ||
+    activation.length !== (entry === "step" ? 3 : 1) || typeof selected !== "function" ||
     types.isAsyncFunction(selected) || types.isGeneratorFunction(selected) ||
     selected.length !== (entry === "step" ? 3 : 1))
     throw new Error("selected_export");
@@ -274,6 +277,7 @@ async function runResidentThread() {
     return clean;
   }
   let busy = false;
+  let activated = false;
   parentPort.on("message", message => {
     if (busy) return exit(1);
     busy = true;
@@ -281,14 +285,23 @@ async function runResidentThread() {
       // Parse into the module's realm rather than exposing outer-realm object
       // constructors through frame/state/input.
       const input = realm.parse(stringify(message));
-      const value = cleanJson(entry === "step"
-        ? selected(input.frame, input.state, input.intent) : selected(input.input));
-      if (entry === "step") {
-        if (!value || Array.isArray(value) ||
-          !exactKeys(value, ["input", "next_state", "status", "events"]) ||
-          byteLength(stringify(value.next_state)) > MAX_STATE)
-          throw new Error("step_result");
+      if (message.type === "resident_activate" && activated) throw new Error("activation_replayed");
+      if (message.type === "resident_activate") activated = true;
+      let returned;
+      try {
+        if (message.type === "resident_activate" && input.frame?.executive && !Object.hasOwn(module.namespace, "activate"))
+          throw new Error("session_requires_activate");
+        returned = entry === "step"
+          ? (message.type === "resident_activate" ? activation : selected)(input.frame, input.state, input.intent)
+          : selected(input.input);
+      } catch {
+        post(stringify({ v: 1, type: "resident_fault", id: message.id, origin: "source_throw" }));
+        return exit(1);
       }
+      const value = cleanJson(returned);
+      // Return plain bounded data even when its gameplay result shape is wrong.
+      // The trusted decoder reports invalid fields; killing this thread would
+      // misclassify a repairable authored return as an opaque runtime failure.
       const encoded = stringify({ v: 1, type: "resident_result", id: message.id, value });
       if (byteLength(encoded) + 1 > MAX_OUTPUT || !depthIsBounded(parse(encoded)))
         throw new Error("output_limit");
@@ -657,10 +670,11 @@ function runSupervisor() {
     output(line);
   }
 
-  function fail() {
+  function fail(origin = "opaque") {
     if (closing) return;
     try {
-      send({ type: "error" });
+      send(resident ? { v: 1, type: "resident_fault", id: sequence,
+        origin: ["watchdog", "source_throw", "opaque"].includes(origin) ? origin : "opaque" } : { type: "error" });
     } catch {
       /* Never forward policy logs or raw errors. */
     }
@@ -693,7 +707,7 @@ function runSupervisor() {
         return;
       }
       const step = residentEntry === "step";
-      if (!thread || message.type !== `resident_${residentEntry}` ||
+      if (!thread || (message.type !== `resident_${residentEntry}` && !(step && message.type === "resident_activate")) ||
         message.id !== sequence + 1 ||
         !exactKeys(message, step ? ["v", "type", "id", "frame", "state", "intent"]
           : ["v", "type", "id", "input"]))
@@ -703,7 +717,7 @@ function runSupervisor() {
         throw new Error("state_limit");
       sequence = message.id;
       expected = "resident_result";
-      watchdog = setTimeout(fail, budget);
+      watchdog = setTimeout(() => fail("watchdog"), budget);
       thread.postMessage(message);
       return;
     }
@@ -771,6 +785,9 @@ function runSupervisor() {
           )
             throw new Error("protocol");
           const reply = parse(encoded);
+          if (resident && reply?.v === 1 && reply.type === "resident_fault" && reply.id === sequence &&
+              exactKeys(reply, ["v", "type", "id", "origin"]) && reply.origin === "source_throw")
+            return fail("source_throw");
           if (!reply || !depthIsBounded(reply) || reply.type !== expected)
             throw new Error("protocol");
           if (resident && (reply.v !== 1 || reply.id !== sequence ||

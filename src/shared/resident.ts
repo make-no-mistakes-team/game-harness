@@ -1,10 +1,11 @@
 import { z } from "zod";
 import type { Json, Sha256 } from "./contracts.ts";
 import { identitySchema, safeCounterSchema, sha256Schema } from "./control.ts";
-import { controllerInputSchema, inputAppliedAckSchema, nativeNanosecondsSchema, RevocationAck, type ControllerEffectUpdate, type ControllerInput,
+import { authoredControllerInputSchema, controllerInputSchema, inputAppliedAckSchema, nativeNanosecondsSchema, RevocationAck, type ControllerEffectUpdate, type ControllerInput,
   type ControllerInputChannel, type InputAppliedAck } from "./controller.ts";
 import { jsonSchema } from "./primitives.ts";
 import type { MinecraftControllerFrame } from "./minecraft.ts";
+import { executiveChoiceSchema, executiveSnapshotSchema, type ExecutiveSnapshot } from "./control-session.ts";
 
 export const RESIDENT_PROTOCOL_VERSION = 1;
 export const RESIDENT_INPUT_BYTES = 262144;
@@ -89,18 +90,21 @@ export type ControllerEvent = z.infer<typeof controllerEventSchema>;
 export type ControllerStatus = "running" | "blocked" | "yielded" | "completed";
 // Omission belongs only to the actor result, never to the native channel.
 // Explicit edges must still pass every native refinement without modification.
-const actorControllerInputSchema = z.union([
-  controllerInputSchema,
-  controllerInputSchema.options[0].omit({ edges: true })
-    .extend({ held: controllerInputSchema.options[0].shape.held
-      .describe("Complete desired held state. With edges omitted, changed booleans become single press/release transitions; unchanged attack/use never add counted presses.") })
-    .describe("With edges omitted, derive one press/release per changed held boolean from the last successfully submitted held state, initially neutral. Unchanged held controls add no presses."),
-]);
 export const controllerStepResultSchema = jsonBoundary(RESIDENT_OUTPUT_BYTES).pipe(z.object({
-  input: actorControllerInputSchema, next_state: residentStateSchema,
+  input: authoredControllerInputSchema, next_state: residentStateSchema,
   status: z.enum(["running", "blocked", "yielded", "completed"]), events: z.array(controllerEventSchema).max(16),
 }).strict());
 export type ControllerStepResult = z.infer<typeof controllerStepResultSchema>;
+export const executiveStepResultSchema = jsonBoundary(RESIDENT_OUTPUT_BYTES).pipe(z.object({
+  choice: executiveChoiceSchema, next_state: residentStateSchema,
+  status: z.enum(["running", "blocked", "yielded", "completed"]), events: z.array(controllerEventSchema).max(16),
+}).strict());
+export type ExecutiveStepResult = z.infer<typeof executiveStepResultSchema>;
+export const residentDecisionSchema = z.union([controllerStepResultSchema, executiveStepResultSchema]);
+export type ResidentDecision = ControllerStepResult | ExecutiveStepResult;
+export const residentActivationResultSchema = z.union([residentDecisionSchema,
+  z.object({ refused: z.literal(true), reason: z.string().min(1).max(1000) }).strict()]);
+export type ResidentActivationResult = z.infer<typeof residentActivationResultSchema>;
 
 export const residentLimitsSchema = z.object({
   duration_ms: z.number().int().min(1000).max(57600000), frequency_hz: z.union([z.literal(1), z.literal(5), z.literal(20)]),
@@ -129,7 +133,9 @@ export const residentActorLimitsSchema = residentLimitsSchema.extend({
 }).prefault({});
 
 export interface ResidentWorker {
-  step(frame: MinecraftControllerFrame, state: Json, intent: Json, signal?: AbortSignal): Promise<ControllerStepResult>;
+  step(frame: MinecraftControllerFrame, state: Json, intent: Json, signal?: AbortSignal): Promise<ResidentDecision>;
+  /** First live call in the clean prepared invocation; never a replay of shadow output. */
+  activate?(frame: MinecraftControllerFrame, state: Json, intent: Json, signal?: AbortSignal): Promise<ResidentActivationResult>;
   close(): Promise<void>;
 }
 export interface ResidentAnalysisWorker {
@@ -155,6 +161,7 @@ export interface ResidentSnapshot {
   pending: { frames: number; edges: number; analysis: boolean }; last_input: InputAppliedAck | null;
   timings: { step_ms: ResidentTimingSummary; input_age_ms: ResidentTimingSummary };
   events: { sequence: number; host_monotonic_ms: number; event: ControllerEvent }[];
+  session?: ExecutiveSnapshot;
   cleanup: { worker: "open" | "closing" | "closed" | "unknown"; native: "open" | "revoking" | "retired" | "unknown" };
 }
 const residentTimingSchema = z.object({ count: safeCounterSchema, p50: z.number().finite().nonnegative().nullable(),
@@ -172,6 +179,7 @@ export const residentSnapshotSchema = z.object({
   pending: z.object({ frames: safeCounterSchema, edges: safeCounterSchema, analysis: z.boolean() }).strict(),
   last_input: inputAppliedAckSchema.nullable(), timings: z.object({ step_ms: residentTimingSchema, input_age_ms: residentTimingSchema }).strict(),
   events: z.array(z.object({ sequence: safeCounterSchema.min(1), host_monotonic_ms: z.number().finite(), event: controllerEventSchema }).strict()).max(128),
+  session: executiveSnapshotSchema.optional(),
   cleanup: z.object({ worker: z.enum(["open", "closing", "closed", "unknown"]), native: z.enum(["open", "revoking", "retired", "unknown"]) }).strict(),
 }).strict() satisfies z.ZodType<ResidentSnapshot>;
 export interface ResidentAnalysisSource { skill_id: string; version: number; hash: Sha256; source: string }
@@ -209,8 +217,9 @@ export type ResidentTraceEvent = ResidentTraceStage & {
 export interface ResidentControllerOptions {
   execution_id: string; source_hash: Sha256; controller_generation: number; limits: ResidentLimits; deadline_host_ms: number;
   initial_state: Json; intent: Json; worker: ResidentWorker;
+  first_activation?: boolean;
   open(deadlineHostMs: number, applied: (ack: InputAppliedAck) => void, effect: (event: ControllerEffectUpdate) => void,
-    lifecycle: ResidentLifecycle): Promise<ControllerInputChannel>;
+    lifecycle: ResidentLifecycle, controllerGeneration?: number): Promise<ControllerInputChannel>;
   current(): boolean; event(event: ControllerEvent): void; effect(input: ControllerInput, event: ControllerEffectUpdate): void;
   changed(snapshot: ResidentSnapshot, terminal: boolean): void;
   analysis(source: ResidentAnalysisSource, input: Json, budgetMs: number, signal: AbortSignal,

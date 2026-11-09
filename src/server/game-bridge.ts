@@ -14,7 +14,7 @@ import type {
   MotorProfile,
   RuntimeAdapter,
 } from "../shared/contracts.ts";
-import type { EffectEnvelope, EffectOwnerRef } from "../shared/control.ts";
+import type { EffectEnvelope, EffectOwnerRef, ProducerSupervision } from "../shared/control.ts";
 import {
   effectEnvelopeSchema,
   effectScopeSchema,
@@ -1613,6 +1613,19 @@ export class GameBridgeClient implements GameBridge {
         );
       } catch {}
     }
+  }
+  async superviseProducer(executionId: string, supervision: ProducerSupervision): Promise<boolean> {
+    const owned = this.ownedEffect;
+    if (!owned || owned.effect.scope.execution_id !== executionId) return false;
+    const expected = owned.effect.supervision;
+    if (!expected || expected.session_id !== supervision.session_id ||
+      expected.behavior_generation !== supervision.behavior_generation)
+      throw new Error("Semantic supervision cannot adopt another producer or source generation");
+    const response = z.object({ renewed: z.boolean(), lease_deadline_native_ns: nativeNanosecondsSchema.nullable() }).strict()
+      .parse(await this.request("producer_supervise", { owner: { operation_id: owned.effect.operation_id,
+        scope: owned.effect.scope, generation: owned.generation }, ...supervision }, 1000));
+    if (response.renewed && this.ownedEffect === owned) owned.effect.supervision = { ...supervision };
+    return response.renewed;
   }
   async neutralize(owner: EffectOwnerRef) {
     if (!owner)

@@ -15,6 +15,7 @@ import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import type { SkillCapabilityRequest } from "../src/shared/programs.ts";
 import { Json } from "../src/shared/contracts.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
+import { GeneratedControllerResultValidationError, parseGeneratedResidentResult } from "../src/server/program-diagnostics.ts";
 
 // This exercises the shipped supervisor and untrusted module thread, not Docker
 // isolation. The parent's Docker/profile proof remains a separate requirement.
@@ -102,6 +103,21 @@ test("ordinary step module compiles once and reuses module state with explicit s
   expect(await worker.read()).toEqual({ v: 1, type: "resident_result", id: 1, value: { input: neutralInput, next_state: { count: 4, local: 1, intent: "first" }, status: "running", events: [] } });
   worker.send({ v: 1, type: "resident_step", id: 2, frame: { frame_seq: 7 }, state: { count: 4 }, intent: "second" });
   expect(await worker.read()).toMatchObject({ value: { next_state: { count: 5, local: 2, intent: "second" } } });
+});
+
+test("malformed authored activation returns bounded data for a field diagnostic instead of an opaque worker exit", async () => {
+  const worker = await compile(`export function activate(frame,state,intent) { return {refused:false}; }
+export function step(frame,state,intent) { return {choice:{kind:"observe"},next_state:null,status:"running",events:[]}; }`, "step");
+  worker.send({ v: 1, type: "resident_activate", id: 1, frame: { executive: {} }, state: null, intent: null });
+  const reply = await worker.read();
+  expect(reply).toMatchObject({ type: "resident_result", id: 1 });
+  const value = reply !== null && typeof reply === "object" && "value" in reply ? reply.value : null;
+  try { parseGeneratedResidentResult(value, true); throw new Error("Malformed activation was accepted"); }
+  catch (error) {
+    expect(error).toBeInstanceOf(GeneratedControllerResultValidationError);
+    if (!(error instanceof GeneratedControllerResultValidationError)) throw error;
+    expect(error.issues.some(issue => issue.path === "choice" || issue.path === "input" || issue.path === "refused")).toBe(true);
+  }
 });
 
 test("ordinary step worker preserves omitted edges for host normalization without injecting controls", async () => {
@@ -380,10 +396,17 @@ test("step rejects oversize explicit state and intent before evaluating", async 
   }
 });
 
-test("step cannot return an oversize next_state even inside a bounded envelope", async () => {
+test("oversize next_state in a bounded worker result is rejected by the trusted state contract", async () => {
   const worker = await compile(`export function step(frame,state,intent) { return { input: ${JSON.stringify(neutralInput)}, next_state: 'x'.repeat(16384), status: 'running', events: [] }; }`, "step");
   worker.send({ v: 1, type: "resident_step", id: 1, frame: {}, state: null, intent: null });
-  expect(await worker.closed).not.toBe(0);
+  const reply = await worker.read();
+  const value = reply !== null && typeof reply === "object" && "value" in reply ? reply.value : null;
+  try { parseGeneratedResidentResult(value); throw new Error("Oversize state was accepted"); }
+  catch (error) {
+    expect(error).toBeInstanceOf(GeneratedControllerResultValidationError);
+    if (!(error instanceof GeneratedControllerResultValidationError)) throw error;
+    expect(error.issues).toContainEqual({ path: "next_state", code: "custom" });
+  }
 });
 
 test("EOF aborts a hung job and close waits for the actual child exit", async () => {

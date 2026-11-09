@@ -51,6 +51,8 @@ let residentEntry = null;
 let residentSequence = 0;
 let residentInitialized = false;
 let residentEvaluation = null;
+let residentFaultReported = false;
+let residentActivated = false;
 // Neither container output nor a pending host call can extend this deadline.
 const lifetimeTimer = skill ? setTimeout(stop, lifetime) : null;
 
@@ -154,6 +156,14 @@ function reportAnalysisEvaluation(outcome) {
     id: evaluation.id, entry: "analyze",
     elapsed_ms: Math.max(0, performance.now() - evaluation.started), outcome }) + "\n");
 }
+function residentFault(origin, trustedOrigin = true) {
+  if (resident && !residentFaultReported && !closing) {
+    residentFaultReported = true;
+    process.stdout.write(JSON.stringify({ v: 2, type: "guardian_resident_fault",
+      id: residentSequence, origin, trusted_origin: trustedOrigin }) + "\n");
+  }
+  return stop();
+}
 
 function stop() {
   if (cleanup) return cleanup;
@@ -216,11 +226,14 @@ process.stdin.on("data", (chunk) => {
         residentEntry = request.entry;
         expected = "resident_compiled";
       } else {
-        if (request.type !== `resident_${residentEntry}` ||
+        const activation = residentEntry === "step" && request.type === "resident_activate";
+        if ((request.type !== `resident_${residentEntry}` && !activation) ||
+          (activation && residentActivated) ||
           request.id !== residentSequence + 1 ||
           !exactKeys(request, residentEntry === "step"
             ? ["v", "type", "id", "frame", "state", "intent"] : ["v", "type", "id", "input"]))
           throw new Error("protocol");
+        if (activation) residentActivated = true;
         residentSequence = request.id;
         expected = "resident_result";
         if (residentEntry === "analyze")
@@ -229,7 +242,7 @@ process.stdin.on("data", (chunk) => {
       outputBytes = 0;
       // Only the trusted host dispatch can arm this finite compute budget.
       // A container's output cannot change or renew it.
-      timer = setTimeout(stop, expected === "resident_result" ? lifetime : STARTUP_MS);
+      timer = setTimeout(() => residentFault("watchdog"), expected === "resident_result" ? lifetime : STARTUP_MS);
       attached.stdin.write(input);
       input = Buffer.alloc(0);
       return;
@@ -350,9 +363,9 @@ async function start() {
   const exit = Promise.withResolvers();
   attached.once("close", exit.resolve);
   attachedExited = exit.promise;
-  attached.on("error", stop);
+  attached.on("error", () => resident ? residentFault("transport") : stop());
   attached.on("close", () => {
-    if (!closing) void stop();
+    if (!closing) void (resident ? residentFault("opaque") : stop());
   });
   attached.stdin.on("error", stop);
   attached.stderr.on("data", (chunk) => {
@@ -369,6 +382,10 @@ async function start() {
     if (end !== output.length - 1) return void stop();
     try {
       const reply = boundedJson(output.subarray(0, end).toString("utf8"));
+      if (resident && reply?.v === 1 && reply.type === "resident_fault" && reply.id === residentSequence &&
+          exactKeys(reply, ["v", "type", "id", "origin"]) &&
+          ["source_throw", "watchdog", "opaque"].includes(reply.origin))
+        return void residentFault(reply.origin, false);
       if (resident && (reply?.v !== 1 || reply.id !== residentSequence ||
         !exactKeys(reply, expected === "resident_result"
           ? ["v", "type", "id", "value"] : ["v", "type", "id"])))
@@ -423,7 +440,7 @@ async function start() {
       process.stdout.write(output);
       output = Buffer.alloc(0);
     } catch {
-      void stop();
+      void (resident ? residentFault("opaque") : stop());
     }
   });
   return true;

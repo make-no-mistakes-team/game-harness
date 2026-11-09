@@ -28,6 +28,18 @@ public final class InputConsumption {
       if (key == button) { remaining[index]--; return; }
     }
   }
+  /** One-based original ordered edge, including counted presses within one edge. */
+  public long nextOrdinal(int button, long start) {
+    if (step == null) return 0;
+    long offset = start;
+    for (int index = 0; index < step.edgeCount(); index++) {
+      WorldInputPlan.Edge edge = step.edge(index);
+      if (edge.kind() == WorldInputPlan.EdgeKind.BUTTON && edge.press() && edge.key() == button && remaining[index] > 0)
+        return offset + edge.count() - remaining[index] + 1;
+      offset += edge.count();
+    }
+    return 0;
+  }
   public void releasesConsumed() {
     if (step == null) return;
     for (int index = 0; index < step.edgeCount(); index++) {

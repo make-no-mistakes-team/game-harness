@@ -453,6 +453,61 @@ attenuation negatives have production-predicate proofs, not live mute-test credi
 This establishes the basic read interface, not resident streaming, expanded
 visibility, multipart combat attribution or autonomous gameplay quality.
 
+### Native dynamic sensing and mechanical feedback
+
+The v6 assisted profile keeps its eight-block, camera-independent range. Frame
+schema 3 separates `dynamic_entities` from the 500 ms terrain cache in
+`visible_world`. Dynamic geometry is acquired once per native tick on the
+client thread, including while a semantic motor owns the avatar. A spatial
+candidate cap of 128 precedes visibility filtering; at most 32 permitted rows
+are returned. Coverage is always partial, without rejected-candidate counts.
+Terrain keeps its original sequence, timestamp and one-second stale threshold.
+
+Entity optics permit air, open water and bubble columns. Waterlogged solids,
+lava, unknown cells and opaque walls still block the conservative structured
+projection. Vanilla visibility, invisibility, world and distance checks remain.
+Visible bounds and an aim point describe permitted geometry, not hidden target
+health or intent. Admitted mechanical targets have bounded active pins;
+producer neutralization invalidates dependent caches and handles together.
+
+Current body feedback includes actual blocking readiness, active-use ticks and
+equipped-item durability. The bounded `mechanics` ring correlates stream attack
+key consumption and ordinary attack-callback entry with generation, input
+sequence and ordered edge. These are separate facts: a consumed key need not
+invoke an attack, and callback entry proves neither accepted damage nor a kill.
+Actually heard hurt/death, shield, item-break and attack sounds use the existing
+coarse audible channel and independent cursors. They carry no source identity
+or damage attribution.
+
+Session children may carry an exact executive supervision identity. Only a
+fresh retained native frame continuing that same child renews its 250 ms lease;
+the original child deadline remains in force. Expiry fences further motor,
+finite-input and GUI emission, then releases the exact producer. GUI cleanup
+keeps its applied prefix and uncertain inventory effects and leaves the screen
+open. The executive must inspect current screen/cursor state before choosing
+another operation. Exact cancellation uses the existing out-of-band owner
+retirement lane; queued old-generation operations cannot inherit a replacement
+owner.
+
+Holding attack still means an ordinary held key, not repeated entity strikes.
+When use is already active, a same-tick release and attack press can be consumed
+without invoking the attack callback. This is observable input behavior, not
+a host-supplied combat policy. The native sensing and world-input fixtures
+contain bounded probes for these mechanics; a passing conformance probe does
+not establish model-authored combat competence.
+
+Java 21 build proofs and actual Fabric sensing, world-input and controller-stream
+fixtures passed on 9 November 2026. The latter two exercised 28 and 12 cases.
+A separate connected supervision proof kept the game ticking during 500 ms
+without renewal: semantic and GUI producers stopped, late renewal was refused
+and the GUI retained its handler and uncertain cursor/slot effects. Sixteen
+fresh renewals did not extend a 1,200 ms semantic child's original deadline;
+its measured native duration was 1,239.87 ms. All admitted fixtures confirmed
+cleanup and made zero provider calls. A stale-artifact admission failure and an
+evaluator probe with an invalid movement duration remain failed attempts.
+These results qualify the exercised mechanisms, not a combat win rate or
+continuous useful model-authored play.
+
 ### Native controller transport conformance — 30 October 2026
 
 Profile v4 and frame schema 2 passed eleven actual Fabric cases with confirmed

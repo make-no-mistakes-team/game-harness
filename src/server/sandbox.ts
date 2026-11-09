@@ -37,12 +37,29 @@ import {
 } from "./program-instrumentation.ts";
 import { validateProgramSource, type ExecutableValidationContext } from "./program-validation.ts";
 import type { SkillAPIManifest } from "../shared/programs.ts";
-import { capabilityFailure, GeneratedResultValidationError, parseGeneratedControllerResult, parseGeneratedSkillResult, ProgramExecutionError, readProgramDiagnostic } from "./program-diagnostics.ts";
+import { capabilityFailure, GeneratedResultValidationError, parseGeneratedResidentResult, parseGeneratedSkillResult, ProgramExecutionError, readProgramDiagnostic } from "./program-diagnostics.ts";
 import { residentIntentSchema, residentStateSchema,
-  type ControllerStepResult, type ResidentWorker, type ResidentAnalysisWorker, 
+  type ResidentDecision, type ResidentActivationResult,
+  type ResidentWorker, type ResidentAnalysisWorker,
   ResidentCleanupError, RESIDENT_STEP_RESPONSE_MS} from "../shared/resident.ts";
 import type { MinecraftControllerFrame } from "../shared/minecraft.ts";
 
+export interface ResidentPreparedWorker extends ResidentWorker {
+  activate?(frame: MinecraftControllerFrame, state: Json, intent: Json, signal?: AbortSignal): Promise<ResidentActivationResult>;
+}
+export type ResidentWorkerFaultOrigin = "watchdog" | "source_throw" | "transport" | "opaque" | "cleanup";
+/** The category is selected at a worker-service boundary, never from authored exception text.
+ * Only host/guardian faults have trustedOrigin; container diagnostics are advisory. */
+export class ResidentWorkerFault extends Error {
+  constructor(readonly origin: ResidentWorkerFaultOrigin, readonly trustedOrigin: boolean = true) {
+    super(`Resident worker failed (${origin}).`);
+    this.name = "ResidentWorkerFault";
+  }
+}
+export class ResidentWorkerCleanupFault extends ResidentCleanupError {
+  readonly origin = "cleanup";
+  readonly trustedOrigin = true;
+}
 export interface SkillSandboxHooks {
   api?: SkillAPIManifest;
   onTiming?(event: {
@@ -476,6 +493,18 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
       checkJsonDepth(text);
       const reply: unknown = JSON.parse(text);
       if (reply && typeof reply === "object" && !Array.isArray(reply) &&
+          "type" in reply && reply.type === "guardian_resident_fault") {
+        const fault = reply as Reply;
+        if (!this.residentEntry || fault.v !== 2 || fault.id !== this.pending.id ||
+            !exactKeys(fault, ["v", "type", "id", "origin", "trusted_origin"]) ||
+            !["watchdog", "source_throw", "transport", "opaque"].includes(fault.origin as string) ||
+            typeof fault.trusted_origin !== "boolean" ||
+            (fault.trusted_origin && fault.origin === "source_throw"))
+          throw new Error("Invalid resident fault envelope.");
+        this.fail(new ResidentWorkerFault(fault.origin as ResidentWorkerFaultOrigin, fault.trusted_origin));
+        return;
+      }
+      if (reply && typeof reply === "object" && !Array.isArray(reply) &&
         "type" in reply && reply.type === "guardian_analysis_evaluated") {
         const frame = reply as Reply, evaluation = this.analysisEvaluation;
         if (this.residentEntry !== "analyze" || this.pending.type !== "resident_result" ||
@@ -538,9 +567,14 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
   }
 
   async step(frame: MinecraftControllerFrame, state: Json, intent: Json,
-    signal?: AbortSignal): Promise<ControllerStepResult> {
+    signal?: AbortSignal): Promise<ResidentDecision> {
     return await this.residentValue("step", { frame, state, intent }, signal, value =>
-      parseGeneratedControllerResult(value));
+      parseGeneratedResidentResult(value));
+  }
+  async activate(frame: MinecraftControllerFrame, state: Json, intent: Json,
+    signal?: AbortSignal): Promise<ResidentActivationResult> {
+    return await this.residentValue("step", { frame, state, intent }, signal, value =>
+      parseGeneratedResidentResult(value, true), undefined, true);
   }
 
   async analyze(input: Json, signal?: AbortSignal, onEvaluation?: (elapsedMs: number) => void): Promise<Json> {
@@ -548,7 +582,8 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
   }
 
   private async residentValue<T>(entry: "step" | "analyze", payload: Reply,
-    signal: AbortSignal | undefined, decode: (value: unknown) => T, onEvaluation?: (elapsedMs: number) => void): Promise<T> {
+    signal: AbortSignal | undefined, decode: (value: unknown) => T, onEvaluation?: (elapsedMs: number) => void,
+    activate = false): Promise<T> {
     if (this.closing || this.residentEntry !== entry)
       throw new Error("Resident worker is closed or has the wrong selected entry.");
     if (this.evaluating) throw new Error("Concurrent resident computation is not allowed.");
@@ -565,7 +600,7 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
       if (!Number.isSafeInteger(this.sequence + 1)) throw new Error("Resident sequence exhausted.");
       const id = ++this.sequence;
       const reply = await this.request("resident_result",
-        { v: 1, type: `resident_${entry}`, id, ...payload },
+        { v: 1, type: activate ? "resident_activate" : `resident_${entry}`, id, ...payload },
         entry === "step" ? RESIDENT_STEP_RESPONSE_MS : this.residentBudget, id, onEvaluation);
       if (signal?.aborted || this.closing) throw new Error("Resident computation was cancelled.");
       return decode(reply.value);
@@ -634,7 +669,8 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
 
   private fail(error: Error): void {
     // The pending request is rejected only after Docker removal and child reaping finish.
-    void this.terminate(error).catch(() => {
+    void this.terminate(this.residentEntry && !(error instanceof ResidentWorkerFault)
+      ? new ResidentWorkerFault("transport") : error).catch(() => {
       /* The original waiter receives the safe cleanup error. */
     });
   }
@@ -664,7 +700,7 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
             );
         }
       } catch {
-        failure = this.residentEntry ? new ResidentCleanupError() : new Error(
+        failure = this.residentEntry ? new ResidentWorkerCleanupFault() : new Error(
           "Docker could not confirm policy container cleanup. Check the Docker daemon before continuing.",
         );
       } finally {

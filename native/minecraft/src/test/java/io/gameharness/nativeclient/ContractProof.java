@@ -26,6 +26,7 @@ public final class ContractProof {
     ControllerRenderProof.main(ignored);
     ControllerStreamProof.main(ignored);
     InputConsumptionProof.main(ignored);
+    producerSupervision();
     NativeControlWriterProof.main(ignored);
     NativeEvaluationProof.main(ignored);
     visibleInventoryCustody();
@@ -186,7 +187,12 @@ public final class ContractProof {
     require(!targets.current(cell, dimensionTarget, nether, 3), "uncertainty did not fence handles");
     var boundedTarget = targets.observe(cell, overworld, 3);
     targets.observe(neighbor, overworld, 3);
+    targets.pin(cell, boundedTarget);
     targets.observe(new Cell(2, 64, 0), overworld, 3);
+    require(targets.current(cell, boundedTarget, overworld, 3),
+        "bounded observation churn evicted an active mechanical pin");
+    targets.unpin(cell);
+    targets.observe(new Cell(3, 64, 0), overworld, 3);
     require(!targets.current(cell, boundedTarget, overworld, 3),
         "owned binding bypassed bounded incarnation-store revocation");
 
@@ -228,5 +234,28 @@ public final class ContractProof {
     require(!InventoryGestureFence.cleanCustody(1, 0)
         && !InventoryGestureFence.cleanCustody(0, 1)
         && InventoryGestureFence.cleanCustody(0, 0), "receipt ignored cursor/grid custody");
+  }
+
+  private static void producerSupervision() {
+    var wire = new com.google.gson.JsonObject();
+    wire.addProperty("session_id", "executive"); wire.addProperty("behavior_generation", 1);
+    wire.addProperty("frame_seq", 10);
+    long now = -9_007_199_254_740_997L;
+    var lease = new ProducerSupervision(wire);
+    require(!lease.admit(now - 150_000_001L, now), "stale executive admitted a semantic producer");
+    require(lease.admit(now, now) && lease.deadline() == now + 250_000_000L,
+        "semantic producer lease did not derive from its exact capture time");
+    require(!lease.renew("other", 1, 11, now, now), "foreign executive renewed producer");
+    require(!lease.renew("executive", 2, 11, now, now), "foreign behavior generation renewed producer");
+    require(!lease.renew("executive", 1, 10, now, now), "same stale decision renewed producer");
+    require(lease.renew("executive", 1, 11, now + 50_000_000L, now + 50_000_000L),
+        "fresh exact continuation failed");
+    require(!lease.current(now + 500_000_000L)
+        && !lease.renew("executive", 1, 12, now + 500_000_000L, now + 500_000_000L),
+        "500ms executive stall retained or resurrected a semantic producer");
+    var retired = new ProducerSupervision(wire);
+    require(retired.admit(now, now), "retirement positive control failed");
+    retired.retire();
+    require(!retired.renew("executive", 1, 11, now + 1, now + 1), "retiring child renewed supervision");
   }
 }

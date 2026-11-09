@@ -49,6 +49,10 @@ public final class InputConsumptionProof {
     consumption.counted(7); consumption.counted(7); consumption.counted(9);
     require(consumption.prefix(0) == 3, "full prior edge plus partial counted edge lost expanded prefix");
     consumption.reset(step(384, "[" + press("use", 3) + "," + press("attack", 2) + "]"));
+    require(consumption.nextOrdinal(7, 20) == 24, "attack callback lost its original ordered edge identity");
+    consumption.counted(7);
+    require(consumption.nextOrdinal(7, 20) == 25, "counted attack callbacks shared one edge ordinal");
+    consumption.reset(step(384, "[" + press("use", 3) + "," + press("attack", 2) + "]"));
     consumption.counted(7); consumption.counted(7);
     require(consumption.prefix(0) == 0, "later consumed presses jumped an earlier unresolved ordered suffix");
     consumption.counted(8);

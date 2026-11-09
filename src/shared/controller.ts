@@ -56,6 +56,12 @@ export const controllerInputSchema = z.discriminatedUnion("kind", [
     context.addIssue({ code: "custom", path: ["selected_hotbar"], message: "Hotbar edge must match the declared selection" });
 });
 export type ControllerInput = z.infer<typeof controllerInputSchema>;
+/** Missing edges derive only changed held booleans, never repeated strikes. */
+export const authoredControllerInputSchema = z.union([
+  controllerInputSchema,
+  controllerInputSchema.options[0].omit({ edges: true }),
+]);
+export type AuthoredControllerInput = z.infer<typeof authoredControllerInputSchema>;
 
 export const controllerInputFrameSchema = z.object({ context: residentFrameContextSchema, input: controllerInputSchema }).strict();
 export type ControllerInputFrame = z.infer<typeof controllerInputFrameSchema>;

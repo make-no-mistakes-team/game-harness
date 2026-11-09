@@ -36,13 +36,16 @@ public final class SoundProjection {
   private static final long MAX_SEQUENCE = 9_007_199_254_740_991L;
   private final Event[] retained = new Event[CAPACITY];
   // Cue bins precede the five generic categories so the result cap cannot hide a retained cue.
-  private final Event[] grouped = new Event[6 * 9 * 3];
+  private static final String[] CUES = {"creeper_primed", "shield_block", "shield_break", "item_break",
+      "attack_strong", "attack_weak", "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback",
+      "mob_hurt", "mob_death"};
+  private final Event[] grouped = new Event[(CUES.length + 5) * 9 * 3];
   private String streamId = UUID.randomUUID().toString();
   private long sequence;
   private int head;
   private int size;
 
-  /** Kinds 0..4 retain the old categories; kind 5 is the sole additional priming cue. */
+  /** Kinds 0..4 are generic groups; subsequent kinds identify actually heard combat cues. */
   public static int category(String id) {
     return switch (id) {
       case "minecraft:block.grass.step", "minecraft:entity.player.swim" -> 0;
@@ -51,6 +54,21 @@ public final class SoundProjection {
               "minecraft:block.wood.break",
               "minecraft:block.wood.place" ->
           1;
+      case "minecraft:entity.zombie.hurt", "minecraft:entity.husk.hurt", "minecraft:entity.drowned.hurt",
+              "minecraft:entity.skeleton.hurt", "minecraft:entity.stray.hurt", "minecraft:entity.bogged.hurt",
+              "minecraft:entity.creeper.hurt", "minecraft:entity.spider.hurt", "minecraft:entity.enderman.hurt" -> 15;
+      case "minecraft:entity.zombie.death", "minecraft:entity.husk.death", "minecraft:entity.drowned.death",
+              "minecraft:entity.skeleton.death", "minecraft:entity.stray.death", "minecraft:entity.bogged.death",
+              "minecraft:entity.creeper.death", "minecraft:entity.spider.death", "minecraft:entity.enderman.death" -> 16;
+      case "minecraft:item.shield.block" -> 6;
+      case "minecraft:item.shield.break" -> 7;
+      case "minecraft:entity.item.break" -> 8;
+      case "minecraft:entity.player.attack.strong" -> 9;
+      case "minecraft:entity.player.attack.weak" -> 10;
+      case "minecraft:entity.player.attack.nodamage" -> 11;
+      case "minecraft:entity.player.attack.crit" -> 12;
+      case "minecraft:entity.player.attack.sweep" -> 13;
+      case "minecraft:entity.player.attack.knockback" -> 14;
       case "minecraft:entity.player.hurt",
               "minecraft:entity.generic.hurt",
               "minecraft:entity.generic.death",
@@ -117,7 +135,7 @@ public final class SoundProjection {
   private void append(
       int kind, double dx, double dy, double dz, long wallMillis, long nativeNanos) {
     if (kind < 0
-        || kind > 5
+        || kind >= 5 + CUES.length
         || !Double.isFinite(dx)
         || !Double.isFinite(dy)
         || !Double.isFinite(dz)) return;
@@ -130,8 +148,8 @@ public final class SoundProjection {
       direction = 1 + Math.floorMod(sector, 8);
     }
     if (sequence == MAX_SEQUENCE) throw new IllegalStateException("sound sequence exhausted");
-    Event event = new Event(++sequence, kind == 5 ? 2 : kind,
-        kind == 5 ? "creeper_primed" : null, direction, distance, wallMillis, nativeNanos);
+    Event event = new Event(++sequence, kind >= 5 ? 2 : kind,
+        kind >= 5 ? CUES[kind - 5] : null, direction, distance, wallMillis, nativeNanos);
     if (size == CAPACITY) {
       retained[head] = event;
       head = (head + 1) % CAPACITY;
@@ -180,7 +198,9 @@ public final class SoundProjection {
     Arrays.fill(grouped, null);
     for (int i = 0; i < size; i++) {
       Event event = at(i);
-      int kind = event.cue() == null ? event.category() + 1 : 0;
+      int kind = CUES.length + event.category();
+      if (event.cue() != null)
+        for (int cue = 0; cue < CUES.length; cue++) if (CUES[cue].equals(event.cue())) { kind = cue; break; }
       grouped[(kind * 9 + event.direction()) * 3 + event.distance()] = event;
     }
     List<Group> result = null;

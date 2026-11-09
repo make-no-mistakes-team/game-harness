@@ -275,6 +275,7 @@ const runBody = z
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
     working_programs: workingProgramModeSchema.optional(),
+    control_mode: z.enum(["executive", "legacy"]).default("executive"),
   })
   .strict();
 const comparisonVersion = skillRefSchema.extend({ run_id: z.uuid(), hash: z.string().regex(/^[a-f0-9]{64}$/) }).strict();

@@ -79,6 +79,7 @@ public final class ControllerBody {
     body.addProperty("xp_level", player.experienceLevel);
     body.addProperty("xp_progress", finite(player.experienceProgress));
     body.add("active_use", activeUse(player));
+    body.addProperty("blocking", player.isBlocking());
     body.add("equipment", equipment(player));
     body.add("status_effects", statusEffects(player));
 
@@ -119,6 +120,13 @@ public final class ControllerBody {
       entry.addProperty("slot", EQUIPMENT_NAMES[i]);
       entry.addProperty("item", stack.isEmpty() ? null : itemName(stack));
       entry.addProperty("count", stack.isEmpty() ? 0 : stack.getCount());
+      if (stack.isEmpty() || !stack.isDamageable()) entry.add("durability", JsonNull.INSTANCE);
+      else {
+        JsonObject durability = new JsonObject();
+        durability.addProperty("damage", stack.getDamage());
+        durability.addProperty("maximum", stack.getMaxDamage());
+        entry.add("durability", durability);
+      }
       result.add(entry);
     }
     return result;

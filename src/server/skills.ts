@@ -24,7 +24,7 @@ import { programFingerprint, validateSkill } from "./program-validation.ts";
 import type { EffectContext, EffectInvocation, EffectScope } from "../shared/control.ts";
 import { assertExecutableCompatible } from "./effect-contract.ts";
 import { RegisteredAdapterContract } from "./registered-adapter.ts";
-import { SKILL_API_VERSION } from "../shared/programs.ts";
+import { MAX_SKILL_LIMITS, SKILL_API_VERSION } from "../shared/programs.ts";
 import { SkillCleanupError, type SandboxService } from "./sandbox.ts";
 import type { Store } from "./store.ts";
 import type { LookaheadConfig } from "../shared/planning.ts";
@@ -33,9 +33,38 @@ import { RuntimeFault } from "./runtime-fault.ts";
 import { HOST_MONOTONIC_CLOCK_ID } from "./performance.ts";
 import { capabilityFailure, GeneratedResultValidationError, parseGeneratedSkillResult, programDiagnostic } from "./program-diagnostics.ts";
 import type { ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck } from "../shared/controller.ts";
-import type { ResidentAnalysisResult, ResidentLifecycle, ResidentSnapshot } from "../shared/resident.ts";
-import { ResidentCleanupError } from "../shared/resident.ts";
+import type { ResidentAnalysisResult, ResidentLifecycle, ResidentSnapshot, ResidentControllerOptions } from "../shared/resident.ts";
+import { ResidentCleanupError, controllerStepResultSchema, executiveStepResultSchema, residentActivationResultSchema } from "../shared/resident.ts";
 import { ResidentController } from "./resident-controller.ts";
+import { minecraftControllerFrameSchema } from "../shared/minecraft.ts";
+import type { ResidentWorker } from "../shared/resident.ts";
+import type { ResidentPreparedWorker } from "./sandbox.ts";
+import { ControlSession } from "./control-session.ts";
+import type { ExecutiveTaskRequest } from "../shared/control-session.ts";
+import type { MinecraftControllerFrame } from "../shared/minecraft.ts";
+interface PreparedHandoff {
+  slot: string;
+  key: string;
+  predecessorId: string;
+  revision: number;
+  deadlineHostMs: number;
+  intentVersion: number | null;
+  controller: AbortController;
+  workers: Set<ResidentWorker>;
+  worker: ResidentPreparedWorker | null;
+  task: Promise<void>;
+  disposed: boolean;
+  closing: Promise<void> | null;
+  executionId: string | null;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  releaseSignal(): void;
+  assertCurrent(): void;
+  retired: (() => void) | null;
+}
+export interface PreparedResidentHandoff {
+  assertCurrent(): void;
+  close(): Promise<void>;
+}
 export interface SkillHost {
   authorize(scope: EffectContext): void;
   adapter(): RuntimeAdapter | null;
@@ -61,6 +90,10 @@ export interface SkillHost {
     lifecycle: ResidentLifecycle): Promise<ControllerInputChannel>;
   programEvent?(execution: SkillExecutionView, event: import("../shared/resident.ts").ControllerEvent): void;
   residentEffect?(execution: SkillExecutionView, input: ControllerInput, event: ControllerEffectUpdate, adapter: RuntimeAdapter): void;
+  sessionTask?(execution: SkillExecutionView, request: ExecutiveTaskRequest, handle: number, deadlineHostMs: number,
+    signal: AbortSignal, frame: MinecraftControllerFrame, behaviorGeneration: number): Promise<GameActionResult>;
+  superviseSessionTask?(execution: SkillExecutionView, handle: number, frame: MinecraftControllerFrame, behaviorGeneration: number): Promise<void>;
+  retireSessionTask?(execution: SkillExecutionView, handle: number, reason: string): Promise<void>;
 }
 interface Live {
   view: SkillExecutionView;
@@ -80,7 +113,7 @@ interface Live {
   lifeId: number;
   scope: EffectScope;
   invocation: EffectInvocation;
-  resident: ResidentController | null;
+  resident: ResidentController | ControlSession | null;
   deadlineHostMs: number;
 }
 const terminal = new Set<SkillExecutionView["status"]>([
@@ -97,6 +130,8 @@ export class SkillManager {
   private cleanupFailures = new Set<Error>();
   private handoffRevision = 0;
   private handoffReservation: { predecessorId: string; revision: number } | null = null;
+  private preparedHandoffs = new Map<string, PreparedHandoff>();
+  private sessionChildren = new Map<string, Live>();
   private trace: ExecutionTrace;
   constructor(
     private store: Store,
@@ -249,9 +284,24 @@ export class SkillManager {
         ? "Previous foreground work is retiring; new admission waits for confirmed worker/native drain"
         : "A foreground program is still live; start does not replace it. Inspect target:'current' for its exact reference and pass handoff:{name,version,execution_ordinal} on start/submit to replace it. Stop is for a deliberate stop, not an automatic replacement.");
     }
-    const admitted = this.store.admitSkill(runId, parsed);
+    const prepared = this.preparedHandoffs.get(`${runId}:${parsed.start_key}`);
+    if (prepared) {
+      try {
+        prepared.assertCurrent();
+        if (prepared.key !== this.preparationKey(runId, parsed) || !prepared.worker || prepared.executionId || !prepared.retired)
+          throw new RuntimeFault("stale_context", "Prepared runtime does not match the retired successor request");
+        prepared.retired();
+      } catch (error) {
+        void this.closePrepared(prepared).catch(() => this.host.unsafe()); throw error;
+      }
+    }
+    const admitted = this.store.admitSkill(runId, parsed, undefined, prepared
+      ? new Date(Date.now() + Math.max(0, prepared.deadlineHostMs - performance.now())).toISOString() : undefined);
     if (admitted.created) {
-      const live = this.dispatch(admitted.view, skill, null);
+      if (prepared) {
+        prepared.executionId = admitted.view.execution_id;
+      }
+      const live = this.dispatch(admitted.view, skill, null, prepared);
       try {
         armLookahead?.(admitted.view.execution_id);
       } catch (error) {
@@ -264,6 +314,130 @@ export class SkillManager {
     }
     return structuredClone(admitted.view);
   }
+  private preparationKey(runId: string, request: SkillStartRequest): string {
+    const skill = this.store.skill(runId, request);
+    return JSON.stringify([runId, skill.skill_id, skill.version, skill.hash, skill.source, request]);
+  }
+  private async closePrepared(record: PreparedHandoff): Promise<void> {
+    if (record.closing) return record.closing;
+    record.disposed = true;
+    record.controller.abort("Prepared runtime discarded");
+    clearTimeout(record.timer);
+    record.releaseSignal();
+    record.closing = (async () => {
+      await record.task.catch(() => {});
+      const results = await Promise.allSettled([...record.workers].map(worker => worker.close()));
+      if (this.preparedHandoffs.get(record.slot) === record) this.preparedHandoffs.delete(record.slot);
+      if (results.some(result => result.status === "rejected")) {
+        const error = new ResidentCleanupError();
+        this.cleanupFailures.add(error); this.host.unsafe(); throw error;
+      }
+    })();
+    return record.closing;
+  }
+  /** Probe only disposable state, then hold a separate compiled, never-invoked live worker. */
+  async prepareResidentHandoff(runId: string, request: SkillStartRequest, predecessorId: string,
+    signal?: AbortSignal, current: () => void = () => {}): Promise<PreparedResidentHandoff> {
+    const parsed = skillStartRequestSchema.parse(request), { skill } = this.prepareStart(runId, parsed);
+    if (parsed.entry !== "step" || !this.sandbox.createResidentWorker)
+      throw new RuntimeFault("precondition_failed", "Only resident successors have prepared runtimes");
+    if (createHash("sha256").update(skill.source).digest("hex") !== skill.hash)
+      throw new RuntimeFault("stale_context", "Published source bytes do not match the immutable canonical hash");
+    const slot = `${runId}:${parsed.start_key}`, key = this.preparationKey(runId, parsed);
+    const previous = this.preparedHandoffs.get(slot);
+    if (previous) {
+      if (previous.key !== key) { await this.closePrepared(previous); throw new RuntimeFault("conflict", "Prepared source identity changed"); }
+      await previous.task; previous.assertCurrent();
+      return { assertCurrent: previous.assertCurrent, close: () => this.closePrepared(previous) };
+    }
+    if (this.preparedHandoffs.size)
+      throw new RuntimeFault("busy", "One bounded successor preparation is already owned");
+    const predecessor = this.live.get(predecessorId), selected = this.store.skillExecution(runId, { execution_id: predecessorId });
+    const predecessorScope = predecessor?.scope ?? selected;
+    if (!selected || selected.parent_execution_id !== null || !["accepted", "running", "succeeded"].includes(selected.status) ||
+        predecessor?.controller.signal.aborted || this.store.latestRootExecution(runId)?.execution_id !== predecessorId ||
+        predecessorScope?.session_id !== parsed.session_id || predecessorScope?.epoch !== parsed.epoch ||
+        predecessorScope?.life_id !== parsed.life_id || predecessorScope?.space_epoch !== parsed.space_epoch ||
+        predecessorScope?.run_generation !== parsed.run_generation || predecessorScope?.native_boot_id !== parsed.native_boot_id ||
+        selected.compatibility_hash !== parsed.compatibility_hash)
+      throw new RuntimeFault("precondition_failed", "Preparation requires the exact latest predecessor");
+    const deadlineHostMs = predecessor?.deadlineHostMs ??
+      performance.now() + Math.max(0, Date.parse(selected.deadline_at) - Date.now());
+    const intentVersion = predecessor?.resident?.snapshot().intent_version ?? (selected.entry === "step" ? selected.resident?.intent_version : null) ?? null;
+    const record: PreparedHandoff = {
+      slot, key, predecessorId, revision: this.handoffRevision, deadlineHostMs,
+      intentVersion, controller: new AbortController(), workers: new Set(), worker: null, task: Promise.resolve(),
+      disposed: false, closing: null, executionId: null, timer: undefined, releaseSignal: () => {}, assertCurrent: () => {}, retired: null,
+    };
+    record.assertCurrent = () => {
+      // The caller's predecessor CAS is an admission permit. Once admission
+      // installs our successor, rerunning it would reject that legitimate root
+      // change (or an acknowledged tool delivery). The owned revision, signal,
+      // exact root, source, intent, scope and deadline still fence activation.
+      if (!record.executionId) current();
+      const latest = this.store.latestRootExecution(runId);
+      const oldView = this.store.skillExecution(runId, { execution_id: predecessorId });
+      const old = this.live.get(predecessorId)?.resident?.snapshot() ??
+        (oldView?.entry === "step" ? oldView.resident : null);
+      if (record.disposed || record.controller.signal.aborted || signal?.aborted ||
+          record.revision !== this.handoffRevision || this.cleanupFailures.size || performance.now() >= deadlineHostMs ||
+          latest?.execution_id !== (record.executionId ?? predecessorId) ||
+          (old?.intent_version ?? null) !== intentVersion ||
+          (!record.executionId && !record.retired && !["accepted", "running", "succeeded"].includes(oldView?.status ?? "")) ||
+          this.preparationKey(runId, parsed) !== key)
+        throw new RuntimeFault("stale_context", "Prepared source, intent, scope or original deadline changed");
+      this.prepareStart(runId, parsed);
+    };
+    const abort = () => { void this.closePrepared(record).catch(() => this.host.unsafe()); };
+    signal?.addEventListener("abort", abort, { once: true });
+    record.releaseSignal = () => signal?.removeEventListener("abort", abort);
+    this.preparedHandoffs.set(slot, record);
+    // One isolated candidate remains bounded by the predecessor's original
+    // authority, including strategic delays longer than worker startup.
+    record.timer = setTimeout(abort, Math.max(1, deadlineHostMs - performance.now()));
+    record.task = Promise.resolve().then(async () => {
+      record.assertCurrent();
+      const shadow = await this.sandbox.createResidentWorker!(skill.source, parsed.limits.step_ms, record.controller.signal) as ResidentPreparedWorker;
+      record.workers.add(shadow);
+      try {
+        record.assertCurrent();
+        const frame = minecraftControllerFrameSchema.parse(await this.host.queryCapability("minecraft.controller_frame", 2, { audio_cursor: null }));
+        record.assertCurrent();
+        if (frame.life_id !== parsed.life_id || frame.space.space_epoch !== parsed.space_epoch)
+          throw new RuntimeFault("stale_context", "Shadow frame does not match the prepared scope");
+        const probeFrame = parsed.session ? { ...frame, executive: {
+          schema_version: 1 as const, session_id: predecessorId, behavior_generation: 1, producer: "none" as const,
+          task_high_water: 0, tasks: [], last_command_error: null, restarts: 0, deadline_host_ms: deadlineHostMs,
+        } } : frame;
+        const result = residentActivationResultSchema.parse(await (shadow.activate ?? shadow.step).call(shadow, probeFrame, structuredClone(parsed.initial_state),
+          structuredClone(parsed.args), record.controller.signal));
+        if ("refused" in result || result.status === "blocked")
+          throw new RuntimeFault("precondition_failed", "Candidate refused shadow activation");
+        // A valid result for another entry mode is still an invalid successor.
+        (parsed.session ? executiveStepResultSchema : controllerStepResultSchema).parse(result);
+        record.assertCurrent();
+      } finally {
+        try { await shadow.close(); record.workers.delete(shadow); }
+        catch {
+          const error = new ResidentCleanupError();
+          this.cleanupFailures.add(error); this.host.unsafe(); throw error;
+        }
+      }
+      record.assertCurrent();
+      const clean = await this.sandbox.createResidentWorker!(skill.source, parsed.limits.step_ms, record.controller.signal) as ResidentPreparedWorker;
+      record.workers.add(clean);
+      record.assertCurrent();
+      record.worker = clean;
+    });
+    try {
+      await record.task;
+      record.assertCurrent();
+      return { assertCurrent: record.assertCurrent, close: () => this.closePrepared(record) };
+    } catch (error) {
+      await this.closePrepared(record);
+      throw error;
+    }
+  }
   private prepareStart(runId: string, parsed: SkillStartRequest) {
     const selected = this.store.skill(runId, parsed);
     this.compatible(selected);
@@ -271,8 +445,13 @@ export class SkillManager {
       throw new RuntimeFault("precondition_failed", "Playing entry does not match the immutable source");
     if (parsed.entry === "step" && (!this.sandbox.createResidentWorker || !this.sandbox.createResidentAnalysisWorker || !this.host.openController))
       throw new RuntimeFault("precondition_failed", "This host does not provide resident worker and native controller authority");
+    if (parsed.entry === "step" && parsed.session &&
+        (!this.host.sessionTask || !this.host.superviseSessionTask || !this.host.retireSessionTask))
+      throw new RuntimeFault("precondition_failed", "Control sessions require supervised task and exact retirement authority");
     const run = this.store.getRun(runId);
     if (!run) throw new RuntimeFault("not_found", "Run not found");
+    if (run.control_mode === "executive" && (parsed.entry !== "step" || !parsed.session))
+      throw new RuntimeFault("precondition_failed", "Executive runs admit only life-scoped step sessions as roots; legacy programs must be supervised children");
     this.host.authorize({ session_id: parsed.session_id, world_id: run.world_id, epoch: parsed.epoch,
       native_boot_id: parsed.native_boot_id, run_id: runId, run_generation: parsed.run_generation,
       life_id: parsed.life_id, space_epoch: parsed.space_epoch });
@@ -291,6 +470,8 @@ export class SkillManager {
   async retireForHandoff(runId: string, request: SkillStartRequest, predecessorId: string, signal: AbortSignal | undefined): Promise<() => void> {
     const parsed = skillStartRequestSchema.parse(request);
     this.prepareStart(runId, parsed);
+    if (parsed.entry === "step")
+      await this.prepareResidentHandoff(runId, parsed, predecessorId, signal);
     const selected = this.store.skillExecution(runId, { execution_id: predecessorId });
     const live = this.live.get(predecessorId);
     const sameScope = (view: SkillExecutionView, scope: EffectScope | SkillExecutionView = view) =>
@@ -362,6 +543,8 @@ export class SkillManager {
       };
       await Promise.race([settle(), aborted.promise]);
       assertRetired();
+      const prepared = this.preparedHandoffs.get(`${runId}:${parsed.start_key}`);
+      if (prepared) prepared.retired = assertRetired;
       return assertRetired;
     } finally {
       signal?.removeEventListener("abort", abort);
@@ -370,6 +553,8 @@ export class SkillManager {
   /** A deliberate Stop also revokes a handoff waiting on observation, not just a live worker. */
   interruptHandoffs(): void {
     this.handoffRevision++;
+    for (const record of this.preparedHandoffs.values())
+      void this.closePrepared(record).catch(() => this.host.unsafe());
   }
   get(
     runId: string,
@@ -408,10 +593,12 @@ export class SkillManager {
         void this.closeTree(live, reason).catch(() => this.host.changed(true));
   }
   async closeAll(reason: string): Promise<void> {
+    const preparations = [...this.preparedHandoffs.values()];
     this.interruptHandoffs();
     const roots = [...this.live.values()].filter((live) => live.root === live);
     for (const root of roots) this.revoke(root, reason);
     await Promise.all(roots.map((root) => this.closeTree(root, reason)));
+    await Promise.all(preparations.map(record => this.closePrepared(record)));
     if (this.cleanupFailures.size)
       throw this.cleanupFailures.values().next().value;
   }
@@ -428,6 +615,7 @@ export class SkillManager {
     view: SkillExecutionView,
     skill: SkillView,
     parent: Live | null,
+    prepared?: PreparedHandoff,
   ): Live {
     const live: Live = {
       view,
@@ -450,15 +638,17 @@ export class SkillManager {
         execution_id: view.execution_id, source_hash: skill.hash },
       invocation: { kind: "skill", execution_id: view.execution_id, source_hash: skill.hash },
       resident: null,
-      deadlineHostMs: performance.now() + Math.max(0, Date.parse(view.deadline_at) - Date.now()),
+      deadlineHostMs: Math.min(prepared?.deadlineHostMs ?? Infinity,
+        performance.now() + Math.max(0, Date.parse(view.deadline_at) - Date.now())),
     };
     live.root = parent?.root ?? live;
     parent?.children.add(live);
     this.live.set(view.execution_id, live);
     live.timer = setTimeout(
       () => {
-        this.interruptHandoffs();
-        void this.closeTree(live.root, "Root skill deadline reached").catch(
+        const sessionChild = live !== live.root && live.root.view.entry === "step" && !!live.root.view.session;
+        if (!sessionChild) this.interruptHandoffs();
+        void this.closeTree(sessionChild ? live : live.root, sessionChild ? "Session child deadline reached" : "Root skill deadline reached").catch(
           () => this.host.changed(true),
         );
       },
@@ -476,7 +666,7 @@ export class SkillManager {
           "Skill dispatched inside its isolated execution",
         );
         this.authorize(live);
-        outcome = view.entry === "step" ? await this.runResident(live, skill) : parseGeneratedSkillResult(
+        outcome = view.entry === "step" ? await this.runResident(live, skill, prepared) : parseGeneratedSkillResult(
           await this.sandbox.runSkill(
             skill.source,
             view.args,
@@ -545,6 +735,13 @@ export class SkillManager {
             };
         }
       } finally {
+        if (prepared) {
+          try { await this.closePrepared(prepared); }
+          catch (error) {
+            live.cleanupFailure = error instanceof Error ? error : new ResidentCleanupError();
+            live.abortStatus = "unknown"; view.status = "unknown"; this.host.unsafe();
+          }
+        }
         try {
           await live.cleanupEffects;
           await Promise.all([...live.children].map((child) => child.done));
@@ -571,21 +768,44 @@ export class SkillManager {
     this.host.changed(false);
     return live;
   }
-  private async runResident(live: Live, skill: SkillView): Promise<SkillResult> {
+  private async runResident(live: Live, skill: SkillView, prepared?: PreparedHandoff): Promise<SkillResult> {
     const view = live.view;
     if (view.entry !== "step" || !this.sandbox.createResidentWorker || !this.host.openController)
       throw new Error("Resident execution is not supported by this host");
     const adapter = this.context().adapter;
-    const worker = await this.sandbox.createResidentWorker(skill.source, view.limits.step_ms, live.controller.signal);
+    const ready = prepared?.worker;
+    if (prepared && !ready) throw new RuntimeFault("stale_context", "Prepared live runtime is unavailable");
+    const worker = ready ?? await this.sandbox.createResidentWorker(skill.source, view.limits.step_ms, live.controller.signal);
+    let activated = !prepared;
+    const liveWorker: ResidentPreparedWorker = {
+      step: (...args) => worker.step(...args),
+      activate: async (...args: Parameters<NonNullable<ResidentPreparedWorker["activate"]>>) => {
+        if (!prepared) return await ((worker as ResidentPreparedWorker).activate ?? worker.step).apply(worker, args);
+        if (activated) throw new RuntimeFault("stale_context", "Prepared activation cannot be replayed");
+        prepared.assertCurrent();
+        const result = await ((worker as ResidentPreparedWorker).activate ?? worker.step).apply(worker, args);
+        prepared.assertCurrent();
+        this.authorize(live);
+        activated = true;
+        clearTimeout(prepared.timer); prepared.releaseSignal();
+        if (this.preparedHandoffs.get(prepared.slot) === prepared) this.preparedHandoffs.delete(prepared.slot);
+        return result;
+      },
+      close: async () => {
+        await worker.close();
+        prepared?.workers.delete(worker);
+      },
+    };
     const completed = Promise.withResolvers<ResidentSnapshot>();
-    let resident: ResidentController | null = null;
+    let resident: ResidentController | ControlSession | null = null;
     const abort = () => { if (resident) void resident.stop(view.error ?? "Resident root authority revoked"); };
     try {
       this.authorize(live);
-      resident = new ResidentController({
+      const options: ResidentControllerOptions = {
         execution_id: view.execution_id, source_hash: skill.hash, controller_generation: 1,
-        limits: view.limits, deadline_host_ms: live.deadlineHostMs, initial_state: view.initial_state, intent: view.args, worker,
-        open: (deadline, applied, effect, lifecycle) => this.host.openController!(view, 1, deadline, applied, effect, lifecycle),
+        limits: view.limits, deadline_host_ms: live.deadlineHostMs, initial_state: view.initial_state, intent: view.args, worker: liveWorker,
+        first_activation: !!prepared,
+        open: (deadline, applied, effect, lifecycle, generation = 1) => this.host.openController!(view, generation, deadline, applied, effect, lifecycle),
         current: () => {
           try { this.authorize(live); return performance.now() < live.deadlineHostMs; } catch { return false; }
         },
@@ -615,7 +835,19 @@ export class SkillManager {
         },
         clock: { id: HOST_MONOTONIC_CLOCK_ID, now: () => performance.now(), setTimeout: (callback, delay) => setTimeout(callback, delay),
           clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>) },
-      });
+      };
+      resident = view.session ? new ControlSession({
+        ...options, config: view.session,
+        sample: cursor => this.host.queryCapability("minecraft.controller_frame", 2, { audio_cursor: cursor }),
+        task: (request, handle, deadline, signal, frame, generation) =>
+          this.host.sessionTask!(view, request, handle, deadline, signal, frame, generation),
+        supervise: (handle, frame, generation) => this.host.superviseSessionTask!(view, handle, frame, generation),
+        retireTask: (handle, reason) => this.host.retireSessionTask!(view, handle, reason),
+        record: (type, details) => this.store.event(view.run_id, type, "Control session lifecycle; no tactical or effect success claim", {
+          execution_id: view.execution_id, source_hash: skill.hash, details,
+        }),
+        restartWorker: signal => this.sandbox.createResidentWorker!(skill.source, view.limits.step_ms, signal),
+      }) : new ResidentController(options);
       live.resident = resident;
       live.controller.signal.addEventListener("abort", abort, { once: true });
       if (live.controller.signal.aborted) abort();
@@ -652,23 +884,101 @@ export class SkillManager {
     this.store.event(runId, "controller.analysis", "Pure analysis result; no effect or automatic intent adoption", result as unknown as Json);
     return result;
   }
+  async runSessionChild(execution: SkillExecutionView, exactNamedRef: { name: string; version: number }, args: Json,
+    duration: number, handle: number, signal: AbortSignal): Promise<GameActionResult> {
+    const root = this.live.get(execution.execution_id);
+    if (!root || root.root !== root || root.view.entry !== "step" || !root.view.session)
+      throw new RuntimeFault("precondition_failed", "A live control session must own the child");
+    this.authorize(root);
+    if (!Number.isSafeInteger(handle) || handle < 1 || !Number.isSafeInteger(duration) || duration < 1 || duration > 600000)
+      throw new RuntimeFault("precondition_failed", "Session children require a finite handle and deadline");
+    const rootSource = this.store.skill(root.view.run_id, root.view);
+    const selected = rootSource.dependencies.map(ref => this.store.skill(root.view.run_id, ref))
+      .find(skill => skill.name === exactNamedRef.name && skill.version === exactNamedRef.version);
+    if (!selected || selected.entry !== "run")
+      throw new RuntimeFault("precondition_failed", "Session child must name an exact declared run dependency");
+    this.compatible(selected);
+    const generation = root.resident?.snapshot().session?.behavior_generation ?? 1;
+    const key = `${execution.execution_id}:${generation}:${handle}`;
+    if (this.sessionChildren.has(key))
+      throw new RuntimeFault("conflict", "An admitted session child handle cannot dispatch twice");
+    if (signal.aborted) throw new RuntimeFault("stale_context", "Session child was cancelled before admission");
+    this.consume(root, false);
+    this.authorize(root);
+    const limits = this.remaining(root), deadline = Math.min(root.deadlineHostMs, performance.now() + duration);
+    const admitted = this.store.admitSkill(root.view.run_id, {
+      entry: "run", skill_id: selected.skill_id, version: selected.version,
+      start_key: `session_child_${createHash("sha256").update(key).digest("hex")}`,
+      session_id: root.scope.session_id, epoch: root.scope.epoch, life_id: root.scope.life_id,
+      native_boot_id: root.scope.native_boot_id, run_generation: root.scope.run_generation,
+      space_epoch: root.scope.space_epoch, compatibility_hash: root.view.compatibility_hash!,
+      args, limits: { ...limits, duration_ms: Math.max(1, Math.floor(deadline - performance.now())) },
+    }, { parent_execution_id: root.view.execution_id, root_execution_id: root.view.execution_id });
+    if (!admitted.created)
+      throw new RuntimeFault("conflict", "A session child invocation is retained; it cannot replay");
+    const child = this.dispatch(admitted.view, selected, root);
+    child.deadlineHostMs = deadline;
+    clearTimeout(child.timer);
+    child.timer = setTimeout(() => { void this.closeTree(child, "Finite session child deadline reached").catch(() => this.host.unsafe()); },
+      Math.max(0, deadline - performance.now()));
+    this.sessionChildren.set(key, child);
+    const abort = () => { void this.closeTree(child, "Executive interrupted exact finite child").catch(() => this.host.unsafe()); };
+    signal.addEventListener("abort", abort, { once: true });
+    try {
+      if (signal.aborted) abort();
+      await child.done;
+      if (child.closing) await child.closing;
+      return { status: child.view.status === "succeeded" ? "succeeded" : child.view.status === "cancelled" ? "cancelled"
+        : child.view.status === "unknown" ? "unknown" : "failed",
+      summary: child.view.result?.summary ?? child.view.error ?? "Finite session child settled",
+      evidence: { execution_id: child.view.execution_id, source_hash: selected.hash,
+        result: child.view.result as unknown as Json } };
+    } finally {
+      signal.removeEventListener("abort", abort);
+      this.sessionChildren.delete(key);
+    }
+  }
+  consumeSessionAction(execution: SkillExecutionView): void {
+    const root = this.live.get(execution.execution_id);
+    if (!root || root.root !== root || root.view.run_id !== execution.run_id || root.view.entry !== "step" || !root.view.session)
+      throw new RuntimeFault("precondition_failed", "A live control session must own the action");
+    this.authorize(root);
+    this.consume(root, true);
+    // Budget publication can synchronously revoke the owning session.
+    this.authorize(root);
+  }
+  async retireSessionChild(execution: SkillExecutionView, handle: number, reason: string): Promise<void> {
+    const prefix = `${execution.execution_id}:`;
+    const children = [...this.sessionChildren.entries()]
+      .filter(([key]) => key.startsWith(prefix) && key.endsWith(`:${handle}`)).map(([, child]) => child);
+    await Promise.all(children.map(child => this.closeTree(child, reason)));
+  }
+  private capabilityLimits(root: Live): SkillLimits {
+    if (root.view.entry === "run") return root.view.limits;
+    if (root.view.entry === "step" && root.view.session) return {
+      duration_ms: root.view.limits.duration_ms, max_actions: root.view.session.max_actions,
+      max_calls: root.view.session.max_calls, max_depth: root.view.session.max_depth,
+    };
+    throw new Error("Raw resident entries cannot acquire finite capability authority");
+  }
   private remaining(live: Live): SkillLimits {
-    if (live.root.view.entry !== "run") throw new Error("Only run entries have capability-call budgets");
+    const limits = this.capabilityLimits(live.root);
     return {
-      ...live.root.view.limits,
+      ...limits,
       duration_ms: Math.max(
         1,
-        Date.parse(live.root.view.deadline_at) - Date.now(),
+        Math.min(MAX_SKILL_LIMITS.duration_ms,
+          Math.floor(Math.min(live.deadlineHostMs, live.root.deadlineHostMs) - performance.now())),
       ),
       max_actions: Math.max(
         1,
-        live.root.view.limits.max_actions - live.root.view.actions,
+        Math.min(MAX_SKILL_LIMITS.max_actions, limits.max_actions - live.root.view.actions),
       ),
       max_calls: Math.max(
         1,
-        live.root.view.limits.max_calls - live.root.view.calls,
+        Math.min(MAX_SKILL_LIMITS.max_calls, limits.max_calls - live.root.view.calls),
       ),
-      max_depth: Math.max(1, live.root.view.limits.max_depth - live.depth + 1),
+      max_depth: Math.max(1, Math.min(MAX_SKILL_LIMITS.max_depth, limits.max_depth - live.depth + 1)),
     };
   }
   private authorize(live: Live): void {
@@ -676,6 +986,7 @@ export class SkillManager {
       live.controller.signal.aborted ||
       live.root.controller.signal.aborted ||
       terminal.has(live.view.status) ||
+      performance.now() >= live.deadlineHostMs ||
       (live.root.view.entry === "step" ? performance.now() >= live.root.deadlineHostMs : Date.now() >= Date.parse(live.root.view.deadline_at))
     )
       throw new Error("Skill authority revoked");
@@ -685,17 +996,17 @@ export class SkillManager {
     const root = live.root;
     if (root.handoff)
       return new RuntimeFault("stale_context", "Program capability admission retired for authored handoff");
-    if (root.view.entry !== "run") throw new Error("Resident entries cannot acquire finite capability authority");
+    const limits = this.capabilityLimits(root);
     if (
-      root.view.calls >= root.view.limits.max_calls ||
-      (action && root.view.actions >= root.view.limits.max_actions)
+      root.view.calls >= limits.max_calls ||
+      (action && root.view.actions >= limits.max_actions)
     ) {
       const exhausted = [
-        ...(root.view.calls >= root.view.limits.max_calls ? ["max_calls"] : []),
-        ...(action && root.view.actions >= root.view.limits.max_actions ? ["max_actions"] : []),
+        ...(root.view.calls >= limits.max_calls ? ["max_calls"] : []),
+        ...(action && root.view.actions >= limits.max_actions ? ["max_actions"] : []),
       ].join(" and ");
       const failure = new RuntimeFault("budget_exceeded",
-        `Aggregate root skill budget exhausted: ${exhausted} (calls=${root.view.calls}/${root.view.limits.max_calls}, actions=${root.view.actions}/${root.view.limits.max_actions}). No additional capability admitted; execution authority revoked. Inspect execution evidence and adapt the bounded program flow before a new execution.`);
+        `Aggregate root skill budget exhausted: ${exhausted} (calls=${root.view.calls}/${limits.max_calls}, actions=${root.view.actions}/${limits.max_actions}). No additional capability admitted; execution authority revoked. Inspect execution evidence and adapt the bounded program flow before a new execution.`);
       // Abort wins the sandbox's failure race. Retain this trusted cause before
       // revocation so worker cancellation cannot replace it with a generic error.
       const retain = (node: Live): void => {
@@ -805,6 +1116,13 @@ export class SkillManager {
             action.status === "cancelled" ||
             action.requires_reconnect
           ) {
+            if (live !== live.root && live.root.view.entry === "step" && live.root.view.session && !action.requires_reconnect) {
+              live.abortStatus = action.status === "unknown" ? "unknown" : "cancelled";
+              live.view.result = { status: "failed", summary: action.summary, result: action as unknown as Json };
+              this.revoke(live, "Session child interrupted; past effects retain original attribution");
+              void this.closeTree(live, "Exact session child emitter retired").catch(() => this.host.unsafe());
+              throw new Error("Session child interrupted");
+            }
             live.root.abortStatus =
               action.status === "unknown" || action.requires_reconnect
                 ? "unknown"
@@ -854,14 +1172,15 @@ export class SkillManager {
           break;
         }
         case "call": {
-          if (live.root.view.entry !== "run") throw new Error("Only run roots can compose playing children");
+          if (live.root.view.entry !== "run" && !(live.root.view.entry === "step" && live.root.view.session))
+            throw new Error("Only finite programs and control sessions can compose playing children");
           const declared = skill.dependencies.map((ref) => this.store.skill(live.view.run_id, ref))
             .filter((dependency) => dependency.name === request.skill.name &&
               (request.skill.version === undefined || dependency.version === request.skill.version));
           if (declared.length !== 1)
             throw new RuntimeFault("precondition_failed",
               "game.call requires exactly one matching named child in the parent's pinned program dependencies. Declare the child's exact reference and select its name/version. Native adapter bindings are direct game methods, not program dependencies.");
-          if (live.depth >= live.root.view.limits.max_depth)
+          if (live.depth >= this.capabilityLimits(live.root).max_depth)
             throw new Error("Root composition depth exhausted");
           const dependency = declared[0]!;
           this.compatible(dependency);
@@ -888,7 +1207,7 @@ export class SkillManager {
               space_epoch: live.scope.space_epoch,
               compatibility_hash: this.context().binding.compatibility_hash,
               args: request.args,
-              limits: live.root.view.limits,
+              limits: live.root.view.entry === "step" ? this.remaining(live) : this.capabilityLimits(live.root),
             },
             {
               parent_execution_id: live.view.execution_id,

@@ -71,6 +71,7 @@ export class ResidentController {
   private traceSequence = 0;
   private observerErrors = 0;
   private resultFailure: GeneratedControllerResultValidationError | null = null;
+  private activated = false;
 
   get failure(): GeneratedControllerResultValidationError | null { return this.resultFailure; }
 
@@ -365,7 +366,12 @@ export class ResidentController {
         if (!this.fenced && !this.options.current()) this.finish("stopped", "resident_source_changed");
         return;
       }
-      raw = await this.options.worker.step(frame, structuredClone(this.data.state), structuredClone(this.intent), this.abort.signal);
+      if (this.options.first_activation && !this.activated && this.options.worker.activate) {
+        this.activated = true;
+        const activation = await this.options.worker.activate(frame, structuredClone(this.data.state), structuredClone(this.intent), this.abort.signal);
+        if ("refused" in activation) { this.finish("blocked", activation.reason); return; }
+        raw = activation;
+      } else raw = await this.options.worker.step(frame, structuredClone(this.data.state), structuredClone(this.intent), this.abort.signal);
       if (this.options.trace) this.trace({ stage: "worker_return", slot, frame_seq: frame.frame_seq, outcome: "returned" });
     }
     catch (error) {

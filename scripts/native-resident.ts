@@ -347,6 +347,7 @@ export async function runNativeResidentFixture(project: string, caps: Evaluation
           trace.steps.push(sample);
           try {
             const result = await worker.step(frame, state, intent, stepSignal);
+            requireProof("input" in result, "Legacy resident input probe cannot accept an executive task command");
             sample.returned_host_ms = performance.now(); sample.input = controllerInputSchema.parse(result.input); sample.status = result.status;
             return result;
           } catch (error) { sample.failure = String(error); sample.returned_host_ms = performance.now(); throw error; }

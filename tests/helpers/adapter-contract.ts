@@ -45,18 +45,20 @@ export function descriptor() {
   const schemas = schemaCatalog();
   const configuration = {
     sampler: { radius_blocks: 8, max_blocks: 144, max_entities: 32, max_age_ms: 1000,
-      camera_independent: true, occlusion_test: "native_raycast" },
+      camera_independent: true, occlusion_test: "native_raycast", dynamic_interval_ticks: 1,
+      dynamic_candidate_limit: 128, entity_optical_gate: "air_water_bubble_only", terrain_interval_ms: 500 },
     actor_image: { codec: "png", presentation: "opaque_rgb", alignment: "unsynchronized" },
     motor_profile: "balanced",
     assistance: { semantic_helpers: true },
     visible_gui: { projection: "current_visible_layout", max_slots: 128, max_elements: 64, max_progress: 32, coordinates: "logical_gui" },
-    controller_feedback: { schema_version: 2, own_body: "current_client_state", inventory: "client_prediction",
+    controller_feedback: { schema_version: 3, own_body: "current_client_state", inventory: "client_prediction",
       screen: "current_visible_layout", visible_world: "last_authorized_observation",
       render_capture: "capture_sequence_metadata_only", render_max_age_ms: 5000,
       last_input: "actual_application_ack", effect_updates: "bounded_later_receipts", max_effect_updates: 8,
-      max_effect_update_bytes: 16384 },
+      max_effect_update_bytes: 16384, mechanics: "ordinary_attack_entry", max_mechanics: 32,
+      equipment_durability: true, blocking: true },
     audible: { source: "actually_delivered_allowlisted", capacity: 128, ttl_ms: 1000,
-      max_events_per_page: 8, cursors: "consumer_owned", creeper_primed: true,
+      max_events_per_page: 8, cursors: "consumer_owned", creeper_primed: true, combat_cues: "hurt_death_shield_item_attack",
       ordinary_groups: { max_groups: 8, cue_distinct: true, cue_priority: true } },
   };
   return {
@@ -66,7 +68,7 @@ export function descriptor() {
     observation: {
       schema_version: 3, schema_hash: sha256(schemas.observation),
       payload_schema: { id: "contract_test_payload_v1", version: 1, hash: sha256(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_360_r8_control_v5", version: 5, configuration,
+      profile: { id: "minecraft_assisted_rgb_360_r8_control_v6", version: 6, configuration,
         configuration_hash: sha256(configuration) },
     },
     capabilities: [

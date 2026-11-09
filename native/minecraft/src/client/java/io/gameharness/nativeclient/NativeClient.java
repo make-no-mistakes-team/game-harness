@@ -70,6 +70,9 @@ public final class NativeClient implements ClientModInitializer {
   private JsonObject descriptor;
   private String compatibilityHash;
   private final Map<Long, NativeEffectContract.Received> effectRequests = new HashMap<>();
+  private NativeEffectContract.Received supervisedProducer;
+  private final ArrayDeque<JsonObject> mechanics = new ArrayDeque<>(32);
+  private long mechanicsSequence, mechanicsOmitted;
   private final TargetIncarnations<BlockPos> blockIncarnations = new TargetIncarnations<>(256);
   private final TargetIncarnations<UUID> entityIncarnations = new TargetIncarnations<>(256);
   private final ScreenIncarnations screenIncarnations = new ScreenIncarnations();
@@ -113,6 +116,13 @@ public final class NativeClient implements ClientModInitializer {
       new java.util.concurrent.atomic.AtomicReference<>();
   private long controllerFrameSequence;
   private final ControllerWorldRefresh controllerWorld = new ControllerWorldRefresh(this::acquirePermittedWorld);
+  private JsonObject dynamicEntities;
+  private long dynamicTick = -1, dynamicLife = -1;
+  private EffectAuthority.Space dynamicSpace;
+  private final ArrayList<Entity> dynamicCandidates = new ArrayList<>(NativeContractResource.DYNAMIC_CANDIDATES);
+  private static final net.minecraft.util.TypeFilter<Entity, Entity> DYNAMIC_TYPE =
+      net.minecraft.util.TypeFilter.instanceOf(Entity.class);
+  private static final java.util.function.Predicate<Entity> DYNAMIC_CANDIDATE = entity -> true;
   private final Function<BlockPos, JsonElement> controllerBlockReference = this::controllerBlockReference;
   private final Function<Entity, JsonElement> controllerEntityReference = this::controllerEntityReference;
 
@@ -163,7 +173,10 @@ public final class NativeClient implements ClientModInitializer {
   public void screenTransactionReceived(int syncId) {
     if (client.player != null && (syncId <= 0 || syncId == client.player.currentScreenHandler.syncId)) screenTransactionReceived();
   }
-  public void entityReplaced(Entity entity) { if (incarnationSignals != null) incarnationSignals.entityReplaced(entity); }
+  public void entityReplaced(Entity entity) {
+    dynamicEntities = null;
+    if (incarnationSignals != null) incarnationSignals.entityReplaced(entity);
+  }
 
   private NativeEffectContract.Received receivedEffect(long id) {
     synchronized (effectRequests) { return effectRequests.get(id); }
@@ -297,6 +310,13 @@ public final class NativeClient implements ClientModInitializer {
         if (client.world == null || !client.world.isChunkLoaded(visibilityCell)) return -1;
         return client.world.getBlockState(visibilityCell).isAir() ? 0 : 1;
       };
+  private final VoxelVisibility.Cells opticalCells = (x, y, z) -> {
+    visibilityCell.set(x, y, z);
+    if (client.world == null || !client.world.isChunkLoaded(visibilityCell)) return -1;
+    var state = client.world.getBlockState(visibilityCell);
+    return state.isAir() || state.isOf(net.minecraft.block.Blocks.WATER)
+        || state.isOf(net.minecraft.block.Blocks.BUBBLE_COLUMN) ? 0 : 1;
+  };
 
   private boolean clearLine(Vec3d end, BlockPos exempt) {
     Vec3d eye = client.player.getEyePos();
@@ -315,11 +335,18 @@ public final class NativeClient implements ClientModInitializer {
 
   private boolean authorizedEntity(Entity e) {
     return e != null
+        && e.getWorld() == client.world
         && !e.isRemoved()
         && !e.isInvisibleTo(client.player)
         && client.player.canSee(e)
         && e.squaredDistanceTo(client.player) <= NativeContractResource.RADIUS_SQUARED
-        && clearLine(e.getBoundingBox().getCenter(), null);
+        && opticalLine(e.getBoundingBox().getCenter());
+  }
+
+  private boolean opticalLine(Vec3d end) {
+    Vec3d eye = client.player.getEyePos();
+    return visibility.clear(eye.x, eye.y, eye.z, end.x, end.y, end.z,
+        Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE, opticalCells);
   }
 
   private JsonObject config;
@@ -564,7 +591,7 @@ public final class NativeClient implements ClientModInitializer {
             case "controller_submit", "controller_heartbeat", "controller_sample", "controller_revoke",
                 "controller_open", "controller_frame", "cancel", "disconnect", "execute", "ping",
                 "diagnostics", "evaluation_arm_inventory_replacement", "evaluation_status",
-                "motor_profile", "observe", "visible_screen", "recipes" -> method;
+                "motor_profile", "observe", "visible_screen", "recipes", "producer_supervise" -> method;
             default -> "unrecognized";
           };
           if (method.equals("controller_submit") || method.equals("controller_heartbeat")) {
@@ -1389,6 +1416,22 @@ public final class NativeClient implements ClientModInitializer {
         reply(id, diagnostics(), null);
         return;
       }
+      if (method.equals("producer_supervise")) {
+        JsonObject params = request.getAsJsonObject("params");
+        NativeControllerContract.fields(params, Set.of("owner", "session_id", "behavior_generation", "frame_seq"));
+        var producer = supervisedProducer;
+        var owner = NativeEffectContract.owner(params.getAsJsonObject("owner"));
+        long frameSequence = NativeEffectContract.counter(params, "frame_seq");
+        CapturedControllerFrame capture = supervisionCapture(frameSequence, owner);
+        boolean renewed = producer != null && producer.owner().equals(owner) && capture != null
+            && effectAuthority.validateApplication(owner, producer.compatibilityHash()) == EffectAuthority.Rejection.NONE
+            && producer.supervision().renew(NativeEffectContract.id(params, "session_id"),
+                NativeEffectContract.counter(params, "behavior_generation"), frameSequence, capture.nanos(), System.nanoTime());
+        JsonObject out = new JsonObject(); out.addProperty("renewed", renewed);
+        if (renewed) out.addProperty("lease_deadline_native_ns", Long.toString(producer.supervision().deadline()));
+        else out.add("lease_deadline_native_ns", JsonNull.INSTANCE);
+        reply(id, out, null); return;
+      }
       if (method.equals("evaluation_arm_inventory_replacement")) {
         if (evaluationConfig == null || !evaluationConfig.allowInventoryReplacement())
           throw new IllegalStateException("Native inventory evaluation is disabled");
@@ -1524,6 +1567,13 @@ public final class NativeClient implements ClientModInitializer {
         return;
       }
       JsonObject action = received.action();
+      if (received.supervision() != null) {
+        CapturedControllerFrame capture = supervisionCapture(received.supervision().frameSequence(), received.owner());
+        if (capture == null || !received.supervision().admit(capture.nanos(), System.nanoTime())) {
+          reply(id, rejectedEffect("game_thread", "Fresh executive supervision required"), null); return;
+        }
+        supervisedProducer = received;
+      }
       if (action.get("kind").getAsString().equals("respawn")) {
         if (respawnRequest != 0 || motor != null || ordinaryInput != null || visibleInput != null || lifecycle.status() != PlayerLifecycle.Status.DEAD) {
           reply(id, result("failed", "Vanilla death screen is not ready for this life respawn", false), null);
@@ -1564,6 +1614,7 @@ public final class NativeClient implements ClientModInitializer {
             request.get("received_ns").getAsLong(), effectAuthority.nativeBootId(),
             () -> connected && client.isOnThread() && lifecycle.ready() && client.player != null
                 && client.world != null && client.player.getHealth() > 0 && !client.player.isDead()
+                && producerCurrent(received)
                 && effectAuthority.validateApplication(received.owner(), received.compatibilityHash()) == EffectAuthority.Rejection.NONE,
             this::nextReceiptNonce, (prefix, appliedAt) -> {}, outcome -> { visibleInput = null; reply(id, outcome, null); });
         return;
@@ -1714,10 +1765,14 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private static JsonObject position(Vec3d p) {
+    return position(p.x, p.y, p.z);
+  }
+
+  private static JsonObject position(double x, double y, double z) {
     JsonObject v = new JsonObject();
-    v.addProperty("x", p.x);
-    v.addProperty("y", p.y);
-    v.addProperty("z", p.z);
+    v.addProperty("x", x);
+    v.addProperty("y", y);
+    v.addProperty("z", z);
     return v;
   }
 
@@ -1744,7 +1799,13 @@ public final class NativeClient implements ClientModInitializer {
     o.add("data", data);
     data.add("player", player());
     data.add("blocks", world.get("blocks"));
-    data.add("entities", world.get("entities"));
+    JsonArray strategicEntities = new JsonArray();
+    for (JsonElement row : acquireDynamicEntities().getAsJsonArray("entities")) {
+      JsonObject item = row.getAsJsonObject().deepCopy();
+      item.remove("bounds"); item.remove("aim_position");
+      strategicEntities.add(item);
+    }
+    data.add("entities", strategicEntities);
     JsonArray heard = new JsonArray();
     for (SoundProjection.Group group : sounds.recent(System.nanoTime())) {
       JsonObject sound = new JsonObject();
@@ -1771,7 +1832,6 @@ public final class NativeClient implements ClientModInitializer {
     String now = Instant.now().toString();
     JsonArray visible = new JsonArray();
     blocks.clear();
-    entities.clear();
     BlockPos center = client.player.getBlockPos();
     Vec3d eye = client.player.getEyePos();
     // Resolve geometry first; hidden block material is never inspected before the visibility test.
@@ -1807,9 +1867,32 @@ public final class NativeClient implements ClientModInitializer {
             visible.add(item);
             if (visible.size() >= NativeContractResource.MAX_BLOCKS) break outer;
           }
+    JsonObject world = new JsonObject();
+    world.addProperty("source", "last_authorized_observation");
+    observationSeq = ContractIdentity.next(observationSeq);
+    world.addProperty("observation_seq", observationSeq);
+    world.addProperty("captured_at", now);
+    world.addProperty("captured_native_ns", Long.toString(acquiredAt));
+    world.add("blocks", visible); world.add("entities", new JsonArray());
+    return world;
+  }
+
+  /** Bounded traversal and optical work, on the game thread, once per coherent native tick. */
+  private JsonObject acquireDynamicEntities() {
+    var space = incarnationSignals.space();
+    if (dynamicEntities != null && dynamicTick == clientTick && dynamicLife == lifecycle.lifeId()
+        && Objects.equals(dynamicSpace, space)) return dynamicEntities;
+    long captured = System.nanoTime();
+    String now = Instant.now().toString();
     JsonArray seenEntities = new JsonArray();
-    for (Entity e :
-        client.world.getOtherEntities(client.player, client.player.getBoundingBox().expand(NativeContractResource.RADIUS))) {
+    entities.clear();
+    dynamicCandidates.clear();
+    // Vanilla's bounded spatial collection aborts at the candidate cap, before permission
+    // filtering. Denied local candidates consume quota too; their count is never exposed.
+    client.world.collectEntitiesByType(DYNAMIC_TYPE, client.player.getBoundingBox().expand(NativeContractResource.RADIUS),
+        DYNAMIC_CANDIDATE, dynamicCandidates, NativeContractResource.DYNAMIC_CANDIDATES);
+    for (Entity e : dynamicCandidates) {
+      if (e == client.player) continue;
       if (!authorizedEntity(e)) continue;
       TargetIncarnations.Target reference = entityIncarnations.observe(e.getUuid(), incarnationSignals.space(), lifecycle.lifeId());
       String id = reference.targetId();
@@ -1818,6 +1901,12 @@ public final class NativeClient implements ClientModInitializer {
       item.add("target", NativeEffectContract.target(reference));
       item.addProperty("name", Registries.ENTITY_TYPE.getId(e.getType()).getPath());
       item.add("position", position(e.getPos()));
+      JsonObject bounds = new JsonObject();
+      var box = e.getBoundingBox();
+      bounds.add("min", position(box.minX, box.minY, box.minZ));
+      bounds.add("max", position(box.maxX, box.maxY, box.maxZ));
+      item.add("bounds", bounds);
+      item.add("aim_position", position(box.getCenter()));
       item.addProperty("observed_at", now);
       item.addProperty("current", true);
       if (e instanceof ItemEntity dropped && !dropped.getStack().isEmpty())
@@ -1825,14 +1914,15 @@ public final class NativeClient implements ClientModInitializer {
       seenEntities.add(item);
       if (seenEntities.size() >= NativeContractResource.MAX_ENTITIES) break;
     }
-    JsonObject world = new JsonObject();
-    world.addProperty("source", "last_authorized_observation");
-    observationSeq = ContractIdentity.next(observationSeq);
-    world.addProperty("observation_seq", observationSeq);
-    world.addProperty("captured_at", now);
-    world.addProperty("captured_native_ns", Long.toString(acquiredAt));
-    world.add("blocks", visible); world.add("entities", seenEntities);
-    return world;
+    JsonObject projection = new JsonObject();
+    projection.addProperty("source", "current_authorized_tick");
+    projection.addProperty("native_tick", clientTick);
+    projection.addProperty("captured_at", now);
+    projection.addProperty("captured_native_ns", Long.toString(captured));
+    projection.addProperty("partial", true);
+    projection.add("entities", seenEntities);
+    dynamicTick = clientTick; dynamicLife = lifecycle.lifeId(); dynamicSpace = space;
+    return dynamicEntities = projection;
   }
 
   private JsonObject inventoryCounts() {
@@ -1864,6 +1954,7 @@ public final class NativeClient implements ClientModInitializer {
   private void tick() {
     clientTick = ContractIdentity.next(clientTick);
     drainRetirement();
+    expireSupervisedProducer();
     if (!connected) {
       neutralize();
       return;
@@ -1912,8 +2003,62 @@ public final class NativeClient implements ClientModInitializer {
     }
   }
 
+  private CapturedControllerFrame supervisionCapture(long sequence, EffectAuthority.Owner owner) {
+    synchronized (controllerCaptures) {
+      CapturedControllerFrame capture = controllerCaptures.get(sequence);
+      return capture != null && capture.life() == owner.scope().lifeId()
+          && capture.life() == lifecycle.lifeId() && capture.space().equals(incarnationSignals.space())
+          && capture.space().epoch() == owner.scope().spaceEpoch() ? capture : null;
+    }
+  }
+
+  private boolean producerCurrent(NativeEffectContract.Received received) {
+    return received.supervision() == null || supervisedProducer == received
+        && received.supervision().current(System.nanoTime());
+  }
+
+  private void expireSupervisedProducer() {
+    var producer = supervisedProducer;
+    if (producer == null) return;
+    if (effectAuthority.owner() == null || !effectAuthority.owner().equals(producer.owner())) {
+      producer.supervision().retire(); supervisedProducer = null; return;
+    }
+    if (producerCurrent(producer)) return;
+    // Revoke emission before cleanup; past effects remain attributed to this exact child.
+    producer.supervision().retire();
+    if (visibleInput != null) visibleInput.cancel();
+    if (ordinaryInput != null) finishOrdinary("expired");
+    if (motor != null && motor.received == producer)
+      motor.finish("cancelled", "Executive supervision expired", false);
+    effectAuthority.close(producer.owner()); authority = effectAuthority.cancellationGeneration();
+    supervisedProducer = null;
+    applyInput();
+    if (client.player != null && client.player.isUsingItem() && client.interactionManager != null)
+      client.interactionManager.stopUsingItem(client.player);
+  }
+
+  private void recordMechanic(String stage, long edgeOrdinal) {
+    if (streamOwner == null || streamInputs == null || streamInputs.pending() == null) return;
+    var entry = streamInputs.pending();
+    JsonObject fact = new JsonObject();
+    mechanicsSequence = ContractIdentity.next(mechanicsSequence);
+    fact.addProperty("event_seq", mechanicsSequence);
+    fact.addProperty("controller_generation", streamOwner.grant().controllerGeneration());
+    fact.addProperty("sequence", entry.sequence());
+    fact.addProperty("edge_ordinal", edgeOrdinal);
+    fact.addProperty("stage", stage);
+    fact.addProperty("native_tick", clientTick);
+    fact.addProperty("recorded_native_ns", Long.toString(System.nanoTime()));
+    fact.addProperty("crosshair", client.crosshairTarget == null ? "unavailable"
+        : client.crosshairTarget instanceof EntityHitResult ? "entity"
+        : client.crosshairTarget instanceof BlockHitResult && client.crosshairTarget.getType() == HitResult.Type.BLOCK ? "block" : "miss");
+    if (mechanics.size() == 32) { mechanics.removeFirst(); mechanicsOmitted = ContractIdentity.next(mechanicsOmitted); }
+    mechanics.addLast(fact);
+  }
+
   private boolean ordinaryAuthorized() {
     return ordinaryInput != null && connected && client.isOnThread()
+        && producerCurrent(ordinaryInput.received)
         && client.player != null && client.world != null && lifecycle.ready()
         && client.player.getHealth() > 0 && !client.player.isDead()
         && effectAuthority.validateApplication(ordinaryInput.received.owner(),
@@ -1951,7 +2096,12 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   public boolean ordinaryAttackEntry() {
-    if (streamInputs != null) return streamCanConsume() && client.currentScreen == null;
+    if (streamInputs != null) {
+      boolean allowed = streamCanConsume() && client.currentScreen == null;
+      if (allowed && streamInputs.attackEdgeOrdinal() > 0)
+        recordMechanic("attack_callback", streamInputs.attackEdgeOrdinal());
+      return allowed;
+    }
     if (ordinaryInput == null) return true;
     if (!checkOrdinary()) return false;
     ordinaryInput.attackEntry();
@@ -1987,7 +2137,11 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   public void streamKeyConsumed(net.minecraft.client.option.KeyBinding key) {
-    if (client.isOnThread() && streamInputs != null) streamInputs.keyConsumed(key);
+    if (client.isOnThread() && streamInputs != null) {
+      streamInputs.keyConsumed(key);
+      if (key == client.options.attackKey && streamInputs.attackEdgeOrdinal() > 0)
+        recordMechanic("key_consumed", streamInputs.attackEdgeOrdinal());
+    }
   }
   public void beforeStreamKeyConsumption() {
     if (client.isOnThread() && streamInputs != null) streamCanConsume();
@@ -2123,10 +2277,14 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void neutralize() {
+    if (supervisedProducer != null) supervisedProducer.supervision().retire();
+    supervisedProducer = null;
     retireController("native_neutralization");
     blocks.clear();
     entities.clear();
     blockIncarnations.invalidate(); entityIncarnations.invalidate();
+    controllerWorld.invalidate(); dynamicEntities = null;
+    mechanics.clear();
     if (respawnRequest != 0) {
       long id = respawnRequest;
       respawnRequest = 0; respawnReceipt = 0;
@@ -2177,6 +2335,7 @@ public final class NativeClient implements ClientModInitializer {
 
   private void resetSensingScope() {
     controllerWorld.invalidate();
+    dynamicEntities = null; mechanics.clear();
     sounds.clear();
     synchronized (controllerCaptures) { controllerCaptures.clear(); }
     controllerEffects.clear(); controllerEffectBytes = 0; controllerEffectsOmitted = 0; lastStreamAck = null;
@@ -2342,9 +2501,8 @@ public final class NativeClient implements ClientModInitializer {
         || lifecycle.status() == PlayerLifecycle.Status.LOADING || lifecycle.status() == PlayerLifecycle.Status.RESPAWNING)
       throw new IllegalStateException("Authoritative current player space is unavailable");
     long acquisitionStarted = System.nanoTime();
-    // No assisted-owner target-store eviction as a side effect of ordinary controller sensing.
-    if (motor == null)
-      controllerWorld.sample(acquisitionStarted, lifecycle.lifeId(), space, incarnationSignals.screen());
+    controllerWorld.sample(acquisitionStarted, lifecycle.lifeId(), space, incarnationSignals.screen());
+    JsonObject dynamics = acquireDynamicEntities();
     long now = System.nanoTime();
     JsonObject body = controllerBody.capture(clientTick, now, controllerBlockReference, controllerEntityReference);
     JsonObject value = new JsonObject(), profile = descriptor.getAsJsonObject("observation").getAsJsonObject("profile");
@@ -2353,7 +2511,7 @@ public final class NativeClient implements ClientModInitializer {
       if (controllerCaptures.size() == 32) controllerCaptures.remove(controllerCaptures.keySet().iterator().next());
       controllerCaptures.put(controllerFrameSequence, new CapturedControllerFrame(clientTick, now, lifecycle.lifeId(), space));
     }
-    value.addProperty("schema_version", 2); value.addProperty("frame_seq", controllerFrameSequence);
+    value.addProperty("schema_version", 3); value.addProperty("frame_seq", controllerFrameSequence);
     value.addProperty("native_tick", clientTick); value.addProperty("captured_native_ns", Long.toString(now));
     value.addProperty("captured_at", Instant.now().toString());
     value.add("profile_id", profile.get("id")); value.add("profile_version", profile.get("version"));
@@ -2367,6 +2525,10 @@ public final class NativeClient implements ClientModInitializer {
     // Scan time belongs to the acquisition's age, not a new freshness timestamp.
     JsonObject world = controllerWorld.retained(now, lifecycle.lifeId(), space, incarnationSignals.screen());
     value.add("visible_world", world == null ? JsonNull.INSTANCE : world);
+    value.add("dynamic_entities", dynamics);
+    JsonArray mechanicFacts = new JsonArray();
+    for (JsonObject fact : mechanics) mechanicFacts.add(fact);
+    value.add("mechanics", mechanicFacts); value.addProperty("mechanics_omitted", mechanicsOmitted);
     value.add("audible", controllerSounds(sounds.page(cursor, System.nanoTime())));
     return value;
   }
@@ -2507,7 +2669,7 @@ public final class NativeClient implements ClientModInitializer {
     }
 
     boolean authorized(boolean checkScreen) {
-      return (checkScreen
+      return producerCurrent(received) && (checkScreen
           ? effectAuthority.validateApplication(received.owner(), received.compatibilityHash(), received.expectedScreen())
           : effectAuthority.validateApplication(received.owner(), received.compatibilityHash())) == EffectAuthority.Rejection.NONE;
     }
@@ -2554,7 +2716,25 @@ public final class NativeClient implements ClientModInitializer {
         interactionBinding = targetBlock(interactionReference);
         interactionEntityBinding = targetEntity(interactionReference);
       }
+      pin(targetReference, targetBinding, targetEntityBinding);
+      pin(tableReference, tableBinding, tableEntityBinding);
+      pin(gazeReference, gazeBinding, gazeEntityBinding);
+      pin(interactionReference, interactionBinding, interactionEntityBinding);
       bindingsResolved = true;
+    }
+
+    void pin(TargetIncarnations.Target ref, BlockPos block, Entity entity) {
+      if (block != null) blockIncarnations.pin(block, ref);
+      if (entity != null) entityIncarnations.pin(entity.getUuid(), ref);
+    }
+
+    void releasePins() {
+      unpin(targetBinding, targetEntityBinding); unpin(tableBinding, tableEntityBinding);
+      unpin(gazeBinding, gazeEntityBinding); unpin(interactionBinding, interactionEntityBinding);
+    }
+    void unpin(BlockPos block, Entity entity) {
+      if (block != null) blockIncarnations.unpin(block);
+      if (entity != null) entityIncarnations.unpin(entity.getUuid());
     }
 
     boolean targetsCurrent() {
@@ -3390,8 +3570,10 @@ public final class NativeClient implements ClientModInitializer {
         positionRange = navigationCurrentDistanceSquared <= range * range;
       }
       motor = null;
-      if (equipmentSession != null) equipmentSession.cancel(true);
-      Recipes.cancel(true);
+      releasePins();
+      boolean closeOwnedInventory = received.supervision() == null;
+      if (equipmentSession != null) equipmentSession.cancel(closeOwnedInventory);
+      Recipes.cancel(closeOwnedInventory);
       JsonObject inventoryUi = inventorySession == null ? null : inventorySession.diagnostics();
       controls = null;
       looking = false;

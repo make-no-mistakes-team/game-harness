@@ -5,6 +5,7 @@ import { promotionDeclarationSchema } from "./experience.ts";
 import { residentActorLimitsSchema, residentAnalysisInputSchema, residentIntentSchema, residentStateSchema } from "../shared/resident.ts";
 import type { ImprovementFeedbackCursor, VersionComparisonCursor } from "../shared/execution-evidence.ts";
 import { policyWatchSchema } from "./reactive.ts";
+import { controlSessionConfigSchema } from "../shared/control-session.ts";
 
 export const programSelectorSchema = namedProgramRefSchema;
 export const improvementFeedbackCursorSchema = z.object({
@@ -56,6 +57,7 @@ export const programSubmitSchema = z.discriminatedUnion("entry", [
     limits: actorLimitsSchema, next: nextConfigSchema.optional(), handoff: handoffSchema.optional() }).strict(),
   programWriteSchema.extend({ entry: z.literal("step"),
     args: residentIntentSchema.describe("Required JSON initial resident intent; pass null when unused."),
+    session: controlSessionConfigSchema.optional().describe("Life-scoped executive mode: source exports step and activate, returning choice rather than input. Finite semantic children do not end the executive."),
     initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema, next: nextConfigSchema.optional(), handoff: handoffSchema.optional() }).strict(),
 ]);
 const playingStartSchema = z.discriminatedUnion("entry", [
@@ -63,6 +65,7 @@ const playingStartSchema = z.discriminatedUnion("entry", [
     args: jsonSchema, limits: actorLimitsSchema, next: nextConfigSchema.optional(), handoff: handoffSchema.optional() }).strict(),
   programSelectorSchema.extend({ operation: z.literal("start"), entry: z.literal("step"),
     args: residentIntentSchema, initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema,
+    session: controlSessionConfigSchema.optional(),
     next: nextConfigSchema.optional(), handoff: handoffSchema.optional() }).strict(),
 ]);
 export const programRunSchema = z.discriminatedUnion("operation", [
@@ -109,7 +112,8 @@ const preparedBaseSchema = programSelectorSchema.extend({
 export const prepareNextSchema = z.discriminatedUnion("entry", [
   preparedBaseSchema.extend({ entry: z.literal("run").default("run"), limits: actorLimitsSchema }).strict(),
   preparedBaseSchema.extend({ entry: z.literal("step"), args: residentIntentSchema,
-    initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema }).strict(),
+    initial_state: residentStateSchema.default(null), limits: residentActorLimitsSchema,
+    session: controlSessionConfigSchema.optional() }).strict(),
 ]);
 export const helpSchema = z.object({
   topic: z.enum(["overview", "actions", "controller", "game", "programs", "planning", "reflex", "memory"]).default("overview"),

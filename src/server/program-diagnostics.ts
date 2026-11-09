@@ -3,6 +3,8 @@ import type { Json } from "../shared/contracts.ts";
 import type { SkillResult, ProgramOutputFailure } from "../shared/programs.ts";
 import { jsonSchema, skillResultSchema } from "../shared/validation.ts";
 import { controllerStepResultSchema, type ControllerStepResult } from "../shared/resident.ts";
+import { residentDecisionSchema, residentActivationResultSchema, type ResidentDecision, type ResidentActivationResult } from "../shared/resident.ts";
+import type { ZodIssue } from "zod";
 
 /** The same bounded public failure is sent to generated code and retained as evidence. */
 export function capabilityFailure(error: unknown): { code: string; message: string } {
@@ -27,8 +29,10 @@ export class GeneratedResultValidationError extends ProgramExecutionError {
 }
 
 export class GeneratedControllerResultValidationError extends Error {
-  constructor(readonly issues: NonNullable<ProgramDiagnostic["issues"]>) {
-    super(`Generated step return does not match {input,next_state,status,events}. Invalid fields: ${issues.map(issue => `${issue.path || "<root>"} (${issue.code})`).join(", ")}. See help controller/programs for the exact result contract.`.slice(0, 1000));
+  constructor(readonly issues: NonNullable<ProgramDiagnostic["issues"]>, surface = "step") {
+    super(`Generated ${surface} return does not match ${surface === "activation"
+      ? "{choice,next_state,status,events} (legacy input also allowed), or {refused:true,reason}; refused:false is not acceptance"
+      : "{input or choice,next_state,status,events}"}. Invalid fields: ${issues.map(issue => `${issue.path || "<root>"} (${issue.code})`).join(", ")}. See help controller/programs for the exact result contract.`.slice(0, 1000));
     this.name = "GeneratedControllerResultValidationError";
   }
 }
@@ -38,10 +42,21 @@ export class GeneratedControllerResultValidationError extends Error {
 export function parseGeneratedControllerResult(value: unknown): ControllerStepResult {
   const parsed = controllerStepResultSchema.safeParse(value);
   if (parsed.success) return parsed.data;
-  type Issue = (typeof parsed.error.issues)[number];
+  throw new GeneratedControllerResultValidationError(generatedReturnIssues(parsed.error.issues));
+}
+
+export function parseGeneratedResidentResult(value: unknown, activation: true): ResidentActivationResult;
+export function parseGeneratedResidentResult(value: unknown, activation?: false): ResidentDecision;
+export function parseGeneratedResidentResult(value: unknown, activation = false): ResidentActivationResult {
+  const parsed = (activation ? residentActivationResultSchema : residentDecisionSchema).safeParse(value);
+  if (parsed.success) return parsed.data;
+  throw new GeneratedControllerResultValidationError(generatedReturnIssues(parsed.error.issues), activation ? "activation" : "executive");
+}
+
+function generatedReturnIssues(issues: readonly ZodIssue[]): NonNullable<ProgramDiagnostic["issues"]> {
   type Issues = NonNullable<ProgramDiagnostic["issues"]>;
   let visited = 0;
-  const collect = (input: readonly Issue[], prefix: string, depth: number): Issues => {
+  const collect = (input: readonly ZodIssue[], prefix: string, depth: number): Issues => {
     const result: Issues = [];
     for (const issue of input) {
       if (++visited > 128 || result.length >= 16) break;
@@ -60,7 +75,7 @@ export function parseGeneratedControllerResult(value: unknown): ControllerStepRe
     }
     return result;
   };
-  throw new GeneratedControllerResultValidationError(collect(parsed.error.issues, "", 0));
+  return collect(issues, "", 0);
 }
 
 /** Only an actual returned generated value is classified here. Arbitrary host

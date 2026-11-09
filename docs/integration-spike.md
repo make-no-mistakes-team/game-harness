@@ -508,6 +508,17 @@ evaluator probe with an invalid movement duration remain failed attempts.
 These results qualify the exercised mechanisms, not a combat win rate or
 continuous useful model-authored play.
 
+An initial integrated Luna episode remained a failed resource/resumption test.
+Its own generated executive defeated one normal zombie with a wooden sword
+while an admitted strategic request was withheld for 50 seconds. Independent
+vanilla records confirmed the kill and zero deaths; observed health stayed
+full. But it collected no logs: its first policy repeatedly replaced its own
+finite digging tasks, then remained observation-only after the fight. A later
+revision was additionally blocked by the diagnostic worker-frame byte cap.
+The cap was an evaluator defect, not proof that the revised gameplay algorithm
+failed. This episode demonstrates a possible local combat path, not the
+integrated continuity gate, ordinary-world reliability or human-like appearance.
+
 ### Native controller transport conformance — 30 October 2026
 
 Profile v4 and frame schema 2 passed eleven actual Fabric cases with confirmed

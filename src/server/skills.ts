@@ -89,6 +89,7 @@ export interface SkillHost {
     applied: (ack: InputAppliedAck) => void, effect: (event: ControllerEffectUpdate) => void,
     lifecycle: ResidentLifecycle): Promise<ControllerInputChannel>;
   programEvent?(execution: SkillExecutionView, event: import("../shared/resident.ts").ControllerEvent): void;
+  residentProgress?(execution: SkillExecutionView, snapshot: ResidentSnapshot): void;
   residentEffect?(execution: SkillExecutionView, input: ControllerInput, event: ControllerEffectUpdate, adapter: RuntimeAdapter): void;
   sessionTask?(execution: SkillExecutionView, request: ExecutiveTaskRequest, handle: number, deadlineHostMs: number,
     signal: AbortSignal, frame: MinecraftControllerFrame, behaviorGeneration: number): Promise<GameActionResult>;
@@ -819,6 +820,7 @@ export class SkillManager {
           view.resident = snapshot;
           if (!done && !terminal.has(view.status))
             this.save(live, "controller.progress", "Resident aggregate state; processing is not input application");
+          this.host.residentProgress?.(view, snapshot);
           if (done) completed.resolve(snapshot);
         },
         analysis: async (source, input, budget, signal, report) => {

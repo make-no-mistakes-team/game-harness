@@ -51,6 +51,8 @@ import { HistoryProjectionOwner } from "./history-projection-owner.ts";
 import { ExecutionTrace } from "./execution-trace.ts";
 import { ActorFrameSelector, type ModelObservation } from "./actor-frames.ts";
 import { retainResidentReceipt } from "./resident-evidence.ts";
+import { ExecutiveObservationMonitor } from "./executive-incidents.ts";
+import type { ResidentSnapshot } from "../shared/resident.ts";
 
 const TERMINAL: Partial<Record<RunView["status"], true>> = {
   stopped: true,
@@ -115,6 +117,7 @@ export class Runtime {
     root: string; rootSource: string; scope: EffectScope; signature: string;
     count: number; notified: boolean; actionIds: string[];
   } | null = null;
+  private readonly executiveObservation = new ExecutiveObservationMonitor();
 
   private context() {
     const adapter = typeof this.adapterSource === "function" ? this.adapterSource() : this.adapterSource ?? this.game.adapter();
@@ -232,6 +235,36 @@ export class Runtime {
     if (this.repeatedNoEffect === slot && current?.execution_id === root.execution_id &&
       current.source_hash === root.source_hash) this.strategic.wake("program_no_effect");
     else this.repeatedNoEffect = null;
+  }
+
+  private executiveIncidentCurrent(execution: SkillExecutionView): boolean {
+    const run = this.run, state = this.game.snapshot(), scope = this.skills.effectScope(execution.execution_id);
+    return !!run && run.status === "running" && !this.closed && !this.needsReconnect &&
+      !this.lifeRecovery && !this.uncertaintyRecovery && execution.entry === "step" && !!execution.session &&
+      execution.ended_at === null && ["accepted", "running"].includes(execution.status) &&
+      run.run_id === execution.run_id && execution.run_generation === this.generation &&
+      execution.compatibility_hash === run.compatibility_hash && state.status === "connected" && state.error === null &&
+      state.binding?.ready === true && state.binding.compatibility_hash === run.compatibility_hash &&
+      state.world_id === run.world_id && state.session_id === run.session_id && state.epoch === run.epoch &&
+      state.binding.native_boot_id === run.native_boot_id && state.life?.status === "alive" &&
+      state.life.life_id === run.life_id && state.space?.space_epoch === run.space_epoch &&
+      !!scope && scope.source_hash === execution.source_hash && scope.run_generation === this.generation &&
+      scope.life_id === run.life_id && scope.space_epoch === run.space_epoch &&
+      this.store.latestRootExecution(run.run_id)?.execution_id === execution.execution_id;
+  }
+
+  private recordExecutiveObservation(execution: SkillExecutionView, snapshot: ResidentSnapshot): void {
+    if (!this.executiveIncidentCurrent(execution)) { this.executiveObservation.clear(); return; }
+    const incident = this.executiveObservation.update(execution.execution_id, snapshot, performance.now());
+    if (!incident) return;
+    this.store.event(execution.run_id, "program.repeated_no_effect",
+      "Advisory: executive decisions only observed without selecting a producer for at least five seconds; observation may be intentional", {
+        source: "runtime_mechanical", usefulness_inferred: false, ...incident,
+        execution_id: execution.execution_id, source_hash: execution.source_hash,
+        root_execution_id: execution.execution_id, root_source_hash: execution.source_hash,
+      });
+    // Synchronous subscribers may have stopped or replaced the owner.
+    if (this.executiveIncidentCurrent(execution)) this.strategic.wake("program_no_effect");
   }
 
   constructor(
@@ -391,6 +424,7 @@ export class Runtime {
       programEvent: (_execution, event) => {
         if (event.kind === "attention") this.strategic.wake("resident_attention");
       },
+      residentProgress: (execution, snapshot) => this.recordExecutiveObservation(execution, snapshot),
       residentEffect: (execution, input, event, adapter) => {
         // Retirement may arrive after run/life authority was fenced. Retain the
         // original owner's real prefix and unknown suffix without a new grant.
@@ -1306,6 +1340,7 @@ export class Runtime {
 
   private fenceAuthority(message: string, uncertainExecutionId?: string): void {
     this.repeatedNoEffect = null;
+    this.executiveObservation.clear();
     this.generation++;
     for (const recheck of this.imageAuthorityWaits) recheck();
     this.planning.invalidate(message.includes("life") ? "life_changed" : "cancelled");

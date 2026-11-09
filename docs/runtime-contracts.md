@@ -201,6 +201,14 @@ session. A child is not a saved async stack: resumption requires a fresh keyed
 invocation chosen from current observations. Source replacement, local recovery
 and child starts do not renew the original session deadline.
 
+Five seconds of fresh consecutive executive decisions that only observe, with
+no selected producer, new task or raw submission, emit one mechanical advisory
+per continuous interval. A changed intent, owner, command or sampling gap resets
+the interval. The advisory requests an ordinary strategic decision while leaving
+the executive running; it does not abort an admitted provider request, select
+input or infer that observation is useless. Missing progress and stationary
+productive work are not classified as inactivity.
+
 Sampling pins the exact producer and transition phase before awaiting a frame.
 If opening or retirement completes during an independent read, that frame is
 discarded before authored computation. The next decision uses a capture retained

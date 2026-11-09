@@ -193,7 +193,8 @@ function feedbackEntry(event: ActivityEvent, workspace: ProgramWorkspace): Json 
     }
   }
   if (event.type === "program.repeated_no_effect") {
-    for (const key of ["source", "usefulness_inferred", "count", "world_effect_emitted", "neutralized"]) {
+    for (const key of ["source", "usefulness_inferred", "count", "world_effect_emitted", "neutralized",
+      "elapsed_host_ms", "no_input_decisions", "processed_frame_seq", "intent_version"]) {
       const value = details?.[key];
       if (typeof value === "string") selected[key] = value.slice(0, 160);
       else if (typeof value === "number" || typeof value === "boolean") selected[key] = value;

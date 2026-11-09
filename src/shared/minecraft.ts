@@ -223,7 +223,8 @@ export const minecraftCrosshairSchema = z.discriminatedUnion("kind", [
     block_position: z.object({ x: z.number().int().min(-2147483648).max(2147483647),
       y: z.number().int().min(-2147483648).max(2147483647), z: z.number().int().min(-2147483648).max(2147483647) }).strict(),
     face: z.enum(["up", "down", "north", "south", "east", "west"]), target: targetRefSchema.nullable() }).strict(),
-  z.object({ kind: z.literal("entity"), hit_position: frameVector, target: targetRefSchema.nullable() }).strict(),
+  z.object({ kind: z.literal("entity"), hit_position: frameVector, target: targetRefSchema }).strict()
+    .describe("Only an admitted same-render entity. Denied entity hits are whole misses, without a presence kind, coordinates or token."),
 ]);
 export const minecraftRenderCaptureSchema = z.object({
   capture_sequence: z.number().int().min(0).max(4294967295), client_tick: safeCounterSchema, render_invocation: safeCounterSchema,
@@ -234,7 +235,7 @@ export const minecraftRenderCaptureSchema = z.object({
 export const minecraftControllerFrameSchema = z.object({
   schema_version: z.literal(3), frame_seq: safeCounterSchema.min(1), native_tick: safeCounterSchema,
   captured_native_ns: nativeNanoseconds, captured_at: frameTimestamp,
-  profile_id: z.literal("minecraft_assisted_rgb_360_r8_control_v6"), profile_version: z.literal(6),
+  profile_id: z.literal("minecraft_assisted_rgb_fov_r8_control_v7"), profile_version: z.literal(7),
   life_id: safeCounterSchema, space: spaceRefSchema, player: minecraftOwnBodySchema,
   inventory: z.object({ source: z.literal("client_prediction"), captured_native_ns: nativeNanoseconds,
     items: z.array(minecraftInventoryItemSchema).max(64) }).strict()
@@ -247,13 +248,14 @@ export const minecraftControllerFrameSchema = z.object({
     captured_at: frameTimestamp, captured_native_ns: nativeNanoseconds, stale: z.boolean(),
     blocks: z.array(minecraftObservedBlockSchema).max(144), entities: z.array(minecraftObservedEntitySchema).max(0),
   }).strict().nullable().describe("Authorized r8 terrain cache with original acquisition sequence/time; 500ms controller cadence, explicit observe refresh, stale after 1000ms. Entities are exclusively in dynamic_entities."),
-  dynamic_entities: z.object({ source: z.literal("current_authorized_tick"), native_tick: safeCounterSchema,
+  dynamic_entities: z.object({ source: z.literal("rendered_camera_capture"), native_tick: safeCounterSchema,
     captured_at: frameTimestamp, captured_native_ns: nativeNanoseconds, partial: z.literal(true),
+    render_invocation: safeCounterSchema.nullable(), capture_sequence: z.number().int().min(0).max(4294967295).nullable(),
     entities: z.array(minecraftObservedEntitySchema.safeExtend({
       bounds: z.object({ min: frameVector, max: frameVector }).strict(),
       aim_position: frameVector,
     })).max(32),
-  }).strict().describe("Current conservative optical r8 entities/projectiles, at most 128 candidates and 32 rows per native tick; no denied-candidate counts. Active mechanical custody does not suppress sensing."),
+  }).strict().describe("Conservative optical r8 entity witnesses from the actual entity renderer and same completed GHV2 framebuffer; actual camera view/projection clip admission, at most 128 render candidates and 32 rows. Original render time and interpolated pose, never later live motion. Uncaptured renders neither replace nor refresh the last completed image's evidence. Fail closed on missing/replaced completed capture, wrong life/space, or age over 250ms; null capture identity means unavailable and requires no entities. Terrain remains independently assisted."),
   mechanics: z.array(z.object({ event_seq: safeCounterSchema.min(1), controller_generation: safeCounterSchema,
     sequence: safeCounterSchema.min(1), edge_ordinal: safeCounterSchema.min(1),
     stage: z.enum(["key_consumed", "attack_callback"]), native_tick: safeCounterSchema,
@@ -278,9 +280,25 @@ export const minecraftControllerFrameSchema = z.object({
         context.addIssue({ code: "custom", path: ["visible_world"],
           message: "World acquisition cannot follow this capture or label geometry older than 1000ms as fresh" });
     }
-    if (frame.dynamic_entities.native_tick !== frame.native_tick ||
+    if (frame.dynamic_entities.native_tick > frame.native_tick ||
       BigInt(frame.dynamic_entities.captured_native_ns) > BigInt(frame.captured_native_ns))
-      context.addIssue({ code: "custom", path: ["dynamic_entities"], message: "Dynamic sensing must belong to this native tick and precede body capture" });
+      context.addIssue({ code: "custom", path: ["dynamic_entities"], message: "Entity render time/tick cannot follow body capture" });
+    const dynamic = frame.dynamic_entities, render = frame.view.render_capture;
+    const witnessed = dynamic.render_invocation !== null && dynamic.capture_sequence !== null;
+    if ((dynamic.render_invocation === null) !== (dynamic.capture_sequence === null) ||
+      (!witnessed && dynamic.entities.length > 0) ||
+      (witnessed && (!render || dynamic.render_invocation !== render.render_invocation ||
+        dynamic.capture_sequence !== render.capture_sequence || dynamic.native_tick !== render.client_tick ||
+        dynamic.captured_native_ns !== render.sampled_native_ns ||
+        BigInt(frame.captured_native_ns) - BigInt(dynamic.captured_native_ns) > 250_000_000n)) ||
+      dynamic.entities.some(entity => !entity.current || entity.observed_at !== dynamic.captured_at))
+      context.addIssue({ code: "custom", path: ["dynamic_entities"], message: "Entities require fresh same-capture render witnesses with original times" });
+    const entityCrosshair = frame.view.crosshair.kind === "entity" ? frame.view.crosshair : null;
+    const crosshairTarget = entityCrosshair?.target;
+    if (entityCrosshair && (!witnessed || !crosshairTarget ||
+      !dynamic.entities.some(entity => entity.target.target_id === crosshairTarget.target_id &&
+        entity.target.incarnation === crosshairTarget.incarnation)))
+      context.addIssue({ code: "custom", path: ["view", "crosshair"], message: "Entity crosshair requires an admitted same-render entity, not a hidden presence marker" });
     if (frame.mechanics.some(event => event.native_tick > frame.native_tick ||
       BigInt(event.recorded_native_ns) > BigInt(frame.captured_native_ns)))
       context.addIssue({ code: "custom", path: ["mechanics"], message: "Mechanical facts cannot follow their containing frame" });
@@ -309,9 +327,11 @@ export const minecraftControllerFrameRequestSchema = z.object({ audio_cursor: so
 /** These values are compiled into the native resource and are the sampler's actual settings. */
 export const minecraftProfileConfigurationSchema = z.object({
   sampler: z.object({ radius_blocks: z.literal(8), max_blocks: z.literal(144), max_entities: z.literal(32),
-    max_age_ms: z.literal(1000), camera_independent: z.literal(true), occlusion_test: z.literal("native_raycast"),
-    dynamic_interval_ticks: z.literal(1), dynamic_candidate_limit: z.literal(128),
-    entity_optical_gate: z.literal("air_water_bubble_only"), terrain_interval_ms: z.literal(500) }).strict(),
+    max_age_ms: z.literal(1000), terrain_camera_independent: z.literal(true), occlusion_test: z.literal("native_raycast"),
+    dynamic_candidate_limit: z.literal(128), entity_camera: z.literal("actual_render_view_projection"),
+    entity_witness: z.literal("entity_renderer_same_completed_framebuffer"), entity_max_age_ms: z.literal(250),
+    entity_pose: z.literal("original_render_interpolated"), entity_optical_gate: z.literal("air_water_bubble_only"),
+    terrain_interval_ms: z.literal(500) }).strict(),
   actor_image: z.object({ codec: z.literal("png"), presentation: z.literal("opaque_rgb"), alignment: z.literal("unsynchronized") }).strict(),
   motor_profile: z.enum(["precise", "balanced", "fast"]),
   assistance: z.object({ semantic_helpers: z.literal(true) }).strict(),
@@ -333,8 +353,10 @@ export const minecraftProfileConfigurationSchema = z.object({
 export function minecraftProfileConfiguration(motorProfile: "precise" | "balanced" | "fast" = "balanced") {
   return minecraftProfileConfigurationSchema.parse({
     sampler: { radius_blocks: 8, max_blocks: 144, max_entities: 32, max_age_ms: 1000,
-      camera_independent: true, occlusion_test: "native_raycast", dynamic_interval_ticks: 1,
-      dynamic_candidate_limit: 128, entity_optical_gate: "air_water_bubble_only", terrain_interval_ms: 500 },
+      terrain_camera_independent: true, occlusion_test: "native_raycast", dynamic_candidate_limit: 128,
+      entity_camera: "actual_render_view_projection", entity_witness: "entity_renderer_same_completed_framebuffer",
+      entity_max_age_ms: 250, entity_pose: "original_render_interpolated",
+      entity_optical_gate: "air_water_bubble_only", terrain_interval_ms: 500 },
     actor_image: { codec: "png", presentation: "opaque_rgb", alignment: "unsynchronized" },
     motor_profile: motorProfile, assistance: { semantic_helpers: true },
     visible_gui: { projection: "current_visible_layout", max_slots: 128, max_elements: 64, max_progress: 32, coordinates: "logical_gui" },

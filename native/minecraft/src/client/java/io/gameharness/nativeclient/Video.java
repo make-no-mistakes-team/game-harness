@@ -84,24 +84,24 @@ public final class Video {
     }
   }
 
-  public void capture(NativeRenderSnapshot snapshot, long clientTick, long lifeId, long spaceEpoch,
+  public boolean capture(NativeRenderSnapshot snapshot, long clientTick, long lifeId, long spaceEpoch,
       long generation, EffectAuthority.Screen tailScreen) {
     long now = System.nanoTime();
-    if (!running) return;
+    if (!running) return false;
     MinecraftClient client = MinecraftClient.getInstance();
-    if (client.world == null || client.player == null) return;
+    if (client.world == null || client.player == null) return false;
     if (renderStarted == 0) renderStarted = now;
     renderCalls++;
-    if (now < nextCapture) return;
+    if (now < nextCapture) return false;
     nextCapture =
         nextCapture == 0 || now - nextCapture > 33333333L
             ? now + 33333333L
             : nextCapture + 33333333L;
     Framebuffer f = client.getFramebuffer();
     int w = f.textureWidth, h = f.textureHeight;
-    if (w < 1 || h < 1 || w > 1920 || h > 1080) return;
+    if (w < 1 || h < 1 || w > 1920 || h > 1080) return false;
     int index = queue.acquire();
-    if (index < 0) return;
+    if (index < 0) return false;
     ByteBuffer frame = buffers[index];
     frame.clear();
     frame.limit(NativeRenderSnapshot.HEADER_BYTES + w * h * 4);
@@ -138,5 +138,6 @@ public final class Video {
     captured++;
     frame.position(0);
     queue.publish(index);
+    return true;
   }
 }

@@ -48,7 +48,7 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
   const schemas = minecraftSchemaCatalog();
   const compatibility = adapterCompatibility(descriptor, schemas);
   descriptor = compatibility.descriptor;
-  if (descriptor.observation.profile.id !== "minecraft_assisted_rgb_360_r8_control_v6" || descriptor.observation.profile.version !== 6)
+  if (descriptor.observation.profile.id !== "minecraft_assisted_rgb_fov_r8_control_v7" || descriptor.observation.profile.version !== 7)
     throw new Error("Minecraft adapter requires its registered control-feedback profile");
   const configuration = minecraftProfileConfigurationSchema.parse(descriptor.observation.profile.configuration);
   const now = options.now ?? Date.now;
@@ -143,7 +143,8 @@ export function createMinecraftAdapter(descriptor: AdapterDescriptor, options: {
       return { state: current.data, summary: "Authorized own-player state and assisted nearby observations",
         metadata: { adapter_id: adapterId, profile_id: descriptor.observation.profile.id,
           position_units: "world_blocks", yaw_units: "absolute_world_radians", pitch_units: "absolute_radians_positive_up",
-          actor_image_alignment: "unsynchronized", world_sampler: "camera_independent_raycast_radius_8",
+          actor_image_alignment: "unsynchronized", terrain_sampler: "camera_independent_raycast_radius_8",
+          entity_sampler: "actual_render_camera_same_framebuffer_optical_radius_8",
           inventory_counts: counts, inventory_change: changes } };
     },
     captureBaseline(selected, value) {

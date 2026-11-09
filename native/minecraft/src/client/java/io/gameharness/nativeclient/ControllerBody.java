@@ -44,7 +44,7 @@ public final class ControllerBody {
 
   /** Call on the client thread; an unavailable/unsupported sample fails rather than inventing state. */
   public JsonObject capture(long tick, long now, Function<BlockPos, JsonElement> blockReference,
-      Function<Entity, JsonElement> entityReference) {
+      Function<Entity, JsonElement> entityReference, Function<Entity, Vec3d> entityPosition) {
     ContractIdentity.checked(tick);
     Objects.requireNonNull(blockReference);
     Objects.requireNonNull(entityReference);
@@ -90,7 +90,7 @@ public final class ControllerBody {
     view.add("applied_pose", pose);
     // Both vanilla crosshair and hotbar HUD indicators sample this exact zero-delta value.
     view.addProperty("attack_indicator", finite(player.getAttackCooldownProgress(0)));
-    view.add("crosshair", crosshair(blockReference, entityReference));
+    view.add("crosshair", crosshair(blockReference, entityReference, entityPosition));
     view.add("render_capture", render.actorCapture(currentLife, currentSpace.epoch(), now));
     if (client.player != player || client.world != player.getWorld() || lifeId.getAsLong() != currentLife
         || !currentSpace.equals(space.get()))
@@ -170,7 +170,7 @@ public final class ControllerBody {
   }
 
   private JsonObject crosshair(Function<BlockPos, JsonElement> blockReference,
-      Function<Entity, JsonElement> entityReference) {
+      Function<Entity, JsonElement> entityReference, Function<Entity, Vec3d> entityPosition) {
     HitResult hit = client.crosshairTarget;
     if (hit == null) throw new IllegalStateException("Vanilla crosshair is unavailable");
     JsonObject result = new JsonObject();
@@ -187,9 +187,14 @@ public final class ControllerBody {
       result.addProperty("face", block.getSide().asString());
       result.add("target", blockReference.apply(pos));
     } else if (hit.getType() == HitResult.Type.ENTITY && hit instanceof EntityHitResult entity) {
-      result.addProperty("kind", "entity");
-      result.add("hit_position", vector(entity.getPos()));
-      result.add("target", entityReference.apply(entity.getEntity()));
+      JsonElement target = entityReference.apply(entity.getEntity());
+      Vec3d position = target.isJsonNull() ? null : entityPosition.apply(entity.getEntity());
+      if (position == null) result.addProperty("kind", "miss");
+      else {
+        result.addProperty("kind", "entity");
+        result.add("hit_position", vector(position));
+        result.add("target", target);
+      }
     } else {
       throw new IllegalStateException("Unsupported vanilla crosshair state");
     }

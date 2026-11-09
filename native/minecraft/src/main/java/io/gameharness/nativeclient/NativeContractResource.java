@@ -20,7 +20,7 @@ public final class NativeContractResource {
   public static final int MAX_AGE_MS = counter(CONFIGURATION.getAsJsonObject("sampler"), "max_age_ms", 1000);
   public static final int RADIUS_SQUARED = RADIUS * RADIUS;
   public static final int DYNAMIC_CANDIDATES = counter(CONFIGURATION.getAsJsonObject("sampler"), "dynamic_candidate_limit", 128);
-  public static final int DYNAMIC_INTERVAL_TICKS = counter(CONFIGURATION.getAsJsonObject("sampler"), "dynamic_interval_ticks", 1);
+  public static final int ENTITY_MAX_AGE_MS = counter(CONFIGURATION.getAsJsonObject("sampler"), "entity_max_age_ms", 250);
 
   private NativeContractResource() {}
 

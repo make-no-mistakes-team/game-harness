@@ -9,7 +9,7 @@ export function controllerFrameFixture(lifeId = 3, spaceEpoch = 4) {
   const page = { stream_id: stream, after_sequence: 9, next_cursor: { stream_id: stream, sequence: 11 },
     gap: true, omitted_before: 1, has_more: false, events: [event] };
   return { schema_version: 3, frame_seq: 7, native_tick: 125, captured_native_ns: "-9007199254740993", captured_at: at,
-    profile_id: "minecraft_assisted_rgb_360_r8_control_v6", profile_version: 6, life_id: lifeId, space,
+    profile_id: "minecraft_assisted_rgb_fov_r8_control_v7", profile_version: 7, life_id: lifeId, space,
     player: { position, velocity_blocks_per_tick: { x: 0.1, y: -0.3, z: 0 }, health: 18, food: 16,
       on_ground: false, in_water: true, submerged_in_water: true, in_lava: false, air_ticks: -12, max_air_ticks: 300,
       sprinting: false, sneaking: false, swimming: true, gliding: false, vehicle_type: null, selected_hotbar: 2,
@@ -28,8 +28,8 @@ export function controllerFrameFixture(lifeId = 3, spaceEpoch = 4) {
     visible_world: { source: "last_authorized_observation", observation_seq: 20, captured_at: "2026-10-29T11:59:58.000Z",
       captured_native_ns: "-9007199256740993", stale: true,
       blocks: [{ target, name: "stone", position, observed_at: "2026-10-29T11:59:58.000Z", current: true }], entities: [] },
-    dynamic_entities: { source: "current_authorized_tick", native_tick: 125, captured_native_ns: "-9007199254740993",
-      captured_at: at, partial: true, entities: [] },
+    dynamic_entities: { source: "rendered_camera_capture", native_tick: 125, captured_native_ns: "-9007199254740993",
+      captured_at: at, partial: true, render_invocation: null as number | null, capture_sequence: null as number | null, entities: [] },
     mechanics: [], mechanics_omitted: 0,
     audible: page, last_input: null, effect_updates: [], effect_updates_omitted: 0 };
 }

@@ -26,10 +26,15 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
   const read = async (cursor: SoundCursor | null = null) => minecraftControllerFrameSchema.parse(
     await fixture.bridge.queryCapability("minecraft.controller_frame", 2, { audio_cursor: cursor }));
   const worldProvenance = (frame: MinecraftControllerFrame, prior?: MinecraftControllerFrame) => {
-    requireProof(frame.dynamic_entities.native_tick === frame.native_tick &&
+    const render = frame.view.render_capture;
+    requireProof(frame.dynamic_entities.native_tick <= frame.native_tick &&
       BigInt(frame.dynamic_entities.captured_native_ns) <= BigInt(frame.captured_native_ns) &&
-      frame.dynamic_entities.entities.length <= 32 && frame.dynamic_entities.partial,
-    "Dynamic sensing lost coherent tick, original time or bounded partial coverage");
+      frame.dynamic_entities.entities.length <= 32 && frame.dynamic_entities.partial &&
+      (frame.dynamic_entities.entities.length === 0 || (render !== null && frame.dynamic_entities.capture_sequence !== null &&
+        frame.dynamic_entities.render_invocation === render.render_invocation &&
+        frame.dynamic_entities.capture_sequence === render.capture_sequence &&
+        frame.dynamic_entities.captured_native_ns === render.sampled_native_ns)),
+    "Dynamic sensing lost its same-render capture, original time or bounded partial coverage");
     const world = frame.visible_world, previous = prior?.visible_world;
     if (!world) return;
     const age = BigInt(frame.captured_native_ns) - BigInt(world.captured_native_ns);
@@ -187,9 +192,9 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
         freshness.push(await read()); await pause(50);
       }
       requireProof(new Set(freshness.map(frame => frame.dynamic_entities.native_tick)).size >= 6 &&
-        freshness.every(frame => frame.dynamic_entities.native_tick === frame.native_tick &&
-          BigInt(frame.captured_native_ns) - BigInt(frame.dynamic_entities.captured_native_ns) < 150_000_000n),
-      "Dynamic geometry retained the former 500ms acquisition cadence");
+        freshness.every(frame => frame.dynamic_entities.native_tick <= frame.native_tick &&
+          BigInt(frame.captured_native_ns) - BigInt(frame.dynamic_entities.captured_native_ns) <= 250_000_000n),
+      "Dynamic geometry lost bounded original render age or retained the former 500ms acquisition cadence");
       entry.dynamic_freshness = freshness;
       await fixture.console(["fill -1 240 2 4 244 2 minecraft:stone"]);
       entry.occluded = await until(read, frame => !frame.dynamic_entities.entities.some(entity =>

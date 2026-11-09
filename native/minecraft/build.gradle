@@ -64,7 +64,14 @@ tasks.register('nativeCraftProof', JavaExec) {
     classpath = sourceSets.test.runtimeClasspath
     mainClass = 'io.gameharness.nativeclient.CraftSequenceProof'
 }
+tasks.register('nativeCameraEntityProof', JavaExec) {
+    group = 'verification'
+    description = 'Runs pure rendered-camera entity admission and unchanged audible-channel proofs.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'io.gameharness.nativeclient.CameraEntityAdmissionProof'
+}
 tasks.named('check') {
     dependsOn tasks.named('nativeBoundaryProof'), tasks.named('nativeMotorProof'),
-        tasks.named('nativeContractProof'), tasks.named('nativeCraftProof')
+        tasks.named('nativeContractProof'), tasks.named('nativeCraftProof'), tasks.named('nativeCameraEntityProof')
 }

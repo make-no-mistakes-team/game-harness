@@ -43,22 +43,40 @@ test("world acquisition cannot come from the future or relabel expired geometry 
   expect(minecraftControllerFrameSchema.safeParse(worldAt(-1n, true)).success).toBe(false);
 });
 
-test("dynamic entities have their own current tick, scope and geometry without retiming terrain", () => {
+test("dynamic entities retain actual render identity, original time and pose without retiming terrain", () => {
   const f = frame();
   const entity = { target, name: "husk", position, observed_at: at, current: true,
     bounds: { min: position, max: { ...position, y: position.y + 2 } }, aim_position: position };
-  const dynamic = { ...f.dynamic_entities, entities: [entity] };
+  const render = f.view.render_capture;
+  const dynamic = { ...f.dynamic_entities, native_tick: render.client_tick,
+    captured_native_ns: render.sampled_native_ns, render_invocation: render.render_invocation,
+    capture_sequence: render.capture_sequence, entities: [entity] };
   const parsed = minecraftControllerFrameSchema.parse({ ...f, dynamic_entities: dynamic });
   expect(parsed.visible_world?.captured_at).toBe(f.visible_world.captured_at);
   expect(parsed.dynamic_entities.entities[0]!.name).toBe("husk");
   for (const invalid of [
-    { ...dynamic, native_tick: f.native_tick - 1 },
+    { ...dynamic, native_tick: f.native_tick + 1 },
     { ...dynamic, captured_native_ns: String(BigInt(f.captured_native_ns) + 1n) },
+    { ...dynamic, captured_native_ns: f.captured_native_ns },
+    { ...dynamic, render_invocation: render.render_invocation + 1 },
+    { ...dynamic, capture_sequence: render.capture_sequence + 1 },
+    { ...dynamic, render_invocation: null, capture_sequence: null },
+    { ...dynamic, entities: [{ ...entity, observed_at: "2026-10-29T12:00:00.001Z" }] },
+    { ...dynamic, entities: [{ ...entity, current: false }] },
     { ...dynamic, entities: [{ ...entity, target: { ...target, life_id: 99 } }] },
     { ...dynamic, entities: [{ ...entity, health: 20 }] },
     { ...dynamic, rejected_count: 100 },
     { ...dynamic, entities: Array.from({ length: 33 }, () => entity) },
   ]) expect(minecraftControllerFrameSchema.safeParse({ ...f, dynamic_entities: invalid }).success).toBe(false);
+  expect(minecraftControllerFrameSchema.safeParse({ ...f, captured_native_ns: String(BigInt(render.sampled_native_ns) + 250_000_001n),
+    dynamic_entities: dynamic }).success).toBe(false);
+  expect(minecraftControllerFrameSchema.safeParse({ ...f, dynamic_entities: dynamic,
+    view: { ...f.view, render_capture: null } }).success).toBe(false);
+  const crosshair = { kind: "entity", hit_position: position, target };
+  expect(minecraftControllerFrameSchema.safeParse({ ...f, dynamic_entities: dynamic,
+    view: { ...f.view, crosshair } }).success).toBe(true);
+  expect(minecraftControllerFrameSchema.safeParse({ ...f, view: { ...f.view, crosshair } }).success).toBe(false);
+  expect(minecraftControllerFrameSchema.safeParse({ ...f, view: { ...f.view, crosshair: { ...crosshair, target: null } } }).success).toBe(false);
 });
 
 test("mechanical attack evidence distinguishes consumed keys from callbacks and damage", () => {
@@ -206,7 +224,7 @@ test("crosshair references and last-world samples cannot cross the frame life or
     expect(minecraftControllerFrameSchema.safeParse({ ...f, visible_world: { ...f.visible_world,
       blocks: [{ ...f.visible_world.blocks[0], target: foreign }] } }).success).toBe(false);
   }
-  for (const crosshair of [{ kind: "miss" }, { kind: "entity", hit_position: position, target: null },
+  for (const crosshair of [{ kind: "miss" },
     { ...f.view.crosshair, target: null }])
     expect(minecraftControllerFrameSchema.safeParse({ ...f, visible_world: null, view: { ...f.view, render_capture: null, crosshair } }).success).toBe(true);
 });
@@ -258,6 +276,7 @@ test("feedback profile negotiation rejects old identities and omitted or inflate
   const adapter = minecraftTestAdapter(), descriptor = adapter.descriptor;
   for (const profile of [{ ...descriptor.observation.profile, id: "minecraft_assisted_rgb_360_r8_gui_v2", version: 2 },
     { ...descriptor.observation.profile, id: "minecraft_assisted_rgb_360_r8_control_v4", version: 4 },
+    { ...descriptor.observation.profile, id: "minecraft_assisted_rgb_360_r8_control_v6", version: 6 },
     { ...descriptor.observation.profile, version: 2 }])
     expect(() => createMinecraftAdapter({ ...descriptor, observation: { ...descriptor.observation, profile } })).toThrow();
   expect(minecraftControllerFrameSchema.safeParse({ ...frame(),
@@ -265,6 +284,9 @@ test("feedback profile negotiation rejects old identities and omitted or inflate
   const configuration = descriptor.observation.profile.configuration;
   if (!configuration || typeof configuration !== "object" || Array.isArray(configuration)) throw new Error("Expected profile object");
   for (const invalid of [{ ...configuration, controller_feedback: undefined },
+    { ...configuration, sampler: { ...(configuration.sampler as Record<string, unknown>), entity_camera: undefined } },
+    { ...configuration, sampler: { ...(configuration.sampler as Record<string, unknown>), entity_max_age_ms: 1000 } },
+    { ...configuration, sampler: { ...(configuration.sampler as Record<string, unknown>), camera_independent: true } },
     { ...configuration, controller_feedback: { inventory: "server_confirmed" } },
     { ...configuration, audible: { source: "all_sound_sources" } },
     { ...configuration, actor_image: { codec: "png", presentation: "opaque_rgb", alignment: "atomic" } }])

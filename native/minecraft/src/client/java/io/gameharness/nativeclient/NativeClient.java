@@ -78,6 +78,9 @@ public final class NativeClient implements ClientModInitializer {
   private final ScreenIncarnations screenIncarnations = new ScreenIncarnations();
   private final NativeReplyTiming replyTiming = new NativeReplyTiming();
   private final NativeRenderSnapshot renderSnapshot = new NativeRenderSnapshot();
+  private final RenderedEntityAdmission<Entity, JsonObject> renderedEntities =
+      new RenderedEntityAdmission<>(NativeContractResource.MAX_ENTITIES);
+  private final float[] entityModelView = new float[16];
   private volatile long clientTick;
   private Motor keyboardSamplingOwner;
   private NativeInputs ordinaryInput, lastOrdinaryInput, ordinarySamplingOwner;
@@ -116,13 +119,6 @@ public final class NativeClient implements ClientModInitializer {
       new java.util.concurrent.atomic.AtomicReference<>();
   private long controllerFrameSequence;
   private final ControllerWorldRefresh controllerWorld = new ControllerWorldRefresh(this::acquirePermittedWorld);
-  private JsonObject dynamicEntities;
-  private long dynamicTick = -1, dynamicLife = -1;
-  private EffectAuthority.Space dynamicSpace;
-  private final ArrayList<Entity> dynamicCandidates = new ArrayList<>(NativeContractResource.DYNAMIC_CANDIDATES);
-  private static final net.minecraft.util.TypeFilter<Entity, Entity> DYNAMIC_TYPE =
-      net.minecraft.util.TypeFilter.instanceOf(Entity.class);
-  private static final java.util.function.Predicate<Entity> DYNAMIC_CANDIDATE = entity -> true;
   private final Function<BlockPos, JsonElement> controllerBlockReference = this::controllerBlockReference;
   private final Function<Entity, JsonElement> controllerEntityReference = this::controllerEntityReference;
 
@@ -133,6 +129,7 @@ public final class NativeClient implements ClientModInitializer {
 
   private void fenceAuthority() {
     renderSnapshot.invalidate();
+    renderedEntities.invalidate();
     if (evaluationGate != null) evaluationGate.cancel(effectAuthority.owner());
     effectAuthority.emergencyStop();
     StreamOwner stream = streamOwner;
@@ -174,7 +171,6 @@ public final class NativeClient implements ClientModInitializer {
     if (client.player != null && (syncId <= 0 || syncId == client.player.currentScreenHandler.syncId)) screenTransactionReceived();
   }
   public void entityReplaced(Entity entity) {
-    dynamicEntities = null;
     if (incarnationSignals != null) incarnationSignals.entityReplaced(entity);
   }
 
@@ -334,13 +330,58 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private boolean authorizedEntity(Entity e) {
-    return e != null
-        && e.getWorld() == client.world
-        && !e.isRemoved()
-        && !e.isInvisibleTo(client.player)
-        && client.player.canSee(e)
-        && e.squaredDistanceTo(client.player) <= NativeContractResource.RADIUS_SQUARED
-        && opticalLine(e.getBoundingBox().getCenter());
+    return entityWitness(e) != null;
+  }
+
+  private JsonObject entityWitness(Entity e) {
+    return e == null ? null : renderedEntities.get(e, renderSnapshot.captureInvocation(), lifecycle.lifeId(),
+        incarnationSignals.space(), System.nanoTime());
+  }
+
+  private Vec3d entityPosition(Entity e, String field) {
+    JsonObject witness = entityWitness(e);
+    if (witness == null) return null;
+    JsonObject p = witness.getAsJsonObject(field);
+    return new Vec3d(p.get("x").getAsDouble(), p.get("y").getAsDouble(), p.get("z").getAsDouble());
+  }
+
+  private double entityDistance(Entity e) {
+    Vec3d p = entityPosition(e, "position");
+    return p == null ? Double.POSITIVE_INFINITY : p.distanceTo(client.player.getPos());
+  }
+
+  /** Called only by the actual dispatcher after rendering an entity in this world invocation.
+   * Keep the rendered (interpolated) pose, never later world motion under an older image. */
+  public void entityRendered(Entity e, double relativeX, double relativeY, double relativeZ,
+      net.minecraft.client.util.math.MatrixStack matrices) {
+    var space = incarnationSignals.space();
+    if (space == null || !lifecycle.ready() || !renderSnapshot.currentWorld(lifecycle.lifeId(), space.epoch())
+        || !renderedEntities.candidate() || client.currentScreen != null || e == client.player || e.getWorld() != client.world
+        || e.isRemoved() || e.isInvisibleTo(client.player) || !client.player.canSee(e)
+        || e.squaredDistanceTo(client.player) > NativeContractResource.RADIUS_SQUARED) return;
+    double x = renderSnapshot.cameraX() + relativeX;
+    double y = renderSnapshot.cameraY() + relativeY;
+    double z = renderSnapshot.cameraZ() + relativeZ;
+    var box = e.getBoundingBox().offset(x - e.getX(), y - e.getY(), z - e.getZ());
+    Vec3d center = box.getCenter();
+    // Dispatcher placement includes the renderer offset, but its MatrixStack starts at
+    // identity: the camera rotation is a separate world-render matrix in vanilla 1.21.4.
+    matrices.peek().getPositionMatrix().get(entityModelView);
+    if (!RenderedEntityAdmission.inViewport(renderSnapshot.positionMatrix, entityModelView, renderSnapshot.projectionMatrix,
+        center.x - x, center.y - y, center.z - z)
+        || !opticalLine(center)
+        || !visibility.clear(renderSnapshot.cameraX(), renderSnapshot.cameraY(), renderSnapshot.cameraZ(),
+            center.x, center.y, center.z, Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE, opticalCells)) return;
+    JsonObject row = new JsonObject(), bounds = new JsonObject();
+    row.addProperty("name", Registries.ENTITY_TYPE.getId(e.getType()).getPath());
+    row.add("position", position(x, y, z));
+    bounds.add("min", position(box.minX, box.minY, box.minZ));
+    bounds.add("max", position(box.maxX, box.maxY, box.maxZ));
+    row.add("bounds", bounds); row.add("aim_position", position(center));
+    row.addProperty("observed_at", renderedEntities.collectingWallTime()); row.addProperty("current", true);
+    if (e instanceof ItemEntity dropped && !dropped.getStack().isEmpty())
+      row.addProperty("item_name", Registries.ITEM.getId(dropped.getStack().getItem()).getPath());
+    renderedEntities.rendered(e, row);
   }
 
   private boolean opticalLine(Vec3d end) {
@@ -480,6 +521,7 @@ public final class NativeClient implements ClientModInitializer {
           new ClientIncarnationSignals.Listener() {
             public void scopeFenced() {
               renderSnapshot.invalidate();
+              renderedEntities.invalidate();
               resetSensingScope();
               authority = effectAuthority.cancellationGeneration();
               if (respawnRequest != 0 && lifecycle.status() == PlayerLifecycle.Status.RESPAWNING) {
@@ -487,7 +529,7 @@ public final class NativeClient implements ClientModInitializer {
               } else neutralize();
               bindScopeIfReady(); publishScope();
             }
-            public void screenChanged() { renderSnapshot.invalidate(); controllerWorld.invalidate(); publishScope(); }
+            public void screenChanged() { renderSnapshot.invalidate(); renderedEntities.invalidate(); controllerWorld.invalidate(); publishScope(); }
           });
     } catch (Exception e) {
       throw new IllegalStateException("Private native configuration unavailable");
@@ -501,6 +543,7 @@ public final class NativeClient implements ClientModInitializer {
     ClientTickEvents.START_CLIENT_TICK.register(c -> tick());
     ClientTickEvents.END_CLIENT_TICK.register(c -> inputTickEnded());
     WorldRenderEvents.START.register(this::worldRenderStarted);
+    WorldRenderEvents.END.register(context -> renderedEntities.endWorld());
     video = new Video(config);
     Thread control = new Thread(this::control, "gameharness-control");
     control.setDaemon(true);
@@ -527,13 +570,22 @@ public final class NativeClient implements ClientModInitializer {
     renderSnapshot.sample(sampled, lifecycle.lifeId(), space == null ? 0 : space.epoch(),
         position.x, position.y, position.z, rotation.x(), rotation.y(), rotation.z(), rotation.w(),
         Math.toRadians(camera.getYaw()), Math.toRadians(camera.getPitch()), camera.getLastTickDelta());
+    renderedEntities.begin(renderSnapshot.invocation(), sampled, Instant.now().toString(),
+        clientTick, lifecycle.lifeId(), space);
   }
 
   public void render() {
     try {
       EffectAuthority.Space space = incarnationSignals.space();
-      if (video != null) video.capture(renderSnapshot, clientTick, lifecycle.lifeId(),
-          space == null ? 0 : space.epoch(), authority, incarnationSignals.screen());
+      if (video != null && video.capture(renderSnapshot, clientTick, lifecycle.lifeId(),
+          space == null ? 0 : space.epoch(), authority, incarnationSignals.screen())
+          && space != null && renderSnapshot.currentWorld(lifecycle.lifeId(), space.epoch())) {
+        renderedEntities.captured(renderSnapshot.invocation(), renderSnapshot.captureSequence(), lifecycle.lifeId(), space);
+        // Failed/skipped readbacks never consume public incarnation counters or produce handles.
+        renderedEntities.forEach(renderSnapshot.invocation(), lifecycle.lifeId(), space, System.nanoTime(),
+            (entity, row) -> row.add("target", NativeEffectContract.target(
+                entityIncarnations.observe(entity.getUuid(), space, lifecycle.lifeId()))));
+      }
       settleResidentSample(true);
     } finally {
       renderSnapshot.end();
@@ -1877,52 +1929,27 @@ public final class NativeClient implements ClientModInitializer {
     return world;
   }
 
-  /** Bounded traversal and optical work, on the game thread, once per coherent native tick. */
+  /** Read only the completed framebuffer's bounded render witnesses; never rescan entity state. */
   private JsonObject acquireDynamicEntities() {
     var space = incarnationSignals.space();
-    if (dynamicEntities != null && dynamicTick == clientTick && dynamicLife == lifecycle.lifeId()
-        && Objects.equals(dynamicSpace, space)) return dynamicEntities;
-    long captured = System.nanoTime();
-    String now = Instant.now().toString();
+    long now = System.nanoTime();
+    boolean current = renderedEntities.current(renderSnapshot.captureInvocation(), lifecycle.lifeId(), space, now);
     JsonArray seenEntities = new JsonArray();
     entities.clear();
-    dynamicCandidates.clear();
-    // Vanilla's bounded spatial collection aborts at the candidate cap, before permission
-    // filtering. Denied local candidates consume quota too; their count is never exposed.
-    client.world.collectEntitiesByType(DYNAMIC_TYPE, client.player.getBoundingBox().expand(NativeContractResource.RADIUS),
-        DYNAMIC_CANDIDATE, dynamicCandidates, NativeContractResource.DYNAMIC_CANDIDATES);
-    for (Entity e : dynamicCandidates) {
-      if (e == client.player) continue;
-      if (!authorizedEntity(e)) continue;
-      TargetIncarnations.Target reference = entityIncarnations.observe(e.getUuid(), incarnationSignals.space(), lifecycle.lifeId());
-      String id = reference.targetId();
-      entities.put(id, e);
-      JsonObject item = new JsonObject();
-      item.add("target", NativeEffectContract.target(reference));
-      item.addProperty("name", Registries.ENTITY_TYPE.getId(e.getType()).getPath());
-      item.add("position", position(e.getPos()));
-      JsonObject bounds = new JsonObject();
-      var box = e.getBoundingBox();
-      bounds.add("min", position(box.minX, box.minY, box.minZ));
-      bounds.add("max", position(box.maxX, box.maxY, box.maxZ));
-      item.add("bounds", bounds);
-      item.add("aim_position", position(box.getCenter()));
-      item.addProperty("observed_at", now);
-      item.addProperty("current", true);
-      if (e instanceof ItemEntity dropped && !dropped.getStack().isEmpty())
-        item.addProperty("item_name", Registries.ITEM.getId(dropped.getStack().getItem()).getPath());
-      seenEntities.add(item);
-      if (seenEntities.size() >= NativeContractResource.MAX_ENTITIES) break;
-    }
+    if (current) renderedEntities.forEach(renderSnapshot.captureInvocation(), lifecycle.lifeId(), space, now, (entity, row) -> {
+      entities.put(row.getAsJsonObject("target").get("target_id").getAsString(), entity);
+      seenEntities.add(row);
+    });
     JsonObject projection = new JsonObject();
-    projection.addProperty("source", "current_authorized_tick");
-    projection.addProperty("native_tick", clientTick);
-    projection.addProperty("captured_at", now);
-    projection.addProperty("captured_native_ns", Long.toString(captured));
+    projection.addProperty("source", "rendered_camera_capture");
+    projection.addProperty("native_tick", current ? renderedEntities.tick() : clientTick);
+    projection.addProperty("captured_at", current ? renderedEntities.wallTime() : Instant.now().toString());
+    projection.addProperty("captured_native_ns", Long.toString(current ? renderedEntities.sampled() : now));
+    projection.add("render_invocation", current ? new JsonPrimitive(renderedEntities.invocation()) : JsonNull.INSTANCE);
+    projection.add("capture_sequence", current ? new JsonPrimitive(renderedEntities.captureSequence()) : JsonNull.INSTANCE);
     projection.addProperty("partial", true);
     projection.add("entities", seenEntities);
-    dynamicTick = clientTick; dynamicLife = lifecycle.lifeId(); dynamicSpace = space;
-    return dynamicEntities = projection;
+    return projection;
   }
 
   private JsonObject inventoryCounts() {
@@ -2050,7 +2077,7 @@ public final class NativeClient implements ClientModInitializer {
     fact.addProperty("native_tick", clientTick);
     fact.addProperty("recorded_native_ns", Long.toString(System.nanoTime()));
     fact.addProperty("crosshair", client.crosshairTarget == null ? "unavailable"
-        : client.crosshairTarget instanceof EntityHitResult ? "entity"
+        : client.crosshairTarget instanceof EntityHitResult hit ? authorizedEntity(hit.getEntity()) ? "entity" : "miss"
         : client.crosshairTarget instanceof BlockHitResult && client.crosshairTarget.getType() == HitResult.Type.BLOCK ? "block" : "miss");
     if (mechanics.size() == 32) { mechanics.removeFirst(); mechanicsOmitted = ContractIdentity.next(mechanicsOmitted); }
     mechanics.addLast(fact);
@@ -2283,7 +2310,7 @@ public final class NativeClient implements ClientModInitializer {
     blocks.clear();
     entities.clear();
     blockIncarnations.invalidate(); entityIncarnations.invalidate();
-    controllerWorld.invalidate(); dynamicEntities = null;
+    controllerWorld.invalidate(); renderedEntities.invalidate();
     mechanics.clear();
     if (respawnRequest != 0) {
       long id = respawnRequest;
@@ -2335,7 +2362,7 @@ public final class NativeClient implements ClientModInitializer {
 
   private void resetSensingScope() {
     controllerWorld.invalidate();
-    dynamicEntities = null; mechanics.clear();
+    renderedEntities.invalidate(); mechanics.clear();
     sounds.clear();
     synchronized (controllerCaptures) { controllerCaptures.clear(); }
     controllerEffects.clear(); controllerEffectBytes = 0; controllerEffectsOmitted = 0; lastStreamAck = null;
@@ -2462,10 +2489,11 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private JsonElement controllerEntityReference(Entity entity) {
-    if (!authorizedEntity(entity)) return JsonNull.INSTANCE;
-    var reference = entityIncarnations.observe(entity.getUuid(), incarnationSignals.space(), lifecycle.lifeId());
-    retainControllerTarget(entities, reference.targetId(), entity);
-    return NativeEffectContract.target(reference);
+    JsonObject witness = entityWitness(entity);
+    if (witness == null) return JsonNull.INSTANCE;
+    JsonObject reference = witness.getAsJsonObject("target");
+    retainControllerTarget(entities, reference.get("target_id").getAsString(), entity);
+    return reference;
   }
 
   private static <T> void retainControllerTarget(Map<String, T> targets, String id, T value) {
@@ -2504,7 +2532,8 @@ public final class NativeClient implements ClientModInitializer {
     controllerWorld.sample(acquisitionStarted, lifecycle.lifeId(), space, incarnationSignals.screen());
     JsonObject dynamics = acquireDynamicEntities();
     long now = System.nanoTime();
-    JsonObject body = controllerBody.capture(clientTick, now, controllerBlockReference, controllerEntityReference);
+    JsonObject body = controllerBody.capture(clientTick, now, controllerBlockReference, controllerEntityReference,
+        entity -> entityPosition(entity, "aim_position"));
     JsonObject value = new JsonObject(), profile = descriptor.getAsJsonObject("observation").getAsJsonObject("profile");
     controllerFrameSequence = ContractIdentity.next(controllerFrameSequence);
     synchronized (controllerCaptures) {
@@ -2679,7 +2708,7 @@ public final class NativeClient implements ClientModInitializer {
       BlockPos block = bindingsResolved ? boundBlock(reference) : blocks.get(reference.targetId());
       if (block != null) return blockIncarnations.current(block, reference, incarnationSignals.space(), lifecycle.lifeId());
       Entity entity = bindingsResolved ? boundEntity(reference) : entities.get(reference.targetId());
-      return entity != null && !entity.isRemoved()
+      return authorizedEntity(entity)
           && entityIncarnations.current(entity.getUuid(), reference, incarnationSignals.space(), lifecycle.lifeId());
     }
 
@@ -2759,7 +2788,8 @@ public final class NativeClient implements ClientModInitializer {
       if (targetReference != null) {
         applicationRejection.add("target_reference", NativeEffectContract.target(targetReference));
         applicationRejection.addProperty("target_current", current(targetReference));
-        applicationRejection.addProperty("target_in_current_observation", blocks.containsKey(targetReference.targetId()) || entities.containsKey(targetReference.targetId()));
+        applicationRejection.addProperty("target_in_current_observation", blocks.containsKey(targetReference.targetId())
+            || authorizedEntity(entities.get(targetReference.targetId())));
       }
       finish("failed", "Scope, screen or target incarnation changed before game-thread application", false);
     }
@@ -2826,11 +2856,11 @@ public final class NativeClient implements ClientModInitializer {
           finish("failed", "Target is not currently visible", false);
           return;
         }
-        navigationGoal = target != null ? target.toCenterPos() : entity.getPos();
+        navigationGoal = target != null ? target.toCenterPos() : entityPosition(entity, "position");
         navigationStartDistanceSquared = initial.squaredDistanceTo(navigationGoal);
         navigationCurrentDistanceSquared = navigationStartDistanceSquared;
-        if (entity instanceof ItemEntity dropped && !dropped.getStack().isEmpty())
-          pickupItem = Registries.ITEM.getId(dropped.getStack().getItem()).getPath();
+        if (entity != null && entityWitness(entity).has("item_name"))
+          pickupItem = entityWitness(entity).get("item_name").getAsString();
         duration = action.get("duration_ms").getAsLong();
         if (action.has("gaze") && action.getAsJsonObject("gaze").get("kind").getAsString().equals("free"))
           setLook(action.getAsJsonObject("gaze"));
@@ -2875,13 +2905,13 @@ public final class NativeClient implements ClientModInitializer {
           finish("failed", "Block target is not currently reachable and visible", false);
           return;
         }
-        if (kind.equals("attack") && (entity == null || entity.distanceTo(client.player) > 4.5)) {
+        if (kind.equals("attack") && (entity == null || entityDistance(entity) > 4.5)) {
           finish("failed", "Entity target is not currently within interaction range", false);
           return;
         }
         if (kind.equals("interact")
             && !(target != null && reachable(target)
-                || entity != null && entity.distanceTo(client.player) <= 4.5)) {
+                || entity != null && entityDistance(entity) <= 4.5)) {
           finish("failed", "Interaction target is not currently reachable and visible", false);
           return;
         }
@@ -2892,7 +2922,7 @@ public final class NativeClient implements ClientModInitializer {
               face == null
                   ? target.toCenterPos()
                   : target.toCenterPos().add(Vec3d.of(face.getVector()).multiply(.5)));
-        } else aim(entity.getBoundingBox().getCenter());
+        } else aim(entityPosition(entity, "aim_position"));
         duration = kind.equals("dig") ? 30000 : kind.equals("place") ? VisibleInventory.PLACE_MS : 4000;
       }
     }
@@ -3017,7 +3047,7 @@ public final class NativeClient implements ClientModInitializer {
         BlockPos block = gazeBinding;
         Entity e = authorizedEntity(gazeEntityBinding) ? gazeEntityBinding : null;
         if (block != null && clearLine(block.toCenterPos(), block)) aim(block.toCenterPos());
-        else if (e != null) aim(e.getBoundingBox().getCenter());
+        else if (e != null) aim(entityPosition(e, "aim_position"));
         else { navigationStopReason = "gaze_unavailable"; return false; }
       }
       double desiredYaw = Math.toDegrees(Math.atan2(-(routeGaze.x - p.x), routeGaze.z - p.z));
@@ -3148,7 +3178,7 @@ public final class NativeClient implements ClientModInitializer {
       if (!kind.equals("navigate") || pickupItem == null || entity == null
           || current(targetReference) || !current(tableReference) || !current(gazeReference)
           || !current(interactionReference) || !authorized(false)
-          || entity.getPos().distanceTo(client.player.getPos()) > 2
+          || navigationGoal == null || navigationGoal.distanceTo(client.player.getPos()) > 2
           || (emissions & EffectOutcome.WORLD_EFFECT) == 0) return false;
       completingPickup = true;
       pickupReceiptDeadline = System.nanoTime() + 1500000000L;
@@ -3439,7 +3469,7 @@ public final class NativeClient implements ClientModInitializer {
                   client.player, Hand.MAIN_HAND, faceHit);
               placementLocalResult = local.isAccepted() ? "accepted"
                   : local instanceof ActionResult.Fail ? "fail" : "pass";
-            } else if (authorizedEntity(entity) && entity.distanceTo(client.player) <= 4.5) {
+            } else if (authorizedEntity(entity) && entityDistance(entity) <= 4.5) {
               issued = true; ticks = 0;
               emissions |= EffectOutcome.WORLD_EFFECT;
               if (kind.equals("attack")) {
@@ -3514,7 +3544,7 @@ public final class NativeClient implements ClientModInitializer {
           interactionReference != null
               ? interactionEntityBinding
               : client.crosshairTarget instanceof EntityHitResult hit ? hit.getEntity() : null;
-      if (e != null && authorizedEntity(e) && e.distanceTo(client.player) <= 4.5) {
+      if (e != null && authorizedEntity(e) && entityDistance(e) <= 4.5) {
         emissions |= EffectOutcome.WORLD_EFFECT;
         if (attack) client.interactionManager.attackEntity(client.player, e);
         else client.interactionManager.interactEntity(client.player, e, Hand.MAIN_HAND);

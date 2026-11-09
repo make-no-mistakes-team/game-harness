@@ -33,6 +33,14 @@ public final class NativeRenderSnapshot {
   public void invalidate() { valid = false; capturedWorld = false; }
   public void end() { open = false; valid = false; }
   public long invocation() { return invocation; }
+  public long captureSequence() { return captureSequence; }
+  public long captureInvocation() { return capturedWorld ? captureInvocation : 0; }
+  public boolean currentWorld(long lifeId, long spaceEpoch) {
+    return open && valid && life == lifeId && space == spaceEpoch;
+  }
+  public double cameraX() { return x; }
+  public double cameraY() { return y; }
+  public double cameraZ() { return z; }
 
   /** Matrices must already have been copied into the owned arrays by the same START callback. */
   public void sample(long nanos, long lifeId, long spaceEpoch, double px, double py, double pz,

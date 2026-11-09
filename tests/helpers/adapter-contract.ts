@@ -45,8 +45,10 @@ export function descriptor() {
   const schemas = schemaCatalog();
   const configuration = {
     sampler: { radius_blocks: 8, max_blocks: 144, max_entities: 32, max_age_ms: 1000,
-      camera_independent: true, occlusion_test: "native_raycast", dynamic_interval_ticks: 1,
-      dynamic_candidate_limit: 128, entity_optical_gate: "air_water_bubble_only", terrain_interval_ms: 500 },
+      terrain_camera_independent: true, occlusion_test: "native_raycast", dynamic_candidate_limit: 128,
+      entity_camera: "actual_render_view_projection", entity_witness: "entity_renderer_same_completed_framebuffer",
+      entity_max_age_ms: 250, entity_pose: "original_render_interpolated",
+      entity_optical_gate: "air_water_bubble_only", terrain_interval_ms: 500 },
     actor_image: { codec: "png", presentation: "opaque_rgb", alignment: "unsynchronized" },
     motor_profile: "balanced",
     assistance: { semantic_helpers: true },
@@ -68,7 +70,7 @@ export function descriptor() {
     observation: {
       schema_version: 3, schema_hash: sha256(schemas.observation),
       payload_schema: { id: "contract_test_payload_v1", version: 1, hash: sha256(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_360_r8_control_v6", version: 6, configuration,
+      profile: { id: "minecraft_assisted_rgb_fov_r8_control_v7", version: 7, configuration,
         configuration_hash: sha256(configuration) },
     },
     capabilities: [

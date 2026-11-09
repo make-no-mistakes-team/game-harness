@@ -453,15 +453,37 @@ attenuation negatives have production-predicate proofs, not live mute-test credi
 This establishes the basic read interface, not resident streaming, expanded
 visibility, multipart combat attribution or autonomous gameplay quality.
 
-### Native dynamic sensing and mechanical feedback
+### Camera-bound entity perception — v7
 
-The v6 assisted profile keeps its eight-block, camera-independent range. Frame
+The active [v7 profile](runtime-contracts.md#current-player-observable-structured-profile)
+requires an actual entity-renderer witness in a completed framebuffer. Camera
+rotation and dispatcher model placement are separate transforms in the pinned
+client. Uncaptured renders cannot erase or refresh the previous completed
+image's evidence; the next completed image replaces it atomically.
+
+Four actual-client conformance cases passed: a visible front entity reached both
+read paths; turning away removed it and rejected an old-target attack without
+camera or world effects; a new silent entity behind the camera remained hidden
+until a turn; and a genuinely played sound behind the camera remained audible
+without granting entity geometry. All owners closed, with zero model calls.
+Java 21 geometry, capture-boundary and sound proofs also passed. Earlier failed
+native attempts exposed the capture-publication and camera-transform defects;
+they remain failed, not additional successful repetitions.
+
+This qualifies the exercised sensing boundary. It does not establish pixel-only
+perception, model-authored combat competence or ordinary-world reliability.
+
+### Native dynamic sensing and mechanical feedback — v6 cohort
+
+The historical v6 assisted profile kept its eight-block, camera-independent range. Frame
 schema 3 separates `dynamic_entities` from the 500 ms terrain cache in
 `visible_world`. Dynamic geometry is acquired once per native tick on the
 client thread, including while a semantic motor owns the avatar. A spatial
 candidate cap of 128 precedes visibility filtering; at most 32 permitted rows
 are returned. Coverage is always partial, without rejected-candidate counts.
 Terrain keeps its original sequence, timestamp and one-second stale threshold.
+
+The v6 results below do not qualify the changed v7 perception condition.
 
 Entity optics permit air, open water and bubble columns. Waterlogged solids,
 lava, unknown cells and opaque walls still block the conservative structured

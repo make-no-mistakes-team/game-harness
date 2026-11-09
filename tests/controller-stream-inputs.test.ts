@@ -5,8 +5,9 @@ import { controllerInputFrameSchema, controllerInputSchema, inputAppliedAckSchem
   residentFrameContextSchema, revocationAckSchema,
   type ControllerInputFrame, type InputAppliedAck, type RevocationAck } from "../src/shared/controller.ts";
 import { ControllerInputs } from "../src/server/controller-inputs.ts";
-import { NativeControllerChannel, type ControllerChannelTransport } from "../src/server/controller-channel.ts";
+import { NativeControllerChannel, NativeRequestFault, type ControllerChannelTransport } from "../src/server/controller-channel.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
+import type { NativeControlTiming } from "../src/server/performance.ts";
 
 const neutral: WorldHeld = { forward: false, back: false, left: false, right: false, jump: false,
   sprint: false, sneak: false, attack: false, use: false };
@@ -66,7 +67,7 @@ test("last compatible unsent snapshot coalesces with new identity without jumpin
   expect(ledger.snapshot()).toMatchObject({ submitted_sequence: 3, applied_sequence: 0, pending_frames: 2 });
   expect(ledger.take()).toMatchObject({ sequence: 1, ordered_edge_start: 0, ordered_edge_end: 1 });
   expect(ledger.take()).toMatchObject({ sequence: 3, frame: { context: { frame_seq: 3 } }, ordered_edge_start: 1, ordered_edge_end: 1 });
-  expect(ledger.acceptAck(ack(2))).toBe(false);
+  expect(ledger.acceptAck(ack(2))).toBe("ack_for_unsent_input");
   expect(ledger.snapshot()).toMatchObject({ fenced: true, applied_sequence: 0, pending_edges: 1 });
 });
 
@@ -124,7 +125,7 @@ test("fence and revocation prevent unsent backlog emission but retain already se
     if (stop === "revoke") ledger.revoke();
     else submit(ledger, screen(5));
     expect(ledger.take()).toBeNull();
-    expect(ledger.acceptAck(ack(1, 1))).toBe(true);
+    expect(ledger.acceptAck(ack(1, 1))).toBe("accepted");
     expect(ledger.snapshot()).toMatchObject({ fenced: true, pending_frames: 3, pending_edges: 3, applied_sequence: 1 });
     expect(ledger.take()).toBeNull();
   }
@@ -146,9 +147,9 @@ test("expanded edge budget survives snapshot ACK independently of consumed prefi
   const ledger = new ControllerInputs(owner(), 7);
   submit(ledger, world(1, { ...neutral, attack: true }, [press("attack", 256)]));
   ledger.take();
-  expect(ledger.acceptAck(ack(1, 0, { held: { ...neutral, attack: true } }))).toBe(true);
+  expect(ledger.acceptAck(ack(1, 0, { held: { ...neutral, attack: true } }))).toBe("accepted");
   expect(ledger.snapshot()).toMatchObject({ pending_frames: 0, pending_edges: 256, applied_sequence: 1 });
-  expect(ledger.acceptAck(ack(1, 128, { held: { ...neutral, attack: true } }))).toBe(true);
+  expect(ledger.acceptAck(ack(1, 128, { held: { ...neutral, attack: true } }))).toBe("accepted");
   expect(ledger.snapshot().pending_edges).toBe(128);
   expect(submit(ledger, world(2, { ...neutral, attack: true }, [press("attack", 128)])).status).toBe("submitted");
   expect(ledger.snapshot().pending_edges).toBe(256);
@@ -224,26 +225,26 @@ test("every owner field plus generation and source is admission authority", () =
 test("later sent ACK retires earlier snapshots but older and duplicate ACKs never earn credit", () => {
   const ledger = new ControllerInputs(owner(), 7);
   submit(ledger, screen(1)); submit(ledger, screen(2)); ledger.take(); ledger.take();
-  expect(ledger.acceptAck(ack(2, 1, { applied_native_tick: 20, applied_native_ns: "1100000000" }))).toBe(true);
+  expect(ledger.acceptAck(ack(2, 1, { applied_native_tick: 20, applied_native_ns: "1100000000" }))).toBe("accepted");
   const before = ledger.snapshot();
   expect(before).toMatchObject({ applied_sequence: 2, ordered_edge_prefix: 1, pending_frames: 0, pending_edges: 1 });
-  expect(ledger.acceptAck(ack(1, 1))).toBe(false);
-  expect(ledger.acceptAck(ack(2, 1, { applied_native_tick: 20, applied_native_ns: "1100000000" }))).toBe(false);
-  expect(ledger.acceptAck(ack(2, 2, { applied_native_tick: 19, applied_native_ns: "1100000000" }))).toBe(false);
-  expect(ledger.acceptAck(ack(2, 2, { applied_native_tick: 20, applied_native_ns: "1099999999" }))).toBe(false);
+  expect(ledger.acceptAck(ack(1, 1))).toBe("stale_or_duplicate");
+  expect(ledger.acceptAck(ack(2, 1, { applied_native_tick: 20, applied_native_ns: "1100000000" }))).toBe("stale_or_duplicate");
+  expect(ledger.acceptAck(ack(2, 2, { applied_native_tick: 19, applied_native_ns: "1100000000" }))).toBe("stale_or_duplicate");
+  expect(ledger.acceptAck(ack(2, 2, { applied_native_tick: 20, applied_native_ns: "1099999999" }))).toBe("stale_or_duplicate");
   expect(ledger.snapshot()).toEqual(before);
-  expect(ledger.acceptAck(ack(2, 2, { applied_native_tick: 21, applied_native_ns: "1100000001" }))).toBe(true);
+  expect(ledger.acceptAck(ack(2, 2, { applied_native_tick: 21, applied_native_ns: "1100000001" }))).toBe("accepted");
   expect(ledger.snapshot()).toMatchObject({ pending_edges: 0, ordered_edge_prefix: 2 });
 });
 
 test("wrong generation ACK is ignored but unsent and future sequences fence without credit", () => {
   const old = new ControllerInputs(owner(), 7);
   submit(old, screen(1)); old.take();
-  expect(old.acceptAck(ack(1, 1, { controller_generation: 6 }))).toBe(false);
+  expect(old.acceptAck(ack(1, 1, { controller_generation: 6 }))).toBe("stale_or_duplicate");
   expect(old.snapshot()).toMatchObject({ fenced: false, pending_edges: 1, applied_sequence: 0 });
   for (const sequence of [1, 2]) {
     const ledger = new ControllerInputs(owner(), 7); submit(ledger, screen(1));
-    expect(ledger.acceptAck(ack(sequence, 1))).toBe(false);
+    expect(ledger.acceptAck(ack(sequence, 1))).toBe("ack_for_unsent_input");
     expect(ledger.snapshot()).toMatchObject({ fenced: true, pending_frames: 1, pending_edges: 1, applied_sequence: 0 });
   }
 });
@@ -251,20 +252,20 @@ test("wrong generation ACK is ignored but unsent and future sequences fence with
 test("ACK cannot claim edges beyond its own sent range or regress the confirmed prefix", () => {
   const ledger = new ControllerInputs(owner(), 7);
   submit(ledger, screen(1)); submit(ledger, screen(2)); ledger.take(); ledger.take();
-  expect(ledger.acceptAck(ack(1, 2))).toBe(false);
+  expect(ledger.acceptAck(ack(1, 2))).toBe("ack_overclaims_ordered_prefix");
   expect(ledger.snapshot()).toMatchObject({ fenced: true, pending_frames: 2, pending_edges: 2, ordered_edge_prefix: 0 });
   const valid = new ControllerInputs(owner(), 7);
   submit(valid, screen(1)); submit(valid, screen(2)); valid.take(); valid.take();
   valid.acceptAck(ack(1, 1));
   const before = valid.snapshot();
-  expect(valid.acceptAck(ack(2, 0))).toBe(false);
+  expect(valid.acceptAck(ack(2, 0))).toBe("stale_or_duplicate");
   expect(valid.snapshot()).toEqual(before);
 });
 
 test("confirmed ACK held must match the submitted final state", () => {
   const ledger = new ControllerInputs(owner(), 7);
   submit(ledger, world(1, { ...neutral, attack: true }, [press("attack")])); ledger.take();
-  expect(ledger.acceptAck(ack(1, 1))).toBe(false);
+  expect(ledger.acceptAck(ack(1, 1))).toBe("ack_held_mismatch");
   expect(ledger.snapshot()).toMatchObject({ fenced: true, pending_frames: 1, pending_edges: 1, last_input: null });
 });
 
@@ -272,7 +273,7 @@ test("partial and unknown ACKs preserve truthful actual input and fence further 
   for (const input_application of ["partial", "unknown"] as const) {
     const ledger = new ControllerInputs(owner(), 7);
     submit(ledger, world(1, { ...neutral, attack: true }, [press("attack", 4)])); ledger.take();
-    expect(ledger.acceptAck(ack(1, 1, { input_application, reason: "native interruption" }))).toBe(true);
+    expect(ledger.acceptAck(ack(1, 1, { input_application, reason: "native interruption" }))).toBe("accepted");
     expect(ledger.snapshot()).toMatchObject({ fenced: true, retired: false, pending_edges: 3,
       last_input: { input_application, held: neutral, ordered_edge_prefix: 1 } });
     expect(submit(ledger, world(2, { ...neutral, attack: true })).status).toBe("rejected");
@@ -328,7 +329,7 @@ test("retained authority frames and actual ACKs cannot be changed through caller
   expect(taken.frame.context.owner.scope.life_id).toBe(4);
   if (taken.frame.input.kind === "world") { taken.frame.input.held.use = false; taken.frame.input.edges.length = 0; }
   const applied = ack(1, 1, { held: { ...neutral, use: true } });
-  expect(ledger.acceptAck(applied)).toBe(true);
+  expect(ledger.acceptAck(applied)).toBe("accepted");
   applied.held.use = false; applied.applied_pose.pitch_radians = 1;
   const copy = ledger.snapshot(); copy.last_input!.held.use = false;
   expect(ledger.snapshot().last_input).toMatchObject({ held: { use: true }, applied_pose: { pitch_radians: .25 } });
@@ -384,6 +385,7 @@ function nativeChannel(operationId = "resident-owner", generation = 3, deadlineH
   frame.captured_native_ns = frame.inventory.captured_native_ns = "1000000000";
   const calls: string[] = [], applied: InputAppliedAck[] = [];
   let retired = false;
+  let retirementTiming: NativeControlTiming | null = null;
   let request: ControllerChannelTransport["request"] = async method => {
     if (method === "controller_revoke") return { ack: retirement({ owner: identity,
       last_applied_sequence: applied.at(-1)?.sequence ?? 0, ordered_edge_prefix: applied.at(-1)?.ordered_edge_prefix ?? 0 }), generation: generation + 1 };
@@ -396,13 +398,159 @@ function nativeChannel(operationId = "resident-owner", generation = 3, deadlineH
     clock: () => ({ clock_id: "native-test", host_sent_ms: 0, host_received_ms: 0,
       native_received_ns: "1000000000", native_replied_ns: "1000000000", native_processing_ms: 0,
       residual_round_trip_ms: 0, offset_lower_ms: 1000, offset_upper_ms: 1000, uncertainty_ms: 0 }),
+    retirementTiming: () => retirementTiming,
     assertCurrent() { if (retired) throw new Error("Controller owner has retired."); },
     retired() { retired = true; }, async failed() { throw new Error("Unexpected unconfirmed retirement"); },
   };
   const channel = new NativeControllerChannel(identity, 7, deadlineHostMs, transport, value => applied.push(value), () => {});
-  return { channel, calls, applied, frame, request(fn: typeof request) { request = fn; } };
+  return { channel, calls, applied, frame, request(fn: typeof request) { request = fn; },
+    timing(value: NativeControlTiming) { retirementTiming = value; } };
 }
 async function settleChannel() { for (let turn = 0; turn < 30; turn++) await Promise.resolve(); }
+
+test.each([
+  ["not_dispatched", "not_dispatched", "submit_dispatch"],
+  ["write_failed", "dispatched", "submit_response"],
+  ["request_timeout", "dispatched", "submit_response"],
+  ["transport_closed", "dispatched", "submit_response"],
+] as const)("typed %s keeps dispatch evidence after physical retirement", async (cause, dispatch, stage) => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  h.request(async method => {
+    if (method === "controller_submit")
+      throw new NativeRequestFault(cause, method, dispatch === "not_dispatched" ? null : 9, dispatch, "Same diagnostic text");
+    return { ack: retirement(), generation: 4 };
+  });
+  try {
+    const frame = await h.channel.sample(null);
+    expect(h.channel.submit(frame, screen(1).input).status).toBe("submitted");
+    await settleChannel(); await h.channel.revoke();
+    expect(h.channel.snapshot()).toMatchObject({ retired: true, submitted_sequence: 1, applied_sequence: 0, last_input: null,
+      fault: { stage, cause, decision_dispatch: dispatch, sequence: 1, frame_seq: 1, captured_native_ns: "1000000000",
+        request_id: dispatch === "not_dispatched" ? null : 9, native_first_fence: null } });
+    expect(h.calls.filter(method => method === "controller_submit")).toHaveLength(1);
+    expect(h.applied).toEqual([]);
+  } finally { clock.mockRestore(); }
+});
+
+test.each([
+  ["schema", {}, "ack_schema", "invalid_ack", 0],
+  ["unsent", ack(2), "ack_relation", "ack_for_unsent_input", 0],
+  ["held", ack(1, 0, { held: { ...neutral, forward: true } }), "ack_relation", "ack_held_mismatch", 0],
+  ["partial", ack(1, 0, { input_application: "partial", reason: "native_input_lease_expired" }), "application", "application_partial", 1],
+  ["unknown", ack(1, 0, { input_application: "unknown", reason: "native_input_lease_expired" }), "application", "application_unknown", 1],
+] as const)("ACK %s has a distinct consumer-visible fault and truthful application counters", async (_name, reply, stage, cause, applied) => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  h.request(async method => method === "controller_submit" ? reply : {
+    ack: retirement({ last_applied_sequence: applied }), generation: 4,
+  });
+  try {
+    expect(h.channel.submit(await h.channel.sample(null), world(1).input).status).toBe("submitted");
+    await settleChannel(); await h.channel.revoke();
+    expect(h.channel.snapshot()).toMatchObject({ fenced: true, retired: true, applied_sequence: applied,
+      fault: { stage, cause, decision_dispatch: "dispatched", sequence: 1, native_first_fence: null } });
+    expect(h.applied).toHaveLength(applied);
+  } finally { clock.mockRestore(); }
+});
+
+test("a valid duplicate ACK is an ACK relation fault, not schema rejection or new application", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  try {
+    h.channel.submit(await h.channel.sample(null), world(1).input);
+    await settleChannel();
+    h.frame.frame_seq = 2;
+    h.channel.submit(await h.channel.sample(null), world(2).input);
+    await settleChannel(); await h.channel.revoke();
+    expect(h.channel.snapshot()).toMatchObject({ applied_sequence: 1, submitted_sequence: 2,
+      fault: { stage: "ack_relation", cause: "stale_or_duplicate", sequence: 2 } });
+    expect(h.applied).toHaveLength(1);
+  } finally { clock.mockRestore(); }
+});
+
+test.each(["exact", "absent", "owner", "generation", "boot", "text_only"] as const)(
+  "only validated exact-owner timing classifies native expiry (%s)", async authority => {
+    const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+    const timing: NativeControlTiming = { schema_version: 1, clock_id: "boot", received_ns: "1020000000",
+      replied_ns: "1020000001", client_tick: 12, controller_lease: { schema_version: 1, event: "refused",
+        owner: owner(), controller_generation: 7, checked_native_ns: "1020000000",
+        requested_deadline_native_ns: "1250000000", previous_deadline_native_ns: "1010000000",
+        effective_deadline_native_ns: "1010000000", task_deadline_native_ns: "11000000000", accepted: false,
+        first_fence_reason: "native_input_lease_expired", first_fence_native_ns: "1010000001",
+        retirement_trigger: null, retirement_native_ns: null } };
+    if (authority === "owner") timing.controller_lease!.owner.operation_id = "another-owner";
+    if (authority === "generation") timing.controller_lease!.controller_generation++;
+    if (authority === "boot") timing.clock_id = "other-boot";
+    h.request(async method => {
+      if (method === "controller_submit") {
+        if (authority === "text_only") throw new Error("native_input_lease_expired");
+        throw new NativeRequestFault("native_rejected", method, 12, "dispatched", "native_input_lease_expired",
+          authority === "absent" ? null : timing);
+      }
+      return { ack: retirement(), generation: 4 };
+    });
+    try {
+      h.channel.submit(await h.channel.sample(null), world(1).input);
+      await settleChannel(); await h.channel.revoke();
+      const fault = h.channel.snapshot().fault!;
+      expect(fault.cause).toBe(authority === "exact" ? "native_lease_expired" : authority === "text_only" ? "transport_unknown" : "native_rejected");
+      expect(fault.decision_dispatch).toBe(authority === "text_only" ? "unknown" : "dispatched");
+      expect(fault.native_first_fence).toEqual(authority === "exact" ? { reason: "native_input_lease_expired",
+        native_ns: "1010000001", checked_native_ns: "1020000000", effective_deadline_native_ns: "1010000000" } : null);
+      expect(fault.host_detected_ms).toBeLessThan(250);
+      expect(h.applied).toEqual([]);
+    } finally { clock.mockRestore(); }
+  });
+
+test("late heartbeat and retirement symptoms cannot replace the first submission fault", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  const heartbeat = Promise.withResolvers<unknown>();
+  h.request(async method => {
+    if (method === "controller_heartbeat") return await heartbeat.promise;
+    if (method === "controller_submit") throw new NativeRequestFault("native_rejected", method, 8, "dispatched", "Rejected input");
+    return { ack: retirement(), generation: 4 };
+  });
+  try {
+    const frame = await h.channel.sample(null); await h.channel.renew(frame);
+    h.channel.submit(frame, world(1).input); await settleChannel();
+    const first = h.channel.snapshot().fault;
+    heartbeat.reject(new NativeRequestFault("request_timeout", "controller_heartbeat", 7, "dispatched", "Late heartbeat failure"));
+    await h.channel.revoke();
+    expect(h.channel.snapshot().fault).toEqual(first);
+    expect(h.channel.snapshot()).toMatchObject({ retired: true, fault: { stage: "submit_response", cause: "native_rejected", request_id: 8 } });
+    await expect(h.channel.sample(null)).rejects.toThrow();
+    expect(h.channel.snapshot().fault).toEqual(first);
+    expect(h.calls).toEqual(["controller_heartbeat", "controller_submit", "controller_revoke"]);
+  } finally { heartbeat.resolve({}); await settleChannel(); clock.mockRestore(); }
+});
+
+test("late exact retirement timing annotates the original fault without rewriting its cause or detecting stage", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  const retiring = Promise.withResolvers<unknown>();
+  h.request(async method => {
+    if (method === "controller_submit")
+      throw new NativeRequestFault("native_rejected", method, 19, "dispatched", "Rejected input without timing");
+    return await retiring.promise;
+  });
+  try {
+    h.channel.submit(await h.channel.sample(null), world(1).input);
+    await settleChannel();
+    const first = h.channel.snapshot().fault!;
+    expect(first.native_first_fence).toBeNull();
+    h.timing({ schema_version: 1, clock_id: "boot", received_ns: "1152000000", replied_ns: "1152000001",
+      client_tick: 12, controller_lease: { schema_version: 1, event: "retirement", owner: owner(), controller_generation: 7,
+        checked_native_ns: "1152000000", requested_deadline_native_ns: null, previous_deadline_native_ns: "1250000000",
+        effective_deadline_native_ns: "1250000000", task_deadline_native_ns: "11000000000", accepted: false,
+        first_fence_reason: "queued_frame_expired_before_application", first_fence_native_ns: "1151000000",
+        retirement_trigger: "explicit_retirement", retirement_native_ns: "1152000000" } });
+    retiring.resolve({ ack: retirement(), generation: 4 });
+    await h.channel.revoke();
+    expect(h.channel.snapshot().fault).toEqual({ ...first, native_first_fence: {
+      reason: "queued_frame_expired_before_application", native_ns: "1151000000",
+      checked_native_ns: "1152000000", effective_deadline_native_ns: "1250000000",
+    } });
+    expect(h.channel.snapshot()).toMatchObject({ applied_sequence: 0, last_input: null, retired: true,
+      fault: { stage: "submit_response", cause: "native_rejected", request_id: 19 } });
+  } finally { retiring.resolve({ ack: retirement(), generation: 4 }); await settleChannel(); clock.mockRestore(); }
+});
 
 test.each([false, true])("partial GUI ACK retains its cause through queued rejection and retirement (contained=%s)", async contained => {
   const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();

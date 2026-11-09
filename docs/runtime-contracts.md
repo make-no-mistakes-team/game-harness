@@ -243,6 +243,15 @@ failure or source exception does not authorize a retry of the same invocation.
 Compile-once live workers retain their own module globals across decisions;
 explicit state is not an automatic rollback checkpoint.
 
+The host retains the first structured controller fault across later heartbeat
+errors and retirement. Records distinguish unsent admission, dispatched transport
+uncertainty, ACK validation and partial application; only exact-owner native
+timing can identify a native expiry. `session.controller_fault` precedes separate
+cleanup evidence. Candidate preparation likewise records its failing shadow or
+clean-worker stage and actual closure without replacing the incumbent or leaking
+arbitrary host exception text. These records do not authorize retries or recover
+the missing cause of an older run.
+
 Review with an explicit version stays exact. Without one, `program_review` selects the family's latest matching outcome, not an unexecuted latest source revision. A write experiment still requires its exact latest direct parent's own feedback. A prior `keep` or `insufficient_evidence` assessment stays immutable but does not block repair. Authoring does not require a review call.
 
 Model selectors use human names and optional exact versions; the host resolves IDs, hashes and authority scope. Starting without `version` pins latest validated once before admission. Catalog pages expose the latest stored revision per family with cursors; execution/history/source lookup never rewrites an already captured reference. Inspection preserves explicit omissions and independent feedback cursors.

@@ -1,5 +1,5 @@
 import type { GameActionResult, Json } from "../shared/contracts.ts";
-import type { ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck } from "../shared/controller.ts";
+import type { ControllerChannelFault, ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck } from "../shared/controller.ts";
 import { controllerInputSchema, revocationAckSchema } from "../shared/controller.ts";
 import { sameEffectScope, type WorldHeld, type WorldInputEdge } from "../shared/control.ts";
 import { minecraftControllerFrameSchema, type MinecraftControllerFrame } from "../shared/minecraft.ts";
@@ -9,6 +9,7 @@ import { executiveStepResultSchema, residentActivationResultSchema, ResidentClea
 import { type ControlSessionConfig, type ExecutiveChoice, type ExecutiveSnapshot, type ExecutiveTaskRequest,
   type ExecutiveTaskSnapshot } from "../shared/control-session.ts";
 import { GeneratedControllerResultValidationError } from "./program-diagnostics.ts";
+import { ControllerChannelFaultError } from "./controller-channel.ts";
 
 interface Task {
   snapshot: ExecutiveTaskSnapshot;
@@ -68,6 +69,7 @@ export class ControlSession {
   }>();
   private readonly session: ExecutiveSnapshot;
   private resultFailure: GeneratedControllerResultValidationError | null = null;
+  private controllerFaultRecorded = false;
   get failure(): GeneratedControllerResultValidationError | null { return this.resultFailure; }
 
   constructor(private readonly options: ControlSessionOptions) {
@@ -143,7 +145,8 @@ export class ControlSession {
       this.timer = null; this.slot++;
       const work = this.tick(); this.flight = work;
       void work.catch(error => {
-        if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
+        if (error instanceof ControllerChannelFaultError) this.recordControllerFault(this.raw, error.fault);
+        else if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
         return this.fail(errorText(error));
       }).finally(() => {
         this.flight = null; if (this.current()) this.schedule();
@@ -161,8 +164,14 @@ export class ControlSession {
     }
     const samplingTransition = this.transition;
     const samplingChannel = samplingTransition ? null : this.raw;
-    const frame = minecraftControllerFrameSchema.parse(await (samplingChannel
-      ? samplingChannel.sample(this.cursor) : this.options.sample(this.cursor)));
+    let frame: MinecraftControllerFrame;
+    try {
+      frame = minecraftControllerFrameSchema.parse(await (samplingChannel
+        ? samplingChannel.sample(this.cursor) : this.options.sample(this.cursor)));
+    } catch (error) {
+      if (samplingChannel) throw this.channelFailure(samplingChannel, error);
+      throw error;
+    }
     if (!this.current()) return;
     if (frame.frame_seq <= this.lastFrame) { this.data.counters.stale_frames++; return; }
     this.lastFrame = frame.frame_seq; this.data.counters.frames++;
@@ -220,9 +229,14 @@ export class ControlSession {
   private async retireRaw(): Promise<void> {
     const raw = this.raw;
     if (!raw) return;
+    this.recordControllerFault(raw);
     const ack = revocationAckSchema.parse(await raw.revoke());
     if (ack.controller_generation !== raw.controllerGeneration || ack.owner.operation_id !== raw.owner.operation_id ||
       ack.owner.generation !== raw.owner.generation || !sameEffectScope(ack.owner.scope, raw.owner.scope)) throw new ResidentCleanupError();
+    const snapshot = raw.snapshot();
+    if (snapshot.fault) this.recordControllerFault(raw, snapshot.fault, snapshot);
+    if (this.controllerFaultRecorded) this.options.record("session.controller_cleanup", { owner: raw.owner, controller_generation: raw.controllerGeneration,
+      native: "retired", retirement: ack, fault: snapshot.fault } as unknown as Json);
     if (this.raw === raw) this.raw = null;
     for (const button of Object.keys(this.submittedHeld) as (keyof WorldHeld)[]) this.submittedHeld[button] = false;
     this.inputCaptures.clear(); this.session.producer = "none";
@@ -267,7 +281,12 @@ export class ControlSession {
         });
         return true;
       }
-      if (this.raw.snapshot().fenced) throw new Error("session_producer_fenced_without_known_lease_expiry");
+      const snapshot = this.raw.snapshot();
+      if (snapshot.fenced) {
+        this.recordControllerFault(this.raw, snapshot.fault, snapshot);
+        throw new ControllerChannelFaultError(snapshot.fault, snapshot.fault
+          ? `session_controller_fault: ${snapshot.fault.stage}:${snapshot.fault.cause}` : "session_controller_fault_unavailable");
+      }
       // tick sampled through this exact channel, so its capture is retained for admission.
       const admittedFrame = frame;
       let desired = choice.input;
@@ -285,15 +304,24 @@ export class ControlSession {
         expanded + this.edgeWindow.reduce((sum, entry) => sum + entry.count, 0) > this.options.limits.max_edges_per_second)
         throw new Error("session_edge_budget");
       const renewalStarted = this.clock.now();
-      await this.raw.renew(admittedFrame as unknown as Json);
+      try { await this.raw.renew(admittedFrame as unknown as Json); } catch (error) {
+        throw this.channelFailure(this.raw, error);
+      }
       this.rawLeaseDeadline = renewalStarted + 250;
       if (!this.current()) return false;
       if (this.data.intent_version !== expectedIntentVersion) {
         this.data.counters.stale_results++;
         throw new Error("session_decision_superseded_before_input_admission");
       }
-      const submitted = this.raw.submit(admittedFrame as unknown as Json, input);
-      if (submitted.status === "rejected") throw new Error(`session_input_rejected: ${submitted.reason}`);
+      let submitted: ReturnType<ControllerInputChannel["submit"]>;
+      try { submitted = this.raw.submit(admittedFrame as unknown as Json, input); } catch (error) {
+        throw this.channelFailure(this.raw, error);
+      }
+      if (submitted.status === "rejected") {
+        const snapshot = this.raw.snapshot();
+        this.recordControllerFault(this.raw, snapshot.fault, snapshot, submitted.reason);
+        throw new ControllerChannelFaultError(snapshot.fault, `session_input_rejected: ${submitted.reason}`);
+      }
       if (this.inputCaptures.size >= 512) throw new Error("session_input_attribution_capacity");
       this.inputCaptures.set(`${this.rawGeneration}:${submitted.sequence}`, {
         generation: this.rawGeneration, sequence: submitted.sequence, frame, input,
@@ -440,7 +468,30 @@ export class ControlSession {
         original_deadline_host_ms: this.options.deadline_host_ms, replayed_effects: false });
     });
   }
+  private channelFailure(channel: ControllerInputChannel, error: unknown): ControllerChannelFaultError {
+    const snapshot = channel.snapshot();
+    const fault = snapshot.fault ?? (error instanceof ControllerChannelFaultError ? error.fault : null);
+    this.recordControllerFault(channel, fault, snapshot, errorText(error));
+    return new ControllerChannelFaultError(fault, errorText(error));
+  }
+  private recordControllerFault(channel: ControllerInputChannel | null, fault: ControllerChannelFault | null = null,
+    snapshot = channel?.snapshot(), unavailableDetail: string | null = null): void {
+    if (this.controllerFaultRecorded) return;
+    fault ??= snapshot?.fault ?? null;
+    if (!fault && !snapshot?.fenced && unavailableDetail === null) return;
+    this.controllerFaultRecorded = true;
+    this.options.record("session.controller_fault", {
+      schema_version: 1, fault: fault === null ? null : structuredClone(fault), cause_available: fault !== null,
+      unavailable_detail: fault ? null : (unavailableDetail ?? snapshot?.reason ?? "Channel fenced without retained typed cause").slice(0, 2000),
+      owner: channel?.owner ?? fault?.owner ?? null,
+      controller_generation: channel?.controllerGeneration ?? fault?.controller_generation ?? this.rawGeneration,
+      host_detected_ms: this.clock.now(), host_lease_deadline_ms: Number.isFinite(this.rawLeaseDeadline) ? this.rawLeaseDeadline : null,
+      original_deadline_host_ms: this.options.deadline_host_ms,
+      channel: snapshot ?? null, counters: { ...this.data.counters }, cleanup: { ...this.data.cleanup },
+    } as unknown as Json);
+  }
   private async fail(reason: string): Promise<void> {
+    this.recordControllerFault(this.raw);
     if (!this.abort.signal.aborted) { this.data.status = "failed"; this.data.reason = reason; }
     void this.stop(reason);
   }
@@ -464,11 +515,16 @@ export class ControlSession {
         Promise.resolve().then(async () => { await this.flight?.catch(() => {}); }),
       ]);
       const failure = cleanup.find(result => result.status === "rejected");
+      this.recordControllerFault(this.raw);
       if (failure) {
         this.data.status = "unknown";
         if (cleanup[0]!.status === "rejected") this.data.cleanup.native = "unknown";
         if (cleanup[1]!.status === "rejected") this.data.cleanup.worker = "unknown";
       } else if (!["failed", "completed", "blocked", "yielded"].includes(this.data.status)) this.data.status = "stopped";
+      if (this.controllerFaultRecorded) this.options.record("session.controller_cleanup", {
+        cleanup: { ...this.data.cleanup }, original_deadline_host_ms: this.options.deadline_host_ms,
+        host_completed_ms: this.clock.now(),
+      });
       this.notify(true, true);
       if (failure) throw new ResidentCleanupError();
     })().then(done.resolve, done.reject);

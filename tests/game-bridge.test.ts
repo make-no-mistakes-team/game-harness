@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { GameBridgeClient } from "../src/server/game-bridge.ts";
+import { NativeRequestFault } from "../src/server/controller-channel.ts";
 import { spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { createConnection, type Server, type Socket } from "node:net";
@@ -36,6 +37,15 @@ import type {
 } from "../src/server/performance.ts";
 
 const adapter = minecraftTestAdapter();
+function capturedFrame<T extends {
+  inventory: { captured_native_ns: string };
+  dynamic_entities: { native_tick: number; captured_native_ns: string };
+}>(frame: T, frameSequence: number, tick: number) {
+  const nanos = nativeFixtureNanos();
+  return { ...frame, frame_seq: frameSequence, native_tick: tick, captured_native_ns: nanos,
+    inventory: { ...frame.inventory, captured_native_ns: nanos },
+    dynamic_entities: { ...frame.dynamic_entities, native_tick: tick, captured_native_ns: nanos } };
+}
 const ordinaryInput: GameAction = {
   kind: "world_input",
   steps: [
@@ -590,6 +600,39 @@ test("trusted timing subscribers receive correlated native lease deadlines even 
     await f.close();
   }
 });
+test("early byte admission is known unsent and allocates no pending native request", async () => {
+  const f = fixture();
+  try {
+    await f.channel("control");
+    const request = Reflect.get(f.bridge, "request").bind(f.bridge);
+    const outcome = await request("controller_submit", { payload: "x".repeat(65536) }, 1000).catch((error: unknown) => error);
+    expect(outcome).toBeInstanceOf(NativeRequestFault);
+    expect(outcome).toMatchObject({ status: "not_dispatched", method: "controller_submit", requestId: null, dispatch: "not_dispatched" });
+    expect((Reflect.get(f.bridge, "pending") as Map<number, unknown>).size).toBe(0);
+    expect(f.child.killed).toBe(false);
+    expect(f.bridge.snapshot().binding?.ready).toBe(true);
+  } finally { await f.close(); }
+});
+test("an initiating request timeout survives emitter-closed fanout to an earlier heartbeat", async () => {
+  const f = fixture();
+  try {
+    await f.channel("control");
+    const request = Reflect.get(f.bridge, "request").bind(f.bridge);
+    const heartbeat = request("controller_heartbeat", {}, 1000);
+    const submission = request("controller_submit", {}, 20);
+    const results = await Promise.allSettled([heartbeat, submission]);
+    expect(results.map(result => result.status)).toEqual(["rejected", "rejected"]);
+    const first = (results[0] as PromiseRejectedResult).reason;
+    const initiating = (results[1] as PromiseRejectedResult).reason;
+    expect(first).toBeInstanceOf(NativeRequestFault);
+    expect(initiating).toBeInstanceOf(NativeRequestFault);
+    expect(first).toMatchObject({ status: "request_timeout", method: "controller_heartbeat", dispatch: "dispatched",
+      initiatingRequestId: initiating.requestId, initiatingMethod: "controller_submit" });
+    expect(initiating).toMatchObject({ status: "request_timeout", method: "controller_submit", dispatch: "dispatched",
+      initiatingRequestId: initiating.requestId, initiatingMethod: "controller_submit" });
+    expect(first.requestId).not.toBe(initiating.requestId);
+  } finally { await f.close(); }
+});
 test("a successful native application retains exact queue and hook timing without expanding its receipt", async () => {
   const f = fixture();
   try {
@@ -1046,11 +1089,8 @@ test.each([false, true])("socket controller writes overlapping heartbeats before
           owner: request.params.owner, controller_generation: request.params.controller_generation,
         });
       } else if (request.method === "controller_sample") {
-        const ns = nativeFixtureNanos(), frame = controllerFrameFixture(1, 1);
-        frame.inventory.captured_native_ns = ns;
-        timedReply(peer, request.id, {
-          ...frame, frame_seq: ++captureSequence, native_tick: 10 + captureSequence, captured_native_ns: ns,
-        });
+        captureSequence++;
+        timedReply(peer, request.id, capturedFrame(controllerFrameFixture(1, 1), captureSequence, 10 + captureSequence));
       } else if (request.method === "controller_heartbeat") {
         ordered.push(request);
         if (request.generation === 1) held.push(request);
@@ -1152,12 +1192,7 @@ test("a controller retains the sole writer through submitted input and the actua
           controller_generation: 1,
         });
       else if (request.method === "controller_sample")
-        timedReply(peer, request.id, {
-          ...controllerFrameFixture(1, 1),
-          frame_seq: ++captureSequence,
-          native_tick: 10,
-          captured_native_ns: nativeFixtureNanos(),
-        });
+        timedReply(peer, request.id, capturedFrame(controllerFrameFixture(1, 1), ++captureSequence, 10));
       else if (request.method === "controller_submit")
         submitted.resolve(request);
       else if (request.method === "controller_revoke")
@@ -1306,12 +1341,7 @@ for (const [label, rootMs, applicationDelay, expected] of [
             controller_generation: 1,
           });
         else if (request.method === "controller_sample")
-          timedReply(peer, request.id, {
-            ...projectedFeedback(),
-            frame_seq: 1,
-            native_tick: 10,
-            captured_native_ns: nativeFixtureNanos(),
-          });
+          timedReply(peer, request.id, capturedFrame(projectedFeedback(), 1, 10));
         else if (request.method === "controller_submit")
           delayed = setTimeout(
             () =>
@@ -1406,12 +1436,7 @@ test("resident renewal refuses an aged decision without disguising it as a fresh
           controller_generation: 1,
         });
       else if (request.method === "controller_sample")
-        timedReply(peer, request.id, {
-          ...controllerFrameFixture(1, 1),
-          frame_seq: 1,
-          native_tick: 10,
-          captured_native_ns: nativeFixtureNanos(),
-        });
+        timedReply(peer, request.id, capturedFrame(controllerFrameFixture(1, 1), 1, 10));
       else {
         if (request.method === "controller_heartbeat") heartbeats++;
         timedReply(peer, request.id, {});

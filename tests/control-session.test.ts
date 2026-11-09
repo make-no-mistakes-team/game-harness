@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test, vi } from "bun:test";
 import { ControlSession, type ControlSessionOptions } from "../src/server/control-session.ts";
 import { controlSessionConfigSchema, type ExecutiveChoice } from "../src/shared/control-session.ts";
 import { DEFAULT_RESIDENT_LIMITS, type ResidentClock, type ResidentSnapshot } from "../src/shared/resident.ts";
@@ -6,6 +6,7 @@ import type { GameActionResult, Json } from "../src/shared/contracts.ts";
 import type { ControllerInputChannel, InputAppliedAck, RevocationAck } from "../src/shared/controller.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
+import { NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
 
 async function settle() { for (let index = 0; index < 100; index++) await Promise.resolve(); }
 class Clock implements ResidentClock {
@@ -83,7 +84,7 @@ function harness(retained = 32) {
           await renewal();
         },
         snapshot() { return { fenced: revoked, retired: revoked, submitted_sequence: sequence, applied_sequence: 0, ordered_edge_prefix: 0,
-          pending_frames: 0, pending_edges: 0, last_input: null, reason: null }; },
+          pending_frames: 0, pending_edges: 0, last_input: null, reason: null, fault: null }; },
         async revoke() { revoked = true; await retirement; retired++; return { owner, controller_generation: currentGeneration, admission_revoked: true,
           last_applied_sequence: 0, ordered_edge_prefix: 0, retirement_applied_native_tick: frameSeq,
           retirement_applied_native_ns: String(Math.round(clock.now() * 1e6)), input_application: "confirmed", unresolved_operation_refs: [] } satisfies RevocationAck; },
@@ -193,6 +194,87 @@ test("an invalid activation fails the invocation without turning its joined comp
   expect(h.session.snapshot()).toMatchObject({ status: "failed",
     cleanup: { worker: "closed", native: "retired" }, counters: { submissions: 0 } });
   expect(h.workerClosed).toBe(1);
+});
+
+test("an asynchronous native fence during a valid step persists the first cause while the host lease is live", async () => {
+  const h = harness(), host = vi.spyOn(performance, "now").mockImplementation(() => h.clock.now());
+  const originalOpen = h.options.open, step = h.options.worker.step;
+  const response = Promise.withResolvers<unknown>();
+  let submissions = 0;
+  h.options.open = async (deadline, applied, effect, ...rest) => {
+    const base = await originalOpen(deadline, applied, effect, ...rest), owner = base.owner;
+    return new NativeControllerChannel(owner, base.controllerGeneration, deadline, {
+      async request(method) {
+        if (method === "controller_submit") { submissions++; return await response.promise; }
+        if (method === "controller_revoke") return { generation: owner.generation + 1, ack: {
+          owner, controller_generation: base.controllerGeneration, admission_revoked: true, last_applied_sequence: 0,
+          ordered_edge_prefix: 0, retirement_applied_native_tick: 5, retirement_applied_native_ns: "100000000",
+          input_application: "confirmed", unresolved_operation_refs: [],
+        } };
+        return {};
+      },
+      sample: async () => minecraftControllerFrameSchema.parse(await h.options.sample(null)),
+      clock: () => ({ clock_id: "boot", host_sent_ms: 0, host_received_ms: 0, native_received_ns: "0",
+        native_replied_ns: "0", native_processing_ms: 0, residual_round_trip_ms: 0,
+        offset_lower_ms: 0, offset_upper_ms: 0, uncertainty_ms: 0 }),
+      assertCurrent() {}, retired() {}, async failed() { throw new Error("Retirement must be confirmed"); },
+    }, applied, effect);
+  };
+  h.options.worker.step = async (...args) => {
+    if (submissions === 1) {
+      response.reject(new NativeRequestFault("native_rejected", "controller_submit", 41, "dispatched", "Rejected input"));
+      await settle();
+    }
+    return await step(...args);
+  };
+  try {
+    h.choose(rawChoice); await h.session.start(); await h.clock.advance(100);
+    await h.session.stop("join failed invocation");
+    const faults = h.records.filter(record => record.type === "session.controller_fault");
+    expect(faults).toHaveLength(1);
+    expect(faults[0]!.details).toMatchObject({
+      cause_available: true, host_detected_ms: 100, host_lease_deadline_ms: 300, original_deadline_host_ms: 10000,
+      fault: { stage: "submit_response", cause: "native_rejected", decision_dispatch: "dispatched",
+        request_id: 41, sequence: 1, frame_seq: 2, captured_native_ns: "50000000", native_first_fence: null },
+      channel: { submitted_sequence: 1, applied_sequence: 0 },
+    });
+    expect(submissions).toBe(1);
+    expect(h.session.snapshot()).toMatchObject({ status: "failed", session: { restarts: 0 },
+      cleanup: { native: "retired", worker: "closed" } });
+    expect(h.records.filter(record => record.type === "session.controller_cleanup").at(-1)!.details)
+      .toMatchObject({ cleanup: { native: "retired", worker: "closed" } });
+  } finally { response.resolve({}); host.mockRestore(); }
+});
+
+test("a source error impersonating the host fault name cannot create trusted channel evidence", async () => {
+  const h = harness();
+  h.options.worker.activate = async () => {
+    const error = new Error("native_input_lease_expired");
+    error.name = "ControllerChannelFaultError";
+    throw error;
+  };
+  await h.session.start(); await h.clock.advance(0); await h.session.stop("join source failure");
+  expect(h.records.filter(record => record.type === "session.controller_fault")).toHaveLength(0);
+  expect(h.session.snapshot()).toMatchObject({ status: "failed", session: { restarts: 0 } });
+});
+
+test.each(["sample", "renew", "submit"] as const)("an untyped trusted %s failure records explicit missing cause before cleanup", async stage => {
+  const h = harness(), open = h.options.open;
+  h.options.open = async (...args) => {
+    const channel = await open(...args);
+    if (stage === "sample") channel.sample = async () => { throw new Error("native_input_lease_expired"); };
+    if (stage === "renew") channel.renew = async () => { throw new Error("native_input_lease_expired"); };
+    if (stage === "submit") channel.submit = () => { throw new Error("native_input_lease_expired"); };
+    return channel;
+  };
+  h.choose(rawChoice); await h.session.start(); await h.clock.advance(50); await h.session.stop("join failed native edge");
+  const faults = h.records.filter(record => record.type === "session.controller_fault");
+  expect(faults).toHaveLength(1);
+  expect(faults[0]!.details).toMatchObject({ fault: null, cause_available: false,
+    original_deadline_host_ms: 10000, cleanup: { native: "open", worker: "open" } });
+  expect(h.sent).toHaveLength(0);
+  expect(h.session.snapshot()).toMatchObject({ status: "failed", session: { restarts: 0 },
+    cleanup: { native: "retired", worker: "closed" } });
 });
 
 test("raw retirement keeps read-only sensing alive without reading through the fenced channel", async () => {

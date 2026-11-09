@@ -81,7 +81,7 @@ test("resident reservation blocks finite admission until confirmed old-owner ret
       sample: async () => { throw new Error("No sensor in this isolated authority fixture"); },
       submit: () => { throw new Error("No actuator in this isolated authority fixture"); },
       renew: async (_frame) => { throw new Error("No native clock in this isolated authority fixture"); },
-      revoke: () => retired.promise, snapshot: () => ledger.snapshot(),
+      revoke: () => retired.promise, snapshot: () => ({ ...ledger.snapshot(), fault: null }),
     };
     return channel;
   };

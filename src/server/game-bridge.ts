@@ -82,6 +82,8 @@ import {
 import {
   controllerNativeDeadline,
   NativeControllerChannel,
+  NativeRequestFault,
+  type NativeRequestStatus,
 } from "./controller-channel.ts";
 
 const noticeSchema = z
@@ -798,13 +800,15 @@ export class GameBridgeClient implements GameBridge {
               : null,
           );
           if (message.ok) pending.resolve(message.data);
-          else pending.reject(new Error(message.error));
+          else pending.reject(new NativeRequestFault("native_rejected", pending.timing.method, message.id,
+            "dispatched", message.error, message.timing ?? null));
         }
       } catch {
         socket.destroy();
         if (authorized || authenticated)
           void this.terminate(
             "Native negotiation, framing or authority failed.",
+            { status: "protocol_invalid", requestId: null },
           );
       }
     });
@@ -906,7 +910,7 @@ export class GameBridgeClient implements GameBridge {
       binding = this.state.binding;
     if (!socket || socket.destroyed || !binding?.ready)
       return Promise.reject(
-        new Error("Negotiated native control is unavailable."),
+        new NativeRequestFault("not_dispatched", method, null, "not_dispatched", "Negotiated native control is unavailable."),
       );
     const lane = controlLane(method);
     if (
@@ -914,33 +918,39 @@ export class GameBridgeClient implements GameBridge {
       this.sequence >= Number.MAX_SAFE_INTEGER
     )
       return Promise.reject(
-        new Error("Native request identity/lane bound reached."),
+        new NativeRequestFault("not_dispatched", method, null, "not_dispatched", "Native request identity/lane bound reached."),
       );
     const id = this.sequence + 1;
-    const packet = Buffer.from(
-      JSON.stringify({
-        id,
-        method,
-        params,
-        world_id: this.state.world_id,
-        epoch: this.state.epoch,
-        generation: this.generation,
-        native_boot_id: binding.native_boot_id,
-        session_id: this.owned?.session.session_id ?? this.state.session_id,
-      }) + "\n",
-    );
+    let packet: Buffer;
+    try {
+      packet = Buffer.from(
+        JSON.stringify({
+          id,
+          method,
+          params,
+          world_id: this.state.world_id,
+          epoch: this.state.epoch,
+          generation: this.generation,
+          native_boot_id: binding.native_boot_id,
+          session_id: this.owned?.session.session_id ?? this.state.session_id,
+        }) + "\n",
+      );
+    } catch {
+      return Promise.reject(new NativeRequestFault("not_dispatched", method, null, "not_dispatched",
+        "Native request serialization failed before dispatch."));
+    }
     const bound = lane === "retirement" ? 1024 * 1024 : 1024 * 1024 - 4096;
     if (
       packet.length > (lane === "retirement" ? 4096 : 65536) ||
       socket.writableLength + packet.length > bound
     )
       return Promise.reject(
-        new Error("Native request byte bound reached; no input was submitted."),
+        new NativeRequestFault("not_dispatched", method, null, "not_dispatched", "Native request byte bound reached; no input was submitted."),
       );
     this.sequence = id;
     const reply = Promise.withResolvers<unknown>();
     const timer = setTimeout(() => {
-      void this.terminate("Native operation deadline expired.");
+      void this.terminate("Native operation deadline expired.", { status: "request_timeout", requestId: id });
     }, timeout);
     const effect =
       method === "execute"
@@ -970,9 +980,13 @@ export class GameBridgeClient implements GameBridge {
         started_monotonic_ms: started,
       },
     });
-    socket.write(packet, (error) => {
-      if (error) void this.terminate("Native request write failed.");
-    });
+    try {
+      socket.write(packet, (error) => {
+        if (error) void this.terminate("Native request write failed.", { status: "write_failed", requestId: id });
+      });
+    } catch {
+      void this.terminate("Native request write failed.", { status: "write_failed", requestId: id });
+    }
     return reply.promise;
   }
   private finishTiming(
@@ -1393,6 +1407,29 @@ export class GameBridgeClient implements GameBridge {
                 this.request("controller_sample", params, 2000),
               ),
             clock: () => this.controlTimeline.currentCorrespondence(),
+            retirementTiming: () => {
+              const samples = this.controlTimeline.snapshot().samples;
+              for (let index = samples.length - 1; index >= 0; index--) {
+                const sample = samples[index]!, lease = sample.native_timing?.controller_lease;
+                if (sample.method === "controller_revoke" && lease?.owner.operation_id === owner.operation_id &&
+                  lease.owner.generation === owner.generation && lease.controller_generation === controllerGeneration)
+                  return sample.native_timing;
+              }
+              return null;
+            },
+            applicationEvidence: sequence => {
+              const samples = this.controlTimeline.snapshot().samples;
+              for (let index = samples.length - 1; index >= 0; index--) {
+                const sample = samples[index]!;
+                const application = sample.native_timing?.controller_application;
+                if (sample.method === "controller_submit" && sample.native_timing?.clock_id === owner.scope.native_boot_id &&
+                  application?.sequence === sequence && application.controller_generation === controllerGeneration &&
+                  application.owner.operation_id === owner.operation_id && application.owner.generation === owner.generation &&
+                  sameEffectScope(application.owner.scope, owner.scope))
+                  return { request_id: sample.request_id, timing: sample.native_timing };
+              }
+              return null;
+            },
             assertCurrent: () => {
               if (
                 this.controller !== channel ||
@@ -1766,7 +1803,8 @@ export class GameBridgeClient implements GameBridge {
   async disconnect() {
     await this.terminate();
   }
-  private async terminate(error: string | null = null) {
+  private async terminate(error: string | null = null,
+    initiating: { status: NativeRequestStatus; requestId: number | null } | null = null) {
     if (this.closing) return this.closing;
     this.connectionAbort?.abort();
     this.connectionAbort = null;
@@ -1777,10 +1815,13 @@ export class GameBridgeClient implements GameBridge {
         this.heartbeat = null;
       }
       this.controller?.contained();
+      const initiatingMethod = initiating?.requestId === null || !initiating ? null :
+        this.pending.get(initiating.requestId)?.timing.method ?? null;
       for (const [id, pending] of this.pending) {
         clearTimeout(pending.timer);
         this.finishTiming(id, pending, "unknown", performance.now(), null);
-        pending.reject(new Error("Native client emitter closed."));
+        pending.reject(new NativeRequestFault(initiating?.status ?? "transport_closed", pending.timing.method, id,
+          "dispatched", error ?? "Native client emitter closed.", null, initiating?.requestId ?? null, initiatingMethod));
       }
       this.controlTimeline.bindBoot(null);
       this.pending.clear();

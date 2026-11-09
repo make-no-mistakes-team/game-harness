@@ -14,6 +14,14 @@ type AppliedFrame = { sequence: number; ordered_edge_end: number; held: WorldHel
 const heldKeys: (keyof WorldHeld)[] = ["forward", "back", "left", "right", "jump", "sprint", "sneak", "attack", "use"];
 const neutralHeld: WorldHeld = { forward: false, back: false, left: false, right: false, jump: false,
   sprint: false, sneak: false, attack: false, use: false };
+export type ControllerLedgerReason = "admission_revoked" | "invalid_input" | "stale_owner" |
+  "nonincreasing_frame_sequence" | "unusable_native_clock" | "stale_native_frame" | "invalid_held_transition" |
+  "screen_requires_neutral_world_input" | "input_capacity_exceeded" | "invalid_input_ack" |
+  "ack_for_unsent_input" | "ack_overclaims_ordered_prefix" | "ack_held_mismatch" |
+  "application_partial" | "application_unknown";
+export type ControllerAckAdmission = "accepted" | "stale_or_duplicate" | "invalid_input_ack" |
+  "ack_for_unsent_input" | "ack_overclaims_ordered_prefix" | "ack_held_mismatch";
+type LedgerSubmission = InputSubmission & { reason: ControllerLedgerReason | null };
 
 function sameHeld(a: WorldHeld, b: WorldHeld): boolean {
   return heldKeys.every(key => a[key] === b[key]);
@@ -27,7 +35,7 @@ export class ControllerInputs {
   private frames: PendingFrame[] = [];
   private fenced = false;
   private retired = false;
-  private reason: string | null = null;
+  private reason: ControllerLedgerReason | null = null;
   private submittedSequence = 0;
   private acceptedFrameSequence = 0;
   private submittedEdges = 0;
@@ -40,7 +48,7 @@ export class ControllerInputs {
     this.controllerGeneration = safeCounterSchema.min(1).parse(controllerGeneration);
   }
 
-  submit(frame: ControllerInputFrame, nativeNowNs: string): InputSubmission {
+  submit(frame: ControllerInputFrame, nativeNowNs: string): LedgerSubmission {
     if (this.fenced) return this.rejected(this.reason ?? "admission_revoked");
     const parsed = controllerInputFrameSchema.safeParse(frame);
     if (!parsed.success) {
@@ -107,17 +115,17 @@ export class ControllerInputs {
       ordered_edge_start: entry.ordered_edge_start, ordered_edge_end: entry.ordered_edge_end };
   }
 
-  acceptAck(ack: InputAppliedAck): boolean {
-    if (this.retired) return false;
+  acceptAck(ack: InputAppliedAck): ControllerAckAdmission {
+    if (this.retired) return "stale_or_duplicate";
     const parsed = inputAppliedAckSchema.safeParse(ack);
     if (!parsed.success) {
       this.fence("invalid_input_ack");
-      return false;
+      return "invalid_input_ack";
     }
     const value = parsed.data;
-    if (value.controller_generation !== this.controllerGeneration) return false;
+    if (value.controller_generation !== this.controllerGeneration) return "stale_or_duplicate";
     const appliedSequence = this.applied?.sequence ?? 0;
-    if (value.sequence < appliedSequence) return false;
+    if (value.sequence < appliedSequence) return "stale_or_duplicate";
     // The latest applied identity is retained separately for subsequent consumed-prefix progress.
     const pending = this.frames.find(frame => frame.sequence === value.sequence && frame.sent);
     const target: AppliedFrame | null = value.sequence === appliedSequence ? this.applied : pending ? {
@@ -126,19 +134,19 @@ export class ControllerInputs {
     } : null;
     if (!target) {
       this.fence("ack_for_unsent_input");
-      return false;
+      return "ack_for_unsent_input";
     }
     if (value.ordered_edge_prefix > target.ordered_edge_end) {
       this.fence("ack_overclaims_ordered_prefix");
-      return false;
+      return "ack_overclaims_ordered_prefix";
     }
     if (value.ordered_edge_prefix < this.orderedEdgePrefix ||
       (this.lastInput !== null && (value.applied_native_tick < this.lastInput.applied_native_tick ||
         BigInt(value.applied_native_ns) < BigInt(this.lastInput.applied_native_ns))) ||
-      (value.sequence === appliedSequence && value.ordered_edge_prefix === this.orderedEdgePrefix)) return false;
+      (value.sequence === appliedSequence && value.ordered_edge_prefix === this.orderedEdgePrefix)) return "stale_or_duplicate";
     if (value.input_application === "confirmed" && !sameHeld(value.held, target.held)) {
       this.fence("ack_held_mismatch");
-      return false;
+      return "ack_held_mismatch";
     }
 
     this.applied = target;
@@ -146,8 +154,8 @@ export class ControllerInputs {
     this.lastInput = value;
     // Frame acknowledgment is not counted-edge consumption. The cumulative counters outlive snapshots.
     this.frames = this.frames.filter(frame => frame.sequence > value.sequence || !frame.sent);
-    if (value.input_application !== "confirmed") this.fence(value.reason ?? `input_application_${value.input_application}`);
-    return true;
+    if (value.input_application !== "confirmed") this.fence(`application_${value.input_application}`);
+    return "accepted";
   }
 
   revoke(): void {
@@ -195,11 +203,11 @@ export class ControllerInputs {
       sameEffectScope(owner.scope, this.owner.scope);
   }
 
-  private rejected(reason: string): InputSubmission {
+  private rejected(reason: ControllerLedgerReason): LedgerSubmission {
     return { sequence: this.submittedSequence, status: "rejected", reason };
   }
 
-  private fence(reason: string): void {
+  private fence(reason: ControllerLedgerReason): void {
     this.fenced = true;
     this.reason ??= reason;
   }

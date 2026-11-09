@@ -2,17 +2,40 @@ import { z } from "zod";
 import type { Json } from "../shared/contracts.ts";
 import { expectedEffectOwnerSchema, safeCounterSchema, sameEffectScope, type ExpectedEffectOwner } from "../shared/control.ts";
 import { controllerEffectUpdateSchema, inputAppliedAckSchema, nativeNanosecondsSchema, revocationAckSchema,
-  type ControllerEffectUpdate, type ControllerInput, type ControllerInputChannel, type InputAppliedAck,
+  type ControllerChannelFault, type ControllerEffectUpdate, type ControllerInput, type ControllerInputChannel, type InputAppliedAck,
   type InputSubmission, type RevocationAck } from "../shared/controller.ts";
 import { minecraftControllerFrameRequestSchema, minecraftControllerFrameSchema, type MinecraftControllerFrame } from "../shared/minecraft.ts";
 import { ControllerInputs } from "./controller-inputs.ts";
-import type { NativeClockCorrespondence } from "./performance.ts";
+import type { NativeClockCorrespondence, NativeControlTiming } from "./performance.ts";
+
+export type NativeRequestStatus = "not_dispatched" | "native_rejected" | "write_failed" |
+  "request_timeout" | "transport_closed" | "protocol_invalid";
+/** Constructed only at the trusted transport boundary, never from serialized source errors. */
+export class NativeRequestFault extends Error {
+  constructor(readonly status: NativeRequestStatus, readonly method: string, readonly requestId: number | null,
+    readonly dispatch: "not_dispatched" | "dispatched", detail: string,
+    readonly nativeTiming: NativeControlTiming | null = null, readonly initiatingRequestId: number | null = requestId,
+    readonly initiatingMethod: string | null = method) {
+    super(detail.slice(0, 1000));
+    this.name = "NativeRequestFault";
+  }
+}
+export class ControllerChannelFaultError extends Error {
+  constructor(readonly fault: ControllerChannelFault | null, detail: string) {
+    super(detail);
+    this.name = "ControllerChannelFaultError";
+  }
+}
 
 export interface ControllerChannelTransport {
   /** Dispatches in call order, before returning; native heartbeat and submit share an ordered receiver. */
   request(method: string, params: unknown, timeout: number): Promise<unknown>;
   sample(params: unknown): Promise<MinecraftControllerFrame>;
   clock(): NativeClockCorrespondence | null;
+  /** Read only on a faulted retirement; success replies keep their ordinary shape. */
+  retirementTiming?(): NativeControlTiming | null;
+  /** Consulted only for a failed application response with exact native sequence evidence. */
+  applicationEvidence?(sequence: number): { request_id: number; timing: NativeControlTiming } | null;
   assertCurrent(): void;
   retired(ack: RevocationAck, generation: number): void;
   failed(): Promise<void>;
@@ -51,6 +74,8 @@ export class NativeControllerChannel implements ControllerInputChannel {
   private retirement: Promise<RevocationAck> | null = null;
   private lastEffectSequence = 0;
   private failureReason: string | null = null;
+  private firstFault: ControllerChannelFault | null = null;
+  private admissionFault: ControllerChannelFault | null = null;
 
   constructor(owner: ExpectedEffectOwner, readonly controllerGeneration: number, private readonly deadlineHostMs: number,
     private readonly transport: ControllerChannelTransport, private readonly applied: (ack: InputAppliedAck) => void,
@@ -61,7 +86,8 @@ export class NativeControllerChannel implements ControllerInputChannel {
   get owner(): ExpectedEffectOwner { return structuredClone(this.expectedOwner); }
   snapshot() {
     const snapshot = this.inputs.snapshot();
-    return this.failureReason === null ? snapshot : { ...snapshot, reason: this.failureReason };
+    return { ...snapshot, reason: this.failureReason ?? snapshot.reason,
+      fault: this.firstFault === null ? this.admissionFault === null ? null : structuredClone(this.admissionFault) : structuredClone(this.firstFault) };
   }
   private identity() { return { owner: this.expectedOwner, controller_generation: this.controllerGeneration }; }
   private decisionDiagnostic(stage: string, frame: MinecraftControllerFrame | null, now: number, nativeUpper: string | null): string {
@@ -71,7 +97,36 @@ export class NativeControllerChannel implements ControllerInputChannel {
       (nativeUpper === null ? "" : ` native_now_upper_ns=${nativeUpper}` +
         (frame === null ? "" : ` native_age_upper_ns=${BigInt(nativeUpper) - BigInt(frame.captured_native_ns)}`));
   }
-  private failed(reason: string): void {
+  private fault(stage: ControllerChannelFault["stage"], cause: ControllerChannelFault["cause"], detail: string,
+    frame: { frame_seq: number; captured_native_ns: string } | null = null, sequence: number | null = null,
+    error: unknown = null, dispatch: ControllerChannelFault["decision_dispatch"] = "not_dispatched"): ControllerChannelFault {
+    const native = error instanceof NativeRequestFault ? error : null;
+    const evidence = native === null && sequence !== null ? this.transport.applicationEvidence?.(sequence) ?? null : null;
+    const fence = this.nativeFence(native?.nativeTiming ?? evidence?.timing ?? null);
+    if (native) {
+      cause = native.status;
+      dispatch = native.dispatch;
+      if (native.status === "native_rejected" && fence?.reason === "native_input_lease_expired") cause = "native_lease_expired";
+      if (native.status === "native_rejected" && fence?.reason === "queued_frame_expired_before_application") cause = "native_frame_expired";
+    }
+    return { schema_version: 1, stage, cause, decision_dispatch: dispatch, owner: structuredClone(this.expectedOwner),
+      controller_generation: this.controllerGeneration, sequence, frame_seq: frame?.frame_seq ?? null,
+      captured_native_ns: frame?.captured_native_ns ?? null, request_id: native?.requestId ?? evidence?.request_id ?? null,
+      request_method: native?.method ?? (evidence ? "controller_submit" : null), initiating_request_id: native?.initiatingRequestId ?? null,
+      initiating_method: native?.initiatingMethod ?? null, host_detected_ms: performance.now(),
+      original_deadline_host_ms: this.deadlineHostMs, native_first_fence: fence, detail: detail.slice(0, 2000) };
+  }
+  private nativeFence(timing: NativeControlTiming | null): ControllerChannelFault["native_first_fence"] {
+    const lease = timing?.controller_lease;
+    if (timing?.clock_id !== this.expectedOwner.scope.native_boot_id || !lease ||
+      lease.owner.operation_id !== this.expectedOwner.operation_id || lease.owner.generation !== this.expectedOwner.generation ||
+      !sameEffectScope(lease.owner.scope, this.expectedOwner.scope) || lease.controller_generation !== this.controllerGeneration ||
+      lease.first_fence_reason === null || lease.first_fence_native_ns === null) return null;
+    return { reason: lease.first_fence_reason, native_ns: lease.first_fence_native_ns,
+      checked_native_ns: lease.checked_native_ns, effective_deadline_native_ns: lease.effective_deadline_native_ns };
+  }
+  private failed(reason: string, fault: ControllerChannelFault): void {
+    this.firstFault ??= fault;
     const retainedReason = this.inputs.snapshot().reason;
     this.failureReason ??= retainedReason !== null && retainedReason !== "admission_revoked" ? retainedReason : reason;
     this.inputs.revoke();
@@ -80,10 +135,19 @@ export class NativeControllerChannel implements ControllerInputChannel {
   private current(): void {
     // A self-retired channel keeps the actual first failure, even after the
     // transport detaches this owner and can report only "owner has retired".
-    if (this.failureReason !== null) throw new Error(this.failureReason);
-    this.transport.assertCurrent();
-    if (this.retirement || this.inputs.snapshot().fenced || performance.now() >= this.deadlineHostMs)
-      throw new Error("Controller ordinary admission is fenced or expired.");
+    if (this.failureReason !== null) throw new ControllerChannelFaultError(this.firstFault, this.failureReason);
+    try { this.transport.assertCurrent(); } catch (error) {
+      const detail = error instanceof Error ? error.message : "Controller scope changed";
+      this.firstFault ??= this.fault("scope", "scope_changed", detail, null, null, error, "not_applicable");
+      throw new ControllerChannelFaultError(this.firstFault, detail);
+    }
+    if (this.retirement || this.inputs.snapshot().fenced || performance.now() >= this.deadlineHostMs) {
+      const detail = "Controller ordinary admission is fenced or expired.";
+      if (performance.now() >= this.deadlineHostMs)
+        this.firstFault ??= this.fault("task_deadline", "task_deadline", detail, null, null, null, "not_applicable");
+      throw new ControllerChannelFaultError(this.firstFault ??
+        this.fault("retirement", "admission_revoked", detail, null, null, null, "not_applicable"), detail);
+    }
   }
   private track<T>(operation: Promise<T>): Promise<T> {
     this.inflight.add(operation);
@@ -94,8 +158,17 @@ export class NativeControllerChannel implements ControllerInputChannel {
     this.current();
     const audio = minecraftControllerFrameRequestSchema.parse({ audio_cursor: audioCursor });
     const work = (async () => {
-      const frame = await this.transport.sample({ ...this.identity(), ...audio });
+      let frame: MinecraftControllerFrame;
+      try { frame = await this.transport.sample({ ...this.identity(), ...audio }); } catch (error) {
+        const detail = error instanceof Error ? error.message : "Controller sample failed";
+        // A rejected read did not previously fence actuator admission. Preserve
+        // that policy while carrying its trusted evidence to the session.
+        const fault = this.firstFault ?? this.fault("sample", "transport_unknown", detail, null, null, error, "unknown");
+        if (this.firstFault === null) this.admissionFault = fault;
+        throw new ControllerChannelFaultError(fault, detail);
+      }
       this.current();
+      if (this.admissionFault?.stage === "sample") this.admissionFault = null;
       if (this.captures.size === 16) this.captures.delete(this.captures.keys().next().value!);
       this.captures.set(frame.frame_seq, { tick: frame.native_tick, nanos: frame.captured_native_ns });
       return frame;
@@ -111,24 +184,36 @@ export class NativeControllerChannel implements ControllerInputChannel {
   }
   submit(frame: Json, input: ControllerInput): InputSubmission {
     let submission: InputSubmission;
+    let parsed: MinecraftControllerFrame | null = null;
+    let stage: ControllerChannelFault["stage"] = "capture_identity";
     try {
       this.current();
-      const parsed = this.capture(frame);
+      parsed = this.capture(frame);
+      stage = "clock_bound";
       const now = performance.now(), nativeUpper = nativeNowUpper(this.transport.clock(), now);
-      submission = this.inputs.submit({ context: { ...this.identity(), source_hash: this.expectedOwner.scope.source_hash,
+      stage = "submit_admission";
+      const admitted = this.inputs.submit({ context: { ...this.identity(), source_hash: this.expectedOwner.scope.source_hash,
         frame_seq: parsed.frame_seq, observed_native_tick: parsed.native_tick, captured_native_ns: parsed.captured_native_ns }, input },
       nativeUpper);
-      if (submission.status === "rejected")
+      submission = admitted;
+      if (submission.status === "rejected") {
+        this.admissionFault = this.fault(stage, admitted.reason ?? "invalid_input", submission.reason ?? "Controller admission rejected", parsed);
         submission = { ...submission, reason: `${submission.reason}; ${this.decisionDiagnostic("controller_submit_admission", parsed, now, nativeUpper)} input_kind=${input.kind}` };
+      }
     } catch (error) {
+      this.firstFault ??= error instanceof ControllerChannelFaultError ? error.fault :
+        this.fault(stage, stage === "capture_identity" ? "unretained_capture" : "unusable_native_clock",
+          error instanceof Error ? error.message : "Controller submission rejected", parsed);
       this.inputs.revoke();
       submission = { sequence: this.inputs.snapshot().submitted_sequence, status: "rejected",
         reason: error instanceof Error ? error.message : "Controller submission rejected" };
     }
     if (submission.status === "rejected") {
-      if (this.inputs.snapshot().fenced) this.failed(submission.reason ?? "Controller submission rejected");
+      if (this.inputs.snapshot().fenced) this.failed(submission.reason ?? "Controller submission rejected",
+        this.firstFault ?? this.admissionFault ?? this.fault("submit_admission", "invalid_input", submission.reason ?? "Rejected"));
       return submission;
     }
+    this.admissionFault = null;
     // Drain on a microtask so successive still-unsent compatible held snapshots may coalesce.
     queueMicrotask(() => this.drain());
     return submission;
@@ -137,6 +222,7 @@ export class NativeControllerChannel implements ControllerInputChannel {
     for (;;) {
       const remainingTaskMs = this.deadlineHostMs - performance.now();
       if (remainingTaskMs <= 0) {
+        this.firstFault ??= this.fault("task_deadline", "task_deadline", "Original controller deadline expired", null, null, null, "not_applicable");
         this.inputs.revoke();
         void this.revoke().catch(() => {});
         return;
@@ -145,36 +231,74 @@ export class NativeControllerChannel implements ControllerInputChannel {
       if (next === null) break;
       const applicationMs = next.frame.input.kind === "screen" ? 5000 + 4000 * next.frame.input.operations.length : 2000;
       const dispatched = performance.now();
+      let stage: ControllerChannelFault["stage"] = "submit_response";
+      let cause: ControllerChannelFault["cause"] = "transport_unknown";
       const work = this.transport.request("controller_submit", next, Math.max(1, Math.min(applicationMs, remainingTaskMs))).then(raw => {
-        const ack = inputAppliedAckSchema.parse(raw);
-        if (!this.inputs.acceptAck(ack)) throw new Error("Controller application ACK is duplicate, stale or invalid.");
+        stage = "ack_schema"; cause = "invalid_ack";
+        const parsed = inputAppliedAckSchema.safeParse(raw);
+        if (!parsed.success) {
+          this.firstFault ??= this.fault(stage, cause, "Controller application ACK failed schema validation",
+            next.frame.context, next.sequence, null, "dispatched");
+          throw new ControllerChannelFaultError(this.firstFault, "Controller application ACK failed schema validation");
+        }
+        const ack = parsed.data;
+        stage = "ack_relation";
+        const admission = this.inputs.acceptAck(ack);
+        if (admission !== "accepted") {
+          cause = admission;
+          this.firstFault ??= this.fault(stage, cause, `Controller application ACK rejected: ${admission}`,
+            next.frame.context, next.sequence, null, "dispatched");
+          throw new ControllerChannelFaultError(this.firstFault, `Controller application ACK rejected: ${admission}`);
+        }
         // Retain the native cause before callbacks or queued failures can replace it with a retirement symptom.
-        if (ack.input_application !== "confirmed")
+        if (ack.input_application !== "confirmed") {
           this.failureReason ??= ack.reason ?? `input_application_${ack.input_application}`;
-        this.applied(ack);
+          this.firstFault ??= this.fault("application", `application_${ack.input_application}`, this.failureReason,
+            next.frame.context, next.sequence, null, "dispatched");
+        }
+        stage = "applied_callback"; cause = "applied_callback_failed";
+        try { this.applied(ack); } catch (error) {
+          this.firstFault ??= this.fault(stage, cause, error instanceof Error ? error.message : "Applied callback failed",
+            next.frame.context, next.sequence, null, "dispatched");
+          throw error;
+        }
         if (this.inputs.snapshot().fenced) void this.revoke().catch(() => {});
       }).catch(error => {
         const context = next.frame.context;
-        this.failed(`${error instanceof Error ? error.message : String(error)}; controller_submit` +
+        const reason = `${error instanceof Error ? error.message : String(error)}; controller_submit` +
           ` operation_id=${this.expectedOwner.operation_id} owner_generation=${this.expectedOwner.generation}` +
           ` controller_generation=${this.controllerGeneration} native_boot_id=${this.expectedOwner.scope.native_boot_id}` +
           ` sequence=${next.sequence} input_kind=${next.frame.input.kind} frame_seq=${context.frame_seq}` +
           ` native_tick=${context.observed_native_tick} captured_native_ns=${context.captured_native_ns}` +
-          ` host_dispatch_ms=${dispatched} response_elapsed_ms=${Math.max(0, performance.now() - dispatched)}`);
+          ` host_dispatch_ms=${dispatched} response_elapsed_ms=${Math.max(0, performance.now() - dispatched)}`;
+        this.failed(reason, this.fault(error instanceof NativeRequestFault && error.dispatch === "not_dispatched" ? "submit_dispatch" : stage,
+          cause, reason, context, next.sequence, error, stage === "submit_response" ? "unknown" : "dispatched"));
       });
       this.track(work);
     }
   }
   async renew(frame: Json | null): Promise<void> {
     this.current();
-    const captured = frame === null ? null : this.capture(frame);
+    let captured: MinecraftControllerFrame | null = null;
+    try { captured = frame === null ? null : this.capture(frame); } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unretained controller capture";
+      this.admissionFault = this.fault("capture_identity", "unretained_capture", detail);
+      throw new ControllerChannelFaultError(this.admissionFault, detail);
+    }
     const now = performance.now(), deadline = Math.min(this.deadlineHostMs, now + 250);
     let nativeUpper: string | null = null;
     if (captured !== null) {
-      nativeUpper = nativeNowUpper(this.transport.clock(), now);
+      try { nativeUpper = nativeNowUpper(this.transport.clock(), now); } catch (error) {
+        const detail = error instanceof Error ? error.message : "Unusable native clock";
+        this.admissionFault = this.fault("clock_bound", "unusable_native_clock", detail, captured);
+        throw new ControllerChannelFaultError(this.admissionFault, detail);
+      }
       const age = BigInt(nativeUpper) - BigInt(captured.captured_native_ns);
-      if (age < 0n || age > 150000000n)
-        throw new Error(`A stale decision cannot renew the native input lease; ${this.decisionDiagnostic("controller_heartbeat_admission", captured, now, nativeUpper)}`);
+      if (age < 0n || age > 150000000n) {
+        const detail = `A stale decision cannot renew the native input lease; ${this.decisionDiagnostic("controller_heartbeat_admission", captured, now, nativeUpper)}`;
+        this.admissionFault = this.fault("heartbeat_admission", "stale_native_frame", detail, captured);
+        throw new ControllerChannelFaultError(this.admissionFault, detail);
+      }
     }
     if (this.latestHeartbeat !== null) {
       // Only a newer dispatch can extend local admission, never a delayed ACK.
@@ -182,8 +306,8 @@ export class NativeControllerChannel implements ControllerInputChannel {
       if (now >= this.latestHeartbeat.deadlineHostMs) {
         const reason = `Controller heartbeat admission is past its latest dispatched lease deadline; ` +
           this.decisionDiagnostic("controller_heartbeat_admission", captured, now, nativeUpper);
-        this.failed(reason);
-        throw new Error(reason);
+        this.failed(reason, this.fault("heartbeat_admission", "host_lease_expired", reason, captured));
+        throw new ControllerChannelFaultError(this.firstFault, reason);
       }
       if (captured === null && this.heartbeats.has(this.latestHeartbeat.work)) {
         await this.latestHeartbeat.work;
@@ -193,17 +317,25 @@ export class NativeControllerChannel implements ControllerInputChannel {
     if (this.heartbeats.size >= 8) {
       const reason = `Controller heartbeat outstanding response bound reached; ` +
         this.decisionDiagnostic("controller_heartbeat_admission", captured, now, nativeUpper);
-      this.failed(reason);
-      throw new Error(reason);
+      this.failed(reason, this.fault("heartbeat_admission", "heartbeat_capacity", reason, captured));
+      throw new ControllerChannelFaultError(this.firstFault, reason);
     }
+    let nativeDeadline: string;
+    try { nativeDeadline = controllerNativeDeadline(this.transport.clock(), deadline, now); } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unusable native clock";
+      this.admissionFault = this.fault("clock_bound", "unusable_native_clock", detail, captured);
+      throw new ControllerChannelFaultError(this.admissionFault, detail);
+    }
+    this.admissionFault = null;
     const work = this.transport.request("controller_heartbeat", { ...this.identity(),
-      deadline_native_ns: controllerNativeDeadline(this.transport.clock(), deadline, now) }, 1000).then(() => {
+      deadline_native_ns: nativeDeadline }, 1000).then(() => {
       this.transport.assertCurrent();
     }).catch(error => {
       const reason = `${error instanceof Error ? error.message : String(error)}; ${this.decisionDiagnostic("controller_heartbeat", captured, now, nativeUpper)}` +
         ` response_elapsed_ms=${Math.max(0, performance.now() - now)}`;
-      this.failed(reason);
-      throw new Error(reason);
+      this.failed(reason, this.fault(error instanceof NativeRequestFault && error.dispatch === "not_dispatched" ? "heartbeat_dispatch" : "heartbeat_response",
+        "transport_unknown", reason, captured, null, error, "unknown"));
+      throw new ControllerChannelFaultError(this.firstFault, reason);
     });
     this.track(work);
     this.heartbeats.add(work);
@@ -236,10 +368,18 @@ export class NativeControllerChannel implements ControllerInputChannel {
         if (result.generation <= this.expectedOwner.generation || !this.inputs.acceptRevocation(result.ack))
           throw new Error("Controller retirement ACK is not actual current-owner retirement.");
         await Promise.allSettled([...this.inflight]);
+        if (this.firstFault && this.firstFault.native_first_fence === null) {
+          this.firstFault.native_first_fence = this.nativeFence(this.transport.retirementTiming?.() ?? null);
+        }
         this.transport.retired(result.ack, result.generation);
         done.resolve(result.ack);
       } catch (error) {
-        await this.transport.failed();
+        const detail = error instanceof Error ? error.message : "Controller retirement remains unknown.";
+        this.firstFault ??= this.fault("retirement", "retirement_unknown", detail, null, null, error, "unknown");
+        try { await this.transport.failed(); } catch (cleanupError) {
+          done.reject(new AggregateError([error, cleanupError], detail));
+          return;
+        }
         done.reject(error instanceof Error ? error : new Error("Controller retirement remains unknown."));
       }
     })();

@@ -25,13 +25,13 @@ import type { EffectContext, EffectInvocation, EffectScope } from "../shared/con
 import { assertExecutableCompatible } from "./effect-contract.ts";
 import { RegisteredAdapterContract } from "./registered-adapter.ts";
 import { MAX_SKILL_LIMITS, SKILL_API_VERSION } from "../shared/programs.ts";
-import { SkillCleanupError, type SandboxService } from "./sandbox.ts";
+import { ResidentWorkerFault, SkillCleanupError, type SandboxService } from "./sandbox.ts";
 import type { Store } from "./store.ts";
 import type { LookaheadConfig } from "../shared/planning.ts";
 import { ExecutionTrace } from "./execution-trace.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { HOST_MONOTONIC_CLOCK_ID } from "./performance.ts";
-import { capabilityFailure, GeneratedResultValidationError, parseGeneratedSkillResult, programDiagnostic } from "./program-diagnostics.ts";
+import { capabilityFailure, GeneratedControllerResultValidationError, GeneratedResultValidationError, parseGeneratedSkillResult, programDiagnostic } from "./program-diagnostics.ts";
 import type { ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck } from "../shared/controller.ts";
 import type { ResidentAnalysisResult, ResidentLifecycle, ResidentSnapshot, ResidentControllerOptions } from "../shared/resident.ts";
 import { ResidentCleanupError, controllerStepResultSchema, executiveStepResultSchema, residentActivationResultSchema } from "../shared/resident.ts";
@@ -396,12 +396,37 @@ export class SkillManager {
     // One isolated candidate remains bounded by the predecessor's original
     // authority, including strategic delays longer than worker startup.
     record.timer = setTimeout(abort, Math.max(1, deadlineHostMs - performance.now()));
+    let stage = "authority", faultRecorded = false;
+    const preparationEvidence = () => ({ predecessor_execution_id: predecessorId,
+      skill_id: skill.skill_id, version: skill.version, source_hash: skill.hash,
+      original_deadline_host_ms: deadlineHostMs, host_clock_id: HOST_MONOTONIC_CLOCK_ID,
+      host_monotonic_ms: performance.now() });
+    const retainFault = (error: unknown) => {
+      if (faultRecorded) return;
+      faultRecorded = true;
+      const fault: Json = error instanceof ResidentWorkerFault
+        ? { kind: "worker", origin: error.origin, trusted_origin: error.trustedOrigin }
+        : error instanceof GeneratedControllerResultValidationError
+          ? { kind: "generated_result", issues: error.issues.slice(0, 8).map(issue => {
+            const detail: { [key: string]: Json } = { code: issue.code, path: issue.path };
+            if (issue.maximum !== undefined) detail.maximum = issue.maximum;
+            if (issue.actual !== undefined) detail.actual = issue.actual;
+            return detail;
+          }) }
+          : error instanceof RuntimeFault ? { kind: "authority", code: error.code }
+          : error instanceof ResidentCleanupError ? { kind: "cleanup" } : { kind: "opaque" };
+      this.store.event(runId, "program.preparation_failed", "Candidate preparation failed before predecessor retirement", {
+        ...preparationEvidence(), stage, fault, predecessor_retirement_started: false,
+      });
+    };
     record.task = Promise.resolve().then(async () => {
       record.assertCurrent();
+      stage = "shadow_start";
       const shadow = await this.sandbox.createResidentWorker!(skill.source, parsed.limits.step_ms, record.controller.signal) as ResidentPreparedWorker;
       record.workers.add(shadow);
       try {
         record.assertCurrent();
+        stage = "shadow_sample";
         const frame = minecraftControllerFrameSchema.parse(await this.host.queryCapability("minecraft.controller_frame", 2, { audio_cursor: null }));
         record.assertCurrent();
         if (frame.life_id !== parsed.life_id || frame.space.space_epoch !== parsed.space_epoch)
@@ -410,14 +435,19 @@ export class SkillManager {
           schema_version: 1 as const, session_id: predecessorId, behavior_generation: 1, producer: "none" as const,
           task_high_water: 0, tasks: [], last_command_error: null, restarts: 0, deadline_host_ms: deadlineHostMs,
         } } : frame;
+        stage = "shadow_activate";
         const result = residentActivationResultSchema.parse(await (shadow.activate ?? shadow.step).call(shadow, probeFrame, structuredClone(parsed.initial_state),
           structuredClone(parsed.args), record.controller.signal));
+        stage = "shadow_result";
         if ("refused" in result || result.status === "blocked")
           throw new RuntimeFault("precondition_failed", "Candidate refused shadow activation");
         // A valid result for another entry mode is still an invalid successor.
         (parsed.session ? executiveStepResultSchema : controllerStepResultSchema).parse(result);
         record.assertCurrent();
+      } catch (error) {
+        retainFault(error); throw error;
       } finally {
+        stage = "shadow_close";
         try { await shadow.close(); record.workers.delete(shadow); }
         catch {
           const error = new ResidentCleanupError();
@@ -425,17 +455,32 @@ export class SkillManager {
         }
       }
       record.assertCurrent();
+      stage = "clean_start";
       const clean = await this.sandbox.createResidentWorker!(skill.source, parsed.limits.step_ms, record.controller.signal) as ResidentPreparedWorker;
       record.workers.add(clean);
       record.assertCurrent();
       record.worker = clean;
+      stage = "ready";
+      this.store.event(runId, "program.preparation_ready", "Separate clean candidate compiled; no live activation or gameplay proof", preparationEvidence());
+    }).catch(error => {
+      retainFault(error); throw error;
     });
     try {
       await record.task;
       record.assertCurrent();
       return { assertCurrent: record.assertCurrent, close: () => this.closePrepared(record) };
     } catch (error) {
-      await this.closePrepared(record);
+      try {
+        await this.closePrepared(record);
+        this.store.event(runId, "program.preparation_cleanup", "Failed candidate workers drained; no successor activated", {
+          ...preparationEvidence(), workers_closed: true,
+        });
+      } catch (cleanup) {
+        this.store.event(runId, "program.preparation_cleanup", "Candidate cleanup unconfirmed; containment remains required", {
+          ...preparationEvidence(), workers_closed: false,
+        });
+        throw cleanup;
+      }
       throw error;
     }
   }

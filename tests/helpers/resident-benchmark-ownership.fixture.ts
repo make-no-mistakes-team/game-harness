@@ -542,6 +542,7 @@ mock.module(
               pending_edges: 0,
               last_input: null,
               reason: retired ? "synthetic-retired" : null,
+              fault: null,
             }),
           };
           try {

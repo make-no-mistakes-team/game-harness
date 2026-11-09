@@ -101,6 +101,37 @@ export const controllerReservationSchema = z.object({
   invocation: effectInvocationSchema, expected_screen: effectScreenPreconditionSchema,
 }).strict().refine(value => value.scope.execution_id === value.invocation.execution_id &&
   value.scope.source_hash === value.invocation.source_hash, { message: "Controller invocation must match its host scope" });
+/** Host-only evidence. Neither this record nor transport timing is an actor observation. */
+export interface ControllerChannelFault {
+  schema_version: 1;
+  stage: "sample" | "capture_identity" | "clock_bound" | "submit_admission" | "submit_dispatch" |
+    "submit_response" | "ack_schema" | "ack_relation" | "application" | "applied_callback" |
+    "heartbeat_admission" | "heartbeat_dispatch" | "heartbeat_response" | "scope" | "task_deadline" | "retirement";
+  cause: "admission_revoked" | "invalid_input" | "stale_owner" | "nonincreasing_frame_sequence" |
+    "unusable_native_clock" | "stale_native_frame" | "invalid_held_transition" |
+    "screen_requires_neutral_world_input" | "input_capacity_exceeded" | "invalid_input_ack" |
+    "ack_for_unsent_input" | "ack_overclaims_ordered_prefix" | "ack_held_mismatch" | "stale_or_duplicate" |
+    "application_partial" | "application_unknown" | "invalid_ack" | "unretained_capture" | "transport_unknown" |
+    "not_dispatched" | "native_rejected" | "write_failed" | "request_timeout" | "transport_closed" | "protocol_invalid" |
+    "native_lease_expired" | "native_frame_expired" | "host_lease_expired" | "heartbeat_capacity" |
+    "scope_changed" | "task_deadline" | "applied_callback_failed" | "retirement_unknown";
+  decision_dispatch: "not_dispatched" | "dispatched" | "unknown" | "not_applicable";
+  owner: ExpectedEffectOwner;
+  controller_generation: number;
+  sequence: number | null;
+  frame_seq: number | null;
+  captured_native_ns: string | null;
+  request_id: number | null;
+  request_method: string | null;
+  initiating_request_id: number | null;
+  initiating_method: string | null;
+  host_detected_ms: number;
+  original_deadline_host_ms: number;
+  native_first_fence: {
+    reason: string; native_ns: string; checked_native_ns: string; effective_deadline_native_ns: string;
+  } | null;
+  detail: string;
+}
 export interface ControllerInputChannel {
   readonly owner: ExpectedEffectOwner;
   readonly controllerGeneration: number;
@@ -114,6 +145,6 @@ export interface ControllerInputChannel {
   snapshot(): {
     fenced: boolean; retired: boolean; submitted_sequence: number; applied_sequence: number;
     ordered_edge_prefix: number; pending_frames: number; pending_edges: number;
-    last_input: InputAppliedAck | null; reason: string | null;
+    last_input: InputAppliedAck | null; reason: string | null; fault: ControllerChannelFault | null;
   };
 }

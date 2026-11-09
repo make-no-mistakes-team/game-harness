@@ -82,7 +82,7 @@ async function fixture(analysisFactory?: (budget: number) => Promise<ResidentAna
         submit() { if (output !== "running") throw new Error("Completed neutral step must retire without input");
           return { sequence: ++submitted, status: "submitted", reason: null }; }, renew: async () => {},
         async revoke() { await hooks.retire?.(); lifecycle.fence("retire"); await lifecycle.drain(); retired = true; return { owner, controller_generation: generation, admission_revoked: true, last_applied_sequence: 0, ordered_edge_prefix: 0, retirement_applied_native_tick: sequence, retirement_applied_native_ns: String(BigInt(sequence) * 50000000n), input_application: "confirmed", unresolved_operation_refs: [] } satisfies RevocationAck; },
-        snapshot: () => ({ fenced: retired, retired, submitted_sequence: submitted, applied_sequence: 0, ordered_edge_prefix: 0, pending_frames: retired ? 0 : submitted, pending_edges: 0, last_input: null, reason: null }),
+        snapshot: () => ({ fenced: retired, retired, submitted_sequence: submitted, applied_sequence: 0, ordered_edge_prefix: 0, pending_frames: retired ? 0 : submitted, pending_edges: 0, last_input: null, reason: null, fault: null }),
       } satisfies ControllerInputChannel;
     },
   });
@@ -374,11 +374,17 @@ test(`candidate startup failure in preparation worker ${failedFactory} preserves
   const successor = await f.manager.register(f.run.run_id, { entry: "step", name: "startup successor", source, card, dependencies: [] });
   candidateSource = successor.source;
   await expect(f.manager.retireForHandoff(f.run.run_id, { ...request, skill_id: successor.skill_id, version: successor.version,
-    start_key: "startup-successor" }, old.execution_id, undefined)).rejects.toThrow("Injected startup failure");
+    start_key: "startup-successor" }, old.execution_id, undefined)).rejects.toThrow();
   expect(attempts).toBe(failedFactory);
   expect(candidateClosed).toBe(failedFactory - 1);
   expect(f.manager.effectScope(old.execution_id)).not.toBeNull();
   expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  expect(f.store.latestEvent(f.run.run_id, "program.preparation_failed")?.details).toMatchObject({
+    predecessor_execution_id: old.execution_id, source_hash: successor.hash,
+    stage: failedFactory === 1 ? "shadow_start" : "clean_start",
+    fault: { kind: "opaque" }, predecessor_retirement_started: false,
+  });
+  expect(f.store.latestEvent(f.run.run_id, "program.preparation_cleanup")?.details).toMatchObject({ workers_closed: true });
 });
 
 for (const race of ["Stop", "scope", "intent", "source"] as const)

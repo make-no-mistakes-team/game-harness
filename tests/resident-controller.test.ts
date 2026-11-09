@@ -71,7 +71,7 @@ function harness(limits: Partial<ResidentLimits> = {}, trace?: ResidentControlle
       retirement_applied_native_tick: 9, retirement_applied_native_ns: "9000000000", input_application: "confirmed", unresolved_operation_refs: [] } satisfies RevocationAck; },
     snapshot() { return { fenced, retired, submitted_sequence: seq, applied_sequence: last?.sequence ?? 0,
       ordered_edge_prefix: last?.ordered_edge_prefix ?? 0, pending_frames: retired ? 0 : sent.filter(s => s.sequence > (last?.sequence ?? 0)).length,
-      pending_edges: 0, last_input: last, reason: null }; },
+      pending_edges: 0, last_input: last, reason: null, fault: null }; },
   };
   const options: ResidentControllerOptions = { execution_id: "resident", source_hash: hash, controller_generation: 1,
     limits: { ...DEFAULT_RESIDENT_LIMITS, ...limits }, deadline_host_ms: 10000, initial_state: 0, intent: {}, clock, trace,

@@ -39,7 +39,7 @@ afterEach(async () => {
   }
 });
 
-async function repeatedNoEffectFixture() {
+async function repeatedNoEffectFixture(executive = false) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-no-effect-")), store = new Store(directory);
   const adapter = minecraftTestAdapter(), observation = minecraftObservationFixture(adapter);
   const state: GameState = { status: "connected", username: "Fixture", version: "1.21.4", world_id: observation.world_id,
@@ -50,12 +50,19 @@ async function repeatedNoEffectFixture() {
   const ready = Promise.withResolvers<(request: SkillCapabilityRequest) => Promise<Json>>();
   let result: GameActionResult = { status: "succeeded", summary: "Explicit neutral outcome",
     evidence: { world_effect_emitted: false, neutralized: true, camera_changed: false } };
-  let settle: (() => Promise<GameActionResult>) | null = null, nativeCalls = 0, aborts = 0;
+  let settle: (() => Promise<GameActionResult>) | null = null, nativeCalls = 0, aborts = 0, sample = 0;
   const game: GameBridge = {
     connect: async () => {}, disconnect: async () => {}, snapshot: () => state, observe: async () => observation,
     execute: async () => { nativeCalls++; return settle ? await settle() : result; },
     cancel: async () => {}, neutralize: async () => {}, emergencyStop: async () => {},
     adapter: () => adapter, subscribe: () => () => {},
+    openController: async () => { throw new Error("Observe-only executive must not acquire raw input"); },
+    queryCapability: async () => {
+      const frame = controllerFrameFixture(observation.life.life_id, observation.space.space_epoch);
+      frame.frame_seq = ++sample; frame.native_tick = sample; frame.captured_native_ns = String(sample * 50000000);
+      frame.dynamic_entities.native_tick = sample; frame.dynamic_entities.captured_native_ns = frame.captured_native_ns;
+      return jsonSchema.parse(frame);
+    },
   };
   const contexts: Record<string, any>[] = [];
   let tools: AgentTool[] = [];
@@ -69,14 +76,21 @@ async function repeatedNoEffectFixture() {
       contexts.push(JSON.parse(text));
       await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
       if (contexts.length === 1) {
-        await tools.find(tool => tool.name === "program_write")!.execute("no-effect-write", {
-          name: "Neutral repeated actions", source: 'for (let i=0;i<64;i++) { await game.action({kind:"look",yaw:0,pitch:0}); } return {status:"completed",summary:"Finite neutral observations",result:null};',
+        const written = await tools.find(tool => tool.name === "program_write")!.execute("no-effect-write", {
+          ...(executive ? { entry: "step" } : {}),
+          name: "Neutral repeated actions", source: executive
+            ? 'export function step(frame,state,intent){return {choice:{kind:"observe"},next_state:state,status:"running",events:[]};} export function activate(frame,state,intent){return step(frame,state,intent);}'
+            : 'for (let i=0;i<64;i++) { await game.action({kind:"look",yaw:0,pitch:0}); } return {status:"completed",summary:"Finite neutral observations",result:null};',
           dependencies: [], card: { purpose: "Inspect repeated neutral outcomes", applicability: "Fixture",
             method: "Finite identical neutral requests", reason: "Mechanical diagnostic regression", limitations: "No gameplay claim" },
         });
-        await tools.find(tool => tool.name === "program_run")!.execute("no-effect-start", {
-          operation: "start", name: "Neutral repeated actions", args: null, limits: { ...DEFAULT_SKILL_LIMITS },
+        if (written.isError) { ready.reject(new Error(JSON.stringify(written))); return; }
+        const started = await tools.find(tool => tool.name === "program_run")!.execute("no-effect-start", {
+          operation: "start", name: "Neutral repeated actions", args: null,
+          ...(executive ? { entry: "step", session: { schema_version: 1 },
+            limits: { ...DEFAULT_RESIDENT_LIMITS, duration_ms: 15000 } } : { limits: { ...DEFAULT_SKILL_LIMITS } }),
         });
+        if (started.isError) ready.reject(new Error(JSON.stringify(started)));
       } else await promptWork?.();
       listener?.({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [],
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } } as unknown as AgentEvent);
@@ -86,6 +100,13 @@ async function repeatedNoEffectFixture() {
     createAgent: async (options: { tools: AgentTool[] }) => { tools = options.tools; return agent as unknown as Agent; },
     releaseAgent: async () => {} } as unknown as AuthManager;
   const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }),
+    createResidentAnalysisWorker: async () => { throw new Error("Observe-only fixture does not request analysis"); },
+    createResidentWorker: async () => {
+      ready.resolve(async () => { throw new Error("Observe-only executive has no async capability"); });
+      const decision = async () => ({ choice: { kind: "observe" as const }, next_state: null,
+        status: "running" as const, events: [] });
+      return { activate: decision, step: decision, close: async () => {} };
+    },
     runSkill: async (_source: unknown, _args: unknown, handle: (request: SkillCapabilityRequest) => Promise<Json>,
       _limits: unknown, signal: AbortSignal) => {
       ready.resolve(handle);
@@ -102,7 +123,7 @@ async function repeatedNoEffectFixture() {
   });
   await runtime.initialize();
   const run = await runtime.createRun({ task: "Review explicit neutral outcomes without automatic recovery", model_id: "fixture-model",
-    goal: adapter.goals.find(goal => goal.goal_id === "custom")! });
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")!, ...(executive ? { control_mode: "executive" } : {}) });
   const initial = finished();
   await runtime.control(run.run_id, "start");
   const handle = await ready.promise;
@@ -128,6 +149,30 @@ async function repeatedNoEffectFixture() {
     finishTask: () => tools.find(tool => tool.name === "task_finish")!.execute("fixture-finish", { summary: "Explicit terminal lifecycle fixture" }),
   };
 }
+
+test("observe-only executive requests one ordinary decision without inventing effects or stopping local control", async () => {
+  const fixture = await repeatedNoEffectFixture(true);
+  await new Promise<void>((resolve, reject) => {
+    const off = fixture.store.subscribe(event => {
+      if (event.type === "scheduler.turn_finished") { off(); resolve(); }
+      else if (event.type === "skill.closed" || event.type === "scheduler.turn_failed") {
+        off(); reject(new Error(`${event.type}: ${JSON.stringify(event.details)}`));
+      }
+    });
+  });
+  expect(fixture.contexts).toHaveLength(2);
+  expect(fixture.contexts[1]).toMatchObject({ reason: ["program_no_effect"], pending_decision: true });
+  expect(fixture.contexts[1]!.feedback).toEqual(expect.arrayContaining([expect.objectContaining({
+    type: "program.repeated_no_effect", details: expect.objectContaining({
+      reason: "executive_observe_only", source: "runtime_mechanical", usefulness_inferred: false,
+      elapsed_host_ms: expect.any(Number), no_input_decisions: expect.any(Number),
+    }),
+  })]));
+  expect(fixture.diagnostics()).toHaveLength(1);
+  expect(fixture.diagnostics()[0]!.details).not.toHaveProperty("world_effect_emitted");
+  expect(fixture.store.latestRootExecution(fixture.run.run_id)).toMatchObject({ status: "running", ended_at: null });
+  expect(fixture.counts()).toEqual({ nativeCalls: 0, aborts: 0 });
+}, 15000);
 
 for (const backlog of [0, 501]) test(`three explicit identical neutral outcomes wake ordinary strategy with a live root across ${backlog} earlier events`, async () => {
   const fixture = await repeatedNoEffectFixture();
@@ -552,7 +597,7 @@ for (const backlog of [0, 501]) test(`Runtime resident attention reaches the rea
             input_application: "confirmed", unresolved_operation_refs: [] };
         },
         snapshot: () => ({ fenced: retired, retired, submitted_sequence: 0, applied_sequence: 0, ordered_edge_prefix: 0,
-          pending_frames: 0, pending_edges: 0, last_input: null, reason: null }) };
+          pending_frames: 0, pending_edges: 0, last_input: null, reason: null, fault: null }) };
     },
   };
   let attentionReady = false, attentionEmitted = false;

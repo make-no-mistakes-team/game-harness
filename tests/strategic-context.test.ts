@@ -188,7 +188,7 @@ async function failedResident(f: ReturnType<typeof fixture>, failure: "held_tran
         input_application: "confirmed", unresolved_operation_refs: [] };
     },
     snapshot: () => ({ fenced: retired, retired, submitted_sequence: 0, applied_sequence: 0,
-      ordered_edge_prefix: 0, pending_frames: 0, pending_edges: 0, last_input: null, reason: null }),
+      ordered_edge_prefix: 0, pending_frames: 0, pending_edges: 0, last_input: null, reason: null, fault: null }),
   };
   const controller = new ResidentController({
     execution_id: execution.execution_id, source_hash: skill.hash, controller_generation: 1,

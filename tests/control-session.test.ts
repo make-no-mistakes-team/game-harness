@@ -66,14 +66,22 @@ function harness(retained = 32) {
     sample,
     async open(_deadline, applied, _effect) {
       const currentGeneration = ++generation; let sequence = 0, revoked = false;
+      const captures = new Set<number>();
       acknowledgements.set(currentGeneration, applied);
       const owner = { operation_id: `producer-${generation}`, generation, scope: { session_id: "game-session", world_id: "world", epoch: 1,
         native_boot_id: "boot", run_id: "run", run_generation: 1, life_id: 3, space_epoch: 4,
         execution_id: "executive", source_hash: "a".repeat(64) } };
       return { owner, controllerGeneration: currentGeneration,
-        async sample() { if (revoked) throw new Error("Retired channel cannot sample"); return await sample(); },
+        async sample() {
+          if (revoked) throw new Error("Retired channel cannot sample");
+          const frame = await sample(); captures.add(minecraftControllerFrameSchema.parse(frame).frame_seq); return frame;
+        },
         submit(frame, input) { if (revoked) throw new Error("Retired writer emitted"); sent.push({ sequence: ++sequence, frame, input }); return { sequence, status: "submitted", reason: null }; },
-        async renew() { if (revoked) throw new Error("Retired writer renewed"); await renewal(); },
+        async renew(frame) {
+          if (revoked) throw new Error("Retired writer renewed");
+          if (!captures.has(minecraftControllerFrameSchema.parse(frame).frame_seq)) throw new Error("Capture does not belong to this channel");
+          await renewal();
+        },
         snapshot() { return { fenced: revoked, retired: revoked, submitted_sequence: sequence, applied_sequence: 0, ordered_edge_prefix: 0,
           pending_frames: 0, pending_edges: 0, last_input: null, reason: null }; },
         async revoke() { revoked = true; await retirement; retired++; return { owner, controller_generation: currentGeneration, admission_revoked: true,
@@ -252,5 +260,24 @@ test("large retained receipts remain in history without exceeding subsequent wor
   expect(h.records.filter(record => record.type === "session.child_settled")
     .every(record => JSON.stringify(record.details).includes("x".repeat(60000)))).toBe(true);
   expect(Math.max(...frameSizes)).toBeLessThan(262144 - 32768);
+  await h.session.stop("complete");
+});
+
+test("a channel opened during a read-only sample cannot adopt that unretained capture", async () => {
+  const h = harness(), opening = Promise.withResolvers<void>();
+  const open = h.options.open, sample = h.options.sample;
+  h.options.open = async (...args) => { await opening.promise; return await open(...args); };
+  h.choose(rawChoice); await h.session.start(); await h.clock.advance(0);
+  let released = false;
+  h.options.sample = async cursor => {
+    const frame = await sample(cursor);
+    if (!released) { released = true; opening.resolve(); await settle(); }
+    return frame;
+  };
+  await h.clock.advance(50);
+  expect(h.sent).toHaveLength(0);
+  expect(h.session.snapshot().status).toBe("running");
+  await h.clock.advance(50);
+  expect(h.sent.map(input => minecraftControllerFrameSchema.parse(input.frame).frame_seq)).toEqual([3]);
   await h.session.stop("complete");
 });

@@ -192,6 +192,12 @@ session. A child is not a saved async stack: resumption requires a fresh keyed
 invocation chosen from current observations. Source replacement, local recovery
 and child starts do not renew the original session deadline.
 
+Sampling pins the exact producer and transition phase before awaiting a frame.
+If opening or retirement completes during an independent read, that frame is
+discarded before authored computation. The next decision uses a capture retained
+by the new channel. An authorized read-only snapshot cannot be relabeled as a
+new owner's input capture merely because the transfer finished while it waited.
+
 Native supervision is separate from a child's hard deadline. An exact retained
 capture no older than 150 ms can renew the selected semantic producer for 250 ms
 from that capture. Expiry fences motor, input and deferred GUI emission; cleanup

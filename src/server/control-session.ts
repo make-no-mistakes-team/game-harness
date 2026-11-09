@@ -159,12 +159,17 @@ export class ControlSession {
     if (!this.transition && this.raw && this.clock.now() >= this.rawLeaseDeadline) {
       await this.recover("known_expired_raw_lease"); return;
     }
-    const frame = minecraftControllerFrameSchema.parse(await (!this.transition && this.raw
-      ? this.raw.sample(this.cursor) : this.options.sample(this.cursor)));
+    const samplingTransition = this.transition;
+    const samplingChannel = samplingTransition ? null : this.raw;
+    const frame = minecraftControllerFrameSchema.parse(await (samplingChannel
+      ? samplingChannel.sample(this.cursor) : this.options.sample(this.cursor)));
     if (!this.current()) return;
     if (frame.frame_seq <= this.lastFrame) { this.data.counters.stale_frames++; return; }
     this.lastFrame = frame.frame_seq; this.data.counters.frames++;
-    if (this.transition) return;
+    // Opening/retiring may finish while the independent read is in flight.
+    // That capture was never retained by the new channel: compute again from
+    // its own next sample rather than relabeling or replaying this one.
+    if (samplingTransition || this.transition || samplingChannel !== this.raw) return;
     // The host decorates only its own software state, never native or evaluator observations.
     const decorated = { ...frame, executive: this.snapshot().session } as MinecraftControllerFrame;
     const version = this.data.intent_version, started = this.clock.now();

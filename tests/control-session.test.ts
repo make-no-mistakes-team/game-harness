@@ -38,7 +38,7 @@ const rawChoice: ExecutiveChoice = { kind: "raw", input: { kind: "world", held: 
 const request = { kind: "action" as const, action: { kind: "navigate", destination: "authorized-target" }, duration_ms: 1000 };
 const success: GameActionResult = { status: "succeeded", summary: "Finite resource work completed", evidence: { collected: 1 } };
 function harness(retained = 32) {
-  const clock = new Clock(), completed: { handle: number; result: {
+  const clock = new Clock(), completed: { handle: number; frame_seq: number; deadline: number; result: {
     promise: Promise<GameActionResult>; resolve(value: GameActionResult): void; reject(reason?: unknown): void;
   } }[] = [];
   const records: { type: string; details: Json }[] = [], sent: { sequence: number; frame: Json; input: unknown }[] = [];
@@ -89,9 +89,9 @@ function harness(retained = 32) {
           retirement_applied_native_ns: String(Math.round(clock.now() * 1e6)), input_application: "confirmed", unresolved_operation_refs: [] } satisfies RevocationAck; },
       } satisfies ControllerInputChannel;
     },
-    async task(_request, handle, deadline, signal) {
+    async task(_request, handle, deadline, signal, frame) {
       expect(deadline).toBeLessThanOrEqual(10000);
-      const outcome = Promise.withResolvers<GameActionResult>(); completed.push({ handle, result: outcome });
+      const outcome = Promise.withResolvers<GameActionResult>(); completed.push({ handle, frame_seq: frame.frame_seq, deadline, result: outcome });
       signal.addEventListener("abort", () => outcome.resolve({ status: "cancelled", summary: "Interrupted exactly", evidence: null }), { once: true });
       return await outcome.promise;
     },
@@ -279,5 +279,49 @@ test("a channel opened during a read-only sample cannot adopt that unretained ca
   expect(h.session.snapshot().status).toBe("running");
   await h.clock.advance(50);
   expect(h.sent.map(input => minecraftControllerFrameSchema.parse(input.frame).frame_seq)).toEqual([3]);
+  await h.session.stop("complete");
+});
+
+test("one ensure_task reserves its request across raw retirement and a fresh continue starts it once", async () => {
+  const h = harness(); h.choose(rawChoice); await h.session.start(); await h.clock.advance(50);
+  const lastRawFrame = minecraftControllerFrameSchema.parse(h.sent[0]!.frame).frame_seq;
+  const barrier = Promise.withResolvers<void>(); h.setRetirement(barrier.promise);
+  h.choose({ kind: "ensure_task", key: 1, request }); await h.clock.advance(50);
+  expect(h.session.snapshot()).toMatchObject({ session: { task_high_water: 1,
+    tasks: [{ handle: 1, status: "starting", deadline_host_ms: 1100 }] } });
+  expect(h.completed).toHaveLength(0);
+  await h.clock.advance(200);
+  barrier.resolve(); await settle();
+  h.choose({ kind: "continue", handle: 1 }); await h.clock.advance(100);
+  expect(h.completed.map(task => task.handle)).toEqual([1]);
+  expect(h.completed[0]!.frame_seq).toBeGreaterThan(lastRawFrame);
+  expect(h.completed[0]!.deadline).toBe(1100);
+  expect(h.session.snapshot()).toMatchObject({ status: "running",
+    session: { producer: "task", tasks: [{ handle: 1, status: "running" }] } });
+  await h.session.stop("complete");
+});
+
+test("a reserved task cannot extend its deadline while raw retirement is pending", async () => {
+  const h = harness(); h.choose(rawChoice); await h.session.start(); await h.clock.advance(50);
+  const barrier = Promise.withResolvers<void>(); h.setRetirement(barrier.promise);
+  h.choose({ kind: "ensure_task", key: 1, request: { ...request, duration_ms: 100 } }); await h.clock.advance(50);
+  await h.clock.advance(250); barrier.resolve(); await settle();
+  h.choose({ kind: "continue", handle: 1 }); await h.clock.advance(50);
+  expect(h.completed).toHaveLength(0);
+  expect(h.session.snapshot()).toMatchObject({ status: "running", session: { task_high_water: 1,
+    tasks: [{ handle: 1, status: "failed", deadline_host_ms: 200, result: { evidence: { world_effect_emitted: false } } }] } });
+  await h.session.stop("complete");
+});
+
+test("completion racing replacement preserves the old successful result and the newly reserved handle", async () => {
+  const h = harness(); h.choose({ kind: "ensure_task", key: 1, request });
+  await h.session.start(); await h.clock.advance(0);
+  const barrier = Promise.withResolvers<void>(); h.setRetirement(barrier.promise);
+  h.completed[0]!.result.resolve(success); await settle();
+  h.choose({ kind: "ensure_task", key: 2, request }); await h.clock.advance(50);
+  barrier.resolve(); await settle(); h.choose({ kind: "continue", handle: 2 }); await h.clock.advance(50);
+  expect(h.session.snapshot()).toMatchObject({ session: { task_high_water: 2,
+    tasks: [{ handle: 1, status: "succeeded" }, { handle: 2, status: "running" }] } });
+  expect(h.completed.map(task => task.handle)).toEqual([1, 2]);
   await h.session.stop("complete");
 });

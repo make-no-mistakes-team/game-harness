@@ -172,6 +172,15 @@ supplies no target selection, combat cadence, escape rule or survival policy.
 | `cancel` with `handle` | Fence the exact child and await its physical retirement, preserving partial or unknown effects. |
 | `observe` | Commit an observation-only decision without renewing a semantic producer. |
 
+An accepted `ensure_task` reserves its key and immutable request immediately,
+even when raw control must retire first. Its `starting` handle appears in the
+next software snapshot. A fresh `continue(handle)` or identical `ensure_task`
+after retirement starts that reserved child exactly once, using the fresh
+capture for supervision. The original child deadline includes retirement and
+never renews. Cancellation before dispatch remains a settled, nonreplayable
+handle with known no-emission evidence. Reserving a replacement does not rewrite
+a predecessor's successful result when completion races retirement.
+
 `frame.executive` describes software state: source generation, selected producer,
 task high-water mark, retained results, command errors and original deadline.
 It is not game truth. Keys advance by one; evicting settled detail never permits

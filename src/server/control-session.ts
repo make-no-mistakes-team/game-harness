@@ -229,11 +229,18 @@ export class ControlSession {
   }
   private async retire(task: Task, reason: string): Promise<void> {
     if (task.retirement) return task.retirement;
-    task.snapshot.status = "retiring"; task.abort.abort(reason);
+    const unstarted = task.work === null;
+    if (!settled(task)) task.snapshot.status = "retiring";
+    task.abort.abort(reason);
     task.retirement = (async () => {
       await this.options.retireTask(task.snapshot.handle, reason);
       await task.work;
       if (task.snapshot.status === "retiring") task.snapshot.status = "interrupted";
+      if (unstarted) {
+        task.snapshot.result = { status: "cancelled", summary: "Reserved child cancelled before dispatch",
+          evidence: { world_effect_emitted: false } };
+        task.frameResult = task.snapshot.result;
+      }
       if (this.activeTask === task) this.activeTask = null;
       this.options.record("session.child_retired", task.snapshot as unknown as Json);
       this.session.producer = "none";
@@ -312,20 +319,21 @@ export class ControlSession {
       if (!existing) return this.reject(`Task ${handle} detail not retained; history ${this.options.execution_id}:task:${handle}; no replay`);
       if (settled(existing)) return true;
       if (existing !== this.activeTask || existing.snapshot.status === "retiring") return this.reject("Retiring or inactive child cannot renew");
+      if (existing.snapshot.status === "starting") { this.startTask(existing, frame); return true; }
       await this.options.supervise(handle, frame, this.session.behavior_generation); return true;
     }
     const fingerprint = JSON.stringify(choice.request);
     if (existing) {
       if (existing.fingerprint !== fingerprint) return this.reject("Task key conflict: changed content cannot execute under an existing key");
-      if (existing === this.activeTask && existing.snapshot.status === "running")
-        await this.options.supervise(handle, frame, this.session.behavior_generation);
+      if (existing === this.activeTask) {
+        if (existing.snapshot.status === "starting") this.startTask(existing, frame);
+        else if (existing.snapshot.status === "running") await this.options.supervise(handle, frame, this.session.behavior_generation);
+      }
       return true;
     }
     if (handle <= this.session.task_high_water) return this.reject(`Task ${handle} expired; no replay; history ${this.options.execution_id}:task:${handle}`);
     if (handle !== this.session.task_high_water + 1) return this.reject("Task keys must advance by one");
     if (this.session.task_high_water >= this.options.config.max_tasks) return this.reject("Session task budget exhausted");
-    if (this.raw) { this.change(() => this.retireRaw()); return true; }
-    if (this.activeTask) { const task = this.activeTask; this.change(() => this.retire(task, "Executive selected another child")); return true; }
     this.pruneTasks();
     if (this.tasks.size >= this.options.config.retained_tasks) return this.reject("Unresolved task detail quota exhausted; no effects admitted");
     const deadline = Math.min(this.options.deadline_host_ms, this.clock.now() + choice.request.duration_ms);
@@ -334,13 +342,43 @@ export class ControlSession {
       abort: new AbortController(), work: null, retirement: null,
       frameRequest: Buffer.byteLength(fingerprint) <= 1024 ? choice.request : null, frameResult: null,
       detailOmitted: Buffer.byteLength(fingerprint) > 1024 };
-    this.tasks.set(handle, task); this.session.task_high_water = handle;
-    this.activeTask = task; this.session.producer = "task";
-    this.options.record("session.child_admitted", task.snapshot as unknown as Json);
+    const previous = this.activeTask;
+    this.tasks.set(handle, task); this.session.task_high_water = handle; this.activeTask = task;
+    this.options.record("session.child_reserved", task.snapshot as unknown as Json);
+    // Adoption reserves an idempotent logical child immediately. Otherwise a
+    // policy that records its requested strike/task would lose that request
+    // when retirement finishes and its next decision chooses something else.
+    if (this.raw) { this.change(() => this.retireRaw()); return true; }
+    if (previous) { this.change(() => this.retire(previous, "Executive selected another child")); return true; }
+    this.startTask(task, frame);
+    return true;
+  }
+
+  private startTask(task: Task, frame: MinecraftControllerFrame): void {
+    if (task.work || task !== this.activeTask || task.snapshot.status !== "starting") return;
+    if (this.raw || this.transition) throw new Error("Semantic child cannot start before exact producer retirement");
+    if (!this.current() || task.abort.signal.aborted || this.clock.now() >= task.snapshot.deadline_host_ms) {
+      task.snapshot.status = task.abort.signal.aborted ? "interrupted" : "failed";
+      task.snapshot.result = { status: "cancelled", summary: "Reserved child deadline or authority ended before dispatch",
+        evidence: { world_effect_emitted: false } };
+      task.frameResult = task.snapshot.result; this.activeTask = null;
+      this.options.record("session.child_settled", task.snapshot as unknown as Json);
+      return;
+    }
+    const request = task.snapshot.request;
+    if (!request) throw new Error("Reserved child lost its immutable request");
+    const handle = task.snapshot.handle, deadline = task.snapshot.deadline_host_ms;
+    this.session.producer = "task";
     task.snapshot.status = "running";
     task.work = Promise.resolve().then(async () => {
       try {
-        const result = await this.options.task(choice.request, handle, deadline, task.abort.signal, frame, this.session.behavior_generation);
+        if (!this.current() || task.abort.signal.aborted) {
+          task.snapshot.status = "interrupted";
+          task.snapshot.result = { status: "cancelled", summary: "Child authority ended before dispatch",
+            evidence: { world_effect_emitted: false } };
+          task.frameResult = task.snapshot.result; return;
+        }
+        const result = await this.options.task(request, handle, deadline, task.abort.signal, frame, this.session.behavior_generation);
         task.snapshot.result = result;
         const completeResult = Buffer.byteLength(JSON.stringify(result)) <= 1024;
         task.frameResult = completeResult ? result : { ...result, summary: result.summary.slice(0, 256), evidence: null };
@@ -360,7 +398,6 @@ export class ControlSession {
       }
     });
     void task.work.catch(error => this.fail(errorText(error)));
-    return true;
   }
   private pruneTasks(): void {
     for (const [key, task] of this.tasks) {

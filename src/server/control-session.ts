@@ -1,7 +1,7 @@
 import type { GameActionResult, Json } from "../shared/contracts.ts";
 import type { ControllerChannelFault, ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck } from "../shared/controller.ts";
 import { controllerInputSchema, revocationAckSchema } from "../shared/controller.ts";
-import { sameEffectScope, type WorldHeld, type WorldInputEdge } from "../shared/control.ts";
+import { sameEffectScope, type EffectScope, type WorldHeld, type WorldInputEdge } from "../shared/control.ts";
 import { minecraftControllerFrameSchema, type MinecraftControllerFrame } from "../shared/minecraft.ts";
 import { executiveStepResultSchema, residentActivationResultSchema, ResidentCleanupError,
   type ResidentAnalysisResult, type ResidentAnalysisSource, type ResidentControllerOptions,
@@ -10,7 +10,7 @@ import { type ControlSessionConfig, type ExecutiveChoice, type ExecutiveSnapshot
   type ExecutiveTaskSnapshot } from "../shared/control-session.ts";
 import { GeneratedControllerResultValidationError } from "./program-diagnostics.ts";
 import { ControllerChannelFaultError } from "./controller-channel.ts";
-import { ExecutiveRawMonitor } from "./executive-incidents.ts";
+import { ExecutiveRawMonitor, ExecutiveStationaryViewMonitor } from "./executive-incidents.ts";
 import { ResidentAnalysisLane } from "./resident-analysis.ts";
 
 interface Task {
@@ -73,6 +73,8 @@ export class ControlSession {
   private resultFailure: GeneratedControllerResultValidationError | null = null;
   private controllerFaultRecorded = false;
   private readonly rawMonitor = new ExecutiveRawMonitor();
+  private readonly stationaryViewMonitor = new ExecutiveStationaryViewMonitor();
+  private stationaryViewScope: EffectScope | null = null;
   private readonly analysisLane: ResidentAnalysisLane;
   get failure(): GeneratedControllerResultValidationError | null { return this.resultFailure; }
 
@@ -136,6 +138,7 @@ export class ControlSession {
   updateIntent(intent: Json, expectedVersion: number): number {
     if (!this.current() || expectedVersion !== this.data.intent_version) throw new Error("Stale executive intent update");
     this.rawMonitor.clear();
+    this.stationaryViewMonitor.clear();
     this.intent = structuredClone(intent); return ++this.data.intent_version;
   }
   analyze(source: ResidentAnalysisSource, input: Json, version: number): Promise<ResidentAnalysisResult> {
@@ -211,13 +214,27 @@ export class ControlSession {
     }
     if (result.events.length > limits.max_events - this.events) throw new Error("session_event_budget");
     if (result.status !== "running") { this.data.status = result.status; void this.stop(`session_${result.status}`); return; }
-    const adopted = await this.choose(result.choice, frame, version);
+    const choice = result.choice;
+    const implicitEdges = choice.kind === "raw" && choice.input.kind === "world" && !("edges" in choice.input) &&
+      (Object.keys(this.submittedHeld) as (keyof WorldHeld)[]).some(button =>
+        choice.input.kind === "world" && choice.input.held[button] !== this.submittedHeld[button]);
+    const adopted = await this.choose(choice, frame, version);
     if (!adopted || !this.current() || version !== this.data.intent_version) return;
     this.data.state = structuredClone(result.next_state); this.cursor = frame.audible.next_cursor;
     this.data.processed_frame_seq = frame.frame_seq; this.data.processed_native_tick = frame.native_tick;
     this.data.processed_native_ns = frame.captured_native_ns;
     const elapsed = this.clock.now() - started;
     this.data.timings.step_ms.count++; this.data.timings.step_ms.max = Math.max(this.data.timings.step_ms.max ?? 0, elapsed);
+    // This survives harmless raw/observe producer turnover, not semantic work or
+    // authority changes. It certifies samples and accepted choices, never ACKs.
+    if (implicitEdges || this.activeTask || elapsed > 150) this.stationaryViewMonitor.clear();
+    else {
+      const incident = this.stationaryViewMonitor.update(
+        `${this.options.execution_id}:${this.session.behavior_generation}:${version}`, frame, choice, this.clock.now(),
+        choice.kind !== "raw" || this.raw !== null);
+      if (incident) this.options.record("session.continuity_incident", { ...incident,
+        intent_version: version, behavior_generation: this.session.behavior_generation });
+    }
     for (const event of result.events) {
       this.events++; this.data.counters.events = this.events;
       this.data.events.push({ sequence: this.events, host_monotonic_ms: this.clock.now(), event });
@@ -285,6 +302,9 @@ export class ControlSession {
           const channel = await this.options.open(this.options.deadline_host_ms,
             ack => this.applied(generation, ack), event => this.effect(generation, event),
             { fence: () => {}, drain: async () => {} }, generation);
+          if (this.stationaryViewScope && !sameEffectScope(this.stationaryViewScope, channel.owner.scope))
+            this.stationaryViewMonitor.clear();
+          this.stationaryViewScope = channel.owner.scope;
           this.raw = channel;
           this.rawLeaseDeadline = openedAt + 250;
           this.data.controller_generation = generation;
@@ -516,6 +536,7 @@ export class ControlSession {
   }
   stop(reason: string): Promise<void> {
     if (this.stopTask) return this.stopTask;
+    this.stationaryViewMonitor.clear();
     this.abort.abort(reason);
     this.analysisLane.fence(reason);
     if (this.timer !== null) this.clock.clearTimeout(this.timer);

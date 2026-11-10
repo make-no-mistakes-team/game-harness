@@ -1,6 +1,6 @@
 import { expect, test, vi } from "bun:test";
 import { ResidentController } from "../src/server/resident-controller.ts";
-import { NativeControllerChannel } from "../src/server/controller-channel.ts";
+import { controllerNativeDeadline, NativeControllerChannel } from "../src/server/controller-channel.ts";
 import type { Json, Sha256 } from "../src/shared/contracts.ts";
 import type { ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck, RevocationAck } from "../src/shared/controller.ts";
 import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
@@ -110,11 +110,12 @@ test("resident keeps dispatching fresh decisions through held heartbeat replies 
   h.step(async () => decision(heldWorld(held), 1));
   h.options.open = async (deadline, applied, effect, hooks) => {
     await open(deadline, applied, effect, hooks);
-    return new NativeControllerChannel(h.channel.owner, 1, deadline, {
+    const clock = { clock_id: "native-test", host_sent_ms: 0, host_received_ms: 0,
+      native_received_ns: "0", native_replied_ns: "0", native_processing_ms: 0,
+      residual_round_trip_ms: 0, offset_lower_ms: 0, offset_upper_ms: 0, uncertainty_ms: 0 };
+    return new NativeControllerChannel(h.channel.owner, 1, deadline, controllerNativeDeadline(clock, deadline), {
       async sample(params) { return minecraftControllerFrameSchema.parse(await h.channel.sample(params as Json)); },
-      clock: () => ({ clock_id: "native-test", host_sent_ms: 0, host_received_ms: 0,
-        native_received_ns: "0", native_replied_ns: "0", native_processing_ms: 0,
-        residual_round_trip_ms: 0, offset_lower_ms: 0, offset_upper_ms: 0, uncertainty_ms: 0 }),
+      clock: () => clock,
       assertCurrent() { if (retired) throw new Error("Controller owner has retired."); },
       retired() { retired = true; },
       async failed() { throw new Error("Unexpected unconfirmed retirement"); },

@@ -7,7 +7,7 @@ import type { GameActionResult, Json } from "../src/shared/contracts.ts";
 import type { ControllerInputChannel, InputAppliedAck, RevocationAck } from "../src/shared/controller.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
-import { NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
+import { controllerNativeDeadline, NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
 
 async function settle() { for (let index = 0; index < 100; index++) await Promise.resolve(); }
 class Clock implements ResidentClock {
@@ -207,6 +207,79 @@ test("confirmed stationary raw movement reports one advisory without replacing t
   await h.session.stop("test complete");
 });
 
+const viewOnlyChoice: ExecutiveChoice = { kind: "raw", input: { kind: "world", held: { ...neutral },
+  view: { kind: "rate", yaw_radians_per_second: 1, pitch_radians_per_second: 0 }, selected_hotbar: null } };
+
+test("accepted raw-view and observe alternation reports once across real producer-generation turnover without claiming application", async () => {
+  const h = harness(32, body => { body.on_ground = true; body.in_water = false; });
+  h.choose(viewOnlyChoice); await h.session.start(); await h.clock.advance(0);
+  for (let now = 50; now <= 8000; now += 50) {
+    h.choose(now % 800 === 0 ? { kind: "observe" } : viewOnlyChoice);
+    await h.clock.advance(50);
+  }
+  const incidents = h.records.filter(record => record.type === "session.continuity_incident");
+  expect(incidents).toHaveLength(1);
+  expect(incidents[0]?.details).toMatchObject({
+    reason: "executive_stationary_view_observe", application_inferred: false, usefulness_inferred: false,
+    elapsed_native_ms: 5000, intent_version: 0, behavior_generation: 1,
+  });
+  const facts = incidents[0]!.details as { [key: string]: Json };
+  expect(Number(facts.raw_view_decisions)).toBeGreaterThan(0);
+  expect(Number(facts.observe_decisions)).toBeGreaterThan(0);
+  expect(Number(facts.raw_view_decisions) + Number(facts.raw_neutral_decisions) + Number(facts.observe_decisions))
+    .toBe(Number(facts.samples));
+  expect(facts).not.toHaveProperty("applied_native_ns");
+  expect(facts).not.toHaveProperty("controller_generation");
+  expect(h.retired).toBeGreaterThan(5);
+  expect(h.session.snapshot().controller_generation).toBeGreaterThan(5);
+  expect(h.session.snapshot()).toMatchObject({ status: "running", session: { task_high_water: 0 } });
+  expect(h.sent.length).toBeGreaterThan(0);
+  await h.session.stop("test complete");
+});
+
+test("accepted stationary windows reset on movement, attack, tasks, intent, native scope and missing coverage", async () => {
+  for (const interrupt of ["position", "attack", "task", "intent", "native_scope", "gap"] as const) {
+    let offset = 0, changedScope = false;
+    const h = harness(32, body => { body.on_ground = true; body.in_water = false; body.position.x += offset; });
+    const open = h.options.open;
+    h.options.open = async (...args) => {
+      const channel = await open(...args);
+      if (changedScope) channel.owner.scope.native_boot_id = "replacement-boot";
+      return channel;
+    };
+    h.choose(viewOnlyChoice); await h.session.start(); await h.clock.advance(0);
+    for (let now = 50; now <= 4000; now += 50) {
+      h.choose(now % 800 === 0 ? { kind: "observe" } : viewOnlyChoice);
+      await h.clock.advance(50);
+    }
+    expect(h.records.filter(record => record.type === "session.continuity_incident")).toHaveLength(0);
+    if (interrupt === "position") offset = 0.31;
+    if (interrupt === "intent") h.session.updateIntent({ changed: true }, 0);
+    if (interrupt === "native_scope") changedScope = true;
+    const attack: ExecutiveChoice = { kind: "raw", input: { kind: "world", held: { ...neutral, attack: true },
+      view: { kind: "unchanged" }, selected_hotbar: null } };
+    h.choose(interrupt === "attack" ? attack : interrupt === "task" ? { kind: "ensure_task", key: 1, request } : viewOnlyChoice);
+    if (interrupt === "gap") await h.clock.jump(300);
+    else await h.clock.advance(50);
+    offset = 0;
+    h.choose(viewOnlyChoice);
+    await h.clock.advance(4500);
+    expect(h.records.filter(record => record.type === "session.continuity_incident")).toHaveLength(0);
+    await h.clock.advance(750);
+    expect(h.records.filter(record => record.type === "session.continuity_incident")).toHaveLength(1);
+    expect(h.session.snapshot().status).toBe("running");
+    await h.session.stop("test complete");
+  }
+});
+
+test("accepted observe-only choices do not duplicate the software-only observation incident domain", async () => {
+  const h = harness(32, body => { body.on_ground = true; body.in_water = false; });
+  await h.session.start(); await h.clock.advance(6000);
+  expect(h.records.filter(record => record.type === "session.continuity_incident")).toHaveLength(0);
+  expect(h.sent).toHaveLength(0);
+  await h.session.stop("test complete");
+});
+
 const analysisBundle = singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze");
 const analysisSource = { skill_id: "pure-analysis", version: 1, hash: analysisBundle.source_hash, bundle: analysisBundle };
 
@@ -266,7 +339,10 @@ test("an asynchronous native fence during a valid step persists the first cause 
   let submissions = 0;
   h.options.open = async (deadline, applied, effect, ...rest) => {
     const base = await originalOpen(deadline, applied, effect, ...rest), owner = base.owner;
-    return new NativeControllerChannel(owner, base.controllerGeneration, deadline, {
+    const clock = { clock_id: "boot", host_sent_ms: 0, host_received_ms: 0, native_received_ns: "0",
+      native_replied_ns: "0", native_processing_ms: 0, residual_round_trip_ms: 0,
+      offset_lower_ms: 0, offset_upper_ms: 0, uncertainty_ms: 0 };
+    return new NativeControllerChannel(owner, base.controllerGeneration, deadline, controllerNativeDeadline(clock, deadline), {
       async request(method) {
         if (method === "controller_submit") { submissions++; return await response.promise; }
         if (method === "controller_revoke") return { generation: owner.generation + 1, ack: {
@@ -277,9 +353,7 @@ test("an asynchronous native fence during a valid step persists the first cause 
         return {};
       },
       sample: async () => minecraftControllerFrameSchema.parse(await h.options.sample(null)),
-      clock: () => ({ clock_id: "boot", host_sent_ms: 0, host_received_ms: 0, native_received_ns: "0",
-        native_replied_ns: "0", native_processing_ms: 0, residual_round_trip_ms: 0,
-        offset_lower_ms: 0, offset_upper_ms: 0, uncertainty_ms: 0 }),
+      clock: () => clock,
       assertCurrent() {}, retired() {}, async failed() { throw new Error("Retirement must be confirmed"); },
     }, applied, effect);
   };

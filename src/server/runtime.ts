@@ -430,7 +430,7 @@ export class Runtime {
       executiveIncident: (execution, details) => {
         if (!this.executiveIncidentCurrent(execution)) return;
         this.store.event(execution.run_id, "program.repeated_no_effect",
-          "Advisory: confirmed raw controls remained neutral or own-body motion stayed within a small region for five seconds; usefulness is not inferred", {
+          "Advisory: bounded control or view/observe decisions accompanied five seconds within a small own-body region; application and usefulness are qualified by the retained evidence", {
             ...(details !== null && typeof details === "object" && !Array.isArray(details) ? details : {}),
             source: "runtime_mechanical",
             usefulness_inferred: false, execution_id: execution.execution_id, source_hash: execution.source_hash,

@@ -52,6 +52,7 @@ const PROVIDER_FAILURE =
 // not permission to dispatch its tools or retain its requested knowledge.
 const RECOVERED_PROVIDER_FAILURE = "stream_interrupted_after_content";
 const MEANINGFUL_WAKES: Record<string, true> = {
+  preflight_ready: true,
   policy_replan: true,
   policy_interrupt: true,
   policy_error: true,
@@ -193,9 +194,10 @@ function feedbackEntry(event: ActivityEvent, workspace: ProgramWorkspace): Json 
     }
   }
   if (event.type === "program.repeated_no_effect") {
-    for (const key of ["source", "usefulness_inferred", "count", "world_effect_emitted", "neutralized",
+    for (const key of ["source", "usefulness_inferred", "application_inferred", "count", "world_effect_emitted", "neutralized",
       "elapsed_host_ms", "elapsed_native_ms", "samples", "no_input_decisions", "processed_frame_seq", "intent_version",
-      "maximum_anchor_distance_blocks", "applied_sequence", "behavior_generation"]) {
+      "maximum_anchor_distance_blocks", "applied_sequence", "behavior_generation",
+      "raw_view_decisions", "raw_neutral_decisions", "observe_decisions"]) {
       const value = details?.[key];
       if (typeof value === "string") selected[key] = value.slice(0, 160);
       else if (typeof value === "number" || typeof value === "boolean") selected[key] = value;

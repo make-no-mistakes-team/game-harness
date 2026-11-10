@@ -58,6 +58,8 @@ An identical `request_id` and body returns the retained receipt without another 
 
 Successful transfer records `closure:"transferred"`, not worker closure. The preparation deadline then ends, and ordinary run/controller budgets, Pause, Resume and Stop own execution. Preparation cancellation refuses a started transferred run; use ordinary run controls. A later startup failure must drain the run owner without silently disconnecting a healthy transferred world. Explicit Stop world still owns session teardown. Software lifecycle tests can establish ordering and ownership under their fixtures; they do not prove natural-model adoption, visual correctness or native gameplay success.
 
+The ordinary `preflight_ready` wake admits Main's first task decision even while the prepared executive is live. Local control starts without waiting for cloud readiness; conversely, pending local work must not postpone that initial strategic inspection until root retirement. Later decisions retain the usual single-flight outcome, attention and authoring rules.
+
 ## Ordinary modules and recovery target
 
 The required program format is ordinary bounded JavaScript modules with relative local imports, a controlled resolver for declared pure libraries and a `run(game, args, checkpoint)` entry. Local pure calls share one isolated execution; a function call does not require another container. Source/bundle bytes, initialization transport, memory, CPU and capability budgets remain finite. These requirements do not grant generated code package installation, arbitrary imports, network, host files or process creation.
@@ -67,6 +69,8 @@ The agent can observe, write/edit, run, inspect and revise without filling out a
 Checkpoint recovery uses versioned serializable task state and unresolved operation references, not saved JavaScript stacks or promises. Resume requires compatible source/state, fresh authorized game state, fenced prior owners and actual neutralization/drain. Preserve explicit Pause/Stop and uncertain effects; restoring source or conversation never rewinds the game. Pure local modules are delivered for `step` and `analyze`; the async module entry and checkpoint recovery remain later work. The current async body and restart contracts below still apply.
 
 The active perception profile is `minecraft_assisted_rgb_fov_r8_control_v7`, with observation envelope 3, payload `minecraft_observation_v1@2`, controller frame 3 and a separate typed actor PNG. Entity evidence requires the actual rendered camera and completed framebuffer; terrain retains its assisted eight-block cache. Feedback includes actual blocking, equipment durability, attack-key consumption/callback facts and actually heard combat cues. Full pixel-only and atomically synchronized perception remain separate targets.
+
+Pure local decisions receive JSON, not Main's actor image. Terrain rows cover an occlusion-filtered spherical eight-block neighborhood around the player's block; their positions are already block centres. Empty local rows do not establish absence elsewhere, even when distant features remain visible in Main's image. Authored state may retain earlier permitted evidence with its capture/scope, but historical coordinates and handles never grant current target authority or automatic recovery.
 
 ## Current compact program interface
 
@@ -269,6 +273,16 @@ Capture-to-application age must be at most 150 ms. Each continuous interval
 reports once; it neither proves collision or uselessness nor selects a response.
 Duplicate ACKs cannot extend coverage. The ordinary strategic wake leaves local
 control running and cannot shorten a provider response by itself.
+
+A separate view/observe advisory uses accepted software choices and fresh
+own-body samples. It can span harmless raw/observe producer turnover within
+the same executive authority: five native seconds inside the same 0.3-block
+region, at least one nonzero view choice, and no sample gap over 250 ms.
+Movement, attack/use, edges, selection changes, semantic work, GUI, unsupported
+body conditions or authority changes reset coverage. Counts distinguish view,
+neutral and observe decisions. This evidence explicitly sets
+`application_inferred:false` and `usefulness_inferred:false`; it proves neither
+that a requested rotation applied nor that observation was unproductive.
 
 Executive and legacy residents share one bounded pure-analysis lifecycle.
 Analysis runs alongside local decisions, with one outstanding job and the
@@ -885,11 +899,13 @@ controller owner, receives an explicit request error without closing the
 native connection or revoking a replacement owner. This does not admit
 stale input or change the separate occupied-lane and framing rules.
 
-`step_ms` bounds isolated worker/guardian evaluation, including serialization.
-The host separately permits at most 500 ms for a step response, under the
-unchanged root deadline. Host scheduling and IPC delay are not computation
-time; the snapshot's `timings.step_ms` reports that round-trip wall interval,
-not CPU. Waiting sends no lease heartbeat. A returned running decision must
+`step_ms` is a guarded wall-time allowance, not a CPU measurement. The trusted
+guardian starts it before dispatch through Docker; container transport,
+scheduling, evaluation and serialization consume that allowance. The container
+also watches its worker independently. The host separately permits at most
+500 ms for a step response, under the unchanged root deadline. The snapshot's
+`timings.step_ms` reports the host round-trip wall interval, not CPU.
+Waiting sends no lease heartbeat. A returned running decision must
 still pass the original 150 ms native capture-age check before renewal or
 state publication; an expired lease cannot be revived by a late response.
 
@@ -901,6 +917,9 @@ Up to eight heartbeat responses may remain outstanding. Each genuine fresh
 decision can dispatch a renewal without waiting for an older ACK; saturation
 fences the channel rather than creating an unbounded future-renewal queue.
 Every request keeps its original deadline, capped by the original root.
+Each renewal is also capped by the exact native deadline accepted at
+`controller_open`. A later clock correspondence cannot enlarge that immutable
+native grant, even when its mapped host-root deadline would be slightly later.
 Host expiry follows the latest dispatch-owned deadline, never an older
 flight's expiry or a later ACK time. Native expiry and actual rejection remain
 authoritative; a dispatch return is not a lease or input-application ACK.

@@ -1414,6 +1414,7 @@ export class GameBridgeClient implements GameBridge {
           owner,
           controllerGeneration,
           deadlineHostMs,
+          deadline,
           {
             request: (method, params, timeout) =>
               this.request(method, params, timeout),

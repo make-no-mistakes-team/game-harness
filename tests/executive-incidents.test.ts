@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
-import { ExecutiveObservationMonitor, ExecutiveRawMonitor } from "../src/server/executive-incidents.ts";
+import { ExecutiveObservationMonitor, ExecutiveRawMonitor, ExecutiveStationaryViewMonitor } from "../src/server/executive-incidents.ts";
 import type { ResidentSnapshot } from "../src/shared/resident.ts";
 import type { ControllerInput, InputAppliedAck } from "../src/shared/controller.ts";
+import type { ExecutiveChoice } from "../src/shared/control-session.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
 
@@ -150,4 +151,130 @@ test("moving beyond the bounded own-body region resets a blocked-motion window e
   expect(monitor.update("owner", sample.frame, sample.input, sample.ack, 8000)).toBeNull();
   // Duplicate old ACKs provide no extra observed coverage.
   expect(monitor.update("owner", sample.frame, sample.input, sample.ack, 15000)).toBeNull();
+});
+
+function stationaryChoice(now: number): ExecutiveChoice {
+  if (now % 150 === 0) return { kind: "observe" };
+  const { input } = rawSample(now);
+  if (input.kind === "world") input.view = now % 150 === 50
+    ? { kind: "rate", yaw_radians_per_second: 1, pitch_radians_per_second: 0 }
+    : { kind: "delta", yaw_radians: 0, pitch_radians: -0.01 };
+  return { kind: "raw", input };
+}
+
+test("stationary view/observe evidence counts software choices without asserting native application", () => {
+  const monitor = new ExecutiveStationaryViewMonitor(), incidents = [];
+  const origin = 9_007_199_254_740_993n;
+  for (let now = 0; now <= 8000; now += 50) {
+    const { frame } = rawSample(now);
+    frame.captured_native_ns = String(origin + BigInt(now) * 1_000_000n);
+    const incident = monitor.update("root:behavior:intent", frame, stationaryChoice(now), now);
+    if (incident) incidents.push(incident);
+  }
+  expect(incidents).toHaveLength(1);
+  expect(incidents[0]).toMatchObject({
+    reason: "executive_stationary_view_observe", application_inferred: false, usefulness_inferred: false,
+    elapsed_native_ms: 5000, samples: 101, raw_view_decisions: 67, observe_decisions: 34, raw_neutral_decisions: 0,
+    first_captured_native_ns: String(origin), captured_native_ns: String(origin + 5_000_000_000n),
+  });
+  expect(incidents[0]).not.toHaveProperty("applied_native_ns");
+  expect(incidents[0]).not.toHaveProperty("controller_generation");
+});
+
+test("observe-only or neutral-only evidence never becomes a view/observe incident", () => {
+  for (const kind of ["observe", "neutral"] as const) {
+    const monitor = new ExecutiveStationaryViewMonitor();
+    for (let now = 0; now <= 6000; now += 50) {
+      const { frame, input } = rawSample(now);
+      expect(monitor.update("owner", frame, kind === "observe" ? { kind: "observe" } : { kind: "raw", input }, now)).toBeNull();
+    }
+  }
+});
+
+test("stationary sample coverage admits exactly 250ms adjacency and a 0.3-block anchor including neutral view choices", () => {
+  const monitor = new ExecutiveStationaryViewMonitor(), incidents = [];
+  for (let now = 0; now <= 5000; now += 250) {
+    const { frame, input } = rawSample(now);
+    frame.player.position.x = now === 0 ? 0 : 0.3;
+    const choice: ExecutiveChoice = now === 2500 ? { kind: "raw", input } : stationaryChoice(now);
+    const incident = monitor.update("owner", frame, choice, now);
+    if (incident) incidents.push(incident);
+  }
+  expect(incidents).toHaveLength(1);
+  expect(incidents[0]).toMatchObject({
+    reason: "executive_stationary_view_observe", elapsed_native_ms: 5000, samples: 21,
+    raw_neutral_decisions: 1, own_position: { x: 0.3 }, anchor_position: { x: 0 },
+  });
+});
+
+test("stationary view/observe windows reset on authority, movement, controls and coverage boundaries", () => {
+  for (const interrupt of ["key", "life", "dimension", "space", "position", "selection", "attack", "use",
+    "jump", "move", "edge", "hotbar", "screen", "air", "water", "lava", "vehicle", "gliding",
+    "task", "host_gap", "native_gap"] as const) {
+    const monitor = new ExecutiveStationaryViewMonitor();
+    for (let now = 0; now < 4000; now += 50) {
+      const { frame } = rawSample(now);
+      expect(monitor.update("owner", frame, stationaryChoice(now), now)).toBeNull();
+    }
+    for (let now = 4000; now <= 8000; now += 50) {
+      const { frame, input } = rawSample(now);
+      let choice = stationaryChoice(now), key = "owner", host = now;
+      if (interrupt === "key") key = "replacement";
+      if (interrupt === "life") frame.life_id++;
+      if (interrupt === "dimension") frame.space.dimension_id = "minecraft:the_nether";
+      if (interrupt === "space") frame.space.space_epoch++;
+      if (interrupt === "host_gap") host += 251;
+      if (interrupt === "native_gap") frame.captured_native_ns = String(BigInt(frame.captured_native_ns) + 251_000_000n);
+      if (now === 4000) {
+        if (interrupt === "position") frame.player.position.x += 0.31;
+        if (interrupt === "selection") frame.player.selected_hotbar = (frame.player.selected_hotbar + 1) % 9;
+        if (input.kind === "world") {
+          if (interrupt === "attack" || interrupt === "use" || interrupt === "jump") input.held[interrupt] = true;
+          if (interrupt === "move") input.held.forward = true;
+          if (interrupt === "edge") input.edges = [{ kind: "button", button: "inventory", phase: "press", count: 1 }];
+          if (interrupt === "hotbar") input.selected_hotbar = (frame.player.selected_hotbar + 1) % 9;
+          choice = { kind: "raw", input };
+        }
+        if (interrupt === "task") choice = { kind: "continue", handle: 1 };
+        if (interrupt === "air") frame.player.on_ground = false;
+        if (interrupt === "water") frame.player.in_water = true;
+        if (interrupt === "lava") frame.player.in_lava = true;
+        if (interrupt === "vehicle") frame.player.vehicle_type = "boat";
+        if (interrupt === "gliding") frame.player.gliding = true;
+        if (interrupt === "screen") frame.screen = {
+          identity: { screen_id: "inventory", incarnation: 1, layout_revision: 1 },
+          content_revision: 1, screen_kind: "inventory", viewport: { width: 320, height: 240, scale_factor: 2 },
+          slots: [], cursor: { item: null, count: 0 }, elements: [], progress: [],
+        };
+      }
+      expect(monitor.update(key, frame, choice, host)).toBeNull();
+    }
+  }
+});
+
+test("duplicate captures cannot add stationary choice coverage or bridge a missing interval", () => {
+  const monitor = new ExecutiveStationaryViewMonitor(), { frame } = rawSample(0);
+  expect(monitor.update("owner", frame, stationaryChoice(50), 0)).toBeNull();
+  for (let now = 50; now <= 6000; now += 50)
+    expect(monitor.update("owner", frame, stationaryChoice(now), now)).toBeNull();
+  const next = rawSample(6050);
+  expect(monitor.update("owner", next.frame, stationaryChoice(6050), 6050)).toBeNull();
+});
+
+test("pending native scope cannot publish or consume a notification and invalid pending samples still reset coverage", () => {
+  for (const invalidPending of [false, true]) {
+    const monitor = new ExecutiveStationaryViewMonitor();
+    for (let now = 0; now < 5000; now += 50) {
+      const { frame } = rawSample(now);
+      expect(monitor.update("owner", frame, stationaryChoice(now), now)).toBeNull();
+    }
+    const pending = rawSample(5000);
+    if (invalidPending && pending.input.kind === "world") pending.input.held.attack = true;
+    const choice: ExecutiveChoice = invalidPending ? { kind: "raw", input: pending.input } : stationaryChoice(5000);
+    expect(monitor.update("owner", pending.frame, choice, 5000, false)).toBeNull();
+    const next = rawSample(5050);
+    const incident = monitor.update("owner", next.frame, stationaryChoice(5050), 5050);
+    if (invalidPending) expect(incident).toBeNull();
+    else expect(incident).toMatchObject({ reason: "executive_stationary_view_observe", elapsed_native_ms: 5050 });
+  }
 });

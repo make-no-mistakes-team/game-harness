@@ -5,9 +5,9 @@ import { controllerInputFrameSchema, controllerInputSchema, inputAppliedAckSchem
   residentFrameContextSchema, revocationAckSchema,
   type ControllerInputFrame, type InputAppliedAck, type RevocationAck } from "../src/shared/controller.ts";
 import { ControllerInputs } from "../src/server/controller-inputs.ts";
-import { NativeControllerChannel, NativeRequestFault, type ControllerChannelTransport } from "../src/server/controller-channel.ts";
+import { controllerNativeDeadline, NativeControllerChannel, NativeRequestFault, type ControllerChannelTransport } from "../src/server/controller-channel.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
-import type { NativeControlTiming } from "../src/server/performance.ts";
+import type { NativeClockCorrespondence, NativeControlTiming } from "../src/server/performance.ts";
 
 const neutral: WorldHeld = { forward: false, back: false, left: false, right: false, jump: false,
   sprint: false, sneak: false, attack: false, use: false };
@@ -378,13 +378,18 @@ test("DTOs reject unsafe counters private actor ACK authority and malformed nati
   expect(() => new ControllerInputs(owner(), 0)).toThrow();
 });
 
-function nativeChannel(operationId = "resident-owner", generation = 3, deadlineHostMs = 10000) {
+function nativeChannel(operationId = "resident-owner", generation = 3, deadlineHostMs = 10000,
+  openingClock: NativeClockCorrespondence = { clock_id: "native-test", host_sent_ms: 0, host_received_ms: 0,
+    native_received_ns: "1000000000", native_replied_ns: "1000000000", native_processing_ms: 0,
+    residual_round_trip_ms: 0, offset_lower_ms: 1000, offset_upper_ms: 1000, uncertainty_ms: 0 },
+  deadlineNativeNs = controllerNativeDeadline(openingClock, deadlineHostMs, openingClock.host_received_ms)) {
   const identity = { ...owner(), operation_id: operationId, generation };
   const frame = controllerFrameFixture(identity.scope.life_id, identity.scope.space_epoch);
   frame.frame_seq = 1; frame.native_tick = frame.dynamic_entities.native_tick = 10;
   frame.captured_native_ns = frame.inventory.captured_native_ns = "1000000000";
   const calls: string[] = [], applied: InputAppliedAck[] = [];
   let retired = false;
+  let mapping = openingClock;
   let retirementTiming: NativeControlTiming | null = null;
   let request: ControllerChannelTransport["request"] = async method => {
     if (method === "controller_revoke") return { ack: retirement({ owner: identity,
@@ -395,15 +400,14 @@ function nativeChannel(operationId = "resident-owner", generation = 3, deadlineH
   const transport: ControllerChannelTransport = {
     async request(...args) { calls.push(args[0]); return await request(...args); },
     async sample() { return minecraftControllerFrameSchema.parse(structuredClone(frame)); },
-    clock: () => ({ clock_id: "native-test", host_sent_ms: 0, host_received_ms: 0,
-      native_received_ns: "1000000000", native_replied_ns: "1000000000", native_processing_ms: 0,
-      residual_round_trip_ms: 0, offset_lower_ms: 1000, offset_upper_ms: 1000, uncertainty_ms: 0 }),
+    clock: () => mapping,
     retirementTiming: () => retirementTiming,
     assertCurrent() { if (retired) throw new Error("Controller owner has retired."); },
     retired() { retired = true; }, async failed() { throw new Error("Unexpected unconfirmed retirement"); },
   };
-  const channel = new NativeControllerChannel(identity, 7, deadlineHostMs, transport, value => applied.push(value), () => {});
+  const channel = new NativeControllerChannel(identity, 7, deadlineHostMs, deadlineNativeNs, transport, value => applied.push(value), () => {});
   return { channel, calls, applied, frame, request(fn: typeof request) { request = fn; },
+    clock(value: NativeClockCorrespondence) { mapping = value; },
     timing(value: NativeControlTiming) { retirementTiming = value; } };
 }
 async function settleChannel() { for (let turn = 0; turn < 30; turn++) await Promise.resolve(); }
@@ -823,6 +827,83 @@ test("overlapping heartbeat deadlines stay capped by the original root and late 
     await h.channel.revoke();
   } finally { heartbeat.resolve({}); await settleChannel(); clock.mockRestore(); }
 });
+
+test.each([-9007199254740993n, 9007199254740993n])(
+  "near-root renewals retain the exact accepted native grant across clock correspondence drift (origin=%s)", async origin => {
+    const clock = vi.spyOn(performance, "now").mockReturnValue(4);
+    const openingClock: NativeClockCorrespondence = { clock_id: "boot", host_sent_ms: 0, host_received_ms: 4,
+      native_received_ns: String(origin + 2000000n), native_replied_ns: String(origin + 2000000n),
+      native_processing_ms: 0, residual_round_trip_ms: 4, offset_lower_ms: 0, offset_upper_ms: 4, uncertainty_ms: 2 };
+    const rootDeadline = 1000, originalGrant = controllerNativeDeadline(openingClock, rootDeadline, 4);
+    const h = nativeChannel("resident-owner", 3, rootDeadline, openingClock, originalGrant);
+    const grant = BigInt(originalGrant), deadlines: bigint[] = [];
+    let nativeNow = origin + 4000000n, leaseDeadline = nativeNow + 250000000n;
+    const receive: ControllerChannelTransport["request"] = async (method, params) => {
+      if (method === "controller_heartbeat") {
+        const deadline = BigInt((params as { deadline_native_ns: string }).deadline_native_ns);
+        // ControllerInputQueue checks the immutable open task deadline as well
+        // as the existing lease and the fresh 250ms mechanical lease bound.
+        if (nativeNow >= leaseDeadline || nativeNow >= grant || deadline <= nativeNow ||
+          deadline > grant || deadline - nativeNow > 250000000n)
+          throw new NativeRequestFault("native_rejected", method, deadlines.length + 1, "dispatched",
+            "Invalid mechanical controller lease");
+        deadlines.push(deadline);
+        if (deadline > leaseDeadline) leaseDeadline = deadline;
+        return {};
+      }
+      return { ack: retirement(), generation: 4 };
+    };
+    h.request(receive);
+    try {
+      for (const [index, now] of [4, 200, 400, 600, 800, 900, 997].entries()) {
+        clock.mockReturnValue(now);
+        nativeNow = origin + BigInt(now) * 1000000n;
+        if (now !== 4) {
+          const freshClock: NativeClockCorrespondence = { ...openingClock, host_sent_ms: now, host_received_ms: now,
+            native_received_ns: String(nativeNow), native_replied_ns: String(nativeNow),
+            residual_round_trip_ms: 0, uncertainty_ms: 0 };
+          h.clock(freshClock);
+          if (now >= 800) {
+            // Re-mapping the original host root would fabricate 2ms of native
+            // task authority, even though it is future and within 250ms.
+            const uncapped = BigInt(controllerNativeDeadline(freshClock, Math.min(rootDeadline, now + 250), now));
+            expect(uncapped).toBeGreaterThan(grant);
+            expect(uncapped - nativeNow).toBeGreaterThan(0n);
+            expect(uncapped - nativeNow).toBeLessThanOrEqual(250000000n);
+            await expect(receive("controller_heartbeat", { deadline_native_ns: String(uncapped) }, 1000))
+              .rejects.toThrow("Invalid mechanical controller lease");
+          }
+        }
+        h.frame.frame_seq++;
+        h.frame.captured_native_ns = h.frame.inventory.captured_native_ns = String(nativeNow);
+        const frame = await h.channel.sample(null);
+        await h.channel.renew(frame);
+        await settleChannel();
+        expect(h.channel.snapshot()).toMatchObject({ fenced: false, fault: null });
+        expect(deadlines).toHaveLength(index + 1);
+        expect(deadlines.at(-1)!).toBeGreaterThan(nativeNow);
+        expect(deadlines.at(-1)!).toBeLessThanOrEqual(grant);
+        expect(deadlines.at(-1)! - nativeNow).toBeLessThanOrEqual(250000000n);
+      }
+      expect(deadlines.slice(-3)).toEqual([grant, grant, grant]);
+      expect(grant).toBe(origin + 997999998n);
+      expect(h.applied).toEqual([]);
+      h.frame.frame_seq++;
+      h.frame.captured_native_ns = h.frame.inventory.captured_native_ns = String(nativeNow - 150000000n);
+      await expect(h.channel.renew(await h.channel.sample(null))).rejects.toThrow(/stale decision/);
+      expect(deadlines).toHaveLength(7);
+      expect(h.channel.snapshot().fenced).toBe(false);
+      clock.mockReturnValue(rootDeadline);
+      await expect(h.channel.renew(null)).rejects.toThrow(/expired/);
+      expect(deadlines).toHaveLength(7);
+      await h.channel.revoke();
+    } finally { await h.channel.revoke(); clock.mockRestore(); }
+  });
+
+test.each(["01", "1e9", "9223372036854775808", "-9223372036854775809"])(
+  "a channel rejects a malformed immutable native grant (%s)", deadline => {
+    expect(() => nativeChannel("resident-owner", 3, 10000, undefined, deadline)).toThrow();
+  });
 
 test("an older rejected heartbeat fences dispatch despite a newer success and retirement joins the remaining response", async () => {
   const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();

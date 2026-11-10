@@ -66,6 +66,7 @@ const retirementResponseSchema = z.object({ ack: revocationAckSchema, generation
 /** One admitted owner; admission, actual application and physical retirement remain distinct. */
 export class NativeControllerChannel implements ControllerInputChannel {
   private readonly expectedOwner: ExpectedEffectOwner;
+  private readonly deadlineNativeNs: bigint;
   private readonly inputs: ControllerInputs;
   private readonly captures = new Map<number, { tick: number; nanos: string }>();
   private readonly inflight = new Set<Promise<unknown>>();
@@ -78,9 +79,10 @@ export class NativeControllerChannel implements ControllerInputChannel {
   private admissionFault: ControllerChannelFault | null = null;
 
   constructor(owner: ExpectedEffectOwner, readonly controllerGeneration: number, private readonly deadlineHostMs: number,
-    private readonly transport: ControllerChannelTransport, private readonly applied: (ack: InputAppliedAck) => void,
+    acceptedDeadlineNativeNs: string, private readonly transport: ControllerChannelTransport, private readonly applied: (ack: InputAppliedAck) => void,
     private readonly effect: (update: ControllerEffectUpdate) => void) {
     this.expectedOwner = expectedEffectOwnerSchema.parse(owner);
+    this.deadlineNativeNs = BigInt(nativeNanosecondsSchema.parse(acceptedDeadlineNativeNs));
     this.inputs = new ControllerInputs(this.expectedOwner, controllerGeneration);
   }
   get owner(): ExpectedEffectOwner { return structuredClone(this.expectedOwner); }
@@ -321,7 +323,12 @@ export class NativeControllerChannel implements ControllerInputChannel {
       throw new ControllerChannelFaultError(this.firstFault, reason);
     }
     let nativeDeadline: string;
-    try { nativeDeadline = controllerNativeDeadline(this.transport.clock(), deadline, now); } catch (error) {
+    try {
+      const freshDeadline = BigInt(controllerNativeDeadline(this.transport.clock(), deadline, now));
+      // Native's task grant is the exact accepted open deadline, not a host
+      // deadline re-mapped through a later clock correspondence.
+      nativeDeadline = String(freshDeadline < this.deadlineNativeNs ? freshDeadline : this.deadlineNativeNs);
+    } catch (error) {
       const detail = error instanceof Error ? error.message : "Unusable native clock";
       this.admissionFault = this.fault("clock_bound", "unusable_native_clock", detail, captured);
       throw new ControllerChannelFaultError(this.admissionFault, detail);

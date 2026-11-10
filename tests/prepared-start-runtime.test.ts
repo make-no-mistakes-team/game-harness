@@ -3,6 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
+import type { AgentEvent, AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type { AuthState, GameBridge, GameState, Json } from "../src/shared/contracts.ts";
 import type { ResidentWorker } from "../src/shared/resident.ts";
 import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
@@ -107,7 +109,7 @@ async function fixture() {
     deadline_host_ms: performance.now() + 300000, assertCurrent() {}, setPhase() {},
     takeWorker(runId) { takes++; sourceHashAtTake = store.skillExecution(runId, { start_key: `prepared_${id}` })?.source_hash ?? null; return worker; },
     transferClosed() { throw new Error("No launch coordinator owns this software-only fixture"); } };
-  return { runtime, store, candidate, submitted: submitted.promise, workerClosed: workerClosed.promise, cloudOpening: cloudOpening.promise,
+  return { runtime, store, candidate, cloud, submitted: submitted.promise, workerClosed: workerClosed.promise, cloudOpening: cloudOpening.promise,
     counts: () => ({ inputCount, closeCount, activations, takes, ordinaryCompiles, sourceHashAtTake }),
     close };
 }
@@ -126,4 +128,35 @@ test("first compiled executive controls before cloud readiness and Stop retires 
     expect(f.counts().closeCount).toBe(1);
     await f.close(); await starting; await stopping;
   } catch (error) { await f.close(); throw error; }
+}, 10000);
+
+test("prepared local control does not suppress Main's initial ordinary task decision until root retirement", async () => {
+  const f = await fixture(), prompted = Promise.withResolvers<Record<string, unknown>>();
+  const hooks = new DiagnosticModelHooks();
+  let listener: ((event: AgentEvent) => void) | null = null, tools: AgentTool[] = [];
+  const agent = {
+    addBeforeModelCallHook: hooks.add, setBeforeModelCall() {}, replaceMessages() {},
+    setTools(value: AgentTool[]) { tools = value; },
+    subscribe(value: (event: AgentEvent) => void) { listener = value; return () => { listener = null; }; },
+    abort() {}, async waitForIdle() {},
+    async prompt(text: string) {
+      await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
+      prompted.resolve(JSON.parse(text));
+      listener?.({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [],
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } } } as unknown as AgentEvent);
+    },
+  } as unknown as Agent;
+  const starting = f.runtime.startPreparedRun(f.candidate);
+  try {
+    await f.cloudOpening; await f.submitted;
+    f.cloud.resolve(agent);
+    await starting;
+    const timeout = setTimeout(() => prompted.reject(new Error("Initial Main decision waited for live root retirement")), 2000);
+    let context: Record<string, unknown>;
+    try { context = await prompted.promise; } finally { clearTimeout(timeout); }
+    expect(context).toMatchObject({ reason: ["preflight_ready"], pending_decision: true, role: "planning" });
+    const run = f.runtime.snapshot()!;
+    expect(f.store.latestRootExecution(run.run_id)).toMatchObject({ status: "running", ended_at: null });
+    expect(f.counts()).toMatchObject({ activations: 1, takes: 1, ordinaryCompiles: 0 });
+  } finally { await f.close(); await starting; }
 }, 10000);

@@ -1,6 +1,7 @@
 import type { ResidentSnapshot } from "../shared/resident.ts";
 import type { ControllerInput, InputAppliedAck } from "../shared/controller.ts";
 import type { MinecraftControllerFrame } from "../shared/minecraft.ts";
+import type { ExecutiveChoice } from "../shared/control-session.ts";
 
 /** Facts about confirmed controls and own-body samples, never a gameplay verdict. */
 export class ExecutiveRawMonitor {
@@ -49,6 +50,68 @@ export class ExecutiveRawMonitor {
       first_captured_native_ns: interval.since.toString(), captured_native_ns: frame.captured_native_ns,
       applied_native_ns: ack.applied_native_ns, processed_frame_seq: frame.frame_seq,
       controller_generation: ack.controller_generation, applied_sequence: ack.sequence,
+      own_position: { ...position }, anchor_position: { ...interval.anchor }, maximum_anchor_distance_blocks: 0.3 };
+  }
+}
+
+/** Actual own-body samples plus accepted software choices, not evidence of applied input. */
+export class ExecutiveStationaryViewMonitor {
+  private interval: {
+    key: string; life: number; dimension: string; space: number; selected: number;
+    since: bigint; at: bigint; host: number; frame: number;
+    anchor: { x: number; y: number; z: number }; samples: number;
+    view: number; neutral: number; observe: number; notified: boolean;
+  } | null = null;
+
+  clear(): void { this.interval = null; }
+
+  update(key: string, frame: MinecraftControllerFrame, choice: ExecutiveChoice, now: number, nativeScopeKnown = true) {
+    const previous = this.interval, body = frame.player;
+    const sameAuthority = previous && previous.key === key && previous.life === frame.life_id &&
+      previous.dimension === frame.space.dimension_id && previous.space === frame.space.space_epoch;
+    if (sameAuthority && frame.frame_seq <= previous.frame) return null;
+    let rotating = false;
+    if (choice.kind === "raw" && choice.input.kind === "world") {
+      const input = choice.input, view = input.view;
+      if (Object.values(input.held).some(Boolean) || ("edges" in input && input.edges.length !== 0) ||
+        (input.selected_hotbar !== null && input.selected_hotbar !== body.selected_hotbar)) {
+        this.clear(); return null;
+      }
+      rotating = view.kind === "delta" ? view.yaw_radians !== 0 || view.pitch_radians !== 0
+        : view.kind === "rate" && (view.yaw_radians_per_second !== 0 || view.pitch_radians_per_second !== 0);
+    } else if (choice.kind !== "observe") {
+      this.clear(); return null;
+    }
+    if (frame.screen !== null || !body.on_ground || body.in_water || body.in_lava || body.gliding || body.vehicle_type !== null) {
+      this.clear(); return null;
+    }
+    const sampled = BigInt(frame.captured_native_ns), position = body.position;
+    const consecutive = sameAuthority && previous.selected === body.selected_hotbar &&
+      sampled > previous.at && sampled - previous.at <= 250_000_000n &&
+      now >= previous.host && now - previous.host <= 250 &&
+      Math.hypot(position.x - previous.anchor.x, position.y - previous.anchor.y, position.z - previous.anchor.z) <= 0.3;
+    // Opening a producer may still reveal a different native scope. Its sample
+    // can invalidate prior coverage, but cannot add facts under the old scope.
+    if (!nativeScopeKnown) {
+      if (!consecutive) this.clear();
+      return null;
+    }
+    const interval = this.interval = {
+      key, life: frame.life_id, dimension: frame.space.dimension_id, space: frame.space.space_epoch, selected: body.selected_hotbar,
+      since: consecutive ? previous.since : sampled, at: sampled, host: now, frame: frame.frame_seq,
+      anchor: consecutive ? previous.anchor : { ...position }, samples: consecutive ? previous.samples + 1 : 1,
+      view: (consecutive ? previous.view : 0) + Number(rotating),
+      neutral: (consecutive ? previous.neutral : 0) + Number(choice.kind === "raw" && !rotating),
+      observe: (consecutive ? previous.observe : 0) + Number(choice.kind === "observe"),
+      notified: consecutive ? previous.notified : false,
+    };
+    if (interval.notified || interval.view === 0 || sampled - interval.since < 5_000_000_000n) return null;
+    interval.notified = true;
+    return { reason: "executive_stationary_view_observe", application_inferred: false, usefulness_inferred: false,
+      elapsed_native_ms: Number(sampled - interval.since) / 1e6, samples: interval.samples,
+      raw_view_decisions: interval.view, raw_neutral_decisions: interval.neutral, observe_decisions: interval.observe,
+      first_captured_native_ns: interval.since.toString(), captured_native_ns: frame.captured_native_ns,
+      processed_frame_seq: frame.frame_seq, life_id: frame.life_id, space: { ...frame.space },
       own_position: { ...position }, anchor_position: { ...interval.anchor }, maximum_anchor_distance_blocks: 0.3 };
   }
 }

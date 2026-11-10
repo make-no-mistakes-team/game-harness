@@ -39,7 +39,7 @@ afterEach(async () => {
   }
 });
 
-async function repeatedNoEffectFixture(executive: boolean | "raw" = false) {
+async function repeatedNoEffectFixture(executive: boolean | "raw" | "view-observe" = false) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-no-effect-")), store = new Store(directory);
   const adapter = minecraftTestAdapter(), observation = minecraftObservationFixture(adapter);
   const state: GameState = { status: "connected", username: "Fixture", version: "1.21.4", world_id: observation.world_id,
@@ -51,14 +51,19 @@ async function repeatedNoEffectFixture(executive: boolean | "raw" = false) {
   let result: GameActionResult = { status: "succeeded", summary: "Explicit neutral outcome",
     evidence: { world_effect_emitted: false, neutralized: true, camera_changed: false } };
   let settle: (() => Promise<GameActionResult>) | null = null, nativeCalls = 0, aborts = 0, sample = 0;
-  const rawInput = { kind: "world" as const, held: { forward: true, back: false, left: false, right: false, jump: false,
-    sprint: false, sneak: false, attack: false, use: false }, view: { kind: "unchanged" as const }, selected_hotbar: null };
+  const rawInput = { kind: "world" as const, held: { forward: executive === "raw", back: false, left: false, right: false, jump: false,
+    sprint: false, sneak: false, attack: false, use: false },
+    view: executive === "view-observe" ? { kind: "rate" as const, yaw_radians_per_second: 2, pitch_radians_per_second: 0 }
+      : { kind: "unchanged" as const }, selected_hotbar: null };
   const sampleFrame = async () => {
     const frame = controllerFrameFixture(observation.life.life_id, observation.space.space_epoch);
     frame.frame_seq = ++sample; frame.native_tick = sample; frame.captured_native_ns = String(sample * 50000000);
     frame.dynamic_entities.native_tick = sample; frame.dynamic_entities.captured_native_ns = frame.captured_native_ns;
     frame.inventory.captured_native_ns = frame.captured_native_ns;
-    if (executive === "raw") { frame.player.on_ground = true; frame.player.in_water = false; }
+    if (executive === "raw" || executive === "view-observe") {
+      frame.player.on_ground = true; frame.player.in_water = false; frame.player.in_lava = false;
+      frame.player.gliding = false; frame.player.vehicle_type = null;
+    }
     return frame;
   };
   const game: GameBridge = {
@@ -67,7 +72,7 @@ async function repeatedNoEffectFixture(executive: boolean | "raw" = false) {
     cancel: async () => {}, neutralize: async () => {}, emergencyStop: async () => {},
     adapter: () => adapter, subscribe: () => () => {},
     openController: async (reservation, generation, _deadline, applied) => {
-      if (executive !== "raw") throw new Error("Observe-only executive must not acquire raw input");
+      if (executive !== "raw" && executive !== "view-observe") throw new Error("Observe-only executive must not acquire raw input");
       const owner = { operation_id: reservation.operation_id, generation: 1, scope: reservation.scope };
       let sequence = 0, revoked = false;
       return {
@@ -105,7 +110,9 @@ async function repeatedNoEffectFixture(executive: boolean | "raw" = false) {
         const written = await tools.find(tool => tool.name === "program_write")!.execute("no-effect-write", {
           ...(executive ? { entry: "step" } : {}),
           name: "Neutral repeated actions", source: executive
-            ? `export function step(frame,state,intent){return {choice:${JSON.stringify(executive === "raw" ? { kind: "raw", input: rawInput } : { kind: "observe" })},next_state:state,status:"running",events:[]};} export function activate(frame,state,intent){return step(frame,state,intent);}`
+            ? `export function step(frame,state,intent){const n=state?.n||0;return {choice:${executive === "view-observe"
+              ? `(n%8===0?{kind:"observe"}:${JSON.stringify({ kind: "raw", input: rawInput })})`
+              : JSON.stringify(executive === "raw" ? { kind: "raw", input: rawInput } : { kind: "observe" })},next_state:{n:n+1},status:"running",events:[]};} export function activate(frame,state,intent){return step(frame,state,intent);}`
             : 'for (let i=0;i<64;i++) { await game.action({kind:"look",yaw:0,pitch:0}); } return {status:"completed",summary:"Finite neutral observations",result:null};',
           dependencies: [], card: { purpose: "Inspect repeated neutral outcomes", applicability: "Fixture",
             method: "Finite identical neutral requests", reason: "Mechanical diagnostic regression", limitations: "No gameplay claim" },
@@ -129,7 +136,9 @@ async function repeatedNoEffectFixture(executive: boolean | "raw" = false) {
     createResidentAnalysisWorker: async () => { throw new Error("Observe-only fixture does not request analysis"); },
     createResidentWorker: async () => {
       ready.resolve(async () => { throw new Error("Observe-only executive has no async capability"); });
-      const decision = async () => ({ choice: executive === "raw" ? { kind: "raw" as const, input: rawInput } : { kind: "observe" as const }, next_state: null,
+      let decisions = 0;
+      const decision = async () => ({ choice: executive === "raw" || executive === "view-observe" && decisions++ % 8 !== 0
+        ? { kind: "raw" as const, input: rawInput } : { kind: "observe" as const }, next_state: null,
         status: "running" as const, events: [] });
       return { activate: decision, step: decision, close: async () => {} };
     },
@@ -214,6 +223,21 @@ test("confirmed stationary raw motion wakes ordinary repair without stopping the
   expect(fixture.store.latestRootExecution(fixture.run.run_id)).toMatchObject({ status: "running", ended_at: null });
   expect(fixture.counts()).toEqual({ nativeCalls: 0, aborts: 0 });
 }, 15000);
+
+test("stationary view and observe turnover reaches ordinary strategy with software-only evidence", async () => {
+  const fixture = await repeatedNoEffectFixture("view-observe");
+  await fixture.finished();
+  const feedback = fixture.contexts[1]?.feedback.find((entry: { type: string }) => entry.type === "program.repeated_no_effect");
+  expect(fixture.contexts[1]).toMatchObject({ reason: ["program_no_effect"], pending_decision: true });
+  expect(feedback).toMatchObject({ details: { reason: "executive_stationary_view_observe",
+    source: "runtime_mechanical", application_inferred: false, usefulness_inferred: false,
+    elapsed_native_ms: expect.any(Number), own_position: expect.any(Object), anchor_position: expect.any(Object) } });
+  expect(feedback.details.raw_view_decisions).toBeGreaterThan(0);
+  expect(feedback.details.observe_decisions).toBeGreaterThan(0);
+  expect(fixture.diagnostics()).toHaveLength(1);
+  expect(fixture.store.latestRootExecution(fixture.run.run_id)).toMatchObject({ status: "running", ended_at: null });
+  expect(fixture.counts()).toEqual({ nativeCalls: 0, aborts: 0 });
+}, 20000);
 
 for (const backlog of [0, 501]) test(`three explicit identical neutral outcomes wake ordinary strategy with a live root across ${backlog} earlier events`, async () => {
   const fixture = await repeatedNoEffectFixture();

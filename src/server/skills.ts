@@ -309,7 +309,8 @@ export class SkillManager {
       if (candidate) throw new RuntimeFault("conflict", "Prepared first-root admission already has its original receipt");
       return this.store.admitSkill(runId, parsed).view;
     }
-    const { skill, bundle, armLookahead } = this.prepareStart(runId, parsed);
+    const { skill, bundle } = this.prepareStart(runId, parsed);
+    const armLookahead = this.prepareLookaheadAdmission(parsed);
     if (candidate) {
       candidate.assertCurrent();
       if (parsed.entry !== "step" || !parsed.session || parsed.lookahead || !bundle ||
@@ -397,6 +398,7 @@ export class SkillManager {
     const parsed = skillStartRequestSchema.parse(request), { skill, bundle } = this.prepareStart(runId, parsed);
     if (parsed.entry !== "step" || !bundle || !this.sandbox.createResidentWorker)
       throw new RuntimeFault("precondition_failed", "Only resident successors have prepared runtimes");
+    this.prepareLookaheadAdmission(parsed);
     if (createHash("sha256").update(skill.source).digest("hex") !== skill.hash)
       throw new RuntimeFault("stale_context", "Published source bytes do not match the immutable canonical hash");
     const slot = `${runId}:${parsed.start_key}`, key = this.preparationKey(runId, parsed);
@@ -557,10 +559,6 @@ export class SkillManager {
     this.host.authorize({ session_id: parsed.session_id, world_id: run.world_id, epoch: parsed.epoch,
       native_boot_id: parsed.native_boot_id, run_id: runId, run_generation: parsed.run_generation,
       life_id: parsed.life_id, space_epoch: parsed.space_epoch });
-    const armLookahead = parsed.lookahead
-      ? this.host.prepareLookahead?.(parsed.lookahead) : undefined;
-    if (parsed.lookahead && !armLookahead)
-      throw new Error("This program host does not provide speculative planning");
     const skill = this.store.skill(runId, parsed);
     if (skill.state !== "validated") throw new Error("Skill is not validated");
     if (skill.validation.runtime_version !== SKILL_API_VERSION)
@@ -570,7 +568,13 @@ export class SkillManager {
     if (parsed.entry === "run" && skill.dependencies.some(dependency => dependency.import_path !== undefined ||
       this.store.skill(runId, dependency).entry !== "run"))
       throw new RuntimeFault("precondition_failed", "Async run dependencies can only name semantic run children");
-    return { skill, bundle, armLookahead };
+    return { skill, bundle };
+  }
+  /** Future-slot admission is not part of rechecking an already admitted worker. */
+  private prepareLookaheadAdmission(parsed: SkillStartRequest) {
+    const arm = parsed.lookahead ? this.host.prepareLookahead?.(parsed.lookahead) : undefined;
+    if (parsed.lookahead && !arm) throw new Error("This program host does not provide speculative planning");
+    return arm;
   }
   /** Fence new capabilities, settle the admitted leaf, then retain the admission guard. */
   async retireForHandoff(runId: string, request: SkillStartRequest, predecessorId: string, signal: AbortSignal | undefined): Promise<() => void> {
@@ -578,6 +582,7 @@ export class SkillManager {
     this.prepareStart(runId, parsed);
     if (parsed.entry === "step")
       await this.prepareResidentHandoff(runId, parsed, predecessorId, signal);
+    else this.prepareLookaheadAdmission(parsed);
     const selected = this.store.skillExecution(runId, { execution_id: predecessorId });
     const live = this.live.get(predecessorId);
     const sameScope = (view: SkillExecutionView, scope: EffectScope | SkillExecutionView = view) =>

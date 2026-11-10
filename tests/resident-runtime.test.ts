@@ -172,6 +172,59 @@ test("ordinary named resident handoff holds admission until native retirement th
   expect(f.manager.effectScope(next.execution_id)).not.toBeNull();
 });
 
+test("an admitted prepared successor keeps playing while its own lookahead slot is armed", async () => {
+  let planner: SpeculativePlanning;
+  const f = await fixture(undefined, {}, { prepareLookahead: config => planner.prepareOptIn(config) });
+  const adapter = minecraftTestAdapter();
+  const scope = () => ({ run_id: f.run.run_id, generation: 1, session_id: f.run.session_id!, world_id: f.run.world_id,
+    epoch: f.run.epoch, life_id: f.run.life_id!, life_status: "alive" as const, task: f.run.task,
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")!, native_boot_id: f.run.native_boot_id!,
+    space_epoch: f.run.space_epoch!, compatibility_hash: f.run.compatibility_hash!, screen: null });
+  planner = new SpeculativePlanning({
+    contract: () => adapter, admissionContext: scope,
+    context: () => {
+      const root = f.store.latestRootExecution(f.run.run_id);
+      return root ? { ...scope(), root: { execution_id: root.execution_id, skill_id: root.skill_id,
+        version: root.version, hash: root.source_hash!, status: root.status,
+        intent_version: root.entry === "step" ? root.resident?.intent_version ?? 0 : null } } : null;
+    },
+    skill: ref => f.store.skill(f.run.run_id, ref),
+    observe: async () => minecraftObservationFixture(adapter),
+    evaluateGuard: async () => { throw new Error("No speculative guard in this lifecycle fixture"); },
+    admit: async (request, permit) => { permit.assertCurrent(); return f.manager.start(f.run.run_id, request); },
+    evidence: (type, details) => { f.store.event(f.run.run_id, type, type, details); }, wake: () => {},
+  });
+  cleanup.unshift(async () => { planner.invalidate(); });
+  f.running();
+  const predecessor = f.start(); await f.firstStep.promise;
+  const successor = await f.manager.register(f.run.run_id, { entry: "step", name: "prepared with next", source, card, dependencies: [] });
+  const request = { entry: "step" as const, skill_id: successor.skill_id, version: successor.version,
+    start_key: "prepared-own-slot", ...executionScopeFixture(f.run), args: null, initial_state: 0,
+    limits: { ...DEFAULT_RESIDENT_LIMITS, duration_ms: 9000 },
+    lookahead: { after_ms: 8000, reason: "Independent later source", budget: { calls: 1, tools: 1, duration_ms: 3000 } } };
+  const retired = await f.manager.retireForHandoff(f.run.run_id, request, predecessor.execution_id, undefined);
+  retired();
+  const admitted = f.manager.start(f.run.run_id, request);
+  await until(f.store, f.run.run_id, () => {
+    const view = f.manager.get(f.run.run_id, { execution_id: admitted.execution_id });
+    return view?.ended_at !== null || view.entry === "step" && (view.resident?.counters.steps ?? 0) >= 2;
+  });
+  const playing = f.manager.get(f.run.run_id, { execution_id: admitted.execution_id })!;
+  expect(playing).toMatchObject({ status: "running", ended_at: null, resident: { status: "running" } });
+  expect(planner.projection()).toMatchObject({ state: "armed", basis: { root: { execution_id: admitted.execution_id } } });
+  const originalScope = f.manager.effectScope(admitted.execution_id);
+  await expect(f.manager.retireForHandoff(f.run.run_id, { ...request, start_key: "competing-prepared" },
+    admitted.execution_id, undefined)).rejects.toMatchObject({ code: "conflict" });
+  expect(f.manager.effectScope(admitted.execution_id)).toEqual(originalScope);
+  planner.invalidate();
+  await until(f.store, f.run.run_id, () => {
+    const view = f.manager.get(f.run.run_id, { execution_id: admitted.execution_id });
+    return view?.ended_at !== null || view.entry === "step" &&
+      (view.resident?.counters.steps ?? 0) > (playing.entry === "step" ? playing.resident!.counters.steps : 0);
+  });
+  expect(f.manager.get(f.run.run_id, { execution_id: admitted.execution_id })).toMatchObject({ status: "running", ended_at: null });
+});
+
 // Shipped supervisor/module thread through a plain Node pipe. Docker and native
 // application are deliberately substituted, not claimed by these lifecycle tests.
 async function residentProcess(bundle: ExecutableModuleBundle, signal: AbortSignal): Promise<ResidentWorker> {

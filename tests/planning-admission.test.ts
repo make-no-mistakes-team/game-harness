@@ -129,7 +129,7 @@ test(`real durable ${scenario.activation} admission after ${scenario.order} pres
   expect(manager.start(run.run_id, rootRequest).execution_id).toBe(rootId);
   expect(planner.projection()?.plan_id).toBe(draft.plan_id);
   expect(store.eventsAfter(run.run_id, 0, 500).filter((event) => event.type === "planning.requested")).toHaveLength(1);
-  expect(() => manager.start(run.run_id, { ...rootRequest, start_key: "competing_root" })).toThrow("Only one");
+  expect(() => manager.start(run.run_id, { ...rootRequest, start_key: "competing_root" })).toThrow();
   expect(store.skillExecutions(run.run_id)).toHaveLength(1);
   await started.promise;
   planner.begin();

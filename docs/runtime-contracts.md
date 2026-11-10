@@ -72,6 +72,8 @@ The active perception profile is `minecraft_assisted_rgb_fov_r8_control_v7`, wit
 
 Pure local decisions receive JSON, not Main's actor image. Terrain rows cover an occlusion-filtered spherical eight-block neighborhood around the player's block; their positions are already block centres. Empty local rows do not establish absence elsewhere, even when distant features remain visible in Main's image. Authored state may retain earlier permitted evidence with its capture/scope, but historical coordinates and handles never grant current target authority or automatic recovery.
 
+Memory is not populated automatically. Previously observed positions may inform model-chosen bounded raw movement checked against fresh own-body and local feedback, without assuming old geometry remains current. Targeted effects still require ordinary fresh admission; remembering a position neither revives its handle nor grants a private planner.
+
 ## Current compact program interface
 
 Executable types live in [`src/shared/programs.ts`](../src/shared/programs.ts); model inputs in [`src/server/program-interface.ts`](../src/server/program-interface.ts). [`RuntimeTools`](../src/server/runtime-tools.ts) applies role/schema authority, [`ProgramOperations`](../src/server/program-operations.ts) owns use cases and [`ProgramWorkspace`](../src/server/program-workspace.ts) resolves names and bounded evidence. Each immutable program selects `run`, `step`, `analyze` or pure `library`. Actor authoring defaults an omitted entry to `run`; durable execution never infers a missing historical entry.
@@ -183,6 +185,13 @@ acknowledged call returns its original selection without cancelling the
 successor. Each root keeps ordinary limits, and the run deadline is unchanged.
 Handoff supplies no behavior, state migration, fallback or replay of old effects.
 
+Lookahead availability is checked while preparing admission, before retirement,
+and its permit arms once for the admitted root. Subsequent prepared-worker
+activation and step checks validate the pinned source, scope, intent and
+original deadline; they do not request another future-planning slot. An
+already armed slot belonging to that root must not abort its playing worker.
+Competing lookahead admission still refuses before disturbing the incumbent.
+
 A resident successor is prepared before retirement: the host pins the published
 source bytes and SHA-256, exact request, compatibility and authority scope,
 predecessor identity, intent version and original deadline. One disposable
@@ -283,6 +292,12 @@ body conditions or authority changes reset coverage. Counts distinguish view,
 neutral and observe decisions. This evidence explicitly sets
 `application_inferred:false` and `usefulness_inferred:false`; it proves neither
 that a requested rotation applied nor that observation was unproductive.
+
+`max_events` is cumulative and counts diagnostics as well as attention.
+Repeated callbacks while completion predicates remain true do not renew it.
+Authored reporting should be transition-gated, including any wrapper that
+keeps running while Main acknowledges completion. The host does not raise the
+allowance or treat repeated notifications as new gameplay progress.
 
 Executive and legacy residents share one bounded pure-analysis lifecycle.
 Analysis runs alongside local decisions, with one outstanding job and the

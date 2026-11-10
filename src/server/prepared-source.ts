@@ -499,6 +499,9 @@ export class PreparedSource {
       "program_write saves inactive canonical immutable source; use named versions and CAS based_on for revisions, ordinary libraries/reexports and async run children when useful. " +
       "program_analyze runs bounded pure software tests on your explicitly synthetic input, never actual observations or qualification. " +
       "Before sealing, exercise your state transitions on repeated callbacks with a pending child, then terminal success/failure/unknown bookkeeping. " +
+      "Also test loss and return of rows in a partial sensing projection: absence locally is not global absence, and any retained evidence must keep its original scope/time separate from current target authority. " +
+      "You choose the synthetic inputs, assertions, memory representation and behavior; no host test supplies a route, target or response. " +
+      "Test repeated callbacks after a reporting/completion transition too: every diagnostic or attention event consumes the cumulative event allowance, not just attention. " +
       "Use an analyze module importing your own pure library; catch source exceptions into compact JSON diagnostics and inspect mismatches. This is software checking, not a successful game run. " +
       "Inspect your authored sources and actual API/schema help as needed. There is no tool for observing, playing, respawning, network or filesystem access. " +
       "Author an executive step(frame,state,intent) and explicit activate(frame,state,intent), selecting the exact root yourself with prepare_finish(args,initial_state,limits,session). " +

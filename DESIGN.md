@@ -290,6 +290,8 @@ The sidebar presents session/player life, the current goal, exact executing prog
 
 Run guidance keeps agent control separate from the session: Pause, Stop run, and goal completion leave a healthy client/video connected, and paused control does not freeze world ticks. A new task can reuse that session; Stop world ends it.
 
+With the client disconnected and the prepared server stopped, **Prepare & play** authors and compiles fresh programs before joining the player. Settings discloses selected-model usage and the twelve-request, five-minute preparation bounds before submission. Preparation has its own phase, original deadline, request count and cancellation; it never labels source readiness as gameplay success. Unknown cleanup blocks another startup. The latest failure and recovery guidance precede the re-enabled submission action, including at the minimum window size. An unknown HTTP outcome offers an explicit retry of the same request, not a second preparation. After worker transfer, the actual run status and ordinary controls take precedence. Separate **Start world** and connected-world **Create run** remain available; a selected startup bundle is never silently discarded.
+
 ### Dialogs and Working Containers
 
 Native modal dialogs carry named headings, Close actions, Escape behavior, focus containment, and restoration to the opening control. Settings and task entry, retained history, evidence categories, source/StrategyCards, evidence-backed promotion, and diagnostics share the same bounded frame. StrategyCards are definition lists with a label column (130px), not decorative cards. Errors use explicit wording and bounded notice regions. Opening evidence does not resume a retained run.

@@ -27,6 +27,7 @@ import { effectInvocationSchema, effectScopeSchema, screenRefSchema, spaceRefSch
 import { adapterActorProjectionSchema } from "../../src/shared/observations.ts";
 import { goalSchema, gameActionSchema } from "../../src/shared/validation.ts";
 import { residentLimitsSchema, residentSnapshotSchema, residentStateSchema } from "../../src/shared/resident.ts";
+import { PREPARED_START_LIMITS, preparedStartRequestSchema, type PreparedStartRequest, type PreparedStartView } from "../../src/shared/prepared-start.ts";
 
 const nullableText = z.string().nullable();
 const historyProjectionSchema = z.object({
@@ -202,6 +203,43 @@ const tokenUsage = z.object({
   known_cost: z.number().nullable(),
   legacy_input: z.number().nullable(),
 });
+const runUsage = tokenUsage.extend({
+  accounting_basis: z.literal("sdk_reported_subtotal"),
+  by_purpose: z.object({
+    authoring: tokenUsage,
+    planning: tokenUsage,
+    replanning: tokenUsage,
+    improvement: tokenUsage,
+    other: tokenUsage,
+  }),
+});
+const preparedStart: z.ZodType<PreparedStartView> = preparedStartRequestSchema.omit({ request_id: true }).extend({
+  preparation_id: z.string().min(1),
+  phase: z.enum(["authoring", "compiling", "ready", "joining", "activating", "started", "cancelling", "cancelled", "failed"]),
+  started_at: z.iso.datetime(),
+  deadline_at: z.iso.datetime(),
+  ready_at: z.iso.datetime().nullable(),
+  run_id: nullableText,
+  requests_admitted: z.int().nonnegative(),
+  tools_used: z.int().nonnegative(),
+  source_versions: z.int().nonnegative(),
+  analysis_jobs: z.int().nonnegative(),
+  analysis_ms: z.number().nonnegative(),
+  program: z.object({ name: z.string(), version: z.int().positive() }).nullable(),
+  usage: runUsage,
+  limits: z.object({
+    duration_ms: z.literal(PREPARED_START_LIMITS.duration_ms),
+    max_requests: z.literal(PREPARED_START_LIMITS.max_requests),
+    max_tools: z.literal(PREPARED_START_LIMITS.max_tools),
+    max_source_versions: z.literal(PREPARED_START_LIMITS.max_source_versions),
+    max_source_bytes: z.literal(PREPARED_START_LIMITS.max_source_bytes),
+    max_analysis_jobs: z.literal(PREPARED_START_LIMITS.max_analysis_jobs),
+    analysis_job_ms: z.literal(PREPARED_START_LIMITS.analysis_job_ms),
+    max_analysis_ms: z.literal(PREPARED_START_LIMITS.max_analysis_ms),
+  }),
+  closure: z.enum(["open", "draining", "closed", "transferred", "unknown"]),
+  error: nullableText,
+});
 const actionInput = gameActionSchema;
 const decision = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("continue"), reason: z.string().optional() }),
@@ -319,16 +357,7 @@ const run: z.ZodType<RunView> = z.object({
   skills: z.array(skill),
   executions: z.array(execution),
   error: nullableText,
-  usage: tokenUsage.extend({
-    accounting_basis: z.literal("sdk_reported_subtotal"),
-    by_purpose: z.object({
-      authoring: tokenUsage,
-      planning: tokenUsage,
-      replanning: tokenUsage,
-      improvement: tokenUsage,
-      other: tokenUsage,
-    }),
-  }),
+  usage: runUsage,
 });
 const snapshot: z.ZodType<AppSnapshot> = z.object({
   auth,
@@ -379,6 +408,7 @@ const snapshot: z.ZodType<AppSnapshot> = z.object({
     error: nullableText,
   }),
   run: run.nullable(),
+  prepared_start: preparedStart.nullable(),
   goals: z.array(
     z.object({
       id: z.string(),
@@ -496,6 +526,26 @@ export async function fetchState(): Promise<AppSnapshot> {
 
 export async function mutate(path: string, body: unknown = {}): Promise<void> {
   await request(path, body);
+}
+
+function preparationResponse(value: unknown): PreparedStartView {
+  const parsed = preparedStart.safeParse(value);
+  if (!parsed.success)
+    throw new ApiError(
+      "The service returned an unreadable preparation. Reconnect to inspect its state before starting another.",
+      0,
+      "invalid_preparation",
+    );
+  return parsed.data;
+}
+
+export async function prepareAndPlay(body: PreparedStartRequest): Promise<PreparedStartView> {
+  return preparationResponse(await request("/v1/prepared-start", preparedStartRequestSchema.parse(body)));
+}
+
+export async function cancelPreparation(preparationId: string): Promise<PreparedStartView> {
+  const id = z.string().min(1).parse(preparationId);
+  return preparationResponse(await request(`/v1/prepared-start/${encodeURIComponent(id)}/cancel`, {}));
 }
 
 export async function createRun(body: {

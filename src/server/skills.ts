@@ -17,7 +17,9 @@ import type {
   SkillView,
   SkillDependency,
   ExecutableModuleBundle,
+  ResidentSkillStartRequest,
 } from "../shared/programs.ts";
+import type { PreparedSourceCandidate } from "./prepared-source-contract.ts";
 import {
   skillCapabilitySchema,
   skillStartRequestSchema,
@@ -65,6 +67,7 @@ interface PreparedHandoff {
   assertCurrent(): void;
   retired: (() => void) | null;
 }
+interface InitialResidentWorker { worker: ResidentWorker; consumed: boolean }
 export interface PreparedResidentHandoff {
   assertCurrent(): void;
   close(): Promise<void>;
@@ -291,12 +294,31 @@ export class SkillManager {
     for (const dependency of dependencies) visit(dependency, 2);
   }
   start(runId: string, request: SkillStartRequest): SkillExecutionView {
+    return this.startRoot(runId, request);
+  }
+  /** First-root transfer has no predecessor, probe frame or saved native authority. */
+  startInitialPrepared(runId: string, request: ResidentSkillStartRequest, candidate: PreparedSourceCandidate): SkillExecutionView {
+    return this.startRoot(runId, request, candidate);
+  }
+  private startRoot(runId: string, request: SkillStartRequest, candidate?: PreparedSourceCandidate): SkillExecutionView {
     const parsed = skillStartRequestSchema.parse(request);
     const existing = this.store.skillExecution(runId, {
       start_key: parsed.start_key,
     });
-    if (existing) return this.store.admitSkill(runId, parsed).view;
+    if (existing) {
+      if (candidate) throw new RuntimeFault("conflict", "Prepared first-root admission already has its original receipt");
+      return this.store.admitSkill(runId, parsed).view;
+    }
     const { skill, bundle, armLookahead } = this.prepareStart(runId, parsed);
+    if (candidate) {
+      candidate.assertCurrent();
+      if (parsed.entry !== "step" || !parsed.session || parsed.lookahead || !bundle ||
+        JSON.stringify(bundle) !== JSON.stringify(candidate.bundle) || parsed.skill_id !== candidate.root.skill_id ||
+        parsed.version !== candidate.root.version || parsed.start_key !== `prepared_${candidate.preparation_id}` ||
+        JSON.stringify([parsed.args, parsed.initial_state, parsed.limits, parsed.session]) !==
+          JSON.stringify([candidate.intent, candidate.initial_state, candidate.limits, candidate.session]))
+        throw new RuntimeFault("stale_context", "Prepared first-root source does not match the exact admitted executive");
+    }
     for (const live of this.live.values()) {
       if (live.root !== live) continue;
       throw new RuntimeFault("busy", live.closing || live.controller.signal.aborted
@@ -304,6 +326,7 @@ export class SkillManager {
         : "A foreground program is still live; start does not replace it. Inspect target:'current' for its exact reference and pass handoff:{name,version,execution_ordinal} on start/submit to replace it. Stop is for a deliberate stop, not an automatic replacement.");
     }
     const prepared = this.preparedHandoffs.get(`${runId}:${parsed.start_key}`);
+    if (candidate && prepared) throw new RuntimeFault("conflict", "A first-root transfer cannot consume a predecessor handoff");
     if (prepared) {
       try {
         prepared.assertCurrent();
@@ -320,7 +343,20 @@ export class SkillManager {
       if (prepared) {
         prepared.executionId = admitted.view.execution_id;
       }
-      const live = this.dispatch(admitted.view, skill, null, prepared, bundle);
+      let initial: InitialResidentWorker | undefined;
+      if (candidate) {
+        try {
+          candidate.assertCurrent();
+          initial = { worker: candidate.takeWorker(runId), consumed: false };
+        } catch (error) {
+          admitted.view.status = "cancelled";
+          admitted.view.ended_at = new Date().toISOString();
+          admitted.view.error = "First-root source authority ended before worker transfer; no effects dispatched";
+          this.store.updateSkillExecution(admitted.view, "skill.closed", admitted.view.error);
+          throw error;
+        }
+      }
+      const live = this.dispatch(admitted.view, skill, null, prepared, bundle, initial);
       try {
         armLookahead?.(admitted.view.execution_id);
       } catch (error) {
@@ -687,6 +723,7 @@ export class SkillManager {
     parent: Live | null,
     prepared?: PreparedHandoff,
     bundle?: ExecutableModuleBundle,
+    initial?: InitialResidentWorker,
   ): Live {
     const sourceHash = view.source_hash;
     if (sourceHash === null) throw new Error("Admitted execution is missing its source identity");
@@ -739,7 +776,7 @@ export class SkillManager {
           "Skill dispatched inside its isolated execution",
         );
         this.authorize(live);
-        outcome = view.entry === "step" ? await this.runResident(live, prepared, bundle) : parseGeneratedSkillResult(
+        outcome = view.entry === "step" ? await this.runResident(live, prepared, bundle, initial) : parseGeneratedSkillResult(
           await this.sandbox.runSkill(
             skill.source,
             view.args,
@@ -808,6 +845,13 @@ export class SkillManager {
             };
         }
       } finally {
+        if (initial && !initial.consumed) {
+          try { await initial.worker.close(); }
+          catch {
+            live.cleanupFailure = new ResidentCleanupError();
+            live.abortStatus = "unknown"; view.status = "unknown"; this.host.unsafe();
+          }
+        }
         if (prepared) {
           try { await this.closePrepared(prepared); }
           catch (error) {
@@ -841,7 +885,8 @@ export class SkillManager {
     this.host.changed(false);
     return live;
   }
-  private async runResident(live: Live, prepared?: PreparedHandoff, pinnedBundle?: ExecutableModuleBundle): Promise<SkillResult> {
+  private async runResident(live: Live, prepared?: PreparedHandoff, pinnedBundle?: ExecutableModuleBundle,
+    initial?: InitialResidentWorker): Promise<SkillResult> {
     const view = live.view;
     if (view.entry !== "step" || !this.sandbox.createResidentWorker || !this.host.openController)
       throw new Error("Resident execution is not supported by this host");
@@ -851,7 +896,7 @@ export class SkillManager {
       throw new RuntimeFault("stale_context", "Admitted resident realm does not match its pinned module bundle");
     const ready = prepared?.worker;
     if (prepared && !ready) throw new RuntimeFault("stale_context", "Prepared live runtime is unavailable");
-    const worker = ready ?? await this.sandbox.createResidentWorker(bundle, view.limits.step_ms, live.controller.signal);
+    const worker = ready ?? initial?.worker ?? await this.sandbox.createResidentWorker(bundle, view.limits.step_ms, live.controller.signal);
     let activated = !prepared;
     const liveWorker: ResidentPreparedWorker = {
       step: (...args) => worker.step(...args),
@@ -876,11 +921,12 @@ export class SkillManager {
     let resident: ResidentController | ControlSession | null = null;
     const abort = () => { if (resident) void resident.stop(view.error ?? "Resident root authority revoked"); };
     try {
+      if (initial) initial.consumed = true;
       this.authorize(live);
       const options: ResidentControllerOptions = {
         execution_id: view.execution_id, source_hash: view.source_hash, controller_generation: 1,
         limits: view.limits, deadline_host_ms: live.deadlineHostMs, initial_state: view.initial_state, intent: view.args, worker: liveWorker,
-        first_activation: !!prepared,
+        first_activation: !!prepared || !!initial,
         open: (deadline, applied, effect, lifecycle, generation = 1) => this.host.openController!(view, generation, deadline, applied, effect, lifecycle),
         current: () => {
           try { this.authorize(live); return performance.now() < live.deadlineHostMs; } catch { return false; }

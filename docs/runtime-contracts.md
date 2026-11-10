@@ -30,6 +30,34 @@ GameHarness must be language-agnostic at component boundaries. Performance-criti
 
 The implementation separates `Runtime` lifecycle/observation/goal authority from `ActionArbiter` (`action-arbiter.ts`), `ReactiveRuntime` (`reactive.ts`), `StrategicPlanner` (`strategic.ts`), `RuntimeTools` (`runtime-tools.ts`), `SkillManager` (`skills.ts`), `ExperienceLibrary` (`experience.ts`) and program evidence (`program-evidence.ts`). Each owns its state and enforcement responsibilities; `runtime-prompt.ts` holds authoring instructions. The public runtime API remains the composition seam, not a per-tick gameplay engine.
 
+## Prepare before joining
+
+`POST /v1/prepared-start` accepts an immutable `{request_id,task,goal,model_id}` request; `request_id` is a UUID. It requires a stopped server with the EULA accepted, a disconnected player, a ready sandbox, no active run or unsettled preparation, and an exact image-capable model discovered through the authenticated account. The selected model authors code before the host starts the world or joins an avatar. **Start world** and connected-world **Create** remain separate ordinary paths. Preparation never disconnects an existing world to make its preconditions true.
+
+The host explicitly reads the native JAR, checks its embedded contract against current build inputs, and binds its SHA-256 and adapter compatibility hash. Missing or stale artifacts refuse preparation; schema knowledge establishes neither a negotiated native session nor an observation. The model receives the task, selected goal, actual schema/reference help and finite limits, with `world_state`, `observation` and `native_identity` set to null. The host creates no placeholder run, world, session or player-life identity.
+
+Each attempt has a fresh private sourcebook: no prior working programs, experience snapshot, observations or cross-model history are hydrated. Its tools are `help`, inactive `program_write`, source/catalog-only `program_inspect`, pure `program_analyze` and `prepare_finish`. Writes retain immutable named versions, explicit `based_on` revisions and pinned dependencies; outcome-linked top-level `reason` is unavailable. Analysis uses disposable workers and model-authored synthetic JSON, with results labelled as software tests. It cannot exercise the clean playing worker or establish gameplay effectiveness.
+
+The non-renewing bounds in [`PREPARED_START_LIMITS`](../src/shared/prepared-start.ts) are:
+
+| Resource | Bound per attempt |
+| --- | --- |
+| Original preparation deadline, including compile and join through transfer | 300,000 ms |
+| Model requests / tool admissions | 12 / 48 |
+| All immutable source versions / cumulative canonical source | 64 / 524,288 bytes |
+| Pure analysis jobs | 8 |
+| Evaluation time per analysis job / cumulative evaluation time | 500 ms / 4,000 ms |
+
+Ordinary per-definition and module-closure limits also apply. The private journal permits 16 MiB plus a 1 MiB terminal reserve, with a 2 MiB record cap. Failed work and source revisions do not renew allowances; evidence persistence failure fences preparation and blocks new admission.
+
+The model must call `prepare_finish` with an exact `step` version exporting both `activate(frame,state,intent)` and `step(frame,state,intent)`, plus explicit args, initial state, finite resident limits and a control-session configuration. Sealing fences further tools and inference. The host joins inference/tool drain, then compiles the pinned bundle in a clean isolated worker without invoking either entry. `ready` means that worker exists and supports activation; it is not a gameplay result. The coordinator rechecks idle ownership, artifact SHA-256 and compatibility before reserving a new native launch.
+
+Only actual joined readiness permits Runtime to create a real executive run with fresh working programs, retain authoring usage and import the exact selected source closure. Ordinary preflight acquires authoritative state and requires a living player; startup never respawns automatically. SkillManager checks the bundle, root, args, state, limits and session against the sealed candidate, then admits the root in Store **before** taking its worker exactly once under that real run ID. The controller invokes `activate` on its first actual frame. There is no predecessor, synthetic activation frame or probe result to replay. Worker transfer, activation, applied input and verified task success remain separate facts. The host supplies no gameplay policy.
+
+An identical `request_id` and body returns the retained receipt without another model call, compile or launch; a changed body conflicts. Same-identity tool retries likewise retain their original receipts. `POST /v1/prepared-start/{preparation_id}/cancel` with `{}` fences inference and pending compilation synchronously, then joins owned inference, tools, workers and any untransferred native launch. Closure is `closed` only after confirmed cleanup. Failed or interrupted ownership without confirmed drain remains `unknown`, blocks new preparation and is never replayed after restart.
+
+Successful transfer records `closure:"transferred"`, not worker closure. The preparation deadline then ends, and ordinary run/controller budgets, Pause, Resume and Stop own execution. Preparation cancellation refuses a started transferred run; use ordinary run controls. A later startup failure must drain the run owner without silently disconnecting a healthy transferred world. Explicit Stop world still owns session teardown. Software lifecycle tests can establish ordering and ownership under their fixtures; they do not prove natural-model adoption, visual correctness or native gameplay success.
+
 ## Ordinary modules and recovery target
 
 The required program format is ordinary bounded JavaScript modules with relative local imports, a controlled resolver for declared pure libraries and a `run(game, args, checkpoint)` entry. Local pure calls share one isolated execution; a function call does not require another container. Source/bundle bytes, initialization transport, memory, CPU and capability budgets remain finite. These requirements do not grant generated code package installation, arbitrary imports, network, host files or process creation.

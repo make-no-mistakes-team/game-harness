@@ -23,6 +23,8 @@ import type {
   PromotionDeclaration,
 } from "../../src/server/experience.ts";
 import {
+  ApiError,
+  cancelPreparation,
   createRun,
   eventSchema,
   fetchExperience,
@@ -34,6 +36,7 @@ import {
   fetchState,
   mutate,
   openSession,
+  prepareAndPlay,
   promoteExperience,
   removeJevKey,
   setJevKey,
@@ -43,7 +46,11 @@ import { NativeVideo } from "./video.ts";
 import { EvidenceInspector, promotionEvidence } from "./evidence.ts";
 import { MAX_TASK_CHARACTERS, taskTextSchema } from "../../src/shared/tasks.ts";
 import { initialTaskDraft, editTaskPrompt, selectTaskChoice, taskSubmission } from "./task-draft.ts";
-import { currentTaskText, stopControl, operatorLabel, canRefreshModels } from "./operator-state.ts";
+import {
+  currentTaskText, stopControl, operatorLabel, canRefreshModels, commandAvailable, currentUsage,
+  preparationPrerequisite, preparationLabel, preparationCancellation, preparationTiming, detachedPreparation,
+} from "./operator-state.ts";
+import { PREPARED_START_LIMITS, preparedStartActive, preparedStartRequestSchema, type PreparedStartRequest } from "../../src/shared/prepared-start.ts";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("Application mount is missing.");
@@ -69,13 +76,13 @@ root.innerHTML = `
       <p id="run-error" class="error" role="alert" hidden></p>
     </aside>
   </div>
-  <section class="run-toolbar" id="run-controls" aria-label="Run controls" tabindex="-1"><div class="run-control-state"><strong id="run-status" role="status">No run</strong><span id="run-hint">Configure a task in Settings.</span></div><div class="button-row"><button id="new-task" type="button">Task / model</button><button id="start-run" class="primary" type="button">Start</button><button id="pause-run" type="button">Pause</button><button id="resume-run" class="primary" type="button" hidden>Resume</button><button id="stop-run" class="danger" type="button">Stop run</button></div></section>
+  <section class="run-toolbar" id="run-controls" aria-label="Run controls" tabindex="-1"><div class="run-control-state"><strong id="run-status" role="status">No run</strong><span id="run-hint">Configure a task in Settings.</span></div><div class="button-row"><button id="new-task" type="button">Task / model</button><button id="cancel-preparation" class="danger" type="button" hidden>Cancel preparation</button><button id="start-run" class="primary" type="button">Start</button><button id="pause-run" type="button">Pause</button><button id="resume-run" class="primary" type="button" hidden>Resume</button><button id="stop-run" class="danger" type="button">Stop run</button></div></section>
   <footer><span id="readiness">World · unknown / Model · unknown / Isolation · unknown</span><button id="inventory-open" class="text-button" type="button">Inventory</button><span class="muted">Read-only video · no manual gameplay</span></footer>
 </main>
 <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-header"><h2 id="settings-title">Settings & task</h2><button type="button" data-close="settings-dialog" aria-label="Close settings">Close</button></div><div class="dialog-body settings-grid">
   <section class="settings-task"><h3>Game integration</h3><p>GameHarness runs model-authored game programs. Minecraft Java 1.21.4 is the first available integration; other game adapters are not available in this build.</p></section>
-  <section class="settings-task"><h3>Task and strategic model</h3><form id="task-form"><div class="form-row"><label>Automatic success check<select id="goal" required aria-describedby="goal-condition"><option value="">Waiting for checks</option></select></label><label>Strategic model<select id="model" required><option value="">Connect OpenAI first</option></select></label></div><p id="goal-condition" role="status">Custom tasks have no automatic success check.</p><div class="section-heading"><label for="task">Task</label><button id="use-goal" class="text-button" type="button">Restore preset prompt</button></div><textarea id="task" rows="3" minlength="1" maxlength="${MAX_TASK_CHARACTERS}" required placeholder="Describe what the agent should do in this world."></textarea><div class="button-row"><button id="create-run" type="submit" class="primary">Create run</button><span id="create-hint" class="muted">Create saves the task; Start begins inference.</span></div></form></section>
-  <section class="settings-task"><h3>Program libraries</h3><label for="working-programs">Working definitions for the next task</label><select id="working-programs"><option value="continue">Continue this session’s same-model working programs</option><option value="fresh">Fresh — omit working programs</option></select><p>Working candidates retain validated code, not arguments, observations or execution state. They are not qualified experience.</p><p>Separately, optionally load one exact evidence-backed startup bundle. Neither choice executes code; the new run still receives fresh permissions and validation.</p><label for="experience">Qualified compatible startup bundle</label><select id="experience"><option value="">No saved programs</option></select><p id="library-status" role="status">Choose a strategic model to load compatible bundles.</p><button id="library-refresh" type="button">Refresh compatible library</button><pre id="experience-detail" tabindex="0" hidden></pre></section>
+  <section class="settings-task"><h3>Task and strategic model</h3><form id="task-form"><div class="form-row"><label>Automatic success check<select id="goal" required aria-describedby="goal-condition"><option value="">Waiting for checks</option></select></label><label>Strategic model<select id="model" required><option value="">Connect OpenAI first</option></select></label></div><p id="goal-condition" role="status">Custom tasks have no automatic success check.</p><div class="section-heading"><label for="task">Task</label><button id="use-goal" class="text-button" type="button">Restore preset prompt</button></div><textarea id="task" rows="3" minlength="1" maxlength="${MAX_TASK_CHARACTERS}" required placeholder="Describe what the agent should do in this world."></textarea><p id="preparation-disclosure" class="muted">Preparation uses the selected model and counts toward your account usage: up to ${PREPARED_START_LIMITS.max_requests} requests, with a ${PREPARED_START_LIMITS.duration_ms / 60000}-minute preparation limit. It starts with fresh programs; the world opens only after compilation.</p><p id="preparation-prerequisite" role="status"></p><p id="preparation-error" class="error" role="alert" hidden></p><div class="button-row"><button id="prepare-play" type="submit" class="primary" aria-describedby="preparation-disclosure preparation-prerequisite">Prepare &amp; play</button><button id="create-run" type="submit" class="primary" hidden>Create run</button><span id="create-hint" class="muted" hidden>Create saves the task; Start begins inference.</span></div></form><div id="preparation-panel" class="preparation-status" tabindex="-1" aria-labelledby="preparation-status" hidden><p id="preparation-status" role="status"></p><p id="preparation-clock" class="mono"></p><p id="preparation-requests" class="mono"></p><button id="cancel-preparation-settings" class="danger" type="button" hidden>Cancel preparation</button><details><summary>Preparation details</summary><pre id="preparation-details" tabindex="0"></pre></details></div></section>
+  <section class="settings-task"><h3>Program libraries</h3><div id="working-library"><label for="working-programs">Working definitions for the next task</label><select id="working-programs"><option value="continue">Continue this session’s same-model working programs</option><option value="fresh">Fresh — omit working programs</option></select><p>Working candidates retain validated code, not arguments, observations or execution state. They are not qualified experience.</p></div><p id="library-mode">Separately, optionally load one exact evidence-backed startup bundle. Neither choice executes code; the new run still receives fresh permissions and validation.</p><label for="experience">Qualified compatible startup bundle</label><select id="experience"><option value="">No saved programs</option></select><p id="library-status" role="status">Choose a strategic model to load compatible bundles.</p><button id="library-refresh" type="button">Refresh compatible library</button><pre id="experience-detail" tabindex="0" hidden></pre></section>
   <section><h3>OpenAI connection</h3><p id="account-description">Connect your own account to discover models.</p><div class="button-row"><button id="login-browser" type="button">Connect in browser</button><button id="login-device" type="button">Use device code</button><button id="refresh-models" type="button" hidden>Refresh models</button><button id="logout" type="button" hidden>Disconnect account</button></div><div id="login-flow" hidden><p id="login-instructions"></p><a id="authorize-link" class="button primary" target="_blank" rel="noopener noreferrer" hidden>Continue in browser</a><p class="muted">Complete authorization in your browser, then return here.</p><form id="auth-form" hidden><label id="auth-input-label" for="auth-input">Authorization response</label><div class="input-row"><input id="auth-input" autocomplete="off" spellcheck="false" maxlength="16000"><button id="auth-submit" type="submit">Submit response</button></div></form><button id="cancel-login" type="button">Cancel authorization</button></div><p id="auth-error" class="error" role="alert" hidden></p></section>
   <section><h3>Isolated Minecraft world</h3><p id="world-description">Waiting for the local server.</p><p class="muted">Uses the authorized official Launcher account for this isolated client only. Personal worlds are not changed.</p><label id="eula-row" class="check-row" hidden><input id="eula" type="checkbox"><span>I accept the <a href="https://www.minecraft.net/eula" target="_blank" rel="noopener noreferrer">Minecraft EULA</a> for this local server.</span></label><div class="button-row"><button id="prepare-game" type="button">Prepare server</button><button id="start-game" type="button">Start world</button><button id="stop-game" type="button">Stop world</button></div><details><summary>New world</summary><p>Replaces this app’s world lineage, not your personal worlds. Recorded runs are retained. Stop the run and world first.</p><label class="check-row"><input id="confirm-world" type="checkbox"><span>Replace this app’s current world.</span></label><button id="new-world" class="danger" type="button">Create new world</button></details><p id="game-error" class="error" role="alert" hidden></p><p id="sandbox-error" class="error" role="alert" hidden></p></section>
   <section><h3>Optional Jev connection</h3><p id="jev-status">Connection status not loaded.</p><p class="muted">JavaScript reactions need no Jev key. The key is sent only to the authenticated local service and is never returned.</p><form id="jev-form"><label for="jev-key">Jev API key</label><div class="input-row"><input id="jev-key" type="password" autocomplete="off" spellcheck="false" maxlength="4096"><button id="jev-save" type="submit">Set key</button></div></form><button id="jev-remove" class="danger" type="button">Remove key</button><p id="jev-error" class="error" role="alert" hidden></p></section>
@@ -144,6 +151,10 @@ let evidenceTab = "programs",
 let library: ExperienceView[] = [];
 let libraryGeneration = 0;
 let libraryContext = "";
+let preparationAttempt: { request: PreparedStartRequest; previousId: string | null } | null = null;
+let preparationOutcomeUnknown = false;
+let preparationTimer = 0;
+let preparationIdentity = "";
 let performanceTimer = 0;
 let performanceGeneration = 0;
 let performanceLastStarted = -Infinity;
@@ -267,17 +278,28 @@ function active(run: RunView | null): boolean {
   return !!run && !["stopped", "completed", "failed"].includes(run.status);
 }
 function canOperate(id?: string): boolean {
-  return (
-    serviceReady &&
-    !!snapshot &&
-    (pending.size === 0 || (id === "stop-run" && !pending.has(id)))
-  );
+  return commandAvailable(serviceReady, snapshot !== null, pending, id);
 }
 function buttons(): void {
   const state = snapshot,
     run = state?.run ?? null,
     available = canOperate(),
     hasRun = active(run);
+  const preparation = state?.prepared_start ?? null;
+  const startupLocked = preparedStartActive(preparation) || preparationAttempt !== null;
+  const preparePath = state?.game.status !== "connected" || startupLocked;
+  const cancel = preparationCancellation(preparation);
+  const focused = document.activeElement;
+  const preparationReason = preparationOutcomeUnknown
+    ? "Preparation outcome is unknown. Reconnect to inspect state, or retry this same request without creating a second preparation."
+    : pending.has("prepare-play")
+      ? "Submitting preparation request…"
+      : !serviceReady
+        ? "Reconnect to the local service before preparing."
+        : preparationPrerequisite(state, {
+            task: task.value, choiceId: goal.value, modelId: model.value,
+            experienceId: el<HTMLSelectElement>("experience").value,
+          });
   const authBusy = ["authorizing", "discovering"].includes(
     state?.auth.status ?? "",
   );
@@ -298,68 +320,99 @@ function buttons(): void {
   const executableRun = !!run && typeof run.goal !== "string" && run.native_boot_id === state?.game.binding?.native_boot_id &&
     run.compatibility_hash !== null && run.compatibility_hash === state?.game.binding?.compatibility_hash && run.session_id === state?.game.session_id;
   const disabled: Record<string, boolean> = {
-    "login-browser": !available || authBusy || hasRun,
-    "login-device": !available || authBusy || hasRun,
+    "login-browser": !available || authBusy || hasRun || startupLocked,
+    "login-device": !available || authBusy || hasRun || startupLocked,
     "refresh-models":
-      !available || !state?.auth.authenticated || authBusy || !canRefreshModels(run?.status),
-    logout: !available || !state?.auth.authenticated || authBusy || hasRun,
-    "auth-submit": !available || !state?.auth.login?.prompt,
-    "cancel-login": !available || !state?.auth.login,
+      !available || !state?.auth.authenticated || authBusy || startupLocked || !canRefreshModels(run?.status),
+    logout: !available || !state?.auth.authenticated || authBusy || hasRun || startupLocked,
+    "auth-submit": !available || startupLocked || !state?.auth.login?.prompt,
+    "cancel-login": !available || startupLocked || !state?.auth.login,
     "prepare-game":
       !available ||
+      startupLocked ||
       gameBusy ||
       state?.server.status === "running" ||
       hasRun ||
       (!state?.server.eula_accepted && !el<HTMLInputElement>("eula").checked),
     "start-game":
       !available ||
+      startupLocked ||
       gameBusy ||
       (!reconnect && state?.server.status !== "stopped") ||
       (hasRun && !(["created", "paused"].includes(run?.status ?? "") && reconnect)),
     "stop-game":
-      !available ||
-      !["running", "starting", "error"].includes(state?.server.status ?? ""),
+      !canOperate("stop-game") ||
+      (!startupLocked && !["running", "starting", "error"].includes(state?.server.status ?? "") &&
+        !["connected", "connecting", "error"].includes(state?.game.status ?? "")),
     "new-world":
       !available ||
+      startupLocked ||
       hasRun ||
       state?.server.status !== "stopped" ||
       !el<HTMLInputElement>("confirm-world").checked,
     "create-run":
       !available ||
+      startupLocked ||
       hasRun ||
       !ready ||
       !taskTextSchema.safeParse(task.value).success ||
       !goal.value ||
       !model.value,
-    "start-run": !available || run?.status !== "created" || !ready || !executableRun,
+    "prepare-play": !available || (preparationOutcomeUnknown
+      ? !preparationAttempt || preparedStartActive(preparation)
+      : startupLocked || preparationReason !== null),
+    "cancel-preparation": !canOperate("cancel-preparation") || !cancel.available || cancel.draining,
+    "cancel-preparation-settings": !canOperate("cancel-preparation") || !cancel.available || cancel.draining,
+    "start-run": !available || startupLocked || run?.status !== "created" || !ready || !executableRun,
     "pause-run":
       !available || !["running", "bootstrapping", "reviewing"].includes(run?.status ?? ""),
-    "resume-run": !available || run?.status !== "paused" || !ready || !executableRun,
+    "resume-run": !available || startupLocked || run?.status !== "paused" || !ready || !executableRun,
     "stop-run":
       !canOperate("stop-run") ||
       !hasRun ||
       stopControl(run?.status, run?.operator.cleanup_error ?? null).draining,
-    "use-goal": !available || !goal.value,
+    "use-goal": !available || hasRun || startupLocked || !state?.goals.find(item => item.id === goal.value)?.goal.verifier,
     "jev-save":
-      !available || hasRun || !el<HTMLInputElement>("jev-key").value.trim(),
-    "jev-remove": !available || hasRun,
-    "motor-save": !available || !motorEdited || minecraftMotorProfile(snapshot) === null,
+      !available || hasRun || startupLocked || !el<HTMLInputElement>("jev-key").value.trim(),
+    "jev-remove": !available || hasRun || startupLocked,
+    "motor-save": !available || startupLocked || !motorEdited || minecraftMotorProfile(snapshot) === null,
   };
   for (const [id, value] of Object.entries(disabled)) {
     const button = el<HTMLButtonElement>(id);
     button.disabled = value;
-    button.setAttribute("aria-busy", String(pending.has(id)));
+    button.setAttribute("aria-busy", String(pending.has(id === "cancel-preparation-settings" ? "cancel-preparation" : id)));
   }
-  goal.disabled = !available || hasRun;
-  model.disabled = !available || hasRun || !state?.auth.models.length;
-  task.disabled = !serviceReady || hasRun;
-  el<HTMLSelectElement>("experience").disabled = !available || hasRun;
-  el<HTMLSelectElement>("working-programs").disabled = !available || hasRun;
-  el<HTMLSelectElement>("motor-profile").disabled = !available;
+  goal.disabled = !available || hasRun || startupLocked;
+  model.disabled = !available || hasRun || startupLocked || !state?.auth.models.length;
+  task.disabled = !available || hasRun || startupLocked;
+  el<HTMLSelectElement>("experience").disabled = !available || hasRun || startupLocked;
+  el<HTMLSelectElement>("working-programs").disabled = !available || hasRun || startupLocked || preparePath;
+  el<HTMLSelectElement>("motor-profile").disabled = !available || startupLocked || minecraftMotorProfile(state) === null;
+  for (const id of ["eula", "confirm-world", "auth-input", "jev-key"])
+    el<HTMLInputElement>(id).disabled = !available || startupLocked;
   el<HTMLButtonElement>("library-refresh").disabled =
-    !available || hasRun || !model.value;
-  hidden("pause-run", run?.status === "paused");
-  hidden("resume-run", run?.status !== "paused");
+    !available || hasRun || startupLocked || !model.value;
+  hidden("prepare-play", !preparePath || preparedStartActive(preparation));
+  el<HTMLButtonElement>("prepare-play").type = preparePath ? "submit" : "button";
+  el<HTMLButtonElement>("create-run").type = preparePath ? "button" : "submit";
+  hidden("preparation-disclosure", !preparePath || startupLocked);
+  hidden("create-run", preparePath);
+  hidden("create-hint", preparePath);
+  hidden("working-library", preparePath);
+  text("library-mode", preparePath
+    ? "Qualified bundles load through Create run in a connected world."
+    : "Separately, optionally load one exact evidence-backed startup bundle. Neither choice executes code; the new run still receives fresh permissions and validation.");
+  text("prepare-play", preparationOutcomeUnknown ? "Retry preparation request" : "Prepare & play");
+  text("preparation-prerequisite", preparationReason ?? "");
+  hidden("preparation-prerequisite", !preparePath || !preparationReason || preparedStartActive(preparation));
+  for (const id of ["cancel-preparation", "cancel-preparation-settings"]) {
+    hidden(id, !cancel.available);
+    text(id, cancel.label);
+  }
+  hidden("start-run", startupLocked && !hasRun);
+  hidden("stop-run", startupLocked && !hasRun);
+  hidden("pause-run", run?.status === "paused" || startupLocked && !hasRun);
+  hidden("resume-run", run?.status !== "paused" || startupLocked && !hasRun);
   text(
     "stop-run",
     stopControl(run?.status, run?.operator.cleanup_error ?? null).label,
@@ -380,6 +433,12 @@ function buttons(): void {
       ? "Stop this run before creating another task."
       : "Create saves the task; Start begins inference.",
   );
+  if (focused instanceof HTMLButtonElement &&
+    ["cancel-preparation", "cancel-preparation-settings"].includes(focused.id) &&
+    (focused.disabled || focused.hidden)) {
+    el(el<HTMLDialogElement>("settings-dialog").open ? "preparation-panel" : "run-controls")
+      .focus({ preventScroll: true });
+  }
   promotionButtons();
 }
 
@@ -389,17 +448,17 @@ function librarySelection(): void {
   );
   hidden("experience-detail", !selection);
   text("experience-detail", selection ? json(selection) : "");
+  buttons();
 }
 
 async function loadLibrary(): Promise<void> {
+  if (preparedStartActive(snapshot?.prepared_start ?? null) || preparationAttempt) return;
   const current = ++libraryGeneration;
   const modelId = model.value;
   libraryContext = json([modelId, snapshot?.server.world_id ?? null]);
   const select = el<HTMLSelectElement>("experience");
   const previous = select.value;
-  library = [];
-  select.replaceChildren(new Option("No saved programs", ""));
-  librarySelection();
+  const previousLabel = select.selectedOptions[0]?.textContent ?? previous;
   if (!serviceReady || !modelId) {
     text(
       "library-status",
@@ -422,11 +481,16 @@ async function loadLibrary(): Promise<void> {
           ),
       ),
     );
-    if (items.some((item) => item.experience_id === previous))
+    if (previous) {
+      if (!items.some((item) => item.experience_id === previous))
+        select.add(new Option(previousLabel, previous));
       select.value = previous;
+    }
     text(
       "library-status",
-      items.length
+      previous && !items.some(item => item.experience_id === previous)
+        ? "The selected bundle is no longer listed. Clear it or refresh the compatible library before creating a run."
+        : items.length
         ? `${items.length} bundles listed by the service for this model and current world. Exact compatibility is rechecked on admission.`
         : "No compatible saved bundles. New runs can still author their own programs.",
     );
@@ -435,7 +499,7 @@ async function loadLibrary(): Promise<void> {
     if (current === libraryGeneration)
       text(
         "library-status",
-        `Library unavailable: ${message(error)} No saved bundle is selected.`,
+        `Library unavailable: ${message(error)}${previous ? " Your selected bundle is unchanged." : " No saved bundle is selected."}`,
       );
   }
 }
@@ -554,6 +618,8 @@ function promotionButtons(): void {
   );
   el<HTMLButtonElement>("promotion-save").disabled =
     !canOperate() ||
+    preparedStartActive(snapshot?.prepared_start ?? null) ||
+    preparationAttempt !== null ||
     invalidPortable ||
     !scope ||
     !worldData ||
@@ -657,7 +723,7 @@ function renderOptions(state: AppSnapshot): void {
   const ms = json(state.auth.models);
   if (ms !== modelSignature) {
     modelSignature = ms;
-    const previous = model.value || state.run?.model_id;
+    const previous = model.value || state.prepared_start?.model_id || state.run?.model_id;
     model.replaceChildren(
       ...(state.auth.models.length
         ? state.auth.models.map((item) => new Option(item.name, item.id))
@@ -666,6 +732,20 @@ function renderOptions(state: AppSnapshot): void {
     if (previous && state.auth.models.some((item) => item.id === previous))
       model.value = previous;
   }
+  const preparation = state.prepared_start;
+  if (preparation && preparation.preparation_id !== preparationIdentity) {
+    preparationIdentity = preparation.preparation_id;
+    if (preparedStartActive(preparation) || !state.run) {
+      task.value = preparation.task;
+      const choice = state.goals.find(item => json(item.goal) === json(preparation.goal));
+      goal.value = choice?.id ?? "";
+      if (state.auth.models.some(item => item.id === preparation.model_id))
+        model.value = preparation.model_id;
+      renderTaskCondition();
+    }
+  }
+  if (preparedStartActive(preparation))
+    model.value = state.auth.models.some(item => item.id === preparation!.model_id) ? preparation!.model_id : "";
 }
 function safeOAuth(value: string | null): string | null {
   if (!value) return null;
@@ -742,6 +822,43 @@ function usageList(node: HTMLElement, usage: TokenUsage | null): void {
     node.append(dt, dd);
   }
 }
+function renderPreparationClock(): void {
+  window.clearTimeout(preparationTimer);
+  preparationTimer = 0;
+  const preparation = snapshot?.prepared_start;
+  if (!preparation) return;
+  const timing = preparationTiming(preparation, Date.now());
+  const elapsed = timing.elapsed_ms === null ? null : Math.floor(timing.elapsed_ms / 1000);
+  const clock = elapsed === null
+    ? `Started ${when(preparation.started_at)} · deadline ${when(preparation.deadline_at)}`
+    : `Elapsed ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")} · deadline ${when(preparation.deadline_at)}${timing.deadline_reached ? " · deadline passed" : ""}`;
+  text("preparation-clock", clock);
+  if (elapsed !== null && snapshot && detachedPreparation(snapshot) === preparation && !preparationAttempt &&
+    !["cancelling", "cancelled", "failed", "started"].includes(preparation.phase) &&
+    preparation.closure !== "unknown")
+    text("run-hint",
+      `${preparation.requests_admitted} / ${preparation.limits.max_requests} requests · elapsed ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, "0")} · deadline ${new Date(preparation.deadline_at).toLocaleTimeString()}${timing.deadline_reached ? " · deadline passed" : ""}`);
+  if (timing.elapsed_ms !== null)
+    preparationTimer = window.setTimeout(renderPreparationClock, 1000);
+}
+function renderPreparation(): void {
+  const preparation = snapshot?.prepared_start ?? null;
+  hidden("preparation-panel", !preparation || preparationAttempt !== null);
+  if (preparation) {
+    text("preparation-status", preparationLabel(preparation));
+    text("preparation-requests",
+      `${preparation.requests_admitted} / ${preparation.limits.max_requests} model requests · ${preparation.model_id}`);
+    const cleanup = preparation.closure === "unknown"
+      ? `Cleanup is unconfirmed; new startup remains blocked. ${preparationCancellation(preparation).available ? "Use Cancel preparation or Stop world to retry cleanup." : "Use Stop world to retry cleanup."}`
+      : null;
+    const recovery = preparation.phase === "failed" && preparation.closure === "closed"
+      ? "Review the task or model before starting a new preparation."
+      : null;
+    errorText("preparation-error", [preparation.error, cleanup, recovery].filter(Boolean).join(" ") || null);
+    text("preparation-details", json(preparation));
+  }
+  renderPreparationClock();
+}
 function mergeEvents(incoming: ActivityEvent[]): void {
   for (const event of incoming)
     events.set(`${event.run_id ?? "system"}:${event.event_seq}`, event);
@@ -751,7 +868,7 @@ function mergeEvents(incoming: ActivityEvent[]): void {
   events.clear();
   for (const event of ordered)
     events.set(`${event.run_id ?? "system"}:${event.event_seq}`, event);
-  const run = snapshot?.run;
+  const run = snapshot && detachedPreparation(snapshot) ? null : snapshot?.run;
   const latest = run ? ordered.filter(event => event.run_id === run.run_id).at(-1) : ordered.at(-1);
   const progress = run?.operator.progress;
   const summary = progress?.summary ?? latest?.summary;
@@ -768,6 +885,14 @@ function mergeEvents(incoming: ActivityEvent[]): void {
 }
 function render(state: AppSnapshot): void {
   snapshot = state;
+  if (preparationAttempt && state.prepared_start &&
+    state.prepared_start.preparation_id !== preparationAttempt.previousId &&
+    state.prepared_start.task === preparationAttempt.request.task &&
+    state.prepared_start.model_id === preparationAttempt.request.model_id &&
+    json(state.prepared_start.goal) === json(preparationAttempt.request.goal)) {
+    preparationAttempt = null;
+    preparationOutcomeUnknown = false;
+  }
   renderOptions(state);
   renderAuth(state);
   mergeEvents(state.events);
@@ -788,6 +913,7 @@ function render(state: AppSnapshot): void {
     if (el<HTMLDialogElement>("settings-dialog").open) void loadLibrary();
   }
   const run = state.run;
+  const preparation = detachedPreparation(state);
   const life = state.game.life;
   const deadControl = ["bootstrapping", "running"].includes(run?.status ?? "")
     ? "model may request respawn"
@@ -812,16 +938,22 @@ function render(state: AppSnapshot): void {
   if (el<HTMLSelectElement>("motor-profile").value === motorProfile) motorEdited = false;
   if (!motorEdited && motorProfile) el<HTMLSelectElement>("motor-profile").value = motorProfile;
   text("motor-status", motorProfile ? `Current materialized profile: ${motorProfile}.${motorEdited ? " Selection not applied." : " Applies live without restarting the session; old executable validations cannot cross a changed profile."}` : "This adapter has no Minecraft motor-profile control.");
-  text("run-status", run ? operatorLabel(run.operator.state, run.operator.completion) : "No run");
-  el("run-status").dataset.state = run?.operator.state ?? "none";
-  el("run-status").dataset.completion = run?.operator.completion ?? "none";
-  const suppliedGoal = state.goals.find(item => typeof run?.goal === "object" && item.goal.adapter_id === run.goal.adapter_id &&
-    item.goal.goal_id === run.goal.goal_id && item.goal.verifier?.id === run.goal.verifier?.id &&
-    item.goal.verifier?.version === run.goal.verifier?.version);
-  const taskText = run ? currentTaskText(run.task, run.task === suppliedGoal?.prompt) : null;
+  text("run-status", preparationAttempt
+    ? preparationOutcomeUnknown ? "Preparation outcome unknown" : "Submitting preparation request"
+    : preparation && preparation.phase !== "started" ? preparationLabel(preparation)
+      : run ? operatorLabel(run.operator.state, run.operator.completion) : "No run");
+  el("run-status").dataset.state = preparationAttempt ? "preparation-pending"
+    : preparation && preparation.phase !== "started" ? `preparation-${preparation.phase}` : run?.operator.state ?? "none";
+  el("run-status").dataset.completion = preparation ? "none" : run?.operator.completion ?? "none";
+  const currentGoal = preparation?.goal ?? run?.goal;
+  const currentTask = preparation?.task ?? run?.task;
+  const suppliedGoal = state.goals.find(item => typeof currentGoal === "object" && item.goal.adapter_id === currentGoal.adapter_id &&
+    item.goal.goal_id === currentGoal.goal_id && item.goal.verifier?.id === currentGoal.verifier?.id &&
+    item.goal.verifier?.version === currentGoal.verifier?.version);
+  const taskText = currentTask ? currentTaskText(currentTask, currentTask === suppliedGoal?.prompt) : null;
   text("current-task", taskText?.excerpt ?? "No run created.");
   hidden("goal-more", !taskText?.showFull);
-  const execution = run?.executions.find((item) => item.execution_id === run.action?.execution_id) ?? run?.executions.find((item) =>
+  const execution = preparation ? null : run?.executions.find((item) => item.execution_id === run.action?.execution_id) ?? run?.executions.find((item) =>
     ["running", "accepted", "cancel_requested"].includes(item.status),
   );
   const skill = run?.skills.find(
@@ -831,18 +963,24 @@ function render(state: AppSnapshot): void {
   );
   text(
     "program-current",
-    execution
+    preparation
+      ? preparation.program?.name ?? "No program selected yet."
+      : execution
       ? skill && skill.name.length <= 32 && !/[\r\n]/.test(skill.name)
         ? skill.name
         : execution.skill_id
       : run ? operatorLabel(run.operator.state, run.operator.completion) : "No executing skill.",
   );
-  const currentAction = run?.action && ["accepted", "running", "cancel_requested"].includes(run.action.status)
+  const currentAction = !preparation && run?.action && ["accepted", "running", "cancel_requested"].includes(run.action.status)
     ? `${run.action.kind} · ${run.action.summary.replace(/\s+/g, " ").slice(0, 80)}` : null;
-  text("program-status", [execution ? `v${execution.version} · ${label(execution.status)}` : null, currentAction].filter(Boolean).join(" · "));
-  hidden("program-status", !execution && !currentAction);
-  usageList(el("usage-summary"), run?.usage ?? null);
-  errorText("run-error", [...new Set([run?.error, run?.operator.cleanup_error].filter(Boolean))].join(" ") || null);
+  text("program-status", preparation
+    ? [preparation.program ? `v${preparation.program.version}` : null, preparationLabel(preparation)].filter(Boolean).join(" · ")
+    : [execution ? `v${execution.version} · ${label(execution.status)}` : null, currentAction].filter(Boolean).join(" · "));
+  hidden("program-status", !preparation && !execution && !currentAction);
+  usageList(el("usage-summary"), preparationAttempt ? null : currentUsage(state));
+  errorText("run-error", preparation
+    ? preparation.error
+    : [...new Set([run?.error, run?.operator.cleanup_error].filter(Boolean))].join(" ") || null);
   text(
     "readiness",
     `World · ${label(state.server.status)} / OpenAI · ${label(state.auth.status)} / Isolation · ${label(state.sandbox.status)}`,
@@ -896,7 +1034,24 @@ function render(state: AppSnapshot): void {
       : "Player dead; no active run. Connect OpenAI in Settings, create a task and Start.";
   else if (!state.auth.authenticated)
     hint = "Connect OpenAI and prepare the world in Settings.";
+  if (preparationAttempt)
+    hint = preparationOutcomeUnknown
+      ? "Reconnect to inspect preparation. Stop world remains available in Settings."
+      : "Waiting for the service to admit preparation. Stop world remains available in Settings.";
+  else if (preparation && preparation.phase !== "started")
+    hint = preparation.closure === "unknown"
+      ? "Cleanup is unconfirmed. New startup is blocked; inspect preparation in Settings."
+      : preparation.phase === "cancelling"
+        ? "Waiting for confirmed cleanup; task and world settings remain locked."
+        : preparation.phase === "failed"
+          ? "Inspect the preparation error in Settings before trying again."
+          : preparation.phase === "cancelled"
+            ? "Configure the next task in Settings."
+            : `${preparation.requests_admitted} / ${preparation.limits.max_requests} model requests · deadline ${new Date(preparation.deadline_at).toLocaleTimeString()}`;
+  else if (!run && state.game.status === "disconnected" && state.auth.authenticated)
+    hint = "Choose a task and model in Settings, then Prepare & play.";
   text("run-hint", hint);
+  renderPreparation();
   buttons();
   renderEvidence();
 }
@@ -940,7 +1095,7 @@ function pre(parent: HTMLElement, value: unknown): void {
   node.textContent = json(value);
   parent.append(node);
 }
-function usageTable(parent: HTMLElement, run: RunView): void {
+function usageTable(parent: HTMLElement, run: Pick<RunView, "usage">): void {
   paragraph(
     parent,
     "SDK/provider-message reported subtotals, not proven provider-consumption totals. Unknown means unreported; legacy aggregate input is not relabeled as uncached input. Reported monetary cost is a subtotal, not a subscription invoice.",
@@ -1008,7 +1163,8 @@ function renderEvidence(force = false): void {
     el<HTMLDialogElement>("promotion-dialog").open
   )
     return;
-  const run = selectedRun ?? snapshot?.run ?? null;
+  const preparation = selectedRun || !snapshot ? null : detachedPreparation(snapshot);
+  const run = selectedRun ?? (preparation ? null : snapshot?.run ?? null);
   const archive = run ? archivedEvents.get(run.run_id) : null;
   const retained = new Map<string, ActivityEvent>();
   for (const event of [...events.values(), ...(archive?.events ?? [])]) {
@@ -1021,6 +1177,7 @@ function renderEvidence(force = false): void {
   const signature = json([
     evidenceTab,
     run,
+    preparation,
     evidenceTab === "activity" ? [relevantEvents, archive] : null,
     evidenceTab === "inventory" ? snapshot?.game.presentation : null,
     evidenceTab === "life" ? snapshot?.game : null,
@@ -1033,7 +1190,7 @@ function renderEvidence(force = false): void {
     "evidence-run",
     run
       ? `${selectedRun ? "Retained" : "Current"} run · ${run.run_id} · ${operatorLabel(run.operator.state, run.operator.completion)}`
-      : "No run selected",
+      : preparation ? `${preparationLabel(preparation)} · ${preparation.model_id}` : "No run selected",
   );
   if (inspector.render(evidenceTab, node, run, selectedRun ? null : snapshot?.game ?? null)) return;
   const focused =
@@ -1047,8 +1204,8 @@ function renderEvidence(force = false): void {
   );
   const scroll = node.scrollTop;
   node.replaceChildren();
-  if (run) {
-    paragraph(node, run.task, "evidence-task");
+  if (run || preparation) {
+    paragraph(node, (run ?? preparation)!.task, "evidence-task");
     const task = node.querySelector<HTMLElement>(".evidence-task")!;
     task.tabIndex = -1;
     task.dataset.key = "full-task";
@@ -1108,6 +1265,15 @@ function renderEvidence(force = false): void {
       );
       if (presentation) paragraph(node, json(presentation.state), "mono");
     }
+  } else if (preparation && evidenceTab === "usage") {
+    usageTable(node, preparation);
+  } else if (preparation && evidenceTab === "programs") {
+    sectionHeading(node, preparationLabel(preparation));
+    paragraph(node, preparation.program
+      ? `Selected program: ${preparation.program.name} · v${preparation.program.version}`
+      : "No program selected yet.");
+    if (preparation.error) paragraph(node, preparation.error, "error");
+    pre(node, preparation);
   } else if (!run) {
     paragraph(
       node,
@@ -1734,8 +1900,60 @@ click("use-goal", () => {
   task.focus();
   buttons();
 });
+async function startPreparedTask(): Promise<void> {
+  if (el<HTMLButtonElement>("prepare-play").disabled || !snapshot) return;
+  await command("prepare-play", async () => {
+    if (!snapshot) throw new Error("No current service state.");
+    if (!preparationAttempt) {
+      const submission = taskSubmission({ choice_id: goal.value, task: task.value }, snapshot.goals);
+      preparationAttempt = {
+        request: preparedStartRequestSchema.parse({ ...submission, request_id: crypto.randomUUID(), model_id: model.value }),
+        previousId: snapshot.prepared_start?.preparation_id ?? null,
+      };
+    }
+    const request = preparationAttempt.request;
+    preparationOutcomeUnknown = false;
+    libraryGeneration++;
+    render(snapshot);
+    try {
+      const preparation = await prepareAndPlay(request);
+      preparationAttempt = null;
+      preparationOutcomeUnknown = false;
+      if (snapshot)
+        render({ ...snapshot, prepared_start: snapshot.prepared_start?.preparation_id === preparation.preparation_id
+          ? snapshot.prepared_start : preparation });
+      el<HTMLDialogElement>("settings-dialog").close();
+    } catch (error) {
+      if (preparationAttempt) {
+        if (error instanceof ApiError && error.status >= 400 && error.code !== "invalid_response")
+          preparationAttempt = null;
+        else preparationOutcomeUnknown = true;
+      }
+      if (snapshot) render(snapshot);
+      throw error;
+    }
+  });
+  if (!el<HTMLDialogElement>("settings-dialog").open) {
+    const cancel = el<HTMLButtonElement>("cancel-preparation");
+    (cancel.hidden || cancel.disabled ? el("run-controls") : cancel).focus({ preventScroll: true });
+  }
+}
+for (const id of ["cancel-preparation", "cancel-preparation-settings"])
+  click(id, () => {
+    const preparation = snapshot?.prepared_start;
+    if (!preparation || el<HTMLButtonElement>(id).disabled || !preparationCancellation(preparation).available) return;
+    void command("cancel-preparation", async () => {
+      const closed = await cancelPreparation(preparation.preparation_id);
+      if (snapshot?.prepared_start?.preparation_id === preparation.preparation_id)
+        render({ ...snapshot, prepared_start: closed });
+    });
+  });
 el("task-form").addEventListener("submit", (event) => {
   event.preventDefault();
+  if (!el<HTMLButtonElement>("prepare-play").hidden) {
+    void startPreparedTask();
+    return;
+  }
   if (el<HTMLButtonElement>("create-run").disabled) return;
   void command("create-run", async () => {
     const experienceId = el<HTMLSelectElement>("experience").value;
@@ -1917,6 +2135,7 @@ for (const link of document.querySelectorAll<HTMLAnchorElement>(
 window.addEventListener("pagehide", () => {
   stream?.close();
   video.disconnect();
+  window.clearTimeout(preparationTimer);
   stopPerformance();
 });
 window.addEventListener("pageshow", (event) => {

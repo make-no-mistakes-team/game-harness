@@ -2,6 +2,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
+import type { PreparationContract } from "./prepared-source-contract.ts";
 import type {
   AdapterDescriptor,
   AdapterSchemaCatalog,
@@ -556,6 +557,18 @@ export class GameBridgeClient implements GameBridge {
   adapter() {
     return this.state.binding?.ready ? this.runtimeAdapter : null;
   }
+  /** Artifact/schema knowledge only; this neither joins a player nor establishes native authority. */
+  async prepareExecutableContract(): Promise<PreparationContract> {
+    const assertDisconnected = () => {
+      if (this.connecting || this.owned || this.closing || this.state.status !== "disconnected" ||
+        this.options.descriptor !== undefined)
+        throw new Error("Prejoin source preparation requires an idle disconnected native client and actual installed artifact");
+    };
+    assertDisconnected();
+    const { actual, adapter } = await this.readExecutableContract();
+    assertDisconnected();
+    return { adapter, artifact_sha256: actual.artifact_sha256 };
+  }
   performanceMetrics() {
     return {
       native: this.nativeMetrics,
@@ -615,6 +628,16 @@ export class GameBridgeClient implements GameBridge {
       this.ensureProvidedRegistration();
       return;
     }
+    const { actual, adapter } = await this.readExecutableContract();
+    this.prepared = actual;
+    this.expectedDescriptor = adapter.descriptor;
+    this.schemas = adapter.schemas;
+    this.runtimeAdapter = adapter;
+    this.registration = new RegisteredAdapterContract(
+      adapter.descriptor, adapter.schemas, adapter.capabilityValidators,
+    );
+  }
+  private async readExecutableContract() {
     const artifact = path.join(
       this.projectRoot,
       "native/minecraft/build/libs/gameharness-native-1.0.0.jar",
@@ -624,21 +647,13 @@ export class GameBridgeClient implements GameBridge {
       this.projectRoot,
       actual.resource,
     );
-    this.prepared = actual;
     const descriptor = structuredClone(resource.descriptor);
     descriptor.observation.profile.configuration =
       minecraftProfileConfiguration(this.motorProfile);
     descriptor.observation.profile.configuration_hash = contractHash(
       descriptor.observation.profile.configuration,
     );
-    this.expectedDescriptor = descriptor;
-    this.schemas = resource.schemas;
-    this.runtimeAdapter = createMinecraftAdapter(descriptor);
-    this.registration = new RegisteredAdapterContract(
-      descriptor,
-      resource.schemas,
-      this.runtimeAdapter.capabilityValidators,
-    );
+    return { actual, adapter: createMinecraftAdapter(descriptor) };
   }
   private async listener(kind: "control" | "video") {
     const server = createServer((socket) => this.accept(socket, kind));

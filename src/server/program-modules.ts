@@ -9,6 +9,11 @@ import type { Store } from "./store.ts";
 export const MODULE_LIMITS = Object.freeze({ modules: 32, depth: 8, source_bytes: 65536, envelope_bytes: 262144 });
 export const LOCAL_MODULE_ALIAS = /^\.\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|mjs)$/;
 type Definition = Pick<SkillView, "entry" | "name" | "source" | "hash" | "dependencies" | "validation">;
+/** Trusted immutable catalog: no run, native identity or playing authority is implied. */
+export interface ProgramArtifactCatalog {
+  readonly compatibility_hash: string;
+  read(ref: SkillRef): SkillView;
+}
 type ModuleRow = ExecutableModuleBundle["modules"][number];
 type Node = { type: string; [key: string]: unknown };
 type Binding = { node: Node | null; identity: string };
@@ -35,13 +40,22 @@ export function resolveProgramModuleClosure(store: Pick<Store, "skill" | "getRun
   compatible?: (definition: Definition) => void, dependencyState: "validated" | "historical" = "validated"): ModuleRow[] {
   const run = store.getRun(runId);
   if (!run?.compatibility_hash) fail("invalid_modules", "Module closure requires the current run adapter profile.");
+  return resolveArtifactModuleClosure({ compatibility_hash: run.compatibility_hash, read: ref => store.skill(runId, ref) },
+    root, compatible, dependencyState);
+}
+
+/** Same resolver for trusted prejoin artifacts and admitted run-local artifacts. */
+export function resolveArtifactModuleClosure(catalog: ProgramArtifactCatalog, root: Definition,
+  compatible?: (definition: Definition) => void, dependencyState: "validated" | "historical" = "validated",
+  requireActivate = false): ModuleRow[] {
+  if (!catalog.compatibility_hash) fail("invalid_modules", "Module closure requires a trusted artifact profile.");
   const check = (definition: Definition) => {
     const validation = definition.validation, features = validation.runtime_features;
     if (!definition.entry || validation.runtime_version !== 5 || validation.api_version !== 5 || validation.validator_version !== 5 ||
-      validation.compatibility_hash !== run.compatibility_hash || (features !== undefined &&
+      validation.compatibility_hash !== catalog.compatibility_hash || (features !== undefined &&
         (features.length > 1 || (features.length === 1 && features[0] !== "pure_modules_v1"))) ||
       validation.fingerprint !== programFingerprint(definition.hash, definition.entry === "run" ? "skill" : definition.entry,
-        run.compatibility_hash!, undefined, features)) fail("invalid_modules", "Module validation is incompatible with this run.");
+        catalog.compatibility_hash, undefined, features)) fail("invalid_modules", "Module validation is incompatible with this artifact.");
     if (sha(definition.source) !== definition.hash) fail("invalid_modules", "Immutable module source hash does not match its bytes.");
     if (Buffer.byteLength(definition.source, "utf8") > 16384) fail("module_source_limit", "Module source exceeds 16 KiB.");
     if (definition.dependencies.length > 32) fail("invalid_dependencies", "A definition cannot declare more than 32 dependencies.");
@@ -82,7 +96,7 @@ export function resolveProgramModuleClosure(store: Pick<Store, "skill" | "getRun
     const aliases = new Map<string, Map<string, Binding>>();
     const declaredAliases = new Set<string>();
     for (const dependency of definition.dependencies) {
-      const selected = store.skill(runId, dependency);
+      const selected = catalog.read(dependency);
       if (selected.skill_id !== dependency.skill_id || selected.version !== dependency.version ||
         (dependencyState === "validated" && selected.state !== "validated"))
         fail("invalid_modules", "Dependency is not the exact validated run-local reference.");
@@ -193,6 +207,8 @@ export function resolveProgramModuleClosure(store: Pick<Store, "skill" | "getRun
           fail("invalid_entry", "Selected root exports must be synchronous functions with the declared plain-parameter arity.");
       }
       if (!result.has(definition.entry)) fail("invalid_entry", "Module does not export its selected entry.");
+      if (id === "root" && requireActivate && (definition.entry !== "step" || !result.has("activate")))
+        fail("invalid_entry", "Prepared executives must explicitly export a synchronous activate(frame, state, intent).");
     }
     row.imports.sort((a, b) => a.specifier < b.specifier ? -1 : a.specifier > b.specifier ? 1 : 0);
     heights.set(id, 1 + Math.max(0, ...row.imports.map(binding => heights.get(binding.module_id)!)));
@@ -205,15 +221,22 @@ export function resolveProgramModuleClosure(store: Pick<Store, "skill" | "getRun
 /** Build a self-contained, byte-verified execution realm before any producer is retired. */
 export function buildExecutableModuleBundle(store: Pick<Store, "skill" | "getRun">, runId: string, root: SkillView,
   compatible?: (definition: Definition) => void): ExecutableModuleBundle {
-  const selected = store.skill(runId, root);
+  const run = store.getRun(runId);
+  if (!run?.compatibility_hash) fail("invalid_modules", "Module closure requires the current run adapter profile.");
+  return buildArtifactModuleBundle({ compatibility_hash: run.compatibility_hash, read: ref => store.skill(runId, ref) }, root, compatible);
+}
+
+export function buildArtifactModuleBundle(catalog: ProgramArtifactCatalog, root: SkillView,
+  compatible?: (definition: Definition) => void, requireActivate = false): ExecutableModuleBundle {
+  const selected = catalog.read(root);
   const identity = (definition: SkillView) => JSON.stringify([definition.skill_id, definition.version, definition.name,
-    definition.entry, definition.source, definition.hash, definition.validation.fingerprint, definition.validation.runtime_features,
+    definition.entry, definition.source, definition.hash, definition.validation,
     definition.dependencies.map(dependency => [dependency.import_path ?? null, dependency.skill_id, dependency.version])]);
   if (selected.state !== "validated" || identity(selected) !== identity(root))
     fail("invalid_modules", "Execution requires the exact immutable root definition from this run.");
   root = selected;
   if (root.entry !== "step" && root.entry !== "analyze") fail("invalid_entry", "Only step and analyze roots acquire executable module bundles.");
-  const modules = resolveProgramModuleClosure(store, runId, root, compatible);
+  const modules = resolveArtifactModuleClosure(catalog, root, compatible, "validated", requireActivate);
   const bundle: ExecutableModuleBundle = { schema_version: 1, entry: root.entry, root: "root",
     source_hash: executableModuleBundleHash(root.entry, modules), modules };
   if (Buffer.byteLength(JSON.stringify(bundle), "utf8") > MODULE_LIMITS.envelope_bytes)

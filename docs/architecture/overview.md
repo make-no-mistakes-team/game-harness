@@ -58,6 +58,7 @@ Decompose the runtime by responsibility: lifecycle/coordinator, strategic schedu
 | Module | Owns |
 | --- | --- |
 | Run coordinator — `runtime.ts` | Lifecycle and trusted observation/goal authority, configuration, pause/stop/recovery intent |
+| Prejoin startup — `prepared-start.ts`, `prepared-source.ts`, `prepared-sourcebook.ts` | Artifact-bound source-only model authoring, finite immutable history, confirmed inference drain, clean-worker readiness and one-use transfer after real first-root admission |
 | Speculative planning — `speculative-planning.ts` | One-flight preparation, pinned predecessor/source closure, optional isolated game guard and one-use Main-authorized continuation |
 | Strategic planner — `strategic.ts` | Authenticated Agent, serialized turns/wakes, compact context, one-shot attention, actual request purpose and usage |
 | Runtime tools — `runtime-tools.ts` | Shared role/module registry enforcement, schema dispatch and trusted tool-call retry identity |
@@ -127,7 +128,11 @@ Only the executor admits effects. Read-only observation and inference can overla
 
 ## Bootstrap and adaptation
 
-Both cold and warm runs receive the same capability catalogue and game-independent explanation of inference latency and policy-authoring tools. Warm runs additionally receive a selected compatible immutable experience snapshot. Cold does not mean disabled programming, reference access, or fast-model support.
+The delivered prepare-before-join path authors an executive before starting a stopped world or joining an avatar. `PreparedSource` gives the actual selected authenticated model a fresh sourcebook and trusted artifact/schema references, with no native facts, observations or run identity. Pure synthetic analysis remains software checking. After exact source selection and inference drain, a clean worker compiles without invoking gameplay entries. `PreparedStart` rechecks the actual artifact and compatibility before it owns a new native launch.
+
+Joined readiness then permits Runtime to create the real run and import the pinned closure. SkillManager admits the exact root in Store before consuming the compiled worker once; the controller's first actual frame supplies activation. Transfer hands ownership to ordinary run controls and budgets. Cancellation before transfer drains only the owned startup; unknown closure blocks another attempt, and request replay never repeats authoring or launch. Existing **Start world** and connected-world **Create** remain available; preparation cannot restart a connected world automatically. The [startup contract](../runtime-contracts.md#prepare-before-joining) specifies tools, finite bounds, replay and closure semantics. Compilation and synthetic lifecycle tests do not establish gameplay success.
+
+Ordinary connected-world cold and warm runs receive the same capability catalogue and game-independent explanation of inference latency and policy-authoring tools. Warm runs additionally receive a selected compatible immutable experience snapshot. Cold does not mean disabled programming, reference access, or fast-model support.
 
 Host preflight checks readiness and fresh authoritative state before ordinary scheduling; it does not require several model calls to confirm those facts. Per-model bounds are frozen equally across matched arms. Preparation, actual requests/exposed attempts, retrieval, validation/cache, activation and first confirmed effect are measured; failures cannot reset an allowance. An absent reaction remains explicit and inserts no hidden tactic.
 

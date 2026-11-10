@@ -93,6 +93,8 @@ export interface NativeFixtureOptions {
   deadlineHostMs?: number;
   /** Original preparation deadline; never renewed by a nested startup stage. */
   preparationDeadlineHostMs?: number;
+  /** Privileged controlled-fixture setup only; never permitted in a natural condition. */
+  beforePlayerJoin?(fixture: NativeFixture): Promise<void>;
 }
 
 /** Evaluator-only infrastructure, never a gameplay/source library or model API.
@@ -115,6 +117,7 @@ export class NativeFixture {
   private closed = false;
   private closePromise: Promise<{ closed: boolean }> | null = null;
   private readonly startupOperations = new Set<Promise<unknown>>();
+  private preparation: Promise<void> | null = null;
   private nativeArtifactHash: string | null = null;
   private diagnosticStore: Store | null = null;
   private diagnosticSource: string | null = null;
@@ -123,7 +126,8 @@ export class NativeFixture {
   private constructor(readonly project: string, readonly root: string, readonly port: number,
     readonly caps: EvaluationCaps, private readonly authDirectory: string, private readonly conditions?: WorldConditions,
     private readonly initialEpoch = 1, private readonly evaluation: Readonly<NativeEvaluationOptions> | null = null,
-    private readonly deadlineHostMs = Infinity, private readonly preparationDeadlineHostMs = Infinity) {
+    private readonly deadlineHostMs = Infinity, private readonly preparationDeadlineHostMs = Infinity,
+    private readonly beforePlayerJoin?: NativeFixtureOptions["beforePlayerJoin"]) {
     this.evidenceDirectory = path.join(root, "evidence");
     this.report = { root, port, started_at: new Date().toISOString(), pass: false, cleanup: false,
       classification: conditions ? "natural_normal_survival_actual_model_acceptance" : "synthetic_caller_privileged_evaluator_infrastructure_not_model_gameplay",
@@ -141,6 +145,7 @@ export class NativeFixture {
     requireProof(process.env.GAMEHARNESS_NATIVE_PROOF === "1", "Explicit native opt-in is required: GAMEHARNESS_NATIVE_PROOF=1");
     const evaluation = normalizeNativeEvaluation(options.evaluation ?? null, process.env.GAMEHARNESS_NATIVE_PROOF === "1");
     requireProof(!options.conditions || evaluation === null, "Natural fixtures cannot enable native evaluation");
+    requireProof(!options.conditions || !options.beforePlayerJoin, "Natural fixtures cannot inject privileged prejoin setup");
     requireProof(/^[a-zA-Z0-9_-]{1,80}$/.test(name), "Native fixture name must be a bounded identifier");
     const project = path.resolve(options.projectRoot ?? process.cwd());
     const paths = evaluationPaths(project, options.paths);
@@ -167,7 +172,7 @@ export class NativeFixture {
     process.env.GAMEHARNESS_MINECRAFT_PORT = String(port);
     requireProof(Number.isSafeInteger(options.initialEpoch ?? 1) && (options.initialEpoch ?? 1) >= 0, "Native fixture epoch must be a nonnegative safe integer");
     const fixture = new NativeFixture(project, root, port, options.caps ?? DEFAULT_EVALUATION_CAPS, authDirectory, options.conditions, options.initialEpoch ?? 1, evaluation,
-      options.deadlineHostMs, options.preparationDeadlineHostMs);
+      options.deadlineHostMs, options.preparationDeadlineHostMs, options.beforePlayerJoin);
     await fixture.flush();
     return fixture;
   }
@@ -185,6 +190,22 @@ export class NativeFixture {
       this.preparationDeadlineHostMs) - performance.now())), message);
   }
   async start() {
+    await this.prepare();
+    this.assertPreparation();
+    requireProof(this.nativeArtifactHash, "Native artifact preparation did not complete");
+    await this.startWorld(this.nativeArtifactHash, path.join(this.project, "native/minecraft/build/libs/gameharness-native-1.0.0.jar"));
+  }
+  /** Install/verify owned resources without starting the server or joining an avatar. */
+  prepare(): Promise<void> {
+    this.assertPreparation();
+    if (!this.preparation) {
+      const work = Promise.resolve().then(() => this.prepareResources());
+      this.preparation = work; this.startupOperations.add(work);
+      void work.finally(() => this.startupOperations.delete(work)).catch(() => {});
+    }
+    return this.preparation;
+  }
+  private async prepareResources(): Promise<void> {
     this.assertPreparation();
     const consent = JSON.parse(await readFile(path.join(this.authDirectory, "provisioning-consent.json"), "utf8"));
     requireProof(consent.eulaAccepted === true && consent.minecraftVersion === "1.21.4" && consent.eulaUrl === "https://www.minecraft.net/en-us/eula", "Existing explicit provisioning consent is unavailable; this evaluator cannot grant consent");
@@ -212,7 +233,8 @@ export class NativeFixture {
         this.timeline.push({ at: new Date().toISOString(), type: "state", status, session_id, epoch, life, error, frames: video.frames });
       } else if (notice.type === "game_event") this.timeline.push({ at: new Date().toISOString(), type: "game_event", data: notice.data });
     }));
-    await this.startWorld(hash, jar);
+    await this.prepareWithin(() => this.server.initialize(), this.caps.startMs, "Server initialization timed out");
+    await this.prepareWithin(() => this.server.prepare(false), this.caps.totalMs, "Pinned server preparation timed out");
   }
   private async startWorld(hash: string, jar: string) {
     await this.prepareWithin(() => this.server.initialize(), this.caps.startMs, "Server initialization timed out");
@@ -225,6 +247,11 @@ export class NativeFixture {
     this.report.fixture_server_pid = this.ownedServer().child.pid;
     this.report.server_stdout_artifact = `minecraft/worlds/${world}/gameharness-private.log`;
     if (this.conditions) await this.verifyWorldConditions(world);
+    if (this.beforePlayerJoin) {
+      requireProof(this.bridge.snapshot().status === "disconnected", "Privileged prejoin setup requires an absent player");
+      await this.prepareWithin(() => this.beforePlayerJoin!(this), this.caps.totalMs, "Privileged prejoin setup exceeded its original allowance");
+      requireProof(this.bridge.snapshot().status === "disconnected", "Prejoin setup cannot join a player itself");
+    }
     await this.prepareWithin(() => this.bridge.connect({ host: "127.0.0.1", port: this.port, version: "1.21.4", world_id: world, epoch: this.initialEpoch }), this.caps.totalMs, "Owned native connection timed out");
     const client = this.ownedClient();
     this.clients.push(client);

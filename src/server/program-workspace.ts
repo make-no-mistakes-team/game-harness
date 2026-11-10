@@ -86,12 +86,14 @@ export class ProgramWorkspace {
     const compatible = !!program.entry && program.validation.runtime_version === 5 && program.validation.api_version === 5 && program.validation.validator_version === 5 &&
       program.validation.compatibility_hash === this.store.getRun(this.runId)?.compatibility_hash;
     return { name: program.name, version: program.version, entry: program.entry ?? null, source: program.source, card: program.card,
-      dependencies: program.dependencies.map((ref) => this.programReference(ref)),
+      dependencies: program.dependencies.map((ref) => ({ ...this.programReference(ref),
+        ...(ref.import_path === undefined ? {} : { import_path: ref.import_path }) })),
       parent_version: program.parent_version, state: program.state, execution_compatible: compatible,
       validation: { runtime_version: program.validation.runtime_version ?? null, api_version: program.validation.api_version ?? null,
         validator_version: program.validation.validator_version ?? null, compatibility_hash: program.validation.compatibility_hash ?? null,
         fingerprint: program.validation.fingerprint, formatted_lines: program.validation.formatted_lines, complexity: program.validation.complexity,
-        nesting: program.validation.nesting }, created_at: program.created_at };
+        nesting: program.validation.nesting,
+        ...(program.validation.runtime_features ? { runtime_features: program.validation.runtime_features } : {}) }, created_at: program.created_at };
   }
 
   observationView(observation: ObservationV3, projection?: AdapterActorProjection) {

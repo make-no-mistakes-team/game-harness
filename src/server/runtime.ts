@@ -53,6 +53,7 @@ import { ActorFrameSelector, type ModelObservation } from "./actor-frames.ts";
 import { retainResidentReceipt } from "./resident-evidence.ts";
 import { ExecutiveObservationMonitor } from "./executive-incidents.ts";
 import type { ResidentSnapshot } from "../shared/resident.ts";
+import type { PreparedSourceCandidate } from "./prepared-source-contract.ts";
 
 const TERMINAL: Partial<Record<RunView["status"], true>> = {
   stopped: true,
@@ -118,6 +119,7 @@ export class Runtime {
     count: number; notified: boolean; actionIds: string[];
   } | null = null;
   private readonly executiveObservation = new ExecutiveObservationMonitor();
+  private preparingFirstRoot = false;
 
   private context() {
     const adapter = typeof this.adapterSource === "function" ? this.adapterSource() : this.adapterSource ?? this.game.adapter();
@@ -991,7 +993,10 @@ export class Runtime {
     working_programs?: "continue" | "fresh";
     control_mode?: "executive" | "legacy";
   }): Promise<RunView> {
-    return await this.serialize(async () => {
+    if (this.preparingFirstRoot) throw new RuntimeFault("busy", "A prepared first-root admission owns run creation");
+    return await this.serialize(() => this.createRunState(input));
+  }
+  private async createRunState(input: Parameters<Runtime["createRun"]>[0]): Promise<RunView> {
       if (this.closed)
         throw new RuntimeFault("unavailable", "The runtime is closed");
       if (this.run && !TERMINAL[this.run.status])
@@ -1137,7 +1142,60 @@ export class Runtime {
       }
       this.onChange();
       return this.snapshot()!;
-    });
+  }
+  /** Import exact model-authored code only after real native readiness, then consume its clean worker once. */
+  async startPreparedRun(candidate: PreparedSourceCandidate): Promise<RunView> {
+    if (this.preparingFirstRoot || this.closed) throw new RuntimeFault("busy", "Prepared run admission is unavailable");
+    candidate.assertCurrent();
+    this.preparingFirstRoot = true;
+    try {
+      return await this.serialize(async () => {
+        let runId: string | null = null;
+        try {
+          candidate.assertCurrent();
+          const request = candidate.request;
+          if (this.context().binding.compatibility_hash !== candidate.contract_hash)
+            throw new RuntimeFault("stale_context", "The joined native contract differs from the prepared source contract");
+          const created = await this.createRunState({ task: request.task, goal: request.goal, model_id: request.model_id,
+            working_programs: "fresh", control_mode: "executive" });
+          runId = created.run_id;
+          const generation = this.generation;
+          const current = () => {
+            candidate.assertCurrent();
+            const run = this.run, state = this.game.snapshot();
+            if (this.closed || generation !== this.generation || run?.run_id !== runId || run.status !== "created" ||
+              run.model_id !== request.model_id || run.task !== request.task ||
+              canonicalContractJson(run.goal) !== canonicalContractJson(request.goal) ||
+              state.status !== "connected" || state.error !== null || state.world_id !== run.world_id ||
+              state.session_id !== run.session_id || state.epoch !== run.epoch ||
+              state.binding?.native_boot_id !== run.native_boot_id || state.binding?.compatibility_hash !== candidate.contract_hash ||
+              state.life?.life_id !== run.life_id || state.space?.space_epoch !== run.space_epoch)
+              throw new RuntimeFault("stale_context", "Prepared task, model or native scope changed before admission");
+          };
+          current();
+          this.run!.usage = structuredClone(candidate.usage);
+          this.store.event(runId, "preparation.attached", "Actual source-only authoring attached once; no prior observations or effects restored", {
+            preparation_id: candidate.preparation_id, model_id: request.model_id, artifact_sha256: candidate.artifact_sha256,
+            compatibility_hash: candidate.contract_hash, source_hash: candidate.bundle.source_hash,
+            source_versions: candidate.sources.length, usage: candidate.usage as unknown as Json,
+          });
+          this.persist("Prepared authoring usage retained before source import; no effects admitted");
+          current();
+          for (const source of candidate.sources) await this.skills.importSnapshot(runId, source, current);
+          current();
+          candidate.setPhase("activating");
+          const transferred = await this.begin(false, candidate);
+          if (!transferred) throw new RuntimeFault("precondition_failed", "Prepared code was not admitted under fresh native authority");
+          return this.snapshot()!;
+        } catch (error) {
+          if (runId && this.run?.run_id === runId && !TERMINAL[this.run.status]) {
+            this.fenceStop("Prepared initial source admission failed; effect authority revoked");
+            await this.halt("stopped", "Prepared startup did not enter ordinary run control");
+          }
+          throw error;
+        }
+      });
+    } finally { this.preparingFirstRoot = false; }
   }
   close(): Promise<void> {
     if (this.closing) return this.closing;
@@ -1166,7 +1224,7 @@ export class Runtime {
     });
     return this.closing;
   }
-  private async begin(resuming: boolean): Promise<void> {
+  private async begin(resuming: boolean, initial?: PreparedSourceCandidate): Promise<boolean> {
     const run = this.run!,
       state = this.game.snapshot();
     if (typeof run.goal === "string" || !run.native_boot_id || !run.compatibility_hash)
@@ -1203,7 +1261,7 @@ export class Runtime {
     this.observationRequest = null;
     this.needsReconnect = false;
     const observation = this.context().registration.parseObservation(await this.game.observe());
-    if (generation !== this.generation || this.closed) return;
+    if (generation !== this.generation || this.closed) return false;
     const current = this.game.snapshot();
     if (
       observation.world_id !== run.world_id ||
@@ -1240,6 +1298,7 @@ export class Runtime {
         ? "Run resumed with fresh authority and worker state"
         : "Host preflight confirmed readiness and authoritative game state",
     );
+    let transferred = false;
     try {
       if (resuming) {
         await this.historyDrain;
@@ -1247,6 +1306,23 @@ export class Runtime {
         // Direct uncertainty pauses do not pass through halt's metadata
         // reopening. Admit only new history work after fresh safe preflight.
         this.historyOwner.resumeRun(run.run_id);
+      }
+      if (initial) {
+        initial.assertCurrent();
+        this.assertCurrent(generation);
+        if (observation.life.status !== "alive")
+          throw new RuntimeFault("precondition_failed", "Prepared first-root activation requires a real living player; no automatic respawn");
+        const scope = this.effectContext();
+        const root = this.skills.startInitialPrepared(run.run_id, { skill_id: initial.root.skill_id, version: initial.root.version, entry: "step",
+          start_key: `prepared_${initial.preparation_id}`, epoch: scope.epoch, session_id: scope.session_id,
+          native_boot_id: scope.native_boot_id, run_generation: scope.run_generation, life_id: scope.life_id,
+          space_epoch: scope.space_epoch, compatibility_hash: run.compatibility_hash,
+          args: initial.intent, initial_state: initial.initial_state, limits: initial.limits, session: initial.session,
+        }, initial);
+        transferred = true;
+        this.store.event(run.run_id, "preparation.executive_admitted", "Clean prepared worker admitted; first actual frame and effects remain separate evidence", {
+          preparation_id: initial.preparation_id, execution_id: root.execution_id, source_hash: root.source_hash,
+        });
       }
       await this.strategic.start(generation);
       this.assertCurrent(generation);
@@ -1260,14 +1336,16 @@ export class Runtime {
         );
       }
       this.strategic.wake(resuming ? "recovery_completed" : "preflight_ready");
-    } catch {
-      if (generation !== this.generation || this.closed) return;
+    } catch (error) {
+      if (generation !== this.generation || this.closed) return transferred;
       const failure =
         "The authenticated agent or isolated worker could not be prepared. Check readiness before resuming.";
       run.error ??= failure;
       this.controlState().pause_cause ??= "preparation_failed";
       await this.halt("paused", failure);
+      if (initial && !transferred) throw error;
     }
+    return transferred;
   }
   private async policyContext(): Promise<PolicyContext> {
     const run = this.run!;

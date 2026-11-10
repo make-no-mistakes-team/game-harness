@@ -1,4 +1,5 @@
 import type { SkillView, SkillExecutionView } from "./programs.ts";
+import type { PreparedStartView } from "./prepared-start.ts";
 import type { EffectOwnerRef, EffectScope, EffectEnvelope, EffectInvocation, EffectScreenPrecondition, SpaceRef, ScreenRef } from "./control.ts";
 import type { AdapterActorProjection, ObservationV3 } from "./observations.ts";
 export type { ObservationV3 } from "./observations.ts";
@@ -484,6 +485,7 @@ export interface AppSnapshot {
   server: GameServerState;
   game: GameState;
   sandbox: SandboxState;
+  prepared_start: PreparedStartView | null;
   run: RunView | null;
   goals: GoalChoice[];
   events: ActivityEvent[];

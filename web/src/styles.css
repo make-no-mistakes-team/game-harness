@@ -609,6 +609,17 @@ dialog::backdrop {
 .settings-task textarea {
   margin-bottom: 12px;
 }
+.preparation-status {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.preparation-status > [role="status"] {
+  font-weight: 700;
+}
+.preparation-status .mono {
+  font-variant-numeric: tabular-nums;
+}
 .input-row {
   display: flex;
   gap: 8px;

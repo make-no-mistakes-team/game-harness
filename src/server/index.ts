@@ -25,6 +25,8 @@ import { taskTextSchema } from "../shared/tasks.ts";
 import type { AppSnapshot, RunView } from "../shared/contracts.ts";
 import { promotionDeclarationSchema } from "./experience.ts";
 import { improvementFeedbackCursorSchema, versionComparisonCursorSchema } from "./program-interface.ts";
+import { PreparedStart, type PreparedWorldLaunch } from "./prepared-start.ts";
+import { preparedStartRequestSchema } from "../shared/prepared-start.ts";
 
 if (process.env.GAMEHARNESS_LOCK_HELD !== "1")
   throw new Error(
@@ -68,6 +70,13 @@ const runtime = new Runtime(store, auth, game, sandbox, onChange, {
   judge: jev,
   adapter: () => game.adapter(),
   actorFrames: game,
+});
+const preparedStart = new PreparedStart({
+  directory: DATA_DIR, auth, sandbox, runtime, changed: onChange,
+  state: () => ({ game: game.snapshot(), server: minecraft.snapshot(), sandbox: sandbox.snapshot(), run: runtime.snapshot() }),
+  getContract: () => game.prepareExecutableContract(),
+  launch: () => beginPreparedWorld(),
+  record: (type, summary, details) => { store.event(null, type, summary, details); },
 });
 const video = new VideoStream((milliseconds) =>
   performanceMonitor.record("video_forward_ms", milliseconds),
@@ -147,8 +156,9 @@ function snapshot(): AppSnapshot {
     server: minecraft.snapshot(),
     game: game.snapshot(),
     sandbox: sandbox.snapshot(),
+    prepared_start: preparedStart.snapshot(),
     run: runtime.snapshot(),
-    goals: runtime.goals(),
+    goals: runtime.goals().length ? runtime.goals() : preparedStart.goals(),
     events: store.events(null, 0, 150),
   };
 }
@@ -256,6 +266,40 @@ function launchGameOperation(
     });
   gameOperation = pending;
   onChange();
+}
+function assertNoPreparationMutation(): void {
+  if (preparedStart.active())
+    throw new HttpError(409, "busy", "Cancel prepared startup before changing its model, task or native configuration");
+}
+/** Reserve before scheduling: cancellation owns this exact startup, never a previously connected world. */
+function beginPreparedWorld(): PreparedWorldLaunch {
+  if (gameOperation || game.snapshot().status !== "disconnected" || minecraft.snapshot().status !== "stopped")
+    throw new HttpError(409, "busy", "A new prepared startup requires an idle disconnected world");
+  const generation = ++operationGeneration;
+  const ready = Promise.resolve().then(async () => {
+    assertGameOperation(generation);
+    await minecraft.start();
+    assertGameOperation(generation);
+    await connectPlayer(generation);
+  }).finally(() => {
+    if (gameOperation === ready) gameOperation = null;
+    onChange();
+  });
+  void ready.catch(() => {});
+  gameOperation = ready;
+  let closingLaunch: Promise<void> | null = null;
+  return { ready, close() {
+    if (closingLaunch) return closingLaunch;
+    if (generation === operationGeneration) ++operationGeneration;
+    // Before transfer there is no effectful root. Abort pending native startup
+    // without waiting for its joined-readiness promise, then join every owner.
+    closingLaunch = (async () => {
+      const settled = await Promise.allSettled([stopRun(), game.disconnect(), minecraft.stop(), ready.catch(() => {})]);
+      const failed = settled.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (failed.length) throw new AggregateError(failed.map(result => result.reason), "Prepared native startup cleanup is unconfirmed");
+    })();
+    return closingLaunch;
+  } };
 }
 
 const emptyBody = z.object({}).strict();
@@ -375,6 +419,7 @@ const server = Bun.serve<VideoSocketData>({
         if (request.method === "GET" && url.pathname === "/v1/config")
           return json({ motor_profile: motorProfile });
         if (request.method === "POST" && url.pathname === "/v1/config") {
+          assertNoPreparationMutation();
           const input = await body(request, z.object({ motor_profile: motorProfileSchema }).strict());
           const update = profileUpdate.then(async () => {
             await game.setMotorProfile(input.motor_profile);
@@ -391,6 +436,7 @@ const server = Bun.serve<VideoSocketData>({
           });
           profileUpdate = update.catch(() => {});
           await update;
+          if (game.snapshot().status === "disconnected") await preparedStart.refreshContract();
           return json({ motor_profile: motorProfile });
         }
         if (request.method === "POST" && url.pathname === "/v1/program-comparisons") {
@@ -561,6 +607,7 @@ const server = Bun.serve<VideoSocketData>({
           });
         }
         if (request.method === "POST" && url.pathname === "/v1/auth/login") {
+          assertNoPreparationMutation();
           const input = await body(
             request,
             z.object({ mode: z.enum(["browser", "device"]) }).strict(),
@@ -607,22 +654,27 @@ const server = Bun.serve<VideoSocketData>({
         }
         if (request.method === "POST" && url.pathname === "/v1/auth/logout") {
           await body(request, emptyBody);
+          const cancelling = preparedStart.cancelCurrent();
           const stopping = stopRun();
           return json(
             await admitConnection(async () => {
-              await stopping;
+              const drained = await Promise.allSettled([cancelling, stopping]);
               await stopRun();
               await auth.logout();
+              if (drained.some(result => result.status === "rejected"))
+                throw new Error("Model account disconnected, but prepared startup cleanup remains unconfirmed");
               return auth.snapshot();
             }),
           );
         }
         if (request.method === "POST" && url.pathname === "/v1/auth/refresh") {
+          assertNoPreparationMutation();
           await body(request, emptyBody);
           await auth.refreshModels();
           return json(auth.snapshot());
         }
         if (request.method === "POST" && url.pathname === "/v1/game/prepare") {
+          assertNoPreparationMutation();
           const input = await body(
             request,
             z.object({ accept_eula: z.boolean() }).strict(),
@@ -630,10 +682,12 @@ const server = Bun.serve<VideoSocketData>({
           launchGameOperation(async () => {
             await minecraft.prepare(input.accept_eula);
             if (sandbox.snapshot().status !== "ready") await sandbox.prepare();
+            await preparedStart.refreshContract();
           });
           return json({ accepted: true }, 202);
         }
         if (request.method === "POST" && url.pathname === "/v1/game/start") {
+          assertNoPreparationMutation();
           await body(request, emptyBody);
           launchGameOperation(async (generation) => {
             await minecraft.start();
@@ -644,15 +698,18 @@ const server = Bun.serve<VideoSocketData>({
         if (request.method === "POST" && url.pathname === "/v1/game/stop") {
           await body(request, emptyBody);
           ++operationGeneration;
-          await stopRun();
-          await game.disconnect();
-          await minecraft.stop();
+          const cleanup = await Promise.allSettled([preparedStart.cancelCurrent(), stopRun()]);
+          for (const close of [() => game.disconnect(), () => minecraft.stop()])
+            try { await close(); } catch (reason) { cleanup.push({ status: "rejected", reason }); }
+          if (cleanup.some(result => result.status === "rejected"))
+            throw new Error("World closure is not confirmed; inspect retained startup and run cleanup");
           return json(snapshot());
         }
         if (
           request.method === "POST" &&
           url.pathname === "/v1/game/new-world"
         ) {
+          assertNoPreparationMutation();
           await body(request, z.object({ confirm: z.literal(true) }).strict());
           launchGameOperation(async (generation) => {
             await stopRun();
@@ -667,8 +724,18 @@ const server = Bun.serve<VideoSocketData>({
           return json({ accepted: true }, 202);
         }
         if (request.method === "POST" && url.pathname === "/v1/runs") {
+          assertNoPreparationMutation();
           const input = await body(request, runBody);
           return json(await runtime.createRun(input), 201);
+        }
+        if (request.method === "POST" && url.pathname === "/v1/prepared-start") {
+          const input = await body(request, preparedStartRequestSchema);
+          return json(await preparedStart.start(input), 202);
+        }
+        const preparedCancel = /^\/v1\/prepared-start\/([a-f0-9-]{36})\/cancel$/.exec(url.pathname);
+        if (request.method === "POST" && preparedCancel?.[1]) {
+          await body(request, emptyBody);
+          return json(await preparedStart.cancel(preparedCancel[1]));
         }
         const runMatch = /^\/v1\/runs\/([a-f0-9-]{36})$/.exec(url.pathname);
         if (request.method === "GET" && runMatch?.[1]) {
@@ -851,6 +918,7 @@ const server = Bun.serve<VideoSocketData>({
         if (request.method === "POST" && controlMatch?.[1]) {
           const input = await body(request, controlBody),
             runId = controlMatch[1];
+          if (input.command === "start" || input.command === "resume") assertNoPreparationMutation();
           const key = `${runId}:${input.request_id}`,
             fingerprint = input.command;
           const existing = controls.get(key);
@@ -962,6 +1030,7 @@ async function closeApplication(): Promise<void> {
   ++operationGeneration;
   shutdown = (async () => {
     const cleanup = await Promise.allSettled([
+      preparedStart.close(),
       runtime.close(),
       auth.close(),
       jev.close(),
@@ -1025,6 +1094,7 @@ try {
   await minecraft.initialize();
   await runtime.initialize();
   await sandbox.prepare();
+  await preparedStart.initialize();
   initialized = true;
   store.event(null, "application.ready", "Local services initialized", {
     sandbox: sandbox.snapshot().status,

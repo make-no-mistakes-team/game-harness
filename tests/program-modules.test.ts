@@ -3,10 +3,11 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SkillDependency, SkillSpec, SkillView } from "../src/shared/programs.ts";
+import type { SkillDependency, SkillRef, SkillSpec, SkillView } from "../src/shared/programs.ts";
 import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
 import { executableModuleBundleHash } from "../src/shared/program-modules.ts";
-import { buildExecutableModuleBundle, programExecutionHash, resolveProgramModuleClosure } from "../src/server/program-modules.ts";
+import { buildArtifactModuleBundle, buildExecutableModuleBundle, programExecutionHash, resolveArtifactModuleClosure,
+  resolveProgramModuleClosure } from "../src/server/program-modules.ts";
 import { programFingerprint, validateSkill, validateProgramSource } from "../src/server/program-validation.ts";
 import { Store } from "../src/server/store.ts";
 import { executionScopeFixture, minecraftRunFixture, minecraftTestAdapter } from "./helpers/adapter-contract.ts";
@@ -26,6 +27,39 @@ function fixture() {
 function imported(value: SkillView, import_path = "./helper.js"): SkillDependency {
   return { skill_id: value.skill_id, version: value.version, import_path };
 }
+
+test("trusted artifact catalogs resolve the same inline realm without inventing a run", async () => {
+  const f = fixture();
+  const library = await f.save("offline library", "library", "export function value(input) { return input; }");
+  const root = await f.save("offline root", "analyze",
+    "import {value} from './helper.js'; export function analyze(input) { return value(input); }", [imported(library)]);
+  const catalog = { compatibility_hash: root.validation.compatibility_hash!, read: (ref: SkillRef) => f.store.skill(f.run.run_id, ref) };
+  expect(buildArtifactModuleBundle(catalog, root)).toEqual(buildExecutableModuleBundle(f.store, f.run.run_id, root));
+  expect(resolveArtifactModuleClosure(catalog, root)).toEqual(resolveProgramModuleClosure(f.store, f.run.run_id, root));
+});
+
+test("prepared activate admission checks resolved reexports without calling any frame function", async () => {
+  const f = fixture();
+  const library = await f.save("executive exports", "library",
+    "export function step(frame,state,intent) { return null; } export function activate(frame,state,intent) { return null; }");
+  const root = await f.save("prepared executive", "step", "export {step,activate} from './helper.js';", [imported(library)]);
+  const catalog = { compatibility_hash: root.validation.compatibility_hash!, read: (ref: SkillRef) => f.store.skill(f.run.run_id, ref) };
+  expect(buildArtifactModuleBundle(catalog, root, undefined, true).modules).toHaveLength(2);
+  const missing = await f.save("missing activation", "step", "export function step(frame,state,intent) { return null; }");
+  expect(() => buildArtifactModuleBundle(catalog, missing, undefined, true)).toThrow();
+});
+
+test("artifact source/header substitutions are rejected before acquiring a worker", async () => {
+  const f = fixture();
+  const root = await f.save("sealed artifact", "step",
+    "export function step(frame,state,intent) { return null; } export function activate(frame,state,intent) { return null; }");
+  const catalog = { compatibility_hash: root.validation.compatibility_hash!, read: () => root };
+  expect(() => buildArtifactModuleBundle(catalog, { ...root, validation: { ...root.validation, api_version: 4 } }, undefined, true)).toThrow();
+  expect(() => buildArtifactModuleBundle(catalog, { ...root, source: root.source + "\\n" }, undefined, true)).toThrow();
+  expect(() => buildArtifactModuleBundle({ ...catalog, read: () => ({ ...root, hash: "a".repeat(64) }) },
+    { ...root, hash: "a".repeat(64) }, undefined, true)).toThrow();
+  expect(() => buildArtifactModuleBundle({ ...catalog, compatibility_hash: "b".repeat(64) }, root, undefined, true)).toThrow();
+});
 
 test("retiring pure source blocks new admission without erasing its historical execution identity", async () => {
   const f = fixture();

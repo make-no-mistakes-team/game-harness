@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
-import type { ProgramEvidenceView } from "../../src/shared/contracts.ts";
+import type { AppSnapshot, ProgramEvidenceView, RunUsage } from "../../src/shared/contracts.ts";
 import type { ObjectiveMetrics, ObjectiveMetricUpdate } from "../../src/shared/execution-evidence.ts";
+import { PREPARED_START_LIMITS, type PreparedStartRequest, type PreparedStartView } from "../../src/shared/prepared-start.ts";
 import { fetchImprovementFeedback, fetchSkillEvidence, type SkillEvidencePage } from "./api.ts";
 
 test("measurement pages reject unsafe cursors, oversized records and invalid coverage", async () => {
@@ -68,15 +69,23 @@ function metric(): ObjectiveMetrics {
   };
 }
 
-async function withApiResponse(body: (respond: (value: unknown) => void) => Promise<void>) {
+async function withApiResponse(body: (
+  respond: (value: unknown, status?: number) => void,
+  requests: { path: string; init: RequestInit | undefined }[],
+) => Promise<void>) {
   const originalFetch = globalThis.fetch;
   const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   let response: unknown;
+  let status = 200;
+  const requests: { path: string; init: RequestInit | undefined }[] = [];
   Object.defineProperty(globalThis, "window", { configurable: true, value: { setTimeout, clearTimeout } });
-  globalThis.fetch = Object.assign(async () => new Response(JSON.stringify(response), {
-    headers: { "Content-Type": "application/json" },
-  }), { preconnect: originalFetch.preconnect });
-  try { await body(value => { response = value; }); }
+  globalThis.fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    requests.push({ path: String(input), init });
+    return new Response(JSON.stringify(response), {
+      status, headers: { "Content-Type": "application/json" },
+    });
+  }, { preconnect: originalFetch.preconnect });
+  try { await body((value, code = 200) => { response = value; status = code; }, requests); }
   finally {
     globalThis.fetch = originalFetch;
     if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
@@ -176,5 +185,127 @@ test("comparison continuation keeps both generation pins and rejects the old num
       await expect(client.fetchComparison(before, after, first.next_after)).rejects.toThrow();
     }
     await expect(Reflect.apply(client.fetchComparison, undefined, [before, after, 0])).rejects.toThrow();
+  });
+});
+
+function preparedUsageFixture(): RunUsage {
+  const token = { uncached_input: 71, cache_read: null, cache_write: 0, output: 24,
+    calls: 2, known_cost: null, legacy_input: null };
+  return { ...token, accounting_basis: "sdk_reported_subtotal",
+    by_purpose: { authoring: { ...token }, planning: { ...token }, replanning: { ...token },
+      improvement: { ...token }, other: { ...token } } };
+}
+
+function preparedViewFixture(patch: Partial<PreparedStartView> = {}): PreparedStartView {
+  return {
+    preparation_id: "prepared/fixture", task: "Gather supplies", model_id: "fixture-discovered-model",
+    goal: { adapter_id: "minecraft", goal_id: "custom", verifier: null, parameters: { declared: "fixture" } },
+    phase: "compiling", started_at: "2026-11-10T10:00:00.000Z", deadline_at: "2026-11-10T10:05:00.000Z",
+    ready_at: null, run_id: null, requests_admitted: 2, tools_used: 4, source_versions: 3,
+    analysis_jobs: 1, analysis_ms: 31.75, program: { name: "Fixture source", version: 3 },
+    usage: preparedUsageFixture(), limits: PREPARED_START_LIMITS, closure: "open", error: null, ...patch,
+  };
+}
+
+function preparedStateFixture(prepared_start: PreparedStartView | null): AppSnapshot {
+  return {
+    auth: { status: "signed_out", authenticated: false, provider: "openai-codex",
+      account_label: null, models: [], login: null, error: null },
+    server: { status: "stopped", version: "1.21.4", host: "127.0.0.1", port: 25565,
+      world_id: null, eula_accepted: true, error: null },
+    game: { status: "disconnected", username: "fixture", version: "1.21.4", world_id: null, epoch: 0,
+      session_id: null, life: null, binding: null, space: null, screen: null, presentation: null,
+      video: { status: "idle", width: 0, height: 0, fps: null, frames: 0, last_frame_at: null, error: null },
+      last_observation_at: null, error: null },
+    sandbox: { status: "ready", image: "fixture-image", error: null },
+    prepared_start, run: null, goals: [], events: [],
+  };
+}
+
+test("prepared HTTP interactions retain exact request identity, source metadata and honest closure states", async () => {
+  await withApiResponse(async (respond, requests) => {
+    const client: typeof import("./api.ts") = await import(new URL("./api.ts?prepared-http-fixture", import.meta.url).href);
+    respond({ csrf_token: "fixture-prepared-session" });
+    await client.openSession();
+    const view = preparedViewFixture();
+    const request: PreparedStartRequest = { request_id: "f762fe8c-e3db-4a09-ae04-1d8318b00ad9",
+      task: view.task, goal: view.goal, model_id: view.model_id };
+    respond(view, 202);
+    expect(await client.prepareAndPlay(request)).toEqual(view);
+    expect(await client.prepareAndPlay(request)).toEqual(view);
+    const sent = requests.slice(1);
+    expect(sent).toHaveLength(2);
+    expect(sent[0]?.init?.body).toBe(sent[1]?.init?.body);
+    expect(sent[0]?.path).toBe("/v1/prepared-start");
+    expect(sent[0]?.init).toMatchObject({ method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json", "X-CSRF-Token": "fixture-prepared-session" },
+      body: JSON.stringify(request) });
+    const cancelled = preparedViewFixture({ phase: "cancelled", closure: "closed" });
+    respond(cancelled);
+    expect(await client.cancelPreparation(view.preparation_id)).toEqual(cancelled);
+    expect(requests.at(-1)).toMatchObject({
+      path: "/v1/prepared-start/prepared%2Ffixture/cancel", init: { method: "POST", body: "{}" },
+    });
+    for (const phase of ["authoring", "compiling", "ready", "joining", "activating", "started", "cancelling", "cancelled", "failed"] as const) {
+      const state = preparedViewFixture({ phase,
+        closure: phase === "started" ? "transferred" : phase === "failed" ? "unknown" : phase === "cancelling" ? "draining" : "open",
+        run_id: phase === "started" ? "actual-admitted-run" : null,
+        ready_at: ["ready", "joining", "activating", "started"].includes(phase) ? "2026-11-10T10:01:00.000Z" : null });
+      respond(preparedStateFixture(state));
+      expect((await client.fetchState()).prepared_start).toEqual(state);
+    }
+    const beforeInvalidRequest = requests.length;
+    await expect(Reflect.apply(client.prepareAndPlay, undefined, [{ ...request, experience_id: "must-not-drop" }])).rejects.toThrow();
+    await expect(Reflect.apply(client.prepareAndPlay, undefined, [{ ...request, request_id: "not-a-uuid" }])).rejects.toThrow();
+    expect(requests).toHaveLength(beforeInvalidRequest);
+  });
+});
+
+test("prepared snapshot requires explicit null and rejects missing finite limits, source identity and usage metadata", async () => {
+  await withApiResponse(async respond => {
+    const client: typeof import("./api.ts") = await import(new URL("./api.ts?prepared-validation-fixture", import.meta.url).href);
+    const empty = preparedStateFixture(null);
+    respond(empty);
+    expect((await client.fetchState()).prepared_start).toBeNull();
+    const { prepared_start: omitted, ...missing } = empty;
+    respond(missing);
+    await expect(client.fetchState()).rejects.toThrow("does not match this UI");
+    const view = preparedViewFixture();
+    for (const malformed of [
+      { ...view, limits: { ...view.limits, max_requests: 13 } },
+      { ...view, limits: { ...view.limits, max_analysis_ms: undefined } },
+      { ...view, program: { name: "Fixture source" } },
+      { ...view, program: { name: "Fixture source", version: 0 } },
+      { ...view, phase: "playing" },
+      { ...view, closure: undefined },
+      { ...view, analysis_ms: -1 },
+      { ...view, started_at: "unknown" },
+      { ...view, usage: { ...view.usage, cache_read: undefined } },
+      { ...view, usage: { ...view.usage, by_purpose: undefined } },
+      { ...view, goal: { ...view.goal, verifier: { id: "fixture", version: undefined } } },
+    ]) {
+      respond({ ...empty, prepared_start: malformed });
+      await expect(client.fetchState()).rejects.toThrow("does not match this UI");
+    }
+  });
+});
+
+test("preparation response failures are reported without automatic retries or invented success", async () => {
+  await withApiResponse(async (respond, requests) => {
+    const client: typeof import("./api.ts") = await import(new URL("./api.ts?prepared-errors-fixture", import.meta.url).href);
+    respond({ csrf_token: "fixture-prepared-errors" });
+    await client.openSession();
+    const view = preparedViewFixture();
+    const request: PreparedStartRequest = { request_id: "1714daae-2827-4c2c-a8d7-a5f000f484f9",
+      task: view.task, goal: view.goal, model_id: view.model_id };
+    respond({ ...view, closure: undefined }, 202);
+    await expect(client.prepareAndPlay(request)).rejects.toMatchObject({ code: "invalid_preparation" });
+    expect(requests).toHaveLength(2);
+    respond({ error: { code: "preparation_conflict", message: "Another preparation owns startup." } }, 409);
+    await expect(client.prepareAndPlay(request)).rejects.toMatchObject({ status: 409, code: "preparation_conflict" });
+    expect(requests).toHaveLength(3);
+    respond({ phase: "cancelled" });
+    await expect(client.cancelPreparation(view.preparation_id)).rejects.toMatchObject({ code: "invalid_preparation" });
+    expect(requests).toHaveLength(4);
   });
 });

@@ -30,12 +30,15 @@ const cardSchema = z.object({
   limitations: z.string().trim().min(1).max(1000),
 }).strict();
 export const programWriteSchema = z.object({
-  entry: z.enum(["run", "step", "analyze"]).default("run"),
+  entry: z.enum(["run", "step", "analyze", "library"]).default("run"),
   name: z.string().trim().min(1).max(80), source: z.string().min(1).max(16384), card: cardSchema.default({
     purpose: "Unspecified by author", applicability: "Unspecified by author", method: "See immutable source",
     reason: "Unspecified by author", limitations: "Untested; no efficacy or applicability claim",
   }),
-  dependencies: z.array(programSelectorSchema).max(32).default([]),
+  dependencies: z.array(programSelectorSchema.extend({
+    import_path: z.string().max(512).regex(/^\.\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|mjs)$/).optional()
+      .describe("Explicit local import alias pinned to this exact library version. Omit only for semantic run children."),
+  }).strict()).max(32).default([]),
   based_on: z.int().positive().optional().describe("Required for an existing name: its latest stored version, even if unexecuted; not the latest executed version. Omit for a new name. Stale parents conflict without rebasing."),
   reason: z.string().trim().min(1).max(2000).optional().describe("Experimental revision link to actual outcome feedback for the exact based_on parent. Omit for an ordinary revision, including revising stored but unexecuted source; use card.reason for descriptive motivation. Missing parent feedback refuses the write/start."),
 }).strict();

@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
-import { ExecutiveObservationMonitor } from "../src/server/executive-incidents.ts";
+import { ExecutiveObservationMonitor, ExecutiveRawMonitor } from "../src/server/executive-incidents.ts";
 import type { ResidentSnapshot } from "../src/shared/resident.ts";
+import type { ControllerInput, InputAppliedAck } from "../src/shared/controller.ts";
+import { controllerFrameFixture } from "./helpers/controller-frame.ts";
+import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
 
 function snapshot(): ResidentSnapshot {
   const timing = () => ({ count: 0, p50: null, p95: null, p99: null, max: null, omitted_samples: 0 });
@@ -74,4 +77,77 @@ test("intervening commands, intent changes, missing progress and owner changes c
   expect(monitor.update("executive", frame, 6000)).toBeNull();
   observe(frame);
   expect(monitor.update("executive", frame, 6001)).toBeNull();
+});
+
+function rawSample(now: number, moving = false) {
+  const frame = minecraftControllerFrameSchema.parse(controllerFrameFixture());
+  frame.frame_seq = now / 50 + 1; frame.captured_native_ns = String(BigInt(now) * 1_000_000n);
+  frame.screen = null; frame.player.on_ground = true; frame.player.in_water = false;
+  frame.player.in_lava = false; frame.player.gliding = false; frame.player.vehicle_type = null;
+  const held = { forward: moving, back: false, left: false, right: false, jump: false,
+    sprint: false, sneak: false, attack: false, use: false };
+  const input: ControllerInput = { kind: "world", held, edges: [], view: { kind: "unchanged" }, selected_hotbar: null };
+  const ack: InputAppliedAck = { controller_generation: 1, sequence: frame.frame_seq, ordered_edge_prefix: 0,
+    applied_native_tick: frame.frame_seq, applied_native_ns: frame.captured_native_ns, held: { ...held },
+    applied_pose: { yaw_radians: 0, pitch_radians: 0 }, input_application: "confirmed", reason: null };
+  return { frame, input, ack };
+}
+
+test("confirmed neutral and stationary motion each produce one factual advisory after five native seconds", () => {
+  for (const moving of [false, true]) {
+    const monitor = new ExecutiveRawMonitor(), incidents = [];
+    for (let now = 0; now <= 8000; now += 50) {
+      const { frame, input, ack } = rawSample(now, moving);
+      const incident = monitor.update("same-owner", frame, input, ack, now);
+      if (incident) incidents.push(incident);
+    }
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]).toMatchObject({ reason: moving ? "executive_raw_motion_stationary" : "executive_raw_neutral",
+      elapsed_native_ms: 5000, samples: 101 });
+  }
+});
+
+test("unknown, stale, changed, purposeful controls and missing coverage cannot accumulate raw advice", () => {
+  for (const interrupt of ["unknown", "stale", "gap", "scope", "attack", "rotation", "selection", "screen", "held_mismatch"] as const) {
+    const monitor = new ExecutiveRawMonitor();
+    for (let now = 0; now <= 4000; now += 50) {
+      const { frame, input, ack } = rawSample(now);
+      expect(monitor.update("owner", frame, input, ack, now)).toBeNull();
+    }
+    const { frame, input, ack } = rawSample(4050);
+    let key = "owner", host = 4050;
+    if (interrupt === "unknown") ack.input_application = "unknown";
+    if (interrupt === "stale") ack.applied_native_ns = String(BigInt(frame.captured_native_ns) + 150_000_001n);
+    if (interrupt === "gap") host += 251;
+    if (interrupt === "scope") key = "replacement";
+    if (input.kind === "world") {
+      if (interrupt === "attack") input.held.attack = ack.held.attack = true;
+      if (interrupt === "rotation") input.view = { kind: "delta", yaw_radians: 0.1, pitch_radians: 0 };
+      if (interrupt === "selection") input.selected_hotbar = (frame.player.selected_hotbar + 1) % 9;
+      if (interrupt === "held_mismatch") ack.held.forward = true;
+    }
+    if (interrupt === "screen") frame.screen = {
+      identity: { screen_id: "visible-inventory", incarnation: 1, layout_revision: 1 },
+      content_revision: 1, screen_kind: "inventory", viewport: { width: 320, height: 240, scale_factor: 2 },
+      slots: [], cursor: { item: null, count: 0 }, elements: [], progress: [],
+    };
+    expect(monitor.update(key, frame, input, ack, host)).toBeNull();
+    for (let now = 4100; now <= 5050; now += 50) {
+      const next = rawSample(now);
+      expect(monitor.update(key, next.frame, next.input, next.ack, host + now - 4050)).toBeNull();
+    }
+  }
+});
+
+test("moving beyond the bounded own-body region resets a blocked-motion window even on a round trip", () => {
+  const monitor = new ExecutiveRawMonitor();
+  for (let now = 0; now <= 7000; now += 50) {
+    const { frame, input, ack } = rawSample(now, true);
+    frame.player.position.x += Math.sin(now / 1000) * 2;
+    expect(monitor.update("owner", frame, input, ack, now)).toBeNull();
+  }
+  const sample = rawSample(8000, true);
+  expect(monitor.update("owner", sample.frame, sample.input, sample.ack, 8000)).toBeNull();
+  // Duplicate old ACKs provide no extra observed coverage.
+  expect(monitor.update("owner", sample.frame, sample.input, sample.ack, 15000)).toBeNull();
 });

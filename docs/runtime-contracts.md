@@ -36,19 +36,39 @@ The required program format is ordinary bounded JavaScript modules with relative
 
 The agent can observe, write/edit, run, inspect and revise without filling out an artifact form first. The host supplies stable identities, timestamps and scope. Detailed cards remain useful views and reusable-artifact evidence, while a claimed intent is not a verified result. Optional Jev and registered reflexes may help execution; neither is mandatory ceremony for the first complete autonomous chain.
 
-Checkpoint recovery uses versioned serializable task state and unresolved operation references, not saved JavaScript stacks or promises. Resume requires compatible source/state, fresh authorized game state, fenced prior owners and actual neutralization/drain. Preserve explicit Pause/Stop and uncertain effects; restoring source or conversation never rewinds the game. Ordinary modules and checkpoint recovery remain later implementation work. The current body and restart contracts below remain the delivered interfaces until their cutover.
+Checkpoint recovery uses versioned serializable task state and unresolved operation references, not saved JavaScript stacks or promises. Resume requires compatible source/state, fresh authorized game state, fenced prior owners and actual neutralization/drain. Preserve explicit Pause/Stop and uncertain effects; restoring source or conversation never rewinds the game. Pure local modules are delivered for `step` and `analyze`; the async module entry and checkpoint recovery remain later work. The current async body and restart contracts below still apply.
 
 The active perception profile is `minecraft_assisted_rgb_fov_r8_control_v7`, with observation envelope 3, payload `minecraft_observation_v1@2`, controller frame 3 and a separate typed actor PNG. Entity evidence requires the actual rendered camera and completed framebuffer; terrain retains its assisted eight-block cache. Feedback includes actual blocking, equipment durability, attack-key consumption/callback facts and actually heard combat cues. Full pixel-only and atomically synchronized perception remain separate targets.
 
 ## Current compact program interface
 
-Executable types live in [`src/shared/programs.ts`](../src/shared/programs.ts); model inputs in [`src/server/program-interface.ts`](../src/server/program-interface.ts). [`RuntimeTools`](../src/server/runtime-tools.ts) applies role/schema authority, [`ProgramOperations`](../src/server/program-operations.ts) owns use cases and [`ProgramWorkspace`](../src/server/program-workspace.ts) resolves names and bounded evidence. Each immutable program selects `run`, `step` or `analyze`. Actor authoring defaults an omitted entry to `run`; durable execution never infers a missing historical entry.
+Executable types live in [`src/shared/programs.ts`](../src/shared/programs.ts); model inputs in [`src/server/program-interface.ts`](../src/server/program-interface.ts). [`RuntimeTools`](../src/server/runtime-tools.ts) applies role/schema authority, [`ProgramOperations`](../src/server/program-operations.ts) owns use cases and [`ProgramWorkspace`](../src/server/program-workspace.ts) resolves names and bounded evidence. Each immutable program selects `run`, `step`, `analyze` or pure `library`. Actor authoring defaults an omitted entry to `run`; durable execution never infers a missing historical entry.
 
 `help {topic:"actions"}` provides the compact semantic taskflow reference: generated action shapes and bounds, method invocations, ordinary observation fields and result contracts. It lists raw input kinds without repeating their detailed controls; use `controller` for raw frame/input authoring. `help {topic:"actions",kind:"craft"}` requests the complete registered schema for that exact action family, including both single and sequence forms. Other registered kinds use the same selector. `kind` is invalid on other topics. Shapes are not validators, and adapter-owned semantic predicates remain authoritative.
 
 Full native reader/result, observation and capability schemas remain available through `help {topic:"game"}`. Selected action families have distinct retained references, subject to the existing help/request byte caps and explicit omissions. A selected family's schema is retained whole or omitted whole, never split into a partial family that silently loses an alternative or bound. This reference routing changes neither playing authority nor observation permissions.
 
-`run` remains an async JavaScript body with host-bound `game,args`. It can implement a finite procedure or semantic feedback loop. `step` exports synchronous `step(frame,state,intent)` and may also export `activate(frame,state,intent)`; executive mode requires both. `analyze` exports only synchronous `analyze(input)`. Pure helpers and constants are allowed; imports, packages and ambient host access are rejected. Original and canonical source each have a 16 KiB UTF-8 bound. These formats share the artifact store and exact-version publication path.
+`run` remains an async JavaScript body with host-bound `game,args`, without imports or exports. It can implement a finite procedure or semantic feedback loop. `step` exports synchronous `step(frame,state,intent)` and may also export `activate(frame,state,intent)`; executive mode requires both. `analyze` exports only synchronous `analyze(input)`. Both pure roots can import declared libraries and reexport their selected entry functions. Original and canonical source each have a 16 KiB UTF-8 bound. These formats share the artifact store and exact-version publication path.
+
+Write reusable pure code with `entry:"library"`. A consumer declares
+`dependencies:[{name,version,import_path:"./helper.js"}]`, then uses that exact
+specifier in an ordinary static import. Each alias resolves to the immutable
+version captured at authoring, not a file or the latest catalog revision.
+Libraries can use named/default exports and static reexports; they cannot play.
+Package, absolute, parent-directory and dynamic imports, `import.meta` and
+ambient host access remain forbidden. Pure `analyze` and `library` dependencies
+must be imported libraries; a `step` may additionally declare finite `run`
+children under the existing semantic-task contract.
+
+The acyclic pure closure is bounded to 32 modules, depth eight and 64 KiB of
+canonical source, inside a 256 KiB initialization message. All pure calls share
+one watched realm; each exact module has one instance in that realm. Separate
+shadow and live workers start fresh. Per-file hashes remain source identities;
+the execution hash binds the complete imported sources, aliases and topology.
+An import-free root retains its existing hash and validation fingerprint.
+New module syntax carries an explicit runtime feature in validation. Preparation
+pins the entire closure before producer retirement; changing a library's latest
+revision cannot alter an already captured root.
 
 Pure modules also receive the realm-local, frozen `motion.turn(options,state)`
 math binding. The caller supplies actual `native_tick` and applied pose, its
@@ -67,7 +87,7 @@ The ordinary default exposes these tools:
 | Model tool | Purpose |
 |---|---|
 | `observe` | Obtain fresh authorized game state, a typed actor PNG and separate image metadata without caller-supplied session/life/epoch. |
-| `program_write` | Create a named immutable `run`, `step` or `analyze` revision; omitted card/dependencies remain unspecified and untested. |
+| `program_write` | Create a named immutable `run`, `step`, `analyze` or pure `library` revision; omitted card/dependencies remain unspecified and untested. |
 | `program_submit` | Explicitly write an immutable version and request its exact-version start through ordinary admission; report persistence separately from a refused or uncertain start. |
 | `program_run` | Start a matching `run`/`step`, inspect or stop it, version-update resident intent, run a pure analysis job, activate prepared playing work or select a finite attention wake. |
 | `program_inspect` | Read catalog/source/execution/history/metric/evidence/trace/feedback/comparison/planning and mechanical reference views. |
@@ -208,6 +228,24 @@ the interval. The advisory requests an ordinary strategic decision while leaving
 the executive running; it does not abort an admitted provider request, select
 input or infer that observation is useless. Missing progress and stationary
 productive work are not classified as inactivity.
+
+Raw controls have a separate confirmed-input advisory. Five seconds of fresh
+ACKs can establish neutral input, or directional input while all sampled own
+feet positions remain within 0.3 blocks of one anchor. Attack/use, jumping,
+water/lava, airborne/vehicle/gliding motion, GUI input, uncertain application,
+changed authority or gaps over 250 ms do not accumulate a stationary-motion
+window. Neutral input also excludes rotation, edges and a changed hotbar slot.
+Capture-to-application age must be at most 150 ms. Each continuous interval
+reports once; it neither proves collision or uselessness nor selects a response.
+Duplicate ACKs cannot extend coverage. The ordinary strategic wake leaves local
+control running and cannot shorten a provider response by itself.
+
+Executive and legacy residents share one bounded pure-analysis lifecycle.
+Analysis runs alongside local decisions, with one outstanding job and the
+original cumulative job/time budgets. An intent change marks its result stale;
+it never changes controls or intent automatically. Stop aborts analysis and
+joins the actual worker-service settlement. Unknown analysis cleanup keeps the
+owner's worker drain unknown instead of claiming safe retirement.
 
 Sampling pins the exact producer and transition phase before awaiting a frame.
 If opening or retirement completes during an independent read, that frame is
@@ -402,7 +440,17 @@ The runtime also emits one `program.repeated_no_effect` advisory after three con
 
 This advisory requests an ordinary strategic decision while foreground work continues. It neither aborts an admitted provider request nor grants another allowance, changes intent, chooses a response, retries an action or stops the actor. Repeating the same neutral sequence does not flood requests. Purposeful stationary observation remains valid; the model decides whether its loop needs repair.
 
-`program_write` and `program_submit` dependencies list only already authored named programs for `game.call`, never native binding names. The host resolves these declarations to exact validated versions when the parent is written. A running child lookup uses **only that parent's pinned closure**, never current latest; omitted child version requires an unambiguous declared name. A native read and an authored program with the same name remain separate authorities: the direct method invokes the binding, while `game.call` requires the captured authored dependency. Internal `SkillRef` identities remain evidence/enforcement details. Every return path, including early blocked/failed exits, supplies `{status:"completed"|"blocked"|"failed",summary,result}`; use `result:null` without a payload. Static validation does not prove every path returns correctly, and completion does not certify the operator's objective.
+Dependencies name already authored programs, never native binding names. An
+`import_path` selects pure local-module composition; a declaration without it
+selects the existing finite `run` child contract. The host captures exact
+validated versions when the parent is written. A running child lookup uses
+**only that parent's pinned closure**, never current latest; omitted child
+version requires an unambiguous declared name. A direct native method and
+`game.call` remain separate authorities. Internal `SkillRef` identities are
+evidence/enforcement details. Every async return path, including early
+blocked/failed exits, supplies `{status:"completed"|"blocked"|"failed",summary,result}`;
+use `result:null` without a payload. Static validation does not prove every path
+returns correctly, and completion does not certify the operator's objective.
 
 `game.actionAndObserve(action)` composes one ordinary action with a fresh ordinary observation, returning `{action,observation}` without changing the action result. Without a reconnect requirement, observation follows success or a neutralized failure with explicit `world_effect_emitted:false` or `failure_outcome_confirmed:true`. The latter is native-owned evidence of a settled failed outcome, not an action argument or proof that nothing changed in the world. Attempted input and partial movement remain recorded. Other outcomes return `observation:null`; unknown, cancellation and reconnect retain the host's execution fences. Validation, observation and scope-revocation errors propagate without stale fallback. Both calls consume existing budgets.
 

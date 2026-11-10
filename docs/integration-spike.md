@@ -2,7 +2,16 @@
 
 GameHarness is a desktop harness intended for many supported games through explicit adapters. This guide covers its first implemented adapter, Minecraft Java: an owned Fabric client/server, authentic video and compact model-authored programs. Other adapters are planned, not delivered automatically. Old Mineflayer/prismarine results below are scoped history and do not certify the native replacement.
 
-The supported slice includes natural-language tasks, bounded model-authored programs, native movement and visible inventory mechanics, retained evidence and safe run closure. A reviewed two-trip task supports a small end-to-end gameplay result; it does not certify every criterion in the broader [playable gate](implementation-mvp.md) or release contract. The [runtime contracts](runtime-contracts.md#current-compact-program-interface) distinguish delivered tools from ordinary-module, checkpoint and other future interfaces.
+The supported slice includes natural-language tasks, bounded model-authored programs, native movement and visible inventory mechanics, retained evidence and safe run closure. A reviewed two-trip task supports a small end-to-end gameplay result; it does not certify every criterion in the broader [playable gate](implementation-mvp.md) or release contract. The [runtime contracts](runtime-contracts.md#current-compact-program-interface) distinguish delivered pure local modules and async bodies from the future async-module/checkpoint interface.
+
+Pure-library worker verification covers nested named/default/reexports,
+same-realm sharing, fresh workers, exact alias/hash/size bounds and denied host
+imports. `bun test tests/resident-worker.test.ts tests/resident-controller.test.ts`
+passed 192 cases with one opt-in Docker case skipped. Running that case with
+`GAMEHARNESS_DOCKER_MODULE_SMOKE=1` passed through the actual Docker guardian,
+including shared/fresh analysis realms and a step root. These checks establish
+software behavior, not model adoption, useful gameplay or a five-second pause
+guarantee.
 
 Game session, agent run and player life have separate lifetimes. Their current operating contract is below; retained death-disconnect/saved-dead-auto-respawn reports describe superseded cohorts. Historical promotion and exact warm invocation remain limited evidence: the inherited program blocked on absent observable prerequisites and a later program ended in death. Neither durable source nor successful hydration establishes useful warm-task performance.
 

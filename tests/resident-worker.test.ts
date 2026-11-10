@@ -12,7 +12,8 @@ import { validateProgramSource } from "../src/server/program-validation.ts";
 import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 import type { TemporalTurnOptions, TemporalTurnResult, TemporalTurnState } from "../src/shared/temporal-turn.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
-import type { SkillCapabilityRequest } from "../src/shared/programs.ts";
+import type { ExecutableModuleBundle, SkillCapabilityRequest } from "../src/shared/programs.ts";
+import { assertExecutableModuleBundle, executableModuleBundleHash, singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 import { Json } from "../src/shared/contracts.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { GeneratedControllerResultValidationError, parseGeneratedResidentResult } from "../src/server/program-diagnostics.ts";
@@ -84,9 +85,12 @@ function processWorker(budget = 80): ProcessWorker {
   };
 }
 async function compile(source: string, entry: "step" | "analyze" = "analyze", budget = 80) {
+  return await compileBundle(singletonExecutableModuleBundle(source, entry), budget);
+}
+async function compileBundle(bundle: ExecutableModuleBundle, budget = 80) {
   const worker = processWorker(budget);
   expect(await worker.read()).toEqual({ v: 1, type: "resident_ready", id: 0 });
-  worker.send({ v: 1, type: "resident_init", id: 0, entry, source });
+  worker.send({ v: 1, type: "resident_init", id: 0, entry: bundle.entry, bundle });
   expect(await worker.read()).toEqual({ v: 1, type: "resident_compiled", id: 0 });
   return worker;
 }
@@ -94,6 +98,240 @@ async function analyze(worker: ProcessWorker, id: number, input: unknown) {
   worker.send({ v: 1, type: "resident_analyze", id, input });
   return await worker.read();
 }
+function moduleBundle(rows: { name: string; source: string; imports?: { specifier: string; name: string }[] }[],
+  entry: ExecutableModuleBundle["entry"] = "analyze"): ExecutableModuleBundle {
+  const id = (name: string) => name === "root" ? "root" : `module:${JSON.stringify([name, 1])}`;
+  const modules = rows.map(row => ({ ...singletonExecutableModuleBundle(row.source, entry).modules[0]!,
+    id: id(row.name), imports: (row.imports ?? []).map(binding => ({ specifier: binding.specifier, module_id: id(binding.name) })) }));
+  return { schema_version: 1, entry, root: "root", source_hash: executableModuleBundleHash(entry, modules), modules };
+}
+function sharedLibraryBundle(): ExecutableModuleBundle {
+  return moduleBundle([
+    { name: "root", source: `import {left} from "./left.js"; import right from "./right.mjs";
+      export function analyze(input) { return [left(input), right(input)]; }`,
+      imports: [{ specifier: "./left.js", name: "left" }, { specifier: "./right.mjs", name: "right" }] },
+    { name: "left", source: `export { next as left } from "./counter.js";`, imports: [{ specifier: "./counter.js", name: "counter" }] },
+    { name: "right", source: `import {next} from "./same.js"; export default function right(input) { return next(input); }`,
+      imports: [{ specifier: "./same.js", name: "counter" }] },
+    { name: "counter", source: `let count = 0; export function next(input) {
+      return {count: ++count, realm: input instanceof Object, motion_frozen: Object.isFrozen(motion.turn),
+        game: typeof game, process: typeof process, fetch: typeof fetch}; }` },
+  ]);
+}
+
+test("pure nested named/default/reexports share one library singleton and fresh workers reset its state", async () => {
+  const bundle = sharedLibraryBundle();
+  const first = await compileBundle(bundle), second = await compileBundle(bundle);
+  expect(await analyze(first, 1, {})).toMatchObject({ value: [
+    { count: 1, realm: true, motion_frozen: true, game: "undefined", process: "undefined", fetch: "undefined" },
+    { count: 2, realm: true, motion_frozen: true, game: "undefined", process: "undefined", fetch: "undefined" },
+  ] });
+  expect(await analyze(first, 2, {})).toMatchObject({ value: [{ count: 3 }, { count: 4 }] });
+  expect(await analyze(second, 1, {})).toMatchObject({ value: [{ count: 1 }, { count: 2 }] });
+});
+
+test("root binding/reexports select synchronous library entry functions without leaking library exports", async () => {
+  const bundle = moduleBundle([
+    { name: "root", source: `export {default as analyze} from "./entry.js";`, imports: [{ specifier: "./entry.js", name: "entry" }] },
+    { name: "entry", source: `export const unused = 4; export default function analyze(input) { return input.value + unused; }` },
+  ]);
+  const worker = await compileBundle(bundle);
+  expect(await analyze(worker, 1, { value: 3 })).toMatchObject({ value: 7 });
+});
+
+test("shared library object mutation is local to each worker realm", async () => {
+  const bundle = moduleBundle([
+    { name: "root", source: `import value from "./value.js"; export function analyze(input) {
+      value.total += input; return value; }`, imports: [{ specifier: "./value.js", name: "value" }] },
+    { name: "value", source: `export default { total: 0 };` },
+  ]);
+  const first = await compileBundle(bundle), second = await compileBundle(bundle);
+  expect(await analyze(first, 1, 3)).toMatchObject({ value: { total: 3 } });
+  expect(await analyze(first, 2, 4)).toMatchObject({ value: { total: 7 } });
+  expect(await analyze(second, 1, 2)).toMatchObject({ value: { total: 2 } });
+});
+
+test("library namespace bindings cannot be reassigned by an importing root", async () => {
+  const bundle = moduleBundle([
+    { name: "root", source: `import * as library from "./library.js"; export function analyze(input) {
+      let blocked = false; try { library.value = input; } catch { blocked = true; }
+      return { blocked, value: library.value }; }`, imports: [{ specifier: "./library.js", name: "library" }] },
+    { name: "library", source: `export const value = 1;` },
+  ]);
+  const worker = await compileBundle(bundle);
+  expect(await analyze(worker, 1, 9)).toMatchObject({ value: { blocked: true, value: 1 } });
+});
+
+test("step and activate library reexports preserve synchronous root arity and selected namespace", async () => {
+  const bundle = moduleBundle([
+    { name: "root", source: `export {step,activate} from "./entry.js";`, imports: [{ specifier: "./entry.js", name: "entry" }] },
+    { name: "entry", source: `let count = 0;
+      export function activate(frame,state,intent) { return {choice:{kind:"observe"},next_state:++count,status:"running",events:[]}; }
+      export function step(frame,state,intent) { return {choice:{kind:"observe"},next_state:++count,status:"running",events:[]}; }` },
+  ], "step");
+  const worker = await compileBundle(bundle);
+  worker.send({ v: 1, type: "resident_activate", id: 1, frame: { executive: {} }, state: null, intent: null });
+  expect(await worker.read()).toMatchObject({ value: { next_state: 1 } });
+  worker.send({ v: 1, type: "resident_step", id: 2, frame: { executive: {} }, state: null, intent: null });
+  expect(await worker.read()).toMatchObject({ value: { next_state: 2 } });
+});
+
+const invalidBundles: { name: string; bundle(): ExecutableModuleBundle }[] = [
+  { name: "changed source bytes", bundle() { const bundle = sharedLibraryBundle(); bundle.modules[1]!.source += " "; return bundle; } },
+  { name: "changed realm hash", bundle() { const bundle = sharedLibraryBundle(); bundle.source_hash = "0".repeat(64); return bundle; } },
+  { name: "unknown target", bundle() { const bundle = sharedLibraryBundle(); bundle.modules[0]!.imports[0]!.module_id = 'module:["missing",1]'; return bundle; } },
+  { name: "duplicate alias", bundle() { const bundle = sharedLibraryBundle(); bundle.modules[0]!.imports.push(bundle.modules[0]!.imports[0]!); return bundle; } },
+  { name: "traversal alias", bundle() { const bundle = sharedLibraryBundle(); bundle.modules[0]!.imports[0]!.specifier = "./../left.js"; return bundle; } },
+  { name: "node alias", bundle() { const bundle = sharedLibraryBundle(); bundle.modules[0]!.imports[0]!.specifier = "node:fs"; return bundle; } },
+  { name: "noncanonical module identity", bundle() { const bundle = sharedLibraryBundle(); bundle.modules[1]!.id = 'module:[ "left", 1 ]'; return bundle; } },
+  { name: "unreachable module", bundle() { return moduleBundle([
+    { name: "root", source: "export function analyze(input) { return input; }" }, { name: "extra", source: "export const x=1;" },
+  ]); } },
+  { name: "cyclic libraries", bundle() { return moduleBundle([
+    { name: "root", source: 'export {analyze} from "./a.js";', imports: [{ specifier: "./a.js", name: "a" }] },
+    { name: "a", source: 'export {analyze} from "./b.js";', imports: [{ specifier: "./b.js", name: "b" }] },
+    { name: "b", source: 'export {analyze} from "./a.js";', imports: [{ specifier: "./a.js", name: "a" }] },
+  ]); } },
+  { name: "33 modules", bundle() { return moduleBundle([
+    { name: "root", source: `${Array.from({ length: 32 }, (_, i) => `import "./m${i}.js";`).join("")} export function analyze(input){return input;}`,
+      imports: Array.from({ length: 32 }, (_, i) => ({ specifier: `./m${i}.js`, name: `m${i}` })) },
+    ...Array.from({ length: 32 }, (_, i) => ({ name: `m${i}`, source: "export const n=0;" })),
+  ]); } },
+  { name: "depth nine", bundle() { return moduleBundle(Array.from({ length: 9 }, (_, i) => ({
+    name: i === 0 ? "root" : `d${i}`,
+    source: i === 8 ? "export function analyze(input){return input;}" : `export {analyze} from "./next.js";`,
+    imports: i === 8 ? [] : [{ specifier: "./next.js", name: `d${i + 1}` }],
+  }))); } },
+  { name: "aggregate source over 64KiB", bundle() { return moduleBundle([
+    { name: "root", source: `import "./a.js"; import "./b.js"; import "./c.js"; import "./d.js"; export function analyze(input){return input;}`,
+      imports: ["a", "b", "c", "d"].map(name => ({ specifier: `./${name}.js`, name })) },
+    ...["a", "b", "c", "d"].map(name => ({ name, source: "export const x=1;".padEnd(16384, " ") })),
+  ]); } },
+  { name: "JSON envelope over 256KiB despite bounded raw source", bundle() { return moduleBundle([
+    { name: "root", source: `import "./a.js"; import "./b.js"; import "./c.js"; export function analyze(input){return input;}`,
+      imports: ["a", "b", "c"].map(name => ({ specifier: `./${name}.js`, name })) },
+    ...["a", "b", "c"].map(name => ({ name, source: `/*${"\0".repeat(16380)}*/` })),
+  ]); } },
+];
+for (const invalid of invalidBundles) test(`resident rejects bundle ${invalid.name} before authored execution`, async () => {
+  const bundle = invalid.bundle();
+  expect(() => assertExecutableModuleBundle(bundle)).toThrow();
+  const worker = processWorker(); await worker.read();
+  worker.send({ v: 1, type: "resident_init", id: 0, entry: bundle.entry, bundle });
+  expect(await worker.closed).not.toBe(0);
+});
+
+for (const source of [
+  `import {x} from "./undeclared.js"; export function analyze(input){return x;}`,
+  `import fs from "node:fs"; export function analyze(input){return fs;}`,
+  `import x from "a-package"; export function analyze(input){return x;}`,
+]) test(`resident linker refuses imports absent from the exact captured alias graph: ${source}`, async () => {
+  const worker = processWorker(); await worker.read();
+  const bundle = singletonExecutableModuleBundle(source, "analyze");
+  worker.send({ v: 1, type: "resident_init", id: 0, entry: "analyze", bundle });
+  expect(await worker.closed).not.toBe(0);
+});
+
+test("pure imported library cannot use dynamic imports or import.meta to acquire host values", async () => {
+  for (const expression of ["import('node:fs')", "import.meta"]) {
+    const bundle = moduleBundle([
+      { name: "root", source: `export {analyze} from "./entry.js";`, imports: [{ specifier: "./entry.js", name: "entry" }] },
+      { name: "entry", source: `export function analyze(input) { return ${expression}; }` },
+    ]);
+    const worker = await compileBundle(bundle);
+    worker.send({ v: 1, type: "resident_analyze", id: 1, input: null });
+    expect(await worker.closed).not.toBe(0);
+  }
+});
+
+test("caught import.meta and dynamic-import denials cannot expose outer-realm Error constructors", async () => {
+  const meta = moduleBundle([
+    { name: "root", source: `export {analyze} from "./entry.js";`, imports: [{ specifier: "./entry.js", name: "entry" }] },
+    { name: "entry", source: `export function analyze(input) { try { return import.meta; } catch (error) {
+      try { return error.constructor.constructor("return process")().version; } catch { return "blocked"; }
+    } }` },
+  ]);
+  expect(await analyze(await compileBundle(meta), 1, null)).toMatchObject({ value: "blocked" });
+  const dynamic = moduleBundle([
+    { name: "root", source: `export {analyze} from "./entry.js";`, imports: [{ specifier: "./entry.js", name: "entry" }] },
+    { name: "entry", source: `let outcome = "idle"; export function analyze(input) {
+      if (input) { import("node:fs").catch(error => {
+        try { error.constructor.constructor("return process")(); outcome = "leaked"; } catch { outcome = "blocked"; }
+      }); return "pending"; } return outcome;
+    }` },
+  ]);
+  const worker = await compileBundle(dynamic);
+  expect(await analyze(worker, 1, true)).toMatchObject({ value: "pending" });
+  expect(await analyze(worker, 2, false)).toMatchObject({ value: "blocked" });
+});
+
+test("resident accepts exact 16KiB canonical root bytes without changing its legacy hash", async () => {
+  const source = "export function analyze(input){return input;}".padEnd(16384, " ");
+  const bundle = singletonExecutableModuleBundle(source, "analyze");
+  assertExecutableModuleBundle(bundle);
+  expect(bundle.source_hash).toBe(bundle.modules[0]!.source_hash);
+  const worker = await compileBundle(bundle);
+  expect(await analyze(worker, 1, 7)).toMatchObject({ value: 7 });
+});
+
+test("resident accepts a complete eight-module path and exact 64KiB aggregate source", async () => {
+  const depthBundle = moduleBundle(Array.from({ length: 8 }, (_, i) => ({
+    name: i === 0 ? "root" : `d${i}`,
+    source: i === 7 ? "export function analyze(input){return input;}" : `export {analyze} from "./next.js";`,
+    imports: i === 7 ? [] : [{ specifier: "./next.js", name: `d${i + 1}` }],
+  })));
+  const depthWorker = await compileBundle(depthBundle);
+  expect(await analyze(depthWorker, 1, 7)).toMatchObject({ value: 7 });
+  const aggregateBundle = moduleBundle([
+    { name: "root", source: `import "./a.js"; import "./b.js"; import "./c.js"; export function analyze(input){return input;}`.padEnd(16384, " "),
+      imports: ["a", "b", "c"].map(name => ({ specifier: `./${name}.js`, name })) },
+    ...["a", "b", "c"].map(name => ({ name, source: "export const x=1;".padEnd(16384, " ") })),
+  ]);
+  assertExecutableModuleBundle(aggregateBundle);
+  const aggregateWorker = await compileBundle(aggregateBundle);
+  expect(await analyze(aggregateWorker, 1, 9)).toMatchObject({ value: 9 });
+});
+
+test("resident accepts 32 reachable module singletons", async () => {
+  const bundle = moduleBundle([
+    { name: "root", source: `${Array.from({ length: 31 }, (_, i) => `import "./m${i}.js";`).join("")} export function analyze(input){return input;}`,
+      imports: Array.from({ length: 31 }, (_, i) => ({ specifier: `./m${i}.js`, name: `m${i}` })) },
+    ...Array.from({ length: 31 }, (_, i) => ({ name: `m${i}`, source: "export const n=0;" })),
+  ]);
+  assertExecutableModuleBundle(bundle);
+  const worker = await compileBundle(bundle);
+  expect(await analyze(worker, 1, 7)).toMatchObject({ value: 7 });
+});
+
+const dockerModuleSmoke = process.env.GAMEHARNESS_DOCKER_MODULE_SMOKE === "1" ? test : test.skip;
+dockerModuleSmoke("actual Docker guardian runs nested pure libraries in shared and fresh realms", async () => {
+  const sandbox = new SandboxService(new URL("..", import.meta.url).pathname);
+  try {
+    await sandbox.prepare();
+    expect(sandbox.snapshot().status).toBe("ready");
+    const bundle = sharedLibraryBundle(), signal = new AbortController().signal;
+    const first = await sandbox.createResidentAnalysisWorker(bundle, 1000, signal);
+    const second = await sandbox.createResidentAnalysisWorker(bundle, 1000, signal);
+    try {
+      expect(await first.analyze({}, signal)).toMatchObject([{ count: 1 }, { count: 2 }]);
+      expect(await first.analyze({}, signal)).toMatchObject([{ count: 3 }, { count: 4 }]);
+      expect(await second.analyze({}, signal)).toMatchObject([{ count: 1 }, { count: 2 }]);
+    } finally { await Promise.all([first.close(), second.close()]); }
+    const stepBundle = moduleBundle([
+      { name: "root", source: `import {next} from "./state.js"; export function step(frame,state,intent) {
+        return {choice:{kind:"observe"},next_state:next(),status:"running",events:[]}; }`,
+        imports: [{ specifier: "./state.js", name: "state" }] },
+      { name: "state", source: `export {next} from "./counter.js";`, imports: [{ specifier: "./counter.js", name: "counter" }] },
+      { name: "counter", source: `let count=0; export function next(){return ++count;}` },
+    ], "step");
+    const step = await sandbox.createResidentWorker(stepBundle, 500, signal);
+    try {
+      const frame = minecraftControllerFrameSchema.parse(controllerFrameFixture());
+      expect(await step.step(frame, null, null, signal)).toMatchObject({ next_state: 1 });
+      expect(await step.step(frame, null, null, signal)).toMatchObject({ next_state: 2 });
+    } finally { await step.close(); }
+  } finally { await sandbox.close(); }
+}, 60000);
 const neutralInput = { kind: "world", held: { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, attack: false, use: false }, edges: [], view: { kind: "unchanged" }, selected_hotbar: null };
 const stepResult = `{ input: ${JSON.stringify(neutralInput)}, next_state: { count: state.count + 1, local: ++count, intent }, status: "running", events: [] }`;
 
@@ -324,7 +562,7 @@ for (const [label, source] of [
   ["oversize UTF8 source", `export function analyze(input) { return 1; } /*${"é".repeat(8200)}*/`],
 ] as const) test(`resident compilation rejects ${label}`, async () => {
   const worker = processWorker(); await worker.read();
-  worker.send({ v: 1, type: "resident_init", id: 0, entry: "analyze", source });
+  worker.send({ v: 1, type: "resident_init", id: 0, entry: "analyze", bundle: singletonExecutableModuleBundle(source, "analyze") });
   expect(await worker.closed).not.toBe(0);
 });
 
@@ -463,8 +701,8 @@ async function hostResidentProtocol(frames: unknown[], result: boolean, stepDela
   Object.assign(sandbox, { state: { status: "ready", image: "controlled-guardian", error: null },
     runner: new URL("../sandbox/worker.mjs", import.meta.url).pathname, guardian });
   const worker = stepDelayMs === undefined
-    ? await sandbox.createResidentAnalysisWorker("export function analyze(input) { return input; }", 1000, new AbortController().signal)
-    : await sandbox.createResidentWorker("export function step(frame,state,intent) { return null; }", 25, new AbortController().signal);
+    ? await sandbox.createResidentAnalysisWorker(singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze"), 1000, new AbortController().signal)
+    : await sandbox.createResidentWorker(singletonExecutableModuleBundle("export function step(frame,state,intent) { return null; }", "step"), 25, new AbortController().signal);
   return { worker, release() { writeFileSync(release, "drained"); }, async close() {
     writeFileSync(release, "drained"); await sandbox.close(); rmSync(directory, { recursive: true, force: true });
   } };

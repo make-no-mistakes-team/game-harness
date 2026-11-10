@@ -6,6 +6,7 @@ import type { ControllerEffectUpdate, ControllerInput, ControllerInputChannel, I
 import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
 import { DEFAULT_RESIDENT_LIMITS, ResidentCleanupError, type ControllerStepResult, type ResidentClock, type ResidentControllerOptions, type ResidentLifecycle, type ResidentLimits, type ResidentSnapshot, type ResidentTraceEvent } from "../src/shared/resident.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
+import { singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 
 const hash = "a".repeat(64) as Sha256;
 const neutral = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, attack: false, use: false };
@@ -95,7 +96,8 @@ function harness(limits: Partial<ResidentLimits> = {}, trace?: ResidentControlle
     effect(event: ControllerEffectUpdate) { effect(event); },
   };
 }
-const analysisSource = { skill_id: "pure-analysis", version: 1, hash, source: "export function analyze(input) { return input; }" };
+const analysisSource = { skill_id: "pure-analysis", version: 1, hash,
+  bundle: singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze") };
 async function begin(h: { controller: ResidentController; clock: Clock }) { await h.controller.start(); await h.clock.advance(0); }
 
 test("resident keeps dispatching fresh decisions through held heartbeat replies and Stop joins every reply", async () => {

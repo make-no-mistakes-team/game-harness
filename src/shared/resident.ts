@@ -6,6 +6,7 @@ import { authoredControllerInputSchema, controllerInputSchema, inputAppliedAckSc
 import { jsonSchema } from "./primitives.ts";
 import type { MinecraftControllerFrame } from "./minecraft.ts";
 import { executiveChoiceSchema, executiveSnapshotSchema, type ExecutiveSnapshot } from "./control-session.ts";
+import type { ExecutableModuleBundle } from "./programs.ts";
 
 export const RESIDENT_PROTOCOL_VERSION = 1;
 export const RESIDENT_INPUT_BYTES = 262144;
@@ -182,7 +183,7 @@ export const residentSnapshotSchema = z.object({
   session: executiveSnapshotSchema.optional(),
   cleanup: z.object({ worker: z.enum(["open", "closing", "closed", "unknown"]), native: z.enum(["open", "revoking", "retired", "unknown"]) }).strict(),
 }).strict() satisfies z.ZodType<ResidentSnapshot>;
-export interface ResidentAnalysisSource { skill_id: string; version: number; hash: Sha256; source: string }
+export interface ResidentAnalysisSource { skill_id: string; version: number; hash: Sha256; bundle: ExecutableModuleBundle }
 export interface ResidentAnalysisResult {
   job_id: string; source: { skill_id: string; version: number; hash: Sha256 };
   controller_execution_id: string; controller_source_hash: Sha256; controller_generation: number;

@@ -1,13 +1,14 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { Json } from "../shared/contracts.ts";
 import { sameEffectScope, type WorldHeld, type WorldInputEdge } from "../shared/control.ts";
 import { controllerEffectUpdateSchema, controllerInputSchema, inputAppliedAckSchema, revocationAckSchema,
   type ControllerEffectUpdate, type ControllerInput, type ControllerInputChannel, type InputAppliedAck } from "../shared/controller.ts";
 import { minecraftControllerFrameSchema } from "../shared/minecraft.ts";
-import { ResidentCleanupError, RESIDENT_STEP_RESPONSE_MS, residentAnalysisInputSchema, residentAnalysisOutputSchema, residentIntentSchema, residentLimitsSchema, residentSourceIdentitySchema, residentStateSchema,
+import { ResidentCleanupError, RESIDENT_STEP_RESPONSE_MS, residentIntentSchema, residentLimitsSchema, residentStateSchema,
   type ResidentAnalysisResult, type ResidentAnalysisSource, type ResidentClock, type ResidentControllerOptions,
   type ResidentSnapshot, type ResidentTimingSummary, type ResidentTraceStage } from "../shared/resident.ts";
 import { GeneratedControllerResultValidationError, parseGeneratedControllerResult } from "./program-diagnostics.ts";
+import { ResidentAnalysisLane } from "./resident-analysis.ts";
 
 const heldKeys: (keyof WorldHeld)[] = ["forward", "back", "left", "right", "jump", "sprint", "sneak", "attack", "use"];
 const neutral: WorldHeld = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, attack: false, use: false };
@@ -52,9 +53,7 @@ export class ResidentController {
   private stopTask: Promise<void> | null = null;
   private drainTask: Promise<void> | null = null;
   private flight: Promise<void> | null = null;
-  private analysisTask: Promise<ResidentAnalysisResult> | null = null;
-  private analysisAbort: AbortController | null = null;
-  private analysisCleanupFailure: ResidentCleanupError | null = null;
+  private readonly analysisLane: ResidentAnalysisLane;
   private timer: unknown = null;
   private deadlineTimer: unknown = null;
   private fenced = false;
@@ -88,6 +87,9 @@ export class ResidentController {
         stale_frames: 0, read_failures: 0, no_input_decisions: 0, expanded_edges: 0, events: 0, analysis_jobs: 0, analysis_ms: 0 },
       pending: { frames: 0, edges: 0, analysis: false }, last_input: null,
       timings: { step_ms: this.stepTiming.snapshot(), input_age_ms: this.ageTiming.snapshot() }, events: [], cleanup: { worker: "open", native: "open" } };
+    this.analysisLane = new ResidentAnalysisLane(this.options, this.data, this.clock, () => this.active(),
+      () => this.fenced || this.abort.signal.aborted, (status, reason) => this.finish(status, reason),
+      () => this.notify(false, false));
   }
 
   start(): Promise<void> {
@@ -140,63 +142,7 @@ export class ResidentController {
   }
 
   analyze(source: ResidentAnalysisSource, input: Json, expectedIntentVersion: number): Promise<ResidentAnalysisResult> {
-    if (!this.active() || this.data.status !== "running") return Promise.reject(new Error("Resident is not running"));
-    if (expectedIntentVersion !== this.data.intent_version) return Promise.reject(new Error("Stale resident analysis intent version"));
-    if (this.analysisTask) return Promise.reject(new Error("Resident analysis already running"));
-    if (this.data.counters.analysis_jobs >= this.options.limits.max_analysis_jobs) return Promise.reject(new Error("Resident analysis job budget exhausted"));
-    const remaining = this.options.limits.max_analysis_ms - this.data.counters.analysis_ms;
-    if (remaining <= 0) return Promise.reject(new Error("Resident analysis time budget exhausted"));
-    const identity = residentSourceIdentitySchema.parse({ skill_id: source.skill_id, version: source.version, hash: source.hash });
-    const selectedSource = { ...source };
-    const detached = structuredClone(residentAnalysisInputSchema.parse(input));
-    const budget = Math.min(remaining, this.options.limits.analysis_job_ms, Math.max(0, this.options.deadline_host_ms - this.clock.now()));
-    if (budget <= 0) return Promise.reject(new Error("Resident deadline reached"));
-    const abort = new AbortController(); this.analysisAbort = abort;
-    const job = ++this.data.counters.analysis_jobs;
-    const result: ResidentAnalysisResult = { job_id: `${this.options.execution_id}:analysis:${job}`, source: identity,
-      controller_execution_id: this.options.execution_id, controller_source_hash: this.options.source_hash,
-      controller_generation: this.options.controller_generation, input_hash: createHash("sha256").update(JSON.stringify(detached)).digest("hex"),
-      input_version: expectedIntentVersion, status: "failed", output: null, elapsed_ms: 0, post_evaluation_ms: null, reason: null };
-    this.data.pending.analysis = true;
-    // Install the task before invoking the service: synchronous rejection must still participate in drain.
-    const task = Promise.resolve().then(async () => {
-      let reported = false, invalidReport = false, evaluationOpen = true;
-      let evaluatedAt: number | null = null;
-      try {
-        if (!this.active() || abort.signal.aborted) {
-          result.status = "cancelled"; result.reason = this.data.reason ?? "resident_not_current_or_expired";
-          if (!this.fenced) this.finish("stopped", result.reason);
-          return result;
-        }
-        const output = await this.options.analysis(selectedSource, detached, budget, abort.signal, elapsed => {
-          if (!evaluationOpen) { this.finish("failed", "resident_analysis_accounting"); return; }
-          if (reported || !Number.isFinite(elapsed) || elapsed < 0 || elapsed > Number.MAX_SAFE_INTEGER ||
-            this.data.counters.analysis_ms + elapsed > Number.MAX_SAFE_INTEGER) { invalidReport = true; return; }
-          reported = true; evaluatedAt = this.clock.now(); result.elapsed_ms = elapsed; this.data.counters.analysis_ms += elapsed;
-        });
-        if (!reported || invalidReport) { invalidReport = true; throw new Error("Invalid resident analysis evaluation report"); }
-        result.output = structuredClone(residentAnalysisOutputSchema.parse(output));
-        if (this.fenced || this.abort.signal.aborted) { result.status = "cancelled"; result.reason = this.data.reason ?? "resident_stopped"; }
-        else if (result.elapsed_ms > budget) { result.status = "failed"; result.reason = "analysis_budget"; result.output = null; }
-        else if (!this.options.current() || this.data.intent_version !== expectedIntentVersion) { result.status = "stale"; result.reason = "resident_analysis_version_changed"; }
-        else result.status = "completed";
-      } catch (error) {
-        result.status = this.fenced ? "cancelled" : "failed"; result.reason = message(error); result.output = null;
-        if (error instanceof ResidentCleanupError) {
-          this.analysisCleanupFailure = error;
-          this.finish("unknown", error.message);
-        }
-      } finally {
-        evaluationOpen = false;
-        // Both endpoints use this host clock; guardian-relative elapsed is never
-        // subtracted from a host timestamp. Compilation-only failure stays null.
-        if (evaluatedAt !== null) result.post_evaluation_ms = Math.max(0, this.clock.now() - evaluatedAt);
-        if (invalidReport) this.finish("failed", "resident_analysis_accounting");
-        this.data.pending.analysis = false; this.analysisAbort = null; this.analysisTask = null; this.notify(false, false);
-      }
-      return result;
-    });
-    this.analysisTask = task; return task;
+    return this.analysisLane.analyze(source, input, expectedIntentVersion);
   }
 
   stop(reason: string): Promise<void> {
@@ -211,7 +157,7 @@ export class ResidentController {
     this.fenced = true; this.data.reason ??= reason; this.data.status = "stopping";
     if (this.timer !== null) this.clock.clearTimeout(this.timer);
     if (this.deadlineTimer !== null) this.clock.clearTimeout(this.deadlineTimer);
-    this.abort.abort(reason); this.analysisAbort?.abort(reason);
+    this.abort.abort(reason); this.analysisLane.fence(reason);
     this.notify(true, false);
   }
 
@@ -222,8 +168,8 @@ export class ResidentController {
     const worker = Promise.resolve().then(() => this.options.worker.close()).then(() => { this.data.cleanup.worker = "closed"; }, error => {
       this.data.cleanup.worker = "unknown"; throw error;
     });
-    this.drainTask = Promise.allSettled([worker, this.flight, this.analysisTask]).then(results => {
-      if (this.analysisCleanupFailure) { this.data.cleanup.worker = "unknown"; throw this.analysisCleanupFailure; }
+    this.drainTask = Promise.allSettled([worker, this.flight, this.analysisLane.drain()]).then(results => {
+      if (results[2]!.status === "rejected") { this.data.cleanup.worker = "unknown"; throw results[2]!.reason; }
       const workerResult = results[0]!;
       if (workerResult.status === "rejected") throw workerResult.reason;
     });

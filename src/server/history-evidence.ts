@@ -30,6 +30,7 @@ import type {
 import { readProjectedObjectiveMetric } from "./history-objective.ts";
 import type { StoreReadQueries } from "./store-read.ts";
 import type { StoredRun } from "./store.ts";
+import { programExecutionHash } from "./program-modules.ts";
 
 const object = (value: unknown): Record<string, Json> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -346,7 +347,7 @@ function qualifyController(draft: ProjectionDraft, key: string): boolean {
     owner.run_generation === scope.run_generation &&
     owner.life_id === scope.life_id &&
     owner.space_epoch === scope.space_epoch &&
-    scope.source_hash === draft.source.skill(draft.runId, owner).hash &&
+    scope.source_hash === programExecutionHash(draft.source, draft.runId, owner) &&
     receipt.input_id ===
       `controller:${owner.execution_id}:${receipt.update.controller_generation}:${receipt.update.sequence}`
   );

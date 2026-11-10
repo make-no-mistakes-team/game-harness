@@ -1,7 +1,8 @@
 import { expect, test, vi } from "bun:test";
 import { ControlSession, type ControlSessionOptions } from "../src/server/control-session.ts";
 import { controlSessionConfigSchema, type ExecutiveChoice } from "../src/shared/control-session.ts";
-import { DEFAULT_RESIDENT_LIMITS, type ResidentClock, type ResidentSnapshot } from "../src/shared/resident.ts";
+import { DEFAULT_RESIDENT_LIMITS, ResidentCleanupError, type ResidentClock, type ResidentSnapshot } from "../src/shared/resident.ts";
+import { singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 import type { GameActionResult, Json } from "../src/shared/contracts.ts";
 import type { ControllerInputChannel, InputAppliedAck, RevocationAck } from "../src/shared/controller.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
@@ -38,7 +39,7 @@ const rawChoice: ExecutiveChoice = { kind: "raw", input: { kind: "world", held: 
   edges: [{ kind: "button", button: "forward", phase: "press", count: 1 }], view: { kind: "unchanged" }, selected_hotbar: null } };
 const request = { kind: "action" as const, action: { kind: "navigate", destination: "authorized-target" }, duration_ms: 1000 };
 const success: GameActionResult = { status: "succeeded", summary: "Finite resource work completed", evidence: { collected: 1 } };
-function harness(retained = 32) {
+function harness(retained = 32, ownBody?: (body: ReturnType<typeof controllerFrameFixture>["player"]) => void) {
   const clock = new Clock(), completed: { handle: number; frame_seq: number; deadline: number; result: {
     promise: Promise<GameActionResult>; resolve(value: GameActionResult): void; reject(reason?: unknown): void;
   } }[] = [];
@@ -54,6 +55,7 @@ function harness(retained = 32) {
     frame.dynamic_entities.native_tick = frameSeq; frame.captured_native_ns = String(Math.round(clock.now() * 1e6));
     frame.dynamic_entities.captured_native_ns = frame.captured_native_ns;
     frame.inventory.captured_native_ns = frame.captured_native_ns;
+    ownBody?.(frame.player);
     return frame as unknown as Json;
   };
   const result = (state: Json) => ({ choice: structuredClone(choice), next_state: Number(state) + 1,
@@ -184,6 +186,67 @@ test("a deliberate observation does not keep a semantic producer alive without a
   h.choose({ kind: "observe" }); await h.clock.advance(150); expect(h.supervision).toBe(0);
   h.choose({ kind: "continue", handle: 1 }); await h.clock.advance(50); expect(h.supervision).toBe(1);
   await h.session.stop("test complete");
+});
+
+test("confirmed stationary raw movement reports one advisory without replacing the authored producer", async () => {
+  const h = harness(32, body => { body.on_ground = true; body.in_water = false; });
+  h.choose({ kind: "raw", input: { kind: "world", held: { ...neutral, forward: true },
+    view: { kind: "unchanged" }, selected_hotbar: null } });
+  await h.session.start(); await h.clock.advance(0);
+  for (let now = 50; now <= 5500; now += 50) {
+    await h.clock.advance(50);
+    const last = h.sent.at(-1);
+    if (last) h.acknowledge(1, last.sequence);
+  }
+  expect(h.records.filter(record => record.type === "session.continuity_incident")).toHaveLength(1);
+  expect(h.records.find(record => record.type === "session.continuity_incident")?.details).toMatchObject({
+    reason: "executive_raw_motion_stationary", elapsed_native_ms: 5000, usefulness_inferred: false,
+  });
+  expect(h.session.snapshot()).toMatchObject({ status: "running", session: { producer: "raw", task_high_water: 0 } });
+  expect(h.retired).toBe(0);
+  await h.session.stop("test complete");
+});
+
+const analysisBundle = singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze");
+const analysisSource = { skill_id: "pure-analysis", version: 1, hash: analysisBundle.source_hash, bundle: analysisBundle };
+
+test("executive analysis keeps stepping, rejects concurrent jobs and retains stale-result provenance and cumulative budget", async () => {
+  const h = harness(), output = Promise.withResolvers<Json>();
+  h.options.limits.max_analysis_ms = 10;
+  h.options.analysis = async (_source, _input, budget, _signal, report) => {
+    expect(budget).toBe(10); const value = await output.promise; report(10); return value;
+  };
+  await h.session.start(); await h.clock.advance(0);
+  const job = h.session.analyze(analysisSource, { query: 1 }, 0); await settle();
+  await expect(h.session.analyze(analysisSource, null, 0)).rejects.toThrow("already running");
+  const before = h.stepCount; await h.clock.advance(100);
+  expect(h.stepCount).toBeGreaterThan(before); expect(h.session.snapshot().pending.analysis).toBe(true);
+  h.session.updateIntent({ revised: true }, 0); output.resolve({ answer: 7 });
+  expect(await job).toMatchObject({ status: "stale", output: { answer: 7 }, input_version: 0,
+    controller_execution_id: "executive", source: { skill_id: "pure-analysis", hash: analysisBundle.source_hash } });
+  await expect(h.session.analyze(analysisSource, null, 1)).rejects.toThrow("time budget exhausted");
+  await h.session.stop("test complete");
+});
+
+test("executive Stop aborts analysis and waits for its real service settlement", async () => {
+  const h = harness(), output = Promise.withResolvers<Json>(), entered = Promise.withResolvers<AbortSignal>();
+  h.options.analysis = async (_source, _input, _budget, signal, report) => {
+    entered.resolve(signal); const value = await output.promise; report(1); return value;
+  };
+  await h.session.start(); await h.clock.advance(0);
+  const job = h.session.analyze(analysisSource, null, 0), signal = await entered.promise;
+  let stopped = false; const stopping = h.session.stop("operator Stop").then(() => { stopped = true; });
+  await settle(); expect(signal.aborted).toBe(true); expect(stopped).toBe(false);
+  output.resolve({ late: true }); expect((await job).status).toBe("cancelled"); await stopping;
+  expect(h.session.snapshot().cleanup).toEqual({ worker: "closed", native: "retired" });
+});
+
+test("unconfirmed executive analysis cleanup contains the owner and cannot claim a known drain", async () => {
+  const h = harness(); h.options.analysis = async () => { throw new ResidentCleanupError(); };
+  await h.session.start(); await h.clock.advance(0);
+  expect((await h.session.analyze(analysisSource, null, 0)).status).toBe("failed"); await settle();
+  await expect(h.session.stop("test complete")).rejects.toBeInstanceOf(ResidentCleanupError);
+  expect(h.session.snapshot()).toMatchObject({ status: "unknown", cleanup: { worker: "unknown", native: "retired" } });
 });
 
 test("an invalid activation fails the invocation without turning its joined computation into unknown cleanup", async () => {

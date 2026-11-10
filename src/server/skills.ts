@@ -15,12 +15,15 @@ import type {
   SkillResult,
   SkillStartRequest,
   SkillView,
+  SkillDependency,
+  ExecutableModuleBundle,
 } from "../shared/programs.ts";
 import {
   skillCapabilitySchema,
   skillStartRequestSchema,
 } from "../shared/validation.ts";
 import { programFingerprint, validateSkill } from "./program-validation.ts";
+import { buildExecutableModuleBundle, resolveProgramModuleClosure } from "./program-modules.ts";
 import type { EffectContext, EffectInvocation, EffectScope } from "../shared/control.ts";
 import { assertExecutableCompatible } from "./effect-contract.ts";
 import { RegisteredAdapterContract } from "./registered-adapter.ts";
@@ -45,6 +48,7 @@ import type { MinecraftControllerFrame } from "../shared/minecraft.ts";
 interface PreparedHandoff {
   slot: string;
   key: string;
+  bundle: ExecutableModuleBundle;
   predecessorId: string;
   revision: number;
   deadlineHostMs: number;
@@ -90,6 +94,7 @@ export interface SkillHost {
     lifecycle: ResidentLifecycle): Promise<ControllerInputChannel>;
   programEvent?(execution: SkillExecutionView, event: import("../shared/resident.ts").ControllerEvent): void;
   residentProgress?(execution: SkillExecutionView, snapshot: ResidentSnapshot): void;
+  executiveIncident?(execution: SkillExecutionView, details: Json): void;
   residentEffect?(execution: SkillExecutionView, input: ControllerInput, event: ControllerEffectUpdate, adapter: RuntimeAdapter): void;
   sessionTask?(execution: SkillExecutionView, request: ExecutiveTaskRequest, handle: number, deadlineHostMs: number,
     signal: AbortSignal, frame: MinecraftControllerFrame, behaviorGeneration: number): Promise<GameActionResult>;
@@ -153,7 +158,10 @@ export class SkillManager {
   }
   private compatible(skill: SkillView): void {
     const context = this.context(), validation = assertExecutableCompatible(skill.validation, context.binding);
-    if (!skill.entry || validation.fingerprint !== programFingerprint(skill.hash, skill.entry === "run" ? "skill" : skill.entry, context.binding.compatibility_hash))
+    const features = skill.validation.runtime_features;
+    if ((features !== undefined && (features.length > 1 || (features.length === 1 && features[0] !== "pure_modules_v1"))) ||
+      !skill.entry || validation.fingerprint !== programFingerprint(skill.hash, skill.entry === "run" ? "skill" : skill.entry,
+        context.binding.compatibility_hash, undefined, features))
       throw new RuntimeFault("precondition_failed", "Cached source validation is incompatible; retain history and create a fresh immutable revision");
   }
   effectScope(executionId: string): EffectScope | null {
@@ -177,6 +185,11 @@ export class SkillManager {
     return this.timeSource(runId, registration?.call_id ?? null, async timing => {
       const validated = await validateSkill(spec, this.context());
       this.validateDependencies(runId, validated.dependencies);
+      if (validated.entry === "run" && validated.dependencies.some(dependency => this.store.skill(runId, dependency).entry !== "run"))
+        throw new RuntimeFault("precondition_failed", "Async run dependencies can only name semantic run children");
+      if (validated.entry !== "run") resolveProgramModuleClosure(this.store, runId, {
+        ...validated, hash: createHash("sha256").update(validated.source).digest("hex"),
+      });
       timing.validatedAt = performance.now();
       const published = await this.store.registerSkill(runId, validated, registration, beforeCommit);
       timing.published = published;
@@ -236,6 +249,9 @@ export class SkillManager {
           "Snapshot validator configuration changed; fresh evidence requires a validated revision",
         );
       this.validateDependencies(runId, snapshot.dependencies);
+      if (snapshot.entry === "run" && snapshot.dependencies.some(dependency => this.store.skill(runId, dependency).entry !== "run"))
+        throw new RuntimeFault("precondition_failed", "Async run dependencies can only name semantic run children");
+      if (snapshot.entry !== "run") resolveProgramModuleClosure(this.store, runId, snapshot);
       timing.validatedAt = performance.now();
       const view = await this.store.importSkill(runId, snapshot, beforeCommit);
       timing.published = view;
@@ -255,7 +271,7 @@ export class SkillManager {
       return view;
     });
   }
-  private validateDependencies(runId: string, dependencies: SkillRef[]): void {
+  private validateDependencies(runId: string, dependencies: SkillDependency[]): void {
     const visited = new Map<string, number>();
     const visit = (ref: SkillRef, depth: number): void => {
       if (depth > 8) throw new Error("Dependency depth exceeds eight");
@@ -268,6 +284,8 @@ export class SkillManager {
         throw new Error("Dependency is not validated");
       if (dependency.validation.runtime_version !== SKILL_API_VERSION)
         throw new RuntimeFault("precondition_failed", "Dependency uses an incompatible skill API; retained source is inspectable but cannot execute");
+      if (createHash("sha256").update(dependency.source).digest("hex") !== dependency.hash)
+        throw new RuntimeFault("stale_context", "Dependency bytes do not match the immutable source hash");
       for (const nested of dependency.dependencies) visit(nested, depth + 1);
     };
     for (const dependency of dependencies) visit(dependency, 2);
@@ -278,7 +296,7 @@ export class SkillManager {
       start_key: parsed.start_key,
     });
     if (existing) return this.store.admitSkill(runId, parsed).view;
-    const { skill, armLookahead } = this.prepareStart(runId, parsed);
+    const { skill, bundle, armLookahead } = this.prepareStart(runId, parsed);
     for (const live of this.live.values()) {
       if (live.root !== live) continue;
       throw new RuntimeFault("busy", live.closing || live.controller.signal.aborted
@@ -302,7 +320,7 @@ export class SkillManager {
       if (prepared) {
         prepared.executionId = admitted.view.execution_id;
       }
-      const live = this.dispatch(admitted.view, skill, null, prepared);
+      const live = this.dispatch(admitted.view, skill, null, prepared, bundle);
       try {
         armLookahead?.(admitted.view.execution_id);
       } catch (error) {
@@ -317,7 +335,8 @@ export class SkillManager {
   }
   private preparationKey(runId: string, request: SkillStartRequest): string {
     const skill = this.store.skill(runId, request);
-    return JSON.stringify([runId, skill.skill_id, skill.version, skill.hash, skill.source, request]);
+    const bundle = request.entry === "step" ? buildExecutableModuleBundle(this.store, runId, skill) : null;
+    return JSON.stringify([runId, skill.skill_id, skill.version, skill.hash, skill.source, bundle, request]);
   }
   private async closePrepared(record: PreparedHandoff): Promise<void> {
     if (record.closing) return record.closing;
@@ -339,8 +358,8 @@ export class SkillManager {
   /** Probe only disposable state, then hold a separate compiled, never-invoked live worker. */
   async prepareResidentHandoff(runId: string, request: SkillStartRequest, predecessorId: string,
     signal?: AbortSignal, current: () => void = () => {}): Promise<PreparedResidentHandoff> {
-    const parsed = skillStartRequestSchema.parse(request), { skill } = this.prepareStart(runId, parsed);
-    if (parsed.entry !== "step" || !this.sandbox.createResidentWorker)
+    const parsed = skillStartRequestSchema.parse(request), { skill, bundle } = this.prepareStart(runId, parsed);
+    if (parsed.entry !== "step" || !bundle || !this.sandbox.createResidentWorker)
       throw new RuntimeFault("precondition_failed", "Only resident successors have prepared runtimes");
     if (createHash("sha256").update(skill.source).digest("hex") !== skill.hash)
       throw new RuntimeFault("stale_context", "Published source bytes do not match the immutable canonical hash");
@@ -366,7 +385,7 @@ export class SkillManager {
       performance.now() + Math.max(0, Date.parse(selected.deadline_at) - Date.now());
     const intentVersion = predecessor?.resident?.snapshot().intent_version ?? (selected.entry === "step" ? selected.resident?.intent_version : null) ?? null;
     const record: PreparedHandoff = {
-      slot, key, predecessorId, revision: this.handoffRevision, deadlineHostMs,
+      slot, key, bundle, predecessorId, revision: this.handoffRevision, deadlineHostMs,
       intentVersion, controller: new AbortController(), workers: new Set(), worker: null, task: Promise.resolve(),
       disposed: false, closing: null, executionId: null, timer: undefined, releaseSignal: () => {}, assertCurrent: () => {}, retired: null,
     };
@@ -398,7 +417,8 @@ export class SkillManager {
     record.timer = setTimeout(abort, Math.max(1, deadlineHostMs - performance.now()));
     let stage = "authority", faultRecorded = false;
     const preparationEvidence = () => ({ predecessor_execution_id: predecessorId,
-      skill_id: skill.skill_id, version: skill.version, source_hash: skill.hash,
+      skill_id: skill.skill_id, version: skill.version, source_hash: bundle.source_hash,
+      module_bundle: bundle as unknown as Json,
       original_deadline_host_ms: deadlineHostMs, host_clock_id: HOST_MONOTONIC_CLOCK_ID,
       host_monotonic_ms: performance.now() });
     const retainFault = (error: unknown) => {
@@ -422,7 +442,7 @@ export class SkillManager {
     record.task = Promise.resolve().then(async () => {
       record.assertCurrent();
       stage = "shadow_start";
-      const shadow = await this.sandbox.createResidentWorker!(skill.source, parsed.limits.step_ms, record.controller.signal) as ResidentPreparedWorker;
+      const shadow = await this.sandbox.createResidentWorker!(bundle, parsed.limits.step_ms, record.controller.signal) as ResidentPreparedWorker;
       record.workers.add(shadow);
       try {
         record.assertCurrent();
@@ -456,7 +476,7 @@ export class SkillManager {
       }
       record.assertCurrent();
       stage = "clean_start";
-      const clean = await this.sandbox.createResidentWorker!(skill.source, parsed.limits.step_ms, record.controller.signal) as ResidentPreparedWorker;
+      const clean = await this.sandbox.createResidentWorker!(bundle, parsed.limits.step_ms, record.controller.signal) as ResidentPreparedWorker;
       record.workers.add(clean);
       record.assertCurrent();
       record.worker = clean;
@@ -510,7 +530,11 @@ export class SkillManager {
     if (skill.validation.runtime_version !== SKILL_API_VERSION)
       throw new RuntimeFault("precondition_failed", "Program uses an incompatible skill API; retained source is inspectable but cannot execute");
     this.validateDependencies(runId, skill.dependencies);
-    return { skill, armLookahead };
+    const bundle = parsed.entry === "step" ? buildExecutableModuleBundle(this.store, runId, skill) : undefined;
+    if (parsed.entry === "run" && skill.dependencies.some(dependency => dependency.import_path !== undefined ||
+      this.store.skill(runId, dependency).entry !== "run"))
+      throw new RuntimeFault("precondition_failed", "Async run dependencies can only name semantic run children");
+    return { skill, bundle, armLookahead };
   }
   /** Fence new capabilities, settle the admitted leaf, then retain the admission guard. */
   async retireForHandoff(runId: string, request: SkillStartRequest, predecessorId: string, signal: AbortSignal | undefined): Promise<() => void> {
@@ -662,7 +686,10 @@ export class SkillManager {
     skill: SkillView,
     parent: Live | null,
     prepared?: PreparedHandoff,
+    bundle?: ExecutableModuleBundle,
   ): Live {
+    const sourceHash = view.source_hash;
+    if (sourceHash === null) throw new Error("Admitted execution is missing its source identity");
     const live: Live = {
       view,
       root: null as unknown as Live,
@@ -681,8 +708,8 @@ export class SkillManager {
       lifeId: view.life_id!,
       scope: { session_id: view.session_id!, world_id: view.world_id!, epoch: view.epoch, native_boot_id: view.native_boot_id!,
         run_id: view.run_id, run_generation: view.run_generation!, life_id: view.life_id!, space_epoch: view.space_epoch!,
-        execution_id: view.execution_id, source_hash: skill.hash },
-      invocation: { kind: "skill", execution_id: view.execution_id, source_hash: skill.hash },
+        execution_id: view.execution_id, source_hash: sourceHash },
+      invocation: { kind: "skill", execution_id: view.execution_id, source_hash: sourceHash },
       resident: null,
       deadlineHostMs: Math.min(prepared?.deadlineHostMs ?? Infinity,
         performance.now() + Math.max(0, Date.parse(view.deadline_at) - Date.now())),
@@ -712,7 +739,7 @@ export class SkillManager {
           "Skill dispatched inside its isolated execution",
         );
         this.authorize(live);
-        outcome = view.entry === "step" ? await this.runResident(live, skill, prepared) : parseGeneratedSkillResult(
+        outcome = view.entry === "step" ? await this.runResident(live, prepared, bundle) : parseGeneratedSkillResult(
           await this.sandbox.runSkill(
             skill.source,
             view.args,
@@ -770,7 +797,7 @@ export class SkillManager {
             ),
           );
           view.status = live.cleanupFailure ? "unknown" : "failed";
-          view.diagnostic = programDiagnostic(error, skill.hash);
+          view.diagnostic = programDiagnostic(error, sourceHash);
           view.error = view.diagnostic.message;
           if (!live.cleanupFailure)
             view.result = {
@@ -814,14 +841,17 @@ export class SkillManager {
     this.host.changed(false);
     return live;
   }
-  private async runResident(live: Live, skill: SkillView, prepared?: PreparedHandoff): Promise<SkillResult> {
+  private async runResident(live: Live, prepared?: PreparedHandoff, pinnedBundle?: ExecutableModuleBundle): Promise<SkillResult> {
     const view = live.view;
     if (view.entry !== "step" || !this.sandbox.createResidentWorker || !this.host.openController)
       throw new Error("Resident execution is not supported by this host");
     const adapter = this.context().adapter;
+    const bundle = prepared?.bundle ?? pinnedBundle;
+    if (!bundle || bundle.source_hash !== view.source_hash)
+      throw new RuntimeFault("stale_context", "Admitted resident realm does not match its pinned module bundle");
     const ready = prepared?.worker;
     if (prepared && !ready) throw new RuntimeFault("stale_context", "Prepared live runtime is unavailable");
-    const worker = ready ?? await this.sandbox.createResidentWorker(skill.source, view.limits.step_ms, live.controller.signal);
+    const worker = ready ?? await this.sandbox.createResidentWorker(bundle, view.limits.step_ms, live.controller.signal);
     let activated = !prepared;
     const liveWorker: ResidentPreparedWorker = {
       step: (...args) => worker.step(...args),
@@ -848,7 +878,7 @@ export class SkillManager {
     try {
       this.authorize(live);
       const options: ResidentControllerOptions = {
-        execution_id: view.execution_id, source_hash: skill.hash, controller_generation: 1,
+        execution_id: view.execution_id, source_hash: view.source_hash, controller_generation: 1,
         limits: view.limits, deadline_host_ms: live.deadlineHostMs, initial_state: view.initial_state, intent: view.args, worker: liveWorker,
         first_activation: !!prepared,
         open: (deadline, applied, effect, lifecycle, generation = 1) => this.host.openController!(view, generation, deadline, applied, effect, lifecycle),
@@ -857,7 +887,7 @@ export class SkillManager {
         },
         event: event => {
           this.store.event(view.run_id, "controller.event", event.summary, { execution_id: view.execution_id,
-            source_hash: skill.hash, author: "model", event: event as unknown as Json, gameplay_success_proof: false });
+            source_hash: view.source_hash, author: "model", event: event as unknown as Json, gameplay_success_proof: false });
           this.host.programEvent?.(view, event);
         },
         effect: (input, event) => this.host.residentEffect?.(view, input, event, adapter),
@@ -871,10 +901,11 @@ export class SkillManager {
         analysis: async (source, input, budget, signal, report) => {
           const selected = this.store.skill(view.run_id, source);
           this.compatible(selected);
-          if (selected.entry !== "analyze" || selected.hash !== source.hash || selected.source !== source.source)
+          const resolved = buildExecutableModuleBundle(this.store, view.run_id, selected);
+          if (selected.entry !== "analyze" || resolved.source_hash !== source.hash || JSON.stringify(resolved) !== JSON.stringify(source.bundle))
             throw new RuntimeFault("stale_context", "Analysis source identity is no longer current");
           if (!this.sandbox.createResidentAnalysisWorker) throw new Error("Pure analysis worker is unavailable");
-          const analysis = await this.sandbox.createResidentAnalysisWorker(source.source, Math.max(1, Math.floor(budget)), signal);
+          const analysis = await this.sandbox.createResidentAnalysisWorker(source.bundle, Math.max(1, Math.floor(budget)), signal);
           try { return await analysis.analyze(input, signal, report); }
           finally {
             try { await analysis.close(); } catch { throw new ResidentCleanupError(); }
@@ -890,10 +921,13 @@ export class SkillManager {
           this.host.sessionTask!(view, request, handle, deadline, signal, frame, generation),
         supervise: (handle, frame, generation) => this.host.superviseSessionTask!(view, handle, frame, generation),
         retireTask: (handle, reason) => this.host.retireSessionTask!(view, handle, reason),
-        record: (type, details) => this.store.event(view.run_id, type, "Control session lifecycle; no tactical or effect success claim", {
-          execution_id: view.execution_id, source_hash: skill.hash, details,
-        }),
-        restartWorker: signal => this.sandbox.createResidentWorker!(skill.source, view.limits.step_ms, signal),
+        record: (type, details) => {
+          this.store.event(view.run_id, type, "Control session lifecycle; no tactical or effect success claim", {
+            execution_id: view.execution_id, source_hash: view.source_hash, details,
+          });
+          if (type === "session.continuity_incident") this.host.executiveIncident?.(view, details);
+        },
+        restartWorker: signal => this.sandbox.createResidentWorker!(bundle, view.limits.step_ms, signal),
       }) : new ResidentController(options);
       live.resident = resident;
       live.controller.signal.addEventListener("abort", abort, { once: true });
@@ -926,8 +960,9 @@ export class SkillManager {
     const selected = this.store.skill(runId, source);
     this.compatible(selected);
     if (selected.entry !== "analyze") throw new RuntimeFault("precondition_failed", "Analysis requires an immutable pure analyze entry");
+    const bundle = buildExecutableModuleBundle(this.store, runId, selected);
     const result = await live.resident.analyze({ skill_id: selected.skill_id, version: selected.version,
-      hash: selected.hash, source: selected.source }, input, expectedVersion);
+      hash: bundle.source_hash, bundle }, input, expectedVersion);
     this.store.event(runId, "controller.analysis", "Pure analysis result; no effect or automatic intent adoption", result as unknown as Json);
     return result;
   }

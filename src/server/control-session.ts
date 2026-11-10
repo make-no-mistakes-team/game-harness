@@ -10,6 +10,8 @@ import { type ControlSessionConfig, type ExecutiveChoice, type ExecutiveSnapshot
   type ExecutiveTaskSnapshot } from "../shared/control-session.ts";
 import { GeneratedControllerResultValidationError } from "./program-diagnostics.ts";
 import { ControllerChannelFaultError } from "./controller-channel.ts";
+import { ExecutiveRawMonitor } from "./executive-incidents.ts";
+import { ResidentAnalysisLane } from "./resident-analysis.ts";
 
 interface Task {
   snapshot: ExecutiveTaskSnapshot;
@@ -65,11 +67,13 @@ export class ControlSession {
   private submittedHeld: WorldHeld = { forward: false, back: false, left: false, right: false, jump: false,
     sprint: false, sneak: false, attack: false, use: false };
   private readonly inputCaptures = new Map<string, {
-    generation: number; sequence: number; frame: MinecraftControllerFrame; input: ControllerInput;
+    generation: number; sequence: number; intentVersion: number; frame: MinecraftControllerFrame; input: ControllerInput;
   }>();
   private readonly session: ExecutiveSnapshot;
   private resultFailure: GeneratedControllerResultValidationError | null = null;
   private controllerFaultRecorded = false;
+  private readonly rawMonitor = new ExecutiveRawMonitor();
+  private readonly analysisLane: ResidentAnalysisLane;
   get failure(): GeneratedControllerResultValidationError | null { return this.resultFailure; }
 
   constructor(private readonly options: ControlSessionOptions) {
@@ -91,6 +95,11 @@ export class ControlSession {
       pending: { frames: 0, edges: 0, analysis: false }, last_input: null,
       timings: { step_ms: emptyTiming(), input_age_ms: emptyTiming() }, events: [],
       cleanup: { worker: "open", native: "open" }, session: this.session };
+    this.analysisLane = new ResidentAnalysisLane(options, this.data, this.clock, () => this.current(),
+      () => this.abort.signal.aborted, (status, reason) => {
+        if (!this.abort.signal.aborted) { this.data.status = status; this.data.reason = reason; }
+        void this.stop(reason);
+      }, () => this.notify());
   }
   snapshot(): ResidentSnapshot {
     // Bulk receipts stay in durable history, not in every 20Hz worker message.
@@ -126,10 +135,11 @@ export class ControlSession {
   }
   updateIntent(intent: Json, expectedVersion: number): number {
     if (!this.current() || expectedVersion !== this.data.intent_version) throw new Error("Stale executive intent update");
+    this.rawMonitor.clear();
     this.intent = structuredClone(intent); return ++this.data.intent_version;
   }
-  analyze(_source: ResidentAnalysisSource, _input: Json, _version: number): Promise<ResidentAnalysisResult> {
-    return Promise.reject(new Error("Use the strategic authoring lane while the executive continues; session analysis is not an effect capability"));
+  analyze(source: ResidentAnalysisSource, input: Json, version: number): Promise<ResidentAnalysisResult> {
+    return this.analysisLane.analyze(source, input, version);
   }
   private current(): boolean { return !this.abort.signal.aborted && this.options.current() && this.clock.now() < this.options.deadline_host_ms; }
   private notify(force = false, terminal = false): void {
@@ -227,6 +237,7 @@ export class ControlSession {
     });
   }
   private async retireRaw(): Promise<void> {
+    this.rawMonitor.clear();
     const raw = this.raw;
     if (!raw) return;
     this.recordControllerFault(raw);
@@ -264,6 +275,7 @@ export class ControlSession {
   private reject(reason: string): boolean { this.session.last_command_error = reason.slice(0, 1000); return true; }
   private async choose(choice: ExecutiveChoice, frame: MinecraftControllerFrame, expectedIntentVersion: number): Promise<boolean> {
     this.session.last_command_error = null;
+    if (choice.kind !== "raw") this.rawMonitor.clear();
     if (choice.kind === "raw") {
       if (this.activeTask) { const task = this.activeTask; this.change(() => this.retire(task, "Executive selected raw control")); return true; }
       if (!this.raw) {
@@ -324,7 +336,7 @@ export class ControlSession {
       }
       if (this.inputCaptures.size >= 512) throw new Error("session_input_attribution_capacity");
       this.inputCaptures.set(`${this.rawGeneration}:${submitted.sequence}`, {
-        generation: this.rawGeneration, sequence: submitted.sequence, frame, input,
+        generation: this.rawGeneration, sequence: submitted.sequence, intentVersion: expectedIntentVersion, frame, input,
       });
       if (input.kind === "world") this.submittedHeld = { ...input.held };
       this.totalEdges += expanded; this.data.counters.expanded_edges = this.totalEdges;
@@ -442,6 +454,13 @@ export class ControlSession {
       const age = Number(BigInt(ack.applied_native_ns) - BigInt(capture.frame.captured_native_ns)) / 1e6;
       this.data.timings.input_age_ms.count++; this.data.timings.input_age_ms.max = Math.max(this.data.timings.input_age_ms.max ?? 0, age);
     }
+    if (this.current() && !this.transition && this.raw && generation === this.rawGeneration &&
+      capture.intentVersion === this.data.intent_version && this.session.producer === "raw") {
+      const incident = this.rawMonitor.update(`${generation}:${this.session.behavior_generation}:${this.data.intent_version}`,
+        capture.frame, capture.input, ack, this.clock.now());
+      if (incident) this.options.record("session.continuity_incident", { ...incident, usefulness_inferred: false,
+        intent_version: this.data.intent_version, behavior_generation: this.session.behavior_generation });
+    }
     for (const [key, value] of this.inputCaptures)
       if (value.generation === generation && value.sequence < ack.sequence && value.input.kind === "world")
         this.inputCaptures.delete(key);
@@ -498,6 +517,7 @@ export class ControlSession {
   stop(reason: string): Promise<void> {
     if (this.stopTask) return this.stopTask;
     this.abort.abort(reason);
+    this.analysisLane.fence(reason);
     if (this.timer !== null) this.clock.clearTimeout(this.timer);
     if (this.deadlineTimer !== null) this.clock.clearTimeout(this.deadlineTimer);
     this.data.reason ??= reason;
@@ -510,6 +530,7 @@ export class ControlSession {
           await this.retireRaw(); this.data.cleanup.native = "retired";
         }),
         Promise.resolve().then(async () => { await this.worker.close(); this.data.cleanup.worker = "closed"; }),
+        Promise.resolve().then(async () => { await this.analysisLane.drain(); }),
         // A source/result failure is the reason for stopping, not failed cleanup.
         // Join the attempt; worker.close and exact native retirement prove drain.
         Promise.resolve().then(async () => { await this.flight?.catch(() => {}); }),
@@ -519,7 +540,7 @@ export class ControlSession {
       if (failure) {
         this.data.status = "unknown";
         if (cleanup[0]!.status === "rejected") this.data.cleanup.native = "unknown";
-        if (cleanup[1]!.status === "rejected") this.data.cleanup.worker = "unknown";
+        if (cleanup[1]!.status === "rejected" || cleanup[2]!.status === "rejected") this.data.cleanup.worker = "unknown";
       } else if (!["failed", "completed", "blocked", "yielded"].includes(this.data.status)) this.data.status = "stopped";
       if (this.controllerFaultRecorded) this.options.record("session.controller_cleanup", {
         cleanup: { ...this.data.cleanup }, original_deadline_host_ms: this.options.deadline_host_ms,

@@ -10,6 +10,7 @@ import type { Runtime } from "../src/server/runtime.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import type { ResidentLimits, ResidentSnapshot } from "../src/shared/resident.ts";
 import type { SkillExecutionView } from "../src/shared/programs.ts";
+import { singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 import type { GameAction, Json } from "../src/shared/contracts.ts";
 import { jsonSchema } from "../src/shared/primitives.ts";
 import type { MinecraftControllerFrame } from "../src/shared/minecraft.ts";
@@ -330,12 +331,12 @@ export async function runNativeResidentFixture(project: string, caps: Evaluation
     // Passive tracing around the real service only: no alternate input channel,
     // fake worker result, execution engine, source validator or cleanup owner.
     const createWorker = sandbox.createResidentWorker.bind(sandbox);
-    sandbox.createResidentWorker = async (source, stepMs, signal) => {
-      const trace: WorkerTrace = { source_sha256: createHash("sha256").update(source).digest("hex"), compile_started_at: new Date().toISOString(),
+    sandbox.createResidentWorker = async (bundle, stepMs, signal) => {
+      const trace: WorkerTrace = { source_sha256: bundle.source_hash, compile_started_at: new Date().toISOString(),
         compile_ready_at: null, compile_failure: null, close_started_at: null, close_completed_at: null, steps: [] };
       activeWorkers?.push(trace);
       let worker;
-      try { worker = await createWorker(source, stepMs, signal); trace.compile_ready_at = new Date().toISOString(); }
+      try { worker = await createWorker(bundle, stepMs, signal); trace.compile_ready_at = new Date().toISOString(); }
       catch (error) { trace.compile_failure = String(error); throw error; }
       return {
         step: async (frame, state, intent, stepSignal) => {
@@ -384,7 +385,7 @@ export async function runNativeResidentFixture(project: string, caps: Evaluation
         const candidate = store!.skills(session.runId).find(value => value.name === "P06 evaluator inactive candidate");
         requireProof(candidate?.entry === "step", "Normal source publisher did not retain the inactive selected-entry candidate");
         session.entry.inactive_candidate = candidate;
-        const candidateWorker = await sandbox!.createResidentWorker(candidate.source, 100, abort.signal);
+        const candidateWorker = await sandbox!.createResidentWorker(singletonExecutableModuleBundle(candidate.source, "step"), 100, abort.signal);
         try { session.entry.inactive_compile_completed_host_ms = performance.now(); }
         finally { await candidateWorker.close(); }
         await session.caller.call("program_inspect", { view: "history", after: 0, limit: 25 });

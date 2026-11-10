@@ -17,6 +17,7 @@ import { minecraftGoalBaselineSchema, minecraftInventoryCounts } from "./minecra
 import type { ObjectiveMetrics } from "../shared/execution-evidence.ts";
 import { confirmedRemoval, eligibleLog, objectiveMetrics, receiptedInventoryDelta, type ObjectiveMetricsReadStore } from "./objective-metrics.ts";
 import { residentReceiptSchema, type ResidentReceipt } from "./resident-evidence.ts";
+import { programExecutionHash } from "./program-modules.ts";
 export type ProgramEvidenceReadStore = ObjectiveMetricsReadStore & Pick<StoreReadQueries, "skill" | "getRun" | "skillExecution">;
 export type DetailedProgramEvidence = ProgramEvidenceView & {
   metrics: ObjectiveMetrics;
@@ -242,6 +243,7 @@ export function programEvidence(
   const confirmed = new Map<string, OwnedAction>();
   const receipted = new Map<string, OwnedAction>();
   const controllers = new Map<string, OwnedController | null>();
+  const controllerSources = new Map<string, string>();
   const retained = new Map<string, ActivityEvent | null>();
   let compatibility: z.infer<typeof programCompatibilitySchema> | null = null;
   const goals: ActivityEvent[] = [];
@@ -263,7 +265,9 @@ export function programEvidence(
             receipt.compatibility_hash === run?.compatibility_hash && owner.run_id === scope.run_id && owner.world_id === scope.world_id &&
             owner.session_id === scope.session_id && owner.epoch === scope.epoch && owner.native_boot_id === scope.native_boot_id &&
             owner.run_generation === scope.run_generation && owner.life_id === scope.life_id && owner.space_epoch === scope.space_epoch &&
-            scope.source_hash === store.skill(runId, owner).hash &&
+            scope.source_hash === (controllerSources.get(owner.execution_id) ?? (() => {
+              const hash = programExecutionHash(store, runId, owner); controllerSources.set(owner.execution_id, hash); return hash;
+            })()) &&
             receipt.input_id === `controller:${owner.execution_id}:${receipt.update.controller_generation}:${receipt.update.sequence}`) {
             controllers.set(receipt.input_id, controllers.has(receipt.input_id) ? null : { owner, receipt, event });
           }

@@ -120,12 +120,12 @@ const limits = z.object({
   max_depth: z.number(),
 });
 const skill = skillRef.extend({
-  entry: z.enum(["run", "step", "analyze"]).optional(),
+  entry: z.enum(["run", "step", "analyze", "library"]).optional(),
   name: z.string(),
   source: z.string(),
   hash: z.string(),
   card,
-  dependencies: z.array(skillRef),
+  dependencies: z.array(skillRef.extend({ import_path: z.string().optional() })),
   parent_version: z.number().nullable(),
   state: z.enum(["validated", "quarantined", "retired"]),
   validation: z.object({
@@ -137,6 +137,7 @@ const skill = skillRef.extend({
     api_version: z.number().int().positive().optional(),
     validator_version: z.number().int().positive().optional(),
     compatibility_hash: z.string().optional(),
+    runtime_features: z.array(z.literal("pure_modules_v1")).max(1).optional(),
   }),
   created_at: z.string(),
 });

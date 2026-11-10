@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { createConnection } from "node:net";
 import { types } from "node:util";
@@ -23,6 +24,68 @@ const MAX_SKILL_INPUT = MAX_INPUT + 512 * 1024;
 const MAX_SKILL_OUTPUT = MAX_OUTPUT + 20 * 1024;
 const MAX_STATE = 16 * 1024;
 const MAX_DEPTH = 32;
+
+// Keep this wire-boundary verifier aligned with shared/program-modules.ts.
+function validateModuleBundle(bundle, entry) {
+  const fail = () => { throw new Error("module_bundle"); };
+  const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
+  const exact = (value, keys) => record(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+  const digest = text => createHash("sha256").update(text, "utf8").digest("hex");
+  const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+  const validId = id => {
+    if (id === "root") return true;
+    if (typeof id !== "string" || !id.startsWith("module:") || id.length > 512) return false;
+    try {
+      const ref = JSON.parse(id.slice(7));
+      return Array.isArray(ref) && ref.length === 2 && typeof ref[0] === "string" && ref[0].length > 0 &&
+        ref[0].length <= 80 && ref[0].trim().length > 0 && Number.isSafeInteger(ref[1]) && ref[1] > 0 &&
+        id === "module:" + JSON.stringify(ref);
+    } catch { return false; }
+  };
+  if (!exact(bundle, ["schema_version", "entry", "root", "source_hash", "modules"]) || bundle.schema_version !== 1 ||
+    !["step", "analyze"].includes(bundle.entry) || bundle.entry !== entry || bundle.root !== "root" ||
+    typeof bundle.source_hash !== "string" || !/^[a-f0-9]{64}$/.test(bundle.source_hash) ||
+    !Array.isArray(bundle.modules) || bundle.modules.length < 1 || bundle.modules.length > 32 ||
+    Buffer.byteLength(JSON.stringify(bundle)) > 262144) fail();
+  const rows = new Map();
+  let bytes = 0;
+  for (const row of bundle.modules) {
+    if (!exact(row, ["id", "source", "source_hash", "imports"]) || !validId(row.id) || rows.has(row.id) ||
+      typeof row.source !== "string" || Buffer.byteLength(row.source) > 16384 || row.source_hash !== digest(row.source) ||
+      !Array.isArray(row.imports) || row.imports.length > 32) fail();
+    bytes += Buffer.byteLength(row.source);
+    if (bytes > 65536) fail();
+    const aliases = new Set();
+    for (const binding of row.imports) {
+      if (!exact(binding, ["specifier", "module_id"]) || typeof binding.specifier !== "string" ||
+        binding.specifier.length > 512 || !/^\.\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|mjs)$/.test(binding.specifier) ||
+        aliases.has(binding.specifier) || !validId(binding.module_id) || binding.module_id === "root") fail();
+      aliases.add(binding.specifier);
+    }
+    rows.set(row.id, row);
+  }
+  const active = new Set(), heights = new Map();
+  function visit(id) {
+    if (heights.has(id)) return heights.get(id);
+    const row = rows.get(id);
+    if (!row || active.has(id)) fail();
+    active.add(id);
+    let height = 1;
+    for (const binding of row.imports) height = Math.max(height, visit(binding.module_id) + 1);
+    active.delete(id);
+    if (height > 8) fail();
+    heights.set(id, height);
+    return height;
+  }
+  visit("root");
+  const modules = [...bundle.modules].sort((a, b) => compare(a.id, b.id)).map(row => ({ id: row.id,
+    source: row.source, source_hash: row.source_hash, imports: [...row.imports].sort((a, b) => compare(a.specifier, b.specifier))
+      .map(binding => ({ specifier: binding.specifier, module_id: binding.module_id })) }));
+  const hash = modules.length === 1 && modules[0].id === "root" && modules[0].imports.length === 0
+    ? digest(modules[0].source) : digest(JSON.stringify({ schema_version: 1, entry, root: "root", modules }));
+  if (heights.size !== rows.size || bundle.source_hash !== hash) fail();
+  return rows;
+}
 
 function depthIsBounded(value, depth = 0) {
   if (depth > MAX_DEPTH) return false;
@@ -225,16 +288,38 @@ async function runResidentThread() {
   const post = parentPort.postMessage.bind(parentPort);
   const exit = process.exit.bind(process);
   const entry = workerData.entry;
+  const rows = validateModuleBundle(workerData.bundle, entry);
   const context = vm.createContext(Object.create(null), {
     codeGeneration: { strings: false, wasm: false },
   });
   vm.runInContext(`const motion = (${createMotionMath.toString()})();`, context);
-  const realm = vm.runInContext("({ parse: JSON.parse, object: Object.prototype, array: Array.prototype })", context);
-  const module = new vm.SourceTextModule(workerData.source, {
-    context,
-    importModuleDynamically() { throw new Error("imports_unsupported"); },
+  const realm = vm.runInContext("({ parse: JSON.parse, object: Object.prototype, array: Array.prototype, error: Error })", context);
+  const modules = new Map(), moduleIds = new Map();
+  for (const row of rows.values()) {
+    const compiled = new vm.SourceTextModule(row.source, {
+      context, identifier: row.id,
+      // Rejections are catchable authored values: never expose an outer-realm
+      // Error (and its host Function constructor) to a module.
+      initializeImportMeta() { throw new realm.error("import_meta_unsupported"); },
+      importModuleDynamically() { throw new realm.error("dynamic_import_unsupported"); },
+    });
+    const requested = new Set(compiled.dependencySpecifiers);
+    if (requested.size !== row.imports.length || row.imports.some(binding => !requested.has(binding.specifier)))
+      throw new Error("import_closure");
+    modules.set(row.id, compiled);
+    moduleIds.set(compiled, row.id);
+  }
+  const module = modules.get("root");
+  await module.link((specifier, referencingModule, attributes = {}) => {
+    if (Object.keys(attributes.attributes ?? attributes.assert ?? {}).length !== 0)
+      throw new Error("import_attributes_unsupported");
+    const row = rows.get(moduleIds.get(referencingModule));
+    const binding = row?.imports.find(binding => binding.specifier === specifier);
+    if (!binding || !modules.has(binding.module_id)) throw new Error("undeclared_import");
+    return modules.get(binding.module_id);
   });
-  await module.link(() => { throw new Error("imports_unsupported"); });
+  if (typeof module.hasTopLevelAwait === "function" && [...modules.values()].some(compiled => compiled.hasTopLevelAwait()))
+    throw new Error("top_level_await_unsupported");
   await module.evaluate();
   const names = Object.getOwnPropertyNames(module.namespace);
   const selected = module.namespace[entry];
@@ -689,16 +774,16 @@ function runSupervisor() {
         throw new Error("protocol");
       if (!initialized) {
         if (message.type !== "resident_init" || message.id !== 0 ||
-          !exactKeys(message, ["v", "type", "id", "entry", "source"]) ||
-          !["step", "analyze"].includes(message.entry) ||
-          typeof message.source !== "string" || byteLength(message.source) > 16384)
+          !exactKeys(message, ["v", "type", "id", "entry", "bundle"]) ||
+          !["step", "analyze"].includes(message.entry))
           throw new Error("resident_init");
+        validateModuleBundle(message.bundle, message.entry);
         initialized = true;
         residentEntry = message.entry;
         expected = "resident_compiled";
         watchdog = setTimeout(fail, 15_000);
         thread = new Worker(new URL(import.meta.url), {
-          workerData: { mode: "resident", source: message.source, entry: residentEntry },
+          workerData: { mode: "resident", bundle: message.bundle, entry: residentEntry },
           execArgv: ["--experimental-vm-modules"],
           stdout: true, stderr: true,
           resourceLimits: { maxOldGenerationSizeMb: 48, stackSizeMb: 2 },

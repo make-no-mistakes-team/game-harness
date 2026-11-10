@@ -47,6 +47,7 @@ import {
   requireTierOptIn,
 } from "../src/evaluation/tiers.ts";
 import { canonicalContractJson } from "../src/server/adapter-contract.ts";
+import { singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 import {
   minecraftControllerFrameSchema,
   type MinecraftControllerFrame,
@@ -1324,7 +1325,7 @@ export async function runResidentBenchmarkSlot(
                   selectedWorker = await workBound(() => {
                     selectedWorkerCreation = sandbox!
                       .createResidentWorker(
-                        selected.source,
+                        singletonExecutableModuleBundle(selected.source, "step"),
                         protocol.step_ms,
                         abort.signal,
                       )
@@ -1935,7 +1936,7 @@ export async function runResidentBenchmarkSlot(
                     };
                     remaining();
                     inactiveWorker = await sandbox!.createResidentWorker(
-                      registered.source,
+                      singletonExecutableModuleBundle(registered.source, "step"),
                       protocol.step_ms,
                       abort.signal,
                     );

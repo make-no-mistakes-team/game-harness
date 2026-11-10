@@ -20,7 +20,8 @@ import type { Json } from "../src/shared/contracts.ts";
 import { spawn } from "node:child_process";
 import { residentActivationResultSchema, residentDecisionSchema } from "../src/shared/resident.ts";
 import { ResidentWorkerFault, type ResidentWorkerFaultOrigin } from "../src/server/sandbox.ts";
-import { MAX_SKILL_LIMITS, type SkillLimits } from "../src/shared/programs.ts";
+import { MAX_SKILL_LIMITS, type ExecutableModuleBundle, type SkillLimits } from "../src/shared/programs.ts";
+import { singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 import { controlSessionConfigSchema } from "../src/shared/control-session.ts";
 
 const cleanup: (() => Promise<void>)[] = [];
@@ -55,8 +56,8 @@ async function fixture(analysisFactory?: (budget: number) => Promise<ResidentAna
     return result;
   }, async close() { closed++; } };
   const manager = new SkillManager(store, { runSkill: hooks.runSkill ?? (async () => { finiteCalls++; throw new Error("Resident must not dispatch legacy capability execution"); }),
-    createResidentWorker: hooks.createResidentWorker ?? (async (_source, _budget, signal) => { compiled.resolve(); if (holdCompile) await finishCompile.promise; if (signal.aborted) { await worker.close(); throw new Error("compile aborted"); } return worker; }),
-    async createResidentAnalysisWorker(_source, budget) { return analysisFactory ? await analysisFactory(budget) : { analyze: async (input: Json, _signal?: AbortSignal, report?: (ms: number) => void) => { report?.(1); return input; }, close: async () => {} }; },
+    createResidentWorker: hooks.createResidentWorker ?? (async (_bundle, _budget, signal) => { compiled.resolve(); if (holdCompile) await finishCompile.promise; if (signal.aborted) { await worker.close(); throw new Error("compile aborted"); } return worker; }),
+    async createResidentAnalysisWorker(_bundle, budget) { return analysisFactory ? await analysisFactory(budget) : { analyze: async (input: Json, _signal?: AbortSignal, report?: (ms: number) => void) => { report?.(1); return input; }, close: async () => {} }; },
   }, { adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
     authorize: scope => { if (run.status !== "running" || scope.run_id !== run.run_id || scope.life_id !== run.life_id) throw new Error("scope revoked"); },
     observe: async () => { throw new Error("No ordinary observation polling in resident fixture"); },
@@ -173,7 +174,7 @@ test("ordinary named resident handoff holds admission until native retirement th
 
 // Shipped supervisor/module thread through a plain Node pipe. Docker and native
 // application are deliberately substituted, not claimed by these lifecycle tests.
-async function residentProcess(source: string, signal: AbortSignal): Promise<ResidentWorker> {
+async function residentProcess(bundle: ExecutableModuleBundle, signal: AbortSignal): Promise<ResidentWorker> {
   const executable = Bun.which("node");
   if (!executable) throw new Error("Node is required for the shipped worker fixture");
   const child = spawn(executable, [new URL("../sandbox/worker.mjs", import.meta.url).pathname, "resident", "250"],
@@ -209,7 +210,7 @@ async function residentProcess(source: string, signal: AbortSignal): Promise<Res
   cleanup.unshift(close);
   try {
     expect(await read()).toEqual({ v: 1, type: "resident_ready", id: 0 });
-    child.stdin.write(JSON.stringify({ v: 1, type: "resident_init", id: 0, entry: "step", source }) + "\n");
+    child.stdin.write(JSON.stringify({ v: 1, type: "resident_init", id: 0, entry: "step", bundle }) + "\n");
     expect(await read()).toEqual({ v: 1, type: "resident_compiled", id: 0 });
     const compute = async (type: string, frame: unknown, state: Json, intent: Json) => {
       const id = ++sequence;
@@ -227,7 +228,7 @@ async function residentProcess(source: string, signal: AbortSignal): Promise<Res
 }
 
 test("shipped worker classifies source throws independently of authored watchdog text", async () => {
-  const worker = await residentProcess("export function step(frame,state,intent){throw new Error('resident_step_watchdog transport cleanup');}",
+  const worker = await residentProcess(singletonExecutableModuleBundle("export function step(frame,state,intent){throw new Error('resident_step_watchdog transport cleanup');}", "step"),
     new AbortController().signal);
   try {
     await expect(worker.step(controllerFrameFixture() as Parameters<ResidentWorker["step"]>[0], null, null))
@@ -242,7 +243,7 @@ test("actual manager prepares both slow workers before retirement and discards s
   const f = await fixture(undefined, {}, {
     retire: async () => { retired = true; },
     createResidentWorker: async (published, _budget, signal) => {
-      if (published === candidateSource) {
+      if (published.modules.find(module => module.id === "root")?.source === candidateSource) {
         expect(retired).toBe(false);
         factories++;
         if (factories === 1) { shadowHeld.resolve(); await releaseShadow.promise; }
@@ -337,7 +338,7 @@ test("dynamically invalid canonical candidate leaves the actual manager incumben
   let badSource = "", invalidClosed = 0;
   const f = await fixture(undefined, {}, { createResidentWorker: async (published, _budget, signal) => {
     const worker = await residentProcess(published, signal);
-    return { ...worker, async close() { if (published === badSource) invalidClosed++; await worker.close(); } };
+    return { ...worker, async close() { if (published.modules.find(module => module.id === "root")?.source === badSource) invalidClosed++; await worker.close(); } };
   } });
   f.running();
   const incumbent = await f.manager.register(f.run.run_id, { entry: "step", name: "retained incumbent",
@@ -360,9 +361,9 @@ for (const failedFactory of [1, 2])
 test(`candidate startup failure in preparation worker ${failedFactory} preserves incumbent`, async () => {
   let candidateSource = "", attempts = 0, candidateClosed = 0;
   const f = await fixture(undefined, {}, { createResidentWorker: async (published, _budget, signal) => {
-    if (published === candidateSource && ++attempts === failedFactory) throw new Error("Injected startup failure");
+    if (published.modules.find(module => module.id === "root")?.source === candidateSource && ++attempts === failedFactory) throw new Error("Injected startup failure");
     const worker = await residentProcess(published, signal);
-    return { ...worker, async close() { if (published === candidateSource) candidateClosed++; await worker.close(); } };
+    return { ...worker, async close() { if (published.modules.find(module => module.id === "root")?.source === candidateSource) candidateClosed++; await worker.close(); } };
   } });
   f.running();
   const incumbent = await f.manager.register(f.run.run_id, { entry: "step", name: "startup incumbent",

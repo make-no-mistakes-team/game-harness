@@ -1323,6 +1323,46 @@ test("program_write lost source acknowledgement reuses the registered version ra
   expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
 });
 
+test("program_write durably pins local library aliases even when registration is interrupted before publication", async () => {
+  const f = fixture();
+  expect((await f.write("pure helper", "export const value = 1;", { entry: "library" })).isError).not.toBe(true);
+  const library = f.store.namedSkill(f.run.run_id, "pure helper", 1)!;
+  const input = { entry: "analyze", name: "pure consumer",
+    source: 'import {value} from "./helper.js"; export function analyze(input) { return value; }',
+    dependencies: [{ name: "pure helper", import_path: "./helper.js" }] };
+  const register = f.manager.register.bind(f.manager);
+  f.manager.register = async () => { throw new Error("Interrupted after exact dependency binding"); };
+  expect((await f.call("program_write", input, "module-binding-replay")).isError).toBe(true);
+  f.manager.register = register;
+  expect((await f.write("pure helper", "export const value = 2;", { entry: "library", based_on: 1 })).isError).not.toBe(true);
+  expect(data(await f.call("program_write", input, "module-binding-replay"))).toMatchObject({
+    name: "pure consumer", version: 1, dependencies: [{ name: "pure helper", version: 1, import_path: "./helper.js" }],
+  });
+  const root = f.store.namedSkill(f.run.run_id, "pure consumer", 1)!;
+  expect(root.dependencies).toEqual([{ skill_id: library.skill_id, version: 1, import_path: "./helper.js" }]);
+  expect(root.validation.runtime_features).toEqual(["pure_modules_v1"]);
+  expect(data(await f.call("program_write", input, "module-binding-replay"))).toMatchObject({ name: "pure consumer", version: 1 });
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
+test("ambiguous aliases and playing library substitutions cannot publish a pure consumer", async () => {
+  const f = fixture();
+  await f.write("first library", "export const value = 1;", { entry: "library" });
+  await f.write("second library", "export const value = 2;", { entry: "library" });
+  await f.write("semantic child");
+  const source = 'import {value} from "./helper.js"; export function analyze(input) { return value; }';
+  expect((await f.write("ambiguous aliases", source, { entry: "analyze", dependencies: [
+    { name: "first library", version: 1, import_path: "./helper.js" },
+    { name: "second library", version: 1, import_path: "./helper.js" },
+  ] })).isError).toBe(true);
+  expect((await f.write("playing substitution", source, { entry: "analyze", dependencies: [
+    { name: "semantic child", version: 1, import_path: "./helper.js" },
+  ] })).isError).toBe(true);
+  expect(f.store.namedSkill(f.run.run_id, "ambiguous aliases")).toBeNull();
+  expect(f.store.namedSkill(f.run.run_id, "playing substitution")).toBeNull();
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
 test("program_submit never retries an ambiguous start without a durable execution receipt", async () => {
   const f = fixture();
   let attempts = 0;

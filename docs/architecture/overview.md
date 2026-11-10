@@ -68,6 +68,8 @@ Decompose the runtime by responsibility: lifecycle/coordinator, strategic schedu
 | Game adapter | Game-specific observation permissions, capability schemas, mechanics, view, and result verification |
 | Skill manager — `skills.ts` | Durable program trees, shared budgets and checked capability broker; sandbox execution remains separate |
 | Local executive — `control-session.ts` | Life-scoped model decisions, bounded task identities/status, exact producer switching and reset-safe local recovery; no supplied gameplay policy |
+| Pure program composition — `program-modules.ts` | Exact immutable local-import closure, bounded source bundle and execution hash; no filesystem/package resolver |
+| Resident analysis — `resident-analysis.ts` | One effect-free analysis job beside either controller, cumulative evaluation accounting and actual closure join |
 | Experience library — `experience.ts` | Explicit model-scoped snapshots, useful-gameplay predicate gates, portability/world-local declarations and fresh exact-version hydration |
 | Program evidence — `program-evidence.ts` | Attributable execution/action outcomes and measured effectiveness, kept separate from compactness |
 | Trace, improvement and comparison | Bounded authorized execution evidence, durable opportunities, exact revision links and descriptive objective samples; DTOs in `src/shared/execution-evidence.ts` |

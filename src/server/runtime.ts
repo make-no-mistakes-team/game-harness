@@ -425,6 +425,17 @@ export class Runtime {
         if (event.kind === "attention") this.strategic.wake("resident_attention");
       },
       residentProgress: (execution, snapshot) => this.recordExecutiveObservation(execution, snapshot),
+      executiveIncident: (execution, details) => {
+        if (!this.executiveIncidentCurrent(execution)) return;
+        this.store.event(execution.run_id, "program.repeated_no_effect",
+          "Advisory: confirmed raw controls remained neutral or own-body motion stayed within a small region for five seconds; usefulness is not inferred", {
+            ...(details !== null && typeof details === "object" && !Array.isArray(details) ? details : {}),
+            source: "runtime_mechanical",
+            usefulness_inferred: false, execution_id: execution.execution_id, source_hash: execution.source_hash,
+            root_execution_id: execution.execution_id, root_source_hash: execution.source_hash,
+          });
+        if (this.executiveIncidentCurrent(execution)) this.strategic.wake("program_no_effect");
+      },
       residentEffect: (execution, input, event, adapter) => {
         // Retirement may arrive after run/life authority was fenced. Retain the
         // original owner's real prefix and unknown suffix without a new grant.

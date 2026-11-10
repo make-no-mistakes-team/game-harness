@@ -52,11 +52,12 @@ const skillRefSchema = z
   .object({
     skill_id: text(160),
     version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    import_path: z.string().max(512).regex(/^\.\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|mjs)$/).optional(),
   })
   .strict();
 const skillSchema: z.ZodType<SkillSpec> = z
   .object({
-    entry: z.enum(["run", "step", "analyze"]),
+    entry: z.enum(["run", "step", "analyze", "library"]),
     name: text(80),
     source: z.string(),
     card: z
@@ -320,9 +321,9 @@ function parseBody(source: string, kind: "skill" | "policy" | "guard") {
   return { fn, body: fn.body, formatterSource, locate };
 }
 
-type ProgramSourceKind = "skill" | "policy" | "guard" | "step" | "analyze";
+type ProgramSourceKind = "skill" | "policy" | "guard" | "step" | "analyze" | "library";
 
-function parseModule(source: string, kind: "step" | "analyze") {
+function parseModule(source: string, kind: "step" | "analyze" | "library") {
   const locate = (position: number) => {
     const lines = source.slice(0, position).split("\n");
     return { line: lines.length, column: (lines.at(-1)?.length ?? 0) + 1 };
@@ -335,10 +336,55 @@ function parseModule(source: string, kind: "step" | "analyze") {
     throw new ProgramValidationError([issue("invalid_syntax", "Source must be an ordinary JavaScript module.", locate(position))]);
   }
   const exports = nodes(ast.body).filter(node => node.type.startsWith("Export"));
+  const imports = nodes(ast.body).filter(node => node.type === "ImportDeclaration");
+  const selected = [...exports, ...imports];
+  for (const node of selected) {
+    if (isNode(node.source) && (typeof node.source.value !== "string" ||
+      !/^\.\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|mjs)$/.test(node.source.value)))
+      throw new ProgramValidationError([issue("forbidden_syntax", "Static imports require canonical local .js or .mjs aliases.", locate(node.start))]);
+  }
+  const feature = kind === "library" || imports.length > 0 || exports.some(node =>
+    node.type !== "ExportNamedDeclaration" || !isNode(node.declaration));
+  if (kind === "library")
+    return { fn: ast, body: ast, formatterSource: source, locate, selected, feature };
   const permitted = kind === "step" ? [kind, "activate"] : [kind];
   const names = new Set<string>();
+  const bindings = new Map<string, SyntaxNode>();
+  const importedBindings = new Set(imports.flatMap(entry => nodes(entry.specifiers).map(specifier =>
+    isNode(specifier.local) ? String(specifier.local.name) : "")));
+  for (const statement of nodes(ast.body)) {
+    const declaration = statement.type === "ExportNamedDeclaration" && isNode(statement.declaration) ? statement.declaration : statement;
+    if (declaration.type === "FunctionDeclaration" && isNode(declaration.id))
+      bindings.set(String(declaration.id.name), declaration);
+    if (declaration.type === "VariableDeclaration") for (const entry of nodes(declaration.declarations))
+      if (isNode(entry.id) && entry.id.type === "Identifier" && isNode(entry.init)) bindings.set(String(entry.id.name), entry.init);
+  }
   const valid = exports.every(selected => {
     const declaration = isNode(selected.declaration) ? selected.declaration : null;
+    if (!declaration && selected.type === "ExportNamedDeclaration") {
+      for (const specifier of nodes(selected.specifiers)) {
+        const name = isNode(specifier.exported) ? specifier.exported.name ?? specifier.exported.value : null;
+        if (typeof name !== "string" || !permitted.includes(name) || names.has(name)) return false;
+        if (!selected.source && isNode(specifier.local) && !importedBindings.has(String(specifier.local.name))) {
+          let fn = bindings.get(String(specifier.local.name));
+          const seen = new Set<string>();
+          let imported = false;
+          while (fn?.type === "Identifier") {
+            const key = String(fn.name);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            if (importedBindings.has(key)) { imported = true; break; }
+            fn = bindings.get(key);
+          }
+          if (!imported && (!fn || !functionTypes[fn.type] || fn.async || fn.generator ||
+            nodes(fn.params).length !== (kind === "step" ? 3 : 1) || nodes(fn.params).some(parameter => parameter.type !== "Identifier")))
+            return false;
+        }
+        names.add(name);
+      }
+      return true;
+    }
+    if (selected.type === "ExportAllDeclaration" && !selected.exported) return true;
     const parameters = declaration ? nodes(declaration.params) : [];
     const name = declaration && isNode(declaration.id) ? declaration.id.name : null;
     if (selected.type !== "ExportNamedDeclaration" || !declaration || typeof name !== "string" ||
@@ -347,15 +393,15 @@ function parseModule(source: string, kind: "step" | "analyze") {
       parameters.some(parameter => parameter.type !== "Identifier")) return false;
     names.add(name); return true;
   });
-  if (!valid || !names.has(kind)) {
+  if (!valid || (!names.has(kind) && !exports.some(node => node.type === "ExportAllDeclaration"))) {
     throw new ProgramValidationError([issue("invalid_entry",
       `Module requires synchronous ${kind} with ${kind === "step" ? "three" : "one"} plain parameters; step may also export activate(frame,state,intent). No other exports are allowed.`)]);
   }
-  return { fn: ast, body: ast, formatterSource: source, locate, selected: exports };
+  return { fn: ast, body: ast, formatterSource: source, locate, selected, feature };
 }
 
 function analyze(source: string, kind: ProgramSourceKind) {
-  const module = kind === "step" || kind === "analyze";
+  const module = kind === "step" || kind === "analyze" || kind === "library";
   const parsed = module ? parseModule(source, kind) : parseBody(source, kind);
   const issues: ProgramValidationIssue[] = [];
   let maximumComplexity = 1;
@@ -448,7 +494,7 @@ export async function validateProgramSource(
   context: ExecutableValidationContext,
 ): Promise<ValidatedProgramSource> {
   const compatibility = adapterCompatibility(context.descriptor, context.schemas);
-  if (kind !== "skill" && kind !== "policy" && kind !== "guard" && kind !== "step" && kind !== "analyze") {
+  if (kind !== "skill" && kind !== "policy" && kind !== "guard" && kind !== "step" && kind !== "analyze" && kind !== "library") {
     throw new ProgramValidationError([
       issue("invalid_kind", "Unsupported program kind."),
     ]);
@@ -476,7 +522,7 @@ export async function validateProgramSource(
   let canonical: string;
   try {
     const formatted = await format(analysis.formatterSource, formatterOptions);
-    if (kind === "step" || kind === "analyze") {
+    if (kind === "step" || kind === "analyze" || kind === "library") {
       canonical = formatted;
     } else {
     const formattedAst = parse(formatted, {
@@ -542,7 +588,9 @@ export async function validateProgramSource(
   }
   if (issues.length) throw new ProgramValidationError(issues);
   const hash = digest(canonical);
-  const fingerprint = programFingerprint(hash, kind, compatibility.compatibility_hash);
+  const runtimeFeatures: SkillView["validation"]["runtime_features"] =
+    "feature" in analysis && analysis.feature ? ["pure_modules_v1"] : undefined;
+  const fingerprint = programFingerprint(hash, kind, compatibility.compatibility_hash, undefined, runtimeFeatures);
   return {
     source: canonical,
     hash,
@@ -552,6 +600,7 @@ export async function validateProgramSource(
       formatted_lines: lines,
       complexity: analysis.complexity,
       nesting: analysis.nesting,
+      ...(runtimeFeatures ? { runtime_features: runtimeFeatures } : {}),
     },
   };
 }
@@ -564,8 +613,9 @@ export async function validateSkill(
   if (!parsed.success)
     throw new ProgramValidationError(metadataIssues(parsed.error));
   const dependencies = new Set<string>();
+  const aliases = new Set<string>();
   for (const dependency of parsed.data.dependencies) {
-    const key = JSON.stringify([dependency.skill_id, dependency.version]);
+    const key = JSON.stringify([dependency.import_path ?? null, dependency.skill_id, dependency.version]);
     if (dependencies.has(key)) {
       throw new ProgramValidationError([
         {
@@ -578,10 +628,20 @@ export async function validateSkill(
       ]);
     }
     dependencies.add(key);
+    if (dependency.import_path !== undefined) {
+      if (parsed.data.entry === "run" || aliases.has(dependency.import_path))
+        throw new ProgramValidationError([issue("invalid_dependencies", "Import aliases must be unique and cannot be used by async run bodies.")]);
+      aliases.add(dependency.import_path);
+    } else if (parsed.data.entry === "analyze" || parsed.data.entry === "library") {
+      throw new ProgramValidationError([issue("invalid_dependencies", "Pure analyze and library dependencies require explicit local import aliases.")]);
+    }
   }
-  if (parsed.data.entry === "analyze" && parsed.data.dependencies.length)
-    throw new ProgramValidationError([{ ...issue("invalid_dependencies", "Pure analyze modules cannot call playing dependencies."), path: "dependencies" }]);
   const program = await validateProgramSource(parsed.data.source, parsed.data.entry === "run" ? "skill" : parsed.data.entry, context);
+  if (aliases.size && !program.validation.runtime_features) {
+    program.validation.runtime_features = ["pure_modules_v1"];
+    program.validation.fingerprint = programFingerprint(program.hash, parsed.data.entry === "run" ? "skill" : parsed.data.entry,
+      program.validation.compatibility_hash!, undefined, program.validation.runtime_features);
+  }
   return {
     ...parsed.data,
     source: program.source,
@@ -590,11 +650,13 @@ export async function validateSkill(
 }
 
 /** Recheck cached validation without rerunning parsing/formatting or changing immutable history. */
-export function programFingerprint(hash: string, kind: ProgramSourceKind | "jev", compatibilityHash: string, choices?: unknown): string {
+export function programFingerprint(hash: string, kind: ProgramSourceKind | "jev", compatibilityHash: string, choices?: unknown,
+  runtimeFeatures?: SkillView["validation"]["runtime_features"]): string {
   return contractHash({ validator: 5, runtime: 5, skill_api: SKILL_API_VERSION,
     comments: "permitted", structural_metrics: "descriptive_not_admission_limits", kind,
     ...((kind === "step" || kind === "analyze") ? { pure_math: "motion.turn/native-tick-cubic-v1" } : {}),
     parser: acornVersion, formatter: prettierVersion, formatterOptions, limits: PROGRAM_LIMITS,
     forbiddenAmbient: [...forbiddenAmbient], forbiddenSyntax: Object.keys(forbiddenSyntax), hash,
-    compatibility_hash: compatibilityHash, ...(choices === undefined ? {} : { choices }) });
+    compatibility_hash: compatibilityHash, ...(choices === undefined ? {} : { choices }),
+    ...(runtimeFeatures?.length ? { runtime_features: runtimeFeatures } : {}) });
 }

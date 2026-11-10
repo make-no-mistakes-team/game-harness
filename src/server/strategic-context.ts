@@ -10,6 +10,7 @@ import { effectInvocationSchema, effectScopeSchema, identitySchema, safeCounterS
 import { revocationAckSchema } from "../shared/controller.ts";
 import { confirmedMinecraftGuiTransactions } from "../shared/minecraft.ts";
 import { residentReceiptSchema, type ResidentReceipt } from "./resident-evidence.ts";
+import { programExecutionHash } from "./program-modules.ts";
 
 // Supplement only: the root prompt, current authorized observation, active SDK
 // tool/result pairs and the existing 8 KiB turn feedback have their own bounds.
@@ -395,7 +396,7 @@ export class StrategicContext {
     if (owner.world_id !== scope.world_id || owner.session_id !== scope.session_id || owner.epoch !== scope.epoch ||
         owner.native_boot_id !== scope.native_boot_id || owner.run_generation !== scope.run_generation ||
         owner.life_id !== scope.life_id || owner.space_epoch !== scope.space_epoch) return false;
-    return this.store.skill(run.run_id, owner).hash === scope.source_hash;
+    return programExecutionHash(this.store, run.run_id, owner) === scope.source_hash;
   }
 
   private residentReceipt(run: StoredRun, event: ActivityEvent): ResidentReceipt | null {
@@ -656,7 +657,7 @@ export class StrategicContext {
           execution.resident?.status === "failed" || execution.resident?.status === "unknown" ||
           execution.world_id !== run.world_id || execution.compatibility_hash !== run.compatibility_hash) continue;
       const program = this.store.skill(run.run_id, execution);
-      if (program.hash !== execution.source_hash) continue;
+      if (programExecutionHash(this.store, run.run_id, program) !== execution.source_hash) continue;
       add(program);
       if (candidates.length) { recentResident = execution; break; }
     }
@@ -665,7 +666,7 @@ export class StrategicContext {
     for (const entry of workspace.catalog(0, 3).records) add(this.store.namedSkill(run.run_id, entry.name, entry.version));
     const contracts = {
       api_version: SKILL_API_VERSION,
-      body: "run: async BODY(game,args), return {status:'completed'|'blocked'|'failed',summary,result}. step/analyze: one synchronous export step(frame,state,intent) or analyze(input). No imports/packages/host APIs. Await one capability at a time. Exact formats/limits remain in the root prompt and help programs/controller.",
+      body: "run: async BODY(game,args), return {status:'completed'|'blocked'|'failed',summary,result}; await one capability at a time. step/activate(frame,state,intent) and analyze(input) are synchronous. Pure library imports require dependencies with exact local import_path aliases; no packages/dynamic imports/host APIs. Exact formats/limits remain in the root prompt and help programs/controller.",
       programs: "Immutable named versions. Existing name requires based_on latest. Write saves only; ordinary-only program_submit explicitly writes and starts that exact version through ordinary admission; program_run starts existing. Dependencies are pinned. Validation is not gameplay proof; completed program is not task success.",
       freshness: "Retained source/docs and model-authored state are historical reference only, never authority or gameplay proof. Worksite/local positions require fresh reacquisition. Current authorized observation, especially inventory, and later observe results outrank notes. Life/session/boot/space changes discard current dynamic notes; explicit world-local objective/worksite notes and no-replay uncertainty remain historical with original scope. Task/world/fresh-run changes discard experience. Program argument samples/outcomes are sanitized historical examples, never restored inputs or recommendations to rerun blocked/unknown procedures. Resolve fresh targets and construct current args; no target handles, roots, effects or execution state are restored.",
       recovery: "Known settled failure with current authority permits fresh observation and an authored changed selection. Unknown/cancelled/reconnect fence and reconcile; emitter closure and fresh state do not prove old effects absent.",

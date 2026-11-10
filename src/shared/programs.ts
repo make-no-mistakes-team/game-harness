@@ -9,11 +9,30 @@ import type { LookaheadConfig } from "./planning.ts";
 import type { ControllerEvent, ResidentLimits, ResidentSnapshot } from "./resident.ts";
 import type { ControlSessionConfig } from "./control-session.ts";
 
-export type ProgramEntry = "run" | "step" | "analyze";
+export type ProgramEntry = "run" | "step" | "analyze" | "library";
 
 export interface SkillRef {
   skill_id: string;
   version: number;
+}
+
+/** A local ESM import is pinned to this exact immutable definition. */
+export interface SkillDependency extends SkillRef {
+  import_path?: string;
+}
+
+/** Pure modules share one watched realm; they never acquire playing capabilities. */
+export interface ExecutableModuleBundle {
+  schema_version: 1;
+  entry: "step" | "analyze";
+  root: "root";
+  source_hash: string;
+  modules: {
+    id: string;
+    source: string;
+    source_hash: string;
+    imports: { specifier: string; module_id: string }[];
+  }[];
 }
 
 export const SKILL_API_VERSION = 5;
@@ -60,7 +79,7 @@ export interface SkillSpec {
   name: string;
   source: string;
   card: StrategyCard;
-  dependencies: SkillRef[];
+  dependencies: SkillDependency[];
 }
 
 export interface SkillView extends SkillRef {
@@ -70,7 +89,7 @@ export interface SkillView extends SkillRef {
   source: string;
   hash: string;
   card: StrategyCard;
-  dependencies: SkillRef[];
+  dependencies: SkillDependency[];
   parent_version: number | null;
   state: "validated" | "quarantined" | "retired";
   validation: {
@@ -82,6 +101,7 @@ export interface SkillView extends SkillRef {
     api_version?: number;
     validator_version?: number;
     compatibility_hash?: string;
+    runtime_features?: ("pure_modules_v1")[];
   };
   created_at: string;
 }

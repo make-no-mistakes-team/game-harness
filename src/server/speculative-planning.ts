@@ -524,7 +524,8 @@ export class SpeculativePlanning {
     const scope = this.host.admissionContext();
     if (!scope || !skill.entry || skill.validation.runtime_version !== 5 || skill.validation.api_version !== 5 || skill.validation.validator_version !== 5 ||
       skill.validation.compatibility_hash !== scope.compatibility_hash ||
-      skill.validation.fingerprint !== programFingerprint(skill.hash, skill.entry === "run" ? "skill" : skill.entry, scope.compatibility_hash))
+      skill.validation.fingerprint !== programFingerprint(skill.hash, skill.entry === "run" ? "skill" : skill.entry,
+        scope.compatibility_hash, undefined, skill.validation.runtime_features))
       throw new RuntimeFault("precondition_failed", "Selected cached executable contract is incompatible");
     if (createHash("sha256").update(skill.source).digest("hex") !== skill.hash)
       throw new RuntimeFault("stale_context", "Selected program source does not match its immutable hash");

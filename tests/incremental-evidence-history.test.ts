@@ -534,6 +534,28 @@ function expectNoFiniteAction(row: DetailedProgramEvidence) {
   expect(row.metrics.motion_receipts).toBe(0);
   expect(row.metrics.evidence_event_seqs).toEqual([]);
 }
+test("imported resident realm receipts retain goal attribution after a newer library and Store reopen", async () => {
+  const f = new EvidenceFixture("craft_crafting_table");
+  const library = await f.manager.register(f.run.run_id, { entry: "library", name: "pure receipt helper",
+    source: "export function step(frame,state,intent) { return null; }", card, dependencies: [] });
+  const root = await f.manager.register(f.run.run_id, { entry: "step", name: "imported resident",
+    source: 'export { step } from "./helper.js";', card,
+    dependencies: [{ skill_id: library.skill_id, version: library.version, import_path: "./helper.js" }] });
+  const owner = f.admit(root, 0, "step");
+  expect(owner.source_hash).not.toBe(root.hash);
+  const facts = at(10, () => retainResidentReceipt(f.store, adapter, owner, screenInput, residentUpdate));
+  const read = f.possession(owner, { crafting_table: 1 }), goal = f.verdict([...facts, read]);
+  f.close(owner);
+  await f.manager.register(f.run.run_id, { entry: "library", name: library.name,
+    source: "export function step(frame,state,intent) { return state; }", card, dependencies: [] });
+  await f.reopen(); await f.prepare();
+  const evidence = measured(await f.published(), owner);
+  expect(evidence).toMatchObject({ evidence_status: "verified_goal", verified_event_seqs: [goal.event_seq],
+    goal_associations: [expect.objectContaining({ relationship: "direct_receipt",
+      controller_input: { input_id: `controller:${owner.execution_id}:1:7`, generation: 1, sequence: 7 } })] });
+  expectNoFiniteAction(evidence);
+});
+
 for (const reopenBefore of [false, true]) {
   test(`incremental evidence interval backdating, inclusive close and duplicate request IDs (reopen=${reopenBefore})`, async () => {
     const f = new EvidenceFixture(),

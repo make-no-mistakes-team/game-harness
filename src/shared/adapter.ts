@@ -19,6 +19,7 @@ export const adapterBindingSchema = programCompatibilitySchema.extend({ native_b
 export const activeExecutableValidationSchema = z.object({ api_version: z.literal(5), validator_version: z.literal(5), runtime_version: z.literal(5),
   compatibility_hash: sha256Schema, fingerprint: sha256Schema, formatted_lines: safeCounterSchema,
   complexity: safeCounterSchema, nesting: safeCounterSchema,
+  runtime_features: z.array(z.literal("pure_modules_v1")).max(1).optional(),
 }).strict() satisfies z.ZodType<ActiveExecutableValidation>;
 export const historicalExecutableValidationSchema = z.object({ runtime_version: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
   fingerprint: z.string(), api_version: safeCounterSchema.optional(), validator_version: safeCounterSchema.optional(),

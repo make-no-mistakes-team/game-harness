@@ -24,7 +24,9 @@ import type {
   SkillCapabilityRequest,
   SkillLimits,
   SkillResult,
+  ExecutableModuleBundle,
 } from "../shared/programs.ts";
+import { assertExecutableModuleBundle } from "../shared/program-modules.ts";
 import type {
   ProgramBranchTrace,
   ProgramInstrumentation,
@@ -277,7 +279,7 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
     this.name = `gameharness-policy-${owner}-${randomUUID()}`;
   }
 
-  async start(source?: string, binding: "policy" | "guard" | "step" | "analyze" = "policy",
+  async start(source?: string | ExecutableModuleBundle, binding: "policy" | "guard" | "step" | "analyze" = "policy",
     budget = 0, signal?: AbortSignal): Promise<void> {
     try {
       if (this.closing) throw new Error("Sandbox worker is closed.");
@@ -329,7 +331,7 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
       if (source !== undefined) {
         if (this.residentEntry)
           await this.request("resident_compiled", { v: 1, type: "resident_init", id: 0,
-            source, entry: this.residentEntry }, STARTUP_MS, 0);
+            bundle: source, entry: this.residentEntry }, STARTUP_MS, 0);
         else await this.request("compiled", { type: "init", source, binding }, STARTUP_MS);
       }
       if (this.closing || signal?.aborted) throw new Error("Sandbox worker was cancelled during startup.");
@@ -1245,25 +1247,26 @@ export class SandboxService {
     return worker;
   }
 
-  async createResidentWorker(source: string, stepMs: number, signal: AbortSignal): Promise<ResidentWorker> {
-    return await this.createResident(source, "step", stepMs, signal);
+  async createResidentWorker(bundle: ExecutableModuleBundle, stepMs: number, signal: AbortSignal): Promise<ResidentWorker> {
+    return await this.createResident(bundle, "step", stepMs, signal);
   }
 
-  async createResidentAnalysisWorker(source: string, jobMs: number, signal: AbortSignal): Promise<ResidentAnalysisWorker> {
-    return await this.createResident(source, "analyze", jobMs, signal);
+  async createResidentAnalysisWorker(bundle: ExecutableModuleBundle, jobMs: number, signal: AbortSignal): Promise<ResidentAnalysisWorker> {
+    return await this.createResident(bundle, "analyze", jobMs, signal);
   }
 
-  private async createResident(source: string, entry: "step" | "analyze", budget: number,
+  private async createResident(bundle: ExecutableModuleBundle, entry: "step" | "analyze", budget: number,
     signal: AbortSignal): Promise<DockerPolicyWorker> {
     if (this.closed || this.state.status !== "ready")
       throw new Error("Prepare the Docker sandbox before creating a resident worker.");
-    if (typeof source !== "string" || Buffer.byteLength(source, "utf8") > 16384)
-      throw new Error("Resident source exceeds its size limit.");
+    assertResidentInput(bundle);
+    assertExecutableModuleBundle(bundle, entry);
+    encode({ v: 1, type: "resident_init", id: 0, bundle, entry }, INPUT_BYTES);
     if (!Number.isSafeInteger(budget) || budget < 1 || budget > (entry === "step" ? 500 : 5000))
       throw new Error("Resident computation budget must be finite and within its maximum.");
     if (signal.aborted) throw new Error("Resident worker was cancelled.");
     const worker = this.allocate();
-    await worker.start(source, entry, budget, signal);
+    await worker.start(bundle, entry, budget, signal);
     return worker;
   }
 

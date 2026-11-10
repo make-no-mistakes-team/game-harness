@@ -38,12 +38,13 @@ export class ProgramOperations {
       });
     };
     if (!pinned) assertParent();
-    const dependencies = pinned?.dependencies ?? z.array(skillRefSchema).parse(this.store.bindToolCall(this.run.run_id, callId,
+    const dependencies = pinned?.dependencies ?? z.array(skillRefSchema.extend({ import_path: z.string().optional() }).strict()).parse(this.store.bindToolCall(this.run.run_id, callId,
       { tool: "program_write", input } as unknown as Json, () => {
         commit();
         return input.dependencies.map((selector) => {
           const dependency = this.workspace.select(selector, true);
-          return { skill_id: dependency.skill_id, version: dependency.version };
+          return { skill_id: dependency.skill_id, version: dependency.version,
+            ...(selector.import_path === undefined ? {} : { import_path: selector.import_path }) };
         });
       }));
     if (input.reason && !previous) throw new RuntimeFault("invalid_request", "A candidate experiment reason requires an actual revision of an existing program");
@@ -98,7 +99,8 @@ export class ProgramOperations {
         }) as unknown as { decision: "revise"; measured: boolean; reason: string };
     }
     return { name: program.name, version: program.version, entry: program.entry, state: program.state, purpose: program.card.purpose,
-      dependencies: input.dependencies.map((selector, index) => ({ name: selector.name, version: dependencies[index]!.version })),
+      dependencies: input.dependencies.map((selector, index) => ({ name: selector.name, version: dependencies[index]!.version,
+        ...(selector.import_path === undefined ? {} : { import_path: selector.import_path }) })),
       experiment: experiment ? { ...experiment, qualification: "candidate_not_proven_improvement" } : null };
   }
 

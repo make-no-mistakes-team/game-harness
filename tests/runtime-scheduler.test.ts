@@ -39,7 +39,7 @@ afterEach(async () => {
   }
 });
 
-async function repeatedNoEffectFixture(executive = false) {
+async function repeatedNoEffectFixture(executive: boolean | "raw" = false) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-no-effect-")), store = new Store(directory);
   const adapter = minecraftTestAdapter(), observation = minecraftObservationFixture(adapter);
   const state: GameState = { status: "connected", username: "Fixture", version: "1.21.4", world_id: observation.world_id,
@@ -51,18 +51,44 @@ async function repeatedNoEffectFixture(executive = false) {
   let result: GameActionResult = { status: "succeeded", summary: "Explicit neutral outcome",
     evidence: { world_effect_emitted: false, neutralized: true, camera_changed: false } };
   let settle: (() => Promise<GameActionResult>) | null = null, nativeCalls = 0, aborts = 0, sample = 0;
+  const rawInput = { kind: "world" as const, held: { forward: true, back: false, left: false, right: false, jump: false,
+    sprint: false, sneak: false, attack: false, use: false }, view: { kind: "unchanged" as const }, selected_hotbar: null };
+  const sampleFrame = async () => {
+    const frame = controllerFrameFixture(observation.life.life_id, observation.space.space_epoch);
+    frame.frame_seq = ++sample; frame.native_tick = sample; frame.captured_native_ns = String(sample * 50000000);
+    frame.dynamic_entities.native_tick = sample; frame.dynamic_entities.captured_native_ns = frame.captured_native_ns;
+    frame.inventory.captured_native_ns = frame.captured_native_ns;
+    if (executive === "raw") { frame.player.on_ground = true; frame.player.in_water = false; }
+    return frame;
+  };
   const game: GameBridge = {
     connect: async () => {}, disconnect: async () => {}, snapshot: () => state, observe: async () => observation,
     execute: async () => { nativeCalls++; return settle ? await settle() : result; },
     cancel: async () => {}, neutralize: async () => {}, emergencyStop: async () => {},
     adapter: () => adapter, subscribe: () => () => {},
-    openController: async () => { throw new Error("Observe-only executive must not acquire raw input"); },
-    queryCapability: async () => {
-      const frame = controllerFrameFixture(observation.life.life_id, observation.space.space_epoch);
-      frame.frame_seq = ++sample; frame.native_tick = sample; frame.captured_native_ns = String(sample * 50000000);
-      frame.dynamic_entities.native_tick = sample; frame.dynamic_entities.captured_native_ns = frame.captured_native_ns;
-      return jsonSchema.parse(frame);
+    openController: async (reservation, generation, _deadline, applied) => {
+      if (executive !== "raw") throw new Error("Observe-only executive must not acquire raw input");
+      const owner = { operation_id: reservation.operation_id, generation: 1, scope: reservation.scope };
+      let sequence = 0, revoked = false;
+      return {
+        owner, controllerGeneration: generation, sample: async () => jsonSchema.parse(await sampleFrame()),
+        renew: async () => {},
+        submit(_frame, input) {
+          if (revoked || input.kind !== "world") throw new Error("Unexpected fixture input");
+          const current = ++sequence;
+          queueMicrotask(() => applied({ controller_generation: generation, sequence: current, ordered_edge_prefix: 0,
+            applied_native_tick: sample, applied_native_ns: String(sample * 50000000), held: { ...input.held },
+            applied_pose: { yaw_radians: 0, pitch_radians: 0 }, input_application: "confirmed", reason: null }));
+          return { sequence: current, status: "submitted", reason: null };
+        },
+        snapshot: () => ({ fenced: revoked, retired: revoked, submitted_sequence: sequence, applied_sequence: sequence,
+          ordered_edge_prefix: 0, pending_frames: 0, pending_edges: 0, last_input: null, reason: null, fault: null }),
+        revoke: async () => { revoked = true; return { owner, controller_generation: generation, admission_revoked: true,
+          last_applied_sequence: sequence, ordered_edge_prefix: 0, retirement_applied_native_tick: sample,
+          retirement_applied_native_ns: String(sample * 50000000), input_application: "confirmed", unresolved_operation_refs: [] }; },
+      };
     },
+    queryCapability: async () => jsonSchema.parse(await sampleFrame()),
   };
   const contexts: Record<string, any>[] = [];
   let tools: AgentTool[] = [];
@@ -79,7 +105,7 @@ async function repeatedNoEffectFixture(executive = false) {
         const written = await tools.find(tool => tool.name === "program_write")!.execute("no-effect-write", {
           ...(executive ? { entry: "step" } : {}),
           name: "Neutral repeated actions", source: executive
-            ? 'export function step(frame,state,intent){return {choice:{kind:"observe"},next_state:state,status:"running",events:[]};} export function activate(frame,state,intent){return step(frame,state,intent);}'
+            ? `export function step(frame,state,intent){return {choice:${JSON.stringify(executive === "raw" ? { kind: "raw", input: rawInput } : { kind: "observe" })},next_state:state,status:"running",events:[]};} export function activate(frame,state,intent){return step(frame,state,intent);}`
             : 'for (let i=0;i<64;i++) { await game.action({kind:"look",yaw:0,pitch:0}); } return {status:"completed",summary:"Finite neutral observations",result:null};',
           dependencies: [], card: { purpose: "Inspect repeated neutral outcomes", applicability: "Fixture",
             method: "Finite identical neutral requests", reason: "Mechanical diagnostic regression", limitations: "No gameplay claim" },
@@ -103,7 +129,7 @@ async function repeatedNoEffectFixture(executive = false) {
     createResidentAnalysisWorker: async () => { throw new Error("Observe-only fixture does not request analysis"); },
     createResidentWorker: async () => {
       ready.resolve(async () => { throw new Error("Observe-only executive has no async capability"); });
-      const decision = async () => ({ choice: { kind: "observe" as const }, next_state: null,
+      const decision = async () => ({ choice: executive === "raw" ? { kind: "raw" as const, input: rawInput } : { kind: "observe" as const }, next_state: null,
         status: "running" as const, events: [] });
       return { activate: decision, step: decision, close: async () => {} };
     },
@@ -170,6 +196,21 @@ test("observe-only executive requests one ordinary decision without inventing ef
   })]));
   expect(fixture.diagnostics()).toHaveLength(1);
   expect(fixture.diagnostics()[0]!.details).not.toHaveProperty("world_effect_emitted");
+  expect(fixture.store.latestRootExecution(fixture.run.run_id)).toMatchObject({ status: "running", ended_at: null });
+  expect(fixture.counts()).toEqual({ nativeCalls: 0, aborts: 0 });
+}, 15000);
+
+test("confirmed stationary raw motion wakes ordinary repair without stopping the executive or supplying movement", async () => {
+  const fixture = await repeatedNoEffectFixture("raw");
+  await fixture.finished();
+  expect(fixture.contexts).toHaveLength(2);
+  expect(fixture.contexts[1]).toMatchObject({ reason: ["program_no_effect"], pending_decision: true });
+  expect(fixture.contexts[1]!.feedback).toEqual(expect.arrayContaining([expect.objectContaining({
+    type: "program.repeated_no_effect", details: expect.objectContaining({
+      reason: "executive_raw_motion_stationary", usefulness_inferred: false, elapsed_native_ms: 5000,
+    }),
+  })]));
+  expect(fixture.diagnostics()).toHaveLength(1);
   expect(fixture.store.latestRootExecution(fixture.run.run_id)).toMatchObject({ status: "running", ended_at: null });
   expect(fixture.counts()).toEqual({ nativeCalls: 0, aborts: 0 });
 }, 15000);

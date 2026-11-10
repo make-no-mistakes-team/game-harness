@@ -194,10 +194,16 @@ function feedbackEntry(event: ActivityEvent, workspace: ProgramWorkspace): Json 
   }
   if (event.type === "program.repeated_no_effect") {
     for (const key of ["source", "usefulness_inferred", "count", "world_effect_emitted", "neutralized",
-      "elapsed_host_ms", "no_input_decisions", "processed_frame_seq", "intent_version"]) {
+      "elapsed_host_ms", "elapsed_native_ms", "samples", "no_input_decisions", "processed_frame_seq", "intent_version",
+      "maximum_anchor_distance_blocks", "applied_sequence", "behavior_generation"]) {
       const value = details?.[key];
       if (typeof value === "string") selected[key] = value.slice(0, 160);
       else if (typeof value === "number" || typeof value === "boolean") selected[key] = value;
+    }
+    for (const key of ["own_position", "anchor_position"]) {
+      const position = record(details?.[key] ?? null);
+      if (position && ["x", "y", "z"].every(axis => typeof position[axis] === "number" && Number.isFinite(position[axis])))
+        selected[key] = { x: position.x!, y: position.y!, z: position.z! };
     }
   }
   for (const key of [

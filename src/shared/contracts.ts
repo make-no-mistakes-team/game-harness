@@ -59,6 +59,7 @@ export interface ActiveExecutableValidation {
   formatted_lines: number;
   complexity: number;
   nesting: number;
+  runtime_features?: ("pure_modules_v1")[];
 }
 /** Registered by trusted composition; never populated from a native hello or program arguments. */
 export interface AdapterSchemaCatalog {

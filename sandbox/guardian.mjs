@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 
 // This runs on the host, in a session separate from the backend. Generated code
 // never runs here and cannot see its EOF pipe, PIDs, or Docker control socket.
@@ -55,6 +56,68 @@ let residentFaultReported = false;
 let residentActivated = false;
 // Neither container output nor a pending host call can extend this deadline.
 const lifetimeTimer = skill ? setTimeout(stop, lifetime) : null;
+
+// Keep this wire-boundary verifier aligned with shared/program-modules.ts.
+function validateModuleBundle(bundle, entry) {
+  const fail = () => { throw new Error("module_bundle"); };
+  const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
+  const exact = (value, keys) => record(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+  const digest = text => createHash("sha256").update(text, "utf8").digest("hex");
+  const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+  const validId = id => {
+    if (id === "root") return true;
+    if (typeof id !== "string" || !id.startsWith("module:") || id.length > 512) return false;
+    try {
+      const ref = JSON.parse(id.slice(7));
+      return Array.isArray(ref) && ref.length === 2 && typeof ref[0] === "string" && ref[0].length > 0 &&
+        ref[0].length <= 80 && ref[0].trim().length > 0 && Number.isSafeInteger(ref[1]) && ref[1] > 0 &&
+        id === "module:" + JSON.stringify(ref);
+    } catch { return false; }
+  };
+  if (!exact(bundle, ["schema_version", "entry", "root", "source_hash", "modules"]) || bundle.schema_version !== 1 ||
+    !["step", "analyze"].includes(bundle.entry) || bundle.entry !== entry || bundle.root !== "root" ||
+    typeof bundle.source_hash !== "string" || !/^[a-f0-9]{64}$/.test(bundle.source_hash) ||
+    !Array.isArray(bundle.modules) || bundle.modules.length < 1 || bundle.modules.length > 32 ||
+    Buffer.byteLength(JSON.stringify(bundle)) > 262144) fail();
+  const rows = new Map();
+  let bytes = 0;
+  for (const row of bundle.modules) {
+    if (!exact(row, ["id", "source", "source_hash", "imports"]) || !validId(row.id) || rows.has(row.id) ||
+      typeof row.source !== "string" || Buffer.byteLength(row.source) > 16384 || row.source_hash !== digest(row.source) ||
+      !Array.isArray(row.imports) || row.imports.length > 32) fail();
+    bytes += Buffer.byteLength(row.source);
+    if (bytes > 65536) fail();
+    const aliases = new Set();
+    for (const binding of row.imports) {
+      if (!exact(binding, ["specifier", "module_id"]) || typeof binding.specifier !== "string" ||
+        binding.specifier.length > 512 || !/^\.\/(?:[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.(?:js|mjs)$/.test(binding.specifier) ||
+        aliases.has(binding.specifier) || !validId(binding.module_id) || binding.module_id === "root") fail();
+      aliases.add(binding.specifier);
+    }
+    rows.set(row.id, row);
+  }
+  const active = new Set(), heights = new Map();
+  function visit(id) {
+    if (heights.has(id)) return heights.get(id);
+    const row = rows.get(id);
+    if (!row || active.has(id)) fail();
+    active.add(id);
+    let height = 1;
+    for (const binding of row.imports) height = Math.max(height, visit(binding.module_id) + 1);
+    active.delete(id);
+    if (height > 8) fail();
+    heights.set(id, height);
+    return height;
+  }
+  visit("root");
+  const modules = [...bundle.modules].sort((a, b) => compare(a.id, b.id)).map(row => ({ id: row.id,
+    source: row.source, source_hash: row.source_hash, imports: [...row.imports].sort((a, b) => compare(a.specifier, b.specifier))
+      .map(binding => ({ specifier: binding.specifier, module_id: binding.module_id })) }));
+  const hash = modules.length === 1 && modules[0].id === "root" && modules[0].imports.length === 0
+    ? digest(modules[0].source) : digest(JSON.stringify({ schema_version: 1, entry, root: "root", modules }));
+  if (heights.size !== rows.size || bundle.source_hash !== hash) fail();
+  return rows;
+}
 
 function boundedJson(text) {
   let depth = 0;
@@ -219,9 +282,9 @@ process.stdin.on("data", (chunk) => {
       if (!residentInitialized) {
         if (request.type !== "resident_init" || request.id !== 0 ||
           !["step", "analyze"].includes(request.entry) ||
-          !exactKeys(request, ["v", "type", "id", "source", "entry"]) ||
-          typeof request.source !== "string" || Buffer.byteLength(request.source) > 16384)
+          !exactKeys(request, ["v", "type", "id", "bundle", "entry"]))
           throw new Error("protocol");
+        validateModuleBundle(request.bundle, request.entry);
         residentInitialized = true;
         residentEntry = request.entry;
         expected = "resident_compiled";

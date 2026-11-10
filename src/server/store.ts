@@ -30,6 +30,7 @@ import type {
   SkillView,
 } from "../shared/programs.ts";
 import { SKILL_API_VERSION } from "../shared/programs.ts";
+import { buildExecutableModuleBundle } from "./program-modules.ts";
 import type { EffectInvocation, EffectScope } from "../shared/control.ts";
 import { effectInvocationSchema, effectScopeSchema } from "../shared/control.ts";
 import { skillStartRequestSchema } from "../shared/validation.ts";
@@ -1009,6 +1010,9 @@ export class Store extends StoreReadQueries {
       if (skill.validation.runtime_version !== 5 || skill.validation.api_version !== 5 || skill.validation.validator_version !== 5 ||
         skill.validation.compatibility_hash !== request.compatibility_hash)
         throw new Error("Historical or incompatible executable validation is read-only");
+      const bundle = request.entry === "step" &&
+        (skill.validation.runtime_features?.length || skill.dependencies.some(dependency => dependency.import_path !== undefined))
+        ? buildExecutableModuleBundle(this, runId, skill) : null;
       const id = randomUUID();
       let root: SkillExecutionView | null = null;
       if (lineage) {
@@ -1071,7 +1075,7 @@ export class Store extends StoreReadQueries {
         native_boot_id: request.native_boot_id,
         run_generation: request.run_generation,
         space_epoch: request.space_epoch,
-        source_hash: skill.hash,
+        source_hash: bundle?.source_hash ?? skill.hash,
         compatibility_hash: request.compatibility_hash,
         args: request.args,
         ...(request.entry === "step"
@@ -1125,6 +1129,8 @@ export class Store extends StoreReadQueries {
           session_id: view.session_id,
           life_id: view.life_id,
           deadline_at: view.deadline_at,
+          source_hash: view.source_hash,
+          ...(bundle ? { module_bundle: bundle as unknown as Json } : {}),
         },
       );
       return { view, created: true };

@@ -309,7 +309,7 @@ export class PreparedSource {
         artifact_sha256: contract.artifact_sha256, compatibility_hash: compatibility.compatibility_hash,
         deadline_at: attempt.view.deadline_at, limits: PREPARED_START_LIMITS,
         world_state: null, observation: null, native_identity: null,
-        controller_reference: programHelp("controller", contract.adapter) };
+        controller_reference: this.help({ topic: "controller" }, contract, tools) };
       this.append(attempt, "model.prompt", prompt as unknown as Json);
       await agent.prompt(JSON.stringify(prompt));
       this.current(attempt);
@@ -433,9 +433,9 @@ export class PreparedSource {
         return task;
       },
     });
-    return [
+    const tools: AgentTool[] = [
       tool("help", "Inspect actual authored program, controller, game and action schema references. This does not observe a world.", helpSchema,
-        input => programHelp(input.topic, contract.adapter, input.kind) as unknown as Json),
+        input => this.help(input, contract, tools)),
       tool("program_write", "Save validated inactive immutable source in this fresh preparation codebook. No outcome-linked reason or playing authority.", inactivePreparedWriteSchema,
         (input, callId, requestId) => attempt.book!.write(input, callId, requestId)),
       tool("program_inspect", "Inspect named prepared catalog or exact canonical source; contains no execution or native observations.", inspectSchema,
@@ -509,6 +509,30 @@ export class PreparedSource {
             qualification: "inactive_source_only_pending_clean_compile" };
         }),
     ];
+    return tools;
+  }
+  private help(input: z.infer<typeof helpSchema>, contract: PreparationContract, tools: AgentTool[]): Json {
+    const schemas = Object.fromEntries(tools.map(tool => [tool.name, tool.parameters]));
+    const topics = ["overview", "programs", "controller", "actions", "game"];
+    const authority = "Source-only preparation. No world observation or playing authority. Only these advertised tools are callable; game/action references describe authored children after actual launch.";
+    if (input.topic === "overview") return { authority, tools: tools.map(tool => tool.name), topics, schemas } as Json;
+    if (!topics.includes(input.topic)) return { available: false, topic: input.topic, topics, authority };
+    const reference = programHelp(input.topic, contract.adapter, input.kind) as Record<string, unknown>;
+    const softwareTests = "Use program_analyze with an exact analyze wrapper importing your pinned step candidate. validate_as checks only its returned activation/decision shape. Synthetic inputs and passing shape validation are not gameplay or live admission evidence.";
+    if (input.topic === "controller" && "launch" in reference)
+      return { ...reference, authority, launch: { tool: "prepare_finish", schema: schemas.prepare_finish },
+        operations: "Save inactive source with program_write; select the exact root and finite initial state/intent/session with prepare_finish. The clean playing worker activates only after genuine launch on the first actual frame.",
+        software_tests: softwareTests } as unknown as Json;
+    if (input.topic === "programs" && "resident" in reference) {
+      const { operations: _operations, software_tests: _tests, ...resident } = reference.resident as Record<string, unknown>;
+      return { authority, schemas, body: reference.body, identifiers: reference.identifiers,
+        coverage: reference.coverage, composition: reference.composition, resident,
+        software_tests: softwareTests, world_view: reference.world_view, temporal_turn: reference.temporal_turn,
+        result: reference.result, execution_limits: reference.execution_limits,
+        limits: reference.limits, default_execution_limits: reference.default_execution_limits,
+        default_resident_limits: reference.default_resident_limits } as unknown as Json;
+    }
+    return { authority, ...reference } as unknown as Json;
   }
   private prompt(): string {
     return "You author source before any game world/client/avatar is entered. Follow the user's exact task and goal using the selected model. " +

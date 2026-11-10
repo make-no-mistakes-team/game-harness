@@ -17,11 +17,12 @@ import type { PreparationContract, PreparedSourceCandidate } from "./prepared-so
 import { adapterCompatibility, canonicalContractJson } from "./adapter-contract.ts";
 import { PreparedSourcebook, inactivePreparedWriteSchema } from "./prepared-sourcebook.ts";
 import { PreparedInference } from "./prepared-inference.ts";
-import { helpSchema, programSelectorSchema } from "./program-interface.ts";
+import { analysisValidateAsSchema, helpSchema, programSelectorSchema } from "./program-interface.ts";
 import { programHelp } from "./program-help.ts";
 import { emptyRunUsage } from "./usage.ts";
 import { PreparedSourceFault, preparationFailure } from "./prepared-source-error.ts";
 import { HOST_MONOTONIC_CLOCK_ID } from "./performance.ts";
+import { GeneratedControllerResultValidationError, parseGeneratedResidentResult } from "./program-diagnostics.ts";
 
 export interface PreparedSourceOptions {
   directory: string;
@@ -39,7 +40,8 @@ const finishSchema = programSelectorSchema.required({ version: true }).extend({ 
 type Finish = z.infer<typeof finishSchema>;
 const inspectSchema = z.discriminatedUnion("view", [z.object({ view: z.literal("catalog") }).strict(),
   programSelectorSchema.extend({ view: z.literal("source") }).strict()]);
-const analyzeSchema = programSelectorSchema.required({ version: true }).extend({ input: residentAnalysisInputSchema }).strict();
+const analyzeSchema = programSelectorSchema.required({ version: true }).extend({ input: residentAnalysisInputSchema,
+  validate_as: analysisValidateAsSchema.optional() }).strict();
 type Attempt = {
   request: PreparedStartRequest; identity: string; view: PreparedStartView; file: string;
   deadlineHostMs: number;
@@ -412,7 +414,8 @@ export class PreparedSource {
           this.current(attempt);
           if (name !== "program_write") book.complete(callId, identity, value);
           attempt.view.source_versions = book.versions; this.save(attempt);
-          return { content: [{ type: "text", text: JSON.stringify(value) }], details: value };
+          return { content: [{ type: "text", text: JSON.stringify(value) }], details: value,
+            ...(value && typeof value === "object" && "failed" in value && value.failed === true ? { isError: true } : {}) };
         } catch (error) {
           const details: Json = { failed: true, ...preparationFailure(error) };
           this.append(attempt, "tool.failed", { call_id: callId, tool: name, details });
@@ -437,7 +440,7 @@ export class PreparedSource {
         (input, callId, requestId) => attempt.book!.write(input, callId, requestId)),
       tool("program_inspect", "Inspect named prepared catalog or exact canonical source; contains no execution or native observations.", inspectSchema,
         input => input.view === "catalog" ? attempt.book!.catalog() : attempt.book!.publicSource(attempt.book!.select(input))),
-      tool("program_analyze", "Execute a disposable pure analyze module on explicitly model-authored synthetic software-test JSON. It may call imported pure functions, but cannot invoke the clean playing worker or certify gameplay.", analyzeSchema,
+      tool("program_analyze", "Execute a disposable pure analyze wrapper importing your exact step candidate on explicitly model-authored synthetic software-test JSON. Optional validate_as checks only the returned activation/decision shape, not gameplay or live acceptance. Cannot invoke the clean playing worker.", analyzeSchema,
         async input => {
           this.current(attempt);
           if (attempt.view.analysis_jobs >= PREPARED_START_LIMITS.max_analysis_jobs || attempt.view.analysis_ms >= PREPARED_START_LIMITS.max_analysis_ms)
@@ -465,8 +468,23 @@ export class PreparedSource {
             });
             this.current(attempt);
             if (elapsed === null || accountingFailure || elapsed > budget) throw new PreparedSourceFault("Invalid or over-budget trusted analysis evaluation report");
-            return { qualification: "synthetic_software_test_only", source: { name: root.name, version: root.version, hash: root.hash },
-              input: input.input, output: residentAnalysisOutputSchema.parse(result), evaluation_ms: elapsed };
+            // Only bounded plain JSON can be retained as a raw failed result.
+            // Do not serialize an invalid object while trying to explain it.
+            residentAnalysisOutputSchema.parse(result);
+            const response = { qualification: "synthetic_software_test_only",
+              source: { name: root.name, version: root.version, hash: root.hash },
+              input: input.input, output: result, evaluation_ms: elapsed };
+            try {
+              if (input.validate_as === "activation") parseGeneratedResidentResult(result, true);
+              else if (input.validate_as === "decision") parseGeneratedResidentResult(result);
+            } catch (error) {
+              if (!(error instanceof GeneratedControllerResultValidationError)) throw error;
+              const failed = { ...response, failed: true, ...preparationFailure(error) };
+              this.append(attempt, "analysis.return_validation_failed", { ...failed, realm_hash: bundle.source_hash });
+              return failed;
+            }
+            return { ...response,
+              ...(input.validate_as ? { validation: { validate_as: input.validate_as, qualification: "software_return_shape_only" } } : {}) };
           } catch (error) {
             if (error instanceof ResidentCleanupError && !worker) attempt.unreachableUnknown = true;
             throw error;
@@ -497,12 +515,13 @@ export class PreparedSource {
       "There is no initial observation, player/native identity or world state. Do not invent them or claim gameplay success. " +
       "This is a fresh source-only codebook; no prior session or cross-model experience is hydrated. Only the advertised tools are authorized. " +
       "program_write saves inactive canonical immutable source; use named versions and CAS based_on for revisions, ordinary libraries/reexports and async run children when useful. " +
-      "program_analyze runs bounded pure software tests on your explicitly synthetic input, never actual observations or qualification. " +
+      "program_analyze runs bounded pure software tests on your explicitly synthetic input, never actual observations or gameplay qualification. Optional validate_as checks only output return shape; a refusal has valid activation shape but is not accepted live activation. " +
       "Before sealing, exercise your state transitions on repeated callbacks with a pending child, then terminal success/failure/unknown bookkeeping. " +
       "Also test loss and return of rows in a partial sensing projection: absence locally is not global absence, and any retained evidence must keep its original scope/time separate from current target authority. " +
       "You choose the synthetic inputs, assertions, memory representation and behavior; no host test supplies a route, target or response. " +
       "Test repeated callbacks after a reporting/completion transition too: every diagnostic or attention event consumes the cumulative event allowance, not just attention. " +
-      "Use an analyze module importing your own pure library; catch source exceptions into compact JSON diagnostics and inspect mismatches. This is software checking, not a successful game run. " +
+      "Use an analyze wrapper importing the exact step candidate you intend to select, including its activate/step exports; test your selected initial_state and args on your own labelled synthetic inputs. Return the exact candidate result when using validate_as, rather than only a helper assertion. Catch source exceptions into compact JSON diagnostics and inspect mismatches. This is software checking, not a successful game run. " +
+      "Exercise larger permitted projections too: a complete frame can exceed the16KiB state allowance, and the host does not truncate an oversized next_state into validity. " +
       "Inspect your authored sources and actual API/schema help as needed. There is no tool for observing, playing, respawning, network or filesystem access. " +
       "Author an executive step(frame,state,intent) and explicit activate(frame,state,intent), selecting the exact root yourself with prepare_finish(args,initial_state,limits,session). " +
       "The clean playing worker is never invoked during preparation; its first activation receives the real initial frame after launch. Disposable analyze workers may test imported functions on labelled synthetic data. " +

@@ -14,6 +14,7 @@ import type { programInspectSchema, programReviewSchema, programRunSchema, progr
 import { programSelectorSchema } from "./program-interface.ts";
 import { skillRefSchema } from "../shared/validation.ts";
 import { policyRefSchema } from "./reactive.ts";
+import { GeneratedControllerResultValidationError, parseGeneratedResidentResult, programDiagnostic } from "./program-diagnostics.ts";
 
 const exactNamedProgramSchema = programSelectorSchema.required({ version: true });
 const executionControlSchema = z.object({ execution_id: z.string().nullable(), plan_id: z.string().nullable() }).strict();
@@ -316,8 +317,23 @@ export class ProgramOperations {
         }));
       if (!first) return { status: "unknown", reason: "Original pure analysis result was not acknowledged; inspect retained analysis events. It is never dispatched again." };
       const result = await this.skills.analyzeResident(this.run.run_id, selected.execution_id, selected.source, input.input, input.expected_intent_version);
-      this.store.completeToolCall(this.run.run_id, resultKey, identity, result as unknown as Json);
-      return result;
+      let receipt: Json = result as unknown as Json;
+      if (result.status === "completed" && input.validate_as) {
+        try {
+          if (input.validate_as === "activation") parseGeneratedResidentResult(result.output, true);
+          else parseGeneratedResidentResult(result.output);
+          receipt = { ...result, validation: { validate_as: input.validate_as, qualification: "software_return_shape_only" } } as unknown as Json;
+        } catch (error) {
+          if (!(error instanceof GeneratedControllerResultValidationError)) throw error;
+          // The software evaluation completed and was accounted/drained already.
+          // Retain its raw output and failure receipt rather than redispatching it
+          // or exposing an arbitrary exception through the tool boundary.
+          receipt = { ...result, status: "failed", reason: error.message,
+            diagnostic: programDiagnostic(error, result.source.hash) } as unknown as Json;
+        }
+      }
+      this.store.completeToolCall(this.run.run_id, resultKey, identity, receipt as unknown as Json);
+      return receipt;
     }
     if (input.operation === "activate_next") {
       const planId = z.string().parse(this.store.bindToolCall(this.run.run_id, callId,

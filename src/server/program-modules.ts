@@ -107,7 +107,8 @@ export function resolveArtifactModuleClosure(catalog: ProgramArtifactCatalog, ro
       }
       if (dependency.import_path.length > 512 || !LOCAL_MODULE_ALIAS.test(dependency.import_path) || declaredAliases.has(dependency.import_path))
         fail("invalid_dependencies", "Local import aliases must be canonical and unambiguous per definition.");
-      if (selected.entry !== "library") fail("invalid_dependencies", "Imported dependencies must select pure library definitions.");
+      if (selected.entry !== "library" && !(definition.entry === "analyze" && selected.entry === "step"))
+        fail("invalid_dependencies", "Imports require pure libraries; analyze may also import an exact step definition as software.");
       declaredAliases.add(dependency.import_path);
       if (!usedAliases.has(dependency.import_path)) { check(selected); continue; }
       const moduleId = "module:" + JSON.stringify([selected.name, selected.version]);
@@ -118,7 +119,7 @@ export function resolveArtifactModuleClosure(catalog: ProgramArtifactCatalog, ro
     const locals = new Map<string, Binding>(), result = new Map<string, Binding>();
     const imported = (source: unknown) => {
       const specifier = name(source), values = aliases.get(specifier);
-      if (!LOCAL_MODULE_ALIAS.test(specifier) || !values) fail("unbound_import", "Every static import must use an explicitly pinned local library alias.");
+      if (!LOCAL_MODULE_ALIAS.test(specifier) || !values) fail("unbound_import", "Every static import must use an explicitly pinned local pure-module alias.");
       return values;
     };
     const lookup = (values: Map<string, Binding>, key: string) => {

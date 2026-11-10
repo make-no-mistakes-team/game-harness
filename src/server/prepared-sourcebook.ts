@@ -64,8 +64,10 @@ export class PreparedSourcebook implements ProgramArtifactCatalog {
       throw new PreparedSourceFault("Source revision conflicts with the latest immutable parent; inspect and explicitly select based_on");
     const dependencies = input.dependencies.map(ref => {
       const selected = this.select(ref);
-      if (ref.import_path !== undefined ? selected.entry !== "library" : input.entry !== "step" && input.entry !== "run" || selected.entry !== "run")
-        throw new PreparedSourceFault("Imports require pinned pure libraries; semantic dependencies require run children");
+      if (ref.import_path !== undefined ?
+        selected.entry !== "library" && !(input.entry === "analyze" && selected.entry === "step") :
+        input.entry !== "step" && input.entry !== "run" || selected.entry !== "run")
+        throw new PreparedSourceFault("Imports require pinned libraries or analyze-to-step software imports; semantic dependencies require run children");
       return { skill_id: selected.skill_id, version: selected.version,
         ...(ref.import_path === undefined ? {} : { import_path: ref.import_path }) };
     });

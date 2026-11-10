@@ -8,7 +8,8 @@ import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
 import { executableModuleBundleHash } from "../src/shared/program-modules.ts";
 import { buildArtifactModuleBundle, buildExecutableModuleBundle, programExecutionHash, resolveArtifactModuleClosure,
   resolveProgramModuleClosure } from "../src/server/program-modules.ts";
-import { programFingerprint, validateSkill, validateProgramSource } from "../src/server/program-validation.ts";
+import { ProgramValidationError, programFingerprint, validateSkill, validateProgramSource } from "../src/server/program-validation.ts";
+import { PreparedSourcebook } from "../src/server/prepared-sourcebook.ts";
 import { Store } from "../src/server/store.ts";
 import { executionScopeFixture, minecraftRunFixture, minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 
@@ -26,6 +27,13 @@ function fixture() {
 }
 function imported(value: SkillView, import_path = "./helper.js"): SkillDependency {
   return { skill_id: value.skill_id, version: value.version, import_path };
+}
+function validationCodes(operation: () => unknown): string[] {
+  try { operation(); } catch (error) {
+    if (error instanceof ProgramValidationError) return error.issues.map(issue => issue.code);
+    throw error;
+  }
+  return [];
 }
 
 test("trusted artifact catalogs resolve the same inline realm without inventing a run", async () => {
@@ -92,6 +100,115 @@ test("module realms pin exact library bytes and keep source identity separate fr
     start_key: "pinned-realm", ...executionScopeFixture(f.run), args: null, initial_state: null, limits: { ...DEFAULT_RESIDENT_LIMITS } });
   expect(admitted.view.source_hash).toBe(initial.source_hash);
   expect(f.store.skillExecution(f.run.run_id, { execution_id: admitted.view.execution_id })?.source_hash).toBe(initial.source_hash);
+});
+
+test("analysis pins the actual step role and its nested library versions without compiling semantic run children", async () => {
+  const f = fixture(), library = await f.save("candidate helper", "library", "export const value = 1;");
+  const child = await f.save("semantic procedure", "run", "throw new Error('Semantic source must remain inert');");
+  const candidate = await f.save("candidate", "step",
+    'import {value} from "./helper.js"; export function activate(frame,state,intent) { return value; } export function step(frame,state,intent) { return value; }',
+    [imported(library), { skill_id: child.skill_id, version: child.version }]);
+  const root = await f.save("candidate check", "analyze",
+    'import * as candidate from "./candidate.js"; export {} from "./candidate.js"; export function analyze(input) { return candidate.step(input.frame,input.state,input.intent); }',
+    [imported(candidate, "./candidate.js")]);
+  const initial = buildExecutableModuleBundle(f.store, f.run.run_id, root);
+  const newerLibrary = await f.save(library.name, "library", "export const value = 2;");
+  const newerCandidate = await f.save(candidate.name, "step", candidate.source, [imported(newerLibrary)]);
+  expect(buildExecutableModuleBundle(f.store, f.run.run_id, root)).toEqual(initial);
+  expect(initial.entry).toBe("analyze");
+  expect(initial.modules.map(module => module.id)).toEqual(['module:["candidate helper",1]', 'module:["candidate",1]', "root"]);
+  expect(initial.modules.find(module => module.id === 'module:["candidate",1]')).toMatchObject({
+    source: candidate.source, source_hash: candidate.hash,
+    imports: [{ specifier: "./helper.js", module_id: 'module:["candidate helper",1]' }],
+  });
+  expect(initial.source_hash).toBe(executableModuleBundleHash("analyze", initial.modules));
+  const revised = await f.save(root.name, "analyze", root.source, [imported(newerCandidate, "./candidate.js")]);
+  expect(revised.hash).toBe(root.hash);
+  expect(buildExecutableModuleBundle(f.store, f.run.run_id, revised).source_hash).not.toBe(initial.source_hash);
+  const catalog = { compatibility_hash: f.run.compatibility_hash!, read: (ref: SkillRef) => f.store.skill(f.run.run_id, ref) };
+  expect(buildArtifactModuleBundle(catalog, root)).toEqual(initial);
+  const relabeled = { ...candidate, validation: { ...candidate.validation,
+    fingerprint: programFingerprint(candidate.hash, "library", f.run.compatibility_hash!, undefined, candidate.validation.runtime_features) } };
+  expect(validationCodes(() => buildArtifactModuleBundle({ ...catalog, read: ref =>
+    ref.skill_id === candidate.skill_id && ref.version === candidate.version ? relabeled : catalog.read(ref) }, root))).toEqual(["invalid_modules"]);
+  const malformed = await validateProgramSource("export const step = 7;", "library", f.adapter);
+  const invalidCandidate = { ...candidate, ...malformed, dependencies: [], validation: { ...malformed.validation,
+    fingerprint: programFingerprint(malformed.hash, "step", f.run.compatibility_hash!, undefined, malformed.validation.runtime_features) } };
+  expect(validationCodes(() => buildArtifactModuleBundle({ ...catalog, read: ref =>
+    ref.skill_id === candidate.skill_id && ref.version === candidate.version ? invalidCandidate : catalog.read(ref) }, root))).toEqual(["invalid_entry"]);
+});
+
+test("prepared catalogs and store resolution admit only analyze-to-step and existing library imports", async () => {
+  const f = fixture(), book = new PreparedSourcebook(f.run.compatibility_hash!, f.adapter, () => {}, () => {});
+  let call = 0;
+  const write = (name: string, entry: SkillSpec["entry"], source: string,
+    dependencies: { name: string; version: number; import_path?: string }[] = [], based_on?: number) =>
+    book.write({ name, entry, source, dependencies, card, ...(based_on === undefined ? {} : { based_on }) }, `call-${++call}`, "request");
+  await write("pure helper", "library", "export const value = 1;");
+  await write("procedure", "run", "return null;");
+  await write("executive", "step",
+    'import {value} from "./helper.js"; export function step(frame,state,intent) { return value; }',
+    [{ name: "pure helper", version: 1, import_path: "./helper.js" }, { name: "procedure", version: 1 }]);
+  await write("check", "analyze",
+    'import {step} from "./candidate.js"; export function analyze(input) { return step(input.frame,input.state,input.intent); }',
+    [{ name: "executive", version: 1, import_path: "./candidate.js" }]);
+  const root = book.select({ name: "check", version: 1 }), initial = book.bundle(root);
+  await write("pure helper", "library", "export const value = 2;", [], 1);
+  await write("executive", "step", "export function step(frame,state,intent) { return 2; }", [], 1);
+  expect(book.bundle(root)).toEqual(initial);
+  expect(book.sources(root).map(value => [value.name, value.version])).toEqual([
+    ["pure helper", 1], ["procedure", 1], ["executive", 1], ["check", 1],
+  ]);
+  const targets = ["procedure", "executive", "check"] as const;
+  for (const entry of ["step", "library", "analyze"] as const) for (const target of targets) {
+    if (entry === "analyze" && target === "executive") continue;
+    const source = `import "./target.js"; export function ${entry === "library" ? "value" : entry}(${entry === "step" ? "frame,state,intent" : "input"}) { return null; }`;
+    await expect(write(`invalid ${entry} ${target}`, entry, source,
+      [{ name: target, version: 1, import_path: "./target.js" }])).rejects.toThrow();
+    const stored = await f.save(`invalid ${entry} ${target}`, entry, source, [imported(
+      await f.save(`target ${entry} ${target}`, book.select({ name: target, version: 1 }).entry!,
+        target === "procedure" ? "return null;" : target === "executive" ?
+          "export function step(frame,state,intent) { return null; }" : "export function analyze(input) { return input; }"), "./target.js")]);
+    expect(validationCodes(() => resolveProgramModuleClosure(f.store, f.run.run_id, stored))).toEqual(["invalid_dependencies"]);
+  }
+});
+
+test("an imported step cannot bypass pure closure count, bytes, depth or cycle bounds", async () => {
+  const f = fixture();
+  const wrap = async (candidate: SkillView, name: string) => f.save(name, "analyze",
+    'import {step} from "./candidate.js"; export function analyze(input) { return step(input,null,null); }',
+    [imported(candidate, "./candidate.js")]);
+  const libraries = await Promise.all(Array.from({ length: 31 }, (_, index) =>
+    f.save(`step helper ${index}`, "library", `export const value = ${index};`)));
+  const candidateSource = (count: number) => Array.from({ length: count }, (_, index) => `import "./h${index}.js";`).join("\n") +
+    "\nexport function step(frame,state,intent) { return state; }";
+  const candidate = await f.save("wide step", "step", candidateSource(31), libraries.map((value, index) => imported(value, `./h${index}.js`)));
+  expect(() => buildExecutableModuleBundle(f.store, f.run.run_id, candidate)).not.toThrow();
+  const excessive = await wrap(candidate, "wide check");
+  expect(validationCodes(() => buildExecutableModuleBundle(f.store, f.run.run_id, excessive))).toEqual(["module_count_limit"]);
+  const bounded = await f.save("bounded step", "step", candidateSource(30), candidate.dependencies.slice(0, 30));
+  expect(buildExecutableModuleBundle(f.store, f.run.run_id, await wrap(bounded, "bounded check")).modules).toHaveLength(32);
+  const large = await Promise.all(Array.from({ length: 5 }, (_, index) =>
+    f.save(`step large ${index}`, "library", `export const value = "${"x".repeat(15000)}";`)));
+  const oversized = await f.save("large step", "step", candidateSource(5), large.map((value, index) => imported(value, `./h${index}.js`)));
+  const oversizedRoot = await wrap(oversized, "large check");
+  expect(validationCodes(() => buildExecutableModuleBundle(f.store, f.run.run_id, oversizedRoot))).toEqual(["module_bytes_limit"]);
+  let next = libraries[0]!;
+  for (let index = 1; index <= 6; index++)
+    next = await f.save(`step depth ${index}`, "library", 'export {value} from "./helper.js";', [imported(next)]);
+  const deep = await f.save("deep step", "step", 'import "./helper.js"; export function step(frame,state,intent) { return state; }', [imported(next)]);
+  expect(buildExecutableModuleBundle(f.store, f.run.run_id, deep).modules).toHaveLength(8);
+  const deepRoot = await wrap(deep, "deep check");
+  expect(validationCodes(() => buildExecutableModuleBundle(f.store, f.run.run_id, deepRoot))).toEqual(["module_depth_limit"]);
+  const cycleOther = await f.save("step cycle peer", "library", 'export {value} from "./helper.js";', [imported(libraries[0]!)]);
+  const cyclicSource = await validateProgramSource('export {value} from "./helper.js";', "library", f.adapter);
+  const cycle = { ...libraries[0]!, ...cyclicSource, dependencies: [imported(cycleOther)] };
+  const cyclicStep = await f.save("cyclic step", "step",
+    'import "./helper.js"; export function step(frame,state,intent) { return state; }', [imported(cycleOther)]);
+  const cyclicRoot = await wrap(cyclicStep, "cyclic check");
+  const cyclic = { getRun: f.store.getRun.bind(f.store), skill: (runId: string, ref: SkillRef) =>
+    ref.skill_id === cycle.skill_id ? cycle : f.store.skill(runId, ref) };
+  expect(validationCodes(() => buildExecutableModuleBundle(cyclic, f.run.run_id, cyclicRoot))).toEqual(["module_cycle"]);
 });
 
 test("library IDs and realm hashes depend on named versions rather than Store UUIDs", async () => {

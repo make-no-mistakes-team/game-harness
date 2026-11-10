@@ -9,6 +9,8 @@ import { controllerStepResultSchema } from "../src/shared/resident.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
 import { validateProgramSource } from "../src/server/program-validation.ts";
+import { PreparedSourcebook } from "../src/server/prepared-sourcebook.ts";
+import { adapterCompatibility } from "../src/server/adapter-contract.ts";
 import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 import type { TemporalTurnOptions, TemporalTurnResult, TemporalTurnState } from "../src/shared/temporal-turn.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
@@ -128,6 +130,61 @@ test("pure nested named/default/reexports share one library singleton and fresh 
   ] });
   expect(await analyze(first, 2, {})).toMatchObject({ value: [{ count: 3 }, { count: 4 }] });
   expect(await analyze(second, 1, {})).toMatchObject({ value: [{ count: 1 }, { count: 2 }] });
+});
+
+test("validated analysis calls its exact step candidate as software without activating the separate step realm", async () => {
+  const adapter = minecraftTestAdapter(), compatibility = adapterCompatibility(adapter.descriptor, adapter.schemas);
+  const book = new PreparedSourcebook(compatibility.compatibility_hash, adapter, () => {}, () => {});
+  const card = { purpose: "Exercise exact exported software", applicability: "Synthetic JSON only", method: "Call pinned exports",
+    reason: "Return-shape regression", limitations: "No live activation or gameplay claim" };
+  await book.write({ entry: "library", name: "arithmetic", card,
+    source: "export function plus(a,b) { return a+b; }" }, "helper", "request");
+  await book.write({ entry: "run", name: "semantic only", card,
+    source: "throw new Error('A semantic child must never be compiled or executed here');" }, "semantic", "request");
+  await book.write({ entry: "step", name: "candidate", card,
+    source: `import {plus} from "./arithmetic.js";
+      let activations = 0, steps = 0;
+      function result(frame,state,intent) {
+        return {choice:{kind:"observe"},next_state:{seed:state.seed,value:plus(frame.value,intent.offset),
+          activations,steps},status:"running",events:[]};
+      }
+      export function activate(frame,state,intent) { activations++; return result(frame,state,intent); }
+      export function step(frame,state,intent) { steps++; return result(frame,state,intent); }`,
+    dependencies: [{ name: "arithmetic", version: 1, import_path: "./arithmetic.js" }, { name: "semantic only", version: 1 }],
+  }, "candidate", "request");
+  await book.write({ entry: "analyze", name: "exact check", card,
+    source: `import {activate,step} from "./candidate.js";
+      export function analyze(input) {
+        const activation = activate(input.frame,input.state,input.intent);
+        return {activation,decision:step(input.frame,activation.next_state,input.intent),game:typeof game};
+      }`,
+    dependencies: [{ name: "candidate", version: 1, import_path: "./candidate.js" }],
+  }, "check", "request");
+  const candidate = book.select({ name: "candidate", version: 1 }), root = book.select({ name: "exact check", version: 1 });
+  const bundle = book.bundle(root), stepBundle = book.bundle(candidate, true);
+  await book.write({ entry: "library", name: "arithmetic", based_on: 1, card,
+    source: "export function plus(a,b) { return 999; }" }, "helper-v2", "request");
+  await book.write({ entry: "step", name: "candidate", based_on: 1, card,
+    source: "export function step(frame,state,intent) { return null; }" }, "candidate-v2", "request");
+  const clean = await compileBundle(stepBundle), analysis = await compileBundle(book.bundle(root));
+  expect(book.bundle(root)).toEqual(bundle);
+  expect(bundle.entry).toBe("analyze");
+  expect(bundle.modules).toHaveLength(3);
+  const input = { frame: { value: 5 }, state: { seed: 7 }, intent: { offset: 3 } };
+  expect(await analyze(analysis, 1, input)).toMatchObject({ type: "resident_result", value: {
+    activation: { choice: { kind: "observe" }, next_state: { seed: 7, value: 8, activations: 1, steps: 0 } },
+    decision: { next_state: { seed: 7, value: 8, activations: 1, steps: 1 } }, game: "undefined",
+  } });
+  expect(await analyze(analysis, 2, input)).toMatchObject({ value: {
+    activation: { next_state: { activations: 2, steps: 1 } },
+    decision: { next_state: { activations: 2, steps: 2 } },
+  } });
+  // Only an explicit synthetic software frame is sent to the separate realm;
+  // no activation message or native/capability transport exists in this test.
+  clean.send({ v: 1, type: "resident_step", id: 1, ...input });
+  expect(await clean.read()).toMatchObject({ type: "resident_result", value: {
+    next_state: { seed: 7, value: 8, activations: 0, steps: 1 },
+  } });
 });
 
 test("root binding/reexports select synchronous library entry functions without leaking library exports", async () => {
@@ -643,7 +700,7 @@ test("oversize next_state in a bounded worker result is rejected by the trusted 
   catch (error) {
     expect(error).toBeInstanceOf(GeneratedControllerResultValidationError);
     if (!(error instanceof GeneratedControllerResultValidationError)) throw error;
-    expect(error.issues).toContainEqual({ path: "next_state", code: "custom" });
+    expect(error.issues).toContainEqual({ path: "next_state", code: "custom", constraint: "utf8_bytes", maximum: 16384 });
   }
 });
 

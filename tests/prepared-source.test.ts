@@ -13,6 +13,7 @@ import type { PreparedStartRequest, PreparedStartView } from "../src/shared/prep
 import { PreparedSource, type PreparedSourceOptions } from "../src/server/prepared-source.ts";
 import type { PreparedSourceCandidate } from "../src/server/prepared-source-contract.ts";
 import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
+import { residentAnalysisProcess } from "./helpers/resident-analysis-process.ts";
 
 const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
@@ -264,6 +265,85 @@ test("finite pure analysis budget admits at most eight software jobs and keeps f
   await f.owner.initialize(); await f.owner.start(f.request); await f.ready;
   expect(jobs).toBe(8); expect(f.owner.snapshot()?.analysis_jobs).toBe(8);
   expect(f.owner.snapshot()?.analysis_ms).toBe(4000); expect(f.agent().results[9]!.isError).toBe(true);
+  await f.owner.close();
+});
+
+test("source analysis validates the exact imported activation return after accounting and joins its original disposable owner", async () => {
+  const selectedSource = `export function activate(frame,state,intent) { return step(frame,state,intent); }
+    export function step(frame,state,intent) { return {choice:{kind:'observe'},
+      next_state:{memory:'é'.repeat(8192)},status:'running',events:[]}; }`;
+  const analyze = { name: "probe", version: 1, input: { frame: { synthetic: true }, state: null, intent: null }, validate_as: "activation" };
+  const calls: Call[] = [
+    { name: "program_write", args: { name: "executive", entry: "step", source: selectedSource } },
+    { name: "program_write", args: { name: "probe", entry: "analyze",
+      source: "import {activate} from './candidate.js'; export function analyze(input) { return activate(input.frame,input.state,input.intent); }",
+      dependencies: [{ name: "executive", version: 1, import_path: "./candidate.js" }] } },
+    { name: "program_analyze", id: "exact-return", args: analyze },
+    { name: "program_analyze", args: { ...analyze, validate_as: "not-a-shape" } },
+    rootCalls()[1]!,
+  ];
+  const closing = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const budgets: number[] = [];
+  let closed = 0;
+  const f = fixture(calls);
+  f.options.sandbox.createResidentAnalysisWorker = async (bundle, budget, signal) => {
+    budgets.push(budget);
+    const worker = await residentAnalysisProcess(bundle, budget, signal);
+    return { analyze: worker.analyze, async close() {
+      closing.resolve(); await release.promise; await worker.close(); closed++;
+    } };
+  };
+  await f.owner.initialize(); await f.owner.start(f.request);
+  try {
+    await closing.promise;
+    expect(f.agent().results).toHaveLength(2);
+    expect(f.counters()).toMatchObject({ compiled: 0, activated: 0 });
+    expect(f.owner.snapshot()?.analysis_jobs).toBe(1);
+    expect(f.owner.snapshot()?.analysis_ms).toBeGreaterThan(0);
+    expect(budgets).toHaveLength(1); expect(budgets[0]).toBeGreaterThan(0); expect(budgets[0]).toBeLessThanOrEqual(500);
+  } finally { release.resolve(); }
+  await f.ready;
+  const failure = f.agent().results[2]!;
+  expect(failure.isError).toBe(true);
+  expect(failure.details).toMatchObject({ failed: true, code: "invalid_program_result",
+    issues: [{ code: "custom", path: "next_state", constraint: "utf8_bytes", maximum: 16384 }] });
+  const retained = failure.details as { output: { next_state: Json }; issues: { maximum: number }[] };
+  expect(Buffer.byteLength(JSON.stringify(retained.output.next_state))).toBeGreaterThan(retained.issues[0]!.maximum);
+  const analysisTool = f.agent().tools.find(tool => tool.name === "program_analyze")!;
+  // Transport redelivery is not a contradictory duplicate call inside one
+  // provider response. Replay the actual retained tool receipt after sealing.
+  expect((await analysisTool.execute("exact-return", analyze)).details).toEqual(failure.details);
+  expect((await analysisTool.execute("exact-return", { ...analyze, validate_as: "decision" })).isError).toBe(true);
+  expect(f.agent().results[3]!.isError).toBe(true);
+  expect(budgets).toHaveLength(1); expect(closed).toBe(1);
+  expect(f.owner.snapshot()?.analysis_jobs).toBe(1);
+  expect(f.owner.snapshot()?.analysis_ms).toBeLessThanOrEqual(budgets[0]!);
+  expect(f.counters().activated).toBe(0);
+  await f.owner.close();
+});
+
+test("source activation refusal validates only software return shape and retains its unmodified output", async () => {
+  const calls: Call[] = [rootCalls()[0]!,
+    { name: "program_write", args: { name: "probe", entry: "analyze",
+      source: "import {activate} from './candidate.js'; export function analyze(input) { return activate(input.frame,input.state,input.intent); }",
+      dependencies: [{ name: "executive", version: 1, import_path: "./candidate.js" }] } },
+    { name: "program_analyze", args: { name: "probe", version: 1, input: { frame: { synthetic: true }, state: null, intent: null },
+      validate_as: "activation" } }, rootCalls()[1]!,
+  ];
+  let closed = 0;
+  const f = fixture(calls);
+  f.options.sandbox.createResidentAnalysisWorker = async (bundle, budget, signal) => {
+    const worker = await residentAnalysisProcess(bundle, budget, signal);
+    return { analyze: worker.analyze, async close() { await worker.close(); closed++; } };
+  };
+  await f.owner.initialize(); await f.owner.start(f.request); await f.ready;
+  expect(f.agent().results[2]!.isError).not.toBe(true);
+  expect(f.agent().results[2]!.details).toMatchObject({ qualification: "synthetic_software_test_only",
+    output: { refused: true, reason: "software fixture only" },
+    validation: { validate_as: "activation", qualification: "software_return_shape_only" } });
+  expect(f.owner.snapshot()?.analysis_jobs).toBe(1);
+  expect(f.owner.snapshot()?.analysis_ms).toBeGreaterThan(0);
+  expect(closed).toBe(1); expect(f.counters().activated).toBe(0);
   await f.owner.close();
 });
 

@@ -38,6 +38,16 @@ The host explicitly reads the native JAR, checks its embedded contract against c
 
 Each attempt has a fresh private sourcebook: no prior working programs, experience snapshot, observations or cross-model history are hydrated. Its tools are `help`, inactive `program_write`, source/catalog-only `program_inspect`, pure `program_analyze` and `prepare_finish`. Writes retain immutable named versions, explicit `based_on` revisions and pinned dependencies; outcome-linked top-level `reason` is unavailable. Analysis uses disposable workers and model-authored synthetic JSON, with results labelled as software tests. It cannot exercise the clean playing worker or establish gameplay effectiveness.
 
+An `analyze` wrapper may directly import the exact candidate `step` artifact
+and call its exported `activate` or `step` on model-authored software inputs,
+including the selected initial state and intent. Optional
+`validate_as:"activation"|"decision"` checks the returned output against the
+actual return contract after evaluation accounting. It checks shape only:
+a refusal is a valid activation return, not accepted live applicability.
+The original output and bounded failure diagnostics remain available without
+another evaluation. A large frame is not a suitable default memory snapshot;
+state still has its separate 16 KiB limit.
+
 The non-renewing bounds in [`PREPARED_START_LIMITS`](../src/shared/prepared-start.ts) are:
 
 | Resource | Bound per attempt |
@@ -90,9 +100,13 @@ specifier in an ordinary static import. Each alias resolves to the immutable
 version captured at authoring, not a file or the latest catalog revision.
 Libraries can use named/default exports and static reexports; they cannot play.
 Package, absolute, parent-directory and dynamic imports, `import.meta` and
-ambient host access remain forbidden. Pure `analyze` and `library` dependencies
-must be imported libraries; a `step` may additionally declare finite `run`
-children under the existing semantic-task contract.
+ambient host access remain forbidden. Libraries import only libraries.
+An `analyze` may additionally import an exact validated `step` as pure code;
+that does not execute its semantic children or grant playing capabilities.
+A `step` imports libraries and may additionally declare finite `run`
+children under the existing semantic-task contract. Step-to-step and
+library-to-step imports remain invalid. Analysis wrappers consume the same
+module, byte and depth limits rather than enlarging them.
 
 The acyclic pure closure is bounded to 32 modules, depth eight and 64 KiB of
 canonical source, inside a 256 KiB initialization message. All pure calls share
@@ -305,6 +319,15 @@ original cumulative job/time budgets. An intent change marks its result stale;
 it never changes controls or intent automatically. Stop aborts analysis and
 joins the actual worker-service settlement. Unknown analysis cleanup keeps the
 owner's worker drain unknown instead of claiming safe retirement.
+
+Ordinary `program_run` analysis also accepts optional
+`validate_as:"activation"|"decision"`. A shape mismatch produces a retained
+failed analysis receipt with the original output and safe diagnostics; it
+does not repeat evaluation or refund its allowance. Changed validation flags
+under the same call identity conflict. Resident JSON diagnostics distinguish
+UTF-8 bytes, depth and plain-data violations using metadata from the trusted
+boundary. They expose bounded maxima, not input values, arbitrary custom
+validator parameters or fabricated exact sizes from an early-exit walk.
 
 Sampling pins the exact producer and transition phase before awaiting a frame.
 If opening or retirement completes during an independent read, that frame is

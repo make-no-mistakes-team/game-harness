@@ -23,6 +23,7 @@ import { ResidentWorkerFault, type ResidentWorkerFaultOrigin } from "../src/serv
 import { MAX_SKILL_LIMITS, type ExecutableModuleBundle, type SkillLimits } from "../src/shared/programs.ts";
 import { singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 import { controlSessionConfigSchema } from "../src/shared/control-session.ts";
+import { residentAnalysisProcess } from "./helpers/resident-analysis-process.ts";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0)) await close(); });
@@ -32,7 +33,7 @@ function until(store: Store, runId: string, predicate: () => boolean) {
   if (predicate()) return Promise.resolve();
   return new Promise<void>(resolve => { const off = store.subscribe(event => { if (event.run_id === runId && predicate()) { off(); resolve(); } }); });
 }
-async function fixture(analysisFactory?: (budget: number) => Promise<ResidentAnalysisWorker>, limits: Partial<ResidentLimits> = {},
+async function fixture(analysisFactory?: (budget: number, bundle: ExecutableModuleBundle, signal: AbortSignal) => Promise<ResidentAnalysisWorker>, limits: Partial<ResidentLimits> = {},
   hooks: { prepareLookahead?: SkillHost["prepareLookahead"]; changed?: SkillHost["changed"];
     retire?: () => Promise<void>; runSkill?: SandboxService["runSkill"];
     createResidentWorker?: SandboxService["createResidentWorker"];
@@ -57,7 +58,7 @@ async function fixture(analysisFactory?: (budget: number) => Promise<ResidentAna
   }, async close() { closed++; } };
   const manager = new SkillManager(store, { runSkill: hooks.runSkill ?? (async () => { finiteCalls++; throw new Error("Resident must not dispatch legacy capability execution"); }),
     createResidentWorker: hooks.createResidentWorker ?? (async (_bundle, _budget, signal) => { compiled.resolve(); if (holdCompile) await finishCompile.promise; if (signal.aborted) { await worker.close(); throw new Error("compile aborted"); } return worker; }),
-    async createResidentAnalysisWorker(_bundle, budget) { return analysisFactory ? await analysisFactory(budget) : { analyze: async (input: Json, _signal?: AbortSignal, report?: (ms: number) => void) => { report?.(1); return input; }, close: async () => {} }; },
+    async createResidentAnalysisWorker(_bundle, budget, signal) { return analysisFactory ? await analysisFactory(budget, _bundle, signal) : { analyze: async (input: Json, _signal?: AbortSignal, report?: (ms: number) => void) => { report?.(1); return input; }, close: async () => {} }; },
   }, { adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
     authorize: scope => { if (run.status !== "running" || scope.run_id !== run.run_id || scope.life_id !== run.life_id) throw new Error("scope revoked"); },
     observe: async () => { throw new Error("No ordinary observation polling in resident fixture"); },
@@ -113,6 +114,71 @@ test("shared root admission refuses legacy step roots in executive runs before d
   const f = await fixture(); f.run.control_mode = "executive"; f.store.saveRun(f.run);
   expect(() => f.start()).toThrow(/life-scoped step sessions/);
   expect(f.opened).toBe(0); expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
+test("ordinary exact-return analysis keeps raw output, budgets and immutable flag-sensitive receipts without playing dispatch", async () => {
+  const budgets: number[] = [];
+  let disposed = 0;
+  const f = await fixture(async (budget, bundle, signal) => {
+    budgets.push(budget);
+    const worker = await residentAnalysisProcess(bundle, budget, signal);
+    return { analyze: worker.analyze, async close() { await worker.close(); disposed++; } };
+  }, { analysis_job_ms: 500, max_analysis_ms: 2000, max_analysis_jobs: 4 });
+  const adapter = minecraftTestAdapter(), history = new HistoryReader(f.store.readLocation());
+  const learning = new ImprovementLearning(f.store, history);
+  cleanup.unshift(async () => { await history.close(); });
+  const scope = () => ({ run_id: f.run.run_id, generation: 1, session_id: f.run.session_id!, world_id: f.run.world_id,
+    epoch: f.run.epoch, life_id: f.run.life_id!, life_status: "alive" as const, task: f.run.task,
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")!, native_boot_id: f.run.native_boot_id!,
+    space_epoch: f.run.space_epoch!, compatibility_hash: f.run.compatibility_hash!, screen: null });
+  const planning = new SpeculativePlanning({ contract: () => adapter, admissionContext: scope, context: () => null,
+    skill: ref => f.store.skill(f.run.run_id, ref), observe: async () => minecraftObservationFixture(adapter),
+    evaluateGuard: async () => { throw new Error("No speculative guard"); },
+    admit: async (request, permit) => { permit.assertCurrent(); return f.manager.start(f.run.run_id, request); },
+    evidence: () => {}, wake: () => {} });
+  const host: RuntimeToolHost = { run: () => f.run, assertCurrent: () => f.run,
+    observe: async () => minecraftObservationFixture(adapter), adapter: () => adapter, generation: () => 1,
+    attentionAfter: () => {}, admitted: () => {}, history: () => history, planning: () => planning,
+    learning: () => learning, toolAuthority: () => () => {}, finishTask: () => { throw new Error("No task completion"); } };
+  const tool = new RuntimeTools(f.store, f.manager, {} as ReactiveRuntime, null, host).build(1).find(tool => tool.name === "program_run")!;
+  const analysis = await f.manager.register(f.run.run_id, { entry: "analyze", name: "exact-return software probe",
+    source: `export function analyze(input) {
+      if (input.refuse) return {refused:true,reason:'software only'};
+      return {input:{kind:'world',held:{forward:false,back:false,left:false,right:false,jump:false,sprint:false,sneak:false,attack:false,use:false},
+        view:{kind:'unchanged'},selected_hotbar:null},next_state:input.oversize ? 'é'.repeat(8192) : {counter:input.counter},
+        status:'running',events:[]}; }`, card, dependencies: [] });
+  f.running(); const execution = f.start(); await f.firstStep.promise;
+  const input = { operation: "analyze", target: "current", name: analysis.name, version: analysis.version,
+    expected_intent_version: 0, input: { oversize: true, counter: 4 }, validate_as: "decision" };
+  expect((await tool.execute("invalid-analysis-shape", { ...input, validate_as: "not-a-shape" })).isError).toBe(true);
+  expect((await tool.execute("stale-analysis", { ...input, expected_intent_version: 1 })).isError).toBe(true);
+  expect(budgets).toHaveLength(0);
+  const failed = await tool.execute("invalid-return", input);
+  expect(failed.details).toMatchObject({ status: "failed", output: { next_state: "é".repeat(8192) },
+    diagnostic: { code: "invalid_program_result",
+      issues: [{ code: "custom", path: "next_state", constraint: "utf8_bytes", maximum: 16384 }] } });
+  const failedData = failed.details as { output: { input: object }; elapsed_ms: number };
+  expect(Object.hasOwn(failedData.output.input, "edges")).toBe(false);
+  expect(failedData.elapsed_ms).toBeGreaterThan(0); expect(failedData.elapsed_ms).toBeLessThanOrEqual(500);
+  expect(disposed).toBe(1);
+  expect((await tool.execute("invalid-return", input)).details).toEqual(failed.details);
+  expect((await tool.execute("invalid-return", { ...input, validate_as: "activation" })).isError).toBe(true);
+  expect(budgets).toHaveLength(1);
+  const accepted = await tool.execute("valid-return", { ...input, input: { oversize: false, counter: 4 } });
+  expect(accepted.details).toMatchObject({ status: "completed", output: { next_state: { counter: 4 } },
+    validation: { validate_as: "decision", qualification: "software_return_shape_only" } });
+  expect(Object.hasOwn((accepted.details as { output: { input: object } }).output.input, "edges")).toBe(false);
+  const refusal = await tool.execute("valid-refusal-shape", { ...input, input: { refuse: true }, validate_as: "activation" });
+  expect(refusal.details).toMatchObject({ status: "completed", output: { refused: true, reason: "software only" },
+    validation: { validate_as: "activation", qualification: "software_return_shape_only" } });
+  const current = f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!;
+  if (current.entry !== "step") throw new Error("Resident analysis changed the playing entry");
+  const snapshot = current.resident!;
+  expect(snapshot.counters.analysis_jobs).toBe(3);
+  expect(snapshot.counters.analysis_ms).toBeGreaterThanOrEqual(failedData.elapsed_ms);
+  expect(snapshot.counters.analysis_ms).toBeLessThanOrEqual(1500);
+  expect(budgets).toEqual([500, 500, 500]); expect(disposed).toBe(3);
+  expect(f.opened).toBe(1); expect(f.finiteCalls).toBe(0);
 });
 
 test("ordinary named resident handoff holds admission until native retirement then starts exact step limits once", async () => {

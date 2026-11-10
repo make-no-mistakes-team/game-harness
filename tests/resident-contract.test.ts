@@ -1,9 +1,13 @@
 import { expect, test } from "bun:test";
 import { controllerStepResultSchema, residentActorLimitsSchema, residentLimitsSchema,
-  residentStateSchema, residentIntentSchema } from "../src/shared/resident.ts";
+  residentStateSchema, residentIntentSchema, residentJsonConstraint } from "../src/shared/resident.ts";
 import { programRunSchema, programSubmitSchema, programWriteSchema } from "../src/server/program-interface.ts";
 import { skillStartRequestSchema } from "../src/shared/validation.ts";
 import { controllerInputFrameSchema, controllerInputSchema } from "../src/shared/controller.ts";
+import { z } from "zod";
+import { GeneratedControllerResultValidationError, parseGeneratedResidentResult, programDiagnostic,
+  readProgramDiagnostic } from "../src/server/program-diagnostics.ts";
+import { preparationFailure } from "../src/server/prepared-source-error.ts";
 
 const neutral = { forward: false, back: false, left: false, right: false, jump: false,
   sprint: false, sneak: false, attack: false, use: false };
@@ -93,6 +97,72 @@ test("state validation rejects accessors without executing generated behavior on
   const toJSON = { toJSON() { calls++; return {}; } };
   expect(residentStateSchema.safeParse(toJSON).success).toBe(false);
   expect(calls).toBe(0);
+});
+
+test("generated return diagnostics distinguish trusted byte, depth and plain-data boundaries without values", () => {
+  const secret = "PRIVATE_VALUE /private/path";
+  let nested: unknown = secret;
+  for (let depth = 0; depth < 33; depth++) nested = [nested];
+  let getters = 0;
+  const accessor = Object.defineProperty({}, "value", { enumerable: true, get() { getters++; return secret; } });
+  const cases: { value: unknown; constraint: "utf8_bytes" | "depth" | "plain_data"; maximum?: number; path: string }[] = [
+    { value: { ...result(), next_state: secret + "é".repeat(8192) }, constraint: "utf8_bytes", maximum: 16384, path: "next_state" },
+    { value: { ...result(), next_state: nested }, constraint: "depth", maximum: 32, path: "" },
+    { value: { ...result(), next_state: accessor }, constraint: "plain_data", path: "" },
+    { value: { ...result(), next_state: { value: Infinity, secret } }, constraint: "plain_data", path: "" },
+  ];
+  for (const entry of cases) {
+    for (const activation of [false, true]) {
+      let caught: unknown;
+      try {
+        if (activation) parseGeneratedResidentResult(entry.value, true);
+        else parseGeneratedResidentResult(entry.value);
+      } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(GeneratedControllerResultValidationError);
+      if (!(caught instanceof GeneratedControllerResultValidationError)) throw new Error("Missing generated return diagnostic");
+      const expected = { code: "custom", path: entry.path, constraint: entry.constraint,
+        ...(entry.maximum !== undefined ? { maximum: entry.maximum } : {}) };
+      expect(caught.issues).toContainEqual(expected);
+      expect(caught.issues.every(issue => !Object.hasOwn(issue, "actual"))).toBe(true);
+      const diagnostic = programDiagnostic(caught, "a".repeat(64));
+      const readback = readProgramDiagnostic(JSON.parse(JSON.stringify(diagnostic)), "a".repeat(64));
+      expect(readback.issues).toContainEqual(expected);
+      expect(preparationFailure(caught)).toMatchObject({ code: "invalid_program_result", issues: caught.issues });
+      expect(JSON.stringify([diagnostic, readback, preparationFailure(caught)])).not.toContain(secret);
+    }
+  }
+  // The refusal alternative cannot bypass the plain-data guard and run a getter.
+  const refused = Object.defineProperty({ reason: secret }, "refused", { enumerable: true, get() { getters++; return true; } });
+  expect(() => parseGeneratedResidentResult(refused, true)).toThrow(GeneratedControllerResultValidationError);
+  expect(getters).toBe(0);
+});
+
+test("JSON constraint metadata retains exact UTF8 limits but does not trust lookalike custom params", () => {
+  for (const value of ["x".repeat(16382), "é".repeat(8191), "😀".repeat(4095) + "xx"])
+    expect(residentStateSchema.safeParse(value).success).toBe(true);
+  for (const value of ["x".repeat(16383), "é".repeat(8192), "😀".repeat(4096)]) {
+    const parsed = residentStateSchema.safeParse(value);
+    expect(parsed.success).toBe(false);
+    if (parsed.success) throw new Error("Byte boundary accepted an over-limit value");
+    expect(residentJsonConstraint(parsed.error.issues[0])).toEqual({ constraint: "utf8_bytes", maximum: 16384 });
+    expect(preparationFailure(parsed.error).issues).toMatchObject([{ code: "custom", constraint: "utf8_bytes", maximum: 16384 }]);
+  }
+  const fake = z.unknown().superRefine((_value, context) => context.addIssue({
+    code: "custom", message: "PRIVATE_VALIDATOR_MESSAGE", params: { constraint: "utf8_bytes", maximum: 1, actual: 999999 },
+  })).safeParse(null);
+  if (fake.success) throw new Error("Missing synthetic Zod issue");
+  expect(residentJsonConstraint(fake.error.issues[0])).toBeUndefined();
+  expect(JSON.stringify(preparationFailure(fake.error))).not.toContain("PRIVATE_VALIDATOR_MESSAGE");
+  expect(preparationFailure(fake.error).issues).toEqual([{ code: "custom", message: "Invalid preparation tool argument" }]);
+  let getters = 0;
+  expect(residentJsonConstraint(Object.defineProperty({}, "params", { get() { getters++; return {}; } }))).toBeUndefined();
+  expect(getters).toBe(0);
+  const readback = readProgramDiagnostic({ type: "GeneratedControllerResultValidationError", message: "Safe host diagnostic",
+    source_hash: "a".repeat(64), location: { mapping: "unmapped" },
+    issues: [{ code: "custom", path: "next_state", params: fake.error.issues[0], message: "PRIVATE_VALIDATOR_MESSAGE" },
+      { code: "custom", path: "", constraint: "utf8_bytes", maximum: 7, actual: 999999 }] }, "a".repeat(64));
+  expect(readback.issues).toEqual([{ code: "custom", path: "next_state" }, { code: "custom", path: "" }]);
+  expect(JSON.stringify(readback)).not.toContain("PRIVATE_VALIDATOR_MESSAGE");
 });
 
 test("resident events and the complete decision stay bounded independently of state", () => {

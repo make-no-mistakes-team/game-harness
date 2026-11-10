@@ -3,7 +3,8 @@ import type { Json } from "../shared/contracts.ts";
 import type { SkillResult, ProgramOutputFailure } from "../shared/programs.ts";
 import { jsonSchema, skillResultSchema } from "../shared/validation.ts";
 import { controllerStepResultSchema, type ControllerStepResult } from "../shared/resident.ts";
-import { residentDecisionSchema, residentActivationResultSchema, type ResidentDecision, type ResidentActivationResult } from "../shared/resident.ts";
+import { residentDecisionSchema, residentActivationResultSchema, residentJsonConstraint, type ResidentJsonConstraint,
+  type ResidentDecision, type ResidentActivationResult } from "../shared/resident.ts";
 import type { ZodIssue } from "zod";
 
 /** The same bounded public failure is sent to generated code and retained as evidence. */
@@ -15,7 +16,7 @@ export function capabilityFailure(error: unknown): { code: string; message: stri
 
 export interface ProgramDiagnostic {
   type: string; message: string; source_hash: string; location: { mapping: "unmapped" }; code?: string;
-  issues?: { code: string; path: string; maximum?: number; actual?: number }[];
+  issues?: { code: string; path: string; constraint?: ResidentJsonConstraint["constraint"]; maximum?: number; actual?: number }[];
   result_path?: "result.rejected_result";
   output?: ProgramOutputFailure;
 }
@@ -32,7 +33,8 @@ export class GeneratedControllerResultValidationError extends Error {
   constructor(readonly issues: NonNullable<ProgramDiagnostic["issues"]>, surface = "step") {
     super(`Generated ${surface} return does not match ${surface === "activation"
       ? "{choice,next_state,status,events} (legacy input also allowed), or {refused:true,reason}; refused:false is not acceptance"
-      : "{input or choice,next_state,status,events}"}. Invalid fields: ${issues.map(issue => `${issue.path || "<root>"} (${issue.code})`).join(", ")}. See help controller/programs for the exact result contract.`.slice(0, 1000));
+      : "{input or choice,next_state,status,events}"}. Invalid fields: ${issues.map(issue =>
+        `${issue.path || "<root>"} (${issue.code}${issue.constraint ? `; ${issue.constraint}${issue.maximum !== undefined ? ` maximum=${issue.maximum}` : ""}` : ""})`).join(", ")}. See help controller/programs for the exact result contract.`.slice(0, 1000));
     this.name = "GeneratedControllerResultValidationError";
   }
 }
@@ -69,7 +71,7 @@ function generatedReturnIssues(issues: readonly ZodIssue[]): NonNullable<Program
           if (next.length && (!branch || next.length < branch.length)) branch = next;
         }
       }
-      for (const entry of branch ?? [{ code: issue.code, path }])
+      for (const entry of branch ?? [{ code: issue.code, path, ...residentJsonConstraint(issue) }])
         if (result.length < 16 && !result.some(existing => existing.code === entry.code && existing.path === entry.path))
           result.push(entry);
     }
@@ -127,6 +129,24 @@ export function readProgramDiagnostic(value: unknown, sourceHash: string): Progr
     !Number.isSafeInteger(output.completed_capability_calls) || output.completed_capability_calls < 0))
     throw new Error("Invalid terminal output diagnostic");
   return { type: data.type, message: data.message, source_hash: sourceHash, location: { mapping: "unmapped" },
+    ...(Array.isArray(data.issues) ? { issues: data.issues.slice(0, 16).flatMap(issue => {
+      if (!issue || typeof issue !== "object" || typeof issue.code !== "string" || !/^[a-z_]{1,80}$/.test(issue.code) ||
+        typeof issue.path !== "string" || issue.path.length > 160) return [];
+      // Wire diagnostics have no object identity. Admit only the bounded public
+      // vocabulary, never validator params/messages or additional properties.
+      const constraint = issue.code === "custom" &&
+        (issue.constraint === "plain_data" ||
+          issue.constraint === "depth" && issue.maximum === 32 ||
+          issue.constraint === "utf8_bytes" && [16384, 65536, 262144].includes(issue.maximum!))
+        ? issue.constraint : undefined;
+      return [{ code: issue.code, path: issue.path,
+        ...(constraint ? { constraint } : {}),
+        ...(constraint && constraint !== "plain_data" ? { maximum: issue.maximum }
+          : constraint === undefined && issue.code === "too_big" && Number.isSafeInteger(issue.maximum) && issue.maximum! >= 0
+            ? { maximum: issue.maximum } : {}),
+        ...(issue.code === "too_big" && Number.isSafeInteger(issue.actual) && issue.actual! >= 0 ? { actual: issue.actual } : {}),
+      }];
+    }) } : {}),
     ...(output ? { output: { phase: output.phase, reason: output.reason, maximum_bytes: output.maximum_bytes,
       actual_bytes: output.actual_bytes, completed_capability_calls: output.completed_capability_calls } } : {}),
     ...(typeof data.code === "string" && /^[a-z_]{1,80}$/.test(data.code) ? { code: data.code } : {}) };

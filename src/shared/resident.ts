@@ -34,8 +34,19 @@ function jsonStringBytes(value: string, maximum: number): number {
   return bytes;
 }
 
+export type ResidentJsonConstraint =
+  | Readonly<{ constraint: "utf8_bytes" | "depth"; maximum: number }>
+  | Readonly<{ constraint: "plain_data" }>;
+const trustedJsonConstraints = new WeakSet<object>();
+/** Only metadata allocated by this boundary is trusted; matching actor params are not. */
+export function residentJsonConstraint(issue: unknown): ResidentJsonConstraint | undefined {
+  if (!issue || typeof issue !== "object") return undefined;
+  const params = Object.getOwnPropertyDescriptor(issue, "params")?.value;
+  return params && typeof params === "object" && trustedJsonConstraints.has(params) ? params : undefined;
+}
+
 /** Validate plain data before recursive Zod parsing or JSON serialization can invoke a getter. */
-function boundedJsonIssue(value: unknown, maximum: number): string | null {
+function boundedJsonIssue(value: unknown, maximum: number): ResidentJsonConstraint["constraint"] | null {
   const active = new Set<object>();
   const pending: ({ kind: "value"; value: unknown; depth: number } | { kind: "exit"; value: object })[] = [{ kind: "value", value, depth: 0 }];
   let bytes = 0;
@@ -48,37 +59,46 @@ function boundedJsonIssue(value: unknown, maximum: number): string | null {
     else if (typeof current === "string") bytes += jsonStringBytes(current, maximum - bytes);
     else if (typeof current === "number" && Number.isFinite(current)) bytes += JSON.stringify(current).length;
     else if (typeof current === "object") {
-      if (item.depth + 1 > RESIDENT_JSON_DEPTH) return "Resident JSON exceeds its nesting bound";
-      if (active.has(current)) return "Resident JSON cannot contain cycles";
+      if (item.depth + 1 > RESIDENT_JSON_DEPTH) return "depth";
+      if (active.has(current)) return "plain_data";
       const array = Array.isArray(current), prototype = Object.getPrototypeOf(current);
-      if (!array && prototype !== Object.prototype && prototype !== null) return "Resident JSON requires plain data objects";
+      if (!array && prototype !== Object.prototype && prototype !== null) return "plain_data";
       const descriptors = Object.getOwnPropertyDescriptors(current), keys = Reflect.ownKeys(descriptors);
       const length = array ? descriptors.length?.value : keys.length;
-      if (!Number.isSafeInteger(length) || length < 0 || length > maximum) return "Resident JSON exceeds its size bound";
-      if (array && keys.length !== length + 1) return "Resident JSON cannot contain sparse or decorated arrays";
+      if (!Number.isSafeInteger(length) || length < 0) return "plain_data";
+      if (length > maximum) return "utf8_bytes";
+      if (array && keys.length !== length + 1) return "plain_data";
       bytes += 2 + Math.max(0, length - 1);
       active.add(current); pending.push({ kind: "exit", value: current });
       for (const key of keys) {
-        if (typeof key !== "string") return "Resident JSON cannot contain symbol properties";
+        if (typeof key !== "string") return "plain_data";
         const descriptor = descriptors[key]!;
         if (array && key === "length") continue;
-        if (!descriptor.enumerable || !Object.hasOwn(descriptor, "value")) return "Resident JSON cannot contain accessors or hidden properties";
-        if (array && (!/^(?:0|[1-9][0-9]*)$/.test(key) || Number(key) >= length)) return "Resident JSON requires ordinary array indices";
+        if (!descriptor.enumerable || !Object.hasOwn(descriptor, "value")) return "plain_data";
+        if (array && (!/^(?:0|[1-9][0-9]*)$/.test(key) || Number(key) >= length)) return "plain_data";
         if (!array) bytes += jsonStringBytes(key, maximum - bytes) + 1;
-        if (bytes > maximum) return "Resident JSON exceeds its UTF8 byte bound";
+        if (bytes > maximum) return "utf8_bytes";
         pending.push({ kind: "value", value: descriptor.value, depth: item.depth + 1 });
       }
-    } else return "Resident JSON requires finite JSON data";
-    if (bytes > maximum) return "Resident JSON exceeds its UTF8 byte bound";
+    } else return "plain_data";
+    if (bytes > maximum) return "utf8_bytes";
   }
   return null;
 }
 function jsonBoundary(maximum: number) {
+  const constraints = {
+    utf8_bytes: Object.freeze({ constraint: "utf8_bytes", maximum }),
+    depth: Object.freeze({ constraint: "depth", maximum: RESIDENT_JSON_DEPTH }),
+    plain_data: Object.freeze({ constraint: "plain_data" }),
+  } satisfies Record<ResidentJsonConstraint["constraint"], ResidentJsonConstraint>;
+  for (const metadata of Object.values(constraints)) trustedJsonConstraints.add(metadata);
   return z.unknown().superRefine((value, context) => {
-    let issue: string | null;
+    let issue: ResidentJsonConstraint["constraint"] | null;
     try { issue = boundedJsonIssue(value, maximum); }
-    catch { issue = "Resident JSON could not be safely inspected"; }
-    if (issue) context.addIssue({ code: "custom", message: issue });
+    catch { issue = "plain_data"; }
+    if (issue) context.addIssue({ code: "custom", params: constraints[issue],
+      message: issue === "utf8_bytes" ? "Resident JSON exceeds its UTF8 byte bound"
+        : issue === "depth" ? "Resident JSON exceeds its nesting bound" : "Resident JSON requires finite plain JSON data" });
   });
 }
 export const residentStateSchema = jsonBoundary(RESIDENT_STATE_BYTES).pipe(jsonSchema);
@@ -103,8 +123,8 @@ export const executiveStepResultSchema = jsonBoundary(RESIDENT_OUTPUT_BYTES).pip
 export type ExecutiveStepResult = z.infer<typeof executiveStepResultSchema>;
 export const residentDecisionSchema = z.union([controllerStepResultSchema, executiveStepResultSchema]);
 export type ResidentDecision = ControllerStepResult | ExecutiveStepResult;
-export const residentActivationResultSchema = z.union([residentDecisionSchema,
-  z.object({ refused: z.literal(true), reason: z.string().min(1).max(1000) }).strict()]);
+export const residentActivationResultSchema = jsonBoundary(RESIDENT_OUTPUT_BYTES).pipe(z.union([residentDecisionSchema,
+  z.object({ refused: z.literal(true), reason: z.string().min(1).max(1000) }).strict()]));
 export type ResidentActivationResult = z.infer<typeof residentActivationResultSchema>;
 
 export const residentLimitsSchema = z.object({

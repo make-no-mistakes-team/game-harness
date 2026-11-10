@@ -8,6 +8,8 @@ import { policyWatchSchema } from "./reactive.ts";
 import { controlSessionConfigSchema } from "../shared/control-session.ts";
 
 export const programSelectorSchema = namedProgramRefSchema;
+export const analysisValidateAsSchema = z.enum(["activation", "decision"])
+  .describe("Validate only the returned software JSON against the playing activation/decision return shape. Refusal is a valid activation shape, not live acceptance; no gameplay qualification or effects.");
 export const improvementFeedbackCursorSchema = z.object({
   schema_version: z.literal(2),
   opportunity_change_seq: z.int().nonnegative(),
@@ -76,7 +78,8 @@ export const programRunSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("update_intent"), target: z.literal("current").default("current"),
     expected_version: z.int().nonnegative(), intent: residentIntentSchema }).strict(),
   programSelectorSchema.extend({ operation: z.literal("analyze"), target: z.literal("current").default("current"),
-    expected_intent_version: z.int().nonnegative(), input: residentAnalysisInputSchema }).strict(),
+    expected_intent_version: z.int().nonnegative(), input: residentAnalysisInputSchema,
+    validate_as: analysisValidateAsSchema.optional() }).strict(),
   z.object({ operation: z.literal("inspect"), target: z.enum(["current", "latest"]).default("current") }).strict(),
   z.object({ operation: z.literal("stop"), target: z.enum(["current", "latest"]).default("current") }).strict(),
   z.object({ operation: z.literal("activate_next") }).strict(),

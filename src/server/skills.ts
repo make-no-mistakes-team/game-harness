@@ -467,6 +467,7 @@ export class SkillManager {
         : error instanceof GeneratedControllerResultValidationError
           ? { kind: "generated_result", issues: error.issues.slice(0, 8).map(issue => {
             const detail: { [key: string]: Json } = { code: issue.code, path: issue.path };
+            if (issue.constraint !== undefined) detail.constraint = issue.constraint;
             if (issue.maximum !== undefined) detail.maximum = issue.maximum;
             if (issue.actual !== undefined) detail.actual = issue.actual;
             return detail;

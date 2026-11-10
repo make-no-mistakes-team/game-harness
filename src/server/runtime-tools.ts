@@ -16,6 +16,7 @@ import type { ModelObservation } from "./actor-frames.ts";
 import { ProgramOperations } from "./program-operations.ts";
 import { programHelp } from "./program-help.ts";
 import { helpSchema, memorySchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
+import { residentJsonConstraint } from "../shared/resident.ts";
 
 const faultIssuesSchema = z.array(z.object({
   code: z.string().max(80),
@@ -170,6 +171,7 @@ export class RuntimeTools {
               const keys = issue.code === "unrecognized_keys" ? issue.keys.slice(0, 8) : null;
               return {
                 code: issue.code, path: issue.path.map(String).join(".").slice(0, 160),
+                ...residentJsonConstraint(issue),
                 message: issue.code === "unrecognized_keys" ? "Unknown fields are not accepted" : issue.message.slice(0, 300),
                 ...(keys ? {
                   keys: keys.map(key => key.slice(0, 80)),

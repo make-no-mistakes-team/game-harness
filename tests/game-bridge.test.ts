@@ -2369,12 +2369,14 @@ test("expected-owner barrier accepts its ACK before newer death notice without a
     await f.close();
   }
 }, 10000);
-test("alive connection waits for the loading screen to close before publishing readiness", async () => {
+test("alive connection waits for the loading screen and actual overlay input eligibility", async () => {
   const f = fixture(),
     methods: string[] = [],
     loading = { screen_id: "loading", incarnation: 1, revision: 1 };
   const seenLoading = Promise.withResolvers<void>();
   let screen: typeof loading | null = loading;
+  let diagnostics: Record<string, boolean> = {};
+  let diagnosticRead = Promise.withResolvers<void>();
   Reflect.set(f.bridge, "owned", null);
   Reflect.set(
     Reflect.get(f.bridge, "launcher"),
@@ -2388,6 +2390,11 @@ test("alive connection waits for the loading screen to close before publishing r
       );
       requests(peer, (request) => {
         methods.push(request.method);
+        if (request.method === "diagnostics") {
+          reply(peer, request.id, diagnostics);
+          diagnosticRead.resolve();
+          return;
+        }
         if (request.method !== "observe") return;
         const observation = minecraftObservationFixture(adapter, {
           world_id: f.session.world_id,
@@ -2419,10 +2426,23 @@ test("alive connection waits for the loading screen to close before publishing r
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(f.bridge.snapshot().status).toBe("connecting");
     screen = null;
+    for (const next of [
+      { overlay_present: true, world_input_events_ready: false },
+      { overlay_present: false, world_input_events_ready: false },
+      { overlay_present: false, world_input_events_ready: true },
+    ]) {
+      await diagnosticRead.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(f.bridge.snapshot().status).toBe("connecting");
+      diagnostics = next;
+      diagnosticRead = Promise.withResolvers<void>();
+    }
     await connecting;
     expect(f.bridge.snapshot().status).toBe("connected");
     expect((await f.bridge.observe()).screen).toBeNull();
-    expect(methods.every((method) => method === "observe")).toBe(true);
+    expect(methods).not.toContain("execute");
+    expect(methods).not.toContain("respawn");
+    expect(methods).not.toContain("controller_open");
   } finally {
     await f.close();
   }

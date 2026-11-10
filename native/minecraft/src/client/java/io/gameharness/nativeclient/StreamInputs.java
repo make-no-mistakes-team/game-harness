@@ -11,11 +11,12 @@ public final class StreamInputs {
   private final MinecraftClient client;
   private final KeyBinding[] keys;
   private final InputConsumption consumption = new InputConsumption();
+  private final SimulationViewMotion viewMotion = new SimulationViewMotion();
   private WorldInputPlan.Step step;
   private ControllerInputQueue.Entry entry;
   private long preparedTick = -1;
   private long attackEdgeOrdinal;
-  private boolean entering, consuming, consumed, sampled, screenOpened;
+  private boolean entering, consuming, consumed, sampled, screenOpened, viewInterrupted;
 
   public StreamInputs(MinecraftClient client) {
     this.client = client; keys = NativeInputs.ownedKeys(client);
@@ -26,7 +27,10 @@ public final class StreamInputs {
   }
   public void begin(ControllerInputQueue.Entry entry) {
     if (this.entry != null || entry.world() == null) throw new IllegalStateException("Stream input application already pending");
-    this.entry = entry; step = entry.world(); entering = true; consumed = sampled = screenOpened = false;
+    viewMotion.clear();
+    this.entry = entry; step = entry.world(); entering = true;
+    preparedTick = -1;
+    consumed = sampled = screenOpened = viewInterrupted = false;
     consumption.reset(step);
     attackEdgeOrdinal = 0;
   }
@@ -34,8 +38,12 @@ public final class StreamInputs {
     if (step == null || screenOpened || preparedTick == tick) return false;
     preparedTick = tick;
     double yaw = step.yawDelta(entering), pitch = step.pitchDelta(entering);
-    if (yaw != 0 || pitch != 0)
+    if (step.rate()) {
+      viewMotion.clear();
+      if (yaw != 0 || pitch != 0) viewMotion.begin(tick, yaw, pitch);
+    } else if (yaw != 0 || pitch != 0) {
       client.player.changeLookDirection(Math.toDegrees(yaw) / .15, -Math.toDegrees(pitch) / .15);
+    }
     if (entering) {
       if (step.selected() >= 0) client.player.getInventory().selectedSlot = step.selected();
       for (int index = 0; index < step.edgeCount(); index++) {
@@ -54,6 +62,18 @@ public final class StreamInputs {
     }
     applyHeld();
     return true;
+  }
+  /** Called only after checking the unchanged stream grant/lease and current world scope. */
+  public void sampleView(long tick, double progress, boolean boundary) {
+    if (step == null || screenOpened) return;
+    if (boundary) viewMotion.boundary(tick); else viewMotion.sample(progress);
+    if (viewMotion.yaw() != 0 || viewMotion.pitch() != 0)
+      client.player.changeLookDirection(Math.toDegrees(viewMotion.yaw()) / .15,
+          -Math.toDegrees(viewMotion.pitch()) / .15);
+  }
+  public void discardView() {
+    viewInterrupted |= viewMotion.pending();
+    viewMotion.clear();
   }
   public void applyHeld() {
     if (step == null || screenOpened) return;
@@ -91,12 +111,13 @@ public final class StreamInputs {
   public boolean dropAll() { return consuming && step != null && step.dropAll(); }
   public ControllerInputQueue.Entry pending() { return entry; }
   public JsonObject settle(long generation, long tick, long now) {
-    if (entry == null || preparedTick != tick || !consumed) return null;
+    if (entry == null || preparedTick > tick || !consumed || viewMotion.pending()) return null;
     long prefix = consumption.prefix(entry.edgeStart());
     boolean movement = (step.heldMask() & 127) != 0;
-    boolean confirmed = prefix == entry.edgeEnd() && (!movement || sampled);
+    boolean confirmed = prefix == entry.edgeEnd() && (!movement || sampled) && !viewInterrupted;
     JsonObject ack = ack(generation, entry.sequence(), prefix, tick, now,
-        confirmed ? "confirmed" : "partial", confirmed ? null : "ordinary_input_not_fully_consumed");
+        confirmed ? "confirmed" : "partial", confirmed ? null
+            : viewInterrupted ? "view_motion_interrupted" : "ordinary_input_not_fully_consumed");
     entry = null; consumed = sampled = false;
     if (screenOpened) step = null;
     return ack;
@@ -114,13 +135,15 @@ public final class StreamInputs {
     return ack;
   }
   public void release() {
-    clearKeys(); step = null; entry = null; consuming = false;
+    discardView();
+    clearKeys(); step = null; entry = null; consuming = false; preparedTick = -1;
     if (client.interactionManager != null) {
       client.interactionManager.cancelBlockBreaking();
       if (client.player != null && client.player.isUsingItem()) client.interactionManager.stopUsingItem(client.player);
     }
   }
   public void screenChanged() {
+    discardView();
     screenOpened = true;
     clearKeys();
     if (client.interactionManager != null) {

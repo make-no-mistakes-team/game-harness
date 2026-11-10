@@ -406,6 +406,7 @@ function analyze(source: string, kind: ProgramSourceKind) {
   const issues: ProgramValidationIssue[] = [];
   let maximumComplexity = 1;
   let maximumNesting = 0;
+  let usesMotionMath = false;
   const visit = (
     node: SyntaxNode,
     parent: SyntaxNode | null,
@@ -441,6 +442,10 @@ function analyze(source: string, kind: ProgramSourceKind) {
         ),
       );
     }
+    // Conservatively tag any access to the binding, not just `.track`: authored
+    // aliases, destructuring and computed property names must not evade admission.
+    if (module && node.type === "Identifier" && node.name === "motion" &&
+      identifierIsReference(node, parent, key)) usesMotionMath = true;
     const bareBlock =
       node.type === "BlockStatement" &&
       parent !== null &&
@@ -484,7 +489,7 @@ function analyze(source: string, kind: ProgramSourceKind) {
     ]);
   }
   if (issues.length) throw new ProgramValidationError(issues);
-  return { ...parsed, complexity: maximumComplexity, nesting: maximumNesting };
+  return { ...parsed, complexity: maximumComplexity, nesting: maximumNesting, usesMotionMath };
 }
 
 // Static admission checks do not replace the isolated execution sandbox.
@@ -588,8 +593,10 @@ export async function validateProgramSource(
   }
   if (issues.length) throw new ProgramValidationError(issues);
   const hash = digest(canonical);
-  const runtimeFeatures: SkillView["validation"]["runtime_features"] =
-    "feature" in analysis && analysis.feature ? ["pure_modules_v1"] : undefined;
+  const features: NonNullable<SkillView["validation"]["runtime_features"]> = [];
+  if ("feature" in analysis && analysis.feature) features.push("pure_modules_v1");
+  if (analysis.usesMotionMath) features.push("motion_track_v1");
+  const runtimeFeatures = features.length ? features : undefined;
   const fingerprint = programFingerprint(hash, kind, compatibility.compatibility_hash, undefined, runtimeFeatures);
   return {
     source: canonical,
@@ -637,8 +644,8 @@ export async function validateSkill(
     }
   }
   const program = await validateProgramSource(parsed.data.source, parsed.data.entry === "run" ? "skill" : parsed.data.entry, context);
-  if (aliases.size && !program.validation.runtime_features) {
-    program.validation.runtime_features = ["pure_modules_v1"];
+  if (aliases.size && !program.validation.runtime_features?.includes("pure_modules_v1")) {
+    program.validation.runtime_features = ["pure_modules_v1", ...(program.validation.runtime_features ?? [])];
     program.validation.fingerprint = programFingerprint(program.hash, parsed.data.entry === "run" ? "skill" : parsed.data.entry,
       program.validation.compatibility_hash!, undefined, program.validation.runtime_features);
   }
@@ -655,6 +662,7 @@ export function programFingerprint(hash: string, kind: ProgramSourceKind | "jev"
   return contractHash({ validator: 5, runtime: 5, skill_api: SKILL_API_VERSION,
     comments: "permitted", structural_metrics: "descriptive_not_admission_limits", kind,
     ...((kind === "step" || kind === "analyze") ? { pure_math: "motion.turn/native-tick-cubic-v1" } : {}),
+    ...(runtimeFeatures?.includes("motion_track_v1") ? { tracking_math: "motion.track/native-tick-feedback-v1" } : {}),
     parser: acornVersion, formatter: prettierVersion, formatterOptions, limits: PROGRAM_LIMITS,
     forbiddenAmbient: [...forbiddenAmbient], forbiddenSyntax: Object.keys(forbiddenSyntax), hash,
     compatibility_hash: compatibilityHash, ...(choices === undefined ? {} : { choices }),

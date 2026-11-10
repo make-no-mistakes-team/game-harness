@@ -14,12 +14,13 @@ public final class NativeInputs {
   public final NativeEffectContract.Received received;
   private final MinecraftClient client;
   private final WorldInputState state;
+  private final SimulationViewMotion viewMotion = new SimulationViewMotion();
   private final KeyBinding[] buttons, owned;
   private WorldInputPlan.Step current;
-  private boolean active = true, consuming, screenOpened, emitted;
+  private boolean active = true, consuming, screenOpened, emitted, viewInterrupted;
   private int attackEntries, useEntries;
   private long preparedTick = -1;
-  private final NativeInputTiming timing = new NativeInputTiming("NativeInputs.prepare/preCrosshair/changeLookDirection");
+  private final NativeInputTiming timing = new NativeInputTiming("NativeInputs/simulationTick+mouseTick/changeLookDirection");
 
   public NativeInputs(MinecraftClient client, long requestId, NativeEffectContract.Received received, long receivedNanos) {
     this.client = client; this.requestId = requestId; this.received = received;
@@ -55,11 +56,12 @@ public final class NativeInputs {
     if (!active || screenOpened || !state.prepare(tick, now)) return;
     preparedTick = tick; current = state.step();
     double yaw = state.yawDelta(), pitch = state.pitchDelta();
-    if (yaw != 0 || pitch != 0) {
-      float beforeYaw = client.player.getYaw(), beforePitch = client.player.getPitch();
-      client.player.changeLookDirection(Math.toDegrees(yaw) / .15, -Math.toDegrees(pitch) / .15);
-      if (client.player.getYaw() != beforeYaw || client.player.getPitch() != beforePitch)
-        timing.cameraApply.record(System.nanoTime(), tick);
+    if (current.rate()) {
+      viewMotion.clear();
+      if (yaw != 0 || pitch != 0) viewMotion.begin(tick, yaw, pitch);
+    } else {
+      viewMotion.clear();
+      applyView(yaw, pitch, tick);
     }
     if (state.entry()) {
       // Declarative selection precedes vanilla interactionManager.tick's slot sync.
@@ -82,6 +84,30 @@ public final class NativeInputs {
     }
     applyHeld();
   }
+  private void applyView(double yaw, double pitch, long tick) {
+    if (yaw != 0 || pitch != 0) {
+      float beforeYaw = client.player.getYaw(), beforePitch = client.player.getPitch();
+      client.player.changeLookDirection(Math.toDegrees(yaw) / .15, -Math.toDegrees(pitch) / .15);
+      if (client.player.getYaw() != beforeYaw || client.player.getPitch() != beforePitch)
+        timing.cameraApply.record(System.nanoTime(), tick);
+    }
+  }
+  /** The caller rechecks the original authority before either kind of sample. */
+  public void sampleView(long tick, double progress, boolean boundary) {
+    if (!active || screenOpened) return;
+    if (boundary) viewMotion.boundary(tick); else viewMotion.sample(progress);
+    applyView(viewMotion.yaw(), viewMotion.pitch(), tick);
+  }
+  public boolean viewPending() { return viewMotion.pending(); }
+  public boolean completed() { return state.completed(); }
+  public void discardView() {
+    viewInterrupted |= viewMotion.pending();
+    viewMotion.clear();
+  }
+  private void recordPose() {
+    if (client.player != null) state.pose(
+        Math.toRadians(MathHelper.wrapDegrees(client.player.getYaw())), -Math.toRadians(client.player.getPitch()));
+  }
   public void applyHeld() {
     if (!active || screenOpened || current == null) return;
     for (int key = 0; key < 9; key++) access(buttons[key]).gameharness$held(state.held(key));
@@ -103,6 +129,7 @@ public final class NativeInputs {
   public boolean settle(long tick) {
     if (client.player != null) state.settle(tick,
         Math.toRadians(MathHelper.wrapDegrees(client.player.getYaw())), -Math.toRadians(client.player.getPitch()));
+    if (state.completed() && viewPending()) releaseKeys(tick);
     return state.completed();
   }
   /** A visible screen transition stops the clip synchronously, without closing the new screen. */
@@ -111,6 +138,10 @@ public final class NativeInputs {
     screenOpened = true; release(tick);
   }
   private void release(long tick) {
+    discardView();
+    releaseKeys(tick);
+  }
+  private void releaseKeys(long tick) {
     boolean held = false; for (KeyBinding key : owned) held |= key.isPressed();
     clearKeys();
     if (held) timing.keyRelease.record(System.nanoTime(), tick);
@@ -121,10 +152,13 @@ public final class NativeInputs {
   }
   public JsonObject finish(String reason, long tick, String clockId) {
     settle(tick);
+    recordPose();
+    boolean motionConfirmed = !viewInterrupted && !viewPending();
     release(tick); active = false; consuming = false; state.stop();
     JsonObject result = new JsonObject(), evidence = new JsonObject();
-    boolean completed = state.applicationConfirmed(reason);
-    result.addProperty("status", state.applicationStatus(reason, emitted));
+    boolean completed = state.applicationConfirmed(reason) && motionConfirmed;
+    result.addProperty("status", !motionConfirmed && state.applicationConfirmed(reason)
+        ? "unknown" : state.applicationStatus(reason, emitted));
     result.addProperty("summary", "Ordinary vanilla input stopped: " + reason + "; world consequences are not confirmed");
     evidence.addProperty("effect_confirmed", false); evidence.addProperty("world_effect_emitted", emitted);
     evidence.addProperty("neutralized_effect", false); evidence.addProperty("neutralized", true);

@@ -51,6 +51,8 @@ export function descriptor() {
       entity_optical_gate: "air_water_bubble_only", terrain_interval_ms: 500 },
     actor_image: { codec: "png", presentation: "opaque_rgb", alignment: "unsynchronized" },
     motor_profile: "balanced",
+    view_motion: { rate: "simulation_tick_render_sampled_rate", native_tick_ms: 50,
+      delta: "immediate_step_entry", motor: "simulation_progress_mouse_cadence" },
     assistance: { semantic_helpers: true },
     visible_gui: { projection: "current_visible_layout", max_slots: 128, max_elements: 64, max_progress: 32, coordinates: "logical_gui" },
     controller_feedback: { schema_version: 3, own_body: "current_client_state", inventory: "client_prediction",
@@ -70,7 +72,7 @@ export function descriptor() {
     observation: {
       schema_version: 3, schema_hash: sha256(schemas.observation),
       payload_schema: { id: "contract_test_payload_v1", version: 1, hash: sha256(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_fov_r8_control_v7", version: 7, configuration,
+      profile: { id: "minecraft_assisted_rgb_fov_r8_control_v8", version: 8, configuration,
         configuration_hash: sha256(configuration) },
     },
     capabilities: [

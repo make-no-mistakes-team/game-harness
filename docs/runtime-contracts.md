@@ -78,6 +78,14 @@ Successful transfer records `closure:"transferred"`, not worker closure. The pre
 
 The ordinary `preflight_ready` wake admits Main's first task decision even while the prepared executive is live. Local control starts without waiting for cloud readiness; conversely, pending local work must not postpone that initial strategic inspection until root retirement. Later decisions retain the usual single-flight outcome, attention and authoring rules.
 
+Initial connection readiness also waits for actual native
+`overlay_present:false` and `world_input_events_ready:true`. An alive player
+with a null screen can still be behind vanilla's resource-loading overlay.
+These read-only diagnostics gate publication; the host does not dismiss the
+overlay, pause the world or infer readiness from a delay. Missing readiness
+facts keep the connection pending. Saved-dead connections remain available
+for explicit recovery without requiring world-input eligibility or respawning.
+
 ## Ordinary modules and recovery target
 
 The required program format is ordinary bounded JavaScript modules with relative local imports, a controlled resolver for declared pure libraries and a `run(game, args, checkpoint)` entry. Local pure calls share one isolated execution; a function call does not require another container. Source/bundle bytes, initialization transport, memory, CPU and capability budgets remain finite. These requirements do not grant generated code package installation, arbitrary imports, network, host files or process creation.
@@ -86,7 +94,7 @@ The agent can observe, write/edit, run, inspect and revise without filling out a
 
 Checkpoint recovery uses versioned serializable task state and unresolved operation references, not saved JavaScript stacks or promises. Resume requires compatible source/state, fresh authorized game state, fenced prior owners and actual neutralization/drain. Preserve explicit Pause/Stop and uncertain effects; restoring source or conversation never rewinds the game. Pure local modules are delivered for `step` and `analyze`; the async module entry and checkpoint recovery remain later work. The current async body and restart contracts below still apply.
 
-The active perception profile is `minecraft_assisted_rgb_fov_r8_control_v7`, with observation envelope 3, payload `minecraft_observation_v1@2`, controller frame 3 and a separate typed actor PNG. Entity evidence requires the actual rendered camera and completed framebuffer; terrain retains its assisted eight-block cache. Feedback includes actual blocking, equipment durability, attack-key consumption/callback facts and actually heard combat cues. Full pixel-only and atomically synchronized perception remain separate targets.
+The active perception profile is `minecraft_assisted_rgb_fov_r8_control_v8`, with observation envelope 3, payload `minecraft_observation_v1@2`, controller frame 3 and a separate typed actor PNG. Entity evidence requires the actual rendered camera and completed framebuffer; terrain retains its assisted eight-block cache. Feedback includes actual blocking, equipment durability, attack-key consumption/callback facts and actually heard combat cues. The profile also binds simulation-progress mouse-cadence view motion. Full pixel-only and atomically synchronized perception remain separate targets.
 
 Pure local decisions receive JSON, not Main's actor image. Terrain rows cover an occlusion-filtered spherical eight-block neighborhood around the player's block; their positions are already block centres. Empty local rows do not establish absence elsewhere, even when distant features remain visible in Main's image. Authored state may retain earlier permitted evidence with its capture/scope, but historical coordinates and handles never grant current target authority or automatic recovery.
 
@@ -135,8 +143,25 @@ itself. Repeated callbacks on one tick do not advance time. Retargeting or a
 regressed clock rebases from actual pose. At the authored duration it returns
 zero rates even if the actual pose has not aligned; `finished` and `aligned`
 are separate results. The model must submit the returned view and decide what
-to do next. Raw `rate` and `delta` semantics remain unchanged. The helper's
-version participates in pure-module validation compatibility.
+to do next. The helper's version participates in pure-module validation
+compatibility; it does not alter the native actuator contract.
+
+`motion.track(options,state)` supplies separate feedback math for changing
+model-selected orientations. It takes actual native tick/applied pose, a chosen
+target, required `max_rate`, `max_acceleration` and `response_ticks`, and optional
+alignment tolerance. The model retains explicit last-tick and per-axis velocity
+state. Desired velocity is wrapped yaw/clamped-pitch error divided by the
+selected response time, capped by rate; each update changes velocity by at most
+acceleration times elapsed native time. Target changes preserve velocity.
+Same-tick calls do not advance it; null or regressed time resets to zero.
+Invalid state rejects, including carried velocity above a newly lowered cap.
+Tolerance reports current alignment without snapping the velocity.
+
+Tracking may lag or overshoot. Neither helper selects a target, scans, moves,
+attacks, supplies a gameplay policy or guarantees arrival. Validation records
+`motion_track_v1` for motion-binding references, including aliases, and worker
+readiness must advertise support before source dispatch. Old kernels are
+refused rather than given a replacement implementation.
 
 The ordinary default exposes these tools:
 
@@ -689,7 +714,8 @@ Arbitrary keys, chat/debug commands and generic GUI input are not admitted
 through this action.
 
 View commands are unchanged, a delta applied once at step entry, or a rate
-integrated once per consumed client simulation tick at 0.05 seconds. Units
+whose 0.05-second budget per admitted simulation tick is sampled at the
+ordinary mouse/render cadence using vanilla simulation progress. Units
 are radians or radians per second, with positive-up actor pitch. The native
 look path applies ordinary pitch and vehicle constraints; receipts return
 the actual pose. This is not the assisted target servo. Normal vanilla
@@ -892,8 +918,18 @@ snapshot entry. It is not divided across the step's duration. A delta
 equal to the entire target error therefore turns immediately; selecting a
 target does not create a trajectory.
 
-`rate` uses radians per second. Each actual client simulation tick applies
-`rate * 0.05`, independent of render frequency and elapsed wall time.
+`rate` uses radians per second. Each admitted actual client simulation tick
+owns at most `rate * 0.05` rotation. Vanilla's monotone render-tick fraction
+splits that budget across ordinary mouse samples; it does not create ticks
+from elapsed wall time or increase the angle at a higher render frequency.
+An authorized remainder can settle at the next real tick boundary before
+crosshair/input work. Stop, expiry, screen/scope changes or retirement discard
+the remainder instead of completing a late turn. Paused or unadvanced
+simulation supplies no additional rotation budget.
+Nonzero-rate stream ACKs confirm the settled interval at the next real boundary,
+using its actual pose/time rather than the preparation pose. Finite final-rate
+completion follows the same settlement; held keys release at their original
+last consumed tick. Interrupted fractional motion is not confirmed application.
 An ordinary action applies the rate for the step's declared `ticks`,
 then applies the next step or releases control at action completion.
 A stream retains its rate on subsequent ticks without another command,
@@ -913,9 +949,11 @@ mean that the player made a full turn.
 
 The common actor prompt and public program help require target transitions
 to unfold over authored time. The model chooses targets and the rotation
-schedule, using existing rates or successive small deltas to express
-bounded temporal turns. Raw input does not smooth full-error deltas,
-select targets or promise sub-tick interpolation.
+schedule. Stable-target `motion.turn` and moving-target `motion.track` are
+pure math aids, not automatic behavior. Raw `delta` still applies immediately;
+native rate sampling does not repair a full-error delta or choose a camera
+trajectory. Periodic full-circle scans and re-aiming at removed blocks are not
+required mechanics and do not establish useful continuity.
 
 To end a stream view rate, submit `unchanged` or a zero rate.
 `unchanged` replaces the prior rate when applied; it does not restore an
@@ -1814,7 +1852,7 @@ The profile targets Minecraft Java 1.21.4 Normal Survival, one avatar, ordinary 
 
 ### Current player-observable structured profile
 
-The active profile is **`minecraft_assisted_rgb_fov_r8_control_v7`**, version 7. The descriptor declares observation envelope **3**, payload schema **`minecraft_observation_v1@2`** and controller frame **3**. It retains radius 8, at most 144 terrain rows/32 entity rows, unsynchronized strategic RGB selection, the actual motor setting and disclosed semantic helpers. Configuration and schema hashes bind these declarations; earlier episodes retain their original profile and evidence.
+The active profile is **`minecraft_assisted_rgb_fov_r8_control_v8`**, version 8. The descriptor declares observation envelope **3**, payload schema **`minecraft_observation_v1@2`** and controller frame **3**. It retains radius 8, at most 144 terrain rows/32 entity rows, unsynchronized strategic RGB selection, the actual motor setting and disclosed semantic helpers. `view_motion` binds render-sampled simulation-tick rate integration, immediate explicit deltas and simulation-progress semantic motor motion. Configuration and schema hashes bind these declarations; earlier episodes retain their original profile and evidence.
 
 Entity rows require actual camera projection and an entity-renderer witness in the same completed framebuffer. `dynamic_entities.source:"rendered_camera_capture"` retains the original render tick/time, invocation and capture sequence, not a new timestamp on old geometry. Rows contain the interpolated rendered position, bounds and aim point. A missing, foreign-scope or older-than-250-ms witness denies access. Pending or skipped readbacks cannot replace or refresh the last completed image's evidence; the next completed capture atomically replaces it, including an empty turned-away view. Ordinary observations, crosshair results and semantic target access use the same admission boundary. An old handle cannot supply live offscreen tracking, and a denied entity crosshair becomes a miss rather than leaking a hit position or entity kind.
 

@@ -328,7 +328,8 @@ async function residentProcess(bundle: ExecutableModuleBundle, signal: AbortSign
   signal.addEventListener("abort", abort, { once: true });
   cleanup.unshift(close);
   try {
-    expect(await read()).toEqual({ v: 1, type: "resident_ready", id: 0 });
+    expect(await read()).toEqual({ v: 1, type: "resident_ready", id: 0,
+      runtime_features: ["pure_modules_v1", "motion_track_v1"] });
     child.stdin.write(JSON.stringify({ v: 1, type: "resident_init", id: 0, entry: "step", bundle }) + "\n");
     expect(await read()).toEqual({ v: 1, type: "resident_compiled", id: 0 });
     const compute = async (type: string, frame: unknown, state: Json, intent: Json) => {

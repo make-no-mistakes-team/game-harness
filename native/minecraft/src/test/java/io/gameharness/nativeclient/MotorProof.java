@@ -92,6 +92,37 @@ public final class MotorProof {
     }
   }
 
+  private static void simulationSampledClock() {
+    SimulationViewMotion progress = new SimulationViewMotion();
+    CameraMotion.State split = state(0, 0), whole = state(0, 0);
+    progress.begin(1, 1, 0);
+    double elapsedNanos = 0, previousYaw = 0;
+    for (double sample : new double[] {.2, .4, .6, .8}) {
+      progress.sample(sample);
+      elapsedNanos += progress.yaw() * 50_000_000;
+      CameraMotion.advance(split, 90, -30, CameraMotion.Profile.BALANCED, Math.round(elapsedNanos));
+      require(split.yaw > previousYaw, "semantic camera remained tick-stepped across advancing render samples");
+      previousYaw = split.yaw;
+    }
+    progress.boundary(2);
+    elapsedNanos += progress.yaw() * 50_000_000;
+    CameraMotion.advance(split, 90, -30, CameraMotion.Profile.BALANCED, Math.round(elapsedNanos));
+    CameraMotion.advance(whole, 90, -30, CameraMotion.Profile.BALANCED, 50 * MILLISECOND);
+    near(split.yaw, whole.yaw, 1e-9, "semantic render samples overspent the actual simulation interval");
+    near(split.pitch, whole.pitch, 1e-9, "semantic pitch changed under simulation partition");
+    near(split.yawVelocity, whole.yawVelocity, 1e-9, "semantic sample cadence changed acceleration");
+    double before = split.yaw;
+    progress.boundary(2);
+    elapsedNanos += progress.yaw() * 50_000_000;
+    CameraMotion.advance(split, 90, -30, CameraMotion.Profile.BALANCED, Math.round(elapsedNanos));
+    near(split.yaw, before, 0, "semantic tick boundary integrated the same interval twice");
+    progress.begin(2, 1, 0);
+    progress.sample(.25);
+    progress.clear();
+    progress.boundary(3);
+    require(progress.yaw() == 0, "semantic retirement retained future fractional motion");
+  }
+
   private static void clockAndPartition() {
     CameraMotion.State fixed = state(170, 10), irregular = state(170, 10);
     for (int millis = 5; millis <= 170; millis += 5)
@@ -215,6 +246,7 @@ public final class MotorProof {
     long five = balancedNinety(5), ten = balancedNinety(10), twenty = balancedNinety(20);
     largeSmallAndWrap();
     clockAndPartition();
+    simulationSampledClock();
     targetReversal();
     routeGeometry();
     explicitGazeAndSteering();

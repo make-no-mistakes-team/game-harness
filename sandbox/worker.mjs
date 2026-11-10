@@ -279,7 +279,55 @@ function createMotionMath() {
       error: { yaw_radians: errorYaw, pitch_radians: errorPitch },
     };
   }
-  return Object.freeze({ turn: Object.freeze(turn) });
+  function track(options, state = null) {
+    if (!options || !tick(options.native_tick) || !orientation(options.pose) ||
+      Math.abs(options.pose.pitch_radians) > halfPi || !orientation(options.target) ||
+      !finite(options.max_rate) || options.max_rate <= 0 || options.max_rate > 20 * pi ||
+      !finite(options.max_acceleration) || options.max_acceleration <= 0 ||
+      !Number.isSafeInteger(options.response_ticks) || options.response_ticks < 1 ||
+      (options.tolerance !== undefined &&
+        (!finite(options.tolerance) || options.tolerance < 0 || options.tolerance > pi)))
+      throw new RangeError("motion.track requires actual native_tick/pose, a finite target, positive response_ticks, max_acceleration and max_rate <= 20*pi");
+    if (state !== null && (!state || !tick(state.last_tick) || !state.velocity ||
+      !finite(state.velocity.yaw_radians_per_second) || !finite(state.velocity.pitch_radians_per_second) ||
+      Math.abs(state.velocity.yaw_radians_per_second) > options.max_rate ||
+      Math.abs(state.velocity.pitch_radians_per_second) > options.max_rate))
+      throw new RangeError("motion.track state must carry a valid native tick and finite velocities within max_rate");
+    // Wrap each operand first: even finite raw yaw inputs can overflow on subtraction.
+    const errorYaw = wrap(wrap(options.target.yaw_radians) - wrap(options.pose.yaw_radians));
+    const errorPitch = clamp(options.target.pitch_radians, halfPi) - options.pose.pitch_radians;
+    if (state === null || options.native_tick < state.last_tick) {
+      // No elapsed measurement exists at initialization/reset. Do not invent a
+      // tick, assume actual movement, or inherit velocity across a clock reset.
+      state = { last_tick: options.native_tick,
+        velocity: { yaw_radians_per_second: 0, pitch_radians_per_second: 0 } };
+    } else if (options.native_tick !== state.last_tick) {
+      const elapsed = (options.native_tick - state.last_tick) * 0.05;
+      const response = options.response_ticks * 0.05;
+      const change = options.max_acceleration * elapsed;
+      const prior = state.velocity;
+      const desiredYaw = clamp(errorYaw / response, options.max_rate);
+      const desiredPitch = clamp(errorPitch / response, options.max_rate);
+      // Convex movement toward already-bounded desired rates preserves both
+      // speed and acceleration bounds, including reversals and moving targets.
+      state = { last_tick: options.native_tick, velocity: {
+        yaw_radians_per_second: clamp(prior.yaw_radians_per_second +
+          clamp(desiredYaw - prior.yaw_radians_per_second, change), options.max_rate),
+        pitch_radians_per_second: clamp(prior.pitch_radians_per_second +
+          clamp(desiredPitch - prior.pitch_radians_per_second, change), options.max_rate),
+      } };
+    }
+    // Same-tick calls reuse immutable state, never integrating a second time.
+    // Tolerance reports actual-pose alignment only; it cannot bypass braking.
+    const tolerance = options.tolerance ?? 0.01;
+    return {
+      view: { kind: "rate", yaw_radians_per_second: state.velocity.yaw_radians_per_second,
+        pitch_radians_per_second: state.velocity.pitch_radians_per_second },
+      state, aligned: Math.abs(errorYaw) <= tolerance && Math.abs(errorPitch) <= tolerance,
+      error: { yaw_radians: errorYaw, pitch_radians: errorPitch },
+    };
+  }
+  return Object.freeze({ turn: Object.freeze(turn), track: Object.freeze(track) });
 }
 
 // Resident computation and all inspection/serialization of its return value
@@ -919,7 +967,8 @@ function runSupervisor() {
   process.stdin.on("error", fail);
   process.on("uncaughtException", fail);
   process.on("unhandledRejection", fail);
-  send(resident ? { v: 1, type: "resident_ready", id: 0 } : { type: "ready" });
+  send(resident ? { v: 1, type: "resident_ready", id: 0,
+    runtime_features: ["pure_modules_v1", "motion_track_v1"] } : { type: "ready" });
 }
 
 if (isMainThread) {

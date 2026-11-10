@@ -42,6 +42,42 @@ public final class WorldInputProof {
     return count;
   }
   public static void main(String[] ignored) {
+    SimulationViewMotion motion = new SimulationViewMotion();
+    motion.sample(.9);
+    require(motion.yaw() == 0, "render without an admitted simulation interval manufactured rotation");
+    motion.begin(1, .1, -.05);
+    motion.sample(.2);
+    double splitYaw = motion.yaw(), splitPitch = motion.pitch();
+    motion.sample(.2);
+    require(motion.yaw() == 0, "unchanged simulation fraction advanced camera");
+    motion.sample(.1);
+    require(motion.yaw() == 0, "backwards simulation fraction replayed camera");
+    motion.boundary(1);
+    require(motion.yaw() == 0 && motion.pending(), "same-tick boundary flushed future rotation");
+    motion.sample(.7); splitYaw += motion.yaw(); splitPitch += motion.pitch();
+    motion.boundary(2); splitYaw += motion.yaw(); splitPitch += motion.pitch();
+    require(Math.abs(splitYaw - .1) < 1e-12 && Math.abs(splitPitch + .05) < 1e-12 && !motion.pending(),
+        "render partitions and next real tick changed the one-tick commanded angle");
+    motion.boundary(2);
+    require(motion.yaw() == 0 && motion.pitch() == 0, "tick boundary double-integrated completed interval");
+    motion.begin(2, .1, -.05); motion.sample(.3); motion.clear(); motion.boundary(3);
+    require(motion.yaw() == 0 && !motion.pending(), "Stop/expiry retained a fractional view remainder");
+    motion.begin(3, 0, 0); motion.sample(.8); motion.boundary(4);
+    require(motion.yaw() == 0 && motion.pitch() == 0, "replacement unchanged view retained the prior rate");
+    motion.begin(4, -.2, .1); motion.sample(Double.NaN);
+    require(motion.yaw() == 0 && motion.pending(), "invalid render fraction consumed a rate interval");
+    motion.sample(2);
+    require(motion.yaw() == -.2 && motion.pitch() == .1 && !motion.pending(),
+        "render fraction beyond the interval increased total commanded motion");
+    motion.begin(5, .1, 0);
+    boolean unsettledReplacementRejected = false;
+    try { motion.begin(6, .2, 0); } catch (IllegalStateException expected) { unsettledReplacementRejected = true; }
+    require(unsettledReplacementRejected, "new tick silently lost an unsettled interval");
+    motion.clear();
+    motion.begin(6, .2, 0); motion.sample(.4);
+    motion.clear(); motion.sample(.9); motion.boundary(7);
+    require(motion.yaw() == 0 && !motion.pending(),
+        "screen/life replacement or expiry applied a discarded fractional rate");
     JsonObject ordinaryEnvelope = new JsonObject();
     ordinaryEnvelope.addProperty("operation_id", "ordinary-proof");
     ordinaryEnvelope.addProperty("compatibility_hash", "a".repeat(64));

@@ -128,6 +128,9 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void fenceAuthority() {
+    if (ordinaryInput != null) ordinaryInput.discardView();
+    if (streamInputs != null) streamInputs.discardView();
+    if (motor != null) motor.viewProgress.clear();
     renderSnapshot.invalidate();
     renderedEntities.invalidate();
     if (evaluationGate != null) evaluationGate.cancel(effectAuthority.owner());
@@ -162,6 +165,7 @@ public final class NativeClient implements ClientModInitializer {
   public void scopeUnavailable() { if (incarnationSignals != null) incarnationSignals.loading(); }
   public void screenReceived() {
     VisibleScreen.screenChanged();
+    if (motor != null && client.currentScreen != null) motor.viewProgress.clear();
     if (ordinaryInput != null && client.currentScreen != null) ordinaryInput.screenChanged(clientTick);
     if (streamInputs != null && client.currentScreen != null) streamInputs.screenChanged();
     if (incarnationSignals != null) incarnationSignals.viewReceived();
@@ -1011,7 +1015,7 @@ public final class NativeClient implements ClientModInitializer {
     boolean prepared = streamInputs != null;
     if (prepared) {
       values |= 1; evaluated |= 2;
-      prepared = client.currentScreen == null;
+      prepared = client.currentScreen == null && viewSimulationAdvancing();
       if (prepared) {
         values |= 2; evaluated |= 4;
         prepared = streamInputs.prepare(clientTick);
@@ -1727,7 +1731,7 @@ public final class NativeClient implements ClientModInitializer {
     m.addProperty("max_pitch_degrees_per_second", motorProfile.pitchSpeed);
     m.addProperty("yaw_acceleration_degrees_per_second_squared", motorProfile.yawAcceleration);
     m.addProperty("pitch_acceleration_degrees_per_second_squared", motorProfile.pitchAcceleration);
-    m.addProperty("camera_integration_clock", ordinaryInput == null && streamInputs == null ? "client_tick_monotonic_assisted" : "client_simulation_tick_0.05_seconds");
+    m.addProperty("camera_integration_clock", "simulation_progress_mouse_cadence");
     if (motor != null) {
       if (motor.inventorySession() != null)
         m.add("native_inventory_ui", motor.inventorySession().diagnostics());
@@ -2104,10 +2108,37 @@ public final class NativeClient implements ClientModInitializer {
   /** Pinned tick bytecode updates the crosshair before handleInputEvents. */
   public void beforeCrosshair() {
     drainRetirement();
+    sampleOwnedView(true);
     prepareController();
-    if (ordinaryInput != null && checkOrdinary() && !client.isPaused() && client.getOverlay() == null)
+    if (ordinaryInput != null && checkOrdinary() && viewSimulationAdvancing())
       ordinaryInput.prepare(clientTick, System.nanoTime());
-    if (motor != null) motor.rotate();
+    if (motor != null) motor.beginViewTick();
+  }
+
+  /** Ordinary mouse cadence, before vanilla renderWorld updates the crosshair and camera. */
+  public void mouseTick() {
+    drainRetirement();
+    sampleOwnedView(false);
+  }
+
+  private boolean viewSimulationAdvancing() {
+    return client.player != null && client.world != null && !client.isPaused()
+        && client.currentScreen == null && client.getOverlay() == null
+        && client.world.getTickManager().shouldTick();
+  }
+
+  private void sampleOwnedView(boolean boundary) {
+    boolean advancing = viewSimulationAdvancing();
+    double progress = boundary ? 1 : client.getRenderTickCounter().getTickDelta(false);
+    if (streamInputs != null && streamCanConsume()) {
+      if (advancing) streamInputs.sampleView(clientTick, progress, boundary);
+      if (boundary) settleStreamInput();
+    }
+    if (ordinaryInput != null && checkOrdinary()) {
+      if (advancing) ordinaryInput.sampleView(clientTick, progress, boundary);
+      if (ordinaryInput.completed() && !ordinaryInput.viewPending()) finishOrdinary("completed");
+    }
+    if (motor != null) motor.sampleView(progress, boundary, advancing);
   }
 
   public void ordinaryConsumptionStarted() {
@@ -2187,20 +2218,24 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void inputTickEnded() {
-    if (streamInputs != null && streamOwner != null) {
-      StreamOwner stream = streamOwner;
-      ControllerInputQueue.Entry pending = streamInputs.pending();
-      JsonObject ack = streamInputs.settle(stream.grant().controllerGeneration(), clientTick, System.nanoTime());
-      if (ack != null) completeControllerInput(stream, pending, ack);
-    }
+    settleStreamInput();
     publishControllerProgress();
     // Life/space notices from this tick precede a pending read failure.
     settleResidentSample(false);
     if (ordinaryInput == null) return;
     boolean complete = ordinaryInput.settle(clientTick);
     if (ordinaryInput.screenOpened()) finishOrdinary("screen_opened");
-    else if (complete) finishOrdinary("completed");
+    else if (complete && !ordinaryInput.viewPending()) finishOrdinary("completed");
     else checkOrdinary();
+  }
+
+  private void settleStreamInput() {
+    if (streamInputs != null && streamOwner != null) {
+      StreamOwner stream = streamOwner;
+      ControllerInputQueue.Entry pending = streamInputs.pending();
+      JsonObject ack = streamInputs.settle(stream.grant().controllerGeneration(), clientTick, System.nanoTime());
+      if (ack != null) completeControllerInput(stream, pending, ack);
+    }
   }
 
   private void publishControllerProgress() {
@@ -2602,6 +2637,8 @@ public final class NativeClient implements ClientModInitializer {
     final long admittedNanos = System.nanoTime();
     final long lifeId = lifecycle.lifeId();
     final CameraMotion.State camera = new CameraMotion.State();
+    final SimulationViewMotion viewProgress = new SimulationViewMotion();
+    double cameraSimulationNanos;
     final NativeInputTiming inputTiming = new NativeInputTiming();
     final NavigationGaze.Output routeGaze = new NavigationGaze.Output();
     final NavigationGaze.Movement steering = new NavigationGaze.Movement();
@@ -2832,7 +2869,7 @@ public final class NativeClient implements ClientModInitializer {
       sampledYaw = client.player.getYaw();
       sampledPitch = client.player.getPitch();
       startPose = pose();
-      CameraMotion.reset(camera, sampledYaw, sampledPitch, System.nanoTime());
+      CameraMotion.reset(camera, sampledYaw, sampledPitch, 0);
       target = targetBinding;
       entity = targetEntityBinding;
       if (target != null) {
@@ -2940,8 +2977,24 @@ public final class NativeClient implements ClientModInitializer {
       looking = true;
     }
 
-    void rotate() {
+    void beginViewTick() {
+      if (!viewSimulationAdvancing()) { viewProgress.clear(); return; }
+      // A scalar one-tick budget shares the same monotone simulation partition as raw rates.
+      viewProgress.begin(clientTick, 1, 0);
+    }
+
+    void sampleView(double progress, boolean boundary, boolean advancing) {
+      if (!advancing) { viewProgress.clear(); return; }
+      if (boundary) viewProgress.boundary(clientTick); else viewProgress.sample(progress);
+      double fraction = viewProgress.yaw();
+      if (fraction <= 0) return;
+      rotate(fraction);
+    }
+
+    void rotate(double fraction) {
       if (!looking || generation != authority || !authorized(false) || lifeId != lifecycle.lifeId() || !lifecycle.ready() || client.player == null) return;
+      if (client.player.getHealth() <= 0 || client.player.isDead()
+          || (System.nanoTime() - started) / 1_000_000 > duration) return;
       VisibleInventory session = inventorySession();
       if (session != null && !session.closed()) return;
       if (!targetsCurrent()) {
@@ -2949,12 +3002,12 @@ public final class NativeClient implements ClientModInitializer {
         if (!issued && !(kind.equals("dig") && serverBlockRemoved)) finish(EffectOutcome.deadline(emissions), "Target incarnation changed before camera/input application", false);
         return;
       }
-      long now = System.nanoTime();
       float beforeYaw = client.player.getYaw(), beforePitch = client.player.getPitch();
       // Packet corrections are actual pose changes, not an alternate integration clock.
       camera.yaw = beforeYaw;
       camera.pitch = beforePitch;
-      CameraMotion.advance(camera, yaw, pitch, motorProfile, now);
+      cameraSimulationNanos += fraction * 50_000_000;
+      CameraMotion.advance(camera, yaw, pitch, motorProfile, Math.round(cameraSimulationNanos));
       yawVelocity = camera.yawVelocity;
       pitchVelocity = camera.pitchVelocity;
       client.player.changeLookDirection(MathHelper.wrapDegrees(camera.yaw - beforeYaw) / .15,
@@ -3576,6 +3629,7 @@ public final class NativeClient implements ClientModInitializer {
 
     void finish(String status, String summary, boolean effect) {
       if (motor != this) return;
+      viewProgress.clear();
       inventoryEmissions();
       VisibleInventory inventorySession = inventorySession();
       JsonArray craftStages = kind.equals("craft") ? Recipes.stageEvidence() : null;

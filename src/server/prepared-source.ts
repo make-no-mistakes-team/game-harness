@@ -526,8 +526,9 @@ export class PreparedSource {
     if (input.topic === "programs" && "resident" in reference) {
       const { operations: _operations, software_tests: _tests, ...resident } = reference.resident as Record<string, unknown>;
       return { authority, schemas, body: reference.body, identifiers: reference.identifiers,
-        coverage: reference.coverage, composition: reference.composition, resident,
+        coverage: reference.coverage, hearing: reference.hearing, composition: reference.composition, resident,
         software_tests: softwareTests, world_view: reference.world_view, temporal_turn: reference.temporal_turn,
+        temporal_tracking: reference.temporal_tracking, target_transitions: reference.target_transitions,
         result: reference.result, execution_limits: reference.execution_limits,
         limits: reference.limits, default_execution_limits: reference.default_execution_limits,
         default_resident_limits: reference.default_resident_limits } as unknown as Json;
@@ -546,6 +547,9 @@ export class PreparedSource {
       "Test repeated callbacks after a reporting/completion transition too: every diagnostic or attention event consumes the cumulative event allowance, not just attention. " +
       "Use an analyze wrapper importing the exact step candidate you intend to select, including its activate/step exports; test your selected initial_state and args on your own labelled synthetic inputs. Return the exact candidate result when using validate_as, rather than only a helper assertion. Catch source exceptions into compact JSON diagnostics and inspect mismatches. This is software checking, not a successful game run. " +
       "Exercise larger permitted projections too: a complete frame can exceed the16KiB state allowance, and the host does not truncate an oversized next_state into validity. " +
+      "View quality matters: repeated timed360-degree scans and full-error delta re-aims are not human-like control. Sound directions are world compass, not screen-relative; compare genuine heard bearings with actual applied yaw. " +
+      "Choose purposeful bounded camera changes yourself, retaining your temporal turn/tracking state across moving-target, resource and pickup transitions. A removed block's position is not automatically the next gaze target. " +
+      "Test your exact candidate's view outputs across those transitions as well as its software return shape; a passing JSON schema does not establish a useful smooth camera trajectory. See controller help for motion.turn/track, which provide pure math but no target selection or tactics. " +
       "Inspect your authored sources and actual API/schema help as needed. There is no tool for observing, playing, respawning, network or filesystem access. " +
       "Author an executive step(frame,state,intent) and explicit activate(frame,state,intent), selecting the exact root yourself with prepare_finish(args,initial_state,limits,session). " +
       "The clean playing worker is never invoked during preparation; its first activation receives the real initial frame after launch. Disposable analyze workers may test imported functions on labelled synthetic data. " +

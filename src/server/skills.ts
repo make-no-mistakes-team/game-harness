@@ -162,7 +162,8 @@ export class SkillManager {
   private compatible(skill: SkillView): void {
     const context = this.context(), validation = assertExecutableCompatible(skill.validation, context.binding);
     const features = skill.validation.runtime_features;
-    if ((features !== undefined && (features.length > 1 || (features.length === 1 && features[0] !== "pure_modules_v1"))) ||
+    if ((features !== undefined && (features.length > 2 || new Set(features).size !== features.length ||
+      features.some(feature => feature !== "pure_modules_v1" && feature !== "motion_track_v1"))) ||
       !skill.entry || validation.fingerprint !== programFingerprint(skill.hash, skill.entry === "run" ? "skill" : skill.entry,
         context.binding.compatibility_hash, undefined, features))
       throw new RuntimeFault("precondition_failed", "Cached source validation is incompatible; retain history and create a fresh immutable revision");

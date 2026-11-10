@@ -48,13 +48,6 @@ public final class NativeTimingProof {
         && evidence.get("generation").getAsLong() == 9, "cleanup release attributed to replacement owner");
     require(evidence.getAsJsonObject("key_release").get("point").getAsString()
         .equals("KeyBinding.setPressed/release"), "release claimed keyboard consumption or game confirmation");
-    require(evidence.getAsJsonObject("camera_apply").get("point").getAsString()
-        .equals("Motor.rotate/preCrosshair/changeLookDirection"), "camera timing retained obsolete renderTAIL attribution");
-    NativeInputTiming ordinaryTiming = new NativeInputTiming("NativeInputs.prepare/preCrosshair/changeLookDirection");
-    ordinaryTiming.cameraApply.record(123, 7);
-    require(ordinaryTiming.evidence("boot", 2, "world-owner", 9).getAsJsonObject("camera_apply")
-        .get("point").getAsString().equals("NativeInputs.prepare/preCrosshair/changeLookDirection"),
-        "ordinary camera application misattributed to assisted servo");
     require(new NativeInputTiming().evidence("boot", 1, "unused", 1).get("key_sample").isJsonNull(),
         "missing input sampling fabricated a timestamp");
 

@@ -7,7 +7,7 @@ import com.google.gson.JsonObject;
 public final class NativeInputTiming {
   private final String cameraPoint;
 
-  public NativeInputTiming() { this("Motor.rotate/preCrosshair/changeLookDirection"); }
+  public NativeInputTiming() { this("Motor.rotate/simulationTick+mouseTick/changeLookDirection"); }
   public NativeInputTiming(String cameraPoint) { this.cameraPoint = cameraPoint; }
 
   public static final class Samples {

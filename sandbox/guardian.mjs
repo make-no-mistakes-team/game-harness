@@ -451,8 +451,13 @@ async function start() {
         return void residentFault(reply.origin, false);
       if (resident && (reply?.v !== 1 || reply.id !== residentSequence ||
         !exactKeys(reply, expected === "resident_result"
-          ? ["v", "type", "id", "value"] : ["v", "type", "id"])))
+          ? ["v", "type", "id", "value"] : expected === "resident_ready"
+            ? ["v", "type", "id", "runtime_features"] : ["v", "type", "id"])))
         throw new Error("protocol");
+      if (resident && expected === "resident_ready" && (!Array.isArray(reply.runtime_features) ||
+        reply.runtime_features.length > 2 || new Set(reply.runtime_features).size !== reply.runtime_features.length ||
+        reply.runtime_features.some(feature => feature !== "pure_modules_v1" && feature !== "motion_track_v1")))
+        throw new Error("runtime_features");
       if (skill) {
         const line = output;
         output = Buffer.alloc(0);

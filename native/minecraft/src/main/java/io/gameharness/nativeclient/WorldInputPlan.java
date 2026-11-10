@@ -37,6 +37,7 @@ public final class WorldInputPlan {
     public int edgeCount() { return edges.length; }
     public Edge edge(int index) { return edges[index]; }
     public boolean dropAll() { return dropAll; }
+    public boolean rate() { return rate; }
     public double yawDelta(boolean entry) { return rate ? yaw * .05 : entry ? yaw : 0; }
     public double pitchDelta(boolean entry) { return rate ? pitch * .05 : entry ? pitch : 0; }
   }

@@ -53,7 +53,8 @@ export function resolveArtifactModuleClosure(catalog: ProgramArtifactCatalog, ro
     const validation = definition.validation, features = validation.runtime_features;
     if (!definition.entry || validation.runtime_version !== 5 || validation.api_version !== 5 || validation.validator_version !== 5 ||
       validation.compatibility_hash !== catalog.compatibility_hash || (features !== undefined &&
-        (features.length > 1 || (features.length === 1 && features[0] !== "pure_modules_v1"))) ||
+        (features.length > 2 || new Set(features).size !== features.length ||
+          features.some(feature => feature !== "pure_modules_v1" && feature !== "motion_track_v1"))) ||
       validation.fingerprint !== programFingerprint(definition.hash, definition.entry === "run" ? "skill" : definition.entry,
         catalog.compatibility_hash, undefined, features)) fail("invalid_modules", "Module validation is incompatible with this artifact.");
     if (sha(definition.source) !== definition.hash) fail("invalid_modules", "Immutable module source hash does not match its bytes.");

@@ -43,6 +43,16 @@ public final class NativeContractResource {
       JsonObject profile = observation.getAsJsonObject("profile");
       if (!hash(profile.get("configuration")).equals(profile.get("configuration_hash").getAsString()))
         throw new IllegalStateException("Native resource has inconsistent effective configuration");
+      JsonObject viewMotion = profile.getAsJsonObject("configuration").getAsJsonObject("view_motion");
+      if (profile.get("version").getAsInt() != 8
+          || !profile.get("id").getAsString().equals("minecraft_assisted_rgb_fov_r8_control_v8")
+          || viewMotion == null
+          || !viewMotion.keySet().equals(java.util.Set.of("rate", "native_tick_ms", "delta", "motor"))
+          || !NativeEffectContract.id(viewMotion, "rate").equals("simulation_tick_render_sampled_rate")
+          || NativeEffectContract.counter(viewMotion, "native_tick_ms") != 50
+          || !NativeEffectContract.id(viewMotion, "delta").equals("immediate_step_entry")
+          || !NativeEffectContract.id(viewMotion, "motor").equals("simulation_progress_mouse_cadence"))
+        throw new IllegalStateException("Unsupported compiled native view-motion contract");
       for (JsonElement element : descriptor.getAsJsonArray("capabilities")) {
         JsonObject capability = element.getAsJsonObject();
         String key = capability.get("id").getAsString() + "@" + capability.get("version").getAsInt();

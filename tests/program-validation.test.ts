@@ -3,6 +3,7 @@ import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import {
   ProgramValidationError,
+  programFingerprint,
   validateProgramSource,
   validateSkill,
   validateSkillLimits,
@@ -14,8 +15,29 @@ import {
 import type { SkillSpec } from "../src/shared/programs.ts";
 import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 import { policySpecSchema } from "../src/shared/validation.ts";
+import { activeExecutableValidationSchema } from "../src/shared/adapter.ts";
 
 const fixtureContract = minecraftTestAdapter();
+test("motion math requirements survive direct, aliased and computed binding access and alter immutable admission", async () => {
+  for (const body of [
+    "return motion.track(input.options,input.state);",
+    "const math=motion; return math[input.method](input.options,input.state);",
+    "const {track}=motion; return track(input.options,input.state);",
+  ]) {
+    const program = await validateProgramSource(`export function analyze(input) { ${body} }`, "analyze", fixtureContract);
+    expect(program.validation.runtime_features).toEqual(["motion_track_v1"]);
+    expect(program.validation.fingerprint).not.toBe(
+      programFingerprint(program.hash, "analyze", program.validation.compatibility_hash!));
+    expect(activeExecutableValidationSchema.safeParse(program.validation).success).toBe(true);
+    expect(activeExecutableValidationSchema.safeParse({ ...program.validation,
+      runtime_features: ["motion_track_v1", "motion_track_v1"] }).success).toBe(false);
+    expect(activeExecutableValidationSchema.safeParse({ ...program.validation,
+      runtime_features: ["motion_track_v2"] }).success).toBe(false);
+  }
+  const library = await validateProgramSource("export const tracking = motion.track;", "library", fixtureContract);
+  expect(library.validation.runtime_features).toEqual(["pure_modules_v1", "motion_track_v1"]);
+});
+
 test("browser-safe policy source validation retains exact UTF-8 byte bounds", () => {
   const spec = { backend: "javascript", choices: null, name: "UTF-8 schema boundary", priority: 0, interval_ms: 200,
     card: { purpose: "Byte contract", applicability: "Schema-only", method: "Count actual UTF-8", reason: "No Node browser dependency", limitations: "No execution claim" } };

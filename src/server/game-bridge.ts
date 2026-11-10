@@ -1104,13 +1104,20 @@ export class GameBridgeClient implements GameBridge {
         if (this.control) {
           try {
             const current = await this.observe();
-            // Joining can report an alive player before vanilla closes its loading screen.
-            if (
-              (current.life.status === "alive" && current.screen === null) ||
-              current.life.status === "dead"
-            ) {
+            if (current.life.status === "dead") {
               observed = true;
               break;
+            }
+            // A resource-loading overlay is not a Screen. An alive/null-screen
+            // observation alone can precede vanilla's actual input eligibility.
+            if (current.life.status === "alive" && current.screen === null) {
+              const metrics = jsonSchema.parse(await this.request("diagnostics", {}, 5000));
+              this.nativeMetrics = metrics;
+              if (metrics !== null && typeof metrics === "object" && !Array.isArray(metrics) &&
+                  metrics.overlay_present === false && metrics.world_input_events_ready === true) {
+                observed = true;
+                break;
+              }
             }
           } catch {}
         }

@@ -274,12 +274,17 @@ export class StrategicContext {
       if (section.topic === "game" && this.actionHelpSection !== null &&
         (section.section === this.actionHelpSection || section.section.startsWith(`${this.actionHelpSection}.`))) return 1;
       if (section.topic === "programs" &&
-        (section.section === "resident.response" || section.section.startsWith("resident.response."))) return 2;
+        (section.section === "resident.response" || section.section.startsWith("resident.response.") ||
+          section.section === "resident.software_tests")) return 2;
       if (this.helpSchemas.has(section)) return 4;
       if (section.topic === "game" && (section.section === "adapter" || section.section.startsWith("adapter."))) return 3;
       if (section.topic === "game" && (section.section === "validation" || section.section === "lifecycle" ||
         section.section === "progress")) return 2;
-      if (section.topic === "programs" && section.section === "temporal_turn") return 0;
+      if (section.topic === "programs" &&
+        (section.section === "temporal_turn" || section.section === "temporal_tracking")) return 0;
+      // Complete callable action families outrank duplicate lifecycle prose:
+      // the root contract already carries that prose, not native argument schemas.
+      if (section.topic === "programs" && section.section.startsWith("resident.")) return 2;
       // Body and raw-view prose also live in the current root contract. Keep
       // requested executable shapes ahead of those duplicates under pressure.
       if (section.topic === "programs" && section.section !== "resident" &&

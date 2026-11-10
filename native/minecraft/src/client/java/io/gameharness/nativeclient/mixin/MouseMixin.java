@@ -9,6 +9,13 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(Mouse.class)
 public abstract class MouseMixin {
+  // MinecraftClient.render invokes Mouse.tick after actual ticks and before renderWorld's
+  // crosshair/camera update. Apply the real pose here, never a capture-only camera offset.
+  @Inject(method = "tick", at = @At("TAIL"))
+  private void ownedViewSample(CallbackInfo ci) {
+    if (NativeClient.INSTANCE != null) NativeClient.INSTANCE.mouseTick();
+  }
+
   @Inject(method = "isCursorLocked", at = @At("HEAD"), cancellable = true)
   private void ownedWorldCursor(CallbackInfoReturnable<Boolean> ci) {
     if (NativeClient.INSTANCE != null && NativeClient.INSTANCE.ownedWorldCursor()) ci.setReturnValue(true);

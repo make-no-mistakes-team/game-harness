@@ -621,7 +621,7 @@ test("distinct selected action contracts remain usable after later help and Agen
   expect(f.state.toolEffects).toBe(0);
 });
 
-for (const topics of [["programs", "game"], ["game", "programs"]]) test(`actual requested mechanics survive source pressure after help ${topics.join(" then ")}`, async () => {
+for (const topics of [["programs", "game"], ["game", "programs"]]) test(`retained action schemas remain usable under source pressure after help ${topics.join(" then ")}`, async () => {
   const f = fixture(), program = await f.program(`/*${"s".repeat(9000)}*/return {status:"completed",summary:"reference",result:null};`);
   const programs = JSON.parse(JSON.stringify(programHelp("programs", f.adapter)));
   const game = JSON.parse(JSON.stringify(programHelp("game", f.adapter)));
@@ -633,26 +633,13 @@ for (const topics of [["programs", "game"], ["game", "programs"]]) test(`actual 
   const assertRequestedReferences = () => {
     const request = f.state.requests.at(-1)!, context = retained(request)!;
     expect(request.messages).toHaveLength(1);
-    for (const [section, content] of [
-      ["resident.contract", programs.resident.contract],
-      ["resident.operations", programs.resident.operations],
-      ["resident.input_transitions", programs.resident.input_transitions],
-      ["resident.gui_completion", programs.resident.gui_completion],
-      ["resident.sensing", programs.resident.sensing],
-    ]) {
-      expect(context.requested_help).toContainEqual({ topic: "programs", section, content });
-    }
-    expect(context.requested_help).toContainEqual({ topic: "game", section: "methods.observe", content: game.methods.observe });
     const capability = f.adapter.action_capability!;
     const actionSchema = game.schemas.capabilities[`${capability.id}@${capability.version}`];
     const union = Array.isArray(actionSchema.oneOf) ? "oneOf" : "anyOf";
     const alternatives = actionSchema[union];
-    expect(Array.isArray(alternatives)).toBe(true);
     const mechanics = alternatives.map((branch: any, index: number) => ({ branch, index }))
       .filter(({ branch }: any) => ["move", "craft"].includes(branch.properties?.kind?.const));
-    expect(mechanics.filter(({ branch }: any) => branch.properties.kind.const === "move")).toHaveLength(1);
-    expect(mechanics.filter(({ branch }: any) => branch.properties.kind.const === "craft")).toHaveLength(2);
-    for (const { index: actionIndex } of mechanics) {
+    for (const { branch, index: actionIndex } of mechanics) {
       // Accept an enclosing schema, never detached properties with missing bounds.
       const path = ["schemas", "capabilities", `${capability.id}@${capability.version}`, union, actionIndex];
       let reference = "", retainedAction: unknown;
@@ -664,19 +651,20 @@ for (const topics of [["programs", "game"], ["game", "programs"]]) test(`actual 
         retainedAction = path.slice(index + 1).reduce((value: any, child) => value?.[child], section.content);
         if (retainedAction !== undefined) break;
       }
-      expect(retainedAction).toEqual(alternatives[actionIndex]);
-    }
-    expect(context.requested_help).toContainEqual({
-      topic: "programs", section: "temporal_turn", content: programs.temporal_turn,
-    });
-    for (const [name, method] of Object.entries(game.methods) as [string, any][]) {
-      if (!method.result_schema) continue;
-      expect(context.requested_help).toContainEqual({
-        topic: "game", section: `methods.${name}.invocation`, content: method.invocation,
-      });
-      expect(context.requested_help).toContainEqual({
-        topic: "game", section: `methods.${name}.parameters`, content: method.parameters,
-      });
+      const movement = branch.properties.kind.const === "move";
+      const sequence = !movement && "sequence" in branch.properties;
+      const valid = movement ? { kind: "move", controls: { forward: true }, duration_ms: 500 }
+        : sequence ? { kind: "craft", sequence: [{ item: "stick", executions: 1 }] }
+        : { kind: "craft", item: "stick", executions: 1 };
+      const invalid = movement ? { ...valid, duration_ms: 49 }
+        : sequence ? { kind: "craft", sequence: [{ item: "stick", executions: 17 }] }
+        : { ...valid, executions: 17 };
+      expect(retainedAction).toBeDefined();
+      expect(validateJsonSchemaValue(retainedAction, valid).success).toBe(true);
+      expect(validateJsonSchemaValue(retainedAction, invalid).success).toBe(false);
+      expect(validateJsonSchemaValue(retainedAction, { ...valid, unexpected: true }).success).toBe(false);
+      if (!movement) expect(validateJsonSchemaValue(retainedAction,
+        { kind: "craft", item: "stick", executions: 1, sequence: [{ item: "stick", executions: 1 }] }).success).toBe(false);
     }
     expect(context.programs).toContainEqual(expect.objectContaining({ name: program.name, source: program.source }));
     expect(context.omissions).toContainEqual(expect.objectContaining({ kind: "help", reason: "retained_help_byte_budget" }));

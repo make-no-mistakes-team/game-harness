@@ -37,10 +37,12 @@ public final class WorldInputState {
   /** Client tick end follows movement/key sampling and records constrained actual player pose. */
   public boolean settle(long clientTick, double actualYaw, double actualPitch) {
     if (!pending || !consumed || consumedTick != clientTick) return false;
-    yaw = actualYaw; pitch = actualPitch; pending = false;
+    pose(actualYaw, actualPitch); pending = false;
     if (++tickInStep == step().ticks()) { appliedSteps++; step++; tickInStep = 0; }
     return true;
   }
+  /** Render-sampled rate motion may finish after the last ordinary-input consumption. */
+  public void pose(double actualYaw, double actualPitch) { yaw = actualYaw; pitch = actualPitch; }
   public boolean completed() { return step == plan.stepCount(); }
   /** A screen may end an already fully consumed clip, but never confirms its world consequences. */
   public boolean applicationConfirmed(String reason) {

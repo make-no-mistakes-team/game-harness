@@ -88,7 +88,7 @@ export async function buildNativeContract(projectRoot: string): Promise<NativeCo
     adapter: { id: "fabric-owned-client", version: "1.0.0", build_hash: contractHash(buildInputs) },
     observation: { schema_version: 3, schema_hash: contractHash(schemas.observation),
       payload_schema: { id: "minecraft_observation_v1", version: 2, hash: contractHash(schemas.payload) },
-      profile: { id: "minecraft_assisted_rgb_fov_r8_control_v7", version: 7, configuration,
+      profile: { id: "minecraft_assisted_rgb_fov_r8_control_v8", version: 8, configuration,
         configuration_hash: contractHash(configuration) } },
     capabilities: Object.entries(schemas.capabilities).map(([key, schema]) => {
       const separator = key.lastIndexOf("@");

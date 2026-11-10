@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SandboxService } from "../src/server/sandbox.ts";
@@ -12,7 +12,8 @@ import { validateProgramSource } from "../src/server/program-validation.ts";
 import { PreparedSourcebook } from "../src/server/prepared-sourcebook.ts";
 import { adapterCompatibility } from "../src/server/adapter-contract.ts";
 import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
-import type { TemporalTurnOptions, TemporalTurnResult, TemporalTurnState } from "../src/shared/temporal-turn.ts";
+import type { TemporalTurnOptions, TemporalTurnResult, TemporalTurnState,
+  TemporalTrackOptions, TemporalTrackResult, TemporalTrackState } from "../src/shared/temporal-turn.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import type { ExecutableModuleBundle, SkillCapabilityRequest } from "../src/shared/programs.ts";
 import { assertExecutableModuleBundle, executableModuleBundleHash, singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
@@ -91,7 +92,8 @@ async function compile(source: string, entry: "step" | "analyze" = "analyze", bu
 }
 async function compileBundle(bundle: ExecutableModuleBundle, budget = 80) {
   const worker = processWorker(budget);
-  expect(await worker.read()).toEqual({ v: 1, type: "resident_ready", id: 0 });
+  expect(await worker.read()).toEqual({ v: 1, type: "resident_ready", id: 0,
+    runtime_features: ["pure_modules_v1", "motion_track_v1"] });
   worker.send({ v: 1, type: "resident_init", id: 0, entry: bundle.entry, bundle });
   expect(await worker.read()).toEqual({ v: 1, type: "resident_compiled", id: 0 });
   return worker;
@@ -608,6 +610,169 @@ test("pure math binding remains realm-local, immutable and cannot expose host co
   });
 });
 
+const trackOptions: TemporalTrackOptions = {
+  native_tick: 100, pose: { yaw_radians: 0, pitch_radians: 0 },
+  target: { yaw_radians: 1, pitch_radians: -0.4 },
+  max_rate: 2, max_acceleration: 4, response_ticks: 4,
+};
+async function trackingWorker() {
+  const source = await validateProgramSource(
+    "export function analyze(input) { return motion.track(input.options, input.state); }",
+    "analyze", minecraftTestAdapter(),
+  );
+  return await compile(source.source);
+}
+async function track(worker: ProcessWorker, id: number, options: TemporalTrackOptions, state: TemporalTrackState | null = null) {
+  const reply = await analyze(worker, id, { options, state }) as { value: TemporalTrackResult };
+  return reply.value;
+}
+
+test("tracking uses shortest wrapped yaw and valid target pitch without an initial snap", async () => {
+  const worker = await trackingWorker();
+  const options = { ...trackOptions, pose: { yaw_radians: Math.PI - 0.1, pitch_radians: 0 },
+    target: { yaw_radians: -Math.PI + 0.1, pitch_radians: 20 } };
+  const first = await track(worker, 1, options);
+  expect(first.error.yaw_radians).toBeCloseTo(0.2, 10);
+  expect(first.error.pitch_radians).toBe(Math.PI / 2);
+  expect(first.view).toEqual({ kind: "rate", yaw_radians_per_second: 0, pitch_radians_per_second: 0 });
+  const next = await track(worker, 2, { ...options, native_tick: 101 }, first.state);
+  expect(next.view.yaw_radians_per_second).toBeCloseTo(0.2, 10);
+  expect(next.view.pitch_radians_per_second).toBeCloseTo(0.2, 10);
+  const huge = await track(worker, 3, { ...trackOptions,
+    pose: { yaw_radians: -Number.MAX_VALUE, pitch_radians: 0 },
+    target: { yaw_radians: Number.MAX_VALUE, pitch_radians: -20 } });
+  expect(Number.isFinite(huge.error.yaw_radians)).toBe(true);
+  expect(Math.abs(huge.error.yaw_radians)).toBeLessThanOrEqual(Math.PI);
+  expect(huge.error.pitch_radians).toBe(-Math.PI / 2);
+});
+
+test("tracking bounds per-axis speed and acceleration by actual elapsed native ticks across moving targets", async () => {
+  const worker = await trackingWorker();
+  const options = { ...trackOptions, max_rate: 0.7, max_acceleration: 1.2, response_ticks: 2 };
+  let state: TemporalTrackState | null = null;
+  let prior = { yaw_radians_per_second: 0, pitch_radians_per_second: 0 };
+  let lastTick = 100;
+  for (const [index, native_tick] of [100, 101, 102, 105, 106, 110, 111, 112].entries()) {
+    const result = await track(worker, index + 1, { ...options, native_tick,
+      target: { yaw_radians: index < 5 ? 1 + index * 0.1 : -1,
+        pitch_radians: index < 4 ? -1 : 1 } }, state);
+    const elapsed = (native_tick - lastTick) * 0.05;
+    for (const axis of ["yaw_radians_per_second", "pitch_radians_per_second"] as const) {
+      expect(Math.abs(result.view[axis])).toBeLessThanOrEqual(options.max_rate);
+      expect(Math.abs(result.view[axis] - prior[axis])).toBeLessThanOrEqual(options.max_acceleration * elapsed + 1e-12);
+    }
+    expect(result.state.last_tick).toBe(native_tick);
+    expect(result.aligned).toBe(false);
+    prior = result.state.velocity; state = result.state; lastTick = native_tick;
+  }
+  const still = await track(worker, 9, { ...options, native_tick: 113,
+    target: { yaw_radians: 0.02, pitch_radians: -0.03 },
+    response_ticks: 10, max_acceleration: 100 }, { last_tick: 112,
+      velocity: { yaw_radians_per_second: 0, pitch_radians_per_second: 0 } });
+  expect(still.view.yaw_radians_per_second).toBeCloseTo(0.04, 10);
+  expect(still.view.pitch_radians_per_second).toBeCloseTo(-0.06, 10);
+});
+
+test("retargets preserve velocity, same-tick calls do not integrate twice and alignment does not snap braking", async () => {
+  const worker = await trackingWorker();
+  const initial = await track(worker, 1, trackOptions);
+  const moving = await track(worker, 2, { ...trackOptions, native_tick: 103 }, initial.state);
+  expect(moving.view.yaw_radians_per_second).toBeCloseTo(0.6, 10);
+  const reversedOptions = { ...trackOptions, native_tick: 104,
+    target: { yaw_radians: -1, pitch_radians: 1 } };
+  const reversed = await track(worker, 3, reversedOptions, moving.state);
+  expect(reversed.view.yaw_radians_per_second).toBeCloseTo(0.4, 10);
+  expect(reversed.view.pitch_radians_per_second).toBeCloseTo(-0.4, 10);
+  const sameTick = await track(worker, 4, { ...reversedOptions,
+    pose: { yaw_radians: 0.3, pitch_radians: 0.1 }, target: { yaw_radians: 1, pitch_radians: -1 } }, reversed.state);
+  expect(sameTick.state).toEqual(reversed.state);
+  expect(sameTick.view).toEqual(reversed.view);
+  expect(sameTick.error.yaw_radians).toBeCloseTo(0.7, 10);
+  const aligned = await track(worker, 5, { ...trackOptions, native_tick: 105,
+    target: { ...trackOptions.pose } }, reversed.state);
+  expect(aligned.aligned).toBe(true);
+  expect(aligned.view.yaw_radians_per_second).toBeCloseTo(0.2, 10);
+  const reset = await track(worker, 6, { ...trackOptions, native_tick: 2 }, aligned.state);
+  expect(reset.state).toEqual({ last_tick: 2, velocity: { yaw_radians_per_second: 0, pitch_radians_per_second: 0 } });
+  expect(reset.view.yaw_radians_per_second).toBe(0);
+  const explicitReset = await track(worker, 7, { ...trackOptions, native_tick: 106 });
+  expect(explicitReset.state.velocity).toEqual(reset.state.velocity);
+});
+
+test("tracking preserves caller JSON and remains realm-local with no retained hidden state", async () => {
+  const source = await validateProgramSource(`export function analyze(input) {
+    const before = JSON.stringify(input);
+    const result = motion.track(input.options,input.state);
+    return {result,unchanged:before===JSON.stringify(input),
+      local:result instanceof Object && result.state instanceof Object && result.state.velocity instanceof Object,
+      frozen:Object.isFrozen(motion) && Object.isFrozen(motion.track)};
+  }`, "analyze", minecraftTestAdapter());
+  const first = await compile(source.source), second = await compile(source.source);
+  const input = { options: { ...trackOptions, native_tick: 105 },
+    state: { last_tick: 100, velocity: { yaw_radians_per_second: 0.3, pitch_radians_per_second: -0.2 } } };
+  const a = await analyze(first, 1, input) as { value: unknown };
+  await analyze(first, 2, { options: { ...trackOptions, native_tick: 500 }, state: null });
+  const again = await analyze(first, 3, input) as { value: unknown };
+  const b = await analyze(second, 1, input) as { value: unknown };
+  expect(a.value).toEqual(b.value);
+  expect(again.value).toEqual(a.value);
+  expect(a).toMatchObject({ value: { unchanged: true, local: true, frozen: true } });
+  const constructorProbe = await compile(`export function analyze(input) {
+    let functionBlocked=false, errorBlocked=false;
+    try { motion.track.constructor("return process")(); } catch { functionBlocked=true; }
+    try { motion.track(null); } catch (error) {
+      try { error.constructor.constructor("return process")(); } catch { errorBlocked=true; }
+    }
+    return {functionBlocked,errorBlocked};
+  }`);
+  expect(await analyze(constructorProbe, 1, null)).toMatchObject({ value: { functionBlocked: true, errorBlocked: true } });
+});
+
+test("tracking deterministically rejects invalid inputs and malformed or out-of-cap explicit state", async () => {
+  const worker = await compile(`export function analyze(input) {
+    return input.map(item => {
+      try { motion.track(item.options,item.state); return "accepted"; }
+      catch(error) { return {range:error instanceof RangeError,message:error.message}; }
+    });
+  }`);
+  const cases = [
+    { options: { ...trackOptions, native_tick: -1 }, state: null },
+    { options: { ...trackOptions, native_tick: 1.5 }, state: null },
+    { options: { ...trackOptions, response_ticks: 0 }, state: null },
+    { options: { ...trackOptions, response_ticks: 0.5 }, state: null },
+    { options: { ...trackOptions, response_ticks: undefined }, state: null },
+    { options: { ...trackOptions, max_acceleration: 0 }, state: null },
+    { options: { ...trackOptions, max_acceleration: -1 }, state: null },
+    { options: { ...trackOptions, max_acceleration: undefined }, state: null },
+    { options: { ...trackOptions, max_rate: 0 }, state: null },
+    { options: { ...trackOptions, max_rate: undefined }, state: null },
+    { options: { ...trackOptions, max_rate: 20 * Math.PI + 1 }, state: null },
+    { options: { ...trackOptions, tolerance: -1 }, state: null },
+    { options: { ...trackOptions, pose: { yaw_radians: 0, pitch_radians: 2 } }, state: null },
+    { options: trackOptions, state: {} },
+    { options: trackOptions, state: { last_tick: 100, velocity: null } },
+    { options: trackOptions, state: { last_tick: -1, velocity: { yaw_radians_per_second: 0, pitch_radians_per_second: 0 } } },
+    { options: trackOptions, state: { last_tick: 100, velocity: { yaw_radians_per_second: 3, pitch_radians_per_second: 0 } } },
+  ];
+  const first = await analyze(worker, 1, cases) as { value: { range: boolean; message: string }[] };
+  const second = await analyze(worker, 2, cases) as { value: unknown };
+  expect(first.value).toHaveLength(cases.length);
+  expect(first.value.every(value => value.range && value.message.startsWith("motion.track"))).toBe(true);
+  expect(second.value).toEqual(first.value);
+  // Non-JSON numbers can be constructed by authored code, not serialized as input.
+  const nonfinite = await compile(`export function analyze(input) {
+    const options=input.options;
+    const checks=[
+      {...options,max_acceleration:Infinity},
+      {...options,target:{yaw_radians:NaN,pitch_radians:0}}
+    ].map(value=>{try{motion.track(value);return false;}catch(error){return error instanceof RangeError;}});
+    try { motion.track(options,{last_tick:100,velocity:{yaw_radians_per_second:NaN,pitch_radians_per_second:0}}); checks.push(false); }
+    catch(error) { checks.push(error instanceof RangeError); }
+    return checks;
+  }`);
+  expect(await analyze(nonfinite, 1, { options: trackOptions })).toMatchObject({ value: [true, true, true] });
+});
+
 for (const [label, source] of [
   ["wrong selected export", "export function step(frame,state,intent) { return null; }"],
   ["async selected export", "export async function analyze(input) { return 1; }"],
@@ -724,6 +889,30 @@ test("unexpected worker death closes transport without a fabricated result", asy
 
 // Replace only the external guardian process, not DockerPolicyWorker's protocol,
 // timers, selected-entry checks, accounting callback, allocation, or cleanup join.
+test("host refuses tracking artifacts before source dispatch when the kernel lacks tracking math", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "resident-old-kernel-"));
+  const guardian = join(directory, "guardian.mjs"), dispatched = join(directory, "source-dispatched");
+  writeFileSync(guardian, `
+    import { writeFileSync } from "node:fs";
+    process.stdout.write(JSON.stringify({v:1,type:"resident_ready",id:0,runtime_features:["pure_modules_v1"]})+"\\n");
+    process.stdin.on("data",()=>writeFileSync(${JSON.stringify(dispatched)},"unexpected dispatch"));
+    process.stdin.on("end",()=>process.exit(0));
+    process.stdin.resume();
+  `);
+  const sandbox = new SandboxService(directory);
+  Object.assign(sandbox, { state: { status: "ready", image: "old-kernel-fixture", error: null },
+    runner: new URL("../sandbox/worker.mjs", import.meta.url).pathname, guardian });
+  try {
+    const source = await validateProgramSource(
+      "export function analyze(input) { return motion.track(input.options,input.state); }",
+      "analyze", minecraftTestAdapter(),
+    );
+    await expect(sandbox.createResidentAnalysisWorker(singletonExecutableModuleBundle(source.source, "analyze"),
+      1000, new AbortController().signal)).rejects.toThrow("required pure module motion features");
+    expect(existsSync(dispatched)).toBe(false);
+  } finally { await sandbox.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 interface HostProtocolFixture<T> { worker: T; release(): void; close(): Promise<void> }
 function hostResidentProtocol(frames: unknown[], result: boolean): Promise<HostProtocolFixture<ResidentAnalysisWorker>>;
 function hostResidentProtocol(frames: unknown[], result: boolean, stepDelayMs: number): Promise<HostProtocolFixture<ResidentWorker>>;
@@ -736,7 +925,7 @@ async function hostResidentProtocol(frames: unknown[], result: boolean, stepDela
     import { existsSync } from "node:fs";
     const send = value => process.stdout.write(JSON.stringify(value) + "\\n");
     const lines = createInterface({ input: process.stdin });
-    send({v:1,type:"resident_ready",id:0});
+    send({v:1,type:"resident_ready",id:0,runtime_features:["pure_modules_v1","motion_track_v1"]});
     lines.on("line", line => {
       const frame = JSON.parse(line);
       if (frame.type === "resident_init") send({v:1,type:"resident_compiled",id:0});

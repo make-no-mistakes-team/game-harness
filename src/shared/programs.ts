@@ -101,7 +101,7 @@ export interface SkillView extends SkillRef {
     api_version?: number;
     validator_version?: number;
     compatibility_hash?: string;
-    runtime_features?: ("pure_modules_v1")[];
+    runtime_features?: ("pure_modules_v1" | "motion_track_v1")[];
   };
   created_at: string;
 }

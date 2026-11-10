@@ -309,6 +309,19 @@ test("unused declarations do not manufacture inline module bytes or change an im
   expect(bundle.source_hash).toBe(root.hash);
 });
 
+test("tracking math admission composes with declared pure dependencies without dropping either requirement", async () => {
+  const f = fixture();
+  const helper = await f.save("tracking library", "library", "export const track = motion.track;");
+  const root = await f.save("tracking root", "analyze",
+    "export function analyze(input) { return motion.track(input.options,input.state); }", [imported(helper)]);
+  expect(root.validation.runtime_features).toEqual(["pure_modules_v1", "motion_track_v1"]);
+  expect(buildExecutableModuleBundle(f.store, f.run.run_id, root).source_hash).toBe(root.hash);
+  const stripped: SkillView = { ...root, validation: { ...root.validation, runtime_features: ["pure_modules_v1"] } };
+  expect(validationCodes(() => resolveArtifactModuleClosure({
+    compatibility_hash: root.validation.compatibility_hash!, read: ref => f.store.skill(f.run.run_id, ref),
+  }, stripped))).toEqual(["invalid_modules"]);
+});
+
 test("module syntax stays local and plain legacy fingerprints remain untagged", async () => {
   const f = fixture();
   for (const specifier of ["node:fs", "package", "../helper.js", "/helper.js", "./nested/../helper.js", "./helper.js?version=1"]) {

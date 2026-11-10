@@ -327,7 +327,11 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
         if (!this.closing)
           this.fail(new Error("Sandbox worker exited unexpectedly."));
       });
-      await ready;
+      const readiness = await ready;
+      const runtimeFeatures = readiness.runtime_features;
+      if (this.residentEntry && (!Array.isArray(runtimeFeatures) ||
+        !["pure_modules_v1", "motion_track_v1"].every(feature => runtimeFeatures.includes(feature))))
+        throw new Error("Resident kernel does not support the required pure module motion features.");
       if (source !== undefined) {
         if (this.residentEntry)
           await this.request("resident_compiled", { v: 1, type: "resident_init", id: 0,
@@ -536,8 +540,13 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
         const frame = reply as Reply;
         if (frame.v !== 1 || frame.id !== this.pending.id ||
           !exactKeys(frame, frame.type === "resident_result"
-            ? ["v", "type", "id", "value"] : ["v", "type", "id"]) || !finiteJson(frame))
+            ? ["v", "type", "id", "value"] : frame.type === "resident_ready"
+              ? ["v", "type", "id", "runtime_features"] : ["v", "type", "id"]) || !finiteJson(frame))
           throw new Error("Resident worker returned an invalid protocol response.");
+        if (frame.type === "resident_ready" && (!Array.isArray(frame.runtime_features) ||
+          frame.runtime_features.length > 2 || new Set(frame.runtime_features).size !== frame.runtime_features.length ||
+          frame.runtime_features.some(feature => feature !== "pure_modules_v1" && feature !== "motion_track_v1")))
+          throw new Error("Resident worker returned invalid runtime features.");
         if (this.residentEntry === "analyze" && frame.type === "resident_result" &&
           !this.analysisEvaluation?.reported)
           throw new Error("Resident analysis result omitted trusted evaluation timing.");

@@ -38,6 +38,49 @@ export interface TemporalTurnResult {
   error: TurnOrientation;
 }
 
+export interface TemporalTrackOptions {
+  /** Actual frame.native_tick, not wall time or the number of callbacks. */
+  native_tick: number;
+  /** Actual frame.view.applied_pose; pitch must already be valid. */
+  pose: TurnOrientation;
+  /** Model-selected orientation; shortest wrapped yaw and clamped target pitch. */
+  target: TurnOrientation;
+  /** Required positive per-axis radians/sec cap, at most 20*pi. */
+  max_rate: number;
+  /** Required finite positive per-axis radians/sec² cap. */
+  max_acceleration: number;
+  /** Required positive safe integer ticks: desired velocity = error / (response_ticks * .05). */
+  response_ticks: number;
+  /** Alignment reporting only, default .01 radians, in [0, pi]; never snaps velocity to zero. */
+  tolerance?: number;
+}
+
+export interface TemporalTrackState {
+  last_tick: number;
+  /** Prior requested velocity, not an assertion that the native pose moved. */
+  velocity: {
+    yaw_radians_per_second: number;
+    pitch_radians_per_second: number;
+  };
+}
+
+export interface TemporalTrackResult {
+  view: { kind: "rate"; yaw_radians_per_second: number; pitch_radians_per_second: number };
+  /**
+   * Explicit immutable JSON state; retain in next_state. Null or a regressed tick
+   * initializes zero velocity at the current tick. Same-tick calls retain velocity,
+   * even if pose/target changes. Target changes otherwise never reset velocity.
+   * Invalid inputs/state throw RangeError, including prior speed above max_rate;
+   * a lower cap therefore requires a fitting carried velocity or an explicit reset.
+   */
+  state: TemporalTrackState;
+  /** Actual pose within tolerance on both axes, not completion or a zero-rate guarantee. */
+  aligned: boolean;
+  error: TurnOrientation;
+}
+
 export interface PureModuleMotion {
   turn(options: TemporalTurnOptions, state?: TemporalTurnState | null): TemporalTurnResult;
+  /** Pure feedback math only: no target selection, timing, arrival or gameplay guarantee. */
+  track(options: TemporalTrackOptions, state?: TemporalTrackState | null): TemporalTrackResult;
 }

@@ -495,7 +495,7 @@ export class PreparedSource {
             catch (error) { attempt.unknown = true; throw error; }
           }
         }),
-      tool("prepare_finish", "Select and seal an exact step executive with explicit activate export, initial args/state, finite limits and session. Ends inference before clean compile and real-world launch; makes no success claim.", finishSchema,
+      tool("prepare_finish", "Select and seal an exact complete step candidate for a bounded real-world development trial, not efficacy certification. Requires activate, initial args/state, finite limits and session. Ends inference before clean compile/launch; no task-success claim or exhaustive-test prerequisite.", finishSchema,
         input => {
           this.current(attempt);
           const root = attempt.book!.select(input);
@@ -541,15 +541,16 @@ export class PreparedSource {
       "This is a fresh source-only codebook; no prior session or cross-model experience is hydrated. Only the advertised tools are authorized. " +
       "program_write saves inactive canonical immutable source; use named versions and CAS based_on for revisions, ordinary libraries/reexports and async run children when useful. " +
       "program_analyze runs bounded pure software tests on your explicitly synthetic input, never actual observations or gameplay qualification. Optional validate_as checks only output return shape; a refusal has valid activation shape but is not accepted live activation. " +
-      "Before sealing, exercise your state transitions on repeated callbacks with a pending child, then terminal success/failure/unknown bookkeeping. " +
-      "Also test loss and return of rows in a partial sensing projection: absence locally is not global absence, and any retained evidence must keep its original scope/time separate from current target authority. " +
+      "Produce complete source for a finite real-world development trial, not proof of gameplay before a world exists. prepare_finish selects the exact candidate for host validation and that trial; it does not certify efficacy, complete the gameplay goal or require an exhaustive synthetic test suite. " +
+      "Software checks are optional and risk-driven. Correct known implementation/contract defects; do not seal a stub or knowingly missing required behavior. If the complete implementation is internally consistent, select it within the original budget rather than ending with an unfinished test-plan report merely because every scenario is not yet exercised. " +
+      "Useful test priorities include changed pending-child transitions and terminal success/failure/unknown bookkeeping. Partial-row loss/return is another risk: local absence is not global absence; retained evidence needs original scope/time separate from live authority. " +
       "You choose the synthetic inputs, assertions, memory representation and behavior; no host test supplies a route, target or response. " +
-      "Test repeated callbacks after a reporting/completion transition too: every diagnostic or attention event consumes the cumulative event allowance, not just attention. " +
-      "Use an analyze wrapper importing the exact step candidate you intend to select, including its activate/step exports; test your selected initial_state and args on your own labelled synthetic inputs. Return the exact candidate result when using validate_as, rather than only a helper assertion. Catch source exceptions into compact JSON diagnostics and inspect mismatches. This is software checking, not a successful game run. " +
-      "Exercise larger permitted projections too: a complete frame can exceed the16KiB state allowance, and the host does not truncate an oversized next_state into validity. " +
+      "Every diagnostic/attention event consumes the cumulative allowance, including repeated completion callbacks; check changed reporting latches when uncertain. " +
+      "When analyzing, import the exact step candidate and call activate/step on your own labelled synthetic initial_state/args. Return the exact candidate result with validate_as, not a helper assertion or result bundle. Inspect compact source diagnostics and repair actual mismatches. This is software checking, not successful gameplay. " +
+      "Keep explicit state bounded: a complete frame can exceed16KiB, and the host never truncates oversized next_state into validity. Test larger projections when that risk is uncertain. " +
       "View quality matters: repeated timed360-degree scans and full-error delta re-aims are not human-like control. Sound directions are world compass, not screen-relative; compare genuine heard bearings with actual applied yaw. " +
       "Choose purposeful bounded camera changes yourself, retaining your temporal turn/tracking state across moving-target, resource and pickup transitions. A removed block's position is not automatically the next gaze target. " +
-      "Test your exact candidate's view outputs across those transitions as well as its software return shape; a passing JSON schema does not establish a useful smooth camera trajectory. See controller help for motion.turn/track, which provide pure math but no target selection or tactics. " +
+      "Changed view transitions are useful software-check targets; passing JSON shape alone never establishes useful smooth motion. See controller help for motion.turn/track, which supply pure math, not target selection or tactics. " +
       "Inspect your authored sources and actual API/schema help as needed. There is no tool for observing, playing, respawning, network or filesystem access. " +
       "Author an executive step(frame,state,intent) and explicit activate(frame,state,intent), selecting the exact root yourself with prepare_finish(args,initial_state,limits,session). " +
       "The clean playing worker is never invoked during preparation; its first activation receives the real initial frame after launch. Disposable analyze workers may test imported functions on labelled synthetic data. " +

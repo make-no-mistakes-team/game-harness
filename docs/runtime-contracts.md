@@ -38,6 +38,14 @@ The host explicitly reads the native JAR, checks its embedded contract against c
 
 Each attempt has a fresh private sourcebook: no prior working programs, experience snapshot, observations or cross-model history are hydrated. Its tools are `help`, inactive `program_write`, source/catalog-only `program_inspect`, pure `program_analyze` and `prepare_finish`. Writes retain immutable named versions, explicit `based_on` revisions and pinned dependencies; outcome-linked top-level `reason` is unavailable. Analysis uses disposable workers and model-authored synthetic JSON, with results labelled as software tests. It cannot exercise the clean playing worker or establish gameplay effectiveness.
 
+`prepare_finish` selects complete source for a bounded development trial, not
+an efficacy certificate or gameplay completion. Software checks are optional
+and risk-driven; an exhaustive synthetic matrix is not an admission gate.
+Known source/contract defects still need correction. Validation, finite limits,
+clean compile, fresh native applicability and actual ownership checks remain
+mandatory. Neither an untested candidate nor a passing shape check is qualified
+experience; the actual trial and its outcome remain separate evidence.
+
 Preparation help uses the actual source-only tool catalog and argument schemas.
 Its controller launch reference selects `prepare_finish`, not an unavailable
 playing submission. Program help retains the shared executable and module

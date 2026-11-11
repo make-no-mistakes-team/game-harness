@@ -1,7 +1,7 @@
 import { expect, test, vi } from "bun:test";
 import { ControlSession, type ControlSessionOptions } from "../src/server/control-session.ts";
 import { controlSessionConfigSchema, type ExecutiveChoice } from "../src/shared/control-session.ts";
-import { DEFAULT_RESIDENT_LIMITS, ResidentCleanupError, type ResidentClock, type ResidentSnapshot } from "../src/shared/resident.ts";
+import { DEFAULT_RESIDENT_LIMITS, ResidentCleanupError, type ExecutiveStepResult, type ResidentClock, type ResidentSnapshot } from "../src/shared/resident.ts";
 import { singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 import type { GameActionResult, Json } from "../src/shared/contracts.ts";
 import type { ControllerInputChannel, InputAppliedAck, RevocationAck } from "../src/shared/controller.ts";
@@ -117,6 +117,154 @@ function harness(retained = 32, ownBody?: (body: ReturnType<typeof controllerFra
     get stepCount() { return stepCount; }, get activationCount() { return activationCount; },
     get workerClosed() { return workerClosed; }, get retired() { return retired; }, get supervision() { return supervision; } };
 }
+
+const terminalEvent = { kind: "diagnostic", urgency: "ordinary", summary: "Local objective evidence collected",
+  details: { logs: 8, postEncounterDig: true } } as const;
+
+test.each(["completed", "blocked", "yielded"] as const)(
+  "a current %s software return publishes count eight and its event without admitting its terminal choice", async status => {
+    const choice: ExecutiveChoice = status === "completed" ? rawChoice
+      : status === "blocked" ? { kind: "ensure_task", key: 1, request } : { kind: "observe" };
+    const h = harness(), returned = Promise.withResolvers<ExecutiveStepResult>(), finals: ResidentSnapshot[] = [];
+    const eventStatuses: ResidentSnapshot["status"][] = [];
+    let lateIntentAccepted = false;
+    const priorEvent = { ...terminalEvent, summary: "Earlier evidence", details: { logs: 7 } };
+    h.options.limits.max_events = 2;
+    h.options.worker.activate = async () => ({ status: "running", choice: { kind: "observe" },
+      next_state: { logs: 7, done: null }, events: [priorEvent] });
+    h.options.worker.step = async () => returned.promise;
+    h.options.open = vi.fn(h.options.open); h.options.task = vi.fn(h.options.task);
+    h.options.event = vi.fn(event => {
+      if (event.summary !== terminalEvent.summary) return;
+      eventStatuses.push(h.session.snapshot().status);
+      try { h.session.updateIntent({ late: true }, 0); lateIntentAccepted = true; } catch {}
+    });
+    h.options.effect = vi.fn();
+    const changed = h.options.changed;
+    h.options.changed = (snapshot, terminal) => { changed(snapshot, terminal); if (terminal) finals.push(snapshot); };
+    await h.session.start(); await h.clock.advance(0);
+    expect(h.session.snapshot().state).toEqual({ logs: 7, done: null });
+    await h.clock.advance(50); await h.clock.advance(3);
+    returned.resolve({ status, choice, next_state: { logs: 8, done: terminalEvent.summary }, events: [terminalEvent] });
+    await settle(); await h.session.stop("join terminal publication"); await h.clock.advance(1000);
+    expect(finals).toHaveLength(1);
+    expect(finals[0]).toMatchObject({ status, reason: `session_${status}`,
+      state: { logs: 8, done: terminalEvent.summary }, processed_frame_seq: 2, processed_native_tick: 2,
+      processed_native_ns: "50000000", cleanup: { worker: "closed", native: "retired" },
+      counters: { frames: 2, steps: 2, events: 2, submissions: 0, expanded_edges: 0, applied_sequence: 0 },
+      timings: { step_ms: { count: 2, max: 3 }, input_age_ms: { count: 0 } },
+      last_input: null, session: { task_high_water: 0, producer: "none", tasks: [] } });
+    expect(finals[0]!.events).toEqual([
+      { sequence: 1, host_monotonic_ms: 0, event: priorEvent },
+      { sequence: 2, host_monotonic_ms: 53, event: terminalEvent },
+    ]);
+    expect(h.options.event).toHaveBeenCalledTimes(2);
+    expect(h.options.event).toHaveBeenLastCalledWith(terminalEvent);
+    expect(h.options.open).not.toHaveBeenCalled(); expect(h.options.task).not.toHaveBeenCalled();
+    expect(h.options.effect).not.toHaveBeenCalled(); expect(h.sent).toHaveLength(0);
+    expect(h.workerClosed).toBe(1);
+    expect(eventStatuses).toEqual([status]); expect(lateIntentAccepted).toBe(false);
+  });
+
+test("terminal raw input cannot renew an existing producer before its confirmed drain", async () => {
+  const choice = rawChoice;
+  const h = harness(), barrier = Promise.withResolvers<void>(), finals: ResidentSnapshot[] = [];
+  h.options.open = vi.fn(h.options.open); h.options.task = vi.fn(h.options.task); h.options.event = vi.fn();
+  const renew = vi.fn(async () => {}); h.onRenew(renew);
+  const changed = h.options.changed;
+  h.options.changed = (snapshot, terminal) => { changed(snapshot, terminal); if (terminal) finals.push(snapshot); };
+  h.choose(rawChoice); await h.session.start(); await h.clock.advance(50);
+  expect(h.sent).toHaveLength(1); expect(renew).toHaveBeenCalledTimes(1);
+  h.setRetirement(barrier.promise);
+  h.options.worker.step = async () => ({ status: "completed", choice,
+    next_state: { logs: 8, done: terminalEvent.summary }, events: [terminalEvent] });
+  await h.clock.advance(50);
+  expect(h.session.snapshot()).toMatchObject({ state: { logs: 8, done: terminalEvent.summary },
+    status: "completed", cleanup: { worker: "closed", native: "open" } });
+  expect(finals).toHaveLength(0); expect(h.retired).toBe(0);
+  expect(h.options.open).toHaveBeenCalledTimes(1); expect(renew).toHaveBeenCalledTimes(1);
+  expect(h.options.task).not.toHaveBeenCalled(); expect(h.sent).toHaveLength(1);
+  const stopping = h.session.stop("join terminal drain"); barrier.resolve(); await stopping;
+  expect(finals).toHaveLength(1);
+  expect(finals[0]).toMatchObject({ status: "completed", counters: { submissions: 1, applied_sequence: 0, events: 1 },
+    cleanup: { worker: "closed", native: "retired" }, session: { producer: "none", task_high_water: 0, tasks: [] } });
+  expect(h.options.event).toHaveBeenCalledTimes(1); expect(h.retired).toBe(1); expect(h.workerClosed).toBe(1);
+});
+
+test("a terminal activation publishes software evidence but unconfirmed cleanup remains unknown", async () => {
+  const h = harness();
+  h.options.worker.activate = async () => ({ status: "completed", choice: rawChoice,
+    next_state: { logs: 8, done: terminalEvent.summary }, events: [terminalEvent] });
+  h.options.worker.close = async () => { throw new ResidentCleanupError(); };
+  h.options.event = vi.fn(); h.options.open = vi.fn(h.options.open);
+  await h.session.start(); await h.clock.advance(0);
+  await expect(h.session.stop("join unknown cleanup")).rejects.toBeInstanceOf(ResidentCleanupError);
+  expect(h.snapshots.at(-1)).toMatchObject({ status: "unknown", state: { logs: 8, done: terminalEvent.summary },
+    processed_frame_seq: 1, counters: { events: 1, submissions: 0 }, cleanup: { worker: "unknown", native: "retired" } });
+  expect(h.options.event).toHaveBeenCalledTimes(1); expect(h.options.open).not.toHaveBeenCalled();
+});
+
+test("a terminal event cannot exceed the cumulative source-event budget or publish partial state", async () => {
+  const h = harness();
+  h.options.limits.max_events = 1;
+  h.options.worker.activate = async () => ({ status: "running", choice: { kind: "observe" },
+    next_state: { logs: 7, done: null }, events: [terminalEvent] });
+  h.options.worker.step = async () => ({ status: "completed", choice: rawChoice,
+    next_state: { logs: 8, done: terminalEvent.summary }, events: [terminalEvent] });
+  h.options.event = vi.fn(); h.options.open = vi.fn(h.options.open);
+  await h.session.start(); await h.clock.advance(50); await h.session.stop("join event budget failure");
+  expect(h.session.snapshot()).toMatchObject({ status: "failed", reason: "session_event_budget",
+    state: { logs: 7, done: null }, processed_frame_seq: 1, processed_native_tick: 1, processed_native_ns: "0",
+    counters: { events: 1, submissions: 0 }, timings: { step_ms: { count: 1 } },
+    cleanup: { worker: "closed", native: "retired" } });
+  expect(h.session.snapshot().events).toHaveLength(1);
+  expect(h.options.event).toHaveBeenCalledTimes(1); expect(h.options.open).not.toHaveBeenCalled();
+});
+
+test("terminal publication retains the bounded event tail without resetting cumulative event accounting", async () => {
+  const h = harness();
+  h.options.limits.max_events = 129; h.options.event = vi.fn();
+  const running = async () => ({ status: "running" as const, choice: { kind: "observe" as const }, next_state: 7,
+    events: Array.from({ length: 16 }, () => ({ ...terminalEvent, summary: "Earlier software event" })) });
+  h.options.worker.activate = running; h.options.worker.step = running;
+  await h.session.start(); await h.clock.advance(350);
+  expect(h.session.snapshot().counters.events).toBe(128);
+  h.options.worker.step = async () => ({ status: "completed", choice: { kind: "observe" },
+    next_state: 8, events: [terminalEvent] });
+  await h.clock.advance(50); await h.session.stop("join bounded terminal publication");
+  const snapshot = h.session.snapshot();
+  expect(snapshot.counters.events).toBe(129); expect(snapshot.events).toHaveLength(128);
+  expect(snapshot.events[0]!.sequence).toBe(2);
+  expect(snapshot.events.at(-1)).toEqual({ sequence: 129, host_monotonic_ms: 400, event: terminalEvent });
+  expect(h.options.event).toHaveBeenCalledTimes(129);
+});
+
+test.each(["intent", "scope", "Stop", "deadline", "stale"] as const)(
+  "a terminal return superseded by %s cannot publish software state, frame bookkeeping or events", async cause => {
+    const h = harness(), returned = Promise.withResolvers<ExecutiveStepResult>();
+    h.options.worker.activate = async () => ({ status: "running", choice: { kind: "observe" },
+      next_state: { logs: 7, done: null }, events: [] });
+    h.options.worker.step = async () => returned.promise;
+    h.options.event = vi.fn(); h.options.open = vi.fn(h.options.open); h.options.task = vi.fn(h.options.task);
+    await h.session.start(); await h.clock.advance(50);
+    let stopping: Promise<void> | undefined;
+    if (cause === "intent") h.session.updateIntent({ revised: true }, 0);
+    else if (cause === "scope") h.setActive(false);
+    else if (cause === "Stop") stopping = h.session.stop("operator Stop");
+    else await h.clock.advance(cause === "deadline" ? 9950 : 126);
+    returned.resolve({ status: "completed", choice: { kind: "ensure_task", key: 1, request },
+      next_state: { logs: 8, done: terminalEvent.summary }, events: [terminalEvent] });
+    await settle(); await (stopping ?? h.session.stop("join rejected terminal return"));
+    expect(h.session.snapshot()).toMatchObject({ state: { logs: 7, done: null },
+      processed_frame_seq: 1, processed_native_tick: 1, processed_native_ns: "0",
+      counters: { events: 0, submissions: 0, stale_results: cause === "stale" ? 0 : 1 },
+      timings: { step_ms: { count: 1 } }, cleanup: { worker: "closed", native: "retired" },
+      session: { task_high_water: 0, tasks: [] } });
+    expect(h.session.snapshot().status).toBe(cause === "Stop" || cause === "deadline" ? "stopped" : "failed");
+    expect(h.session.snapshot().events).toEqual([]);
+    expect(h.options.event).not.toHaveBeenCalled(); expect(h.options.open).not.toHaveBeenCalled();
+    expect(h.options.task).not.toHaveBeenCalled(); expect(h.sent).toHaveLength(0);
+  });
 
 test("finite child completion and a racing continue leave the executive alive without restarting the task", async () => {
   const h = harness(); h.choose({ kind: "ensure_task", key: 1, request });

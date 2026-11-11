@@ -281,7 +281,8 @@ export class StrategicContext {
       if (section.topic === "game" && (section.section === "validation" || section.section === "lifecycle" ||
         section.section === "progress")) return 2;
       if (section.topic === "programs" &&
-        (section.section === "temporal_turn" || section.section === "temporal_tracking")) return 0;
+        (section.section === "temporal_turn" || section.section === "temporal_tracking" ||
+          section.section === "compass_bearings")) return 0;
       // Complete callable action families outrank duplicate lifecycle prose:
       // the root contract already carries that prose, not native argument schemas.
       if (section.topic === "programs" && section.section.startsWith("resident.")) return 2;

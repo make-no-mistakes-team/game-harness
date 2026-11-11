@@ -136,7 +136,8 @@ export class ControlSession {
     this.notify(true); this.schedule();
   }
   updateIntent(intent: Json, expectedVersion: number): number {
-    if (!this.current() || expectedVersion !== this.data.intent_version) throw new Error("Stale executive intent update");
+    if (!this.current() || this.data.status !== "running" || expectedVersion !== this.data.intent_version)
+      throw new Error("Stale executive intent update");
     this.rawMonitor.clear();
     this.stationaryViewMonitor.clear();
     this.intent = structuredClone(intent); return ++this.data.intent_version;
@@ -213,13 +214,17 @@ export class ControlSession {
       await this.recover("known_unsent_stale_decision"); return;
     }
     if (result.events.length > limits.max_events - this.events) throw new Error("session_event_budget");
-    if (result.status !== "running") { this.data.status = result.status; void this.stop(`session_${result.status}`); return; }
+    const terminal = result.status !== "running";
     const choice = result.choice;
-    const implicitEdges = choice.kind === "raw" && choice.input.kind === "world" && !("edges" in choice.input) &&
-      (Object.keys(this.submittedHeld) as (keyof WorldHeld)[]).some(button =>
-        choice.input.kind === "world" && choice.input.held[button] !== this.submittedHeld[button]);
-    const adopted = await this.choose(choice, frame, version);
-    if (!adopted || !this.current() || version !== this.data.intent_version) return;
+    let implicitEdges = false;
+    // A terminal software return is publishable, but its choice admits no effects.
+    if (!terminal) {
+      implicitEdges = choice.kind === "raw" && choice.input.kind === "world" && !("edges" in choice.input) &&
+        (Object.keys(this.submittedHeld) as (keyof WorldHeld)[]).some(button =>
+          choice.input.kind === "world" && choice.input.held[button] !== this.submittedHeld[button]);
+      const adopted = await this.choose(choice, frame, version);
+      if (!adopted || !this.current() || version !== this.data.intent_version) return;
+    }
     this.data.state = structuredClone(result.next_state); this.cursor = frame.audible.next_cursor;
     this.data.processed_frame_seq = frame.frame_seq; this.data.processed_native_tick = frame.native_tick;
     this.data.processed_native_ns = frame.captured_native_ns;
@@ -227,19 +232,24 @@ export class ControlSession {
     this.data.timings.step_ms.count++; this.data.timings.step_ms.max = Math.max(this.data.timings.step_ms.max ?? 0, elapsed);
     // This survives harmless raw/observe producer turnover, not semantic work or
     // authority changes. It certifies samples and accepted choices, never ACKs.
-    if (implicitEdges || this.activeTask || elapsed > 150) this.stationaryViewMonitor.clear();
-    else {
+    if (!terminal && (implicitEdges || this.activeTask || elapsed > 150)) this.stationaryViewMonitor.clear();
+    else if (!terminal) {
       const incident = this.stationaryViewMonitor.update(
         `${this.options.execution_id}:${this.session.behavior_generation}:${version}`, frame, choice, this.clock.now(),
         choice.kind !== "raw" || this.raw !== null);
       if (incident) this.options.record("session.continuity_incident", { ...incident,
         intent_version: version, behavior_generation: this.session.behavior_generation });
     }
+    if (terminal) this.data.status = result.status;
     for (const event of result.events) {
       this.events++; this.data.counters.events = this.events;
       this.data.events.push({ sequence: this.events, host_monotonic_ms: this.clock.now(), event });
       if (this.data.events.length > 128) this.data.events.shift();
       this.options.event(event);
+    }
+    if (terminal) {
+      // stop joins this tick; awaiting it here would deadlock its own drain.
+      void this.stop(`session_${result.status}`); return;
     }
     this.notify();
   }

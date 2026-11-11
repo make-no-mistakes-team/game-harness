@@ -526,7 +526,8 @@ export class PreparedSource {
     if (input.topic === "programs" && "resident" in reference) {
       const { operations: _operations, software_tests: _tests, ...resident } = reference.resident as Record<string, unknown>;
       return { authority, schemas, body: reference.body, identifiers: reference.identifiers,
-        coverage: reference.coverage, hearing: reference.hearing, composition: reference.composition, resident,
+        coverage: reference.coverage, hearing: reference.hearing, compass_bearings: reference.compass_bearings,
+        composition: reference.composition, resident,
         software_tests: softwareTests, world_view: reference.world_view, temporal_turn: reference.temporal_turn,
         temporal_tracking: reference.temporal_tracking, target_transitions: reference.target_transitions,
         result: reference.result, execution_limits: reference.execution_limits,

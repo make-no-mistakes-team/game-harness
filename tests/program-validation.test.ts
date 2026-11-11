@@ -16,6 +16,8 @@ import type { SkillSpec } from "../src/shared/programs.ts";
 import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 import { policySpecSchema } from "../src/shared/validation.ts";
 import { activeExecutableValidationSchema } from "../src/shared/adapter.ts";
+import { PreparedSourcebook } from "../src/server/prepared-sourcebook.ts";
+import { preparationFailure } from "../src/server/prepared-source-error.ts";
 
 const fixtureContract = minecraftTestAdapter();
 test("motion math requirements survive direct, aliased and computed binding access and alter immutable admission", async () => {
@@ -78,6 +80,132 @@ async function rejection(work: Promise<unknown>, code: string) {
   }
   throw new Error("Expected program admission to fail");
 }
+
+test("pure source writes reject nested shorthand typos before retaining any version", async () => {
+  const source = [
+    "export function step(f,s,intent) {",
+    "  const t = f.native_tick;",
+    "  function issue(action,ms,max,id) {",
+    "    const key = 1, request = {action,ms};",
+    "    s.pending = {key,request,tick,kind:action.kind,max,id};",
+    "  }",
+    "  return issue(intent.action,t,2,'pending');",
+    "}",
+  ].join("\n");
+  const book = new PreparedSourcebook("a".repeat(64), fixtureContract, () => {}, () => {});
+  const input = { ...specification(source), name: "scope admission", entry: "step", dependencies: [] };
+  const error = await rejection(book.write(input, "scope-write", "request"), "unbound_identifier");
+  expect(book.versions).toBe(0);
+  expect(book.sourceBytes).toBe(0);
+  const diagnostic = error.issues.find(entry => entry.code === "unbound_identifier")!;
+  expect(diagnostic.message).toContain('"tick"');
+  expect(diagnostic.location).toEqual({ line: 5, column: 30 });
+  const feedback = preparationFailure(error);
+  expect(feedback.code).toBe("invalid_source");
+  expect(JSON.stringify(feedback.issues)).toBe(JSON.stringify(error.issues));
+  for (const kind of ["step", "analyze", "library"] as const) {
+    const selected = kind === "analyze" ? "export function analyze(input) { return {missing}; }" : source;
+    await rejection(validateProgramSource(selected, kind, fixtureContract), "unbound_identifier");
+  }
+});
+
+test("module free reads, calls, writes and computed expressions are admission errors", async () => {
+  for (const body of [
+    "return absent;",
+    "return absent();",
+    "absent = input; return null;",
+    "absent++; return null;",
+    "({value: absent} = input); return null;",
+    "return {[absent]: input};",
+    "return input[absent];",
+    "return class { [absent]() {} };",
+    "return class { field = absent; };",
+    "return class { static { absent(); } };",
+    "const {value = absent} = input; return value;",
+    "const {[absent]: value} = input; return value;",
+    "function nested(value = bodyOnly) { var bodyOnly = 1; return value; } return nested();",
+    "{ let scoped = input; } return scoped;",
+    "{ function scoped() {} } return scoped();",
+    "try {} catch ({message}) {} return message;",
+    "const value = function named() { return named; }; return named;",
+    "const value = class Named { method() { return Named; } }; return Named;",
+    "class Local { static { var hidden = 1; } } return hidden;",
+  ]) {
+    const error = await rejection(validateProgramSource(`export function analyze(input) { ${body} }`, "analyze", fixtureContract),
+      "unbound_identifier");
+    expect(error.issues.every(entry => entry.location !== null)).toBe(true);
+  }
+  await rejection(validateProgramSource("const unused = absent; export function analyze(input) { return input; }",
+    "analyze", fixtureContract), "unbound_identifier");
+});
+
+test("pure modules resolve closures, hoisting, patterns, catch and class expression scopes", async () => {
+  for (const body of [
+    "const read = () => later + helper(); var later = 2; function helper() { return input.value; } return read();",
+    "const read = () => later; let later = input.value; return read();",
+    "if (input) { var shared = input.value; } return shared;",
+    "let total = 0; outer: for (let index = 0; index < 2; index++) { if (index) continue outer; const read = () => index; total += read(); } return total;",
+    "const seed = input.value; function nested({value = seed} = {}, [first = seed] = []) { return () => value + first; } return nested()();",
+    "const fallback = 2; const {[input.key]: value = fallback, ...rest} = input; const [first = value, ...tail] = rest.values; return {value,first,tail};",
+    "let result; try { throw input; } catch ({value: reason = 1, ...rest}) { result = (() => reason + rest.extra)(); } return result;",
+    "const callable = function recurse(value) { return value ? recurse(value - 1) : input.value; }; return callable(1);",
+    "const Type = class Named { field = input.value; #private = 1; method() { return Named; } static { const inner = Named; var local = inner; } }; return new Type().field;",
+    "class Base {} class Child extends Base { [input.key]() { return Child; } static value = input.value; } return Child.value;",
+    "const key = 'value'; return {absent: input.absent, [key]: input[key], method({value = 1}) { return value; }};",
+    "switch (input.kind) { case 1: { const result = input.value; return result; } default: return null; }",
+  ]) {
+    await validateProgramSource(`export function analyze(input) { ${body} }`, "analyze", fixtureContract);
+  }
+  const admitted = await validateProgramSource(
+    "export function analyze(input) { const closure = () => later + hoisted(); var later = 2; function hoisted() { return input; } return closure(); }",
+    "analyze", fixtureContract);
+  const module = await import(`data:text/javascript;base64,${Buffer.from(admitted.source).toString("base64")}`);
+  expect(module.analyze(40)).toBe(42);
+});
+
+test("module scope admission distinguishes safe typeof probes from ordinary unknown references", async () => {
+  for (const body of ["return typeof optionalFeature;", "return typeof (optionalFeature) === 'undefined';"])
+    await validateProgramSource(`export function analyze(input) { ${body} }`, "analyze", fixtureContract);
+  for (const body of [
+    "return typeof optionalFeature.value;",
+    "return typeof optionalFeature();",
+    "return typeof (0, optionalFeature);",
+    "return typeof optionalFeature === 'function' && optionalFeature();",
+  ]) await rejection(validateProgramSource(`export function analyze(input) { ${body} }`, "analyze", fixtureContract), "unbound_identifier");
+  await rejection(validateProgramSource("export function analyze(input) { return typeof process; }", "analyze", fixtureContract),
+    "forbidden_api");
+});
+
+test("pure modules admit ECMAScript realm math and reject host-only globals", async () => {
+  await validateProgramSource(`export function analyze(input) {
+    return [Math, JSON, Object, Array, Number, Boolean, String, BigInt, Symbol, Date, RegExp, Intl,
+      Map, Set, WeakMap, WeakSet, WeakRef, FinalizationRegistry, Promise, Proxy, Reflect,
+      Iterator, Float16Array, DisposableStack, AsyncDisposableStack, SuppressedError,
+      Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError, AggregateError,
+      ArrayBuffer, DataView, Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
+      Int32Array, Uint32Array, Float32Array, Float64Array, BigInt64Array, BigUint64Array,
+      NaN, Infinity, undefined, parseInt, parseFloat, isFinite, isNaN, encodeURI, decodeURI,
+      encodeURIComponent, decodeURIComponent, motion];
+  }`, "analyze", fixtureContract);
+  for (const name of ["URL", "TextEncoder", "performance", "structuredClone", "crypto", "game", "args"])
+    await rejection(validateProgramSource(`export function analyze(input) { return ${name}; }`, "analyze", fixtureContract),
+      "unbound_identifier");
+  for (const body of ["return process;", "return fetch(input);", "return globalThis;", "return {console};",
+    "const process = input; return process;", "return (() => arguments)();"])
+    await rejection(validateProgramSource(`export function analyze(input) { ${body} }`, "analyze", fixtureContract), "forbidden_api");
+});
+
+test("unbound identifier feedback bounds names and issue count without echoing source values", async () => {
+  const name = "missing".repeat(100);
+  const error = await rejection(validateProgramSource(
+    `export function analyze(input) { const secret = "PRIVATE_SOURCE_VALUE"; return [${name},${Array.from({ length: 40 }, (_, index) => `missing${index}`).join(",")}]; }`,
+    "analyze", fixtureContract), "unbound_identifier");
+  expect(error.issues).toHaveLength(16);
+  expect(error.issues[0]!.message.length).toBeLessThan(200);
+  expect(error.issues[0]!.message).toContain(name.slice(0, 80));
+  expect(JSON.stringify(preparationFailure(error))).not.toContain("PRIVATE_SOURCE_VALUE");
+  expect(JSON.stringify(error.issues)).not.toContain(name);
+});
 
 test("selected resident modules preserve helpers and literal semantics without source-format guessing", async () => {
   for (const kind of ["step", "analyze"] as const) {

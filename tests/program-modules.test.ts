@@ -46,6 +46,29 @@ test("trusted artifact catalogs resolve the same inline realm without inventing 
   expect(resolveArtifactModuleClosure(catalog, root)).toEqual(resolveProgramModuleClosure(f.store, f.run.run_id, root));
 });
 
+test("scope admission resolves import aliases and reexports without treating property names as free reads", async () => {
+  const f = fixture();
+  const helper = await f.save("scope helper", "library",
+    "const value = 3; export {value, value as process}; export default function(value) { return value; }");
+  const middle = await f.save("scope aliases", "library", `
+    import identity, {value as local, process as safe} from "./helper.js";
+    import * as namespace from "./helper.js";
+    const result = identity(local) + namespace.value + safe;
+    export {result as process};
+    export {value as missing} from "./helper.js";
+    export * as forwarded from "./helper.js";
+  `, [imported(helper)]);
+  const root = await f.save("scope consumer", "analyze", `
+    import * as values from "./helper.js";
+    export function analyze(input) {
+      const key = "process";
+      return {process: values.process, motion: input.motion, [key]: values[key], tick: values.missing};
+    }
+  `, [imported(middle)]);
+  expect(root.validation.runtime_features).toEqual(["pure_modules_v1"]);
+  expect(buildExecutableModuleBundle(f.store, f.run.run_id, root).modules).toHaveLength(3);
+});
+
 test("prepared activate admission checks resolved reexports without calling any frame function", async () => {
   const f = fixture();
   const library = await f.save("executive exports", "library",

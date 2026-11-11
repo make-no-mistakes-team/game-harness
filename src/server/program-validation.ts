@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { parse, version as acornVersion } from "acorn";
+import { analyze as analyzeScopes, version as scopeAnalyzerVersion } from "eslint-scope";
 import { format, version as prettierVersion } from "prettier";
 import { z } from "zod";
 import type { SkillLimits, SkillSpec, SkillView } from "../shared/programs.ts";
@@ -118,6 +119,33 @@ const forbiddenAmbient = new Set([
   "console",
   "arguments",
 ]);
+// ECMAScript globals supplied by the pure worker's empty Node VM realm, plus
+// its explicit math capability. Never derive this from the host's globalThis:
+// admission runs under Bun/Node, whose host APIs are not module capabilities.
+const pureRealmGlobals = new Set([
+  "Infinity", "NaN", "undefined",
+  "isFinite", "isNaN", "parseFloat", "parseInt",
+  "decodeURI", "decodeURIComponent", "encodeURI", "encodeURIComponent",
+  "escape", "unescape",
+  "Object", "Boolean", "Symbol", "Number", "BigInt", "String",
+  "Error", "AggregateError", "EvalError", "RangeError", "ReferenceError",
+  "SyntaxError", "TypeError", "URIError",
+  "Math", "Date", "RegExp", "Array",
+  "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+  "Int32Array", "Uint32Array", "BigInt64Array", "BigUint64Array",
+  "Float16Array", "Float32Array", "Float64Array",
+  "Map", "Set", "WeakMap", "WeakSet", "ArrayBuffer", "DataView",
+  "WeakRef", "FinalizationRegistry", "JSON", "Promise", "Reflect", "Proxy",
+  "Iterator", "DisposableStack", "AsyncDisposableStack", "SuppressedError",
+  "Intl", "motion",
+]);
+const MAX_UNBOUND_ISSUES = 16;
+const MAX_IDENTIFIER_HINT = 80;
+const pureModuleScopeFingerprint = Object.freeze({
+  version: 1, analyzer: scopeAnalyzerVersion, ecma_version: 2025,
+  globals: Object.freeze([...pureRealmGlobals]), typeof_unknown: "direct_identifier_only",
+  maximum_issues: MAX_UNBOUND_ISSUES, maximum_identifier_hint: MAX_IDENTIFIER_HINT,
+});
 const forbiddenSyntax: Record<string, true> = {
   ImportDeclaration: true,
   ImportExpression: true,
@@ -330,7 +358,7 @@ function parseModule(source: string, kind: "step" | "analyze" | "library") {
   };
   let ast: SyntaxNode;
   try {
-    ast = parse(source, { ecmaVersion: "latest", sourceType: "module" }) as unknown as SyntaxNode;
+    ast = parse(source, { ecmaVersion: "latest", sourceType: "module", ranges: true }) as unknown as SyntaxNode;
   } catch (error) {
     const position = typeof error === "object" && error !== null && "pos" in error && typeof error.pos === "number" ? error.pos : 0;
     throw new ProgramValidationError([issue("invalid_syntax", "Source must be an ordinary JavaScript module.", locate(position))]);
@@ -407,6 +435,7 @@ function analyze(source: string, kind: ProgramSourceKind) {
   let maximumComplexity = 1;
   let maximumNesting = 0;
   let usesMotionMath = false;
+  const typeofProbes = new Set<number>();
   const visit = (
     node: SyntaxNode,
     parent: SyntaxNode | null,
@@ -429,7 +458,7 @@ function analyze(source: string, kind: ProgramSourceKind) {
       );
     }
     if (
-      node.type === "Identifier" &&
+      !module && node.type === "Identifier" &&
       typeof node.name === "string" &&
       forbiddenAmbient.has(node.name) &&
       identifierIsReference(node, parent, key)
@@ -442,10 +471,10 @@ function analyze(source: string, kind: ProgramSourceKind) {
         ),
       );
     }
-    // Conservatively tag any access to the binding, not just `.track`: authored
-    // aliases, destructuring and computed property names must not evade admission.
-    if (module && node.type === "Identifier" && node.name === "motion" &&
-      identifierIsReference(node, parent, key)) usesMotionMath = true;
+    // Only typeof's direct Identifier operand is a nonthrowing unknown-name
+    // probe. `typeof missing.x`, calls and sequence expressions still read it.
+    if (module && node.type === "UnaryExpression" && node.operator === "typeof" &&
+      isNode(node.argument) && node.argument.type === "Identifier") typeofProbes.add(node.argument.start);
     const bareBlock =
       node.type === "BlockStatement" &&
       parent !== null &&
@@ -483,6 +512,40 @@ function analyze(source: string, kind: ProgramSourceKind) {
   };
   try {
     visit(parsed.fn, null, "", 0, { value: 1 });
+    if (module && !issues.length) {
+      // Export provenance in program-modules.ts is not lexical name resolution.
+      // ESLint's scope graph handles hoisting, parameter/default environments,
+      // patterns, classes, imports and closures without evaluating source.
+      const scopes = analyzeScopes(parsed.fn as unknown as Parameters<typeof analyzeScopes>[0], {
+        ecmaVersion: 2025,
+        sourceType: "module",
+      });
+      for (const scope of scopes.scopes) for (const reference of scope.references) {
+        const identifier = reference.identifier;
+        const position = identifier.range![0];
+        if (forbiddenAmbient.has(identifier.name)) issues.push(issue("forbidden_api",
+          "Ambient host APIs are not permitted; use the program capabilities.", parsed.locate(position)));
+        // Conservatively tag every actual reference, including local aliases
+        // and computed access, rather than guessing which math member is used.
+        if (identifier.name === "motion") usesMotionMath = true;
+      }
+      // Keep the ambient prohibition authoritative even for typeof and local
+      // bindings. Only names unresolved by the complete ESM scope graph are
+      // candidates for the new unknown-identifier diagnostic.
+      if (!issues.length) {
+        let unbound = 0;
+        for (const reference of scopes.globalScope!.through) {
+          const identifier = reference.identifier;
+          const position = identifier.range![0];
+          if (pureRealmGlobals.has(identifier.name) || typeofProbes.has(position)) continue;
+          const hint = identifier.name.slice(0, MAX_IDENTIFIER_HINT) +
+            (identifier.name.length > MAX_IDENTIFIER_HINT ? "…" : "");
+          issues.push(issue("unbound_identifier",
+            `Unbound identifier ${JSON.stringify(hint)}; declare or import this binding.`, parsed.locate(position)));
+          if (++unbound === MAX_UNBOUND_ISSUES) break;
+        }
+      }
+    }
   } catch {
     throw new ProgramValidationError([
       issue("analysis_limit", "Source is too deeply nested to analyze safely."),
@@ -661,6 +724,8 @@ export function programFingerprint(hash: string, kind: ProgramSourceKind | "jev"
   runtimeFeatures?: SkillView["validation"]["runtime_features"]): string {
   return contractHash({ validator: 5, runtime: 5, skill_api: SKILL_API_VERSION,
     comments: "permitted", structural_metrics: "descriptive_not_admission_limits", kind,
+    ...((kind === "step" || kind === "analyze" || kind === "library")
+      ? { source_scope: pureModuleScopeFingerprint } : {}),
     ...((kind === "step" || kind === "analyze") ? { pure_math: "motion.turn/native-tick-cubic-v1" } : {}),
     ...(runtimeFeatures?.includes("motion_track_v1") ? { tracking_math: "motion.track/native-tick-feedback-v1" } : {}),
     parser: acornVersion, formatter: prettierVersion, formatterOptions, limits: PROGRAM_LIMITS,

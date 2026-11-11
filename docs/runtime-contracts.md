@@ -142,6 +142,17 @@ New module syntax carries an explicit runtime feature in validation. Preparation
 pins the entire closure before producer retirement; changing a library's latest
 revision cannot alter an already captured root.
 
+Pure `step`, `analyze` and `library` admission also resolves lexical bindings
+with the pinned ECMAScript scope analyzer. Undeclared reads, calls and writes
+produce `unbound_identifier` with a bounded name and original source location,
+before the source is saved or played. Imports, lexical scopes, closures,
+destructuring and hoisting retain their normal meaning. Direct `typeof missing`
+probes remain valid; `typeof missing.member` still reads an undeclared name.
+The realm's explicit ECMAScript globals and `motion` are available, while the
+existing forbidden-host rules remain authoritative. Scope semantics enter the
+validation fingerprint. This is not type, temporal-dead-zone or gameplay
+verification, and legacy async bodies keep their separate contract.
+
 Pure modules also receive the realm-local, frozen `motion.turn(options,state)`
 math binding. The caller supplies actual `native_tick` and applied pose, its
 chosen target orientation, positive `duration_ticks` and `max_rate`, then retains
@@ -281,6 +292,15 @@ The model exports synchronous `activate(frame,state,intent)` and
 activation may instead refuse `{refused:true,reason}`. `help controller` derives
 the exact result, task, session and frame shapes from validators. The host
 supplies no target selection, combat cadence, escape rule or survival policy.
+
+An accepted terminal executive return retains its final software `next_state`,
+processed frame/tick/native timestamp, timing and bounded events. It does not
+admit its final `choice`: no final raw input, child task, renewal or replay.
+Terminal status is visible to event callbacks before they can request another
+intent. Superseded, stopped, stale or over-budget returns cannot publish final
+state. Final execution closure still joins actual worker/native cleanup;
+uncertain cleanup remains unknown. These are model-authored software facts,
+not input-application receipts or trusted task-success evidence.
 
 | Choice | Host behavior |
 | --- | --- |
@@ -954,6 +974,13 @@ and report pitch clamped to `[-pi/2,pi/2]` under ordinary player and vehicle
 constraints. Read those applied values rather than treating a requested
 rotation as an achieved pose. Crossing the yaw wrap boundary does not
 mean that the player made a full turn.
+
+Heard compass labels use world axes, not clockwise map angles or screen sides.
+`N` is `-Z`, while actor yaw zero faces `S/+Z`; `E/+X` therefore means
+`-pi/2`, not `+pi/2`. `help controller` supplies the complete
+`compass_bearings.yaw_radians` data and the `pi/8` sector half-width.
+`here` has no useful horizontal bearing. The mapping neither selects an
+investigation target nor reveals the sound source's identity or position.
 
 The common actor prompt and public program help require target transitions
 to unfold over authored time. The model chooses targets and the rotation

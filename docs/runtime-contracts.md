@@ -967,6 +967,15 @@ or control retires or expires. There is no automatic stop at a target angle.
 The 150 ms capture-age check, 250 ms native lease and original root
 deadline remain separate bounds.
 
+Capture age gates actual new snapshot/key consumption, not the later
+render settlement of an interval already consumed within that bound.
+An unacknowledged nonzero-rate snapshot may therefore receive its final
+pose acknowledgment after 150 ms. Mouse samples and boundary settlement
+still check the current owner, scope and native lease on every call.
+They neither consume another key edge nor renew authority. Stale pending
+snapshots still fence before consumption; Stop, scope loss and lease expiry
+still discard unsampled motion without a completion claim.
+
 Positive yaw turns right: yaw zero faces `+Z`, `+pi/2` faces `-X`,
 `-pi/2` faces `+X`, and `+/-pi` faces `-Z`. Positive pitch points up.
 Actual body and input-acknowledgment `applied_pose` wrap yaw to `[-pi,pi)`

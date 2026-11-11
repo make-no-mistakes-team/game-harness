@@ -2130,7 +2130,10 @@ public final class NativeClient implements ClientModInitializer {
   private void sampleOwnedView(boolean boundary) {
     boolean advancing = viewSimulationAdvancing();
     double progress = boundary ? 1 : client.getRenderTickCounter().getTickDelta(false);
-    if (streamInputs != null && streamCanConsume()) {
+    // An already-consumed interval is awaiting rendered motion/ACK, not another
+    // key consumption. Its original decision may age while that interval settles;
+    // the unchanged owner/lease still gates every sample and drops revoked motion.
+    if (streamInputs != null && streamCurrent()) {
       if (advancing) streamInputs.sampleView(clientTick, progress, boundary);
       if (boundary) settleStreamInput();
     }
@@ -2204,13 +2207,20 @@ public final class NativeClient implements ClientModInitializer {
   public void beforeStreamKeyConsumption() {
     if (client.isOnThread() && streamInputs != null) streamCanConsume();
   }
-  private boolean streamCanConsume() {
+  private boolean streamCurrent() {
     StreamOwner stream = streamOwner;
     if (stream == null || streamInputs == null) return false;
+    if (!streamAuthorized() || stream.queue().expired(System.nanoTime())) {
+      retireController(stream.queue().reason() == null ? "controller_scope_changed" : stream.queue().reason());
+      return false;
+    }
+    return true;
+  }
+  private boolean streamCanConsume() {
+    if (!streamCurrent()) return false;
     long now = System.nanoTime();
     ControllerInputQueue.Entry pending = streamInputs.pending();
-    if (!streamAuthorized() || stream.queue().expired(now) ||
-        pending != null && (now < pending.capturedNanos() || now - pending.capturedNanos() > ControllerInputQueue.FRAME_AGE_NS)) {
+    if (pending != null && (now < pending.capturedNanos() || now - pending.capturedNanos() > ControllerInputQueue.FRAME_AGE_NS)) {
       retireController("controller_input_expired_before_vanilla_consumption");
       return false;
     }

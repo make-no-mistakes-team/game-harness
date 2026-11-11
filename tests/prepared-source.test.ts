@@ -19,7 +19,7 @@ const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
 type Call = { name: string; args: unknown; id?: string };
 const rootSource = "export function activate(frame,state,intent) { return {refused:true,reason:'software fixture only'}; } export function step(frame,state,intent) { return {choice:{kind:'observe'},next_state:state,status:'running',events:[]}; }";
-const rootCalls = (): Call[] => [{ name: "program_write", args: { name: "executive", entry: "step", source: rootSource } },
+const rootCalls = (): Call[] => [{ name: "program_write", args: { name: "executive", source: rootSource } },
   { name: "prepare_finish", args: { name: "executive", version: 1, args: null, initial_state: null, limits: {}, session: { schema_version: 1 } } }];
 const sourceAuthState = (): AuthState => ({ authenticated: true, status: "ready", provider: "openai-codex",
   account_label: null, login: null, error: null,
@@ -90,11 +90,12 @@ function fixture(calls = rootCalls(), overrides: Partial<PreparedSourceOptions> 
     counters: () => ({ releases, compiled, closed, activated }), agent: () => agent!, worker };
 }
 
-test("selected-model inactive source compiles without frames and transfers once to the actual admitted run", async () => {
+test("omitted-entry executive source is selected explicitly, compiles without frames and transfers once to the actual admitted run", async () => {
   const f = fixture(); await f.owner.initialize();
   const accepted = await f.owner.start(f.request);
   expect(accepted.phase).toBe("authoring");
   const candidate = await f.ready;
+  expect(f.agent().results[0]!.isError).not.toBe(true);
   expect(f.counters()).toEqual({ releases: 1, compiled: 1, closed: 0, activated: 0 });
   expect(() => candidate.takeWorker("second-run")).toThrow();
   expect(f.owner.snapshot()?.run_id).toBe("actual-admitted-run");
@@ -157,7 +158,7 @@ test("exact request retries never infer or mutate source again, including after 
 });
 
 test("missing activate is rejected before compiling or launch and late tools cannot alter a sealed root", async () => {
-  const missing = fixture([{ name: "program_write", args: { entry: "step", name: "executive",
+  const missing = fixture([{ name: "program_write", args: { name: "executive",
     source: "export function step(frame,state,intent) { return null; }" } }, rootCalls()[1]!]);
   await missing.owner.initialize(); await missing.owner.start(missing.request); const failure = await missing.terminal;
   expect(failure.phase).toBe("failed"); expect(missing.counters().compiled).toBe(0);
@@ -167,6 +168,72 @@ test("missing activate is rejected before compiling or launch and late tools can
   expect(candidate.sources).toHaveLength(1); expect(candidate.root.version).toBe(1);
   expect(sealed.agent().results).toHaveLength(2);
   await sealed.owner.close();
+});
+
+test("an explicit run entry rejects a step module until the model submits its complete root with the matching entry", async () => {
+  const f = fixture([
+    { name: "program_write", args: { name: "executive", entry: "run", source: rootSource } },
+    { name: "program_write", args: { name: "executive", entry: "step",
+      source: "export function step(frame,state) {} export function activate() {}" } },
+    { name: "program_write", args: { name: "probe", entry: "analyze",
+      source: "export async function analyze(input) {}" } },
+    ...rootCalls(),
+  ]);
+  await f.owner.initialize(); await f.owner.start(f.request); const candidate = await f.ready;
+  expect(f.agent().results[0]!.isError).toBe(true);
+  expect(f.agent().results[0]!.details).toMatchObject({ failed: true, code: "invalid_source",
+    issues: expect.arrayContaining([expect.objectContaining({ code: "forbidden_syntax", entry_contract: {
+      selected_entry: "run", source_format: "async_body", required_exports: [], optional_exports: [],
+      parameter_count: null, detected_exports: ["activate", "step"], omitted_exports: 0,
+      detected_signatures: [
+        { name: "activate", parameter_count: 3, plain_parameters: true, async: false, generator: false },
+        { name: "step", parameter_count: 3, plain_parameters: true, async: false, generator: false },
+      ],
+    } })]) });
+  expect(f.agent().results[1]!.isError).toBe(true);
+  expect(f.agent().results[1]!.details).toMatchObject({ failed: true, code: "invalid_source", issues: [{ entry_contract: {
+    selected_entry: "step", source_format: "module", required_exports: ["step"], optional_exports: ["activate"],
+    parameter_count: 3, detected_exports: ["step", "activate"], omitted_exports: 0,
+    detected_signatures: [
+      { name: "step", parameter_count: 2, plain_parameters: true, async: false, generator: false },
+      { name: "activate", parameter_count: 0, plain_parameters: true, async: false, generator: false },
+    ],
+  } }] });
+  expect(f.agent().results[2]!.isError).toBe(true);
+  expect(f.agent().results[2]!.details).toMatchObject({ failed: true, code: "invalid_source", issues: [{ entry_contract: {
+    selected_entry: "analyze", source_format: "module", required_exports: ["analyze"], optional_exports: [],
+    parameter_count: 1, detected_exports: ["analyze"], omitted_exports: 0,
+    detected_signatures: [{ name: "analyze", parameter_count: 1, plain_parameters: true, async: true, generator: false }],
+  } }] });
+  expect(f.agent().results[3]!.isError).not.toBe(true);
+  expect(candidate.sources).toHaveLength(1);
+  expect(f.owner.snapshot()?.source_versions).toBe(1);
+  expect(f.counters()).toMatchObject({ compiled: 1, activated: 0 });
+  await f.owner.close();
+});
+
+test("async bodies require explicit run entry and cannot be selected as the executive root", async () => {
+  const source = "return {status:'blocked',summary:'software fixture',result:null};";
+  const f = fixture([
+    { name: "program_write", args: { name: "child", source } },
+    { name: "program_write", args: { name: "child", entry: "run", source } },
+    { name: "program_write", args: { name: "executive", source: rootSource,
+      dependencies: [{ name: "child", version: 1 }] } },
+    { name: "prepare_finish", args: { name: "child", version: 1, args: null, initial_state: null,
+      limits: {}, session: { schema_version: 1 } } },
+    rootCalls()[1]!,
+  ]);
+  await f.owner.initialize(); await f.owner.start(f.request); const candidate = await f.ready;
+  expect(f.agent().results[0]!.isError).toBe(true);
+  expect(f.agent().results[1]!.isError).not.toBe(true);
+  expect(f.agent().results[2]!.isError).not.toBe(true);
+  expect(f.agent().results[3]!.isError).toBe(true);
+  expect(candidate.sources.map(value => [value.name, value.entry, value.version])).toEqual([
+    ["child", "run", 1], ["executive", "step", 1],
+  ]);
+  expect(f.owner.snapshot()?.source_versions).toBe(2);
+  expect(f.counters()).toMatchObject({ compiled: 1, activated: 0 });
+  await f.owner.close();
 });
 
 test("cancel fences a late authentic Agent allocation and joins its exact release", async () => {

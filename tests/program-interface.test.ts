@@ -25,6 +25,7 @@ import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import { HistoryReader, HistoryReaderError } from "../src/server/history-reader.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
+import { ProgramValidationError, validateProgramSource } from "../src/server/program-validation.ts";
 import { DiagnosticAgent, DIAGNOSTIC_PROGRAMS } from "../src/evaluation/diagnostic-agent.ts";
 import type { ReactiveRuntime } from "../src/server/reactive.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
@@ -1431,6 +1432,38 @@ test("program_submit rolls back version creation if its exact registration ident
   db.close();
 });
 
+test("ordinary selected-entry rejections expose source-format facts without source or execution admission", async () => {
+  const f = fixture();
+  const executive = "export function step(frame,state,intent) { return 'PRIVATE_SOURCE_VALUE'; } export function activate(frame,state,intent) { return null; }";
+  const cases = [
+    { entry: "run", source: executive, contract: {
+      selected_entry: "run", source_format: "async_body", required_exports: [], optional_exports: [],
+      parameter_count: null, detected_exports: ["step", "activate"], omitted_exports: 0,
+      detected_signatures: ["step", "activate"].map(name => ({ name, parameter_count: 3, plain_parameters: true, async: false, generator: false })),
+    } },
+    { entry: "step", source: "export async function step(frame,state,intent) { return null; }", contract: {
+      selected_entry: "step", source_format: "module", required_exports: ["step"], optional_exports: ["activate"],
+      parameter_count: 3, detected_exports: ["step"], omitted_exports: 0,
+      detected_signatures: [{ name: "step", parameter_count: 3, plain_parameters: true, async: true, generator: false }],
+    } },
+    { entry: "analyze", source: "export function analyze(input,extra) { return null; }", contract: {
+      selected_entry: "analyze", source_format: "module", required_exports: ["analyze"], optional_exports: [],
+      parameter_count: 1, detected_exports: ["analyze"], omitted_exports: 0,
+      detected_signatures: [{ name: "analyze", parameter_count: 2, plain_parameters: true, async: false, generator: false }],
+    } },
+  ];
+  for (const entry of cases) {
+    const reply = await f.write(`wrong ${entry.entry}`, entry.source, { entry: entry.entry });
+    expect(reply.isError).toBe(true);
+    expect(data(reply).error).toMatchObject({ code: "invalid_program",
+      issues: expect.arrayContaining([expect.objectContaining({ entry_contract: entry.contract })]) });
+    expect(JSON.stringify(reply)).not.toContain("PRIVATE_SOURCE_VALUE");
+  }
+  expect(f.store.skills(f.run.run_id)).toHaveLength(0);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+});
+
 test("tool rejections preserve bounded trusted issues without exposing arbitrary host error fields", async () => {
   const f = fixture();
   const issues = [{ code: "invalid_syntax", message: "Invalid body", location: { line: 3, column: 7 }, limit: null,
@@ -1456,6 +1489,41 @@ test("tool rejections preserve bounded trusted issues without exposing arbitrary
   f.toolHost.observe = async () => { throw null; };
   expect(data(await f.call("observe", {})).error.code).toBe("backend_unavailable");
   expect(JSON.stringify(f.store.eventsAfter(f.run.run_id, 0, 500))).not.toContain("PRIVATE_HOST");
+});
+
+test("both ordinary validation fault paths preserve bounded entry facts and strip nested arbitrary metadata", async () => {
+  const f = fixture();
+  const names = Array.from({ length: 12 }, (_, index) => `exported${index}${"x".repeat(90)}`);
+  let validation: ProgramValidationError | null = null;
+  try {
+    await validateProgramSource(names.map(name => `export function ${name}() { return 'PRIVATE_SOURCE_VALUE'; }`).join("\n"), "step", minecraftTestAdapter());
+  } catch (error) {
+    if (!(error instanceof ProgramValidationError)) throw error;
+    validation = error;
+  }
+  if (!validation) throw new Error("Expected invalid selected-entry source");
+  const contract = validation.issues[0]!.entry_contract!;
+  expect(contract.detected_exports).toHaveLength(8);
+  expect(contract.detected_exports.every(name => name.length === 80)).toBe(true);
+  expect(contract.omitted_exports).toBe(4);
+  const issues = validation.issues.map(issue => ({ ...issue, host_secret: "PRIVATE_HOST_FIELD",
+    entry_contract: { ...issue.entry_contract!, host_secret: "PRIVATE_HOST_CONTRACT",
+      detected_signatures: issue.entry_contract!.detected_signatures!.map(signature => ({
+        ...signature, host_secret: "PRIVATE_HOST_SIGNATURE",
+      })) } }));
+  for (const error of [
+    new ProgramValidationError(issues),
+    Object.assign(new RuntimeFault("invalid_program", "Program failed validation"), { issues }),
+  ]) {
+    f.toolHost.observe = async () => { throw error; };
+    const reply = await f.call("observe", {});
+    expect(reply.isError).toBe(true);
+    expect(data(reply).error.issues).toEqual(validation.issues);
+    expect(JSON.stringify(reply)).not.toContain("PRIVATE_");
+  }
+  expect(JSON.stringify(f.store.eventsAfter(f.run.run_id, 0, 500))).not.toContain("PRIVATE_");
+  expect(f.store.skills(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
 });
 
 test("actual history inspection preserves named-domain fault codes at the model boundary", async () => {

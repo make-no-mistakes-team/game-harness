@@ -19,12 +19,30 @@ export const PROGRAM_LIMITS = Object.freeze({
   dependencies: 32,
 });
 
+export const programEntryContractSchema = z.object({
+  selected_entry: z.enum(["run", "step", "analyze"]),
+  source_format: z.enum(["async_body", "module"]),
+  required_exports: z.array(z.enum(["step", "analyze"])).max(1),
+  optional_exports: z.array(z.literal("activate")).max(1),
+  parameter_count: z.number().int().nonnegative().nullable(),
+  detected_exports: z.array(z.string().max(80)).max(8),
+  omitted_exports: z.number().int().nonnegative(),
+  detected_signatures: z.array(z.object({
+    name: z.string().max(80),
+    parameter_count: z.number().int().nonnegative(),
+    plain_parameters: z.boolean(),
+    async: z.boolean(),
+    generator: z.boolean(),
+  })).max(8).optional(),
+});
+
 export interface ProgramValidationIssue {
   code: string;
   message: string;
   location: { line: number; column: number } | null;
   limit: { maximum: number; actual: number } | null;
   path?: string;
+  entry_contract?: z.infer<typeof programEntryContractSchema>;
 }
 
 export class ProgramValidationError extends Error {
@@ -227,6 +245,118 @@ function metadataIssues(error: z.ZodError): ProgramValidationIssue[] {
   }));
 }
 
+function entryBindings(statements: SyntaxNode[]) {
+  const bindings = new Map<string, SyntaxNode>();
+  for (const statement of statements) {
+    const declaration = statement.type === "ExportNamedDeclaration" && isNode(statement.declaration) ? statement.declaration : statement;
+    if (declaration.type === "FunctionDeclaration" && isNode(declaration.id))
+      bindings.set(String(declaration.id.name), declaration);
+    if (declaration.type === "VariableDeclaration") for (const entry of nodes(declaration.declarations))
+      if (isNode(entry.id) && entry.id.type === "Identifier" && isNode(entry.init)) bindings.set(String(entry.id.name), entry.init);
+  }
+  return bindings;
+}
+
+function entryContract(selected: "run" | "step" | "analyze", statements: SyntaxNode[],
+  bindings: Map<string, SyntaxNode>, importedBindings: Set<string> = new Set()): NonNullable<ProgramValidationIssue["entry_contract"]> {
+  const names = new Set<string>();
+  const signatures: NonNullable<ProgramValidationIssue["entry_contract"]>["detected_signatures"] = [];
+  const signatureNames = new Set<string>();
+  const uncertainBindings = new Set<string>();
+  const signature = (name: string, value: SyntaxNode | undefined) => {
+    const seen = new Set<string>();
+    while (value?.type === "Identifier") {
+      const local = String(value.name);
+      if (seen.has(local) || importedBindings.has(local) || uncertainBindings.has(local)) return;
+      seen.add(local);
+      value = bindings.get(local);
+    }
+    if (!value || !functionTypes[value.type] || signatureNames.has(name) || signatures.length === 8) return;
+    signatureNames.add(name);
+    const parameters = nodes(value.params);
+    signatures.push({ name: name.slice(0, 80), parameter_count: parameters.length,
+      plain_parameters: parameters.every(parameter => parameter.type === "Identifier"),
+      async: value.async === true, generator: value.generator === true });
+  };
+  const bindingNames = (node: SyntaxNode, target = names) => {
+    if (node.type === "Identifier" && typeof node.name === "string") target.add(node.name);
+    else if (node.type === "ObjectPattern") for (const property of nodes(node.properties)) {
+      const value = property.type === "RestElement" ? property.argument : property.value;
+      if (isNode(value)) bindingNames(value, target);
+    }
+    else if (node.type === "ArrayPattern") for (const element of nodes(node.elements)) bindingNames(element, target);
+    else if (node.type === "AssignmentPattern" && isNode(node.left)) bindingNames(node.left, target);
+    else if (node.type === "RestElement" && isNode(node.argument)) bindingNames(node.argument, target);
+  };
+  // Only report declaration signatures when the local alias chain is stable.
+  // Conservatively omit writes even in nested scopes rather than guessing
+  // whether a runtime reassignment could select a different function.
+  const declarations = new Set<string>();
+  const pending = [...statements];
+  for (const statement of statements) {
+    const declaration = statement.type === "ExportNamedDeclaration" && isNode(statement.declaration) ? statement.declaration : statement;
+    const declared = isNode(declaration.id) ? [declaration.id] : nodes(declaration.declarations).flatMap(entry => isNode(entry.id) ? [entry.id] : []);
+    for (const binding of declared) {
+      const localNames = new Set<string>();
+      bindingNames(binding, localNames);
+      for (const name of localNames) {
+        if (declarations.has(name)) uncertainBindings.add(name);
+        declarations.add(name);
+      }
+    }
+  }
+  while (pending.length) {
+    const node = pending.pop()!;
+    const written = node.type === "AssignmentExpression" || node.type === "ForInStatement" || node.type === "ForOfStatement"
+      ? node.left : node.type === "UpdateExpression" ? node.argument : null;
+    if (isNode(written)) bindingNames(written, uncertainBindings);
+    for (const value of Object.values(node)) {
+      if (isNode(value)) pending.push(value);
+      else if (Array.isArray(value)) pending.push(...nodes(value));
+    }
+  }
+  for (const statement of statements) {
+    if (statement.type === "ExportDefaultDeclaration") {
+      names.add("default");
+      signature("default", isNode(statement.declaration) ? statement.declaration : undefined);
+    }
+    else if (statement.type === "ExportNamedDeclaration" || statement.type === "ExportAllDeclaration") {
+      if (isNode(statement.exported)) {
+        const name = statement.exported.name ?? statement.exported.value;
+        if (typeof name === "string") names.add(name);
+      }
+      for (const specifier of nodes(statement.specifiers)) if (isNode(specifier.exported)) {
+        const name = specifier.exported.name ?? specifier.exported.value;
+        if (typeof name === "string") {
+          names.add(name);
+          if (!statement.source && isNode(specifier.local)) signature(name, specifier.local);
+        }
+      }
+      if (isNode(statement.declaration)) {
+        const declaration = statement.declaration;
+        if (isNode(declaration.id)) {
+          bindingNames(declaration.id);
+          if (typeof declaration.id.name === "string" && !uncertainBindings.has(declaration.id.name)) signature(declaration.id.name, declaration);
+        }
+        for (const entry of nodes(declaration.declarations)) if (isNode(entry.id)) {
+          bindingNames(entry.id);
+          if (typeof entry.id.name === "string" && !uncertainBindings.has(entry.id.name)) signature(entry.id.name, isNode(entry.init) ? entry.init : undefined);
+        }
+      }
+    }
+  }
+  return {
+    selected_entry: selected,
+    source_format: selected === "run" ? "async_body" : "module",
+    required_exports: selected === "run" ? [] : [selected],
+    optional_exports: selected === "step" ? ["activate"] : [],
+    parameter_count: selected === "run" ? null : selected === "step" ? 3 : 1,
+    detected_exports: [...names].slice(0, 8).map(name => name.slice(0, 80)),
+    omitted_exports: Math.max(0, names.size - 8),
+    detected_signatures: signatures,
+  };
+}
+
 export function validateSkillLimits(value: unknown): SkillLimits {
   const parsed = limitsSchema.safeParse(value);
   if (!parsed.success)
@@ -377,16 +507,9 @@ function parseModule(source: string, kind: "step" | "analyze" | "library") {
     return { fn: ast, body: ast, formatterSource: source, locate, selected, feature };
   const permitted = kind === "step" ? [kind, "activate"] : [kind];
   const names = new Set<string>();
-  const bindings = new Map<string, SyntaxNode>();
+  const bindings = entryBindings(nodes(ast.body));
   const importedBindings = new Set(imports.flatMap(entry => nodes(entry.specifiers).map(specifier =>
     isNode(specifier.local) ? String(specifier.local.name) : "")));
-  for (const statement of nodes(ast.body)) {
-    const declaration = statement.type === "ExportNamedDeclaration" && isNode(statement.declaration) ? statement.declaration : statement;
-    if (declaration.type === "FunctionDeclaration" && isNode(declaration.id))
-      bindings.set(String(declaration.id.name), declaration);
-    if (declaration.type === "VariableDeclaration") for (const entry of nodes(declaration.declarations))
-      if (isNode(entry.id) && entry.id.type === "Identifier" && isNode(entry.init)) bindings.set(String(entry.id.name), entry.init);
-  }
   const valid = exports.every(selected => {
     const declaration = isNode(selected.declaration) ? selected.declaration : null;
     if (!declaration && selected.type === "ExportNamedDeclaration") {
@@ -422,8 +545,9 @@ function parseModule(source: string, kind: "step" | "analyze" | "library") {
     names.add(name); return true;
   });
   if (!valid || (!names.has(kind) && !exports.some(node => node.type === "ExportAllDeclaration"))) {
-    throw new ProgramValidationError([issue("invalid_entry",
-      `Module requires synchronous ${kind} with ${kind === "step" ? "three" : "one"} plain parameters; step may also export activate(frame,state,intent). No other exports are allowed.`)]);
+    throw new ProgramValidationError([{ ...issue("invalid_entry",
+      `Module requires synchronous ${kind} with ${kind === "step" ? "three" : "one"} plain parameters.${kind === "step" ? " step may also export activate(frame,state,intent)." : ""} No other exports are allowed.`),
+      entry_contract: entryContract(kind, nodes(ast.body), bindings, importedBindings) }]);
   }
   return { fn: ast, body: ast, formatterSource: source, locate, selected, feature };
 }
@@ -431,6 +555,8 @@ function parseModule(source: string, kind: "step" | "analyze" | "library") {
 function analyze(source: string, kind: ProgramSourceKind) {
   const module = kind === "step" || kind === "analyze" || kind === "library";
   const parsed = module ? parseModule(source, kind) : parseBody(source, kind);
+  const topLevelExports = kind === "skill" ? nodes(parsed.body.body).filter(node => node.type.startsWith("Export")) : [];
+  const runContract = topLevelExports.length ? entryContract("run", nodes(parsed.body.body), entryBindings(nodes(parsed.body.body))) : undefined;
   const issues: ProgramValidationIssue[] = [];
   let maximumComplexity = 1;
   let maximumNesting = 0;
@@ -450,11 +576,11 @@ function analyze(source: string, kind: ProgramSourceKind) {
     if ((forbiddenSyntax[node.type] && !(module && "selected" in parsed && Array.isArray(parsed.selected) && parsed.selected.includes(node))) ||
       (module && node.type === "AwaitExpression")) {
       issues.push(
-        issue(
+        { ...issue(
           "forbidden_syntax",
           "Imports, exports and ambient execution syntax are not permitted.",
           parsed.locate(node.start),
-        ),
+        ), ...(runContract && topLevelExports[0] === node ? { entry_contract: runContract } : {}) },
       );
     }
     if (

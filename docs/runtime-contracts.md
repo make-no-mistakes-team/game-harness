@@ -18,7 +18,7 @@ The trusted runtime owns scheduling, authorization, persistence, and the action 
 | Lease | Exclusive authority to issue foreground effects for the controlled actor/session, called the avatar here. There is at most one effectful foreground lease. |
 | Skill | An LLM-authored long-running program that can submit bounded actions and consume feedback. It does not own the lease continuously. |
 | Policy / reflex | A short LLM-authored reaction rule, implemented as isolated JavaScript or a declarative fast-model configuration. It proposes a scheduler decision. |
-| Knowledge | Evidence-backed remembered facts or abstractions. It is separate from executable skills and policies. |
+| Knowledge | Remembered evidence or abstractions with their original time and scope. They can inform reasoning without granting current effect authority. Knowledge is separate from executable skills and policies. |
 | Validation | Checks that an artifact is well-formed and can run within its declared capabilities and isolation limits. It does not establish gameplay effectiveness. |
 | Trial | Bounded gameplay use of a validated candidate, with actual outcomes recorded. All normal security and scheduling rules apply. |
 | Strategic turn | One serialized strategic decision, including its tool rounds, bounded context batch and durable outcome. There is never more than one strategic request in flight for the run. |
@@ -37,6 +37,25 @@ The implementation separates `Runtime` lifecycle/observation/goal authority from
 The host explicitly reads the native JAR, checks its embedded contract against current build inputs, and binds its SHA-256 and adapter compatibility hash. Missing or stale artifacts refuse preparation; schema knowledge establishes neither a negotiated native session nor an observation. The model receives the task, selected goal, actual schema/reference help and finite limits, with `world_state`, `observation` and `native_identity` set to null. The host creates no placeholder run, world, session or player-life identity.
 
 Each attempt has a fresh private sourcebook: no prior working programs, experience snapshot, observations or cross-model history are hydrated. Its tools are `help`, inactive `program_write`, source/catalog-only `program_inspect`, pure `program_analyze` and `prepare_finish`. Writes retain immutable named versions, explicit `based_on` revisions and pinned dependencies; outcome-linked top-level `reason` is unavailable. Analysis uses disposable workers and model-authored synthetic JSON, with results labelled as software tests. It cannot exercise the clean playing worker or establish gameplay effectiveness.
+
+Only this source-only `program_write` defaults to `entry:"step"`.
+The executive root exports synchronous `step(frame,state,intent)` and
+`activate(frame,state,intent)` and is still selected explicitly with
+`prepare_finish`. Semantic children use explicit `entry:"run"` with an async
+body, without a function wrapper, imports or exports. Pure test wrappers and
+libraries select `analyze` and `library` explicitly. Ordinary `program_write`
+and `program_submit` retain their `run` default. No entry is inferred from
+source or retried as another format.
+
+Entry-format and module-entry rejections can include `entry_contract`:
+the selected format, required and optional exports, expected plain parameter
+count, and exports detected in the submitted AST. Export names and locally
+resolved signatures each cap at eight entries and 80 characters per name.
+Uncertain imported or reassigned signatures are not guessed. The async-body
+parameter count is `null`; synchronous `step` and `analyze` require three and
+one parameters respectively. Both ordinary and source-only errors retain these
+bounded facts while stripping unrelated metadata. They do not select another
+entry, repair source, retain a rejected version or grant execution authority.
 
 `prepare_finish` selects complete source for a bounded development trial, not
 an efficacy certificate or gameplay completion. Software checks are optional
@@ -301,6 +320,15 @@ intent. Superseded, stopped, stale or over-budget returns cannot publish final
 state. Final execution closure still joins actual worker/native cleanup;
 uncertain cleanup remains unknown. These are model-authored software facts,
 not input-application receipts or trusted task-success evidence.
+
+`historical:true` and `current_authority:false` do not erase recorded evidence.
+They prevent old records from authorizing new effects or supplying live targets.
+Current observations establish current state; an earlier inventory baseline or
+encounter event can still inform a scoped comparison. Authored state keys have
+the meanings defined by their immutable source, not native lifecycle semantics.
+An inferred hostile-death cue is not own-player death. The latter comes from
+native life status and transition evidence. Main must preserve that distinction
+and report uncertainty rather than inventing a death or a verified success.
 
 | Choice | Host behavior |
 | --- | --- |

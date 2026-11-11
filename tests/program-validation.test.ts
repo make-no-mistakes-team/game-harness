@@ -243,6 +243,126 @@ test("resident module admission checks every helper and initializer and only one
   ]) await rejection(validateProgramSource(source, "step", fixtureContract), "forbidden_api");
 });
 
+test("selected run rejects executive exports with bounded async-body contract facts and no retained source", async () => {
+  const book = new PreparedSourcebook("a".repeat(64), fixtureContract, () => {}, () => {});
+  const source = "export function step(frame,state,intent) { return 'PRIVATE_SOURCE_VALUE'; } export function activate(frame,state,intent) { return null; }";
+  const error = await rejection(book.write({ ...specification(source), dependencies: [] }, "wrong-format", "request"), "forbidden_syntax");
+  const contract = { selected_entry: "run" as const, source_format: "async_body" as const, required_exports: [], optional_exports: [],
+    parameter_count: null, detected_exports: ["step", "activate"], omitted_exports: 0,
+    detected_signatures: ["step", "activate"].map(name => ({ name, parameter_count: 3, plain_parameters: true, async: false, generator: false })) };
+  expect(preparationFailure(error)).toMatchObject({ code: "invalid_source", issues: expect.arrayContaining([
+    expect.objectContaining({ code: "forbidden_syntax", entry_contract: contract }),
+  ]) });
+  expect(JSON.stringify(preparationFailure(error))).not.toContain("PRIVATE_SOURCE_VALUE");
+  expect(book.versions).toBe(0);
+  expect(book.sourceBytes).toBe(0);
+  expect(await validateSkill(specification("await game.observe(); return args;"), fixtureContract)).toMatchObject({ entry: "run" });
+});
+
+test("invalid selected module entries expose exact synchronous contracts without relaxing export or parameter admission", async () => {
+  for (const kind of ["step", "analyze"] as const) {
+    const params = kind === "step" ? "frame,state,intent" : "input";
+    const cases = [
+      { source: "const local = 1;", names: [] },
+      { source: `export function other(${params}) { return null; }`, names: ["other"] },
+      { source: `export function ${kind}(${params}) { return null; } export const extra = 1;`, names: [kind, "extra"] },
+      { source: `export async function ${kind}(${params}) { return null; }`, names: [kind] },
+      { source: `export function* ${kind}(${params}) { yield null; }`, names: [kind] },
+      { source: `export default function ${kind}(${params}) { return null; }`, names: ["default"] },
+      ...["", `${params},extra`, kind === "step" ? "frame={},state,intent" : "input={}",
+        kind === "step" ? "frame,state,...intent" : "...input",
+        kind === "step" ? "{frame},state,intent" : "{input}",
+        kind === "step" ? "[frame],state,intent" : "[input]"].map(parameters => ({
+        source: `export function ${kind}(${parameters}) { return null; }`, names: [kind],
+      })),
+      { source: `const local = async (${params}) => null; export {local as ${kind}};`, names: [kind] },
+      { source: `const local = (${params},extra) => null; const alias = local; export {alias as ${kind}};`, names: [kind] },
+      { source: `export {${kind},extra} from './helper.js';`, names: [kind, "extra"] },
+    ];
+    for (const entry of cases) {
+      const error = await rejection(validateProgramSource(entry.source, kind, fixtureContract), "invalid_entry");
+      expect(error.issues[0]!.entry_contract).toMatchObject({
+        selected_entry: kind, source_format: "module", required_exports: [kind],
+        optional_exports: kind === "step" ? ["activate"] : [], parameter_count: kind === "step" ? 3 : 1,
+        detected_exports: entry.names, omitted_exports: 0,
+      });
+    }
+  }
+  await rejection(validateProgramSource(
+    "export function step(frame,state,intent) { return null; } export async function activate(frame,state,intent) { return null; }",
+    "step", fixtureContract), "invalid_entry");
+});
+
+test("entry hints report bounded locally resolved signatures and leave imported signatures unknown", async () => {
+  const cases = [
+    { source: "export function step(frame,state) {} export function activate() {}", expected: [
+      { name: "step", parameter_count: 2, plain_parameters: true, async: false, generator: false },
+      { name: "activate", parameter_count: 0, plain_parameters: true, async: false, generator: false },
+    ] },
+    { source: "const local = async (frame,state,intent) => null; const alias = local; export {alias as step};", expected: [
+      { name: "step", parameter_count: 3, plain_parameters: true, async: true, generator: false },
+    ] },
+    { source: "export function* step(frame,state,intent) {}", expected: [
+      { name: "step", parameter_count: 3, plain_parameters: true, async: false, generator: true },
+    ] },
+    ...["frame={},state,intent", "frame,state,...intent", "{frame},state,intent", "[frame],state,intent"].map(params => ({
+      source: `export function step(${params}) {}`, expected: [
+        { name: "step", parameter_count: 3, plain_parameters: false, async: false, generator: false },
+      ],
+    })),
+    { source: "import {step} from './helper.js'; export {step}; export const extra = 1;", expected: [] },
+    { source: "import {step} from './helper.js'; const alias = step; export {alias as step}; export const extra = 1;", expected: [] },
+    { source: "export {step,extra} from './helper.js';", expected: [] },
+    { source: "let local = (frame,state) => null; local = () => null; export {local as step};", expected: [] },
+    { source: "var local = (frame,state) => null; var local = () => null; export {local as step};", expected: [] },
+    { source: "const first = second; const second = first; export {first as step};", expected: [] },
+  ];
+  for (const entry of cases) {
+    const error = await rejection(validateProgramSource(entry.source, "step", fixtureContract), "invalid_entry");
+    expect(error.issues[0]!.entry_contract!.detected_signatures).toEqual(entry.expected);
+    expect(preparationFailure(error)).toMatchObject({ issues: [{ entry_contract: { detected_signatures: entry.expected } }] });
+  }
+  const long = "helper".repeat(20);
+  const source = Array.from({ length: 12 }, (_, index) => `export function ${long}${index}(frame) {}`).join("\n");
+  const error = await rejection(validateProgramSource(source, "step", fixtureContract), "invalid_entry");
+  const signatures = error.issues[0]!.entry_contract!.detected_signatures!;
+  expect(signatures).toHaveLength(8);
+  expect(signatures.every(signature => signature.name.length === 80 && signature.parameter_count === 1)).toBe(true);
+});
+
+test("entry export hints use AST export names and bound count and length before both projections", async () => {
+  const long = "exported".repeat(20);
+  const extra = Array.from({ length: 10 }, (_, index) => `extra${index}`);
+  const source = `export const {value: ${long}, nested: [${extra.join(",")}]} = {}; export default 'PRIVATE_SOURCE_VALUE';`;
+  for (const kind of ["skill", "step"] as const) {
+    const error = await rejection(validateProgramSource(source, kind, fixtureContract), kind === "skill" ? "forbidden_syntax" : "invalid_entry");
+    const contract = error.issues[0]!.entry_contract!;
+    expect(contract.detected_exports).toEqual([long.slice(0, 80), ...extra.slice(0, 7)]);
+    expect(contract.omitted_exports).toBe(4);
+    const decorated = new ProgramValidationError(error.issues.map(issue => ({
+      ...issue, host_secret: "PRIVATE_METADATA", entry_contract: Object.assign({}, issue.entry_contract, { host_secret: "PRIVATE_METADATA" }),
+    })));
+    expect(JSON.stringify(preparationFailure(decorated).issues)).toBe(JSON.stringify(error.issues));
+    expect(JSON.stringify(preparationFailure(decorated))).not.toContain("PRIVATE_");
+  }
+});
+
+test("valid selected imported reexported and aliased entry paths keep their existing admission", async () => {
+  for (const kind of ["step", "analyze"] as const) {
+    const params = kind === "step" ? "frame,state,intent" : "input";
+    for (const source of [
+      `const local = (${params}) => null; const alias = local; export {alias as ${kind}};`,
+      `import {entry} from './helper.js'; export {entry as ${kind}};`,
+      `import {entry} from './helper.js'; const alias = entry; export {alias as ${kind}};`,
+      `export {entry as ${kind}} from './helper.js';`,
+      "export * from './helper.js';",
+    ]) expect((await validateProgramSource(source, kind, fixtureContract)).source.length).toBeGreaterThan(0);
+  }
+  await validateProgramSource(
+    "export function step(frame,state,intent) { return null; } export function activate(frame,state,intent) { return null; }",
+    "step", fixtureContract);
+});
+
 test("comment-looking strings, regexes, template text and metadata are not executable comments", async () => {
   const source = String.raw`
 const text = "https://example.test/*literal*/";

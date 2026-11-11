@@ -10,7 +10,9 @@ import { PROGRAM_LIMITS, validateSkill } from "./program-validation.ts";
 import { PreparedSourceFault } from "./prepared-source-error.ts";
 
 type Append = (type: string, details: Json) => void;
-export const inactivePreparedWriteSchema = programWriteSchema.omit({ reason: true });
+export const inactivePreparedWriteSchema = programWriteSchema.omit({ reason: true }).extend({
+  entry: programWriteSchema.shape.entry.default("step"),
+});
 
 /** Private immutable history; all mutations and their replay receipt share one durable journal row. */
 export class PreparedSourcebook implements ProgramArtifactCatalog {

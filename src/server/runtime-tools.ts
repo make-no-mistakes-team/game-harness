@@ -10,7 +10,7 @@ import type { SpeculativePlanning } from "./speculative-planning.ts";
 import type { ImprovementLearning } from "./improvement-learning.ts";
 import type { HistoryQueryClient } from "./history-protocol.ts";
 import type { StageCorrection } from "../shared/planning.ts";
-import { ProgramValidationError } from "./program-validation.ts";
+import { ProgramValidationError, programEntryContractSchema } from "./program-validation.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import type { ModelObservation } from "./actor-frames.ts";
 import { ProgramOperations } from "./program-operations.ts";
@@ -25,6 +25,7 @@ const faultIssuesSchema = z.array(z.object({
   location: z.object({ line: z.number().int().positive(), column: z.number().int().positive() }).nullable().optional(),
   limit: z.object({ maximum: z.number().finite(), actual: z.number().finite() }).nullable().optional(),
   latest_parent: z.object({ name: z.string().max(80), version: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).nullable().optional(),
+  entry_contract: programEntryContractSchema.optional(),
 })).max(32);
 
 const runtimeTools = new WeakSet<AgentTool>();
@@ -162,7 +163,7 @@ export class RuntimeTools {
         } catch (error) {
           const invalidArguments = argumentError !== null && error === argumentError;
           const failure: Record<string, Json> = error instanceof ProgramValidationError
-            ? { code: "invalid_program", message: name === "prepare_next" ? "Guard must be an async BODY using only observation,args bindings and returning a strict boolean; no wrapper/import/export." : "Program failed selected-entry validation. run uses async BODY(game,args); step/analyze uses one synchronous named module export with the advertised parameters. No imports/packages/ambient host APIs. Original and canonical source <=16 KiB. See help programs.", retryable: false, issues: JSON.parse(JSON.stringify(error.issues)) as Json }
+            ? { code: "invalid_program", message: name === "prepare_next" ? "Guard must be an async BODY using only observation,args bindings and returning a strict boolean; no wrapper/import/export." : "Program failed selected-entry validation. run uses async BODY(game,args); step/analyze uses one synchronous named module export with the advertised parameters. No imports/packages/ambient host APIs. Original and canonical source <=16 KiB. See help programs.", retryable: false }
             : error instanceof RuntimeFault
               ? { code: error.code, message: error.message, retryable: false }
               : { code: invalidArguments ? "invalid_request" : "backend_unavailable", message: invalidArguments ? "Tool arguments do not match the advertised schema; no operation was admitted" : "The requested operation could not complete safely", retryable: false };
@@ -180,7 +181,7 @@ export class RuntimeTools {
                 } : {}),
               };
             });
-          if (error instanceof RuntimeFault && "issues" in error && Array.isArray(error.issues)) {
+          if ((error instanceof RuntimeFault || error instanceof ProgramValidationError) && "issues" in error && Array.isArray(error.issues)) {
             const issues = faultIssuesSchema.safeParse(error.issues.slice(0, 32));
             if (issues.success) failure.issues = JSON.parse(JSON.stringify(issues.data)) as Json;
           }

@@ -488,6 +488,55 @@ test("explicit resident and selected attention retain ordinary intent/stop autho
   expect(f.state.pauses).toEqual([]);
 });
 
+test("real SDK selected delayed attention settles the decision after its complete tool group and wakes a fresh turn", async () => {
+  let requests = 0, writes = 0;
+  const reasons: unknown[] = [];
+  const f = await setup(async () => { throw new Error("Installed SDK owns the decision loop"); }, async (model, context) => {
+    const index = requests++;
+    const user = context.messages.find(message => message.role === "user");
+    if (user && Array.isArray(user.content)) {
+      const text = user.content.find(part => part.type === "text");
+      if (text?.type === "text") reasons.push(JSON.parse(text.text).reason);
+    }
+    const calls: ToolCall[] = index === 0
+      ? [{ type: "toolCall", id: "read-before-attention", name: "program_inspect", arguments: { view: "catalog" } }]
+      : index === 1 ? [
+        { type: "toolCall", id: "select-later-attention", name: "program_run",
+          arguments: { operation: "attention", after_ms: 1000, reason: "Retain current useful foreground" } },
+        { type: "toolCall", id: "same-group-inactive-write", name: "program_write", arguments: {} },
+      ] : [];
+    const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+      timestamp: Date.now(), stopReason: calls.length ? "toolUse" : "stop", content: calls,
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const stream = new AssistantMessageEventStream();
+    stream.push({ type: "done", reason: calls.length ? "toolUse" : "stop", message }); stream.end();
+    return stream;
+  });
+  f.tools.find(tool => tool.name === "program_run")!.execute = async () => {
+    f.planner.attentionAfter(1000, "Retain current useful foreground");
+    return { content: [], details: null };
+  };
+  f.tools.find(tool => tool.name === "program_write")!.execute = async () => {
+    writes++; return { content: [], details: null };
+  };
+  const deadline = f.root.deadline_at;
+  await f.planner.start(1);
+  const first = f.event("scheduler.turn_finished");
+  f.planner.wake("preflight_ready"); await first;
+  expect(requests).toBe(2);
+  expect(writes).toBe(1);
+  expect(f.state.pauses).toEqual([]);
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: f.root.execution_id }))
+    .toMatchObject({ status: "running", deadline_at: deadline });
+  const next = f.event("scheduler.turn_finished");
+  await next;
+  expect(requests).toBe(3);
+  expect(reasons).toEqual([["preflight_ready"], ["preflight_ready"], ["selected_attention"]]);
+  expect(f.state.pending).toBe(true);
+  expect(f.state.pauses).toEqual([]);
+}, 5000);
+
 test("real SDK attention can inspect, load mechanics and observe before stopping the current root", async () => {
   let requests = 0, stopped = false, ungroundedStarts = 0;
   const f = await setup(async () => { throw new Error("Installed SDK owns the decision loop"); }, async (model) => {

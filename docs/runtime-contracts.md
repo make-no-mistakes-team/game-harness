@@ -1624,6 +1624,14 @@ An admitted foreground root opens one authoring window bound to its actual Store
 
 An explicit attention/outcome/recovery wake preserves ordinary decision authority through intermediate reads and inactive writes. It is consumed at the next SDK request boundary after the primary root is replaced or retired, or its resident intent version changes. Worker readiness alone does not consume it. A live replacement then uses its finite inactive-authoring lane rather than continuing to replace roots until the ordinary turn deadline. Settlement without foreground work ends that SDK loop; fresh outcome evidence owns the next turn. No allowance or original deadline is extended.
 
+Selecting delayed attention while deciding about an existing foreground root
+also settles that decision. The complete current SDK tool group returns first;
+the next request boundary ends the loop without another provider request.
+The selected timer supplies a fresh ordinary turn rather than continuing the
+old transcript. Foreground execution and its original deadlines remain unchanged.
+Provider failures and a deadline reached before a valid selection still retain
+their ordinary failure handling.
+
 Saving an inactive version does not alter the running version. Updating intent changes only the JSON passed to `step`; code that ignores those fields does not change behavior. Only one playing root, whether `run` or `step`, may be live or retiring. Another start refuses without cancellation and points to explicit `handoff`; retiring work has a separate refusal. Durable retries still return the original admission, and declared child composition and pure analysis retain their existing rules. Both resident steps and bounded async semantic-feedback loops can overlap strategic inference. Choosing raw input does not waive progress checks or make a long-lived worker useful.
 
 Authoring allows `observe`, `help`, read-only `program_inspect` and pure `program_write`. A successful write saves an immutable inactive version; it cannot submit, start, activate, stage a successor, finish the task, mutate memory/reflexes or record a review. The playing root and its effect lease continue under their original budgets. No polling timer, keepalive request, second actor or additional transport owner is introduced.

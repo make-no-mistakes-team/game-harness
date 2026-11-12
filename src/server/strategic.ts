@@ -288,6 +288,7 @@ export class StrategicPlanner {
   private turnAbortRequested = false;
   private pendingDecision = false;
   private decisionBasis: { root: string; intentVersion: number | null } | null = null;
+  private attentionDecisionSelected = false;
   private emptyTurns = 0;
   private workRevision = 0;
   private contextCursor = 0;
@@ -343,6 +344,7 @@ export class StrategicPlanner {
     this.turnAbortRequested = false;
     this.pendingDecision = false;
     this.decisionBasis = null;
+    this.attentionDecisionSelected = false;
     this.emptyTurns = 0;
     this.workRevision = 0;
     this.contextCursor = 0;
@@ -598,6 +600,8 @@ export class StrategicPlanner {
         // Admission may arm a window inside program_submit/run. Only the next
         // SDK request boundary changes phase, after that tool group returned.
         selectPhase();
+        if (this.attentionDecisionSelected)
+          return stop("Selected attention settled this decision; the timed wake owns the next turn");
         if (this.decisionBasis && !this.pendingDecision && !this.host.programPending())
           return stop("The primary control decision settled; fresh outcome evidence owns the next turn");
         const toolRole = this.toolRole();
@@ -982,6 +986,8 @@ export class StrategicPlanner {
         "Strategic attention authority is closed",
       );
     clearTimeout(this.attentionTimer);
+    if (this.turn && this.pendingDecision && this.decisionBasis)
+      this.attentionDecisionSelected = true;
     this.attentionTimer = setTimeout(() => {
       this.attentionTimer = undefined;
       if (!this.current(run, generation)) return;
@@ -1214,6 +1220,7 @@ export class StrategicPlanner {
     }
     this.speculativeTurn = speculative !== null;
     this.pendingDecision = !review && !speculative && this.host.programPending() && reasons.some(pendingDecisionWake);
+    this.attentionDecisionSelected = false;
     const decisionRoot = this.pendingDecision ? this.store.latestRootExecution(run.run_id) : null;
     this.decisionBasis = decisionRoot ? { root: decisionRoot.execution_id,
       intentVersion: decisionRoot.entry === "step" ? decisionRoot.resident?.intent_version ?? 0 : null } : null;
@@ -1546,6 +1553,7 @@ export class StrategicPlanner {
       this.authoringPhase = false;
       this.pendingDecision = false;
       this.decisionBasis = null;
+      this.attentionDecisionSelected = false;
       if (speculative) agent.setTools(this.host.tools(generation)
         .filter((tool) => isToolAllowed(this.toolRole(), tool.name)));
       this.eligibleTools.clear();

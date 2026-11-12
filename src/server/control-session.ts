@@ -85,7 +85,7 @@ export class ControlSession {
     this.worker = options.worker;
     this.intent = structuredClone(options.intent);
     this.session = { schema_version: 1, session_id: options.execution_id, behavior_generation: 1,
-      producer: "none", task_high_water: 0, tasks: [], last_command_error: null, restarts: 0,
+      producer: "none", task_high_water: 0, tasks: [], last_submission: null, last_command_error: null, restarts: 0,
       deadline_host_ms: options.deadline_host_ms };
     this.data = { execution_id: options.execution_id, source_hash: options.source_hash,
       controller_generation: options.controller_generation, host_clock_id: this.clock.id, status: "starting",
@@ -229,9 +229,9 @@ export class ControlSession {
     let implicitEdges = false;
     // A terminal software return is publishable, but its choice admits no effects.
     if (!terminal) {
-      implicitEdges = choice.kind === "raw" && choice.input.kind === "world" && !("edges" in choice.input) &&
+      implicitEdges = choice.kind === "raw" && choice.input?.kind === "world" && !("edges" in choice.input) &&
         (Object.keys(this.submittedHeld) as (keyof WorldHeld)[]).some(button =>
-          choice.input.kind === "world" && choice.input.held[button] !== this.submittedHeld[button]);
+          choice.input?.kind === "world" && choice.input.held[button] !== this.submittedHeld[button]);
       const adopted = await this.choose(choice, frame, version);
       if (!adopted || !this.current() || version !== this.data.intent_version) return;
     }
@@ -287,7 +287,7 @@ export class ControlSession {
       native: "retired", retirement: ack, fault: snapshot.fault } as unknown as Json);
     if (this.raw === raw) this.raw = null;
     for (const button of Object.keys(this.submittedHeld) as (keyof WorldHeld)[]) this.submittedHeld[button] = false;
-    this.inputCaptures.clear(); this.session.producer = "none";
+    this.inputCaptures.clear(); this.session.producer = "none"; this.session.last_submission = null;
   }
   private async retire(task: Task, reason: string): Promise<void> {
     if (task.retirement) return task.retirement;
@@ -327,7 +327,8 @@ export class ControlSession {
           this.stationaryViewScope = channel.owner.scope;
           this.raw = channel;
           this.rawLeaseDeadline = openedAt + 250;
-          this.data.controller_generation = generation;
+          this.session.last_submission = null;
+          this.data.controller_generation = channel.controllerGeneration;
           this.data.counters.applied_sequence = 0; this.data.counters.ordered_edge_prefix = 0; this.data.last_input = null;
           if (!this.current()) await this.retireRaw(); else this.session.producer = "raw";
         });
@@ -342,15 +343,15 @@ export class ControlSession {
       // tick sampled through this exact channel, so its capture is retained for admission.
       const admittedFrame = frame;
       let desired = choice.input;
-      if (desired.kind === "world" && !("edges" in desired)) {
+      if (desired?.kind === "world" && !("edges" in desired)) {
         const edges: WorldInputEdge[] = [];
         for (const button of Object.keys(this.submittedHeld) as (keyof WorldHeld)[])
           if (desired.held[button] !== this.submittedHeld[button])
             edges.push({ kind: "button", button, phase: desired.held[button] ? "press" : "release", count: 1 });
         desired = { ...desired, edges };
       }
-      const input = controllerInputSchema.parse(desired);
-      const expanded = input.kind === "screen" ? input.operations.length : input.edges.reduce((sum, edge) => sum + (edge.kind === "button" ? edge.count : 1), 0);
+      const input = desired === null ? null : controllerInputSchema.parse(desired);
+      const expanded = input === null ? 0 : input.kind === "screen" ? input.operations.length : input.edges.reduce((sum, edge) => sum + (edge.kind === "button" ? edge.count : 1), 0);
       while (this.edgeWindow.length && this.edgeWindow[0]!.at <= this.clock.now() - 1000) this.edgeWindow.shift();
       if (expanded > this.options.limits.max_edges - this.totalEdges ||
         expanded + this.edgeWindow.reduce((sum, entry) => sum + entry.count, 0) > this.options.limits.max_edges_per_second)
@@ -365,6 +366,10 @@ export class ControlSession {
         this.data.counters.stale_results++;
         throw new Error("session_decision_superseded_before_input_admission");
       }
+      if (input === null) {
+        this.data.counters.no_input_decisions++;
+        return true;
+      }
       let submitted: ReturnType<ControllerInputChannel["submit"]>;
       try { submitted = this.raw.submit(admittedFrame as unknown as Json, input); } catch (error) {
         throw this.channelFailure(this.raw, error);
@@ -378,6 +383,10 @@ export class ControlSession {
       this.inputCaptures.set(`${this.rawGeneration}:${submitted.sequence}`, {
         generation: this.rawGeneration, sequence: submitted.sequence, intentVersion: expectedIntentVersion, frame, input,
       });
+      this.session.last_submission = { frame_seq: frame.frame_seq,
+        controller_generation: this.raw.controllerGeneration, sequence: submitted.sequence,
+        intent_version: expectedIntentVersion, behavior_generation: this.session.behavior_generation,
+        status: submitted.status };
       if (input.kind === "world") this.submittedHeld = { ...input.held };
       this.totalEdges += expanded; this.data.counters.expanded_edges = this.totalEdges;
       if (expanded) this.edgeWindow.push({ at: this.clock.now(), count: expanded });

@@ -386,7 +386,8 @@ mandatory references remain explicitly omitted.
 
 | Choice | Host behavior |
 | --- | --- |
-| `raw` with `input` | Select the ordinary input producer. A switch first retires the prior producer; a later fresh computation supplies the first input. |
+| `raw` with non-null `input` | Select the ordinary input producer. A switch first retires the prior producer; a later fresh computation supplies the first input. |
+| `raw` with `input:null` | Keep or open the raw producer without submitting input. Fresh frames renew only its short lease; previous held keys/view rate remain until changed or retired. |
 | `ensure_task` with `key,request` | Start one finite semantic action or exact pinned `run` dependency. Repeating the same key/content returns its status; changed content conflicts. |
 | `continue` with `handle` | Renew only that active child's supervision from this fresh decision. A settled handle is a normal lookup. |
 | `cancel` with `handle` | Fence the exact child and await its physical retirement, preserving partial or unknown effects. |
@@ -401,12 +402,28 @@ never renews. Cancellation before dispatch remains a settled, nonreplayable
 handle with known no-emission evidence. Reserving a replacement does not rewrite
 a predecessor's successful result when completion races retirement.
 
+An executive no-submission wait still consumes frame/step/time budgets and
+passes the same scope, freshness, intent and pre/post-computation lease checks.
+It does not emit an input sequence, ACK, effect receipt, release or replay.
+Switch-time choices still only change the producer. `observe` remains a
+different choice: it retires raw control rather than keeping it alive.
+
 `frame.executive` describes software state: source generation, selected producer,
 task high-water mark, retained results, command errors and original deadline.
 It is not game truth. Keys advance by one; evicting settled detail never permits
 an old key to execute again. Unknown task detail remains retained. Exhausted
 detail or invocation budgets refuse additional conflicting work. Session
 task/action/call/depth limits are shared across children.
+
+`frame.executive.last_submission` attributes the latest accepted raw input to
+its source `frame_seq`, actual `controller_generation` and input `sequence`,
+with the original intent/source generation and submitted/coalesced status.
+Match the source frame of the model's returned command, then retain that exact
+generation/sequence pair for ACK and receipt correlation. This is submission
+metadata, not application or world-effect proof. Null waits leave it unchanged;
+raw retirement clears it, and a newly opened producer starts with null.
+Older historical snapshots may omit it; omission supplies no attribution and
+never licenses guessing from a native tick, capture counter or previous ACK.
 
 Worker frames carry at most 24 KiB of active/recent task summaries. Oversized
 request/result detail stays in durable events under its original `history_ref`;
@@ -1201,9 +1218,10 @@ fences first, uses its reserved revoke lane and joins every heartbeat and
 application response before releasing the owner. It adds no survival timer.
 
 A stale decision cannot renew the 250 ms native lease. At 1 Hz, expiry before
-the next step is expected. Empty visible-screen waits and unchanged neutral
-world waits can process feedback without submitting another input; stopping
-a prior view rate still requires a submission. Frames, steps, ordered edges,
+the next step is expected. Executive `choice:{kind:"raw",input:null}` and
+raw-only resident `input:null` process feedback without submitting another
+input; stopping a prior held key or view rate still requires an explicit
+submission or retirement. Frames, steps, ordered edges,
 events and pure jobs have separate cumulative limits. Resident frames do not
 consume the legacy taskflow action/call allowance.
 
@@ -1214,9 +1232,13 @@ They can contribute adapter-owned verification facts without a finite
 `ActionView` or a second input owner.
 Visible cursor or slot changes can precede gesture completion. A dependent
 GUI operation waits for the preceding nonempty gesture's matching application
-acknowledgment and terminal effect receipt; empty screen operations keep
-sampling while it is pending. Do not wait for a separate effect receipt for
-world input or an empty screen operation: neither produces one.
+acknowledgment and terminal effect receipt. Use a no-submission raw wait while
+it is pending. Do not enqueue empty screen operations as polling inputs after
+a close or layout-changing gesture: even a fresh captured layout can become
+stale before the queued snapshot executes, and the ordinary layout fence still
+rejects it. No stale-predicate bypass or synthetic ACK is supplied.
+World input and empty screen operations have application ACKs but no separate
+effect receipt; no-submission waits have neither.
 An unknown result must not be replayed. Applicable terminal non-success
 resident summaries include `resident:{status,reason}`, with reason capped
 at 300 code units. The next ordinary failure feedback and retained source

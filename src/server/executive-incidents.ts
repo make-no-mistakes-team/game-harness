@@ -71,7 +71,7 @@ export class ExecutiveStationaryViewMonitor {
       previous.dimension === frame.space.dimension_id && previous.space === frame.space.space_epoch;
     if (sameAuthority && frame.frame_seq <= previous.frame) return null;
     let rotating = false;
-    if (choice.kind === "raw" && choice.input.kind === "world") {
+    if (choice.kind === "raw" && choice.input?.kind === "world") {
       const input = choice.input, view = input.view;
       if (Object.values(input.held).some(Boolean) || ("edges" in input && input.edges.length !== 0) ||
         (input.selected_hotbar !== null && input.selected_hotbar !== body.selected_hotbar)) {

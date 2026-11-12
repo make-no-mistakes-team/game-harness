@@ -1,12 +1,12 @@
 import { expect, test, vi } from "bun:test";
 import { ControlSession, type ControlSessionOptions } from "../src/server/control-session.ts";
-import { controlSessionConfigSchema, type ExecutiveChoice } from "../src/shared/control-session.ts";
+import { controlSessionConfigSchema, executiveSnapshotSchema, type ExecutiveChoice, type ExecutiveSnapshot } from "../src/shared/control-session.ts";
 import { DEFAULT_RESIDENT_LIMITS, ResidentCleanupError, type ExecutiveStepResult, type ResidentClock, type ResidentSnapshot } from "../src/shared/resident.ts";
 import { singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 import type { GameActionResult, Json } from "../src/shared/contracts.ts";
 import type { ControllerInputChannel, InputAppliedAck, RevocationAck } from "../src/shared/controller.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
-import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
+import { minecraftControllerFrameSchema, type MinecraftControllerFrame } from "../src/shared/minecraft.ts";
 import { controllerNativeDeadline, ControllerScreenReadSupersededError, NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
 
 async function settle() { for (let index = 0; index < 100; index++) await Promise.resolve(); }
@@ -39,23 +39,26 @@ const rawChoice: ExecutiveChoice = { kind: "raw", input: { kind: "world", held: 
   edges: [{ kind: "button", button: "forward", phase: "press", count: 1 }], view: { kind: "unchanged" }, selected_hotbar: null } };
 const request = { kind: "action" as const, action: { kind: "navigate", destination: "authorized-target" }, duration_ms: 1000 };
 const success: GameActionResult = { status: "succeeded", summary: "Finite resource work completed", evidence: { collected: 1 } };
-function harness(retained = 32, ownBody?: (body: ReturnType<typeof controllerFrameFixture>["player"]) => void) {
+function harness(retained = 32, ownBody?: (body: MinecraftControllerFrame["player"]) => void,
+  ownFrame?: (frame: MinecraftControllerFrame) => void, nativeGenerationOffset = 0) {
   const clock = new Clock(), completed: { handle: number; frame_seq: number; deadline: number; result: {
     promise: Promise<GameActionResult>; resolve(value: GameActionResult): void; reject(reason?: unknown): void;
   } }[] = [];
   const records: { type: string; details: Json }[] = [], sent: { sequence: number; frame: Json; input: unknown }[] = [];
   const snapshots: ResidentSnapshot[] = [];
   const acknowledgements = new Map<number, (ack: InputAppliedAck) => void>();
-  let choice: ExecutiveChoice = { kind: "observe" }, frameSeq = 0, generation = 0, workerClosed = 0, retired = 0;
+  let choice: ExecutiveChoice = { kind: "observe" }, frameSeq = 0, nativeTick = 0, generation = 0, workerClosed = 0, retired = 0;
   let active = true, stepCount = 0, activationCount = 0;
   let retirement = Promise.resolve(), supervision = 0;
   let renewal = async () => {};
   const sample = async () => {
-    const frame = controllerFrameFixture(); frame.frame_seq = ++frameSeq; frame.native_tick = frameSeq;
+    const frame = minecraftControllerFrameSchema.parse(controllerFrameFixture()); frame.frame_seq = ++frameSeq; frame.native_tick = frameSeq;
     frame.dynamic_entities.native_tick = frameSeq; frame.captured_native_ns = String(Math.round(clock.now() * 1e6));
     frame.dynamic_entities.captured_native_ns = frame.captured_native_ns;
     frame.inventory.captured_native_ns = frame.captured_native_ns;
     ownBody?.(frame.player);
+    ownFrame?.(frame);
+    nativeTick = frame.native_tick;
     return frame as unknown as Json;
   };
   const result = (state: Json) => ({ choice: structuredClone(choice), next_state: Number(state) + 1,
@@ -68,7 +71,7 @@ function harness(retained = 32, ownBody?: (body: ReturnType<typeof controllerFra
       async step(_frame, state) { stepCount++; return result(state); }, async close() { workerClosed++; } },
     sample,
     async open(_deadline, applied, _effect) {
-      const currentGeneration = ++generation; let sequence = 0, revoked = false;
+      const currentGeneration = ++generation + nativeGenerationOffset; let sequence = 0, revoked = false;
       const captures = new Set<number>();
       acknowledgements.set(currentGeneration, applied);
       const owner = { operation_id: `producer-${generation}`, generation, scope: { session_id: "game-session", world_id: "world", epoch: 1,
@@ -88,7 +91,7 @@ function harness(retained = 32, ownBody?: (body: ReturnType<typeof controllerFra
         snapshot() { return { fenced: revoked, retired: revoked, submitted_sequence: sequence, applied_sequence: 0, ordered_edge_prefix: 0,
           pending_frames: 0, pending_edges: 0, last_input: null, reason: null, fault: null }; },
         async revoke() { revoked = true; await retirement; retired++; return { owner, controller_generation: currentGeneration, admission_revoked: true,
-          last_applied_sequence: 0, ordered_edge_prefix: 0, retirement_applied_native_tick: frameSeq,
+          last_applied_sequence: 0, ordered_edge_prefix: 0, retirement_applied_native_tick: nativeTick,
           retirement_applied_native_ns: String(Math.round(clock.now() * 1e6)), input_application: "confirmed", unresolved_operation_refs: [] } satisfies RevocationAck; },
       } satisfies ControllerInputChannel;
     },
@@ -109,7 +112,7 @@ function harness(retained = 32, ownBody?: (body: ReturnType<typeof controllerFra
     onRenew(operation: () => Promise<void>) { renewal = operation; },
     acknowledge(currentGeneration: number, sequence: number) {
       acknowledgements.get(currentGeneration)!({ controller_generation: currentGeneration, sequence, ordered_edge_prefix: sequence,
-        applied_native_tick: frameSeq, applied_native_ns: String(Math.round(clock.now() * 1e6)),
+        applied_native_tick: nativeTick, applied_native_ns: String(Math.round(clock.now() * 1e6)),
         held: { ...neutral, forward: true }, applied_pose: { yaw_radians: 0, pitch_radians: 0 },
         input_application: "confirmed", reason: null });
     },
@@ -120,6 +123,80 @@ function harness(retained = 32, ownBody?: (body: ReturnType<typeof controllerFra
 
 const terminalEvent = { kind: "diagnostic", urgency: "ordinary", summary: "Local objective evidence collected",
   details: { logs: 8, postEncounterDig: true } } as const;
+
+test("raw null waits cross a GUI close without queuing stale screen snapshots and retain exact submission attribution", async () => {
+  let screenOpen = true;
+  const screen = { identity: { screen_id: "inventory", incarnation: 3, layout_revision: 1 },
+    content_revision: 1, screen_kind: "inventory", viewport: { width: 640, height: 480, scale_factor: 1 },
+    slots: [], cursor: { item: null, count: 0 }, elements: [], progress: [] };
+  const h = harness(32, undefined, frame => {
+    frame.native_tick += 1000; frame.dynamic_entities.native_tick += 1000;
+    frame.screen = screenOpen ? screen : null;
+  }, 40);
+  const seen: { frame_seq: number; native_tick: number; submission: ExecutiveSnapshot["last_submission"] }[] = [];
+  const step = h.options.worker.step;
+  h.options.worker.step = async (...args) => {
+    const frame = args[0], executive = executiveSnapshotSchema.parse(frame.executive);
+    seen.push({ frame_seq: frame.frame_seq, native_tick: frame.native_tick, submission: executive.last_submission });
+    return await step(...args);
+  };
+  const wait: ExecutiveChoice = { kind: "raw", input: null };
+  h.choose(wait); await h.session.start(); await h.clock.advance(50);
+  expect(h.sent).toHaveLength(0);
+  expect(h.session.snapshot().session?.last_submission).toBeNull();
+  h.choose({ kind: "raw", input: { kind: "screen", screen: screen.identity, operations: [{ kind: "close" }] } });
+  await h.clock.advance(50);
+  const submission = { frame_seq: 3, controller_generation: 41, sequence: 1,
+    intent_version: 0, behavior_generation: 1, status: "submitted" as const };
+  expect(h.session.snapshot().session?.last_submission).toEqual(submission);
+  // The screen changes before any application ACK is delivered. Waiting must
+  // neither enqueue an old GUI snapshot nor fabricate command application.
+  screenOpen = false; h.choose(wait); await h.clock.advance(200);
+  expect(h.sent).toHaveLength(1);
+  expect(seen.find(frame => frame.frame_seq === 4)).toEqual({
+    frame_seq: 4, native_tick: 1004, submission,
+  });
+  expect(h.session.snapshot()).toMatchObject({ status: "running", controller_generation: 41, last_input: null,
+    counters: { submissions: 1, applied_sequence: 0 }, session: { last_submission: submission } });
+  h.choose({ kind: "observe" }); await h.clock.advance(50);
+  expect(h.session.snapshot().session?.last_submission).toBeNull();
+  h.choose(wait); await h.clock.advance(100);
+  expect(h.sent).toHaveLength(1);
+  h.choose(rawChoice); await h.clock.advance(50);
+  expect(h.session.snapshot().session?.last_submission).toMatchObject({
+    controller_generation: 42, sequence: 1, intent_version: 0, behavior_generation: 1,
+  });
+  expect(h.session.snapshot().session?.last_submission?.frame_seq).toBeGreaterThan(3);
+  await h.session.stop("End no-submission GUI wait");
+});
+
+test("raw null waits preserve held-input bookkeeping until an explicit release", async () => {
+  const h = harness(); h.choose(rawChoice); await h.session.start(); await h.clock.advance(50);
+  h.acknowledge(1, 1);
+  const submission = h.session.snapshot().session?.last_submission;
+  h.choose({ kind: "raw", input: null }); await h.clock.advance(500);
+  expect(h.sent).toHaveLength(1);
+  expect(h.session.snapshot()).toMatchObject({ last_input: { sequence: 1, held: { forward: true } },
+    counters: { submissions: 1, applied_sequence: 1 }, session: { producer: "raw", last_submission: submission } });
+  h.choose({ kind: "raw", input: { kind: "world", held: { ...neutral },
+    view: { kind: "unchanged" }, selected_hotbar: null } });
+  await h.clock.advance(50);
+  expect(h.sent[1]!.input).toMatchObject({ kind: "world", held: neutral,
+    edges: [{ kind: "button", button: "forward", phase: "release", count: 1 }] });
+  await h.session.stop("End retained held-input state");
+});
+
+test("fresh raw null waits cannot extend the original root deadline or mint input acknowledgments", async () => {
+  const h = harness(); h.choose({ kind: "raw", input: null });
+  await h.session.start(); await h.clock.advance(10000);
+  expect(h.sent).toHaveLength(0);
+  expect(h.session.snapshot()).toMatchObject({ last_input: null,
+    counters: { submissions: 0, applied_sequence: 0, expanded_edges: 0 },
+    session: { producer: "none", last_submission: null, deadline_host_ms: 10000, restarts: 0 },
+    cleanup: { native: "retired", worker: "closed" } });
+  expect(h.workerClosed).toBe(1); expect(h.retired).toBe(1);
+  await h.session.stop("End original deadline proof");
+});
 
 test.each([false, true])("only a trusted superseded-screen read can be discarded without a decision (trusted=%s)", async trusted => {
   const h = harness(), sample = h.options.sample;
@@ -173,7 +250,8 @@ test.each([false, true])("superseded raw samples never renew the producer lease 
   await h.session.stop("End superseded sample lease boundary");
 });
 
-test.each([false, true])("lease expiry during computation never renews or submits the old owner (reset_safe=%s)", async resetSafe => {
+for (const noSubmission of [false, true])
+test.each([false, true])(`lease expiry during computation never renews or submits the old owner (wait=${noSubmission}, reset_safe=%s)`, async resetSafe => {
   const h = harness(), renew = vi.fn(async () => {});
   h.onRenew(renew);
   h.options.config.recovery = resetSafe ? "reset_safe" : "none";
@@ -181,7 +259,8 @@ test.each([false, true])("lease expiry during computation never renews or submit
   h.options.restartWorker = async () => h.options.worker;
   h.options.worker.step = async () => {
     h.clock.time += 60;
-    return { choice: rawChoice, next_state: { uncommitted: true }, status: "running", events: [] };
+    return { choice: noSubmission ? { kind: "raw", input: null } : rawChoice,
+      next_state: { uncommitted: true }, status: "running", events: [] };
   };
   h.choose(rawChoice);
   await h.session.start();

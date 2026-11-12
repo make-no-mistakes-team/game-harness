@@ -29,7 +29,8 @@ export type ExecutiveTaskRequest = z.infer<typeof executiveTaskRequestSchema>;
 
 /** Keys are monotonically increasing ordinals in this source generation, never reusable IDs. */
 export const executiveChoiceSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("raw"), input: authoredControllerInputSchema }).strict(),
+  z.object({ kind: z.literal("raw"), input: authoredControllerInputSchema.nullable()
+    .describe("Null keeps/opens the raw producer without submitting input. Fresh valid frames still renew only its short lease; prior held/view controls remain until explicitly changed or retired.") }).strict(),
   z.object({ kind: z.literal("ensure_task"), key: safeCounterSchema.min(1), request: executiveTaskRequestSchema }).strict(),
   z.object({ kind: z.literal("continue"), handle: safeCounterSchema.min(1) }).strict(),
   z.object({ kind: z.literal("cancel"), handle: safeCounterSchema.min(1) }).strict(),
@@ -53,6 +54,11 @@ export const executiveSnapshotSchema = z.object({
   producer: z.enum(["none", "raw", "task", "retiring"]),
   task_high_water: safeCounterSchema, tasks: z.array(executiveTaskSnapshotSchema).max(128),
   tasks_omitted: safeCounterSchema.optional(),
+  last_submission: z.object({
+    frame_seq: safeCounterSchema.min(1), controller_generation: safeCounterSchema.min(1),
+    sequence: safeCounterSchema.min(1), intent_version: safeCounterSchema,
+    behavior_generation: safeCounterSchema.min(1), status: z.enum(["submitted", "coalesced"]),
+  }).strict().nullable().optional().describe("Latest accepted raw submission from this producer, attributed to its source frame. Software admission only, not an application ACK or world-effect receipt. Null waits do not replace it; retirement clears it. Omission in older historical snapshots means attribution unavailable, never an inferred sequence."),
   last_command_error: z.string().max(1000).nullable(),
   restarts: safeCounterSchema, deadline_host_ms: z.number().finite().nonnegative(),
 }).strict();

@@ -210,7 +210,7 @@ test("stationary sample coverage admits exactly 250ms adjacency and a 0.3-block 
 test("stationary view/observe windows reset on authority, movement, controls and coverage boundaries", () => {
   for (const interrupt of ["key", "life", "dimension", "space", "position", "selection", "attack", "use",
     "jump", "move", "edge", "hotbar", "screen", "air", "water", "lava", "vehicle", "gliding",
-    "task", "host_gap", "native_gap"] as const) {
+    "task", "no_submission", "host_gap", "native_gap"] as const) {
     const monitor = new ExecutiveStationaryViewMonitor();
     for (let now = 0; now < 4000; now += 50) {
       const { frame } = rawSample(now);
@@ -236,6 +236,7 @@ test("stationary view/observe windows reset on authority, movement, controls and
           choice = { kind: "raw", input };
         }
         if (interrupt === "task") choice = { kind: "continue", handle: 1 };
+        if (interrupt === "no_submission") choice = { kind: "raw", input: null };
         if (interrupt === "air") frame.player.on_ground = false;
         if (interrupt === "water") frame.player.in_water = true;
         if (interrupt === "lava") frame.player.in_lava = true;

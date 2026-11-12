@@ -548,6 +548,7 @@ export class PreparedSource {
       return { authority, schemas, source_references, body: reference.body, identifiers: reference.identifiers,
         coverage: reference.coverage, hearing: reference.hearing, compass_bearings: reference.compass_bearings,
         composition: reference.composition, resident,
+        attention: reference.attention,
         software_tests: softwareTests, world_view: reference.world_view, temporal_turn: reference.temporal_turn,
         temporal_tracking: reference.temporal_tracking, target_transitions: reference.target_transitions,
         semantic_aiming: reference.semantic_aiming,
@@ -570,6 +571,7 @@ export class PreparedSource {
       "Useful test priorities include changed pending-child transitions and terminal success/failure/unknown bookkeeping. Partial-row loss/return is another risk: local absence is not global absence; retained evidence needs original scope/time separate from live authority. " +
       "You choose the synthetic inputs, assertions, memory representation and behavior; no host test supplies a route, target or response. " +
       "Every diagnostic/attention event consumes the cumulative allowance, including repeated completion callbacks; check changed reporting latches when uncertain. " +
+      "A step kind:'diagnostic' event retains evidence but does not request cognition. Use a transition-gated kind:'attention' event when a meaningful readiness or coverage change needs Main; while Main is pending this queues the next ordinary decision without another concurrent owner or renewed budget. " +
       "When analyzing, import the exact step candidate and call activate/step on your own labelled synthetic initial_state/args. Return the exact candidate result with validate_as, not a helper assertion or result bundle. Inspect compact source diagnostics and repair actual mismatches. This is software checking, not successful gameplay. " +
       "Keep explicit state bounded: a complete frame can exceed16KiB, and the host never truncates oversized next_state into validity. Test larger projections when that risk is uncertain. " +
       "View quality matters: repeated timed360-degree scans and full-error delta re-aims are not human-like control. Sound directions are world compass, not screen-relative; compare genuine heard bearings with actual applied yaw. " +

@@ -474,9 +474,13 @@ keeps running while Main acknowledges completion. The host does not raise the
 allowance or treat repeated notifications as new gameplay progress.
 
 Local goal readiness does not require executive retirement. When Main is still
-pending, model-authored software can report readiness once and retain useful
-bounded task coverage. A running wrapper that only waits or repeats completion
-events supplies no useful coverage. Main still owns custom `task_finish`;
+pending, model-authored software can request its decision with one
+`kind:"attention"` event while useful bounded task coverage remains.
+`kind:"diagnostic"` retains evidence but does not request cognition. Attention
+during a pending turn queues the next ordinary decision; it does not admit a
+concurrent inference owner, fabricate a response or renew an allowance.
+A running wrapper that only waits or repeats completion events supplies no
+useful coverage. Main still owns custom `task_finish`;
 neither an authored predicate nor a running executive independently verifies
 the goal, extends its deadline or permits acting after Stop.
 

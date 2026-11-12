@@ -457,6 +457,11 @@ recovery after confirmed retirement and worker closure. The model's activation
 must reconsider fresh applicability. This resets explicit state; it does not
 restore a transactional checkpoint, replay edges or retry arbitrary source
 exceptions. Opaque and source faults remain quarantined.
+The host checks the known raw lease both before sampling and after computation,
+before a running raw choice can renew or submit input. If it expires during
+computation, that result is discarded. A reset-safe session may use its remaining
+restart allowance; other sessions fail closed. Neither path extends the expired
+lease or the original session deadline.
 
 A malformed authored return is a result-validation failure, not evidence that
 native cleanup failed. The sandbox retains plain bounded returned data for the

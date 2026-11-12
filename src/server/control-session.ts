@@ -216,6 +216,12 @@ export class ControlSession {
     if (result.events.length > limits.max_events - this.events) throw new Error("session_event_budget");
     const terminal = result.status !== "running";
     const choice = result.choice;
+    // A live lease at sample time may expire while the worker computes.
+    // Do not try to renew that retired owner or submit this computed input.
+    // Only an explicitly reset-safe session may start a fresh invocation.
+    if (!terminal && choice.kind === "raw" && this.raw && this.clock.now() >= this.rawLeaseDeadline) {
+      await this.recover("known_expired_raw_lease"); return;
+    }
     let implicitEdges = false;
     // A terminal software return is publishable, but its choice admits no effects.
     if (!terminal) {

@@ -121,6 +121,38 @@ function harness(retained = 32, ownBody?: (body: ReturnType<typeof controllerFra
 const terminalEvent = { kind: "diagnostic", urgency: "ordinary", summary: "Local objective evidence collected",
   details: { logs: 8, postEncounterDig: true } } as const;
 
+test.each([false, true])("lease expiry during computation never renews or submits the old owner (reset_safe=%s)", async resetSafe => {
+  const h = harness(), renew = vi.fn(async () => {});
+  h.onRenew(renew);
+  h.options.config.recovery = resetSafe ? "reset_safe" : "none";
+  h.options.config.max_restarts = resetSafe ? 1 : 0;
+  h.options.restartWorker = async () => h.options.worker;
+  h.options.worker.step = async () => {
+    h.clock.time += 60;
+    return { choice: rawChoice, next_state: { uncommitted: true }, status: "running", events: [] };
+  };
+  h.choose(rawChoice);
+  await h.session.start();
+  await h.clock.advance(0);
+  // The owner opened at zero; its original 250ms lease is still live when
+  // this delayed tick starts, but expires before its 60ms computation ends.
+  await h.clock.jump(200);
+  expect(h.sent).toHaveLength(0);
+  expect(renew).not.toHaveBeenCalled();
+  expect(h.retired).toBe(1);
+  const snapshot = h.session.snapshot();
+  expect(snapshot.state).toEqual(resetSafe ? 0 : 1);
+  expect(snapshot.session).toMatchObject({
+    restarts: resetSafe ? 1 : 0,
+    behavior_generation: resetSafe ? 2 : 1,
+    deadline_host_ms: 10000,
+    producer: "none",
+  });
+  expect(snapshot.status).toBe(resetSafe ? "running" : "failed");
+  expect(h.records.filter(record => record.type === "session.reset_safe_restart")).toHaveLength(resetSafe ? 1 : 0);
+  await h.session.stop("End expiry boundary");
+});
+
 test.each(["completed", "blocked", "yielded"] as const)(
   "a current %s software return publishes count eight and its event without admitting its terminal choice", async status => {
     const choice: ExecutiveChoice = status === "completed" ? rawChoice

@@ -1309,9 +1309,21 @@ export class StrategicPlanner {
         500,
       );
       if (this.role === "planning" && reasons.includes("skill_outcome") &&
-          candidates.some((event) => event.type === "action.failed" || event.type === "action.unknown" ||
-            (event.type === "skill.closed" &&
-              ["failed", "blocked", "unknown"].includes(String(record(event.details)?.status))))) {
+          candidates.some((event) => {
+            const details = record(event.details);
+            if (event.type !== "action.failed" && event.type !== "action.unknown" &&
+                !(event.type === "skill.closed" && ["failed", "blocked", "unknown"].includes(String(details?.status))))
+              return false;
+            const action = typeof details?.action_id === "string" ? this.store.getAction(run.run_id, details.action_id) : null;
+            const id = typeof details?.execution_id === "string" ? details.execution_id : action?.view.execution_id;
+            const owner = id ? this.store.skillExecution(run.run_id, { execution_id: id }) : null;
+            const root = owner ? this.store.skillExecution(run.run_id, { execution_id: owner.root_execution_id }) : null;
+            // A successful containing execution already handled its earlier
+            // child outcome. Keep that evidence/no-replay uncertainty, but do
+            // not turn normal whole-task assessment into mandatory repair.
+            // Unowned failures and unsuccessful roots still need recovery.
+            return root?.status !== "succeeded";
+          })) {
         this.role = "recovery";
         this.purpose = "replanning";
       }
@@ -1453,7 +1465,7 @@ export class StrategicPlanner {
                 ? this.pendingDecision
                   ? "Resolve this explicit attention/outcome/recovery signal within the ordinary bounded decision turn. Inspect current state or mechanics as needed, then choose the necessary current-root intent update, code change or stop. Decision authority survives intermediate reads and inactive writes, then ends at the next request after a root/intent change or predecessor retirement. It does not renew the root deadline or inactive-authoring allowance. Keep useful local control running; no polling or duplicate foreground work."
                   : "The foreground program continues unchanged. Use only observe, help, program_inspect and pure program_write to prepare immutable inactive source within the remaining root-bound authoring allowance. No starts, activation, effects, polling or keepalive; repeated wakes do not renew the window."
-                : "Advance the task with an autonomous local taskflow using current evidence. Keep short input intervals, fresh target selection and ordinary recovery inside your code. For ongoing world control use a resident step (help controller); keep useful control running through cloud decisions. Return blocked only when the local algorithm genuinely cannot continue, not merely because an input interval finished. Choose survival and combat responses yourself. No human continuation is needed.",
+                : "Assess the whole task from current permitted state and retained execution facts/events before starting or revising work. If the custom task is done on that evidence, call task_finish now with an honest evidence/uncertainty summary; execution completion alone is not proof. Earlier child failure or unknown effects do not erase later evidence, resolve that uncertainty or permit replay. Otherwise advance the unfinished task with an autonomous local taskflow. Keep short input intervals, fresh target selection and ordinary recovery inside your code. For ongoing world control use a resident step (help controller); keep useful control running through cloud decisions. Return blocked only when the local algorithm genuinely cannot continue, not merely because an input interval finished. Choose survival and combat responses yourself. No human continuation is needed.",
           };
         for (;;) {
           try {

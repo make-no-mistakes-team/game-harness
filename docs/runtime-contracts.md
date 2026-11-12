@@ -591,6 +591,16 @@ The strategist keeps a run-owned reference context outside its disposable Agent.
 
 Programs can report `current_subgoal`, `worksite`, `resource_requirements` and `recovery_reason` through existing `game.progress` details or their returned result. Selected bounded notes and up to four explicitly returned positions survive ordinary turns and safe Agent recreation; an unspecified program card is not a current subgoal. These are labelled model-authored notes, not current inventory, target authority or success proof. Current observations must supply resources and freshly reacquired handles. Session/life/native-boot/space changes clear current dynamic notes. Explicit subgoal/worksite notes can remain separately labelled historical references with their original scope; a task/world/fresh-run change clears that retained experience. A generic execution closure does not hide its actual action obstruction; selected mechanical receipt fields remain available without restoring old target handles or full observations.
 
+An outcome wake does not force the recovery role solely because an earlier
+child action or execution failed inside a root that has since succeeded.
+Its original failure and any no-replay uncertainty remain in context.
+Unowned failures and unsuccessful containing roots still select recovery.
+This is an execution-lifecycle distinction, not a task-success verdict.
+When no foreground work remains, Main assesses the whole task from current
+permitted state and retained evidence before starting or revising software.
+Custom-task completion still requires its explicit, unverified `task_finish`
+report; built-in goals retain their independent verifier.
+
 Keep location meanings distinct: `worksite` records an observed task site and changes only when establishing or deliberately relocating that site. Omit it during travel or recovery to retain it. Current position comes from fresh observation; a temporary `recovery_position` belongs under its own structured root-result label. Existing returned-position retention preserves that label without inferring a worksite. This is an authoring contract, not evidence that a model followed it.
 
 Requested documentation checks executable/API/adapter/profile and model

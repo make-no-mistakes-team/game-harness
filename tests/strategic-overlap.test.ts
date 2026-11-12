@@ -249,6 +249,46 @@ for (const sample of [
   });
 }
 
+for (const sample of [
+  { root: "succeeded", failure: "owned_action", role: "planning" },
+  { root: "blocked", failure: "owned_action", role: "recovery" },
+  { root: "succeeded", failure: "unowned_action", role: "recovery" },
+  { root: "succeeded", failure: "child", role: "planning" },
+] as const) {
+  test(`outcome role keeps ${sample.failure} evidence after root ${sample.root} without forcing unrelated repair`, async () => {
+    const f = await setup(async (context, agent) => {
+      expect(context.role).toBe(sample.role);
+      expect(context.feedback).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: sample.failure === "child" ? "skill.closed" : "action.unknown" }),
+      ]));
+      expect(await agent.tool("task_finish")).toBe(true);
+      expect(await agent.call()).toBe(true);
+    });
+    if (sample.failure === "child") {
+      const child = historyExecution(f.store, f.run, f.root, f.root);
+      child.status = "failed";
+      child.ended_at = "2020-01-01T00:00:01.000Z";
+      f.store.updateSkillExecution(child, "skill.closed", "Child failed before the root selected other work");
+    } else f.store.event(f.run.run_id, "action.unknown", "Retired child effect remains unknown", {
+      action_id: "unknown",
+      ...(sample.failure === "owned_action" ? { execution_id: f.root.execution_id } : {}),
+      status: "unknown",
+    });
+    if (sample.root === "succeeded") finishHistoryExecution(f.store, f.root);
+    else {
+      f.root.status = "blocked";
+      f.root.ended_at = "2020-01-01T00:00:01.000Z";
+      f.store.updateSkillExecution(f.root, "skill.closed", "Root could not continue");
+    }
+    f.state.pending = false;
+    await f.planner.start(1);
+    const done = f.event("scheduler.turn_finished");
+    f.planner.wake("skill_outcome");
+    await done;
+    expect(f.state.pauses).toEqual([]);
+  });
+}
+
 test("pending-root uncertainty keeps a bounded decision turn while raw context stays out of compact feedback", async () => {
   const f = await setup(async (context, agent) => {
     expect(context.reason).toEqual(["uncertainty"]);

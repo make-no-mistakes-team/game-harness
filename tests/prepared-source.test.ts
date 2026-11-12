@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +12,10 @@ import type { AuthState, Json } from "../src/shared/contracts.ts";
 import type { ResidentAnalysisWorker, ResidentWorker } from "../src/shared/resident.ts";
 import type { PreparedStartRequest, PreparedStartView } from "../src/shared/prepared-start.ts";
 import { PreparedSource, type PreparedSourceOptions } from "../src/server/prepared-source.ts";
+import { PreparedSourcebook } from "../src/server/prepared-sourcebook.ts";
+import { adapterCompatibility } from "../src/server/adapter-contract.ts";
+import type { ApprovedSourceReference } from "../src/server/source-authoring.ts";
+import { PREPARED_START_LIMITS } from "../src/shared/prepared-start.ts";
 import type { PreparedSourceCandidate } from "../src/server/prepared-source-contract.ts";
 import { minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 import { residentAnalysisProcess } from "./helpers/resident-analysis-process.ts";
@@ -21,6 +26,12 @@ type Call = { name: string; args: unknown; id?: string };
 const rootSource = "export function activate(frame,state,intent) { return {refused:true,reason:'software fixture only'}; } export function step(frame,state,intent) { return {choice:{kind:'observe'},next_state:state,status:'running',events:[]}; }";
 const rootCalls = (): Call[] => [{ name: "program_write", args: { name: "executive", source: rootSource } },
   { name: "prepare_finish", args: { name: "executive", version: 1, args: null, initial_state: null, limits: {}, session: { schema_version: 1 } } }];
+function approvedReference(source = rootSource, entry: ApprovedSourceReference["entry"] = "step"): ApprovedSourceReference {
+  return { hash: createHash("sha256").update(source, "utf8").digest("hex"), source, entry,
+    card: { purpose: "Synthetic source-copy protocol", applicability: "Software tests only",
+      method: "Explicit selected-model copy", reason: "Operator-approved fixture",
+      limitations: "No gameplay evidence" }, provenance: "operator-approved synthetic authored-source fixture" };
+}
 const sourceAuthState = (): AuthState => ({ authenticated: true, status: "ready", provider: "openai-codex",
   account_label: null, login: null, error: null,
   models: [{ id: "selected-model", name: "Selected fixture model", provider: "openai-codex",
@@ -58,7 +69,7 @@ class ScriptedSourceAgent {
     }
     // Real Agent asks the supported gate again after tool results. Sealing must stop here.
     const stopped = this.gate?.({});
-    if (!stopped) throw new Error("Fixture requires a terminal host gate");
+    if (!stopped) throw new Error(`Fixture requires a terminal host gate: ${JSON.stringify(this.results.filter(result => result.isError).map(result => result.details))}`);
   }
 }
 
@@ -66,6 +77,7 @@ function fixture(calls = rootCalls(), overrides: Partial<PreparedSourceOptions> 
   const directory = mkdtempSync(join(tmpdir(), "prepared-source-")); directories.push(directory);
   const adapter = minecraftTestAdapter();
   let agent: ScriptedSourceAgent | null = null, releases = 0, compiled = 0, closed = 0, activated = 0;
+  let promptFailure: unknown = null;
   let owner: PreparedSource;
   const terminal = Promise.withResolvers<PreparedStartView>();
   const ready = Promise.withResolvers<PreparedSourceCandidate>();
@@ -73,7 +85,12 @@ function fixture(calls = rootCalls(), overrides: Partial<PreparedSourceOptions> 
     async activate() { activated++; throw new Error("No activation is authorized in source preparation"); }, async close() { closed++; } };
   const options: PreparedSourceOptions = { directory,
     auth: { snapshot: sourceAuthState,
-      createAgent: async input => { agent = new ScriptedSourceAgent(input.tools, calls); return agent as unknown as Agent; },
+      createAgent: async input => {
+        agent = new ScriptedSourceAgent(input.tools, calls);
+        const prompt = agent.prompt.bind(agent);
+        agent.prompt = async () => { try { await prompt(); } catch (error) { promptFailure = error; throw error; } };
+        return agent as unknown as Agent;
+      },
       releaseAgent: async () => { releases++; } },
     sandbox: { createResidentWorker: async () => { compiled++; return worker; },
       createResidentAnalysisWorker: async () => { throw new Error("No analysis configured"); } },
@@ -87,7 +104,7 @@ function fixture(calls = rootCalls(), overrides: Partial<PreparedSourceOptions> 
   const request: PreparedStartRequest = { request_id: crypto.randomUUID(), task: "Test source-only admission",
     goal: structuredClone(adapter.goals[0]!), model_id: "selected-model" };
   return { owner, options, request, directory, ready: ready.promise, terminal: terminal.promise,
-    counters: () => ({ releases, compiled, closed, activated }), agent: () => agent!, worker };
+    counters: () => ({ releases, compiled, closed, activated }), agent: () => agent!, worker, promptFailure: () => promptFailure };
 }
 
 test("omitted-entry executive source is selected explicitly, compiles without frames and transfers once to the actual admitted run", async () => {
@@ -269,18 +286,249 @@ test("cancel during clean compile readiness closes the late worker without invok
 test("source call receipts replay exactly while stale CAS parents cannot rebase immutable history", async () => {
   const write = { ...rootCalls()[0]!, id: "stable-source-call" };
   const revisedSource = rootSource + "\n";
-  const f = fixture([write, write,
+  const f = fixture([write,
     { name: "program_write", args: { name: "executive", entry: "step", based_on: 2, source: revisedSource } },
     { name: "program_write", args: { name: "executive", entry: "step", based_on: 1, source: revisedSource } },
     { name: "prepare_finish", args: { name: "executive", version: 2, args: null, initial_state: null, limits: {}, session: { schema_version: 1 } } }]);
   await f.owner.initialize(); const accepted = await f.owner.start(f.request);
   const retry = await f.owner.start(structuredClone(f.request));
   expect(retry.preparation_id).toBe(accepted.preparation_id); expect(retry.deadline_at).toBe(accepted.deadline_at);
-  const candidate = await f.ready;
+  const candidate = await Promise.race([f.ready, f.terminal.then(view => {
+    if (view.phase !== "started") throw f.promptFailure() ?? new Error(view.error ?? "Source receipt fixture failed before readiness");
+    return f.ready;
+  })]);
   expect(candidate.root.version).toBe(2); expect(f.owner.snapshot()?.source_versions).toBe(2);
-  expect(f.agent().results[0]!.details).toEqual(f.agent().results[1]!.details);
-  expect(f.agent().results[2]!.isError).toBe(true);
+  const writeTool = f.agent().tools.find(tool => tool.name === "program_write")!;
+  // Transport redelivery retains the original call, rather than asking a
+  // provider response to issue the same tool-call identity twice.
+  expect((await writeTool.execute(write.id, write.args)).details).toEqual(f.agent().results[0]!.details);
+  expect(f.agent().results[1]!.isError).toBe(true);
   expect(f.owner.snapshot()?.tools_used).toBe(4); // The identical durable receipt did not spend a second tool.
+  await f.owner.close();
+});
+
+test("approved references stay outside the empty catalog until the selected model explicitly copies their hash", async () => {
+  const reference = approvedReference();
+  const copy = { name: "executive", reference_hash: reference.hash, entry: "step" };
+  const f = fixture([
+    { name: "program_inspect", args: { view: "catalog" } },
+    { name: "help", args: { topic: "overview" } },
+    { name: "program_inspect", args: { view: "reference_source", reference_hash: "0".repeat(64) } },
+    { name: "program_inspect", args: { view: "reference_source", reference_hash: reference.hash } },
+    { name: "program_inspect", args: { view: "catalog" } },
+    { name: "program_copy", args: { ...copy, reference_hash: "0".repeat(64) } },
+    { name: "program_copy", args: { name: copy.name, reference_hash: copy.reference_hash } },
+    { name: "program_copy", args: { ...copy, entry: "run" } },
+    { name: "program_copy", args: copy, id: "selected-copy" },
+    { name: "program_edit", args: { name: "executive", based_on: 1,
+      edits: [{ old_text: "software fixture only", new_text: "software fixture revised" }] } },
+    { ...rootCalls()[1]!, args: { ...rootCalls()[1]!.args as object, version: 2 } },
+  ], { sourceReferences: [reference] });
+  // Mutating constructor task material later must not change the detached registry.
+  reference.card.purpose = "MUTATED_AFTER_CONSTRUCTION";
+  await f.owner.initialize(); await f.owner.start(f.request); const candidate = await f.ready;
+  const results = f.agent().results;
+  expect(results[0]!.details).toEqual([]);
+  expect(results[1]!.details).toMatchObject({ source_references: [{
+    reference_hash: reference.hash, entry: "step", provenance: reference.provenance }] });
+  expect(JSON.stringify(results[1]!.details)).not.toContain(rootSource);
+  expect(results[2]!.isError).toBe(true);
+  expect(JSON.stringify(results[2]!.details)).not.toContain(rootSource);
+  expect(results[3]!.details).toMatchObject({ source: rootSource, reference_hash: reference.hash });
+  expect(results[4]!.details).toEqual([]);
+  for (const index of [5, 6, 7]) expect(results[index]!.isError).toBe(true);
+  expect(results[8]!.details).toMatchObject({ name: "executive", version: 1,
+    card: { purpose: "Synthetic source-copy protocol" },
+    operation: { tool: "program_copy", provenance: { reference_hash: reference.hash,
+      operator_provenance: reference.provenance } } });
+  const copied = (results[8]!.details as { source: string; hash: string });
+  expect(copied.hash).toBe(createHash("sha256").update(copied.source, "utf8").digest("hex"));
+  expect(candidate.root.version).toBe(2);
+  expect(f.counters().activated).toBe(0);
+  const copyTool = f.agent().tools.find(tool => tool.name === "program_copy")!;
+  expect((await copyTool.execute("selected-copy", copy)).details).toEqual(results[8]!.details);
+  expect((await copyTool.execute("selected-copy", { ...copy, name: "other" })).isError).toBe(true);
+  expect((await copyTool.execute("late-copy", { ...copy, name: "other" })).isError).toBe(true);
+  const rows: { type: string; details: Record<string, Json> }[] =
+    readFileSync(join(f.directory, "prepared-source", readdirSync(join(f.directory, "prepared-source"))[0]!), "utf8")
+      .trim().split("\n").map(line => JSON.parse(line));
+  const mutations = rows.filter(row => row.type === "source.written");
+  expect(mutations).toHaveLength(2);
+  expect(mutations[0]!.details).toMatchObject({ tool: "program_copy", tool_call_id: "selected-copy",
+    provenance: { reference_hash: reference.hash, operator_provenance: reference.provenance },
+    receipt: results[8]!.details });
+  expect(mutations[0]!.details.identity).toContain('"tool":"program_copy"');
+  expect(rows.filter(row => row.type === "tool.receipt" && row.details.call_id === "selected-copy")).toHaveLength(0);
+  const prompt = rows.find(row => row.type === "model.prompt")!;
+  expect(JSON.stringify(prompt.details)).not.toContain(rootSource);
+  await f.owner.close();
+});
+
+test("invalid approved registries fail before auth, inference or admission without exposing source", async () => {
+  const reference = approvedReference();
+  let consulted = 0;
+  const f = fixture();
+  const invalid: unknown[] = [
+    [{ ...reference, hash: "f".repeat(64) }],
+    [{ ...reference, entry: "guessed" }],
+    [{ ...reference, provenance: "" }],
+    [{ ...reference, card: { ...reference.card, purpose: "" } }],
+    [{ ...reference, source: "é".repeat(9000) }],
+    [approvedReference("a".repeat(16380) + "XX\ude00", "library")],
+    [reference, { ...reference, provenance: "conflicting provenance" }],
+    Array.from({ length: 33 }, () => reference),
+  ];
+  for (const sourceReferences of invalid) {
+    let failure: unknown;
+    try {
+      new PreparedSource({ ...f.options, sourceReferences: sourceReferences as readonly ApprovedSourceReference[],
+        auth: { ...f.options.auth, snapshot() { consulted++; return sourceAuthState(); },
+          async createAgent() { consulted++; throw new Error("Unexpected inference"); } },
+        assertCanStart() { consulted++; }, async getContract() { consulted++; throw new Error("Unexpected contract"); } });
+    } catch (error) { failure = error; }
+    expect(failure).toBeInstanceOf(Error);
+    expect(String(failure)).not.toContain(rootSource);
+  }
+  expect(consulted).toBe(0);
+  await f.owner.initialize(); await f.owner.start(f.request); await f.ready;
+  expect(f.agent().tools.some(tool => tool.name === "program_copy")).toBe(false);
+  await f.owner.close();
+});
+
+test("exact source edits preserve the canonical entry card and pinned imports with atomic failures and immutable replay", async () => {
+  const card = approvedReference().card;
+  const source = "import {value} from './helper.js'; export function analyze(input) { return {value:value(input),label:'unchanged'}; }";
+  const edits = [{ old_text: '"unchanged"', new_text: '"changed"' }];
+  const edit: Call = { name: "program_edit", id: "exact-edit",
+    args: { name: "probe", based_on: 1, edits } };
+  const f = fixture([
+    { name: "program_write", args: { name: "helper", entry: "library",
+      source: "export function value(input) { return input; }" } },
+    { name: "program_write", args: { name: "probe", entry: "analyze", source, card,
+      dependencies: [{ name: "helper", version: 1, import_path: "./helper.js" }] } },
+    { name: "program_edit", args: { name: "probe", based_on: 1, edits: [
+      { old_text: '"unchanged"', new_text: '"would partially change"' },
+      { old_text: "ABSENT_EXACT_TEXT", new_text: "" }] } },
+    { name: "program_edit", args: { name: "probe", based_on: 1, edits: [{ old_text: "input", new_text: "ambiguous" }] } },
+    edit,
+    { name: "program_edit", args: { name: "probe", based_on: 1, edits } },
+    { name: "program_edit", args: { name: "probe", based_on: 2,
+      edits: [{ old_text: '"changed"', new_text: '"third version"' }] } },
+    ...rootCalls(),
+  ]);
+  await f.owner.initialize(); await f.owner.start(f.request); await f.ready;
+  const results = f.agent().results;
+  for (const index of [2, 3, 5]) expect(results[index]!.isError).toBe(true);
+  expect(results[4]!.details).toMatchObject({ entry: "analyze", version: 2, based_on: 1, card,
+    dependencies: [{ name: "helper", version: 1, import_path: "./helper.js" }],
+    operation: { tool: "program_edit", provenance: { based_on: 1, edits } } });
+  expect((results[4]!.details as { source: string }).source).toContain('import { value } from "./helper.js"');
+  expect((results[4]!.details as { source: string }).source).not.toContain("would partially change");
+  const editTool = f.agent().tools.find(tool => tool.name === "program_edit")!;
+  expect((await editTool.execute(edit.id!, edit.args)).details).toEqual(results[4]!.details);
+  expect((await editTool.execute(edit.id!, { name: "probe", based_on: 2, edits })).isError).toBe(true);
+  expect((await editTool.execute("late-edit", { name: "probe", based_on: 3, edits })).isError).toBe(true);
+  expect(f.counters().activated).toBe(0);
+  expect(f.owner.snapshot()?.analysis_jobs).toBe(0);
+  expect(f.owner.snapshot()?.source_versions).toBe(5);
+  const rows: { type: string; details: Record<string, Json> }[] =
+    readFileSync(join(f.directory, "prepared-source", readdirSync(join(f.directory, "prepared-source"))[0]!), "utf8")
+      .trim().split("\n").map(line => JSON.parse(line));
+  expect(rows.filter(row => row.type === "source.written" && row.details.tool === "program_edit")).toHaveLength(2);
+  const mutation = rows.find(row => row.type === "source.written" && row.details.tool_call_id === edit.id)!;
+  expect(mutation.details).toMatchObject({ provenance: { based_on: 1, edits }, receipt: results[4]!.details });
+  expect(mutation.details.identity).toContain('"tool":"program_edit"');
+  expect(rows.filter(row => row.type === "tool.receipt" && row.details.call_id === edit.id)).toHaveLength(0);
+  await f.owner.close();
+});
+
+test("copy never hydrates dependencies and exact revisions retain post-validation CAS and lifecycle fences", async () => {
+  const reference = approvedReference("import {value} from './helper.js'; export function analyze(input) { return value(input); }", "analyze");
+  const rows: string[] = [];
+  let revoked = false, failAppend = false;
+  const adapter = minecraftTestAdapter();
+  const compatibility = adapterCompatibility(adapter.descriptor, adapter.schemas);
+  const book = new PreparedSourcebook(compatibility.compatibility_hash, adapter, type => {
+    if (failAppend) throw new Error("Simulated durable append failure");
+    rows.push(type);
+  }, () => { if (revoked) throw new Error("Revoked authority"); }, [reference]);
+  const copy = { name: "probe", entry: "analyze", reference_hash: reference.hash };
+  expect(book.catalog()).toEqual([]);
+  await expect(book.copy(copy, "missing-pin", "request")).rejects.toThrow();
+  expect(book.versions).toBe(0); expect(rows).toHaveLength(0);
+  await book.write({ name: "helper", entry: "library", source: "export function value(input) { return input; }" }, "helper", "request");
+  await expect(book.copy(copy, "still-missing-pin", "request")).rejects.toThrow();
+  const pinned = { ...copy, dependencies: [{ name: "helper", version: 1, import_path: "./helper.js" }] };
+  failAppend = true;
+  await expect(book.copy(pinned, "durable-copy", "request")).rejects.toThrow();
+  expect(book.versions).toBe(1); expect(rows).toHaveLength(1);
+  failAppend = false;
+  const receipt = await book.copy(pinned, "durable-copy", "request");
+  const edits = [{ old_text: "return value(input)", new_text: "return value(null)" }];
+  const concurrent = await Promise.allSettled([
+    book.edit({ name: "probe", based_on: 1, edits }, "edit-a", "request"),
+    book.edit({ name: "probe", based_on: 1, edits }, "edit-b", "request"),
+  ]);
+  expect(concurrent.filter(result => result.status === "fulfilled")).toHaveLength(1);
+  expect(concurrent.filter(result => result.status === "rejected")).toHaveLength(1);
+  expect(book.select({ name: "probe" }).version).toBe(2);
+  expect(await book.copy(pinned, "durable-copy", "request")).toEqual(receipt);
+  const cancelled = book.edit({ name: "probe", based_on: 2,
+    edits: [{ old_text: "return value(null)", new_text: "return value(input)" }] }, "cancelled-edit", "request");
+  revoked = true;
+  await expect(cancelled).rejects.toThrow();
+  expect(book.select({ name: "probe" }).version).toBe(2);
+  revoked = false; book.seal();
+  await expect(book.copy({ ...pinned, name: "late" }, "late-copy", "request")).rejects.toThrow();
+  await expect(book.edit({ name: "probe", based_on: 2, edits }, "late-edit", "request")).rejects.toThrow();
+  expect(rows.filter(type => type === "source.written")).toHaveLength(3);
+});
+
+test("copy and edit share immutable all-history version and source-byte budgets", async () => {
+  const reference = approvedReference("export const value = 1;", "library");
+  const adapter = minecraftTestAdapter();
+  const compatibility = adapterCompatibility(adapter.descriptor, adapter.schemas);
+  const book = new PreparedSourcebook(compatibility.compatibility_hash, adapter, () => {}, () => {}, [reference]);
+  await book.copy({ name: "helper", entry: "library", reference_hash: reference.hash }, "copy", "request");
+  for (let version = 1; version < PREPARED_START_LIMITS.max_source_versions; version++)
+    await book.edit({ name: "helper", based_on: version, edits: [{
+      old_text: `value = ${version}`, new_text: `value = ${version + 1}`,
+    }] }, `edit-${version}`, "request");
+  expect(book.versions).toBe(PREPARED_START_LIMITS.max_source_versions);
+  expect(book.sourceBytes).toBeGreaterThan(Buffer.byteLength(book.select({ name: "helper" }).source));
+  await expect(book.copy({ name: "another", entry: "library", reference_hash: reference.hash }, "overflow-copy", "request")).rejects.toThrow();
+  await expect(book.edit({ name: "helper", based_on: PREPARED_START_LIMITS.max_source_versions,
+    edits: [{ old_text: "value = 64", new_text: "value = 65" }] }, "overflow-edit", "request")).rejects.toThrow();
+  expect(book.versions).toBe(PREPARED_START_LIMITS.max_source_versions);
+  const largeReference = approvedReference(`/*${"x".repeat(15500)}*/\nexport const value = 1;`, "library");
+  const largeBook = new PreparedSourcebook(compatibility.compatibility_hash, adapter, () => {}, () => {}, [largeReference]);
+  const largeCopy = { entry: "library", reference_hash: largeReference.hash };
+  await largeBook.copy({ ...largeCopy, name: "large-0" }, "large-copy-0", "request");
+  const size = largeBook.sourceBytes;
+  const maximumVersions = Math.floor(PREPARED_START_LIMITS.max_source_bytes / size);
+  for (let index = 1; index < maximumVersions; index++)
+    await largeBook.copy({ ...largeCopy, name: `large-${index}` }, `large-copy-${index}`, "request");
+  const before = largeBook.sourceBytes;
+  await expect(largeBook.copy({ ...largeCopy, name: "overflow" }, "bytes-overflow-copy", "request")).rejects.toThrow();
+  await expect(largeBook.edit({ name: "large-0", based_on: 1,
+    edits: [{ old_text: "value = 1", new_text: "value = 2" }] }, "bytes-overflow-edit", "request")).rejects.toThrow();
+  expect(largeBook.sourceBytes).toBe(before);
+  expect(largeBook.versions).toBe(maximumVersions);
+});
+
+test("source edits do not renew the original forty-eight-tool allowance", async () => {
+  const calls: Call[] = [rootCalls()[0]!];
+  for (let version = 1; version <= PREPARED_START_LIMITS.max_tools; version++)
+    calls.push({ name: "program_edit", args: { name: "executive", based_on: version,
+      edits: [{ old_text: version === 1 ? "software fixture only" : `software fixture revision ${version}`,
+        new_text: `software fixture revision ${version + 1}` }] } });
+  calls.push({ ...rootCalls()[1]!, args: { ...rootCalls()[1]!.args as object, version: PREPARED_START_LIMITS.max_tools } });
+  const f = fixture(calls);
+  await f.owner.initialize(); await f.owner.start(f.request); const terminal = await f.terminal;
+  expect(terminal.tools_used).toBe(PREPARED_START_LIMITS.max_tools);
+  expect(terminal.source_versions).toBe(PREPARED_START_LIMITS.max_tools);
+  expect(terminal.phase).toBe("failed");
+  expect(f.counters()).toMatchObject({ compiled: 0, activated: 0 });
   await f.owner.close();
 });
 

@@ -15,7 +15,9 @@ import type { AuthManager } from "./auth.ts";
 import type { SandboxService } from "./sandbox.ts";
 import type { PreparationContract, PreparedSourceCandidate } from "./prepared-source-contract.ts";
 import { adapterCompatibility, canonicalContractJson } from "./adapter-contract.ts";
-import { PreparedSourcebook, inactivePreparedWriteSchema } from "./prepared-sourcebook.ts";
+import { PreparedSourcebook, inactivePreparedCopySchema, inactivePreparedEditSchema,
+  inactivePreparedWriteSchema, validatePreparedSourceReferences } from "./prepared-sourcebook.ts";
+import type { ApprovedSourceReference } from "./source-authoring.ts";
 import { PreparedInference } from "./prepared-inference.ts";
 import { analysisValidateAsSchema, helpSchema, programSelectorSchema } from "./program-interface.ts";
 import { programHelp } from "./program-help.ts";
@@ -26,6 +28,7 @@ import { GeneratedControllerResultValidationError, parseGeneratedResidentResult 
 
 export interface PreparedSourceOptions {
   directory: string;
+  sourceReferences?: readonly ApprovedSourceReference[];
   auth: Pick<AuthManager, "snapshot" | "createAgent" | "releaseAgent">;
   sandbox: Pick<SandboxService, "createResidentWorker" | "createResidentAnalysisWorker">;
   getContract(): Promise<PreparationContract>;
@@ -39,7 +42,8 @@ const finishSchema = programSelectorSchema.required({ version: true }).extend({ 
   initial_state: residentStateSchema, limits: residentActorLimitsSchema, session: controlSessionConfigSchema }).strict();
 type Finish = z.infer<typeof finishSchema>;
 const inspectSchema = z.discriminatedUnion("view", [z.object({ view: z.literal("catalog") }).strict(),
-  programSelectorSchema.extend({ view: z.literal("source") }).strict()]);
+  programSelectorSchema.extend({ view: z.literal("source") }).strict(),
+  z.object({ view: z.literal("reference_source"), reference_hash: inactivePreparedCopySchema.shape.reference_hash }).strict()]);
 const analyzeSchema = programSelectorSchema.required({ version: true }).extend({ input: residentAnalysisInputSchema,
   validate_as: analysisValidateAsSchema.optional() }).strict();
 type Attempt = {
@@ -72,7 +76,11 @@ export class PreparedSource {
   private journalBlocked = false;
   private readonly unsettled = new Set<Attempt>();
   private readonly directory: string;
-  constructor(private readonly options: PreparedSourceOptions) { this.directory = join(options.directory, "prepared-source"); }
+  private readonly sourceReferences: readonly ApprovedSourceReference[];
+  constructor(private readonly options: PreparedSourceOptions) {
+    this.sourceReferences = validatePreparedSourceReferences(options.sourceReferences);
+    this.directory = join(options.directory, "prepared-source");
+  }
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
@@ -290,7 +298,7 @@ export class PreparedSource {
         compatibility_hash: compatibility.compatibility_hash, descriptor: contract.adapter.descriptor as unknown as Json,
         schemas: contract.adapter.schemas as unknown as Json });
       const book = new PreparedSourcebook(compatibility.compatibility_hash, contract.adapter,
-        (type, data) => this.append(attempt, type, data), () => this.current(attempt));
+        (type, data) => this.append(attempt, type, data), () => this.current(attempt), this.sourceReferences);
       attempt.book = book;
       const systemPrompt = [this.prompt()], tools = this.tools(attempt, contract);
       this.append(attempt, "model.context", { model_id: attempt.request.model_id, system_prompt: systemPrompt,
@@ -309,6 +317,7 @@ export class PreparedSource {
         artifact_sha256: contract.artifact_sha256, compatibility_hash: compatibility.compatibility_hash,
         deadline_at: attempt.view.deadline_at, limits: PREPARED_START_LIMITS,
         world_state: null, observation: null, native_identity: null,
+        source_references: this.referenceList(),
         controller_reference: this.help({ topic: "controller" }, contract, tools) };
       this.append(attempt, "model.prompt", prompt as unknown as Json);
       await agent.prompt(JSON.stringify(prompt));
@@ -412,7 +421,7 @@ export class PreparedSource {
           const input = parsed.data;
           const value = await handle(input, callId, requestId);
           this.current(attempt);
-          if (name !== "program_write") book.complete(callId, identity, value);
+          if (!["program_write", "program_edit", "program_copy"].includes(name)) book.complete(callId, identity, value);
           attempt.view.source_versions = book.versions; this.save(attempt);
           return { content: [{ type: "text", text: JSON.stringify(value) }], details: value,
             ...(value && typeof value === "object" && "failed" in value && value.failed === true ? { isError: true } : {}) };
@@ -438,8 +447,11 @@ export class PreparedSource {
         input => this.help(input, contract, tools)),
       tool("program_write", "Save validated inactive immutable source. Entry defaults to step: the root module exports step(frame,state,intent) and activate(frame,state,intent). Explicit entry run is an async BODY for semantic children, without a function wrapper, imports or exports. Use a separate entry analyze wrapper for software tests or entry library for helpers. No outcome-linked reason or playing authority.", inactivePreparedWriteSchema,
         (input, callId, requestId) => attempt.book!.write(input, callId, requestId)),
-      tool("program_inspect", "Inspect named prepared catalog or exact canonical source; contains no execution or native observations.", inspectSchema,
-        input => input.view === "catalog" ? attempt.book!.catalog() : attempt.book!.publicSource(attempt.book!.select(input))),
+      tool("program_edit", "Apply explicit sequential exact unique-match replacements to the latest based_on canonical source. Inherits its exact entry, card and pinned dependencies. Atomic validation/CAS; no inferred repair, execution or selection change.", inactivePreparedEditSchema,
+        (input, callId, requestId) => attempt.book!.edit(input, callId, requestId)),
+      tool("program_inspect", "Inspect the prepared catalog or canonical source. reference_source explicitly reads only an operator-approved task-material hash; this does not save it or hydrate dependencies. Contains no execution or native observations.", inspectSchema,
+        input => input.view === "catalog" ? attempt.book!.catalog() : input.view === "reference_source"
+          ? attempt.book!.referenceSource(input.reference_hash) : attempt.book!.publicSource(attempt.book!.select(input))),
       tool("program_analyze", "Execute a disposable pure analyze wrapper importing your exact step candidate on explicitly model-authored synthetic software-test JSON. Optional validate_as checks only the returned activation/decision shape, not gameplay or live acceptance. Cannot invoke the clean playing worker.", analyzeSchema,
         async input => {
           this.current(attempt);
@@ -509,23 +521,31 @@ export class PreparedSource {
             qualification: "inactive_source_only_pending_clean_compile" };
         }),
     ];
+    if (this.sourceReferences.length) tools.push(
+      tool("program_copy", "Explicitly copy one operator-approved task-material reference by hash into inactive validated source. Required entry must match the approved reference. Card defaults to its approved card; dependencies default empty and must pin current-book versions explicitly. No dependency hydration, execution or selection change.", inactivePreparedCopySchema,
+        (input, callId, requestId) => attempt.book!.copy(input, callId, requestId)));
     return tools;
+  }
+  private referenceList(): Json {
+    return this.sourceReferences.map(reference => ({ reference_hash: reference.hash,
+      provenance: reference.provenance, entry: reference.entry }));
   }
   private help(input: z.infer<typeof helpSchema>, contract: PreparationContract, tools: AgentTool[]): Json {
     const schemas = Object.fromEntries(tools.map(tool => [tool.name, tool.parameters]));
     const topics = ["overview", "programs", "controller", "actions", "game"];
     const authority = "Source-only preparation. No world observation or playing authority. Only these advertised tools are callable; game/action references describe authored children after actual launch.";
-    if (input.topic === "overview") return { authority, tools: tools.map(tool => tool.name), topics, schemas } as Json;
+    const source_references = this.referenceList();
+    if (input.topic === "overview") return { authority, tools: tools.map(tool => tool.name), topics, schemas, source_references } as Json;
     if (!topics.includes(input.topic)) return { available: false, topic: input.topic, topics, authority };
     const reference = programHelp(input.topic, contract.adapter, input.kind) as Record<string, unknown>;
     const softwareTests = "Use program_analyze with an exact analyze wrapper importing your pinned step candidate. validate_as checks only its returned activation/decision shape, not an aggregate case report. Validated source throws expose bounded source_diagnostic marked advisory/untrusted; its source_hash identifies the compiled pinned realm, not merely the root body. Use your assertion/error text to correct source or synthetic fixtures, never as a host fact or native authority. Synthetic inputs and passing shape validation are not gameplay or live admission evidence.";
     if (input.topic === "controller" && "launch" in reference)
-      return { ...reference, authority, launch: { tool: "prepare_finish", schema: schemas.prepare_finish },
-        operations: "Save inactive source with program_write; select the exact root and finite initial state/intent/session with prepare_finish. The clean playing worker activates only after genuine launch on the first actual frame.",
+      return { ...reference, authority, source_references, launch: { tool: "prepare_finish", schema: schemas.prepare_finish },
+        operations: "Save inactive source with program_write or explicit exact program_edit. When advertised, program_copy requires an operator-approved hash and explicit matching entry; inspect reference_source for its bytes. References never enter the catalog without your tool call and dependencies are not hydrated. Select the exact root and finite initial state/intent/session with prepare_finish. The clean playing worker activates only after genuine launch on the first actual frame.",
         software_tests: softwareTests } as unknown as Json;
     if (input.topic === "programs" && "resident" in reference) {
       const { operations: _operations, software_tests: _tests, ...resident } = reference.resident as Record<string, unknown>;
-      return { authority, schemas, body: reference.body, identifiers: reference.identifiers,
+      return { authority, schemas, source_references, body: reference.body, identifiers: reference.identifiers,
         coverage: reference.coverage, hearing: reference.hearing, compass_bearings: reference.compass_bearings,
         composition: reference.composition, resident,
         software_tests: softwareTests, world_view: reference.world_view, temporal_turn: reference.temporal_turn,
@@ -534,12 +554,13 @@ export class PreparedSource {
         limits: reference.limits, default_execution_limits: reference.default_execution_limits,
         default_resident_limits: reference.default_resident_limits } as unknown as Json;
     }
-    return { authority, ...reference } as unknown as Json;
+    return { authority, ...reference, source_references } as unknown as Json;
   }
   private prompt(): string {
     return "You author source before any game world/client/avatar is entered. Follow the user's exact task and goal using the selected model. " +
       "There is no initial observation, player/native identity or world state. Do not invent them or claim gameplay success. " +
       "This is a fresh source-only codebook; no prior session or cross-model experience is hydrated. Only the advertised tools are authorized. " +
+      "Explicit operator-approved source references, if any, are task material listed only by hash/provenance/entry. Inspect reference_source to read one, then choose program_copy with its exact hash and explicit matching entry if advertised. Nothing is saved or imported automatically; pin any current-book dependencies yourself. program_edit applies only your explicit exact unique-match replacements to the latest based_on source, preserving entry/card/dependencies. Neither operation executes source or selects a root. " +
       "program_write saves inactive canonical immutable source and defaults to entry step. Author the root with entry:'step', exporting step(frame,state,intent) and activate(frame,state,intent); do not put these exports in entry:'run'. " +
       "Semantic children require explicit entry:'run' and an async BODY only: no function wrapper, imports or exports. Use explicit entry:'library' for ordinary libraries/reexports and a separate entry:'analyze' module exporting analyze(input) for software tests. Use named versions and CAS based_on for revisions. " +
       "program_analyze runs bounded pure software tests on your explicitly synthetic input, never actual observations or gameplay qualification. Optional validate_as checks only output return shape; a refusal has valid activation shape but is not accepted live activation. " +

@@ -13,6 +13,7 @@ export interface PreparedWorldLaunch {
 }
 export interface PreparedStartOptions {
   directory: string;
+  sourceReferences?: PreparedSourceOptions["sourceReferences"];
   auth: PreparedSourceOptions["auth"];
   sandbox: PreparedSourceOptions["sandbox"];
   runtime: Pick<Runtime, "snapshot" | "startPreparedRun" | "control">;
@@ -31,6 +32,7 @@ export class PreparedStart {
 
   constructor(private readonly options: PreparedStartOptions) {
     this.source = new PreparedSource({ directory: options.directory, auth: options.auth, sandbox: options.sandbox,
+      sourceReferences: options.sourceReferences,
       getContract: () => this.refreshContract(), assertCanStart: () => this.assertIdle(),
       onReady: candidate => this.enter(candidate), onCancel: () => this.closeLaunch(),
       changed: options.changed, record: options.record });

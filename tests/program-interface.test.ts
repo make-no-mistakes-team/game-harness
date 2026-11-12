@@ -564,7 +564,7 @@ test("program_submit rejects invalid source, lineage, dependencies and limits be
   expect(f.dispatches()).toBe(0);
 });
 
-for (const toolName of ["program_write", "program_submit"] as const) {
+for (const toolName of ["program_write", "program_submit", "program_edit"] as const) {
   test(`${toolName} distinguishes missing parent outcome from missing source and permits an ordinary revision`, async () => {
     const f = fixture();
     const name = "unexecuted revision";
@@ -578,8 +578,10 @@ for (const toolName of ["program_write", "program_submit"] as const) {
     expect(feedback).toHaveLength(1);
     expect(feedback[0]!.version.version).toBe(1);
     const revisionCard = { ...card, reason: "Repair the stored source before its first execution" };
-    const input = { entry: "run", name, source, card: revisionCard, based_on: 2,
-      ...(toolName === "program_submit" ? { args: null } : {}) };
+    const input = toolName === "program_edit"
+      ? { name, based_on: 2, edits: [{ old_text: "Neutral result", new_text: "Stored revision" }] }
+      : { entry: "run", name, source, card: revisionCard, based_on: 2,
+        ...(toolName === "program_submit" ? { args: null } : {}) };
     const refused = await f.call(toolName, { ...input, reason: "Link a candidate to this exact parent's outcome" });
     expect(refused.isError).toBe(true);
     expect(data(refused).error).toMatchObject({
@@ -605,7 +607,7 @@ for (const toolName of ["program_write", "program_submit"] as const) {
       await waitClosed(f.store, f.run.run_id, execution.execution_id);
     } else expect(data(ordinary)).toMatchObject({ name, version: 3, experiment: null });
     expect(f.store.namedSkill(f.run.run_id, name, 3)).toMatchObject({
-      skill_id: parent.skill_id, parent_version: 2, card: revisionCard,
+      skill_id: parent.skill_id, parent_version: 2, card: toolName === "program_edit" ? parent.card : revisionCard,
     });
     expect(f.actions()).toBe(0);
     expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")).toEqual(feedback);
@@ -1316,6 +1318,144 @@ test("program_write lost source acknowledgement reuses the registered version ra
   expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
 });
 
+test("program_edit preserves the inspected entry, card and exact dependency aliases without execution", async () => {
+  const f = fixture();
+  await f.write("edit library", "export const value = 1;", { entry: "library" });
+  await f.write("edit consumer", 'import {value} from "./helper.js"; export function analyze(input) { return value; }',
+    { entry: "analyze", dependencies: [{ name: "edit library", version: 1, import_path: "./helper.js" }] });
+  const before = data(await f.call("program_inspect", { view: "source", name: "edit consumer", version: 1 }));
+  await f.write("edit library", "export const value = 2;", { entry: "library", based_on: 1 });
+  const input = { name: "edit consumer", based_on: 1, edits: [
+    { old_text: "return value;", new_text: "return value + 1;" },
+    { old_text: "value + 1", new_text: "value + 2" },
+  ] };
+  const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: "exact-consumer-edit", name: "program_edit", arguments: input }]);
+  expect(replies[0]!.isError).not.toBe(true);
+  expect(data(replies[0]!)).toMatchObject({
+    name: "edit consumer", version: 2, entry: "analyze", experiment: null,
+    dependencies: [{ name: "edit library", version: 1, import_path: "./helper.js" }],
+  });
+  const after = data(await f.call("program_inspect", { view: "source", name: "edit consumer", version: 2 }));
+  expect(after).toMatchObject({
+    entry: before.entry, card: before.card, dependencies: before.dependencies, parent_version: 1,
+    source: before.source.replace("return value;", "return value + 2;"),
+  });
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+  expect(f.actions()).toBe(0);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "program.edited")).toMatchObject([{
+    details: { tool: "program_edit", input, base: { version: 1 }, revision: { name: "edit consumer", version: 2 } },
+  }]);
+});
+
+test("program_edit refuses missing or stale bases and failed, ambiguous or invalid replacements without revisions", async () => {
+  const f = fixture();
+  await f.write("edit base", 'const first = "same"; const second = "same"; return {status:"completed",summary:first,result:second};');
+  await f.write("edit base", undefined, { based_on: 1 });
+  const parent = f.store.namedSkill(f.run.run_id, "edit base")!;
+  for (const [name, based_on, edits, code] of [
+    ["missing edit", 1, [{ old_text: "Neutral result", new_text: "Changed" }], "not_found"],
+    ["edit base", 99, [{ old_text: "Neutral result", new_text: "Changed" }], "not_found"],
+    ["edit base", 1, [{ old_text: "same", new_text: "Changed" }], "conflict"],
+    ["edit base", 2, [{ old_text: "absent", new_text: "Changed" }], "invalid_program"],
+    ["edit base", 2, [{ old_text: "Neutral", new_text: "Changed" }, { old_text: "absent", new_text: "" }], "invalid_program"],
+    ["edit base", 2, [{ old_text: "return", new_text: "return (" }], "invalid_program"],
+  ] as const) {
+    expect(data(await f.call("program_edit", { name, based_on, edits })).error.code).toBe(code);
+    expect(f.store.namedSkill(f.run.run_id, "edit base")).toEqual(parent);
+    expect(f.store.skills(f.run.run_id)).toHaveLength(2);
+  }
+  await f.write("ambiguous edit", 'const first = "same"; const second = "same"; return {status:"completed",summary:first,result:second};');
+  expect(data(await f.call("program_edit", { name: "ambiguous edit", based_on: 1,
+    edits: [{ old_text: "same", new_text: "Changed" }] })).error.code).toBe("invalid_program");
+  expect(f.store.namedSkill(f.run.run_id, "ambiguous edit")!.version).toBe(1);
+  const rejected = await agentCalls(f.tools(), [{
+    type: "toolCall", id: "edit-cannot-replace-source", name: "program_edit",
+    arguments: { name: "edit base", based_on: 2, source,
+      edits: [{ old_text: "Neutral result", new_text: "Changed" }] },
+  }]);
+  expect(data(rejected[0]!).error.code).toBe("invalid_request");
+  expect(f.store.namedSkill(f.run.run_id, "edit base")).toEqual(parent);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
+for (const interruption of ["registration", "final_ack"] as const) {
+  test(`program_edit replays its original mutation after ${interruption} and newer source, rejecting equivalent conflicting edits`, async () => {
+    const f = fixture();
+    await f.write("edit replay");
+    const id = `edit-replay-${interruption}`;
+    const input = { name: "edit replay", based_on: 1, edits: [{ old_text: "Neutral result", new_text: "Edited result" }] };
+    const register = f.manager.register.bind(f.manager);
+    const db = new Database(join(f.directory, "runs.sqlite"));
+    if (interruption === "registration") f.manager.register = async (...args) => {
+      await register(...args);
+      throw new Error("Edit registration acknowledgement lost");
+    };
+    else db.exec(`CREATE TRIGGER lose_edit_ack BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND NEW.object_key='${id}' BEGIN SELECT RAISE(ABORT,'edit acknowledgement lost'); END;`);
+    expect((await f.call("program_edit", input, id)).isError).toBe(true);
+    f.manager.register = register;
+    if (interruption === "final_ack") db.exec("DROP TRIGGER lose_edit_ack;");
+    db.close();
+    expect(f.store.namedSkill(f.run.run_id, "edit replay")!.version).toBe(2);
+    await f.write("edit replay", source, { based_on: 2 });
+    const replay = await f.call("program_edit", input, id);
+    expect(replay.isError).not.toBe(true);
+    expect(data(replay)).toMatchObject({ name: "edit replay", version: 2, experiment: null });
+    expect(data(await f.call("program_edit", { ...input,
+      edits: [{ old_text: '"Neutral result"', new_text: '"Edited result"' }] }, id)).error.code).toBe("conflict");
+    expect(data(await f.call("program_edit", input, id))).toEqual(data(replay));
+    expect(f.store.skills(f.run.run_id)).toHaveLength(3);
+    expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "program.edited")).toHaveLength(1);
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  });
+}
+
+for (const boundary of ["abort", "generation", "role", "newer_parent"] as const) {
+  test(`program_edit rechecks ${boundary} after asynchronous validation before publication`, async () => {
+    const f = fixture(), controller = new AbortController();
+    await f.write("guarded edit");
+    const ready = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const register = f.store.registerSkill.bind(f.store);
+    f.store.registerSkill = async (...args) => {
+      ready.resolve();
+      await release.promise;
+      return register(...args);
+    };
+    const pending = f.tools().find(tool => tool.name === "program_edit")!.execute(`guarded-edit-${boundary}`, {
+      name: "guarded edit", based_on: 1, edits: [{ old_text: "Neutral result", new_text: "Candidate result" }],
+    }, controller.signal);
+    await ready.promise;
+    f.store.registerSkill = register;
+    if (boundary === "abort") controller.abort();
+    else if (boundary === "generation") f.fence();
+    else if (boundary === "role") f.toolHost.toolRole = () => "authoring";
+    else await f.write("guarded edit", source, { based_on: 1 });
+    release.resolve();
+    expect(data(await pending).error.code).toBe(boundary === "newer_parent" ? "conflict" : "stale_context");
+    expect(f.store.namedSkill(f.run.run_id, "guarded edit")!.version).toBe(boundary === "newer_parent" ? 2 : 1);
+    expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "program.edited")).toHaveLength(0);
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  });
+}
+
+test("program_edit cannot publish a revision without its atomic registration receipt", async () => {
+  const f = fixture();
+  await f.write("atomic edit");
+  const db = new Database(join(f.directory, "runs.sqlite"));
+  db.exec("CREATE TRIGGER lose_edit_registration BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND json_extract(NEW.payload,'$.skill_id') IS NOT NULL BEGIN SELECT RAISE(ABORT,'edit registration unavailable'); END;");
+  const input = { name: "atomic edit", based_on: 1, edits: [{ old_text: "Neutral result", new_text: "Edited result" }] };
+  const failed = await f.call("program_edit", input, "atomic-edit");
+  expect(failed.isError).toBe(true);
+  expect(f.store.namedSkill(f.run.run_id, "atomic edit")!.version).toBe(1);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "skill.authored")).toHaveLength(1);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "program.edited")).toHaveLength(0);
+  db.exec("DROP TRIGGER lose_edit_registration;");
+  db.close();
+  expect(data(await f.call("program_edit", input, "atomic-edit"))).toMatchObject({ name: "atomic edit", version: 2 });
+  expect(f.store.skills(f.run.run_id)).toHaveLength(2);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
 test("program_write durably pins local library aliases even when registration is interrupted before publication", async () => {
   const f = fixture();
   expect((await f.write("pure helper", "export const value = 1;", { entry: "library" })).isError).not.toBe(true);
@@ -1746,9 +1886,10 @@ test("installed Agent cannot use captured playing tools during authoring and sav
   expect(started[0]!.isError).not.toBe(true);
   const root = f.store.latestRootExecution(f.run.run_id)!;
   f.toolHost.toolRole = () => "authoring";
-  expect(f.tools().map(tool => tool.name).sort()).toEqual(["help", "observe", "program_inspect", "program_write"]);
+  expect(f.tools().map(tool => tool.name).sort()).toEqual(["help", "observe", "program_edit", "program_inspect", "program_write"]);
   expect(f.tools().find(tool => tool.name === "program_write")!.parameters).not.toHaveProperty("properties.reason");
   expect(f.tools().find(tool => tool.name === "program_write")!.parameters).toHaveProperty("properties.based_on");
+  expect(f.tools().find(tool => tool.name === "program_edit")!.parameters).not.toHaveProperty("properties.reason");
   const forbidden: ToolCall[] = [
     ...["start", "stop", "update_intent", "analyze", "activate_next", "attention"].map((operation, index) => ({
       type: "toolCall" as const, id: `blocked-control-${index}`, name: "program_run", arguments: { operation, name: "foreground", args: null },
@@ -1760,6 +1901,9 @@ test("installed Agent cannot use captured playing tools during authoring and sav
     { type: "toolCall", id: "blocked-review", name: "program_review", arguments: { name: "foreground", decision: "keep", reason: "Unauthorized assessment" } },
     { type: "toolCall", id: "blocked-prepare", name: "prepare_next", arguments: { name: "foreground", args: null } },
     { type: "toolCall", id: "blocked-experiment", name: "program_write", arguments: { entry: "run", name: "foreground", based_on: 1, source, reason: "Unauthorized outcome linkage" } },
+    { type: "toolCall", id: "blocked-edit-experiment", name: "program_edit", arguments: {
+      name: "foreground", based_on: 1, edits: [{ old_text: "Neutral result", new_text: "Changed" }], reason: "Unauthorized outcome linkage",
+    } },
   ];
   const rejected = await agentCalls([...ordinary, prepared], forbidden);
   expect(rejected).toHaveLength(forbidden.length);
@@ -1790,11 +1934,20 @@ test("installed Agent cannot use captured playing tools during authoring and sav
   expect(f.run.status).toBe("running");
   expect(f.store.policies(f.run.run_id)).toEqual([]);
   expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")).toEqual([]);
+  const edited = await agentCalls(f.tools(), [{
+    type: "toolCall", id: "inactive-exact-edit", name: "program_edit", arguments: {
+      name: "foreground", based_on: 2, edits: [{ old_text: "Inactive candidate", new_text: "Edited inactive candidate" }],
+    },
+  }]);
+  expect(data(edited[0]!)).toMatchObject({ name: "foreground", version: 3, experiment: null });
+  expect(f.store.latestRootExecution(f.run.run_id)).toEqual(root);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  expect(f.dispatches()).toBe(1);
   f.run.status = "reviewing";
   expect(f.tools().some(tool => tool.name === "program_review")).toBe(true);
   expect(f.tools().find(tool => tool.name === "program_write")!.parameters).toHaveProperty("properties.reason");
   const review = await agentCalls(f.tools(), [
-    { type: "toolCall", id: "review-precedence", name: "program_write", arguments: { entry: "run", name: "foreground", based_on: 2, source, reason: "Use review rather than authoring authority" } },
+    { type: "toolCall", id: "review-precedence", name: "program_write", arguments: { entry: "run", name: "foreground", based_on: 3, source, reason: "Use review rather than authoring authority" } },
   ]);
   expect(data(review[0]!).error.code).toBe("precondition_failed");
   release.resolve();
@@ -1963,9 +2116,9 @@ test("effect-free review links actual revisions to exact matching feedback and i
   expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
 });
 
-for (const assessed of [false, true]) {
+for (const toolName of ["program_write", "program_edit"] as const) for (const assessed of [false, true]) {
   for (const newerOutcome of [false, true]) {
-    test(`program_write reason replay pins original feedback and does not duplicate linkage (assessed=${assessed}, newer=${newerOutcome})`, async () => {
+    test(`${toolName} reason replay pins original feedback and does not duplicate linkage (assessed=${assessed}, newer=${newerOutcome})`, async () => {
       const f = fixture();
       const name = "feedback identity";
       await f.write(name, 'throw new Error("Controlled original sample");');
@@ -1979,7 +2132,10 @@ for (const assessed of [false, true]) {
       const id = "lost-feedback-write-ack";
       db.exec(`CREATE TRIGGER lose_feedback_ack BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND NEW.object_key='${id}' BEGIN SELECT RAISE(ABORT,'lost feedback acknowledgement'); END;`);
       const options = { based_on: 1, reason: "A candidate specifically addressing outcome A" };
-      expect((await f.write(name, source, options, id)).isError).toBe(true);
+      const revise = () => toolName === "program_edit"
+        ? f.call(toolName, { name, ...options, edits: [{ old_text: "Controlled original sample", new_text: "Changed candidate sample" }] }, id)
+        : f.write(name, source, options, id);
+      expect((await revise()).isError).toBe(true);
       const child = f.store.namedSkill(f.run.run_id, name, 2)!;
       expect(child.parent_version).toBe(1);
       db.exec("DROP TRIGGER lose_feedback_ack;");
@@ -1996,7 +2152,7 @@ for (const assessed of [false, true]) {
       expect(links.some(event => event.details !== null && typeof event.details === "object" && !Array.isArray(event.details) &&
         event.details.opportunity_id === original.opportunity_id)).toBe(true);
       f.learning.prepareFeedback = async () => { throw new Error("Pinned feedback retry must not prepare or reselect outcomes"); };
-      const replay = await f.write(name, source, options, id);
+      const replay = await revise();
       expect(replay.isError).not.toBe(true);
       expect(data(replay)).toMatchObject({ name, version: 2, experiment: { decision: "revise", reason: options.reason } });
       expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity")).toEqual(opportunities);
@@ -2051,7 +2207,7 @@ for (const view of ["events", "metric", "evidence"] as const) {
  }
 }
 
-for (const name of ["program_write", "program_submit", "program_review"] as const) {
+for (const name of ["program_write", "program_submit", "program_edit", "program_review"] as const) {
   for (const boundary of ["abort", "generation"] as const) {
     test(`${name} cannot bind feedback or persist a decision after ${boundary} during preparation`, async () => {
       const f = fixture(), controller = new AbortController();
@@ -2067,6 +2223,8 @@ for (const name of ["program_write", "program_submit", "program_review"] as cons
       };
       const input = name === "program_review"
         ? { name: "preparation parent", version: 1, decision: "keep", reason: "Assess the exact original outcome" }
+        : name === "program_edit"
+        ? { name: "preparation parent", based_on: 1, edits: [{ old_text: "Neutral result", new_text: "Candidate result" }], reason: "A changed candidate needs fresh authority" }
         : { entry: "run", name: "preparation parent", based_on: 1, source, reason: "A changed candidate needs fresh authority", ...(name === "program_submit" ? { args: null } : {}) };
       const tool = f.tools().find(entry => entry.name === name)!;
       const reply = await tool.execute(`cancel-${name}-${boundary}`, input, controller.signal);
@@ -2081,7 +2239,7 @@ for (const name of ["program_write", "program_submit", "program_review"] as cons
   }
 }
 
-test("feedback preparation rechecks the original source parent before binding or registration", async () => {
+for (const toolName of ["program_write", "program_edit"] as const) test(`${toolName} feedback preparation rechecks the original source parent before binding or registration`, async () => {
   const f = fixture();
   await f.write("racing parent");
   await f.call("program_run", { operation: "start", name: "racing parent", args: null });
@@ -2091,7 +2249,10 @@ test("feedback preparation rechecks the original source parent before binding or
     await prepare(runId, options);
     expect((await f.write("racing parent", source, { based_on: 1 })).isError).not.toBe(true);
   };
-  const reply = await f.write("racing parent", source, { based_on: 1, reason: "Do not rebase the original parent" }, "racing-feedback");
+  const reply = toolName === "program_edit"
+    ? await f.call(toolName, { name: "racing parent", based_on: 1, reason: "Do not rebase the original parent",
+      edits: [{ old_text: "Neutral result", new_text: "Candidate result" }] }, "racing-feedback")
+    : await f.write("racing parent", source, { based_on: 1, reason: "Do not rebase the original parent" }, "racing-feedback");
   expect(data(reply).error).toMatchObject({ code: "conflict", issues: [{ code: "stale_parent", latest_parent: { name: "racing parent", version: 2 } }] });
   expect(f.store.namedSkill(f.run.run_id, "racing parent")!.version).toBe(2);
   expect(f.store.evidenceObjects<ImprovementOpportunity>(f.run.run_id, "opportunity").every(entry => entry.resolution === null)).toBe(true);

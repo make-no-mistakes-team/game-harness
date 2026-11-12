@@ -5,7 +5,7 @@ import { DEFAULT_SKILL_LIMITS, PROGRAM_RESULT_GUIDANCE } from "../shared/program
 import { PROGRAM_LIMITS } from "./program-validation.ts";
 import { controllerStepResultSchema, executiveStepResultSchema, residentActivationResultSchema, DEFAULT_RESIDENT_LIMITS, RESIDENT_STEP_RESPONSE_MS } from "../shared/resident.ts";
 import { controlSessionConfigSchema, executiveSnapshotSchema } from "../shared/control-session.ts";
-import { helpSchema, memorySchema, nextConfigSchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
+import { helpSchema, memorySchema, nextConfigSchema, prepareNextSchema, programEditSchema, programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 
 const MINECRAFT_IDENTIFIERS = "Minecraft block/entity/inventory name, dropped item_name, equipment item, active_use.item and screen-slot item use registry paths without a namespace prefix (for example oak_log, zombie, wooden_sword), not minecraft:oak_log. These are distinct from full identifiers such as space.dimension_id, player.vehicle_type and status_effects[].id. Compare the exact projected strings; display_name is presentation text.";
@@ -152,7 +152,8 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?
   }
   if (topic === "programs" || topic === "controller") {
     const reference = {
-    write: schema(programWriteSchema), submit: schema(programSubmitSchema), run: schema(programRunSchema), inspect: schema(programInspectSchema), review: schema(programReviewSchema),
+    write: schema(programWriteSchema), edit: schema(programEditSchema), submit: schema(programSubmitSchema), run: schema(programRunSchema), inspect: schema(programInspectSchema), review: schema(programReviewSchema),
+    source_edits: "program_edit creates an inactive revision of an existing definition using exact latest based_on and 1..16 sequential {old_text,new_text} replacements. Each old_text must match exactly once in the selected canonical source; no fuzzy matching, inferred repair or partial save. Entry, card and pinned dependencies are retained. Full canonical source validation and byte/graph limits still apply; stale parent conflicts rather than rebases. It never changes a live worker or starts/selects code. Use actual returned version receipts for later analysis/selection. Optional top-level reason has the same exact-parent outcome-feedback requirement as program_write.",
     identifiers: MINECRAFT_IDENTIFIERS,
     coverage: MINECRAFT_LOCAL_COVERAGE,
     hearing: MINECRAFT_HEARING,
@@ -275,7 +276,7 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?
     contract: "Catalog latest compatible snapshot per name with durable numeric revisions and paging. Load {name,version?} pins one exact snapshot, latest when omitted, then freshly validates its captured dependencies without restoring observations,args,targets or worker state. qualify requires the existing trusted bounded goal/block/inventory evidence declaration. No self-rating or automatic promotion. Older same-name revisions remain selectable explicitly.",
   };
   return {
-    tools: ["observe", "program_write", "program_submit", "program_run", "program_inspect", "program_review", "reflex", "help"],
+    tools: ["observe", "program_write", "program_edit", "program_submit", "program_run", "program_inspect", "program_review", "reflex", "help"],
     lifecycle: {
       task_finish: schema(taskFinishSchema),
       contract: "Separate from the gameplay/program verbs. Ordinary role and custom tasks only. As soon as actual authorized evidence shows the whole task complete, call task_finish with a brief evidence summary instead of more no-op/check programs or review. It immediately revokes admission and stops the run; completion is model-reported and unverified, never goal.verified. Program completed statuses are execution-only. Built-in goals cannot bypass their trusted verifier.",
@@ -283,7 +284,7 @@ export function programHelp(topic: z.infer<typeof helpSchema>["topic"], adapter?
     topics: ["actions", "controller", "game", "programs", "planning", "reflex", "memory"],
     advanced: "Reflex is available in ordinary planning; read its reference before authoring. Request help memory to disclose that optional module. Help never grants playing authority to authoring, speculative or post-goal roles.",
     observation: "The observe tool returns permitted adapter projection data/metadata without host authority identities. Program game.observe() and guards use ObservationV3 with adapter-owned data. Historical schema2 artifacts are read-only. Arguments, results and detailed traces retain opaque JSON keys; byte-budget omissions remain explicit.",
-    workflow: "Observe authorized state; submit a compact named taskflow with required args (null if unused), or intentionally write without starting and later run an existing version. Let admitted work proceed. Inspect exact source/outcomes/trace/feedback when useful. Revise with based_on equal to the latest stored version. card.reason describes motivation; omit top-level reason for ordinary revisions, or supply it only to link an experiment to that exact parent's actual outcome. Assessments are optional. Host preflight owns readiness, not a mandatory model bootstrap ceremony.",
+    workflow: "Observe authorized state; submit a compact named taskflow with required args (null if unused), or intentionally write without starting and later run an existing version. Let admitted work proceed. Inspect exact source/outcomes/trace/feedback when useful. Revise with based_on equal to the latest stored version; program_edit can retain unchanged code instead of retyping it. card.reason describes motivation; omit top-level reason for ordinary revisions, or supply it only to link an experiment to that exact parent's actual outcome. Assessments are optional. Host preflight owns readiness, not a mandatory model bootstrap ceremony.",
   };
 }
 

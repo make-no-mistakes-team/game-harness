@@ -74,7 +74,7 @@ export interface VersionComparisonCursor {
   scope_hash: string;
 }
 export const IMPROVEMENT_RESOLUTION_HELP =
-  "Use program_review to record keep or insufficient_evidence for a named version's latest matching outcome. Link an actual direct-child code-change experiment through program_write with based_on and reason; the host captures exact source and evidence references. An internal revise assessment records that candidate experiment, not verified improvement, adoption or promotion. Candidates may be unmeasured and measured trials may remain inconclusive. Explain the evidence limits in reason.";
+  "Use program_review to record keep or insufficient_evidence for a named version's latest matching outcome. Link an actual direct-child code-change experiment through program_write or program_edit with based_on and reason; the host captures exact source and evidence references. An internal revise assessment records that candidate experiment, not verified improvement, adoption or promotion. Candidates may be unmeasured and measured trials may remain inconclusive. Explain the evidence limits in reason.";
 export interface ImprovementOpportunity {
   opportunity_id: string;
   run_id: string;

@@ -1465,13 +1465,13 @@ export class StrategicPlanner {
             omitted_resident_attention: attentionOmission,
             through_event_seq: through,
             instruction: review
-              ? "The goal is verified. Perform one bounded effect-free review: inspect evidence, record keep/insufficient_evidence, or program_write a linked revision with reason. A candidate is not proven improvement. No gameplay trials or effects. Completion follows automatically."
+              ? "The goal is verified. Perform one bounded effect-free review: inspect evidence, record keep/insufficient_evidence, or program_write/program_edit a linked revision with reason. A candidate is not proven improvement. No gameplay trials or effects. Completion follows automatically."
               : speculative
-                ? "This is the one authorized independent planning flight. Observe, inspect, help, pure program_write and prepare_next only. Prepare immutable inactive source if needed, then select one exact named candidate; optionally author guard_source BODY(observation,args) returning strict boolean. Omission adds no game constraint. No starts, activation, effects or polling. Source preparation and corrections share the original finite deadline and allowance. Main's captured permission and all host invariants govern activation."
+                ? "This is the one authorized independent planning flight. Observe, inspect, help, pure program_write/program_edit and prepare_next only. Prepare immutable inactive source if needed, then select one exact named candidate; optionally author guard_source BODY(observation,args) returning strict boolean. Omission adds no game constraint. No starts, activation, effects or polling. Source preparation and corrections share the original finite deadline and allowance. Main's captured permission and all host invariants govern activation."
               : this.host.programPending()
                 ? this.pendingDecision
                   ? "Resolve this explicit attention/outcome/recovery signal within the ordinary bounded decision turn. Inspect current state or mechanics as needed, then choose the necessary current-root intent update, code change or stop. Decision authority survives intermediate reads and inactive writes, then ends at the next request after a root/intent change or predecessor retirement. It does not renew the root deadline or inactive-authoring allowance. Keep useful local control running; no polling or duplicate foreground work."
-                  : "The foreground program continues unchanged. Use only observe, help, program_inspect and pure program_write to prepare immutable inactive source within the remaining root-bound authoring allowance. No starts, activation, effects, polling or keepalive; repeated wakes do not renew the window."
+                  : "The foreground program continues unchanged. Use only observe, help, program_inspect and pure program_write/program_edit to prepare immutable inactive source within the remaining root-bound authoring allowance. No starts, activation, effects, polling or keepalive; repeated wakes do not renew the window."
                 : "Assess the whole task from current permitted state and retained execution facts/events before starting or revising work. If the custom task is done on that evidence, call task_finish now with an honest evidence/uncertainty summary; execution completion alone is not proof. Earlier child failure or unknown effects do not erase later evidence, resolve that uncertainty or permit replay. Otherwise advance the unfinished task with an autonomous local taskflow. Keep short input intervals, fresh target selection and ordinary recovery inside your code. For ongoing world control use a resident step (help controller); keep useful control running through cloud decisions. Return blocked only when the local algorithm genuinely cannot continue, not merely because an input interval finished. Choose survival and combat responses yourself. No human continuation is needed.",
           };
         for (;;) {
@@ -1764,7 +1764,7 @@ export class StrategicPlanner {
         const toolCalls = message.content.filter((content) => content.type === "toolCall");
         const toolNames = [...new Set(toolCalls.map((content) => content.name))];
         const improvement = toolCalls.some((call) => call.name === "program_review" ||
-          (call.name === "program_write" || call.name === "program_submit") && call.arguments && typeof call.arguments === "object" && "based_on" in call.arguments ||
+          (call.name === "program_write" || call.name === "program_edit" || call.name === "program_submit") && call.arguments && typeof call.arguments === "object" && "based_on" in call.arguments ||
           call.name === "program_inspect" && call.arguments && typeof call.arguments === "object" &&
             (call.arguments.view === "feedback" || call.arguments.view === "comparison"));
         const provisionalPurpose = request.purpose;
@@ -1774,7 +1774,7 @@ export class StrategicPlanner {
               : request.role === "authoring" ? "authoring"
               : improvement
                 ? "improvement"
-                : toolNames.some((name) => name === "program_write" || name === "program_submit" || name === "reflex")
+                : toolNames.some((name) => name === "program_write" || name === "program_edit" || name === "program_submit" || name === "reflex")
                   ? "authoring"
                   : "planning";
         if (purpose !== provisionalPurpose) {
@@ -1902,7 +1902,7 @@ export class StrategicPlanner {
             const topic = typeof input?.topic === "string" ? input.topic : "overview";
             const reference = topic === "actions" && typeof input?.kind === "string" ? `actions:${input.kind}` : topic;
             this.retainedContext.rememberHelp(reference, parsed.data);
-          } else if (["program_write", "program_run", "program_inspect", "program_submit"].includes(event.toolName)) {
+          } else if (["program_write", "program_edit", "program_run", "program_inspect", "program_submit"].includes(event.toolName)) {
             const selected = event.toolName === "program_submit" ? record(value?.source ?? null) : value;
             if (typeof selected?.name === "string" && typeof selected.version === "number")
               this.retainedContext.selectProgram(selected.name, selected.version);

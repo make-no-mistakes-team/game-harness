@@ -11,7 +11,8 @@ import type { ExperienceLibrary } from "./experience.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { ProgramWorkspace } from "./program-workspace.ts";
 import type { programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, memorySchema, prepareNextSchema, reflexSchema } from "./program-interface.ts";
-import { programSelectorSchema } from "./program-interface.ts";
+import { programEditSchema, programSelectorSchema } from "./program-interface.ts";
+import { applySourceEdits } from "./source-authoring.ts";
 import { skillRefSchema } from "../shared/validation.ts";
 import { policyRefSchema } from "./reactive.ts";
 import { GeneratedControllerResultValidationError, parseGeneratedResidentResult, programDiagnostic } from "./program-diagnostics.ts";
@@ -19,6 +20,7 @@ import { GeneratedControllerResultValidationError, parseGeneratedResidentResult,
 const exactNamedProgramSchema = programSelectorSchema.required({ version: true });
 const executionControlSchema = z.object({ execution_id: z.string().nullable(), plan_id: z.string().nullable() }).strict();
 const preparedSelectionSchema = z.object({ plan_id: z.string(), skill: skillRefSchema }).strict();
+type SourceAuthoringIdentity = { tool: "program_write" | "program_edit"; input: Json };
 
 export class ProgramOperations {
   readonly workspace: ProgramWorkspace;
@@ -28,8 +30,51 @@ export class ProgramOperations {
   }
 
   async write(input: z.infer<typeof programWriteSchema>, callId: string, commit: () => void, signal?: AbortSignal) {
-    const registration = this.registration(input, callId);
-    const pinned = this.registered(input, callId);
+    return this.writeSource(input, callId, commit, signal, { tool: "program_write", input: input as unknown as Json });
+  }
+
+  async edit(input: z.infer<typeof programEditSchema>, callId: string, commit: () => void, signal?: AbortSignal) {
+    const identity: SourceAuthoringIdentity = { tool: "program_edit", input: input as unknown as Json };
+    const binding = z.object({
+      tool: z.literal("program_edit"), input: programEditSchema,
+      base: skillRefSchema.extend({ hash: z.string() }).strict(),
+    }).strict().parse(this.store.bindToolCall(this.run.run_id, this.phaseKey(callId, "edit_base"), identity, () => {
+      commit();
+      const base = this.workspace.select({ name: input.name, version: input.based_on });
+      const latest = this.workspace.select({ name: input.name });
+      if (latest.version !== base.version) throw Object.assign(new RuntimeFault("conflict", "Exact edits require based_on equal to the latest stored version; source is never silently rebased."), {
+        issues: [{ code: "stale_parent", path: "based_on", latest_parent: { name: latest.name, version: latest.version } }],
+      });
+      return { tool: "program_edit", input, base: { skill_id: base.skill_id, version: base.version, hash: base.hash } } as unknown as Json;
+    }));
+    const base = this.store.skill(this.run.run_id, binding.base);
+    if (base.hash !== binding.base.hash) throw new RuntimeFault("conflict", "The exact edit base is unavailable");
+    if (!base.entry) throw new RuntimeFault("precondition_failed", "The exact edit base has no retained entry contract");
+    const writeInput = {
+      name: input.name, based_on: input.based_on, entry: base.entry,
+      source: applySourceEdits(base.source, input.edits), card: base.card,
+      dependencies: base.dependencies.map(dependency => ({
+        name: this.store.skill(this.run.run_id, dependency).name, version: dependency.version,
+        ...(dependency.import_path === undefined ? {} : { import_path: dependency.import_path }),
+      })),
+      ...(input.reason === undefined ? {} : { reason: input.reason }),
+    };
+    const result = await this.writeSource(writeInput, callId, commit, signal, identity);
+    this.store.bindToolCall(this.run.run_id, this.phaseKey(callId, "edit_provenance"), identity, () => {
+      commit();
+      const revision = { name: result.name, version: result.version };
+      this.store.event(this.run.run_id, "program.edited", "Saved exact model-specified edits without execution", {
+        tool_call_id: callId, ...binding, revision,
+      } as unknown as Json);
+      return revision;
+    });
+    return result;
+  }
+
+  private async writeSource(input: z.infer<typeof programWriteSchema>, callId: string, commit: () => void,
+    signal: AbortSignal | undefined, identity: SourceAuthoringIdentity) {
+    const registration = this.registration(identity, callId);
+    const pinned = this.registeredSource(identity, callId);
     const previous = pinned ? pinned.parent_version === null ? null : this.store.namedSkill(this.run.run_id, input.name, pinned.parent_version)
       : this.store.namedSkill(this.run.run_id, input.name);
     const assertParent = () => {
@@ -40,7 +85,7 @@ export class ProgramOperations {
     };
     if (!pinned) assertParent();
     const dependencies = pinned?.dependencies ?? z.array(skillRefSchema.extend({ import_path: z.string().optional() }).strict()).parse(this.store.bindToolCall(this.run.run_id, callId,
-      { tool: "program_write", input } as unknown as Json, () => {
+      identity, () => {
         commit();
         return input.dependencies.map((selector) => {
           const dependency = this.workspace.select(selector, true);
@@ -51,7 +96,7 @@ export class ProgramOperations {
     if (input.reason && !previous) throw new RuntimeFault("invalid_request", "A candidate experiment reason requires an actual revision of an existing program");
     let opportunity: ImprovementOpportunity | null = null;
     if (input.reason && previous) {
-      const feedbackKey = this.phaseKey(callId, "feedback"), identity = { tool: "program_write", input } as unknown as Json;
+      const feedbackKey = this.phaseKey(callId, "feedback");
       const bound = this.store.lookupToolCallBinding(this.run.run_id, feedbackKey, identity);
       if (!bound.found) {
         await this.host.learning().prepareFeedback(this.run.run_id, { signal, deadlineHostMs: performance.now() + 10_000 });
@@ -83,7 +128,7 @@ export class ProgramOperations {
       // Replaying a persisted write cannot reselect a newer outcome, convert
       // our own prior resolution to a candidate event, or append that event twice.
       experiment = this.store.bindToolCall(this.run.run_id, this.phaseKey(callId, "feedback_link"),
-        { tool: "program_write", input, revision } as unknown as Json, () => {
+        { ...identity, revision } as unknown as Json, () => {
           const decision = { decision: "revise" as const, measured: false, reason };
           if (selected.resolution === null) {
             decision.measured = this.host.learning().resolve(this.run.run_id, selected.opportunity_id, {
@@ -109,12 +154,16 @@ export class ProgramOperations {
     return `program_phase_${createHash("sha256").update(JSON.stringify([callId, phase])).digest("hex")}`;
   }
 
-  private registration(input: z.infer<typeof programWriteSchema>, callId: string) {
-    return { call_id: this.phaseKey(callId, "registration"), input: { tool: "program_write", input } as unknown as Json };
+  private registration(identity: Json, callId: string) {
+    return { call_id: this.phaseKey(callId, "registration"), input: identity };
   }
 
   private registered(input: z.infer<typeof programWriteSchema>, callId: string) {
-    const registration = this.registration(input, callId);
+    return this.registeredSource({ tool: "program_write", input } as unknown as Json, callId);
+  }
+
+  private registeredSource(identity: Json, callId: string) {
+    const registration = this.registration(identity, callId);
     const ref = this.store.completedToolCall(this.run.run_id, registration.call_id, registration.input);
     return ref === null ? null : this.store.skill(this.run.run_id, skillRefSchema.parse(ref));
   }

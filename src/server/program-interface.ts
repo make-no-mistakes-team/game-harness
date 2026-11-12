@@ -6,6 +6,7 @@ import { residentActorLimitsSchema, residentAnalysisInputSchema, residentIntentS
 import type { ImprovementFeedbackCursor, VersionComparisonCursor } from "../shared/execution-evidence.ts";
 import { policyWatchSchema } from "./reactive.ts";
 import { controlSessionConfigSchema } from "../shared/control-session.ts";
+import { sourceEditsSchema } from "./source-authoring.ts";
 
 export const programSelectorSchema = namedProgramRefSchema;
 export const analysisValidateAsSchema = z.enum(["activation", "decision"])
@@ -44,6 +45,12 @@ export const programWriteSchema = z.object({
   }).strict()).max(32).default([]),
   based_on: z.int().positive().optional().describe("Required for an existing name: its latest stored version, even if unexecuted; not the latest executed version. Omit for a new name. Stale parents conflict without rebasing."),
   reason: z.string().trim().min(1).max(2000).optional().describe("Experimental revision link to actual outcome feedback for the exact based_on parent. Omit for an ordinary revision, including revising stored but unexecuted source; use card.reason for descriptive motivation. Missing parent feedback refuses the write/start."),
+}).strict();
+export const programEditSchema = z.object({
+  name: programWriteSchema.shape.name,
+  based_on: z.int().positive().describe("Exact latest existing version to edit; never silently rebased."),
+  edits: sourceEditsSchema,
+  reason: programWriteSchema.shape.reason,
 }).strict();
 export const nextConfigSchema = lookaheadConfigSchema.extend({ activation: z.enum(["manual", "on_predecessor_success"]).default("manual") }).strict();
 // Actor input may override individual fields. Only this boundary supplies

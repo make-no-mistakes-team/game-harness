@@ -15,7 +15,7 @@ import { RuntimeFault } from "./runtime-fault.ts";
 import type { ModelObservation } from "./actor-frames.ts";
 import { ProgramOperations } from "./program-operations.ts";
 import { programHelp } from "./program-help.ts";
-import { helpSchema, memorySchema, prepareNextSchema, programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
+import { helpSchema, memorySchema, prepareNextSchema, programEditSchema, programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
 import { residentJsonConstraint } from "../shared/resident.ts";
 
 const faultIssuesSchema = z.array(z.object({
@@ -79,6 +79,7 @@ export class RuntimeTools {
       this.host.toolRole?.() ?? (this.host.planning().projection()?.planning_active ? "speculative" : "ordinary");
     const inactiveWrite = () => role() === "authoring" || role() === "speculative";
     const writeSchema = inactiveWrite() ? programWriteSchema.omit({ reason: true }) : programWriteSchema;
+    const editSchema = inactiveWrite() ? programEditSchema.omit({ reason: true }) : programEditSchema;
     const result = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value });
     const tool = <T>(name: string, description: string, schema: z.ZodType<T>,
       handler: (input: T, callId: string, signal: AbortSignal | undefined, commit: () => void) => unknown | Promise<unknown>): AgentTool => {
@@ -98,12 +99,12 @@ export class RuntimeTools {
           const parsed = schema.safeParse(raw);
           if (!parsed.success) { argumentError = parsed.error; throw argumentError; }
           const input = parsed.data;
-          if ((admittedRole === "authoring" || admittedRole === "speculative") && name === "program_write" &&
+          if ((admittedRole === "authoring" || admittedRole === "speculative") && (name === "program_write" || name === "program_edit") &&
             input !== null && typeof input === "object" && "reason" in input)
             throw new RuntimeFault("forbidden", "Pending-program authoring saves inactive source only; outcome assessments require an ordinary or review turn");
           const identity = { tool: name, input } as unknown as Json;
           const operation = input && typeof input === "object" && "operation" in input ? input.operation : null;
-          const mutation = name === "task_finish" || name === "program_write" || name === "program_submit" || name === "program_review" || name === "prepare_next" ||
+          const mutation = name === "task_finish" || name === "program_write" || name === "program_edit" || name === "program_submit" || name === "program_review" || name === "prepare_next" ||
             name === "program_run" && operation !== "inspect" || name === "reflex" && operation !== "inspect" ||
             name === "memory" && operation !== "catalog";
           const completed = mutation ? this.store.completedToolCall(run.run_id, callId, identity) : null;
@@ -139,7 +140,7 @@ export class RuntimeTools {
           };
           commit();
           const assessment = role() === "review" && (name === "program_review" ||
-            name === "program_write" && input !== null && typeof input === "object" && "reason" in input);
+            (name === "program_write" || name === "program_edit") && input !== null && typeof input === "object" && "reason" in input);
           if (assessment && this.reviewDecisions.size >= 4)
             throw new RuntimeFault("deadline_exceeded", "The bounded post-goal review decision allowance is exhausted");
           const handled = await handler(input, callId, signal, commit);
@@ -209,6 +210,8 @@ export class RuntimeTools {
         ? "Validate and save inactive source without starting or replacing foreground work. Explicit entry is required, including revisions: run BODY or step/analyze/library module. Existing names require based_on. card.reason is inert descriptive metadata."
         : "Create or revise named JavaScript source. Explicit entry is required, including revisions: run BODY or step/analyze/library module. Existing names require based_on. Optional reason links actual revision feedback, not proven efficacy.",
         writeSchema, (input, callId, signal, commit) => operations.write(input, callId, commit, signal)),
+      tool("program_edit", "Apply only your sequential exact unique-match replacements to the latest existing based_on source. Retains its entry, card and exact dependency versions/import aliases; validates and saves without execution or controller replacement. Optional reason links the exact parent's actual outcome feedback.",
+        editSchema, (input, callId, signal, commit) => operations.edit(input, callId, commit, signal)),
       tool("program_submit", "Write and start exact model-authored JavaScript. step is ongoing raw frame/input control; run can be a finite procedure OR an ongoing semantic feedback loop within declared finite root limits. Both can remain useful while cognition runs. Required args is JSON (null if unused); card optional; revisions need based_on latest stored. Optional exact-predecessor handoff fences future capabilities after validation, lets only the current admitted bounded semantic capability settle, then retires before replacement; residents retire immediately. Stop/tool abort revoke immediately. Returns source separately from started/refused/unknown; never retry unknown.", programSubmitSchema, (input, callId, signal, commit) => operations.submit(input, callId, commit, signal)),
       tool("program_run", "Start exact named run/step; optional handoff:{name,version,execution_ordinal} replaces only after confirmed retirement. After validation, future predecessor capabilities are fenced immediately; only its current admitted bounded semantic capability may settle. Residents retire immediately; Stop/tool abort revoke immediately. Inspect/stop, update resident intent, run pure analyze, activate a prepared successor, or select finite attention. No automatic replacement or analysis-to-control injection. Host owns retry identity and authority.", programRunSchema, (input, callId, signal, commit) => operations.runProgram(input, callId, commit, signal)),
       tool("program_inspect", "Read named catalog/source/execution/trace/feedback/comparison/planning views without effects. Preserve page cursors and explicit omissions.", programInspectSchema, (input, _callId, signal, commit) => operations.inspect(input, signal, commit)),

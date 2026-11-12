@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import type { PreparedStartRequest, PreparedStartView } from "../src/shared/prep
 import type { ResidentWorker } from "../src/shared/resident.ts";
 import { PreparedStart, type PreparedStartOptions } from "../src/server/prepared-start.ts";
 import type { PreparationContract } from "../src/server/prepared-source-contract.ts";
+import type { ApprovedSourceReference } from "../src/server/source-authoring.ts";
 import { Store } from "../src/server/store.ts";
 import { minecraftRunFixture, minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 
@@ -28,7 +30,7 @@ class ScriptedSourceAgent {
   gate: ((context: unknown, signal?: AbortSignal) => unknown) | null = null;
   beforeToolCall: ((context: unknown, signal?: AbortSignal) => unknown) | null = null;
   streamFn: StreamFn = (() => ({ async *[Symbol.asyncIterator]() {} })) as unknown as StreamFn;
-  constructor(readonly tools: AgentTool[]) {}
+  constructor(readonly tools: AgentTool[], readonly reference?: ApprovedSourceReference) {}
   setBeforeModelCall(gate: ScriptedSourceAgent["gate"]) { this.gate = gate; }
   subscribe(listener: (event: AgentEvent) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   abort() {}
@@ -38,7 +40,9 @@ class ScriptedSourceAgent {
     const stream = await this.streamFn(this.state.model as never, { messages: [], tools: this.tools } as never, {});
     for await (const _event of stream) { /* Join the actual wrapped stream owner. */ }
     const content = [
-      { type: "toolCall" as const, id: "source-write", name: "program_write", arguments: { name: "executive", entry: "step", source: rootSource } },
+      { type: "toolCall" as const, id: "source-write", name: this.reference ? "program_copy" : "program_write",
+        arguments: this.reference ? { name: "executive", entry: "step", reference_hash: this.reference.hash }
+          : { name: "executive", entry: "step", source: rootSource } },
       { type: "toolCall" as const, id: "source-finish", name: "prepare_finish", arguments: {
         name: "executive", version: 1, args: null, initial_state: null, limits: {}, session: { schema_version: 1 } } },
     ];
@@ -56,7 +60,7 @@ class ScriptedSourceAgent {
   }
 }
 
-function fixture() {
+function fixture(sourceReferences?: readonly ApprovedSourceReference[]) {
   const directory = mkdtempSync(join(tmpdir(), "prepared-start-"));
   const adapter = minecraftTestAdapter();
   let contract: PreparationContract = { adapter, artifact_sha256: "a".repeat(64) };
@@ -82,9 +86,9 @@ function fixture() {
   };
   let owner: PreparedStart;
   let afterCompile: (() => void) | null = null;
-  const options: PreparedStartOptions = { directory,
+  const options: PreparedStartOptions = { directory, sourceReferences,
     auth: { snapshot() { counts.authReads++; return authState(); },
-      async createAgent(input) { counts.agents++; return new ScriptedSourceAgent(input.tools) as unknown as Agent; },
+      async createAgent(input) { counts.agents++; return new ScriptedSourceAgent(input.tools, sourceReferences?.[0]) as unknown as Agent; },
       async releaseAgent() { counts.releases++; } },
     sandbox: { async createResidentWorker() { counts.compiles++; compileEntered.resolve(); return compileResult.promise; },
       async createResidentAnalysisWorker() { throw new Error("No analysis configured"); } },
@@ -133,6 +137,26 @@ for (const change of ["artifact", "contract"] as const) {
     expect(f.state.game.status).toBe("disconnected");
   });
 }
+
+test("prepared start forwards only explicit validated source task material to selected-model copying", async () => {
+  const reference: ApprovedSourceReference = { source: rootSource, entry: "step",
+    hash: createHash("sha256").update(rootSource, "utf8").digest("hex"),
+    card: { purpose: "Synthetic coordinator protocol", applicability: "Software fixtures only",
+      method: "Explicit selected-model copy", reason: "Operator approval", limitations: "No gameplay evidence" },
+    provenance: "operator-approved coordinator fixture" };
+  const f = fixture([reference]);
+  await f.owner.initialize(); const accepted = await f.owner.start(f.request);
+  await f.compileEntered.promise;
+  expect(f.owner.snapshot()).toMatchObject({ source_versions: 1, phase: "compiling" });
+  expect(f.counts.agents).toBe(1); expect(f.counts.activations).toBe(0); expect(f.counts.launches).toBe(0);
+  const cancellation = f.owner.cancel(accepted.preparation_id);
+  f.compileResult.resolve(f.worker);
+  expect((await cancellation).closure).toBe("closed");
+  const counts = { ...f.counts };
+  expect(() => new PreparedStart({ ...f.options,
+    sourceReferences: [{ ...reference, hash: "0".repeat(64) }] })).toThrow();
+  expect(f.counts).toEqual(counts);
+});
 
 test("cancel during joining closes the reserved launch once and waits for its original readiness owner", async () => {
   const f = fixture(); f.compileResult.resolve(f.worker); await f.owner.initialize();

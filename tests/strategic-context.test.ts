@@ -103,7 +103,7 @@ function fixture() {
       return state.run;
     },
     tools: () => [{ ...help, parameters: { ...help.parameters, description: state.toolSchema } },
-      effect("program_submit"), effect("program_write"), effect("program_run")],
+      effect("program_submit"), effect("program_write"), effect("program_edit"), effect("program_run")],
     rootPrompt: () => state.root, adapter: () => state.adapter,
     observe: async () => state.observation, projectObservation: observation => state.adapter.projectObservation(observation),
     policies: () => [], action: () => null, programPending: () => false, busy: () => true,
@@ -1645,7 +1645,7 @@ test("failed provider output cannot run tools or load retained help", async () =
   expect(JSON.stringify(retained(f.state.requests.at(-1))?.requested_help)).not.toContain("Useful exact requested contract");
 });
 
-for (const tool of ["program_submit", "program_write", "program_run", "help"]) {
+for (const tool of ["program_submit", "program_write", "program_edit", "program_run", "help"]) {
   test(`SDK recovered transient failed ${tool} output never becomes eligible or retained`, async () => {
     const f = fixture();
     f.state.completedToolEvents = true;

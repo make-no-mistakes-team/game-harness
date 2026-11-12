@@ -335,6 +335,40 @@ test("finite pure analysis budget admits at most eight software jobs and keeps f
   await f.owner.close();
 });
 
+test("an imported source assertion reaches preparation as untrusted advice with its exact executable bundle identity", async () => {
+  const calls: Call[] = [
+    { name: "program_write", args: { name: "assertions", entry: "library",
+      source: "export function assert(value) { if (!value) throw new TypeError('probe assertion: expected explicit state'); }" } },
+    { name: "program_write", args: { name: "probe", entry: "analyze",
+      source: "import {assert} from './assertions.js'; export function analyze(input) { assert(input); return null; }",
+      dependencies: [{ name: "assertions", version: 1, import_path: "./assertions.js" }] } },
+    { name: "program_analyze", id: "source-assertion", args: { name: "probe", version: 1, input: false } },
+    ...rootCalls(),
+  ];
+  let bundleHash = "", rootHash = "", closed = 0;
+  const f = fixture(calls);
+  f.options.sandbox.createResidentAnalysisWorker = async (bundle, budget, signal) => {
+    bundleHash = bundle.source_hash; rootHash = bundle.modules.find(module => module.id === bundle.root)!.source_hash;
+    const worker = await residentAnalysisProcess(bundle, budget, signal);
+    return { analyze: worker.analyze, async close() { await worker.close(); closed++; } };
+  };
+  await f.owner.initialize(); await f.owner.start(f.request); await f.ready;
+  const failure = f.agent().results[2]!;
+  expect(failure.isError).toBe(true);
+  expect(failure.details).toMatchObject({ failed: true, code: "source_throw",
+    source_diagnostic: { advisory: true, trusted_origin: false, origin: "source_throw", diagnostic: {
+      type: "TypeError", message: "probe assertion: expected explicit state",
+      source_hash: bundleHash, location: { mapping: "unmapped" },
+    } } });
+  expect(bundleHash).not.toBe(rootHash);
+  expect(JSON.stringify(failure.content)).toContain("probe assertion: expected explicit state");
+  expect(closed).toBe(1); expect(f.owner.snapshot()?.analysis_jobs).toBe(1);
+  expect(f.owner.snapshot()?.analysis_ms).toBeGreaterThan(0);
+  const tool = f.agent().tools.find(tool => tool.name === "program_analyze")!;
+  expect((await tool.execute("source-assertion", calls[2]!.args)).details).toEqual(failure.details);
+  await f.owner.close();
+});
+
 test("source analysis validates the exact imported activation return after accounting and joins its original disposable owner", async () => {
   const selectedSource = `export function activate(frame,state,intent) { return step(frame,state,intent); }
     export function step(frame,state,intent) { return {choice:{kind:'observe'},

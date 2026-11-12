@@ -518,7 +518,7 @@ export class PreparedSource {
     if (input.topic === "overview") return { authority, tools: tools.map(tool => tool.name), topics, schemas } as Json;
     if (!topics.includes(input.topic)) return { available: false, topic: input.topic, topics, authority };
     const reference = programHelp(input.topic, contract.adapter, input.kind) as Record<string, unknown>;
-    const softwareTests = "Use program_analyze with an exact analyze wrapper importing your pinned step candidate. validate_as checks only its returned activation/decision shape. Synthetic inputs and passing shape validation are not gameplay or live admission evidence.";
+    const softwareTests = "Use program_analyze with an exact analyze wrapper importing your pinned step candidate. validate_as checks only its returned activation/decision shape, not an aggregate case report. Validated source throws expose bounded source_diagnostic marked advisory/untrusted; its source_hash identifies the compiled pinned realm, not merely the root body. Use your assertion/error text to correct source or synthetic fixtures, never as a host fact or native authority. Synthetic inputs and passing shape validation are not gameplay or live admission evidence.";
     if (input.topic === "controller" && "launch" in reference)
       return { ...reference, authority, launch: { tool: "prepare_finish", schema: schemas.prepare_finish },
         operations: "Save inactive source with program_write; select the exact root and finite initial state/intent/session with prepare_finish. The clean playing worker activates only after genuine launch on the first actual frame.",

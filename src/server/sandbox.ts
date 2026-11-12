@@ -43,6 +43,7 @@ import { capabilityFailure, GeneratedResultValidationError, parseGeneratedReside
 import { residentIntentSchema, residentStateSchema,
   type ResidentDecision, type ResidentActivationResult,
   type ResidentWorker, type ResidentAnalysisWorker,
+  type ResidentSourceDiagnostic, type ResidentSourceAdvisory,
   ResidentCleanupError, RESIDENT_STEP_RESPONSE_MS} from "../shared/resident.ts";
 import type { MinecraftControllerFrame } from "../shared/minecraft.ts";
 
@@ -50,13 +51,67 @@ export interface ResidentPreparedWorker extends ResidentWorker {
   activate?(frame: MinecraftControllerFrame, state: Json, intent: Json, signal?: AbortSignal): Promise<ResidentActivationResult>;
 }
 export type ResidentWorkerFaultOrigin = "watchdog" | "source_throw" | "transport" | "opaque" | "cleanup";
+const residentSourceDiagnostics = new WeakMap<object, ResidentSourceDiagnostic>();
+const residentWorkerFailures = new WeakMap<object, { error: string; code: ResidentWorkerFaultOrigin }>();
+
+function readResidentSourceDiagnostic(value: unknown, sourceHash?: string | null): ResidentSourceDiagnostic {
+  if (!value || typeof value !== "object" || Array.isArray(value) || types.isProxy(value))
+    throw new Error("Invalid resident source diagnostic.");
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Object.keys(descriptors).length !== 4 ||
+    !["type", "message", "source_hash", "location"].every(key => descriptors[key] && "value" in descriptors[key]))
+    throw new Error("Invalid resident source diagnostic.");
+  const type: unknown = descriptors.type!.value, message: unknown = descriptors.message!.value;
+  const hash: unknown = descriptors.source_hash!.value, location: unknown = descriptors.location!.value;
+  if (typeof type !== "string" ||
+    !["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError", "EvalError", "AggregateError", "ThrownValue"].includes(type) ||
+    typeof message !== "string" || message.length > 1000 ||
+    typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash) || sourceHash !== undefined && hash !== sourceHash ||
+    !location || typeof location !== "object" || Array.isArray(location) || types.isProxy(location))
+    throw new Error("Invalid resident source diagnostic.");
+  const mapping = Object.getOwnPropertyDescriptors(location);
+  if (Reflect.ownKeys(location).length !== 1 || !mapping.mapping || !("value" in mapping.mapping) ||
+    mapping.mapping.value !== "unmapped" || Reflect.ownKeys(value).length !== 4)
+    throw new Error("Invalid resident source diagnostic.");
+  return Object.freeze({ type: type as ResidentSourceDiagnostic["type"], message, source_hash: hash,
+    location: Object.freeze({ mapping: "unmapped" as const }) });
+}
+
 /** The category is selected at a worker-service boundary, never from authored exception text.
  * Only host/guardian faults have trustedOrigin; container diagnostics are advisory. */
 export class ResidentWorkerFault extends Error {
-  constructor(readonly origin: ResidentWorkerFaultOrigin, readonly trustedOrigin: boolean = true) {
+  readonly sourceDiagnostic?: ResidentSourceDiagnostic;
+  constructor(readonly origin: ResidentWorkerFaultOrigin, readonly trustedOrigin: boolean = true,
+    sourceDiagnostic?: unknown) {
     super(`Resident worker failed (${origin}).`);
     this.name = "ResidentWorkerFault";
+    residentWorkerFailures.set(this, { error: this.message, code: origin });
+    if (sourceDiagnostic !== undefined) {
+      if (origin !== "source_throw" || trustedOrigin !== false)
+        throw new Error("Invalid resident source diagnostic origin.");
+      this.sourceDiagnostic = readResidentSourceDiagnostic(sourceDiagnostic);
+      residentSourceDiagnostics.set(this, this.sourceDiagnostic);
+    }
   }
+}
+
+/** Explicit projection of validated, source-authored advice, never host authority. */
+export function residentSourceAdvisory(error: unknown): ResidentSourceAdvisory | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const diagnostic = residentSourceDiagnostics.get(error);
+  return diagnostic ? { advisory: true, trusted_origin: false, origin: "source_throw",
+    diagnostic: { ...diagnostic, location: { mapping: "unmapped" } } } : undefined;
+}
+
+/** The branded category and advisory are separate from arbitrary exception properties. */
+export function residentWorkerFailure(error: unknown): {
+  error: string; code: string; source_diagnostic?: ResidentSourceAdvisory;
+} | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const failure = residentWorkerFailures.get(error);
+  if (!failure) return undefined;
+  const source_diagnostic = residentSourceAdvisory(error);
+  return { ...failure, ...(source_diagnostic ? { source_diagnostic } : {}) };
 }
 export class ResidentWorkerCleanupFault extends ResidentCleanupError {
   readonly origin = "cleanup";
@@ -265,10 +320,12 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
   private evaluating = false;
   private state: Record<string, Json> = {};
   private residentEntry: "step" | "analyze" | null = null;
+  private residentSourceHash: string | null = null;
   private residentBudget = 0;
   private sequence = 0;
   private releaseSignal: (() => void) | null = null;
   private analysisEvaluation: { id: number; started: number; reported: boolean; callback?: (elapsedMs: number) => void } | null = null;
+  private analysisFault: ResidentWorkerFault | null = null;
 
   constructor(
     private runner: string,
@@ -333,10 +390,11 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
         !["pure_modules_v1", "motion_track_v1"].every(feature => runtimeFeatures.includes(feature))))
         throw new Error("Resident kernel does not support the required pure module motion features.");
       if (source !== undefined) {
-        if (this.residentEntry)
+        if (this.residentEntry) {
+          this.residentSourceHash = typeof source === "string" ? null : source.source_hash;
           await this.request("resident_compiled", { v: 1, type: "resident_init", id: 0,
             bundle: source, entry: this.residentEntry }, STARTUP_MS, 0);
-        else await this.request("compiled", { type: "init", source, binding }, STARTUP_MS);
+        } else await this.request("compiled", { type: "init", source, binding }, STARTUP_MS);
       }
       if (this.closing || signal?.aborted) throw new Error("Sandbox worker was cancelled during startup.");
     } catch (error) {
@@ -502,12 +560,22 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
           "type" in reply && reply.type === "guardian_resident_fault") {
         const fault = reply as Reply;
         if (!this.residentEntry || fault.v !== 2 || fault.id !== this.pending.id ||
-            !exactKeys(fault, ["v", "type", "id", "origin", "trusted_origin"]) ||
+            !exactKeys(fault, fault.origin === "source_throw"
+              ? ["v", "type", "id", "origin", "trusted_origin", "diagnostic"]
+              : ["v", "type", "id", "origin", "trusted_origin"]) ||
             !["watchdog", "source_throw", "transport", "opaque"].includes(fault.origin as string) ||
             typeof fault.trusted_origin !== "boolean" ||
             (fault.trusted_origin && fault.origin === "source_throw"))
           throw new Error("Invalid resident fault envelope.");
-        this.fail(new ResidentWorkerFault(fault.origin as ResidentWorkerFaultOrigin, fault.trusted_origin));
+        const diagnostic = fault.origin === "source_throw"
+          ? readResidentSourceDiagnostic(fault.diagnostic, this.residentSourceHash) : undefined;
+        const failure = new ResidentWorkerFault(fault.origin as ResidentWorkerFaultOrigin, fault.trusted_origin, diagnostic);
+        if (this.residentEntry === "analyze" && this.analysisEvaluation && !this.analysisEvaluation.reported) {
+          if (this.analysisFault) throw new Error("Repeated resident analysis fault.");
+          // Guardian reports its measured evaluation boundary immediately after
+          // the fault. Keep the original request timer and cleanup ownership.
+          this.analysisFault = failure;
+        } else this.fail(failure);
         return;
       }
       if (reply && typeof reply === "object" && !Array.isArray(reply) &&
@@ -521,8 +589,11 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
           frame.elapsed_ms < 0 || frame.elapsed_ms > Number.MAX_SAFE_INTEGER ||
           !["result", "terminated"].includes(frame.outcome as string))
           throw new Error("Invalid trusted analysis evaluation notification.");
+        if (this.analysisFault && frame.outcome !== "terminated")
+          throw new Error("Resident analysis fault has inconsistent timing.");
         this.reportAnalysisEvaluation(frame.elapsed_ms);
-        if (frame.outcome === "terminated") this.fail(new Error("Resident analysis evaluation failed or exceeded its guarded deadline."));
+        if (frame.outcome === "terminated") this.fail(this.analysisFault ??
+          new Error("Resident analysis evaluation failed or exceeded its guarded deadline."));
         return;
       }
       if (
@@ -622,7 +693,7 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
     } finally {
       signal?.removeEventListener("abort", abort);
       this.evaluating = false;
-      if (entry === "analyze") this.analysisEvaluation = null;
+      if (entry === "analyze") { this.analysisEvaluation = null; this.analysisFault = null; }
     }
   }
 

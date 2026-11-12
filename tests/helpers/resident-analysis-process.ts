@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import type { Json } from "../../src/shared/contracts.ts";
 import type { ExecutableModuleBundle } from "../../src/shared/programs.ts";
 import type { ResidentAnalysisWorker } from "../../src/shared/resident.ts";
+import { ResidentWorkerFault } from "../../src/server/sandbox.ts";
 
 /** Shipped supervisor/module thread, not Docker or native gameplay. Timing here
  * is local pipe roundtrip, not a claim about production guardian CPU accounting. */
@@ -48,8 +49,20 @@ export async function residentAnalysisProcess(bundle: ExecutableModuleBundle, bu
     return { async analyze(input, _signal, onEvaluation) {
       const id = ++sequence, started = performance.now();
       child.stdin.write(JSON.stringify({ v: 1, type: "resident_analyze", id, input }) + "\n");
-      const result = await read() as { type: string; value: Json };
+      const result = await read() as { v: number; id: number; type: string; value: Json; origin?: unknown; diagnostic?: unknown };
       onEvaluation?.(performance.now() - started);
+      if (result.type === "resident_fault") {
+        const origin = result.origin;
+        if (result.v !== 1 || result.id !== id ||
+          origin !== "source_throw" && origin !== "watchdog" && origin !== "transport" && origin !== "opaque" ||
+          Object.keys(result).sort().join(",") !== (origin === "source_throw"
+            ? "diagnostic,id,origin,type,v" : "id,origin,type,v"))
+          throw new Error("Invalid isolated software fault");
+        const failure = new ResidentWorkerFault(origin, false, result.diagnostic);
+        if (origin === "source_throw" && failure.sourceDiagnostic?.source_hash !== bundle.source_hash)
+          throw new Error("Invalid isolated software source identity");
+        throw failure;
+      }
       if (result.type !== "resident_result") throw new Error("Isolated software analysis failed");
       return result.value;
     }, close };

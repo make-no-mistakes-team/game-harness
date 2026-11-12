@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/server/store.ts";
@@ -9,7 +9,7 @@ import { RuntimeTools, type RuntimeToolHost } from "../src/server/runtime-tools.
 import { HistoryReader } from "../src/server/history-reader.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import type { ReactiveRuntime } from "../src/server/reactive.ts";
-import type { SandboxService } from "../src/server/sandbox.ts";
+import { SandboxService } from "../src/server/sandbox.ts";
 import type { LookaheadConfig } from "../src/shared/planning.ts";
 import { DEFAULT_RESIDENT_LIMITS, type ControllerStepResult, type ResidentAnalysisWorker, type ResidentLimits, type ResidentWorker } from "../src/shared/resident.ts";
 import type { ControllerInputChannel, RevocationAck } from "../src/shared/controller.ts";
@@ -19,9 +19,10 @@ import { jsonSchema } from "../src/shared/primitives.ts";
 import type { Json } from "../src/shared/contracts.ts";
 import { spawn } from "node:child_process";
 import { residentActivationResultSchema, residentDecisionSchema } from "../src/shared/resident.ts";
-import { ResidentWorkerFault, type ResidentWorkerFaultOrigin } from "../src/server/sandbox.ts";
+import { ResidentWorkerFault, residentSourceAdvisory, type ResidentWorkerFaultOrigin } from "../src/server/sandbox.ts";
+import { preparationFailure } from "../src/server/prepared-source-error.ts";
 import { MAX_SKILL_LIMITS, type ExecutableModuleBundle, type SkillLimits } from "../src/shared/programs.ts";
-import { singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
+import { executableModuleBundleHash, singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 import { controlSessionConfigSchema } from "../src/shared/control-session.ts";
 import { residentAnalysisProcess } from "./helpers/resident-analysis-process.ts";
 
@@ -93,6 +94,107 @@ async function fixture(analysisFactory?: (budget: number, bundle: ExecutableModu
   const start = (lookahead?: LookaheadConfig) => manager.start(run.run_id, {entry:"step", skill_id:program.skill_id, version:program.version, start_key:crypto.randomUUID(), ...executionScopeFixture(run), args:{goal:"wait"}, initial_state:0, limits:{...DEFAULT_RESIDENT_LIMITS, duration_ms:10000, ...limits}, ...(lookahead ? { lookahead } : {})});
   return { store, run, manager, program, start, compiled, finishCompile, firstStep, hold() {holdCompile=true;}, running() {output="running";}, get opened(){return opened;}, get closed(){return closed;}, get finiteCalls(){return finiteCalls;} };
 }
+
+/** Controlled guardian frames exercise the actual host decoder and process
+ * closure, not Docker isolation, measured CPU, native control or gameplay. */
+async function hostFaultWorker(bundle: ExecutableModuleBundle, fault: Record<string, unknown>,
+  exitCode = 0, timing = true) {
+  const directory = mkdtempSync(join(tmpdir(), "resident-host-fault-"));
+  const guardian = join(directory, "guardian.mjs");
+  writeFileSync(guardian, `
+    import {createInterface} from "node:readline";
+    const send = value => process.stdout.write(JSON.stringify(value)+"\\n");
+    send({v:1,type:"resident_ready",id:0,runtime_features:["pure_modules_v1","motion_track_v1"]});
+    const lines=createInterface({input:process.stdin});
+    lines.on("line", text => {
+      const request=JSON.parse(text);
+      if(request.type==="resident_init") send({v:1,type:"resident_compiled",id:0});
+      else {
+        send({...${JSON.stringify(fault)},id:request.id});
+        if(${timing}) send({v:2,type:"guardian_analysis_evaluated",id:request.id,entry:"analyze",elapsed_ms:7,outcome:"terminated"});
+      }
+    });
+    lines.on("close",()=>{process.exitCode=${exitCode};});
+  `);
+  const sandbox = new SandboxService(directory);
+  Object.assign(sandbox, { state: { status: "ready", image: "controlled-guardian", error: null },
+    runner: new URL("../sandbox/worker.mjs", import.meta.url).pathname, guardian });
+  cleanup.push(async () => {
+    try {
+      if (exitCode === 0) await sandbox.close();
+      else await expect(sandbox.close()).rejects.toThrow();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+  return await sandbox.createResidentAnalysisWorker(bundle, 1000, new AbortController().signal);
+}
+
+function diagnosticBundle(): ExecutableModuleBundle {
+  const bundle = singletonExecutableModuleBundle("import {check} from './check.js'; export function analyze(input) { return check(input); }", "analyze");
+  const library = singletonExecutableModuleBundle("export function check(input) { return input; }", "analyze").modules[0]!;
+  const id = 'module:["check",1]';
+  bundle.modules[0]!.imports.push({ specifier: "./check.js", module_id: id });
+  bundle.modules.push({ ...library, id });
+  bundle.source_hash = executableModuleBundleHash(bundle.entry, bundle.modules);
+  return bundle;
+}
+
+test("host decoder preserves source advice and exact bundle hash through following trusted terminated timing and cleanup", async () => {
+  const bundle = diagnosticBundle();
+  const diagnostic = { type: "TypeError", message: "assertion: explicit state required",
+    source_hash: bundle.source_hash, location: { mapping: "unmapped" } };
+  const worker = await hostFaultWorker(bundle, { v: 2, type: "guardian_resident_fault",
+    origin: "source_throw", trusted_origin: false, diagnostic });
+  const reports: number[] = [];
+  let caught: unknown;
+  try { await worker.analyze(null, undefined, elapsed => reports.push(elapsed)); }
+  catch (error) { caught = error; }
+  expect(caught).toBeInstanceOf(ResidentWorkerFault);
+  expect(caught).toMatchObject({ origin: "source_throw", trustedOrigin: false, sourceDiagnostic: diagnostic });
+  expect(reports).toEqual([7]);
+  expect(preparationFailure(caught)).toMatchObject({ code: "source_throw",
+    source_diagnostic: { advisory: true, trusted_origin: false, diagnostic } });
+  expect((caught as Error).message).not.toContain(diagnostic.message);
+  await worker.close();
+});
+
+test("host decoder rejects malformed, wrong-source and forged-trust source frames without exposing their text", async () => {
+  const bundle = diagnosticBundle();
+  const diagnostic = { type: "Error", message: "PRIVATE_HOST_SENTINEL",
+    source_hash: bundle.source_hash, location: { mapping: "unmapped" } };
+  const base = { v: 2, type: "guardian_resident_fault", origin: "source_throw", trusted_origin: false, diagnostic };
+  const { diagnostic: _omitted, ...missing } = base;
+  for (const fault of [missing, { ...base, trusted_origin: true }, { ...base, extra: "PRIVATE_EXTRA" },
+    { ...base, diagnostic: { ...diagnostic, source_hash: "f".repeat(64) } },
+    { ...base, diagnostic: { ...diagnostic, source_hash: bundle.modules[0]!.source_hash } },
+    { ...base, diagnostic: { ...diagnostic, source_hash: bundle.source_hash.toUpperCase() } },
+    { ...base, diagnostic: { ...diagnostic, type: "HostInternalError" } },
+    { ...base, diagnostic: { ...diagnostic, message: "PRIVATE".repeat(200) } },
+    { ...base, diagnostic: { ...diagnostic, stack: "PRIVATE_STACK" } },
+    { ...base, diagnostic: { ...diagnostic, location: { mapping: "unmapped", path: "PRIVATE_PATH" } } },
+    { ...base, origin: "watchdog" }, { ...base, origin: "transport" }, { ...base, origin: "opaque" }]) {
+    const worker = await hostFaultWorker(bundle, fault);
+    let caught: unknown;
+    try { await worker.analyze(null); } catch (error) { caught = error; }
+    expect(caught).toMatchObject({ origin: "transport", trustedOrigin: true });
+    expect(residentSourceAdvisory(caught)).toBeUndefined();
+    expect(JSON.stringify(preparationFailure(caught))).not.toContain("PRIVATE");
+    await worker.close();
+  }
+});
+
+test("cleanup uncertainty supersedes a valid advisory without leaking source text", async () => {
+  const bundle = singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze");
+  const worker = await hostFaultWorker(bundle, { v: 2, type: "guardian_resident_fault",
+    origin: "source_throw", trusted_origin: false, diagnostic: { type: "Error",
+      message: "PRIVATE_UNCONFIRMED_SOURCE", source_hash: bundle.source_hash, location: { mapping: "unmapped" } } }, 1);
+  let caught: unknown;
+  try { await worker.analyze(null); } catch (error) { caught = error; }
+  expect(caught).toMatchObject({ origin: "cleanup", trustedOrigin: true });
+  expect(residentSourceAdvisory(caught)).toBeUndefined();
+  expect(preparationFailure(caught).code).toBe("cleanup");
+  expect(JSON.stringify(preparationFailure(caught))).not.toContain("PRIVATE");
+  await expect(worker.close()).rejects.toThrow();
+});
 
 test("a raw-result candidate cannot retire an incumbent when the pinned request selects executive mode", async () => {
   const f = await fixture(undefined, {}, { sessionTask: async () => ({ status: "succeeded", summary: "unused", evidence: null }),
@@ -179,6 +281,47 @@ test("ordinary exact-return analysis keeps raw output, budgets and immutable fla
   expect(snapshot.counters.analysis_ms).toBeLessThanOrEqual(1500);
   expect(budgets).toEqual([500, 500, 500]); expect(disposed).toBe(3);
   expect(f.opened).toBe(1); expect(f.finiteCalls).toBe(0);
+});
+
+test("ordinary resident analysis returns actual source assertions only as bounded untrusted advice", async () => {
+  const f = await fixture(async (budget, bundle, signal) => await residentAnalysisProcess(bundle, budget, signal));
+  f.running(); const execution = f.start(); await f.firstStep.promise;
+  const analysis = await f.manager.register(f.run.run_id, { entry: "analyze", name: "assertion probe",
+    source: "export function analyze(input) { if (!input) throw new TypeError('probe assertion: input required'); return input; }",
+    card, dependencies: [] });
+  const result = await f.manager.analyzeResident(f.run.run_id, execution.execution_id,
+    { skill_id: analysis.skill_id, version: analysis.version }, false, 0);
+  expect(result).toMatchObject({ status: "failed", output: null,
+    source: { skill_id: analysis.skill_id, version: analysis.version, hash: analysis.hash },
+    source_diagnostic: { advisory: true, trusted_origin: false, origin: "source_throw", diagnostic: {
+      type: "TypeError", message: "probe assertion: input required", source_hash: analysis.hash,
+      location: { mapping: "unmapped" },
+    } } });
+  expect(result.reason).not.toContain("probe assertion");
+  expect(result.elapsed_ms).toBeGreaterThan(0);
+  expect(f.opened).toBe(1); expect(f.finiteCalls).toBe(0);
+});
+
+test("ordinary resident analysis redacts host exceptions, structural spoofs and wrong-source diagnostics", async () => {
+  let injected: unknown = new Error("PRIVATE_HOST_ANALYSIS");
+  const f = await fixture(async () => ({ async analyze(_input, _signal, report) {
+    report?.(1); throw injected;
+  }, async close() {} }));
+  f.running(); const execution = f.start(); await f.firstStep.promise;
+  const analysis = await f.manager.register(f.run.run_id, { entry: "analyze", name: "host boundary probe",
+    source: "export function analyze(input) { return input; }", card, dependencies: [] });
+  for (const error of [injected, { origin: "source_throw", trustedOrigin: false, message: "PRIVATE_SPOOF",
+    sourceDiagnostic: { type: "Error", message: "PRIVATE_SPOOF", source_hash: analysis.hash, location: { mapping: "unmapped" } } },
+    new ResidentWorkerFault("source_throw", false, { type: "Error", message: "PRIVATE_WRONG_SOURCE",
+      source_hash: "f".repeat(64), location: { mapping: "unmapped" } }),
+    new ResidentWorkerFault("watchdog"), new ResidentWorkerFault("transport")]) {
+    injected = error;
+    const result = await f.manager.analyzeResident(f.run.run_id, execution.execution_id,
+      { skill_id: analysis.skill_id, version: analysis.version }, null, 0);
+    expect(result.status).toBe("failed"); expect(result.output).toBeNull();
+    expect(result.source_diagnostic).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain("PRIVATE");
+  }
 });
 
 test("ordinary named resident handoff holds admission until native retirement then starts exact step limits once", async () => {
@@ -335,8 +478,13 @@ async function residentProcess(bundle: ExecutableModuleBundle, signal: AbortSign
     const compute = async (type: string, frame: unknown, state: Json, intent: Json) => {
       const id = ++sequence;
       child.stdin.write(JSON.stringify({ v: 1, type, id, frame, state, intent }) + "\n");
-      const reply = await read() as { type: string; value: unknown; origin: ResidentWorkerFaultOrigin };
-      if (reply.type !== "resident_result") throw new ResidentWorkerFault(reply.origin, false);
+      const reply = await read() as { type: string; value: unknown; origin: ResidentWorkerFaultOrigin; diagnostic?: unknown };
+      if (reply.type !== "resident_result") {
+        const failure = new ResidentWorkerFault(reply.origin, false, reply.diagnostic);
+        if (reply.origin === "source_throw" && failure.sourceDiagnostic?.source_hash !== bundle.source_hash)
+          throw new Error("Invalid fixture source fault identity");
+        throw failure;
+      }
       return reply.value;
     };
     return {

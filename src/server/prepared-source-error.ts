@@ -3,14 +3,23 @@ import type { Json } from "../shared/contracts.ts";
 import { ProgramValidationError, programEntryContractSchema } from "./program-validation.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { GeneratedControllerResultValidationError } from "./program-diagnostics.ts";
-import { residentJsonConstraint } from "../shared/resident.ts";
+import { ResidentCleanupError, residentJsonConstraint } from "../shared/resident.ts";
+import type { ResidentSourceAdvisory } from "../shared/resident.ts";
+import { residentWorkerFailure } from "./sandbox.ts";
 
-/** Only explicit host-authored preparation preconditions may expose their text to a model. */
+/** Host-authored preparation preconditions have public text; container source
+ * messages are exposed only in their separately labelled advisory projection. */
 export class PreparedSourceFault extends Error {
   constructor(message: string) { super(message); this.name = "PreparedSourceFault"; }
 }
 
-export function preparationFailure(error: unknown): { error: string; code: string; issues?: Json; omitted_issues?: number } {
+export function preparationFailure(error: unknown): {
+  error: string; code: string; issues?: Json; omitted_issues?: number; source_diagnostic?: ResidentSourceAdvisory;
+} {
+  const workerFailure = residentWorkerFailure(error);
+  if (workerFailure) return workerFailure;
+  if (error instanceof ResidentCleanupError)
+    return { error: "Resident cleanup could not be confirmed.", code: "cleanup" };
   if (error instanceof GeneratedControllerResultValidationError)
     return { error: error.message.slice(0, 1000), code: "invalid_program_result",
       issues: error.issues.slice(0, 16) as Json, omitted_issues: Math.max(0, error.issues.length - 16) };

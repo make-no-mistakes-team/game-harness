@@ -24,6 +24,19 @@ const MAX_SKILL_INPUT = MAX_INPUT + 512 * 1024;
 const MAX_SKILL_OUTPUT = MAX_OUTPUT + 20 * 1024;
 const MAX_STATE = 16 * 1024;
 const MAX_DEPTH = 32;
+const SOURCE_DIAGNOSTIC_TYPES = ["Error", "TypeError", "RangeError", "ReferenceError",
+  "SyntaxError", "URIError", "EvalError", "AggregateError", "ThrownValue"];
+
+function validSourceDiagnostic(value, sourceHash) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) &&
+    exactKeys(value, ["type", "message", "source_hash", "location"]) &&
+    SOURCE_DIAGNOSTIC_TYPES.includes(value.type) &&
+    typeof value.message === "string" && value.message.length <= 1000 &&
+    typeof sourceHash === "string" && /^[a-f0-9]{64}$/.test(sourceHash) &&
+    value.source_hash === sourceHash && value.location !== null &&
+    typeof value.location === "object" && !Array.isArray(value.location) &&
+    exactKeys(value.location, ["mapping"]) && value.location.mapping === "unmapped";
+}
 
 // Keep this wire-boundary verifier aligned with shared/program-modules.ts.
 function validateModuleBundle(bundle, entry) {
@@ -342,6 +355,25 @@ async function runResidentThread() {
   });
   vm.runInContext(`const motion = (${createMotionMath.toString()})();`, context);
   const realm = vm.runInContext("({ parse: JSON.parse, object: Object.prototype, array: Array.prototype, error: Error })", context);
+  const errorPrototypes = Array.from(vm.runInContext(
+    "[Error,TypeError,RangeError,ReferenceError,SyntaxError,URIError,EvalError,AggregateError].map(value => value.prototype)", context));
+  const descriptor = Object.getOwnPropertyDescriptor;
+  const nativeError = types.isNativeError;
+  const getPrototype = Object.getPrototypeOf;
+  const slice = Function.prototype.call.bind(String.prototype.slice);
+  function sourceDiagnostic(error) {
+    let type = "ThrownValue", message = "Generated program threw a non-error value (not serialized)";
+    // isNativeError rejects proxies without touching their traps. Never inspect
+    // arbitrary thrown values, constructors, stacks, accessors or coercion hooks.
+    if (nativeError(error)) {
+      const index = errorPrototypes.indexOf(getPrototype(error));
+      type = index < 0 ? "Error" : SOURCE_DIAGNOSTIC_TYPES[index];
+      const ownMessage = descriptor(error, "message");
+      message = ownMessage && Object.hasOwn(ownMessage, "value") && typeof ownMessage.value === "string"
+        ? slice(ownMessage.value, 0, 1000) : "Generated program failed";
+    }
+    return { type, message, source_hash: workerData.bundle.source_hash, location: { mapping: "unmapped" } };
+  }
   const modules = new Map(), moduleIds = new Map();
   for (const row of rows.values()) {
     const compiled = new vm.SourceTextModule(row.source, {
@@ -427,8 +459,10 @@ async function runResidentThread() {
         returned = entry === "step"
           ? (message.type === "resident_activate" ? activation : selected)(input.frame, input.state, input.intent)
           : selected(input.input);
-      } catch {
-        post(stringify({ v: 1, type: "resident_fault", id: message.id, origin: "source_throw" }));
+      } catch (error) {
+        const diagnostic = sourceDiagnostic(error);
+        if (!validSourceDiagnostic(diagnostic, workerData.bundle.source_hash)) throw new Error("diagnostic");
+        post(stringify({ v: 1, type: "resident_fault", id: message.id, origin: "source_throw", diagnostic }));
         return exit(1);
       }
       const value = cleanJson(returned);
@@ -777,6 +811,7 @@ function runSupervisor() {
   const resident = process.argv[2] === "resident";
   const budget = resident ? Number(process.argv[3]) : 500;
   let residentEntry = null;
+  let residentSourceHash = null;
   let sequence = 0;
   if (resident && (!Number.isSafeInteger(budget) || budget < 1 || budget > 5000))
     return exit(1);
@@ -803,11 +838,13 @@ function runSupervisor() {
     output(line);
   }
 
-  function fail(origin = "opaque") {
+  function fail(origin = "opaque", diagnostic) {
     if (closing) return;
     try {
+      const sourceThrow = origin === "source_throw" && validSourceDiagnostic(diagnostic, residentSourceHash);
       send(resident ? { v: 1, type: "resident_fault", id: sequence,
-        origin: ["watchdog", "source_throw", "opaque"].includes(origin) ? origin : "opaque" } : { type: "error" });
+        origin: sourceThrow ? "source_throw" : origin === "watchdog" ? "watchdog" : "opaque",
+        ...(sourceThrow ? { diagnostic } : {}) } : { type: "error" });
     } catch {
       /* Never forward policy logs or raw errors. */
     }
@@ -828,6 +865,7 @@ function runSupervisor() {
         validateModuleBundle(message.bundle, message.entry);
         initialized = true;
         residentEntry = message.entry;
+        residentSourceHash = message.bundle.source_hash;
         expected = "resident_compiled";
         watchdog = setTimeout(fail, 15_000);
         thread = new Worker(new URL(import.meta.url), {
@@ -919,8 +957,10 @@ function runSupervisor() {
             throw new Error("protocol");
           const reply = parse(encoded);
           if (resident && reply?.v === 1 && reply.type === "resident_fault" && reply.id === sequence &&
-              exactKeys(reply, ["v", "type", "id", "origin"]) && reply.origin === "source_throw")
-            return fail("source_throw");
+              expected === "resident_result" &&
+              exactKeys(reply, ["v", "type", "id", "origin", "diagnostic"]) && reply.origin === "source_throw" &&
+              validSourceDiagnostic(reply.diagnostic, residentSourceHash))
+            return fail("source_throw", reply.diagnostic);
           if (!reply || !depthIsBounded(reply) || reply.type !== expected)
             throw new Error("protocol");
           if (resident && (reply.v !== 1 || reply.id !== sequence ||

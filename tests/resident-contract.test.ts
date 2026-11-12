@@ -12,12 +12,65 @@ import {
     readProgramDiagnostic
 } from "../src/server/program-diagnostics.ts";
 import { preparationFailure } from "../src/server/prepared-source-error.ts";
+import { ResidentWorkerFault, residentSourceAdvisory } from "../src/server/sandbox.ts";
 
 const neutral = { forward: false, back: false, left: false, right: false, jump: false,
   sprint: false, sneak: false, attack: false, use: false };
 const result = () => ({ input: { kind: "world", held: { ...neutral }, edges: [],
   view: { kind: "unchanged" }, selected_hotbar: null }, next_state: { observations_processed: 1 },
   status: "running", events: [] });
+
+test("only a branded detached source diagnostic is projected as untrusted preparation advice", () => {
+  const diagnostic = { type: "TypeError", message: "assertion: explicit state required",
+    source_hash: "a".repeat(64), location: { mapping: "unmapped" } };
+  const fault = new ResidentWorkerFault("source_throw", false, diagnostic);
+  diagnostic.message = "PRIVATE_MUTATED_HOST_VALUE"; diagnostic.location.mapping = "PRIVATE_MAPPING";
+  Reflect.set(fault, "message", "PRIVATE_HOST_ERROR");
+  expect(preparationFailure(fault)).toMatchObject({ code: "source_throw",
+    source_diagnostic: { advisory: true, trusted_origin: false, origin: "source_throw", diagnostic: {
+      type: "TypeError", message: "assertion: explicit state required", source_hash: "a".repeat(64),
+      location: { mapping: "unmapped" },
+    } } });
+  expect(JSON.stringify(preparationFailure(fault))).not.toContain("PRIVATE");
+  expect(fault.sourceDiagnostic?.message).toBe("assertion: explicit state required");
+  const projected = residentSourceAdvisory(fault)!;
+  Reflect.set(projected.diagnostic, "message", "PRIVATE_PROJECTED_MUTATION");
+  expect(residentSourceAdvisory(fault)?.diagnostic.message).toBe("assertion: explicit state required");
+  for (const spoof of [
+    new Error("PRIVATE_HOST_ERROR"),
+    { origin: "source_throw", trustedOrigin: false, sourceDiagnostic: diagnostic, message: "PRIVATE_STRUCTURAL" },
+    Object.assign(Object.create(ResidentWorkerFault.prototype), { origin: "source_throw", sourceDiagnostic: diagnostic }),
+  ]) {
+    expect(preparationFailure(spoof).code).toBe("service_failure");
+    expect(residentSourceAdvisory(spoof)).toBeUndefined();
+    expect(JSON.stringify(preparationFailure(spoof))).not.toContain("PRIVATE");
+  }
+});
+
+test("source diagnostic construction rejects hooks, invalid fields and promoted trust without inspecting them", () => {
+  let hooks = 0;
+  const base = { type: "Error", message: "assertion", source_hash: "a".repeat(64), location: { mapping: "unmapped" } };
+  const accessor = { ...base };
+  Object.defineProperty(accessor, "message", { get() { hooks++; throw new Error("PRIVATE_GETTER"); } });
+  const proxy = new Proxy(base, { ownKeys() { hooks++; throw new Error("PRIVATE_PROXY"); } });
+  const locationProxy = new Proxy(base.location, { ownKeys() { hooks++; throw new Error("PRIVATE_LOCATION"); } });
+  for (const diagnostic of [accessor, proxy, { ...base, location: locationProxy },
+    { ...base, stack: "PRIVATE_STACK" }, { ...base, type: "CustomHostError" },
+    { ...base, source_hash: "A".repeat(64) }, { ...base, message: "x".repeat(1001) },
+    { ...base, location: { mapping: "unmapped", path: "PRIVATE_PATH" } }]) {
+    expect(() => new ResidentWorkerFault("source_throw", false, diagnostic)).toThrow();
+  }
+  expect(hooks).toBe(0);
+  expect(() => new ResidentWorkerFault("source_throw", true, base)).toThrow();
+  expect(() => new ResidentWorkerFault("watchdog", false, base)).toThrow();
+  const bounded = new ResidentWorkerFault("source_throw", false, { ...base, message: "é".repeat(1000) });
+  expect(residentSourceAdvisory(bounded)?.diagnostic.message).toHaveLength(1000);
+  for (const origin of ["watchdog", "transport", "opaque", "cleanup"] as const) {
+    expect(preparationFailure(new ResidentWorkerFault(origin))).toEqual({
+      error: `Resident worker failed (${origin}).`, code: origin,
+    });
+  }
+});
 
 test("actor-selected entries cannot exchange playing and pure-analysis authority or budgets", () => {
   const source = "export function step(frame,state,intent) { return null; }";

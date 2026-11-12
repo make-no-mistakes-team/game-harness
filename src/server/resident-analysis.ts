@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Json } from "../shared/contracts.ts";
+import { preparationFailure } from "./prepared-source-error.ts";
 import { ResidentCleanupError, residentAnalysisInputSchema, residentAnalysisOutputSchema, residentSourceIdentitySchema,
   type ResidentAnalysisResult, type ResidentAnalysisSource, type ResidentClock, type ResidentControllerOptions,
   type ResidentSnapshot } from "../shared/resident.ts";
@@ -59,9 +60,12 @@ export class ResidentAnalysisLane {
         else result.status = "completed";
       } catch (error) {
         result.status = this.stopped() ? "cancelled" : "failed";
-        result.reason = error instanceof Error ? error.message : String(error); result.output = null;
+        const failure = preparationFailure(error);
+        result.reason = failure.error; result.output = null;
+        if (failure.source_diagnostic?.diagnostic.source_hash === selectedSource.bundle.source_hash)
+          result.source_diagnostic = failure.source_diagnostic;
         if (error instanceof ResidentCleanupError) {
-          this.cleanupFailure = error; this.fault("unknown", error.message);
+          this.cleanupFailure = error; this.fault("unknown", failure.error);
         }
       } finally {
         evaluationOpen = false;

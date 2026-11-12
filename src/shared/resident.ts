@@ -204,6 +204,20 @@ export const residentSnapshotSchema = z.object({
   cleanup: z.object({ worker: z.enum(["open", "closing", "closed", "unknown"]), native: z.enum(["open", "revoking", "retired", "unknown"]) }).strict(),
 }).strict() satisfies z.ZodType<ResidentSnapshot>;
 export interface ResidentAnalysisSource { skill_id: string; version: number; hash: Sha256; bundle: ExecutableModuleBundle }
+/** Bounded untrusted source text, never a host exception or native fact. */
+export type ResidentSourceDiagnostic = {
+  readonly type: "Error" | "TypeError" | "RangeError" | "ReferenceError" | "SyntaxError" |
+    "URIError" | "EvalError" | "AggregateError" | "ThrownValue";
+  readonly message: string;
+  readonly source_hash: Sha256;
+  readonly location: Readonly<{ mapping: "unmapped" }>;
+};
+export type ResidentSourceAdvisory = {
+  readonly advisory: true;
+  readonly trusted_origin: false;
+  readonly origin: "source_throw";
+  readonly diagnostic: ResidentSourceDiagnostic;
+};
 export interface ResidentAnalysisResult {
   job_id: string; source: { skill_id: string; version: number; hash: Sha256 };
   controller_execution_id: string; controller_source_hash: Sha256; controller_generation: number;
@@ -211,6 +225,7 @@ export interface ResidentAnalysisResult {
   output: Json; elapsed_ms: number;
   /** Same-host observation from evaluation notification until service settlement, including delivery/cleanup/host delay; not CPU. */
   post_evaluation_ms: number | null; reason: string | null;
+  source_diagnostic?: ResidentSourceAdvisory;
 }
 export interface ResidentClock { id: string; now(): number; setTimeout(callback: () => void, delay: number): unknown; clearTimeout(handle: unknown): void }
 export interface ResidentLifecycle { fence(reason: string): void; drain(): Promise<void> }

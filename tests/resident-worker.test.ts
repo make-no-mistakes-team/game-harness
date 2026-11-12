@@ -48,6 +48,9 @@ function processWorker(budget = 80): ProcessWorker {
   const child = spawn(executable, [new URL("../sandbox/worker.mjs", import.meta.url).pathname, "resident", String(budget)], {
     stdio: ["pipe", "pipe", "pipe"], env: { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: "/nonexistent", LANG: "C.UTF-8" },
   });
+  return processTransport(child);
+}
+function processTransport(child: ChildProcessWithoutNullStreams): ProcessWorker {
   children.add(child);
   const lines: unknown[] = [];
   let buffer = "", stderr = "", ended = false;
@@ -102,6 +105,208 @@ async function analyze(worker: ProcessWorker, id: number, input: unknown) {
   worker.send({ v: 1, type: "resident_analyze", id, input });
   return await worker.read();
 }
+
+function sourceFault(bundle: ExecutableModuleBundle, type: string, message: string) {
+  return { v: 1, type: "resident_fault", id: 1, origin: "source_throw",
+    diagnostic: { type, message, source_hash: bundle.source_hash, location: { mapping: "unmapped" } } };
+}
+
+for (const [label, body, type, message] of [
+  ["own assertion", `if (input !== 7) throw new Error("Expected seven; observed another input");`, "Error", "Expected seven; observed another input"],
+  ["own TypeError", `throw new TypeError("Expected path array");`, "TypeError", "Expected path array"],
+  ["engine TypeError", `null.missing();`, "TypeError", "Cannot read properties of null (reading 'missing')"],
+  ["RangeError", `throw new RangeError("range");`, "RangeError", "range"],
+  ["ReferenceError", `throw new ReferenceError("reference");`, "ReferenceError", "reference"],
+  ["SyntaxError", `throw new SyntaxError("syntax");`, "SyntaxError", "syntax"],
+  ["URIError", `throw new URIError("uri");`, "URIError", "uri"],
+  ["EvalError", `throw new EvalError("eval");`, "EvalError", "eval"],
+  ["AggregateError", `throw new AggregateError([], "aggregate");`, "AggregateError", "aggregate"],
+] as const) test(`resident source diagnostic preserves bounded ${label} text`, async () => {
+  const bundle = singletonExecutableModuleBundle(`export function analyze(input) { ${body} }`, "analyze");
+  const worker = await compileBundle(bundle);
+  expect(await analyze(worker, 1, null)).toEqual(sourceFault(bundle, type, message));
+  expect(await worker.closed).not.toBe(0);
+});
+
+test("resident source diagnostic binds imported failures to the executable bundle, not root body", async () => {
+  const bundle = moduleBundle([
+    { name: "root", source: `export { analyze } from "./library.js";`, imports: [{ specifier: "./library.js", name: "library" }] },
+    { name: "library", source: `export function analyze(input) { throw new TypeError("Library assertion"); }` },
+  ]);
+  expect(bundle.source_hash).not.toBe(bundle.modules[0]!.source_hash);
+  const worker = await compileBundle(bundle);
+  expect(await analyze(worker, 1, null)).toEqual(sourceFault(bundle, "TypeError", "Library assertion"));
+  expect(await worker.closed).not.toBe(0);
+});
+
+for (const [label, body, type, message] of [
+  ["native message getter", `const error=new TypeError(); Object.defineProperty(error,"message",{get(){for(;;){}}}); throw error;`, "TypeError", "Generated program failed"],
+  ["native nonprimitive message", `const error=new Error(); error.message={toString(){for(;;){}}}; throw error;`, "Error", "Generated program failed"],
+  ["native constructor/name/stack/serialization hooks", `const error=new Error("Own text"); for(const key of ["constructor","name","stack","code","toJSON"])Object.defineProperty(error,key,{get(){for(;;){}}}); Error.prepareStackTrace=()=>{for(;;){}}; throw error;`, "Error", "Own text"],
+  ["inherited message getter", `const error=new Error(); Object.setPrototypeOf(error,{get message(){for(;;){}}}); throw error;`, "Error", "Generated program failed"],
+  ["native proxy prototype", `const error=new Error("Own text"); Object.setPrototypeOf(error,new Proxy({},{get(){for(;;){}},getPrototypeOf(){for(;;){}}})); throw error;`, "Error", "Own text"],
+  ["realm array inspection hooks", `Array.prototype.indexOf=()=>{for(;;){}}; throw new TypeError("Own text");`, "TypeError", "Own text"],
+  ["non-error getter", `throw {get message(){for(;;){}},toJSON(){for(;;){}},toString(){for(;;){}}};`, "ThrownValue", "Generated program threw a non-error value (not serialized)"],
+  ["proxy", `throw new Proxy(new Error("Must not read"),{get(){for(;;){}},getOwnPropertyDescriptor(){for(;;){}},getPrototypeOf(){for(;;){}},ownKeys(){for(;;){}}});`, "ThrownValue", "Generated program threw a non-error value (not serialized)"],
+  ["revoked proxy", `const value=Proxy.revocable(new Error("Must not read"),{});value.revoke();throw value.proxy;`, "ThrownValue", "Generated program threw a non-error value (not serialized)"],
+  ["primitive symbol", `throw Symbol("Must not coerce");`, "ThrownValue", "Generated program threw a non-error value (not serialized)"],
+  ["primitive bigint", `throw 42n;`, "ThrownValue", "Generated program threw a non-error value (not serialized)"],
+  ["null", `throw null;`, "ThrownValue", "Generated program threw a non-error value (not serialized)"],
+] as const) test(`resident source diagnostic never invokes ${label}`, async () => {
+  const bundle = singletonExecutableModuleBundle(`export function analyze(input) { ${body} }`, "analyze");
+  const worker = await compileBundle(bundle, 200);
+  expect(await analyze(worker, 1, null)).toEqual(sourceFault(bundle, type, message));
+  expect(await worker.closed).not.toBe(0);
+});
+
+for (const text of ["a".repeat(1000), "a".repeat(1001), "😀".repeat(501), "\ud800".repeat(1001)])
+test(`resident source diagnostic bounds ${text.length} code units without widening output limits`, async () => {
+  const bundle = singletonExecutableModuleBundle(`export function analyze(input) { throw new Error(input); }`, "analyze");
+  const worker = await compileBundle(bundle);
+  expect(await analyze(worker, 1, text)).toEqual(sourceFault(bundle, "Error", text.slice(0, 1000)));
+  expect(await worker.closed).not.toBe(0);
+});
+
+test("resident activation carries the same bounded source diagnostic as analysis", async () => {
+  const bundle = singletonExecutableModuleBundle(`export function step(frame,state,intent) { return null; }
+    export function activate(frame,state,intent) { throw new TypeError("Activation assertion"); }`, "step");
+  const worker = await compileBundle(bundle);
+  worker.send({ v: 1, type: "resident_activate", id: 1, frame: {}, state: null, intent: null });
+  expect(await worker.read()).toEqual(sourceFault(bundle, "TypeError", "Activation assertion"));
+  expect(await worker.closed).not.toBe(0);
+});
+
+test("resident source computation hang remains watchdog without a diagnostic", async () => {
+  const worker = await compile(`export function analyze(input) { for (;;) {} }`, "analyze", 25);
+  expect(await analyze(worker, 1, null)).toEqual({ v: 1, type: "resident_fault", id: 1, origin: "watchdog" });
+  expect(await worker.closed).not.toBe(0);
+});
+
+// Link the unchanged shipped guardian against a fake Docker CLI only. Source
+// decoding, hash validation, timers, ordering and cleanup run in real Node.
+function guardianFaultProcess(fault: unknown): ProcessWorker {
+  const executable = Bun.which("node");
+  if (!executable) throw new Error("The real Node guardian executable is unavailable.");
+  const bootstrap = `
+    import { readFileSync } from "node:fs";
+    import { EventEmitter } from "node:events";
+    import { PassThrough } from "node:stream";
+    import { SourceTextModule, SyntheticModule } from "node:vm";
+    import { createHash } from "node:crypto";
+    const name="gameharness-policy-"+ "a".repeat(73);
+    process.argv=["node","guardian.mjs",name,"/runner.mjs","node:24-bookworm-slim@sha256:"+ "b".repeat(64),"resident","1000"];
+    function spawn(_command,args) {
+      const child=new EventEmitter();
+      child.stdout=new PassThrough();child.stderr=new PassThrough();child.stdin=new PassThrough();
+      child.kill=()=>{setImmediate(()=>child.emit("close",0));return true;};
+      if(args[0]==="start") {
+        child.stdin.on("data",chunk=>{
+          const request=JSON.parse(chunk.toString());
+          const reply=request.type==="resident_init"?{v:1,type:"resident_compiled",id:0}:${JSON.stringify(fault)};
+          child.stdout.write(JSON.stringify(reply)+"\\n");
+        });
+        setImmediate(()=>child.stdout.write(JSON.stringify({v:1,type:"resident_ready",id:0,runtime_features:["pure_modules_v1","motion_track_v1"]})+"\\n"));
+      } else setImmediate(()=>{
+        if(args[0]==="create")child.stdout.write("c".repeat(64)+"\\n");
+        else if(args[0]==="inspect")child.stdout.write(JSON.stringify({"io.gameharness.role":"policy","io.gameharness.owner":name}));
+        child.emit("close",0);
+      });
+      return child;
+    }
+    const module=new SourceTextModule(readFileSync(${JSON.stringify(new URL("../sandbox/guardian.mjs", import.meta.url).pathname)},"utf8"));
+    await module.link(specifier=>{
+      if(specifier==="node:child_process")return new SyntheticModule(["spawn"],function(){this.setExport("spawn",spawn);});
+      if(specifier==="node:crypto")return new SyntheticModule(["createHash"],function(){this.setExport("createHash",createHash);});
+      throw new Error("Unexpected guardian import");
+    });
+    await module.evaluate();
+  `;
+  return processTransport(spawn(executable, ["--experimental-vm-modules", "--input-type=module", "-e", bootstrap], {
+    stdio: ["pipe", "pipe", "pipe"], env: { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: "/nonexistent", LANG: "C.UTF-8" },
+  }));
+}
+
+// Substitute only the Worker transport, not the resident supervisor's decoder
+// or watchdog. Authored source cannot legitimately send these forged frames.
+function supervisorFaultProcess(fault: unknown): ProcessWorker {
+  const executable = Bun.which("node");
+  if (!executable) throw new Error("The real Node worker executable is unavailable.");
+  const workerUrl = new URL("../sandbox/worker.mjs", import.meta.url);
+  const bootstrap = `
+    import { readFileSync } from "node:fs";
+    import { EventEmitter } from "node:events";
+    import { PassThrough } from "node:stream";
+    import { SourceTextModule, SyntheticModule } from "node:vm";
+    process.argv=["node",${JSON.stringify(workerUrl.pathname)},"resident","1000"];
+    class Worker extends EventEmitter {
+      constructor() {
+        super();this.stdout=new PassThrough();this.stderr=new PassThrough();
+        setImmediate(()=>this.emit("message",JSON.stringify({v:1,type:"resident_compiled",id:0})));
+      }
+      postMessage() {setImmediate(()=>this.emit("message",JSON.stringify(${JSON.stringify(fault)})));}
+      async terminate() {return 1;}
+    }
+    const module=new SourceTextModule(readFileSync(${JSON.stringify(workerUrl.pathname)},"utf8"),{
+      initializeImportMeta(meta){meta.url=${JSON.stringify(workerUrl.href)};}
+    });
+    await module.link(async specifier=>{
+      if(specifier==="node:worker_threads")return new SyntheticModule(["Worker","isMainThread","parentPort","workerData"],
+        function(){this.setExport("Worker",Worker);this.setExport("isMainThread",true);this.setExport("parentPort",null);this.setExport("workerData",null);});
+      const namespace=await import(specifier),keys=Object.keys(namespace);
+      return new SyntheticModule(keys,function(){for(const key of keys)this.setExport(key,namespace[key]);});
+    });
+    await module.evaluate();
+  `;
+  return processTransport(spawn(executable, ["--experimental-vm-modules", "--input-type=module", "-e", bootstrap], {
+    stdio: ["pipe", "pipe", "pipe"], env: { PATH: "/usr/local/bin:/usr/bin:/bin", HOME: "/nonexistent", LANG: "C.UTF-8" },
+  }));
+}
+
+const guardianDiagnosticBundle = singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze");
+const guardianDiagnosticFault = sourceFault(guardianDiagnosticBundle, "TypeError", "Authored assertion, not host fact");
+const diagnosticFaultCases = [
+  ["valid source diagnostic", guardianDiagnosticFault, true],
+  ["exact maximum code units", sourceFault(guardianDiagnosticBundle, "Error", "😀".repeat(500)), true],
+  ["missing diagnostic", { v: 1, type: "resident_fault", id: 1, origin: "source_throw" }, false],
+  ["wrong bundle hash", { ...guardianDiagnosticFault, diagnostic: { ...guardianDiagnosticFault.diagnostic, source_hash: "0".repeat(64) } }, false],
+  ["uppercase bundle hash", { ...guardianDiagnosticFault, diagnostic: { ...guardianDiagnosticFault.diagnostic, source_hash: guardianDiagnosticBundle.source_hash.toUpperCase() } }, false],
+  ["oversize message", sourceFault(guardianDiagnosticBundle, "Error", "a".repeat(1001)), false],
+  ["nonstring message", { ...guardianDiagnosticFault, diagnostic: { ...guardianDiagnosticFault.diagnostic, message: {} } }, false],
+  ["unknown error type", sourceFault(guardianDiagnosticBundle, "AssertionError", "not whitelisted"), false],
+  ["stack field", { ...guardianDiagnosticFault, diagnostic: { ...guardianDiagnosticFault.diagnostic, stack: "must not escape" } }, false],
+  ["mapped location", { ...guardianDiagnosticFault, diagnostic: { ...guardianDiagnosticFault.diagnostic, location: { mapping: "mapped" } } }, false],
+  ["extra location data", { ...guardianDiagnosticFault, diagnostic: { ...guardianDiagnosticFault.diagnostic, location: { mapping: "unmapped", line: 1 } } }, false],
+  ["null diagnostic", { ...guardianDiagnosticFault, diagnostic: null }, false],
+  ["array diagnostic", { ...guardianDiagnosticFault, diagnostic: [] }, false],
+  ["forged trust", { ...guardianDiagnosticFault, trusted_origin: true }, false],
+  ["watchdog diagnostic", { ...guardianDiagnosticFault, origin: "watchdog" }, false],
+  ["opaque diagnostic", { ...guardianDiagnosticFault, origin: "opaque" }, false],
+] as const;
+for (const [label, fault, accepted] of diagnosticFaultCases)
+test(`guardian source diagnostic ${label} is ${accepted ? "advisory" : "quarantined"}`, async () => {
+  const worker = guardianFaultProcess(fault);
+  expect(await worker.read()).toMatchObject({ v: 1, type: "resident_ready", id: 0 });
+  worker.send({ v: 1, type: "resident_init", id: 0, entry: "analyze", bundle: guardianDiagnosticBundle });
+  expect(await worker.read()).toEqual({ v: 1, type: "resident_compiled", id: 0 });
+  const reply = await analyze(worker, 1, null);
+  expect(reply).toEqual(accepted
+    ? { ...fault, v: 2, type: "guardian_resident_fault", trusted_origin: false }
+    : { v: 2, type: "guardian_resident_fault", id: 1, origin: "opaque", trusted_origin: true });
+  expect(await worker.read()).toMatchObject({ v: 2, type: "guardian_analysis_evaluated", id: 1, entry: "analyze", outcome: "terminated" });
+  expect(await worker.closed).toBe(0);
+});
+
+for (const [label, fault, accepted] of diagnosticFaultCases)
+test(`resident supervisor source diagnostic ${label} is ${accepted ? "advisory" : "quarantined"}`, async () => {
+  const worker = supervisorFaultProcess(fault);
+  expect(await worker.read()).toMatchObject({ v: 1, type: "resident_ready", id: 0 });
+  worker.send({ v: 1, type: "resident_init", id: 0, entry: "analyze", bundle: guardianDiagnosticBundle });
+  expect(await worker.read()).toEqual({ v: 1, type: "resident_compiled", id: 0 });
+  expect(await analyze(worker, 1, null)).toEqual(accepted ? fault
+    : { v: 1, type: "resident_fault", id: 1, origin: "opaque" });
+  expect(await worker.closed).not.toBe(0);
+});
+
 function moduleBundle(rows: { name: string; source: string; imports?: { specifier: string; name: string }[] }[],
   entry: ExecutableModuleBundle["entry"] = "analyze"): ExecutableModuleBundle {
   const id = (name: string) => name === "root" ? "root" : `module:${JSON.stringify([name, 1])}`;

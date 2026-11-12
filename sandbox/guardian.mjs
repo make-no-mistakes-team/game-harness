@@ -49,6 +49,7 @@ let creation = Promise.resolve();
 let skillPhase = "ready";
 let skillSequence = 0;
 let residentEntry = null;
+let residentSourceHash = null;
 let residentSequence = 0;
 let residentInitialized = false;
 let residentEvaluation = null;
@@ -141,6 +142,18 @@ function exactKeys(value, keys) {
     keys.every(key => Object.hasOwn(value, key));
 }
 
+function validSourceDiagnostic(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value) &&
+    exactKeys(value, ["type", "message", "source_hash", "location"]) &&
+    ["Error", "TypeError", "RangeError", "ReferenceError", "SyntaxError", "URIError",
+      "EvalError", "AggregateError", "ThrownValue"].includes(value.type) &&
+    typeof value.message === "string" && value.message.length <= 1000 &&
+    typeof residentSourceHash === "string" && /^[a-f0-9]{64}$/.test(residentSourceHash) &&
+    value.source_hash === residentSourceHash && value.location !== null &&
+    typeof value.location === "object" && !Array.isArray(value.location) &&
+    exactKeys(value.location, ["mapping"]) && value.location.mapping === "unmapped";
+}
+
 function command(args, timeout = 5_000) {
   const completion = Promise.withResolvers();
   const child = spawn(DOCKER, args, {
@@ -219,11 +232,18 @@ function reportAnalysisEvaluation(outcome) {
     id: evaluation.id, entry: "analyze",
     elapsed_ms: Math.max(0, performance.now() - evaluation.started), outcome }) + "\n");
 }
-function residentFault(origin, trustedOrigin = true) {
+function residentFault(origin, trustedOrigin = true, diagnostic) {
   if (resident && !residentFaultReported && !closing) {
+    // Source text is container-authored advisory data, never a host assertion.
+    if (origin === "source_throw" && (trustedOrigin || !validSourceDiagnostic(diagnostic))) {
+      origin = "opaque";
+      trustedOrigin = true;
+      diagnostic = undefined;
+    }
     residentFaultReported = true;
     process.stdout.write(JSON.stringify({ v: 2, type: "guardian_resident_fault",
-      id: residentSequence, origin, trusted_origin: trustedOrigin }) + "\n");
+      id: residentSequence, origin, trusted_origin: trustedOrigin,
+      ...(origin === "source_throw" ? { diagnostic } : {}) }) + "\n");
   }
   return stop();
 }
@@ -287,6 +307,7 @@ process.stdin.on("data", (chunk) => {
         validateModuleBundle(request.bundle, request.entry);
         residentInitialized = true;
         residentEntry = request.entry;
+        residentSourceHash = request.bundle.source_hash;
         expected = "resident_compiled";
       } else {
         const activation = residentEntry === "step" && request.type === "resident_activate";
@@ -446,9 +467,14 @@ async function start() {
     try {
       const reply = boundedJson(output.subarray(0, end).toString("utf8"));
       if (resident && reply?.v === 1 && reply.type === "resident_fault" && reply.id === residentSequence &&
-          exactKeys(reply, ["v", "type", "id", "origin"]) &&
-          ["source_throw", "watchdog", "opaque"].includes(reply.origin))
-        return void residentFault(reply.origin, false);
+          ["source_throw", "watchdog", "opaque"].includes(reply.origin)) {
+        if (reply.origin === "source_throw") {
+          if (expected !== "resident_result" ||
+            !exactKeys(reply, ["v", "type", "id", "origin", "diagnostic"]) ||
+            !validSourceDiagnostic(reply.diagnostic)) throw new Error("protocol");
+        } else if (!exactKeys(reply, ["v", "type", "id", "origin"])) throw new Error("protocol");
+        return void residentFault(reply.origin, false, reply.diagnostic);
+      }
       if (resident && (reply?.v !== 1 || reply.id !== residentSequence ||
         !exactKeys(reply, expected === "resident_result"
           ? ["v", "type", "id", "value"] : expected === "resident_ready"

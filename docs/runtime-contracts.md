@@ -439,6 +439,23 @@ UTF-8 bytes, depth and plain-data violations using metadata from the trusted
 boundary. They expose bounded maxima, not input values, arbitrary custom
 validator parameters or fabricated exact sizes from an early-exit walk.
 
+Source exceptions have a separate bounded `source_diagnostic` advisory in
+preparation failures and ordinary resident-analysis results. It retains the
+validated JavaScript error type and at most 1,000 JavaScript code units of the
+source's own message. Non-error thrown values receive constant text rather than
+serialization. The hash identifies the complete pinned execution realm, not
+merely its root source body; location remains explicitly unmapped. No stack,
+host path, stderr, environment or arbitrary thrown-object properties are exposed.
+Extraction remains inside the original guarded computation budget.
+
+The advisory is always `origin:"source_throw"`, `trusted_origin:false` and
+`advisory:true`. It is source-authored text, not a host assertion, native fact,
+control capability or gameplay verdict. Every worker/guardian/host boundary
+checks its exact shape and current realm hash. Other fault origins cannot carry
+this diagnostic. Source failure and trusted evaluation timing settle once under
+the original request deadline; cleanup uncertainty remains a separate failure.
+Arbitrary host exceptions and forged diagnostic-shaped objects stay redacted.
+
 Sampling pins the exact producer and transition phase before awaiting a frame.
 If opening or retirement completes during an independent read, that frame is
 discarded before authored computation. The next decision uses a capture retained

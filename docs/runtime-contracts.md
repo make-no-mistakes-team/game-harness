@@ -971,7 +971,10 @@ actual tick/time, held keys and constrained pose describe input application.
 They do not establish damage, production or another world consequence.
 `effect_updates` retains up to eight later GUI receipts within 16 KiB,
 with original native times and an explicit omitted count. Receipts can
-remain unknown after confirmed input. Neither field exposes the private
+remain unknown after confirmed input. Only nonempty GUI operations produce
+these later effect receipts; world inputs and empty screen operations have
+application ACKs but no separate effect receipt. Input sequence, native tick
+and capture frame sequence are independent counters. Neither field exposes the private
 owner/scope grant. Distant/frustum sensing, incremental live geometry and
 multipart/nonliving effect attribution remain separate work.
 
@@ -1047,8 +1050,12 @@ Every held change then needs its matching press or release; inconsistent
 lists are rejected rather than repaired. Native input still requires a
 complete explicit list. Authors constructing explicit transitions must
 track submitted state separately from the potentially lagging `last_input`
-ACK. Before screen input, submit neutral held with omitted edges or exact
-releases. A non-running result retires without submitting its returned input.
+ACK. Screen input requires a neutral submitted world-held state. Release
+world buttons while the screen is absent: once a screen is visible, even
+neutral world input is forbidden. A newly opened raw channel already starts
+neutral; it needs no world-input barrier before its first screen input.
+The input returned during a producer switch is still discarded, not applied.
+A non-running result retires without submitting its returned input.
 
 ### Authored view motion
 
@@ -1180,8 +1187,10 @@ sequence and source, including confirmed prefixes with unknown suffixes.
 They can contribute adapter-owned verification facts without a finite
 `ActionView` or a second input owner.
 Visible cursor or slot changes can precede gesture completion. A dependent
-GUI operation waits for the matching application acknowledgment and terminal
-effect receipt; empty screen operations keep sampling while it is pending.
+GUI operation waits for the preceding nonempty gesture's matching application
+acknowledgment and terminal effect receipt; empty screen operations keep
+sampling while it is pending. Do not wait for a separate effect receipt for
+world input or an empty screen operation: neither produces one.
 An unknown result must not be replayed. Applicable terminal non-success
 resident summaries include `resident:{status,reason}`, with reason capped
 at 300 code units. The next ordinary failure feedback and retained source

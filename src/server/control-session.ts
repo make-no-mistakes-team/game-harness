@@ -531,6 +531,9 @@ export class ControlSession {
       this.session.restarts++; this.session.behavior_generation++;
       this.worker = await this.options.restartWorker!(this.abort.signal);
       if (!this.worker.activate) throw new Error("Recovery worker lacks reset-safe activation");
+      // The child may have settled before recovery started, leaving no retire()
+      // call to clear the transition marker. All previous emitters are drained.
+      this.session.producer = "none";
       this.data.state = structuredClone(this.options.initial_state); this.activated = false;
       this.options.record("session.reset_safe_restart", { reason, generation: this.session.behavior_generation,
         original_deadline_host_ms: this.options.deadline_host_ms, replayed_effects: false });

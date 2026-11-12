@@ -551,6 +551,10 @@ recovery after confirmed retirement and worker closure. The model's activation
 must reconsider fresh applicability. This resets explicit state; it does not
 restore a transactional checkpoint, replay edges or retry arbitrary source
 exceptions. Opaque and source faults remain quarantined.
+Once previous emitters and the old worker are drained and the clean worker is
+ready, fresh activation sees producer `"none"`, not the transition marker
+`"retiring"`. This also holds when a semantic child settled before the stale
+decision arrived; its original outcome and task high-water mark remain intact.
 The host checks the known raw lease both before sampling and after computation,
 before a running raw choice can renew or submit input. If it expires during
 computation, that result is discarded. A reset-safe session may use its remaining

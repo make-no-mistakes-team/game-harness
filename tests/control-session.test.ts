@@ -761,6 +761,57 @@ test("known expired raw leases recover before sampling the old channel under the
   await h.session.stop("complete");
 });
 
+test("recovery after a child settles during a stale decision admits fresh work instead of exposing a permanent retirement", async () => {
+  const h = harness(), returned = Promise.withResolvers<ExecutiveStepResult>(), closed = Promise.withResolvers<void>();
+  const unknown: GameActionResult = { status: "unknown", summary: "Native supervision expired after emission",
+    evidence: { world_effect_emitted: true, neutralized: true } };
+  const late: ExecutiveStepResult = { choice: { kind: "continue", handle: 1 },
+    next_state: { uncommitted: true }, status: "running", events: [terminalEvent] };
+  const freshInputs: { session: ExecutiveSnapshot; state: Json }[] = [];
+  h.options.config.recovery = "reset_safe"; h.options.config.max_restarts = 1;
+  const oldClose = h.options.worker.close;
+  h.options.worker.close = async () => { await closed.promise; await oldClose(); };
+  h.options.worker.step = async () => await returned.promise;
+  h.options.event = vi.fn();
+  h.options.restartWorker = async () => ({
+    async activate(frame, state) {
+      const session = executiveSnapshotSchema.parse(minecraftControllerFrameSchema.parse(frame).executive);
+      freshInputs.push({ session, state });
+      // A consumer must wait while retirement is reported, as the real executive did.
+      return { choice: session.producer === "retiring" ? { kind: "observe" } : { kind: "ensure_task", key: 2, request },
+        next_state: 1, status: "running", events: [] };
+    },
+    async step() { return { choice: { kind: "continue", handle: 2 }, next_state: 2, status: "running", events: [] }; },
+    async close() {},
+  });
+  try {
+    h.choose({ kind: "ensure_task", key: 1, request });
+    await h.session.start(); await h.clock.advance(50);
+    // Native expiry settles and retires the child before the delayed VM result arrives.
+    h.completed[0]!.result.resolve(unknown); await settle();
+    expect(h.session.snapshot().session).toMatchObject({ producer: "none", task_high_water: 1,
+      tasks: [{ handle: 1, status: "unknown" }] });
+    await h.clock.jump(350);
+    returned.resolve(late); await settle();
+    expect(h.session.snapshot()).toMatchObject({ status: "running", state: 1,
+      session: { producer: "retiring", task_high_water: 1, restarts: 0, deadline_host_ms: 10000 } });
+    expect(h.completed.map(task => task.handle)).toEqual([1]);
+    expect(h.options.event).not.toHaveBeenCalled();
+    closed.resolve(); await settle(); await h.clock.advance(100);
+    expect(freshInputs[0]).toMatchObject({ state: 0,
+      session: { producer: "none", behavior_generation: 2, task_high_water: 1, restarts: 1, deadline_host_ms: 10000 } });
+    expect(h.completed.map(task => task.handle)).toEqual([1, 2]);
+    expect(h.workerClosed).toBe(1);
+    expect(h.session.snapshot()).toMatchObject({ status: "running",
+      session: { producer: "task", task_high_water: 2, restarts: 1, deadline_host_ms: 10000 } });
+    expect(h.session.snapshot().session?.tasks.find(task => task.handle === 1)?.result).toEqual(unknown);
+    expect(h.session.snapshot().counters.steps).toBeGreaterThan(2);
+  } finally {
+    returned.resolve(late); closed.resolve();
+    await h.session.stop("End stale semantic settlement recovery proof");
+  }
+});
+
 test("an earlier application acknowledgment cannot delete a later outstanding input capture", async () => {
   const h = harness(); h.choose(rawChoice); await h.session.start(); await h.clock.advance(100);
   expect(h.sent.map(input => input.sequence)).toEqual([1, 2]);

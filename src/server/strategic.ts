@@ -1438,7 +1438,7 @@ export class StrategicPlanner {
               })),
             programs: workspace.catalog(0, 12),
             executions: this.store.skillExecutions(run.run_id).slice(0, 8).map((execution) => ({
-              ...workspace.executionSummary(execution),
+              ...workspace.executionSummary(execution, run),
               summary: (execution.result?.summary ?? execution.error)?.slice(0, 500) ?? null,
             })),
             feedback,

@@ -26,6 +26,7 @@ import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import { HistoryReader, HistoryReaderError } from "../src/server/history-reader.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { ProgramValidationError, validateProgramSource } from "../src/server/program-validation.ts";
+import { ProgramWorkspace } from "../src/server/program-workspace.ts";
 import { DiagnosticAgent, DIAGNOSTIC_PROGRAMS } from "../src/evaluation/diagnostic-agent.ts";
 import type { ReactiveRuntime } from "../src/server/reactive.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
@@ -1137,6 +1138,14 @@ for (const status of ["blocked", "failed", "cancelled", "unknown"] as const) {
     const predecessor = f.store.latestRootExecution(f.run.run_id)!;
     await waitClosed(f.store, f.run.run_id, predecessor.execution_id);
     expect(f.store.skillExecution(f.run.run_id, { execution_id: predecessor.execution_id })!.status).toBe(status);
+    if (status === "unknown") {
+      const retained = f.store.skillExecution(f.run.run_id, { execution_id: predecessor.execution_id })!;
+      const inspected = data(await f.call("program_inspect", { view: "execution", program: { name: "non-success predecessor" } }));
+      expect(inspected).toMatchObject({ status: "unknown", native_life_relation: "same_native_life",
+        error: retained.error, result: retained.result });
+      expect(f.store.skillExecution(f.run.run_id, { execution_id: predecessor.execution_id })).toEqual(retained);
+      expect(f.actions()).toBe(0);
+    }
     const result = data(await f.call("program_submit", { name: "must not implicitly recover", source, args: null, handoff: {
       name: old.name, version: old.version, execution_ordinal: old.execution_ordinal,
     } }));
@@ -2345,6 +2354,73 @@ test("actual execution and trace inspection preserve opaque model JSON keys and 
   const childResult = trace.records.find((record: { kind: string; capability: string }) => record.kind === "capability_result" && record.capability === "call");
   expect(childResult.payload.result.result).toEqual(opaque);
   expect(trace.records.find((record: { kind: string }) => record.kind === "observation").payload.data.blocks[0].target.target_id).toBe("authorized-block");
+});
+
+for (const boundary of ["same", "world", "session", "epoch", "life", "boot", "space"] as const) {
+  test(`named execution native-life relation follows ${boundary} identity, not authored death state`, async () => {
+    const f = fixture();
+    const input = { name: "authored death state",
+      source: 'return {status:"completed",summary:"Authored diagnostic only",result:{state:{dead:true,life_id:99,session_id:"authored-session",epoch:99,native_boot_id:"authored-boot"}}};',
+      args: null };
+    const admitted = data(await f.call("program_submit", input));
+    expect(admitted.start).toMatchObject({ status: "started", execution: { name: input.name, native_life_relation: "same_native_life" } });
+    const original = f.store.latestRootExecution(f.run.run_id)!;
+    await waitClosed(f.store, f.run.run_id, original.execution_id);
+    const inspect = async () => data(await f.call("program_inspect", { view: "execution", program: { name: input.name } }));
+    const before = await inspect();
+    expect(before).toMatchObject({ status: "succeeded", native_life_relation: "same_native_life",
+      result: { result: { state: { dead: true } } } });
+    const current = { ...f.run };
+    if (boundary === "world") f.run.world_id = crypto.randomUUID();
+    if (boundary === "session") f.run.session_id = "next-session";
+    if (boundary === "epoch") f.run.epoch++;
+    if (boundary === "life") f.run.life_id!++;
+    if (boundary === "boot") f.run.native_boot_id = "next-boot";
+    if (boundary === "space") f.run.space_epoch!++;
+    f.store.saveRun(f.run);
+    const after = await inspect();
+    expect(after).toEqual({ ...before, native_life_relation:
+      boundary === "same" || boundary === "space" ? "same_native_life" : "different_native_scope" });
+    for (const key of ["world_id", "session_id", "epoch", "native_boot_id", "life_id", "space_epoch", "current_authority", "alive", "dead"])
+      expect(after).not.toHaveProperty(key);
+    expect(f.dispatches()).toBe(1);
+    expect(f.actions()).toBe(0);
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+    Object.assign(f.run, current);
+    f.store.saveRun(f.run);
+    expect((await inspect()).native_life_relation).toBe("same_native_life");
+    f.setLife({ life_id: f.run.life_id!, status: "dead", can_respawn: true,
+      death: { death_id: "observed-death", at: "2026-10-22T00:00:00Z", message: "Native status is separate from identity" } });
+    expect((await inspect()).native_life_relation).toBe("same_native_life");
+  });
+}
+
+test("named execution native-life relation is unknown when original or current attribution is missing", async () => {
+  const f = fixture();
+  await f.write("missing native attribution");
+  await f.call("program_run", { operation: "start", name: "missing native attribution", args: null });
+  const original = f.store.latestRootExecution(f.run.run_id)!;
+  await waitClosed(f.store, f.run.run_id, original.execution_id);
+  const completed = f.store.skillExecution(f.run.run_id, { execution_id: original.execution_id })!;
+  const current = { ...f.run };
+  const workspace = new ProgramWorkspace(f.store, f.run.run_id);
+  const inspect = async () => data(await f.call("program_inspect", { view: "execution", program: { name: "missing native attribution" } }));
+  const before = await inspect();
+  for (const key of ["world_id", "session_id", "native_boot_id", "life_id"] as const) {
+    expect(workspace.executionSummary({ ...completed, [key]: undefined }, f.run).native_life_relation).toBe("unknown");
+    Object.assign(f.run, { [key]: null });
+    f.store.saveRun(f.run);
+    expect(await inspect()).toEqual({ ...before, native_life_relation: "unknown" });
+    Object.assign(f.run, current);
+    f.store.saveRun(f.run);
+    expect(await inspect()).toEqual(before);
+  }
+  expect(workspace.executionSummary(completed, { ...f.run, epoch: undefined }).native_life_relation).toBe("unknown");
+  expect(workspace.executionSummary(completed, null).native_life_relation).toBe("unknown");
+  expect(workspace.executionSummary(completed).native_life_relation).toBe("same_native_life");
+  expect(workspace.executionView(completed)?.native_life_relation).toBe("same_native_life");
+  expect(f.dispatches()).toBe(1);
+  expect(f.actions()).toBe(0);
 });
 
 test("feedback names every exact version and distinguishes neutral executions without objective event sequences", async () => {

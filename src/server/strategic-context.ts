@@ -3,7 +3,7 @@ import type { Context, Model } from "@oh-my-pi/pi-ai";
 import type { ActivityEvent, Json, ObservationV3, RuntimeAdapter } from "../shared/contracts.ts";
 import type { SkillExecutionView, SkillView } from "../shared/programs.ts";
 import { SKILL_API_VERSION } from "../shared/programs.ts";
-import { ProgramWorkspace, type ProgramSelector } from "./program-workspace.ts";
+import { executionNativeLifeRelation, ProgramWorkspace, type NamedExecutionReference, type ProgramSelector } from "./program-workspace.ts";
 import type { Store, StoredRun } from "./store.ts";
 import { z } from "zod";
 import { effectInvocationSchema, effectScopeSchema, identitySchema, safeCounterSchema, sameEffectScope, type EffectScope } from "../shared/control.ts";
@@ -11,6 +11,7 @@ import { revocationAckSchema } from "../shared/controller.ts";
 import { confirmedMinecraftGuiTransactions } from "../shared/minecraft.ts";
 import { residentReceiptSchema, type ResidentReceipt } from "./resident-evidence.ts";
 import { programExecutionHash } from "./program-modules.ts";
+import { controllerEventSchema } from "../shared/resident.ts";
 
 // Supplement only: the root prompt, current authorized observation, active SDK
 // tool/result pairs and the existing 8 KiB turn feedback have their own bounds.
@@ -24,6 +25,8 @@ const HELP_BYTES = 24 * 1024;
 const HELP_SECTION_BYTES = 6 * 1024;
 const MAX_UNRESOLVED = 8;
 const NOTE_BYTES = 2 * 1024;
+const CONTROLLER_EVENT_BYTES = 3 * 1024;
+const MAX_CONTROLLER_EVENTS = 4;
 interface Omission { kind: string; reference: string; reason: string; original_bytes?: number }
 interface HelpSection { topic: string; section: string; content: Json }
 interface HistoricalScope {
@@ -43,6 +46,15 @@ const controllerContainmentSchema = z.object({ operation_id: identitySchema, inp
 interface HistoricalNote {
   field: "current_subgoal" | "worksite"; event_seq: number; value: Json; original_scope: HistoricalScope;
   historical: true; current_authority: false; value_omitted?: true;
+}
+interface AuthoredControllerEvent {
+  event_seq: number; at: string; type: "controller.event";
+  author: "model"; gameplay_success_proof: false; historical: true; current_authority: false;
+  execution: NamedExecutionReference & { source_hash: string };
+  producer?: NamedExecutionReference & { source_hash: string; authored_module_hash: string };
+  original_scope: HistoricalScope & { epoch: number };
+  kind: "diagnostic" | "attention"; urgency: "ordinary" | "urgent";
+  summary: string; details: Json; summary_omitted?: true; details_omitted?: true;
 }
 interface AuthoredState {
   author: "model";
@@ -164,6 +176,12 @@ export class StrategicContext {
   private readonly helpSchemas = new WeakSet<HelpSection>();
   private actionHelpSection: string | null = null;
   private helpOmissions: Omission[] = [];
+  private authoredControllerEvents: AuthoredControllerEvent[] = [];
+  private omittedControllerEvents = 0;
+  private controllerBoundaryCursor = 0;
+  private controllerBoundaryEvent = 0;
+  private controllerKnowledgeScope = "";
+  private controllerEventFloor = 0;
 
   constructor(private readonly store: Store) {}
 
@@ -175,6 +193,9 @@ export class StrategicContext {
     this.adoptedScopes.clear();
     this.failure = null; this.unresolved.clear(); this.controllerAdmissions.clear(); this.omittedUnknown = 0;
     this.help = []; this.actionHelpSection = null; this.helpOmissions = [];
+    this.authoredControllerEvents = []; this.omittedControllerEvents = 0;
+    this.controllerBoundaryCursor = 0; this.controllerBoundaryEvent = 0;
+    this.controllerKnowledgeScope = ""; this.controllerEventFloor = 0;
   }
 
   private scope(run: StoredRun): void {
@@ -185,6 +206,7 @@ export class StrategicContext {
       if (this.knowledgeScope) this.experienceFloor = this.sourceFloor = this.store.lastEventSeq();
       this.knowledgeScope = knowledge; this.selected = []; this.authored.clear();
       this.unresolved.clear(); this.controllerAdmissions.clear(); this.omittedUnknown = 0; this.historicalNotes.clear(); this.lastExecutions.clear();
+      this.authoredControllerEvents = []; this.omittedControllerEvents = 0;
     }
     const dynamic = JSON.stringify([knowledge, run.session_id, run.life_id, run.native_boot_id, run.space_epoch]);
     if (dynamic !== this.dynamicScope) {
@@ -461,7 +483,71 @@ export class StrategicContext {
     }
   }
 
+  private refreshControllerBoundary(run: StoredRun): void {
+    // Run revisions are durable even when saveRun emitted no public event.
+    // Replay their ordering with event appends so context recreation cannot
+    // resurrect a previous task's facts (including task -> other -> task).
+    let page;
+    do {
+      page = this.store.historySourceChanges(run.run_id, this.controllerBoundaryCursor);
+      for (const change of page.records) {
+        if (change.kind === "event") this.controllerBoundaryEvent = Math.max(this.controllerBoundaryEvent, Number(change.source_key));
+        if (change.kind !== "run") continue;
+        const record = this.store.historySourceRecord(run.run_id, "run", change.source_key, change.change_seq);
+        const payload = record?.columns.payload;
+        const original = typeof payload === "string" ? object(JSON.parse(payload)) : null;
+        if (!original) continue;
+        const knowledge = JSON.stringify([run.run_id, original.task, original.world_id]);
+        if (this.controllerKnowledgeScope && knowledge !== this.controllerKnowledgeScope) {
+          this.controllerEventFloor = this.controllerBoundaryEvent;
+          this.authoredControllerEvents = []; this.omittedControllerEvents = 0;
+        }
+        this.controllerKnowledgeScope = knowledge;
+      }
+      this.controllerBoundaryCursor = page.next_after;
+    } while (page.has_more);
+  }
+
+  private rememberControllerEvent(run: StoredRun, event: ActivityEvent): void {
+    if (event.event_seq <= this.controllerEventFloor || this.controllerKnowledgeScope !== this.knowledgeScope) return;
+    const details = object(event.details), parsed = controllerEventSchema.safeParse(details?.event);
+    if (!parsed.success || details?.author !== "model" || details.gameplay_success_proof !== false ||
+        typeof details.execution_id !== "string") return;
+    const execution = this.store.skillExecution(run.run_id, { execution_id: details.execution_id });
+    if (!execution || !execution.source_hash || execution.world_id !== run.world_id || details.source_hash !== execution.source_hash) return;
+    const workspace = new ProgramWorkspace(this.store, run.run_id), reference = workspace.executionReference(execution.execution_id);
+    if (!reference) return;
+    let producer: AuthoredControllerEvent["producer"];
+    if (details.producer_execution_id !== undefined || details.producer_source_hash !== undefined) {
+      if (typeof details.producer_execution_id !== "string" || typeof details.producer_source_hash !== "string") return;
+      const source = this.store.skillExecution(run.run_id, { execution_id: details.producer_execution_id });
+      const named = source ? workspace.executionReference(source.execution_id) : null;
+      if (!source || !source.source_hash || !named || source.root_execution_id !== execution.execution_id ||
+          this.store.skill(run.run_id, source)?.hash !== details.producer_source_hash) return;
+      producer = { ...named, source_hash: source.source_hash, authored_module_hash: details.producer_source_hash };
+    }
+    const note = boundedNote(parsed.data.details, 512, true);
+    const record: AuthoredControllerEvent = {
+      event_seq: event.event_seq, at: event.at, type: "controller.event",
+      author: "model", gameplay_success_proof: false, historical: true, current_authority: false,
+      execution: { ...reference, source_hash: execution.source_hash }, ...(producer ? { producer } : {}),
+      original_scope: { ...this.eventScope(run, event), epoch: execution.epoch },
+      kind: parsed.data.kind, urgency: parsed.data.urgency, summary: parsed.data.summary.slice(0, 240),
+      details: note.value, ...(note.omitted ? { details_omitted: true } : {}),
+      ...(parsed.data.summary.length > 240 ? { summary_omitted: true } : {}),
+    };
+    this.authoredControllerEvents.push(record);
+    // Reserve envelope/relation overhead as well as the sanitized records.
+    const size = () => bytes(this.authoredControllerEvents.map(value => ({
+      ...value, native_life_relation: "different_native_scope",
+    }))) + 384;
+    while (this.authoredControllerEvents.length > MAX_CONTROLLER_EVENTS || size() > CONTROLLER_EVENT_BYTES) {
+      this.authoredControllerEvents.shift(); this.omittedControllerEvents++;
+    }
+  }
+
   private refresh(run: StoredRun): void {
+    this.refreshControllerBoundary(run);
     let page: ActivityEvent[];
     do {
       page = this.store.eventsAfter(run.run_id, this.cursor, 500);
@@ -487,6 +573,10 @@ export class StrategicContext {
               native_boot_id: details.native_boot_id, space_epoch: details.space_epoch });
             if (this.adoptedScopes.size > 32) this.adoptedScopes.delete(this.adoptedScopes.keys().next().value!);
           }
+        }
+        if (event.type === "controller.event") {
+          this.rememberControllerEvent(run, event);
+          continue;
         }
         if (event.event_seq <= this.experienceFloor) continue;
         if (["controller.admitted", "controller.receipted", "controller.retired", "controller.contained"].includes(event.type)) {
@@ -594,7 +684,7 @@ export class StrategicContext {
       status: submission.start.status, ...(submission.start.status === "unknown" ? { no_replay: true } : {}) };
     const execution = event.type === "skill.closed" && typeof details?.execution_id === "string"
       ? this.store.skillExecution(run.run_id, { execution_id: details.execution_id }) : null;
-    const resident = execution ? new ProgramWorkspace(this.store, run.run_id).executionSummary(execution).resident : null;
+    const resident = execution ? new ProgramWorkspace(this.store, run.run_id).executionSummary(execution, run).resident : null;
     const action = typeof details?.action_id === "string" ? this.store.getAction(run.run_id, details.action_id)?.view
       : event.type === "skill.closed" && typeof details?.execution_id === "string"
         ? this.store.selectedAction(run.run_id, "latest", details.execution_id) : null;
@@ -621,6 +711,7 @@ export class StrategicContext {
     const args = boundedNote(execution.args, 1024, true);
     const result = execution.result ? boundedNote(execution.result.result, 1024) : null;
     return { ...reference, historical: true, current_authority: false, gameplay_success_proof: false,
+      native_life_relation: executionNativeLifeRelation(execution, run),
       original_scope: { world_id: execution.world_id, session_id: execution.session_id, life_id: execution.life_id,
         native_boot_id: execution.native_boot_id, space_epoch: execution.space_epoch },
       status: execution.status, actions: execution.actions, calls: execution.calls, ...(resident ? { resident } : {}),
@@ -701,6 +792,12 @@ export class StrategicContext {
       current_subgoal: this.authoredState.current_subgoal !== undefined ? this.authoredState.current_subgoal
         : purpose && purpose !== "Unspecified by author" ? purpose.slice(0, 400) : null,
       authored_state: { ...this.authoredState },
+      authored_controller_events: {
+        author: "model", gameplay_success_proof: false, historical: true, current_authority: false,
+        history_reference: "Read the original record with program_inspect({view:'events',after:event_seq-1,limit:1}); each retained record names its execution.",
+        omitted_events: this.omittedControllerEvents,
+        records: [] as (AuthoredControllerEvent & { native_life_relation: ReturnType<typeof executionNativeLifeRelation> })[],
+      },
       historical_authored_state: { author: "model", gameplay_success_proof: false, current_authority: false, notes: historicalNotes },
       latest_failure: this.failure ? this.eventView(run, this.failure) : null, unresolved,
       programs: [] as { name: string; version: number; hash: string; source?: string; source_omission?: string;
@@ -823,6 +920,26 @@ export class StrategicContext {
       record.detail_omitted = true;
       if ("evidence" in detail) record.evidence_omitted = true;
       value.omitted_records++;
+    }
+    // Passive authored knowledge gets only the remaining budget, after safety,
+    // source/help and no-replay receipts. It never wakes or changes scheduling.
+    const feed = value.authored_controller_events;
+    if (this.omittedControllerEvents) omit({ kind: "authored_controller_events", reference: feed.history_reference,
+      reason: `${this.omittedControllerEvents}_older_events_count_or_byte_budget` });
+    for (const record of [...this.authoredControllerEvents].reverse()) {
+      const entry = { ...record, native_life_relation: executionNativeLifeRelation(record.original_scope, run) };
+      feed.records.unshift(entry);
+      if (Buffer.byteLength(encoded()) + 256 > INPUT_BYTES) {
+        feed.records.shift(); feed.omitted_events++;
+        omit({ kind: "authored_controller_event", reference: `event_seq:${record.event_seq}`,
+          reason: "request_byte_budget_use_named_execution_history" });
+      } else if (record.details_omitted || record.summary_omitted) {
+        omit({ kind: "authored_controller_event", reference: `event_seq:${record.event_seq}`,
+          reason: "bounded_note_fields_or_bytes_use_named_execution_history" });
+      }
+    }
+    while (Buffer.byteLength(encoded()) > INPUT_BYTES && omissions.length) {
+      omissions.pop(); value.omitted_records++;
     }
     return encoded();
   }

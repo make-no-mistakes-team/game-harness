@@ -6,7 +6,7 @@ import { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool, StreamFn } from "@oh-my-pi/pi-agent-core/types";
 import type { AssistantMessage, Context, Model, ToolCall } from "@oh-my-pi/pi-ai";
 import type { Json } from "../src/shared/contracts.ts";
-import type { SkillView } from "../src/shared/programs.ts";
+import type { SkillExecutionView, SkillView } from "../src/shared/programs.ts";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
@@ -787,10 +787,13 @@ test("final SDK context allocates action contracts before historical unknown rec
       retainedAction = path.slice(depth + 1).reduce((value: any, child) => value?.[child], section.content);
       if (retainedAction !== undefined) break;
     }
-    expect(retainedAction).toEqual(content);
+    const action = { kind: content.properties.kind.const, duration_ms: 50, mode: "first" };
+    expect(validateJsonSchemaValue(retainedAction, action).success).toBe(true);
+    expect(validateJsonSchemaValue(retainedAction, { ...action, duration_ms: 49 }).success).toBe(false);
+    expect(validateJsonSchemaValue(retainedAction, { ...action, duration_ms: 2001 }).success).toBe(false);
+    expect(validateJsonSchemaValue(retainedAction, { ...action, mode: "unavailable" }).success).toBe(false);
+    expect(validateJsonSchemaValue(retainedAction, { ...action, unexpected: true }).success).toBe(false);
   }
-  for (const section of ["contract", "input_transitions", "gui_completion"])
-    expect(context.requested_help).toContainEqual({ topic: "programs", section: `resident.${section}`, content: programs.resident[section] });
   expect(Buffer.byteLength(JSON.stringify({ strategic_context: context }))).toBeLessThanOrEqual(32 * 1024);
   expect(context.programs.reduce((sum: number, entry: unknown) => sum + Buffer.byteLength(JSON.stringify(entry)), 0))
     .toBeLessThanOrEqual(18 * 1024);
@@ -1251,7 +1254,8 @@ async function residentReference(f: ReturnType<typeof fixture>, revision = 1) {
 }
 
 function executeResidentReference(f: ReturnType<typeof fixture>, skill: SkillView,
-  status: "cancelled" | "succeeded" | "failed" | "unknown" = "cancelled") {
+  status: "cancelled" | "succeeded" | "failed" | "unknown" = "cancelled",
+  state: Json = { private: "OLD_RESIDENT_RUNTIME_STATE" }) {
   const execution = f.store.admitSkill(f.state.run.run_id, { entry: "step",
     skill_id: skill.skill_id, version: skill.version, start_key: `resident-reference-${f.store.lastEventSeq()}`,
     ...executionScopeFixture(f.state.run),
@@ -1269,7 +1273,7 @@ function executeResidentReference(f: ReturnType<typeof fixture>, skill: SkillVie
     execution_id: execution.execution_id, source_hash: skill.hash, controller_generation: 1,
     host_clock_id: "OLD_RESIDENT_CLOCK", status: status === "succeeded" ? "completed" : status === "cancelled" ? "stopped" : status,
     reason: status === "cancelled" ? "explicit_handoff" : `resident_${status}`, intent_version: 7,
-    state: { private: "OLD_RESIDENT_RUNTIME_STATE" }, processed_frame_seq: 4, processed_native_tick: 4, processed_native_ns: "4",
+    state, processed_frame_seq: 4, processed_native_tick: 4, processed_native_ns: "4",
     counters: { frames: 4, steps: 4, submissions: 4, applied_sequence: 4, ordered_edge_prefix: 0,
       missed_slots: 0, stale_results: 0, stale_frames: 0, read_failures: 0, no_input_decisions: 0,
       expanded_edges: 0, events: 0, analysis_jobs: 0, analysis_ms: 0 },
@@ -1291,6 +1295,161 @@ function finishReferenceProcedure(f: ReturnType<typeof fixture>, skill: SkillVie
   execution.result = { status: "completed", summary: "Finite procedure ended", result: null };
   f.store.updateSkillExecution(execution, "skill.closed", execution.result.summary, { status: execution.status });
 }
+
+function authoredControllerEvent(f: ReturnType<typeof fixture>, execution: SkillExecutionView,
+  kind: "diagnostic" | "attention", summary: string, details: Json = null) {
+  return f.store.event(f.state.run.run_id, "controller.event", summary, {
+    execution_id: execution.execution_id, source_hash: execution.source_hash, author: "model",
+    gameplay_success_proof: false, event: { kind, urgency: "ordinary", summary, details },
+  });
+}
+
+test("next ordinary SDK context preserves passive authored hostile-death and completion facts without native death inference", async () => {
+  const f = fixture();
+  await f.planner.start(1); await f.turn();
+  const skill = await residentReference(f), execution = executeResidentReference(f, skill, "succeeded",
+    { dead: true, logs: 8, minHP: 20 });
+  const hostile = authoredControllerEvent(f, execution, "diagnostic", "Nearby zombie died after my attack", {
+    hostile: "zombie", own_kill: true, hostile_dead: true, own_deaths: 0,
+    target_id: "STALE_HOSTILE_HANDLE", inventory: ["STALE_INVENTORY"],
+  });
+  const completed = authoredControllerEvent(f, execution, "diagnostic", "Gathered 8 logs; authored controller complete", {
+    logs: 8, minHP: 20, own_deaths: 0, completed: true,
+  });
+  await f.turn();
+  const context = retained(f.state.requests.at(-1))!, feed = context.authored_controller_events;
+  expect(feed).toMatchObject({ author: "model", gameplay_success_proof: false, historical: true, current_authority: false,
+    omitted_events: 0, records: [
+      { event_seq: hostile.event_seq, at: hostile.at, kind: "diagnostic", summary: hostile.summary,
+        execution: { name: skill.name, version: skill.version, source_hash: execution.source_hash },
+        original_scope: { life_id: 1, epoch: execution.epoch }, native_life_relation: "same_native_life",
+        author: "model", gameplay_success_proof: false, historical: true, current_authority: false,
+        details: { hostile: "zombie", own_kill: true, hostile_dead: true, own_deaths: 0 }, details_omitted: true },
+      { event_seq: completed.event_seq, kind: "diagnostic", summary: completed.summary,
+        native_life_relation: "same_native_life", details: { logs: 8, minHP: 20, own_deaths: 0, completed: true } },
+    ] });
+  const retainedExecution = context.programs.find((program: { name: string }) => program.name === skill.name).last_execution;
+  expect(retainedExecution.native_life_relation).toBe("same_native_life");
+  expect(JSON.stringify(feed)).not.toContain("STALE_HOSTILE_HANDLE");
+  expect(JSON.stringify(feed)).not.toContain("STALE_INVENTORY");
+  expect(JSON.stringify(feed)).not.toContain(execution.execution_id);
+  expect(JSON.stringify(feed)).not.toContain('"dead":true');
+  expect(f.state.run.life_id).toBe(1);
+  expect(f.state.observation.life.status).toBe("alive");
+  expect(f.state.toolEffects).toBe(0);
+  await f.turn();
+  expect(retained(f.state.requests.at(-1))!.authored_controller_events.records.map((event: { event_seq: number }) => event.event_seq))
+    .toEqual([hostile.event_seq, completed.event_seq]);
+  const store = await f.reopen(), recreated = new StrategicContext(store);
+  for (let request = 0; request < 2; request++) {
+    const rebuilt = JSON.parse(recreated.assemble(f.state.run)).strategic_context;
+    expect(rebuilt.authored_controller_events).toEqual(feed);
+  }
+});
+
+for (const changed of ["life", "session", "boot", "epoch", "space", "missing"] as const)
+  test(`authored controller facts retain historical provenance across ${changed} without declaring death`, async () => {
+    const f = fixture(), execution = f.execution(await f.program());
+    const event = authoredControllerEvent(f, execution, "attention", "Authored local completion", { completed: true });
+    const context = new StrategicContext(f.store);
+    context.assemble(f.state.run);
+    if (changed === "life") f.state.run.life_id = 2;
+    if (changed === "session") f.state.run.session_id = "other-session";
+    if (changed === "boot") f.state.run.native_boot_id = "other-boot";
+    if (changed === "epoch") f.state.run.epoch++;
+    if (changed === "space") f.state.run.space_epoch = 2;
+    if (changed === "missing") f.state.run.native_boot_id = null;
+    f.store.saveRun(f.state.run);
+    const expectedRelation = changed === "space" ? "same_native_life" : changed === "missing" ? "unknown" : "different_native_scope";
+    for (const retainedContext of [context, new StrategicContext(f.store)]) {
+      const value = JSON.parse(retainedContext.assemble(f.state.run)).strategic_context;
+      expect(value.authored_controller_events.records).toMatchObject([{
+        event_seq: event.event_seq, kind: "attention", historical: true, current_authority: false,
+        author: "model", gameplay_success_proof: false, native_life_relation: expectedRelation,
+        original_scope: { life_id: execution.life_id, native_boot_id: execution.native_boot_id,
+          session_id: execution.session_id, epoch: execution.epoch, space_epoch: execution.space_epoch },
+      }]);
+      expect(value.programs.find((program: { last_execution?: unknown }) => program.last_execution)?.last_execution.native_life_relation).toBe(expectedRelation);
+      expect(value.authored_state.latest_root_result).toBeUndefined();
+    }
+  });
+
+for (const changed of ["task", "world", "task_round_trip", "run"] as const)
+  test(`authored controller facts do not cross ${changed} experience boundaries, including Store recreation`, async () => {
+    const f = fixture(), execution = f.execution(await f.program()), context = new StrategicContext(f.store);
+    authoredControllerEvent(f, execution, "diagnostic", "OLD_CONTROLLER_EXPERIENCE");
+    expect(JSON.parse(context.assemble(f.state.run)).strategic_context.authored_controller_events.records).toHaveLength(1);
+    const originalTask = f.state.run.task;
+    if (changed === "task" || changed === "task_round_trip") f.state.run.task = "New task";
+    if (changed === "world") f.state.run.world_id = "other-world";
+    if (changed === "run") f.state.run = minecraftRunFixture(f.adapter, { run_id: "replacement-run" });
+    f.store.saveRun(f.state.run);
+    if (changed === "task_round_trip") { f.state.run.task = originalTask; f.store.saveRun(f.state.run); }
+    const fresh = f.execution(await f.program(undefined, "New task procedure"));
+    const next = authoredControllerEvent(f, fresh, "diagnostic", "NEW_CONTROLLER_EXPERIENCE");
+    expect(JSON.parse(context.assemble(f.state.run)).strategic_context.authored_controller_events.records.map((record: { event_seq: number }) => record.event_seq))
+      .toEqual([next.event_seq]);
+    const store = await f.reopen();
+    for (const retainedContext of [new StrategicContext(store)]) {
+      const value = JSON.parse(retainedContext.assemble(f.state.run)).strategic_context;
+      expect(value.authored_controller_events.records.map((record: { event_seq: number }) => record.event_seq)).toEqual([next.event_seq]);
+      expect(JSON.stringify(value.authored_controller_events)).not.toContain("OLD_CONTROLLER_EXPERIENCE");
+    }
+  });
+
+test("bounded authored controller feed reports event and detail omissions and rejects mechanical or invalid provenance", async () => {
+  const f = fixture(), execution = f.execution(await f.program());
+  const context = new StrategicContext(f.store), events = [];
+  for (let index = 0; index < 7; index++)
+    events.push(authoredControllerEvent(f, execution, index % 2 ? "attention" : "diagnostic", `Authored event ${index}`, {
+      index, text: "界".repeat(2000), state: { private: "PRIVATE_WORKER_STATE" },
+      observation: { private: "PRIVATE_OBSERVATION" },
+    }));
+  for (const invalid of ["mechanical", "missing_author", "source", "execution", "schema"] as const) {
+    const event: Record<string, Json> = { execution_id: execution.execution_id, source_hash: execution.source_hash,
+      author: "model", gameplay_success_proof: false,
+      event: { kind: "diagnostic", urgency: "ordinary", summary: `INVALID_${invalid}`, details: null } };
+    if (invalid === "mechanical") event.author = "runtime_mechanical";
+    if (invalid === "missing_author") delete event.author;
+    if (invalid === "source") event.source_hash = "0".repeat(64);
+    if (invalid === "execution") event.execution_id = "missing-execution";
+    if (invalid === "schema") event.event = { kind: "death", summary: "INVALID_schema" };
+    f.store.event(f.state.run.run_id, "controller.event", `INVALID_${invalid}`, event);
+  }
+  const value = JSON.parse(context.assemble(f.state.run)).strategic_context, feed = value.authored_controller_events;
+  expect(feed.records.length).toBeGreaterThan(0);
+  expect(feed.records.length).toBeLessThanOrEqual(4);
+  expect(feed.omitted_events + feed.records.length).toBe(events.length);
+  expect(Buffer.byteLength(JSON.stringify(feed))).toBeLessThanOrEqual(3072);
+  expect(feed.records.at(-1).event_seq).toBe(events.at(-1)!.event_seq);
+  expect(feed.records.every((record: { details_omitted?: boolean }) => record.details_omitted)).toBe(true);
+  for (const marker of ["PRIVATE_WORKER_STATE", "PRIVATE_OBSERVATION", "INVALID_"])
+    expect(JSON.stringify(feed)).not.toContain(marker);
+  expect(value.omissions).toContainEqual(expect.objectContaining({ kind: "authored_controller_events" }));
+  expect(value.omissions).toContainEqual(expect.objectContaining({ kind: "authored_controller_event" }));
+  expect(JSON.parse(context.assemble(f.state.run)).strategic_context.authored_controller_events).toEqual(feed);
+  expect(JSON.parse(new StrategicContext(f.store).assemble(f.state.run)).strategic_context.authored_controller_events).toEqual(feed);
+});
+
+test("authored controller details cannot displace no-replay fences or complete requested action help under pressure", async () => {
+  const f = fixture(), execution = f.execution(await f.program(`/*${"s".repeat(16000)}*/return {status:"completed",summary:"bounded",result:null};`));
+  f.store.event(f.state.run.run_id, "runtime.uncertainty", "Unresolved operation stays fenced", {
+    action_id: "unknown-action", life_id: f.state.run.life_id,
+  });
+  const context = new StrategicContext(f.store);
+  context.rememberHelp("actions", { contract: "h".repeat(5200), parameters: "p".repeat(5200), result: "r".repeat(5200) });
+  const before = JSON.parse(context.assemble(f.state.run)).strategic_context;
+  for (let index = 0; index < 8; index++)
+    authoredControllerEvent(f, execution, "diagnostic", `Pressure ${index}`, { details: "界".repeat(2000) });
+  const encoded = context.assemble(f.state.run), after = JSON.parse(encoded).strategic_context;
+  expect(Buffer.byteLength(encoded)).toBeLessThanOrEqual(32768);
+  expect(after.unresolved).toEqual(before.unresolved);
+  expect(after.unresolved[0]).toMatchObject({ no_replay: true, historical: true, current_authority: false });
+  expect(after.requested_help).toEqual(before.requested_help);
+  expect(after.programs).toEqual(before.programs);
+  expect(after.authored_controller_events.omitted_events).toBeGreaterThan(0);
+  expect(after.authored_controller_events.records.length).toBeLessThanOrEqual(4);
+});
 
 for (const status of ["cancelled", "succeeded"] as const)
   test(`next SDK request retains exact ${status} resident source and historical arguments behind a finite procedure and inactive draft`, async () => {

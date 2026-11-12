@@ -13,6 +13,19 @@ import { evidenceObject } from "./objective-metrics.ts";
 export type ProgramWorkspaceReadStore = Pick<StoreReadQueries, "namedSkill" | "programCatalog" | "selectedSkillExecution" | "executionReferences" | "skill" | "latestOpportunityForVersion" | "getRun" | "opportunity" | "historyProjectionGeneration" | "historyProjectionRow" | "historyProjectionRows">;
 export interface ProgramSelector { name: string; version?: number }
 export interface NamedExecutionReference { name: string; version: number; execution_ordinal: number }
+type NativeLifeScope = Partial<Pick<SkillExecutionView,
+  "world_id" | "session_id" | "epoch" | "native_boot_id" | "life_id">>;
+const NATIVE_LIFE_SCOPE_KEYS = ["world_id", "session_id", "epoch", "native_boot_id", "life_id"] as const;
+/** Identity relation only: neither liveness, effect authority nor a goal verdict. */
+export function executionNativeLifeRelation(original: NativeLifeScope, current: NativeLifeScope | null) {
+  if (!current) return "unknown" as const;
+  let missing = false;
+  for (const key of NATIVE_LIFE_SCOPE_KEYS) {
+    if (original[key] == null || current[key] == null) missing = true;
+    else if (original[key] !== current[key]) return "different_native_scope" as const;
+  }
+  return missing ? "unknown" as const : "same_native_life" as const;
+}
 interface EvidenceOmission { kind: string; id: string; reason: string; original_bytes: number; reference?: Json }
 export interface ModelReviewContext {
   opportunities: ImprovementOpportunity[];
@@ -121,7 +134,7 @@ export class ProgramWorkspace {
       ended_at: execution.ended_at, deadline_at: execution.deadline_at, args: field("args"), result: field("result"), error: execution.error, diagnostic: execution.diagnostic ?? null, omissions };
   }
 
-  executionSummary(execution: SkillExecutionView) {
+  executionSummary(execution: SkillExecutionView, currentRun: NativeLifeScope | null = this.store.getRun(this.runId)) {
     const program = this.store.skill(this.runId, execution);
     const resident = execution.entry === "step" &&
       (execution.status === "failed" || execution.status === "blocked" || execution.status === "unknown") &&
@@ -129,6 +142,7 @@ export class ProgramWorkspace {
       ? { status: execution.resident.status, reason: execution.resident.reason?.slice(0, 300) ?? null } : null;
     return { name: program.name, version: execution.version, execution_ordinal: this.executionReference(execution.execution_id)?.execution_ordinal ?? null,
       entry: execution.entry, status: execution.status, target: Object.hasOwn(unfinished, execution.status) ? "current" : "latest",
+      native_life_relation: executionNativeLifeRelation(execution, currentRun),
       actions: execution.actions, calls: execution.calls, resident,
       summary: (execution.result?.summary ?? execution.error)?.slice(0, 1000) ?? null };
   }

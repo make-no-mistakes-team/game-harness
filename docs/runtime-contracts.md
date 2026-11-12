@@ -330,6 +330,22 @@ An inferred hostile-death cue is not own-player death. The latter comes from
 native life status and transition evidence. Main must preserve that distinction
 and report uncertainty rather than inventing a death or a verified success.
 
+Execution projections include `native_life_relation`, computed from recorded
+world, session, connection epoch, native boot and player-life identities.
+`same_native_life` means those known identities match the current run;
+`different_native_scope` means at least one known identity differs; `unknown`
+means the comparison lacks an identity. A space-only transition does not create
+a new player life. This relation says nothing about whether the player is alive,
+whether an effect occurred or whether a goal succeeded. Historical records keep
+their original scope and remain non-authoritative for new effects.
+
+Compact Main context retains bounded `authored_controller_events` with original
+provenance and explicit omissions. Model-authored diagnostics can therefore
+remain available after a controller completes, even when they did not request
+attention. This is passive evidence delivery, not an extra wake, model request,
+native receipt or automatic goal verdict. Mechanical advisories retain their
+separate producer identity and are not relabelled as authored events.
+
 | Choice | Host behavior |
 | --- | --- |
 | `raw` with `input` | Select the ordinary input producer. A switch first retires the prior producer; a later fresh computation supplies the first input. |

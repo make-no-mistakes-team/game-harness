@@ -44,7 +44,7 @@ The executive root exports synchronous `step(frame,state,intent)` and
 `prepare_finish`. Semantic children use explicit `entry:"run"` with an async
 body, without a function wrapper, imports or exports. Pure test wrappers and
 libraries select `analyze` and `library` explicitly. Ordinary `program_write`
-and `program_submit` retain their `run` default. No entry is inferred from
+requires an explicit entry; `program_submit` retains its `run` default. No entry is inferred from
 source or retried as another format.
 
 Entry-format and module-entry rejections can include `entry_contract`:
@@ -56,6 +56,13 @@ parameter count is `null`; synchronous `step` and `analyze` require three and
 one parameters respectively. Both ordinary and source-only errors retain these
 bounded facts while stripping unrelated metadata. They do not select another
 entry, repair source, retain a rejected version or grant execution authority.
+
+Syntax errors retain the submitted source location and can identify a reserved
+keyword, duplicate binding or unexpected token. These hints classify known parser
+failures; they never forward parser messages, source identifiers, literals or
+host stack traces. An unrecognized parser failure retains the generic format
+error. A rejected write creates no source version and remains correctable within
+the original finite allowance.
 
 `prepare_finish` selects complete source for a bounded development trial, not
 an efficacy certificate or gameplay completion. Software checks are optional

@@ -405,6 +405,19 @@ function identifierIsReference(
   return node.type === "Identifier";
 }
 
+function syntaxHint(error: unknown): string {
+  if (!(error instanceof SyntaxError)) return "";
+  // Parser messages can contain arbitrary source identifiers and literals.
+  // Classify known failures without forwarding the message or source text.
+  if (/^(?:Unexpected keyword '[a-z]+'|The keyword '[a-z]+' is reserved) \(\d+:\d+\)$/.test(error.message))
+    return " A reserved JavaScript keyword is invalid here; it cannot be used as a binding.";
+  if (/^Identifier '[^'\r\n]+' has already been declared \(\d+:\d+\)$/.test(error.message))
+    return " A binding has already been declared in this scope.";
+  if (/^Unexpected token \(\d+:\d+\)$/.test(error.message))
+    return " Unexpected token; check the syntax at the reported location.";
+  return "";
+}
+
 function parseBody(source: string, kind: "skill" | "policy" | "guard") {
   const parameters = kind === "skill" ? "game, args" : kind === "guard" ? "observation, args" : "context, state";
   const prefix = `async function __gameharness_program(${parameters}) {\n"use strict";\n`;
@@ -440,7 +453,7 @@ function parseBody(source: string, kind: "skill" | "policy" | "guard") {
     throw new ProgramValidationError([
       issue(
         "invalid_syntax",
-        "Source must be a valid asynchronous JavaScript function body.",
+        "Source must be a valid asynchronous JavaScript function body." + syntaxHint(error),
         locate(position),
       ),
     ]);
@@ -491,7 +504,7 @@ function parseModule(source: string, kind: "step" | "analyze" | "library") {
     ast = parse(source, { ecmaVersion: "latest", sourceType: "module", ranges: true }) as unknown as SyntaxNode;
   } catch (error) {
     const position = typeof error === "object" && error !== null && "pos" in error && typeof error.pos === "number" ? error.pos : 0;
-    throw new ProgramValidationError([issue("invalid_syntax", "Source must be an ordinary JavaScript module.", locate(position))]);
+    throw new ProgramValidationError([issue("invalid_syntax", "Source must be an ordinary JavaScript module." + syntaxHint(error), locate(position))]);
   }
   const exports = nodes(ast.body).filter(node => node.type.startsWith("Export"));
   const imports = nodes(ast.body).filter(node => node.type === "ImportDeclaration");

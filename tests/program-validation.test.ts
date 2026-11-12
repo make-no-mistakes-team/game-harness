@@ -464,6 +464,27 @@ test("syntax errors and wrapper escapes return safe structured errors without so
   }
 });
 
+test("parser diagnostics never expose source identifiers or literal values in either entry format", async () => {
+  const secret = "PRIVATE_PARSER_SOURCE_VALUE";
+  for (const kind of ["skill", "analyze"] as const) {
+    for (const body of [
+      `const ${secret}=1; const ${secret}=2;`,
+      `const value="${secret}`,
+      `const ${secret}=;`,
+      `let switch="${secret}";`,
+      `let private="${secret}";`,
+    ]) {
+      const source = kind === "skill" ? body : `export function analyze(input) {\n${body}\n}`;
+      const error = await rejection(validateProgramSource(source, kind, fixtureContract), "invalid_syntax");
+      expect(JSON.stringify(preparationFailure(error))).not.toContain(secret);
+      const location = error.issues[0]!.location!;
+      expect(location.line).toBe(kind === "skill" ? 1 : 2);
+      expect(location.column).toBeGreaterThan(0);
+      expect(location.column).toBeLessThanOrEqual(body.length + 1);
+    }
+  }
+});
+
 test("ordinary coherent bodies may exceed eighty canonical lines within the byte cap", async () => {
   const body = `let total = 0;\n${"total += 1;\n".repeat(100)}return total;`;
   const admitted = await validateProgramSource(body, "skill", fixtureContract);

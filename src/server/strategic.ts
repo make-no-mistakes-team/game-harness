@@ -1542,9 +1542,9 @@ export class StrategicPlanner {
       if (authoring && !authoring.closed &&
           !["accepted", "running"].includes(this.store.skillExecution(run.run_id, { execution_id: authoring.root })?.status ?? ""))
         this.endAuthoring(authoring, "root_settled", false);
-      // Confirm authoring transport release before the queued root outcome can
-      // obtain this single owner. This never touches the playing root.
-      if (this.authoringEnded) {
+      // Confirm canceled transport release before any queued signal can obtain
+      // this single owner. This never touches the playing root.
+      if (this.authoringEnded || deadlineReached) {
         const drains = [...this.streamDrains.values()];
         await Promise.all(drains.flatMap(stream => [stream.close(), stream.drained]));
       }
@@ -1582,6 +1582,37 @@ export class StrategicPlanner {
       });
       this.host.persist();
       return;
+    }
+    if (deadlineReached && !this.providerFailed && !this.providerAborted &&
+      !this.authoringEnded && this.turnCalls > 0) {
+      const root = this.store.latestRootExecution(run.run_id);
+      const continuing = this.host.programPending() && root?.entry === "step" && root.session &&
+        root.status === "running" && root.ended_at === null &&
+        root.parent_execution_id === null && root.root_execution_id === root.execution_id &&
+        root.run_generation === generation && root.world_id === run.world_id &&
+        root.session_id === run.session_id && root.epoch === run.epoch &&
+        root.life_id !== null && root.life_id === run.life_id &&
+        root.native_boot_id !== null && root.native_boot_id === run.native_boot_id &&
+        root.space_epoch !== null && root.space_epoch === run.space_epoch &&
+        root.compatibility_hash === run.compatibility_hash && root.source_hash !== null &&
+        root.resident?.status === "running" && typeof root.resident.processed_frame_seq === "number" &&
+        root.resident.processed_frame_seq > 0 &&
+        root.resident.cleanup.worker === "open" && root.resident.cleanup.native === "open" &&
+        Date.parse(root.deadline_at) > Date.now();
+      if (continuing) {
+        run.model_status = "idle";
+        this.store.event(run.run_id, "scheduler.turn_deferred",
+          "Finite Main window expired; existing scoped executive authority remains unchanged", {
+            turn_id: turnId, root_execution_id: root.execution_id, source_hash: root.source_hash,
+            original_root_deadline_at: root.deadline_at, calls: this.turnCalls, tools: this.turnToolCalls,
+            deadline_reached: true, provider_failed: false, provider_aborted: false,
+            selected_feedback_consumed: false, automatic_retry: false,
+          });
+        // No retry/wake or control renewal here. Only a new ordinary signal can
+        // request another decision; the executive retains its original budgets.
+        this.host.persist();
+        return;
+      }
     }
     if (
       this.providerFailed || this.providerAborted ||

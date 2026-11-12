@@ -1734,8 +1734,9 @@ also settles that decision. The complete current SDK tool group returns first;
 the next request boundary ends the loop without another provider request.
 The selected timer supplies a fresh ordinary turn rather than continuing the
 old transcript. Foreground execution and its original deadlines remain unchanged.
-Provider failures and a deadline reached before a valid selection still retain
-their ordinary failure handling.
+Provider failures retain their ordinary failure handling. A host-only decision
+deadline does not grant a selection or another request; the scoped-executive
+continuation rule below determines whether the body can remain admitted.
 
 Saving an inactive version does not alter the running version. Updating intent changes only the JSON passed to `step`; code that ignores those fields does not change behavior. Only one playing root, whether `run` or `step`, may be live or retiring. Another start refuses without cancellation and points to explicit `handoff`; retiring work has a separate refusal. Durable retries still return the original admission, and declared child composition and pure analysis retain their existing rules. Both resident steps and bounded async semantic-feedback loops can overlap strategic inference. Choosing raw input does not waive progress checks or make a long-lived worker useful.
 
@@ -1749,7 +1750,21 @@ Before deliberately aborting an in-flight authoring request, the host captures i
 
 Every strategic `Agent.abort()` uses one private request owner. Before invoking the SDK, it records the first cancellation intent against the exact active admitted request; repeated fence/close calls cannot replace that cause. A terminal-received latch prevents reconciliation or event subscribers from adding provenance after the terminal callback has begun. Actual root-bound authoring cancellation keeps the marker above. Cancellation of an ordinary planning, recovery or review request, or of a speculative request, instead uses `host_cancellation:{kind:"strategic_host",request_id,reason}` without a root field. Lifecycle reasons are `fenced` for authority fencing, `speculative_preempted` for a meaningful wake that cancels optional lookahead, and `turn_deadline` for the existing finite turn timer. The settlement retains its admitted role. Fencing and speculative preemption make the response obsolete; a turn deadline can cancel a still-current request.
 
-Only a final SDK `aborted` response with intent captured before its callback qualifies as trusted host cancellation. The request owner and live/read-only evaluation consumers share the close-reason contract, including urgent resident attention and reactive interruption. This suppresses provider-outage classification while preserving raw recovery metadata, usage uncertainty and the complete request history. A generic turn deadline still fails and pauses the ordinary turn with cause `deadline`; it cannot count as successful progress or consume selected feedback. Provider errors, recovered non-abort responses, unmarked provider aborts, unsettled requests and unconfirmed transport drain retain their existing failure handling. Cancellation never grants tools or restores revoked effect authority.
+Only a final SDK `aborted` response with intent captured before its callback qualifies as trusted host cancellation. The request owner and live/read-only evaluation consumers share the close-reason contract, including urgent resident attention and reactive interruption. This suppresses provider-outage classification while preserving raw recovery metadata, usage uncertainty and the complete request history. A generic turn deadline cannot count as successful progress or consume selected feedback. Provider errors, recovered non-abort responses, unmarked provider aborts, unsettled requests and unconfirmed transport drain retain their existing failure handling. Cancellation never grants tools or restores revoked effect authority.
+
+After an admitted Main request, host-only expiry of the finite decision window
+may leave an existing executive running. The host first joins canceled transport
+ownership, then requires a running, unended `step` executive with a processed
+frame, open worker/native state and the exact current run generation,
+world/session/epoch/life/boot/space/compatibility scope. Its original root
+deadline must still be in the future. This records `scheduler.turn_deferred`
+and idle model status, not successful planning. Selected feedback remains
+unconsumed. No request retry, wake, control renewal, worker restart or extension
+of any root/authoring allowance is issued. A new ordinary signal can request
+another finite decision through the existing scheduler. If these predicates
+are unavailable, or there is a genuine provider failure/abort, the existing
+pause behavior remains. This preserves already authorized local software;
+it supplies neither a fallback fighter nor evidence that the software is useful.
 
 Each admitted request also bounds generated string prefixes against its actual
 advertised tool schemas. Strict root objects have a decoded property-name bound

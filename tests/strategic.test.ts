@@ -16,12 +16,15 @@ import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { HistoryReader } from "../src/server/history-reader.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import type { HistoryQueryOptions } from "../src/server/history-protocol.ts";
+import { validateSkill } from "../src/server/program-validation.ts";
+import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
+import { controlSessionConfigSchema } from "../src/shared/control-session.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import {
   StrategicPlanner,
   type StrategicHost,
 } from "../src/server/strategic.ts";
-import { minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter } from "./helpers/adapter-contract.ts";
+import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 import { finishHistoryExecution, historyExecution, historySpec } from "./helpers/history-fixture.ts";
 
 type Gate = Parameters<Agent["setBeforeModelCall"]>[0];
@@ -263,6 +266,93 @@ async function pendingRoot(fixture: ReturnType<typeof setup>, name = "Continuing
   fixture.state.pending = true;
   return root;
 }
+
+/** Real immutable/admission records; no sandbox, native control or gameplay claim. */
+async function pendingExecutive(f: ReturnType<typeof setup>, durationMs = 360000) {
+  const source = await f.store.registerSkill(f.run.run_id, await validateSkill({
+    entry: "step", name: "Finite executive owner",
+    source: "export function activate(frame,state,intent){return step(frame,state,intent)} export function step(frame,state,intent){return {choice:{kind:'raw',input:null},next_state:state,status:'running',events:[]}}",
+    dependencies: [], card: { purpose: "Decision ownership", applicability: "Storage-only test",
+      method: "Retain original admission", reason: "Host expiry", limitations: "No gameplay proof" },
+  }, minecraftTestAdapter()));
+  const execution = f.store.admitSkill(f.run.run_id, { entry: "step",
+    skill_id: source.skill_id, version: source.version, start_key: crypto.randomUUID(),
+    ...executionScopeFixture(f.run), args: null, initial_state: null,
+    limits: { ...DEFAULT_RESIDENT_LIMITS, duration_ms: durationMs, max_frames: 7200, max_steps: 7200 },
+    session: controlSessionConfigSchema.parse({ schema_version: 1 }),
+  }).view;
+  if (execution.entry !== "step") throw new Error("Expected executive admission");
+  execution.status = "running"; execution.started_at = new Date().toISOString();
+  const timing = { count: 0, p50: null, p95: null, p99: null, max: null, omitted_samples: 0 };
+  execution.resident = {
+    execution_id: execution.execution_id, source_hash: source.hash, controller_generation: 1,
+    host_clock_id: "storage-only-clock", status: "running", reason: null, intent_version: 0,
+    state: null, processed_frame_seq: 1, processed_native_tick: 1, processed_native_ns: "1",
+    counters: { frames: 1, steps: 1, submissions: 0, applied_sequence: 0, ordered_edge_prefix: 0,
+      missed_slots: 0, stale_results: 0, stale_frames: 0, read_failures: 0, no_input_decisions: 1,
+      expanded_edges: 0, events: 0, analysis_jobs: 0, analysis_ms: 0 },
+    pending: { frames: 0, edges: 0, analysis: false }, last_input: null,
+    timings: { step_ms: timing, input_age_ms: timing }, events: [],
+    cleanup: { worker: "open", native: "open" },
+  };
+  f.store.updateSkillExecution(execution, "skill.running", "Storage-only executive admission metadata");
+  f.state.pending = true;
+  return execution;
+}
+
+test("Main expiry preserves a scoped finite executive until a fresh decision signal", async () => {
+  let calls = 0, now = Date.now();
+  let f: ReturnType<typeof setup>;
+  f = setup(async (_text, agent) => {
+    expect(await callGate(agent)).toBeUndefined();
+    if (++calls === 1) now = Reflect.get(f.planner, "turnDeadline") as number;
+    agent.emit({});
+  });
+  const root = await pendingExecutive(f), originalDeadline = root.deadline_at;
+  // Advance only the host wall-clock boundary after real history preparation.
+  // Global fake timers would also suspend the worker-backed history protocol.
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  await f.planner.start(1);
+  const deferred = f.event("scheduler.turn_deferred");
+  f.planner.wake("preflight_ready"); await deferred;
+  expect(f.state.pauseCauses).toEqual([]);
+  expect(f.run.model_status).toBe("idle");
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id }))
+    .toMatchObject({ status: "running", ended_at: null, deadline_at: originalDeadline });
+  expect(Reflect.get(f.planner, "contextCursor")).toBe(0);
+  expect(f.state.prompts).toBe(1);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "scheduler.turn_started")).toHaveLength(1);
+  const finished = f.event("scheduler.turn_finished");
+  const attention = f.store.event(f.run.run_id, "controller.event", "New model-authored attention after expiry", {
+    event: { kind: "attention", urgency: "ordinary", summary: "New bounded decision needed", details: null },
+  });
+  f.planner.wake("resident_attention");
+  await finished;
+  expect(f.state.prompts).toBe(2);
+  expect((f.state.contexts[1]?.feedback as { event_seq: number }[]).map(event => event.event_seq)).toContain(attention.event_seq);
+  expect(f.state.pauseCauses).toEqual([]);
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })?.deadline_at).toBe(originalDeadline);
+});
+
+for (const fault of ["replaced_native_scope", "root_deadline", "provider_failure"] as const)
+test(`expired Main cannot defer on ${fault}`, async () => {
+  let f: ReturnType<typeof setup>;
+  f = setup(async (_text, agent) => {
+    await callGate(agent);
+    const deadline = Reflect.get(f.planner, "turnDeadline") as number;
+    vi.spyOn(Date, "now").mockReturnValue(deadline);
+    if (fault === "replaced_native_scope") f.run.native_boot_id = "replacement-native";
+    agent.emit(fault === "provider_failure"
+      ? { stopReason: "error", errorMessage: "Controlled provider failure" } as Partial<Assistant>
+      : {});
+  });
+  await pendingExecutive(f, fault === "root_deadline" ? 120000 : 360000);
+  await f.planner.start(1);
+  const failed = f.event("scheduler.turn_failed");
+  f.planner.wake("preflight_ready"); await failed;
+  expect(f.state.pauses).toHaveLength(1);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event => event.type === "scheduler.turn_deferred")).toBe(false);
+});
 
 for (const delivery of ["resolve", "reject"] as const)
 for (const revoke of ["fence", "generation", "phase"] as const)

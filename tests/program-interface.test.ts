@@ -138,7 +138,7 @@ function fixture(runner?: SandboxService["runSkill"], hooks: { action?: SkillHos
   return { directory, store, run, manager, planning, learning, history, prepareFeedback, catalog, tools, call, toolHost, actions: () => actions, dispatches: () => dispatches,
     observation, setLife: (value: ObservationV3["life"]) => { life = value; },
     fence: () => { generation++; manager.fence("Fixture fenced"); planning.invalidate("cancelled"); },
-    write: (name: string, body = source, options: Record<string, unknown> = {}, id?: string) => call("program_write", { name, source: body, card, dependencies: [], ...options }, id),
+    write: (name: string, body = source, options: Record<string, unknown> = {}, id?: string) => call("program_write", { entry: "run", name, source: body, card, dependencies: [], ...options }, id),
   };
 }
 
@@ -372,7 +372,7 @@ test("installed Agent rejects explicit invalid actor limits without source persi
 test("unknown tool fields are named without their values and permit an explicit corrected non-admitted write", async () => {
   const f = fixture(), id = "unknown-field-correction";
   const rejected = await f.call("program_write", {
-    name: "field correction", source, budget: { private_value: "NOT_AN_ERROR_DIAGNOSTIC_VALUE" },
+    entry: "run", name: "field correction", source, budget: { private_value: "NOT_AN_ERROR_DIAGNOSTIC_VALUE" },
   }, id);
   expect(rejected.isError).toBe(true);
   expect(data(rejected).error).toMatchObject({
@@ -443,7 +443,7 @@ test("SDK raw invalid limits cannot replay a prior valid normalized submission i
 test("SDK raw prototype keys cannot supply inherited start arguments", async () => {
   const f = fixture();
   const saved = await agentCalls(f.tools(), [{ type: "toolCall", id: "prototype-write", name: "program_write",
-    arguments: { name: "prototype target", source } }]);
+    arguments: { entry: "run", name: "prototype target", source } }]);
   expect(saved[0]!.isError).toBe(false);
   const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: "prototype-start", name: "program_run",
     arguments: JSON.parse('{"__proto__":{"operation":"start","name":"prototype target","args":null}}') }]);
@@ -465,44 +465,27 @@ test("malformed SDK argument JSON remains SDK-owned rather than a fabricated har
   expect(f.dispatches()).toBe(0);
 });
 
-test("installed Agent registers minimal program_write input with real untested metadata and source", async () => {
-  const f = fixture();
-  const replies = await agentCalls(f.tools(), [
-    { type: "toolCall", id: "minimal-sdk-write", name: "program_write", arguments: { name: "sdk ordinary reader", source } },
-  ]);
-  expect(replies).toHaveLength(1);
-  expect(replies[0]!.isError).toBe(false);
-  expect(data(replies[0]!)).toMatchObject({ name: "sdk ordinary reader", version: 1, state: "validated" });
-  const stored = f.store.namedSkill(f.run.run_id, "sdk ordinary reader", 1)!;
-  expect(stored).not.toBeNull();
-  expect(stored.dependencies).toEqual([]);
-  expect(stored.card.applicability).toMatch(/unspecified/i);
-  expect(stored.card.limitations).toMatch(/untested/i);
-  expect(typeof stored.source).toBe("string");
-  expect(stored.source.length).toBeGreaterThan(0);
-  expect(f.store.skills(f.run.run_id)).toHaveLength(1);
-  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
-  expect(f.actions()).toBe(0);
-});
-
 test("installed Agent rejects malformed program input and host-forbidden writes without creating artifacts", async () => {
   const f = fixture();
   const tools = f.tools();
   const malformed = await agentCalls(tools, [
-    { type: "toolCall", id: "sdk-missing-source", name: "program_write", arguments: { name: "missing source" } },
-    { type: "toolCall", id: "sdk-invalid-body", name: "program_write", arguments: { name: "invalid body", source: "return {", card, dependencies: [] } },
+    { type: "toolCall", id: "sdk-missing-source", name: "program_write", arguments: { entry: "run", name: "missing source" } },
+    { type: "toolCall", id: "sdk-invalid-body", name: "program_write", arguments: { entry: "run", name: "invalid body", source: "return {", card, dependencies: [] } },
   ]);
   expect(malformed).toHaveLength(2);
   expect(malformed.every((reply) => reply.isError)).toBe(true);
   expect(data(malformed[1]!).error.code).toBe("invalid_program");
-  const forged = await f.call("program_write", { name: "forged authority", source, run_id: "caller-owned-run" });
+  const missingEntry = await f.call("program_write", { name: "unselected module format",
+    source: "export function step(frame,state,intent) { return null; }" });
+  expect(data(missingEntry).error.code).toBe("invalid_request");
+  const forged = await f.call("program_write", { entry: "run", name: "forged authority", source, run_id: "caller-owned-run" });
   expect(forged.isError).toBe(true);
   expect(data(forged).error.code).toBe("invalid_request");
   expect(f.store.skills(f.run.run_id)).toHaveLength(0);
   // Captured ordinary tools must still enforce current host authority.
   f.run.status = "stopped";
   const forbidden = await agentCalls(tools, [
-    { type: "toolCall", id: "sdk-forbidden-write", name: "program_write", arguments: { name: "forbidden write", source, card, dependencies: [] } },
+    { type: "toolCall", id: "sdk-forbidden-write", name: "program_write", arguments: { entry: "run", name: "forbidden write", source, card, dependencies: [] } },
   ]);
   expect(forbidden).toHaveLength(1);
   expect(forbidden[0]!.isError).toBe(true);
@@ -595,7 +578,7 @@ for (const toolName of ["program_write", "program_submit"] as const) {
     expect(feedback).toHaveLength(1);
     expect(feedback[0]!.version.version).toBe(1);
     const revisionCard = { ...card, reason: "Repair the stored source before its first execution" };
-    const input = { name, source, card: revisionCard, based_on: 2,
+    const input = { entry: "run", name, source, card: revisionCard, based_on: 2,
       ...(toolName === "program_submit" ? { args: null } : {}) };
     const refused = await f.call(toolName, { ...input, reason: "Link a candidate to this exact parent's outcome" });
     expect(refused.isError).toBe(true);
@@ -1717,10 +1700,10 @@ test("actual catalogs and dispatch share ordinary, speculative, advanced-module 
   const speculative = f.tools();
   expect(speculative.some((tool) => tool.name === "prepare_next")).toBe(true);
   expect(speculative.some((tool) => tool.name === "program_run" || tool.name === "program_submit" || tool.name === "task_finish")).toBe(false);
-  const saved = await f.call("program_write", { name: "prepared during execution", source, card, dependencies: [] }, "inactive-spec-write", ordinary);
+  const saved = await f.call("program_write", { entry: "run", name: "prepared during execution", source, card, dependencies: [] }, "inactive-spec-write", ordinary);
   expect(saved.isError).not.toBe(true);
   expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
-  const assessment = await f.call("program_write", { name: "candidate", based_on: 1, source,
+  const assessment = await f.call("program_write", { entry: "run", name: "candidate", based_on: 1, source,
     reason: "Speculation cannot resolve an outcome" }, "forbidden-spec-assessment", ordinary);
   expect(data(assessment).error.code).toBe("forbidden");
   expect(f.store.namedSkill(f.run.run_id, "candidate")!.version).toBe(1);
@@ -1776,7 +1759,7 @@ test("installed Agent cannot use captured playing tools during authoring and sav
     { type: "toolCall", id: "blocked-memory", name: "memory", arguments: { operation: "load", name: "unexpected" } },
     { type: "toolCall", id: "blocked-review", name: "program_review", arguments: { name: "foreground", decision: "keep", reason: "Unauthorized assessment" } },
     { type: "toolCall", id: "blocked-prepare", name: "prepare_next", arguments: { name: "foreground", args: null } },
-    { type: "toolCall", id: "blocked-experiment", name: "program_write", arguments: { name: "foreground", based_on: 1, source, reason: "Unauthorized outcome linkage" } },
+    { type: "toolCall", id: "blocked-experiment", name: "program_write", arguments: { entry: "run", name: "foreground", based_on: 1, source, reason: "Unauthorized outcome linkage" } },
   ];
   const rejected = await agentCalls([...ordinary, prepared], forbidden);
   expect(rejected).toHaveLength(forbidden.length);
@@ -1786,8 +1769,8 @@ test("installed Agent cannot use captured playing tools during authoring and sav
   }
   const revised = 'return {status:"completed",summary:"Inactive candidate",result:2};';
   const drafts = await agentCalls(f.tools(), [
-    { type: "toolCall", id: "inactive-revision", name: "program_write", arguments: { name: "foreground", based_on: 1, source: revised, card: { ...card, reason: "Inert candidate motivation" } } },
-    { type: "toolCall", id: "inactive-helper", name: "program_write", arguments: { name: "future helper", source } },
+    { type: "toolCall", id: "inactive-revision", name: "program_write", arguments: { entry: "run", name: "foreground", based_on: 1, source: revised, card: { ...card, reason: "Inert candidate motivation" } } },
+    { type: "toolCall", id: "inactive-helper", name: "program_write", arguments: { entry: "run", name: "future helper", source } },
     { type: "toolCall", id: "read-original", name: "program_inspect", arguments: { view: "source", name: "foreground", version: 1 } },
     { type: "toolCall", id: "authoring-observe", name: "observe", arguments: {} },
   ]);
@@ -1811,7 +1794,7 @@ test("installed Agent cannot use captured playing tools during authoring and sav
   expect(f.tools().some(tool => tool.name === "program_review")).toBe(true);
   expect(f.tools().find(tool => tool.name === "program_write")!.parameters).toHaveProperty("properties.reason");
   const review = await agentCalls(f.tools(), [
-    { type: "toolCall", id: "review-precedence", name: "program_write", arguments: { name: "foreground", based_on: 2, source, reason: "Use review rather than authoring authority" } },
+    { type: "toolCall", id: "review-precedence", name: "program_write", arguments: { entry: "run", name: "foreground", based_on: 2, source, reason: "Use review rather than authoring authority" } },
   ]);
   expect(data(review[0]!).error.code).toBe("precondition_failed");
   release.resolve();
@@ -1872,7 +1855,7 @@ for (const boundary of ["root_settlement", "stop", "role_change"] as const) {
       return await register(...args);
     };
     const pending = agentCalls(f.tools(), [
-      { type: "toolCall", id: `late-draft-${boundary}`, name: "program_write", arguments: { name: "late draft", source } },
+      { type: "toolCall", id: `late-draft-${boundary}`, name: "program_write", arguments: { entry: "run", name: "late draft", source } },
     ]);
     await validationReady.promise;
     if (boundary === "root_settlement") {
@@ -2084,7 +2067,7 @@ for (const name of ["program_write", "program_submit", "program_review"] as cons
       };
       const input = name === "program_review"
         ? { name: "preparation parent", version: 1, decision: "keep", reason: "Assess the exact original outcome" }
-        : { name: "preparation parent", based_on: 1, source, reason: "A changed candidate needs fresh authority", ...(name === "program_submit" ? { args: null } : {}) };
+        : { entry: "run", name: "preparation parent", based_on: 1, source, reason: "A changed candidate needs fresh authority", ...(name === "program_submit" ? { args: null } : {}) };
       const tool = f.tools().find(entry => entry.name === name)!;
       const reply = await tool.execute(`cancel-${name}-${boundary}`, input, controller.signal);
       expect(data(reply).error.code).toBe("stale_context");
@@ -2260,7 +2243,7 @@ test("stop fences the actual named execution and stale tool closures cannot writ
   await waitClosed(f.store, f.run.run_id, root.execution_id);
   expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })!.status).toBe("cancelled");
   const old = f.tools(); f.fence();
-  expect((await f.call("program_write", { name: "stale", source, card, dependencies: [] }, "stale-call", old)).isError).toBe(true);
+  expect((await f.call("program_write", { entry: "run", name: "stale", source, card, dependencies: [] }, "stale-call", old)).isError).toBe(true);
   expect(f.store.namedSkill(f.run.run_id, "stale")).toBeNull();
   expect(f.actions()).toBe(0);
 });
@@ -2510,7 +2493,7 @@ test("Codex wire preserves optional program arguments and discriminants through 
     // https://developers.openai.com/api/docs/guides/function-calling#strict-mode
     return adaptSchemaForStrict(declaration.parameters, declaration.strict ?? true).schema;
   };
-  const creation = { name: "wire neutral", source, card, dependencies: [] };
+  const creation = { entry: "run", name: "wire neutral", source, card, dependencies: [] };
   expect(validateJsonSchemaValue(wireSchema("program_write"), creation)).toEqual({ success: true, issues: [] });
   const admitted = data(await f.call("program_write", creation, "wire-create", tools));
   expect(admitted).toMatchObject({ name: "wire neutral", version: 1, state: "validated" });
@@ -2687,7 +2670,7 @@ test("all default-bearing tool declarations accept omitted inputs without weaken
   expect(f.planning.begin()).not.toBeNull();
   const declarations = [...ordinary, ...f.tools()];
   const cases: { name: string; input: Record<string, unknown> }[] = [
-    { name: "program_write", input: { name: "default candidate", source } },
+    { name: "program_write", input: { entry: "run", name: "default candidate", source } },
     { name: "program_submit", input: { name: "default submitted candidate", source, args: null } },
     { name: "program_submit", input: { name: "default submitted candidate", source, args: null, next } },
     { name: "program_run", input: { operation: "start", name: "default predecessor", args: null } },
@@ -2780,14 +2763,13 @@ return {status:"completed",summary:"Read-only fixture completed",result:{total,s
   expect(f.actions()).toBe(0);
 });
 
-test("ordinary program_write can omit verbose card without inventing tested applicability", async () => {
+test("ordinary writes without cards still enforce immutable version lineage", async () => {
   const f = fixture();
-  const written = await f.call("program_write", { name: "ordinary reader", source, dependencies: [] });
+  const written = await f.call("program_write", { entry: "run", name: "ordinary reader", source, dependencies: [] });
   expect(written.isError).not.toBe(true);
   const inspected = data(await f.call("program_inspect", { view: "source", name: "ordinary reader", version: 1 }));
-  expect(JSON.stringify(inspected.card)).toMatch(/untested|unspecified/i);
   expect(inspected.state).toBe("validated");
-  expect((await f.call("program_write", { name: "ordinary reader", source, dependencies: [] })).isError).toBe(true);
+  expect(data(await f.call("program_write", { entry: "run", name: "ordinary reader", source, dependencies: [] })).error.code).toBe("conflict");
 });
 
 test("strategic observe supplies typed PNG through actual offline Codex transformation, never JSON evidence", async () => {

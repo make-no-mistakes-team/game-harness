@@ -1,12 +1,16 @@
 import { expect, test } from "bun:test";
-import { controllerStepResultSchema, residentActorLimitsSchema, residentLimitsSchema,
-  residentStateSchema, residentIntentSchema, residentJsonConstraint } from "../src/shared/resident.ts";
-import { programRunSchema, programSubmitSchema, programWriteSchema } from "../src/server/program-interface.ts";
+import {
+    controllerStepResultSchema, residentActorLimitsSchema, residentLimitsSchema,
+    residentStateSchema, residentIntentSchema, residentJsonConstraint
+} from "../src/shared/resident.ts";
+import { programRunSchema, programSubmitSchema } from "../src/server/program-interface.ts";
 import { skillStartRequestSchema } from "../src/shared/validation.ts";
 import { controllerInputFrameSchema, controllerInputSchema } from "../src/shared/controller.ts";
 import { z } from "zod";
-import { GeneratedControllerResultValidationError, parseGeneratedResidentResult, programDiagnostic,
-  readProgramDiagnostic } from "../src/server/program-diagnostics.ts";
+import {
+    GeneratedControllerResultValidationError, parseGeneratedResidentResult, programDiagnostic,
+    readProgramDiagnostic
+} from "../src/server/program-diagnostics.ts";
 import { preparationFailure } from "../src/server/prepared-source-error.ts";
 
 const neutral = { forward: false, back: false, left: false, right: false, jump: false,
@@ -17,8 +21,6 @@ const result = () => ({ input: { kind: "world", held: { ...neutral }, edges: [],
 
 test("actor-selected entries cannot exchange playing and pure-analysis authority or budgets", () => {
   const source = "export function step(frame,state,intent) { return null; }";
-  expect(programWriteSchema.parse({ name: "legacy-body", source: "return null;" }).entry).toBe("run");
-  expect(programWriteSchema.parse({ name: "resident", entry: "step", source }).entry).toBe("step");
   const step = { operation: "start", entry: "step", name: "resident", args: { goal: "wait" }, initial_state: null };
   const parsed = programRunSchema.parse(step);
   expect(parsed).toMatchObject({ entry: "step", limits: { frequency_hz: 20, step_ms: 25 } });

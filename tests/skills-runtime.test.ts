@@ -444,7 +444,7 @@ return {status:"completed",summary:"Foreground settled after attention",result:n
         arguments: { name: "Async attention foreground", source, args: null,
           limits: { duration_ms: 10000, max_calls: 8, max_actions: 1 } } }
       : index === 1 ? { type: "toolCall", id: "obsolete-authoring-write", name: "program_write",
-        arguments: { name: "Late inactive draft", source: 'return {status:"completed",summary:"Draft only",result:null};' } } : undefined;
+        arguments: { entry: "run", name: "Late inactive draft", source: 'return {status:"completed",summary:"Draft only",result:null};' } } : undefined;
     const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
       timestamp: Date.now(), stopReason: call ? "toolUse" : "stop", content: call ? [call] : [],
       usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
@@ -559,7 +559,7 @@ describe("durable program execution through host capabilities", () => {
         const selectedLimits = limits === undefined ? {} : { limits };
         const calls: ToolCall[] = toolName === "program_submit"
           ? [{ type: "toolCall", id: "runtime-submit", name: toolName, arguments: { name: "runtime budget", source: body, args: null, ...selectedLimits } }]
-          : [{ type: "toolCall", id: "runtime-write", name: "program_write", arguments: { name: "runtime budget", source: body } },
+          : [{ type: "toolCall", id: "runtime-write", name: "program_write", arguments: { entry: "run", name: "runtime budget", source: body } },
             { type: "toolCall", id: "runtime-start", name: toolName, arguments: { operation: "start", name: "runtime budget", args: null, ...selectedLimits } }];
         calls.unshift({ type: "toolCall", id: "runtime-invalid-limit", name: "program_submit",
           arguments: { name: "must not persist", source: body, args: null, limits: { max_actions: "2" } } });

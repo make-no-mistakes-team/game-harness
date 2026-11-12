@@ -32,7 +32,8 @@ const cardSchema = z.object({
   limitations: z.string().trim().min(1).max(1000),
 }).strict();
 export const programWriteSchema = z.object({
-  entry: z.enum(["run", "step", "analyze", "library"]).default("run"),
+  entry: z.enum(["run", "step", "analyze", "library"])
+    .describe("Ordinary writes require an explicit source format, including revisions: run is async BODY(game,args); step/analyze/library are synchronous modules. No format is inferred from source or based_on."),
   name: z.string().trim().min(1).max(80), source: z.string().min(1).max(16384), card: cardSchema.default({
     purpose: "Unspecified by author", applicability: "Unspecified by author", method: "See immutable source",
     reason: "Unspecified by author", limitations: "Untested; no efficacy or applicability claim",

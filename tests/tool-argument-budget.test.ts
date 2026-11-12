@@ -33,7 +33,7 @@ test("incomplete requests, partial discriminators and numeric prefixes are not v
 
 test("legal source, free JSON arguments and intentional waits keep their advertised budgets", () => {
   const source = "x".repeat(16384);
-  expect(compileToolArgumentBudget(advertised(programWriteSchema))({ name: "neutral", source })).toBeNull();
+  expect(compileToolArgumentBudget(advertised(programWriteSchema))({ entry: "run", name: "neutral", source })).toBeNull();
   expect(compileToolArgumentBudget(advertised(programSubmitSchema))({ entry: "run", name: "neutral", source,
     args: { nested: { reason: "x".repeat(100000) }, list: ["x".repeat(100000)] } })).toBeNull();
   expect(compileToolArgumentBudget(advertised(programRunSchema))({ operation: "start", entry: "run", name: "neutral",

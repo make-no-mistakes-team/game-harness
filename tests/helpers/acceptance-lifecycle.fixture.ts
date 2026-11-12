@@ -273,7 +273,7 @@ const stream: StreamFn = (_model, context, options) => {
   const finishing = customFinish && providerCalls === 1;
   const message: AssistantMessage = { role: "assistant", content: finishing ? [{ type: "toolCall", id: crypto.randomUUID(), name: "task_finish",
     arguments: { summary: "Synthetic custom completion claim; not independently verified" } }] : repair ? [{ type: "toolCall", id: crypto.randomUUID(), name: "program_write",
-    arguments: { name: "slot-private-repair", source: `return {status:"completed",summary:"Unexecuted local repair revision ${providerCalls}",result:null};`,
+    arguments: { entry: "run", name: "slot-private-repair", source: `return {status:"completed",summary:"Unexecuted local repair revision ${providerCalls}",result:null};`,
       card: { purpose: "Local study isolation fixture", applicability: "This isolated slot only", method: "Retain an unexecuted local source revision",
         reason: "Exercise actual run-private repair", limitations: "Not executed; no gameplay efficacy evidence" }, dependencies: [],
       ...(providerCalls === 2 ? { based_on: 1 } : {}) } }] : [{ type: "text", text: "Synthetic local lifecycle response; no network." }],

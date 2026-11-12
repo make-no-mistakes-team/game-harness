@@ -139,7 +139,7 @@ export class DiagnosticAgent {
               if (context.role === "review" || context.phase === "reviewing") return;
               for (const definition of definitions) {
                 if (this.store.skills(runId).some(skill => skill.name === definition.name)) continue;
-                const result = await call("program_write", { ...definition, dependencies: [], card: {
+                const result = await call("program_write", { entry: "run", ...definition, dependencies: [], card: {
                   purpose: "Exercise the native Runtime planning boundary", applicability: "Evaluator-owned isolated infrastructure fixture only",
                   method: "Bounded observation and neutral motor probes", reason: "Real Fabric, Docker, bridge, source integrity and admission evidence",
                   limitations: "Synthetic caller, no provider/model authorship, resource strategy, gameplay success, promotion or efficiency claim",

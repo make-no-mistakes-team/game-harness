@@ -294,7 +294,8 @@ export class StrategicContext {
         return 0;
       }
       if (section.topic === "game" && this.actionHelpSection !== null &&
-        (section.section === this.actionHelpSection || section.section.startsWith(`${this.actionHelpSection}.`))) return 1;
+        (section.section === this.actionHelpSection || section.section.startsWith(`${this.actionHelpSection}.`) ||
+          this.actionHelpSection.startsWith(`${section.section}.`))) return 1;
       if (section.topic === "programs" &&
         (section.section === "resident.response" || section.section.startsWith("resident.response.") ||
           section.section === "resident.software_tests")) return 2;
@@ -831,6 +832,14 @@ export class StrategicContext {
         value.omitted_records++;
       }
     }
+    // Preserve space for recent execution facts before optional source/help
+    // and old receipt detail consume it. Mandatory no-replay references above
+    // still use the full hard cap and can never be evicted for these facts.
+    const controllerFacts = this.authoredControllerEvents.map(record => ({
+      ...record, native_life_relation: executionNativeLifeRelation(record.original_scope, run),
+    }));
+    // Four bounded event-detail notices plus framing fit in this headroom.
+    const optionalBudget = INPUT_BYTES - (controllerFacts.length ? bytes(controllerFacts) + 1024 : 0);
     let used = 0;
     for (const program of candidates) {
       const metadata = this.programExecution(run, program, workspace,
@@ -839,24 +848,24 @@ export class StrategicContext {
       const entry = { name: program.name, version: program.version, hash: program.hash, source: program.source,
         ...(metadata ? { last_execution: metadata } : {}) };
       const size = bytes(entry);
-      if (used + size <= SOURCE_BYTES && Buffer.byteLength(encoded()) + size + 512 <= INPUT_BYTES) {
+      if (used + size <= SOURCE_BYTES && Buffer.byteLength(encoded()) + size + 512 <= optionalBudget) {
         value.programs.push(entry); used += size;
       } else {
         const reference = { name: program.name, version: program.version, hash: program.hash,
           source_omission: "Use program_inspect view source for this exact version", ...(metadata ? { last_execution: metadata } : {}) };
-        if (metadata && (used + bytes(reference) > SOURCE_BYTES || Buffer.byteLength(encoded()) + bytes(reference) + 512 > INPUT_BYTES)) {
+        if (metadata && (used + bytes(reference) > SOURCE_BYTES || Buffer.byteLength(encoded()) + bytes(reference) + 512 > optionalBudget)) {
           delete reference.last_execution;
           omit({ kind: "program_execution", reference: `${program.name}@${program.version}`,
             reason: "reuse_metadata_byte_budget_use_program_inspect" });
         }
-        if (used + bytes(reference) <= SOURCE_BYTES && Buffer.byteLength(encoded()) + bytes(reference) + 512 <= INPUT_BYTES) {
+        if (used + bytes(reference) <= SOURCE_BYTES && Buffer.byteLength(encoded()) + bytes(reference) + 512 <= optionalBudget) {
           value.programs.push(reference); used += bytes(reference);
         } else omit({ kind: "program", reference: `${program.name}@${program.version}`, reason: "reference_byte_budget_use_program_inspect" });
         omit({ kind: "source", reference: `${program.name}@${program.version}`, reason: "whole_source_byte_budget", original_bytes: size });
       }
     }
     for (const section of this.help) {
-      if (Buffer.byteLength(encoded()) + bytes(section) + 512 <= INPUT_BYTES) value.requested_help.push(section);
+      if (Buffer.byteLength(encoded()) + bytes(section) + 512 <= optionalBudget) value.requested_help.push(section);
       else omit({ kind: "help", reference: `${section.topic}.${section.section}`, reason: "request_byte_budget", original_bytes: bytes(section) });
     }
     // The only potentially adapter-sized mandatory field is the binding list.
@@ -866,7 +875,7 @@ export class StrategicContext {
     }
     // Metadata itself is bounded; never let many omission notices defeat the
     // input cap. Count what no longer fits rather than implying full recall.
-    while (Buffer.byteLength(encoded()) > INPUT_BYTES && omissions.length > 1) {
+    while (Buffer.byteLength(encoded()) > optionalBudget && omissions.length > 1) {
       omissions.pop(); value.omitted_records++;
     }
     while (Buffer.byteLength(encoded()) > INPUT_BYTES && value.requested_help.length) {
@@ -903,8 +912,8 @@ export class StrategicContext {
     if (Buffer.byteLength(encoded()) > INPUT_BYTES) {
       value.objective = value.objective.slice(0, 500); value.omitted_records++;
     }
-    // Second pass restores only already-sanitized detail and cannot evict any
-    // selected source/help. Preserve pre-existing partial-evidence semantics.
+    // Restore sanitized old detail only outside the execution-fact reserve,
+    // without evicting selected source/help or changing partial-effect facts.
     for (const { record, detail, originalEvidenceOmitted } of receiptDetails) {
       if (!unresolved.some(reference => reference === record || reference.containment === record)) {
         value.omitted_records--;
@@ -915,26 +924,25 @@ export class StrategicContext {
       if (originalEvidenceOmitted === undefined) delete record.evidence_omitted;
       else record.evidence_omitted = originalEvidenceOmitted;
       value.omitted_records--;
-      if (Buffer.byteLength(encoded()) <= INPUT_BYTES) continue;
+      if (Buffer.byteLength(encoded()) <= optionalBudget) continue;
       for (const key of Object.keys(detail)) delete record[key];
       record.detail_omitted = true;
       if ("evidence" in detail) record.evidence_omitted = true;
       value.omitted_records++;
     }
-    // Passive authored knowledge gets only the remaining budget, after safety,
-    // source/help and no-replay receipts. It never wakes or changes scheduling.
+    // Fill the bounded reserve without weakening mandatory no-replay fences.
+    // This passive knowledge never wakes or changes scheduling.
     const feed = value.authored_controller_events;
     if (this.omittedControllerEvents) omit({ kind: "authored_controller_events", reference: feed.history_reference,
       reason: `${this.omittedControllerEvents}_older_events_count_or_byte_budget` });
-    for (const record of [...this.authoredControllerEvents].reverse()) {
-      const entry = { ...record, native_life_relation: executionNativeLifeRelation(record.original_scope, run) };
+    for (const entry of [...controllerFacts].reverse()) {
       feed.records.unshift(entry);
       if (Buffer.byteLength(encoded()) + 256 > INPUT_BYTES) {
         feed.records.shift(); feed.omitted_events++;
-        omit({ kind: "authored_controller_event", reference: `event_seq:${record.event_seq}`,
+        omit({ kind: "authored_controller_event", reference: `event_seq:${entry.event_seq}`,
           reason: "request_byte_budget_use_named_execution_history" });
-      } else if (record.details_omitted || record.summary_omitted) {
-        omit({ kind: "authored_controller_event", reference: `event_seq:${record.event_seq}`,
+      } else if (entry.details_omitted || entry.summary_omitted) {
+        omit({ kind: "authored_controller_event", reference: `event_seq:${entry.event_seq}`,
           reason: "bounded_note_fields_or_bytes_use_named_execution_history" });
       }
     }

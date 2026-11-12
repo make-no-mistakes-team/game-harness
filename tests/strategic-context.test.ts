@@ -1243,9 +1243,9 @@ export function step(frame,state,intent) {
 }`;
 }
 
-async function residentReference(f: ReturnType<typeof fixture>, revision = 1) {
+async function residentReference(f: ReturnType<typeof fixture>, revision = 1, padding = 0) {
   return f.store.registerSkill(f.state.run.run_id, { entry: "step", name: "Reusable resident",
-    source: residentReferenceSource(revision), dependencies: [],
+    source: `${padding ? `/*${"p".repeat(padding)}*/\n` : ""}${residentReferenceSource(revision)}`, dependencies: [],
     card: { purpose: "Use an explicitly selected bounded observation mode", applicability: "Fixture",
       method: "Apply the selected mode until its frame bound", reason: "Historical source retention",
       limitations: "No gameplay efficacy established" },
@@ -1306,8 +1306,9 @@ function authoredControllerEvent(f: ReturnType<typeof fixture>, execution: Skill
 
 test("next ordinary SDK context preserves passive authored hostile-death and completion facts without native death inference", async () => {
   const f = fixture();
-  await f.planner.start(1); await f.turn();
-  const skill = await residentReference(f), execution = executeResidentReference(f, skill, "succeeded",
+  f.state.helpResults.controller = JSON.parse(JSON.stringify(programHelp("controller", f.adapter)));
+  await f.planner.start(1); await f.turn([f.requestHelp("controller"), settlement()]);
+  const skill = await residentReference(f, 1, 3000), execution = executeResidentReference(f, skill, "succeeded",
     { dead: true, logs: 8, minHP: 20 });
   const hostile = authoredControllerEvent(f, execution, "diagnostic", "Nearby zombie died after my attack", {
     hostile: "zombie", own_kill: true, hostile_dead: true, own_deaths: 0,
@@ -1431,24 +1432,50 @@ test("bounded authored controller feed reports event and detail omissions and re
   expect(JSON.parse(new StrategicContext(f.store).assemble(f.state.run)).strategic_context.authored_controller_events).toEqual(feed);
 });
 
-test("authored controller details cannot displace no-replay fences or complete requested action help under pressure", async () => {
-  const f = fixture(), execution = f.execution(await f.program(`/*${"s".repeat(16000)}*/return {status:"completed",summary:"bounded",result:null};`));
+test("authored controller facts survive source and help pressure without weakening no-replay or callable contracts", async () => {
+  const f = fixture(), execution = executeResidentReference(f, await residentReference(f, 1, 5000), "succeeded");
   f.store.event(f.state.run.run_id, "runtime.uncertainty", "Unresolved operation stays fenced", {
     action_id: "unknown-action", life_id: f.state.run.life_id,
   });
   const context = new StrategicContext(f.store);
-  context.rememberHelp("actions", { contract: "h".repeat(5200), parameters: "p".repeat(5200), result: "r".repeat(5200) });
+  const capability = f.adapter.action_capability!;
+  context.synchronize(f.state.run, model(), { systemPrompt: [], messages: [] }, f.state.observation, f.adapter);
+  context.rememberHelp("game", {
+    validation: "h".repeat(5200), lifecycle: "p".repeat(5200), progress: "r".repeat(5200),
+    schemas: { capabilities: { [`${capability.id}@${capability.version}`]: {
+      anyOf: [{ type: "object", properties: { kind: { const: "fixture_action" },
+        duration_ms: { type: "integer", minimum: 50, maximum: 2000 } },
+      required: ["kind", "duration_ms"], additionalProperties: false }],
+    } } },
+  });
   const before = JSON.parse(context.assemble(f.state.run)).strategic_context;
+  let lastEvent = 0;
   for (let index = 0; index < 8; index++)
-    authoredControllerEvent(f, execution, "diagnostic", `Pressure ${index}`, { details: "界".repeat(2000) });
+    lastEvent = authoredControllerEvent(f, execution, "diagnostic", `Pressure ${index}`, { details: "界".repeat(2000) }).event_seq;
   const encoded = context.assemble(f.state.run), after = JSON.parse(encoded).strategic_context;
   expect(Buffer.byteLength(encoded)).toBeLessThanOrEqual(32768);
   expect(after.unresolved).toEqual(before.unresolved);
   expect(after.unresolved[0]).toMatchObject({ no_replay: true, historical: true, current_authority: false });
-  expect(after.requested_help).toEqual(before.requested_help);
-  expect(after.programs).toEqual(before.programs);
   expect(after.authored_controller_events.omitted_events).toBeGreaterThan(0);
   expect(after.authored_controller_events.records.length).toBeLessThanOrEqual(4);
+  expect(after.authored_controller_events.records.at(-1)?.event_seq).toBe(lastEvent);
+  const schemaPath = ["schemas", "capabilities", `${capability.id}@${capability.version}`, "anyOf", 0];
+  let reference = "", retainedAction: unknown;
+  for (let depth = 0; depth < schemaPath.length; depth++) {
+    const key = schemaPath[depth]!;
+    reference += typeof key === "number" ? `[${key}]` : `${depth ? "." : ""}${key}`;
+    const section = after.requested_help.find((entry: { topic: string; section: string }) =>
+      entry.topic === "game" && entry.section === reference);
+    if (!section) continue;
+    let value: unknown = section.content;
+    for (const child of schemaPath.slice(depth + 1))
+      value = value !== null && typeof value === "object" && child in value ? Reflect.get(value, child) : undefined;
+    if (value !== undefined) { retainedAction = value; break; }
+  }
+  expect(validateJsonSchemaValue(retainedAction, { kind: "fixture_action", duration_ms: 50 }).success).toBe(true);
+  expect(validateJsonSchemaValue(retainedAction, { kind: "fixture_action", duration_ms: 49 }).success).toBe(false);
+  expect(validateJsonSchemaValue(retainedAction, { kind: "fixture_action", duration_ms: 2001 }).success).toBe(false);
+  expect(validateJsonSchemaValue(retainedAction, { kind: "fixture_action", duration_ms: 50, unexpected: true }).success).toBe(false);
 });
 
 for (const status of ["cancelled", "succeeded"] as const)

@@ -345,6 +345,11 @@ remain available after a controller completes, even when they did not request
 attention. This is passive evidence delivery, not an extra wake, model request,
 native receipt or automatic goal verdict. Mechanical advisories retain their
 separate producer identity and are not relabelled as authored events.
+Recent authored events reserve space before optional source, requested help and
+old receipt detail are allocated. Mandatory safety and no-replay references
+retain priority. All share the same 32 KiB request cap; source or help pressure
+cannot silently displace the event reserve. Events that cannot fit alongside
+mandatory references remain explicitly omitted.
 
 | Choice | Host behavior |
 | --- | --- |

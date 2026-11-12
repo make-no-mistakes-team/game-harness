@@ -550,6 +550,7 @@ export class PreparedSource {
         composition: reference.composition, resident,
         software_tests: softwareTests, world_view: reference.world_view, temporal_turn: reference.temporal_turn,
         temporal_tracking: reference.temporal_tracking, target_transitions: reference.target_transitions,
+        semantic_aiming: reference.semantic_aiming,
         result: reference.result, execution_limits: reference.execution_limits,
         limits: reference.limits, default_execution_limits: reference.default_execution_limits,
         default_resident_limits: reference.default_resident_limits } as unknown as Json;
@@ -573,6 +574,7 @@ export class PreparedSource {
       "Keep explicit state bounded: a complete frame can exceed16KiB, and the host never truncates oversized next_state into validity. Test larger projections when that risk is uncertain. " +
       "View quality matters: repeated timed360-degree scans and full-error delta re-aims are not human-like control. Sound directions are world compass, not screen-relative; compare genuine heard bearings with actual applied yaw. " +
       "Choose purposeful bounded camera changes yourself, retaining your temporal turn/tracking state across moving-target, resource and pickup transitions. A removed block's position is not automatically the next gaze target. " +
+      "Smooth aiming need not be slow or finish before mining starts. Controller help describes raw held-attack/view overlap and the separate semantic-dig camera profile; choose timing without inventing a mandatory camera-stop gate. " +
       "Changed view transitions are useful software-check targets; passing JSON shape alone never establishes useful smooth motion. See controller help for motion.turn/track, which supply pure math, not target selection or tactics. " +
       "Inspect your authored sources and actual API/schema help as needed. There is no tool for observing, playing, respawning, network or filesystem access. " +
       "Author an executive step(frame,state,intent) and explicit activate(frame,state,intent), selecting the exact root yourself with prepare_finish(args,initial_state,limits,session). " +

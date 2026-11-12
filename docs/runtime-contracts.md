@@ -473,6 +473,13 @@ Authored reporting should be transition-gated, including any wrapper that
 keeps running while Main acknowledges completion. The host does not raise the
 allowance or treat repeated notifications as new gameplay progress.
 
+Local goal readiness does not require executive retirement. When Main is still
+pending, model-authored software can report readiness once and retain useful
+bounded task coverage. A running wrapper that only waits or repeats completion
+events supplies no useful coverage. Main still owns custom `task_finish`;
+neither an authored predicate nor a running executive independently verifies
+the goal, extends its deadline or permits acting after Stop.
+
 Executive and legacy residents share one bounded pure-analysis lifecycle.
 Analysis runs alongside local decisions, with one outstanding job and the
 original cumulative job/time budgets. An intent change marks its result stale;
@@ -2183,6 +2190,16 @@ Paper Anti-Xray is optional defense in depth, never the sole filter; these permi
 Initial capability schemas cover bounded movement/input/look, interaction, dig, place, craft, equip and navigation under the profile above. Parameters explicitly select targets, recipe/item identifiers, quantities, slots and other tactical choices. The bridge rechecks reach, profile-authorized target validity, inventory, UI session and terrain constraints immediately before effects; any game-required aiming is an action constraint, not a camera-cone observation filter. Coordinated movement/look/attack may be one bounded composite action, never independent foreground leases. An A* motor must obey the private local-geometry contract; it cannot discover hidden targets or higher-level routes. No handwritten collect-wood, explore, survive, fight or complete-game routine is supplied.
 
 Motor profiles are `precise`, `balanced` (default) and `fast`, configured by the operator independently of gameplay through `GameBridge.setMotorProfile(profile)`. Persisted selection applies live without restart. Balanced starts with yaw/pitch limits of 480°/s and 300°/s and adaptive large-turn/small-settle control; these are configured limits, not measured achieved speed. One render-monotonic integration clock avoids double tick/render integration, using shortest yaw and bounded settling without overshoot.
+
+Raw held attack and view rate can operate together under ordinary crosshair
+and vanilla input rules. Semantic `dig` instead starts its own camera profile
+from the actual pose with zero initial velocity and aims at the selected block
+centre. Its angular gate is less than 3° on each axis; it does not wait for
+zero camera velocity. Mining can overlap the remaining camera adjustment.
+A raw-to-semantic transfer can finish a small residual error much faster than
+the preceding authored approach. This is not necessarily a pose teleport.
+The model chooses timing and trajectories; an input ACK alone does not prove
+block removal or pickup.
 
 `look` and `move.look` remain explicit free orientation. `navigate.gaze` is optional: `{kind:"navigation"}` by default, `{kind:"target",target}` with a fresh `TargetRef`, or `{kind:"free",yaw,pitch}`. Default gaze samples bounded actual local route geometry, interpolates a near-route point and adds eye height so flat ground stays level and slopes affect pitch mechanically. Target interactions use target gaze. Movement gating uses yaw rather than pitch; free/target gaze must preserve world-direction travel through legal strafe synthesis. `navigate.range` allows 0.5–4 blocks for ordinary approach precision, not an automatic pickup tactic. Camera/navigation speed and useful-play improvements require new measured evidence.
 

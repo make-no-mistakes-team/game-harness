@@ -452,6 +452,14 @@ and receipt reconciliation remain allowed. A retiring or expired producer cannot
 renew. Raw input retains its existing short native lease. Independent reflex
 writers cannot preempt an executive session; the executive chooses interruptions.
 
+Independent controller feedback may follow a GUI opening, closure or replacement
+while the native read is in flight. Admission requires the returned frame's
+screen identity to match the current delivery authority, with unchanged
+world/session/life/native-boot/profile/space authority. The starting screen is
+not a read precondition. A frame obsoleted by a later screen notice is still
+refused. Effect-specific screen predicates, capture freshness and native
+supervision remain unchanged.
+
 Optional `recovery:"reset_safe",max_restarts:N` permits bounded clean-invocation
 recovery after confirmed retirement and worker closure. The model's activation
 must reconsider fresh applicability. This resets explicit state; it does not

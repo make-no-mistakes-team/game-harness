@@ -1678,6 +1678,38 @@ for (const [name, replacement] of [
     }
   });
 }
+for (const [name, initial, replacement] of [
+  ["open", null, feedbackScreen],
+  ["close", feedbackScreen, null],
+  ["replacement", feedbackScreen, { screen_id: "fresh-feedback-B", incarnation: 5, revision: 1 }],
+  ["reincarnation", feedbackScreen, { screen_id: feedbackScreen.screen_id, incarnation: 5, revision: 1 }],
+] as const) {
+  test(`fresh controller feedback follows a ${name} during the read without adopting an old screen`, async () => {
+    const f = fixture();
+    try {
+      const peer = await f.channel("control");
+      Reflect.set(f.bridge, "state", { ...f.bridge.snapshot(), screen: initial });
+      requests(peer, request => {
+        if (request.method !== "controller_frame") { reply(peer, request.id, {}); return; }
+        const projected = projectedFeedback();
+        const screen = replacement ? { ...projected.screen,
+          identity: { ...projected.screen.identity, screen_id: replacement.screen_id, incarnation: replacement.incarnation } } : null;
+        const notice = { ...f.notice({ life_id: 1, status: "alive", can_respawn: false, death: null }, 2),
+          type: "scope", screen: replacement };
+        const control = Reflect.get(f.bridge, "control") as Socket;
+        control.emit("data", Buffer.from(
+          `${JSON.stringify({ id: request.id, ok: true, data: { ...projected, screen } })}\n${JSON.stringify({ notice })}\n`,
+        ));
+      });
+      const result = await f.bridge.queryCapability("minecraft.controller_frame", 2, { audio_cursor: null });
+      expect(result).toMatchObject({ screen: replacement ? {
+        identity: { screen_id: replacement.screen_id, incarnation: replacement.incarnation },
+      } : null });
+      expect(f.bridge.snapshot().screen).toEqual(replacement);
+    } finally { await f.close(); }
+  });
+}
+
 test("controller feedback retains the same screen across unrelated transaction revisions", async () => {
   const f = fixture();
   try {

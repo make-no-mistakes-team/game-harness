@@ -1299,8 +1299,7 @@ export class GameBridgeClient implements GameBridge {
   private async readControllerFrame(read: () => Promise<unknown>) {
     const binding = this.state.binding,
       life = this.state.life,
-      space = this.state.space,
-      screen = this.state.screen;
+      space = this.state.space;
     const session = this.state.session_id,
       world = this.state.world_id,
       epoch = this.state.epoch;
@@ -1328,9 +1327,10 @@ export class GameBridgeClient implements GameBridge {
       throw new Error(
         "Controller feedback has stale profile or life/space authority.",
       );
+    // This is a read, not an effect admitted against the starting screen.
+    // A GUI may open/close while native samples it; accept only the screen
+    // actually captured if it still matches current delivery authority.
     if (
-      this.state.screen?.screen_id !== screen?.screen_id ||
-      this.state.screen?.incarnation !== screen?.incarnation ||
       frame.screen?.identity.screen_id !== this.state.screen?.screen_id ||
       frame.screen?.identity.incarnation !== this.state.screen?.incarnation
     )

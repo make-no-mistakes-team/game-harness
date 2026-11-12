@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { GameBridgeClient } from "../src/server/game-bridge.ts";
-import { NativeRequestFault } from "../src/server/controller-channel.ts";
+import { ControllerScreenReadSupersededError, NativeRequestFault } from "../src/server/controller-channel.ts";
 import { spawn } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { createConnection, type Server, type Socket } from "node:net";
@@ -1671,7 +1671,7 @@ for (const [name, replacement] of [
       replace = true;
       await expect(
         f.bridge.queryCapability("minecraft.controller_frame", 2, args),
-      ).rejects.toThrow("screen");
+      ).rejects.toBeInstanceOf(ControllerScreenReadSupersededError);
       expect(f.bridge.snapshot().screen).toEqual(replacement);
     } finally {
       await f.close();

@@ -9,7 +9,7 @@ import { executiveStepResultSchema, residentActivationResultSchema, ResidentClea
 import { type ControlSessionConfig, type ExecutiveChoice, type ExecutiveSnapshot, type ExecutiveTaskRequest,
   type ExecutiveTaskSnapshot } from "../shared/control-session.ts";
 import { GeneratedControllerResultValidationError } from "./program-diagnostics.ts";
-import { ControllerChannelFaultError } from "./controller-channel.ts";
+import { ControllerChannelFaultError, ControllerScreenReadSupersededError } from "./controller-channel.ts";
 import { ExecutiveRawMonitor, ExecutiveStationaryViewMonitor } from "./executive-incidents.ts";
 import { ResidentAnalysisLane } from "./resident-analysis.ts";
 
@@ -183,6 +183,10 @@ export class ControlSession {
       frame = minecraftControllerFrameSchema.parse(await (samplingChannel
         ? samplingChannel.sample(this.cursor) : this.options.sample(this.cursor)));
     } catch (error) {
+      if (error instanceof ControllerScreenReadSupersededError) {
+        this.data.counters.stale_frames++;
+        return;
+      }
       if (samplingChannel) throw this.channelFailure(samplingChannel, error);
       throw error;
     }

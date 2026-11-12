@@ -5,7 +5,7 @@ import { controllerInputFrameSchema, controllerInputSchema, inputAppliedAckSchem
   residentFrameContextSchema, revocationAckSchema,
   type ControllerInputFrame, type InputAppliedAck, type RevocationAck } from "../src/shared/controller.ts";
 import { ControllerInputs } from "../src/server/controller-inputs.ts";
-import { controllerNativeDeadline, NativeControllerChannel, NativeRequestFault, type ControllerChannelTransport } from "../src/server/controller-channel.ts";
+import { controllerNativeDeadline, ControllerScreenReadSupersededError, NativeControllerChannel, NativeRequestFault, type ControllerChannelTransport } from "../src/server/controller-channel.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import type { NativeClockCorrespondence, NativeControlTiming } from "../src/server/performance.ts";
 
@@ -407,10 +407,27 @@ function nativeChannel(operationId = "resident-owner", generation = 3, deadlineH
   };
   const channel = new NativeControllerChannel(identity, 7, deadlineHostMs, deadlineNativeNs, transport, value => applied.push(value), () => {});
   return { channel, calls, applied, frame, request(fn: typeof request) { request = fn; },
+    read(fn: ControllerChannelTransport["sample"]) { transport.sample = fn; },
     clock(value: NativeClockCorrespondence) { mapping = value; },
     timing(value: NativeControlTiming) { retirementTiming = value; } };
 }
 async function settleChannel() { for (let turn = 0; turn < 30; turn++) await Promise.resolve(); }
+
+test("a superseded screen read retains no capture or channel fault and cannot renew old input", async () => {
+  const clock = vi.spyOn(performance, "now").mockReturnValue(0), h = nativeChannel();
+  try {
+    h.read(async () => { throw new ControllerScreenReadSupersededError(); });
+    await expect(h.channel.sample(null)).rejects.toBeInstanceOf(ControllerScreenReadSupersededError);
+    expect(h.channel.snapshot()).toMatchObject({ fenced: false, retired: false, fault: null, submitted_sequence: 0 });
+    expect(h.calls).toEqual([]);
+    h.read(async () => minecraftControllerFrameSchema.parse({ ...h.frame, frame_seq: 2 }));
+    const fresh = await h.channel.sample(null);
+    expect(h.channel.submit(fresh, world(2).input).status).toBe("submitted");
+    await settleChannel();
+    expect(h.channel.snapshot()).toMatchObject({ applied_sequence: 1, fault: null });
+    expect(h.calls).toEqual(["controller_submit"]);
+  } finally { await h.channel.revoke(); clock.mockRestore(); }
+});
 
 test.each([
   ["not_dispatched", "not_dispatched", "submit_dispatch"],

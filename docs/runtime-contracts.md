@@ -460,6 +460,14 @@ not a read precondition. A frame obsoleted by a later screen notice is still
 refused. Effect-specific screen predicates, capture freshness and native
 supervision remain unchanged.
 
+When only delivery-time screen identity supersedes a read, the executive
+discards that frame and waits for its next ordinary sampling slot. It does not
+invoke source, commit state, advance the audio cursor, renew supervision or
+submit input for the discarded read. Existing native leases still expire on
+time. Profile/life/space/scope changes, malformed responses and transport faults
+retain their ordinary failure handling; matching error text is not sufficient
+to classify a read as superseded.
+
 Optional `recovery:"reset_safe",max_restarts:N` permits bounded clean-invocation
 recovery after confirmed retirement and worker closure. The model's activation
 must reconsider fresh applicability. This resets explicit state; it does not

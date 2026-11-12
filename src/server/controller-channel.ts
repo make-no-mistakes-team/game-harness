@@ -26,6 +26,13 @@ export class ControllerChannelFaultError extends Error {
     this.name = "ControllerChannelFaultError";
   }
 }
+/** Trusted read-only screen mismatch after the other owner/scope checks passed. */
+export class ControllerScreenReadSupersededError extends Error {
+  constructor() {
+    super("Controller feedback has stale or unavailable screen authority.");
+    this.name = "ControllerScreenReadSupersededError";
+  }
+}
 
 export interface ControllerChannelTransport {
   /** Dispatches in call order, before returning; native heartbeat and submit share an ordered receiver. */
@@ -162,6 +169,10 @@ export class NativeControllerChannel implements ControllerInputChannel {
     const work = (async () => {
       let frame: MinecraftControllerFrame;
       try { frame = await this.transport.sample({ ...this.identity(), ...audio }); } catch (error) {
+        if (error instanceof ControllerScreenReadSupersededError) {
+          this.current();
+          throw error;
+        }
         const detail = error instanceof Error ? error.message : "Controller sample failed";
         // A rejected read did not previously fence actuator admission. Preserve
         // that policy while carrying its trusted evidence to the session.

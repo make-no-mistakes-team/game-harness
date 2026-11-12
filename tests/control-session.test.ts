@@ -7,7 +7,7 @@ import type { GameActionResult, Json } from "../src/shared/contracts.ts";
 import type { ControllerInputChannel, InputAppliedAck, RevocationAck } from "../src/shared/controller.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
-import { controllerNativeDeadline, NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
+import { controllerNativeDeadline, ControllerScreenReadSupersededError, NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
 
 async function settle() { for (let index = 0; index < 100; index++) await Promise.resolve(); }
 class Clock implements ResidentClock {
@@ -120,6 +120,58 @@ function harness(retained = 32, ownBody?: (body: ReturnType<typeof controllerFra
 
 const terminalEvent = { kind: "diagnostic", urgency: "ordinary", summary: "Local objective evidence collected",
   details: { logs: 8, postEncounterDig: true } } as const;
+
+test.each([false, true])("only a trusted superseded-screen read can be discarded without a decision (trusted=%s)", async trusted => {
+  const h = harness(), sample = h.options.sample;
+  h.options.sample = async () => {
+    const error = new ControllerScreenReadSupersededError();
+    throw trusted ? error : new Error(error.message);
+  };
+  h.choose(rawChoice);
+  await h.session.start(); await h.clock.advance(0);
+  expect(h.activationCount).toBe(0);
+  expect(h.sent).toHaveLength(0);
+  expect(h.session.snapshot()).toMatchObject({ status: trusted ? "running" : "failed",
+    counters: { stale_frames: trusted ? 1 : 0 }, state: 0 });
+  h.options.sample = sample;
+  await h.clock.advance(100);
+  expect(h.activationCount).toBe(trusted ? 1 : 0);
+  expect(h.sent).toHaveLength(trusted ? 1 : 0);
+  await h.session.stop("End screen-read classification");
+});
+
+test.each([false, true])("superseded raw samples never renew the producer lease (continuous=%s)", async continuous => {
+  const h = harness(), open = h.options.open, renew = vi.fn(async () => {});
+  let reads = 0;
+  h.onRenew(renew);
+  h.options.open = async (...args) => {
+    const channel = await open(...args), sample = channel.sample.bind(channel);
+    channel.sample = async cursor => {
+      if (continuous || reads++ === 0) throw new ControllerScreenReadSupersededError();
+      return await sample(cursor);
+    };
+    return channel;
+  };
+  h.choose(rawChoice);
+  await h.session.start(); await h.clock.advance(50);
+  expect(h.sent).toHaveLength(0);
+  expect(renew).not.toHaveBeenCalled();
+  expect(h.retired).toBe(0);
+  expect(h.stepCount).toBe(0);
+  await h.clock.advance(200);
+  if (continuous) {
+    expect(h.sent).toHaveLength(0);
+    expect(renew).not.toHaveBeenCalled();
+    expect(h.retired).toBe(1);
+    expect(h.session.snapshot()).toMatchObject({ status: "failed",
+      session: { deadline_host_ms: 10000, restarts: 0, producer: "none" } });
+  } else {
+    expect(h.sent[0]?.sequence).toBe(1);
+    expect(h.retired).toBe(0);
+    expect(h.session.snapshot().status).toBe("running");
+  }
+  await h.session.stop("End superseded sample lease boundary");
+});
 
 test.each([false, true])("lease expiry during computation never renews or submits the old owner (reset_safe=%s)", async resetSafe => {
   const h = harness(), renew = vi.fn(async () => {});

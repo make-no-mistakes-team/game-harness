@@ -82,6 +82,7 @@ import {
 } from "./performance.ts";
 import {
   controllerNativeDeadline,
+  ControllerScreenReadSupersededError,
   NativeControllerChannel,
   NativeRequestFault,
   type NativeRequestStatus,
@@ -1334,9 +1335,7 @@ export class GameBridgeClient implements GameBridge {
       frame.screen?.identity.screen_id !== this.state.screen?.screen_id ||
       frame.screen?.identity.incarnation !== this.state.screen?.incarnation
     )
-      throw new Error(
-        "Controller feedback has stale or unavailable screen authority.",
-      );
+      throw new ControllerScreenReadSupersededError();
     return frame;
   }
   private assertControllerScope(reservation: ControllerReservation) {

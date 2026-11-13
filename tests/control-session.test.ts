@@ -966,6 +966,84 @@ test("raw retirement keeps read-only sensing alive without reading through the f
   barrier.resolve(); await settle(); await h.session.stop("complete");
 });
 
+test.each(["lease", "queued", "missing_fence", "wrong_owner", "opaque", "gui", "unresolved", "exhausted"] as const)(
+  "checkpoint-safe native recovery preserves committed JSON only after proven world retirement: %s", async mode => {
+  const h = harness(), open = h.options.open;
+  const allowed = mode === "lease" || mode === "queued";
+  const pending = Promise.withResolvers<ExecutiveStepResult>();
+  void pending.promise.catch(() => {});
+  const fresh: { state: Json; session: ExecutiveSnapshot }[] = [];
+  let fault: ControllerChannelFault | null = null, retired = false, failed = false;
+  h.options.config = controlSessionConfigSchema.parse({ schema_version: 1, recovery: "checkpoint_safe", max_restarts: 1 });
+  if (mode === "exhausted") h.options.config.max_restarts = 0;
+  h.options.event = vi.fn();
+  h.options.worker.step = async () => await pending.promise;
+  h.options.worker.close = async () => {
+    pending.reject(new Error("Old worker was closed during native recovery"));
+  };
+  h.options.restartWorker = async () => ({
+    async activate(frame, state) {
+      fresh.push({ state, session: executiveSnapshotSchema.parse(frame.executive) });
+      return { choice: { kind: "observe" }, next_state: 10, status: "running", events: [] };
+    },
+    async step(_frame, state) { return { choice: { kind: "observe" }, next_state: state, status: "running", events: [] }; },
+    async close() {},
+  });
+  h.options.open = async (...args) => {
+    const channel = await open(...args), sample = channel.sample.bind(channel), snapshot = channel.snapshot.bind(channel);
+    const revoke = channel.revoke.bind(channel);
+    channel.sample = async cursor => {
+      if (!failed && h.clock.now() >= 100) {
+        failed = true;
+        fault = { schema_version: 1, stage: "sample", cause: mode === "opaque" ? "transport_unknown" : "native_rejected", decision_dispatch: "dispatched",
+          owner: mode === "wrong_owner" ? { ...channel.owner, operation_id: "foreign" } : channel.owner,
+          controller_generation: channel.controllerGeneration,
+          sequence: null, frame_seq: null, captured_native_ns: null, request_id: 41, request_method: "controller_sample",
+          initiating_request_id: 41, initiating_method: "controller_sample", host_detected_ms: h.clock.now(),
+          original_deadline_host_ms: 10000, native_first_fence: null, detail: "Native owner expired" };
+        throw new ControllerChannelFaultError(fault, fault.detail);
+      }
+      return await sample(cursor);
+    };
+    channel.snapshot = () => ({ ...snapshot(), fenced: fault !== null, fault: fault && { ...fault,
+      native_first_fence: retired && mode !== "missing_fence" ? {
+        reason: mode === "queued" ? "queued_frame_expired_before_application" : "native_input_lease_expired", native_ns: "99000000",
+        checked_native_ns: "100000000", effective_deadline_native_ns: "99000000" } : null } });
+    channel.revoke = async () => { const ack = await revoke(); retired = true;
+      return { ...ack, unresolved_operation_refs: mode === "unresolved" ? ["unresolved-input"] : [] }; };
+    return channel;
+  };
+  try {
+    const selected: ExecutiveChoice = mode === "gui" ? { kind: "raw", input: { kind: "world", held: neutral,
+      edges: [{ kind: "button", button: "inventory", phase: "press", count: 1 }],
+      view: { kind: "unchanged" }, selected_hotbar: null } } : rawChoice;
+    h.choose(selected);
+    // Commit one world decision before suspending the following one.
+    const originalStep = h.options.worker.step;
+    h.options.worker.step = mode === "gui"
+      ? async (frame, state, intent, signal) => {
+        if (h.clock.now() === 50) return { choice: selected, next_state: 1, status: "running", events: [] };
+        return await originalStep(frame, state, intent, signal);
+      } : originalStep;
+    await h.session.start(); await h.clock.advance(mode === "gui" ? 75 : 50);
+    expect(h.session.snapshot().state).toBe(1);
+    expect(fresh).toEqual([]);
+    await h.clock.advance(150);
+    expect(fresh).toHaveLength(allowed ? 1 : 0);
+    if (allowed) expect(fresh[0]).toMatchObject({ state: 1, session: { producer: "none", restarts: 1,
+      behavior_generation: 2, deadline_host_ms: 10000 } });
+    expect(h.sent).toHaveLength(mode === "gui" ? 1 : 0);
+    expect(h.options.event).not.toHaveBeenCalled();
+    expect(h.session.snapshot()).toMatchObject({ status: allowed ? "running" : "failed",
+      state: allowed ? 10 : 1, session: { restarts: allowed ? 1 : 0 } });
+    if (allowed) expect(h.records.find(row => row.type === "session.checkpoint_safe_restart")?.details)
+      .toMatchObject({ reason: "confirmed_native_world_fence", replayed_effects: false, original_deadline_host_ms: 10000 });
+  } finally {
+    pending.resolve({ choice: rawChoice, next_state: 999, events: [terminalEvent], status: "running" });
+    await h.session.stop("test complete");
+  }
+});
+
 test("an intent update during renewal cannot submit the previous intent's computed input", async () => {
   const h = harness(); h.choose(rawChoice); await h.session.start(); await h.clock.advance(0);
   h.onRenew(async () => { h.session.updateIntent({ destination: "new" }, 0); });
@@ -992,14 +1070,15 @@ test("known expired raw leases recover before sampling the old channel under the
   await h.session.stop("complete");
 });
 
-test("recovery after a child settles during a stale decision admits fresh work instead of exposing a permanent retirement", async () => {
+test.each(["reset_safe", "checkpoint_safe"] as const)(
+  "recovery after a settled unknown child retains its outcome and admits a new task: %s", async mode => {
   const h = harness(), returned = Promise.withResolvers<ExecutiveStepResult>(), closed = Promise.withResolvers<void>();
   const unknown: GameActionResult = { status: "unknown", summary: "Native supervision expired after emission",
     evidence: { world_effect_emitted: true, neutralized: true } };
   const late: ExecutiveStepResult = { choice: { kind: "continue", handle: 1 },
     next_state: { uncommitted: true }, status: "running", events: [terminalEvent] };
   const freshInputs: { session: ExecutiveSnapshot; state: Json }[] = [];
-  h.options.config.recovery = "reset_safe"; h.options.config.max_restarts = 1;
+  h.options.config.recovery = mode; h.options.config.max_restarts = 1;
   const oldClose = h.options.worker.close;
   h.options.worker.close = async () => { await closed.promise; await oldClose(); };
   h.options.worker.step = async () => await returned.promise;
@@ -1029,7 +1108,7 @@ test("recovery after a child settles during a stale decision admits fresh work i
     expect(h.completed.map(task => task.handle)).toEqual([1]);
     expect(h.options.event).not.toHaveBeenCalled();
     closed.resolve(); await settle(); await h.clock.advance(100);
-    expect(freshInputs[0]).toMatchObject({ state: 0,
+    expect(freshInputs[0]).toMatchObject({ state: mode === "checkpoint_safe" ? 1 : 0,
       session: { producer: "none", behavior_generation: 2, task_high_water: 1, restarts: 1, deadline_host_ms: 10000 } });
     expect(h.completed.map(task => task.handle)).toEqual([1, 2]);
     expect(h.workerClosed).toBe(1);
@@ -1041,6 +1120,32 @@ test("recovery after a child settles during a stale decision admits fresh work i
     returned.resolve(late); closed.resolve();
     await h.session.stop("End stale semantic settlement recovery proof");
   }
+});
+
+test.each([false, true])("Stop joins a late recovery factory and contains unclosed candidates (unknown=%s)", async unknown => {
+  const h = harness(), factory = Promise.withResolvers<ControlSessionOptions["worker"]>();
+  const close = Promise.withResolvers<void>(), activate = vi.fn(h.options.worker.activate!);
+  let candidatesClosed = 0, stopped = false;
+  h.options.config = controlSessionConfigSchema.parse({ schema_version: 1, recovery: "reset_safe", max_restarts: 1 });
+  h.options.restartWorker = vi.fn(async () => await factory.promise);
+  h.choose(rawChoice); await h.session.start(); await h.clock.advance(50);
+  await h.clock.jump(350);
+  expect(h.options.restartWorker).toHaveBeenCalledTimes(1);
+  const outcome = h.session.stop("operator Stop during recovery factory").then(
+    () => { stopped = true; return null; }, error => { stopped = true; return error; });
+  await settle(); expect(stopped).toBe(false);
+  factory.resolve({ activate, step: h.options.worker.step, async close() {
+    candidatesClosed++; await close.promise; if (unknown) throw new ResidentCleanupError();
+  } });
+  await settle(); expect(stopped).toBe(false); expect(candidatesClosed).toBe(1);
+  close.resolve();
+  const failure = await outcome;
+  if (unknown) expect(failure).toBeInstanceOf(ResidentCleanupError);
+  else expect(failure).toBeNull();
+  expect(activate).not.toHaveBeenCalled();
+  expect(h.sent).toHaveLength(1);
+  expect(h.session.snapshot()).toMatchObject({ status: unknown ? "unknown" : "stopped",
+    cleanup: { native: "retired", worker: unknown ? "unknown" : "closed" } });
 });
 
 test("an earlier application acknowledgment cannot delete a later outstanding input capture", async () => {

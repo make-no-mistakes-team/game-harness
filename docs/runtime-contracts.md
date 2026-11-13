@@ -609,23 +609,42 @@ recovery after confirmed retirement and worker closure. The model's activation
 must reconsider fresh applicability. This resets explicit state; it does not
 restore a transactional checkpoint, replay edges or retry arbitrary source
 exceptions. Opaque and source faults remain quarantined.
+`recovery:"checkpoint_safe",max_restarts:N` instead passes the last committed
+validated model JSON to the clean worker. Pending decisions, events, input,
+module globals and VM stacks are discarded. Task identities, unknown outcomes,
+audio cursor, counters and the original deadline remain unchanged. Activation
+must reconcile that JSON with fresh observations and retained task receipts;
+JSON does not establish whether an earlier world effect happened.
+
+Checkpoint-safe recovery also admits trusted exact-owner native world-input
+faults after confirmed revocation identifies the first fence as
+`native_input_lease_expired` or `queued_frame_expired_before_application`.
+An absent or unrelated first fence, untyped/opaque fault, unresolved raw effect
+or unconfirmed retirement denies a new invocation. Owners that saw an open
+screen or submitted screen, use or inventory input are excluded. No GUI
+transaction or buffered input is replayed. Recovery invalidates any pending
+old-worker decision before closing it, so a late result cannot publish state,
+events or effects. Stop joins a pending recovery factory and closes its late
+candidate; an unconfirmed candidate closure remains unknown cleanup.
+
 Once previous emitters and the old worker are drained and the clean worker is
 ready, fresh activation sees producer `"none"`, not the transition marker
 `"retiring"`. This also holds when a semantic child settled before the stale
 decision arrived; its original outcome and task high-water mark remain intact.
 The host checks the known raw lease both before sampling and after computation,
 before a running raw choice can renew or submit input. If it expires during
-computation, that result is discarded. A reset-safe session may use its remaining
+computation, that result is discarded. An explicitly recovery-safe session may use its remaining
 restart allowance; other sessions fail closed. Neither path extends the expired
 lease or the original session deadline.
 
 A trusted channel can also reject a capture older than 150 ms before sending
 its heartbeat, even when VM computation finished within its own time bound.
 An exact-owner `heartbeat_admission` / `stale_native_frame` fault marked
-`not_dispatched` may use the same explicit reset-safe allowance. The old decision,
+`not_dispatched` may use either explicit recovery allowance. The old decision,
 state and events are discarded; confirmed retirement and worker closure precede
-fresh activation. Dispatched, untyped, mismatched-owner and other channel faults
-do not enter this path. No stale heartbeat or input is retried.
+fresh activation. Dispatched faults do not enter this known-unsent path;
+checkpoint-safe native retirement has the separate restrictions above. Untyped
+and mismatched-owner faults remain fail-closed. No stale heartbeat or input is retried.
 
 A malformed authored return is a result-validation failure, not evidence that
 native cleanup failed. The sandbox retains plain bounded returned data for the

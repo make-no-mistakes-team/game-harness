@@ -12,10 +12,10 @@ export const controlSessionConfigSchema = z.object({
   max_depth: safeCounterSchema.min(1).max(8).default(8),
   retained_tasks: safeCounterSchema.min(1).max(128).default(32),
   max_restarts: safeCounterSchema.max(16).default(0),
-  recovery: z.enum(["none", "reset_safe"]).default("none"),
+  recovery: z.enum(["none", "reset_safe", "checkpoint_safe"]).default("none"),
 }).strict().superRefine((value, context) => {
   if (value.recovery === "none" && value.max_restarts !== 0)
-    context.addIssue({ code: "custom", path: ["max_restarts"], message: "Restarts require an explicit model-authored reset-safe activation contract" });
+    context.addIssue({ code: "custom", path: ["max_restarts"], message: "Restarts require an explicit model-authored clean-activation recovery contract" });
 });
 export type ControlSessionConfig = z.infer<typeof controlSessionConfigSchema>;
 

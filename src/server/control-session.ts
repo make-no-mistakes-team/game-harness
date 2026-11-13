@@ -1,5 +1,5 @@
 import type { GameActionResult, Json } from "../shared/contracts.ts";
-import type { ControllerChannelFault, ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck } from "../shared/controller.ts";
+import type { ControllerChannelFault, ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck, RevocationAck } from "../shared/controller.ts";
 import { controllerInputSchema, revocationAckSchema } from "../shared/controller.ts";
 import { sameEffectScope, type EffectScope, type WorldHeld, type WorldInputEdge } from "../shared/control.ts";
 import { minecraftControllerFrameSchema, type MinecraftControllerFrame } from "../shared/minecraft.ts";
@@ -37,6 +37,7 @@ export interface ControlSessionOptions extends ResidentControllerOptions {
 const emptyTiming = () => ({ count: 0, p50: null, p95: null, p99: null, max: null, omitted_samples: 0 });
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const settled = (task: Task) => !["starting", "running", "retiring"].includes(task.snapshot.status);
+class RecoveryAdmissionRefused extends Error {}
 
 /** The executive survives finite children; only one selected producer can emit. No tactics live here. */
 export class ControlSession {
@@ -68,6 +69,9 @@ export class ControlSession {
   private anchor = 0;
   private rawGeneration = 0;
   private rawLeaseDeadline = -Infinity;
+  private rawWorldOnly = false;
+  private decisionEpoch = 0;
+  private recoveryWorkerUnknown = false;
   private lastNotify = -Infinity;
   private events = 0;
   private totalEdges = 0;
@@ -172,8 +176,11 @@ export class ControlSession {
     this.timer = this.clock.setTimeout(() => {
       this.timer = null; this.timerAt = Infinity;
       const previousSteps = this.data.counters.steps;
+      const epoch = this.decisionEpoch, channel = this.raw;
       const work = this.tick(); this.flight = work;
       void work.catch(error => {
+        if (epoch !== this.decisionEpoch) return;
+        if (channel && this.recoverNativeFault(channel, error)) return;
         if (error instanceof ControllerChannelFaultError) this.recordControllerFault(this.raw, error.fault);
         else if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
         return this.fail(errorText(error));
@@ -212,10 +219,14 @@ export class ControlSession {
       if (error instanceof ControllerScreenReadSupersededError || transitioning || this.transition || channel !== this.raw) {
         this.data.counters.stale_frames++; return;
       }
-      if (channel) throw this.channelFailure(channel, error);
+      if (channel) {
+        if (this.recoverNativeFault(channel, error)) return;
+        throw this.channelFailure(channel, error);
+      }
       throw error;
     }
     if (!this.current()) return;
+    if (channel === this.raw && frame.screen !== null) this.rawWorldOnly = false;
     if (frame.frame_seq <= this.lastSampleFrame) { this.data.counters.stale_frames++; return; }
     this.lastSampleFrame = frame.frame_seq; this.data.counters.frames++;
     // One latest-capture mailbox: no unbounded frame queue or parallel VM calls.
@@ -240,6 +251,7 @@ export class ControlSession {
     // That capture was never retained by the new channel: compute again from
     // its own next sample rather than relabeling or replaying this one.
     if (samplingTransition || this.transition || samplingChannel !== this.raw || capture.generation !== this.captureGeneration) return;
+    if (this.raw && frame.screen !== null) this.rawWorldOnly = false;
     // After a coordinator stall, the latest buffered capture may already have
     // spent most of its native application window waiting here. No VM has run
     // on it yet: discard it, not its eventual input or mutated source globals.
@@ -258,7 +270,7 @@ export class ControlSession {
     }
     // The host decorates only its own software state, never native or evaluator observations.
     const decorated = { ...frame, executive: this.snapshot().session } as MinecraftControllerFrame;
-    const version = this.data.intent_version, started = this.clock.now();
+    const version = this.data.intent_version, epoch = this.decisionEpoch, started = this.clock.now();
     const period = 1000 / limits.frequency_hz;
     if (this.lastDecisionStarted !== null)
       this.data.counters.missed_slots += Math.max(0, Math.floor((started - this.lastDecisionStarted) / period) - 1);
@@ -266,9 +278,16 @@ export class ControlSession {
     this.data.counters.steps++;
     const activating = !this.activated;
     this.activated = true;
-    const raw = activating
-      ? await this.worker.activate!(decorated, structuredClone(this.data.state), structuredClone(this.intent), this.abort.signal)
-      : await this.worker.step(decorated, structuredClone(this.data.state), structuredClone(this.intent), this.abort.signal);
+    let raw: unknown;
+    try {
+      raw = activating
+        ? await this.worker.activate!(decorated, structuredClone(this.data.state), structuredClone(this.intent), this.abort.signal)
+        : await this.worker.step(decorated, structuredClone(this.data.state), structuredClone(this.intent), this.abort.signal);
+    } catch (error) {
+      if (epoch !== this.decisionEpoch) { this.data.counters.stale_results++; return; }
+      throw error;
+    }
+    if (epoch !== this.decisionEpoch) { this.data.counters.stale_results++; return; }
     if (!this.current() || version !== this.data.intent_version) {
       this.data.counters.stale_results++;
       // Globals may already have changed: never reuse an uncommitted first activation.
@@ -285,7 +304,7 @@ export class ControlSession {
     const choice = result.choice;
     // A live lease at sample time may expire while the worker computes.
     // Do not try to renew that retired owner or submit this computed input.
-    // Only an explicitly reset-safe session may start a fresh invocation.
+    // Only an explicitly selected recovery contract may start a fresh invocation.
     if (!terminal && choice.kind === "raw" && this.raw && this.clock.now() >= this.rawLeaseDeadline) {
       await this.recover("known_expired_raw_lease"); return;
     }
@@ -295,8 +314,8 @@ export class ControlSession {
       implicitEdges = choice.kind === "raw" && choice.input?.kind === "world" && !("edges" in choice.input) &&
         (Object.keys(this.submittedHeld) as (keyof WorldHeld)[]).some(button =>
           choice.input?.kind === "world" && choice.input.held[button] !== this.submittedHeld[button]);
-      const adopted = await this.choose(choice, frame, version);
-      if (!adopted || !this.current() || version !== this.data.intent_version) return;
+      const adopted = await this.choose(choice, frame, version, epoch);
+      if (!adopted || !this.current() || version !== this.data.intent_version || epoch !== this.decisionEpoch) return;
     }
     this.data.state = structuredClone(result.next_state); this.cursor = frame.audible.next_cursor;
     this.data.processed_frame_seq = frame.frame_seq; this.data.processed_native_tick = frame.native_tick;
@@ -337,10 +356,10 @@ export class ControlSession {
       this.notify(true);
     });
   }
-  private async retireRaw(): Promise<void> {
+  private async retireRaw(): Promise<RevocationAck | null> {
     this.rawMonitor.clear();
     const raw = this.raw;
-    if (!raw) return;
+    if (!raw) return null;
     this.recordControllerFault(raw);
     const ack = revocationAckSchema.parse(await raw.revoke());
     if (ack.controller_generation !== raw.controllerGeneration || ack.owner.operation_id !== raw.owner.operation_id ||
@@ -352,6 +371,7 @@ export class ControlSession {
     if (this.raw === raw) this.raw = null;
     for (const button of Object.keys(this.submittedHeld) as (keyof WorldHeld)[]) this.submittedHeld[button] = false;
     this.inputCaptures.clear(); this.session.producer = "none"; this.session.last_submission = null;
+    return ack;
   }
   private async retire(task: Task, reason: string): Promise<void> {
     if (task.retirement) return task.retirement;
@@ -374,7 +394,7 @@ export class ControlSession {
     return task.retirement;
   }
   private reject(reason: string): boolean { this.session.last_command_error = reason.slice(0, 1000); return true; }
-  private async choose(choice: ExecutiveChoice, frame: MinecraftControllerFrame, expectedIntentVersion: number): Promise<boolean> {
+  private async choose(choice: ExecutiveChoice, frame: MinecraftControllerFrame, expectedIntentVersion: number, epoch: number): Promise<boolean> {
     this.session.last_command_error = null;
     if (choice.kind !== "raw") this.rawMonitor.clear();
     if (choice.kind === "raw") {
@@ -390,6 +410,7 @@ export class ControlSession {
             this.stationaryViewMonitor.clear();
           this.stationaryViewScope = channel.owner.scope;
           this.raw = channel;
+          this.rawWorldOnly = frame.screen === null;
           this.rawLeaseDeadline = openedAt + 250;
           this.session.last_submission = null;
           this.data.controller_generation = channel.controllerGeneration;
@@ -415,6 +436,9 @@ export class ControlSession {
         desired = { ...desired, edges };
       }
       const input = desired === null ? null : controllerInputSchema.parse(desired);
+      if (input?.kind === "screen" || input?.kind === "world" && (input.held.use ||
+        input.edges.some(edge => edge.kind === "button" && edge.phase === "press" &&
+          (edge.button === "inventory" || edge.button === "use")))) this.rawWorldOnly = false;
       const expanded = input === null ? 0 : input.kind === "screen" ? input.operations.length : input.edges.reduce((sum, edge) => sum + (edge.kind === "button" ? edge.count : 1), 0);
       while (this.edgeWindow.length && this.edgeWindow[0]!.at <= this.clock.now() - 1000) this.edgeWindow.shift();
       if (expanded > this.options.limits.max_edges - this.totalEdges ||
@@ -441,7 +465,7 @@ export class ControlSession {
         throw failure;
       }
       this.rawLeaseDeadline = renewalStarted + 250;
-      if (!this.current()) return false;
+      if (!this.current() || epoch !== this.decisionEpoch) return false;
       if (this.data.intent_version !== expectedIntentVersion) {
         this.data.counters.stale_results++;
         throw new Error("session_decision_superseded_before_input_admission");
@@ -474,7 +498,7 @@ export class ControlSession {
       return true;
     }
     if (choice.kind === "observe") {
-      if (this.raw) { this.change(() => this.retireRaw()); return true; }
+      if (this.raw) { this.change(async () => { await this.retireRaw(); }); return true; }
       // Observing deliberately does not renew a semantic producer's supervision lease.
       this.data.counters.no_input_decisions++; return true;
     }
@@ -519,7 +543,7 @@ export class ControlSession {
     // Adoption reserves an idempotent logical child immediately. Otherwise a
     // policy that records its requested strike/task would lose that request
     // when retirement finishes and its next decision chooses something else.
-    if (this.raw) { this.change(() => this.retireRaw()); return true; }
+    if (this.raw) { this.change(async () => { await this.retireRaw(); }); return true; }
     if (previous) { this.change(() => this.retire(previous, "Executive selected another child")); return true; }
     this.startTask(task, frame);
     return true;
@@ -601,23 +625,60 @@ export class ControlSession {
     if (!capture) return;
     this.options.effect(capture.input, event); this.inputCaptures.delete(key);
   }
-  private async recover(reason: string): Promise<void> {
-    // A compile-once realm cannot roll back globals, events, edges and audio independently.
-    // Recovery starts a clean explicitly reset-safe invocation, never a replay/checkpoint claim.
-    if (this.options.config.recovery !== "reset_safe" || !this.options.restartWorker ||
+  private exactFault(channel: ControllerInputChannel, fault: ControllerChannelFault): boolean {
+    return fault.owner.operation_id === channel.owner.operation_id && fault.owner.generation === channel.owner.generation &&
+      sameEffectScope(fault.owner.scope, channel.owner.scope) && fault.controller_generation === channel.controllerGeneration &&
+      fault.original_deadline_host_ms === this.options.deadline_host_ms;
+  }
+  private recoverNativeFault(channel: ControllerInputChannel, error: unknown): boolean {
+    if (!this.current() || channel !== this.raw || this.transition || !this.rawWorldOnly ||
+      this.options.config.recovery !== "checkpoint_safe" || !this.options.restartWorker ||
+      this.session.restarts >= this.options.config.max_restarts ||
+      !(error instanceof ControllerChannelFaultError) || !error.fault || !this.exactFault(channel, error.fault) ||
+      !["sample", "heartbeat_response", "submit_response"].includes(error.fault.stage) ||
+      !["native_rejected", "native_lease_expired", "native_frame_expired"].includes(error.fault.cause)) return false;
+    this.recordControllerFault(channel, error.fault);
+    // A candidate is not permission to retry. Exact retirement must supply the
+    // native first-fence cause before a new realm can be created.
+    void this.recover("confirmed_native_world_fence", channel);
+    return true;
+  }
+  private async recover(reason: string, nativeCandidate?: ControllerInputChannel): Promise<void> {
+    const checkpoint = this.options.config.recovery === "checkpoint_safe";
+    // Only committed JSON crosses realms. Globals, pending results and effects do not.
+    if (this.options.config.recovery === "none" || !this.options.restartWorker ||
       this.session.restarts >= this.options.config.max_restarts || this.transition) throw new Error(`session_recovery_refused: ${reason}`);
+    if (checkpoint && this.raw && !this.rawWorldOnly) throw new Error(`session_recovery_refused_gui: ${reason}`);
+    const state = structuredClone(checkpoint ? this.data.state : this.options.initial_state);
+    this.decisionEpoch++;
     this.change(async () => {
       if (this.activeTask) await this.retire(this.activeTask, reason);
-      await this.retireRaw(); await this.worker.close();
+      const retirement = await this.retireRaw();
+      if (checkpoint && retirement && retirement.unresolved_operation_refs.length)
+        throw new RecoveryAdmissionRefused("session_recovery_refused_unresolved_raw_effects");
+      if (nativeCandidate) {
+        const retired = nativeCandidate.snapshot(), fault = retired.fault;
+        if (!retired.retired || !fault || !this.exactFault(nativeCandidate, fault) ||
+          !["native_input_lease_expired", "queued_frame_expired_before_application"].includes(fault.native_first_fence?.reason ?? ""))
+          throw new RecoveryAdmissionRefused("session_recovery_refused_native_fence");
+      }
+      try { await this.worker.close(); } catch (error) { this.recoveryWorkerUnknown = true; throw error; }
       if (!this.current()) return;
       this.session.restarts++; this.session.behavior_generation++;
-      this.worker = await this.options.restartWorker!(this.abort.signal);
-      if (!this.worker.activate) throw new Error("Recovery worker lacks reset-safe activation");
+      let candidate: ResidentWorker;
+      try { candidate = await this.options.restartWorker!(this.abort.signal); }
+      catch (error) { if (error instanceof ResidentCleanupError) this.recoveryWorkerUnknown = true; throw error; }
+      if (!this.current() || !candidate.activate) {
+        try { await candidate.close(); } catch (error) { this.recoveryWorkerUnknown = true; throw error; }
+        if (!this.current()) return;
+        throw new RecoveryAdmissionRefused("Recovery worker lacks clean activation");
+      }
+      this.worker = candidate;
       // The child may have settled before recovery started, leaving no retire()
       // call to clear the transition marker. All previous emitters are drained.
       this.session.producer = "none";
-      this.data.state = structuredClone(this.options.initial_state); this.activated = false;
-      this.options.record("session.reset_safe_restart", { reason, generation: this.session.behavior_generation,
+      this.data.state = state; this.activated = false;
+      this.options.record(checkpoint ? "session.checkpoint_safe_restart" : "session.reset_safe_restart", { reason, generation: this.session.behavior_generation,
         original_deadline_host_ms: this.options.deadline_host_ms, replayed_effects: false });
     });
   }
@@ -661,11 +722,21 @@ export class ControlSession {
     void (async () => {
       const cleanup = await Promise.allSettled([
         Promise.resolve().then(async () => {
-          await this.transition;
+          await this.transition?.catch(error => {
+            if (!this.recoveryWorkerUnknown && !(error instanceof RecoveryAdmissionRefused)) throw error;
+          });
           if (this.activeTask) await this.retire(this.activeTask, reason);
           await this.retireRaw(); this.data.cleanup.native = "retired";
         }),
-        Promise.resolve().then(async () => { await this.worker.close(); this.data.cleanup.worker = "closed"; }),
+        Promise.resolve().then(async () => {
+          await this.worker.close();
+          // Recovery may still own a factory result after Stop closes the old worker.
+          await this.transition?.catch(error => {
+            if (!this.recoveryWorkerUnknown && !(error instanceof RecoveryAdmissionRefused)) throw error;
+          });
+          if (this.recoveryWorkerUnknown) throw new ResidentCleanupError();
+          this.data.cleanup.worker = "closed";
+        }),
         Promise.resolve().then(async () => { await this.analysisLane.drain(); }),
         // A source/result failure is the reason for stopping, not failed cleanup.
         // Join the attempt; worker.close and exact native retirement prove drain.

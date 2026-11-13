@@ -234,6 +234,14 @@ export class ControlSession {
       this.data.counters.stale_frames++;
       return;
     }
+    const applied = this.raw?.snapshot().last_input;
+    if (applied?.input_application === "confirmed" &&
+      BigInt(frame.captured_native_ns) < BigInt(applied.applied_native_ns)) {
+      // The read may have completed recently but still precede the previous
+      // input's application. Wait for actual post-application feedback.
+      this.data.counters.stale_frames++;
+      return;
+    }
     // The host decorates only its own software state, never native or evaluator observations.
     const decorated = { ...frame, executive: this.snapshot().session } as MinecraftControllerFrame;
     const version = this.data.intent_version, started = this.clock.now();

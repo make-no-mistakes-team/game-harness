@@ -701,6 +701,40 @@ test("a coordinator stall discards an aged mailbox before VM invocation while on
   }
 });
 
+test("a newly delivered capture from before confirmed raw application cannot drive the next VM decision", async () => {
+  const h = harness(), open = h.options.open;
+  const oldRead = Promise.withResolvers<void>(), freshRead = Promise.withResolvers<void>();
+  let applied: InputAppliedAck | null = null, reads = 0;
+  h.options.open = async (deadline, onApplied, effect, ...rest) => {
+    const channel = await open(deadline, ack => { applied = ack; onApplied(ack); }, effect, ...rest);
+    const sample = channel.sample.bind(channel), snapshot = channel.snapshot.bind(channel);
+    channel.snapshot = () => ({ ...snapshot(), last_input: applied, applied_sequence: applied?.sequence ?? 0 });
+    channel.sample = async cursor => {
+      const frame = await sample(cursor);
+      if (++reads === 2) await oldRead.promise;
+      else if (reads === 3) await freshRead.promise;
+      return frame;
+    };
+    return channel;
+  };
+  h.options.worker.step = vi.fn(h.options.worker.step);
+  try {
+    h.choose(rawChoice); await h.session.start(); await h.clock.advance(125);
+    expect(h.sent).toHaveLength(1);
+    h.acknowledge(1, 1);
+    oldRead.resolve(); await settle(); await h.clock.advance(25);
+    expect(h.options.worker.step).toHaveBeenCalledTimes(1);
+    expect(h.sent).toHaveLength(1);
+    freshRead.resolve(); await settle(); await h.clock.advance(50);
+    expect(h.options.worker.step).toHaveBeenCalledTimes(2);
+    expect(h.sent).toHaveLength(2);
+    expect(BigInt(minecraftControllerFrameSchema.parse(h.sent[1]!.frame).captured_native_ns)).toBeGreaterThanOrEqual(125_000_000n);
+    expect(h.session.snapshot()).toMatchObject({ status: "running", counters: { stale_frames: 1 }, session: { restarts: 0 } });
+  } finally {
+    oldRead.resolve(); freshRead.resolve(); await h.session.stop("test complete");
+  }
+});
+
 const analysisBundle = singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze");
 const analysisSource = { skill_id: "pure-analysis", version: 1, hash: analysisBundle.source_hash, bundle: analysisBundle };
 

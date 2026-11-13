@@ -458,6 +458,10 @@ one configured sampling period or 150 ms, whichever is smaller, is discarded.
 The source has not run on it, so neither state rollback nor input replay is
 needed. This host waiting-time check does not replace the native capture-age
 checks at admission and application.
+Within a raw producer, a capture must also be at least as new as that channel's
+latest confirmed application ACK. A delayed read taken before the previous
+input applied cannot drive another decision merely because it arrived recently.
+It is discarded before source invocation; no pose or timestamp is relabelled.
 Read count and VM-step count have separate original limits; skipped captures
 still consume the read budget. Stop fences both lanes and joins the exact
 outstanding read, worker and native retirement. Sampling alone never renews a

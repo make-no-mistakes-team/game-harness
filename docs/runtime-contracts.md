@@ -568,6 +568,14 @@ computation, that result is discarded. A reset-safe session may use its remainin
 restart allowance; other sessions fail closed. Neither path extends the expired
 lease or the original session deadline.
 
+A trusted channel can also reject a capture older than 150 ms before sending
+its heartbeat, even when VM computation finished within its own time bound.
+An exact-owner `heartbeat_admission` / `stale_native_frame` fault marked
+`not_dispatched` may use the same explicit reset-safe allowance. The old decision,
+state and events are discarded; confirmed retirement and worker closure precede
+fresh activation. Dispatched, untyped, mismatched-owner and other channel faults
+do not enter this path. No stale heartbeat or input is retried.
+
 A malformed authored return is a result-validation failure, not evidence that
 native cleanup failed. The sandbox retains plain bounded returned data for the
 trusted decoder to report invalid fields. Joining a rejected computation is

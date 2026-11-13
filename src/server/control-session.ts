@@ -358,7 +358,23 @@ export class ControlSession {
         throw new Error("session_edge_budget");
       const renewalStarted = this.clock.now();
       try { await this.raw.renew(admittedFrame as unknown as Json); } catch (error) {
-        throw this.channelFailure(this.raw, error);
+        const failure = this.channelFailure(this.raw, error), fault = failure.fault;
+        // The channel can reject capture age after otherwise timely VM work.
+        // Only this trusted exact-owner, known-unsent admission is reset-safe;
+        // an asynchronous response or unrelated fault remains fail-closed.
+        if (error instanceof ControllerChannelFaultError && fault?.stage === "heartbeat_admission" &&
+          fault.cause === "stale_native_frame" && fault.decision_dispatch === "not_dispatched" &&
+          fault.request_id === null && fault.sequence === null &&
+          fault.owner.operation_id === this.raw.owner.operation_id && fault.owner.generation === this.raw.owner.generation &&
+          sameEffectScope(fault.owner.scope, this.raw.owner.scope) &&
+          fault.controller_generation === this.raw.controllerGeneration &&
+          fault.frame_seq === admittedFrame.frame_seq && fault.captured_native_ns === admittedFrame.captured_native_ns &&
+          fault.original_deadline_host_ms === this.options.deadline_host_ms) {
+          this.data.counters.stale_results++;
+          await this.recover("known_unsent_stale_native_frame");
+          return false;
+        }
+        throw failure;
       }
       this.rawLeaseDeadline = renewalStarted + 250;
       if (!this.current()) return false;

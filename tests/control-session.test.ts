@@ -4,10 +4,10 @@ import { controlSessionConfigSchema, executiveSnapshotSchema, type ExecutiveChoi
 import { DEFAULT_RESIDENT_LIMITS, ResidentCleanupError, type ExecutiveStepResult, type ResidentClock, type ResidentSnapshot } from "../src/shared/resident.ts";
 import { singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
 import type { GameActionResult, Json } from "../src/shared/contracts.ts";
-import type { ControllerInputChannel, InputAppliedAck, RevocationAck } from "../src/shared/controller.ts";
+import type { ControllerChannelFault, ControllerInputChannel, InputAppliedAck, RevocationAck } from "../src/shared/controller.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { minecraftControllerFrameSchema, type MinecraftControllerFrame } from "../src/shared/minecraft.ts";
-import { controllerNativeDeadline, ControllerScreenReadSupersededError, NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
+import { controllerNativeDeadline, ControllerChannelFaultError, ControllerScreenReadSupersededError, NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
 
 async function settle() { for (let index = 0; index < 100; index++) await Promise.resolve(); }
 class Clock implements ResidentClock {
@@ -705,6 +705,74 @@ test("a source error impersonating the host fault name cannot create trusted cha
   expect(h.records.filter(record => record.type === "session.controller_fault")).toHaveLength(0);
   expect(h.session.snapshot()).toMatchObject({ status: "failed", session: { restarts: 0 } });
 });
+
+test.each(["reset_safe", "none", "dispatched", "wrong_owner"] as const)(
+  "known-unsent stale renewal starts only an explicitly reset-safe exact-owner invocation: %s", async mode => {
+    const h = harness(), open = h.options.open, restart = Promise.withResolvers<ControlSessionOptions["worker"]>();
+    let rejected = false, restarts = 0;
+    const fresh: { state: Json; producer: string | undefined }[] = [];
+    h.options.config = { ...h.options.config, recovery: mode === "none" ? "none" : "reset_safe",
+      max_restarts: mode === "none" ? 0 : 1 };
+    h.options.restartWorker = async () => { restarts++; return await restart.promise; };
+    h.options.worker.step = async (_frame, _state, _intent) => ({ choice: rawChoice, next_state: 777,
+      status: "running", events: [{ kind: "diagnostic", urgency: "ordinary", summary: "uncommitted stale decision", details: null }] });
+    h.options.open = async (...args) => {
+      const channel = await open(...args), renew = channel.renew.bind(channel);
+      channel.renew = async frame => {
+        if (rejected) return await renew(frame);
+        rejected = true;
+        const capture = minecraftControllerFrameSchema.parse(frame);
+        const fault: ControllerChannelFault = {
+          schema_version: 1, stage: "heartbeat_admission", cause: "stale_native_frame",
+          decision_dispatch: mode === "dispatched" ? "dispatched" : "not_dispatched",
+          owner: mode === "wrong_owner" ? { ...channel.owner, operation_id: "unrelated-owner" } : channel.owner,
+          controller_generation: channel.controllerGeneration, sequence: null, frame_seq: capture.frame_seq,
+          captured_native_ns: capture.captured_native_ns, request_id: null, request_method: null,
+          initiating_request_id: null, initiating_method: null, host_detected_ms: h.clock.now(),
+          original_deadline_host_ms: h.options.deadline_host_ms, native_first_fence: null,
+          detail: "Trusted local stale-capture admission refused before heartbeat/input dispatch",
+        };
+        throw new ControllerChannelFaultError(fault, fault.detail);
+      };
+      return channel;
+    };
+    h.options.event = vi.fn();
+    try {
+      h.choose(rawChoice); await h.session.start(); await h.clock.advance(50);
+      expect(h.sent).toHaveLength(0);
+      expect(h.options.event).not.toHaveBeenCalled();
+      if (mode === "reset_safe") {
+        expect(restarts).toBe(1);
+        expect(h.workerClosed).toBe(1);
+        expect(h.session.snapshot()).toMatchObject({ status: "running", state: 1 });
+        await h.clock.advance(100);
+        expect(h.sent).toHaveLength(0);
+        expect(fresh).toEqual([]);
+        restart.resolve({
+          async activate(frame, state) {
+            fresh.push({ state, producer: executiveSnapshotSchema.parse(minecraftControllerFrameSchema.parse(frame).executive).producer });
+            return { choice: rawChoice, next_state: 1, status: "running", events: [] };
+          },
+          async step() { return { choice: rawChoice, next_state: 2, status: "running", events: [] }; },
+          async close() {},
+        });
+        await settle(); await h.clock.advance(100);
+        expect(fresh).toEqual([{ state: 0, producer: "none" }]);
+        expect(h.sent).toHaveLength(1);
+        expect(h.session.snapshot()).toMatchObject({ status: "running", state: 2,
+          session: { restarts: 1, behavior_generation: 2, deadline_host_ms: 10000 } });
+        expect(h.records.find(row => row.type === "session.reset_safe_restart")?.details)
+          .toMatchObject({ reason: "known_unsent_stale_native_frame", replayed_effects: false, original_deadline_host_ms: 10000 });
+      } else {
+        expect(restarts).toBe(0);
+        expect(h.session.snapshot()).toMatchObject({ status: "failed", session: { restarts: 0 },
+          cleanup: { worker: "closed", native: "retired" } });
+      }
+    } finally {
+      restart.resolve(h.options.worker);
+      await h.session.stop("test complete");
+    }
+  });
 
 test.each(["sample", "renew", "submit"] as const)("an untyped trusted %s failure records explicit missing cause before cleanup", async stage => {
   const h = harness(), open = h.options.open;

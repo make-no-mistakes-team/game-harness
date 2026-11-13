@@ -433,6 +433,7 @@ test(`${recoveryKind} recovery drains the actual old feedback reader before admi
       if (prompts > 2) return;
       await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
       if (prompts === 1) await tools.find(tool => tool.name === "program_write")!.execute("write-history-root", {
+        entry: "run",
         name: "History recovery root", source: 'return {status:"blocked",summary:"Bounded retained root outcome",result:null};',
         dependencies: [], card: { purpose: "Retain root outcomes", applicability: "Fixture",
           method: "Return a bounded outcome", reason: "History recovery regression", limitations: "No gameplay claim" },
@@ -652,6 +653,8 @@ for (const backlog of [0, 501]) test(`Runtime resident attention reaches the rea
         sample: async () => {
           const frame = controllerFrameFixture(observation.life.life_id, observation.space.space_epoch);
           frame.frame_seq = ++sample; frame.native_tick = sample; frame.captured_native_ns = String(sample * 50000000);
+          frame.dynamic_entities.native_tick = sample; frame.dynamic_entities.captured_native_ns = frame.captured_native_ns;
+          frame.inventory.captured_native_ns = frame.captured_native_ns;
           return jsonSchema.parse(frame);
         },
         submit: () => { throw new Error("Neutral resident must not submit input"); }, renew: async () => {},
@@ -870,6 +873,7 @@ test("a pending program stays unpolled and native first-cause remains immutable 
         await tools
           .find((tool) => tool.name === "program_write")!
           .execute("register", {
+              entry: "run",
               name: "Neutral observer",
               source:
                 'for (let step = 0; step < 2; step++) { await game.observe(); const result = await game.action({kind:"look",yaw:step * 0.1,pitch:0}); if (result.status !== "succeeded") return {status:"blocked",summary:"Neutral fixture action did not succeed",result}; } return {status:"completed",summary:"Bounded neutral flow settled",result:null};',

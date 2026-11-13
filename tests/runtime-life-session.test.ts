@@ -131,7 +131,7 @@ async function fixture(options: Options = {}) {
     return result;
   };
   const write = async (name: string, source: string, dependencies: { name: string; version?: number }[] = []) =>
-    await required("program_write", { name, source, card, dependencies });
+    await required("program_write", { entry: "run", name, source, card, dependencies });
   const authState: AuthState = { status: "ready", authenticated: true, provider: "openai-codex", account_label: null, models: [{ id: "fixture-model", name: "Fixture", provider: "fixture", context_window: null }], login: null, error: null };
   const auth = {
     snapshot: () => authState,
@@ -178,7 +178,7 @@ async function fixture(options: Options = {}) {
               await required("prepare_next", { name: FOLLOW, args: { mode: "follow-up" }, limits: DEFAULT_SKILL_LIMITS,
                 ...(options.guardSource === undefined ? {} : { guard_source: options.guardSource }) });
             } else if (context.phase === "reviewing") {
-              const result = await required("program_write", { name: ROOT, based_on: 1,
+              const result = await required("program_write", { entry: "run", name: ROOT, based_on: 1,
                 source: 'await game.observe(); return {status:"blocked",summary:"Candidate awaits a future task",result:null};', card, dependencies: [] });
               reviewed.resolve(result.details);
             } else if (!rootStarted) {
@@ -569,7 +569,7 @@ test("named root opt-in overlaps actual local continuation without exposing ordi
   await reached(f, f.specEntered.promise);
   expect(f.advertised()).toContain("prepare_next");
   expect(f.advertised()).not.toContain("program_run");
-  const written = await f.invoke("program_write", { name: "inactive prepared reference",
+  const written = await f.invoke("program_write", { entry: "run", name: "inactive prepared reference",
     source: 'return {status:"completed",summary:"Inactive reference",result:null};' });
   expect(written.isError).not.toBe(true);
   expect(f.store.namedSkill(f.created.run_id, "inactive prepared reference")?.entry).toBe("run");
@@ -777,13 +777,13 @@ test("named source and comparisons cannot read another model's workspace", async
 
 test("named revision pins the original running version and trusted call retries cannot select today's latest", async () => {
   const f = await fixture(); const original = f.store.namedSkill(f.created.run_id, ROOT, 1)!;
-  const written = await f.invoke("program_write", { name: ROOT, based_on: 1, source: 'await game.observe(); return {status:"blocked",summary:"Unmeasured candidate",result:null};', card, dependencies: [] });
+  const written = await f.invoke("program_write", { entry: "run", name: ROOT, based_on: 1, source: 'await game.observe(); return {status:"blocked",summary:"Unmeasured candidate",result:null};', card, dependencies: [] });
   expect(written.details).toMatchObject({ name: ROOT, version: 2 });
   const retry = await f.retryRoot(); expect(retry.isError).not.toBe(true);
   expect(f.findExecution(ROOT)).toMatchObject({ version: 1, status: "running" });
   expect(f.store.allSkillExecutions(f.created.run_id)).toHaveLength(1);
   expect(f.store.skill(f.created.run_id, original)).toMatchObject({ source: original.source, hash: original.hash });
-  const stale = await f.invoke("program_write", { name: ROOT, based_on: 1, source: 'return {status:"blocked",summary:"Stale candidate",result:null};', card, dependencies: [] });
+  const stale = await f.invoke("program_write", { entry: "run", name: ROOT, based_on: 1, source: 'return {status:"blocked",summary:"Stale candidate",result:null};', card, dependencies: [] });
   expect(stale).toMatchObject({ isError: true, details: { error: { code: "conflict", issues: [{ latest_parent: { name: ROOT, version: 2 } }] } } });
   f.finishFirst(); f.workerExit.resolve(); await f.runtime.control(f.created.run_id, "stop");
 });
@@ -823,7 +823,7 @@ test("a revision reason links the exact candidate experiment without a bookkeepi
   const feedback = await f.invoke("program_inspect", { view: "feedback", program: { name: ROOT, version: 1 } });
   expect(feedback.isError).not.toBe(true);
   expect(f.store.evidenceObjects<ImprovementOpportunity>(f.created.run_id, "opportunity")).toEqual(before);
-  const input = { name: ROOT, based_on: 1, reason: "Choose this candidate experiment without claiming proven efficacy", source: 'await game.observe(); return {status:"blocked",summary:"Candidate awaiting independent measurement",result:null};', card, dependencies: [] };
+  const input = { entry: "run", name: ROOT, based_on: 1, reason: "Choose this candidate experiment without claiming proven efficacy", source: 'await game.observe(); return {status:"blocked",summary:"Candidate awaiting independent measurement",result:null};', card, dependencies: [] };
   const written = await f.invoke("program_write", input, "write-candidate-experiment");
   expect(written.isError).not.toBe(true);
   expect(written.details).toMatchObject({ name: ROOT, version: 2, experiment: { decision: "revise", measured: false, qualification: "candidate_not_proven_improvement" } });

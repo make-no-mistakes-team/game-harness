@@ -1525,7 +1525,7 @@ test("real SDK budget correction cannot reset the original twelve-call allowance
 test("real SDK argument budget admits a 16KiB source, free JSON execution arguments and a bounded intentional wait", async () => {
   let requests = 0, executed = 0;
   const calls: ToolCall[] = [
-    { type: "toolCall", id: "legal-source", name: "program_write", arguments: { name: "Legal source", source: `/*${"x".repeat(16380)}*/` } },
+    { type: "toolCall", id: "legal-source", name: "program_write", arguments: { entry: "run", name: "Legal source", source: `/*${"x".repeat(16380)}*/` } },
     { type: "toolCall", id: "free-json", name: "program_run", arguments: { operation: "start", entry: "run",
       name: "Legal", version: 1, args: { ["nested free key ".repeat(100)]: "j".repeat(40000) } } },
     { type: "toolCall", id: "intentional-wait", name: "program_run",

@@ -86,6 +86,7 @@ test("a genuine transport fault pauses only after native and isolated emitters c
         initialized = true;
         expect(context.phase).toBe("running");
         await tools.find(tool => tool.name === "program_write")!.execute("register", {
+          entry: "run",
           name: "Neutral drain fixture", source: 'const result = await game.action({kind:"look",yaw:0,pitch:0}); return {status:"completed",summary:"Neutral result inspected",result};', card: { purpose: "Exercise cancellation", applicability: "Connected fixture", method: "Await one bounded neutral effect", reason: "Prove teardown barriers", limitations: "No gameplay claim" }, dependencies: [],
         });
         await tools.find(tool => tool.name === "program_run")!.execute("start", { operation: "start", name: "Neutral drain fixture", args: null, limits: { ...DEFAULT_SKILL_LIMITS } });

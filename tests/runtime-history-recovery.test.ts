@@ -161,6 +161,7 @@ async function fixture(unconfirmedBarrier = false) {
             await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
             if (ordinal === 1) {
               const written = await invoke("program_write", {
+                entry: "run",
                 name,
                 source:
                   'const result = await game.action({kind:"look",yaw:0,pitch:0}); return {status:"blocked",summary:"Uncertain effect retained",result};',

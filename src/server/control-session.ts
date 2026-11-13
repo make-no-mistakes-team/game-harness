@@ -418,11 +418,12 @@ export class ControlSession {
     const existing = this.tasks.get(handle);
     if (choice.kind === "cancel") {
       if (existing && !settled(existing)) { this.change(() => this.retire(existing, "Executive cancelled exact child")); return true; }
+      if (existing) this.data.counters.no_input_decisions++;
       return existing ? true : this.reject(`Task ${handle} detail expired or was never admitted; no replay (high-water ${this.session.task_high_water})`);
     }
     if (choice.kind === "continue") {
       if (!existing) return this.reject(`Task ${handle} detail not retained; history ${this.options.execution_id}:task:${handle}; no replay`);
-      if (settled(existing)) return true;
+      if (settled(existing)) { this.data.counters.no_input_decisions++; return true; }
       if (existing !== this.activeTask || existing.snapshot.status === "retiring") return this.reject("Retiring or inactive child cannot renew");
       if (existing.snapshot.status === "starting") { this.startTask(existing, frame); return true; }
       await this.options.supervise(handle, frame, this.session.behavior_generation); return true;
@@ -430,6 +431,7 @@ export class ControlSession {
     const fingerprint = JSON.stringify(choice.request);
     if (existing) {
       if (existing.fingerprint !== fingerprint) return this.reject("Task key conflict: changed content cannot execute under an existing key");
+      if (settled(existing)) this.data.counters.no_input_decisions++;
       if (existing === this.activeTask) {
         if (existing.snapshot.status === "starting") this.startTask(existing, frame);
         else if (existing.snapshot.status === "running") await this.options.supervise(handle, frame, this.session.behavior_generation);

@@ -8,6 +8,7 @@ import type { ControllerChannelFault, ControllerInputChannel, InputAppliedAck, R
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { minecraftControllerFrameSchema, type MinecraftControllerFrame } from "../src/shared/minecraft.ts";
 import { controllerNativeDeadline, ControllerChannelFaultError, ControllerScreenReadSupersededError, NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
+import { ExecutiveObservationMonitor } from "../src/server/executive-incidents.ts";
 
 async function settle() { for (let index = 0; index < 100; index++) await Promise.resolve(); }
 class Clock implements ResidentClock {
@@ -590,6 +591,35 @@ test("accepted observe-only choices do not duplicate the software-only observati
   expect(h.sent).toHaveLength(0);
   await h.session.stop("test complete");
 });
+
+test.each(["ensure_task", "continue", "cancel"] as const)(
+  "repeated settled %s lookups request software advice without replaying or stopping the executive", async kind => {
+    const h = harness(), monitor = new ExecutiveObservationMonitor(), advice: Json[] = [];
+    h.options.changed = snapshot => {
+      const incident = monitor.update("executive", snapshot, h.clock.now());
+      if (incident) advice.push(incident);
+    };
+    h.choose({ kind: "ensure_task", key: 1, request });
+    await h.session.start(); await h.clock.advance(0);
+    expect(h.completed).toHaveLength(1);
+    h.completed[0]!.result.resolve(success); await settle();
+    h.choose(kind === "ensure_task" ? { kind, key: 1, request } : { kind, handle: 1 });
+    try {
+      await h.clock.advance(6100);
+      expect(advice).toHaveLength(1);
+      expect(advice[0]).toMatchObject({ reason: "executive_no_effect_decisions", elapsed_host_ms: 5000 });
+      expect(advice[0]).not.toHaveProperty("world_effect_emitted");
+      expect(h.completed).toHaveLength(1);
+      expect(h.sent).toHaveLength(0);
+      expect(h.session.snapshot()).toMatchObject({ status: "running", session: { producer: "none", task_high_water: 1 } });
+      const noInput = h.session.snapshot().counters.no_input_decisions;
+      h.choose({ kind: "ensure_task", key: 2, request: { ...request, duration_ms: 3000 } });
+      await h.clock.advance(2500);
+      expect(h.completed).toHaveLength(2);
+      expect(h.session.snapshot().counters.no_input_decisions).toBe(noInput);
+      expect(advice).toHaveLength(1);
+    } finally { await h.session.stop("test complete"); }
+  });
 
 const analysisBundle = singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze");
 const analysisSource = { skill_id: "pure-analysis", version: 1, hash: analysisBundle.source_hash, bundle: analysisBundle };

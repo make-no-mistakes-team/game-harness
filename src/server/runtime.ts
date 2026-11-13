@@ -260,7 +260,7 @@ export class Runtime {
     const incident = this.executiveObservation.update(execution.execution_id, snapshot, performance.now());
     if (!incident) return;
     this.store.event(execution.run_id, "program.repeated_no_effect",
-      "Advisory: executive decisions only observed without selecting a producer for at least five seconds; observation may be intentional", {
+      "Advisory: executive decisions observed or looked up settled tasks without selecting a producer for at least five seconds; usefulness is not inferred", {
         source: "runtime_mechanical", usefulness_inferred: false, ...incident,
         execution_id: execution.execution_id, source_hash: execution.source_hash,
         root_execution_id: execution.execution_id, root_source_hash: execution.source_hash,

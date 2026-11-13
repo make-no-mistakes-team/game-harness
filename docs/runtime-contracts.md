@@ -445,13 +445,20 @@ session. A child is not a saved async stack: resumption requires a fresh keyed
 invocation chosen from current observations. Source replacement, local recovery
 and child starts do not renew the original session deadline.
 
-Five seconds of fresh consecutive executive decisions that only observe, with
-no selected producer, new task or raw submission, emit one mechanical advisory
+Five seconds of fresh consecutive executive decisions that only observe or
+look up settled tasks, with no selected producer, new task or raw submission,
+emit one `executive_no_effect_decisions` mechanical advisory
 per continuous interval. A changed intent, owner, command or sampling gap resets
 the interval. The advisory requests an ordinary strategic decision while leaving
 the executive running; it does not abort an admitted provider request, select
 input or infer that observation is useless. Missing progress and stationary
 productive work are not classified as inactivity.
+
+An identical `ensure_task`, `continue` or `cancel` for a retained settled handle
+counts as a no-input decision: it neither replays the task nor supervises a live
+producer. Running children do not accumulate this counter. Repeated settled
+lookups can therefore request cognition without ending local control or
+supplying a source repair.
 
 Raw controls have a separate confirmed-input advisory. Five seconds of fresh
 ACKs can establish neutral input, or directional input while all sampled own

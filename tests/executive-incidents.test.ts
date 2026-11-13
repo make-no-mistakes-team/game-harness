@@ -36,7 +36,7 @@ test("five seconds of fresh observe-only decisions produce one advisory per cont
   }
   observe(frame);
   expect(monitor.update("executive", frame, 5000)).toEqual({
-    reason: "executive_observe_only", elapsed_host_ms: 5000, no_input_decisions: 6,
+    reason: "executive_no_effect_decisions", elapsed_host_ms: 5000, no_input_decisions: 6,
     processed_frame_seq: 6, intent_version: 0,
   });
   for (let now = 6000; now <= 10000; now += 1000) {

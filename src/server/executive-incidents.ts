@@ -116,7 +116,7 @@ export class ExecutiveStationaryViewMonitor {
   }
 }
 
-/** Software-only advice. Observation may be purposeful; this never selects input. */
+/** Software-only advice for observation or settled-task lookups, never a gameplay verdict. */
 export class ExecutiveObservationMonitor {
   private interval: {
     execution: string; intent: number; since: number; at: number; frame: number;
@@ -144,7 +144,7 @@ export class ExecutiveObservationMonitor {
     };
     if (interval.notified || now - interval.since < 5000) return null;
     interval.notified = true;
-    return { reason: "executive_observe_only", elapsed_host_ms: now - interval.since,
+    return { reason: "executive_no_effect_decisions", elapsed_host_ms: now - interval.since,
       no_input_decisions: interval.observations, processed_frame_seq: frame, intent_version: interval.intent };
   }
 }

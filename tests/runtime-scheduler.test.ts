@@ -199,7 +199,7 @@ test("observe-only executive requests one ordinary decision without inventing ef
   expect(fixture.contexts[1]).toMatchObject({ reason: ["program_no_effect"], pending_decision: true });
   expect(fixture.contexts[1]!.feedback).toEqual(expect.arrayContaining([expect.objectContaining({
     type: "program.repeated_no_effect", details: expect.objectContaining({
-      reason: "executive_observe_only", source: "runtime_mechanical", usefulness_inferred: false,
+      reason: "executive_no_effect_decisions", source: "runtime_mechanical", usefulness_inferred: false,
       elapsed_host_ms: expect.any(Number), no_input_decisions: expect.any(Number),
     }),
   })]));

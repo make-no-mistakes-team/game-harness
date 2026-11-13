@@ -1,6 +1,7 @@
 package io.gameharness.nativeclient.mixin;
 
 import io.gameharness.nativeclient.NativeClient;
+import io.gameharness.nativeclient.VisibleInventory;
 import io.gameharness.nativeclient.VisibleScreen;
 import net.minecraft.client.gui.screen.Screen;
 import org.spongepowered.asm.mixin.Mixin;
@@ -14,11 +15,13 @@ public abstract class WorldModifierMixin {
   @Inject(method = "hasControlDown", at = @At("HEAD"), cancellable = true)
   private static void ownedDrop(CallbackInfoReturnable<Boolean> ci) {
     if (VisibleScreen.modifiersOwned()) ci.setReturnValue(VisibleScreen.controlDown());
+    else if (VisibleInventory.modifiersOwned()) ci.setReturnValue(false);
     else if (NativeClient.INSTANCE != null && NativeClient.INSTANCE.ownedWorldModifier())
       ci.setReturnValue(NativeClient.INSTANCE.ownedWorldDropAll());
   }
   @Inject(method = "hasShiftDown", at = @At("HEAD"), cancellable = true)
   private static void ownedShift(CallbackInfoReturnable<Boolean> ci) {
     if (VisibleScreen.modifiersOwned()) ci.setReturnValue(VisibleScreen.shiftDown());
+    else if (VisibleInventory.modifiersOwned()) ci.setReturnValue(VisibleInventory.shiftDown());
   }
 }

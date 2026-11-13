@@ -2299,6 +2299,24 @@ Craft/equip use the bounded native [`VisibleInventory`](../native/minecraft/src/
 
 Ingredient assignments are grouped by their actual source slot. The controller picks up that stack once, distributes single items with separate ordinary right-clicks and returns surplus once before changing material or collecting output. The mouse button is released between placements; the remaining stack stays on the cursor. Source/cursor/grid components and counts remain checked throughout, including split sources and mixed materials. Vanilla ingredient eligibility matches permitted item alternatives; it does not require a material's incidental components to equal the recipe display's default stack. This does not relax actual custody checks or implement drag distribution.
 
+For a prepared multi-execution batch, output is taken with one ordinary
+Shift-click when the grid contains exactly that bounded quantity and ordinary
+inventory slots have capacity for the whole output. Recipes with remainders,
+dynamic displays or output used as an ingredient retain single-execution
+handling. The helper never refills the grid from inventory or increases the
+model's requested recipe count.
+
+Minecraft can predict one execution before the server finishes a Shift batch.
+After the owned press, only bounded changes within that batch's original grid
+and output-slot footprint may settle; unrelated slot or component changes still
+revoke the gesture. Settlement has a 1,500 ms bound and requires the exact
+output gain with empty cursor, grid and result slot. Shift is visible to
+vanilla modifier polling only inside authorized mouse callbacks, never as a
+physical key override during waiting or after cleanup. Client settlement
+counts deposited executions, not confirmed production: the existing
+authoritative stage receipt still gates advancement. Partial or missing proof
+does not authorize another click.
+
 Pointer plans sample a stable inset landing, modest path/profile variation and bounded category timing at gesture/group boundaries. Short placements share a coherent group tempo; acquisitions, transfers and output transitions have distinct timing. A recorded seed reproduces the motion plan, not operating-system or game-loop scheduling. Bounded gesture evidence retains actual press/release times and exact role totals so tick/render quantization can be measured rather than inferred from nominal delays. The normal pointer stays white; no decorative noise, forced overshoot or click-state tint is added.
 
 Each semantic operation owns one screen session. Equipment already in the hotbar is selected directly; inventory equipment is visibly transferred to a suitable hotbar/equipment slot. Placement uses that same controller and rechecks placement after the owned transfer closes, not while the item is legitimately on the cursor. Handler/sync identity, current layout, source/destination capacity, cursor and grid are checked before consequential gestures. Resize retargets pending slot travel; a held gesture or pending recipe-book button with changed geometry is revoked instead of clicking stale coordinates.
@@ -2308,6 +2326,13 @@ Native craft is bounded to 16 executions and `10,000 + 35,000 × executions` ms;
 Successful inventory receipts include authoritative selected slot, cursor and crafting-grid custody. Stop/replacement/correction revokes pending gestures without committing a mouse release into another handler. Trusted cleanup may close only its exact owned handler; closing is not rollback. A detached handler's last carried stack remains historical evidence even when fresh current-handler custody is empty. Emitted but unconfirmed outcomes stay unknown and fenced.
 
 Selected zero-provider Runtime/Docker/native verification exercised 2×2 planks/table/sticks, 3×3 wooden-pickaxe/furnace output, inventory-to-hotbar equipment, direct hotbar selection and implicit equipment for table/furnace placement. Focused native negatives covered full output capacity, Stop while carrying, handler replacement and an authoritative slot correction. This is evaluator-authored mechanics evidence, not model competence, human-like presentation approval or resolved model latency; visual acceptance remains a human gate.
+
+Batch-specific native checks covered exact Shift output and ordered server
+receipts, a confirmed partial recipe prefix, full-capacity refusal, Stop after
+the Shift press and an unrelated authoritative post-press slot correction.
+Interrupted output remained bounded by the requested quantity and retained
+ingredient/output conservation; cleanup left no held gesture or dirty current
+cursor/grid. These checks used supplied fixture inventory and no provider.
 
 Cancellation stops the motor/navigation task, releases held inputs and obtains neutralization acknowledgement; if that cannot be established, the bridge emitter must be fenced/terminated and recovery entered before a new lease. A lost craft/place/consume result stays uncertain rather than triggering blind repetition. Domain revision examples include pose, target validity, inventory-slot contents, UI session and the authorized navigation goal/corridor plus controller envelope; unrelated observation updates do not invalidate every slow result.
 

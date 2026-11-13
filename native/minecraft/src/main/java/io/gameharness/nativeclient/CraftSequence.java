@@ -39,11 +39,11 @@ public final class CraftSequence {
     if (count < 1 || count > 64 || outputs[index] != 0) throw new IllegalStateException("Invalid recipe output count");
     outputs[index] = count;
   }
-  public void deposited() {
+  public void deposited(int executions) {
     requireActive();
-    if (outputs[index] == 0 || completed[index] == current().executions())
+    if (outputs[index] == 0 || executions < 1 || executions > current().executions() - completed[index])
       throw new IllegalStateException("Output exceeds requested executions");
-    completed[index]++;
+    completed[index] += executions;
   }
   /** A partial receipt retains actual production, but never admits another stage. */
   public boolean confirm(int actualGain, boolean cleanCustody) {

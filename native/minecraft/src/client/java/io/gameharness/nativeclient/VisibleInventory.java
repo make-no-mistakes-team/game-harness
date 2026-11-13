@@ -62,6 +62,10 @@ public final class VisibleInventory {
   private int screenBindings, screenCloses;
   private boolean failed, closed, emitted;
   private boolean releaseTransfers;
+  private boolean quickMove, quickMovePressed, ownedShift, calling;
+  private BooleanSupplier quickMoveEligible, allowedSettlement, settled;
+  private long window, quickMovePressedAt;
+  private int quickMovePresses, quickMoveGestures;
   private String reason;
   private int equipSource = -1, equipDestination = -1, equipPhase;
   private boolean equipment, direct;
@@ -94,6 +98,7 @@ public final class VisibleInventory {
     } else if (!(client.currentScreen instanceof InventoryScreen)
         || !(client.player.currentScreenHandler instanceof PlayerScreenHandler)) return false;
     screen = (HandledScreen<?>) client.currentScreen;
+    window = client.getWindow().getHandle();
     screenBindings++;
     handler = client.player.currentScreenHandler;
     if (screen.getScreenHandler() != handler) { fail("screen_handler_mismatch"); return false; }
@@ -121,6 +126,40 @@ public final class VisibleInventory {
   public boolean ownsHandler() { return screen != null && !failed && !closed && valid(); }
   public boolean busy() { return phase != 0; }
 
+  /** Modifier ownership exists only inside this owner's ordinary vanilla mouse callback. */
+  public static boolean modifiersOwned() {
+    VisibleInventory owner = active;
+    return owner != null && owner.callbackOwned();
+  }
+
+  public static boolean shiftDown() {
+    VisibleInventory owner = active;
+    return owner != null && owner.callbackOwned() && owner.ownedShift;
+  }
+
+  public static boolean ownedKeyPoll(long window, int key) {
+    VisibleInventory owner = active;
+    return owner != null && window == owner.window
+        && VisibleScreenContract.ownedModifierPoll(owner.callbackOwned(), window, owner.window,
+            key, owner.ownedShift, false);
+  }
+
+  private boolean callbackOwned() {
+    if (active != this || !calling || failed || closed || !client.isOnThread()
+        || client.getWindow() == null || client.getWindow().getHandle() != window
+        || client.player == null || client.player.isDead() || client.currentScreen != screen
+        || client.player.currentScreenHandler != handler || screen.getScreenHandler() != handler)
+      return false;
+    try {
+      // A legitimate result press consumes the grid before vanilla finishes polling modifiers.
+      // Custody and recipe eligibility are checked BEFORE entry, never against that consumed grid.
+      return authorized.getAsBoolean()
+          && fence.allows(client.currentScreen, client.player.currentScreenHandler, handler.syncId, true);
+    } catch (RuntimeException error) {
+      return false;
+    }
+  }
+
   private void snapshot() {
     if (expected == null) expected = new ItemStack[handler.slots.size()];
     for (int i = 1; i < expected.length; i++) expected[i] = handler.slots.get(i).getStack().copy();
@@ -129,22 +168,45 @@ public final class VisibleInventory {
 
   private boolean custodyMatches() {
     if (handler.slots.size() != expected.length || !ItemStack.areEqual(cursor, handler.getCursorStack())) return false;
+    boolean matches = true;
     for (int i = 0; i < handler.slots.size(); i++) {
       Slot slot = handler.slots.get(i);
-      if (slot != slots[i] || slot.id != layout[i * 3] || slot.x != layout[i * 3 + 1] || slot.y != layout[i * 3 + 2]
-          || i > 0 && !ItemStack.areEqual(expected[i], slot.getStack())) return false;
+      if (slot != slots[i] || slot.id != layout[i * 3] || slot.x != layout[i * 3 + 1] || slot.y != layout[i * 3 + 2])
+        return false;
+      if (i > 0 && !ItemStack.areEqual(expected[i], slot.getStack())) matches = false;
     }
+    if (!quickMove || !quickMovePressed) return matches;
+    try {
+      // Only this batch's original-footprint guard may admit authoritative post-press changes.
+      if (allowedSettlement == null || !allowedSettlement.getAsBoolean()) return false;
+    } catch (RuntimeException error) {
+      fail("quick_move_settlement_guard_exception"); return false;
+    }
+    if (!matches) snapshot();
     return true;
   }
 
   private boolean valid() {
     if (failed || closed || fence == null) return false;
-    if (!authorized.getAsBoolean() || client.player == null || client.player.isDead()
+    boolean permitted;
+    try {
+      permitted = authorized.getAsBoolean();
+    } catch (RuntimeException error) {
+      fail("authority_check_exception"); return false;
+    }
+    if (!permitted || client.player == null || client.player.isDead()
         || client.currentScreen != screen || client.player.currentScreenHandler != handler
         || screen.getScreenHandler() != handler
-        || !fence.allows(client.currentScreen, client.player.currentScreenHandler, handler.syncId, custodyMatches())) {
+        || quickMove && (!client.isOnThread() || client.getWindow() == null || client.getWindow().getHandle() != window)
+        || !fence.allows(client.currentScreen, client.player.currentScreenHandler, handler.syncId, true)) {
       fail("handler_layout_or_custody_changed");
       return false;
+    }
+    if (quickMovePressed && System.nanoTime() - quickMovePressedAt >= 1_500_000_000L) {
+      fail("quick_move_settlement_timeout"); return false;
+    }
+    if (!custodyMatches()) {
+      fail("handler_layout_or_custody_changed"); return false;
     }
     return true;
   }
@@ -177,8 +239,53 @@ public final class VisibleInventory {
     return true;
   }
 
+  /**
+   * One visible vanilla Shift+left result click. The caller supplies exact pre-press eligibility,
+   * an original-batch-footprint settlement guard, and the full-batch completion predicate.
+   */
+  public boolean quickMoveResult(BooleanSupplier eligible, BooleanSupplier allowedSettlement, BooleanSupplier settled) {
+    if (!valid() || busy()) return false;
+    if (!quickMoveAllowed(eligible)) return false;
+    if (allowedSettlement == null || settled == null) {
+      fail("quick_move_settlement_guard_missing"); return false;
+    }
+    if (!client.isOnThread() || client.getWindow() == null || client.getWindow().getHandle() != window) {
+      fail("quick_move_window_or_thread_changed"); return false;
+    }
+    if (!handler.getCursorStack().isEmpty()) { fail("quick_move_cursor_not_empty"); return false; }
+    if (!click(0, 0, Gesture.RESULT)) return false;
+    quickMove = true;
+    quickMoveEligible = eligible;
+    this.allowedSettlement = allowedSettlement;
+    this.settled = settled;
+    if (gestureEvent != null) gestureEvent.addProperty("mode", "shift");
+    return true;
+  }
+
+  private boolean quickMoveAllowed(BooleanSupplier eligible) {
+    try {
+      if (eligible != null && eligible.getAsBoolean()) return true;
+      fail("quick_move_ineligible");
+    } catch (RuntimeException error) {
+      fail("quick_move_eligibility_exception");
+    }
+    return false;
+  }
+
+  private void clearQuickMove() {
+    quickMove = false;
+    quickMovePressed = false;
+    quickMoveEligible = null;
+    allowedSettlement = null;
+    settled = null;
+    quickMovePressedAt = 0;
+    ownedShift = false;
+    calling = false;
+  }
+
   private void move(int slotId, double left, double top, double width, double height,
       int button, Gesture purpose) {
+    clearQuickMove();
     targetSlot = slotId; this.button = button;
     this.purpose = purpose;
     motion.plan(x, y, left, top, width, height, purpose.category);
@@ -187,6 +294,7 @@ public final class VisibleInventory {
     if (gestureEvents.size() < 128) {
       gestureEvent = new JsonObject();
       gestureEvent.addProperty("role", purpose.name().toLowerCase(java.util.Locale.ROOT));
+      gestureEvent.addProperty("mode", "normal");
       gestureEvent.addProperty("slot", slotId); gestureEvent.addProperty("button", button);
       gestureEvent.addProperty("group", ingredientGroup);
       gestureEvent.addProperty("group_source_slot", groupSource);
@@ -259,32 +367,96 @@ public final class VisibleInventory {
         fail("target_stack_changed_before_press"); return;
       }
       if (!gestureCapacity()) { fail("gesture_destination_capacity_changed"); return; }
-      releaseTransfers = targetSlot >= 0 && !handler.getCursorStack().isEmpty();
-      fence.press();
-      if (targetSlot >= 0) emitted = true;
-      if (gestureEvent != null) gestureEvent.addProperty("pressed_ms", elapsedMillis(System.nanoTime()));
-      gesturePressCounts[purpose.ordinal()]++;
-      screen.mouseClicked(Math.round(x), Math.round(y), button);
-      if (targetSlot < 0) {
-        // The owned recipe-book button legitimately repositions this same layout.
-        originX = access.gameharness$x(); originY = access.gameharness$y();
+      if (quickMove) {
+        if (!quickMoveAllowed(quickMoveEligible)) return;
+        if (!valid() || !targetStillUnderPointer()) return;
+        if (!client.isOnThread() || client.getWindow() == null || client.getWindow().getHandle() != window
+            || !handler.getCursorStack().isEmpty()
+            || !ItemStack.areEqual(targetBefore, handler.getSlot(targetSlot).getStack())
+            || !gestureCapacity()) {
+          fail("quick_move_scope_or_target_changed_before_press"); return;
+        }
       }
-      snapshot();
+      releaseTransfers = targetSlot >= 0 && !handler.getCursorStack().isEmpty();
+      try {
+        fence.press();
+        if (!mouseCallback(true)) return;
+        if (targetSlot < 0) {
+          // The owned recipe-book button legitimately repositions this same layout.
+          originX = access.gameharness$x(); originY = access.gameharness$y();
+        }
+        if (quickMove) {
+          if (!valid()) return;
+        } else snapshot();
+      } catch (RuntimeException error) {
+        fail("vanilla_press_exception"); return;
+      }
       phase = 2; stageAt = now; phaseFrame = frames;
     } else if (phase == 2 && now - stageAt >= motion.pressNanos && frames > phaseFrame) {
       // Every release rechecks custody/handler first. Revocation NEVER calls this path.
       if (targetSlot >= 0 && !targetStillUnderPointer()) return;
       if (releaseTransfers && !gestureCapacity()) { fail("release_destination_capacity_changed"); return; }
-      if (gestureEvent != null) gestureEvent.addProperty("released_ms", elapsedMillis(System.nanoTime()));
-      screen.mouseReleased(Math.round(x), Math.round(y), button);
-      fence.release(); snapshot(); gestures++;
+      try {
+        if (!mouseCallback(false)) return;
+        fence.release();
+        if (quickMove) {
+          if (!valid()) return;
+        } else snapshot();
+      } catch (RuntimeException error) {
+        fail("vanilla_release_exception"); return;
+      }
+      gestures++;
+      if (quickMove) quickMoveGestures++;
       gestureCounts[purpose.ordinal()]++;
       if (gestureEvent != null) gestureEvent.addProperty("completed", true);
       phase = 3; stageAt = now; phaseFrame = frames;
     } else if (phase == 3 && now - stageAt >= motion.dwellNanos && frames > phaseFrame) {
+      if (quickMove) {
+        try {
+          if (!settled.getAsBoolean()) return;
+        } catch (RuntimeException error) {
+          fail("quick_move_settled_guard_exception"); return;
+        }
+        // The last batch-specific allowance ends before the caller accounts the completed batch.
+        if (!valid()) return;
+        if (gestureEvent != null) gestureEvent.addProperty("settled_ms", elapsedMillis(System.nanoTime()));
+      }
       phase = 0;
+      clearQuickMove();
       // The opening orientation dwell is not charged to every subsequent gesture.
       stageAt = now - 250_000_000L;
+    }
+  }
+
+  private boolean mouseCallback(boolean press) {
+    ownedShift = quickMove;
+    calling = true;
+    try {
+      if (quickMove && !callbackOwned()) {
+        fail("quick_move_callback_scope_changed"); return false;
+      }
+      if (press) {
+        if (targetSlot >= 0) emitted = true;
+        if (gestureEvent != null) gestureEvent.addProperty("pressed_ms", elapsedMillis(System.nanoTime()));
+        gesturePressCounts[purpose.ordinal()]++;
+        long pressedAt = System.nanoTime();
+        if (quickMove) quickMovePresses++;
+        boolean handled = screen.mouseClicked(Math.round(x), Math.round(y), button);
+        if (quickMove && !handled) {
+          fail("vanilla_quick_move_press_rejected"); return false;
+        }
+        if (quickMove) {
+          quickMovePressed = true;
+          quickMovePressedAt = pressedAt;
+        }
+      } else {
+        if (gestureEvent != null) gestureEvent.addProperty("released_ms", elapsedMillis(System.nanoTime()));
+        screen.mouseReleased(Math.round(x), Math.round(y), button);
+      }
+      return !failed && !closed;
+    } finally {
+      ownedShift = false;
+      calling = false;
     }
   }
 
@@ -312,12 +484,16 @@ public final class VisibleInventory {
 
   public void close() {
     if (!valid() || busy() || !clean()) { fail("unclean_inventory_close"); return; }
-    fence.revoke();
-    revokeGesture();
-    client.player.closeHandledScreen();
-    screenCloses++;
-    closed = true;
-    if (active == this) active = null;
+    try {
+      fence.revoke();
+      revokeGesture();
+      client.player.closeHandledScreen();
+      screenCloses++;
+      closed = true;
+    } finally {
+      clearQuickMove();
+      if (active == this) active = null;
+    }
   }
 
   public void fail(String reason) {
@@ -327,14 +503,18 @@ public final class VisibleInventory {
   }
 
   private void revoke() {
-    if (gestureEvent != null && (phase == 1 || phase == 2)) {
-      gestureEvent.addProperty("revoked_ms", elapsedMillis(System.nanoTime()));
-      gestureEvent.addProperty("revoked_phase", phase);
+    try {
+      if (gestureEvent != null && (phase == 1 || phase == 2 || quickMove && phase == 3)) {
+        gestureEvent.addProperty("revoked_ms", elapsedMillis(System.nanoTime()));
+        gestureEvent.addProperty("revoked_phase", phase);
+      }
+      if (fence != null) fence.revoke();
+      if (screen != null) revokeGesture();
+    } finally {
+      clearQuickMove();
+      phase = 0;
+      if (active == this) active = null;
     }
-    if (fence != null) fence.revoke();
-    if (screen != null) revokeGesture();
-    phase = 0;
-    if (active == this) active = null;
   }
 
   private void revokeGesture() {
@@ -372,6 +552,8 @@ public final class VisibleInventory {
     value.add("gesture_counts", counts); value.add("gesture_events", gestureEvents.deepCopy());
     value.add("gesture_press_counts", pressCounts);
     value.addProperty("gesture_attempts", gestureAttempts);
+    value.addProperty("quick_move_presses", quickMovePresses);
+    value.addProperty("quick_move_gestures", quickMoveGestures);
     value.addProperty("gesture_events_omitted", gestureAttempts - gestureEvents.size());
     // Preserve all 64 seed bits through the host's JavaScript JSON reader.
     value.addProperty("motion_seed", Long.toString(motion.seed));

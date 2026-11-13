@@ -24,6 +24,12 @@ public final class Recipes {
   private static JsonObject[] stageReceipts;
   private static boolean awaitingReceipt;
   private static int batch, batchRemaining;
+  private static int batchGridMask, quickMoveExecutions, quickMoveOutputBefore;
+  private static boolean batchRemainderFree;
+  private static ItemStack[] quickMoveBefore;
+  private static final BooleanSupplier QUICK_MOVE_ELIGIBLE = Recipes::quickMoveEligible;
+  private static final BooleanSupplier QUICK_MOVE_ALLOWED = Recipes::quickMoveAllowedSettlement;
+  private static final BooleanSupplier QUICK_MOVE_SETTLED = Recipes::quickMoveSettled;
   private static boolean invalidated;
   private static String beginRefusalReason;
   private static VisibleInventory session;
@@ -195,6 +201,7 @@ public final class Recipes {
       BooleanSupplier authorized) {
     active = null;
     session = null;
+    quickMoveBefore = null;
     invalidated = false;
     beginRefusalReason = null;
     table = action.has("table");
@@ -262,6 +269,7 @@ public final class Recipes {
     session = null;
     sequence = null;
     stageReceipts = null;
+    quickMoveBefore = null;
   }
 
   public static void tick(MinecraftClient c) {
@@ -278,7 +286,7 @@ public final class Recipes {
     switch (phase) {
       case 0 -> {
         if (!session.clean()) { fail("craft_grid_or_cursor_not_clear"); return; }
-        if (destination(c, output) < 0) { fail("craft_output_capacity_unavailable"); return; }
+        if (!outputCapacity(c, output.getCount())) { fail("craft_output_capacity_unavailable"); return; }
         String planningRefusal = plan(c);
         if (planningRefusal != null) { fail(planningRefusal); return; }
         ingredient = 0; placement = 0; phase = 1;
@@ -350,6 +358,16 @@ public final class Recipes {
           if (System.nanoTime() - outputWait > 2_000_000_000L) fail("craft_output_not_observed");
           return;
         }
+        if (quickMoveEligible()) {
+          quickMoveExecutions = batchRemaining;
+          quickMoveOutputBefore = inventoryOutputCount(c);
+          quickMoveBefore = new ItemStack[handler.slots.size()];
+          for (int i = 0; i < quickMoveBefore.length; i++)
+            quickMoveBefore[i] = handler.slots.get(i).getStack().copy();
+          if (session.quickMoveResult(QUICK_MOVE_ELIGIBLE, QUICK_MOVE_ALLOWED, QUICK_MOVE_SETTLED)) phase = 11;
+          else fail("craft_output_quick_move_not_started");
+          return;
+        }
         destination = destination(c, output);
         if (destination < 0) { fail("craft_output_capacity_changed"); return; }
         if (session.click(0, 0, VisibleInventory.Gesture.RESULT)) phase = 5;
@@ -362,11 +380,30 @@ public final class Recipes {
       }
       case 6 -> {
         if (!cursor.isEmpty()) { fail("craft_output_cursor_not_deposited"); return; }
-        sequence.deposited();
+        sequence.deposited(1);
         remaining--; batchRemaining--;
         if (remaining > 0 && batchRemaining > 0 && loadedBatchMatches(handler)) {
           phase = 4; outputWait = System.nanoTime(); return;
         }
+        remainder = 1; phase = 7;
+      }
+      case 11 -> {
+        // A Shift result is deposited by vanilla, never held as one enlarged cursor stack.
+        int gain = inventoryOutputCount(c) - quickMoveOutputBefore;
+        int executions = gain > 0 && gain % output.getCount() == 0 ? gain / output.getCount() : 0;
+        boolean bounded = quickMoveAllowedSettlement() && cursor.isEmpty()
+            && executions > 0 && executions <= quickMoveExecutions
+            && executions <= remaining && executions <= batchRemaining
+            && gridMatches(handler, batchRemaining - executions);
+        if (bounded) {
+          sequence.deposited(executions);
+          remaining -= executions; batchRemaining -= executions;
+        }
+        if (!bounded || executions != quickMoveExecutions) {
+          // Even a coherent partial prediction is not permission to replay this gesture.
+          fail("craft_output_quick_move_unresolved"); return;
+        }
+        quickMoveBefore = null;
         remainder = 1; phase = 7;
       }
       case 7 -> {
@@ -422,9 +459,97 @@ public final class Recipes {
   }
 
   private static boolean loadedBatchMatches(ScreenHandler handler) {
+    return gridMatches(handler, batchRemaining);
+  }
+
+  private static boolean gridMatches(ScreenHandler handler, int count) {
+    int gridSize = table ? 9 : 4;
+    for (int grid = 1; grid <= gridSize; grid++)
+      if ((batchGridMask & 1 << grid) == 0 && !handler.getSlot(grid).getStack().isEmpty()) return false;
     for (IngredientGroup group : groups) for (int grid : group.grids())
-      if (!stackMatches(handler.getSlot(grid).getStack(), group.stack(), batchRemaining)) return false;
+      if (!stackMatches(handler.getSlot(grid).getStack(), group.stack(), count)) return false;
     return true;
+  }
+
+  /** Rechecked by VisibleInventory immediately before the actual vanilla press. */
+  private static boolean quickMoveEligible() {
+    MinecraftClient c = MinecraftClient.getInstance();
+    return session != null && c.player != null && batchRemainderFree
+        && batchRemaining > 1 && batchRemaining <= remaining && remaining <= 16
+        && session.handler().getCursorStack().isEmpty()
+        && ItemStack.areEqual(session.handler().getSlot(0).getStack(), output)
+        && loadedBatchMatches(session.handler())
+        && outputCapacity(c, batchRemaining * output.getCount());
+  }
+
+  /** Only this owned batch's bounded packet-interleaved transitions may relax snapshot custody. */
+  private static boolean quickMoveAllowedSettlement() {
+    MinecraftClient c = MinecraftClient.getInstance();
+    if (session == null || c.player == null || quickMoveBefore == null) return false;
+    ScreenHandler handler = session.handler();
+    if (handler == null || handler.slots.size() != quickMoveBefore.length
+        || !handler.getCursorStack().isEmpty()) return false;
+    int gain = 0, gridSize = table ? 9 : 4;
+    for (int i = 0; i < quickMoveBefore.length; i++) {
+      Slot slot = handler.slots.get(i);
+      ItemStack before = quickMoveBefore[i], actual = slot.getStack();
+      if (i == 0) {
+        if (!actual.isEmpty() && !ItemStack.areEqual(actual, output)) return false;
+      } else if (i <= gridSize && (batchGridMask & 1 << i) != 0) {
+        if (!actual.isEmpty() && (actual.getCount() > before.getCount()
+            || !ItemStack.areItemsAndComponentsEqual(actual, before))) return false;
+      } else if (slot.inventory == c.player.getInventory() && slot.getIndex() >= 0 && slot.getIndex() < 36
+          && (before.isEmpty() || ItemStack.areItemsAndComponentsEqual(before, output))) {
+        if (actual.isEmpty()) {
+          if (!before.isEmpty()) return false;
+        } else {
+          int previous = before.getCount();
+          if (!ItemStack.areItemsAndComponentsEqual(actual, output) || actual.getCount() < previous
+              || actual.getCount() > Math.min(output.getMaxCount(), slot.getMaxItemCount(output))) return false;
+          if (actual.getCount() > previous && (!slot.isEnabled() || !slot.canInsert(output))) return false;
+          gain += actual.getCount() - previous;
+        }
+      } else if (!ItemStack.areEqual(actual, before)) return false;
+    }
+    return gain <= quickMoveExecutions * output.getCount();
+  }
+
+  private static boolean quickMoveSettled() {
+    if (!quickMoveAllowedSettlement()) return false;
+    ScreenHandler handler = session.handler();
+    return handler.getSlot(0).getStack().isEmpty() && gridMatches(handler, 0)
+        && inventoryOutputCount(MinecraftClient.getInstance()) - quickMoveOutputBefore
+            == quickMoveExecutions * output.getCount();
+  }
+
+  private static int inventoryOutputCount(MinecraftClient c) {
+    int count = 0;
+    ScreenHandler handler = session.handler();
+    for (int i = 0; i < handler.slots.size(); i++) {
+      Slot slot = handler.slots.get(i);
+      if (slot.inventory == c.player.getInventory() && slot.getIndex() >= 0 && slot.getIndex() < 36
+          && ItemStack.areItemsAndComponentsEqual(slot.getStack(), output))
+        count += slot.getStack().getCount();
+    }
+    return count;
+  }
+
+  /** Capacity is shared across compatible stacks and ordinary inventory slots, never armor/offhand. */
+  private static boolean outputCapacity(MinecraftClient c, int needed) {
+    ScreenHandler handler = session.handler();
+    if (output.getCount() > output.getMaxCount()) return false;
+    for (int i = 0; i < handler.slots.size(); i++) {
+      Slot slot = handler.slots.get(i);
+      if (slot.inventory != c.player.getInventory() || slot.getIndex() < 0 || slot.getIndex() >= 36
+          || !slot.isEnabled() || !slot.canInsert(output)) continue;
+      ItemStack existing = slot.getStack();
+      int limit = Math.min(output.getMaxCount(), slot.getMaxItemCount(output));
+      if (existing.isEmpty()) needed -= limit;
+      else if (output.isStackable() && ItemStack.areItemsAndComponentsEqual(existing, output))
+        needed -= Math.max(0, limit - existing.getCount());
+      if (needed <= 0) return true;
+    }
+    return false;
   }
 
   private static boolean heldIngredientMatches(ScreenHandler handler, ItemStack cursor, int placed) {
@@ -452,6 +577,9 @@ public final class Recipes {
     } else if (active.display() instanceof ShapelessCraftingRecipeDisplay shapeless) {
       ingredients = shapeless.ingredients(); width = table ? 3 : 2;
     } else return "craft_recipe_display_unsupported";
+    batchRemainderFree = plainIngredientDisplay(active.display().result());
+    for (int i = 0; i < ingredients.size(); i++)
+      batchRemainderFree &= plainIngredientDisplay(ingredients.get(i));
     Map<Integer, List<Integer>> selected = new LinkedHashMap<>();
     ScreenHandler handler = session.handler();
     int[] reserved = new int[handler.slots.size()];
@@ -471,18 +599,40 @@ public final class Recipes {
       if (sourceSlot < 0) return "craft_ingredients_unavailable";
       int grid = 1 + i % width + i / width * (table ? 3 : 2);
       ItemStack sourceStack = handler.getSlot(sourceSlot).getStack();
+      // 1.21.4 crafting remainders are Item#getRecipeRemainder(), not use-food remainders.
+      if (!sourceStack.getItem().getRecipeRemainder().isEmpty()) batchRemainderFree = false;
+      if (sourceStack.isOf(output.getItem())) batchRemainderFree = false;
       if (!handler.getSlot(grid).canInsert(sourceStack) || handler.getSlot(grid).getMaxItemCount(sourceStack) < count)
         return "craft_ingredient_grid_capacity";
       reserved[sourceSlot] += count;
       List<Integer> cells = selected.computeIfAbsent(sourceSlot, ignored -> new ArrayList<>());
       cells.add(grid);
     }
+    // One execution empties each ingredient cell before its remainder is returned there.
+    // Loading several containers could instead force vanilla to insert/drop their remainders.
+    if (count > 1 && !batchRemainderFree) return "craft_recipe_requires_single_execution";
     groups = new IngredientGroup[selected.size()];
+    batchGridMask = 0;
     int index = 0;
-    for (var entry : selected.entrySet())
+    for (var entry : selected.entrySet()) {
       groups[index++] = new IngredientGroup(entry.getKey(), handler.getSlot(entry.getKey()).getStack().copy(),
           entry.getValue().stream().mapToInt(Integer::intValue).toArray());
+      for (int grid : groups[index - 1].grids()) batchGridMask |= 1 << grid;
+    }
     return groups.length > 0 ? null : "craft_recipe_has_no_supported_ingredients";
+  }
+
+  /** Unknown/dynamic displays and WithRemainder (even nested alternatives) are not batch-safe. */
+  private static boolean plainIngredientDisplay(SlotDisplay display) {
+    if (display instanceof SlotDisplay.CompositeSlotDisplay composite) {
+      for (int i = 0; i < composite.contents().size(); i++)
+        if (!plainIngredientDisplay(composite.contents().get(i))) return false;
+      return true;
+    }
+    return display instanceof SlotDisplay.EmptySlotDisplay
+        || display instanceof SlotDisplay.ItemSlotDisplay
+        || display instanceof SlotDisplay.StackSlotDisplay
+        || display instanceof SlotDisplay.TagSlotDisplay;
   }
 
   private static int destination(MinecraftClient c, ItemStack stack) {

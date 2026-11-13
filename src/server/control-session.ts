@@ -53,7 +53,7 @@ export class ControlSession {
   private sampleSlot = 0;
   private lastSampleFrame = 0;
   private captureGeneration = 0;
-  private capture: { frame: MinecraftControllerFrame; channel: ControllerInputChannel | null; transitioning: boolean; generation: number } | null = null;
+  private capture: { frame: MinecraftControllerFrame; channel: ControllerInputChannel | null; transitioning: boolean; generation: number; receivedHostMs: number } | null = null;
   private deadlineTimer: unknown = null;
   private flight: Promise<void> | null = null;
   private transition: Promise<void> | null = null;
@@ -206,7 +206,7 @@ export class ControlSession {
     if (frame.frame_seq <= this.lastSampleFrame) { this.data.counters.stale_frames++; return; }
     this.lastSampleFrame = frame.frame_seq; this.data.counters.frames++;
     // One latest-capture mailbox: no unbounded frame queue or parallel VM calls.
-    this.capture = { frame, channel, transitioning, generation };
+    this.capture = { frame, channel, transitioning, generation, receivedHostMs: this.clock.now() };
   }
   private async tick(): Promise<void> {
     const limits = this.options.limits;
@@ -226,6 +226,14 @@ export class ControlSession {
     // That capture was never retained by the new channel: compute again from
     // its own next sample rather than relabeling or replaying this one.
     if (samplingTransition || this.transition || samplingChannel !== this.raw || capture.generation !== this.captureGeneration) return;
+    // After a coordinator stall, the latest buffered capture may already have
+    // spent most of its native application window waiting here. No VM has run
+    // on it yet: discard it, not its eventual input or mutated source globals.
+    const mailboxAge = this.clock.now() - capture.receivedHostMs;
+    if (mailboxAge < 0 || mailboxAge > Math.min(150, 1000 / limits.frequency_hz)) {
+      this.data.counters.stale_frames++;
+      return;
+    }
     // The host decorates only its own software state, never native or evaluator observations.
     const decorated = { ...frame, executive: this.snapshot().session } as MinecraftControllerFrame;
     const version = this.data.intent_version, started = this.clock.now();

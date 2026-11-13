@@ -669,6 +669,38 @@ test("Stop joins the exact independent read and a late capture cannot activate o
   expect(h.session.snapshot()).toMatchObject({ status: "stopped", cleanup: { worker: "closed", native: "retired" } });
 });
 
+test("a coordinator stall discards an aged mailbox before VM invocation while one fresh read is pending", async () => {
+  const h = harness(), open = h.options.open;
+  const first = Promise.withResolvers<void>(), second = Promise.withResolvers<void>();
+  let reads = 0;
+  h.options.open = async (...args) => {
+    const channel = await open(...args), sample = channel.sample.bind(channel);
+    channel.sample = async cursor => {
+      const frame = await sample(cursor);
+      if (++reads === 1) await first.promise;
+      else if (reads === 2) await second.promise;
+      return frame;
+    };
+    return channel;
+  };
+  h.options.worker.step = vi.fn(h.options.worker.step);
+  try {
+    h.choose(rawChoice); await h.session.start(); await h.clock.advance(75);
+    first.resolve(); await settle();
+    await h.clock.jump(125);
+    expect(reads).toBe(2);
+    expect(h.options.worker.step).not.toHaveBeenCalled();
+    expect(h.sent).toHaveLength(0);
+    second.resolve(); await settle(); await h.clock.advance(0);
+    expect(h.options.worker.step).toHaveBeenCalledTimes(1);
+    expect(h.sent.map(row => minecraftControllerFrameSchema.parse(row.frame).frame_seq)).toEqual([3]);
+    expect(h.session.snapshot()).toMatchObject({ status: "running",
+      counters: { stale_frames: 1, steps: 2 }, session: { restarts: 0, deadline_host_ms: 10000 } });
+  } finally {
+    first.resolve(); second.resolve(); await h.session.stop("test complete");
+  }
+});
+
 const analysisBundle = singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze");
 const analysisSource = { skill_id: "pure-analysis", version: 1, hash: analysisBundle.source_hash, bundle: analysisBundle };
 

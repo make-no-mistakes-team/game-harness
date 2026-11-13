@@ -453,6 +453,11 @@ mailbox. A pending VM decision does not stop sampling; newer captures replace
 unconsumed ones, never form an unbounded queue or cause concurrent VM calls.
 Each capture retains its read channel and producer-transition generation.
 Captures from opening/retiring or superseded producers cannot enter a successor.
+Before invoking the VM, a capture that has waited in the mailbox longer than
+one configured sampling period or 150 ms, whichever is smaller, is discarded.
+The source has not run on it, so neither state rollback nor input replay is
+needed. This host waiting-time check does not replace the native capture-age
+checks at admission and application.
 Read count and VM-step count have separate original limits; skipped captures
 still consume the read budget. Stop fences both lanes and joins the exact
 outstanding read, worker and native retirement. Sampling alone never renews a

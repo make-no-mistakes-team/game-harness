@@ -460,6 +460,11 @@ or retirement, including when a later input has already been submitted.
 Executive sampling has one independent read lane and a single latest-capture
 mailbox. A pending VM decision does not stop sampling; newer captures replace
 unconsumed ones, never form an unbounded queue or cause concurrent VM calls.
+An available fresh capture wakes an unused decision opportunity immediately,
+without waiting for the next polling boundary. VM starts still remain at least
+one configured period apart. When no usable capture is available, bounded
+periodic checks retain scope, lease-expiry and deadline supervision; sampling
+does not grant an extra callback or extend a lease.
 Each capture retains its read channel and producer-transition generation.
 Captures from opening/retiring or superseded producers cannot enter a successor.
 Before invoking the VM, a capture that has waited in the mailbox longer than

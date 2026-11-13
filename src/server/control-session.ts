@@ -48,6 +48,9 @@ export class ControlSession {
   private intent: Json;
   private cursor: Json = null;
   private timer: unknown = null;
+  private timerAt = Infinity;
+  private nextDecisionAt = 0;
+  private lastDecisionStarted: number | null = null;
   private sampleTimer: unknown = null;
   private sampleFlight: Promise<void> | null = null;
   private sampleSlot = 0;
@@ -63,7 +66,6 @@ export class ControlSession {
   private activated = false;
   private lastFrame = 0;
   private anchor = 0;
-  private slot = 0;
   private rawGeneration = 0;
   private rawLeaseDeadline = -Infinity;
   private lastNotify = -Infinity;
@@ -137,7 +139,7 @@ export class ControlSession {
       await this.stop("session_not_current"); return;
     }
     if (!this.worker.activate) { await this.fail("session_requires_model_authored_activate"); return; }
-    this.anchor = this.clock.now(); this.data.status = "running";
+    this.anchor = this.clock.now(); this.nextDecisionAt = this.anchor; this.data.status = "running";
     this.deadlineTimer = this.clock.setTimeout(() => { void this.stop("session_deadline"); }, this.options.deadline_host_ms - this.clock.now());
     this.notify(true); this.scheduleSample(); this.schedule();
   }
@@ -156,22 +158,33 @@ export class ControlSession {
     if (!force && this.clock.now() - this.lastNotify < 1000) return;
     this.lastNotify = this.clock.now(); this.options.changed(this.snapshot(), terminal);
   }
-  private schedule(): void {
+  private schedule(waitForNextPeriod = false): void {
     if (!this.current()) { void this.stop("session_scope_or_deadline_closed"); return; }
+    if (this.flight) return;
     const period = 1000 / this.options.limits.frequency_hz;
-    const next = Math.max(this.slot, Math.ceil((this.clock.now() - this.anchor) / period));
-    this.data.counters.missed_slots += next - this.slot; this.slot = next;
+    const now = this.clock.now();
+    const due = Math.max(now, this.nextDecisionAt, waitForNextPeriod ? now + period : now);
+    if (this.timer !== null) {
+      if (this.timerAt <= due) return;
+      this.clock.clearTimeout(this.timer);
+    }
+    this.timerAt = due;
     this.timer = this.clock.setTimeout(() => {
-      this.timer = null; this.slot++;
+      this.timer = null; this.timerAt = Infinity;
+      const previousSteps = this.data.counters.steps;
       const work = this.tick(); this.flight = work;
       void work.catch(error => {
         if (error instanceof ControllerChannelFaultError) this.recordControllerFault(this.raw, error.fault);
         else if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
         return this.fail(errorText(error));
       }).finally(() => {
-        this.flight = null; if (this.current()) this.schedule();
+        this.flight = null;
+        if (this.current()) {
+          const unread = this.capture !== null && this.capture.frame.frame_seq > this.lastFrame;
+          this.schedule(this.data.counters.steps === previousSteps && !unread);
+        }
       });
-    }, Math.max(0, this.anchor + next * period - this.clock.now()));
+    }, Math.max(0, Math.ceil(due - now)));
   }
   private scheduleSample(): void {
     if (!this.current() || this.data.counters.frames >= this.options.limits.max_frames) return;
@@ -207,6 +220,7 @@ export class ControlSession {
     this.lastSampleFrame = frame.frame_seq; this.data.counters.frames++;
     // One latest-capture mailbox: no unbounded frame queue or parallel VM calls.
     this.capture = { frame, channel, transitioning, generation, receivedHostMs: this.clock.now() };
+    this.schedule();
   }
   private async tick(): Promise<void> {
     const limits = this.options.limits;
@@ -245,6 +259,10 @@ export class ControlSession {
     // The host decorates only its own software state, never native or evaluator observations.
     const decorated = { ...frame, executive: this.snapshot().session } as MinecraftControllerFrame;
     const version = this.data.intent_version, started = this.clock.now();
+    const period = 1000 / limits.frequency_hz;
+    if (this.lastDecisionStarted !== null)
+      this.data.counters.missed_slots += Math.max(0, Math.floor((started - this.lastDecisionStarted) / period) - 1);
+    this.lastDecisionStarted = started; this.nextDecisionAt = started + period;
     this.data.counters.steps++;
     const activating = !this.activated;
     this.activated = true;

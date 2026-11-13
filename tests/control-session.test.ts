@@ -725,7 +725,7 @@ test("a newly delivered capture from before confirmed raw application cannot dri
     oldRead.resolve(); await settle(); await h.clock.advance(25);
     expect(h.options.worker.step).toHaveBeenCalledTimes(1);
     expect(h.sent).toHaveLength(1);
-    freshRead.resolve(); await settle(); await h.clock.advance(50);
+    freshRead.resolve(); await settle(); await h.clock.advance(0);
     expect(h.options.worker.step).toHaveBeenCalledTimes(2);
     expect(h.sent).toHaveLength(2);
     expect(BigInt(minecraftControllerFrameSchema.parse(h.sent[1]!.frame).captured_native_ns)).toBeGreaterThanOrEqual(125_000_000n);
@@ -733,6 +733,25 @@ test("a newly delivered capture from before confirmed raw application cannot dri
   } finally {
     oldRead.resolve(); freshRead.resolve(); await h.session.stop("test complete");
   }
+});
+
+test("a fresh read wakes an unused decision slot before the original raw lease expires", async () => {
+  const h = harness(), open = h.options.open, ready = Promise.withResolvers<void>();
+  h.options.open = async (...args) => {
+    const channel = await open(...args), sample = channel.sample.bind(channel);
+    channel.sample = async cursor => { await ready.promise; return await sample(cursor); };
+    return channel;
+  };
+  try {
+    h.choose(rawChoice); await h.session.start(); await h.clock.advance(230);
+    expect(h.sent).toHaveLength(0);
+    ready.resolve(); await settle(); await h.clock.advance(0);
+    expect(h.sent).toHaveLength(1);
+    expect(minecraftControllerFrameSchema.parse(h.sent[0]!.frame).captured_native_ns).toBe("230000000");
+    await h.clock.advance(20);
+    expect(h.sent).toHaveLength(1);
+    expect(h.session.snapshot()).toMatchObject({ status: "running", session: { restarts: 0, deadline_host_ms: 10000 } });
+  } finally { ready.resolve(); await h.session.stop("test complete"); }
 });
 
 const analysisBundle = singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze");

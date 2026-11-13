@@ -160,6 +160,64 @@ test("actual SDK dispatch owns terminal tool JSON before queued message observer
   } finally { await f.owner.close(); }
 });
 
+test("live remaining budgets let the selected model seal on its last request without renewing failed work", async () => {
+  const descriptor = getBundledModels("openai-codex").find(value => value.api === "openai-codex-responses");
+  if (!descriptor) throw new Error("Installed offline SDK model descriptor unavailable");
+  const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
+  type Budget = { requests_remaining_after_this_request: number; tools_remaining: number;
+    source_versions_remaining: number; source_bytes_remaining: number; time_remaining_ms: number; deadline_at: string };
+  const budgets: Budget[] = [];
+  const f = fixture([], { auth: {
+    snapshot: sourceAuthState,
+    createAgent: async options => new Agent({
+      initialState: { model, systemPrompt: options.systemPrompt, tools: options.tools },
+      getApiKey: () => "OFFLINE_PROTOCOL_FIXTURE_NO_NETWORK",
+      streamFn: (_model, context) => {
+        const last = context.messages.at(-1);
+        const text = last?.role === "user" && Array.isArray(last.content)
+          ? last.content.find(part => part.type === "text") : null;
+        const budget = text?.type === "text" ? JSON.parse(text.text).preparation_budget as Budget | undefined : undefined;
+        if (!budget) throw new Error("Selected model cannot see its current preparation allowance");
+        budgets.push(budget);
+        const index = budgets.length - 1;
+        const call: Call = budget.requests_remaining_after_this_request === 0 ? rootCalls()[1]!
+          : index === 0 ? rootCalls()[0]!
+          : index === 1 ? { name: "program_edit", args: { name: "missing", based_on: 1,
+            edits: [{ old_text: "absent", new_text: "unused" }] } }
+          : { name: "program_inspect", args: { view: "catalog" } };
+        const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+          content: [{ type: "toolCall", id: `budget_${index}|provider_${index}`, name: call.name, arguments: call.args as Record<string, unknown> }],
+          stopReason: "toolUse", timestamp: 0,
+          usage: { input: 11, output: 7, cacheRead: 0, cacheWrite: 0, totalTokens: 18,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+        const stream = new AssistantMessageEventStream();
+        stream.push({ type: "start", partial: message });
+        stream.push({ type: "done", reason: "toolUse", message }); stream.end(); return stream;
+      },
+    }),
+    releaseAgent: async agent => { agent.abort(); await agent.waitForIdle(); },
+  } });
+  try {
+    await f.owner.initialize(); await f.owner.start(f.request);
+    const view = await f.terminal;
+    expect(view).toMatchObject({ phase: "started", closure: "transferred",
+      requests_admitted: PREPARED_START_LIMITS.max_requests, source_versions: 1 });
+    expect(budgets.map(value => value.requests_remaining_after_this_request))
+      .toEqual(Array.from({ length: PREPARED_START_LIMITS.max_requests }, (_, index) => PREPARED_START_LIMITS.max_requests - index - 1));
+    expect(budgets[0]).toMatchObject({ tools_remaining: PREPARED_START_LIMITS.max_tools,
+      source_versions_remaining: PREPARED_START_LIMITS.max_source_versions, source_bytes_remaining: PREPARED_START_LIMITS.max_source_bytes });
+    expect(budgets[2]).toMatchObject({ tools_remaining: PREPARED_START_LIMITS.max_tools - 2,
+      source_versions_remaining: PREPARED_START_LIMITS.max_source_versions - 1 });
+    expect(budgets[2]!.source_bytes_remaining).toBe(budgets[1]!.source_bytes_remaining);
+    expect(budgets[1]!.source_bytes_remaining).toBeLessThan(budgets[0]!.source_bytes_remaining);
+    for (let index = 1; index < budgets.length; index++) {
+      expect(budgets[index]!.deadline_at).toBe(budgets[0]!.deadline_at);
+      expect(budgets[index]!.time_remaining_ms).toBeLessThanOrEqual(budgets[index - 1]!.time_remaining_ms);
+    }
+    expect(f.counters()).toMatchObject({ compiled: 1, activated: 0 });
+  } finally { await f.owner.close(); }
+});
+
 test("exact request retries never infer or mutate source again, including after restart", async () => {
   const f = fixture(); await f.owner.initialize(); await f.owner.start(f.request); await f.ready; await f.owner.close();
   const first = await f.owner.start(f.request).catch(() => null); // A closed owner rejects new access; reopen durable receipts below.

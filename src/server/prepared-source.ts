@@ -312,7 +312,17 @@ export class PreparedSource {
         if (attempt.view.requests_admitted >= PREPARED_START_LIMITS.max_requests) throw new PreparedSourceFault("Finite preparation request budget exhausted");
         if (attempt.view.tools_used >= PREPARED_START_LIMITS.max_tools) throw new PreparedSourceFault("Finite preparation tool budget exhausted");
         attempt.view.requests_admitted++;
-      }, () => this.current(attempt), () => attempt.selection !== null);
+      }, () => this.current(attempt), () => attempt.selection !== null, () => ({
+        preparation_id: attempt.view.preparation_id,
+        requests_remaining_after_this_request: PREPARED_START_LIMITS.max_requests - attempt.view.requests_admitted,
+        tools_remaining: PREPARED_START_LIMITS.max_tools - attempt.view.tools_used,
+        source_versions_remaining: PREPARED_START_LIMITS.max_source_versions - book.versions,
+        source_bytes_remaining: PREPARED_START_LIMITS.max_source_bytes - book.sourceBytes,
+        analysis_jobs_remaining: PREPARED_START_LIMITS.max_analysis_jobs - attempt.view.analysis_jobs,
+        analysis_ms_remaining: Math.max(0, PREPARED_START_LIMITS.max_analysis_ms - attempt.view.analysis_ms),
+        deadline_at: attempt.view.deadline_at,
+        time_remaining_ms: Math.max(0, Math.floor(attempt.deadlineHostMs - performance.now())),
+      }));
       const prompt = { preparation_id: attempt.view.preparation_id, request: attempt.request,
         artifact_sha256: contract.artifact_sha256, compatibility_hash: compatibility.compatibility_hash,
         deadline_at: attempt.view.deadline_at, limits: PREPARED_START_LIMITS,
@@ -585,6 +595,7 @@ export class PreparedSource {
       "Distinguish starting/running/retiring from succeeded/failed/interrupted/unknown before transitions; unknown is not success. " +
       "Local applicability and semantic children must be finite and checked from actual supplied frames/results. Source chooses all gameplay behavior; the host supplies no tactic or default fighter. " +
       "The original finite deadline and tool/request/analysis/source history budgets do not renew. prepare_finish seals all tools and stops further inference before compile/launch. " +
+      "Each request receives current preparation_budget context: requests_remaining_after_this_request excludes this already admitted request. Zero means this response is the last opportunity to call prepare_finish, not permission for another inference. Other remaining counters include failed work; time_remaining_ms uses the original deadline. " +
       "No fake test, supplied target, source rewrite, automatic connected-session restart or hidden world pause is permitted.";
   }
 }

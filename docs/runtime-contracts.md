@@ -116,6 +116,13 @@ The non-renewing bounds in [`PREPARED_START_LIMITS`](../src/shared/prepared-star
 
 Ordinary per-definition and module-closure limits also apply. The private journal permits 16 MiB plus a 1 MiB terminal reserve, with a 2 MiB record cap. Failed work and source revisions do not renew allowances; evidence persistence failure fences preparation and blocks new admission.
 
+Before each source-model dispatch, a journaled `preparation_budget` message gives
+the remaining requests, tools, source versions/bytes, analysis jobs/time and
+original deadline. `requests_remaining_after_this_request` excludes the request
+already admitted: zero leaves this response as the last chance to request
+`prepare_finish`. Failed work remains charged. This dispatch-local context does
+not change immutable tool receipts or renew any allowance.
+
 The model must call `prepare_finish` with an exact `step` version exporting both `activate(frame,state,intent)` and `step(frame,state,intent)`, plus explicit args, initial state, finite resident limits and a control-session configuration. Sealing fences further tools and inference. The host joins inference/tool drain, then compiles the pinned bundle in a clean isolated worker without invoking either entry. `ready` means that worker exists and supports activation; it is not a gameplay result. The coordinator rechecks idle ownership, artifact SHA-256 and compatibility before reserving a new native launch.
 
 Only actual joined readiness permits Runtime to create a real executive run with fresh working programs, retain authoring usage and import the exact selected source closure. Ordinary preflight acquires authoritative state and requires a living player; startup never respawns automatically. SkillManager checks the bundle, root, args, state, limits and session against the sealed candidate, then admits the root in Store **before** taking its worker exactly once under that real run ID. The controller invokes `activate` on its first actual frame. There is no predecessor, synthetic activation frame or probe result to replay. Worker transfer, activation, applied input and verified task success remain separate facts. The host supplies no gameplay policy.

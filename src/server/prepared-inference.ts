@@ -25,7 +25,7 @@ export class PreparedInference {
   constructor(agent: Agent, private readonly usage: RunUsage,
     private readonly append: (type: string, data: Json) => void,
     private readonly admit: () => void, private readonly current: () => void,
-    private readonly sealed: () => boolean) {
+    private readonly sealed: () => boolean, private readonly budget: () => Json) {
     agent.setBeforeModelCall((_context, signal) => {
       try {
         if (signal?.aborted) throw new PreparedSourceFault("Preparation inference cancelled");
@@ -59,7 +59,12 @@ export class PreparedInference {
         this.failed = true; this.stop = reason; agent.abort(reason);
         this.append("model.resource_rejected", { request_id: attempt.id, reason });
       };
-      const events = await stream(model, context, { ...options, onSseEvent: (event, eventModel) => {
+      // Dispatch-local context leaves immutable tool receipts and Agent history
+      // unchanged. The next request gets a fresh allowance, not an old snapshot.
+      const budgetMessage = { role: "user" as const, timestamp: Date.now(),
+        content: [{ type: "text" as const, text: JSON.stringify({ preparation_budget: this.budget() }) }] };
+      this.append("model.budget_context", { request_id: attempt.id, message: budgetMessage });
+      const events = await stream(model, { ...context, messages: [...context.messages, budgetMessage] }, { ...options, onSseEvent: (event, eventModel) => {
         attempt.usage.observe(event, eventModel ?? model); options?.onSseEvent?.(event, eventModel);
       } });
       const iterator = events[Symbol.asyncIterator]();

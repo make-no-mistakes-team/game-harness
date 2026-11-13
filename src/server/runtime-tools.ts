@@ -222,7 +222,7 @@ export class RuntimeTools {
         if (input.topic === "memory" && role() === "ordinary") this.modules.add(input.topic);
         return programHelp(input.topic, this.host.adapter(), input.kind);
       }),
-      tool("task_finish", "Report the whole custom task complete from actual authorized evidence and stop the run immediately. This is unverified model reporting, not built-in goal verification.", taskFinishSchema, (input, callId) => {
+      tool("task_finish", "TERMINAL: report the WHOLE custom task complete and immediately stop/drain the run and all local control. Unverified means model-reported, not unfinished. Never use this to end a planning turn, report partial progress or say completion cannot be claimed. When work remains, leave useful control running and end your response without this tool.", taskFinishSchema, (input, callId) => {
         if (typeof run.goal === "string" || run.goal.goal_id !== "custom" || run.goal.verifier !== null) throw new RuntimeFault("forbidden", "Only custom tasks permit model-reported completion; built-in goals require trusted verification");
         this.host.finishTask(input.summary, callId);
         return { status: "stopping", verification: "unverified" };

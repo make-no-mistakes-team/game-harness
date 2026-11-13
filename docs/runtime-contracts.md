@@ -255,6 +255,15 @@ The ordinary default exposes these tools:
 
 For a custom task, Main calls `task_finish({summary})` once authorized observations and execution evidence show that the whole requested task is done. A successful program return, completion prose or `game.progress` alone never closes a task. Do not rerun already-satisfied work or wait for the empty-turn limit to stop inference.
 
+`task_finish` is terminal, not an end-of-turn or progress-report operation.
+“Unverified” describes the source of the completion report; it does not mean
+that the task is unfinished. A summary saying that completion cannot be claimed
+still stops all control. When requirements remain, Main ends its planning
+response without this tool, retaining useful bounded control and requesting a
+finite attention wake only when needed. The host does not interpret summary
+wording or consult evaluator-private counters to decide whether a custom task
+is done.
+
 Ordinary task entry starts with **Custom / natural language**, without an automatic verifier. Built-in success checks are explicit presets: selecting one replaces the draft with its matching prompt and displays its exact early-stop condition. Editing that prompt switches to Custom, even if the original text is later restored; rebinding requires an explicit preset selection. UI, HTTP and Runtime accept the same trimmed task length of 1–4,000 characters. API callers remain responsible for binding a registered criterion to the whole request.
 
 The host records `task.completion_reported` with `source:"model"`, `reported_outcome:"completed"` and `verification:"unverified"`. It synchronously fences further inference and effects, acknowledges `status:"stopping"`, then awaits ordinary neutralization and worker/planner/action drain before reaching `stopped`. It retains a healthy session/video and does not start post-goal review. The tool does not emit `goal.verified`, qualify experience or bypass a built-in verifier. Speculative and review roles cannot invoke it. Identical tool-call retries return the original acknowledgement without another closure request; changed arguments conflict.

@@ -439,6 +439,18 @@ individually valid large receipts cannot expand the next worker message without
 bound. Pending input captures remain attributable until their own acknowledgment
 or retirement, including when a later input has already been submitted.
 
+Executive sampling has one independent read lane and a single latest-capture
+mailbox. A pending VM decision does not stop sampling; newer captures replace
+unconsumed ones, never form an unbounded queue or cause concurrent VM calls.
+Each capture retains its read channel and producer-transition generation.
+Captures from opening/retiring or superseded producers cannot enter a successor.
+Read count and VM-step count have separate original limits; skipped captures
+still consume the read budget. Stop fences both lanes and joins the exact
+outstanding read, worker and native retirement. Sampling alone never renews a
+producer: only a fresh accepted model choice may do so. The 150-ms freshness and
+250-ms supervision gates remain unchanged. Both lanes still use the coordinator
+event loop; this is not whole-control-pump isolation from coordinator stalls.
+
 Child completion, cancellation or a retired unknown effect leaves the executive
 alive. Unconfirmed emission/cleanup and reconnect requirements still contain the
 session. A child is not a saved async stack: resumption requires a fresh keyed

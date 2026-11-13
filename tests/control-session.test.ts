@@ -621,6 +621,54 @@ test.each(["ensure_task", "continue", "cancel"] as const)(
     } finally { await h.session.stop("test complete"); }
   });
 
+test("executive sampling continues through one pending VM decision and the next callback consumes the newest exact capture", async () => {
+  const h = harness(), activation = Promise.withResolvers<ExecutiveStepResult>();
+  const sample = h.options.sample, captures: number[] = [], inputs: number[] = [];
+  h.options.sample = async cursor => {
+    const frame = await sample(cursor);
+    captures.push(minecraftControllerFrameSchema.parse(frame).frame_seq);
+    return frame;
+  };
+  h.options.worker.activate = vi.fn(async frame => {
+    inputs.push(minecraftControllerFrameSchema.parse(frame).frame_seq);
+    return await activation.promise;
+  });
+  h.options.worker.step = vi.fn(async (frame: MinecraftControllerFrame, state: Json): Promise<ExecutiveStepResult> => {
+    inputs.push(minecraftControllerFrameSchema.parse(frame).frame_seq);
+    return { choice: { kind: "observe" }, next_state: state, status: "running", events: [] };
+  });
+  try {
+    await h.session.start(); await h.clock.advance(100);
+    expect(captures).toEqual([1, 2, 3]);
+    expect(inputs).toEqual([1]);
+    activation.resolve({ choice: { kind: "observe" }, next_state: 1, status: "running", events: [] });
+    await settle(); await h.clock.advance(0);
+    expect(inputs).toEqual([1, 3]);
+    expect(h.session.snapshot()).toMatchObject({ status: "running", state: 1, processed_frame_seq: 3,
+      counters: { frames: 3, steps: 2, submissions: 0 } });
+  } finally {
+    activation.resolve({ choice: { kind: "observe" }, next_state: 1, status: "running", events: [] });
+    await h.session.stop("test complete");
+  }
+});
+
+test("Stop joins the exact independent read and a late capture cannot activate or submit", async () => {
+  const h = harness(), sample = h.options.sample, pending = Promise.withResolvers<Json>();
+  h.options.sample = vi.fn(async () => await pending.promise);
+  h.options.worker.activate = vi.fn(h.options.worker.activate!);
+  await h.session.start(); await h.clock.advance(0);
+  let closed = false;
+  const stopping = h.session.stop("operator Stop").then(() => { closed = true; });
+  await settle();
+  expect(closed).toBe(false);
+  expect(h.options.worker.activate).not.toHaveBeenCalled();
+  pending.resolve(await sample(null)); await stopping;
+  expect(h.options.sample).toHaveBeenCalledTimes(1);
+  expect(h.options.worker.activate).not.toHaveBeenCalled();
+  expect(h.sent).toHaveLength(0);
+  expect(h.session.snapshot()).toMatchObject({ status: "stopped", cleanup: { worker: "closed", native: "retired" } });
+});
+
 const analysisBundle = singletonExecutableModuleBundle("export function analyze(input) { return input; }", "analyze");
 const analysisSource = { skill_id: "pure-analysis", version: 1, hash: analysisBundle.source_hash, bundle: analysisBundle };
 
@@ -945,19 +993,35 @@ test("large retained receipts remain in history without exceeding subsequent wor
 test("a channel opened during a read-only sample cannot adopt that unretained capture", async () => {
   const h = harness(), opening = Promise.withResolvers<void>();
   const open = h.options.open, sample = h.options.sample;
-  h.options.open = async (...args) => { await opening.promise; return await open(...args); };
+  const retained = new Set<number>(), unretained = new Set<number>();
+  h.options.open = async (...args) => {
+    await opening.promise;
+    const channel = await open(...args), sample = channel.sample.bind(channel);
+    channel.sample = async cursor => {
+      const frame = await sample(cursor);
+      retained.add(minecraftControllerFrameSchema.parse(frame).frame_seq);
+      return frame;
+    };
+    return channel;
+  };
   h.choose(rawChoice); await h.session.start(); await h.clock.advance(0);
   let released = false;
   h.options.sample = async cursor => {
     const frame = await sample(cursor);
+    unretained.add(minecraftControllerFrameSchema.parse(frame).frame_seq);
     if (!released) { released = true; opening.resolve(); await settle(); }
     return frame;
   };
   await h.clock.advance(50);
   expect(h.sent).toHaveLength(0);
   expect(h.session.snapshot().status).toBe("running");
-  await h.clock.advance(50);
-  expect(h.sent.map(input => minecraftControllerFrameSchema.parse(input.frame).frame_seq)).toEqual([3]);
+  await h.clock.advance(100);
+  expect(h.sent.length).toBeGreaterThan(0);
+  for (const input of h.sent) {
+    const sequence = minecraftControllerFrameSchema.parse(input.frame).frame_seq;
+    expect(retained.has(sequence)).toBe(true);
+    expect(unretained.has(sequence)).toBe(false);
+  }
   await h.session.stop("complete");
 });
 

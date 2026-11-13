@@ -48,6 +48,12 @@ export class ControlSession {
   private intent: Json;
   private cursor: Json = null;
   private timer: unknown = null;
+  private sampleTimer: unknown = null;
+  private sampleFlight: Promise<void> | null = null;
+  private sampleSlot = 0;
+  private lastSampleFrame = 0;
+  private captureGeneration = 0;
+  private capture: { frame: MinecraftControllerFrame; channel: ControllerInputChannel | null; transitioning: boolean; generation: number } | null = null;
   private deadlineTimer: unknown = null;
   private flight: Promise<void> | null = null;
   private transition: Promise<void> | null = null;
@@ -133,7 +139,7 @@ export class ControlSession {
     if (!this.worker.activate) { await this.fail("session_requires_model_authored_activate"); return; }
     this.anchor = this.clock.now(); this.data.status = "running";
     this.deadlineTimer = this.clock.setTimeout(() => { void this.stop("session_deadline"); }, this.options.deadline_host_ms - this.clock.now());
-    this.notify(true); this.schedule();
+    this.notify(true); this.scheduleSample(); this.schedule();
   }
   updateIntent(intent: Json, expectedVersion: number): number {
     if (!this.current() || this.data.status !== "running" || expectedVersion !== this.data.intent_version)
@@ -167,36 +173,59 @@ export class ControlSession {
       });
     }, Math.max(0, this.anchor + next * period - this.clock.now()));
   }
+  private scheduleSample(): void {
+    if (!this.current() || this.data.counters.frames >= this.options.limits.max_frames) return;
+    const period = 1000 / this.options.limits.frequency_hz;
+    const slot = Math.max(this.sampleSlot, Math.ceil((this.clock.now() - this.anchor) / period));
+    this.sampleTimer = this.clock.setTimeout(() => {
+      this.sampleTimer = null; this.sampleSlot = slot + 1;
+      const work = this.sample(); this.sampleFlight = work;
+      void work.catch(error => this.fail(errorText(error))).finally(() => {
+        this.sampleFlight = null;
+        if (this.current()) this.scheduleSample();
+      });
+    }, Math.max(0, this.anchor + slot * period - this.clock.now()));
+  }
+  private async sample(): Promise<void> {
+    if (!this.current()) return;
+    const transitioning = this.transition !== null, channel = transitioning ? null : this.raw, generation = this.captureGeneration;
+    let frame: MinecraftControllerFrame;
+    try {
+      frame = minecraftControllerFrameSchema.parse(await (channel ? channel.sample(this.cursor) : this.options.sample(this.cursor)));
+    } catch (error) {
+      if (!this.current()) return;
+      // A read pinned before a deliberate producer switch cannot be consumed
+      // by its successor. Exact retirement still joins that old native owner.
+      if (error instanceof ControllerScreenReadSupersededError || transitioning || this.transition || channel !== this.raw) {
+        this.data.counters.stale_frames++; return;
+      }
+      if (channel) throw this.channelFailure(channel, error);
+      throw error;
+    }
+    if (!this.current()) return;
+    if (frame.frame_seq <= this.lastSampleFrame) { this.data.counters.stale_frames++; return; }
+    this.lastSampleFrame = frame.frame_seq; this.data.counters.frames++;
+    // One latest-capture mailbox: no unbounded frame queue or parallel VM calls.
+    this.capture = { frame, channel, transitioning, generation };
+  }
   private async tick(): Promise<void> {
     const limits = this.options.limits;
     if (!this.current()) return;
-    if (this.data.counters.frames >= limits.max_frames || this.data.counters.steps >= limits.max_steps) {
+    if (this.data.counters.steps >= limits.max_steps ||
+      this.data.counters.frames >= limits.max_frames && (!this.capture || this.capture.frame.frame_seq <= this.lastFrame)) {
       void this.stop("session_frame_budget"); return;
     }
     if (!this.transition && this.raw && this.clock.now() >= this.rawLeaseDeadline) {
       await this.recover("known_expired_raw_lease"); return;
     }
-    const samplingTransition = this.transition;
-    const samplingChannel = samplingTransition ? null : this.raw;
-    let frame: MinecraftControllerFrame;
-    try {
-      frame = minecraftControllerFrameSchema.parse(await (samplingChannel
-        ? samplingChannel.sample(this.cursor) : this.options.sample(this.cursor)));
-    } catch (error) {
-      if (error instanceof ControllerScreenReadSupersededError) {
-        this.data.counters.stale_frames++;
-        return;
-      }
-      if (samplingChannel) throw this.channelFailure(samplingChannel, error);
-      throw error;
-    }
-    if (!this.current()) return;
-    if (frame.frame_seq <= this.lastFrame) { this.data.counters.stale_frames++; return; }
-    this.lastFrame = frame.frame_seq; this.data.counters.frames++;
+    const capture = this.capture;
+    if (!capture || capture.frame.frame_seq <= this.lastFrame) return;
+    const { frame, channel: samplingChannel, transitioning: samplingTransition } = capture;
+    this.lastFrame = frame.frame_seq;
     // Opening/retiring may finish while the independent read is in flight.
     // That capture was never retained by the new channel: compute again from
     // its own next sample rather than relabeling or replaying this one.
-    if (samplingTransition || this.transition || samplingChannel !== this.raw) return;
+    if (samplingTransition || this.transition || samplingChannel !== this.raw || capture.generation !== this.captureGeneration) return;
     // The host decorates only its own software state, never native or evaluator observations.
     const decorated = { ...frame, executive: this.snapshot().session } as MinecraftControllerFrame;
     const version = this.data.intent_version, started = this.clock.now();
@@ -265,6 +294,7 @@ export class ControlSession {
   }
   private change(operation: () => Promise<void>): void {
     if (this.transition) return;
+    this.captureGeneration++;
     this.session.producer = "retiring";
     const work = Promise.resolve().then(operation);
     this.transition = work;
@@ -590,6 +620,7 @@ export class ControlSession {
     this.abort.abort(reason);
     this.analysisLane.fence(reason);
     if (this.timer !== null) this.clock.clearTimeout(this.timer);
+    if (this.sampleTimer !== null) this.clock.clearTimeout(this.sampleTimer);
     if (this.deadlineTimer !== null) this.clock.clearTimeout(this.deadlineTimer);
     this.data.reason ??= reason;
     const done = Promise.withResolvers<void>(); this.stopTask = done.promise;
@@ -605,6 +636,7 @@ export class ControlSession {
         // A source/result failure is the reason for stopping, not failed cleanup.
         // Join the attempt; worker.close and exact native retirement prove drain.
         Promise.resolve().then(async () => { await this.flight?.catch(() => {}); }),
+        Promise.resolve().then(async () => { await this.sampleFlight?.catch(() => {}); }),
       ]);
       const failure = cleanup.find(result => result.status === "rejected");
       this.recordControllerFault(this.raw);

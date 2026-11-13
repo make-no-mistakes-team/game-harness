@@ -1,5 +1,5 @@
 import type { GameActionResult, Json } from "../shared/contracts.ts";
-import type { ControllerChannelFault, ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck, RevocationAck } from "../shared/controller.ts";
+import type { ControllerChannelFault, ControllerEffectUpdate, ControllerInput, ControllerInputChannel, InputAppliedAck } from "../shared/controller.ts";
 import { controllerInputSchema, revocationAckSchema } from "../shared/controller.ts";
 import { sameEffectScope, type EffectScope, type WorldHeld, type WorldInputEdge } from "../shared/control.ts";
 import { minecraftControllerFrameSchema, type MinecraftControllerFrame } from "../shared/minecraft.ts";
@@ -356,10 +356,10 @@ export class ControlSession {
       this.notify(true);
     });
   }
-  private async retireRaw(): Promise<RevocationAck | null> {
+  private async retireRaw(): Promise<void> {
     this.rawMonitor.clear();
     const raw = this.raw;
-    if (!raw) return null;
+    if (!raw) return;
     this.recordControllerFault(raw);
     const ack = revocationAckSchema.parse(await raw.revoke());
     if (ack.controller_generation !== raw.controllerGeneration || ack.owner.operation_id !== raw.owner.operation_id ||
@@ -371,7 +371,6 @@ export class ControlSession {
     if (this.raw === raw) this.raw = null;
     for (const button of Object.keys(this.submittedHeld) as (keyof WorldHeld)[]) this.submittedHeld[button] = false;
     this.inputCaptures.clear(); this.session.producer = "none"; this.session.last_submission = null;
-    return ack;
   }
   private async retire(task: Task, reason: string): Promise<void> {
     if (task.retirement) return task.retirement;
@@ -498,7 +497,7 @@ export class ControlSession {
       return true;
     }
     if (choice.kind === "observe") {
-      if (this.raw) { this.change(async () => { await this.retireRaw(); }); return true; }
+      if (this.raw) { this.change(() => this.retireRaw()); return true; }
       // Observing deliberately does not renew a semantic producer's supervision lease.
       this.data.counters.no_input_decisions++; return true;
     }
@@ -543,7 +542,7 @@ export class ControlSession {
     // Adoption reserves an idempotent logical child immediately. Otherwise a
     // policy that records its requested strike/task would lose that request
     // when retirement finishes and its next decision chooses something else.
-    if (this.raw) { this.change(async () => { await this.retireRaw(); }); return true; }
+    if (this.raw) { this.change(() => this.retireRaw()); return true; }
     if (previous) { this.change(() => this.retire(previous, "Executive selected another child")); return true; }
     this.startTask(task, frame);
     return true;
@@ -653,9 +652,7 @@ export class ControlSession {
     this.decisionEpoch++;
     this.change(async () => {
       if (this.activeTask) await this.retire(this.activeTask, reason);
-      const retirement = await this.retireRaw();
-      if (checkpoint && retirement && retirement.unresolved_operation_refs.length)
-        throw new RecoveryAdmissionRefused("session_recovery_refused_unresolved_raw_effects");
+      await this.retireRaw();
       if (nativeCandidate) {
         const retired = nativeCandidate.snapshot(), fault = retired.fault;
         if (!retired.retired || !fault || !this.exactFault(nativeCandidate, fault) ||

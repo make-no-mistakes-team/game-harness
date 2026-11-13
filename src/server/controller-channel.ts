@@ -386,8 +386,9 @@ export class NativeControllerChannel implements ControllerInputChannel {
         if (result.generation <= this.expectedOwner.generation || !this.inputs.acceptRevocation(result.ack))
           throw new Error("Controller retirement ACK is not actual current-owner retirement.");
         await Promise.allSettled([...this.inflight]);
-        if (this.firstFault && this.firstFault.native_first_fence === null) {
-          this.firstFault.native_first_fence = this.nativeFence(this.transport.retirementTiming?.() ?? null);
+        const fault = this.firstFault ?? this.admissionFault;
+        if (fault && fault.native_first_fence === null) {
+          fault.native_first_fence = this.nativeFence(this.transport.retirementTiming?.() ?? null);
         }
         this.transport.retired(result.ack, result.generation);
         done.resolve(result.ack);

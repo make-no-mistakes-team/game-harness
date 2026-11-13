@@ -966,10 +966,65 @@ test("raw retirement keeps read-only sensing alive without reading through the f
   barrier.resolve(); await settle(); await h.session.stop("complete");
 });
 
-test.each(["lease", "queued", "missing_fence", "wrong_owner", "opaque", "gui", "unresolved", "exhausted"] as const)(
+test("a real channel retains retirement-only sample fence evidence without treating unknown world effects as GUI replay", async () => {
+  const h = harness(), open = h.options.open, host = vi.spyOn(performance, "now").mockImplementation(() => h.clock.now());
+  let retired = false;
+  const states: Json[] = [];
+  h.options.config = controlSessionConfigSchema.parse({ schema_version: 1, recovery: "checkpoint_safe", max_restarts: 1 });
+  h.options.restartWorker = async () => ({
+    async activate(_frame, state) {
+      expect(retired).toBe(true); states.push(state);
+      return { choice: { kind: "observe" }, next_state: state, status: "running", events: [] };
+    },
+    async step(_frame, state) { return { choice: { kind: "observe" }, next_state: state, status: "running", events: [] }; },
+    async close() {},
+  });
+  h.options.open = async (deadline, applied, effect, ...rest) => {
+    const base = await open(deadline, applied, effect, ...rest), owner = base.owner;
+    const clock = { clock_id: "boot", host_sent_ms: 0, host_received_ms: 0, native_received_ns: "0",
+      native_replied_ns: "0", native_processing_ms: 0, residual_round_trip_ms: 0,
+      offset_lower_ms: 0, offset_upper_ms: 0, uncertainty_ms: 0 };
+    return new NativeControllerChannel(owner, base.controllerGeneration, deadline, controllerNativeDeadline(clock, deadline), {
+      async request(method) {
+        if (method === "controller_revoke") return { generation: owner.generation + 1,
+          ack: { ...await base.revoke(), unresolved_operation_refs: [owner.operation_id] } };
+        return {};
+      },
+      async sample() {
+        if (h.clock.now() >= 100)
+          throw new NativeRequestFault("native_rejected", "controller_sample", 41, "dispatched", "Native sample rejected");
+        return minecraftControllerFrameSchema.parse(await h.options.sample(null));
+      },
+      clock: () => clock,
+      retirementTiming: () => ({ schema_version: 1, clock_id: "boot", received_ns: "100000000",
+        replied_ns: "101000000", client_tick: 2, controller_lease: {
+          schema_version: 1, event: "retirement", owner, controller_generation: base.controllerGeneration,
+          checked_native_ns: "99000000", requested_deadline_native_ns: null, previous_deadline_native_ns: "98000000",
+          effective_deadline_native_ns: "98000000", task_deadline_native_ns: "10000000000", accepted: true,
+          first_fence_reason: "native_input_lease_expired", first_fence_native_ns: "99000000",
+          retirement_trigger: "native_input_lease_expired", retirement_native_ns: "99000000",
+        } }),
+      assertCurrent() {}, retired() { retired = true; },
+      async failed() { throw new ResidentCleanupError(); },
+    }, applied, effect);
+  };
+  try {
+    h.choose({ kind: "raw", input: null }); await h.session.start(); await h.clock.advance(200);
+    expect(states).toEqual([2]);
+    expect(h.session.snapshot()).toMatchObject({ status: "running", state: 2,
+      session: { restarts: 1, behavior_generation: 2, deadline_host_ms: 10000 } });
+    expect(h.sent).toHaveLength(0);
+    expect(h.records.find(row => row.type === "session.controller_cleanup")?.details)
+      .toMatchObject({ retirement: { unresolved_operation_refs: ["producer-1"] },
+        fault: { stage: "sample", native_first_fence: { reason: "native_input_lease_expired" } } });
+  } finally { await h.session.stop("test complete"); host.mockRestore(); }
+});
+
+test.each(["lease", "queued", "missing_fence", "wrong_owner", "opaque", "gui", "unresolved_world", "unresolved_gui", "exhausted"] as const)(
   "checkpoint-safe native recovery preserves committed JSON only after proven world retirement: %s", async mode => {
   const h = harness(), open = h.options.open;
-  const allowed = mode === "lease" || mode === "queued";
+  const allowed = mode === "lease" || mode === "queued" || mode === "unresolved_world";
+  const gui = mode === "gui" || mode === "unresolved_gui";
   const pending = Promise.withResolvers<ExecutiveStepResult>();
   void pending.promise.catch(() => {});
   const fresh: { state: Json; session: ExecutiveSnapshot }[] = [];
@@ -1010,29 +1065,29 @@ test.each(["lease", "queued", "missing_fence", "wrong_owner", "opaque", "gui", "
         reason: mode === "queued" ? "queued_frame_expired_before_application" : "native_input_lease_expired", native_ns: "99000000",
         checked_native_ns: "100000000", effective_deadline_native_ns: "99000000" } : null } });
     channel.revoke = async () => { const ack = await revoke(); retired = true;
-      return { ...ack, unresolved_operation_refs: mode === "unresolved" ? ["unresolved-input"] : [] }; };
+      return { ...ack, unresolved_operation_refs: mode.startsWith("unresolved") ? ["unresolved-input"] : [] }; };
     return channel;
   };
   try {
-    const selected: ExecutiveChoice = mode === "gui" ? { kind: "raw", input: { kind: "world", held: neutral,
+    const selected: ExecutiveChoice = gui ? { kind: "raw", input: { kind: "world", held: neutral,
       edges: [{ kind: "button", button: "inventory", phase: "press", count: 1 }],
       view: { kind: "unchanged" }, selected_hotbar: null } } : rawChoice;
     h.choose(selected);
     // Commit one world decision before suspending the following one.
     const originalStep = h.options.worker.step;
-    h.options.worker.step = mode === "gui"
+    h.options.worker.step = gui
       ? async (frame, state, intent, signal) => {
         if (h.clock.now() === 50) return { choice: selected, next_state: 1, status: "running", events: [] };
         return await originalStep(frame, state, intent, signal);
       } : originalStep;
-    await h.session.start(); await h.clock.advance(mode === "gui" ? 75 : 50);
+    await h.session.start(); await h.clock.advance(gui ? 75 : 50);
     expect(h.session.snapshot().state).toBe(1);
     expect(fresh).toEqual([]);
     await h.clock.advance(150);
     expect(fresh).toHaveLength(allowed ? 1 : 0);
     if (allowed) expect(fresh[0]).toMatchObject({ state: 1, session: { producer: "none", restarts: 1,
       behavior_generation: 2, deadline_host_ms: 10000 } });
-    expect(h.sent).toHaveLength(mode === "gui" ? 1 : 0);
+    expect(h.sent).toHaveLength(gui ? 1 : 0);
     expect(h.options.event).not.toHaveBeenCalled();
     expect(h.session.snapshot()).toMatchObject({ status: allowed ? "running" : "failed",
       state: allowed ? 10 : 1, session: { restarts: allowed ? 1 : 0 } });

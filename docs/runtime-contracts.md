@@ -619,10 +619,13 @@ JSON does not establish whether an earlier world effect happened.
 Checkpoint-safe recovery also admits trusted exact-owner native world-input
 faults after confirmed revocation identifies the first fence as
 `native_input_lease_expired` or `queued_frame_expired_before_application`.
-An absent or unrelated first fence, untyped/opaque fault, unresolved raw effect
-or unconfirmed retirement denies a new invocation. Owners that saw an open
-screen or submitted screen, use or inventory input are excluded. No GUI
-transaction or buffered input is replayed. Recovery invalidates any pending
+An absent or unrelated first fence, untyped/opaque fault or unconfirmed retirement
+denies a new invocation. Owners that saw an open screen or submitted screen,
+use or inventory input are excluded. Unresolved world-effect references remain
+unknown: native retirement always retains its owner reference and does not prove
+past effects absent. Those references do not prevent fresh activation after
+confirmed closure. No GUI transaction or buffered input is replayed.
+Recovery invalidates any pending
 old-worker decision before closing it, so a late result cannot publish state,
 events or effects. Stop joins a pending recovery factory and closes its late
 candidate; an unconfirmed candidate closure remains unknown cleanup.

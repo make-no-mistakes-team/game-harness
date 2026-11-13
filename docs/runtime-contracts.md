@@ -52,6 +52,15 @@ retains the original copy identity and reference provenance, not a claim of newl
 authored code or qualified gameplay experience. Copying or editing grants no
 software-check result, root selection, sealing or fresh live activation.
 
+`program_edit` retains the parent's entry and card. Omitted `dependencies`
+retains its exact pins; a supplied list replaces the whole list, and `[]`
+removes all pins. The model must first author every selected dependency and
+provide matching imports in its text edits. Source, graph, byte bounds and the
+latest parent are checked before one immutable revision is saved. A rejected
+graph changes neither source nor pins. This lets the model move a helper into
+a library without retyping a near-limit root; it grants no execution or
+automatic replacement.
+
 Only this source-only `program_write` defaults to `entry:"step"`.
 The executive root exports synchronous `step(frame,state,intent)` and
 `activate(frame,state,intent)` and is still selected explicitly with
@@ -235,7 +244,7 @@ The ordinary default exposes these tools:
 |---|---|
 | `observe` | Obtain fresh authorized game state, a typed actor PNG and separate image metadata without caller-supplied session/life/epoch. |
 | `program_write` | Create a named immutable `run`, `step`, `analyze` or pure `library` revision; omitted card/dependencies remain unspecified and untested. |
-| `program_edit` | Save an inactive revision using exact model-specified text replacements against the latest immutable parent, retaining its entry, card and dependency pins. |
+| `program_edit` | Save an inactive atomic source/graph revision against the latest immutable parent; retain entry/card and omitted pins, or explicitly replace the complete dependency list. |
 | `program_submit` | Explicitly write an immutable version and request its exact-version start through ordinary admission; report persistence separately from a refused or uncertain start. |
 | `program_run` | Start a matching `run`/`step`, inspect or stop it, version-update resident intent, run a pure analysis job, activate prepared playing work or select a finite attention wake. |
 | `program_inspect` | Read catalog/source/execution/history/metric/evidence/trace/feedback/comparison/planning and mechanical reference views. |

@@ -1348,6 +1348,30 @@ test("program_edit preserves the inspected entry, card and exact dependency alia
   }]);
 });
 
+test("program_edit changes dependency pins only when explicitly supplied and keeps graph failures atomic", async () => {
+  const f = fixture();
+  await f.write("extracted helper", "export const value = 42;", { entry: "library" });
+  await f.write("inline consumer", "const value = 41; export function analyze(input) { return value; }", { entry: "analyze" });
+  const parent = f.store.namedSkill(f.run.run_id, "inline consumer")!;
+  const input = { name: "inline consumer", based_on: 1,
+    edits: [{ old_text: "const value = 41;", new_text: 'import { value } from "./helper.js";' }],
+    dependencies: [{ name: "extracted helper", version: 1, import_path: "./helper.js" }] };
+  const invalid = await f.call("program_edit", { ...input,
+    dependencies: [{ name: "missing helper", version: 1, import_path: "./helper.js" }] }, "bad-graph");
+  expect(invalid.isError).toBe(true);
+  expect(f.store.namedSkill(f.run.run_id, "inline consumer")).toEqual(parent);
+  const edited = await f.call("program_edit", input, "extract-helper");
+  expect(edited.isError).not.toBe(true);
+  expect(data(edited)).toMatchObject({ name: "inline consumer", version: 2,
+    dependencies: [{ name: "extracted helper", version: 1, import_path: "./helper.js" }] });
+  await f.write("extracted helper", "export const value = 43;", { entry: "library", based_on: 1 });
+  expect(data(await f.call("program_edit", input, "extract-helper"))).toEqual(data(edited));
+  expect(data(await f.call("program_edit", { ...input,
+    dependencies: [{ name: "extracted helper", version: 2, import_path: "./helper.js" }] }, "extract-helper")).error.code).toBe("conflict");
+  expect(f.store.namedSkill(f.run.run_id, "inline consumer", 1)).toEqual(parent);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+});
+
 test("program_edit refuses missing or stale bases and failed, ambiguous or invalid replacements without revisions", async () => {
   const f = fixture();
   await f.write("edit base", 'const first = "same"; const second = "same"; return {status:"completed",summary:first,result:second};');

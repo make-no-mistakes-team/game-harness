@@ -53,7 +53,7 @@ export class ProgramOperations {
     const writeInput = {
       name: input.name, based_on: input.based_on, entry: base.entry,
       source: applySourceEdits(base.source, input.edits), card: base.card,
-      dependencies: base.dependencies.map(dependency => ({
+      dependencies: input.dependencies ?? base.dependencies.map(dependency => ({
         name: this.store.skill(this.run.run_id, dependency).name, version: dependency.version,
         ...(dependency.import_path === undefined ? {} : { import_path: dependency.import_path }),
       })),

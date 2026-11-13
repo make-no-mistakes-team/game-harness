@@ -140,10 +140,13 @@ export class PreparedSourcebook implements ProgramArtifactCatalog {
     const parent = this.parent(input.name, input.based_on);
     if (!parent?.entry) throw new PreparedSourceFault("Exact source edit requires an existing explicit-entry parent");
     const source = applySourceEdits(parent.source, input.edits);
+    const dependencies = input.dependencies === undefined ? structuredClone(parent.dependencies)
+      : this.dependencies({ entry: parent.entry, dependencies: input.dependencies });
     return this.commit({ name: parent.name, entry: parent.entry, source, card: parent.card,
-      dependencies: structuredClone(parent.dependencies) }, parent, callId, requestId, identity,
+      dependencies }, parent, callId, requestId, identity,
       "program_edit", { kind: "selected_model_exact_edits", based_on: input.based_on,
-        base_hash: parent.hash, edits: input.edits });
+        base_hash: parent.hash, edits: input.edits,
+        ...(input.dependencies === undefined ? {} : { dependencies: input.dependencies }) });
   }
   private parent(name: string, basedOn: number | undefined): SkillView | undefined {
     const parent = this.latest.get(name);

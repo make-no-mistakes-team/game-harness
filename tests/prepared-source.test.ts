@@ -500,6 +500,32 @@ test("exact source edits preserve the canonical entry card and pinned imports wi
   await f.owner.close();
 });
 
+test("an exact prepared edit can extract a helper with explicit pins while rejected graphs leave the parent intact", async () => {
+  const adapter = minecraftTestAdapter(), compatibility = adapterCompatibility(adapter.descriptor, adapter.schemas);
+  const book = new PreparedSourcebook(compatibility.compatibility_hash, adapter, () => {}, () => {});
+  await book.write({ name: "probe", entry: "analyze",
+    source: "function value(input) { return input + 1; } export function analyze(input) { return value(input); }" }, "root", "request");
+  await book.write({ name: "helper", entry: "library",
+    source: "export function value(input) { return input + 2; }" }, "helper", "request");
+  const parent = structuredClone(book.select({ name: "probe" }));
+  const prefix = parent.source.slice(0, parent.source.indexOf("export function analyze"));
+  const edits = [{ old_text: prefix, new_text: 'import { value } from "./helper.js";\n' }];
+  await expect(book.edit({ name: "probe", based_on: 1, edits,
+    dependencies: [{ name: "missing", version: 1, import_path: "./helper.js" }] }, "bad-pin", "request")).rejects.toThrow();
+  expect(book.select({ name: "probe" })).toEqual(parent);
+  const input = { name: "probe", based_on: 1, edits,
+    dependencies: [{ name: "helper", version: 1, import_path: "./helper.js" }] };
+  const receipt = await book.edit(input, "extract", "request");
+  await book.write({ name: "helper", entry: "library", based_on: 1,
+    source: "export function value(input) { return input + 3; }" }, "newer-helper", "request");
+  expect(await book.edit(input, "extract", "request")).toEqual(receipt);
+  const controller = new AbortController();
+  const worker = await residentAnalysisProcess(book.bundle(book.select({ name: "probe", version: 2 })), 500, controller.signal);
+  try { expect(await worker.analyze(40, controller.signal)).toBe(42); }
+  finally { await worker.close(); }
+  expect(book.select({ name: "probe", version: 1 })).toEqual(parent);
+});
+
 test("copy never hydrates dependencies and exact revisions retain post-validation CAS and lifecycle fences", async () => {
   const reference = approvedReference("import {value} from './helper.js'; export function analyze(input) { return value(input); }", "analyze");
   const rows: string[] = [];

@@ -50,6 +50,8 @@ export const programEditSchema = z.object({
   name: programWriteSchema.shape.name,
   based_on: z.int().positive().describe("Exact latest existing version to edit; never silently rebased."),
   edits: sourceEditsSchema,
+  dependencies: programWriteSchema.shape.dependencies.unwrap().optional()
+    .describe("Omit to retain the parent's exact pins. Supply the complete replacement list to explicitly rebind imports or semantic children; [] removes all dependencies. Targets must already exist and the edited source/graph must validate atomically."),
   reason: programWriteSchema.shape.reason,
 }).strict();
 export const nextConfigSchema = lookaheadConfigSchema.extend({ activation: z.enum(["manual", "on_predecessor_success"]).default("manual") }).strict();

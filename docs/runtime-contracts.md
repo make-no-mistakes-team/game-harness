@@ -494,6 +494,12 @@ session. A child is not a saved async stack: resumption requires a fresh keyed
 invocation chosen from current observations. Source replacement, local recovery
 and child starts do not renew the original session deadline.
 
+`SessionEffects` owns the local selection, supervision and retirement joins for
+these physical children, including action-completion subscriptions and trace
+attribution. It reuses the existing `SkillManager` and sole `ActionArbiter`.
+Runtime still owns lifecycle authority; this extraction does not move execution
+off the coordinator event loop.
+
 Five seconds of fresh consecutive executive decisions that only observe or
 look up settled tasks, with no selected producer, new task or raw submission,
 emit one `executive_no_effect_decisions` mechanical advisory

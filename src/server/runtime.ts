@@ -21,7 +21,7 @@ import { projectRunOperator } from "./operator-state.ts";
 import type { SkillExecutionView } from "../shared/programs.ts";
 import { goalSchema, verificationResultSchema } from "../shared/validation.ts";
 import { taskTextSchema } from "../shared/tasks.ts";
-import type { EffectContext, EffectScope, ProducerSupervision } from "../shared/control.ts";
+import type { EffectContext, EffectScope } from "../shared/control.ts";
 import { sameEffectScope, sameScreen } from "../shared/control.ts";
 import { adapterCompatibility, canonicalContractJson } from "./adapter-contract.ts";
 import { RegisteredAdapterContract } from "./registered-adapter.ts";
@@ -30,6 +30,7 @@ import type { AuthManager } from "./auth.ts";
 import type { SandboxService } from "./sandbox.ts";
 import type { Store, StoredRun } from "./store.ts";
 import { SkillManager } from "./skills.ts";
+import { SessionEffects } from "./session-effects.ts";
 import { emptyRunUsage } from "./usage.ts";
 import {
   ExperienceLibrary,
@@ -60,12 +61,6 @@ const TERMINAL: Partial<Record<RunView["status"], true>> = {
   completed: true,
   failed: true,
 };
-const ACTION_TERMINAL = new Set([
-  "succeeded",
-  "failed",
-  "cancelled",
-  "unknown",
-]);
 const BRIDGE_FAILURE =
   "The game effect could not be safely reconciled. Reconnect the game before resuming; no uncertain action will be replayed.";
 export interface RuntimeOptions {
@@ -83,6 +78,7 @@ export class Runtime {
   private readonly actorFrameSource: RuntimeOptions["actorFrames"];
   private readonly imageAuthorityWaits = new Set<() => void>();
   private readonly skills: SkillManager;
+  private readonly sessionEffects: SessionEffects;
   private readonly experience: ExperienceLibrary | null;
   private readonly adapterSource: RuntimeOptions["adapter"];
   private readonly registrations = new WeakMap<RuntimeAdapter, RegisteredAdapterContract>();
@@ -93,7 +89,6 @@ export class Runtime {
   private readonly planning: SpeculativePlanning;
   private readonly learning: ImprovementLearning;
   private readonly historyOwner: HistoryProjectionOwner;
-  private readonly trace: ExecutionTrace;
   private run: StoredRun | null = null;
   private observation: ObservationV3 | null = null;
   private observationRequest: Promise<ObservationV3> | null = null;
@@ -111,9 +106,6 @@ export class Runtime {
   private deathIds = new Set<string>();
   private lifeRecovery: Promise<void> | null = null;
   private uncertaintyRecovery: Promise<void> | null = null;
-  private readonly sessionChildren = new Map<string, {
-    handle: number; executionId: string; deadlineHostMs: number; supervision: ProducerSupervision;
-  }>();
   private repeatedNoEffect: {
     root: string; rootSource: string; scope: EffectScope; signature: string;
     count: number; notified: boolean; actionIds: string[];
@@ -299,7 +291,6 @@ export class Runtime {
     this.historyQueries = new HistoryReader(store.readLocation());
     this.learning = new ImprovementLearning(store, this.historyQueries);
     this.historyOwner = new HistoryProjectionOwner(store, this.learning);
-    this.trace = new ExecutionTrace(store);
     this.planning = new SpeculativePlanning({
       contract: () => this.context().adapter,
       admissionContext: () => {
@@ -385,42 +376,12 @@ export class Runtime {
       },
     });
     this.skills = new SkillManager(store, sandbox, {
-      sessionTask: async (execution, request, handle, deadline, signal, frame, behaviorGeneration) => {
-        if (!game.superviseProducer) throw new RuntimeFault("precondition_failed", "Native semantic supervision is required");
-        const selection = { handle, executionId: execution.execution_id, deadlineHostMs: deadline,
-          supervision: { session_id: execution.execution_id, behavior_generation: behaviorGeneration, frame_seq: frame.frame_seq } };
-        if (this.sessionChildren.has(execution.execution_id)) throw new RuntimeFault("busy", "Previous session child has not retired");
-        this.sessionChildren.set(execution.execution_id, selection);
-        try {
-          if (request.kind === "program")
-            return await this.skills.runSessionChild(execution, request.program, request.args,
-              Math.max(1, Math.floor(deadline - performance.now())), handle, signal);
-          this.skills.consumeSessionAction(execution);
-          return await this.skillAction(execution, request.action, signal, `session_${handle}`);
-        } finally {
-          if (this.sessionChildren.get(execution.execution_id) === selection) this.sessionChildren.delete(execution.execution_id);
-        }
-      },
-      superviseSessionTask: async (execution, handle, frame, behaviorGeneration) => {
-        const selection = this.sessionChildren.get(execution.execution_id);
-        if (!selection || selection.handle !== handle) return; // Normal completion/continue race.
-        if (performance.now() >= selection.deadlineHostMs) {
-          await this.actions.cancelOwned(new Set([selection.executionId]), "Session child original deadline reached"); return;
-        }
-        selection.supervision = { session_id: execution.execution_id, behavior_generation: behaviorGeneration, frame_seq: frame.frame_seq };
-        const active = this.actions.active;
-        if (active && active.entry.stored.view.scope &&
-          (active.entry.stored.view.execution_id === execution.execution_id ||
-            this.store.skillExecution(execution.run_id, { execution_id: active.entry.stored.view.execution_id! })?.root_execution_id === execution.execution_id)) {
-          selection.executionId = active.entry.stored.view.execution_id!;
-          await game.superviseProducer!(selection.executionId, selection.supervision);
-        }
-      },
-      retireSessionTask: async (execution, handle, reason) => {
-        const selection = this.sessionChildren.get(execution.execution_id);
-        await this.skills.retireSessionChild(execution, handle, reason);
-        await this.actions.cancelOwned(new Set([execution.execution_id, ...(selection ? [selection.executionId] : [])]), reason);
-      },
+      sessionTask: (execution, request, handle, deadline, signal, frame, behaviorGeneration) =>
+        this.sessionEffects.sessionTask(execution, request, handle, deadline, signal, frame, behaviorGeneration),
+      superviseSessionTask: (execution, handle, frame, behaviorGeneration) =>
+        this.sessionEffects.superviseSessionTask(execution, handle, frame, behaviorGeneration),
+      retireSessionTask: (execution, handle, reason) =>
+        this.sessionEffects.retireSessionTask(execution, handle, reason),
       openController: (execution, generation, deadline, applied, effect, lifecycle) =>
         this.actions.reserveController(execution.execution_id, generation, deadline, applied, effect, lifecycle),
       programEvent: (_execution, event) => {
@@ -467,7 +428,7 @@ export class Runtime {
       },
       observe: () => this.refreshObservation(),
       action: (execution, action, signal, callId) =>
-        this.skillAction(execution, action, signal, callId),
+        this.sessionEffects.action(execution, action, signal, callId),
       queryCapability: async (id, version, args) => {
         if (!game.queryCapability) throw new RuntimeFault("precondition_failed", "This adapter has no registered read capability");
         return await game.queryCapability(id, version, args);
@@ -522,6 +483,7 @@ export class Runtime {
         );
       },
     });
+    this.sessionEffects = new SessionEffects(store, game, this.skills, this.actions, new ExecutionTrace(store), () => this.run);
     this.reactions = new ReactiveRuntime(
       store,
       sandbox,
@@ -1365,68 +1327,6 @@ export class Runtime {
       task: run.task,
     };
   }
-  private async skillAction(
-    execution: SkillExecutionView,
-    action: GameAction,
-    signal: AbortSignal,
-    callId: string,
-  ): Promise<GameActionResult> {
-    if (signal.aborted)
-      throw new RuntimeFault("stale_context", "Skill action authority revoked");
-    const id = "skill_" + randomUUID(),
-      completion = Promise.withResolvers<GameActionResult>();
-    let unsubscribe = () => {};
-    let settling = false;
-    const check = () => {
-      const view = this.store.getAction(execution.run_id, id)?.view;
-      if (view && ACTION_TERMINAL.has(view.status) && !settling) {
-        settling = true;
-        unsubscribe();
-        const root = this.store.skillExecution(execution.run_id, { execution_id: execution.root_execution_id });
-        if ((view.result?.status === "unknown" && !(root?.entry === "step" && root.session)) || view.result?.requires_reconnect)
-          this.skills.fence("Leaf outcome is unknown; interrupted execution lineage retained", execution.execution_id);
-        if (view.result) completion.resolve(view.result);
-        else
-          completion.reject(
-            new RuntimeFault("unknown_effect", "Skill action has no confirmed result"),
-          );
-      }
-    };
-    unsubscribe = this.store.subscribe((event) => {
-      if (event.run_id === execution.run_id && event.type.startsWith("action."))
-        check();
-    });
-    try {
-      const sessionChild = this.sessionChildren.get(execution.root_execution_id);
-      if (sessionChild) sessionChild.executionId = execution.execution_id;
-      this.actions.admit(
-        id,
-        action,
-        0,
-        sessionChild ? Math.max(1, sessionChild.deadlineHostMs - performance.now()) : undefined,
-        null,
-        execution.execution_id,
-        sessionChild?.supervision,
-      );
-      this.trace.record(execution, "capability_request", { kind: "admitted_action", action: action as unknown as Json }, {
-        call_id: callId, action_id: id, capability: action.kind === "respawn" ? "respawn" : "action",
-        session_id: this.run!.session_id, life_id: this.store.getAction(execution.run_id, id)!.view.life_id,
-      });
-      check();
-      const result = await completion.promise;
-      const active = this.actions.active;
-      if (active?.entry.stored.view.action_id === id)
-        await this.actions.awaitRetirement(active);
-      this.trace.record(execution, "capability_result", result as unknown as Json, {
-        call_id: callId, action_id: id, capability: action.kind === "respawn" ? "respawn" : "action",
-        session_id: this.run!.session_id, life_id: this.store.getAction(execution.run_id, id)!.view.life_id,
-      });
-      return result;
-    } finally {
-      unsubscribe();
-    }
-  }
-
   private fenceAuthority(message: string, uncertainExecutionId?: string): void {
     this.repeatedNoEffect = null;
     this.executiveObservation.clear();

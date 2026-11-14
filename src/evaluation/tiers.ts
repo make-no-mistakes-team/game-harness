@@ -57,6 +57,10 @@ export const TEST_TIERS = Object.freeze({
     "tests/planning-admission.test.ts", // Real Store/SkillManager/planner; substituted sandbox seam.
     "tests/program-experience.test.ts", // SQLite, evidence and experience services.
     "tests/store-readonly.test.ts", // Existing-only SQLite snapshots and canonical historical/source semantics.
+    "tests/projection-storage.test.ts", // Bound separate derived ledger, migration and durable audit recovery.
+    "tests/projection-writer.test.ts", // Real independent derived writer, canonical progress and cancellation/closure.
+    "tests/source-validation-worker.test.ts", // Real bounded source/static/graph worker and fenced publication.
+    "tests/strategic-context-worker.test.ts", // Real readonly context child, retained knowledge and joined cancellation.
     "tests/history-reader.test.ts", // Actual readonly child, bounded IPC and exit/pipe-drain cancellation barriers.
     "tests/history-dispatch.test.ts", // Real SQLite projections, scoped cursors and complete archive transport.
     "tests/improvement-preparation.test.ts", // Child candidate pages and sole-writer exact revalidation across awaits.

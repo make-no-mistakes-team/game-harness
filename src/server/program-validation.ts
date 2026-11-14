@@ -45,6 +45,20 @@ export interface ProgramValidationIssue {
   entry_contract?: z.infer<typeof programEntryContractSchema>;
 }
 
+/** Only these bounded source diagnostics may cross the trusted validation-worker seam. */
+export const sourceValidationIssuesSchema = z.array(z.object({
+  code: z.enum(["invalid_metadata", "invalid_dependencies", "invalid_syntax", "invalid_entry",
+    "forbidden_syntax", "forbidden_api", "unbound_identifier", "analysis_limit", "invalid_kind",
+    "invalid_source", "source_bytes_limit", "invalid_modules", "module_source_limit",
+    "module_depth_limit", "module_cycle", "module_count_limit", "module_bytes_limit",
+    "unbound_import", "invalid_module_export", "source_graph_limit", "source_validation_envelope_limit"]),
+  message: z.string().max(2048),
+  location: z.object({ line: z.number().int().nonnegative(), column: z.number().int().nonnegative() }).strict().nullable(),
+  limit: z.object({ maximum: z.number().finite().nonnegative(), actual: z.number().finite().nonnegative() }).strict().nullable(),
+  path: z.string().max(4096).optional(),
+  entry_contract: programEntryContractSchema.optional(),
+}).strict()).min(1).max(16384);
+
 export class ProgramValidationError extends Error {
   readonly issues: readonly ProgramValidationIssue[];
 

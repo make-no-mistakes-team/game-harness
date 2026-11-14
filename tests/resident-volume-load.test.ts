@@ -121,7 +121,6 @@ test("P13 seeds exactly 30 attributable real raw receipts without premeasurement
   const originals = {
     saveRun: f.store.saveRun,
     saveAction: f.store.saveAction,
-    commit: f.store.commitHistoryProjectionBatch,
     bootstrap: f.store.advanceHistorySourceBootstrap,
   };
   f.owner = await prepareResidentVolumeLoad(options(f));
@@ -227,7 +226,6 @@ test("P13 seeds exactly 30 attributable real raw receipts without premeasurement
   await f.owner.close();
   expect(f.store.saveRun).toBe(originals.saveRun);
   expect(f.store.saveAction).toBe(originals.saveAction);
-  expect(f.store.commitHistoryProjectionBatch).toBe(originals.commit);
   expect(f.store.advanceHistorySourceBootstrap).toBe(originals.bootstrap);
   expect(f.owner.snapshot()).toMatchObject({
     closed: true,

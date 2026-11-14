@@ -1,4 +1,4 @@
-import { afterEach, expect, test, vi } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +23,18 @@ import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup(); });
+async function waitForPublication(runtime: Runtime, runId: string, through: number) {
+  const options = { deadlineHostMs: performance.now() + 10_000 };
+  for (let queries = 0; queries < 1024 && performance.now() < options.deadlineHostMs; queries++) {
+    const status = await runtime.historyQueries.query(
+      { kind: "projection_status", run_id: runId },
+      options,
+    );
+    if (status.published && status.published.source_through >= through)
+      return status.published;
+  }
+  throw new Error(`History did not publish the retained source frontier ${through}`);
+}
 const ROOT = "Neutral flow", FOLLOW = "Fresh follow-up", RECOVERY = "Explicit recovery", CHILD = "Neutral child";
 const card = { purpose: "Exercise trusted lifecycle transitions", applicability: "Deterministic neutral fixture", method: "Await authorized bounded capabilities", reason: "Measure actual ownership transitions", limitations: "No gameplay effectiveness claim" };
 const ok: GameActionResult = { status: "succeeded", summary: "Confirmed neutral fixture effect", evidence: { effect_confirmed: true } };
@@ -791,24 +803,12 @@ test("named revision pins the original running version and trusted call retries 
 test("a revision reason links the exact candidate experiment without a bookkeeping-only model call", async () => {
   const f = await fixture();
   const original = f.store.namedSkill(f.created.run_id, ROOT, 1)!;
-  const published = Promise.withResolvers<void>(), commit = f.store.commitHistoryProjectionBatch.bind(f.store);
-  let through = Number.POSITIVE_INFINITY;
-  const publication = vi.spyOn(f.store, "commitHistoryProjectionBatch").mockImplementation((runId, batch) => {
-    commit(runId, batch);
-    if (runId === f.created.run_id && batch.after.phase === "idle" && batch.after.source_through >= through)
-      published.resolve();
-  });
-  try {
-    f.unknown(); await reached(f, f.replanned.promise);
-    // Replanning admits strategy, not history publication. Join the real
-    // background writer's fixed committed frontier; feedback remains readonly.
-    through = f.store.historySourceHighwater(f.created.run_id);
-    if ((f.store.historyProjectionGeneration(f.created.run_id)?.source_through ?? -1) >= through)
-      published.resolve();
-    await reached(f, published.promise);
-  } finally {
-    publication.mockRestore();
-  }
+  f.unknown(); await reached(f, f.replanned.promise);
+  // Replanning admits strategy, not history publication. Join the real
+  // background writer's fixed committed frontier; feedback remains readonly.
+  const through = f.store.historySourceHighwater(f.created.run_id);
+  const published = await reached(f, waitForPublication(f.runtime, f.created.run_id, through));
+  expect(published.source_through).toBeGreaterThanOrEqual(through);
   const execution = f.findExecution(ROOT)!;
   const closed = f.store.eventsAfter(f.created.run_id, 0, 500).find(event =>
     event.type === "skill.closed" && eventDetails(event.details)?.execution_id === execution.execution_id)!;

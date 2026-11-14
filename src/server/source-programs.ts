@@ -4,9 +4,8 @@ import type { SkillDependency, SkillRef, SkillView } from "../shared/programs.ts
 import { SKILL_API_VERSION } from "../shared/programs.ts";
 import { assertExecutableCompatible } from "./effect-contract.ts";
 import { HOST_MONOTONIC_CLOCK_ID } from "./performance.ts";
-import { resolveProgramModuleClosure } from "./program-modules.ts";
-import { programFingerprint, validateSkill } from "./program-validation.ts";
-import { RegisteredAdapterContract } from "./registered-adapter.ts";
+import { programFingerprint } from "./program-validation.ts";
+import { validateSourceInWorker, type SourceValidationOptions } from "./source-validation-client.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import type { Store } from "./store.ts";
 
@@ -56,23 +55,32 @@ export function assertSourceDependencies(store: Pick<SourceProgramStore, "skill"
   for (const dependency of dependencies) visit(dependency, 2);
 }
 
-/** Pure source validation and catalog publication, independent of physical scheduling. */
+/** Default source/static/graph work runs in an owned worker; publication stays on the canonical owner. */
 export class SourcePrograms {
-  private readonly registrations = new WeakMap<RuntimeAdapter, RegisteredAdapterContract>();
   constructor(private store: SourceProgramStore, private host: SourceProgramHost) {}
 
   private context() {
     const adapter = this.host.adapter(), binding = this.host.binding();
     if (!adapter || !binding?.ready) throw new RuntimeFault("precondition_failed", "A negotiated adapter contract is required");
-    let registration = this.registrations.get(adapter);
-    if (!registration) { registration = new RegisteredAdapterContract(adapter.descriptor, adapter.schemas, adapter.capabilityValidators); this.registrations.set(adapter, registration); }
-    if (registration.compatibility.compatibility_hash !== binding.compatibility_hash)
-      throw new RuntimeFault("precondition_failed", "Executable and native adapter profiles do not match");
-    return { adapter, binding, registration, descriptor: adapter.descriptor, schemas: adapter.schemas };
+    return { binding, descriptor: adapter.descriptor, schemas: adapter.schemas };
   }
 
-  private compatible(skill: SkillView): void {
-    assertSourceCompatible(skill, this.context().binding);
+  private async validate(runId: string, spec: unknown, beforeCommit: () => void,
+    options: SourceValidationOptions, snapshot?: SkillView) {
+    const context = this.context();
+    const contextIdentity = JSON.stringify(context);
+    const runCompatibilityHash = this.store.getRun(runId)?.compatibility_hash ?? null;
+    const assertScope = () => {
+      beforeCommit();
+      if (JSON.stringify(this.context()) !== contextIdentity ||
+        (this.store.getRun(runId)?.compatibility_hash ?? null) !== runCompatibilityHash)
+        throw new RuntimeFault("stale_context", "Source validation adapter profile changed before publication");
+    };
+    return validateSourceInWorker({
+      spec, ...(snapshot ? { snapshot } : {}),
+      context: { descriptor: context.descriptor, schemas: context.schemas },
+      binding: context.binding, runCompatibilityHash,
+    }, ref => this.store.skill(runId, ref), assertScope, options);
   }
 
   async register(
@@ -80,21 +88,19 @@ export class SourcePrograms {
     spec: unknown,
     beforeCommit: () => void = () => {},
     registration?: { call_id: string; input: Json },
+    options: SourceValidationOptions = {},
   ): Promise<SkillView> {
     if (registration) {
+      registration = structuredClone(registration);
       const previous = this.store.completedToolCall(runId, registration.call_id, registration.input);
       if (previous !== null) return this.store.skill(runId, previous as unknown as SkillRef);
     }
     return this.timeSource(runId, registration?.call_id ?? null, async timing => {
-      const validated = await validateSkill(spec, this.context());
-      assertSourceDependencies(this.store, runId, validated.dependencies, dependency => this.compatible(dependency));
-      if (validated.entry === "run" && validated.dependencies.some(dependency => this.store.skill(runId, dependency).entry !== "run"))
-        throw new RuntimeFault("precondition_failed", "Async run dependencies can only name semantic run children");
-      if (validated.entry !== "run") resolveProgramModuleClosure(this.store, runId, {
-        ...validated, hash: createHash("sha256").update(validated.source).digest("hex"),
-      });
+      const admission = await this.validate(runId, spec, beforeCommit, options);
+      const validated = admission.validated;
+      admission.assertCurrent();
       timing.validatedAt = performance.now();
-      const published = await this.store.registerSkill(runId, validated, registration, beforeCommit);
+      const published = await this.store.registerSkill(runId, validated, registration, () => admission.assertCurrent());
       timing.published = published;
       timing.publishedAt = performance.now();
       this.host.changed?.();
@@ -106,34 +112,21 @@ export class SourcePrograms {
     runId: string,
     snapshot: SkillView,
     beforeCommit: () => void = () => {},
+    options: SourceValidationOptions = {},
   ): Promise<SkillView> {
+    snapshot = structuredClone(snapshot);
     return this.timeSource(runId, null, async timing => {
-      this.compatible(snapshot);
-      const validated = await validateSkill({
+      const admission = await this.validate(runId, {
         entry: snapshot.entry,
         name: snapshot.name,
         source: snapshot.source,
         card: snapshot.card,
         dependencies: snapshot.dependencies,
-      }, this.context());
-      if (
-        validated.source !== snapshot.source ||
-        createHash("sha256").update(snapshot.source).digest("hex") !==
-          snapshot.hash
-      )
-        throw new Error(
-          "Exact snapshot bytes do not match current canonical validation",
-        );
-      if (validated.validation.fingerprint !== snapshot.validation.fingerprint)
-        throw new Error(
-          "Snapshot validator configuration changed; fresh evidence requires a validated revision",
-        );
-      assertSourceDependencies(this.store, runId, snapshot.dependencies, dependency => this.compatible(dependency));
-      if (snapshot.entry === "run" && snapshot.dependencies.some(dependency => this.store.skill(runId, dependency).entry !== "run"))
-        throw new RuntimeFault("precondition_failed", "Async run dependencies can only name semantic run children");
-      if (snapshot.entry !== "run") resolveProgramModuleClosure(this.store, runId, snapshot);
+      }, beforeCommit, options, snapshot);
+      const validated = admission.validated;
+      admission.assertCurrent();
       timing.validatedAt = performance.now();
-      const view = await this.store.importSkill(runId, snapshot, beforeCommit);
+      const view = await this.store.importSkill(runId, snapshot, () => admission.assertCurrent());
       timing.published = view;
       timing.publishedAt = performance.now();
       await this.store.event(

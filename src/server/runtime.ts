@@ -50,6 +50,7 @@ import { RuntimeFault } from "./runtime-fault.ts";
 import { SpeculativePlanning } from "./speculative-planning.ts";
 import { ImprovementLearning } from "./improvement-learning.ts";
 import { HistoryProjectionOwner } from "./history-projection-owner.ts";
+import { ProjectionWriterClient } from "./projection-writer-client.ts";
 import { ExecutionTrace } from "./execution-trace.ts";
 import { ActorFrameSelector, type ModelObservation } from "./actor-frames.ts";
 import { retainResidentReceipt } from "./resident-evidence.ts";
@@ -291,7 +292,7 @@ export class Runtime {
       ? new ExperienceLibrary(options.experienceDirectory, () => this.currentCompatibility())
       : null;
     this.historyQueries = new HistoryReader(store.readLocation());
-    this.learning = new ImprovementLearning(store, this.historyQueries);
+    this.learning = new ImprovementLearning(store, this.historyQueries, new ProjectionWriterClient(store));
     this.historyOwner = new HistoryProjectionOwner(store, this.learning);
     this.planning = new SpeculativePlanning({
       contract: () => this.context().adapter,
@@ -659,6 +660,7 @@ export class Runtime {
   }
   async initialize(): Promise<void> {
     if (this.unsubscribeGame) return;
+    await this.learning.ready;
     const retained = this.store.lastRun();
     // Historical rows are exposed only through read APIs, never restored as a
     // live controller or rewritten by current lifecycle/policy initialization.
@@ -967,6 +969,7 @@ export class Runtime {
     return await this.serialize(() => this.createRunState(input));
   }
   private async createRunState(input: Parameters<Runtime["createRun"]>[0]): Promise<RunView> {
+      await this.learning.ready;
       if (this.closed)
         throw new RuntimeFault("unavailable", "The runtime is closed");
       if (this.run && !TERMINAL[this.run.status])

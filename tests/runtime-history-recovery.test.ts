@@ -1,4 +1,4 @@
-import { afterEach, expect, test, vi } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +27,18 @@ const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
 });
+async function waitForPublication(runtime: Runtime, runId: string, through: number) {
+  const options = { deadlineHostMs: performance.now() + 10_000 };
+  for (let queries = 0; queries < 1024 && performance.now() < options.deadlineHostMs; queries++) {
+    const status = await runtime.historyQueries.query(
+      { kind: "projection_status", run_id: runId },
+      options,
+    );
+    if (status.published && status.published.source_through >= through)
+      return status.published;
+  }
+  throw new Error(`History did not publish the retained source frontier ${through}`);
+}
 const name = "Uncertain history root";
 const card = {
   purpose: "Retain an uncertain outcome",
@@ -379,51 +391,32 @@ test("explicit Resume after drained uncertainty and failed observation restores 
   if (baselineUpdate?.kind !== "replace")
     throw new Error("The retained execution must have a baseline replacement");
   const baseline = baselineUpdate.metric;
-  const published = Promise.withResolvers<void>(),
-    commit = f.store.commitHistoryProjectionBatch.bind(f.store);
-  let through = Number.POSITIVE_INFINITY;
-  const spy = vi
-    .spyOn(f.store, "commitHistoryProjectionBatch")
-    .mockImplementation((runId, batch) => {
-      commit(runId, batch);
-      if (
-        runId === f.run.run_id &&
-        batch.after.phase === "idle" &&
-        batch.after.source_through >= through
-      )
-        published.resolve();
-    });
-  try {
-    const eventsBefore = f.store.lastEventSeq();
-    const trace = new ExecutionTrace(f.store);
-    trace.span(execution, "sandbox", 100, 107);
-    through = f.store.historySourceHighwater(f.run.run_id);
-    expect(f.store.lastEventSeq()).toBe(eventsBefore);
-    await f.reached(published.promise);
-    expect(
-      f.store.historyProjectionGeneration(f.run.run_id)!.source_through,
-    ).toBeGreaterThanOrEqual(through);
-    const after = await f.runtime.historyQueries.query(
-      {
-        kind: "operator_feedback",
-        run_id: f.run.run_id,
-        after: before.next_after,
-        limit: 100,
-      },
-      { deadlineHostMs: performance.now() + 10_000 },
-    );
-    const replacement = after.metrics
-      .filter((item) => item.execution_id === execution.execution_id)
-      .at(-1);
-    if (replacement?.kind !== "replace")
-      throw new Error("The retained execution must receive a span replacement");
-    expect(replacement.metric.spans_ms.sandbox).toBe(
-      (baseline.spans_ms.sandbox ?? 0) + 7,
-    );
-    expect(f.store.lastEventSeq()).toBe(eventsBefore);
-  } finally {
-    spy.mockRestore();
-  }
+  const eventsBefore = f.store.lastEventSeq();
+  const trace = new ExecutionTrace(f.store);
+  trace.span(execution, "sandbox", 100, 107);
+  const through = f.store.historySourceHighwater(f.run.run_id);
+  expect(f.store.lastEventSeq()).toBe(eventsBefore);
+  const published = await f.reached(waitForPublication(f.runtime, f.run.run_id, through));
+  expect(published.source_through).toBeGreaterThanOrEqual(through);
+  expect(published.generation).toBeGreaterThan(before.projection.generation);
+  const after = await f.runtime.historyQueries.query(
+    {
+      kind: "operator_feedback",
+      run_id: f.run.run_id,
+      after: before.next_after,
+      limit: 100,
+    },
+    { deadlineHostMs: performance.now() + 10_000 },
+  );
+  const replacement = after.metrics
+    .filter((item) => item.execution_id === execution.execution_id)
+    .at(-1);
+  if (replacement?.kind !== "replace")
+    throw new Error("The retained execution must receive a span replacement");
+  expect(replacement.metric.spans_ms.sandbox).toBe(
+    (baseline.spans_ms.sandbox ?? 0) + 7,
+  );
+  expect(f.store.lastEventSeq()).toBe(eventsBefore);
   const freshRun = f.freshTools().find((tool) => tool.name === "program_run")!;
   await f.runtime.control(f.run.run_id, "stop");
   expect(
@@ -444,29 +437,7 @@ test("unconfirmed uncertainty native drain cannot be bypassed by same-session Re
   const f = await fixture(true);
   // Establish the old complete snapshot before deliberately fencing publication.
   const through = f.store.historySourceHighwater(f.run.run_id);
-  const published = Promise.withResolvers<void>();
-  const commit = f.store.commitHistoryProjectionBatch.bind(f.store);
-  const publication = vi
-    .spyOn(f.store, "commitHistoryProjectionBatch")
-    .mockImplementation((runId, batch) => {
-      commit(runId, batch);
-      if (
-        runId === f.run.run_id &&
-        batch.after.phase === "idle" &&
-        batch.after.source_through >= through
-      )
-        published.resolve();
-    });
-  try {
-    if (
-      (f.store.historyProjectionGeneration(f.run.run_id)?.source_through ??
-        -1) >= through
-    )
-      published.resolve();
-    await f.reached(published.promise);
-  } finally {
-    publication.mockRestore();
-  }
+  await f.reached(waitForPublication(f.runtime, f.run.run_id, through));
   f.unknown();
   await f.reached(f.barrierEntered.promise);
   f.nativeBarrier.resolve();

@@ -6,6 +6,7 @@ import { projectionBatchSchema, type HistoryQueryClient, type HistoryQueryOption
 import type { ProjectionCheckpoint } from "./history-projection.ts";
 import { exactVersion } from "./program-feedback.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
+import type { ProjectionWriterClient } from "./projection-writer-client.ts";
 
 export interface ImprovementResolution {
   /** Candidate-experiment decision, not an efficacy, adoption, or promotion claim. */
@@ -25,7 +26,11 @@ export class ImprovementLearning {
   }>();
   private closed = false;
 
-  constructor(private readonly store: Store, private readonly reader: HistoryQueryClient) {}
+  readonly ready: Promise<void>;
+  constructor(private readonly store: Store, private readonly reader: HistoryQueryClient,
+    private readonly writer?: ProjectionWriterClient) {
+    this.ready = writer?.ready ?? Promise.resolve();
+  }
 
   /** Readonly work runs in bounded child pages; only current, exact candidates reach the writer. */
   async prepareFeedback(runId: string, options: HistoryQueryOptions): Promise<void> {
@@ -60,7 +65,9 @@ export class ImprovementLearning {
         assertActive();
       }
       assertActive();
-      let checkpoint = this.store.beginHistoryProjection(runId, desiredThrough);
+      let checkpoint = this.writer
+        ? await this.writer.beginHistoryProjection(runId, desiredThrough, options)
+        : this.store.beginHistoryProjection(runId, desiredThrough);
       while (true) {
         assertActive();
         const response = await this.reader.query({
@@ -74,14 +81,17 @@ export class ImprovementLearning {
         if (!this.sameCheckpoint(batch.before, checkpoint) ||
           (batch.has_more && batch.after.revision <= checkpoint.revision))
           throw new RuntimeFault("history_protocol", "Invalid history projection checkpoint or progress");
-        // The writer validates scopes, limits, checkpoint CAS and exact current
-        // candidate sources in the same transaction as every derived patch.
+        // Candidate source acceptance and derived checkpoint publication retain
+        // their separate durable commits; no canonical lock spans the worker.
         assertActive();
-        this.store.commitHistoryProjectionBatch(runId, batch);
+        if (this.writer) await this.writer.commitHistoryProjectionBatch(runId, batch, options);
+        else this.store.commitHistoryProjectionBatch(runId, batch);
         checkpoint = batch.after;
         if (!batch.has_more) {
           if (checkpoint.source_through >= desiredThrough) return;
-          const next = this.store.beginHistoryProjection(runId, desiredThrough);
+          const next = this.writer
+            ? await this.writer.beginHistoryProjection(runId, desiredThrough, options)
+            : this.store.beginHistoryProjection(runId, desiredThrough);
           if (this.sameCheckpoint(next, checkpoint))
             throw new RuntimeFault("history_protocol", "History projection did not reach its fixed source frontier");
           checkpoint = next;
@@ -106,7 +116,7 @@ export class ImprovementLearning {
     for (const waiter of [...(this.preparing.get(runId) ?? [])]) waiter.cancel();
     const active = [...admission.active];
     const queryDrain = this.reader.cancelRun(runId);
-    return this.joinPreparations([queryDrain, ...active]);
+    return this.joinPreparations([queryDrain, this.writer?.cancelRun(runId) ?? Promise.resolve(), ...active]);
   }
 
   resumeRun(runId: string): void {
@@ -119,7 +129,7 @@ export class ImprovementLearning {
   close(): Promise<void> {
     this.closed = true;
     const drains = [...this.admissions.keys()].map(runId => this.suspendRun(runId));
-    return this.joinPreparations([this.reader.close(), ...drains]);
+    return this.joinPreparations([this.reader.close(), this.writer?.close() ?? Promise.resolve(), ...drains]);
   }
 
   private async joinPreparations(tasks: Promise<void>[]): Promise<void> {
@@ -220,7 +230,14 @@ export class ImprovementLearning {
       throw new RuntimeFault("history_deadline", "Improvement preparation deadline exceeded");
   }
 
-  resolve(runId: string, id: string, input: ImprovementResolution): ImprovementOpportunity {
+  async resolve(runId: string, id: string, input: ImprovementResolution,
+    options: HistoryQueryOptions = { deadlineHostMs: performance.now() + 10_000 }): Promise<ImprovementOpportunity> {
+    this.assertPreparationActive(options);
+    if (this.closed || this.admissions.get(runId)?.suspended)
+      throw new RuntimeFault("history_cancelled", "Improvement resolution admission is closed");
+    const persist = (resolution: NonNullable<ImprovementOpportunity["resolution"]>) => this.writer
+      ? this.writer.resolveOpportunity(runId, id, resolution, options)
+      : this.store.resolveOpportunity(runId, id, resolution);
     if (!["revise", "keep", "insufficient_evidence"].includes(input.decision) || !input.reason.trim() || input.reason.length > 4000 || input.event_seqs.length > 64) throw new Error("Invalid bounded improvement resolution");
     if (input.decision === "revise" && input.revision === null)
       throw new RuntimeFault("invalid_request", `Revise requires an exact revision reference. ${IMPROVEMENT_RESOLUTION_HELP}`);
@@ -237,7 +254,7 @@ export class ImprovementLearning {
         !sameRevision ||
         JSON.stringify(previous.event_seqs) !== JSON.stringify([...new Set(input.event_seqs)]))
         throw new RuntimeFault("conflict", "This improvement opportunity already has an immutable resolution; identical retries return that resolution.");
-      return this.store.resolveOpportunity(runId, id, previous);
+      return persist(previous);
     }
     exactVersion(this.store, opportunity.version);
     for (const seq of input.event_seqs) {
@@ -251,6 +268,6 @@ export class ImprovementLearning {
       if (!sourceRun || !revisionRun || sourceRun.model_id !== revisionRun.model_id || revision.skill_id !== parent.skill_id || revision.parent_version !== parent.version) throw new Error("Revision must name a same-model direct child version");
       measured = this.store.hasMeasuredSkillExecution(input.revision.run_id, revision);
     }
-    return this.store.resolveOpportunity(runId, id, { ...input, event_seqs: [...new Set(input.event_seqs)], measured, at: new Date().toISOString() });
+    return persist({ ...input, event_seqs: [...new Set(input.event_seqs)], measured, at: new Date().toISOString() });
   }
 }

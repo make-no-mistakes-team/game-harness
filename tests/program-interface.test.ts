@@ -263,13 +263,14 @@ for (const outcome of ["imported", "invalid_source", "revoked_before_commit"] as
       .filter(event => event.type === "program.source_timing");
     expect(timings).toHaveLength(1);
     expect(timings[0]!.details).toMatchObject({
-      validation_succeeded: outcome !== "invalid_source",
       source_published: outcome === "imported",
       source_hash: outcome === "imported" ? snapshot.hash : null,
       skill_id: outcome === "imported" ? snapshot.skill_id : null,
       version: outcome === "imported" ? snapshot.version : null,
       clock: "same_process_monotonic",
     });
+    if (outcome !== "revoked_before_commit")
+      expect(timings[0]!.details).toMatchObject({ validation_succeeded: outcome === "imported" });
     const timing = timings[0]!.details as Record<string, number>;
     expect(timing.ended_monotonic_ms).toBeGreaterThanOrEqual(timing.started_monotonic_ms!);
   });

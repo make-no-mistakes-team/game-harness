@@ -1086,9 +1086,9 @@ test("death episodes and improvement decisions deduplicate and preserve exact ca
   store.updateSkillExecution(undispatched, "skill.closed", "Cancelled before dispatch");
   const chosen = feedback.opportunities[0]!;
   const decision = { decision: "revise" as const, reason: "Model-authored candidate; not measured", revision: after, event_seqs: [event.event_seq] };
-  expect(learning.resolve(run.run_id, chosen.opportunity_id, decision).resolution?.measured).toBe(false);
-  expect(learning.resolve(run.run_id, chosen.opportunity_id, decision).resolution?.decision).toBe("revise");
-  expect(() => learning.resolve(run.run_id, chosen.opportunity_id, { decision: "keep", reason: "Conflict", revision: null, event_seqs: [] })).toThrow();
+  expect((await learning.resolve(run.run_id, chosen.opportunity_id, decision)).resolution?.measured).toBe(false);
+  expect((await learning.resolve(run.run_id, chosen.opportunity_id, decision)).resolution?.decision).toBe("revise");
+  await expect(learning.resolve(run.run_id, chosen.opportunity_id, { decision: "keep", reason: "Conflict", revision: null, event_seqs: [] })).rejects.toThrow();
   await learning.prepareFeedback(run.run_id, preparationOptions());
   const scope = { kind: "model" as const, run_id: run.run_id, model_id: run.model_id };
   const comparison = compareProgramVersions(store, before, after, scope);
@@ -1401,7 +1401,7 @@ test("invalid decision/revision pairs reject actionably without a record before 
   const beforeSeq = store.lastEventSeq();
   let rejection: unknown;
   try {
-    learning.resolve(run.run_id, opportunity.opportunity_id, { decision: "insufficient_evidence", reason, revision, event_seqs: [evidence.event_seq] });
+    await learning.resolve(run.run_id, opportunity.opportunity_id, { decision: "insufficient_evidence", reason, revision, event_seqs: [evidence.event_seq] });
   } catch (error) { rejection = error; }
   expect(rejection).toBeInstanceOf(RuntimeFault);
   if (!(rejection instanceof RuntimeFault)) throw new Error("Expected a typed semantic rejection");
@@ -1409,11 +1409,11 @@ test("invalid decision/revision pairs reject actionably without a record before 
   expect(store.lastEventSeq()).toBe(beforeSeq);
   expect(readImprovementFeedback(store, run.run_id).opportunities.find((value) => value.opportunity_id === opportunity.opportunity_id)?.resolution).toBeNull();
   const corrected = { decision: "revise" as const, reason, revision, event_seqs: [evidence.event_seq] };
-  const accepted = learning.resolve(run.run_id, opportunity.opportunity_id, corrected);
+  const accepted = await learning.resolve(run.run_id, opportunity.opportunity_id, corrected);
   expect(accepted.resolution?.decision).toBe("revise");
   expect(accepted.resolution?.revision).toEqual(revision);
   expect(accepted.resolution?.measured).toBe(true);
-  expect(learning.resolve(run.run_id, opportunity.opportunity_id, corrected)).toEqual(accepted);
+  expect(await learning.resolve(run.run_id, opportunity.opportunity_id, corrected)).toEqual(accepted);
   const resolutions = store.eventsAfter(run.run_id, 0, 500).filter((event) => event.type === "learning.resolved");
   expect(resolutions).toHaveLength(1);
   expect(resolutions[0]?.details).toMatchObject({ qualification: "measured_not_causally_proven" });

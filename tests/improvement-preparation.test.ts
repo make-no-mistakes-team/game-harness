@@ -1,10 +1,13 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { rmSync } from "node:fs";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import { HistoryReader } from "../src/server/history-reader.ts";
 import type { HistoryQuery, HistoryQueryClient, HistoryQueryOptions, HistoryResult } from "../src/server/history-protocol.ts";
 import type { HistoryProjectionBatch } from "../src/server/history-projection.ts";
+import { HISTORY_PROJECTION_SCHEMA_SQL } from "../src/server/history-projection.ts";
 import { Store } from "../src/server/store.ts";
+import { STORE_OPPORTUNITY_INDEXES } from "../src/server/store-database.ts";
 import { readImprovementFeedback } from "../src/server/program-feedback.ts";
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import { executionScopeFixture } from "./helpers/adapter-contract.ts";
@@ -83,9 +86,9 @@ test("preparation persists exact opportunities beyond 256, fixes one through bou
     expect(beyond).toBeDefined();
     expect(rows.some((row) => row.value.execution_id === lateId)).toBe(false);
     const decision = { decision: "keep" as const, reason: "Retain the exact descriptive outcome", revision: null, event_seqs: [] };
-    const resolved = learning.resolve(run.run_id, beyond.value.opportunity_id, decision);
-    expect(learning.resolve(run.run_id, beyond.value.opportunity_id, decision)).toEqual(resolved);
-    expect(() => learning.resolve(run.run_id, beyond.value.opportunity_id, { ...decision, reason: "Changed retry" })).toThrow();
+    const resolved = await learning.resolve(run.run_id, beyond.value.opportunity_id, decision);
+    expect(await learning.resolve(run.run_id, beyond.value.opportunity_id, decision)).toEqual(resolved);
+    await expect(learning.resolve(run.run_id, beyond.value.opportunity_id, { ...decision, reason: "Changed retry" })).rejects.toThrow();
     await new ImprovementLearning(store, reader).prepareFeedback(run.run_id, options());
     expect(store.opportunityCount(run.run_id)).toBe(274);
     expect(store.opportunity(run.run_id, beyond.value.opportunity_id)).toEqual(resolved);
@@ -208,7 +211,7 @@ test(`a failed checkpoint commit after ${fault} writes rolls back atomically and
       finishHistoryExecution(store, historyExecution(store, run, skill));
     let before: HistoryProjectionBatch["before"] | undefined;
     let rowsBefore = 0, updatesBefore = 0, opportunitiesBefore = 0;
-    const database = new Database(store.readLocation().database);
+    const database = new Database(store.readLocation().projection!);
     try {
       database.exec(`CREATE TRIGGER reject_history_batch AFTER INSERT ON ${fault === "derived" ? "history_projection_rows" : "evidence_objects"}
         ${fault === "opportunity" ? "WHEN NEW.kind='opportunity'" : ""}
@@ -217,7 +220,7 @@ test(`a failed checkpoint commit after ${fault} writes rolls back atomically and
     reader = new HistoryReader(store.readLocation());
     const client = interceptReader(reader, (_query, batch) => {
       before = batch.before;
-      const db = new Database(store.readLocation().database);
+      const db = new Database(store.readLocation().projection!, { readonly: true });
       try {
         rowsBefore = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM history_projection_rows").get()!.count;
         updatesBefore = db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM history_opportunity_updates").get()!.count;
@@ -228,7 +231,7 @@ test(`a failed checkpoint commit after ${fault} writes rolls back atomically and
     expect(before).toBeDefined();
     expect(store.opportunityCount(run.run_id)).toBe(opportunitiesBefore);
     expect(store.historyProjectionCheckpoint(run.run_id)).toEqual(before!);
-    const repair = new Database(store.readLocation().database);
+    const repair = new Database(store.readLocation().projection!);
     try {
       expect(repair.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM history_projection_rows").get()!.count).toBe(rowsBefore);
       expect(repair.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM history_opportunity_updates").get()!.count).toBe(updatesBefore);
@@ -264,7 +267,7 @@ test("an execution change reconsiders already consumed outcome events without ch
     await learning.prepareFeedback(run.run_id, options());
     const first = store.evidenceObjectRows<{ opportunity_id: string; kind: string }>(run.run_id, "opportunity", 0, 10);
     expect(first.map(row => row.value.kind)).toEqual(["failure"]);
-    const resolved = learning.resolve(run.run_id, first[0]!.value.opportunity_id,
+    const resolved = await learning.resolve(run.run_id, first[0]!.value.opportunity_id,
       { decision: "keep", reason: "Retain the earlier observation", revision: null, event_seqs: [historical.event_seq] });
     finishHistoryExecution(store, execution);
     await learning.prepareFeedback(run.run_id, options());
@@ -294,7 +297,7 @@ test("two readers cannot publish the same checkpoint twice or overwrite the winn
     await new ImprovementLearning(store, readers[0]!).prepareFeedback(run.run_id, options());
     const opportunity = store.evidenceObjectRows<{ opportunity_id: string }>(run.run_id, "opportunity", 0, 10)[0]!.value;
     const learning = new ImprovementLearning(store, readers[0]!);
-    const resolved = learning.resolve(run.run_id, opportunity.opportunity_id,
+    const resolved = await learning.resolve(run.run_id, opportunity.opportunity_id,
       { decision: "keep", reason: "Winner's immutable decision", revision: null, event_seqs: [] });
     expect(() => store.commitHistoryProjectionBatch(run.run_id, second!)).toThrow();
     expect(store.opportunityCount(run.run_id)).toBe(1);
@@ -316,12 +319,33 @@ test("schema4 history bootstraps once from the full ledger and retains resolved 
     const learning = new ImprovementLearning(store, reader);
     await learning.prepareFeedback(run.run_id, options());
     const opportunity = store.latestOpportunityForVersion({ run_id: run.run_id, skill_id: skill.skill_id, version: skill.version, hash: skill.hash })!;
-    const resolved = learning.resolve(run.run_id, opportunity.opportunity_id,
+    const resolved = await learning.resolve(run.run_id, opportunity.opportunity_id,
       { decision: "keep", reason: "Keep the migrated immutable decision", revision: null, event_seqs: [] });
     await reader.close();
+    const location = store.readLocation();
     store.close();
-    const database = new Database(store.readLocation().database);
+    const database = new Database(location.database);
     try {
+      // Schema4 predates the separate derived ledger. Reconstruct the combined
+      // storage, including the real resolved opportunity, before removing the
+      // later source/projection schema.
+      database.query("ATTACH DATABASE ? AS derived").run(location.projection!);
+      database.transaction(() => {
+        database.exec(HISTORY_PROJECTION_SCHEMA_SQL.replace(/CREATE TRIGGER[\s\S]*$/, ""));
+        database.exec("INSERT INTO evidence_objects(rowid,run_id,kind,object_key,payload) SELECT rowid,run_id,kind,object_key,payload FROM derived.evidence_objects");
+        for (const table of [
+          "history_projection_rows",
+          "history_projection_checkpoints",
+          "history_projection_generations",
+          "history_opportunity_visibility",
+          "history_opportunity_updates",
+        ])
+          database.exec(`INSERT INTO ${table} SELECT * FROM derived.${table}`);
+        database.exec(HISTORY_PROJECTION_SCHEMA_SQL);
+        for (const index of STORE_OPPORTUNITY_INDEXES) database.exec(index.sql);
+        database.exec("DROP TABLE projection_storage_binding; DROP TABLE projection_publications; DROP TABLE projection_audit_receipts");
+      })();
+      database.exec("DETACH DATABASE derived");
       const objects = database.query<{ type: string; name: string }, []>(
         `SELECT type,name FROM sqlite_schema
           WHERE type IN ('trigger','table') AND
@@ -334,6 +358,9 @@ test("schema4 history bootstraps once from the full ledger and retains resolved 
         database.exec(`DROP ${object.type.toUpperCase()} "${object.name.replaceAll('"', '""')}"`);
       database.exec("PRAGMA user_version=4");
     } finally { database.close(true); }
+    rmSync(location.projection!);
+    for (const suffix of ["-wal", "-shm"])
+      rmSync(location.projection! + suffix, { force: true });
     store = new Store(directory);
     expect(store.skillExecution(run.run_id, { execution_id: execution.execution_id })).toEqual(execution);
     expect(store.eventsAfter(run.run_id, 0, 500).some(event => event.type === "skill.closed")).toBe(true);

@@ -311,6 +311,15 @@ scheduler. Timing and import events finish persistence before authoring returns.
 `SkillManager` owns execution admission, workers and retirement; source-only
 authoring cannot acquire a producer or replace live work.
 
+Ordinary source/static/graph validation runs in a credential-free child process.
+At most four jobs may run; there is no waiting queue or local fallback. Startup
+and validation share a five-second ceiling, shortened by the original caller
+deadline. Cancellation joins process exit and all pipes before returning.
+Only bounded exact dependency artifacts cross its source-read protocol. After
+closure, publication rechecks the profile, scope and dependency metadata/bytes,
+including inside Store's commit callback. A worker crash creates no source
+version and cannot terminate the coordinator.
+
 For an intentional continuation or replacement, `program_submit` and `program_run`
 start accept optional `handoff:{name,version,execution_ordinal}` for the exact
 latest predecessor. Source authoring and validation leave live work running.
@@ -730,8 +739,22 @@ provider authority.
 improvement opportunities. `Store.readLocation()` supplies both paths and the
 immutable artifact directory; current readers refuse a missing or foreign
 projection identity. A derived write transaction does not hold the canonical
-ledger's SQLite writer lock. Both writers still run on the coordinator event
-loop; database separation alone does not isolate physical execution.
+ledger's SQLite writer lock. Default `Runtime` hands the derived writer to one
+owned child process; canonical source writes remain with the coordinator.
+Standalone Store callers retain the same derived implementation locally.
+
+The child performs source interpretation, checkpoint CAS and derived SQLite
+commits. Its bounded sequential metadata exchanges permit only canonical frontier acceptance
+and idempotent audit receipts, never arbitrary SQL or physical commands. Eight
+queued requests retain their original deadlines, translated conservatively to
+Linux `CLOCK_MONOTONIC`. Cancellation joins process exit and every owned pipe;
+an interrupted mutation reports unknown persistence. A fresh owner inspects
+retained checkpoints and drains immutable outbox receipts without replaying the
+interrupted mutation. Run admission waits for startup audit recovery.
+
+Native control, strategic scheduling, SDK/provider callbacks and UI publication
+still share the coordinator. Independent derived persistence alone does not
+isolate the complete physical execution host.
 
 Source changes to runs, actions, executions, events, traces, trace budgets and
 immutable program metadata receive durable change sequences. The writer seals
@@ -846,6 +869,15 @@ Source-only disconnected preparation separately defaults its write entry to
 unchanged.
 
 The strategist keeps a run-owned reference context outside its disposable Agent. Each actual SDK stream invocation, including tool-loop continuations, receives a supplement capped at 32 KiB serialized UTF-8: compact contracts, objective, model-authored recovery state, latest consequential obstruction, unresolved-operation references, relevant compatible immutable source and useful requested help. This is included in the actual request, not merely cached on the host. Source and its reuse metadata share an 18 KiB allowance; retained help has a 24 KiB ceiling. Both share the same 32 KiB request cap rather than additive reservations. Requested executable-format, temporal-view, resident and native-invocation mechanics take precedence, followed by complete native action alternatives, other reference prose, game-adapter metadata and observation/read/result schemas. Native method references keep their invocation fields separate from embedded result schemas. This ordering also applies when source and unresolved-effect history compete for the final request budget, independently of help-topic request order. Top-level action `anyOf`/`oneOf` alternatives stay whole: an alternative over the 6 KiB section bound is omitted, not split into detached properties. Other oversized documentation is split at schema/property boundaries. Retained help remains partial; omission references distinguish section, retained-help and final-request byte limits, while `omitted_records` counts details/notices that no longer fit. The supplement directs the model to re-request the corresponding `help` topic for the full current contract. Whole sources are either included or explicitly omitted, never truncated into executable fragments. This supplements, rather than replaces, bounded current observations, tool pairs and turn feedback.
+
+Default planning reconstructs this supplement in a readonly child process using
+the bound source and projection locations. Each job uses a pinned snapshot,
+an original monotonic deadline and a five-second ceiling. Ordered help/source
+selections and bounded passive reducer checkpoints preserve knowledge across
+joined worker replacement. They restore no playing authority. Cancellation
+joins the process and pipes; there is no local reconstruction fallback.
+Before using a returned supplement, the planner rechecks the exact request,
+run/generation, role, phase, profile, scope and original deadline.
 
 Programs can report `current_subgoal`, `worksite`, `resource_requirements` and `recovery_reason` through existing `game.progress` details or their returned result. Selected bounded notes and up to four explicitly returned positions survive ordinary turns and safe Agent recreation; an unspecified program card is not a current subgoal. These are labelled model-authored notes, not current inventory, target authority or success proof. Current observations must supply resources and freshly reacquired handles. Session/life/native-boot/space changes clear current dynamic notes. Explicit subgoal/worksite notes can remain separately labelled historical references with their original scope; a task/world/fresh-run change clears that retained experience. A generic execution closure does not hide its actual action obstruction; selected mechanical receipt fields remain available without restoring old target handles or full observations.
 

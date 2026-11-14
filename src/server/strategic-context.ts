@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import type { Context, Model } from "@oh-my-pi/pi-ai";
+import type { Context } from "@oh-my-pi/pi-ai";
 import type { ActivityEvent, Json, ObservationV3, RuntimeAdapter } from "../shared/contracts.ts";
 import type { SkillExecutionView, SkillView } from "../shared/programs.ts";
 import { SKILL_API_VERSION } from "../shared/programs.ts";
-import { executionNativeLifeRelation, ProgramWorkspace, type NamedExecutionReference, type ProgramSelector } from "./program-workspace.ts";
-import type { Store, StoredRun } from "./store.ts";
+import { executionNativeLifeRelation, ProgramWorkspace, type NamedExecutionReference, type ProgramSelector, type ProgramWorkspaceReadStore } from "./program-workspace.ts";
+import type { StoredRun } from "./store.ts";
+import type { StoreReadQueries } from "./store-read.ts";
 import { z } from "zod";
 import { effectInvocationSchema, effectScopeSchema, identitySchema, safeCounterSchema, sameEffectScope, type EffectScope } from "../shared/control.ts";
 import { revocationAckSchema } from "../shared/controller.ts";
@@ -68,6 +69,22 @@ interface AuthoredState {
   latest_root_result?: { event_seq: number; status: string; summary: string; result: Json };
 }
 type ObservationIdentity = Pick<ObservationV3, "profile_id" | "profile_configuration_hash">;
+export type StrategicContextAdapter = Pick<RuntimeAdapter, "descriptor" | "action_capability" | "supports_respawn" | "bindings">;
+export type StrategicContextReadStore = ProgramWorkspaceReadStore & Pick<StoreReadQueries,
+  "lastEventSeq" | "eventsAfter" | "getAction" | "skillExecution" | "historySourceChanges" |
+  "historySourceRecord" | "selectedAction" | "latestRootExecution" | "skillExecutions">;
+export interface ContextCheckpoint {
+  runId: string | null; knowledgeScope: string; dynamicScope: string; compatibility: string; sourceCompatibility: string;
+  cursor: number; sourceFloor: number; experienceFloor: number; noteScope: string; noteFloor: number;
+  authoredState: AuthoredState; noteOmissions: string[]; historicalNotes: [HistoricalNote["field"], HistoricalNote][];
+  lastExecutions: [string, string][];
+  adoptedScopes: [string, { event_seq: number; life_id: number; native_boot_id: string; space_epoch: number }][];
+  authored: string[]; selected: ProgramSelector[]; failure: number | null; unresolved: [string, UnknownReference][];
+  controllerAdmissions: [string, z.infer<typeof controllerAdmissionSchema>][];
+  omittedUnknown: number; help: HelpSection[]; helpSchemas: number[]; actionHelpSection: string | null;
+  helpOmissions: Omission[]; authoredControllerEvents: AuthoredControllerEvent[]; omittedControllerEvents: number;
+  controllerBoundaryCursor: number; controllerBoundaryEvent: number; controllerKnowledgeScope: string; controllerEventFloor: number;
+}
 
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -183,7 +200,44 @@ export class StrategicContext {
   private controllerKnowledgeScope = "";
   private controllerEventFloor = 0;
 
-  constructor(private readonly store: Store) {}
+  constructor(private readonly store: StrategicContextReadStore) {}
+
+  /** Passive reducer custody only: never executable state, an observation or effect authority. */
+  checkpoint(): ContextCheckpoint {
+    return {
+      runId: this.runId, knowledgeScope: this.knowledgeScope, dynamicScope: this.dynamicScope,
+      compatibility: this.compatibility, sourceCompatibility: this.sourceCompatibility,
+      cursor: this.cursor, sourceFloor: this.sourceFloor, experienceFloor: this.experienceFloor,
+      noteScope: this.noteScope, noteFloor: this.noteFloor, authoredState: this.authoredState,
+      noteOmissions: [...this.noteOmissions], historicalNotes: [...this.historicalNotes],
+      lastExecutions: [...this.lastExecutions], adoptedScopes: [...this.adoptedScopes],
+      authored: [...this.authored], selected: this.selected, failure: this.failure,
+      unresolved: [...this.unresolved], controllerAdmissions: [...this.controllerAdmissions],
+      omittedUnknown: this.omittedUnknown, help: this.help,
+      helpSchemas: this.help.flatMap((entry, index) => this.helpSchemas.has(entry) ? [index] : []),
+      actionHelpSection: this.actionHelpSection, helpOmissions: this.helpOmissions,
+      authoredControllerEvents: this.authoredControllerEvents, omittedControllerEvents: this.omittedControllerEvents,
+      controllerBoundaryCursor: this.controllerBoundaryCursor, controllerBoundaryEvent: this.controllerBoundaryEvent,
+      controllerKnowledgeScope: this.controllerKnowledgeScope, controllerEventFloor: this.controllerEventFloor,
+    };
+  }
+
+  restore(value: ContextCheckpoint): void {
+    this.runId = value.runId; this.knowledgeScope = value.knowledgeScope; this.dynamicScope = value.dynamicScope;
+    this.compatibility = value.compatibility; this.sourceCompatibility = value.sourceCompatibility;
+    this.cursor = value.cursor; this.sourceFloor = value.sourceFloor; this.experienceFloor = value.experienceFloor;
+    this.noteScope = value.noteScope; this.noteFloor = value.noteFloor; this.authoredState = value.authoredState;
+    this.noteOmissions = new Set(value.noteOmissions); this.historicalNotes = new Map(value.historicalNotes);
+    this.lastExecutions = new Map(value.lastExecutions); this.adoptedScopes = new Map(value.adoptedScopes);
+    this.authored = new Set(value.authored); this.selected = value.selected; this.failure = value.failure;
+    this.unresolved = new Map(value.unresolved); this.controllerAdmissions = new Map(value.controllerAdmissions);
+    this.omittedUnknown = value.omittedUnknown; this.help = value.help;
+    for (const index of value.helpSchemas) this.helpSchemas.add(this.help[index]!);
+    this.actionHelpSection = value.actionHelpSection; this.helpOmissions = value.helpOmissions;
+    this.authoredControllerEvents = value.authoredControllerEvents; this.omittedControllerEvents = value.omittedControllerEvents;
+    this.controllerBoundaryCursor = value.controllerBoundaryCursor; this.controllerBoundaryEvent = value.controllerBoundaryEvent;
+    this.controllerKnowledgeScope = value.controllerKnowledgeScope; this.controllerEventFloor = value.controllerEventFloor;
+  }
 
   reset(): void {
     this.runId = null; this.knowledgeScope = ""; this.dynamicScope = ""; this.compatibility = ""; this.sourceCompatibility = "";
@@ -220,8 +274,8 @@ export class StrategicContext {
     }
   }
 
-  synchronize(run: StoredRun, model: Pick<Model, "api" | "provider">, _context: Context,
-    observation: ObservationIdentity | null, adapter?: RuntimeAdapter): void {
+  synchronize(run: StoredRun, model: { api: string; provider: string }, _context: Context,
+    observation: ObservationIdentity | null, adapter?: StrategicContextAdapter): void {
     this.scope(run);
     // Provider transport, root prose and tool-role changes do not change the
     // validated JavaScript executable contract. Keep useful source under those
@@ -722,7 +776,7 @@ export class StrategicContext {
       ...(execution.error ? { error: execution.error.slice(0, 300) } : {}) };
   }
 
-  assemble(run: StoredRun, adapter?: RuntimeAdapter, pendingAuthoring?: Json): string {
+  assemble(run: StoredRun, adapter?: StrategicContextAdapter, pendingAuthoring?: Json): string {
     this.scope(run); this.refresh(run);
     const workspace = new ProgramWorkspace(this.store, run.run_id);
     const omissions: Omission[] = [...this.helpOmissions];

@@ -25,7 +25,9 @@ import { compileToolArgumentBudget, type ToolArgumentOverrun } from "./tool-argu
 import { createToolArgumentKeyBudget } from "./tool-argument-key-budget.ts";
 import type { HistoryQueryOptions } from "./history-protocol.ts";
 import type { ModelObservation } from "./actor-frames.ts";
-import { StrategicContext } from "./strategic-context.ts";
+import { StrategicContextClient } from "./strategic-context-client.ts";
+import { strategicContextAdapter, strategicContextScope } from "./strategic-context-protocol.ts";
+import { osMonotonicNs } from "./os-monotonic.ts";
 import { jsonSchema } from "../shared/validation.ts";
 import { preserveRuntimeToolArguments } from "./runtime-tools.ts";
 import { HOST_MONOTONIC_CLOCK_ID } from "./performance.ts";
@@ -126,6 +128,7 @@ export interface StrategicHost {
 interface RequestAttempt {
   id: string;
   startedMono: number;
+  deadlineOsNs: bigint;
   usage: ProviderUsageCollector;
   purpose: UsagePurpose;
   index: number;
@@ -276,6 +279,7 @@ export class StrategicPlanner {
   private turnDelivered = 0;
   private turnToolCalls = 0;
   private turnDeadline = 0;
+  private turnDeadlineOsNs = 0n;
   private historyController: AbortController | null = null;
   private providerFailed = false;
   private providerAborted = false;
@@ -311,7 +315,7 @@ export class StrategicPlanner {
   private attentionTimer: NodeJS.Timeout | undefined;
   private attentionReason: string | null = null;
   private speculativeTurn = false;
-  private readonly retainedContext: StrategicContext;
+  private readonly retainedContext: StrategicContextClient;
   private contextObservation: Pick<ObservationV3, "profile_id" | "profile_configuration_hash"> | null = null;
   private readonly eligibleTools = new Map<string, { name: string; arguments: unknown; authority?: () => void }>();
 
@@ -320,7 +324,7 @@ export class StrategicPlanner {
     private readonly auth: AuthManager,
     private readonly host: StrategicHost,
   ) {
-    this.retainedContext = new StrategicContext(store);
+    this.retainedContext = new StrategicContextClient(store.readLocation());
   }
 
   reset(): void {
@@ -334,6 +338,7 @@ export class StrategicPlanner {
     this.turnDelivered = 0;
     this.turnToolCalls = 0;
     this.turnDeadline = 0;
+    this.turnDeadlineOsNs = 0n;
     this.providerFailed = false;
     this.providerAborted = false;
     this.gateReason = null;
@@ -376,6 +381,7 @@ export class StrategicPlanner {
         "Strategic startup was superseded",
       );
     const run = this.host.assertCurrent(generation);
+    this.retainedContext.open();
     this.fenced = false;
     const opening = (async () => {
       const agent = await this.auth.createAgent({
@@ -402,12 +408,35 @@ export class StrategicPlanner {
         const argumentSchemas = new Map(context.tools?.map(tool => [tool.name, tool.parameters]));
         const argumentKeyBudgets = new Map<number, ReturnType<typeof createToolArgumentKeyBudget>>();
         if (request.authoring) this.assertAuthoring(request.authoring);
-        const adapter = this.host.adapter?.();
-        this.retainedContext.synchronize(run, model, context, this.contextObservation, adapter);
+        const adapter = strategicContextAdapter(this.host.adapter?.());
+        const scope = strategicContextScope(run);
+        const phase = run.status, revision = this.fenceRevision, toolRole = this.toolRole();
+        const observation = this.contextObservation;
         // This is the final supported SDK stream boundary, including tool-loop
         // continuations. Supplement the actual request, not the disposable
         // Agent's history or a host-only reference cache.
         const pendingAuthoring = this.authoringProjection();
+        const retained = await this.retainedContext.assemble({
+          scope, model: { api: model.api, provider: model.provider }, observation, adapter, pendingAuthoring,
+        }, { deadlineOsNs: request.deadlineOsNs, signal: options?.signal });
+        // This await is a new authority seam, not an admission extension. The
+        // exact request, role, run incarnation and original deadline still own
+        // publication to the provider; a late reducer response grants nothing.
+        this.reconcileDecision();
+        selectPhase();
+        if (request.authoring) this.assertAuthoring(request.authoring);
+        if (this.request !== request || this.agent !== agent || !this.current(run, generation) ||
+            this.fenceRevision !== revision || run.status !== phase || this.toolRole() !== toolRole ||
+            request.role !== (request.authoring ? "authoring" : this.role) ||
+            request.pendingDecision !== this.pendingDecision || request.hostCancellation || this.turnAbortRequested ||
+            options?.signal?.aborted || osMonotonicNs() >= request.deadlineOsNs ||
+            JSON.stringify(strategicContextScope(run)) !== JSON.stringify(scope) ||
+            JSON.stringify(this.contextObservation) !== JSON.stringify(observation) ||
+            JSON.stringify(strategicContextAdapter(this.host.adapter?.())) !== JSON.stringify(adapter) ||
+            request.planId && (this.host.speculation?.().projection()?.plan_id !== request.planId ||
+              this.host.speculation?.().projection()?.planning_active !== true))
+          throw new RuntimeFault("stale_context", "Strategic retained context authority was revoked");
+        this.host.assertCurrent(generation);
         const requestContext = {
           ...context,
           // The SDK keeps the original user message through its tool loop.
@@ -424,7 +453,7 @@ export class StrategicPlanner {
             return { ...message, content: typeof message.content === "string" ? refresh(message.content) :
               message.content.map(part => part.type === "text" ? { ...part, text: refresh(part.text) } : part) };
           }),
-          systemPrompt: [...(context.systemPrompt ?? []), this.retainedContext.assemble(run, adapter, pendingAuthoring)],
+          systemPrompt: [...(context.systemPrompt ?? []), retained],
         };
         let firstResponse = false;
         const events = await stream(model, requestContext, { ...options,
@@ -636,9 +665,13 @@ export class StrategicPlanner {
         // SDK boundary, without renewing the root's inactive authoring budget.
         this.turnCalls++;
         run.turns++;
+        const authoringDeadlineOsNs = authoring
+          ? osMonotonicNs() + BigInt(Math.max(0, Math.floor(authoring.deadline - Date.now()))) * 1_000_000n
+          : this.turnDeadlineOsNs;
         this.request = {
           id: requestId,
           startedMono: performance.now(),
+          deadlineOsNs: this.turnDeadlineOsNs < authoringDeadlineOsNs ? this.turnDeadlineOsNs : authoringDeadlineOsNs,
           usage: new ProviderUsageCollector(requestId, this.responseOwners),
           purpose: authoring ? "authoring" : this.purpose,
           index: this.turnCalls,
@@ -1060,6 +1093,7 @@ export class StrategicPlanner {
     this.pendingDecision = false;
     this.decisionBasis = null;
     this.historyController?.abort();
+    void this.retainedContext.close().catch(() => {});
     clearTimeout(this.wakeTimer);
     clearTimeout(this.idleTimer);
     clearTimeout(this.attentionTimer);
@@ -1080,6 +1114,7 @@ export class StrategicPlanner {
     this.fence();
     if (this.closing) return this.closing;
     const opening = this.opening;
+    const contextClosure = this.retainedContext.close();
     const closure = (async () => {
       // A cancelled createAgent may still return an allocated auth scope. It
       // publishes that scope before rejecting, so drain creation before release.
@@ -1088,6 +1123,7 @@ export class StrategicPlanner {
       const settlements = await Promise.allSettled([
         agent?.waitForIdle(),
         this.turn,
+        contextClosure,
       ]);
       let released = !agent;
       if (agent) {
@@ -1254,6 +1290,7 @@ export class StrategicPlanner {
     this.turnDeadline = speculative
         ? Date.now() + (this.host.speculation?.().remainingMs() ?? 0)
         : Date.now() + (review ? 30_000 : TURN_MS);
+    this.turnDeadlineOsNs = osMonotonicNs() + BigInt(Math.max(0, Math.floor(this.turnDeadline - Date.now()))) * 1_000_000n;
     const historyController = new AbortController();
     this.historyController = historyController;
     const historyOptions: HistoryQueryOptions = {

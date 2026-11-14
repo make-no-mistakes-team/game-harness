@@ -17,7 +17,7 @@ const limit = z.int().min(1).max(100);
 const selector = z.object({ name: z.string().min(1).max(80), version: z.int().positive().optional() }).strict();
 const version = z.object({ run_id: run, skill_id: run, version: z.int().positive(), hash: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 const json: z.ZodType<Json> = z.lazy(() => z.union([z.null(), z.boolean(), z.number(), z.string(), z.array(json), z.record(z.string(), json)]));
-const projectionCheckpointSchema: z.ZodType<ProjectionCheckpoint> = z.object({
+export const projectionCheckpointSchema: z.ZodType<ProjectionCheckpoint> = z.object({
   schema_version: z.literal(1), revision: sequence, generation: sequence, published_revision: sequence,
   source_through: sequence, target_through: sequence,
   phase: z.enum(["bootstrap", "index", "expand", "detect", "objective", "evidence", "publish", "idle"]),
@@ -25,7 +25,7 @@ const projectionCheckpointSchema: z.ZodType<ProjectionCheckpoint> = z.object({
   metric_change_seq: sequence, published_metric_change_seq: sequence,
 }).strict();
 const collection = z.enum(PROJECTION_COLLECTIONS);
-const opportunity = z.object({
+export const improvementOpportunitySchema = z.object({
   opportunity_id: z.string().min(1), run_id: run, kind: z.enum(["death", "failure", "outcome"]), version,
   execution_id: z.string().min(1), event_seqs: z.array(z.int().positive()), created_at: z.string().min(1),
   resolution: z.object({ decision: z.enum(["revise", "keep", "insufficient_evidence"]), reason: z.string(), revision: version.nullable(),
@@ -38,8 +38,8 @@ export const projectionBatchSchema: z.ZodType<HistoryProjectionBatch> = z.object
       order_seq: sequence, tag: z.string().nullable(), value: json }).strict() }).strict(),
     z.object({ type: z.literal("delete"), collection, key: z.string().min(1) }).strict(),
   ])).max(64),
-  candidates: z.array(opportunity.extend({ resolution: z.null(), event_seqs: z.array(z.int().positive()).length(1) })).max(16),
-  opportunity_bootstrap: z.array(z.object({ seq: sequence, value: opportunity }).strict()).max(128),
+  candidates: z.array(improvementOpportunitySchema.extend({ resolution: z.null(), event_seqs: z.array(z.int().positive()).length(1) })).max(16),
+  opportunity_bootstrap: z.array(z.object({ seq: sequence, value: improvementOpportunitySchema }).strict()).max(128),
   has_more: z.boolean(),
 }).strict();
 const cursor = improvementFeedbackCursorSchema;

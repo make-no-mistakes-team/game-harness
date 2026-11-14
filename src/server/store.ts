@@ -1,7 +1,10 @@
 import { Database } from "bun:sqlite";
+import { z } from "zod";
 import { StoreDatabase, STORE_OPPORTUNITY_INDEXES, STORE_SCHEMA_VERSION } from "./store-database.ts";
 import { ReadonlyStore, StoreReadQueries, type StoreReadLocation, type PolicyRow, type SkillRow } from "./store-read.ts";
 import { ProjectionStorage } from "./projection-storage.ts";
+import { ProjectionLedger, type ProjectionControl, type ProjectionIdentity } from "./projection-ledger.ts";
+import { canonical } from "./store-json.ts";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -35,8 +38,7 @@ import { buildExecutableModuleBundle } from "./program-modules.ts";
 import type { EffectInvocation, EffectScope } from "../shared/control.ts";
 import { effectInvocationSchema, effectScopeSchema } from "../shared/control.ts";
 import { skillStartRequestSchema } from "../shared/validation.ts";
-import { assertProjectionCheckpoint, assertProjectionRow, projectionRequestFits, HISTORY_PROJECTION_SCHEMA_SQL, PROJECTION_COLLECTIONS, type HistoryProjectionBatch, type ProjectionCheckpoint } from "./history-projection.ts";
-import { improvementOpportunityCandidate } from "./program-feedback.ts";
+import { HISTORY_PROJECTION_SCHEMA_SQL, type HistoryProjectionBatch, type ProjectionCheckpoint } from "./history-projection.ts";
 import { HISTORY_SOURCE_KINDS, HISTORY_SOURCE_REGISTRY, HISTORY_SOURCE_SCHEMA_SQL, HISTORY_SOURCE_SCHEMA_VERSION, type HistorySourceKind } from "./history-source.ts";
 
 export type StoredRun = Omit<
@@ -52,22 +54,6 @@ export interface StoredAction {
   view: ActionView;
 }
 
-function canonical(value: unknown): string {
-  const text = JSON.stringify(value, (_key, item: unknown) => {
-    if (typeof item === "number" && !Number.isFinite(item))
-      throw new Error("Non-finite request value");
-    if (item && typeof item === "object" && !Array.isArray(item))
-      return Object.fromEntries(
-        Object.entries(item).sort(([left], [right]) =>
-          left < right ? -1 : left > right ? 1 : 0,
-        ),
-      );
-    return item;
-  });
-  if (text === undefined) throw new Error("Request must be JSON");
-  return text;
-}
-
 const terminalExecutions = new Set<SkillExecutionView["status"]>([
   "succeeded",
   "blocked",
@@ -76,12 +62,19 @@ const terminalExecutions = new Set<SkillExecutionView["status"]>([
   "unknown",
 ]);
 
+const projectionAuditPayloadSchema = z.object({
+  run_id: z.string().min(1).max(200),
+  type: z.literal("learning.resolved"),
+  summary: z.literal("Recorded model-selected improvement decision"),
+  details: z.json(),
+}).strict();
+
 export class Store extends StoreReadQueries {
   private readonly db: StoreDatabase;
   private readonly artifactDir: string;
   private readonly projections: ProjectionStorage;
-  private readonly projectionDb: StoreDatabase;
-  private readonly projectionSource: ReadonlyStore;
+  private projectionDb: StoreDatabase;
+  private projectionLedger: ProjectionLedger | null = null;
   private readonly listeners = new Set<(event: ActivityEvent) => void>();
   private readonly traceObservers = new Set<(input: TraceInput) => void>();
   private readonly historyListeners = new Set<(runId: string) => void>();
@@ -261,7 +254,7 @@ export class Store extends StoreReadQueries {
       if (version < 8) this.db.exec("PRAGMA user_version=7");
     })();
     let projectionDb: StoreDatabase | undefined;
-    let projectionSource: ReadonlyStore | undefined;
+    let projectionLedger: ProjectionLedger | undefined;
     try {
       if (version < 8) {
         const legacy = new ReadonlyStore({ database: filename, artifacts: artifactDir });
@@ -270,10 +263,12 @@ export class Store extends StoreReadQueries {
       this.projections = new ProjectionStorage(this.db, filename, path.resolve(dataDir, "history.sqlite"));
       this.projectionDb = projectionDb = this.projections.database;
       this.useProjectionDatabase(this.projectionDb);
-      this.projectionSource = projectionSource = new ReadonlyStore(this.readLocation());
-      this.drainProjectionAudit();
+      this.projectionLedger = projectionLedger = new ProjectionLedger(this.readLocation(),
+        { source_id: this.projections.sourceId, projection_id: this.projections.projectionId },
+        this.projectionControl(), this.projectionDb);
+      this.projectionLedger.drainAudit();
     } catch (error) {
-      projectionSource?.close();
+      projectionLedger?.close();
       projectionDb?.close();
       this.db.close();
       throw error;
@@ -1350,197 +1345,85 @@ export class Store extends StoreReadQueries {
     if (event) this.notify(event);
   }
 
-  saveOpportunity(value: ImprovementOpportunity): ImprovementOpportunity {
+  private localProjection(): ProjectionLedger {
     this.assertProjectionWriteIndependent();
-    if (!this.projectionSource.getRun(value.run_id)) throw new Error("Run not found");
-    this.insertOpportunity(value);
-    return this.opportunity(value.run_id, value.opportunity_id)!;
+    if (!this.projectionLedger) throw new Error("The derived writer is independently owned");
+    return this.projectionLedger;
   }
 
-  private insertOpportunity(value: ImprovementOpportunity): void {
-    const payload = canonical(value);
-    if (Buffer.byteLength(payload) > 65536) throw new Error("Evidence object exceeds 64 KiB budget");
-    this.projectionDb.query("INSERT OR IGNORE INTO evidence_objects(run_id,kind,object_key,payload) VALUES(?,'opportunity',?,?)")
-      .run(value.run_id, value.opportunity_id, payload);
+  saveOpportunity(value: ImprovementOpportunity): ImprovementOpportunity {
+    return this.localProjection().saveOpportunity(value);
   }
 
   private assertProjectionWriteIndependent(): void {
+    this.assertOpen();
     if (this.db.inTransaction) throw new Error("Derived persistence cannot run inside an authoritative control transaction");
   }
 
-  /** Derived commit -> canonical receipt/event -> derived acknowledgement; each step is durable. */
-  private drainProjectionAudit(): void {
-    this.assertProjectionWriteIndependent();
-    for (;;) {
-      const rows = this.projectionDb.query<{ receipt_id: string; run_id: string; payload: string }, []>(
-        "SELECT receipt_id,run_id,payload FROM projection_audit_outbox WHERE event_seq IS NULL ORDER BY outbox_seq LIMIT 64",
-      ).all();
-      if (!rows.length) return;
-      for (const row of rows) {
-        const audit = JSON.parse(row.payload) as { run_id: string; type: string; summary: string; details: Json };
-        if (audit.run_id !== row.run_id || audit.type !== "learning.resolved" ||
-          audit.summary !== "Recorded model-selected improvement decision")
-          throw new Error("Corrupt projection audit outbox");
-        let emitted: ActivityEvent | null = null;
-        const sequence = this.db.transaction(() => {
-          const existing = this.db.query<{ event_seq: number; payload: string }, [string]>(
-            "SELECT event_seq,payload FROM projection_audit_receipts WHERE receipt_id=?",
-          ).get(row.receipt_id);
+  /** Give up the local derived writer exactly once; canonical writes stay here. */
+  handoffProjectionWriter(): { location: StoreReadLocation; identity: ProjectionIdentity; control: ProjectionControl } {
+    const ledger = this.localProjection();
+    ledger.close();
+    this.projectionLedger = null;
+    this.projectionDb = new StoreDatabase(new Database(this.projections.filename, { readonly: true, strict: true }));
+    this.useProjectionDatabase(this.projectionDb);
+    return { location: this.readLocation(), identity: { source_id: this.projections.sourceId, projection_id: this.projections.projectionId }, control: this.projectionControl() };
+  }
+
+  private projectionControl(): ProjectionControl {
+    const hash = (value: string) => { if (!/^[a-f0-9]{64}$/.test(value)) throw new Error("Invalid projection receipt identity"); };
+    return {
+      publication: value => {
+        this.assertProjectionWriteIndependent(); hash(value);
+        return this.db.query<{batch_hash: string}, [string]>("SELECT batch_hash FROM projection_publications WHERE publication_id=?").get(value);
+      },
+      acceptPublication: (runId, value, sourceThrough) => {
+        this.assertProjectionWriteIndependent(); hash(value);
+        if (!Number.isSafeInteger(sourceThrough) || sourceThrough < 0) throw new Error("Invalid projection source frontier");
+        this.db.transaction(() => {
+          if (this.historySourceHighwater(runId) !== sourceThrough) throw new RuntimeFault("conflict", "History source changed before opportunity acceptance");
+          this.db.query("INSERT OR IGNORE INTO projection_publications(publication_id,run_id,source_through,batch_hash) VALUES(?,?,?,?)").run(value, runId, sourceThrough, value);
+        }).immediate();
+      },
+      appendAudit: (receiptId, runId, payload) => {
+        this.assertProjectionWriteIndependent(); hash(receiptId);
+        if (Buffer.byteLength(payload) > 65536) throw new Error("Projection audit exceeds its finite budget");
+        const audit = projectionAuditPayloadSchema.parse(JSON.parse(payload));
+        if (audit.run_id !== runId || canonical(audit) !== payload) throw new Error("Corrupt projection audit outbox");
+        return this.db.transaction(() => {
+          const existing = this.db.query<{event_seq: number; payload: string}, [string]>("SELECT event_seq,payload FROM projection_audit_receipts WHERE receipt_id=?").get(receiptId);
           if (existing) {
-            if (existing.payload !== row.payload) throw new Error("Projection audit receipt identity conflict");
+            if (existing.payload !== payload) throw new Error("Projection audit receipt identity conflict");
             return existing.event_seq;
           }
-          emitted = this.append(row.run_id, audit.type, audit.summary, audit.details);
-          this.db.query("INSERT INTO projection_audit_receipts(receipt_id,event_seq,payload) VALUES(?,?,?)")
-            .run(row.receipt_id, emitted.event_seq, row.payload);
-          return emitted.event_seq;
+          const event = this.append(runId, audit.type, audit.summary, audit.details);
+          this.db.query("INSERT INTO projection_audit_receipts(receipt_id,event_seq,payload) VALUES(?,?,?)").run(receiptId, event.event_seq, payload);
+          return event.event_seq;
         }).immediate();
-        // A crash here reuses the permanent receipt, never appends a duplicate event.
-        this.projectionDb.query("UPDATE projection_audit_outbox SET event_seq=? WHERE receipt_id=? AND event_seq IS NULL")
-          .run(sequence, row.receipt_id);
-        if (emitted) this.notify(emitted);
-      }
-    }
+      },
+      publishAudit: sequence => {
+        this.assertProjectionWriteIndependent();
+        const row = this.db.query<Omit<ActivityEvent, "details"> & { details: string }, [number]>(
+          "SELECT event_seq,run_id,at,type,summary,details FROM events WHERE event_seq=? AND type='learning.resolved'",
+        ).get(sequence);
+        if (!row) throw new Error("Projection audit event is unavailable");
+        // Notifications are hints; the durable sequence deduplicates consumers.
+        this.notify({ ...row, details: JSON.parse(row.details) as Json });
+      },
+    };
   }
 
-  /** A caller frontier is explicit and never chased by a preview or commit. */
+  private drainProjectionAudit(): void {
+    // Once handed off, the independent writer drains its own durable outbox.
+    this.projectionLedger?.drainAudit();
+  }
+
   beginHistoryProjection(runId: string, desiredThrough?: number): ProjectionCheckpoint {
-    this.assertProjectionWriteIndependent();
-    return this.projectionDb.transaction(() => {
-      if (!this.projectionSource.getRun(runId)) throw new RuntimeFault("not_found", "Run not found");
-      const available = this.projectionSource.historySourceHighwater(runId), desired = desiredThrough ?? available;
-      if (!Number.isSafeInteger(desired) || desired < 0 || desired > available) throw new Error("Invalid history projection frontier");
-      const existing = this.historyProjectionCheckpoint(runId);
-      const checkpoint: ProjectionCheckpoint = existing ? structuredClone(existing) : {
-        schema_version: 1, revision: 0, generation: 0, published_revision: 0, source_through: 0,
-        target_through: desired, phase: "bootstrap", job: {}, metric_change_seq: 0, published_metric_change_seq: 0,
-      };
-      if (existing && desired > checkpoint.target_through && ["bootstrap", "index", "expand", "detect", "idle"].includes(checkpoint.phase)) {
-        checkpoint.target_through = desired;
-        if (checkpoint.phase !== "bootstrap") {
-          checkpoint.phase = "index";
-          checkpoint.job.index_after ??= checkpoint.source_through;
-          delete checkpoint.job.expand;
-        }
-        checkpoint.revision++;
-      }
-      assertProjectionCheckpoint(checkpoint);
-      if (!projectionRequestFits(runId, checkpoint))
-        throw new RuntimeFault("budget_exceeded", "History checkpoint cannot fit its next request");
-      if (!existing) this.projectionDb.query("INSERT INTO history_projection_checkpoints(run_id,payload) VALUES(?,?)").run(runId, canonical(checkpoint));
-      else if (canonical(existing) !== canonical(checkpoint)) this.projectionDb.query("UPDATE history_projection_checkpoints SET payload=? WHERE run_id=? AND payload=?").run(canonical(checkpoint), runId, canonical(existing));
-      return checkpoint;
-    }).immediate();
+    return this.localProjection().beginHistoryProjection(runId, desiredThrough);
   }
 
-  /** Persist only bounded trusted patches; expensive domain interpretation stays readonly. */
   commitHistoryProjectionBatch(runId: string, batch: HistoryProjectionBatch): void {
-    this.assertProjectionWriteIndependent();
-    assertProjectionCheckpoint(batch.before);
-    assertProjectionCheckpoint(batch.after);
-    if (!projectionRequestFits(runId, batch.after))
-      throw new RuntimeFault("budget_exceeded", "History checkpoint cannot fit its next request");
-    if (!Array.isArray(batch.patches) || batch.patches.length > 64 || !Array.isArray(batch.candidates) || batch.candidates.length > 16 ||
-      !Array.isArray(batch.opportunity_bootstrap) || batch.opportunity_bootstrap.length > 128 || Buffer.byteLength(JSON.stringify(batch)) > 64000)
-      throw new Error("History projection batch exceeds bounded envelope");
-    const changed = canonical(batch.before) !== canonical(batch.after) || batch.patches.length > 0 || batch.candidates.length > 0 || batch.opportunity_bootstrap.length > 0;
-    const publication = batch.after.generation === batch.before.generation + 1;
-    const phases = ["bootstrap", "index", "expand", "detect", "objective", "evidence", "publish", "idle"];
-    const phaseAdvance = phases.indexOf(batch.after.phase) - phases.indexOf(batch.before.phase);
-    if (batch.after.revision !== batch.before.revision + (changed ? 1 : 0) || batch.after.target_through !== batch.before.target_through ||
-      (phaseAdvance !== 0 && phaseAdvance !== 1) || (publication && batch.before.phase !== "publish") ||
-      batch.after.metric_change_seq < batch.before.metric_change_seq || batch.after.generation !== batch.before.generation + (publication ? 1 : 0) ||
-      batch.has_more !== (batch.after.phase !== "idle") ||
-      (!publication && (batch.after.source_through !== batch.before.source_through || batch.after.published_revision !== batch.before.published_revision || batch.after.published_metric_change_seq !== batch.before.published_metric_change_seq)) ||
-      (publication && (batch.after.phase !== "idle" || batch.after.source_through !== batch.before.target_through || batch.after.published_revision !== batch.after.revision || batch.after.published_metric_change_seq !== batch.after.metric_change_seq)))
-      throw new Error("Invalid history projection progress transition");
-    const identities = new Set<string>();
-    for (const patch of batch.patches) {
-      const collection = patch.type === "put" ? patch.row.collection : patch.collection, key = patch.type === "put" ? patch.row.key : patch.key;
-      if (!["put", "delete"].includes(patch.type) || !PROJECTION_COLLECTIONS.includes(collection) || typeof key !== "string" || !key) throw new Error("Invalid projection mutation scope");
-      if (patch.type === "put") assertProjectionRow(patch.row);
-      if (patch.type === "put" && collection === "pending_opportunity" &&
-        !batch.candidates.some(candidate => candidate.opportunity_id === key && canonical(candidate) === canonical(patch.row.value)))
-        throw new Error("Pending opportunity lacks an exact validated capture");
-      if (patch.type === "put" && collection === "metric_update" &&
-        (patch.row.order_seq <= batch.before.metric_change_seq || patch.row.order_seq > batch.after.metric_change_seq))
-        throw new Error("Metric replacement is outside the batch change frontier");
-      const identity = canonical([collection, key]);
-      if (identities.has(identity)) throw new Error("Duplicate projection mutation key");
-      identities.add(identity);
-    }
-    const batchHash = createHash("sha256").update(canonical([this.projections.projectionId, runId, batch])).digest("hex");
-    if (batch.candidates.length) {
-      const accepted = this.db.query<{ batch_hash: string }, [string]>("SELECT batch_hash FROM projection_publications WHERE publication_id=?").get(batchHash);
-      if (!accepted) {
-        const available = this.projectionSource.snapshot(() => {
-          const source = this.projectionSource;
-      for (const candidate of batch.candidates) {
-        if (candidate.run_id !== runId || candidate.resolution !== null || candidate.event_seqs.length !== 1) throw new Error("Invalid staged opportunity scope");
-        const sequence = candidate.event_seqs[0]!;
-        const current = source.historySourceRecord(runId, "event", String(sequence), source.historySourceHighwater(runId));
-        const pinned = source.historySourceRecord(runId, "event", String(sequence), batch.before.target_through);
-        const exact = current ? improvementOpportunityCandidate(source, runId, source.decodeHistorySource("event", current)) : null;
-        const available = source.historySourceHighwater(runId);
-        const currentExecution = source.historySourceRecord(runId, "execution", candidate.execution_id, available);
-        const pinnedExecution = source.historySourceRecord(runId, "execution", candidate.execution_id, batch.before.target_through);
-        const skillKey = JSON.stringify([candidate.version.skill_id, candidate.version.version]);
-        const currentSkill = source.historySourceRecord(runId, "skill", skillKey, available);
-        const pinnedSkill = source.historySourceRecord(runId, "skill", skillKey, batch.before.target_through);
-        const patch = batch.patches.find(p => p.type === "put" && p.row.collection === "pending_opportunity" && p.row.key === candidate.opportunity_id);
-        if (!exact || canonical(current) !== canonical(pinned) || canonical(currentExecution) !== canonical(pinnedExecution) || canonical(currentSkill) !== canonical(pinnedSkill) ||
-          canonical(exact) !== canonical(candidate) || !patch || patch.type !== "put" || canonical(patch.row.value) !== canonical(candidate))
-          throw new RuntimeFault("conflict", "History opportunity candidate no longer matches exact current source");
-      }
-          return source.historySourceHighwater(runId);
-        });
-        // This bounded metadata CAS is the eligibility linearization point. No reducer,
-        // artifact read, derived write, or model work runs under the control write lock.
-        this.db.transaction(() => {
-          if (this.historySourceHighwater(runId) !== available) throw new RuntimeFault("conflict", "History source changed before opportunity acceptance");
-          this.db.query("INSERT OR IGNORE INTO projection_publications(publication_id,run_id,source_through,batch_hash) VALUES(?,?,?,?)").run(batchHash, runId, available, batchHash);
-        }).immediate();
-      } else if (accepted.batch_hash !== batchHash) throw new Error("Corrupt projection publication receipt");
-    }
-    this.projectionDb.transaction(() => {
-      const saved = this.historyProjectionCheckpoint(runId);
-      if (!saved || canonical(saved) !== canonical(batch.before)) throw new RuntimeFault("conflict", "History projection checkpoint changed before persistence");
-      for (const entry of batch.opportunity_bootstrap) {
-        const current = this.projectionDb.query<{ seq: number; payload: string }, [string, string]>("SELECT rowid AS seq,payload FROM evidence_objects WHERE run_id=? AND kind='opportunity' AND object_key=?").get(runId, entry.value.opportunity_id);
-        if (!current || current.seq !== entry.seq || canonical(JSON.parse(current.payload)) !== canonical(entry.value)) throw new RuntimeFault("conflict", "Opportunity bootstrap changed before persistence");
-        this.projectionDb.query(`INSERT INTO history_opportunity_updates(run_id,opportunity_id,generation,skill_id,version,payload)
-          SELECT ?1,?2,COALESCE((SELECT generation FROM history_opportunity_visibility WHERE run_id=?1 AND opportunity_id=?2),0),?3,?4,?5
-          WHERE NOT EXISTS(SELECT 1 FROM history_opportunity_updates WHERE run_id=?1 AND opportunity_id=?2)`)
-          .run(runId, entry.value.opportunity_id, entry.value.version.skill_id, entry.value.version.version, canonical(entry.value));
-      }
-      for (const patch of batch.patches) {
-        if (patch.type === "delete") {
-          if (patch.collection === "pending_opportunity") {
-            const pending = this.historyProjectionRow(runId, batch.before.revision, patch.collection, patch.key);
-            if (!pending || batch.before.phase !== "publish") throw new Error("Opportunity publication requires staged capture");
-            const candidate = pending.value as unknown as ImprovementOpportunity;
-            this.projectionDb.query(`INSERT OR IGNORE INTO history_opportunity_visibility(run_id,opportunity_id,generation)
-              SELECT ?1,?2,?3 WHERE NOT EXISTS(SELECT 1 FROM evidence_objects WHERE run_id=?1 AND kind='opportunity' AND object_key=?2)`).run(runId, patch.key, batch.before.generation + 1);
-            this.insertOpportunity(candidate);
-          }
-          this.projectionDb.query("INSERT INTO history_projection_rows(run_id,collection,object_key,revision,owner_id,source_id,order_seq,tag,payload,deleted) VALUES(?,?,?,?,NULL,NULL,0,NULL,NULL,1)").run(runId, patch.collection, patch.key, batch.after.revision);
-        } else {
-          const row = patch.row;
-          this.projectionDb.query("INSERT INTO history_projection_rows(run_id,collection,object_key,revision,owner_id,source_id,order_seq,tag,payload,deleted) VALUES(?,?,?,?,?,?,?,?,?,0)")
-            .run(runId, row.collection, row.key, batch.after.revision, row.owner_id, row.source_id, row.order_seq, row.tag, canonical(row.value));
-        }
-      }
-      if (publication) {
-        for (const collection of ["pending_opportunity", "dirty_detection", "dirty_outcome", "dirty_objective", "objective_job", "dirty_evidence", "evidence_job"] as const) {
-          if (this.historyProjectionCount(runId, batch.after.revision, { collection }) !== 0) throw new Error("Cannot publish a partial history generation");
-        }
-        this.projectionDb.query("INSERT INTO history_projection_generations(run_id,generation,revision,source_through,metric_change_seq) VALUES(?,?,?,?,?)")
-          .run(runId, batch.after.generation, batch.after.revision, batch.after.source_through, batch.after.published_metric_change_seq);
-      }
-      if (!changed) return;
-      const result = this.projectionDb.query("UPDATE history_projection_checkpoints SET payload=? WHERE run_id=? AND payload=?").run(canonical(batch.after), runId, canonical(batch.before));
-      if (result.changes !== 1) throw new RuntimeFault("conflict", "History projection checkpoint changed during persistence");
-    }).immediate();
+    this.localProjection().commitHistoryProjectionBatch(runId, batch);
   }
 
   hasMeasuredSkillExecution(runId: string, ref: SkillRef): boolean {
@@ -1550,26 +1433,7 @@ export class Store extends StoreReadQueries {
   }
 
   resolveOpportunity(runId: string, id: string, resolution: NonNullable<ImprovementOpportunity["resolution"]>): ImprovementOpportunity {
-    this.assertProjectionWriteIndependent();
-    const resolved = this.projectionDb.transaction(() => {
-      const value = this.opportunity(runId, id);
-      if (!value) throw new Error("Improvement opportunity not found");
-      if (value.resolution) {
-        const { at: _at, ...existing } = value.resolution;
-        const { at: _newAt, ...proposed } = resolution;
-        if (canonical(existing) !== canonical(proposed)) throw new Error("Improvement resolution is immutable");
-        return value;
-      }
-      value.resolution = resolution;
-      this.projectionDb.query("UPDATE evidence_objects SET payload=? WHERE run_id=? AND kind='opportunity' AND object_key=?").run(canonical(value), runId, id);
-      const details: Json = { opportunity_id: id, decision: resolution.decision, revision: resolution.revision as unknown as Json, measured: resolution.measured, qualification: resolution.measured ? "measured_not_causally_proven" : "unmeasured_candidate" };
-      const payload = canonical({ run_id: runId, type: "learning.resolved", summary: "Recorded model-selected improvement decision", details });
-      const receipt = createHash("sha256").update(canonical([this.projections.projectionId, runId, id, "learning.resolved"])).digest("hex");
-      this.projectionDb.query("INSERT INTO projection_audit_outbox(receipt_id,run_id,payload,event_seq) VALUES(?,?,?,NULL)").run(receipt, runId, payload);
-      return value;
-    })();
-    this.drainProjectionAudit();
-    return resolved;
+    return this.localProjection().resolveOpportunity(runId, id, resolution);
   }
 
   retainWorkingPrograms(runId: string, sessionId: string): WorkingProgram[] {
@@ -1631,7 +1495,7 @@ export class Store extends StoreReadQueries {
     this.listeners.clear();
     this.historyListeners.clear();
     this.traceObservers.clear();
-    this.projectionSource.close();
+    this.projectionLedger?.close();
     this.projectionDb.close();
     this.db.close();
   }

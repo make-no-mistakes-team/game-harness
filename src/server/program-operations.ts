@@ -80,6 +80,7 @@ export class ProgramOperations {
 
   private async writeSource(input: z.infer<typeof programWriteSchema>, callId: string, commit: () => void,
     signal: AbortSignal | undefined, identity: SourceAuthoringIdentity) {
+    const feedbackOptions = { signal, deadlineHostMs: performance.now() + 10_000 };
     const registration = this.registration(identity, callId);
     const pinned = this.registeredSource(identity, callId);
     const previous = pinned ? pinned.parent_version === null ? null : this.store.namedSkill(this.run.run_id, input.name, pinned.parent_version)
@@ -106,7 +107,7 @@ export class ProgramOperations {
       const feedbackKey = this.phaseKey(callId, "feedback");
       const bound = this.store.lookupToolCallBinding(this.run.run_id, feedbackKey, identity);
       if (!bound.found) {
-        await this.host.learning().prepareFeedback(this.run.run_id, { signal, deadlineHostMs: performance.now() + 10_000 });
+        await this.host.learning().prepareFeedback(this.run.run_id, feedbackOptions);
         commit();
         if (!pinned) assertParent();
       }
@@ -125,7 +126,7 @@ export class ProgramOperations {
       })) as unknown as ImprovementOpportunity;
     }
     const program = pinned ?? await this.sources.register(this.run.run_id, { entry: input.entry, name: input.name, source: input.source, card: input.card, dependencies },
-      () => { commit(); assertParent(); }, registration);
+      () => { commit(); assertParent(); }, registration, { signal });
     commit();
     let experiment: { decision: "revise"; measured: boolean; reason: string } | null = null;
     if (opportunity && input.reason) {
@@ -151,12 +152,13 @@ export class ProgramOperations {
         if (selection.kind === "resolve") {
           // Resolution and its audit outbox live in derived storage. Never hold
           // a canonical write transaction across that independently durable work.
-          measured = this.host.learning().resolve(this.run.run_id, selection.opportunity_id, {
+          measured = (await this.host.learning().resolve(this.run.run_id, selection.opportunity_id, {
             decision: "revise", reason, revision, event_seqs: selected.event_seqs,
-          }).resolution!.measured;
+          }, feedbackOptions)).resolution!.measured;
         }
         experiment = feedbackExperimentSchema.parse(this.store.bindToolCall(this.run.run_id,
           linkKey, linkIdentity, () => {
+            commit();
             const decision = { decision: "revise" as const, measured, reason };
             if (selection.kind === "candidate") {
               this.store.event(this.run.run_id, "learning.candidate_written", "Recorded candidate revision without changing the prior outcome assessment", {
@@ -506,9 +508,10 @@ export class ProgramOperations {
 
   async review(input: z.infer<typeof programReviewSchema>, callId: string, commit: () => void, signal?: AbortSignal) {
     const identity = { tool: "program_review", input } as unknown as Json;
+    const options = { signal, deadlineHostMs: performance.now() + 10_000 };
     const bound = this.store.lookupToolCallBinding(this.run.run_id, callId, identity);
     if (!bound.found) {
-      await this.host.learning().prepareFeedback(this.run.run_id, { signal, deadlineHostMs: performance.now() + 10_000 });
+      await this.host.learning().prepareFeedback(this.run.run_id, options);
       commit();
     }
     const opportunityId = z.string().parse(bound.found ? bound.value : this.store.bindToolCall(this.run.run_id, callId, identity, () => {
@@ -523,8 +526,8 @@ export class ProgramOperations {
     const opportunity = this.store.opportunity(this.run.run_id, opportunityId);
     if (!opportunity) throw new RuntimeFault("not_found", "Pinned outcome feedback is not retained");
     const program = this.store.skill(this.run.run_id, opportunity.version);
-    const assessment = this.host.learning().resolve(this.run.run_id, opportunity.opportunity_id,
-      { decision: input.decision, reason: input.reason, revision: null, event_seqs: opportunity.event_seqs });
+    const assessment = await this.host.learning().resolve(this.run.run_id, opportunity.opportunity_id,
+      { decision: input.decision, reason: input.reason, revision: null, event_seqs: opportunity.event_seqs }, options);
     return { name: program.name, version: program.version, decision: assessment.resolution!.decision,
       reason: assessment.resolution!.reason, measured: assessment.resolution!.measured,
       qualification: "assessment_not_promotion_or_causal_improvement" };

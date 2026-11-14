@@ -121,7 +121,11 @@ export const programInspectSchema = z.discriminatedUnion("view", [
   z.object({ view: z.literal("action"), ...executionSelection }).strict(),
 ]);
 export const programReviewSchema = programSelectorSchema.extend({ decision: z.enum(["keep", "insufficient_evidence"]), reason: z.string().trim().min(1).max(2000) }).strict();
-export const taskFinishSchema = z.object({ summary: z.string().trim().min(1).max(2000) }).strict();
+export const taskFinishSchema = z.object({
+  all_requested_work_complete: z.literal(true)
+    .describe("Explicitly affirm that the WHOLE user task is complete. Do not call when work or required evidence remains; this stops every local controller."),
+  summary: z.string().trim().min(1).max(2000),
+}).strict();
 const preparedBaseSchema = programSelectorSchema.extend({
   args: jsonSchema, guard_source: z.string().min(1).max(16384).optional(),
 });

@@ -131,7 +131,7 @@ async function fixture(options: Options = {}) {
     return result;
   };
   const write = async (name: string, source: string, dependencies: { name: string; version?: number }[] = []) =>
-    await required("program_write", { name, source, card, dependencies });
+    await required("program_write", { entry: "run", name, source, card, dependencies });
   const authState: AuthState = { status: "ready", authenticated: true, provider: "openai-codex", account_label: null, models: [{ id: "fixture-model", name: "Fixture", provider: "fixture", context_window: null }], login: null, error: null };
   const auth = {
     snapshot: () => authState,
@@ -200,7 +200,7 @@ async function fixture(options: Options = {}) {
                 await required("program_run", { operation: "start", name: FOLLOW, args: { mode: "follow-up" }, limits: DEFAULT_SKILL_LIMITS });
                 await tailEntered.promise;
               }
-              await required("task_finish", { summary: "Collected one dirt block; fresh inventory contains dirt" });
+              await required("task_finish", { all_requested_work_complete: true, summary: "Collected one dirt block; fresh inventory contains dirt" });
               finishReturned.resolve();
             } else if (life.status === "dead" && !recoveryStarted) {
               recoveryStarted = true;
@@ -701,7 +701,7 @@ for (const customCompletion of ["after-root", "with-pending-root"] as const) {
 
 test("task_finish cannot replace the trusted verifier for a built-in goal", async () => {
   const f = await fixture({ goal: "collect_wood" });
-  const result = await f.invoke("task_finish", { summary: "Collected one dirt block; fresh inventory contains dirt" });
+  const result = await f.invoke("task_finish", { all_requested_work_complete: true, summary: "Collected one dirt block; fresh inventory contains dirt" });
   expect(result.isError).toBe(true);
   expect(f.runtime.snapshot()).toMatchObject({ status: "running", error: null });
   expect(f.store.getRun(f.created.run_id)?.status).toBe("running");

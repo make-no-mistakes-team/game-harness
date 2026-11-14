@@ -108,7 +108,7 @@ async function repeatedNoEffectFixture(executive: boolean | "raw" | "view-observ
       await hooks.run(undefined, { systemPrompt: [], messages: [], tools });
       if (contexts.length === 1) {
         const written = await tools.find(tool => tool.name === "program_write")!.execute("no-effect-write", {
-          ...(executive ? { entry: "step" } : {}),
+          entry: executive ? "step" : "run",
           name: "Neutral repeated actions", source: executive
             ? `export function step(frame,state,intent){const n=state?.n||0;return {choice:${executive === "view-observe"
               ? `(n%8===0?{kind:"observe"}:${JSON.stringify({ kind: "raw", input: rawInput })})`
@@ -181,7 +181,7 @@ async function repeatedNoEffectFixture(executive: boolean | "raw" | "view-observ
     settlement: (value: (() => Promise<GameActionResult>) | null) => { settle = value; },
     counts: () => ({ nativeCalls, aborts }),
     diagnostics,
-    finishTask: () => tools.find(tool => tool.name === "task_finish")!.execute("fixture-finish", { summary: "Explicit terminal lifecycle fixture" }),
+    finishTask: () => tools.find(tool => tool.name === "task_finish")!.execute("fixture-finish", { all_requested_work_complete: true, summary: "Explicit terminal lifecycle fixture" }),
   };
 }
 

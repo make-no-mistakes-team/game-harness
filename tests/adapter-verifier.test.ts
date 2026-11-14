@@ -156,9 +156,9 @@ test("custom task_finish remains unverified and retains strict:false with host a
   const finish = f.tools.get("task_finish");
   expect(finish).toBeDefined();
   expect(finish!.strict).toBe(false);
-  const invalid = await finish!.execute("invalid-finish", { summary: "Report only", scope: effectScope() });
+  const invalid = await finish!.execute("invalid-finish", { all_requested_work_complete: true, summary: "Report only", scope: effectScope() });
   expect(invalid.isError).toBe(true);
-  const response = await finish!.execute("custom-finish", { summary: "Own visible counter is nine" });
+  const response = await finish!.execute("custom-finish", { all_requested_work_complete: true, summary: "Own visible counter is nine" });
   expect(response).not.toMatchObject({ isError: true });
   const events = f.store.eventsAfter(f.run.run_id, 0, 500);
   expect(events.some(event => event.type === "goal.verified")).toBe(false);
@@ -169,7 +169,7 @@ test("custom task_finish remains unverified and retains strict:false with host a
 test("a built-in adapter goal cannot substitute model-reported task_finish for verifier authority", async () => {
   const f = await runtimeFixture();
   const finish = f.tools.get("task_finish")!;
-  const response = await finish.execute("forged-built-in-finish", { summary: "Trust the model" });
+  const response = await finish.execute("forged-built-in-finish", { all_requested_work_complete: true, summary: "Trust the model" });
   expect(response.isError).toBe(true);
   expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event => event.type === "goal.verified")).toBe(false);
 });

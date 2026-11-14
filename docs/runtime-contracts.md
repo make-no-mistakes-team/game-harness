@@ -251,18 +251,23 @@ The ordinary default exposes these tools:
 | `program_review` | Record `keep` or `insufficient_evidence` for a named version's latest matching outcome, with reason. |
 | `reflex` | Author, validate and explicitly activate bounded local reactions; no policy is supplied automatically. |
 | `help` | Load controller, game, program, planning or reflex reference; disclose the optional memory module on demand. |
-| `task_finish` | Request safe closure of a custom task with a model-authored completion summary; not independent goal verification. |
+| `task_finish` | Affirm all requested work is complete and request safe custom-task closure with a model-authored summary; not independent goal verification. |
 
-For a custom task, Main calls `task_finish({summary})` once authorized observations and execution evidence show that the whole requested task is done. A successful program return, completion prose or `game.progress` alone never closes a task. Do not rerun already-satisfied work or wait for the empty-turn limit to stop inference.
+For a custom task, Main calls
+`task_finish({all_requested_work_complete:true,summary})` once authorized
+observations and execution evidence support completion of the whole request.
+A successful program return, completion prose or `game.progress` alone never
+closes a task. Do not rerun satisfied work or wait for the empty-turn limit.
 
 `task_finish` is terminal, not an end-of-turn or progress-report operation.
 “Unverified” describes the source of the completion report; it does not mean
-that the task is unfinished. A summary saying that completion cannot be claimed
-still stops all control. When requirements remain, Main ends its planning
-response without this tool, retaining useful bounded control and requesting a
-finite attention wake only when needed. The host does not interpret summary
-wording or consult evaluator-private counters to decide whether a custom task
-is done.
+that the task is unfinished. The required literal
+`all_requested_work_complete:true` is an explicit model affirmation, not trusted
+verification. Missing, false or coerced string values are rejected before
+admission; the live controller and its authority remain unchanged. When
+requirements remain, Main ends its planning response normally, retaining useful
+bounded control and requesting a finite attention wake only when needed. The
+host does not parse summary wording or consult evaluator-private counters.
 
 Ordinary task entry starts with **Custom / natural language**, without an automatic verifier. Built-in success checks are explicit presets: selecting one replaces the draft with its matching prompt and displays its exact early-stop condition. Editing that prompt switches to Custom, even if the original text is later restored; rebinding requires an explicit preset selection. UI, HTTP and Runtime accept the same trimmed task length of 1–4,000 characters. API callers remain responsible for binding a registered criterion to the whole request.
 

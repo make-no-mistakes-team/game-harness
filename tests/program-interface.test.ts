@@ -1872,7 +1872,7 @@ test("actual catalogs and dispatch share ordinary, speculative, advanced-module 
   expect(data(assessment).error.code).toBe("forbidden");
   expect(f.store.namedSkill(f.run.run_id, "candidate")!.version).toBe(1);
   expect(data(await f.call("program_submit", { name: "forbidden submit", source, args: null }, "forbidden-spec-submit", ordinary)).error.code).toBe("forbidden");
-  expect(data(await f.call("task_finish", { summary: "Not authorized during speculation" }, "forbidden-spec-finish", ordinary)).error.code).toBe("forbidden");
+  expect(data(await f.call("task_finish", { all_requested_work_complete: true, summary: "Not authorized during speculation" }, "forbidden-spec-finish", ordinary)).error.code).toBe("forbidden");
   expect(data(await f.call("prepare_next", { name: "prepared during execution", args: null })).guard_status).toBe("omitted");
   expect(f.planning.projection()?.candidate?.skill_id).toBe(f.store.namedSkill(f.run.run_id, "prepared during execution")!.skill_id);
   f.planning.finish(plan.plan_id); release.resolve();
@@ -1883,7 +1883,7 @@ test("actual catalogs and dispatch share ordinary, speculative, advanced-module 
   expect(f.tools().some((tool) => tool.name === "program_run" || tool.name === "program_submit" || tool.name === "prepare_next" || tool.name === "task_finish")).toBe(false);
   expect((await f.call("program_run", { operation: "start", name: "candidate", args: null }, "forbidden-review-run", ordinary)).isError).toBe(true);
   expect(data(await f.call("program_submit", { name: "forbidden submit", source, args: null }, "forbidden-review-submit", ordinary)).error.code).toBe("forbidden");
-  expect(data(await f.call("task_finish", { summary: "Not authorized during review" }, "forbidden-review-finish", ordinary)).error.code).toBe("forbidden");
+  expect(data(await f.call("task_finish", { all_requested_work_complete: true, summary: "Not authorized during review" }, "forbidden-review-finish", ordinary)).error.code).toBe("forbidden");
   await f.call("help", { topic: "memory" });
   expect(f.tools().some((tool) => tool.name === "memory")).toBe(false);
   expect(f.actions()).toBe(0);
@@ -1919,7 +1919,7 @@ test("installed Agent cannot use captured playing tools during authoring and sav
       type: "toolCall" as const, id: `blocked-control-${index}`, name: "program_run", arguments: { operation, name: "foreground", args: null },
     })),
     { type: "toolCall", id: "blocked-submit", name: "program_submit", arguments: { name: "unexpected playing source", source, args: null } },
-    { type: "toolCall", id: "blocked-finish", name: "task_finish", arguments: { summary: "Unauthorized completion" } },
+    { type: "toolCall", id: "blocked-finish", name: "task_finish", arguments: { all_requested_work_complete: true, summary: "Unauthorized completion" } },
     { type: "toolCall", id: "blocked-reflex", name: "reflex", arguments: { operation: "activate", name: "unexpected" } },
     { type: "toolCall", id: "blocked-memory", name: "memory", arguments: { operation: "load", name: "unexpected" } },
     { type: "toolCall", id: "blocked-review", name: "program_review", arguments: { name: "foreground", decision: "keep", reason: "Unauthorized assessment" } },
@@ -2061,6 +2061,36 @@ for (const boundary of ["root_settlement", "stop", "role_change"] as const) {
   });
 }
 
+test.each(["missing", false, "true"] as const)(
+  "unaffirmed task_finish preserves the live root and its next authorized effect through the SDK: %s", async affirmation => {
+    const entered = Promise.withResolvers<void>(), continueWork = Promise.withResolvers<void>(), progressed = Promise.withResolvers<void>();
+    const f = fixture(async (_source, _args, handle, _limits, signal) => {
+      entered.resolve();
+      await Promise.race([continueWork.promise, aborted(signal)]);
+      if (!signal.aborted) {
+        await handle({ kind: "action", action: { kind: "look", yaw: 0.1, pitch: 0 } });
+        progressed.resolve();
+        await aborted(signal);
+      }
+      return { status: "completed", summary: "Fenced fixture settled", result: null };
+    });
+    await f.write("pending");
+    await f.call("program_run", { operation: "start", name: "pending", args: null });
+    await entered.promise;
+    const root = f.store.latestRootExecution(f.run.run_id)!;
+    const arguments_ = { summary: "Not complete; preserve the useful local controller",
+      ...(affirmation === "missing" ? {} : { all_requested_work_complete: affirmation }) };
+    const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: "unaffirmed-finish",
+      name: "task_finish", arguments: arguments_ }]);
+    expect(replies[0]).toMatchObject({ isError: true });
+    expect(f.run.status).toBe("running");
+    expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })?.status).toBe("running");
+    expect(f.manager.effectScope(root.execution_id)).not.toBeNull();
+    continueWork.resolve(); await progressed.promise;
+    expect(f.actions()).toBe(1);
+    expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event => event.type === "task.completion_reported")).toBe(false);
+  });
+
 test("task_finish persists an immutable acknowledgement despite consuming its own authority", async () => {
   const entered = Promise.withResolvers<void>();
   const f = fixture(async (_source, _args, _handle, _limits, signal) => {
@@ -2074,20 +2104,20 @@ test("task_finish persists an immutable acknowledgement despite consuming its ow
   await entered.promise;
   const root = f.store.latestRootExecution(f.run.run_id)!;
   const id = "finish-once";
-  const input = { summary: "  Whole task done from authorized evidence  " };
+  const input = { all_requested_work_complete: true, summary: "  Whole task done from authorized evidence  " };
   const first = await f.call("task_finish", input, id, ordinary);
   expect(first.isError).not.toBe(true);
   expect(data(first)).toEqual({ status: "stopping", verification: "unverified" });
   expect(f.run.status).toBe("stopping");
   expect(f.store.completedToolCall(f.run.run_id, id, {
-    tool: "task_finish", input: { summary: "Whole task done from authorized evidence" },
+    tool: "task_finish", input: { all_requested_work_complete: true, summary: "Whole task done from authorized evidence" },
   })).toEqual({ status: "stopping", verification: "unverified" });
   await waitClosed(f.store, f.run.run_id, root.execution_id);
   expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })?.status).toBe("cancelled");
   f.run.status = "stopped";
   expect(data(await f.call("task_finish", input, id, ordinary))).toEqual({ status: "stopping", verification: "unverified" });
   expect(f.run.status).toBe("stopped");
-  expect(data(await f.call("task_finish", { summary: "Changed claim" }, id, ordinary)).error.code).toBe("conflict");
+  expect(data(await f.call("task_finish", { all_requested_work_complete: true, summary: "Changed claim" }, id, ordinary)).error.code).toBe("conflict");
   expect(data(await f.call("task_finish", input, "new-finish", ordinary)).error.code).toBe("stale_context");
   expect(data(await f.call("program_run", { operation: "start", name: "pending", args: null }, "after-finish", ordinary)).error.code).toBe("stale_context");
   expect((await f.write("after-finish")).isError).toBe(true);
@@ -2101,21 +2131,23 @@ test("task_finish persists an immutable acknowledgement despite consuming its ow
 test("task_finish validates bounded summaries and preserves cancellation, generation and built-in authority checks", async () => {
   const f = fixture();
   const ordinary = f.tools();
-  for (const input of [{}, { summary: "" }, { summary: "   " }, { summary: "x".repeat(2001) }, { summary: 1 }, { summary: "Done", extra: true }]) {
+  for (const input of [{ all_requested_work_complete: true }, { all_requested_work_complete: true, summary: "" },
+    { all_requested_work_complete: true, summary: "   " }, { all_requested_work_complete: true, summary: "x".repeat(2001) },
+    { all_requested_work_complete: true, summary: 1 }, { all_requested_work_complete: true, summary: "Done", extra: true }]) {
     expect(data(await f.call("task_finish", input)).error.code).toBe("invalid_request");
     expect(f.run.status).toBe("running");
   }
   const cancelled = new AbortController();
   cancelled.abort();
   expect(data(await ordinary.find((tool) => tool.name === "task_finish")!.execute(
-    "cancelled-finish", { summary: "Not admitted" }, cancelled.signal,
+    "cancelled-finish", { all_requested_work_complete: true, summary: "Not admitted" }, cancelled.signal,
   )).error.code).toBe("stale_context");
   f.run.goal = "collect_wood";
-  expect(data(await f.call("task_finish", { summary: "Not trusted proof" }, "built-in-finish", ordinary)).error.code).toBe("forbidden");
+  expect(data(await f.call("task_finish", { all_requested_work_complete: true, summary: "Not trusted proof" }, "built-in-finish", ordinary)).error.code).toBe("forbidden");
   expect(f.run.status).toBe("running");
   f.run.goal = "custom";
   f.fence();
-  expect(data(await f.call("task_finish", { summary: "Stale claim" }, "stale-finish", ordinary)).error.code).toBe("stale_context");
+  expect(data(await f.call("task_finish", { all_requested_work_complete: true, summary: "Stale claim" }, "stale-finish", ordinary)).error.code).toBe("stale_context");
   expect(f.run.status).toBe("running");
   expect(f.store.eventsAfter(f.run.run_id, 0, 500).some((event) => event.type === "model.tool_result")).toBe(false);
 });

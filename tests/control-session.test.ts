@@ -9,6 +9,7 @@ import { controllerFrameFixture } from "./helpers/controller-frame.ts";
 import { minecraftControllerFrameSchema, type MinecraftControllerFrame } from "../src/shared/minecraft.ts";
 import { controllerNativeDeadline, ControllerChannelFaultError, ControllerScreenReadSupersededError, NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
 import { ExecutiveObservationMonitor } from "../src/server/executive-incidents.ts";
+import { programDiagnostic } from "../src/server/program-diagnostics.ts";
 
 async function settle() { for (let index = 0; index < 100; index++) await Promise.resolve(); }
 class Clock implements ResidentClock {
@@ -1123,6 +1124,34 @@ test("known expired raw leases recover before sampling the old channel under the
     .not.toBe(minecraftControllerFrameSchema.parse(previous.frame).captured_native_ns);
   expect(h.retired).toBe(1);
   await h.session.stop("complete");
+});
+
+test("exhausted selected recovery retains an actionable safe diagnostic after exact drain", async () => {
+  const h = harness();
+  h.options.config = controlSessionConfigSchema.parse({ schema_version: 1, recovery: "checkpoint_safe", max_restarts: 1 });
+  let factories = 0;
+  const old = h.options.worker;
+  h.options.restartWorker = async () => {
+    factories++;
+    return { step: (...args) => old.step(...args), activate: (...args) => old.activate!(...args), close: () => old.close() };
+  };
+  try {
+    h.choose(rawChoice); await h.session.start(); await h.clock.advance(50);
+    await h.clock.jump(350); await h.clock.advance(100);
+    expect(h.session.snapshot()).toMatchObject({ status: "running", session: { restarts: 1 } });
+    const submitted = h.sent.length;
+    await h.clock.jump(350);
+    await h.session.stop("join exhausted recovery");
+    expect(h.session.snapshot()).toMatchObject({ status: "failed",
+      session: { restarts: 1, deadline_host_ms: 10000 }, cleanup: { native: "retired", worker: "closed" } });
+    expect(factories).toBe(1);
+    expect(h.sent).toHaveLength(submitted);
+    expect(h.retired).toBe(2);
+    expect(programDiagnostic(h.session.failure, h.options.source_hash)).toMatchObject({
+      type: "RuntimeFault", code: "session_recovery_exhausted",
+      source_hash: h.options.source_hash,
+    });
+  } finally { await h.session.stop("test complete"); }
 });
 
 test.each(["reset_safe", "checkpoint_safe"] as const)(

@@ -12,6 +12,7 @@ import { GeneratedControllerResultValidationError } from "./program-diagnostics.
 import { ControllerChannelFaultError, ControllerScreenReadSupersededError } from "./controller-channel.ts";
 import { ExecutiveRawMonitor, ExecutiveStationaryViewMonitor } from "./executive-incidents.ts";
 import { ResidentAnalysisLane } from "./resident-analysis.ts";
+import { RuntimeFault } from "./runtime-fault.ts";
 
 interface Task {
   snapshot: ExecutiveTaskSnapshot;
@@ -82,13 +83,13 @@ export class ControlSession {
     generation: number; sequence: number; intentVersion: number; frame: MinecraftControllerFrame; input: ControllerInput;
   }>();
   private readonly session: ExecutiveSnapshot;
-  private resultFailure: GeneratedControllerResultValidationError | null = null;
+  private resultFailure: GeneratedControllerResultValidationError | RuntimeFault | null = null;
   private controllerFaultRecorded = false;
   private readonly rawMonitor = new ExecutiveRawMonitor();
   private readonly stationaryViewMonitor = new ExecutiveStationaryViewMonitor();
   private stationaryViewScope: EffectScope | null = null;
   private readonly analysisLane: ResidentAnalysisLane;
-  get failure(): GeneratedControllerResultValidationError | null { return this.resultFailure; }
+  get failure(): GeneratedControllerResultValidationError | RuntimeFault | null { return this.resultFailure; }
 
   constructor(private readonly options: ControlSessionOptions) {
     this.clock = options.clock ?? { id: "control-session-host", now: () => performance.now(),
@@ -645,8 +646,15 @@ export class ControlSession {
   private async recover(reason: string, nativeCandidate?: ControllerInputChannel): Promise<void> {
     const checkpoint = this.options.config.recovery === "checkpoint_safe";
     // Only committed JSON crosses realms. Globals, pending results and effects do not.
+    if (this.options.config.recovery !== "none" && this.options.restartWorker &&
+      this.session.restarts >= this.options.config.max_restarts) {
+      const failure = new RuntimeFault("session_recovery_exhausted",
+        "Executive recovery exhausted its model-selected restart allowance; no further restart was admitted. Original deadlines and unknown outcomes remain unchanged.");
+      this.resultFailure = failure;
+      throw failure;
+    }
     if (this.options.config.recovery === "none" || !this.options.restartWorker ||
-      this.session.restarts >= this.options.config.max_restarts || this.transition) throw new Error(`session_recovery_refused: ${reason}`);
+      this.transition) throw new Error(`session_recovery_refused: ${reason}`);
     if (checkpoint && this.raw && !this.rawWorldOnly) throw new Error(`session_recovery_refused_gui: ${reason}`);
     const state = structuredClone(checkpoint ? this.data.state : this.options.initial_state);
     this.decisionEpoch++;

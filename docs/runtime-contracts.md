@@ -645,6 +645,13 @@ computation, that result is discarded. An explicitly recovery-safe session may u
 restart allowance; other sessions fail closed. Neither path extends the expired
 lease or the original session deadline.
 
+If a known expired lease or stale unsent decision needs recovery after the
+selected `max_restarts` allowance is exhausted, the execution retains the fixed
+`session_recovery_exhausted` diagnostic instead of an opaque execution failure.
+It admits no further restart, preserves unknown outcomes and joins the same
+native and worker drain. Generated error text cannot select this host-owned
+diagnostic or replenish the allowance.
+
 A trusted channel can also reject a capture older than 150 ms before sending
 its heartbeat, even when VM computation finished within its own time bound.
 An exact-owner `heartbeat_admission` / `stale_native_frame` fault marked

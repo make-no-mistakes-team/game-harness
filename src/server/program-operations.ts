@@ -6,6 +6,7 @@ import type { ImprovementOpportunity } from "../shared/execution-evidence.ts";
 import type { RuntimeToolHost } from "./runtime-tools.ts";
 import type { Store, StoredRun } from "./store.ts";
 import type { SkillManager } from "./skills.ts";
+import type { SourcePrograms } from "./source-programs.ts";
 import type { ReactiveRuntime } from "./reactive.ts";
 import type { ExperienceLibrary } from "./experience.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
@@ -20,11 +21,17 @@ import { GeneratedControllerResultValidationError, parseGeneratedResidentResult,
 const exactNamedProgramSchema = programSelectorSchema.required({ version: true });
 const executionControlSchema = z.object({ execution_id: z.string().nullable(), plan_id: z.string().nullable() }).strict();
 const preparedSelectionSchema = z.object({ plan_id: z.string(), skill: skillRefSchema }).strict();
+const feedbackSelectionSchema = z.object({
+  kind: z.enum(["resolve", "candidate"]), opportunity_id: z.string().min(1),
+}).strict();
+const feedbackExperimentSchema = z.object({
+  decision: z.literal("revise"), measured: z.boolean(), reason: z.string(),
+}).strict();
 type SourceAuthoringIdentity = { tool: "program_write" | "program_edit"; input: Json };
 
 export class ProgramOperations {
   readonly workspace: ProgramWorkspace;
-  constructor(private store: Store, private skills: SkillManager, private reactions: ReactiveRuntime,
+  constructor(private store: Store, private skills: SkillManager, private sources: SourcePrograms, private reactions: ReactiveRuntime,
     private experience: ExperienceLibrary | null, private host: RuntimeToolHost, private run: StoredRun) {
     this.workspace = new ProgramWorkspace(store, run.run_id);
   }
@@ -117,32 +124,50 @@ export class ProgramOperations {
         }
       })) as unknown as ImprovementOpportunity;
     }
-    const program = pinned ?? await this.skills.register(this.run.run_id, { entry: input.entry, name: input.name, source: input.source, card: input.card, dependencies },
+    const program = pinned ?? await this.sources.register(this.run.run_id, { entry: input.entry, name: input.name, source: input.source, card: input.card, dependencies },
       () => { commit(); assertParent(); }, registration);
     commit();
     let experiment: { decision: "revise"; measured: boolean; reason: string } | null = null;
     if (opportunity && input.reason) {
       const selected = opportunity, reason = input.reason;
       const revision = { run_id: this.run.run_id, skill_id: program.skill_id, version: program.version, hash: program.hash };
-      // Bind the linkage and its event/resolution in the same transaction.
-      // Replaying a persisted write cannot reselect a newer outcome, convert
-      // our own prior resolution to a candidate event, or append that event twice.
-      experiment = this.store.bindToolCall(this.run.run_id, this.phaseKey(callId, "feedback_link"),
-        { ...identity, revision } as unknown as Json, () => {
-          const decision = { decision: "revise" as const, measured: false, reason };
-          if (selected.resolution === null) {
-            decision.measured = this.host.learning().resolve(this.run.run_id, selected.opportunity_id, {
-              decision: decision.decision, reason, revision, event_seqs: selected.event_seqs,
-            }).resolution!.measured;
-          } else {
-            this.store.event(this.run.run_id, "learning.candidate_written", "Recorded candidate revision without changing the prior outcome assessment", {
-              opportunity_id: selected.opportunity_id, execution_id: selected.execution_id,
-              parent: selected.version as unknown as Json, revision, event_seqs: selected.event_seqs,
-              ...decision, qualification: "candidate_not_proven_improvement",
-            });
-          }
-          return decision;
-        }) as unknown as { decision: "revise"; measured: boolean; reason: string };
+      const linkKey = this.phaseKey(callId, "feedback_link");
+      const linkIdentity = { ...identity, revision } as unknown as Json;
+      const linked = this.store.lookupToolCallBinding(this.run.run_id, linkKey, linkIdentity);
+      if (linked.found) experiment = feedbackExperimentSchema.parse(linked.value);
+      else {
+        // Persist the original choice before crossing into the derived ledger.
+        // A retry after resolution cannot reinterpret our own earlier decision
+        // as a new candidate event or select another opportunity.
+        const selection = feedbackSelectionSchema.parse(this.store.bindToolCall(this.run.run_id,
+          this.phaseKey(callId, "feedback_decision"), linkIdentity, () => {
+            commit();
+            return { kind: selected.resolution === null ? "resolve" : "candidate",
+              opportunity_id: selected.opportunity_id };
+          }));
+        if (selection.opportunity_id !== selected.opportunity_id)
+          throw new RuntimeFault("conflict", "Source feedback choice does not match its pinned opportunity");
+        let measured = false;
+        if (selection.kind === "resolve") {
+          // Resolution and its audit outbox live in derived storage. Never hold
+          // a canonical write transaction across that independently durable work.
+          measured = this.host.learning().resolve(this.run.run_id, selection.opportunity_id, {
+            decision: "revise", reason, revision, event_seqs: selected.event_seqs,
+          }).resolution!.measured;
+        }
+        experiment = feedbackExperimentSchema.parse(this.store.bindToolCall(this.run.run_id,
+          linkKey, linkIdentity, () => {
+            const decision = { decision: "revise" as const, measured, reason };
+            if (selection.kind === "candidate") {
+              this.store.event(this.run.run_id, "learning.candidate_written", "Recorded candidate revision without changing the prior outcome assessment", {
+                opportunity_id: selected.opportunity_id, execution_id: selected.execution_id,
+                parent: selected.version as unknown as Json, revision, event_seqs: selected.event_seqs,
+                ...decision, qualification: "candidate_not_proven_improvement",
+              });
+            }
+            return decision;
+          }));
+      }
     }
     return { name: program.name, version: program.version, entry: program.entry, state: program.state, purpose: program.card.purpose,
       dependencies: input.dependencies.map((selector, index) => ({ name: selector.name, version: dependencies[index]!.version,
@@ -609,7 +634,7 @@ export class ProgramOperations {
         }));
       const selected = this.experience.named(this.run.model_id, this.run.world_id, reference.name, reference.version);
       if (!selected) throw new RuntimeFault("not_found", "Named compatible memory revision not found");
-      const program = await this.experience.hydrate(selected.experience_id, this.run.model_id, this.run.world_id, this.run.run_id, this.skills, commit);
+      const program = await this.experience.hydrate(selected.experience_id, this.run.model_id, this.run.world_id, this.run.run_id, this.sources, commit);
       return { name: program.name, version: program.version, state: program.state,
         memory: { name: selected.name, version: selected.version } };
     }

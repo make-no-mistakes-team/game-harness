@@ -237,7 +237,7 @@ export class ImprovementLearning {
         !sameRevision ||
         JSON.stringify(previous.event_seqs) !== JSON.stringify([...new Set(input.event_seqs)]))
         throw new RuntimeFault("conflict", "This improvement opportunity already has an immutable resolution; identical retries return that resolution.");
-      return opportunity;
+      return this.store.resolveOpportunity(runId, id, previous);
     }
     exactVersion(this.store, opportunity.version);
     for (const seq of input.event_seqs) {
@@ -251,8 +251,6 @@ export class ImprovementLearning {
       if (!sourceRun || !revisionRun || sourceRun.model_id !== revisionRun.model_id || revision.skill_id !== parent.skill_id || revision.parent_version !== parent.version) throw new Error("Revision must name a same-model direct child version");
       measured = this.store.hasMeasuredSkillExecution(input.revision.run_id, revision);
     }
-    const value = this.store.resolveOpportunity(runId, id, { ...input, event_seqs: [...new Set(input.event_seqs)], measured, at: new Date().toISOString() });
-    if (!opportunity.resolution) this.store.event(runId, "learning.resolved", "Recorded model-selected improvement decision", { opportunity_id: id, decision: input.decision, revision: input.revision as unknown as Json, measured, qualification: measured ? "measured_not_causally_proven" : "unmeasured_candidate" });
-    return value;
+    return this.store.resolveOpportunity(runId, id, { ...input, event_seqs: [...new Set(input.event_seqs)], measured, at: new Date().toISOString() });
   }
 }

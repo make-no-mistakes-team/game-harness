@@ -30,12 +30,12 @@ async function send(frame: HistoryResponseFrame): Promise<void> {
 }
 
 async function run(): Promise<void> {
-  const database = process.argv[2], artifacts = process.argv[3];
-  if (process.argv.length !== 4 || !database || !artifacts) throw new Error("History worker requires fixed store paths");
+  const database = process.argv[2], artifacts = process.argv[3], projection = process.argv[4];
+  if ((process.argv.length !== 4 && process.argv.length !== 5) || !database || !artifacts || (process.argv.length === 5 && !projection)) throw new Error("History worker requires fixed store paths");
   const [{ ReadonlyStore }, { dispatchHistoryQuery }] = await Promise.all([
     import("./store-read.ts"), import("./history-dispatch.ts"),
   ]);
-  const store = new ReadonlyStore({ database, artifacts });
+  const store = new ReadonlyStore({ database, artifacts, ...(projection === undefined ? {} : { projection }) });
   let bytes = 0;
   let parts: Buffer[] = [];
   let lastId = 0;

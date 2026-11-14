@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/server/store.ts";
 import { SkillManager, type SkillHost } from "../src/server/skills.ts";
+import { SourcePrograms } from "../src/server/source-programs.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { RuntimeTools, type RuntimeToolHost } from "../src/server/runtime-tools.ts";
 import { HistoryReader } from "../src/server/history-reader.ts";
@@ -90,9 +91,11 @@ async function fixture(analysisFactory?: (budget: number, bundle: ExecutableModu
     },
   });
   cleanup.push(async () => { finishCompile.resolve(); await manager.closeAll("Fixture cleanup"); store.close(); rmSync(directory, {recursive:true,force:true}); });
-  const program = await manager.register(run.run_id, {entry:"step", name:"resident", source, card, dependencies:[]});
+  const sources = new SourcePrograms(store, { adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
+    changed: () => hooks.changed?.(false) });
+  const program = await sources.register(run.run_id, {entry:"step", name:"resident", source, card, dependencies:[]});
   const start = (lookahead?: LookaheadConfig) => manager.start(run.run_id, {entry:"step", skill_id:program.skill_id, version:program.version, start_key:crypto.randomUUID(), ...executionScopeFixture(run), args:{goal:"wait"}, initial_state:0, limits:{...DEFAULT_RESIDENT_LIMITS, duration_ms:10000, ...limits}, ...(lookahead ? { lookahead } : {})});
-  return { store, run, manager, program, start, compiled, finishCompile, firstStep, hold() {holdCompile=true;}, running() {output="running";}, get opened(){return opened;}, get closed(){return closed;}, get finiteCalls(){return finiteCalls;} };
+  return { store, run, manager, sources, program, start, compiled, finishCompile, firstStep, hold() {holdCompile=true;}, running() {output="running";}, get opened(){return opened;}, get closed(){return closed;}, get finiteCalls(){return finiteCalls;} };
 }
 
 /** Controlled guardian frames exercise the actual host decoder and process
@@ -242,8 +245,8 @@ test("ordinary exact-return analysis keeps raw output, budgets and immutable fla
     observe: async () => minecraftObservationFixture(adapter), adapter: () => adapter, generation: () => 1,
     attentionAfter: () => {}, admitted: () => {}, history: () => history, planning: () => planning,
     learning: () => learning, toolAuthority: () => () => {}, finishTask: () => { throw new Error("No task completion"); } };
-  const tool = new RuntimeTools(f.store, f.manager, {} as ReactiveRuntime, null, host).build(1).find(tool => tool.name === "program_run")!;
-  const analysis = await f.manager.register(f.run.run_id, { entry: "analyze", name: "exact-return software probe",
+  const tool = new RuntimeTools(f.store, f.manager, f.sources, {} as ReactiveRuntime, null, host).build(1).find(tool => tool.name === "program_run")!;
+  const analysis = await f.sources.register(f.run.run_id, { entry: "analyze", name: "exact-return software probe",
     source: `export function analyze(input) {
       if (input.refuse) return {refused:true,reason:'software only'};
       return {input:{kind:'world',held:{forward:false,back:false,left:false,right:false,jump:false,sprint:false,sneak:false,attack:false,use:false},
@@ -286,7 +289,7 @@ test("ordinary exact-return analysis keeps raw output, budgets and immutable fla
 test("ordinary resident analysis returns actual source assertions only as bounded untrusted advice", async () => {
   const f = await fixture(async (budget, bundle, signal) => await residentAnalysisProcess(bundle, budget, signal));
   f.running(); const execution = f.start(); await f.firstStep.promise;
-  const analysis = await f.manager.register(f.run.run_id, { entry: "analyze", name: "assertion probe",
+  const analysis = await f.sources.register(f.run.run_id, { entry: "analyze", name: "assertion probe",
     source: "export function analyze(input) { if (!input) throw new TypeError('probe assertion: input required'); return input; }",
     card, dependencies: [] });
   const result = await f.manager.analyzeResident(f.run.run_id, execution.execution_id,
@@ -308,7 +311,7 @@ test("ordinary resident analysis redacts host exceptions, structural spoofs and 
     report?.(1); throw injected;
   }, async close() {} }));
   f.running(); const execution = f.start(); await f.firstStep.promise;
-  const analysis = await f.manager.register(f.run.run_id, { entry: "analyze", name: "host boundary probe",
+  const analysis = await f.sources.register(f.run.run_id, { entry: "analyze", name: "host boundary probe",
     source: "export function analyze(input) { return input; }", card, dependencies: [] });
   for (const error of [injected, { origin: "source_throw", trustedOrigin: false, message: "PRIVATE_SPOOF",
     sourceDiagnostic: { type: "Error", message: "PRIVATE_SPOOF", source_hash: analysis.hash, location: { mapping: "unmapped" } } },
@@ -351,12 +354,12 @@ test("ordinary named resident handoff holds admission until native retirement th
     adapter: () => adapter, generation: () => 1, attentionAfter: () => {}, admitted: () => {},
     history: () => history, planning: () => planning, learning: () => learning, toolAuthority: () => () => {},
     finishTask: () => { throw new Error("No task completion"); } };
-  const catalog = new RuntimeTools(f.store, f.manager, {} as ReactiveRuntime, null, host);
+  const catalog = new RuntimeTools(f.store, f.manager, f.sources, {} as ReactiveRuntime, null, host);
   const tool = catalog.build(1).find(tool => tool.name === "program_run")!;
   f.running();
   const predecessor = f.start();
   await f.firstStep.promise;
-  const successor = await f.manager.register(f.run.run_id, { entry: "step", name: "exact successor", source, card, dependencies: [] });
+  const successor = await f.sources.register(f.run.run_id, { entry: "step", name: "exact successor", source, card, dependencies: [] });
   const limits = { ...DEFAULT_RESIDENT_LIMITS, duration_ms: 8000, max_steps: 17, max_frames: 11 };
   const input = { operation: "start", entry: "step", name: successor.name, args: { goal: "new authored intent" }, initial_state: 0, limits,
     handoff: { name: f.program.name, version: f.program.version, execution_ordinal: 1 } };
@@ -406,7 +409,7 @@ test("an admitted prepared successor keeps playing while its own lookahead slot 
   cleanup.unshift(async () => { planner.invalidate(); });
   f.running();
   const predecessor = f.start(); await f.firstStep.promise;
-  const successor = await f.manager.register(f.run.run_id, { entry: "step", name: "prepared with next", source, card, dependencies: [] });
+  const successor = await f.sources.register(f.run.run_id, { entry: "step", name: "prepared with next", source, card, dependencies: [] });
   const request = { entry: "step" as const, skill_id: successor.skill_id, version: successor.version,
     start_key: "prepared-own-slot", ...executionScopeFixture(f.run), args: null, initial_state: 0,
     limits: { ...DEFAULT_RESIDENT_LIMITS, duration_ms: 9000 },
@@ -521,7 +524,7 @@ test("actual manager prepares both slow workers before retirement and discards s
     },
   });
   cleanup.unshift(async () => { releaseShadow.resolve(); releaseClean.resolve(); });
-  const incumbent = await f.manager.register(f.run.run_id, { entry: "step", name: "useful incumbent",
+  const incumbent = await f.sources.register(f.run.run_id, { entry: "step", name: "useful incumbent",
     source: source.replace("status:'completed'", "status:'running'"), card, dependencies: [] });
   const request = { entry: "step" as const, skill_id: incumbent.skill_id, version: incumbent.version, start_key: "prepared-incumbent",
     ...executionScopeFixture(f.run), args: null, initial_state: 0, limits: { ...DEFAULT_RESIDENT_LIMITS, duration_ms: 10000, step_ms: 250 } };
@@ -531,7 +534,7 @@ test("actual manager prepares both slow workers before retirement and discards s
     const execution = f.manager.get(f.run.run_id, { execution_id: old.execution_id });
     return execution?.entry === "step" && (execution.resident?.counters.steps ?? 0) >= 1;
   });
-  const successor = await f.manager.register(f.run.run_id, { entry: "step", name: "private global successor", card, dependencies: [],
+  const successor = await f.sources.register(f.run.run_id, { entry: "step", name: "private global successor", card, dependencies: [],
     source: `let visits=0; ${source.replace("next_state:state", "next_state:{visits:++visits,frame:frame.frame_seq}")}` });
   candidateSource = successor.source;
   const next = { ...request, skill_id: successor.skill_id, version: successor.version, start_key: "prepared-successor" };
@@ -609,13 +612,13 @@ test("dynamically invalid canonical candidate leaves the actual manager incumben
     return { ...worker, async close() { if (published.modules.find(module => module.id === "root")?.source === badSource) invalidClosed++; await worker.close(); } };
   } });
   f.running();
-  const incumbent = await f.manager.register(f.run.run_id, { entry: "step", name: "retained incumbent",
+  const incumbent = await f.sources.register(f.run.run_id, { entry: "step", name: "retained incumbent",
     source: source.replace("status:'completed'", "status:'running'"), card, dependencies: [] });
   const request = { entry: "step" as const, skill_id: incumbent.skill_id, version: incumbent.version, start_key: "invalid-incumbent",
     ...executionScopeFixture(f.run), args: null, initial_state: 0, limits: { ...DEFAULT_RESIDENT_LIMITS, duration_ms: 10000, step_ms: 250 } };
   const old = f.manager.start(f.run.run_id, request);
   await until(f.store, f.run.run_id, () => f.opened === 1);
-  const invalid = await f.manager.register(f.run.run_id, { entry: "step", name: "dynamic invalid", card, dependencies: [],
+  const invalid = await f.sources.register(f.run.run_id, { entry: "step", name: "dynamic invalid", card, dependencies: [],
     source: "export function step(frame,state,intent){return {input:null,next_state:state,status:'running',events:[]};}" });
   badSource = invalid.source;
   await expect(f.manager.retireForHandoff(f.run.run_id, { ...request, skill_id: invalid.skill_id, version: invalid.version,
@@ -634,13 +637,13 @@ test(`candidate startup failure in preparation worker ${failedFactory} preserves
     return { ...worker, async close() { if (published.modules.find(module => module.id === "root")?.source === candidateSource) candidateClosed++; await worker.close(); } };
   } });
   f.running();
-  const incumbent = await f.manager.register(f.run.run_id, { entry: "step", name: "startup incumbent",
+  const incumbent = await f.sources.register(f.run.run_id, { entry: "step", name: "startup incumbent",
     source: source.replace("status:'completed'", "status:'running'"), card, dependencies: [] });
   const request = { entry: "step" as const, skill_id: incumbent.skill_id, version: incumbent.version, start_key: "startup-incumbent",
     ...executionScopeFixture(f.run), args: null, initial_state: 0, limits: { ...DEFAULT_RESIDENT_LIMITS, duration_ms: 10000, step_ms: 250 } };
   const old = f.manager.start(f.run.run_id, request);
   await until(f.store, f.run.run_id, () => f.opened === 1);
-  const successor = await f.manager.register(f.run.run_id, { entry: "step", name: "startup successor", source, card, dependencies: [] });
+  const successor = await f.sources.register(f.run.run_id, { entry: "step", name: "startup successor", source, card, dependencies: [] });
   candidateSource = successor.source;
   await expect(f.manager.retireForHandoff(f.run.run_id, { ...request, skill_id: successor.skill_id, version: successor.version,
     start_key: "startup-successor" }, old.execution_id, undefined)).rejects.toThrow();
@@ -690,7 +693,7 @@ test(`prepared clean workers close on ${race} races without a second owner`, asy
   }
   if (race === "source") {
     (await f.manager.retireForHandoff(f.run.run_id, next, old.execution_id, undefined))();
-    const other = await f.manager.register(f.run.run_id, { entry: "step", name: "mismatched ready source", source, card, dependencies: [] });
+    const other = await f.sources.register(f.run.run_id, { entry: "step", name: "mismatched ready source", source, card, dependencies: [] });
     expect(() => f.manager.start(f.run.run_id, { ...next, skill_id: other.skill_id, version: other.version })).toThrow();
   }
   await prepared.close();
@@ -737,7 +740,7 @@ test("resident prepared continuation cannot start until actual native retirement
     admit: async (request, permit) => { permit.assertCurrent(); return f.manager.start(f.run.run_id, request); },
     evidence: (type, details) => { f.store.event(f.run.run_id, type, type, details); }, wake: () => {},
   });
-  const next = await f.manager.register(f.run.run_id, { entry: "run", name: "prepared follow-up",
+  const next = await f.sources.register(f.run.run_id, { entry: "run", name: "prepared follow-up",
     source: 'return {status:"completed",summary:"Follow-up",result:null};', card, dependencies: [] });
   f.hold();
   const root = f.start({ after_ms: 0, reason: "Prepare while resident runs",
@@ -819,9 +822,9 @@ test("session children cap finite invocation limits without shrinking aggregate 
       return { status: "completed", summary: "Finite child settled", result: null };
     },
   });
-  const child = await f.manager.register(f.run.run_id, { entry: "run", name: "bounded child",
+  const child = await f.sources.register(f.run.run_id, { entry: "run", name: "bounded child",
     source: 'return {status:"completed",summary:"Child",result:null};', card, dependencies: [] });
-  const parent = await f.manager.register(f.run.run_id, { entry: "step", name: "session budget owner",
+  const parent = await f.sources.register(f.run.run_id, { entry: "step", name: "session budget owner",
     source, card, dependencies: [{ skill_id: child.skill_id, version: child.version }] });
   const session = controlSessionConfigSchema.parse({ schema_version: 1 });
   f.hold();
@@ -890,7 +893,7 @@ test("SkillManager preserves remaining analysis compute after failed evaluation 
   }, { max_analysis_ms: 20, analysis_job_ms: 20 });
   cleanup.unshift(async () => { removal.resolve(); });
   f.running(); const execution = f.start(); await f.firstStep.promise;
-  const analysis = await f.manager.register(f.run.run_id, { entry: "analyze", name: "analysis", source: "export function analyze(input) { return input; }", card, dependencies: [] });
+  const analysis = await f.sources.register(f.run.run_id, { entry: "analyze", name: "analysis", source: "export function analyze(input) { return input; }", card, dependencies: [] });
   const ref = { skill_id: analysis.skill_id, version: analysis.version, hash: analysis.hash };
   const first = f.manager.analyzeResident(f.run.run_id, execution.execution_id, ref, { value: 1 }, 0);
   void first.then(() => { settled = true; });

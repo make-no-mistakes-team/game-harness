@@ -9,6 +9,7 @@ import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import type { SkillExecutionView, SkillRef } from "../src/shared/programs.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { SkillManager } from "../src/server/skills.ts";
+import { SourcePrograms } from "../src/server/source-programs.ts";
 import {
   HISTORICAL_PROGRAM_COMPATIBILITY_V3,
   ExperienceLibrary,
@@ -110,41 +111,19 @@ function fixture() {
     "Explicit native descriptor fixture",
     jsonSchema.parse(currentCompatibility),
   );
-  const manager = new SkillManager(
-    store,
-    {
-      runSkill: async () => ({
-        status: "completed",
-        summary: "Fixture",
-        result: null,
-      }),
-    },
-    {
-      authorize: () => {},
-      adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
-      observe: async () => observation(run),
-      action: async () => ({
-        status: "unknown",
-        summary: "Not called",
-        evidence: null,
-      }),
-      queryCapability: async () => null,
-      cancelActions: async () => {},
-      changed: () => {},
-      unsafe: () => {},
-      recover: async () => { throw new Error("Fixture does not authorize respawn"); },
-    },
-  );
+  const sources = new SourcePrograms(store, {
+    adapter: () => adapter, binding: () => minecraftTestBinding(adapter),
+  });
   resources.push({ directory, store, library });
-  return { directory, store, library, run, manager };
+  return { directory, store, library, run, sources };
 }
 async function authored(
-  manager: SkillManager,
+  sources: SourcePrograms,
   run: StoredRun,
   name = "fixture",
   dependencies: SkillRef[] = [],
 ) {
-  return await manager.register(run.run_id, { entry: "run",
+  return await sources.register(run.run_id, { entry: "run",
     name,
     source:
       'const state = await game.observe(); return {status:"completed",summary:"Current observation",result:state.data.player.position.x};',
@@ -240,8 +219,8 @@ function declaration(
 }
 
 test("self-report and confirmed movement do not qualify as verified inventory effectiveness", async () => {
-  const { store, library, run, manager } = fixture();
-  const skill = await authored(manager, run),
+  const { store, library, run, sources } = fixture();
+  const skill = await authored(sources, run),
     view = execution(store, run, skill);
   action(store, run, view, {
     effect_confirmed: true,
@@ -267,9 +246,9 @@ test("self-report and confirmed movement do not qualify as verified inventory ef
 
 for (const producer of ["crafting", "trading", "anvil"] as const) {
   test(`craft qualification attributes GUI ${producer} through actual production rather than transferred possession`, async () => {
-    const { store, library, run, manager } = fixture();
+    const { store, library, run, sources } = fixture();
     run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!; store.saveRun(run);
-    const owner = execution(store, run, await authored(manager, run));
+    const owner = execution(store, run, await authored(sources, run));
     const gui = action(store, run, owner, { effect_confirmed: true, gui_transactions: [{
       kind: "gui_transaction", mechanism: "visible_gui", operation_index: 0, receipt_ref: "server:1:9",
       input_application: "confirmed", effect_status: "confirmed", inventory_before: {}, inventory_after: {},
@@ -291,9 +270,9 @@ for (const producer of ["crafting", "trading", "anvil"] as const) {
 
 for (const validReceipt of [true, false]) {
   test(`craft-sequence qualification ${validReceipt ? "credits confirmed stages" : "rejects mismatched stage quantities"}`, async () => {
-    const { store, library, run, manager } = fixture();
+    const { store, library, run, sources } = fixture();
     run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!; store.saveRun(run);
-    const owner = execution(store, run, await authored(manager, run));
+    const owner = execution(store, run, await authored(sources, run));
     const stage = (stage_index: number, item: string, executions: number, output_per_execution: number,
       inventory_before: Record<string, number>, inventory_after: Record<string, number>) => ({
       stage_index, item, executions, output_per_execution, completed_executions: executions, confirmed_executions: executions,
@@ -319,7 +298,7 @@ for (const validReceipt of [true, false]) {
 }
 
 test("confirmed GUI transfer qualifies inventory gain without being relabelled as helper production", async () => {
-  const { store, library, run, manager } = fixture(), owner = execution(store, run, await authored(manager, run));
+  const { store, library, run, sources } = fixture(), owner = execution(store, run, await authored(sources, run));
   const transfer = action(store, run, owner, { effect_confirmed: true, gui_transactions: [{
     kind: "gui_transaction", mechanism: "visible_gui", operation_index: 0, receipt_ref: "server:1:10",
     input_application: "confirmed", effect_status: "confirmed", inventory_before: {}, inventory_after: { stone: 2 }, productions: [],
@@ -333,9 +312,9 @@ test("confirmed GUI transfer qualifies inventory gain without being relabelled a
 
 for (const retained of ["matching", "tampered", "missing"] as const) {
   test(`retained GUI crafting ${retained} receipt links only actual server-confirmed production`, async () => {
-    const { store, run, manager } = fixture();
+    const { store, run, sources } = fixture();
     run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!; store.saveRun(run);
-    const owner = execution(store, run, await authored(manager, run));
+    const owner = execution(store, run, await authored(sources, run));
     const request: GameAction = { kind: "screen_input", screen: { screen_id: "view", incarnation: 1, layout_revision: 1 },
       operations: [{ kind: "slot", slot_id: 0, button: "left", mode: "ordinary", hotbar_slot: null,
         expected_cursor: { item: null, count: 0 }, expected_slots: [{ slot_id: 0, value: { item: "crafting_table", count: 1 } }] }] };
@@ -378,9 +357,9 @@ for (const retained of ["matching", "tampered", "missing"] as const) {
 
 for (const boundary of ["matching", "different retained input", "no retained receipt"] as const) {
   test(`resident ${boundary} links a confirmed GUI prefix without inventing a finite action`, async () => {
-    const { directory, store, run, manager } = fixture();
+    const { directory, store, run, sources } = fixture();
     run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!; store.saveRun(run);
-    const skill = await manager.register(run.run_id, { entry: "step", name: "resident-prefix",
+    const skill = await sources.register(run.run_id, { entry: "step", name: "resident-prefix",
       source: "export function step(frame,state,intent) { return null; }", card, dependencies: [] });
     const owner = store.admitSkill(run.run_id, { entry: "step", skill_id: skill.skill_id, version: skill.version,
       start_key: crypto.randomUUID(), ...executionScopeFixture(run), args: null, initial_state: null, limits: { ...DEFAULT_RESIDENT_LIMITS } }).view;
@@ -429,10 +408,10 @@ for (const boundary of ["matching", "different retained input", "no retained rec
 
 for (const boundary of ["matching", "no prefix", "source mismatch", "origin mismatch", "unrelated prefix"] as const) {
   test(`retained unknown GUI action ${boundary} preserves only its own confirmed crafting prefix association`, async () => {
-    const { store, run, manager } = fixture();
+    const { store, run, sources } = fixture();
     run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!;
     store.saveRun(run);
-    const owner = execution(store, run, await authored(manager, run));
+    const owner = execution(store, run, await authored(sources, run));
     const request: GameAction = { kind: "screen_input", screen: { screen_id: "view", incarnation: 1, layout_revision: 1 },
       operations: [
         { kind: "slot", slot_id: 0, button: "left", mode: "ordinary", hotbar_slot: null,
@@ -519,9 +498,9 @@ for (const boundary of ["matching", "no prefix", "source mismatch", "origin mism
 }
 
 test("persisted named memory revisions survive duplicate names, paging and SQLite compaction", async () => {
-  const { directory, store, library, run, manager } = fixture();
+  const { directory, store, library, run, sources } = fixture();
   const qualify = async (programName: string, memoryName: string) => {
-    const skill = await authored(manager, run, programName);
+    const skill = await authored(sources, run, programName);
     const view = execution(store, run, skill);
     action(store, run, view, { effect_confirmed: true, inventory_receipt_confirmed: true,
       inventory_before: { stone: 0 }, inventory_after: { stone: 2 } });
@@ -552,9 +531,9 @@ test("persisted named memory revisions survive duplicate names, paging and SQLit
 });
 
 test("portable exact snapshot accepts live coordinate reads but does not restore invocation coordinates", async () => {
-  const { store, library, run, manager } = fixture();
-  const child = await authored(manager, run, "child");
-  const root = await manager.register(run.run_id, { entry: "run",
+  const { store, library, run, sources } = fixture();
+  const child = await authored(sources, run, "child");
+  const root = await sources.register(run.run_id, { entry: "run",
     name: "root",
     source: `const result = await game.call({name:\"child\",version:${child.version}}, \"dependency\"); return {status:\"completed\",summary:\"Composed exact dependency\",result};`,
     card,
@@ -585,13 +564,7 @@ test("portable exact snapshot accepts live coordinate reads but does not restore
     status: "created",
   };
   store.saveRun(destination);
-  const hydrated = await library.hydrate(
-    promoted.experience_id,
-    destination.model_id,
-    destination.world_id,
-    destination.run_id,
-    manager,
-  );
+  const hydrated = await library.hydrate(promoted.experience_id, destination.model_id, destination.world_id, destination.run_id, sources);
   expect(hydrated.hash).toBe(root.hash);
   expect(hydrated.dependencies).toHaveLength(1);
   expect(hydrated.dependencies[0]?.skill_id).toBe(child.skill_id);
@@ -662,19 +635,13 @@ test("portable exact snapshot accepts live coordinate reads but does not restore
     })?.status,
   ).toBe("succeeded");
   await expect(
-    library.hydrate(
-      promoted.experience_id,
-      "other-model",
-      destination.world_id,
-      destination.run_id,
-      manager,
-    ),
+    library.hydrate(promoted.experience_id, "other-model", destination.world_id, destination.run_id, sources),
   ).rejects.toThrow();
 });
 
 test("world-bound declarations cannot masquerade as portable and world-local snapshots cannot cross worlds", async () => {
-  const { store, library, run, manager } = fixture();
-  const skill = await authored(manager, run),
+  const { store, library, run, sources } = fixture();
+  const skill = await authored(sources, run),
     view = execution(store, run, skill);
   action(store, run, view, {
     effect_confirmed: true,
@@ -703,19 +670,13 @@ test("world-bound declarations cannot masquerade as portable and world-local sna
   const otherWorld = crypto.randomUUID();
   expect(library.list(run.model_id, otherWorld)).toEqual([]);
   await expect(
-    library.hydrate(
-      local.experience_id,
-      run.model_id,
-      otherWorld,
-      run.run_id,
-      manager,
-    ),
+    library.hydrate(local.experience_id, run.model_id, otherWorld, run.run_id, sources),
   ).rejects.toThrow();
 });
 
 test("program history counts actual strategic requests separately from Jev and compactness", async () => {
-  const { store, run, manager } = fixture();
-  const skill = await authored(manager, run),
+  const { store, run, sources } = fixture();
+  const skill = await authored(sources, run),
     view = execution(store, run, skill);
   store.event(run.run_id, "model.call", "Actual strategic request", {
     request_id: "strategic-1",
@@ -802,8 +763,8 @@ test("new provider evidence never fabricates a breakdown for aggregate-only lega
 });
 
 test("authorized execution traces persist exact lineage, bounded pages and explicit payload omissions", async () => {
-  const { directory, store, run, manager } = fixture();
-  const skill = await authored(manager, run), view = execution(store, run, skill);
+  const { directory, store, run, sources } = fixture();
+  const skill = await authored(sources, run), view = execution(store, run, skill);
   const trace = new ExecutionTrace(store);
   trace.observe(view, observation(run), { call_id: "observe-1" });
   trace.record(view, "branch", { diagnostic_only: true, events: [{ point_id: 1, decision: false }] });
@@ -845,8 +806,8 @@ test("authorized execution traces persist exact lineage, bounded pages and expli
 });
 
 test("objective metrics separate removed blocks, receipted counts, measured motion and life-discontinuous samples", async () => {
-  const { store, run, manager } = fixture();
-  const skill = await authored(manager, run), view = execution(store, run, skill);
+  const { store, run, sources } = fixture();
+  const skill = await authored(sources, run), view = execution(store, run, skill);
   const trace = new ExecutionTrace(store);
   trace.observe(view, observation(run));
   const next = observation(run);
@@ -876,9 +837,9 @@ test("objective metrics separate removed blocks, receipted counts, measured moti
 });
 
 test("break_log qualification never fabricates inventory and cross-root pickup cannot qualify the removing root", async () => {
-  const { store, library, run, manager } = fixture();
+  const { store, library, run, sources } = fixture();
   run.goal = adapter.goals.find(goal => goal.goal_id === "collect_wood")!; store.saveRun(run);
-  const skill = await authored(manager, run), remover = execution(store, run, skill);
+  const skill = await authored(sources, run), remover = execution(store, run, skill);
   const look = action(store, run, remover, { effect_confirmed: true });
   const admitted = store.admitAction(run.run_id, crypto.randomUUID(), { kind: "dig", target: { target_id: "log", incarnation: 1,
     life_id: run.life_id!, space: { dimension_id: "minecraft:overworld", space_epoch: run.space_epoch! } } }, "skill", remover.execution_id, actionAuthority(run, remover));
@@ -916,10 +877,10 @@ test("break_log qualification never fabricates inventory and cross-root pickup c
 
 for (const goalId of ["break_log", "craft_crafting_table"] as const) {
   test(`versioned ${goalId} evidence resolves its retained fact to the confirmed owning receipt`, async () => {
-    const { store, run, manager } = fixture();
+    const { store, run, sources } = fixture();
     run.goal = adapter.goals.find(goal => goal.goal_id === goalId)!;
     store.saveRun(run);
-    const owner = execution(store, run, await authored(manager, run));
+    const owner = execution(store, run, await authored(sources, run));
     const request: GameAction = goalId === "break_log"
       ? { kind: "dig" as const, target: { target_id: "log", incarnation: 1, life_id: run.life_id!,
           space: { dimension_id: "minecraft:overworld", space_epoch: run.space_epoch! } } }
@@ -954,10 +915,10 @@ for (const goalId of ["break_log", "craft_crafting_table"] as const) {
 }
 
 test("combined goal resolves pre-consumption planks production separately from the final table receipt", async () => {
-  const { store, run, manager } = fixture();
+  const { store, run, sources } = fixture();
   run.goal = adapter.goals.find(goal => goal.goal_id === "collect_and_craft_table")!;
   store.saveRun(run);
-  const owner = execution(store, run, await authored(manager, run));
+  const owner = execution(store, run, await authored(sources, run));
   const produced = (item: string, before: Record<string, number>, after: Record<string, number>) => {
     const request: GameAction = { kind: "craft", item, executions: 1 };
     const admitted = store.admitAction(run.run_id, crypto.randomUUID(), request, "skill", owner.execution_id, actionAuthority(run, owner));
@@ -998,10 +959,10 @@ test("combined goal resolves pre-consumption planks production separately from t
 
 for (const invalid of ["missing retained reference", "wrong verifier version", "wrong adapter", "unconfirmed receipt"] as const) {
   test(`versioned verifier projection refuses ${invalid} instead of inventing goal attribution`, async () => {
-    const { store, run, manager } = fixture();
+    const { store, run, sources } = fixture();
     run.goal = adapter.goals.find(goal => goal.goal_id === "craft_crafting_table")!;
     store.saveRun(run);
-    const owner = execution(store, run, await authored(manager, run));
+    const owner = execution(store, run, await authored(sources, run));
     const request = { kind: "craft" as const, item: "crafting_table", executions: 1 };
     const admitted = store.admitAction(run.run_id, crypto.randomUUID(), request, "skill", owner.execution_id, actionAuthority(run, owner));
     const receipt = admitted.action.view;
@@ -1035,9 +996,9 @@ for (const invalid of ["missing retained reference", "wrong verifier version", "
 }
 
 test("historical v1 goal payload keeps its explicit receipt association without relabeling", async () => {
-  const { store, run, manager } = fixture();
+  const { store, run, sources } = fixture();
   run.goal = "collect_wood"; store.saveRun(run);
-  const owner = execution(store, run, await authored(manager, run));
+  const owner = execution(store, run, await authored(sources, run));
   const pickup = action(store, run, owner, { effect_confirmed: true, inventory_receipt_confirmed: true,
     inventory_before: { oak_log: 0 }, inventory_after: { oak_log: 1 } });
   const details = { goal: "collect_wood", item: "oak_log", action_id: pickup.action_id };
@@ -1051,8 +1012,8 @@ test("historical v1 goal payload keeps its explicit receipt association without 
 });
 
 test("custom-task typed inventory selection reaches actual qualification while preserving receipt attribution", async () => {
-  const { store, library, run, manager } = fixture();
-  const owner = execution(store, run, await authored(manager, run));
+  const { store, library, run, sources } = fixture();
+  const owner = execution(store, run, await authored(sources, run));
   const pickup = action(store, run, owner, { effect_confirmed: true, inventory_receipt_confirmed: true,
     inventory_before: { stone: 0 }, inventory_after: { stone: 2 } });
   const observed = inventoryObservation(store, run, { stone: 2 });
@@ -1065,8 +1026,8 @@ test("custom-task typed inventory selection reaches actual qualification while p
 });
 
 test("historical inventory counts remain selectable as historical data, not current adapter qualification", async () => {
-  const { store, library, run, manager } = fixture();
-  const owner = execution(store, run, await authored(manager, run));
+  const { store, library, run, sources } = fixture();
+  const owner = execution(store, run, await authored(sources, run));
   const historical = store.event(run.run_id, "observation.inventory", "Historical inventory payload", { counts: { stone: 2 } });
   finish(store, owner);
   expect(promotionEvidence(historical, { ...run, goal: "custom", native_boot_id: null, compatibility_hash: null }, owner, store.eventsAfter(run.run_id, 0, 500)))
@@ -1078,8 +1039,8 @@ test("historical inventory counts remain selectable as historical data, not curr
 
 for (const invalid of ["other run", "other life", "other boot", "dead player", "wrong schema", "out of interval"] as const) {
   test(`operator inventory candidate rejects ${invalid} before presenting typed evidence as selectable`, async () => {
-    const { store, library, run, manager } = fixture();
-    const owner = execution(store, run, await authored(manager, run));
+    const { store, library, run, sources } = fixture();
+    const owner = execution(store, run, await authored(sources, run));
     action(store, run, owner, { effect_confirmed: true, inventory_receipt_confirmed: true,
       inventory_before: { stone: 0 }, inventory_after: { stone: 2 } });
     const current = observation(run); current.observation_seq = 2;
@@ -1100,8 +1061,8 @@ for (const invalid of ["other run", "other life", "other boot", "dead player", "
 }
 
 test("death episodes and improvement decisions deduplicate and preserve exact candidate version evidence", async () => {
-  const { store, run, manager } = fixture();
-  const first = await authored(manager, run), view = execution(store, run, first);
+  const { store, run, sources } = fixture();
+  const first = await authored(sources, run), view = execution(store, run, first);
   const event = store.event(run.run_id, "fixture.authoritative_death", "Observed authoritative death");
   const episode = { death_id: "death-1", session_id: run.session_id!, life_id: run.life_id!, last_observation: observation(run), current_root_execution_id: view.execution_id, action_id: null, event_seqs: [event.event_seq] };
   store.recordDeathEpisode(run.run_id, episode); store.recordDeathEpisode(run.run_id, episode);
@@ -1116,7 +1077,7 @@ test("death episodes and improvement decisions deduplicate and preserve exact ca
   await learning.prepareFeedback(run.run_id, preparationOptions());
   expect(readImprovementFeedback(store, run.run_id).opportunities).toHaveLength(2);
   expect(store.deathEpisodesPage(run.run_id).episodes).toHaveLength(1);
-  const second = await manager.register(run.run_id, { entry: "run", name: first.name, source: 'const state = await game.observe(); return {status:"blocked",summary:"Current state reported",result:state.data.player.health};', card, dependencies: [] });
+  const second = await sources.register(run.run_id, { entry: "run", name: first.name, source: 'const state = await game.observe(); return {status:"blocked",summary:"Current state reported",result:state.data.player.health};', card, dependencies: [] });
   const before = { run_id: run.run_id, skill_id: first.skill_id, version: first.version, hash: first.hash };
   const after = { run_id: run.run_id, skill_id: second.skill_id, version: second.version, hash: second.hash };
   const undispatched = store.admitSkill(run.run_id, { entry: "run", skill_id: after.skill_id, version: after.version,
@@ -1144,8 +1105,8 @@ test("death episodes and improvement decisions deduplicate and preserve exact ca
 });
 
 test("working candidates are same-session model-scoped definitions with no invocation state and freshly validated exact imports", async () => {
-  const { store, run, manager } = fixture();
-  const skill = await authored(manager, run), view = execution(store, run, skill);
+  const { store, run, sources } = fixture();
+  const skill = await authored(sources, run), view = execution(store, run, skill);
   finish(store, view);
   const retained = store.retainWorkingPrograms(run.run_id, run.session_id!);
   expect(retained[0]?.qualification).toBe("working_candidate");
@@ -1154,14 +1115,14 @@ test("working candidates are same-session model-scoped definitions with no invoc
   expect(store.workingPrograms(run.model_id, "another-session")).toEqual([]);
   const destination: StoredRun = { ...run, run_id: crypto.randomUUID(), baseline: {} };
   store.saveRun(destination);
-  const imported = await store.hydrateWorkingPrograms(run.model_id, run.session_id!, destination.run_id, manager);
+  const imported = await store.hydrateWorkingPrograms(run.model_id, run.session_id!, destination.run_id, sources);
   expect(imported[0]?.hash).toBe(skill.hash);
   expect(imported[0]?.source).toBe(skill.source);
   expect(store.allSkillExecutions(destination.run_id)).toEqual([]);
 });
 
 test("legacy experience remains byte-identical and inspectable but cannot cross the schema2/protocol2 import fence", async () => {
-  const { directory, library, run, manager } = fixture();
+  const { directory, library, run, sources } = fixture();
   const historical = JSON.stringify({
     experience_id: "legacy-immutable", name: "Historical fixture", model_id: run.model_id,
     profile_id: "player-observable-structured", preset_id: "minecraft-observable-initial-r1",
@@ -1175,17 +1136,17 @@ test("legacy experience remains byte-identical and inspectable but cannot cross 
     db.query("INSERT INTO bundles(id,model,payload) VALUES(?,?,?)").run("legacy-immutable", run.model_id, historical);
     expect(library.inspect("legacy-immutable", run.model_id)?.compatibility).toMatchObject({ observation_schema: 1, skill_protocol: 1 });
     expect(library.list(run.model_id, run.world_id)).toEqual([]);
-    await expect(library.hydrate("legacy-immutable", run.model_id, run.world_id, run.run_id, manager)).rejects.toThrow();
+    await expect(library.hydrate("legacy-immutable", run.model_id, run.world_id, run.run_id, sources)).rejects.toThrow();
     expect(db.query<{ payload: string }, [string]>("SELECT payload FROM bundles WHERE id=?").get("legacy-immutable")?.payload).toBe(historical);
   } finally { db.close(); }
 });
 
 test("same-model comparison authorization is enforced before either foreign source is read", async () => {
-  const { store, run, manager } = fixture();
+  const { store, run, sources } = fixture();
   const foreign: StoredRun = { ...run, run_id: crypto.randomUUID(), model_id: "other-model" };
   store.saveRun(foreign);
-  const first = await authored(manager, foreign, "foreign");
-  const second = await manager.register(foreign.run_id, { entry: "run", name: first.name, source: 'return {status:"blocked",summary:"Foreign version",result:null};', card, dependencies: [] });
+  const first = await authored(sources, foreign, "foreign");
+  const second = await sources.register(foreign.run_id, { entry: "run", name: first.name, source: 'return {status:"blocked",summary:"Foreign version",result:null};', card, dependencies: [] });
   const ref = (skill: typeof first) => ({ run_id: foreign.run_id, skill_id: skill.skill_id, version: skill.version, hash: skill.hash });
   const read = store.skill.bind(store);
   let foreignReads = 0;
@@ -1197,18 +1158,18 @@ test("same-model comparison authorization is enforced before either foreign sour
 });
 
 test("fresh same-session working definitions replace stale names with a coherent exact dependency closure", async () => {
-  const { store, run, manager } = fixture();
-  const first = await authored(manager, run, "same-name");
+  const { store, run, sources } = fixture();
+  const first = await authored(sources, run, "same-name");
   store.retainWorkingPrograms(run.run_id, run.session_id!);
   const fresh: StoredRun = { ...run, run_id: crypto.randomUUID() };
   store.saveRun(fresh);
-  const dependency = await authored(manager, fresh, "fresh-dependency");
-  const replacement = await authored(manager, fresh, "same-name", [{ skill_id: dependency.skill_id, version: dependency.version }]);
+  const dependency = await authored(sources, fresh, "fresh-dependency");
+  const replacement = await authored(sources, fresh, "same-name", [{ skill_id: dependency.skill_id, version: dependency.version }]);
   expect(replacement.skill_id).not.toBe(first.skill_id);
   store.retainWorkingPrograms(fresh.run_id, fresh.session_id!);
   const next: StoredRun = { ...fresh, run_id: crypto.randomUUID() };
   store.saveRun(next);
-  const imported = await store.hydrateWorkingPrograms(next.model_id, next.session_id!, next.run_id, manager);
+  const imported = await store.hydrateWorkingPrograms(next.model_id, next.session_id!, next.run_id, sources);
   expect(imported.find((skill) => skill.name === "same-name")?.skill_id).toBe(replacement.skill_id);
   expect(store.skill(next.run_id, replacement).dependencies).toEqual([{ skill_id: dependency.skill_id, version: dependency.version }]);
   expect(store.workingPrograms(next.model_id, next.session_id!).every((candidate) => candidate.source_run_id === fresh.run_id)).toBe(true);
@@ -1216,8 +1177,8 @@ test("fresh same-session working definitions replace stale names with a coherent
 });
 
 test("radian observation rotation uses shortest yaw across the pi seam", async () => {
-  const { store, run, manager } = fixture();
-  const skill = await authored(manager, run), view = execution(store, run, skill), trace = new ExecutionTrace(store);
+  const { store, run, sources } = fixture();
+  const skill = await authored(sources, run), view = execution(store, run, skill), trace = new ExecutionTrace(store);
   const first = observation(run); first.data.player.yaw = 3 * Math.PI / 4;
   const second = observation(run); second.observation_seq++; second.data.player.yaw = -3 * Math.PI / 4; second.data.player.pitch = Math.PI / 4;
   trace.observe(view, first); trace.observe(view, second);
@@ -1225,8 +1186,8 @@ test("radian observation rotation uses shortest yaw across the pi seam", async (
 });
 
 test("death snapshot and detection event roll back together and commit before observers run", async () => {
-  const { directory, store, run, manager } = fixture();
-  const skill = await authored(manager, run), view = execution(store, run, skill);
+  const { directory, store, run, sources } = fixture();
+  const skill = await authored(sources, run), view = execution(store, run, skill);
   const db = new Database(join(directory, "runs", "runs.sqlite"));
   const episode = { death_id: "transactional-death", session_id: run.session_id!, life_id: run.life_id!, last_observation: observation(run), current_root_execution_id: view.execution_id, action_id: null, event_seqs: [] };
   try {
@@ -1253,8 +1214,8 @@ test("death snapshot and detection event roll back together and commit before ob
 });
 
 test("known branch losses and unknown abrupt tails mark diagnostics incomplete without discarding real effects", async () => {
-  const { store, run, manager } = fixture();
-  const skill = await authored(manager, run), view = execution(store, run, skill), trace = new ExecutionTrace(store);
+  const { store, run, sources } = fixture();
+  const skill = await authored(sources, run), view = execution(store, run, skill), trace = new ExecutionTrace(store);
   action(store, run, view, { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: { stone: 1 } });
   trace.record(view, "branch", { diagnostic_only: true, events: [], omitted: 3, tail_incomplete: false, loss_reason: null });
   let metric = objectiveMetrics(store, run.run_id)[0]!;
@@ -1269,8 +1230,8 @@ test("known branch losses and unknown abrupt tails mark diagnostics incomplete w
 });
 
 test("trace paging reserves the final false envelope byte at the exact 64 KiB boundary", async () => {
-  const { store, run, manager } = fixture();
-  const skill = await authored(manager, run), view = execution(store, run, skill), trace = new ExecutionTrace(store);
+  const { store, run, sources } = fixture();
+  const skill = await authored(sources, run), view = execution(store, run, skill), trace = new ExecutionTrace(store);
   trace.record(view, "capability_result", { text: "x".repeat(22000) });
   trace.record(view, "capability_result", { text: "x".repeat(22000) });
   const seed = trace.record(view, "capability_result", { text: "" })!;
@@ -1295,8 +1256,8 @@ test("trace paging reserves the final false envelope byte at the exact 64 KiB bo
 });
 
 test("feedback omission metadata cannot overfill a nearly full metrics page", async () => {
-  const { store, run, manager } = fixture();
-  const skill = await authored(manager, run);
+  const { store, run, sources } = fixture();
+  const skill = await authored(sources, run);
   const first = execution(store, run, skill), second = execution(store, run, skill), oversized = execution(store, run, skill);
   const counts = (length: number) => Object.fromEntries(Array.from({ length }, (_, index) => [`fixture_item_${index}`, 1]));
   action(store, run, first, { effect_confirmed: true, inventory_receipt_confirmed: true, inventory_before: {}, inventory_after: counts(1000) });
@@ -1390,8 +1351,8 @@ test("feedback omission metadata cannot overfill a nearly full metrics page", as
 }, 180_000);
 
 test("durable latest-root lookup survives more than 100 sequential children without expanding presentation snapshots", async () => {
-  const { store, run, manager } = fixture();
-  const skill = await authored(manager, run), root = execution(store, run, skill);
+  const { store, run, sources } = fixture();
+  const skill = await authored(sources, run), root = execution(store, run, skill);
   for (let index = 0; index < 101; index++) {
     const child = store.admitSkill(run.run_id, { entry: "run",
       skill_id: skill.skill_id, version: skill.version, start_key: `child-${index}`,
@@ -1421,13 +1382,13 @@ test("durable latest-root lookup survives more than 100 sequential children with
 });
 
 test("invalid decision/revision pairs reject actionably without a record before an explicit candidate-experiment correction", async () => {
-  const { store, library, run, manager } = fixture();
-  const first = await authored(manager, run), firstExecution = execution(store, run, first);
+  const { store, library, run, sources } = fixture();
+  const first = await authored(sources, run), firstExecution = execution(store, run, first);
   finish(store, firstExecution);
   const learning = learningFixture(store);
   await learning.prepareFeedback(run.run_id, preparationOptions());
   const opportunity = readImprovementFeedback(store, run.run_id).opportunities.find((value) => value.execution_id === firstExecution.execution_id)!;
-  const second = await manager.register(run.run_id, { entry: "run",
+  const second = await sources.register(run.run_id, { entry: "run",
     name: first.name,
     source: 'const state = await game.observe(); return {status:"completed",summary:"Candidate observation experiment",result:state.data.player.health};',
     card, dependencies: [],

@@ -83,9 +83,11 @@ export class HistoryReader implements HistoryQueryClient {
   constructor(location: StoreReadLocation) {
     if (!location || typeof location.database !== "string" || !location.database ||
       typeof location.artifacts !== "string" || !location.artifacts ||
-      location.database.includes("\0") || location.artifacts.includes("\0"))
+      location.database.includes("\0") || location.artifacts.includes("\0") ||
+      (location.projection !== undefined && (typeof location.projection !== "string" || !location.projection || location.projection.includes("\0"))))
       throw new HistoryReaderError("invalid_location", "History requires fixed database and artifact locations");
-    this.#location = Object.freeze({ database: path.resolve(location.database), artifacts: path.resolve(location.artifacts) });
+    this.#location = Object.freeze({ database: path.resolve(location.database), artifacts: path.resolve(location.artifacts),
+      ...(location.projection === undefined ? {} : { projection: path.resolve(location.projection) }) });
   }
 
   snapshot(): HistoryReaderSnapshot {
@@ -214,7 +216,8 @@ export class HistoryReader implements HistoryQueryClient {
   }
 
   #start(): OwnedChild {
-    const processChild = spawn(process.execPath, ["--no-env-file", workerPath, this.#location.database, this.#location.artifacts], {
+    const processChild = spawn(process.execPath, ["--no-env-file", workerPath, this.#location.database, this.#location.artifacts,
+      ...(this.#location.projection === undefined ? [] : [this.#location.projection])], {
       cwd: path.dirname(workerPath),
       // No inherited HOME, credential, proxy, NODE_OPTIONS, BUN_OPTIONS or preload configuration.
       env: { LANG: "C.UTF-8", LC_ALL: "C.UTF-8", TZ: "UTC" },

@@ -1135,7 +1135,7 @@ test("failed publication rolls back opportunity, derived writes and checkpoint; 
   expect(feedback.has_more).toBe(false);
   await f.reopen();
   closeUnknown(f, owner);
-  const database = new Database(f.store.readLocation().database);
+  const database = new Database(f.store.readLocation().projection!);
   let failed: HistoryProjectionBatch | undefined;
   try {
     database.exec(`CREATE TRIGGER incremental_objective_publish_fault AFTER INSERT ON evidence_objects

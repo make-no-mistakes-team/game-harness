@@ -16,6 +16,7 @@ import type { AuthManager } from "../src/server/auth.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { SkillManager } from "../src/server/skills.ts";
+import { SourcePrograms } from "../src/server/source-programs.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { StrategicPlanner, type StrategicRequestAdmission } from "../src/server/strategic.ts";
@@ -198,7 +199,10 @@ for (const selectedKind of ["lookahead", "attention"] as const) {
       }, unsafe: () => { f.state.pauses.push("Unconfirmed cleanup"); },
     });
     managers.push(manager);
-    const program = await manager.register(f.run.run_id, { entry: "run", name: "Neutral continued program", source: 'await game.action({kind:"look",yaw:0,pitch:0}); await game.action({kind:"look",yaw:1,pitch:0}); return {status:"completed",summary:"Neutral flow settled",result:null};',
+    const sources = new SourcePrograms(f.store, { adapter: () => f.adapter, binding: () => minecraftTestBinding(f.adapter),
+      changed: () => { f.state.pending = manager.pending; const root = f.store.latestRootExecution(f.run.run_id);
+        if (root) f.basis.root = { execution_id: root.execution_id, skill_id: root.skill_id, version: root.version, hash: f.store.skill(f.run.run_id, root).hash, status: root.status }; } });
+    const program = await sources.register(f.run.run_id, { entry: "run", name: "Neutral continued program", source: 'await game.action({kind:"look",yaw:0,pitch:0}); await game.action({kind:"look",yaw:1,pitch:0}); return {status:"completed",summary:"Neutral flow settled",result:null};',
       card: { purpose: "Measure selected attention", applicability: "Neutral fixture", method: "Two authorized capabilities", reason: "Prove root handoff", limitations: "No gameplay claim" }, dependencies: [] });
     const root = manager.start(f.run.run_id, { entry: "run", skill_id: program.skill_id, version: program.version, start_key: "continued", ...executionScopeFixture(f.run), args: null,
       limits: { duration_ms: 10000, max_actions: 2, max_calls: 2, max_depth: 1 },
@@ -346,7 +350,7 @@ test("ordinary authoring shares one root budget across wakes, leaf admissions an
   const f = await setup(async (_context, agent) => {
     prompts++;
     expect(await agent.call()).toBe(true);
-    expect(agent.catalog().sort()).toEqual(["help", "observe", "program_inspect", "program_write"]);
+    expect(agent.catalog().sort()).toEqual(["help", "observe", "program_edit", "program_inspect", "program_write"]);
     expect(await agent.tool("program_write")).toBe(true);
     for (const forbidden of ["program_submit", "program_run", "prepare_next", "task_finish", "reflex", "memory", "program_review"])
       expect(await agent.tool(forbidden)).toBe(false);
@@ -583,7 +587,7 @@ test(`real SDK ${decision} consumes one attention decision after reads and leaf 
     const index = requests++ - (budget === "exhausted" ? 3 : 0);
     if (index >= 0 && index <= 4) expect(context.tools?.some(tool => tool.name === "program_run")).toBe(true);
     else {
-      expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_inspect", "program_write"]);
+      expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_edit", "program_inspect", "program_write"]);
       expect(f.planner.toolRole()).toBe("authoring");
     }
     const name = index < 0 ? "program_inspect" : index === 0 || index === 4 ? "program_run" : index === 1 ? "help"
@@ -1251,7 +1255,7 @@ test("the real SDK continues after submit through evidence and inactive validate
   const f = await setup(async () => { throw new Error("Installed SDK owns the tool loop"); }, async (model, context) => {
     const index = requests++;
     if (index > 0) {
-      expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_inspect", "program_write"]);
+      expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_edit", "program_inspect", "program_write"]);
       const supplement = context.systemPrompt?.at(-1)!;
       expect(Buffer.byteLength(supplement)).toBeLessThanOrEqual(32768);
       const retained = JSON.parse(supplement).strategic_context;
@@ -1294,12 +1298,14 @@ test("the real SDK continues after submit through evidence and inactive validate
     changed: () => { f.state.pending = manager.pending; }, unsafe: () => { throw new Error("Unexpected cleanup uncertainty"); },
   });
   managers.push(manager);
+  const sources = new SourcePrograms(f.store, { adapter: () => f.adapter, binding: () => minecraftTestBinding(f.adapter),
+    changed: () => { f.state.pending = manager.pending; } });
   const foreground = 'await game.action({kind:"look",yaw:0,pitch:0}); await game.action({kind:"look",yaw:1,pitch:0}); return {status:"completed",summary:"Foreground fixture finished",result:null};';
   const card = { purpose: "SDK overlap regression", applicability: "Offline fixture", method: "Two bounded effects",
     reason: "Keep foreground work independent of authoring", limitations: "No native or model adoption claim" };
   const install = (name: string, execute: AgentTool["execute"]) => { f.tools.find(tool => tool.name === name)!.execute = execute; };
   install("program_submit", async () => {
-    const program = await manager.register(f.run.run_id, { entry: "run", name: "SDK foreground", source: foreground, card, dependencies: [] });
+    const program = await sources.register(f.run.run_id, { entry: "run", name: "SDK foreground", source: foreground, card, dependencies: [] });
     manager.start(f.run.run_id, { entry: "run", skill_id: program.skill_id, version: program.version,
       start_key: "sdk-foreground", ...executionScopeFixture(f.run), args: null,
       limits: { duration_ms: 10000, max_actions: 2, max_calls: 2, max_depth: 1 } });
@@ -1314,7 +1320,7 @@ test("the real SDK continues after submit through evidence and inactive validate
   install("program_inspect", async () => ({ content: [], details: { status: "running" } }));
   install("program_write", async () => {
     const permit = f.planner.speculativeToolAuthority();
-    const program = await manager.register(f.run.run_id, { entry: "run", name: "SDK inactive candidate",
+    const program = await sources.register(f.run.run_id, { entry: "run", name: "SDK inactive candidate",
       source: 'const current = await game.observe(); return {status:"blocked",summary:"Inactive authored candidate",result:{observed:current.observation_seq}};',
       dependencies: [], card }, () => permit());
     wrote = true;
@@ -1351,7 +1357,7 @@ test("real SDK publishes inactive source after root settlement without acquiring
       expect(context.tools?.some(tool => tool.name === "program_run")).toBe(true);
     }
     if (index > 0 && index < 3) {
-      expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_inspect", "program_write"]);
+      expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_edit", "program_inspect", "program_write"]);
       const user = context.messages.find(message => message.role === "user")!;
       if (user.role !== "user") throw new Error("Missing actual request projection");
       const text = typeof user.content === "string" ? user.content :
@@ -1431,7 +1437,7 @@ test(`real SDK rejects an oversized attention prefix and its completed sibling b
     }
     const message = budgetMessage(model);
     const sibling: ToolCall = { type: "toolCall", id: "completed-but-rejected-write", name: "program_write",
-      arguments: { name: "Rejected sibling", source: "return null;" } };
+      arguments: { entry: "run", name: "Rejected sibling", source: "return null;" } };
     const poison: ToolCall = { type: "toolCall", id: "oversized-attention", name: "program_run",
       arguments: { operation: "attention", after_ms: 1000, reason: "" } };
     const stream = new AssistantMessageEventStream();
@@ -1525,7 +1531,7 @@ test("real SDK budget correction cannot reset the original twelve-call allowance
 test("real SDK argument budget admits a 16KiB source, free JSON execution arguments and a bounded intentional wait", async () => {
   let requests = 0, executed = 0;
   const calls: ToolCall[] = [
-    { type: "toolCall", id: "legal-source", name: "program_write", arguments: { name: "Legal source", source: `/*${"x".repeat(16380)}*/` } },
+    { type: "toolCall", id: "legal-source", name: "program_write", arguments: { entry: "run", name: "Legal source", source: `/*${"x".repeat(16380)}*/` } },
     { type: "toolCall", id: "free-json", name: "program_run", arguments: { operation: "start", entry: "run",
       name: "Legal", version: 1, args: { ["nested free key ".repeat(100)]: "j".repeat(40000) } } },
     { type: "toolCall", id: "intentional-wait", name: "program_run",
@@ -1559,9 +1565,9 @@ test("real SDK resource corrections retain the three-call inactive authoring win
   let requests = 0;
   const f = await setup(async () => { throw new Error("Installed SDK owns inactive resource corrections"); }, async (model, context) => {
     requests++;
-    expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_inspect", "program_write"]);
+    expect(context.tools?.map(tool => tool.name).sort()).toEqual(["help", "observe", "program_edit", "program_inspect", "program_write"]);
     const message = budgetMessage(model, [{ type: "toolCall", id: `oversized-source-${requests}`, name: "program_write",
-      arguments: { name: "Overlong inactive source", source: "x".repeat(16385) } }]);
+      arguments: { entry: "run", name: "Overlong inactive source", source: "x".repeat(16385) } }]);
     const stream = new AssistantMessageEventStream();
     stream.push({ type: "start", partial: message });
     stream.push({ type: "toolcall_delta", contentIndex: 0, delta: "", partial: message });
@@ -1634,7 +1640,7 @@ test("real SDK rejects a growing unterminated root key that the parsed attention
       return stream;
     }
     const sibling: ToolCall = { type: "toolCall", id: "unfinished-key-sibling", name: "program_write",
-      arguments: { name: "No sibling publication", source: "return null;" } };
+      arguments: { entry: "run", name: "No sibling publication", source: "return null;" } };
     const call: ToolCall = { type: "toolCall", id: "unfinished-key-attention", name: "program_run", arguments: partialArguments };
     const message = budgetMessage(model, [sibling, call]);
     const stream = new AssistantMessageEventStream();

@@ -30,6 +30,7 @@ import type { AuthManager } from "./auth.ts";
 import type { SandboxService } from "./sandbox.ts";
 import type { Store, StoredRun } from "./store.ts";
 import { SkillManager } from "./skills.ts";
+import { SourcePrograms } from "./source-programs.ts";
 import { SessionEffects } from "./session-effects.ts";
 import { emptyRunUsage } from "./usage.ts";
 import {
@@ -78,6 +79,7 @@ export class Runtime {
   private readonly actorFrameSource: RuntimeOptions["actorFrames"];
   private readonly imageAuthorityWaits = new Set<() => void>();
   private readonly skills: SkillManager;
+  private readonly sources: SourcePrograms;
   private readonly sessionEffects: SessionEffects;
   private readonly experience: ExperienceLibrary | null;
   private readonly adapterSource: RuntimeOptions["adapter"];
@@ -375,6 +377,11 @@ export class Runtime {
         this.recordRepeatedNoEffect(action, result, view);
       },
     });
+    this.sources = new SourcePrograms(store, {
+      adapter: () => this.context().adapter,
+      binding: () => this.game.snapshot().binding,
+      changed: () => this.onChange(),
+    });
     this.skills = new SkillManager(store, sandbox, {
       sessionTask: (execution, request, handle, deadline, signal, frame, behaviorGeneration) =>
         this.sessionEffects.sessionTask(execution, request, handle, deadline, signal, frame, behaviorGeneration),
@@ -567,6 +574,7 @@ export class Runtime {
     this.catalog = new RuntimeTools(
       store,
       this.skills,
+      this.sources,
       this.reactions,
       this.experience,
       {
@@ -1060,7 +1068,7 @@ export class Runtime {
             parsed.model_id,
             this.run.world_id,
             this.run.run_id,
-            this.skills,
+            this.sources,
             () => {
               if (
                 generation !== this.generation ||
@@ -1097,7 +1105,7 @@ export class Runtime {
         }
       } else if (parsed.working_programs !== "fresh") {
         const generation = this.generation;
-        await this.store.hydrateWorkingPrograms(parsed.model_id, state.session_id, this.run.run_id, this.skills, () => {
+        await this.store.hydrateWorkingPrograms(parsed.model_id, state.session_id, this.run.run_id, this.sources, () => {
           if (generation !== this.generation || this.run?.status !== "created")
             throw new RuntimeFault("stale_context", "Working-program selection authority revoked");
         });
@@ -1143,7 +1151,7 @@ export class Runtime {
           });
           this.persist("Prepared authoring usage retained before source import; no effects admitted");
           current();
-          for (const source of candidate.sources) await this.skills.importSnapshot(runId, source, current);
+          for (const source of candidate.sources) await this.sources.importSnapshot(runId, source, current);
           current();
           candidate.setPhase("activating");
           const transferred = await this.begin(false, candidate);

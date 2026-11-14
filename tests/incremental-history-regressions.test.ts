@@ -357,7 +357,7 @@ for (const mutation of ["delete", "rekey", "move"] as const) {
       });
       expect((await feedback(later.next_after)).metrics).toEqual([]);
       if (mutation === "delete") {
-        const corrupt = new Database(store.readLocation().database);
+        const corrupt = new Database(store.readLocation().projection!);
         try {
           corrupt
             .query(

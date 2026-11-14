@@ -162,6 +162,7 @@ async function fixture(unconfirmedBarrier = false) {
             if (ordinal === 1) {
               const written = await invoke("program_write", {
                 name,
+                entry: "run",
                 source:
                   'const result = await game.action({kind:"look",yaw:0,pitch:0}); return {status:"blocked",summary:"Uncertain effect retained",result};',
                 card,

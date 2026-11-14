@@ -15,7 +15,6 @@ import type {
   SkillResult,
   SkillStartRequest,
   SkillView,
-  SkillDependency,
   ExecutableModuleBundle,
   ResidentSkillStartRequest,
 } from "../shared/programs.ts";
@@ -24,10 +23,9 @@ import {
   skillCapabilitySchema,
   skillStartRequestSchema,
 } from "../shared/validation.ts";
-import { programFingerprint, validateSkill } from "./program-validation.ts";
-import { buildExecutableModuleBundle, resolveProgramModuleClosure } from "./program-modules.ts";
+import { buildExecutableModuleBundle } from "./program-modules.ts";
+import { assertSourceCompatible, assertSourceDependencies } from "./source-programs.ts";
 import type { EffectContext, EffectInvocation, EffectScope } from "../shared/control.ts";
-import { assertExecutableCompatible } from "./effect-contract.ts";
 import { RegisteredAdapterContract } from "./registered-adapter.ts";
 import { MAX_SKILL_LIMITS, SKILL_API_VERSION } from "../shared/programs.ts";
 import { ResidentWorkerFault, SkillCleanupError, type SandboxService } from "./sandbox.ts";
@@ -160,13 +158,7 @@ export class SkillManager {
     return { adapter, binding, registration, descriptor: adapter.descriptor, schemas: adapter.schemas };
   }
   private compatible(skill: SkillView): void {
-    const context = this.context(), validation = assertExecutableCompatible(skill.validation, context.binding);
-    const features = skill.validation.runtime_features;
-    if ((features !== undefined && (features.length > 2 || new Set(features).size !== features.length ||
-      features.some(feature => feature !== "pure_modules_v1" && feature !== "motion_track_v1"))) ||
-      !skill.entry || validation.fingerprint !== programFingerprint(skill.hash, skill.entry === "run" ? "skill" : skill.entry,
-        context.binding.compatibility_hash, undefined, features))
-      throw new RuntimeFault("precondition_failed", "Cached source validation is incompatible; retain history and create a fresh immutable revision");
+    assertSourceCompatible(skill, this.context().binding);
   }
   effectScope(executionId: string): EffectScope | null {
     const live = this.live.get(executionId);
@@ -175,124 +167,6 @@ export class SkillManager {
   }
   invocation(executionId: string): EffectInvocation | null {
     return this.effectScope(executionId) ? this.live.get(executionId)!.invocation : null;
-  }
-  async register(
-    runId: string,
-    spec: unknown,
-    beforeCommit: () => void = () => {},
-    registration?: { call_id: string; input: Json },
-  ): Promise<SkillView> {
-    if (registration) {
-      const previous = this.store.completedToolCall(runId, registration.call_id, registration.input);
-      if (previous !== null) return this.store.skill(runId, previous as unknown as SkillRef);
-    }
-    return this.timeSource(runId, registration?.call_id ?? null, async timing => {
-      const validated = await validateSkill(spec, this.context());
-      this.validateDependencies(runId, validated.dependencies);
-      if (validated.entry === "run" && validated.dependencies.some(dependency => this.store.skill(runId, dependency).entry !== "run"))
-        throw new RuntimeFault("precondition_failed", "Async run dependencies can only name semantic run children");
-      if (validated.entry !== "run") resolveProgramModuleClosure(this.store, runId, {
-        ...validated, hash: createHash("sha256").update(validated.source).digest("hex"),
-      });
-      timing.validatedAt = performance.now();
-      const published = await this.store.registerSkill(runId, validated, registration, beforeCommit);
-      timing.published = published;
-      timing.publishedAt = performance.now();
-      this.host.changed(false);
-      return published;
-    });
-  }
-  private async timeSource(
-    runId: string,
-    toolCallId: string | null,
-    perform: (timing: { validatedAt: number | null; publishedAt: number | null; published: SkillView | null }) => Promise<SkillView>,
-  ): Promise<SkillView> {
-    const started = performance.now(), validationId = randomUUID();
-    const timing: { validatedAt: number | null; publishedAt: number | null; published: SkillView | null } = {
-      validatedAt: null, publishedAt: null, published: null,
-    };
-    try {
-      return await perform(timing);
-    } finally {
-      const ended = performance.now();
-      this.store.event(runId, "program.source_timing", "Source validation and publication timing; no execution or efficacy claim", {
-        validation_id: validationId, tool_call_id: toolCallId,
-        clock_id: HOST_MONOTONIC_CLOCK_ID, clock: "same_process_monotonic",
-        started_monotonic_ms: started, ended_monotonic_ms: ended,
-        validation_finished_monotonic_ms: timing.validatedAt, published_monotonic_ms: timing.publishedAt,
-        duration_ms: ended - started, validation_succeeded: timing.validatedAt !== null,
-        source_published: timing.published !== null, source_hash: timing.published?.hash ?? null,
-        skill_id: timing.published?.skill_id ?? null, version: timing.published?.version ?? null,
-      });
-    }
-  }
-  async importSnapshot(
-    runId: string,
-    snapshot: SkillView,
-    beforeCommit: () => void = () => {},
-  ): Promise<SkillView> {
-    return this.timeSource(runId, null, async timing => {
-      this.compatible(snapshot);
-      const validated = await validateSkill({
-        entry: snapshot.entry,
-        name: snapshot.name,
-        source: snapshot.source,
-        card: snapshot.card,
-        dependencies: snapshot.dependencies,
-      }, this.context());
-      if (
-        validated.source !== snapshot.source ||
-        createHash("sha256").update(snapshot.source).digest("hex") !==
-          snapshot.hash
-      )
-        throw new Error(
-          "Exact snapshot bytes do not match current canonical validation",
-        );
-      if (validated.validation.fingerprint !== snapshot.validation.fingerprint)
-        throw new Error(
-          "Snapshot validator configuration changed; fresh evidence requires a validated revision",
-        );
-      this.validateDependencies(runId, snapshot.dependencies);
-      if (snapshot.entry === "run" && snapshot.dependencies.some(dependency => this.store.skill(runId, dependency).entry !== "run"))
-        throw new RuntimeFault("precondition_failed", "Async run dependencies can only name semantic run children");
-      if (snapshot.entry !== "run") resolveProgramModuleClosure(this.store, runId, snapshot);
-      timing.validatedAt = performance.now();
-      const view = await this.store.importSkill(runId, snapshot, beforeCommit);
-      timing.published = view;
-      timing.publishedAt = performance.now();
-      this.store.event(
-        runId,
-        "skill.revalidated_import",
-        "Exact portable snapshot freshly validated without rewriting dependency references",
-        {
-          skill_id: view.skill_id,
-          version: view.version,
-          hash: view.hash,
-          validation: validated.validation as unknown as Json,
-        },
-      );
-      this.host.changed(false);
-      return view;
-    });
-  }
-  private validateDependencies(runId: string, dependencies: SkillDependency[]): void {
-    const visited = new Map<string, number>();
-    const visit = (ref: SkillRef, depth: number): void => {
-      if (depth > 8) throw new Error("Dependency depth exceeds eight");
-      const key = `${ref.skill_id}:${ref.version}`;
-      if ((visited.get(key) ?? 0) >= depth) return;
-      visited.set(key, depth);
-      const dependency = this.store.skill(runId, ref);
-      this.compatible(dependency);
-      if (dependency.state !== "validated")
-        throw new Error("Dependency is not validated");
-      if (dependency.validation.runtime_version !== SKILL_API_VERSION)
-        throw new RuntimeFault("precondition_failed", "Dependency uses an incompatible skill API; retained source is inspectable but cannot execute");
-      if (createHash("sha256").update(dependency.source).digest("hex") !== dependency.hash)
-        throw new RuntimeFault("stale_context", "Dependency bytes do not match the immutable source hash");
-      for (const nested of dependency.dependencies) visit(nested, depth + 1);
-    };
-    for (const dependency of dependencies) visit(dependency, 2);
   }
   start(runId: string, request: SkillStartRequest): SkillExecutionView {
     return this.startRoot(runId, request);
@@ -565,7 +439,7 @@ export class SkillManager {
     if (skill.state !== "validated") throw new Error("Skill is not validated");
     if (skill.validation.runtime_version !== SKILL_API_VERSION)
       throw new RuntimeFault("precondition_failed", "Program uses an incompatible skill API; retained source is inspectable but cannot execute");
-    this.validateDependencies(runId, skill.dependencies);
+    assertSourceDependencies(this.store, runId, skill.dependencies, dependency => this.compatible(dependency));
     const bundle = parsed.entry === "step" ? buildExecutableModuleBundle(this.store, runId, skill) : undefined;
     if (parsed.entry === "run" && skill.dependencies.some(dependency => dependency.import_path !== undefined ||
       this.store.skill(runId, dependency).entry !== "run"))

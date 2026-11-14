@@ -7,6 +7,7 @@ import type { ImprovementOpportunity, ProgramVersionEvidence, ReadonlyDeathEpiso
 import { SKILL_API_VERSION, type SkillExecutionView, type SkillRef, type SkillView } from "../shared/programs.ts";
 import type { StoredAction, StoredRun } from "./store.ts";
 import { StoreDatabase, STORE_OPPORTUNITY_INDEXES, STORE_SCHEMA_VERSION } from "./store-database.ts";
+import { requireProjectionBinding } from "./projection-storage.ts";
 import {
   HISTORY_SOURCE_INDEXES, HISTORY_SOURCE_KINDS, HISTORY_SOURCE_TRIGGERS,
   type HistorySourceChanges, type HistorySourceKind, type HistorySourcePage, type HistorySourceRecord,
@@ -18,6 +19,8 @@ import { assertProjectionCheckpoint, HISTORY_PROJECTION_SCHEMA_SQL, PROJECTION_C
 export interface StoreReadLocation {
   database: string;
   artifacts: string;
+  /** Required for separated current stores; omitted only for frozen combined v7 stores. */
+  projection?: string;
 }
 
 interface EventRow {
@@ -76,14 +79,18 @@ const LATEST_OPPORTUNITY_FAMILY_SQL = opportunityLookupSql(OPPORTUNITY_FAMILY_KE
 
 export class StoreReadQueries {
   readonly #readDb: ReadDatabase;
+  #projectionDb: ReadDatabase;
   readonly #readArtifactDir: string;
   readonly #historySources: HistorySourceReadQueries;
 
-  protected constructor(readDb: ReadDatabase, readArtifactDir: string) {
+  protected constructor(readDb: ReadDatabase, readArtifactDir: string, projectionDb: ReadDatabase = readDb) {
     this.#readDb = readDb;
+    this.#projectionDb = projectionDb;
     this.#readArtifactDir = readArtifactDir;
     this.#historySources = new HistorySourceReadQueries(readDb);
   }
+
+  protected useProjectionDatabase(database: ReadDatabase): void { this.#projectionDb = database; }
 
   /** Internal source generation; unrelated to public feedback and event cursors. */
   historySourceHighwater(runId: string): number {
@@ -108,7 +115,7 @@ export class StoreReadQueries {
   }
 
   historyProjectionCheckpoint(runId: string): ProjectionCheckpoint | null {
-    const row = this.#readDb.query<{ payload: string }, [string]>("SELECT payload FROM history_projection_checkpoints WHERE run_id=?").get(runId);
+    const row = this.#projectionDb.query<{ payload: string }, [string]>("SELECT payload FROM history_projection_checkpoints WHERE run_id=?").get(runId);
     if (!row) return null;
     const checkpoint = JSON.parse(row.payload) as ProjectionCheckpoint;
     assertProjectionCheckpoint(checkpoint);
@@ -117,14 +124,15 @@ export class StoreReadQueries {
 
   historyProjectionGeneration(runId: string, generation?: number): ProjectionGeneration | null {
     if (generation !== undefined && (!Number.isSafeInteger(generation) || generation < 0)) throw new Error("Invalid history generation");
-    return this.#readDb.transaction(() => {
+    return this.#projectionDb.transaction(() => {
       const checkpoint = this.historyProjectionCheckpoint(runId);
       if (!checkpoint) return null;
-      const row = this.#readDb.query<{ generation: number; revision: number; source_through: number; metric_change_seq: number }, [string, number]>(
+      const row = this.#projectionDb.query<{ generation: number; revision: number; source_through: number; metric_change_seq: number }, [string, number]>(
         "SELECT generation,revision,source_through,metric_change_seq FROM history_projection_generations WHERE run_id=? AND generation=?",
       ).get(runId, generation ?? checkpoint.generation);
       if (!row) return null;
       const source_available = this.historySourceHighwater(runId);
+      if (row.source_through > source_available) throw new Error("Projection generation exceeds its bound source ledger");
       return { ...row, source_available, has_pending: checkpoint.phase !== "idle" || row.source_through < source_available,
         opportunity_change_seq: this.historyOpportunityVisibleThrough(runId, checkpoint.generation) };
     }).deferred();
@@ -153,7 +161,7 @@ export class StoreReadQueries {
 
   historyProjectionRow(runId: string, revision: number, collection: ProjectionCollection, key: string): ProjectionRow | null {
     if (!Number.isSafeInteger(revision) || revision < 0 || !PROJECTION_COLLECTIONS.includes(collection) || typeof key !== "string") throw new Error("Invalid projection exact key");
-    const row = this.#readDb.query<{ collection: ProjectionCollection; object_key: string; owner_id: string | null; source_id: string | null; order_seq: number; tag: string | null; payload: string | null; deleted: number }, [string, string, string, number]>(
+    const row = this.#projectionDb.query<{ collection: ProjectionCollection; object_key: string; owner_id: string | null; source_id: string | null; order_seq: number; tag: string | null; payload: string | null; deleted: number }, [string, string, string, number]>(
       "SELECT collection,object_key,owner_id,source_id,order_seq,tag,payload,deleted FROM history_projection_rows WHERE run_id=? AND collection=? AND object_key=? AND revision<=? ORDER BY revision DESC LIMIT 1",
     ).get(runId, collection, key, revision);
     if (!row || row.deleted) return null;
@@ -165,7 +173,7 @@ export class StoreReadQueries {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128 || !Number.isSafeInteger(offset) || offset < 0) throw new Error("Invalid projection page bounds");
     const { where, bindings } = this.historyProjectionSelection(runId, revision, query);
     const direction = query.descending ? "DESC" : "ASC";
-    const rows = this.#readDb.query<{ collection: ProjectionCollection; object_key: string; owner_id: string | null; source_id: string | null; order_seq: number; tag: string | null; payload: string }>(
+    const rows = this.#projectionDb.query<{ collection: ProjectionCollection; object_key: string; owner_id: string | null; source_id: string | null; order_seq: number; tag: string | null; payload: string }>(
       `SELECT r.collection,r.object_key,r.owner_id,r.source_id,r.order_seq,r.tag,r.payload FROM history_projection_rows r WHERE ${where} ORDER BY r.order_seq ${direction},r.object_key COLLATE BINARY ${direction} LIMIT ? OFFSET ?`,
     ).all(...bindings, limit, offset);
     return rows.map(row => ({ collection: row.collection, key: row.object_key, owner_id: row.owner_id, source_id: row.source_id, order_seq: row.order_seq, tag: row.tag, value: JSON.parse(row.payload) as Json }));
@@ -173,32 +181,32 @@ export class StoreReadQueries {
 
   historyProjectionCount(runId: string, revision: number, query: ProjectionQuery): number {
     const { where, bindings } = this.historyProjectionSelection(runId, revision, query);
-    return this.#readDb.query<{ total: number }>(`SELECT COUNT(*) AS total FROM history_projection_rows r WHERE ${where}`).get(...bindings)!.total;
+    return this.#projectionDb.query<{ total: number }>(`SELECT COUNT(*) AS total FROM history_projection_rows r WHERE ${where}`).get(...bindings)!.total;
   }
 
   private historyOpportunityVisibleThrough(runId: string, generation: number): number {
-    return this.#readDb.query<{ through: number }, [string, number]>(
+    return this.#projectionDb.query<{ through: number }, [string, number]>(
       "SELECT COALESCE(MAX(change_seq),0) AS through FROM history_opportunity_updates WHERE run_id=?1 AND change_seq<COALESCE((SELECT MIN(change_seq) FROM history_opportunity_updates WHERE run_id=?1 AND generation>?2),9223372036854775807)",
     ).get(runId, generation)!.through;
   }
 
   historyOpportunityBootstrapPage(runId: string, after = 0, limit = 128): { seq: number; value: ImprovementOpportunity }[] {
     if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 128) throw new Error("Invalid opportunity bootstrap page");
-    return this.#readDb.query<{ seq: number; payload: string }, [string, number, number]>(
+    return this.#projectionDb.query<{ seq: number; payload: string }, [string, number, number]>(
       "SELECT e.rowid AS seq,e.payload FROM evidence_objects e WHERE e.run_id=? AND e.kind='opportunity' AND e.rowid>? AND NOT EXISTS(SELECT 1 FROM history_opportunity_updates u WHERE u.run_id=e.run_id AND u.opportunity_id=e.object_key) ORDER BY e.rowid LIMIT ?",
     ).all(runId, after, limit).map(row => ({ seq: row.seq, value: JSON.parse(row.payload) as ImprovementOpportunity }));
   }
 
   opportunityUpdates(runId: string, after = 0, limit = 128, skillId?: string, version?: number): { records: { change_seq: number; value: ImprovementOpportunity }[]; next_after: number; through: number; has_more: boolean } {
     if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 128) throw new Error("Invalid opportunity update page");
-    return this.#readDb.transaction(() => {
+    return this.#projectionDb.transaction(() => {
       const generation = this.historyProjectionCheckpoint(runId)?.generation ?? 0;
       const through = this.historyOpportunityVisibleThrough(runId, generation);
       if (after > through) throw new Error("Opportunity cursor exceeds visible history");
       const scope = skillId === undefined ? "" : version === undefined ? " AND skill_id=?" : " AND skill_id=? AND version=?";
       const bindings: (string | number)[] = [runId, after, through];
       if (skillId !== undefined) { bindings.push(skillId); if (version !== undefined) bindings.push(version); }
-      const rows = this.#readDb.query<{ change_seq: number; payload: string }>(
+      const rows = this.#projectionDb.query<{ change_seq: number; payload: string }>(
         `SELECT change_seq,payload FROM history_opportunity_updates WHERE run_id=? AND change_seq>? AND change_seq<=?${scope} ORDER BY change_seq LIMIT ?`,
       ).all(...bindings, limit + 1);
       const records = rows.slice(0, limit).map(row => ({ change_seq: row.change_seq, value: JSON.parse(row.payload) as ImprovementOpportunity }));
@@ -680,13 +688,13 @@ export class StoreReadQueries {
   }
 
   evidenceObjects<T>(runId: string, kind: "death" | "opportunity"): T[] {
-    return this.#readDb.query<{ payload: string }, [string, string]>(
+    return (kind === "opportunity" ? this.#projectionDb : this.#readDb).query<{ payload: string }, [string, string]>(
       "SELECT payload FROM evidence_objects WHERE run_id=? AND kind=? ORDER BY rowid",
     ).all(runId, kind).map(({ payload }) => JSON.parse(payload) as T);
   }
 
   evidenceObjectRows<T>(runId: string, kind: "opportunity", after: number, limit: number): { seq: number; value: T }[] {
-    return this.#readDb.query<{ seq: number; payload: string }, [string, string, number, number]>(
+    return this.#projectionDb.query<{ seq: number; payload: string }, [string, string, number, number]>(
       "SELECT rowid AS seq,payload FROM evidence_objects WHERE run_id=? AND kind=? AND rowid>? ORDER BY rowid LIMIT ?",
     ).all(runId, kind, after, limit).map((row) => ({ seq: row.seq, value: JSON.parse(row.payload) as T }));
   }
@@ -718,28 +726,28 @@ export class StoreReadQueries {
   }
 
   opportunity(runId: string, id: string): ImprovementOpportunity | null {
-    const row = this.#readDb.query<{ payload: string }, [string, string]>(
+    const row = this.#projectionDb.query<{ payload: string }, [string, string]>(
       "SELECT payload FROM evidence_objects WHERE run_id=? AND kind='opportunity' AND object_key=?",
     ).get(runId, id);
     return row ? JSON.parse(row.payload) as ImprovementOpportunity : null;
   }
 
   latestOpportunityForVersion(ref: ProgramVersionEvidence): ImprovementOpportunity | null {
-    const row = this.#readDb.query<{ payload: string }, [string, string, string, number, string]>(
+    const row = this.#projectionDb.query<{ payload: string }, [string, string, string, number, string]>(
       LATEST_OPPORTUNITY_VERSION_SQL,
     ).get(ref.run_id, ref.run_id, ref.skill_id, ref.version, ref.hash);
     return row ? JSON.parse(row.payload) as ImprovementOpportunity : null;
   }
 
   latestOpportunityForFamily(runId: string, skillId: string): ImprovementOpportunity | null {
-    const row = this.#readDb.query<{ payload: string }, [string, string]>(
+    const row = this.#projectionDb.query<{ payload: string }, [string, string]>(
       LATEST_OPPORTUNITY_FAMILY_SQL,
     ).get(runId, skillId);
     return row ? JSON.parse(row.payload) as ImprovementOpportunity : null;
   }
 
   opportunityCount(runId: string): number {
-    return this.#readDb.query<{ count: number }, [string]>(
+    return this.#projectionDb.query<{ count: number }, [string]>(
       "SELECT COUNT(*) AS count FROM evidence_objects WHERE run_id=? AND kind='opportunity'",
     ).get(runId)!.count;
   }
@@ -749,6 +757,7 @@ export class StoreReadQueries {
 /** Open only a writer-prepared, already-existing database. Never create or repair it. */
 export class ReadonlyStore extends StoreReadQueries {
   readonly #database: StoreDatabase;
+  readonly #projection: StoreDatabase;
   #closed = false;
 
   constructor(location: StoreReadLocation) {
@@ -756,18 +765,26 @@ export class ReadonlyStore extends StoreReadQueries {
     const database = new StoreDatabase(connection);
     super(database, location.artifacts);
     this.#database = database;
+    let projection: StoreDatabase = database;
     try {
-      database.transaction(() => this.requireReadySchema(connection)).deferred();
+      if (location.projection) projection = new StoreDatabase(new Database(location.projection, { readonly: true, create: false, strict: true }));
+      this.#projection = projection;
+      this.useProjectionDatabase(projection);
+      if (location.projection) requireProjectionBinding(database, projection);
+      this.snapshot(() => this.requireReadySchema());
     } catch (error) {
+      if (projection !== database) projection.close();
       database.close();
       throw error;
     }
   }
 
-  private requireReadySchema(connection: Database): void {
+  private requireReadySchema(): void {
     const version = this.#database.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version;
-    if (version !== STORE_SCHEMA_VERSION)
+    if (version !== (this.#projection === this.#database ? 7 : STORE_SCHEMA_VERSION))
       throw new Error(`Readonly store requires the current writer-migrated schema (user_version ${STORE_SCHEMA_VERSION})`);
+    const databaseFor = (table: string): StoreDatabase =>
+      table === "evidence_objects" || table.startsWith("history_projection_") || table.startsWith("history_opportunity_") ? this.#projection : this.#database;
     const tables = {
       runs: ["run_id", "created_at", "payload"],
       events: ["event_seq", "run_id", "at", "type", "summary", "details"],
@@ -795,11 +812,11 @@ export class ReadonlyStore extends StoreReadQueries {
       "change_seq", "ordinal", "present", "key_seq", "created_seq", "through_ordinal", "after_ordinal", "order_seq", "deleted", "generation", "source_through", "metric_change_seq"]);
     const tableIndexes = new Map<string, { name: string; unique: number; partial: number }[]>();
     for (const [table, required] of Object.entries(tables)) {
-      const columns = this.#database.query<{ name: string; type: string }, []>(`PRAGMA table_info(${table})`).all();
+      const columns = databaseFor(table).query<{ name: string; type: string }, []>(`PRAGMA table_info(${table})`).all();
       if (required.some((name) => !columns.some((column) =>
         column.name === name && column.type.toUpperCase() === (integerColumns.has(name) ? "INTEGER" : "TEXT"))))
         throw new Error(`Readonly store requires writer-prepared table ${table}`);
-      tableIndexes.set(table, this.#database.query<{ name: string; unique: number; partial: number }, []>(
+      tableIndexes.set(table, databaseFor(table).query<{ name: string; unique: number; partial: number }, []>(
         `PRAGMA index_list(${table})`,
       ).all());
     }
@@ -829,7 +846,7 @@ export class ReadonlyStore extends StoreReadQueries {
         row.partial !== ("partial" in index && index.partial ? 1 : 0))
         throw new Error(`Readonly store requires writer-prepared index ${index.name}`);
       if (index.columns) {
-        const columns = this.#database.query<{ name: string | null }, []>(`PRAGMA index_info(${index.name})`).all();
+        const columns = databaseFor(index.table).query<{ name: string | null }, []>(`PRAGMA index_info(${index.name})`).all();
         if (columns.length !== index.columns.length || columns.some((column, position) => column.name !== index.columns![position]))
           throw new Error(`Readonly store requires writer-prepared index columns ${index.name}`);
       }
@@ -846,7 +863,7 @@ export class ReadonlyStore extends StoreReadQueries {
     }
     for (const expected of HISTORY_PROJECTION_SCHEMA_SQL.match(/CREATE TRIGGER IF NOT EXISTS history_opportunity_(?:insert|update)[\s\S]*?END;/g) ?? []) {
       const name = /CREATE TRIGGER IF NOT EXISTS (\w+)/.exec(expected)![1]!;
-      const actual = this.#database.query<{ sql: string | null }, [string]>("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?").get(name);
+      const actual = this.#projection.query<{ sql: string | null }, [string]>("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?").get(name);
       if (!actual?.sql || normalizeDdl(actual.sql) !== normalizeDdl(expected)) throw new Error(`Readonly store requires writer-prepared opportunity journal behavior ${name}`);
     }
     for (const [table, primaryKey] of [
@@ -860,7 +877,7 @@ export class ReadonlyStore extends StoreReadQueries {
       ["history_opportunity_visibility", ["run_id", "opportunity_id"]],
       ["history_opportunity_updates", ["change_seq"]],
     ] as const) {
-      const actual = this.#database.query<{ name: string; pk: number }, []>(`PRAGMA table_info(${table})`).all()
+      const actual = databaseFor(table).query<{ name: string; pk: number }, []>(`PRAGMA table_info(${table})`).all()
         .filter(column => column.pk > 0).sort((left, right) => left.pk - right.pk);
       if (actual.length !== primaryKey.length || actual.some((column, position) => column.name !== primaryKey[position]))
         throw new Error(`Readonly store requires writer-prepared source primary key ${table}`);
@@ -887,17 +904,7 @@ export class ReadonlyStore extends StoreReadQueries {
       { name: "evidence_opportunity_family", keys: OPPORTUNITY_FAMILY_KEYS },
     ]) {
       const searchKeyCount = (lookupKeys: readonly string[]): number => {
-        const statement = connection.prepare<{ detail: string }, string[]>(
-          `EXPLAIN QUERY PLAN ${opportunityLookupSql(lookupKeys, name)}`,
-        );
-        let plan: { detail: string }[];
-        try {
-          plan = statement.all(...lookupKeys.map(() => ""));
-        } finally {
-          // Bun's bundled SQLite leaves EXPLAIN VMs active even at SQLITE_DONE.
-          // Finalize these one-shot probes before the readiness snapshot commits.
-          statement.finalize();
-        }
+        const plan = this.#projection.explain(opportunityLookupSql(lookupKeys, name), lookupKeys.map(() => ""));
         // A single indexed SEARCH must satisfy every equality and rowid ordering;
         // a scan, run-only prefix or temporary sort is not readiness.
         if (plan.length !== 1) return 0;
@@ -920,16 +927,32 @@ export class ReadonlyStore extends StoreReadQueries {
       "SELECT 1 AS invalid FROM skill_executions WHERE admission_ordinal IS NULL OR typeof(admission_ordinal)<>'integer' OR admission_ordinal<=0 LIMIT 1",
     ).get();
     if (invalidOrdinal) throw new Error("Readonly store requires writer-prepared execution admission ordinals");
+    for (const row of this.#projection.query<{ run_id: string; payload: string }, []>(
+      "SELECT run_id,payload FROM history_projection_checkpoints",
+    ).iterate()) {
+      const checkpoint = JSON.parse(row.payload) as ProjectionCheckpoint;
+      assertProjectionCheckpoint(checkpoint);
+      if (!this.getRun(row.run_id) || checkpoint.target_through > this.historySourceHighwater(row.run_id))
+        throw new Error("Projection checkpoint exceeds its bound source ledger");
+    }
   }
 
   snapshot<T>(operation: () => T): T {
     if (this.#closed) throw new Error("Readonly store is closed");
-    return this.#database.transaction(operation).deferred();
+    return this.#projection.transaction(() => {
+      // Pin derived first: its publications were accepted by an earlier source commit.
+      this.#projection.query("SELECT run_id FROM history_projection_checkpoints LIMIT 1").get();
+      return this.#database.transaction(() => {
+        this.#database.query("SELECT value FROM store_metadata WHERE key='game_epoch'").get();
+        return operation();
+      }).deferred();
+    }).deferred();
   }
 
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    if (this.#projection !== this.#database) this.#projection.close();
     this.#database.close();
   }
 }

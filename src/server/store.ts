@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { StoreDatabase, STORE_OPPORTUNITY_INDEXES, STORE_SCHEMA_VERSION } from "./store-database.ts";
-import { StoreReadQueries, type StoreReadLocation, type PolicyRow, type SkillRow } from "./store-read.ts";
+import { ReadonlyStore, StoreReadQueries, type StoreReadLocation, type PolicyRow, type SkillRow } from "./store-read.ts";
+import { ProjectionStorage } from "./projection-storage.ts";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -9,7 +10,7 @@ import {
 import { open, readFile, rename, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { DeathEpisode, SavedDeathEpisode, ImprovementOpportunity, TraceInput, TraceRecord, WorkingProgram } from "../shared/execution-evidence.ts";
-import type { SkillManager } from "./skills.ts";
+import type { SourcePrograms } from "./source-programs.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import type {
   ActionView,
@@ -78,6 +79,9 @@ const terminalExecutions = new Set<SkillExecutionView["status"]>([
 export class Store extends StoreReadQueries {
   private readonly db: StoreDatabase;
   private readonly artifactDir: string;
+  private readonly projections: ProjectionStorage;
+  private readonly projectionDb: StoreDatabase;
+  private readonly projectionSource: ReadonlyStore;
   private readonly listeners = new Set<(event: ActivityEvent) => void>();
   private readonly traceObservers = new Set<(input: TraceInput) => void>();
   private readonly historyListeners = new Set<(runId: string) => void>();
@@ -101,10 +105,24 @@ export class Store extends StoreReadQueries {
     const version =
       this.db.query<{ user_version: number }, []>("PRAGMA user_version").get()
         ?.user_version ?? 0;
-    if (version > STORE_SCHEMA_VERSION)
+    if (version > STORE_SCHEMA_VERSION) {
+      this.db.close();
       throw new Error(
         "The run database was created by a newer GameHarness version",
       );
+    }
+    if (version === 7 || version === 8) {
+      // Existing histories must be complete before any CREATE IF NOT EXISTS
+      // can accidentally turn a corrupt/missing derived table into an empty history.
+      try {
+        const legacy = new ReadonlyStore({ database: filename, artifacts: artifactDir,
+          ...(version === 8 ? { projection: path.resolve(dataDir, "history.sqlite") } : {}) });
+        legacy.close();
+      } catch (error) {
+        this.db.close();
+        throw error;
+      }
+    }
     this.db.transaction(() => {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS runs (
@@ -218,7 +236,7 @@ export class Store extends StoreReadQueries {
         this.db.exec("UPDATE skill_executions SET admission_ordinal=rowid");
       }
       this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS skill_executions_ordinal ON skill_executions(admission_ordinal)");
-      for (const index of STORE_OPPORTUNITY_INDEXES) this.db.exec(index.sql);
+      if (version < 8) for (const index of STORE_OPPORTUNITY_INDEXES) this.db.exec(index.sql);
       if (version < 2) this.migrateLegacyRows();
       if (version < HISTORY_SOURCE_SCHEMA_VERSION) {
         this.db.exec(HISTORY_SOURCE_SCHEMA_SQL);
@@ -235,17 +253,35 @@ export class Store extends StoreReadQueries {
           registerBootstrap.run(kind, through);
         }
       }
-      this.db.exec(HISTORY_PROJECTION_SCHEMA_SQL);
+      if (version < 8) this.db.exec(HISTORY_PROJECTION_SCHEMA_SQL);
       for (const row of this.db.query<{ name: string }, []>("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE 'improvement_%'").all()) {
         this.db.exec(`DROP TRIGGER "${row.name.replace(/"/g, '""')}"`);
       }
       this.db.exec("DROP TABLE IF EXISTS improvement_work; DROP TABLE IF EXISTS improvement_checkpoints; DROP INDEX IF EXISTS events_improvement_run_seq; DROP INDEX IF EXISTS events_improvement_execution_seq;");
-      this.db.exec(`PRAGMA user_version=${STORE_SCHEMA_VERSION}`);
+      if (version < 8) this.db.exec("PRAGMA user_version=7");
     })();
+    let projectionDb: StoreDatabase | undefined;
+    let projectionSource: ReadonlyStore | undefined;
+    try {
+      if (version < 8) {
+        const legacy = new ReadonlyStore({ database: filename, artifacts: artifactDir });
+        legacy.close();
+      }
+      this.projections = new ProjectionStorage(this.db, filename, path.resolve(dataDir, "history.sqlite"));
+      this.projectionDb = projectionDb = this.projections.database;
+      this.useProjectionDatabase(this.projectionDb);
+      this.projectionSource = projectionSource = new ReadonlyStore(this.readLocation());
+      this.drainProjectionAudit();
+    } catch (error) {
+      projectionSource?.close();
+      projectionDb?.close();
+      this.db.close();
+      throw error;
+    }
   }
 
   readLocation(): StoreReadLocation {
-    return { database: path.join(path.dirname(this.artifactDir), "runs.sqlite"), artifacts: this.artifactDir };
+    return { database: path.join(path.dirname(this.artifactDir), "runs.sqlite"), artifacts: this.artifactDir, projection: this.projections.filename };
   }
 
   /** Register only bounded baseline keys; bodies remain backed by canonical source rows. */
@@ -944,6 +980,9 @@ export class Store extends StoreReadQueries {
   }
 
   completeToolCall(runId: string, callId: string, input: Json, result: Json): void {
+    // Review completions are external calls; source-registration completions may
+    // already be nested in a control transaction and must never acknowledge early.
+    if (!this.db.inTransaction) this.drainProjectionAudit();
     this.db.transaction(() => {
       this.assertToolCallInput(runId, callId, input, true);
       const previous = this.toolCallRecord(runId, callId, "tool_result");
@@ -1312,15 +1351,64 @@ export class Store extends StoreReadQueries {
   }
 
   saveOpportunity(value: ImprovementOpportunity): ImprovementOpportunity {
-    this.saveEvidenceObject(value.run_id, "opportunity", value.opportunity_id, value);
+    this.assertProjectionWriteIndependent();
+    if (!this.projectionSource.getRun(value.run_id)) throw new Error("Run not found");
+    this.insertOpportunity(value);
     return this.opportunity(value.run_id, value.opportunity_id)!;
+  }
+
+  private insertOpportunity(value: ImprovementOpportunity): void {
+    const payload = canonical(value);
+    if (Buffer.byteLength(payload) > 65536) throw new Error("Evidence object exceeds 64 KiB budget");
+    this.projectionDb.query("INSERT OR IGNORE INTO evidence_objects(run_id,kind,object_key,payload) VALUES(?,'opportunity',?,?)")
+      .run(value.run_id, value.opportunity_id, payload);
+  }
+
+  private assertProjectionWriteIndependent(): void {
+    if (this.db.inTransaction) throw new Error("Derived persistence cannot run inside an authoritative control transaction");
+  }
+
+  /** Derived commit -> canonical receipt/event -> derived acknowledgement; each step is durable. */
+  private drainProjectionAudit(): void {
+    this.assertProjectionWriteIndependent();
+    for (;;) {
+      const rows = this.projectionDb.query<{ receipt_id: string; run_id: string; payload: string }, []>(
+        "SELECT receipt_id,run_id,payload FROM projection_audit_outbox WHERE event_seq IS NULL ORDER BY outbox_seq LIMIT 64",
+      ).all();
+      if (!rows.length) return;
+      for (const row of rows) {
+        const audit = JSON.parse(row.payload) as { run_id: string; type: string; summary: string; details: Json };
+        if (audit.run_id !== row.run_id || audit.type !== "learning.resolved" ||
+          audit.summary !== "Recorded model-selected improvement decision")
+          throw new Error("Corrupt projection audit outbox");
+        let emitted: ActivityEvent | null = null;
+        const sequence = this.db.transaction(() => {
+          const existing = this.db.query<{ event_seq: number; payload: string }, [string]>(
+            "SELECT event_seq,payload FROM projection_audit_receipts WHERE receipt_id=?",
+          ).get(row.receipt_id);
+          if (existing) {
+            if (existing.payload !== row.payload) throw new Error("Projection audit receipt identity conflict");
+            return existing.event_seq;
+          }
+          emitted = this.append(row.run_id, audit.type, audit.summary, audit.details);
+          this.db.query("INSERT INTO projection_audit_receipts(receipt_id,event_seq,payload) VALUES(?,?,?)")
+            .run(row.receipt_id, emitted.event_seq, row.payload);
+          return emitted.event_seq;
+        }).immediate();
+        // A crash here reuses the permanent receipt, never appends a duplicate event.
+        this.projectionDb.query("UPDATE projection_audit_outbox SET event_seq=? WHERE receipt_id=? AND event_seq IS NULL")
+          .run(sequence, row.receipt_id);
+        if (emitted) this.notify(emitted);
+      }
+    }
   }
 
   /** A caller frontier is explicit and never chased by a preview or commit. */
   beginHistoryProjection(runId: string, desiredThrough?: number): ProjectionCheckpoint {
-    return this.db.transaction(() => {
-      if (!this.getRun(runId)) throw new RuntimeFault("not_found", "Run not found");
-      const available = this.historySourceHighwater(runId), desired = desiredThrough ?? available;
+    this.assertProjectionWriteIndependent();
+    return this.projectionDb.transaction(() => {
+      if (!this.projectionSource.getRun(runId)) throw new RuntimeFault("not_found", "Run not found");
+      const available = this.projectionSource.historySourceHighwater(runId), desired = desiredThrough ?? available;
       if (!Number.isSafeInteger(desired) || desired < 0 || desired > available) throw new Error("Invalid history projection frontier");
       const existing = this.historyProjectionCheckpoint(runId);
       const checkpoint: ProjectionCheckpoint = existing ? structuredClone(existing) : {
@@ -1339,14 +1427,15 @@ export class Store extends StoreReadQueries {
       assertProjectionCheckpoint(checkpoint);
       if (!projectionRequestFits(runId, checkpoint))
         throw new RuntimeFault("budget_exceeded", "History checkpoint cannot fit its next request");
-      if (!existing) this.db.query("INSERT INTO history_projection_checkpoints(run_id,payload) VALUES(?,?)").run(runId, canonical(checkpoint));
-      else if (canonical(existing) !== canonical(checkpoint)) this.db.query("UPDATE history_projection_checkpoints SET payload=? WHERE run_id=? AND payload=?").run(canonical(checkpoint), runId, canonical(existing));
+      if (!existing) this.projectionDb.query("INSERT INTO history_projection_checkpoints(run_id,payload) VALUES(?,?)").run(runId, canonical(checkpoint));
+      else if (canonical(existing) !== canonical(checkpoint)) this.projectionDb.query("UPDATE history_projection_checkpoints SET payload=? WHERE run_id=? AND payload=?").run(canonical(checkpoint), runId, canonical(existing));
       return checkpoint;
     }).immediate();
   }
 
   /** Persist only bounded trusted patches; expensive domain interpretation stays readonly. */
   commitHistoryProjectionBatch(runId: string, batch: HistoryProjectionBatch): void {
+    this.assertProjectionWriteIndependent();
     assertProjectionCheckpoint(batch.before);
     assertProjectionCheckpoint(batch.after);
     if (!projectionRequestFits(runId, batch.after))
@@ -1380,30 +1469,46 @@ export class Store extends StoreReadQueries {
       if (identities.has(identity)) throw new Error("Duplicate projection mutation key");
       identities.add(identity);
     }
-    this.db.transaction(() => {
-      const saved = this.historyProjectionCheckpoint(runId);
-      if (!saved || canonical(saved) !== canonical(batch.before)) throw new RuntimeFault("conflict", "History projection checkpoint changed before persistence");
+    const batchHash = createHash("sha256").update(canonical([this.projections.projectionId, runId, batch])).digest("hex");
+    if (batch.candidates.length) {
+      const accepted = this.db.query<{ batch_hash: string }, [string]>("SELECT batch_hash FROM projection_publications WHERE publication_id=?").get(batchHash);
+      if (!accepted) {
+        const available = this.projectionSource.snapshot(() => {
+          const source = this.projectionSource;
       for (const candidate of batch.candidates) {
         if (candidate.run_id !== runId || candidate.resolution !== null || candidate.event_seqs.length !== 1) throw new Error("Invalid staged opportunity scope");
         const sequence = candidate.event_seqs[0]!;
-        const current = this.historySourceRecord(runId, "event", String(sequence), this.historySourceHighwater(runId));
-        const pinned = this.historySourceRecord(runId, "event", String(sequence), batch.before.target_through);
-        const exact = current ? improvementOpportunityCandidate(this, runId, this.decodeHistorySource("event", current)) : null;
-        const available = this.historySourceHighwater(runId);
-        const currentExecution = this.historySourceRecord(runId, "execution", candidate.execution_id, available);
-        const pinnedExecution = this.historySourceRecord(runId, "execution", candidate.execution_id, batch.before.target_through);
+        const current = source.historySourceRecord(runId, "event", String(sequence), source.historySourceHighwater(runId));
+        const pinned = source.historySourceRecord(runId, "event", String(sequence), batch.before.target_through);
+        const exact = current ? improvementOpportunityCandidate(source, runId, source.decodeHistorySource("event", current)) : null;
+        const available = source.historySourceHighwater(runId);
+        const currentExecution = source.historySourceRecord(runId, "execution", candidate.execution_id, available);
+        const pinnedExecution = source.historySourceRecord(runId, "execution", candidate.execution_id, batch.before.target_through);
         const skillKey = JSON.stringify([candidate.version.skill_id, candidate.version.version]);
-        const currentSkill = this.historySourceRecord(runId, "skill", skillKey, available);
-        const pinnedSkill = this.historySourceRecord(runId, "skill", skillKey, batch.before.target_through);
+        const currentSkill = source.historySourceRecord(runId, "skill", skillKey, available);
+        const pinnedSkill = source.historySourceRecord(runId, "skill", skillKey, batch.before.target_through);
         const patch = batch.patches.find(p => p.type === "put" && p.row.collection === "pending_opportunity" && p.row.key === candidate.opportunity_id);
         if (!exact || canonical(current) !== canonical(pinned) || canonical(currentExecution) !== canonical(pinnedExecution) || canonical(currentSkill) !== canonical(pinnedSkill) ||
           canonical(exact) !== canonical(candidate) || !patch || patch.type !== "put" || canonical(patch.row.value) !== canonical(candidate))
           throw new RuntimeFault("conflict", "History opportunity candidate no longer matches exact current source");
       }
+          return source.historySourceHighwater(runId);
+        });
+        // This bounded metadata CAS is the eligibility linearization point. No reducer,
+        // artifact read, derived write, or model work runs under the control write lock.
+        this.db.transaction(() => {
+          if (this.historySourceHighwater(runId) !== available) throw new RuntimeFault("conflict", "History source changed before opportunity acceptance");
+          this.db.query("INSERT OR IGNORE INTO projection_publications(publication_id,run_id,source_through,batch_hash) VALUES(?,?,?,?)").run(batchHash, runId, available, batchHash);
+        }).immediate();
+      } else if (accepted.batch_hash !== batchHash) throw new Error("Corrupt projection publication receipt");
+    }
+    this.projectionDb.transaction(() => {
+      const saved = this.historyProjectionCheckpoint(runId);
+      if (!saved || canonical(saved) !== canonical(batch.before)) throw new RuntimeFault("conflict", "History projection checkpoint changed before persistence");
       for (const entry of batch.opportunity_bootstrap) {
-        const current = this.db.query<{ seq: number; payload: string }, [string, string]>("SELECT rowid AS seq,payload FROM evidence_objects WHERE run_id=? AND kind='opportunity' AND object_key=?").get(runId, entry.value.opportunity_id);
+        const current = this.projectionDb.query<{ seq: number; payload: string }, [string, string]>("SELECT rowid AS seq,payload FROM evidence_objects WHERE run_id=? AND kind='opportunity' AND object_key=?").get(runId, entry.value.opportunity_id);
         if (!current || current.seq !== entry.seq || canonical(JSON.parse(current.payload)) !== canonical(entry.value)) throw new RuntimeFault("conflict", "Opportunity bootstrap changed before persistence");
-        this.db.query(`INSERT INTO history_opportunity_updates(run_id,opportunity_id,generation,skill_id,version,payload)
+        this.projectionDb.query(`INSERT INTO history_opportunity_updates(run_id,opportunity_id,generation,skill_id,version,payload)
           SELECT ?1,?2,COALESCE((SELECT generation FROM history_opportunity_visibility WHERE run_id=?1 AND opportunity_id=?2),0),?3,?4,?5
           WHERE NOT EXISTS(SELECT 1 FROM history_opportunity_updates WHERE run_id=?1 AND opportunity_id=?2)`)
           .run(runId, entry.value.opportunity_id, entry.value.version.skill_id, entry.value.version.version, canonical(entry.value));
@@ -1414,14 +1519,14 @@ export class Store extends StoreReadQueries {
             const pending = this.historyProjectionRow(runId, batch.before.revision, patch.collection, patch.key);
             if (!pending || batch.before.phase !== "publish") throw new Error("Opportunity publication requires staged capture");
             const candidate = pending.value as unknown as ImprovementOpportunity;
-            this.db.query(`INSERT OR IGNORE INTO history_opportunity_visibility(run_id,opportunity_id,generation)
+            this.projectionDb.query(`INSERT OR IGNORE INTO history_opportunity_visibility(run_id,opportunity_id,generation)
               SELECT ?1,?2,?3 WHERE NOT EXISTS(SELECT 1 FROM evidence_objects WHERE run_id=?1 AND kind='opportunity' AND object_key=?2)`).run(runId, patch.key, batch.before.generation + 1);
-            this.saveEvidenceObject(runId, "opportunity", patch.key, candidate);
+            this.insertOpportunity(candidate);
           }
-          this.db.query("INSERT INTO history_projection_rows(run_id,collection,object_key,revision,owner_id,source_id,order_seq,tag,payload,deleted) VALUES(?,?,?,?,NULL,NULL,0,NULL,NULL,1)").run(runId, patch.collection, patch.key, batch.after.revision);
+          this.projectionDb.query("INSERT INTO history_projection_rows(run_id,collection,object_key,revision,owner_id,source_id,order_seq,tag,payload,deleted) VALUES(?,?,?,?,NULL,NULL,0,NULL,NULL,1)").run(runId, patch.collection, patch.key, batch.after.revision);
         } else {
           const row = patch.row;
-          this.db.query("INSERT INTO history_projection_rows(run_id,collection,object_key,revision,owner_id,source_id,order_seq,tag,payload,deleted) VALUES(?,?,?,?,?,?,?,?,?,0)")
+          this.projectionDb.query("INSERT INTO history_projection_rows(run_id,collection,object_key,revision,owner_id,source_id,order_seq,tag,payload,deleted) VALUES(?,?,?,?,?,?,?,?,?,0)")
             .run(runId, row.collection, row.key, batch.after.revision, row.owner_id, row.source_id, row.order_seq, row.tag, canonical(row.value));
         }
       }
@@ -1429,11 +1534,11 @@ export class Store extends StoreReadQueries {
         for (const collection of ["pending_opportunity", "dirty_detection", "dirty_outcome", "dirty_objective", "objective_job", "dirty_evidence", "evidence_job"] as const) {
           if (this.historyProjectionCount(runId, batch.after.revision, { collection }) !== 0) throw new Error("Cannot publish a partial history generation");
         }
-        this.db.query("INSERT INTO history_projection_generations(run_id,generation,revision,source_through,metric_change_seq) VALUES(?,?,?,?,?)")
+        this.projectionDb.query("INSERT INTO history_projection_generations(run_id,generation,revision,source_through,metric_change_seq) VALUES(?,?,?,?,?)")
           .run(runId, batch.after.generation, batch.after.revision, batch.after.source_through, batch.after.published_metric_change_seq);
       }
       if (!changed) return;
-      const result = this.db.query("UPDATE history_projection_checkpoints SET payload=? WHERE run_id=? AND payload=?").run(canonical(batch.after), runId, canonical(batch.before));
+      const result = this.projectionDb.query("UPDATE history_projection_checkpoints SET payload=? WHERE run_id=? AND payload=?").run(canonical(batch.after), runId, canonical(batch.before));
       if (result.changes !== 1) throw new RuntimeFault("conflict", "History projection checkpoint changed during persistence");
     }).immediate();
   }
@@ -1445,7 +1550,8 @@ export class Store extends StoreReadQueries {
   }
 
   resolveOpportunity(runId: string, id: string, resolution: NonNullable<ImprovementOpportunity["resolution"]>): ImprovementOpportunity {
-    return this.db.transaction(() => {
+    this.assertProjectionWriteIndependent();
+    const resolved = this.projectionDb.transaction(() => {
       const value = this.opportunity(runId, id);
       if (!value) throw new Error("Improvement opportunity not found");
       if (value.resolution) {
@@ -1455,9 +1561,15 @@ export class Store extends StoreReadQueries {
         return value;
       }
       value.resolution = resolution;
-      this.db.query("UPDATE evidence_objects SET payload=? WHERE run_id=? AND kind='opportunity' AND object_key=?").run(canonical(value), runId, id);
+      this.projectionDb.query("UPDATE evidence_objects SET payload=? WHERE run_id=? AND kind='opportunity' AND object_key=?").run(canonical(value), runId, id);
+      const details: Json = { opportunity_id: id, decision: resolution.decision, revision: resolution.revision as unknown as Json, measured: resolution.measured, qualification: resolution.measured ? "measured_not_causally_proven" : "unmeasured_candidate" };
+      const payload = canonical({ run_id: runId, type: "learning.resolved", summary: "Recorded model-selected improvement decision", details });
+      const receipt = createHash("sha256").update(canonical([this.projections.projectionId, runId, id, "learning.resolved"])).digest("hex");
+      this.projectionDb.query("INSERT INTO projection_audit_outbox(receipt_id,run_id,payload,event_seq) VALUES(?,?,?,NULL)").run(receipt, runId, payload);
       return value;
     })();
+    this.drainProjectionAudit();
+    return resolved;
   }
 
   retainWorkingPrograms(runId: string, sessionId: string): WorkingProgram[] {
@@ -1493,7 +1605,7 @@ export class Store extends StoreReadQueries {
     return candidates;
   }
 
-  async hydrateWorkingPrograms(modelId: string, sessionId: string, runId: string, manager: Pick<SkillManager, "importSnapshot">, beforeCommit: () => void = () => {}): Promise<SkillView[]> {
+  async hydrateWorkingPrograms(modelId: string, sessionId: string, runId: string, sources: Pick<SourcePrograms, "importSnapshot">, beforeCommit: () => void = () => {}): Promise<SkillView[]> {
     const run = this.getRun(runId);
     if (!run || run.model_id !== modelId || run.session_id !== sessionId) throw new Error("Working library scope does not match run");
     const imported = new Map<string, SkillView>();
@@ -1507,7 +1619,7 @@ export class Store extends StoreReadQueries {
       }
       for (const skill of candidate.skills) {
         const key = `${skill.skill_id}:${skill.version}`;
-        if (!imported.has(key)) imported.set(key, await manager.importSnapshot(runId, skill, beforeCommit));
+        if (!imported.has(key)) imported.set(key, await sources.importSnapshot(runId, skill, beforeCommit));
       }
     }
     return [...imported.values()];
@@ -1519,6 +1631,8 @@ export class Store extends StoreReadQueries {
     this.listeners.clear();
     this.historyListeners.clear();
     this.traceObservers.clear();
+    this.projectionSource.close();
+    this.projectionDb.close();
     this.db.close();
   }
 }

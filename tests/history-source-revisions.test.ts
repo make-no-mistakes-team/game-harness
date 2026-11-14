@@ -1,7 +1,11 @@
 import { expect, test, vi } from "bun:test";
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { readFileSync, rmSync } from "node:fs";
 import { Store } from "../src/server/store.ts";
 import { ReadonlyStore } from "../src/server/store-read.ts";
+import { STORE_OPPORTUNITY_INDEXES } from "../src/server/store-database.ts";
+import { HISTORY_PROJECTION_SCHEMA_SQL } from "../src/server/history-projection.ts";
 import type { HistorySourceKind } from "../src/server/history-source.ts";
 import { objectiveMetrics } from "../src/server/objective-metrics.ts";
 import { programEvidence } from "../src/server/program-evidence.ts";
@@ -13,7 +17,39 @@ import {
   historyExecution,
   historyFixture,
   historySpec,
+  type HistoryFixture,
 } from "./helpers/history-fixture.ts";
+
+function combinedSchema7(fixture: HistoryFixture) {
+  const location = fixture.store.readLocation();
+  fixture.store.close();
+  const db = new Database(location.database);
+  try {
+    db.query("ATTACH DATABASE ? AS derived").run(location.projection!);
+    db.transaction(() => {
+      db.exec(HISTORY_PROJECTION_SCHEMA_SQL.replace(/CREATE TRIGGER[\s\S]*$/, ""));
+      db.exec("INSERT INTO evidence_objects(rowid,run_id,kind,object_key,payload) SELECT rowid,run_id,kind,object_key,payload FROM derived.evidence_objects");
+      for (const table of [
+        "history_projection_rows",
+        "history_projection_checkpoints",
+        "history_projection_generations",
+        "history_opportunity_visibility",
+        "history_opportunity_updates",
+      ])
+        db.exec(`INSERT INTO ${table} SELECT * FROM derived.${table}`);
+      db.exec(HISTORY_PROJECTION_SCHEMA_SQL);
+      for (const index of STORE_OPPORTUNITY_INDEXES) db.exec(index.sql);
+      db.exec("DROP TABLE projection_storage_binding; DROP TABLE projection_publications; DROP TABLE projection_audit_receipts; PRAGMA user_version=7");
+    })();
+    db.exec("DETACH DATABASE derived");
+  } finally {
+    db.close(true);
+  }
+  rmSync(location.projection!);
+  for (const suffix of ["-wal", "-shm"])
+    rmSync(location.projection! + suffix, { force: true });
+  return { database: location.database, artifacts: location.artifacts };
+}
 
 function bootstrap(store: Store, limit = 128) {
   for (let batch = 0; batch < 1000; batch++) {
@@ -419,6 +455,32 @@ test("a source-transaction fault rolls back backing data, sealed versions and th
   }
 });
 
+test("frozen combined schema7 preserves source revisions without writer migration", () => {
+  const fixture = historyFixture(),
+    { store, run } = fixture;
+  let reader: ReadonlyStore | undefined;
+  try {
+    bootstrap(store);
+    const original = store.historySourceHighwater(run.run_id);
+    store.saveRun({ ...run, turns: 8 });
+    const current = store.historySourceHighwater(run.run_id);
+    const location = combinedSchema7(fixture);
+    const digest = () =>
+      createHash("sha256").update(readFileSync(location.database)).digest("hex");
+    const before = digest();
+    reader = new ReadonlyStore(location);
+    expect(body(reader, run.run_id, "run", run.run_id, original, "payload").turns)
+      .toBe(0);
+    expect(body(reader, run.run_id, "run", run.run_id, current, "payload").turns)
+      .toBe(8);
+    reader.close();
+    expect(digest()).toBe(before);
+  } finally {
+    reader?.close();
+    fixture.close();
+  }
+});
+
 test("bounded schema5 bootstrap preserves an unvisited original source while later sources remain absent at generation0", () => {
   const fixture = historyFixture(),
     { directory, run } = fixture;
@@ -428,8 +490,8 @@ test("bounded schema5 bootstrap preserves an unvisited original source while lat
   const later = { ...run, run_id: crypto.randomUUID() };
   try {
     store.saveRun(original);
-    store.close();
-    const db = new Database(store.readLocation().database);
+    const location = combinedSchema7(fixture);
+    const db = new Database(location.database);
     try {
       const triggers = db
         .query<{ name: string }, []>(

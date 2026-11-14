@@ -5,6 +5,7 @@ import { toolCatalogAllows, type ToolModule, type ToolRole } from "../shared/too
 import type { Store, StoredRun } from "./store.ts";
 import type { ReactiveRuntime } from "./reactive.ts";
 import type { SkillManager } from "./skills.ts";
+import type { SourcePrograms } from "./source-programs.ts";
 import type { ExperienceLibrary } from "./experience.ts";
 import type { SpeculativePlanning } from "./speculative-planning.ts";
 import type { ImprovementLearning } from "./improvement-learning.ts";
@@ -66,7 +67,7 @@ export class RuntimeTools {
   private modules = new Set<ToolModule>();
   private reviewDecisions = new Set<string>();
   private moduleRun: string | null = null;
-  constructor(private store: Store, private skills: SkillManager, private reactions: ReactiveRuntime,
+  constructor(private store: Store, private skills: SkillManager, private sources: SourcePrograms, private reactions: ReactiveRuntime,
     private experience: ExperienceLibrary | null, private host: RuntimeToolHost) {}
 
   build(generation: number): AgentTool[] {
@@ -74,7 +75,7 @@ export class RuntimeTools {
     if (this.moduleRun !== run.run_id) {
       this.moduleRun = run.run_id; this.modules.clear(); this.modules.add("reflex"); this.reviewDecisions.clear();
     }
-    const operations = new ProgramOperations(this.store, this.skills, this.reactions, this.experience, this.host, run);
+    const operations = new ProgramOperations(this.store, this.skills, this.sources, this.reactions, this.experience, this.host, run);
     const role = (): ToolRole => run.status === "reviewing" ? "review" :
       this.host.toolRole?.() ?? (this.host.planning().projection()?.planning_active ? "speculative" : "ordinary");
     const inactiveWrite = () => role() === "authoring" || role() === "speculative";

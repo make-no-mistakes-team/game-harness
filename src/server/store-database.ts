@@ -1,6 +1,6 @@
 import { type Database, type SQLQueryBindings, type Statement } from "bun:sqlite";
 
-export const STORE_SCHEMA_VERSION = 7;
+export const STORE_SCHEMA_VERSION = 8;
 
 /** Own every fixed SQL statement, including Bun 1.3 query-cache overflow. */
 export class StoreDatabase {
@@ -23,6 +23,11 @@ export class StoreDatabase {
   }
 
   exec(sql: string): void { this.database.exec(sql); }
+  explain(sql: string, bindings: string[]): { detail: string }[] {
+    const statement = this.database.prepare<{ detail: string }, string[]>(`EXPLAIN QUERY PLAN ${sql}`);
+    try { return statement.all(...bindings); }
+    finally { statement.finalize(); }
+  }
   transaction<T>(operation: () => T) {
     const transaction = this.database.transaction(operation);
     const invoke = (mode: "deferred" | "immediate" | "exclusive"): T => {
@@ -51,6 +56,8 @@ export class StoreDatabase {
     if (this.#transactionDepth > 0) this.#commitCallbacks.push(callback);
     else callback();
   }
+
+  get inTransaction(): boolean { return this.#transactionDepth > 0; }
 
   close(): void {
     if (this.#closed) return;

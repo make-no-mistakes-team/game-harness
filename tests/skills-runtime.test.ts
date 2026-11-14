@@ -19,6 +19,7 @@ import type {
 import { DEFAULT_SKILL_LIMITS } from "../src/shared/programs.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { SkillManager, type SkillHost } from "../src/server/skills.ts";
+import { SourcePrograms } from "../src/server/source-programs.ts";
 import {
   SkillCleanupError,
   type SandboxService,
@@ -162,8 +163,9 @@ function fixture(runner: Runner, overrides: Partial<SkillHost> = {}) {
     ...overrides,
   };
   const manager = new SkillManager(store, { runSkill: runner }, host);
+  const sources = new SourcePrograms(store, { adapter: host.adapter, binding: host.binding, changed: () => host.changed(false) });
   resources.push({ directory, store, manager });
-  return { directory, store, run, manager, unsafe: () => unsafe };
+  return { directory, store, run, manager, sources, unsafe: () => unsafe };
 }
 const card = {
   purpose: "Exercise the public program lifecycle",
@@ -173,12 +175,12 @@ const card = {
   limitations: "No gameplay effectiveness claim",
 };
 async function register(
-  manager: SkillManager,
+  sources: SourcePrograms,
   runId: string,
   name = "fixture",
   dependencies: SkillRef[] = [],
 ) {
-  const view = await manager.register(runId, { entry: "run",
+  const view = await sources.register(runId, { entry: "run",
     name,
     source:
       'return {status:"completed",summary:"Fixture complete",result:null};',
@@ -189,7 +191,7 @@ async function register(
 }
 
 test("source registration rechecks authority after artifact preparation before publishing a receipt", async () => {
-  const { store, run, manager } = fixture(async () => completed);
+  const { store, run, sources } = fixture(async () => completed);
   let authorized = true;
   const registerSource = store.registerSkill.bind(store);
   store.registerSkill = (...args) => {
@@ -198,7 +200,7 @@ test("source registration rechecks authority after artifact preparation before p
     return pending;
   };
   const registration = { call_id: "stopped-registration", input: { name: "stopped source" } };
-  await expect(manager.register(run.run_id, { entry: "run", name: "stopped source", card, dependencies: [],
+  await expect(sources.register(run.run_id, { entry: "run", name: "stopped source", card, dependencies: [],
     source: 'return {status:"completed",summary:"Not published",result:null};' }, () => {
     if (!authorized) throw new Error("Authority revoked during persistence");
   }, registration)).rejects.toThrow("Authority revoked");
@@ -207,8 +209,8 @@ test("source registration rechecks authority after artifact preparation before p
 });
 
 test("snapshot import rechecks authority after artifact preparation before publishing into its destination", async () => {
-  const { store, run, manager } = fixture(async () => completed);
-  const ref = await register(manager, run.run_id), snapshot = store.skill(run.run_id, ref);
+  const { store, run, sources } = fixture(async () => completed);
+  const ref = await register(sources, run.run_id), snapshot = store.skill(run.run_id, ref);
   const destination = { ...run, run_id: crypto.randomUUID() };
   store.saveRun(destination);
   let authorized = true;
@@ -218,7 +220,7 @@ test("snapshot import rechecks authority after artifact preparation before publi
     authorized = false;
     return pending;
   };
-  await expect(manager.importSnapshot(destination.run_id, snapshot, () => {
+  await expect(sources.importSnapshot(destination.run_id, snapshot, () => {
     if (!authorized) throw new Error("Import authority revoked during persistence");
   })).rejects.toThrow("Import authority revoked");
   expect(store.skills(destination.run_id)).toEqual([]);
@@ -264,17 +266,17 @@ function start(
 test("generated attention preserves root attribution, child producer and shared call limits without effects", async () => {
   const wakes: { execution_id: string; source_hash: string | null; summary: string }[] = [];
   let effects = 0;
-  const { store, run, manager } = fixture(generatedWorker, {
+  const { store, run, manager, sources } = fixture(generatedWorker, {
     programEvent: (execution, event) => { wakes.push({ execution_id: execution.execution_id,
       source_hash: execution.source_hash, summary: event.summary }); },
     action: async () => { effects++; return success; },
   });
-  const child = await manager.register(run.run_id, { entry: "run", name: "Attention child", card, dependencies: [],
+  const child = await sources.register(run.run_id, { entry: "run", name: "Attention child", card, dependencies: [],
     source: `const returned = await game.attention({urgency:"ordinary",summary:"Child needs cognition",details:{producer:"child"}});
 if(returned !== undefined) throw new Error("Attention must return void");
 await game.attention({urgency:"urgent",summary:"Must not pass root budget",details:null});
 return {status:"completed",summary:"Unreachable",result:null};` });
-  const root = await manager.register(run.run_id, { entry: "run", name: "Attention root", card,
+  const root = await sources.register(run.run_id, { entry: "run", name: "Attention root", card,
     dependencies: [{ skill_id: child.skill_id, version: child.version }],
     source: 'await game.call({name:"Attention child"},null);return {status:"completed",summary:"Unreachable",result:null};' });
   const execution = manager.start(run.run_id, start(run, root, "child-attention", null,
@@ -317,7 +319,7 @@ test("confirmed failed input cannot deliver a fresh observation after actual lif
       return authorizedObservation();
     },
   });
-  const skill = await f.manager.register(f.run.run_id, { entry: "run", name: "Revoked failure feedback", card, dependencies: [],
+  const skill = await f.sources.register(f.run.run_id, { entry: "run", name: "Revoked failure feedback", card, dependencies: [],
     source: `let received=false;
 try {
  const checked=await game.actionAndObserve({kind:"look",yaw:0,pitch:0});
@@ -338,10 +340,10 @@ return {status:"completed",summary:"Scoped failure feedback handled",result:{rec
 
 test("generated attention rejects invalid events without wake, effects or admitted calls", async () => {
   let wakes = 0, effects = 0;
-  const { store, run, manager } = fixture(generatedWorker, {
+  const { store, run, manager, sources } = fixture(generatedWorker, {
     programEvent: () => { wakes++; }, action: async () => { effects++; return success; },
   });
-  const skill = await manager.register(run.run_id, { entry: "run", name: "Invalid attention", card, dependencies: [],
+  const skill = await sources.register(run.run_id, { entry: "run", name: "Invalid attention", card, dependencies: [],
     source: `const invalid = [
 {urgency:"immediate",summary:"Invalid urgency",details:null},
 {urgency:"ordinary",summary:"",details:null},
@@ -366,7 +368,7 @@ return {status:"completed",summary:"Invalid attention handled",result:{rejected}
 for (const fence of ["scope", "budget_observer", "unknown", "terminal"] as const)
 test(`${fence} authority cannot publish late program attention or wake cognition`, async () => {
   let wakes = 0, late: Parameters<Runner>[2] | undefined;
-  const { store, run, manager } = fixture(async (_source, _args, handle) => {
+  const { store, run, manager, sources } = fixture(async (_source, _args, handle) => {
     late = handle;
     if (fence === "terminal") return completed;
     if (fence === "scope") run.status = "paused";
@@ -379,7 +381,7 @@ test(`${fence} authority cannot publish late program attention or wake cognition
     programEvent: () => { wakes++; },
     action: async () => ({ status: "unknown", summary: "Uncertain fixture effect", evidence: null, requires_reconnect: true }),
   });
-  const skill = await register(manager, run.run_id, `Revoked attention ${fence}`);
+  const skill = await register(sources, run.run_id, `Revoked attention ${fence}`);
   const off = store.subscribe(event => {
     if (fence === "budget_observer" && event.type === "skill.budget") manager.fence("Synchronous admission observer revoked root");
   });
@@ -619,10 +621,10 @@ describe("durable program execution through host capabilities", () => {
 
   for (const summaryLength of [2000, 2001]) {
     test(`generated terminal summary length ${summaryLength} preserves receipts and rejects only the over-limit result`, async () => {
-      const { directory, store, run, manager } = fixture(generatedWorker);
+      const { directory, store, run, manager, sources } = fixture(generatedWorker);
       const observer = new ModelProgramEvidence(store, directory, DEFAULT_EVALUATION_CAPS, "test-host-clock", () => {});
       try {
-        const skill = await manager.register(run.run_id, { entry: "run", name: `terminal summary ${summaryLength}`, card, dependencies: [],
+        const skill = await sources.register(run.run_id, { entry: "run", name: `terminal summary ${summaryLength}`, card, dependencies: [],
           source: `const receipt = await game.action({kind:"look",yaw:0,pitch:0});
 return {status:"completed",summary:"s".repeat(${summaryLength}),result:{receipt,details:{selected:"actor-authored detail retained"}}};` });
         const accepted = manager.start(run.run_id, start(run, skill, `summary-${summaryLength}`));
@@ -657,8 +659,8 @@ return {status:"completed",summary:"s".repeat(${summaryLength}),result:{receipt,
   }
 
   test("a brief generated summary keeps detailed raw receipts in structured result without increasing protocol limits", async () => {
-    const { store, run, manager } = fixture(generatedWorker);
-    const skill = await manager.register(run.run_id, { entry: "run", name: "brief result with details", card, dependencies: [],
+    const { store, run, manager, sources } = fixture(generatedWorker);
+    const skill = await sources.register(run.run_id, { entry: "run", name: "brief result with details", card, dependencies: [],
       source: 'const receipt=await game.action({kind:"look",yaw:0,pitch:0});return {status:"completed",summary:"One bounded fixture action settled; details are in result.",result:{receipt,details:"d".repeat(4000)}};' });
     const execution = manager.start(run.run_id, start(run, skill, "brief-result"));
     await closed(store, run.run_id, execution.execution_id);
@@ -774,7 +776,7 @@ return {status:"completed",summary:"Explicit fresh bounded decision after pre-ad
   test("real worker named-call refusals remain safe preconditions without admitting native bindings or children", async () => {
     const queries: { id: string; version: number; args: Json }[] = [];
     let effects = 0;
-    const { directory, store, run, manager } = fixture(generatedWorker, {
+    const { directory, store, run, manager, sources } = fixture(generatedWorker, {
       action: async () => { effects++; return success; },
       queryCapability: async (id, version, args) => {
         queries.push({ id, version, args });
@@ -784,11 +786,11 @@ return {status:"completed",summary:"Explicit fresh bounded decision after pre-ad
     const observer = new ModelProgramEvidence(store, directory, DEFAULT_EVALUATION_CAPS, "test-host-clock", () => {});
     try {
       const childSource = 'await game.action({kind:"look",yaw:0,pitch:0});return {status:"completed",summary:"Child executed",result:null};';
-      await manager.register(run.run_id, { entry: "run", name: "recipes", card, dependencies: [], source: childSource });
-      const first = await manager.register(run.run_id, { entry: "run", name: "ambiguous child", card, dependencies: [], source: childSource });
-      const second = await manager.register(run.run_id, { entry: "run", name: "ambiguous child", card, dependencies: [],
+      await sources.register(run.run_id, { entry: "run", name: "recipes", card, dependencies: [], source: childSource });
+      const first = await sources.register(run.run_id, { entry: "run", name: "ambiguous child", card, dependencies: [], source: childSource });
+      const second = await sources.register(run.run_id, { entry: "run", name: "ambiguous child", card, dependencies: [],
         source: 'await game.action({kind:"look",yaw:0,pitch:0});return {status:"completed",summary:"Revised child executed",result:null};' });
-      const skill = await manager.register(run.run_id, { entry: "run", name: "invalid named calls", card,
+      const skill = await sources.register(run.run_id, { entry: "run", name: "invalid named calls", card,
         dependencies: [first, second].map(({ skill_id, version }) => ({ skill_id, version })),
         source: `
 const failures = [];
@@ -842,7 +844,7 @@ return {status:"completed",summary:"Named calls refused; direct native read comp
     trusted.stack = "HOST_STACK_SECRET at /private/host/trusted-capability.ts:42";
     const arbitrary = new Error("HOST_MESSAGE_SECRET /private/host/credentials.json");
     arbitrary.stack = "HOST_STACK_SECRET at /private/host/backend.ts:99";
-    const { directory, store, run, manager } = fixture(generatedWorker, {
+    const { directory, store, run, manager, sources } = fixture(generatedWorker, {
       observe: async () => { throw trusted; },
       queryCapability: async () => { throw arbitrary; },
     });
@@ -850,7 +852,7 @@ return {status:"completed",summary:"Named calls refused; direct native read comp
     const observer = new ModelProgramEvidence(store, directory, DEFAULT_EVALUATION_CAPS,
       "test-host-clock", (_runId, reason) => { stops.push(reason); });
     try {
-      const skill = await manager.register(run.run_id, { entry: "run",
+      const skill = await sources.register(run.run_id, { entry: "run",
         name: "caught capability failures", card, dependencies: [],
         source: `
 let handled = 0;
@@ -907,11 +909,11 @@ return {status:"completed", summary:"Continued after two safely handled rejectio
   });
 
   test("trusted capability diagnostics survive failure cleanup, durable inspection and skill outcome evidence", async () => {
-    const { store, run, manager } = fixture(async (_source, _args, handle) => {
+    const { store, run, manager, sources } = fixture(async (_source, _args, handle) => {
       await handle({ kind: "observe" });
       return completed;
     }, { observe: async () => { throw new RuntimeFault("precondition_failed", "Observation is not available in the current life"); } });
-    const skill = await register(manager, run.run_id, "diagnostic reader");
+    const skill = await register(sources, run.run_id, "diagnostic reader");
     const accepted = manager.start(run.run_id, start(run, skill, "diagnostic-reader"));
     await closed(store, run.run_id, accepted.execution_id);
     const outcome = manager.get(run.run_id, { execution_id: accepted.execution_id })!;
@@ -962,7 +964,7 @@ return {status:"completed", summary:"Continued after two safely handled rejectio
         result: { failed, corrected, blocked },
       };
     };
-    const { store, run, manager } = fixture(runner, {
+    const { store, run, manager, sources } = fixture(runner, {
       action: async () =>
         ++actions === 1
           ? {
@@ -976,8 +978,8 @@ return {status:"completed", summary:"Continued after two safely handled rejectio
         return authorizedObservation();
       },
     });
-    child = await register(manager, run.run_id, "blocked-child");
-    const root = await register(manager, run.run_id, "handles-results", [
+    child = await register(sources, run.run_id, "blocked-child");
+    const root = await register(sources, run.run_id, "handles-results", [
       child,
     ]);
     const accepted = manager.start(run.run_id, start(run, root, "recoverable"));
@@ -1009,7 +1011,7 @@ return {status:"completed", summary:"Continued after two safely handled rejectio
 
   test("unknown leaf effects fence the root before another action can be issued", async () => {
     let actions = 0;
-    const { store, run, manager } = fixture(
+    const { store, run, manager, sources } = fixture(
       async (_source, _args, handle) => {
         try {
           await handle({
@@ -1035,7 +1037,7 @@ return {status:"completed", summary:"Continued after two safely handled rejectio
         },
       },
     );
-    const skill = await register(manager, run.run_id);
+    const skill = await register(sources, run.run_id);
     const accepted = manager.start(
       run.run_id,
       start(run, skill, "unknown-effect"),
@@ -1051,13 +1053,13 @@ return {status:"completed", summary:"Continued after two safely handled rejectio
     let invocations = 0;
     const entered = deferred<void>(),
       release = deferred<void>();
-    const { store, run, manager } = fixture(async () => {
+    const { store, run, manager, sources } = fixture(async () => {
       invocations++;
       entered.resolve();
       await release.promise;
       return completed;
     });
-    const skill = await register(manager, run.run_id);
+    const skill = await register(sources, run.run_id);
     const request = start(run, skill, "stable-start");
     const accepted = manager.start(run.run_id, request);
     await entered.promise;
@@ -1095,7 +1097,7 @@ return {status:"completed", summary:"Continued after two safely handled rejectio
       }
       return completed;
     };
-    const { store, run, manager } = fixture(runner, {
+    const { store, run, manager, sources } = fixture(runner, {
       observe: async () => {
         observed++;
         return authorizedObservation();
@@ -1105,8 +1107,8 @@ return {status:"completed", summary:"Continued after two safely handled rejectio
         return success;
       },
     });
-    child = await register(manager, run.run_id, "child");
-    const root = await register(manager, run.run_id, "root", [child]);
+    child = await register(sources, run.run_id, "child");
+    const root = await register(sources, run.run_id, "root", [child]);
     const accepted = manager.start(
       run.run_id,
       start(run, root, "aggregate", null, {
@@ -1166,7 +1168,7 @@ return {status:"completed", summary:"Continued after two safely handled rejectio
             if (--workers === 0) workerClosed.resolve();
           }
         };
-        const { store, run, manager } = fixture(runner, {
+        const { store, run, manager, sources } = fixture(runner, {
           action: async () => { effects++; return success; },
           observe: async () => { observations++; return authorizedObservation(); },
           cancelActions: async () => { cleanupEntered.resolve(); await cleanup.promise; },
@@ -1182,10 +1184,10 @@ try {
 }
 return {status:"completed",summary:"Must not override exhausted authority",result:null};
 `;
-        const child = composed ? await manager.register(run.run_id, {
+        const child = composed ? await sources.register(run.run_id, {
           entry: "run", name: "budget child", card, dependencies: [], source: body,
         }) : null;
-        const root = await manager.register(run.run_id, {
+        const root = await sources.register(run.run_id, {
           entry: "run", name: "budget root", card,
           dependencies: child ? [{ skill_id: child.skill_id, version: child.version }] : [],
           source: child
@@ -1253,12 +1255,12 @@ return {status:"completed",summary:"Must not override exhausted authority",resul
 
   test("an undeclared named dependency cannot acquire a child execution", async () => {
     let dependency: SkillRef;
-    const { store, run, manager } = fixture(async (_source, _args, handle) => {
+    const { store, run, manager, sources } = fixture(async (_source, _args, handle) => {
       await handle({ kind: "call", skill: { name: "not-declared", version: dependency.version }, args: null });
       return completed;
     });
-    dependency = await register(manager, run.run_id, "not-declared");
-    const root = await register(manager, run.run_id, "root");
+    dependency = await register(sources, run.run_id, "not-declared");
+    const root = await register(sources, run.run_id, "root");
     const accepted = manager.start(run.run_id, start(run, root, "undeclared"));
     await closed(store, run.run_id, accepted.execution_id);
     expect(store.skillExecutions(run.run_id)).toHaveLength(1);
@@ -1290,7 +1292,7 @@ return {status:"completed",summary:"Must not override exhausted authority",resul
         abort.promise,
       ]);
     };
-    const { store, run, manager } = fixture(runner, {
+    const { store, run, manager, sources } = fixture(runner, {
       action: async () => {
         actions++;
         entered.resolve();
@@ -1300,7 +1302,7 @@ return {status:"completed",summary:"Must not override exhausted authority",resul
         await cleanup.promise;
       },
     });
-    const skill = await register(manager, run.run_id);
+    const skill = await register(sources, run.run_id);
     const accepted = manager.start(
       run.run_id,
       start(run, skill, "cancel-tree"),
@@ -1331,7 +1333,7 @@ return {status:"completed",summary:"Must not override exhausted authority",resul
 
   test("unconfirmed isolated cleanup remains unknown rather than a false cancelled success", async () => {
     const entered = deferred<void>();
-    const { store, run, manager, unsafe } = fixture(
+    const { store, run, manager, sources, unsafe } = fixture(
       async (_source, _args, _handle, _limits, signal) => {
         const abort = Promise.withResolvers<void>();
         signal.addEventListener("abort", () => abort.resolve(), { once: true });
@@ -1340,7 +1342,7 @@ return {status:"completed",summary:"Must not override exhausted authority",resul
         throw new SkillCleanupError();
       },
     );
-    const skill = await register(manager, run.run_id);
+    const skill = await register(sources, run.run_id);
     const accepted = manager.start(
       run.run_id,
       start(run, skill, "unknown-cleanup"),
@@ -1369,7 +1371,7 @@ describe("semantic handoff capability boundaries", () => {
         let effects = 0, reads = 0, cancellations = 0, wakes = 0, rejected = 0;
         let leafId = "", leafSignal: AbortSignal | undefined;
         const request: SkillCapabilityRequest = boundary === "action" ? action : boundary === "adapter" ? read : { kind: "observe" };
-        const { store, run, manager } = fixture(async (_source, args, handle, _limits, signal) => {
+        const { store, run, manager, sources } = fixture(async (_source, args, handle, _limits, signal) => {
           if (nested && args !== "leaf") {
             await handle({ kind: "call", skill: { name: args === "middle" ? "boundary leaf" : "boundary middle" },
               args: args === "middle" ? "leaf" : "middle" });
@@ -1405,10 +1407,10 @@ describe("semantic handoff capability boundaries", () => {
           cancelActions: async () => { cancellations++; },
           programEvent: () => { wakes++; },
         });
-        const leaf = await register(manager, run.run_id, "boundary leaf");
-        const middle = await register(manager, run.run_id, "boundary middle", [leaf]);
-        const root = nested ? await register(manager, run.run_id, "boundary root", [middle]) : leaf;
-        const successor = await register(manager, run.run_id, "boundary successor");
+        const leaf = await register(sources, run.run_id, "boundary leaf");
+        const middle = await register(sources, run.run_id, "boundary middle", [leaf]);
+        const root = nested ? await register(sources, run.run_id, "boundary root", [middle]) : leaf;
+        const successor = await register(sources, run.run_id, "boundary successor");
         const accepted = manager.start(run.run_id, start(run, root, "boundary-predecessor", nested ? "root" : "leaf"));
         await entered.promise;
         const next = start(run, successor, "boundary-successor");
@@ -1436,7 +1438,7 @@ describe("semantic handoff capability boundaries", () => {
     test(`synchronous budget publication sees ${kind} admission before handoff`, async () => {
       const release = deferred<void>(), entered = deferred<void>();
       let effects = 0, invocations = 0, retiring: Promise<() => void> | undefined;
-      const { store, run, manager } = fixture(abortableRunner(async (_source, _args, handle) => {
+      const { store, run, manager, sources } = fixture(abortableRunner(async (_source, _args, handle) => {
         invocations++;
         await handle(kind === "action" ? action : { kind: "call", skill: { name: "publication child" }, args: null });
         return completed;
@@ -1447,9 +1449,9 @@ describe("semantic handoff capability boundaries", () => {
           return success;
         },
       });
-      const child = await register(manager, run.run_id, "publication child");
-      const root = await register(manager, run.run_id, "publication root", [child]);
-      const successor = await register(manager, run.run_id, "publication successor");
+      const child = await register(sources, run.run_id, "publication child");
+      const root = await register(sources, run.run_id, "publication root", [child]);
+      const successor = await register(sources, run.run_id, "publication successor");
       const off = store.subscribe(event => {
         if (event.type !== "skill.budget" || retiring) return;
         const predecessor = store.latestRootExecution(run.run_id)!;
@@ -1471,7 +1473,7 @@ describe("semantic handoff capability boundaries", () => {
     test(`handoff does not grant an idle ${nested ? "child" : "root"} its first capability`, async () => {
       const entered = deferred<void>(), never = deferred<SkillResult>();
       let effects = 0;
-      const { store, run, manager } = fixture(abortableRunner(async (_source, args, handle) => {
+      const { store, run, manager, sources } = fixture(abortableRunner(async (_source, args, handle) => {
         if (nested && args !== "child") {
           await handle({ kind: "call", skill: { name: "idle child" }, args: "child" });
           return completed;
@@ -1481,9 +1483,9 @@ describe("semantic handoff capability boundaries", () => {
         await handle(action);
         return completed;
       }), { action: async () => { effects++; return success; } });
-      const child = await register(manager, run.run_id, "idle child");
-      const root = nested ? await register(manager, run.run_id, "idle root", [child]) : child;
-      const successor = await register(manager, run.run_id, "idle successor");
+      const child = await register(sources, run.run_id, "idle child");
+      const root = nested ? await register(sources, run.run_id, "idle root", [child]) : child;
+      const successor = await register(sources, run.run_id, "idle successor");
       const accepted = manager.start(run.run_id, start(run, root, "idle-predecessor"));
       await entered.promise;
       (await manager.retireForHandoff(run.run_id, start(run, successor, "idle-successor"), accepted.execution_id, undefined))();
@@ -1496,7 +1498,7 @@ describe("semantic handoff capability boundaries", () => {
       const entered = deferred<void>(), release = deferred<GameActionResult>(), workerAborted = deferred<void>();
       const cancelled = deferred<void>();
       let signal: AbortSignal | undefined, effects = 0;
-      const { store, run, manager } = fixture(abortableRunner(async (_source, _args, handle, _limits, workerSignal) => {
+      const { store, run, manager, sources } = fixture(abortableRunner(async (_source, _args, handle, _limits, workerSignal) => {
         signal = workerSignal;
         workerSignal.addEventListener("abort", () => workerAborted.resolve(), { once: true });
         await handle(action);
@@ -1506,8 +1508,8 @@ describe("semantic handoff capability boundaries", () => {
         action: async () => { effects++; entered.resolve(); return release.promise; },
         cancelActions: async () => { cancelled.resolve(); },
       });
-      const root = await register(manager, run.run_id, "preempted root");
-      const successor = await register(manager, run.run_id, "preempted successor");
+      const root = await register(sources, run.run_id, "preempted root");
+      const successor = await register(sources, run.run_id, "preempted successor");
       const limits = { ...DEFAULT_SKILL_LIMITS, duration_ms: interruption === "deadline" ? 1000 : 10000 };
       const accepted = manager.start(run.run_id, start(run, root, "preempted-predecessor", null, limits));
       await entered.promise;
@@ -1532,9 +1534,9 @@ describe("semantic handoff capability boundaries", () => {
 
   for (const status of ["completed", "blocked", "failed"] as const)
     test(`natural ${status} is retained rather than rewritten for handoff`, async () => {
-      const { store, run, manager } = fixture(async () => ({ status, summary: "Natural source outcome", result: null }));
-      const root = await register(manager, run.run_id, "natural predecessor");
-      const successor = await register(manager, run.run_id, "natural successor");
+      const { store, run, manager, sources } = fixture(async () => ({ status, summary: "Natural source outcome", result: null }));
+      const root = await register(sources, run.run_id, "natural predecessor");
+      const successor = await register(sources, run.run_id, "natural successor");
       const accepted = manager.start(run.run_id, start(run, root, "natural-predecessor"));
       await closed(store, run.run_id, accepted.execution_id);
       const next = start(run, successor, "natural-successor");
@@ -1546,7 +1548,7 @@ describe("semantic handoff capability boundaries", () => {
   test("a caught held read failure retires before any recovery capability or child", async () => {
     const entered = deferred<void>(), release = deferred<void>();
     let effects = 0, refused = 0;
-    const { store, run, manager } = fixture(async (_source, _args, handle, _limits, signal) => {
+    const { store, run, manager, sources } = fixture(async (_source, _args, handle, _limits, signal) => {
       try { await handle(read); } catch {}
       expect(signal.aborted).toBe(true);
       for (const request of [action, { kind: "call", skill: { name: "read fallback" }, args: null }] satisfies SkillCapabilityRequest[]) {
@@ -1557,8 +1559,8 @@ describe("semantic handoff capability boundaries", () => {
       queryCapability: async () => { entered.resolve(); await release.promise; throw new RuntimeFault("precondition_failed", "Read unavailable"); },
       action: async () => { effects++; return success; },
     });
-    const child = await register(manager, run.run_id, "read fallback");
-    const root = await register(manager, run.run_id, "read failure predecessor", [child]);
+    const child = await register(sources, run.run_id, "read fallback");
+    const root = await register(sources, run.run_id, "read failure predecessor", [child]);
     const next = start(run, child, "read-failure-successor");
     const accepted = manager.start(run.run_id, start(run, root, "read-failure-predecessor"));
     await entered.promise;
@@ -1576,13 +1578,13 @@ describe("semantic handoff capability boundaries", () => {
       const entered = deferred<void>(), release = deferred<void>();
       const receipt: GameActionResult = { status, summary: "Truthful native receipt", evidence: { effect_confirmed: false } };
       let returned: Json | undefined, effects = 0, lateRefusals = 0;
-      const { store, run, manager } = fixture(async (_source, _args, handle) => {
+      const { store, run, manager, sources } = fixture(async (_source, _args, handle) => {
         try { returned = await handle(action); } catch {}
         try { await handle(action); } catch { lateRefusals++; }
         return completed;
       }, { action: async () => { effects++; entered.resolve(); await release.promise; return receipt; } });
-      const root = await register(manager, run.run_id, "receipt predecessor");
-      const successor = await register(manager, run.run_id, "receipt successor");
+      const root = await register(sources, run.run_id, "receipt predecessor");
+      const successor = await register(sources, run.run_id, "receipt successor");
       const accepted = manager.start(run.run_id, start(run, root, "receipt-predecessor"));
       await entered.promise;
       const retiring = manager.retireForHandoff(run.run_id, start(run, successor, "receipt-successor"), accepted.execution_id, undefined);
@@ -1605,14 +1607,14 @@ describe("semantic handoff capability boundaries", () => {
   test("scope mismatch refuses handoff without touching the admitted action", async () => {
     const entered = deferred<void>(), release = deferred<void>();
     let aborted = false;
-    const { store, run, manager } = fixture(async (_source, _args, handle) => {
+    const { store, run, manager, sources } = fixture(async (_source, _args, handle) => {
       await handle(action);
       return completed;
     }, { action: async (_execution, _action, signal) => {
       entered.resolve(); await release.promise; aborted = signal.aborted; return success;
     } });
-    const root = await register(manager, run.run_id, "scope predecessor");
-    const next = await register(manager, run.run_id, "scope successor");
+    const root = await register(sources, run.run_id, "scope predecessor");
+    const next = await register(sources, run.run_id, "scope successor");
     const accepted = manager.start(run.run_id, start(run, root, "scope-predecessor"));
     await entered.promise;
     await expect(manager.retireForHandoff(run.run_id, { ...start(run, next, "scope-successor"), life_id: run.life_id! + 1 },
@@ -1626,9 +1628,9 @@ describe("semantic handoff capability boundaries", () => {
 
   test("retired guards retain current scope, latest root, signal and lost-ack barriers", async () => {
     let invocations = 0;
-    const { store, run, manager } = fixture(async () => { invocations++; return completed; });
-    const root = await register(manager, run.run_id, "guard predecessor");
-    const successor = await register(manager, run.run_id, "guard successor");
+    const { store, run, manager, sources } = fixture(async () => { invocations++; return completed; });
+    const root = await register(sources, run.run_id, "guard predecessor");
+    const successor = await register(sources, run.run_id, "guard successor");
     const accepted = manager.start(run.run_id, start(run, root, "guard-predecessor"));
     await closed(store, run.run_id, accepted.execution_id);
     const controller = new AbortController();
@@ -1651,12 +1653,12 @@ describe("semantic handoff capability boundaries", () => {
 
   test("unconfirmed leaf cleanup cannot acknowledge semantic retirement or a successor", async () => {
     const entered = deferred<void>(), release = deferred<void>();
-    const { store, run, manager } = fixture(async (_source, _args, handle) => {
+    const { store, run, manager, sources } = fixture(async (_source, _args, handle) => {
       await handle(action);
       throw new SkillCleanupError();
     }, { action: async () => { entered.resolve(); await release.promise; return success; } });
-    const root = await register(manager, run.run_id, "unsafe predecessor");
-    const next = await register(manager, run.run_id, "unsafe successor");
+    const root = await register(sources, run.run_id, "unsafe predecessor");
+    const next = await register(sources, run.run_id, "unsafe successor");
     const accepted = manager.start(run.run_id, start(run, root, "unsafe-predecessor"));
     await entered.promise;
     const retiring = manager.retireForHandoff(run.run_id, start(run, next, "unsafe-successor"), accepted.execution_id, undefined);

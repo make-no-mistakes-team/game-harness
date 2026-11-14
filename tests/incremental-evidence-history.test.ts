@@ -22,6 +22,7 @@ import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
 import { jsonSchema } from "../src/shared/primitives.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { SkillManager } from "../src/server/skills.ts";
+import { SourcePrograms } from "../src/server/source-programs.ts";
 import { HistoryReader } from "../src/server/history-reader.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import {
@@ -88,6 +89,7 @@ class EvidenceFixture {
   learning = new ImprovementLearning(this.store, this.reader);
   run: StoredRun;
   manager: SkillManager;
+  sources: SourcePrograms;
   constructor(goalId = "custom", descriptor = true) {
     setSystemTime(new Date(QUERY_TIME));
     this.run = minecraftRunFixture(adapter, {
@@ -110,6 +112,7 @@ class EvidenceFixture {
         ),
       );
     this.manager = this.makeManager();
+    this.sources = this.makeSources();
     resources.push(this);
   }
   makeManager() {
@@ -138,8 +141,11 @@ class EvidenceFixture {
       },
     );
   }
+  makeSources() {
+    return new SourcePrograms(this.store, { adapter: () => adapter, binding: () => minecraftTestBinding(adapter) });
+  }
   async authored(name = "measured", entry: "run" | "step" = "run") {
-    return this.manager.register(this.run.run_id, {
+    return this.sources.register(this.run.run_id, {
       entry,
       name,
       source:
@@ -352,6 +358,7 @@ class EvidenceFixture {
     this.reader = new HistoryReader(this.store.readLocation());
     this.learning = new ImprovementLearning(this.store, this.reader);
     this.manager = this.makeManager();
+    this.sources = this.makeSources();
   }
   async feedback(after = initialCursor(), limit = 100) {
     return this.reader.query(
@@ -536,9 +543,9 @@ function expectNoFiniteAction(row: DetailedProgramEvidence) {
 }
 test("imported resident realm receipts retain goal attribution after a newer library and Store reopen", async () => {
   const f = new EvidenceFixture("craft_crafting_table");
-  const library = await f.manager.register(f.run.run_id, { entry: "library", name: "pure receipt helper",
+  const library = await f.sources.register(f.run.run_id, { entry: "library", name: "pure receipt helper",
     source: "export function step(frame,state,intent) { return null; }", card, dependencies: [] });
-  const root = await f.manager.register(f.run.run_id, { entry: "step", name: "imported resident",
+  const root = await f.sources.register(f.run.run_id, { entry: "step", name: "imported resident",
     source: 'export { step } from "./helper.js";', card,
     dependencies: [{ skill_id: library.skill_id, version: library.version, import_path: "./helper.js" }] });
   const owner = f.admit(root, 0, "step");
@@ -546,7 +553,7 @@ test("imported resident realm receipts retain goal attribution after a newer lib
   const facts = at(10, () => retainResidentReceipt(f.store, adapter, owner, screenInput, residentUpdate));
   const read = f.possession(owner, { crafting_table: 1 }), goal = f.verdict([...facts, read]);
   f.close(owner);
-  await f.manager.register(f.run.run_id, { entry: "library", name: library.name,
+  await f.sources.register(f.run.run_id, { entry: "library", name: library.name,
     source: "export function step(frame,state,intent) { return state; }", card, dependencies: [] });
   await f.reopen(); await f.prepare();
   const evidence = measured(await f.published(), owner);
@@ -628,7 +635,7 @@ for (const reopenBefore of [false, true]) {
     const older = f.admit(before),
       younger = f.admit(before);
     f.close(younger);
-    const after = await f.manager.register(f.run.run_id, {
+    const after = await f.sources.register(f.run.run_id, {
       entry: "run",
       name: before.name,
       source:
@@ -866,14 +873,14 @@ test("same-model authorization rejects foreign comparison before any artifact hy
     model_id: "different-model",
   };
   f.store.saveRun(foreign);
-  const left = await f.manager.register(foreign.run_id, {
+  const left = await f.sources.register(foreign.run_id, {
     entry: "run",
     name: "foreign",
     source,
     card,
     dependencies: [],
   });
-  const right = await f.manager.register(foreign.run_id, {
+  const right = await f.sources.register(foreign.run_id, {
     entry: "run",
     name: "foreign",
     source: 'return {status:"blocked",summary:"Foreign revision",result:null};',
@@ -970,7 +977,7 @@ for (const reopenBefore of [false, true]) {
     for (let index = 0; index < 255; index++)
       f.close(f.admit(other), 40, "failed");
     // The newest catalog version must not substitute for the explicitly selected parent.
-    await f.manager.register(f.run.run_id, {
+    await f.sources.register(f.run.run_id, {
       entry: "run",
       name: other.name,
       source:
@@ -1136,14 +1143,10 @@ for (const reopenBefore of [false, true]) {
       reason: "Candidate addressing the exact latest retained parent outcome",
     });
     const callId = "pinned-beyond-256";
-    const operations = new ProgramOperations(
-      f.store,
-      f.manager,
-      {} as ReactiveRuntime,
-      null,
-      host,
-      f.run,
-    );
+    const operations = new ProgramOperations(f.store, f.manager, f.sources, {} as ReactiveRuntime,
+    null,
+    host,
+    f.run,);
     await expect(
       operations.write(writeInput, callId, () => {
         if (f.store.namedSkill(f.run.run_id, parent.name, 2))
@@ -1164,14 +1167,10 @@ for (const reopenBefore of [false, true]) {
     ).toBe(newer.execution_id);
     await f.reopen();
     const retryCheckpoint = f.store.historyProjectionCheckpoint(f.run.run_id);
-    const retryOperations = new ProgramOperations(
-      f.store,
-      f.manager,
-      {} as ReactiveRuntime,
-      null,
-      host,
-      f.run,
-    );
+    const retryOperations = new ProgramOperations(f.store, f.manager, f.sources, {} as ReactiveRuntime,
+    null,
+    host,
+    f.run,);
     const retried = await retryOperations.write(writeInput, callId, () =>
       host.assertCurrent(1),
     );
@@ -1276,7 +1275,7 @@ for (const workLimit of [1, 2]) {
       throw new Error(
         "Bounded projection did not reach opportunity publication",
       );
-    const db = new Database(f.store.readLocation().database);
+    const db = new Database(f.store.readLocation().projection!);
     try {
       const rowsBefore = db
         .query<{ count: number }, [string]>(

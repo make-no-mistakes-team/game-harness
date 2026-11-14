@@ -10,7 +10,7 @@ import type {
   SkillView,
 } from "../shared/programs.ts";
 import type { Store } from "./store.ts";
-import type { SkillManager } from "./skills.ts";
+import type { SourcePrograms } from "./source-programs.ts";
 import { SKILL_API_VERSION } from "../shared/programs.ts";
 import { sameProgramCompatibility } from "./adapter-contract.ts";
 import { qualifyMinecraftExperience } from "./minecraft-qualification.ts";
@@ -282,7 +282,7 @@ export class ExperienceLibrary {
     modelId: string,
     worldId: string,
     runId: string,
-    manager: SkillManager,
+    sources: Pick<SourcePrograms, "importSnapshot">,
     beforeCommit: () => void = () => {},
   ): Promise<SkillView> {
     const row = this.db
@@ -310,7 +310,7 @@ export class ExperienceLibrary {
       for (const ref of skill.dependencies)
         if (!imported.has(`${ref.skill_id}:${ref.version}`))
           throw new Error("Experience dependency snapshot incomplete");
-      const view = await manager.importSnapshot(runId, skill, beforeCommit);
+      const view = await sources.importSnapshot(runId, skill, beforeCommit);
       imported.set(`${skill.skill_id}:${skill.version}`, view);
     }
     const root = imported.get(`${bundle.root.skill_id}:${bundle.root.version}`);

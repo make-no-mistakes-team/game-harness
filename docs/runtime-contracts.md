@@ -28,7 +28,7 @@ The principal model owns strategy, procedure construction and repair. Disclosed 
 
 GameHarness must be language-agnostic at component boundaries. Performance-critical components may be implemented in native languages without modifying the agent runtime, skill format, or game adapter contracts. Versioned bounded data, explicit deadlines/cancellation and authority checks remain stable across language changes. TypeScript orchestration, Java Fabric perception/motors/capture and generated JavaScript skills are distinct responsibilities; an optional measured Rust optimization cannot introduce a second skill format or bypass the adapter.
 
-The implementation separates `Runtime` lifecycle/observation/goal authority from `ActionArbiter` (`action-arbiter.ts`), `ReactiveRuntime` (`reactive.ts`), `StrategicPlanner` (`strategic.ts`), `RuntimeTools` (`runtime-tools.ts`), `SkillManager` (`skills.ts`), `ExperienceLibrary` (`experience.ts`) and program evidence (`program-evidence.ts`). Each owns its state and enforcement responsibilities; `runtime-prompt.ts` holds authoring instructions. The public runtime API remains the composition seam, not a per-tick gameplay engine.
+The implementation separates `Runtime` lifecycle/observation/goal authority from `ActionArbiter` (`action-arbiter.ts`), `ReactiveRuntime` (`reactive.ts`), `StrategicPlanner` (`strategic.ts`), `RuntimeTools` (`runtime-tools.ts`), `SourcePrograms` (`source-programs.ts`), `SkillManager` (`skills.ts`), `ExperienceLibrary` (`experience.ts`) and program evidence (`program-evidence.ts`). Each owns its state and enforcement responsibilities; `runtime-prompt.ts` holds authoring instructions. The public runtime API remains the composition seam, not a per-tick gameplay engine.
 
 ## Prepare before joining
 
@@ -303,6 +303,13 @@ the original edit call and parent, even after newer versions exist.
 `program_submit` accepts a `run` or `step` definition with required JSON `args` and entry-specific finite limits. Pass `args:null` when unused; omission is invalid before source persistence or execution. For a step, `args` supplies initial intent, and `initial_state` is also accepted. Both playing entries may select speculative `next`. Submission saves one validated version, then requests that exact version through ordinary admission. `program_write` remains save-only. Review and speculative roles cannot submit. The result separates `source:{status:"persisted",name,version}` from `start.status:"started"|"refused"|"unknown"`. A refused start does not roll back source. Inspect an unknown start rather than resubmitting it.
 
 Source registration and its exact-version receipt share one Store transaction. Submission phase identities retain the original source and execution across duplicate delivery or lost acknowledgements; replay never selects a newer catalog revision. An interrupted submission cannot automatically start on redelivery. Stop/Pause, task, owner, generation and negotiated scope are rechecked between persistence and admission. Successful admission retains the scheduler's pending-work behavior instead of requiring a separate run-only model request.
+
+`SourcePrograms` owns source validation, exact snapshot imports, dependency
+identity and catalog publication. It needs source metadata, immutable artifact
+storage and a negotiated compatibility binding, without constructing a physical
+scheduler. Timing and import events finish persistence before authoring returns.
+`SkillManager` owns execution admission, workers and retirement; source-only
+authoring cannot acquire a producer or replace live work.
 
 For an intentional continuation or replacement, `program_submit` and `program_run`
 start accept optional `handoff:{name,version,execution_ordinal}` for the exact
@@ -718,7 +725,14 @@ settles only after the owned child exits and its output pipe drains. Stop fences
 input independently before joining that drain; no query can restore effect or
 provider authority.
 
-SQLite schema 7 retains writer-owned source MVCC and versioned derived history.
+`runs.sqlite` schema 8 retains authoritative source MVCC. Separately bound
+`history.sqlite` schema 1 owns derived rows, generations, checkpoints and
+improvement opportunities. `Store.readLocation()` supplies both paths and the
+immutable artifact directory; current readers refuse a missing or foreign
+projection identity. A derived write transaction does not hold the canonical
+ledger's SQLite writer lock. Both writers still run on the coordinator event
+loop; database separation alone does not isolate physical execution.
+
 Source changes to runs, actions, executions, events, traces, trace budgets and
 immutable program metadata receive durable change sequences. The writer seals
 prior raw values before mutation; an unchanged current value can remain backed
@@ -729,12 +743,26 @@ bootstrap and indexed source pages are bounded to 128 rows.
 Preparation captures its desired source boundary once and never chases later
 mutations within that invocation. A readonly preview computes at most 64 patches
 and 16 opportunity captures within 128 work iterations. The writer validates
-scope, progress, bounds and the prior checkpoint, rechecks candidate captures
-against current evidence, then atomically commits patches and checkpoint progress.
-Failure rolls back the batch; reopen resumes the last committed checkpoint.
+scope, progress, bounds and the prior checkpoint, and rechecks candidate captures
+against a readonly source snapshot. A bounded canonical transaction compares the
+current source frontier and records acceptance of the exact candidate-bearing
+batch hash. Derived patches and checkpoint progress then commit together in the
+projection database. An identical accepted batch can resume after a derived
+rollback; changed content requires fresh source validation.
 Every continuation must fit the complete 8 KiB request frame, including its
 envelope and newline, before it can be committed; fitting the reply alone is
 insufficient.
+
+Review resolution and its audit outbox entry commit together in the projection
+database. Canonical event insertion and its deduplication receipt commit
+together before the outbox is acknowledged. Reopen or identical review replay
+drains pending entries without duplicating `learning.resolved`. These are
+separate durable commits, not a cross-database atomic transaction.
+
+Writer migration copies and verifies existing derived rows and identities before
+removing their old canonical copies. Interrupted migration compares the retained
+copy on reopen; corruption refuses admission instead of rebuilding empty history.
+Frozen combined schema-7 histories remain readable without migration or mutation.
 
 Only complete derived generations become public. Their retained mappings pin the
 derived revision and exact `source_through` across reopen; staged metrics and
@@ -1008,7 +1036,7 @@ bytes. Explicit lossless capture's offline H.264 derivative retains its existing
 Abort or expiry kills the owned encoder and joins its process-close barrier
 before returning.
 
-The active boundary uses observation envelope **3**, executable API/validator/runtime **5**, native hello **4**, and `minecraft.action@4`. Isolated worker framing remains **1**; resident messages use their own version-1 namespace. Login admission proof remains **1**, live binary capture is **GHV2**, SQLite uses schema **7**, usage metrics remain **2**, and request-usage evidence remains **1**. Screen and controller-feedback reads use `minecraft.visible_screen@1` and `minecraft.controller_frame@2`. Semantic heard-event feedback is separate from audio recording, which remains absent. This cutover does not deliver larger source bundles, checkpoints or another supported game.
+The active boundary uses observation envelope **3**, executable API/validator/runtime **5**, native hello **4**, and `minecraft.action@4`. Isolated worker framing remains **1**; resident messages use their own version-1 namespace. Login admission proof remains **1**, live binary capture is **GHV2**, canonical SQLite uses schema **8** with derived schema **1**, usage metrics remain **2**, and request-usage evidence remains **1**. Screen and controller-feedback reads use `minecraft.visible_screen@1` and `minecraft.controller_frame@2`. Semantic heard-event feedback is separate from audio recording, which remains absent. This cutover does not deliver larger source bundles, checkpoints or another supported game.
 
 ### Ordinary Minecraft world input
 

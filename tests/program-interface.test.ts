@@ -20,6 +20,7 @@ import { observationSchema, skillResultSchema } from "../src/shared/validation.t
 import { gameActionResultSchema } from "../src/shared/primitives.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { SkillManager, type SkillHost } from "../src/server/skills.ts";
+import { SourcePrograms } from "../src/server/source-programs.ts";
 import { preserveRuntimeToolArguments, RuntimeTools, type RuntimeToolHost } from "../src/server/runtime-tools.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
@@ -126,7 +127,8 @@ function fixture(runner?: SandboxService["runSkill"], hooks: { action?: SkillHos
       return () => { if (generation !== revision || !["running", "reviewing"].includes(run.status)) throw new RuntimeFault("stale_context", "Fixture turn fenced"); permit?.(); }; },
     finishTask: () => { run.status = "stopping"; generation++; planning.invalidate("cancelled"); manager.fence("Custom completion fenced"); store.saveRun(run); },
   };
-  const catalog = new RuntimeTools(store, manager, {} as ReactiveRuntime, null, toolHost);
+  const sources = new SourcePrograms(store, { adapter: () => adapter, binding: () => minecraftTestBinding(adapter) });
+  const catalog = new RuntimeTools(store, manager, sources, {} as ReactiveRuntime, null, toolHost);
   const tools = () => catalog.build(generation);
   const call = async (name: string, input: unknown, callId: string = crypto.randomUUID(), selected = tools()) => {
     const tool = selected.find((tool) => tool.name === name);
@@ -135,7 +137,7 @@ function fixture(runner?: SandboxService["runSkill"], hooks: { action?: SkillHos
   };
   const close = async () => { planning.invalidate("cancelled"); await manager.closeAll("Fixture complete"); await history.close(); store.close(); rmSync(directory, { recursive: true, force: true }); };
   resources.push(close);
-  return { directory, store, run, manager, planning, learning, history, prepareFeedback, catalog, tools, call, toolHost, actions: () => actions, dispatches: () => dispatches,
+  return { directory, store, run, manager, sources, planning, learning, history, prepareFeedback, catalog, tools, call, toolHost, actions: () => actions, dispatches: () => dispatches,
     observation, setLife: (value: ObservationV3["life"]) => { life = value; },
     fence: () => { generation++; manager.fence("Fixture fenced"); planning.invalidate("cancelled"); },
     write: (name: string, body = source, options: Record<string, unknown> = {}, id?: string) => call("program_write", { entry: "run", name, source: body, card, dependencies: [], ...options }, id),
@@ -242,11 +244,11 @@ test("failed source validation remains timed without fabricating a published rev
 for (const outcome of ["imported", "invalid_source", "revoked_before_commit"] as const) {
   test(`snapshot source readiness remains timed when ${outcome}`, async () => {
     const origin = fixture(), recipient = fixture();
-    const snapshot = await origin.manager.register(origin.run.run_id, { entry: "run",
+    const snapshot = await origin.sources.register(origin.run.run_id, { entry: "run",
       name: "Portable neutral source", source, card, dependencies: [],
     });
     const input = outcome === "invalid_source" ? { ...snapshot, source: "const broken = ;" } : snapshot;
-    const importing = recipient.manager.importSnapshot(recipient.run.run_id, input, () => {
+    const importing = recipient.sources.importSnapshot(recipient.run.run_id, input, () => {
       if (outcome === "revoked_before_commit") throw new Error("Import authority revoked");
     });
     if (outcome === "imported") {
@@ -842,8 +844,8 @@ test("one submission keeps old control through validation and waits actual retir
   await f.write("old controller");
   const predecessor = data(await f.call("program_run", { operation: "start", name: "old controller", args: "old" }));
   await entered.promise;
-  const originalRegister = f.manager.register.bind(f.manager);
-  f.manager.register = async (...args) => { validating.resolve(); await publish.promise; return await originalRegister(...args); };
+  const originalRegister = f.sources.register.bind(f.sources);
+  f.sources.register = async (...args) => { validating.resolve(); await publish.promise; return await originalRegister(...args); };
   const input = { name: "authored successor", source, args: { selected: "original" }, handoff: {
     name: predecessor.name, version: predecessor.version, execution_ordinal: predecessor.execution_ordinal,
   }, limits: { duration_ms: 9000, max_actions: 3, max_calls: 4, max_depth: 2 } };
@@ -1167,9 +1169,9 @@ test("program_submit pins source and dependencies even when a newer revision app
   const f = fixture();
   await f.write("child", 'return {status:"completed",summary:"Original child",result:1};');
   const input = { name: "submitted parent", source: 'return await game.call({name:"child"},args);', args: null, dependencies: [{ name: "child" }] };
-  const originalRegister = f.manager.register.bind(f.manager);
+  const originalRegister = f.sources.register.bind(f.sources);
   let interleave = true;
-  f.manager.register = async (...args) => {
+  f.sources.register = async (...args) => {
     const written = await originalRegister(...args);
     if (interleave && written.name === input.name) {
       interleave = false;
@@ -1188,8 +1190,8 @@ test("program_submit pins source and dependencies even when a newer revision app
 for (const boundary of ["stop", "pause", "generation", "task", "owner"] as const) {
   test(`program_submit preserves source but blocks ${boundary} authority changes between phases`, async () => {
     const f = fixture();
-    const originalRegister = f.manager.register.bind(f.manager);
-    f.manager.register = async (...args) => {
+    const originalRegister = f.sources.register.bind(f.sources);
+    f.sources.register = async (...args) => {
       const written = await originalRegister(...args);
       if (boundary === "stop") f.run.status = "stopped";
       if (boundary === "pause") f.run.status = "paused";
@@ -1287,15 +1289,15 @@ for (const boundary of ["pause", "generation", "abort"] as const) {
 
 test("program_submit persisted-source interruption cannot create another revision or silently start on duplicate", async () => {
   const f = fixture();
-  const originalRegister = f.manager.register.bind(f.manager);
-  f.manager.register = async (...args) => {
+  const originalRegister = f.sources.register.bind(f.sources);
+  f.sources.register = async (...args) => {
     await originalRegister(...args);
     throw new Error("Lost acknowledgement immediately after immutable source commit");
   };
   const input = { name: "lost source acknowledgement", source, args: null };
   const first = data(await f.call("program_submit", input, "lost-source-submit"));
   expect(first).toMatchObject({ source: { status: "persisted", version: 1 }, start: { status: "refused", error: { retryable: false } } });
-  f.manager.register = originalRegister;
+  f.sources.register = originalRegister;
   await f.write(input.name, source, { based_on: 1 });
   expect(data(await f.call("program_submit", input, "lost-source-submit"))).toEqual(first);
   expect(f.store.skills(f.run.run_id)).toHaveLength(2);
@@ -1305,13 +1307,13 @@ test("program_submit persisted-source interruption cannot create another revisio
 
 test("program_write lost source acknowledgement reuses the registered version rather than rechecking latest", async () => {
   const f = fixture();
-  const originalRegister = f.manager.register.bind(f.manager);
-  f.manager.register = async (...args) => {
+  const originalRegister = f.sources.register.bind(f.sources);
+  f.sources.register = async (...args) => {
     await originalRegister(...args);
     throw new Error("Source committed but acknowledgement lost");
   };
   expect((await f.write("write replay", source, {}, "write-lost-source")).isError).toBe(true);
-  f.manager.register = originalRegister;
+  f.sources.register = originalRegister;
   await f.write("write replay", source, { based_on: 1 });
   expect(data(await f.write("write replay", source, {}, "write-lost-source"))).toMatchObject({ name: "write replay", version: 1 });
   expect(f.store.skills(f.run.run_id)).toHaveLength(2);
@@ -1409,15 +1411,15 @@ for (const interruption of ["registration", "final_ack"] as const) {
     await f.write("edit replay");
     const id = `edit-replay-${interruption}`;
     const input = { name: "edit replay", based_on: 1, edits: [{ old_text: "Neutral result", new_text: "Edited result" }] };
-    const register = f.manager.register.bind(f.manager);
+    const register = f.sources.register.bind(f.sources);
     const db = new Database(join(f.directory, "runs.sqlite"));
-    if (interruption === "registration") f.manager.register = async (...args) => {
+    if (interruption === "registration") f.sources.register = async (...args) => {
       await register(...args);
       throw new Error("Edit registration acknowledgement lost");
     };
     else db.exec(`CREATE TRIGGER lose_edit_ack BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND NEW.object_key='${id}' BEGIN SELECT RAISE(ABORT,'edit acknowledgement lost'); END;`);
     expect((await f.call("program_edit", input, id)).isError).toBe(true);
-    f.manager.register = register;
+    f.sources.register = register;
     if (interruption === "final_ack") db.exec("DROP TRIGGER lose_edit_ack;");
     db.close();
     expect(f.store.namedSkill(f.run.run_id, "edit replay")!.version).toBe(2);
@@ -1487,10 +1489,10 @@ test("program_write durably pins local library aliases even when registration is
   const input = { entry: "analyze", name: "pure consumer",
     source: 'import {value} from "./helper.js"; export function analyze(input) { return value; }',
     dependencies: [{ name: "pure helper", import_path: "./helper.js" }] };
-  const register = f.manager.register.bind(f.manager);
-  f.manager.register = async () => { throw new Error("Interrupted after exact dependency binding"); };
+  const register = f.sources.register.bind(f.sources);
+  f.sources.register = async () => { throw new Error("Interrupted after exact dependency binding"); };
   expect((await f.call("program_write", input, "module-binding-replay")).isError).toBe(true);
-  f.manager.register = register;
+  f.sources.register = register;
   expect((await f.write("pure helper", "export const value = 2;", { entry: "library", based_on: 1 })).isError).not.toBe(true);
   expect(data(await f.call("program_write", input, "module-binding-replay"))).toMatchObject({
     name: "pure consumer", version: 1, dependencies: [{ name: "pure helper", version: 1, import_path: "./helper.js" }],
@@ -1535,8 +1537,8 @@ test("program_submit never retries an ambiguous start without a durable executio
 test("program_submit duplicate during validation cannot create a second version or execution", async () => {
   const f = fixture();
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-  const originalRegister = f.manager.register.bind(f.manager);
-  f.manager.register = async (...args) => {
+  const originalRegister = f.sources.register.bind(f.sources);
+  f.sources.register = async (...args) => {
     entered.resolve();
     await release.promise;
     return await originalRegister(...args);
@@ -1557,8 +1559,8 @@ test("program_submit duplicate during validation cannot create a second version 
 test("program_submit duplicate after persistence fences the still-pending original start attempt", async () => {
   const f = fixture();
   const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
-  const originalRegister = f.manager.register.bind(f.manager);
-  f.manager.register = async (...args) => {
+  const originalRegister = f.sources.register.bind(f.sources);
+  f.sources.register = async (...args) => {
     const program = await originalRegister(...args);
     entered.resolve();
     await release.promise;

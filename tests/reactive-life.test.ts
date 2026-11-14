@@ -10,6 +10,7 @@ import { JevBroker } from "../src/server/jev.ts";
 import { ReactiveRuntime, activateSchema } from "../src/server/reactive.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { SkillManager } from "../src/server/skills.ts";
+import { SourcePrograms } from "../src/server/source-programs.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
 import { minecraftActionSchema } from "../src/shared/minecraft.ts";
@@ -87,7 +88,8 @@ function reflexOperations(f: ReturnType<typeof fixture>) {
     observe: () => f.game.observe(), generation: () => 1, attentionAfter: unexpected, admitted: unexpected,
     history: unexpected, planning: unexpected, learning: unexpected, finishTask: unexpected,
   };
-  const catalog = new RuntimeTools(f.store, {} as SkillManager, f.reactive, null, host);
+  const sources = new SourcePrograms(f.store, { adapter: () => f.adapter, binding: () => f.game.snapshot().binding });
+  const catalog = new RuntimeTools(f.store, {} as SkillManager, sources, f.reactive, null, host);
   return async (input: unknown, callId: string, signal?: AbortSignal) => {
     const tool = catalog.build(1).find(value => value.name === "reflex")!;
     const result = await tool.execute(callId, input, signal);
@@ -778,6 +780,7 @@ test("owned reactive cancellation preserves UNKNOWN action and root, drains the 
     recover: async () => { throw new Error("No respawn in this preemption fixture"); },
   });
   f.bindManager(manager);
+  const sources = new SourcePrograms(f.store, { adapter: () => f.adapter, binding: () => f.game.snapshot().binding });
   cleanups.push(async () => { await manager.closeAll("Fixture cleanup"); });
   const move = hold<GameActionResult>(interrupted);
   const cancellationAck = hold<void>(undefined);
@@ -804,7 +807,7 @@ test("owned reactive cancellation preserves UNKNOWN action and root, drains the 
     uncertaintyFences++;
     f.reactive.fence();
   });
-  const skill = await manager.register(f.run.run_id, { entry: "run",
+  const skill = await sources.register(f.run.run_id, { entry: "run",
     name: "Interrupted movement",
     source: 'await game.action({kind:"move",controls:{forward:true},duration_ms:2000}); return {status:"completed",summary:"Movement settled",result:null};',
     dependencies: [], card: specification().card,

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ObservationV3 } from "../src/shared/contracts.ts";
 import type { SkillView } from "../src/shared/programs.ts";
 import { SkillManager } from "../src/server/skills.ts";
+import { SourcePrograms } from "../src/server/source-programs.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { Store, type StoredRun } from "../src/server/store.ts";
@@ -106,9 +107,10 @@ test(`real durable ${scenario.activation} admission after ${scenario.order} pres
     wake: () => {},
   });
   resources.push({ manager, planner, store, directory });
+  const sources = new SourcePrograms(store, { adapter: () => adapter, binding: () => minecraftTestBinding(adapter) });
   const card = { purpose: "Observe", applicability: "Authorized state", method: "Fresh observation", reason: "Neutral mechanics regression", limitations: "No gameplay claim" };
-  rootSource = await manager.register(run.run_id, { entry: "run", name: "predecessor", source: 'await game.observe(); return {status:"completed",summary:"Observed",result:null};', card, dependencies: [] });
-  const candidate = await manager.register(run.run_id, { entry: "run",
+  rootSource = await sources.register(run.run_id, { entry: "run", name: "predecessor", source: 'await game.observe(); return {status:"completed",summary:"Observed",result:null};', card, dependencies: [] });
+  const candidate = await sources.register(run.run_id, { entry: "run",
     name: "follow-up", source: 'const fresh = await game.observe(); return {status:"completed",summary:"Fresh observation",result:fresh.observation_seq};', card, dependencies: [],
   });
   const rootRequest = { entry: "run" as const,

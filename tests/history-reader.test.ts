@@ -43,14 +43,18 @@ function closureObserved(snapshot: HistoryReaderSnapshot) {
   expect(snapshot.child!.closedHostMs!).toBeGreaterThanOrEqual(snapshot.child!.exitObservedHostMs!);
   expect(snapshot.child!.closedHostMs!).toBeGreaterThanOrEqual(snapshot.child!.stdoutDrainObservedHostMs!);
 }
-function digest(file: string) { return createHash("sha256").update(readFileSync(file)).digest("hex"); }
+function digest(store: HistoryFixture["store"]) {
+  const { database, projection } = store.readLocation();
+  return [database, projection!]
+    .map(file => createHash("sha256").update(readFileSync(file)).digest("hex"))
+    .join(":");
+}
 
 test("real worker is lazy, reuses one readonly child, and returns detached values", async () => {
   const { reader, query, store } = setup();
   expect(reader.snapshot()).toEqual({ closed: false, active: false, queued: 0, child: null });
   store.close();
-  const database = store.readLocation().database;
-  const before = digest(database);
+  const before = digest(store);
   const first = await reader.query(query, options());
   const pid = reader.snapshot().child!.pid;
   expect(first).toEqual({ episodes: [], next_after: 0, has_more: false });
@@ -60,7 +64,7 @@ test("real worker is lazy, reuses one readonly child, and returns detached value
   expect(reader.snapshot().child!.closedHostMs).toBeNull();
   await reader.close();
   closureObserved(reader.snapshot());
-  expect(digest(database)).toBe(before);
+  expect(digest(store)).toBe(before);
 });
 
 test("strict validation, finite host deadlines and pre-aborted queries do not launch a child", async () => {
@@ -217,7 +221,7 @@ test("worker opening faults are explicit and settle queued work only after pipe 
 async function rawWorker(fixture: HistoryFixture, input: Buffer) {
   const location = fixture.store.readLocation();
   const child = spawn(process.execPath, ["--no-env-file", fileURLToPath(new URL("../src/server/history-worker.ts", import.meta.url)),
-    location.database, location.artifacts], { stdio: ["pipe", "pipe", "ignore"], env: { LANG: "C.UTF-8", LC_ALL: "C.UTF-8", TZ: "UTC" } });
+    location.database, location.artifacts, location.projection!], { stdio: ["pipe", "pipe", "ignore"], env: { LANG: "C.UTF-8", LC_ALL: "C.UTF-8", TZ: "UTC" } });
   const closed = Promise.withResolvers<number | null>();
   const output: Buffer[] = [];
   child.stdout!.on("data", (chunk: Buffer) => output.push(chunk));
@@ -231,12 +235,12 @@ async function rawWorker(fixture: HistoryFixture, input: Buffer) {
 test("fixed worker accepts one strict UTF-8 line and closes readonly storage on normal EOF", async () => {
   const fixture = setup();
   fixture.store.close();
-  const before = digest(fixture.store.readLocation().database);
+  const before = digest(fixture.store);
   const response = await rawWorker(fixture, Buffer.from(JSON.stringify({ id: 1, query: fixture.query }) + "\n"));
   expect(response.code).toBe(0);
   expect(response.output.length).toBeLessThanOrEqual(HISTORY_LIMITS.responseBytes);
   expect(JSON.parse(response.output.toString("utf8"))).toEqual({ id: 1, ok: true, value: { episodes: [], next_after: 0, has_more: false } });
-  expect(digest(fixture.store.readLocation().database)).toBe(before);
+  expect(digest(fixture.store)).toBe(before);
 });
 
 test("fixed worker rejects malformed, unknown, invalid UTF-8 and oversized whole request frames", async () => {
@@ -272,7 +276,7 @@ test("real worker reconstructs oversized UTF-8 archives from bounded pages and c
   const task = "界😀".repeat(HISTORY_LIMITS.responseBytes);
   fixture.store.saveRun({ ...fixture.run, task });
   fixture.store.close();
-  const before = digest(fixture.store.readLocation().database);
+  const before = digest(fixture.store);
   const chunks: { text: string; sha256: string; original_bytes: number; chunk_count: number }[] = [];
   let after: HistoryExportCursor = { record_index: 0, chunk_index: 0 };
   let pages = 0;
@@ -314,5 +318,5 @@ test("real worker reconstructs oversized UTF-8 archives from bounded pages and c
     expect(chunk).toMatchObject({ sha256: hash, original_bytes: bytes, chunk_count: chunks.length });
   expect(JSON.parse(encoded)).toMatchObject({ run_id: fixture.run.run_id, task });
   expect(bytes).toBeGreaterThan(HISTORY_LIMITS.responseBytes);
-  expect(digest(fixture.store.readLocation().database)).toBe(before);
+  expect(digest(fixture.store)).toBe(before);
 });

@@ -28,7 +28,8 @@ def generateNativeContract = tasks.register('generateNativeContract', Exec) {
     inputs.files(file('../../package.json'), file('../../bun.lock'), file('../../scripts/build-native-contract.ts'))
     inputs.files(fileTree('../../src/shared'), file('../../src/server/adapter-contract.ts'),
         file('../../src/server/native-contract.ts'), file('../../src/server/minecraft-adapter.ts'),
-        file('../../src/server/actor-frames.ts'), file('../../src/server/video.ts'))
+        file('../../src/server/actor-frames.ts'), file('../../src/server/video.ts'),
+        fileTree('../../src/server') { include 'actor-frame-*.ts' }, file('../../src/server/os-monotonic.ts'))
     outputs.file(contractResources.map { it.file('gameharness-native-contract.json') })
 }
 sourceSets.main.resources.srcDir(contractResources)

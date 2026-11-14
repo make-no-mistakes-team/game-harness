@@ -608,6 +608,15 @@ discarded before authored computation. The next decision uses a capture retained
 by the new channel. An authorized read-only snapshot cannot be relabeled as a
 new owner's input capture merely because the transfer finished while it waited.
 
+Ordinary `observe` health and inventory receipts have independent read custody:
+the exact request nonce and receipt generation, connection, player, client world,
+life, authoritative space and profile. Retiring a physical producer may advance
+effect cancellation authority while that server receipt is in flight; it does
+not invalidate an otherwise unchanged observation read. A changed read scope
+settles with a rejection instead of silently losing the reply. Stop still
+rejects pending reads, and motor/respawn receipts retain their effect-authority
+checks. This grants no input authority, retry, deadline renewal or wider sensing.
+
 Native supervision is separate from a child's hard deadline. An exact retained
 capture no older than 150 ms can renew the selected semantic producer for 250 ms
 from that capture. Expiry fences motor, input and deferred GUI emission; cleanup
@@ -1001,6 +1010,11 @@ original 1500 ms preparation window, measured with Linux `CLOCK_MONOTONIC`.
 Cancellation joins that owner; Runtime closure also drains it. There is no local
 encoding fallback. Recording callers use the same codec without acquiring actor
 selection authority.
+
+The native build fingerprint includes the extracted codec, image client,
+protocol, worker and monotonic-clock source, as well as the selector. Changes
+to those modules require a freshly generated native contract; moving code out
+of the selector does not remove it from artifact identity.
 
 The parent retains capture identity from the original packet and rechecks its
 freshness and selection scope after the worker closes. A child result cannot

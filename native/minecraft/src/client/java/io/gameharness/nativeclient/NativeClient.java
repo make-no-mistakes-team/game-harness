@@ -37,7 +37,7 @@ public final class NativeClient implements ClientModInitializer {
   public static NativeClient INSTANCE;
   public static long blockedKeyboardCallbacks, blockedMouseCallbacks, suppressedPolls;
   private int receiptNonce;
-  private final Map<Integer, Long> pendingObservations = new LinkedHashMap<>();
+  private final Map<Integer, InventoryObservationRead> pendingObservations = new LinkedHashMap<>();
   private final Map<Long, Long> pendingGuiReads = new LinkedHashMap<>();
   private record ControllerRead(SoundProjection.Cursor cursor, long deadline) {}
   private final Map<Long, ControllerRead> pendingControllerReads = new LinkedHashMap<>();
@@ -192,7 +192,18 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   public void inventoryReceipt(int nonce, long generation, String contents) {
-    if (generation != authority || client.player == null || client.world == null) return;
+    InventoryObservationRead pendingObservation = pendingObservations.get(nonce);
+    if (pendingObservation != null && !pendingObservation.accepts(generation, config,
+        client.player, client.world, lifecycle.lifeId(), incarnationSignals.space(), compatibilityHash)) {
+      pendingObservations.remove(nonce);
+      reply(pendingObservation.requestId(), null, "Observation receipt predates its player or connection scope");
+      return;
+    }
+    // Producer retirement advances effect authority while this independent read
+    // is in flight. Its exact nonce/generation and unchanged player scope remain
+    // sufficient; motor/respawn receipts still require current effect authority.
+    if ((pendingObservation == null && generation != authority)
+        || client.player == null || client.world == null) return;
     if (nonce != respawnReceipt && !pendingObservations.containsKey(nonce)
         && (motor == null || generation != motor.generation || nonce != motor.receiptNonce)) return;
     JsonObject value = JsonParser.parseString(contents).getAsJsonObject();
@@ -225,13 +236,14 @@ public final class NativeClient implements ClientModInitializer {
     PlayerLifecycle.Decision decision =
         handleLifecycle(alive && client.player.getHealth() > 0 && !client.player.isDead(), true);
     if (decision == PlayerLifecycle.Decision.WAIT && lifecycle.status() == PlayerLifecycle.Status.LOADING) {
-      Long waiting = pendingObservations.remove(nonce);
+      InventoryObservationRead waiting = pendingObservations.remove(nonce);
       if (waiting != null)
-        reply(waiting, null, "Waiting for authoritative player state");
+        reply(waiting.requestId(), null, "Waiting for authoritative player state");
       return;
     }
-    Long observationId = pendingObservations.remove(nonce);
-    if (observationId != null) {
+    InventoryObservationRead observationRead = pendingObservations.remove(nonce);
+    if (observationRead != null) {
+      if (generation != authority) observationProducerTurnovers++;
       JsonObject observation = observe();
       JsonArray inventory = new JsonArray();
       for (var entry : value.getAsJsonObject("slots").entrySet()) {
@@ -252,7 +264,7 @@ public final class NativeClient implements ClientModInitializer {
       }
       observation.getAsJsonObject("data").getAsJsonObject("player").add("inventory", inventory);
       observation.getAsJsonObject("data").getAsJsonObject("player").add("health", value.get("health"));
-      reply(observationId, observation, null);
+      reply(observationRead.requestId(), observation, null);
       return;
     }
     if (motor == null || generation != motor.generation || nonce != motor.receiptNonce) return;
@@ -408,6 +420,7 @@ public final class NativeClient implements ClientModInitializer {
   private Motor motor;
   private Video video;
   private long observationSeq;
+  private long observationProducerTurnovers;
   private long observationNanos,
       observationCount,
       observationMaxNanos,
@@ -1557,8 +1570,10 @@ public final class NativeClient implements ClientModInitializer {
           return;
         }
         int nonce = nextReceiptNonce();
-        pendingObservations.put(nonce, id);
-        InventoryProofClient.request(nonce, authority);
+        long receiptGeneration = authority;
+        pendingObservations.put(nonce, new InventoryObservationRead(id, receiptGeneration,
+            config, client.player, client.world, lifecycle.lifeId(), incarnationSignals.space(), compatibilityHash));
+        InventoryProofClient.request(nonce, receiptGeneration);
         return;
       }
       if (method.equals("visible_screen")) {
@@ -1756,6 +1771,8 @@ public final class NativeClient implements ClientModInitializer {
       m.add("navigation_lookahead", lookahead);
     }
     m.addProperty("observation_count", observationCount);
+    m.addProperty("observation_receipts_after_producer_retirement", observationProducerTurnovers);
+    m.addProperty("pending_observation_receipts", pendingObservations.size());
     m.addProperty(
         "observation_mean_ms",
         observationCount == 0 ? 0 : observationNanos / 1e6 / observationCount);
@@ -2380,7 +2397,7 @@ public final class NativeClient implements ClientModInitializer {
   }
 
   private void rejectObservations(String reason) {
-    for (long id : pendingObservations.values()) reply(id, null, reason);
+    for (InventoryObservationRead read : pendingObservations.values()) reply(read.requestId(), null, reason);
     pendingObservations.clear();
   }
   private void settleGuiReads() {

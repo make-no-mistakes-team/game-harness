@@ -15,6 +15,8 @@ export const NATIVE_CONTRACT_BUILD_INPUTS = [
   "src/shared/contracts.ts", "src/shared/control.ts", "src/shared/controller.ts", "src/shared/resident.ts", "src/shared/control-session.ts", "src/shared/observations.ts", "src/shared/minecraft.ts", "src/shared/primitives.ts", "src/shared/adapter.ts",
   "src/shared/validation.ts", "src/shared/programs.ts", "src/shared/video.ts", "src/server/adapter-contract.ts", "src/server/native-contract.ts",
   "src/server/minecraft-adapter.ts", "src/server/actor-frames.ts", "src/server/video.ts",
+  "src/server/actor-frame-codec.ts", "src/server/actor-frame-client.ts",
+  "src/server/actor-frame-protocol.ts", "src/server/actor-frame-worker.ts", "src/server/os-monotonic.ts",
 ];
 export interface NativeBuildIdentity {
   schema_version: 1;

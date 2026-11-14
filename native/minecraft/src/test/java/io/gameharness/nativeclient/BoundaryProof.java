@@ -12,6 +12,42 @@ public final class BoundaryProof {
   public static void main(String[] ignored) {
     VideoFrameQueueProof.main(ignored);
     SoundProjectionProof.main(ignored);
+    Object connection = new Object(), player = new Object(), world = new Object();
+    String profile = "a".repeat(64);
+    EffectAuthority.Space space = new EffectAuthority.Space("minecraft:overworld", 1);
+    EffectAuthority effects = new EffectAuthority("session", "world", 1);
+    effects.bind(profile, 1, space, null);
+    long readGeneration = effects.cancellationGeneration();
+    InventoryObservationRead read = new InventoryObservationRead(
+        10, readGeneration, connection, player, world, 1, space, profile);
+    EffectAuthority.Scope effectScope = new EffectAuthority.Scope("session", "world", 1,
+        effects.nativeBootId(), "run", 1, 1, 1, "execution", "b".repeat(64));
+    EffectAuthority.Owner producer = new EffectAuthority.Owner("producer", effectScope, readGeneration);
+    require(effects.grant(producer, profile, EffectAuthority.ScreenPrecondition.absent())
+        == EffectAuthority.Rejection.NONE, "read/producer overlap was not admitted");
+    require(effects.close(producer) && effects.cancellationGeneration() != readGeneration,
+        "producer retirement did not advance effect authority");
+    require(read.accepts(readGeneration, connection, player, world, 1, space, profile),
+        "ordinary observation lost its exact receipt during producer retirement");
+    require(!read.accepts(effects.cancellationGeneration(), connection, player, world, 1, space, profile),
+        "a different receipt generation was relabelled as the pending read");
+    require(!read.accepts(readGeneration, new Object(), player, world, 1, space, profile),
+        "old connection receipt reached a replacement connection");
+    require(!read.accepts(readGeneration, connection, new Object(), world, 1, space, profile),
+        "old player receipt reached a replacement player");
+    require(!read.accepts(readGeneration, connection, player, new Object(), 1, space, profile),
+        "old world receipt reached a replacement client world");
+    require(!read.accepts(readGeneration, connection, player, world, 2, space, profile),
+        "old health/inventory receipt reached a different life");
+    require(!read.accepts(readGeneration, connection, player, world, 1,
+        new EffectAuthority.Space("minecraft:the_nether", 1), profile),
+        "old receipt crossed dimensions");
+    require(!read.accepts(readGeneration, connection, player, world, 1,
+        new EffectAuthority.Space("minecraft:overworld", 2), profile),
+        "old receipt crossed an authoritative relocation");
+    require(!read.accepts(readGeneration, connection, player, world, 1, null, profile)
+        && !read.accepts(readGeneration, connection, player, world, 1, space, "c".repeat(64)),
+        "loading or changed profile retained old observation custody");
     VoxelVisibility ray = new VoxelVisibility();
     VoxelVisibility.Cells air = (x, y, z) -> 0;
     require(ray.clear(.5, .5, .5, 3.5, .5, .5, 3, 0, 0, air), "clear ray blocked");

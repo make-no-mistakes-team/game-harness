@@ -336,6 +336,15 @@ requirements remain, Main ends its planning response normally, retaining useful
 bounded control and requesting a finite attention wake only when needed. The
 host does not parse summary wording or consult evaluator-private counters.
 
+An ordinary Main request with `task_finish` advertised already has decision
+authority. Supported whole-task completion belongs in that decision, even while
+a resident runs; terminal shutdown owns its retirement. A running execution is
+not evidence that task requirements remain. Read genuinely missing facts within
+the same turn, and reserve timed attention for unfinished work that needs future
+evidence. The shared custom-completion guidance applies to both idle and
+pending-root decision context. It changes instructions, not tool permissions,
+explicit affirmation, verification or automatic-closure behavior.
+
 Ordinary task entry starts with **Custom / natural language**, without an automatic verifier. Built-in success checks are explicit presets: selecting one replaces the draft with its matching prompt and displays its exact early-stop condition. Editing that prompt switches to Custom, even if the original text is later restored; rebinding requires an explicit preset selection. UI, HTTP and Runtime accept the same trimmed task length of 1–4,000 characters. API callers remain responsible for binding a registered criterion to the whole request.
 
 The host records `task.completion_reported` with `source:"model"`, `reported_outcome:"completed"` and `verification:"unverified"`. It synchronously fences further inference and effects, acknowledges `status:"stopping"`, then awaits ordinary neutralization and worker/planner/action drain before reaching `stopped`. It retains a healthy session/video and does not start post-goal review. The tool does not emit `goal.verified`, qualify experience or bypass a built-in verifier. Speculative and review roles cannot invoke it. Identical tool-call retries return the original acknowledgement without another closure request; changed arguments conflict.

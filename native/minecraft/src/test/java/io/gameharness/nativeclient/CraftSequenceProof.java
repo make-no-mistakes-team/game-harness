@@ -107,6 +107,28 @@ public final class CraftSequenceProof {
     require(!fence.held() && !fence.allows(screen, handler, 7, true), "Stop retained press/release authority");
     require(fence.cleanupOwns(screen, handler, 7) && !fence.cleanupOwns(new Object(), handler, 7),
         "cleanup lost exact old handler identity");
+    var startup = new InventoryGestureFence(screen, handler, 7);
+    require(startup.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 0, 0),
+        "empty preplan server inventory update lost its actual handler");
+    require(!startup.allowsUnplannedInventoryRefresh(new Object(), handler, 7, true, 0, 0)
+        && !startup.allowsUnplannedInventoryRefresh(screen, new Object(), 7, true, 0, 0)
+        && !startup.allowsUnplannedInventoryRefresh(screen, handler, 8, true, 0, 0),
+        "startup refresh crossed screen, handler or sync identity");
+    require(!startup.allowsUnplannedInventoryRefresh(screen, handler, 7, false, 0, 0)
+        && !startup.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 1, 0)
+        && !startup.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 0, 1),
+        "startup refresh discarded a planned pointer or nonempty cursor/grid");
+    startup.sealInventoryPlan();
+    require(!startup.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 0, 0),
+        "inventory changed after recipe planning was silently rebased");
+    var pressed = new InventoryGestureFence(screen, handler, 7);
+    pressed.press(); pressed.release();
+    require(!pressed.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 0, 0),
+        "a completed press reopened the startup inventory baseline");
+    var revoked = new InventoryGestureFence(screen, handler, 7);
+    revoked.revoke();
+    require(!revoked.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 0, 0),
+        "Stop allowed a fresh inventory baseline");
     for (int count : new int[] {0, 17}) {
       try { new CraftSequence(List.of(new CraftSequence.Stage("stick", count))); throw new AssertionError("unbounded quantity"); }
       catch (IllegalArgumentException expected) {}

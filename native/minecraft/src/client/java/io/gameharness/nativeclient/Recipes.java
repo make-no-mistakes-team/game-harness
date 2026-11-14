@@ -287,6 +287,7 @@ public final class Recipes {
       case 0 -> {
         if (!session.clean()) { fail("craft_grid_or_cursor_not_clear"); return; }
         if (!outputCapacity(c, output.getCount())) { fail("craft_output_capacity_unavailable"); return; }
+        if (!session.sealInventoryPlan()) { fail("craft_inventory_plan_not_owned"); return; }
         String planningRefusal = plan(c);
         if (planningRefusal != null) { fail(planningRefusal); return; }
         ingredient = 0; placement = 0; phase = 1;

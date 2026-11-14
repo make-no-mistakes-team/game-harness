@@ -449,6 +449,14 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
   const inventoryRunIds: string[] = [];
   let observationCount = 0;
   const parentPolls: Array<Record<string, unknown>> = [];
+  // Parent-only mechanics perturbation; the worker source and requested sequence
+  // are unchanged. A claim is consumed before console dispatch, never retried.
+  let inventoryUpdate: {
+    scenario: string; samples: number; injection_attempts: number;
+    gate?: NativeDiagnostics; acknowledged_ms?: number; started_ms?: number;
+    observation?: Awaited<ReturnType<NativeFixture["observe"]>>;
+    after?: NativeDiagnostics; error?: string;
+  } | undefined;
   const transcript: unknown[] = [], effects: Array<{ action_id: string; action: GameAction; stage?: ProbeStage; result?: GameActionResult; error?: string; started_ms?: number; settled_ms?: number; polling_before?: number; polling_after?: number }> = [];
   const admission = Promise.withResolvers<void>(); void admission.promise.catch(() => {});
   let active = Promise.resolve(), release: (() => void) | undefined, admitted = false, peak = 0, concurrent = 0;
@@ -544,7 +552,8 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
               }
               if (selected === "inventory") {
                 await call("program_submit", { name: "Disclosed visible inventory fixture", source: inventorySource,
-                  args: {scenario: inventoryScenario}, limits: {duration_ms: caps.runMs, max_actions: 20, max_calls: 80, max_depth: 1} });
+                  args: {scenario: inventoryScenario.startsWith("startup-update-") ? "sequence-partial" : inventoryScenario},
+                  limits: {duration_ms: caps.runMs, max_actions: 20, max_calls: 80, max_depth: 1} });
                 admission.resolve(); return;
               }
               if (selected === "repair") {
@@ -582,7 +591,52 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
           // and native application. No retry or mutation of the old handle.
           await fixture.console(["kill @e[type=minecraft:item,tag=stale_pickup]"]);
         }
-        if (selected !== "approach") receipt.result = await execute(request, signal);
+        if (selected === "inventory" && inventoryUpdate) {
+          const update = inventoryUpdate;
+          receipt.result = await pollMechanicalEffect(async () => {
+            const result = await execute(request, signal); receipt.result = result; return result;
+          }, async () => {
+            open();
+            if (update.injection_attempts !== 0) return;
+            const diagnostics = await fixture.diagnostics();
+            update.samples++;
+            const raw = diagnostics.native_inventory_ui;
+            const ui = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+            const custody = diagnostics.current_inventory_custody as Record<string, unknown> | undefined;
+            // Native class names may be remapped. This table-free request's
+            // successful native binding plus player-handler sync0 is the
+            // witness; never guess a development-only GUI class spelling.
+            const bound = diagnostics.motor_active && diagnostics.screen_type !== null && custody?.sync_id === 0 &&
+              ui?.screen_bindings === 1 && ui.closed === false && ui.failed === false;
+            const ready = update.scenario === "startup-update-preplan"
+              ? ui?.phase === 0 && ui.gesture_attempts === 0 && ui.held === false &&
+                ui.cursor_count === 0 && ui.grid_count === 0 && custody?.cursor_count === 0 && custody.grid_count === 0
+              : ui?.quick_move_presses === 1 && (ui.phase === 2 || ui.phase === 3) &&
+                typeof ui.gesture_attempts === "number" && ui.gesture_attempts > 0;
+            if (!bound || !ready) return;
+            update.gate = diagnostics;
+            update.injection_attempts++;
+            update.started_ms = performance.now();
+            try {
+              // console() includes its existing post-ack settle delay. Observe
+              // the actual arriving increment concurrently, not after that
+              // delay has silently consumed the native preplan window.
+              await pollMechanicalEffect(async () => {
+                await fixture.console(["give @a minecraft:oak_log 1"]);
+                update.acknowledged_ms = performance.now();
+              }, async () => {
+                if (update.observation) return;
+                const observation = await fixture.observe();
+                const logs = observation.data.player.inventory.filter(item => item.name === "oak_log")
+                  .reduce((sum, item) => sum + item.count, 0);
+                if (logs !== (update.scenario === "startup-update-preplan" ? 3 : 1)) return;
+                update.observation = observation;
+                update.after = await fixture.diagnostics();
+              }, 0);
+            } catch (error) { update.error = String(error); throw error; }
+          }, 5);
+        }
+        else if (selected !== "approach") receipt.result = await execute(request, signal);
         else {
           let replaced = false;
           receipt.result = await pollMechanicalEffect(async () => {
@@ -869,11 +923,14 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
       await pause(15000); open();
       fixture.report.inventory_setup_frame = await fixture.frame("inventory-setup-settled");
       const inventoryScenarios = ["positive", "sequence-partial", "surplus", "split", "variants", "components", "full", "stop", "stop-distributed", "replacement", "correction", "shift-stop", "shift-correction"];
+      const startupUpdateScenarios = ["startup-update-preplan", "startup-update-postpress"];
       const selectedInventoryScenarios = stageSelection === undefined ? inventoryScenarios : stageSelection.split(",");
-      requireProof(selectedInventoryScenarios.length > 0 && selectedInventoryScenarios.every(value => inventoryScenarios.includes(value)) &&
+      requireProof(selectedInventoryScenarios.length > 0 && selectedInventoryScenarios.every(value => [...inventoryScenarios, ...startupUpdateScenarios].includes(value)) &&
         new Set(selectedInventoryScenarios).size === selectedInventoryScenarios.length, "Inventory --stages must name unique known inventory scenarios");
       for (const scenario of selectedInventoryScenarios) {
         inventoryScenario = scenario; admitted = false;
+        const startupUpdate = startupUpdateScenarios.includes(scenario);
+        inventoryUpdate = startupUpdate ? {scenario, samples: 0, injection_attempts: 0} : undefined;
         if (scenario === "positive" && selectedInventoryScenarios.indexOf(scenario) > 0) {
           await fixture.console([
             "clear @a", "setblock 2 240 2 minecraft:air", "setblock 2 239 2 minecraft:grass_block",
@@ -890,7 +947,11 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
               ...Array.from({length: 27}, (_,slot) => `item replace entity @a inventory.${slot} with minecraft:stone 64`),
               "item replace entity @a inventory.0 with minecraft:oak_log 64",
             ]);
-          } else if (scenario === "shift-stop" || scenario === "shift-correction") await fixture.console([
+          } else if (startupUpdate) await fixture.console([
+            "item replace entity @a inventory.0 with minecraft:oak_log 2",
+            "item replace entity @a inventory.1 with minecraft:oak_planks 6",
+          ]);
+          else if (scenario === "shift-stop" || scenario === "shift-correction") await fixture.console([
             "item replace entity @a inventory.0 with minecraft:oak_planks 4",
           ]);
           else if (scenario === "sequence-partial") await fixture.console([
@@ -917,7 +978,7 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
         inventoryRunIds.push(runId);
         const effectStart = effects.length;
         const recordingDirectory = path.join(fixture.evidenceDirectory, `recording-inventory-${scenario}`);
-        recorder = ["positive", "sequence-partial", "surplus", "split", "stop-distributed", "shift-stop", "shift-correction"].includes(scenario) ? new EpisodeRecorder({
+        recorder = startupUpdate || ["positive", "sequence-partial", "surplus", "split", "stop-distributed", "shift-stop", "shift-correction"].includes(scenario) ? new EpisodeRecorder({
           directory: recordingDirectory, bridge: fixture.bridge, captureMode: "live_compressed",
           identity: {episode_id: randomUUID(), run_id: runId, world_id: run.world_id, session_id: run.session_id!},
           limits: {maxDurationMs: 180_000, maxFrames: 5500, maxStoredFrameBytes: 256 * 1024 ** 2}, onIncomplete: stop,
@@ -925,6 +986,7 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
         await fixture.case(`visible_inventory_${scenario}`, {evaluator_authored: true, supplied_inventory: true,
           model_inference: false, world_time_continues: true, perturbation: scenario === "positive" ? null : scenario}, async entry => {
           entry.before = before;
+          if (startupUpdate) entry.parent_update = inventoryUpdate;
           const commandsBefore = fixture.commands.length;
           await runtime!.control(runId!, "start");
           await until(async () => {
@@ -1028,7 +1090,7 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
               "Full inventory must refuse rather than falsely complete or lose output");
             requireProof(evidence(actualEffects[0]!.result!).world_effect_emitted === false,
               "Full-inventory refusal emitted effects before capacity validation");
-          } else {
+          } else if (!startupUpdate) {
             requireProof(execution?.status !== "succeeded" && actualEffects.every(effect => effect.result?.status !== "succeeded"),
               "Interrupted/replaced/corrected inventory work falsely completed");
             entry.interrupted_ui = interruptedUi;
@@ -1041,6 +1103,69 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
           entry.after = after; entry.final_diagnostics = diagnostics;
           requireProof(diagnostics.controls_neutral && !diagnostics.motor_active && concurrent === 0 && peak === 1,
             "Inventory fixture did not drain one effect owner");
+          if (startupUpdate) {
+            const update = inventoryUpdate!;
+            const result = actualEffects[0]?.result, ui = uiEvidence(result);
+            const gateUi = update.gate ? nativeUi(update.gate) : null;
+            const afterUi = update.after ? nativeUi(update.after) : null;
+            const gateCustody = update.gate?.current_inventory_custody as Record<string, unknown> | undefined;
+            const afterCustody = update.after?.current_inventory_custody as Record<string, unknown> | undefined;
+            const sameSession = (value: Record<string, unknown> | null) => value?.motion_seed === gateUi?.motion_seed &&
+              value?.screen_bindings === 1;
+            const livePreplan = afterUi?.gesture_attempts === 0 && afterUi.phase === 0 &&
+              afterUi.cursor_count === 0 && afterUi.grid_count === 0 && sameSession(afterUi) &&
+              update.after?.screen_type === update.gate?.screen_type && afterCustody?.sync_id === gateCustody?.sync_id;
+            const redPreplan = result?.status === "failed" && ui?.reason === "handler_layout_or_custody_changed" &&
+              ui.gesture_attempts === 0 && sameSession(ui);
+            entry.preplan_update_witness = livePreplan ? "same_bound_handler_still_idle_after_visible_increment" :
+              redPreplan ? "same_bound_session_custody_refusal_before_first_plan" : null;
+            entry.original_requested_sequence = [
+              {item: "oak_planks", executions: 2}, {item: "crafting_table", executions: 3}, {item: "stick", executions: 1},
+            ];
+            requireProof(update.injection_attempts === 1 && update.acknowledged_ms !== undefined && !update.error &&
+              fixture.commands.length === commandsBefore + 1, "Required actual native GUI phase was not reached for exactly one acknowledged server give");
+            requireProof(actualEffects.length === 1 && actualEffects[0]?.action.kind === "craft" &&
+              Array.isArray(actualEffects[0].action.sequence) && result && !actualEffects[0].error,
+              "Startup update lost its sole original native craft receipt or replayed an action");
+            const stages = evidence(result).craft_stages;
+            requireProof(Array.isArray(stages) && stages.length === 3,
+              "Startup update lost the original ordered request/partial receipt accounting");
+            if (scenario === "startup-update-preplan") {
+              requireProof(update.observation && retained(update.observation, "oak_log") === 3 && (livePreplan || redPreplan),
+                "Server increment was not actually witnessed on the same empty preplan handler; timing gate unproven");
+              requireProof(result.status === "succeeded" && execution?.status === "succeeded",
+                `Preplan increment fenced the original request: ${JSON.stringify({status: result.status, ui, stages})}`);
+              requireProof(stages.every((stage, index) => stage && typeof stage === "object" && !Array.isArray(stage) &&
+                stage.stage_index === index && stage.status === "succeeded" &&
+                stage.completed_executions === [2,3,1][index] && stage.confirmed_executions === [2,3,1][index] &&
+                stage.inventory_receipt_confirmed === true && stage.inventory_custody_confirmed === true),
+                "Preplan increment lacks exact ordered server-confirmed production receipts");
+              batchResults(result, 2);
+              requireProof(retained(after, "oak_log") === 1 && retained(after, "oak_planks") === 0 &&
+                retained(after, "crafting_table") === 3 && retained(after, "stick") === 4,
+                "Preplan increment overcrafted, consumed the supplied surplus or lost requested output");
+              requireProof(ui?.screen_bindings === 1 && ui.screen_closes === 1 && ui.closed === true &&
+                ui.cursor_count === 0 && ui.grid_count === 0, "Preplan request rebound or lost empty closed custody");
+            } else {
+              requireProof(gateUi?.quick_move_presses === 1 && (gateUi.phase === 2 || gateUi.phase === 3) &&
+                result.status === "unknown" && execution?.status === "unknown" &&
+                evidence(result).world_effect_emitted === true && ui?.failed === true &&
+                ui.reason === "handler_layout_or_custody_changed" && ui.quick_move_presses === 1,
+                "Actual post-press increment did not retain the strict emitted-unknown custody fence without replay");
+              requireProof(stages.every((stage, index) => stage && typeof stage === "object" && !Array.isArray(stage) &&
+                stage.stage_index === index && typeof stage.confirmed_executions === "number" &&
+                typeof stage.completed_executions === "number" && stage.confirmed_executions <= stage.completed_executions &&
+                stage.completed_executions <= [2,3,1][index]! &&
+                (index === 0 || stage.completed_executions === 0 && stage.confirmed_executions === 0 && stage.status === "not_started")),
+                "Post-press fence fabricated confirmed production or ran beyond the honest original prefix");
+              const logs = retained(after, "oak_log"), planks = retained(after, "oak_planks");
+              requireProof(logs >= 1 && logs <= 3 && planks >= 6 && planks <= 14 &&
+                planks + 4 * (logs - 1) === 14 && retained(after, "crafting_table") === 0 && retained(after, "stick") === 0,
+                "Post-press fence erased the server increment, overcrafted a later stage or lost ingredient custody");
+              requireProof(ui.screen_bindings === 1 && ui.screen_closes === 1,
+                "Post-press fence reopened/rebound or failed to close its one owned handler");
+            }
+          }
           if (scenario === "full") requireProof(JSON.stringify(counts(before)) === JSON.stringify(counts(after)),
             "Capacity refusal changed actual own inventory");
           if (["surplus", "split", "components"].includes(scenario))
@@ -1086,7 +1211,21 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
           }
           entry.claim = "Evaluator-authored native mechanics/presentation only, not model intelligence or pacing proof";
         });
-        requireProof(fixture.cases.at(-1)?.status === "passed", `Inventory ${scenario} case failed; no later case may hide it`);
+        if (startupUpdate && recorder) {
+          // Assertion failures must not discard the red clip when proceeding to
+          // the independent strict-fence negative in this same owned fixture.
+          await runtime.control(runId!, "stop");
+          const retainedCase = fixture.cases.at(-1)!;
+          retainedCase.recording = await recorder.finish({endedAt: Date.now(), reason: `visible_inventory_${scenario}_retained`});
+          retainedCase.replay = await recorder.renderReplay({signal: scope.signal});
+          const drained = await fixture.diagnostics();
+          retainedCase.retained_diagnostics = drained;
+          requireProof(drained.controls_neutral && !drained.motor_active && concurrent === 0,
+            "Startup-update case did not drain before the independent next case");
+        }
+        // The finite comparator retains BOTH outcomes on red. The aggregate
+        // report still fails; a later negative cannot hide the positive defect.
+        if (!startupUpdate) requireProof(fixture.cases.at(-1)?.status === "passed", `Inventory ${scenario} case failed; no later case may hide it`);
         recorder = undefined;
       }
     } else {

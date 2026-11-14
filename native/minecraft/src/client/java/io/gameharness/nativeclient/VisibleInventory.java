@@ -58,7 +58,7 @@ public final class VisibleInventory {
   private Gesture purpose;
   private JsonObject gestureEvent;
   private int gestureAttempts, ingredientGroup, groupSource = -1, resizeRetargets;
-  private int originX, originY;
+  private int originX, originY, startupInventoryRebases;
   private int screenBindings, screenCloses;
   private boolean failed, closed, emitted;
   private boolean releaseTransfers;
@@ -175,6 +175,16 @@ public final class VisibleInventory {
         return false;
       if (i > 0 && !ItemStack.areEqual(expected[i], slot.getStack())) matches = false;
     }
+    if (!matches && !equipment && gestureAttempts == 0 && ingredientGroup == 0
+        && fence.allowsUnplannedInventoryRefresh(client.currentScreen,
+            client.player.currentScreenHandler, handler.syncId, phase == 0,
+            handler.getCursorStack().getCount(), gridCount())) {
+      // Server pickups before any recipe/input plan are fresh own-inventory
+      // facts. Adopt them without resetting dwell, deadlines or gesture budgets.
+      snapshot();
+      startupInventoryRebases++;
+      return true;
+    }
     if (!quickMove || !quickMovePressed) return matches;
     try {
       // Only this batch's original-footprint guard may admit authoritative post-press changes.
@@ -218,6 +228,12 @@ public final class VisibleInventory {
       move(-1, position.x() + 3, position.y() + 2, 14, 14, 0, Gesture.TRANSFER);
       return false;
     }
+    return true;
+  }
+
+  public boolean sealInventoryPlan() {
+    if (!valid() || busy() || !clean()) return false;
+    fence.sealInventoryPlan();
     return true;
   }
 
@@ -559,6 +575,7 @@ public final class VisibleInventory {
     value.addProperty("motion_seed", Long.toString(motion.seed));
     value.addProperty("ingredient_groups", ingredientGroup);
     value.addProperty("resize_retargets", resizeRetargets);
+    value.addProperty("startup_inventory_rebases", startupInventoryRebases);
     if (reason != null) value.addProperty("reason", reason);
     return value;
   }

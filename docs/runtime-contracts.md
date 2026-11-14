@@ -2476,6 +2476,15 @@ Once a requested table opens its crafting grid, recipe transfers bind to that ex
 
 Craft/equip use the bounded native [`VisibleInventory`](../native/minecraft/src/client/java/io/gameharness/nativeclient/VisibleInventory.java) controller beneath the existing semantic actions; [`Recipes`](../native/minecraft/src/client/java/io/gameharness/nativeclient/Recipes.java) owns manual recipe transfers. Crafting opens the real 2×2 inventory or reachable 3×3 table screen, manually places ingredients through vanilla pickup/right-click gestures, retrieves output and returns remainders. There is no hidden recipe autofill. One virtual pointer supplies screen hover, carried-stack rendering and actual press/release coordinates before native capture. Gestures advance on ticks/rendered frames, without game-thread sleep or catch-up click bursts; world time continues.
 
+Before recipe planning or any gesture attempt, a server inventory update may
+refresh an idle crafting session's startup snapshot. The authorized screen,
+handler, sync identity and slot geometry must still match, with empty cursor
+and grid. Equipment remains strict. Recipe planning seals that baseline before
+reading ingredient assignments; any press also seals it. Later unexpected
+changes retain the existing custody fence. Refresh resets neither opening
+dwell, action/root deadlines nor gesture allowances, and replays no input.
+Diagnostics count these changes as `startup_inventory_rebases`.
+
 Ingredient assignments are grouped by their actual source slot. The controller picks up that stack once, distributes single items with separate ordinary right-clicks and returns surplus once before changing material or collecting output. The mouse button is released between placements; the remaining stack stays on the cursor. Source/cursor/grid components and counts remain checked throughout, including split sources and mixed materials. Vanilla ingredient eligibility matches permitted item alternatives; it does not require a material's incidental components to equal the recipe display's default stack. This does not relax actual custody checks or implement drag distribution.
 
 For a prepared multi-execution batch, output is taken with one ordinary
@@ -2512,6 +2521,13 @@ the Shift press and an unrelated authoritative post-press slot correction.
 Interrupted output remained bounded by the requested quantity and retained
 ingredient/output conservation; cleanup left no held gesture or dirty current
 cursor/grid. These checks used supplied fixture inventory and no provider.
+
+An additional native comparator injected one server inventory increment before
+the first plan. The original request completed its exact ordered recipe counts
+without rebinding the screen. The same increment after a Shift press retained
+an unknown emitted outcome, no later-stage execution and released controls.
+Both cases used supplied inventory, compressed recordings and zero inference;
+they establish mechanical custody behavior, not improved agent gameplay.
 
 Cancellation stops the motor/navigation task, releases held inputs and obtains neutralization acknowledgement; if that cannot be established, the bridge emitter must be fenced/terminated and recovery entered before a new lease. A lost craft/place/consume result stays uncertain rather than triggering blind repetition. Domain revision examples include pose, target validity, inventory-slot contents, UI session and the authorized navigation goal/corridor plus controller envelope; unrelated observation updates do not invalidate every slow result.
 

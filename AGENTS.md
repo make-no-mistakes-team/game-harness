@@ -64,6 +64,20 @@ safety, concurrency limits, frozen experiment protocols, explicit stop
 instructions or successful-run manual-review pauses. It does not permit
 silently substituting Luna for a different model in a declared experiment.
 
+### Budget-limited outcomes
+
+Treat exhaustion of a run's time, request, token, tool, analysis or evidence
+budget as a budget-limited outcome, not proof of model incapability. Record the
+limit, its value, actual consumption, unfinished work and observed failures.
+Consider whether the budget prevented meaningful completion before attributing
+failure to the model or switching models.
+
+Propose larger limits, including substantially larger ones, when justified.
+Before increasing any model-run or experiment limit, obtain explicit user
+approval: state the old and proposed values, reason, cost or resource risks,
+and whether the change is permanent or applies only to specified runs. Use
+approved higher limits in a newly declared run.
+
 ## Manual gameplay review
 
 Request manual visual review only for gameplay runs you judge successful for

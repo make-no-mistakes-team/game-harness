@@ -333,8 +333,11 @@ that the task is unfinished. The required literal
 verification. Missing, false or coerced string values are rejected before
 admission; the live controller and its authority remain unchanged. When
 requirements remain, Main ends its planning response normally, retaining useful
-bounded control and requesting a finite attention wake only when needed. The
-host does not parse summary wording or consult evaluator-private counters.
+bounded control and requesting a finite attention wake only when needed.
+The shared guidance evaluates this incomplete branch first: do not set the
+affirmation merely to satisfy the schema, or use terminal completion to report
+that completion cannot be claimed. The host does not parse summary wording
+or consult evaluator-private counters.
 
 An ordinary Main request with `task_finish` advertised already has decision
 authority. Supported whole-task completion belongs in that decision, even while

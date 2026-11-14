@@ -191,18 +191,17 @@ test("cancellation revokes the SDK wait without pretending host refresh or priva
   expect(drained).toBe(true);
 });
 
-test("close joins the real SDK idle promise and transport acknowledgment and closes owned provider sessions", async () => {
+test("close joins the real SDK idle promise and private transport acknowledgment", async () => {
   const selected = grant();
   const entered = Promise.withResolvers<void>(), modelGate = Promise.withResolvers<void>();
   const releaseStarted = Promise.withResolvers<void>(), releaseGate = Promise.withResolvers<void>();
-  let streamCalls = 0, providerCloses = 0;
+  let streamCalls = 0;
   const factory = new CognitionAgentFactory(selected, {
     async resolveKey() { return { apiKey: "offline-private-bearer", credentialId: 9 }; },
     release() { releaseStarted.resolve(); return releaseGate.promise; },
   });
   const agent = await factory.createAgent({ modelId: selected.model.id, systemPrompt: [], tools: [] });
   agent.streamFn = () => { streamCalls++; throw new Error("Offline fixture forbids provider dispatch"); };
-  agent.providerSessionState?.set("offline-owned-state", { close() { providerCloses++; } });
   agent.setBeforeModelCall(async () => {
     entered.resolve();
     await modelGate.promise;
@@ -214,7 +213,6 @@ test("close joins the real SDK idle promise and transport acknowledgment and clo
   const closing = factory.close().then(() => { drained = true; });
   await releaseStarted.promise;
   expect(agent.isAborting).toBe(true);
-  expect(providerCloses).toBe(1);
   releaseGate.resolve();
   await Promise.resolve();
   expect(drained).toBe(false);
@@ -222,8 +220,6 @@ test("close joins the real SDK idle promise and transport acknowledgment and clo
   await Promise.all([prompt, closing]);
   expect(drained).toBe(true);
   expect(streamCalls).toBe(0);
-  expect(providerCloses).toBe(1);
-  expect(agent.providerSessionState?.size).toBe(0);
 });
 
 test("invalid private key responses never become an ambient-key fallback", async () => {

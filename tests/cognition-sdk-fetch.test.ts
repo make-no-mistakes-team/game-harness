@@ -31,7 +31,7 @@ function success() {
 
 type Mode = "remote" | "embedded";
 type Hook = NonNullable<StrategicRequestAdmission["beforeSdkFetch"]>;
-async function fixture(mode: Mode, hook?: Hook, retry = false) {
+async function fixture(mode: Mode, hook?: Hook, retry = false, modelWebsockets = false) {
   const f = passiveHostFixture();
   const received: Request[] = [];
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
@@ -44,7 +44,7 @@ async function fixture(mode: Mode, hook?: Hook, retry = false) {
   const descriptor = getBundledModels("openai-codex").find(model => model.api === "openai-codex-responses");
   if (!descriptor) throw new Error("Installed SDK lacks the offline Codex descriptor");
   const model = { ...getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id),
-    baseUrl: `http://127.0.0.1:${server.port}/codex/responses`, preferWebsockets: false };
+    baseUrl: `http://127.0.0.1:${server.port}/codex/responses`, preferWebsockets: modelWebsockets };
   f.run.model_id = model.id; f.store.saveRun(f.run);
   const reservations: string[] = [], transports: string[] = [], drains: string[] = [];
   f.host.requestAdmission = {
@@ -95,6 +95,17 @@ async function fixture(mode: Mode, hook?: Hook, retry = false) {
 // Loopback HTTP and the installed provider SDK only; no model, gameplay source,
 // native adapter or real account is invoked by these infrastructure regressions.
 for (const mode of ["remote", "embedded"] as const) {
+  test(`${mode}: model WebSocket preference does not introduce a transport absent from the selected local Agent`, async () => {
+    let admissions = 0;
+    const f = await fixture(mode, async () => { admissions++; }, false, true);
+    f.owner.wake("preflight_ready"); await f.finished;
+    expect(f.received).toHaveLength(1);
+    expect(f.received[0]!.method).toBe("POST");
+    expect(admissions).toBe(1);
+    expect(f.reservations).toHaveLength(1);
+    expect(f.pauses).toEqual([]);
+  }, 20_000);
+
   test(`${mode}: each genuine SDK transport retry has private admission under the same original request`, async () => {
     const admissions: { request: Parameters<Hook>[0]; deadline: bigint; signal: AbortSignal }[] = [];
     const f = await fixture(mode, async (request, options) => {

@@ -1,4 +1,3 @@
-import type { ProviderSessionState } from "@oh-my-pi/pi-ai";
 import type { ApiKeyResolveContext, ResolvedApiKey } from "@oh-my-pi/pi-ai/auth-retry";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { CodexApiError } from "@oh-my-pi/pi-ai/providers/openai-codex/response-handler";
@@ -210,7 +209,6 @@ export class CognitionAgentFactory {
   readonly #grant: CognitionSessionGrant;
   readonly #port: CognitionInferencePort;
   readonly #controller = new AbortController();
-  readonly #providerSessions = new Map<string, ProviderSessionState>();
   readonly #resolutions = new Set<Promise<ResolvedApiKey>>();
   #agent: Agent | undefined;
   #allocated = false;
@@ -227,7 +225,8 @@ export class CognitionAgentFactory {
     this.#allocated = true;
     try {
       // No await before assigning the real Agent: revocation cannot race a late
-      // allocation. Provider state belongs to this factory, not a global cache.
+      // allocation. Match the selected local Agent's transport configuration:
+      // adding providerSessionState would silently enable persistent WebSockets.
       const agent = new Agent({
         sessionId: this.#grant.sessionId,
         initialState: {
@@ -235,7 +234,6 @@ export class CognitionAgentFactory {
           systemPrompt: [...options.systemPrompt], tools: [...options.tools], messages: [],
         },
         intentTracing: false,
-        providerSessionState: this.#providerSessions,
         streamFn: this.#grant.singleInferenceDispatch ? singleDispatchCodexStream : undefined,
         getApiKey: requested => {
           this.#assertCurrent(requested);
@@ -261,7 +259,7 @@ export class CognitionAgentFactory {
     this.#agent?.abort("Cognition inference session released");
   }
 
-  /** Idempotent real drain, including private RPC and cached provider sockets. */
+  /** Idempotent real drain, including private RPC and actual SDK idle. */
   close(): Promise<void> {
     if (this.#closing) return this.#closing;
     // Install the join before abort listeners or port.release can reenter.
@@ -273,16 +271,6 @@ export class CognitionAgentFactory {
   }
 
   async #drain(): Promise<void> {
-    let failed = false;
-    const closed = new Set<ProviderSessionState>();
-    const closeProviderSessions = () => {
-      for (const session of this.#providerSessions.values()) {
-        if (closed.has(session)) continue;
-        closed.add(session);
-        try { session.close(); } catch { failed = true; }
-      }
-    };
-    closeProviderSessions();
     // Release starts before idle/resolve joins: closing the private channel must
     // settle a resolver that was still waiting when the SDK was aborted.
     const release = Promise.resolve().then(() => this.#port.release());
@@ -291,9 +279,7 @@ export class CognitionAgentFactory {
       this.#agent?.waitForIdle() ?? Promise.resolve(),
       Promise.allSettled([...this.#resolutions]),
     ]);
-    closeProviderSessions();
-    if (failed || results.some(result => result.status === "rejected")) throw privateFailure();
-    this.#providerSessions.clear();
+    if (results.some(result => result.status === "rejected")) throw privateFailure();
   }
 
   #assertCurrent(model: Model): void {

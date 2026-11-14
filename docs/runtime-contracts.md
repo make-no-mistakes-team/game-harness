@@ -48,6 +48,13 @@ and original tool arguments precede dispatch. Credential resolution and refresh
 remain owned by the host's selected-account inference session; private resolver
 traffic never enters ordinary metadata or operator publication.
 
+Cognition preserves the selected local Agent's SDK transport configuration.
+It does not add a provider-session cache that would silently enable persistent
+WebSockets. Optional `beforeSdkFetch` admission runs before each actual SDK
+`options.fetch` call, including SDK retries, under the original request identity
+and deadline. It receives no transport arguments or credentials. Fetch counts
+do not establish WebSocket, redirect, wire-attempt or consumption counts.
+
 Cross-process deadlines use Linux `CLOCK_MONOTONIC`. Expiry revokes authority
 immediately. Up to one second is reserved solely for cooperative cancellation
 and settlement, with no new request or tool permission. An unresponsive owner

@@ -79,6 +79,24 @@ handlers. Component lifecycle checks do not establish native continuity through
 Main/context/history/publication stalls or independently received Stop; those
 require the actual default native path.
 
+A native proof exercised twelve finite episodes through the concrete application
+and default cognition process: 500 ms and five-second process suspensions during
+idle cognition, in-flight SDK inference, active context assembly, historical
+reads, current-run history cancellation and operator publication. Applied native
+inputs continued, each fresh independently authenticated Stop neutralized them
+before the suspended owner resumed or its current-run read was retired, and all
+owners drained. There was one physical controller at a time and twelve confirmed
+retirements. The original 150 ms application-start freshness and 250 ms
+supervision gates remained in force. Five-second context suspension exercised
+deadline expiry and containment, not acceptance of late context.
+
+That proof used an evaluator mechanical fixture and the real SDK over a local
+HTTP transport, with zero real provider calls. It establishes those physical
+stall/Stop conditions, not model competence, natural gameplay or endurance.
+Native ACK time records later consumption/view-motion settlement; it must not
+replace the separately correlated application-start timestamp when checking
+capture freshness.
+
 ## Prepare before joining
 
 `POST /v1/prepared-start` accepts an immutable `{request_id,task,goal,model_id}` request; `request_id` is a UUID. It requires a stopped server with the EULA accepted, a disconnected player, a ready sandbox, no active run or unsettled preparation, and an exact image-capable model discovered through the authenticated account. The selected model authors code before the host starts the world or joins an avatar. **Start world** and connected-world **Create** remain separate ordinary paths. Preparation never disconnects an existing world to make its preconditions true.

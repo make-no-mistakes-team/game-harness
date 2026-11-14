@@ -207,7 +207,6 @@ test("post-transfer failure joins Stop on the admitted stored run without closin
       await transferredWorker.current.close();
       const run = store.getRun(runId)!;
       store.saveRun({ ...run, status: "stopped", ended_at: new Date().toISOString() });
-      return snapshot()!;
     },
   };
   f.options.launch = () => {

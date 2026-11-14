@@ -263,7 +263,9 @@ export async function runNativeRecordingProof(args: readonly string[], project =
       evidence = new evidenceModule.ModelProgramEvidence(store, fixture.evidenceDirectory, fixture.caps, `offline-${randomUUID()}`, stop,
         { limits: evidenceProfile.profile.journal });
       evidence.observeAuthAgents(auth);
-      runtime = new runtimeModule.Runtime(store, auth, fixture.bridge, sandbox, () => {}, { adapter: () => fixture.bridge.adapter(), actorFrames: fixture.bridge });
+      runtime = new runtimeModule.Runtime(store, auth, fixture.bridge, sandbox, () => {}, {
+        adapter: () => fixture.bridge.adapter(), actorFrames: fixture.bridge, strategicAgentFactory: auth,
+      });
       await runtime.initialize(); evidence.bindRuntime(runtime);
       const goal = fixture.bridge.adapter()?.goals.find(goal => goal.goal_id === "custom" && goal.verifier === null);
       requireProof(goal, "Custom infrastructure goal unavailable");

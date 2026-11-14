@@ -2,24 +2,25 @@ import { randomUUID } from "node:crypto";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentEvent, AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { Context, Model } from "@oh-my-pi/pi-ai";
 import type {
   ActionView,
   ActivityEvent,
   Json,
   ObservationV3,
-  PolicyView,
   RuntimeAdapter,
   RunPauseCause,
   UsagePurpose,
+  GoalChoice,
 } from "../shared/contracts.ts";
 import type { AdapterActorProjection } from "../shared/observations.ts";
-import type { AuthManager } from "./auth.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
-import type { Store, StoredRun } from "./store.ts";
+import type { StoredRun } from "./store.ts";
 import { recordCall, recordUsage } from "./usage.ts";
 import { ProviderUsageCollector } from "./provider-usage.ts";
-import type { SpeculativePlanning } from "./speculative-planning.ts";
-import { isToolAllowed, type ToolRole } from "../shared/tool-policy.ts";
+import type { CognitionEvidenceEvent, CognitionRequestIdentity, StrategicAgentFactory, StrategicOwnership, StrategicPolicy, StrategicSpeculation, StrategicStore } from "./cognition-ports.ts";
+import type { ContextOwner } from "./cognition-context.ts";
+import { isToolAllowed, type ToolRole, type ToolModule } from "../shared/tool-policy.ts";
 import { ProgramWorkspace } from "./program-workspace.ts";
 import { compileToolArgumentBudget, type ToolArgumentOverrun } from "./tool-argument-budget.ts";
 import { createToolArgumentKeyBudget } from "./tool-argument-key-budget.ts";
@@ -100,6 +101,17 @@ export interface StrategicRequestAdmission {
   reserve(requestId: string, model: { id: string; provider: string; api: string }): void;
   transportEnded(requestId: string, closed: boolean): void;
   drained(requestIds: readonly string[]): void;
+  /** Private actual SDK context, never credentials/options or public metadata. */
+  beforeDispatch?(request: { identity: CognitionRequestIdentity; model: Model; context: Context },
+    options: { signal: AbortSignal; deadlineOsNs: bigint }): Promise<void>;
+  /**
+   * Private finite admission immediately before each SDK options.fetch call,
+   * including SDK-owned retries. Never receives transport arguments or secrets.
+   * Rejection prevents that fetch; it does not create a retry or a new request.
+   */
+  beforeSdkFetch?(request: { identity: CognitionRequestIdentity; model: { id: string; provider: string; api: string } },
+    options: { signal: AbortSignal; deadlineOsNs: bigint }): Promise<void>;
+  evidence?(event: CognitionEvidenceEvent): void;
 }
 
 export interface StrategicHost {
@@ -107,19 +119,22 @@ export interface StrategicHost {
   generation(): number;
   assertCurrent(generation: number, epoch?: number): StoredRun;
   tools(generation: number): AgentTool[];
+  disclosedModules?(): ToolModule[];
+  cognitionEvidence?: { enabled(): boolean; emit(event: CognitionEvidenceEvent): void };
   rootPrompt(): string;
+  promptInput?(): GoalChoice;
   adapter?(): RuntimeAdapter;
   observe(): Promise<ObservationV3>;
   modelObservation?(): Promise<ModelObservation>;
   projectObservation(observation: ObservationV3, previous: ObservationV3 | null): AdapterActorProjection;
-  policies(): PolicyView[];
+  policies(): StrategicPolicy[];
   action(): ActionView | null;
   programPending(): boolean;
   busy(): boolean;
   persist(summary?: string): void;
   pause(message: string, cause: RunPauseCause): void;
   terminal(status: "completed" | "failed", message: string): void;
-  speculation?(): SpeculativePlanning;
+  speculation?(): StrategicSpeculation;
   reviewContext?(options: HistoryQueryOptions): Promise<Json>;
   reviewComplete?(): void;
   requestAdmission?: StrategicRequestAdmission;
@@ -309,23 +324,32 @@ export class StrategicPlanner {
   private readonly responseOwners = new Map<string, string>();
   private readonly admittedRequests = new Set<string>();
   private readonly streamDrains = new Map<string, { drained: Promise<void>; close(): Promise<unknown> }>();
+  private readonly sdkFetchOperations = new Set<Promise<unknown>>();
   private wakeReasons = new Set<string>();
   private wakeTimer: NodeJS.Timeout | undefined;
   private idleTimer: NodeJS.Timeout | undefined;
   private attentionTimer: NodeJS.Timeout | undefined;
   private attentionReason: string | null = null;
   private speculativeTurn = false;
-  private readonly retainedContext: StrategicContextClient;
+  private readonly retainedContext: ContextOwner;
+  private readonly ownership: StrategicOwnership;
+  private turnId = "";
+  private turnCancellation: { id: string; cancel(): void } | null = null;
   private contextObservation: Pick<ObservationV3, "profile_id" | "profile_configuration_hash"> | null = null;
   private readonly eligibleTools = new Map<string, { name: string; arguments: unknown; authority?: () => void }>();
 
   constructor(
-    private readonly store: Store,
-    private readonly auth: AuthManager,
+    private readonly store: StrategicStore,
+    private readonly auth: StrategicAgentFactory,
     private readonly host: StrategicHost,
+    options: { context?: ContextOwner; ownership?: StrategicOwnership } = {},
   ) {
-    this.retainedContext = new StrategicContextClient(store.readLocation());
+    this.retainedContext = options.context ?? new StrategicContextClient(store.readLocation());
+    this.ownership = options.ownership ?? {};
   }
+
+  private timingNow(): number { return this.ownership.timing?.now() ?? performance.now(); }
+  private get timingClock(): string { return this.ownership.timing?.clockId ?? HOST_MONOTONIC_CLOCK_ID; }
 
   reset(): void {
     if (this.agent || this.opening || this.turn || this.closing)
@@ -455,8 +479,60 @@ export class StrategicPlanner {
           }),
           systemPrompt: [...(context.systemPrompt ?? []), retained],
         };
+        await this.ownership.flush?.();
+        const identity: CognitionRequestIdentity = {
+          turn_id: this.turnId, request_id: request.id, generation, role: this.toolRole(),
+          deadline_os_ns: request.deadlineOsNs.toString(), phase: run.status,
+          root_execution_id: request.authoring?.root ?? this.decisionBasis?.root ?? null,
+          source_hash: request.authoring?.source ?? null,
+          authoring_deadline_at: request.authoring?.deadline ?? null,
+          pending_decision: request.pendingDecision, plan_id: request.planId,
+        };
+        await this.ownership.dispatch?.(identity, { model, context: requestContext });
+        if (!this.current(run, generation) || options?.signal?.aborted || osMonotonicNs() >= request.deadlineOsNs)
+          throw new RuntimeFault("stale_context", "Strategic dispatch authority was revoked");
+        const beforeSdkFetch = this.host.requestAdmission?.beforeSdkFetch;
+        const fetchOptions = beforeSdkFetch ? (() => {
+          const fetch = options?.fetch ?? globalThis.fetch;
+          const originalSignal = options?.signal ?? new AbortController().signal;
+          const selected = { id: model.id, provider: model.provider, api: model.api };
+          const speculativePermit = identity.role === "speculative" ? this.host.speculation?.().authority() : undefined;
+          const assert = () => {
+            this.reconcileDecision();
+            if (request.authoring) this.assertAuthoring(request.authoring);
+            if (this.request !== request || this.agent !== agent || !this.current(run, generation) ||
+              this.fenceRevision !== revision || this.turnId !== identity.turn_id || run.status !== identity.phase ||
+              this.toolRole() !== identity.role || request.hostCancellation || this.turnAbortRequested ||
+              request.pendingDecision !== identity.pending_decision || request.deadlineOsNs.toString() !== identity.deadline_os_ns ||
+              model.id !== selected.id || model.provider !== selected.provider || model.api !== selected.api ||
+              agent.state.model.id !== selected.id || agent.state.model.provider !== selected.provider || agent.state.model.api !== selected.api ||
+              originalSignal.aborted || osMonotonicNs() >= request.deadlineOsNs ||
+              JSON.stringify(strategicContextScope(run)) !== JSON.stringify(scope))
+              throw new RuntimeFault("stale_context", "Original strategic SDK fetch authority was revoked");
+            speculativePermit?.();
+            this.host.assertCurrent(generation);
+          };
+          return { fetch: async (...args: Parameters<typeof fetch>) => {
+            const operation = (async () => {
+              const assertSignals = () => {
+                args[1]?.signal?.throwIfAborted();
+                if (args[0] instanceof Request) args[0].signal.throwIfAborted();
+              };
+              assert(); assertSignals();
+              await beforeSdkFetch.call(this.host.requestAdmission,
+                { identity: { ...identity }, model: { ...selected } },
+                { signal: originalSignal, deadlineOsNs: request.deadlineOsNs });
+              assert(); assertSignals();
+              // Preserve the SDK's exact input, init, signal, body and response.
+              return fetch(...args);
+            })();
+            this.sdkFetchOperations.add(operation);
+            try { return await operation; }
+            finally { this.sdkFetchOperations.delete(operation); }
+          } };
+        })() : {};
         let firstResponse = false;
-        const events = await stream(model, requestContext, { ...options,
+        const events = await stream(model, requestContext, { ...options, ...fetchOptions,
           onPayload: async (payload, payloadModel, signal) => {
             const replacement = await options?.onPayload?.(payload, payloadModel, signal);
             const sent = record((replacement ?? payload) as Json);
@@ -464,7 +540,7 @@ export class StrategicPlanner {
             if (this.request?.id === request.id) this.store.event(run.run_id, "model.request_configuration",
               "Supported SDK payload hook observed the final request configuration, not provider-effective reasoning",
               { request_id: request.id, source: "sdk_transformed_payload",
-                clock_id: HOST_MONOTONIC_CLOCK_ID, prepared_monotonic_ms: performance.now(),
+                clock_id: this.timingClock, prepared_monotonic_ms: this.timingNow(),
                 model: typeof sent?.model === "string" ? sent.model.slice(0, 120) : null,
                 reasoning_effort: typeof reasoning?.effort === "string" &&
                   /^(none|minimal|low|medium|high|xhigh|max)$/.test(reasoning.effort) ? reasoning.effort : null,
@@ -485,11 +561,11 @@ export class StrategicPlanner {
               const received = !outbound && (owner === undefined || owner === request.id);
               if (received && !firstResponse) {
                 firstResponse = true;
-                const receivedMono = performance.now();
+                const receivedMono = this.timingNow();
                 this.store.event(run.run_id, "model.first_response_event", "First received provider SSE event; internal latency components remain unknown",
                   { request_id: request.id, event_type: typeof payload?.type === "string" &&
                     /^[a-zA-Z0-9._-]{1,100}$/.test(payload.type) ? payload.type : null,
-                    clock_id: HOST_MONOTONIC_CLOCK_ID, received_monotonic_ms: receivedMono,
+                    clock_id: this.timingClock, received_monotonic_ms: receivedMono,
                     request_elapsed_ms: receivedMono - request.startedMono,
                     observation_point: "complete_received_sse_event", raw_first_byte_monotonic_ms: null });
               }
@@ -606,10 +682,13 @@ export class StrategicPlanner {
       // setTools inside the admission gate is too late for this SDK: its
       // provider context has already been normalized. Refresh the live catalog
       // at the supported synchronization hook, after the previous tool group.
-      const unsubscribePhase = agent.addBeforeModelCallHook((signal) => {
+      const unsubscribePhase = agent.addBeforeModelCallHook(async (signal) => {
+        await this.ownership.flush?.();
+        await this.ownership.synchronize?.();
         if (!signal?.aborted && this.current(run, generation)) selectPhase();
       });
-      agent.setBeforeModelCall((_context, signal) => {
+      agent.setBeforeModelCall(async (_context, signal) => {
+        this.ownership.evidence?.("sdk_context_before_request_assembly_not_wire_payload", _context);
         const stop = (reason: string) => {
           this.gateReason = reason;
           return { stop: true as const, reason };
@@ -634,7 +713,7 @@ export class StrategicPlanner {
         if (this.decisionBasis && !this.pendingDecision && !this.host.programPending())
           return stop("The primary control decision settled; fresh outcome evidence owns the next turn");
         const toolRole = this.toolRole();
-        if (this.speculativeTurn && !this.host.speculation?.().requestCall())
+        if (this.speculativeTurn && !await this.host.speculation?.().requestCall())
           return stop("Finite lookahead request authority reached");
         const authoring = toolRole === "authoring" ? this.reconcileAuthoring() : null;
         if (this.authoringEnded) return stop("The root-bound authoring window ended");
@@ -670,7 +749,7 @@ export class StrategicPlanner {
           : this.turnDeadlineOsNs;
         this.request = {
           id: requestId,
-          startedMono: performance.now(),
+          startedMono: this.timingNow(),
           deadlineOsNs: this.turnDeadlineOsNs < authoringDeadlineOsNs ? this.turnDeadlineOsNs : authoringDeadlineOsNs,
           usage: new ProviderUsageCollector(requestId, this.responseOwners),
           purpose: authoring ? "authoring" : this.purpose,
@@ -683,6 +762,7 @@ export class StrategicPlanner {
           terminalReceived: false,
         };
         recordCall(run.usage, this.request.purpose);
+        this.ownership.call?.(run, this.request.purpose, this.request.id);
         this.store.event(
           run.run_id,
           "model.call",
@@ -691,7 +771,7 @@ export class StrategicPlanner {
             turn: run.turns,
             generation,
             request_id: this.request.id,
-            clock_id: HOST_MONOTONIC_CLOCK_ID,
+            clock_id: this.timingClock,
             started_monotonic_ms: this.request.startedMono,
             request_id_source: "host",
             request_index: this.request.index,
@@ -706,8 +786,10 @@ export class StrategicPlanner {
         );
         this.host.persist();
       });
-      agent.beforeToolCall = (context, signal) => {
+      agent.beforeToolCall = async (context, signal) => {
         preserveRuntimeToolArguments(context);
+        await this.ownership.flush?.();
+        await this.ownership.beforeTool?.(context);
         const window = this.request?.authoring;
         const obsoleteAuthoring = Boolean(window && (this.reconcileAuthoring() !== window || window.closed));
         if (!this.rejectedResponse && !obsoleteAuthoring && context.assistantMessage?.stopDetails?.type === RECOVERED_PROVIDER_FAILURE)
@@ -1087,6 +1169,12 @@ export class StrategicPlanner {
     this.schedule();
   }
 
+  /** Host deadline receipt cancels only the exact finite turn, never the owner. */
+  cancelTurn(id: string): void {
+    if (id !== this.turnId || this.turnCancellation?.id !== id || osMonotonicNs() < this.turnDeadlineOsNs) return;
+    this.turnCancellation?.cancel();
+  }
+
   fence(): void {
     this.fenced = true;
     this.fenceRevision++;
@@ -1124,6 +1212,8 @@ export class StrategicPlanner {
         agent?.waitForIdle(),
         this.turn,
         contextClosure,
+        // A rejected admission/transport is not an ownership-drain failure.
+        Promise.allSettled([...this.sdkFetchOperations]),
       ]);
       let released = !agent;
       if (agent) {
@@ -1156,6 +1246,7 @@ export class StrategicPlanner {
         this.admittedRequests.clear();
       }
       this.streamDrains.clear();
+      await this.ownership.flush?.();
     })();
     this.closing = closure;
     void closure
@@ -1210,7 +1301,9 @@ export class StrategicPlanner {
         .catch(() => {
           if (this.current(run, generation)) this.host.pause(PROVIDER_FAILURE, "safety");
         })
-        .finally(() => {
+        .finally(async () => {
+          await this.ownership.flush?.();
+          await this.ownership.endTurn?.(this.turnId);
           if (this.turn === turn) this.turn = null;
           this.schedule();
         })
@@ -1242,7 +1335,7 @@ export class StrategicPlanner {
     const speculative = !review &&
       reasons.includes("speculative_lookahead") &&
       reasons.every((reason) => reason === "speculative_lookahead")
-      ? this.host.speculation?.().begin() ?? null
+      ? await this.host.speculation?.().begin() ?? null
       : null;
     if (reasons.includes("speculative_lookahead") && !speculative) {
       this.host.speculation?.().invalidate("cancelled");
@@ -1278,6 +1371,7 @@ export class StrategicPlanner {
       : speculative ? "planning"
         : this.role === "recovery" ? "replanning" : "planning";
     const turnId = randomUUID();
+    this.turnId = turnId;
     const revision = this.workRevision;
     this.turnCalls = 0;
     this.turnDelivered = 0;
@@ -1293,6 +1387,29 @@ export class StrategicPlanner {
     this.turnDeadlineOsNs = osMonotonicNs() + BigInt(Math.max(0, Math.floor(this.turnDeadline - Date.now()))) * 1_000_000n;
     const historyController = new AbortController();
     this.historyController = historyController;
+    let deadlineReached = false;
+    const cancellation = { id: turnId, cancel: () => {
+      if (deadlineReached) return;
+      deadlineReached = true;
+      historyController.abort();
+      this.store.event(run.run_id, "model.deadline",
+        "Host strategic time allowance reached; provider cancellation requested", { turn_id: turnId });
+      this.abortRequest({ kind: "strategic_host", reason: "turn_deadline" }, agent);
+    } };
+    this.turnCancellation = cancellation;
+    try { await this.ownership.beginTurn?.(turnId, this.turnDeadlineOsNs); }
+    catch (error) {
+      if (this.turnCancellation === cancellation) this.turnCancellation = null;
+      if (this.historyController === historyController) this.historyController = null;
+      historyController.abort();
+      throw error;
+    }
+    if (!this.current(run, generation)) {
+      if (this.turnCancellation === cancellation) this.turnCancellation = null;
+      if (this.historyController === historyController) this.historyController = null;
+      historyController.abort();
+      return;
+    }
     const historyOptions: HistoryQueryOptions = {
       signal: historyController.signal,
       deadlineHostMs: performance.now() + Math.max(0, this.turnDeadline - Date.now()),
@@ -1311,21 +1428,8 @@ export class StrategicPlanner {
         read_only_review: review,
       },
     );
-    let deadlineReached = false;
     const timer = setTimeout(
-      () => {
-        deadlineReached = true;
-        historyController.abort();
-        this.store.event(
-          run.run_id,
-          "model.deadline",
-          "Host strategic time allowance reached; provider cancellation requested",
-          {
-            turn_id: turnId,
-          },
-        );
-        this.abortRequest({ kind: "strategic_host", reason: "turn_deadline" }, agent);
-      },
+      cancellation.cancel,
       Math.max(1, this.turnDeadline - Date.now()),
     );
     let through = this.contextCursor;
@@ -1571,6 +1675,7 @@ export class StrategicPlanner {
       }
     } finally {
       clearTimeout(timer);
+      if (this.turnCancellation === cancellation) this.turnCancellation = null;
       historyController.abort();
       if (this.historyController === historyController) this.historyController = null;
       this.finishUnsettledRequest(run);
@@ -1597,6 +1702,7 @@ export class StrategicPlanner {
       // Keep no transcript or old effect authority. Compatible bounded docs
       // and fresh Store projections are owned outside this temporary Agent.
       agent.replaceMessages([]);
+      await this.ownership.flush?.();
     }
     if (!this.current(run, generation)) return;
     if (review) {
@@ -1762,14 +1868,14 @@ export class StrategicPlanner {
   private finishUnsettledRequest(run: StoredRun): void {
     const request = this.request;
     if (!request) return;
-    const endedMono = performance.now();
+    const endedMono = this.timingNow();
     this.store.event(
       run.run_id,
       "model.request_unsettled",
       "An admitted provider request ended without a final usage message; usage and provider attempt count remain unknown",
       {
         request_id: request.id,
-        clock_id: HOST_MONOTONIC_CLOCK_ID,
+        clock_id: this.timingClock,
         started_monotonic_ms: request.startedMono,
         ended_monotonic_ms: endedMono,
         duration_ms: endedMono - request.startedMono,
@@ -1794,6 +1900,8 @@ export class StrategicPlanner {
     run: StoredRun,
     generation: number,
   ): void {
+    if (["message_start", "message_end", "tool_execution_start", "tool_execution_end"].includes(event.type))
+      this.ownership.evidence?.("visible_agent_event", event);
     if (event.type === "message_update" && event.message.role === "assistant" &&
         (event.assistantMessageEvent.type === "toolcall_delta" || event.assistantMessageEvent.type === "toolcall_end") && this.request)
       this.checkToolArgumentBudget(this.request, event.message, run, generation);
@@ -1826,6 +1934,12 @@ export class StrategicPlanner {
             ...(window ? { authority: () => this.assertAuthoring(window) } : {}) });
         }
       }
+      if (request) this.ownership.response?.({
+        request_id: request.id,
+        successful: !resourceRejected && !obsolete && !hostYield && !recoveredFailure &&
+          ["stop", "toolUse"].includes(message.stopReason),
+        calls: [...this.eligibleTools].map(([id, call]) => ({ id, name: call.name, arguments: call.arguments })),
+      });
       if (!hostYield && request) {
         // Host workflow roles outrank visible requested tool categories. This is
         // accounting classification, never a claim about hidden intent or cause.
@@ -1856,6 +1970,7 @@ export class StrategicPlanner {
             classified.output = null;
           }
           if (classified.calls !== null) classified.calls++;
+          this.ownership.classify?.(run, provisionalPurpose, purpose, request.id);
           request.purpose = purpose;
         }
         this.store.event(run.run_id, "model.purpose_classified", "Host classified the admitted request from workflow role and visible requested tools; no semantic intent or causality is inferred", {
@@ -1871,6 +1986,7 @@ export class StrategicPlanner {
         const evidence = request.usage.finish(message.usage);
         if (message.usage) {
           recordUsage(run.usage, request.purpose, message.usage);
+          this.ownership.usage?.(run, request.purpose, message.usage, request.id);
         }
         this.store.event(
             run.run_id,
@@ -1898,9 +2014,9 @@ export class StrategicPlanner {
           "Admitted strategic provider request settled",
           {
             request_id: request.id,
-            clock_id: HOST_MONOTONIC_CLOCK_ID,
+            clock_id: this.timingClock,
             started_monotonic_ms: request.startedMono,
-            ended_monotonic_ms: performance.now(),
+            ended_monotonic_ms: this.timingNow(),
             request_index: request.index,
             provider_response_id: message.responseId ?? null,
             provider_retry_attempt: message.retryRecovery?.attempt ?? null,
@@ -1944,7 +2060,7 @@ export class StrategicPlanner {
         }
       }
       if (this.host.run() === run) this.host.persist();
-      else this.store.saveRun(run);
+      else this.store.saveRun?.(run);
     } else if (event.type === "tool_execution_start") {
       this.store.event(
         run.run_id,

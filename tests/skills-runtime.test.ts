@@ -480,7 +480,7 @@ return {status:"completed",summary:"Foreground settled after attention",result:n
     releaseAgent: async () => { agent?.abort(); await agent?.waitForIdle(); },
   } as unknown as AuthManager;
   const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }), runSkill: generatedWorker } as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
   const failures = deferred<never>();
   void failures.promise.catch(() => {});
   const off = store.subscribe(event => {
@@ -596,7 +596,7 @@ describe("durable program execution through host capabilities", () => {
           releaseAgent: async () => { agent?.abort(); await agent?.waitForIdle(); },
         } as unknown as AuthManager;
         const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }), runSkill: generatedWorker } as unknown as SandboxService;
-        const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+        const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
         try {
           await runtime.initialize();
           const run = await runtime.createRun({ task: "Evaluator-authored zero-provider budget fixture",
@@ -743,7 +743,7 @@ return {status:"completed",summary:"Explicit fresh bounded decision after pre-ad
       releaseAgent: async () => {},
     } as unknown as AuthManager;
     const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }), runSkill: generatedWorker } as unknown as SandboxService;
-    const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+    const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
     try {
       await runtime.initialize();
       const run = await runtime.createRun({ task: "Exercise registered argument recovery without native services",

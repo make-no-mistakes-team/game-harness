@@ -151,7 +151,7 @@ async function repeatedNoEffectFixture(executive: boolean | "raw" | "view-observ
       });
       return { status: "completed", summary: "Neutral worker drained", result: null };
     } } as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
   resources.push({ runtime, store, directory });
   const finished = () => new Promise<void>(resolve => {
     const off = store.subscribe(event => { if (event.type === "scheduler.turn_finished") { off(); resolve(); } });
@@ -450,7 +450,7 @@ test(`${recoveryKind} recovery drains the actual old feedback reader before admi
   const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }),
     runSkill: async () => ({ status: "blocked", summary: "Bounded retained root outcome", result: null }),
   } as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
   resources.push({ runtime, store, directory });
   const reader = runtime.historyQueries as HistoryReader, query = reader.query.bind(reader), kill = ChildProcess.prototype.kill;
   const owner = Reflect.get(runtime, "historyOwner") as HistoryProjectionOwner;
@@ -567,7 +567,7 @@ test("Pause and Stop start native neutralization before readonly joins, resume r
     createAgent: async () => agent as unknown as Agent, releaseAgent: async () => {},
   } as unknown as AuthManager;
   const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }) } as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
   resources.push({ runtime, store, directory });
   await runtime.initialize();
   const run = await runtime.createRun({ task: "Keep history effect-free", model_id: "fixture-model",
@@ -716,7 +716,7 @@ for (const backlog of [0, 501]) test(`Runtime resident attention reaches the rea
           ] : [] };
       }, close: async () => {},
     }) } as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
   resources.push({ runtime, store, directory });
   const eventWaits: { promise: Promise<void>; cancel: () => void }[] = [];
   const event = (type: string) => {
@@ -958,7 +958,7 @@ test("a pending program stays unpolled and native first-cause remains immutable 
       return await abort.promise;
     },
   } as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
   resources.push({ runtime, store, directory });
   await runtime.initialize();
   const created = await runtime.createRun({

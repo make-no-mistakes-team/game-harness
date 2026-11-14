@@ -274,7 +274,7 @@ async function fixture(options: Options = {}) {
       return options.guardResult ?? true;
     },
   } satisfies Pick<SandboxService, "snapshot" | "runSkill" | "evaluateGameGuard"> as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
   cleanups.push(async () => {
     failBarrier = false; failObservation = false; failDisconnect = false;
     specReply.resolve(); firstEffect.resolve(cancelled); tailEffect.resolve(cancelled);

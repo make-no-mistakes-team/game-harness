@@ -2,10 +2,6 @@ import { mock } from "bun:test";
 import { mkdir, writeFile, readFile, readdir, stat, access, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { createHash, randomFillSync } from "node:crypto";
-import { Agent } from "@oh-my-pi/pi-agent-core/agent";
-import type { StreamFn } from "@oh-my-pi/pi-agent-core/types";
-import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import type { GameBridge, GameState, ObservationV3 } from "../../src/shared/contracts.ts";
 import { nativeFrame } from "./native-frame.ts";
@@ -23,6 +19,7 @@ import * as historyModule from "../../src/server/history-reader.ts";
 import type { HistoryQuery, HistoryQueryOptions, HistoryResult } from "../../src/server/history-protocol.ts";
 import * as recording from "../../src/server/recording.ts";
 import { ArtifactRetention } from "../../src/evaluation/artifact-retention.ts";
+import { AcceptanceLoopbackInference, codexLifecycleFrames, type LoopbackResponse } from "./acceptance-loopback-inference.ts";
 
 // Only native ownership, Docker provisioning and the authenticated provider
 // factory are substituted. Runner, Runtime, Agent/gates/events, Store, verifier,
@@ -260,74 +257,97 @@ const earlyIterator = cancelBeforeIterator ? { entered: Promise.withResolvers<vo
 let originalIteratorReads = 0, originalIteratorReturns = 0, originalIteratorClosed = false;
 let returnedBeforeTransportRelease: boolean | null = null, requestSignalAbortedBeforeRead = false;
 let requestCapResponseAbortedBeforeDelivery: boolean | null = null;
-const stream: StreamFn = (_model, context, options) => {
+// The actual default cognition child uses the real SDK against this private
+// provider. No Agent closure or in-process stream implementation crosses IPC.
+for (const name of ["NO_PROXY", "no_proxy"] as const)
+  process.env[name] = [process.env[name], "127.0.0.1", "localhost"].filter(Boolean).join(",");
+const inference = new AcceptanceLoopbackInference(model, ({ body, signal }): LoopbackResponse => {
   providerCalls++;
   const request = providerCalls;
-  actorContexts.push(JSON.stringify(context));
-  // Inventory gain is a synthetic native observation, not a fake verifier.
-  // Parity gain belongs to the native idle probe and survives later requests.
-  if (!observerParity) hasWood = !imageFailure && mode !== "cold-isolation" && mode !== "request-cap" &&
-    !planningStalled && !requestCapNonGoal && !cancelBeforeIterator;
-  const events = new AssistantMessageEventStream();
+  actorContexts.push(JSON.stringify(body));
+  // Inventory gain remains a native-fixture observation, not an injected
+  // verifier. Real HTTP/process delivery is asynchronous: publish positive
+  // gain only after the actual response/tool group settles, not at acquisition.
   const repair = mode === "cold-isolation" && providerCalls <= 2 || requestCapNonGoal && providerCalls === 1;
   const finishing = customFinish && providerCalls === 1;
-  const message: AssistantMessage = { role: "assistant", content: finishing ? [{ type: "toolCall", id: crypto.randomUUID(), name: "task_finish",
-    arguments: { all_requested_work_complete: true, summary: "Synthetic custom completion claim; not independently verified" } }] : repair ? [{ type: "toolCall", id: crypto.randomUUID(), name: "program_write",
+  const call = finishing ? { id: crypto.randomUUID(), name: "task_finish",
+    arguments: { all_requested_work_complete: true, summary: "Synthetic custom completion claim; not independently verified" } } : repair ? { id: crypto.randomUUID(), name: "program_write",
     arguments: { entry: "run", name: "slot-private-repair", source: `return {status:"completed",summary:"Unexecuted local repair revision ${providerCalls}",result:null};`,
       card: { purpose: "Local study isolation fixture", applicability: "This isolated slot only", method: "Retain an unexecuted local source revision",
         reason: "Exercise actual run-private repair", limitations: "Not executed; no gameplay efficacy evidence" }, dependencies: [],
-      ...(providerCalls === 2 ? { based_on: 1 } : {}) } }] : [{ type: "text", text: "Synthetic local lifecycle response; no network." }],
-    api: model.api, provider: model.provider, model: model.id, stopReason: repair || finishing ? "toolUse" : "stop", timestamp: Date.now(),
-    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
-  const deliver = () => {
-    events.push({ type: "start", partial: message });
-    for (const content of message.content) {
-      if (content.type !== "toolCall") continue;
-      // The actual SDK discards unfinished streamed calls. Mirror the provider's
-      // completed tool sequence so real host dispatch, not fixture Store writes,
-      // creates and revises these local programs.
-      events.push({ type: "toolcall_start", contentIndex: 0, partial: message });
-      events.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(content.arguments), partial: message });
-      events.push({ type: "toolcall_end", contentIndex: 0, toolCall: content, partial: message });
-    }
-    events.push({ type: "done", reason: repair || finishing ? "toolUse" : "stop", message }); events.end();
-  };
+      ...(providerCalls === 2 ? { based_on: 1 } : {}) } } : undefined;
+  const payload = codexLifecycleFrames(request, call ? { call } :
+    { text: "Synthetic local lifecycle response; loopback transport only." });
+  let delivered = false;
+  let delay: Promise<void> | undefined;
   if (observerParity) {
     paritySnapshot(request, "request_started");
-    parityProbes.push((async () => {
+    delay = (async () => {
       await Bun.sleep(150);
       paritySnapshot(request, "request_held");
-      deliver();
-    })());
+    })();
+    parityProbes.push(delay);
   } else if (developmentMode && requestCapNonGoal) {
     // The last admitted response must retain authority through delivery and
     // its real program_write. Only the following request may trigger Stop.
-    void Bun.sleep(25).then(() => {
-      requestCapResponseAbortedBeforeDelivery = options?.signal?.aborted === true;
-      deliver();
+    delay = Bun.sleep(25).then(() => {
+      requestCapResponseAbortedBeforeDelivery = signal.aborted;
     });
-  } else deliver();
-  if (earlyIterator) {
-    // This is the actual external stream-acquisition seam. The real Agent's
-    // signal is cancelled before its SDK asks the returned iterator for next().
-    // Its original transport iterator has explicit, separately joined cleanup.
-    events[Symbol.asyncIterator] = () => ({
-      next: async () => { originalIteratorReads++; return { done: true as const, value: undefined }; },
-      return: async () => {
-        originalIteratorReturns++;
-        earlyIterator.entered.resolve();
-        await earlyIterator.release.promise;
-        originalIteratorClosed = true;
-        return { done: true as const, value: undefined };
-      },
-    });
-    for (const agent of agents) agent.abort("Synthetic acquisition cancellation before first iterator read");
-    requestSignalAbortedBeforeRead = options?.signal?.aborted === true;
-    process.kill(process.pid, "SIGINT");
   }
-  return events;
+  if (earlyIterator) {
+    // The real SDK has acquired the loopback HTTP request, but this original
+    // provider body iterator has not been read. Revocation must join its actual
+    // return() independently of the child/SDK abort and process close.
+    return {
+      iterator: {
+        next: async () => { originalIteratorReads++; return { done: true as const, value: undefined }; },
+        return: async () => {
+          originalIteratorReturns++;
+          earlyIterator.entered.resolve();
+          await earlyIterator.release.promise;
+          originalIteratorClosed = true;
+          return { done: true as const, value: undefined };
+        },
+      },
+      acquired: owner => {
+        owner.cancel();
+        requestSignalAbortedBeforeRead = owner.signal.aborted;
+        process.kill(process.pid, "SIGINT");
+      },
+    };
+  }
+  return { iterator: {
+    async next() {
+      if (delay) await delay;
+      if (signal.aborted || delivered) return { done: true as const, value: undefined };
+      delivered = true; return { done: false as const, value: payload };
+    },
+    async return() {
+      // Delayed response factories/reads remain owned after a canceled wait.
+      if (delay) await delay;
+      delivered = true; return { done: true as const, value: undefined };
+    },
+  } };
+});
+// Observe actual canonical host settlement, not a synthetic Agent callback.
+// The provider/native scenario decisions above are unchanged.
+const persistEvent = Store.prototype.event;
+Store.prototype.event = function (...args: Parameters<Store["event"]>) {
+  const event = persistEvent.apply(this, args);
+  if (event.type === "scheduler.turn_finished") {
+    if (!observerParity && !imageFailure && mode !== "cold-isolation" &&
+      !planningStalled && !requestCapNonGoal && !cancelBeforeIterator) hasWood = true;
+    if (observerParity && providerCalls === 1) {
+      paritySnapshot(1, "request_settled");
+      parityProbes.push((async () => {
+        await Bun.sleep(150);
+        paritySnapshot(1, "idle");
+        hasWood = true;
+      })());
+    }
+  }
+  return event;
 };
-const agents = new Set<Agent>();
 mock.module(resolve(import.meta.dir, "../../src/server/auth.ts"), () => ({ AuthManager: { create: async () => {
   authCreates++;
   authReservationSeen = await reservationExists();
@@ -335,31 +355,10 @@ mock.module(resolve(import.meta.dir, "../../src/server/auth.ts"), () => ({ AuthM
   snapshot: () => ({ status: "ready", authenticated: true, provider: "openai-codex", account_label: null, login: null, error: null,
     models: mode === "model-mismatch" ? [] : [{ id: model.id, name: model.name, provider: model.provider, context_window: model.contextWindow,
       input_modalities: ["text", "image"], capability_provenance: "discovered_sdk_descriptor_not_live_vision" }] }),
-  createAgent: async (options: { systemPrompt: string[]; tools: Parameters<Agent["setTools"]>[0] }) => {
-    const agent = new Agent({ initialState: { model, systemPrompt: options.systemPrompt, tools: options.tools }, streamFn: stream,
-      getApiKey: () => "LOCAL_SYNTHETIC_PROVIDER_ONLY" });
-    // This case asserts a settled request followed by a verified goal. Publishing
-    // gain at acquisition instead races goal Stop against iterator exhaustion,
-    // correctly producing unknown consumption even before the run deadline.
-    if (mode === "request-cap") agent.subscribe(event => {
-      if (event.type === "agent_end") hasWood = true;
-    });
-    if (observerParity) agent.subscribe(event => {
-      if (event.type !== "agent_end" || providerCalls !== 1) return;
-      paritySnapshot(1, "request_settled");
-      parityProbes.push((async () => {
-        await Bun.sleep(150);
-        paritySnapshot(1, "idle");
-        // The native seam changes inventory only after both quiet windows.
-        // Runtime's normal idle wake must obtain and verify it; the fixture
-        // never publishes an observation notice or invokes a verifier.
-        hasWood = true;
-      })());
-    });
-    agents.add(agent); return agent;
-  },
-  releaseAgent: async (agent: Agent) => { agent.abort(); await agent.waitForIdle(); agents.delete(agent); },
-  close: async () => { for (const agent of agents) { agent.abort(); await agent.waitForIdle(); } agents.clear(); },
+  createInferenceSession: inference.createInferenceSession.bind(inference),
+  createAgent: inference.createAgent.bind(inference),
+  releaseAgent: inference.releaseAgent.bind(inference),
+  close: inference.close.bind(inference),
 }); } } }));
 // Intentional loading boundary: preserve real sandbox exports (notably the
 // cleanup error contract), but never prepare Docker in this synthetic process.
@@ -629,6 +628,11 @@ async function observeResult() {
   if (rendererPid !== null) { try { process.kill(rendererPid, "SIGKILL"); } catch {} }
   // Contain an implementation regression without hiding its observed evidence.
   await writeFile(join(root, "release-render"), "fixture cleanup");
+  // The fixture also owns its finite loopback listener if startup was refused
+  // before AuthManager creation. Do this after observing caller-return evidence
+  // so containment cannot hide an abandoned production auth/transport owner.
+  await inference.close();
+  Store.prototype.event = persistEvent;
  }
 }
 const observed = observeResult();

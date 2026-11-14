@@ -43,7 +43,9 @@ import { HistoryReader } from "./history-reader.ts";
 import type { HistoryQueryClient, HistoryQueryOptions } from "./history-protocol.ts";
 import { ActionArbiter } from "./action-arbiter.ts";
 import { ReactiveRuntime } from "./reactive.ts";
-import { StrategicPlanner, type StrategicRequestAdmission } from "./strategic.ts";
+import { StrategicPlanner, type StrategicHost, type StrategicRequestAdmission } from "./strategic.ts";
+import { CognitionClient } from "./cognition-client.ts";
+import type { CognitionEvidenceEvent, StrategicAgentFactory } from "./cognition-ports.ts";
 import { RuntimeTools } from "./runtime-tools.ts";
 import { createRuntimePrompt } from "./runtime-prompt.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
@@ -72,6 +74,8 @@ export interface RuntimeOptions {
   judge?: FastJudgeBroker;
   adapter?: RuntimeAdapter | (() => RuntimeAdapter | null);
   requestAdmission?: StrategicRequestAdmission;
+  /** Explicit embedded ownership for direct SDK consumers/tests, never a failure fallback. */
+  strategicAgentFactory?: StrategicAgentFactory;
 }
 
 /** Lifecycle and trusted observation/goal authority; execution modules own their scheduling. */
@@ -88,7 +92,7 @@ export class Runtime {
   private readonly registrations = new WeakMap<RuntimeAdapter, RegisteredAdapterContract>();
   private readonly actions: ActionArbiter;
   private readonly reactions: ReactiveRuntime;
-  private readonly strategic: StrategicPlanner;
+  private readonly strategic: StrategicPlanner | CognitionClient;
   private readonly catalog: RuntimeTools;
   private readonly planning: SpeculativePlanning;
   private readonly learning: ImprovementLearning;
@@ -116,6 +120,7 @@ export class Runtime {
   } | null = null;
   private readonly executiveObservation = new ExecutiveObservationMonitor();
   private preparingFirstRoot = false;
+  private readonly cognitionEvidenceListeners = new Set<(event: CognitionEvidenceEvent) => void>();
 
   private context() {
     const adapter = typeof this.adapterSource === "function" ? this.adapterSource() : this.adapterSource ?? this.game.adapter();
@@ -289,9 +294,6 @@ export class Runtime {
           space: state.space, screen: state.screen };
       },
     }) : null;
-    this.experience = options.experienceDirectory
-      ? new ExperienceLibrary(options.experienceDirectory, () => this.currentCompatibility())
-      : null;
     this.historyQueries = new HistoryReader(store.readLocation());
     this.learning = new ImprovementLearning(store, this.historyQueries, new ProjectionWriterClient(store));
     this.historyOwner = new HistoryProjectionOwner(store, this.learning);
@@ -529,18 +531,24 @@ export class Runtime {
       },
       options.judge,
     );
-    this.strategic = new StrategicPlanner(store, auth, {
+    const strategicHost = {
       requestAdmission: options.requestAdmission,
+      cognitionEvidence: {
+        enabled: () => this.cognitionEvidenceListeners.size > 0,
+        emit: event => { for (const listener of this.cognitionEvidenceListeners) listener(event); },
+      },
       run: () => this.run,
       generation: () => this.generation,
       assertCurrent: (generation, epoch) =>
         this.assertCurrent(generation, epoch),
       tools: (generation) => this.catalog.build(generation),
+      disclosedModules: () => this.catalog.disclosedModules(),
       rootPrompt: () =>
         createRuntimePrompt(
           this.run!,
           this.goalChoice(),
         ),
+      promptInput: () => this.goalChoice(),
       observe: () => this.refreshObservation(),
       modelObservation: () => this.modelObservation(),
       projectObservation: (observation, previous) => this.context().adapter.projectObservation(observation, previous),
@@ -572,7 +580,15 @@ export class Runtime {
         assertReview();
         return context;
       },
-    });
+    } satisfies StrategicHost;
+    this.strategic = options.strategicAgentFactory
+      ? new StrategicPlanner(store, options.strategicAgentFactory, strategicHost)
+      : new CognitionClient(store, auth, strategicHost);
+    // Open synchronous external storage only after the other constructor work.
+    // Child-process startup remains owned by initialize(), after Runtime exists.
+    this.experience = options.experienceDirectory
+      ? new ExperienceLibrary(options.experienceDirectory, () => this.currentCompatibility())
+      : null;
     this.catalog = new RuntimeTools(
       store,
       this.skills,
@@ -728,6 +744,10 @@ export class Runtime {
   currentRunId(): string | null {
     return this.run?.run_id ?? null;
   }
+  /** Bounded owner/phase diagnostics; no source, credentials or effect authority. */
+  cognitionSnapshot(): ReturnType<CognitionClient["snapshot"]> | null {
+    return this.strategic instanceof CognitionClient ? this.strategic.snapshot() : null;
+  }
   snapshot(): RunView | null {
     if (!this.run) return null;
     const { baseline: _baseline, control: _control, ...view } = this.run;
@@ -740,6 +760,41 @@ export class Runtime {
       executions,
       operator: projectRunOperator(this.store, this.run, this.actions.view, executions, !!(this.lifeRecovery || this.uncertaintyRecovery)),
     });
+  }
+  /** Source-free publication seed; never hydrates Store or computes a RunView. */
+  publicationSeed() {
+    const policies = this.reactions.list;
+    // Refuse publication explicitly instead of silently dropping live versions.
+    // This only affects the readonly publisher; physical admission never uses it.
+    if (policies.length > 1024)
+      throw new RuntimeFault("unavailable", "Operator publication seed exceeds its bounded policy allowance");
+    let bytes = 0;
+    for (const policy of policies) {
+      bytes += policy.policy_id.length * 3 + (policy.last_error?.length ?? 0) * 3 + 128;
+      if (bytes > 256 * 1024)
+        throw new RuntimeFault("unavailable", "Operator publication seed exceeds its bounded metadata allowance");
+    }
+    return { run_id: this.run?.run_id ?? null, action: this.actions.view,
+      recovering: !!(this.lifeRecovery || this.uncertaintyRecovery),
+      planning: this.planning.projection(),
+      policy_order: policies.map(({ policy_id, version, last_error }) => ({ policy_id, version, last_error })) };
+  }
+  subscribeCognitionEvidence(listener: (event: CognitionEvidenceEvent) => void): () => void {
+    if (this.cognitionEvidenceListeners.size >= 16)
+      throw new RuntimeFault("unavailable", "The bounded private cognition observer allowance is full");
+    this.cognitionEvidenceListeners.add(listener);
+    try {
+      if (this.run) listener({ run_id: this.run.run_id, kind: "coverage", body: {
+        coverage: this.run.status === "created" ? "registered_before_cognition_start" : "partial",
+        prior_events_unavailable: this.run.status !== "created", reconstructed: false,
+        source_preparation_observed_separately: true,
+      } });
+      if (this.strategic instanceof CognitionClient) this.strategic.evidenceChanged();
+    } catch (error) { this.cognitionEvidenceListeners.delete(listener); throw error; }
+    return () => {
+      this.cognitionEvidenceListeners.delete(listener);
+      if (this.strategic instanceof CognitionClient) this.strategic.evidenceChanged();
+    };
   }
   getRun(id: string): RunView | null {
     if (this.run?.run_id === id) return this.snapshot();
@@ -805,7 +860,7 @@ export class Runtime {
   async control(
     id: string,
     command: "start" | "pause" | "resume" | "stop",
-  ): Promise<RunView> {
+  ): Promise<void> {
     if (command === "pause" && this.run?.run_id === id &&
       ["running", "reviewing"].includes(this.run.status)) {
       this.run.status = "pausing";
@@ -856,7 +911,6 @@ export class Runtime {
           );
         await this.begin(true);
       }
-      return this.snapshot()!;
     });
   }
 

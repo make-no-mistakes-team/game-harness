@@ -114,7 +114,7 @@ test("a genuine transport fault pauses only after native and isolated emitters c
   } as unknown as SandboxService;
   const runtime = new Runtime(store, auth, game, sandbox, () => {
     if (runtime.snapshot()?.status === "paused") paused.resolve();
-  }, { adapter });
+  }, { adapter, strategicAgentFactory: auth });
   resources.push({ runtime, store, directory, release: () => { action.resolve(unknown); nativeClosed.resolve(); workerClosed.resolve(); } });
   await runtime.initialize();
   const created = await runtime.createRun({ task: "Observe neutral cancellation", goal: adapter.goals.find(goal => goal.goal_id === "custom")!, model_id: "fixture-model" });

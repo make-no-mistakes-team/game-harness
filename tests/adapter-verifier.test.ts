@@ -89,7 +89,7 @@ async function runtimeFixture(custom = false, unsupportedVerifier = false) {
     createAgent: async (configuration: { tools: AgentTool[] }) => { selectTools(configuration.tools); return agent; },
     releaseAgent: async () => {} } as unknown as AuthManager;
   const sandbox = { snapshot: () => ({ status: "ready", error: null }) } as unknown as SandboxService;
-  const options = { adapter, actorFrames: undefined };
+  const options = { adapter, actorFrames: undefined, strategicAgentFactory: auth };
   const runtime = new Runtime(store, auth, game, sandbox, () => {}, options);
   resources.push(async () => { await runtime.close(); store.close(); rmSync(directory, { recursive: true, force: true }); });
   await runtime.initialize();

@@ -245,6 +245,7 @@ async function fixture(unconfirmedBarrier = false) {
   > as unknown as SandboxService;
   const runtime = new Runtime(store, auth, game, sandbox, () => {}, {
     adapter,
+    strategicAgentFactory: auth,
   });
   cleanups.push(async () => {
     failBarrier = false;

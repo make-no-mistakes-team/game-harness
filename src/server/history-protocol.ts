@@ -103,6 +103,7 @@ export interface EvaluationPrefixSummary {
   admissions: number;
   usage: UsageMetrics;
   tools: { name: string; count: number }[];
+  confirmed_harness_faults: string[];
   provider_error: boolean;
   provider_settled: boolean;
   event_counts: { type: string; count: number; failed_verifications: number }[];

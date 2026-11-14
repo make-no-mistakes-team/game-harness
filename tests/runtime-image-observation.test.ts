@@ -43,7 +43,7 @@ async function fixture() {
     replaceMessages: () => {}, prompt: async () => {}, abort: () => {}, waitForIdle: async () => {} } as unknown as Agent;
   const auth = { snapshot: () => authState, createAgent: async () => agent, releaseAgent: async () => {} } as unknown as AuthManager;
   const sandbox = { snapshot: () => ({ status: "ready", error: null }) } as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, actorFrames: {
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth, actorFrames: {
     latestFrame: () => packet,
     subscribeFrames: listener => { frames.add(listener); subscribed.resolve(); return () => { frames.delete(listener); }; },
   } });

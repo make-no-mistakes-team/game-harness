@@ -397,7 +397,8 @@ for (const [mode, admissions] of [["image-before-first", 0], ["image-after-settl
     expect(result.attempts).toHaveLength(1);
     expect(result.attempts[0]).toMatchObject({ state: "settled", interruption: null,
       settlement: { outcome: expectedOutcome, usage: { admissions, reported_messages: admissions,
-        event_coverage: "complete", consumption_coverage: admissions ? "unknown" : "known" } } });
+        event_coverage: "complete", consumption_coverage: admissions ? "partial" : "known",
+        ...(admissions ? { cache_write: null, output: 1, cache_read: 0 } : {}) } } });
     expect(result.report.results).toHaveLength(1);
     expect(result.report.results[0]).toMatchObject({ outcome: expectedOutcome, host_baseline_preserved: true,
       usage: { admissions, reported_messages: admissions }, verification: { adapter_id: "fabric-owned-client", status: "incomplete",

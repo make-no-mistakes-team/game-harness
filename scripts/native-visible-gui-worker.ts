@@ -163,7 +163,9 @@ export async function runVisibleGuiWorkerCase(entry: Record<string, unknown>, ct
     sandbox = new SandboxService(ctx.fixture.project, () => {});
     await bounded(sandbox.prepare(), ctx.caps.startMs, "Real Docker worker preparation timed out");
     entry.sandbox = sandbox.snapshot(); requireProof(sandbox.snapshot().status === "ready", "Real isolated Docker runtime unavailable");
-    runtime = new Runtime(store, auth, ctx.fixture.bridge, sandbox, () => {}, { adapter: () => ctx.fixture.bridge.adapter() });
+    runtime = new Runtime(store, auth, ctx.fixture.bridge, sandbox, () => {}, {
+      adapter: () => ctx.fixture.bridge.adapter(), strategicAgentFactory: auth,
+    });
     requireProof(!arbiterBefore || ActionArbiter.current(ctx.fixture.bridge) === arbiterBefore, "Runtime replaced the sole native bridge arbiter");
     await runtime.initialize();
     const goal = ctx.fixture.bridge.adapter()?.goals.find(goal => goal.goal_id === "craft_crafting_table");

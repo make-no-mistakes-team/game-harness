@@ -6,6 +6,14 @@ import { classifyEvaluationRequest } from "./request-outcome.ts";
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const counter = (value: unknown): number | null => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 
+export function confirmedHarnessFault(event: ActivityEvent): string | null {
+  if (event.type === "runtime.model_observation_failed") return "model_observation_failed";
+  if (event.type === "runtime.history_query_failed") return "history_query_failed";
+  const reason = object(event.details).reason;
+  return event.type === "cognition.rpc_rejected" && (reason === "invalid_metadata" || reason === "invalid_protocol")
+    ? "cognition_protocol_rejected" : null;
+}
+
 /** Exact legacy first-N event qualification, shared by the live observer and readonly child. */
 export function reduceEvaluationPrefix(events: readonly ActivityEvent[], admissions: number, eventsOmitted: boolean): EvaluationPrefixSummary {
   const admitted = events.filter(event => event.type === "model.call");
@@ -42,8 +50,11 @@ export function reduceEvaluationPrefix(events: readonly ActivityEvent[], admissi
   const settledIds = new Set<unknown>();
   let providerError = false;
   const tools = new Map<string, number>();
+  const faults = new Set<string>();
   const counts = new Map<string, { type: string; count: number; failed_verifications: number }>();
   for (const event of events) {
+    const fault = confirmedHarnessFault(event);
+    if (fault) faults.add(fault);
     if (event.type === "model.request_settled" || event.type === "model.request_unsettled") {
       const outcome = classifyEvaluationRequest(event);
       if (outcome.provider_error) providerError = true;
@@ -60,6 +71,7 @@ export function reduceEvaluationPrefix(events: readonly ActivityEvent[], admissi
     admitted_request_ids: admitted.flatMap(event => { const id = object(event.details).request_id; return typeof id === "string" ? [id] : []; }),
     messages, additional_terminal_evidence: unsettled, events_omitted: eventsOmitted }),
     tools: [...tools].map(([name, count]) => ({ name, count })),
+    confirmed_harness_faults: [...faults],
     provider_error: providerError,
     provider_settled: admitted.length > 0 && !eventsOmitted && admitted.every(event => settledIds.has(object(event.details).request_id)),
     event_counts: [...counts.values()], events_omitted: eventsOmitted };

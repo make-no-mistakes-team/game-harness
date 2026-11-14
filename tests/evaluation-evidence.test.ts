@@ -628,9 +628,8 @@ async function observedAgent(f: ReturnType<typeof setup>) {
   if (!descriptor) throw new Error("Installed catalog lacks offline Codex descriptor");
   const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
   const agent = new Agent({ initialState: { model }, getApiKey: async () => "DO_NOT_PERSIST_FIXTURE_CREDENTIAL" });
-  f.observer.bindRuntime({ currentRunId: () => f.run.run_id } as unknown as Runtime);
   const auth = { createAgent: async () => agent } as unknown as AuthManager;
-  f.observer.observeAuthAgents(auth);
+  f.observer.observeAuthAgents(auth, () => f.run.run_id);
   await auth.createAgent({} as Parameters<AuthManager["createAgent"]>[0]);
   return agent;
 }
@@ -724,8 +723,7 @@ test("private journal retains the supplemented context actually delivered to the
       stream.push({type:"start",partial:message}); stream.push({type:"done",reason:"stop",message}); stream.end(); return stream;
     } });
   const auth = { createAgent: async () => agent, releaseAgent: async () => {agent.abort();await agent.waitForIdle();} } as unknown as AuthManager;
-  f.observer.bindRuntime({currentRunId:()=>f.run.run_id} as unknown as Runtime);
-  f.observer.observeAuthAgents(auth);
+  f.observer.observeAuthAgents(auth, () => f.run.run_id);
   const observation = minecraftObservationFixture(adapter,{world_id:f.run.world_id,session_id:f.run.session_id!});
   const planner = new StrategicPlanner(f.store,auth,{
     run:()=>f.run,generation:()=>1,assertCurrent:()=>f.run,tools:()=>[],rootPrompt:()=>"Evidence fixture",
@@ -963,6 +961,27 @@ test("provider errors stop the sample and remain distinct from a confirmed harne
   expect(observer.hasProviderFailure(run.run_id)).toBe(true);
   expect(stops).toEqual(["provider_failure_or_unsettled_no_repeat"]);
   expect(await observer.summary(run.run_id)).toMatchObject({ provider_error: true, provider_settled: false, confirmed_harness_faults: [] });
+});
+
+test("a rejected cognition protocol before admission remains a platform failure in live and readonly evidence", async () => {
+  const f = setup(30);
+  f.emit("cognition.rpc_rejected", { method: "metadata", reason: "host_operation_failed" });
+  expect((await f.observer.summary(f.run.run_id)).confirmed_harness_faults).toEqual([]);
+  f.emit("cognition.rpc_rejected", { method: "metadata", reason: "invalid_metadata", issue_codes: ["unrecognized_keys"] });
+  const summary = await f.observer.summary(f.run.run_id);
+  expect(summary.confirmed_harness_faults).toContain("cognition_protocol_rejected");
+  expect(classifyEvaluation({ inferenceAdmitted: false, goalVerified: false, platformChecksComplete: true,
+    confirmedHarnessFaults: summary.confirmed_harness_faults, providerError: summary.provider_error,
+    providerSettled: summary.provider_settled })).toMatchObject({
+    platform_status: "fail", provider_status: "not_called", agent_status: "not_run",
+  });
+  const reader = new HistoryReader(f.store.readLocation());
+  try {
+    const retrospective = await reader.query({ kind: "evaluation_prefix", run_id: f.run.run_id, event_limit: 100 },
+      { deadlineHostMs: performance.now() + 5000 });
+    expect(retrospective).toMatchObject({ admissions: 0, confirmed_harness_faults: ["cognition_protocol_rejected"],
+      provider_error: false, provider_settled: false });
+  } finally { await reader.close(); }
 });
 
 for (const settledRequests of [0, 1]) {

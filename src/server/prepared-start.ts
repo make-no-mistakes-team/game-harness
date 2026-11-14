@@ -2,7 +2,6 @@ import type { AppSnapshot, GoalChoice, Json, RunView } from "../shared/contracts
 import { preparedStartActive, type PreparedStartRequest, type PreparedStartView } from "../shared/prepared-start.ts";
 import { PreparedSource, type PreparedSourceOptions } from "./prepared-source.ts";
 import type { PreparationContract, PreparedSourceCandidate } from "./prepared-source-contract.ts";
-import type { Runtime } from "./runtime.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { adapterCompatibility } from "./adapter-contract.ts";
 
@@ -11,12 +10,17 @@ export interface PreparedWorldLaunch {
   ready: Promise<void>;
   close(): Promise<void>;
 }
+export interface PreparedStartRuntime {
+  snapshot(): RunView | null;
+  startPreparedRun(candidate: PreparedSourceCandidate): Promise<RunView>;
+  control(id: string, command: "start" | "pause" | "resume" | "stop"): Promise<void>;
+}
 export interface PreparedStartOptions {
   directory: string;
   sourceReferences?: PreparedSourceOptions["sourceReferences"];
   auth: PreparedSourceOptions["auth"];
   sandbox: PreparedSourceOptions["sandbox"];
-  runtime: Pick<Runtime, "snapshot" | "startPreparedRun" | "control">;
+  runtime: PreparedStartRuntime;
   state(): Pick<AppSnapshot, "game" | "server" | "sandbox" | "run">;
   getContract(): Promise<PreparationContract>;
   launch(): PreparedWorldLaunch;
@@ -100,9 +104,9 @@ export class PreparedStart {
         // hidden world disconnect or claim that the transferred worker closed.
         try {
           const run = this.options.runtime.snapshot();
-          let final: RunView | null = run;
           if (run?.run_id === view.run_id && !["stopped", "completed", "failed"].includes(run.status))
-            final = await this.options.runtime.control(run.run_id, "stop");
+            await this.options.runtime.control(run.run_id, "stop");
+          const final = this.options.runtime.snapshot();
           candidate.transferClosed(final?.run_id === view.run_id && final.operator.cleanup_error === null);
         } catch { candidate.transferClosed(false); }
       } else await this.closeLaunch();

@@ -16,8 +16,13 @@ import { RuntimeFault } from "./runtime-fault.ts";
 import type { ModelObservation } from "./actor-frames.ts";
 import { ProgramOperations } from "./program-operations.ts";
 import { programHelp } from "./program-help.ts";
-import { helpSchema, memorySchema, prepareNextSchema, programEditSchema, programInspectSchema, programReviewSchema, programRunSchema, programSubmitSchema, programWriteSchema, reflexSchema, taskFinishSchema } from "./program-interface.ts";
+import { runtimeToolCatalogue, runtimeToolDescriptor, type RuntimeToolCatalogueEntry, type RuntimeToolInputs, type RuntimeToolName } from "./runtime-tool-catalog.ts";
 import { residentJsonConstraint } from "../shared/resident.ts";
+
+type RuntimeToolHandler<Name extends RuntimeToolName> = (
+  input: RuntimeToolInputs[Name], callId: string, signal: AbortSignal | undefined, commit: () => void,
+) => unknown | Promise<unknown>;
+type RuntimeToolHandlers = { [Name in RuntimeToolName]: RuntimeToolHandler<Name> };
 
 const faultIssuesSchema = z.array(z.object({
   code: z.string().max(80),
@@ -70,25 +75,34 @@ export class RuntimeTools {
   constructor(private store: Store, private skills: SkillManager, private sources: SourcePrograms, private reactions: ReactiveRuntime,
     private experience: ExperienceLibrary | null, private host: RuntimeToolHost) {}
 
+  private synchronizeModules(runId: string): void {
+    if (this.moduleRun !== runId) {
+      this.moduleRun = runId; this.modules.clear(); this.modules.add("reflex"); this.reviewDecisions.clear();
+    }
+  }
+
+  disclosedModules(): ToolModule[] {
+    this.synchronizeModules(this.host.run().run_id);
+    return [...this.modules];
+  }
+
   build(generation: number): AgentTool[] {
     const run = this.host.run();
-    if (this.moduleRun !== run.run_id) {
-      this.moduleRun = run.run_id; this.modules.clear(); this.modules.add("reflex"); this.reviewDecisions.clear();
-    }
+    this.synchronizeModules(run.run_id);
     const operations = new ProgramOperations(this.store, this.skills, this.sources, this.reactions, this.experience, this.host, run);
     const role = (): ToolRole => run.status === "reviewing" ? "review" :
       this.host.toolRole?.() ?? (this.host.planning().projection()?.planning_active ? "speculative" : "ordinary");
-    const inactiveWrite = () => role() === "authoring" || role() === "speculative";
-    const writeSchema = inactiveWrite() ? programWriteSchema.omit({ reason: true }) : programWriteSchema;
-    const editSchema = inactiveWrite() ? programEditSchema.omit({ reason: true }) : programEditSchema;
     const result = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }], details: value });
-    const tool = <T>(name: string, description: string, schema: z.ZodType<T>,
-      handler: (input: T, callId: string, signal: AbortSignal | undefined, commit: () => void) => unknown | Promise<unknown>): AgentTool => {
+    const tool = <Name extends RuntimeToolName>(entry: RuntimeToolCatalogueEntry<Name>): AgentTool => {
+      const { name, schema } = entry;
+      const handler: RuntimeToolHandler<Name> = handlers[name];
+      const descriptor = runtimeToolDescriptor(entry);
       const registered: AgentTool = {
-      name, label: name, description, intent: "omit", concurrency: "exclusive", strict: false,
+      name: descriptor.name, label: descriptor.label, description: descriptor.description,
+      intent: descriptor.intent, concurrency: descriptor.concurrency, strict: descriptor.strict,
+      lenientArgValidation: descriptor.lenientArgValidation,
+      get parameters() { return descriptor.parameters; },
       // Only schema mismatches reach the host; malformed JSON remains SDK-owned.
-      lenientArgValidation: true,
-      parameters: z.toJSONSchema(schema, { unrepresentable: "any", io: "input" }),
       execute: async (callId, raw, signal) => {
         let argumentError: z.ZodError | null = null;
         try {
@@ -200,37 +214,34 @@ export class RuntimeTools {
       runtimeTools.add(registered);
       return registered;
     };
-    return [
-      tool("observe", "Obtain a fresh authorized player observation and current typed actor image when enabled; no authority identities are caller supplied.", z.object({}).strict(), async () => {
+    const handlers: RuntimeToolHandlers = {
+      observe: async () => {
         const selected = this.host.modelObservation ? await this.host.modelObservation() :
           { observation: await this.host.observe(), images: [], image_metadata: { mode: "disabled" } };
         const projection = this.host.adapter().projectObservation(selected.observation);
         return { value: { ...operations.workspace.observationView(selected.observation, projection), image_metadata: selected.image_metadata }, images: selected.images };
-      }),
-      tool("program_write", inactiveWrite()
-        ? "Validate and save inactive source without starting or replacing foreground work. Explicit entry is required, including revisions: run BODY or step/analyze/library module. Existing names require based_on. card.reason is inert descriptive metadata."
-        : "Create or revise named JavaScript source. Explicit entry is required, including revisions: run BODY or step/analyze/library module. Existing names require based_on. Optional reason links actual revision feedback, not proven efficacy.",
-        writeSchema, (input, callId, signal, commit) => operations.write(input, callId, commit, signal)),
-      tool("program_edit", "Apply only your sequential exact unique-match replacements to the latest existing based_on source. Retains entry/card and exact dependency pins when dependencies is omitted. Supply a complete dependencies list to explicitly replace pins using already authored versions. Validates source and graph atomically, saves without execution or controller replacement. Optional reason links the exact parent's actual outcome feedback.",
-        editSchema, (input, callId, signal, commit) => operations.edit(input, callId, commit, signal)),
-      tool("program_submit", "Write and start exact model-authored JavaScript. step is ongoing raw frame/input control; run can be a finite procedure OR an ongoing semantic feedback loop within declared finite root limits. Both can remain useful while cognition runs. Required args is JSON (null if unused); card optional; revisions need based_on latest stored. Optional exact-predecessor handoff fences future capabilities after validation, lets only the current admitted bounded semantic capability settle, then retires before replacement; residents retire immediately. Stop/tool abort revoke immediately. Returns source separately from started/refused/unknown; never retry unknown.", programSubmitSchema, (input, callId, signal, commit) => operations.submit(input, callId, commit, signal)),
-      tool("program_run", "Start exact named run/step; optional handoff:{name,version,execution_ordinal} replaces only after confirmed retirement. After validation, future predecessor capabilities are fenced immediately; only its current admitted bounded semantic capability may settle. Residents retire immediately; Stop/tool abort revoke immediately. Inspect/stop, update resident intent, run pure analyze, activate a prepared successor, or select finite attention. No automatic replacement or analysis-to-control injection. Host owns retry identity and authority.", programRunSchema, (input, callId, signal, commit) => operations.runProgram(input, callId, commit, signal)),
-      tool("program_inspect", "Read named catalog/source/execution/trace/feedback/comparison/planning views without effects. Preserve page cursors and explicit omissions.", programInspectSchema, (input, _callId, signal, commit) => operations.inspect(input, signal, commit)),
-      tool("program_review", "Record keep or insufficient_evidence for the latest matching outcome of a named version. A performed code experiment is linked directly through program_write.reason.", programReviewSchema, (input, callId, signal, commit) => operations.review(input, callId, commit, signal)),
-      tool("help", "Load actions for compact async methods, action shapes/bounds and crafting. Add kind to topic actions for one complete exact action family. Controller covers local frame/input control; game has full registered schemas; programs covers lifecycle; planning covers prepared successors; reflex covers local reactions. Memory discloses its optional module.", helpSchema, (input) => {
+      },
+      program_write: (input, callId, signal, commit) => operations.write(input, callId, commit, signal),
+      program_edit: (input, callId, signal, commit) => operations.edit(input, callId, commit, signal),
+      program_submit: (input, callId, signal, commit) => operations.submit(input, callId, commit, signal),
+      program_run: (input, callId, signal, commit) => operations.runProgram(input, callId, commit, signal),
+      program_inspect: (input, _callId, signal, commit) => operations.inspect(input, signal, commit),
+      program_review: (input, callId, signal, commit) => operations.review(input, callId, commit, signal),
+      help: (input) => {
         if (input.topic === "memory" && role() === "authoring")
           throw new RuntimeFault("forbidden", "Optional playing modules are unavailable during pending-program authoring");
         if (input.topic === "memory" && role() === "ordinary") this.modules.add(input.topic);
         return programHelp(input.topic, this.host.adapter(), input.kind);
-      }),
-      tool("task_finish", "TERMINAL: requires all_requested_work_complete:true, explicitly affirming the WHOLE custom task is complete, then immediately stops/drains the run and every local controller. Unverified means model-reported, not unfinished. Never affirm this to end a planning turn, report partial progress or say completion cannot be claimed. If work remains, end your response without this tool and retain useful bounded control.", taskFinishSchema, (input, callId) => {
+      },
+      task_finish: (input, callId) => {
         if (typeof run.goal === "string" || run.goal.goal_id !== "custom" || run.goal.verifier !== null) throw new RuntimeFault("forbidden", "Only custom tasks permit model-reported completion; built-in goals require trusted verification");
         this.host.finishTask(input.summary, callId);
         return { status: "stopping", verification: "unverified" };
-      }),
-      tool("prepare_next", "Stage one existing named program for the current restricted planning flight. Optional guard_source binds only observation,args; omission adds no gameplay condition or effect authority.", prepareNextSchema, (input, callId) => operations.prepare(input, callId)),
-      tool("reflex", "Submit your authored reaction in one call: operation:'submit' persists the exact source, validates in isolation and explicitly arms a finite trial/watch. Separate write/inspect/validate/activate/retire remain available; keep requires real trial evidence. No policy or response is supplied automatically. Read help reflex for context/state and budgets. Jev requires separately configured provider access.", reflexSchema, (input, callId, signal, commit) => operations.reflex(input, callId, generation, commit, signal)),
-      tool("memory", "Inspect, freshly load, or explicitly qualify compatible named exact experience snapshots using real bounded evidence.", memorySchema, (input, callId, _signal, commit) => operations.memory(input, callId, commit)),
-    ].filter((entry) => toolCatalogAllows(role(), entry.name, this.modules));
+      },
+      prepare_next: (input, callId) => operations.prepare(input, callId),
+      reflex: (input, callId, signal, commit) => operations.reflex(input, callId, generation, commit, signal),
+      memory: (input, callId, _signal, commit) => operations.memory(input, callId, commit),
+    };
+    return runtimeToolCatalogue(role(), this.modules).map(tool);
   }
 }

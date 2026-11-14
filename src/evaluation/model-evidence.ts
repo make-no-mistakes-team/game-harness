@@ -17,6 +17,7 @@ import type { JournalLimits } from "../shared/evidence-limits.ts";
 import { HOST_MONOTONIC_CLOCK_ID } from "../server/performance.ts";
 import type { ProjectionProgress } from "../server/program-feedback.ts";
 import { classifyEvaluationRequest } from "./request-outcome.ts";
+import { confirmedHarnessFault } from "./evidence-prefix.ts";
 
 const object = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 
@@ -142,8 +143,7 @@ export class ModelProgramEvidence {
   private readonly initializedRuns = new Map<string, Promise<void>>();
   private readonly toolFailureFlags = new Map<string, { backend: boolean; unclassified: boolean }>();
   private readonly providerFailures = new Set<string>();
-  private readonly modelObservationFailures = new Set<string>();
-  private readonly historyQueryFailures = new Set<string>();
+  private readonly harnessFaults = new Map<string, Set<string>>();
   private readonly stopRequested = new Set<string>();
   private readonly journals = new Map<string, PrivateJournal>();
   private readonly history: HistoryReader;
@@ -184,7 +184,15 @@ export class ModelProgramEvidence {
     }
     return journal;
   }
-  bindRuntime(runtime: Runtime) { this.runtime = runtime; }
+  bindRuntime(runtime: Runtime) {
+    this.runtime = runtime;
+    this.agentSubscriptions.push(runtime.subscribeCognitionEvidence(event => {
+      if (this.closed) return;
+      if (event.kind === "visible_agent_event")
+        this.observeVisibleAgentEvent(event.body, event.run_id);
+      else this.journal(event.run_id).append(event.kind, event.body);
+    }));
+  }
   recordObservation(runId: string, observation: ObservationV3) {
     this.journal(runId).append("authorized_evaluation_observation", { observation });
   }
@@ -214,8 +222,12 @@ export class ModelProgramEvidence {
       if (event.type === "goal.verification" && data.status === "failed") count.failed_verifications++;
       counts.set(event.type, count);
     }
-    if (event.type === "runtime.model_observation_failed") this.modelObservationFailures.add(runId);
-    if (event.type === "runtime.history_query_failed") this.historyQueryFailures.add(runId);
+    const fault = confirmedHarnessFault(event);
+    if (fault) {
+      let faults = this.harnessFaults.get(runId);
+      if (!faults) { faults = new Set(); this.harnessFaults.set(runId, faults); }
+      faults.add(fault);
+    }
     if (event.type.startsWith("action.") && typeof data.action_id === "string") {
       const action = this.store.getAction(runId, data.action_id);
       if (action) {
@@ -278,12 +290,12 @@ export class ModelProgramEvidence {
     } else if (/^action\.(?:succeeded|failed|cancelled|unknown)$/.test(event.type) && typeof data.action_id === "string") close(`action:${runId}:${data.action_id}`);
   }
   /** Wraps only Agent creation to subscribe to the actual returned Agent. */
-  observeAuthAgents(auth: AuthManager) {
+  observeAuthAgents(auth: AuthManager, currentRunId: () => string | null = () => this.runtime?.currentRunId() ?? null) {
     if (this.restoreAuthFactory) throw new Error("The actual Agent observer is already installed");
     const original = auth.createAgent;
     auth.createAgent = async options => {
       const agent = await original.call(auth, options);
-      const runId = this.runtime?.currentRunId();
+      const runId = currentRunId();
       if (runId && !this.closed) this.observeAgent(agent, runId);
       return agent;
     };
@@ -308,33 +320,40 @@ export class ModelProgramEvidence {
       agent.streamFn = observed;
       this.agentSubscriptions.push(() => { if (agent.streamFn === observed) agent.streamFn = stream; });
     }
-    this.agentSubscriptions.push(agent.subscribe(event => {
-      // Only SDK-visible conversation/tool events. No launcher logs, API keys,
-      // transport options, auth database contents or hidden evaluator state.
-      if (["message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(event.type))
-        this.journal(runId).append("visible_agent_event", event);
-      if (event.type === "tool_execution_end" && event.isError) {
-        const details = object(object(event.result).details), error = object(details.error);
-        const code = typeof error.code === "string" ? error.code : null;
-        this.toolFailures.push({ run_id: runId, tool: event.toolName, tool_call_id: event.toolCallId,
-          code });
-        const flags = this.toolFailureFlags.get(runId) ?? { backend: false, unclassified: false };
-        flags.backend ||= code === "backend_unavailable";
-        flags.unclassified ||= code === null || !expectedToolFailures.has(code) && code !== "backend_unavailable";
-        this.toolFailureFlags.set(runId, flags);
-      }
-      if (event.type !== "message_end" || event.message.role !== "assistant") return;
-      for (const content of event.message.content) {
-        if (content.type !== "toolCall") continue;
-        try {
-          const json = JSON.stringify(content.arguments), size = Buffer.byteLength(json);
-          if (this.toolBytes + size > this.caps.reportJsonBytes / 4) { this.omit("assistant_tool_call_arguments"); continue; }
-          this.toolCalls.push({ run_id: runId, name: content.name, tool_call_id: content.id, arguments: JSON.parse(json),
-            arguments_sha256: createHash("sha256").update(json).digest("hex"), omission: null });
-          this.toolBytes += size;
-        } catch { this.omit("assistant_tool_call_arguments"); }
-      }
-    }));
+    this.agentSubscriptions.push(agent.subscribe(event => this.observeVisibleAgentEvent(event, runId)));
+  }
+  private observeVisibleAgentEvent(input: unknown, runId: string): void {
+    const event = object(input);
+    // Local Agents and the owned cognition process share the same accounting.
+    // The remote subscription supplies completed SDK-visible events, not
+    // credentials, transport options or reconstructed token-level updates.
+    if (["message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(String(event.type)))
+      this.journal(runId).append("visible_agent_event", input);
+    if (event.type === "tool_execution_end" && event.isError === true &&
+        typeof event.toolName === "string" && typeof event.toolCallId === "string") {
+      const details = object(object(event.result).details), error = object(details.error);
+      const code = typeof error.code === "string" ? error.code : null;
+      this.toolFailures.push({ run_id: runId, tool: event.toolName, tool_call_id: event.toolCallId, code });
+      const flags = this.toolFailureFlags.get(runId) ?? { backend: false, unclassified: false };
+      flags.backend ||= code === "backend_unavailable";
+      flags.unclassified ||= code === null || !expectedToolFailures.has(code) && code !== "backend_unavailable";
+      this.toolFailureFlags.set(runId, flags);
+    }
+    const message = object(event.message);
+    if (event.type !== "message_end" || message.role !== "assistant" || !Array.isArray(message.content)) return;
+    for (const part of message.content) {
+      const content = object(part);
+      if (content.type !== "toolCall") continue;
+      try {
+        if (typeof content.name !== "string" || typeof content.id !== "string")
+          throw new Error("Malformed visible tool identity");
+        const json = JSON.stringify(content.arguments), size = Buffer.byteLength(json);
+        if (this.toolBytes + size > this.caps.reportJsonBytes / 4) { this.omit("assistant_tool_call_arguments"); continue; }
+        this.toolCalls.push({ run_id: runId, name: content.name, tool_call_id: content.id, arguments: JSON.parse(json),
+          arguments_sha256: createHash("sha256").update(json).digest("hex"), omission: null });
+        this.toolBytes += size;
+      } catch { this.omit("assistant_tool_call_arguments"); }
+    }
   }
   count(runId: string) { return this.admissions.get(runId) ?? 0; }
   initialize(runId: string, options?: HistoryQueryOptions): Promise<void> {
@@ -396,13 +415,12 @@ export class ModelProgramEvidence {
     const prefix = await this.prefix(runId, options);
     this.omissions.events = prefix.events_omitted ? 1 : 0;
     const flags = this.toolFailureFlags.get(runId);
-    const faults = flags?.backend ? ["tool_backend_unavailable"] : [];
-    if (this.modelObservationFailures.has(runId)) faults.push("model_observation_failed");
-    if (this.historyQueryFailures.has(runId)) faults.push("history_query_failed");
+    const faults = new Set([...prefix.confirmed_harness_faults, ...(this.harnessFaults.get(runId) ?? [])]);
+    if (flags?.backend) faults.add("tool_backend_unavailable");
     const actions = this.actionSummaries.get(runId) ?? actionMetrics([]);
     return { usage: prefix.usage, tools: prefix.tools, provider_error: prefix.provider_error, provider_settled: prefix.provider_settled,
       actions: { ...actions, by_status: { ...actions.by_status }, inventory_delta: { ...actions.inventory_delta } },
-      confirmed_harness_faults: faults, unclassified_tool_failures: flags?.unclassified ?? false,
+      confirmed_harness_faults: [...faults], unclassified_tool_failures: flags?.unclassified ?? false,
       observer_error: this.observerError, omissions: { ...this.omissions } };
   }
   private queryOptions(options?: HistoryQueryOptions): HistoryQueryOptions {

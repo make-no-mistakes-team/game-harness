@@ -83,7 +83,7 @@ async function fixture() {
     createResidentWorker: async () => { ordinaryCompiles++; throw new Error("Prepared root must not compile again after join"); },
     createResidentAnalysisWorker: async () => { throw new Error("No fixture analysis"); },
     runSkill: async () => { throw new Error("No legacy root"); } } as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter });
+  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
   let closed = false;
   const close = async () => {
     if (closed) return;

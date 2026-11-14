@@ -105,7 +105,10 @@ try {
     catch (error) { receipt.error = error instanceof Error ? error.message : String(error); throw error; }
     finally { receipt.end_ms = performance.now() - started; }
   };
-  runtime = new Runtime(store, diagnostic.auth(), fixture.bridge, sandbox, () => {}, { adapter: () => fixture.bridge.adapter() });
+  const diagnosticAuth = diagnostic.auth();
+  runtime = new Runtime(store, diagnosticAuth, fixture.bridge, sandbox, () => {}, {
+    adapter: () => fixture.bridge.adapter(), strategicAgentFactory: diagnosticAuth,
+  });
   await runtime.initialize();
   for (const scenario of cases) {
     if (failure) break;

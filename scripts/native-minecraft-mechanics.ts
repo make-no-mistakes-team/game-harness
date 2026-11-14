@@ -680,7 +680,9 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
         if (selected === "approach") receipt.polling_after = observationCount;
       }
     };
-    runtime = new Runtime(store, auth, fixture.bridge, sandbox, () => {}, { adapter: () => fixture.bridge.adapter() });
+    runtime = new Runtime(store, auth, fixture.bridge, sandbox, () => {}, {
+      adapter: () => fixture.bridge.adapter(), strategicAgentFactory: auth,
+    });
     await runtime.initialize(); open();
     const adapter = fixture.bridge.adapter(); requireProof(adapter, "Missing negotiated adapter");
     const goal = adapter.goals.find(goal => goal.goal_id === "custom" && goal.verifier === null); requireProof(goal, "Missing unverified fixture goal");

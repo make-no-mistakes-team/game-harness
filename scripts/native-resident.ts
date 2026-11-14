@@ -205,7 +205,9 @@ export async function runNativeResidentFixture(project: string, caps: Evaluation
       const grants: NativeGrantTrace[] = []; activeNativeGrants = grants; entry.native_grants = grants;
       const prior = ActionArbiter.current(fixture.bridge);
       const { Runtime } = await import("../src/server/runtime.ts");
-      const runtime = new Runtime(store, caller.auth, fixture.bridge, sandbox, () => {}, { adapter: () => fixture.bridge.adapter() });
+      const runtime = new Runtime(store, caller.auth, fixture.bridge, sandbox, () => {}, {
+        adapter: () => fixture.bridge.adapter(), strategicAgentFactory: caller.auth,
+      });
       activeRuntime = runtime;
       requireProof(!prior || ActionArbiter.current(fixture.bridge) === prior, "Runtime replaced the bridge's sole arbiter");
       let runId: string | undefined, caseFailure: unknown;

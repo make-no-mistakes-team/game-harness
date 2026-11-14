@@ -30,6 +30,48 @@ GameHarness must be language-agnostic at component boundaries. Performance-criti
 
 The implementation separates `Runtime` lifecycle/observation/goal authority from `ActionArbiter` (`action-arbiter.ts`), `ReactiveRuntime` (`reactive.ts`), `StrategicPlanner` (`strategic.ts`), `RuntimeTools` (`runtime-tools.ts`), `SourcePrograms` (`source-programs.ts`), `SkillManager` (`skills.ts`), `ExperienceLibrary` (`experience.ts`) and program evidence (`program-evidence.ts`). Each owns its state and enforcement responsibilities; `runtime-prompt.ts` holds authoring instructions. The public runtime API remains the composition seam, not a per-tick gameplay engine.
 
+### Process ownership
+
+Default `Runtime` runs the whole `StrategicPlanner`, actual SDK Agent/provider
+callbacks and retained-context construction in one owned cognition process.
+The physical host retains native transport, capture/ACK handling, local program
+supervision, the sole action arbiter, effect authority and retirement. Direct
+consumers can explicitly select an embedded strategic Agent factory; that path
+does not demonstrate default-process isolation.
+
+The cognition process reads canonical history through a readonly Store and
+submits bounded ordered metadata to the host. Only the host writes canonical
+run state or admits tools. An exact request, turn, role, root, generation, scope
+and original deadline must still be current at admission and after asynchronous
+work. A child snapshot cannot grant effects. Successful SDK-response ownership
+and original tool arguments precede dispatch. Credential resolution and refresh
+remain owned by the host's selected-account inference session; private resolver
+traffic never enters ordinary metadata or operator publication.
+
+Cross-process deadlines use Linux `CLOCK_MONOTONIC`. Expiry revokes authority
+immediately. Up to one second is reserved solely for cooperative cancellation
+and settlement, with no new request or tool permission. An unresponsive owner
+is contained and the run pauses for operator recovery; there is no automatic
+cognition restart, model retry or embedded fallback. Closure joins the actual
+process, pipes, outstanding host operations and credential refresh. A failed
+write is a delivery failure, not proof that the owner remains undrained.
+
+Operator source/history reads, JSON serialization and activity SSE run in a
+separate readonly publication process. The public host authenticates requests,
+checks Origin/CSRF and handles idempotent run controls, including Stop. It
+forwards already encoded publication bytes without hydrating source-heavy views.
+Live seeds use one in-flight update and one latest dirty state. Binary video
+still uses bounded immutable packet forwarding in the host, with a finite viewer
+limit and per-viewer backpressure.
+
+Application factories own startup rollback and joined shutdown. Constructing
+Runtime does not start its derived-writer process: its first actual use does.
+Partial SQLite construction closes any opened database before propagating an
+error. Importing the server entry point creates no application, lock or signal
+handlers. Component lifecycle checks do not establish native continuity through
+Main/context/history/publication stalls or independently received Stop; those
+require the actual default native path.
+
 ## Prepare before joining
 
 `POST /v1/prepared-start` accepts an immutable `{request_id,task,goal,model_id}` request; `request_id` is a UUID. It requires a stopped server with the EULA accepted, a disconnected player, a ready sandbox, no active run or unsettled preparation, and an exact image-capable model discovered through the authenticated account. The selected model authors code before the host starts the world or joins an avatar. **Start world** and connected-world **Create** remain separate ordinary paths. Preparation never disconnects an existing world to make its preconditions true.
@@ -501,8 +543,9 @@ Read count and VM-step count have separate original limits; skipped captures
 still consume the read budget. Stop fences both lanes and joins the exact
 outstanding read, worker and native retirement. Sampling alone never renews a
 producer: only a fresh accepted model choice may do so. The 150-ms freshness and
-250-ms supervision gates remain unchanged. Both lanes still use the coordinator
-event loop; this is not whole-control-pump isolation from coordinator stalls.
+250-ms supervision gates remain unchanged. Both lanes use the physical host's
+event loop; blocking that host itself can still interrupt control. Moving
+cognition and publication out of it does not isolate it from its own stalls.
 
 Child completion, cancellation or a retired unknown effect leaves the executive
 alive. Unconfirmed emission/cleanup and reconnect requirements still contain the
@@ -761,9 +804,9 @@ an interrupted mutation reports unknown persistence. A fresh owner inspects
 retained checkpoints and drains immutable outbox receipts without replaying the
 interrupted mutation. Run admission waits for startup audit recovery.
 
-Native control, strategic scheduling, SDK/provider callbacks and UI publication
-still share the coordinator. Independent derived persistence alone does not
-isolate the complete physical execution host.
+The derived writer, cognition and operator publication have separate owned
+processes. Canonical persistence and physical control still share the trusted
+host. Independent derived persistence alone does not qualify native continuity.
 
 Source changes to runs, actions, executions, events, traces, trace budgets and
 immutable program metadata receive durable change sequences. The writer seals
@@ -879,12 +922,17 @@ unchanged.
 
 The strategist keeps a run-owned reference context outside its disposable Agent. Each actual SDK stream invocation, including tool-loop continuations, receives a supplement capped at 32 KiB serialized UTF-8: compact contracts, objective, model-authored recovery state, latest consequential obstruction, unresolved-operation references, relevant compatible immutable source and useful requested help. This is included in the actual request, not merely cached on the host. Source and its reuse metadata share an 18 KiB allowance; retained help has a 24 KiB ceiling. Both share the same 32 KiB request cap rather than additive reservations. Requested executable-format, temporal-view, resident and native-invocation mechanics take precedence, followed by complete native action alternatives, other reference prose, game-adapter metadata and observation/read/result schemas. Native method references keep their invocation fields separate from embedded result schemas. This ordering also applies when source and unresolved-effect history compete for the final request budget, independently of help-topic request order. Top-level action `anyOf`/`oneOf` alternatives stay whole: an alternative over the 6 KiB section bound is omitted, not split into detached properties. Other oversized documentation is split at schema/property boundaries. Retained help remains partial; omission references distinguish section, retained-help and final-request byte limits, while `omitted_records` counts details/notices that no longer fit. The supplement directs the model to re-request the corresponding `help` topic for the full current contract. Whole sources are either included or explicitly omitted, never truncated into executable fragments. This supplements, rather than replaces, bounded current observations, tool pairs and turn feedback.
 
-Default planning reconstructs this supplement in a readonly child process using
-the bound source and projection locations. Each job uses a pinned snapshot,
-an original monotonic deadline and a five-second ceiling. Ordered help/source
-selections and bounded passive reducer checkpoints preserve knowledge across
-joined worker replacement. They restore no playing authority. Cancellation
-joins the process and pipes; there is no local reconstruction fallback.
+Default planning reconstructs this supplement inside the cognition process
+using readonly bound source and projection locations. Explicit embedded callers
+retain an owned context child. Each job uses a pinned snapshot, an original
+monotonic deadline and a five-second ceiling. Ordered help/source selections
+and bounded passive reducer checkpoints preserve knowledge across joined
+cognition replacement, including Pause/Resume. Assembly stages a checkpoint;
+only successful, current, unexpired settlement commits it. Failed assembly
+preserves the preceding checkpoint and ordered operations. Forced process loss
+retains the last committed state and explicitly marks uncertain uncommitted
+custody. These records restore no playing authority. Cancellation joins owned
+processes and pipes; there is no reconstruction fallback.
 Before using a returned supplement, the planner rechecks the exact request,
 run/generation, role, phase, profile, scope and original deadline.
 
@@ -1018,9 +1066,9 @@ of the selector does not remove it from artifact identity.
 
 The parent retains capture identity from the original packet and rechecks its
 freshness and selection scope after the worker closes. A child result cannot
-renew the capture timestamp or supply native fault authority. This removes image
-encoding CPU work from the coordinator; it does not establish complete
-Main, UI-publication or trusted execution-host isolation.
+renew the capture timestamp or supply native fault authority. Image encoding,
+cognition and heavy operator publication have separate owners. Their component
+checks do not establish complete native stall/Stop qualification.
 
 Live capture uses a fixed 328-byte little-endian GHV2 header and unchanged
 RGBA pixels. The canonical [packet decoder](../src/shared/video.ts) binds

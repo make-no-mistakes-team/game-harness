@@ -1,9 +1,10 @@
 import type { ActionView, RunOperatorView } from "../shared/contracts.ts";
 import type { SkillExecutionView } from "../shared/programs.ts";
-import type { Store, StoredRun } from "./store.ts";
+import type { StoredRun } from "./store.ts";
+import type { StoreReadQueries } from "./store-read.ts";
 
 export function projectRunOperator(
-  store: Store, run: StoredRun, action: ActionView | null,
+  store: Pick<StoreReadQueries, "latestEvent" | "latestRootExecution">, run: StoredRun, action: ActionView | null,
   executions: SkillExecutionView[], recovering = false,
 ): RunOperatorView {
   const control = run.control ?? { pause_cause: null, cleanup_error: null };

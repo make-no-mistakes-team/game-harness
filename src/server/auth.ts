@@ -12,7 +12,7 @@ import type {
   SessionRestrictionLease,
   StoredAuthCredential,
 } from "@oh-my-pi/pi-ai/auth-storage";
-import type { ApiKeyResolveContext } from "@oh-my-pi/pi-ai/auth-retry";
+import type { ApiKeyResolveContext, ResolvedApiKey } from "@oh-my-pi/pi-ai/auth-retry";
 import { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -31,6 +31,7 @@ import {
 import type { AuthWorkerMessage } from "./auth-protocol.ts";
 import { authWorkerEnvironment } from "./auth-network.ts";
 import { assertSingleDispatchEnvironment, singleDispatchCodexStream } from "./evaluation-inference.ts";
+import type { InferenceSessionConsumer, SelectedAccountInferenceSession } from "./auth-session.ts";
 
 const PROVIDER = "openai-codex";
 const LOGIN_FAILURE =
@@ -46,11 +47,14 @@ type LoginJob = {
   committing: boolean;
   done: Promise<void>;
 };
-type AgentScope = {
+type InferenceScope = {
   sessionId: string;
   restriction: SessionRestrictionLease;
+  consumer: InferenceSessionConsumer;
+  controller: AbortController;
   active: boolean;
   operations: Set<Promise<unknown>>;
+  closing: Promise<void> | null;
 };
 
 async function privateFiles(directory: string): Promise<void> {
@@ -104,7 +108,8 @@ export class AuthManager {
   #job: LoginJob | null = null;
   #discovery: AbortController | null = null;
   #operations = new Set<Promise<unknown>>();
-  #agents = new Map<Agent, AgentScope>();
+  #agents = new Map<Agent, SelectedAccountInferenceSession>();
+  #sessions = new Set<InferenceScope>();
   #credentialEpoch = 0;
   #ending = false;
   #closed = false;
@@ -276,6 +281,9 @@ export class AuthManager {
     this.#ending = true;
     this.#credentialEpoch++;
     this.#cancelDiscovery();
+    const sessions = this.#stopSessions();
+    // Observe immediately while login cleanup runs, then join below.
+    void sessions.catch(() => {});
     try {
       const job = this.#job;
       if (job) {
@@ -283,7 +291,7 @@ export class AuthManager {
         job.child.kill("SIGKILL");
         await job.done;
       }
-      await this.#stopAgents();
+      await sessions;
       await this.#settleOperations();
       await this.#auth.credentials.remove(PROVIDER);
       await this.#auth.credentials.reload();
@@ -332,17 +340,22 @@ export class AuthManager {
     if (id === null) return;
     const controller = new AbortController();
     this.#discovery = controller;
+    this.#credentialEpoch++;
     this.#state.status = "discovering";
     this.#state.error = null;
     this.#changed();
-    await this.#track(this.#discover(id, controller));
+    await this.#track((async () => {
+      await this.#stopSessions();
+      if (this.#currentDiscovery(id, controller))
+        await this.#discover(id, controller);
+    })());
   }
 
-  async createAgent(options: {
+  /** Own a selected-account grant without allocating an SDK Agent. */
+  createInferenceSession(options: {
     modelId: string;
-    systemPrompt: string[];
-    tools: AgentTool[];
-  }): Promise<Agent> {
+    consumer: InferenceSessionConsumer;
+  }): SelectedAccountInferenceSession {
     this.#available();
     const model = this.#models.get(options.modelId);
     const row = this.#auth.credentials
@@ -350,7 +363,7 @@ export class AuthManager {
       .find((entry) => entry.id === this.#selectedId);
     if (!row || row.credential.type !== "oauth")
       throw new Error("Sign in to a GameHarness OpenAI account first");
-    if (!model)
+    if (!model || this.#state.status !== "ready")
       throw new Error(
         "Choose a supported model from the authenticated account’s current discovery result",
       );
@@ -358,6 +371,7 @@ export class AuthManager {
     const identity = resolveCredentialIdentityKey(PROVIDER, row.credential);
     if (!identity)
       throw new Error("This OAuth account has no routable identity");
+    const selectedModel = structuredClone(model);
     const sessionId = crypto.randomUUID();
     const restriction = this.#auth.sessions.restrict(PROVIDER, sessionId, [
       identity,
@@ -368,102 +382,116 @@ export class AuthManager {
     }
     const epoch = this.#credentialEpoch;
     const credentialId = row.id;
-    const scope: AgentScope = {
+    const scope: InferenceScope = {
       sessionId,
       restriction,
+      consumer: options.consumer,
+      controller: new AbortController(),
       active: true,
       operations: new Set(),
+      closing: null,
     };
+    this.#sessions.add(scope);
+    const assertCurrent = (requested: Model) => {
+      this.#assertScope(epoch, credentialId, identity, scope);
+      if (
+        requested.provider !== model.provider ||
+        requested.id !== model.id ||
+        requested.api !== model.api ||
+        requested.baseUrl !== model.baseUrl ||
+        this.#models.get(model.id) !== model
+      )
+        throw new Error("This session is authorized only for its selected Codex model");
+    };
+    return Object.freeze({
+      sessionId,
+      model: selectedModel,
+      thinkingLevel,
+      singleInferenceDispatch: this.#singleInferenceDispatch,
+      streamFn: this.#singleInferenceDispatch ? singleDispatchCodexStream : undefined,
+      signal: scope.controller.signal,
+      getApiKey: (requested: Model) => {
+        assertCurrent(requested);
+        const resolve = this.#auth.keys.resolver(PROVIDER, {
+          sessionId,
+          modelId: model.id,
+          baseUrl: model.baseUrl,
+        });
+        return async (context: ApiKeyResolveContext): Promise<ResolvedApiKey> => {
+          try {
+            return await untilAborted(AbortSignal.any([
+              scope.controller.signal,
+              ...(context.signal ? [context.signal] : []),
+            ]), () =>
+              this.#track((async () => {
+                assertCurrent(requested);
+                // Cancellation ends only the wait, not refresh/persistence
+                // ownership. The restriction stays installed until close joins.
+                const key = await resolve({ ...context, signal: undefined });
+                assertCurrent(requested);
+                if (!key || typeof key === "string" ||
+                    key.credentialId !== credentialId || !key.apiKey)
+                  throw new Error("Credential unavailable");
+                // Keep OAuthRequestIdentity and afterSiblingWait, not a DTO.
+                return key;
+              })(), scope),
+            );
+          } catch {
+            // Never return undefined or expose provider/cancellation payloads.
+            // Some transports use ambient keys when resolution returns no key.
+            throw new Error(
+              "The selected GameHarness OAuth account cannot authorize this request. Refresh models or sign in again.",
+            );
+          }
+        };
+      },
+      cancel: () => this.#cancelSession(scope),
+      close: () => this.#closeSession(scope),
+    });
+  }
+
+  async createAgent(options: {
+    modelId: string;
+    systemPrompt: string[];
+    tools: AgentTool[];
+  }): Promise<Agent> {
+    let agent: Agent | undefined;
+    // Allocation is synchronous: no revocation can interleave before `agent`
+    // is assigned. Remote/asynchronous adapters must join late startup in drain.
+    const session = this.createInferenceSession({
+      modelId: options.modelId,
+      consumer: {
+        revoke: () => agent?.abort("GameHarness model agent released"),
+        drain: async () => { await agent?.waitForIdle(); },
+      },
+    });
     try {
-      const agent = new Agent({
-        sessionId,
+      agent = new Agent({
+        sessionId: session.sessionId,
         initialState: {
-          model,
-          thinkingLevel,
+          model: session.model,
+          thinkingLevel: session.thinkingLevel,
           systemPrompt: [...options.systemPrompt],
           tools: [...options.tools],
           messages: [],
         },
         intentTracing: false,
-        streamFn: this.#singleInferenceDispatch ? singleDispatchCodexStream : undefined,
-        getApiKey: (requested) => {
-          this.#assertScope(epoch, credentialId, scope);
-          if (
-            requested.provider !== PROVIDER ||
-            requested.id !== model.id ||
-            requested.api !== model.api ||
-            requested.baseUrl !== model.baseUrl
-          )
-            throw new Error(
-              "This agent is authorized only for its selected Codex model",
-            );
-          const resolve = this.#auth.keys.resolver(PROVIDER, {
-            sessionId,
-            modelId: model.id,
-            baseUrl: model.baseUrl,
-          });
-          return (context: ApiKeyResolveContext) =>
-            untilAborted(context.signal, () =>
-              this.#track(
-                (async () => {
-                  this.#assertScope(epoch, credentialId, scope);
-                  try {
-                    // Own the full resolver through leased refresh persistence.
-                    // Caller cancellation ends only its wait, never that ownership.
-                    const key = await resolve({
-                      ...context,
-                      signal: undefined,
-                    });
-                    this.#assertScope(epoch, credentialId, scope);
-                    if (
-                      !key ||
-                      typeof key === "string" ||
-                      key.credentialId !== credentialId ||
-                      !key.apiKey
-                    )
-                      throw new Error("Credential unavailable");
-                    return key;
-                  } catch {
-                    // Throw rather than returning undefined: some transports use
-                    // ambient environment credentials when given no key.
-                    throw new Error(
-                      "The selected GameHarness OAuth account cannot authorize this request. Refresh models or sign in again.",
-                    );
-                  }
-                })(),
-                scope,
-              ),
-            );
-        },
+        streamFn: session.streamFn,
+        getApiKey: (requested) => session.getApiKey(requested),
       });
-      this.#agents.set(agent, scope);
+      this.#agents.set(agent, session);
       return agent;
     } catch {
-      this.#auth.sessions.unrestrict(PROVIDER, sessionId, restriction);
+      await session.close();
       throw new Error("The authenticated model agent could not be created");
     }
   }
 
   async releaseAgent(agent: Agent): Promise<void> {
-    const scope = this.#agents.get(agent);
-    if (!scope) return;
-    // Fence future/reused prompts before aborting. Removing the restriction
-    // alone must never let a retained Agent borrow ambient credentials.
-    scope.active = false;
-    agent.abort("GameHarness model agent released");
-    await agent.waitForIdle();
-    // A cancelled transport may stop awaiting a resolver before its token
-    // rotation finishes. Keep the account restriction installed until every
-    // owned resolution has finished, so none can fall through to ambient keys.
-    while (scope.operations.size)
-      await Promise.allSettled([...scope.operations]);
-    if (this.#agents.get(agent) !== scope) return;
-    this.#auth.sessions.unrestrict(
-      PROVIDER,
-      scope.sessionId,
-      scope.restriction,
-    );
-    this.#agents.delete(agent);
+    const session = this.#agents.get(agent);
+    if (!session) return;
+    await session.close();
+    if (this.#agents.get(agent) === session) this.#agents.delete(agent);
   }
 
   /**
@@ -472,14 +500,19 @@ export class AuthManager {
    */
   close(): Promise<void> {
     if (this.#closing) return this.#closing;
+    // Install the join before abort signals/consumer revocation can reenter.
+    const finished = Promise.withResolvers<void>();
+    this.#closing = finished.promise;
     this.#closed = true;
     this.#credentialEpoch++;
     this.#cancelDiscovery();
-    this.#closing = this.#close();
+    const sessions = this.#stopSessions();
+    void sessions.catch(() => {});
+    void this.#close(sessions).then(finished.resolve, finished.reject);
     return this.#closing;
   }
 
-  async #close(): Promise<void> {
+  async #close(sessions: Promise<void>): Promise<void> {
     if (this.#signingOut) await this.#signingOut;
     const job = this.#job;
     if (job) {
@@ -487,7 +520,7 @@ export class AuthManager {
       job.child.kill("SIGKILL");
       await job.done;
     }
-    await this.#stopAgents();
+    await sessions;
     await this.#settleOperations();
     this.#auth.close();
   }
@@ -546,10 +579,14 @@ export class AuthManager {
       };
       const identity = resolveCredentialIdentityKey(PROVIDER, credential);
       if (!identity) throw new Error("OAuth identity missing");
-      // No await between the current-job fence and entry to upstream's local
-      // synchronous SQLite transaction. Only the parent may commit grants.
+      // Commit admission is no longer cancellable. Revoke and join the previous
+      // account's consumers before replacing credentials; recheck shutdown
+      // after that asynchronous drain. Only this owner may commit the grant.
       job.committing = true;
       this.#state.login = null;
+      this.#credentialEpoch++;
+      await this.#stopSessions();
+      if (this.#closed || this.#ending) return;
       await this.#auth.credentials.upsert(PROVIDER, credential);
       await this.#auth.credentials.reload();
       await privateFiles(this.#directory);
@@ -729,16 +766,18 @@ export class AuthManager {
     if (this.#closed || this.#ending)
       throw new Error("Authentication manager is closed or signing out");
   }
-  #assertScope(epoch: number, id: number, scope: AgentScope): void {
+  #assertScope(epoch: number, id: number, identity: string, scope: InferenceScope): void {
     this.#available();
     if (
       !scope.active ||
       epoch !== this.#credentialEpoch ||
+      this.#selectedId !== id ||
       !this.#auth.credentials
         .list(PROVIDER)
-        .some((row) => row.id === id && row.credential.type === "oauth")
+        .some((row) => row.id === id && row.credential.type === "oauth" &&
+          resolveCredentialIdentityKey(PROVIDER, row.credential) === identity)
     )
-      throw new Error("This agent’s OAuth authorization is no longer active");
+      throw new Error("This session’s OAuth authorization is no longer active");
   }
   #changed(): void {
     try {
@@ -747,7 +786,7 @@ export class AuthManager {
       /* UI invalidation cannot affect credential ownership. */
     }
   }
-  #track<T>(operation: Promise<T>, scope?: AgentScope): Promise<T> {
+  #track<T>(operation: Promise<T>, scope?: InferenceScope): Promise<T> {
     this.#operations.add(operation);
     scope?.operations.add(operation);
     const settled = () => {
@@ -761,9 +800,45 @@ export class AuthManager {
     while (this.#operations.size)
       await Promise.allSettled([...this.#operations]);
   }
-  async #stopAgents(): Promise<void> {
-    await Promise.all(
-      [...this.#agents.keys()].map((agent) => this.releaseAgent(agent)),
-    );
+  #cancelSession(scope: InferenceScope): void {
+    if (!scope.active) return;
+    scope.active = false;
+    scope.controller.abort(new Error("GameHarness inference session revoked"));
+    try {
+      scope.consumer.revoke();
+    } catch {
+      // drain is still mandatory, and is the proof of consumer shutdown.
+    }
+  }
+
+  #closeSession(scope: InferenceScope): Promise<void> {
+    if (scope.closing) return scope.closing;
+    // Defer the consumer call so closing is installed before adapter reentry.
+    scope.closing = Promise.resolve().then(async () => {
+      const results = await Promise.allSettled([
+        Promise.resolve().then(() => scope.consumer.drain()),
+        (async () => {
+          while (scope.operations.size)
+            await Promise.allSettled([...scope.operations]);
+        })(),
+      ]);
+      if (results.some((result) => result.status === "rejected"))
+        throw new Error("The inference session consumer could not be drained");
+      this.#auth.sessions.unrestrict(PROVIDER, scope.sessionId, scope.restriction);
+      this.#sessions.delete(scope);
+      for (const [agent, session] of this.#agents)
+        if (session.sessionId === scope.sessionId) this.#agents.delete(agent);
+    });
+    this.#cancelSession(scope);
+    return scope.closing;
+  }
+
+  async #stopSessions(): Promise<void> {
+    const scopes = [...this.#sessions];
+    // Fence every owner synchronously before starting any asynchronous join.
+    for (const scope of scopes) this.#cancelSession(scope);
+    const results = await Promise.allSettled(scopes.map((scope) => this.#closeSession(scope)));
+    if (results.some((result) => result.status === "rejected"))
+      throw new Error("Inference session shutdown could not be confirmed");
   }
 }

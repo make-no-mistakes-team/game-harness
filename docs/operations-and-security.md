@@ -150,6 +150,20 @@ At run start the backend resolves an opaque connection to the selected model and
 
 Revocation or expired refresh credentials marks the connection unavailable, rejects new requests and fences late callbacks. The UI asks the operator to reconnect through the trusted flow. Already admitted bounded gameplay can finish or be cancelled according to its normal contract; no extra strategy or substitute backend is silently selected. The agent can choose validated local-code policies when available. Jev failure remains a Jev failure in evidence, even if later code-only operation proceeds.
 
+`AuthManager` owns selected-account inference sessions independently of SDK Agent
+construction. The existing Agent API uses the same session core. Each consumer
+registers synchronous revocation and an asynchronous drain covering startup,
+late allocations and transports. Logout, model refresh, account replacement and
+application closure revoke sessions before joining them. Failed drain retains
+the account restriction and prevents credential-store shutdown.
+
+Resolution checks the selected credential identity and exact model before and
+after the full tracked refresh transaction. Caller cancellation ends its wait,
+not refresh-persistence ownership. The session preserves upstream credential
+provenance and sibling-wait metadata; it never returns a string, missing key or
+ambient-key fallback. This ownership API does not itself move Main inference
+into another process or grant generated programs credential access.
+
 Local tool schemas and the SDK's actual request are separate evidence boundaries. For optional/discriminated inputs, explicitly control provider strictness rather than assuming omission preserves local schema semantics. The [Responses strict-mode contract](https://developers.openai.com/api/docs/guides/function-calling#strict-mode) allows normalization when strictness is omitted; explicit `strict:false` selects best-effort arguments. It does not relax host parsing, role authority, source limits, admission or cancellation fences. Exercise the real SDK request construction with a zero-network capture before consuming another live allowance; absent remote grammar remains unknown, not proof that a model or provider caused a failure.
 
 ## Browser and local transport controls

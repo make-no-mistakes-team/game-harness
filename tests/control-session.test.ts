@@ -858,6 +858,43 @@ test("an asynchronous native fence during a valid step persists the first cause 
   } finally { response.resolve({}); host.mockRestore(); }
 });
 
+test("a previous raw owner's retirement cannot hide the next owner's terminal fault", async () => {
+  const h = harness(), open = h.options.open;
+  h.options.open = async (...args) => {
+    const channel = await open(...args), revoke = channel.revoke.bind(channel), snapshot = channel.snapshot.bind(channel);
+    let fault: ControllerChannelFault | null = null;
+    if (channel.owner.operation_id === "producer-1") channel.revoke = async () => {
+      const ack = await revoke();
+      fault = { schema_version: 1, stage: "submit_response", cause: "native_rejected", decision_dispatch: "dispatched",
+        owner: channel.owner, controller_generation: channel.controllerGeneration, sequence: 1, frame_seq: 2,
+        captured_native_ns: "50000000", request_id: 41, request_method: "controller_submit",
+        initiating_request_id: 41, initiating_method: "controller_submit", host_detected_ms: h.clock.now(),
+        original_deadline_host_ms: 10000, native_first_fence: {
+          reason: "admission_revoked", native_ns: "100000000", checked_native_ns: "100000000",
+          effective_deadline_native_ns: "300000000",
+        }, detail: "Pending input settled after deliberate retirement" };
+      return ack;
+    };
+    else channel.sample = async () => { throw new Error("Second owner's read-only sample failed"); };
+    channel.snapshot = () => ({ ...snapshot(), fault });
+    return channel;
+  };
+  try {
+    h.choose(rawChoice); await h.session.start(); await h.clock.advance(50);
+    h.choose({ kind: "observe" }); await h.clock.advance(50);
+    expect(h.session.snapshot()).toMatchObject({ status: "running", session: { producer: "none" } });
+    h.choose(rawChoice); await h.clock.advance(100);
+    await h.session.stop("join second owner failure");
+    const faults = h.records.filter(row => row.type === "session.controller_fault");
+    expect(faults).toHaveLength(2);
+    expect(faults[0]!.details).toMatchObject({ owner: { operation_id: "producer-1" }, cause_available: true,
+      fault: { native_first_fence: { reason: "admission_revoked" } } });
+    expect(faults[1]!.details).toMatchObject({ owner: { operation_id: "producer-2" }, cause_available: false, fault: null });
+    expect(h.session.snapshot()).toMatchObject({ status: "failed", cleanup: { native: "retired", worker: "closed" } });
+    expect(h.retired).toBe(2);
+  } finally { await h.session.stop("test complete"); }
+});
+
 test("a source error impersonating the host fault name cannot create trusted channel evidence", async () => {
   const h = harness();
   h.options.worker.activate = async () => {

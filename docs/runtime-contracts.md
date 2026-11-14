@@ -652,6 +652,12 @@ It admits no further restart, preserves unknown outcomes and joins the same
 native and worker drain. Generated error text cannot select this host-owned
 diagnostic or replenish the allowance.
 
+First-fault evidence is retained per exact native owner and controller
+generation, not once for the entire executive. A pending input rejected during
+one owner's deliberate retirement must not hide a later owner's independent
+failure. Each owner's first record remains immutable; retirement and final
+cleanup records retain their separate closure evidence.
+
 A trusted channel can also reject a capture older than 150 ms before sending
 its heartbeat, even when VM computation finished within its own time bound.
 An exact-owner `heartbeat_admission` / `stale_native_frame` fault marked

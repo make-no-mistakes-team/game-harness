@@ -84,7 +84,7 @@ export class ControlSession {
   }>();
   private readonly session: ExecutiveSnapshot;
   private resultFailure: GeneratedControllerResultValidationError | RuntimeFault | null = null;
-  private controllerFaultRecorded = false;
+  private readonly controllerFaultOwners = new Set<string>();
   private readonly rawMonitor = new ExecutiveRawMonitor();
   private readonly stationaryViewMonitor = new ExecutiveStationaryViewMonitor();
   private stationaryViewScope: EffectScope | null = null;
@@ -367,7 +367,7 @@ export class ControlSession {
       ack.owner.generation !== raw.owner.generation || !sameEffectScope(ack.owner.scope, raw.owner.scope)) throw new ResidentCleanupError();
     const snapshot = raw.snapshot();
     if (snapshot.fault) this.recordControllerFault(raw, snapshot.fault, snapshot);
-    if (this.controllerFaultRecorded) this.options.record("session.controller_cleanup", { owner: raw.owner, controller_generation: raw.controllerGeneration,
+    if (this.controllerFaultOwners.size) this.options.record("session.controller_cleanup", { owner: raw.owner, controller_generation: raw.controllerGeneration,
       native: "retired", retirement: ack, fault: snapshot.fault } as unknown as Json);
     if (this.raw === raw) this.raw = null;
     for (const button of Object.keys(this.submittedHeld) as (keyof WorldHeld)[]) this.submittedHeld[button] = false;
@@ -695,15 +695,18 @@ export class ControlSession {
   }
   private recordControllerFault(channel: ControllerInputChannel | null, fault: ControllerChannelFault | null = null,
     snapshot = channel?.snapshot(), unavailableDetail: string | null = null): void {
-    if (this.controllerFaultRecorded) return;
     fault ??= snapshot?.fault ?? null;
     if (!fault && !snapshot?.fenced && unavailableDetail === null) return;
-    this.controllerFaultRecorded = true;
+    const owner = channel?.owner ?? fault?.owner ?? null;
+    const generation = channel?.controllerGeneration ?? fault?.controller_generation ?? this.rawGeneration;
+    const key = JSON.stringify([owner?.operation_id ?? null, owner?.generation ?? null, generation]);
+    if (this.controllerFaultOwners.has(key)) return;
+    this.controllerFaultOwners.add(key);
     this.options.record("session.controller_fault", {
       schema_version: 1, fault: fault === null ? null : structuredClone(fault), cause_available: fault !== null,
       unavailable_detail: fault ? null : (unavailableDetail ?? snapshot?.reason ?? "Channel fenced without retained typed cause").slice(0, 2000),
-      owner: channel?.owner ?? fault?.owner ?? null,
-      controller_generation: channel?.controllerGeneration ?? fault?.controller_generation ?? this.rawGeneration,
+      owner,
+      controller_generation: generation,
       host_detected_ms: this.clock.now(), host_lease_deadline_ms: Number.isFinite(this.rawLeaseDeadline) ? this.rawLeaseDeadline : null,
       original_deadline_host_ms: this.options.deadline_host_ms,
       channel: snapshot ?? null, counters: { ...this.data.counters }, cleanup: { ...this.data.cleanup },
@@ -755,7 +758,7 @@ export class ControlSession {
         if (cleanup[0]!.status === "rejected") this.data.cleanup.native = "unknown";
         if (cleanup[1]!.status === "rejected" || cleanup[2]!.status === "rejected") this.data.cleanup.worker = "unknown";
       } else if (!["failed", "completed", "blocked", "yielded"].includes(this.data.status)) this.data.status = "stopped";
-      if (this.controllerFaultRecorded) this.options.record("session.controller_cleanup", {
+      if (this.controllerFaultOwners.size) this.options.record("session.controller_cleanup", {
         cleanup: { ...this.data.cleanup }, original_deadline_host_ms: this.options.deadline_host_ms,
         host_completed_ms: this.clock.now(),
       });

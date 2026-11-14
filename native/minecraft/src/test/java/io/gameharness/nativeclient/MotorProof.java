@@ -242,6 +242,22 @@ public final class MotorProof {
         "observation lattice membership incorrectly widened native navigation geometry");
   }
 
+  private static void changingEyeAndTarget() {
+    TargetAim aim = new TargetAim();
+    // A target below the airborne eyes becomes above the eyes after landing.
+    aim.update(0, 3, 0, 0, 2.5, 2);
+    require(aim.pitch > 0, "airborne target should require looking down");
+    aim.update(0, 1.62, 0, 0, 2.5, 2);
+    require(aim.pitch < 0, "landing retained stale downward aim at an overhead target");
+    near(aim.pitch, -Math.toDegrees(Math.atan2(.88, 2)), 1e-5,
+        "landed target angle does not use current eye height");
+    aim.update(1, 1.62, 0, 0, 2.5, 2);
+    near(aim.yaw, Math.toDegrees(Math.atan2(1, 2)), 1e-5,
+        "body translation retained stale target yaw");
+    aim.update(1, 1.62, 0, 2, 2.5, 2);
+    require(aim.yaw < 0, "moving target retained old witnessed position");
+  }
+
   public static void main(String[] ignored) {
     long five = balancedNinety(5), ten = balancedNinety(10), twenty = balancedNinety(20);
     largeSmallAndWrap();
@@ -251,6 +267,7 @@ public final class MotorProof {
     routeGeometry();
     explicitGazeAndSteering();
     navigationEnvelope();
+    changingEyeAndTarget();
     System.out.println("Native motor proof PASS: measured balanced 90-degree settling "
         + five + "/" + ten + "/" + twenty + " ms at 5/10/20-ms steps (100-ms hold); "
         + "speed/acceleration limits, shortest yaw, no overshoot, frame partition, monotonic "

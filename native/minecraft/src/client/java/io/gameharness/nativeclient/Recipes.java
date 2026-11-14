@@ -13,7 +13,6 @@ import net.minecraft.screen.slot.*;
 import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.*;
-import net.minecraft.world.RaycastContext;
 
 /** Client-synchronized unlocked recipes only; all crafting goes through vanilla server packets. */
 public final class Recipes {
@@ -229,16 +228,9 @@ public final class Recipes {
         session.cancel(false); active = null;
         return false;
       }
-      BlockHitResult hit =
-          c.world.raycast(
-              new RaycastContext(
-                  c.player.getEyePos(),
-                  pos.toCenterPos(),
-                  RaycastContext.ShapeType.OUTLINE,
-                  RaycastContext.FluidHandling.NONE,
-                  c.player));
-      if (!hit.getBlockPos().equals(pos)) {
-        beginRefusalReason = "Line of sight to supplied crafting table is blocked or unavailable";
+      BlockHitResult hit = VanillaCrosshair.block(VanillaCrosshair.current(c), pos);
+      if (hit == null) {
+        beginRefusalReason = "Supplied crafting table is not under the ordinary vanilla crosshair";
         session.cancel(false); active = null;
         return false;
       }

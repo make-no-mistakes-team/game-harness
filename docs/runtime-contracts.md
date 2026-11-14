@@ -2493,12 +2493,24 @@ Motor profiles are `precise`, `balanced` (default) and `fast`, configured by the
 Raw held attack and view rate can operate together under ordinary crosshair
 and vanilla input rules. Semantic `dig` instead starts its own camera profile
 from the actual pose with zero initial velocity and aims at the selected block
-centre. Its angular gate is less than 3° on each axis; it does not wait for
-zero camera velocity. Mining can overlap the remaining camera adjustment.
+centre. Target angles are refreshed from the current eye origin as the body
+moves, including jump and landing. Entity aiming uses the latest admitted
+rendered witness, never hidden live entity geometry. Its angular gate is less
+than 3° on each axis; it does not wait for zero camera velocity. Mining can
+overlap the remaining camera adjustment.
 A raw-to-semantic transfer can finish a small residual error much faster than
 the preceding authored approach. This is not necessarily a pose teleport.
 The model chooses timing and trajectories; an input ACK alone does not prove
 block removal or pickup.
+
+Targeted dig, place, attack, interaction, composite interaction and table
+opening also require the selected target to match the ordinary vanilla
+crosshair. Native semantic effects refresh vanilla's current-pose crosshair
+before dispatch because they run before its usual tick refresh. Packets use
+that actual hit and face; a synthetic eye-to-target visibility ray cannot
+substitute for aiming. Placement must also match the requested face. Losing
+the selected dig hit cancels block-breaking progress until the camera
+reacquires it, within the original action deadline.
 
 `look` and `move.look` remain explicit free orientation. `navigate.gaze` is optional: `{kind:"navigation"}` by default, `{kind:"target",target}` with a fresh `TargetRef`, or `{kind:"free",yaw,pitch}`. Default gaze samples bounded actual local route geometry, interpolates a near-route point and adds eye height so flat ground stays level and slopes affect pitch mechanically. Target interactions use target gaze. Movement gating uses yaw rather than pitch; free/target gaze must preserve world-direction travel through legal strafe synthesis. `navigate.range` allows 0.5–4 blocks for ordinary approach precision, not an automatic pickup tactic. Camera/navigation speed and useful-play improvements require new measured evidence.
 

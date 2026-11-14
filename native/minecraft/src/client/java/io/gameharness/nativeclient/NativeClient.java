@@ -2664,6 +2664,7 @@ public final class NativeClient implements ClientModInitializer {
     final long admittedNanos = System.nanoTime();
     final long lifeId = lifecycle.lifeId();
     final CameraMotion.State camera = new CameraMotion.State();
+    final TargetAim targetAim = new TargetAim();
     final SimulationViewMotion viewProgress = new SimulationViewMotion();
     double cameraSimulationNanos;
     final NativeInputTiming inputTiming = new NativeInputTiming();
@@ -2998,10 +2999,31 @@ public final class NativeClient implements ClientModInitializer {
     }
 
     void aim(Vec3d position) {
-      Vec3d d = position.subtract(client.player.getEyePos());
-      yaw = (float) Math.toDegrees(Math.atan2(-d.x, d.z));
-      pitch = (float) -Math.toDegrees(Math.atan2(d.y, Math.sqrt(d.x * d.x + d.z * d.z)));
+      aim(position.x, position.y, position.z);
+    }
+
+    void aim(double x, double y, double z) {
+      targetAim.update(client.player.getX(), client.player.getEyeY(), client.player.getZ(), x, y, z);
+      yaw = targetAim.yaw;
+      pitch = targetAim.pitch;
       looking = true;
+    }
+
+    void refreshTargetAim() {
+      if (issued || kind.equals("dig") && serverBlockRemoved) return;
+      if (!(kind.equals("dig") || kind.equals("place") || kind.equals("interact")
+          || kind.equals("attack") || kind.equals("craft") && tableReference != null)) return;
+      if (target != null) {
+        Direction face = kind.equals("place") ? Direction.byName(action.get("face").getAsString()) : null;
+        aim(target.getX() + .5 + (face == null ? 0 : face.getOffsetX() * .5),
+            target.getY() + .5 + (face == null ? 0 : face.getOffsetY() * .5),
+            target.getZ() + .5 + (face == null ? 0 : face.getOffsetZ() * .5));
+      } else if (entity != null) {
+        JsonObject witness = entityWitness(entity);
+        if (witness == null) return;
+        JsonObject point = witness.getAsJsonObject("aim_position");
+        aim(point.get("x").getAsDouble(), point.get("y").getAsDouble(), point.get("z").getAsDouble());
+      }
     }
 
     void beginViewTick() {
@@ -3029,6 +3051,7 @@ public final class NativeClient implements ClientModInitializer {
         if (!issued && !(kind.equals("dig") && serverBlockRemoved)) finish(EffectOutcome.deadline(emissions), "Target incarnation changed before camera/input application", false);
         return;
       }
+      refreshTargetAim();
       float beforeYaw = client.player.getYaw(), beforePitch = client.player.getPitch();
       // Packet corrections are actual pose changes, not an alternate integration clock.
       camera.yaw = beforeYaw;
@@ -3409,18 +3432,11 @@ public final class NativeClient implements ClientModInitializer {
             finish("failed", "Block is no longer reachable and visible", false);
             return;
           }
-          if (aligned()) {
-            var hit =
-                client.world.raycast(
-                    new RaycastContext(
-                        client.player.getEyePos(),
-                        target.toCenterPos(),
-                        RaycastContext.ShapeType.OUTLINE,
-                        RaycastContext.FluidHandling.NONE,
-                        client.player));
+          BlockHitResult hit = VanillaCrosshair.block(VanillaCrosshair.current(client), target);
+          if (aligned() && hit != null) {
             client.interactionManager.updateBlockBreakingProgress(target, hit.getSide());
             client.player.swingHand(Hand.MAIN_HAND);
-          }
+          } else client.interactionManager.cancelBlockBreaking();
         }
         case "equip" -> {
           equipmentSession.tickEquip();
@@ -3514,6 +3530,7 @@ public final class NativeClient implements ClientModInitializer {
           if (!issued) {
             if (kind.equals("place")) {
               if (equipmentSession == null) {
+                if (VanillaCrosshair.block(VanillaCrosshair.current(client), target) == null) return;
                 if (placementPreflight() == null) return;
                 if (!startEquipment(action.get("item").getAsString(), "hand")) {
                   inventoryEmissions();
@@ -3534,6 +3551,9 @@ public final class NativeClient implements ClientModInitializer {
               if (!equipmentSession.closed()) return;
               BlockHitResult faceHit = placementPreflight();
               if (faceHit == null) return;
+              BlockHitResult blockHit = VanillaCrosshair.block(VanillaCrosshair.current(client), target);
+              if (blockHit == null) return;
+              if (blockHit.getSide() != faceHit.getSide()) return;
               initialCount = beforeCount(action.get("item").getAsString());
               if (!Registries.ITEM.getId(client.player.getMainHandStack().getItem()).getPath()
                   .equals(action.get("item").getAsString())) {
@@ -3546,10 +3566,11 @@ public final class NativeClient implements ClientModInitializer {
               emissions |= EffectOutcome.WORLD_EFFECT;
               issued = true; ticks = 0;
               ActionResult local = client.interactionManager.interactBlock(
-                  client.player, Hand.MAIN_HAND, faceHit);
+                  client.player, Hand.MAIN_HAND, blockHit);
               placementLocalResult = local.isAccepted() ? "accepted"
                   : local instanceof ActionResult.Fail ? "fail" : "pass";
             } else if (authorizedEntity(entity) && entityDistance(entity) <= 4.5) {
+              if (!VanillaCrosshair.entity(VanillaCrosshair.current(client), entity)) return;
               issued = true; ticks = 0;
               emissions |= EffectOutcome.WORLD_EFFECT;
               if (kind.equals("attack")) {
@@ -3559,18 +3580,14 @@ public final class NativeClient implements ClientModInitializer {
               } else
                 client.interactionManager.interactEntity(client.player, entity, Hand.MAIN_HAND);
             } else if (target != null && reachable(target) && !kind.equals("attack")) {
+              BlockHitResult blockHit = VanillaCrosshair.block(VanillaCrosshair.current(client), target);
+              if (blockHit == null) return;
               issued = true; ticks = 0;
               emissions |= EffectOutcome.WORLD_EFFECT;
               client.interactionManager.interactBlock(
                   client.player,
                   Hand.MAIN_HAND,
-                  client.world.raycast(
-                      new RaycastContext(
-                          client.player.getEyePos(),
-                          target.toCenterPos(),
-                          RaycastContext.ShapeType.OUTLINE,
-                          RaycastContext.FluidHandling.NONE,
-                          client.player)));
+                  blockHit);
             } else {
               finish("failed", "Interaction target unavailable", false);
               return;
@@ -3620,11 +3637,12 @@ public final class NativeClient implements ClientModInitializer {
 
     void interactComposite(JsonObject interaction) {
       boolean attack = interaction.get("kind").getAsString().equals("attack");
+      HitResult crosshair = VanillaCrosshair.current(client);
       Entity e =
           interactionReference != null
               ? interactionEntityBinding
-              : client.crosshairTarget instanceof EntityHitResult hit ? hit.getEntity() : null;
-      if (e != null && authorizedEntity(e) && entityDistance(e) <= 4.5) {
+              : crosshair instanceof EntityHitResult hit ? hit.getEntity() : null;
+      if (VanillaCrosshair.entity(crosshair, e) && authorizedEntity(e) && entityDistance(e) <= 4.5) {
         emissions |= EffectOutcome.WORLD_EFFECT;
         if (attack) client.interactionManager.attackEntity(client.player, e);
         else client.interactionManager.interactEntity(client.player, e, Hand.MAIN_HAND);
@@ -3633,21 +3651,15 @@ public final class NativeClient implements ClientModInitializer {
       BlockPos pos =
           interactionReference != null
               ? interactionBinding
-              : client.crosshairTarget instanceof BlockHitResult hit ? hit.getBlockPos() : null;
-      if (pos != null && reachable(pos)) {
+              : crosshair instanceof BlockHitResult hit ? hit.getBlockPos() : null;
+      BlockHitResult hit = VanillaCrosshair.block(crosshair, pos);
+      if (hit != null && reachable(pos)) {
         emissions |= EffectOutcome.WORLD_EFFECT;
-        BlockHitResult hit =
-            client.world.raycast(
-                new RaycastContext(
-                    client.player.getEyePos(),
-                    pos.toCenterPos(),
-                    RaycastContext.ShapeType.OUTLINE,
-                    RaycastContext.FluidHandling.NONE,
-                    client.player));
         if (attack) client.interactionManager.updateBlockBreakingProgress(pos, hit.getSide());
         else client.interactionManager.interactBlock(client.player, Hand.MAIN_HAND, hit);
         return;
       }
+      if (attack) client.interactionManager.cancelBlockBreaking();
       if (!attack && interactionReference == null) {
         emissions |= EffectOutcome.WORLD_EFFECT;
         client.interactionManager.interactItem(client.player, Hand.MAIN_HAND);

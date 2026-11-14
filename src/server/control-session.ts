@@ -183,8 +183,7 @@ export class ControlSession {
         if (epoch !== this.decisionEpoch) return;
         if (channel && this.recoverNativeFault(channel, error)) return;
         if (error instanceof ControllerChannelFaultError) this.recordControllerFault(this.raw, error.fault);
-        else if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
-        return this.fail(errorText(error));
+        return this.fail(error);
       }).finally(() => {
         this.flight = null;
         if (this.current()) {
@@ -201,7 +200,7 @@ export class ControlSession {
     this.sampleTimer = this.clock.setTimeout(() => {
       this.sampleTimer = null; this.sampleSlot = slot + 1;
       const work = this.sample(); this.sampleFlight = work;
-      void work.catch(error => this.fail(errorText(error))).finally(() => {
+      void work.catch(error => this.fail(error)).finally(() => {
         this.sampleFlight = null;
         if (this.current()) this.scheduleSample();
       });
@@ -352,7 +351,7 @@ export class ControlSession {
     this.session.producer = "retiring";
     const work = Promise.resolve().then(operation);
     this.transition = work;
-    void work.catch(error => this.fail(errorText(error))).finally(() => {
+    void work.catch(error => this.fail(error)).finally(() => {
       if (this.transition === work) this.transition = null;
       this.notify(true);
     });
@@ -581,7 +580,7 @@ export class ControlSession {
         task.snapshot.status = result.status === "succeeded" ? "succeeded" : result.status === "cancelled" ? "interrupted" : result.status;
         if (result.requires_reconnect) throw new ResidentCleanupError();
       } catch (error) {
-        if (error instanceof ResidentCleanupError) { void this.fail(error.message); throw error; }
+        if (error instanceof ResidentCleanupError) { void this.fail(error); throw error; }
         task.snapshot.status = task.abort.signal.aborted ? "interrupted" : "failed";
         task.snapshot.result = { status: "failed", summary: errorText(error).slice(0, 2000), evidence: null };
         task.frameResult = { ...task.snapshot.result, summary: task.snapshot.result.summary.slice(0, 256) };
@@ -592,7 +591,7 @@ export class ControlSession {
         this.options.record("session.child_settled", task.snapshot as unknown as Json); this.notify(true);
       }
     });
-    void task.work.catch(error => this.fail(errorText(error)));
+    void task.work.catch(error => this.fail(error));
   }
   private pruneTasks(): void {
     for (const [key, task] of this.tasks) {
@@ -712,9 +711,19 @@ export class ControlSession {
       channel: snapshot ?? null, counters: { ...this.data.counters }, cleanup: { ...this.data.cleanup },
     } as unknown as Json);
   }
-  private async fail(reason: string): Promise<void> {
+  private async fail(error: unknown): Promise<void> {
+    const reason = errorText(error);
     this.recordControllerFault(this.raw);
-    if (!this.abort.signal.aborted) { this.data.status = "failed"; this.data.reason = reason; }
+    if (!this.abort.signal.aborted) {
+      if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
+      else if (error instanceof ControllerChannelFaultError) {
+        this.resultFailure = new RuntimeFault(error.fault ? "native_controller_fault" : "controller_cause_unavailable",
+          error.fault
+            ? "The native controller failed; inspect the retained session.controller_fault and retirement evidence. Unknown effects remain unknown and must not be replayed."
+            : "The controller failed without a retained trusted cause; inspect session.controller_fault and cleanup evidence. Exception text grants no retry permission.");
+      }
+      this.data.status = "failed"; this.data.reason = reason;
+    }
     void this.stop(reason);
   }
   stop(reason: string): Promise<void> {

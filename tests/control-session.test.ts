@@ -853,6 +853,9 @@ test("an asynchronous native fence during a valid step persists the first cause 
     expect(submissions).toBe(1);
     expect(h.session.snapshot()).toMatchObject({ status: "failed", session: { restarts: 0 },
       cleanup: { native: "retired", worker: "closed" } });
+    expect(programDiagnostic(h.session.failure, h.options.source_hash)).toMatchObject({
+      type: "RuntimeFault", code: "native_controller_fault", source_hash: h.options.source_hash,
+    });
     expect(h.records.filter(record => record.type === "session.controller_cleanup").at(-1)!.details)
       .toMatchObject({ cleanup: { native: "retired", worker: "closed" } });
   } finally { response.resolve({}); host.mockRestore(); }
@@ -905,6 +908,7 @@ test("a source error impersonating the host fault name cannot create trusted cha
   await h.session.start(); await h.clock.advance(0); await h.session.stop("join source failure");
   expect(h.records.filter(record => record.type === "session.controller_fault")).toHaveLength(0);
   expect(h.session.snapshot()).toMatchObject({ status: "failed", session: { restarts: 0 } });
+  expect(programDiagnostic(h.session.failure, h.options.source_hash).type).toBe("ExecutionFailure");
 });
 
 test.each(["reset_safe", "none", "dispatched", "wrong_owner"] as const)(
@@ -992,6 +996,9 @@ test.each(["sample", "renew", "submit"] as const)("an untyped trusted %s failure
   expect(h.sent).toHaveLength(0);
   expect(h.session.snapshot()).toMatchObject({ status: "failed", session: { restarts: 0 },
     cleanup: { native: "retired", worker: "closed" } });
+  expect(programDiagnostic(h.session.failure, h.options.source_hash)).toMatchObject({
+    type: "RuntimeFault", code: "controller_cause_unavailable", source_hash: h.options.source_hash,
+  });
 });
 
 test("raw retirement keeps read-only sensing alive without reading through the fenced channel", async () => {

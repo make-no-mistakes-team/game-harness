@@ -664,6 +664,13 @@ one owner's deliberate retirement must not hide a later owner's independent
 failure. Each owner's first record remains immutable; retirement and final
 cleanup records retain their separate closure evidence.
 
+Terminal controller failures also retain a fixed public execution diagnostic:
+`native_controller_fault` when a trusted channel fault is available, or
+`controller_cause_unavailable` when it is not. The diagnostic points to retained
+fault and retirement evidence without exposing arbitrary host exception text.
+An exception name or serialized source field cannot select either category.
+Neither category grants recovery or replay permission.
+
 A trusted channel can also reject a capture older than 150 ms before sending
 its heartbeat, even when VM computation finished within its own time bound.
 An exact-owner `heartbeat_admission` / `stale_native_frame` fault marked

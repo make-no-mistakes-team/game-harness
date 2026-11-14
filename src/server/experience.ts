@@ -111,18 +111,23 @@ export class ExperienceLibrary {
     chmodSync(directory, 0o700);
     const filename = join(directory, "experience.sqlite");
     this.db = new Database(filename, { create: true, strict: true });
-    chmodSync(filename, 0o600);
-    this.db.exec(
-      "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS bundles(id TEXT PRIMARY KEY,model TEXT NOT NULL,payload TEXT NOT NULL CHECK(json_valid(payload))) STRICT;",
-    );
-    this.db.transaction(() => {
-      const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(bundles)").all();
-      if (!columns.some((column) => column.name === "revision")) {
-        this.db.exec("ALTER TABLE bundles ADD COLUMN revision INTEGER");
-        this.db.exec("UPDATE bundles SET revision=rowid");
-      }
-      this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS bundles_revision ON bundles(revision)");
-    })();
+    try {
+      chmodSync(filename, 0o600);
+      this.db.exec(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS bundles(id TEXT PRIMARY KEY,model TEXT NOT NULL,payload TEXT NOT NULL CHECK(json_valid(payload))) STRICT;",
+      );
+      this.db.transaction(() => {
+        const columns = this.db.query<{ name: string }, []>("PRAGMA table_info(bundles)").all();
+        if (!columns.some((column) => column.name === "revision")) {
+          this.db.exec("ALTER TABLE bundles ADD COLUMN revision INTEGER");
+          this.db.exec("UPDATE bundles SET revision=rowid");
+        }
+        this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS bundles_revision ON bundles(revision)");
+      })();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
   private compatibility(): ProgramCompatibility | null { return typeof this.current === "function" ? this.current() : this.current; }
   list(modelId: string, worldId: string | null): ExperienceView[] {

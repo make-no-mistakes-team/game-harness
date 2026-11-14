@@ -34,7 +34,7 @@ interface OwnedProjectionChild {
 
 /** One independent derived process. This facade opens no writable database. */
 export class ProjectionWriterClient {
-  readonly ready: Promise<void>;
+  private readiness: Promise<void> | null = null;
   private readonly control: ProjectionControl;
   private readonly location: StoreReadLocation;
   private readonly identity: ProjectionIdentity;
@@ -48,21 +48,31 @@ export class ProjectionWriterClient {
   constructor(store: Store) {
     const handoff = store.handoffProjectionWriter();
     this.control = handoff.control; this.location = handoff.location; this.identity = handoff.identity;
-    this.ready = this.request({ kind: "drain" }, { deadlineHostMs: performance.now() + 5000 }).then(value => { z.null().parse(value); });
-    // Initialization owns and later awaits this same failure.
-    void this.ready.catch(() => {});
+  }
+  /** Start only after the enclosing owner has returned and can be closed. */
+  get ready(): Promise<void> {
+    if (!this.readiness) {
+      this.readiness = this.request({ kind: "drain" }, { deadlineHostMs: performance.now() + 5000 })
+        .then(value => { z.null().parse(value); });
+      // Initialization owns and later awaits this same failure.
+      void this.readiness.catch(() => {});
+    }
+    return this.readiness;
   }
   snapshot(): { closed: boolean; worker_closed: boolean; active: boolean; queued: number } {
     return { closed: this.closed, worker_closed: this.child === null, active: this.current !== null, queued: this.queue.length };
   }
   async beginHistoryProjection(runId: string, desiredThrough: number | undefined, options: HistoryQueryOptions): Promise<ProjectionCheckpoint> {
+    void this.ready;
     return projectionCheckpointSchema.parse(await this.request({ kind: "begin", run_id: runId,
       ...(desiredThrough === undefined ? {} : { desired_through: desiredThrough }) }, options));
   }
   async commitHistoryProjectionBatch(runId: string, batch: HistoryProjectionBatch, options: HistoryQueryOptions): Promise<void> {
+    void this.ready;
     z.null().parse(await this.request({ kind: "commit", run_id: runId, batch }, options));
   }
   async resolveOpportunity(runId: string, id: string, resolution: NonNullable<ImprovementOpportunity["resolution"]>, options: HistoryQueryOptions): Promise<ImprovementOpportunity> {
+    void this.ready;
     return improvementOpportunitySchema.parse(await this.request({ kind: "resolve", run_id: runId, opportunity_id: id, resolution }, options));
   }
   cancelRun(runId: string): Promise<void> {

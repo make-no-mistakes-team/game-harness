@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { GameAction, GameActionResult, Json } from "../src/shared/contracts.ts";
@@ -60,6 +60,35 @@ afterEach(async () => {
   }
   if (failures.length) throw new AggregateError(failures, "Experience fixture cleanup failed");
 });
+
+test.skipIf(process.platform !== "linux")("experience construction failure closes SQLite custody and preserves the conflicting records", () => {
+  const directory = mkdtempSync(join(tmpdir(), "gameharness-experience-construction-"));
+  const filename = join(directory, "experience.sqlite");
+  const seed = new Database(filename);
+  try {
+    seed.exec("CREATE TABLE bundles(id TEXT PRIMARY KEY,model TEXT NOT NULL,payload TEXT NOT NULL CHECK(json_valid(payload)),revision INTEGER) STRICT;");
+    seed.exec("INSERT INTO bundles VALUES('a','fixture','{}',1),('b','fixture','{}',1);");
+  } finally { seed.close(); }
+  const retainedHandles = () => readdirSync("/proc/self/fd").flatMap(fd => {
+    try {
+      const target = readlinkSync(`/proc/self/fd/${fd}`);
+      return target === filename || target === filename + "-wal" || target === filename + "-shm" ? [target] : [];
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+      throw error;
+    }
+  });
+  try {
+    expect(() => new ExperienceLibrary(directory, currentCompatibility)).toThrow();
+    expect(retainedHandles()).toEqual([]);
+    const recovered = new Database(filename, { readonly: true });
+    try {
+      expect(recovered.query("SELECT id,revision FROM bundles ORDER BY id").all())
+        .toEqual([{ id: "a", revision: 1 }, { id: "b", revision: 1 }]);
+    } finally { recovered.close(); }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 function learningFixture(store: Store): ImprovementLearning {
   const resource = resources.find((value) => value.store === store)!;
   resource.reader ??= new HistoryReader(store.readLocation());

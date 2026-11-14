@@ -26,11 +26,9 @@ export class ImprovementLearning {
   }>();
   private closed = false;
 
-  readonly ready: Promise<void>;
   constructor(private readonly store: Store, private readonly reader: HistoryQueryClient,
-    private readonly writer?: ProjectionWriterClient) {
-    this.ready = writer?.ready ?? Promise.resolve();
-  }
+    private readonly writer?: ProjectionWriterClient) {}
+  get ready(): Promise<void> { return this.writer?.ready ?? Promise.resolve(); }
 
   /** Readonly work runs in bounded child pages; only current, exact candidates reach the writer. */
   async prepareFeedback(runId: string, options: HistoryQueryOptions): Promise<void> {

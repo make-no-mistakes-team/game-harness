@@ -7,6 +7,21 @@ import { finishHistoryExecution, historyExecution, historyFixture, historySpec }
 
 const options = () => ({ deadlineHostMs: performance.now() + 10_000 });
 
+test("closing an uninitialized enclosing owner admits no audit mutation with unknown persistence", async () => {
+  const f = historyFixture();
+  const writer = new ProjectionWriterClient(f.store);
+  const reader = new HistoryReader(f.store.readLocation());
+  const learning = new ImprovementLearning(f.store, reader, writer);
+  try {
+    // Construction failure must be safely closeable without having admitted a
+    // background audit before the caller received its Runtime owner.
+    await learning.close();
+    await expect(learning.ready).rejects.toMatchObject({ code: "history_closed", persistence: "not_started" });
+    await expect(writer.beginHistoryProjection(f.run.run_id, undefined, options())).rejects.toMatchObject({ persistence: "not_started" });
+    expect(writer.snapshot()).toEqual({ closed: true, worker_closed: true, active: false, queued: 0 });
+  } finally { await learning.close(); f.close(); }
+});
+
 test("independent writer publishes real history and resolves a review exactly once through canonical receipts", async () => {
   const f = historyFixture();
   const writer = new ProjectionWriterClient(f.store);

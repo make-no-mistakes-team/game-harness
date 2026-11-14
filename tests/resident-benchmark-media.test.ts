@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import * as runner from '../scripts/native-resident-benchmark.ts';
 import { EpisodeRecorder } from '../src/server/recording.ts';
 import { nativeFrame } from './helpers/native-frame.ts';
-import { osMonotonicNs } from '../src/evaluation/os-monotonic.ts';
+import { osMonotonicNs } from '../src/server/os-monotonic.ts';
 import { P13_VOLUME_CLASSIFICATION } from '../src/evaluation/resident-volume.ts';
 
 const roots: string[] = [];

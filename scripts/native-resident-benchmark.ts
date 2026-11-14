@@ -8,7 +8,7 @@ import { z } from "zod";
 import { canonicalContractJson } from "../src/server/adapter-contract.ts";
 import { renderEpisodeReplay } from "../src/server/recording.ts";
 import { evaluationPaths } from "../src/evaluation/paths.ts";
-import { osMonotonicNs } from "../src/evaluation/os-monotonic.ts";
+import { osMonotonicNs } from "../src/server/os-monotonic.ts";
 import {
   assertNativeArtifactFresh,
   requireTierOptIn,

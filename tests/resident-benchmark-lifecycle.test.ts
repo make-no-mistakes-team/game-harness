@@ -10,7 +10,7 @@ import { closeResidentBenchmarkNativeAfterDrain, waitResidentBenchmarkUntil } fr
 import { HistoryReader } from '../src/server/history-reader.ts';
 import { historyFixture } from './helpers/history-fixture.ts';
 import { P13_VOLUME_CLASSIFICATION } from '../src/evaluation/resident-volume.ts';
-import { osMonotonicNs } from '../src/evaluation/os-monotonic.ts';
+import { osMonotonicNs } from '../src/server/os-monotonic.ts';
 
 const roots:string[]=[];
 afterEach(()=>{for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
@@ -345,7 +345,7 @@ test('earlier original OS-monotonic workflow bounds preserve an in-budget finali
   const deadlineEpochMs = Date.now() + 5000;
   const deadlineMonotonicNs = osMonotonicNs() + 1_800_000_000n;
   const source = `
-    import { osMonotonicNs } from ${JSON.stringify(new URL('../src/evaluation/os-monotonic.ts', import.meta.url).pathname)};
+    import { osMonotonicNs } from ${JSON.stringify(new URL('../src/server/os-monotonic.ts', import.meta.url).pathname)};
     process.on('message', value => {
       if (value === 'finalize') {
         const entered_epoch_ms = Date.now(), entered_monotonic_ns = osMonotonicNs().toString();

@@ -13,7 +13,7 @@ import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import { NativeFixture, requireProof } from "../src/evaluation/native-game.ts";
 import { createEvaluationCaps } from "../src/evaluation/config.ts";
 import { evaluationPaths } from "../src/evaluation/paths.ts";
-import { osMonotonicNs } from "../src/evaluation/os-monotonic.ts";
+import { osMonotonicNs } from "../src/server/os-monotonic.ts";
 import { PrivateJournal } from "../src/evaluation/private-journal.ts";
 import {
   RESIDENT_BENCHMARK_SLOT_WALL_MS,

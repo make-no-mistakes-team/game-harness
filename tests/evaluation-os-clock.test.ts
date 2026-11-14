@@ -1,11 +1,11 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { osMonotonicNs } from "../src/evaluation/os-monotonic.ts";
+import { osMonotonicNs } from "../src/server/os-monotonic.ts";
 
 test("native workflow timestamps use one OS clock across independently started Bun processes", () => {
   const module = fileURLToPath(
-    new URL("../src/evaluation/os-monotonic.ts", import.meta.url),
+    new URL("../src/server/os-monotonic.ts", import.meta.url),
   );
   const before = osMonotonicNs();
   const child = spawnSync(

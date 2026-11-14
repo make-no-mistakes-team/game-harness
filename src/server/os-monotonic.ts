@@ -1,6 +1,6 @@
 import { dlopen, ptr } from "bun:ffi";
 
-// Native timing assays bind Python/OS witnesses and separate Bun processes.
+// Process-independent Linux time for native timing and execution-host coordination.
 // Bun 1.3.14's process.hrtime.bigint() is process-relative, so it is not a
 // cross-process CLOCK_MONOTONIC reading on this supported Linux runtime.
 if (process.platform !== "linux" || !["x64", "arm64"].includes(process.arch))

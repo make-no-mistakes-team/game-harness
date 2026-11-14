@@ -1,7 +1,7 @@
 import path from "node:path";
 import { mkdir, writeFile } from "node:fs/promises";
 import { z } from "zod";
-import { encodeNativeFramePng } from "../src/server/actor-frames.ts";
+import { encodeNativeFramePng } from "../src/server/actor-frame-codec.ts";
 import { HOST_MONOTONIC_CLOCK_ID } from "../src/server/performance.ts";
 import { decodeNativeVideoHeader } from "../src/shared/video.ts";
 import type { VisibleScreenOperation, VisibleScreenSnapshot } from "../src/shared/control.ts";

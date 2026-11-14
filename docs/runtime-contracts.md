@@ -990,7 +990,23 @@ A transported resident step return that violates `{input,next_state,status,event
 
 ### Delivered actor images and recorded episodes
 
-The application and actual acceptance runner use `Runtime.modelObservation()` for strategic prompts and `observe`: authorized structured observation, one typed PNG image and separate metadata. Worker `game.observe()` remains JSON-only. The shared asynchronous actor/recorder PNG codec corrects native bottom-up rows and preserves every RGB byte without a per-observation subprocess. It sets PNG alpha to 255: native framebuffer alpha does not describe display transparency, and the actual game viewer renders sampled RGB as opaque. Actor metadata declares `pixel_presentation:"opaque_rgb"`; these PNGs preserve visible native RGB, not the source framebuffer's alpha channel. Actor PNGs have a 2 MiB cap and explicit stale/malformed/oversize failures. Selection rechecks run/session/life/generation authority after encoding. Actor metadata identifies host selection scope and retains `alignment:"unsynchronized"` with structured observations. Richer GHV2 capture diagnostics remain outside this actor metadata; they neither expand the sensory profile nor restore input authority.
+The application and actual acceptance runner use `Runtime.modelObservation()` for strategic prompts and `observe`: authorized structured observation, one typed PNG image and separate metadata. Worker `game.observe()` remains JSON-only. The shared actor/recorder PNG codec corrects native bottom-up rows and preserves every RGB byte. It sets PNG alpha to 255: native framebuffer alpha does not describe display transparency, and the actual game viewer renders sampled RGB as opaque. Actor metadata declares `pixel_presentation:"opaque_rgb"`; these PNGs preserve visible native RGB, not the source framebuffer's alpha channel. Actor PNGs have a 2 MiB cap and explicit stale/malformed/oversize failures. Selection rechecks run/session/life/generation authority after encoding. Actor metadata identifies host selection scope and retains `alignment:"unsynchronized"` with structured observations. Richer GHV2 capture diagnostics remain outside this actor metadata; they neither expand the sensory profile nor restore input authority.
+
+Default live actor selection runs pixel copying, row reorientation, alpha
+conversion, compression, PNG assembly, hashing and base64 encoding in one owned
+subprocess per inference image. Each selector admits one active encoding and no
+waiting frame queue. The raw packet crosses as a buffer view, not a base64
+request. Startup, encoding and actual process/pipe closure share Runtime's
+original 1500 ms preparation window, measured with Linux `CLOCK_MONOTONIC`.
+Cancellation joins that owner; Runtime closure also drains it. There is no local
+encoding fallback. Recording callers use the same codec without acquiring actor
+selection authority.
+
+The parent retains capture identity from the original packet and rechecks its
+freshness and selection scope after the worker closes. A child result cannot
+renew the capture timestamp or supply native fault authority. This removes image
+encoding CPU work from the coordinator; it does not establish complete
+Main, UI-publication or trusted execution-host isolation.
 
 Live capture uses a fixed 328-byte little-endian GHV2 header and unchanged
 RGBA pixels. The canonical [packet decoder](../src/shared/video.ts) binds

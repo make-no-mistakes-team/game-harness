@@ -1,9 +1,17 @@
-import { expect, test } from "bun:test";
-import { randomFillSync } from "node:crypto";
-import { ActorFrameSelector, encodeNativeFramePng } from "../src/server/actor-frames.ts";
+import { afterEach, expect, test } from "bun:test";
+import { createHash, randomFillSync } from "node:crypto";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { ActorFrameSelector } from "../src/server/actor-frames.ts";
+import { encodeNativeFramePng } from "../src/server/actor-frame-codec.ts";
+import { ActorFrameEncodingClient } from "../src/server/actor-frame-client.ts";
+import { ACTOR_FRAME_PROTOCOL_VERSION } from "../src/server/actor-frame-protocol.ts";
+import { osMonotonicNs } from "../src/server/os-monotonic.ts";
 import { decodeRgbaPng, frameScope, nativeFrame } from "./helpers/native-frame.ts";
 
 const red = [255, 0, 0, 255], green = [0, 255, 0, 255], blue = [0, 0, 255, 255], white = [255, 255, 255, 255];
+const owners: ActorFrameEncodingClient[] = [];
+afterEach(async () => { await Promise.all(owners.splice(0).map(owner => owner.close())); });
 
 test("native PNG has independently decoded dimensions, CRCs and corrected corner colors", async () => {
   for (const bottomUp of [false, true]) {
@@ -107,5 +115,114 @@ test("image-enabled selection cannot silently return no image for absent or expi
   for (const packet of [null, nativeFrame({ capturedAt: Date.now() - 6000 })]) {
     const selector = new ActorFrameSelector({ latestFrame: () => packet, scope: frameScope });
     await expect(selector.select()).rejects.toThrow();
+  }
+});
+
+test("default subprocess presentation exactly matches the shared codec without modifying or renewing native packets", async () => {
+  for (const bottomUp of [false, true]) {
+    const top = [255, 0, 0, 0, 0, 255, 0, 127], bottom = [0, 0, 255, 1, 255, 255, 255, 0];
+    const packet = nativeFrame({ sequence: 49, bottomUp, pixels: new Uint8Array(bottomUp ? [...bottom, ...top] : [...top, ...bottom]) });
+    const before = packet.slice(), scope = frameScope();
+    const expected = await encodeNativeFramePng(packet);
+    const selector = new ActorFrameSelector({ latestFrame: () => packet, scope: () => scope });
+    try {
+      const selected = await selector.select();
+      expect(selected.images[0]!.data).toBe(expected.png.toString("base64"));
+      expect(selected.metadata).toMatchObject({ sequence: expected.sequence, capturedAt: expected.capturedAt,
+        width: expected.width, height: expected.height, encoded_bytes: expected.png.length,
+        sha256: createHash("sha256").update(expected.png).digest("hex"), host_selection_scope: scope });
+      expect(decodeRgbaPng(Buffer.from(selected.images[0]!.data, "base64")).pixels).toEqual([...red, ...green, ...blue, ...white]);
+      expect(packet).toEqual(before);
+    } finally { await selector.close(); }
+  }
+});
+
+test("actual subprocess completion cannot relabel an in-flight image after screen authority changes", async () => {
+  let scope = frameScope(), packet = nativeFrame();
+  const selector = new ActorFrameSelector({ latestFrame: () => packet, scope: () => scope });
+  try {
+    const pending = selector.select();
+    scope = { ...scope, screen: { screen_id: crypto.randomUUID(), incarnation: 1, revision: 1 } };
+    packet = nativeFrame({ sequence: 2 });
+    await expect(pending).rejects.toMatchObject({ code: "stale_context" });
+    await expect(selector.select()).rejects.toMatchObject({ code: "stale_context" });
+    packet = nativeFrame({ sequence: 3 });
+    expect((await selector.select()).metadata.sequence).toBe(3);
+  } finally { await selector.close(); }
+});
+
+test("cancelling startup joins the real child, refuses a waiting frame queue, and releases the owner slot", async () => {
+  const owner = new ActorFrameEncodingClient(), abort = new AbortController();
+  owners.push(owner);
+  const options = { deadlineOsNs: osMonotonicNs() + 1_500_000_000n, signal: abort.signal };
+  const pending = owner.encode(nativeFrame(), options);
+  const pid = owner.snapshot().child_pid;
+  expect(pid).not.toBeNull();
+  expect(pid).not.toBe(process.pid);
+  await expect(owner.encode(nativeFrame(), options)).rejects.toMatchObject({ code: "backend_unavailable" });
+  abort.abort();
+  await expect(pending).rejects.toMatchObject({ code: "backend_unavailable" });
+  expect(owner.snapshot().active).toBe(false);
+  expect(() => process.kill(pid!, 0)).toThrow();
+  const result = await owner.encode(nativeFrame(), { deadlineOsNs: osMonotonicNs() + 1_500_000_000n });
+  expect(result.encoded_bytes).toBeGreaterThan(0);
+  expect(owner.snapshot().active).toBe(false);
+});
+
+test("child death and immediate owner close join startup and never admit a result or native fault authority", async () => {
+  for (const mode of ["death", "close"] as const) {
+    const owner = new ActorFrameEncodingClient();
+    owners.push(owner);
+    const pending = owner.encode(nativeFrame(), { deadlineOsNs: osMonotonicNs() + 1_500_000_000n });
+    const pid = owner.snapshot().child_pid;
+    expect(pid).not.toBeNull();
+    // Register rejection ownership without awaiting Bun's promise matcher before
+    // issuing the fault: a tiny image may finish while the matcher is waiting.
+    void pending.catch(() => {});
+    if (mode === "death") process.kill(pid!, "SIGKILL");
+    else await owner.close();
+    await expect(pending).rejects.toMatchObject({ code: "backend_unavailable" });
+    expect(owner.snapshot().active).toBe(false);
+    expect(() => process.kill(pid!, 0)).toThrow();
+    if (mode === "close")
+      await expect(owner.encode(nativeFrame(), { deadlineOsNs: osMonotonicNs() + 1_500_000_000n })).rejects.toMatchObject({ code: "backend_unavailable" });
+  }
+});
+
+test("original monotonic deadline kills and joins a stopped encoding process instead of renewing startup time", async () => {
+  const owner = new ActorFrameEncodingClient();
+  owners.push(owner);
+  const pending = owner.encode(nativeFrame(), { deadlineOsNs: osMonotonicNs() + 100_000_000n });
+  const pid = owner.snapshot().child_pid;
+  expect(pid).not.toBeNull();
+  process.kill(pid!, "SIGSTOP");
+  await expect(pending).rejects.toMatchObject({ code: "backend_unavailable" });
+  expect(owner.snapshot().active).toBe(false);
+  expect(() => process.kill(pid!, 0)).toThrow();
+  await expect(owner.encode(nativeFrame(), { deadlineOsNs: osMonotonicNs() - 1n })).rejects.toMatchObject({ code: "backend_unavailable" });
+  expect(owner.snapshot().child_pid).toBeNull();
+});
+
+test("worker EOF cannot encode a truncated binary native frame", async () => {
+  const child = spawn(process.execPath, ["--no-env-file", fileURLToPath(new URL("../src/server/actor-frame-worker.ts", import.meta.url))],
+    { env: { LANG: "C.UTF-8", LC_ALL: "C.UTF-8", TZ: "UTC" }, stdio: ["pipe", "pipe", "ignore"] });
+  const closed = Promise.withResolvers<number | null>();
+  let outputBytes = 0;
+  child.stdout!.on("data", (part: Buffer) => { outputBytes += part.length; });
+  child.on("error", () => {});
+  child.stdin!.on("error", () => {});
+  child.once("close", code => closed.resolve(code));
+  const timer = setTimeout(() => child.kill("SIGKILL"), 1500);
+  try {
+    const packet = nativeFrame(), metadata = Buffer.from(JSON.stringify({ v: ACTOR_FRAME_PROTOCOL_VERSION,
+      frame_bytes: packet.length, received_at: Date.now(), deadline_os_ns: (osMonotonicNs() + 1_500_000_000n).toString() }));
+    const prefix = Buffer.alloc(4); prefix.writeUInt32BE(metadata.length);
+    child.stdin!.write(prefix); child.stdin!.write(metadata); child.stdin!.end(packet.subarray(0, packet.length - 1));
+    expect(await closed.promise).toBe(1);
+    expect(outputBytes).toBe(0);
+  } finally {
+    clearTimeout(timer);
+    child.kill("SIGKILL");
+    await closed.promise;
   }
 });

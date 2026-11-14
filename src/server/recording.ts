@@ -2,7 +2,7 @@ import { mkdir, open, readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { encodeNativeFramePng } from "./actor-frames.ts";
+import { encodeNativeFramePng } from "./actor-frame-codec.ts";
 import { inspectVideoFrame } from "./video.ts";
 import { normalizeRecordingLimits, type RecordingLimits } from "../shared/evidence-limits.ts";
 import { LiveEpisodeRecorder, renderLiveReplay } from "./recording-live.ts";

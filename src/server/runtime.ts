@@ -53,6 +53,7 @@ import { HistoryProjectionOwner } from "./history-projection-owner.ts";
 import { ProjectionWriterClient } from "./projection-writer-client.ts";
 import { ExecutionTrace } from "./execution-trace.ts";
 import { ActorFrameSelector, type ModelObservation } from "./actor-frames.ts";
+import { osMonotonicNs } from "./os-monotonic.ts";
 import { retainResidentReceipt } from "./resident-evidence.ts";
 import { ExecutiveObservationMonitor } from "./executive-incidents.ts";
 import type { ResidentSnapshot } from "../shared/resident.ts";
@@ -612,6 +613,8 @@ export class Runtime {
   }
   private async prepareActorFrame(selector: ActorFrameSelector, generation: number, observation: ObservationV3) {
     const source = this.actorFrameSource!;
+    const encodingAbort = new AbortController();
+    const deadlineOsNs = osMonotonicNs() + 1_500_000_000n;
     const cancelled = Promise.withResolvers<never>();
     let delivered = Promise.withResolvers<void>();
     const assertAuthority = () => {
@@ -623,7 +626,10 @@ export class Runtime {
         !sameScreen(state.screen, observation.screen))
         throw new RuntimeFault("stale_context", "Native image preparation life authority changed");
     };
-    const recheck = () => { try { assertAuthority(); } catch (error) { cancelled.reject(error); } };
+    const recheck = () => {
+      try { assertAuthority(); }
+      catch (error) { cancelled.reject(error); encodingAbort.abort(); }
+    };
     // One finite local preparation window, not another model request. An old
     // buffer after resume/respawn must wait for a real delivery, never fallback.
     const timer = setTimeout(() => {
@@ -631,6 +637,7 @@ export class Runtime {
         assertAuthority();
         cancelled.reject(new RuntimeFault("backend_unavailable", "No current-scope native image arrived within the 1500 ms preparation bound"));
       } catch (error) { cancelled.reject(error); }
+      encodingAbort.abort();
     }, 1500);
     let unsubscribeFrames = () => {}, unsubscribeState = () => {};
     this.imageAuthorityWaits.add(recheck);
@@ -642,7 +649,7 @@ export class Runtime {
         delivered = Promise.withResolvers<void>();
         const packet = source.latestFrame();
         try {
-          const selected = await Promise.race([selector.select(), cancelled.promise]);
+          const selected = await Promise.race([selector.select({ deadlineOsNs, signal: encodingAbort.signal }), cancelled.promise]);
           assertAuthority();
           return selected;
         } catch (error) {
@@ -653,6 +660,7 @@ export class Runtime {
           await Promise.race([delivered.promise, cancelled.promise]);
       }
     } finally {
+      encodingAbort.abort();
       clearTimeout(timer);
       unsubscribeFrames(); unsubscribeState();
       this.imageAuthorityWaits.delete(recheck);
@@ -1179,15 +1187,17 @@ export class Runtime {
       );
     const historyClosing = this.historyOwner.close();
     void historyClosing.catch(() => {});
+    const actorImagesClosing = this.actorFrames?.close() ?? Promise.resolve();
+    void actorImagesClosing.catch(() => {});
     this.closing = this.serialize(async () => {
       try {
         if (this.run && !TERMINAL[this.run.status])
           await this.halt("stopped", "Application closed; work is not replayed");
       } finally {
         try {
-          const history = await Promise.allSettled([historyClosing, this.historyDrain]);
+          const history = await Promise.allSettled([historyClosing, this.historyDrain, actorImagesClosing]);
           const failed = history.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-          if (failed.length) throw new AggregateError(failed.map(result => result.reason), "Readonly history owners did not drain");
+          if (failed.length) throw new AggregateError(failed.map(result => result.reason), "Runtime history or actor image owners did not drain");
         } finally {
           this.unsubscribeGame?.();
           this.unsubscribeGame = null;

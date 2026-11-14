@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EpisodeRecorder } from "../src/server/recording.ts";
-import { encodeNativeFramePng } from "../src/server/actor-frames.ts";
+import { encodeNativeFramePng } from "../src/server/actor-frame-codec.ts";
 import { decodeRgbaPng, nativeFrame } from "./helpers/native-frame.ts";
 
 const roots: string[] = [];

@@ -97,6 +97,15 @@ Native ACK time records later consumption/view-motion settlement; it must not
 replace the separately correlated application-start timestamp when checking
 capture freshness.
 
+Locally surfaced cognition-worker boundary rejections use fixed
+`cognition_*` categories, including context overlap, expiry, settlement and
+pre-fetch admission expiry. These diagnostics contain no tool arguments,
+resolver context or arbitrary host/provider exception text. They distinguish
+infrastructure boundaries; they do not establish provider transport failure,
+model incapability or the cause of a historical generic error. Categorization
+does not extend deadlines, admit a retry, restart the process or bypass pause
+and joined closure. Private-pipe failures still redact peer exception details.
+
 ## Prepare before joining
 
 `POST /v1/prepared-start` accepts an immutable `{request_id,task,goal,model_id}` request; `request_id` is a UUID. It requires a stopped server with the EULA accepted, a disconnected player, a ready sandbox, no active run or unsettled preparation, and an exact image-capable model discovered through the authenticated account. The selected model authors code before the host starts the world or joins an avatar. **Start world** and connected-world **Create** remain separate ordinary paths. Preparation never disconnects an existing world to make its preconditions true.

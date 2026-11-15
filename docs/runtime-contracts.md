@@ -558,6 +558,16 @@ raw retirement clears it, and a newly opened producer starts with null.
 Older historical snapshots may omit it; omission supplies no attribution and
 never licenses guessing from a native tick, capture counter or previous ACK.
 
+Submission metadata, application ACKs, attack mechanics and effect receipts
+are independently timed. A later release or view update can replace
+`last_submission` before an earlier `attack_callback` arrives. Retain the
+matching generation/sequence pair when observed, then correlate later evidence
+against that retained pair. Requiring all facts in one frame can lose a
+successful attack's callback permanently. If no matching attribution was
+observed, keep the correlation unknown; do not substitute a later ACK.
+Submission, application and callback entry still prove neither accepted damage
+nor a kill.
+
 Worker frames carry at most 24 KiB of active/recent task summaries. Oversized
 request/result detail stays in durable events under its original `history_ref`;
 `detail_omitted` and `tasks_omitted` disclose projection loss. Retaining many

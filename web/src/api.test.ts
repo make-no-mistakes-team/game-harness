@@ -261,6 +261,24 @@ test("prepared HTTP interactions retain exact request identity, source metadata 
   });
 });
 
+test("retained preparations keep their original budgets after new defaults increase", async () => {
+  await withApiResponse(async respond => {
+    const client: typeof import("./api.ts") = await import(new URL("./api.ts?retained-preparation-budget", import.meta.url).href);
+    const historical = {
+      ...preparedViewFixture({ phase: "failed", closure: "closed" }),
+      limits: { ...PREPARED_START_LIMITS, duration_ms: 300000, max_requests: 12 },
+    };
+    respond({ ...preparedStateFixture(null), prepared_start: historical });
+    const retained = (await client.fetchState()).prepared_start;
+    expect(retained).toEqual(historical);
+    expect(retained?.deadline_at).toBe("2026-11-10T10:05:00.000Z");
+    const current = preparedViewFixture({ deadline_at: "2026-11-10T10:10:00.000Z" });
+    respond(preparedStateFixture(current));
+    expect((await client.fetchState()).prepared_start).toEqual(current);
+    expect(retained?.limits).toEqual(historical.limits);
+  });
+});
+
 test("prepared snapshot requires explicit null and rejects missing finite limits, source identity and usage metadata", async () => {
   await withApiResponse(async respond => {
     const client: typeof import("./api.ts") = await import(new URL("./api.ts?prepared-validation-fixture", import.meta.url).href);
@@ -272,7 +290,10 @@ test("prepared snapshot requires explicit null and rejects missing finite limits
     await expect(client.fetchState()).rejects.toThrow("does not match this UI");
     const view = preparedViewFixture();
     for (const malformed of [
-      { ...view, limits: { ...view.limits, max_requests: 13 } },
+      { ...view, limits: { ...view.limits, max_requests: 0 } },
+      { ...view, limits: { ...view.limits, max_requests: 1.5 } },
+      { ...view, limits: { ...view.limits, max_requests: Number.MAX_SAFE_INTEGER + 1 } },
+      { ...view, limits: { ...view.limits, duration_ms: 0 } },
       { ...view, limits: { ...view.limits, max_analysis_ms: undefined } },
       { ...view, program: { name: "Fixture source" } },
       { ...view, program: { name: "Fixture source", version: 0 } },

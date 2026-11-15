@@ -32,7 +32,8 @@ export interface PreparedStartView {
   analysis_ms: number;
   program: { name: string; version: number } | null;
   usage: RunUsage;
-  limits: typeof PREPARED_START_LIMITS;
+  /** Captured per-attempt values; later defaults do not rewrite history. */
+  limits: Readonly<Record<keyof typeof PREPARED_START_LIMITS, number>>;
   /** Transfer means the admitted Runtime owns the live worker, not that it was closed. */
   closure: "open" | "draining" | "closed" | "transferred" | "unknown";
   error: string | null;

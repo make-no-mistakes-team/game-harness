@@ -228,8 +228,8 @@ const preparedStart: z.ZodType<PreparedStartView> = preparedStartRequestSchema.o
   program: z.object({ name: z.string(), version: z.int().positive() }).nullable(),
   usage: runUsage,
   limits: z.object({
-    duration_ms: z.literal(PREPARED_START_LIMITS.duration_ms),
-    max_requests: z.literal(PREPARED_START_LIMITS.max_requests),
+    duration_ms: z.int().positive(),
+    max_requests: z.int().positive(),
     max_tools: z.literal(PREPARED_START_LIMITS.max_tools),
     max_source_versions: z.literal(PREPARED_START_LIMITS.max_source_versions),
     max_source_bytes: z.literal(PREPARED_START_LIMITS.max_source_bytes),

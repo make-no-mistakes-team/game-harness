@@ -184,8 +184,8 @@ The non-renewing bounds in [`PREPARED_START_LIMITS`](../src/shared/prepared-star
 
 | Resource | Bound per attempt |
 | --- | --- |
-| Original preparation deadline, including compile and join through transfer | 300,000 ms |
-| Model requests / tool admissions | 12 / 48 |
+| Original preparation deadline, including compile and join through transfer | 600,000 ms |
+| Model requests / tool admissions | 24 / 48 |
 | All immutable source versions / cumulative canonical source | 64 / 524,288 bytes |
 | Pure analysis jobs | 8 |
 | Evaluation time per analysis job / cumulative evaluation time | 500 ms / 4,000 ms |

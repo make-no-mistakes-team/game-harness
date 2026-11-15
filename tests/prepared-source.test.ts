@@ -791,12 +791,12 @@ test("all-history canonical source budget includes unselected library versions",
   await f.owner.close();
 });
 
-test("the original owner refuses a thirteenth selected-model request rather than renewing its allowance", async () => {
+test("the original owner refuses the request beyond its finite preparation allowance", async () => {
   const f = fixture([]);
   f.options.auth.createAgent = async input => {
     const agent = new ScriptedSourceAgent(input.tools, []);
     agent.prompt = async () => {
-      for (let index = 0; index < 13; index++) {
+      for (let index = 0; index <= PREPARED_START_LIMITS.max_requests; index++) {
         if (agent.gate?.({})) return;
         const stream = await agent.streamFn(agent.state.model as never, { messages: [], tools: input.tools } as never, {});
         for await (const _event of stream) {}
@@ -804,13 +804,13 @@ test("the original owner refuses a thirteenth selected-model request rather than
           usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 } } as unknown as AssistantMessage;
         for (const listener of agent.listeners) listener({ type: "message_end", message: response });
       }
-      throw new Error("A thirteenth request must never be admitted");
+      throw new Error("A request beyond the original allowance must never be admitted");
     };
     return agent as unknown as Agent;
   };
   await f.owner.initialize(); await f.owner.start(f.request); const terminal = await f.terminal;
-  expect(terminal.phase).toBe("failed"); expect(terminal.requests_admitted).toBe(12);
-  expect(terminal.usage.calls).toBe(12); expect(f.counters().compiled).toBe(0);
+  expect(terminal.phase).toBe("failed"); expect(terminal.requests_admitted).toBe(PREPARED_START_LIMITS.max_requests);
+  expect(terminal.usage.calls).toBe(PREPARED_START_LIMITS.max_requests); expect(f.counters().compiled).toBe(0);
   await f.owner.close();
 });
 

@@ -815,6 +815,13 @@ opaque failure or cleanup. Host/guardian timing and transport categories are
 separate from advisory in-container diagnostics; generated exception text cannot
 select a recovery category. Cleanup failure remains containment, and an opaque
 failure or source exception does not authorize a retry of the same invocation.
+Live execution diagnostics retain branded watchdog and source-throw failures as
+`resident_watchdog` and `resident_source_throw`, with fixed public text. These
+categories distinguish a worker timing limit from a source exception; neither
+establishes gameplay incapability or the cause of an older opaque failure.
+Mutable error fields, source messages and structural lookalikes cannot select
+these categories. Transport, opaque and cleanup failures keep their existing
+diagnostic and containment behavior.
 Compile-once live workers retain their own module globals across decisions;
 explicit state is not an automatic rollback checkpoint.
 

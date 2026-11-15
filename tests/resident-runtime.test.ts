@@ -20,7 +20,7 @@ import { jsonSchema } from "../src/shared/primitives.ts";
 import type { Json } from "../src/shared/contracts.ts";
 import { spawn } from "node:child_process";
 import { residentActivationResultSchema, residentDecisionSchema } from "../src/shared/resident.ts";
-import { ResidentWorkerFault, residentSourceAdvisory, type ResidentWorkerFaultOrigin } from "../src/server/sandbox.ts";
+import { ResidentWorkerFault, residentSourceAdvisory, type ResidentWorkerFaultOrigin } from "../src/server/resident-worker-fault.ts";
 import { preparationFailure } from "../src/server/prepared-source-error.ts";
 import { MAX_SKILL_LIMITS, type ExecutableModuleBundle, type SkillLimits } from "../src/shared/programs.ts";
 import { executableModuleBundleHash, singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";

@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import type { Json } from "../../src/shared/contracts.ts";
 import type { ExecutableModuleBundle } from "../../src/shared/programs.ts";
 import type { ResidentAnalysisWorker } from "../../src/shared/resident.ts";
-import { ResidentWorkerFault } from "../../src/server/sandbox.ts";
+import { ResidentWorkerFault } from "../../src/server/resident-worker-fault.ts";
 
 /** Shipped supervisor/module thread, not Docker or native gameplay. Timing here
  * is local pipe roundtrip, not a claim about production guardian CPU accounting. */

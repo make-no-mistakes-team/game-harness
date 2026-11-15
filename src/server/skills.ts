@@ -28,7 +28,8 @@ import { assertSourceCompatible, assertSourceDependencies } from "./source-progr
 import type { EffectContext, EffectInvocation, EffectScope } from "../shared/control.ts";
 import { RegisteredAdapterContract } from "./registered-adapter.ts";
 import { MAX_SKILL_LIMITS, SKILL_API_VERSION } from "../shared/programs.ts";
-import { ResidentWorkerFault, SkillCleanupError, type SandboxService } from "./sandbox.ts";
+import { SkillCleanupError, type SandboxService } from "./sandbox.ts";
+import { ResidentWorkerFault } from "./resident-worker-fault.ts";
 import type { Store } from "./store.ts";
 import type { LookaheadConfig } from "../shared/planning.ts";
 import { ExecutionTrace } from "./execution-trace.ts";

@@ -13,6 +13,7 @@ import { ControllerChannelFaultError, ControllerScreenReadSupersededError } from
 import { ExecutiveRawMonitor, ExecutiveStationaryViewMonitor } from "./executive-incidents.ts";
 import { ResidentAnalysisLane } from "./resident-analysis.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
+import { ResidentWorkerFault, residentWorkerFailure } from "./resident-worker-fault.ts";
 
 interface Task {
   snapshot: ExecutiveTaskSnapshot;
@@ -83,13 +84,13 @@ export class ControlSession {
     generation: number; sequence: number; intentVersion: number; frame: MinecraftControllerFrame; input: ControllerInput;
   }>();
   private readonly session: ExecutiveSnapshot;
-  private resultFailure: GeneratedControllerResultValidationError | RuntimeFault | null = null;
+  private resultFailure: GeneratedControllerResultValidationError | RuntimeFault | ResidentWorkerFault | null = null;
   private readonly controllerFaultOwners = new Set<string>();
   private readonly rawMonitor = new ExecutiveRawMonitor();
   private readonly stationaryViewMonitor = new ExecutiveStationaryViewMonitor();
   private stationaryViewScope: EffectScope | null = null;
   private readonly analysisLane: ResidentAnalysisLane;
-  get failure(): GeneratedControllerResultValidationError | RuntimeFault | null { return this.resultFailure; }
+  get failure(): GeneratedControllerResultValidationError | RuntimeFault | ResidentWorkerFault | null { return this.resultFailure; }
 
   constructor(private readonly options: ControlSessionOptions) {
     this.clock = options.clock ?? { id: "control-session-host", now: () => performance.now(),
@@ -716,6 +717,8 @@ export class ControlSession {
     this.recordControllerFault(this.raw);
     if (!this.abort.signal.aborted) {
       if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
+      else if (error instanceof ResidentWorkerFault &&
+        ["watchdog", "source_throw"].includes(residentWorkerFailure(error)?.code ?? "")) this.resultFailure = error;
       else if (error instanceof ControllerChannelFaultError) {
         this.resultFailure = new RuntimeFault(error.fault ? "native_controller_fault" : "controller_cause_unavailable",
           error.fault

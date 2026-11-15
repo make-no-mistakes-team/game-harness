@@ -5,7 +5,7 @@ import { RuntimeFault } from "./runtime-fault.ts";
 import { GeneratedControllerResultValidationError } from "./program-diagnostics.ts";
 import { ResidentCleanupError, residentJsonConstraint } from "../shared/resident.ts";
 import type { ResidentSourceAdvisory } from "../shared/resident.ts";
-import { residentWorkerFailure } from "./sandbox.ts";
+import { residentWorkerFailure } from "./resident-worker-fault.ts";
 
 /** Host-authored preparation preconditions have public text; container source
  * messages are exposed only in their separately labelled advisory projection. */

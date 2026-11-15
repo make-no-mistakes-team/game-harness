@@ -10,6 +10,7 @@ import { minecraftControllerFrameSchema, type MinecraftControllerFrame } from ".
 import { controllerNativeDeadline, ControllerChannelFaultError, ControllerScreenReadSupersededError, NativeControllerChannel, NativeRequestFault } from "../src/server/controller-channel.ts";
 import { ExecutiveObservationMonitor } from "../src/server/executive-incidents.ts";
 import { programDiagnostic } from "../src/server/program-diagnostics.ts";
+import { ResidentWorkerFault } from "../src/server/resident-worker-fault.ts";
 
 async function settle() { for (let index = 0; index < 100; index++) await Promise.resolve(); }
 class Clock implements ResidentClock {
@@ -910,6 +911,26 @@ test("a source error impersonating the host fault name cannot create trusted cha
   expect(h.session.snapshot()).toMatchObject({ status: "failed", session: { restarts: 0 } });
   expect(programDiagnostic(h.session.failure, h.options.source_hash).type).toBe("ExecutionFailure");
 });
+
+test.each(["activate", "step"] as const)(
+  "live resident %s faults preserve the original category after exact retirement without retry", async phase => {
+    for (const origin of ["watchdog", "source_throw"] as const) {
+      const h = harness(), fault = new ResidentWorkerFault(origin, origin === "watchdog");
+      let invocations = 0;
+      h.choose(rawChoice);
+      h.options.worker[phase] = async () => { invocations++; throw fault; };
+      await h.session.start(); await h.clock.advance(100);
+      await h.session.stop("join resident failure");
+      expect(h.session.failure).toBe(fault);
+      expect(programDiagnostic(h.session.failure, h.options.source_hash)).toMatchObject({
+        type: "ResidentWorkerFailure", code: `resident_${origin}`,
+      });
+      expect(h.session.snapshot()).toMatchObject({ status: "failed", session: { restarts: 0 } });
+      expect(invocations).toBe(1);
+      expect(h.workerClosed).toBe(1); expect(h.retired).toBe(phase === "step" ? 1 : 0);
+      expect(h.session.snapshot().cleanup).toEqual({ worker: "closed", native: "retired" });
+    }
+  });
 
 test.each(["reset_safe", "none", "dispatched", "wrong_owner"] as const)(
   "known-unsent stale renewal starts only an explicitly reset-safe exact-owner invocation: %s", async mode => {

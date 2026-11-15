@@ -6,6 +6,7 @@ import { controllerStepResultSchema, type ControllerStepResult } from "../shared
 import { residentDecisionSchema, residentActivationResultSchema, residentJsonConstraint, type ResidentJsonConstraint,
   type ResidentDecision, type ResidentActivationResult } from "../shared/resident.ts";
 import type { ZodIssue } from "zod";
+import { residentWorkerFailure } from "./resident-worker-fault.ts";
 
 /** The same bounded public failure is sent to generated code and retained as evidence. */
 export function capabilityFailure(error: unknown): { code: string; message: string } {
@@ -111,6 +112,11 @@ export function programDiagnostic(error: unknown, sourceHash: string): ProgramDi
   if (error instanceof ProgramExecutionError) return { ...error.diagnostic, source_hash: sourceHash };
   if (error instanceof RuntimeFault) return { type: "RuntimeFault", code: error.code,
     message: error.message.slice(0, 1000), source_hash: sourceHash, location: { mapping: "unmapped" } };
+  const workerFailure = residentWorkerFailure(error);
+  if (workerFailure?.code === "watchdog" || workerFailure?.code === "source_throw") return {
+    type: "ResidentWorkerFailure", code: `resident_${workerFailure.code}`,
+    message: workerFailure.error, source_hash: sourceHash, location: { mapping: "unmapped" },
+  };
   // Only the worker's validated diagnostic and explicitly safe host faults carry
   // messages. Arbitrary host errors can contain paths, environment or secrets.
   return { type: "ExecutionFailure", message: "Generated program or trusted capability failed; host exception details are not exposed",

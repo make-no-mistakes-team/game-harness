@@ -12,7 +12,7 @@ import {
     readProgramDiagnostic
 } from "../src/server/program-diagnostics.ts";
 import { preparationFailure } from "../src/server/prepared-source-error.ts";
-import { ResidentWorkerFault, residentSourceAdvisory } from "../src/server/sandbox.ts";
+import { ResidentWorkerFault, residentSourceAdvisory } from "../src/server/resident-worker-fault.ts";
 
 const neutral = { forward: false, back: false, left: false, right: false, jump: false,
   sprint: false, sneak: false, attack: false, use: false };
@@ -69,6 +69,32 @@ test("source diagnostic construction rejects hooks, invalid fields and promoted 
     expect(preparationFailure(new ResidentWorkerFault(origin))).toEqual({
       error: `Resident worker failed (${origin}).`, code: origin,
     });
+  }
+});
+
+test("live diagnostics retain only branded watchdog and source-failure categories, not mutable error text", () => {
+  const hash = "a".repeat(64);
+  for (const origin of ["watchdog", "source_throw"] as const) {
+    const fault = new ResidentWorkerFault(origin, origin === "watchdog", origin === "source_throw" ? {
+      type: "TypeError", message: "PRIVATE_SOURCE_TEXT", source_hash: hash, location: { mapping: "unmapped" },
+    } : undefined);
+    Reflect.set(fault, "message", "PRIVATE_HOST_TEXT");
+    Reflect.set(fault, "origin", "PRIVATE_MUTATED_ORIGIN");
+    const diagnostic = programDiagnostic(fault, hash);
+    expect(diagnostic).toEqual({ type: "ResidentWorkerFailure", code: `resident_${origin}`,
+      message: `Resident worker failed (${origin}).`, source_hash: hash, location: { mapping: "unmapped" } });
+    expect(readProgramDiagnostic(JSON.parse(JSON.stringify(diagnostic)), hash)).toEqual(diagnostic);
+    expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE");
+  }
+  for (const error of [
+    new ResidentWorkerFault("transport"), new ResidentWorkerFault("opaque"), new ResidentWorkerFault("cleanup"),
+    Object.assign(new Error("PRIVATE_HOST_TEXT"), { name: "ResidentWorkerFault", origin: "watchdog" }),
+    Object.assign(Object.create(ResidentWorkerFault.prototype), { origin: "source_throw", message: "PRIVATE_SPOOF" }),
+  ]) {
+    const diagnostic = programDiagnostic(error, hash);
+    expect(diagnostic.type).toBe("ExecutionFailure");
+    expect(diagnostic.code).toBeUndefined();
+    expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE");
   }
 });
 

@@ -568,6 +568,15 @@ observed, keep the correlation unknown; do not substitute a later ACK.
 Submission, application and callback entry still prove neither accepted damage
 nor a kill.
 
+`last_input` is a latest-ACK snapshot, not a delivery log. Captures can skip
+intermediate ACK sequences entirely. A matching native `attack_callback` can
+remain observable even when its exact ACK was never carried in a frame.
+Each channel retains its own meaning: a callback records entry into that native
+path, not an ACK or a confirmed world effect. A newer ACK does not synthesize
+receipts for all earlier submissions. Correlate actually observed evidence
+independently; do not require an ACK/callback coincidence that may never occur.
+Both the `programs` and `controller` help topics expose this contract.
+
 Worker frames carry at most 24 KiB of active/recent task summaries. Oversized
 request/result detail stays in durable events under its original `history_ref`;
 `detail_omitted` and `tasks_omitted` disclose projection loss. Retaining many

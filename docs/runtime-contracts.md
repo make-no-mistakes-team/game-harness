@@ -1230,6 +1230,14 @@ ends the world clip without closing that screen or applying later steps.
 Arbitrary keys, chat/debug commands and generic GUI input are not admitted
 through this action.
 
+Held movement keys follow the player's actual yaw at each native tick, not a
+world compass bearing or a requested future camera pose. For horizontal
+forward input, the direction is `X = -sin(yaw), Z = cos(yaw)`; back reverses
+it. Turning by pi and then pressing back reverses the direction twice.
+Simultaneous turning changes this basis throughout movement. Fresh own-body
+and application feedback establish the resulting pose and displacement;
+these mechanics neither choose nor verify a movement or defense policy.
+
 View commands are unchanged, a delta applied once at step entry, or a rate
 whose 0.05-second budget per admitted simulation tick is sampled at the
 ordinary mouse/render cadence using vanilla simulation progress. Units

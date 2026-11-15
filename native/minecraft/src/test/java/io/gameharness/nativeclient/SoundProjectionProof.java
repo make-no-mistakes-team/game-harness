@@ -211,25 +211,29 @@ public final class SoundProjectionProof {
       }
     }
 
-    SoundProjection capped = new SoundProjection();
     double[][] offsets = {{0, -2}, {2, -2}, {2, 0}, {2, 2}, {0, 2}, {-2, 2}, {-2, 0}, {-2, -2}};
-    for (int i = offsets.length - 1; i >= 0; i--)
-      capped.accept(0, offsets[i][0], 0, offsets[i][1], WALL + i, NOW + i);
-    capped.accept(5, 0, 0, 2, WALL + 8, NOW + 8);
-    var groups = capped.recent(NOW + 8);
-    require(groups.size() == 8 && "creeper_primed".equals(groups.getFirst().cue())
-        && groups.getFirst().wallMillis() == WALL + 8,
-        "eight generic bins masked a retained cue before the group cap");
-    for (int i = 1; i < groups.size(); i++)
-      require(groups.get(i).category() == 0 && groups.get(i).cue() == null
-          && groups.get(i).direction() == i && groups.get(i).wallMillis() == WALL + i - 1,
-          "generic remainder was not in deterministic bin order");
-    var first = capped.page(null, NOW + 8);
-    var last = capped.page(first.nextCursor(), NOW + 8);
-    require(first.events().size() == 8 && first.hasMore() && last.events().size() == 1
-        && "creeper_primed".equals(last.events().getFirst().cue())
-        && !last.hasMore() && groups.equals(capped.recent(NOW + 8)),
-        "ordinary cap discarded the paged cue or paged reads consumed ordinary groups");
+    for (String[] distinct : new String[][] {
+        {"minecraft:entity.creeper.primed", "creeper_primed"},
+        {"minecraft:entity.generic.explode", "explosion"}}) {
+      SoundProjection capped = new SoundProjection();
+      for (int i = offsets.length - 1; i >= 0; i--)
+        capped.accept(0, offsets[i][0], 0, offsets[i][1], WALL + i, NOW + i);
+      capped.accept(distinct[0], 0, 0, 2, WALL + 8, NOW + 8);
+      var groups = capped.recent(NOW + 8);
+      require(groups.size() == 8 && distinct[1].equals(groups.getFirst().cue())
+          && groups.getFirst().wallMillis() == WALL + 8,
+          "eight generic bins masked a retained cue before the group cap");
+      for (int i = 1; i < groups.size(); i++)
+        require(groups.get(i).category() == 0 && groups.get(i).cue() == null
+            && groups.get(i).direction() == i && groups.get(i).wallMillis() == WALL + i - 1,
+            "generic remainder was not in deterministic bin order");
+      var first = capped.page(null, NOW + 8);
+      var last = capped.page(first.nextCursor(), NOW + 8);
+      require(first.events().size() == 8 && first.hasMore() && last.events().size() == 1
+          && distinct[1].equals(last.events().getFirst().cue())
+          && !last.hasMore() && groups.equals(capped.recent(NOW + 8)),
+          "ordinary cap discarded the paged cue or paged reads consumed ordinary groups");
+    }
 
     SoundProjection expiry = new SoundProjection();
     expiry.accept(5, 0, 0, 2, WALL, NOW);
@@ -259,10 +263,10 @@ public final class SoundProjectionProof {
       "minecraft:block.wood.break", "minecraft:block.wood.place",
       "minecraft:entity.player.hurt", "minecraft:entity.generic.hurt",
       "minecraft:entity.generic.death", "minecraft:entity.arrow.shoot",
-      "minecraft:entity.generic.explode", "minecraft:entity.zombie.ambient",
+      "minecraft:entity.zombie.ambient",
       "minecraft:entity.skeleton.ambient", "minecraft:entity.lightning_bolt.thunder"
     };
-    int[] categories = {0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 4};
+    int[] categories = {0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4};
     for (int i = 0; i < approved.length; i++) {
       SoundProjection one = new SoundProjection();
       one.accept(approved[i], 0, 0, 2, WALL, NOW);
@@ -272,7 +276,7 @@ public final class SoundProjectionProof {
     }
     sounds.accept("minecraft:entity.creeper.primed", 0, 0, 2, WALL, NOW);
     sounds.accept("minecraft:entity.warden.heartbeat", 0, 0, 2, WALL, NOW);
-    sounds.accept(17, 0, 0, 2, WALL, NOW);
+    sounds.accept(18, 0, 0, 2, WALL, NOW);
     var primed = sounds.page(null, NOW).events();
     require(primed.size() == 1 && primed.getFirst().category() == 2
         && "creeper_primed".equals(primed.getFirst().cue())
@@ -281,9 +285,9 @@ public final class SoundProjectionProof {
       "minecraft:entity.item.break", "minecraft:entity.player.attack.strong", "minecraft:entity.player.attack.weak",
       "minecraft:entity.player.attack.nodamage", "minecraft:entity.player.attack.crit",
       "minecraft:entity.player.attack.sweep", "minecraft:entity.player.attack.knockback",
-      "minecraft:entity.creeper.hurt", "minecraft:entity.skeleton.death"};
+      "minecraft:entity.creeper.hurt", "minecraft:entity.skeleton.death", "minecraft:entity.generic.explode"};
     String[] combatCues = {"shield_block", "shield_break", "item_break", "attack_strong", "attack_weak",
-      "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback", "mob_hurt", "mob_death"};
+      "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback", "mob_hurt", "mob_death", "explosion"};
     for (int i = 0; i < combatSounds.length; i++) {
       var one = new SoundProjection();
       one.accept(combatSounds[i], 0, 0, 2, WALL, NOW);

@@ -98,7 +98,7 @@ test("own blocking, selected durability and heard combat cues remain actor facts
   expect(minecraftControllerFrameSchema.parse({ ...f, player }).player.blocking).toBe(true);
   expect(minecraftControllerFrameSchema.safeParse({ ...f, player: { ...player,
     equipment: [{ ...player.equipment[0], durability: { damage: 60, maximum: 59 } }] } }).success).toBe(false);
-  for (const cue of ["shield_block", "shield_break", "item_break", "attack_nodamage", "mob_hurt", "mob_death"])
+  for (const cue of ["shield_block", "shield_break", "item_break", "attack_nodamage", "mob_hurt", "mob_death", "explosion"])
     expect(soundPageSchema.safeParse({ ...page, events: [{ ...event, cue }] }).success).toBe(true);
 });
 

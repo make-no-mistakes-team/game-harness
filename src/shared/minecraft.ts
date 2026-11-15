@@ -23,7 +23,7 @@ export type MinecraftSoundObservation = {
   | { category: "movement" | "interaction" | "combat" | "creature" | "weather"; cue: null }
   | { category: "combat"; cue: "creeper_primed" | "shield_block" | "shield_break" | "item_break"
       | "attack_strong" | "attack_weak" | "attack_nodamage" | "attack_crit" | "attack_sweep" | "attack_knockback"
-      | "mob_hurt" | "mob_death" }
+      | "mob_hurt" | "mob_death" | "explosion" }
 );
 export type MinecraftObservationData = {
   player: MinecraftPlayer;
@@ -87,7 +87,7 @@ export const minecraftSoundSchema = z.union([
     cue: z.null().describe("No distinct allowlisted cue was heard for this group.") }).strict(),
   z.object({ ...ordinarySoundFields, category: z.literal("combat"),
     cue: z.enum(["creeper_primed", "shield_block", "shield_break", "item_break", "attack_strong", "attack_weak",
-      "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback", "mob_hurt", "mob_death"])
+      "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback", "mob_hurt", "mob_death", "explosion"])
       .describe("Actually heard allowlisted combat sound; no damage attribution, hidden HP, source identity or position.") }).strict(),
 ]);
 export const minecraftObservationDataSchema = z.object({ player: minecraftPlayerSchema,
@@ -171,7 +171,7 @@ export type SoundCursor = z.infer<typeof soundCursorSchema>;
 export const soundEventSchema = z.object({
   sequence: safeCounterSchema.min(1), category: z.enum(["movement", "interaction", "combat", "creature", "weather"]),
   cue: z.enum(["creeper_primed", "shield_block", "shield_break", "item_break", "attack_strong", "attack_weak",
-    "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback", "mob_hurt", "mob_death"]).nullable(),
+    "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback", "mob_hurt", "mob_death", "explosion"]).nullable(),
   direction: z.enum(["here", "N", "NE", "E", "SE", "S", "SW", "W", "NW"]),
   distance: z.enum(["near", "mid", "far"]), heard_at: frameTimestamp, heard_native_ns: nativeNanoseconds,
 }).strict().refine(event => event.cue === null || event.category === "combat",

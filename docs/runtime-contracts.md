@@ -1309,11 +1309,14 @@ eight per read. Independent cursors do not drain each other's events;
 expiry and overflow have explicit gaps. Scope changes invalidate old
 cursors and queued old-scope playback. The original sound time is preserved
 in ordinary grouped observations too. Each ordinary sound group has required
-nullable `cue`; `creeper_primed` is valid only with category `combat`. That group
+nullable `cue`; `creeper_primed` and `explosion` are valid only with category `combat`. Each cue group
 stays distinct from generic combat in the same direction/distance bin and
 precedes generic groups before the eight-group cap. Reading either view does
 not consume the ring. An actually delivered creeper priming sound may expose
-this cue and coarse direction/distance, never a hidden fuse or inferred threat.
+its cue and coarse direction/distance, never a hidden fuse or inferred threat.
+An actually delivered generic explosion sound carries `cue:"explosion"` without
+identifying its source or establishing a creeper's death, own kill credit, damage
+or safety.
 This channel supplies neither a
 subtitle-rendering feed nor recorded audio.
 
@@ -2471,7 +2474,17 @@ Encode compact JSON without insignificant whitespace, counting actual UTF-8 byte
 
 #### Legitimate coarse sound
 
-Use only sound events actually delivered as audible to this avatar, never inferred from entity state or an unrestricted world-event feed. The exact sound-ID whitelist maps `minecraft:block.grass.step` and `minecraft:entity.player.swim` to `movement`; `minecraft:block.stone.break`, `minecraft:block.stone.place`, `minecraft:block.wood.break` and `minecraft:block.wood.place` to `interaction`; `minecraft:entity.player.hurt`, `minecraft:entity.generic.hurt`, `minecraft:entity.generic.death`, `minecraft:entity.arrow.shoot`, `minecraft:entity.generic.explode` and `minecraft:entity.creeper.primed` to `combat`; `minecraft:entity.zombie.ambient` and `minecraft:entity.skeleton.ambient` to `creature`; and `minecraft:entity.lightning_bolt.thunder` to `weather`. Only the last combat sound carries `cue:"creeper_primed"`; other records carry `cue:null`. Drop other IDs. A protocol/source that cannot establish legitimate audible delivery cannot provide these observations.
+Use only sound events actually delivered as audible to this avatar, never inferred from entity state or an unrestricted world-event feed. The explicit whitelist in `SoundProjection.category` maps footsteps/swimming to `movement`, approved block changes to `interaction`, approved hurt/death/attack/shield/item sounds to `combat`, approved ambient mob sounds to `creature`, and thunder to `weather`. `minecraft:entity.creeper.primed` carries `cue:"creeper_primed"`; `minecraft:entity.generic.explode` carries `cue:"explosion"`. Approved mob hurt/death, shield, item-break and player-attack sounds retain their distinct cues from the registered sound schema; generic groups carry `cue:null`. Other IDs are dropped. An explosion cue does not identify a source entity, establish death or award a kill. A source that cannot establish legitimate audible delivery cannot provide these observations.
+
+The controller reference also documents static vanilla 1.21.4 creeper mechanics,
+not live AI state. An ordinary creeper not manually ignited may start swelling
+at a target distance below three blocks. Its ignition goal decreases fuse progress when target distance exceeds
+seven blocks or it cannot see that target; progress decreases gradually rather
+than resetting immediately. A hiss occurs when positive progress starts from
+zero, so resuming a partially charged fuse need not produce another hiss.
+Current progress, fuse speed and AI target/visibility remain hidden. These facts
+come from the version-pinned `CreeperIgniteGoal` and `CreeperEntity.tick`; they
+provide no control policy, chosen safety margin or runtime fuse estimate.
 
 Using the listener position at event delivery, discard events beyond Euclidean distance `32`; emit only distance bands `near: [0,8)`, `mid: [8,16)`, `far: [16,32]`. Horizontal direction has eight fixed world-relative sectors, nearest compass heading with exact halfway ties clockwise: north is `−Z`, east is `+X`. Horizontal distance below `1` yields `here`, without vertical direction. A scope-bound ring retains at most 128 coarsened events for 1,000 ms, with their original heard times. It retains no raw sound ID, exact source coordinates, source identity/handle, volume or pitch.
 

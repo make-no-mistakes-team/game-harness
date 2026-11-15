@@ -68,9 +68,10 @@ test("ordinary sound cues survive registered admission and projection with comba
     category: "combat", cue: null, direction: "NE", distance: "near", observed_at: current.captured_at,
   };
   const primed: MinecraftSoundObservation = { ...generic, category: "combat", cue: "creeper_primed" };
+  const explosion: MinecraftSoundObservation = { ...generic, category: "combat", cue: "explosion" };
   const withSounds = (sounds: Json[]) => ({ ...current, data: { ...current.data, sounds } });
   for (const category of ["movement", "interaction", "combat", "creature", "weather"] as const) {
-    const value = withSounds([{ ...generic, category }, primed]);
+    const value = withSounds([{ ...generic, category }, primed, explosion]);
     expect(minecraftObservationV3Schema.safeParse(value).success).toBe(true);
     expect(validateJsonSchemaValue(helpPayload, value.data).success).toBe(true);
     expect(registry.parseObservation(value).data).toEqual(value.data);
@@ -80,7 +81,8 @@ test("ordinary sound cues survive registered admission and projection with comba
     missingCue, { ...generic, cue: "creeper_fuse" },
     { ...primed, category: "movement" }, { ...primed, category: "creature" },
     { ...primed, source_position: { x: 1, y: 64, z: 1 } }, { ...primed, fuse_ticks: 20 },
-    { ...primed, entity_id: "hidden-source" },
+    { ...primed, entity_id: "hidden-source" }, { ...explosion, category: "creature" },
+    { ...explosion, entity_id: "inferred-creeper" }, { ...explosion, own_kill: true },
   ]) {
     const value = withSounds([invalid]);
     expect(minecraftObservationV3Schema.safeParse(value).success).toBe(false);

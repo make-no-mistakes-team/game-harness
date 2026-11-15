@@ -427,7 +427,7 @@ export async function runNativeSensingFixture(project: string, caps: EvaluationC
       for (const [sound, cue] of [["minecraft:item.shield.block", "shield_block"],
         ["minecraft:item.shield.break", "shield_break"], ["minecraft:entity.item.break", "item_break"],
         ["minecraft:entity.player.attack.nodamage", "attack_nodamage"], ["minecraft:entity.husk.hurt", "mob_hurt"],
-        ["minecraft:entity.husk.death", "mob_death"]]) {
+        ["minecraft:entity.husk.death", "mob_death"], ["minecraft:entity.generic.explode", "explosion"]]) {
         const after = (await read()).audible.next_cursor;
         await fixture.console([`playsound ${sound} master @a 0.5 240 2.5 1 1`]);
         actualCombat.push(await until(() => read(after), frame => frame.audible.events.some(event => event.cue === cue),

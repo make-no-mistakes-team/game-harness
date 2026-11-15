@@ -38,7 +38,7 @@ public final class SoundProjection {
   // Cue bins precede the five generic categories so the result cap cannot hide a retained cue.
   private static final String[] CUES = {"creeper_primed", "shield_block", "shield_break", "item_break",
       "attack_strong", "attack_weak", "attack_nodamage", "attack_crit", "attack_sweep", "attack_knockback",
-      "mob_hurt", "mob_death"};
+      "mob_hurt", "mob_death", "explosion"};
   private final Event[] grouped = new Event[(CUES.length + 5) * 9 * 3];
   private String streamId = UUID.randomUUID().toString();
   private long sequence;
@@ -69,11 +69,11 @@ public final class SoundProjection {
       case "minecraft:entity.player.attack.crit" -> 12;
       case "minecraft:entity.player.attack.sweep" -> 13;
       case "minecraft:entity.player.attack.knockback" -> 14;
+      case "minecraft:entity.generic.explode" -> 17;
       case "minecraft:entity.player.hurt",
               "minecraft:entity.generic.hurt",
               "minecraft:entity.generic.death",
-              "minecraft:entity.arrow.shoot",
-              "minecraft:entity.generic.explode" ->
+              "minecraft:entity.arrow.shoot" ->
           2;
       case "minecraft:entity.zombie.ambient", "minecraft:entity.skeleton.ambient" -> 3;
       case "minecraft:entity.lightning_bolt.thunder" -> 4;

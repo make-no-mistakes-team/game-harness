@@ -322,7 +322,7 @@ The ordinary default exposes these tools:
 | `program_review` | Record `keep` or `insufficient_evidence` for a named version's latest matching outcome, with reason. |
 | `reflex` | Author, validate and explicitly activate bounded local reactions; no policy is supplied automatically. |
 | `help` | Load controller, game, program, planning or reflex reference; disclose the optional memory module on demand. |
-| `task_finish` | Affirm all requested work is complete and request safe custom-task closure with a model-authored summary; not independent goal verification. |
+| `task_finish` | Report incomplete custom-task work without changing control, or explicitly affirm whole-task completion and request safe closure; not independent goal verification. |
 
 For a custom task, Main calls
 `task_finish({all_requested_work_complete:true,summary})` once authorized
@@ -330,18 +330,22 @@ observations and execution evidence support completion of the whole request.
 A successful program return, completion prose or `game.progress` alone never
 closes a task. Do not rerun satisfied work or wait for the empty-turn limit.
 
-`task_finish` is terminal, not an end-of-turn or progress-report operation.
-“Unverified” describes the source of the completion report; it does not mean
-that the task is unfinished. The required literal
-`all_requested_work_complete:true` is an explicit model affirmation, not trusted
-verification. Missing, false or coerced string values are rejected before
-admission; the live controller and its authority remain unchanged. When
-requirements remain, Main ends its planning response normally, retaining useful
-bounded control and requesting a finite attention wake only when needed.
-The shared guidance evaluates this incomplete branch first: do not set the
-affirmation merely to satisfy the schema, or use terminal completion to report
-that completion cannot be claimed. The host does not parse summary wording
-or consult evaluator-private counters.
+`all_requested_work_complete` is a required boolean. When requirements remain,
+Main may call `task_finish({all_requested_work_complete:false,summary})`.
+The host records `task.progress_reported` and returns
+`{status:"continuing",all_requested_work_complete:false}` without changing
+controller authority, intent or deadlines. Main then ends its planning response
+normally. This report is optional; ending a response without the tool also
+preserves useful bounded control. A finite attention wake is needed only for
+future evidence.
+
+Only `true` requests terminal shutdown. It explicitly affirms whole-task
+completion, not trusted verification. “Unverified” describes the report's source,
+not unfinished work. Missing or string values are rejected before admission.
+Both branches retain immutable call acknowledgements: an identical replay
+returns its receipt; changing a previous incomplete report into a completion
+claim under the same call ID conflicts. The host neither parses summary wording
+nor consults evaluator-private counters.
 
 An ordinary Main request with `task_finish` advertised already has decision
 authority. Supported whole-task completion belongs in that decision, even while
@@ -349,8 +353,8 @@ a resident runs; terminal shutdown owns its retirement. A running execution is
 not evidence that task requirements remain. Read genuinely missing facts within
 the same turn, and reserve timed attention for unfinished work that needs future
 evidence. The shared custom-completion guidance applies to both idle and
-pending-root decision context. It changes instructions, not tool permissions,
-explicit affirmation, verification or automatic-closure behavior.
+pending-root decision context. Neither branch grants new tool permissions,
+trusted verification or automatic closure.
 
 Ordinary task entry starts with **Custom / natural language**, without an automatic verifier. Built-in success checks are explicit presets: selecting one replaces the draft with its matching prompt and displays its exact early-stop condition. Editing that prompt switches to Custom, even if the original text is later restored; rebinding requires an explicit preset selection. UI, HTTP and Runtime accept the same trimmed task length of 1–4,000 characters. API callers remain responsible for binding a registered criterion to the whole request.
 

@@ -2085,13 +2085,24 @@ test.each(["missing", false, "true"] as const)(
       ...(affirmation === "missing" ? {} : { all_requested_work_complete: affirmation }) };
     const replies = await agentCalls(f.tools(), [{ type: "toolCall", id: "unaffirmed-finish",
       name: "task_finish", arguments: arguments_ }]);
-    expect(replies[0]).toMatchObject({ isError: true });
+    if (affirmation === false) {
+      expect(replies[0]!.isError).not.toBe(true);
+      expect(data(replies[0]!)).toEqual({ status: "continuing", all_requested_work_complete: false });
+      expect(data(await f.call("task_finish", arguments_, "unaffirmed-finish")))
+        .toEqual({ status: "continuing", all_requested_work_complete: false });
+      expect(data(await f.call("task_finish", { all_requested_work_complete: true, summary: arguments_.summary }, "unaffirmed-finish"))
+        .error.code).toBe("conflict");
+    } else {
+      expect(replies[0]).toMatchObject({ isError: true });
+    }
     expect(f.run.status).toBe("running");
     expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })?.status).toBe("running");
     expect(f.manager.effectScope(root.execution_id)).not.toBeNull();
     continueWork.resolve(); await progressed.promise;
     expect(f.actions()).toBe(1);
     expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event => event.type === "task.completion_reported")).toBe(false);
+    expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "task.progress_reported"))
+      .toHaveLength(affirmation === false ? 1 : 0);
   });
 
 test("task_finish persists an immutable acknowledgement despite consuming its own authority", async () => {

@@ -78,7 +78,7 @@ export function runtimeToolCatalogue(role: ToolRole, modules: ReadonlySet<ToolMo
     },
     {
       name: "task_finish",
-      description: "TERMINAL: requires all_requested_work_complete:true, explicitly affirming the WHOLE custom task is complete, then immediately stops/drains the run and every local controller. Unverified means model-reported, not unfinished. Never affirm this to end a planning turn, report partial progress or say completion cannot be claimed. If work remains, end your response without this tool and retain useful bounded control.",
+      description: "Report the custom-task decision. all_requested_work_complete:false records unfinished work and preserves running control; then end this planning response normally. true is TERMINAL: explicitly affirm the WHOLE task is complete, then stop/drain the run and every controller. Unverified means model-reported, not unfinished. Never choose true for partial progress, inability to claim completion or the end of a planning turn.",
       schema: schemas.task_finish,
     },
     {

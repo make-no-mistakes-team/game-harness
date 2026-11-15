@@ -235,6 +235,12 @@ export class RuntimeTools {
       },
       task_finish: (input, callId) => {
         if (typeof run.goal === "string" || run.goal.goal_id !== "custom" || run.goal.verifier !== null) throw new RuntimeFault("forbidden", "Only custom tasks permit model-reported completion; built-in goals require trusted verification");
+        if (!input.all_requested_work_complete) {
+          this.store.event(run.run_id, "task.progress_reported", "Model reported unfinished custom-task work; control continues", {
+            source: "model", reported_outcome: "incomplete", summary: input.summary, tool_call_id: callId,
+          });
+          return { status: "continuing", all_requested_work_complete: false };
+        }
         this.host.finishTask(input.summary, callId);
         return { status: "stopping", verification: "unverified" };
       },

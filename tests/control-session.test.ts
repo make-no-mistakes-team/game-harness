@@ -379,7 +379,8 @@ test("a terminal event cannot exceed the cumulative source-event budget or publi
     next_state: { logs: 8, done: terminalEvent.summary }, events: [terminalEvent] });
   h.options.event = vi.fn(); h.options.open = vi.fn(h.options.open);
   await h.session.start(); await h.clock.advance(50); await h.session.stop("join event budget failure");
-  expect(h.session.snapshot()).toMatchObject({ status: "failed", reason: "session_event_budget",
+  expect(h.session.snapshot()).toMatchObject({ status: "failed",
+    reason: "Generated program or trusted capability failed; host exception details are not exposed",
     state: { logs: 7, done: null }, processed_frame_seq: 1, processed_native_tick: 1, processed_native_ns: "0",
     counters: { events: 1, submissions: 0 }, timings: { step_ms: { count: 1 } },
     cleanup: { worker: "closed", native: "retired" } });

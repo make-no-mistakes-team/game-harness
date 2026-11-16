@@ -7,14 +7,14 @@ import { minecraftControllerFrameSchema } from "../shared/minecraft.ts";
 import { ResidentCleanupError, RESIDENT_STEP_RESPONSE_MS, residentIntentSchema, residentLimitsSchema, residentStateSchema,
   type ResidentAnalysisResult, type ResidentAnalysisSource, type ResidentClock, type ResidentControllerOptions,
   type ResidentSnapshot, type ResidentTimingSummary, type ResidentTraceStage } from "../shared/resident.ts";
-import { GeneratedControllerResultValidationError, parseGeneratedControllerResult } from "./program-diagnostics.ts";
+import { GeneratedControllerResultValidationError, parseGeneratedControllerResult, programDiagnostic } from "./program-diagnostics.ts";
 import { ResidentAnalysisLane } from "./resident-analysis.ts";
+import { ResidentWorkerFault, residentWorkerFailure } from "./resident-worker-fault.ts";
 
 const heldKeys: (keyof WorldHeld)[] = ["forward", "back", "left", "right", "jump", "sprint", "sneak", "attack", "use"];
 const neutral: WorldHeld = { forward: false, back: false, left: false, right: false, jump: false, sprint: false, sneak: false, attack: false, use: false };
 const defaultClock: ResidentClock = { id: `host-${randomUUID()}`, now: () => performance.now(),
   setTimeout: (callback, delay) => setTimeout(callback, delay), clearTimeout: handle => clearTimeout(handle as ReturnType<typeof setTimeout>) };
-const message = (error: unknown) => error instanceof Error ? error.message : String(error);
 const sameHeld = (a: WorldHeld, b: WorldHeld) => heldKeys.every(key => a[key] === b[key]);
 
 class TimingWindow {
@@ -69,10 +69,10 @@ export class ResidentController {
   private finalStatus: ResidentSnapshot["status"] = "stopped";
   private traceSequence = 0;
   private observerErrors = 0;
-  private resultFailure: GeneratedControllerResultValidationError | null = null;
+  private resultFailure: GeneratedControllerResultValidationError | ResidentWorkerFault | null = null;
   private activated = false;
 
-  get failure(): GeneratedControllerResultValidationError | null { return this.resultFailure; }
+  get failure(): GeneratedControllerResultValidationError | ResidentWorkerFault | null { return this.resultFailure; }
 
   constructor(options: ResidentControllerOptions) {
     this.options = { ...options, limits: residentLimitsSchema.parse(options.limits) };
@@ -123,7 +123,7 @@ export class ResidentController {
       this.notify(true, false); this.schedule();
     } catch (error) {
       if (!this.channel) this.data.cleanup.native = "unknown";
-      this.finish("failed", `resident_open: ${message(error)}`);
+      this.finish("failed", `resident_open: ${programDiagnostic(error, this.options.source_hash).message}`);
     }
   }
 
@@ -196,7 +196,8 @@ export class ResidentController {
       try {
         accept(await this.channel.revoke());
       } catch (error) {
-        nativeKnown = false; this.data.cleanup.native = "unknown"; this.data.reason ??= message(error);
+        nativeKnown = false; this.data.cleanup.native = "unknown";
+        this.data.reason ??= programDiagnostic(error, this.options.source_hash).message;
         if (error instanceof ResidentCleanupError) {
           combinedCleanupKnown = false;
           if (error.retirement)
@@ -266,7 +267,9 @@ export class ResidentController {
     void this.process(slot).then(flight.resolve, flight.reject);
     void flight.promise.catch(error => {
       if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
-      this.finish("failed", `resident_step: ${message(error)}`);
+      else if (error instanceof ResidentWorkerFault && residentWorkerFailure(error)?.code === "source_throw")
+        this.resultFailure = error;
+      this.finish("failed", `resident_step: ${programDiagnostic(error, this.options.source_hash).message}`);
     }).finally(() => {
       this.flight = null; if (!this.fenced) { this.notify(false, false); this.schedule(); }
     });

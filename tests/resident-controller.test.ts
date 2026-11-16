@@ -682,7 +682,8 @@ for (const missing of ["press", "release"] as const) {
       calls++ === 0 ? heldWorld(held) : world(), 99));
     await begin(h);
     if (missing === "release") await h.clock.advance(50);
-    expect(h.controller.snapshot()).toMatchObject({ status: "failed", reason: "resident_step: Invalid resident held transition",
+    expect(h.controller.snapshot()).toMatchObject({ status: "failed",
+      reason: "resident_step: Generated program or trusted capability failed; host exception details are not exposed",
       counters: { submissions: missing === "press" ? 0 : 1, expanded_edges: missing === "press" ? 0 : 1 } });
     expect(h.sent.length).toBe(missing === "press" ? 0 : 1);
     await h.controller.stop("test");
@@ -870,7 +871,7 @@ for (const limits of [{ max_edges: 1 }, { max_edges_per_second: 1 }]) {
     h.step(async () => decision(heldWorld(calls++ === 0 ? { ...neutral, forward: true } : { ...neutral }), calls));
     await begin(h); await h.clock.advance(50);
     expect(h.controller.snapshot()).toMatchObject({ status: "failed",
-      reason: "resident_step: Resident cumulative edge/event budget exceeded", state: 1,
+      reason: "resident_step: Generated program or trusted capability failed; host exception details are not exposed", state: 1,
       counters: { expanded_edges: 1, submissions: 1 } });
     expect(h.sent.map(entry => entry.input)).toEqual([
       world({ held: { ...neutral, forward: true }, edges: [{ kind: "button", button: "forward", phase: "press", count: 1 }] }),

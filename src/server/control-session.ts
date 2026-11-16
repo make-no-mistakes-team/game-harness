@@ -8,7 +8,7 @@ import { executiveStepResultSchema, residentActivationResultSchema, ResidentClea
   type ResidentSnapshot, type ResidentWorker } from "../shared/resident.ts";
 import { type ControlSessionConfig, type ExecutiveChoice, type ExecutiveSnapshot, type ExecutiveTaskRequest,
   type ExecutiveTaskSnapshot } from "../shared/control-session.ts";
-import { GeneratedControllerResultValidationError } from "./program-diagnostics.ts";
+import { GeneratedControllerResultValidationError, programDiagnostic } from "./program-diagnostics.ts";
 import { ControllerChannelFaultError, ControllerScreenReadSupersededError } from "./controller-channel.ts";
 import { ExecutiveRawMonitor, ExecutiveStationaryViewMonitor } from "./executive-incidents.ts";
 import { ResidentAnalysisLane } from "./resident-analysis.ts";
@@ -713,7 +713,6 @@ export class ControlSession {
     } as unknown as Json);
   }
   private async fail(error: unknown): Promise<void> {
-    const reason = errorText(error);
     this.recordControllerFault(this.raw);
     if (!this.abort.signal.aborted) {
       if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
@@ -725,9 +724,10 @@ export class ControlSession {
             ? "The native controller failed; inspect the retained session.controller_fault and retirement evidence. Unknown effects remain unknown and must not be replayed."
             : "The controller failed without a retained trusted cause; inspect session.controller_fault and cleanup evidence. Exception text grants no retry permission.");
       }
-      this.data.status = "failed"; this.data.reason = reason;
+      this.data.status = "failed";
+      this.data.reason = programDiagnostic(this.resultFailure ?? error, this.options.source_hash).message;
     }
-    void this.stop(reason);
+    void this.stop(this.data.reason ?? programDiagnostic(error, this.options.source_hash).message);
   }
   stop(reason: string): Promise<void> {
     if (this.stopTask) return this.stopTask;

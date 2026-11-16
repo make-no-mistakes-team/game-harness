@@ -747,7 +747,10 @@ boundary. They expose bounded maxima, not input values, arbitrary custom
 validator parameters or fabricated exact sizes from an early-exit walk.
 
 Source exceptions have a separate bounded `source_diagnostic` advisory in
-preparation failures and ordinary resident-analysis results. It retains the
+preparation failures, ordinary resident-analysis results and live resident
+execution diagnostics. Ordinary `program_inspect` execution and retained
+`skill.closed` event views expose it under `diagnostic.source_diagnostic`;
+the trusted failure category and message remain fixed. It retains the
 validated JavaScript error type and at most 1,000 JavaScript code units of the
 source's own message. Non-error thrown values receive constant text rather than
 serialization. The hash identifies the complete pinned execution realm, not
@@ -762,6 +765,8 @@ checks its exact shape and current realm hash. Other fault origins cannot carry
 this diagnostic. Source failure and trusted evaluation timing settle once under
 the original request deadline; cleanup uncertainty remains a separate failure.
 Arbitrary host exceptions and forged diagnostic-shaped objects stay redacted.
+Live failure-generated snapshot reasons use the same safe diagnostic messages;
+ordinary model-authored blocked or completion reasons are unchanged.
 
 Sampling pins the exact producer and transition phase before awaiting a frame.
 If opening or retirement completes during an independent read, that frame is

@@ -4,7 +4,7 @@ import type { SkillResult, ProgramOutputFailure } from "../shared/programs.ts";
 import { jsonSchema, skillResultSchema } from "../shared/validation.ts";
 import { controllerStepResultSchema, type ControllerStepResult } from "../shared/resident.ts";
 import { residentDecisionSchema, residentActivationResultSchema, residentJsonConstraint, type ResidentJsonConstraint,
-  type ResidentDecision, type ResidentActivationResult } from "../shared/resident.ts";
+  type ResidentDecision, type ResidentActivationResult, type ResidentSourceAdvisory } from "../shared/resident.ts";
 import type { ZodIssue } from "zod";
 import { residentWorkerFailure } from "./resident-worker-fault.ts";
 
@@ -20,6 +20,7 @@ export interface ProgramDiagnostic {
   issues?: { code: string; path: string; constraint?: ResidentJsonConstraint["constraint"]; maximum?: number; actual?: number }[];
   result_path?: "result.rejected_result";
   output?: ProgramOutputFailure;
+  source_diagnostic?: ResidentSourceAdvisory;
 }
 export class ProgramExecutionError extends Error {
   constructor(readonly diagnostic: ProgramDiagnostic) { super(diagnostic.message); this.name = "ProgramExecutionError"; }
@@ -109,13 +110,19 @@ export function programDiagnostic(error: unknown, sourceHash: string): ProgramDi
     type: error.name, code: "invalid_program_result", message: error.message,
     issues: error.issues, source_hash: sourceHash, location: { mapping: "unmapped" },
   };
-  if (error instanceof ProgramExecutionError) return { ...error.diagnostic, source_hash: sourceHash };
+  if (error instanceof ProgramExecutionError) {
+    // Finite-program wire diagnostics cannot establish resident fault custody.
+    const { source_diagnostic: _advisory, ...diagnostic } = error.diagnostic;
+    return { ...diagnostic, source_hash: sourceHash };
+  }
   if (error instanceof RuntimeFault) return { type: "RuntimeFault", code: error.code,
     message: error.message.slice(0, 1000), source_hash: sourceHash, location: { mapping: "unmapped" } };
   const workerFailure = residentWorkerFailure(error);
   if (workerFailure?.code === "watchdog" || workerFailure?.code === "source_throw") return {
     type: "ResidentWorkerFailure", code: `resident_${workerFailure.code}`,
     message: workerFailure.error, source_hash: sourceHash, location: { mapping: "unmapped" },
+    ...(workerFailure.source_diagnostic?.diagnostic.source_hash === sourceHash
+      ? { source_diagnostic: workerFailure.source_diagnostic } : {}),
   };
   // Only the worker's validated diagnostic and explicitly safe host faults carry
   // messages. Arbitrary host errors can contain paths, environment or secrets.

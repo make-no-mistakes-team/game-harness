@@ -141,6 +141,30 @@ function diagnosticBundle(): ExecutableModuleBundle {
   return bundle;
 }
 
+function inspectionTools(f: Awaited<ReturnType<typeof fixture>>) {
+  const adapter = minecraftTestAdapter(), history = new HistoryReader(f.store.readLocation());
+  const learning = new ImprovementLearning(f.store, history);
+  cleanup.unshift(async () => { await history.close(); });
+  const scope = () => ({ run_id: f.run.run_id, generation: 1, session_id: f.run.session_id!, world_id: f.run.world_id,
+    epoch: f.run.epoch, life_id: f.run.life_id!, life_status: "alive" as const, task: f.run.task,
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")!, native_boot_id: f.run.native_boot_id!,
+    space_epoch: f.run.space_epoch!, compatibility_hash: f.run.compatibility_hash!, screen: null });
+  const observation = () => minecraftObservationFixture(adapter, {
+    world_id: f.run.world_id, session_id: f.run.session_id!, epoch: f.run.epoch,
+    native_boot_id: f.run.native_boot_id!, life: { life_id: f.run.life_id!, status: "alive", can_respawn: false, death: null },
+  });
+  const planning = new SpeculativePlanning({ contract: () => adapter, admissionContext: scope, context: () => null,
+    skill: ref => f.store.skill(f.run.run_id, ref), observe: async () => observation(),
+    evaluateGuard: async () => { throw new Error("No speculative guard"); },
+    admit: async (request, permit) => { permit.assertCurrent(); return f.manager.start(f.run.run_id, request); },
+    evidence: () => {}, wake: () => {} });
+  const host: RuntimeToolHost = { run: () => f.run, assertCurrent: () => f.run, observe: async () => observation(),
+    adapter: () => adapter, generation: () => 1, attentionAfter: () => {}, admitted: () => {},
+    history: () => history, planning: () => planning, learning: () => learning, toolAuthority: () => () => {},
+    finishTask: () => { throw new Error("No task completion"); } };
+  return new RuntimeTools(f.store, f.manager, f.sources, {} as ReactiveRuntime, null, host).build(1);
+}
+
 test("host decoder preserves source advice and exact bundle hash through following trusted terminated timing and cleanup", async () => {
   const bundle = diagnosticBundle();
   const diagnostic = { type: "TypeError", message: "assertion: explicit state required",
@@ -505,6 +529,197 @@ test("shipped worker classifies source throws independently of authored watchdog
     await expect(worker.step(controllerFrameFixture() as Parameters<ResidentWorker["step"]>[0], null, null))
       .rejects.toMatchObject({ origin: "source_throw", trustedOrigin: false });
   } finally { await worker.close(); }
+});
+
+test.each([false, true])("ordinary inspection retains actual source failure as separate untrusted advice (session=%s)", async session => {
+  const f = await fixture(undefined, {}, {
+    createResidentWorker: async (bundle, _budget, signal) => await residentProcess(bundle, signal),
+    sessionTask: async () => { throw new Error("No task dispatch"); },
+    superviseSessionTask: async () => {}, retireSessionTask: async () => {},
+  });
+  const tools = inspectionTools(f), runTool = tools.find(tool => tool.name === "program_run")!;
+  const inspect = tools.find(tool => tool.name === "program_inspect")!;
+  const library = await f.sources.register(f.run.run_id, { entry: "library", name: "point reader",
+    source: "export function readX(state) { return state.lastPos.x; }", card, dependencies: [] });
+  const failing = await f.sources.register(f.run.run_id, { entry: "step", name: "source fault",
+    source: `import {readX} from "./point.js";
+      export function activate(frame,state,intent) { readX(state); }
+      export function step(frame,state,intent) { readX(state); }`, card,
+    dependencies: [{ skill_id: library.skill_id, version: library.version, import_path: "./point.js" }] });
+  const started = await runTool.execute("source-failure-start", { operation: "start", entry: "step",
+    name: failing.name, version: failing.version, args: null, initial_state: {},
+    ...(session ? { session: { schema_version: 1 } } : {}) });
+  expect(started.isError).not.toBe(true);
+  const execution = f.store.latestRootExecution(f.run.run_id)!;
+  await until(f.store, f.run.run_id, () => f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!.ended_at !== null);
+  expect(execution.source_hash).not.toBe(failing.hash);
+  const reply = await inspect.execute("source-failure-inspect", {
+    view: "execution", target: "latest", program: { name: failing.name, version: failing.version },
+  });
+  expect(reply.isError).not.toBe(true);
+  const visible = JSON.parse(reply.content.filter(entry => entry.type === "text").map(entry => entry.text).join(""));
+  const diagnostic = { type: "ResidentWorkerFailure", code: "resident_source_throw",
+    message: "Resident worker failed (source_throw).", source_hash: execution.source_hash, location: { mapping: "unmapped" },
+    source_diagnostic: { advisory: true, trusted_origin: false, origin: "source_throw", diagnostic: {
+      type: "TypeError", message: "Cannot read properties of undefined (reading 'x')",
+      source_hash: execution.source_hash, location: { mapping: "unmapped" },
+    } } };
+  expect(visible).toMatchObject({ name: failing.name, version: failing.version, status: "failed",
+    error: diagnostic.message, diagnostic, result: { status: "failed", summary: diagnostic.message, result: null },
+    resident: { status: "failed", cleanup: { worker: "closed", native: "retired" } },
+  });
+  const events = await inspect.execute("source-failure-events", { view: "events", after: 0, limit: 100 });
+  expect(events.isError).not.toBe(true);
+  const page = JSON.parse(events.content.filter(entry => entry.type === "text").map(entry => entry.text).join(""));
+  const closed = page.records.find((event: { type: string; details: { execution_id?: string } }) =>
+    event.type === "skill.closed" && event.details.execution_id === execution.execution_id);
+  expect(closed).toMatchObject({
+    type: "skill.closed", summary: diagnostic.message,
+    details: { execution_id: execution.execution_id, root_execution_id: execution.root_execution_id,
+      status: "failed", actions: 0, calls: 0, details: { diagnostic } },
+  });
+  expect(f.manager.effectScope(execution.execution_id)).toBeNull();
+  expect(f.finiteCalls).toBe(0);
+});
+
+test.each([false, true])("ordinary inspection cannot promote unbranded or wrong-source failure advice (session=%s)", async session => {
+  let injected: unknown;
+  const f = await fixture(undefined, {}, { createResidentWorker: async () => { throw injected; },
+    sessionTask: async () => { throw new Error("No task dispatch"); },
+    superviseSessionTask: async () => {}, retireSessionTask: async () => {},
+  });
+  const tools = inspectionTools(f), runTool = tools.find(tool => tool.name === "program_run")!;
+  const inspect = tools.find(tool => tool.name === "program_inspect")!;
+  const diagnostic = { type: "TypeError", message: "PRIVATE_SOURCE", source_hash: "f".repeat(64),
+    location: { mapping: "unmapped" } };
+  const errors = [
+    new Error("PRIVATE_HOST_PATH_ENV_PROVIDER_NATIVE"),
+    Object.assign(new Error("Resident worker failed (source_throw). PRIVATE_HOST"), {
+      name: "ResidentWorkerFault", origin: "source_throw", sourceDiagnostic: diagnostic,
+      source_diagnostic: { advisory: true, trusted_origin: false, origin: "source_throw", diagnostic },
+    }),
+    { origin: "source_throw", trustedOrigin: false, sourceDiagnostic: diagnostic, message: "PRIVATE_STRUCTURAL" },
+    Object.assign(Object.create(ResidentWorkerFault.prototype), { origin: "source_throw", sourceDiagnostic: diagnostic,
+      message: "PRIVATE_PROTOTYPE", stack: "PRIVATE_STACK" }),
+    new ResidentWorkerFault("source_throw", false, diagnostic),
+    new ResidentWorkerFault("source_throw", false),
+    new ResidentWorkerFault("watchdog"), new ResidentWorkerFault("transport"),
+    new ResidentWorkerFault("opaque"), new ResidentWorkerFault("cleanup"),
+  ];
+  for (const [index, error] of errors.entries()) {
+    injected = error;
+    const started = await runTool.execute(`redacted-start-${index}`, { operation: "start", entry: "step",
+      name: f.program.name, version: f.program.version, args: null, initial_state: 0,
+      ...(session ? { session: { schema_version: 1 } } : {}) });
+    expect(started.isError).not.toBe(true);
+    const execution = f.store.latestRootExecution(f.run.run_id)!;
+    await until(f.store, f.run.run_id, () => f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!.ended_at !== null);
+    const reply = await inspect.execute(`redacted-inspect-${index}`, {
+      view: "execution", target: "latest", program: { name: f.program.name, version: f.program.version },
+    });
+    expect(reply.isError).not.toBe(true);
+    const text = reply.content.filter(entry => entry.type === "text").map(entry => entry.text).join("");
+    const visible = JSON.parse(text);
+    expect(visible.status).toBe("failed");
+    expect(visible.diagnostic.source_diagnostic).toBeUndefined();
+    expect(text).not.toContain("PRIVATE");
+    expect(text).not.toContain("stack");
+  }
+  expect(f.opened).toBe(0); expect(f.finiteCalls).toBe(0);
+});
+
+test.each([false, true])("ordinary inspection redacts host failures after a live snapshot exists (session=%s)", async session => {
+  let injected: unknown;
+  let entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const fail = async () => { entered.resolve(); await release.promise; throw injected; };
+  const f = await fixture(undefined, {}, { createResidentWorker: async () => ({
+    step: fail, activate: fail, close: async () => {},
+  }),
+    sessionTask: async () => { throw new Error("No task dispatch"); },
+    superviseSessionTask: async () => {}, retireSessionTask: async () => {},
+  });
+  cleanup.unshift(async () => { release.resolve(); });
+  const tools = inspectionTools(f), runTool = tools.find(tool => tool.name === "program_run")!;
+  const inspect = tools.find(tool => tool.name === "program_inspect")!;
+  const diagnostic = { type: "TypeError", message: "PRIVATE_WRONG_SOURCE", source_hash: "f".repeat(64),
+    location: { mapping: "unmapped" } };
+  const errors = [
+    new Error("PRIVATE_HOST_PATH_ENV_PROVIDER_NATIVE"),
+    { origin: "source_throw", trustedOrigin: false, sourceDiagnostic: diagnostic,
+      message: "PRIVATE_STRUCTURAL", stack: "PRIVATE_STACK" },
+    Object.assign(Object.create(ResidentWorkerFault.prototype), { origin: "source_throw",
+      sourceDiagnostic: diagnostic, message: "PRIVATE_PROTOTYPE", stack: "PRIVATE_STACK" }),
+    new ResidentWorkerFault("source_throw", false, diagnostic),
+  ];
+  for (const [index, error] of errors.entries()) {
+    entered = Promise.withResolvers<void>(); release = Promise.withResolvers<void>(); injected = error;
+    const started = await runTool.execute(`live-redacted-start-${index}`, { operation: "start", entry: "step",
+      name: f.program.name, version: f.program.version, args: null, initial_state: 0,
+      ...(session ? { session: { schema_version: 1 } } : {}) });
+    expect(started.isError).not.toBe(true);
+    await entered.promise;
+    const execution = f.store.latestRootExecution(f.run.run_id)!;
+    const before = await inspect.execute(`live-before-fault-${index}`, {
+      view: "execution", target: "current", program: { name: f.program.name, version: f.program.version },
+    });
+    expect(before.details).toMatchObject({ status: "running", resident: { status: "running" } });
+    release.resolve();
+    await until(f.store, f.run.run_id, () => f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!.ended_at !== null);
+    const reply = await inspect.execute(`live-redacted-inspect-${index}`, {
+      view: "execution", target: "latest", program: { name: f.program.name, version: f.program.version },
+    });
+    expect(reply.isError).not.toBe(true);
+    const text = reply.content.filter(entry => entry.type === "text").map(entry => entry.text).join("");
+    const visible = JSON.parse(text);
+    expect(visible).toMatchObject({ status: "failed", resident: { status: "failed",
+      cleanup: { worker: "closed", native: "retired" } } });
+    expect(visible.diagnostic.source_diagnostic).toBeUndefined();
+    expect(visible.resident.reason).toBe(session ? visible.diagnostic.message : `resident_step: ${visible.diagnostic.message}`);
+    expect(text).not.toContain("PRIVATE"); expect(text).not.toContain("stack");
+  }
+  expect(f.finiteCalls).toBe(0);
+});
+
+test.each([false, true])("ordinary inspection bounds source text without serializing hostile thrown objects (session=%s)", async session => {
+  const f = await fixture(undefined, {}, {
+    createResidentWorker: async (bundle, _budget, signal) => await residentProcess(bundle, signal),
+    sessionTask: async () => { throw new Error("No task dispatch"); },
+    superviseSessionTask: async () => {}, retireSessionTask: async () => {},
+  });
+  const tools = inspectionTools(f), runTool = tools.find(tool => tool.name === "program_run")!;
+  const inspect = tools.find(tool => tool.name === "program_inspect")!;
+  const cases = [
+    { body: `throw {message:"PRIVATE_THROWN_OBJECT",stack:"PRIVATE_STACK",
+        get name(){throw new Error("PRIVATE_GETTER");},toJSON(){throw new Error("PRIVATE_JSON");},
+        toString(){throw new Error("PRIVATE_COERCION");}};`,
+      type: "ThrownValue", message: "Generated program threw a non-error value (not serialized)" },
+    { body: `throw new Error("UNTRUSTED_AUTHORED_TEXT ".repeat(100));`,
+      type: "Error", message: "UNTRUSTED_AUTHORED_TEXT ".repeat(100).slice(0, 1000) },
+  ];
+  for (const [index, entry] of cases.entries()) {
+    const selected = await f.sources.register(f.run.run_id, { entry: "step", name: `bounded source ${index}`,
+      source: `export function activate(frame,state,intent){${entry.body}}
+        export function step(frame,state,intent){${entry.body}}`, card, dependencies: [] });
+    const started = await runTool.execute(`bounded-source-start-${index}`, { operation: "start", entry: "step",
+      name: selected.name, version: selected.version, args: null, initial_state: 0,
+      ...(session ? { session: { schema_version: 1 } } : {}) });
+    expect(started.isError).not.toBe(true);
+    const execution = f.store.latestRootExecution(f.run.run_id)!;
+    await until(f.store, f.run.run_id, () => f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!.ended_at !== null);
+    const reply = await inspect.execute(`bounded-source-inspect-${index}`, {
+      view: "execution", target: "latest", program: { name: selected.name, version: selected.version },
+    });
+    expect(reply.isError).not.toBe(true);
+    const text = reply.content.filter(entry => entry.type === "text").map(entry => entry.text).join("");
+    const visible = JSON.parse(text);
+    expect(visible).toMatchObject({ status: "failed", error: "Resident worker failed (source_throw).",
+      diagnostic: { source_diagnostic: { advisory: true, trusted_origin: false, origin: "source_throw",
+        diagnostic: { type: entry.type, message: entry.message, source_hash: execution.source_hash,
+          location: { mapping: "unmapped" } } } } });
+    expect(visible.resident.reason).not.toContain("UNTRUSTED_AUTHORED_TEXT");
+    expect(text).not.toContain("PRIVATE"); expect(text).not.toContain("stack");
+  }
+  expect(f.finiteCalls).toBe(0);
 });
 
 test("actual manager prepares both slow workers before retirement and discards shadow module globals", async () => {

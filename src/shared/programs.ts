@@ -6,7 +6,7 @@ import type {
   StrategyCard,
 } from "./contracts.ts";
 import type { LookaheadConfig } from "./planning.ts";
-import type { ControllerEvent, ResidentLimits, ResidentSnapshot } from "./resident.ts";
+import type { ControllerEvent, ResidentLimits, ResidentSnapshot, ResidentSourceAdvisory } from "./resident.ts";
 import type { ControlSessionConfig } from "./control-session.ts";
 
 export type ProgramEntry = "run" | "step" | "analyze" | "library";
@@ -197,7 +197,7 @@ interface SkillExecutionBase extends SkillRef {
   result: SkillResult | null;
   error: string | null;
   diagnostic?: { type: string; message: string; source_hash: string; location: { mapping: "unmapped" }; code?: string;
-    output?: ProgramOutputFailure };
+    output?: ProgramOutputFailure; source_diagnostic?: ResidentSourceAdvisory };
 }
 export type SkillExecutionView = SkillExecutionBase & (
   | { entry: "run"; limits: SkillLimits }

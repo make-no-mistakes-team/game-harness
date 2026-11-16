@@ -9,7 +9,7 @@ import { controllerInputFrameSchema, controllerInputSchema } from "../src/shared
 import { z } from "zod";
 import {
     GeneratedControllerResultValidationError, parseGeneratedResidentResult, programDiagnostic,
-    readProgramDiagnostic
+    ProgramExecutionError, readProgramDiagnostic
 } from "../src/server/program-diagnostics.ts";
 import { preparationFailure } from "../src/server/prepared-source-error.ts";
 import { ResidentWorkerFault, residentSourceAdvisory } from "../src/server/resident-worker-fault.ts";
@@ -76,14 +76,24 @@ test("live diagnostics retain only branded watchdog and source-failure categorie
   const hash = "a".repeat(64);
   for (const origin of ["watchdog", "source_throw"] as const) {
     const fault = new ResidentWorkerFault(origin, origin === "watchdog", origin === "source_throw" ? {
-      type: "TypeError", message: "PRIVATE_SOURCE_TEXT", source_hash: hash, location: { mapping: "unmapped" },
+      type: "TypeError", message: "Cannot read properties of undefined (reading 'x')", source_hash: hash, location: { mapping: "unmapped" },
     } : undefined);
     Reflect.set(fault, "message", "PRIVATE_HOST_TEXT");
     Reflect.set(fault, "origin", "PRIVATE_MUTATED_ORIGIN");
+    Reflect.set(fault, "sourceDiagnostic", { type: "Error", message: "PRIVATE_MUTATED_DIAGNOSTIC" });
     const diagnostic = programDiagnostic(fault, hash);
     expect(diagnostic).toEqual({ type: "ResidentWorkerFailure", code: `resident_${origin}`,
-      message: `Resident worker failed (${origin}).`, source_hash: hash, location: { mapping: "unmapped" } });
-    expect(readProgramDiagnostic(JSON.parse(JSON.stringify(diagnostic)), hash)).toEqual(diagnostic);
+      message: `Resident worker failed (${origin}).`, source_hash: hash, location: { mapping: "unmapped" },
+      ...(origin === "source_throw" ? { source_diagnostic: {
+        advisory: true, trusted_origin: false, origin: "source_throw", diagnostic: {
+          type: "TypeError", message: "Cannot read properties of undefined (reading 'x')",
+          source_hash: hash, location: { mapping: "unmapped" },
+        },
+      } } : {}),
+    });
+    // The finite-program wire reader does not establish resident fault custody.
+    const { source_diagnostic: _advisory, ...withoutAdvisory } = diagnostic;
+    expect(readProgramDiagnostic(JSON.parse(JSON.stringify(diagnostic)), hash)).toEqual(withoutAdvisory);
     expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE");
   }
   for (const error of [
@@ -96,6 +106,24 @@ test("live diagnostics retain only branded watchdog and source-failure categorie
     expect(diagnostic.code).toBeUndefined();
     expect(JSON.stringify(diagnostic)).not.toContain("PRIVATE");
   }
+});
+
+test("live source advice cannot cross source identities or mutate its branded diagnostic", () => {
+  const hash = "a".repeat(64);
+  const fault = new ResidentWorkerFault("source_throw", false, {
+    type: "Error", message: "Source assertion", source_hash: hash, location: { mapping: "unmapped" },
+  });
+  const diagnostic = programDiagnostic(fault, hash);
+  Reflect.set(diagnostic.source_diagnostic!.diagnostic, "message", "PRIVATE_PROJECTED_MUTATION");
+  expect(programDiagnostic(fault, hash).source_diagnostic?.diagnostic.message).toBe("Source assertion");
+  expect(programDiagnostic(fault, "b".repeat(64))).toEqual({
+    type: "ResidentWorkerFailure", code: "resident_source_throw", message: "Resident worker failed (source_throw).",
+    source_hash: "b".repeat(64), location: { mapping: "unmapped" },
+  });
+  const wireDiagnostic = { type: "ResidentWorkerFailure", code: "resident_source_throw",
+    message: "Fixed wire text", source_hash: hash, location: { mapping: "unmapped" as const },
+    source_diagnostic: programDiagnostic(fault, hash).source_diagnostic };
+  expect(programDiagnostic(new ProgramExecutionError(wireDiagnostic), hash).source_diagnostic).toBeUndefined();
 });
 
 test("actor-selected entries cannot exchange playing and pure-analysis authority or budgets", () => {

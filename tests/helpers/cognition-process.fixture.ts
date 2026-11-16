@@ -209,7 +209,10 @@ export async function retainFiniteExecutive(f: PassiveHostFixture): Promise<Skil
   return root;
 }
 
-export function processFixture(scenario = "passive"): ProcessFixture {
+export function processFixture(scenario = "passive", options: {
+  inference?: Pick<FakeSelectedSessionOwner, "createInferenceSession">;
+  ordinaryWorker?: boolean;
+} = {}): ProcessFixture {
   const f = passiveHostFixture();
   const goal = f.host.promptInput!();
   f.host.promptInput = () => ({ ...goal, prompt: scenario });
@@ -235,7 +238,10 @@ export function processFixture(scenario = "passive"): ProcessFixture {
       return child;
     },
   });
-  const client = new CognitionClient(f.store, f.owner, f.host, { workerPath, spawn: spawnOwned });
+  const client = new CognitionClient(f.store, options.inference ?? f.owner, f.host, {
+    workerPath: options.ordinaryWorker ? fileURLToPath(new URL("../../src/server/cognition-worker.ts", import.meta.url)) : workerPath,
+    spawn: spawnOwned,
+  });
   return { ...f, client, processes, closures, receipts,
     marker: (name: string): Promise<Json> => {
       if (values.has(name)) return Promise.resolve(values.get(name)!);

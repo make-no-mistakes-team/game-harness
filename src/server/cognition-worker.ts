@@ -13,6 +13,7 @@ import { InlineCognitionContext } from "./cognition-context.ts";
 import type { ContextOwner } from "./cognition-context.ts";
 import type { ContextCustodyTransfer, PassiveContextState } from "./cognition-context-custody.ts";
 import { CognitionWire, COGNITION_LIMITS } from "./cognition-wire.ts";
+import { projectCognitionEvidence } from "./cognition-evidence.ts";
 import { ReadonlyStore, type StoreReadLocation } from "./store-read.ts";
 import type { StoredRun } from "./store.ts";
 import type { StrategicOwnership, StrategicSpeculation } from "./cognition-ports.ts";
@@ -296,7 +297,7 @@ async function start(input: CognitionStart): Promise<void> {
       activeRequest = identity.request_id;
     },
     evidence: (kind, body) => {
-      if (observingSdk) enqueue({ kind: "sdk_evidence", evidence_kind: kind, body: JSON.parse(JSON.stringify(body)) as Json });
+      if (observingSdk) enqueue({ kind: "sdk_evidence", evidence_kind: kind, body: projectCognitionEvidence(kind, body) });
     },
     response: response => enqueue({ kind: "response", response: { ...response, calls: response.calls.map(call => ({ ...call, arguments: call.arguments as Json })) } }),
     beforeTool: async context => { restoreOriginalArguments(context); await flush(); },

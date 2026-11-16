@@ -48,6 +48,14 @@ and original tool arguments precede dispatch. Credential resolution and refresh
 remain owned by the host's selected-account inference session; private resolver
 traffic never enters ordinary metadata or operator publication.
 
+Diagnostic SDK event and preassembly-context copies replace image content parts
+with `image_reference` records: MIME type, base64 character count and SHA-256 of
+the original base64 text. Text, tool arguments and details remain intact. This
+avoids copying the same PNG into several bounded metadata events. It changes
+neither the live SDK data nor the authoritative final context. When evidence
+recording is enabled, the host captures that context before dispatch and retains
+exact image bytes and private PNG sidecars. Metadata and wire limits stay unchanged.
+
 Cognition preserves the selected local Agent's SDK transport configuration.
 It does not add a provider-session cache that would silently enable persistent
 WebSockets. Optional `beforeSdkFetch` admission runs before each actual SDK

@@ -1,13 +1,20 @@
 import { afterEach, expect, test, vi } from "bun:test";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { Agent } from "@oh-my-pi/pi-agent-core/agent";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import type { AssistantMessage, Context, ImageContent } from "@oh-my-pi/pi-ai";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import type { Json } from "../src/shared/contracts.ts";
+import type { CognitionEvidenceEvent } from "../src/server/cognition-ports.ts";
+import { COGNITION_LIMITS } from "../src/server/cognition-wire.ts";
+import { encodeNativeFramePng } from "../src/server/actor-frame-codec.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { StrategicPlanner } from "../src/server/strategic.ts";
 import { InlineCognitionContext } from "../src/server/cognition-context.ts";
 import * as monotonicClock from "../src/server/os-monotonic.ts";
+import { AcceptanceLoopbackInference, codexLifecycleFrames } from "./helpers/acceptance-loopback-inference.ts";
+import { nativeFrame } from "./helpers/native-frame.ts";
 import { deferred, eventLoopTurn, passiveHostFixture, processFixture, retainFiniteExecutive, type ProcessFixture } from "./helpers/cognition-process.fixture.ts";
 
 const cleanup: (() => void | Promise<void>)[] = [];
@@ -79,6 +86,131 @@ test("ordinary start owns a distinct real process and graceful close joins both 
   expect(f.owner.resolutions).toBe(0);
   expect(f.run.turns).toBe(0);
   f.client.reset();
+}, 10_000);
+
+test("ordinary SDK process retains large observe images at dispatch while duplicate diagnostics stay within metadata bounds", async () => {
+  // Deterministic RGB noise produces a real PNG whose duplicated SDK events
+  // exceed two MiB, while each original tool/dispatch frame remains below four.
+  const width = 640, height = 480, pixels = new Uint8Array(width * height * 4);
+  let noise = 0x13579bdf;
+  for (let offset = 0; offset < pixels.length; offset++) {
+    noise ^= noise << 13; noise ^= noise >>> 17; noise ^= noise << 5;
+    pixels[offset] = noise & 255;
+  }
+  const capturedAt = Date.now();
+  const { png } = await encodeNativeFramePng(nativeFrame({ width, height, pixels, capturedAt }), capturedAt);
+  const image: ImageContent = { type: "image", mimeType: "image/png", data: png.toString("base64") };
+  expect(image.data.length).toBeGreaterThan(COGNITION_LIMITS.metadataBytes / 2);
+  expect(image.data.length).toBeLessThan(COGNITION_LIMITS.metadataBytes);
+  const imageReference = { type: "image_reference", mimeType: "image/png", base64_chars: image.data.length,
+    base64_sha256: createHash("sha256").update(image.data).digest("hex") };
+  const literal = { type: "image", mimeType: "image/png", data: "literal-detail-not-an-sdk-content-part" };
+  const arguments_ = {};
+  const providerBodies: Record<string, unknown>[] = [];
+  const model = getBundledModels("openai-codex")[0];
+  if (!model) throw new Error("Offline descriptor required by the infrastructure fixture");
+  const inference = new AcceptanceLoopbackInference(model, ({ ordinal, body }) => {
+    providerBodies.push(body);
+    if (ordinal > 2) throw new Error("No retry or third provider request is authorized");
+    const frames = codexLifecycleFrames(ordinal, ordinal === 1
+      ? { call: { id: "observe-image", name: "observe", arguments: arguments_ } }
+      : { text: "Offline image observation received; finite planning complete." });
+    return { iterator: (async function* () { yield frames; })() };
+  });
+  let sessions = 0;
+  const f = processFixture("sdk_image_diagnostics", { ordinaryWorker: true, inference: {
+    createInferenceSession: options => { sessions++; return inference.createInferenceSession(options); },
+  } });
+  cleanup.push(async () => { await f.close(); await inference.close(); });
+  f.state.speculative = false;
+  const evidence: CognitionEvidenceEvent[] = [];
+  const dispatches: Context[] = [];
+  const sidecarImages: Buffer[] = [];
+  const settled = deferred<"finished" | "paused">();
+  const pause = f.host.pause;
+  f.host.pause = (message, cause) => { pause(message, cause); settled.resolve("paused"); };
+  const unsubscribe = f.store.subscribe(event => {
+    if (event.type === "scheduler.turn_finished") settled.resolve("finished");
+  });
+  cleanup.push(unsubscribe);
+  f.host.cognitionEvidence = { enabled: () => true, emit: event => { evidence.push(event); } };
+  f.host.requestAdmission = {
+    reserve: () => {}, transportEnded: () => {}, drained: () => {},
+    beforeDispatch: async ({ context }) => {
+      dispatches.push(structuredClone(context));
+      // This is the existing host-side sidecar opportunity before dispatch, not
+      // a diagnostic reconstruction: consume the original typed SDK image.
+      for (const message of context.messages) {
+        if (!Array.isArray(message.content)) continue;
+        for (const part of message.content)
+          if (part.type === "image") sidecarImages.push(Buffer.from(part.data, "base64"));
+      }
+    },
+  };
+  let toolCalls = 0;
+  const content = [{ type: "text" as const, text: "Fresh offline observation" }, image];
+  const details = { image_metadata: { mode: "actor", width, height }, literal_image: literal };
+  f.tools.push({ name: "observe", label: "observe", description: "Generic offline image observation",
+    parameters: z.toJSONSchema(z.object({}).strict()),
+    execute: async (_id, raw) => {
+      expect(raw).toEqual(arguments_); toolCalls++;
+      return { content, details };
+    },
+  });
+  await f.client.start(1);
+  f.client.wake("preflight_ready");
+  expect(await settled.promise).toBe("finished");
+  await f.client.close();
+  expect(f.pauses).toEqual([]);
+  expect(toolCalls).toBe(1); expect(providerBodies).toHaveLength(2);
+  expect(dispatches).toHaveLength(2); expect(f.run.turns).toBe(2); expect(sessions).toBe(1);
+  const actualCall = dispatches[1]!.messages.flatMap(message => message.role === "assistant" ? message.content : [])
+    .find(part => part.type === "toolCall" && part.name === "observe");
+  if (!actualCall || actualCall.type !== "toolCall") throw new Error("Original SDK observe call is missing");
+  expect(actualCall.arguments).toEqual(arguments_);
+  const actualResult = dispatches[1]!.messages.find(message => message.role === "toolResult");
+  expect(actualResult?.content).toEqual(content);
+  expect(actualResult).toMatchObject({ toolCallId: actualCall.id, toolName: "observe", details });
+  expect(sidecarImages).toHaveLength(1); expect(sidecarImages[0]!.equals(png)).toBe(true);
+  expect(JSON.stringify(providerBodies[1])).toContain(`data:image/png;base64,${image.data}`);
+  const finalContexts = evidence.filter(event => event.kind === "final_sdk_visible_context_not_wire_payload");
+  expect(finalContexts.map(event => event.body)).toEqual(dispatches as unknown as Json[]);
+  expect(JSON.stringify(finalContexts[1]!.body)).toContain(image.data);
+
+  const diagnostics = evidence.filter(event => event.kind === "visible_agent_event" ||
+    event.kind === "sdk_context_before_request_assembly_not_wire_payload");
+  for (const type of ["tool_execution_end", "message_start", "message_end"]) {
+    const copies = diagnostics.filter(event => event.kind === "visible_agent_event" &&
+      (event.body as Record<string, Json>).type === type);
+    expect(copies).toContainEqual(expect.objectContaining({ body: expect.objectContaining(type === "tool_execution_end"
+      ? { toolCallId: actualCall.id, result: { content: [content[0], imageReference], details } }
+      : { message: expect.objectContaining({ role: "toolResult", toolCallId: actualCall.id, content: [content[0], imageReference], details }) }) }));
+  }
+  expect(diagnostics).toContainEqual(expect.objectContaining({
+    kind: "sdk_context_before_request_assembly_not_wire_payload",
+    body: expect.objectContaining({ messages: expect.arrayContaining([
+      expect.objectContaining({ role: "toolResult", toolCallId: actualCall.id, content: [content[0], imageReference], details }),
+    ]) }),
+  }));
+  expect(diagnostics).toContainEqual(expect.objectContaining({ kind: "visible_agent_event",
+    body: expect.objectContaining({ type: "tool_execution_start", toolCallId: actualCall.id, args: arguments_ }) }));
+  expect(diagnostics).toContainEqual(expect.objectContaining({ kind: "visible_agent_event",
+    body: expect.objectContaining({ type: "message_end", message: expect.objectContaining({
+      role: "assistant", content: expect.arrayContaining([
+        expect.objectContaining({ type: "toolCall", id: actualCall.id, name: "observe", arguments: arguments_ }),
+      ]),
+    }) }) }));
+  const diagnosticJson = JSON.stringify(diagnostics);
+  expect(diagnosticJson).not.toContain(image.data);
+  expect(Buffer.byteLength(diagnosticJson)).toBeLessThan(COGNITION_LIMITS.metadataBytes);
+  const events = f.store.eventsAfter(f.run.run_id, 0, 200);
+  expect(events.filter(event => event.type === "model.tool_finished")).toHaveLength(1);
+  expect(events.some(event => event.type === "cognition.rpc_rejected" || event.type === "cognition.contained" ||
+    event.type === "model.request_unsettled")).toBe(false);
+  expect(f.processes).toHaveLength(1); expect(f.processes[0]!.pid).not.toBe(process.pid);
+  expect(f.receipts).toEqual([{ code: 0, signal: null }]);
+  expect(f.processes[0]!.stdout?.readableEnded).toBe(true);
+  expect(f.processes[0]!.stdin?.destroyed).toBe(true);
 }, 10_000);
 
 test("actual child death pauses the default client without model retry, process restart or embedded fallback", async () => {

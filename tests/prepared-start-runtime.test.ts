@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentEvent, AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type { AuthState, GameBridge, GameState, Json } from "../src/shared/contracts.ts";
 import type { ResidentWorker } from "../src/shared/resident.ts";
@@ -11,6 +12,8 @@ import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
 import { controlSessionConfigSchema } from "../src/shared/control-session.ts";
 import { Store } from "../src/server/store.ts";
 import { Runtime } from "../src/server/runtime.ts";
+import { CognitionClient } from "../src/server/cognition-client.ts";
+import type { StrategicRequestAdmission } from "../src/server/strategic.ts";
 import type { AuthManager } from "../src/server/auth.ts";
 import type { SandboxService } from "../src/server/sandbox.ts";
 import type { PreparedSourceCandidate } from "../src/server/prepared-source-contract.ts";
@@ -18,13 +21,19 @@ import { PreparedSourcebook } from "../src/server/prepared-sourcebook.ts";
 import { adapterCompatibility } from "../src/server/adapter-contract.ts";
 import { emptyRunUsage, recordCall } from "../src/server/usage.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
+import { AcceptanceLoopbackInference, codexLifecycleFrames } from "./helpers/acceptance-loopback-inference.ts";
 import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 
 const card = { purpose: "First-root lifecycle fixture", applicability: "Synthetic boundaries only",
   method: "Prepared worker before cloud readiness", reason: "Keep control independent", limitations: "No model or native gameplay claim" };
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanups.splice(0)) await close(); });
-async function fixture() {
+async function fixture(mainDecisionWindow?: { maxRequests: number }, ordinary?: {
+  inference: Pick<AuthManager, "createInferenceSession">;
+  modelId: string;
+  requestAdmission: StrategicRequestAdmission;
+  paused?(): void;
+}) {
   const directory = mkdtempSync(join(tmpdir(), "prepared-runtime-")), store = new Store(directory);
   const adapter = minecraftTestAdapter(), observation = minecraftObservationFixture(adapter);
   const compatibility = adapterCompatibility(adapter.descriptor, adapter.schemas);
@@ -36,6 +45,7 @@ async function fixture() {
   const cloud = Promise.withResolvers<Agent>(), cloudOpening = Promise.withResolvers<void>();
   void cloud.promise.catch(() => {});
   const submitted = Promise.withResolvers<void>(), workerClosed = Promise.withResolvers<void>();
+  const inputWaiters = new Set<() => void>();
   let frameSequence = 0, inputCount = 0, closeCount = 0, activations = 0, takes = 0, ordinaryCompiles = 0;
   let sourceHashAtTake: string | null = null;
   const sample = async () => {
@@ -64,6 +74,8 @@ async function fixture() {
         renew: async () => {}, submit(_frame, input) {
           if (retired || input.kind !== "world") throw new Error("Invalid fixture producer");
           const current = ++sequence; inputCount++; submitted.resolve();
+          for (const resolve of inputWaiters) resolve();
+          inputWaiters.clear();
           queueMicrotask(() => applied({ controller_generation: generation, sequence: current, ordered_edge_prefix: 0,
             applied_native_tick: 1000 + frameSequence, applied_native_ns: String(Math.round(performance.now() * 1e6)),
             held: { ...input.held }, applied_pose: { yaw_radians: 0, pitch_radians: 0 }, input_application: "confirmed", reason: null }));
@@ -76,14 +88,19 @@ async function fixture() {
       };
     } };
   const authState: AuthState = { authenticated: true, status: "ready", provider: "openai-codex", account_label: null,
-    models: [{ id: "fixture-model", name: "Fixture", provider: "openai-codex", context_window: null, input_modalities: ["image"] }], login: null, error: null };
+    models: [{ id: ordinary?.modelId ?? "fixture-model", name: "Fixture", provider: "openai-codex", context_window: null, input_modalities: ["image"] }], login: null, error: null };
   const auth = { snapshot: () => authState, createAgent: async () => { cloudOpening.resolve(); return await cloud.promise; },
+    createInferenceSession: ordinary?.inference.createInferenceSession.bind(ordinary.inference),
     releaseAgent: async () => {} } as unknown as AuthManager;
   const sandbox = { snapshot: () => ({ status: "ready", image: "fixture", error: null }),
     createResidentWorker: async () => { ordinaryCompiles++; throw new Error("Prepared root must not compile again after join"); },
     createResidentAnalysisWorker: async () => { throw new Error("No fixture analysis"); },
     runSkill: async () => { throw new Error("No legacy root"); } } as unknown as SandboxService;
-  const runtime = new Runtime(store, auth, game, sandbox, () => {}, { adapter, strategicAgentFactory: auth });
+  let runtime!: Runtime;
+  runtime = new Runtime(store, auth, game, sandbox, () => {
+    if (ordinary?.paused && runtime?.snapshot()?.status === "paused") ordinary.paused();
+  }, { adapter, mainDecisionWindow,
+    ...(ordinary ? { requestAdmission: ordinary.requestAdmission } : { strategicAgentFactory: auth }) });
   let closed = false;
   const close = async () => {
     if (closed) return;
@@ -103,13 +120,14 @@ async function fixture() {
   const usage = emptyRunUsage(); recordCall(usage, "authoring"); recordCall(usage, "authoring");
   const id = crypto.randomUUID();
   const candidate: PreparedSourceCandidate = { preparation_id: id, request: { request_id: crypto.randomUUID(), task: "Prepared first-root software proof",
-    goal: adapter.goals.find(goal => goal.goal_id === "custom")!, model_id: "fixture-model" }, contract_hash: compatibility.compatibility_hash,
+    goal: adapter.goals.find(goal => goal.goal_id === "custom")!, model_id: ordinary?.modelId ?? "fixture-model" }, contract_hash: compatibility.compatibility_hash,
     artifact_sha256: "a".repeat(64), sources: book.sources(root), root, bundle, initial_state: null, intent: null,
     limits: { ...DEFAULT_RESIDENT_LIMITS }, session: controlSessionConfigSchema.parse({ schema_version: 1 }), usage,
     deadline_host_ms: performance.now() + 300000, assertCurrent() {}, setPhase() {},
     takeWorker(runId) { takes++; sourceHashAtTake = store.skillExecution(runId, { start_key: `prepared_${id}` })?.source_hash ?? null; return worker; },
     transferClosed() { throw new Error("No launch coordinator owns this software-only fixture"); } };
   return { runtime, store, candidate, cloud, submitted: submitted.promise, workerClosed: workerClosed.promise, cloudOpening: cloudOpening.promise,
+    nextInput: () => new Promise<void>(resolve => { inputWaiters.add(resolve); }),
     counts: () => ({ inputCount, closeCount, activations, takes, ordinaryCompiles, sourceHashAtTake }),
     close };
 }
@@ -160,3 +178,138 @@ test("prepared local control does not suppress Main's initial ordinary task deci
     expect(f.counts()).toMatchObject({ activations: 1, takes: 1, ordinaryCompiles: 0 });
   } finally { await f.close(); await starting; }
 }, 10000);
+
+test("ordinary Cognition process, auth and transport fully drain before the same finite session accepts further local submissions until Stop", async () => {
+  const model = getBundledModels("openai-codex")[0];
+  if (!model) throw new Error("Offline descriptor required by the infrastructure fixture");
+  const releaseResponse = Promise.withResolvers<void>(), ownershipDrained = Promise.withResolvers<readonly string[]>();
+  const reservations: string[] = [], dispatches: string[] = [], fetches: string[] = [];
+  const transportEnds: { id: string; natural: boolean }[] = [];
+  let providerRequests = 0, providerDrained = false, authClosed = false, sessions = 0;
+  const inference = new AcceptanceLoopbackInference(model, async ({ ordinal }) => {
+    providerRequests++;
+    if (ordinal !== 1) throw new Error("No provider request may follow the closed Main window");
+    await releaseResponse.promise;
+    return { iterator: (async function* () {
+      try { yield codexLifecycleFrames(ordinal, { text: "Finite administrative decision complete." }); }
+      finally { providerDrained = true; }
+    })() };
+  });
+  const f = await fixture({ maxRequests: 1 }, {
+    modelId: inference.model.id,
+    inference: { createInferenceSession: options => {
+      sessions++;
+      const session = inference.createInferenceSession(options);
+      return { ...session, close: async () => { await session.close(); authClosed = true; } };
+    } },
+    requestAdmission: {
+      reserve: id => { reservations.push(id); },
+      beforeDispatch: async ({ identity }) => { dispatches.push(identity.request_id); },
+      beforeSdkFetch: async ({ identity }) => { fetches.push(identity.request_id); },
+      transportEnded: (id, natural) => { transportEnds.push({ id, natural }); },
+      drained: ids => { ownershipDrained.resolve([...ids]); },
+    },
+  });
+  const deferred = Promise.withResolvers<void>();
+  const off = f.store.subscribe(event => {
+    if (event.type === "scheduler.turn_deferred") deferred.resolve();
+    if (event.type === "scheduler.turn_failed") deferred.reject(new Error("Main request closure retired the eligible executive"));
+  });
+  const starting = f.runtime.startPreparedRun(f.candidate);
+  try {
+    await f.submitted;
+    const before = f.runtime.snapshot()!, original = f.store.latestRootExecution(before.run_id)!;
+    if (original.entry !== "step") throw new Error("Prepared-runtime proof requires the actual finite executive");
+    const authority = { execution_id: original.execution_id, source_hash: original.source_hash,
+      deadline_at: original.deadline_at, session: original.session, limits: original.limits,
+      run_generation: original.run_generation, session_id: original.session_id, native_boot_id: original.native_boot_id };
+    releaseResponse.resolve(); await starting; await deferred.promise;
+    const drainedRequests = await ownershipDrained.promise;
+    expect(authClosed).toBe(true); expect(providerDrained).toBe(true);
+    expect(drainedRequests).toEqual(reservations);
+    expect(reservations).toHaveLength(1); expect(dispatches).toEqual(reservations);
+    expect(fetches).toEqual(reservations);
+    expect(transportEnds).toEqual([{ id: reservations[0]!, natural: true }]);
+    const cognition = Reflect.get(f.runtime, "strategic") as CognitionClient;
+    expect(cognition).toBeInstanceOf(CognitionClient);
+    expect(cognition.snapshot()).toMatchObject({ pid: null, turn_id: null, request_id: null, context_id: null });
+    const inputsAfterDrain = f.counts().inputCount;
+    await f.nextInput();
+    expect(f.counts().inputCount).toBeGreaterThan(inputsAfterDrain);
+    expect(f.runtime.snapshot()).toMatchObject({ status: "running", model_status: "idle",
+      world_id: before.world_id, session_id: before.session_id, epoch: before.epoch, life_id: before.life_id });
+    expect(f.store.latestRootExecution(before.run_id)).toMatchObject({ ...authority, status: "running", ended_at: null });
+    expect(f.counts()).toMatchObject({ activations: 1, takes: 1, ordinaryCompiles: 0, closeCount: 0 });
+    expect(providerRequests).toBe(1); expect(sessions).toBe(1);
+    const events = f.store.eventsAfter(before.run_id, 0, 500);
+    const started = events.find(event => event.type === "cognition.started")?.details as { worker_pid: number } | undefined;
+    expect(started?.worker_pid).toBeDefined(); expect(started?.worker_pid).not.toBe(process.pid);
+    expect(events.some(event => event.type === "cognition.contained" || event.type === "scheduler.turn_failed")).toBe(false);
+    expect(events.filter(event => event.type === "scheduler.decision_window_closed").map(event => event.details))
+      .toEqual([{ outcome: "decision_window_closed", reason: "request_limit", admitted_requests: 1, max_requests: 1,
+        automatic_retry: false, physical_authority_renewed: false }]);
+    expect(events.find(event => event.type === "scheduler.turn_deferred")?.details)
+      .toMatchObject({ reason: "request_limit", root_execution_id: original.execution_id,
+        original_root_deadline_at: original.deadline_at, automatic_retry: false });
+    await f.runtime.control(before.run_id, "stop");
+    expect(f.runtime.snapshot()?.status).toBe("stopped");
+    expect(f.counts().closeCount).toBe(1); expect(providerRequests).toBe(1);
+  } finally { releaseResponse.resolve(); off(); await f.close(); await starting; await inference.close(); }
+}, 10_000);
+
+test("a final-slot real provider failure physically pauses Runtime instead of preserving its executive as normal budget expiry", async () => {
+  const model = getBundledModels("openai-codex")[0];
+  if (!model) throw new Error("Offline descriptor required by the infrastructure fixture");
+  const releaseResponse = Promise.withResolvers<void>(), paused = Promise.withResolvers<void>();
+  const reservations: string[] = [], drained: string[][] = [];
+  let requests = 0, providerDrained = false, authClosed = false;
+  const inference = new AcceptanceLoopbackInference(model, async ({ ordinal }) => {
+    requests++;
+    if (ordinal !== 1) throw new Error("A provider failure must not admit another Main request");
+    await releaseResponse.promise;
+    return { iterator: (async function* () {
+      try {
+        yield `data: ${JSON.stringify({ type: "response.failed", response: { id: "failed-final-admission",
+          status: "failed", error: { code: "server_error", message: "Controlled administrative provider failure" } } })}\n\n`;
+      } finally { providerDrained = true; }
+    })() };
+  });
+  const f = await fixture({ maxRequests: 1 }, {
+    modelId: inference.model.id,
+    inference: { createInferenceSession: options => {
+      const session = inference.createInferenceSession(options);
+      return { ...session, close: async () => { await session.close(); authClosed = true; } };
+    } },
+    requestAdmission: {
+      reserve: id => { reservations.push(id); },
+      transportEnded: () => {},
+      drained: ids => { drained.push([...ids]); },
+    },
+    paused: () => paused.resolve(),
+  });
+  const starting = f.runtime.startPreparedRun(f.candidate);
+  try {
+    await f.submitted;
+    const run = f.runtime.snapshot()!, original = f.store.latestRootExecution(run.run_id)!;
+    expect(original).toMatchObject({ status: "running", ended_at: null });
+    releaseResponse.resolve(); await starting; await paused.promise;
+    expect(f.runtime.snapshot()).toMatchObject({ status: "paused", operator: { pause_cause: "provider_failure" } });
+    expect(f.counts().closeCount).toBe(1);
+    const retired = f.store.latestRootExecution(run.run_id)!;
+    expect(retired.status).not.toBe("running"); expect(retired.ended_at).not.toBeNull();
+    expect(retired.deadline_at).toBe(original.deadline_at);
+    expect(providerDrained).toBe(true); expect(authClosed).toBe(true);
+    expect(reservations).toHaveLength(1); expect(drained.flat()).toEqual(reservations);
+    const cognition = Reflect.get(f.runtime, "strategic") as CognitionClient;
+    expect(cognition.snapshot()).toMatchObject({ pid: null, fenced: true, closing: false });
+    cognition.wake("resident_attention"); cognition.wake("goal_review");
+    await cognition.close();
+    const events = f.store.eventsAfter(run.run_id, 0, 500);
+    expect(events.some(event => event.type === "scheduler.turn_deferred")).toBe(false);
+    expect(requests).toBe(1);
+    const inputsAtPause = f.counts().inputCount;
+    await f.runtime.control(run.run_id, "stop");
+    expect(f.runtime.snapshot()?.status).toBe("stopped");
+    expect(f.counts().inputCount).toBe(inputsAtPause); expect(requests).toBe(1);
+  } finally { releaseResponse.resolve(); await f.close(); await starting; await inference.close(); }
+}, 10_000);

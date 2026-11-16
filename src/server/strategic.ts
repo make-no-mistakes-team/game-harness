@@ -35,6 +35,8 @@ import { HOST_MONOTONIC_CLOCK_ID } from "./performance.ts";
 import { controllerEventSchema } from "../shared/resident.ts";
 import { AUTHORING_CANCELLATION_REASONS } from "../shared/strategic-cancellation.ts";
 import { CUSTOM_TASK_COMPLETION_GUIDANCE } from "./runtime-prompt.ts";
+import { MainDecisionWindow, retainedFiniteExecutive, type MainDecisionWindowOptions,
+  type ClosedMainDecisionWindow } from "./main-decision-window.ts";
 
 const COALESCE_MS = 100;
 type ResidentAttentionOmission = { count: number; after_event_seq: number; through_event_seq: number };
@@ -116,6 +118,7 @@ export interface StrategicRequestAdmission {
 }
 
 export interface StrategicHost {
+  mainDecisionWindow?: MainDecisionWindowOptions;
   run(): StoredRun | null;
   generation(): number;
   assertCurrent(generation: number, epoch?: number): StoredRun;
@@ -337,6 +340,12 @@ export class StrategicPlanner {
   private turnId = "";
   private turnCancellation: { id: string; cancel(): void } | null = null;
   private contextObservation: Pick<ObservationV3, "profile_id" | "profile_configuration_hash"> | null = null;
+  private readonly mainDecisionWindow: MainDecisionWindow | null;
+  private decisionWindowRunId: string | null = null;
+  private decisionWindowClosed: ClosedMainDecisionWindow | null = null;
+  private decisionWindowReported = false;
+  private hostAdmissionFailed = false;
+  private requestBoundaryPending = false;
   private readonly eligibleTools = new Map<string, { name: string; arguments: unknown; authority?: () => void }>();
 
   constructor(
@@ -347,6 +356,8 @@ export class StrategicPlanner {
   ) {
     this.retainedContext = options.context ?? new StrategicContextClient(store.readLocation());
     this.ownership = options.ownership ?? {};
+    this.mainDecisionWindow = host.mainDecisionWindow && !this.ownership.decisionWindowState
+      ? new MainDecisionWindow(host.mainDecisionWindow) : null;
   }
 
   private timingNow(): number { return this.ownership.timing?.now() ?? performance.now(); }
@@ -394,6 +405,32 @@ export class StrategicPlanner {
     this.eligibleTools.clear();
   }
 
+  private async reconcileDecisionWindow(run: StoredRun): Promise<void> {
+    if (this.decisionWindowRunId !== run.run_id) {
+      this.decisionWindowRunId = run.run_id;
+      this.decisionWindowClosed = null;
+      this.decisionWindowReported = false;
+    }
+    const state = this.ownership.decisionWindowState
+      ? await this.ownership.decisionWindowState() : this.mainDecisionWindow?.state(run.run_id);
+    if (state?.outcome === "decision_window_closed") this.decisionWindowClosed = state;
+  }
+
+  private recordDecisionWindowClosed(run: StoredRun): void {
+    if (!this.decisionWindowClosed || this.decisionWindowReported) return;
+    this.decisionWindowReported = true;
+    clearTimeout(this.attentionTimer);
+    clearTimeout(this.idleTimer);
+    clearTimeout(this.wakeTimer);
+    this.attentionTimer = this.idleTimer = this.wakeTimer = undefined;
+    this.wakeReasons.clear();
+    this.store.event(run.run_id, "scheduler.decision_window_closed",
+      "Host Main logical request window is closed; no further inference is admitted", {
+        ...this.decisionWindowClosed, automatic_retry: false, physical_authority_renewed: false,
+      });
+    this.host.persist();
+  }
+
   async start(generation: number): Promise<void> {
     // Retaining an old provider request while replacing its Agent would give
     // two request owners. Release its entire authenticated scope first.
@@ -406,6 +443,15 @@ export class StrategicPlanner {
         "Strategic startup was superseded",
       );
     const run = this.host.assertCurrent(generation);
+    await this.reconcileDecisionWindow(run);
+    if (this.decisionWindowClosed) {
+      this.recordDecisionWindowClosed(run);
+      const retained = retainedFiniteExecutive(this.store, run, generation, this.host.programPending());
+      run.model_status = retained ? "idle" : "error";
+      this.host.persist();
+      if (!retained) this.host.pause("The closed Main decision window has no valid finite executive", "deadline");
+      return;
+    }
     this.retainedContext.open();
     this.fenced = false;
     const opening = (async () => {
@@ -689,6 +735,15 @@ export class StrategicPlanner {
         if (!signal?.aborted && this.current(run, generation)) selectPhase();
       });
       agent.setBeforeModelCall(async (_context, signal) => {
+        const finiteMain = this.host.mainDecisionWindow !== undefined;
+        if (finiteMain && (this.requestBoundaryPending || this.request && !this.request.terminalReceived)) {
+          this.hostAdmissionFailed = true;
+          run.model_status = "error";
+          this.host.pause("Main cognition violated its single-flight request ownership", "safety");
+          throw new RuntimeFault("conflict", "Main model request boundaries must be serialized");
+        }
+        if (finiteMain) this.requestBoundaryPending = true;
+        try {
         this.ownership.evidence?.("sdk_context_before_request_assembly_not_wire_payload", _context);
         const stop = (reason: string) => {
           this.gateReason = reason;
@@ -730,10 +785,27 @@ export class StrategicPlanner {
           Date.now() >= this.turnDeadline
         )
           return stop("Finite strategic call allowance reached");
+        await this.reconcileDecisionWindow(run);
+        if (this.hostAdmissionFailed) return stop("Host Main request admission was fenced");
+        if (signal?.aborted || !this.current(run, generation)) return stop("Run authority revoked");
+        if (this.decisionWindowClosed)
+          return stop("Host Main decision window closed: request_limit");
         this.gateReason = null;
         const requestId = randomUUID();
-        try { this.host.requestAdmission?.reserve(requestId, agent.state.model); }
-        catch { return stop("The finite registered study request allowance or ownership gate refused admission"); }
+        try {
+          const reserve = () => this.host.requestAdmission?.reserve(requestId, agent.state.model);
+          if (this.mainDecisionWindow) this.mainDecisionWindow.reserve(run.run_id, requestId, reserve);
+          else reserve();
+        }
+        catch (error) {
+          if (this.host.mainDecisionWindow) {
+            this.hostAdmissionFailed = true;
+            run.model_status = "error";
+            this.host.pause("The host Main request reservation failed; no inference or new authority is admitted", "safety");
+            throw error;
+          }
+          return stop("The finite registered study request allowance or ownership gate refused admission");
+        }
         if (this.host.requestAdmission) this.admittedRequests.add(requestId);
         if (authoring) {
           authoring.calls++;
@@ -786,6 +858,9 @@ export class StrategicPlanner {
           },
         );
         this.host.persist();
+        } finally {
+          if (finiteMain) this.requestBoundaryPending = false;
+        }
       });
       agent.beforeToolCall = async (context, signal) => {
         preserveRuntimeToolArguments(context);
@@ -1096,7 +1171,7 @@ export class StrategicPlanner {
       );
     const run = this.host.run();
     const generation = this.host.generation();
-    if (!run || !this.current(run, generation))
+    if (!run || !this.current(run, generation) || this.decisionWindowClosed)
       throw new RuntimeFault(
         "stale_context",
         "Strategic attention authority is closed",
@@ -1114,7 +1189,7 @@ export class StrategicPlanner {
 
   wake(reason: string): void {
     const run = this.host.run();
-    if (!run || !this.current(run, this.host.generation())) return;
+    if (!run || !this.current(run, this.host.generation()) || this.decisionWindowClosed) return;
     // Unsuccessful outcomes revoke inactive authoring before fresh strategy.
     this.reconcileAuthoring();
     if (this.host.programPending() && !Object.hasOwn(MEANINGFUL_WAKES, reason))
@@ -1274,7 +1349,8 @@ export class StrategicPlanner {
       this.idleTimer ||
       !this.agent ||
       !this.wakeReasons.size ||
-      this.fenced
+      this.fenced ||
+      this.decisionWindowClosed
     )
       return;
     const window = this.reconcileAuthoring();
@@ -1306,7 +1382,8 @@ export class StrategicPlanner {
           await this.ownership.flush?.();
           await this.ownership.endTurn?.(this.turnId);
           if (this.turn === turn) this.turn = null;
-          this.schedule();
+          if (this.decisionWindowClosed && !this.ownership.decisionWindowState) await this.close();
+          else this.schedule();
         })
         .catch(() => {});
     }, COALESCE_MS);
@@ -1379,6 +1456,7 @@ export class StrategicPlanner {
     this.turnToolCalls = 0;
     this.providerFailed = false;
     this.providerAborted = false;
+    this.hostAdmissionFailed = false;
     this.gateReason = null;
     this.request = null;
     this.rejectedResponse = null;
@@ -1650,9 +1728,12 @@ export class StrategicPlanner {
           Object.assign(prompt, { response_budget_feedback: correction });
         }
       }
+      if (this.hostAdmissionFailed) return;
       if (Date.now() >= this.turnDeadline) deadlineReached = true;
+      await this.reconcileDecisionWindow(run);
     } catch (error) {
       if (!this.current(run, generation) || run.status !== phase || this.fenceRevision !== fenceRevision) return;
+      if (this.hostAdmissionFailed) return; // Already safety-paused; never invent a provider failure or success.
       if (Date.now() >= this.turnDeadline || performance.now() >= historyOptions.deadlineHostMs)
         deadlineReached = true;
       if (this.current(run, generation) && !deadlineReached) {
@@ -1687,7 +1768,7 @@ export class StrategicPlanner {
         this.endAuthoring(authoring, "root_settled", false);
       // Confirm canceled transport release before any queued signal can obtain
       // this single owner. This never touches the playing root.
-      if (this.authoringEnded || deadlineReached) {
+      if (this.authoringEnded || deadlineReached || this.decisionWindowClosed) {
         const drains = [...this.streamDrains.values()];
         await Promise.all(drains.flatMap(stream => [stream.close(), stream.drained]));
       }
@@ -1706,6 +1787,7 @@ export class StrategicPlanner {
       await this.ownership.flush?.();
     }
     if (!this.current(run, generation)) return;
+    this.recordDecisionWindowClosed(run);
     if (review) {
       run.model_status = "idle";
       this.store.event(run.run_id, "scheduler.review_finished", "Bounded effect-free post-goal review settled; candidates are not measured improvements", {
@@ -1727,29 +1809,19 @@ export class StrategicPlanner {
       this.host.persist();
       return;
     }
-    if (deadlineReached && !this.providerFailed && !this.providerAborted &&
-      !this.authoringEnded && this.turnCalls > 0) {
-      const root = this.store.latestRootExecution(run.run_id);
-      const continuing = this.host.programPending() && root?.entry === "step" && root.session &&
-        root.status === "running" && root.ended_at === null &&
-        root.parent_execution_id === null && root.root_execution_id === root.execution_id &&
-        root.run_generation === generation && root.world_id === run.world_id &&
-        root.session_id === run.session_id && root.epoch === run.epoch &&
-        root.life_id !== null && root.life_id === run.life_id &&
-        root.native_boot_id !== null && root.native_boot_id === run.native_boot_id &&
-        root.space_epoch !== null && root.space_epoch === run.space_epoch &&
-        root.compatibility_hash === run.compatibility_hash && root.source_hash !== null &&
-        root.resident?.status === "running" && typeof root.resident.processed_frame_seq === "number" &&
-        root.resident.processed_frame_seq > 0 &&
-        root.resident.cleanup.worker === "open" && root.resident.cleanup.native === "open" &&
-        Date.parse(root.deadline_at) > Date.now();
-      if (continuing) {
+    if ((deadlineReached || this.decisionWindowClosed) && !this.providerFailed && !this.providerAborted &&
+      (this.decisionWindowClosed || !this.authoringEnded && this.turnCalls > 0)) {
+      const root = retainedFiniteExecutive(this.store, run, generation, this.host.programPending());
+      if (root) {
         run.model_status = "idle";
         this.store.event(run.run_id, "scheduler.turn_deferred",
           "Finite Main window expired; existing scoped executive authority remains unchanged", {
             turn_id: turnId, root_execution_id: root.execution_id, source_hash: root.source_hash,
             original_root_deadline_at: root.deadline_at, calls: this.turnCalls, tools: this.turnToolCalls,
-            deadline_reached: true, provider_failed: false, provider_aborted: false,
+            deadline_reached: deadlineReached, provider_failed: false, provider_aborted: false,
+            ...(this.decisionWindowClosed ? { reason: "request_limit",
+              admitted_requests: this.decisionWindowClosed.admitted_requests,
+              max_requests: this.decisionWindowClosed.max_requests } : {}),
             selected_feedback_consumed: false, automatic_retry: false,
           });
         // No retry/wake or control renewal here. Only a new ordinary signal can
@@ -1760,9 +1832,11 @@ export class StrategicPlanner {
     }
     if (
       this.providerFailed || this.providerAborted ||
-      !this.authoringEnded && deadlineReached
+      !this.authoringEnded && deadlineReached || this.decisionWindowClosed
     ) {
-      const pauseCause: RunPauseCause = deadlineReached ? "deadline" : this.providerAborted ? "provider_aborted" : "provider_failure";
+      const pauseCause: RunPauseCause = this.decisionWindowClosed
+        ? this.providerFailed ? "provider_failure" : this.providerAborted ? "provider_aborted" : "deadline"
+        : deadlineReached ? "deadline" : this.providerAborted ? "provider_aborted" : "provider_failure";
       run.model_status = "error";
       this.store.event(
         run.run_id,
@@ -1777,7 +1851,8 @@ export class StrategicPlanner {
           consumed_event_seq: this.contextCursor,
         },
       );
-      this.host.pause(PROVIDER_FAILURE, pauseCause);
+      this.host.pause(this.decisionWindowClosed && !this.providerFailed && !this.providerAborted
+        ? "The closed Main decision window has no valid finite executive" : PROVIDER_FAILURE, pauseCause);
       return;
     }
     // A host gate can reject the initial request after observation/admission.

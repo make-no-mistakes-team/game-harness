@@ -63,6 +63,25 @@ WebSockets. Optional `beforeSdkFetch` admission runs before each actual SDK
 and deadline. It receives no transport arguments or credentials. Fetch counts
 do not establish WebSocket, redirect, wire-attempt or consumption counts.
 
+Hosts may set `RuntimeOptions.mainDecisionWindow:{maxRequests:number}` to bound
+logical Main requests across all turns and roles in one Run. `maxRequests` must
+be a positive safe integer. Omission preserves existing behavior without adding
+a global default cap. Each request is charged once at reservation; Source
+preparation is excluded, and SDK transport retries are not new logical requests.
+The final admitted response and its tools finish, and the actual transport drains,
+before the normal `decision_window_closed` outcome with reason `request_limit`.
+Closure remains sticky through that Run: later wakes cannot reopen inference.
+Closure joins the actual cognition process and its auth owner without logging
+out or mutating the selected account; physical executive authority stays unchanged.
+A still-valid executive may continue under its original root, session, scope,
+deadlines and budgets, using the same continuation rules as turn-time expiry.
+Closure neither stops physical control by itself nor renews authority. Without
+a valid executive, continuation fails closed. Provider, external admission and
+scope faults remain failures; Stop still revokes authority and joins closure.
+Model-call boundaries remain serialized through the preceding terminal response;
+the read-only window query is not an atomic reservation. Expected exhaustion is
+returned as data, not a metadata exception; concurrency violations remain failures.
+
 Cross-process deadlines use Linux `CLOCK_MONOTONIC`. Expiry revokes authority
 immediately. Up to one second is reserved solely for cooperative cancellation
 and settlement, with no new request or tool permission. An unresponsive owner

@@ -22,6 +22,7 @@ import { osMonotonicNs } from "./os-monotonic.ts";
 import { RuntimeFault } from "./runtime-fault.ts";
 import { cognitionJsonSchema } from "./cognition-json.ts";
 import { CognitionContextCustody } from "./cognition-context-custody.ts";
+import { MainDecisionWindow, retainedFiniteExecutive } from "./main-decision-window.ts";
 
 const workerPath = fileURLToPath(new URL("./cognition-worker.ts", import.meta.url));
 const failure = () => new RuntimeFault("backend_unavailable", "The ordinary cognition process could not complete; no model retry or embedded fallback was started");
@@ -84,9 +85,11 @@ export class CognitionClient {
   #notifying: Promise<void> | null = null;
   #evidenceNotifying: Promise<void> | null = null;
   #evidenceDirty = false;
+  readonly #mainDecisionWindow: MainDecisionWindow | null;
   constructor(private readonly store: Store, private readonly auth: Pick<AuthManager, "createInferenceSession">,
     private readonly host: StrategicHost, private readonly options: CognitionClientOptions = {}) {
     this.#authority = new CognitionAuthority(store, host);
+    this.#mainDecisionWindow = host.mainDecisionWindow ? new MainDecisionWindow(host.mainDecisionWindow) : null;
   }
   /** Bounded ownership diagnostics only; never model context or credentials. */
   snapshot(): CognitionClientSnapshot {
@@ -108,6 +111,13 @@ export class CognitionClient {
     await closed;
     if (revision !== this.#revision) throw new RuntimeFault("stale_context", "Cognition startup was superseded");
     const run = this.host.assertCurrent(generation);
+    if (this.#mainDecisionWindow?.state(run.run_id).outcome === "decision_window_closed") {
+      const retained = retainedFiniteExecutive(this.store, run, generation, this.host.programPending());
+      run.model_status = retained ? "idle" : "error";
+      this.host.persist();
+      if (!retained) this.host.pause("The closed Main decision window has no valid finite executive", "deadline");
+      return;
+    }
     this.#authority.start(run, generation); this.#fenced = false;
     const session = this.auth.createInferenceSession({ modelId: run.model_id,
       consumer: {
@@ -259,7 +269,9 @@ export class CognitionClient {
         },
         speculation: this.host.speculation?.(), requestAdmission: {
           reserve: (id, model) => {
-            this.host.requestAdmission?.reserve(id, model);
+            const reserve = () => this.host.requestAdmission?.reserve(id, model);
+            if (this.#mainDecisionWindow) this.#mainDecisionWindow.reserve(run.run_id, id, reserve);
+            else reserve();
             child.registeredRequests.add(id);
           },
           transportEnded: (id, natural) => this.host.requestAdmission?.transportEnded(id, natural),
@@ -323,7 +335,8 @@ export class CognitionClient {
       timing: { clock_id: HOST_MONOTONIC_CLOCK_ID, os_origin_ns: osMonotonicNs().toString(), host_origin_ms: performance.now() },
       observeSdk: !!(this.host.requestAdmission?.evidence || this.host.cognitionEvidence?.enabled()),
       observeDispatch: !!(this.host.requestAdmission?.evidence || this.host.requestAdmission?.beforeDispatch || this.host.cognitionEvidence?.enabled()),
-      admitSdkFetch: !!this.host.requestAdmission?.beforeSdkFetch };
+      admitSdkFetch: !!this.host.requestAdmission?.beforeSdkFetch,
+      ...(this.#mainDecisionWindow ? { mainDecisionWindow: { maxRequests: this.#mainDecisionWindow.maxRequests } } : {}) };
     this.store.event(run.run_id, "cognition.started",
       "Ordinary planner and SDK are owned by an independent process; physical authority remains local", {
         worker_pid: childProcess.pid ?? null, host_clock_id: input.timing.clock_id,
@@ -453,10 +466,25 @@ export class CognitionClient {
       if (child.turnId === input.id) {
         clearTimeout(child.turnTimer); child.turnId = null; this.#authority.endTurn(input.id);
         clearTimeout(child.requestTimer); child.requestId = null;
+        if (this.#mainDecisionWindow?.state(child.run.run_id).outcome === "decision_window_closed") {
+          // Reply to this final turn barrier before closing the real process/auth owner.
+          // This deferred close belongs only to this child/revision. A concurrent
+          // explicit close/start already owns its drain; never fence that successor.
+          const revision = this.#revision;
+          setImmediate(() => {
+            if (this.#child !== child || this.#revision !== revision || this.#fenced ||
+              child.stopping || this.host.run() !== child.run || this.host.generation() !== child.generation) return;
+            void this.close().catch(() => this.#failed(child));
+          });
+        }
       }
       return null;
     }
     if (this.#current() !== child) throw failure();
+    if (method === "decision_window") {
+      if (!this.#mainDecisionWindow || body !== null) throw failure();
+      return this.#mainDecisionWindow.state(child.run.run_id);
+    }
     if (method === "synchronize") return this.#snapshot(child);
     if (method === "sdk_fetch") {
       const input = cognitionSdkFetchSchema.parse(body);

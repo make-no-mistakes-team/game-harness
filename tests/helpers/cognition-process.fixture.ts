@@ -212,8 +212,10 @@ export async function retainFiniteExecutive(f: PassiveHostFixture): Promise<Skil
 export function processFixture(scenario = "passive", options: {
   inference?: Pick<FakeSelectedSessionOwner, "createInferenceSession">;
   ordinaryWorker?: boolean;
+  mainDecisionWindow?: { maxRequests: number };
 } = {}): ProcessFixture {
   const f = passiveHostFixture();
+  f.host.mainDecisionWindow = options.mainDecisionWindow;
   const goal = f.host.promptInput!();
   f.host.promptInput = () => ({ ...goal, prompt: scenario });
   const processes: ChildProcess[] = [];

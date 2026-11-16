@@ -16,6 +16,7 @@ import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { HistoryReader } from "../src/server/history-reader.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import type { HistoryQueryOptions } from "../src/server/history-protocol.ts";
+import type { StrategicOwnership } from "../src/server/cognition-ports.ts";
 import { validateSkill } from "../src/server/program-validation.ts";
 import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
 import { controlSessionConfigSchema } from "../src/shared/control-session.ts";
@@ -54,7 +55,8 @@ afterEach(async () => {
   }
 });
 
-function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, streamFn?: StreamFn) {
+function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, streamFn?: StreamFn,
+  mainDecisionWindow?: { maxRequests: number }, ownership?: StrategicOwnership) {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-strategic-"));
   const store = new Store(directory), adapter = minecraftTestAdapter();
   const history = new HistoryReader(store.readLocation());
@@ -94,6 +96,7 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, stre
   };
   let planner: StrategicPlanner;
   const host: StrategicHost = {
+    mainDecisionWindow,
     run: () => run,
     generation: () => state.generation,
     assertCurrent: (generation, epoch) => {
@@ -188,7 +191,7 @@ function setup(onPrompt: (text: string, agent: FakeAgent) => Promise<void>, stre
       state.releases++;
     },
   } as unknown as AuthManager;
-  planner = new StrategicPlanner(store, auth, host);
+  planner = new StrategicPlanner(store, auth, host, { ownership });
   resources.push({ planner, store, directory, history, learning });
   const event = (type: string) => {
     const ready = Promise.withResolvers<void>();
@@ -332,6 +335,160 @@ test("Main expiry preserves a scoped finite executive until a fresh decision sig
   expect((f.state.contexts[1]?.feedback as { event_seq: number }[]).map(event => event.event_seq)).toContain(attention.event_seq);
   expect(f.state.pauseCauses).toEqual([]);
   expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })?.deadline_at).toBe(originalDeadline);
+});
+
+test("Main request cap includes ordinary, root-bound authoring and read-only review calls", async () => {
+  let f: ReturnType<typeof setup>;
+  f = setup(async (_text, agent) => {
+    expect(await callGate(agent)).toBeUndefined();
+    agent.emit({});
+  }, undefined, { maxRequests: 3 });
+  const root = await pendingExecutive(f), original = structuredClone(root);
+  await f.planner.start(1);
+  let done = f.event("scheduler.turn_finished");
+  f.planner.wake("preflight_ready"); await done;
+  done = f.event("scheduler.turn_finished");
+  f.planner.wake("planning_continuation"); await done;
+  expect(f.run.usage.by_purpose.planning.calls).toBe(1);
+  expect(f.run.usage.by_purpose.authoring.calls).toBe(1);
+  f.run.status = "reviewing"; f.store.saveRun(f.run);
+  done = f.event("scheduler.review_finished");
+  f.planner.wake("goal_review"); await done;
+  expect(f.run).toMatchObject({ status: "completed" });
+  expect(f.run.usage.calls).toBe(3);
+  expect(f.run.usage.by_purpose.improvement.calls).toBe(1);
+  expect(f.state.prompts).toBe(3); expect(f.state.pauses).toEqual([]);
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })).toEqual(original);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 300)
+    .filter(event => event.type === "scheduler.decision_window_closed").map(event => event.details))
+    .toEqual([{ outcome: "decision_window_closed", reason: "request_limit", admitted_requests: 3, max_requests: 3,
+      automatic_retry: false, physical_authority_renewed: false }]);
+});
+
+test("same-Run embedded planner restart cannot renew a closed Main request cap", async () => {
+  const f = setup(async (_text, agent) => {
+    expect(await callGate(agent)).toBeUndefined(); agent.emit({});
+  }, undefined, { maxRequests: 2 });
+  const root = await pendingExecutive(f), original = structuredClone(root);
+  await f.planner.start(1);
+  let done = f.event("scheduler.turn_finished");
+  f.planner.wake("preflight_ready"); await done;
+  done = f.event("scheduler.turn_deferred");
+  f.planner.wake("resident_attention"); await done;
+  await f.planner.close();
+  f.planner.reset();
+  await f.planner.start(1);
+  for (const reason of ["resident_attention", "planning_continuation", "policy_replan", "preflight_ready"])
+    f.planner.wake(reason);
+  await f.planner.close();
+  expect(f.state.prompts).toBe(2); expect(f.run.usage.calls).toBe(2);
+  expect(f.state.pauses).toEqual([]);
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })).toEqual(original);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 300)
+    .filter(event => event.type === "scheduler.decision_window_closed")).toHaveLength(1);
+});
+
+for (const fault of ["no_executive", "replaced_native_scope", "provider_failure", "provider_abort"] as const)
+test(`last Main admission preserves fail-closed handling for ${fault}`, async () => {
+  let f: ReturnType<typeof setup>;
+  f = setup(async (_text, agent) => {
+    expect(await callGate(agent)).toBeUndefined();
+    if (fault === "replaced_native_scope") f.run.native_boot_id = "replacement-native";
+    agent.emit(fault === "provider_failure"
+      ? { stopReason: "error", errorMessage: "Controlled provider failure on the last admission" } as Partial<Assistant>
+      : fault === "provider_abort"
+        ? { stopReason: "aborted", errorMessage: "Controlled provider abort on the last admission" } as Partial<Assistant>
+        : {});
+  }, undefined, { maxRequests: 1 });
+  if (fault !== "no_executive") await pendingExecutive(f);
+  await f.planner.start(1);
+  const failed = f.event("scheduler.turn_failed");
+  f.planner.wake("preflight_ready"); await failed;
+  expect(f.state.pauses).toHaveLength(1);
+  expect(f.run.model_status).toBe("error");
+  expect(f.run.usage.calls).toBe(1);
+  if (fault === "provider_failure") expect(f.state.pauseCauses).toEqual(["provider_failure"]);
+  if (fault === "provider_abort") expect(f.state.pauseCauses).toEqual(["provider_aborted"]);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 300)
+    .some(event => event.type === "scheduler.turn_deferred")).toBe(false);
+});
+
+test("Stop during the last admitted Main response cannot become an idle retained executive", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const f = setup(async (_text, agent) => {
+    expect(await callGate(agent)).toBeUndefined();
+    entered.resolve(); await release.promise; agent.emit({});
+  }, undefined, { maxRequests: 1 });
+  await pendingExecutive(f);
+  await f.planner.start(1);
+  f.planner.wake("preflight_ready"); await entered.promise;
+  f.run.status = "stopped"; f.state.generation++; f.planner.fence();
+  release.resolve(); await f.planner.close();
+  expect(f.run.status).toBe("stopped"); expect(f.state.prompts).toBe(1);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 300)
+    .some(event => event.type === "scheduler.turn_deferred")).toBe(false);
+});
+
+test("a configured Main cap preserves external reserve refusal as a safety failure without spending an admission", async () => {
+  const f = setup(async (_text, agent) => {
+    await callGate(agent);
+    throw new Error("A rejected external reservation cannot dispatch a response");
+  }, undefined, { maxRequests: 1 });
+  await pendingExecutive(f);
+  const paused = Promise.withResolvers<void>();
+  const pause = f.host.pause;
+  f.host.pause = (message, cause) => { pause(message, cause); paused.resolve(); };
+  f.host.requestAdmission = {
+    reserve: () => { throw new Error("Independent external admission refused"); },
+    transportEnded: () => {}, drained: () => {},
+  };
+  await f.planner.start(1);
+  Reflect.set(Reflect.get(f.planner, "agent"), "state", { model: accountingModel() });
+  f.planner.wake("preflight_ready"); await paused.promise;
+  f.planner.wake("resident_attention"); await f.planner.close();
+  expect(f.run.usage.calls).toBe(0); expect(f.run.turns).toBe(0);
+  expect(f.state.prompts).toBe(1); expect(f.state.pauseCauses).toEqual(["safety"]);
+  expect(f.run.status).toBe("paused");
+  expect(f.store.eventsAfter(f.run.run_id, 0, 300).some(event =>
+    event.type === "scheduler.decision_window_closed" || event.type === "scheduler.turn_deferred" ||
+    event.type === "scheduler.turn_finished")).toBe(false);
+});
+
+test("overlapping configured SDK request boundaries safety-fail before a second host window read or reserve", async () => {
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const promptAgent = Promise.withResolvers<FakeAgent>();
+  let holdBoundaryRead = false, boundaryReads = 0, reservations = 0;
+  const f = setup(async (_text, agent) => {
+    promptAgent.resolve(agent);
+    const result = await callGate(agent);
+    if (result?.stop) gated(agent, result.reason);
+    else throw new Error("The revoked overlapping boundary cannot admit a response");
+  }, undefined, { maxRequests: 1 }, {
+    decisionWindowState: async () => {
+      if (holdBoundaryRead) { boundaryReads++; entered.resolve(); await release.promise; }
+      return { outcome: "open", admitted_requests: 0, max_requests: 1 };
+    },
+  });
+  await pendingExecutive(f);
+  f.host.requestAdmission = {
+    reserve: () => { reservations++; },
+    transportEnded: () => {}, drained: () => {},
+  };
+  await f.planner.start(1);
+  Reflect.set(Reflect.get(f.planner, "agent"), "state", { model: accountingModel() });
+  holdBoundaryRead = true;
+  f.planner.wake("preflight_ready");
+  try {
+    const agent = await promptAgent.promise;
+    await entered.promise;
+    await expect(callGate(agent)).rejects.toMatchObject({ code: "conflict" });
+    expect(boundaryReads).toBe(1); expect(reservations).toBe(0);
+    expect(f.state.pauseCauses).toEqual(["safety"]); expect(f.run.status).toBe("paused");
+  } finally { release.resolve(); await f.planner.close(); }
+  expect(f.run.usage.calls).toBe(0); expect(f.run.turns).toBe(0);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 300).some(event =>
+    event.type === "scheduler.decision_window_closed" || event.type === "scheduler.turn_deferred" ||
+    event.type === "scheduler.turn_finished")).toBe(false);
 });
 
 for (const fault of ["replaced_native_scope", "root_deadline", "provider_failure"] as const)

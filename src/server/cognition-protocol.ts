@@ -10,6 +10,7 @@ import { COGNITION_LIMITS } from "./cognition-wire.ts";
 import { cognitionJsonSchema } from "./cognition-json.ts";
 import type { StrategicPolicy } from "./cognition-ports.ts";
 import type { PassiveContextState } from "./cognition-context-custody.ts";
+import type { MainDecisionWindowOptions } from "./main-decision-window.ts";
 
 const identity = z.string().min(1).max(512);
 const purpose = z.enum(["authoring", "planning", "replanning", "improvement", "other"]);
@@ -69,6 +70,7 @@ export interface CognitionStart {
   observeSdk: boolean;
   observeDispatch: boolean;
   admitSdkFetch: boolean;
+  mainDecisionWindow?: MainDecisionWindowOptions;
 }
 export interface CognitionToolCall { request_id: string; call_id: string; name: string; arguments: Json }
 export const cognitionToolCallSchema = z.object({ request_id: identity, call_id: identity, name: identity, arguments: cognitionJsonSchema }).strict();

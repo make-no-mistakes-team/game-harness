@@ -24,6 +24,7 @@ import { createRuntimePrompt } from "./runtime-prompt.ts";
 import { createMinecraftAdapter } from "./minecraft-adapter.ts";
 import { runtimeToolDescriptors } from "./runtime-tool-catalog.ts";
 import { usageCounter } from "./provider-usage.ts";
+import { mainDecisionWindowStateSchema } from "./main-decision-window.ts";
 import { setTransports } from "@oh-my-pi/pi-utils/logger";
 
 // The host's logger configuration is not inherited by a new process.
@@ -239,6 +240,7 @@ async function start(input: CognitionStart): Promise<void> {
   // descriptor inside cognition. Its observation/context CPU is never host RPC.
   const adapter = createMinecraftAdapter(input.snapshot.adapter.descriptor);
   const host: StrategicHost = {
+    mainDecisionWindow: input.mainDecisionWindow,
     run: () => current,
     generation: () => snapshot!.generation,
     assertCurrent: (generation, epoch) => {
@@ -288,6 +290,12 @@ async function start(input: CognitionStart): Promise<void> {
   };
   const ownership: StrategicOwnership = {
     synchronize, flush,
+    ...(input.mainDecisionWindow ? { decisionWindowState: async () => {
+      // Settle every preceding real reservation before reading the host count.
+      // The closed tag is data, never an exception in an atomic metadata batch.
+      await flush();
+      return mainDecisionWindowStateSchema.parse(await wire.call("decision_window", null));
+    } } : {}),
     beginTurn: async (id, deadline) => { await flush(); await wire.call("turn", { id, deadline_os_ns: deadline.toString() }); },
     endTurn: async id => { await flush(); await wire.call("turn_end", { id }); },
     dispatch: async (identity, request) => {

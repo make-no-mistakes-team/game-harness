@@ -10,12 +10,14 @@ import type { CognitionEvidenceEvent } from "../src/server/cognition-ports.ts";
 import { COGNITION_LIMITS } from "../src/server/cognition-wire.ts";
 import { encodeNativeFramePng } from "../src/server/actor-frame-codec.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
+import { CognitionClient } from "../src/server/cognition-client.ts";
+import { recordCall } from "../src/server/usage.ts";
 import { StrategicPlanner } from "../src/server/strategic.ts";
 import { InlineCognitionContext } from "../src/server/cognition-context.ts";
 import * as monotonicClock from "../src/server/os-monotonic.ts";
 import { AcceptanceLoopbackInference, codexLifecycleFrames } from "./helpers/acceptance-loopback-inference.ts";
 import { nativeFrame } from "./helpers/native-frame.ts";
-import { deferred, eventLoopTurn, passiveHostFixture, processFixture, retainFiniteExecutive, type ProcessFixture } from "./helpers/cognition-process.fixture.ts";
+import { deferred, eventLoopTurn, passiveHostFixture, processFixture, retainFiniteExecutive, type Deferred, type ProcessFixture } from "./helpers/cognition-process.fixture.ts";
 
 const cleanup: (() => void | Promise<void>)[] = [];
 afterEach(async () => {
@@ -34,6 +36,264 @@ function assertOwnedClosed(f: ProcessFixture) {
   expect(child.stdin?.destroyed).toBe(true);
   expect(f.owner.allocations).toBe(1);
 }
+
+function decisionWindowFixture(maxRequests: number,
+  respond?: (ordinal: number) => Parameters<typeof codexLifecycleFrames>[1] & { providerFailure?: boolean },
+  tail?: { entered: Deferred<void>; release: Deferred<void> }) {
+  const model = getBundledModels("openai-codex")[0];
+  if (!model) throw new Error("Offline descriptor required by the infrastructure fixture");
+  const requests: number[] = [], reservations: string[] = [], dispatches: string[] = [], fetches: string[] = [];
+  const transports: { id: string; natural: boolean }[] = [], drains: string[][] = [], sessions: string[] = [];
+  const bodies: Record<string, unknown>[] = [], providerDrained: number[] = [];
+  let activeTransports = 0, maxConcurrentTransports = 0;
+  const inference = new AcceptanceLoopbackInference(model, ({ ordinal, body }) => {
+    requests.push(ordinal); bodies.push(body);
+    if (ordinal > maxRequests) throw new Error("Decision window dispatched an unauthorized provider request");
+    activeTransports++; maxConcurrentTransports = Math.max(maxConcurrentTransports, activeTransports);
+    return { iterator: (async function* () {
+      try {
+        const output = respond?.(ordinal) ?? { text: "Finite administrative decision settled." };
+        yield output.providerFailure
+          ? `data: ${JSON.stringify({ type: "response.failed", response: { id: `failed-${ordinal}`, status: "failed",
+              error: { code: "server_error", message: "Controlled administrative provider failure" } } })}\n\n`
+          : codexLifecycleFrames(ordinal, output);
+        if (ordinal === maxRequests && tail) { tail.entered.resolve(); await tail.release.promise; }
+      }
+      finally { activeTransports--; providerDrained.push(ordinal); }
+    })() };
+  });
+  const f = processFixture("finite_main_decisions", { ordinaryWorker: true, mainDecisionWindow: { maxRequests }, inference: {
+    createInferenceSession: options => {
+      const session = inference.createInferenceSession(options); sessions.push(session.sessionId); return session;
+    },
+  } });
+  f.state.speculative = false;
+  f.host.requestAdmission = {
+    reserve: id => { reservations.push(id); },
+    beforeDispatch: async ({ identity }) => { dispatches.push(identity.request_id); },
+    beforeSdkFetch: async ({ identity }) => { fetches.push(identity.request_id); },
+    transportEnded: (id, natural) => { transports.push({ id, natural }); },
+    drained: ids => { drains.push([...ids]); },
+  };
+  cleanup.push(async () => { await f.close(); await inference.close(); });
+  const next = (type: string) => {
+    const ready = deferred();
+    const off = f.store.subscribe(event => {
+      if (event.run_id === f.run.run_id && event.type === type) { off(); ready.resolve(); }
+    });
+    cleanup.push(off);
+    return ready.promise;
+  };
+  return { ...f, requests, reservations, dispatches, fetches, transports, drains, sessions, bodies, providerDrained, next,
+    transportConcurrency: () => ({ active: activeTransports, max: maxConcurrentTransports }) };
+}
+
+for (const maxRequests of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])
+test(`host Main decision window rejects invalid maxRequests ${String(maxRequests)} before session allocation`, () => {
+  const f = passiveHostFixture();
+  cleanup.push(() => f.close());
+  f.host.mainDecisionWindow = { maxRequests };
+  expect(() => new CognitionClient(f.store, f.owner, f.host))
+    .toThrow("Main decision window requires a positive safe-integer maxRequests");
+  expect(f.owner.allocations).toBe(0); expect(f.run.usage.calls).toBe(0);
+});
+
+test("Main cap two spans attention turns and stays closed across same-Run process restart", async () => {
+  const f = decisionWindowFixture(2), root = await retainFiniteExecutive(f);
+  const original = structuredClone(root), runScope = [f.run.world_id, f.run.session_id, f.run.epoch, f.run.life_id, f.run.native_boot_id];
+  await f.client.start(1);
+  let settled = f.next("scheduler.turn_finished");
+  f.client.wake("preflight_ready"); await settled;
+  expect(f.requests).toEqual([1]);
+  const deferredTurn = f.next("scheduler.turn_deferred");
+  f.store.event(f.run.run_id, "controller.event", "Administrative attention", {
+    event: { kind: "attention", urgency: "ordinary", summary: "Fresh finite decision", details: null },
+  });
+  f.client.wake("resident_attention"); await deferredTurn;
+  expect(f.run).toMatchObject({ status: "running", model_status: "idle", turns: 2 });
+  expect(f.pauses).toEqual([]);
+  expect(f.sessions).toHaveLength(1);
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })).toEqual(original);
+  expect([f.run.world_id, f.run.session_id, f.run.epoch, f.run.life_id, f.run.native_boot_id]).toEqual(runScope);
+  for (const reason of ["resident_attention", "planning_continuation", "policy_replan", "goal_review", "observation"])
+    f.client.wake(reason);
+  await eventLoopTurn();
+  await f.client.start(1);
+  expect(f.client.snapshot()).toMatchObject({ pid: null, fenced: true, closing: false });
+  expect(f.sessions).toHaveLength(1); expect(f.processes).toHaveLength(1);
+  f.client.wake("resident_attention");
+  await eventLoopTurn(); await f.client.close();
+  expect(f.requests).toEqual([1, 2]);
+  expect(f.reservations).toHaveLength(2);
+  expect(new Set(f.reservations).size).toBe(2);
+  expect(f.dispatches).toEqual(f.reservations);
+  expect(f.fetches).toEqual(f.reservations);
+  expect(f.providerDrained).toEqual([1, 2]);
+  expect(f.transports).toEqual(f.reservations.map(id => ({ id, natural: true })));
+  expect(f.drains.flat()).toEqual(f.reservations);
+  const events = f.store.eventsAfter(f.run.run_id, 0, 300);
+  expect(events.filter(event => event.type === "scheduler.decision_window_closed").map(event => event.details))
+    .toEqual([{ outcome: "decision_window_closed", reason: "request_limit", admitted_requests: 2, max_requests: 2,
+      automatic_retry: false, physical_authority_renewed: false }]);
+  expect(events.filter(event => event.type === "scheduler.turn_deferred")).toHaveLength(1);
+  expect(events.find(event => event.type === "scheduler.turn_deferred")?.details).toMatchObject({
+    reason: "request_limit", root_execution_id: root.execution_id, original_root_deadline_at: root.deadline_at,
+    automatic_retry: false,
+  });
+  expect(events.some(event => event.type === "scheduler.turn_failed" || event.type === "cognition.contained")).toBe(false);
+}, 10_000);
+
+test("the last admitted SDK response commits its real host tool before decision-window settlement", async () => {
+  const f = decisionWindowFixture(2, ordinal => ({ calls: (ordinal === 1 ? [1] : [2, 3])
+    .map(value => ({ id: `administrative-${value}`, name: "help", arguments: { value } })) }));
+  const root = await retainFiniteExecutive(f), original = structuredClone(root);
+  const entered = deferred(), release = deferred();
+  cleanup.push(() => release.resolve());
+  const commits: number[] = [];
+  let closed = false;
+  const off = f.store.subscribe(event => { if (event.type === "scheduler.decision_window_closed") closed = true; });
+  cleanup.push(off);
+  f.tools.push({ name: "help", label: "help", description: "Finite administrative host transaction",
+    parameters: z.toJSONSchema(z.object({ value: z.number().int() }).strict()),
+    execute: async (_id, raw) => {
+      const { value } = z.object({ value: z.number().int() }).strict().parse(raw);
+      const commit = f.client.speculativeToolAuthority();
+      if (value >= 2) { entered.resolve(); await release.promise; }
+      commit(); commits.push(value);
+      return { content: [{ type: "text", text: `Administrative receipt ${value}` }], details: { committed: value } };
+    },
+  });
+  await f.client.start(1);
+  const settled = f.next("scheduler.turn_deferred");
+  f.client.wake("preflight_ready"); await entered.promise;
+  expect(commits).toEqual([1]); expect(closed).toBe(false);
+  expect(f.providerDrained).toEqual([1, 2]);
+  expect(f.reservations).toHaveLength(2); expect(f.requests).toEqual([1, 2]);
+  release.resolve(); await settled;
+  expect([...commits].sort((left, right) => left - right)).toEqual([1, 2, 3]); expect(f.pauses).toEqual([]);
+  expect(f.store.skillExecution(f.run.run_id, { execution_id: root.execution_id })).toEqual(original);
+  await f.client.close();
+  expect(f.dispatches).toEqual(f.reservations); expect(f.fetches).toEqual(f.reservations);
+  expect(f.transports).toEqual(f.reservations.map(id => ({ id, natural: true })));
+  expect(f.drains.flat()).toEqual(f.reservations);
+  const events = f.store.eventsAfter(f.run.run_id, 0, 300);
+  expect(events.filter(event => event.type === "model.tool_finished")).toHaveLength(3);
+  const lastTool = events.filter(event => event.type === "model.tool_finished").at(-1)!;
+  expect(events.find(event => event.type === "scheduler.decision_window_closed")!.event_seq).toBeGreaterThan(lastTool.event_seq);
+}, 10_000);
+
+test("a real SDK provider failure on the final Main admission still pauses rather than deferring", async () => {
+  const f = decisionWindowFixture(1, () => ({ providerFailure: true }));
+  await retainFiniteExecutive(f);
+  const paused = deferred();
+  const pause = f.host.pause;
+  f.host.pause = (message, cause) => { pause(message, cause); paused.resolve(); };
+  await f.client.start(1);
+  f.client.wake("preflight_ready"); await paused.promise; await f.client.close();
+  expect(f.requests).toEqual([1]); expect(f.reservations).toHaveLength(1);
+  expect(f.dispatches).toEqual(f.reservations); expect(f.fetches).toEqual(f.reservations);
+  expect(f.pauses.map(value => value.cause)).toEqual(["provider_failure"]);
+  // This passive host only records pause requests; Runtime owns the physical
+  // pause/status transition, covered by the prepared-runtime consumer proof.
+  expect(f.client.snapshot()).toMatchObject({ pid: null, fenced: true, closing: false });
+  expect(f.providerDrained).toEqual([1]); expect(f.drains.flat()).toEqual(f.reservations);
+  f.client.wake("resident_attention"); f.client.wake("goal_review");
+  await eventLoopTurn();
+  expect(f.requests).toEqual([1]); expect(f.sessions).toHaveLength(1);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 300)
+    .some(event => event.type === "scheduler.turn_deferred")).toBe(false);
+}, 10_000);
+
+test("Main request closure waits for the admitted HTTP iterator's real tail, not just its terminal frame", async () => {
+  const tail = { entered: deferred(), release: deferred() };
+  const f = decisionWindowFixture(1, undefined, tail);
+  await retainFiniteExecutive(f);
+  cleanup.push(() => tail.release.resolve());
+  let settled = false;
+  const off = f.store.subscribe(event => {
+    if (event.type === "scheduler.turn_deferred" || event.type === "scheduler.decision_window_closed") settled = true;
+  });
+  cleanup.push(off);
+  await f.client.start(1);
+  const done = f.next("scheduler.turn_deferred");
+  f.client.wake("preflight_ready"); await tail.entered.promise; await eventLoopTurn();
+  expect(settled).toBe(false); expect(f.providerDrained).toEqual([]);
+  expect(f.transports).toEqual([]); expect(f.requests).toEqual([1]);
+  tail.release.resolve(); await done; await f.client.close();
+  expect(f.providerDrained).toEqual([1]); expect(f.pauses).toEqual([]);
+  expect(f.reservations).toHaveLength(1); expect(f.dispatches).toEqual(f.reservations);
+  expect(f.fetches).toEqual(f.reservations);
+  expect(f.transports).toEqual([{ id: f.reservations[0]!, natural: true }]);
+  expect(f.drains.flat()).toEqual(f.reservations);
+}, 10_000);
+
+test("real SDK queued wakes and final-slot review remain single-flight and close without poisoning metadata", async () => {
+  const tail = { entered: deferred(), release: deferred() };
+  const completed = deferred();
+  const f = decisionWindowFixture(2, undefined, tail);
+  await retainFiniteExecutive(f);
+  cleanup.push(() => tail.release.resolve());
+  f.host.reviewContext = async options => {
+    options.signal?.throwIfAborted();
+    return { metrics: [], opportunities: [] };
+  };
+  f.host.reviewComplete = () => { f.run.status = "completed"; completed.resolve(); };
+  await f.client.start(1);
+  const first = f.next("scheduler.turn_finished");
+  f.client.wake("preflight_ready"); await first;
+  f.run.status = "reviewing"; f.store.saveRun(f.run);
+  const reviewed = f.next("scheduler.review_finished");
+  f.client.wake("goal_review"); await tail.entered.promise;
+  for (const reason of ["goal_review", "resident_attention", "planning_continuation", "policy_replan", "goal_review"])
+    f.client.wake(reason);
+  expect(f.requests).toEqual([1, 2]);
+  expect(f.transportConcurrency()).toEqual({ active: 1, max: 1 });
+  tail.release.resolve(); await reviewed; await completed.promise; await f.client.close();
+  expect(f.transportConcurrency()).toEqual({ active: 0, max: 1 });
+  expect(f.requests).toEqual([1, 2]); expect(f.reservations).toHaveLength(2);
+  expect(f.dispatches).toEqual(f.reservations); expect(f.fetches).toEqual(f.reservations);
+  expect(f.drains.flat()).toEqual(f.reservations);
+  expect(f.run).toMatchObject({ status: "completed", model_status: "idle", turns: 2 });
+  expect(f.run.usage.by_purpose.planning.calls).toBe(1);
+  expect(f.run.usage.by_purpose.improvement.calls).toBe(1);
+  expect(f.pauses).toEqual([]);
+  const events = f.store.eventsAfter(f.run.run_id, 0, 300);
+  expect(events.filter(event => event.type === "scheduler.decision_window_closed")).toHaveLength(1);
+  expect(events.find(event => event.type === "scheduler.decision_window_closed")?.details)
+    .toMatchObject({ outcome: "decision_window_closed", reason: "request_limit", admitted_requests: 2, max_requests: 2 });
+  expect(events.some(event => event.type === "cognition.rpc_rejected" || event.type === "cognition.contained" ||
+    event.type === "model.request_unsettled" || event.type === "scheduler.turn_failed")).toBe(false);
+}, 10_000);
+
+test("48 imported Source calls do not spend the 24 actual Main admissions even in the same usage purpose", async () => {
+  const f = decisionWindowFixture(24, ordinal => ordinal === 24
+    ? { call: { id: "final-administrative-read", name: "help", arguments: {} } }
+    : { text: "Bounded administrative decision complete." });
+  await retainFiniteExecutive(f);
+  // The prepared-start handoff imports Source usage, not Main request identities.
+  for (let index = 0; index < 48; index++) recordCall(f.run.usage, "authoring");
+  f.store.saveRun(f.run);
+  f.tools.push({ name: "help", label: "help", description: "Administrative catalog read",
+    parameters: z.toJSONSchema(z.object({}).strict()),
+    execute: async () => ({ content: [], details: {} }),
+  });
+  await f.client.start(1);
+  for (let index = 0; index < 24; index++) {
+    const settled = f.next(index === 23 ? "scheduler.turn_deferred" : "scheduler.turn_finished");
+    f.client.wake(index === 0 ? "preflight_ready" : index === 23 ? "planning_continuation" : "resident_attention");
+    await settled;
+  }
+  f.client.wake("resident_attention"); await eventLoopTurn(); await f.client.close();
+  expect(f.requests).toEqual(Array.from({ length: 24 }, (_, index) => index + 1));
+  expect(f.reservations).toHaveLength(24); expect(f.dispatches).toEqual(f.reservations);
+  expect(f.fetches).toEqual(f.reservations); expect(f.providerDrained).toHaveLength(24);
+  expect(f.run.turns).toBe(24); expect(f.run.usage.calls).toBe(72);
+  expect(f.run.usage.by_purpose.authoring.calls).toBeGreaterThan(48);
+  expect(f.pauses).toEqual([]);
+  expect(f.store.eventsAfter(f.run.run_id, 0, 1000)
+    .find(event => event.type === "scheduler.decision_window_closed")?.details)
+    .toMatchObject({ admitted_requests: 24, max_requests: 24 });
+}, 20_000);
 
 // These are generic selected-session/process/wire ownership tests. They contain
 // no gameplay source, real inference, action execution, sandbox or native driver.

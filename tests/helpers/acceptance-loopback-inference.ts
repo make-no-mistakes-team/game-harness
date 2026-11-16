@@ -211,18 +211,25 @@ export class AcceptanceLoopbackInference {
 /** Actual Codex Responses SSE, not an SDK stream replacement. */
 export function codexLifecycleFrames(request: number, output: {
   text?: string; call?: { id: string; name: string; arguments: unknown };
+  calls?: { id: string; name: string; arguments: unknown }[];
 }): string {
   const frame = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
   const responseId = `loopback-response-${request}`;
   const created = frame({ type: "response.created", response: { id: responseId, status: "in_progress" } });
   let frames: string, item: Record<string, unknown>;
-  if (output.call) {
-    const call = output.call, args = JSON.stringify(call.arguments);
-    item = { id: `loopback-item-${request}`, type: "function_call", call_id: call.id, name: call.name, arguments: args, status: "completed" };
-    frames = frame({ type: "response.output_item.added", output_index: 0, item: { ...item, status: "in_progress", arguments: "" } }) +
-      frame({ type: "response.function_call_arguments.delta", output_index: 0, item_id: item.id, delta: args }) +
-      frame({ type: "response.function_call_arguments.done", output_index: 0, item_id: item.id, arguments: args }) +
-      frame({ type: "response.output_item.done", output_index: 0, item });
+  const items: Record<string, unknown>[] = [];
+  const calls = output.calls ?? (output.call ? [output.call] : []);
+  if (calls.length) {
+    frames = calls.map((call, index) => {
+      const args = JSON.stringify(call.arguments);
+      const current = { id: `loopback-item-${request}${index ? `-${index}` : ""}`, type: "function_call",
+        call_id: call.id, name: call.name, arguments: args, status: "completed" };
+      items.push(current);
+      return frame({ type: "response.output_item.added", output_index: index, item: { ...current, status: "in_progress", arguments: "" } }) +
+        frame({ type: "response.function_call_arguments.delta", output_index: index, item_id: current.id, delta: args }) +
+        frame({ type: "response.function_call_arguments.done", output_index: index, item_id: current.id, arguments: args }) +
+        frame({ type: "response.output_item.done", output_index: index, item: current });
+    }).join("");
   } else {
     const text = output.text ?? "";
     item = { id: `loopback-item-${request}`, type: "message", role: "assistant", status: "completed",
@@ -233,7 +240,8 @@ export function codexLifecycleFrames(request: number, output: {
       frame({ type: "response.output_text.delta", item_id: item.id, output_index: 0, content_index: 0, delta: text }) +
       frame({ type: "response.output_text.done", item_id: item.id, output_index: 0, content_index: 0, text }) +
       frame({ type: "response.output_item.done", output_index: 0, item });
+    items.push(item);
   }
-  return created + frames + frame({ type: "response.completed", response: { id: responseId, status: "completed", output: [item],
+  return created + frames + frame({ type: "response.completed", response: { id: responseId, status: "completed", output: items,
     usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2, input_tokens_details: { cached_tokens: 0 } } } });
 }

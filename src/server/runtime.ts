@@ -45,6 +45,7 @@ import { ActionArbiter } from "./action-arbiter.ts";
 import { ReactiveRuntime } from "./reactive.ts";
 import { StrategicPlanner, type StrategicHost, type StrategicRequestAdmission } from "./strategic.ts";
 import { CognitionClient } from "./cognition-client.ts";
+import { validateMainDecisionWindow, type MainDecisionWindowOptions } from "./main-decision-window.ts";
 import type { CognitionEvidenceEvent, StrategicAgentFactory } from "./cognition-ports.ts";
 import { RuntimeTools } from "./runtime-tools.ts";
 import { createRuntimePrompt } from "./runtime-prompt.ts";
@@ -75,6 +76,8 @@ export interface RuntimeOptions {
   judge?: FastJudgeBroker;
   adapter?: RuntimeAdapter | (() => RuntimeAdapter | null);
   requestAdmission?: StrategicRequestAdmission;
+  /** Host-only per-run logical Main cap; expiry never renews physical authority. */
+  mainDecisionWindow?: MainDecisionWindowOptions;
   /** Optional host-owned finite-scope admission; never modifies requested authority. */
   assertProgramStart?(request: SkillStartRequest): void;
   /** Explicit embedded ownership for direct SDK consumers/tests, never a failure fallback. */
@@ -282,6 +285,7 @@ export class Runtime {
     private readonly onChange: () => void,
     options: RuntimeOptions = {},
   ) {
+    validateMainDecisionWindow(options.mainDecisionWindow);
     this.adapterSource = options.adapter;
     this.actorFrameSource = options.actorFrames;
     this.programStartAdmission = options.assertProgramStart;
@@ -541,6 +545,7 @@ export class Runtime {
     );
     const strategicHost = {
       requestAdmission: options.requestAdmission,
+      mainDecisionWindow: options.mainDecisionWindow && { ...options.mainDecisionWindow },
       cognitionEvidence: {
         enabled: () => this.cognitionEvidenceListeners.size > 0,
         emit: event => { for (const listener of this.cognitionEvidenceListeners) listener(event); },

@@ -7,6 +7,7 @@ import type { PlanProjection, PlanRejectReason } from "../shared/planning.ts";
 import type { StoreReadQueries, StoreReadLocation } from "./store-read.ts";
 import type { StoredRun } from "./store.ts";
 import type { ProgramWorkspaceReadStore } from "./program-workspace.ts";
+import type { MainDecisionWindowState } from "./main-decision-window.ts";
 
 /** Only readonly source queries and ordered metadata belong to cognition. */
 export type StrategicStore = ProgramWorkspaceReadStore & Pick<StoreReadQueries,
@@ -59,6 +60,8 @@ export interface CognitionEvidenceEvent {
 export type StrategicPolicy = Pick<PolicyView, "version" | "backend" | "name" | "state" | "priority" | "effects" | "last_error">;
 /** Optional only for embedded owners. Default playing installs every hook. */
 export interface StrategicOwnership {
+  /** Read-only host-owned cumulative admission state; never a model/tool capability. */
+  decisionWindowState?(): Promise<MainDecisionWindowState>;
   synchronize?(): Promise<void>;
   beginTurn?(id: string, deadlineOsNs: bigint): Promise<void>;
   endTurn?(id: string): Promise<void>;

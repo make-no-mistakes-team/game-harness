@@ -556,8 +556,39 @@ export class CognitionClient {
       } finally { permit.release(); }
     }
     if (method === "observe") return await this.host.observe();
-    if (method === "model_observation") return this.host.modelObservation
-      ? await this.host.modelObservation() : { observation: await this.host.observe(), images: [], image_metadata: { mode: "disabled" } };
+    if (method === "model_observation") {
+      const run = child.run, generation = this.host.generation(), phase = run.status;
+      const root = this.store.latestRootExecution(run.run_id)?.execution_id ?? null;
+      const scope = [run.world_id, run.session_id, run.epoch, run.life_id, run.native_boot_id,
+        run.space_epoch, run.compatibility_hash];
+      try {
+        return this.host.modelObservation ? await this.host.modelObservation() :
+          { observation: await this.host.observe(), images: [], image_metadata: { mode: "disabled" } };
+      } catch (error) {
+        // Root replacement is not part of Runtime's native image scope. Record
+        // discriminating host facts without guessing which native guard failed,
+        // transferring an exception brand, retrying capture or publishing data.
+        const currentScope = [run.world_id, run.session_id, run.epoch, run.life_id, run.native_boot_id,
+          run.space_epoch, run.compatibility_hash];
+        const reason = error instanceof RuntimeFault
+          ? error.code === "stale_context" ? "stale_context"
+            : error.code === "stale_epoch" ? "stale_epoch"
+              : error.code === "backend_unavailable" ? "backend_unavailable"
+                : error.code === "precondition_failed" ? "precondition_failed" : "other_runtime_fault"
+          : "host_operation_failed";
+        this.store.event(run.run_id, "cognition.model_observation_rejected",
+          "Model observation failed at the host capture boundary; native guard identity is not inferred", {
+            reason, turn_id: child.turnId, request_id: child.requestId,
+            run_replaced: this.host.run() !== run,
+            generation_changed: this.host.generation() !== generation,
+            phase_changed: run.status !== phase,
+            run_scope_changed: scope.some((value, index) => value !== currentScope[index]),
+            root_changed: (this.store.latestRootExecution(run.run_id)?.execution_id ?? null) !== root,
+            native_guard: "not_reported", provider_request_made: false, capture_retried: false,
+          });
+        throw error;
+      }
+    }
     if (method === "planning_pending" || method === "planning_begin") {
       const planning = this.host.speculation?.();
       if (!planning) throw failure();

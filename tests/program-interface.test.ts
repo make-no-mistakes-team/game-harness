@@ -11,7 +11,11 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { buildTransformedCodexRequestBody } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { adaptSchemaForStrict, validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
-import type { ObservationV3 } from "../src/shared/contracts.ts";
+import type { Json, ObservationV3 } from "../src/shared/contracts.ts";
+import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
+import type { SkillStartRequest } from "../src/shared/programs.ts";
+import { controlSessionConfigSchema } from "../src/shared/control-session.ts";
+import { prepareNextSchema, programRunSchema } from "../src/server/program-interface.ts";
 import type { ImprovementOpportunity } from "../src/shared/execution-evidence.ts";
 import type { MinecraftGameAPI, MinecraftObservation } from "../src/shared/minecraft.ts";
 import { minecraftControllerFrameSchema } from "../src/shared/minecraft.ts";
@@ -518,6 +522,221 @@ test("named writes use optimistic revisions and catalog pagination counts famili
   expect(next.records).toMatchObject([{ name: "zebra", version: 2 }]);
   expect(next.has_more).toBe(false);
   expect(data(await f.call("program_inspect", { view: "source", name: "zebra", version: 1 })).version).toBe(1);
+});
+
+const ceilingResidentSource = 'export function step(frame,state,intent){return {input:null,next_state:state,status:"completed",events:[]};}';
+const fixtureResidentCeilings = { ...DEFAULT_RESIDENT_LIMITS, max_analysis_jobs: 0, max_analysis_ms: 0 };
+const fixtureSessionCeilings = controlSessionConfigSchema.parse({ schema_version: 1 });
+function assertFixtureStartCeilings(request: SkillStartRequest) {
+  if (request.entry !== "step") return;
+  for (const key of Object.keys(fixtureResidentCeilings) as (keyof typeof fixtureResidentCeilings)[]) {
+    if (request.limits[key] > fixtureResidentCeilings[key])
+      throw new RuntimeFault("precondition_failed", `Declared resident ceiling exceeded: ${key}`);
+  }
+  if (request.session) {
+    for (const key of ["max_tasks", "max_actions", "max_calls", "max_depth", "retained_tasks", "max_restarts"] as const) {
+      if (request.session[key] > fixtureSessionCeilings[key])
+        throw new RuntimeFault("precondition_failed", `Declared session ceiling exceeded: ${key}`);
+    }
+    if (request.session.recovery !== fixtureSessionCeilings.recovery)
+      throw new RuntimeFault("precondition_failed", "Declared session recovery exceeded");
+  }
+}
+
+for (const toolName of ["program_run", "program_submit"] as const) {
+  for (const violation of [
+    { limits: { ...fixtureResidentCeilings, duration_ms: 300000 }, field: "duration_ms" },
+    { limits: { ...fixtureResidentCeilings, max_steps: 6000 }, field: "max_steps" },
+    { limits: {}, field: "max_analysis_jobs" },
+    { limits: { ...fixtureResidentCeilings, max_analysis_ms: 10000 }, field: "max_analysis_ms" },
+    { limits: fixtureResidentCeilings, session: { schema_version: 1, max_restarts: 1, recovery: "checkpoint_safe" }, field: "max_restarts" },
+    { limits: fixtureResidentCeilings, session: { schema_version: 1, recovery: "checkpoint_safe" }, field: "recovery" },
+    { limits: fixtureResidentCeilings, session: { schema_version: 1, max_tasks: 4097 }, field: "max_tasks" },
+  ]) {
+    test(`${toolName} host start ceilings refuse ${violation.field} before live replacement changes authority`, async () => {
+      const entered = Promise.withResolvers<void>();
+      let incumbentSignal: AbortSignal | undefined, cancelled = 0, preflights = 0, retirements = 0, observed = 0, admissions = 0;
+      const f = fixture(async (_body, _args, _handle, _limits, signal) => {
+        incumbentSignal = signal; entered.resolve(); await aborted(signal);
+        return { status: "completed", summary: "Neutral incumbent drained", result: null };
+      }, { cancelActions: async () => { cancelled++; } });
+      await f.write("ceiling incumbent");
+      const old = data(await f.call("program_run", { operation: "start", name: "ceiling incumbent", args: null }));
+      await entered.promise;
+      const incumbent = f.store.latestRootExecution(f.run.run_id)!;
+      if (toolName === "program_run") await f.write("ceiling candidate", ceilingResidentSource, { entry: "step" });
+      const prepare = f.manager.prepareResidentHandoff.bind(f.manager), retire = f.manager.retireForHandoff.bind(f.manager);
+      f.manager.prepareResidentHandoff = async (...args) => { preflights++; return await prepare(...args); };
+      f.manager.retireForHandoff = async (...args) => { retirements++; return await retire(...args); };
+      f.toolHost.observe = async () => { observed++; return f.observation(); };
+      f.toolHost.admitted = () => { admissions++; };
+      f.toolHost.assertProgramStart = assertFixtureStartCeilings;
+      const input = { name: "ceiling candidate", entry: "step", args: null, limits: violation.limits,
+        session: "session" in violation ? violation.session : { schema_version: 1 },
+        handoff: { name: old.name, version: old.version, execution_ordinal: old.execution_ordinal },
+        ...(toolName === "program_submit" ? { source: ceilingResidentSource } : { operation: "start" }) };
+      const id = `ceiling-${toolName}-${violation.field}`;
+      const refused = data(await f.call(toolName, input, id));
+      if (toolName === "program_submit") expect(refused).toMatchObject({
+        source: { status: "persisted", name: input.name, version: 1 },
+        start: { status: "refused", error: { code: "precondition_failed", retryable: false } },
+      });
+      const failure = toolName === "program_submit" ? refused.start.error : refused.error;
+      expect(failure.message).toContain(violation.field);
+      expect(failure.code).toBe("precondition_failed");
+      if (toolName === "program_run") {
+        expect(f.store.lookupToolCallBinding(f.run.run_id, id,
+          { tool: toolName, input: programRunSchema.parse(input) } as unknown as Json)).toEqual({ found: false });
+      }
+      expect(incumbentSignal!.aborted).toBe(false);
+      expect(f.manager.effectScope(incumbent.execution_id)).not.toBeNull();
+      expect(f.store.latestRootExecution(f.run.run_id)!.execution_id).toBe(incumbent.execution_id);
+      expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+      expect({ cancelled, preflights, retirements, observed, admissions }).toEqual({
+        cancelled: 0, preflights: 0, retirements: 0, observed: 0, admissions: 0,
+      });
+      expect(f.dispatches()).toBe(1);
+      expect(f.actions()).toBe(0);
+      if (toolName === "program_submit")
+        f.toolHost.assertProgramStart = () => { throw new Error("Persisted refusal must not retry authority"); };
+      expect(data(await f.call(toolName, input, id))).toEqual(refused);
+      expect(f.dispatches()).toBe(1);
+    });
+  }
+}
+
+for (const [form, limits, expected] of [
+  ["omitted", undefined, { duration_ms: 120000, max_actions: 64, max_calls: 256, max_depth: 8 }],
+  ["empty", {}, { duration_ms: 120000, max_actions: 64, max_calls: 256, max_depth: 8 }],
+  ["partial", { max_actions: 2 }, { duration_ms: 120000, max_actions: 2, max_calls: 256, max_depth: 8 }],
+] as const) test(`host start ceilings preserve ${form} normalized legal starts and cached evidence`, async () => {
+  const f = fixture();
+  await f.write("ceiling legal");
+  let checked = 0;
+  f.toolHost.assertProgramStart = request => {
+    checked++;
+    expect(request.entry).toBe("run");
+    expect(request.limits).toEqual(expected);
+  };
+  const input = { operation: "start", name: "ceiling legal", args: null, ...(limits === undefined ? {} : { limits }) };
+  const id = `legal-ceiling-${form}`;
+  const first = data(await f.call("program_run", input, id));
+  const execution = f.store.latestRootExecution(f.run.run_id)!;
+  await waitClosed(f.store, f.run.run_id, execution.execution_id);
+  expect(execution.limits).toEqual(expected);
+  expect(checked).toBe(1);
+  f.toolHost.assertProgramStart = () => { throw new Error("Cached evidence must not request new authority"); };
+  expect(data(await f.call("program_run", input, id))).toEqual(first);
+  expect(f.dispatches()).toBe(1);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+});
+
+test("host start ceilings recheck a bound request without an execution instead of treating it as cached admission", async () => {
+  const f = fixture();
+  await f.write("ceiling bound candidate", ceilingResidentSource, { entry: "step" });
+  const input = { operation: "start", entry: "step", name: "ceiling bound candidate", args: null,
+    limits: { ...fixtureResidentCeilings, duration_ms: 300000 }, session: { schema_version: 1 } };
+  const id = "ceiling-bound-no-execution";
+  const start = f.manager.start.bind(f.manager);
+  let attempts = 0;
+  f.manager.start = () => { attempts++; throw new RuntimeFault("conflict", "Fixture admission withheld"); };
+  expect(data(await f.call("program_run", input, id)).error.code).toBe("conflict");
+  expect(f.store.lookupToolCallBinding(f.run.run_id, id,
+    { tool: "program_run", input: programRunSchema.parse(input) } as unknown as Json).found).toBe(true);
+  f.manager.start = (...args) => { attempts++; return start(...args); };
+  f.toolHost.assertProgramStart = assertFixtureStartCeilings;
+  const refused = data(await f.call("program_run", input, id));
+  expect(refused.error).toMatchObject({ code: "precondition_failed", message: "Declared resident ceiling exceeded: duration_ms" });
+  expect(attempts).toBe(1);
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+  expect(f.dispatches()).toBe(0);
+});
+
+test("host start ceilings do not reauthorize an actual execution after lost tool acknowledgement", async () => {
+  const f = fixture();
+  await f.write("ceiling accepted receipt");
+  let checks = 0, admissions = 0;
+  f.toolHost.assertProgramStart = () => { checks++; };
+  f.toolHost.admitted = () => { admissions++; };
+  const id = "ceiling-lost-ack", input = { operation: "start", name: "ceiling accepted receipt", args: null };
+  const db = new Database(join(f.directory, "runs.sqlite"));
+  try {
+    db.exec(`CREATE TRIGGER lose_ceiling_ack BEFORE INSERT ON evidence_objects WHEN NEW.kind='tool_result' AND NEW.object_key='${id}' BEGIN SELECT RAISE(ABORT,'lost acknowledgement'); END;`);
+    expect((await f.call("program_run", input, id)).isError).toBe(true);
+    const execution = f.store.latestRootExecution(f.run.run_id)!;
+    await waitClosed(f.store, f.run.run_id, execution.execution_id);
+    db.exec("DROP TRIGGER lose_ceiling_ack;");
+    f.toolHost.assertProgramStart = () => { throw new Error("Execution evidence is not new admission"); };
+    const replay = await f.call("program_run", input, id);
+    expect(replay.isError).not.toBe(true);
+    expect(data(replay)).toMatchObject({ name: "ceiling accepted receipt", version: 1 });
+    expect({ checks, admissions }).toEqual({ checks: 1, admissions: 1 });
+    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+    expect(f.dispatches()).toBe(1);
+  } finally { db.close(); }
+});
+
+test("host start ceilings preserve the incumbent while a legal normalized handoff actually starts once", async () => {
+  const entered = Promise.withResolvers<void>();
+  const f = fixture(async (_body, args, _handle, _limits, signal) => {
+    if (args === "incumbent") { entered.resolve(); await aborted(signal); }
+    return { status: "completed", summary: "Neutral lifecycle result", result: null };
+  });
+  await f.write("legal ceiling incumbent"); await f.write("legal ceiling successor");
+  const old = data(await f.call("program_run", { operation: "start", name: "legal ceiling incumbent", args: "incumbent" }));
+  await entered.promise;
+  const incumbent = f.store.latestRootExecution(f.run.run_id)!;
+  let checked = 0;
+  f.toolHost.assertProgramStart = request => {
+    checked++;
+    expect(request.limits).toEqual({ duration_ms: 120000, max_actions: 2, max_calls: 256, max_depth: 8 });
+    expect(f.manager.effectScope(incumbent.execution_id)).not.toBeNull();
+  };
+  const input = { operation: "start", name: "legal ceiling successor", args: null, limits: { max_actions: 2 },
+    handoff: { name: old.name, version: old.version, execution_ordinal: old.execution_ordinal } };
+  const first = data(await f.call("program_run", input, "legal-ceiling-handoff"));
+  expect(first.name).toBe("legal ceiling successor");
+  expect(checked).toBe(1);
+  const successor = f.store.latestRootExecution(f.run.run_id)!;
+  await waitClosed(f.store, f.run.run_id, successor.execution_id);
+  expect(successor.execution_id).not.toBe(incumbent.execution_id);
+  expect(f.manager.effectScope(incumbent.execution_id)).toBeNull();
+  f.toolHost.assertProgramStart = () => { throw new Error("Replayed handoff must not reauthorize"); };
+  expect(data(await f.call("program_run", input, "legal-ceiling-handoff"))).toEqual(first);
+  expect(f.dispatches()).toBe(2);
+});
+
+for (const selected of ["fresh", "bound_without_staging"] as const) test(`prepare_next host start ceilings refuse ${selected} normalized candidates before staging`, async () => {
+  const release = Promise.withResolvers<void>();
+  const f = fixture(async (_body, _args, _handle, _limits, signal) => {
+    await Promise.race([release.promise, aborted(signal)]);
+    return { status: "completed", summary: "Neutral predecessor settled", result: null };
+  });
+  await f.write("ceiling planning incumbent");
+  await f.write("ceiling planning candidate", ceilingResidentSource, { entry: "step" });
+  await f.call("program_run", { operation: "start", name: "ceiling planning incumbent", args: null,
+    next: { after_ms: 0, reason: "Neutral ceiling staging", budget: { calls: 1, tools: 8, duration_ms: 30000 } } });
+  const incumbent = f.store.latestRootExecution(f.run.run_id)!;
+  const flight = f.planning.begin()!;
+  const input = { entry: "step", name: "ceiling planning candidate", args: null, session: { schema_version: 1 } };
+  const id = "ceiling-prepare";
+  if (selected === "bound_without_staging") {
+    const stage = f.planning.stage.bind(f.planning);
+    f.planning.stage = async () => { throw new RuntimeFault("conflict", "Fixture staging withheld"); };
+    expect(data(await f.call("prepare_next", input, id)).error.code).toBe("conflict");
+    f.planning.stage = stage;
+  }
+  f.toolHost.assertProgramStart = assertFixtureStartCeilings;
+  const refused = data(await f.call("prepare_next", input, id));
+  expect(refused.error).toMatchObject({ code: "precondition_failed", message: "Declared resident ceiling exceeded: max_analysis_jobs" });
+  expect(f.store.lookupToolCallBinding(f.run.run_id, id,
+    { tool: "prepare_next", input: prepareNextSchema.parse(input) } as unknown as Json).found).toBe(selected !== "fresh");
+  expect(f.planning.projection()).toMatchObject({ plan_id: flight.plan_id, state: "planning", candidate: null });
+  expect(f.manager.effectScope(incumbent.execution_id)).not.toBeNull();
+  expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(1);
+  expect(f.dispatches()).toBe(1);
+  expect(data(await f.call("prepare_next", input, id))).toEqual(refused);
+  release.resolve();
 });
 
 test("program_submit persists and starts its exact version once and reports pending work to the host", async () => {

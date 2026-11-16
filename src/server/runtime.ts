@@ -60,6 +60,7 @@ import { retainResidentReceipt } from "./resident-evidence.ts";
 import { ExecutiveObservationMonitor } from "./executive-incidents.ts";
 import type { ResidentSnapshot } from "../shared/resident.ts";
 import type { PreparedSourceCandidate } from "./prepared-source-contract.ts";
+import type { SkillStartRequest } from "../shared/programs.ts";
 
 const TERMINAL: Partial<Record<RunView["status"], true>> = {
   stopped: true,
@@ -74,6 +75,8 @@ export interface RuntimeOptions {
   judge?: FastJudgeBroker;
   adapter?: RuntimeAdapter | (() => RuntimeAdapter | null);
   requestAdmission?: StrategicRequestAdmission;
+  /** Optional host-owned finite-scope admission; never modifies requested authority. */
+  assertProgramStart?(request: SkillStartRequest): void;
   /** Explicit embedded ownership for direct SDK consumers/tests, never a failure fallback. */
   strategicAgentFactory?: StrategicAgentFactory;
 }
@@ -83,6 +86,7 @@ export class Runtime {
   readonly historyQueries: HistoryQueryClient;
   private readonly actorFrames: ActorFrameSelector | null;
   private readonly actorFrameSource: RuntimeOptions["actorFrames"];
+  private readonly programStartAdmission: RuntimeOptions["assertProgramStart"];
   private readonly imageAuthorityWaits = new Set<() => void>();
   private readonly skills: SkillManager;
   private readonly sources: SourcePrograms;
@@ -280,6 +284,7 @@ export class Runtime {
   ) {
     this.adapterSource = options.adapter;
     this.actorFrameSource = options.actorFrames;
+    this.programStartAdmission = options.assertProgramStart;
     this.actorFrames = options.actorFrames ? new ActorFrameSelector({
       latestFrame: () => options.actorFrames!.latestFrame(),
       scope: () => {
@@ -340,11 +345,14 @@ export class Runtime {
       observe: () => this.refreshObservation(),
       evaluateGuard: (source, observation, args, signal) =>
         sandbox.evaluateGameGuard(source, observation, args, signal, this.context().adapter),
-      prepareReady: (request, predecessorId, signal, current) =>
-        this.skills.prepareResidentHandoff(this.run!.run_id, request, predecessorId, signal, current),
+      prepareReady: (request, predecessorId, signal, current) => {
+        this.programStartAdmission?.(request);
+        return this.skills.prepareResidentHandoff(this.run!.run_id, request, predecessorId, signal, current);
+      },
       admit: async (request, permit) => {
         permit.assertCurrent();
         if (permit.signal.aborted) throw new RuntimeFault("stale_context", "Plan admission cancelled");
+        this.programStartAdmission?.(request);
         if (request.entry === "step") {
           const predecessor = this.store.latestRootExecution(this.run!.run_id);
           if (!predecessor) throw new RuntimeFault("stale_context", "Prepared continuation lost its predecessor");
@@ -612,20 +620,32 @@ export class Runtime {
         toolRole: () => this.strategic.toolRole(),
         toolAuthority: () => this.strategic.speculativeToolAuthority(),
         finishTask: (summary, callId) => this.finishTask(summary, callId),
+        ...(options.assertProgramStart ? { assertProgramStart: options.assertProgramStart } : {}),
       },
     );
   }
   async modelObservation(): Promise<ModelObservation> {
     const generation = this.generation;
-    const observation = await this.refreshObservation();
-    if (!this.actorFrames) return { observation, images: [], image_metadata: { mode: "disabled" } };
-    const run = this.assertCurrent(generation, observation.epoch);
-    const model = this.auth.snapshot().models.find(model => model.id === run.model_id);
-    if (!model?.input_modalities?.includes("image"))
-      throw new RuntimeFault("precondition_failed", "Image-enabled actor requires discovered SDK image input capability; this is not a live vision claim");
-    const selected = await this.prepareActorFrame(this.actorFrames, generation, observation);
-    this.assertCurrent(generation, observation.epoch);
-    return { observation, images: selected.images, image_metadata: selected.metadata };
+    const runId = this.run?.run_id ?? null;
+    let stage: "refresh_observation" | "image_capability" | "native_image_preparation" | "final_authority" = "refresh_observation";
+    try {
+      const observation = await this.refreshObservation();
+      if (!this.actorFrames) return { observation, images: [], image_metadata: { mode: "disabled" } };
+      stage = "image_capability";
+      const run = this.assertCurrent(generation, observation.epoch);
+      const model = this.auth.snapshot().models.find(model => model.id === run.model_id);
+      if (!model?.input_modalities?.includes("image"))
+        throw new RuntimeFault("precondition_failed", "Image-enabled actor requires discovered SDK image input capability; this is not a live vision claim");
+      stage = "native_image_preparation";
+      const selected = await this.prepareActorFrame(this.actorFrames, generation, observation);
+      stage = "final_authority";
+      this.assertCurrent(generation, observation.epoch);
+      return { observation, images: selected.images, image_metadata: selected.metadata };
+    } catch (error) {
+      this.store.event(runId, "runtime.model_observation_stage_failed",
+        "Authorized observation failed at a fixed preparation stage; no error body retained", { stage });
+      throw error;
+    }
   }
   private async prepareActorFrame(selector: ActorFrameSelector, generation: number, observation: ObservationV3) {
     const source = this.actorFrameSource!;
@@ -633,14 +653,31 @@ export class Runtime {
     const deadlineOsNs = osMonotonicNs() + 1_500_000_000n;
     const cancelled = Promise.withResolvers<never>();
     let delivered = Promise.withResolvers<void>();
+    let invalidationRecorded = false;
     const assertAuthority = () => {
       const run = this.assertCurrent(generation, observation.epoch);
       const state = this.game.snapshot();
-      if (run.life_id !== observation.life.life_id || state.life?.life_id !== observation.life.life_id ||
-        state.session_id !== observation.session_id || state.binding?.native_boot_id !== observation.native_boot_id ||
-        state.binding.compatibility_hash !== observation.compatibility_hash || state.space?.space_epoch !== observation.space.space_epoch ||
-        !sameScreen(state.screen, observation.screen))
+      const runLifeChanged = run.life_id !== observation.life.life_id;
+      const nativeLifeChanged = state.life?.life_id !== observation.life.life_id;
+      const sessionChanged = state.session_id !== observation.session_id;
+      const nativeBootChanged = state.binding?.native_boot_id !== observation.native_boot_id;
+      const compatibilityChanged = state.binding?.compatibility_hash !== observation.compatibility_hash;
+      const spaceChanged = state.space?.space_epoch !== observation.space.space_epoch;
+      const screenChanged = !sameScreen(state.screen, observation.screen);
+      if (runLifeChanged || nativeLifeChanged || sessionChanged || nativeBootChanged ||
+        compatibilityChanged || spaceChanged || screenChanged) {
+        if (!invalidationRecorded) {
+          invalidationRecorded = true;
+          this.store.event(run.run_id, "runtime.model_observation_invalidated",
+            "Native image preparation authority changed; no stale image delivered", {
+              run_life_changed: runLifeChanged, native_life_changed: nativeLifeChanged,
+              session_changed: sessionChanged, native_boot_changed: nativeBootChanged,
+              compatibility_changed: compatibilityChanged, space_changed: spaceChanged,
+              screen_changed: screenChanged,
+            });
+        }
         throw new RuntimeFault("stale_context", "Native image preparation life authority changed");
+      }
     };
     const recheck = () => {
       try { assertAuthority(); }
@@ -1350,12 +1387,14 @@ export class Runtime {
         if (observation.life.status !== "alive")
           throw new RuntimeFault("precondition_failed", "Prepared first-root activation requires a real living player; no automatic respawn");
         const scope = this.effectContext();
-        const root = this.skills.startInitialPrepared(run.run_id, { skill_id: initial.root.skill_id, version: initial.root.version, entry: "step",
+        const request: SkillStartRequest = { skill_id: initial.root.skill_id, version: initial.root.version, entry: "step",
           start_key: `prepared_${initial.preparation_id}`, epoch: scope.epoch, session_id: scope.session_id,
           native_boot_id: scope.native_boot_id, run_generation: scope.run_generation, life_id: scope.life_id,
           space_epoch: scope.space_epoch, compatibility_hash: run.compatibility_hash,
           args: initial.intent, initial_state: initial.initial_state, limits: initial.limits, session: initial.session,
-        }, initial);
+        };
+        this.programStartAdmission?.(request);
+        const root = this.skills.startInitialPrepared(run.run_id, request, initial);
         transferred = true;
         this.store.event(run.run_id, "preparation.executive_admitted", "Clean prepared worker admitted; first actual frame and effects remain separate evidence", {
           preparation_id: initial.preparation_id, execution_id: root.execution_id, source_hash: root.source_hash,

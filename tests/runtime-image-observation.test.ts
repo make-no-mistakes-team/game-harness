@@ -22,12 +22,13 @@ async function fixture() {
   const frames = new Set<(frame: Uint8Array) => void>();
   const subscribed = Promise.withResolvers<void>();
   let packet: Uint8Array | null = null, sequence = 0, observationReads = 0;
+  let screen: GameState["screen"] = null;
   const observation = () => minecraftObservationFixture(adapter, { world_id: world, session_id: session, observation_seq: ++sequence });
   const game: GameBridge = {
     connect: async () => {}, disconnect: async () => {},
     snapshot: (): GameState => ({ status: "connected", username: "Image fixture", version: "1.21.4",
       world_id: world, epoch: 1, session_id: session, life: { life_id: 1, status: "alive", can_respawn: false, death: null },
-      binding: minecraftTestBinding(adapter), space: { dimension_id: "minecraft:overworld", space_epoch: 1 }, screen: null,
+      binding: minecraftTestBinding(adapter), space: { dimension_id: "minecraft:overworld", space_epoch: 1 }, screen,
       presentation: null, last_observation_at: null, error: null,
       video: { status: "streaming", width: 2, height: 2, fps: 30, frames: packet ? 1 : 0, last_frame_at: null, error: null } }),
     observe: async () => { observationReads++; return observation(); }, neutralize: async () => {}, cancel: async () => {},
@@ -53,6 +54,7 @@ async function fixture() {
   await runtime.control(run.run_id, "start");
   return { runtime, store, run, subscribed: subscribed.promise, frameReaders: () => frames.size, observationReads: () => observationReads,
     freshObservation: observation,
+    setScreen(value: GameState["screen"]) { screen = value; },
     publishObservation(value: ObservationV3) { for (const listener of notices) listener({ type: "observation", data: value }); },
     deliver(value: Uint8Array) { packet = value; for (const listener of frames) listener(value); } };
 }
@@ -100,6 +102,27 @@ test("absence of new frame delivery ends at the bounded preparation deadline", a
   expect(f.frameReaders()).toBe(0);
   expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "model.call")).toEqual([]);
 }, 5000);
+
+test("a screen change during image preparation rejects stale pixels and identifies only the changed authority", async () => {
+  const f = await fixture();
+  const pending = f.runtime.modelObservation();
+  void pending.catch(() => {});
+  await f.subscribed;
+  f.setScreen({ screen_id: "fixture-new-screen", incarnation: 1, revision: 1 });
+  f.deliver(nativeFrame({ sequence: 53 }));
+  await expect(pending).rejects.toMatchObject({ code: "stale_context" });
+  expect(f.frameReaders()).toBe(0);
+  const events = f.store.eventsAfter(f.run.run_id, 0, 500);
+  const invalidations = events.filter(event => event.type === "runtime.model_observation_invalidated");
+  expect(invalidations.map(event => event.details)).toEqual([{
+    run_life_changed: false, native_life_changed: false, session_changed: false,
+    native_boot_changed: false, compatibility_changed: false, space_changed: false,
+    screen_changed: true,
+  }]);
+  expect(events.filter(event => event.type === "runtime.model_observation_stage_failed")
+    .map(event => event.details)).toEqual([{ stage: "native_image_preparation" }]);
+  expect(events.filter(event => event.type === "model.call")).toEqual([]);
+});
 
 test("Stop cancels a delivery wait and late frames cannot restore its authority", async () => {
   const f = await fixture();

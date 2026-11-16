@@ -345,18 +345,26 @@ export class ProgramOperations {
             !reference || reference.name !== input.handoff.name || reference.version !== input.handoff.version ||
             reference.execution_ordinal !== input.handoff.execution_ordinal))
           throw new RuntimeFault("precondition_failed", "Handoff must name the exact latest live or successfully completed predecessor");
-        first = true;
-        return { entry: input.entry, skill_id: program.skill_id, version: program.version, start_key: startKey,
+        const request = { entry: input.entry, skill_id: program.skill_id, version: program.version, start_key: startKey,
           epoch: this.run.epoch, session_id: this.run.session_id!, life_id: this.run.life_id!,
           native_boot_id: this.run.native_boot_id!, run_generation: this.host.generation(), space_epoch: this.run.space_epoch!,
           compatibility_hash: this.run.compatibility_hash!,
           args: input.args, limits: input.limits, ...(input.entry === "step" ? { initial_state: input.initial_state,
             ...(input.session ? { session: input.session } : {}) } : {}),
+          ...(input.next ? { lookahead: input.next } : {}) } as SkillStartRequest;
+        // Refusal must precede durable selection, resident preflight and
+        // predecessor retirement. Actor schemas have already supplied defaults.
+        this.host.assertProgramStart?.(request);
+        first = true;
+        return { ...request,
           ...(predecessor ? { handoff_predecessor_id: predecessor.execution_id } : {}),
-          ...(input.next ? { lookahead: input.next } : {}) } as unknown as Json;
+        } as unknown as Json;
       }) as unknown as SkillStartRequest & { handoff_predecessor_id?: string };
       const { handoff_predecessor_id: predecessorId, ...request } = bound;
       const existing = this.skills.get(this.run.run_id, { start_key: startKey });
+      // A durable selection without an execution is not an admission receipt.
+      // Recheck current host ceilings, but never reauthorize a cached execution.
+      if (!first && !existing) this.host.assertProgramStart?.(request);
       if (input.handoff && !existing) {
         if (!predecessorId) throw new RuntimeFault("conflict", "Original handoff selection is unavailable");
         await this.handoffStart(request, predecessorId, callId, identity, first, commit, signal);
@@ -454,14 +462,38 @@ export class ProgramOperations {
     return this.workspace.executionView(this.skills.get(this.run.run_id, { execution_id: execution.execution_id }));
   }
 
+  private preparedStartRequest(input: z.infer<typeof prepareNextSchema>, planId: string,
+    skill: { skill_id: string; version: number }): SkillStartRequest {
+    const plan = this.host.planning().projection();
+    if (!plan || plan.plan_id !== planId)
+      throw new RuntimeFault("stale_context", "Original prepared selection no longer has its planning authority");
+    const basis = plan.basis;
+    return {
+      ...(input.entry === "step"
+        ? { entry: "step", initial_state: input.initial_state, limits: input.limits,
+            ...(input.session ? { session: input.session } : {}) }
+        : { entry: "run", limits: input.limits }),
+      ...skill, start_key: `plan_${planId}`, epoch: basis.epoch, session_id: basis.session_id,
+      life_id: basis.life_id, native_boot_id: basis.native_boot_id, run_generation: basis.generation,
+      space_epoch: basis.space_epoch, compatibility_hash: basis.compatibility_hash, args: input.args,
+    };
+  }
+
   async prepare(input: z.infer<typeof prepareNextSchema>, callId: string) {
+    let first = false;
     const selected = preparedSelectionSchema.parse(this.store.bindToolCall(this.run.run_id, callId,
       { tool: "prepare_next", input } as unknown as Json, () => {
         const plan = this.host.planning().projection();
         if (!plan) throw new RuntimeFault("not_found", "No current planning flight is available");
         const program = this.workspace.select(input, true);
-        return { plan_id: plan.plan_id, skill: { skill_id: program.skill_id, version: program.version } };
+        const skill = { skill_id: program.skill_id, version: program.version };
+        if (program.entry !== input.entry)
+          throw new RuntimeFault("precondition_failed", "Prepared entry does not match the selected immutable source");
+        this.host.assertProgramStart?.(this.preparedStartRequest(input, plan.plan_id, skill));
+        first = true;
+        return { plan_id: plan.plan_id, skill };
       }));
+    if (!first) this.host.assertProgramStart?.(this.preparedStartRequest(input, selected.plan_id, selected.skill));
     const program = this.store.skill(this.run.run_id, selected.skill);
     if (program.entry !== input.entry)
       throw new RuntimeFault("precondition_failed", "Prepared entry does not match the selected immutable source");

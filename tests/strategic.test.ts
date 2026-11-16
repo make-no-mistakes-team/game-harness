@@ -787,22 +787,30 @@ test("revoking scope during image selection cannot prompt and is not a provider 
   expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event => event.type === "model.call")).toBe(false);
 });
 
-test("image encoding failure before prompt is not misclassified as provider failure", async () => {
-  const f = setup(async () => { throw new Error("Encoding failure must not enter prompt"); });
-  Object.assign(f.host, { modelObservation: async () => { throw new RuntimeFault("backend_unavailable", "Native image encoding failed"); } });
-  await f.planner.start(1);
-  const rejected = f.event("runtime.model_observation_failed");
-  f.planner.wake("policy_replan");
-  await rejected;
-  await f.planner.close();
-  expect(f.state.prompts).toBe(0);
-  expect(f.run.usage.calls).toBe(0);
-  expect(f.run.model_status).not.toBe("error");
-  expect(f.run.status).toBe("paused");
-  expect(f.state.pauses).toHaveLength(1);
-  expect(f.state.pauseCauses).toEqual(["observation_unavailable"]);
-  expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event => event.type === "model.call" || event.type === "scheduler.turn_failed")).toBe(false);
-});
+for (const code of ["backend_unavailable", "stale_context"]) {
+  test(`native image ${code} before prompt remains an observation safety pause, not a provider failure`, async () => {
+    const f = setup(async () => { throw new Error("Encoding failure must not enter prompt"); });
+    let captures = 0;
+    Object.assign(f.host, { modelObservation: async () => {
+      captures++;
+      throw new RuntimeFault(code, "SECRET_NATIVE_IMAGE_FAILURE");
+    } });
+    await f.planner.start(1);
+    const rejected = f.event("runtime.model_observation_failed");
+    f.planner.wake("policy_replan");
+    await rejected;
+    await f.planner.close();
+    expect(f.state.prompts).toBe(0);
+    expect(f.run.usage.calls).toBe(0);
+    expect(f.run.model_status).not.toBe("error");
+    expect(f.run.status).toBe("paused");
+    expect(f.state.pauses).toHaveLength(1);
+    expect(f.state.pauseCauses).toEqual(["observation_unavailable"]);
+    expect(captures).toBe(1);
+    expect(JSON.stringify(f.store.eventsAfter(f.run.run_id, 0, 500))).not.toContain("SECRET_NATIVE_IMAGE_FAILURE");
+    expect(f.store.eventsAfter(f.run.run_id, 0, 500).some(event => event.type === "model.call" || event.type === "scheduler.turn_failed")).toBe(false);
+  });
+}
 
 test("next-turn feedback retains safe validation locations and generated failure identity", async () => {
   const f = setup(async (_text, agent) => { await callGate(agent); agent.emit({}); });

@@ -30,6 +30,42 @@ function assertOwnedClosed(f: ProcessFixture) {
 
 // These are generic selected-session/process/wire ownership tests. They contain
 // no gameplay source, real inference, action execution, sandbox or native driver.
+for (const change of ["none", "root", "life"] as const) {
+  test(`observation rejection records ${change} authority change without leaking native errors or retrying capture`, async () => {
+    const f = fixture("observation"), entered = deferred(), release = deferred();
+    await retainFiniteExecutive(f);
+    const root = vi.spyOn(f.store, "latestRootExecution").mockImplementation(() => f.state.root);
+    cleanup.push(() => root.mockRestore());
+    let captures = 0;
+    f.host.modelObservation = async () => {
+      captures++; entered.resolve(); await release.promise;
+      throw new RuntimeFault("stale_context", "SECRET_NATIVE_OBSERVATION_FAILURE");
+    };
+    cleanup.push(() => release.resolve());
+    await f.client.start(1);
+    f.client.wake("observation"); await entered.promise;
+    const originalTurn = f.client.snapshot().turn_id;
+    if (change === "root") f.state.root = { ...f.state.root!, execution_id: "replacement-metadata-root" };
+    if (change === "life") f.run.life_id = (f.run.life_id ?? 0) + 1;
+    release.resolve();
+    expect(await f.marker("observation_rejected")).toEqual({ message: "Cognition transport unavailable" });
+    const events = f.store.eventsAfter(f.run.run_id, 0, 100);
+    expect(events.find(event => event.type === "cognition.model_observation_rejected")?.details).toEqual({
+      reason: "stale_context", turn_id: originalTurn, request_id: null,
+      run_replaced: false, generation_changed: false, phase_changed: false,
+      run_scope_changed: change === "life", root_changed: change === "root",
+      native_guard: "not_reported", provider_request_made: false, capture_retried: false,
+    });
+    expect(JSON.stringify(events)).not.toContain("SECRET_NATIVE_OBSERVATION_FAILURE");
+    expect(events.some(event => event.type === "model.call" ||
+      event.type === "fixture.cognition" && event.summary === "observation_returned")).toBe(false);
+    expect(captures).toBe(1);
+    expect(f.owner.resolutions).toBe(0);
+    expect(f.pauses).toEqual([]);
+    await f.client.close(); assertOwnedClosed(f);
+  }, 10_000);
+}
+
 test("ordinary start owns a distinct real process and graceful close joins both ordinary pipes", async () => {
   const f = fixture(); await f.client.start(1);
   expect(f.processes[0]!.pid).not.toBe(process.pid);

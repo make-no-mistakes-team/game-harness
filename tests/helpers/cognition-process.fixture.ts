@@ -325,7 +325,16 @@ async function runOwnedProtocolFixture(): Promise<void> {
     }
     if (method === "wake") {
       const { reason } = body as { reason: string };
-      if (reason === "context" && input!.goal.prompt.startsWith("context_")) {
+      if (reason === "observation" && input!.goal.prompt === "observation") {
+        const id = "observation-turn";
+        await wire.call("turn", { id, deadline_os_ns: (osMonotonicNs() + 10_000_000_000n).toString() });
+        try {
+          await wire.call("model_observation", null);
+          await marker("observation_returned");
+        } catch (error) {
+          await marker("observation_rejected", { message: error instanceof Error ? error.message : "Unknown error" });
+        } finally { await wire.call("turn_end", { id }); }
+      } else if (reason === "context" && input!.goal.prompt.startsWith("context_")) {
         const id = "finite-context", deadline = osMonotonicNs() + 200_000_000n;
         await wire.call("context_begin", { id, deadline_os_ns: deadline.toString() });
         await marker("context_entered");

@@ -18,6 +18,7 @@ import { ProgramOperations } from "./program-operations.ts";
 import { programHelp } from "./program-help.ts";
 import { runtimeToolCatalogue, runtimeToolDescriptor, type RuntimeToolCatalogueEntry, type RuntimeToolInputs, type RuntimeToolName } from "./runtime-tool-catalog.ts";
 import { residentJsonConstraint } from "../shared/resident.ts";
+import type { SkillStartRequest } from "../shared/programs.ts";
 
 type RuntimeToolHandler<Name extends RuntimeToolName> = (
   input: RuntimeToolInputs[Name], callId: string, signal: AbortSignal | undefined, commit: () => void,
@@ -60,6 +61,10 @@ export interface RuntimeToolHost {
   generation(): number;
   attentionAfter(ms: number, reason: string): void;
   admitted(): void;
+  /** Optional host-owned ceiling check on normalized requests. Throw to refuse;
+   * never mutate, clamp or grant authority. Existing execution receipts bypass it.
+   * Planning hosts must also check before preparation and final admission. */
+  assertProgramStart?(request: SkillStartRequest): void;
   history(): HistoryQueryClient;
   planning(): SpeculativePlanning;
   learning(): ImprovementLearning;

@@ -379,6 +379,16 @@ The tool factory explicitly sets `strict:false` at the provider boundary to pres
 
 For `program_submit`, `program_run` start and prepared successors, omitted `limits` or `{}` selects the documented defaults; valid partial objects override only supplied fields. The host records a complete strict effective limits object. Explicit invalid values, wrong types and unknown properties are rejected, not clamped. The installed SDK's supported lenient-validation hook preserves the actor's raw own properties for host validation before identity lookup or persistence; SDK coercion must not turn an invalid argument into an accepted operation or replay. Only proven failures of that tool's own input schema receive structured `invalid_request` diagnostics. Malformed SDK argument JSON remains SDK-owned; arbitrary host errors are not relabeled harmless validation failures.
 
+Embedded callers can set `RuntimeOptions.assertProgramStart` to enforce stricter
+declared limits. It receives the complete normalized start request before
+execution acceptance or predecessor retirement, including live replacements,
+submissions, prepared continuations and the initial prepared root. A refusal
+leaves a viable incumbent running; a refused submission retains its saved source.
+Cached selections without an execution are checked again. Existing execution
+receipts remain evidence-only replays. The hook supplies no default policy and
+never clamps requests or renews deadlines; checking only the first root does not
+constrain later Main starts.
+
 Unknown-field diagnostics include the containing `path` and up to eight actor-supplied `keys`, each bounded to 80 UTF-16 code units. `omitted_keys` counts excluded names; `key_names_truncated:true` identifies shortened names. Values are never included in these hints. A rejected input still admits no operation; the model must explicitly correct its arguments within existing authority and budgets.
 
 A new `name` creates a family and omits `based_on`. An existing name requires `based_on` equal to its latest stored version, even if unexecuted, not its latest executed version. The host checks that parent before validation and before commit; stale-parent errors identify the current named version, never silently rebase. Revisions preserve the family name, canonical source/hash and parent lineage.
@@ -1165,6 +1175,13 @@ retained historical artifacts are not rewritten.
 The codec uses fast lossless deflate with a bounded 256 KiB output chunk. In the pinned Bun runtime, exhausting its default 16 KiB output buffer schedules another [worker/event-loop continuation](https://github.com/oven-sh/bun/blob/bun-v1.3.14/src/js/node/zlib.ts#L458-L495); a large PNG can otherwise accumulate many continuations under live raw-video I/O. This changes compressed bytes and storage cost, not pixels, permissions, the actor image cap or recorder queue limits. The selected zero-provider `scripts/native-recording-proof.ts --allow-native --jar <fresh.jar> --natural-start` case captures ordinary seed-1 startup with concurrent observations/actor-image selection and no setup commands or gameplay effects. It is recording infrastructure evidence, not model gameplay or a general throughput guarantee.
 
 After rejecting an old buffered image, Runtime may wait for a new delivered frame through the bridge subscription within one 1500 ms preparation window. It rechecks run/session/life, native boot, profile, space and screen authority during that wait and cancels on generation fences. It does not substitute stale pixels, fall back to text or make another provider request. These are host selection checks, not capture-time synchronization.
+
+Observation failures retain a fixed preparation stage. Native image invalidation
+records which life, session, boot, profile, space or screen check changed;
+cognition records separate scope-change flags at the RPC rejection. These
+diagnostics contain no exception body or credentials. A nearby root handoff alone
+does not identify the failed check. Rejection still delivers no stale image,
+retries no capture or inference, and preserves the ordinary safety pause.
 
 Runtime accepts a bridge-delivered structured observation through its ordinary schema, run-authority, evidence and goal path without issuing an echo native read. Duplicate or older observation sequences do not create fresh evidence. Explicit observation requests still acquire current native state. The recording proof's optional `--natural-start --runtime-load` condition includes a real SDK Agent, Runtime, Store, actor image and private journal with an abortable local stream; it makes no provider calls or gameplay effects. A direct recorder-only pass does not establish throughput under that integrated workload.
 

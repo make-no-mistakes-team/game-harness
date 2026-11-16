@@ -73,6 +73,8 @@ Consider whether the budget prevented meaningful completion before attributing
 failure to the model or switching models.
 
 Propose larger limits, including substantially larger ones, when justified.
+For a recurring constraint, explicitly offer a permanent default change rather
+than only repeated temporary exceptions.
 Before increasing any model-run or experiment limit, obtain explicit user
 approval: state the old and proposed values, reason, cost or resource risks,
 and whether the change is permanent or applies only to specified runs. Use

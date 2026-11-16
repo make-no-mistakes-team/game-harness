@@ -9,6 +9,7 @@ import type { NativeProcess } from "../server/minecraft-client.ts";
 import { normalizeNativeEvaluation, type NativeEvaluationOptions } from "../server/native-evaluation.ts";
 import type { GameBridgeClient } from "../server/game-bridge.ts";
 import type { MinecraftServer } from "../server/minecraft-server.ts";
+import type { FabricServerArtifactSource } from "../server/minecraft-server-artifact.ts";
 import type { EvaluationCaps } from "./contracts.ts";
 import type { WorldConditions } from "./scenarios.ts";
 import { minecraftObservationV3Schema, type MinecraftObservation, type MinecraftObservationData } from "../shared/minecraft.ts";
@@ -85,6 +86,8 @@ export interface NativeFixtureOptions {
   caps?: EvaluationCaps;
   /** Existing GameHarness data root; only nonsecret provisioning consent is copied. */
   authDirectory?: string;
+  /** Explicit host-only public dependency source; never copies world or client state. */
+  serverArtifact?: FabricServerArtifactSource;
   /** Omitted only for explicitly synthetic technical diagnostics. */
   conditions?: WorldConditions;
   /** Trusted conformance label; exercises the actual checked Java long boundary. */
@@ -127,7 +130,8 @@ export class NativeFixture {
     readonly caps: EvaluationCaps, private readonly authDirectory: string, private readonly conditions?: WorldConditions,
     private readonly initialEpoch = 1, private readonly evaluation: Readonly<NativeEvaluationOptions> | null = null,
     private readonly deadlineHostMs = Infinity, private readonly preparationDeadlineHostMs = Infinity,
-    private readonly beforePlayerJoin?: NativeFixtureOptions["beforePlayerJoin"]) {
+    private readonly beforePlayerJoin?: NativeFixtureOptions["beforePlayerJoin"],
+    private readonly serverArtifact?: FabricServerArtifactSource) {
     this.evidenceDirectory = path.join(root, "evidence");
     this.report = { root, port, started_at: new Date().toISOString(), pass: false, cleanup: false,
       classification: conditions ? "natural_normal_survival_actual_model_acceptance" : "synthetic_caller_privileged_evaluator_infrastructure_not_model_gameplay",
@@ -172,7 +176,8 @@ export class NativeFixture {
     process.env.GAMEHARNESS_MINECRAFT_PORT = String(port);
     requireProof(Number.isSafeInteger(options.initialEpoch ?? 1) && (options.initialEpoch ?? 1) >= 0, "Native fixture epoch must be a nonnegative safe integer");
     const fixture = new NativeFixture(project, root, port, options.caps ?? DEFAULT_EVALUATION_CAPS, authDirectory, options.conditions, options.initialEpoch ?? 1, evaluation,
-      options.deadlineHostMs, options.preparationDeadlineHostMs, options.beforePlayerJoin);
+      options.deadlineHostMs, options.preparationDeadlineHostMs, options.beforePlayerJoin,
+      options.serverArtifact && { ...options.serverArtifact });
     await fixture.flush();
     return fixture;
   }
@@ -224,7 +229,7 @@ export class NativeFixture {
       "Native evaluation needs a fresh command process; production config was imported before fixture isolation");
     this.assertPreparation();
     this.server = new MinecraftServer(() => {}, (type, summary, details) => { this.timeline.push({ at: new Date().toISOString(), type, summary, details }); },
-      this.conditions ? { worldSeed: this.conditions.seed } : {});
+      { ...(this.conditions ? { worldSeed: this.conditions.seed } : {}), serverArtifact: this.serverArtifact });
     this.bridge = new GameBridgeClient(this.project, { dataDir: this.root, evaluation: this.evaluation ?? undefined });
     this.detach.push(this.bridge.subscribeFrames(() => { this.frames++; }));
     this.detach.push(this.bridge.subscribe(notice => {

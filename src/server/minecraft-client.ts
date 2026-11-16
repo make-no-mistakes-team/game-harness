@@ -28,6 +28,12 @@ import {
   type NativeEvaluationOptions,
 } from "./native-evaluation.ts";
 import { javaProxyArguments } from "./java-network.ts";
+import {
+  hasCompletedFabricInstallation,
+  recordCompletedFabricInstallation,
+  stageFabricServerArtifact,
+  type FabricServerArtifactSource,
+} from "./minecraft-server-artifact.ts";
 
 export const JAVA = process.env.JAVA_HOME
   ? path.resolve(process.env.JAVA_HOME, "bin", "java")
@@ -150,12 +156,14 @@ export async function prepareFabricServer(
   directory: string,
   java = JAVA,
   signal?: AbortSignal,
+  serverArtifact?: FabricServerArtifactSource,
 ) {
   signal?.throwIfAborted();
   const proxyArguments = javaProxyArguments(process.env);
   await prepareNativeMod(projectRoot, directory, signal);
   const launcher = path.join(directory, "fabric-server-launch.jar");
-  if (!(await exists(launcher))) {
+  if (!(await hasCompletedFabricInstallation(directory, LOADER))) {
+    if (serverArtifact) await stageFabricServerArtifact(projectRoot, directory, serverArtifact, signal);
     const installer = path.join(directory, "fabric-installer-1.0.1.jar");
     const url =
       "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.0.1/fabric-installer-1.0.1.jar";
@@ -190,26 +198,26 @@ export async function prepareFabricServer(
         env: { PATH: "/usr/bin:/bin", HOME: directory, LANG: "C.UTF-8" },
       },
     );
-    const abort = () => child.kill("SIGKILL");
+    let reason: "caller_abort" | "timeout" | "spawn_failure" | null = null;
+    const abort = () => { reason ??= "caller_abort"; child.kill("SIGKILL"); };
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
-    const timer = setTimeout(abort, 240000);
-    child.once("error", () =>
-      installation.reject(
-        new Error("Fabric server installer could not start."),
-      ),
-    );
-    child.once("close", (code) => {
+    const timer = setTimeout(() => { reason ??= "timeout"; child.kill("SIGKILL"); }, 240000);
+    child.once("error", () => { reason = "spawn_failure"; });
+    child.once("close", (code, exitSignal) => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
-      code === 0 && !signal?.aborted
+      code === 0 && !signal?.aborted && reason === null
         ? installation.resolve()
         : installation.reject(
-            new Error("Fabric server installation failed or was cancelled."),
+            new Error(`Fabric server installation failed (stage=installer; reason=${reason ?? (signal?.aborted ? "caller_abort" : "nonzero_exit")}; exit=${code}; signal=${exitSignal && /^SIG[A-Z0-9]+$/.test(exitSignal) ? exitSignal : "none"}).`),
           );
     });
     await installation.promise;
+    signal?.throwIfAborted();
+    await recordCompletedFabricInstallation(directory, LOADER, signal);
   }
+  signal?.throwIfAborted();
   return launcher;
 }
 

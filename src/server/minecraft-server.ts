@@ -11,10 +11,12 @@ import {
 } from "./config.ts";
 import {
   JAVA,
+  LOADER,
   prepareFabricServer,
   prepareNativeMod,
   privateJson,
 } from "./minecraft-client.ts";
+import { hasCompletedFabricInstallation, type FabricServerArtifactSource } from "./minecraft-server-artifact.ts";
 import type { GameServerState, Json } from "../shared/contracts.ts";
 
 const EULA_URL = "https://www.minecraft.net/en-us/eula";
@@ -28,6 +30,8 @@ interface OwnedServer {
 export interface MinecraftServerOptions {
   /** Trusted host configuration for a new ordinary world, never a model capability. */
   worldSeed?: string;
+  /** Trusted host-selected existing public dependency cache; no world or player state. */
+  serverArtifact?: FabricServerArtifactSource;
 }
 /** Host-only owner of one local Fabric process. No console or credentials cross the program API. */
 export class MinecraftServer {
@@ -50,6 +54,7 @@ export class MinecraftServer {
   private closePromise: Promise<void> | null = null;
   private active: AbortController | null = null;
   private readonly worldSeed: string | undefined;
+  private readonly serverArtifact: FabricServerArtifactSource | undefined;
   constructor(
     private readonly onChange: () => void,
     private readonly onEvent: (
@@ -63,6 +68,7 @@ export class MinecraftServer {
     if (seed !== undefined && (!seed || seed.length > 128 || seed.trim() !== seed || /[\x00-\x1f\x7f\\=:]/.test(seed)))
       throw new Error("World seed must be one bounded property value without control characters or property escapes");
     this.worldSeed = seed;
+    this.serverArtifact = options.serverArtifact && { ...options.serverArtifact };
   }
   snapshot(): GameServerState {
     return { ...this.state };
@@ -159,6 +165,7 @@ export class MinecraftServer {
           this.directory(),
           JAVA,
           controller.signal,
+          this.serverArtifact,
         );
         if (ticket !== this.generation)
           throw new Error("Minecraft operation was cancelled.");
@@ -230,12 +237,7 @@ export class MinecraftServer {
     await this.initialize();
     if (this.process?.ready) return;
     if (
-      !(await access(
-        path.join(this.directory(), "fabric-server-launch.jar"),
-      ).then(
-        () => true,
-        () => false,
-      ))
+      !(await hasCompletedFabricInstallation(this.directory(), LOADER))
     )
       await this.prepare(false);
     const ticket = this.generation;

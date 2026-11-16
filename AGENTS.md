@@ -64,6 +64,11 @@ safety, concurrency limits, frozen experiment protocols, explicit stop
 instructions or successful-run manual-review pauses. It does not permit
 silently substituting Luna for a different model in a declared experiment.
 
+The default resident step budget remains 25 ms. The user permits temporary
+50 ms step budgets in individually declared finite development experiments;
+record the override in each declaration. This does not authorize changing the
+default or increasing other limits.
+
 ### Budget-limited outcomes
 
 Treat exhaustion of a run's time, request, token, tool, analysis or evidence

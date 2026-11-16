@@ -201,15 +201,16 @@ The non-renewing bounds in [`PREPARED_START_LIMITS`](../src/shared/prepared-star
 
 | Resource | Bound per attempt |
 | --- | --- |
-| Original preparation deadline, including compile and join through transfer | 600,000 ms |
-| Model requests / tool admissions | 24 / 48 |
+| Original preparation deadline, including compile and join through transfer | 1,200,000 ms |
+| Model requests / tool admissions | 48 / 96 |
 | All immutable source versions / cumulative canonical source | 64 / 524,288 bytes |
 | Pure analysis jobs | 8 |
 | Evaluation time per analysis job / cumulative evaluation time | 500 ms / 4,000 ms |
 
 These defaults apply to new attempts. Retained preparation views keep their
-original request and time limits and deadlines; reading them neither upgrades
-their allowance nor renews authority.
+original limits and deadlines, including attempts with 12 requests / 300,000 ms
+or 24 requests / 600,000 ms and their original 48-tool allowance. Reading them
+neither upgrades their allowance nor renews authority.
 
 Ordinary per-definition and module-closure limits also apply. The private journal permits 16 MiB plus a 1 MiB terminal reserve, with a 2 MiB record cap. Failed work and source revisions do not renew allowances; evidence persistence failure fences preparation and blocks new admission.
 

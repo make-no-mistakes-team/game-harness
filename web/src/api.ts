@@ -230,7 +230,7 @@ const preparedStart: z.ZodType<PreparedStartView> = preparedStartRequestSchema.o
   limits: z.object({
     duration_ms: z.int().positive(),
     max_requests: z.int().positive(),
-    max_tools: z.literal(PREPARED_START_LIMITS.max_tools),
+    max_tools: z.int().positive(),
     max_source_versions: z.literal(PREPARED_START_LIMITS.max_source_versions),
     max_source_bytes: z.literal(PREPARED_START_LIMITS.max_source_bytes),
     max_analysis_jobs: z.literal(PREPARED_START_LIMITS.max_analysis_jobs),

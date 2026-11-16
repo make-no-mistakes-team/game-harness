@@ -201,7 +201,8 @@ test("live remaining budgets let the selected model seal on its last request wit
     await f.owner.initialize(); await f.owner.start(f.request);
     const view = await f.terminal;
     expect(view).toMatchObject({ phase: "started", closure: "transferred",
-      requests_admitted: PREPARED_START_LIMITS.max_requests, source_versions: 1 });
+      requests_admitted: PREPARED_START_LIMITS.max_requests, tools_used: PREPARED_START_LIMITS.max_requests,
+      source_versions: 1 });
     expect(budgets.map(value => value.requests_remaining_after_this_request))
       .toEqual(Array.from({ length: PREPARED_START_LIMITS.max_requests }, (_, index) => PREPARED_START_LIMITS.max_requests - index - 1));
     expect(budgets[0]).toMatchObject({ tools_remaining: PREPARED_START_LIMITS.max_tools,
@@ -600,20 +601,78 @@ test("copy and edit share immutable all-history version and source-byte budgets"
   expect(largeBook.versions).toBe(maximumVersions);
 });
 
-test("source edits do not renew the original forty-eight-tool allowance", async () => {
-  const calls: Call[] = [rootCalls()[0]!];
-  for (let version = 1; version <= PREPARED_START_LIMITS.max_tools; version++)
-    calls.push({ name: "program_edit", args: { name: "executive", based_on: version,
-      edits: [{ old_text: version === 1 ? "software fixture only" : `software fixture revision ${version}`,
-        new_text: `software fixture revision ${version + 1}` }] } });
-  calls.push({ ...rootCalls()[1]!, args: { ...rootCalls()[1]!.args as object, version: PREPARED_START_LIMITS.max_tools } });
-  const f = fixture(calls);
-  await f.owner.initialize(); await f.owner.start(f.request); const terminal = await f.terminal;
-  expect(terminal.tools_used).toBe(PREPARED_START_LIMITS.max_tools);
-  expect(terminal.source_versions).toBe(PREPARED_START_LIMITS.max_tools);
-  expect(terminal.phase).toBe("failed");
-  expect(f.counters()).toMatchObject({ compiled: 0, activated: 0 });
-  await f.owner.close();
+test("source edits and reads do not renew the original ninety-six-tool allowance", async () => {
+  const descriptor = getBundledModels("openai-codex").find(value => value.api === "openai-codex-responses");
+  if (!descriptor) throw new Error("Installed offline SDK model descriptor unavailable");
+  const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
+  const calls: Call[] = [rootCalls()[0]!, { name: "program_edit", args: { name: "executive", based_on: 1,
+    edits: [{ old_text: "software fixture only", new_text: "software fixture revision 2" }] } }];
+  while (calls.length < PREPARED_START_LIMITS.max_tools)
+    calls.push({ name: "program_inspect", args: { view: "catalog" } });
+  const toolsPerResponse = 12;
+  const responses = Array.from({ length: Math.ceil(calls.length / toolsPerResponse) },
+    (_, index) => calls.slice(index * toolsPerResponse, (index + 1) * toolsPerResponse));
+  responses.at(-1)!.push(
+    { name: "program_edit", args: { name: "executive", based_on: 2,
+      edits: [{ old_text: "software fixture revision 2", new_text: "software fixture revision 3" }] } },
+    { ...rootCalls()[1]!, args: { ...rootCalls()[1]!.args as object, version: 3 } },
+  );
+  const budgets: { tools_remaining: number; source_versions_remaining: number; deadline_at: string }[] = [];
+  const results: AgentToolResult[] = [];
+  const f = fixture([], { auth: {
+    snapshot: sourceAuthState,
+    createAgent: async options => new Agent({
+      initialState: { model, systemPrompt: options.systemPrompt, tools: options.tools.map(tool => ({
+        ...tool, execute: async (...args: Parameters<typeof tool.execute>) => {
+          const result = await tool.execute(...args); results.push(result); return result;
+        },
+      })) },
+      getApiKey: () => "OFFLINE_PROTOCOL_FIXTURE_NO_NETWORK",
+      streamFn: (_model, context) => {
+        const last = context.messages.at(-1);
+        const text = last?.role === "user" && Array.isArray(last.content)
+          ? last.content.find(part => part.type === "text") : null;
+        const budget = text?.type === "text" ? JSON.parse(text.text).preparation_budget as typeof budgets[number] | undefined : undefined;
+        if (!budget) throw new Error("Selected model cannot see its current preparation allowance");
+        const index = budgets.length, response = responses[index];
+        if (!response) throw new Error("Exhausted tools must not admit another response");
+        budgets.push(budget);
+        const message: AssistantMessage = { role: "assistant", api: model.api, provider: model.provider, model: model.id,
+          content: response.map((call, toolIndex) => ({ type: "toolCall",
+            id: `tools_${index}_${toolIndex}|provider_${index}_${toolIndex}`, name: call.name,
+            arguments: call.args as Record<string, unknown> })),
+          stopReason: "toolUse", timestamp: 0,
+          usage: { input: 11, output: 7, cacheRead: 0, cacheWrite: 0, totalTokens: 18,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+        const stream = new AssistantMessageEventStream();
+        stream.push({ type: "start", partial: message });
+        stream.push({ type: "done", reason: "toolUse", message }); stream.end(); return stream;
+      },
+    }),
+    releaseAgent: async agent => { agent.abort(); await agent.waitForIdle(); },
+  } });
+  try {
+    await f.owner.initialize(); const accepted = await f.owner.start(f.request);
+    const terminal = await f.terminal;
+    expect(accepted.limits).toMatchObject({ max_tools: 96, max_source_versions: 64 });
+    expect(terminal).toMatchObject({ phase: "failed", closure: "closed", tools_used: 96,
+      source_versions: 2, requests_admitted: responses.length, deadline_at: accepted.deadline_at });
+    expect(budgets.map(value => value.tools_remaining))
+      .toEqual(responses.map((_, index) => PREPARED_START_LIMITS.max_tools - index * toolsPerResponse));
+    expect(budgets[0]!.source_versions_remaining).toBe(64);
+    for (const budget of budgets.slice(1)) {
+      expect(budget.source_versions_remaining).toBe(62);
+      expect(budget.deadline_at).toBe(accepted.deadline_at);
+    }
+    expect(results).toHaveLength(PREPARED_START_LIMITS.max_tools + 2);
+    expect(results.slice(0, PREPARED_START_LIMITS.max_tools).every(result => !result.isError)).toBe(true);
+    for (const result of results.slice(PREPARED_START_LIMITS.max_tools)) {
+      expect(result.isError).toBe(true);
+      expect(result.details).toMatchObject({ failed: true, code: "precondition_failed",
+        error: "Finite preparation tool budget exhausted" });
+    }
+    expect(f.counters()).toMatchObject({ compiled: 0, activated: 0 });
+  } finally { await f.owner.close(); }
 });
 
 test("pretransfer launch cancellation joins its launch owner and refuses a late worker claim", async () => {

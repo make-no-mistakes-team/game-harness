@@ -200,7 +200,7 @@ function preparedViewFixture(patch: Partial<PreparedStartView> = {}): PreparedSt
   return {
     preparation_id: "prepared/fixture", task: "Gather supplies", model_id: "fixture-discovered-model",
     goal: { adapter_id: "minecraft", goal_id: "custom", verifier: null, parameters: { declared: "fixture" } },
-    phase: "compiling", started_at: "2026-11-10T10:00:00.000Z", deadline_at: "2026-11-10T10:05:00.000Z",
+    phase: "compiling", started_at: "2026-11-10T10:00:00.000Z", deadline_at: "2026-11-10T10:20:00.000Z",
     ready_at: null, run_id: null, requests_admitted: 2, tools_used: 4, source_versions: 3,
     analysis_jobs: 1, analysis_ms: 31.75, program: { name: "Fixture source", version: 3 },
     usage: preparedUsageFixture(), limits: PREPARED_START_LIMITS, closure: "open", error: null, ...patch,
@@ -264,18 +264,29 @@ test("prepared HTTP interactions retain exact request identity, source metadata 
 test("retained preparations keep their original budgets after new defaults increase", async () => {
   await withApiResponse(async respond => {
     const client: typeof import("./api.ts") = await import(new URL("./api.ts?retained-preparation-budget", import.meta.url).href);
-    const historical = {
-      ...preparedViewFixture({ phase: "failed", closure: "closed" }),
-      limits: { ...PREPARED_START_LIMITS, duration_ms: 300000, max_requests: 12 },
-    };
-    respond({ ...preparedStateFixture(null), prepared_start: historical });
-    const retained = (await client.fetchState()).prepared_start;
-    expect(retained).toEqual(historical);
-    expect(retained?.deadline_at).toBe("2026-11-10T10:05:00.000Z");
-    const current = preparedViewFixture({ deadline_at: "2026-11-10T10:10:00.000Z" });
+    const historical = [
+      { duration_ms: 300000, max_requests: 12, deadline_at: "2026-11-10T10:05:00.000Z" },
+      { duration_ms: 600000, max_requests: 24, deadline_at: "2026-11-10T10:10:00.000Z" },
+    ].map(({ deadline_at, ...limits }) => preparedViewFixture({
+      phase: "failed", closure: "closed", deadline_at,
+      limits: { ...PREPARED_START_LIMITS, ...limits, max_tools: 48 },
+    }));
+    const retained: (PreparedStartView | null)[] = [];
+    for (const view of historical) {
+      respond(preparedStateFixture(view));
+      const parsed = (await client.fetchState()).prepared_start;
+      expect(parsed).toEqual(view);
+      expect(parsed?.deadline_at).toBe(view.deadline_at);
+      expect(parsed?.limits).toEqual(view.limits);
+      retained.push(parsed);
+    }
+    const current = preparedViewFixture();
     respond(preparedStateFixture(current));
-    expect((await client.fetchState()).prepared_start).toEqual(current);
-    expect(retained?.limits).toEqual(historical.limits);
+    const parsed = (await client.fetchState()).prepared_start;
+    expect(parsed).toEqual(current);
+    expect(parsed?.limits).toMatchObject({ duration_ms: 1200000, max_requests: 48, max_tools: 96 });
+    expect(parsed?.deadline_at).toBe("2026-11-10T10:20:00.000Z");
+    expect(retained).toEqual(historical);
   });
 });
 
@@ -294,6 +305,8 @@ test("prepared snapshot requires explicit null and rejects missing finite limits
       { ...view, limits: { ...view.limits, max_requests: 1.5 } },
       { ...view, limits: { ...view.limits, max_requests: Number.MAX_SAFE_INTEGER + 1 } },
       { ...view, limits: { ...view.limits, duration_ms: 0 } },
+      ...[undefined, null, "96", -1, 0, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]
+        .map(max_tools => ({ ...view, limits: { ...view.limits, max_tools } })),
       { ...view, limits: { ...view.limits, max_analysis_ms: undefined } },
       { ...view, program: { name: "Fixture source" } },
       { ...view, program: { name: "Fixture source", version: 0 } },

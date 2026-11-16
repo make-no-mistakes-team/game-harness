@@ -10,7 +10,7 @@ export const preparedStartRequestSchema = z.object({
 export type PreparedStartRequest = z.infer<typeof preparedStartRequestSchema>;
 export type PreparedStartPhase = "authoring" | "compiling" | "ready" | "joining" | "activating" |
   "started" | "cancelling" | "cancelled" | "failed";
-export const PREPARED_START_LIMITS = Object.freeze({ duration_ms: 600000, max_requests: 24, max_tools: 48,
+export const PREPARED_START_LIMITS = Object.freeze({ duration_ms: 1200000, max_requests: 48, max_tools: 96,
   max_source_versions: 64, max_source_bytes: 524288, max_analysis_jobs: 8,
   analysis_job_ms: 500, max_analysis_ms: 4000 });
 

@@ -38,8 +38,10 @@ export interface PreparedSourceOptions {
   changed(): void;
   record(type: string, summary: string, details: Json): void;
 }
-const finishSchema = programSelectorSchema.required({ version: true }).extend({ args: residentIntentSchema,
-  initial_state: residentStateSchema, limits: residentActorLimitsSchema, session: controlSessionConfigSchema }).strict();
+const finishSchema = programSelectorSchema.required({ version: true }).extend({
+  args: residentIntentSchema.describe("Exact JSON passed unchanged as initial intent. Select the value your final code actually accepts and checks; null and {} are distinct."),
+  initial_state: residentStateSchema.describe("Exact JSON passed unchanged to activate as state. {} is not a fresh-state marker. If your activate initializes only from null, select null; check this exact selected value, not a different test initializer."),
+  limits: residentActorLimitsSchema, session: controlSessionConfigSchema }).strict();
 type Finish = z.infer<typeof finishSchema>;
 const inspectSchema = z.discriminatedUnion("view", [z.object({ view: z.literal("catalog") }).strict(),
   programSelectorSchema.extend({ view: z.literal("source") }).strict(),

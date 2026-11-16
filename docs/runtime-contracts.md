@@ -214,6 +214,13 @@ not change immutable tool receipts or renew any allowance.
 
 The model must call `prepare_finish` with an exact `step` version exporting both `activate(frame,state,intent)` and `step(frame,state,intent)`, plus explicit args, initial state, finite resident limits and a control-session configuration. Sealing fences further tools and inference. The host joins inference/tool drain, then compiles the pinned bundle in a clean isolated worker without invoking either entry. `ready` means that worker exists and supports activation; it is not a gameplay result. The coordinator rechecks idle ownership, artifact SHA-256 and compatibility before reserving a new native launch.
 
+Selected `initial_state` and `args` reach `activate` unchanged as state and intent.
+`null` and `{}` are different values. An empty object does not request fresh
+initialization or acquire matching life/space fields. If the authored initializer
+accepts only `null` for a fresh start, selecting `{}` can legitimately refuse.
+Software checks should use the values actually selected; checking `null` does
+not validate a later empty-object selection.
+
 Only actual joined readiness permits Runtime to create a real executive run with fresh working programs, retain authoring usage and import the exact selected source closure. Ordinary preflight acquires authoritative state and requires a living player; startup never respawns automatically. SkillManager checks the bundle, root, args, state, limits and session against the sealed candidate, then admits the root in Store **before** taking its worker exactly once under that real run ID. The controller invokes `activate` on its first actual frame. There is no predecessor, synthetic activation frame or probe result to replay. Worker transfer, activation, applied input and verified task success remain separate facts. The host supplies no gameplay policy.
 
 An identical `request_id` and body returns the retained receipt without another model call, compile or launch; a changed body conflicts. Same-identity tool retries likewise retain their original receipts. `POST /v1/prepared-start/{preparation_id}/cancel` with `{}` fences inference and pending compilation synchronously, then joins owned inference, tools, workers and any untransferred native launch. Closure is `closed` only after confirmed cleanup. Failed or interrupted ownership without confirmed drain remains `unknown`, blocks new preparation and is never replayed after restart.

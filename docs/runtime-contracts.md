@@ -933,14 +933,21 @@ separate from confirming worker closure and exact native retirement. This keeps
 an invalid activation from falsely requiring a game disconnect. Shadow probes
 also validate the selected raw/executive contract before retiring an incumbent.
 
-Resident worker faults carry a typed origin: watchdog, source throw, transport,
-opaque failure or cleanup. Host/guardian timing and transport categories are
+Nonfinite numbers and other unsupported JSON returns are rejected before any
+decision commits. Return cleanup or encoded-output failure emits the fixed
+`invalid_return_json` category with `advisory:true` and `trusted_origin:false`;
+no rejected value, property path, exception or stack is serialized. Proxies,
+accessors and serialization hooks are not invoked. Valid JSON `null` remains
+data, not a failure sentinel.
+
+Resident worker faults carry a typed origin: watchdog, source throw, invalid JSON
+return, transport, opaque failure or cleanup. Host/guardian timing and transport categories are
 separate from advisory in-container diagnostics; generated exception text cannot
 select a recovery category. Cleanup failure remains containment, and an opaque
 failure or source exception does not authorize a retry of the same invocation.
-Live execution diagnostics retain branded watchdog and source-throw failures as
-`resident_watchdog` and `resident_source_throw`, with fixed public text. These
-categories distinguish a worker timing limit from a source exception; neither
+Live execution diagnostics retain branded failures as `resident_watchdog`,
+`resident_source_throw` or `resident_invalid_return_json`, with fixed public text.
+These categories distinguish timing, source exceptions and invalid returns; none
 establishes gameplay incapability or the cause of an older opaque failure.
 Mutable error fields, source messages and structural lookalikes cannot select
 these categories. Transport, opaque and cleanup failures keep their existing
@@ -988,6 +995,11 @@ Linux `CLOCK_MONOTONIC`. Cancellation joins process exit and every owned pipe;
 an interrupted mutation reports unknown persistence. A fresh owner inspects
 retained checkpoints and drains immutable outbox receipts without replaying the
 interrupted mutation. Run admission waits for startup audit recovery.
+
+Metadata polling passes the live typed-array descriptor to the native binding,
+not a cached raw address, so each read/write wait uses its current endpoint and
+event mask. A deadline can expire after a derived commit but before its reply;
+that remains unknown persistence, not permission to replay the mutation.
 
 The derived writer, cognition and operator publication have separate owned
 processes. Canonical persistence and physical control still share the trusted

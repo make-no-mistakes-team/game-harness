@@ -77,7 +77,12 @@ public final class Recipes {
               && shapeless.ingredients().size() <= (table ? 9 : 4);
       if (!fits) continue;
       active = entry; output = result.copy();
-      sequence.setOutputCount(output.getCount());
+      int plannedOutput = sequence.outputCount(sequence.index());
+      if (plannedOutput == 0) sequence.setOutputCount(output.getCount());
+      else if (plannedOutput != output.getCount()) {
+        beginRefusalReason = "Craft recipe output quantity changed before the first input";
+        return false;
+      }
       return true;
     }
     beginRefusalReason = matchingOutput
@@ -272,17 +277,27 @@ public final class Recipes {
     }
     session.tick();
     if (session.failed()) { invalidated = true; return; }
+    if (session.takeInventoryReplan()) {
+      if (table || !sequence.canReplanBeforeInput() || awaitingReceipt || quickMoveBefore != null) {
+        fail("craft_pre_input_replan_not_owned"); return;
+      }
+      // This is not a craft retry: no input has been issued and no stage/prefix is advanced.
+      // Reselect the current unlocked display, then rebuild source stacks, carried quantities,
+      // batch size and placements from current own inventory, not the stale acquire plan.
+      groups = null; carried = null;
+      source = destination = carriedCount = placement = ingredient = 0;
+      batch = batchRemaining = batchGridMask = quickMoveExecutions = quickMoveOutputBefore = 0;
+      batchRemainderFree = false;
+      outputWait = 0;
+      if (!selectStage(c)) { fail(beginRefusalReason); return; }
+      if (!planIngredients(c)) return;
+    }
     if (!session.ready()) return;
     ScreenHandler handler = session.handler();
     ItemStack cursor = handler.getCursorStack();
     switch (phase) {
       case 0 -> {
-        if (!session.clean()) { fail("craft_grid_or_cursor_not_clear"); return; }
-        if (!outputCapacity(c, output.getCount())) { fail("craft_output_capacity_unavailable"); return; }
-        if (!session.sealInventoryPlan()) { fail("craft_inventory_plan_not_owned"); return; }
-        String planningRefusal = plan(c);
-        if (planningRefusal != null) { fail(planningRefusal); return; }
-        ingredient = 0; placement = 0; phase = 1;
+        planIngredients(c);
       }
       case 1 -> {
         if (!cursor.isEmpty() || !ingredientsMatch(handler, 0)) {
@@ -432,6 +447,17 @@ public final class Recipes {
 
   private static void fail(String reason) {
     session.fail(reason); invalidated = true;
+  }
+
+  private static boolean planIngredients(MinecraftClient c) {
+    if (!session.clean()) { fail("craft_grid_or_cursor_not_clear"); return false; }
+    if (!outputCapacity(c, output.getCount())) { fail("craft_output_capacity_unavailable"); return false; }
+    String refusal = plan(c);
+    if (refusal != null) { fail(refusal); return false; }
+    // Opening this barrier before rebuilding would admit the old acquire's carried count.
+    if (!session.sealInventoryPlan()) { fail("craft_inventory_plan_not_owned"); return false; }
+    ingredient = 0; placement = 0; phase = 1;
+    return true;
   }
 
   private static boolean stackMatches(ItemStack actual, ItemStack expected, int count) {

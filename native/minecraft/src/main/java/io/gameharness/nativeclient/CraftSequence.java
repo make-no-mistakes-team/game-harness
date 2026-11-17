@@ -34,6 +34,9 @@ public final class CraftSequence {
   public int outputCount(int stage) { return outputs[stage]; }
   public boolean complete() { return !stopped && index == stages.size(); }
   public boolean stopped() { return stopped; }
+  public boolean canReplanBeforeInput() {
+    return !stopped && index == 0 && completed[0] == 0 && confirmed[0] == 0;
+  }
   public void setOutputCount(int count) {
     requireActive();
     if (count < 1 || count > 64 || outputs[index] != 0) throw new IllegalStateException("Invalid recipe output count");

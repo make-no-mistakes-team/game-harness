@@ -40,6 +40,7 @@ public final class VisibleInventory {
   private final MinecraftClient client;
   private final BooleanSupplier authorized;
   private final boolean table;
+  private final Object player, world;
   private HandledScreen<?> screen;
   private ScreenHandler handler;
   private InventoryGestureFence fence;
@@ -58,7 +59,7 @@ public final class VisibleInventory {
   private Gesture purpose;
   private JsonObject gestureEvent;
   private int gestureAttempts, ingredientGroup, groupSource = -1, resizeRetargets;
-  private int originX, originY, startupInventoryRebases;
+  private int originX, originY, boundWidth, boundHeight, startupInventoryRebases;
   private int screenBindings, screenCloses;
   private boolean failed, closed, emitted;
   private boolean releaseTransfers;
@@ -67,6 +68,10 @@ public final class VisibleInventory {
   private long window, quickMovePressedAt;
   private int quickMovePresses, quickMoveGestures;
   private String reason;
+  private enum CustodyFailure { SCOPE_CHANGED, HANDLER_CHANGED, LAYOUT_CHANGED, CURSOR_CHANGED, INVENTORY_CHANGED }
+  private CustodyFailure custodyFailure;
+  private InventoryGestureFence.InventoryRefresh inventoryRefresh;
+  private boolean inventoryReplanRequested;
   private int equipSource = -1, equipDestination = -1, equipPhase;
   private boolean equipment, direct;
 
@@ -75,6 +80,8 @@ public final class VisibleInventory {
     this.client = client;
     this.table = table;
     this.authorized = authorized;
+    player = client.player;
+    world = client.world;
     active = this;
     stageAt = System.nanoTime();
   }
@@ -105,6 +112,7 @@ public final class VisibleInventory {
     fence = new InventoryGestureFence(screen, handler, handler.syncId);
     var access = (HandledScreenAccess) screen;
     originX = access.gameharness$x(); originY = access.gameharness$y();
+    boundWidth = screen.width; boundHeight = screen.height;
     x = originX + 88; y = originY + 75;
     layout = new int[handler.slots.size() * 3];
     slots = new Slot[handler.slots.size()];
@@ -167,25 +175,57 @@ public final class VisibleInventory {
   }
 
   private boolean custodyMatches() {
-    if (handler.slots.size() != expected.length || !ItemStack.areEqual(cursor, handler.getCursorStack())) return false;
+    if (handler.slots.size() != expected.length) {
+      custodyFailure = CustodyFailure.LAYOUT_CHANGED; return false;
+    }
+    if (!ItemStack.areEqual(cursor, handler.getCursorStack())) {
+      custodyFailure = CustodyFailure.CURSOR_CHANGED; return false;
+    }
     boolean matches = true;
+    boolean ownInventoryOnly = handler.getSlot(0).getStack().isEmpty();
     for (int i = 0; i < handler.slots.size(); i++) {
       Slot slot = handler.slots.get(i);
-      if (slot != slots[i] || slot.id != layout[i * 3] || slot.x != layout[i * 3 + 1] || slot.y != layout[i * 3 + 2])
-        return false;
-      if (i > 0 && !ItemStack.areEqual(expected[i], slot.getStack())) matches = false;
+      if (slot != slots[i] || slot.id != layout[i * 3] || slot.x != layout[i * 3 + 1] || slot.y != layout[i * 3 + 2]) {
+        custodyFailure = CustodyFailure.LAYOUT_CHANGED; return false;
+      }
+      if (i > 0 && !ItemStack.areEqual(expected[i], slot.getStack())) {
+        matches = false;
+        ownInventoryOnly &= slot.inventory == client.player.getInventory()
+            && slot.getIndex() >= 0 && slot.getIndex() < 36;
+      }
     }
-    if (!matches && !equipment && gestureAttempts == 0 && ingredientGroup == 0
-        && fence.allowsUnplannedInventoryRefresh(client.currentScreen,
-            client.player.currentScreenHandler, handler.syncId, phase == 0,
-            handler.getCursorStack().getCount(), gridCount())) {
-      // Server pickups before any recipe/input plan are fresh own-inventory
-      // facts. Adopt them without resetting dwell, deadlines or gesture budgets.
-      snapshot();
-      startupInventoryRebases++;
-      return true;
+    if (!matches && !equipment && !table) {
+      var access = (HandledScreenAccess) screen;
+      inventoryRefresh = fence.refreshBeforeInput(client.currentScreen,
+          client.player.currentScreenHandler, handler.syncId,
+          active == this && client.player == player && client.world == world
+              && client.isOnThread() && client.getWindow() != null && client.getWindow().getHandle() == window,
+          resizeRetargets == 0 && screen.width == boundWidth && screen.height == boundHeight
+              && originX == access.gameharness$x() && originY == access.gameharness$y(),
+          ownInventoryOnly,
+          !emitted && !quickMove && !quickMovePressed && !ownedShift && !calling
+              && !releaseTransfers && gestures == 0 && (phase == 0 || targetSlot > 0 && purpose == Gesture.ACQUIRE),
+          phase, handler.getCursorStack().getCount(), gridCount());
+      if (inventoryRefresh == InventoryGestureFence.InventoryRefresh.REFRESHED) {
+        // Pointer travel is not a mouse press. Discard it BEFORE adopting contents;
+        // the fence blocks every press until Recipes rebuilds and seals its plan.
+        if (gestureEvent != null && phase == 1) {
+          gestureEvent.addProperty("cancelled_before_input", true);
+          gestureEvent.addProperty("cancelled_ms", elapsedMillis(System.nanoTime()));
+        }
+        phase = 0; targetSlot = -1; targetBefore = null; purpose = null; gestureEvent = null;
+        groupSource = -1;
+        inventoryReplanRequested = true;
+        snapshot();
+        startupInventoryRebases++;
+        // Do not reset stageAt, startedAt, attempts, groups, deadline or resource budgets.
+        return true;
+      }
     }
-    if (!quickMove || !quickMovePressed) return matches;
+    if (!quickMove || !quickMovePressed) {
+      if (!matches) custodyFailure = CustodyFailure.INVENTORY_CHANGED;
+      return matches;
+    }
     try {
       // Only this batch's original-footprint guard may admit authoritative post-press changes.
       if (allowedSettlement == null || !allowedSettlement.getAsBoolean()) return false;
@@ -204,11 +244,15 @@ public final class VisibleInventory {
     } catch (RuntimeException error) {
       fail("authority_check_exception"); return false;
     }
-    if (!permitted || client.player == null || client.player.isDead()
-        || client.currentScreen != screen || client.player.currentScreenHandler != handler
+    if (!permitted || client.player == null || client.player.isDead()) {
+      custodyFailure = CustodyFailure.SCOPE_CHANGED;
+      fail("handler_layout_or_custody_changed"); return false;
+    }
+    if (client.currentScreen != screen || client.player.currentScreenHandler != handler
         || screen.getScreenHandler() != handler
         || quickMove && (!client.isOnThread() || client.getWindow() == null || client.getWindow().getHandle() != window)
         || !fence.allows(client.currentScreen, client.player.currentScreenHandler, handler.syncId, true)) {
+      custodyFailure = CustodyFailure.HANDLER_CHANGED;
       fail("handler_layout_or_custody_changed");
       return false;
     }
@@ -235,6 +279,13 @@ public final class VisibleInventory {
     if (!valid() || busy() || !clean()) return false;
     fence.sealInventoryPlan();
     return true;
+  }
+
+  /** Notification is consumed separately from the fence's mandatory fresh-plan barrier. */
+  public boolean takeInventoryReplan() {
+    boolean requested = inventoryReplanRequested;
+    inventoryReplanRequested = false;
+    return requested;
   }
 
   public void beginIngredientGroup(int sourceSlot) {
@@ -576,6 +627,11 @@ public final class VisibleInventory {
     value.addProperty("ingredient_groups", ingredientGroup);
     value.addProperty("resize_retargets", resizeRetargets);
     value.addProperty("startup_inventory_rebases", startupInventoryRebases);
+    value.addProperty("inventory_replan_pending", fence != null && fence.inventoryReplanPending());
+    if (inventoryRefresh != null)
+      value.addProperty("inventory_refresh", inventoryRefresh.name().toLowerCase(java.util.Locale.ROOT));
+    if (custodyFailure != null)
+      value.addProperty("custody_failure", custodyFailure.name().toLowerCase(java.util.Locale.ROOT));
     if (reason != null) value.addProperty("reason", reason);
     return value;
   }

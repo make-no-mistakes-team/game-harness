@@ -2795,14 +2795,22 @@ Once a requested table opens its crafting grid, recipe transfers bind to that ex
 
 Craft/equip use the bounded native [`VisibleInventory`](../native/minecraft/src/client/java/io/gameharness/nativeclient/VisibleInventory.java) controller beneath the existing semantic actions; [`Recipes`](../native/minecraft/src/client/java/io/gameharness/nativeclient/Recipes.java) owns manual recipe transfers. Crafting opens the real 2×2 inventory or reachable 3×3 table screen, manually places ingredients through vanilla pickup/right-click gestures, retrieves output and returns remainders. There is no hidden recipe autofill. One virtual pointer supplies screen hover, carried-stack rendering and actual press/release coordinates before native capture. Gestures advance on ticks/rendered frames, without game-thread sleep or catch-up click bursts; world time continues.
 
-Before recipe planning or any gesture attempt, a server inventory update may
-refresh an idle crafting session's startup snapshot. The authorized screen,
-handler, sync identity and slot geometry must still match, with empty cursor
-and grid. Equipment remains strict. Recipe planning seals that baseline before
-reading ingredient assignments; any press also seals it. Later unexpected
-changes retain the existing custody fence. Refresh resets neither opening
-dwell, action/root deadlines nor gesture allowances, and replays no input.
-Diagnostics count these changes as `startup_inventory_rebases`.
+Before any mouse press, an inventory-screen crafting session may adopt one
+server update to ordinary player inventory slots, including during the first
+ingredient's unpressed pointer travel. Owner, life, space, screen, handler,
+sync identity, slot objects and geometry must remain unchanged; cursor, grid
+and output must be empty. Equipment and table crafting remain strict.
+The controller cancels the old pointer plan, then rebuilds recipe assignments,
+source quantities and placements from current inventory before allowing a
+press. Requested executions do not increase. Any prior press, emitted effect,
+held button, completed gesture or in-flight transfer forbids this refresh,
+including when its effect is unknown. The single allowance is shared with
+startup refresh; rejected updates do not consume it. Refresh resets neither
+opening dwell, action/root deadlines nor gesture allowances, and replays no
+input. `startup_inventory_rebases` remains zero or one; `inventory_refresh`,
+`inventory_replan_pending` and `custody_failure` distinguish refresh decisions,
+the fresh-plan barrier and custody refusals. A canceled pointer records
+`cancelled_before_input` without manufacturing a press or completed gesture.
 
 Ingredient assignments are grouped by their actual source slot. The controller picks up that stack once, distributes single items with separate ordinary right-clicks and returns surplus once before changing material or collecting output. The mouse button is released between placements; the remaining stack stays on the cursor. Source/cursor/grid components and counts remain checked throughout, including split sources and mixed materials. Vanilla ingredient eligibility matches permitted item alternatives; it does not require a material's incidental components to equal the recipe display's default stack. This does not relax actual custody checks or implement drag distribution.
 

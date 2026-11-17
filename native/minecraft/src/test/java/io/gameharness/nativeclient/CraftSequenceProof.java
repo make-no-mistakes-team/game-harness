@@ -7,7 +7,106 @@ public final class CraftSequenceProof {
   private static void require(boolean value, String message) {
     if (!value) throw new AssertionError(message);
   }
+
+  /** The production consumer must discard its unpressed pointer and rebuild before pressing. */
+  private static void zeroPressInventoryRefresh() {
+    Object screen = new Object(), handler = new Object();
+    var fence = new InventoryGestureFence(screen, handler, 7);
+    var craft = new CraftSequence(List.of(new CraftSequence.Stage("spruce_planks", 1)));
+    craft.setOutputCount(4);
+    require(craft.canReplanBeforeInput(), "an untouched one-execution craft could not rebuild its input plan");
+    fence.sealInventoryPlan();
+    require(fence.refreshBeforeInput(screen, handler, 7, true, true, true, true, 1, 0, 0)
+        == InventoryGestureFence.InventoryRefresh.REFRESHED,
+        "a passive pickup during the first acquire's pointer travel was refused as an issued gesture");
+    require(fence.inventoryReplanPending() && !fence.held(),
+        "refresh retained the old recipe/input plan or manufactured a held press");
+    try {
+      fence.press();
+      throw new AssertionError("stale acquire was allowed before fresh material/input planning");
+    } catch (IllegalStateException expected) {}
+    require(craft.canReplanBeforeInput() && craft.current().executions() == 1
+        && craft.completed(0) == 0 && craft.confirmed(0) == 0 && craft.outputCount(0) == 4,
+        "refresh altered the authored quantity or invented a craft prefix/receipt");
+    fence.sealInventoryPlan();
+    require(!fence.inventoryReplanPending(), "fresh recipe/input planning did not clear the replan barrier");
+    require(fence.refreshBeforeInput(screen, handler, 7, true, true, true, true, 1, 0, 0)
+        == InventoryGestureFence.InventoryRefresh.EXHAUSTED,
+        "a second pickup restarted the finite pre-input refresh");
+    fence.press();
+    require(fence.held(), "freshly rebuilt first acquire could not press");
+    fence.release();
+    try {
+      craft.deposited(2);
+      throw new AssertionError("the two-log inventory enlarged the authored one-execution craft");
+    } catch (IllegalStateException expected) {}
+    craft.deposited(1);
+    require(!craft.canReplanBeforeInput() && craft.confirm(4, true) && craft.complete(),
+        "one refreshed spruce-planks execution was inflated or lost its exact four-plank receipt");
+    require(fence.refreshBeforeInput(screen, handler, 7, true, true, true, true, 0, 0, 0)
+        == InventoryGestureFence.InventoryRefresh.INPUT_ISSUED,
+        "a released/completed input was replayable through the pre-input path");
+
+    var startup = new InventoryGestureFence(screen, handler, 7);
+    require(startup.refreshBeforeInput(screen, handler, 7, true, true, true, true, 0, 0, 0)
+        == InventoryGestureFence.InventoryRefresh.REFRESHED,
+        "an empty preplan startup baseline could not adopt current own inventory");
+    require(startup.inventoryReplanPending(), "startup refresh bypassed current material planning");
+  }
+
+  private static void preInputRefreshRefusals() {
+    Object screen = new Object(), handler = new Object();
+    for (int changed = 0; changed < 12; changed++) {
+      var fence = new InventoryGestureFence(screen, handler, 7);
+      fence.sealInventoryPlan();
+      var result = fence.refreshBeforeInput(changed == 0 ? new Object() : screen,
+          changed == 1 ? new Object() : handler, changed == 2 ? 8 : 7,
+          changed != 3, changed != 4, changed != 5, changed != 6,
+          changed == 7 ? 2 : changed == 8 ? 3 : changed == 9 ? -1 : 1,
+          changed == 10 ? 1 : 0, changed == 11 ? 1 : 0);
+      var expected = switch (changed) {
+        case 0, 1, 2 -> InventoryGestureFence.InventoryRefresh.HANDLER_CHANGED;
+        case 3 -> InventoryGestureFence.InventoryRefresh.SCOPE_CHANGED;
+        case 4 -> InventoryGestureFence.InventoryRefresh.LAYOUT_CHANGED;
+        case 5 -> InventoryGestureFence.InventoryRefresh.NON_INVENTORY_CHANGED;
+        case 6 -> InventoryGestureFence.InventoryRefresh.NATIVE_EFFECT;
+        case 7, 8, 9 -> InventoryGestureFence.InventoryRefresh.IN_FLIGHT;
+        default -> InventoryGestureFence.InventoryRefresh.CURSOR_OR_GRID_CHANGED;
+      };
+      require(result == expected && !fence.inventoryReplanPending(),
+          "pre-input refresh crossed identity/scope/layout/custody/effect or in-flight phase: " + changed);
+      require(fence.refreshBeforeInput(screen, handler, 7, true, true, true, true, 1, 0, 0)
+          == InventoryGestureFence.InventoryRefresh.REFRESHED,
+          "a refused guard consumed the single refresh allowance");
+    }
+    var held = new InventoryGestureFence(screen, handler, 7);
+    held.press();
+    require(held.refreshBeforeInput(screen, handler, 7, true, true, true, true, 1, 0, 0)
+        == InventoryGestureFence.InventoryRefresh.INPUT_ISSUED && held.held(),
+        "held/unknown press was refreshed or implicitly released");
+    held.release();
+    require(held.refreshBeforeInput(screen, handler, 7, true, true, true, true, 1, 0, 0)
+        == InventoryGestureFence.InventoryRefresh.INPUT_ISSUED,
+        "completed input/prefix reopened pre-input custody");
+    var revoked = new InventoryGestureFence(screen, handler, 7);
+    revoked.revoke();
+    require(revoked.refreshBeforeInput(screen, handler, 7, true, true, true, true, 1, 0, 0)
+        == InventoryGestureFence.InventoryRefresh.SCOPE_CHANGED,
+        "revoked/unknown operation inherited a fresh baseline");
+    var stopped = new CraftSequence(List.of(new CraftSequence.Stage("spruce_planks", 1)));
+    stopped.stop();
+    require(!stopped.canReplanBeforeInput(), "stopped/unknown sequence reopened its first input plan");
+    var prefix = new CraftSequence(List.of(new CraftSequence.Stage("spruce_planks", 1),
+        new CraftSequence.Stage("stick", 1)));
+    prefix.setOutputCount(4); prefix.deposited(1);
+    require(!prefix.canReplanBeforeInput(), "an unconfirmed completed prefix admitted refresh");
+    require(prefix.confirm(4, true) && !prefix.canReplanBeforeInput(),
+        "a confirmed earlier stage admitted pre-first-input refresh");
+  }
+
   public static void main(String[] args) {
+    zeroPressInventoryRefresh();
+    preInputRefreshRefusals();
     var plan = new CraftSequence(List.of(new CraftSequence.Stage("oak_planks", 2),
         new CraftSequence.Stage("crafting_table", 1), new CraftSequence.Stage("stick", 1)));
     plan.setOutputCount(4);
@@ -107,28 +206,6 @@ public final class CraftSequenceProof {
     require(!fence.held() && !fence.allows(screen, handler, 7, true), "Stop retained press/release authority");
     require(fence.cleanupOwns(screen, handler, 7) && !fence.cleanupOwns(new Object(), handler, 7),
         "cleanup lost exact old handler identity");
-    var startup = new InventoryGestureFence(screen, handler, 7);
-    require(startup.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 0, 0),
-        "empty preplan server inventory update lost its actual handler");
-    require(!startup.allowsUnplannedInventoryRefresh(new Object(), handler, 7, true, 0, 0)
-        && !startup.allowsUnplannedInventoryRefresh(screen, new Object(), 7, true, 0, 0)
-        && !startup.allowsUnplannedInventoryRefresh(screen, handler, 8, true, 0, 0),
-        "startup refresh crossed screen, handler or sync identity");
-    require(!startup.allowsUnplannedInventoryRefresh(screen, handler, 7, false, 0, 0)
-        && !startup.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 1, 0)
-        && !startup.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 0, 1),
-        "startup refresh discarded a planned pointer or nonempty cursor/grid");
-    startup.sealInventoryPlan();
-    require(!startup.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 0, 0),
-        "inventory changed after recipe planning was silently rebased");
-    var pressed = new InventoryGestureFence(screen, handler, 7);
-    pressed.press(); pressed.release();
-    require(!pressed.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 0, 0),
-        "a completed press reopened the startup inventory baseline");
-    var revoked = new InventoryGestureFence(screen, handler, 7);
-    revoked.revoke();
-    require(!revoked.allowsUnplannedInventoryRefresh(screen, handler, 7, true, 0, 0),
-        "Stop allowed a fresh inventory baseline");
     for (int count : new int[] {0, 17}) {
       try { new CraftSequence(List.of(new CraftSequence.Stage("stick", count))); throw new AssertionError("unbounded quantity"); }
       catch (IllegalArgumentException expected) {}

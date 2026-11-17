@@ -654,7 +654,15 @@ export class ControlSession {
       throw failure;
     }
     if (this.options.config.recovery === "none" || !this.options.restartWorker ||
-      this.transition) throw new Error(`session_recovery_refused: ${reason}`);
+      this.transition) {
+      if (reason === "known_expired_raw_lease") {
+        // Keep custody at this known host branch, not at an exception-message boundary.
+        this.resultFailure = Object.freeze(new RuntimeFault("session_recovery_refused",
+          "Executive recovery refused (known_expired_raw_lease); no restart was admitted. Original deadlines and unknown outcomes remain unchanged."));
+        throw this.resultFailure;
+      }
+      throw new Error(`session_recovery_refused: ${reason}`);
+    }
     if (checkpoint && this.raw && !this.rawWorldOnly) throw new Error(`session_recovery_refused_gui: ${reason}`);
     const state = structuredClone(checkpoint ? this.data.state : this.options.initial_state);
     this.decisionEpoch++;
@@ -725,7 +733,9 @@ export class ControlSession {
             : "The controller failed without a retained trusted cause; inspect session.controller_fault and cleanup evidence. Exception text grants no retry permission.");
       }
       this.data.status = "failed";
-      this.data.reason = programDiagnostic(this.resultFailure ?? error, this.options.source_hash).message;
+      // Only retained typed failures may publish text after a live snapshot.
+      // An arbitrary host error (even a RuntimeFault lookalike) has no custody here.
+      this.data.reason = programDiagnostic(this.resultFailure, this.options.source_hash).message;
     }
     void this.stop(this.data.reason ?? programDiagnostic(error, this.options.source_hash).message);
   }

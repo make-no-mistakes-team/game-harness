@@ -483,6 +483,60 @@ test("unknown child effect survives as unknown, never replays and does not delet
   await h.session.stop("test complete");
 });
 
+test("retained unknowns reject the correct next key without renewing raw authority and retain the safe refusal diagnostic", async () => {
+  const h = harness(2), renew = vi.fn(async () => {});
+  const unknown: GameActionResult = { status: "unknown", summary: "Earlier world consequence unresolved",
+    evidence: { world_effect_emitted: true } };
+  h.options.config.recovery = "none"; h.options.config.max_restarts = 0;
+  h.options.restartWorker = vi.fn(async () => h.options.worker);
+  const retireTask = vi.fn(h.options.retireTask);
+  h.options.task = vi.fn(h.options.task); h.options.retireTask = retireTask;
+  h.options.effect = vi.fn();
+  h.onRenew(renew);
+  h.choose({ kind: "ensure_task", key: 1, request });
+  await h.session.start(); await h.clock.advance(0);
+  h.completed[0]!.result.resolve(unknown); await settle();
+  h.choose({ kind: "ensure_task", key: 2, request }); await h.clock.advance(50);
+  h.completed[1]!.result.resolve(unknown); await settle();
+  const retained = h.session.snapshot().session!.tasks;
+  h.choose(rawChoice); await h.clock.advance(100);
+  expect(h.sent).toHaveLength(1); expect(renew).toHaveBeenCalledTimes(1);
+  const lastRenewal = h.clock.now(), reserved = h.records.filter(record => record.type === "session.child_reserved");
+  const retiredTasks = retireTask.mock.calls.length;
+  const submitted = h.sent.length;
+  h.choose({ kind: "ensure_task", key: 3, request });
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await h.clock.advance(50);
+    expect(h.session.snapshot()).toMatchObject({ status: "running", session: {
+      producer: "raw", task_high_water: 2, tasks: retained,
+      last_command_error: "Unresolved task detail quota exhausted; no effects admitted",
+      restarts: 0, deadline_host_ms: 10000,
+    } });
+    expect(h.options.task).toHaveBeenCalledTimes(2);
+    expect(h.options.retireTask).toHaveBeenCalledTimes(retiredTasks);
+    expect(h.records.filter(record => record.type === "session.child_reserved")).toEqual(reserved);
+    expect(h.sent).toHaveLength(submitted); expect(renew).toHaveBeenCalledTimes(1);
+    expect(h.options.effect).not.toHaveBeenCalled();
+  }
+  expect(h.clock.now() - lastRenewal).toBe(200);
+  await h.clock.advance(50);
+  await h.session.stop("join refused raw lease recovery");
+  const diagnostic = programDiagnostic(h.session.failure, h.options.source_hash);
+  expect(diagnostic).toEqual({ type: "RuntimeFault", code: "session_recovery_refused",
+    message: "Executive recovery refused (known_expired_raw_lease); no restart was admitted. Original deadlines and unknown outcomes remain unchanged.",
+    source_hash: h.options.source_hash, location: { mapping: "unmapped" } });
+  expect(h.session.snapshot()).toMatchObject({ status: "failed", reason: diagnostic.message,
+    cleanup: { worker: "closed", native: "retired" }, session: {
+      producer: "none", task_high_water: 2, tasks: retained, restarts: 0, deadline_host_ms: 10000,
+    } });
+  expect(h.options.task).toHaveBeenCalledTimes(2);
+  expect(h.records.filter(record => record.type === "session.child_reserved")).toEqual(reserved);
+  expect(h.sent).toHaveLength(submitted); expect(renew).toHaveBeenCalledTimes(1);
+  expect(h.options.restartWorker).not.toHaveBeenCalled();
+  expect(h.options.effect).not.toHaveBeenCalled();
+  expect(h.workerClosed).toBe(1); expect(h.retired).toBe(1);
+});
+
 test("Stop fences new effects and joins the selected child physical retirement before terminal publication", async () => {
   const h = harness(); h.choose({ kind: "ensure_task", key: 1, request });
   await h.session.start(); await h.clock.advance(0);

@@ -12,7 +12,7 @@ import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import type { ReactiveRuntime } from "../src/server/reactive.ts";
 import { SandboxService } from "../src/server/sandbox.ts";
 import type { LookaheadConfig } from "../src/shared/planning.ts";
-import { DEFAULT_RESIDENT_LIMITS, type ControllerStepResult, type ResidentAnalysisWorker, type ResidentLimits, type ResidentWorker } from "../src/shared/resident.ts";
+import { DEFAULT_RESIDENT_LIMITS, type ControllerStepResult, type ExecutiveStepResult, type ResidentAnalysisWorker, type ResidentLimits, type ResidentWorker } from "../src/shared/resident.ts";
 import type { ControllerInputChannel, RevocationAck } from "../src/shared/controller.ts";
 import { executionScopeFixture, minecraftObservationFixture, minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 import { controllerFrameFixture } from "./helpers/controller-frame.ts";
@@ -24,8 +24,9 @@ import { ResidentWorkerFault, residentSourceAdvisory, type ResidentWorkerFaultOr
 import { preparationFailure } from "../src/server/prepared-source-error.ts";
 import { MAX_SKILL_LIMITS, type ExecutableModuleBundle, type SkillLimits } from "../src/shared/programs.ts";
 import { executableModuleBundleHash, singletonExecutableModuleBundle } from "../src/shared/program-modules.ts";
-import { controlSessionConfigSchema } from "../src/shared/control-session.ts";
+import { controlSessionConfigSchema, type ExecutiveChoice } from "../src/shared/control-session.ts";
 import { residentAnalysisProcess } from "./helpers/resident-analysis-process.ts";
+import { RuntimeFault } from "../src/server/runtime-fault.ts";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0)) await close(); });
@@ -628,6 +629,54 @@ test.each([false, true])("ordinary inspection cannot promote unbranded or wrong-
   expect(f.opened).toBe(0); expect(f.finiteCalls).toBe(0);
 });
 
+test("ordinary inspection and skill.closed preserve a known raw-lease recovery refusal through Skills", async () => {
+  let workerClosed = 0, taskCalls = 0;
+  const running = (choice: ExecutiveChoice): ExecutiveStepResult => ({ status: "running", choice, next_state: null, events: [] });
+  const f = await fixture(undefined, {}, {
+    createResidentWorker: async () => ({
+      async activate() { return running({ kind: "raw", input: null }); },
+      async step() {
+        return running({ kind: "ensure_task", key: 2, request: {
+          kind: "action", action: { kind: "navigate", destination: "authorized-target" }, duration_ms: 1000,
+        } });
+      },
+      async close() { workerClosed++; },
+    }),
+    sessionTask: async () => { taskCalls++; throw new Error("Rejected key must not dispatch"); },
+    superviseSessionTask: async () => {}, retireSessionTask: async () => {},
+  });
+  const tools = inspectionTools(f), runTool = tools.find(tool => tool.name === "program_run")!;
+  const inspect = tools.find(tool => tool.name === "program_inspect")!;
+  const started = await runTool.execute("raw-refusal-start", { operation: "start", entry: "step",
+    name: f.program.name, version: f.program.version, args: null, initial_state: null,
+    session: { schema_version: 1, recovery: "none", max_restarts: 0, retained_tasks: 1 } });
+  expect(started.isError).not.toBe(true);
+  const execution = f.store.latestRootExecution(f.run.run_id)!;
+  await until(f.store, f.run.run_id, () => f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!.ended_at !== null);
+  const diagnostic = { type: "RuntimeFault", code: "session_recovery_refused",
+    message: "Executive recovery refused (known_expired_raw_lease); no restart was admitted. Original deadlines and unknown outcomes remain unchanged.",
+    source_hash: execution.source_hash, location: { mapping: "unmapped" } };
+  const reply = await inspect.execute("raw-refusal-inspect", {
+    view: "execution", target: "latest", program: { name: f.program.name, version: f.program.version },
+  });
+  expect(reply.isError).not.toBe(true);
+  expect(reply.details).toMatchObject({ status: "failed", error: diagnostic.message, diagnostic,
+    result: { status: "failed", summary: diagnostic.message, result: null },
+    resident: { status: "failed", reason: diagnostic.message, cleanup: { worker: "closed", native: "retired" },
+      session: { restarts: 0, producer: "none", task_high_water: 0, tasks: [] } } });
+  const events = await inspect.execute("raw-refusal-events", { view: "events", after: 0, limit: 100 });
+  expect(events.isError).not.toBe(true);
+  const page = JSON.parse(events.content.filter(entry => entry.type === "text").map(entry => entry.text).join(""));
+  const closed = page.records.find((event: { type: string; details: { execution_id?: string } }) =>
+    event.type === "skill.closed" && event.details.execution_id === execution.execution_id);
+  expect(closed).toMatchObject({ summary: diagnostic.message, details: {
+    status: "failed", actions: 0, calls: 0, details: { diagnostic },
+  } });
+  expect(workerClosed).toBe(1); expect(taskCalls).toBe(0);
+  expect(f.opened).toBe(1); expect(f.finiteCalls).toBe(0);
+  expect(f.manager.effectScope(execution.execution_id)).toBeNull();
+});
+
 test.each([false, true])("ordinary inspection redacts host failures after a live snapshot exists (session=%s)", async session => {
   let injected: unknown;
   let entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
@@ -643,6 +692,9 @@ test.each([false, true])("ordinary inspection redacts host failures after a live
   const inspect = tools.find(tool => tool.name === "program_inspect")!;
   const diagnostic = { type: "TypeError", message: "PRIVATE_WRONG_SOURCE", source_hash: "f".repeat(64),
     location: { mapping: "unmapped" } };
+  const mutated = new RuntimeFault("session_recovery_refused", "Safe-looking initial message");
+  Reflect.set(mutated, "code", "PRIVATE_MUTATED_CODE");
+  Reflect.set(mutated, "message", "PRIVATE_MUTATED_HOST");
   const errors = [
     new Error("PRIVATE_HOST_PATH_ENV_PROVIDER_NATIVE"),
     { origin: "source_throw", trustedOrigin: false, sourceDiagnostic: diagnostic,
@@ -650,6 +702,14 @@ test.each([false, true])("ordinary inspection redacts host failures after a live
     Object.assign(Object.create(ResidentWorkerFault.prototype), { origin: "source_throw",
       sourceDiagnostic: diagnostic, message: "PRIVATE_PROTOTYPE", stack: "PRIVATE_STACK" }),
     new ResidentWorkerFault("source_throw", false, diagnostic),
+    ...(session ? [
+      new Error("session_recovery_refused: known_expired_raw_lease PRIVATE_HOST"),
+      { name: "RuntimeFault", code: "session_recovery_refused", message: "PRIVATE_STRUCTURAL_RUNTIME" },
+      Object.assign(Object.create(RuntimeFault.prototype), {
+        code: "session_recovery_refused", message: "PRIVATE_RUNTIME_PROTOTYPE", stack: "PRIVATE_STACK",
+      }),
+      mutated,
+    ] : []),
   ];
   for (const [index, error] of errors.entries()) {
     entered = Promise.withResolvers<void>(); release = Promise.withResolvers<void>(); injected = error;
@@ -676,6 +736,25 @@ test.each([false, true])("ordinary inspection redacts host failures after a live
     expect(visible.diagnostic.source_diagnostic).toBeUndefined();
     expect(visible.resident.reason).toBe(session ? visible.diagnostic.message : `resident_step: ${visible.diagnostic.message}`);
     expect(text).not.toContain("PRIVATE"); expect(text).not.toContain("stack");
+    if (session && index >= 4) {
+      expect(visible.diagnostic.type).toBe("ExecutionFailure");
+      expect(visible.diagnostic.code).toBeUndefined();
+      let after = 0, closed: unknown;
+      for (;;) {
+        const events = await inspect.execute(`live-redacted-events-${index}-${after}`, { view: "events", after, limit: 100 });
+        expect(events.isError).not.toBe(true);
+        const eventText = events.content.filter(entry => entry.type === "text").map(entry => entry.text).join("");
+        expect(eventText).not.toContain("PRIVATE");
+        const page = JSON.parse(eventText);
+        closed = page.records.find((event: { type: string; details: { execution_id?: string } }) =>
+          event.type === "skill.closed" && event.details.execution_id === execution.execution_id);
+        if (closed !== undefined || !page.has_more) break;
+        expect(page.next_after).toBeGreaterThan(after);
+        after = page.next_after;
+      }
+      expect(closed).toMatchObject({ summary: visible.diagnostic.message,
+        details: { status: "failed", details: { diagnostic: visible.diagnostic } } });
+    }
   }
   expect(f.finiteCalls).toBe(0);
 });

@@ -842,6 +842,15 @@ computation, that result is discarded. An explicitly recovery-safe session may u
 restart allowance; other sessions fail closed. Neither path extends the expired
 lease or the original session deadline.
 
+If a known raw lease expires with recovery disabled or unavailable, ordinary
+execution inspection and `skill.closed` retain the fixed
+`RuntimeFault` code `session_recovery_refused` and safe reason
+`known_expired_raw_lease`. Rejected task choices do not renew the raw lease,
+reserve a child or advance the task high-water mark. Retained unknown outcomes
+remain intact, and termination joins the same native and worker drain.
+Only the host's recovery-refusal branch selects this diagnostic; matching
+exception text, forged fault objects and mutated host errors remain redacted.
+
 If a known expired lease or stale unsent decision needs recovery after the
 selected `max_restarts` allowance is exhausted, the execution retains the fixed
 `session_recovery_exhausted` diagnostic instead of an opaque execution failure.

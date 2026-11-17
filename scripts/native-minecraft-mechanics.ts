@@ -338,6 +338,10 @@ const required = async action => {
   if (!await act(action)) throw new Error(receipts[receipts.length-1].result.summary);
 };
 try {
+  if (args.scenario === "spruce-prepress" || args.scenario === "spruce-postpress") {
+    const succeeded = await act({kind:"craft",item:"spruce_planks",executions:1});
+    return {status:succeeded?"completed":"blocked",summary:"Single disclosed spruce craft; no retry",result:{receipts,inventory:o.data.player.inventory}};
+  }
   if (args.scenario === "sequence-partial") {
     const succeeded = await act({kind:"craft",sequence:[
       {item:"oak_planks",executions:2},{item:"crafting_table",executions:3},{item:"stick",executions:1}
@@ -379,6 +383,135 @@ try {
 }
 `;
 
+const diagnosticObject = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value)
+  ? value as Record<string, unknown> : {};
+const diagnosticRows = (value: unknown) => Array.isArray(value) ? value.map(diagnosticObject) : [];
+const actualPresses = (ui: Record<string, unknown>) => {
+  const values = Object.values(diagnosticObject(ui.gesture_press_counts));
+  return values.length > 0 && values.every(value => typeof value === "number" && Number.isInteger(value) && value >= 0)
+    ? values.reduce<number>((sum, value) => sum + Number(value), 0) : -1;
+};
+
+/** Consumes native receipts, not source spelling. Timing misses never qualify a
+ * boundary, and an emitted unknown is not converted into a no-effect failure. */
+export interface SpruceCaseAssessment { status: "passed" | "failed" | "timing_inconclusive"; reasons: string[] }
+export function readSpruceServerInventory(value: unknown): Record<string, number> | null {
+  if (typeof value !== "string") return null;
+  const payload = /has the following entity data:\s*(\[[^\r\n]*\])/.exec(value)?.[1];
+  if (!payload || !/^\[\s*(?:\{[^{}]*\}(?:,\s*)?)*\s*\]$/.test(payload)) return null;
+  const counts: Record<string, number> = {}, slots = new Set<number>();
+  for (const match of payload.matchAll(/\{[^{}]*\}/g)) {
+    const name = /\bid:\s*"minecraft:([a-z0-9_]+)"/.exec(match[0])?.[1];
+    const quantity = /\bcount:\s*(\d+)\b/.exec(match[0])?.[1];
+    const slot = /\bSlot:\s*(\d+)b\b/.exec(match[0])?.[1];
+    if (!name || quantity === undefined || slot === undefined || slots.has(Number(slot))) return null;
+    const count = Number(quantity);
+    if (!Number.isSafeInteger(count) || count < 1 || count > 64) return null;
+    slots.add(Number(slot)); counts[name] = (counts[name] ?? 0) + count;
+  }
+  return counts;
+}
+export function inspectSprucePrepressCase(value: unknown): SpruceCaseAssessment {
+  const entry = diagnosticObject(value), update = diagnosticObject(entry.parent_update);
+  const effects = diagnosticRows(entry.effects), effect = effects[0] ?? {}, action = diagnosticObject(effect.action);
+  const result = diagnosticObject(effect.result), detail = diagnosticObject(result.evidence), ui = diagnosticObject(detail.native_inventory_ui);
+  const gate = diagnosticObject(update.gate), gateUi = diagnosticObject(gate.native_inventory_ui);
+  const arrival = diagnosticObject(update.after), arrivalUi = diagnosticObject(arrival.native_inventory_ui);
+  const final = diagnosticObject(entry.final_diagnostics), custody = diagnosticObject(final.current_inventory_custody);
+  const events = diagnosticRows(ui.gesture_events), gateEvents = diagnosticRows(gateUi.gesture_events);
+  const stages = diagnosticRows(detail.craft_stages), stage = stages[0] ?? {};
+  const positive = entry.name === "visible_inventory_spruce-prepress";
+  const count = (observation: unknown, name: string) => diagnosticRows(diagnosticObject(diagnosticObject(diagnosticObject(observation).data).player).inventory)
+    .filter(item => item.name === name).reduce((sum, item) => sum + Number(item.count), 0);
+  const reasons: string[] = [];
+  const check = (condition: unknown, reason: string) => { if (!condition) reasons.push(reason); };
+  const server = diagnosticObject(entry.server_inventory), serverCounts = readSpruceServerInventory(server.stdout);
+  check(positive || entry.name === "visible_inventory_spruce-postpress", "Unknown spruce diagnostic case");
+  check(effects.length === 1 && !effect.error && action.kind === "craft" && action.item === "spruce_planks" &&
+    action.executions === 1 && action.sequence === undefined && action.table === undefined, "Original single exact craft was replaced or replayed");
+  check(count(entry.before, "spruce_log") === 1 && count(entry.before, "spruce_planks") === 0, "Initial spruce inventory differs");
+  check(final.screen_type === null && custody.cursor_count === 0 && custody.grid_count === 0 &&
+    final.controls_neutral === true && final.motor_active === false && entry.concurrent_effects_after === 0,
+    "Current native custody or effect owner did not close");
+  check(ui.held === false && ui.screen_bindings === 1 && ui.screen_closes === 1 && ui.closed === true, "Owned native gesture/screen did not close exactly once");
+  check(Number(update.injection_attempts) <= 1 && entry.perturbation_commands === update.injection_attempts && !update.error,
+    "Perturbation was replayed or failed");
+  check(server.acknowledged === true && JSON.stringify(server.commands) === JSON.stringify(["data get entity @p Inventory"]) && serverCounts,
+    "Actual acknowledged read-only server Inventory query is missing or unreadable");
+  if (reasons.length) return {status: "failed", reasons};
+  const sameSession = arrivalUi.motion_seed === gateUi.motion_seed && typeof gateUi.motion_seed === "string" &&
+    arrivalUi.screen_bindings === 1 && ui.motion_seed === gateUi.motion_seed &&
+    arrival.screen_type === gate.screen_type && diagnosticObject(arrival.current_inventory_custody).sync_id === 0 &&
+    gate.session_id === arrival.session_id && gate.native_generation === arrival.native_generation &&
+    JSON.stringify(gate.life) === JSON.stringify(arrival.life);
+  const bound = gate.motor_active === true && gate.screen_type != null && gateUi.screen_bindings === 1 &&
+    diagnosticObject(gate.current_inventory_custody).sync_id === 0 && gateUi.resize_retargets === 0 &&
+    typeof gate.session_id === "string" && typeof gate.native_generation === "number" &&
+    diagnosticObject(gate.life).status === "alive";
+  const first = gateEvents[0] ?? {};
+  const initialLogs = diagnosticRows(diagnosticObject(diagnosticObject(diagnosticObject(entry.before).data).player).inventory)
+    .filter(item => item.name === "spruce_log");
+  const arrivingLogs = diagnosticRows(diagnosticObject(diagnosticObject(diagnosticObject(update.observation).data).player).inventory)
+    .filter(item => item.name === "spruce_log");
+  const sourceInventorySlot = typeof first.slot === "number" && first.slot >= 36 ? first.slot - 36 : first.slot;
+  const timing = update.injection_attempts === 1 && typeof update.acknowledged_ms === "number" && bound &&
+    (positive
+      ? gateUi.phase === 1 && gateUi.gesture_attempts === 1 && first.role === "acquire" &&
+        actualPresses(gateUi) === 0 && gateUi.held === false && gateUi.cursor_count === 0 && gateUi.grid_count === 0 &&
+        gate.motor_world_effect_emitted === false && first.pressed_ms === undefined &&
+        typeof first.slot === "number" && first.slot >= 9 && first.slot <= 44 &&
+        initialLogs.length === 1 && arrivingLogs.length === 1 &&
+        initialLogs[0]?.slot === sourceInventorySlot && initialLogs[0]?.count === 1 &&
+        arrivingLogs[0]?.slot === sourceInventorySlot && arrivingLogs[0]?.count === 2 &&
+        count(update.observation, "spruce_log") === 2 && count(update.observation, "spruce_planks") === 0 &&
+        sameSession && actualPresses(arrivalUi) === 0 && arrivalUi.cursor_count === 0 && arrivalUi.grid_count === 0 &&
+        arrivalUi.resize_retargets === 0 && arrivalUi.startup_inventory_rebases === 1
+      : gateUi.gesture_attempts === 1 && actualPresses(gateUi) === 1 &&
+        diagnosticObject(gateUi.gesture_press_counts).acquire === 1 && gateUi.quick_move_presses === 0 &&
+        first.role === "acquire" && typeof first.pressed_ms === "number" &&
+        gateUi.cursor_count === 1 && gateUi.grid_count === 0 &&
+        (gateUi.phase === 2 || gateUi.phase === 3) && count(update.observation, "spruce_log") >= 1 &&
+        diagnosticObject(ui.gesture_press_counts).distribute === 0 &&
+        diagnosticObject(ui.gesture_press_counts).result === 0 && diagnosticObject(ui.gesture_press_counts).transfer === 0);
+  if (!timing) return {status: "timing_inconclusive", reasons: ["One finite exposure did not witness the exact native arrival/press window; no retry authorized"]};
+  const before = diagnosticObject(entry.before), observed = diagnosticObject(update.observation);
+  check(JSON.stringify(before.life) === JSON.stringify(observed.life) && JSON.stringify(before.space) === JSON.stringify(observed.space) &&
+    before.session_id === observed.session_id, "Inventory arrival changed life, space or session");
+  check(stages.length === 1 && stage.stage_index === 0 && stage.item === "spruce_planks" && stage.executions === 1, "Original recipe receipt accounting differs");
+  check(serverCounts?.spruce_log === (positive ? 1 : 2) && (serverCounts?.spruce_planks ?? 0) === (positive ? 4 : 0),
+    "Server inventory does not confirm exact final ingredient/output conservation");
+  if (positive) {
+    const cancelled = events[0] ?? {}, pressed = events.filter(event => typeof event.pressed_ms === "number");
+    check(ui.startup_inventory_rebases === 1 && ui.resize_retargets === 0 && ui.inventory_replan_pending === false &&
+      cancelled.role === "acquire" && cancelled.started_ms === first.started_ms && cancelled.cancelled_before_input === true &&
+      cancelled.pressed_ms === undefined && typeof cancelled.cancelled_ms === "number" &&
+      pressed.length > 0 && pressed.every(event => Number(event.pressed_ms) > Number(cancelled.cancelled_ms)) &&
+      events[1]?.role === "acquire" && events[1]?.slot === first.slot &&
+      Number(events[1]?.started_ms) >= Number(cancelled.cancelled_ms) &&
+      events.some(event => event.role === "distribute" && event.slot === 1 && event.button === 1 && event.completed === true) &&
+      events.some(event => event.role === "return" && event.slot === first.slot && event.button === 0 && event.completed === true),
+      "Native pointer cancellation/replan did not precede every actual press");
+    check(result.status === "succeeded" && diagnosticObject(entry.execution).status === "succeeded" &&
+      stage.status === "succeeded" && stage.completed_executions === 1 && stage.confirmed_executions === 1 &&
+      stage.inventory_receipt_confirmed === true && stage.inventory_custody_confirmed === true &&
+      detail.world_effect_emitted === true && ui.quick_move_presses === 0 &&
+      diagnosticObject(ui.gesture_press_counts).acquire === 1 &&
+      diagnosticObject(ui.gesture_press_counts).distribute === 1 && diagnosticObject(ui.gesture_press_counts).return === 1 &&
+      count(entry.after, "spruce_planks") === 4 && count(entry.after, "spruce_log") === 1,
+      "Original one-execution request lacks exact server-confirmed 4 planks plus 1 log");
+  } else {
+    check(result.status === "unknown" && diagnosticObject(entry.execution).status === "unknown" &&
+      detail.world_effect_emitted === true && detail.effect_confirmed === false && ui.failed === true &&
+      ui.reason === "handler_layout_or_custody_changed" && ui.startup_inventory_rebases === 0 &&
+      ui.gesture_attempts === 1 && actualPresses(ui) === 1 && ui.quick_move_presses === 0 &&
+      events.every(event => event.cancelled_before_input !== true) &&
+      stage.completed_executions === 0 && stage.confirmed_executions === 0 &&
+      count(entry.after, "spruce_log") === 2 && count(entry.after, "spruce_planks") === 0,
+      "First-acquire postpress increment refreshed/replayed, concealed emitted uncertainty or lost returned cursor custody");
+  }
+  return {status: reasons.length ? "failed" : "passed", reasons};
+}
+
 export async function runNativeMinecraftMechanics(args: readonly string[]) {
   requireTierOptIn("native-game", { allowNative: args.includes("--allow-native") });
   const flags = [...args];
@@ -394,7 +527,7 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
     (selected === "approach" || !args.includes("--mode")) &&
     (selected === "approach" || selected === "visible-gui" || selected === "inventory" || stageSelection === undefined) &&
     flags.every(flag => flag === "--allow-native"),
-    "Pass --allow-native --jar and --case basic|tool|stone|repair|approach|inventory|world-input|visible-gui|sensing|controller-stream|resident; approach accepts --mode and --stages, visible-gui/inventory accept --stages, no inference");
+    "Pass --allow-native --jar and --case basic|tool|stone|repair|approach|inventory|world-input|visible-gui|sensing|controller-stream|resident; approach accepts --mode and --stages, visible-gui/inventory accept --stages; inventory opt-in spruce-prepress,spruce-postpress use one finite timing exposure each, no inference");
   requireProof(mode==="fixed" || probeStages.every(stage => mechanicalProbeStages.some(known=>known===stage)), "Additional negative stages require --mode fixed");
   requireProof(!probeStages.includes("replacement-stale") || probeStages.includes("replacement"), "replacement-stale requires replacement in the same selected proof");
   const artifact = assertNativeArtifactFresh(project, jar);
@@ -608,7 +741,15 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
             // witness; never guess a development-only GUI class spelling.
             const bound = diagnostics.motor_active && diagnostics.screen_type !== null && custody?.sync_id === 0 &&
               ui?.screen_bindings === 1 && ui.closed === false && ui.failed === false;
-            const ready = update.scenario === "startup-update-preplan"
+            const spruce = update.scenario.startsWith("spruce-");
+            const presses = ui ? actualPresses(ui) : -1;
+            const ready = spruce ? ui?.gesture_attempts === 1 && ui.quick_move_presses === 0 &&
+              diagnosticRows(ui.gesture_events)[0]?.role === "acquire" &&
+              (update.scenario === "spruce-prepress"
+                ? ui.phase === 1 && presses === 0 && ui.held === false && ui.cursor_count === 0 && ui.grid_count === 0 &&
+                  custody?.cursor_count === 0 && custody.grid_count === 0 && diagnostics.motor_world_effect_emitted === false
+                : presses === 1 && diagnosticObject(ui.gesture_press_counts).acquire === 1 && (ui.phase === 2 || ui.phase === 3))
+              : update.scenario === "startup-update-preplan"
               ? ui?.phase === 0 && ui.gesture_attempts === 0 && ui.held === false &&
                 ui.cursor_count === 0 && ui.grid_count === 0 && custody?.cursor_count === 0 && custody.grid_count === 0
               : ui?.quick_move_presses === 1 && (ui.phase === 2 || ui.phase === 3) &&
@@ -622,16 +763,22 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
               // the actual arriving increment concurrently, not after that
               // delay has silently consumed the native preplan window.
               await pollMechanicalEffect(async () => {
-                await fixture.console(["give @a minecraft:oak_log 1"]);
+                await fixture.console([`give @a minecraft:${spruce ? "spruce" : "oak"}_log 1`]);
                 update.acknowledged_ms = performance.now();
               }, async () => {
                 if (update.observation) return;
                 const observation = await fixture.observe();
-                const logs = observation.data.player.inventory.filter(item => item.name === "oak_log")
+                const logs = observation.data.player.inventory.filter(item => item.name === (spruce ? "spruce_log" : "oak_log"))
                   .reduce((sum, item) => sum + item.count, 0);
-                if (logs !== (update.scenario === "startup-update-preplan" ? 3 : 1)) return;
+                if (spruce ? update.scenario === "spruce-prepress" ? logs !== 2 : logs !== 1 && logs !== 2
+                  : logs !== (update.scenario === "startup-update-preplan" ? 3 : 1)) return;
+                const arrival = await fixture.diagnostics();
+                if (update.scenario === "spruce-prepress") {
+                  const arrivalUi = diagnosticObject(arrival.native_inventory_ui);
+                  if (arrivalUi.startup_inventory_rebases !== 1 || actualPresses(arrivalUi) !== 0) return;
+                }
                 update.observation = observation;
-                update.after = await fixture.diagnostics();
+                update.after = arrival;
               }, 0);
             } catch (error) { update.error = String(error); throw error; }
           }, 5);
@@ -925,13 +1072,14 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
       await pause(15000); open();
       fixture.report.inventory_setup_frame = await fixture.frame("inventory-setup-settled");
       const inventoryScenarios = ["positive", "sequence-partial", "surplus", "split", "variants", "components", "full", "stop", "stop-distributed", "replacement", "correction", "shift-stop", "shift-correction"];
-      const startupUpdateScenarios = ["startup-update-preplan", "startup-update-postpress"];
+      const startupUpdateScenarios = ["startup-update-preplan", "startup-update-postpress", "spruce-prepress", "spruce-postpress"];
       const selectedInventoryScenarios = stageSelection === undefined ? inventoryScenarios : stageSelection.split(",");
       requireProof(selectedInventoryScenarios.length > 0 && selectedInventoryScenarios.every(value => [...inventoryScenarios, ...startupUpdateScenarios].includes(value)) &&
         new Set(selectedInventoryScenarios).size === selectedInventoryScenarios.length, "Inventory --stages must name unique known inventory scenarios");
       for (const scenario of selectedInventoryScenarios) {
         inventoryScenario = scenario; admitted = false;
         const startupUpdate = startupUpdateScenarios.includes(scenario);
+        const spruceUpdate = scenario.startsWith("spruce-");
         inventoryUpdate = startupUpdate ? {scenario, samples: 0, injection_attempts: 0} : undefined;
         if (scenario === "positive" && selectedInventoryScenarios.indexOf(scenario) > 0) {
           await fixture.console([
@@ -949,7 +1097,10 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
               ...Array.from({length: 27}, (_,slot) => `item replace entity @a inventory.${slot} with minecraft:stone 64`),
               "item replace entity @a inventory.0 with minecraft:oak_log 64",
             ]);
-          } else if (startupUpdate) await fixture.console([
+          } else if (spruceUpdate) await fixture.console([
+            "item replace entity @a inventory.0 with minecraft:spruce_log 1",
+          ]);
+          else if (startupUpdate) await fixture.console([
             "item replace entity @a inventory.0 with minecraft:oak_log 2",
             "item replace entity @a inventory.1 with minecraft:oak_planks 6",
           ]);
@@ -1105,7 +1256,16 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
           entry.after = after; entry.final_diagnostics = diagnostics;
           requireProof(diagnostics.controls_neutral && !diagnostics.motor_active && concurrent === 0 && peak === 1,
             "Inventory fixture did not drain one effect owner");
-          if (startupUpdate) {
+          if (spruceUpdate) {
+            entry.perturbation_commands = fixture.commands.length - commandsBefore;
+            entry.concurrent_effects_after = concurrent;
+            entry.original_requested_action = {kind: "craft", item: "spruce_planks", executions: 1};
+            await fixture.console(["data get entity @p Inventory"]);
+            entry.server_inventory = fixture.commands.at(-1);
+            const assessment = inspectSprucePrepressCase(entry);
+            entry.spruce_assessment = assessment;
+            requireProof(assessment.status === "passed", `${assessment.status}: ${assessment.reasons.join("; ")}`);
+          } else if (startupUpdate) {
             const update = inventoryUpdate!;
             const result = actualEffects[0]?.result, ui = uiEvidence(result);
             const gateUi = update.gate ? nativeUi(update.gate) : null;
@@ -1209,7 +1369,7 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
             const recording = await recorder.finish({endedAt: Date.now(), reason: `visible_inventory_${scenario}_settled`});
             entry.recording = recording;
             requireProof(recording.status === "complete", "Native inventory recording incomplete");
-            entry.replay = await recorder.renderReplay({signal: scope.signal});
+            entry.replay = await recorder.renderReplay({signal: scope.signal, ...(spruceUpdate ? {combinedMaxBytes: 512 * 1024 ** 2} : {})});
           }
           entry.claim = "Evaluator-authored native mechanics/presentation only, not model intelligence or pacing proof";
         });
@@ -1219,7 +1379,7 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
           await runtime.control(runId!, "stop");
           const retainedCase = fixture.cases.at(-1)!;
           retainedCase.recording = await recorder.finish({endedAt: Date.now(), reason: `visible_inventory_${scenario}_retained`});
-          retainedCase.replay = await recorder.renderReplay({signal: scope.signal});
+          retainedCase.replay = await recorder.renderReplay({signal: scope.signal, ...(spruceUpdate ? {combinedMaxBytes: 512 * 1024 ** 2} : {})});
           const drained = await fixture.diagnostics();
           retainedCase.retained_diagnostics = drained;
           requireProof(drained.controls_neutral && !drained.motor_active && concurrent === 0,
@@ -1304,7 +1464,8 @@ export async function runNativeMinecraftMechanics(args: readonly string[]) {
       await settle("recording", async () => { if (recorder) {
         fixture.report.recording = await recorder.finish({ endedAt: Date.now(), reason: failure ? "failed" : "completed" });
         if (failure && !scope.signal.aborted) {
-          try { fixture.report.failure_replay = await recorder.renderReplay({ signal: scope.signal }); } catch { fixture.report.failure_replay = "render_failed_original_frames_retained"; }
+          try { fixture.report.failure_replay = await recorder.renderReplay({ signal: scope.signal,
+            ...(stageSelection?.split(",").some(stage => stage.startsWith("spruce-")) ? {combinedMaxBytes: 512 * 1024 ** 2} : {}) }); } catch { fixture.report.failure_replay = "render_failed_original_frames_retained"; }
         }
       } });
       await settle("runtime_evidence", async () => {

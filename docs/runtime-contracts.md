@@ -2812,6 +2812,15 @@ input. `startup_inventory_rebases` remains zero or one; `inventory_refresh`,
 the fresh-plan barrier and custody refusals. A canceled pointer records
 `cancelled_before_input` without manufacturing a press or completed gesture.
 
+The opt-in `spruce-prepress` and `spruce-postpress` stages in
+[`native-minecraft-mechanics.ts`](../scripts/native-minecraft-mechanics.ts)
+exercise one inventory arrival during the first ingredient transfer, before
+or after its press. Each sends one original single-execution craft and one
+inventory perturbation. A missed timing window is inconclusive; command
+dispatch alone does not prove arrival before a press. Final conservation uses
+an acknowledged server inventory query after owned-screen cleanup. These
+synthetic native mechanics checks make no model-gameplay claim.
+
 Ingredient assignments are grouped by their actual source slot. The controller picks up that stack once, distributes single items with separate ordinary right-clicks and returns surplus once before changing material or collecting output. The mouse button is released between placements; the remaining stack stays on the cursor. Source/cursor/grid components and counts remain checked throughout, including split sources and mixed materials. Vanilla ingredient eligibility matches permitted item alternatives; it does not require a material's incidental components to equal the recipe display's default stack. This does not relax actual custody checks or implement drag distribution.
 
 For a prepared multi-execution batch, output is taken with one ordinary

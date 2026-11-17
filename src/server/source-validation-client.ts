@@ -13,6 +13,7 @@ import { SOURCE_VALIDATION_LIMITS, SourceValidationFrames, assertSourceValidatio
 const workerPath = fileURLToPath(new URL("./source-validation-worker.ts", import.meta.url));
 let activeJobs = 0;
 const backendFailure = () => new Error("Source validation backend failed; no source was published");
+const cancelled = () => new RuntimeFault("stale_context", "Source validation cancelled; no source was published");
 function knownError(code: string): Error {
   switch (code) {
     case "dependency_depth": return new Error("Dependency depth exceeds eight");
@@ -48,7 +49,7 @@ export async function validateSourceInWorker(request: SourceValidationRequest,
     options.deadlineHostMs === undefined ? SOURCE_VALIDATION_LIMITS.job_ms : options.deadlineHostMs - startedHostMs);
   const deadlineNs = startedNs + BigInt(Math.floor(Math.max(0, allowanceMs) * 1_000_000));
   const assertActive = () => {
-    if (options.signal?.aborted) throw new Error("Source validation cancelled; no source was published");
+    if (options.signal?.aborted) throw cancelled();
     if (osMonotonicNs() >= deadlineNs) throw new Error("Source validation deadline exceeded; no source was published");
     assertScope();
   };
@@ -91,7 +92,7 @@ export async function validateSourceInWorker(request: SourceValidationRequest,
     // independently owned process is killed; close still owns the drain barrier.
     if (!closed) { try { child?.kill("SIGKILL"); } catch { /* close owns the join. */ } }
   };
-  const abort = () => fail(new Error("Source validation cancelled; no source was published"));
+  const abort = () => fail(cancelled());
   const armDeadline = () => {
     const remaining = deadlineNs - osMonotonicNs();
     if (remaining <= 0n) fail(new Error("Source validation deadline exceeded; no source was published"));

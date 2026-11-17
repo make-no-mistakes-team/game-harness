@@ -9,6 +9,7 @@ import { ProgramValidationError, validateSkill } from "../src/server/program-val
 import { SourceValidationFrames, SOURCE_VALIDATION_LIMITS, encodeSourceValidationSpec, sourceValidationLine,
   sourceValidationMessageSchema, sourceValidationReadSchema, sourceValidationWorkerRequestSchema } from "../src/server/source-validation-protocol.ts";
 import { Store } from "../src/server/store.ts";
+import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { minecraftRunFixture, minecraftTestAdapter, minecraftTestBinding } from "./helpers/adapter-contract.ts";
 
 const resources: { store: Store; directory: string }[] = [];
@@ -162,11 +163,35 @@ test("cancellation joins startup workers before returning and releases the finit
   controller.abort();
   const outcomes = await pending;
   expect(outcomes.every(outcome => outcome.status === "rejected" &&
-    outcome.reason instanceof Error && outcome.reason.message.includes("Source validation cancelled"))).toBe(true);
+    outcome.reason instanceof RuntimeFault && outcome.reason.code === "stale_context" &&
+    outcome.reason.message === "Source validation cancelled; no source was published")).toBe(true);
   expect(store.skills(run.run_id)).toEqual([]);
   expect(validationChildren()).toEqual([]);
   await sources.register(run.run_id, spec("after-cancellation"));
   expect(store.skills(run.run_id)).toHaveLength(1);
+}, 15000);
+
+test("cancelled joined validation admission remains stale before publication without renewing or exposing the abort reason", async () => {
+  const { store, adapter, binding, run, sources } = fixture();
+  const controller = new AbortController();
+  const admission = await validateSourceInWorker({ spec: spec("cancel-after-join"), context: adapter,
+    binding, runCompatibilityHash: run.compatibility_hash }, () => {
+    throw new Error("The source has no dependencies");
+  }, () => {}, { signal: controller.signal });
+  expect(validationChildren()).toEqual([]);
+  admission.assertCurrent();
+  controller.abort(new Error("PRIVATE_ABORT_REASON"));
+  let refused: unknown;
+  try { admission.assertCurrent(); }
+  catch (error) { refused = error; }
+  expect(refused).toBeInstanceOf(RuntimeFault);
+  expect(refused).toMatchObject({ code: "stale_context", message: "Source validation cancelled; no source was published" });
+  await expect(sources.register(run.run_id, spec("already-cancelled"), () => {}, undefined,
+    { signal: controller.signal })).rejects.toMatchObject({
+    code: "stale_context", message: "Source validation cancelled; no source was published",
+  });
+  expect(store.skills(run.run_id)).toEqual([]);
+  expect(validationChildren()).toEqual([]);
 }, 15000);
 
 test("expired original caller deadlines cannot receive a renewed worker allowance", async () => {
@@ -271,7 +296,9 @@ test("cancellation during an actual source read joins the child and cannot admit
     read = true;
     controller.abort();
     return structuredClone(leaf);
-  }, () => {}, { signal: controller.signal })).rejects.toThrow("Source validation cancelled; no source was published");
+  }, () => {}, { signal: controller.signal })).rejects.toMatchObject({
+    code: "stale_context", message: "Source validation cancelled; no source was published",
+  });
   expect(read).toBe(true);
   expect(validationChildren()).toEqual([]);
   await sources.register(run.run_id, spec("after-rpc-cancellation"));

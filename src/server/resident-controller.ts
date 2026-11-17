@@ -267,7 +267,8 @@ export class ResidentController {
     void this.process(slot).then(flight.resolve, flight.reject);
     void flight.promise.catch(error => {
       if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
-      else if (error instanceof ResidentWorkerFault && residentWorkerFailure(error)?.code === "source_throw")
+      else if (error instanceof ResidentWorkerFault &&
+        ["source_throw", "invalid_return_json"].includes(residentWorkerFailure(error)?.code ?? ""))
         this.resultFailure = error;
       this.finish("failed", `resident_step: ${programDiagnostic(error, this.options.source_hash).message}`);
     }).finally(() => {

@@ -21,6 +21,8 @@ export interface ProgramDiagnostic {
   result_path?: "result.rejected_result";
   output?: ProgramOutputFailure;
   source_diagnostic?: ResidentSourceAdvisory;
+  advisory?: true;
+  trusted_origin?: false;
 }
 export class ProgramExecutionError extends Error {
   constructor(readonly diagnostic: ProgramDiagnostic) { super(diagnostic.message); this.name = "ProgramExecutionError"; }
@@ -112,15 +114,17 @@ export function programDiagnostic(error: unknown, sourceHash: string): ProgramDi
   };
   if (error instanceof ProgramExecutionError) {
     // Finite-program wire diagnostics cannot establish resident fault custody.
-    const { source_diagnostic: _advisory, ...diagnostic } = error.diagnostic;
+    const { source_diagnostic: _advisory, advisory: _workerAdvice, trusted_origin: _workerOrigin, ...diagnostic } = error.diagnostic;
     return { ...diagnostic, source_hash: sourceHash };
   }
   if (error instanceof RuntimeFault) return { type: "RuntimeFault", code: error.code,
     message: error.message.slice(0, 1000), source_hash: sourceHash, location: { mapping: "unmapped" } };
   const workerFailure = residentWorkerFailure(error);
-  if (workerFailure?.code === "watchdog" || workerFailure?.code === "source_throw") return {
+  if (workerFailure?.code === "watchdog" || workerFailure?.code === "source_throw" ||
+    workerFailure?.code === "invalid_return_json") return {
     type: "ResidentWorkerFailure", code: `resident_${workerFailure.code}`,
     message: workerFailure.error, source_hash: sourceHash, location: { mapping: "unmapped" },
+    ...(workerFailure.advisory ? { advisory: true, trusted_origin: false } : {}),
     ...(workerFailure.source_diagnostic?.diagnostic.source_hash === sourceHash
       ? { source_diagnostic: workerFailure.source_diagnostic } : {}),
   };

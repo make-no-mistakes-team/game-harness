@@ -15,7 +15,8 @@ export class PreparedSourceFault extends Error {
 }
 
 export function preparationFailure(error: unknown): {
-  error: string; code: string; stage?: "native_launch"; issues?: Json; omitted_issues?: number; source_diagnostic?: ResidentSourceAdvisory;
+  error: string; code: string; stage?: "native_launch"; issues?: Json; omitted_issues?: number;
+  advisory?: true; trusted_origin?: false; source_diagnostic?: ResidentSourceAdvisory;
 } {
   const launchFailure = nativeLaunchFailure(error);
   if (launchFailure) return launchFailure;

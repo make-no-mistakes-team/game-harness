@@ -185,6 +185,49 @@ test("host decoder preserves source advice and exact bundle hash through followi
   await worker.close();
 });
 
+test("host decoder preserves only an untrusted fixed invalid-return category through timing and cleanup", async () => {
+  const bundle = diagnosticBundle();
+  const worker = await hostFaultWorker(bundle, { v: 2, type: "guardian_resident_fault",
+    origin: "invalid_return_json", trusted_origin: false });
+  const reports: number[] = [];
+  let caught: unknown;
+  try { await worker.analyze(null, undefined, elapsed => reports.push(elapsed)); }
+  catch (error) { caught = error; }
+  expect(caught).toMatchObject({ origin: "invalid_return_json", trustedOrigin: false });
+  expect(reports).toEqual([7]);
+  expect(preparationFailure(caught)).toEqual({
+    code: "invalid_return_json", advisory: true, trusted_origin: false,
+    error: "Resident worker failed (invalid_return_json). Return bounded plain JSON with finite numbers and no accessors, proxies or serialization hooks.",
+  });
+  expect(residentSourceAdvisory(caught)).toBeUndefined();
+  await worker.close();
+});
+
+test("host decoder quarantines invalid-return details and promoted trust", async () => {
+  const bundle = diagnosticBundle();
+  const base = { v: 2, type: "guardian_resident_fault", origin: "invalid_return_json", trusted_origin: false };
+  for (const fault of [{ ...base, trusted_origin: true }, { ...base, message: "PRIVATE_SOURCE_VALUE" },
+    { ...base, diagnostic: { message: "PRIVATE_SOURCE_MESSAGE" } }, { ...base, path: "PRIVATE_KEY_PATH" }]) {
+    const worker = await hostFaultWorker(bundle, fault);
+    let caught: unknown;
+    try { await worker.analyze(null); } catch (error) { caught = error; }
+    expect(caught).toMatchObject({ origin: "transport", trustedOrigin: true });
+    expect(JSON.stringify(preparationFailure(caught))).not.toContain("PRIVATE");
+    await worker.close();
+  }
+});
+
+test("invalid-return advice cannot override failed cleanup", async () => {
+  const worker = await hostFaultWorker(diagnosticBundle(), { v: 2, type: "guardian_resident_fault",
+    origin: "invalid_return_json", trusted_origin: false }, 1);
+  let caught: unknown;
+  try { await worker.analyze(null); } catch (error) { caught = error; }
+  expect(caught).toMatchObject({ origin: "cleanup", trustedOrigin: true });
+  expect(preparationFailure(caught).code).toBe("cleanup");
+  expect(preparationFailure(caught)).not.toHaveProperty("advisory");
+  await expect(worker.close()).rejects.toThrow();
+});
+
 test("host decoder rejects malformed, wrong-source and forged-trust source frames without exposing their text", async () => {
   const bundle = diagnosticBundle();
   const diagnostic = { type: "Error", message: "PRIVATE_HOST_SENTINEL",
@@ -579,6 +622,48 @@ test.each([false, true])("ordinary inspection retains actual source failure as s
     details: { execution_id: execution.execution_id, root_execution_id: execution.root_execution_id,
       status: "failed", actions: 0, calls: 0, details: { diagnostic } },
   });
+  expect(f.manager.effectScope(execution.execution_id)).toBeNull();
+  expect(f.finiteCalls).toBe(0);
+});
+
+test.each([false, true])("ordinary inspection retains actual invalid-return cleanup without a fake decision (session=%s)", async session => {
+  const f = await fixture(undefined, {}, {
+    createResidentWorker: async (bundle, _budget, signal) => await residentProcess(bundle, signal),
+    sessionTask: async () => { throw new Error("No task dispatch"); },
+    superviseSessionTask: async () => {}, retireSessionTask: async () => {},
+  });
+  const tools = inspectionTools(f), runTool = tools.find(tool => tool.name === "program_run")!;
+  const inspect = tools.find(tool => tool.name === "program_inspect")!;
+  const failing = await f.sources.register(f.run.run_id, { entry: "step", name: "invalid return",
+    source: `function invalid() {
+      return {choice:{kind:"observe"},next_state:{PRIVATE_KEY:Infinity},status:"running",
+        events:[{kind:"diagnostic",urgency:"ordinary",summary:"PRIVATE_UNCOMMITTED_EVENT",details:null}]};
+    }
+    export function activate(frame,state,intent) { return invalid(); }
+    export function step(frame,state,intent) { return invalid(); }`, card, dependencies: [] });
+  const started = await runTool.execute("invalid-return-start", { operation: "start", entry: "step",
+    name: failing.name, version: failing.version, args: null, initial_state: 0,
+    ...(session ? { session: { schema_version: 1 } } : {}) });
+  expect(started.isError).not.toBe(true);
+  const execution = f.store.latestRootExecution(f.run.run_id)!;
+  await until(f.store, f.run.run_id, () => f.manager.get(f.run.run_id, { execution_id: execution.execution_id })!.ended_at !== null);
+  const reply = await inspect.execute("invalid-return-inspect", {
+    view: "execution", target: "latest", program: { name: failing.name, version: failing.version },
+  });
+  expect(reply.isError).not.toBe(true);
+  const text = reply.content.filter(entry => entry.type === "text").map(entry => entry.text).join("");
+  const visible = JSON.parse(text);
+  const diagnostic = { type: "ResidentWorkerFailure", code: "resident_invalid_return_json",
+    message: "Resident worker failed (invalid_return_json). Return bounded plain JSON with finite numbers and no accessors, proxies or serialization hooks.",
+    source_hash: execution.source_hash, location: { mapping: "unmapped" }, advisory: true, trusted_origin: false };
+  expect(visible).toMatchObject({ status: "failed", diagnostic,
+    result: { status: "failed", summary: diagnostic.message, result: null },
+    resident: { status: "failed", state: 0, processed_frame_seq: null, processed_native_tick: null,
+      counters: { steps: 1, submissions: 0, events: 0 },
+      cleanup: { worker: "closed", native: "retired" },
+      ...(session ? { session: { restarts: 0, producer: "none" } } : {}) },
+  });
+  expect(text).not.toContain("PRIVATE");
   expect(f.manager.effectScope(execution.execution_id)).toBeNull();
   expect(f.finiteCalls).toBe(0);
 });

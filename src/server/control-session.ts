@@ -725,7 +725,7 @@ export class ControlSession {
     if (!this.abort.signal.aborted) {
       if (error instanceof GeneratedControllerResultValidationError) this.resultFailure = error;
       else if (error instanceof ResidentWorkerFault &&
-        ["watchdog", "source_throw"].includes(residentWorkerFailure(error)?.code ?? "")) this.resultFailure = error;
+        ["watchdog", "source_throw", "invalid_return_json"].includes(residentWorkerFailure(error)?.code ?? "")) this.resultFailure = error;
       else if (error instanceof ControllerChannelFaultError) {
         this.resultFailure = new RuntimeFault(error.fault ? "native_controller_fault" : "controller_cause_unavailable",
           error.fault

@@ -1,7 +1,7 @@
 import { types } from "node:util";
 import type { ResidentSourceDiagnostic, ResidentSourceAdvisory } from "../shared/resident.ts";
 
-export type ResidentWorkerFaultOrigin = "watchdog" | "source_throw" | "transport" | "opaque" | "cleanup";
+export type ResidentWorkerFaultOrigin = "watchdog" | "source_throw" | "invalid_return_json" | "transport" | "opaque" | "cleanup";
 const residentSourceDiagnostics = new WeakMap<object, ResidentSourceDiagnostic>();
 const residentWorkerFailures = new WeakMap<object, { error: string; code: ResidentWorkerFaultOrigin }>();
 
@@ -34,7 +34,11 @@ export class ResidentWorkerFault extends Error {
   readonly sourceDiagnostic?: ResidentSourceDiagnostic;
   constructor(readonly origin: ResidentWorkerFaultOrigin, readonly trustedOrigin: boolean = true,
     sourceDiagnostic?: unknown) {
-    super(`Resident worker failed (${origin}).`);
+    super(origin === "invalid_return_json"
+      ? "Resident worker failed (invalid_return_json). Return bounded plain JSON with finite numbers and no accessors, proxies or serialization hooks."
+      : `Resident worker failed (${origin}).`);
+    if (origin === "invalid_return_json" && trustedOrigin)
+      throw new Error("Invalid resident return fault origin.");
     this.name = "ResidentWorkerFault";
     residentWorkerFailures.set(this, { error: this.message, code: origin });
     if (sourceDiagnostic !== undefined) {
@@ -56,11 +60,13 @@ export function residentSourceAdvisory(error: unknown): ResidentSourceAdvisory |
 
 /** The branded category and advisory are separate from arbitrary exception properties. */
 export function residentWorkerFailure(error: unknown): {
-  error: string; code: string; source_diagnostic?: ResidentSourceAdvisory;
+  error: string; code: string; advisory?: true; trusted_origin?: false; source_diagnostic?: ResidentSourceAdvisory;
 } | undefined {
   if (!error || typeof error !== "object") return undefined;
   const failure = residentWorkerFailures.get(error);
   if (!failure) return undefined;
   const source_diagnostic = residentSourceAdvisory(error);
-  return { ...failure, ...(source_diagnostic ? { source_diagnostic } : {}) };
+  return { ...failure,
+    ...(failure.code === "invalid_return_json" ? { advisory: true as const, trusted_origin: false as const } : {}),
+    ...(source_diagnostic ? { source_diagnostic } : {}) };
 }

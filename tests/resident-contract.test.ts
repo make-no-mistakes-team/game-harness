@@ -126,6 +126,34 @@ test("live source advice cannot cross source identities or mutate its branded di
   expect(programDiagnostic(new ProgramExecutionError(wireDiagnostic), hash).source_diagnostic).toBeUndefined();
 });
 
+test("invalid-return diagnostics are fixed branded advice, not mutable source detail or host authority", () => {
+  const hash = "a".repeat(64), fault = new ResidentWorkerFault("invalid_return_json", false);
+  const message = "Resident worker failed (invalid_return_json). Return bounded plain JSON with finite numbers and no accessors, proxies or serialization hooks.";
+  Reflect.set(fault, "message", "PRIVATE_EXCEPTION");
+  Reflect.set(fault, "origin", "watchdog");
+  Reflect.set(fault, "trustedOrigin", true);
+  Reflect.set(fault, "sourceDiagnostic", { message: "PRIVATE_SOURCE" });
+  expect(preparationFailure(fault)).toEqual({
+    code: "invalid_return_json", error: message, advisory: true, trusted_origin: false,
+  });
+  const diagnostic = programDiagnostic(fault, hash);
+  expect(diagnostic).toEqual({ type: "ResidentWorkerFailure", code: "resident_invalid_return_json",
+    message, source_hash: hash, location: { mapping: "unmapped" }, advisory: true, trusted_origin: false });
+  expect(residentSourceAdvisory(fault)).toBeUndefined();
+  expect(() => new ResidentWorkerFault("invalid_return_json", true)).toThrow("Invalid resident return fault origin.");
+  expect(() => new ResidentWorkerFault("invalid_return_json", false, {
+    type: "Error", message: "PRIVATE_SOURCE", source_hash: hash, location: { mapping: "unmapped" },
+  })).toThrow("Invalid resident source diagnostic origin.");
+  const { advisory: _advice, trusted_origin: _origin, ...wireDiagnostic } = diagnostic;
+  expect(readProgramDiagnostic(JSON.parse(JSON.stringify(diagnostic)), hash)).toEqual(wireDiagnostic);
+  expect(programDiagnostic(new ProgramExecutionError(diagnostic), hash)).toEqual(wireDiagnostic);
+  for (const spoof of [{ origin: "invalid_return_json", trustedOrigin: false, message: "PRIVATE_SOURCE" },
+    Object.assign(Object.create(ResidentWorkerFault.prototype), { origin: "invalid_return_json" })]) {
+    expect(programDiagnostic(spoof, hash).type).toBe("ExecutionFailure");
+    expect(preparationFailure(spoof).code).toBe("service_failure");
+  }
+});
+
 test("actor-selected entries cannot exchange playing and pure-analysis authority or budgets", () => {
   const source = "export function step(frame,state,intent) { return null; }";
   const step = { operation: "start", entry: "step", name: "resident", args: { goal: "wait" }, initial_state: null };

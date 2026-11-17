@@ -969,9 +969,11 @@ test("a source error impersonating the host fault name cannot create trusted cha
 
 test.each(["activate", "step"] as const)(
   "live resident %s faults preserve the original category after exact retirement without retry", async phase => {
-    for (const origin of ["watchdog", "source_throw"] as const) {
+    for (const origin of ["watchdog", "source_throw", "invalid_return_json"] as const) {
       const h = harness(), fault = new ResidentWorkerFault(origin, origin === "watchdog");
       let invocations = 0;
+      h.options.config = { ...h.options.config, recovery: "reset_safe", max_restarts: 1 };
+      h.options.restartWorker = async () => { throw new Error("A resident fault must not authorize recovery"); };
       h.choose(rawChoice);
       h.options.worker[phase] = async () => { invocations++; throw fault; };
       await h.session.start(); await h.clock.advance(100);

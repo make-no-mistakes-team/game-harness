@@ -266,6 +266,12 @@ const guardianDiagnosticBundle = singletonExecutableModuleBundle("export functio
 const guardianDiagnosticFault = sourceFault(guardianDiagnosticBundle, "TypeError", "Authored assertion, not host fact");
 const diagnosticFaultCases = [
   ["valid source diagnostic", guardianDiagnosticFault, true],
+  ["invalid JSON return", { v: 1, type: "resident_fault", id: 1, origin: "invalid_return_json" }, true],
+  ["invalid JSON return diagnostic", { ...guardianDiagnosticFault, origin: "invalid_return_json" }, false],
+  ["invalid JSON return extra text", { v: 1, type: "resident_fault", id: 1,
+    origin: "invalid_return_json", message: "PRIVATE_RETURN" }, false],
+  ["invalid JSON return forged trust", { v: 1, type: "resident_fault", id: 1,
+    origin: "invalid_return_json", trusted_origin: true }, false],
   ["exact maximum code units", sourceFault(guardianDiagnosticBundle, "Error", "😀".repeat(500)), true],
   ["missing diagnostic", { v: 1, type: "resident_fault", id: 1, origin: "source_throw" }, false],
   ["wrong bundle hash", { ...guardianDiagnosticFault, diagnostic: { ...guardianDiagnosticFault.diagnostic, source_hash: "0".repeat(64) } }, false],
@@ -997,21 +1003,49 @@ for (const [label, expression] of [
   ["promise", "Promise.resolve(1)"],
   ["thenable", "({ then() {} })"],
   ["nonfinite number", "NaN"],
+  ["positive infinity state", "({next_state:{PRIVATE_KEY:Infinity},PRIVATE_VALUE:'must not escape'})"],
+  ["negative infinity", "-Infinity"],
   ["undefined field", "({ lost: undefined })"],
   ["bigint", "1n"],
+  ["symbol key", "({[Symbol('PRIVATE_KEY')]:1})"],
+  ["sparse array", "Array(2)"],
+  ["custom prototype", "Object.create({PRIVATE_KEY:1})"],
   ["cycle", "(() => { const x = {}; x.x = x; return x; })()"],
   ["getter", "({ get value() { while (true) {} } })"],
+  ["throwing getter", "({ get PRIVATE_KEY() { throw new Error('PRIVATE_GETTER'); } })"],
   ["toJSON", "({ toJSON() { while (true) {} } })"],
-  ["proxy serialization loop", "new Proxy({}, { ownKeys() { while (true) {} } })"],
-  ["infinite computation", "(() => { while (true) {} })()"],
+  ["proxy inspection loops", "new Proxy({}, { getPrototypeOf() { while (true) {} }, ownKeys() { while (true) {} } })"],
+  ["nested proxy", "({safe:new Proxy({}, {ownKeys(){throw new Error('PRIVATE_PROXY');}})})"],
+  ["revoked proxy", "(() => { const value=Proxy.revocable({},{});value.revoke();return value.proxy; })()"],
   ["oversize output", "'x'.repeat(65536)"],
+  ["oversize UTF8 output", "'😀'.repeat(16384)"],
+  ["encoded frame depth", "(() => { let x = 0; for (let i=0;i<32;i++) x = [x]; return x; })()"],
   ["deep output", "(() => { let x = 0; for (let i=0;i<40;i++) x = [x]; return x; })()"],
-  ["dynamic import", "import('node:fs')"],
-] as const) test(`resident evaluation fails closed for ${label} and reaps real process`, async () => {
-  const worker = await compile(`export function analyze(input) { return ${expression}; }`);
-  worker.send({ v: 1, type: "resident_analyze", id: 1, input: null });
+  ["dynamic import promise", "import('node:fs')"],
+] as const) test(`resident return cleanup rejects ${label} with only a fixed category and reaps real process`, async () => {
+  const worker = await compile(`export function analyze(input) { return input ? ${expression} : {value:7}; }`, "analyze", 200);
+  expect(await analyze(worker, 1, false)).toEqual({ v: 1, type: "resident_result", id: 1, value: { value: 7 } });
+  expect(await analyze(worker, 2, true)).toEqual({ v: 1, type: "resident_fault", id: 2, origin: "invalid_return_json" });
   expect(await worker.closed).not.toBe(0);
   expect(worker.child.exitCode).not.toBeNull();
+  await expect(worker.read()).rejects.toThrow("worker closed");
+});
+
+test.each(["resident_activate", "resident_step"] as const)(
+  "resident return cleanup classifies nonfinite %s state without committing a decision", async type => {
+    const worker = await compile(`export function step(frame,state,intent) {
+      return {choice:{kind:"observe"},next_state:{PRIVATE_KEY:Infinity},status:"running",events:[]};
+    }`, "step", 25);
+    worker.send({ v: 1, type, id: 1, frame: {}, state: null, intent: null });
+    expect(await worker.read()).toEqual({ v: 1, type: "resident_fault", id: 1, origin: "invalid_return_json" });
+    expect(await worker.closed).not.toBe(0);
+    await expect(worker.read()).rejects.toThrow("worker closed");
+  });
+
+test("resident return cleanup preserves valid JSON null rather than using it as a failure sentinel", async () => {
+  const worker = await compile("export function analyze(input) { return null; }");
+  expect(await analyze(worker, 1, null)).toEqual({ v: 1, type: "resident_result", id: 1, value: null });
+  expect(await analyze(worker, 2, null)).toEqual({ v: 1, type: "resident_result", id: 2, value: null });
 });
 
 for (const [label, frame] of [

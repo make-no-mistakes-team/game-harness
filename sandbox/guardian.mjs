@@ -240,6 +240,7 @@ function residentFault(origin, trustedOrigin = true, diagnostic) {
       trustedOrigin = true;
       diagnostic = undefined;
     }
+    if (origin === "invalid_return_json" && trustedOrigin) origin = "opaque";
     residentFaultReported = true;
     process.stdout.write(JSON.stringify({ v: 2, type: "guardian_resident_fault",
       id: residentSequence, origin, trusted_origin: trustedOrigin,
@@ -467,12 +468,13 @@ async function start() {
     try {
       const reply = boundedJson(output.subarray(0, end).toString("utf8"));
       if (resident && reply?.v === 1 && reply.type === "resident_fault" && reply.id === residentSequence &&
-          ["source_throw", "watchdog", "opaque"].includes(reply.origin)) {
+          ["source_throw", "invalid_return_json", "watchdog", "opaque"].includes(reply.origin)) {
         if (reply.origin === "source_throw") {
           if (expected !== "resident_result" ||
             !exactKeys(reply, ["v", "type", "id", "origin", "diagnostic"]) ||
             !validSourceDiagnostic(reply.diagnostic)) throw new Error("protocol");
-        } else if (!exactKeys(reply, ["v", "type", "id", "origin"])) throw new Error("protocol");
+        } else if (!exactKeys(reply, ["v", "type", "id", "origin"]) ||
+          reply.origin === "invalid_return_json" && expected !== "resident_result") throw new Error("protocol");
         return void residentFault(reply.origin, false, reply.diagnostic);
       }
       if (resident && (reply?.v !== 1 || reply.id !== residentSequence ||

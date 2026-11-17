@@ -414,7 +414,7 @@ async function runResidentThread() {
   function cleanJson(value, depth = 0, active = new Set()) {
     if (value === null || typeof value === "string" || typeof value === "boolean") return value;
     if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (!value || typeof value !== "object" || depth + 1 > MAX_DEPTH || active.has(value))
+    if (!value || typeof value !== "object" || depth + 1 > MAX_DEPTH || active.has(value) || types.isProxy(value))
       throw new Error("json");
     const array = Array.isArray(value);
     const prototype = Object.getPrototypeOf(value);
@@ -465,13 +465,18 @@ async function runResidentThread() {
         post(stringify({ v: 1, type: "resident_fault", id: message.id, origin: "source_throw", diagnostic }));
         return exit(1);
       }
-      const value = cleanJson(returned);
-      // Return plain bounded data even when its gameplay result shape is wrong.
-      // The trusted decoder reports invalid fields; killing this thread would
-      // misclassify a repairable authored return as an opaque runtime failure.
-      const encoded = stringify({ v: 1, type: "resident_result", id: message.id, value });
-      if (byteLength(encoded) + 1 > MAX_OUTPUT || !depthIsBounded(parse(encoded)))
-        throw new Error("output_limit");
+      let encoded;
+      try {
+        const value = cleanJson(returned);
+        // Plain bounded returns still reach the trusted gameplay-shape decoder.
+        encoded = stringify({ v: 1, type: "resident_result", id: message.id, value });
+        if (byteLength(encoded) + 1 > MAX_OUTPUT || !depthIsBounded(parse(encoded)))
+          throw new Error("output_limit");
+      } catch {
+        // Never inspect or serialize the rejected value or validation exception.
+        post(stringify({ v: 1, type: "resident_fault", id: message.id, origin: "invalid_return_json" }));
+        return exit(1);
+      }
       post(encoded);
       busy = false;
     } catch { exit(1); }
@@ -843,7 +848,8 @@ function runSupervisor() {
     try {
       const sourceThrow = origin === "source_throw" && validSourceDiagnostic(diagnostic, residentSourceHash);
       send(resident ? { v: 1, type: "resident_fault", id: sequence,
-        origin: sourceThrow ? "source_throw" : origin === "watchdog" ? "watchdog" : "opaque",
+        origin: sourceThrow ? "source_throw" : origin === "watchdog" ? "watchdog"
+          : origin === "invalid_return_json" ? "invalid_return_json" : "opaque",
         ...(sourceThrow ? { diagnostic } : {}) } : { type: "error" });
     } catch {
       /* Never forward policy logs or raw errors. */
@@ -961,6 +967,10 @@ function runSupervisor() {
               exactKeys(reply, ["v", "type", "id", "origin", "diagnostic"]) && reply.origin === "source_throw" &&
               validSourceDiagnostic(reply.diagnostic, residentSourceHash))
             return fail("source_throw", reply.diagnostic);
+          if (resident && reply?.v === 1 && reply.type === "resident_fault" && reply.id === sequence &&
+              expected === "resident_result" && reply.origin === "invalid_return_json" &&
+              exactKeys(reply, ["v", "type", "id", "origin"]))
+            return fail("invalid_return_json");
           if (!reply || !depthIsBounded(reply) || reply.type !== expected)
             throw new Error("protocol");
           if (resident && (reply.v !== 1 || reply.id !== sequence ||

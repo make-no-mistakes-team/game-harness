@@ -500,9 +500,9 @@ class DockerPolicyWorker implements PolicyWorker, ResidentWorker, ResidentAnalys
             !exactKeys(fault, fault.origin === "source_throw"
               ? ["v", "type", "id", "origin", "trusted_origin", "diagnostic"]
               : ["v", "type", "id", "origin", "trusted_origin"]) ||
-            !["watchdog", "source_throw", "transport", "opaque"].includes(fault.origin as string) ||
+            !["watchdog", "source_throw", "invalid_return_json", "transport", "opaque"].includes(fault.origin as string) ||
             typeof fault.trusted_origin !== "boolean" ||
-            (fault.trusted_origin && fault.origin === "source_throw"))
+            (fault.trusted_origin && ["source_throw", "invalid_return_json"].includes(fault.origin as string)))
           throw new Error("Invalid resident fault envelope.");
         const diagnostic = fault.origin === "source_throw"
           ? readResidentSourceDiagnostic(fault.diagnostic, this.residentSourceHash) : undefined;

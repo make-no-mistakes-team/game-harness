@@ -15,6 +15,8 @@ import { CONTEXT_WORKER_LIMITS, strategicContextScope, type ContextAssemblyInput
 import { emptyRunUsage } from "../src/server/usage.ts";
 import { CognitionWire } from "../src/server/cognition-wire.ts";
 import { osMonotonicNs } from "../src/server/os-monotonic.ts";
+import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
+import { controlSessionConfigSchema } from "../src/shared/control-session.ts";
 
 const cleanup: (() => void | Promise<void>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -94,6 +96,59 @@ test("inline context exactly matches the shared readonly reducer, including scop
   expect(changed.programs).toEqual(context.programs);
   expect(changed.unresolved).toEqual(context.unresolved);
   expect(changed.requested_help).toEqual([]);
+});
+
+test("current authority disclosure survives help/source pressure within 32 KiB without hiding earlier failure or unknown scope", async () => {
+  const f = fixture(), program = await source(f.store, f.run);
+  const unknown = f.store.event(f.run.run_id, "runtime.uncertainty", "UNCONFIRMED_EARLIER_EFFECT", {
+    action_id: "bounded-unknown", world_id: f.run.world_id, session_id: f.run.session_id,
+    life_id: f.run.life_id, native_boot_id: f.run.native_boot_id, space_epoch: f.run.space_epoch,
+  });
+  const failure = f.store.event(f.run.run_id, "model.tool_rejected", "EARLIER_REFUSAL_REMAINS_EVIDENCE", {
+    tool: "program_run", error: { code: "budget_exceeded", message: "Earlier bounded refusal", retryable: false },
+  });
+  f.owner.selectProgram(program.name, program.version);
+  const authority = { playing_authority: { limits: { ...DEFAULT_RESIDENT_LIMITS,
+    max_analysis_jobs: 0, max_analysis_ms: 0 }, session: controlSessionConfigSchema.parse({ schema_version: 1 }) },
+    main_decision_window: { max_requests: 24, admitted_requests: 23, remaining_requests: 1,
+      count_semantics: "after_current_request_admission" as const } };
+  const baseline = JSON.parse(await f.owner.assemble({ ...f.input, authority }, f.options())).strategic_context;
+  f.owner.rememberHelp("programs", Object.fromEntries(Array.from({ length: 12 }, (_, index) =>
+    [`section_${index}`, "Bounded program reference ".repeat(220)])));
+  f.owner.rememberHelp("game", { schemas: Array.from({ length: 20 }, () => "界".repeat(1000)) });
+  const encoded = await f.owner.assemble({ ...f.input, authority }, f.options());
+  const received = JSON.parse(encoded).strategic_context;
+  expect(Buffer.byteLength(encoded)).toBeLessThanOrEqual(32768);
+  expect(received.authority).toEqual(authority);
+  expect(received.latest_failure).toEqual(baseline.latest_failure);
+  expect(received.latest_failure).toMatchObject({ event_seq: failure.event_seq, type: "model.tool_rejected" });
+  expect(received.unresolved).toEqual(baseline.unresolved);
+  expect(received.unresolved).toContainEqual(expect.objectContaining({ event_seq: unknown.event_seq, no_replay: true,
+    original_scope: expect.objectContaining({ life_id: f.run.life_id, native_boot_id: f.run.native_boot_id }) }));
+  await f.owner.close(); f.owner.open();
+  const finalAuthority = { ...authority, main_decision_window: {
+    ...authority.main_decision_window, admitted_requests: 24, remaining_requests: 0 } };
+  const final = JSON.parse(await f.owner.assemble({ ...f.input, authority: finalAuthority }, f.options())).strategic_context;
+  expect(final.authority).toEqual(finalAuthority);
+  expect(final.latest_failure).toEqual(baseline.latest_failure);
+  expect(final.unresolved).toEqual(baseline.unresolved);
+  const unconfigured = JSON.parse(await f.owner.assemble(f.input, f.options())).strategic_context;
+  expect(unconfigured).not.toHaveProperty("authority");
+});
+
+for (const invalid of [
+  { main_decision_window: { max_requests: 24, admitted_requests: 23, remaining_requests: 2,
+    count_semantics: "after_current_request_admission" } },
+  { main_decision_window: { max_requests: 24, admitted_requests: 0, remaining_requests: 24,
+    count_semantics: "after_current_request_admission" } },
+  { playing_authority: { limits: DEFAULT_RESIDENT_LIMITS, session: { schema_version: 1 } } },
+  { main_decision_window: { max_requests: 24, admitted_requests: 1, remaining_requests: 23,
+    count_semantics: "before_admission" } },
+  { arbitrary_provider_text: "PRIVATE_PROVIDER_TEXT".repeat(1000) },
+]) test("context input refuses incomplete, inconsistent or arbitrary authority metadata rather than publishing it", async () => {
+  const f = fixture();
+  await expect(f.owner.assemble({ ...f.input, authority: invalid as ContextAssemblyInput["authority"] }, f.options()))
+    .rejects.toThrow("Strategic retained context could not complete");
 });
 
 test("task replacement preserves the reducer's source floor across close and reopen", async () => {

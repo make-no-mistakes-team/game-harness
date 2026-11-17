@@ -44,7 +44,7 @@ function decisionWindowFixture(maxRequests: number,
   if (!model) throw new Error("Offline descriptor required by the infrastructure fixture");
   const requests: number[] = [], reservations: string[] = [], dispatches: string[] = [], fetches: string[] = [];
   const transports: { id: string; natural: boolean }[] = [], drains: string[][] = [], sessions: string[] = [];
-  const bodies: Record<string, unknown>[] = [], providerDrained: number[] = [];
+  const bodies: Record<string, unknown>[] = [], contexts: Context[] = [], providerDrained: number[] = [];
   let activeTransports = 0, maxConcurrentTransports = 0;
   const inference = new AcceptanceLoopbackInference(model, ({ ordinal, body }) => {
     requests.push(ordinal); bodies.push(body);
@@ -70,7 +70,7 @@ function decisionWindowFixture(maxRequests: number,
   f.state.speculative = false;
   f.host.requestAdmission = {
     reserve: id => { reservations.push(id); },
-    beforeDispatch: async ({ identity }) => { dispatches.push(identity.request_id); },
+    beforeDispatch: async ({ identity, context }) => { dispatches.push(identity.request_id); contexts.push(structuredClone(context)); },
     beforeSdkFetch: async ({ identity }) => { fetches.push(identity.request_id); },
     transportEnded: (id, natural) => { transports.push({ id, natural }); },
     drained: ids => { drains.push([...ids]); },
@@ -84,7 +84,7 @@ function decisionWindowFixture(maxRequests: number,
     cleanup.push(off);
     return ready.promise;
   };
-  return { ...f, requests, reservations, dispatches, fetches, transports, drains, sessions, bodies, providerDrained, next,
+  return { ...f, requests, reservations, dispatches, fetches, transports, drains, sessions, bodies, contexts, providerDrained, next,
     transportConcurrency: () => ({ active: activeTransports, max: maxConcurrentTransports }) };
 }
 
@@ -289,6 +289,15 @@ test("48 imported Source calls do not spend the 24 actual Main admissions even i
   expect(f.fetches).toEqual(f.reservations); expect(f.providerDrained).toHaveLength(24);
   expect(f.run.turns).toBe(24); expect(f.run.usage.calls).toBe(72);
   expect(f.run.usage.by_purpose.authoring.calls).toBeGreaterThan(48);
+  for (const index of [0, 22, 23]) {
+    const retained = f.contexts[index]!.systemPrompt!.map(text => {
+      try { return JSON.parse(text).strategic_context; } catch { return undefined; }
+    }).find(Boolean);
+    expect(retained.authority).toEqual({ main_decision_window: { max_requests: 24,
+      admitted_requests: index + 1, remaining_requests: 23 - index,
+      count_semantics: "after_current_request_admission" } });
+    expect(retained.authority).not.toHaveProperty("playing_authority");
+  }
   expect(f.pauses).toEqual([]);
   expect(f.store.eventsAfter(f.run.run_id, 0, 1000)
     .find(event => event.type === "scheduler.decision_window_closed")?.details)
@@ -424,6 +433,13 @@ test("ordinary SDK process retains large observe images at dispatch while duplic
   expect(f.pauses).toEqual([]);
   expect(toolCalls).toBe(1); expect(providerBodies).toHaveLength(2);
   expect(dispatches).toHaveLength(2); expect(f.run.turns).toBe(2); expect(sessions).toBe(1);
+  for (const context of dispatches) {
+    const retained = context.systemPrompt!.map(text => {
+      try { return JSON.parse(text).strategic_context; } catch { return undefined; }
+    }).find(Boolean);
+    expect(retained).toBeDefined();
+    expect(retained).not.toHaveProperty("authority");
+  }
   const actualCall = dispatches[1]!.messages.flatMap(message => message.role === "assistant" ? message.content : [])
     .find(part => part.type === "toolCall" && part.name === "observe");
   if (!actualCall || actualCall.type !== "toolCall") throw new Error("Original SDK observe call is missing");

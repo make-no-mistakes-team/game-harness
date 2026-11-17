@@ -11,12 +11,20 @@ import { cognitionJsonSchema } from "./cognition-json.ts";
 import type { StrategicPolicy } from "./cognition-ports.ts";
 import type { PassiveContextState } from "./cognition-context-custody.ts";
 import type { MainDecisionWindowOptions } from "./main-decision-window.ts";
+import { mainDecisionWindowBudgetSchema } from "./main-decision-window.ts";
+import { playingAuthorityEnvelopeSchema, type EffectivePlayingCeilings } from "./playing-authority.ts";
 
 const identity = z.string().min(1).max(512);
 const purpose = z.enum(["authoring", "planning", "replanning", "improvement", "other"]);
 const role = z.enum(["ordinary", "authoring", "speculative", "review"]);
 const counter = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const reportedCounter = counter.nullable();
+/** Host-owned bounded authority disclosure, not observations or inclusive usage. */
+export const cognitionAuthorityContextSchema = z.object({
+  playing_authority: playingAuthorityEnvelopeSchema.optional(),
+  main_decision_window: mainDecisionWindowBudgetSchema.optional(),
+}).strict();
+export type CognitionAuthorityContext = z.infer<typeof cognitionAuthorityContextSchema>;
 export const cognitionRequestSchema = z.object({ turn_id: identity, request_id: identity, generation: counter,
   role, deadline_os_ns: z.string().regex(/^\d{1,24}$/), phase: z.enum(["created", "running", "pausing", "paused", "stopping", "stopped", "reviewing", "completed", "failed"]),
   root_execution_id: identity.nullable(), source_hash: identity.nullable(), authoring_deadline_at: z.number().finite().nullable(),
@@ -71,6 +79,7 @@ export interface CognitionStart {
   observeDispatch: boolean;
   admitSdkFetch: boolean;
   mainDecisionWindow?: MainDecisionWindowOptions;
+  playingAuthorityCeilings?: EffectivePlayingCeilings;
 }
 export interface CognitionToolCall { request_id: string; call_id: string; name: string; arguments: Json }
 export const cognitionToolCallSchema = z.object({ request_id: identity, call_id: identity, name: identity, arguments: cognitionJsonSchema }).strict();

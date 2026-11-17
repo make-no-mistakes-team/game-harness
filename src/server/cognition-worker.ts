@@ -25,6 +25,7 @@ import { createMinecraftAdapter } from "./minecraft-adapter.ts";
 import { runtimeToolDescriptors } from "./runtime-tool-catalog.ts";
 import { usageCounter } from "./provider-usage.ts";
 import { mainDecisionWindowStateSchema } from "./main-decision-window.ts";
+import { validatePlayingAuthorityCeilings } from "./playing-authority.ts";
 import { setTransports } from "@oh-my-pi/pi-utils/logger";
 
 // The host's logger configuration is not inherited by a new process.
@@ -241,6 +242,9 @@ async function start(input: CognitionStart): Promise<void> {
   const adapter = createMinecraftAdapter(input.snapshot.adapter.descriptor);
   const host: StrategicHost = {
     mainDecisionWindow: input.mainDecisionWindow,
+    ...(input.playingAuthorityCeilings === undefined ? {} : {
+      playingAuthorityCeilings: validatePlayingAuthorityCeilings(input.playingAuthorityCeilings),
+    }),
     run: () => current,
     generation: () => snapshot!.generation,
     assertCurrent: (generation, epoch) => {

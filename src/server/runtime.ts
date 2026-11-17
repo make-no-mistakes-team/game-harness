@@ -46,6 +46,8 @@ import { ReactiveRuntime } from "./reactive.ts";
 import { StrategicPlanner, type StrategicHost, type StrategicRequestAdmission } from "./strategic.ts";
 import { CognitionClient } from "./cognition-client.ts";
 import { validateMainDecisionWindow, type MainDecisionWindowOptions } from "./main-decision-window.ts";
+import { assertPlayingProgramStart, validatePlayingAuthorityCeilings,
+  type PlayingAuthorityCeilings } from "./playing-authority.ts";
 import type { CognitionEvidenceEvent, StrategicAgentFactory } from "./cognition-ports.ts";
 import { RuntimeTools } from "./runtime-tools.ts";
 import { createRuntimePrompt } from "./runtime-prompt.ts";
@@ -78,6 +80,8 @@ export interface RuntimeOptions {
   requestAdmission?: StrategicRequestAdmission;
   /** Host-only per-run logical Main cap; expiry never renews physical authority. */
   mainDecisionWindow?: MainDecisionWindowOptions;
+  /** Optional complete finite envelope; when configured, starts require resident step sessions. */
+  playingAuthorityCeilings?: PlayingAuthorityCeilings;
   /** Optional host-owned finite-scope admission; never modifies requested authority. */
   assertProgramStart?(request: SkillStartRequest): void;
   /** Explicit embedded ownership for direct SDK consumers/tests, never a failure fallback. */
@@ -286,9 +290,15 @@ export class Runtime {
     options: RuntimeOptions = {},
   ) {
     validateMainDecisionWindow(options.mainDecisionWindow);
+    const playingAuthorityCeilings = options.playingAuthorityCeilings === undefined ? undefined
+      : validatePlayingAuthorityCeilings(options.playingAuthorityCeilings);
     this.adapterSource = options.adapter;
     this.actorFrameSource = options.actorFrames;
-    this.programStartAdmission = options.assertProgramStart;
+    const additionalAdmission = options.assertProgramStart;
+    this.programStartAdmission = playingAuthorityCeilings || additionalAdmission ? request => {
+      if (playingAuthorityCeilings) assertPlayingProgramStart(request, playingAuthorityCeilings);
+      additionalAdmission?.(request);
+    } : undefined;
     this.actorFrames = options.actorFrames ? new ActorFrameSelector({
       latestFrame: () => options.actorFrames!.latestFrame(),
       scope: () => {
@@ -546,6 +556,7 @@ export class Runtime {
     const strategicHost = {
       requestAdmission: options.requestAdmission,
       mainDecisionWindow: options.mainDecisionWindow && { ...options.mainDecisionWindow },
+      playingAuthorityCeilings,
       cognitionEvidence: {
         enabled: () => this.cognitionEvidenceListeners.size > 0,
         emit: event => { for (const listener of this.cognitionEvidenceListeners) listener(event); },
@@ -609,6 +620,7 @@ export class Runtime {
       this.reactions,
       this.experience,
       {
+        playingAuthorityCeilings,
         run: () => this.run!,
         assertCurrent: (generation, epoch) =>
           this.assertCurrent(generation, epoch),
@@ -625,7 +637,7 @@ export class Runtime {
         toolRole: () => this.strategic.toolRole(),
         toolAuthority: () => this.strategic.speculativeToolAuthority(),
         finishTask: (summary, callId) => this.finishTask(summary, callId),
-        ...(options.assertProgramStart ? { assertProgramStart: options.assertProgramStart } : {}),
+        ...(this.programStartAdmission ? { assertProgramStart: this.programStartAdmission } : {}),
       },
     );
   }

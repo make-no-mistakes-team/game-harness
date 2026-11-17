@@ -19,6 +19,7 @@ import { programHelp } from "./program-help.ts";
 import { runtimeToolCatalogue, runtimeToolDescriptor, type RuntimeToolCatalogueEntry, type RuntimeToolInputs, type RuntimeToolName } from "./runtime-tool-catalog.ts";
 import { residentJsonConstraint } from "../shared/resident.ts";
 import type { SkillStartRequest } from "../shared/programs.ts";
+import type { EffectivePlayingCeilings } from "./playing-authority.ts";
 
 type RuntimeToolHandler<Name extends RuntimeToolName> = (
   input: RuntimeToolInputs[Name], callId: string, signal: AbortSignal | undefined, commit: () => void,
@@ -53,6 +54,7 @@ export function preserveRuntimeToolArguments(context: BeforeToolCallContext): vo
 }
 
 export interface RuntimeToolHost {
+  playingAuthorityCeilings?: EffectivePlayingCeilings;
   run(): StoredRun;
   assertCurrent(generation: number, epoch?: number): StoredRun;
   observe(): Promise<ObservationV3>;
@@ -236,7 +238,10 @@ export class RuntimeTools {
         if (input.topic === "memory" && role() === "authoring")
           throw new RuntimeFault("forbidden", "Optional playing modules are unavailable during pending-program authoring");
         if (input.topic === "memory" && role() === "ordinary") this.modules.add(input.topic);
-        return programHelp(input.topic, this.host.adapter(), input.kind);
+        const reference = programHelp(input.topic, this.host.adapter(), input.kind);
+        return this.host.playingAuthorityCeilings && (input.topic === "programs" || input.topic === "controller")
+          ? { ...reference, playing_authority: this.host.playingAuthorityCeilings,
+            playing_entry: "step", playing_session_required: true } : reference;
       },
       task_finish: (input, callId) => {
         if (typeof run.goal === "string" || run.goal.goal_id !== "custom" || run.goal.verifier !== null) throw new RuntimeFault("forbidden", "Only custom tasks permit model-reported completion; built-in goals require trusted verification");

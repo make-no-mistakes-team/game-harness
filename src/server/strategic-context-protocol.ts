@@ -4,6 +4,7 @@ import { adapterDescriptorSchema } from "../shared/adapter.ts";
 import { identitySchema, safeCounterSchema } from "../shared/control.ts";
 import type { StoredRun } from "./store.ts";
 import type { StrategicContextAdapter } from "./strategic-context.ts";
+import { cognitionAuthorityContextSchema, type CognitionAuthorityContext } from "./cognition-protocol.ts";
 
 export const CONTEXT_WORKER_LIMITS = Object.freeze({ requestBytes: 2 * 1024 * 1024, responseBytes: 768 * 1024,
   checkpointBytes: 512 * 1024, contextBytes: 32 * 1024, queued: 8, operations: 64, jobMs: 5_000 });
@@ -44,12 +45,14 @@ export interface ContextAssemblyInput {
   observation: Pick<ObservationV3, "profile_id" | "profile_configuration_hash"> | null;
   adapter?: StrategicContextAdapter;
   pendingAuthoring?: Json;
+  authority?: CognitionAuthorityContext;
 }
 export const contextRequestSchema = z.object({ v: z.literal(CONTEXT_PROTOCOL_VERSION), id: counter.min(1),
   deadline_os_ns: z.string().regex(/^\d{1,24}$/), checkpoint: z.string().max(CONTEXT_WORKER_LIMITS.checkpointBytes).nullable(),
   scope: scopeSchema, model: z.object({ api: z.string().min(1).max(128), provider: z.string().min(1).max(128) }).strict(),
   observation: z.object({ profile_id: identitySchema, profile_configuration_hash: identitySchema }).strict().nullable(),
   adapter: adapterSchema.optional(), pendingAuthoring: z.json().optional(),
+  authority: cognitionAuthorityContextSchema.optional(),
   operations: z.array(contextOperationSchema).max(CONTEXT_WORKER_LIMITS.operations),
 }).strict();
 export const contextResponseSchema = z.discriminatedUnion("ok", [

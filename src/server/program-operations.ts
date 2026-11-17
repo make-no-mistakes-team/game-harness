@@ -328,7 +328,7 @@ export class ProgramOperations {
 
   async runProgram(input: z.infer<typeof programRunSchema>, callId: string, commit: () => void, signal: AbortSignal | undefined) {
     if (input.operation === "start") {
-      if (this.run.control_mode === "executive" && (input.entry !== "step" || !input.session))
+      if (!this.host.playingAuthorityCeilings && this.run.control_mode === "executive" && (input.entry !== "step" || !input.session))
         throw new RuntimeFault("precondition_failed",
           "This run uses a life-scoped executive. Start entry:'step',session:{schema_version:1} with model-authored activate/step; select finite actions or pinned run dependencies through its nonblocking choice. Direct roots require a separately declared legacy run.");
       const startKey = this.startKey(callId);

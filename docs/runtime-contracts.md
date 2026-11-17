@@ -82,6 +82,49 @@ Model-call boundaries remain serialized through the preceding terminal response;
 the read-only window query is not an atomic reservation. Expected exhaustion is
 returned as data, not a metadata exception; concurrency violations remain failures.
 
+The ordinary Main SDK context includes `strategic_context.authority.main_decision_window`
+when that window is configured: `max_requests`, `admitted_requests`,
+`remaining_requests`, and `count_semantics:"after_current_request_admission"`.
+The host window is read after the receiving request's reservation has settled.
+Its admitted count includes that request; its remaining count excludes it.
+For a 24-request window, the first, penultimate and final requests receive
+`1/23`, `23/1` and `24/0` admitted/remaining respectively. These are Main
+admissions, independent of imported Source preparation calls or inclusive
+`run.usage`. Omission of the option leaves this field absent.
+
+`RuntimeOptions.playingAuthorityCeilings:{limits,session}` optionally declares
+one complete finite playing envelope. Both groups must contain every field
+accepted by the resident-limit and control-session schemas; session defaults
+cannot fill a missing declaration. Runtime detaches and validates this
+configuration before creating its owners. When configured, every new initial,
+ordinary or prepared playing start must be a resident `step` with a session,
+with each numeric value at or below its ceiling and the declared schema version
+and recovery mode unchanged. The check runs before execution acceptance,
+resident handoff preparation or predecessor retirement. Cached execution
+receipts grant no new admission. The existing `assertProgramStart` callback
+remains an additional policy guard after this check.
+
+Ordinary Main receives the full configured envelope in
+`strategic_context.authority.playing_authority`; `help programs` and
+`help controller` also return it with the resident-step/session requirement.
+These bounded fields take priority over optional source and retained help
+inside the existing 32 KiB context cap. They contain no images and do not
+replace earlier failures, no-replay references or original scope. No explicit
+envelope is invented when the option is absent.
+
+`src/server/playing-authority.ts` exports
+`assertDeclaredPlayingAuthority(request,ceilings)` for disconnected operator
+gates with the same complete numeric/enum checks. A refusal is a
+`RuntimeFault("budget_exceeded",...)` with bounded JSON containing validated
+effective ceilings, a known violated field when available, and
+`operation_admitted:false`, `authority_renewed:false`,
+`live_program_replacement:"actual_exact_handoff_required"`. Invalid trusted
+configuration reports `ceilings:null`. Request values, source, provider data
+and caught exception text never enter that diagnostic. Neither the check nor
+the disclosure clamps parameters, retries, chooses a handoff, increases limits
+or changes a running root's original deadline. Callback/frame capacity and
+semantic action/call authority remain separate units.
+
 Cross-process deadlines use Linux `CLOCK_MONOTONIC`. Expiry revokes authority
 immediately. Up to one second is reserved solely for cooperative cancellation
 and settlement, with no new request or tool permission. An unresponsive owner
@@ -456,6 +499,9 @@ Ordinary source/static/graph validation runs in a credential-free child process.
 At most four jobs may run; there is no waiting queue or local fallback. Startup
 and validation share a five-second ceiling, shortened by the original caller
 deadline. Cancellation joins process exit and all pipes before returning.
+An aborted caller receives `RuntimeFault("stale_context",...)` with the fixed
+source-cancellation message, including when cancellation is detected by the
+joined admission's final commit check. The caller's abort reason is not exposed.
 Only bounded exact dependency artifacts cross its source-read protocol. After
 closure, publication rechecks the profile, scope and dependency metadata/bytes,
 including inside Store's commit callback. A worker crash creates no source

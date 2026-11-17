@@ -55,7 +55,7 @@ async function run() {
             }
             retained.synchronize(run, request.model,
               { messages: [] }, request.observation, request.adapter);
-            return retained.assemble(run, request.adapter, request.pendingAuthoring);
+            return retained.assemble(run, request.adapter, request.pendingAuthoring, request.authority);
           });
           const checkpoint = JSON.stringify(retained.checkpoint());
           if (osMonotonicNs() >= deadline || Buffer.byteLength(context) > CONTEXT_WORKER_LIMITS.contextBytes ||

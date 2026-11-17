@@ -30,6 +30,7 @@ import { SpeculativePlanning } from "../src/server/speculative-planning.ts";
 import { ImprovementLearning } from "../src/server/improvement-learning.ts";
 import { HistoryReader, HistoryReaderError } from "../src/server/history-reader.ts";
 import { RuntimeFault } from "../src/server/runtime-fault.ts";
+import { assertPlayingProgramStart } from "../src/server/playing-authority.ts";
 import { ProgramValidationError, validateProgramSource } from "../src/server/program-validation.ts";
 import { ProgramWorkspace } from "../src/server/program-workspace.ts";
 import { DiagnosticAgent, DIAGNOSTIC_PROGRAMS } from "../src/evaluation/diagnostic-agent.ts";
@@ -528,22 +529,30 @@ const ceilingResidentSource = 'export function step(frame,state,intent){return {
 const fixtureResidentCeilings = { ...DEFAULT_RESIDENT_LIMITS, max_analysis_jobs: 0, max_analysis_ms: 0 };
 const fixtureSessionCeilings = controlSessionConfigSchema.parse({ schema_version: 1 });
 function assertFixtureStartCeilings(request: SkillStartRequest) {
-  if (request.entry !== "step") return;
-  for (const key of Object.keys(fixtureResidentCeilings) as (keyof typeof fixtureResidentCeilings)[]) {
-    if (request.limits[key] > fixtureResidentCeilings[key])
-      throw new RuntimeFault("precondition_failed", `Declared resident ceiling exceeded: ${key}`);
-  }
-  if (request.session) {
-    for (const key of ["max_tasks", "max_actions", "max_calls", "max_depth", "retained_tasks", "max_restarts"] as const) {
-      if (request.session[key] > fixtureSessionCeilings[key])
-        throw new RuntimeFault("precondition_failed", `Declared session ceiling exceeded: ${key}`);
-    }
-    if (request.session.recovery !== fixtureSessionCeilings.recovery)
-      throw new RuntimeFault("precondition_failed", "Declared session recovery exceeded");
-  }
+  assertPlayingProgramStart(request, { limits: fixtureResidentCeilings, session: fixtureSessionCeilings });
 }
 
 for (const toolName of ["program_run", "program_submit"] as const) {
+  for (const entry of ["run", "step"] as const)
+    test(`${toolName} configured playing authority refuses ${entry === "run" ? "nonresident roots" : "resident roots without sessions"} before acceptance`, async () => {
+      const f = fixture();
+      const selectedSource = entry === "step" ? ceilingResidentSource : source;
+      if (toolName === "program_run") await f.write("finite envelope candidate", selectedSource, { entry });
+      f.toolHost.playingAuthorityCeilings = { limits: fixtureResidentCeilings, session: fixtureSessionCeilings };
+      f.toolHost.assertProgramStart = assertFixtureStartCeilings;
+      const input = { name: "finite envelope candidate", entry, args: null,
+        ...(entry === "step" ? { limits: fixtureResidentCeilings } : {}),
+        ...(toolName === "program_submit" ? { source: selectedSource } : { operation: "start" }) };
+      const refused = data(await f.call(toolName, input));
+      const error = toolName === "program_submit" ? refused.start.error : refused.error;
+      expect(error.code).toBe("budget_exceeded");
+      expect(JSON.parse(error.message.slice("Declared playing authority refused: ".length)))
+        .toMatchObject({ category: "request_authority_refused",
+          violated_field: entry === "run" ? "entry" : null,
+          ceilings: { limits: fixtureResidentCeilings, session: fixtureSessionCeilings } });
+      expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+      expect(f.dispatches()).toBe(0); expect(f.actions()).toBe(0);
+    });
   for (const violation of [
     { limits: { ...fixtureResidentCeilings, duration_ms: 300000 }, field: "duration_ms" },
     { limits: { ...fixtureResidentCeilings, max_steps: 6000 }, field: "max_steps" },
@@ -579,11 +588,16 @@ for (const toolName of ["program_run", "program_submit"] as const) {
       const refused = data(await f.call(toolName, input, id));
       if (toolName === "program_submit") expect(refused).toMatchObject({
         source: { status: "persisted", name: input.name, version: 1 },
-        start: { status: "refused", error: { code: "precondition_failed", retryable: false } },
+        start: { status: "refused", error: { code: "budget_exceeded", retryable: false } },
       });
       const failure = toolName === "program_submit" ? refused.start.error : refused.error;
       expect(failure.message).toContain(violation.field);
-      expect(failure.code).toBe("precondition_failed");
+      expect(failure.code).toBe("budget_exceeded");
+      const diagnostic = JSON.parse(failure.message.slice("Declared playing authority refused: ".length));
+      expect(diagnostic).toMatchObject({ category: "request_authority_refused",
+        ceilings: { limits: fixtureResidentCeilings, session: fixtureSessionCeilings },
+        operation_admitted: false, authority_renewed: false,
+        live_program_replacement: "actual_exact_handoff_required" });
       if (toolName === "program_run") {
         expect(f.store.lookupToolCallBinding(f.run.run_id, id,
           { tool: toolName, input: programRunSchema.parse(input) } as unknown as Json)).toEqual({ found: false });
@@ -646,7 +660,10 @@ test("host start ceilings recheck a bound request without an execution instead o
   f.manager.start = (...args) => { attempts++; return start(...args); };
   f.toolHost.assertProgramStart = assertFixtureStartCeilings;
   const refused = data(await f.call("program_run", input, id));
-  expect(refused.error).toMatchObject({ code: "precondition_failed", message: "Declared resident ceiling exceeded: duration_ms" });
+  expect(refused.error.code).toBe("budget_exceeded");
+  expect(JSON.parse(refused.error.message.slice("Declared playing authority refused: ".length)))
+    .toMatchObject({ violated_field: "limits.duration_ms",
+      ceilings: { limits: fixtureResidentCeilings, session: fixtureSessionCeilings } });
   expect(attempts).toBe(1);
   expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
   expect(f.dispatches()).toBe(0);
@@ -728,7 +745,10 @@ for (const selected of ["fresh", "bound_without_staging"] as const) test(`prepar
   }
   f.toolHost.assertProgramStart = assertFixtureStartCeilings;
   const refused = data(await f.call("prepare_next", input, id));
-  expect(refused.error).toMatchObject({ code: "precondition_failed", message: "Declared resident ceiling exceeded: max_analysis_jobs" });
+  expect(refused.error.code).toBe("budget_exceeded");
+  expect(JSON.parse(refused.error.message.slice("Declared playing authority refused: ".length)))
+    .toMatchObject({ violated_field: "limits.max_analysis_jobs",
+      ceilings: { limits: fixtureResidentCeilings, session: fixtureSessionCeilings } });
   expect(f.store.lookupToolCallBinding(f.run.run_id, id,
     { tool: "prepare_next", input: prepareNextSchema.parse(input) } as unknown as Json).found).toBe(selected !== "fresh");
   expect(f.planning.projection()).toMatchObject({ plan_id: flight.plan_id, state: "planning", candidate: null });
@@ -1670,17 +1690,24 @@ for (const boundary of ["abort", "generation", "role", "newer_parent"] as const)
     const pending = f.tools().find(tool => tool.name === "program_edit")!.execute(`guarded-edit-${boundary}`, {
       name: "guarded edit", based_on: 1, edits: [{ old_text: "Neutral result", new_text: "Candidate result" }],
     }, controller.signal);
-    await ready.promise;
-    f.store.registerSkill = register;
-    if (boundary === "abort") controller.abort();
-    else if (boundary === "generation") f.fence();
-    else if (boundary === "role") f.toolHost.toolRole = () => "authoring";
-    else await f.write("guarded edit", source, { based_on: 1 });
-    release.resolve();
-    expect(data(await pending).error.code).toBe(boundary === "newer_parent" ? "conflict" : "stale_context");
-    expect(f.store.namedSkill(f.run.run_id, "guarded edit")!.version).toBe(boundary === "newer_parent" ? 2 : 1);
-    expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "program.edited")).toHaveLength(0);
-    expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+    try {
+      await ready.promise;
+      f.store.registerSkill = register;
+      if (boundary === "abort") controller.abort();
+      else if (boundary === "generation") f.fence();
+      else if (boundary === "role") f.toolHost.toolRole = () => "authoring";
+      else await f.write("guarded edit", source, { based_on: 1 });
+      release.resolve();
+      expect(data(await pending).error.code).toBe(boundary === "newer_parent" ? "conflict" : "stale_context");
+      expect(f.store.namedSkill(f.run.run_id, "guarded edit")!.version).toBe(boundary === "newer_parent" ? 2 : 1);
+      expect(f.store.eventsAfter(f.run.run_id, 0, 500).filter(event => event.type === "program.edited")).toHaveLength(0);
+      expect(f.store.allSkillExecutions(f.run.run_id)).toHaveLength(0);
+    } finally {
+      f.store.registerSkill = register;
+      controller.abort();
+      release.resolve();
+      await pending;
+    }
   });
 }
 

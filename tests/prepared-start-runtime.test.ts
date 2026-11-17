@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import type { AgentEvent, AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import type { Context } from "@oh-my-pi/pi-ai";
 import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { DiagnosticModelHooks } from "../src/evaluation/diagnostic-model-hooks.ts";
 import type { AuthState, GameBridge, GameState, Json } from "../src/shared/contracts.ts";
@@ -11,7 +12,8 @@ import type { ResidentWorker } from "../src/shared/resident.ts";
 import { DEFAULT_RESIDENT_LIMITS } from "../src/shared/resident.ts";
 import { controlSessionConfigSchema } from "../src/shared/control-session.ts";
 import { Store } from "../src/server/store.ts";
-import { Runtime } from "../src/server/runtime.ts";
+import { Runtime, type RuntimeOptions } from "../src/server/runtime.ts";
+import { RuntimeFault } from "../src/server/runtime-fault.ts";
 import { CognitionClient } from "../src/server/cognition-client.ts";
 import type { StrategicRequestAdmission } from "../src/server/strategic.ts";
 import type { AuthManager } from "../src/server/auth.ts";
@@ -27,13 +29,20 @@ import { minecraftObservationFixture, minecraftTestAdapter, minecraftTestBinding
 const card = { purpose: "First-root lifecycle fixture", applicability: "Synthetic boundaries only",
   method: "Prepared worker before cloud readiness", reason: "Keep control independent", limitations: "No model or native gameplay claim" };
 const cleanups: (() => Promise<void>)[] = [];
-afterEach(async () => { for (const close of cleanups.splice(0)) await close(); });
+async function joinOwners(owners: (() => Promise<unknown>)[]): Promise<void> {
+  // Each owner must receive closure even if another rejects or needs that
+  // owner's cancellation to finish. Report errors only after every real join.
+  const results = await Promise.allSettled(owners.map(async close => await close()));
+  const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Fixture owner closure failed");
+}
+afterEach(async () => { await joinOwners(cleanups.splice(0)); });
 async function fixture(mainDecisionWindow?: { maxRequests: number }, ordinary?: {
   inference: Pick<AuthManager, "createInferenceSession">;
   modelId: string;
   requestAdmission: StrategicRequestAdmission;
   paused?(): void;
-}) {
+}, options: Pick<RuntimeOptions, "playingAuthorityCeilings" | "assertProgramStart"> = {}) {
   const directory = mkdtempSync(join(tmpdir(), "prepared-runtime-")), store = new Store(directory);
   const adapter = minecraftTestAdapter(), observation = minecraftObservationFixture(adapter);
   const compatibility = adapterCompatibility(adapter.descriptor, adapter.schemas);
@@ -99,7 +108,7 @@ async function fixture(mainDecisionWindow?: { maxRequests: number }, ordinary?: 
   let runtime!: Runtime;
   runtime = new Runtime(store, auth, game, sandbox, () => {
     if (ordinary?.paused && runtime?.snapshot()?.status === "paused") ordinary.paused();
-  }, { adapter, mainDecisionWindow,
+  }, { adapter, mainDecisionWindow, ...options,
     ...(ordinary ? { requestAdmission: ordinary.requestAdmission } : { strategicAgentFactory: auth }) });
   let closed = false;
   const close = async () => {
@@ -179,6 +188,140 @@ test("prepared local control does not suppress Main's initial ordinary task deci
   } finally { await f.close(); await starting; }
 }, 10000);
 
+const playingCeilings = () => ({
+  limits: { ...DEFAULT_RESIDENT_LIMITS, max_analysis_jobs: 0, max_analysis_ms: 0 },
+  session: controlSessionConfigSchema.parse({ schema_version: 1, retained_tasks: 128 }),
+});
+function authorityContext(context: Context) {
+  for (const text of context.systemPrompt ?? []) {
+    try {
+      const value = JSON.parse(text);
+      if (value.strategic_context) return value.strategic_context;
+    } catch { /* The root prompt is prose. */ }
+  }
+  throw new Error("Ordinary SDK consumer did not receive bounded strategic context");
+}
+
+test("ordinary cognition receives immutable playing bounds and exact first, penultimate and final Main budgets before a refused handoff can retire its predecessor", async () => {
+  const model = getBundledModels("openai-codex")[0];
+  if (!model) throw new Error("Offline descriptor required by the infrastructure fixture");
+  const configured = playingCeilings(), effective = structuredClone(configured);
+  const contexts: Context[] = [], bodies: Record<string, unknown>[] = [], reservations: string[] = [];
+  const admitted: unknown[] = [], drained = Promise.withResolvers<readonly string[]>();
+  let originalDeadline = "", originalId = "";
+  let f!: Awaited<ReturnType<typeof fixture>>;
+  const inference = new AcceptanceLoopbackInference(model, ({ ordinal, body }) => {
+    bodies.push(body);
+    if (ordinal > 3) throw new Error("No dispatch may follow the configured Main window");
+    const run = f.runtime.snapshot()!, root = f.store.latestRootExecution(run.run_id)!;
+    expect(root).toMatchObject({ entry: "step", status: "running", ended_at: null });
+    if (ordinal === 1) { originalId = root.execution_id; originalDeadline = root.deadline_at; }
+    expect(root.execution_id).toBe(originalId); expect(root.deadline_at).toBe(originalDeadline);
+    expect(f.counts().closeCount).toBe(0);
+    const output = ordinal === 1 ? { call: { id: "over-ceiling-handoff", name: "program_run", arguments: {
+      operation: "start", name: "prepared root", version: 1, entry: "step", args: { actor: "UNCHANGED_INTENT" },
+      initial_state: { actor: "UNCHANGED_STATE" },
+      limits: effective.limits, session: { ...effective.session, max_calls: effective.session.max_calls + 1 },
+      handoff: { name: "prepared root", version: 1, execution_ordinal: 1 },
+    } } } : ordinal === 2 ? { call: { id: "inspect-playing-help", name: "help", arguments: { topic: "controller" } } }
+      : { text: "Finite administrative request settled." };
+    return { iterator: (async function* () { yield codexLifecycleFrames(ordinal, output); })() };
+  });
+  cleanups.push(() => inference.close());
+  f = await fixture({ maxRequests: 3 }, { modelId: inference.model.id, inference,
+    requestAdmission: {
+      reserve: id => { reservations.push(id); },
+      beforeDispatch: async ({ context }) => { contexts.push(structuredClone(context)); },
+      transportEnded: () => {}, drained: ids => drained.resolve([...ids]),
+    },
+  }, { playingAuthorityCeilings: configured, assertProgramStart: request => { admitted.push(structuredClone(request)); } });
+  const candidate = { ...f.candidate, limits: { ...effective.limits }, session: { ...effective.session } };
+  // Caller mutation cannot change the accepted effective configuration.
+  configured.session.max_calls = 1; configured.limits.max_steps = 1;
+  const settled = Promise.withResolvers<void>();
+  const off = f.store.subscribe(event => {
+    if (event.type === "scheduler.turn_deferred") settled.resolve();
+    if (event.type === "scheduler.turn_failed" || event.type === "cognition.contained")
+      settled.reject(new Error("Ordinary finite disclosure must not fail cognition ownership"));
+  });
+  const starting = f.runtime.startPreparedRun(candidate);
+  try {
+    await starting; await settled.promise; expect(await drained.promise).toEqual(reservations);
+    expect(contexts).toHaveLength(3); expect(bodies).toHaveLength(3);
+    const projections = contexts.map(authorityContext);
+    for (let index = 0; index < projections.length; index++) {
+      const projection = projections[index]!;
+      expect(Buffer.byteLength(JSON.stringify({ strategic_context: projection }))).toBeLessThanOrEqual(32768);
+      expect(projection.authority).toEqual({ playing_authority: effective, main_decision_window: {
+        max_requests: 3, admitted_requests: index + 1, remaining_requests: 2 - index,
+        count_semantics: "after_current_request_admission",
+      } });
+      expect(JSON.stringify(bodies[index])).toContain(JSON.stringify(JSON.stringify(projection.authority)).slice(1, -1));
+    }
+    // Preparation contributed two inclusive usage calls, but never Main admissions.
+    expect(f.runtime.snapshot()!.usage.calls).toBe(5);
+    const refusal = contexts[1]!.messages.filter(message => message.role === "toolResult")
+      .find(message => message.toolName === "program_run");
+    expect(refusal).toBeDefined();
+    const refusedText = refusal!.content.filter(part => part.type === "text").map(part => part.text).join("");
+    const error = JSON.parse(refusedText).error;
+    expect(error.code).toBe("budget_exceeded");
+    const diagnostic = JSON.parse(error.message.slice("Declared playing authority refused: ".length));
+    expect(diagnostic).toMatchObject({ violated_field: "session.max_calls", ceilings: effective,
+      operation_admitted: false, authority_renewed: false,
+      live_program_replacement: "actual_exact_handoff_required" });
+    expect(error.message).not.toContain("UNCHANGED_");
+    const help = contexts[2]!.messages.filter(message => message.role === "toolResult")
+      .find(message => message.toolName === "help");
+    expect(help).toBeDefined();
+    expect(JSON.parse(help!.content.filter(part => part.type === "text").map(part => part.text).join("")))
+      .toMatchObject({ playing_authority: effective, playing_entry: "step", playing_session_required: true });
+    expect(admitted).toHaveLength(1); // Additional policy callback only saw the legal initial admission.
+    const run = f.runtime.snapshot()!;
+    expect(f.store.allSkillExecutions(run.run_id)).toHaveLength(1);
+    expect(f.store.latestRootExecution(run.run_id)).toMatchObject({ execution_id: originalId,
+      deadline_at: originalDeadline, status: "running", ended_at: null, args: null, initial_state: null,
+      limits: effective.limits, session: effective.session });
+    expect(f.counts()).toMatchObject({ takes: 1, activations: 1, ordinaryCompiles: 0, closeCount: 0 });
+    const cognition = Reflect.get(f.runtime, "strategic") as CognitionClient;
+    cognition.wake("resident_attention"); cognition.wake("preflight_ready");
+    expect(cognition.snapshot()).toMatchObject({ pid: null, fenced: true,
+      turn_id: null, request_id: null, context_id: null });
+    expect(bodies).toHaveLength(3); expect(reservations).toHaveLength(3);
+    const before = f.counts().inputCount; await f.nextInput();
+    expect(f.counts().inputCount).toBeGreaterThan(before);
+    expect(bodies).toHaveLength(3);
+    await f.runtime.control(run.run_id, "stop");
+    expect(f.counts().closeCount).toBe(1); expect(bodies).toHaveLength(3);
+  } finally { off(); await joinOwners([() => f.close(), () => starting, () => inference.close()]); }
+}, 10_000);
+
+test("configured playing authority refuses the initial prepared root before acceptance or worker transfer", async () => {
+  let additional = 0;
+  const effective = playingCeilings();
+  const f = await fixture(undefined, undefined, {
+    playingAuthorityCeilings: effective, assertProgramStart: () => { additional++; },
+  });
+  const candidate = { ...f.candidate,
+    limits: { ...effective.limits, max_steps: effective.limits.max_steps + 1 }, session: effective.session };
+  await expect(f.runtime.startPreparedRun(candidate)).rejects.toMatchObject({ code: "budget_exceeded" });
+  const run = f.runtime.snapshot()!;
+  expect(f.store.allSkillExecutions(run.run_id)).toHaveLength(0);
+  expect(f.counts()).toMatchObject({ takes: 0, activations: 0, ordinaryCompiles: 0, inputCount: 0 });
+  expect(additional).toBe(0);
+});
+
+test("the existing additional program-start callback still refuses an otherwise legal configured initial root", async () => {
+  const effective = playingCeilings(), policyRefusal = new RuntimeFault("precondition_failed", "Additional immutable policy gate refused");
+  let checked = 0;
+  const f = await fixture(undefined, undefined, { playingAuthorityCeilings: effective,
+    assertProgramStart: () => { checked++; throw policyRefusal; } });
+  const candidate = { ...f.candidate, limits: effective.limits, session: effective.session };
+  await expect(f.runtime.startPreparedRun(candidate)).rejects.toBe(policyRefusal);
+  expect(checked).toBe(1); expect(f.counts().takes).toBe(0);
+  expect(f.store.allSkillExecutions(f.runtime.snapshot()!.run_id)).toHaveLength(0);
+});
+
 test("ordinary Cognition process, auth and transport fully drain before the same finite session accepts further local submissions until Stop", async () => {
   const model = getBundledModels("openai-codex")[0];
   if (!model) throw new Error("Offline descriptor required by the infrastructure fixture");
@@ -195,6 +338,7 @@ test("ordinary Cognition process, auth and transport fully drain before the same
       finally { providerDrained = true; }
     })() };
   });
+  cleanups.push(async () => { releaseResponse.resolve(); await inference.close(); });
   const f = await fixture({ maxRequests: 1 }, {
     modelId: inference.model.id,
     inference: { createInferenceSession: options => {
@@ -254,7 +398,10 @@ test("ordinary Cognition process, auth and transport fully drain before the same
     await f.runtime.control(before.run_id, "stop");
     expect(f.runtime.snapshot()?.status).toBe("stopped");
     expect(f.counts().closeCount).toBe(1); expect(providerRequests).toBe(1);
-  } finally { releaseResponse.resolve(); off(); await f.close(); await starting; await inference.close(); }
+  } finally {
+    releaseResponse.resolve(); off();
+    await joinOwners([() => f.close(), () => starting, () => inference.close()]);
+  }
 }, 10_000);
 
 test("a final-slot real provider failure physically pauses Runtime instead of preserving its executive as normal budget expiry", async () => {
@@ -274,6 +421,7 @@ test("a final-slot real provider failure physically pauses Runtime instead of pr
       } finally { providerDrained = true; }
     })() };
   });
+  cleanups.push(async () => { releaseResponse.resolve(); await inference.close(); });
   const f = await fixture({ maxRequests: 1 }, {
     modelId: inference.model.id,
     inference: { createInferenceSession: options => {
@@ -311,5 +459,8 @@ test("a final-slot real provider failure physically pauses Runtime instead of pr
     await f.runtime.control(run.run_id, "stop");
     expect(f.runtime.snapshot()?.status).toBe("stopped");
     expect(f.counts().inputCount).toBe(inputsAtPause); expect(requests).toBe(1);
-  } finally { releaseResponse.resolve(); await f.close(); await starting; await inference.close(); }
+  } finally {
+    releaseResponse.resolve();
+    await joinOwners([() => f.close(), () => starting, () => inference.close()]);
+  }
 }, 10_000);

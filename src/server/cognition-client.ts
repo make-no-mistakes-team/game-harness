@@ -336,6 +336,7 @@ export class CognitionClient {
       observeSdk: !!(this.host.requestAdmission?.evidence || this.host.cognitionEvidence?.enabled()),
       observeDispatch: !!(this.host.requestAdmission?.evidence || this.host.requestAdmission?.beforeDispatch || this.host.cognitionEvidence?.enabled()),
       admitSdkFetch: !!this.host.requestAdmission?.beforeSdkFetch,
+      ...(this.host.playingAuthorityCeilings ? { playingAuthorityCeilings: this.host.playingAuthorityCeilings } : {}),
       ...(this.#mainDecisionWindow ? { mainDecisionWindow: { maxRequests: this.#mainDecisionWindow.maxRequests } } : {}) };
     this.store.event(run.run_id, "cognition.started",
       "Ordinary planner and SDK are owned by an independent process; physical authority remains local", {

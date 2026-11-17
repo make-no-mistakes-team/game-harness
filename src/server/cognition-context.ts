@@ -202,7 +202,7 @@ export class InlineCognitionContext implements ContextOwner {
           else retained.selectProgram(operation.name, operation.version);
         }
         retained.synchronize(run, request.model, { messages: [] }, request.observation, request.adapter);
-        return retained.assemble(run, request.adapter, request.pendingAuthoring);
+        return retained.assemble(run, request.adapter, request.pendingAuthoring, request.authority);
       });
       const checkpoint = JSON.stringify(retained.checkpoint());
       const response = JSON.stringify({ v: CONTEXT_PROTOCOL_VERSION, id: request.id, ok: true,

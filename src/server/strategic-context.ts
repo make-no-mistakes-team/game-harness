@@ -13,6 +13,7 @@ import { confirmedMinecraftGuiTransactions } from "../shared/minecraft.ts";
 import { residentReceiptSchema, type ResidentReceipt } from "./resident-evidence.ts";
 import { programExecutionHash } from "./program-modules.ts";
 import { controllerEventSchema } from "../shared/resident.ts";
+import { cognitionAuthorityContextSchema, type CognitionAuthorityContext } from "./cognition-protocol.ts";
 
 // Supplement only: the root prompt, current authorized observation, active SDK
 // tool/result pairs and the existing 8 KiB turn feedback have their own bounds.
@@ -776,7 +777,8 @@ export class StrategicContext {
       ...(execution.error ? { error: execution.error.slice(0, 300) } : {}) };
   }
 
-  assemble(run: StoredRun, adapter?: StrategicContextAdapter, pendingAuthoring?: Json): string {
+  assemble(run: StoredRun, adapter?: StrategicContextAdapter, pendingAuthoring?: Json,
+    authority?: CognitionAuthorityContext): string {
     this.scope(run); this.refresh(run);
     const workspace = new ProgramWorkspace(this.store, run.run_id);
     const omissions: Omission[] = [...this.helpOmissions];
@@ -818,6 +820,7 @@ export class StrategicContext {
     for (const entry of workspace.catalog(0, 3).records) add(this.store.namedSkill(run.run_id, entry.name, entry.version));
     const contracts = {
       api_version: SKILL_API_VERSION,
+      ...(authority ? { authority: "playing_authority is the configured complete ceiling for new resident step sessions, not renewed authority or a changed live execution. Callback/frame counts do not increase semantic action/call limits. main_decision_window counts host logical Main admissions across turns/roles, including this request; remaining_requests excludes this request. Source preparation usage and SDK retries are separate. Omitted fields mean no configured cap of that kind. Live replacement still requires the exact actual handoff; reads, help and inactive writes do not replace a predecessor." } : {}),
       body: "run: async BODY(game,args), return {status:'completed'|'blocked'|'failed',summary,result}; await one capability at a time. step/activate(frame,state,intent) and analyze(input) are synchronous. Pure library imports require dependencies with exact local import_path aliases; no packages/dynamic imports/host APIs. Exact formats/limits remain in the root prompt and help programs/controller.",
       programs: "Immutable named versions. Existing name requires based_on latest. Write saves only; ordinary-only program_submit explicitly writes and starts that exact version through ordinary admission; program_run starts existing. Dependencies are pinned. Validation is not gameplay proof; completed program is not task success.",
       freshness: "Historical records remain evidence at their original time/scope; current_authority:false denies new effects, not knowledge. Authored state is model-defined, not native lifecycle or independent goal proof; interpret ambiguous keys from source/events. Current observations establish current inventory/geometry without erasing earlier encounter evidence. Worksite/targets require fresh reacquisition. Life/session/boot/space changes discard current dynamic notes; explicit world-local objective/worksite notes and no-replay uncertainty remain historical with original scope. Task/world/fresh-run changes discard experience. Argument samples/outcomes are sanitized historical examples, not restored inputs or rerun advice. Construct fresh args/targets; no handles, roots, effects or execution state are restored.",
@@ -842,6 +845,7 @@ export class StrategicContext {
       ? candidates.find(program => program.skill_id === latest.skill_id && program.version === latest.version) : null;
     const purpose = latestProgram?.card.purpose;
     const value = { budget_bytes: INPUT_BYTES, contracts,
+      ...(authority ? { authority: cognitionAuthorityContextSchema.parse(authority) } : {}),
       ...(pending ? { pending_authoring: pending } : {}),
       requested_help: [] as HelpSection[], objective: run.task,
       current_subgoal: this.authoredState.current_subgoal !== undefined ? this.authoredState.current_subgoal

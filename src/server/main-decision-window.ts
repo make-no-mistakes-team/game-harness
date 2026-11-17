@@ -11,6 +11,13 @@ export const mainDecisionWindowStateSchema = z.discriminatedUnion("outcome", [
 ]);
 export type MainDecisionWindowState = z.infer<typeof mainDecisionWindowStateSchema>;
 export type ClosedMainDecisionWindow = Extract<MainDecisionWindowState, { outcome: "decision_window_closed" }>;
+/** Model disclosure is sampled after reservation, including the request receiving it. */
+export const mainDecisionWindowBudgetSchema = z.object({
+  max_requests: count.min(1), admitted_requests: count.min(1), remaining_requests: count,
+  count_semantics: z.literal("after_current_request_admission"),
+}).strict().refine(value => value.admitted_requests <= value.max_requests &&
+  value.remaining_requests === value.max_requests - value.admitted_requests,
+{ message: "Main request budget must match its admitted window" });
 
 export function validateMainDecisionWindow(options: MainDecisionWindowOptions | undefined): void {
   if (options !== undefined && (!options || !Number.isSafeInteger(options.maxRequests) || options.maxRequests <= 0))

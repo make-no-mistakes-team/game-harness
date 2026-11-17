@@ -37,6 +37,8 @@ import { AUTHORING_CANCELLATION_REASONS } from "../shared/strategic-cancellation
 import { CUSTOM_TASK_COMPLETION_GUIDANCE } from "./runtime-prompt.ts";
 import { MainDecisionWindow, retainedFiniteExecutive, type MainDecisionWindowOptions,
   type ClosedMainDecisionWindow } from "./main-decision-window.ts";
+import { cognitionAuthorityContextSchema } from "./cognition-protocol.ts";
+import type { EffectivePlayingCeilings } from "./playing-authority.ts";
 
 const COALESCE_MS = 100;
 type ResidentAttentionOmission = { count: number; after_event_seq: number; through_event_seq: number };
@@ -119,6 +121,7 @@ export interface StrategicRequestAdmission {
 
 export interface StrategicHost {
   mainDecisionWindow?: MainDecisionWindowOptions;
+  playingAuthorityCeilings?: EffectivePlayingCeilings;
   run(): StoredRun | null;
   generation(): number;
   assertCurrent(generation: number, epoch?: number): StoredRun;
@@ -487,8 +490,22 @@ export class StrategicPlanner {
         // continuations. Supplement the actual request, not the disposable
         // Agent's history or a host-only reference cache.
         const pendingAuthoring = this.authoringProjection();
+        // Reservation has already happened. In ordinary cognition its metadata
+        // must reach the host window before reading authoritative admission counts.
+        const window = this.host.mainDecisionWindow ? await (async () => {
+          await this.ownership.flush?.();
+          return this.ownership.decisionWindowState
+            ? await this.ownership.decisionWindowState() : this.mainDecisionWindow?.state(run.run_id);
+        })() : undefined;
+        const authority = this.host.playingAuthorityCeilings || window ? cognitionAuthorityContextSchema.parse({
+          ...(this.host.playingAuthorityCeilings ? { playing_authority: this.host.playingAuthorityCeilings } : {}),
+          ...(window ? { main_decision_window: { max_requests: window.max_requests,
+            admitted_requests: window.admitted_requests,
+            remaining_requests: window.max_requests - window.admitted_requests,
+            count_semantics: "after_current_request_admission" } } : {}),
+        }) : undefined;
         const retained = await this.retainedContext.assemble({
-          scope, model: { api: model.api, provider: model.provider }, observation, adapter, pendingAuthoring,
+          scope, model: { api: model.api, provider: model.provider }, observation, adapter, pendingAuthoring, authority,
         }, { deadlineOsNs: request.deadlineOsNs, signal: options?.signal });
         // This await is a new authority seam, not an admission extension. The
         // exact request, role, run incarnation and original deadline still own

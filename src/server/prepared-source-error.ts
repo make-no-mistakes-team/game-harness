@@ -6,6 +6,7 @@ import { GeneratedControllerResultValidationError } from "./program-diagnostics.
 import { ResidentCleanupError, residentJsonConstraint } from "../shared/resident.ts";
 import type { ResidentSourceAdvisory } from "../shared/resident.ts";
 import { residentWorkerFailure } from "./resident-worker-fault.ts";
+import { nativeLaunchFailure } from "./native-launch-fault.ts";
 
 /** Host-authored preparation preconditions have public text; container source
  * messages are exposed only in their separately labelled advisory projection. */
@@ -14,8 +15,10 @@ export class PreparedSourceFault extends Error {
 }
 
 export function preparationFailure(error: unknown): {
-  error: string; code: string; issues?: Json; omitted_issues?: number; source_diagnostic?: ResidentSourceAdvisory;
+  error: string; code: string; stage?: "native_launch"; issues?: Json; omitted_issues?: number; source_diagnostic?: ResidentSourceAdvisory;
 } {
+  const launchFailure = nativeLaunchFailure(error);
+  if (launchFailure) return launchFailure;
   const workerFailure = residentWorkerFailure(error);
   if (workerFailure) return workerFailure;
   if (error instanceof ResidentCleanupError)

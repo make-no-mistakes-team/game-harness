@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Agent } from "@oh-my-pi/pi-agent-core/agent";
@@ -13,6 +13,7 @@ import { PreparedStart, type PreparedStartOptions } from "../src/server/prepared
 import type { PreparationContract } from "../src/server/prepared-source-contract.ts";
 import type { ApprovedSourceReference } from "../src/server/source-authoring.ts";
 import { Store } from "../src/server/store.ts";
+import { OfficialSessionUnavailableError } from "../src/server/native-launch-fault.ts";
 import { minecraftRunFixture, minecraftTestAdapter } from "./helpers/adapter-contract.ts";
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -175,6 +176,48 @@ test("cancel during joining closes the reserved launch once and waits for its or
   await f.owner.close();
   expect(f.counts).toMatchObject({ launches: 1, launchCloses: 1, admissions: 0, workerCloses: 1, activations: 0 });
 });
+
+for (const kind of ["official", "forged", "host", "provider"] as const) {
+  test(`launch-ready rejection joins launch closure and retains safe failure projection (${kind})`, async () => {
+    const f = fixture(); f.compileResult.resolve(f.worker); await f.owner.initialize();
+    const accepted = await f.owner.start(f.request); await f.launchEntered.promise;
+    const readyAt = f.owner.snapshot()?.ready_at;
+    expect(typeof readyAt).toBe("string");
+    const known = new OfficialSessionUnavailableError();
+    const error = kind === "official" ? known : kind === "forged"
+      ? Object.assign(Object.create(OfficialSessionUnavailableError.prototype), {
+        stage: "native_launch", code: "official_session_unavailable",
+        message: `${known.message} PRIVATE_FORGED_SECRET`, name: "PRIVATE_FORGED_NAME",
+      }) : Object.assign(new Error(`${known.message} PRIVATE_${kind.toUpperCase()}_SECRET /private/host/path`),
+        { name: "PRIVATE_UNTRUSTED_NAME", stage: "native_launch", code: "official_session_unavailable" });
+    // Even a branded instance's mutable Error fields are never publication authority.
+    if (kind === "official") {
+      known.message = "PRIVATE_MUTATED_SECRET"; known.name = "PRIVATE_MUTATED_NAME";
+    }
+    f.launchReady.reject(error); await f.launchCloseEntered.promise;
+    expect(f.owner.snapshot()).toMatchObject({ phase: "joining", run_id: null, ready_at: readyAt });
+    expect(f.counts).toMatchObject({ launchCloses: 1, admissions: 0, activations: 0, workerCloses: 0 });
+    f.launchCloseResult.resolve();
+    const failed = await f.terminal.promise; await f.owner.close();
+    expect(failed).toMatchObject({ phase: "failed", closure: "closed", run_id: null, ready_at: readyAt });
+    expect(f.counts).toMatchObject({ launches: 1, launchCloses: 1, admissions: 0, activations: 0, workerCloses: 1 });
+    const journal = readFileSync(join(f.directory, "prepared-source", `${accepted.preparation_id}.jsonl`), "utf8");
+    const rows = journal.trim().split("\n").map(line => JSON.parse(line));
+    const failure = rows.find(row => row.type === "attempt.failure");
+    expect(failure).toBeDefined();
+    if (kind === "official") {
+      expect(failure.details).toMatchObject({ stage: "native_launch", code: "official_session_unavailable",
+        error: "The official Launcher Minecraft session is unavailable. Sign in and launch Minecraft 1.21.4 with the official Launcher." });
+      expect(failed.error).toBe(failure.details.error);
+    } else {
+      expect(failure.details.code).toBe("service_failure");
+      expect(failure.details.stage).toBeUndefined();
+    }
+    expect(rows.some(row => row.type === "worker.transferred")).toBe(false);
+    expect(JSON.stringify({ failed, journal })).not.toContain("PRIVATE");
+    expect(JSON.stringify({ failed, journal })).not.toContain("/private/host/path");
+  });
+}
 
 test("post-transfer failure joins Stop on the admitted stored run without closing the healthy world", async () => {
   const f = fixture(), store = new Store(f.directory);

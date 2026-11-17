@@ -396,7 +396,7 @@ export class PreparedSource {
         attempt.view.phase = "failed"; attempt.view.closure = attempt.unknown ? "unknown" : "closed";
         try {
           this.append(attempt, "attempt.failure", { ...preparationFailure(error),
-            type: error instanceof Error ? error.name.slice(0, 80) : "UnknownFailure" });
+            type: error instanceof Error ? "Error" : "UnknownFailure" });
           this.save(attempt);
         } catch {
           // Physical closure was already joined. Audit failure is not a false

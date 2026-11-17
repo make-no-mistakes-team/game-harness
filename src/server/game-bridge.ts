@@ -65,6 +65,7 @@ import {
   type NativeArtifactContract,
 } from "./native-artifact.ts";
 import { assertNativeContractFresh } from "./native-contract.ts";
+import { nativeLaunchFailure } from "./native-launch-fault.ts";
 import {
   MinecraftClient,
   type NativeOptions,
@@ -1159,11 +1160,14 @@ export class GameBridgeClient implements GameBridge {
         }
       }, 3000);
     } catch (error) {
-      const message =
+      const launchFailure = nativeLaunchFailure(error);
+      const message = launchFailure?.error ?? (
         error instanceof Error
           ? error.message
-          : "Native Minecraft launch failed.";
+          : "Native Minecraft launch failed.");
       await this.terminate(message);
+      // Preserve verifier provenance through the actual prepared launch-ready seam.
+      if (launchFailure) throw error;
       throw new Error(message);
     } finally {
       this.connecting = false;

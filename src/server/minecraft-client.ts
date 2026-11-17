@@ -28,6 +28,7 @@ import {
   type NativeEvaluationOptions,
 } from "./native-evaluation.ts";
 import { javaProxyArguments } from "./java-network.ts";
+import { OfficialSessionUnavailableError } from "./native-launch-fault.ts";
 import {
   hasCompletedFabricInstallation,
   recordCompletedFabricInstallation,
@@ -243,34 +244,15 @@ export class MinecraftClient {
     this.source = options.sourceMinecraft ?? path.join(homedir(), ".minecraft");
     this.java = options.java ?? JAVA;
   }
-  async launch(
-    config: {
-      host: string;
-      port: number;
-      world_id: string;
-      epoch: number;
-      motor_profile?: MotorProfile;
-    },
-    controlPort: number,
-    videoPort: number,
-    signal: AbortSignal,
-    prepared?: NativeArtifactContract,
-  ): Promise<NativeProcess> {
+  /** Explicit playing-caller preflight before billable Source authoring.
+   * Returns no identity or credentials and grants no cached launch authority.
+   * Pure source authoring need not call it. launch() always verifies again. */
+  async assertOfficialSessionReady(signal: AbortSignal): Promise<void> {
+    await this.verifyOfficialSession(signal);
+  }
+
+  private async verifyOfficialSession(signal: AbortSignal) {
     signal.throwIfAborted();
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    await chmod(this.directory, 0o700);
-    const mod = await prepareNativeMod(
-      this.projectRoot,
-      this.directory,
-      signal,
-      prepared,
-    );
-    const version = JSON.parse(
-      await readFile(
-        path.join(this.source, "versions/1.21.4/1.21.4.json"),
-        "utf8",
-      ),
-    );
     const credentials = Promise.withResolvers<Buffer>();
     const reader = spawn(
       "/usr/bin/python3",
@@ -295,55 +277,82 @@ export class MinecraftClient {
     });
     reader.stderr.on("data", () => {});
     const credentialTimer = setTimeout(() => reader.kill("SIGKILL"), 10000);
-    reader.once("error", () =>
-      credentials.reject(
-        new Error("Official Launcher keyring reader unavailable."),
-      ),
-    );
+    let readerFailed = false;
+    reader.once("error", () => { readerFailed = true; });
     reader.once("close", (code) => {
       clearTimeout(credentialTimer);
       signal.removeEventListener("abort", abortReader);
-      code === 0 && credentialBytes <= 65536
-        ? credentials.resolve(Buffer.concat(chunks))
-        : credentials.reject(
-            new Error(
-              "The official Launcher credential is unavailable. Sign in and launch Minecraft 1.21.4 with the official Launcher.",
-            ),
-          );
+      if (signal.aborted) credentials.reject(signal.reason);
+      else if (!readerFailed && code === 0 && credentialBytes <= 65536)
+        credentials.resolve(Buffer.concat(chunks));
+      else credentials.reject(new OfficialSessionUnavailableError());
     });
-    const credentialBuffer = await credentials.promise;
-    const account = z
-      .object({
-        tokens: z.array(z.string().min(1).max(16384)).min(1).max(8),
-        profile: z.object({ id: z.string().min(1), name: z.string().min(1) }),
-      })
-      .parse(JSON.parse(credentialBuffer.toString("utf8")));
-    credentialBuffer.fill(0);
-    for (const bytes of chunks) bytes.fill(0);
-    let accessToken: string | null = null;
-    const profile = account.profile;
-    // Verify cached candidates against the official service; never substitute an offline profile.
-    for (const candidate of account.tokens) {
-      const auth = await fetch(
-        "https://api.minecraftservices.com/minecraft/profile",
-        {
-          headers: { Authorization: `Bearer ${candidate}` },
-          signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
-        },
-      );
-      if (!auth.ok) continue;
-      const actual = z
-        .object({ id: z.string(), name: z.string() })
-        .parse(await auth.json());
-      if (actual.id === profile.id && actual.name === profile.name) {
-        accessToken = candidate;
-        break;
+    let credentialBuffer: Buffer | undefined;
+    try {
+      credentialBuffer = await credentials.promise;
+      const account = z
+        .object({
+          tokens: z.array(z.string().min(1).max(16384)).min(1).max(8),
+          profile: z.object({ id: z.string().min(1), name: z.string().min(1) }),
+        })
+        .parse(JSON.parse(credentialBuffer.toString("utf8")));
+      credentialBuffer.fill(0);
+      for (const bytes of chunks) bytes.fill(0);
+      // Verify cached candidates against the official service; never substitute an offline profile.
+      for (const candidate of account.tokens) {
+        const auth = await fetch(
+          "https://api.minecraftservices.com/minecraft/profile",
+          {
+            headers: { Authorization: `Bearer ${candidate}` },
+            signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
+          },
+        );
+        if (!auth.ok) continue;
+        const actual = z
+          .object({ id: z.string(), name: z.string() })
+          .parse(await auth.json());
+        if (actual.id === account.profile.id && actual.name === account.profile.name) {
+          signal.throwIfAborted();
+          return { accessToken: candidate, profile: account.profile };
+        }
       }
+      signal.throwIfAborted();
+      throw new OfficialSessionUnavailableError();
+    } finally {
+      credentialBuffer?.fill(0);
+      for (const bytes of chunks) bytes.fill(0);
     }
-    if (!accessToken)
-      throw new Error(
-        "The official Launcher Minecraft session is expired or unavailable. Sign in and launch Minecraft 1.21.4 with the official Launcher.",
-      );
+  }
+
+  async launch(
+    config: {
+      host: string;
+      port: number;
+      world_id: string;
+      epoch: number;
+      motor_profile?: MotorProfile;
+    },
+    controlPort: number,
+    videoPort: number,
+    signal: AbortSignal,
+    prepared?: NativeArtifactContract,
+  ): Promise<NativeProcess> {
+    // A Source phase may outlive an earlier readiness pass. Never reuse its result.
+    const { accessToken, profile } = await this.verifyOfficialSession(signal);
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await chmod(this.directory, 0o700);
+    const mod = await prepareNativeMod(
+      this.projectRoot,
+      this.directory,
+      signal,
+      prepared,
+    );
+    const version = JSON.parse(
+      await readFile(
+        path.join(this.source, "versions/1.21.4/1.21.4.json"),
+        "utf8",
+      ),
+    );
     signal.throwIfAborted();
     const session: NativeSession = {
       secret: randomBytes(32).toString("hex"),

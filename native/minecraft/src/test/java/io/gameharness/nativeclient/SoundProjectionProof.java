@@ -315,6 +315,67 @@ public final class SoundProjectionProof {
         "nonfinite source/master gain was reported heard");
   }
 
+  private static void drownedAudibleBoundary() {
+    // Vanilla 1.21.4 sounds.json and DrownedEntity's ambient/swim dispatch use these IDs.
+    String[] ids = {"minecraft:entity.drowned.ambient", "minecraft:entity.drowned.ambient_water",
+        "minecraft:entity.drowned.swim"};
+    record Playback(boolean playing, double gain, double masterGain, boolean relative,
+        boolean linear, double cutoff, double z) {}
+    Playback[] inaudible = {
+      new Playback(false, .9, 1, false, true, 16, 8),
+      new Playback(true, 0, 1, false, true, 16, 8),
+      new Playback(true, .9, 0, false, true, 16, 8),
+      new Playback(true, .9, 1, true, true, 16, 8),
+      new Playback(true, .9, 1, false, true, 16, 16),
+      new Playback(true, .9, 1, false, true, 0, 8),
+      new Playback(true, .9, 1, false, true, 64, 32.001),
+      new Playback(true, .9, 1, false, false, 0, 32.001),
+      new Playback(true, Double.NaN, 1, false, true, 16, 8),
+      new Playback(true, .9, Double.NaN, false, true, 16, 8)
+    };
+    for (String id : ids) {
+      int kind = SoundProjection.category(id);
+      for (boolean linear : new boolean[] {true, false}) {
+        SoundProjection sounds = new SoundProjection();
+        // Compose the same pure audibility and tagged-stream seams used after Source.play.
+        if (SoundProjection.audible(true, .9, 1, false, linear, 16, 0, 0, 8))
+          sounds.accept(sounds.streamId(), kind, 0, 0, 8, WALL, NOW);
+        var events = sounds.page(null, NOW).events();
+        var groups = sounds.recent(NOW);
+        require(events.size() == 1 && events.getFirst().category() == 3
+            && events.getFirst().cue() == null && events.getFirst().direction() == 5
+            && events.getFirst().distance() == 1 && events.getFirst().nativeNanos() == NOW
+            && groups.size() == 1 && groups.getFirst().category() == 3
+            && groups.getFirst().cue() == null,
+            "audible Drowned sound did not remain a coarse creature event: " + id);
+      }
+      for (Playback source : inaudible) {
+        SoundProjection sounds = new SoundProjection();
+        if (SoundProjection.audible(source.playing(), source.gain(), source.masterGain(),
+            source.relative(), source.linear(), source.cutoff(), 0, 0, source.z()))
+          sounds.accept(sounds.streamId(), kind, 0, 0, source.z(), WALL, NOW);
+        var page = sounds.page(null, NOW);
+        require(page.events().isEmpty() && page.nextCursor().sequence() == 0 && !page.gap()
+            && sounds.recent(NOW).isEmpty(),
+            "inaudible Drowned source entered either projection: " + id + " " + source);
+      }
+      SoundProjection sounds = new SoundProjection();
+      String oldStream = sounds.streamId();
+      sounds.clear();
+      if (SoundProjection.audible(true, .9, 1, false, true, 16, 0, 0, 8)) {
+        sounds.accept(oldStream, kind, 0, 0, 8, WALL, NOW);
+        sounds.accept((String) null, kind, 0, 0, 8, WALL, NOW);
+      }
+      var page = sounds.page(null, NOW);
+      require(page.events().isEmpty() && page.nextCursor().sequence() == 0 && !page.gap()
+          && sounds.recent(NOW).isEmpty(), "out-of-scope Drowned callback entered either projection");
+    }
+    for (String id : new String[] {"minecraft:entity.drowned.step", "minecraft:entity.drowned.shoot",
+        "minecraft:entity.drowned.hurt_water", "minecraft:entity.drowned.death_water",
+        "other:entity.drowned.ambient"})
+      require(SoundProjection.category(id) == -1, "Drowned ambient/swim widened unrelated admission");
+  }
+
   public static void main(String[] ignored) {
     independentReaders();
     overflowAndExpiry();
@@ -322,8 +383,9 @@ public final class SoundProjectionProof {
     binsAndLegacyPresence();
     ordinaryCueGroups();
     allowlistAndAudibility();
+    drownedAudibleBoundary();
     System.out.println("Sound projection proof PASS: independent cursors, bounded pages, explicit gaps,"
         + " scope fencing, monotonic expiry, coarse bins, cue-distinct prioritized ordinary groups,"
-        + " non-draining presence and audibility gates.");
+        + " non-draining presence, coarse Drowned ambient/swim and audibility gates.");
   }
 }

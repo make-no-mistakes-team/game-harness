@@ -75,7 +75,9 @@ public final class SoundProjection {
               "minecraft:entity.generic.death",
               "minecraft:entity.arrow.shoot" ->
           2;
-      case "minecraft:entity.zombie.ambient", "minecraft:entity.skeleton.ambient" -> 3;
+      case "minecraft:entity.zombie.ambient", "minecraft:entity.skeleton.ambient",
+              "minecraft:entity.drowned.ambient", "minecraft:entity.drowned.ambient_water",
+              "minecraft:entity.drowned.swim" -> 3;
       case "minecraft:entity.lightning_bolt.thunder" -> 4;
       case "minecraft:entity.creeper.primed" -> 5;
       default -> -1;

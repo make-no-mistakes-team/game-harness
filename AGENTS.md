@@ -122,7 +122,7 @@ model-visible images separately. Full lossless frame sequences require an
 explicit finite diagnostic or experiment declaration.
 
 Rotate explicitly managed, closed and confirmed-drained unpinned development
-runs, whether successful or failed: 20 GiB project budget, at most ten unpinned
+runs, whether successful or failed: 50 GiB project budget, at most ten unpinned
 runs, and fourteen days. Preserve durable outcomes, usage and explicit payload
 expiry records. Active owners, user worlds, manual-review pins and frozen
 experiments override expiry. Refuse new admission when protected storage fills

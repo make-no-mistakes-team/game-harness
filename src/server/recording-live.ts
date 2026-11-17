@@ -7,7 +7,7 @@ import { normalizeRecordingLimits } from "../shared/evidence-limits.ts";
 import type { NativeVideoHeader } from "../shared/video.ts";
 import { inspectVideoFrame } from "./video.ts";
 import { LiveSegmentEncoder } from "./recording-stream.ts";
-import type { LiveRecordingManifest, RecordingOptions, RecordingSegment, RecorderHealth } from "./recording.ts";
+import type { LiveRecordingManifest, RecordingOptions, RecordingSegment, RecorderHealth, ReplayOptions } from "./recording.ts";
 
 interface Entry { frame: Uint8Array; header: NativeVideoHeader; receivedMonotonic: number; ordinal: number }
 interface Segment { encoder: LiveSegmentEncoder; file: string; start: number; entries: Omit<Entry, "frame">[] }
@@ -225,7 +225,7 @@ export class LiveEpisodeRecorder {
     if (persistenceFailure) throw persistenceFailure;
     return manifest;
   }
-  renderReplay(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string> {
+  renderReplay(options: ReplayOptions = {}): Promise<string> {
     if (!this.replay) this.replay = (async () => {
       if (!this.finished) throw new Error("Finish capture before replay assembly");
       options.signal?.throwIfAborted();
@@ -237,10 +237,13 @@ export class LiveEpisodeRecorder {
 }
 
 /** Remux already-compressed segments, never decode/reencode their capture timeline. */
-export async function renderLiveReplay({ directory, manifest, concatSha256, signal, timeoutMs = 120000 }: {
-  directory: string; manifest: LiveRecordingManifest; concatSha256: string; signal?: AbortSignal; timeoutMs?: number;
+export async function renderLiveReplay({ directory, manifest, concatSha256, signal, timeoutMs = 120000, combinedMaxBytes }: ReplayOptions & {
+  directory: string; manifest: LiveRecordingManifest; concatSha256: string;
 }): Promise<string> {
   signal?.throwIfAborted();
+  const byteLimit = combinedMaxBytes === undefined ? manifest.limits.maxStoredFrameBytes : combinedMaxBytes;
+  if (!Number.isSafeInteger(byteLimit) || byteLimit < 1)
+    throw new RangeError("Replay combined byte ceiling must be a positive safe integer");
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError("Replay timeout must be finite and positive");
   const deadline = performance.now() + timeoutMs;
   if (manifest.concat_sha256 !== concatSha256 || createHash("sha256").update(await readFile(path.join(directory, manifest.concat), { signal })).digest("hex") !== concatSha256)
@@ -252,7 +255,12 @@ export async function renderLiveReplay({ directory, manifest, concatSha256, sign
     if (!/^segment-\d{6}\.mkv$/.test(segment.file)) throw new Error("Invalid recording segment path");
     const filename = path.join(directory, segment.file);
     if (await digest(filename, signal, deadline) !== segment.sha256) throw new Error("Recording segment changed after finalization");
-    storedBytes += (await stat(filename)).size;
+    const bytes = (await stat(filename)).size;
+    if (bytes > manifest.limits.maxStoredFrameBytes - storedBytes)
+      throw new Error("Encoded recording source byte bound reached before replay assembly");
+    if (bytes > byteLimit - storedBytes)
+      throw new Error("Encoded recording byte bound reached before replay assembly");
+    storedBytes += bytes;
   }
   signal?.throwIfAborted();
   if (performance.now() >= deadline) throw new Error("Replay assembly deadline reached");
@@ -271,8 +279,9 @@ export async function renderLiveReplay({ directory, manifest, concatSha256, sign
   const output = (async () => {
     try {
       for await (const data of child.stdout) {
+        if (failure) break;
         const chunk = data as Buffer;
-        if (storedBytes + chunk.length > manifest.limits.maxStoredFrameBytes) {
+        if (chunk.length > byteLimit - storedBytes) {
           terminate(new Error("Encoded recording byte bound reached during replay assembly")); break;
         }
         await file.writeFile(chunk); storedBytes += chunk.length;

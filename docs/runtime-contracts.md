@@ -1268,6 +1268,18 @@ Bounded replay assembly stream-copies sealed segments into MP4, preserving nativ
 millisecond timestamps, gaps and final holds. Failure retains the compressed
 segments and index. Audio is not recorded; encoding is not visual inspection.
 
+Trusted host callers of `renderEpisodeReplay()` or `EpisodeRecorder.renderReplay()`
+may supply `combinedMaxBytes` for source media plus the offline replay. It must
+be a positive safe integer; invalid ceilings reject before replay output is
+created. Actual referenced source files must still fit the manifest's unchanged
+`maxStoredFrameBytes` capture ceiling. Replay writes are checked before each
+chunk, and failure or abort joins the owned process and closes its output handle.
+Without an explicit ceiling, compressed replay keeps its manifest-derived
+combined bound. Historical lossless export keeps its existing behavior; an
+explicit ceiling adds bounded MP4 output without dropping frames or shortening
+their timing. This host option does not amend a sealed manifest or authorize a
+larger experiment budget.
+
 Explicit `lossless_png` capture retains schema 1 and its bounded PNG/index/concat
 pipeline. Registered studies and frozen resident benchmarks select this mode
 rather than silently changing their pixel-evidence contract. Model-visible

@@ -1,4 +1,4 @@
-import { mkdir, open, readFile } from "node:fs/promises";
+import { mkdir, open, readFile, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -41,6 +41,11 @@ export interface LiveRecordingManifest extends Omit<LosslessRecordingManifest, "
   concat_sha256: string;
 }
 export type RecordingManifest = LosslessRecordingManifest | LiveRecordingManifest;
+export interface ReplayOptions {
+  signal?: AbortSignal; timeoutMs?: number;
+  /** Trusted host authorization for source media plus replay bytes; never changes capture limits. */
+  combinedMaxBytes?: number;
+}
 /** Direct delivered-frame subscription, independent of spectator backpressure/latest selection. */
 class LosslessEpisodeRecorder {
   private readonly limits; private readonly now; private readonly monotonic;
@@ -197,11 +202,11 @@ class LosslessEpisodeRecorder {
     return manifest;
   }
   /** Offline optional stage: PNG/index/concat survive FFmpeg failure. No fixed-rate wait compression. */
-  renderReplay(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string> {
+  renderReplay(options: ReplayOptions = {}): Promise<string> {
     if (!this.replay) this.replay = this.render(options);
     return this.replay;
   }
-  private async render(options: { signal?: AbortSignal; timeoutMs?: number }): Promise<string> {
+  private async render(options: ReplayOptions): Promise<string> {
     if (!this.finished) throw new Error("Finish capture before offline replay rendering");
     options.signal?.throwIfAborted();
     await this.finished;
@@ -226,14 +231,16 @@ export class EpisodeRecorder {
   }
   health(): RecorderHealth { return this.recorder.health(); }
   finish(input: { endedAt: number; reason: string }): Promise<RecordingManifest> { return this.recorder.finish(input); }
-  renderReplay(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string> { return this.recorder.renderReplay(options); }
+  renderReplay(options: ReplayOptions = {}): Promise<string> { return this.recorder.renderReplay(options); }
 }
 
 /** Render finalized disk evidence after capture ownership has ended. */
-export async function renderEpisodeReplay({ directory, concatSha256, signal, timeoutMs = 120000 }: {
-  directory: string; concatSha256: string; signal?: AbortSignal; timeoutMs?: number;
+export async function renderEpisodeReplay({ directory, concatSha256, signal, timeoutMs = 120000, combinedMaxBytes }: ReplayOptions & {
+  directory: string; concatSha256: string;
 }): Promise<string> {
   signal?.throwIfAborted();
+  if (combinedMaxBytes !== undefined && (!Number.isSafeInteger(combinedMaxBytes) || combinedMaxBytes < 1))
+    throw new RangeError("Replay combined byte ceiling must be a positive safe integer");
   if (typeof concatSha256 !== "string" || concatSha256.length !== 64 || !/^[a-f0-9]{64}$/.test(concatSha256))
     throw new Error("Replay concat SHA256 digest must be 64 lowercase hexadecimal characters");
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError("Replay timeout must be finite and positive");
@@ -243,10 +250,33 @@ export async function renderEpisodeReplay({ directory, concatSha256, signal, tim
     throw new Error("Recording concat changed after finalization; original evidence retained");
   const manifest = JSON.parse(await readFile(path.join(directory, "recording-manifest.json"), "utf8")) as RecordingManifest;
   if (manifest.schema_version === 2)
-    return renderLiveReplay({ directory, manifest, concatSha256, signal, timeoutMs: Math.max(1, deadline - performance.now()) });
+    return renderLiveReplay({ directory, manifest, concatSha256, signal, combinedMaxBytes, timeoutMs: Math.max(1, deadline - performance.now()) });
   if (manifest.schema_version !== 1) throw new Error("Unsupported recording manifest version");
+  let storedBytes = 0;
+  if (combinedMaxBytes !== undefined) {
+    const sources = new Set<string>();
+    for (const line of concat.toString("utf8").split("\n")) {
+      if (!line.startsWith("file ")) continue;
+      const match = /^file '(frame-\d+\.png)'$/.exec(line);
+      if (!match) throw new Error("Invalid recording frame path");
+      sources.add(match[1]!);
+    }
+    for (const source of sources) {
+      signal?.throwIfAborted();
+      if (performance.now() >= deadline) throw new Error("Offline replay rendering deadline reached");
+      const bytes = (await stat(path.join(directory, source))).size;
+      if (bytes > manifest.limits.maxStoredFrameBytes - storedBytes)
+        throw new Error("Recording source byte bound reached before offline replay rendering");
+      if (bytes > combinedMaxBytes - storedBytes)
+        throw new Error("Recording byte bound reached before offline replay rendering");
+      storedBytes += bytes;
+    }
+  }
   signal?.throwIfAborted();
   if (performance.now() >= deadline) throw new Error("Offline replay rendering deadline reached");
+  // Historical lossless consumers retain their original seekable MP4 output.
+  // An explicit host ceiling requires a bounded pipe, checked before each write.
+  const file = combinedMaxBytes === undefined ? undefined : await open(path.join(directory, "replay.mp4"), "wx", 0o600);
   const closed = Promise.withResolvers<number | null>();
   // Concat per-file options require safe=0. Consume only the unchanged sealed
   // generated manifest, with no network protocols. B-frames can understate
@@ -257,7 +287,8 @@ export async function renderEpisodeReplay({ directory, concatSha256, signal, tim
   // PNG decoding and x264 keep their independent threading defaults.
   const child = spawn("ffmpeg", ["-nostdin", "-filter_threads", "1", "-v", "error", "-n", "-f", "concat", "-safe", "0", "-protocol_whitelist", "file",
     "-i", "replay.ffconcat", "-fps_mode", "passthrough", "-enc_time_base", "1/1000", "-c:v", "libx264", "-preset", "veryfast", "-bf", "0",
-    "-pix_fmt", "yuv420p", "replay.mp4"], { cwd: directory, stdio: "ignore" });
+    "-pix_fmt", "yuv420p", ...(file ? ["-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "pipe:1"] : ["replay.mp4"])],
+    { cwd: directory, stdio: ["ignore", file ? "pipe" : "ignore", "ignore"] });
   let failure: Error | undefined;
   const terminate = (error: Error) => { failure ??= error; child.kill("SIGKILL"); };
   const abort = () => terminate(signal?.reason instanceof Error ? signal.reason : new Error("Offline replay rendering interrupted"));
@@ -268,10 +299,25 @@ export async function renderEpisodeReplay({ directory, concatSha256, signal, tim
   child.once("close", closed.resolve);
   signal?.addEventListener("abort", abort, { once: true });
   if (signal?.aborted) abort();
+  const output = (async () => {
+    if (!file) return;
+    try {
+      for await (const data of child.stdout!) {
+        if (failure) break;
+        const chunk = data as Buffer;
+        if (chunk.length > combinedMaxBytes! - storedBytes) {
+          terminate(new Error("Recording byte bound reached during offline replay rendering")); break;
+        }
+        await file.writeFile(chunk); storedBytes += chunk.length;
+      }
+    } catch { terminate(new Error("Replay persistence failed; original evidence retained")); }
+  })();
   try {
     const code = await closed.promise;
+    await output;
     if (failure) throw failure;
     if (code !== 0) throw new Error("Offline replay rendering failed; original evidence retained");
+    await file?.sync();
     return "replay.mp4";
-  } finally { clearTimeout(timer); signal?.removeEventListener("abort", abort); }
+  } finally { clearTimeout(timer); signal?.removeEventListener("abort", abort); await file?.close(); }
 }

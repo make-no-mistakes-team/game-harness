@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { watch } from "node:fs";
 import { tmpdir } from "node:os";
@@ -214,7 +215,93 @@ test("detached compressed replay honors sealed segment integrity without requiri
   expect((await readdir(changed.directory)).includes("replay.mp4")).toBe(false);
 });
 
-for (const mode of ["encoder-kill", "encoder-drain-timeout", "replay-abort"]) {
+test("default replay still rejects when source plus replay exceeds the sealed live capture ceiling", async () => {
+  const f = await fixture({ maxStoredFrameBytes: 2048 });
+  f.emit(1, 0); f.emit(2, 33); f.emit(4, 846);
+  const manifest = await f.recorder.finish({ endedAt: 10903, reason: "capture_complete" });
+  expect(manifest).toMatchObject({ status: "complete", stored_frames: 3, limits: { maxStoredFrameBytes: 2048 } });
+  await expect(f.recorder.renderReplay()).rejects.toThrow("byte bound reached");
+  let bytes = 0;
+  for (const name of await readdir(f.directory)) if (name.endsWith(".mkv") || name.endsWith(".mp4"))
+    bytes += (await stat(join(f.directory, name))).size;
+  expect(bytes).toBeLessThanOrEqual(2048);
+});
+
+for (const captureMode of ["live_compressed", "lossless_png"] as const) {
+  for (const consumer of ["recorder", "detached"] as const) {
+    test(`${captureMode} ${consumer} honors a separate trusted replay ceiling without changing source limits or timing`, async () => {
+      const sourceLimit = captureMode === "live_compressed" ? 2048 : 512;
+      const f = await fixture({ maxStoredFrameBytes: sourceLimit }, { captureMode });
+      f.emit(1, 0); f.emit(2, 33); f.emit(4, 846);
+      const manifest = await f.recorder.finish({ endedAt: 10903, reason: "capture_complete" });
+      expect(manifest).toMatchObject({ status: "complete", stored_frames: 3,
+        limits: { maxStoredFrameBytes: sourceLimit }, timing: { capture_duration_ms: 846, final_hold_ms: 57 } });
+      const sealed = await readFile(join(f.directory, "recording-manifest.json"));
+      const index = await readFile(join(f.directory, manifest.index));
+      const concat = await readFile(join(f.directory, manifest.concat));
+      const replay = consumer === "recorder"
+        ? await f.recorder.renderReplay({ combinedMaxBytes: 65536 })
+        : await renderEpisodeReplay({ directory: f.directory, concatSha256: createHash("sha256").update(concat).digest("hex"),
+          combinedMaxBytes: 65536 });
+      const probe = await timestamps(f.directory, replay);
+      expect(probe.pts).toEqual([0, .033, .846, .903]);
+      expect(Math.abs(probe.duration - .903)).toBeLessThanOrEqual(.005);
+      const frames = index.toString("utf8").trim().split("\n").map(line => JSON.parse(line)).filter(record => record.kind === "frame");
+      expect(frames.map(record => [record.sequence, record.captured_at])).toEqual([[1, 10000], [2, 10033], [4, 10846]]);
+      let sourceBytes = 0;
+      for (const name of await readdir(f.directory)) if (name.endsWith(".mkv") || name.endsWith(".png"))
+        sourceBytes += (await stat(join(f.directory, name))).size;
+      const total = sourceBytes + (await stat(join(f.directory, replay))).size;
+      expect(sourceBytes).toBeLessThanOrEqual(sourceLimit);
+      expect(total).toBeGreaterThan(sourceLimit);
+      expect(total).toBeLessThanOrEqual(65536);
+      expect(await readFile(join(f.directory, "recording-manifest.json"))).toEqual(sealed);
+      expect(await readFile(join(f.directory, manifest.index))).toEqual(index);
+      expect(await readFile(join(f.directory, manifest.concat))).toEqual(concat);
+    });
+  }
+
+  test(`${captureMode} rejects invalid explicit replay ceilings before creating replay output`, async () => {
+    const f = await fixture({}, { captureMode });
+    f.emit(1, 0);
+    const manifest = await f.recorder.finish({ endedAt: 10100, reason: "capture_complete" });
+    const concatSha256 = createHash("sha256").update(await readFile(join(f.directory, manifest.concat))).digest("hex");
+    for (const combinedMaxBytes of [NaN, Infinity, -Infinity, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, null as unknown as number]) {
+      await expect(renderEpisodeReplay({ directory: f.directory, concatSha256, combinedMaxBytes })).rejects.toThrow("positive safe integer");
+      expect((await readdir(f.directory)).includes("replay.mp4")).toBe(false);
+    }
+    // The recorder path must validate too, including live dispatch that bypasses
+    // the detached wrapper. A rejected render remains single-flight.
+    await expect(f.recorder.renderReplay({ combinedMaxBytes: NaN })).rejects.toThrow("positive safe integer");
+    expect((await readdir(f.directory)).includes("replay.mp4")).toBe(false);
+  });
+
+  test(`${captureMode} explicit replay authorization cannot override the sealed source ceiling`, async () => {
+    const f = await fixture({}, { captureMode }); f.emit(1, 0);
+    const manifest = await f.recorder.finish({ endedAt: 10100, reason: "capture_complete" });
+    // Deliberately inconsistent temporary disk handoff: media hashes still
+    // match, but metadata claims no stored bytes and a one-byte source budget.
+    // The consumer must count the actual referenced originals independently.
+    manifest.limits = { ...manifest.limits, maxStoredFrameBytes: 1 };
+    manifest.health.stored_encoded_bytes = 0; manifest.health.stored_png_bytes = 0;
+    await writeFile(join(f.directory, "recording-manifest.json"), JSON.stringify(manifest));
+    const concatSha256 = createHash("sha256").update(await readFile(join(f.directory, manifest.concat))).digest("hex");
+    await expect(renderEpisodeReplay({ directory: f.directory, concatSha256, combinedMaxBytes: 65536 })).rejects.toThrow("source byte bound reached");
+    expect((await readdir(f.directory)).includes("replay.mp4")).toBe(false);
+  });
+}
+
+test("lossless replay without an explicit host ceiling retains its historical output behavior", async () => {
+  const f = await fixture({ maxStoredFrameBytes: 512 }, { captureMode: "lossless_png" });
+  f.emit(1, 0); f.emit(2, 33); f.emit(4, 846);
+  const manifest = await f.recorder.finish({ endedAt: 10903, reason: "capture_complete" });
+  expect(manifest.status).toBe("complete");
+  const replay = await f.recorder.renderReplay();
+  expect((await stat(join(f.directory, replay))).size).toBeGreaterThan(512);
+  expect((await timestamps(f.directory, replay)).pts).toEqual([0, .033, .846, .903]);
+});
+
+for (const mode of ["encoder-kill", "encoder-drain-timeout", "replay-abort", "lossless-replay-abort", "replay-byte-bound", "lossless-replay-byte-bound"]) {
   test(`${mode} joins actual encoder close and closes every owned artifact handle`, async () => {
     const directory = await mkdtemp(join(tmpdir(), "live-recording-lifecycle-")); roots.push(directory);
     const output = await command([process.execPath, "--no-env-file",
@@ -222,13 +309,19 @@ for (const mode of ["encoder-kill", "encoder-drain-timeout", "replay-abort"]) {
     const line = output.split("\n").find(line => line.startsWith("LIVE_LIFECYCLE_RESULT "));
     if (!line) throw new Error(`Missing lifecycle evidence: ${output}`);
     const result = JSON.parse(line.slice("LIVE_LIFECYCLE_RESULT ".length));
-    expect(result.children.length).toBe(mode === "replay-abort" ? 2 : 1);
+    expect(result.children.length).toBe(mode === "replay-abort" ? 2 : mode === "replay-byte-bound" ? 4 : mode === "lossless-replay-byte-bound" ? 3 : 1);
     expect(result.children.every((child: { closed: boolean; alive: boolean }) => child.closed && !child.alive)).toBe(true);
     expect(result.handles.every((handle: { fd: number; usable: boolean }) => handle.fd === -1 && !handle.usable)).toBe(true);
     expect(result.manifest.health).toMatchObject({ active_encoders: 0, pending_raw_bytes: 0, queued_frames: 0 });
-    if (mode === "replay-abort") {
+    if (mode.endsWith("replay-abort")) {
       expect(result.manifest.status).toBe("complete");
       expect(result.replayError).toContain("operator_cancelled_assembly");
+    } else if (mode.endsWith("replay-byte-bound")) {
+      expect(result.manifest.status).toBe("complete");
+      expect(result.replayError).toContain("byte bound reached");
+      expect(result.referenceBytes).toBe(result.combinedMaxBytes + 1);
+      expect(result.boundaryBytes).toBe(result.referenceBytes);
+      expect(result.actualBytes).toBeLessThanOrEqual(result.combinedMaxBytes);
     } else {
       expect(result.manifest.status).toBe("incomplete");
       expect(result.manifest.stored_frames).toBe(0);

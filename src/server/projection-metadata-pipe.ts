@@ -1,4 +1,4 @@
-import { dlopen, ptr } from "bun:ffi";
+import { dlopen } from "bun:ffi";
 import { readSync, writeSync } from "node:fs";
 import { z } from "zod";
 import { osMonotonicNs } from "./os-monotonic.ts";
@@ -7,9 +7,8 @@ import { PROJECTION_MESSAGE_BYTES, projectionReplySchema } from "./projection-wr
 
 // Only this synchronous derived child blocks. Its normal stdin/stdout carry
 // one job or metadata exchange at a time; no extra process-pipe custody exists.
-const libc = dlopen("libc.so.6", { poll: { args: ["ptr", "u64", "i32"], returns: "i32" } });
+const libc = dlopen("libc.so.6", { poll: { args: ["buffer", "u64", "i32"], returns: "i32" } });
 const descriptor = new Int32Array(2);
-const address = ptr(descriptor);
 const input = Buffer.alloc(PROJECTION_MESSAGE_BYTES + 1);
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const responseSchema = z.object({ serial: z.int().positive(), reply: projectionReplySchema }).strict();
@@ -19,7 +18,9 @@ function wait(fd: number, events: number, deadline?: bigint): void {
     if (remaining !== null && remaining <= 0n) throw new RuntimeFault("history_deadline", "Derived metadata request reached its original deadline");
     descriptor[0] = fd; descriptor[1] = events;
     const timeout = remaining === null ? -1 : Math.min(2_147_483_647, Math.max(1, Math.ceil(Number(remaining) / 1e6)));
-    const count = libc.symbols.poll(address, 1, timeout);
+    // Keep the mutable view visible across the native call. A cached numeric
+    // address can leave this hot loop polling stale fd/events instead.
+    const count = libc.symbols.poll(descriptor, 1, timeout);
     if (count <= 0) continue;
     const returned = descriptor[1]! >>> 16;
     if (returned & events) return;

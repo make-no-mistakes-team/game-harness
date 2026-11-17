@@ -46,6 +46,33 @@ test("independent writer publishes real history and resolves a review exactly on
   expect(writer.snapshot()).toMatchObject({ worker_closed: true, active: false, queued: 0 });
 });
 
+test("one real history consumer publishes twelve successive source generations without restarting its writer", async () => {
+  const f = historyFixture();
+  const writer = new ProjectionWriterClient(f.store);
+  const reader = new HistoryReader(f.store.readLocation());
+  const learning = new ImprovementLearning(f.store, reader, writer);
+  try {
+    await learning.ready;
+    let previousGeneration = 0;
+    for (let publication = 1; publication <= 12; publication++) {
+      const desiredThrough = f.store.historySourceHighwater(f.run.run_id);
+      // Returned publications, not delays or concurrent background sweeps,
+      // authorize each next distinct source frontier on the same real owners.
+      await learning.prepareFeedback(f.run.run_id, options());
+      const generation = f.store.historyProjectionGeneration(f.run.run_id)!;
+      expect(generation.generation).toBe(previousGeneration + 1);
+      expect(generation.source_through).toBe(desiredThrough);
+      expect(generation.has_pending).toBe(false);
+      expect(writer.snapshot()).toEqual({ closed: false, worker_closed: false, active: false, queued: 0 });
+      previousGeneration = generation.generation;
+      f.store.event(f.run.run_id, "fixture.publication_returned", "Committed new source after a returned history publication", { publication });
+      expect(f.store.historySourceHighwater(f.run.run_id)).toBeGreaterThan(desiredThrough);
+    }
+    expect(previousGeneration).toBe(12);
+  } finally { await learning.close(); f.close(); }
+  expect(writer.snapshot()).toEqual({ closed: true, worker_closed: true, active: false, queued: 0 });
+}, 30_000);
+
 test("canonical progress and cancellation remain live while the derived writer waits on its own SQLite lock", async () => {
   const f = historyFixture();
   const writer = new ProjectionWriterClient(f.store);

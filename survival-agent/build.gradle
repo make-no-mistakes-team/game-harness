@@ -16,3 +16,13 @@ loom {
 }
 java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
 tasks.withType(JavaCompile).configureEach { options.release = 21 }
+
+dependencies { testImplementation sourceSets.client.output }
+def dryRouteGraphProof = tasks.register('dryRouteGraphProof', JavaExec) {
+    group = 'verification'
+    description = 'Runs the standalone observed dry-route graph behavior proofs.'
+    dependsOn tasks.named('testClasses')
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'io.gameharness.survival.DryRouteGraphProof'
+}
+tasks.named('check') { dependsOn dryRouteGraphProof }

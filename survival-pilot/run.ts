@@ -13,7 +13,9 @@ import { verifySurvival } from "./verify.ts";
 
 const ROOT = path.resolve(import.meta.dir, "..");
 const RUNTIME = path.join(ROOT, "local/runtime");
-const RUNS = path.join(ROOT, "local/survival-pilot/runs");
+const PILOT_LOCAL = path.join(ROOT, "local/survival-pilot");
+const RUNS = path.join(PILOT_LOCAL, "runs");
+const LIVE = path.join(PILOT_LOCAL, "live.json");
 const SERVER_JAR = path.join(RUNTIME, "minecraft/server-1.21.4.jar");
 const PILOT_JAR = path.join(import.meta.dir, "build/libs/survival-pilot-1.0.jar");
 const GOALS = ["wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond"] as const;
@@ -89,6 +91,8 @@ async function isolatedDisplay() {
     const offline = args.some((arg, index) => arg === "-nolisten" && args[index + 1] === "tcp");
     if (running !== expected || args[1] !== display || authIndex < 0 ||
         !offline || await realpath(args[authIndex + 1]!) !== authFile) throw rejected();
+    const authStat = await stat(authFile);
+    if (!authStat.isFile() || authStat.uid !== process.getuid?.() || (authStat.mode & 0o077)) throw rejected();
     return { display, authority: authFile };
   } catch {
     throw rejected();
@@ -294,6 +298,8 @@ async function run(goal: Goal, seconds: number) {
     );
     const progressFile = path.join(dir, "progress.json");
     const video = path.join(dir, "screen.mp4");
+    const live = { run: path.basename(dir), ...display };
+    let declared = false;
     let stage = "declaration";
     let server: Owned | undefined;
     let client: Owned | undefined;
@@ -321,6 +327,9 @@ async function run(goal: Goal, seconds: number) {
         },
         recording: { file: "screen.mp4", size: SIZE, fps: 30, codec: "h264", cursor: true, audio: false },
       });
+      declared = true;
+      await privateJson(LIVE, { ...live, active: true });
+      console.log("Live view: http://127.0.0.1:4379/ (start with `bun run watch:pilot` if needed)");
       await record("declared");
       meter = (async () => {
         while (!signal.aborted) {
@@ -482,6 +491,11 @@ async function run(goal: Goal, seconds: number) {
       ]);
       if (!recorderDrained || settled.some((step) => step.status === "rejected")) {
         result = new Stop("failed", "An owned process could not be drained cleanly.");
+      }
+      if (declared) {
+        await privateJson(LIVE, { ...live, active: false }).catch(() => {
+          result = new Stop("failed", "Could not mark the live view inactive.");
+        });
       }
       measuredBytes = await diskBytes(dir).catch(() => measuredBytes);
       let verification: Awaited<ReturnType<typeof verifySurvival>> | null = null;

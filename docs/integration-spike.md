@@ -1,5 +1,36 @@
 # First integration: Minecraft desktop setup and spike history
 
+## Standalone Survival Pilot
+
+On the `experiment/survival-pilot` branch, a deterministic Fabric client can
+attempt an item goal in a new Normal Survival world. It uses the installed
+Minecraft Java 1.21.4 client and the project's existing server download and
+EULA consent. Sign in with the official Launcher before starting. On Linux it
+also needs Xvfb, xauth, FFmpeg with x11grab and libx264, Bun, and JDK 21.
+
+```sh
+# Select JDK 21 in JAVA_HOME, then run from the checkout root.
+bun run build:pilot
+bun run play:pilot diamond 1800
+```
+
+The final argument is this attempt's wall time in seconds, including startup.
+Other item goals are `wooden_pickaxe`, `stone_pickaxe`, and `iron_pickaxe`.
+The runner prints the private attempt directory. Open `screen.mp4` there to
+watch the actual client, including the inventory pointer. `outcome.json`
+records why the attempt ended. For a diamond win, the live inventory must
+contain a diamond and the saved vanilla statistics must show both ore mined
+and a diamond picked up. The runner checks those statistics after the world
+closes; the player does not receive them.
+
+To watch as it plays, run `bun run watch:pilot` in a second terminal and open
+`http://127.0.0.1:4379/` on the same computer. Leave the tab open between
+attempts. The read-only stream follows the pilot's private display and
+includes its cursor; the local recording continues if you close the tab.
+
+This command makes no model calls and does not accept free-form tasks.
+The desktop application's model-driven path is described below.
+
 GameHarness is a desktop harness intended for many supported games through explicit adapters. This guide covers its first implemented adapter, Minecraft Java: an owned Fabric client/server, authentic video and compact model-authored programs. Other adapters are planned, not delivered automatically. Old Mineflayer/prismarine results below are scoped history and do not certify the native replacement.
 
 The supported slice includes natural-language tasks, bounded model-authored programs, native movement and visible inventory mechanics, retained evidence and safe run closure. A reviewed two-trip task supports a small end-to-end gameplay result; it does not certify every criterion in the broader [playable gate](implementation-mvp.md) or release contract. The [runtime contracts](runtime-contracts.md#current-compact-program-interface) distinguish delivered pure local modules and async bodies from the future async-module/checkpoint interface.

@@ -362,6 +362,8 @@ final class PilotProgress {
     private float lightSurveyYaw;
     private boolean forcedLight;
     private BlockPos darkAttemptFoot;
+    private BlockPos witnessedStairCut;
+    private int witnessedStairCutTick;
 
     PilotProgress(MinecraftClient c, PilotBody body, PilotHands hands, String goal, PilotMemory memory) {
         this.c = c;
@@ -397,8 +399,18 @@ final class PilotProgress {
         if (known.isEmpty()) return true;
         trail.addAll(known);
         int index = trail.lastIndexOf(standing);
+        litIndex = index + 1; // Periodic light counts new steps; darkness can still demand a light immediately.
         if (index + 1 < trail.size()) resumeIndex = index + 1;
         digDirection = c.player.getHorizontalFacing();
+        // A saved camera can be looking at a wall, torch face, or workbench. Recover the
+        // heading of the actual last horizontal leg rather than mining along that camera angle.
+        for (int i = index; i > 0; i--) {
+            BlockPos last = trail.get(i), prior = trail.get(i - 1);
+            if (last.getX() != prior.getX() || last.getZ() != prior.getZ()) {
+                digDirection = directional(Vec3d.ofBottomCenter(last).subtract(Vec3d.ofBottomCenter(prior)));
+                break;
+            }
+        }
         return true;
     }
 
@@ -2781,7 +2793,7 @@ final class PilotProgress {
             digGoal = toward;
         }
         if (forcedLight) {
-            if (shouldLight(true)) return;
+            if (lightStair(current)) return;
             forcedLight = false;
             if (torchPlacedTick != tick) blockedTunnel();
             return;
@@ -2851,6 +2863,41 @@ final class PilotProgress {
         if (current.equals(darkAttemptFoot) || !has(TORCH, 1)) return false;
         darkAttemptFoot = current;
         forcedLight = true;
+        torchAttempt = tick;
+        torchUsed = 0;
+        return true;
+    }
+
+    private boolean lightStair(BlockPos current) {
+        status = "lighting the current stair before cutting further";
+        if (torchUsed != 0) {
+            if (hands.count(TORCH) < torchBefore) {
+                torchAttempt = torchFace = torchUsed = 0;
+                litIndex = trail.size();
+                torchPlacedTick = tick;
+                return false;
+            }
+            if (tick - torchUsed < 8) return true;
+            torchUsed = 0;
+        }
+        if (tick - torchAttempt >= 50 || !has(TORCH, 1)) {
+            torchAttempt = torchFace = 0;
+            return false;
+        }
+        if (!c.player.isOnGround() || !hands.equipForUse(TORCH)) return true;
+        Vec3d point = Vec3d.ofBottomCenter(current).add(
+            0.36 * digDirection.getOffsetX(), -0.06, 0.36 * digDirection.getOffsetZ());
+        body.aim(point);
+        body.sneak();
+        if (!body.aligned(point)) return true;
+        BlockHitResult hit = body.selectedFace();
+        if (hit != null && hit.getSide() == Direction.UP && hit.getBlockPos().equals(current.down())) {
+            // Ground contact proves this support; the rendered outline proves the usable face.
+            if (!c.player.isSneaking()) return true;
+            body.use(hit.getBlockPos(), hit.getSide());
+            torchBefore = hands.count(TORCH);
+            torchUsed = tick;
+        }
         return true;
     }
 
@@ -2919,9 +2966,16 @@ final class PilotProgress {
         double length = c.player.getEyePos().distanceTo(point);
         BlockHitResult hit = perceive(point, length + 0.18);
         if (hit == null) {
+            if (body.clearTerrain(point)) return Dig.CLEAR;
+            if (nextFoot != null && position.equals(witnessedStairCut)
+                    && tick - witnessedStairCutTick <= 3 && body.outlined(position)) {
+                // Missing one render does not make the same vanilla outlined crack go dark.
+                body.mine(position);
+                return Dig.LOOKING;
+            }
             BlockHitResult outline = body.selectedFace();
-            return body.outlined(position) || outline != null && c.player.getEyePos().distanceTo(outline.getPos()) < length
-                ? Dig.DARK : Dig.CLEAR;
+            return outline != null && (outline.getBlockPos().equals(position)
+                || c.player.getEyePos().distanceTo(outline.getPos()) < length) ? Dig.DARK : Dig.LOOKING;
         }
         if (!hit.getBlockPos().equals(position)) {
             if (hit.getBlockPos().equals(lip) && hit.getSide() == Direction.UP && safeSupport(hit)) return Dig.LIP;
@@ -2943,6 +2997,10 @@ final class PilotProgress {
             || state.isOf(Blocks.FURNACE)) return Dig.BLOCKED;
         if (!tools.canHarvest(state)) return Dig.BLOCKED;
         if (!readyForMine(state)) return Dig.LOOKING;
+        if (nextFoot != null) {
+            witnessedStairCut = position;
+            witnessedStairCutTick = tick;
+        }
         body.mine(position);
         return Dig.LOOKING;
     }

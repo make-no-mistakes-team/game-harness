@@ -120,6 +120,67 @@ test("An admitted preset works during a paid request and an equivalent authoriza
   }
 });
 
+test.each(["opportunity", "neutral handoff"] as const)(
+  "A post-receipt %s wakes work planning once after an in-flight abstention", async wake => {
+    const reply = Promise.withResolvers<void>();
+    const requests: MacroRequest[] = [];
+    const survey = { id: "survey-left", verb: "survey", risk: "read", summary: "Survey left", evidence: "Witnessed ground" } as const;
+    const approach = { id: "approach", verb: "approach", risk: "low", summary: "Walk to the adjacent tile", evidence: "Clear dry sweep" } as const;
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 2) return workReply(request, { kind: "opportunity", opportunityId: survey.id });
+      if (requests.length === 3) {
+        await reply.promise;
+        return workReply(request, { kind: "abstain" }, wake === "neutral handoff" ? 80 : 1100);
+      }
+      return workReply(request, { kind: "abstain" });
+    }, undefined, 6);
+    try {
+      await f.observe(10);
+      const job = await f.order();
+      await f.receipt(job.id, 12, "accepted");
+      await f.observe(13);
+      await f.receipt(job.id, 64, "interrupted");
+      const workOrder = { id: job.id, state: "blocked", detail: "No live source" } as const;
+      await f.observe(94, { workOrder, opportunities: [survey] });
+      await f.actor.poll();
+      const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      expect(requests).toHaveLength(2);
+
+      await f.receipt(intent.id, 174, "accepted");
+      await f.receipt(intent.id, 180, "completed");
+      await f.observe(177, { workOrder }); // The journal can outrun observation.json.
+      expect(requests).toHaveLength(2);
+      await f.observe(181, { workOrder });
+      expect(requests[2]).toMatchObject({
+        trigger: "receipt", observation: { tick: 181, opportunities: [], quiescent: false },
+        lastReceipt: { id: intent.id, tick: 180, status: "completed" },
+      });
+
+      const fresh = wake === "opportunity" ? { opportunities: [approach] } : { quiescent: true };
+      await f.observe(262, { workOrder, ...fresh });
+      expect(requests).toHaveLength(3); // Still one inference in flight.
+      reply.resolve();
+      for (let i = 0; i < 4 && requests.length === 3; i++) await f.actor.poll();
+      expect(requests[3]).toMatchObject({ observation: { tick: 262, ...fresh }, lastReceipt: { id: intent.id } });
+
+      await f.receipt(intent.id, 180, "completed"); // Replayed terminal evidence is not a new edge.
+      await f.observe(345, { workOrder, ...fresh });
+      await f.observe(430, { workOrder, ...fresh });
+      expect(requests).toHaveLength(4);
+      expect(f.actor.status()).toMatchObject({
+        requests: 4, providerDispatches: 4, issued: 1, completedReceipts: 1,
+        staleDecisions: wake === "neutral handoff" ? 1 : 0,
+      });
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+    } finally {
+      reply.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
 test("Constrained stages require witnessed input stock and obsolete dispatched inference is still charged", async () => {
   const log = "minecraft:oak_log";
   const action = { kind: "work-program", stages: [{ policy: {

@@ -429,11 +429,15 @@ function guardBand(value: number): number {
   return value <= 0 ? 0 : value <= 6 ? 1 : value <= 12 ? 2 : 3;
 }
 
+function orderedOpportunities(observation: MacroObservation): MacroOpportunity[] {
+  return [...observation.opportunities].sort((a, b) => a.id.localeCompare(b.id));
+}
+
 function evidenceKey(observation: MacroObservation): string {
   return digest([
     observation.life, observation.epoch, observation.goal, guardBand(observation.health), guardBand(observation.food),
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b)),
-    [...observation.opportunities].sort((a, b) => a.id.localeCompare(b.id)),
+    orderedOpportunities(observation), observation.quiescent,
     [...new Set(observation.recent)].sort(),
   ]);
 }
@@ -542,7 +546,8 @@ export class SurvivalMacroController {
   private newestJob?: WorkJob;
   private lastAcceptedJob?: WorkJob;
   private lastJobOutcome?: WorkJob;
-  private workQuery?: { readonly key: string; readonly tick: number; readonly evidence: string };
+  private workQuery?: { readonly key: string; readonly tick: number; readonly evidence: string; abstained?: true };
+  private readonly workHandoffQueries = new Set<string>();
   private floorScope?: { readonly life: number; readonly reserves: readonly MacroStockFloor[] };
   private completedWorkOrders = 0;
   private completedModelWorkOrders = 0;
@@ -867,11 +872,15 @@ export class SurvivalMacroController {
       }
       return;
     }
+    // The journal can retire an effect before observation.json reaches its
+    // terminal tick. Do not spend a decision on a pre-effect view plus its outcome.
+    if (!this.job && current.tick <= this.handoffAfterTick) return;
     if (this.workMode) {
       await this.scheduleWork(this.view!);
       return;
     }
-    if (!this.config.strategist || !alive(current) || (!current.quiescent && !current.opportunities.length)) return;
+    if (!this.config.strategist || !alive(current) || current.safety?.clear === false ||
+        (!current.quiescent && !current.opportunities.length)) return;
     const latest = this.view!;
     if (this.queryKeys.has(latest.query)) {
       if (this.heldQuery !== latest.query && latest.query === this.lastAsked?.query && now - latest.changedAt >= this.limits.stuckAfterMs) {
@@ -1077,8 +1086,20 @@ export class SurvivalMacroController {
       demand = "changed";
       key = evidence;
     }
-    if (previous && (key === previous.key || (!job && demand === "changed" && previous.evidence === evidence) ||
-        (observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew"))) return;
+    if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew") return;
+    const unchanged = previous && (key === previous.key || (!job && demand === "changed" && previous.evidence === evidence));
+    // A durable demand can stay unchanged while an abstention's premise gains
+    // a witnessed option or a neutral handoff. Use the live view after settlement.
+    if (unchanged) {
+      const asked = this.lastAsked?.observation;
+      if (job || !previous.abstained || !asked ||
+          (!(observation.quiescent && !asked.quiescent) && !observation.opportunities.some(offer =>
+            !sameOffer(offer, asked.opportunities.find(prior => prior.id === offer.id))))) return;
+    }
+    const handoffQuery = !job && (observation.quiescent || observation.opportunities.length > 0)
+      ? digest([evidence, observation.quiescent, orderedOpportunities(observation)]) : null;
+    if (unchanged && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
+    if (handoffQuery) this.workHandoffQueries.add(handoffQuery);
     this.workQuery = { key, tick: observation.tick, evidence };
     await this.begin(view, undefined, {
       mode: this.workMode!, demand,
@@ -1259,7 +1280,7 @@ export class SurvivalMacroController {
   private queryKey(observation: MacroObservation, evidence: string): string {
     const receipt = this.lastReceipt;
     const selection = this.config.skills?.selection();
-    return digest([evidence, receipt?.life === observation.life ? [receipt.status, receipt.detail] : null,
+    return digest([evidence, receipt?.life === observation.life ? receipt.id : null,
       selection?.generation ?? null, this.availableCandidates(selection?.generation), this.currentFeedback(observation) ?? null]);
   }
 
@@ -1742,6 +1763,10 @@ export class SurvivalMacroController {
       return;
     }
     if (!proposal || !current || this.closing) return;
+    // An otherwise valid abstention may have outlived its old view. It still
+    // authorized no effect, and must not suppress a newly witnessed decision.
+    if (proposal.action.kind === "abstain" && context.workDemand && this.workQuery &&
+        model && basisMatches && ttlValid && !runtimeExpired && !late) this.workQuery.abstained = true;
     if (disposition !== "proposed") {
       // The provider chose a pure function, not a durable live command. A
       // stale movement premise may still yield bounded independent testing,

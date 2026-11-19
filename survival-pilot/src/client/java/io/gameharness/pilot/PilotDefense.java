@@ -259,7 +259,7 @@ final class PilotDefense {
     }
 
     private boolean workshop(PilotProgress progress, int tick, String recipe, int planks, int sticks) {
-        if (tick < workshopAfter) return false;
+        if (tick < workshopAfter || !progress.defenseBenchAvailable()) return false;
         if (!recipe.equals(workshopRecipe)) {
             workshopRecipe = recipe;
             workshopUntil = tick + 100;

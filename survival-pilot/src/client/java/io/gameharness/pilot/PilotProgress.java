@@ -172,6 +172,8 @@ final class PilotProgress {
     private Resource caveGoal;
     private boolean lavaProspecting, caveLava;
     private BlockPos cavePeek;
+    private BlockPos stalledCaveFoot;
+    private int stalledCaveUntil;
     private int caveLookUntil, caveOpenings, caveFootsteps;
     private final PilotDefense defense;
     private final PilotPortal portal;
@@ -345,6 +347,7 @@ final class PilotProgress {
     private int branchTurns;
     private int failedDirections;
     private int stairLength;
+    private int refitPickCount = -1, refitPickUntil, refitPickRetry;
     private int deadEnds;
     private int returnTo;
     private BlockPos returnDetour;
@@ -556,6 +559,8 @@ final class PilotProgress {
         boolean continuing = caves.active();
         if (!continuing) {
             if (planned == null || digDirection == null) return false;
+            if (tick < stalledCaveUntil && c.player.getBlockPos().getSquaredDistance(stalledCaveFoot) <= 36
+                    && planned.getSquaredDistance(stalledCaveFoot) <= 36) return false;
             caveLava = lavaProspecting;
             caveGoal = sought == Resource.DIAMOND || sought == Resource.IRON || sought == Resource.COAL ? sought
                 : has(DEEP_PICK, 1) ? Resource.DIAMOND : Resource.IRON;
@@ -673,6 +678,7 @@ final class PilotProgress {
             retreatTunnel();
             return;
         }
+        if (refitMinedPick()) return;
         if (caves.active() && surveyCave(null)) return;
         if (fieldBench.packUntil != 0 && fieldBench.pack()) return;
         if (prepareDefense()) return;
@@ -770,6 +776,14 @@ final class PilotProgress {
 
     private void replanStalledLocalWork() {
         surfaceApproach.abandon();
+        if (caves.active() && c.player.isOnGround()) {
+            stalledCaveFoot = c.player.getBlockPos();
+            stalledCaveUntil = tick + 300;
+        }
+        if (refitPickCount >= 0) {
+            refitPickCount = -1;
+            refitPickRetry = tick + 150;
+        }
         if (fieldWood.deepFoot != null) fieldWood.endDeepDeparture();
         if (fieldWood.anchor != null) fieldWood.finish();
         if (fieldIgnition != null && fieldIgnition.active()) fieldIgnition.finish();
@@ -895,6 +909,7 @@ final class PilotProgress {
     private boolean surfaceDeparture() {
         int height = c.player.getBlockY();
         if (departureKit || height <= 48 || resumeIndex >= 0) return false;
+        if (activeTrail() >= 4 && trail.getFirst().getY() - height >= 3) return false;
         if (height < 64 && has(DEEP_PICK, 1) && (has(RAW_IRON, 1) || has(STONE, 32))) return false;
         return !has(DEEP_PICK, 1) || trail.size() < 2
             || trail.size() < 8 && trail.getFirst().getY() - height < 3;
@@ -942,9 +957,11 @@ final class PilotProgress {
         // Break up to three blocks per stair step. Budget the next lit leg and
         // leave uses for exposed ore, but don't require an entire second kit.
         int litLeg = Math.min(nextLeg, 7 * Math.max(1, torches - 1));
-        if (remaining < 3 * litLeg + 4 && has(STONE, 3) && affordsWood(localTableWood(), 2)) {
-            requestTable("stone_pickaxe", null, 0, 2);
-            return true;
+        if (remaining < 3 * litLeg + 4 && tick >= refitPickRetry
+                && has(STONE, 3) && affordsWood(localTableWood(), 2)) {
+            refitPickCount = hands.count(STONE_PICK);
+            refitPickUntil = tick + 230;
+            return refitMinedPick();
         }
         if (remaining < 4 || depth == DIAMOND_LEVEL && deepUses <= 1 && stoneUses < 4) {
             if (has(STONE, 3)) makePick("stone_pickaxe", STONE, 3);
@@ -954,6 +971,18 @@ final class PilotProgress {
         }
         if (departure) departureKit = true;
         return false;
+    }
+
+    private boolean refitMinedPick() {
+        if (refitPickCount < 0) return false;
+        if (hands.count(STONE_PICK) > refitPickCount || tick >= refitPickUntil || !has(STONE, 3)
+                || !affordsWood(localTableWood(), 2)) {
+            refitPickCount = -1;
+            refitPickRetry = tick + 150;
+            return false;
+        }
+        requestTable("stone_pickaxe", null, 0, 2);
+        return true;
     }
 
     private boolean handleScreen() {
@@ -1387,6 +1416,17 @@ final class PilotProgress {
 
     void requestTable(String recipe, String extra, int planks, int sticks) {
         requestTable(recipe, extra, null, planks, sticks);
+    }
+
+    /** Optional kit work can use a local bench, but cannot interrupt the mine to create one. */
+    boolean defenseBenchAvailable() {
+        BlockHitResult bench = body.find(state -> state.isOf(table.block), REACH - 0.5).orElse(null);
+        if (bench == null) return false;
+        if (!bench.getBlockPos().equals(table.position)) {
+            table.position = confirmStation(table, bench);
+            table.approachUntil = table.openAttempts = 0;
+        }
+        return true;
     }
 
     private void requestTable(String recipe, String extra, String axe, int planks, int sticks) {
@@ -3744,7 +3784,14 @@ final class PilotProgress {
             if (!nextFoot.equals(cavePeek)) {
                 cavePeek = nextFoot;
                 caveLookUntil = tick + 16;
-            } else blockedTunnel();
+            } else {
+                if (current.getY() > depth) {
+                    // This open column had no reachable top at the planned or nearby heights.
+                    // Let the next attempt face a different column instead of the same void one block up.
+                    failedDirections |= 1;
+                }
+                blockedTunnel();
+            }
         }
     }
 
@@ -3858,6 +3905,13 @@ final class PilotProgress {
         boolean descending = current.getY() > depth;
         boolean landing = descending && stairLength >= 9;
         int choices = descending ? 8 : 4;
+        if (!descending && toward == null && failedDirections >= 2 && trail.size() > 4
+                && trail.get(trail.size() - 4).getY() >= current.getY()) {
+            // A failed forward leg and its first alternative are enough in a mine.
+            // Rejoin a real earlier junction before trying another direction; do not
+            // sweep all walls from the same unusable footing.
+            failedDirections = choices;
+        }
         for (; failedDirections < choices; failedDirections++) {
             int side = descending ? failedDirections / 2 : failedDirections;
             digDirection = switch (side) {
@@ -4122,6 +4176,7 @@ final class PilotProgress {
         if (keepTrail) {
             resumeIndex = index + 1;
             resumeStep = -1;
+            if (refitPickCount >= 0) refitPickUntil = tick + 180;
             supplyExcursion.reset();
         } else if (index > 0) {
             closeDig(trail.get(index + 1));

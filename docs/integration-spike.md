@@ -41,6 +41,13 @@ From the terminal, put the strategy options before the goal:
 bun run play:agent --strategy terra --macro-requests 8 --task 'Choose your next subgoal from what you can see.' diamond 360
 ```
 
+When you select Terra, one of those requests may run during world loading.
+It receives the task and a description of available actions, without a game
+frame or an assumed inventory. The player cannot use the conditional plan
+until a real observation satisfies its requirements. A rejected plan or a
+failed startup can still use that request. Pass `--startup off` before the
+goal to wait for the first observation before making a paid call.
+
 Here Terra can make eight requests during a 360-second attempt. While it
 thinks, the local player can continue an authorized job. For example, an
 order can request a stock of planks and protect the last log. The player

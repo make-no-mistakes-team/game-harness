@@ -122,7 +122,7 @@ public final class PilotClient implements ClientModInitializer {
             body.finish();
         }
         boolean won = alive && progress.won() && !hands.busy() && client.currentScreen == null && renderedScreen == null;
-        if (won || !alive) { hands.cancel(); body.release(); ended = true; }
+        if (won || !alive || progress.failure() != null) { hands.cancel(); body.release(); ended = true; }
         String status = !alive ? "dead" : fleeing ? "evading a primed creeper" : progress.status();
         String handStatus = hands.status();
         boolean changed = screenChanged || !status.equals(lastStatus) || !handStatus.equals(lastHands);
@@ -135,6 +135,7 @@ public final class PilotClient implements ClientModInitializer {
             event.addProperty("goal", goal);
             event.addProperty("alive", alive);
             event.addProperty("won", won);
+            if (progress.failure() != null) event.addProperty("failure", progress.failure());
             event.addProperty("health", client.player.getHealth());
             event.addProperty("x", client.player.getX());
             event.addProperty("y", client.player.getY());

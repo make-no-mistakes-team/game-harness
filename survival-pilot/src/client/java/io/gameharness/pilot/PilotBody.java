@@ -234,6 +234,13 @@ final class PilotBody {
             && hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(pos);
     }
 
+    /** Geometry under the actual vanilla crosshair; exposes no block identity in darkness. */
+    BlockHitResult selectedFace() {
+        return hasView() && renderedCrosshair instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK
+            && currentCrosshair() instanceof BlockHitResult now && now.getType() == HitResult.Type.BLOCK
+            && now.getBlockPos().equals(hit.getBlockPos()) && now.getSide() == hit.getSide() ? now : null;
+    }
+
     void release() {
         resetIntentions();
         steering = false;
@@ -354,6 +361,31 @@ final class PilotBody {
             }
         }
         return Optional.ofNullable(best);
+    }
+
+    /** Pick a face from the current view, not a square found by probing the surrounding world. */
+    BlockHitResult stationFace(BlockPos rejected) {
+        if (!hasView()) return null;
+        if (sampleCount == 0) sampleView(4.25);
+        BlockHitResult best = null;
+        double cost = Double.POSITIVE_INFINITY;
+        var player = client.player;
+        for (int i = -1; i < sampleCount; i++) {
+            var hit = i < 0 ? selectedFace() : samples[i];
+            if (hit == null || hit.getSide() == Direction.DOWN) continue;
+            var dest = hit.getBlockPos().offset(hit.getSide());
+            int dy = dest.getY() - player.getBlockY();
+            if (dy < -1 || dy > 1 || dest.equals(rejected) || player.getBoundingBox().intersects(new Box(dest))) continue;
+            double d = eye.squaredDistanceTo(hit.getPos());
+            if (d > 4.15 * 4.15) continue;
+            if (i >= 0) {
+                var state = client.world.getBlockState(hit.getBlockPos());
+                if (state.isReplaceable() || !state.getFluidState().isEmpty()) continue;
+            }
+            double score = d + (hit.getSide() == Direction.UP ? 0 : 3) + Math.abs(dy) * 2;
+            if (score < cost) { cost = score; best = hit; }
+        }
+        return best;
     }
 
     private void sampleView(double distance) {

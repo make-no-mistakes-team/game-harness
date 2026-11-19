@@ -84,6 +84,14 @@ final class AgentBody {
         boolean allowsOutline() { return this == RIM || this == BUCKET || this == OUTLINE; }
     }
 
+    enum Preparation {
+        READY(null), EQUIPMENT("awaiting_equipment"), RECEIPT("awaiting_receipt"), STANCE("awaiting_stance");
+
+        final String waitReason;
+        Preparation(String waitReason) { this.waitReason = waitReason; }
+        static Preparation equipment(boolean ready) { return ready ? READY : EQUIPMENT; }
+    }
+
     record ContactEvidence(int tick, long frame, long wallMs, String action, String status,
                            BlockPos pos, Direction side, double u, double v, double degreesPerSecond,
                            int dwellTicks, long dwellMs) {}
@@ -1123,6 +1131,11 @@ final class AgentBody {
     }
 
     boolean useContact(BlockHitResult witness, Contact mode) {
+        return useContact(witness, mode, Preparation.READY);
+    }
+
+    /** Observe the same contact during preparation, but only READY may emit a use edge. */
+    boolean useContact(BlockHitResult witness, Contact mode, Preparation preparation) {
         if (!prepareContact(witness, mode)) return false;
         String problem = contactProblem(true);
         if (problem == null && mode == Contact.BUCKET) {
@@ -1130,6 +1143,7 @@ final class AgentBody {
             BlockHitResult hit = itemRay(RaycastContext.FluidHandling.NONE);
             if (!contact.admits(hit) || !inView(hit.getPos()) || !litFace(hit)) problem = "ray_disagree";
         }
+        if (problem == null) problem = useReadiness(preparation, mode != Contact.INTERACT);
         if (problem == null && !pulseContactUse()) problem = "input_refused";
         reportContact(problem == null ? "issued" : problem);
         return problem == null;
@@ -1140,11 +1154,25 @@ final class AgentBody {
         if (contactTick == tick && firstValidNanos != 0) reportContact(reason);
     }
 
+    void awaitingContactEquipment() {
+        if (contactTick == tick && contactProblem(false) == null)
+            reportContact(Preparation.EQUIPMENT.waitReason);
+    }
+
     private boolean pulseContactUse() {
         if (tick == lastContactUse || controlledBoat != null || !fallUseReady() || !pressKey(client.options.useKey))
             return false;
         lastContactUse = tick;
         return true;
+    }
+
+    private String useReadiness(Preparation preparation, boolean usesMainHandItem) {
+        if (preparation.waitReason != null) return preparation.waitReason;
+        var player = client.player;
+        ItemStack main = player.getMainHandStack();
+        // Fresh key edges do not inherit vanilla's held-use repeat interval.
+        return usesMainHandItem && !main.isEmpty() && player.getItemCooldownManager().isCoolingDown(main)
+            ? "item_cooldown" : null;
     }
 
     void walk(boolean sprint) {
@@ -1350,10 +1378,14 @@ final class AgentBody {
 
     void wearArmor(Item item) { armor = item; }
 
-    boolean useWaterSource(BlockPos target, Vec3d witness) { return useSource(target, witness, false); }
-    boolean useLavaSource(BlockPos target, Vec3d witness) { return useSource(target, witness, true); }
+    boolean useWaterSource(BlockPos target, Vec3d witness, Preparation preparation) {
+        return useSource(target, witness, false, preparation);
+    }
+    boolean useLavaSource(BlockPos target, Vec3d witness, Preparation preparation) {
+        return useSource(target, witness, true, preparation);
+    }
 
-    private boolean useSource(BlockPos target, Vec3d witness, boolean lava) {
+    private boolean useSource(BlockPos target, Vec3d witness, boolean lava, Preparation preparation) {
         if (!hasView()) return false;
         var player = client.player;
         double reach = player.getBlockInteractionRange();
@@ -1383,9 +1415,8 @@ final class AgentBody {
         }
         sourceTick = tick;
         aimRegion(sourceContact, sourcePoint, true);
-        if (!fallUseReady() || !player.getMainHandStack().isOf(Items.BUCKET)
-                || renderedCrosshair instanceof EntityHitResult || currentCrosshair() instanceof EntityHitResult)
-            return reportSource(lava, "input_refused", null);
+        if (renderedCrosshair instanceof EntityHitResult || currentCrosshair() instanceof EntityHitResult)
+            return reportSource(lava, "vetoed", null);
         BlockHitResult seen = visibleSourceFromCamera(eye.add(player.getRotationVector(observedPitch, observedYaw)
             .multiply(reach)));
         BlockHitResult actual = itemRay(RaycastContext.FluidHandling.SOURCE_ONLY);
@@ -1404,6 +1435,10 @@ final class AgentBody {
         }
         if (!predictedContact(sourceContact, Contact.BUCKET.predictionSeconds))
             return reportSource(lava, "latency_veto", actual);
+        String problem = useReadiness(preparation, true);
+        if (problem != null) return reportSource(lava, problem, actual);
+        if (!player.getMainHandStack().isOf(Items.BUCKET))
+            return reportSource(lava, "awaiting_equipment", actual);
         return reportSource(lava, pulseContactUse() ? "issued" : "input_refused", actual);
     }
 

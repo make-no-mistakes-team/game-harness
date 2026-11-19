@@ -671,12 +671,13 @@ final class AgentCaves {
             return true;
         }
         if (tick - phaseSince >= 42) return alternatives(tick);
-        body.aim(fill.getPos());
+        body.aimFine(fill.getPos());
+        AgentBody.Preparation readiness = lastAction != 0 && tick - lastAction < 7
+            ? AgentBody.Preparation.RECEIPT : AgentBody.Preparation.equipment(hands.equipForUse(BUCKET));
         BlockHitResult hit = observe(fill.getPos());
-        if ((lastAction == 0 || tick - lastAction >= 7)
-            && hit != null && hit.getBlockPos().equals(fill.getBlockPos())
-            && state(hit).getFluidState().isIn(FluidTags.WATER) && hands.equipForUse(BUCKET)
-            && body.useWaterSource(hit.getBlockPos(), hit.getPos())) {
+        if (hit != null && hit.getBlockPos().equals(fill.getBlockPos())
+            && state(hit).getFluidState().isIn(FluidTags.WATER)
+            && body.useWaterSource(hit.getBlockPos(), hit.getPos(), readiness)) {
             lastAction = tick;
         }
         return true;
@@ -714,9 +715,10 @@ final class AgentCaves {
         if (hands.count(WATER) >= before || tick - phaseSince >= 36) return alternatives(tick);
         BlockPos source = plannedWater.source;
         Vec3d point = offset(Vec3d.ofCenter(source, 0.62), plannedWater.approach, -0.25);
-        body.aim(point);
-        if ((lastAction == 0 || tick - lastAction >= 8)
-            && waterHit(source, point, true) && hands.equipForUse(BUCKET) && body.useWaterSource(source, point)) {
+        body.aimFine(point);
+        AgentBody.Preparation readiness = lastAction != 0 && tick - lastAction < 8
+            ? AgentBody.Preparation.RECEIPT : AgentBody.Preparation.equipment(hands.equipForUse(BUCKET));
+        if (waterHit(source, point, true) && body.useWaterSource(source, point, readiness)) {
             lastAction = tick;
         }
         return true;
@@ -857,16 +859,19 @@ final class AgentCaves {
 
     private boolean useFace(BlockHitResult face, Predicate<ItemStack> item) {
         if (face == null) return false;
+        AgentBody.Preparation readiness = AgentBody.Preparation.equipment(hands.equipForUse(item));
         Vec3d point = face.getPos().lerp(Vec3d.ofCenter(face.getBlockPos()), 0.04);
         BlockHitResult observed = observe(point);
         if (!matches(face, observed) || !solid(state(observed))) {
-            body.aim(point);
+            body.aimFine(point);
             return false;
         }
         AgentBody.Contact mode = item == WATER ? AgentBody.Contact.BUCKET : AgentBody.Contact.PRECISE;
         body.aimContact(observed, mode);
         body.sneak();
-        return player.isSneaking() && hands.equipForUse(item) && body.useContact(observed, mode);
+        if (readiness == AgentBody.Preparation.READY && !player.isSneaking())
+            readiness = AgentBody.Preparation.STANCE;
+        return body.useContact(observed, mode, readiness);
     }
 
     private static boolean matches(BlockHitResult a, BlockHitResult b) {

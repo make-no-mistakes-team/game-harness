@@ -476,6 +476,7 @@ final class AgentPortal {
             }
             water = new Target(hit);
             fluidSince = tick;
+            nextFluidUse = 0;
         }
         if (tick - fluidSince > 270 || client.player.getEyePos().distanceTo(water.point) > 4
                 && !progress.portalApproach(water.point)) {
@@ -486,6 +487,7 @@ final class AgentPortal {
         if (client.player.getEyePos().distanceTo(water.point) > 4) return;
         status = "filling the bucket from observed source water";
         body.aimFine(water.point);
+        AgentBody.Preparation readiness = fluidPreparation(BUCKET);
         BlockHitResult hit = observed(water.point);
         if (hit == null || !hit.getBlockPos().equals(water.pos) || !waterSource(state(hit))) {
             if (!body.aligned(water.point)) return;
@@ -493,7 +495,7 @@ final class AgentPortal {
             water = null;
             return;
         }
-        if (tick >= nextFluidUse && hands.equipForUse(BUCKET) && body.useWaterSource(water.pos, water.point))
+        if (body.useWaterSource(water.pos, water.point, readiness))
             nextFluidUse = tick + 6;
     }
 
@@ -539,14 +541,15 @@ final class AgentPortal {
                 if (tick - fluidSince > 60) forgetLava();
                 return;
             }
+            nextFluidUse = 0;
         }
         status = "pouring water from shore onto the observed lava";
         BlockPos support = waterSupport.getBlockPos();
         Direction face = waterSupport.getSide();
         body.aimContact(waterSupport, AgentBody.Contact.BUCKET);
-        if (tick >= nextFluidUse && hands.equipForUse(WATER_BUCKET)
-                && supportFace(support, face, waterSupport.getPos()) != null
-                && body.useContact(waterSupport, AgentBody.Contact.BUCKET)) {
+        AgentBody.Preparation readiness = fluidPreparation(WATER_BUCKET);
+        if (supportFace(support, face, waterSupport.getPos()) != null
+                && body.useContact(waterSupport, AgentBody.Contact.BUCKET, readiness)) {
             pouredAt = tick;
             waterBeforePour = hands.count(WATER_BUCKET);
             bucketsBeforePour = hands.count(BUCKET);
@@ -595,16 +598,22 @@ final class AgentPortal {
         if (reclaimSince == 0) {
             reclaimSince = tick;
             waterBeforeReclaim = hands.count(WATER_BUCKET);
+            nextFluidUse = 0;
         }
         status = "recovering the poured water after cooling lava";
         body.aimFine(pouredWater.point);
+        AgentBody.Preparation readiness = fluidPreparation(BUCKET);
         BlockHitResult hit = observed(pouredWater.point);
-        if (tick >= nextFluidUse && hit != null && hit.getBlockPos().equals(pouredWater.pos)
-                && waterSource(state(hit)) && hands.equipForUse(BUCKET)
-                && body.useWaterSource(pouredWater.pos, pouredWater.point)) {
+        if (hit != null && hit.getBlockPos().equals(pouredWater.pos) && waterSource(state(hit))
+                && body.useWaterSource(pouredWater.pos, pouredWater.point, readiness)) {
             nextFluidUse = tick + 6;
         }
         return true;
+    }
+
+    private AgentBody.Preparation fluidPreparation(Predicate<ItemStack> item) {
+        return tick < nextFluidUse ? AgentBody.Preparation.RECEIPT
+            : AgentBody.Preparation.equipment(hands.equipForUse(item));
     }
 
     private void survey(AgentProgress progress) {
@@ -773,6 +782,8 @@ final class AgentPortal {
         }
         Vec3d point = jump ? new Vec3d(client.player.getX(), work.support.getY() + 0.98, client.player.getZ())
             : work.point;
+        AgentBody.Preparation readiness = work.used != 0 && now - work.used < 6
+            ? AgentBody.Preparation.RECEIPT : AgentBody.Preparation.equipment(hands.equipForUse(work.item));
         BlockHitResult support = supportFace(work.support, work.face, point);
         if (jump) body.aimFixed(point);
         if (support == null) {
@@ -781,22 +792,20 @@ final class AgentPortal {
         }
         AgentBody.Contact contact = jump ? AgentBody.Contact.PRECISE : AgentBody.Contact.PLACE;
         boolean ready = body.aimContact(support, contact);
-        if (!hands.equipForUse(work.item)) return Placement.WAIT;
         if (client.player.getBoundingBox().intersects(new Box(work.dest))) {
             body.vetoContact("collision_veto");
-            if (jump && ready && client.player.isOnGround() && now - work.used >= 6) body.jump();
+            if (jump && ready && client.player.isOnGround() && readiness == AgentBody.Preparation.READY) body.jump();
             return Placement.WAIT;
         }
-        if (now - work.used >= 6) {
-            // Sneak when interacting with blocks that could have their own use action.
-            if (!jump) {
-                body.sneak();
-                if (!client.player.isSneaking()) return Placement.WAIT;
-            }
-            if (body.useContact(support, contact)) {
-                work.inventoryBefore = hands.count(work.item);
-                work.used = now;
-            }
+        // Sneak when interacting with blocks that could have their own use action.
+        if (!jump) {
+            body.sneak();
+            if (readiness == AgentBody.Preparation.READY && !client.player.isSneaking())
+                readiness = AgentBody.Preparation.STANCE;
+        }
+        if (body.useContact(support, contact, readiness)) {
+            work.inventoryBefore = hands.count(work.item);
+            work.used = now;
         }
         return Placement.WAIT;
     }

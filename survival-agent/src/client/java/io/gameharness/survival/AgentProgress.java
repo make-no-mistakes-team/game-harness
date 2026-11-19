@@ -184,7 +184,7 @@ final class AgentProgress {
     private final AgentFall fall;
     private BlockHitResult fieldWater;
     private Vec3d fieldWaterPoint;
-    private int fieldWaterUntil, waterRetry;
+    private int fieldWaterUntil, fieldWaterUsed, waterRetry;
     private Resource caveGoal;
     private boolean lavaProspecting, caveLava;
     private BlockPos cavePeek;
@@ -1541,6 +1541,7 @@ final class AgentProgress {
             }
             fieldWaterPoint = inward(fieldWater);
             fieldWaterUntil = tick + 48;
+            fieldWaterUsed = 0;
         }
         if (tick > fieldWaterUntil
             || c.player.getEyePos().squaredDistanceTo(fieldWater.getPos()) > REACH * REACH) {
@@ -1549,14 +1550,15 @@ final class AgentProgress {
             return false;
         }
         status = "filling the field bucket from visible water";
-        if (!hands.equipForUse(EMPTY_BUCKET)) return true;
         BlockPos source = fieldWater.getBlockPos();
-        body.aim(fieldWaterPoint);
+        body.aimFine(fieldWaterPoint);
+        AgentBody.Preparation readiness = fieldWaterUsed != 0 && tick - fieldWaterUsed < 7
+            ? AgentBody.Preparation.RECEIPT : AgentBody.Preparation.equipment(hands.equipForUse(EMPTY_BUCKET));
         BlockHitResult current = perceive(fieldWaterPoint, REACH);
         if (current != null) {
-            if (source.equals(current.getBlockPos()) && isWaterSource(current))
-                body.useWaterSource(source, fieldWaterPoint);
-            else if (body.aligned(fieldWaterPoint)) {
+            if (source.equals(current.getBlockPos()) && isWaterSource(current)) {
+                if (body.useWaterSource(source, fieldWaterPoint, readiness)) fieldWaterUsed = tick;
+            } else if (readiness != AgentBody.Preparation.RECEIPT && body.aligned(fieldWaterPoint)) {
                 fieldWater = null;
                 waterRetry = tick + 100;
                 return false;
@@ -2108,7 +2110,13 @@ final class AgentProgress {
                     station.underfoot = station.position = null;
                     station.placed = 0;
                     return;
-                } else return;
+                } else {
+                    BlockHitResult placed = perceive(center, REACH);
+                    if (placed != null && placed.getBlockPos().equals(station.position)
+                            && state(placed).isOf(station.block))
+                        body.useContact(placed, AgentBody.Contact.INTERACT, AgentBody.Preparation.RECEIPT);
+                    return;
+                }
             }
             if (distance > 3.75 || tick < station.approachUntil) {
                 if (approach(center, false, false) == Walk.BLOCKED) {
@@ -2126,8 +2134,9 @@ final class AgentProgress {
                 hit -> hit.getBlockPos().equals(station.position)).orElse(null);
             if (seen != null) {
                 confirmStation(station, seen);
-                body.aimContact(seen, AgentBody.Contact.INTERACT);
-                if (tick - station.opened > 7 && body.useContact(seen, AgentBody.Contact.INTERACT)) {
+                AgentBody.Preparation readiness = station.opened != 0 && tick - station.opened <= 7
+                    ? AgentBody.Preparation.RECEIPT : AgentBody.Preparation.READY;
+                if (body.useContact(seen, AgentBody.Contact.INTERACT, readiness)) {
                     station.opened = tick;
                     station.lastUse = seen.getBlockPos();
                     station.openAttempts++;
@@ -2191,9 +2200,11 @@ final class AgentProgress {
                 station.face = null;
                 return;
             }
-            if (!hands.equipForUse(station.item) || !c.player.isSneaking()) return;
+            AgentBody.Preparation readiness = AgentBody.Preparation.equipment(hands.equipForUse(station.item));
+            if (readiness == AgentBody.Preparation.READY && !c.player.isSneaking())
+                readiness = AgentBody.Preparation.STANCE;
             if (ready) {
-                pressPlace(station, face, AgentBody.Contact.PLACE);
+                pressPlace(station, face, AgentBody.Contact.PLACE, readiness);
             } else if (body.aligned(face.getPos())) {
                 BlockHitResult seen = perceive(inward(face), REACH);
                 if (seen != null && seen.getBlockPos().equals(face.getBlockPos()) && seen.getSide() == face.getSide())
@@ -2226,11 +2237,11 @@ final class AgentProgress {
             if (has(TORCH, 1) && tick - station.stageSince <= 45) {
                 if (station.lampUsed == 0) {
                     body.aim(reflected);
+                    AgentBody.Preparation readiness = AgentBody.Preparation.equipment(hands.equipForUse(TORCH));
                     if (!body.aligned(reflected)) return;
                     var face = body.selectedFace();
                     if (face != null && face.getSide() != Direction.DOWN) {
-                        if (!hands.equipForUse(TORCH)) return;
-                        if (body.useContact(face, AgentBody.Contact.OUTLINE)) {
+                        if (body.useContact(face, AgentBody.Contact.OUTLINE, readiness)) {
                             station.lampBefore = hands.count(TORCH);
                             station.lampUsed = tick;
                         }
@@ -2253,14 +2264,14 @@ final class AgentProgress {
         }
         if (station.stage == 3) {
             status = "placing " + station.recipe + " in the recess";
-            if (!hands.equipForUse(station.item)) return;
+            AgentBody.Preparation readiness = AgentBody.Preparation.equipment(hands.equipForUse(station.item));
             boolean floor = tick - station.stageSince >= 14;
             Vec3d center = Vec3d.ofCenter(station.niche);
             Vec3d aim = floor ? center.add(0, -0.52, 0) : center;
             var hit = perceive(aim, REACH);
             if (hit != null && hit.getBlockPos().offset(hit.getSide()).equals(station.niche)
                     && offWorkshopPassage(station.niche)) {
-                if (pressPlace(station, hit, AgentBody.Contact.PLACE)) return;
+                if (pressPlace(station, hit, AgentBody.Contact.PLACE, readiness)) return;
             } else {
                 body.aim(aim);
             }
@@ -2276,7 +2287,7 @@ final class AgentProgress {
         }
         // A shaft may have no side face outside our body. Vanilla permits jump-placing on the
         // floor we stand on; the real player must rise completely above the destination first.
-        if (!hands.equipForUse(station.item)) return;
+        AgentBody.Preparation readiness = AgentBody.Preparation.equipment(hands.equipForUse(station.item));
         if (station.underfoot == null) {
             if (!c.player.isOnGround()) return;
             station.underfoot = c.player.getBlockPos().down();
@@ -2287,9 +2298,11 @@ final class AgentProgress {
         var actual = body.selectedFace();
         if (actual == null || actual.getSide() != Direction.UP || !actual.getBlockPos().equals(base)) return;
         status = "jump-placing " + station.recipe;
-        if (c.player.getBoundingBox().intersects(new Box(base.up()))) body.jump();
+        if (c.player.getBoundingBox().intersects(new Box(base.up()))) {
+            if (readiness == AgentBody.Preparation.READY) body.jump();
+        }
         else pressPlace(station, actual, body.observedFaceLight(actual) > 0
-            ? AgentBody.Contact.PRECISE : AgentBody.Contact.OUTLINE);
+            ? AgentBody.Contact.PRECISE : AgentBody.Contact.OUTLINE, readiness);
     }
 
     private boolean offWorkshopPassage(BlockPos destination) {
@@ -2314,9 +2327,11 @@ final class AgentProgress {
         return true;
     }
 
-    private boolean pressPlace(Station station, BlockHitResult support, AgentBody.Contact mode) {
+    private boolean pressPlace(Station station, BlockHitResult support, AgentBody.Contact mode,
+                               AgentBody.Preparation readiness) {
         BlockPos dest = support.getBlockPos().offset(support.getSide());
-        if (c.player.getBoundingBox().intersects(new Box(dest)) || !body.useContact(support, mode)) return false;
+        if (c.player.getBoundingBox().intersects(new Box(dest)) || !body.useContact(support, mode, readiness))
+            return false;
         if (station == table) {
             // A bench can hang from a wall. Record a real catch floor while the
             // destination is still empty, not after its dropped item falls away.
@@ -3410,10 +3425,12 @@ final class AgentProgress {
                     return;
                 }
                 boolean ready = body.aimContact(hit, AgentBody.Contact.MINE);
-                if (readyForMine(material) && body.mine(hit)) {
+                boolean toolReady = readyForMine(material);
+                if (toolReady && body.mine(hit)) {
                     timberAttackWitnessTick = tick;
                     attackTimber(false);
                 } else if (!ready) stopUnalignedTimber();
+                else if (!toolReady) body.awaitingContactEquipment();
                 return;
             }
         }
@@ -3526,7 +3543,10 @@ final class AgentProgress {
             return;
         }
         body.aimContact(hit, AgentBody.Contact.MINE);
-        if (!readyForMine(material)) return;
+        if (!readyForMine(material)) {
+            body.awaitingContactEquipment();
+            return;
+        }
         // An exposed block can also support a step of the escape route.
         if (lastMining == 0 && supportsTrail(target)) {
             abandonTarget();

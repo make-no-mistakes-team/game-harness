@@ -131,7 +131,6 @@ final class AgentShoreCast {
     private int faceMissSince;
     private int pickupSince;
     private int usedAt;
-    private int nextUse;
     private int fullBefore;
     private int emptyBefore;
     private int scoopReceipts;
@@ -250,6 +249,7 @@ final class AgentShoreCast {
             }
             case BASE_WATER -> {
                 status = "placing water against the temporary block";
+                if (usedAt == 0) hands.equipForUse(WATER);
                 if (usedAt == 0 && !initialWaterCell()) return;
                 if (pourWater(at(BASE_WATER), layout.across().getOpposite())) {
                     coveredAt = tick;
@@ -732,25 +732,26 @@ final class AgentShoreCast {
     private void useSource(Source source, boolean lava) {
         expect(source.pos, lava ? "targeted source-only lava bucket ray" : "targeted source-only water bucket ray");
         body.aimFine(source.point);
+        AgentBody.Preparation readiness = usePreparation(BUCKET, 7);
         BlockHitResult hit = fluid(source.point, REACH);
         observe(hit);
         boolean exact = matches(hit, source.pos) && (lava ? lavaSource(state(hit)) : waterSource(state(hit)));
         // Flowing water can obscure another water block in the perception ray. The actual
         // bucket key is still accepted only by AgentBody's current exact SOURCE_ONLY ray.
         if (!exact && (lava || !body.visibleWaterAt(source.point, REACH))) return;
-        if (tick < nextUse || !equipped(BUCKET)) return;
-        int full = usedAt == 0 ? count(lava ? LAVA : WATER) : fullBefore;
-        int empty = usedAt == 0 ? count(BUCKET) : emptyBefore;
-        if (!(lava ? body.useLavaSource(source.pos, source.point) : body.useWaterSource(source.pos, source.point))) return;
-        fullBefore = full;
-        emptyBefore = empty;
+        if (!(lava ? body.useLavaSource(source.pos, source.point, readiness)
+                : body.useWaterSource(source.pos, source.point, readiness))) return;
+        if (usedAt == 0) {
+            fullBefore = count(lava ? LAVA : WATER);
+            emptyBefore = count(BUCKET);
+        }
         usedAt = tick;
-        nextUse = tick + 7;
     }
 
     private void useAgainst(BlockPos dest, Direction face, Predicate<ItemStack> contents) {
         BlockPos support = dest.offset(face.getOpposite());
         expect(dest, "vanilla " + face + " face of " + support + " for bucket placement");
+        AgentBody.Preparation readiness = usePreparation(contents, 21);
         BlockHitResult hit = workFace(support, face, true);
         if (hit == null) return;
         body.aimContact(hit, AgentBody.Contact.BUCKET);
@@ -759,14 +760,10 @@ final class AgentShoreCast {
             body.vetoContact("collision_veto");
             return;
         }
-        if (tick < nextUse || !equipped(contents)) return;
-        int full = count(contents);
-        int empty = count(BUCKET);
-        if (!body.useContact(hit, AgentBody.Contact.BUCKET)) return;
-        fullBefore = full;
-        emptyBefore = empty;
+        if (!body.useContact(hit, AgentBody.Contact.BUCKET, readiness)) return;
+        fullBefore = count(contents);
+        emptyBefore = count(BUCKET);
         usedAt = tick;
-        nextUse = tick + 21;
     }
 
     private boolean place(BlockPos dest, Direction face, boolean leap, boolean lavaOutline) {
@@ -791,28 +788,25 @@ final class AgentShoreCast {
             witness(dest, "placed compact support");
             return true;
         }
-        if (usedAt != 0 && tick < nextUse) return false;
+        Predicate<ItemStack> filler = item(work.item);
+        AgentBody.Preparation readiness = usePreparation(filler, 21);
         expect(dest, "visible vanilla " + work.face + " placement face " + work.support);
-        BlockHitResult hit = work.leap ? leapingFace(work) : workFace(work.support, work.face, work.lavaOutline);
+        BlockHitResult hit = work.leap ? leapingFace(work, readiness) : workFace(work.support, work.face, work.lavaOutline);
         AgentBody.Contact mode = work.leap ? AgentBody.Contact.LEAP_PLACE
             : work.lavaOutline ? AgentBody.Contact.RIM : AgentBody.Contact.PLACE;
-        if (hit == null || tick < nextUse) return false;
+        if (hit == null) return false;
         body.aimContact(hit, mode);
         if (client.player.getBoundingBox().intersects(new Box(dest))) {
             body.vetoContact("collision_veto");
             return false;
         }
-        Predicate<ItemStack> filler = item(work.item);
-        if (!equipped(filler)) return false;
-        int before = count(filler);
-        if (!body.useContact(hit, mode)) return false;
-        fullBefore = before;
+        if (!body.useContact(hit, mode, readiness)) return false;
+        fullBefore = count(filler);
         usedAt = tick;
-        nextUse = tick + 21;
         return false;
     }
 
-    private BlockHitResult leapingFace(Placement work) {
+    private BlockHitResult leapingFace(Placement work, AgentBody.Preparation readiness) {
         var player = client.player;
         boolean grounded = player.isOnGround();
         if (!grounded) work.wasAirborne = true;
@@ -827,7 +821,7 @@ final class AgentShoreCast {
         observe(seen);
         if (solidFace(seen, work.support, work.face)) return seen;
         if (grounded && player.getEyePos().y < work.support.getY() + 1.06
-                && body.aligned(point) && equipped(item(work.item))) body.jump();
+                && body.aligned(point) && readiness == AgentBody.Preparation.READY) body.jump();
         return null;
     }
 
@@ -1059,10 +1053,12 @@ final class AgentShoreCast {
     }
     private boolean has(Predicate<ItemStack> item) { return count(item) > 0; }
     private boolean equipped(Predicate<ItemStack> item) {
-        if (item.test(client.player.getMainHandStack())) return true;
-        // equip() returning true can mean a hotbar key was only queued. Never use the old tool.
-        hands.equip(item);
-        return false;
+        return hands.equipForUse(item);
+    }
+    private AgentBody.Preparation usePreparation(Predicate<ItemStack> item, int receiptTicks) {
+        // Retry grace belongs to the outstanding input, not to the next job's press.
+        if (usedAt != 0 && tick - usedAt < receiptTicks) return AgentBody.Preparation.RECEIPT;
+        return AgentBody.Preparation.equipment(hands.equipForUse(item));
     }
     private int count(Predicate<ItemStack> item) { return hands.count(item); }
     private static Predicate<ItemStack> item(Item item) { return stack -> stack.isOf(item); }

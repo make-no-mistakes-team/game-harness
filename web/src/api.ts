@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { SURVIVAL_PILOT_GOALS, type SurvivalPilotGoal, type SurvivalPilotSnapshot } from "../../src/shared/survival-pilot-ui.ts";
 import type {
   ActivityEvent,
   AppSnapshot,
@@ -526,6 +527,32 @@ export async function fetchState(): Promise<AppSnapshot> {
 
 export async function mutate(path: string, body: unknown = {}): Promise<void> {
   await request(path, body);
+}
+
+const pilotSnapshot: z.ZodType<SurvivalPilotSnapshot> = z.object({
+  phase: z.enum(["idle", "starting", "playing", "stopping", "ended"]),
+  goal: z.enum(SURVIVAL_PILOT_GOALS).nullable(),
+  status: z.string(), won: z.boolean().nullable(), run: nullableText,
+  elapsedMs: z.number().nonnegative(), health: z.number().nullable(), food: z.number().nullable(),
+});
+
+function pilotResponse(value: unknown): SurvivalPilotSnapshot {
+  const parsed = pilotSnapshot.safeParse(value);
+  if (!parsed.success)
+    throw new ApiError("Survival Pilot status could not be read. Check status before starting again.", 0, "invalid_pilot");
+  return parsed.data;
+}
+
+export async function fetchSurvivalPilot(signal: AbortSignal): Promise<SurvivalPilotSnapshot> {
+  return pilotResponse(await request("/v1/survival-pilot", undefined, undefined, signal));
+}
+
+export async function startSurvivalPilot(goal: SurvivalPilotGoal): Promise<SurvivalPilotSnapshot> {
+  return pilotResponse(await request("/v1/survival-pilot/start", { goal }));
+}
+
+export async function stopSurvivalPilot(): Promise<SurvivalPilotSnapshot> {
+  return pilotResponse(await request("/v1/survival-pilot/stop", {}));
 }
 
 function preparationResponse(value: unknown): PreparedStartView {

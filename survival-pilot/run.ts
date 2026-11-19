@@ -6,8 +6,10 @@ import { createServer } from "node:net";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { SURVIVAL_PILOT_GOALS as GOALS, type SurvivalPilotGoal as Goal } from "../src/shared/survival-pilot-ui.ts";
 import { JAVA, MinecraftClient, privateJson } from "../src/server/minecraft-client.ts";
 import { nativeLaunchFailure } from "../src/server/native-launch-fault.ts";
+import { poolDiagnosticServerProperties, poolDiagnosticWorld, provisionPoolDiagnostic } from "./diagnostic-pool.ts";
 import { admitRun } from "./storage.ts";
 import { verifySurvival } from "./verify.ts";
 
@@ -16,9 +18,10 @@ const RUNTIME = path.join(ROOT, "local/runtime");
 const PILOT_LOCAL = path.join(ROOT, "local/survival-pilot");
 const RUNS = path.join(PILOT_LOCAL, "runs");
 const LIVE = path.join(PILOT_LOCAL, "live.json");
+const DIAGNOSTIC_RUNS = path.join(PILOT_LOCAL, "diagnostic-runs");
+const DIAGNOSTIC_LIVE = path.join(PILOT_LOCAL, "diagnostic-live.json");
 const SERVER_JAR = path.join(RUNTIME, "minecraft/server-1.21.4.jar");
 const PILOT_JAR = path.join(import.meta.dir, "build/libs/survival-pilot-1.0.jar");
-const GOALS = ["wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond", "nether_portal"] as const;
 const RUN_BASENAME = new RegExp(`^\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}\\.\\d{3}Z-(?:${GOALS.join("|")})-[A-Za-z0-9]{6}$`);
 const DEFAULT_SECONDS = 900;
 const MAX_SECONDS = Math.floor(2_147_483_647 / 1_000);
@@ -33,7 +36,6 @@ const MEMORY_BYTES = 32 * 1024;
 const MEMORY_CELLS = 1024;
 const OVERWORLD = "minecraft:overworld";
 const exec = promisify(execFile);
-type Goal = (typeof GOALS)[number];
 type Exit = { code: number | null; signal: NodeJS.Signals | null };
 type Owned = { child: ChildProcess; closed: Promise<Exit>; exit?: Exit };
 type Progress = {
@@ -41,6 +43,7 @@ type Progress = {
   dimension?: string;
   rock_broken?: number;
   frame_blocks?: number;
+  cast_frame_blocks?: number;
   tick: number;
   goal: string;
   status: string;
@@ -61,11 +64,13 @@ class Stop extends Error {
   constructor(readonly status: Status, message: string) { super(message); }
 }
 
-const usage = `Usage: xvfb-run -a -s '-screen 0 ${SIZE}x24' bun survival-pilot/run.ts GOAL [SECONDS [--continue-from RUN_BASENAME]]
+const usage = `Usage: bun run play:pilot GOAL [SECONDS [--continue-from RUN_BASENAME]]
+       bun run diagnose:pool [SECONDS]
 
 GOAL: ${GOALS.join(" | ")}
 SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SECONDS}).
 --continue-from: copy a closed, recorded pilot world. Retry its goal or pursue a later one.
+diagnose:pool: test casting a Nether portal in a separate, pre-provisioned diagnostic world.
 
 Build survival-pilot-1.0.jar first. Requires Java 21, ffmpeg, existing local EULA
 consent, and a signed-in official Launcher with Minecraft 1.21.4 installed.
@@ -74,14 +79,15 @@ Only a confirmed goal exits 0. Artifacts and outcome JSON go in the printed run 
 
 function parseArgs(args: string[]) {
   const [rawGoal, rawSeconds = String(DEFAULT_SECONDS), flag, parentRun] = args;
-  const goal = GOALS.find((item) => item === rawGoal);
+  const diagnostic = rawGoal === "--diagnostic-pool";
+  const goal = diagnostic ? "nether_portal" : GOALS.find((item) => item === rawGoal);
   const seconds = Number(rawSeconds);
-  if (!goal || (args.length > 2 && (args.length !== 4 || flag !== "--continue-from" ||
+  if (!goal || (args.length > 2 && (diagnostic || args.length !== 4 || flag !== "--continue-from" ||
       !parentRun || !RUN_BASENAME.test(parentRun))) || !/^\d+$/.test(rawSeconds) ||
       !Number.isSafeInteger(seconds) || seconds < 1 || seconds > MAX_SECONDS) {
     throw new Error(usage);
   }
-  return { goal, seconds, parentRun };
+  return { goal, seconds, parentRun, diagnostic };
 }
 
 async function isolatedDisplay() {
@@ -112,10 +118,14 @@ async function isolatedDisplay() {
 }
 
 async function verifyInputs() {
-  const consent = await readFile(path.join(RUNTIME, "provisioning-consent.json"), "utf8")
-    .then((content) => JSON.parse(content)).catch(() => null);
-  if (consent?.eulaAccepted !== true || consent?.minecraftVersion !== "1.21.4" ||
-      consent?.eulaUrl !== "https://www.minecraft.net/en-us/eula") {
+  const hasConsent = async (directory: string) => {
+    const consent = await readFile(path.join(directory, "provisioning-consent.json"), "utf8")
+      .then((content) => JSON.parse(content)).catch(() => null);
+    return consent?.eulaAccepted === true && consent.minecraftVersion === "1.21.4" &&
+      consent.eulaUrl === "https://www.minecraft.net/en-us/eula";
+  };
+  if (!(await hasConsent(RUNTIME)) &&
+      !(process.env.GAMEHARNESS_DATA_DIR && await hasConsent(process.env.GAMEHARNESS_DATA_DIR))) {
     throw new Error("Existing explicit Minecraft 1.21.4 EULA consent is required.");
   }
   await access(SERVER_JAR, constants.R_OK);
@@ -561,6 +571,7 @@ function goalMilestones(goal: Goal, progress: Progress, highWater: Map<string, n
       capped("bucket", count("bucket") + count("water_bucket"), 1);
       capped("igniter", count("flint_and_steel"), 1);
       capped("portalFrame", progress.frame_blocks ?? 0, 10);
+      capped("castFrame", progress.cast_frame_blocks ?? 0, 10);
     }
     const depthBand = -Math.floor(Math.max(-64, progress.y) / 8);
     const best = highWater.get("minedDepthBand");
@@ -574,9 +585,11 @@ function goalMilestones(goal: Goal, progress: Progress, highWater: Map<string, n
   return changes;
 }
 
-async function run(goal: Goal, seconds: number, parentRun?: string) {
+async function run(goal: Goal, seconds: number, parentRun: string | undefined, diagnostic: boolean) {
   const display = await isolatedDisplay();
   const { java, ffmpeg } = await verifyInputs();
+  const runs = diagnostic ? DIAGNOSTIC_RUNS : RUNS;
+  const liveFile = diagnostic ? DIAGNOSTIC_LIVE : LIVE;
   const videoBytes = 32_000_000 + seconds * 600_000;
   const reserveBytes = videoBytes + 1_000_000_000;
   const storageStopBytes = reserveBytes - DRAIN_HEADROOM;
@@ -595,11 +608,11 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
   for (const { name, listener } of interrupts) process.on(name, listener);
   let release: (() => void) | undefined;
   try {
-    release = await admitRun(reserveBytes);
+    release = diagnostic ? await admitRun(reserveBytes, "diagnostic") : await admitRun(reserveBytes);
     signal.throwIfAborted();
-    await mkdir(RUNS, { recursive: true, mode: 0o700 });
+    await mkdir(runs, { recursive: true, mode: 0o700 });
     const source = parentRun ? await savedWorld(parentRun, goal, signal) : null;
-    const dir = await mkdtemp(path.join(RUNS, `${new Date().toISOString().replaceAll(":", "-")}-${goal}-`));
+    const dir = await mkdtemp(path.join(runs, `${new Date().toISOString().replaceAll(":", "-")}-${goal}-`));
     console.log(dir);
     const startedAt = new Date().toISOString();
     const start = performance.now();
@@ -612,7 +625,7 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
     const progressFile = path.join(dir, "progress.json");
     const video = path.join(dir, "screen.mp4");
     const live = { run: path.basename(dir), ...display };
-    const world = {
+    const world = diagnostic ? poolDiagnosticWorld : {
       type: "vanilla", mode: "survival", difficulty: "normal",
       ...(parentRun ? { fresh: false, parentRun } : { fresh: true, seed: "random" }),
     };
@@ -645,8 +658,10 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
         recording: { file: "screen.mp4", size: SIZE, fps: 30, codec: "h264", cursor: true, audio: false },
       });
       declared = true;
-      await privateJson(LIVE, { ...live, active: true });
-      console.log("Live view: http://127.0.0.1:4379/ (start with `bun run watch:pilot` if needed)");
+      await privateJson(liveFile, { ...live, active: true });
+      console.log(diagnostic
+        ? "Diagnostic live view: http://127.0.0.1:4382/ (start with `bun survival-pilot/watch.ts --diagnostic` if needed)"
+        : "Live view: http://127.0.0.1:4379/ (start with `bun run watch:pilot` if needed)");
       await record("declared");
       meter = (async () => {
         while (!signal.aborted) {
@@ -691,7 +706,8 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
         "server-ip=127.0.0.1", `server-port=${port}`, "online-mode=false",
         "enforce-secure-profile=false", "gamemode=survival", "difficulty=normal",
         "hardcore=false", "level-name=world", "view-distance=6", "simulation-distance=6", "spawn-protection=0",
-        "max-players=1", "log-ips=false", "enable-rcon=false", "enable-query=false", "",
+        "max-players=1", "log-ips=false", "enable-rcon=false", "enable-query=false",
+        ...(diagnostic ? poolDiagnosticServerProperties : []), "",
       ].join("\n"));
       const serverErr = await open(path.join(dir, "server.stderr.log"), "wx", 0o600);
       try {
@@ -743,7 +759,8 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
 
       stage = "client_startup";
       // Abort in-flight authentication and downloads if any dependency exits before the client joins.
-      void server.closed.then(() => abort("server_exit", "Vanilla server exited unexpectedly."));
+      const runningServer = server;
+      void runningServer.closed.then(() => abort("server_exit", "Vanilla server exited unexpectedly."));
       void recorder.closed.then(async () => {
         if (signal.aborted) return;
         const size = await stat(video).then((entry) => entry.size, () => 0);
@@ -752,6 +769,12 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
       });
       const launched = await launcher.launchPilot({
         runtimeCache: RUNTIME, port, goal, evidenceDir: dir, ...display,
+        beforeConnect: diagnostic ? async (profileName) => {
+          stage = "diagnostic_provisioning";
+          await provisionPoolDiagnostic(runningServer.child, worldDir, profileName, startup);
+          await record("diagnostic_sealed");
+          stage = "client_startup";
+        } : undefined,
       }, startup);
       client = own(launched.child, launched.closed);
       diagnostics = launched.diagnostics;
@@ -789,7 +812,8 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
           signal.throwIfAborted();
           if (progress.won && (goal === "nether_portal" ? progress.dimension === "minecraft:the_nether" :
               (progress.inventory[`minecraft:${goal}`] ?? 0) > 0)) {
-            throw new Stop("won", goal === "nether_portal" ? "Pilot built a portal and entered the Nether." : `Pilot obtained ${goal}.`);
+            throw new Stop("won", diagnostic ? "Pilot cast and lit a portal and entered the Nether."
+              : goal === "nether_portal" ? "Pilot built a portal and entered the Nether." : `Pilot obtained ${goal}.`);
           }
           if (!progress.alive) throw new Stop("died", "The pilot died before obtaining the goal.");
           if (typeof progress.failure === "string") throw new Stop("stalled", progress.failure);
@@ -833,14 +857,14 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
         result = new Stop("failed", "An owned process could not be drained cleanly.");
       }
       if (declared) {
-        await privateJson(LIVE, { ...live, active: false }).catch(() => {
+        await privateJson(liveFile, { ...live, active: false }).catch(() => {
           result = new Stop("failed", "Could not mark the live view inactive.");
         });
       }
       measuredBytes = await diskBytes(dir).catch(() => measuredBytes);
       let verification: Awaited<ReturnType<typeof verifySurvival>> | null = null;
       if (result.status === "won") {
-        verification = await verifySurvival(path.join(dir, "server/world/stats"), goal, lastProgress);
+        verification = await verifySurvival(path.join(dir, "server/world/stats"), goal, lastProgress, diagnostic);
         const videoExists = await stat(video).then((entry) => entry.size > 0, () => false);
         if (!verification.verified) result = new Stop("unverified", verification.reason);
         else if (server?.exit?.code !== 0)
@@ -872,11 +896,12 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
 
 try {
   const args = process.argv.slice(2);
-  if (args.length === 1 && args[0] === "--help") console.log(usage);
+  if ((args.length === 1 && args[0] === "--help") ||
+      (args.length === 2 && args[0] === "--diagnostic-pool" && args[1] === "--help")) console.log(usage);
   else {
-    const { goal, seconds, parentRun } = parseArgs(args);
+    const { goal, seconds, parentRun, diagnostic } = parseArgs(args);
     process.umask(0o077);
-    process.exitCode = await run(goal, seconds, parentRun);
+    process.exitCode = await run(goal, seconds, parentRun, diagnostic);
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : "Run failed.");

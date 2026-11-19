@@ -43,6 +43,7 @@ import {
 } from "./api.ts";
 import type { PerformanceSnapshot, SkillEvidencePage } from "./api.ts";
 import { NativeVideo } from "./video.ts";
+import { SurvivalPilotView } from "./survival-pilot-view.ts";
 import { EvidenceInspector, promotionEvidence } from "./evidence.ts";
 import { MAX_TASK_CHARACTERS, taskTextSchema } from "../../src/shared/tasks.ts";
 import { initialTaskDraft, editTaskPrompt, selectTaskChoice, taskSubmission } from "./task-draft.ts";
@@ -61,26 +62,39 @@ root.innerHTML = `
   <div id="request-error" class="notice error" role="alert" hidden></div>
   <div class="work-area" id="work-area">
     <section class="game-console" aria-label="Authentic Minecraft player video">
-      <div class="console-topline"><h2>Minecraft <span class="muted">/ player view</span></h2><span id="view-status" role="status">Waiting</span></div>
-      <div class="viewer" id="viewer" data-state="idle"><canvas id="game-video" aria-label="Read-only authentic Minecraft video, including the game HUD and player hand" hidden></canvas><div class="viewer-empty" id="viewer-empty"><h3 id="viewer-title">No live video</h3><p id="viewer-description">Connect the isolated Minecraft client in Settings. No simulated footage is displayed.</p><button id="viewer-settings" type="button">Open settings</button></div><p class="frame-warning" id="frame-warning" hidden></p></div>
-      <div class="viewer-foot"><span id="video-detail">Waiting for the local service.</span><button id="video-reconnect" type="button">Reconnect video</button></div>
+      <div class="console-topline"><h2>Minecraft <span class="muted">/ player view</span></h2><span id="view-status" class="model-only" role="status">Waiting</span><span class="pilot-only" id="pilot-video-status" role="status"></span></div>
+      <div class="viewer" id="viewer" data-state="idle"><canvas id="game-video" class="model-only" aria-label="Read-only authentic Minecraft video, including the game HUD and player hand" hidden></canvas><div class="viewer-empty model-only" id="viewer-empty"><h3 id="viewer-title">No live video</h3><p id="viewer-description">Connect the isolated Minecraft client in Settings. No simulated footage is displayed.</p><button id="viewer-settings" type="button">Open settings</button></div><p class="frame-warning model-only" id="frame-warning" hidden></p>
+        <img class="pilot-only" id="pilot-video" width="960" height="540" alt="Read-only Minecraft gameplay from the running Survival Pilot" draggable="false" hidden>
+        <div class="viewer-empty pilot-only" id="pilot-empty"><h3 id="pilot-video-message"></h3><p id="pilot-result" hidden></p></div>
+      </div>
+      <div class="viewer-foot"><span id="video-detail" class="model-only">Waiting for the local service.</span><button id="video-reconnect" class="model-only" type="button">Reconnect video</button><span class="pilot-only" id="pilot-video-detail"></span><button id="pilot-video-retry" class="pilot-only" type="button" hidden>Reconnect video</button></div>
     </section>
     <aside class="context-panel" id="context-panel" aria-label="Current goal and program">
-      <div class="context-overview">
+      <div class="context-overview model-only">
       <section><h2><button id="life-open" class="section-action" type="button"><span>Session / player life</span><span id="life-current" class="context-value">No game session.</span></button></h2></section>
       <section><h2>Current goal</h2><p id="current-task">No run created.</p><button id="goal-more" type="button" hidden>Read full task</button></section>
       <section><h2><button id="programs-open" class="section-action" type="button" title="Inspect programs, model and action"><span>Program / control</span><span id="program-current" class="context-value">No executing skill.</span><span id="program-status" class="context-value" hidden></span></button></h2></section>
       <section><h2><button id="activity-open" class="section-action" type="button" title="Inspect activity"><span id="activity-heading">Latest activity</span><span id="latest-activity" class="context-value">No recorded activity yet.</span></button></h2></section>
       </div>
-      <section class="usage-summary"><h2><button id="usage-open" class="section-action" type="button" aria-label="Usage details" title="Usage details">Actual usage</button></h2><dl id="usage-summary"></dl></section>
-      <p id="run-error" class="error" role="alert" hidden></p>
+      <section class="usage-summary model-only"><h2><button id="usage-open" class="section-action" type="button" aria-label="Usage details" title="Usage details">Actual usage</button></h2><dl id="usage-summary"></dl></section>
+      <p id="run-error" class="error model-only" role="alert" hidden></p>
+      <div class="context-overview pilot-only">
+        <section><h2>Current goal</h2><p id="pilot-task"></p></section>
+        <section id="pilot-activity"><h2 id="pilot-action-heading">Pilot activity</h2><p id="pilot-action"></p></section>
+        <section><h2>Player</h2><p id="pilot-player"></p></section>
+      </div>
+      <section class="usage-summary pilot-only"><h2>Model usage</h2><p>No strategic model is used by Survival Pilot.</p></section>
     </aside>
   </div>
-  <section class="run-toolbar" id="run-controls" aria-label="Run controls" tabindex="-1"><div class="run-control-state"><strong id="run-status" role="status">No run</strong><span id="run-hint">Configure a task in Settings.</span></div><div class="button-row"><button id="new-task" type="button">Task / model</button><button id="cancel-preparation" class="danger" type="button" hidden>Cancel preparation</button><button id="start-run" class="primary" type="button">Start</button><button id="pause-run" type="button">Pause</button><button id="resume-run" class="primary" type="button" hidden>Resume</button><button id="stop-run" class="danger" type="button">Stop run</button></div></section>
-  <footer><span id="readiness">World · unknown / Model · unknown / Isolation · unknown</span><button id="inventory-open" class="text-button" type="button">Inventory</button><span class="muted">Read-only video · no manual gameplay</span></footer>
+  <section class="run-toolbar" id="run-controls" aria-label="Run controls" tabindex="-1"><div class="run-control-state model-only"><strong id="run-status" role="status">No run</strong><span id="run-hint">Configure a task in Settings.</span></div><div class="button-row model-only"><button id="new-task" type="button">Task / model</button><button id="cancel-preparation" class="danger" type="button" hidden>Cancel preparation</button><button id="start-run" class="primary" type="button">Start</button><button id="pause-run" type="button">Pause</button><button id="resume-run" class="primary" type="button" hidden>Resume</button><button id="stop-run" class="danger" type="button">Stop run</button></div>
+    <div class="run-control-state pilot-only"><strong id="pilot-phase" role="status"></strong><span id="pilot-hint"></span><span id="pilot-control-error" class="error" role="alert" hidden></span></div>
+    <div class="button-row pilot-only"><button id="pilot-check" type="button" hidden>Check status</button><button id="pilot-return" type="button" hidden>Model controls</button><button id="pilot-choose" class="primary" type="button" hidden>Choose goal</button><button id="pilot-stop" class="danger" type="button">Stop pilot</button></div>
+  </section>
+  <footer><span id="readiness" class="model-only">World · unknown / Model · unknown / Isolation · unknown</span><button id="inventory-open" class="text-button model-only" type="button">Inventory</button><span class="muted">Read-only video · no manual gameplay</span></footer>
 </main>
 <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-header"><h2 id="settings-title">Settings & task</h2><button type="button" data-close="settings-dialog" aria-label="Close settings">Close</button></div><div class="dialog-body settings-grid">
-  <section class="settings-task"><h3>Game integration</h3><p>GameHarness runs model-authored game programs. Minecraft Java 1.21.4 is the first available integration; other game adapters are not available in this build.</p></section>
+  <section aria-labelledby="pilot-heading"><h3 id="pilot-heading" tabindex="-1">Survival Pilot</h3><form id="pilot-form"><label for="pilot-goal">Pilot goal</label><div class="input-row"><select id="pilot-goal" required></select><button id="pilot-start" type="submit" class="primary" disabled>Start in new world</button></div><p class="muted">Runs without a strategic model.</p><p id="pilot-start-status" role="status" hidden></p><p id="pilot-start-error" class="error" role="alert" hidden></p><button id="pilot-start-check" type="button" hidden>Check status</button></form></section>
+  <section><h3>Game integration</h3><p>GameHarness runs model-authored game programs. Minecraft Java 1.21.4 is the first available integration; other game adapters are not available in this build.</p></section>
   <section class="settings-task"><h3>Task and strategic model</h3><form id="task-form"><div class="form-row"><label>Automatic success check<select id="goal" required aria-describedby="goal-condition"><option value="">Waiting for checks</option></select></label><label>Strategic model<select id="model" required><option value="">Connect OpenAI first</option></select></label></div><p id="goal-condition" role="status">Custom tasks have no automatic success check.</p><div class="section-heading"><label for="task">Task</label><button id="use-goal" class="text-button" type="button">Restore preset prompt</button></div><textarea id="task" rows="3" minlength="1" maxlength="${MAX_TASK_CHARACTERS}" required placeholder="Describe what the agent should do in this world."></textarea><p id="preparation-disclosure" class="muted">Preparation uses the selected model and counts toward your account usage: up to ${PREPARED_START_LIMITS.max_requests} requests, with a ${PREPARED_START_LIMITS.duration_ms / 60000}-minute preparation limit. It starts with fresh programs; the world opens only after compilation.</p><p id="preparation-prerequisite" role="status"></p><p id="preparation-error" class="error" role="alert" hidden></p><div class="button-row"><button id="prepare-play" type="submit" class="primary" aria-describedby="preparation-disclosure preparation-prerequisite">Prepare &amp; play</button><button id="create-run" type="submit" class="primary" hidden>Create run</button><span id="create-hint" class="muted" hidden>Create saves the task; Start begins inference.</span></div></form><div id="preparation-panel" class="preparation-status" tabindex="-1" aria-labelledby="preparation-status" hidden><p id="preparation-status" role="status"></p><p id="preparation-clock" class="mono"></p><p id="preparation-requests" class="mono"></p><button id="cancel-preparation-settings" class="danger" type="button" hidden>Cancel preparation</button><details><summary>Preparation details</summary><pre id="preparation-details" tabindex="0"></pre></details></div></section>
   <section class="settings-task"><h3>Program libraries</h3><div id="working-library"><label for="working-programs">Working definitions for the next task</label><select id="working-programs"><option value="continue">Continue this session’s same-model working programs</option><option value="fresh">Fresh — omit working programs</option></select><p>Working candidates retain validated code, not arguments, observations or execution state. They are not qualified experience.</p></div><p id="library-mode">Separately, optionally load one exact evidence-backed startup bundle. Neither choice executes code; the new run still receives fresh permissions and validation.</p><label for="experience">Qualified compatible startup bundle</label><select id="experience"><option value="">No saved programs</option></select><p id="library-status" role="status">Choose a strategic model to load compatible bundles.</p><button id="library-refresh" type="button">Refresh compatible library</button><pre id="experience-detail" tabindex="0" hidden></pre></section>
   <section><h3>OpenAI connection</h3><p id="account-description">Connect your own account to discover models.</p><div class="button-row"><button id="login-browser" type="button">Connect in browser</button><button id="login-device" type="button">Use device code</button><button id="refresh-models" type="button" hidden>Refresh models</button><button id="logout" type="button" hidden>Disconnect account</button></div><div id="login-flow" hidden><p id="login-instructions"></p><a id="authorize-link" class="button primary" target="_blank" rel="noopener noreferrer" hidden>Continue in browser</a><p class="muted">Complete authorization in your browser, then return here.</p><form id="auth-form" hidden><label id="auth-input-label" for="auth-input">Authorization response</label><div class="input-row"><input id="auth-input" autocomplete="off" spellcheck="false" maxlength="16000"><button id="auth-submit" type="submit">Submit response</button></div></form><button id="cancel-login" type="button">Cancel authorization</button></div><p id="auth-error" class="error" role="alert" hidden></p></section>
@@ -251,6 +265,25 @@ const video = new NativeVideo(
     }
   },
 );
+const pilot = new SurvivalPilotView({
+  el, text, errorText,
+  openSettings: settings,
+  closeSettings() {
+    const dialog = el<HTMLDialogElement>("settings-dialog");
+    if (dialog.open) {
+      dialogOrigins.set(dialog.id, el("run-controls"));
+      dialog.close();
+    }
+  },
+  changeView(visible) {
+    const losingFocus = document.activeElement?.closest(visible ? ".model-only" : ".pilot-only");
+    document.querySelector(".workspace")!.classList.toggle("show-pilot", visible);
+    if (visible) video.disconnect();
+    else if (serviceReady) video.connect();
+    if (losingFocus) el("run-controls").focus({ preventScroll: true });
+  },
+  updateControls: buttons,
+});
 function openDialog(id: string): void {
   const dialog = el<HTMLDialogElement>(id);
   if (dialog.open) return;
@@ -278,7 +311,7 @@ function active(run: RunView | null): boolean {
   return !!run && !["stopped", "completed", "failed"].includes(run.status);
 }
 function canOperate(id?: string): boolean {
-  return commandAvailable(serviceReady, snapshot !== null, pending, id);
+  return !pilot.locksModel && commandAvailable(serviceReady, snapshot !== null, pending, id);
 }
 function buttons(): void {
   const state = snapshot,
@@ -287,6 +320,12 @@ function buttons(): void {
     hasRun = active(run);
   const preparation = state?.prepared_start ?? null;
   const startupLocked = preparedStartActive(preparation) || preparationAttempt !== null;
+  pilot.setModelConflict(startupLocked ? "Finish or cancel model preparation before starting a pilot."
+    : hasRun ? "Stop the model run before starting a pilot."
+    : state && (["running", "starting", "preparing"].includes(state.server.status) ||
+      ["connecting", "connected"].includes(state.game.status))
+      ? "Stop the model world before starting a pilot."
+      : pending.size ? "Wait for the current command to finish." : null);
   const preparePath = state?.game.status !== "connected" || startupLocked;
   const cancel = preparationCancellation(preparation);
   const focused = document.activeElement;
@@ -1033,7 +1072,9 @@ function render(state: AppSnapshot): void {
       ? "Player dead; no active run. Create a task and Start so the model can choose recovery."
       : "Player dead; no active run. Connect OpenAI in Settings, create a task and Start.";
   else if (!state.auth.authenticated)
-    hint = "Connect OpenAI and prepare the world in Settings.";
+    hint = state.game.status === "disconnected"
+      ? "Choose Survival Pilot or set up a model task in Settings."
+      : "Connect OpenAI in Settings to run a model task.";
   if (preparationAttempt)
     hint = preparationOutcomeUnknown
       ? "Reconnect to inspect preparation. Stop world remains available in Settings."
@@ -1501,6 +1542,7 @@ async function command(
 async function bootstrap(): Promise<void> {
   const current = ++generation;
   stream?.close();
+  pilot.disconnect();
   video.disconnect();
   serviceReady = false;
   buttons();
@@ -1509,11 +1551,13 @@ async function bootstrap(): Promise<void> {
   errorText("request-error", null);
   try {
     await openSession();
+    if (current !== generation) return;
+    pilot.connect();
     const next = await fetchState();
     if (current !== generation) return;
     serviceReady = true;
     render(next);
-    video.connect();
+    if (!pilot.visible) video.connect();
     const source = new EventSource("/v1/events", { withCredentials: true });
     stream = source;
     source.onopen = () => {
@@ -1579,6 +1623,7 @@ async function loadJev(): Promise<void> {
 }
 function settings(): void {
   openDialog("settings-dialog");
+  pilot.check();
   if (serviceReady) {
     void loadJev();
     void loadLibrary();
@@ -2133,6 +2178,8 @@ for (const link of document.querySelectorAll<HTMLAnchorElement>(
       .catch((error) => errorText("settings-error", message(error)));
   });
 window.addEventListener("pagehide", () => {
+  ++generation;
+  pilot.disconnect();
   stream?.close();
   video.disconnect();
   window.clearTimeout(preparationTimer);

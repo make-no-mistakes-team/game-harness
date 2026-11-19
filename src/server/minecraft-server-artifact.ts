@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { link, lstat, open, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, open, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 /** Trusted host provisioning input, never a model capability or a world directory. */
@@ -8,6 +8,7 @@ export interface FabricServerArtifactSource { directory: string }
 const VERSION = "1.21.4";
 const SIZE = 56880250;
 const SHA1 = "4707d00eb834b446575d89a61a11b5d548d8c001";
+const SOURCE = `https://piston-data.mojang.com/v1/objects/${SHA1}/server.jar`;
 const RECEIPT = ".gameharness-fabric-installation.json";
 const INVALID_ARTIFACT = "Pinned public server artifact is invalid or unsafe.";
 const invalid = () => new Error(INVALID_ARTIFACT);
@@ -57,6 +58,49 @@ async function digest(file: string, algorithm: string, maximum: number, exactSiz
     if (exactSize !== undefined && total !== exactSize) throw invalid();
     return hash.digest("hex");
   } finally { await handle.close(); }
+}
+
+/** Validate or provision the public vanilla dependency without touching an existing world or replacing an existing jar. */
+export async function preparePilotServerArtifact(projectRoot: string, signal: AbortSignal): Promise<void> {
+  const directory = path.join(projectRoot, "local/runtime/minecraft");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await ownedDirectory(directory);
+  const file = path.join(directory, `server-${VERSION}.jar`);
+  const isMissing = (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT";
+  const check = async () => {
+    if (await digest(file, "sha1", SIZE, SIZE) !== SHA1) throw invalid();
+  };
+  try { await check(); return; } catch (error) { if (!isMissing(error)) throw error; }
+  const response = await fetch(SOURCE, {
+    redirect: "error", signal: AbortSignal.any([signal, AbortSignal.timeout(120_000)]),
+  });
+  if (!response.ok || !response.body) throw invalid();
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  const hash = createHash("sha1");
+  let total = 0;
+  try {
+    const output = await open(temporary, "wx", 0o600);
+    try {
+      for await (const chunk of response.body) {
+        signal.throwIfAborted();
+        total += chunk.length;
+        if (total > SIZE) throw invalid();
+        hash.update(chunk);
+        for (let offset = 0; offset < chunk.length;) {
+          const { bytesWritten } = await output.write(chunk, offset, chunk.length - offset);
+          if (!bytesWritten) throw invalid();
+          offset += bytesWritten;
+        }
+      }
+    } finally { await output.close(); }
+    if (total !== SIZE || hash.digest("hex") !== SHA1) throw invalid();
+    signal.throwIfAborted();
+    try { await link(temporary, file); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      await check();
+    }
+  } finally { await rm(temporary, { force: true }); }
 }
 async function installationIdentity(directory: string, loader: string) {
   await ownedDirectory(directory);
@@ -111,7 +155,7 @@ export async function stageFabricServerArtifact(projectRoot: string, directory: 
   if (!metadata || typeof metadata !== "object" || !("version" in metadata) || !("size" in metadata) ||
     !("sha1" in metadata) || !("url" in metadata) ||
     metadata.version !== VERSION || metadata.size !== SIZE || metadata.sha1 !== SHA1 ||
-    metadata.url !== `https://piston-data.mojang.com/v1/objects/${SHA1}/server.jar`) throw invalid();
+    metadata.url !== SOURCE) throw invalid();
   const input = await openOwnedFile(path.join(sourceDirectory, `server-${VERSION}.jar`), SIZE);
   const temporary = `${destination}.${randomUUID()}.tmp`;
   try {

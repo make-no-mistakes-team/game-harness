@@ -6,12 +6,13 @@ const progressSchema = z.object({
     goal: z.string(), won: z.literal(true), alive: z.literal(true),
     inventory: z.record(z.string(), z.number().int().nonnegative()),
     dimension: z.string().optional(), frame_blocks: z.number().int().optional(), ignited: z.boolean().optional(),
+    cast_frame_blocks: z.number().int().optional(),
 });
 const statsSchema = z.object({ stats: z.record(z.string(), z.record(z.string(), z.number().int().nonnegative())) });
 
 /** Use only after the server has saved and closed the fresh world. Never supply this
  * data to the actor. A client-predicted craft and a timed-out pickup are not wins. */
-export async function verifySurvival(statsDirectory: string, goal: string, progress: unknown) {
+export async function verifySurvival(statsDirectory: string, goal: string, progress: unknown, requireCast = false) {
     let mined = 0, crafted = 0, pickedUp = 0;
     const result = (verified: boolean, reason: string) => ({ verified, reason, mined, crafted, pickedUp });
     const p = progressSchema.safeParse(progress);
@@ -33,10 +34,16 @@ export async function verifySurvival(statsDirectory: string, goal: string, progr
         if (goal === "nether_portal") {
             const advancements = JSON.parse(await readFile(path.join(statsDirectory, "../advancements", files[0]!.name), "utf8"));
             const placed = count("used", "obsidian"), fires = count("used", "flint_and_steel");
+            const lavaBuckets = count("used", "lava_bucket"), waterBuckets = count("used", "water_bucket");
+            const cast = (p.data.cast_frame_blocks ?? 0) >= 10 && lavaBuckets >= 10 && waterBuckets > 0;
             const entered = advancements["minecraft:story/enter_the_nether"]?.done === true;
-            return { ...result(placed >= 10 && fires > 0 && entered, placed >= 10 && fires > 0 && entered
-                ? "Vanilla obsidian use, ignition tool use and Nether advancement corroborate entry"
-                : "Saved statistics do not corroborate portal construction and traversal"), placed, fires, entered };
+            const frame = requireCast ? cast && placed === 0 && count("crafted", "diamond_pickaxe") === 0 :
+                cast || placed >= 10;
+            const verified = frame && fires > 0 && entered;
+            return { ...result(verified, verified
+                ? `Vanilla ${cast ? "bucket casting" : "obsidian use"}, ignition and Nether advancement corroborate entry`
+                : "Saved statistics do not corroborate portal construction and traversal"),
+                placed, lavaBuckets, waterBuckets, cast, fires, entered };
         }
         crafted = count("crafted", goal);
         pickedUp = count("picked_up", goal);

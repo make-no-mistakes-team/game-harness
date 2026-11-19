@@ -451,6 +451,7 @@ export class MinecraftClient {
       evidenceDir: string;
       display: string;
       authority: string;
+      beforeConnect?: (profileName: string) => Promise<void>;
     },
     signal: AbortSignal,
   ) {
@@ -467,6 +468,10 @@ export class MinecraftClient {
       CLIENT_OPTIONS,
       { mode: 0o600 },
     );
+    if (config.beforeConnect) {
+      signal.throwIfAborted();
+      await config.beforeConnect(profile.name);
+    }
     signal.throwIfAborted();
     const child = spawn(this.java, [
       ...javaProxyArguments(process.env),

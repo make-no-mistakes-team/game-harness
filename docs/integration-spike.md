@@ -18,6 +18,14 @@ The seconds argument sets this attempt's wall time, including startup.
 Other item goals are `wooden_pickaxe`, `stone_pickaxe`, and `iron_pickaxe`.
 For `nether_portal`, the pilot needs to build and ignite a frame and enter it.
 Finding an existing portal or merely holding ten obsidian does not qualify.
+
+To launch the same player from the desktop, open **Settings → Survival Pilot**,
+select a goal and click **Start in new world**. The main player view shows
+the actual game. **Stop pilot** saves and closes that run's world; **Choose
+goal** starts the setup for another fresh world. The desktop will not take
+over an ordinary pilot already running from a terminal. Neither launch path
+requires a strategic model.
+
 The runner prints the private attempt directory. Open `screen.mp4` there to
 watch the actual client, including the inventory pointer. `outcome.json`
 records why the attempt ended. For a diamond win, the live inventory must
@@ -48,7 +56,24 @@ To watch as it plays, run `bun run watch:pilot` in a second terminal and open
 attempts. The read-only stream follows the pilot's private display and
 includes its cursor; the local recording continues if you close the tab.
 
-This command makes no model calls and does not accept free-form tasks.
+To test the single-bucket casting path without mining for supplies, run
+`bun run diagnose:pool [SECONDS]`. This starts a separate Normal Survival
+world on a flat plains map. The player starts facing south on a dry stone
+bank, with one dry block between the player and a 7×6, one-block-deep pool
+of 42 lava sources. The world clock is set to tick 1000 before the client
+joins and advances normally afterward.
+
+The starting hotbar contains one water bucket, flint and steel, a stone
+pickaxe, 64 cobblestone and 8 cooked beef. There is no diamond, obsidian,
+portal frame or mold at the start. All setup ends before the client joins;
+the same pilot handles casting, lighting and entry. A win requires ten
+distinct cast frame blocks, entry into the Nether and corroborating vanilla
+statistics. The default live view stays on ordinary runs. For the diagnostic,
+run `bun survival-pilot/watch.ts --diagnostic` and open
+`http://127.0.0.1:4382/`, or play `screen.mp4` from the printed attempt
+directory. Diagnostic worlds cannot be used with `--continue-from`.
+
+The standalone pilot makes no model calls and does not accept free-form tasks.
 The desktop application's model-driven path is described below.
 
 GameHarness is a desktop harness intended for many supported games through explicit adapters. This guide covers its first implemented adapter, Minecraft Java: an owned Fabric client/server, authentic video and compact model-authored programs. Other adapters are planned, not delivered automatically. Old Mineflayer/prismarine results below are scoped history and do not certify the native replacement.
@@ -89,7 +114,7 @@ bun run start
 
 The exact policy image is pinned in [`src/server/sandbox.ts`](../src/server/sandbox.ts). Sandbox preparation uses `--pull=never`: a missing image makes policy isolation unavailable. **Prepare server** can retry sandbox preparation after you install the image, but does not download that image for you. There is no unsandboxed fallback.
 
-`bun run build` builds the native project and Vite renderer. The component commands are `bun run build:native` and `bun run build:ui`; the native wrapper command is `sh native/minecraft/gradlew -p native/minecraft build`. It pins Gradle 8.11.1, Loom 1.9.2, Fabric Loader 0.16.10, Yarn 1.21.4+build.8 and Fabric API 0.119.4+1.21.4.
+`bun run build` builds the native project, Survival Pilot and Vite renderer. The component commands are `bun run build:native`, `bun run build:pilot` and `bun run build:ui`; the native wrapper command is `sh native/minecraft/gradlew -p native/minecraft build`. It pins Gradle 8.11.1, Loom 1.9.2, Fabric Loader 0.16.10, Yarn 1.21.4+build.8 and Fabric API 0.119.4+1.21.4.
 
 `bun run start` opens Electron 45.0.0. `bun run dev` builds once and opens the same desktop; it is not a watched Vite browser server. Keep the checkout, dependencies, built renderer/native artifacts and both sandbox files available.
 

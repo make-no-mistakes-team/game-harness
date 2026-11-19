@@ -1,5 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AuthManager } from "../src/server/auth.ts";
@@ -188,5 +189,69 @@ test("parallel applications keep per-port Origin/session isolation and remove on
   } finally {
     await Promise.all([appA.close(), appB.close()]);
     a.removeDirectory(); b.removeDirectory();
+  }
+});
+
+test("pilot controls enforce the local session, strict input and the independent ordinary lane owner", async () => {
+  const f = await fixture();
+  const minecraftInitialize = spyOn(f.owners.minecraft, "initialize").mockRejectedValue(new Error("No legacy world in this fixture"));
+  let app: Awaited<ReturnType<typeof createOperatorApplication>> | undefined;
+  try {
+    app = await createOperatorApplication({ ...f.owners, projectRoot: f.owners.directory });
+    await app.initialize();
+    const origin = `http://127.0.0.1:${app.server.port}`;
+    const pilot = `${origin}/v1/survival-pilot`;
+    const session = await fetch(`${origin}/v1/session`);
+    const cookie = session.headers.get("set-cookie")!.split(";")[0]!;
+    const { csrf_token: csrf } = await session.json() as { csrf_token: string };
+    const get = (suffix = "") => fetch(pilot + suffix, { headers: { cookie } });
+    const post = (suffix: string, value: unknown, token = csrf) => fetch(pilot + suffix, {
+      method: "POST", headers: { cookie, "x-csrf-token": token, "Content-Type": "application/json" },
+      body: JSON.stringify(value),
+    });
+    expect((await fetch(pilot)).status).toBe(401);
+    expect(await (await get()).json()).toEqual({
+      phase: "idle", goal: null, status: "Ready to start a new Survival world.",
+      won: null, run: null, elapsedMs: 0, health: null, food: null,
+    });
+    expect((await fetch(pilot, { headers: { cookie, "Sec-Fetch-Site": "same-site" } })).status).toBe(403);
+    expect((await post("/start", { goal: "diamond" }, "")).status).toBe(403);
+    expect((await post("/start", { goal: "continue" })).status).toBe(400);
+    expect((await post("/start", { goal: "diamond", display: ":0" })).status).toBe(400);
+    expect((await post("/stop", { pid: 1 })).status).toBe(400);
+    expect((await get("/video?upstream=http://localhost")).status).toBe(400);
+    expect((await get("/video?run=old")).status).toBe(409);
+
+    const lane = path.join(f.owners.directory, "local/survival-pilot");
+    mkdirSync(lane, { recursive: true });
+    const lock = path.join(lane, "owner.sqlite");
+    const external = new Database(lock, { create: true });
+    try {
+      external.run("BEGIN IMMEDIATE");
+      const refused = await post("/start", { goal: "diamond" });
+      expect(refused.status).toBe(409);
+      expect(await refused.json()).toMatchObject({ error: { code: "busy" } });
+      expect((await post("/stop", {})).status).toBe(200);
+      const probe = new Database(lock, { readwrite: true });
+      let lockError: unknown;
+      try {
+        probe.run("BEGIN IMMEDIATE");
+      } catch (error) {
+        lockError = error;
+      } finally { probe.close(); }
+      expect(lockError).toMatchObject({ code: "SQLITE_BUSY" });
+      expect(await (await get()).json()).toMatchObject({ phase: "idle", run: null });
+    } finally { external.close(); }
+
+    const state = f.owners.minecraft.snapshot();
+    const running = spyOn(f.owners.minecraft, "snapshot").mockReturnValue({ ...state, status: "running" });
+    try {
+      const refused = await post("/start", { goal: "diamond" });
+      expect(refused.status).toBe(409);
+      expect(await refused.json()).toMatchObject({ error: { code: "busy", message: expect.stringContaining("model run") } });
+    } finally { running.mockRestore(); }
+  } finally {
+    minecraftInitialize.mockRestore();
+    try { if (app) await app.close(); else await f.closeUntransferred(); } finally { f.removeDirectory(); }
   }
 });

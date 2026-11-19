@@ -1,21 +1,33 @@
 #!/usr/bin/env bun
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { readFile, realpath, stat } from "node:fs/promises";
+import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import type { Readable } from "node:stream";
 import path from "node:path";
 
 // A browser's native multipart JPEG viewer. A new reader must start on a MIME
 // boundary, not halfway through the encoder's current JPEG.
-const port = 4379;
+const args = process.argv.slice(2);
+const diagnostic = args.length === 1 && args[0] === "--diagnostic";
+if (args.length && !diagnostic) {
+    console.error("Usage: bun survival-pilot/watch.ts [--diagnostic]");
+    process.exit(1);
+}
+const port = diagnostic ? 4382 : 4379;
 const root = path.resolve(import.meta.dir, "../local/survival-pilot");
+const descriptor = path.join(root, diagnostic ? "diagnostic-live.json" : "live.json");
+const runs = path.join(root, diagnostic ? "diagnostic-runs" : "runs");
+const label = diagnostic ? "Survival Pilot diagnostic" : "Survival Pilot";
+const waitingText = diagnostic ? "Waiting for the next diagnostic run" : "Waiting for the next survival run";
+const capturePath = "/usr/bin:/bin";
+const xvfb = Bun.which("Xvfb", { PATH: capturePath });
 const viewers = new Set<ServerResponse>();
 let capture: ChildProcessByStdio<null, Readable, null> | undefined;
 let current = "";
 let busy = false;
 let stopping = false;
 const waiting = Bun.spawnSync(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
-    "-i", "color=c=black:s=960x540", "-vf", "drawtext=text='Waiting for the next survival run':fontcolor=white:fontsize=24:x=(w-tw)/2:y=(h-th)/2",
+    "-i", "color=c=black:s=960x540", "-vf", `drawtext=text='${waitingText}':fontcolor=white:fontsize=24:x=(w-tw)/2:y=(h-th)/2`,
     "-frames:v", "1", "-threads", "1", "-f", "mjpeg", "pipe:1"]).stdout;
 const delimiter = Buffer.from("\r\n\r\n");
 let lastJpeg: Buffer = waiting;
@@ -36,36 +48,46 @@ function idle() {
     for (const viewer of viewers) send(viewer, waiting);
 }
 
+async function captureSource() {
+    if (!xvfb) return;
+    const data = JSON.parse(await readFile(descriptor, "utf8"));
+    if (data?.active !== true || typeof data.run !== "string" || !/^[\w.-]+$/.test(data.run) ||
+        data.run === "." || data.run === ".." || typeof data.display !== "string" ||
+        typeof data.authority !== "string" || !path.isAbsolute(data.authority)) return;
+    const display: string = data.display;
+    const number = display.match(/^:([1-9]\d*)$/)?.[1];
+    if (!number || !Number.isSafeInteger(Number(number)) || Number(number) < 90) return;
+    const run = path.join(runs, data.run);
+    if (!(await lstat(run)).isDirectory()) return;
+    const closed = await lstat(path.join(run, "outcome.json")).then(() => true, (error) => {
+        if (error.code === "ENOENT") return false;
+        throw error;
+    });
+    if (closed) return;
+    const pid = (await readFile(`/tmp/.X${number}-lock`, "utf8")).trim();
+    if (!/^[1-9]\d*$/.test(pid)) return;
+    const proc = `/proc/${pid}`;
+    const [running, expected, cmdline, authority] = await Promise.all([
+        realpath(`${proc}/exe`), realpath(xvfb), readFile(`${proc}/cmdline`, "utf8"), realpath(data.authority),
+    ]);
+    const argv = cmdline.split("\0");
+    const auth = argv.indexOf("-auth");
+    const offline = argv.some((arg, index) => arg === "-nolisten" && argv[index + 1] === "tcp");
+    const online = argv.some((arg, index) => arg === "-listen" && argv[index + 1] === "tcp");
+    if (running !== expected || argv[1] !== display || !offline || online || auth < 0 ||
+        await realpath(argv[auth + 1]!) !== authority) return;
+    const authStat = await stat(authority);
+    if (!authStat.isFile() || authStat.uid !== process.getuid?.() || (authStat.mode & 0o077)) return;
+    return { display, authority, identity: JSON.stringify([data.run, display, pid, authority]) };
+}
+
 async function tick() {
     if (busy || stopping) return;
     busy = true;
     try {
-        let source: { run: string, display: string, authority: string } | undefined;
-        if (viewers.size) {
-            const data = JSON.parse(await readFile(path.join(root, "live.json"), "utf8"));
-            if (data.active === true && typeof data.run === "string" && /^[\w.-]+$/.test(data.run) &&
-                data.run !== "." && data.run !== ".." && /^:\d+$/.test(data.display) &&
-                Number(data.display.slice(1)) >= 90 && path.isAbsolute(data.authority)) {
-                const run = path.join(root, "runs", data.run);
-                const closed = await stat(path.join(run, "outcome.json")).then(() => true, (e) => {
-                    if (e.code === "ENOENT") return false;
-                    throw e;
-                });
-                if (!closed) {
-                    const pid = (await readFile(`/tmp/.X${data.display.slice(1)}-lock`, "utf8")).trim();
-                    if (!/^[1-9]\d*$/.test(pid)) throw new Error("Invalid display owner");
-                    const proc = `/proc/${pid}`;
-                    const argv = (await readFile(`${proc}/cmdline`, "utf8")).split("\0");
-                    const auth = argv.indexOf("-auth");
-                    const expected = Bun.which("Xvfb");
-                    if (expected && await realpath(`${proc}/exe`) === await realpath(expected) &&
-                        argv[1] === data.display && auth >= 0 &&
-                        await realpath(argv[auth+1]!) === await realpath(data.authority)) source = data;
-                }
-            }
-        }
+        const source = viewers.size ? await captureSource() : undefined;
         if (stopping) return;
-        if (!source || !viewers.size || source.run !== current) {
+        if (!source || !viewers.size || source.identity !== current) {
             idle();
         }
         if (source && viewers.size && !capture) {
@@ -73,9 +95,9 @@ async function tick() {
                 "-f", "x11grab", "-framerate", "20", "-draw_mouse", "1", "-video_size", "1280x720",
                 "-i", `${source.display}+0,0`, "-an", "-vf", "scale=960:540", "-c:v", "mjpeg",
                 "-threads", "2", "-q:v", "5", "-f", "mpjpeg", "-boundary_tag", "pilotframe", "pipe:1"],
-                { stdio: ["ignore", "pipe", "ignore"], env: { PATH: "/usr/bin:/bin", XAUTHORITY: source.authority } });
+                { stdio: ["ignore", "pipe", "ignore"], env: { PATH: capturePath, XAUTHORITY: source.authority } });
             capture = child;
-            current = source.run;
+            current = source.identity;
             child.on("error", () => {});
             child.on("close", () => { if (capture === child) idle(); });
             let pending: Buffer = Buffer.alloc(0);
@@ -117,7 +139,7 @@ const server = createServer((req, res) => {
     res.on("close", () => { viewers.delete(res); void tick(); });
     void tick();
 });
-server.listen(port, "127.0.0.1", () => console.log(`Survival Pilot live: http://127.0.0.1:${port}/`));
+server.listen(port, "127.0.0.1", () => console.log(`${label} live: http://127.0.0.1:${port}/`));
 const timer = setInterval(() => void tick(), 500);
 function close() {
     stopping = true;

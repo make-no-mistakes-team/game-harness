@@ -50,6 +50,16 @@ behavior. Infrastructure milestones support that outcome; they do not replace it
 
 ## Model-run authorization
 
+On `experiment/survival-pilot`, the user authorizes any number of Luna
+(`gpt-6-luna`) and Terra (`gpt-6.1-terra`) gameplay runs. Ask before each
+`gpt-6.2-sol` run. Choose run-specific timeouts and stop on lack of progress;
+the standing tool, request, and time caps below do not govern the pilot.
+The aggregate artifact ceiling for this branch is 300,000,000,000 bytes,
+including pre-existing runs. These permissions do not change frozen study
+protocols, authorize deleting private material, or grant access to hidden
+blocks, world seeds, or server state. Use ordinary Survival actions and
+visible inventory interactions.
+
 The user grants standing permission for development and gameplay runs with
 `gpt-6-luna`, with no cumulative limit on the number of runs, including after
 unsuccessful attempts. No per-run approval or new platform-evidence revision is

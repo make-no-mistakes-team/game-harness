@@ -65,7 +65,7 @@ root.innerHTML = `
       <div class="console-topline"><h2>Minecraft <span class="muted">/ player view</span></h2><span id="view-status" class="model-only" role="status">Waiting</span><span class="pilot-only" id="pilot-video-status" role="status"></span></div>
       <div class="viewer" id="viewer" data-state="idle"><canvas id="game-video" class="model-only" aria-label="Read-only authentic Minecraft video, including the game HUD and player hand" hidden></canvas><div class="viewer-empty model-only" id="viewer-empty"><h3 id="viewer-title">No live video</h3><p id="viewer-description">Connect the isolated Minecraft client in Settings. No simulated footage is displayed.</p><button id="viewer-settings" type="button">Open settings</button></div><p class="frame-warning model-only" id="frame-warning" hidden></p>
         <img class="pilot-only" id="pilot-video" width="960" height="540" alt="Read-only Minecraft gameplay from the running Survival Pilot" draggable="false" hidden>
-        <div class="viewer-empty pilot-only" id="pilot-empty"><h3 id="pilot-video-message"></h3><p id="pilot-result" hidden></p></div>
+        <div class="viewer-empty pilot-only" id="pilot-empty"><h3 id="pilot-video-message"></h3></div>
       </div>
       <div class="viewer-foot"><span id="video-detail" class="model-only">Waiting for the local service.</span><button id="video-reconnect" class="model-only" type="button">Reconnect video</button><span class="pilot-only" id="pilot-video-detail"></span><button id="pilot-video-retry" class="pilot-only" type="button" hidden>Reconnect video</button></div>
     </section>
@@ -79,7 +79,7 @@ root.innerHTML = `
       <section class="usage-summary model-only"><h2><button id="usage-open" class="section-action" type="button" aria-label="Usage details" title="Usage details">Actual usage</button></h2><dl id="usage-summary"></dl></section>
       <p id="run-error" class="error model-only" role="alert" hidden></p>
       <div class="context-overview pilot-only">
-        <section><h2>Current goal</h2><p id="pilot-task"></p></section>
+        <section><h2 id="pilot-goal-heading">Current goal</h2><p id="pilot-task"></p></section>
         <section id="pilot-activity"><h2 id="pilot-action-heading">Pilot activity</h2><p id="pilot-action"></p></section>
         <section><h2>Player</h2><p id="pilot-player"></p></section>
       </div>

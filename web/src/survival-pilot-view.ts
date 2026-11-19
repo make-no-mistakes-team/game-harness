@@ -1,5 +1,5 @@
 import { SURVIVAL_PILOT_GOALS, type SurvivalPilotGoal, type SurvivalPilotSnapshot } from "../../src/shared/survival-pilot-ui.ts";
-import { fetchSurvivalPilot, startSurvivalPilot, stopSurvivalPilot } from "./api.ts";
+import { ApiError, fetchSurvivalPilot, startSurvivalPilot, stopSurvivalPilot } from "./api.ts";
 
 const goalNames: Record<SurvivalPilotGoal, string> = {
   wooden_pickaxe: "Wooden pickaxe", stone_pickaxe: "Stone pickaxe", iron_pickaxe: "Iron pickaxe",
@@ -23,7 +23,7 @@ function phaseLabel(s: SurvivalPilotSnapshot): string {
     case "starting": return "Preparing pilot world";
     case "playing": return "Pilot playing";
     case "stopping": return "Stopping pilot";
-    case "ended": return s.won === true ? "Pilot goal verified" : "Pilot ended";
+    case "ended": return s.won === true ? "Goal verified" : "Goal not verified";
   }
 }
 
@@ -138,6 +138,7 @@ export class SurvivalPilotView {
   private session = 0;
   private command: "start" | "stop" | null = null;
   private unresolvedStart = false;
+  private dialogStart: SurvivalPilotGoal | null = null;
   private readError: string | null = null;
   private startError: string | null = null;
   private stopError: string | null = null;
@@ -149,6 +150,7 @@ export class SurvivalPilotView {
     this.video = new PilotVideo(el<HTMLImageElement>("pilot-video"), () => this.renderVideo());
     const select = el<HTMLSelectElement>("pilot-goal");
     for (const goal of SURVIVAL_PILOT_GOALS) select.add(new Option(goalNames[goal], goal));
+    el("settings-dialog").addEventListener("close", () => { this.dialogStart = null; });
     el("pilot-form").addEventListener("submit", e => {
       e.preventDefault();
       const goal = SURVIVAL_PILOT_GOALS.find(g => g === select.value);
@@ -230,6 +232,7 @@ export class SurvivalPilotView {
     const session = this.session;
     this.cancelRead();
     this.command = goal ? "start" : "stop";
+    this.dialogStart = goal;
     this.startError = this.stopError = null;
     this.ui.el(goal ? "pilot-heading" : "run-controls").focus({ preventScroll: true });
     this.render();
@@ -237,14 +240,14 @@ export class SurvivalPilotView {
       const next = goal ? await startSurvivalPilot(goal) : await stopSurvivalPilot();
       if (session !== this.session) return;
       this.accept(next);
-      if (goal) {
-        this.show(next.phase !== "idle");
-        this.ui.closeSettings();
-      }
     } catch (error) {
       if (session !== this.session) return;
       const detail = error instanceof Error ? error.message : "Pilot request failed.";
-      if (goal) { this.startError = detail; this.unresolvedStart = true; }
+      if (goal) {
+        this.startError = detail;
+        this.unresolvedStart = !(error instanceof ApiError && error.status >= 400 && error.status < 500 && error.code !== "invalid_response");
+        if (!this.unresolvedStart) this.dialogStart = null;
+      }
       else this.stopError = detail;
       this.known = false; // Reconcile before another mutation, including after an unknown HTTP outcome.
     } finally {
@@ -258,11 +261,16 @@ export class SurvivalPilotView {
     this.known = true;
     this.readError = null;
     this.unresolvedStart = false;
-    if (this.active) { this.startError = null; this.show(true); }
+    if (this.active) {
+      this.startError = null;
+      this.show(true);
+      if (this.dialogStart !== null && next.goal === this.dialogStart) this.ui.closeSettings();
+    }
     else {
       this.stopError = null;
       if (next.phase === "idle") this.show(false);
     }
+    this.dialogStart = null;
   }
   private show(visible: boolean) {
     if (visible === this.visible) return;
@@ -294,7 +302,10 @@ export class SurvivalPilotView {
     const { el, text, errorText } = this.ui, s = this.state;
     const focus = document.activeElement;
     this.renderSettings();
-    this.video.setRun(this.visible && this.known && this.command !== "stop" && s?.phase === "playing" ? s.run : null);
+    // A failed status read is not a video interruption. Keep only the already
+    // admitted stream; never open a new one against unconfirmed state.
+    this.video.setRun(!this.online || !this.visible || this.command === "stop" ? null
+      : !this.known ? this.video.run : s?.phase === "playing" ? s.run : null);
     this.renderVideo();
     if (this.visible && s) {
       const ended = s.phase === "ended" && this.known;
@@ -302,8 +313,9 @@ export class SurvivalPilotView {
       const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
       text("pilot-phase", this.command === "stop" ? "Requesting pilot stop" : this.known ? phaseLabel(s) : "Pilot status unavailable");
       text("pilot-hint", !this.known ? "Run state is unconfirmed."
-        : ended ? `${elapsed} elapsed${s.won !== true ? " · goal not verified" : ""}`
+        : ended ? `${elapsed} elapsed`
         : `${elapsed} elapsed · Stop closes this pilot’s world.`);
+      text("pilot-goal-heading", s.phase === "ended" ? "Session goal" : "Current goal");
       text("pilot-task", !s.goal ? "Goal unavailable." : s.goal === "nether_portal"
         ? "Build a portal and enter the Nether." : s.goal === "diamond"
           ? "Mine and collect a diamond." : `Craft ${s.goal === "iron_pickaxe" ? "an" : "a"} ${goalNames[s.goal].toLowerCase()}.`);
@@ -335,13 +347,11 @@ export class SurvivalPilotView {
     const live = this.video.run !== null && this.video.state === "live";
     const lost = this.video.run !== null && this.video.state === "lost";
     el("pilot-empty").hidden = live;
-    el("pilot-video-retry").hidden = !lost;
+    el("pilot-video-retry").hidden = !lost || !this.known;
     const ended = this.known && s?.phase === "ended";
-    el("pilot-result").hidden = !ended;
-    text("pilot-result", ended ? s.status : "");
     text("pilot-video-status", live ? "Live" : lost ? "Video unavailable" : "No live video");
-    text("pilot-video-message", !this.known ? "Waiting for pilot status" : lost ? "Pilot video interrupted"
-      : s?.phase === "starting" ? "Preparing the new world" : ended ? "Pilot session ended"
+    text("pilot-video-message", lost ? "Pilot video interrupted" : !this.known ? "Waiting for pilot status"
+      : s?.phase === "starting" ? "Preparing the new world" : ended ? s.status.trim() || "Pilot session ended"
       : this.command === "stop" || s?.phase === "stopping" ? "Closing the pilot world" : "Waiting for pilot video");
     const image = el<HTMLImageElement>("pilot-video");
     text("pilot-video-detail", live ? `${image.naturalWidth} × ${image.naturalHeight} · Survival Pilot`

@@ -17,6 +17,7 @@
     "src/**/*.ts",
     "web/src/**/*.ts",
     "scripts/**/*.ts",
+    "survival-pilot/*.ts",
     "tests/**/*.ts",
     "vite.config.ts"
   ]

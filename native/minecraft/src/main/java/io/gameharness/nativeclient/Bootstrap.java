@@ -13,7 +13,8 @@ public final class Bootstrap {
     JsonObject config =
         JsonParser.parseString(new String(input, StandardCharsets.UTF_8)).getAsJsonObject();
     Arrays.fill(input, (byte) 0);
-    System.setProperty("gameharness.session", config.get("session_file").getAsString());
+    if (config.has("session_file"))
+      System.setProperty("gameharness.session", config.get("session_file").getAsString());
     List<String> args = new ArrayList<>();
     for (JsonElement arg : config.getAsJsonArray("args")) args.add(arg.getAsString());
     try {

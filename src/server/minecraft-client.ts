@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
 import {
   mkdir,
   readFile,
@@ -41,6 +42,9 @@ export const JAVA = process.env.JAVA_HOME
   : (Bun.which("java") ?? "java");
 export const LOADER = "0.16.10";
 export const FABRIC_API = "0.119.4+1.21.4";
+const CLIENT_OPTIONS =
+  "version:4189\npauseOnLostFocus:false\nmaxFps:60\nenableVsync:false\nfullscreen:false\nrenderDistance:6\nsimulationDistance:6\nautoJump:false\nshowSubtitles:true\nchatVisibility:2\nonboardAccessibility:false\nskipMultiplayerWarning:true\ntutorialStep:none\n";
+
 export interface NativeOptions {
   dataDir?: string;
   evaluation?: NativeEvaluationOptions;
@@ -138,8 +142,16 @@ export async function prepareNativeMod(
     throw new Error(
       "Installed native artifact bytes differ from the prepared contract artifact",
     );
+  await prepareFabricApi(directory, signal);
+  return artifact;
+}
+async function prepareFabricApi(directory: string, signal?: AbortSignal, cache?: string) {
   const api = path.join(directory, "mods/fabric-api.jar");
   if (!(await exists(api))) {
+    if (cache && (await exists(cache))) {
+      await copyFile(cache, api);
+      return;
+    }
     const url = `https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/${FABRIC_API}/fabric-api-${FABRIC_API}.jar`;
     const sum = await (
       await fetch(`${url}.sha1`, {
@@ -150,7 +162,6 @@ export async function prepareNativeMod(
     ).text();
     await download(url, api, sum, "sha1", signal);
   }
-  return artifact;
 }
 export async function prepareFabricServer(
   projectRoot: string,
@@ -324,29 +335,7 @@ export class MinecraftClient {
     }
   }
 
-  async launch(
-    config: {
-      host: string;
-      port: number;
-      world_id: string;
-      epoch: number;
-      motor_profile?: MotorProfile;
-    },
-    controlPort: number,
-    videoPort: number,
-    signal: AbortSignal,
-    prepared?: NativeArtifactContract,
-  ): Promise<NativeProcess> {
-    // A Source phase may outlive an earlier readiness pass. Never reuse its result.
-    const { accessToken, profile } = await this.verifyOfficialSession(signal);
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    await chmod(this.directory, 0o700);
-    const mod = await prepareNativeMod(
-      this.projectRoot,
-      this.directory,
-      signal,
-      prepared,
-    );
+  private async fabricClasspath(signal: AbortSignal, cachedLibraries?: string) {
     const version = JSON.parse(
       await readFile(
         path.join(this.source, "versions/1.21.4/1.21.4.json"),
@@ -354,15 +343,6 @@ export class MinecraftClient {
       ),
     );
     signal.throwIfAborted();
-    const session: NativeSession = {
-      secret: randomBytes(32).toString("hex"),
-      session_id: randomUUID(),
-      ...config,
-      control_port: controlPort,
-      video_port: videoPort,
-      evaluation: this.evaluation,
-    };
-    await privateJson(this.sessionFile, session);
     const profileUrl = `https://meta.fabricmc.net/v2/versions/loader/1.21.4/${LOADER}/profile/json`;
     const loader = (await (
       await fetch(profileUrl, {
@@ -402,6 +382,11 @@ export class MinecraftClient {
     for (const lib of loader.libraries) {
       const [group, name, version] = lib.name.split(":");
       const relative = `${group!.replaceAll(".", "/")}/${name}/${version}/${name}-${version}.jar`;
+      const cached = cachedLibraries && path.join(cachedLibraries, relative);
+      if (cached && await exists(cached)) {
+        librariesByName.set(`${group}:${name}:`, cached);
+        continue;
+      }
       const file = path.join(this.dataDir, "native-libraries", relative);
       if (!(await exists(file))) {
         const url = `${lib.url}${relative}`;
@@ -414,42 +399,152 @@ export class MinecraftClient {
       }
       librariesByName.set(`${group}:${name}:`, file);
     }
-    const libraries = [
-      ...librariesByName.values(),
-      path.join(this.source, "versions/1.21.4/1.21.4.jar"),
-      mod,
+    return {
+      libraries: [
+        ...librariesByName.values(),
+        path.join(this.source, "versions/1.21.4/1.21.4.jar"),
+      ],
+      assetIndex: String(version.assetIndex.id),
+    };
+  }
+
+  private gameArguments(
+    profile: { name: string; id: string },
+    accessToken: string,
+    assetIndex: string,
+    address: string,
+  ) {
+    return [
+      "--username", profile.name,
+      "--uuid", profile.id,
+      "--accessToken", accessToken,
+      "--userType", "msa",
+      "--version", "1.21.4",
+      "--versionType", "release",
+      "--gameDir", this.directory,
+      "--assetsDir", path.join(this.source, "assets"),
+      "--assetIndex", assetIndex,
+      "--width", "1280",
+      "--height", "720",
+      "--quickPlayMultiplayer", address,
     ];
+  }
+
+  /** Stage and hash the exact pilot jar the fresh client will load. */
+  async stagePilotArtifact(artifact: string) {
+    const mods = path.join(this.directory, "mods");
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await mkdir(mods, { mode: 0o700 });
+    const installed = path.join(mods, "survival-pilot.jar");
+    await copyFile(artifact, installed);
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(installed)) hash.update(chunk);
+    return hash.digest("hex");
+  }
+
+  /** Launch the standalone pilot without the native bridge or its session file. */
+  async launchPilot(
+    config: {
+      runtimeCache: string;
+      port: number;
+      goal: string;
+      evidenceDir: string;
+      display: string;
+      authority: string;
+    },
+    signal: AbortSignal,
+  ) {
+    const { accessToken, profile } = await this.verifyOfficialSession(signal);
+    const tmp = path.join(this.directory, "tmp");
+    await mkdir(tmp, { mode: 0o700 });
+    await prepareFabricApi(this.directory, signal,
+      path.join(config.runtimeCache, "native-client/mods/fabric-api.jar"));
+    const { libraries, assetIndex } = await this.fabricClasspath(
+      signal, path.join(config.runtimeCache, "native-libraries"),
+    );
     await writeFile(
       path.join(this.directory, "options.txt"),
-      "version:4189\npauseOnLostFocus:false\nmaxFps:60\nenableVsync:false\nfullscreen:false\nrenderDistance:6\nsimulationDistance:6\nautoJump:false\nshowSubtitles:true\nchatVisibility:2\nonboardAccessibility:false\nskipMultiplayerWarning:true\ntutorialStep:none\n",
+      CLIENT_OPTIONS,
       { mode: 0o600 },
     );
-    const args = [
-      "--username",
-      profile.name,
-      "--uuid",
-      profile.id,
-      "--accessToken",
-      accessToken,
-      "--userType",
-      "msa",
-      "--version",
-      "1.21.4",
-      "--versionType",
-      "release",
-      "--gameDir",
-      this.directory,
-      "--assetsDir",
-      path.join(this.source, "assets"),
-      "--assetIndex",
-      version.assetIndex.id,
-      "--width",
-      "1280",
-      "--height",
-      "720",
-      "--quickPlayMultiplayer",
-      `${config.host}:${config.port}`,
-    ];
+    signal.throwIfAborted();
+    const child = spawn(this.java, [
+      ...javaProxyArguments(process.env),
+      "-Xms512M",
+      "-Xmx2048M",
+      "-XX:-CreateCoredumpOnCrash",
+      "-Djava.awt.headless=true",
+      `-Duser.home=${this.directory}`,
+      `-Djava.io.tmpdir=${tmp}`,
+      `-Dgh.pilot.dir=${config.evidenceDir}`,
+      `-Dgh.pilot.goal=${config.goal}`,
+      "-cp",
+      libraries.join(path.delimiter),
+      path.join(this.projectRoot,
+        "native/minecraft/src/main/java/io/gameharness/nativeclient/Bootstrap.java"),
+    ], {
+      cwd: this.directory,
+      detached: true,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        PATH: "/usr/bin:/bin", HOME: this.directory, TMPDIR: tmp, LANG: "C.UTF-8",
+        ALSOFT_DRIVERS: "null",
+        DISPLAY: config.display, XAUTHORITY: config.authority,
+      },
+    });
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve) => child.once("close", (code, signal) => resolve({ code, signal })),
+    );
+    child.on("error", () => {});
+    child.stdin.on("error", () => {});
+    // Drain output without persisting third-party messages that could include launch arguments.
+    const diagnostics = new Set<string>();
+    const diagnose = (bytes: Buffer) => {
+      for (const match of bytes.toString("utf8").matchAll(
+        /(?:^|\n)(?:GameHarness launch category: ([A-Za-z0-9_.$]+)|GHFRAME ([A-Za-z0-9_.$]+:\d+))(?=\r?\n|$)/g,
+      )) {
+        const entry = match[1] ?? match[2]!;
+        if (diagnostics.size < 24) diagnostics.add(entry);
+      }
+    };
+    child.stdout.on("data", diagnose);
+    child.stderr.on("data", diagnose);
+    const args = this.gameArguments(profile, accessToken, assetIndex, `127.0.0.1:${config.port}`);
+    child.stdin.end(JSON.stringify({ args }));
+    return { child, closed, diagnostics };
+  }
+
+  async launch(
+    config: {
+      host: string;
+      port: number;
+      world_id: string;
+      epoch: number;
+      motor_profile?: MotorProfile;
+    },
+    controlPort: number,
+    videoPort: number,
+    signal: AbortSignal,
+    prepared?: NativeArtifactContract,
+  ): Promise<NativeProcess> {
+    // A Source phase may outlive an earlier readiness pass. Never reuse its result.
+    const { accessToken, profile } = await this.verifyOfficialSession(signal);
+    await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    await chmod(this.directory, 0o700);
+    const mod = await prepareNativeMod(this.projectRoot, this.directory, signal, prepared);
+    const session: NativeSession = {
+      secret: randomBytes(32).toString("hex"),
+      session_id: randomUUID(),
+      ...config,
+      control_port: controlPort,
+      video_port: videoPort,
+      evaluation: this.evaluation,
+    };
+    await privateJson(this.sessionFile, session);
+    const { libraries, assetIndex } = await this.fabricClasspath(signal);
+    libraries.push(mod);
+    await writeFile(path.join(this.directory, "options.txt"), CLIENT_OPTIONS, { mode: 0o600 });
+    const args = this.gameArguments(profile, accessToken, assetIndex, `${config.host}:${config.port}`);
     signal.throwIfAborted();
     const silentAudio =
       process.env.GAMEHARNESS_NATIVE_AUDIO === "silent" ||

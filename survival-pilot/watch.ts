@@ -5,8 +5,8 @@ import { createServer, type ServerResponse } from "node:http";
 import type { Readable } from "node:stream";
 import path from "node:path";
 
-// A browser's native multipart JPEG viewer. No input channel, auth files or game
-// metadata are served. Anyone joining mid-frame receives the next JPEG boundary.
+// A browser's native multipart JPEG viewer. A new reader must start on a MIME
+// boundary, not halfway through the encoder's current JPEG.
 const port = 4379;
 const root = path.resolve(import.meta.dir, "../local/survival-pilot");
 const viewers = new Set<ServerResponse>();
@@ -14,6 +14,27 @@ let capture: ChildProcessByStdio<null, Readable, null> | undefined;
 let current = "";
 let busy = false;
 let stopping = false;
+const waiting = Bun.spawnSync(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+    "-i", "color=c=black:s=960x540", "-vf", "drawtext=text='Waiting for the next survival run':fontcolor=white:fontsize=24:x=(w-tw)/2:y=(h-th)/2",
+    "-frames:v", "1", "-threads", "1", "-f", "mjpeg", "pipe:1"]).stdout;
+const delimiter = Buffer.from("\r\n\r\n");
+let lastJpeg: Buffer = waiting;
+function send(viewer: ServerResponse, jpeg: Buffer) {
+    if (viewer.writableLength > 2_000_000) { viewer.destroy(); return; }
+    viewer.cork();
+    viewer.write(`--pilotframe\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.length}\r\n\r\n`);
+    viewer.write(jpeg);
+    viewer.write("\r\n");
+    viewer.uncork();
+}
+function idle() {
+    capture?.kill();
+    capture = undefined;
+    current = "";
+    if (lastJpeg === waiting) return;
+    lastJpeg = waiting;
+    for (const viewer of viewers) send(viewer, waiting);
+}
 
 async function tick() {
     if (busy || stopping) return;
@@ -45,9 +66,7 @@ async function tick() {
         }
         if (stopping) return;
         if (!source || !viewers.size || source.run !== current) {
-            capture?.kill();
-            capture = undefined;
-            current = "";
+            idle();
         }
         if (source && viewers.size && !capture) {
             const child = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-nostdin",
@@ -58,16 +77,29 @@ async function tick() {
             capture = child;
             current = source.run;
             child.on("error", () => {});
-            child.on("close", () => { if (capture === child) { capture = undefined; current = ""; } });
+            child.on("close", () => { if (capture === child) idle(); });
+            let pending: Buffer = Buffer.alloc(0);
+            let length = 0;
             child.stdout.on("data", (chunk: Buffer) => {
                 if (capture !== child) return;
-                for (const viewer of viewers) {
-                    if (viewer.writableLength > 2_000_000) viewer.destroy();
-                    else viewer.write(chunk);
+                pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+                while (pending.length) {
+                    if (!length) {
+                        const end = pending.indexOf(delimiter);
+                        if (end < 0) { if (pending.length > 512) idle(); return; }
+                        length = Number(/\bContent-length:\s*(\d+)/i.exec(pending.toString("ascii", 0, end))?.[1]);
+                        if (!(length > 0 && length <= 2_000_000)) { idle(); return; }
+                        pending = pending.subarray(end + delimiter.length);
+                    }
+                    if (pending.length < length) return;
+                    lastJpeg = pending.subarray(0, length);
+                    pending = pending.subarray(length);
+                    length = 0;
+                    for (const viewer of viewers) send(viewer, lastJpeg);
                 }
             });
         }
-    } catch { capture?.kill(); capture = undefined; current = ""; }
+    } catch { idle(); }
     finally { busy = false; }
 }
 
@@ -81,6 +113,7 @@ const server = createServer((req, res) => {
         "X-Content-Type-Options": "nosniff" });
     res.flushHeaders();
     viewers.add(res);
+    send(res, lastJpeg);
     res.on("close", () => { viewers.delete(res); void tick(); });
     void tick();
 });

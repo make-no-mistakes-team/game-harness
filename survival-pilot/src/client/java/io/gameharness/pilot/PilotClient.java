@@ -1,5 +1,6 @@
 package io.gameharness.pilot;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -22,6 +23,7 @@ import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.block.Blocks;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.registry.Registries;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.world.GameMode;
 
@@ -48,7 +50,21 @@ public final class PilotClient implements ClientModInitializer {
     private int sprintTicks;
     private int rockBroken;
     private BufferedWriter movement;
+    private long craftSequence;
+    private long stallSequence;
     private boolean ended;
+
+    private static JsonArray coordinates(Set<BlockPos> cells) {
+        JsonArray result = new JsonArray(cells.size());
+        for (BlockPos pos : cells) {
+            JsonArray xyz = new JsonArray(3);
+            xyz.add(pos.getX());
+            xyz.add(pos.getY());
+            xyz.add(pos.getZ());
+            result.add(xyz);
+        }
+        return result;
+    }
 
     @Override public void onInitializeClient() {
         String output = System.getProperty("gh.pilot.dir", System.getenv("GH_PILOT_DIR"));
@@ -69,6 +85,7 @@ public final class PilotClient implements ClientModInitializer {
         });
         ClientPlayerBlockBreakEvents.AFTER.register((world, player, pos, state) -> {
             if (progress == null || ended) return;
+            if (player == MinecraftClient.getInstance().player) progress.observeOwnBreak(pos, state);
             if (state.isOf(Blocks.STONE) || state.isOf(Blocks.DEEPSLATE) || state.isOf(Blocks.TUFF) ||
                 state.isOf(Blocks.GRANITE) || state.isOf(Blocks.DIORITE) || state.isOf(Blocks.ANDESITE)) ++rockBroken;
             JsonObject hit = new JsonObject();
@@ -176,12 +193,39 @@ public final class PilotClient implements ClientModInitializer {
         if (tick % 2 == 0 || ended) recordMovement(client, status);
         if (ended) closeMovement();
         String handStatus = hands.status();
-        boolean changed = screenChanged || !status.equals(lastStatus) || !handStatus.equals(lastHands);
+        var receipt = hands.lastCraftReceipt();
+        if (receipt != null && receipt.sequence() != craftSequence) {
+            craftSequence = receipt.sequence();
+            JsonObject craft = new JsonObject();
+            craft.addProperty("tick", tick);
+            craft.addProperty("wall_ms", System.currentTimeMillis());
+            craft.addProperty("recipe", receipt.recipe());
+            craft.addProperty("executions", receipt.executions());
+            craft.addProperty("items", receipt.items());
+            craft.addProperty("shift_clicks", receipt.shiftClicks());
+            craft.addProperty("revision", receipt.revision());
+            append("crafts.jsonl", craft + "\n");
+        }
+        var stall = progress.stallReport();
+        boolean changed = screenChanged || !status.equals(lastStatus) || !handStatus.equals(lastHands) ||
+            stall.eventSequence() != stallSequence;
         if (changed || tick % 20 == 0 || ended || tick == 1) {
             JsonObject event = new JsonObject();
             event.addProperty("tick", tick);
             event.addProperty("wall_ms", System.currentTimeMillis());
             event.addProperty("status", status);
+            event.addProperty("stall_phase", stall.phase());
+            event.addProperty("stall_detail", stall.detail());
+            event.addProperty("stall_incidents", stall.incidents());
+            event.addProperty("stall_attempts", stall.attempts());
+            event.addProperty("stall_recoveries", stall.recoveries());
+            event.addProperty("stall_failures", stall.failures());
+            event.addProperty("stall_incident_tick", stall.incidentTick());
+            var ceiling = body.headroomReport();
+            event.addProperty("short_jumps", ceiling.shortJumps());
+            event.addProperty("headroom_cleared", ceiling.cleared());
+            event.addProperty("headroom_bypasses", ceiling.bypasses());
+            event.addProperty("headroom_action", ceiling.reason());
             event.addProperty("hands", handStatus);
             event.addProperty("goal", goal);
             event.addProperty("alive", alive);
@@ -199,9 +243,33 @@ public final class PilotClient implements ClientModInitializer {
             event.addProperty("sprint_ticks", sprintTicks);
             event.addProperty("rock_broken", rockBroken);
             event.addProperty("food", client.player.getHungerManager().getFoodLevel());
+            event.addProperty("blocking", client.player.isBlocking());
+            event.addProperty("offhand", Registries.ITEM.getId(client.player.getOffHandStack().getItem()).toString());
+            event.addProperty("armor_points", client.player.getArmor());
+            event.addProperty("cave_openings", progress.caveOpenings());
+            event.addProperty("cave_steps", progress.caveFootsteps());
+            event.addProperty("water_drop_attempts", progress.fall().waterAttempts());
+            event.addProperty("water_drop_landings", progress.fall().waterSuccesses());
+            event.addProperty("boat_attempts", progress.fall().boatAttempts());
+            event.addProperty("boat_landings", progress.fall().boatSuccesses());
+            event.addProperty("meals_eaten", progress.mealsEaten());
+            event.addProperty("food_picked_up", progress.foodPickedUp());
+            event.addProperty("craft_shift_presses", hands.craftShiftClicks());
             event.addProperty("dimension", client.world.getRegistryKey().getValue().toString());
             if (goal.equals("nether_portal")) {
                 event.addProperty("frame_blocks", progress.confirmedFrameBlocks());
+                event.addProperty("cast_frame_blocks", progress.castFrameBlocks());
+                event.addProperty("cast_passive_blocks", progress.castPassiveBlocks());
+                event.addProperty("cast_lava_deposits", progress.castLavaDeposits());
+                if (progress.castFrameBlocks() == 10 && progress.castPassiveBlocks() == 2) {
+                    var report = progress.shoreCastReport();
+                    event.addProperty("cast_method", "shore");
+                    event.add("cast_passive_cells", coordinates(report.passiveFrameCells()));
+                    event.add("cast_poured_cells", coordinates(report.pouredFrameCells()));
+                }
+                event.addProperty("cast_phase", progress.castPhase());
+                event.addProperty("cast_survey_evidence", progress.castSurveyEvidence());
+                event.addProperty("lava_sources_seen", progress.witnessedLavaSources());
                 event.addProperty("ignited", progress.ignited());
             }
             event.addProperty("gui", client.currentScreen != null);
@@ -231,6 +299,7 @@ public final class PilotClient implements ClientModInitializer {
             } catch (IOException e) { body.release(); ended = true; throw new UncheckedIOException(e); }
             lastStatus = status;
             lastHands = handStatus;
+            stallSequence = stall.eventSequence();
             screenChanged = false;
         }
     }

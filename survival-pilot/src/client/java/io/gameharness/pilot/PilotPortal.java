@@ -23,8 +23,8 @@ import net.minecraft.world.World;
 
 /** Builds and enters a portal using observed materials, inventory receipts and vanilla input. */
 final class PilotPortal {
-    private static final int OBSIDIAN_COUNT = 10;
-    private static final double REACH = 4.25;
+    static final int OBSIDIAN_COUNT = 10;
+    static final double REACH = 4.25;
     private static final double SEARCH = 14;
     private static final Predicate<ItemStack> FLINT = item(Items.FLINT);
     private static final Predicate<ItemStack> GRAVEL_DROPS = stack -> stack.isOf(Items.GRAVEL) || FLINT.test(stack);
@@ -41,7 +41,7 @@ final class PilotPortal {
 
     // Corner filler supports the uprights and lets both lintel blocks attach to inward faces.
     // Each lift raises the camera enough to see the next upward face; the pillar isn't in the frame.
-    private record FrameBlock(int x, int y, int lift, int supportX, boolean obsidian) {}
+    record FrameBlock(int x, int y, int lift, int supportX, boolean obsidian) {}
     private static final FrameBlock[] FRAME = {
         new FrameBlock(0, 0, 0, 0, false), new FrameBlock(3, 0, 0, 3, false),
         new FrameBlock(1, 0, 0, 1, true), new FrameBlock(2, 0, 0, 2, true),
@@ -52,10 +52,14 @@ final class PilotPortal {
         new FrameBlock(1, 4, 3, 0, true), new FrameBlock(2, 4, 3, 3, true)
     };
 
-    private record Site(BlockPos stand, Direction facing) {
+    record Site(BlockPos stand, Direction facing, BlockPos base) {
+        Site(BlockPos stand, Direction facing) {
+            this(stand, facing, stand.offset(facing, 2));
+        }
+
         Direction axis() { return facing.rotateYClockwise(); }
         BlockPos at(int x, int y) {
-            return stand.offset(facing, 2).offset(axis(), x - 1).up(y);
+            return base.offset(axis(), x - 1).up(y);
         }
     }
 
@@ -65,10 +69,10 @@ final class PilotPortal {
         }
     }
 
-    private enum Placement { WAIT, DONE, BLOCKED }
+    enum Placement { WAIT, DONE, BLOCKED }
     private enum Phase { SUPPLY, SURVEY, BUILD, LOWER, LIGHT, ENTER }
 
-    private static final class Place {
+    static final class Place {
         final BlockPos support;
         final Direction face;
         final BlockPos dest;
@@ -94,6 +98,7 @@ final class PilotPortal {
     private final PilotBody body;
     private final PilotHands hands;
     private final PilotTools tools;
+    private final PilotShoreCast shoreCast;
     private final List<Site> rejectedSites = new ArrayList<>();
     private final BlockPos[] rejectedMaterials = new BlockPos[12];
     private final int[] rejectedUntil = new int[rejectedMaterials.length];
@@ -148,19 +153,60 @@ final class PilotPortal {
     private String invalidSite;
     private Place placement;
     private int ignitionUse;
+    private boolean castTraversal;
 
     PilotPortal(MinecraftClient client, PilotBody body, PilotHands hands, PilotTools tools) {
         this.client = client;
         this.body = body;
         this.hands = hands;
         this.tools = tools;
+        shoreCast = new PilotShoreCast(client, body, hands, this);
     }
 
     String status() { return status; }
     String failure() { return failure; }
     boolean won() { return won; }
-    int confirmedFrameBlocks() { return frameBlocks; }
+    int confirmedFrameBlocks() { return castTraversal ? shoreCast.confirmedFrameBlocks() : frameBlocks; }
+    int confirmedCastFrameBlocks() { return shoreCast.confirmedFrameBlocks(); }
+    long castSurveyEvidence() { return shoreCast.surveyEvidence(); }
+    String castPhase() { return castTraversal ? phase.name() : shoreCast.phaseName(); }
+    int witnessedSources() { return shoreCast.witnessedSources(); }
+    PilotShoreCast.Report shoreCastReport() { return shoreCast.report(); }
+    int passiveFrameBlocks() { return shoreCast.passiveFrameBlocks(); }
+    int depositedLavaSources() { return shoreCast.depositedLavaSources(); }
     boolean ignited() { return lit; }
+
+    boolean castEligible() {
+        return failure == null && (castTraversal || phase == Phase.SUPPLY && shoreCast.eligible());
+    }
+
+    void stepCast(PilotProgress progress) {
+        if (updateArrival() || failure != null || client.player == null || client.world == null) return;
+        ++tick;
+        if (castTraversal) {
+            if (phase == Phase.LIGHT) light();
+            else if (phase == Phase.ENTER) enter(progress);
+            return;
+        }
+        shoreCast.step(tick);
+        status = shoreCast.status();
+        if (shoreCast.blocked()) {
+            stop(status);
+            return;
+        }
+        Site built = shoreCast.completed();
+        if (built != null) {
+            site = built;
+            ignitionUse = 0;
+            castTraversal = true;
+            changePhase(Phase.LIGHT);
+        }
+    }
+
+    void rememberCaveLava(BlockHitResult sighting) {
+        lava = new Target(sighting);
+        fluidSince = tick;
+    }
 
     boolean updateArrival() {
         if (!won && lit && phase == Phase.ENTER && client.player != null && client.world != null
@@ -227,7 +273,9 @@ final class PilotPortal {
         changePhase(Phase.SURVEY);
     }
 
-    private Item fillerItem() {
+    int fillerCount() { return hands.count(FILLER); }
+
+    Item fillerItem() {
         var inv = client.player.getInventory();
         if (FILLER.test(inv.getMainHandStack())) return inv.getMainHandStack().getItem();
         for (int i = 0; i < PlayerInventory.MAIN_SIZE; ++i) {
@@ -692,8 +740,12 @@ final class PilotPortal {
         }
     }
 
-    private Placement place(Place work, boolean jump) {
-        if (tick - work.start > 105) return Placement.BLOCKED;
+    Placement place(Place work, boolean jump) {
+        return place(work, jump, tick);
+    }
+
+    Placement place(Place work, boolean jump, int now) {
+        if (now - work.start > 105) return Placement.BLOCKED;
         if (work.used != 0 && hands.count(work.item) < work.inventoryBefore) {
             Vec3d point = jump ? new Vec3d(client.player.getX(), work.dest.getY() + 0.75, client.player.getZ())
                 : Vec3d.ofCenter(work.dest);
@@ -710,14 +762,14 @@ final class PilotPortal {
             return Placement.WAIT;
         }
         if (client.player.getBoundingBox().intersects(new Box(work.dest))) {
-            if (jump && client.player.isOnGround() && tick - work.used >= 6) body.jump();
+            if (jump && client.player.isOnGround() && now - work.used >= 6) body.jump();
             return Placement.WAIT;
         }
-        if (tick - work.used >= 6) {
+        if (now - work.used >= 6) {
             // Sneak when interacting with blocks that could have their own use action.
             if (!jump) body.sneak();
             work.inventoryBefore = hands.count(work.item);
-            work.used = tick;
+            work.used = now;
             body.use(work.support, work.face);
         }
         return Placement.WAIT;
@@ -787,7 +839,11 @@ final class PilotPortal {
     private void light() {
         status = "igniting the built portal with flint and steel";
         if (tick - phaseSince > 165) {
-            rejectSite("flint and steel did not produce a visible portal in the built frame");
+            if (castTraversal) {
+                stop("flint and steel did not produce a visible portal in the compact shore frame at " + site.base());
+            } else {
+                rejectSite("flint and steel did not produce a visible portal in the built frame");
+            }
             return;
         }
         BlockPos base = site.at(1, 0);
@@ -795,7 +851,7 @@ final class PilotPortal {
         if (ignitionUse != 0) {
             body.aim(interior);
             BlockHitResult observed = observed(interior);
-            if (frameBlocks == OBSIDIAN_COUNT && observed != null && observed.getBlockPos().equals(base.up())
+            if (confirmedFrameBlocks() == OBSIDIAN_COUNT && observed != null && observed.getBlockPos().equals(base.up())
                     && state(observed).isOf(Blocks.NETHER_PORTAL)) {
                 lit = true;
                 changePhase(Phase.ENTER);
@@ -805,7 +861,8 @@ final class PilotPortal {
         }
         Vec3d point = facePoint(base, Direction.UP);
         body.aim(point);
-        if (!body.aligned(point) || !hands.equip(STEEL) || !selected(base, Direction.UP)) return;
+        if (!body.aligned(point) || !hands.equip(STEEL) || !STEEL.test(client.player.getMainHandStack())
+                || !selected(base, Direction.UP)) return;
         BlockHitResult support = supportFace(base, Direction.UP, point);
         if (support != null && state(support).isOf(Blocks.OBSIDIAN)) {
             body.use(base, Direction.UP);
@@ -827,6 +884,17 @@ final class PilotPortal {
             body.aim(goal.add(0, 1.4, 0));
             return;
         }
+        if (castTraversal) {
+            BlockPos base = inside.down();
+            Vec3d point = facePoint(base, Direction.UP);
+            body.aim(point);
+            BlockHitResult floor = body.terrain(point, REACH).orElse(null);
+            if (body.aligned(point) && floor != null && floor.getBlockPos().equals(base)
+                    && floor.getSide() == Direction.UP && state(floor).isOf(Blocks.OBSIDIAN)) {
+                body.walkDownTo(goal);
+            }
+            return;
+        }
         Vec3d fromStand = client.player.getPos().subtract(Vec3d.ofBottomCenter(site.stand));
         Direction axis = site.axis();
         Direction facing = site.facing;
@@ -840,7 +908,7 @@ final class PilotPortal {
         moveKnown(delta, delta.y > 0.36 && delta.horizontalLengthSquared() < 1.4 * 1.4);
     }
 
-    private boolean center(BlockPos stance) {
+    boolean center(BlockPos stance) {
         Vec3d delta = Vec3d.ofBottomCenter(stance).subtract(client.player.getPos());
         if (Math.abs(delta.y) > 0.22 || !client.player.isOnGround()) return false;
         if (delta.horizontalLengthSquared() < 0.19 * 0.19) return true;
@@ -876,11 +944,11 @@ final class PilotPortal {
 
     private BlockState state(BlockHitResult hit) { return client.world.getBlockState(hit.getBlockPos()); }
 
-    private static Vec3d facePoint(BlockPos pos, Direction face) {
+    static Vec3d facePoint(BlockPos pos, Direction face) {
         return Vec3d.ofCenter(pos).add(face.getOffsetX() * 0.49, face.getOffsetY() * 0.49, face.getOffsetZ() * 0.49);
     }
 
-    private static boolean usableSupport(BlockState state) {
+    static boolean usableSupport(BlockState state) {
         return !state.isReplaceable() && state.getFluidState().isEmpty() && !state.isOf(Blocks.MAGMA_BLOCK)
             && !state.isOf(Blocks.CACTUS) && !state.isOf(Blocks.POWDER_SNOW) && !state.isOf(Blocks.CAMPFIRE)
             && !state.isOf(Blocks.SOUL_CAMPFIRE) && !state.isOf(Blocks.POINTED_DRIPSTONE)

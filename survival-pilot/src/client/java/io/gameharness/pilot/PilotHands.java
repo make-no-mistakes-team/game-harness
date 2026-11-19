@@ -3,7 +3,7 @@ package io.gameharness.pilot;
 import io.gameharness.pilot.mixin.PilotHandledScreenAccess;
 import io.gameharness.pilot.mixin.PilotMouseAccess;
 import java.util.ArrayDeque;
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Predicate;
 import net.minecraft.client.MinecraftClient;
@@ -42,10 +42,11 @@ final class PilotHands {
 
     private enum Job { CRAFT, SMELT, EQUIP }
 
-    private enum Mode { TAKE, RESULT, ONE, PUT, STORE, SWAP, CLEAR_BOOK }
+    private enum Mode { TAKE, HALF, RESULT, QUICK_RESULT, ONE, PUT, STORE, SWAP, CLEAR_BOOK }
 
     private enum Recipe {
         PLANKS(null, 4, "l"),
+        BOAT(null, 1, "p p", "ppp"),
         CRAFTING_TABLE(Items.CRAFTING_TABLE, 1, "pp", "pp"),
         STICK(Items.STICK, 4, "p", "p"),
         WOODEN_PICKAXE(Items.WOODEN_PICKAXE, 1, "ppp", " s ", " s "),
@@ -61,6 +62,11 @@ final class PilotHands {
         BUCKET(Items.BUCKET, 1, "i i", " i "),
         FLINT_AND_STEEL(Items.FLINT_AND_STEEL, 1, "if"), // Shapeless; place both in the first row.
         STONE_SWORD(Items.STONE_SWORD, 1, "r", "r", "s"),
+        SHIELD(Items.SHIELD, 1, "wiw", "www", " w "),
+        IRON_CHESTPLATE(Items.IRON_CHESTPLATE, 1, "i i", "iii", "iii"),
+        IRON_LEGGINGS(Items.IRON_LEGGINGS, 1, "iii", "i i", "i i"),
+        IRON_HELMET(Items.IRON_HELMET, 1, "iii", "i i"),
+        IRON_BOOTS(Items.IRON_BOOTS, 1, "i i", "i i"),
         TORCH(Items.TORCH, 4, "c", "s");
 
         final Item output;
@@ -80,7 +86,12 @@ final class PilotHands {
 
     private record CraftRequest(Recipe recipe, String key) {}
 
-    private record CraftPlan(Recipe recipe, Item result, int batch, int[] sources, int[] used) {}
+    private record Portion(int source, int cell, int count) {}
+
+    private record CraftPlan(Recipe recipe, ItemStack result, int executions, ItemStack[] cells,
+                             List<Portion> portions, int[] used) {}
+
+    record CraftReceipt(long sequence, String recipe, int executions, int items, int shiftClicks, int revision) {}
 
     private record Step(Mode mode, Slot slot, Item item, int count) {}
 
@@ -99,7 +110,7 @@ final class PilotHands {
             this.bookButton = bookButton;
             cursorBefore = cursor.copy();
             slotBefore = slot.copy();
-            button = step.mode == Mode.ONE ? GLFW_MOUSE_BUTTON_RIGHT : GLFW_MOUSE_BUTTON_LEFT;
+            button = step.mode == Mode.ONE || step.mode == Mode.HALF ? GLFW_MOUSE_BUTTON_RIGHT : GLFW_MOUSE_BUTTON_LEFT;
         }
     }
 
@@ -112,7 +123,11 @@ final class PilotHands {
     private Slot lastLeftSlot;
     private long nextSameLeftPress;
     private CraftRequest[] crafts;
-    private CraftPlan firstCraftPlan;
+    private CraftPlan craftPlan;
+    private ItemStack[] craftStorage;
+    private int craftGridRevision, craftTakeRevision;
+    private long craftSettleDeadline, craftShiftClicks;
+    private CraftReceipt craftReceipt;
     private int craftIndex;
     private ItemStack equipStack = ItemStack.EMPTY;
     private int equipSource, hotbar;
@@ -130,8 +145,32 @@ final class PilotHands {
         return job != null;
     }
 
+    /** A boat cannot use mixed plank species. Only append optional boat work to
+     * a workshop session when the planned plank conversions preserve one species. */
+    boolean singleBoatWoodStock() {
+        if (c.player == null) return false;
+        Item species = null;
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; ++slot) {
+            ItemStack stack = c.player.getInventory().getStack(slot);
+            Item wood = stack.isIn(ItemTags.PLANKS) ? stack.getItem() :
+                stack.isIn(ItemTags.LOGS) ? planksFor(stack) : null;
+            if (wood == null) continue;
+            if (species != null && species != wood) return false;
+            species = wood;
+        }
+        return species != null;
+    }
+
     String status() {
         return status;
+    }
+
+    CraftReceipt lastCraftReceipt() {
+        return craftReceipt;
+    }
+
+    long craftShiftClicks() {
+        return craftShiftClicks;
     }
 
     int count(Predicate<ItemStack> item) {
@@ -170,15 +209,12 @@ final class PilotHands {
             requests[i++] = request;
         }
         CraftRequest first = requests[0];
-        CraftPlan plan = ingredients(c.player.getInventory(), first.recipe, first.key);
-        if (plan == null) return report("craft", "missing ingredients for " + first.key);
-        if (!storageRoom(new ItemStack(plan.result, plan.batch), plan.used))
-            return report("craft", "inventory full");
+        if (findCraftPlan(requests, 0) == null)
+            return report("craft", "missing compatible ingredients or storage room for " + first.key);
 
         String name = requests.length == 1 ? "craft " + first.key : "craft batch (" + requests.length + ")";
         start(Job.CRAFT, name, (HandledScreen<?>) current);
         crafts = requests;
-        firstCraftPlan = plan;
         inventoryNeeded = true;
         return true;
     }
@@ -188,6 +224,7 @@ final class PilotHands {
         String key = item.startsWith("minecraft:") ? item.substring("minecraft:".length()) : item;
         Recipe recipe = switch (key) {
             case "planks" -> Recipe.PLANKS;
+            case "boat" -> Recipe.BOAT;
             case "crafting_table" -> Recipe.CRAFTING_TABLE;
             case "stick", "sticks" -> Recipe.STICK;
             case "wooden_pickaxe" -> Recipe.WOODEN_PICKAXE;
@@ -203,13 +240,21 @@ final class PilotHands {
             case "bucket" -> Recipe.BUCKET;
             case "flint_and_steel" -> Recipe.FLINT_AND_STEEL;
             case "stone_sword" -> Recipe.STONE_SWORD;
+            case "shield" -> Recipe.SHIELD;
+            case "iron_chestplate" -> Recipe.IRON_CHESTPLATE;
+            case "iron_leggings" -> Recipe.IRON_LEGGINGS;
+            case "iron_helmet" -> Recipe.IRON_HELMET;
+            case "iron_boots" -> Recipe.IRON_BOOTS;
             case "torch", "torches" -> Recipe.TORCH;
             default -> {
+                if (vanillaBoat(key) != null) yield Recipe.BOAT;
                 Identifier id = key.endsWith("_planks") && key.indexOf(':') < 0 ? Identifier.tryParse(key) : null;
                 yield id != null && Registries.ITEM.get(id).getRegistryEntry().isIn(ItemTags.PLANKS)
                         ? Recipe.PLANKS : null;
             }
         };
+        if (recipe == Recipe.STICK) key = "stick";
+        if (recipe == Recipe.TORCH) key = "torch";
         return recipe == null ? null : new CraftRequest(recipe, key);
     }
 
@@ -439,7 +484,8 @@ final class PilotHands {
         if (!steps.isEmpty()) {
             Step next = steps.peekFirst();
             ItemStack stack = next.slot.getStack();
-            if (next.mode == Mode.RESULT && !matches(stack, next)) {
+            if (isResult(next) && (!matches(stack, next) || job == Job.CRAFT
+                    && screen.getScreenHandler().getRevision() == craftGridRevision)) {
                 if (resultDeadline == 0) resultDeadline = now + RESULT_TIMEOUT;
                 if (now >= resultDeadline) finish("expected result not visible");
                 return;
@@ -494,8 +540,22 @@ final class PilotHands {
                 finish("slot changed before press");
                 return;
             }
+            boolean craftOutput = job == Job.CRAFT && isResult(click.step);
+            if (craftOutput && !craftReady((AbstractCraftingScreenHandler) handler)) {
+                finish("ingredients or storage changed before craft output");
+                return;
+            }
             c.setNavigationType(GuiNavigationType.MOUSE);
-            screen.mouseClicked(x, y, click.button);
+            if (craftOutput) craftTakeRevision = handler.getRevision();
+            if (click.step.mode == Mode.QUICK_RESULT) {
+                if (!((PilotCraftClick) screen).pilot$shiftClickResult(slot, x, y)) {
+                    finish("vanilla rejected crafting Shift click");
+                    return;
+                }
+                craftShiftClicks++;
+            } else {
+                screen.mouseClicked(x, y, click.button);
+            }
             if (leftSlotPress) {
                 lastLeftSlot = slot;
                 nextSameLeftPress = now + LEFT_CLICK_INTERVAL;
@@ -507,6 +567,8 @@ final class PilotHands {
                 finish("furnace slot changed before release");
                 return;
             }
+            if (job == Job.CRAFT && (click.step.mode == Mode.ONE || click.step.mode == Mode.PUT)
+                    && !isStorage(slot)) craftGridRevision = handler.getRevision();
             screen.mouseReleased(x, y, click.button);
             if (click.step.mode == Mode.CLEAR_BOOK) {
                 if (bookHidesSlots()) finish("recipe book did not close");
@@ -515,12 +577,17 @@ final class PilotHands {
                 if (!clickEffect(click, cursor)) finish("slot gesture had no expected effect");
                 else if (click.step.mode == Mode.STORE && cursor.isEmpty()) resultStored = true;
             }
+            if (busy()) deadline = now + ACTION_TIMEOUT;
             if (busy() && previousFailure) {
                 previousFailure = false;
                 status = label + ": working";
             }
             click = null;
         }
+    }
+
+    private static boolean isResult(Step step) {
+        return step.mode == Mode.RESULT || step.mode == Mode.QUICK_RESULT;
     }
 
     private boolean isFurnacePlacement() {
@@ -580,9 +647,10 @@ final class PilotHands {
         Slot slot = step.slot;
         ItemStack stack = slot.getStack();
         boolean allowed = switch (step.mode) {
-            case TAKE -> cursor.isEmpty() && matches(stack, step) && slot.canTakeItems(c.player);
+            case TAKE, HALF -> cursor.isEmpty() && matches(stack, step) && slot.canTakeItems(c.player);
             case RESULT -> cursor.isEmpty() && matches(stack, step) && slot.canTakeItems(c.player)
                     && storageRoom(stack, null);
+            case QUICK_RESULT -> cursor.isEmpty() && matches(stack, step) && slot.canTakeItems(c.player);
             case ONE -> cursor.isOf(step.item) && room(slot, cursor) >= 1;
             case PUT -> cursor.isOf(step.item) && room(slot, cursor) >= cursor.getCount();
             case STORE -> cursor.isOf(step.item) && room(slot, cursor) > 0;
@@ -601,10 +669,12 @@ final class PilotHands {
     private boolean clickEffect(Click click, ItemStack cursor) {
         return switch (click.step.mode) {
             case TAKE -> ItemStack.areEqual(click.slotBefore, cursor);
+            case HALF -> same(click.slotBefore, cursor) && cursor.getCount() == (click.slotBefore.getCount() + 1) / 2;
             case RESULT -> job == Job.SMELT
                     // The server can finish another item before processing the pickup.
                     ? same(click.slotBefore, cursor) && cursor.getCount() >= click.slotBefore.getCount()
                     : ItemStack.areEqual(click.slotBefore, cursor);
+            case QUICK_RESULT -> cursor.isEmpty(); // Only the later server-backed receipt counts as production.
             case ONE -> cursor.getCount() == click.cursorBefore.getCount() - 1
                     && (cursor.isEmpty() || same(cursor, click.cursorBefore));
             case PUT -> cursor.isEmpty();
@@ -623,19 +693,34 @@ final class PilotHands {
 
     private boolean planNextCraft() {
         CraftRequest request = crafts[craftIndex];
-        CraftPlan plan = firstCraftPlan;
-        firstCraftPlan = null;
-        if (plan == null) plan = ingredients(c.player.getInventory(), request.recipe, request.key);
-        if (plan == null) finish("missing ingredients for " + request.key);
+        CraftPlan plan = findCraftPlan(crafts, craftIndex);
+        if (plan == null) finish("missing compatible ingredients or storage room for " + request.key);
         else if (!planCraft(plan)) finish("inventory or crafting grid changed before " + request.key);
-        else return true;
+        else {
+            craftPlan = plan;
+            return true;
+        }
         return false;
     }
 
     private void completeCraft(long now) {
-        if (!cleanGrid(screen)) {
-            finish("crafting grid did not clear");
-        } else if (++craftIndex == crafts.length) {
+        var handler = screen.getScreenHandler();
+        int quantity = craftPlan.executions * craftPlan.result.getCount();
+        // The server recomputes the result after each take, and a multi-craft's later results
+        // are not client-predicted. Wait for authoritative slot revisions and the full footprint.
+        if (handler.getRevision() == craftTakeRevision || !cleanGrid(screen) || !craftStorageMatches(quantity)) {
+            if (craftSettleDeadline == 0) craftSettleDeadline = now + RESULT_TIMEOUT;
+            if (now >= craftSettleDeadline) finish("craft output did not settle; expected " + quantity);
+            return;
+        }
+        long sequence = craftReceipt == null ? 1 : craftReceipt.sequence + 1;
+        craftReceipt = new CraftReceipt(sequence, crafts[craftIndex].key, craftPlan.executions, quantity,
+                craftPlan.executions > 1 ? 1 : 0, handler.getRevision());
+        craftIndex += craftPlan.executions;
+        craftPlan = null;
+        craftStorage = null;
+        craftSettleDeadline = 0;
+        if (craftIndex == crafts.length) {
             finish("done");
         } else {
             // The next plan must see the actual storage after this recipe, not a projected inventory.
@@ -646,36 +731,71 @@ final class PilotHands {
         }
     }
 
-    private boolean planCraft(CraftPlan craftPlan) {
-        if (!cleanGrid(screen) || !storageRoom(new ItemStack(craftPlan.result, craftPlan.batch), craftPlan.used))
-            return false;
+    private boolean planCraft(CraftPlan plan) {
+        if (!cleanGrid(screen)) return false;
         var handler = (AbstractCraftingScreenHandler) screen.getScreenHandler();
         List<Slot> grid = handler.getInputSlots();
-        int side = screen instanceof CraftingScreen ? 3 : 2;
-        var rows = craftPlan.recipe.rows;
-        int width = rows[0].length();
-        for (int i = 0; i < craftPlan.used.length; i++) {
-            if (craftPlan.used[i] == 0) continue;
+        int width = plan.recipe.rows[0].length(), side = screen instanceof CraftingScreen ? 3 : 2;
+        var inventory = c.player.getInventory();
+        craftStorage = new ItemStack[PlayerInventory.MAIN_SIZE];
+        for (int i = 0; i < plan.used.length; i++) {
+            int used = plan.used[i];
+            ItemStack held = inventory.getStack(i);
+            int after = held.getCount() - used;
+            if (after < 0) return false;
+            craftStorage[i] = after == 0 ? ItemStack.EMPTY : held.copyWithCount(after);
+            if (used == 0) continue;
             Slot source = storageSlot(handler, i);
-            if (source == null || source.getStack().getCount() < craftPlan.used[i]) return false;
-            ItemStack stack = source.getStack();
-            Item material = stack.getItem();
-            steps.addLast(new Step(Mode.TAKE, source, material, stack.getCount()));
-            int remaining = stack.getCount();
-            for (int cell = 0; cell < craftPlan.sources.length; cell++) {
-                if (craftPlan.sources[cell] != i) continue;
-                int row = cell / width, col = cell % width;
-                char ingredient = rows[row].charAt(col);
-                if (!ingredientMatches(ingredient, stack)
-                        || ingredient == 'l' && planksFor(stack) != craftPlan.result) return false;
-                Slot dest = grid.get(row * side + col);
-                steps.addLast(new Step(remaining-- == 1 ? Mode.PUT : Mode.ONE, dest, material, 0));
+            if (source == null) return false;
+            Item material = held.getItem();
+            boolean half = held.getCount() > 1 && used == (held.getCount() + 1) / 2;
+            steps.addLast(new Step(half ? Mode.HALF : Mode.TAKE, source, material, held.getCount()));
+            int remaining = half ? used : held.getCount();
+            for (Portion portion : plan.portions) {
+                if (portion.source != i) continue;
+                int cell = portion.cell, amount = portion.count;
+                if (!same(held, plan.cells[cell])) return false;
+                Slot dest = grid.get((cell / width) * side + cell % width);
+                if (remaining == amount) {
+                    steps.addLast(new Step(Mode.PUT, dest, material, 0));
+                } else {
+                    for (int n = 0; n < amount; n++) steps.addLast(new Step(Mode.ONE, dest, material, 0));
+                }
+                remaining -= amount;
             }
             if (remaining > 0) steps.addLast(new Step(Mode.PUT, source, material, 0));
         }
-        steps.addLast(new Step(Mode.RESULT, handler.getOutputSlot(), craftPlan.result, craftPlan.batch));
-        storeResult = true;
+        steps.addLast(new Step(plan.executions > 1 ? Mode.QUICK_RESULT : Mode.RESULT, handler.getOutputSlot(),
+                plan.result.getItem(), plan.result.getCount()));
+        storeResult = plan.executions == 1;
         return true;
+    }
+
+    private boolean craftReady(AbstractCraftingScreenHandler handler) {
+        if (handler.getRevision() == craftGridRevision || !craftStorageMatches(0)
+                || !ItemStack.areEqual(handler.getOutputSlot().getStack(), craftPlan.result)) return false;
+        int width = craftPlan.recipe.rows[0].length(), side = screen instanceof CraftingScreen ? 3 : 2;
+        List<Slot> grid = handler.getInputSlots();
+        for (int i = 0; i < grid.size(); i++) {
+            int row = i / side, column = i % side;
+            ItemStack expected = row < craftPlan.recipe.rows.length && column < width
+                    ? craftPlan.cells[row * width + column] : ItemStack.EMPTY;
+            if (!ItemStack.areEqual(grid.get(i).getStack(), expected)) return false;
+        }
+        return true;
+    }
+
+    private boolean craftStorageMatches(int outputGain) {
+        var inventory = c.player.getInventory();
+        for (int i = 0; i < craftStorage.length; i++) {
+            ItemStack expected = craftStorage[i], actual = inventory.getStack(i);
+            if (ItemStack.areEqual(expected, actual)) continue;
+            if (outputGain <= 0 || !same(actual, craftPlan.result)
+                    || !expected.isEmpty() && !same(actual, expected)
+                    || actual.getCount() <= expected.getCount()) return false;
+            outputGain -= actual.getCount() - expected.getCount();
+        }
+        return outputGain == 0;
     }
 
     private boolean planEquip() {
@@ -770,7 +890,9 @@ final class PilotHands {
         click = null;
         lastLeftSlot = null;
         crafts = null;
-        firstCraftPlan = null;
+        craftPlan = null;
+        craftStorage = null;
+        craftSettleDeadline = 0;
         craftIndex = 0;
         equipStack = ItemStack.EMPTY;
         steps.clear();
@@ -778,39 +900,103 @@ final class PilotHands {
         resultDeadline = 0;
     }
 
-    private static CraftPlan ingredients(PlayerInventory inv, Recipe recipe, String key) {
-        int width = recipe.rows[0].length();
-        int[] sources = new int[recipe.rows.length * width];
-        int[] used = new int[PlayerInventory.MAIN_SIZE];
-        Arrays.fill(sources, -1);
-        Item result = recipe.output;
-        int batch = recipe.batch;
-        for (int cell = 0; cell < sources.length; cell++) {
-            char ingredient = recipe.rows[cell / width].charAt(cell % width);
-            if (ingredient == ' ') continue;
-            for (int i = 0; i < used.length; i++) {
-                ItemStack stack = inv.getStack(i);
-                if (stack.getCount() <= used[i] || !ingredientMatches(ingredient, stack)) continue;
-                if (ingredient == 'l') {
-                    Item planks = planksFor(stack);
-                    if (planks == null || !key.equals("planks") && !Registries.ITEM.getId(planks).getPath().equals(key))
-                        continue;
-                    result = planks;
-                    if (planks == Items.BAMBOO_PLANKS) batch = 2;
-                }
-                sources[cell] = i;
-                used[i]++;
-                break;
+    private CraftPlan findCraftPlan(CraftRequest[] requests, int index) {
+        CraftRequest request = requests[index];
+        int limit = Math.min(requests.length - index, 64); // Vanilla ingredient stack ceiling.
+        int runs = 1;
+        while (runs < limit && request.equals(requests[index + runs])) runs++;
+        var inventory = c.player.getInventory();
+        for (int executions = runs; executions > 0; executions--) {
+            if (request.recipe == Recipe.BOAT) {
+                CraftPlan plan = boatIngredients(inventory, request, executions);
+                if (plan != null) return plan;
+            } else {
+                CraftPlan plan = ingredients(inventory, request, executions, null, request.recipe.output);
+                if (plan != null && storageRoom(plan.result, plan.result.getCount() * executions, plan.used))
+                    return plan;
             }
-            if (sources[cell] < 0) return null;
         }
-        return new CraftPlan(recipe, result, batch, sources, used);
+        return null;
+    }
+
+    private CraftPlan boatIngredients(PlayerInventory inventory, CraftRequest request, int executions) {
+        Item requestedBoat = request.key.equals("boat") ? null : vanillaBoat(request.key);
+        for (int i = 0; i < PlayerInventory.MAIN_SIZE; i++) {
+            ItemStack stack = inventory.getStack(i);
+            if (!stack.isIn(ItemTags.PLANKS)) continue;
+            Item planks = stack.getItem();
+            boolean seen = false;
+            for (int j = 0; j < i && !seen; j++) seen = inventory.getStack(j).isOf(planks);
+            if (seen) continue;
+            Item boat = boatFor(planks);
+            if (boat == null || requestedBoat != null && boat != requestedBoat) continue;
+            CraftPlan plan = ingredients(inventory, request, executions, planks, boat);
+            if (plan != null && storageRoom(plan.result, executions, plan.used)) return plan;
+        }
+        return null;
+    }
+
+    private static CraftPlan ingredients(PlayerInventory inv, CraftRequest request, int executions,
+                                         Item exactMaterial, Item result) {
+        Recipe recipe = request.recipe;
+        int width = recipe.rows[0].length();
+        ItemStack[] cells = new ItemStack[recipe.rows.length * width];
+        int[] used = new int[PlayerInventory.MAIN_SIZE];
+        var portions = new ArrayList<Portion>();
+        int batch = recipe.batch;
+        for (int cell = 0; cell < cells.length; cell++) {
+            char ingredient = recipe.rows[cell / width].charAt(cell % width);
+            if (ingredient == ' ') {
+                cells[cell] = ItemStack.EMPTY;
+                continue;
+            }
+            ItemStack material = findIngredient(inv, used, ingredient, request.key, executions, exactMaterial);
+            if (material == null) return null;
+            if (ingredient == 'l') {
+                result = planksFor(material);
+                if (result == Items.BAMBOO_PLANKS) batch = 2;
+            }
+            cells[cell] = material.copyWithCount(executions);
+            int remaining = executions;
+            // Multiple storage stacks can feed a cell, but only when vanilla can stack them together.
+            for (int i = 0; i < used.length && remaining > 0; i++) {
+                ItemStack stack = inv.getStack(i);
+                int amount = Math.min(remaining, stack.getCount() - used[i]);
+                if (amount <= 0 || !same(stack, material)) continue;
+                portions.add(new Portion(i, cell, amount));
+                used[i] += amount;
+                remaining -= amount;
+            }
+        }
+        return new CraftPlan(recipe, new ItemStack(result, batch), executions, cells, portions, used);
+    }
+
+    private static ItemStack findIngredient(PlayerInventory inv, int[] used, char ingredient, String key,
+                                            int quantity, Item exactMaterial) {
+        for (int i = 0; i < used.length; i++) {
+            ItemStack stack = inv.getStack(i);
+            int amount = stack.getCount() - used[i];
+            if (amount <= 0 || stack.getMaxCount() < quantity || !ingredientMatches(ingredient, stack)
+                    || exactMaterial != null && !stack.isOf(exactMaterial)) continue;
+            if (ingredient == 'l') {
+                Item planks = planksFor(stack);
+                if (planks == null || !key.equals("planks") && !Registries.ITEM.getId(planks).getPath().equals(key))
+                    continue;
+            }
+            for (int j = i + 1; j < used.length && amount < quantity; j++) {
+                ItemStack other = inv.getStack(j);
+                if (other.getCount() > used[j] && same(stack, other)) amount += other.getCount() - used[j];
+            }
+            if (amount >= quantity) return stack;
+        }
+        return null;
     }
 
     private static boolean ingredientMatches(char token, ItemStack stack) {
         return switch (token) {
             case 'l' -> stack.isIn(ItemTags.LOGS) || stack.isIn(ItemTags.BAMBOO_BLOCKS);
             case 'p' -> stack.isIn(ItemTags.PLANKS);
+            case 'w' -> stack.isIn(ItemTags.WOODEN_TOOL_MATERIALS);
             case 's' -> stack.isOf(Items.STICK);
             case 'r' -> stack.isIn(ItemTags.STONE_TOOL_MATERIALS);
             case 'm' -> stack.isIn(ItemTags.STONE_CRAFTING_MATERIALS);
@@ -832,6 +1018,23 @@ final class PilotHands {
         if (to <= from) return null;
         Item planks = Registries.ITEM.get(Identifier.ofVanilla(path.substring(from, to) + "_planks"));
         return planks == Items.AIR ? null : planks;
+    }
+
+    private static Item boatFor(Item planks) {
+        var id = Registries.ITEM.getId(planks);
+        String suffix = "_planks", path = id.getPath();
+        if (!id.getNamespace().equals("minecraft") || !path.endsWith(suffix)) return null;
+        return planks == Items.BAMBOO_PLANKS ? Items.BAMBOO_RAFT
+                : vanillaBoat(path.substring(0, path.length() - suffix.length()) + "_boat");
+    }
+
+    private static Item vanillaBoat(String key) {
+        if (key.indexOf(':') >= 0 || !key.endsWith("_boat") && !key.equals("bamboo_raft")) return null;
+        Identifier id = Identifier.tryParse(key);
+        if (id == null) return null;
+        Item boat = Registries.ITEM.get(id);
+        var entry = boat.getRegistryEntry();
+        return entry.isIn(ItemTags.BOATS) && !entry.isIn(ItemTags.CHEST_BOATS) ? boat : null;
     }
 
     private static boolean cleanGrid(HandledScreen<?> screen) {
@@ -869,8 +1072,11 @@ final class PilotHands {
     }
 
     private boolean storageRoom(ItemStack result, int[] used) {
+        return storageRoom(result, result.getCount(), used);
+    }
+
+    private boolean storageRoom(ItemStack result, int remaining, int[] used) {
         var inv = c.player.getInventory();
-        int remaining = result.getCount();
         for (int i = 0; i < PlayerInventory.MAIN_SIZE; i++) {
             ItemStack stack = inv.getStack(i);
             int held = stack.getCount() - (used == null ? 0 : used[i]);
@@ -885,7 +1091,8 @@ final class PilotHands {
     private Slot resultDestination(ScreenHandler handler, ItemStack stack) {
         boolean preferHotbar = stack.isOf(Items.CRAFTING_TABLE) || stack.isOf(Items.FURNACE)
                 || stack.isOf(Items.BUCKET) || stack.isOf(Items.FLINT_AND_STEEL)
-                || stack.isIn(ItemTags.PICKAXES) || stack.isIn(ItemTags.SHOVELS) || stack.isIn(ItemTags.SWORDS);
+                || stack.isIn(ItemTags.PICKAXES) || stack.isIn(ItemTags.SHOVELS) || stack.isIn(ItemTags.SWORDS)
+                || stack.isIn(ItemTags.BOATS);
         Slot best = null;
         int bestScore = 0;
         for (Slot slot : handler.slots) {

@@ -1,0 +1,927 @@
+package io.gameharness.pilot;
+
+import static io.gameharness.pilot.PilotPortal.REACH;
+import static io.gameharness.pilot.PilotPortal.facePoint;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.function.Predicate;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.item.BlockItem;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.registry.tag.FluidTags;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.world.World;
+
+/** One-bucket Java shore cast. Coordinates below are from the pool, looking back toward shore. */
+final class PilotShoreCast {
+    static final int MINIMUM_LAVA_POURS = 8;
+    private static final int MINIMUM_FILLER = 9; // Including optional side footing and lintel rehydration support.
+    private static final int FLOW_SETTLE = 35;
+    private static final double SURVEY_REACH = 5.75;
+    private static final Predicate<ItemStack> BUCKET = item(Items.BUCKET);
+    private static final Predicate<ItemStack> WATER = item(Items.WATER_BUCKET);
+    private static final Predicate<ItemStack> LAVA = item(Items.LAVA_BUCKET);
+    private static final Predicate<ItemStack> STEEL = item(Items.FLINT_AND_STEEL);
+    private static final Predicate<ItemStack> PICK = stack -> stack.isOf(Items.STONE_PICKAXE)
+        || stack.isOf(Items.IRON_PICKAXE) || stack.isOf(Items.DIAMOND_PICKAXE);
+    private static final Predicate<ItemStack> BREAKER = stack -> PICK.test(stack) || stack.isOf(Items.STONE_SHOVEL)
+        || stack.isOf(Items.IRON_SHOVEL);
+
+    private record Cell(int x, int y, int z) {}
+    private record Layout(BlockPos edge, Direction shore) {
+        Direction across() { return shore.rotateYClockwise(); }
+        BlockPos at(Cell cell) { return at(cell.x, cell.y, cell.z); }
+        BlockPos at(int x, int y, int z) {
+            return edge.offset(across(), x).offset(shore, -z).up(y);
+        }
+    }
+    private record Proof(BlockPos pos, String kind) {}
+    private record Source(BlockPos pos, Vec3d point) {}
+    record Report(String phase, BlockPos target, String check, String observed, int sources, int neededSources,
+            int minimumLavaPours, int lavaScoopReceipts, int lavaPourReceipts, int waterPourReceipts,
+            int waterRecoveryReceipts, Set<BlockPos> pouredFrameCells, Set<BlockPos> passiveFrameCells) {}
+
+    private enum Phase {
+        IDLE, SURVEY_EDGE, BANK, SURVEY_RESERVE, SUPPLY, PLUG, BASE_WATER, UNPLUG, STRIP,
+        SIDE_FOOTING, CROSS, EXCAVATE, SCOOP, POUR, TOWER, DAM, NOTCH, RECOVER_BASE,
+        UPPER_WATER, LINTEL_CHECK, RECOVER_UPPER, LINTEL_SUPPORT, LINTEL_WATER, RECOVER_FINAL, DRAIN, VERIFY,
+        COMPLETE, DECLINED, BLOCKED
+    }
+
+    private static final Cell PLUG = new Cell(2, 0, 0);
+    private static final Cell BASE_WATER = new Cell(1, 0, 0);
+    private static final Cell UPPER_WATER = new Cell(2, 3, -1);
+    private static final Cell LINTEL_WATER = new Cell(1, 3, -1);
+    private static final Cell BYPASS = new Cell(0, 0, 1);
+    private static final Cell APPROACH = new Cell(1, 1, 1);
+    private static final Cell[] PASSIVE = {
+        new Cell(0, 0, 0), new Cell(3, 0, 0), new Cell(1, 0, 1), new Cell(2, 0, 1)
+    };
+    private static final Cell[] TOWER = {
+        new Cell(3, 1, -1), new Cell(3, 2, -1), new Cell(3, 3, -1), new Cell(3, 3, 0)
+    };
+    private static final Cell[] DAM = { new Cell(0, 1, -1), new Cell(1, 1, -1) };
+    private static final Cell[] NOTCH = { new Cell(2, 1, -1), new Cell(2, 1, -2) };
+    private static final Cell[] CROSS = {
+        new Cell(0, 1, -1), new Cell(0, 1, 0), new Cell(0, 1, 1), APPROACH
+    };
+    private static final Cell[] CASTS = {
+        new Cell(1, -1, 0), new Cell(2, -1, 0),
+        new Cell(3, 1, 0), new Cell(3, 2, 0), new Cell(0, 1, 0), new Cell(0, 2, 0),
+        new Cell(2, 3, 0), new Cell(1, 3, 0)
+    };
+    private static final Direction[] WATER_CONTACT = {
+        Direction.UP, Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST
+    };
+    private static final double[] FACE_OFFSETS = {0.30, 0, -0.30};
+    private static final int[] YAW_SWEEP = {0, -36, 36, -62, 62};
+    private static final int[] LEFT_INDEX = {1, 2, 0, 3};
+
+    private final MinecraftClient client;
+    private final PilotBody body;
+    private final PilotHands hands;
+    private final PilotPortal portal;
+    private final Set<Proof> evidence = new HashSet<>();
+    private final Set<BlockPos> poured = new HashSet<>();
+    private final Set<BlockPos> passive = new HashSet<>();
+    private final Set<BlockPos> sources = new HashSet<>();
+    private final Set<BlockPos> scooped = new HashSet<>();
+    private final ArrayList<Source> reachable = new ArrayList<>();
+    private final List<BlockPos> missedBanks = new ArrayList<>();
+
+    private Phase phase = Phase.IDLE;
+    private String status = "looking for a straight four-cell lava shore";
+    private String check = "";
+    private String observed = "";
+    private BlockPos target;
+    private BlockPos anchor;
+    private BlockPos initialLava;
+    private Direction firstShore;
+    private Layout layout;
+    private BlockPos water;
+    private Block plug;
+    private Source pickup;
+    private boolean contactSeen;
+    private boolean lavaDebited;
+    private int tick;
+    private int since;
+    private int deadline;
+    private int surveyEnd;
+    private int nextProbe;
+    private int candidate;
+    private int index;
+    private int cast;
+    private int scan;
+    private int usedAt;
+    private int nextUse;
+    private int fullBefore;
+    private int emptyBefore;
+    private int scoopReceipts;
+    private int pourReceipts;
+    private int waterPours;
+    private int waterRecoveries;
+    private int coveredAt;
+    private int mineAt;
+    private Placement blockUse;
+
+    private static final class Placement {
+        final BlockPos dest;
+        final BlockPos support;
+        final Direction face;
+        final Item item;
+        final Block block;
+        final boolean leap;
+        final boolean lavaOutline;
+        int option;
+        int triedAt;
+
+        Placement(BlockPos dest, Direction face, Item item, boolean leap, boolean lavaOutline, int tick) {
+            this.dest = dest;
+            this.support = dest.offset(face.getOpposite());
+            this.face = face;
+            this.item = item;
+            this.block = ((BlockItem) item).getBlock();
+            this.leap = leap;
+            this.lavaOutline = lavaOutline;
+            this.triedAt = tick;
+        }
+    }
+
+    PilotShoreCast(MinecraftClient client, PilotBody body, PilotHands hands, PilotPortal portal) {
+        this.client = client;
+        this.body = body;
+        this.hands = hands;
+        this.portal = portal;
+    }
+
+    boolean eligible() {
+        if (phase != Phase.IDLE && phase != Phase.DECLINED) return true;
+        var player = client.player;
+        if (player == null || client.world == null || !World.OVERWORLD.equals(client.world.getRegistryKey())
+                || player.age < nextProbe || !dryGround() || !has(PICK)
+                || !has(WATER) && !has(BUCKET) || !has(STEEL)
+                    && (!has(item(Items.FLINT)) || !has(item(Items.IRON_INGOT)))) return false;
+        nextProbe = player.age + 8;
+        BlockPos feet = player.getBlockPos();
+        if (Math.abs(player.getY() - feet.getY()) > 0.07) return false;
+        for (BlockPos missed : missedBanks) if (feet.getSquaredDistance(missed) <= 9) return false;
+        BlockHitResult sighting = body.visibleFluid(true, true, REACH);
+        if (sighting == null || !lavaSource(state(sighting))) return false;
+        initialLava = sighting.getBlockPos();
+        if (initialLava.getY() != feet.getY() - 1) return false;
+        anchor = feet;
+        Vec3d direction = sighting.getPos().subtract(player.getPos());
+        firstShore = Direction.fromHorizontalDegrees(heading(direction)).getOpposite();
+        sources.clear();
+        rememberSource(sighting);
+        candidate = 0;
+        layout = null;
+        phase = Phase.SURVEY_EDGE;
+        return true;
+    }
+
+    String status() { return status; }
+    String phaseName() { return phase.name(); }
+    int confirmedFrameBlocks() { return poured.size() + passive.size(); }
+    int passiveFrameBlocks() { return passive.size(); }
+    int depositedLavaSources() { return pourReceipts; }
+    long surveyEvidence() { return evidence.size(); }
+    int witnessedSources() { return sources.size(); }
+    boolean blocked() { return phase == Phase.BLOCKED; }
+    PilotPortal.Site completed() {
+        return phase == Phase.COMPLETE
+            ? new PilotPortal.Site(at(APPROACH), layout.shore, at(CASTS[0])) : null;
+    }
+
+    Report report() {
+        return new Report(phase.name(), target, check, observed, layout == null ? 0 : reserveCount(), MINIMUM_LAVA_POURS,
+            MINIMUM_LAVA_POURS, scoopReceipts, pourReceipts, waterPours, waterRecoveries,
+            Set.copyOf(poured), Set.copyOf(passive));
+    }
+
+    void step(int now) {
+        tick = now;
+        if (phase == Phase.SURVEY_EDGE && layout == null) {
+            surveyEnd = tick + 460;
+            nextLayout("initial camera geometry");
+        }
+        if (phase == Phase.IDLE || phase == Phase.COMPLETE || phase == Phase.DECLINED || phase == Phase.BLOCKED) return;
+        if (tick > deadline) {
+            if (phase == Phase.SURVEY_EDGE) nextLayout("unproved " + check + " at " + target + ": " + observed);
+            else if (phase == Phase.BANK || phase == Phase.SURVEY_RESERVE) decline("geometry could not prove " + check);
+            else block("timed out");
+            return;
+        }
+        switch (phase) {
+            case SURVEY_EDGE -> surveyEdge();
+            case BANK -> {
+                if (move(layout.at(1, 1, -1))) {
+                    scan = 0;
+                    change(Phase.SURVEY_RESERVE, 180);
+                }
+            }
+            case SURVEY_RESERVE -> reserve();
+            case SUPPLY -> prepare();
+            case PLUG -> {
+                status = "placing the temporary block in the pool edge";
+                if (place(at(PLUG), Direction.UP, false, true)) {
+                    plug = blockUse.block;
+                    change(Phase.BASE_WATER, 110);
+                }
+            }
+            case BASE_WATER -> {
+                status = "placing water against the temporary block";
+                if (usedAt == 0 && !initialWaterCell()) return;
+                if (pourWater(at(BASE_WATER), layout.across().getOpposite())) {
+                    coveredAt = tick;
+                    change(Phase.UNPLUG, 120);
+                }
+            }
+            case UNPLUG -> {
+                status = "breaking the plug to open the two-cell casting trough";
+                if (tick - coveredAt >= 9 && dig(at(PLUG), plug, PICK)) {
+                    index = 0;
+                    change(Phase.STRIP, 85);
+                }
+            }
+            case STRIP -> confirmStrip();
+            case SIDE_FOOTING -> sideFooting();
+            case CROSS -> {
+                status = "walking the verified corner onto the new obsidian strip";
+                if (move(at(CROSS[index]))) {
+                    if (++index == CROSS.length) {
+                        cast = 0;
+                        change(Phase.EXCAVATE, 125);
+                    } else deadline = tick + 105;
+                }
+            }
+            case EXCAVATE -> {
+                status = "excavating trough floor " + (cast + 1) + "/2 with a pickaxe";
+                if (dig(at(CASTS[cast]), null, PICK)) startScoop();
+            }
+            case SCOOP -> scoop();
+            case POUR -> castLava();
+            case TOWER -> buildTower();
+            case DAM -> buildDam();
+            case NOTCH -> openNotch();
+            case RECOVER_BASE -> {
+                status = "reclaiming the original trough water";
+                if (recoverWater()) change(Phase.UPPER_WATER, 120);
+            }
+            case UPPER_WATER -> {
+                status = "rehoming the same water source beside the top of the rear tower";
+                if (pourWater(at(UPPER_WATER), layout.across().getOpposite())) startScoop();
+            }
+            case LINTEL_CHECK -> {
+                status = "checking that the supplied water reaches the far lintel";
+                BlockPos dest = at(CASTS[cast]);
+                if (aim(cellPoint(dest)) && verifyContact(dest)) startScoop();
+                else if (tick - since >= 40) change(Phase.RECOVER_UPPER, 112);
+            }
+            case RECOVER_UPPER -> {
+                status = "reclaiming the upper source to rehydrate the far lintel cell";
+                if (recoverWater()) change(Phase.LINTEL_SUPPORT, 105);
+            }
+            case LINTEL_SUPPORT -> {
+                status = "adding one side support to move water behind the far lintel";
+                if (place(at(UPPER_WATER), layout.across().getOpposite(), false, false)) {
+                    change(Phase.LINTEL_WATER, 110);
+                }
+            }
+            case LINTEL_WATER -> {
+                status = "moving the one source behind the far lintel";
+                if (pourWater(at(LINTEL_WATER), layout.across().getOpposite())) startScoop();
+            }
+            case RECOVER_FINAL -> {
+                status = "recovering the upper source so the portal can drain";
+                if (recoverWater()) change(Phase.DRAIN, 105);
+            }
+            case DRAIN -> {
+                status = "letting the two-cell opening drain";
+                if (tick - since >= FLOW_SETTLE && move(at(APPROACH))) {
+                    index = 0;
+                    change(Phase.VERIFY, 72);
+                }
+            }
+            case VERIFY -> verify();
+            case IDLE, COMPLETE, DECLINED, BLOCKED -> {}
+        }
+    }
+
+    private void nextLayout(String reason) {
+        if (tick > surveyEnd || candidate >= 4 * 3 * LEFT_INDEX.length) {
+            decline(reason);
+            return;
+        }
+        int option = candidate++;
+        int turn = option / (3 * LEFT_INDEX.length);
+        Direction shore = switch (turn) {
+            case 1 -> firstShore.rotateYClockwise();
+            case 2 -> firstShore.rotateYCounterclockwise();
+            case 3 -> firstShore.getOpposite();
+            default -> firstShore;
+        };
+        Direction pool = shore.getOpposite();
+        Vec3d delta = Vec3d.ofCenter(initialLava).subtract(Vec3d.ofCenter(anchor));
+        int likelyDepth = MathHelper.clamp((int) delta.dotProduct(Vec3d.of(pool.getVector())), 1, 3);
+        int depth = 1 + (likelyDepth - 1 + option / LEFT_INDEX.length % 3) % 3;
+        int fromLeft = LEFT_INDEX[option % LEFT_INDEX.length];
+        BlockPos edge = anchor.down().offset(pool, depth).offset(shore.rotateYClockwise().getOpposite(), fromLeft);
+        layout = new Layout(edge, shore);
+        index = 0;
+        change(Phase.SURVEY_EDGE, 45);
+    }
+
+    private void surveyEdge() {
+        status = "checking visible four-wide shore, plug, and future obsidian footing";
+        if (index < 4) {
+            BlockPos floor = layout.at(index, 0, -1);
+            Vec3d point = facePoint(floor, Direction.UP);
+            expect(floor, "flat, safe dry bank");
+            if (!aim(point)) return;
+            BlockHitResult hit = terrain(point, SURVEY_REACH);
+            if (!matches(hit, floor) || hit.getSide() != Direction.UP || !solid(hit)) {
+                if (hit != null) nextLayout("expected dry top; saw " + describe(hit));
+                return;
+            }
+            witness(floor, "bank floor");
+        } else {
+            BlockPos pos = index < 8 ? layout.at(index - 4, 0, 0) : at(PASSIVE[index - 6]);
+            Vec3d point = Vec3d.ofCenter(pos, 0.73);
+            expect(pos, "visible original lava source");
+            if (!aim(point)) return;
+            BlockHitResult hit = fluid(point, SURVEY_REACH);
+            if (!matches(hit, pos) || !lavaSource(state(hit))) {
+                if (hit != null) nextLayout("expected lava source; saw " + describe(hit));
+                return;
+            }
+            rememberSource(hit);
+        }
+        if (++index == 10) change(Phase.BANK, 130);
+        else deadline = tick + 44;
+    }
+
+    private void reserve() {
+        status = "counting unreserved lava sources: " + reserveCount() + "/" + MINIMUM_LAVA_POURS;
+        expect(layout.edge, "eight additional scoopable sources outside the trough and crossing");
+        float yaw = heading(Vec3d.of(layout.shore.getOpposite().getVector())) + YAW_SWEEP[scan];
+        body.turn(yaw, 37);
+        if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - yaw)) > 5) return;
+        samplePool();
+        if (reserveCount() >= MINIMUM_LAVA_POURS) {
+            change(Phase.SUPPLY, 185);
+            return;
+        }
+        if (tick % 8 == 0) scan = (scan + 1) % YAW_SWEEP.length;
+    }
+
+    private void prepare() {
+        if (portal.fillerCount() < MINIMUM_FILLER) {
+            block("matching shore needs " + MINIMUM_FILLER + " compact casting blocks before modification; have "
+                + portal.fillerCount());
+            return;
+        }
+        if (!has(STEEL)) {
+            status = "crafting flint and steel for the shore cast";
+            hands.craft("flint_and_steel");
+            return;
+        }
+        if (has(WATER)) {
+            change(Phase.PLUG, 105);
+            return;
+        }
+        status = "finding reachable source water before modifying the shore";
+        if (pickup == null) {
+            BlockHitResult hit = body.visibleFluid(false, true, REACH);
+            if (hit != null && waterSource(state(hit))) pickup = new Source(hit.getBlockPos(), inward(hit));
+            else body.turn(heading(Vec3d.of(layout.shore.getVector())) + (tick - since) / 26 * 60, 26);
+            return;
+        }
+        useSource(pickup, false);
+    }
+
+    private boolean initialWaterCell() {
+        BlockPos pos = at(BASE_WATER);
+        Vec3d point = Vec3d.ofCenter(pos, 0.72);
+        BlockHitResult hit = fluid(point, REACH);
+        if (matches(hit, pos) && lavaSource(state(hit))) return true;
+        expect(pos, "original neighboring lava before the initial water use");
+        if (!aim(point)) return false;
+        observe(hit);
+        if (matches(hit, pos) && !lavaSource(state(hit))) block("neighboring water cell is no longer a lava source");
+        return false;
+    }
+
+    private void confirmStrip() {
+        status = "witnessing the two lava uprights and two standing cells cool";
+        BlockPos pos = at(PASSIVE[index]);
+        Vec3d point = Vec3d.ofCenter(pos, 0.9);
+        expect(pos, "original lava source now obsidian after owned water pour");
+        if (!aim(point)) return;
+        BlockHitResult hit = terrain(point, REACH);
+        observe(hit);
+        if (!matches(hit, pos) || !state(hit).isOf(Blocks.OBSIDIAN) || waterPours != 1
+                || !evidence.contains(new Proof(pos, "visible lava source"))) return;
+        if (index < 2) passive.add(pos);
+        witness(pos, "cooled by trough water");
+        if (++index == PASSIVE.length) change(Phase.SIDE_FOOTING, 105);
+        else deadline = tick + 64;
+    }
+
+    private void sideFooting() {
+        status = "checking the low corner crossing to the obsidian standing strip";
+        BlockPos pos = at(BYPASS);
+        if (blockUse == null) {
+            Vec3d point = Vec3d.ofCenter(pos, 0.92);
+            expect(pos, "natural dry footing, or one placement into a shallow lava cell");
+            if (!aim(point)) return;
+            BlockHitResult hit = terrain(point, REACH);
+            observe(hit);
+            if (!matches(hit, pos)) return;
+            if (solid(hit)) {
+                beginCrossing();
+                return;
+            }
+            if (!lavaSource(state(hit))) return;
+        }
+        if (place(pos, Direction.UP, false, true)) beginCrossing();
+    }
+
+    private void beginCrossing() {
+        index = 0;
+        change(Phase.CROSS, 110);
+    }
+
+    private void buildTower() {
+        status = "building the rear three-block tower and one-block overhang";
+        Direction face = index == 3 ? layout.shore.getOpposite() : Direction.UP;
+        if (!place(at(TOWER[index]), face, index == 2, false)) return;
+        if (++index == TOWER.length) {
+            index = 0;
+            change(Phase.DAM, 100);
+        } else change(Phase.TOWER, 125);
+    }
+
+    private void buildDam() {
+        status = "adding the two low rear dam blocks";
+        if (!place(at(DAM[index]), Direction.UP, false, false)) return;
+        if (++index == DAM.length) {
+            index = 0;
+            change(Phase.NOTCH, 110);
+        } else change(Phase.DAM, 110);
+    }
+
+    private void openNotch() {
+        status = "checking the low rear drain notch without breaking its floor";
+        BlockPos pos = at(NOTCH[index]);
+        Vec3d point = Vec3d.ofCenter(pos);
+        expect(pos, "open rear drain above the bank floor");
+        if (!aim(point)) return;
+        if (!body.clearTerrain(point)) {
+            BlockHitResult hit = terrain(point, REACH);
+            observe(hit);
+            if (!matches(hit, pos)) return;
+            BlockState state = state(hit);
+            if (!(state.isOf(Blocks.STONE) || state.isOf(Blocks.COBBLESTONE) || state.isOf(Blocks.DIRT)
+                    || state.isOf(Blocks.GRASS_BLOCK) || state.isOf(Blocks.SAND) || state.isOf(Blocks.SANDSTONE)
+                    || state.isOf(Blocks.GRAVEL))) {
+                block("drain is obstructed by unsuitable terrain");
+                return;
+            }
+            if (!dig(pos, state.getBlock(), BREAKER)) return;
+        }
+        witness(pos, "open rear drain");
+        mineAt = 0;
+        if (++index == NOTCH.length) change(Phase.RECOVER_BASE, 105);
+        else deadline = tick + 125;
+    }
+
+    private void startScoop() {
+        scan = 0;
+        change(Phase.SCOOP, 180);
+    }
+
+    private void scoop() {
+        status = "scooping lava " + (cast + 1) + "/" + MINIMUM_LAVA_POURS + " for the compact frame";
+        if (usedAt != 0 && count(LAVA) > fullBefore && count(BUCKET) < emptyBefore) {
+            scooped.add(pickup.pos);
+            witness(pickup.pos, "lava bucket inventory receipt");
+            ++scoopReceipts;
+            change(Phase.POUR, 145);
+            return;
+        }
+        if (pickup != null) {
+            if (tick - since < 22 || usedAt != 0 && tick - usedAt <= 14) {
+                useSource(pickup, true);
+                return;
+            }
+            pickup = null;
+        }
+        float yaw = heading(Vec3d.of(layout.shore.getOpposite().getVector())) + YAW_SWEEP[scan];
+        body.turn(yaw, 48);
+        if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - yaw)) > 5) return;
+        samplePool();
+        Source best = null;
+        double nearest = REACH * REACH;
+        for (Source source : reachable) {
+            if (reserved(source.pos) || scooped.contains(source.pos)) continue;
+            double distance = source.point.squaredDistanceTo(client.player.getEyePos());
+            if (distance < nearest) {
+                nearest = distance;
+                best = source;
+            }
+        }
+        if (best != null) {
+            pickup = best;
+            usedAt = 0;
+            since = tick;
+        } else if (tick % 9 == 0) scan = (scan + 1) % YAW_SWEEP.length;
+        expect(layout.edge, "unconsumed visible still lava within bucket reach");
+        observed = reserveCount() + " distinct reserve sources witnessed before/during casting";
+    }
+
+    private void castLava() {
+        BlockPos dest = at(CASTS[cast]);
+        status = "casting compact obsidian " + (confirmedFrameBlocks() + 1) + "/10";
+        if (usedAt != 0 && count(LAVA) < fullBefore && count(BUCKET) > emptyBefore) {
+            if (!lavaDebited) {
+                lavaDebited = true;
+                ++pourReceipts;
+                witness(dest, "lava bucket inventory debit");
+            }
+            expect(dest, "lava inventory debit and new visible obsidian at the same frame cell");
+            Vec3d point = cellPoint(dest);
+            if (!aim(point)) return;
+            BlockHitResult hit = terrain(point, REACH);
+            observe(hit);
+            if (!matches(hit, dest) || !state(hit).isOf(Blocks.OBSIDIAN)) return;
+            if (!poured.add(dest)) {
+                block("duplicate cast proof");
+                return;
+            }
+            witness(dest, "lava poured and newly cooled");
+            if (++cast == CASTS.length) {
+                change(Phase.RECOVER_FINAL, 110);
+            } else if (cast == 1) change(Phase.EXCAVATE, 125);
+            else if (cast == 2) {
+                index = 0;
+                change(Phase.TOWER, 115);
+            } else if (cast == 7) {
+                // The upper source can fan sideways after the near lintel redirects it.
+                // Move the one source only if that wing never wets the far lintel.
+                change(Phase.LINTEL_CHECK, 60);
+            } else startScoop();
+            return;
+        }
+        if (usedAt == 0 && !contactSeen) {
+            Vec3d point = cellPoint(dest);
+            expect(dest, "open or flowing-water destination before lava pour");
+            if (!aim(point)) return;
+            if (!body.clearTerrainThroughWater(point)) {
+                observe(terrain(point, REACH));
+                return;
+            }
+            if (!verifyContact(dest)) return;
+        }
+        Direction face = cast >= 6 ? layout.across().getOpposite() : Direction.UP;
+        useAgainst(dest, face, LAVA);
+    }
+
+    private boolean verifyContact(BlockPos dest) {
+        expect(dest, "visible cooling water beside or above the prospective obsidian");
+        for (Direction side : WATER_CONTACT) {
+            BlockPos pos = dest.offset(side);
+            Vec3d point = Vec3d.ofCenter(pos, 0.64);
+            BlockHitResult hit = fluid(point, REACH);
+            if (matches(hit, pos) && state(hit).getFluidState().isIn(FluidTags.WATER)) {
+                contactSeen = true;
+                witness(dest, "adjacent cooling water");
+                return true;
+            }
+        }
+        observed = "no visible water contact";
+        return false;
+    }
+
+    private boolean pourWater(BlockPos dest, Direction face) {
+        if (usedAt != 0 && count(WATER) < fullBefore && count(BUCKET) > emptyBefore) {
+            Vec3d point = Vec3d.ofCenter(dest, 0.69);
+            expect(dest, "water inventory debit and a visible still source at the intended cell");
+            if (!aim(point)) return false;
+            BlockHitResult hit = fluid(point, REACH);
+            observe(hit);
+            if (!matches(hit, dest) || !waterSource(state(hit))) return false;
+            water = dest;
+            ++waterPours;
+            witness(dest, "owned water source placed");
+            return true;
+        }
+        useAgainst(dest, face, WATER);
+        return false;
+    }
+
+    private boolean recoverWater() {
+        if (water == null) {
+            block("lost the owned water source position");
+            return false;
+        }
+        if (usedAt != 0 && count(WATER) > fullBefore && count(BUCKET) < emptyBefore) {
+            ++waterRecoveries;
+            witness(water, "owned source reclaimed into the bucket");
+            water = null;
+            return true;
+        }
+        useSource(new Source(water, Vec3d.ofCenter(water, 0.70)), false);
+        return false;
+    }
+
+    private void useSource(Source source, boolean lava) {
+        expect(source.pos, lava ? "targeted source-only lava bucket ray" : "targeted source-only water bucket ray");
+        if (!aim(source.point)) return;
+        BlockHitResult hit = fluid(source.point, REACH);
+        observe(hit);
+        if (!matches(hit, source.pos) || !(lava ? lavaSource(state(hit)) : waterSource(state(hit)))
+                || tick < nextUse || !equipped(BUCKET)) return;
+        if (usedAt == 0) {
+            fullBefore = count(lava ? LAVA : WATER);
+            emptyBefore = count(BUCKET);
+        }
+        if (lava) body.useLavaSource(source.pos);
+        else body.useWaterSource(source.pos);
+        usedAt = tick;
+        nextUse = tick + 7;
+    }
+
+    private void useAgainst(BlockPos dest, Direction face, Predicate<ItemStack> contents) {
+        BlockPos support = dest.offset(face.getOpposite());
+        Vec3d point = actionPoint(support, face, (tick - since) / 12 % FACE_OFFSETS.length);
+        expect(dest, "vanilla " + face + " face of " + support + " for bucket placement");
+        if (!aim(point)) return;
+        BlockHitResult hit = body.selectedFace();
+        observeOutline(hit);
+        if (!matches(hit, support) || hit.getSide() != face
+                || client.player.getBoundingBox().expand(0.18).intersects(new Box(dest))
+                || tick < nextUse || !equipped(contents)) return;
+        int full = count(contents);
+        int empty = count(BUCKET);
+        if (!body.tapCastFace(support, face, true)) return;
+        fullBefore = full;
+        emptyBefore = empty;
+        usedAt = tick;
+        nextUse = tick + 21;
+    }
+
+    private boolean place(BlockPos dest, Direction face, boolean leap, boolean lavaOutline) {
+        if (blockUse == null) {
+            Item filler = portal.fillerItem();
+            if (filler == null) {
+                block("no solid casting block remains");
+                return false;
+            }
+            blockUse = new Placement(dest, face, filler, leap, lavaOutline, tick);
+        }
+        Placement work = blockUse;
+        if (usedAt != 0 && count(item(work.item)) < fullBefore) {
+            expect(dest, "block inventory debit and visible placement");
+            Vec3d point = cellPoint(dest);
+            if (!aim(point)) return false;
+            BlockHitResult hit = terrain(point, REACH);
+            observe(hit);
+            if (!matches(hit, dest) || !state(hit).isOf(work.block)) return false;
+            witness(dest, "placed compact support");
+            return true;
+        }
+        if (usedAt != 0 && tick < nextUse) {
+            body.aim(cellPoint(dest));
+            return false;
+        }
+        if (tick - work.triedAt >= 13) {
+            work.option = (work.option + 1) % FACE_OFFSETS.length;
+            work.triedAt = tick;
+        }
+        Vec3d point = actionPoint(work.support, work.face, work.option);
+        expect(dest, "visible vanilla " + work.face + " placement face " + work.support);
+        body.aim(point);
+        if (work.leap && client.player.isOnGround() && client.player.getEyePos().y < work.support.getY() + 1.06
+                && body.aligned(point) && equipped(item(work.item))) body.jump();
+        if (!body.aligned(point)) return false;
+        BlockHitResult hit = body.selectedFace();
+        observeOutline(hit);
+        if (!matches(hit, work.support) || hit.getSide() != work.face || tick < nextUse
+                || client.player.getBoundingBox().intersects(new Box(dest))) return false;
+        if (!work.lavaOutline) {
+            BlockHitResult solid = terrain(point, REACH);
+            if (!matches(solid, work.support) || !solid(solid)) return false;
+        }
+        Predicate<ItemStack> filler = item(work.item);
+        if (!equipped(filler)) return false;
+        int before = count(filler);
+        if (!body.tapCastFace(work.support, work.face, false)) return false;
+        fullBefore = before;
+        usedAt = tick;
+        nextUse = tick + 21;
+        return false;
+    }
+
+    private boolean dig(BlockPos pos, Block expected, Predicate<ItemStack> tool) {
+        Vec3d point = cellPoint(pos);
+        expect(pos, "observed ordinary pick target followed by a clear cell");
+        if (!aim(point)) return false;
+        if (mineAt != 0 && body.clearTerrainThroughWater(point)) {
+            witness(pos, "opened by ordinary attack input");
+            return true;
+        }
+        BlockHitResult hit = terrain(point, REACH);
+        observe(hit);
+        if (!matches(hit, pos)) return false;
+        BlockState state = state(hit);
+        if (expected != null && !state.isOf(expected) || expected == null && !solid(hit)
+                || state.isOf(Blocks.OBSIDIAN) || state.isOf(Blocks.BEDROCK)) {
+            block("excavation is obstructed by " + describe(hit));
+            return false;
+        }
+        if (matches(body.selectedFace(), pos) && equipped(tool)) {
+            body.mine(pos);
+            if (mineAt == 0) mineAt = tick;
+        }
+        return false;
+    }
+
+    private void verify() {
+        status = "checking ten compact-cast frame cells and the six dry aperture cells";
+        boolean frame = index < 10;
+        BlockPos pos = frame ? at(index < 2 ? PASSIVE[index] : CASTS[index - 2])
+            : layout.at(1 + (index - 10) % 2, (index - 10) / 2, 0);
+        Vec3d point = cellPoint(pos);
+        expect(pos, frame ? "witnessed obsidian still in the frame" : "dry unobstructed aperture");
+        if (!aim(point)) return;
+        BlockHitResult hit = fluid(point, REACH);
+        observe(hit);
+        if (frame ? !matches(hit, pos) || !state(hit).isOf(Blocks.OBSIDIAN)
+                : matches(hit, pos) || !body.clearTerrain(point)) return;
+        witness(pos, "verified finished compact frame");
+        if (++index == 16) {
+            if (poured.size() != MINIMUM_LAVA_POURS || passive.size() != 2 || !has(WATER)) {
+                block("frame does not have eight poured cells, two passive cells, and the recovered water bucket");
+            } else {
+                status = "finished the compact shore frame with eight pours and two passive obsidian cells";
+                change(Phase.COMPLETE, 0);
+            }
+        } else deadline = tick + 68;
+    }
+
+    private boolean move(BlockPos feet) {
+        expect(feet, "dry supported stance reached with ordinary movement");
+        if (portal.center(feet)) {
+            witness(feet, "standing on proved floor");
+            return !client.player.isInLava();
+        }
+        Vec3d goal = Vec3d.ofBottomCenter(feet);
+        Vec3d delta = goal.subtract(client.player.getPos());
+        if (Math.abs(delta.y) > 0.3 || delta.horizontalLengthSquared() > 9 || client.player.isInLava()) return false;
+        Vec3d point = facePoint(feet.down(), Direction.UP);
+        body.aim(point);
+        BlockHitResult floor = terrain(point, REACH);
+        observe(floor);
+        if (!body.aligned(point) || !matches(floor, feet.down()) || floor.getSide() != Direction.UP || !solid(floor))
+            return false;
+        body.sneak();
+        body.walkDownTo(goal);
+        return false;
+    }
+
+    private void samplePool() {
+        reachable.clear();
+        for (int z = 0; z <= 5; ++z) {
+            for (int x = -3; x <= 6; ++x) {
+                BlockPos pos = layout.at(x, 0, z);
+                Vec3d point = Vec3d.ofCenter(pos, 0.74);
+                if (point.squaredDistanceTo(client.player.getEyePos()) > REACH * REACH) continue;
+                BlockHitResult hit = fluid(point, REACH);
+                if (matches(hit, pos) && lavaSource(state(hit))) {
+                    rememberSource(hit);
+                    reachable.add(new Source(pos, inward(hit)));
+                }
+            }
+        }
+    }
+
+    private int reserveCount() {
+        int count = 0;
+        for (BlockPos pos : sources) if (!reserved(pos)) ++count;
+        return count;
+    }
+
+    private boolean reserved(BlockPos pos) {
+        return pos.equals(at(PLUG)) || pos.equals(at(BASE_WATER)) || pos.equals(at(BYPASS))
+            || pos.equals(at(PASSIVE[0])) || pos.equals(at(PASSIVE[1]))
+            || pos.equals(at(PASSIVE[2])) || pos.equals(at(PASSIVE[3]));
+    }
+
+    private void rememberSource(BlockHitResult hit) {
+        sources.add(hit.getBlockPos());
+        witness(hit.getBlockPos(), "visible lava source");
+    }
+
+    private void decline(String reason) {
+        missedBanks.add(anchor);
+        observed = reason;
+        status = "straight-shore geometry not admitted: " + reason;
+        change(Phase.DECLINED, 0);
+    }
+
+    private void block(String reason) {
+        status = "compact shore cast blocked in " + phase + " at " + target + " (" + check + "): "
+            + reason + "; observed " + observed + "; sources " + sources.size() + ", poured "
+            + poured.size() + "/" + MINIMUM_LAVA_POURS + ", passive " + passive.size() + "/2";
+        change(Phase.BLOCKED, 0);
+    }
+
+    private void change(Phase next, int allowance) {
+        phase = next;
+        since = tick;
+        deadline = tick + allowance;
+        usedAt = mineAt = 0;
+        pickup = null;
+        blockUse = null;
+        contactSeen = lavaDebited = false;
+    }
+
+    private void expect(BlockPos pos, String description) {
+        if (!pos.equals(target) || !description.equals(check)) observed = "awaiting a reachable, rendered face";
+        target = pos;
+        check = description;
+    }
+
+    private void observe(BlockHitResult hit) { observed = describe(hit); }
+    private void observeOutline(BlockHitResult hit) {
+        observed = hit == null ? "no rendered outline" : hit.getSide() + " outline at " + hit.getBlockPos();
+    }
+    private String describe(BlockHitResult hit) {
+        return hit == null ? "no rendered hit" : hit.getSide() + " " + state(hit).getBlock() + " at " + hit.getBlockPos();
+    }
+    private boolean aim(Vec3d point) {
+        body.aim(point);
+        return body.aligned(point);
+    }
+    private Vec3d cellPoint(BlockPos pos) {
+        // Bias downcast looks away from the strip's top edge to see the recess below it.
+        return Vec3d.ofCenter(pos, 0.77).add(Vec3d.of(layout.shore.getVector()).multiply(0.30));
+    }
+    private Vec3d actionPoint(BlockPos support, Direction face, int offset) {
+        Vec3d point = facePoint(support, face);
+        if (face.getAxis().isVertical() || face.getAxis() == layout.across().getAxis())
+            return point.add(Vec3d.of(layout.shore.getVector()).multiply(FACE_OFFSETS[offset]));
+        return point.add(Vec3d.of(layout.across().getVector()).multiply(FACE_OFFSETS[offset]));
+    }
+    private boolean dryGround() {
+        var player = client.player;
+        return player.isOnGround() && !player.isTouchingWater() && !player.isInLava();
+    }
+    private BlockPos at(Cell cell) { return layout.at(cell); }
+    private void witness(BlockPos pos, String kind) { evidence.add(new Proof(pos, kind)); }
+    private BlockHitResult fluid(Vec3d point, double reach) { return body.perceive(point, reach).orElse(null); }
+    private BlockHitResult terrain(Vec3d point, double reach) { return body.terrainThroughWater(point, reach).orElse(null); }
+    private BlockState state(BlockHitResult hit) { return client.world.getBlockState(hit.getBlockPos()); }
+    private boolean solid(BlockHitResult hit) {
+        BlockState state = state(hit);
+        return PilotPortal.usableSupport(state) && Block.isShapeFullCube(state.getCollisionShape(client.world, hit.getBlockPos()));
+    }
+    private boolean has(Predicate<ItemStack> item) { return count(item) > 0; }
+    private boolean equipped(Predicate<ItemStack> item) {
+        if (item.test(client.player.getMainHandStack())) return true;
+        // equip() returning true can mean a hotbar key was only queued. Never use the old tool.
+        hands.equip(item);
+        return false;
+    }
+    private int count(Predicate<ItemStack> item) { return hands.count(item); }
+    private static Predicate<ItemStack> item(Item item) { return stack -> stack.isOf(item); }
+    private static boolean matches(BlockHitResult hit, BlockPos pos) { return hit != null && hit.getBlockPos().equals(pos); }
+    private static boolean lavaSource(BlockState state) {
+        var fluid = state.getFluidState();
+        return fluid.isIn(FluidTags.LAVA) && fluid.isStill();
+    }
+    private static boolean waterSource(BlockState state) {
+        var fluid = state.getFluidState();
+        return state.isOf(Blocks.WATER) && fluid.isIn(FluidTags.WATER) && fluid.isStill();
+    }
+    private static Vec3d inward(BlockHitResult hit) {
+        return hit.getPos().lerp(Vec3d.ofCenter(hit.getBlockPos()), 0.035);
+    }
+    private static float heading(Vec3d delta) {
+        return (float) Math.toDegrees(Math.atan2(-delta.x, delta.z));
+    }
+}

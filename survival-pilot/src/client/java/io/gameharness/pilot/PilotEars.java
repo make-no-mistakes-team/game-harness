@@ -29,6 +29,7 @@ final class PilotEars implements SoundInstanceListener {
         if (escapeTicks <= 0) return false;
         --escapeTicks;
         hands.cancel();
+        if (client.currentScreen instanceof net.minecraft.client.gui.screen.ingame.HandledScreen<?> screen) screen.close();
         body.turn(away, 5f);
         if (Math.abs(MathHelper.wrapDegrees(away - client.player.getYaw())) < 68) body.walk(true);
         else body.back();

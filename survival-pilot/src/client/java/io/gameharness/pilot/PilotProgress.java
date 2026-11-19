@@ -7,6 +7,8 @@ import java.util.function.Predicate;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.CaveVines;
+import net.minecraft.block.SweetBerryBushBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.DeathScreen;
 import net.minecraft.client.gui.screen.ingame.CraftingScreen;
@@ -16,22 +18,27 @@ import net.minecraft.client.world.ClientWorld;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
+import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.attribute.EntityAttributes;
 import net.minecraft.entity.mob.CreeperEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.World;
 
 /** Inventory-driven decisions; coordinates are observations, traveled waypoints or dig intentions. */
 final class PilotProgress {
@@ -46,9 +53,12 @@ final class PilotProgress {
     // Work above the deep lava seas, leaving more than a block of margin below the floor.
     private static final int DIAMOND_LEVEL = -52;
     private static final int IRON_TIMBER = 8;
-    private static final int DEEP_TIMBER = 16;
+    private static final int IRON_LIGHT = 24;
+    private static final int DEEP_LIGHT = 32;
+    private static final int LOCAL_LIGHT = 12;
+    private static final int ORE_MEMORY_LIMIT = 18;
     private static final int TIMBER_WORK_TICKS = 190;
-    private static final float[] TIMBER_STAND_TURNS = {65, -65, 0, 135, -135, 180};
+    private static final int TIMBER_RECENT = 24;
     private static final int TRAIL_LIMIT = 1024;
     private static final Predicate<ItemStack> LOG = stack -> stack.isIn(ItemTags.LOGS);
     private static final Predicate<ItemStack> BURNABLE_LOG = stack -> stack.isIn(ItemTags.LOGS_THAT_BURN);
@@ -60,8 +70,15 @@ final class PilotProgress {
     private static final Predicate<ItemStack> STONE_PICK = item(Items.STONE_PICKAXE);
     private static final Predicate<ItemStack> IRON_PICK = item(Items.IRON_PICKAXE);
     private static final Predicate<ItemStack> DIAMOND_PICK = item(Items.DIAMOND_PICKAXE);
-    private static final Predicate<ItemStack> PORTAL_BUCKET = s -> s.isOf(Items.BUCKET) || s.isOf(Items.WATER_BUCKET);
+    private static final Predicate<ItemStack> WATER_BUCKET = item(Items.WATER_BUCKET);
+    private static final Predicate<ItemStack> PORTAL_BUCKET = s -> s.isOf(Items.BUCKET) || WATER_BUCKET.test(s);
     private static final Predicate<ItemStack> IGNITER = item(Items.FLINT_AND_STEEL);
+    private static final Predicate<ItemStack> FLINT = item(Items.FLINT);
+    private static final Predicate<ItemStack> GRAVEL = item(Items.GRAVEL);
+    private static final Predicate<ItemStack> GRAVEL_DROPS = s -> GRAVEL.test(s) || FLINT.test(s);
+    private static final Predicate<BlockState> GRAVEL_BLOCK = s -> s.isOf(Blocks.GRAVEL);
+    private static final Predicate<ItemStack> BOAT = stack -> stack.isIn(ItemTags.BOATS) && !stack.isIn(ItemTags.CHEST_BOATS);
+    private static final Predicate<ItemStack> EMPTY_BUCKET = item(Items.BUCKET);
     private static final Predicate<ItemStack> DEEP_PICK = stack -> stack.isOf(Items.IRON_PICKAXE)
         || stack.isOf(Items.DIAMOND_PICKAXE) || stack.isOf(Items.NETHERITE_PICKAXE);
     private static final Predicate<ItemStack> SHOVEL = stack -> stack.isOf(Items.WOODEN_SHOVEL)
@@ -77,7 +94,12 @@ final class PilotProgress {
     private static final Predicate<ItemStack> FOOD = stack -> stack.contains(DataComponentTypes.FOOD)
         && !stack.isOf(Items.ROTTEN_FLESH) && !stack.isOf(Items.SPIDER_EYE)
         && !stack.isOf(Items.POISONOUS_POTATO) && !stack.isOf(Items.PUFFERFISH)
-        && !stack.isOf(Items.CHICKEN);
+        && !stack.isOf(Items.CHICKEN) && !stack.isOf(Items.SUSPICIOUS_STEW) && !stack.isOf(Items.CHORUS_FRUIT);
+    private static final Predicate<BlockState> RIPE_BERRIES = state ->
+        state.isOf(Blocks.SWEET_BERRY_BUSH) && state.get(SweetBerryBushBlock.AGE) >= 2
+        || (state.isOf(Blocks.CAVE_VINES) || state.isOf(Blocks.CAVE_VINES_PLANT)) && state.get(CaveVines.BERRIES);
+    private static final int FOOD_RESERVE = 12; // nutrition points, not stack size
+    private static final double FORAGE_LEASH_SQUARED = 36;
 
     private enum Resource {
         STONE(state -> state.isOf(Blocks.STONE) || state.isOf(Blocks.DEEPSLATE) || state.isOf(Blocks.COBBLESTONE)
@@ -102,6 +124,10 @@ final class PilotProgress {
     private enum Footing { LEVEL, DOWN, STEEP, JUMP, WATER, EDGE, UNKNOWN, BLOCKED }
     private enum Dig { LOOKING, CLEAR, BLOCKED, DARK, LIP }
     private enum Firing { NONE, IRON, CHARCOAL }
+    private enum Forage { ANIMAL, BERRIES, DROP }
+
+    private record OreSight(Resource resource, BlockPos block, Vec3d point, BlockPos stance, Vec3d feet,
+                            double rangeSquared) {}
 
     private static final class Station {
         final Block block;
@@ -131,7 +157,20 @@ final class PilotProgress {
     private final PilotBody body;
     private final PilotHands hands;
     private final PilotTools tools;
+    private final PilotStallGuard stallGuard;
+    private final Predicate<BlockPos> protectedHeadroom = this::protectRecoveryBlock;
+    private final PilotCaves caves;
+    private final PilotFall fall;
+    private BlockHitResult fieldWater;
+    private Vec3d fieldWaterPoint;
+    private int fieldWaterUntil, waterRetry;
+    private Resource caveGoal;
+    private boolean lavaProspecting, caveLava;
+    private BlockPos cavePeek;
+    private int caveLookUntil, caveOpenings, caveFootsteps;
+    private final PilotDefense defense;
     private final PilotPortal portal;
+    private final FieldIgnition fieldIgnition;
     private final PilotMemory memory;
     private boolean memoryAttached;
     private boolean portalStarted;
@@ -139,6 +178,7 @@ final class PilotProgress {
     private final Predicate<ItemStack> goalItem;
     private final Station table = new Station(Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE, "crafting_table");
     private final Station furnace = new Station(Blocks.FURNACE, Items.FURNACE, "furnace");
+    private final FieldBench fieldBench = new FieldBench();
     // Only points the player has reached. Retreat never consults terrain behind the camera.
     private final List<BlockPos> trail = new ArrayList<>();
     private final BitSet dugSteps = new BitSet();
@@ -157,10 +197,7 @@ final class PilotProgress {
     private int furnaceDemand;
     private int furnacePoll;
     private boolean furnaceLoaded;
-    private boolean furnaceNeedsWood;
     private boolean furnaceNeedsFuel;
-    private int workshopSweep;
-    private float workshopHeading = Float.NaN;
     private Resource sought;
     private int soughtSince;
     private Resource miningResource;
@@ -169,6 +206,10 @@ final class PilotProgress {
     private int targetDeadline;
     private double targetNearest;
     private int lastMining;
+    private final List<OreSight> oreSights = new ArrayList<>(ORE_MEMORY_LIMIT);
+    private ClientWorld oreWorld;
+    private OreSight oreProbe;
+    private int oreProbeSince;
     private final BlockPos[] ignored = new BlockPos[6];
     private final int[] ignoredUntil = new int[ignored.length];
     private int ignoreCursor;
@@ -185,13 +226,23 @@ final class PilotProgress {
     private int pickupSeen;
     private boolean pickupNeedsDetour;
     private boolean timberReady;
+    private boolean departureKit;
     private BlockHitResult timberWitness;
     private BlockPos timberLastCut;
-    private BlockPos exhaustedStem;
+    private final List<BlockPos> exhaustedStems = new ArrayList<>();
+    private final List<BlockPos> unreachableTimber = new ArrayList<>();
+    private final List<BlockPos> triedTimberFooting = new ArrayList<>();
+    private BlockPos timberExitFrom;
+    private BlockPos timberExitTo;
+    private int timberExitUntil;
+    private int timberExitCheck;
+    private float timberExitYaw;
+    private boolean timberHigherShelf;
     private BlockHitResult timberChop;
     private Vec3d timberChopPoint;
     private boolean timberCuttingLeaves;
     private int timberAttack;
+    private int timberAlignUntil;
     private int timberChopUntil;
     private int timberWorkUntil;
     private int timberSeekTick;
@@ -200,18 +251,14 @@ final class PilotProgress {
     private boolean timberNear;
     private int timberScan;
     private int timberLeafCuts;
-    private Vec3d timberStand;
-    private int timberStandIndex;
     private int timberApproachSince;
-    private float timberStandYaw;
     private Direction timberAscent;
     private Vec3d timberBank;
     private Vec3d timberCanopy;
     private int timberCanopyUntil;
     private boolean timberCanopyPeeking;
-    private BlockPos exhaustedCanopy;
+    private final List<BlockPos> exhaustedCanopies = new ArrayList<>();
     private int timberLookAt;
-    private int timberLookStep;
     private float timberLookYaw;
     private boolean timberSwimming;
     private int timberBankTurns;
@@ -282,14 +329,23 @@ final class PilotProgress {
     private int branchTurns;
     private int failedDirections;
     private int stairLength;
-    private int miningReserve;
     private int deadEnds;
     private int returnTo;
     private BlockPos returnDetour;
     private int returnIndex = -1;
     private int resumeIndex = -1;
     private boolean keepTrail;
-    private boolean foraging;
+    private int mealsEaten;
+    private int foodPickedUp;
+    private Item mealItem;
+    private int mealSlot, mealCount, mealStartHunger;
+    private int mealUntil, mealRetry, mealQuietUntil;
+    private float mealHealth = Float.NaN;
+    private Forage forage;
+    private Entity forageEntity;
+    private BlockPos forageBush;
+    private Vec3d foragePoint, forageOrigin;
+    private int forageUntil, forageSeen, forageAction, forageStock, forageFootingWait, forageScan;
     private int returnAge;
     private int returnClear;
     private int returnLitIndex = -1;
@@ -301,6 +357,9 @@ final class PilotProgress {
     private int torchBefore;
     private int torchUsed;
     private int torchPlacedTick;
+    private BlockPos lightSurveyFoot;
+    private int lightSurveyTurn;
+    private float lightSurveyYaw;
     private boolean forcedLight;
     private BlockPos darkAttemptFoot;
 
@@ -310,8 +369,14 @@ final class PilotProgress {
         this.hands = hands;
         this.memory = memory;
         tools = new PilotTools(c, hands);
+        stallGuard = new PilotStallGuard(c, body, hands, tools, this::protectRecoveryBlock, this::safeSupport,
+            this::recordStallFooting);
+        caves = new PilotCaves(c, body, hands, tools, this::recordCaveFooting);
+        fall = new PilotFall(c, body, hands);
+        defense = new PilotDefense(c, body, hands);
         this.goal = goal;
         portal = goal.equals("nether_portal") ? new PilotPortal(c, body, hands, tools) : null;
+        fieldIgnition = portal != null ? new FieldIgnition() : null;
         goalItem = switch (goal) {
             case "wooden_pickaxe" -> WOOD_PICK;
             case "stone_pickaxe" -> STONE_PICK;
@@ -346,10 +411,25 @@ final class PilotProgress {
     }
 
     String failure() {
+        String recoveryFailure = stallGuard.failure();
+        if (recoveryFailure != null) return recoveryFailure;
         return stopped != null || portal == null ? stopped : portal.failure();
     }
 
+    PilotStallGuard.Report stallReport() { return stallGuard.report(); }
+    void observeOwnBreak(BlockPos position, BlockState state) {
+        body.observeHeadroomBreak(position);
+        stallGuard.broken(position, state);
+    }
+
     int confirmedFrameBlocks() { return portal == null ? 0 : portal.confirmedFrameBlocks(); }
+    int castFrameBlocks() { return portal == null ? 0 : portal.confirmedCastFrameBlocks(); }
+    int castPassiveBlocks() { return portal == null ? 0 : portal.passiveFrameBlocks(); }
+    int castLavaDeposits() { return portal == null ? 0 : portal.depositedLavaSources(); }
+    PilotShoreCast.Report shoreCastReport() { return portal == null ? null : portal.shoreCastReport(); }
+    long castSurveyEvidence() { return portal == null ? 0 : portal.castSurveyEvidence(); }
+    String castPhase() { return portal == null ? "IDLE" : portal.castPhase(); }
+    int witnessedLavaSources() { return portal == null ? 0 : portal.witnessedSources(); }
     boolean ignited() { return portal != null && portal.ignited(); }
 
     void portalWorkshop(String recipe, int sticks) { requestTable(recipe, null, 0, sticks); }
@@ -363,7 +443,53 @@ final class PilotProgress {
         } else explore();
     }
     void portalProspectLava() {
-        if (!prepareMining(16)) excavate(DIAMOND_LEVEL, null);
+        lavaProspecting = true;
+        try { if (!prepareMining(DIAMOND_LEVEL)) excavate(DIAMOND_LEVEL, null); }
+        finally { lavaProspecting = false; }
+    }
+
+    int caveOpenings() { return caveOpenings; }
+    int caveFootsteps() { return caveFootsteps; }
+    PilotFall fall() { return fall; }
+
+    private void recordCaveFooting(BlockPos reached) {
+        if (c.player == null || !c.player.isOnGround() || !reached.equals(c.player.getBlockPos())) return;
+        if (trail.isEmpty() || !reached.equals(trail.getLast())) {
+            // Water crossings retain their real endpoints in-session. PilotMemory saves
+            // only the connected grounded suffix, never imaginary steps through the air.
+            appendGrounded(reached, false);
+            caveFootsteps++;
+        }
+    }
+
+    private boolean surveyCave(BlockPos planned) {
+        boolean continuing = caves.active();
+        if (!continuing) {
+            if (planned == null || digDirection == null) return false;
+            caveLava = lavaProspecting;
+            caveGoal = sought == Resource.DIAMOND || sought == Resource.IRON || sought == Resource.COAL ? sought
+                : has(DEEP_PICK, 1) ? Resource.DIAMOND : Resource.IRON;
+        }
+        if (caves.step(tick, planned, digDirection, caveLava ? null : caveGoal.block)) {
+            if (!continuing) { caveOpenings++; nextFoot = null; cavePeek = null; }
+            status = caves.status();
+            return true;
+        }
+        BlockHitResult exposed = caves.ore();
+        if (exposed != null && caveGoal != null && caveGoal.block.test(state(exposed)) && tools.canHarvest(state(exposed))) {
+            setTarget(exposed, caveGoal);
+            mineTarget(caveGoal);
+            return true;
+        }
+        if (caves.lava() != null && portal != null) {
+            portal.rememberCaveLava(caves.lava());
+            return true;
+        }
+        if (caves.boatFloor() != null && fall.offerBoat(caves.boatFloor(), caves.boatYaw())) {
+            status = fall.status();
+            return true;
+        }
+        return false;
     }
 
     String status() {
@@ -373,11 +499,22 @@ final class PilotProgress {
     void tick() {
         if (win || c.player == null || c.world == null) return;
         tick++;
+        if (portal != null) stallGuard.surveyReceipt(portal.castSurveyEvidence());
+        stallGuard.observe(tick, confirmedFrameBlocks(), mealsEaten, status);
+        advance();
+        if (stopped != null) {
+            stallGuard.skillBlocked(stopped);
+            stopped = null;
+            status = stallGuard.status();
+        }
+    }
+
+    private void advance() {
         if (!c.player.isAlive() || c.currentScreen instanceof DeathScreen) {
             status = "died before " + goal;
             return;
         }
-        if (portalStarted && portal.updateArrival()) {
+        if (portal != null && portal.updateArrival()) {
             win = true;
             status = "entered the Nether through constructed portal";
             return;
@@ -389,22 +526,39 @@ final class PilotProgress {
         }
         trackMotion();
         float health = c.player.getHealth();
-        boolean hurtInScreen = health < previousHealth && c.currentScreen instanceof HandledScreen<?>;
+        boolean hurt = health < previousHealth;
         previousHealth = health;
-        if (hurtInScreen) {
-            interruptHands();
-            retreatYaw = c.player.getYaw() + 130;
-            retreatUntil = tick + 10;
-            status = "interrupting the screen after damage";
+        if (escapeDanger(hurt)) {
+            stallGuard.priorityAim();
             return;
         }
-        if (escapeDanger()) return;
+        if (fall.step()) {
+            body.prioritizeMovement();
+            stallGuard.priorityAim();
+            status = fall.status();
+            return;
+        }
         if (hands.busy()) return;
         if (handleScreen()) return;
-        if (eatOrHunt()) return;
-        if (stopped != null) {
-            status = stopped;
+        if (eatOrHunt()) {
+            stallGuard.priorityAim();
             return;
+        }
+        if (!stallGuard.ownsRecovery() && body.repairHeadroom(tools, protectedHeadroom)) {
+            status = body.headroomReport().reason();
+            return;
+        }
+        if (stallGuard.takeTurn(this::replanStalledLocalWork)) {
+            body.prioritizeMovement();
+            status = stallGuard.status();
+            return;
+        }
+        if ((exitStart != null || returnIndex >= 0) && !has(TORCH, 1) && has(FUEL, 1)
+            && craftTorches(12)) return;
+        if (needsTimberKit() && (sought != null || activeTrail() > 0) && tick % 6 == 0) {
+            findOre(Resource.DIAMOND, SEARCH);
+            findOre(Resource.IRON, SEARCH);
+            findOre(Resource.COAL, SEARCH);
         }
         if (exitStart != null) {
             recoverExit();
@@ -414,7 +568,19 @@ final class PilotProgress {
             retreatTunnel();
             return;
         }
+        if (caves.active() && surveyCave(null)) return;
+        if (fieldBench.packUntil != 0 && fieldBench.pack()) return;
+        if (prepareDefense()) return;
 
+        if (fieldIgnition != null && fieldIgnition.active() && fieldIgnition.step()) return;
+        if (portal != null && portal.castEligible()) {
+            portal.stepCast(this);
+            status = portal.status();
+            return;
+        }
+        if (fieldIgnition != null && !portalStarted && !has(DIAMOND, 3) && !has(DIAMOND_PICK, 1)
+            && has(IRON_PICK, 1) && fieldIgnition.start()) return;
+        if (needsTimberKit() && has(DEEP_PICK, 1) && prepareFieldBucket()) return;
         if (portal != null && (portalStarted || has(DIAMOND, 3) || has(DIAMOND_PICK, 1))) {
             portalStarted = true;
             status = "preparing the Nether portal";
@@ -428,16 +594,19 @@ final class PilotProgress {
         boolean woodPick = has(WOOD_PICK, 1);
         if (!timberReady) {
             boolean longGoal = needsTimberKit();
-            int timberReserve = goal.equals("iron_pickaxe") ? IRON_TIMBER : DEEP_TIMBER;
-            int timber = hands.count(PLANK) + 4 * hands.count(LOG);
-            boolean enoughFuel = hands.count(TORCH) + 4 * hands.count(FUEL) >= 24;
-            boolean workingUnderground = stonePick && c.player.getY() < 48
-                && (has(BURNABLE_LOG, 1) || has(PLANK, 4)) && (has(TORCH, 1) || has(FUEL, 1));
-            if (longGoal && !workingUnderground && !ironPick && trail.isEmpty() && (stonePick || woodPick)
-                && (timberWitness != null || pickupItem == LOG || timber < 4 * timberReserve
-                    || !enoughFuel && !has(BURNABLE_LOG, timberReserve))) {
+            int torchRecipes = torchBatches(launchLight(), hands.count(TORCH));
+            int fuelLogs = Math.max(0, torchRecipes - hands.count(FUEL));
+            // Do not reject an equipped expedition over a fixed stack of logs. Pay for
+            // the missing light, its charcoal heat, and a field kit (bench, replacements,
+            // shield or boat) in addition to the logs that must stay intact for charcoal.
+            int kitPlanks = goal.equals("iron_pickaxe") ? 4 * IRON_TIMBER :
+                24 + localTableWood() + 2 * stickBatches(torchRecipes + 8) + furnacePlanks(fuelLogs) + 4 * fuelLogs;
+            boolean shortTimber = hands.count(PLANK) + 4 * hands.count(LOG) < kitPlanks
+                || hands.count(BURNABLE_LOG) < fuelLogs;
+            if (longGoal && surfaceDeparture() && (stonePick || woodPick || ironPick)
+                && (pickupItem == LOG || tick < timberDropUntil || shortTimber)) {
                 if (pickupItem == LOG || tick < timberDropUntil) seekTimber();
-                else if (timber < 4 * timberReserve && !has(AXE, 1)) {
+                else if (!has(AXE, 1)) {
                     if (has(STONE, stonePick ? 3 : 6)) requestTable("stone_axe", null, 0, 2);
                     else requestTable("wooden_axe", null, 3, 2);
                 } else seekTimber();
@@ -470,14 +639,65 @@ final class PilotProgress {
             acquireIron(3);
             return;
         }
-        if (portal != null) {
+        if (portal != null && nextFoot == null) {
+            // The bucket costs three; the dry-bank route sets a fourth ingot aside for ignition.
             int reserve = (has(PORTAL_BUCKET, 1) ? 0 : 3) + (has(IGNITER, 1) ? 0 : 1);
-            if (!has(INGOT, reserve)) {
-                acquireIron(reserve);
-                return;
+            int missing = reserve - hands.count(INGOT);
+            if (missing > 0) {
+                // Take exposed iron on the way down. Do not spend the whole expedition
+                // branch-mining the iron layer for four spare ingots once the pick is ready.
+                if (hands.count(RAW_IRON) >= Math.min(3, missing)) {
+                    acquireIron(reserve);
+                    return;
+                }
+                if (workOre(Resource.DIAMOND, REACH, false) || workOre(Resource.IRON, SEARCH, true)) return;
             }
         }
         mineDiamonds(goal.equals("nether_portal") ? 3 : 1);
+    }
+
+    private void replanStalledLocalWork() {
+        if (fieldIgnition != null && fieldIgnition.active()) fieldIgnition.finish();
+        if (target != null) {
+            forgetOreTarget();
+            abandonTarget();
+        }
+        if (pickupItem != null) abandonPickup(pickupItem, 110);
+        if (timberWitness != null) finishTimber(null);
+        timberChop = null;
+        if (timberCanopy != null) rememberTimberSite(exhaustedCanopies, BlockPos.ofFloored(timberCanopy));
+        timberCanopy = null;
+        timberExitFrom = timberExitTo = null;
+        if (nextFoot != null) closeDig(nextFoot);
+        nextFoot = cavePeek = climbTo = gaitStep = exitStart = exitTo = null;
+        approachGoal = routeLegStart = sweepOrigin = null;
+        routeTick = -10;
+        heading = Float.NaN;
+        headingUntil = 0;
+    }
+
+    private boolean protectRecoveryBlock(BlockPos block) {
+        return supportsTrail(block) || timberUnderfoot(block) || block.equals(table.position)
+            || block.equals(furnace.position) || block.equals(furnaceWitness) || block.up().equals(table.position)
+            || block.up().equals(furnace.position) || block.up().equals(furnaceWitness);
+    }
+
+    private void recordStallFooting(BlockPos reached) {
+        if (returnIndex >= 0) {
+            int rejoin = trail.lastIndexOf(reached);
+            if (rejoin >= returnTo && rejoin <= returnIndex) {
+                returnIndex = rejoin;
+                returnDetour = null;
+                returnAge = tick;
+                returnClear = -1;
+            } else if (adjacent(reached, trail.get(returnIndex))) {
+                returnDetour = reached;
+                returnAge = tick;
+                returnClear = -1;
+            }
+        } else if (resumeIndex < 0 && !trail.isEmpty() && adjacent(trail.getLast(), reached) && !trail.contains(reached)) {
+            appendGrounded(reached, false);
+        }
     }
 
     void acquireIron(int desired) {
@@ -487,10 +707,26 @@ final class PilotProgress {
         }
         int ingots = hands.count(INGOT);
         if (ingots >= desired) return;
+        if (nextFoot != null) {
+            excavate(nextFoot.getY(), digGoal);
+            return;
+        }
+        if (has(DEEP_PICK, 1) && !has(DIAMOND, portal == null ? 1 : 3)
+            && workOre(Resource.DIAMOND, REACH - 0.35, false)) return;
         int raw = hands.count(RAW_IRON);
         if (raw >= Math.min(3, desired - ingots)) {
+            if (!has(TORCH, 2) && craftTorches(LOCAL_LIGHT)) return;
+            if (!has(FUEL, 1)) {
+                int heatPlanks = furnacePlanks(Math.min(3, raw));
+                if (!affordsWood(localTableWood() + heatPlanks, 2)) {
+                    if (!workOre(Resource.COAL, has(TORCH, 2) ? SEARCH : REACH - 0.35, true))
+                        seekExpeditionSupplies("furnace fuel");
+                    return;
+                }
+                if (!supplyPlanks(heatPlanks)) return;
+            }
             fire(Firing.IRON, desired);
-        } else if (!prepareMining(12)) {
+        } else {
             gather(Resource.IRON, 115, 16);
         }
     }
@@ -499,56 +735,83 @@ final class PilotProgress {
         if (has(DIAMOND, count)) return true;
         if (firing != Firing.NONE) {
             fire(firing, furnaceDemand);
-        } else if (!prepareMining(36)) {
+        } else {
             gather(Resource.DIAMOND, 0, DIAMOND_LEVEL);
         }
         return false;
     }
 
-    private boolean prepareMining(int reserve) {
+    private boolean surfaceDeparture() {
+        int height = c.player.getBlockY();
+        if (departureKit || height <= 48 || resumeIndex >= 0) return false;
+        if (height < 64 && has(DEEP_PICK, 1) && (has(RAW_IRON, 1) || has(STONE, 32))) return false;
+        return !has(DEEP_PICK, 1) || trail.size() < 2
+            || trail.size() < 8 && trail.getFirst().getY() - height < 3;
+    }
+
+    private int launchLight() {
+        return goal.equals("iron_pickaxe") ? IRON_LIGHT : DEEP_LIGHT;
+    }
+
+    private static int torchBatches(int target, int held) {
+        return (Math.max(0, target - held) + 3) / 4;
+    }
+
+    private boolean prepareMining(int depth) {
         if (nextFoot != null) {
             excavate(nextFoot.getY(), digGoal);
             return true;
         }
-        // A reattached actor already standing deep in its own lit shaft is not
-        // departing from the surface again. Do not walk 70 steps back for a fresh
-        // "departure kit" while carrying enough light to prospect locally.
-        if (miningReserve == 0 && c.player.getY() <= 48 && hands.count(TORCH) + 4 * hands.count(FUEL) >= 4)
-            miningReserve = reserve;
-        boolean departure = miningReserve < reserve || resumeIndex == 1;
-        int sparePlanks = reserve >= 24 ? 16 : 8;
-        int spareSticks = reserve >= 24 ? 8 : 4;
-        if (departure && has(TORCH, reserve) && !affordsWood(sparePlanks, spareSticks)) {
-            ensureWood(sparePlanks, spareSticks);
+
+        boolean departure = surfaceDeparture();
+        int torches = hands.count(TORCH);
+        int drop = Math.max(0, c.player.getBlockY() - depth);
+        int nextLeg = drop + drop / 9 + 12;
+        int needed = departure ? launchLight() : Math.min(LOCAL_LIGHT, 2 + (nextLeg + 6) / 7);
+        if (torches < needed) {
+            if (craftTorches(needed)) return true;
+            if (prepareLight(departure)) return true;
+        }
+
+        int deepUses = pickUses(DEEP_PICK);
+        int stoneUses = pickUses(STONE_PICK);
+        int remaining = deepUses + stoneUses;
+        if (depth == DIAMOND_LEVEL && deepUses <= 4) {
+            if (has(INGOT, 3) && affordsWood(localTableWood(), 2)) {
+                requestTable("iron_pickaxe", null, 0, 2);
+                return true;
+            }
+            if (has(RAW_IRON, 3) && (canSetLocalFurnace() || localStation(furnace, furnaceWitness))) {
+                acquireIron(3);
+                return true;
+            }
+            if (workOre(Resource.IRON, torches > 1 ? SEARCH : REACH - 0.35, true)) return true;
+        }
+
+        // Break up to three blocks per stair step. Budget the next lit leg and
+        // leave uses for exposed ore, but don't require an entire second kit.
+        int litLeg = Math.min(nextLeg, 7 * Math.max(1, torches - 1));
+        if (remaining < 3 * litLeg + 4 && has(STONE, 3) && affordsWood(localTableWood(), 2)) {
+            requestTable("stone_pickaxe", null, 0, 2);
             return true;
         }
-        int remaining = pickUses(STONE_PICK);
-        if (remaining < 10 && has(STONE, 3)) {
-            makePick("stone_pickaxe", STONE, 3);
+        if (remaining < 4 || depth == DIAMOND_LEVEL && deepUses <= 1 && stoneUses < 4) {
+            if (has(STONE, 3)) makePick("stone_pickaxe", STONE, 3);
+            else if (depth == DIAMOND_LEVEL && deepUses <= 1
+                || !workOre(Resource.STONE, REACH - 0.35, false)) seekExpeditionSupplies("a replacement pickaxe");
             return true;
         }
-        if (remaining == 0) {
-            gatherStone();
-            return true;
-        }
-        if (target != null && (miningResource == sought || miningResource == Resource.COAL)
-            || pickupItem != null && (pickupItem == FUEL || sought != null && pickupItem == sought.drop)) return false;
-        int needed = departure ? reserve : 4;
-        if (has(TORCH, needed)) {
-            miningReserve = Math.max(miningReserve, reserve);
-            return false;
-        }
-        if (craftTorches(Math.min(reserve, Math.max(needed, 12)))) return true;
-        // A small supply can cover the next ore search, but not entry into a long dark route.
-        if (!departure && has(TORCH, 2)) return false;
-        prepareLight(needed);
-        return true;
+        if (departure) departureKit = true;
+        return false;
     }
 
     private boolean handleScreen() {
-        if (c.currentScreen == null) return false;
+        if (c.currentScreen == null) {
+            fieldBench.confirmCraft();
+            return false;
+        }
         if (c.currentScreen instanceof CraftingScreen && tableRecipe != null) {
-            confirmStationUse(table);
+            BlockPos used = confirmStationUse(table);
             table.openAttempts = 0;
             String recipe = tableRecipe;
             String extra = tableExtra;
@@ -561,21 +824,29 @@ final class PilotProgress {
                 c.currentScreen.close();
                 return true;
             }
-            List<String> recipes = woodBatch(tablePlanks, tableSticks);
+            boolean addBoat = !recipe.equals("boat") && needsTimberKit() && !has(BOAT, 1)
+                && has(BURNABLE_LOG, 8) && affordsWood(tablePlanks + 5 + 12, tableSticks + 4)
+                && hands.singleBoatWoodStock();
+            List<String> recipes = woodBatch(tablePlanks + (addBoat ? 5 : 0), tableSticks);
             recipes.add(recipe);
             if (extra != null) recipes.add(extra);
             if (axe != null) recipes.add(axe);
-            if (!hands.craftBatch(recipes)) c.currentScreen.close();
+            if (addBoat) recipes.add("boat");
+            if (hands.craftBatch(recipes)) fieldBench.awaitCraft(used, recipe);
+            else c.currentScreen.close();
         } else if (c.currentScreen instanceof FurnaceScreen screen && firing != Firing.NONE) {
             confirmStationUse(furnace);
             furnace.openAttempts = 0;
             furnaceWitness = furnace.position;
             status = firing == Firing.IRON ? "smelting iron" : "making charcoal";
             var handler = screen.getScreenHandler();
-            boolean input = !handler.getSlot(0).getStack().isEmpty();
+            ItemStack inputStack = handler.getSlot(0).getStack();
+            boolean input = !inputStack.isEmpty();
             boolean output = !handler.getOutputSlot().getStack().isEmpty();
-            if (!input && !output
-                && has(firing == Firing.IRON ? INGOT : FUEL, furnaceDemand)) {
+            if (handler.isBurning() && !output && (firing == Firing.IRON ? RAW_IRON : BURNABLE_LOG).test(inputStack))
+                stallGuard.cooking(tick, furnace.position, handler.getCookProgress());
+            if (!input && !output && (has(firing == Firing.IRON ? INGOT : FUEL, furnaceDemand)
+                || firing == Firing.CHARCOAL && furnaceLoaded)) {
                 finishFire();
                 c.currentScreen.close();
                 return true;
@@ -588,10 +859,7 @@ final class PilotProgress {
                 String result = hands.status();
                 furnacePoll = tick + (result.equals("smelt: cooking") ? 65 : 24);
                 furnaceNeedsFuel = result.equals("smelt: no fuel");
-                if (result.equals("smelt: no input")) {
-                    furnaceNeedsWood = firing == Firing.CHARCOAL && !has(BURNABLE_LOG, 1);
-                    finishFire();
-                }
+                if (result.equals("smelt: no input")) finishFire();
                 c.currentScreen.close();
             }
         } else if (c.currentScreen instanceof HandledScreen<?>) {
@@ -631,11 +899,238 @@ final class PilotProgress {
         return !goal.equals("wooden_pickaxe") && !goal.equals("stone_pickaxe");
     }
 
+    private boolean prepareFieldBucket() {
+        if (!has(PORTAL_BUCKET, 1)) {
+            if (!has(INGOT, 3) || nextFoot != null || firing != Firing.NONE) return false;
+            requestTable("bucket", null, 0, 0);
+            return true;
+        }
+        return fillFieldBucket();
+    }
+
+    private boolean fillFieldBucket() {
+        if (has(WATER_BUCKET, 1) || !has(EMPTY_BUCKET, 1)) {
+            fieldWater = null;
+            return false;
+        }
+        if (tick < waterRetry || !dryFieldFooting()) return false;
+        if (fieldWater == null) {
+            fieldWater = body.visibleFluid(false, true, REACH - 0.25);
+            if (fieldWater == null || !isWaterSource(fieldWater)) {
+                fieldWater = null;
+                return false;
+            }
+            fieldWaterPoint = inward(fieldWater);
+            fieldWaterUntil = tick + 48;
+        }
+        if (tick > fieldWaterUntil
+            || c.player.getEyePos().squaredDistanceTo(fieldWater.getPos()) > REACH * REACH) {
+            fieldWater = null;
+            waterRetry = tick + 100;
+            return false;
+        }
+        status = "filling the field bucket from visible water";
+        if (!hold(EMPTY_BUCKET)) return true;
+        BlockPos source = fieldWater.getBlockPos();
+        body.aim(fieldWaterPoint);
+        if (!body.aligned(fieldWaterPoint)) return true;
+        BlockHitResult current = perceive(fieldWaterPoint, REACH);
+        if (current != null) {
+            if (source.equals(current.getBlockPos()) && isWaterSource(current)) body.useWaterSource(source);
+            else {
+                fieldWater = null;
+                waterRetry = tick + 100;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isWaterSource(BlockHitResult hit) {
+        BlockState block = state(hit);
+        return block.isOf(Blocks.WATER) && block.getFluidState().isStill();
+    }
+
+    private boolean dryFieldFooting() {
+        return c.player.isOnGround() && !c.player.isTouchingWater() && !c.player.isInLava();
+    }
+
+    private static Vec3d inward(BlockHitResult hit) {
+        return hit.getPos().lerp(Vec3d.ofCenter(hit.getBlockPos()), 0.03);
+    }
+
+    /** A short supply diversion at a currently seen lava bank, not a separate gravel expedition. */
+    private final class FieldIgnition {
+        private static final int GRAVEL_LIMIT = 12;
+        private static final int BANK_LIMIT = 3;
+        private final BlockPos[] checkedBanks = new BlockPos[BANK_LIMIT];
+        private final Predicate<BlockHitResult> gravelCandidate = this::safeGravel;
+        private BlockPos bank, gravelBlock, rejectedGravel;
+        private Vec3d poolPoint, gravelPoint;
+        private PilotPortal.Place placement;
+        private int bankCount, gravelAttempts, nextProbe, until, gravelUntil, dropUntil;
+        private int scanTurn, scanFrames;
+        private float bankBearing;
+        private boolean waterReady, attacked;
+
+        boolean active() { return bank != null; }
+
+        boolean start() {
+            if (bankCount >= BANK_LIMIT || gravelAttempts >= GRAVEL_LIMIT || tick < nextProbe
+                || nextFoot != null || firing != Firing.NONE || !World.OVERWORLD.equals(c.world.getRegistryKey())
+                || !dryFieldFooting() || !has(PORTAL_BUCKET, 1) || !has(INGOT, 1)
+                || has(IGNITER, 1) || has(FLINT, 1)) return false;
+            BlockPos feet = c.player.getBlockPos();
+            if (Math.abs(c.player.getY() - feet.getY()) > 0.06) return false;
+            for (int i = 0; i < bankCount; i++) {
+                if (feet.getSquaredDistance(checkedBanks[i]) <= 6 * 6) return false;
+            }
+            nextProbe = tick + 8;
+            BlockHitResult lava = body.visibleFluid(true, true, REACH);
+            if (lava == null || lava.getSide() != Direction.UP || lava.getBlockPos().getY() != feet.getY() - 1)
+                return false;
+            var fluid = state(lava).getFluidState();
+            if (!fluid.isStill() || !fluid.isIn(FluidTags.LAVA)) return false;
+            checkedBanks[bankCount++] = bank = feet;
+            poolPoint = inward(lava);
+            bankBearing = c.player.getYaw();
+            waterReady = has(WATER_BUCKET, 1);
+            until = tick + 450;
+            return step();
+        }
+
+        boolean step() {
+            if (tick > until || !dryFieldFooting() || c.player.getBlockY() != bank.getY()
+                || c.player.getBlockPos().getSquaredDistance(bank) > 3 * 3) return finish();
+            if (has(IGNITER, 1)) {
+                status = "looking back toward the visible lava pool with field supplies ready";
+                body.aim(poolPoint);
+                if (!body.aligned(poolPoint)) return true;
+                return finish();
+            }
+            if (!has(INGOT, 1)) return finish();
+            if (!has(WATER_BUCKET, 1)) {
+                return fillFieldBucket() || scan("checking the nearby bank for reachable source water");
+            }
+            fieldWater = null;
+            if (!waterReady) {
+                waterReady = true;
+                scanTurn = scanFrames = 0;
+            }
+            if (has(FLINT, 1)) {
+                status = "crafting flint and steel for the nearby lava pool";
+                hands.craft("flint_and_steel");
+                return true;
+            }
+            if (gravelBlock != null) return mineGravel();
+            if (placement != null) {
+                status = "placing carried gravel on the dry bank";
+                switch (portal.place(placement, false, tick)) {
+                    case DONE -> {
+                        startMining(placement.dest, Vec3d.ofCenter(placement.dest));
+                        placement = null;
+                    }
+                    case BLOCKED -> { return finish(); }
+                    case WAIT -> { }
+                }
+                return true;
+            }
+            if (collect(GRAVEL_DROPS, 3.5, false)) return true;
+            if (tick < dropUntil) {
+                status = "watching for the gravel or flint drop";
+                body.aim(gravelPoint);
+                return true;
+            }
+            if (gravelAttempts >= GRAVEL_LIMIT) return finish();
+            if (has(GRAVEL, 1)) {
+                BlockHitResult floor = body.stationFace(null);
+                if (floor != null && floor.getSide() == Direction.UP && safeSupport(floor)
+                    && floor.getBlockPos().getY() + 1 == c.player.getBlockY()
+                    && floor.getPos().y >= c.player.getY() - 0.02
+                    && body.clearTerrain(Vec3d.ofCenter(floor.getBlockPos().up()))) {
+                    placement = new PilotPortal.Place(floor.getBlockPos(), Direction.UP, inward(floor), Items.GRAVEL, tick);
+                    return true;
+                }
+            }
+            BlockHitResult visible = body.find(GRAVEL_BLOCK, REACH - 0.25, gravelCandidate).orElse(null);
+            if (visible != null) {
+                startMining(visible.getBlockPos(), inward(visible));
+                return true;
+            }
+            return scan("checking the nearby bank for exposed gravel");
+        }
+
+        private boolean safeGravel(BlockHitResult hit) {
+            BlockPos pos = hit.getBlockPos();
+            // Don't remove a return step or loosen a gravel column over our footprint.
+            return !pos.equals(rejectedGravel)
+                && pos.getY() >= bank.getY() - 1 && pos.getY() <= bank.getY() + 1
+                && (Math.abs(c.player.getX() - (pos.getX() + 0.5)) > 0.85
+                    || Math.abs(c.player.getZ() - (pos.getZ() + 0.5)) > 0.85)
+                && !protectRecoveryBlock(pos);
+        }
+
+        private void startMining(BlockPos block, Vec3d point) {
+            gravelBlock = block;
+            gravelPoint = point;
+            gravelUntil = tick + 48;
+            attacked = false;
+            ++gravelAttempts;
+        }
+
+        private boolean mineGravel() {
+            status = "breaking confirmed gravel for flint at the lava bank";
+            body.aim(gravelPoint);
+            if (tick > gravelUntil) {
+                rejectedGravel = gravelBlock;
+                gravelBlock = null;
+            } else if (body.aligned(gravelPoint)) {
+                BlockHitResult seen = perceive(gravelPoint, REACH);
+                BlockState block = seen != null && gravelBlock.equals(seen.getBlockPos()) ? state(seen) : null;
+                if (block != null && block.isOf(Blocks.GRAVEL)) {
+                    BlockHitResult selected = body.selectedFace();
+                    if (selected != null && gravelBlock.equals(selected.getBlockPos()) && tools.readyFor(block)) {
+                        body.mine(gravelBlock);
+                        attacked = true;
+                    }
+                } else if (seen != null || body.clearTerrain(gravelPoint)) {
+                    if (attacked) dropUntil = tick + 26;
+                    else rejectedGravel = gravelBlock;
+                    gravelBlock = null;
+                }
+            }
+            return true;
+        }
+
+        private boolean scan(String activity) {
+            if (scanTurn == 4) return finish();
+            float yaw = bankBearing + 90 * scanTurn;
+            body.turn(yaw, 36);
+            if (Math.abs(MathHelper.wrapDegrees(yaw - c.player.getYaw())) < 8
+                && Math.abs(c.player.getPitch() - 36) < 7 && ++scanFrames >= 6) {
+                ++scanTurn;
+                scanFrames = 0;
+            }
+            status = activity;
+            return true;
+        }
+
+        private boolean finish() {
+            if (pickupItem == GRAVEL_DROPS) clearPickup();
+            bank = gravelBlock = rejectedGravel = null;
+            placement = null;
+            fieldWater = null;
+            dropUntil = scanTurn = scanFrames = 0;
+            return false;
+        }
+    }
+
     void requestTable(String recipe, String extra, int planks, int sticks) {
         requestTable(recipe, extra, null, planks, sticks);
     }
 
     private void requestTable(String recipe, String extra, String axe, int planks, int sticks) {
+        if (fieldBench.packUntil != 0) fieldBench.leave();
         if (table.position != null && c.player.getEyePos().distanceTo(Vec3d.ofCenter(table.position)) > 4.0) {
             int bench = stationWaypoint(table.position);
             if (bench >= 0 && activeTrail() - bench <= 14) {
@@ -644,6 +1139,7 @@ final class PilotProgress {
             }
             if (activeTrail() > 0 || resumeIndex >= 0
                 || c.player.getEyePos().distanceTo(Vec3d.ofCenter(table.position)) > 7) {
+                fieldBench.leave();
                 table.position = null;
                 table.face = null;
                 table.niche = table.underfoot = table.rejected = null;
@@ -722,37 +1218,132 @@ final class PilotProgress {
     }
 
     private boolean craftTorches(int reserve) {
-        int batches = Math.min(hands.count(FUEL), (reserve - hands.count(TORCH) + 3) / 4);
-        if (batches <= 0) return false;
-        if (!affordsWood(0, batches)) {
-            ensureWood(0, batches);
-            return true;
+        int held = hands.count(TORCH);
+        int batches = Math.min(Math.min(3, hands.count(FUEL)), torchBatches(reserve, held));
+        while (batches > 0 && !affordsWood(localTableWood(), batches + 2)) batches--;
+        if (batches == 0 && held < reserve && has(FUEL, 1) && canSpareEmergencyStick(held)) {
+            // In a dark passage the two planks in hand buy four real sticks.
+            // Make the affordable batch now instead of waiting for hypothetical bench timber.
+            batches = Math.min(Math.min(3, hands.count(FUEL)), torchBatches(reserve, held));
+            while (batches > 0 && !affordsWood(0, batches)) --batches;
         }
+        if (batches <= 0) return false;
         List<String> recipes = woodBatch(0, batches);
         for (int i = 0; i < batches; i++) recipes.add("torch");
         status = "crafting torches";
-        hands.craftBatch(recipes);
+        return hands.craftBatch(recipes);
+    }
+
+    private boolean prepareLight(boolean departure) {
+        int torches = hands.count(TORCH);
+        boolean canMakeTorch = affordsWood(localTableWood(), 3) || canSpareEmergencyStick(torches);
+        double range = torches > 1 || departure ? SEARCH : REACH - 0.35;
+        if (canMakeTorch && workOre(Resource.COAL, range, departure || torches <= 3))
+            return true;
+
+        boolean localFurnace = localStation(furnace, furnaceWitness);
+        if (!localFurnace) {
+            BlockHitResult seen = body.find(state -> state.isOf(furnace.block), 3.75).orElse(null);
+            if (seen != null) {
+                furnace.position = confirmStation(furnace, seen);
+                localFurnace = true;
+            }
+        }
+        if (localFurnace || canSetLocalFurnace() || departure || activeTrail() <= 1 && c.player.getBlockY() > 48) {
+            if (prepareCharcoal()) return true;
+        } else if (has(BURNABLE_LOG, 1) && affordsWood(localTableWood() + 2, 3)
+            && workOre(Resource.STONE, REACH - 0.35, false)) {
+            status = "gathering local furnace stone";
+            return true;
+        }
+
+        if (!departure && torches <= 3 && surveyLocalLight()) return true;
+        if (!departure && torches >= 2) return false;
+        if (canMakeTorch && recallOre(Resource.COAL, range, activeTrail())) return true;
+        if (!localFurnace && prepareCharcoalAtKnownFurnace()) return true;
+        seekExpeditionSupplies(canMakeTorch ? "light" : "wood and light");
         return true;
     }
 
-    private void prepareLight(int needed) {
-        if (target != null && miningResource != Resource.COAL) target = null;
-        if (collect(FUEL, 6)) return;
-        BlockHitResult coal = body.find(Resource.COAL.block, 6).orElse(null);
-        if ((target != null && miningResource == Resource.COAL) || coal != null && reachableResourceFace(coal.getBlockPos())) {
-            if (target == null || miningResource != Resource.COAL) setTarget(coal, Resource.COAL);
-            mineTarget(Resource.COAL);
-            return;
+    private boolean canSpareEmergencyStick(int torches) {
+        // Do not leave a lit bench for timber merely to protect a stick while
+        // a workable pick and a single torch batch can reopen local options.
+        return torches <= 1 && (has(STICK, 1) || affordsWood(0, 3))
+            && pickUses(DEEP_PICK) + pickUses(STONE_PICK) > 6;
+    }
+
+    private boolean surveyLocalLight() {
+        BlockPos feet = c.player.getBlockPos();
+        if (!feet.equals(lightSurveyFoot)) {
+            lightSurveyFoot = feet;
+            lightSurveyTurn = 0;
+            lightSurveyYaw = c.player.getYaw();
         }
-        if (activeTrail() > 1 && furnaceWitness == null && furnace.position == null) {
-            if (recoverStation(furnace)) return;
-            if (furnace.position == null && !canSetLocalFurnace()) {
-                miningReserve = 0;
-                beginReturn(true);
-                return;
-            }
+        if (lightSurveyTurn >= 4) return false;
+        float yaw = lightSurveyYaw + 90 * lightSurveyTurn;
+        body.turn(yaw, -3);
+        if (Math.abs(MathHelper.wrapDegrees(yaw - c.player.getYaw())) < 8
+            && Math.abs(c.player.getPitch() + 3) < 7) lightSurveyTurn++;
+        status = "looking for local coal or a furnace";
+        return true;
+    }
+
+    private int localTableWood() {
+        return has(table.item, 1) || localStation(table, null) ? 0 : 4;
+    }
+
+    private boolean localStation(Station station, BlockPos alternate) {
+        BlockPos pos = station.position != null ? station.position : alternate;
+        return pos != null && c.player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(pos)) <= 3.75 * 3.75;
+    }
+
+    private boolean prepareCharcoalAtKnownFurnace() {
+        BlockPos known = furnace.position != null ? furnace.position
+            : furnaceWitness != null ? furnaceWitness : memory.station(c.world, true);
+        return known != null && stationWaypoint(known) >= 0 && prepareCharcoal();
+    }
+
+    private boolean prepareCharcoal() {
+        int burnable = hands.count(BURNABLE_LOG);
+        if (burnable == 0 || has(FUEL, 1)) return false;
+        var inventory = c.player.getInventory();
+        var fuels = c.world.getFuelRegistry();
+        int batch = 0;
+        int plankHeat = 0;
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            ItemStack stack = inventory.getStack(slot);
+            if (BURNABLE_LOG.test(stack)) batch = Math.max(batch, Math.min(3, stack.getCount()));
+            if (PLANK.test(stack)) plankHeat = Math.max(plankHeat, fuels.getFuelTicks(stack) * stack.getCount());
         }
-        fire(Firing.CHARCOAL, Math.min(3, (needed - hands.count(TORCH) + 3) / 4));
+        int timber = hands.count(PLANK) + 4 * hands.count(LOG);
+        int heatPlanks = furnacePlanks(batch);
+        int protectedWood = localTableWood() + 2 * stickBatches(batch + 2);
+        // Hands loads up to three logs from one stack. Converting one safely
+        // tightens that limit when only a single log can really be spared.
+        boolean fits = timber - 4 * batch >= heatPlanks + protectedWood;
+        int heatForTable = !has(furnace.item, 1) && !localStation(furnace, furnaceWitness) ? 150 * localTableWood() : 0;
+        if (!fits || plankHeat < 200 * batch + heatForTable) {
+            int minimum = 4 + 2 + localTableWood() + 2 * stickBatches(3);
+            if (burnable < 2 || timber < minimum) return false;
+            status = "reserving workshop wood and preparing charcoal fuel";
+            return hands.craft("planks");
+        }
+        fire(Firing.CHARCOAL, batch);
+        return true;
+    }
+
+    private static int furnacePlanks(int batch) {
+        // Vanilla smelts in 200 ticks; one burnable plank supplies 150 ticks.
+        return (4 * batch + 2) / 3;
+    }
+
+    private void seekExpeditionSupplies(String supplies) {
+        if (activeTrail() > 1) {
+            status = "returning along traveled steps for " + supplies;
+            beginReturn(true);
+        } else {
+            seekTimber();
+        }
     }
 
     private void fire(Firing batch, int demand) {
@@ -770,23 +1361,19 @@ final class PilotProgress {
         if (furnace.position == null) {
             BlockHitResult seen = body.find(state -> state.isOf(furnace.block), 5).orElse(null);
             if (seen != null) furnace.position = confirmStation(furnace, seen);
-            else if (recoverStation(furnace)) return;
+            else if (!(batch == Firing.CHARCOAL && canSetLocalFurnace()) && recoverStation(furnace)) return;
         }
-        if (furnace.position == null && !has(furnace.item, 1) && activeTrail() < 2 && surveyWorkshop()) return;
         if (furnace.position != null && c.player.getEyePos().distanceTo(Vec3d.ofCenter(furnace.position)) > 3.75) {
             int bench = stationWaypoint(furnace.position);
-            if (bench >= 0) {
-                if (!furnaceLoaded && activeTrail() - bench > 12 && canSetLocalFurnace()) {
-                    // Cobblestone and a local table are cheaper than a round trip up a long shaft.
-                    // Keep the observed distant furnace in memory; don't confuse it with an active batch.
-                    furnace.position = furnaceWitness = null;
-                    furnace.face = null;
-                    furnace.siteSince = furnace.stageSince = furnace.stage = 0;
-                } else {
-                    if (batch == Firing.CHARCOAL) miningReserve = 0;
-                    startReturn(bench, true);
-                    return;
-                }
+            if (!furnaceLoaded && canSetLocalFurnace()
+                && (bench < 0 || activeTrail() - bench > 12)) {
+                // Leave the distant furnace in observation memory and use a local replacement.
+                furnace.position = furnaceWitness = null;
+                furnace.face = null;
+                furnace.siteSince = furnace.stageSince = furnace.stage = 0;
+            } else if (bench >= 0) {
+                startReturn(bench, true);
+                return;
             }
         }
         if (furnace.position == null && !has(furnace.item, 1)) {
@@ -795,16 +1382,11 @@ final class PilotProgress {
             else requestTable("furnace", null, 0, 0);
             return;
         }
-        if (!furnaceLoaded && batch == Firing.CHARCOAL && furnaceNeedsWood && !has(BURNABLE_LOG, 1)) {
-            if (activeTrail() > 1) beginReturn(true);
-            else seekTimber();
-            return;
-        }
         if (tick < furnacePoll) {
             status = "waiting for furnace";
             return;
         }
-        if (furnaceNeedsFuel && !has(FUEL, 1) && !supplyPlanks(3)) return;
+        if (furnaceNeedsFuel && !has(FUEL, 1) && !supplyPlanks(4)) return;
         useStation(furnace);
     }
 
@@ -820,33 +1402,20 @@ final class PilotProgress {
         furnaceNeedsFuel = false;
     }
 
-    private boolean surveyWorkshop() {
-        if (workshopSweep >= 4) return false;
-        if (table.position == null) {
-            BlockHitResult seen = body.find(state -> state.isOf(table.block), 5).orElse(null);
-            if (seen != null) table.position = confirmStation(table, seen);
-        }
-        if (Float.isNaN(workshopHeading)) workshopHeading = c.player.getYaw();
-        float heading = workshopHeading + 90 * workshopSweep;
-        body.turn(heading, 28);
-        if (Math.abs(MathHelper.wrapDegrees(heading - c.player.getYaw())) < 8
-            && Math.abs(c.player.getPitch() - 28) < 7) workshopSweep++;
-        status = "surveying for a nearby workshop";
-        return true;
-    }
-
     private BlockPos confirmStation(Station station, BlockHitResult visible) {
         BlockPos position = visible.getBlockPos();
+        if (station == table) fieldBench.observe(visible);
         memory.confirm(c.world, station == furnace, position);
         station.memoryProbe = 0;
         return position;
     }
 
-    private void confirmStationUse(Station station) {
+    private BlockPos confirmStationUse(Station station) {
         BlockPos position = station.lastUse;
-        if (position != null && position.equals(station.position) && tick - station.opened <= 10)
-            memory.confirm(c.world, station == furnace, position);
         station.lastUse = null;
+        if (position == null || !position.equals(station.position) || tick - station.opened > 10) return null;
+        memory.confirm(c.world, station == furnace, position);
+        return position;
     }
 
     private boolean recoverStation(Station station) {
@@ -887,6 +1456,7 @@ final class PilotProgress {
             double distance = c.player.getEyePos().distanceTo(center);
             if (station.placed != 0) {
                 if (!has(station.item, station.placementCount)) {
+                    if (station == table) fieldBench.placementConsumed(station.position);
                     if (station == furnace) furnaceWitness = station.position;
                     station.placed = 0;
                     station.underfoot = null;
@@ -904,7 +1474,10 @@ final class PilotProgress {
                     if (station == furnace && station.position.equals(furnaceWitness)) {
                         if (activeTrail() > 1) beginReturn(true);
                         else stopped = "stopped: cannot reach the witnessed furnace";
-                    } else station.position = null;
+                    } else {
+                        if (station == table) fieldBench.leave();
+                        station.position = null;
+                    }
                 }
                 return;
             }
@@ -959,6 +1532,7 @@ final class PilotProgress {
     private void forgetStation(Station station) {
         memory.forget(c.world, station == furnace, station.position);
         if (station == furnace && station.position.equals(furnaceWitness)) furnaceWitness = null;
+        if (station == table && !fieldBench.removed) fieldBench.leave();
         station.position = null;
         station.lastUse = null;
     }
@@ -1083,49 +1657,284 @@ final class PilotProgress {
         approachGoal = null;
     }
 
-    private void gather(Resource resource, int onSurfaceTicks, int depth) {
-        if (sought != resource) {
-            if (target != null && miningResource != resource && miningResource != Resource.COAL) target = null;
-            if (pickupItem != resource.drop && pickupItem != FUEL) clearPickup();
-            sought = resource;
-            soughtSince = tick;
-            pickupUntil = 0;
+    /** Ownership is local to this pilot: remembering or using a pre-existing table never claims it. */
+    private final class FieldBench {
+        private ClientWorld world;
+        private BlockPos position;
+        private Vec3d center, face, drop;
+        private Predicate<ItemStack> output;
+        private int placedAt, outputBefore, packUntil, before, dropSeen;
+        private boolean crafted, triedAxe, attacked, removed;
+        private final Predicate<Entity> nearbyDrop = entity -> entity instanceof ItemEntity item
+            && table.item.test(item.getStack()) && item.getPos().squaredDistanceTo(center) <= 2.25;
+
+        private void placementConsumed(BlockPos placed) {
+            leave();
+            world = c.world;
+            position = placed;
+            center = Vec3d.ofCenter(placed);
+            placedAt = tick;
         }
-        status = "seeking " + resource.label;
-        if (target != null) {
-            mineTarget(miningResource);
-            return;
-        }
-        if (pickupItem == FUEL && collect(FUEL, 5)) return;
-        if (collect(resource.drop, 7)) return;
-        if (tick < pickupUntil) {
-            if (pickupLook != null) body.aim(pickupLook);
-            return;
-        }
-        if (tick >= seekAfter || activeTrail() > 1) {
-            BlockHitResult hit = body.find(resource.block, SEARCH).orElse(null);
-            if (hit != null && reachableResourceFace(hit.getBlockPos())) {
-                setTarget(hit, resource);
-                mineTarget(resource);
+
+        private void observe(BlockHitResult hit) {
+            if (world != c.world || !hit.getBlockPos().equals(position)) return;
+            if (face == null && tick - placedAt > 30) {
+                leave();
                 return;
             }
-            if ((resource == Resource.IRON || resource == Resource.DIAMOND)
-                && hands.count(TORCH) + 4 * hands.count(FUEL) < 28) {
-                if (collect(FUEL, 5)) return;
-                hit = body.find(Resource.COAL.block, 4.0).orElse(null);
-                if (hit != null && reachableResourceFace(hit.getBlockPos())) {
-                    setTarget(hit, Resource.COAL);
-                    mineTarget(Resource.COAL);
-                    return;
-                }
-            }
+            face = hit.getPos().lerp(center, 0.055);
         }
+
+        private void awaitCraft(BlockPos used, String recipe) {
+            if (world != c.world || face == null || !position.equals(used)) return;
+            output = item(Registries.ITEM.get(Identifier.ofVanilla(recipe)));
+            outputBefore = hands.count(output);
+        }
+
+        private void confirmCraft() {
+            if (output == null) return;
+            crafted |= world == c.world && hands.count(output) > outputBefore;
+            output = null;
+        }
+
+        private boolean pack() {
+            if (!crafted) return false;
+            if (world != c.world || c.player.isTouchingWater() || firing != Firing.NONE) return leave();
+            // A jump-placed table can be the floor: do not mine it from on top.
+            if (!removed) {
+                int height = position.getY() - c.player.getBlockY();
+                if (!position.equals(table.position) || height < 0 || height > 1
+                        || c.player.getEyePos().squaredDistanceTo(face) > REACH * REACH) return leave();
+            }
+            if (packUntil == 0) {
+                if (horizontalDistance(c.player.getPos(), center) > 3 || !roomForTable()) return leave();
+                packUntil = tick + 120;
+                before = hands.count(table.item);
+                approachGoal = null;
+            }
+            if (tick >= packUntil) return leave();
+            if (!removed) {
+                body.aim(face);
+                status = "packing the crafting table";
+                if (!body.aligned(face)) return true;
+                BlockHitResult hit = perceive(face, REACH);
+                if (hit != null && hit.getBlockPos().equals(position)) {
+                    if (!state(hit).isOf(table.block)) {
+                        forgetStation(table);
+                        return false;
+                    }
+                    if (!triedAxe) {
+                        triedAxe = true;
+                        var inv = c.player.getInventory();
+                        if (!AXE.test(inv.getMainHandStack())) {
+                            for (int slot = 0; slot < PlayerInventory.HOTBAR_SIZE; slot++) {
+                                if (AXE.test(inv.getStack(slot)) && !c.options.hotbarKeys[slot].isUnbound()) {
+                                    hands.equipSlot(slot);
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    BlockHitResult selected = body.selectedFace();
+                    if (c.player.isOnGround() && selected != null && selected.getBlockPos().equals(position)) {
+                        body.mine(position);
+                        attacked = true;
+                    }
+                    return true;
+                }
+                if (!attacked || !body.clearTerrain(center) && !has(table.item, before + 1)) return true;
+                removed = true;
+                forgetStation(table);
+                packUntil = Math.min(packUntil, tick + 32);
+            }
+            if (has(table.item, before + 1)) {
+                leave();
+                status = "packed the crafting table";
+                return true;
+            }
+            status = "collecting the packed crafting table";
+            Entity seen = body.visibleEntity(nearbyDrop, 4).orElse(null);
+            if (seen != null) {
+                drop = seen.getPos();
+                dropSeen = tick;
+            }
+            if (drop == null || tick - dropSeen > 9) {
+                body.aim(new Vec3d(center.x, Math.min(center.y, c.player.getY() + 0.3), center.z));
+                return true;
+            }
+            Vec3d delta = drop.subtract(c.player.getPos());
+            if (delta.y < -0.7 || delta.y > 1.5) return leave();
+            if (delta.horizontalLengthSquared() < 0.22) {
+                body.aim(drop);
+                if (delta.y > 0.55 && c.player.isOnGround()) {
+                    if (body.jumpBlocked()) return leave();
+                    body.jumpForReach();
+                }
+                return true;
+            }
+            if (delta.y < 0.7 && delta.horizontalLengthSquared() <= 2.15 && walkMinedPickup(drop)) return true;
+            if (approach(drop, false, false) == Walk.BLOCKED) return leave();
+            return true;
+        }
+
+        private boolean roomForTable() {
+            var inventory = c.player.getInventory();
+            for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+                ItemStack stack = inventory.getStack(slot);
+                if (stack.isEmpty() || table.item.test(stack) && stack.getCount() < stack.getMaxCount()) return true;
+            }
+            return false;
+        }
+
+        private boolean leave() {
+            if (packUntil != 0) approachGoal = null;
+            world = null;
+            position = null;
+            center = face = drop = null;
+            output = null;
+            packUntil = 0;
+            crafted = triedAxe = attacked = removed = false;
+            return false;
+        }
+    }
+
+    private void gather(Resource resource, int onSurfaceTicks, int depth) {
+        if (sought != resource) {
+            sought = resource;
+            soughtSince = tick;
+        }
+        status = "seeking " + resource.label;
+        if (nextFoot != null) {
+            excavate(nextFoot.getY(), digGoal);
+            return;
+        }
+        double range = resource != Resource.STONE && (surfaceDeparture() || !has(TORCH, 2))
+            ? REACH - 0.35 : SEARCH;
+        if (workOre(resource, range, resource != Resource.STONE)) return;
+        if (resource != Resource.STONE && prepareMining(depth)) return;
+        if (resource != Resource.STONE && hands.count(TORCH) + 4 * hands.count(FUEL) < LOCAL_LIGHT
+            && affordsWood(localTableWood(), 3) && workOre(Resource.COAL, range, false)) return;
+        target = null;
         if ((activeTrail() > 1 || resumeIndex >= 0 || tick - soughtSince > onSurfaceTicks)
             && tick >= nextDigStart && (c.player.isOnGround() || activeTrail() > 0) && !c.player.isTouchingWater()) {
             excavate(depth, null);
         } else {
             explore();
         }
+    }
+
+    private boolean workOre(Resource resource, double range, boolean remember) {
+        if (target != null && miningResource == resource
+            && (range > REACH || targetPoint.squaredDistanceTo(c.player.getEyePos()) <= range * range)) {
+            mineTarget(resource);
+            return true;
+        }
+        if (collect(resource.drop, Math.min(7, range), resource == Resource.STONE || has(TORCH, 2))) return true;
+        if (resource == miningResource && tick < pickupUntil) {
+            body.aim(pickupLook);
+            return true;
+        }
+        BlockHitResult hit = findOre(resource, range);
+        if (hit != null && (tick >= seekAfter || activeTrail() > 1) && reachableResourceFace(hit.getBlockPos())
+            && tools.canHarvest(state(hit))) {
+            setTarget(hit, resource);
+            mineTarget(resource);
+            return true;
+        }
+        return remember && recallOre(resource, range, 24);
+    }
+
+    private BlockHitResult findOre(Resource resource, double range) {
+        if (oreWorld != c.world) {
+            oreSights.clear();
+            oreProbe = null;
+            oreWorld = c.world;
+        }
+        BlockHitResult hit = body.find(resource.block, range).orElse(null);
+        if (hit == null || resource == Resource.STONE || !c.player.isOnGround()
+            || c.player.isTouchingWater() || !reachableResourceFace(hit.getBlockPos())) return hit;
+        BlockPos block = hit.getBlockPos();
+        BlockPos stance = c.player.getBlockPos();
+        double rangeSquared = hit.getPos().squaredDistanceTo(c.player.getEyePos());
+        for (int i = 0; i < oreSights.size(); i++) {
+            OreSight old = oreSights.get(i);
+            if (!old.block.equals(block)) continue;
+            if (old.resource == resource && rangeSquared >= old.rangeSquared - 0.25) {
+                if (i != 0) oreSights.addFirst(oreSights.remove(i));
+                return hit;
+            }
+            oreSights.remove(i);
+            break;
+        }
+        if (oreSights.size() == ORE_MEMORY_LIMIT) oreSights.removeLast();
+        oreSights.addFirst(new OreSight(resource, block, orePoint(hit), stance, c.player.getPos(), rangeSquared));
+        return hit;
+    }
+
+    private boolean recallOre(Resource resource, double range, int steps) {
+        int last = activeTrail() - 1;
+        BlockPos standing = c.player.getBlockPos();
+        OreSight best = null;
+        int waypoint = -1;
+        double score = Double.POSITIVE_INFINITY;
+        for (OreSight sight : oreSights) {
+            if (sight.resource != resource || !reachableResourceFace(sight.block)) continue;
+            if (range <= REACH && sight.rangeSquared > range * range) continue;
+            int route = -1;
+            double cost;
+            if (standing.equals(sight.stance)) {
+                cost = 0;
+            } else if (Vec3d.ofBottomCenter(sight.stance).squaredDistanceTo(c.player.getPos()) <= 4
+                && Math.abs(standing.getY() - sight.stance.getY()) <= 1) {
+                cost = 2;
+            } else {
+                for (int i = last; i >= 0 && last - i <= steps; i--) {
+                    if (trail.get(i).equals(sight.stance)) {
+                        route = i;
+                        break;
+                    }
+                }
+                if (route < 0 || route == last) continue;
+                cost = 3 + last - route;
+            }
+            if (sight == oreProbe) cost -= 0.5;
+            if (cost < score) {
+                best = sight;
+                waypoint = route;
+                score = cost;
+            }
+        }
+        if (best == null) return false;
+        if (oreProbe != best) {
+            oreProbe = best;
+            oreProbeSince = tick;
+        }
+        status = "rechecking witnessed " + resource.label;
+        if (waypoint >= 0) {
+            startReturn(waypoint, true);
+            // Travel has its own deadline; the viewpoint probe begins on arrival.
+            oreProbeSince = 0;
+            return true;
+        }
+        if (oreProbeSince == 0) oreProbeSince = tick;
+        if (!arrived(best.stance)) {
+            if (tick - oreProbeSince < 60 && approach(best.feet, false, false) != Walk.BLOCKED)
+                return true;
+        } else {
+            body.aim(best.point);
+            BlockHitResult hit = perceive(best.point, range);
+            if (hit != null && best.block.equals(hit.getBlockPos()) && resource.block.test(state(hit))
+                && tools.canHarvest(state(hit))) {
+                oreProbe = null;
+                setTarget(hit, resource);
+                mineTarget(resource);
+                return true;
+            }
+            if (tick - oreProbeSince < 32) return true;
+        }
+        oreSights.remove(best);
+        oreProbe = null;
+        return false;
     }
 
     private boolean returnToTimberBank() {
@@ -1164,37 +1973,31 @@ final class PilotProgress {
                     }
                 }
             }
-            exhaustedCanopy = BlockPos.ofFloored(timberCanopy);
+            rememberTimberSite(exhaustedCanopies, BlockPos.ofFloored(timberCanopy));
             timberCanopy = null;
             timberLookAt = tick + 75;
         }
         if (tick < timberLookAt) return false;
-        if (timberLookStep == 0) timberLookYaw = c.player.getYaw();
-        BlockHitResult leaf = body.find(state -> state.isIn(BlockTags.LEAVES), 22).orElse(null);
-        if (leaf != null && leaf.getPos().y >= feet.y + 1
-            && horizontalDistance(feet, leaf.getPos()) > 1.3
-            && (exhaustedCanopy == null || leaf.getBlockPos().getSquaredDistance(exhaustedCanopy) > 16)) {
+        BlockHitResult leaf = body.find(state -> state.isIn(BlockTags.LEAVES), 22,
+            hit -> hit.getPos().y >= feet.y + 1 && horizontalDistance(feet, hit.getPos()) > 1.3
+                && newTimberCanopy(hit.getBlockPos())).orElse(null);
+        if (leaf != null) {
             timberCanopy = timberAim(leaf);
             timberCanopyUntil = tick + 145;
             timberCanopyPeeking = false;
             timberLeafCuts = 0;
-            timberLookStep = 0;
             approachGoal = null;
             return true;
         }
-        float look = timberLookYaw + switch (timberLookStep) {
-            case 0 -> 0;
-            case 1 -> 55;
-            case 2 -> -55;
-            default -> 145;
-        };
-        body.turn(look, -1);
-        if (Math.abs(MathHelper.wrapDegrees(c.player.getYaw() - look)) < 7 && Math.abs(c.player.getPitch() + 1) < 6
-            && ++timberLookStep >= 4) {
-            timberLookStep = 0;
-            timberLookAt = tick + 150;
+        return false;
+    }
+
+    private boolean newTimberCanopy(BlockPos leaf) {
+        for (int i = 0; i < exhaustedCanopies.size(); i++) {
+            BlockPos prior = exhaustedCanopies.get(i);
+            int dx = leaf.getX() - prior.getX(), dz = leaf.getZ() - prior.getZ();
+            if (dx * dx + dz * dz <= 9) return false;
         }
-        status = "looking for visible timber";
         return true;
     }
 
@@ -1202,8 +2005,12 @@ final class PilotProgress {
         var player = c.player;
         if (timberWitness != null && timberSeekTick != 0 && tick - timberSeekTick > 1) {
             // Real inventory work and hunger can interrupt the current tree; retain its witness.
-            timberWorkUntil += tick - timberSeekTick - 1;
-            if (timberChop != null) timberChopUntil += tick - timberSeekTick - 1;
+            int paused = tick - timberSeekTick - 1;
+            timberWorkUntil += paused;
+            if (timberChop != null) {
+                timberAlignUntil += paused;
+                timberChopUntil += paused;
+            }
         }
         timberSeekTick = tick;
         if (player.isTouchingWater()) {
@@ -1223,11 +2030,11 @@ final class PilotProgress {
             if (timberSwimming) {
                 timberSwimming = false;
                 timberLookAt = tick;
-                timberLookStep = 0;
                 heading = player.getYaw() + (++timberBankTurns % 2 == 0 ? 75 : -75);
                 headingUntil = tick + 180;
             }
         }
+        if (timberExitFrom != null && repositionForTimber()) return;
         if (timberChop != null) {
             chopTimber();
             return;
@@ -1244,20 +2051,22 @@ final class PilotProgress {
         }
         if (timberWitness != null && tendTimber()) return;
         if (collect(LOG, 7)) return;
-        BlockHitResult log = body.find(state -> state.isIn(BlockTags.LOGS), 22).orElse(null);
-        if (log != null && !sameStem(log.getBlockPos(), exhaustedStem)) {
+        BlockHitResult log = body.find(state -> state.isIn(BlockTags.LOGS), player.getBlockInteractionRange(),
+            hit -> hit.getBlockPos().getY() <= player.getBlockY() + 1 && timberCandidate(hit) && timberInReach(hit)).orElse(null);
+        if (log == null) log = body.find(state -> state.isIn(BlockTags.LOGS), 22, this::timberCandidate).orElse(null);
+        if (log != null) {
             timberWitness = log;
             timberCanopy = null;
             timberLastCut = null;
             timberNear = false;
-            timberLeafCuts = timberScan = timberStandIndex = timberApproachSince = 0;
+            timberLeafCuts = timberScan = timberApproachSince = 0;
             timberWorkUntil = tick + TIMBER_WORK_TICKS;
             approachGoal = null;
             tendTimber();
             timberAscent = null;
             return;
         }
-        if (log == null && timberCanopy == null && player.getY() < 62
+        if (timberCanopy == null && player.getY() < 62
             && body.find(state -> state.isIn(BlockTags.LEAVES) || state.isOf(Blocks.GRASS_BLOCK)
                 || state.isOf(Blocks.SAND) || state.isOf(Blocks.SNOW), 12).isEmpty()) {
             status = "finding a visible way back up for timber";
@@ -1266,22 +2075,30 @@ final class PilotProgress {
             return;
         }
         timberAscent = null;
-        if (!surveyTimber()) explore();
+        if (surveyTimber() || startTimberReposition(player.getYaw())) return;
+        if (Float.isNaN(heading)) heading = player.getYaw();
+        status = step(forward(heading), false, false) == Walk.BLOCKED
+            ? "timber search: local routes exhausted" : "seeking timber along open ground";
     }
 
     private boolean tendTimber() {
         BlockPos stem = timberWitness.getBlockPos();
         Vec3d feet = c.player.getPos();
+        double reach = c.player.getBlockInteractionRange();
         Vec3d base = new Vec3d(stem.getX() + 0.5, feet.y + 0.65, stem.getZ() + 0.5);
-        if (tick >= timberWorkUntil) return finishTimber();
-        if (timberStand != null) {
-            if (tick - timberApproachSince < 65 && horizontalDistance(feet, timberStand) > 0.42
-                && approach(timberStand, false, false) != Walk.BLOCKED) {
-                status = "walking to observed footing next to the timber";
+        if (tick >= timberWorkUntil) return finishTimber("timber target exhausted: work deadline");
+        // A current exposed, reachable lower face beats an approach to an estimated base.
+        if (timberLastCut == null && horizontalDistance(feet, base) <= reach + 0.3) {
+            BlockHitResult hit = body.find(state -> state.isIn(BlockTags.LOGS), reach,
+                face -> sameStem(stem, face.getBlockPos()) && face.getBlockPos().getY() <= c.player.getBlockY()
+                    && !timberUnderfoot(face.getBlockPos()) && timberInReach(face)).orElse(null);
+            if (hit == null) hit = body.find(state -> state.isIn(BlockTags.LOGS), reach,
+                face -> sameStem(stem, face.getBlockPos()) && face.getBlockPos().getY() <= c.player.getBlockY() + 1
+                    && !timberUnderfoot(face.getBlockPos()) && timberInReach(face)).orElse(null);
+            if (hit != null) {
+                beginTimberChop(hit, false);
                 return true;
             }
-            timberStand = null;
-            timberScan = 0;
         }
         double distance = horizontalDistance(feet, base);
         if (!timberNear && distance > 2.8) {
@@ -1289,7 +2106,8 @@ final class PilotProgress {
             if (distance <= 5.3 && timberApproachSince == 0) timberApproachSince = tick;
             if ((timberApproachSince == 0 || tick - timberApproachSince < 48)
                 && approach(base, false, false) != Walk.BLOCKED) return true;
-            if (distance > 5.3) return finishTimber();
+            if (distance > 5.3)
+                return startTimberReposition(yaw(base.subtract(feet))) || finishTimber("timber target exhausted: approach blocked");
         }
         timberNear = true;
         return scanTimberStem(base, distance);
@@ -1298,7 +2116,8 @@ final class PilotProgress {
     private boolean scanTimberStem(Vec3d base, double distance) {
         Vec3d feet = c.player.getPos();
         BlockPos stem = timberWitness.getBlockPos();
-        if (timberScan >= 3) return findTimberStand(base);
+        if (timberScan >= 3)
+            return startTimberReposition(yaw(base.subtract(feet))) || finishTimber("timber target exhausted: no safe stand");
         Vec3d probe = switch (timberScan) {
             case 0 -> base;
             case 1 -> base.add(0, 1.65, 0);
@@ -1308,81 +2127,239 @@ final class PilotProgress {
         status = "checking the witnessed trunk from the base upward";
         if (!body.aligned(probe)) return true;
         Vec3d eye = c.player.getEyePos();
+        double reach = c.player.getBlockInteractionRange();
         int low = c.player.getBlockY() - 2;
-        int high = MathHelper.floor(eye.y + Math.sqrt(Math.max(0, REACH * REACH - distance * distance)));
+        int high = MathHelper.floor(eye.y + reach + 0.6);
         if (timberScan == 0 && timberLastCut == null) high = Math.min(high, c.player.getBlockY() + 2);
         BlockPos next = timberLastCut == null ? stem : timberLastCut.up();
         BlockHitResult mask = null;
         for (int y = low; y <= high; y++) {
             Vec3d center = new Vec3d(base.x, y + 0.5, base.z);
-            if (center.squaredDistanceTo(eye) > (REACH + 0.35) * (REACH + 0.35)) continue;
-            BlockHitResult hit = perceive(center, Math.min(REACH, eye.distanceTo(center) + 0.03));
+            BlockHitResult hit = perceive(center, Math.min(reach + 0.85, eye.distanceTo(center) + 0.03));
             if (hit == null) continue;
-            if (sameStem(hit.getBlockPos(), stem) && state(hit).isIn(BlockTags.LOGS) && !timberUnderfoot(hit.getBlockPos())) {
+            if (sameStem(hit.getBlockPos(), stem) && timberInReach(hit) && state(hit).isIn(BlockTags.LOGS)
+                && !timberUnderfoot(hit.getBlockPos())) {
                 beginTimberChop(hit, false);
                 return true;
             }
             if (timberLeafCuts < 2 && (y == next.getY() || y == next.getY() + 1) && isTimberPassage(hit)
                 && hit.getBlockPos().getSquaredDistance(next) <= 4) mask = hit;
         }
-        if (timberLastCut == null && timberScan > 0) {
+        if (timberLastCut == null) {
             Vec3d point = timberAim(timberWitness);
-            BlockHitResult hit = perceive(point, REACH);
-            if (hit != null && hit.getBlockPos().equals(stem) && state(hit).isIn(BlockTags.LOGS) && !timberUnderfoot(stem)) {
+            BlockHitResult hit = perceive(point, eye.distanceTo(point) + 0.06);
+            if (hit != null && hit.getBlockPos().equals(stem) && timberInReach(hit) && state(hit).isIn(BlockTags.LOGS)
+                && !timberUnderfoot(stem)) {
                 beginTimberChop(hit, false);
                 return true;
             }
         }
         Vec3d above = Vec3d.ofCenter(next);
-        if (timberLastCut != null && eye.squaredDistanceTo(above) < REACH * REACH
-            && body.clearTerrain(above)) return finishTimber();
+        if (timberLastCut != null && eye.squaredDistanceTo(above) < reach * reach
+            && body.clearTerrain(above)) return finishTimber(null);
         if (mask != null) {
             beginTimberChop(mask, true);
             return true;
         }
-        if (++timberScan == 3) {
-            if (timberStandIndex == 0) timberStandYaw = distance > 0.45
-                ? yaw(feet.subtract(base)) : c.player.getYaw();
+        // A high, visibly out-of-reach face is not a chopping target. Try the lower views first.
+        if (timberScan >= 1 && distance <= reach + 0.45) {
+            BlockHitResult highFace = body.find(state -> state.isIn(BlockTags.LOGS), 12,
+                hit -> sameStem(hit.getBlockPos(), stem) && hit.getPos().y > eye.y + 0.8
+                    && !timberInReach(hit) && (distance <= 2.8 || hit.getPos().y - eye.y > reach)).orElse(null);
+            if (highFace != null) return unavailableTimber(highFace, "upper log outside standing reach", true);
+        }
+        timberScan++;
+        return true;
+    }
+
+    private boolean timberCandidate(BlockHitResult hit) {
+        BlockPos block = hit.getBlockPos();
+        if (timberUnderfoot(block)) return false;
+        if (!timberInReach(hit) && rejectedTimberHeight(block)) return false;
+        for (int i = 0; i < exhaustedStems.size(); i++) {
+            if (sameStem(block, exhaustedStems.get(i))) return false;
         }
         return true;
     }
 
-    private boolean findTimberStand(Vec3d base) {
-        if (timberStandIndex >= TIMBER_STAND_TURNS.length) return finishTimber();
-        Vec3d feet = c.player.getPos();
-        Vec3d around = forward(timberStandYaw + TIMBER_STAND_TURNS[timberStandIndex]);
-        Vec3d toe = new Vec3d(base.x + 1.85 * around.x, feet.y - 0.65, base.z + 1.85 * around.z);
-        status = "looking for safe footing beside the witnessed trunk";
-        if (horizontalDistance(feet, toe) < 0.7) {
-            timberStandIndex++;
-            return true;
+    private boolean rejectedTimberHeight(BlockPos block) {
+        for (int i = 0; i < unreachableTimber.size(); i++) {
+            BlockPos prior = unreachableTimber.get(i);
+            if (sameStem(block, prior) && block.getY() >= prior.getY()) return true;
         }
-        body.aim(toe);
-        if (!body.aligned(toe)) return true;
-        BlockHitResult floor = terrain(toe, Math.min(5.5, c.player.getEyePos().distanceTo(toe) + 0.28));
-        timberStandIndex++;
-        if (floor == null || floor.getSide() != Direction.UP || !safeSupport(floor)
-            || Math.abs(floor.getPos().y - feet.y) > 1.15 || horizontalDistance(floor.getPos(), toe) > 0.75
-            || state(floor).isIn(BlockTags.LEAVES) || state(floor).isIn(BlockTags.LOGS)) return true;
-        BlockPos square = floor.getBlockPos();
-        timberStand = new Vec3d(square.getX() + 0.5, floor.getPos().y, square.getZ() + 0.5);
-        timberApproachSince = tick;
-        status = "choosing observed footing beside the witnessed trunk";
-        approachGoal = null;
-        return true;
-    }
-
-    private boolean finishTimber() {
-        exhaustedStem = timberWitness.getBlockPos();
-        timberWitness = null;
-        timberLastCut = null;
-        timberStand = null;
         return false;
     }
 
+    private boolean timberInReach(BlockHitResult hit) {
+        double range = c.player.getBlockInteractionRange();
+        return hit.getPos().squaredDistanceTo(c.player.getEyePos()) <= range * range;
+    }
+
+    private boolean unavailableTimber(BlockHitResult hit, String reason, boolean tryShelf) {
+        BlockPos block = hit.getBlockPos();
+        boolean tried = rejectedTimberHeight(block);
+        if (!tried) rememberTimberSite(unreachableTimber, block);
+        timberChop = null;
+        if (tryShelf && !tried && tryHigherTimberShelf(hit)) return true;
+        clearTimberWitness();
+        status = "timber unavailable: " + reason;
+        return true;
+    }
+
+    private boolean tryHigherTimberShelf(BlockHitResult log) {
+        var player = c.player;
+        BlockPos from = player.getBlockPos();
+        if (!player.isOnGround() || body.jumpBlocked()) return false;
+        double eyeHeight = player.getEyePos().y - player.getY();
+        double range = player.getBlockInteractionRange();
+        BlockHitResult floor = body.find(state -> !state.isOf(Blocks.CRAFTING_TABLE) && !state.isOf(Blocks.FURNACE)
+            && !state.isIn(BlockTags.LOGS) && !state.isIn(BlockTags.LEAVES), 3.25, hit -> {
+                BlockPos to = hit.getBlockPos().up();
+                return hit.getSide() == Direction.UP && to.getY() == from.getY() + 1 && adjacent(from, to)
+                    && !triedTimberFooting.contains(to) && safeSupport(hit)
+                    && Vec3d.ofBottomCenter(to).add(0, eyeHeight, 0).squaredDistanceTo(log.getPos()) <= range * range;
+            }).orElse(null);
+        if (floor == null) return false;
+        timberExitFrom = from;
+        timberExitTo = floor.getBlockPos().up();
+        rememberTimberSite(triedTimberFooting, timberExitTo);
+        timberHigherShelf = true;
+        timberExitCheck = 0;
+        timberExitUntil = tick + 44;
+        status = "timber reposition: trying one visible higher shelf";
+        return true;
+    }
+
+    private boolean finishTimber(String reason) {
+        rememberTimberSite(exhaustedStems, timberWitness.getBlockPos());
+        clearTimberWitness();
+        if (reason != null) {
+            status = reason;
+            return true;
+        }
+        return false;
+    }
+
+    private void clearTimberWitness() {
+        timberWitness = null;
+        timberLastCut = null;
+        timberDropUntil = 0;
+    }
+
+    private static void rememberTimberSite(List<BlockPos> sites, BlockPos block) {
+        if (sites.size() == TIMBER_RECENT) sites.removeFirst();
+        sites.add(block);
+    }
+
+    private boolean startTimberReposition(float bearing) {
+        if (!c.player.isOnGround()) return false;
+        BlockPos from = c.player.getBlockPos();
+        if (triedTimberFooting.contains(from)) return false;
+        rememberTimberSite(triedTimberFooting, from);
+        timberExitFrom = from;
+        timberHigherShelf = false;
+        float yaw = c.player.getYaw();
+        timberExitYaw = yaw + MathHelper.clamp(MathHelper.wrapDegrees(bearing - yaw), -34, 34);
+        timberExitUntil = tick + 18;
+        return repositionForTimber();
+    }
+
+    /** Commit to one observed landing, with at most one glance to bring the floor into view. */
+    private boolean repositionForTimber() {
+        if (timberExitTo != null && arrived(timberExitTo)) {
+            timberExitFrom = timberExitTo = null;
+            timberCanopy = null;
+            timberNear = false;
+            timberScan = timberApproachSince = 0;
+            timberWorkUntil = tick + TIMBER_WORK_TICKS;
+            approachGoal = null;
+            status = "timber reposition: reached verified footing";
+            return true;
+        }
+        if (timberExitTo == null) {
+            BlockHitResult floor = body.find(state -> !state.isOf(Blocks.CRAFTING_TABLE) && !state.isOf(Blocks.FURNACE)
+                && !state.isIn(BlockTags.LOGS) && !state.isIn(BlockTags.LEAVES), 4.2, this::timberLanding).orElse(null);
+            if (floor == null) {
+                if (tick >= timberExitUntil) return rejectTimberExit("no visible landing");
+                body.turn(timberExitYaw, 36);
+                status = "timber reposition: brief look for visible footing";
+                return true;
+            }
+            timberExitTo = floor.getBlockPos().up();
+            rememberTimberSite(triedTimberFooting, timberExitTo);
+            timberExitCheck = 0;
+            timberExitUntil = tick + 72;
+            approachGoal = null;
+        }
+        if (tick >= timberExitUntil) return rejectTimberExit("route deadline");
+        boolean rising = timberExitTo.getY() > timberExitFrom.getY();
+        Vec3d landing = Vec3d.ofBottomCenter(timberExitTo);
+        if (!adjacent(timberExitFrom, timberExitTo)) {
+            if (approach(landing, false, false) == Walk.BLOCKED) return rejectTimberExit("open route blocked");
+            status = "timber reposition: walking toward observed open ground";
+            return true;
+        }
+        if (timberExitCheck < 3) {
+            BlockPos cell = switch (timberExitCheck) {
+                case 0 -> timberExitFrom.up(2);
+                case 1 -> timberExitTo.up();
+                default -> timberExitTo;
+            };
+            Vec3d point = Vec3d.ofCenter(cell);
+            if (timberExitCheck == 0) point = point.add((timberExitTo.getX() - timberExitFrom.getX()) * 0.23, 0,
+                (timberExitTo.getZ() - timberExitFrom.getZ()) * 0.23);
+            body.aim(point);
+            status = "timber reposition: verifying shelf clearance";
+            if (!body.aligned(point)) return true;
+            if (body.clearTerrain(point)) {
+                timberExitCheck++;
+                return true;
+            }
+            BlockHitResult obstacle = perceive(point, c.player.getEyePos().distanceTo(point) + 0.05);
+            if (obstacle == null) return true;
+            BlockPos block = obstacle.getBlockPos();
+            BlockState material = state(obstacle);
+            if (timberHigherShelf || !block.equals(cell) || protectRecoveryBlock(block)
+                || !material.isIn(BlockTags.DIRT) && !material.isIn(BlockTags.LEAVES))
+                return rejectTimberExit("shelf clearance blocked");
+            status = "timber reposition: clearing a visible dirt or leaf obstruction";
+            if (readyForMine(material)) body.mine(block);
+            return true;
+        }
+        Vec3d toward = landing.subtract(c.player.getPos());
+        if (toward.horizontalLengthSquared() < 0.075 && !c.player.isOnGround()) return true;
+        float bearing = yaw(toward);
+        body.turn(bearing, rising ? -6 : 16);
+        status = rising ? "timber reposition: jumping onto the verified shelf" : "timber reposition: walking to verified footing";
+        if (Math.abs(MathHelper.wrapDegrees(bearing - c.player.getYaw())) > 11) return true;
+        if (rising) {
+            if (body.jumpBlocked()) return rejectTimberExit("shelf jump obstructed");
+            body.jump();
+        }
+        walkDown(false);
+        return true;
+    }
+
+    private boolean timberLanding(BlockHitResult floor) {
+        BlockPos to = floor.getBlockPos().up();
+        int rise = to.getY() - timberExitFrom.getY();
+        double distance = horizontalDistance(c.player.getPos(), Vec3d.ofBottomCenter(to));
+        return floor.getSide() == Direction.UP && rise >= 0 && rise <= 1
+            && (rise == 0 || adjacent(timberExitFrom, to))
+            && distance >= (rise == 0 ? 1.25 : 0.45) && distance <= 3.1
+            && !triedTimberFooting.contains(to) && safeSupport(floor);
+    }
+
+    private boolean rejectTimberExit(String reason) {
+        timberExitFrom = timberExitTo = null;
+        if (timberHigherShelf) clearTimberWitness();
+        else if (timberWitness != null) finishTimber(null);
+        status = "timber reposition: " + reason;
+        return true;
+    }
+
     private boolean isTimberPassage(BlockHitResult hit) {
-        return hit.getPos().squaredDistanceTo(c.player.getEyePos()) < (REACH - 0.15) * (REACH - 0.15)
-            && state(hit).isIn(BlockTags.LEAVES) && !timberUnderfoot(hit.getBlockPos());
+        return timberInReach(hit) && state(hit).isIn(BlockTags.LEAVES) && !timberUnderfoot(hit.getBlockPos());
     }
 
     private boolean timberUnderfoot(BlockPos block) {
@@ -1405,27 +2382,42 @@ final class PilotProgress {
         timberChopPoint = timberAim(hit);
         timberCuttingLeaves = leaves;
         timberAttack = 0;
+        timberAlignUntil = tick + 34;
         timberChopUntil = tick + 110;
         if (leaves) timberLeafCuts++;
     }
 
     private void chopTimber() {
-        status = timberCuttingLeaves ? "opening a visible passage through leaves" : "chopping the witnessed trunk";
+        status = timberCuttingLeaves ? "aligning on visible leaves" : "aligning on a reachable log";
         BlockPos block = timberChop.getBlockPos();
-        if (tick >= timberChopUntil || timberUnderfoot(block)
-            || c.player.getEyePos().distanceTo(timberChopPoint) > REACH) {
+        if (tick >= timberChopUntil || timberUnderfoot(block)) {
             timberChop = null;
             timberScan = 0;
             return;
         }
         body.aim(timberChopPoint);
-        if (!body.aligned(timberChopPoint)) return;
-        BlockHitResult hit = perceive(timberChopPoint, REACH);
+        if (!body.aligned(timberChopPoint)) {
+            stopUnalignedTimber();
+            return;
+        }
+        BlockHitResult hit = perceive(timberChopPoint, c.player.getEyePos().distanceTo(timberChopPoint) + 0.08);
         if (hit != null && hit.getBlockPos().equals(block)) {
             BlockState material = state(hit);
             if (material.isIn(timberCuttingLeaves ? BlockTags.LEAVES : BlockTags.LOGS)) {
+                if (!timberInReach(hit)) {
+                    if (!timberCuttingLeaves) unavailableTimber(hit, "log face outside vanilla reach", hit.getPos().y > c.player.getEyePos().y);
+                    else timberChop = null;
+                    return;
+                }
+                BlockHitResult crosshair = body.selectedFace();
+                if (crosshair == null || !crosshair.getBlockPos().equals(block) || !timberInReach(crosshair)) {
+                    stopUnalignedTimber();
+                    return;
+                }
                 if (readyForMine(material)) {
-                    if (body.outlined(block)) timberAttack = tick;
+                    timberAttack = tick;
+                    timberAlignUntil = tick + 8;
+                    status = timberCuttingLeaves ? "opening a visible passage through leaves" : "chopping the witnessed trunk";
                     body.mine(block);
                 }
                 return;
@@ -1439,13 +2431,24 @@ final class PilotProgress {
                 timberDropCount = hands.count(LOG);
             }
             timberWorkUntil = tick + TIMBER_WORK_TICKS;
-            timberStandIndex = timberScan = 0;
+            timberScan = 0;
             timberChop = null;
         } else if (hit != null || cleared || timberAttack != 0 && tick - timberAttack > 10) {
             timberChop = null;
             // Re-observe the column before changing position or choosing another leaf.
             timberScan = 0;
+        } else {
+            stopUnalignedTimber();
         }
+    }
+
+    private void stopUnalignedTimber() {
+        if (tick < timberAlignUntil) return;
+        if (!timberCuttingLeaves && timberWitness != null) {
+            finishTimber("timber unavailable: vanilla crosshair did not confirm log face");
+        }
+        timberChop = null;
+        timberScan = 0;
     }
 
     private void gatherStone() {
@@ -1459,12 +2462,16 @@ final class PilotProgress {
     private void setTarget(BlockHitResult hit, Resource resource) {
         target = hit.getBlockPos();
         miningResource = resource;
-        // A tiny inset retains the known face direction even after a small perspective change.
-        targetPoint = hit.getPos().lerp(Vec3d.ofCenter(target), 0.045);
+        targetPoint = orePoint(hit);
         targetDeadline = tick + 200;
         targetNearest = c.player.getEyePos().distanceTo(targetPoint);
         lastMining = 0;
         approachGoal = null;
+    }
+
+    private static Vec3d orePoint(BlockHitResult hit) {
+        // A tiny inset retains the known face direction even after a small perspective change.
+        return hit.getPos().lerp(Vec3d.ofCenter(hit.getBlockPos()), 0.045);
     }
 
     private boolean reachableResourceFace(BlockPos position) {
@@ -1473,6 +2480,10 @@ final class PilotProgress {
 
     private void mineTarget(Resource resource) {
         status = "mining " + resource.label;
+        if (!reachableResourceFace(target)) {
+            abandonTarget();
+            return;
+        }
         double distance = c.player.getEyePos().distanceTo(targetPoint);
         if (distance < targetNearest - 0.55) {
             targetNearest = distance;
@@ -1483,6 +2494,7 @@ final class PilotProgress {
             return;
         }
         if (distance > REACH - 0.35 && c.player.getY() - target.getY() > 1.25
+            && (resource == Resource.STONE || has(TORCH, 2))
             && c.player.isOnGround() && tick >= nextDigStart) {
             status = "cutting a staircase toward exposed " + resource.label;
             excavate(target.getY() + 1, targetPoint);
@@ -1501,6 +2513,7 @@ final class PilotProgress {
             if (lastMining != 0 && tick - lastMining < 5) {
                 pickupUntil = tick + 19;
                 pickupLook = new Vec3d(targetPoint.x, Math.min(c.player.getY() + 0.35, targetPoint.y), targetPoint.z);
+                forgetOreTarget();
                 target = null;
             } else if (horizontalDistance(c.player.getPos(), targetPoint) > 0.72) {
                 // A ramp changes the viewing angle; walk around the masking near face before giving up.
@@ -1515,8 +2528,32 @@ final class PilotProgress {
             return;
         }
         if (!readyForMine(material)) return;
+        BlockHitResult selected = body.selectedFace();
+        if (selected == null || !selected.getBlockPos().equals(target) || selected.getSide() != hit.getSide()) return;
+        // An exposed block can also support a step of the escape route.
+        if (lastMining == 0 && supportsTrail(target)) {
+            abandonTarget();
+            return;
+        }
         lastMining = tick;
         body.mine(target);
+    }
+
+    private boolean supportsTrail(BlockPos block) {
+        for (int i = trail.size() - 1; i >= 0; i--) {
+            BlockPos step = trail.get(i);
+            if (step.getY() == block.getY() + 1 && step.getX() == block.getX() && step.getZ() == block.getZ()) return true;
+        }
+        return false;
+    }
+
+    private void forgetOreTarget() {
+        for (int i = 0; i < oreSights.size(); i++) {
+            if (oreSights.get(i).block.equals(target)) {
+                oreSights.remove(i);
+                return;
+            }
+        }
     }
 
     private void abandonTarget() {
@@ -1537,6 +2574,10 @@ final class PilotProgress {
     }
 
     private boolean collect(Predicate<ItemStack> drop, double range) {
+        return collect(drop, range, true);
+    }
+
+    private boolean collect(Predicate<ItemStack> drop, double range, boolean mayDig) {
         if (tick < pickupBlockedUntil && pickupBlockedItem == drop) return false;
         Entity entity;
         if (drop == LOG && timberWitness != null) {
@@ -1578,11 +2619,17 @@ final class PilotProgress {
             clearPickup();
             return false;
         }
-        if (delta.getY() < -1.05 && drop != LOG && (has(STONE_PICK, 1) || has(IRON_PICK, 1) || has(WOOD_PICK, 1))
-            && tick >= nextDigStart && c.player.isOnGround()) {
-            status = "cutting a staircase to visible drops";
-            excavate(BlockPos.ofFloored(position).getY(), position);
-            return true;
+        if (delta.getY() < -1.05 && drop != LOG) {
+            if (!mayDig) {
+                clearPickup();
+                return false;
+            }
+            if ((has(STONE_PICK, 1) || has(IRON_PICK, 1) || has(WOOD_PICK, 1))
+                && tick >= nextDigStart && c.player.isOnGround()) {
+                status = "cutting a staircase to visible drops";
+                excavate(BlockPos.ofFloored(position).getY(), position);
+                return true;
+            }
         }
         if (delta.horizontalLengthSquared() < 0.22) {
             if (drop == LOG) {
@@ -1595,7 +2642,13 @@ final class PilotProgress {
             } else {
                 body.turn(c.player.getYaw(), delta.y < 0 ? 68 : 35);
             }
-            if (delta.getY() > 0.55) body.jump();
+            if (delta.getY() > 0.55) {
+                if (body.jumpBlocked()) {
+                    abandonPickup(drop, 32);
+                    return false;
+                }
+                body.jumpForReach();
+            }
             if (entity != null || tick - pickupSeen < 12) return true;
             clearPickup();
             return false;
@@ -1683,6 +2736,7 @@ final class PilotProgress {
     }
 
     private void excavate(int depth, Vec3d toward) {
+        if (nextFoot == null && c.player.isOnGround() && fieldBench.pack()) return;
         BlockPos standing = c.player.getBlockPos();
         if (resumeIndex >= 0) {
             resumeTunnel();
@@ -1732,6 +2786,12 @@ final class PilotProgress {
             if (torchPlacedTick != tick) blockedTunnel();
             return;
         }
+        if (surveyCave(nextFoot)) return;
+        if (nextFoot.equals(cavePeek) && tick <= caveLookUntil) {
+            status = "looking through the opened cave lip";
+            body.turn(yaw(new Vec3d(digDirection.getOffsetX(), 0, digDirection.getOffsetZ())), 12);
+            return;
+        }
         if (tick - digAge > 205 || horizontalDistance(Vec3d.ofBottomCenter(current), c.player.getPos()) > 2.1) {
             blockedTunnel();
             return;
@@ -1769,7 +2829,10 @@ final class PilotProgress {
             // Crouch toward the lip on the proven current support to reveal the next one.
             creepToLip();
         } else if (hit != null || !body.outlined(nextFoot.down()) || !lightDigOnce(current)) {
-            blockedTunnel();
+            if (!nextFoot.equals(cavePeek)) {
+                cavePeek = nextFoot;
+                caveLookUntil = tick + 16;
+            } else blockedTunnel();
         }
     }
 
@@ -1862,7 +2925,15 @@ final class PilotProgress {
         }
         if (!hit.getBlockPos().equals(position)) {
             if (hit.getBlockPos().equals(lip) && hit.getSide() == Direction.UP && safeSupport(hit)) return Dig.LIP;
-            return c.player.getEyePos().distanceTo(hit.getPos()) < length - 0.17 ? Dig.BLOCKED : Dig.CLEAR;
+            if (c.player.getEyePos().distanceTo(hit.getPos()) >= length - 0.17) return Dig.CLEAR;
+            BlockPos obstruction = hit.getBlockPos();
+            if ((returnIndex < 0 && exitStart == null) || obstruction.getY() < c.player.getBlockY()
+                || (climbTo != null && obstruction.equals(climbTo.down()))
+                || obstruction.equals(c.player.getBlockPos().down())) return Dig.BLOCKED;
+            // The near ceiling can mask a previously walked stair. Only dig the actually
+            // selected intervening face; the destination behind it supplies no block data.
+            if (state(hit).getBlock() instanceof net.minecraft.block.FallingBlock) return Dig.BLOCKED;
+            position = obstruction;
         }
         BlockState state = state(hit);
         if (state.isReplaceable() && state.getFluidState().isEmpty() && !state.isOf(Blocks.SNOW)) return Dig.CLEAR;
@@ -1917,9 +2988,11 @@ final class PilotProgress {
         boolean visibleSupport = hit != null && safeSupport(hit);
         // In darkness the rendered outline still proves a real face; let vanilla decide if it accepts a torch.
         if (hit == null && forced) hit = shown;
+        if (hit != null && (shown == null || !shown.getBlockPos().equals(hit.getBlockPos())
+            || shown.getSide() != hit.getSide())) return true;
         if (hit != null && hit.getSide() != Direction.DOWN && (visibleSupport || forced && shown == hit)
             && (nextFoot == null || !hit.getBlockPos().offset(hit.getSide()).equals(nextFoot))) {
-            body.use(hit.getBlockPos(), hit.getSide());
+            body.use(shown.getBlockPos(), shown.getSide());
             torchBefore = remaining;
             torchUsed = tick;
         } else {
@@ -1991,6 +3064,10 @@ final class PilotProgress {
         }
         BlockPos current = returnDetour != null ? returnDetour
             : returnIndex + 1 < trail.size() ? trail.get(returnIndex + 1) : c.player.getBlockPos();
+        if (caves.followWater(current, next, tick)) {
+            status = caves.status();
+            return;
+        }
         if (forcedLight) {
             if (shouldLight(true)) return;
             forcedLight = false;
@@ -2058,6 +3135,10 @@ final class PilotProgress {
         }
         BlockPos next = trail.get(resumeIndex);
         BlockPos current = c.player.getBlockPos();
+        if (resumeIndex > 0 && caves.followWater(trail.get(resumeIndex - 1), next, tick)) {
+            status = caves.status();
+            return;
+        }
         if (resumeIndex > 0 && dugSteps.get(resumeIndex)
             && driveKnownStep(trail.get(resumeIndex - 1), next) != Walk.BLOCKED) return;
         if (tick - returnAge > 155 || !adjacent(current, next)) {
@@ -2110,6 +3191,7 @@ final class PilotProgress {
             }
             gaitStepProof = true;
         }
+        if (ascending && body.jumpBlocked(heading)) return Walk.BLOCKED;
         if (ascending) body.jump();
         walkDown(false);
         return Walk.MOVING;
@@ -2177,7 +3259,7 @@ final class PilotProgress {
         if (delta.horizontalLengthSquared() < 0.075 && feet.y > to.getY() - 0.20) return Walk.MOVING;
         body.turn(heading, -9);
         if (Math.abs(MathHelper.wrapDegrees(heading - c.player.getYaw())) > 10) return Walk.LOOKING;
-        if (++climbDrive > 27) return Walk.BLOCKED;
+        if (body.jumpBlocked(heading) || ++climbDrive > 27) return Walk.BLOCKED;
         body.jump();
         walk(false);
         return Walk.MOVING;
@@ -2344,93 +3426,407 @@ final class PilotProgress {
         return true;
     }
 
-    private boolean escapeDanger() {
+    private boolean escapeDanger(boolean hurt) {
+        if (hurt) defense.markDanger(tick);
         if (c.player.isInLava() || c.player.isTouchingWater() && c.player.getAir() < 70) {
+            defense.markDanger(tick);
             interruptHands();
             status = c.player.isInLava() ? "escaping lava" : "surfacing for air";
             body.jump();
             body.walk(true);
             return true;
         }
-        LivingEntity threat = body.threat(7).orElse(null);
-        if (threat != null) {
+        if (hurt && c.currentScreen instanceof HandledScreen<?>) {
             interruptHands();
-            double distance = c.player.getPos().distanceTo(threat.getPos());
-            boolean flee = threat instanceof CreeperEntity || c.player.getHealth() <= 7;
-            if (flee) {
-                status = threat instanceof CreeperEntity ? "backing off a creeper" : "retreating while hurt";
-                if (tick >= retreatUntil - 10) {
-                    Vec3d away = c.player.getPos().subtract(threat.getPos());
-                    retreatYaw = yaw(away);
-                    retreatUntil = tick + 15;
-                }
-            } else {
-                status = "defending against a visible hostile";
-                if (distance > 2.9) {
-                    walkToward(threat.getPos(), false, false);
-                } else {
-                    Vec3d point = threat.getBoundingBox().getCenter();
-                    body.aim(point);
-                    if (body.aligned(point) && c.player.getAttackCooldownProgress(0.5f) >= 0.85f) body.strike(threat);
-                }
-                return true;
-            }
+            retreatYaw = c.player.getYaw() + 130;
+            retreatUntil = tick + 12;
+            status = "closing the screen after damage";
+            step(forward(retreatYaw), true, true);
+            return true;
+        }
+
+        boolean selecting = defense.combatSelecting();
+        LivingEntity threat = body.threat(8).orElse(null);
+        boolean creeper = threat instanceof CreeperEntity;
+        float health = c.player.getHealth();
+        boolean flee = threat != null && (creeper || health <= 7 || health <= 10 && wantsHealingMeal());
+        if (flee && tick >= retreatUntil - 10) {
+            retreatYaw = yaw(c.player.getPos().subtract(threat.getPos()));
+            retreatUntil = tick + 15;
         }
         if (tick < retreatUntil) {
+            body.prioritizeMovement();
+            defense.markDanger(tick);
+            interruptHands();
+            status = creeper ? "backing off a creeper" : flee ? "retreating while hurt" : "clearing room after danger";
             if (step(forward(retreatYaw), true, true) == Walk.BLOCKED) retreatYaw += 65;
+            return true;
+        }
+        if (threat != null) {
+            body.prioritizeMovement();
+            // The only Hands job combat may retain is a checked hotbar key selection.
+            if (!selecting) interruptHands();
+            if (defense.fight(threat, tick)) {
+                Vec3d target = threat.getPos();
+                if (walkToward(target, false, false) == Walk.MOVING
+                        && bearingDistance(routeYaw, yaw(target.subtract(c.player.getPos()))) <= 12) {
+                    defense.face();
+                }
+            }
+            status = defense.status();
             return true;
         }
         return false;
     }
 
+    private boolean prepareDefense() {
+        if (!(goal.equals("diamond") || portal != null) || nextFoot != null || firing != Firing.NONE
+                || !c.player.isOnGround() || c.player.isTouchingWater() || !defense.canPrepare(tick)
+                || !has(DEEP_PICK, 1)) return false;
+        int reserve = (has(PORTAL_BUCKET, 1) ? 0 : 3) + (has(IGNITER, 1) ? 0 : 1);
+        int sparePlanks = hands.count(PLANK) + 4 * hands.count(LOG) - localTableWood();
+        boolean beforePortal = !portalStarted && (portal == null || !has(DIAMOND, 3) && !has(DIAMOND_PICK, 1));
+        if (!defense.prepare(this, tick, reserve, sparePlanks, hands.count(STICK), beforePortal)) return false;
+        if (defense.status() != null) status = defense.status();
+        return true;
+    }
+
     private void interruptHands() {
+        defense.cancelSelection();
         if (hands.busy()) hands.cancel();
         if (c.currentScreen instanceof HandledScreen<?>) c.currentScreen.close();
     }
 
+    int mealsEaten() { return mealsEaten; }
+    int foodPickedUp() { return foodPickedUp; }
+
+    private boolean wantsHealingMeal() {
+        return canRefuelHealing(c.player.getHungerManager().getFoodLevel()) && has(FOOD, 1);
+    }
+
+    private boolean canRefuelHealing(int hunger) {
+        float health = c.player.getHealth();
+        float max = c.player.getMaxHealth();
+        return hunger < 20 && health < max && (hunger < 18 || health <= max / 2);
+    }
+
     private boolean eatOrHunt() {
-        int hunger = c.player.getHungerManager().getFoodLevel();
-        if (hunger > 14 && !c.player.isUsingItem()) return false;
-        if (has(FOOD, 1) && hunger < 20) {
-            status = "eating";
-            if (hold(FOOD)) {
-                body.turn(c.player.getYaw(), -35);
-                body.holdUse();
+        var player = c.player;
+        int hunger = player.getHungerManager().getFoodLevel();
+        float health = player.getHealth();
+        confirmMeal(hunger);
+        if (forage != null) {
+            int stock = hands.count(FOOD);
+            if (stock > forageStock) {
+                foodPickedUp += stock - forageStock;
+                finishForage(12);
+            } else {
+                forageStock = stock;
             }
-            return true;
         }
-        if (hunger > 10) {
-            foraging = false;
+        // The danger handler runs first. A retreat or newly lost health means the
+        // lack of a hostile in the current view is not yet a good time to stop.
+        if (health < mealHealth) mealQuietUntil = tick + 10;
+        if (retreatUntil > 0) mealQuietUntil = Math.max(mealQuietUntil, retreatUntil + 10);
+        mealHealth = health;
+        if (tick < mealQuietUntil || player.isTouchingWater()) {
+            if (forage != null) finishForage(100);
+            mealUntil = 0;
+            mealItem = null;
             return false;
         }
-        if (hunger <= 7 && activeTrail() > 1 && returnIndex < 0 && exitStart == null) {
-            foraging = true;
-            beginReturn(true);
-            return true;
+        if (!player.isOnGround()) return forage != null && tick < forageUntil;
+        if (tick >= mealRetry && hunger < 20 && (mealUntil != 0 || hunger <= 14 || canRefuelHealing(hunger))
+            && eatMeal(hunger)) return true;
+        if (returnIndex >= 0 || exitStart != null || nextFoot != null || stopped != null) {
+            if (forage != null) finishForage(100);
+            return false;
         }
-        if (activeTrail() > 1 || returnIndex >= 0 || exitStart != null) return false;
-        if (collect(FOOD, 8)) return true;
-        Entity animal = body.visibleEntity(PilotProgress::edibleAnimal, 12).orElse(null);
-        if (animal == null) {
-            if (!foraging) return false;
-            status = "searching above ground for food";
-            explore();
-            return true;
+        if (forage != null) return continueForage();
+        if (tick < forageScan || pickupItem != null) return false;
+        boolean surface = player.getBlockY() > 48 && activeTrail() <= 1;
+        if (hunger > 10 && (!surface || !needsTimberKit() || firing != Firing.NONE)) return false;
+        forageScan = tick + 12;
+        if (hunger > 10 && foodNutrition() >= FOOD_RESERVE) return false;
+        ItemEntity food = visibleMealDrop(false);
+        if (food != null) {
+            startForage(Forage.DROP, food, null, food.getPos(), 50);
+            return continueForage();
         }
-        status = "foraging for food";
-        if (c.player.getPos().distanceTo(animal.getPos()) > 2.75) {
-            return approach(animal.getPos(), false, false) != Walk.BLOCKED;
+        BlockHitResult berries = body.find(RIPE_BERRIES, REACH - 0.25).orElse(null);
+        if (berries != null) {
+            startForage(Forage.BERRIES, null, berries.getBlockPos(), berries.getPos(), 45);
+            return continueForage();
         }
-        Vec3d point = animal.getBoundingBox().getCenter();
-        body.aim(point);
-        if (body.aligned(point) && c.player.getAttackCooldownProgress(0.5f) >= 0.85f) body.strike(animal);
+        if (!surface || huntingWeapon() < 0) return false;
+        Entity animal = body.visibleEntity(candidate -> edibleAnimal(candidate) && localForagePoint(candidate.getPos())
+            && player.getPos().squaredDistanceTo(candidate.getPos()) <= FORAGE_LEASH_SQUARED, 6)
+            .orElse(null);
+        if (animal == null) return false;
+        startForage(Forage.ANIMAL, animal, null, animal.getPos(), 115);
+        return continueForage();
+    }
+
+    private void confirmMeal(int hunger) {
+        if (mealItem == null || hunger <= mealStartHunger) return;
+        ItemStack selectedFood = c.player.getInventory().getStack(mealSlot);
+        if (selectedFood.isOf(mealItem) && selectedFood.getCount() >= mealCount) return;
+        mealsEaten++;
+        mealItem = null;
+        mealUntil = 0;
+    }
+
+    private boolean eatMeal(int hunger) {
+        if (mealUntil != 0 && tick >= mealUntil) {
+            mealRetry = tick + 45;
+            mealUntil = 0;
+            mealItem = null;
+            return false;
+        }
+        if (mealItem == null || !c.player.getMainHandStack().isOf(mealItem)) {
+            int slot = bestMeal(hunger);
+            if (slot < 0) return false;
+            if (mealUntil == 0) mealUntil = tick + 75;
+            if (!hands.equipSlot(slot)) {
+                if (hands.busy()) {
+                    status = "equipping food";
+                    return true;
+                }
+                mealUntil = 0;
+                mealRetry = tick + 45;
+                return false;
+            }
+            ItemStack hand = c.player.getMainHandStack();
+            mealItem = hand.getItem();
+            mealSlot = slot;
+            mealCount = hand.getCount();
+            mealStartHunger = hunger;
+        }
+        status = canRefuelHealing(hunger) ? "eating to recover health" : "eating";
+        body.turn(c.player.getYaw(), -50);
+        body.holdUse();
         return true;
     }
 
+    private int bestMeal(int hunger) {
+        var inv = c.player.getInventory();
+        int best = -1;
+        float score = -1;
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            ItemStack stack = inv.getStack(slot);
+            if (!FOOD.test(stack)) continue;
+            var food = stack.get(DataComponentTypes.FOOD);
+            if (food == null || food.nutrition() <= 0) continue;
+            int useful = Math.min(20 - hunger, food.nutrition());
+            float rank = 2 * useful + food.saturation() - 0.25f * (food.nutrition() - useful);
+            if (rank > score || rank == score && slot == inv.selectedSlot) {
+                best = slot;
+                score = rank;
+            }
+        }
+        return best;
+    }
+
+    private int foodNutrition() {
+        var inv = c.player.getInventory();
+        int total = 0;
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE && total < FOOD_RESERVE; slot++) {
+            ItemStack stack = inv.getStack(slot);
+            if (!FOOD.test(stack)) continue;
+            var food = stack.get(DataComponentTypes.FOOD);
+            if (food != null) total += food.nutrition() * stack.getCount();
+        }
+        return total;
+    }
+
+    private void startForage(Forage purpose, Entity entity, BlockPos bush, Vec3d point, int duration) {
+        forage = purpose;
+        forageEntity = entity;
+        forageBush = bush;
+        foragePoint = point;
+        forageOrigin = c.player.getPos();
+        forageUntil = tick + duration;
+        forageSeen = tick;
+        forageAction = forageFootingWait = 0;
+        forageStock = hands.count(FOOD);
+    }
+
+    private boolean continueForage() {
+        if (tick >= forageUntil || forage != Forage.BERRIES && !localForagePoint(foragePoint)
+            || forageOrigin.squaredDistanceTo(c.player.getPos()) > FORAGE_LEASH_SQUARED) {
+            finishForage(100);
+            return false;
+        }
+        boolean active = switch (forage) {
+            case DROP -> collectMealDrop();
+            case BERRIES -> harvestBerries();
+            case ANIMAL -> huntMeal();
+        };
+        if (!active) finishForage(100);
+        return active;
+    }
+
+    private void finishForage(int delay) {
+        forage = null;
+        forageEntity = null;
+        forageBush = null;
+        foragePoint = forageOrigin = null;
+        forageScan = tick + delay;
+    }
+
+    private boolean localForagePoint(Vec3d point) {
+        return Math.abs(point.y - c.player.getY()) <= 1.2
+            && (forageOrigin == null || forageOrigin.squaredDistanceTo(point) <= FORAGE_LEASH_SQUARED);
+    }
+
+    private ItemEntity visibleMealDrop(boolean meatOnly) {
+        return (ItemEntity) body.visibleEntity(candidate -> candidate instanceof ItemEntity drop
+            && localForagePoint(drop.getPos()) && FOOD.test(drop.getStack())
+            && (!meatOnly || freshMeat(drop.getStack()))
+            && (foragePoint == null || drop.getPos().squaredDistanceTo(foragePoint) <= 9), 6)
+            .orElse(null);
+    }
+
+    private static boolean freshMeat(ItemStack stack) {
+        return stack.isOf(Items.BEEF) || stack.isOf(Items.PORKCHOP) || stack.isOf(Items.MUTTON)
+            || stack.isOf(Items.RABBIT) || stack.isOf(Items.COOKED_BEEF) || stack.isOf(Items.COOKED_PORKCHOP)
+            || stack.isOf(Items.COOKED_MUTTON) || stack.isOf(Items.COOKED_RABBIT);
+    }
+
+    private boolean collectMealDrop() {
+        Entity seen = body.visibleEntity(candidate -> candidate == forageEntity, 6).orElse(null);
+        if (seen == null) {
+            if (tick - forageSeen > 14) return false;
+            body.aim(foragePoint);
+            status = "looking for the visible food drop";
+            return true;
+        }
+        Vec3d pos = seen.getPos();
+        if (!localForagePoint(pos)) return false;
+        foragePoint = pos;
+        forageSeen = tick;
+        status = "collecting visible food";
+        double distance = horizontalDistance(c.player.getPos(), pos);
+        if (distance <= 0.38) {
+            body.aim(pos);
+            return true;
+        }
+        if (distance <= 1.2) {
+            if (dangerInForageLane(pos.add(0, 0.25, 0))) return false;
+            if (walkMinedPickup(pos)) return true;
+        }
+        return advanceForage(pos);
+    }
+
+    private boolean lookForMealDrop(boolean meatOnly) {
+        ItemEntity food = visibleMealDrop(meatOnly);
+        if (food == null) return false;
+        forage = Forage.DROP;
+        forageEntity = food;
+        foragePoint = food.getPos();
+        forageSeen = tick;
+        forageFootingWait = 0;
+        forageUntil = Math.max(forageUntil, tick + 26);
+        return true;
+    }
+
+    private boolean harvestBerries() {
+        if (forageAction != 0 && lookForMealDrop(false)) return true;
+        BlockHitResult hit = perceive(foragePoint, REACH);
+        if (hit != null && hit.getBlockPos().equals(forageBush) && RIPE_BERRIES.test(state(hit))) {
+            if (body.aligned(foragePoint) && (forageAction == 0 || tick - forageAction >= 9)) {
+                body.use(forageBush, hit.getSide());
+                forageAction = tick;
+            }
+        } else if (forageAction != 0 && tick - forageAction > 14) return false;
+        body.aim(foragePoint);
+        status = forageAction == 0 ? "aiming at visible ripe berries" : "harvesting visible berries";
+        return true;
+    }
+
+    private boolean huntMeal() {
+        if (forageAction != 0 && lookForMealDrop(true)) {
+            status = "collecting visible meat";
+            return true;
+        }
+        Entity animal = body.visibleEntity(candidate -> candidate == forageEntity && edibleAnimal(candidate), 8).orElse(null);
+        if (animal == null) {
+            if (tick - forageSeen > (forageAction == 0 ? 12 : 23)) return false;
+            body.aim(foragePoint.add(0, forageAction == 0 ? 0.65 : 0.12, 0));
+            status = forageAction == 0 ? "looking for the visible animal" : "looking for visible meat drops";
+            return true;
+        }
+        Vec3d pos = animal.getPos();
+        if (!localForagePoint(pos)) return false;
+        foragePoint = pos;
+        forageSeen = tick;
+        status = "hunting a visible animal";
+        Vec3d point = animal.getBoundingBox().getCenter();
+        double range = Math.min(2.8, c.player.getEntityInteractionRange() - 0.1);
+        if (c.player.getEyePos().squaredDistanceTo(point) > range * range) return advanceForage(pos);
+        body.aim(point);
+        int weapon = huntingWeapon();
+        if (weapon < 0) return false;
+        if (!hands.equipSlot(weapon)) return hands.busy();
+        if (body.strikeTarget(animal) && c.player.getAttackCooldownProgress(0.5f) >= 0.9f) {
+            body.strike(animal);
+            forageAction = tick;
+        }
+        return true;
+    }
+
+    private boolean advanceForage(Vec3d pos) {
+        if (stuck >= 12) return false;
+        Vec3d feet = c.player.getPos();
+        float bearing = yaw(pos.subtract(feet));
+        body.lookAlongGait(bearing, 34);
+        float facing = c.player.getYaw();
+        if (bearingDistance(bearing, facing) > 7 || c.player.getPitch() < 27) return true;
+        Vec3d lane = forward(facing);
+        if (dangerInForageLane(feet.add(lane.multiply(1.15)).add(0, 0.35, 0))) return false;
+        Footing ground = footing(feet, lane, facing, false);
+        if (ordinaryFooting(ground)) {
+            forageFootingWait = 0;
+            walkDown(false);
+            return true;
+        }
+        // Do not choose a detour or an unproven drop for an optional meal.
+        return ground == Footing.UNKNOWN && ++forageFootingWait < 12;
+    }
+
+    private boolean dangerInForageLane(Vec3d point) {
+        BlockHitResult hit = perceive(point, c.player.getEyePos().distanceTo(point) + 0.1);
+        return hit != null && dangerous(state(hit));
+    }
+
+    private int huntingWeapon() {
+        var inv = c.player.getInventory();
+        int best = -1;
+        double damage = 0;
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            ItemStack stack = inv.getStack(slot);
+            if ((!AXE.test(stack) && !stack.isIn(ItemTags.SWORDS)) || stack.getMaxDamage() - stack.getDamage() < 2)
+                continue;
+            var attributes = stack.get(DataComponentTypes.ATTRIBUTE_MODIFIERS);
+            if (attributes == null) continue;
+            for (var entry : attributes.modifiers()) {
+                if (!entry.attribute().equals(EntityAttributes.ATTACK_DAMAGE)
+                    || !entry.slot().matches(EquipmentSlot.MAINHAND)) continue;
+                double rank = entry.modifier().value();
+                if (rank > damage || rank == damage && slot == inv.selectedSlot) {
+                    damage = rank;
+                    best = slot;
+                }
+            }
+        }
+        return best;
+    }
+
     private static boolean edibleAnimal(Entity entity) {
-        return entity.getType() == EntityType.COW || entity.getType() == EntityType.PIG
-            || entity.getType() == EntityType.SHEEP || entity.getType() == EntityType.MOOSHROOM
-            || entity.getType() == EntityType.RABBIT;
+        var type = entity.getType();
+        return (type == EntityType.COW || type == EntityType.PIG || type == EntityType.SHEEP
+            || type == EntityType.MOOSHROOM || type == EntityType.RABBIT)
+            && entity instanceof LivingEntity animal && !animal.isBaby() && !animal.isTouchingWater();
     }
 
     private void explore() {
@@ -2718,6 +4114,7 @@ final class PilotProgress {
     private Footing footing(Vec3d feet, Vec3d heading, float bearing, boolean allowWater) {
         observedLanding = null;
         if (body.hazardAhead(bearing, 2.3)) return Footing.BLOCKED;
+        if (c.player.isOnGround() && c.player.horizontalCollision && body.jumpBlocked(bearing)) return Footing.BLOCKED;
         BlockHitResult head = terrain(feet.add(heading.multiply(1.55)).add(0, 1.32, 0), 1.58);
         if (head != null && (dangerous(state(head)) || solid(head))) return Footing.BLOCKED;
         BlockHitResult shin = terrain(feet.add(heading.multiply(1.55)).add(0, 0.32, 0), 1.95);
@@ -2735,7 +4132,7 @@ final class PilotProgress {
                 || landing.getSide() != Direction.UP || !safeSupport(landing)) return Footing.UNKNOWN;
             Vec3d upper = feet.add(heading.multiply(1.55)).add(0, 2.35, 0);
             BlockHitResult ceiling = terrain(upper, c.player.getEyePos().distanceTo(upper));
-            return ceiling == null ? Footing.JUMP : Footing.BLOCKED;
+            return ceiling == null && !body.jumpBlocked(bearing) ? Footing.JUMP : Footing.BLOCKED;
         }
         Vec3d eye = c.player.getEyePos();
         Footing result = Footing.UNKNOWN;

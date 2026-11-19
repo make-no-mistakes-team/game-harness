@@ -30,7 +30,7 @@ final class PilotHeadroom {
 
     private final MinecraftClient client;
     private final PilotBody body;
-    private Vec3d launch, lastShort, blockedAt, cutAim;
+    private Vec3d launch, lastShort, blockedAt, clippedAt, cutAim;
     private float launchYaw, lastShortYaw, blockedYaw;
     private int launchTick, lastShortTick, blockedTick, cutTick;
     private double peak, risingVelocity;
@@ -53,7 +53,7 @@ final class PilotHeadroom {
     void interruptAttempt() { launch = null; }
 
     private void releaseStance() {
-        blockedAt = cutAim = null;
+        blockedAt = clippedAt = cutAim = null;
         cut = null;
         surveying = checkingFirstClip = attacked = broken = false;
     }
@@ -84,10 +84,12 @@ final class PilotHeadroom {
                 "headroom: short upward collision at " + height);
             if (repeated) {
                 start(now, launch, launchYaw, false, "checking the ceiling after repeated short jumps (" + height + ")");
+                clippedAt = feet;
             } else if (rise >= CLIPPED_RISE_MIN && peak <= CLIPPED_RISE_MAX && drift <= CLIPPED_DRIFT_SQUARED) {
                 // Positive, sharply clipped upward travel at the launch stance warrants a look,
                 // not an assumption about what stopped the jump.
                 start(now, launch, launchYaw, true, "checking the ceiling after a clipped upward jump (" + height + ")");
+                clippedAt = feet;
             }
             lastShort = launch;
             lastShortYaw = launchYaw;
@@ -147,12 +149,25 @@ final class PilotHeadroom {
             if (elapsed > GLANCE_TICKS) {
                 if (!checkingFirstClip) return bypass("no lit ceiling face in the jump path");
                 releaseStance();
-                note("headroom: no lit ceiling face after the first clipped jump");
+                note("no lit ceiling face after the first clipped jump");
                 return false;
             }
-            BlockHitResult visible = ceiling(player, blockedYaw, true);
+            BlockHitResult visible;
+            if (clippedAt == null || elapsed < 8) {
+                visible = ceiling(player, blockedYaw, true);
+            } else {
+                visible = clippedCeiling(player);
+                if (visible == null && clearJumpCrown(player)) {
+                    releaseStance();
+                    lastShort = null;
+                    note("the current jump has visible headroom after the clip");
+                    return true;
+                }
+            }
             if (visible == null) {
-                body.turn(blockedYaw, elapsed < 9 ? -28 : -64);
+                if (clippedAt == null || elapsed < 8) body.turn(blockedYaw, -38);
+                else if (elapsed < 17) body.turn(blockedYaw, -88);
+                else body.aim(new Vec3d(clippedAt.x, clippedAt.y + player.getHeight() + 0.30, clippedAt.z));
                 return true;
             }
             select(visible, now);
@@ -229,6 +244,48 @@ final class PilotHeadroom {
         }
         return null;
     }
+
+    private BlockHitResult clippedCeiling(ClientPlayerEntity player) {
+        Vec3d feet = player.getPos(), eye = player.getEyePos();
+        double width = player.getWidth() * 0.5 - 0.025;
+        double collisionY = blockedAt.y + player.getHeight() + peak;
+        double roof = collisionY + 0.16;
+        // The launch and collision are player-motion observations, not block observations.
+        // Admit only a lit collider underside actually over the current jump footprint.
+        for (int origin = 0; origin < 3; origin++) {
+            Vec3d base = origin == 0 ? feet : origin == 1 ? clippedAt : blockedAt;
+            for (int i = 0; i < 5; i++) {
+                Vec3d point = new Vec3d(base.x + crownX(i, width), roof, base.z + crownZ(i, width));
+                BlockHitResult hit = body.terrain(point, eye.distanceTo(point) + 0.03).orElse(null);
+                if (hit == null || hit.getSide() != Direction.DOWN || Math.abs(hit.getPos().y - collisionY) > 0.12) continue;
+                Vec3d underside = hit.getPos();
+                if (Math.abs(underside.x - feet.x) < width + 0.025 &&
+                    Math.abs(underside.z - feet.z) < width + 0.025) return hit;
+            }
+        }
+        return null;
+    }
+
+    private boolean clearJumpCrown(ClientPlayerEntity player) {
+        Vec3d feet = player.getPos();
+        double width = player.getWidth() * 0.5;
+        double roof = feet.y + player.getHeight() + SHORT_RISE;
+        double angle = Math.toRadians(blockedYaw);
+        double dx = -Math.sin(angle), dz = Math.cos(angle);
+        for (int i = 0; i < 5; i++) {
+            if (!body.clearTerrain(new Vec3d(feet.x + crownX(i, width), roof, feet.z + crownZ(i, width)))) return false;
+        }
+        // A clear current crown does not prove the forward side of the takeoff.
+        for (int i = -1; i <= 1; i++) {
+            double side = width * i;
+            if (!body.clearTerrain(new Vec3d(feet.x + 0.30 * dx + dz * side, roof, feet.z + 0.30 * dz - dx * side)))
+                return false;
+        }
+        return true;
+    }
+
+    private static double crownX(int i, double width) { return i == 0 ? 0 : i <= 2 ? -width : width; }
+    private static double crownZ(int i, double width) { return i == 0 ? 0 : i % 2 == 0 ? -width : width; }
 
     private boolean fallingOrLavaAbove(ClientPlayerEntity player, BlockHitResult face) {
         Direction side = face.getSide();

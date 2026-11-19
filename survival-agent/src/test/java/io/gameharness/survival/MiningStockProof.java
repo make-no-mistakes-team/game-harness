@@ -20,6 +20,7 @@ import net.minecraft.resource.LifecycledResourceManagerImpl;
 import net.minecraft.resource.ResourceType;
 import net.minecraft.resource.VanillaDataPackProvider;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 import net.minecraft.world.EmptyBlockView;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -166,6 +167,54 @@ final class MiningStockProof {
         stock.setStack(1, new ItemStack(Items.BIRCH_LOG));
         require(budget.missingFloor(stock) == null && budget.limit(Items.BIRCH_LOG, 1) == 0,
             "only a confirmed exact pickup fulfills the floor and the item stays protected");
+    }
+
+    @Test
+    void prospectingCoverRequiresItsOwnEffectAndLeavesABreakForTheSource() {
+        var raw = JsonParser.parseString("""
+            {"v":1,"id":"stone","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":105,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:cobblestone","count":3},
+             "allowedEffects":["break:minecraft:stone"],"costCaps":[],"reserves":[],
+             "maxBreaks":4,"maxCrafts":0,"maxPlacements":0}
+            """).getAsJsonObject();
+        var stone = Blocks.STONE.getDefaultState();
+        var grass = Blocks.GRASS_BLOCK.getDefaultState();
+        var dirt = Blocks.DIRT.getDefaultState();
+        var narrow = AgentWorkOrder.parse(raw, "run", "constrained").policy();
+        require(narrow.breakAllowed(stone) && !narrow.prospectCoverAllowed(grass) && !narrow.prospectCoverAllowed(dirt),
+            "an exact stone break does not permit removing soil");
+        raw.getAsJsonArray("allowedEffects").add("break:minecraft:grass_block");
+        var withGrass = AgentWorkOrder.parse(raw, "run", "constrained").policy();
+        require(withGrass.prospectCoverAllowed(grass) && !withGrass.prospectCoverAllowed(dirt)
+                && !withGrass.breakAllowed(grass) && AgentWorkOrder.prospectCoverDrop(grass) == Items.DIRT,
+            "the named cap is a prospecting permission, not an implied dirt harvest or a wider cover family");
+        var budget = new AgentWorkOrder.Budget(withGrass);
+        for (int i = 0; i < 3; i++) budget.broken(Items.AIR, 0);
+        require(budget.canBreak() && !budget.canCutCover(), "the last break belongs to exposed source work");
+
+        var preset = new AgentWorkOrder.Policy(true, new AgentWorkOrder.Target(null, 0, "stone_pickaxe"),
+            Set.of(), Map.of(), Map.of(), 4, 0, 0);
+        require(preset.prospectCoverAllowed(grass) && preset.prospectCoverAllowed(dirt)
+                && !preset.prospectCoverAllowed(Blocks.GRAVEL.getDefaultState())
+                && !preset.prospectCoverAllowed(Blocks.COAL_ORE.getDefaultState()),
+            "the built-in stone job permits only ordinary non-falling cover, not an unrelated ore");
+    }
+
+    @Test
+    void aSurfaceWindowNeverCutsItsStanceOrTurnsIntoADescent() {
+        var foot = new BlockPos(0, 72, 0);
+        var cap = foot.down().east();
+        require(AgentMacroControl.prospectBearing(foot, foot.down(), Direction.UP, null, null, null) == null
+                && AgentMacroControl.prospectBearing(foot, foot.east().up(), Direction.WEST, null, null, null) == null,
+            "the player cannot cut underfoot or remove its headroom");
+        var bearing = AgentMacroControl.prospectBearing(foot, cap, Direction.UP, null, null, null);
+        require(bearing == Direction.EAST
+                && AgentMacroControl.prospectBearing(foot, cap.east(), Direction.WEST, foot, cap, bearing) == Direction.EAST,
+            "the second cut is a newly exposed side on the same shallow bearing");
+        require(AgentMacroControl.prospectBearing(foot, cap.down(), Direction.UP, foot, cap, bearing) == null
+                && AgentMacroControl.prospectBearing(foot, cap.north(), Direction.SOUTH, foot, cap, bearing) == null
+                && AgentMacroControl.prospectBearing(foot.east(), cap.east(), Direction.WEST, foot, cap, bearing) == null,
+            "the window cannot grow downward, around a corner, or from inside the cut");
     }
 
     private static void require(boolean condition, String message) {

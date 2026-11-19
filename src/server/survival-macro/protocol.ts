@@ -162,6 +162,8 @@ export interface MacroWorkOrder extends MacroWorkPolicy {
   readonly expiresTick: number;
   readonly safetyRevision: number;
   readonly origin: "preset" | "model";
+  /** May retain a clean personal screen for this exact, not-yet-admitted program stage. */
+  readonly nextWorkId?: string;
 }
 export interface MacroWorkState {
   readonly id: string;
@@ -478,17 +480,24 @@ function parseWorkProgress(value: unknown, tick: number): NonNullable<MacroWorkS
 export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   const record = shape(value, "work order", [
     "v", "id", "run", "life", "epoch", "basisTick", "expiresTick", "safetyRevision", "origin", ...WORK_POLICY_KEYS,
-  ]);
+  ], ["nextWorkId"]);
+  const id = validateMacroId(record.id, "work id");
   const origin = choice(record.origin, "work origin", ["preset", "model"] as const);
   const policy = workPolicy(record);
   if (origin === "preset" && (policy.target.kind !== "preset" || policy.allowedEffects.length || policy.costCaps.length ||
       policy.maxBreaks > 32 || policy.maxCrafts > 24 || policy.maxPlacements > 2)) invalid("preset work scope");
+  const nextWorkId = Object.hasOwn(record, "nextWorkId") ? validateMacroId(record.nextWorkId, "next work id") : undefined;
+  if (nextWorkId) {
+    const stage = /^(.+):([12])$/.exec(id);
+    if (origin !== "model" || !stage || nextWorkId !== `${stage[1]}:${Number(stage[2]) + 1}`) invalid("work successor scope");
+  }
   const basisTick = whole(record.basisTick, "work basis tick", 1, Number.MAX_SAFE_INTEGER - MACRO_MAX_INTENT_TTL_TICKS);
   return Object.freeze({
-    v: version(record.v), id: validateMacroId(record.id, "work id"), run: validateMacroId(record.run, "run"),
+    v: version(record.v), id, run: validateMacroId(record.run, "run"),
     life: whole(record.life, "life", 1, 2_147_483_647), epoch: whole(record.epoch, "epoch", 1), basisTick,
     expiresTick: whole(record.expiresTick, "work expiry", basisTick + 1, basisTick + MACRO_MAX_INTENT_TTL_TICKS),
-    safetyRevision: whole(record.safetyRevision, "work safety revision", 1), origin, ...policy,
+    safetyRevision: whole(record.safetyRevision, "work safety revision", 1), origin,
+    ...(nextWorkId ? { nextWorkId } : {}), ...policy,
   });
 }
 

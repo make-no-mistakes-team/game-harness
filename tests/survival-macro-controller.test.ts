@@ -405,11 +405,21 @@ test("A single model work program crosses two native receipts and preserves rese
     await f.observe(100, { epoch: 2, inventory: { [log]: 5 } });
     const craft = await f.order();
     expect(craft).toMatchObject({ target: { item: planks, count: 12 }, expiresTick: gather.expiresTick });
+    expect(gather.nextWorkId).toBe(craft.id);
     await f.receipt(craft.id, 101, "accepted");
+    await f.observe(119, { epoch: 3, inventory: { [log]: 2, [planks]: 12 },
+      workOrder: { id: craft.id, state: "working", detail: "Craft in progress" } });
+    expect(await f.order()).toEqual(craft);
     await f.receipt(craft.id, 120, "completed");
-    await f.observe(120, { epoch: 3, inventory: { [log]: 2, [planks]: 12 } });
+    await f.actor.poll();
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    // The native personal inventory can still be open: this is not a neutral primitive handoff.
+    await f.observe(120, { epoch: 3, inventory: { [log]: 2, [planks]: 12 },
+      workOrder: { id: craft.id, state: "complete", detail: "Confirmed stock" } });
     const pick = await f.order();
     expect(pick).toMatchObject({ target: { kind: "preset", goal: "wooden_pickaxe" }, expiresTick: gather.expiresTick });
+    expect(craft.nextWorkId).toBe(pick.id);
+    expect(pick.nextWorkId).toBeUndefined();
     await f.receipt(pick.id, 121, "accepted");
     await f.receipt(pick.id, 140, "completed");
     await f.observe(140, { epoch: 4, inventory: { [log]: 2, [planks]: 3, "minecraft:wooden_pickaxe": 1 } });
@@ -428,21 +438,23 @@ test("A single model work program crosses two native receipts and preserves rese
 });
 
 test.each([
-  { terminal: "interrupted", actual: 5, reason: "predecessor_did_not_complete" },
-  { terminal: "completed", actual: 4, reason: "predecessor_stock_not_confirmed" },
-] as const)("A $terminal receipt with $actual live logs cannot unlock the second stage", async ({ terminal, actual, reason }) => {
+  { terminal: "interrupted", actual: 5, required: 3, reason: "predecessor_did_not_complete" },
+  { terminal: "completed", actual: 4, required: 3, reason: "predecessor_stock_not_confirmed" },
+  { terminal: "completed", actual: 5, required: 6, reason: "Live stock or target does not support the proposed work policy." },
+] as const)("A $terminal receipt with $actual live logs cannot unlock a stage requiring $required", async ({ terminal, actual, required, reason }) => {
   const log = "minecraft:oak_log";
   const f = await durableFixture(async request => workReply(request, { kind: "work-program", stages: [
     { policy: { target: { kind: "stock", item: log, count: 5 }, allowedEffects: ["break:minecraft:oak_log"],
       costCaps: [], reserves: [], maxBreaks: 6, maxCrafts: 0, maxPlacements: 0 }, requires: [] },
     { policy: { target: { kind: "stock", item: "minecraft:oak_planks", count: 8 }, allowedEffects: ["craft:oak_planks"],
       costCaps: [{ item: log, count: 2 }], reserves: [{ item: log, count: 1 }], maxBreaks: 0, maxCrafts: 2, maxPlacements: 0 },
-      requires: [{ item: log, count: 3 }] },
+      requires: [{ item: log, count: required }] },
   ] }), "Keep a log and make planks", 1);
   try {
     await f.observe(10);
     await f.actor.poll();
     const first = await f.order();
+    expect(first.nextWorkId).toBeDefined();
     await f.receipt(first.id, 11, "accepted");
     await f.receipt(first.id, 50, terminal);
     await f.observe(50, { epoch: 2, inventory: { [log]: actual } });

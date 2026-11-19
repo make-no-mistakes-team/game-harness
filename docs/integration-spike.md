@@ -59,6 +59,14 @@ The work-order executor currently admits gathering, crafting, and crafting
 table placement. Naming the Nether goal does not give that executor the
 deterministic player's furnace-transfer or portal-construction permissions.
 
+When an early stone, coal, or iron source is not in view, an authorized
+work order can look from up to five distinct dry, level footholds. It may
+also open a shallow window through at most two visible cover blocks while
+staying on solid ground. Ordinary tool presets allow dry soil and common
+rock as cover when a relevant source is needed. For a custom job, each
+cover type needs its own exact break permission and counts against the
+same break budget. Breaking cover confirms neither a source nor a pickup.
+
 The three-second planning deadline is a diagnostic target, not a
 guarantee about the footage. If no safe, authorized action is available,
 the player reports the obstruction instead of spending resources or

@@ -636,7 +636,10 @@ public final class AgentClient implements ClientModInitializer {
             else observeContinuityIdle();
         }
         ended = true;
-        if (body != null) releaseLifeInputs(client);
+        if (body != null) {
+            hands.releaseWorkInventory(true);
+            releaseLifeInputs(client);
+        }
         if (pauses != null) pauses.close("runner_stop");
         stopMacro("actor_exit", "The owning runner ended the attempt.");
         client.scheduleStop();

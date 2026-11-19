@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { link, mkdtemp, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { MacroDirectory, MacroObservationRotating, parseMacroProposal } from "../src/server/survival-macro/protocol.ts";
+import { MacroDirectory, MacroObservationRotating, parseMacroProposal, parseMacroWorkOrder } from "../src/server/survival-macro/protocol.ts";
 
 test("Work program caps apply across stages and a later job cannot lower an earlier reserve", () => {
   const log = "minecraft:oak_log";
@@ -22,6 +22,19 @@ test("Work program caps apply across stages and a later job cannot lower an earl
   expect(() => parseMacroProposal(proposal(first, next(25, 2, 304)))).toThrow("work program effect caps");
   expect(() => parseMacroProposal(proposal(first, next(24, 2, 305)))).toThrow("work program item cost cap");
   expect(() => parseMacroProposal(proposal(first, next(24, 1, 304)))).toThrow("work program reserves regressed");
+});
+
+test("A personal crafting handoff can name only the immediate stage of the original program", () => {
+  const order = {
+    v: 1, id: "program:1", run: "run", life: 1, epoch: 1, basisTick: 10, expiresTick: 100, safetyRevision: 1, origin: "model",
+    target: { kind: "preset", goal: "wooden_pickaxe" }, allowedEffects: [], costCaps: [], reserves: [],
+    maxBreaks: 0, maxCrafts: 1, maxPlacements: 0,
+  };
+  expect(parseMacroWorkOrder(order).nextWorkId).toBeUndefined();
+  expect(parseMacroWorkOrder({ ...order, nextWorkId: "program:2" }).nextWorkId).toBe("program:2");
+  expect(() => parseMacroWorkOrder({ ...order, nextWorkId: "program:3" })).toThrow("work successor scope");
+  expect(() => parseMacroWorkOrder({ ...order, nextWorkId: "different:2" })).toThrow("work successor scope");
+  expect(() => parseMacroWorkOrder({ ...order, origin: "preset", nextWorkId: "program:2" })).toThrow("work successor scope");
 });
 
 test.each([

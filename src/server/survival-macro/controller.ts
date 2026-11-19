@@ -1148,7 +1148,13 @@ export class SurvivalMacroController {
 
   private async startWorkStage({ plan, stages, next: index, after }: QueuedWork): Promise<void> {
     const { policy, requires } = stages[index]!;
-    const job = await this.publishWork(plan.observation, policy, "model", plan.requestId, plan.proposal.expiresTick, requires, after?.policy);
+    const successor = stages[index + 1]?.policy;
+    // Only IDs are announced ahead of time; later policy and stock still go through ordinary admission.
+    const stage = stages.length > 1 ? { id: `${plan.requestId}:${index + 1}`,
+      nextWorkId: successor && successor.maxCrafts > 0 && successor.allowedEffects.some(effect => effect.startsWith("craft:"))
+        ? `${plan.requestId}:${index + 2}` : undefined } : undefined;
+    const job = await this.publishWork(plan.observation, policy, "model", plan.requestId, plan.proposal.expiresTick,
+      requires, after?.policy, undefined, stage);
     if (job === null) return; // A rotating observation is not a denied program stage.
     this.queuedWork = undefined;
     if (job && (stages.length > 1 || (job.order.origin === "model" && policy.target.kind === "preset"))) {
@@ -1161,6 +1167,7 @@ export class SurvivalMacroController {
     witness: MacroObservation, policy: MacroWorkPolicy, origin: MacroWorkOrder["origin"], requestId: string | null,
     expiresTick: number, requires: readonly MacroStockFloor[] = [], predecessor?: MacroWorkPolicy,
     admitFresh?: (observation: MacroObservation) => boolean,
+    stage?: { readonly id: string; readonly nextWorkId?: string },
   ): Promise<WorkJob | null | undefined> {
     const fresh = await this.refresh();
     if (!fresh) return null;
@@ -1187,9 +1194,10 @@ export class SurvivalMacroController {
       return previous;
     }
     const order = parseMacroWorkOrder({
-      v: 1, id: randomUUID(), run: fresh.run, life: fresh.life, epoch: fresh.epoch, basisTick: fresh.tick,
+      v: 1, id: stage?.id ?? randomUUID(), run: fresh.run, life: fresh.life, epoch: fresh.epoch, basisTick: fresh.tick,
       expiresTick: Math.min(expiresTick, fresh.tick + this.limits.maxIntentTtlTicks),
       safetyRevision: fresh.safety!.revision, origin: equivalent ? previous.order.origin : origin, ...policy,
+      ...(!equivalent && stage?.nextWorkId ? { nextWorkId: stage.nextWorkId } : {}),
     });
     await this.record("work_order_prepared", { requestId, order, previousId: previous?.order.id ?? null, equivalent });
     if (this.closing || this.config.signal?.aborted) return;

@@ -16,7 +16,8 @@ import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.util.Identifier;
 
 /** A finite, host-issued lease. Geometry, recipes and inputs are native decisions. */
-record AgentWorkOrder(String id, int life, long epoch, long basis, long expires, long safetyRevision, Policy policy) {
+record AgentWorkOrder(String id, int life, long epoch, long basis, long expires, long safetyRevision,
+                      Policy policy, String nextWorkId) {
     static final int MAX_TICKS = 1_200;
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
     private static final Pattern ITEM_ID = Pattern.compile("minecraft:[a-z0-9_]{1,96}");
@@ -31,7 +32,17 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     record Policy(boolean preset, Target target, Set<String> effects, Map<Item, Integer> caps,
                   Map<Item, Integer> floors, int maxBreaks, int maxCrafts, int maxPlacements) {
         boolean breakAllowed(BlockState state) {
-            return resource(state) && (preset || effects.contains("break:" + Registries.BLOCK.getId(state.getBlock())));
+            return resource(state) && (preset || namedBreak(state));
+        }
+
+        boolean prospectCoverAllowed(BlockState state) {
+            return prospectCoverDrop(state) != Items.AIR && (preset
+                ? !target.goal.equals("wooden_pickaxe")
+                : namedBreak(state));
+        }
+
+        private boolean namedBreak(BlockState state) {
+            return effects.contains("break:" + Registries.BLOCK.getId(state.getBlock()));
         }
 
         boolean craftAllowed(String recipe) {
@@ -49,6 +60,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
 
         Budget(Policy policy) { this.policy = policy; }
         boolean canBreak() { return breaks < policy.maxBreaks; }
+        boolean canCutCover() { return policy.maxBreaks - breaks > 1; }
         boolean canPlace() { return placements < policy.maxPlacements; }
         int craftsLeft() { return policy.maxCrafts - crafts; }
         boolean nearLimit() {
@@ -91,7 +103,8 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     }
 
     static AgentWorkOrder parse(JsonObject value, String run, String mode) {
-        if (mode == null || value == null || !value.keySet().equals(FIELDS)) return null;
+        if (mode == null || value == null || !value.keySet().containsAll(FIELDS)
+                || value.size() != FIELDS.size() + (value.has("nextWorkId") ? 1 : 0)) return null;
         AgentWorkOrder envelope;
         try {
             if (integer(value, "v") != 1 || !run.equals(text(value, "run"))) return null;
@@ -101,7 +114,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
             long expires = integer(value, "expiresTick"), safety = integer(value, "safetyRevision");
             if (life < 1 || life > Integer.MAX_VALUE || epoch < 1 || safety < 1 || basis < 1
                     || expires <= basis || expires - basis > MAX_TICKS) return null;
-            envelope = new AgentWorkOrder(id, (int) life, epoch, basis, expires, safety, null);
+            envelope = new AgentWorkOrder(id, (int) life, epoch, basis, expires, safety, null, null);
         } catch (RuntimeException invalid) {
             return null;
         }
@@ -109,6 +122,9 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
             String origin = text(value, "origin");
             boolean preset = origin.equals("preset");
             if (preset ? !"preset".equals(mode) : !origin.equals("model")) return envelope;
+            String nextWorkId = value.has("nextWorkId") ? text(value, "nextWorkId") : null;
+            if (nextWorkId != null && (preset || !ID.matcher(nextWorkId).matches()
+                    || !adjacentStage(envelope.id, nextWorkId))) return envelope;
             JsonObject target = value.getAsJsonObject("target");
             Target desired;
             switch (text(target, "kind")) {
@@ -140,10 +156,17 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                 bounded(value, "maxCrafts", 0, preset ? 24 : 64),
                 bounded(value, "maxPlacements", 0, preset ? 2 : 8));
             return new AgentWorkOrder(envelope.id, envelope.life, envelope.epoch, envelope.basis, envelope.expires,
-                envelope.safetyRevision, policy);
+                envelope.safetyRevision, policy, nextWorkId);
         } catch (RuntimeException invalid) {
             return envelope;
         }
+    }
+
+    private static boolean adjacentStage(String id, String next) {
+        int end = id.length() - 1;
+        return end > 1 && id.charAt(end - 1) == ':' && next.length() == id.length()
+            && id.charAt(end) >= '1' && id.charAt(end) < '3'
+            && next.charAt(end) == id.charAt(end) + 1 && next.regionMatches(0, id, 0, end);
     }
 
     private static boolean validEffect(String effect) {
@@ -151,7 +174,9 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         if (effect.equals(TABLE)) return true;
         if (!effect.startsWith("break:")) return false;
         String id = effect.substring("break:".length());
-        return ITEM_ID.matcher(id).matches() && resource(Registries.BLOCK.get(Identifier.of(id)).getDefaultState());
+        if (!ITEM_ID.matcher(id).matches()) return false;
+        BlockState state = Registries.BLOCK.get(Identifier.of(id)).getDefaultState();
+        return resource(state) || prospectCoverDrop(state) != Items.AIR;
     }
 
     private static Map<Item, Integer> stock(JsonObject value, String field) {
@@ -202,6 +227,16 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     }
 
     static boolean resource(BlockState state) { return harvest(state) != Items.AIR; }
+
+    /** Small, dry surface-cut allowlist. Turf is admitted as cover, not as an exact stock source. */
+    static Item prospectCoverDrop(BlockState state) {
+        if (state.isOf(Blocks.GRASS_BLOCK) || state.isOf(Blocks.DIRT)) return Items.DIRT;
+        if (state.isOf(Blocks.STONE)) return Items.COBBLESTONE;
+        if (state.isOf(Blocks.DEEPSLATE)) return Items.COBBLED_DEEPSLATE;
+        if (state.isOf(Blocks.ANDESITE) || state.isOf(Blocks.DIORITE) || state.isOf(Blocks.GRANITE)
+                || state.isOf(Blocks.TUFF)) return state.getBlock().asItem();
+        return Items.AIR;
+    }
 
     /** Some vanilla sources have conditional/alternative loot. Do not expose those as exact stock work. */
     static Item harvest(BlockState state) {

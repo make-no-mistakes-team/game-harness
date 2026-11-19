@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.FallingBlock;
@@ -69,10 +70,14 @@ final class AgentMacroControl {
     private static final int MAX_AGE = 1_200;
     private static final int MAX_HANDOFF_AGE = 100;
     private static final int MAX_WORK_ADMISSION_AGE = 40;
+    private static final int PERSONAL_HANDOFF_TICKS = 12;
+    private static final long PERSONAL_HANDOFF_NS = 600_000_000L;
     private static final int MAX_ROUTE_EDGES = 8;
     private static final int MAX_OFFERS = 16;
     private static final int MAX_MATERIAL_TARGETS = 4_096;
     private static final int APPROACH_SETTLE_TICKS = 3;
+    private static final int MAX_SOURCE_FOOTHOLDS = 5;
+    private static final int MAX_COVER_CUTS = 2;
     private static final double INSPECT_REACH = 16;
     private static final double PICKUP_STANCE_SQUARED = 1.20 * 1.20;
     private static final double SETTLED_SPEED_SQUARED = 0.001225;
@@ -87,6 +92,12 @@ final class AgentMacroControl {
     private static final Predicate<ItemStack> STONE = stack -> stack.isIn(ItemTags.STONE_TOOL_MATERIALS);
     private static final Predicate<ItemStack> IRON = stack -> stack.isOf(Items.IRON_INGOT);
     private static final Predicate<ItemStack> DIAMOND = stack -> stack.isOf(Items.DIAMOND);
+    private static final BlockState[] EARLY_SOURCES = {
+        Blocks.STONE.getDefaultState(), Blocks.COBBLESTONE.getDefaultState(),
+        Blocks.DEEPSLATE.getDefaultState(), Blocks.COBBLED_DEEPSLATE.getDefaultState(),
+        Blocks.COAL_ORE.getDefaultState(), Blocks.DEEPSLATE_COAL_ORE.getDefaultState(),
+        Blocks.IRON_ORE.getDefaultState(), Blocks.DEEPSLATE_IRON_ORE.getDefaultState()
+    };
 
     private enum Verb {
         SURVEY("survey", "read", 30), INSPECT("inspect", "read", 30), APPROACH("approach", "low", 32),
@@ -134,6 +145,7 @@ final class AgentMacroControl {
     private record Handoff(int life, long epoch, long basis, long expires) {}
     private record Planning(int life, long epoch, long basis, String id, long noticedAt) {}
     private record WorkMailbox(boolean present, AgentWorkOrder order) {}
+    private record PersonalCraft(AgentWorkOrder order, long untilTick, long untilNanos, boolean tableInReach) {}
     private record Inbox(boolean active, Intent intent, Handoff handoff, Planning planning, WorkMailbox work) {}
     private record Camera(float yaw, float pitch) {}
     private record Output(String file, String value) {}
@@ -173,7 +185,7 @@ final class AgentMacroControl {
         final ItemStack harvestTool;
         final Offer[] keepVisible;
         final float pathYaw, pathPitch;
-        boolean drove, fired, broken, purposefulMotion, durable;
+        boolean drove, fired, broken, purposefulMotion, durable, tableInReach, prospectCover;
         float lastCrack;
         long firedAt, pickupDisappeared, craftJob, priorCraftReceipt, settledAt, lastMissingFrame;
         int missingFaceFrames;
@@ -218,27 +230,38 @@ final class AgentMacroControl {
     private static final class WorkSession {
         AgentWorkOrder order;
         final AgentWorkOrder.Budget budget;
+        final SourceSearch sourceSearch;
         final Set<BlockPos> rejected = new HashSet<>();
         final Set<Integer> rejectedDrops = new HashSet<>();
         long deadline;
         BlockPos lastHarvest;
         long lastHarvestTick;
         Item lastHarvestItem;
-        long lastEffectTick;
+        long lastEffectTick, completedTick;
         String lastEffect;
         int confirmedBreaks, confirmedCrafts, confirmedPlacements, startingStock;
-        float sweepStart;
-        int sweep, sweepWait;
         String enactedPhase = "hold", enactedStatus = "No physical step has started.";
         String phase = "working", detail = "Current local evidence admits this bounded work order.";
 
-        WorkSession(AgentWorkOrder order, AgentWorkOrder.Budget budget, long deadline) {
+        WorkSession(AgentWorkOrder order, AgentWorkOrder.Budget budget, SourceSearch sourceSearch, long deadline) {
             this.order = order;
             this.budget = budget;
+            this.sourceSearch = sourceSearch;
             this.deadline = deadline;
         }
 
         boolean active() { return phase.equals("working"); }
+    }
+
+    private static final class SourceSearch {
+        final Set<BlockPos> footholds = new HashSet<>();
+        BlockPos lookedFrom, cutFrom, firstCover;
+        Direction cutBearing;
+        long viewUntil, freshAfter = -1;
+        float viewYaw;
+        int steps, coverCuts;
+        boolean arrived;
+        boolean checked;
     }
 
     private final String run, goal;
@@ -275,6 +298,7 @@ final class AgentMacroControl {
     private Inbox input;
     private Action action;
     private WorkSession work;
+    private PersonalCraft personalCraft;
     private AgentPauseEpisodes.Work continuityWork;
     private long lastHandsEvidence;
     private boolean suspended, visited, owned, hazardClear, lastHazard, quiescent, urgent, blocked, deadlineMeasured;
@@ -510,6 +534,11 @@ final class AgentMacroControl {
                 workTick(progress);
                 return;
             }
+            if (personalCraft != null) {
+                claim("work_order");
+                holdWork();
+                return;
+            }
         }
         boolean thinking = rawPending;
         if (thinking && action == null && !blocked) measureIdle(now);
@@ -672,6 +701,19 @@ final class AgentMacroControl {
             }
         }
         AgentWorkOrder next = mailbox.order;
+        boolean continuePersonal = false;
+        if (personalCraft != null) {
+            boolean finished = work.phase.equals("complete");
+            if (!personalCraftCurrent() || finished && !confirmsWorkStock()) {
+                releasePersonalCraft(true);
+            } else {
+                boolean sameMailbox = next != null && work.order.id().equals(next.id());
+                continuePersonal = finished && next != null && next.id().equals(work.order.nextWorkId())
+                    && next.basis() >= work.completedTick && !consumed.containsKey(next.id());
+                // The host normally removes the completed mailbox before publishing its successor.
+                if (!continuePersonal && !sameMailbox && (mailbox.present || !finished)) releasePersonalCraft(true);
+            }
+        }
         // A mutable echo cannot expand or interrupt the already accepted, immutable permission.
         if (work != null && next != null && work.order.id().equals(next.id())) return;
 
@@ -682,12 +724,14 @@ final class AgentMacroControl {
                 && next.basis() >= work.order.basis();
             boolean compatible = hasActiveWorkOrder() && samePolicy;
             if (next.policy() == null) {
+                if (continuePersonal) releasePersonalCraft(true);
                 markConsumed(next.id());
                 receipt(next.id(), next.life(), "refused", "The work order contains an unsupported target or effect.");
             } else if (next.life() != life || !compatible && next.epoch() != epoch || next.basis() > tick
                     || tick - next.basis() >= MAX_WORK_ADMISSION_AGE || tick >= next.expires()
                     || next.safetyRevision() != safetyRevision || basis == null || basis.epoch != next.epoch()
                     || next.policy().target().goal() != null && !next.policy().target().goal().equals(goal)) {
+                if (continuePersonal) releasePersonalCraft(true);
                 markConsumed(next.id());
                 receipt(next.id(), next.life(), "refused", "The work basis, preset goal, or safety premise changed.");
             } else if (hazardClear && (action == null || action.durable)) {
@@ -702,16 +746,36 @@ final class AgentMacroControl {
                         interrupt("The host replaced the current work policy.", true);
                         retireWork("needs_replan", "interrupted", "The host replaced the current work policy.");
                     }
-                    work = new WorkSession(next, samePolicy ? work.budget : new AgentWorkOrder.Budget(next.policy()), deadline);
-                    work.sweepStart = player.getYaw();
+                    work = new WorkSession(next, samePolicy ? work.budget : new AgentWorkOrder.Budget(next.policy()),
+                        samePolicy ? work.sourceSearch : new SourceSearch(), deadline);
                     Item goalStock = goalStock(next.policy().target());
                     work.startingStock = goalStock == null ? 0 : count(goalStock);
                 }
+                if (continuePersonal) personalCraft = new PersonalCraft(next, personalCraft.untilTick,
+                    personalCraft.untilNanos, personalCraft.tableInReach);
                 markConsumed(next.id());
                 receipt(next.id(), life, "accepted", work.detail);
                 return;
             }
         }
+    }
+
+    private boolean personalCraftCurrent() {
+        return personalCraft.order == work.order && work.order.life() == life && tick < work.order.expires()
+            && now < work.deadline && tick < personalCraft.untilTick && now < personalCraft.untilNanos
+            && hazardClear && work.order.safetyRevision() == safetyRevision && grounded()
+            && body.keysNeutral() && shown == client.currentScreen && hands.workInventoryReady();
+    }
+
+    private boolean confirmsWorkStock() {
+        var target = work.order.policy().target();
+        Item desired = goalStock(target);
+        return desired != null && count(desired) >= goalAmount(target) && missingWorkFloor() == null;
+    }
+
+    private void releasePersonalCraft(boolean close) {
+        personalCraft = null;
+        if (hands != null) hands.releaseWorkInventory(close);
     }
 
     private void retireWork(String phase, String result, String detail) {
@@ -740,21 +804,30 @@ final class AgentMacroControl {
             runWorkStep(progress);
             return;
         }
-        if (!hazardClear || !grounded() || !client.isWindowFocused() || client.getOverlay() != null
-                || client.currentScreen != null || !cursorClear() || !body.hasRecentView() || hands.busy()) {
+        boolean personal = personalCraft != null;
+        if (!personal && (!hazardClear || !grounded() || !client.isWindowFocused() || client.getOverlay() != null
+                || client.currentScreen != null || !cursorClear() || !body.hasRecentView() || hands.busy())) {
             enact("hold", "Waiting for safe footing, a rendered view, and neutral controls.");
             return;
         }
+        var sourceSearch = work.sourceSearch;
+        if (!personal && body.renderedFrame() <= sourceSearch.freshAfter) {
+            enact("search", "Waiting for a fresh first-person view after the physical source probe.");
+            return;
+        }
+        sourceSearch.checked = false;
         var target = work.order.policy().target();
         Item goalStock = goalStock(target);
         boolean goalReached = goalStock != null && count(goalStock) >= goalAmount(target);
         var missingFloor = missingWorkFloor();
         if (goalReached && missingFloor == null) {
+            if (work.order.nextWorkId() == null) releasePersonalCraft(true);
+            work.completedTick = tick;
             retireWork("complete", "completed", "The native inventory confirms the requested outcome and declared reserves.");
             holdWork();
             return;
         }
-        if (work.lastHarvest != null && tick - work.lastHarvestTick <= 15) {
+        if (!personal && work.lastHarvest != null && tick - work.lastHarvestTick <= 15) {
             Item expected = work.lastHarvestItem;
             if (workPickup(stack -> stack.isOf(expected))) {
                 work.lastHarvest = null;
@@ -770,12 +843,13 @@ final class AgentMacroControl {
             }
         }
         work.lastHarvest = null;
-        BlockHitResult tableHit = body.find(state -> state.isOf(Blocks.CRAFTING_TABLE), reach()).orElse(null);
+        BlockHitResult tableHit = personal ? null : body.find(state -> state.isOf(Blocks.CRAFTING_TABLE), reach()).orElse(null);
         if (target.item() != null) {
             Item desired = goalReached ? missingFloor.getKey() : target.item();
             int required = goalReached || missingFloor != null && missingFloor.getKey() == desired
                 ? Math.max(goalReached ? 0 : target.count(), missingFloor.getValue()) : target.count();
             if (workTowardStock(desired, required - count(desired), tableHit, progress)) runWorkStep(progress);
+            else if (personal) releasePersonalCraft(true);
             else searchWork(goalReached ? "The target is present, but no permitted witnessed source can fill the outstanding "
                 + Registries.ITEM.getId(desired) + " reserve."
                 : "No witnessed drop, harvest face, or reserve-safe recipe can advance the requested stock.");
@@ -784,11 +858,15 @@ final class AgentMacroControl {
         if (goalReached) {
             if (workTowardStock(missingFloor.getKey(), missingFloor.getValue() - count(missingFloor.getKey()), tableHit, progress))
                 runWorkStep(progress);
+            else if (personal) releasePersonalCraft(true);
             else searchWork("The preset result is present, but a declared reserve is not yet fulfilled.");
             return;
         }
-        var stage = progress.macroPresetStage(work.budget, tableHit != null);
-        if (stage.blocked() != null) {
+        var stage = progress.macroPresetStage(work.budget, personal ? personalCraft.tableInReach : tableHit != null);
+        if (personal) {
+            if (stage.recipe() != null && startWorkRecipe(stage.recipe(), stage.executions(), null)) runWorkStep(progress);
+            else releasePersonalCraft(true);
+        } else if (stage.blocked() != null) {
             retireWork("blocked", "interrupted", stage.blocked());
             holdWork();
         } else if (stage.recipe() != null) {
@@ -802,7 +880,7 @@ final class AgentMacroControl {
     }
 
     private boolean workTowardStock(Item desired, int quantity, BlockHitResult tableHit, AgentProgress progress) {
-        if (workPickup(stack -> stack.isOf(desired))) return true;
+        if (personalCraft == null && workPickup(stack -> stack.isOf(desired))) return true;
         if (work.budget.policy.preset()) {
             String recipe = Registries.ITEM.getId(desired).getPath();
             if (AgentHands.workOutput(recipe) == desired
@@ -818,7 +896,7 @@ final class AgentMacroControl {
             if (AgentHands.workOutput(recipe) == desired
                     && startStockRecipe(recipe, quantity, tableHit, progress, new HashSet<>(4))) return true;
         }
-        return workGather(progress, state -> AgentWorkOrder.harvest(state) == desired);
+        return personalCraft == null && workGather(progress, state -> AgentWorkOrder.harvest(state) == desired);
     }
 
     private boolean startStockRecipe(String recipe, int quantity, BlockHitResult bench, AgentProgress progress,
@@ -832,7 +910,7 @@ final class AgentMacroControl {
             var need = hands.workNeed(recipe, work.budget);
             if (need == null) return false;
             Predicate<ItemStack> matches = stack -> work.budget.remainingCost(stack.getItem()) > 0 && need.matches(stack);
-            if (workPickup(matches)) return true;
+            if (personalCraft == null && workPickup(matches)) return true;
             for (String effect : work.budget.policy.effects()) {
                 if (!effect.startsWith("craft:")) continue;
                 String supply = effect.substring("craft:".length());
@@ -849,7 +927,7 @@ final class AgentMacroControl {
                             && startStockRecipe(supply, need.count(), bench, progress, visiting)) return true;
                 }
             }
-            return workGather(progress, state -> {
+            return personalCraft == null && workGather(progress, state -> {
                 Item harvest = AgentWorkOrder.harvest(state);
                 return harvest != Items.AIR && matches.test(new ItemStack(harvest));
             });
@@ -909,44 +987,204 @@ final class AgentMacroControl {
     }
 
     private boolean workGather(AgentProgress progress, Predicate<BlockState> matches) {
-        if (!work.budget.canBreak()) return false;
-        var found = body.find(state -> matches.test(state) && work.budget.policy.breakAllowed(state), INSPECT_REACH,
-            hit -> !work.rejected.contains(hit.getBlockPos())
-                && workResourceSafe(hit.getBlockPos(), client.world.getBlockState(hit.getBlockPos()), progress)
-                && workToolSlot(hit.getBlockPos(), client.world.getBlockState(hit.getBlockPos())) >= 0).orElse(null);
-        if (found == null) return false;
-        Face face = face(found);
-        BlockPos pos = found.getBlockPos();
-        Item item = AgentWorkOrder.harvest(face.state);
-        if (!visibleFace(face)) {
-            if (horizontalSquared(player.getPos(), Vec3d.ofCenter(pos)) < 1.0) {
+        if (!work.budget.canBreak() || client.options.attackKey.isUnbound()) return false;
+        Predicate<BlockState> wanted = state -> matches.test(state) && work.budget.policy.breakAllowed(state);
+        Predicate<BlockHitResult> eligible = hit -> {
+            BlockPos pos = hit.getBlockPos();
+            if (work.rejected.contains(pos)) return false;
+            BlockState state = world.getBlockState(pos);
+            return workResourceSafe(pos, state, progress) && workToolSlot(pos, state) >= 0;
+        };
+        double reach = reach();
+        var found = body.find(wanted, reach, hit -> eligible.test(hit) && body.macroMineWitness(hit, reach) != null).orElse(null);
+        if (found != null) {
+            Face face = face(found);
+            return startWorkBreak(face, AgentWorkOrder.harvest(face.state), false);
+        }
+        found = body.find(wanted, INSPECT_REACH, eligible).orElse(null);
+        if (found != null) {
+            BlockPos pos = found.getBlockPos();
+            if (horizontalSquared(player.getPos(), Vec3d.ofCenter(pos)) <= 1.35 * 1.35) {
                 work.rejected.add(pos);
-                return false;
+                return true; // Check a different admitted face on the next view.
             }
+            Face face = face(found);
             startWorkStep(Verb.WORK_WALK, "Approach witnessed " + blockName(face), face, null, null, null);
             action.destination = Vec3d.ofBottomCenter(pos);
             action.distanceLeft = horizontalSquared(player.getPos(), action.destination);
             return true;
         }
-        int tool = workToolSlot(pos, face.state);
+        return prospectForSource(progress, wanted);
+    }
+
+    private boolean startWorkBreak(Face face, Item item, boolean cover) {
+        int tool = workToolSlot(face.hit.getBlockPos(), face.state);
+        if (tool < 0) return false;
         if (tool != player.getInventory().selectedSlot) {
-            int slot = tool;
             startWorkStep(Verb.WORK_EQUIP, "Equip a suitable tool for " + blockName(face), face, null, null, null);
-            action.workSlot = slot;
+            action.workSlot = tool;
             return true;
         }
-        startWorkStep(Verb.BREAK, "Harvest witnessed " + blockName(face), face, null, null, null);
+        startWorkStep(Verb.BREAK, (cover ? "Open a shallow window through witnessed " : "Harvest witnessed ")
+            + blockName(face), face, null, null, null);
         action.tracked = item;
+        action.prospectCover = cover;
         return true;
     }
 
     private boolean workResourceSafe(BlockPos pos, BlockState block, AgentProgress progress) {
-        if (!progress.macroCanBreak(pos) || pos.getY() < player.getBlockY() || !block.getFluidState().isEmpty()
-                || client.world.getBlockState(pos.up()).getBlock() instanceof FallingBlock
-                || !roomFor(new ItemStack(AgentWorkOrder.harvest(block)))) return false;
+        return pos.getY() >= player.getBlockY() && dryWorkBreakSafe(pos, block, AgentWorkOrder.harvest(block), progress);
+    }
+
+    private boolean dryWorkBreakSafe(BlockPos pos, BlockState block, Item drop, AgentProgress progress) {
+        BlockState above = world.getBlockState(pos.up());
+        if (!progress.macroCanBreak(pos) || !block.getFluidState().isEmpty()
+                || above.getBlock() instanceof FallingBlock || station(above) || !roomFor(new ItemStack(drop))) return false;
         for (Direction side : Direction.values())
             if (!client.world.getBlockState(pos.offset(side)).getFluidState().isEmpty()) return false;
         return true;
+    }
+
+    private boolean prospectForSource(AgentProgress progress, Predicate<BlockState> wanted) {
+        BlockPos foot = player.getBlockPos();
+        boolean availableSource = false;
+        for (BlockState source : EARLY_SOURCES) {
+            if (wanted.test(source) && workToolSlot(foot, source) >= 0
+                    && roomFor(new ItemStack(AgentWorkOrder.harvest(source)))) {
+                availableSource = true;
+                break;
+            }
+        }
+        if (!availableSource) return false;
+        var search = work.sourceSearch;
+        search.checked = true;
+        if (!dryProspectStance(foot)) return false;
+        if (!settled()) {
+            status = "Settling on dry footing before checking for a source";
+            enact("search", status);
+            return true;
+        }
+        if (search.firstCover == null) {
+            if (search.arrived && startProspectCover(foot, progress, wanted, search, true)) return true;
+            if (search.steps < MAX_SOURCE_FOOTHOLDS && startSourceFoothold(foot, search)) return true;
+            // One near-ground view per stance. Only a visible approach cue can
+            // change the bearing; there is no sweep through unseen sectors.
+            if (!foot.equals(search.lookedFrom)) {
+                search.lookedFrom = foot;
+                search.viewUntil = tick + 18;
+                search.viewYaw = sourceFootingYaw(foot);
+            }
+            if (tick < search.viewUntil && angle(player.getYaw(), player.getPitch(), search.viewYaw, 48) >= 6
+                    && !body.renderedDirection(search.viewYaw, 48, 5)) {
+                body.turnFine(search.viewYaw, 48);
+                status = "Checking near footing beside witnessed ground for a source route";
+                enact("search", status);
+                return true;
+            }
+        }
+        return startProspectCover(foot, progress, wanted, search, false);
+    }
+
+    private boolean startProspectCover(BlockPos foot, AgentProgress progress, Predicate<BlockState> wanted,
+                                       SourceSearch search, boolean sideOnly) {
+        if (search.coverCuts >= MAX_COVER_CUTS || !work.budget.canCutCover()) return false;
+        // Read only actual exposed hits. No query for an expected block behind the cover.
+        var cover = body.find(state -> work.budget.policy.prospectCoverAllowed(state) && !wanted.test(state), reach(),
+            hit -> {
+                if (sideOnly && !hit.getSide().getAxis().isHorizontal()) return false;
+                BlockPos cell = hit.getBlockPos();
+                BlockState state = world.getBlockState(cell);
+                return !work.rejected.contains(cell) && prospectCutGeometry(foot, hit, search)
+                    && dryWorkBreakSafe(cell, state, AgentWorkOrder.prospectCoverDrop(state), progress)
+                    && workToolSlot(cell, state) >= 0 && body.macroMineWitness(hit, reach()) != null;
+            }).orElse(null);
+        if (cover == null) return false;
+        Face face = face(cover);
+        return startWorkBreak(face, AgentWorkOrder.prospectCoverDrop(face.state), true);
+    }
+
+    private boolean startSourceFoothold(BlockPos foot, SourceSearch search) {
+        if (client.options.forwardKey.isUnbound()) return false;
+        search.footholds.add(foot.down());
+        // An exposed bank takes precedence over unchanged flat ground on the current bearing.
+        BlockHitResult bank = body.find(state -> AgentWorkOrder.prospectCoverDrop(state) != Items.AIR, 8,
+            hit -> hit.getSide().getAxis().isHorizontal() && hit.getBlockPos().getY() >= foot.getY()).orElse(null);
+        float yaw = player.getYaw();
+        if (bank != null) {
+            Vec3d delta = bank.getPos().subtract(player.getPos());
+            yaw = heading(delta.x, delta.z);
+        }
+        Floor best = null;
+        float bestTurn = Float.POSITIVE_INFINITY;
+        for (Direction direction : CARDINAL) {
+            BlockPos floor = foot.down().offset(direction);
+            if (search.footholds.contains(floor) || body.macroFloor(floor) == null) continue;
+            Vec3d landing = Vec3d.ofBottomCenter(floor.up());
+            BlockState support = world.getBlockState(floor);
+            if (support.getBlock() instanceof FallingBlock || !body.macroFlatLane(floor, support, landing)
+                    || !body.macroNoVisiblePickup(landing)) continue;
+            float turn = Math.abs(MathHelper.wrapDegrees(direction.getPositiveHorizontalDegrees() - yaw));
+            if (turn >= bestTurn) continue;
+            best = new Floor(floor, support, landing);
+            bestTurn = turn;
+        }
+        if (best == null) return false;
+        search.footholds.add(best.pos);
+        ++search.steps;
+        String label = "Walk to a distinct witnessed dry foothold for source evidence";
+        Offer approach = new Offer(null, new Key(Verb.APPROACH, best.pos, 0, null), label, "", 0, 0,
+            best, null, null, null, null);
+        action = new Action(null, approach, client, tick, now, body.renderedFrame(), 0, NO_ANCHORS, 42);
+        action.durable = true;
+        status = work.detail = label;
+        enact("route", label);
+        return true;
+    }
+
+    private float sourceFootingYaw(BlockPos foot) {
+        Vec3d feet = player.getPos();
+        float yaw = player.getYaw();
+        BlockHitResult cue = body.find(state -> AgentWorkOrder.prospectCoverDrop(state) != Items.AIR, 4.5,
+            hit -> {
+                if (hit.getSide() != Direction.UP || hit.getBlockPos().getY() != foot.getY() - 1
+                        || hit.getBlockPos().equals(foot.down())) return false;
+                Vec3d point = hit.getPos();
+                float change = Math.abs(MathHelper.wrapDegrees(heading(point.x - feet.x, point.z - feet.z) - yaw));
+                return change >= 16 && change <= 55;
+            }).orElse(null);
+        return cue == null ? yaw : heading(cue.getPos().x - feet.x, cue.getPos().z - feet.z);
+    }
+
+    private boolean dryProspectStance(BlockPos foot) {
+        BlockPos support = foot.down();
+        BlockState state = world.getBlockState(support);
+        return Math.abs(player.getY() - foot.getY()) <= 0.055 && !player.isTouchingWater()
+            && !(state.getBlock() instanceof FallingBlock) && !state.isOf(Blocks.MAGMA_BLOCK)
+            && state.getFluidState().isEmpty() && Block.isShapeFullCube(state.getCollisionShape(world, support));
+    }
+
+    private boolean prospectCutGeometry(BlockPos foot, BlockHitResult hit, SourceSearch search) {
+        BlockPos cell = hit.getBlockPos();
+        if (search.footholds.contains(cell) || cell.equals(foot.down())
+                || player.getBoundingBox().expand(0.14, 0, 0.14).intersects(new Box(cell.getX(), foot.getY(),
+                    cell.getZ(), cell.getX() + 1, foot.getY() + 2, cell.getZ() + 1))) return false;
+        return prospectBearing(foot, cell, hit.getSide(), search.cutFrom, search.firstCover, search.cutBearing) != null;
+    }
+
+    /** An exposed lateral face, or one adjacent cap followed only sideways at the same height. */
+    static Direction prospectBearing(BlockPos foot, BlockPos cell, Direction side,
+                                     BlockPos cutFrom, BlockPos firstCover, Direction bearing) {
+        if (firstCover != null)
+            return bearing != null && foot.equals(cutFrom) && cell.equals(firstCover.offset(bearing)) && side == bearing.getOpposite()
+                ? bearing : null;
+        if (cell.getY() == foot.getY() && side.getAxis().isHorizontal()) {
+            Direction into = side.getOpposite();
+            if (cell.equals(foot.offset(into)) || cell.equals(foot.offset(into, 2))) return into;
+        }
+        if (side == Direction.UP && cell.getY() == foot.getY() - 1) {
+            for (Direction into : CARDINAL) if (cell.equals(foot.down().offset(into))) return into;
+        }
+        return null;
     }
 
     private int workToolSlot(BlockPos pos, BlockState block) {
@@ -981,6 +1219,7 @@ final class AgentMacroControl {
     private boolean startWorkRecipe(String key, int executions, BlockHitResult bench) {
         Face face = null;
         if (AgentHands.workTableRecipe(key)) {
+            if (personalCraft != null) return false;
             if (bench == null) return findWorkTable(key);
             face = face(bench);
         }
@@ -988,6 +1227,7 @@ final class AgentMacroControl {
         startWorkStep(Verb.CONTINUE, "Craft " + key + " within the work budget", face, null, null,
             new Recipe(key, null, null, 0, 0));
         action.executions = executions;
+        action.tableInReach = personalCraft != null ? personalCraft.tableInReach : bench != null;
         return true;
     }
 
@@ -1016,27 +1256,23 @@ final class AgentMacroControl {
     }
 
     private void searchWork(String reason) {
-        // One local discovery sweep is a bounded prerequisite, never evidence of work itself.
-        if (work.sweep >= 6) {
-            retireWork("blocked", "interrupted", reason);
-            holdWork();
-            return;
-        }
-        float yaw = work.sweepStart + 60 * (work.sweep + 1);
-        float pitch = work.sweep == 5 ? 34 : 13;
-        if (body.renderedDirection(yaw, pitch, 6) || work.sweepWait >= 26) {
-            ++work.sweep;
-            work.sweepWait = 0;
-        } else {
-            body.turnScan(yaw, pitch);
-            ++work.sweepWait;
-        }
-        status = "Checking one local view for an authorized source";
-        enact("search", reason);
+        if (work.sourceSearch.checked) reason = "Bounded surface search found no new actionable source. " + reason;
+        retireWork("blocked", "interrupted", reason);
+        holdWork();
     }
 
     private void runWorkStep(AgentProgress progress) {
+        if (action == null) return; // The source search may instead be settling or preparing a rendered view.
         Verb verb = action.offer.key.verb;
+        if (personalCraft != null) {
+            // This is the only exit from a retained personal inventory into another action.
+            if (verb != Verb.CONTINUE || action.offer.face != null) {
+                interrupt("The retained personal crafting screen is no longer available.", true);
+                return;
+            }
+            action.opened = client.currentScreen;
+            personalCraft = null; // The new Hands job takes over this exact screen below.
+        }
         status = action.offer.summary;
         if (tick - action.started > verb.maxTicks) {
             interrupt(timeoutDetail(), true);
@@ -1516,8 +1752,16 @@ final class AgentMacroControl {
             if (action.durable) {
                 ItemStack hand = player.getMainHandStack();
                 int loss = AgentMiningStock.maxLoss(hand, face.state, world, target);
-                mayBreak = work.budget.canBreak() && work.budget.policy.breakAllowed(face.state)
-                    && workResourceSafe(target, face.state, progress)
+                if (action.prospectCover) {
+                    BlockPos foot = player.getBlockPos();
+                    mayBreak = work.budget.canCutCover() && work.budget.policy.prospectCoverAllowed(face.state)
+                        && dryProspectStance(foot) && settled() && prospectCutGeometry(foot, face.hit, work.sourceSearch)
+                        && dryWorkBreakSafe(target, face.state, action.tracked, progress);
+                } else {
+                    mayBreak = work.budget.canBreak() && work.budget.policy.breakAllowed(face.state)
+                        && workResourceSafe(target, face.state, progress);
+                }
+                mayBreak = mayBreak && !client.options.attackKey.isUnbound()
                     && (!face.state.isToolRequired() || hand.isSuitableFor(face.state)) && loss >= 0 && workLootCompatible(hand, face.state)
                     && (loss == 0 || work.budget.limit(hand.getItem(), count(hand.getItem())) >= loss);
                 action.handLoss = loss;
@@ -1527,12 +1771,13 @@ final class AgentMacroControl {
         }
         if (action.broken) {
             continuityWork = AgentPauseEpisodes.Work.NOVELTY;
-            if (action.durable) {
+            if (action.durable && !action.prospectCover) {
                 work.lastHarvest = target;
                 work.lastHarvestItem = action.tracked;
                 work.lastHarvestTick = tick;
             }
-            complete("Vanilla reported this player's break of the witnessed " + blockName(face) + ".");
+            complete("Vanilla reported this player's break of the witnessed " + blockName(face)
+                + (action.prospectCover ? " cover. No source or pickup is confirmed by this cut." : "."));
         } else if (!mayBreak
                 || !ItemStack.areItemsAndComponentsEqual(action.harvestTool, client.player.getMainHandStack())) {
             interrupt("The selected harvest tool or protected footing changed.", true);
@@ -1627,8 +1872,16 @@ final class AgentMacroControl {
                 return;
             }
             var result = hands.lastCraftReceipt();
+            boolean personal = action.durable && hands.holdsWorkInventory();
             if (result != null && result.sequence() > action.priorCraftReceipt
-                    && result.recipe().equals(offer.recipe.id) && result.items() > 0 && client.currentScreen == null) {
+                    && result.recipe().equals(offer.recipe.id) && result.items() > 0
+                    && (client.currentScreen == null || personal)) {
+                if (personal) {
+                    if (shown == client.currentScreen && hands.workInventoryReady())
+                        personalCraft = new PersonalCraft(work.order, tick + PERSONAL_HANDOFF_TICKS,
+                            now + PERSONAL_HANDOFF_NS, action.tableInReach);
+                    else releasePersonalCraft(true);
+                }
                 if (action.durable) work.confirmedCrafts += result.executions();
                 continuityWork = AgentPauseEpisodes.Work.GUI;
                 complete("Vanilla crafting confirmed " + result.items() + " output from " + offer.recipe.id + ".");
@@ -1691,6 +1944,15 @@ final class AgentMacroControl {
             if (action.durable) {
                 ++work.confirmedBreaks;
                 work.budget.broken(action.harvestTool.getItem(), action.handLoss);
+                if (action.prospectCover) {
+                    var search = work.sourceSearch;
+                    if (search.firstCover == null) {
+                        search.cutFrom = player.getBlockPos();
+                        search.cutBearing = prospectBearing(search.cutFrom, pos, action.offer.face.hit.getSide(), null, null, null);
+                        search.firstCover = pos.toImmutable();
+                    }
+                    ++search.coverCuts;
+                }
             }
         }
     }
@@ -1726,7 +1988,7 @@ final class AgentMacroControl {
                 ++safetyRevision;
                 publish(null);
             }
-            if (action != null) interrupt(safety, true);
+            interrupt(safety, true);
             retireWork("needs_replan", "interrupted", "The host revoked macro authority.");
             if (activated && ipc.markerRevoked && !revocationAcknowledged && visited && owned && available()) {
                 JsonObject revoked = header(run);
@@ -1746,7 +2008,8 @@ final class AgentMacroControl {
         }
         if (action != null && (action.offer.key.verb == Verb.APPROACH || action.offer.key.verb == Verb.COLLECT
                 || action.offer.key.verb == Verb.FOLLOW || action.offer.key.verb == Verb.WORK_WALK))
-            action.drove = client.options.forwardKey.isPressed() || !action.durable && action.drove;
+            action.drove = client.options.forwardKey.isPressed()
+                || action.drove && (!action.durable || action.offer.key.verb == Verb.APPROACH);
         if (action != null && action.offer.key.verb == Verb.BREAK && (action.durable || owner.equals("terra")))
             action.fired |= client.options.attackKey.isPressed();
         float crack = advancingCrack();
@@ -1758,7 +2021,8 @@ final class AgentMacroControl {
         rawWorking = continuityWork != null;
         if (rawWorking && action != null && action.durable && tick - lastPurposefulTick >= 10)
             purposeful("work " + action.offer.key.verb.id + ": " + continuityWork.name());
-        boolean due = tick - lastObservation >= OBSERVATION_INTERVAL || lastObservation == 0;
+        boolean due = tick - lastObservation >= OBSERVATION_INTERVAL || lastObservation == 0
+            || personalCraft != null && work.completedTick == tick;
         updateScope(due);
         // Ordinary local work may continue on the very next tick. Only an observed
         // promotion barrier (or an isolated trial) advertises a held neutral window.
@@ -1814,7 +2078,9 @@ final class AgentMacroControl {
             && client.player.currentScreenHandler.getCursorStack().isEmpty();
     }
 
-    boolean neutral() { return body != null && body.keysNeutral() && !hands.busy() && action == null; }
+    boolean neutral() {
+        return body != null && body.keysNeutral() && !hands.busy() && !hands.holdsWorkInventory() && action == null;
+    }
     boolean hazardClear() { return hazardClear; }
 
     private boolean available() {
@@ -2269,10 +2535,12 @@ final class AgentMacroControl {
     private void complete(String detail) { finish("completed", detail); }
 
     private void interrupt(String detail, boolean closeOwned) {
+        boolean retained = hands != null && hands.holdsWorkInventory();
+        releasePersonalCraft(closeOwned);
         if (action == null) return;
         if (closeOwned) {
             if (action.craftJob != 0 && action.craftJob == hands.jobGeneration() && hands.busy()) hands.cancel();
-            else if (action.opened != null && action.opened == client.currentScreen && cursorClear()) action.opened.close();
+            else if (!retained && action.opened != null && action.opened == client.currentScreen && cursorClear()) action.opened.close();
         }
         finish("interrupted", detail);
     }
@@ -2305,14 +2573,15 @@ final class AgentMacroControl {
                 if (action.offer.key.verb == Verb.CONTINUE)
                     retireWork("needs_replan", "interrupted", detail);
             } else if (result.equals("completed")) {
+                if (action.offer.key.verb == Verb.APPROACH) work.sourceSearch.arrived = true;
+                if (action.offer.key.verb == Verb.APPROACH || action.prospectCover)
+                    work.sourceSearch.freshAfter = body.renderedFrame();
                 if (action.offer.key.verb == Verb.BREAK || action.offer.key.verb == Verb.CONTINUE
                         || action.offer.key.verb == Verb.WORK_PLACE || action.offer.drop != null) {
                     work.lastEffect = detail;
                     work.lastEffectTick = tick;
                 }
                 enact("hold", detail);
-                work.sweep = work.sweepWait = 0;
-                work.sweepStart = player.getYaw();
             }
         } else if (action.intent == null) {
             remember("local_motion " + result + ": " + detail);

@@ -198,6 +198,29 @@ final class AgentHands {
         return job != null;
     }
 
+    boolean holdsWorkInventory() {
+        return job == null && screen instanceof InventoryScreen;
+    }
+
+    boolean workInventoryReady() {
+        return holdsWorkInventory() && ownsScreen() && cleanPersonalScreen() && stableCraftFooting()
+            && pointerAvailable() && !Screen.hasShiftDown() && !physicalButtonDown(c.getWindow());
+    }
+
+    private boolean cleanPersonalScreen() {
+        return screen instanceof InventoryScreen && cleanGrid(screen)
+            && !((AgentHandledScreenAccess) screen).agent$cursorDragging();
+    }
+
+    void releaseWorkInventory(boolean close) {
+        if (!holdsWorkInventory()) return;
+        if (close && ownsScreen() && cleanPersonalScreen() && !physicalButtonDown(c.getWindow())) screen.close();
+        screen = null;
+        player = null;
+        handoffAt = 0;
+        lastLeftSlot = null;
+    }
+
     long jobGeneration() { return jobGeneration; }
     long workEvidence() { return workEvidence; }
 
@@ -341,12 +364,13 @@ final class AgentHands {
     }
 
     private boolean craftBatch(List<String> recipes, AgentWorkOrder.Budget budget) {
-        if (busy() || !stableCraftFooting()) return false;
+        boolean retained = holdsWorkInventory();
+        if (busy() || (retained ? budget == null || !workInventoryReady() : !stableCraftFooting())) return false;
         if (recipes.isEmpty()) return report("craft", "no recipes");
         var current = c.currentScreen;
         if (current != null && !(current instanceof InventoryScreen || current instanceof CraftingScreen))
             return report("craft", "incompatible screen");
-        if (current instanceof HandledScreen<?> handled && !cleanGrid(handled))
+        if (!retained && current instanceof HandledScreen<?> handled && !cleanGrid(handled))
             return report("craft", "crafting grid or cursor occupied");
         if (current == null && c.options.inventoryKey.isUnbound())
             return report("craft", "inventory key unbound");
@@ -547,6 +571,7 @@ final class AgentHands {
     }
 
     private boolean queueEquip(PlayerInventory inv, int source, int destination) {
+        if (holdsWorkInventory()) return false;
         if (c.currentScreen != null && !(c.currentScreen instanceof InventoryScreen))
             return report("equip", "incompatible screen");
         var inventory = (InventoryScreen) c.currentScreen;
@@ -567,11 +592,13 @@ final class AgentHands {
 
     void cancel() {
         if (busy()) finish("cancelled");
+        else releaseWorkInventory(true);
     }
 
     void discardLifeInputs() {
         // The server and vanilla own the closing/dropping behavior on death.
         if (busy()) finish("cancelled", false);
+        else releaseWorkInventory(false);
         buttonMotion.reset();
     }
 
@@ -1382,7 +1409,8 @@ final class AgentHands {
         craftStorage = null;
         craftSettleDeadline = 0;
         if (craftBudget != null || craftIndex == crafts.length) {
-            finish("done");
+            finish("done", true, craftBudget != null && screen instanceof InventoryScreen
+                && !((AgentHandledScreenAccess) screen).agent$cursorDragging());
         } else {
             // The next plan must see the actual storage after this recipe, not a projected inventory.
             planned = storeResult = resultStored = false;
@@ -1560,6 +1588,10 @@ final class AgentHands {
     }
 
     private void finish(String reason, boolean closeOwnedScreen) {
+        finish(reason, closeOwnedScreen, false);
+    }
+
+    private void finish(String reason, boolean closeOwnedScreen, boolean retainInventory) {
         if (click != null) {
             Drag drag = click.drag;
             if (drag != null && drag.down) {
@@ -1584,14 +1616,16 @@ final class AgentHands {
             pendingKey = null;
         }
         if (!closeOwnedScreen || job == Job.SMELT && reason.equals("done")) screen = null;
-        else closeScreen();
+        else if (!retainInventory) closeScreen();
         previousFailure = !reason.equals("done") && !reason.equals("cancelled");
         report(label, reason);
         job = null;
-        player = null;
         click = null;
-        handoffAt = 0;
-        lastLeftSlot = null;
+        if (!retainInventory) {
+            player = null;
+            handoffAt = 0;
+            lastLeftSlot = null;
+        }
         crafts = null;
         craftPlan = null;
         craftStorage = null;

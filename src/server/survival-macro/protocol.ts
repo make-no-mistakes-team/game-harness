@@ -444,6 +444,11 @@ function missing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
 }
 
+/** A verified observation inode was displaced before it could be sampled. */
+export class MacroObservationRotating extends Error {
+  constructor() { super("Native macro observation is being replaced."); }
+}
+
 /** Use the opened Linux directory, not a string which can be retargeted during IPC. */
 export class MacroDirectory {
   private constructor(private readonly handle: FileHandle) {}
@@ -473,29 +478,39 @@ export class MacroDirectory {
   }
 
   async read<T>(name: keyof typeof FILE_BYTES, parse: (value: unknown) => T): Promise<T | null> {
-    let file: FileHandle;
-    try {
-      file = await open(this.entry(name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    } catch (error) {
-      if (missing(error)) return null;
-      throw error;
-    }
-    try {
-      const info = await file.stat();
-      const max = FILE_BYTES[name];
-      if (!info.isFile() || info.nlink !== 1 || info.uid !== process.getuid!() || (info.mode & 0o022) !== 0 ||
-          info.size < 1 || info.size > max) throw new Error(`Invalid macro IPC file: ${name}.`);
-      const bytes = Buffer.allocUnsafe(info.size + 1);
-      let length = 0;
-      while (length < bytes.length) {
-        const { bytesRead } = await file.read(bytes, length, bytes.length - length, length);
-        if (bytesRead === 0) break;
-        length += bytesRead;
+    const entry = this.entry(name);
+    for (let retry = 0; ; retry++) {
+      let file: FileHandle;
+      try {
+        file = await open(entry, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      } catch (error) {
+        if (!missing(error)) throw error;
+        if (retry !== 0) throw new MacroObservationRotating();
+        return null;
       }
-      if (length !== info.size) throw new Error(`Macro IPC file changed during read: ${name}.`);
-      return parse(JSON.parse(utf8.decode(bytes.subarray(0, length))));
-    } finally {
-      await file.close();
+      try {
+        const info = await file.stat();
+        if (!info.isFile() || info.uid !== process.getuid!() || (info.mode & 0o022) !== 0 ||
+            info.size < 1 || info.size > FILE_BYTES[name]) throw new Error(`Invalid macro IPC file: ${name}.`);
+        if (name === "observation.json" && info.nlink === 0) {
+          // Native publishes by atomic replacement. A displaced, otherwise
+          // admissible snapshot is not evidence; reopen the pinned path once.
+          if (retry !== 0) throw new MacroObservationRotating();
+          continue;
+        }
+        if (info.nlink !== 1) throw new Error(`Invalid macro IPC file: ${name}.`);
+        const bytes = Buffer.allocUnsafe(info.size + 1);
+        let length = 0;
+        while (length < bytes.length) {
+          const { bytesRead } = await file.read(bytes, length, bytes.length - length, length);
+          if (bytesRead === 0) break;
+          length += bytesRead;
+        }
+        if (length !== info.size) throw new Error(`Macro IPC file changed during read: ${name}.`);
+        return parse(JSON.parse(utf8.decode(bytes.subarray(0, length))));
+      } finally {
+        await file.close();
+      }
     }
   }
 
@@ -585,7 +600,13 @@ async function withMacroDirectory<T>(directory: string, use: (ipc: MacroDirector
 }
 
 export function readMacroObservation(directory: string): Promise<MacroObservation | null> {
-  return withMacroDirectory(directory, ipc => ipc.read("observation.json", parseMacroObservation));
+  return withMacroDirectory(directory, async ipc => {
+    try { return await ipc.read("observation.json", parseMacroObservation); }
+    catch (error) {
+      if (error instanceof MacroObservationRotating) return null;
+      throw error;
+    }
+  });
 }
 
 export function readMacroReceipt(directory: string): Promise<MacroReceipt | null> {

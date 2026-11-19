@@ -4,7 +4,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   MACRO_CAPABILITIES_VERSION, MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
-  MACRO_MAX_PLANNING_IDLE_MS, MacroDirectory, parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
+  MACRO_MAX_PLANNING_IDLE_MS, MacroDirectory, MacroObservationRotating, parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
   parseMacroProposal, parseMacroReceipt, parseMacroRevocation, validateMacroId,
   type MacroBasis, type MacroFeedback, type MacroFrame, type MacroHandoff, type MacroInference, type MacroIntent,
   type MacroObservation, type MacroOpportunity, type MacroPlanning,
@@ -451,7 +451,7 @@ export class SurvivalMacroController {
     if (await ipc.read("revoked.json", parseMacroRevocation)) {
       throw new Error("Native macro authority was unexpectedly revoked.");
     }
-    await this.refresh();
+    const observed = await this.refresh();
     await this.readReceipts();
     if (this.closing) return;
     const [mailbox, barrier, planning] = await Promise.all([
@@ -512,6 +512,10 @@ export class SurvivalMacroController {
       else if (work.cancel.signal.aborted) await this.endPlanning("cancelled");
       else if (!current || !samePlayableScope(work.context.observation, current)) await this.endPlanning("stale_scope");
     }
+    // A displaced observation must not trigger dispatch, promotion, segment
+    // continuation or effect publication from the cached view. Housekeeping
+    // above can still enforce timeouts; retain a settled result for the retry.
+    if (!observed && current && !runtimeExpired) return;
     if (this.busy?.work.result) await this.settle(current, runtimeExpired);
     if (runtimeExpired) {
       if (this.budget !== "wall-time") {
@@ -549,8 +553,13 @@ export class SurvivalMacroController {
     await this.begin(latest);
   }
 
-  private async refresh(): Promise<void> {
-    const observation = await this.ipc!.read("observation.json", parseMacroObservation);
+  private async refresh(): Promise<MacroObservation | undefined> {
+    let observation: MacroObservation | null;
+    try { observation = await this.ipc!.read("observation.json", parseMacroObservation); }
+    catch (error) {
+      if (error instanceof MacroObservationRotating) return;
+      throw error;
+    }
     if (!observation) {
       if (this.view) throw new Error("Native survival macro observation disappeared.");
       return;
@@ -564,7 +573,7 @@ export class SurvivalMacroController {
       }
       if (observation.tick === before.tick && observation.epoch === before.epoch) {
         if (digest(observation) !== digest(before)) throw new Error("Native survival macro changed a previously published tick.");
-        return;
+        return before;
       }
     }
     const evidence = evidenceKey(observation);
@@ -573,6 +582,7 @@ export class SurvivalMacroController {
       observation, evidence, query: this.queryKey(observation, evidence),
       changedAt: this.view?.evidence === evidence ? this.view.changedAt : this.observedAt,
     };
+    return observation;
   }
 
   private queryKey(observation: MacroObservation, evidence: string): string {
@@ -758,7 +768,12 @@ export class SurvivalMacroController {
     signal.throwIfAborted();
     const ipc = this.ipc!;
     const checkScope = async () => {
-      const latest = await ipc.read("observation.json", parseMacroObservation);
+      let latest: MacroObservation | null;
+      try { latest = await ipc.read("observation.json", parseMacroObservation); }
+      catch (error) {
+        if (!(error instanceof MacroObservationRotating)) throw error;
+        latest = null;
+      }
       if (!latest || !scope(latest, observation) || !alive(latest) || latest.tick < observation.tick ||
           performance.now() - observedAt > this.limits.maxObservationAgeMs) {
         throw new FrameRejected("stale", "The observation scope or freshness changed during display capture.");
@@ -1082,8 +1097,8 @@ export class SurvivalMacroController {
     }
     if (ready.kind === "promotion") {
       const { candidate, offer } = ready;
-      await this.refresh();
-      const fresh = this.view!.observation;
+      const fresh = await this.refresh();
+      if (!fresh) return;
       if (!this.isCurrentHandoff(fresh) || !samePlayableScope(current, fresh) || fresh.tick >= plan.proposal.expiresTick ||
           !sameOffer(offer, fresh.opportunities.find(item => item.id === offer.id))) {
         this.ready = undefined;
@@ -1187,9 +1202,11 @@ export class SurvivalMacroController {
   }
 
   private async issue(plan: Plan, witnessed: MacroObservation, opportunityId: string, selection?: Selection): Promise<boolean> {
-    await this.refresh();
-    const view = this.view!;
-    const current = view.observation;
+    const current = await this.refresh();
+    if (!current) {
+      await this.rejectStale(plan, "observation_unavailable_at_handoff");
+      return false;
+    }
     const before = witnessed.opportunities.find(offer => offer.id === opportunityId);
     if (!before) {
       await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "Opportunity was never offered on its basis." });
@@ -1213,9 +1230,8 @@ export class SurvivalMacroController {
       skillHash: selection?.hash ?? null,
     });
     await this.record("intent_prepared", { requestId: plan.requestId, intent, witnessed: before });
-    await this.refresh();
-    const refreshed = this.view!.observation;
-    if (!this.isCurrentHandoff(refreshed) || !samePlayableScope(current, refreshed) || refreshed.tick >= intent.expiresTick ||
+    const refreshed = await this.refresh();
+    if (!refreshed || !this.isCurrentHandoff(refreshed) || !samePlayableScope(current, refreshed) || refreshed.tick >= intent.expiresTick ||
         !sameOffer(after, refreshed.opportunities.find(offer => offer.id === opportunityId)) ||
         (selection && (!selection.offer || !this.isSelectedSkill(selection.hash, selection.generation) ||
           !this.config.skills!.matchesSelection(selection.offer, refreshed, selection.continuation?.receipts)))) {

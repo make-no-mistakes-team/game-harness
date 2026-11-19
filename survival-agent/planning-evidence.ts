@@ -48,9 +48,21 @@ export async function finalPlanningEvidence(runDir: string, sample: unknown) {
     const final = await ipc.read("native-planning-final.json", raw => {
       const scope = terminalScope.parse(raw);
       const evidence = planningWaitEvidence(raw);
-      if (!evidence?.measured || scope.run !== path.basename(runDir) ||
-          last?.measured && (scope.tick < last.tick || scope.life < last.life))
+      if (!evidence?.measured || scope.run !== path.basename(runDir))
         throw new Error("Native planning close does not match the attempt.");
+      if (last?.measured && (scope.tick < last.tick || scope.life < last.life)) {
+        // The game can keep ticking after the final authority revocation.
+        // Later inactive ticks do not supersede the seal; new work would.
+        const sameRetiredAuthority = scope.reason === "authority_revoked" && last.state === "inactive" &&
+          evidence.state === "inactive" && scope.life === last.life &&
+          last.lastPurposefulTick === evidence.lastPurposefulTick &&
+          last.markerObservedMonotonicNs === evidence.markerObservedMonotonicNs &&
+          last.longestPendingWithoutWorkMs === evidence.longestPendingWithoutWorkMs &&
+          last.longestPolicyWaitMs === evidence.longestPolicyWaitMs &&
+          last.totalIdleMs === evidence.totalIdleMs && last.blockedEpisodes === evidence.blockedEpisodes &&
+          last.completedLocalActions === evidence.completedLocalActions && last.urgentInterventions === evidence.urgentInterventions;
+        if (!sameRetiredAuthority) throw new Error("Planning continued past the reported native close.");
+      }
       return { ...evidence, source: "native_final" as const, rightCensored: false, epoch: scope.epoch, reason: scope.reason };
     });
     if (final) return final;

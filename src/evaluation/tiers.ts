@@ -79,7 +79,9 @@ export const TEST_TIERS = Object.freeze({
     "tests/survival-macro-skills.test.ts", // Private source selection and static gates; isolated worker smoke is opt-in.
     "tests/survival-macro-controller.test.ts",
     "tests/survival-macro-memory.test.ts",
+    "tests/survival-macro-protocol.test.ts",
     "tests/survival-native-gap-review.test.ts",
+    "tests/survival-agent-planning-evidence.test.ts",
     "tests/survival-agent-lives.test.ts",
     "tests/survival-agent-verify.test.ts",
     "tests/resident-runtime.test.ts", // Real Store/SkillManager/ResidentController admission; controlled worker/native boundaries.

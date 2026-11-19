@@ -18,6 +18,9 @@ import net.minecraft.util.math.Vec3d;
 /** Short ordinary jumps are evidence of a collision, not of a block's identity or location. */
 final class PilotHeadroom {
     private static final double SHORT_RISE = 0.88;
+    private static final double CLIPPED_RISE_MIN = 0.10;
+    private static final double CLIPPED_RISE_MAX = 0.30;
+    private static final double CLIPPED_DRIFT_SQUARED = 0.18 * 0.18;
     private static final double SAME_STANCE_SQUARED = 0.45 * 0.45;
     private static final int REPEAT_TICKS = 46;
     private static final int GLANCE_TICKS = 24;
@@ -32,7 +35,7 @@ final class PilotHeadroom {
     private int launchTick, lastShortTick, blockedTick, cutTick;
     private double peak, risingVelocity;
     private BlockPos cut;
-    private boolean surveying, attacked, broken;
+    private boolean surveying, checkingFirstClip, attacked, broken;
     private Report report = new Report(0, 0, 0, "");
 
     PilotHeadroom(MinecraftClient client, PilotBody body) {
@@ -52,7 +55,7 @@ final class PilotHeadroom {
     private void releaseStance() {
         blockedAt = cutAim = null;
         cut = null;
-        surveying = attacked = broken = false;
+        surveying = checkingFirstClip = attacked = broken = false;
     }
 
     void observe(int now, boolean ready) {
@@ -68,7 +71,8 @@ final class PilotHeadroom {
         double rise = feet.y - launch.y;
         peak = Math.max(peak, rise);
         double velocity = player.getVelocity().y;
-        if (age > 5 || peak >= SHORT_RISE || rise < -0.05 || horizontalSquared(feet, launch) > 0.62 * 0.62) {
+        double drift = horizontalSquared(feet, launch);
+        if (age > 5 || peak >= SHORT_RISE || rise < -0.05 || drift > 0.62 * 0.62) {
             launch = null;
         } else if (player.verticalCollision && !player.isOnGround() && velocity <= 0.04
                 && (age == 1 || risingVelocity > 0.04)) {
@@ -78,7 +82,13 @@ final class PilotHeadroom {
             String height = Math.round(peak * 100) + " cm";
             report = new Report(report.shortJumps + 1, report.cleared, report.bypasses,
                 "headroom: short upward collision at " + height);
-            if (repeated) start(now, launch, launchYaw, "checking the ceiling after repeated short jumps (" + height + ")");
+            if (repeated) {
+                start(now, launch, launchYaw, false, "checking the ceiling after repeated short jumps (" + height + ")");
+            } else if (rise >= CLIPPED_RISE_MIN && peak <= CLIPPED_RISE_MAX && drift <= CLIPPED_DRIFT_SQUARED) {
+                // Positive, sharply clipped upward travel at the launch stance warrants a look,
+                // not an assumption about what stopped the jump.
+                start(now, launch, launchYaw, true, "checking the ceiling after a clipped upward jump (" + height + ")");
+            }
             lastShort = launch;
             lastShortYaw = launchYaw;
             lastShortTick = now;
@@ -96,7 +106,7 @@ final class PilotHeadroom {
         if (blocked(player, inPlace ? Float.NaN : bearing)) return true;
         BlockHitResult visible = ceiling(player, bearing, false);
         if (visible != null) {
-            start(now, player.getPos(), bearing, "checking a visible obstruction in the jump path");
+            start(now, player.getPos(), bearing, false, "checking a visible obstruction in the jump path");
             select(visible, now);
             return true;
         }
@@ -112,11 +122,12 @@ final class PilotHeadroom {
             && (Float.isNaN(bearing) || bearingMatches(bearing, blockedYaw));
     }
 
-    private void start(int now, Vec3d feet, float bearing, String why) {
+    private void start(int now, Vec3d feet, float bearing, boolean firstClip, String why) {
         blockedAt = feet;
         blockedYaw = bearing;
         blockedTick = now;
         surveying = true;
+        checkingFirstClip = firstClip;
         note(why);
     }
 
@@ -127,11 +138,18 @@ final class PilotHeadroom {
             releaseStance();
             return false;
         }
-        if (!player.isOnGround()) return false;
+        // Keep the interrupted route alive until the clipped jump settles. It would
+        // otherwise interpret the still-blocked takeoff as a failed approach this tick.
+        if (!player.isOnGround()) return true;
         if (body.hazardAhead(blockedYaw, 1.55)) return bypass("known lava near the blocked jump");
         if (cut == null) {
             int elapsed = now - blockedTick;
-            if (elapsed > GLANCE_TICKS) return bypass("no lit ceiling face in the jump path");
+            if (elapsed > GLANCE_TICKS) {
+                if (!checkingFirstClip) return bypass("no lit ceiling face in the jump path");
+                releaseStance();
+                note("headroom: no lit ceiling face after the first clipped jump");
+                return false;
+            }
             BlockHitResult visible = ceiling(player, blockedYaw, true);
             if (visible == null) {
                 body.turn(blockedYaw, elapsed < 9 ? -28 : -64);

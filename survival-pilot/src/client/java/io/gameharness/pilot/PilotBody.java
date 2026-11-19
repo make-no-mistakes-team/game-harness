@@ -4,6 +4,7 @@ import java.util.Optional;
 import java.util.function.Predicate;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
 import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
 import net.minecraft.block.ShapeContext;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
@@ -22,6 +23,7 @@ import net.minecraft.item.BoatItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.util.hit.BlockHitResult;
@@ -36,6 +38,7 @@ import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.util.shape.VoxelShapes;
 import net.minecraft.world.BlockView;
 import net.minecraft.world.RaycastContext;
+import net.minecraft.world.World;
 import org.joml.Matrix4f;
 import org.joml.Vector4f;
 
@@ -51,7 +54,8 @@ final class PilotBody {
     private static final double GAIT_PITCH_SPEED = 48;
     private static final double GAIT_PITCH_ACCELERATION = 200;
     private static final double GAIT_PITCH_TIME = 0.20;
-    private static final float[] ESCAPE_BEARINGS = {0, -45, 45, -90, 90, -135, 135, 180};
+    private static final int FOOTING_AGE = 100;
+    private static final int ESCAPE_TICKS = 44;
 
     private enum Ray {
         SIGHT(RaycastContext.ShapeType.OUTLINE, false),
@@ -85,12 +89,18 @@ final class PilotBody {
     private ClientPlayerEntity hazardPlayer;
     private Vec3d dryFooting;
     private int dryFootingTick;
-    private int lavaContactTick;
-    private Vec3d escapeFrom;
+    private Vec3d previousDryFooting;
+    private int previousDryFootingTick;
+    private boolean lavaEmergency;
+    private int stableDryTicks;
+    private Vec3d escapeLanding;
+    private boolean escapePlanned;
+    private boolean escapeBackward;
+    private float escapeHeading;
     private int escapeSince;
-    private int escapeChoice = -1;
-    private int escapeTried;
-    private float escapeBase;
+    private BlockPos escapeWater;
+    private int escapeWaterTick;
+    private int escapeWaterAttempts;
     private int observedAtTick;
     private Vec3d eye;
     private HitResult renderedCrosshair;
@@ -116,6 +126,7 @@ final class PilotBody {
     private boolean verifiedDescent;
     private Vec3d dryLanding;
     private Vec3d centerLanding;
+    private Vec3d lavaExitWaypoint;
     private boolean jumping;
     private boolean reachJump;
     private boolean routeJumps;
@@ -156,27 +167,36 @@ final class PilotBody {
         if (hazardWorld != client.world || hazardPlayer != client.player) {
             hazards.clear();
             headroom.reset();
-            dryFooting = null;
-            escapeChoice = -1;
+            dryFooting = previousDryFooting = null;
+            lavaEmergency = false;
             hazardWorld = client.world;
             hazardPlayer = client.player;
         }
         boolean available = ready();
-        headroom.observe(tick, available && client.getOverlay() == null);
-        if (!available) return;
-        var player = client.player;
-        if (player.isInLava()) lavaContactTick = tick;
-        if (!lavaEgress(player)) {
-            escapeChoice = -1;
-            if (player.isOnGround() && !player.isTouchingWater()) {
-                Vec3d feet = player.getPos();
-                if (dryFooting == null || feet.squaredDistanceTo(dryFooting) >= 0.36 || tick - dryFootingTick > 20) {
-                    dryFooting = feet;
-                    dryFootingTick = tick;
-                }
-            }
+        if (client.player != null && client.player.isAlive() && client.player.isInLava()) beginLavaEscape();
+        headroom.observe(tick, available && !lavaEmergency && client.getOverlay() == null);
+        if (!available) {
+            stableDryTicks = 0;
+            return;
         }
+        var player = client.player;
         if (hasView()) scanFluids(PilotHazards.SIGHT_RANGE, true, false, false);
+        boolean dry = player.isOnGround() && !player.isInLava() && !player.isTouchingWater()
+            && !player.isOnFire() && !player.hasVehicle() && !hazards.lavaNear(player.getBoundingBox(), 0.12, tick);
+        if (lavaEmergency) {
+            if (dry && escapePlanned && escapeLanding == null && player.getVelocity().horizontalLengthSquared() < 0.0064) {
+                if (++stableDryTicks >= 5) lavaEmergency = false;
+            } else stableDryTicks = 0;
+        }
+        if (!lavaEmergency && dry) {
+            Vec3d feet = player.getPos();
+            if (dryFooting == null || feet.squaredDistanceTo(dryFooting) >= 0.49) {
+                previousDryFooting = dryFooting;
+                previousDryFootingTick = dryFootingTick;
+                dryFooting = feet;
+            }
+            dryFootingTick = tick;
+        }
     }
 
     private void resetIntentions() {
@@ -261,6 +281,10 @@ final class PilotBody {
         var player = client.player;
         var options = client.options;
         if (controlledBoat != null && player.getVehicle() != controlledBoat) controlledBoat = null;
+        if (lavaEmergency) {
+            finishLavaEscape(player);
+            return;
+        }
         boolean advance = forward && (!steering
             || Math.abs(MathHelper.wrapDegrees(goalYaw(player, player.getEyePos()) - player.getYaw())) <= 28);
         boolean retreat = backward;
@@ -270,16 +294,8 @@ final class PilotBody {
             || (advance || retreat) && player.isTouchingWater());
         boolean stepJump = false;
         Ground ground = Ground.CLEAR;
-        boolean escapingLava = lavaEgress(player);
 
-        if (escapingLava) {
-            float heading = lavaEscapeHeading(player);
-            float difference = Math.abs(MathHelper.wrapDegrees(heading - player.getYaw()));
-            advance = difference <= 36;
-            retreat = difference >= 144;
-            turn(retreat ? heading + 180 : heading, 24);
-            jump = player.isInLava();
-        } else if (controlledBoat == null && advance && player.isOnGround() && !player.isTouchingWater()) {
+        if (controlledBoat == null && advance && player.isOnGround() && !player.isTouchingWater()) {
             ground = terrainAhead(player);
             if (ground == Ground.EDGE) {
                 crouch |= !verifiedDescent;
@@ -291,7 +307,7 @@ final class PilotBody {
 
         boolean attack = false;
         boolean use = false;
-        if (!escapingLava && shielding != null && !options.useKey.isUnbound()) {
+        if (shielding != null && !options.useKey.isUnbound()) {
             double dx = shielding.getX() - player.getX();
             double dz = shielding.getZ() - player.getZ();
             boolean facing = dx * dx + dz * dz > 1e-6
@@ -316,7 +332,7 @@ final class PilotBody {
                     }
                 }
             }
-        } else if (!escapingLava && armor != null && !options.useKey.isUnbound()) {
+        } else if (armor != null && !options.useKey.isUnbound()) {
             ItemStack main = player.getMainHandStack();
             var component = main.get(DataComponentTypes.EQUIPPABLE);
             if (main.isOf(armor) && component != null && !player.isUsingItem()) {
@@ -360,9 +376,8 @@ final class PilotBody {
                 attack = hit.getBlockPos().equals(mining);
             }
         }
-        if (escapingLava) crouch = false;
-        boolean sprintRequested = !escapingLava && advance && fast && !crouch && ground == Ground.CLEAR;
-        if (!escapingLava && (advance || retreat)) {
+        boolean sprintRequested = advance && fast && !crouch && ground == Ground.CLEAR;
+        if (advance || retreat) {
             float heading = player.getYaw() + (retreat ? 180 : 0);
             double reach = jump ? 3.2 : sprintRequested || player.isSprinting() ? 2.35 : crouch ? 0.70 : 1.35;
             if (dryLanding != null && advance && !jump && !sprintRequested && !player.isSprinting() && player.isOnGround()) {
@@ -380,7 +395,7 @@ final class PilotBody {
                 advance = retreat = sprintRequested = false;
                 jump = !dive && player.isSubmergedInWater();
             }
-        } else if (!escapingLava && jump && !player.isTouchingWater()) {
+        } else if (jump && !player.isTouchingWater()) {
             Vec3d motion = player.getVelocity();
             double drift = motion.horizontalLengthSquared();
             if (drift > 0.0016
@@ -388,8 +403,8 @@ final class PilotBody {
                         Math.sqrt(drift) * 9, 1.1, false, tick) > 0) jump = false;
         }
         // Vanilla latches sprint when Ctrl is released. Let up on W to brake, then walk again.
-        if (!escapingLava && advance && !sprintRequested && player.isSprinting()) advance = false;
-        boolean centerKeys = centerLanding != null && !escapingLava && controlledBoat == null
+        if (advance && !sprintRequested && player.isSprinting()) advance = false;
+        boolean centerKeys = centerLanding != null && controlledBoat == null
             && player.isOnGround() && !player.isTouchingWater() && player.getVehicle() == null;
         boolean centerLeft = false, centerRight = false;
         if (centerKeys) {
@@ -409,12 +424,12 @@ final class PilotBody {
             }
         }
         if (controlledBoat != null) {
-            boolean dry = !escapingLava && !controlledBoat.isInLava() && !controlledBoat.isTouchingWater();
+            boolean dry = !controlledBoat.isInLava() && !controlledBoat.isTouchingWater();
             advance = dry && rowForward
                 && hazards.lavaRisk(controlledBoat.getBoundingBox(), controlledBoat.getYaw(), 1.6, 0, false, tick) == 0;
             retreat = jump = sprintRequested = attack = use = false;
             // Generic crouch/guard intentions must not eject the pilot from a falling boat.
-            crouch = escapingLava || (dry && boatDismount && controlledBoat.isOnGround());
+            crouch = dry && boatDismount && controlledBoat.isOnGround();
             options.leftKey.setPressed(dry && rowLeft);
             options.rightKey.setPressed(dry && rowRight);
             ownsRowKeys = true;
@@ -426,7 +441,7 @@ final class PilotBody {
             releaseRowKeys();
         }
         // Sample only an input about to reach vanilla, after movement and lava vetoes.
-        if (routeJumps && jump && (advance || reachJump) && !fast && !escapingLava && !crouch
+        if (routeJumps && jump && (advance || reachJump) && !fast && !crouch
                 && !attack && !use && !player.isUsingItem() && !player.isSprinting() && !player.isSneaking()
                 && player.isOnGround() && !player.isTouchingWater() && !player.hasVehicle()
                 && !options.jumpKey.isUnbound() && client.getOverlay() == null) {
@@ -460,46 +475,119 @@ final class PilotBody {
         }
     }
 
-    private boolean lavaEgress(ClientPlayerEntity player) {
-        // Keep the exit bearing through the first jump out, not through a fresh land movement.
-        return player.isInLava() || escapeChoice >= 0 && tick - lavaContactTick <= 12
-            && player.isOnFire() && !player.isOnGround() && !player.isTouchingWater();
+    boolean lavaEmergency() { return lavaEmergency; }
+
+    boolean lavaBreachesDig(BlockPos foot) {
+        if (!ready()) return false;
+        var player = client.player;
+        double dx = foot.getX() + 0.5 - player.getX(), dz = foot.getZ() + 0.5 - player.getZ();
+        return dx * dx + dz * dz < 9 && Math.abs(foot.getY() - player.getY()) < 2
+            && hazards.breachesDig(foot, player.getBlockPos(), tick);
     }
 
-    private float lavaEscapeHeading(ClientPlayerEntity player) {
-        Vec3d feet = player.getPos();
-        if (escapeChoice < 0) {
-            escapeTried = 0;
-            escapeBase = player.getYaw();
-            if (dryFooting != null && tick - dryFootingTick <= 80 && Math.abs(dryFooting.y - feet.y) <= 1.6) {
-                double dx = dryFooting.x - feet.x, dz = dryFooting.z - feet.z;
-                double distance = dx * dx + dz * dz;
-                if (distance > 0.04 && distance <= 36) escapeBase = heading(dx, dz);
+    void beginLavaEscape() {
+        if (lavaEmergency) return;
+        lavaEmergency = true;
+        stableDryTicks = 0;
+        escapeLanding = null;
+        escapePlanned = false;
+        escapeWater = null;
+        escapeWaterAttempts = 0;
+        escapeWaterTick = tick - 8;
+        steering = false;
+    }
+
+    private void finishLavaEscape(ClientPlayerEntity player) {
+        var options = client.options;
+        releaseRowKeys();
+        ownsKeys = true;
+        options.attackKey.setPressed(false);
+        options.useKey.setPressed(false);
+        setSticky(options.sprintKey, false, options.getSprintToggled().getValue());
+        setSticky(options.sneakKey, player.hasVehicle(), options.getSneakToggled().getValue());
+        boolean move = false;
+        boolean jump = false;
+        if (!player.hasVehicle()) {
+            if (!escapePlanned) {
+                if (tick - dryFootingTick <= FOOTING_AGE) preferLavaExit(dryFooting);
+                if (!escapePlanned && tick - previousDryFootingTick <= FOOTING_AGE) preferLavaExit(previousDryFooting);
+                escapePlanned = true;
             }
-        } else {
-            double dx = feet.x - escapeFrom.x, dz = feet.z - escapeFrom.z;
-            if (dx * dx + dz * dz >= 0.12) {
-                escapeFrom = feet;
-                escapeSince = tick;
+            if (escapeLanding != null) {
+                double dx = escapeLanding.x - player.getX(), dz = escapeLanding.z - player.getZ();
+                double distance = Math.hypot(dx, dz), rise = escapeLanding.y - player.getY();
+                float yaw = heading(dx, dz);
+                double bearing = Math.toRadians(escapeHeading);
+                double remaining = -Math.sin(bearing) * dx + Math.cos(bearing) * dz;
+                raysLeft += MOVEMENT_RAYS;
+                sightMovementLane(player, escapeHeading, distance);
+                if (remaining > 0.22 && tick - escapeSince < ESCAPE_TICKS
+                        && hazards.lavaRisk(player.getBoundingBox(), yaw, distance, Math.max(0, rise), true, tick) == 0) {
+                    float facing = escapeHeading + (escapeBackward ? 180 : 0);
+                    float error = Math.abs(MathHelper.wrapDegrees(facing - player.getYaw()));
+                    if (error > 8) turn(facing, player.getPitch());
+                    else steering = false;
+                    move = error <= 9;
+                    // A level tunnel is a backward walk, not a jump into the flow overhead.
+                    jump = move && rise > 0.20 && (player.isInLava() || player.horizontalCollision);
+                } else {
+                    escapeLanding = null;
+                    steering = false;
+                }
             }
-            if (tick - escapeSince < 18) return escapeBase + ESCAPE_BEARINGS[escapeChoice];
-            escapeTried |= 1 << escapeChoice;
-            if (escapeTried == (1 << ESCAPE_BEARINGS.length) - 1) escapeTried = 0;
+            if (escapeLanding == null) {
+                useEscapeWater(player);
+                jump = player.isTouchingWater() && player.getAir() < 70;
+            }
         }
-        double best = Double.POSITIVE_INFINITY;
-        Box bounds = player.getBoundingBox();
-        for (int i = 0; i < ESCAPE_BEARINGS.length; i++) {
-            if ((escapeTried & 1 << i) != 0) continue;
-            double risk = hazards.lavaRisk(bounds, escapeBase + ESCAPE_BEARINGS[i],
-                2.65, 0.85, true, tick) + 0.0015 * Math.abs(ESCAPE_BEARINGS[i]);
-            if (risk < best) {
-                best = risk;
-                escapeChoice = i;
+        options.forwardKey.setPressed(move && !escapeBackward);
+        options.backKey.setPressed(move && escapeBackward);
+        options.jumpKey.setPressed(jump);
+    }
+
+    /** Aiming at a floor is not a use receipt. Require the rendered face and the bucket's own ray. */
+    private void useEscapeWater(ClientPlayerEntity player) {
+        steering = false;
+        if (!hasView() || !client.isWindowFocused() || client.getOverlay() != null
+                || !World.OVERWORLD.equals(client.world.getRegistryKey()) || client.world.getDimension().ultrawarm()
+                || !player.isOnGround() || player.isInLava() || player.isUsingItem()
+                || client.interactionManager == null || client.interactionManager.isBreakingBlock()) return;
+        var stack = player.getMainHandStack();
+        if (escapeWater != null && stack.isOf(Items.BUCKET) && player.isTouchingWater() && !player.isOnFire()
+                && escapeWaterAttempts < 3 && tick - escapeWaterTick >= 8) {
+            turn(player.getYaw(), 89.5f);
+            BlockHitResult hit = itemRay(RaycastContext.FluidHandling.SOURCE_ONLY);
+            var actual = currentCrosshair();
+            if (hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(escapeWater)
+                    && inView(hit.getPos()) && litFace(hit)
+                    && actual instanceof BlockHitResult floor && floor.getType() == HitResult.Type.BLOCK
+                    && floor.getSide() == Direction.UP && floor.getBlockPos().equals(escapeWater.down())
+                    && client.world.getFluidState(escapeWater).isIn(FluidTags.WATER)
+                    && pressKey(client.options.useKey)) {
+                escapeWaterAttempts++;
+                escapeWaterTick = tick;
             }
+            return;
         }
-        escapeFrom = feet;
-        escapeSince = tick;
-        return escapeBase + ESCAPE_BEARINGS[escapeChoice];
+        if (!player.isOnFire() || player.isTouchingWater() || !stack.isOf(Items.WATER_BUCKET)
+                || escapeWaterAttempts >= 2 || tick - escapeWaterTick < 8) return;
+        BlockPos support = player.getBlockPos().down();
+        turn(player.getYaw(), 89.5f);
+        BlockHitResult face = selectedFace();
+        if (face == null || face.getSide() != Direction.UP || !face.getBlockPos().equals(support)
+                || !inView(face.getPos()) || !litFace(face)) return;
+        var state = client.world.getBlockState(support);
+        // Natural ground avoids opening a station or altering a protected block on right click.
+        if (!state.getFluidState().isEmpty() || !(state.isIn(BlockTags.BASE_STONE_OVERWORLD)
+                || state.isIn(BlockTags.DIRT) || state.isOf(Blocks.COBBLESTONE) || state.isOf(Blocks.GRAVEL))) return;
+        BlockHitResult hit = itemRay(RaycastContext.FluidHandling.NONE);
+        if (hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(support)
+                && hit.getSide() == Direction.UP && inView(hit.getPos()) && litFace(hit)
+                && pressKey(client.options.useKey)) {
+            escapeWater = support.up();
+            escapeWaterAttempts++;
+            escapeWaterTick = tick;
+        }
     }
 
     private static float heading(double dx, double dz) {
@@ -541,8 +629,8 @@ final class PilotBody {
         headroom.reset();
         hazardWorld = null;
         hazardPlayer = null;
-        dryFooting = escapeFrom = null;
-        escapeChoice = -1;
+        dryFooting = previousDryFooting = escapeLanding = null;
+        lavaEmergency = false;
         releaseKeys();
     }
 
@@ -720,6 +808,23 @@ final class PilotBody {
         dryLanding = landing;
     }
 
+    /** Retain the backing mode through the whole walked segment; never rotate through alternate bearings. */
+    boolean preferLavaExit(Vec3d walked) {
+        if (!lavaEmergency || escapePlanned || walked == null) return false;
+        var player = client.player;
+        double dx = walked.x - player.getX(), dz = walked.z - player.getZ();
+        double distance = Math.hypot(dx, dz), rise = walked.y - player.getY();
+        if (distance <= 0.25 || distance > 3.2 || rise < -1.1 || rise > 1.15) return false;
+        float yaw = heading(dx, dz);
+        if (hazards.lavaRisk(player.getBoundingBox(), yaw, distance, Math.max(0, rise), true, tick) > 0)
+            return false;
+        escapeLanding = walked;
+        escapeBackward = Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > 90;
+        escapeHeading = yaw;
+        escapeSince = tick;
+        return escapePlanned = true;
+    }
+
     /** Shift laterally toward the center of this same, freshly sighted full top.
      * A fractional edge position need not force a jump or a 180-degree turn. */
     boolean centerOnSupport(BlockPos support) {
@@ -754,7 +859,7 @@ final class PilotBody {
     private boolean fallUseReady() {
         return hasView() && client.getOverlay() == null && client.isWindowFocused()
             && client.interactionManager != null && !client.interactionManager.isBreakingBlock()
-            && !client.player.isUsingItem() && !client.player.hasVehicle() && !lavaEgress(client.player);
+            && !client.player.isUsingItem() && !client.player.hasVehicle() && !lavaEmergency;
     }
 
     /** Validate both the visible vanilla target and the item-specific reach/raycast. */
@@ -926,13 +1031,13 @@ final class PilotBody {
     }
 
     private BlockHitResult scanFluids(double distance, boolean near, boolean lava, boolean sourceOnly) {
-        int columns = near ? 7 : 9, rows = near ? 4 : 5;
+        int columns = near ? 7 : 9, rows = 5;
         float uPhase = (tick & 1) == 0 ? 0.28f : 0.72f;
         float vPhase = (tick & 2) == 0 ? 0.30f : 0.70f;
         double nearest = distance * distance;
         BlockHitResult best = null;
         for (int y = 0; y < rows && raysLeft > 0; y++) {
-            float v = -0.98f + (near ? 1.48f : 1.96f) * ((y + vPhase) / rows);
+            float v = -0.98f + 1.96f * ((y + vPhase) / rows);
             for (int x = 0; x < columns && raysLeft > 0; x++) {
                 float u = 1.96f * ((x + uPhase) / columns) - 0.98f;
                 inverseViewProjection.transform(clip.set(u, v, 0.9f, 1));

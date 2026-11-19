@@ -182,7 +182,7 @@ public final class PilotClient implements ClientModInitializer {
             fleeing = ears.escape(body, hands);
             if (!fleeing) {
                 hands.tick();
-                progress.tick();
+                progress.tick(ears);
             }
             body.finish();
         }

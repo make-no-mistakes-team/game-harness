@@ -8,6 +8,7 @@ import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.CaveVines;
+import net.minecraft.block.LeavesBlock;
 import net.minecraft.block.SweetBerryBushBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.DeathScreen;
@@ -52,13 +53,14 @@ final class PilotProgress {
     private static final float INSPECT_PITCH = 40;
     // Work above the deep lava seas, leaving more than a block of margin below the floor.
     private static final int DIAMOND_LEVEL = -52;
-    private static final int IRON_TIMBER = 8;
     private static final int IRON_LIGHT = 24;
     private static final int DEEP_LIGHT = 32;
     private static final int LOCAL_LIGHT = 12;
     private static final int ORE_MEMORY_LIMIT = 18;
     private static final int TIMBER_WORK_TICKS = 190;
     private static final int TIMBER_RECENT = 24;
+    private static final float[] TIMBER_SHELF_BEARINGS = {0, -68, 68};
+    private static final int TIMBER_SHELF_LOOK_TICKS = 20;
     private static final int TRAIL_LIMIT = 1024;
     private static final Predicate<ItemStack> LOG = stack -> stack.isIn(ItemTags.LOGS);
     private static final Predicate<ItemStack> BURNABLE_LOG = stack -> stack.isIn(ItemTags.LOGS_THAT_BURN);
@@ -160,6 +162,7 @@ final class PilotProgress {
     private final PilotStallGuard stallGuard;
     private final Predicate<BlockPos> protectedHeadroom = this::protectRecoveryBlock;
     private final PilotCaves caves;
+    private final SurfaceApproach surfaceApproach = new SurfaceApproach();
     private final PilotFall fall;
     private BlockHitResult fieldWater;
     private Vec3d fieldWaterPoint;
@@ -238,10 +241,14 @@ final class PilotProgress {
     private int timberExitCheck;
     private float timberExitYaw;
     private boolean timberHigherShelf;
+    private int timberShelfLook = TIMBER_SHELF_BEARINGS.length;
+    private int timberShelfLookUntil;
+    private float timberShelfYaw;
     private BlockHitResult timberChop;
     private Vec3d timberChopPoint;
     private boolean timberCuttingLeaves;
     private int timberAttack;
+    private int timberAttackWitnessTick;
     private int timberAlignUntil;
     private int timberChopUntil;
     private int timberWorkUntil;
@@ -402,16 +409,23 @@ final class PilotProgress {
         litIndex = index + 1; // Periodic light counts new steps; darkness can still demand a light immediately.
         if (index + 1 < trail.size()) resumeIndex = index + 1;
         digDirection = c.player.getHorizontalFacing();
+        useTraveledBearing(index);
+        return true;
+    }
+
+    private void useTraveledBearing(int index) {
         // A saved camera can be looking at a wall, torch face, or workbench. Recover the
         // heading of the actual last horizontal leg rather than mining along that camera angle.
         for (int i = index; i > 0; i--) {
             BlockPos last = trail.get(i), prior = trail.get(i - 1);
-            if (last.getX() != prior.getX() || last.getZ() != prior.getZ()) {
-                digDirection = directional(Vec3d.ofBottomCenter(last).subtract(Vec3d.ofBottomCenter(prior)));
-                break;
+            int dx = last.getX() - prior.getX();
+            int dz = last.getZ() - prior.getZ();
+            if (dx != 0 || dz != 0) {
+                digDirection = Math.abs(dx) > Math.abs(dz)
+                    ? dx < 0 ? Direction.WEST : Direction.EAST : dz < 0 ? Direction.NORTH : Direction.SOUTH;
+                return;
             }
         }
-        return true;
     }
 
     void saveMemory(boolean force) {
@@ -432,6 +446,7 @@ final class PilotProgress {
     void observeOwnBreak(BlockPos position, BlockState state) {
         body.observeHeadroomBreak(position);
         stallGuard.broken(position, state);
+        surfaceApproach.broken(position, state);
     }
 
     int confirmedFrameBlocks() { return portal == null ? 0 : portal.confirmedFrameBlocks(); }
@@ -508,12 +523,12 @@ final class PilotProgress {
         return status;
     }
 
-    void tick() {
+    void tick(PilotEars ears) {
         if (win || c.player == null || c.world == null) return;
         tick++;
         if (portal != null) stallGuard.surveyReceipt(portal.castSurveyEvidence());
         stallGuard.observe(tick, confirmedFrameBlocks(), mealsEaten, status);
-        advance();
+        advance(ears);
         if (stopped != null) {
             stallGuard.skillBlocked(stopped);
             stopped = null;
@@ -521,7 +536,7 @@ final class PilotProgress {
         }
     }
 
-    private void advance() {
+    private void advance(PilotEars ears) {
         if (!c.player.isAlive() || c.currentScreen instanceof DeathScreen) {
             status = "died before " + goal;
             return;
@@ -545,6 +560,7 @@ final class PilotProgress {
             return;
         }
         if (fall.step()) {
+            defense.stopZombieLook();
             body.prioritizeMovement();
             stallGuard.priorityAim();
             status = fall.status();
@@ -553,7 +569,15 @@ final class PilotProgress {
         if (hands.busy()) return;
         if (handleScreen()) return;
         if (eatOrHunt()) {
+            defense.stopZombieLook();
             stallGuard.priorityAim();
+            return;
+        }
+        if (defense.checkZombieCue(ears, tick, nextFoot != null
+                || c.options.attackKey.isPressed() && c.interactionManager.isBreakingBlock())) {
+            body.prioritizeMovement();
+            stallGuard.priorityAim();
+            status = defense.status();
             return;
         }
         if (!stallGuard.ownsRecovery() && body.repairHeadroom(tools, protectedHeadroom)) {
@@ -565,6 +589,7 @@ final class PilotProgress {
             status = stallGuard.status();
             return;
         }
+        if (surfaceApproach.to != null && surfaceApproach.step(c.player.getBlockPos())) return;
         if ((exitStart != null || returnIndex >= 0) && !has(TORCH, 1) && has(FUEL, 1)
             && craftTorches(12)) return;
         if (needsTimberKit() && (sought != null || activeTrail() > 0) && tick % 6 == 0) {
@@ -608,11 +633,11 @@ final class PilotProgress {
             boolean longGoal = needsTimberKit();
             int torchRecipes = torchBatches(launchLight(), hands.count(TORCH));
             int fuelLogs = Math.max(0, torchRecipes - hands.count(FUEL));
-            // Do not reject an equipped expedition over a fixed stack of logs. Pay for
-            // the missing light, its charcoal heat, and a field kit (bench, replacements,
-            // shield or boat) in addition to the logs that must stay intact for charcoal.
-            int kitPlanks = goal.equals("iron_pickaxe") ? 4 * IRON_TIMBER :
-                24 + localTableWood() + 2 * stickBatches(torchRecipes + 8) + furnacePlanks(fuelLogs) + 4 * fuelLogs;
+            // Equip the next leg, not the whole expedition before leaving the first tree.
+            // Hold back bench and replacement-pick wood as well as the actual fuel logs.
+            int fieldReserve = ironPick ? 24 : 12;
+            int kitPlanks = fieldReserve + localTableWood() + 2 * stickBatches(torchRecipes + 4)
+                + furnacePlanks(fuelLogs) + 4 * fuelLogs;
             boolean shortTimber = hands.count(PLANK) + 4 * hands.count(LOG) < kitPlanks
                 || hands.count(BURNABLE_LOG) < fuelLogs;
             if (longGoal && surfaceDeparture() && (stonePick || woodPick || ironPick)
@@ -658,17 +683,21 @@ final class PilotProgress {
             if (missing > 0) {
                 // Take exposed iron on the way down. Do not spend the whole expedition
                 // branch-mining the iron layer for four spare ingots once the pick is ready.
-                if (hands.count(RAW_IRON) >= Math.min(3, missing)) {
+                int raw = hands.count(RAW_IRON);
+                if (raw >= Math.min(3, missing)
+                        && (canSetLocalFurnace() || localStation(furnace, furnaceWitness))) {
                     acquireIron(reserve);
                     return;
                 }
-                if (workOre(Resource.DIAMOND, REACH, false) || workOre(Resource.IRON, SEARCH, true)) return;
+                if (workOre(Resource.DIAMOND, REACH, false)
+                        || raw < missing && workOre(Resource.IRON, SEARCH, true)) return;
             }
         }
         mineDiamonds(goal.equals("nether_portal") ? 3 : 1);
     }
 
     private void replanStalledLocalWork() {
+        surfaceApproach.abandon();
         if (fieldIgnition != null && fieldIgnition.active()) fieldIgnition.finish();
         if (target != null) {
             forgetOreTarget();
@@ -680,6 +709,7 @@ final class PilotProgress {
         if (timberCanopy != null) rememberTimberSite(exhaustedCanopies, BlockPos.ofFloored(timberCanopy));
         timberCanopy = null;
         timberExitFrom = timberExitTo = null;
+        timberShelfLook = TIMBER_SHELF_BEARINGS.length;
         if (nextFoot != null) closeDig(nextFoot);
         nextFoot = cavePeek = climbTo = gaitStep = exitStart = exitTo = null;
         approachGoal = routeLegStart = sweepOrigin = null;
@@ -762,7 +792,7 @@ final class PilotProgress {
     }
 
     private int launchLight() {
-        return goal.equals("iron_pickaxe") ? IRON_LIGHT : DEEP_LIGHT;
+        return goal.equals("iron_pickaxe") ? IRON_LIGHT : has(DEEP_PICK, 1) ? DEEP_LIGHT : LOCAL_LIGHT;
     }
 
     private static int torchBatches(int target, int held) {
@@ -1248,6 +1278,12 @@ final class PilotProgress {
 
     private boolean prepareLight(boolean departure) {
         int torches = hands.count(TORCH);
+        if (!departure && !affordsWood(0, 1) && activeTrail() > 1) {
+            if (torches > 2) return false;
+            // Coal alone cannot make light. Keep the last two torches for the walked way out.
+            seekExpeditionSupplies("wood and light");
+            return true;
+        }
         boolean canMakeTorch = affordsWood(localTableWood(), 3) || canSpareEmergencyStick(torches);
         double range = torches > 1 || departure ? SEARCH : REACH - 0.35;
         if (canMakeTorch && workOre(Resource.COAL, range, departure || torches <= 3))
@@ -1269,8 +1305,8 @@ final class PilotProgress {
             return true;
         }
 
-        if (!departure && torches <= 3 && surveyLocalLight()) return true;
         if (!departure && torches >= 2) return false;
+        if (!departure && surveyLocalLight()) return true;
         if (canMakeTorch && recallOre(Resource.COAL, range, activeTrail())) return true;
         if (!localFurnace && prepareCharcoalAtKnownFurnace()) return true;
         seekExpeditionSupplies(canMakeTorch ? "light" : "wood and light");
@@ -1278,9 +1314,9 @@ final class PilotProgress {
     }
 
     private boolean canSpareEmergencyStick(int torches) {
-        // Do not leave a lit bench for timber merely to protect a stick while
-        // a workable pick and a single torch batch can reopen local options.
-        return torches <= 1 && (has(STICK, 1) || affordsWood(0, 3))
+        // Convert the available fuel before starting a low-light survey for supplies.
+        // A workable pick and the next four torches are worth more than one spare stick.
+        return torches <= 3 && (has(STICK, 1) || affordsWood(0, 3))
             && pickUses(DEEP_PICK) + pickUses(STONE_PICK) > 6;
     }
 
@@ -1820,6 +1856,7 @@ final class PilotProgress {
             excavate(nextFoot.getY(), digGoal);
             return;
         }
+        if (surfaceApproach.step(c.player.getBlockPos())) return;
         double range = resource != Resource.STONE && (surfaceDeparture() || !has(TORCH, 2))
             ? REACH - 0.35 : SEARCH;
         if (workOre(resource, range, resource != Resource.STONE)) return;
@@ -2015,6 +2052,10 @@ final class PilotProgress {
 
     private void seekTimber() {
         var player = c.player;
+        if (!body.hasRecentView()) {
+            if (!continueTimberAttack()) status = "waiting for a rendered view of the timber route";
+            return;
+        }
         if (timberWitness != null && timberSeekTick != 0 && tick - timberSeekTick > 1) {
             // Real inventory work and hunger can interrupt the current tree; retain its witness.
             int paused = tick - timberSeekTick - 1;
@@ -2026,6 +2067,7 @@ final class PilotProgress {
         }
         timberSeekTick = tick;
         if (player.isTouchingWater()) {
+            timberShelfLook = TIMBER_SHELF_BEARINGS.length;
             if (!timberSwimming) timberLookAt = tick;
             if (!returnToTimberBank()) {
                 if (tick >= timberLookAt) {
@@ -2067,6 +2109,7 @@ final class PilotProgress {
             hit -> hit.getBlockPos().getY() <= player.getBlockY() + 1 && timberCandidate(hit) && timberInReach(hit)).orElse(null);
         if (log == null) log = body.find(state -> state.isIn(BlockTags.LOGS), 22, this::timberCandidate).orElse(null);
         if (log != null) {
+            timberShelfLook = TIMBER_SHELF_BEARINGS.length;
             timberWitness = log;
             timberCanopy = null;
             timberLastCut = null;
@@ -2087,10 +2130,34 @@ final class PilotProgress {
             return;
         }
         timberAscent = null;
-        if (surveyTimber() || startTimberReposition(player.getYaw())) return;
+        if (surveyTimber()) {
+            timberShelfLook = TIMBER_SHELF_BEARINGS.length;
+            return;
+        }
+        if (searchTimberFromShelf() || startTimberReposition(player.getYaw())) return;
         if (Float.isNaN(heading)) heading = player.getYaw();
         status = step(forward(heading), false, false) == Walk.BLOCKED
             ? "timber search: local routes exhausted" : "seeking timber along open ground";
+    }
+
+    private boolean searchTimberFromShelf() {
+        if (timberShelfLook >= TIMBER_SHELF_BEARINGS.length) return false;
+        float bearing = timberShelfYaw + TIMBER_SHELF_BEARINGS[timberShelfLook];
+        Walk route = Walk.LOOKING;
+        if (bearingDistance(c.player.getYaw(), bearing) > 12) body.turn(bearing, 7);
+        else route = step(forward(bearing), false, false);
+        if (route == Walk.MOVING) {
+            heading = bearing;
+            timberShelfLook = TIMBER_SHELF_BEARINGS.length;
+            status = "seeking timber from the new shelf";
+            return true;
+        }
+        if (route == Walk.BLOCKED || tick >= timberShelfLookUntil) {
+            timberShelfLook++;
+            timberShelfLookUntil = tick + TIMBER_SHELF_LOOK_TICKS;
+        }
+        status = "timber search: surveying from the new shelf";
+        return true;
     }
 
     private boolean tendTimber() {
@@ -2279,6 +2346,13 @@ final class PilotProgress {
     /** Commit to one observed landing, with at most one glance to bring the floor into view. */
     private boolean repositionForTimber() {
         if (timberExitTo != null && arrived(timberExitTo)) {
+            if (timberWitness == null && timberExitTo.getY() > timberExitFrom.getY()) {
+                // This footprint is already remembered. Survey it rather than retrying the old heading.
+                timberShelfYaw = c.player.getYaw();
+                timberShelfLook = 0;
+                timberShelfLookUntil = tick + TIMBER_SHELF_LOOK_TICKS;
+                timberLookAt = tick;
+            }
             timberExitFrom = timberExitTo = null;
             timberCanopy = null;
             timberNear = false;
@@ -2399,6 +2473,25 @@ final class PilotProgress {
         if (leaves) timberLeafCuts++;
     }
 
+    private boolean continueTimberAttack() {
+        if (timberChop == null || timberAttack == 0 || timberAttack != tick - 1
+                || tick - timberAttackWitnessTick > 3 || tick >= timberChopUntil) return false;
+        BlockPos block = timberChop.getBlockPos();
+        if (timberUnderfoot(block) || !body.outlined(block)) return false;
+        // Bridge a short render gap only for the exact target already being mined.
+        timberSeekTick = tick;
+        body.aim(timberChopPoint);
+        attackTimber(block);
+        return true;
+    }
+
+    private void attackTimber(BlockPos block) {
+        timberAttack = tick;
+        timberAlignUntil = tick + 8;
+        status = timberCuttingLeaves ? "opening a visible passage through leaves" : "chopping the witnessed trunk";
+        body.mine(block);
+    }
+
     private void chopTimber() {
         status = timberCuttingLeaves ? "aligning on visible leaves" : "aligning on a reachable log";
         BlockPos block = timberChop.getBlockPos();
@@ -2427,10 +2520,8 @@ final class PilotProgress {
                     return;
                 }
                 if (readyForMine(material)) {
-                    timberAttack = tick;
-                    timberAlignUntil = tick + 8;
-                    status = timberCuttingLeaves ? "opening a visible passage through leaves" : "chopping the witnessed trunk";
-                    body.mine(block);
+                    timberAttackWitnessTick = tick;
+                    attackTimber(block);
                 }
                 return;
             }
@@ -2728,6 +2819,272 @@ final class PilotProgress {
         return resumeIndex < 0 ? trail.size() : resumeIndex;
     }
 
+    /** A new surface mine starts from walked ground, not from the top of a tree or scaffold. */
+    private final class SurfaceApproach {
+        private final BlockPos[] visited = new BlockPos[24];
+        private final List<BlockPos> route = new ArrayList<>(24);
+        private final List<BlockPos> rejected = new ArrayList<>(16);
+        private final List<BlockPos> triedLeaves = new ArrayList<>(6);
+        private BlockPos entrance, from, to;
+        private BlockPos cut;
+        private Vec3d cutAim;
+        private boolean natural;
+        private int view, since, proof, cuts, cutSince, visitedCursor, backtracks;
+        private float surveyYaw;
+
+        private boolean findingGround() {
+            return from != null && entrance == null && activeTrail() < 4 && c.player.getY() > 48;
+        }
+
+        private void abandon() {
+            from = to = cut = null;
+        }
+
+        private boolean step(BlockPos standing) {
+            if (to == null && (standing.getY() <= 48 || activeTrail() >= 4 || entrance != null
+                    && (entrance.equals(standing) || !trail.isEmpty() && entrance.equals(trail.getFirst())))) return false;
+            status = "checking for walkable ground before starting a surface mine";
+            if (c.player.isTouchingWater()) {
+                to = cut = null;
+                explore();
+                return true;
+            }
+            if (to != null && proof == 4) return traverse();
+            if (!c.player.isOnGround()) return true;
+            if (!standing.equals(from)) {
+                recordStance(standing);
+                rejected.clear();
+                from = standing;
+                to = cut = null;
+                view = 0;
+                since = tick;
+                surveyYaw = c.player.getYaw();
+            }
+            if (to == null) {
+                chooseLanding();
+                if (to == null) {
+                    if (cutSightline()) return true;
+                    if (view < 4) {
+                        float bearing = surveyYaw + 90 * view;
+                        body.turn(bearing, tick - since < 12 ? 23 : 60);
+                        if (bearingDistance(bearing, c.player.getYaw()) < 7 && c.player.getPitch() >= 53
+                                && tick - since >= 24 && !peekFromSupport(bearing)) {
+                            view++;
+                            since = tick;
+                        }
+                    } else if (backtracks < 4 && route.size() > 1) {
+                        BlockPos prior = route.get(route.size() - 2);
+                        if (adjacent(from, prior) && prior.getY() <= from.getY() && !rejected.contains(prior)) {
+                            Vec3d point = supportPoint(prior);
+                            body.aim(point);
+                            BlockHitResult floor = terrain(point, 5.1);
+                            if (visibleTop(floor, prior)) {
+                                nominate(prior, naturalGround(state(floor)));
+                                backtracks++;
+                            } else if (tick - since >= 28) rejected.add(prior);
+                        }
+                    }
+                    return true;
+                }
+                cut = null;
+            }
+            proveLanding();
+            return true;
+        }
+
+        private boolean peekFromSupport(float bearing) {
+            if (tick - since >= 34) return false;
+            Vec3d lane = forward(bearing);
+            Vec3d point = Vec3d.ofBottomCenter(from).add(lane.x * 0.38, -0.035, lane.z * 0.38);
+            Vec3d feet = c.player.getPos();
+            double advance = (point.x - feet.x) * lane.x + (point.z - feet.z) * lane.z;
+            if (advance <= 0.13 || !visibleTop(terrain(point, c.player.getEyePos().distanceTo(point) + 0.05), from)
+                    || body.hazardAhead(bearing, 1.1)) return false;
+            body.sneak();
+            walk(false);
+            status = "crouching on the witnessed canopy edge to look down";
+            return true;
+        }
+
+        private void recordStance(BlockPos standing) {
+            visited[visitedCursor++ % visited.length] = standing;
+            if (route.size() > 1 && standing.equals(route.get(route.size() - 2))) {
+                route.removeLast();
+            } else if (route.isEmpty() || !standing.equals(route.getLast())) {
+                if (route.size() == visited.length || !route.isEmpty() && !adjacent(route.getLast(), standing))
+                    route.clear();
+                route.add(standing);
+            }
+        }
+
+        private Vec3d supportPoint(BlockPos foot) {
+            return new Vec3d(foot.getX() + 0.50 + 0.32 * (foot.getX() - from.getX()), foot.getY() - 0.045,
+                foot.getZ() + 0.50 + 0.32 * (foot.getZ() - from.getZ()));
+        }
+
+        private boolean visibleTop(BlockHitResult hit, BlockPos foot) {
+            return hit != null && hit.getSide() == Direction.UP && hit.getBlockPos().equals(foot.down())
+                && Math.abs(hit.getPos().y - foot.getY()) <= 0.055 && safeSupport(hit);
+        }
+
+        private void nominate(BlockPos foot, boolean ground) {
+            to = foot;
+            natural = ground;
+            proof = 0;
+            since = tick;
+        }
+
+        private void chooseLanding() {
+            double best = Double.POSITIVE_INFINITY;
+            for (Direction direction : Direction.Type.HORIZONTAL) {
+                for (int drop = 0; drop <= 3; drop++) {
+                    BlockPos foot = new BlockPos(from.getX() + direction.getOffsetX(), from.getY() - drop,
+                        from.getZ() + direction.getOffsetZ());
+                    boolean seen = false;
+                    for (BlockPos prior : visited) {
+                        if (foot.equals(prior)) { seen = true; break; }
+                    }
+                    if (seen || rejected.contains(foot)) continue;
+                    BlockHitResult floor = terrain(supportPoint(foot), 5.1);
+                    if (!visibleTop(floor, foot)) continue;
+                    BlockState support = state(floor);
+                    boolean ground = naturalGround(support);
+                    if (!ground && !support.isIn(BlockTags.LEAVES)) continue;
+                    double score = (ground ? 0 : 12) - 3 * drop
+                        + 0.025 * bearingDistance(c.player.getYaw(), direction.getPositiveHorizontalDegrees());
+                    if (score >= best) continue;
+                    best = score;
+                    nominate(foot, ground);
+                }
+            }
+        }
+
+        private boolean naturalGround(BlockState state) {
+            return state.isIn(BlockTags.DIRT) || state.isIn(BlockTags.BASE_STONE_OVERWORLD)
+                || state.isIn(BlockTags.SAND) || state.isOf(Blocks.GRAVEL) || state.isOf(Blocks.MOSS_BLOCK)
+                || state.isOf(Blocks.SNOW_BLOCK) || state.isOf(Blocks.CLAY);
+        }
+
+        private void proveLanding() {
+            Vec3d base = Vec3d.ofBottomCenter(to);
+            Vec3d forward = base.subtract(Vec3d.ofBottomCenter(from));
+            double height = switch (proof) {
+                case 0 -> 0.30;
+                case 1, 2 -> 1.40;
+                default -> Math.max(1.69, 1.42 + from.getY() - to.getY());
+            };
+            double flank = proof == 1 ? 0.24 : proof == 2 ? -0.24 : 0;
+            Vec3d point = base.add(0.14 * forward.x + flank * forward.z, height,
+                0.14 * forward.z - flank * forward.x);
+            status = "verifying clearance to the visible surface landing";
+            if (tick - since >= 72 || body.hazardAhead(yaw(forward), 1.55)) {
+                reject();
+                return;
+            }
+            body.aim(point);
+            if (!body.aligned(point)) return;
+            if (body.clearTerrain(point)) {
+                if (++proof == 4) since = tick;
+                return;
+            }
+            BlockHitResult obstruction = perceive(point, c.player.getEyePos().distanceTo(point) + 0.04);
+            if (obstruction == null) return;
+            BlockPos leaf = obstruction.getBlockPos();
+            BlockState state = state(obstruction);
+            if (!sameStem(leaf, to) || leaf.getY() < to.getY() || leaf.getY() > from.getY() + 1
+                    || !eligibleLeaf(leaf, state)) {
+                reject();
+                return;
+            }
+            status = "clearing a witnessed leaf from the route to ground";
+            if (tools.readyFor(state)) body.mine(leaf);
+        }
+
+        private boolean cutSightline() {
+            // If no floor is visible, open at most one eye-level leaf per direction.
+            // Do not cut the near floor for a speculative landing below it.
+            if (cuts >= 6) return false;
+            if (cut == null) {
+                for (Direction direction : Direction.Type.HORIZONTAL) {
+                    if (bearingDistance(c.player.getYaw(), direction.getPositiveHorizontalDegrees()) > 32) continue;
+                    BlockPos leaf = from.offset(direction).up();
+                    if (triedLeaves.contains(leaf)) continue;
+                    Vec3d point = Vec3d.ofCenter(leaf);
+                    BlockHitResult hit = perceive(point, 2.5);
+                    if (hit == null || !hit.getBlockPos().equals(leaf) || !eligibleLeaf(leaf, state(hit))) continue;
+                    if (triedLeaves.size() == 6) return false;
+                    triedLeaves.add(leaf);
+                    cut = leaf;
+                    cutAim = point;
+                    cutSince = tick;
+                    break;
+                }
+            }
+            if (cut == null) return false;
+            if (tick - cutSince >= 36) {
+                cut = null;
+                return false;
+            }
+            body.aim(cutAim);
+            status = "clearing a witnessed eye-level leaf to reveal the ground route";
+            if (!body.aligned(cutAim)) return true;
+            BlockHitResult seen = perceive(cutAim, c.player.getEyePos().distanceTo(cutAim) + 0.04);
+            if (seen != null && seen.getBlockPos().equals(cut)) {
+                BlockState observed = state(seen);
+                if (eligibleLeaf(cut, observed) && tools.readyFor(observed)) body.mine(cut);
+            }
+            return true;
+        }
+
+        private boolean eligibleLeaf(BlockPos leaf, BlockState state) {
+            return cuts < 6 && !protectRecoveryBlock(leaf) && state.isIn(BlockTags.LEAVES)
+                && state.getFluidState().isEmpty() && state.contains(LeavesBlock.PERSISTENT)
+                && !state.get(LeavesBlock.PERSISTENT);
+        }
+
+        private boolean traverse() {
+            Vec3d landing = Vec3d.ofBottomCenter(to);
+            Vec3d delta = landing.subtract(c.player.getPos());
+            if (arrived(to)) {
+                if (natural) {
+                    entrance = to;
+                    // Old unverified surface waypoints are not a connected mine entrance.
+                    trail.clear();
+                    resumeIndex = -1;
+                    status = "reached natural footing for the mine entrance";
+                }
+                to = null;
+                return true;
+            }
+            status = "walking to a witnessed surface landing";
+            if (tick - since >= 38 || c.player.getY() < to.getY() - 0.12 || c.player.getY() > from.getY() + 0.10
+                    || delta.horizontalLengthSquared() > 2.56) {
+                reject();
+                return true;
+            }
+            if (delta.horizontalLengthSquared() <= 0.045) return true;
+            float bearing = yaw(delta);
+            body.turn(bearing, 45);
+            if (!c.player.horizontalCollision && bearingDistance(bearing, c.player.getYaw()) <= 9
+                    && !body.hazardAhead(bearing, 1.55)) body.walkDownTo(landing);
+            return true;
+        }
+
+        private void reject() {
+            rejected.add(to);
+            to = null;
+            since = tick;
+        }
+
+        private void broken(BlockPos position, BlockState state) {
+            if (!state.isIn(BlockTags.LEAVES)) return;
+            if (position.equals(cut)) {
+                cuts++;
+                cut = null;
+            } else if (to != null && proof < 4 && sameStem(position, to)) cuts++;
+        }
+    }
+
     private int stationWaypoint(BlockPos position) {
         Vec3d station = Vec3d.ofCenter(position);
         double nearest = 3.55 * 3.55;
@@ -2764,7 +3121,7 @@ final class PilotProgress {
             legLength++;
             return;
         }
-        if (nextFoot == null && !c.player.isOnGround()) return;
+        if (nextFoot == null && (surfaceApproach.step(standing) || !c.player.isOnGround())) return;
         if (nextFoot == null && !trail.isEmpty() && !standing.equals(trail.getLast())) {
             int revisit = trail.lastIndexOf(standing);
             if (revisit >= 0) {
@@ -2796,6 +3153,7 @@ final class PilotProgress {
             if (lightStair(current)) return;
             forcedLight = false;
             if (torchPlacedTick != tick) blockedTunnel();
+            else digAge = tick;
             return;
         }
         if (surveyCave(nextFoot)) return;
@@ -2835,17 +3193,47 @@ final class PilotProgress {
         BlockHitResult hit = terrain(support, REACH);
         if (hit != null && hit.getBlockPos().equals(nextFoot.down()) && hit.getSide() == Direction.UP
             && safeSupport(hit)) {
+            if (body.hazardAhead(yaw(direction), 1.65)) {
+                blockedTunnel();
+                return;
+            }
             nextStepProved = true;
             walkDown(false);
+        } else if (followObservedShelf(current, direction)) {
+            status = "following a witnessed shelf in the mine";
         } else if (hit != null && hit.getBlockPos().equals(current.down()) && hit.getSide() == Direction.UP) {
             // Crouch toward the lip on the proven current support to reveal the next one.
             creepToLip();
-        } else if (hit != null || !body.outlined(nextFoot.down()) || !lightDigOnce(current)) {
+        } else if (!lightDigOnce(current)) {
             if (!nextFoot.equals(cavePeek)) {
                 cavePeek = nextFoot;
                 caveLookUntil = tick + 16;
             } else blockedTunnel();
         }
+    }
+
+    private boolean followObservedShelf(BlockPos current, Vec3d direction) {
+        // An older stair can have a level landing or one taller drop. Use its real
+        // exposed top and lower body clearance instead of digging the expected shape.
+        BlockPos planned = nextFoot;
+        for (int drop = 0; drop <= 2; drop++) {
+            int height = current.getY() - drop;
+            if (height == planned.getY()) continue;
+            BlockPos foot = new BlockPos(planned.getX(), height, planned.getZ());
+            Vec3d landing = Vec3d.ofBottomCenter(foot);
+            Vec3d far = landing.add(direction.x * 0.39, -0.045, direction.z * 0.39);
+            BlockHitResult floor = terrain(far, REACH);
+            if (floor == null || floor.getSide() != Direction.UP || !floor.getBlockPos().equals(foot.down())
+                    || Math.abs(floor.getPos().y - height) > 0.055 || !safeSupport(floor)) continue;
+            Vec3d shin = landing.add(direction.x * 0.26, 0.40, direction.z * 0.26);
+            if (!body.clearTerrain(shin.add(0.22 * direction.z, 0, -0.22 * direction.x))
+                    || !body.clearTerrain(shin.add(-0.22 * direction.z, 0, 0.22 * direction.x))
+                    || body.hazardAhead(yaw(direction), 1.65)) continue;
+            nextFoot = foot;
+            nextStepProved = true;
+            return true;
+        }
+        return false;
     }
 
     private void appendGrounded(BlockPos position, boolean dug) {
@@ -3184,6 +3572,7 @@ final class PilotProgress {
         if (resumeIndex < trail.size() && arrived(trail.get(resumeIndex))) resumeIndex++;
         if (resumeIndex >= trail.size()) {
             resumeIndex = -1;
+            useTraveledBearing(trail.size() - 1);
             return;
         }
         if (resumeStep != resumeIndex) {
@@ -3486,10 +3875,44 @@ final class PilotProgress {
 
     private boolean escapeDanger(boolean hurt) {
         if (hurt) defense.markDanger(tick);
-        if (c.player.isInLava() || c.player.isTouchingWater() && c.player.getAir() < 70) {
+        if (nextFoot != null && body.lavaBreachesDig(nextFoot)) body.beginLavaEscape();
+        if (body.lavaEmergency()) {
+            if (nextFoot != null) {
+                int last = activeTrail() - 1;
+                if (last > 0) {
+                    int exit = last - 1;
+                    BlockPos lip = trail.get(last), prior = trail.get(exit);
+                    if (exit > 0) {
+                        BlockPos older = trail.get(exit - 1);
+                        // Retreat across two already walked blocks only if they form a level, straight run.
+                        if (lip.getY() == prior.getY() && prior.getY() == older.getY()
+                                && adjacent(lip, prior) && adjacent(prior, older)
+                                && lip.getX() - prior.getX() == prior.getX() - older.getX()
+                                && lip.getZ() - prior.getZ() == prior.getZ() - older.getZ()) exit--;
+                    }
+                    closeDig(nextFoot);
+                    startReturn(Math.max(0, last - 6), false);
+                    for (int i = exit; i <= last; i++) {
+                        BlockPos walked = trail.get(i);
+                        if (i < last && !adjacent(trail.get(i + 1), walked)) continue;
+                        if (body.preferLavaExit(Vec3d.ofBottomCenter(walked))) {
+                            // Backtrack from the escape point, not toward the abandoned lip.
+                            returnIndex = i;
+                            break;
+                        }
+                    }
+                } else blockedTunnel();
+            }
             defense.markDanger(tick);
             interruptHands();
-            status = c.player.isInLava() ? "escaping lava" : "surfacing for air";
+            body.prioritizeMovement();
+            status = c.player.isInLava() ? "escaping lava" : "retreating from lava";
+            return true;
+        }
+        if (c.player.isTouchingWater() && c.player.getAir() < 70) {
+            defense.markDanger(tick);
+            interruptHands();
+            status = "surfacing for air";
             body.jump();
             body.walk(true);
             return true;
@@ -3506,6 +3929,9 @@ final class PilotProgress {
         boolean selecting = defense.combatSelecting();
         LivingEntity threat = body.threat(8).orElse(null);
         boolean creeper = threat instanceof CreeperEntity;
+        boolean exposedSurface = surfaceApproach.findingGround();
+        if (exposedSurface && threat != null && !creeper
+                && c.player.squaredDistanceTo(threat) > 3.2 * 3.2) return false;
         float health = c.player.getHealth();
         boolean flee = threat != null && (creeper || health <= 7 || health <= 10 && wantsHealingMeal());
         if (flee && tick >= retreatUntil - 10) {
@@ -3524,7 +3950,7 @@ final class PilotProgress {
             body.prioritizeMovement();
             // The only Hands job combat may retain is a checked hotbar key selection.
             if (!selecting) interruptHands();
-            if (defense.fight(threat, tick)) {
+            if (defense.fight(threat, tick) && !exposedSurface) {
                 Vec3d target = threat.getPos();
                 if (walkToward(target, false, false) == Walk.MOVING
                         && bearingDistance(routeYaw, yaw(target.subtract(c.player.getPos()))) <= 12) {
@@ -4184,7 +4610,8 @@ final class PilotProgress {
             double top = shin.getBlockPos().getY() + 1;
             double height = top - feet.getY();
             if (height > 1.05) return Footing.BLOCKED;
-            Vec3d stepTop = Vec3d.ofCenter(shin.getBlockPos(), 0.48);
+            // A deep probe can strike the riser from below and hide a genuinely visible top.
+            Vec3d stepTop = Vec3d.ofCenter(shin.getBlockPos(), 0.95);
             BlockHitResult landing = terrain(stepTop, c.player.getEyePos().distanceTo(stepTop) + 0.12);
             if (landing == null || !landing.getBlockPos().equals(shin.getBlockPos())
                 || landing.getSide() != Direction.UP || !safeSupport(landing)) return Footing.UNKNOWN;

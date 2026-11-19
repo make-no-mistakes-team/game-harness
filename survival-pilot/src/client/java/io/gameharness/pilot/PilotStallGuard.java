@@ -274,7 +274,11 @@ final class PilotStallGuard {
         if (phase == Phase.PENDING) {
             if (tick == entered) return true; // Preserve the trigger in ordinary tick telemetry.
             if (!dryGround()) {
-                if (tick - incidentTick < DRY_FOOTING_TICKS) return false;
+                if (tick - entered < DRY_FOOTING_TICKS) {
+                    // Release ordinary movement long enough to settle a jump or step off a lip.
+                    // Swimming and mounted travel still need their ordinary steering to reach shore.
+                    return !client.player.isTouchingWater() && !client.player.hasVehicle();
+                }
                 fail("no stable dry footing from which to attempt safe recovery");
                 return true;
             }

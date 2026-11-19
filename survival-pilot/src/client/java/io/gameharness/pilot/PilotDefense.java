@@ -13,11 +13,14 @@ import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
 /** Cave kit and weapon choices use the player's inventory; combat uses only the current view. */
 final class PilotDefense {
     private static final int SHIELD_PLANKS = 6;
+    private static final long ZOMBIE_LOOK_NANOS = 1_200_000_000L;
+    private static final float ZOMBIE_LOOK_PITCH = 10;
     private static final Predicate<ItemStack> SHIELD = stack -> stack.isOf(Items.SHIELD);
     private static final Predicate<ItemStack> INGOT = stack -> stack.isOf(Items.IRON_INGOT);
     private static final Predicate<ItemStack> STONE = stack -> stack.isIn(ItemTags.STONE_TOOL_MATERIALS);
@@ -68,6 +71,11 @@ final class PilotDefense {
     private int engagementStarted;
     private int lastEngaged;
     private Vec3d aim;
+    private PilotEars.ZombieCue zombieLook;
+    private long zombieLookUntil;
+    private int zombieLookAfter;
+    private int zombieLookAligned;
+    private float zombieLookYaw;
 
     PilotDefense(MinecraftClient client, PilotBody body, PilotHands hands) {
         this.client = client;
@@ -81,6 +89,39 @@ final class PilotDefense {
 
     void markDanger(int tick) {
         calmAfter = tick + 20;
+        stopZombieLook();
+    }
+
+    static boolean criticallyHurt(LivingEntity player) { return player.getHealth() <= 7; }
+
+    void stopZombieLook() { zombieLook = null; }
+
+    boolean checkZombieCue(PilotEars ears, int tick, boolean digging) {
+        var player = client.player;
+        if (!criticallyHurt(player) || !player.isOnGround() || player.isTouchingWater() || player.hasVehicle()
+                || player.isUsingItem() || client.currentScreen != null || !body.hasRecentView()) {
+            stopZombieLook();
+            return false;
+        }
+        if (zombieLook == null) {
+            if (!digging || tick < zombieLookAfter) return false;
+            zombieLook = ears.takeFreshZombieCue();
+            if (zombieLook == null) return false;
+            zombieLookYaw = ears.zombieBearing();
+            zombieLookUntil = System.nanoTime() + ZOMBIE_LOOK_NANOS;
+            zombieLookAfter = tick + 70;
+            zombieLookAligned = 0;
+        } else if (zombieLookAligned >= 3 || System.nanoTime() - zombieLookUntil >= 0) {
+            stopZombieLook();
+            return false;
+        }
+        if (Math.abs(MathHelper.wrapDegrees(zombieLookYaw - player.getYaw())) <= 10
+                && Math.abs(ZOMBIE_LOOK_PITCH - player.getPitch()) <= 8) zombieLookAligned++;
+        else zombieLookAligned = 0;
+        // This is a stationary camera check, not a combat target or a movement bearing.
+        body.turn(zombieLookYaw, ZOMBIE_LOOK_PITCH);
+        status = zombieLook.status;
+        return true;
     }
 
     boolean combatSelecting() {

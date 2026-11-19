@@ -87,6 +87,33 @@ final class PilotHazards {
         return result;
     }
 
+    /** Visible lava next to a cut can spill into it before it crosses the walking lane. */
+    boolean breachesDig(BlockPos foot, BlockPos standing, int tick) {
+        for (int i = 0; i < size; i++) {
+            if ((kinds[i] & LAVA) == 0 || tick - seen[i] > AGE) continue;
+            BlockPos pos = hits[i].getBlockPos();
+            if (pos.getY() >= Math.min(foot.getY(), standing.getY())
+                    && pos.getY() <= Math.max(foot.getY(), standing.getY()) + 2
+                    && (beside(pos, foot) || (kinds[i] & SOURCE) == 0 && beside(pos, standing))) return true;
+        }
+        return false;
+    }
+
+    private static boolean beside(BlockPos a, BlockPos b) {
+        return Math.abs(a.getX() - b.getX()) + Math.abs(a.getZ() - b.getZ()) <= 1;
+    }
+
+    boolean lavaNear(Box body, double margin, int tick) {
+        for (int i = 0; i < size; i++) {
+            if ((kinds[i] & LAVA) == 0 || tick - seen[i] > AGE) continue;
+            BlockPos pos = hits[i].getBlockPos();
+            if (pos.getY() + 1 > body.minY && pos.getY() < body.maxY
+                    && pos.getX() + 1 + margin > body.minX && pos.getX() - margin < body.maxX
+                    && pos.getZ() + 1 + margin > body.minZ && pos.getZ() - margin < body.maxZ) return true;
+        }
+        return false;
+    }
+
     double lavaRisk(Box body, float yaw, double distance, double rise, boolean escaping, int tick) {
         if (!(distance > 0)) return 0;
         distance = Math.min(distance, MAX_LANE);
@@ -94,7 +121,6 @@ final class PilotHazards {
         double dx = -Math.sin(angle), dz = Math.cos(angle);
         double x = (body.minX + body.maxX) * 0.5, z = (body.minZ + body.maxZ) * 0.5;
         double halfX = (body.maxX - body.minX) * 0.5, halfZ = (body.maxZ - body.minZ) * 0.5;
-        double risk = 0;
         for (int i = 0; i < size; i++) {
             if (tick - seen[i] > AGE || (kinds[i] & LAVA) == 0) continue;
             BlockHitResult hit = hits[i];
@@ -103,19 +129,16 @@ final class PilotHazards {
             if (hit.getPos().y < body.minY - (escaping ? 1.2 : MAX_LANE) || pos.getY() >= body.maxY + rise) continue;
             double minX = pos.getX() - halfX, maxX = pos.getX() + 1 + halfX;
             double minZ = pos.getZ() - halfZ, maxZ = pos.getZ() + 1 + halfZ;
-            if (!escaping) {
-                double overlap = penetration(x, z, minX, maxX, minZ, maxZ);
-                // Existing overlap is not an obstacle to a heading that immediately leaves it.
-                if (overlap > 0
-                    && penetration(x + dx * 0.01, z + dz * 0.01, minX, maxX, minZ, maxZ) < overlap - 1e-7) continue;
-            }
+            double overlap = penetration(x, z, minX, maxX, minZ, maxZ);
+            // During egress a walked landing may lead along the edge of the current flow.
+            // Permit leaving that cell, but not entering a second sighted lava cell.
+            if (overlap > 0 && (escaping
+                    ? penetration(x + dx * distance, z + dz * distance, minX, maxX, minZ, maxZ) <= 0
+                    : penetration(x + dx * 0.01, z + dz * 0.01, minX, maxX, minZ, maxZ) < overlap - 1e-7)) continue;
             double crossing = crossing(x, z, dx, dz, distance, minX, maxX, minZ, maxZ);
-            if (crossing > 0) {
-                if (!escaping) return crossing;
-                risk += crossing;
-            }
+            if (crossing > 0) return crossing;
         }
-        return risk;
+        return 0;
     }
 
     private static double penetration(double x, double z, double minX, double maxX, double minZ, double maxZ) {

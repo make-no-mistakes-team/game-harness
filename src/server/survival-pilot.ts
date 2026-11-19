@@ -265,7 +265,9 @@ export class SurvivalPilot {
     for (const key of ["HOME", "LANG", "JAVA_HOME", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
       "http_proxy", "https_proxy", "no_proxy", "ALL_PROXY", "all_proxy"])
       if (process.env[key] !== undefined) env[key] = process.env[key];
-    const child = spawn(tools.wrapper, ["-a", "-f", authority, "-s", "-screen 0 1280x720x24 -nolisten tcp", ...command], {
+    // Fedora's xvfb-run exports XAUTHORITY to clients but does not pass -auth
+    // to the server. Supply the same private file explicitly on both sides.
+    const child = spawn(tools.wrapper, ["-a", "-f", authority, "-s", `-screen 0 1280x720x24 -nolisten tcp -auth ${authority}`, ...command], {
       cwd: this.root, env, detached: true, stdio: ["ignore", "pipe", "pipe"],
     });
     const launched = performance.now();

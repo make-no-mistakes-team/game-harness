@@ -131,6 +131,20 @@ final class AgentFaceAim {
     double u(Vec3d point) { return axis == Direction.Axis.X ? point.z - z : point.x - x; }
     double v(Vec3d point) { return axis == Direction.Axis.Y ? point.z - z : point.y - y; }
 
+    boolean broadFrom(Vec3d eye, Vec3d point) {
+        double width = Math.min(uMax - uMin, vMax - vMin);
+        if (width < 0.38) return false;
+        double dx = eye.x - point.x, dy = eye.y - point.y, dz = eye.z - point.z;
+        // The projected narrow dimension, in radians to first order, falls
+        // below the broad-contact band at grazing or distant approaches.
+        return width * Math.abs(axis.choose(dx, dy, dz)) >= (dx * dx + dy * dy + dz * dz) * 0.04;
+    }
+
+    boolean sameGoal(AgentFaceAim other) {
+        return this == other || pos.equals(other.pos) && side == other.side
+            && Math.abs(plane - other.plane) <= SURFACE_EPSILON;
+    }
+
     private double minU(Box box) { return axis == Direction.Axis.X ? box.minZ : box.minX; }
     private double maxU(Box box) { return axis == Direction.Axis.X ? box.maxZ : box.maxX; }
     private double minV(Box box) { return axis == Direction.Axis.Y ? box.minZ : box.minY; }

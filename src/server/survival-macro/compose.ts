@@ -6,7 +6,10 @@ import { createMacroTrials, MACRO_TRIAL_ADAPTER_VERSION, MACRO_TRIAL_VERBS } fro
 import { TERRA_MODEL_ID } from "../../shared/survival-agent-ui.ts";
 import { SurvivalMacroController } from "./controller.ts";
 import { createNativeGapReview } from "./gap-review.ts";
-import { MACRO_CAPABILITIES_VERSION, readMacroObservation, type MacroBasis, type MacroFrame, type MacroObservation } from "./protocol.ts";
+import {
+  MACRO_CAPABILITIES_VERSION, MACRO_MAX_PLANNING_IDLE_MS, readMacroObservation,
+  type MacroBasis, type MacroFrame, type MacroInference, type MacroObservation,
+} from "./protocol.ts";
 import { MACRO_AUTOMATIC_SKILL_VERBS, SurvivalMacroSkills } from "./skills.ts";
 import { openTerraStrategist, type TerraStrategist } from "./terra.ts";
 
@@ -23,12 +26,16 @@ export interface TrustedSurvivalDisplay {
   readonly stillOwned: () => boolean;
 }
 
-export function declareTerraStrategy(options: { maxRequests: number; task?: string }, wallMs: number) {
+export function declareTerraStrategy(
+  options: { maxRequests: number; task?: string }, wallMs: number, lane?: { preparedDiagnostic: true },
+) {
+  const preparedDiagnostic = lane?.preparedDiagnostic === true;
   return {
-    strategy: "terra" as const, model: TERRA_MODEL_ID, task: options.task ?? null,
-    limits: { maxRequests: options.maxRequests, maxRuntimeMs: wallMs, requestTimeoutMs: REQUEST_TIMEOUT_MS },
+    strategy: "terra" as const, model: TERRA_MODEL_ID, task: options.task ?? null, preparedDiagnostic,
+    limits: { maxRequests: options.maxRequests, maxRuntimeMs: wallMs, requestTimeoutMs: REQUEST_TIMEOUT_MS,
+      planningIdleMs: MACRO_MAX_PLANNING_IDLE_MS },
     frame: { source: "verified-game-display", format: "image/jpeg", maxBytes: FRAME_BYTES, timeoutMs: FRAME_TIMEOUT_MS },
-    authoring: { adapterVersion: MACRO_TRIAL_ADAPTER_VERSION, lowRiskVerbs: LOW_RISK_VERBS },
+    authoring: preparedDiagnostic ? null : { adapterVersion: MACRO_TRIAL_ADAPTER_VERSION, lowRiskVerbs: LOW_RISK_VERBS },
   };
 }
 
@@ -45,6 +52,11 @@ interface TerraAttemptOptions {
   readonly signal: AbortSignal;
   readonly onDisplayLoss: () => void;
   readonly confirmNativeExit: () => Promise<boolean>;
+  readonly onProviderDispatch?: (event: { basis: MacroBasis; startedAtMs: number; wallMs: number }) => void;
+  readonly onProviderSettled?: (event: {
+    basis: MacroBasis; settledAtMs: number; wallMs: number; outcome: MacroInference["outcome"];
+    providerTerminalAtMs?: number; providerTerminalWallMs?: number;
+  }) => void;
 }
 
 function oneJpeg({ dir, display, width, height, ffmpeg }: TerraAttemptOptions, signal: AbortSignal) {
@@ -89,7 +101,11 @@ function oneJpeg({ dir, display, width, height, ffmpeg }: TerraAttemptOptions, s
 
 /** Owns one admitted Terra lane. The deterministic runner never calls this module. */
 export function composeTerraSurvival(options: TerraAttemptOptions) {
-  const { actorJarSha256, declaration, dir, display, projectRoot, signal } = options;
+  const { actorJarSha256, declaration, dir, display, projectRoot, signal, onProviderDispatch, onProviderSettled } = options;
+  if (!declaration.preparedDiagnostic && (onProviderDispatch || onProviderSettled))
+    throw new Error("Only a prepared diagnostic can observe Terra provider timing.");
+  if (declaration.preparedDiagnostic && path.dirname(dir) !== path.join(projectRoot, "local/survival-agent/diagnostic-runs"))
+    throw new Error("Prepared Terra strategy requires a diagnostic run directory.");
   const run = path.basename(dir);
   const macroDir = path.join(dir, "macro");
   let controller: SurvivalMacroController | undefined;
@@ -159,9 +175,26 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     try {
       if (!path.isAbsolute(options.authDirectory) || !(await stat(options.authDirectory)).isDirectory())
         throw new Error("The explicit GameHarness data root is not an existing absolute directory.");
+      let observedDispatch = false, observedSettlement = false;
       terra = await openTerraStrategist({
         strategy: "terra", authDirectory: options.authDirectory, runId: run, signal,
         requestTimeoutMs: declaration.limits.requestTimeoutMs, assertDispatch,
+        onProviderDispatch: onProviderDispatch && (({ basis, monotonicMs, wallMs }) => {
+          if (observedDispatch) return;
+          observedDispatch = true;
+          onProviderDispatch({ basis, startedAtMs: monotonicMs, wallMs });
+        }),
+        onProviderSettled: onProviderSettled && (({
+          basis, monotonicMs, wallMs, outcome, providerTerminalMonotonicMs, providerTerminalWallMs,
+        }) => {
+          if (observedSettlement) return;
+          observedSettlement = true;
+          onProviderSettled({
+            basis, settledAtMs: monotonicMs, wallMs, outcome,
+            ...(providerTerminalMonotonicMs !== undefined && providerTerminalWallMs !== undefined
+              ? { providerTerminalAtMs: providerTerminalMonotonicMs, providerTerminalWallMs } : {}),
+          });
+        }),
       });
       admission = "admitted";
     } catch {
@@ -171,16 +204,20 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     }
     assertDisplay();
     await mkdir(path.join(dir, FRAME_DIRECTORY), { mode: 0o700 });
-    const directory = path.join(dir, "macro-skills");
-    await mkdir(directory, { mode: 0o700 });
-    trials = createMacroTrials({ ordinaryDir: dir, actorJarSha256 });
-    skills = new SurvivalMacroSkills({
-      directory, projectRoot, worldId: run, actorJarSha256,
-      capabilityVersion: MACRO_CAPABILITIES_VERSION, adapterVersion: MACRO_TRIAL_ADAPTER_VERSION,
-      lowRiskVerbs: declaration.authoring.lowRiskVerbs, readTrial: trials.readTrial,
-      isNeutralHandoff: observation => controller?.isNeutralHandoff(observation) ?? false,
-    });
-    const nativeReview = await createNativeGapReview({ runDir: dir, projectRoot, actorJarSha256, capabilityVersion: MACRO_CAPABILITIES_VERSION });
+    const authoring = declaration.preparedDiagnostic ? null : declaration.authoring;
+    if (authoring) {
+      const directory = path.join(dir, "macro-skills");
+      await mkdir(directory, { mode: 0o700 });
+      trials = createMacroTrials({ ordinaryDir: dir, actorJarSha256 });
+      skills = new SurvivalMacroSkills({
+        directory, projectRoot, worldId: run, actorJarSha256,
+        capabilityVersion: MACRO_CAPABILITIES_VERSION, adapterVersion: authoring.adapterVersion,
+        lowRiskVerbs: authoring.lowRiskVerbs, readTrial: trials.readTrial,
+        isNeutralHandoff: observation => controller?.isNeutralHandoff(observation) ?? false,
+      });
+    }
+    const nativeReview = declaration.preparedDiagnostic ? undefined :
+      await createNativeGapReview({ runDir: dir, projectRoot, actorJarSha256, capabilityVersion: MACRO_CAPABILITIES_VERSION });
     controller = new SurvivalMacroController({
       runDir: dir, run, strategy: "terra", strategist: terra.infer, skills, trial: trials,
       nativeReview,

@@ -485,7 +485,7 @@ final class AgentPortal {
         }
         if (client.player.getEyePos().distanceTo(water.point) > 4) return;
         status = "filling the bucket from observed source water";
-        body.aim(water.point);
+        body.aimFine(water.point);
         BlockHitResult hit = observed(water.point);
         if (hit == null || !hit.getBlockPos().equals(water.pos) || !waterSource(state(hit))) {
             if (!body.aligned(water.point)) return;
@@ -597,7 +597,7 @@ final class AgentPortal {
             waterBeforeReclaim = hands.count(WATER_BUCKET);
         }
         status = "recovering the poured water after cooling lava";
-        body.aim(pouredWater.point);
+        body.aimFine(pouredWater.point);
         BlockHitResult hit = observed(pouredWater.point);
         if (tick >= nextFluidUse && hit != null && hit.getBlockPos().equals(pouredWater.pos)
                 && waterSource(state(hit)) && hands.equipForUse(BUCKET)
@@ -767,14 +767,16 @@ final class AgentPortal {
             BlockHitResult hit = observed(point);
             if (hit != null && hit.getBlockPos().equals(work.dest) && state(hit).isOf(work.block))
                 return Placement.DONE;
-            body.aim(point);
+            if (jump) body.aimFixed(point);
+            else body.aim(point);
             return Placement.WAIT;
         }
         Vec3d point = jump ? new Vec3d(client.player.getX(), work.support.getY() + 0.98, client.player.getZ())
             : work.point;
         BlockHitResult support = supportFace(work.support, work.face, point);
+        if (jump) body.aimFixed(point);
         if (support == null) {
-            body.aim(point);
+            if (!jump) body.aim(point);
             return Placement.WAIT;
         }
         AgentBody.Contact contact = jump ? AgentBody.Contact.PRECISE : AgentBody.Contact.PLACE;
@@ -911,10 +913,10 @@ final class AgentPortal {
         if (delta.horizontalLengthSquared() < 0.24 * 0.24 && delta.y < 0.35) {
             if (castTraversal) {
                 // Wait inside the portal at normal height, looking through the opening.
-                body.turn(site.facing().getPositiveHorizontalDegrees(), 9);
+                body.turnFixed(site.facing().getPositiveHorizontalDegrees(), 9);
             } else {
                 body.sneak();
-                body.aim(goal.add(0, 1.4, 0));
+                body.aimFixed(goal.add(0, 1.4, 0));
             }
             return;
         }
@@ -925,13 +927,13 @@ final class AgentPortal {
                 BlockHitResult floor = body.terrain(point, REACH).orElse(null);
                 if (floor == null || !floor.getBlockPos().equals(base) || floor.getSide() != Direction.UP
                         || !state(floor).isOf(Blocks.OBSIDIAN)) {
-                    body.aim(point);
+                    body.aimFixed(point);
                     return;
                 }
                 castEntryProved = true;
             }
             float yaw = (float) Math.toDegrees(Math.atan2(-delta.x, delta.z));
-            body.turn(yaw, 25);
+            body.turnFixed(yaw, 25);
             if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - yaw)) <= 10) body.walkDownTo(goal);
             return;
         }
@@ -961,7 +963,7 @@ final class AgentPortal {
 
     private void moveKnown(Vec3d delta, boolean jump) {
         float yaw = (float) Math.toDegrees(Math.atan2(-delta.x, delta.z));
-        body.turn(yaw, 30);
+        body.turnFixed(yaw, 30);
         if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - yaw)) > 14) return;
         body.walk(false);
         if (jump && client.player.isOnGround()) body.jump();

@@ -352,6 +352,61 @@ export async function provisionMacroTrialWorld(server: ChildProcess, serverDir: 
   await writePreparedPlayer(serverDir, profile, macroTrialFixture, signal);
 }
 
+const urgentFixture = {
+  goal: "diamond", start: [0.5, 64, 0.5], pitch: 12,
+  kit: [["oak_planks", 5], ["stick", 2]],
+  terrain: { workbench: [2, 64, 2], oakLog: [0, 64, 5] },
+} as const satisfies Fixture;
+
+export const urgentThreatWorld = {
+  type: "prepared-vanilla-creeper-interrupt-v1",
+  mode: "survival", difficulty: "normal", fresh: true,
+  spawn: { position: urgentFixture.start, yaw: 0, pitch: urgentFixture.pitch },
+  terrain: { generator: "minecraft:flat", ...urgentFixture.terrain },
+  oneTimeGrant: urgentFixture.kit,
+} as const;
+
+export async function provisionUrgentThreatWorld(server: ChildProcess, serverDir: string,
+    profile: string, signal: AbortSignal) {
+  await preJoinConsole(server, signal)([
+    ["setworldspawn 0 64 0 0", /^Set the world spawn point to 0, 64, 0 \[0(?:\.0+)?\]$/],
+    ["gamerule doMobSpawning false", /^Gamerule doMobSpawning is now set to: false$/],
+    ["gamerule doDaylightCycle false", /^Gamerule doDaylightCycle is now set to: false$/],
+    fill([-12, 63, -12], [12, 63, 12], "stone"),
+    set(urgentFixture.terrain.workbench, "crafting_table"),
+    set(urgentFixture.terrain.oakLog, "oak_log"),
+    [`time set ${DAY_TICK}`, new RegExp(`^Set the time to ${DAY_TICK}$`)],
+  ]);
+  await writePreparedPlayer(serverDir, profile, urgentFixture, signal);
+}
+
+const urgentCraftFixture = {
+  goal: "stone_pickaxe", start: [0.5, 64, 0.5], pitch: 20,
+  kit: [["cobblestone", 4], ["stick", 2]],
+  terrain: { workbench: [0, 64, 4] },
+} as const satisfies Fixture;
+
+export const urgentCraftWorld = {
+  type: "prepared-vanilla-creeper-crafting-v1",
+  mode: "survival", difficulty: "normal", fresh: true,
+  spawn: { position: urgentCraftFixture.start, yaw: 0, pitch: urgentCraftFixture.pitch },
+  terrain: { generator: "minecraft:flat", ...urgentCraftFixture.terrain },
+  oneTimeGrant: urgentCraftFixture.kit,
+} as const;
+
+export async function provisionUrgentCraftWorld(server: ChildProcess, serverDir: string,
+    profile: string, signal: AbortSignal) {
+  await preJoinConsole(server, signal)([
+    ["setworldspawn 0 64 0 0", /^Set the world spawn point to 0, 64, 0 \[0(?:\.0+)?\]$/],
+    ["gamerule doMobSpawning false", /^Gamerule doMobSpawning is now set to: false$/],
+    ["gamerule doDaylightCycle false", /^Gamerule doDaylightCycle is now set to: false$/],
+    fill([-12, 63, -12], [12, 63, 12], "stone"),
+    set(urgentCraftFixture.terrain.workbench, "crafting_table"),
+    [`time set ${DAY_TICK}`, new RegExp(`^Set the time to ${DAY_TICK}$`)],
+  ]);
+  await writePreparedPlayer(serverDir, profile, urgentCraftFixture, signal);
+}
+
 export async function provisionFixture(variant: FixtureVariant, server: ChildProcess, serverDir: string,
     profile: string, signal: AbortSignal) {
   const console = preJoinConsole(server, signal);

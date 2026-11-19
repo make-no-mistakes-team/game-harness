@@ -87,6 +87,9 @@ final class AgentBody {
     record ContactEvidence(int tick, long frame, long wallMs, String action, String status,
                            BlockPos pos, Direction side, double u, double v, double degreesPerSecond,
                            int dwellTicks, long dwellMs) {}
+    record LookEvidence(long seed, long sequence, int tick, long wallMs, String context, String profile,
+                        double effort, double distance, double appliedDegrees, double peakDegreesPerSecond,
+                        long peakAtMs, long durationMs, String outcome) {}
 
     private enum Ray {
         SIGHT(RaycastContext.ShapeType.OUTLINE, false),
@@ -114,6 +117,7 @@ final class AgentBody {
     private final AgentHazards hazards = new AgentHazards();
     private final AgentHeadroom headroom;
     private final Consumer<ContactEvidence> contactEvidence;
+    private final AgentLookMotor lookMotor;
 
     private ClientWorld observedWorld;
     private ClientPlayerEntity observedPlayer;
@@ -148,6 +152,10 @@ final class AgentBody {
     private boolean steering;
     private boolean gaitSteering;
     private boolean fallSteering;
+    private boolean fixedSteering;
+    private int fixedTick;
+    private AgentLookMotor.Context lookContext = AgentLookMotor.Context.NORMAL;
+    private AgentFaceAim lookTarget;
     private double gaitPitchVelocity;
     private long lastFrame;
     private int tick;
@@ -211,9 +219,11 @@ final class AgentBody {
     private long sourceValidNanos;
     private String sourceStatus;
 
-    AgentBody(MinecraftClient client, Consumer<ContactEvidence> contactEvidence) {
+    AgentBody(MinecraftClient client, Consumer<ContactEvidence> contactEvidence, Consumer<LookEvidence> lookEvidence,
+              long lookSeed) {
         this.client = client;
         this.contactEvidence = contactEvidence;
+        lookMotor = new AgentLookMotor(TURN_SPEED, lookSeed, lookEvidence);
         headroom = new AgentHeadroom(client, this);
     }
 
@@ -279,7 +289,7 @@ final class AgentBody {
     /** Withdraw ordinary work without clearing the rendered view or emergency state. */
     void pauseWork() {
         resetIntentions();
-        steering = gaitSteering = fallSteering = false;
+        steering = gaitSteering = fallSteering = fixedSteering = false;
         gaitPitchVelocity = 0;
         aimPoint = null;
         clearContact();
@@ -288,14 +298,31 @@ final class AgentBody {
     /** Called before GameRenderer computes this frame's camera and crosshair. */
     void frame() {
         long now = System.nanoTime();
-        double dt = lastFrame == 0 ? 0 : Math.min((now - lastFrame) * 1e-9, 0.05);
+        double elapsed = lastFrame == 0 ? 0 : (now - lastFrame) * 1e-9;
+        double dt = Math.min(elapsed, 0.05);
+        if (lastFrame != 0 && now - lastFrame > 150_000_000L) lookMotor.stop(now);
         lastFrame = now;
-        if (!steering || !ready() || dt <= 0) return;
+        if (!steering || !ready()) {
+            lookMotor.stop(now);
+            return;
+        }
+        if (dt <= 0) return;
         var player = client.player;
         Vec3d origin = aimPoint == null ? null
             : player.getCameraPosVec(client.getRenderTickCounter().getTickDelta(true));
-        double yaw = MathHelper.wrapDegrees(goalYaw(player, origin) - player.getYaw());
-        double pitch = goalPitch(origin) - player.getPitch();
+        float yawBefore = player.getYaw(), pitchBefore = player.getPitch();
+        float targetYaw = goalYaw(player, origin), targetPitch = goalPitch(origin);
+        if (!gaitSteering && !fallSteering && !fixedSteering && !lavaEmergency) {
+            lookMotor.step(lookContext, lookTarget, yawBefore, pitchBefore, targetYaw, targetPitch, dt, now, tick);
+            if (lookMotor.yawStep() != 0 || lookMotor.pitchStep() != 0) {
+                player.changeLookDirection(lookMotor.yawStep() / 0.15, lookMotor.pitchStep() / 0.15);
+            }
+            lookMotor.applied(MathHelper.wrapDegrees(player.getYaw() - yawBefore), player.getPitch() - pitchBefore,
+                dt, elapsed, now);
+            return;
+        }
+        double yaw = MathHelper.wrapDegrees(targetYaw - yawBefore);
+        double pitch = targetPitch - pitchBefore;
         double response = -Math.expm1(-dt / TURN_TIME);
         if (gaitSteering) {
             double yawStep = MathHelper.clamp(yaw * response, -TURN_SPEED * dt, TURN_SPEED * dt);
@@ -310,16 +337,27 @@ final class AgentBody {
             if (Math.abs(yawStep) + Math.abs(pitchStep) >= 1e-5) {
                 player.changeLookDirection(yawStep / 0.15, pitchStep / 0.15);
             }
+            recordProtectedLook(AgentLookMotor.Context.GAIT, targetYaw, targetPitch, yawBefore, pitchBefore,
+                Math.hypot(yaw, pitch), elapsed, now);
             return;
         }
         double distance = Math.hypot(yaw, pitch);
-        if (distance < 1e-4) return;
-        // A real fall can have only a few ticks of reach. Still move through the mouse path.
-        double fraction = fallSteering
-            ? Math.min(-Math.expm1(-dt / 0.025), 920 * dt / distance)
-            : Math.min(response, TURN_SPEED * dt / distance);
-        // This is the same pose update Mouse uses, including the previous render angles.
-        player.changeLookDirection(yaw * fraction / 0.15, pitch * fraction / 0.15);
+        if (distance >= 1e-4) {
+            // A real fall can have only a few ticks of reach. Still use the mouse path.
+            double fraction = fallSteering
+                ? Math.min(-Math.expm1(-dt / 0.025), 920 * dt / distance)
+                : Math.min(response, TURN_SPEED * dt / distance);
+            player.changeLookDirection(yaw * fraction / 0.15, pitch * fraction / 0.15);
+        }
+        AgentLookMotor.Context context = fallSteering ? AgentLookMotor.Context.FALL
+            : lavaEmergency ? AgentLookMotor.Context.URGENT : lookContext;
+        recordProtectedLook(context, targetYaw, targetPitch, yawBefore, pitchBefore, distance, elapsed, now);
+    }
+
+    private void recordProtectedLook(AgentLookMotor.Context context, float yaw, float pitch, float beforeYaw,
+                                     float beforePitch, double remaining, double dt, long now) {
+        lookMotor.legacy(context, yaw, pitch, remaining, MathHelper.wrapDegrees(client.player.getYaw() - beforeYaw),
+            client.player.getPitch() - beforePitch, dt, now, tick);
     }
 
     /** Called at WorldRenderEvents.START, when the actual render projection is available. */
@@ -714,10 +752,12 @@ final class AgentBody {
         steering = false;
         gaitSteering = false;
         fallSteering = false;
+        fixedSteering = false;
         controlledBoat = null;
         gaitPitchVelocity = 0;
         aimPoint = null;
         lastFrame = 0;
+        finishWorldLook();
         clearView();
         hazards.clear();
         headroom.reset();
@@ -769,7 +809,22 @@ final class AgentBody {
         steering = true;
         gaitSteering = false;
         fallSteering = false;
+        fixedSteering = false;
+        lookContext = AgentLookMotor.Context.NORMAL;
+        lookTarget = null;
         gaitPitchVelocity = 0;
+    }
+
+    void aimFixed(Vec3d point) {
+        aim(point);
+        protectLook(AgentLookMotor.Context.PHYSICAL);
+    }
+
+    void aimFine(Vec3d point) { aimContactPoint(point, true); }
+
+    void aimUrgent(Vec3d point) {
+        aim(point);
+        protectLook(AgentLookMotor.Context.URGENT);
     }
 
     void aimDuringFall(Vec3d point) {
@@ -788,6 +843,34 @@ final class AgentBody {
         gaitPitchVelocity = 0;
     }
 
+    void turnScan(float yaw, float pitch) {
+        turn(yaw, pitch);
+        lookContext = AgentLookMotor.Context.SCAN;
+    }
+
+    void turnFine(float yaw, float pitch) {
+        turn(yaw, pitch);
+        lookContext = AgentLookMotor.Context.FINE;
+    }
+
+    void turnFixed(float yaw, float pitch) {
+        turn(yaw, pitch);
+        protectLook(AgentLookMotor.Context.PHYSICAL);
+    }
+
+    void turnUrgent(float yaw, float pitch) {
+        turn(yaw, pitch);
+        protectLook(AgentLookMotor.Context.URGENT);
+    }
+
+    private void protectLook(AgentLookMotor.Context context) {
+        fixedSteering = true;
+        fixedTick = tick;
+        lookContext = context;
+    }
+
+    void finishWorldLook() { lookMotor.stop(System.nanoTime()); }
+
     void lookAlongGait(float yaw, float pitch) {
         setTurn(yaw, pitch);
         gaitSteering = true;
@@ -799,6 +882,9 @@ final class AgentBody {
         aimPitch = MathHelper.clamp(pitch, -90, 90);
         steering = true;
         fallSteering = false;
+        fixedSteering = false;
+        lookContext = AgentLookMotor.Context.NORMAL;
+        lookTarget = null;
     }
 
     private float goalYaw(ClientPlayerEntity player, Vec3d origin) {
@@ -832,7 +918,7 @@ final class AgentBody {
         if (!hasView() || witness.getType() != HitResult.Type.BLOCK || witness.isInsideBlock()
                 || mode == Contact.LEAP_PLACE && witness.getSide() != Direction.UP) return false;
         if (!inView(witness.getPos())) {
-            if (mode != Contact.LEAP_PLACE) aim(witness.getPos());
+            if (mode != Contact.LEAP_PLACE) aimContactFallback(witness.getPos(), mode);
             return false;
         }
         if (contactTick == tick && mode == contactMode && contact != null && contact.sameSurface(witness))
@@ -851,7 +937,7 @@ final class AgentBody {
                 if (live != null && mode != Contact.OUTLINE && !litFace(live)) live = null;
             }
             if (!sameBlockFace(witness, live)) {
-                if (mode != Contact.LEAP_PLACE) aim(witness.getPos());
+                if (mode != Contact.LEAP_PLACE) aimContactFallback(witness.getPos(), mode);
                 return false;
             }
             witness = live;
@@ -914,8 +1000,24 @@ final class AgentBody {
                 }
             }
         }
-        aim(contactPoint == null ? witness.getPos() : contactPoint);
+        aimRegion(contact, contactPoint == null ? witness.getPos() : contactPoint, mode.precise);
         return true;
+    }
+
+    private void aimRegion(AgentFaceAim region, Vec3d point, boolean precise) {
+        aimContactPoint(point, precise || !region.broadFrom(eye, point));
+        lookTarget = region;
+    }
+
+    private void aimContactFallback(Vec3d point, Contact mode) {
+        aimContactPoint(point, mode.precise);
+    }
+
+    private void aimContactPoint(Vec3d point, boolean precise) {
+        AgentLookMotor.Context protectedContext = fixedSteering && fixedTick == tick ? lookContext : null;
+        aim(point);
+        if (protectedContext != null) protectLook(protectedContext);
+        else if (precise) lookContext = AgentLookMotor.Context.FINE;
     }
 
     private boolean visibleContact(Vec3d point, double reach) {
@@ -1109,7 +1211,7 @@ final class AgentBody {
                 || !(currentCrosshair() instanceof BlockHitResult now) || !contact.admits(now)
                 || client.world.getBlockState(target) != contactState) return false;
         contactTick = tick;
-        if (contactPoint != null) aim(contactPoint);
+        if (contactPoint != null) aimRegion(contact, contactPoint, false);
         mining = target;
         return true;
     }
@@ -1207,7 +1309,7 @@ final class AgentBody {
     }
 
     void macroFlatWalk(Vec3d landing, float yaw, float pitch) {
-        turn(yaw, pitch);
+        turnFixed(yaw, pitch);
         prioritizeMovement();
         walkDownTo(landing);
         flatWalk = true;
@@ -1280,7 +1382,7 @@ final class AgentBody {
             sourceStatus = null;
         }
         sourceTick = tick;
-        aim(sourcePoint);
+        aimRegion(sourceContact, sourcePoint, true);
         if (!fallUseReady() || !player.getMainHandStack().isOf(Items.BUCKET)
                 || renderedCrosshair instanceof EntityHitResult || currentCrosshair() instanceof EntityHitResult)
             return reportSource(lava, "input_refused", null);

@@ -61,6 +61,7 @@ final class AgentProgress {
     private static final int LOCAL_LIGHT = 12;
     private static final int KIT_WOOD_PICK = 1, KIT_STONE_PICK = 1 << 1, KIT_DEEP_PICK = 1 << 2;
     private static final int KIT_LIGHT = 1 << 3, KIT_IRON = 1 << 4, KIT_STONE = 1 << 5, KIT_WOOD = 1 << 6;
+    private static final int KIT_WORKBENCH = 1 << 7, KIT_FURNACE = 1 << 8;
     // Planning for ordinary burnable planks in Java 1.21.4; furnace loading checks the actual stack's fuel value.
     private static final int PLANK_BURN_TICKS = 300;
     private static final int ORE_MEMORY_LIMIT = 18;
@@ -187,8 +188,7 @@ final class AgentProgress {
     private Resource caveGoal;
     private boolean lavaProspecting, caveLava;
     private BlockPos cavePeek;
-    private BlockPos stalledCaveFoot;
-    private int stalledCaveUntil;
+    private final CaveRetreat caveRetreat = new CaveRetreat();
     private int caveLookUntil, caveOpenings, caveFootsteps;
     private final AgentDefense defense;
     private final AgentPortal portal;
@@ -379,6 +379,7 @@ final class AgentProgress {
     private Item mealItem;
     private int mealSlot, mealCount, mealStartHunger;
     private int mealUntil, mealRetry, mealQuietUntil;
+    private long emergencyMealJob;
     private float mealHealth = Float.NaN;
     private Forage forage;
     private Entity forageEntity;
@@ -573,8 +574,7 @@ final class AgentProgress {
         boolean continuing = caves.active();
         if (!continuing) {
             if (planned == null || digDirection == null) return false;
-            if (tick < stalledCaveUntil && c.player.getBlockPos().getSquaredDistance(stalledCaveFoot) <= 36
-                    && planned.getSquaredDistance(stalledCaveFoot) <= 36) return false;
+            if (caveRetreat.retired(planned)) return false;
             caveLava = lavaProspecting;
             caveGoal = sought == Resource.DIAMOND || sought == Resource.IRON || sought == Resource.COAL ? sought
                 : has(DEEP_PICK, 1) ? Resource.DIAMOND : Resource.IRON;
@@ -598,7 +598,7 @@ final class AgentProgress {
             status = fall.status();
             return true;
         }
-        return false;
+        return caves.deferredOpening() != null && caveRetreat.begin(caves.deferredOpening());
     }
 
     String status() {
@@ -639,27 +639,26 @@ final class AgentProgress {
             status = "died before " + goal;
             return;
         }
-        boolean macroAction = macro != null && macro.hasAction();
-        if (!macroAction && portal != null && portal.updateArrival()) {
-            win = true;
-            status = "entered the Nether through constructed portal";
-            return;
-        }
-        if (!macroAction && goalItem != null && !hands.busy() && c.currentScreen == null && has(goalItem, 1)) {
-            win = true;
-            status = "obtained " + goal;
-            return;
-        }
+        boolean macroEngaged = macro != null && macro.engaged();
+        if (!macroEngaged && confirmGoal()) return;
         trackMotion();
         float health = c.player.getHealth();
         boolean hurt = health < previousHealth;
         previousHealth = health;
-        boolean escaping = escapeDanger(hurt, macro != null && macro.engaged());
+        boolean escaping = escapeDanger(hurt, macroEngaged);
         if ((hurt || escaping) && dropReclaim != null) dropReclaim.cancel();
         if (escaping) {
+            if (macroEngaged) macro.urgent(status);
             caves.interruptLight(tick);
             stallGuard.priorityAim();
             return;
+        }
+        boolean freeFallHands = macroEngaged && !c.player.isOnGround() && !c.player.isTouchingWater()
+            && !c.player.hasVehicle() && c.player.getVelocity().y < -0.27
+            && (hands.busy() || c.currentScreen instanceof HandledScreen<?>);
+        if (freeFallHands) {
+            macro.urgent("releasing the screen and hands during a fall");
+            interruptHands();
         }
         if (fall.step()) {
             if (dropReclaim != null) dropReclaim.cancel();
@@ -668,27 +667,27 @@ final class AgentProgress {
             body.prioritizeMovement();
             stallGuard.priorityAim();
             status = fall.status();
+            if (macroEngaged) macro.urgent(status);
             return;
         }
-        if (macro != null && macro.engaged()) {
-            if (!hands.busy() && c.currentScreen == null &&
-                    (mealUntil != 0 || needsEmergencyFood(c.player.getHungerManager().getFoodLevel())) && eatOrHunt()) {
-                caves.interruptLight(tick);
-                defense.stopZombieLook();
-                stallGuard.priorityAim();
-                return;
-            }
+        if (freeFallHands) {
+            status = "releasing the screen and hands during a fall";
+            return;
+        }
+        if (macroEngaged) {
             if (!hands.busy() && c.currentScreen == null && defense.checkZombieCue(ears, tick,
                     nextFoot != null || c.options.attackKey.isPressed() && c.interactionManager.isBreakingBlock())) {
                 body.prioritizeMovement();
                 stallGuard.priorityAim();
                 status = defense.status();
+                macro.urgent(status);
                 return;
             }
-            if (macro.control(this)) {
-                status = macro.status();
-                return;
-            }
+            if (macroEmergencyMeal(macro)) return;
+            if (!macro.hasAction() && confirmGoal()) return;
+            macro.control(this);
+            status = macro.status();
+            return;
         }
         if (hands.busy()) return;
         if (handleScreen()) return;
@@ -712,6 +711,14 @@ final class AgentProgress {
         if (!stallGuard.ownsRecovery() && body.repairHeadroom(tools, protectedHeadroom)) {
             status = body.headroomReport().reason();
             return;
+        }
+        if (caveRetreat.step()) return;
+        if (stallGuard.caveSurveyStalled()) {
+            AgentCaves.Opening opening = caves.drySurveyOpening();
+            if (opening != null && caveRetreat.begin(opening)) {
+                caves.leaveDrySurvey(tick);
+                return;
+            }
         }
         if (stallGuard.takeTurn(stallReplan, stallChoose, stallStep, stallRelease)) {
             body.prioritizeMovement();
@@ -834,13 +841,20 @@ final class AgentProgress {
         mineDiamonds(goal.equals("nether_portal") ? 3 : 1);
     }
 
+    private boolean confirmGoal() {
+        if (portal != null && portal.updateArrival()) {
+            win = true;
+            status = "entered the Nether through constructed portal";
+        } else if (goalItem != null && !hands.busy() && c.currentScreen == null && has(goalItem, 1)) {
+            win = true;
+            status = "obtained " + goal;
+        }
+        return win;
+    }
+
     private void replanStalledLocalWork() {
         rememberStallWork();
         surfaceApproach.abandon();
-        if (caves.active() && c.player.isOnGround()) {
-            stalledCaveFoot = c.player.getBlockPos();
-            stalledCaveUntil = tick + 300;
-        }
         if (refitPickCount >= 0) {
             refitPickCount = -1;
             refitPickRetry = tick + 150;
@@ -899,7 +913,21 @@ final class AgentProgress {
         if (!iron && has(INGOT, 3)) kit |= KIT_IRON;
         if (!iron && !stone && has(STONE, 3)) kit |= KIT_STONE;
         if (!iron && !stone && !wooden && affordsWood(3, 2)) kit |= KIT_WOOD;
+        // Count an actual owned station when it can advance this leg, separately from wood
+        // that was already convertible in theory. Do not credit spare copies or slot changes.
+        if (!iron && has(table.item, 1) && stallWorkbenchNeeded(kit)) kit |= KIT_WORKBENCH;
+        if (!iron && stone && has(furnace.item, 1) && stallFurnaceNeeded()) kit |= KIT_FURNACE;
         return kit;
+    }
+
+    private boolean stallWorkbenchNeeded(int kit) {
+        return (kit & KIT_WOOD) != 0 || (kit & (KIT_STONE | KIT_IRON)) != 0 && affordsWood(0, 2);
+    }
+
+    private boolean stallFurnaceNeeded() {
+        int missing = 3 - hands.count(INGOT);
+        return missing > 0 && has(RAW_IRON, missing)
+            && (has(FUEL, 1) || affordsWood(localTableWood() + furnacePlanks(missing), 2));
     }
 
     /** Inspect only the existing camera, owned items and actually traveled routes; do not perform another sweep. */
@@ -916,32 +944,25 @@ final class AgentProgress {
             stallWork = () -> AgentStallGuard.Alternative.REPLAN;
             return "replanning from changed settled footing at " + c.player.getBlockPos().toShortString();
         }
-        if (stallStation != null && (portal == null || !portal.locallyStopped())) {
-            Station station = stallStation;
-            BlockHitResult other = body.find(state -> state.isOf(station.block), REACH - 0.5,
-                hit -> !hit.getBlockPos().equals(stallStationPosition) && !stallOreTried.contains(hit.getBlockPos()))
-                .orElse(null);
-            if (other != null) {
-                station.position = confirmStation(station, other);
-                if (station == furnace) furnaceWitness = station.position;
-                station.lastUse = null;
-                station.siteSince = station.stageSince = station.stage = 0;
-                station.placed = station.approachUntil = station.openAttempts = 0;
-                stallOreTried.add(station.position);
-                stallWork = () -> AgentStallGuard.Alternative.REPLAN;
-                return "switching to a different witnessed " + station.recipe + " at " + station.position.toShortString();
-            }
-        }
         if (goalItem != null) {
             String pickup = stallPickup(goalItem, goal);
             if (pickup != null) return pickup;
         }
-        int kit = availableStallKit();
-        if ((kit & ~stallKit) != 0 && (portal == null || !portal.locallyStopped())) {
-            stallKit |= kit;
-            replanStalledLocalWork();
-            stallWork = () -> AgentStallGuard.Alternative.REPLAN;
-            return "replanning with newly available owned tools, light or materials";
+        int kit = availableStallKit(), gained = kit & ~stallKit;
+        if (portal == null || !portal.locallyStopped()) {
+            String station = stallStation == null ? null : stallVisibleStation(stallStation);
+            if (station == null && stallStation != table && stallWorkbenchNeeded(kit)) station = stallVisibleStation(table);
+            if (station == null && stallStation != furnace && (kit & (KIT_STONE_PICK | KIT_DEEP_PICK)) == KIT_STONE_PICK
+                    && stallFurnaceNeeded()) station = stallVisibleStation(furnace);
+            if (station != null) return station;
+            if (gained != 0) {
+                stallKit |= kit;
+                replanStalledLocalWork();
+                stallWork = () -> AgentStallGuard.Alternative.REPLAN;
+                if ((gained & KIT_WORKBENCH) != 0) return "replanning with an owned crafting table and pickaxe ingredients";
+                if ((gained & KIT_FURNACE) != 0) return "replanning with an owned furnace, raw iron and fuel";
+                return "replanning with newly available owned tools, light or materials";
+            }
         }
         String resource;
         if (has(DEEP_PICK, 1) && (goal.equals("diamond") || portal != null && !has(DIAMOND, 3) && !has(DIAMOND_PICK, 1))) {
@@ -977,6 +998,22 @@ final class AgentProgress {
             if (resource != null) return resource;
         }
         return stallKnownRoute();
+    }
+
+    private String stallVisibleStation(Station station) {
+        BlockHitResult other = body.find(state -> state.isOf(station.block), REACH - 0.5,
+            hit -> !hit.getBlockPos().equals(station == stallStation ? stallStationPosition : station.position)
+                && !stallOreTried.contains(hit.getBlockPos())).orElse(null);
+        if (other == null) return null;
+        station.position = confirmStation(station, other);
+        if (station == furnace) furnaceWitness = station.position;
+        station.face = null;
+        station.lastUse = null;
+        station.siteSince = station.stageSince = station.stage = 0;
+        station.placed = station.approachUntil = station.openAttempts = 0;
+        stallOreTried.add(station.position);
+        stallWork = () -> AgentStallGuard.Alternative.REPLAN;
+        return "using a different witnessed " + station.recipe + " at " + station.position.toShortString();
     }
 
     private String stallTimber() {
@@ -1306,16 +1343,6 @@ final class AgentProgress {
             status = "waiting for game view";
         }
         return true;
-    }
-
-    void macroRetireWorkstation() {
-        // Only a pending or already verified ordinary station belongs to our handoff.
-        if (c.currentScreen instanceof CraftingScreen screen && tableRecipe != null && table.face != null) {
-            screen.close();
-        } else if (c.currentScreen instanceof FurnaceScreen screen && (ownsFurnaceScreen(screen)
-                || firing != Firing.NONE && furnaceWitness != null && furnaceWitness.equals(furnace.position))) {
-            screen.close();
-        }
     }
 
     private boolean ownsFurnaceScreen(FurnaceScreen screen) {
@@ -1730,6 +1757,7 @@ final class AgentProgress {
     }
 
     private void requestTable(String recipe, String extra, String axe, int planks, int sticks) {
+        if (!hands.stableCraftFooting()) return;
         if (fieldBench.packUntil != 0) fieldBench.leave();
         if (table.position != null && c.player.getEyePos().distanceTo(Vec3d.ofCenter(table.position)) > 4.0) {
             int bench = stationWaypoint(table.position);
@@ -2255,7 +2283,7 @@ final class AgentProgress {
         }
         var base = station.underfoot;
         status = "lining up jump placement of " + station.recipe;
-        body.turn(c.player.getYaw(), 90);
+        body.turnFixed(c.player.getYaw(), 90);
         var actual = body.selectedFace();
         if (actual == null || actual.getSide() != Direction.UP || !actual.getBlockPos().equals(base)) return;
         status = "jump-placing " + station.recipe;
@@ -3582,6 +3610,18 @@ final class AgentProgress {
         }
         Vec3d position = pickupPosition;
         Vec3d delta = position.subtract(c.player.getPos());
+        if (drop == DIAMOND || drop == RAW_IRON || drop == FUEL || drop == STONE) {
+            Walk pickup = walkOreDrop(entity, position, delta);
+            if (pickup != Walk.BLOCKED) {
+                status = "collecting visible drops on supported ground";
+                return true;
+            }
+            // A loose item is not a route. Leave it for reobservation from a later
+            // grounded stance rather than excavating or jumping toward its last position.
+            abandonPickup(drop, 45);
+            status = "leaving the visible drop until there is a supported approach";
+            return true;
+        }
         if (delta.getY() > 1.45) {
             if (drop == LOG && tick - pickupSeen < 10 && tick - pickupStarted < 26) {
                 body.aim(position);
@@ -3636,6 +3676,47 @@ final class AgentProgress {
         }
         status = "collecting visible drops";
         return true;
+    }
+
+    private Walk walkOreDrop(Entity entity, Vec3d point, Vec3d delta) {
+        if (!dryFieldFooting()) return Walk.LOOKING;
+        if (delta.y < -0.42 || delta.y > 0.65) return Walk.BLOCKED;
+        if (entity == null)
+            return tick - pickupSeen <= 8 ? Walk.LOOKING : Walk.BLOCKED;
+        double distance = Math.sqrt(delta.horizontalLengthSquared());
+        if (distance <= 0.48 || !entity.isOnGround()) {
+            body.aim(point);
+            return Walk.LOOKING; // Wait for a settled visible item or passive pickup.
+        }
+        float yaw = yaw(delta);
+        body.turn(yaw, 48);
+        if (!body.renderedDirection(yaw, 48, 5) || bearingDistance(yaw, c.player.getYaw()) > 4)
+            return Walk.LOOKING;
+        if (body.hazardAhead(yaw, 1.25) || c.player.horizontalCollision || stuck >= 8) return Walk.BLOCKED;
+        Vec3d feet = c.player.getPos();
+        Vec3d eye = c.player.getEyePos();
+        Vec3d lane = forward(c.player.getYaw());
+        // Check both the near and braking portions of the actual body-width lane,
+        // not the block under the item, which may be beyond a hole.
+        double end = Math.min(0.83, distance);
+        for (int sample = 1; sample <= 2; sample++) {
+            double ahead = end * (sample == 1 ? 0.65 : 1);
+            for (int side = -1; side <= 1; side++) {
+                Vec3d foot = feet.add(ahead * lane.x + 0.27 * side * lane.z, 0,
+                    ahead * lane.z - 0.27 * side * lane.x);
+                Vec3d below = foot.add(0, -0.08, 0);
+                BlockHitResult floor = terrain(below, eye.distanceTo(below) + 0.06);
+                if (floor == null || floor.getSide() != Direction.UP || !safeSupport(floor)
+                        || Math.abs(floor.getPos().y - feet.y) > 0.08
+                        || horizontalDistance(floor.getPos(), foot) > 0.13
+                        || !body.clearTerrain(foot.add(0, 0.40, 0))
+                        || !body.clearTerrain(foot.add(0, 1.02, 0))) return Walk.BLOCKED;
+            }
+        }
+        // Crouch prevents a momentum tick at the brink and disables collision auto-jump.
+        body.sneak();
+        if (c.player.isSneaking()) walk(false);
+        return Walk.MOVING;
     }
 
     private void clearPickup() {
@@ -3879,7 +3960,7 @@ final class AgentProgress {
             if (!c.player.isOnGround() || c.player.isTouchingWater()) return false;
             BlockPos standing = c.player.getBlockPos();
             Vec3d point = c.player.getPos().add(0, -0.06, 0);
-            body.turn(c.player.getYaw(), 86);
+            body.turnFixed(c.player.getYaw(), 86);
             status = "checking the rock footing of the equipped expedition";
             BlockHitResult floor = terrain(point, c.player.getEyePos().distanceTo(point) + 0.09);
             if (!visibleTop(floor, standing)) return true;
@@ -4279,6 +4360,7 @@ final class AgentProgress {
             } else {
                 if (current.getY() > depth) {
                     // This open column had no reachable top at the planned or nearby heights.
+                    if (caveRetreat.begin(new AgentCaves.Opening(current, digDirection))) return;
                     // Let the next attempt face a different column instead of the same void one block up.
                     failedDirections |= 1;
                 }
@@ -4418,7 +4500,7 @@ final class AgentProgress {
             };
             BlockPos candidate = current.offset(digDirection);
             if (descending && ((failedDirections & 1) == (landing ? 1 : 0))) candidate = candidate.down();
-            if (trail.contains(candidate) || closedDig.contains(candidate)) continue;
+            if (trail.contains(candidate) || closedDig.contains(candidate) || caveRetreat.retired(candidate)) continue;
             nextFoot = candidate;
             return true;
         }
@@ -4570,6 +4652,137 @@ final class AgentProgress {
         forcedLight = false;
         failedDirections++;
         legLength = 0;
+    }
+
+    /** Retreat on walked cells, then witness a different cut at the older shaft. */
+    private final class CaveRetreat {
+        private final List<BlockPos> mouths = new ArrayList<>(8);
+        private final List<BlockPos> newLegs = new ArrayList<>(8);
+        private ClientWorld world;
+        private BlockPos shaft;
+        private Direction oldLeg, away, probe;
+        private int deadline, probeSince, choice;
+        private boolean supported;
+
+        private boolean retired(BlockPos planned) {
+            if (c.world != world) return false;
+            return mouths.contains(planned) || mouths.contains(planned.up());
+        }
+
+        private boolean begin(AgentCaves.Opening opening) {
+            if (shaft != null || returnIndex >= 0 || resumeIndex >= 0 || exitStart != null
+                    || !dryFieldFooting() || !has(DEEP_PICK, 1) && !has(STONE_PICK, 1) || !has(TORCH, 2)
+                    || c.player.getBlockY() <= (has(DEEP_PICK, 1) ? DIAMOND_LEVEL : 16)) return false;
+            BlockPos standing = c.player.getBlockPos();
+            int end = trail.size() - 1;
+            int lip = trail.lastIndexOf(opening.origin());
+            if (end < 2 || lip < 1 || !trail.getLast().equals(standing) || end - lip > 8) return false;
+            int preferred = Math.max(1, lip - 3), back = end;
+            while (back > preferred) {
+                BlockPos here = trail.get(back), prior = trail.get(back - 1);
+                if (!adjacent(here, prior) || sameStem(here, prior)) break;
+                back--;
+            }
+            if (back >= lip) return false;
+            BlockPos earlier = trail.get(back);
+            // A walked route may dip before a cave ledge rises. It is the
+            // re-observed dry rock at the older stance, not its altitude, that matters.
+            if (earlier.equals(standing)) return false;
+            if (c.world != world) {
+                world = c.world;
+                mouths.clear();
+                newLegs.clear();
+            }
+            BlockPos mouth = opening.mouth();
+            if (mouths.contains(mouth)) return false;
+            if (mouths.size() == 8) mouths.removeFirst();
+            mouths.add(mouth);
+            shaft = earlier;
+            oldLeg = directional(Vec3d.ofBottomCenter(trail.get(back + 1)).subtract(Vec3d.ofBottomCenter(shaft)));
+            away = opening.bearing().getOpposite();
+            deadline = tick + 440;
+            supported = false;
+            probe = null;
+            choice = 0;
+            probeSince = tick;
+            startReturn(back, false);
+            body.pauseWork();
+            status = "leaving an unproved cave descent along the walked mine";
+            return true;
+        }
+
+        private boolean step() {
+            if (shaft == null) return false;
+            if (world != c.world) return reset();
+            if (tick >= deadline || exitStart != null) return refuse("could not retrace the walked mine from the cave");
+            if (returnIndex >= 0) {
+                if (!shaft.equals(trail.get(returnTo))) return reset();
+                retreatTunnel();
+                if (returnIndex < 0) probeSince = tick;
+                return true;
+            }
+            if (!arrived(shaft) || !dryFieldFooting()) return refuse("lost the dry mine branch footing");
+            if (!supported) {
+                // Ground contact alone is not evidence of a suitable mine base.
+                Vec3d foot = c.player.getPos().add(0, -0.035, 0);
+                body.aim(foot);
+                BlockHitResult hit = terrain(foot, 2.4);
+                if (hit != null && hit.getBlockPos().equals(shaft.down()) && hit.getSide() == Direction.UP
+                        && safeSupport(hit) && state(hit).isIn(BlockTags.BASE_STONE_OVERWORLD)) {
+                    supported = true;
+                    probeSince = tick;
+                } else if (tick - probeSince >= 34) return refuse("no visible rock top on the old shaft footing");
+                status = "checking the dry rock footing of the walked shaft";
+                return true;
+            }
+            if (probe == null) {
+                while (probe == null && choice < 3) {
+                    Direction direction = switch (choice++) {
+                        case 0 -> away;
+                        case 1 -> away.rotateYClockwise();
+                        default -> away.rotateYCounterclockwise();
+                    };
+                    BlockPos start = shaft.offset(direction);
+                    if (direction != oldLeg && !trail.contains(start) && !trail.contains(start.down())
+                            && !closedDig.contains(start) && !closedDig.contains(start.down())
+                            && !retired(start) && !newLegs.contains(start)) probe = direction;
+                }
+                if (probe == null) return refuse("no different solid descending branch was visible from the walked shaft");
+                probeSince = tick;
+            }
+            BlockPos face = shaft.offset(probe).up();
+            Vec3d point = Vec3d.ofCenter(face);
+            body.aim(point);
+            status = "checking a different rock face away from the cave";
+            BlockHitResult seen = perceive(point, 3.35);
+            if (seen != null && seen.getBlockPos().equals(face) && seen.getSide() == probe.getOpposite()
+                    && state(seen).isIn(BlockTags.BASE_STONE_OVERWORLD) && tools.canHarvest(state(seen))
+                    && !protectRecoveryBlock(face) && !body.hazardAhead(probe.getPositiveHorizontalDegrees(), 1.65)) {
+                if (newLegs.size() == 8) newLegs.removeFirst();
+                newLegs.add(shaft.offset(probe));
+                digDirection = probe;
+                failedDirections = stairLength = legLength = deadEnds = 0;
+                nextDigStart = tick;
+                stallGuard.mineBranchReady(shaft);
+                status = "returned to the walked shaft; starting a different supported descending branch";
+                reset();
+            } else if (tick - probeSince >= 30) probe = null;
+            return true;
+        }
+
+        private boolean refuse(String reason) {
+            returnIndex = -1;
+            exitStart = exitTo = null;
+            body.pauseWork();
+            localBlock = reason;
+            reset();
+            return true;
+        }
+
+        private boolean reset() {
+            shaft = null;
+            return false;
+        }
     }
 
     private void closeDig(BlockPos position) {
@@ -4951,13 +5164,23 @@ final class AgentProgress {
             if (result == Dig.CLEAR) climbCheck++;
             return Walk.LOOKING;
         }
-        if (climbCheck == 3) {
-            Vec3d lip = Vec3d.ofCenter(to.down(), 0.29);
+        if (climbCheck <= 4) {
+            int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ();
+            // A near, upper edge of the known support may be visible when the
+            // lower center is hidden by the current ledge.
+            boolean upper = climbCheck == 3;
+            Vec3d lip = Vec3d.ofCenter(to.down(), upper ? 0.90 : 0.29);
+            if (upper) lip = lip.add(-0.37 * dx, 0, -0.37 * dz);
             body.aim(lip);
             if (!body.aligned(lip)) return Walk.LOOKING;
             BlockHitResult hit = terrain(lip, 2.75);
-            if (hit == null || !hit.getBlockPos().equals(to.down()) || !safeSupport(hit)) return Walk.BLOCKED;
-            climbCheck++;
+            if (hit == null || !hit.getBlockPos().equals(to.down()) || !safeSupport(hit)
+                    || !Block.isShapeFullCube(state(hit).getCollisionShape(c.world, hit.getBlockPos()))) {
+                if (!upper) return Walk.BLOCKED;
+                climbCheck++;
+                return Walk.LOOKING;
+            }
+            climbCheck = 5;
         }
         Vec3d feet = c.player.getPos();
         Vec3d delta = Vec3d.ofBottomCenter(to).subtract(feet);
@@ -5119,7 +5342,7 @@ final class AgentProgress {
         }
         if (!hands.equipForUse(BUILDING)) return true;
         BlockPos support = exitFrom.down();
-        body.turn(c.player.getYaw(), 90);
+        body.turnFixed(c.player.getYaw(), 90);
         BlockHitResult hit = body.selectedFace();
         if (hit == null || hit.getSide() != Direction.UP || !hit.getBlockPos().equals(support)) return true;
         BlockHitResult floor = terrain(hit.getPos().add(0, -0.04, 0), 3.5);
@@ -5215,6 +5438,7 @@ final class AgentProgress {
             body.prioritizeMovement();
             // The only Hands job combat may retain is a checked hotbar key selection.
             if (!selecting) interruptHands();
+            else if (macroEngaged) hands.tick();
             if (defense.fight(threat, tick) && !exposedSurface) {
                 Vec3d target = threat.getPos();
                 if (walkToward(target, false, false) == Walk.MOVING
@@ -5269,6 +5493,36 @@ final class AgentProgress {
         // Finding ground may take precedence over responding to a distant hostile.
         return !surfaceApproach.findingGround()
             && (hunger == 0 || hunger < 18 && c.player.getHealth() <= c.player.getMaxHealth() / 2);
+    }
+
+    private boolean macroEmergencyMeal(AgentMacroControl macro) {
+        int hunger = c.player.getHungerManager().getFoodLevel();
+        int before = mealsEaten;
+        confirmMeal(hunger);
+        if (mealsEaten > before) macro.safetyEffect("emergency meal consumed");
+        if (emergencyMealJob != 0) {
+            if (hands.busy() && hands.jobGeneration() == emergencyMealJob) {
+                macro.urgent("equipping emergency food");
+                hands.tick();
+                status = "equipping emergency food";
+                return true;
+            }
+            emergencyMealJob = 0;
+        }
+        if (!c.player.isOnGround() || c.player.isTouchingWater()
+                || tick < mealQuietUntil || tick < mealRetry || hunger == 20
+                || (mealUntil == 0 && !needsEmergencyFood(hunger))) return false;
+        if (mealUntil == 0 && bestMeal(hunger) < 0) return false;
+        if (macro.hasAction() || hands.busy() || c.currentScreen instanceof HandledScreen<?>) {
+            macro.urgent("releasing the current action for emergency food");
+            interruptHands();
+            status = "making room to eat emergency food";
+            return true;
+        }
+        if (c.currentScreen != null || !eatMeal(hunger)) return false;
+        if (hands.busy()) emergencyMealJob = hands.jobGeneration();
+        macro.urgent("eating emergency food");
+        return true;
     }
 
     private boolean eatOrHunt() {

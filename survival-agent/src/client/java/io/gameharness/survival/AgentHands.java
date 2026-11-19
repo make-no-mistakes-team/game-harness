@@ -240,8 +240,14 @@ final class AgentHands {
         return craftBatch(List.of(item));
     }
 
+    boolean stableCraftFooting() {
+        var p = c.player;
+        return p != null && p.isOnGround() && !p.isTouchingWater() && !p.isInLava()
+            && !p.hasVehicle() && p.getVelocity().horizontalLengthSquared() <= 0.0025;
+    }
+
     boolean craftBatch(List<String> recipes) {
-        if (busy() || c.player == null) return false;
+        if (busy() || !stableCraftFooting()) return false;
         if (recipes.isEmpty()) return report("craft", "no recipes");
         var current = c.currentScreen;
         if (current != null && !(current instanceof InventoryScreen || current instanceof CraftingScreen))
@@ -611,6 +617,10 @@ final class AgentHands {
             return;
         }
         if (screen == null) {
+            if (job == Job.CRAFT && !stableCraftFooting()) {
+                finish("lost dry footing before opening the inventory");
+                return;
+            }
             if (!inventoryNeeded) {
                 selectHotbar(now);
                 return;

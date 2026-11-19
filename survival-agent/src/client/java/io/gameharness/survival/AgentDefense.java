@@ -121,7 +121,7 @@ final class AgentDefense {
                 && Math.abs(ZOMBIE_LOOK_PITCH - player.getPitch()) <= 8) zombieLookAligned++;
         else zombieLookAligned = 0;
         // This is a stationary camera check, not a combat target or a movement bearing.
-        body.turn(zombieLookYaw, ZOMBIE_LOOK_PITCH);
+        body.turnUrgent(zombieLookYaw, ZOMBIE_LOOK_PITCH);
         status = zombieLook.status;
         return true;
     }
@@ -147,7 +147,7 @@ final class AgentDefense {
             return false;
         }
         // Keep aiming at the observed point. Do not follow a moving entity or request an attack.
-        body.aim(aim);
+        body.aimUrgent(aim);
         body.holdRaisedShieldToward(aim);
         status = "holding the last visible combat bearing";
         return true;
@@ -252,7 +252,7 @@ final class AgentDefense {
             wearing = null;
             return false;
         }
-        body.turn(client.player.getYaw(), -45);
+        body.turnFixed(client.player.getYaw(), -45);
         body.wearArmor(piece.item);
         status = "using armor to equip it";
         return true;
@@ -308,7 +308,7 @@ final class AgentDefense {
     }
 
     void face() {
-        body.aim(aim);
+        body.aimUrgent(aim);
     }
 
     private void guard(LivingEntity threat, boolean shield) {

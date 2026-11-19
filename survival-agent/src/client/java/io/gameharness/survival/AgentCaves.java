@@ -39,6 +39,9 @@ final class AgentCaves {
     private record WaterLink(BlockPos lip, BlockPos source, BlockPos bottom, BlockPos shore,
                              Direction approach, Direction flank) {}
     private record TorchTarget(BlockHitResult support, Vec3d aim, boolean lip) {}
+    record Opening(BlockPos origin, Direction bearing) {
+        BlockPos mouth() { return origin.offset(bearing); }
+    }
 
     private final MinecraftClient client;
     private final AgentBody body;
@@ -62,6 +65,7 @@ final class AgentCaves {
     private boolean entered, needSurvey, triedHigh, triedLight, triedPlace, triedWater, earlyHigh, centerForBearing;
     private boolean afloat, leavingWater, checkedLipLight;
     private BlockHitResult ore, lava, face, fill;
+    private Opening deferred;
     private WaterLink plannedWater, waterLink;
     private BlockPos highBottom, boatFloor;
     private float boatYaw;
@@ -85,6 +89,17 @@ final class AgentCaves {
     BlockHitResult lava() { return lava; }
     BlockPos boatFloor() { return boatFloor; }
     float boatYaw() { return boatYaw; }
+    Opening deferredOpening() { return deferred; }
+
+    Opening drySurveyOpening() {
+        return active() && (phase == Phase.SURVEY || phase == Phase.LOOK_DOWN || phase == Phase.CENTER)
+            && player.isOnGround() && !player.isTouchingWater() && player.getBlockPos().equals(stance)
+            ? new Opening(origin, opening) : null;
+    }
+
+    void leaveDrySurvey(int tick) {
+        finish(tick, "leaving the unproved cave descent for a walked mine route");
+    }
 
     void interruptLight(int tick) {
         if (torchTarget != null) resumeAfterLight(tick);
@@ -95,6 +110,7 @@ final class AgentCaves {
         resetOnWorldChange();
         ore = lava = null;
         boatFloor = null;
+        deferred = null;
         if (player == null || world == null) return false;
         if (!active()) {
             if (planned == null || direction == null || tick < cooldown || !player.isOnGround()
@@ -406,7 +422,7 @@ final class AgentCaves {
         look(Vec3d.ofBottomCenter(shaft), 69);
         status = "crouching at the cave lip to check for a lit floor below";
         if (body.hazardAhead(yaw(Vec3d.ofBottomCenter(shaft)), 2.1))
-            return finish(tick, "cave lip rejected: visible lava in the descent lane");
+            return defer(tick, "cave lip rejected: visible lava in the descent lane");
         creep(shaft);
         for (int drop = 2; highBottom == null && drop <= MAX_DROP; drop++) {
             BlockPos foot = shaft.down(drop);
@@ -487,7 +503,7 @@ final class AgentCaves {
             start(Phase.BOAT_VIEW, tick);
             return true;
         }
-        return finish(tick, highBottom == null ? "cave lip deferred: no lit, reachable landing"
+        return defer(tick, highBottom == null ? "cave lip deferred: no lit, reachable landing"
             : "cave lip deferred: lit floor below, but no verified descent or return route");
     }
 
@@ -877,6 +893,11 @@ final class AgentCaves {
         return false;
     }
 
+    private boolean defer(int tick, String reason) {
+        deferred = new Opening(origin, opening);
+        return finish(tick, reason);
+    }
+
     private boolean quiet(BlockPos foot, int tick) {
         for (int i = 0; i < quietLips.length; i++) {
             if (tick < quietUntil[i] && foot.equals(quietLips[i])) return true;
@@ -933,7 +954,7 @@ final class AgentCaves {
 
     private float look(Vec3d target, float pitch) {
         float yaw = yaw(target);
-        body.turn(yaw, pitch);
+        body.turnFixed(yaw, pitch);
         return yaw;
     }
 

@@ -5,15 +5,15 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { SurvivalMacroController } from "../src/server/survival-macro/controller.ts";
 import {
-  parseMacroIntent, type MacroBasis, type MacroIntent, type MacroObservation,
+  parseMacroIntent, parseMacroPlanning, type MacroBasis, type MacroIntent, type MacroObservation, type MacroStrategist,
 } from "../src/server/survival-macro/protocol.ts";
 
-async function fixture(confirmNativeExit?: () => Promise<boolean>) {
+async function fixture(confirmNativeExit?: () => Promise<boolean>, strategist?: MacroStrategist) {
   const dir = await mkdtemp(path.join(tmpdir(), "survival-macro-controller-"));
   const run = path.basename(dir);
   const actor = new SurvivalMacroController({
-    runDir: dir, run, strategy: "terra", confirmNativeExit, limits: { maxRequests: 1, pollMs: 1_000 },
-    strategist: async ({ observation: { run, life, tick, epoch } }) => ({
+    runDir: dir, run, strategy: "terra", confirmNativeExit, limits: { maxRequests: 1, pollMs: 1_000, maxObservationAgeMs: 10_000 },
+    strategist: strategist ?? (async ({ observation: { run, life, tick, epoch } }) => ({
       basis: { run, life, tick, epoch }, model: "test-strategist", outcome: "completed",
       costUsd: null, usage: null, dispatched: false,
       proposal: {
@@ -21,7 +21,7 @@ async function fixture(confirmNativeExit?: () => Promise<boolean>) {
         contingency: "Wait if the survey is no longer visible", alternative: "Leave the camera still", expiresTick: tick + 100,
         action: { kind: "opportunity", opportunityId: "survey-left" },
       },
-    }),
+    })),
   });
   const file = (name: string) => path.join(actor.directory, name);
   const observation = (tick: number, life = 1, epoch = 5): MacroObservation => ({
@@ -122,6 +122,73 @@ test("Unconfirmed native authority times out without treating the marker removal
     expect(f.actor.status()).toMatchObject({ state: "faulted", nativeAuthority: "unconfirmed", completedReceipts: 0 });
   } finally {
     await f.actor.stop().catch(() => {});
+    await f.clean();
+  }
+});
+
+test("At three seconds a pending provider remains live; routine ticks do not renew its native planning notice", async () => {
+  const reply = Promise.withResolvers<void>();
+  const dispatched = Promise.withResolvers<AbortSignal>();
+  const f = await fixture(async () => true, async ({ observation: { run, life, tick, epoch } }, signal) => {
+    dispatched.resolve(signal);
+    await reply.promise;
+    return {
+      basis: { run, life, tick, epoch }, model: "test-strategist", outcome: "refused",
+      latencyMs: 3_125, dispatched: true, costUsd: null, usage: null, proposal: null,
+    };
+  });
+  try {
+    await f.publish("observation.json", f.observation(10));
+    await f.actor.poll();
+    const signal = await dispatched.promise;
+    const notice = parseMacroPlanning(JSON.parse(await readFile(f.file("planning.json"), "utf8")));
+    expect(notice).toMatchObject({ v: 1, run: f.run, life: 1, epoch: 5, basisTick: 10 });
+    expect(f.actor.status()).toMatchObject({ state: "inferring", planningIdleMs: 3_000, planningEpisodeId: notice.id });
+    await delay(3_005);
+    await f.publish("observation.json", f.observation(71));
+    await f.actor.poll();
+    expect(signal.aborted).toBe(false);
+    expect(parseMacroPlanning(JSON.parse(await readFile(f.file("planning.json"), "utf8")))).toEqual(notice);
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+
+    reply.resolve();
+    for (let iteration = 0; iteration < 4 && f.actor.status().lastProviderOutcome === null; iteration++) await f.actor.poll();
+    await expect(access(f.file("planning.json"))).rejects.toThrow();
+    expect(f.actor.status()).toMatchObject({
+      requests: 1, providerDispatches: 1, lastProviderLatencyMs: 3_125, planningEpisodeId: null, issued: 0,
+    });
+  } finally {
+    reply.resolve();
+    await f.actor.stop();
+    await f.clean();
+  }
+}, 10_000);
+
+test("A stale premise removes its planning notice and Stop leaves no planning authority", async () => {
+  const reply = Promise.withResolvers<void>();
+  const f = await fixture(async () => true, async ({ observation: { run, life, tick, epoch } }) => {
+    await reply.promise;
+    return {
+      basis: { run, life, tick, epoch }, model: "test-strategist", outcome: "cancelled",
+      dispatched: true, costUsd: null, usage: null, proposal: null,
+    };
+  });
+  try {
+    await f.publish("observation.json", f.observation(10));
+    await f.actor.poll();
+    const notice = parseMacroPlanning(JSON.parse(await readFile(f.file("planning.json"), "utf8")));
+    expect(notice).toMatchObject({ v: 1, run: f.run, life: 1, epoch: 5, basisTick: 10 });
+    expect(f.actor.status().planningEpisodeId).toBe(notice.id);
+    await f.publish("observation.json", f.observation(15, 1, 6));
+    await f.actor.poll();
+    await expect(access(f.file("planning.json"))).rejects.toThrow();
+    expect(f.actor.status()).toMatchObject({ planningEpisodeId: null, requests: 1 });
+    reply.resolve();
+    await f.actor.stop();
+    await expect(access(f.file("planning.json"))).rejects.toThrow();
+  } finally {
+    reply.resolve();
+    await f.actor.stop();
     await f.clean();
   }
 });

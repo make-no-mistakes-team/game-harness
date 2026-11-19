@@ -374,7 +374,7 @@ final class AgentShoreCast {
         // First get a single ordinary pool-facing look. Just inspect the parts
         // outside that view individually if the overview could not prove all ten.
         if (tick - since < 22) {
-            body.turn(heading(Vec3d.of(layout.shore.getOpposite().getVector())), 43);
+            body.turnScan(heading(Vec3d.of(layout.shore.getOpposite().getVector())), 43);
             return;
         }
         int missing = Integer.numberOfTrailingZeros(~visibleMask);
@@ -424,7 +424,7 @@ final class AgentShoreCast {
         if (pickup == null) {
             BlockHitResult hit = body.visibleFluid(false, true, REACH);
             if (hit != null && waterSource(state(hit))) pickup = new Source(hit.getBlockPos(), inward(hit));
-            else body.turn(heading(Vec3d.of(layout.shore.getVector())) + (tick - since) / 26 * 60, 26);
+            else body.turnScan(heading(Vec3d.of(layout.shore.getVector())) + (tick - since) / 26 * 60, 26);
             return;
         }
         useSource(pickup, false);
@@ -575,7 +575,7 @@ final class AgentShoreCast {
             return;
         }
         float yaw = heading(Vec3d.of(layout.shore.getOpposite().getVector())) + YAW_SWEEP[scan];
-        body.turn(yaw, 48);
+        body.turnScan(yaw, 48);
         if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - yaw)) <= 5 && tick % 9 == 0)
             scan = (scan + 1) % YAW_SWEEP.length;
         expect(layout.edge, "unconsumed visible still lava within bucket reach");
@@ -731,7 +731,7 @@ final class AgentShoreCast {
 
     private void useSource(Source source, boolean lava) {
         expect(source.pos, lava ? "targeted source-only lava bucket ray" : "targeted source-only water bucket ray");
-        body.aim(source.point);
+        body.aimFine(source.point);
         BlockHitResult hit = fluid(source.point, REACH);
         observe(hit);
         boolean exact = matches(hit, source.pos) && (lava ? lavaSource(state(hit)) : waterSource(state(hit)));
@@ -822,7 +822,7 @@ final class AgentShoreCast {
             faceChoice = (faceChoice + 1) % FACE_OFFSETS.length;
         }
         Vec3d point = actionPoint(work.support, work.face, faceChoice);
-        body.aim(point);
+        body.aimFixed(point);
         BlockHitResult seen = terrain(point, REACH);
         observe(seen);
         if (solidFace(seen, work.support, work.face)) return seen;
@@ -847,7 +847,8 @@ final class AgentShoreCast {
             faceMissSince = 0;
             return seen;
         }
-        body.aim(point);
+        if (allowOutline) body.aimFine(point);
+        else body.aim(point);
         if (!body.aligned(point)) return null;
         if (faceMissSince == 0) faceMissSince = tick;
         if (tick - faceMissSince >= 5) {
@@ -939,7 +940,7 @@ final class AgentShoreCast {
             BlockHitResult floor = terrain(point, REACH);
             observe(floor);
             if (!matches(floor, feet.down()) || floor.getSide() != Direction.UP || !solid(floor)) {
-                body.aim(point);
+                body.aimFixed(point);
                 return false;
             }
             strideProved = true;
@@ -951,7 +952,7 @@ final class AgentShoreCast {
         // Refit a leg only if it drifts off the landing. The body's exact-landing
         // braking window requires that the current heading actually meets it.
         if (Math.abs(MathHelper.wrapDegrees(landingYaw - yaw)) > 8) yaw = landingYaw;
-        body.turn(yaw, 33);
+        body.turnFixed(yaw, 33);
         if (Math.abs(MathHelper.wrapDegrees(player.getYaw() - landingYaw)) > 12) return false;
         if (narrow) body.sneak();
         body.walkDownTo(goal);

@@ -11,11 +11,15 @@ import { JAVA, MinecraftClient, privateJson } from "../src/server/minecraft-clie
 import { nativeLaunchFailure } from "../src/server/native-launch-fault.ts";
 import { composeTerraSurvival, declareTerraStrategy } from "../src/server/survival-macro/compose.ts";
 import { descentFixtures, descentVariants, fixtureWorld, macroTrialWorld, provisionFixture, provisionMacroTrialWorld, terrainFixtures,
-  terrainVariants, type DescentVariant, type TerrainVariant } from "./diagnostic-descent.ts";
+  terrainVariants, provisionUrgentThreatWorld, urgentThreatWorld, provisionUrgentCraftWorld, urgentCraftWorld,
+  type DescentVariant, type TerrainVariant } from "./diagnostic-descent.ts";
 import { poolDiagnosticServerProperties, poolDiagnosticWorld, provisionPoolDiagnostic } from "./diagnostic-pool.ts";
+import { createUrgentThreatProbe, urgentThreatDeclaration, urgentThreatLimits, urgentCraftDeclaration,
+  urgentCraftLimits } from "./diagnostic-urgent.ts";
 import { FAST_DEATH_LIMIT, FAST_DEATH_WINDOW_MS, LIFE_RECEIPTS, LifeLedger, lifeReceiptReader,
   RESPAWN_MARKER, RESPAWN_TIMEOUT_MS } from "./lives.ts";
 import { admitRun } from "./storage.ts";
+import { finalPlanningEvidence } from "./planning-evidence.ts";
 import { readStrategy, type TerraOptions } from "./strategy-options.ts";
 import { monitorDescent, verifyDescent } from "./verify-descent.ts";
 import { verifyTerrain } from "./verify-terrain.ts";
@@ -97,7 +101,7 @@ type Progress = {
 type PlayingProgress = Extract<Progress, { alive: true }>;
 const STATUSES = ["won", "died", "respawn_timeout", "startup_limit", "wall_limit", "heartbeat_lost",
   "stalled", "goal_stalled", "storage_limit", "recording_limit", "interrupted",
-  "server_exit", "client_exit", "recorder_exit", "unverified", "failed", "trial_closed"] as const;
+  "server_exit", "client_exit", "recorder_exit", "unverified", "failed", "trial_closed", "urgent_closed"] as const;
 type Status = (typeof STATUSES)[number];
 
 class Stop extends Error {
@@ -110,6 +114,8 @@ Usage: bun run play:agent [--strategy terra [--macro-requests N] [--task TEXT]] 
        bun run diagnose:pool [SECONDS]
        bun run play:agent --diagnostic-descent (${descentVariants.join(" | ")}) [SECONDS]
        bun run play:agent --diagnostic-terrain (${terrainVariants.join(" | ")}) [SECONDS]
+       bun run play:agent --diagnostic-urgent-creeper
+       bun run play:agent --diagnostic-urgent-craft
 
 GOAL: ${GOALS.join(" | ")}
 --strategy terra: use gpt-6.1-terra for this ordinary run; omitted means no model.
@@ -120,6 +126,8 @@ SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SEC
 diagnose:pool: test casting a Nether portal in a separate, pre-provisioned diagnostic world.
 --diagnostic-descent: test a dry fall, a chosen boat descent, or connected cave shelves.
 --diagnostic-terrain: test timber reach or headroom with an ordinary wooden pickaxe goal.
+--diagnostic-urgent-creeper: test real Terra interruption in a prepared world, without Survival benchmark credit.
+--diagnostic-urgent-craft: test a creeper interrupting an actual crafting drag, without model or Survival benchmark credit.
 Diagnostics share one lane and cannot be continued as survival runs.
 Ordinary runs and incident replays may use vanilla Respawn within one attempt.
 Prepared diagnostic proofs require no deaths.
@@ -127,9 +135,9 @@ Prepared diagnostic proofs require no deaths.
 Build with \`bun run build:agent\` first. Requires Java 21, ffmpeg, existing local
 EULA consent, and a signed-in official Launcher with Minecraft 1.21.4 installed.
 Without JAVA_HOME, the runner prefers the system OpenJDK 21 installation.
-Only a confirmed goal exits 0. Artifacts and outcome JSON go in the printed run directory.`;
+Only a verified result exits 0. Artifacts and outcome JSON go in the printed run directory.`;
 
-type Diagnostic = "pool" | "incident-replay" | "macro-trial" | DescentVariant | TerrainVariant;
+type Diagnostic = "pool" | "incident-replay" | "macro-trial" | "urgent-creeper" | "urgent-craft" | DescentVariant | TerrainVariant;
 
 function parseArgs(args: string[]) {
   if (args[0] === "--diagnostic-descent" || args[0] === "--diagnostic-terrain") {
@@ -778,8 +786,11 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
   const { java, ffmpeg } = await verifyInputs(actorJar);
   const runs = diagnostic ? DIAGNOSTIC_RUNS : RUNS;
   const liveFile = diagnostic ? DIAGNOSTIC_LIVE : LIVE;
-  const fixture = diagnostic === "pool" || diagnostic === "incident-replay" || diagnostic === "macro-trial" ? undefined : diagnostic;
-  const provisioned = fixture !== undefined || diagnostic === "pool" || macroTrial !== undefined;
+  const urgentCraft = diagnostic === "urgent-craft";
+  const urgentDiagnostic = diagnostic === "urgent-creeper" || urgentCraft;
+  const fixture = diagnostic === "water" || diagnostic === "boat" || diagnostic === "cave" ||
+    diagnostic === "birch" || diagnostic === "ceiling" ? diagnostic : undefined;
+  const provisioned = fixture !== undefined || diagnostic === "pool" || macroTrial !== undefined || urgentDiagnostic;
   const claimScope = macroTrial ? "prepared-skill-trial" : diagnostic === "incident-replay" ? "incident-replay" :
     provisioned ? "prepared-diagnostic" : parentRun ? "continuation-chain" : "fresh-attempt";
   const terrain = diagnostic === "birch" || diagnostic === "ceiling" ? diagnostic : undefined;
@@ -806,7 +817,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
   });
   for (const { name, listener } of interrupts) process.on(name, listener);
   let release: (() => void) | undefined;
-  let canReleaseTrial = true;
+  let canReleaseDiagnostic = true;
   try {
     release = diagnostic ? await admitRun(reserveBytes, "diagnostic") : await admitRun(reserveBytes);
     signal.throwIfAborted();
@@ -824,6 +835,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       `${JSON.stringify({ at: new Date().toISOString(), elapsedMs: Math.round(performance.now() - start), event, ...fields })}\n`,
       { mode: 0o600 },
     );
+    const urgentProbe = urgentDiagnostic ? createUrgentThreatProbe(dir, signal, record, urgentCraft ? "craft" : "terra") : undefined;
     const progressFile = path.join(dir, "progress.json");
     const ledger = new LifeLedger(!provisioned);
     const readLifeReceipts = lifeReceiptReader(path.join(dir, LIFE_RECEIPTS));
@@ -840,9 +852,11 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     const video = path.join(dir, "screen.mp4");
     const live = { run: path.basename(dir), display: display.display, authority: display.authority };
     const benchmark = diagnostic ? undefined : { goal, verifier: "vanilla-survival", claimScope };
-    const terraDeclaration = !diagnostic && macroOptions ? declareTerraStrategy(macroOptions, seconds * 1_000) : undefined;
+    const terraDeclaration = macroOptions && (!diagnostic || urgentProbe)
+      ? declareTerraStrategy(macroOptions, seconds * 1_000, urgentProbe && { preparedDiagnostic: true }) : undefined;
     const nativeClient = terraDeclaration ? Promise.withResolvers<Owned | undefined>() : undefined;
-    const world = macroTrial ? macroTrialWorld : fixture ? fixtureWorld(fixture) : diagnostic === "pool" ? poolDiagnosticWorld : {
+    const world = macroTrial ? macroTrialWorld : urgentCraft ? urgentCraftWorld : urgentProbe ? urgentThreatWorld :
+      fixture ? fixtureWorld(fixture) : diagnostic === "pool" ? poolDiagnosticWorld : {
       type: diagnostic === "incident-replay" ? "vanilla-incident-replay" : "vanilla",
       mode: "survival", difficulty: "normal",
       ...(parentRun ? { fresh: false, parentRun } : { fresh: true, seed: "random" }),
@@ -856,6 +870,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     let recorder: Owned | undefined;
     let diagnostics: Set<string> | undefined;
     let lastProgress: Progress | null = null;
+    let lastPlanningSample: Progress | null = null;
     let claimProgress: PlayingProgress | null = null;
     let goalClaim: { life: number; tick: number; wall_ms: number | null; deaths: number } | null = null;
     const statsDirectory = path.join(dir, "server/world/stats");
@@ -898,6 +913,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         world, claimScope, deathPolicy,
         ...(benchmark ? { benchmark, strategy: terraDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
         ...(macroTrial ? { macroTrial: { ordinaryRun: path.basename(macroTrial.ordinaryDir), maximumIntents: 1 } } : {}),
+        ...(urgentProbe ? { urgentThreat: urgentCraft ? urgentCraftDeclaration : urgentThreatDeclaration,
+          strategy: terraDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
         inactivity: { unchangedMs: STALL_MS, noGoalMilestoneMs: GOAL_STALL_MS,
           action: provisioned ? "end_diagnostic" : "record_only" },
         connection: { host: "127.0.0.1", port, auth: "host-verified-official-launcher" },
@@ -935,6 +952,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         macroAttempt = composeTerraSurvival({
           declaration: terraDeclaration, dir, projectRoot: ROOT, actorJarSha256: agentJarSha256,
           authDirectory: process.env.GAMEHARNESS_DATA_DIR ?? RUNTIME, display, ...SCREEN, ffmpeg, signal,
+          ...(urgentProbe ? { onProviderDispatch: urgentProbe.onDispatch, onProviderSettled: urgentProbe.onSettled } : {}),
           onDisplayLoss: () => abort("failed", "The run lost its private Minecraft display; Terra uploads were stopped."),
           confirmNativeExit: async () => {
             const owned = await nativeClient!.promise;
@@ -997,7 +1015,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           cwd: worldDir, env: { ...env, HOME: worldDir, TMPDIR: serverTmp },
           detached: true, stdio: ["pipe", "pipe", serverErr.fd],
         }));
-        if (macroTrial) canReleaseTrial = false;
+        if (macroTrial || urgentProbe) canReleaseDiagnostic = false;
         if (macroTrial && server.child.pid)
           reportMacroTrial({ kind: "owned", run: macroTrial.run, displayRole: "server", pid: server.child.pid });
         let pending = "";
@@ -1055,7 +1073,11 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         beforeConnect: provisioned ? async (profileName) => {
           stage = "diagnostic_provisioning";
           if (macroTrial) await provisionMacroTrialWorld(runningServer.child, worldDir, profileName, startup);
-          else if (fixture) await provisionFixture(fixture, runningServer.child, worldDir, profileName, startup);
+          else if (urgentProbe) {
+            const provision = urgentCraft ? provisionUrgentCraftWorld : provisionUrgentThreatWorld;
+            await provision(runningServer.child, worldDir, profileName, startup);
+            urgentProbe.bind(runningServer.child, profileName);
+          } else if (fixture) await provisionFixture(fixture, runningServer.child, worldDir, profileName, startup);
           else await provisionPoolDiagnostic(runningServer.child, worldDir, profileName, startup);
           await record("diagnostic_sealed");
           stage = "client_startup";
@@ -1090,6 +1112,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         }
         const previous: Progress | null = lastProgress;
         lastProgress = progress ?? previous;
+        if (progress && "macro_planning_state" in progress) lastPlanningSample = progress;
         const lifeStop = ledger.stop(now);
         if (lifeStop) throw new Stop(lifeStop.status, lifeStop.reason);
         signal.throwIfAborted();
@@ -1122,6 +1145,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
               throw new Stop("won", `Observed the ${descent} descent and subsequent survival.`);
             }
             if (progress.won) throw new Stop("unverified", "The ordinary goal ended before proving the descent.");
+          } else if (urgentProbe && progress.won) {
+            throw new Stop("unverified", "The actor stopped at the Survival goal before the diagnostic closed.");
           } else if (!macroTrial && progress.won && retainsGoal(goal, progress)) {
             claimProgress = progress;
             goalClaim = { life: ledger.life!, tick: progress.tick, wall_ms: progress.wall_ms ?? null, deaths: ledger.deaths };
@@ -1132,6 +1157,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         if (typeof progress?.failure === "string") {
           throw new Stop(provisioned ? "stalled" : "failed", progress.failure);
         }
+        if (await urgentProbe?.ready())
+          throw new Stop("urgent_closed", "The native danger evidence settled; closing the prepared diagnostic.");
         if (client.exit) throw new Stop("client_exit", "Minecraft client exited before reporting success.");
         if (!lastProgress && startup.aborted) {
           if (signal.aborted) signal.throwIfAborted();
@@ -1160,7 +1187,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         result = new Stop("startup_limit", "Minecraft did not start before the startup limit.");
       } else {
         const auth = nativeLaunchFailure(error);
-        const setupFailure = (fixture || macroTrial) && stage === "diagnostic_provisioning" && error instanceof Error
+        const setupFailure = (fixture || macroTrial || urgentProbe) && stage === "diagnostic_provisioning" && error instanceof Error
           ? error.message : undefined;
         result = new Stop("failed", auth?.error ?? setupFailure ?? `Run failed during ${stage}.`);
         if (!auth && error instanceof Error)
@@ -1172,10 +1199,34 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       // can attest that no Java client was spawned or join its exact close event.
       nativeClient?.resolve(client);
       controller.abort();
+      const strategyDrain = macroAttempt?.stop();
+      // SIGTERM can prevent Fabric from writing its final observation. Revoke
+      // first; allow a few native ticks for the receipt without delaying Stop
+      // indefinitely on a hung, airborne, or disconnected client.
+      const grace = (async () => {
+        if (!macroAttempt || !client || client.exit) return;
+        const deadline = performance.now() + 750;
+        while (!client.exit && performance.now() < deadline) {
+          const sample = await finalPlanningEvidence(dir, lastPlanningSample).catch(() => null);
+          if (sample?.measured && !sample.rightCensored) return;
+          await delay(Math.max(0, Math.min(40, deadline - performance.now())));
+        }
+      })();
+      const clientDrain = grace.then(() => drain(client));
+      const serverDrainTask = !urgentProbe ? grace.then(() => drainVanillaServer(server)) : (async () => {
+        let cleanupError: unknown;
+        try {
+          await clientDrain;
+          await urgentProbe.cleanUp();
+        } catch (error) { cleanupError = error; }
+        const result = await drainVanillaServer(server);
+        if (cleanupError) throw cleanupError;
+        return result;
+      })();
       const settled = await Promise.allSettled([
-        drain(client), drainVanillaServer(server), drain(recorder, "q\n"), meter, macroAttempt?.stop(),
+        clientDrain, serverDrainTask, grace.then(() => drain(recorder, "q\n")), meter, strategyDrain,
       ]);
-      if (macroTrial) canReleaseTrial =
+      if (macroTrial || urgentProbe) canReleaseDiagnostic =
         [client, server, recorder].every(owned => !owned || owned.exit !== undefined) &&
         settled.every(step => step.status === "fulfilled");
       const serverDrain = settled[1].status === "fulfilled" ? settled[1].value : null;
@@ -1199,6 +1250,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           await observeLife(finalProgress, performance.now(), true);
           if (progressError) throw new Error("Final progress was unreadable.");
           lastProgress = finalProgress ?? lastProgress;
+          if (finalProgress && "macro_planning_state" in finalProgress) lastPlanningSample = finalProgress;
           lifeEvidenceReadable = true;
         } catch {
           await record("life_evidence_unreadable").catch(() => {});
@@ -1235,8 +1287,25 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       }
       const strategy = terraDeclaration
         ? { ...(macroAttempt?.outcome() ?? { ...terraDeclaration, admission: "not_opened", drain: "not_started",
-          outcome: "no_completed_effect", status: null }), localFallbackTicks: lastProgress?.macro_fallback_ticks ?? null }
+          outcome: "no_completed_effect", status: null }), localFallbackTicks: lastProgress?.macro_fallback_ticks ?? null,
+          planningWait: await finalPlanningEvidence(dir, lastPlanningSample) }
         : DETERMINISTIC_STRATEGY;
+      const urgentThreat = urgentProbe && await urgentProbe.verify({
+        noDeath: serverSaved && lifeEvidenceReadable && recordedDeaths?.attempt === 0 && ledger.deaths === 0 &&
+          !!lastProgress?.alive && ledger.currentPlaying(lastProgress),
+        recordingClosed: recorder?.exit?.code === 0 && await stat(video).then(entry => entry.size > 0, () => false),
+        trustedDrain: (urgentCraft ? !macroAttempt : macroAttempt?.outcome().drain === "closed") &&
+          settled.every(step => step.status === "fulfilled") &&
+          measuredBytes !== null && measuredBytes <= reserveBytes,
+        budgetLimited: result.status === "wall_limit" || result.status === "startup_limit" ||
+          result.status === "storage_limit" || result.status === "recording_limit" || !!macroAttempt?.outcome().status?.budget,
+      });
+      if (result.status === "urgent_closed") {
+        if (urgentThreat?.status !== "proved") result = new Stop("unverified", urgentThreat?.reason ?? "Missing urgent threat proof.");
+        else result = new Stop("urgent_closed", urgentCraft ?
+          "Observed an actual crafting drag cancelled without release, returned cursor items, and damage-free escape." :
+          "Observed pre-deadline defense during an authorized pending Terra request.");
+      }
       const benchmarkConfirmed = result.status === "won";
       if (benchmarkConfirmed && "outcome" in strategy && strategy.outcome !== "native_effect_completed")
         result = new Stop("failed", "The vanilla benchmark was verified, but no Terra-issued effect was confirmed.");
@@ -1245,6 +1314,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - start),
         finalStage: stage, reservedBytes: reserveBytes, measuredBytes, progress: lastProgress,
         ...(benchmark ? { benchmark: { ...benchmark, confirmed: benchmarkConfirmed }, strategy } : {}),
+        ...(urgentThreat ? { urgentThreat, strategy } : {}),
         lifecycle: { ...ledger.summary(), receiptFile: LIFE_RECEIPTS, evidenceReadable: lifeEvidenceReadable,
           savedDeaths: recordedDeaths && { ...recordedDeaths, agreesWithObserved: recordedDeaths.attempt === ledger.deaths },
           goalClaim, goalBearingLives: benchmarkConfirmed && goalClaim ? [goalClaim.life] : [],
@@ -1258,7 +1328,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       if (macroTrial && trialJarSha256) {
         reportMacroTrial({
           kind: "closed", run: macroTrial.run, actorJarSha256: trialJarSha256, serverSaved,
-          drained: canReleaseTrial,
+          drained: canReleaseDiagnostic,
           status: result.status,
           recordingClosed: recorder?.exit?.code === 0 && await stat(video).then(entry => entry.size > 0, () => false),
           deaths: Math.max(ledger.deaths, recordedDeaths?.attempt ?? 0),
@@ -1270,10 +1340,11 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       console.log(JSON.stringify(outcome));
     }
     return receivedSignal === "SIGINT" ? 130 : receivedSignal === "SIGTERM" ? 143 :
-      receivedSignal === "SIGHUP" ? 129 : result.status === "won" || result.status === "trial_closed" ? 0 : 1;
+      receivedSignal === "SIGHUP" ? 129 :
+      result.status === "won" || result.status === "trial_closed" || result.status === "urgent_closed" ? 0 : 1;
   } finally {
     try {
-      if (canReleaseTrial) {
+      if (canReleaseDiagnostic) {
         release?.();
         if (macroTrial) reportMacroTrial({ kind: "released", run: macroTrial.run });
       }
@@ -1290,6 +1361,13 @@ try {
     const trial = parseMacroTrialLaunch(args.slice(1), RUNS);
     process.umask(0o077);
     process.exitCode = await run(MACRO_TRIAL_GOAL, MACRO_TRIAL_SECONDS, undefined, "macro-trial", undefined, trial);
+  } else if (args.length === 1 && args[0] === "--diagnostic-urgent-creeper") {
+    process.umask(0o077);
+    process.exitCode = await run("diamond", urgentThreatLimits.wallSeconds, undefined, "urgent-creeper",
+      { strategy: "terra", maxRequests: urgentThreatLimits.maxRequests });
+  } else if (args.length === 1 && args[0] === "--diagnostic-urgent-craft") {
+    process.umask(0o077);
+    process.exitCode = await run("stone_pickaxe", urgentCraftLimits.wallSeconds, undefined, "urgent-craft");
   } else if ((args.length === 1 && args[0] === "--help") ||
       (args.length === 2 && (args[0] === "--diagnostic-pool" || args[0] === "--diagnostic-descent" ||
         args[0] === "--diagnostic-terrain") &&

@@ -4,10 +4,10 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   MACRO_CAPABILITIES_VERSION, MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
-  MacroDirectory, parseMacroHandoff, parseMacroIntent, parseMacroObservation,
+  MACRO_MAX_PLANNING_IDLE_MS, MacroDirectory, parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
   parseMacroProposal, parseMacroReceipt, parseMacroRevocation, validateMacroId,
   type MacroBasis, type MacroFeedback, type MacroFrame, type MacroHandoff, type MacroInference, type MacroIntent,
-  type MacroObservation, type MacroOpportunity,
+  type MacroObservation, type MacroOpportunity, type MacroPlanning,
   type MacroProposal, type MacroReceipt, type MacroRequest, type MacroSkillReceipt, type MacroStrategist,
   type MacroTrigger, type NativeReceiptCursor,
 } from "./protocol.ts";
@@ -89,6 +89,8 @@ export interface MacroStatus {
   readonly capabilitiesVersion: string;
   readonly limits: MacroLimits;
   readonly elapsedMs: number;
+  readonly planningIdleMs: typeof MACRO_MAX_PLANNING_IDLE_MS;
+  readonly planningEpisodeId: string | null;
   readonly requests: number;
   readonly providerDispatches: number;
   readonly unreportedDispatches: number;
@@ -103,6 +105,7 @@ export interface MacroStatus {
   readonly budget: "requests" | "wall-time" | null;
   readonly lastReceipt: MacroReceipt | null;
   readonly lastProviderOutcome: MacroInference["outcome"] | null;
+  readonly lastProviderLatencyMs: number | null;
   readonly lastDisposition: string | null;
 }
 
@@ -301,6 +304,7 @@ export class SurvivalMacroController {
   private feedback?: { readonly observation: MacroObservation; readonly value: MacroFeedback };
   private lastReceipt: MacroReceipt | null = null;
   private lastProviderOutcome: MacroInference["outcome"] | null = null;
+  private lastProviderLatencyMs: number | null = null;
   private lastDisposition: string | null = null;
   private budget: MacroStatus["budget"] = null;
   private readonly models = new Set<string>();
@@ -325,6 +329,7 @@ export class SurvivalMacroController {
   private pending?: Issued;
   private segment?: Segment;
   private lease?: { readonly value: MacroHandoff; readonly plan: Plan };
+  private planning?: { readonly notice: MacroPlanning; readonly startedAt: number };
   private busy?: Busy;
   private ready?: Ready;
   private stopListener = () => { void this.stop().catch(() => {}); };
@@ -370,6 +375,7 @@ export class SurvivalMacroController {
       this.unavailable = !this.config.strategist;
       await this.record("declared", {
         strategy: this.config.strategy, capabilitiesVersion: this.capabilitiesVersion, limits: this.limits,
+        planningIdleMs: MACRO_MAX_PLANNING_IDLE_MS,
         authoring: !!(this.config.skills && this.config.trial && this.limits.maxSkillCandidates), objective: this.objective ?? null,
         admittedSkillVerbs: this.config.skills?.allowedVerbs() ?? [],
       });
@@ -398,12 +404,14 @@ export class SurvivalMacroController {
     return {
       strategy: this.config.strategy, state, capabilitiesVersion: this.capabilitiesVersion, limits: this.limits,
       models: [...this.models], elapsedMs: this.startedAt === undefined ? 0 : Math.round((this.endedAt ?? performance.now()) - this.startedAt),
+      planningIdleMs: MACRO_MAX_PLANNING_IDLE_MS, planningEpisodeId: this.planning?.notice.id ?? null,
       requests: this.requests, providerDispatches: this.providerDispatches, unreportedDispatches: this.unreportedDispatches,
       skillCandidates: this.skillCandidates, staleDecisions: this.staleDecisions, issued: this.publishedIntents,
       terminalReceipts: this.terminalReceipts, completedReceipts: this.completedReceipts,
       lateCompletedReceipts: this.lateCompletedReceipts, unresolvedIntents: this.issued.size - this.terminalReceipts,
       nativeAuthority: this.nativeAuthority,
       budget: this.budget, lastReceipt: this.lastReceipt, lastProviderOutcome: this.lastProviderOutcome, lastDisposition: this.lastDisposition,
+      lastProviderLatencyMs: this.lastProviderLatencyMs,
     };
   }
 
@@ -446,14 +454,17 @@ export class SurvivalMacroController {
     await this.refresh();
     await this.readReceipts();
     if (this.closing) return;
-    const [mailbox, barrier] = await Promise.all([
-      ipc.read("intent.json", parseMacroIntent), ipc.read("handoff.json", parseMacroHandoff),
+    const [mailbox, barrier, planning] = await Promise.all([
+      ipc.read("intent.json", parseMacroIntent), ipc.read("handoff.json", parseMacroHandoff), ipc.read("planning.json", parseMacroPlanning),
     ]);
     if (mailbox ? !this.pending || digest(mailbox) !== digest(this.pending.intent) : !!this.pending) {
       throw new Error("Survival macro intent mailbox changed outside its owner.");
     }
     if (barrier ? !this.lease || digest(barrier) !== digest(this.lease.value) : !!this.lease) {
       throw new Error("Survival macro handoff mailbox changed outside its owner.");
+    }
+    if (planning ? !this.planning || digest(planning) !== digest(this.planning.notice) : !!this.planning) {
+      throw new Error("Survival macro planning notice changed outside its owner.");
     }
     const now = performance.now();
     const view = this.view;
@@ -494,6 +505,12 @@ export class SurvivalMacroController {
         await this.record("work_cancelled", { requestId: work.context.requestId, kind: this.busy.kind,
           reason: describe(work.cancel.signal.reason) });
       }
+    }
+    if (this.planning && this.busy?.kind === "inference") {
+      const { work } = this.busy;
+      if (work.result) await this.endPlanning("settled");
+      else if (work.cancel.signal.aborted) await this.endPlanning("cancelled");
+      else if (!current || !samePlayableScope(work.context.observation, current)) await this.endPlanning("stale_scope");
     }
     if (this.busy?.work.result) await this.settle(current, runtimeExpired);
     if (runtimeExpired) {
@@ -701,6 +718,16 @@ export class SurvivalMacroController {
       await this.disposition("request_not_dispatched", { requestId, reason: this.closing ? "stop" : "runtime_wall_limit" });
       return;
     }
+    const notice = parseMacroPlanning({
+      v: 1, id: requestId, run: observation.run, life: observation.life, epoch: observation.epoch, basisTick: observation.tick,
+    });
+    this.planning = { notice, startedAt: performance.now() };
+    await this.ipc!.write("planning.json", notice);
+    if (this.closing || performance.now() - this.startedAt! >= this.limits.maxRuntimeMs) {
+      await this.endPlanning(this.closing ? "stop" : "cancelled");
+      await this.disposition("request_not_dispatched", { requestId, reason: this.closing ? "stop" : "runtime_wall_limit" });
+      return;
+    }
     this.requests++;
     this.unreportedDispatches++;
     this.busy = {
@@ -866,7 +893,10 @@ export class SurvivalMacroController {
       this.unreportedDispatches--;
       if (inference.dispatched) this.providerDispatches++;
     } else if (!result.ok && result.preflight) this.unreportedDispatches--;
-    if (inference) this.lastProviderOutcome = inference.outcome;
+    if (inference) {
+      this.lastProviderOutcome = inference.outcome;
+      this.lastProviderLatencyMs = positiveFinite(inference.latencyMs);
+    }
     let reason: string | null = result.ok ? null : result.detail;
     if (inference?.outcome === "completed") {
       try {
@@ -1262,7 +1292,18 @@ export class SurvivalMacroController {
     try { await ipc.remove("active.json"); this.markerLive = false; } catch (error) { errors.push(error); }
     try { await ipc.remove("intent.json"); } catch (error) { errors.push(error); }
     try { await ipc.remove("handoff.json"); this.lease = undefined; } catch (error) { errors.push(error); }
+    try { await this.endPlanning("revoked"); } catch (error) { errors.push(error); }
     if (errors.length) throw new AggregateError(errors, "Could not remove all native macro authority files.");
+  }
+
+  private async endPlanning(reason: "settled" | "cancelled" | "stale_scope" | "stop" | "revoked"): Promise<void> {
+    const episode = this.planning;
+    // Also clear an unrecognized mailbox when fail-closing due to tampering.
+    if (episode || reason === "revoked") await this.ipc!.remove("planning.json");
+    this.planning = undefined;
+    if (episode) await this.record("planning_notice_closed", {
+      requestId: episode.notice.id, reason, pendingMs: Math.round(performance.now() - episode.startedAt),
+    });
   }
 
   private async fail(error: unknown): Promise<void> {

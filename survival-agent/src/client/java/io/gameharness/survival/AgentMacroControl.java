@@ -1,6 +1,7 @@
 package io.gameharness.survival;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import java.io.IOException;
@@ -52,6 +53,9 @@ import net.minecraft.world.GameMode;
 /** Camera witnesses and short, cancellable vanilla actions. The host sends IDs, never input or source. */
 final class AgentMacroControl {
     private static final int OBSERVATION_INTERVAL = 5;
+    private static final long PLANNING_IDLE_LIMIT_NS = 3_000_000_000L;
+    // Leave time for a bounded probe and rendered camera motion, not just a turn command.
+    private static final long CAMERA_DISPATCH_LEAD_NS = 600_000_000L;
     private static final int MAX_AGE = 1_200;
     private static final int MAX_HANDOFF_AGE = 100;
     private static final int MAX_OFFERS = 16;
@@ -101,7 +105,8 @@ final class AgentMacroControl {
     private record Snapshot(long epoch, Map<String, Offer> offers) {}
     private record Intent(String id, int life, long epoch, long basis, long expires, String opportunity, String skillHash) {}
     private record Handoff(int life, long epoch, long basis, long expires) {}
-    private record Inbox(boolean active, Intent intent, Handoff handoff) {}
+    private record Planning(int life, long epoch, long basis, String id, long noticedAt) {}
+    private record Inbox(boolean active, Intent intent, Handoff handoff, Planning planning) {}
     private record Camera(float yaw, float pitch) {}
     private record Output(String file, String value) {}
 
@@ -131,21 +136,22 @@ final class AgentMacroControl {
     private static final class Action {
         final Intent intent;
         final Offer offer;
-        final long started, startingFrame;
+        final long started, startedAt, startingFrame;
         final Vec3d position;
         final float yaw, pitch;
         final int itemCount;
         final InventoryWitness walkInventory;
         final Camera camera;
-        boolean drove, fired, broken;
+        boolean drove, fired, broken, purposefulMotion;
         long firedAt, pickupDisappeared, craftJob, priorCraftReceipt, settledAt;
         String unexpectedPickup;
         Screen opened;
 
-        Action(Intent intent, Offer offer, MinecraftClient client, long tick, long frame, int itemCount) {
+        Action(Intent intent, Offer offer, MinecraftClient client, long tick, long now, long frame, int itemCount) {
             this.intent = intent;
             this.offer = offer;
             started = tick;
+            startedAt = now;
             startingFrame = frame;
             position = client.player.getPos();
             yaw = client.player.getYaw();
@@ -171,6 +177,7 @@ final class AgentMacroControl {
     private final LinkedHashMap<Key, String> ids = new LinkedHashMap<>();
     private final LinkedHashMap<String, Boolean> consumed = new LinkedHashMap<>();
     private final Set<Key> retiredViews = new HashSet<>();
+    private final Set<BlockPos> localSteps = new HashSet<>();
     private final ArrayDeque<String> recent = new ArrayDeque<>(8);
     private MinecraftClient client;
     private AgentBody body;
@@ -182,10 +189,17 @@ final class AgentMacroControl {
     private float surveyYaw;
     private long tick, epoch, nextId, lastObservation, inventoryStamp;
     private long fallbackTicks;
+    private long fallbackActions, blockedCount, urgentCount, lastPurposefulTick;
+    private long now, idleSince, waitElapsed, waitTotal, waitMaximum, waitOvershoot, nextLocalProbe;
+    private long rawNoWorkSince, rawNoWorkMax, planningNoticeTick, planningNoticeNanos;
     private int life, surveyOrigin;
     private Inbox input;
     private Action action;
-    private boolean suspended, visited, owned, hazardClear, lastHazard, quiescent, handoff, localWork;
+    private boolean suspended, visited, owned, hazardClear, lastHazard, quiescent, urgent, blocked, deadlineMeasured;
+    private boolean urgentInput;
+    private boolean rawPending;
+    private String planningState = "awaiting_plan", planningEvidence = "No provider decision is pending.";
+    private String activePlanningId, lastPurposefulAction, lastUrgency, blockedReason;
     private boolean trialUsed, revocationSeen, revocationAcknowledged;
     private String owner = "deterministic";
     private String status = "waiting for a current local plan";
@@ -216,6 +230,7 @@ final class AgentMacroControl {
         this.hands = hands;
         this.shown = shown;
         this.tick = tick;
+        sampleClock();
         input = ipc.inbox;
         owner = engaged() ? "safety" : "deterministic";
         if (this.life != life || world != client.world || player != client.player) {
@@ -230,20 +245,126 @@ final class AgentMacroControl {
             anchor = null;
             inventoryStamp = 0;
             lastHazard = false;
-            handoff = localWork = false;
+            localSteps.clear();
+            activePlanningId = null;
+            idleSince = now;
+            nextLocalProbe = 0;
+            blocked = deadlineMeasured = false;
+            waitElapsed = 0;
+            rawPending = false;
         }
+        observePlanning();
     }
 
-    boolean engaged() { return input != null && (trial || input.active || action != null || activated && !revocationAcknowledged); }
+    boolean engaged() { return input != null && (trial || activated); }
     boolean hasAction() { return action != null; }
     String status() { return status; }
     String owner() { return owner; }
     boolean trial() { return trial; }
-    long fallbackTicks() { return fallbackTicks; }
+    String planningState() { return planningState; }
+    String planningEvidence() { return planningEvidence; }
+    long lastPurposefulTick() { return lastPurposefulTick; }
+    long planningIdleDeadlineNanos() { return idleSince + PLANNING_IDLE_LIMIT_NS; }
+
+    private static double millis(long nanos) { return nanos / 1_000_000.0; }
+
+    void addPlanningTelemetry(JsonObject event) {
+        event.addProperty("macro_planning_state", planningState);
+        event.addProperty("macro_planning_evidence", planningEvidence);
+        event.addProperty("macro_wait_elapsed_ms", millis(waitElapsed));
+        event.addProperty("macro_wait_max_idle_ms", millis(waitMaximum));
+        event.addProperty("macro_wait_max_overshoot_ms", millis(waitOvershoot));
+        event.addProperty("macro_wait_total_ms", millis(waitTotal));
+        event.addProperty("macro_wait_max_no_work_ms", millis(rawNoWorkMax));
+        event.addProperty("macro_blocked_count", blockedCount);
+        event.addProperty("macro_urgent_count", urgentCount);
+        event.addProperty("macro_fallback_ticks", fallbackTicks);
+        event.addProperty("macro_fallback_actions", fallbackActions);
+        if (planningNoticeTick == 0) {
+            event.add("macro_planning_marker_notice_tick", JsonNull.INSTANCE);
+            event.add("macro_planning_marker_notice_monotonic_ns", JsonNull.INSTANCE);
+        } else {
+            event.addProperty("macro_planning_marker_notice_tick", planningNoticeTick);
+            event.addProperty("macro_planning_marker_notice_monotonic_ns", Long.toString(planningNoticeNanos));
+        }
+        if (lastPurposefulTick == 0) {
+            event.add("macro_last_purposeful_tick", JsonNull.INSTANCE);
+            event.add("macro_last_purposeful_action", JsonNull.INSTANCE);
+        } else {
+            event.addProperty("macro_last_purposeful_tick", lastPurposefulTick);
+            event.addProperty("macro_last_purposeful_action", lastPurposefulAction);
+        }
+    }
+
+    private void state(String state, String evidence) {
+        planningState = state;
+        planningEvidence = evidence;
+    }
+
+    private void sampleClock() {
+        long sample = System.nanoTime();
+        if (planningState.equals("planning_wait")) {
+            waitTotal += sample - now;
+            measureIdle(sample);
+        }
+        if (rawPending) rawNoWorkMax = Math.max(rawNoWorkMax, sample - rawNoWorkSince);
+        now = sample;
+    }
+
+    private void observePlanning() {
+        Planning planning = input.planning;
+        boolean pending = !trial && planning != null && planning.life == life && planning.basis <= tick
+            && planning.epoch <= epoch && (planning.id.equals(activePlanningId) || tick - planning.basis <= MAX_AGE);
+        if (pending) {
+            if (!planning.id.equals(activePlanningId)) {
+                planningNoticeTick = tick;
+                planningNoticeNanos = planning.noticedAt;
+                activePlanningId = planning.id;
+            }
+            if (!rawPending) rawNoWorkSince = Math.max(idleSince, planning.noticedAt);
+        }
+        rawPending = pending;
+    }
+
+    private void measureIdle(long sample) {
+        if (deadlineMeasured) return;
+        waitElapsed = sample - idleSince;
+        waitMaximum = Math.max(waitMaximum, waitElapsed);
+        if (waitElapsed >= PLANNING_IDLE_LIMIT_NS) {
+            deadlineMeasured = true;
+            waitOvershoot = Math.max(waitOvershoot, waitElapsed - PLANNING_IDLE_LIMIT_NS);
+        }
+    }
+
+    private void purposeful(String detail) {
+        lastPurposefulTick = tick;
+        lastPurposefulAction = detail;
+        idleSince = now;
+        blocked = deadlineMeasured = false;
+        waitElapsed = 0;
+        if (rawPending) rawNoWorkSince = now;
+    }
+
+    void urgent(String detail) {
+        if (!engaged()) return;
+        interrupt("Immediate safety took control: " + detail, true);
+        if (!urgent) {
+            ++urgentCount;
+            remember("safety: " + detail);
+        }
+        urgent = true;
+        lastUrgency = detail;
+        state("urgent", detail);
+    }
+
+    void safetyEffect(String detail) {
+        if (!engaged()) return;
+        remember("safety completed: " + detail);
+        purposeful("safety: " + detail);
+    }
 
     /** Called only after the existing fall, danger and emergency food controllers declined ownership. */
-    boolean control(AgentProgress progress) {
-        if (!engaged()) return false;
+    void control(AgentProgress progress) {
         visited = true;
         hazardClear = !body.lavaEmergency() && !body.macroLavaNear()
             && !client.player.isOnFire() && !client.player.isInLava() && client.player.hurtTime == 0;
@@ -251,23 +372,31 @@ final class AgentMacroControl {
         if (!input.active) {
             claim(trial ? "trial_idle" : "local_handoff");
             interrupt("The host revoked macro authority.", true);
-            if (hands.busy() && client.isWindowFocused() && !client.isPaused()) hands.tick();
-            else if ((localWork || handoff) && cursorClear()) progress.macroRetireWorkstation();
+            if (hands.busy()) hands.cancel();
             status = "macro authority is inactive";
-            return true;
+            state("inactive", status);
+            return;
         }
+        sampleClock();
+        boolean thinking = rawPending;
+        if (thinking && action == null && !blocked) measureIdle(now);
         if (action != null) {
-            claim("terra");
-            if (input.intent == null || !input.intent.equals(action.intent)) {
+            observePurposefulMotion();
+            boolean local = action.intent == null;
+            claim(local ? "local_motion" : "terra");
+            if (local) ++fallbackTicks;
+            state(local ? "local_in_progress" : "terra_in_progress", action.offer.summary);
+            if (!local && (input.intent == null || !input.intent.equals(action.intent))) {
                 interrupt("The host withdrew or replaced this intent.", true);
-            } else if (tick > action.intent.expires || tick - action.started > action.offer.key.verb.maxTicks) {
+            } else if ((local ? now - action.startedAt >= PLANNING_IDLE_LIMIT_NS : tick > action.intent.expires)
+                    || tick - action.started > action.offer.key.verb.maxTicks) {
                 interrupt(timeoutDetail(), true);
             } else if (!grounded() || !hazardClear || !client.isWindowFocused() || client.getOverlay() != null) {
                 interrupt("Grounding, window focus, or local safety changed.", true);
             } else {
                 step(progress);
             }
-            return true;
+            return;
         }
 
         Intent intent = input.intent;
@@ -281,44 +410,19 @@ final class AgentMacroControl {
             }
         }
         boolean barrier = handoffCurrent(input.handoff);
-        boolean requested = pending || barrier;
-        if (localWork && requested) {
-            localWork = false;
-            handoff = true;
-        }
-        if (!trial && !requested && !handoff && localViewAvailable()) {
-            // Only ordinary Progress runs below this return. It retains its nonterminal
-            // stall, cave, workbench and terrain safety policy, not a second input writer.
-            owner = "local_fallback";
-            localWork = true;
-            ++fallbackTicks;
-            hands.tick();
-            return false;
-        }
-
-        claim(handoff ? "local_handoff" : trial ? "trial_idle" : "terra_idle");
-        if (hands.busy()) {
-            // Finish the existing safe hand job; do not start deterministic strategic work here.
-            hands.tick();
-            status = "finishing the current hand job";
-            return true;
-        }
-        if (client.currentScreen != null) {
-            if (handoff && cursorClear()) progress.macroRetireWorkstation();
-            status = "waiting for the world view";
-            return true;
-        }
-        if (handoff) {
-            status = "retiring local input for a plan";
-            if (!requested || available()) handoff = false;
-            return true;
-        }
+        claim(pending || barrier ? "local_handoff" : trial ? "trial_idle" : "terra_idle");
+        // No ordinary Hands job is advanced outside its action/safety authority.
+        if (hands.busy()) hands.cancel();
         if (barrier && !pending) {
             status = "holding neutral for the prepared handoff";
-            return true;
+            if (thinking && now - idleSince >= PLANNING_IDLE_LIMIT_NS) block("A prepared handoff owns the controls.");
+            else state("handoff", status);
+            return;
         }
-        status = "waiting for a current local plan";
-        if (!pending) return true;
+        if (!pending) {
+            idle(progress, thinking);
+            return;
+        }
         Offer offer = snapshots.get(intent.basis).offers.get(intent.opportunity);
         String refusal = !available() ? "No neutral, grounded, safe first-person view." :
             trial && (trialUsed || !diagnosticVerb(offer.key.verb)) ? "The diagnostic admits one isolated reader action."
@@ -327,22 +431,40 @@ final class AgentMacroControl {
             : validate(offer, progress);
         if (refusal != null) {
             refuseUnseen(refusal);
-            return true;
+            idle(progress, thinking);
+            return;
         }
         markConsumed(intent.id);
         owner = "terra";
-        action = new Action(intent, offer, client, tick, body.renderedFrame(),
+        action = new Action(intent, offer, client, tick, now, body.renderedFrame(),
             offer.item == null ? 0 : count(offer.item));
         if (trial) {
             trialUsed = true;
             if (!ipc.evidence("trial-witness.json", trialWitness().toString())) {
                 action = null;
-                return true;
+                return;
             }
         }
         receipt(intent, "accepted", "Current local evidence and controls rechecked.");
+        state("terra_in_progress", offer.summary);
         step(progress);
-        return true;
+    }
+
+    private void observePurposefulMotion() {
+        if (action.purposefulMotion) return;
+        boolean witnessed = false;
+        if (action.camera != null && body.renderedFrame() > action.startingFrame && body.hasRecentView()) {
+            double distanceBefore = angle(action.yaw, action.pitch, action.camera.yaw, action.camera.pitch);
+            double left = angle(player.getYaw(), player.getPitch(), action.camera.yaw, action.camera.pitch);
+            witnessed = distanceBefore - left >= 5;
+        } else if (action.drove) {
+            Vec3d destination = action.offer.floor.landing;
+            witnessed = horizontalSquared(action.position, destination) - horizontalSquared(player.getPos(), destination) >= 0.16;
+        }
+        if (witnessed) {
+            action.purposefulMotion = true;
+            purposeful((action.intent == null ? "local_motion: " : "terra: ") + action.offer.summary);
+        }
     }
 
     private static boolean diagnosticVerb(Verb verb) {
@@ -395,11 +517,90 @@ final class AgentMacroControl {
         body.pauseWork();
     }
 
-    private boolean localViewAvailable() {
-        return client.isWindowFocused() && client.getOverlay() == null && !client.isPaused()
-            && !client.player.isOnFire() && !client.player.isInLava() && client.player.hurtTime == 0
-            && (body.hasRecentView() || hands.busy()
-                || client.currentScreen instanceof CraftingScreen || client.currentScreen instanceof FurnaceScreen);
+    private void idle(AgentProgress progress, boolean thinking) {
+        if (trial) {
+            status = "holding the isolated trial view";
+            state("trial_idle", status);
+            return;
+        }
+        long idleNanos = now - idleSince;
+        boolean due = blocked || idleNanos >= PLANNING_IDLE_LIMIT_NS;
+        boolean cameraReady = due || idleNanos >= PLANNING_IDLE_LIMIT_NS - CAMERA_DISPATCH_LEAD_NS;
+        if (blocked && tick < nextLocalProbe) {
+            status = "blocked/no_safe_action";
+            state(status, blockedReason);
+            return;
+        }
+        if (due || thinking && tick >= nextLocalProbe) {
+            if (!available()) {
+                if (due) {
+                    block("No neutral, grounded, safe first-person view for local work.");
+                    return;
+                }
+            } else if (tick >= nextLocalProbe || due && !blocked) {
+                nextLocalProbe = tick + OBSERVATION_INTERVAL;
+                Offer next = localOffer(progress, cameraReady);
+                if (next == null) {
+                    if (due) {
+                        block("No new lit resource view or safe adjacent step toward a witnessed feature.");
+                        return;
+                    }
+                } else {
+                    if (next.floor != null) localSteps.add(next.floor.pos);
+                    claim("local_motion");
+                    ++fallbackTicks;
+                    action = new Action(null, next, client, tick, now, body.renderedFrame(), 0);
+                    state("local_in_progress", next.summary);
+                    step(progress);
+                    return;
+                }
+            }
+        }
+        if (due) {
+            block("No new lit resource view or safe adjacent step toward a witnessed feature.");
+        } else {
+            status = "waiting for a current local plan";
+            state(thinking ? "planning_wait" : "awaiting_plan", thinking
+                ? "A trusted planning episode is pending." : "No provider decision is pending.");
+        }
+    }
+
+    private Offer localOffer(AgentProgress progress, boolean allowCamera) {
+        Offer inspect = null, survey = null, step = null;
+        Vec3d from = client.player.getPos();
+        BlockHitResult feature = body.find(AgentMacroControl::resource, INSPECT_REACH).orElse(null);
+        double improvement = 0.5;
+        if (localSteps.size() < 32) localSteps.add(client.player.getBlockPos().down());
+        for (Offer offer : offers(progress)) {
+            switch (offer.key.verb) {
+                case APPROACH -> {
+                    if (feature == null || feature.getPos().squaredDistanceTo(client.player.getEyePos()) <= reach() * reach()
+                            || localSteps.size() >= 32 || localSteps.contains(offer.floor.pos)) continue;
+                    double benefit = horizontalSquared(from, feature.getPos()) -
+                        horizontalSquared(offer.floor.landing, feature.getPos());
+                    if (benefit > improvement && validate(offer, progress) == null) {
+                        improvement = benefit;
+                        step = offer;
+                    }
+                }
+                case INSPECT -> { if (allowCamera && inspect == null && validate(offer, progress) == null) inspect = offer; }
+                case SURVEY -> { if (allowCamera && survey == null && validate(offer, progress) == null) survey = offer; }
+                default -> { } // Never select an attack, workstation, crafting, or pickup on local authority.
+            }
+        }
+        return step != null ? step : inspect != null ? inspect : survey;
+    }
+
+    private void block(String detail) {
+        blockedReason = detail;
+        nextLocalProbe = tick + OBSERVATION_INTERVAL;
+        if (!blocked) {
+            blocked = true;
+            ++blockedCount;
+            remember("blocked/no_safe_action: " + detail);
+        }
+        status = "blocked/no_safe_action";
+        state(status, detail);
     }
 
     private String validate(Offer offer, AgentProgress progress) {
@@ -446,7 +647,7 @@ final class AgentMacroControl {
                         && body.renderedDirection(action.camera.yaw, action.camera.pitch, 4)
                         && angle(action.yaw, action.pitch, player.getYaw(), player.getPitch()) >= 5) {
                     complete("The first-person camera rendered the requested survey angle.");
-                } else body.turn(action.camera.yaw, action.camera.pitch);
+                } else body.turnScan(action.camera.yaw, action.camera.pitch);
             }
             case INSPECT -> {
                 if (!body.hasRecentView()) return;
@@ -457,7 +658,7 @@ final class AgentMacroControl {
                         && body.renderedAim(offer.face.hit.getPos(), 4)
                         && angle(action.yaw, action.pitch, client.player.getYaw(), client.player.getPitch()) >= 4)
                     complete("The first-person camera centered the witnessed face.");
-                else body.turn(action.camera.yaw, action.camera.pitch);
+                else body.turnFine(action.camera.yaw, action.camera.pitch);
             }
             case APPROACH, COLLECT -> walk(offer);
             case BREAK -> {
@@ -586,6 +787,13 @@ final class AgentMacroControl {
 
     void end(AgentProgress progress, String safety) {
         if (input == null) return;
+        if (owner.equals("safety") && urgent) {
+            boolean applied = !body.keysNeutral();
+            if (applied && !urgentInput) purposeful("safety: " + lastUrgency);
+            urgentInput = applied;
+        } else {
+            urgent = urgentInput = false;
+        }
         if (!input.active) {
             if (activated && !revocationSeen) {
                 revocationSeen = true;
@@ -601,12 +809,13 @@ final class AgentMacroControl {
                 revoked.addProperty("tick", tick);
                 revocationAcknowledged = ipc.evidence("revoked.json", revoked.toString());
             }
-            if (!activated || revocationAcknowledged) ipc.close();
+            if (!activated || revocationAcknowledged) close("authority_revoked");
             return;
         }
         if (!visited) {
-            interrupt(safety, true);
-            refuseUnseen(safety);
+            String reason = urgent ? "Immediate safety took control: " + lastUrgency : safety;
+            interrupt(reason, true);
+            refuseUnseen(reason);
         }
         if (action != null && (action.offer.key.verb == Verb.APPROACH || action.offer.key.verb == Verb.COLLECT))
             action.drove |= client.options.forwardKey.isPressed();
@@ -614,7 +823,7 @@ final class AgentMacroControl {
         updateScope(due);
         // Ordinary local work may continue on the very next tick. Only an observed
         // promotion barrier (or an isolated trial) advertises a held neutral window.
-        quiescent = (trial || handoffCurrent(input.handoff)) && visited && owned && !handoff && available();
+        quiescent = (trial || handoffCurrent(input.handoff)) && visited && owned && available();
         if (due) publish(progress);
     }
 
@@ -623,6 +832,9 @@ final class AgentMacroControl {
         if (suspended) return;
         suspended = true;
         this.tick = tick;
+        sampleClock();
+        rawPending = false;
+        state("inactive", reason);
         quiescent = hazardClear = owned = false;
         owner = "safety";
         interrupt(reason, false);
@@ -634,7 +846,20 @@ final class AgentMacroControl {
         }
     }
 
-    void close() { ipc.close(); }
+    void close(String reason) {
+        if (ipc.worker.isShutdown()) return;
+        if (!trial && life != 0) {
+            sampleClock();
+            JsonObject finalStats = header(run);
+            finalStats.addProperty("life", life);
+            finalStats.addProperty("epoch", epoch);
+            finalStats.addProperty("tick", tick);
+            finalStats.addProperty("reason", reason);
+            addPlanningTelemetry(finalStats);
+            ipc.evidence("native-planning-final.json", finalStats.toString());
+        }
+        ipc.close();
+    }
     void drain() { ipc.drain(); }
 
     boolean grounded() {
@@ -940,7 +1165,11 @@ final class AgentMacroControl {
         }
         if ((action.offer.key.verb == Verb.SURVEY || action.offer.key.verb == Verb.INSPECT)
                 && retiredViews.size() < 256) retiredViews.add(action.offer.key);
-        receipt(action.intent, result, detail);
+        if (action.intent == null) {
+            remember("local_motion " + result + ": " + detail);
+            if (result.equals("completed")) ++fallbackActions;
+        } else receipt(action.intent, result, detail);
+        if (result.equals("completed") && !action.purposefulMotion) purposeful(detail);
         action = null;
     }
 
@@ -971,8 +1200,12 @@ final class AgentMacroControl {
         value.addProperty("status", result);
         value.addProperty("detail", detail);
         ipc.receipt(value.toString());
+        remember(result + ": " + detail);
+    }
+
+    private void remember(String event) {
         if (recent.size() == 8) recent.removeFirst();
-        recent.addLast(result + ": " + detail);
+        recent.addLast(event);
     }
 
     private static JsonObject header(String run) {
@@ -1004,7 +1237,8 @@ final class AgentMacroControl {
         private static final Set<String> INTENT_FIELDS =
             Set.of("v", "id", "run", "life", "epoch", "basisTick", "expiresTick", "opportunityId", "skillHash");
         private static final Set<String> HANDOFF_FIELDS = Set.of("v", "run", "life", "epoch", "basisTick", "expiresTick");
-        private static final Inbox OFF = new Inbox(false, null, null);
+        private static final Set<String> PLANNING_FIELDS = Set.of("v", "run", "life", "epoch", "basisTick", "id");
+        private static final Inbox OFF = new Inbox(false, null, null, null);
         private final Path directory;
         private final String run;
         private final ScheduledExecutorService worker;
@@ -1018,7 +1252,7 @@ final class AgentMacroControl {
             this.directory = directory;
             this.run = run;
             retired = !active;
-            inbox = active ? new Inbox(true, null, null) : OFF;
+            inbox = active ? new Inbox(true, null, null, null) : OFF;
             worker = Executors.newSingleThreadScheduledExecutor(task -> {
                 Thread thread = new Thread(task, "survival-agent-macro-io");
                 thread.setDaemon(true);
@@ -1059,7 +1293,7 @@ final class AgentMacroControl {
                     markerRevoked = true;
                     retired = true;
                 }
-                Inbox next = retired ? OFF : new Inbox(true, readIntent(), readHandoff());
+                Inbox next = retired ? OFF : new Inbox(true, readIntent(), readHandoff(), readPlanning(inbox.planning));
                 inbox = retired ? OFF : next;
                 flush();
             } catch (RuntimeException e) {
@@ -1151,6 +1385,23 @@ final class AgentMacroControl {
                 long expires = number(value, "expiresTick");
                 return life >= 1 && life <= Integer.MAX_VALUE && epoch >= 1 && basis >= 1 && expires > basis
                     && expires - basis <= MAX_HANDOFF_AGE ? new Handoff((int) life, epoch, basis, expires) : null;
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+
+        private Planning readPlanning(Planning previous) {
+            JsonObject value = read(directory.resolve("planning.json"), 2048);
+            if (value == null || !value.keySet().equals(PLANNING_FIELDS)) return null;
+            try {
+                if (number(value, "v") != 1 || !run.equals(text(value, "run"))) return null;
+                long life = number(value, "life"), epoch = number(value, "epoch"), basis = number(value, "basisTick");
+                String id = text(value, "id");
+                if (life < 1 || life > Integer.MAX_VALUE || epoch < 1 || basis < 1 || !TOKEN.matcher(id).matches())
+                    return null;
+                if (previous != null && previous.id.equals(id) && previous.life == life && previous.epoch == epoch
+                        && previous.basis == basis) return previous;
+                return new Planning((int) life, epoch, basis, id, System.nanoTime());
             } catch (RuntimeException e) {
                 return null;
             }

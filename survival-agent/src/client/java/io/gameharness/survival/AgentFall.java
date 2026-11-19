@@ -275,7 +275,7 @@ final class AgentFall {
         stable = 0;
         nextBoat(Boat.LIP);
         body.sneak();
-        body.aim(along(landing, 0.83, 0));
+        body.aimFixed(along(landing, 0.83, 0));
         status = "checking whether the lower ledge is broad enough for a boat";
         return true;
     }
@@ -312,7 +312,7 @@ final class AgentFall {
             case LIP -> {
                 body.sneak();
                 Vec3d near = along(edge, -0.065, lateral(player.getPos()));
-                body.aim(along(near, 0.6, 0).add(0, -0.25, 0));
+                body.aimFixed(along(near, 0.6, 0).add(0, -0.25, 0));
                 if (forward(player.getPos(), edge) >= -0.075) nextBoat(Boat.LANDING);
                 else if (player.isSneaking() && floorAt(near)) body.walk(false);
             }
@@ -333,14 +333,14 @@ final class AgentFall {
                 // have to turn in a tight space. Vanilla sneak still guards the retreat.
                 body.sneak();
                 float yaw = boatDirection.getPositiveHorizontalDegrees();
-                body.turn(yaw, 39);
+                body.turnFixed(yaw, 39);
                 if (forward(player.getPos(), launch) <= -1.0) nextBoat(Boat.PLACE);
                 else if (player.isSneaking() && Math.abs(lateral(player.getPos())) <= 0.36
                     && Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) <= 2) body.back();
             }
             case PLACE -> {
                 status = "boat: equipping it while standing on the witnessed takeoff";
-                body.aim(launch);
+                body.aimFixed(launch);
                 if (hands.equipForUse(BOAT) && body.tapFallBlock(BlockPos.ofFloored(launch.add(0, -0.03, 0)),
                         player.getMainHandStack().getItem(), launch, 0.17)) {
                     boatSlot = player.getInventory().selectedSlot;
@@ -358,7 +358,7 @@ final class AgentFall {
                         && hull.getVelocity().horizontalLengthSquared() < 0.0025) boat = hull;
                 }
                 if (boat != null) {
-                    body.aim(boat.getBoundingBox().getCenter());
+                    body.aimFixed(boat.getBoundingBox().getCenter());
                     if (!boarded && body.tapVisibleEntity(boat)) boarded = true;
                 }
             }
@@ -378,13 +378,13 @@ final class AgentFall {
                 dropped = true;
             }
             if (dropped) {
-                body.aim(along(landing, 0.8, 0));
+                body.aimFixed(along(landing, 0.8, 0));
                 status = "descending while actually mounted in the boat";
                 if (boat.isOnGround()) nextBoat(Boat.SETTLE);
                 return true;
             }
             Vec3d route = along(edge, 2, 0);
-            body.aim(route);
+            body.aimFixed(route);
             double lateral = lateral(boat.getPos());
             double along = forward(boat.getPos(), edge);
             if (tick - boatSince > 175 || Math.abs(lateral) > 0.36
@@ -421,7 +421,7 @@ final class AgentFall {
         // Choose a currently visible dismount point on real support, not just a clear hull.
         int side = Math.max(0, tick - boatSince - VERIFY_TICKS) / 24 % 3;
         float yaw = boatDirection.getPositiveHorizontalDegrees() + (side == 0 ? 0 : side == 1 ? -90 : 90);
-        body.turn(yaw, 37);
+        body.turnFixed(yaw, 37);
         // Vanilla offsets by half the hull's diagonal plus half the passenger width.
         double offset = (boat.getWidth() * Math.sqrt(2) + player.getWidth() + 1e-5) * 0.5;
         double radians = Math.toRadians(player.getYaw());
@@ -455,7 +455,7 @@ final class AgentFall {
             }
         }
         if (missing == null) return true;
-        body.aim(missing);
+        body.aimFixed(missing);
         return false;
     }
 
@@ -474,7 +474,7 @@ final class AgentFall {
             }
         }
         if (missing == null) return true;
-        body.aim(missing);
+        body.aimFixed(missing);
         return false;
     }
 

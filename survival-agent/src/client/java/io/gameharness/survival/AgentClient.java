@@ -2,6 +2,7 @@ package io.gameharness.survival;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import io.gameharness.survival.mixin.AgentHandledScreenAccess;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -12,6 +13,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
@@ -27,9 +29,12 @@ import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.Item;
 import net.minecraft.registry.Registries;
+import net.minecraft.screen.AbstractCraftingScreenHandler;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.GameMode;
 
 /** Private run telemetry observes the player. No command, server or world-data input channel. */
@@ -57,6 +62,9 @@ public final class AgentClient implements ClientModInitializer {
     private String lastStatus = "";
     private String lastHands = "";
     private String lastOwner = "deterministic";
+    private String lastPlanningState = "";
+    private String lastPlanningEvidence = "";
+    private long lastPurposefulTick;
     private Screen renderedScreen;
     private int personalOpens;
     private int benchOpens;
@@ -69,6 +77,8 @@ public final class AgentClient implements ClientModInitializer {
     private int rockBroken;
     private BufferedWriter movement;
     private BufferedWriter contacts;
+    private BufferedWriter looks;
+    private final long lookSeed = ThreadLocalRandom.current().nextLong();
     private long craftSequence;
     private long stallSequence;
     private boolean allowRespawn;
@@ -77,6 +87,9 @@ public final class AgentClient implements ClientModInitializer {
     private ClientPlayerEntity deadPlayer;
     private AgentRespawn respawn;
     private long lifeDeadline;
+    private long lastFuseCheckNs, lastFuseCheckTick, fuseTick;
+    private Vec3d fuseOrigin;
+    private Item fuseCursorItem;
     private long priorShiftPresses;
     private int priorStallIncidents, priorStallAttempts, priorStallRecoveries, priorStallFailures;
     private int priorShortJumps, priorHeadroomCleared, priorHeadroomBypasses;
@@ -109,7 +122,7 @@ public final class AgentClient implements ClientModInitializer {
         active = this;
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
             if (hands != null) hands.discardLifeInputs();
-            stopMacro("The client is stopping.");
+            stopMacro("actor_exit", "The client is stopping.");
             if (macro != null) macro.drain();
             if (progress != null) progress.saveMemory(true);
             detachEars(client);
@@ -161,6 +174,7 @@ public final class AgentClient implements ClientModInitializer {
             if (tick % 20 == 0) {
                 movement.flush();
                 if (contacts != null) contacts.flush();
+                if (looks != null) looks.flush();
             }
         } catch (IOException e) { throw new UncheckedIOException(e); }
     }
@@ -184,10 +198,25 @@ public final class AgentClient implements ClientModInitializer {
         return Double.isFinite(value) ? Double.toString(value) : "";
     }
 
+    private void recordLook(AgentBody.LookEvidence look) {
+        try {
+            if (looks == null) {
+                looks = Files.newBufferedWriter(directory.resolve("world-looks.tsv"), StandardOpenOption.CREATE_NEW);
+                looks.write("life\tend_tick\twall_ms\tseed\tsequence\tcontext\tprofile\teffort\tinitial_degrees\tapplied_degrees\tpeak_deg_s\tpeak_at_ms\tduration_ms\toutcome\n");
+            }
+            looks.write((respawns + 1) + "\t" + look.tick() + "\t" + look.wallMs() + "\t" + look.seed() + "\t" +
+                look.sequence() + "\t" + look.context() + "\t" + look.profile() + "\t" + finiteSample(look.effort()) +
+                "\t" + finiteSample(look.distance()) + "\t" + finiteSample(look.appliedDegrees()) + "\t" +
+                finiteSample(look.peakDegreesPerSecond()) + "\t" + look.peakAtMs() + "\t" + look.durationMs() +
+                "\t" + look.outcome() + "\n");
+        } catch (IOException e) { throw new UncheckedIOException(e); }
+    }
+
     private void closeMovement() {
-        try (BufferedWriter positions = movement; BufferedWriter actions = contacts) { /* close both writers */ }
+        if (body != null) body.finishWorldLook();
+        try (BufferedWriter positions = movement; BufferedWriter actions = contacts; BufferedWriter gestures = looks) { }
         catch (IOException e) { throw new UncheckedIOException(e); }
-        finally { movement = contacts = null; }
+        finally { movement = contacts = looks = null; }
     }
 
     public static void steerFrame() {
@@ -255,12 +284,15 @@ public final class AgentClient implements ClientModInitializer {
     }
 
     private void bindPolicy(MinecraftClient client) {
-        body = new AgentBody(client, this::recordContact);
+        body = new AgentBody(client, this::recordContact, this::recordLook, lookSeed + respawns);
         hands = new AgentHands(client);
         progress = new AgentProgress(client, body, hands, goal, new AgentMemory(directory));
         craftSequence = stallSequence = 0;
+        lastFuseCheckNs = lastFuseCheckTick = fuseTick = 0;
+        fuseOrigin = null;
+        fuseCursorItem = null;
         if (client.player.isAlive()) {
-            ears = new AgentEars(client);
+            ears = new AgentEars(client, () -> renderedScreen);
             client.getSoundManager().registerListener(ears);
         }
     }
@@ -272,16 +304,17 @@ public final class AgentClient implements ClientModInitializer {
     }
 
     private void releaseLifeInputs(MinecraftClient client) {
+        body.finishWorldLook();
         body.release();
         hands.discardLifeInputs();
         detachEars(client);
         lastYaw = lastPitch = Float.NaN;
     }
 
-    private void stopMacro(String reason) {
+    private void stopMacro(String cause, String reason) {
         if (macro == null) return;
         macro.suspend(tick, reason);
-        macro.close();
+        macro.close(cause);
     }
 
     private boolean observeDeath(MinecraftClient client) {
@@ -300,7 +333,7 @@ public final class AgentClient implements ClientModInitializer {
         if (allowRespawn) {
             respawn = new AgentRespawn();
             lifeDeadline = System.nanoTime() + CONTROL_TIMEOUT;
-        } else if (macro != null) macro.close();
+        } else if (macro != null) macro.close("death_no_respawn");
         return true;
     }
 
@@ -402,7 +435,7 @@ public final class AgentClient implements ClientModInitializer {
     private void failLife(MinecraftClient client, String failure) {
         respawn = null;
         ended = true;
-        stopMacro("Vanilla respawn failed.");
+        stopMacro("respawn_failed", "Vanilla respawn failed.");
         publish(client, "respawn stopped", false, failure, true, System.currentTimeMillis());
     }
 
@@ -412,7 +445,7 @@ public final class AgentClient implements ClientModInitializer {
         ++tick;
         if (!sameConnection(client)) {
             releaseLifeInputs(client);
-            stopMacro("The admitted loopback connection closed.");
+            stopMacro("connection_closed", "The admitted loopback connection closed.");
             if (lifePhase != LifePhase.PLAYING) failLife(client, "Connection closed before respawn completed.");
             else { ended = true; closeMovement(); }
             return;
@@ -435,12 +468,84 @@ public final class AgentClient implements ClientModInitializer {
         progress.observeMemoryFooting(tick);
         body.begin();
         if (macro != null) macro.begin(client, body, hands, renderedScreen, tick, 1 + respawns);
+        long fuseCheckNs = System.nanoTime();
+        var fuse = ears.takeFuseCue();
+        var openAtCheck = fuse == null ? null : client.currentScreen;
+        var shownAtCheck = fuse == null ? null : renderedScreen;
+        String handsAtCheck = fuse == null ? null : hands.status();
+        long handsGeneration = fuse == null ? 0 : hands.jobGeneration();
+        var handler = fuse == null ? null : client.player.currentScreenHandler;
+        var cursorAtCheck = handler == null ? null : handler.getCursorStack();
+        Item cursorItem = cursorAtCheck == null || cursorAtCheck.isEmpty() ? null : cursorAtCheck.getItem();
+        int cursorCount = cursorAtCheck == null ? 0 : cursorAtCheck.getCount();
+        int cursorStock = cursorItem == null ? 0 : countItem(client.player.getInventory(), cursorItem) + cursorCount;
+        if (cursorItem != null && handler instanceof AbstractCraftingScreenHandler crafting) {
+            for (var slot : crafting.getInputSlots()) {
+                var stack = slot.getStack();
+                if (stack.isOf(cursorItem)) cursorStock += stack.getCount();
+            }
+        }
+        int cursorPreviewSlots = openAtCheck instanceof CraftingScreen && openAtCheck instanceof AgentHandledScreenAccess access
+            && access.agent$cursorDragging() ? access.agent$cursorDragSlots().size() : 0;
+        String planningAtCheck = fuse == null || macro == null ? null : macro.planningState();
+        long planningDeadlineNs = fuse == null || macro == null ? 0 : macro.planningIdleDeadlineNanos();
         boolean fleeing = ears.escape(body, hands);
+        if (fleeing && macro != null) macro.urgent("evading a primed creeper");
         if (!fleeing) {
             if (macro == null || !macro.engaged()) hands.tick();
             progress.tick(ears, macro);
         }
         body.finish();
+        if (fuse != null) {
+            fuseOrigin = fuse.origin();
+            fuseTick = tick;
+            fuseCursorItem = cursorItem;
+            JsonObject event = dangerEvent("fuse", client);
+            soundFields(event, fuse);
+            event.addProperty("previous_check_tick", lastFuseCheckTick);
+            event.addProperty("previous_check_mono_ms", millis(lastFuseCheckNs));
+            event.addProperty("check_mono_ms", millis(fuseCheckNs));
+            event.addProperty("check_screen", screenKind(openAtCheck));
+            event.addProperty("rendered_at_check", screenKind(shownAtCheck));
+            event.addProperty("cue_screen_rendered_at_check", fuse.screen() != null && fuse.screen() == shownAtCheck);
+            event.addProperty("screen_after_keys", screenKind(client.currentScreen));
+            event.addProperty("hands_before", handsAtCheck);
+            event.addProperty("hands_after", hands.status());
+            event.addProperty("cursor_before_item", cursorItem == null ? "minecraft:air" : Registries.ITEM.getId(cursorItem).toString());
+            event.addProperty("cursor_before_count", cursorCount);
+            event.addProperty("cursor_after_count", client.player.currentScreenHandler.getCursorStack().getCount());
+            event.addProperty("cursor_before_total", cursorStock);
+            event.addProperty("cursor_preview_slots", cursorPreviewSlots);
+            event.addProperty("gui_sync_id", handler.syncId);
+            event.addProperty("hands_job_generation", handsGeneration);
+            event.addProperty("pursued_fuse_escape", fleeing);
+            event.addProperty("planning_before", planningAtCheck);
+            event.addProperty("planning_deadline_mono_ms", millis(planningDeadlineNs));
+            var keys = client.options;
+            event.addProperty("key_forward", keys.forwardKey.isPressed());
+            event.addProperty("key_back", keys.backKey.isPressed());
+            event.addProperty("key_left", keys.leftKey.isPressed());
+            event.addProperty("key_right", keys.rightKey.isPressed());
+            event.addProperty("key_use", keys.useKey.isPressed());
+            append("urgent-danger.jsonl", event + "\n");
+        }
+        lastFuseCheckNs = fuseCheckNs;
+        lastFuseCheckTick = tick;
+        var explosion = ears.takeExplosionCue();
+        if (fuseOrigin != null) {
+            if (explosion != null) {
+                JsonObject event = dangerEvent("explosion", client);
+                soundFields(event, explosion);
+                append("urgent-danger.jsonl", event + "\n");
+            }
+            long since = tick - fuseTick;
+            if (since > 0 && (since == 1 || since % 4 == 0))
+                append("urgent-danger.jsonl", dangerEvent("effect_sample", client) + "\n");
+            if (since >= 48) {
+                fuseOrigin = null;
+                fuseCursorItem = null;
+            }
+        }
         if (macro != null) macro.end(progress, fleeing ? "A primed creeper owns emergency movement." :
             "The local safety or completion controller owns this tick.");
         boolean won = progress.won() && !hands.busy() && client.currentScreen == null && renderedScreen == null;
@@ -448,17 +553,76 @@ public final class AgentClient implements ClientModInitializer {
             hands.cancel();
             releaseLifeInputs(client);
             ended = true;
-            stopMacro("The Survival goal was reached.");
+            stopMacro("goal_completed", "The Survival goal was reached.");
         }
         progress.saveMemory(ended);
         publish(client, fleeing ? "evading a primed creeper" : progress.status(), won, null,
             false, 0);
     }
 
+    private static double millis(long nanos) { return nanos / 1_000_000.0; }
+
+    private static String screenKind(Screen screen) {
+        return screen == null ? "world" : screen instanceof InventoryScreen ? "inventory" :
+            screen instanceof CraftingScreen ? "crafting_table" : "other";
+    }
+
+    private static void position(JsonObject event, String key, Vec3d p) {
+        JsonArray xyz = new JsonArray(3);
+        xyz.add(p.x);
+        xyz.add(p.y);
+        xyz.add(p.z);
+        event.add(key, xyz);
+    }
+
+    private static int countItem(PlayerInventory inventory, Item item) {
+        int result = 0;
+        for (int i = 0; i < inventory.size(); ++i) {
+            var stack = inventory.getStack(i);
+            if (stack.isOf(item)) result += stack.getCount();
+        }
+        return result;
+    }
+
+    private JsonObject dangerEvent(String kind, MinecraftClient client) {
+        JsonObject event = new JsonObject();
+        event.addProperty("kind", kind);
+        event.addProperty("tick", tick);
+        event.addProperty("wall_ms", System.currentTimeMillis());
+        event.addProperty("mono_ms", millis(System.nanoTime()));
+        event.addProperty("fuse_tick", fuseTick);
+        lifeFields(event, client.player);
+        event.addProperty("health", client.player.getHealth());
+        event.addProperty("hurt_time", client.player.hurtTime);
+        event.addProperty("blocking", client.player.isBlocking());
+        event.addProperty("cursor_item_inventory_count", fuseCursorItem == null ? 0 :
+            countItem(client.player.getInventory(), fuseCursorItem));
+        event.addProperty("active_cursor_count", client.player.currentScreenHandler.getCursorStack().getCount());
+        position(event, "player", client.player.getPos());
+        // Evidence only. Exact sound coordinates do not leave this private journal or influence movement.
+        event.addProperty("distance_from_fuse_origin", client.player.getPos().distanceTo(fuseOrigin));
+        return event;
+    }
+
+    private static void soundFields(JsonObject event, AgentEars.SoundCue cue) {
+        event.addProperty("cue_wall_ms", cue.wallMs());
+        event.addProperty("cue_mono_ms", millis(cue.monotonicNs()));
+        event.addProperty("cue_screen", screenKind(cue.screen()));
+        event.addProperty("cue_screen_rendered", cue.shown());
+        event.addProperty("cue_health", cue.health());
+        position(event, "cue_player", cue.player());
+        position(event, "cue_origin", cue.origin());
+    }
+
     private void publish(MinecraftClient client, String status, boolean won, String failure, boolean boundary,
                          long wallMs) {
         var player = admittedPlayer(client);
         String owner = macro == null ? "deterministic" : macro.owner();
+        String planningState = macro == null ? "" : macro.planningState();
+        String planningEvidence = macro == null ? "" : macro.planningEvidence();
+        long purposefulTick = macro == null ? 0 : macro.lastPurposefulTick();
+        boolean planningChanged = !planningState.equals(lastPlanningState)
+            || !planningEvidence.equals(lastPlanningEvidence) || purposefulTick != lastPurposefulTick;
         boolean ownerChanged = !owner.equals(lastOwner);
         if (tick % 2 == 0 || ended || boundary || ownerChanged || macro != null && macro.trial())
             recordMovement(client, player, status);
@@ -479,7 +643,7 @@ public final class AgentClient implements ClientModInitializer {
         }
         var stall = progress.stallReport();
         boolean newlyBlocked = stall.eventSequence() != stallSequence && stall.phase().equals("blocked");
-        boolean changed = screenChanged || ownerChanged || !status.equals(lastStatus) || !handStatus.equals(lastHands) ||
+        boolean changed = screenChanged || ownerChanged || planningChanged || !status.equals(lastStatus) || !handStatus.equals(lastHands) ||
             stall.eventSequence() != stallSequence;
         if (changed || boundary || tick % 20 == 0 || ended || tick == 1) {
             JsonObject event = new JsonObject();
@@ -503,7 +667,7 @@ public final class AgentClient implements ClientModInitializer {
             if (macro != null) {
                 event.addProperty("control_owner", owner);
                 event.addProperty("macro_trial", macro.trial());
-                event.addProperty("macro_fallback_ticks", macro.fallbackTicks());
+                macro.addPlanningTelemetry(event);
             }
             lifeFields(event, player);
             event.addProperty("won", won);
@@ -568,15 +732,13 @@ public final class AgentClient implements ClientModInitializer {
                 event.addProperty("ignited", progress.ignited());
             }
             event.addProperty("gui", client.currentScreen != null);
-            event.addProperty("rendered_screen", renderedScreen == null ? "world" :
-                renderedScreen instanceof InventoryScreen ? "inventory" :
-                renderedScreen instanceof CraftingScreen ? "crafting_table" : "other");
+            event.addProperty("rendered_screen", screenKind(renderedScreen));
             event.addProperty("personal_opens", personalOpens);
             event.addProperty("bench_opens", benchOpens);
             String line = event + "\n";
             try {
                 if (changed || boundary || ended || tick % 100 == 0) append("events.jsonl", line);
-                if (tick == 1 || tick % 20 == 0 || boundary || ended || newlyBlocked || ownerChanged) {
+                if (tick == 1 || tick % 20 == 0 || boundary || ended || newlyBlocked || ownerChanged || planningChanged) {
                     Path part = directory.resolve("progress.tmp");
                     Files.writeString(part, line);
                     Files.move(part, directory.resolve("progress.json"), StandardCopyOption.ATOMIC_MOVE,
@@ -586,6 +748,9 @@ public final class AgentClient implements ClientModInitializer {
             lastStatus = status;
             lastHands = handStatus;
             lastOwner = owner;
+            lastPlanningState = planningState;
+            lastPlanningEvidence = planningEvidence;
+            lastPurposefulTick = purposefulTick;
             stallSequence = stall.eventSequence();
             screenChanged = false;
         }

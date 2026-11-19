@@ -47,6 +47,7 @@ final class AgentStallGuard {
     private static final int STEP_TICKS = 85;
     private static final int STEP_SETTLE_TICKS = 40;
     private static final int BLOCKED_RECHECK_TICKS = 43; // Stagger the rendered sampler's four interleaved phases.
+    private static final int CHANGED_SUPPORT_TICKS = 3;
     private static final int ALTERNATIVE_TICKS = 210;
     private static final double STEP_CENTER = 0.14;
     private static final double STEP_CLEARANCE = 3.08; // 1.25-block jump plus 1.8-block standing height and margin.
@@ -86,6 +87,7 @@ final class AgentStallGuard {
     private final Set<BlockPos> rejectedStances = new HashSet<>();
     private final Set<BlockPos> triedCuts = new HashSet<>();
     private final Set<BlockPos> drivenStances = new HashSet<>();
+    private final Set<BlockPos> assessedSupports = new HashSet<>();
     private final int[] inventory = new int[Registries.ITEM.size()];
     private final int[] inventorySample = new int[inventory.length];
     private final Item[] sampledItems = new Item[PlayerInventory.OFF_HAND_SLOT + 1];
@@ -129,8 +131,9 @@ final class AgentStallGuard {
     private boolean settledSupport;
     private int alternativeCheckAt;
     private String blockedReason;
-    private BlockPos exhaustedAt;
-    private boolean exhaustedOnSupport;
+    private BlockPos observedQuietSupport;
+    private int observedQuietAge, quietTicks;
+    private Vec3d lastAssessedFeet;
 
     AgentStallGuard(MinecraftClient client, AgentBody body, AgentHands hands, AgentTools tools,
                     Predicate<BlockPos> protectedBlock, Predicate<BlockHitResult> safeSupport,
@@ -152,11 +155,29 @@ final class AgentStallGuard {
     boolean ownsRecovery() { return phase != Phase.WATCH && phase != Phase.RETRY; }
     boolean waitingForEvidence() { return phase == Phase.BLOCKED || phase == Phase.ASSESS; }
     boolean triedStallRoute(BlockPos cell) { return drivenStances.contains(cell); }
+
+    boolean caveSurveyStalled() {
+        return phase == Phase.PENDING && !tookControl && !explicitRefusal
+            || phase == Phase.RETRY && tick - entered >= RETRY_TICKS;
+    }
+
+    /** The miner physically returned to an old shaft and witnessed a different mineable branch. */
+    void mineBranchReady(BlockPos standing) {
+        if (!dryGround() || !standing.equals(client.player.getBlockPos())) return;
+        markUseful(client.player.getPos());
+        if (phase == Phase.WATCH) return;
+        recoveries++;
+        transition(Phase.WATCH, "returned to witnessed shaft footing with a different descending branch");
+    }
+
+    /** A previously walked cell may offer a different approach, but charge each actual support only once per incident. */
     boolean takeChangedFooting() {
-        BlockPos current = client.player.getBlockPos();
-        if (quietSupport() == null || exhaustedOnSupport && current.getSquaredDistance(exhaustedAt) < 4) return false;
-        exhaustedAt = current.toImmutable();
-        exhaustedOnSupport = true;
+        if (quietTicks < CHANGED_SUPPORT_TICKS || observedQuietSupport == null
+                || !observedQuietSupport.equals(quietSupport())) return false;
+        Vec3d feet = client.player.getPos();
+        if (lastAssessedFeet != null && feet.squaredDistanceTo(lastAssessedFeet) < 0.49
+                || !assessedSupports.add(observedQuietSupport)) return false;
+        lastAssessedFeet = feet;
         return true;
     }
 
@@ -296,6 +317,15 @@ final class AgentStallGuard {
             priorGroundAge = player.age;
         } else {
             priorGroundFeet = confirmedFoot = null;
+        }
+        if (blockedReason != null) {
+            BlockPos support = quietSupport();
+            if (support == null) quietTicks = 0;
+            else if (support.equals(observedQuietSupport) && player.age == observedQuietAge + 1)
+                quietTicks = Math.min(CHANGED_SUPPORT_TICKS, quietTicks + 1);
+            else quietTicks = 1;
+            observedQuietSupport = support;
+            observedQuietAge = player.age;
         }
         // Blocked work has no task inputs to verify. Safety still updates the actual pose above.
         if (phase == Phase.BLOCKED) return;
@@ -625,6 +655,7 @@ final class AgentStallGuard {
         rejectedStances.clear();
         triedCuts.clear();
         drivenStances.clear();
+        assessedSupports.clear();
         triedStances.add(incidentFrom);
         rejectedStances.add(incidentFrom);
         cutCount = 0;
@@ -892,7 +923,7 @@ final class AgentStallGuard {
             return;
         }
         if (delta.horizontalLengthSquared() < 0.05) return;
-        body.turn(face, to.getY() > from.getY() ? 9 : 28);
+        body.turnFixed(face, to.getY() > from.getY() ? 9 : 28);
         if (Math.abs(MathHelper.wrapDegrees(player.getYaw() - face)) > 11) return;
         if (driveSince == 0) {
             driveSince = tick;
@@ -925,7 +956,7 @@ final class AgentStallGuard {
             rejectWalk();
             return;
         }
-        body.turn(face, 40);
+        body.turnFixed(face, 40);
         body.sneak();
         if (Math.abs(MathHelper.wrapDegrees(player.getYaw() - face)) > 8 || !player.isSneaking()) return;
         if (driveSince == 0) {
@@ -978,6 +1009,7 @@ final class AgentStallGuard {
 
     private void reachedStance() {
         returningOnContact = null;
+        client.player.supportingBlockPos.ifPresent(assessedSupports::add);
         reached.accept(to);
         if (routeLength != 0 && ++routeIndex < routeLength) {
             from = to;
@@ -999,7 +1031,7 @@ final class AgentStallGuard {
         }
         if (!hands.equipForUse(TORCH)) return;
         BlockPos support = client.player.getBlockPos().down();
-        body.turn(client.player.getYaw(), 89);
+        body.turnFixed(client.player.getYaw(), 89);
         BlockHitResult selected = body.selectedFace();
         if (selected != null && selected.getBlockPos().equals(support) && selected.getSide() == Direction.UP) {
             body.sneak();
@@ -1125,7 +1157,7 @@ final class AgentStallGuard {
             // At this pose the whole tested column, not just the crosshair, must be in view.
             Vec3d overhead = Vec3d.ofBottomCenter(from).add(0, STEP_CLEARANCE, 0);
             double edge = player.getWidth() * 0.5 + STEP_CENTER + 0.01;
-            body.turn(player.getYaw(), -89);
+            body.turnFixed(player.getYaw(), -89);
             if (player.getPitch() > -86) return;
             Vec3d eye = player.getEyePos();
             BlockHitResult lowCeiling = body.terrain(overhead, eye.distanceTo(overhead)).orElse(null);
@@ -1154,8 +1186,8 @@ final class AgentStallGuard {
             avoidFloorTorch();
             return;
         }
-        if (stepAim == null) body.turn(player.getYaw(), 89);
-        else body.aim(stepAim);
+        if (stepAim == null) body.turnFixed(player.getYaw(), 89);
+        else body.aimFixed(stepAim);
         if (stepStage == StepStage.SUPPORT) {
             if (player.getPitch() < 86) return;
             BlockHitResult selected = body.selectedFace();
@@ -1318,6 +1350,13 @@ final class AgentStallGuard {
 
     private void retry(String reason) {
         anchor = client.player.getPos();
+        if (blockedReason != null) {
+            BlockPos support = quietSupport();
+            if (support != null) {
+                assessedSupports.add(support);
+                lastAssessedFeet = anchor;
+            }
+        }
         novelCells = movedCells = retryCuts = retryRouteCells = 0;
         retrySurvey = surveySequence;
         mineSince = 0;
@@ -1334,8 +1373,11 @@ final class AgentStallGuard {
         if ((phase == Phase.STEP || phase == Phase.SETTLE) && quietSupport() == null)
             reason += "; last observed pose unstable (no settled dry support)";
         body.pauseWork();
-        exhaustedAt = client.player.getBlockPos().toImmutable();
-        exhaustedOnSupport = quietSupport() != null;
+        observedQuietSupport = quietSupport();
+        observedQuietAge = client.player.age;
+        quietTicks = observedQuietSupport == null ? 0 : 1;
+        lastAssessedFeet = observedQuietSupport == null ? null : client.player.getPos();
+        if (observedQuietSupport != null) assessedSupports.add(observedQuietSupport);
         blockedReason = reason;
         alternativeCheckAt = tick;
         transition(Phase.ASSESS, reason);

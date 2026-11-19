@@ -66,6 +66,17 @@ const proposalTool = (nativeReview: boolean): Tool => ({
 });
 const proposalTools = [proposalTool(false), proposalTool(true)];
 
+interface TerraProviderMoment {
+  readonly basis: MacroBasis;
+  readonly monotonicMs: number;
+  readonly wallMs: number;
+}
+
+interface TerraProviderTerminal {
+  readonly providerTerminalMonotonicMs: number;
+  readonly providerTerminalWallMs: number;
+}
+
 export interface TerraOptions {
   readonly strategy: "terra";
   readonly authDirectory: string;
@@ -73,11 +84,19 @@ export interface TerraOptions {
   readonly signal: AbortSignal;
   readonly requestTimeoutMs: number;
   readonly assertDispatch?: (basis: MacroBasis) => boolean | void | Promise<boolean | void>;
+  readonly onProviderDispatch?: (event: TerraProviderMoment) => void;
+  readonly onProviderSettled?: (event: TerraProviderMoment & Partial<TerraProviderTerminal> & {
+    readonly outcome: MacroInference["outcome"];
+  }) => void;
 }
 
 export interface TerraStrategist {
   readonly infer: MacroStrategist;
   close(): Promise<void>;
+}
+
+function providerMoment(basis: MacroBasis): TerraProviderMoment {
+  return { basis: { ...basis }, monotonicMs: performance.now(), wallMs: Date.now() };
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -158,11 +177,11 @@ function contextFor(request: MacroRequest, basis: MacroBasis, image?: ImageConte
 }
 
 const isCount = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-const relevantEvent = /response\.(?:function_call_arguments\.done|output_item\.done|refusal\.(?:delta|done)|completed|done|incomplete|failed)/;
+const relevantEvent = /response\.(?:function_call_arguments\.done|output_item\.done|refusal\.(?:delta|done)|completed|done|incomplete|failed)|"error"/;
 const hasRefusal = (item: Record<string, unknown> | undefined) =>
   Array.isArray(item?.content) && item.content.some(part => record(part)?.type === "refusal");
 
-function providerEvidence(abort: AbortController) {
+function providerEvidence(abort: AbortController, markTerminal?: () => void) {
   let bytes = 0;
   let exceeded = false;
   let reportedUsage: { input: number; output: number } | undefined;
@@ -206,10 +225,14 @@ function providerEvidence(abort: AbortController) {
         case "response.refusal.done":
           refused = true;
           break;
+        case "error":
+          markTerminal?.();
+          break;
         case "response.completed":
         case "response.done":
         case "response.incomplete":
         case "response.failed": {
+          markTerminal?.();
           const response = record(payload.response);
           const usage = record(response?.usage);
           // The SDK normalizes usage on terminal success/incomplete events,
@@ -267,6 +290,7 @@ function proposalFor(raw: string | undefined, request: MacroRequest, basis: Macr
 
 async function infer(
   session: SelectedAccountInferenceSession, options: TerraOptions, request: MacroRequest, caller: AbortSignal,
+  markTerminal?: () => void,
 ): Promise<MacroInference> {
   const started = performance.now();
   const { run, life, tick, epoch } = request.observation;
@@ -295,7 +319,7 @@ async function infer(
   if (!context) return finish("invalid");
   const requestAbort = new AbortController();
   const signal = AbortSignal.any([scope, requestAbort.signal]);
-  const evidence = providerEvidence(requestAbort);
+  const evidence = providerEvidence(requestAbort, markTerminal);
   const timeout = setTimeout(() => requestAbort.abort(), options.requestTimeoutMs);
   try {
     const { model, streamFn } = session;
@@ -310,9 +334,19 @@ async function infer(
           throw new Error("The Terra request no longer matches the current game state.");
         }
         signal.throwIfAborted();
+        const pending = fetch(input, init);
         dispatched = true;
         frameSha256 = frame?.sha256;
-        const response = await fetch(input, init);
+        try {
+          options.onProviderDispatch?.(providerMoment(basis));
+        } catch { /* An observer cannot affect the dispatched request. */ }
+        const response = await pending.catch(error => {
+          // The request signal and the SDK's fetch watchdog can both cancel
+          // this transport. Neither is evidence of a server terminal event.
+          if (!signal.aborted && !init?.signal?.aborted) markTerminal?.();
+          throw error;
+        });
+        if (!response.ok || !response.body) markTerminal?.();
         if (response.status === 400 || response.status === 413) {
           // The SDK writes the full rejected body (including images) to its
           // default log directory for these HTTP statuses. Keep it private.
@@ -381,7 +415,21 @@ function ownStrategist(auth: AuthManager, options: TerraOptions): TerraStrategis
   return {
     infer: (request, signal) => {
       if (active) return Promise.reject(new Error("Terra already has a request in flight for this run."));
-      active = Promise.resolve().then(() => infer(session, options, request, signal)).finally(() => { active = undefined; });
+      let terminal: TerraProviderTerminal | undefined;
+      const markTerminal = options.onProviderSettled && (() => {
+        terminal ??= { providerTerminalMonotonicMs: performance.now(), providerTerminalWallMs: Date.now() };
+      });
+      active = Promise.resolve()
+        .then(() => infer(session, options, request, signal, markTerminal))
+        .then(result => {
+          if (result.dispatched && options.onProviderSettled) {
+            try {
+              options.onProviderSettled({ ...providerMoment(result.basis), outcome: result.outcome, ...terminal });
+            } catch { /* An observer cannot affect the inference result. */ }
+          }
+          return result;
+        })
+        .finally(() => { active = undefined; });
       return active;
     },
     close,

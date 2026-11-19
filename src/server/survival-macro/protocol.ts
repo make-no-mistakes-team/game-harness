@@ -7,11 +7,14 @@ export const MACRO_CAPABILITIES_VERSION = "survival-macro/v1";
 export const MACRO_MAX_INTENT_TTL_TICKS = 1_200;
 export const MACRO_MAX_PLAN_TTL_TICKS = 7_200;
 export const MACRO_MAX_HANDOFF_TTL_TICKS = 100;
+export const MACRO_MAX_PLANNING_IDLE_MS = 3_000;
 export const MACRO_MAX_STRATEGIC_EPISODES = 3;
 
 const FILE_BYTES = {
   "active.json": 512,
   "handoff.json": 2 * 1024,
+  "planning.json": 1024,
+  "native-planning-final.json": 8 * 1024,
   "observation.json": 64 * 1024,
   "intent.json": 2 * 1024,
   "receipt.json": 4 * 1024,
@@ -61,6 +64,9 @@ export interface MacroIntent {
 }
 
 export type MacroHandoff = Pick<MacroIntent, "v" | "run" | "life" | "epoch" | "basisTick" | "expiresTick">;
+
+/** Host-owned notice; grants no authority to act, pause safety, or renew native idle time. */
+export type MacroPlanning = Pick<MacroIntent, "v" | "run" | "life" | "epoch" | "basisTick" | "id">;
 
 export interface MacroReceipt {
   readonly v: 1;
@@ -335,6 +341,15 @@ export function parseMacroHandoff(value: unknown): MacroHandoff {
   };
 }
 
+export function parseMacroPlanning(value: unknown): MacroPlanning {
+  const record = shape(value, "planning", ["v", "run", "life", "epoch", "basisTick", "id"]);
+  return {
+    v: version(record.v), run: validateMacroId(record.run, "run"), life: whole(record.life, "life", 1, 2_147_483_647),
+    epoch: whole(record.epoch, "epoch", 1), basisTick: whole(record.basisTick, "basisTick", 1),
+    id: validateMacroId(record.id, "planning request id"),
+  };
+}
+
 export function parseMacroReceipt(value: unknown): MacroReceipt {
   const record = shape(value, "receipt", ["v", "id", "run", "life", "tick", "status", "detail"]);
   return Object.freeze({
@@ -484,7 +499,7 @@ export class MacroDirectory {
     }
   }
 
-  async write(name: "active.json" | "intent.json" | "handoff.json", value: unknown): Promise<void> {
+  async write(name: "active.json" | "intent.json" | "handoff.json" | "planning.json", value: unknown): Promise<void> {
     const content = JSON.stringify(value) + "\n";
     if (Buffer.byteLength(content) > FILE_BYTES[name]) throw new Error(`Macro IPC output exceeds cap: ${name}.`);
     const partial = `.tmp-${randomUUID()}` as const;
@@ -499,7 +514,7 @@ export class MacroDirectory {
     }
   }
 
-  async remove(name: "active.json" | "intent.json" | "handoff.json" | `.tmp-${string}`): Promise<void> {
+  async remove(name: "active.json" | "intent.json" | "handoff.json" | "planning.json" | `.tmp-${string}`): Promise<void> {
     try { await unlink(this.entry(name)); } catch (error) { if (!missing(error)) throw error; }
   }
 

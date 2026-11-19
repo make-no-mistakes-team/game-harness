@@ -99,7 +99,7 @@ final class PilotShoreCast {
     private final Set<BlockPos> passive = new HashSet<>();
     private final Set<BlockPos> sources = new HashSet<>();
     private final Set<BlockPos> scooped = new HashSet<>();
-    private final ArrayList<Source> reachable = new ArrayList<>();
+    private final Set<BlockPos> missedScoops = new HashSet<>();
     private final List<BlockPos> missedBanks = new ArrayList<>();
 
     private Phase phase = Phase.IDLE;
@@ -126,6 +126,10 @@ final class PilotShoreCast {
     private int index;
     private int cast;
     private int scan;
+    private int visibleMask;
+    private int faceChoice;
+    private int faceMissSince;
+    private int pickupSince;
     private int usedAt;
     private int nextUse;
     private int fullBefore;
@@ -137,6 +141,9 @@ final class PilotShoreCast {
     private int coveredAt;
     private int mineAt;
     private Placement blockUse;
+    private BlockPos movingTo;
+    private Vec3d strideOrigin;
+    private boolean strideProved;
 
     private static final class Placement {
         final BlockPos dest;
@@ -146,10 +153,7 @@ final class PilotShoreCast {
         final Block block;
         final boolean leap;
         final boolean lavaOutline;
-        int option;
-        int triedAt;
-
-        Placement(BlockPos dest, Direction face, Item item, boolean leap, boolean lavaOutline, int tick) {
+        Placement(BlockPos dest, Direction face, Item item, boolean leap, boolean lavaOutline) {
             this.dest = dest;
             this.support = dest.offset(face.getOpposite());
             this.face = face;
@@ -157,7 +161,6 @@ final class PilotShoreCast {
             this.block = ((BlockItem) item).getBlock();
             this.leap = leap;
             this.lavaOutline = lavaOutline;
-            this.triedAt = tick;
         }
     }
 
@@ -229,7 +232,8 @@ final class PilotShoreCast {
         switch (phase) {
             case SURVEY_EDGE -> surveyEdge();
             case BANK -> {
-                if (move(layout.at(1, 1, -1))) {
+                status = "walking up the dry bank to the observed pool";
+                if (move(layout.at(1, 1, -1), false)) {
                     scan = 0;
                     change(Phase.SURVEY_RESERVE, 180);
                 }
@@ -262,7 +266,7 @@ final class PilotShoreCast {
             case SIDE_FOOTING -> sideFooting();
             case CROSS -> {
                 status = "walking the verified corner onto the new obsidian strip";
-                if (move(at(CROSS[index]))) {
+                if (move(at(CROSS[index]), index == 2)) {
                     if (++index == CROSS.length) {
                         cast = 0;
                         change(Phase.EXCAVATE, 125);
@@ -311,8 +315,7 @@ final class PilotShoreCast {
             }
             case DRAIN -> {
                 status = "letting the two-cell opening drain";
-                if (tick - since >= FLOW_SETTLE && move(at(APPROACH))) {
-                    index = 0;
+                if (tick - since >= FLOW_SETTLE && move(at(APPROACH), false)) {
                     change(Phase.VERIFY, 72);
                 }
             }
@@ -347,45 +350,58 @@ final class PilotShoreCast {
 
     private void surveyEdge() {
         status = "checking visible four-wide shore, plug, and future obsidian footing";
-        if (index < 4) {
-            BlockPos floor = layout.at(index, 0, -1);
-            Vec3d point = facePoint(floor, Direction.UP);
-            expect(floor, "flat, safe dry bank");
-            if (!aim(point)) return;
-            BlockHitResult hit = terrain(point, SURVEY_REACH);
-            if (!matches(hit, floor) || hit.getSide() != Direction.UP || !solid(hit)) {
-                if (hit != null) nextLayout("expected dry top; saw " + describe(hit));
+        for (int i = 0; i < 10; ++i) {
+            int bit = 1 << i;
+            if ((visibleMask & bit) != 0) continue;
+            BlockPos pos = surveyCell(i);
+            Vec3d point = surveyPoint(i, pos);
+            BlockHitResult hit = i < 4 ? terrain(point, SURVEY_REACH) : fluid(point, SURVEY_REACH);
+            if (matches(hit, pos) && (i < 4 ? hit.getSide() == Direction.UP && solid(hit) : lavaSource(state(hit)))) {
+                if (i < 4) witness(pos, "bank floor");
+                else rememberSource(hit);
+                visibleMask |= bit;
+                deadline = tick + 44;
+            } else if (hit != null && body.aligned(point)) {
+                nextLayout("expected " + (i < 4 ? "dry top" : "lava source") + "; saw " + describe(hit));
                 return;
             }
-            witness(floor, "bank floor");
-        } else {
-            BlockPos pos = index < 8 ? layout.at(index - 4, 0, 0) : at(PASSIVE[index - 6]);
-            Vec3d point = Vec3d.ofCenter(pos, 0.73);
-            expect(pos, "visible original lava source");
-            if (!aim(point)) return;
-            BlockHitResult hit = fluid(point, SURVEY_REACH);
-            if (!matches(hit, pos) || !lavaSource(state(hit))) {
-                if (hit != null) nextLayout("expected lava source; saw " + describe(hit));
-                return;
-            }
-            rememberSource(hit);
         }
-        if (++index == 10) change(Phase.BANK, 130);
-        else deadline = tick + 44;
+        if (visibleMask == 0x3ff) {
+            change(Phase.BANK, 130);
+            return;
+        }
+        // First get a single ordinary pool-facing look. Just inspect the parts
+        // outside that view individually if the overview could not prove all ten.
+        if (tick - since < 22) {
+            body.turn(heading(Vec3d.of(layout.shore.getOpposite().getVector())), 43);
+            return;
+        }
+        int missing = Integer.numberOfTrailingZeros(~visibleMask);
+        BlockPos pos = surveyCell(missing);
+        expect(pos, missing < 4 ? "flat, safe dry bank" : "visible original lava source");
+        body.aim(surveyPoint(missing, pos));
+    }
+
+    private BlockPos surveyCell(int i) {
+        return i < 4 ? layout.at(i, 0, -1) : i < 8 ? layout.at(i - 4, 0, 0) : at(PASSIVE[i - 6]);
+    }
+
+    private static Vec3d surveyPoint(int i, BlockPos pos) {
+        return i < 4 ? facePoint(pos, Direction.UP) : Vec3d.ofCenter(pos, 0.73);
     }
 
     private void reserve() {
         status = "counting unreserved lava sources: " + reserveCount() + "/" + MINIMUM_LAVA_POURS;
         expect(layout.edge, "eight additional scoopable sources outside the trough and crossing");
-        float yaw = heading(Vec3d.of(layout.shore.getOpposite().getVector())) + YAW_SWEEP[scan];
-        body.turn(yaw, 37);
-        if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - yaw)) > 5) return;
         samplePool();
         if (reserveCount() >= MINIMUM_LAVA_POURS) {
             change(Phase.SUPPLY, 185);
             return;
         }
-        if (tick % 8 == 0) scan = (scan + 1) % YAW_SWEEP.length;
+        float yaw = heading(Vec3d.of(layout.shore.getOpposite().getVector())) + YAW_SWEEP[scan];
+        body.turn(yaw, 43);
+        if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - yaw)) <= 5 && tick % 12 == 0)
+            scan = (scan + 1) % YAW_SWEEP.length;
     }
 
     private void prepare() {
@@ -427,20 +443,26 @@ final class PilotShoreCast {
 
     private void confirmStrip() {
         status = "witnessing the two lava uprights and two standing cells cool";
-        BlockPos pos = at(PASSIVE[index]);
-        Vec3d point = Vec3d.ofCenter(pos, 0.9);
-        expect(pos, "original lava source now obsidian after owned water pour");
-        if (!aim(point)) return;
-        BlockHitResult hit = terrain(point, REACH);
-        observe(hit);
-        if (!matches(hit, pos) || !state(hit).isOf(Blocks.OBSIDIAN) || waterPours != 1
-                || !evidence.contains(new Proof(pos, "visible lava source"))) return;
-        if (index < 2) passive.add(pos);
-        witness(pos, "cooled by trough water");
-        if (++index == PASSIVE.length) {
+        for (int i = 0; i < PASSIVE.length; ++i) {
+            int bit = 1 << i;
+            if ((visibleMask & bit) != 0) continue;
+            BlockPos pos = at(PASSIVE[i]);
+            BlockHitResult hit = terrain(Vec3d.ofCenter(pos, 0.9), REACH);
+            if (!matches(hit, pos) || !state(hit).isOf(Blocks.OBSIDIAN) || waterPours != 1
+                    || !evidence.contains(new Proof(pos, "visible lava source"))) continue;
+            if (i < 2) passive.add(pos);
+            witness(pos, "cooled by trough water");
+            visibleMask |= bit;
+            deadline = tick + 64;
+        }
+        if (visibleMask == 0xf) {
             index = 0;
             change(Phase.SIDE_FOOTING, 105);
-        } else deadline = tick + 64;
+            return;
+        }
+        BlockPos pos = at(PASSIVE[Integer.numberOfTrailingZeros(~visibleMask)]);
+        expect(pos, "original lava source now obsidian after owned water pour");
+        body.aim(Vec3d.ofCenter(pos, 0.90));
     }
 
     private void sideFooting() {
@@ -448,7 +470,7 @@ final class PilotShoreCast {
         if (index < 2) {
             // The bank's lip blocks the shallow pool-floor outline at this angle.
             // First move along the bank and onto its freshly cooled outer corner.
-            if (!move(at(CROSS[index]))) return;
+            if (!move(at(CROSS[index]), index == 1)) return;
             deadline = tick + 110;
             if (++index < 2) return;
         }
@@ -520,6 +542,7 @@ final class PilotShoreCast {
 
     private void startScoop() {
         scan = 0;
+        missedScoops.clear();
         change(Phase.SCOOP, 180);
     }
 
@@ -533,33 +556,53 @@ final class PilotShoreCast {
             return;
         }
         if (pickup != null) {
-            if (tick - since < 22 || usedAt != 0 && tick - usedAt <= 14) {
+            if (tick - pickupSince < 32 || usedAt != 0 && tick - usedAt <= 14) {
                 useSource(pickup, true);
                 return;
             }
+            missedScoops.add(pickup.pos);
             pickup = null;
+            usedAt = 0;
+        }
+        // Turn straight to a previously witnessed source on a useful side. The
+        // same rendered still-source and actual bucket-ray checks still gate the use.
+        samplePool();
+        pickup = bestSource();
+        if (pickup != null) {
+            pickupSince = tick;
+            useSource(pickup, true);
+            return;
         }
         float yaw = heading(Vec3d.of(layout.shore.getOpposite().getVector())) + YAW_SWEEP[scan];
         body.turn(yaw, 48);
-        if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - yaw)) > 5) return;
-        samplePool();
-        Source best = null;
-        double nearest = REACH * REACH;
-        for (Source source : reachable) {
-            if (reserved(source.pos) || scooped.contains(source.pos)) continue;
-            double distance = source.point.squaredDistanceTo(client.player.getEyePos());
-            if (distance < nearest) {
-                nearest = distance;
-                best = source;
-            }
-        }
-        if (best != null) {
-            pickup = best;
-            usedAt = 0;
-            since = tick;
-        } else if (tick % 9 == 0) scan = (scan + 1) % YAW_SWEEP.length;
+        if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - yaw)) <= 5 && tick % 9 == 0)
+            scan = (scan + 1) % YAW_SWEEP.length;
         expect(layout.edge, "unconsumed visible still lava within bucket reach");
         observed = reserveCount() + " distinct reserve sources witnessed before/during casting";
+    }
+
+    private Source bestSource() {
+        var player = client.player;
+        Vec3d eye = player.getEyePos();
+        float towardCast = heading(cellPoint(at(CASTS[cast])).subtract(eye));
+        BlockPos best = null;
+        double bestCost = Double.POSITIVE_INFINITY;
+        for (BlockPos pos : sources) {
+            if (reserved(pos) || scooped.contains(pos) || missedScoops.contains(pos)) continue;
+            Vec3d delta = Vec3d.ofCenter(pos, 0.70).subtract(eye);
+            double distance = delta.lengthSquared();
+            if (distance > REACH * REACH) continue;
+            float yaw = heading(delta);
+            // Prefer a smaller total turn out and back; cost still prefers a near source
+            // where two routes need nearly the same turn.
+            double cost = Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw()))
+                + Math.abs(MathHelper.wrapDegrees(yaw - towardCast)) + distance * 2.5;
+            if (cost < bestCost) {
+                best = pos;
+                bestCost = cost;
+            }
+        }
+        return best == null ? null : new Source(best, Vec3d.ofCenter(best, 0.70));
     }
 
     private void castLava() {
@@ -599,8 +642,8 @@ final class PilotShoreCast {
             if (!destinationSeen) {
                 Vec3d point = cellPoint(dest);
                 expect(dest, "open or flowing-water destination before lava pour");
-                if (!aim(point)) return;
                 if (!body.clearTerrainThroughWater(point)) {
+                    body.aim(point);
                     observe(terrain(point, REACH));
                     return;
                 }
@@ -703,14 +746,17 @@ final class PilotShoreCast {
 
     private void useAgainst(BlockPos dest, Direction face, Predicate<ItemStack> contents) {
         BlockPos support = dest.offset(face.getOpposite());
-        Vec3d point = actionPoint(support, face, (tick - since) / 12 % FACE_OFFSETS.length);
+        Vec3d point = actionPoint(support, face, faceChoice);
         expect(dest, "vanilla " + face + " face of " + support + " for bucket placement");
         if (!aim(point)) return;
         BlockHitResult hit = body.selectedFace();
         observeOutline(hit);
-        if (!matches(hit, support) || hit.getSide() != face
-                || client.player.getBoundingBox().expand(0.18).intersects(new Box(dest))
-                || tick < nextUse || !equipped(contents)) return;
+        if (!heldFace(hit, support, face)) return;
+        if (client.player.getBoundingBox().expand(0.18).intersects(new Box(dest))) {
+            observed = "the actor would overlap the fluid placement; keeping the clear stance";
+            return;
+        }
+        if (tick < nextUse || !equipped(contents)) return;
         int full = count(contents);
         int empty = count(BUCKET);
         if (!body.tapCastFace(support, face, true)) return;
@@ -727,7 +773,7 @@ final class PilotShoreCast {
                 block("no solid casting block remains");
                 return false;
             }
-            blockUse = new Placement(dest, face, filler, leap, lavaOutline, tick);
+            blockUse = new Placement(dest, face, filler, leap, lavaOutline);
         }
         Placement work = blockUse;
         if (usedAt != 0 && count(item(work.item)) < fullBefore) {
@@ -744,11 +790,7 @@ final class PilotShoreCast {
             body.aim(cellPoint(dest));
             return false;
         }
-        if (tick - work.triedAt >= 13) {
-            work.option = (work.option + 1) % FACE_OFFSETS.length;
-            work.triedAt = tick;
-        }
-        Vec3d point = actionPoint(work.support, work.face, work.option);
+        Vec3d point = actionPoint(work.support, work.face, faceChoice);
         expect(dest, "visible vanilla " + work.face + " placement face " + work.support);
         body.aim(point);
         if (work.leap && client.player.isOnGround() && client.player.getEyePos().y < work.support.getY() + 1.06
@@ -756,7 +798,7 @@ final class PilotShoreCast {
         if (!body.aligned(point)) return false;
         BlockHitResult hit = body.selectedFace();
         observeOutline(hit);
-        if (!matches(hit, work.support) || hit.getSide() != work.face || tick < nextUse
+        if (!heldFace(hit, work.support, work.face) || tick < nextUse
                 || client.player.getBoundingBox().intersects(new Box(dest))) return false;
         if (!work.lavaOutline) {
             BlockHitResult solid = terrain(point, REACH);
@@ -769,6 +811,19 @@ final class PilotShoreCast {
         fullBefore = before;
         usedAt = tick;
         nextUse = tick + 21;
+        return false;
+    }
+
+    private boolean heldFace(BlockHitResult hit, BlockPos support, Direction face) {
+        if (matches(hit, support) && hit.getSide() == face) {
+            faceMissSince = 0;
+            return true;
+        }
+        if (faceMissSince == 0) faceMissSince = tick;
+        if (tick - faceMissSince >= 5) {
+            faceChoice = (faceChoice + 1) % FACE_OFFSETS.length;
+            faceMissSince = 0;
+        }
         return false;
     }
 
@@ -801,55 +856,86 @@ final class PilotShoreCast {
         // Each frame cell already has a unique, visible conversion receipt; their
         // completed uprights can hide the feet from this stance. Vanilla ignition
         // is the final whole-frame test. Verify that none of its aperture stayed wet.
-        BlockPos pos = layout.at(1 + index % 2, index / 2, 0);
-        Vec3d point = cellPoint(pos);
-        expect(pos, "dry unobstructed aperture");
-        if (!aim(point)) return;
-        BlockHitResult hit = fluid(point, REACH);
-        observe(hit);
-        if (matches(hit, pos) || !body.clearTerrain(point)) return;
-        witness(pos, "verified dry doorway");
-        if (++index == 6) {
+        for (int i = 0; i < 6; ++i) {
+            int bit = 1 << i;
+            if ((visibleMask & bit) != 0) continue;
+            BlockPos pos = layout.at(1 + i % 2, i / 2, 0);
+            Vec3d point = cellPoint(pos);
+            BlockHitResult hit = fluid(point, REACH);
+            if (matches(hit, pos) || !body.clearTerrain(point)) continue;
+            witness(pos, "verified dry doorway");
+            visibleMask |= bit;
+            deadline = tick + 68;
+        }
+        if (visibleMask == 0x3f) {
             if (poured.size() != MINIMUM_LAVA_POURS || passive.size() != 2 || !has(WATER)) {
                 block("frame does not have eight poured cells, two passive cells, and the recovered water bucket");
             } else {
                 status = "finished the compact shore frame with eight pours and two passive obsidian cells";
                 change(Phase.COMPLETE, 0);
             }
-        } else deadline = tick + 68;
+        } else {
+            int missing = Integer.numberOfTrailingZeros(~visibleMask);
+            BlockPos pos = layout.at(1 + missing % 2, missing / 2, 0);
+            expect(pos, "dry unobstructed aperture");
+            body.aim(cellPoint(pos));
+        }
     }
 
-    private boolean move(BlockPos feet) {
+    private boolean move(BlockPos feet, boolean narrow) {
         expect(feet, "dry supported stance reached with ordinary movement");
-        if (portal.center(feet)) {
-            witness(feet, "standing on proved floor");
-            return !client.player.isInLava();
-        }
+        var player = client.player;
         Vec3d goal = Vec3d.ofBottomCenter(feet);
-        Vec3d delta = goal.subtract(client.player.getPos());
-        if (Math.abs(delta.y) > 0.3 || delta.horizontalLengthSquared() > 9 || client.player.isInLava()) return false;
-        Vec3d point = facePoint(feet.down(), Direction.UP);
-        body.aim(point);
-        BlockHitResult floor = terrain(point, REACH);
-        observe(floor);
-        if (!body.aligned(point) || !matches(floor, feet.down()) || floor.getSide() != Direction.UP || !solid(floor))
-            return false;
-        body.sneak();
+        // Finish clear of the initial water placement's body margin even after
+        // the last normal walking step coasts to a stop at the bank.
+        if (phase == Phase.BANK) goal = goal.add(Vec3d.of(layout.shore.getVector()).multiply(0.20));
+        Vec3d delta = goal.subtract(player.getPos());
+        double distance = delta.horizontalLengthSquared();
+        if (Math.abs(delta.y) > 0.22 || distance > 9 || !dryGround()) return false;
+        if (distance < (narrow ? 0.18 * 0.18 : 0.23 * 0.23)) {
+            witness(feet, "standing on proved floor");
+            movingTo = null;
+            return true;
+        }
+        if (!feet.equals(movingTo)) {
+            movingTo = feet;
+            strideOrigin = player.getPos();
+            strideProved = false;
+        }
+        if (!strideProved) {
+            Vec3d point = facePoint(feet.down(), Direction.UP);
+            BlockHitResult floor = terrain(point, REACH);
+            observe(floor);
+            if (!matches(floor, feet.down()) || floor.getSide() != Direction.UP || !solid(floor)) {
+                body.aim(point);
+                return false;
+            }
+            strideProved = true;
+        }
+        // Once proved, keep looking along this leg instead of repeatedly looking
+        // straight down, recentering, and turning back. The motor still vetoes lava.
+        float landingYaw = heading(delta);
+        float yaw = heading(goal.subtract(strideOrigin));
+        // Refit a leg only if it drifts off the landing. The body's exact-landing
+        // braking window requires that the current heading actually meets it.
+        if (Math.abs(MathHelper.wrapDegrees(landingYaw - yaw)) > 8) yaw = landingYaw;
+        body.turn(yaw, 33);
+        if (Math.abs(MathHelper.wrapDegrees(player.getYaw() - landingYaw)) > 12) return false;
+        if (narrow) body.sneak();
         body.walkDownTo(goal);
         return false;
     }
 
     private void samplePool() {
-        reachable.clear();
         for (int z = 0; z <= 5; ++z) {
             for (int x = -3; x <= 6; ++x) {
                 BlockPos pos = layout.at(x, 0, z);
+                if (sources.contains(pos)) continue;
                 Vec3d point = Vec3d.ofCenter(pos, 0.74);
                 if (point.squaredDistanceTo(client.player.getEyePos()) > REACH * REACH) continue;
                 BlockHitResult hit = fluid(point, REACH);
                 if (matches(hit, pos) && lavaSource(state(hit))) {
                     rememberSource(hit);
-                    reachable.add(new Source(pos, inward(hit)));
                 }
             }
         }
@@ -891,6 +977,8 @@ final class PilotShoreCast {
         since = tick;
         deadline = tick + allowance;
         usedAt = mineAt = 0;
+        visibleMask = faceChoice = faceMissSince = 0;
+        movingTo = null;
         pickup = null;
         blockUse = null;
         destinationSeen = contactSeen = lavaDebited = false;

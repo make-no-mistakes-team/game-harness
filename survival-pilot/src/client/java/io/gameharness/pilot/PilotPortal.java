@@ -154,6 +154,7 @@ final class PilotPortal {
     private Place placement;
     private int ignitionUse;
     private boolean castTraversal;
+    private boolean castEntryProved;
 
     PilotPortal(MinecraftClient client, PilotBody body, PilotHands hands, PilotTools tools) {
         this.client = client;
@@ -880,19 +881,30 @@ final class PilotPortal {
         Vec3d goal = Vec3d.ofBottomCenter(inside);
         Vec3d delta = goal.subtract(client.player.getPos());
         if (delta.horizontalLengthSquared() < 0.24 * 0.24 && delta.y < 0.35) {
-            body.sneak();
-            body.aim(goal.add(0, 1.4, 0));
+            if (castTraversal) {
+                // Wait inside the portal at normal height, looking through the opening.
+                body.turn(site.facing().getPositiveHorizontalDegrees(), 9);
+            } else {
+                body.sneak();
+                body.aim(goal.add(0, 1.4, 0));
+            }
             return;
         }
         if (castTraversal) {
-            BlockPos base = inside.down();
-            Vec3d point = facePoint(base, Direction.UP);
-            body.aim(point);
-            BlockHitResult floor = body.terrain(point, REACH).orElse(null);
-            if (body.aligned(point) && floor != null && floor.getBlockPos().equals(base)
-                    && floor.getSide() == Direction.UP && state(floor).isOf(Blocks.OBSIDIAN)) {
-                body.walkDownTo(goal);
+            if (!castEntryProved) {
+                BlockPos base = inside.down();
+                Vec3d point = facePoint(base, Direction.UP);
+                BlockHitResult floor = body.terrain(point, REACH).orElse(null);
+                if (floor == null || !floor.getBlockPos().equals(base) || floor.getSide() != Direction.UP
+                        || !state(floor).isOf(Blocks.OBSIDIAN)) {
+                    body.aim(point);
+                    return;
+                }
+                castEntryProved = true;
             }
+            float yaw = (float) Math.toDegrees(Math.atan2(-delta.x, delta.z));
+            body.turn(yaw, 25);
+            if (Math.abs(MathHelper.wrapDegrees(client.player.getYaw() - yaw)) <= 10) body.walkDownTo(goal);
             return;
         }
         Vec3d fromStand = client.player.getPos().subtract(Vec3d.ofBottomCenter(site.stand));

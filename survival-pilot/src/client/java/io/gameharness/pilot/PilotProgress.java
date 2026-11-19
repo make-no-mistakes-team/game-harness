@@ -60,6 +60,8 @@ final class PilotProgress {
     private static final Predicate<ItemStack> STONE_PICK = item(Items.STONE_PICKAXE);
     private static final Predicate<ItemStack> IRON_PICK = item(Items.IRON_PICKAXE);
     private static final Predicate<ItemStack> DIAMOND_PICK = item(Items.DIAMOND_PICKAXE);
+    private static final Predicate<ItemStack> PORTAL_BUCKET = s -> s.isOf(Items.BUCKET) || s.isOf(Items.WATER_BUCKET);
+    private static final Predicate<ItemStack> IGNITER = item(Items.FLINT_AND_STEEL);
     private static final Predicate<ItemStack> DEEP_PICK = stack -> stack.isOf(Items.IRON_PICKAXE)
         || stack.isOf(Items.DIAMOND_PICKAXE) || stack.isOf(Items.NETHERITE_PICKAXE);
     private static final Predicate<ItemStack> SHOVEL = stack -> stack.isOf(Items.WOODEN_SHOVEL)
@@ -429,7 +431,9 @@ final class PilotProgress {
             int timberReserve = goal.equals("iron_pickaxe") ? IRON_TIMBER : DEEP_TIMBER;
             int timber = hands.count(PLANK) + 4 * hands.count(LOG);
             boolean enoughFuel = hands.count(TORCH) + 4 * hands.count(FUEL) >= 24;
-            if (longGoal && !ironPick && trail.isEmpty() && (stonePick || woodPick)
+            boolean workingUnderground = stonePick && c.player.getY() < 48
+                && (has(BURNABLE_LOG, 1) || has(PLANK, 4)) && (has(TORCH, 1) || has(FUEL, 1));
+            if (longGoal && !workingUnderground && !ironPick && trail.isEmpty() && (stonePick || woodPick)
                 && (timberWitness != null || pickupItem == LOG || timber < 4 * timberReserve
                     || !enoughFuel && !has(BURNABLE_LOG, timberReserve))) {
                 if (pickupItem == LOG || tick < timberDropUntil) seekTimber();
@@ -465,6 +469,13 @@ final class PilotProgress {
         if (!ironPick) {
             acquireIron(3);
             return;
+        }
+        if (portal != null) {
+            int reserve = (has(PORTAL_BUCKET, 1) ? 0 : 3) + (has(IGNITER, 1) ? 0 : 1);
+            if (!has(INGOT, reserve)) {
+                acquireIron(reserve);
+                return;
+            }
         }
         mineDiamonds(goal.equals("nether_portal") ? 3 : 1);
     }
@@ -502,7 +513,7 @@ final class PilotProgress {
         // A reattached actor already standing deep in its own lit shaft is not
         // departing from the surface again. Do not walk 70 steps back for a fresh
         // "departure kit" while carrying enough light to prospect locally.
-        if (miningReserve == 0 && activeTrail() > 4 && c.player.getY() <= 30 && has(TORCH, 4))
+        if (miningReserve == 0 && c.player.getY() <= 48 && hands.count(TORCH) + 4 * hands.count(FUEL) >= 4)
             miningReserve = reserve;
         boolean departure = miningReserve < reserve || resumeIndex == 1;
         int sparePlanks = reserve >= 24 ? 16 : 8;
@@ -527,7 +538,7 @@ final class PilotProgress {
             miningReserve = Math.max(miningReserve, reserve);
             return false;
         }
-        if (craftTorches(needed)) return true;
+        if (craftTorches(Math.min(reserve, Math.max(needed, 12)))) return true;
         // A small supply can cover the next ore search, but not entry into a long dark route.
         if (!departure && has(TORCH, 2)) return false;
         prepareLight(needed);
@@ -735,7 +746,7 @@ final class PilotProgress {
         }
         if (activeTrail() > 1 && furnaceWitness == null && furnace.position == null) {
             if (recoverStation(furnace)) return;
-            if (furnace.position == null) {
+            if (furnace.position == null && !canSetLocalFurnace()) {
                 miningReserve = 0;
                 beginReturn(true);
                 return;
@@ -765,9 +776,17 @@ final class PilotProgress {
         if (furnace.position != null && c.player.getEyePos().distanceTo(Vec3d.ofCenter(furnace.position)) > 3.75) {
             int bench = stationWaypoint(furnace.position);
             if (bench >= 0) {
-                if (batch == Firing.CHARCOAL) miningReserve = 0;
-                startReturn(bench, true);
-                return;
+                if (!furnaceLoaded && activeTrail() - bench > 12 && canSetLocalFurnace()) {
+                    // Cobblestone and a local table are cheaper than a round trip up a long shaft.
+                    // Keep the observed distant furnace in memory; don't confuse it with an active batch.
+                    furnace.position = furnaceWitness = null;
+                    furnace.face = null;
+                    furnace.siteSince = furnace.stageSince = furnace.stage = 0;
+                } else {
+                    if (batch == Firing.CHARCOAL) miningReserve = 0;
+                    startReturn(bench, true);
+                    return;
+                }
             }
         }
         if (furnace.position == null && !has(furnace.item, 1)) {
@@ -776,7 +795,7 @@ final class PilotProgress {
             else requestTable("furnace", null, 0, 0);
             return;
         }
-        if (!furnaceLoaded && batch == Firing.CHARCOAL && furnaceNeedsWood && !has(BURNABLE_LOG, 3)) {
+        if (!furnaceLoaded && batch == Firing.CHARCOAL && furnaceNeedsWood && !has(BURNABLE_LOG, 1)) {
             if (activeTrail() > 1) beginReturn(true);
             else seekTimber();
             return;
@@ -787,6 +806,12 @@ final class PilotProgress {
         }
         if (furnaceNeedsFuel && !has(FUEL, 1) && !supplyPlanks(3)) return;
         useStation(furnace);
+    }
+
+    private boolean canSetLocalFurnace() {
+        return has(furnace.item, 1) || has(STONE, 8) && (has(table.item, 1)
+            || table.position != null && c.player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(table.position)) < 25
+            || affordsWood(4, 0));
     }
 
     private void finishFire() {

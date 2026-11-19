@@ -9,11 +9,12 @@ import { promisify } from "node:util";
 import { SURVIVAL_PILOT_GOALS as GOALS, type SurvivalPilotGoal as Goal } from "../src/shared/survival-pilot-ui.ts";
 import { JAVA, MinecraftClient, privateJson } from "../src/server/minecraft-client.ts";
 import { nativeLaunchFailure } from "../src/server/native-launch-fault.ts";
-import { descentFixtures, descentServerProperties, descentVariants, descentWorld,
-  provisionDescent, type DescentVariant } from "./diagnostic-descent.ts";
+import { descentFixtures, descentVariants, fixtureWorld, provisionFixture, terrainFixtures,
+  terrainVariants, type DescentVariant, type TerrainVariant } from "./diagnostic-descent.ts";
 import { poolDiagnosticServerProperties, poolDiagnosticWorld, provisionPoolDiagnostic } from "./diagnostic-pool.ts";
 import { admitRun } from "./storage.ts";
 import { monitorDescent, verifyDescent } from "./verify-descent.ts";
+import { verifyTerrain } from "./verify-terrain.ts";
 import { verifySurvival } from "./verify.ts";
 
 const ROOT = path.resolve(import.meta.dir, "..");
@@ -67,42 +68,49 @@ class Stop extends Error {
   constructor(readonly status: Status, message: string) { super(message); }
 }
 
-const usage = `Usage: bun run play:pilot GOAL [SECONDS [--continue-from RUN_BASENAME]]
+const usage = `Usage: bun run play:pilot GOAL [SECONDS [(--continue-from | --replay-incident) RUN_BASENAME]]
        bun run diagnose:pool [SECONDS]
        bun run play:pilot --diagnostic-descent (${descentVariants.join(" | ")}) [SECONDS]
+       bun run play:pilot --diagnostic-terrain (${terrainVariants.join(" | ")}) [SECONDS]
 
 GOAL: ${GOALS.join(" | ")}
 SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SECONDS}).
 --continue-from: copy a closed, recorded pilot world. Retry its goal or pursue a later one.
+--replay-incident: copy the same ordinary save into the diagnostic lane without fixture setup.
 diagnose:pool: test casting a Nether portal in a separate, pre-provisioned diagnostic world.
 --diagnostic-descent: test a dry fall, a chosen boat descent, or connected cave shelves.
-Both diagnostics share one lane and cannot be continued as survival runs.
+--diagnostic-terrain: test timber reach or headroom with an ordinary wooden pickaxe goal.
+Diagnostics share one lane and cannot be continued as survival runs.
 
 Build survival-pilot-1.0.jar first. Requires Java 21, ffmpeg, existing local EULA
 consent, and a signed-in official Launcher with Minecraft 1.21.4 installed.
 Without JAVA_HOME, the runner prefers the system OpenJDK 21 installation.
 Only a confirmed goal exits 0. Artifacts and outcome JSON go in the printed run directory.`;
 
-type Diagnostic = "pool" | DescentVariant;
+type Diagnostic = "pool" | "incident-replay" | DescentVariant | TerrainVariant;
 
 function parseArgs(args: string[]) {
-  if (args[0] === "--diagnostic-descent") {
-    const diagnostic = descentVariants.find(item => item === args[1]);
+  if (args[0] === "--diagnostic-descent" || args[0] === "--diagnostic-terrain") {
+    const variants = args[0] === "--diagnostic-descent" ? descentVariants : terrainVariants;
+    const diagnostic = variants.find(item => item === args[1]);
     const rawSeconds = args[2] ?? String(DEFAULT_SECONDS);
     const seconds = Number(rawSeconds);
     if (!diagnostic || args.length > 3 || !/^\d+$/.test(rawSeconds) || !Number.isSafeInteger(seconds) ||
         seconds < 1 || seconds > MAX_SECONDS) throw new Error(usage);
-    return { goal: descentFixtures[diagnostic].goal, seconds, parentRun: undefined, diagnostic };
+    const fixtures = { ...descentFixtures, ...terrainFixtures };
+    return { goal: fixtures[diagnostic].goal, seconds, parentRun: undefined, diagnostic };
   }
   const [rawGoal, rawSeconds = String(DEFAULT_SECONDS), flag, parentRun] = args;
-  const diagnostic = rawGoal === "--diagnostic-pool" ? "pool" as const : undefined;
-  const goal = diagnostic ? "nether_portal" : GOALS.find((item) => item === rawGoal);
+  const pool = rawGoal === "--diagnostic-pool";
+  const goal = pool ? "nether_portal" : GOALS.find((item) => item === rawGoal);
   const seconds = Number(rawSeconds);
-  if (!goal || (args.length > 2 && (diagnostic || args.length !== 4 || flag !== "--continue-from" ||
+  if (!goal || (args.length > 2 && (pool || args.length !== 4 ||
+      (flag !== "--continue-from" && flag !== "--replay-incident") ||
       !parentRun || !RUN_BASENAME.test(parentRun))) || !/^\d+$/.test(rawSeconds) ||
       !Number.isSafeInteger(seconds) || seconds < 1 || seconds > MAX_SECONDS) {
     throw new Error(usage);
   }
+  const diagnostic: Diagnostic | undefined = pool ? "pool" : flag === "--replay-incident" ? "incident-replay" : undefined;
   return { goal, seconds, parentRun, diagnostic };
 }
 
@@ -606,7 +614,10 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
   const { java, ffmpeg } = await verifyInputs();
   const runs = diagnostic ? DIAGNOSTIC_RUNS : RUNS;
   const liveFile = diagnostic ? DIAGNOSTIC_LIVE : LIVE;
-  const descent = diagnostic === "pool" ? undefined : diagnostic;
+  const fixture = diagnostic === "pool" || diagnostic === "incident-replay" ? undefined : diagnostic;
+  const provisioned = fixture !== undefined || diagnostic === "pool";
+  const terrain = diagnostic === "birch" || diagnostic === "ceiling" ? diagnostic : undefined;
+  const descent = diagnostic === "water" || diagnostic === "boat" || diagnostic === "cave" ? diagnostic : undefined;
   const descentMonitor = descent ? monitorDescent(descent) : null;
   const videoBytes = 32_000_000 + seconds * 600_000;
   const reserveBytes = videoBytes + 1_000_000_000;
@@ -643,8 +654,9 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     const progressFile = path.join(dir, "progress.json");
     const video = path.join(dir, "screen.mp4");
     const live = { run: path.basename(dir), ...display };
-    const world = descent ? descentWorld(descent) : diagnostic ? poolDiagnosticWorld : {
-      type: "vanilla", mode: "survival", difficulty: "normal",
+    const world = fixture ? fixtureWorld(fixture) : diagnostic === "pool" ? poolDiagnosticWorld : {
+      type: diagnostic === "incident-replay" ? "vanilla-incident-replay" : "vanilla",
+      mode: "survival", difficulty: "normal",
       ...(parentRun ? { fresh: false, parentRun } : { fresh: true, seed: "random" }),
     };
     let declared = false;
@@ -726,7 +738,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         "enforce-secure-profile=false", "gamemode=survival", "difficulty=normal",
         "hardcore=false", "level-name=world", "view-distance=6", "simulation-distance=6", "spawn-protection=0",
         "max-players=1", "log-ips=false", "enable-rcon=false", "enable-query=false",
-        ...(descent ? descentServerProperties : diagnostic ? poolDiagnosticServerProperties : []), "",
+        ...(provisioned ? poolDiagnosticServerProperties : []), "",
       ].join("\n"));
       const serverErr = await open(path.join(dir, "server.stderr.log"), "wx", 0o600);
       try {
@@ -788,9 +800,9 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       });
       const launched = await launcher.launchPilot({
         runtimeCache: RUNTIME, port, goal, evidenceDir: dir, ...display,
-        beforeConnect: diagnostic ? async (profileName) => {
+        beforeConnect: provisioned ? async (profileName) => {
           stage = "diagnostic_provisioning";
-          if (descent) await provisionDescent(descent, runningServer.child, worldDir, profileName, startup);
+          if (fixture) await provisionFixture(fixture, runningServer.child, worldDir, profileName, startup);
           else await provisionPoolDiagnostic(runningServer.child, worldDir, profileName, startup);
           await record("diagnostic_sealed");
           stage = "client_startup";
@@ -842,7 +854,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
             if (progress.won) throw new Stop("unverified", "The ordinary goal ended before proving the descent.");
           } else if (progress.won && (goal === "nether_portal" ? progress.dimension === "minecraft:the_nether" :
               (progress.inventory[`minecraft:${goal}`] ?? 0) > 0)) {
-            throw new Stop("won", diagnostic ? "Pilot cast and lit a portal and entered the Nether."
+            throw new Stop("won", diagnostic === "pool" ? "Pilot cast and lit a portal and entered the Nether."
               : goal === "nether_portal" ? "Pilot built a portal and entered the Nether." : `Pilot obtained ${goal}.`);
           }
           if (!progress.alive) throw new Stop("died", "The pilot died before obtaining the goal.");
@@ -872,7 +884,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         result = new Stop("startup_limit", "Minecraft did not start before the startup limit.");
       } else {
         const auth = nativeLaunchFailure(error);
-        const setupFailure = descent && stage === "diagnostic_provisioning" && error instanceof Error
+        const setupFailure = fixture && stage === "diagnostic_provisioning" && error instanceof Error
           ? error.message : undefined;
         result = new Stop("failed", auth?.error ?? setupFailure ?? `Run failed during ${stage}.`);
         if (!auth && error instanceof Error)
@@ -894,10 +906,12 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         });
       }
       measuredBytes = await diskBytes(dir).catch(() => measuredBytes);
-      let verification: Awaited<ReturnType<typeof verifySurvival> | ReturnType<typeof verifyDescent>> | null = null;
+      let verification: Awaited<ReturnType<typeof verifySurvival> | ReturnType<typeof verifyDescent> |
+        ReturnType<typeof verifyTerrain>> | null = null;
       if (result.status === "won") {
         verification = descent ? await verifyDescent(dir, descent, descentSettlement) :
-          await verifySurvival(path.join(dir, "server/world/stats"), goal, lastProgress, diagnostic === "pool");
+          terrain ? await verifyTerrain(dir, terrain, lastProgress) :
+            await verifySurvival(path.join(dir, "server/world/stats"), goal, lastProgress, diagnostic === "pool");
         const videoExists = await stat(video).then((entry) => entry.size > 0, () => false);
         if (!verification.verified) result = new Stop("unverified", verification.reason);
         else if (server?.exit?.code !== 0)
@@ -930,7 +944,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
 try {
   const args = process.argv.slice(2);
   if ((args.length === 1 && args[0] === "--help") ||
-      (args.length === 2 && (args[0] === "--diagnostic-pool" || args[0] === "--diagnostic-descent") &&
+      (args.length === 2 && (args[0] === "--diagnostic-pool" || args[0] === "--diagnostic-descent" ||
+        args[0] === "--diagnostic-terrain") &&
         args[1] === "--help")) console.log(usage);
   else {
     const { goal, seconds, parentRun, diagnostic } = parseArgs(args);

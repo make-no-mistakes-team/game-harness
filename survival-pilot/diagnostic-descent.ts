@@ -5,10 +5,12 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { gzipSync } from "node:zlib";
 import type { SurvivalPilotGoal } from "../src/shared/survival-pilot-ui.ts";
-import { poolDiagnosticServerProperties } from "./diagnostic-pool.ts";
 
 export const descentVariants = ["water", "boat", "cave"] as const;
 export type DescentVariant = (typeof descentVariants)[number];
+export const terrainVariants = ["birch", "ceiling"] as const;
+export type TerrainVariant = (typeof terrainVariants)[number];
+type FixtureVariant = DescentVariant | TerrainVariant;
 type Cell = readonly [number, number, number];
 type Grant = readonly [id: string, count: number];
 type Command = readonly [input: string, acknowledgement: RegExp];
@@ -61,10 +63,29 @@ export const descentFixtures = {
   },
 } as const satisfies Record<DescentVariant, Fixture>;
 
-export function descentWorld(variant: DescentVariant) {
-  const fixture = descentFixtures[variant];
+export const terrainFixtures = {
+  birch: {
+    goal: "wooden_pickaxe",
+    start: [0.5, 64, 0.5],
+    pitch: -59,
+    kit: [],
+    terrain: { upperStem: [0, 71, 3], alternateStem: [0, 64, 9] },
+  },
+  ceiling: {
+    goal: "wooden_pickaxe",
+    start: [0.5, 64, -1.5],
+    pitch: 6,
+    kit: [],
+    terrain: { obstruction: [0, 66, 0], step: [0, 64, 1], exit: [0, 65, 3], stem: [0, 65, 8] },
+  },
+} as const satisfies Record<TerrainVariant, Fixture>;
+
+const fixtures = { ...descentFixtures, ...terrainFixtures };
+
+export function fixtureWorld(variant: FixtureVariant) {
+  const fixture = fixtures[variant];
   return {
-    type: `diagnostic_descent_${variant}`, mode: "survival", difficulty: "normal",
+    type: `diagnostic_${variant in terrainFixtures ? "terrain" : "descent"}_${variant}`, mode: "survival", difficulty: "normal",
     fresh: true, seed: "random", mobSpawning: false, continuable: false, generator: "minecraft:flat",
     dayTickSetBeforeJoin: DAY_TICK, terrain: fixture.terrain,
     spawn: { position: fixture.start, facing: "south", yaw: 0, pitch: fixture.pitch },
@@ -74,9 +95,6 @@ export function descentWorld(variant: DescentVariant) {
     },
   };
 }
-
-// The same flat generator as the pool, but no pool terrain or grants.
-export const descentServerProperties = poolDiagnosticServerProperties;
 
 const set = (cell: Cell, block: string): Command =>
   [`setblock ${cell.join(" ")} minecraft:${block}`, /^Changed the block at /];
@@ -175,9 +193,45 @@ function chamber(variant: "boat" | "cave"): Command[] {
   ];
 }
 
+function birch([x, y, z]: Cell, height: number): Command[] {
+  const crown = y + height - 1;
+  return [
+    fill([x, y, z], [x, crown, z], "birch_log"),
+    fill([x - 1, crown, z + 1], [x + 1, crown, z + 1], "birch_leaves"),
+    fill([x - 1, crown + 1, z - 1], [x + 1, crown + 1, z + 1], "birch_leaves"),
+    inspect([x, y, z], "birch_log"),
+  ];
+}
+
+function terrain(variant: TerrainVariant): Command[] {
+  if (variant === "birch") {
+    const { upperStem: high, alternateStem: alternate } = terrainFixtures.birch.terrain;
+    return [
+      // The exposed upper section of a birch after the lower trunk has been cut.
+      ...birch(high, 3),
+      ...birch(alternate, 5),
+      inspect([high[0], high[1] - 1, high[2]], "air"),
+      inspect([high[0], 63, high[2]], "grass_block"),
+    ];
+  }
+  const { obstruction, step, stem } = terrainFixtures.ceiling.terrain;
+  return [
+    // A stone notch with a single dirt overhang on the lower side of its one-block rise.
+    fill([-1, 64, -6], [-1, 67, 4], "stone"),
+    fill([1, 64, -6], [1, 67, 4], "stone"),
+    fill(step, [0, 64, 10], "stone"),
+    set(obstruction, "dirt"),
+    ...birch(stem, 5),
+    inspect(obstruction, "dirt"),
+    inspect([0, 65, 0], "air"),
+    inspect(step, "stone"),
+    inspect([0, 67, 1], "air"),
+  ];
+}
+
 function preJoinConsole(server: ChildProcess, signal: AbortSignal) {
   const { stdin, stdout } = server;
-  if (!stdin || !stdout) throw new Error("Descent setup requires the owned vanilla console.");
+  if (!stdin || !stdout) throw new Error("Diagnostic setup requires the owned vanilla console.");
   return async (steps: Command[], allowMismatch = false) => {
     const ack = Promise.withResolvers<string[]>();
     signal.throwIfAborted();
@@ -205,7 +259,7 @@ function preJoinConsole(server: ChildProcess, signal: AbortSignal) {
       stdin.write(`${steps.map(([command]) => command).join("\n")}\ntime query gametime\n`,
         error => { if (error) ack.reject(error); });
       const failed = await ack.promise;
-      if (failed.length && !allowMismatch) throw new Error(`Vanilla did not confirm descent setup: ${failed[0]}.`);
+      if (failed.length && !allowMismatch) throw new Error(`Vanilla did not confirm diagnostic setup: ${failed[0]}.`);
       return failed;
     } finally {
       stdout.off("data", onOutput);
@@ -261,17 +315,18 @@ function offlineUuid(profile: string) {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-export async function provisionDescent(variant: DescentVariant, server: ChildProcess, serverDir: string,
+export async function provisionFixture(variant: FixtureVariant, server: ChildProcess, serverDir: string,
     profile: string, signal: AbortSignal) {
   const console = preJoinConsole(server, signal);
   await console([
     ["setworldspawn 0 64 0 0", /^Set the world spawn point to 0, 64, 0 \[0(?:\.0+)?\]$/],
     ["gamerule doMobSpawning false", /^Gamerule doMobSpawning is now set to: false$/],
   ]);
-  const steps = variant === "water" ? await waterTerrain(console, signal) : chamber(variant);
+  const steps = variant === "water" ? await waterTerrain(console, signal) :
+    variant === "boat" || variant === "cave" ? chamber(variant) : terrain(variant);
   await console([...steps, [`time set ${DAY_TICK}`, new RegExp(`^Set the time to ${DAY_TICK}$`)]]);
   const players = path.join(serverDir, "world", "playerdata");
   await mkdir(players, { recursive: true, mode: 0o700 });
-  await writeFile(path.join(players, `${offlineUuid(profile)}.dat`), playerData(descentFixtures[variant]),
+  await writeFile(path.join(players, `${offlineUuid(profile)}.dat`), playerData(fixtures[variant]),
     { flag: "wx", mode: 0o600, signal });
 }

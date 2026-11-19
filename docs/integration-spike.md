@@ -73,7 +73,14 @@ all ten positions, arrival in the Nether and corroborating vanilla statistics.
 The default live view stays on ordinary runs. For the diagnostic,
 run `bun survival-pilot/watch.ts --diagnostic` and open
 `http://127.0.0.1:4382/`, or play `screen.mp4` from the printed attempt
-directory. Diagnostic worlds cannot be used with `--continue-from`.
+directory. Diagnostic worlds cannot be used as continuation parents.
+
+To replay an incident from a closed ordinary attempt on that same diagnostic
+stream, use `bun run play:pilot nether_portal 180 --replay-incident "$RUN_BASENAME"`.
+This uses the same save-copy rules and player as `--continue-from`, without
+fixture setup. The declaration and outcome record `world.type: "vanilla-incident-replay"`,
+`world.fresh: false`, and `world.parentRun`. The replay is not a fresh-world
+result. Stopping after observing an incident does not count as reaching the goal.
 
 The same diagnostic stream can show individual descent trials. Use
 `bun run play:pilot --diagnostic-descent water 180` to test a bucket landing

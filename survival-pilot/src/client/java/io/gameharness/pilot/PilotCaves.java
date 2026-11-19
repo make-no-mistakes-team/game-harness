@@ -431,7 +431,7 @@ final class PilotCaves {
         };
         Vec3d target = Vec3d.ofCenter(stance.offset(wall), age >= 42 ? -0.18 : 0.52);
         body.aim(target);
-        if (!body.aligned(target) || !hold(TORCH)) return true;
+        if (!body.aligned(target) || !hands.equipForUse(TORCH)) return true;
         BlockHitResult shown = body.selectedFace();
         if (shown == null || shown.getSide() == Direction.DOWN
             || shown.getPos().squaredDistanceTo(player.getEyePos()) > 2.9 * 2.9
@@ -513,7 +513,7 @@ final class PilotCaves {
         BlockHitResult hit = observe(fill.getPos());
         if ((lastAction == 0 || tick - lastAction >= 7) && body.aligned(fill.getPos())
             && hit != null && hit.getBlockPos().equals(fill.getBlockPos())
-            && state(hit).getFluidState().isIn(FluidTags.WATER) && hold(BUCKET)) {
+            && state(hit).getFluidState().isIn(FluidTags.WATER) && hands.equipForUse(BUCKET)) {
             body.useWaterSource(hit.getBlockPos());
             lastAction = tick;
         }
@@ -554,7 +554,7 @@ final class PilotCaves {
         Vec3d point = offset(Vec3d.ofCenter(source, 0.62), plannedWater.approach, -0.25);
         body.aim(point);
         if ((lastAction == 0 || tick - lastAction >= 8) && body.aligned(point)
-            && waterHit(source, point, true) && hold(BUCKET)) {
+            && waterHit(source, point, true) && hands.equipForUse(BUCKET)) {
             body.useWaterSource(source);
             lastAction = tick;
         }
@@ -698,7 +698,7 @@ final class PilotCaves {
         if (face == null) return false;
         Vec3d point = face.getPos().lerp(Vec3d.ofCenter(face.getBlockPos()), 0.04);
         body.aim(point);
-        if (!body.aligned(point) || !hold(item)) return false;
+        if (!body.aligned(point) || !hands.equipForUse(item)) return false;
         BlockHitResult observed = observe(point), selected = body.selectedFace();
         if (!matches(face, observed) || !matches(face, selected) || !solid(state(observed))) return false;
         body.sneak();
@@ -708,12 +708,6 @@ final class PilotCaves {
 
     private static boolean matches(BlockHitResult a, BlockHitResult b) {
         return b != null && a.getBlockPos().equals(b.getBlockPos()) && a.getSide() == b.getSide();
-    }
-
-    private boolean hold(Predicate<ItemStack> item) {
-        if (item.test(player.getMainHandStack())) return true;
-        hands.equip(item);
-        return false;
     }
 
     private void start(Phase phase, int tick) {

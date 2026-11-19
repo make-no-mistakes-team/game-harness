@@ -329,11 +329,24 @@ final class PilotHands {
         return true;
     }
 
+    /** Returns true if the item is already held or an equip job was queued. */
     boolean equip(Predicate<ItemStack> item) {
         if (c.player == null) return false;
         var inv = c.player.getInventory();
         if (item.test(inv.getMainHandStack())) return true;
-        if (busy()) return false;
+        return !busy() && queueEquip(inv, item);
+    }
+
+    /** Requests selection if needed; returns true only when Hands is idle and the main hand matches. */
+    boolean equipForUse(Predicate<ItemStack> item) {
+        if (c.player == null || busy()) return false;
+        var inv = c.player.getInventory();
+        if (item.test(inv.getMainHandStack())) return true;
+        queueEquip(inv, item);
+        return false;
+    }
+
+    private boolean queueEquip(PlayerInventory inv, Predicate<ItemStack> item) {
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
             if (!item.test(inv.getStack(slot))) continue;
             int destination = equipDestination(inv, slot);

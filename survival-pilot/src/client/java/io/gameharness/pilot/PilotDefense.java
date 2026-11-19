@@ -257,7 +257,8 @@ final class PilotDefense {
     }
 
     private void guard(LivingEntity threat, boolean shield) {
-        if (shield) body.blockAgainst(threat);
+        // Vanilla selects the queued weapon before using; don't raise a shield based on the old hand.
+        if (shield && (client.player.isUsingItem() || !combatSelecting())) body.blockAgainst(threat);
         status = client.player.isBlocking() && SHIELD.test(client.player.getActiveItem())
             ? "shield raised; tracking a visible hostile"
             : shield ? "facing a visible hostile with a shield" : "facing a visible hostile";

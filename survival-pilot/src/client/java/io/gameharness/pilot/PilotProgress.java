@@ -930,7 +930,7 @@ final class PilotProgress {
             return false;
         }
         status = "filling the field bucket from visible water";
-        if (!hold(EMPTY_BUCKET)) return true;
+        if (!hands.equipForUse(EMPTY_BUCKET)) return true;
         BlockPos source = fieldWater.getBlockPos();
         body.aim(fieldWaterPoint);
         if (!body.aligned(fieldWaterPoint)) return true;
@@ -1549,7 +1549,7 @@ final class PilotProgress {
         if (station.stage == 0 && station.face == null) station.face = body.stationFace(station.rejected);
         if (station.face != null) {
             var face = station.face;
-            if (!hold(station.item)) return;
+            if (!hands.equipForUse(station.item)) return;
             body.sneak();
             Vec3d point = face.getPos().lerp(Vec3d.ofCenter(face.getBlockPos()), 0.015);
             body.aim(point);
@@ -1586,7 +1586,7 @@ final class PilotProgress {
                     if (!body.aligned(reflected)) return;
                     var face = body.selectedFace();
                     if (face != null && face.getSide() != Direction.DOWN) {
-                        if (!hold(TORCH)) return;
+                        if (!hands.equipForUse(TORCH)) return;
                         station.lampBefore = hands.count(TORCH);
                         station.lampUsed = tick;
                         body.use(face.getBlockPos(), face.getSide());
@@ -1607,7 +1607,7 @@ final class PilotProgress {
         }
         if (station.stage == 3) {
             status = "placing " + station.recipe + " in the recess";
-            if (!hold(station.item)) return;
+            if (!hands.equipForUse(station.item)) return;
             boolean floor = tick - station.stageSince >= 14;
             Vec3d center = Vec3d.ofCenter(station.niche);
             Vec3d aim = floor ? center.add(0, -0.52, 0) : center;
@@ -1630,7 +1630,7 @@ final class PilotProgress {
         }
         // A shaft may have no side face outside our body. Vanilla permits jump-placing on the
         // floor we stand on; the real player must rise completely above the destination first.
-        if (!hold(station.item)) return;
+        if (!hands.equipForUse(station.item)) return;
         if (station.underfoot == null) {
             if (!c.player.isOnGround()) return;
             station.underfoot = c.player.getBlockPos().down();
@@ -2974,7 +2974,7 @@ final class PilotProgress {
             litIndex = trail.size() - 6;
             return false;
         }
-        if (!hold(TORCH)) return true;
+        if (!hands.equipForUse(TORCH)) return true;
         Direction forward = digDirection == null ? c.player.getHorizontalFacing() : digDirection;
         Direction wall = torchFace == 1 ? forward.rotateYClockwise()
             : torchFace == 2 ? forward.rotateYCounterclockwise() : forward.getOpposite();
@@ -3411,7 +3411,7 @@ final class PilotProgress {
             if (result == Dig.CLEAR) pillarStage++;
             return result == Dig.LOOKING || result == Dig.CLEAR;
         }
-        if (!hold(BUILDING)) return true;
+        if (!hands.equipForUse(BUILDING)) return true;
         BlockPos support = exitFrom.down();
         body.turn(c.player.getYaw(), 90);
         BlockHitResult hit = body.selectedFace();
@@ -4201,12 +4201,6 @@ final class PilotProgress {
 
     private boolean arrived(BlockPos position) {
         return position.equals(c.player.getBlockPos()) && c.player.isOnGround();
-    }
-
-    private boolean hold(Predicate<ItemStack> predicate) {
-        if (predicate.test(c.player.getMainHandStack())) return true;
-        hands.equip(predicate);
-        return false;
     }
 
     private boolean has(Predicate<ItemStack> predicate, int count) {

@@ -341,7 +341,7 @@ final class PilotFall {
             case PLACE -> {
                 status = "boat: equipping it while standing on the witnessed takeoff";
                 body.aim(launch);
-                if (hands.equip(BOAT) && body.tapFallBlock(BlockPos.ofFloored(launch.add(0, -0.03, 0)),
+                if (hands.equipForUse(BOAT) && body.tapFallBlock(BlockPos.ofFloored(launch.add(0, -0.03, 0)),
                         player.getMainHandStack().getItem(), launch, 0.17)) {
                     boatSlot = player.getInventory().selectedSlot;
                     nextBoat(Boat.BOARD);

@@ -646,7 +646,7 @@ final class PilotStallGuard {
             scanFromHere();
             return;
         }
-        if (!hands.equip(TORCH)) return;
+        if (!hands.equipForUse(TORCH)) return;
         BlockPos support = client.player.getBlockPos().down();
         body.turn(client.player.getYaw(), 89);
         BlockHitResult selected = body.selectedFace();
@@ -803,7 +803,7 @@ final class PilotStallGuard {
                 failStep("lost the centered dry starting pose");
                 return;
             }
-            if (!hands.equip(STEP) || !(player.getMainHandStack().getItem() instanceof BlockItem item)) return;
+            if (!hands.equipForUse(STEP) || !(player.getMainHandStack().getItem() instanceof BlockItem item)) return;
             if (player.getPitch() < 86) return;
             BlockHitResult seen = stepTop(support);
             if (seen == null) return;

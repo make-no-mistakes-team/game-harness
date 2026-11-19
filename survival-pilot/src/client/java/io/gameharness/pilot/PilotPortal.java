@@ -470,7 +470,7 @@ final class PilotPortal {
         if (client.player.getEyePos().distanceTo(water.point) > 4) return;
         status = "filling the bucket from observed source water";
         body.aim(water.point);
-        if (tick < nextFluidUse || !body.aligned(water.point) || !hands.equip(BUCKET)) return;
+        if (tick < nextFluidUse || !body.aligned(water.point) || !hands.equipForUse(BUCKET)) return;
         BlockHitResult hit = observed(water.point);
         if (hit == null || !hit.getBlockPos().equals(water.pos) || !waterSource(state(hit))) {
             ignore(water.pos);
@@ -528,7 +528,7 @@ final class PilotPortal {
         BlockPos support = waterSupport.getBlockPos();
         Direction face = waterSupport.getSide();
         body.aim(waterSupport.getPos());
-        if (tick >= nextFluidUse && body.aligned(waterSupport.getPos()) && hands.equip(WATER_BUCKET)
+        if (tick >= nextFluidUse && body.aligned(waterSupport.getPos()) && hands.equipForUse(WATER_BUCKET)
                 && selected(support, face) && supportFace(support, face, waterSupport.getPos()) != null) {
             body.sneak();
             body.use(support, face);
@@ -585,7 +585,7 @@ final class PilotPortal {
         body.aim(pouredWater.point);
         BlockHitResult hit = observed(pouredWater.point);
         if (tick >= nextFluidUse && hit != null && hit.getBlockPos().equals(pouredWater.pos)
-                && waterSource(state(hit)) && body.aligned(pouredWater.point) && hands.equip(BUCKET)) {
+                && waterSource(state(hit)) && body.aligned(pouredWater.point) && hands.equipForUse(BUCKET)) {
             body.useWaterSource(pouredWater.pos);
             nextFluidUse = tick + 6;
         }
@@ -757,7 +757,7 @@ final class PilotPortal {
         Vec3d point = jump ? new Vec3d(client.player.getX(), work.support.getY() + 0.98, client.player.getZ())
             : work.point;
         body.aim(point);
-        if (!hands.equip(work.item) || !body.aligned(point)
+        if (!hands.equipForUse(work.item) || !body.aligned(point)
                 || supportFace(work.support, work.face, point) == null || !selected(work.support, work.face)) {
             return Placement.WAIT;
         }

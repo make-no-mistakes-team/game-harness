@@ -12,7 +12,6 @@ const GROUND_TICKS = 8;
 const WATER_USE = "used the water bucket in reach; checking contact and landing";
 const WATER_LANDING = "water clutch: witnessed water contact and a damage-free landing";
 const CAVE_MOUTH = "cave opening: lit clearance beyond the mine and a visible rock boundary";
-const CAVE_STEP = "reached cave footing and recorded the way back";
 const BOAT_OFFER = "checking whether the lower ledge is broad enough for a boat";
 const BOAT_MOUNT = "rowing from the witnessed ledge with a confirmed mount";
 const BOAT_DROP = "descending while actually mounted in the boat";
@@ -89,6 +88,7 @@ type Sequence = { start: number; action: number; contact: number; landing: numbe
 async function readSequence(directory: string, variant: DescentVariant, throughTick: number): Promise<Sequence> {
   const proof = { start: 0, action: 0, contact: 0, landing: 0 };
   let mount = 0;
+  let previousCaveSteps = 0;
   const stream = createReadStream(path.join(directory, "events.jsonl"));
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
   try {
@@ -118,14 +118,17 @@ async function readSequence(directory: string, variant: DescentVariant, throughT
           // The production counter is emitted only for a still-mounted, settled, dry lower landing.
           if (proof.contact && !proof.landing && p.status === BOAT_LANDING && eligible(variant, p)) proof.landing = p.tick;
           break;
-        case "cave":
+        case "cave": {
+          const arrived = p.cave_steps > previousCaveSteps;
+          previousCaveSteps = p.cave_steps;
           if (!proof.start && p.status === CAVE_MOUTH && Math.abs(p.y - caveStartY) < 0.08 &&
               p.z >= -2 && p.z < 1 && p.cave_openings >= 1) proof.start = p.tick;
-          if (!proof.start || p.status !== CAVE_STEP || Math.abs(p.x - 0.5) >= 1.45) break;
+          if (!proof.start || !arrived || Math.abs(p.x - 0.5) >= 1.45) break;
           if (!proof.action && p.cave_steps >= 1 && onCaveShelf(p, caveShelves[0])) proof.action = p.tick;
           if (proof.action && !proof.landing && p.cave_steps >= 2 && onCaveShelf(p, caveShelves[1]))
             proof.contact = proof.landing = p.tick;
           break;
+        }
       }
     }
   } finally {

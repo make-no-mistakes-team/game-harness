@@ -483,6 +483,7 @@ async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
 type Cell = [number, number, number];
 type AgentMemory = {
   version: 1; dimension: typeof OVERWORLD; trail: Cell[]; dormant?: Cell[]; workbench?: Cell; furnace?: Cell;
+  ownedWorkbench?: Cell;
 };
 
 function isCell(value: unknown): value is Cell {
@@ -514,8 +515,10 @@ function decodeAgentMemory(text: string): AgentMemory | null {
     const value = JSON.parse(text);
     if (value?.version !== 1 || value?.dimension !== OVERWORLD || !validTrail(value.trail, MEMORY_CELLS) ||
         ("dormant" in value && !validTrail(value.dormant, MEMORY_CELLS - value.trail.length)) ||
-        Object.keys(value).some((key) => !["version", "dimension", "trail", "dormant", "workbench", "furnace"].includes(key)) ||
-        ("workbench" in value && !isCell(value.workbench)) || ("furnace" in value && !isCell(value.furnace))) return null;
+        Object.keys(value).some((key) =>
+          !["version", "dimension", "trail", "dormant", "workbench", "furnace", "ownedWorkbench"].includes(key)) ||
+        ("workbench" in value && !isCell(value.workbench)) || ("furnace" in value && !isCell(value.furnace)) ||
+        ("ownedWorkbench" in value && !isCell(value.ownedWorkbench))) return null;
     return value;
   } catch {
     return null;

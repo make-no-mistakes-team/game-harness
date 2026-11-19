@@ -16,13 +16,15 @@ final class AgentReturnableMine {
     private static final int TOOL_RESERVE = 4;
     private static final int LEG_TICKS = 520;
     private static final int PROGRESS_LEASE_TICKS = 48;
+    private static final int CAVE_TURN_LIMIT = 220;
     private static final int RETIRED_LIMIT = 32;
     // The tallest samples cover the lower tread's jump takeoff, not just standing room.
     private static final double[] CLEARANCE_HEIGHTS = {0.20, 0.97, 1.79, 2.86};
 
     enum Outcome { WORKING, REACHED, FAILED, DIVERTED, EXHAUSTED, SUPPLIES }
     private enum Phase { ANCHOR, CHOOSE, CUT, LIGHT, FORWARD, DRIVE, REVERSE, TRIM_RETURN }
-    private record Refusal(BlockPos foot, Direction bearing) {}
+    private record Refusal(BlockPos foot, Direction bearing, boolean level, Face fact) {}
+    enum Face { UNSEEN, OPEN, DARK, OCCLUDED, FLUID, LAVA, FOOTPRINT, PROTECTED, MATERIAL, TOOL, FAILED, MINEABLE }
 
     private final MinecraftClient client;
     private final AgentBody body;
@@ -32,12 +34,15 @@ final class AgentReturnableMine {
     private int retiredCursor, lastTurn, started, phaseSince, optionSince, depth, limit, drops;
     private int choice, cut, proof;
     private int progressAt, treadEvidence;
+    private int caveSince, caveMask, caveContacts;
+    private boolean caveSurveySpent;
     private long revealedFrame = -1;
     private BlockPos anchor, from, to, unjoined, levelFoot, workCell, reverseCeiling;
     private Vec3d aim;
-    private Direction preferred, bearing;
+    private Direction preferred, bearing, caveBearing;
     private Phase phase, afterLight;
-    private boolean litHere, trimmed, levelOnly, levelSpent;
+    private boolean litHere, trimmed, levelOnly, levelSpent, cavePending, levelFallback;
+    private final Face[] faceFacts = new Face[4];
     private Outcome outcome = Outcome.DIVERTED;
     private String status = "";
 
@@ -54,6 +59,8 @@ final class AgentReturnableMine {
         return active() && (phase == Phase.DRIVE || checkingReturn());
     }
 
+    boolean surveyingCave() { return active() && cavePending; }
+
     boolean unjoined(BlockPos foot) {
         return client.world == world && client.player == player && (foot.equals(unjoined) || foot.equals(levelFoot));
     }
@@ -65,7 +72,10 @@ final class AgentReturnableMine {
     boolean hasProgressLease() {
         int now = body.actionTick();
         return active() && now - lastTurn <= 1 && now - started < LEG_TICKS
-            && progressAt >= started && now - progressAt <= PROGRESS_LEASE_TICKS;
+            && (progressAt >= started && now - progressAt <= PROGRESS_LEASE_TICKS
+                || cavePending && now - caveSince <= CAVE_TURN_LIMIT
+                || caveSurveySpent && (phase == Phase.ANCHOR || phase == Phase.CHOOSE)
+                    && now - phaseSince < CAVE_TURN_LIMIT);
     }
 
     void observeBreak(BlockPos position) {
@@ -75,6 +85,14 @@ final class AgentReturnableMine {
                 advanceEvidence(cut, body.actionTick());
                 revealedFrame = body.renderedFrame();
             } else if (phase == Phase.TRIM_RETURN) advanceEvidence(22, body.actionTick());
+        }
+        for (int i = 0; i < retired.length; i++) {
+            Refusal old = retired[i];
+            if (old == null) continue;
+            BlockPos lane = old.foot.offset(old.bearing);
+            if (lane.getX() == position.getX() && lane.getZ() == position.getZ()
+                    && position.getY() >= lane.getY() - 2 && position.getY() <= lane.getY() + 2)
+                retired[i] = null;
         }
     }
 
@@ -102,20 +120,48 @@ final class AgentReturnableMine {
                 Math.min(host.returnableTorches() - TORCH_RESERVE, (host.returnableToolUses() - TOOL_RESERVE) / 3)));
             if (limit <= 0) return finish(levelOnly ? Outcome.EXHAUSTED : Outcome.SUPPLIES,
                 "keeping a light and tool reserve for the mine return");
-            if (!hasBearing(standing))
-                return finish(Outcome.EXHAUSTED, "no further witnessed direction for a returnable mine leg here");
             anchor = from = standing.toImmutable();
             this.depth = depth;
             preferred = levelOnly ? preference.rotateYClockwise() : preference;
             bearing = null;
             choice = drops = 0;
+            levelFallback = levelOnly;
+            caveMask = 0;
+            caveSurveySpent = false;
+            Arrays.fill(faceFacts, null);
             started = now;
             progressAt = now - PROGRESS_LEASE_TICKS - 1;
             begin(Phase.ANCHOR, now);
+            if (player.hurtTime == 0 && !player.isOnFire() && !player.hasVehicle()
+                    && host.startMineCaveSurvey(from, preferred)) {
+                if (host.mineCaveHandedOff()) return finish(Outcome.DIVERTED, host.status());
+                holdCave(host, preferred, now);
+                return outcome;
+            }
         }
         if (player.isTouchingWater() || player.isInLava() || player.isOnFire()
                 || player.hasVehicle() || player.hurtTime > 0) {
             return fail("unsafe conditions interrupted the returnable mine leg");
+        }
+        if (cavePending) {
+            if (now - caveSince >= CAVE_TURN_LIMIT || now - started >= LEG_TICKS) {
+                if (!host.endMineCaveSurvey()) return finish(Outcome.DIVERTED, "yielding to cave traversal already in motion");
+                if (now - started >= LEG_TICKS) return fail("returnable mine leg reached its time limit");
+            } else {
+                boolean continuing = host.continueMineCaveSurvey(caveBearing);
+                if (host.mineCaveHandedOff()) return finish(Outcome.DIVERTED, host.status());
+                if (host.caveFootsteps() != caveContacts)
+                    return finish(Outcome.DIVERTED, "cave travel reached a new footing");
+                if (continuing) return outcome;
+            }
+            cavePending = false;
+            caveSurveySpent = true;
+            int paused = now - caveSince;
+            phaseSince += paused;
+            optionSince += paused;
+            if (!dryGroundAt(from)) return finish(Outcome.DIVERTED, "cave travel changed the mine footing");
+            status = "resuming mine checks from the retained dry footing";
+            return outcome;
         }
         if (now - started >= LEG_TICKS) return fail("returnable mine leg reached its time limit");
         if (phase != Phase.DRIVE && !dryGroundAt(checkingReturn() ? to : from))
@@ -158,9 +204,14 @@ final class AgentReturnableMine {
     private void choose(AgentProgress host, int now) {
         for (; choice < 4; choice++) {
             Direction candidate = option(choice);
-            if (retired(from, candidate)) continue;
-            if (now - optionSince >= 42 || body.hazardAhead(candidate.getPositiveHorizontalDegrees(), 1.65)) {
-                rejectChoice(candidate, now);
+            Face prior = refusal(from, candidate);
+            if (prior != null) { faceFacts[choice] = prior; continue; }
+            if (body.hazardAhead(candidate.getPositiveHorizontalDegrees(), 1.65)) {
+                rejectChoice(candidate, now, Face.LAVA);
+                return;
+            }
+            if (now - optionSince >= 42) {
+                rejectChoice(candidate, now, faceFacts[choice] == null ? Face.UNSEEN : faceFacts[choice]);
                 return;
             }
             if (aim == null) aimCut(nextTread(candidate), candidate);
@@ -169,22 +220,39 @@ final class AgentReturnableMine {
             if (hit != null && hit.getBlockPos().equals(workCell)) {
                 if (host.handoffReturnableResource(hit)) {
                     finish(Outcome.DIVERTED, "taking exposed ore before cutting a mine leg");
-                } else if (host.returnableCutAllowed(hit)) {
-                    bearing = candidate;
-                    prepareCut(now);
-                } else if (body.dryRouteClear(aim) != AgentBody.DryRouteSample.CLEAR) {
-                    rejectChoice(candidate, now);
                 } else {
-                    lowerChoice(host, candidate, now);
+                    Face face = host.returnableFace(hit);
+                    if (face == Face.MINEABLE) {
+                        bearing = candidate;
+                        prepareCut(now);
+                    } else if (body.dryRouteClear(aim) != AgentBody.DryRouteSample.CLEAR) {
+                        rejectChoice(candidate, now, face);
+                    } else {
+                        lowerChoice(host, candidate, now);
+                    }
                 }
                 return;
             }
             var sample = body.dryRouteClear(aim);
-            if (sample == AgentBody.DryRouteSample.FLUID) rejectChoice(candidate, now);
+            if (sample == AgentBody.DryRouteSample.FLUID) rejectChoice(candidate, now, Face.FLUID);
             else if (sample == AgentBody.DryRouteSample.CLEAR) lowerChoice(host, candidate, now);
+            else if (sample == AgentBody.DryRouteSample.DARK) faceFacts[choice] = Face.DARK;
+            else if (hit != null && faceFacts[choice] != Face.DARK) faceFacts[choice] = Face.OCCLUDED;
             return;
         }
-        finish(Outcome.EXHAUSTED, "no witnessed mineable face for a returnable descent");
+        String refusal = refusalSummary();
+        if (!levelFallback && host.returnableToolUses() > TOOL_RESERVE && host.returnableTorches() > TORCH_RESERVE) {
+            levelOnly = levelFallback = true;
+            limit = 1;
+            choice = 0;
+            cut = 1;
+            aim = null;
+            optionSince = now;
+            Arrays.fill(faceFacts, null);
+            status = refusal + "; checking witnessed level alternatives";
+            return;
+        }
+        finish(Outcome.EXHAUSTED, refusal);
     }
 
     private Direction option(int index) {
@@ -196,8 +264,11 @@ final class AgentReturnableMine {
         };
     }
 
-    private void rejectChoice(Direction candidate, int now) {
-        retire(from, candidate);
+    private void rejectChoice(Direction candidate, int now, Face fact) {
+        retire(from, candidate, fact);
+        faceFacts[choice] = fact;
+        status = "returnable mine refused " + candidate + " " + (levelOnly ? "level" : "down")
+            + " from " + from.toShortString() + ": " + fact;
         choice++;
         cut = levelOnly ? 1 : 2;
         aim = null;
@@ -205,12 +276,25 @@ final class AgentReturnableMine {
     }
 
     private void lowerChoice(AgentProgress host, Direction candidate, int now) {
-        if (cut > 0 && host.returnableCaveOpening(from, workCell.down(cut), candidate)) {
-            finish(Outcome.DIVERTED, host.status());
-            return;
-        }
+        if (cut > 0 && offerCave(host, workCell.down(cut), candidate, now)) return;
         aim = null;
-        if (--cut < 0) rejectChoice(candidate, now);
+        if (--cut < 0) rejectChoice(candidate, now, Face.OPEN);
+    }
+
+    private boolean offerCave(AgentProgress host, BlockPos planned, Direction direction, int now) {
+        int bit = 1 << direction.ordinal();
+        if ((caveMask & bit) != 0 || !host.returnableCaveOpening(from, planned, direction)) return false;
+        if (host.mineCaveHandedOff()) finish(Outcome.DIVERTED, host.status());
+        else holdCave(host, direction, now);
+        return true;
+    }
+
+    private void holdCave(AgentProgress host, Direction direction, int now) {
+        caveMask |= 1 << direction.ordinal();
+        cavePending = true;
+        caveBearing = direction;
+        caveSince = now;
+        caveContacts = host.caveFootsteps();
     }
 
     private void prepareCut(int now) {
@@ -236,10 +320,8 @@ final class AgentReturnableMine {
                 return;
             }
         }
-        if ((revealed || cut == 0 && aim == null) && host.returnableCaveOpening(from, to, bearing)) {
-            finish(Outcome.DIVERTED, host.status());
-            return;
-        }
+        if (revealed) caveMask &= ~(1 << bearing.ordinal()); // Only the edited bearing gained evidence.
+        if ((revealed || cut == 0 && aim == null) && offerCave(host, to, bearing, now)) return;
         if (aim == null) {
             if (host.returnableToolUses() <= TOOL_RESERVE) {
                 finish(Outcome.SUPPLIES, "keeping tool uses in reserve for exposed ore and the return");
@@ -297,10 +379,7 @@ final class AgentReturnableMine {
             recheckForward(host, now);
             return;
         }
-        if (!reverse && proof == 0 && aim == null && host.returnableCaveOpening(from, to, bearing)) {
-            finish(Outcome.DIVERTED, host.status());
-            return;
-        }
+        if (!reverse && proof == 0 && aim == null && offerCave(host, to, bearing, now)) return;
         int samples = levelOnly ? 6 : CLEARANCE_HEIGHTS.length * 2;
         if (proof < samples) {
             if (aim == null) {
@@ -408,9 +487,14 @@ final class AgentReturnableMine {
 
     private void completeTread(AgentProgress host, int now) {
         if (levelOnly) {
-            levelFoot = to;
-            levelSpent = true;
-            finish(Outcome.REACHED, "reached one verified level prospecting tread without claiming a depth gain");
+            if (unjoined(from)) {
+                levelFoot = to;
+                levelSpent = true;
+                finish(Outcome.REACHED, "reached one verified level prospecting tread without claiming a depth gain");
+            } else {
+                host.recordReturnableLevel(from, to, bearing);
+                finish(Outcome.REACHED, "reached a verified level prospecting tread");
+            }
             return;
         }
         unjoined = levelFoot = null;
@@ -420,6 +504,8 @@ final class AgentReturnableMine {
         } else {
             from = to;
             to = null;
+            caveMask = 0;
+            caveSurveySpent = false;
             begin(Phase.ANCHOR, now);
         }
     }
@@ -438,7 +524,7 @@ final class AgentReturnableMine {
             double along = (player.getX() - from.getX() - 0.5) * bearing.getOffsetX()
                 + (player.getZ() - from.getZ() - 0.5) * bearing.getOffsetZ();
             if (along >= 0.55) advanceEvidence(20, now);
-            body.driveDryRoute(to, bearing, false);
+            body.driveDryRoute(from, to, bearing);
             host.rememberReturnableMotion();
         }
     }
@@ -494,9 +580,9 @@ final class AgentReturnableMine {
             && !player.isOnFire() && !player.hasVehicle() && now - started < LEG_TICKS;
         markUnjoined();
         if (bearing != null) {
-            retire(anchor, bearing);
-            if (!from.equals(anchor)) retire(from, bearing);
-            if (checkingReturn()) retire(to, bearing.getOpposite());
+            retire(anchor, bearing, Face.FAILED);
+            if (!from.equals(anchor)) retire(from, bearing, Face.FAILED);
+            if (checkingReturn()) retire(to, bearing.getOpposite(), Face.FAILED);
         }
         if (tryLevel) {
             // The lower landing is real, but detached. Take no additional drop
@@ -508,6 +594,8 @@ final class AgentReturnableMine {
             levelOnly = true;
             levelSpent = true;
             choice = drops = 0;
+            caveMask = 0;
+            Arrays.fill(faceFacts, null);
             begin(Phase.ANCHOR, now);
             status = detail + "; checking a level alternative without claiming the drop";
             return outcome;
@@ -528,6 +616,7 @@ final class AgentReturnableMine {
 
     private Outcome finish(Outcome result, String detail) {
         phase = null;
+        cavePending = false;
         anchor = from = to = workCell = null;
         revealedFrame = -1;
         status = detail;
@@ -539,6 +628,7 @@ final class AgentReturnableMine {
         world = client.world;
         player = client.player;
         phase = null;
+        cavePending = false;
         unjoined = levelFoot = reverseCeiling = null;
         levelSpent = false;
         revealedFrame = -1;
@@ -546,19 +636,25 @@ final class AgentReturnableMine {
         retiredCursor = 0;
     }
 
-    private boolean hasBearing(BlockPos foot) {
-        for (Direction direction : Direction.Type.HORIZONTAL) if (!retired(foot, direction)) return true;
-        return false;
-    }
-
-    private boolean retired(BlockPos foot, Direction direction) {
+    private Face refusal(BlockPos foot, Direction direction) {
         for (Refusal refusal : retired)
-            if (refusal != null && refusal.bearing == direction && refusal.foot.equals(foot)) return true;
-        return false;
+            if (refusal != null && refusal.bearing == direction && refusal.level == levelOnly
+                    && refusal.foot.equals(foot)) return refusal.fact;
+        return null;
     }
 
-    private void retire(BlockPos foot, Direction direction) {
-        if (!retired(foot, direction)) retired[retiredCursor++ % retired.length] = new Refusal(foot, direction);
+    private void retire(BlockPos foot, Direction direction, Face fact) {
+        if (refusal(foot, direction) == null)
+            retired[retiredCursor++ % retired.length] = new Refusal(foot, direction, levelOnly, fact);
+    }
+
+    private String refusalSummary() {
+        StringBuilder summary = new StringBuilder(levelOnly ? "no verified level alternative: " : "no verified descending bearing: ");
+        for (int i = 0; i < faceFacts.length; i++) {
+            if (i > 0) summary.append(", ");
+            summary.append(option(i)).append('=').append(faceFacts[i]);
+        }
+        return summary.toString();
     }
 
     private void aimCut(BlockPos foot, Direction direction) {

@@ -56,7 +56,7 @@ final class AgentDryCaveRoute {
     String status() { return activity; }
     String directReason() { return directReason; }
     long surveyEvidence() { return surveyEvidence; }
-    boolean routing() { return edge != null || viewAt != null; }
+    boolean routing() { return edge != null || viewAt != null || centerSince != 0; }
     BlockHitResult ore() { return ore; }
     BlockHitResult lava() { return lava; }
 
@@ -71,6 +71,14 @@ final class AgentDryCaveRoute {
                 || !body.renderedDirection(bearing.getPositiveHorizontalDegrees(), 10, 5)) return null;
         apertureChecked = true;
         return bearing;
+    }
+
+    boolean cancelStationarySurvey() {
+        if (moving || direct != null) return false;
+        interrupt();
+        unprovedAt = null;
+        yieldRefusal = false;
+        return true;
     }
 
     /** Read only the actual rendered lane; an idle native opportunity never asks Body to steer. */
@@ -504,7 +512,7 @@ final class AgentDryCaveRoute {
                 if (direct != null) directReason = "traversing the revalidated authorized edge";
                 activity = "dry route revalidated " + at(edge.from) + " -> " + at(edge.to)
                     + "; held frontier " + at(endpoint);
-                body.driveDryRoute(edge.to, edge.bearing, edge.to.getY() > edge.from.getY());
+                body.driveDryRoute(edge.from, edge.to, edge.bearing);
             }
         } else if (age >= VIEW_TICKS) {
             refuse(edge.failure == Retirement.LIGHT ? Retirement.LIGHT : Retirement.OBSERVATION,
@@ -538,8 +546,7 @@ final class AgentDryCaveRoute {
             edge.sample();
             if (edge.failure == Retirement.OBSTRUCTION || edge.failure == Retirement.HAZARD)
                 refuse(edge.failure, "new visible obstruction during traversal");
-            else if (allowsDirectMovement()) body.driveDryRoute(edge.to, edge.bearing,
-                edge.to.getY() > edge.from.getY() && player.isOnGround() && player.getBlockPos().equals(edge.from));
+            else if (allowsDirectMovement()) body.driveDryRoute(edge.from, edge.to, edge.bearing);
         }
         return true;
     }

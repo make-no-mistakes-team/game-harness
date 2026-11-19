@@ -30,9 +30,10 @@ final class AgentMemory {
     private static final String DIMENSION = "minecraft:overworld";
     private static final Set<PosixFilePermission> PRIVATE_PERMISSIONS = PosixFilePermissions.fromString("rw-------");
 
-    private record Snapshot(List<BlockPos> trail, List<BlockPos> dormant, BlockPos workbench, BlockPos furnace) {}
+    private record Snapshot(List<BlockPos> trail, List<BlockPos> dormant, BlockPos workbench, BlockPos furnace,
+                            BlockPos ownedWorkbench) {}
     record Rejoin(List<BlockPos> prefix, int activeIndex, int resumeAt) {}
-    private static final Snapshot EMPTY = new Snapshot(List.of(), List.of(), null, null);
+    private static final Snapshot EMPTY = new Snapshot(List.of(), List.of(), null, null, null);
     private final Path file;
     private Snapshot saved;
     private List<BlockPos> parentTrail;
@@ -41,6 +42,7 @@ final class AgentMemory {
     private ClientWorld overworld;
     private BlockPos workbench;
     private BlockPos furnace;
+    private BlockPos ownedWorkbench;
     private boolean inheritedWorkbench, inheritedFurnace;
     private boolean localWorkbench, localFurnace;
     private boolean joined;
@@ -58,6 +60,7 @@ final class AgentMemory {
         dormant = saved.dormant;
         workbench = saved.workbench;
         furnace = saved.furnace;
+        ownedWorkbench = saved.ownedWorkbench;
         inheritedWorkbench = workbench != null;
         inheritedFurnace = furnace != null;
     }
@@ -227,6 +230,23 @@ final class AgentMemory {
         else if (!isFurnace && position.equals(workbench)) workbench = null;
     }
 
+    void placedWorkbench(ClientWorld world, BlockPos position) {
+        if (world == overworld && valid(position)) ownedWorkbench = position.toImmutable();
+    }
+
+    /** A camera guide only; the block and the attempted contact still need a live witness. */
+    BlockPos ownedWorkbench(ClientWorld world) {
+        return world == overworld ? ownedWorkbench : null;
+    }
+
+    boolean ownsWorkbench(ClientWorld world, BlockPos position) {
+        return position.equals(ownedWorkbench(world));
+    }
+
+    void forgetOwnedWorkbench(ClientWorld world, BlockPos position) {
+        if (ownsWorkbench(world, position)) ownedWorkbench = null;
+    }
+
     void save(ClientWorld world, List<BlockPos> trail, boolean force) {
         if (world == null || world != overworld) return;
         long now = System.nanoTime();
@@ -249,13 +269,15 @@ final class AgentMemory {
         if (dormantLength < 2) dormantLength = 0;
         if (sameTrail(saved.trail, trail, start, length, extra) && sameTrail(saved.dormant, inactive, 0, dormantLength, null)
             && Objects.equals(workbench, saved.workbench)
-            && Objects.equals(furnace, saved.furnace)) return;
+            && Objects.equals(furnace, saved.furnace)
+            && Objects.equals(ownedWorkbench, saved.ownedWorkbench)) return;
         StringBuilder json = new StringBuilder(96 + (activeLength + dormantLength) * 14);
         json.append("{\"version\":1,\"dimension\":\"").append(DIMENSION).append("\",\"trail\":");
         encodeTrail(json, trail, start, length, extra);
         if (dormantLength > 0) encodeTrail(json.append(",\"dormant\":"), inactive, 0, dormantLength, null);
         if (workbench != null) encode(json.append(",\"workbench\":"), workbench);
         if (furnace != null) encode(json.append(",\"furnace\":"), furnace);
+        if (ownedWorkbench != null) encode(json.append(",\"ownedWorkbench\":"), ownedWorkbench);
         json.append('}');
         Path tmp = null;
         try {
@@ -272,7 +294,7 @@ final class AgentMemory {
                 recorded = extended;
             } else recorded = List.copyOf(recorded);
             saved = new Snapshot(recorded,
-                List.copyOf(inactive.subList(0, dormantLength)), workbench, furnace);
+                List.copyOf(inactive.subList(0, dormantLength)), workbench, furnace, ownedWorkbench);
         } catch (IOException ignored) {
             // Optional memory must not interrupt play or emit recorded positions.
         } finally {
@@ -313,13 +335,14 @@ final class AgentMemory {
                 if (integer(object.get("version")) != 1 || !dimension.isJsonPrimitive()
                     || !dimension.getAsJsonPrimitive().isString() || !DIMENSION.equals(dimension.getAsString())
                     || object.size() != 3 + (object.has("dormant") ? 1 : 0) + (object.has("workbench") ? 1 : 0)
-                        + (object.has("furnace") ? 1 : 0))
+                        + (object.has("furnace") ? 1 : 0) + (object.has("ownedWorkbench") ? 1 : 0))
                     return EMPTY;
                 List<BlockPos> cells = decodeTrail(object.getAsJsonArray("trail"), MAX_CELLS);
                 List<BlockPos> inactive = object.has("dormant")
                     ? decodeTrail(object.getAsJsonArray("dormant"), MAX_CELLS - cells.size()) : List.of();
                 return new Snapshot(cells, inactive, object.has("workbench") ? decode(object.get("workbench")) : null,
-                    object.has("furnace") ? decode(object.get("furnace")) : null);
+                    object.has("furnace") ? decode(object.get("furnace")) : null,
+                    object.has("ownedWorkbench") ? decode(object.get("ownedWorkbench")) : null);
             }
         } catch (IOException | RuntimeException ignored) {
             return EMPTY;

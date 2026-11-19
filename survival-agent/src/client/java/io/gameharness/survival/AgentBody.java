@@ -62,6 +62,7 @@ final class AgentBody {
     private static final int ESCAPE_TICKS = 44;
     private static final String SUPPORTING_FOOTPRINT = "supporting_footprint";
     private static final double[] MACRO_FLOOR_OFFSETS = {0, -0.36, 0.36};
+    static final int SUPPLY_OPEN = 1, SUPPLY_ROOF = 2, SUPPLY_WALL = 4;
 
     enum Contact {
         PLACE("place", false, 0.012),
@@ -1327,6 +1328,30 @@ final class AgentBody {
             tolerance);
     }
 
+    /** One panoramic sector from the actually rendered view, not a skylight or terrain-column query. */
+    int supplyPerspective(float yaw) {
+        if (!hasView()) return 0;
+        var player = client.player;
+        Vec3d left = eye.add(player.getRotationVector(-26, yaw - 22).multiply(MAX_RANGE));
+        Vec3d right = eye.add(player.getRotationVector(-26, yaw + 22).multiply(MAX_RANGE));
+        Vec3d high = eye.add(player.getRotationVector(-71, yaw).multiply(MAX_RANGE));
+        if (clearPoint(high, Ray.SIGHT) && clearPoint(left, Ray.SIGHT) && clearPoint(right, Ray.SIGHT))
+            return SUPPLY_OPEN;
+        Vec3d roof = eye.add(player.getRotationVector(-62, yaw).multiply(9));
+        Vec3d wall = eye.add(player.getRotationVector(-12, yaw).multiply(7));
+        BlockHitResult overhead = inView(roof) ? visibleHit(roof, Ray.TERRAIN) : null;
+        BlockHitResult ahead = inView(wall) ? visibleHit(wall, Ray.TERRAIN) : null;
+        // The selected outline still shows geometry in dim light. It supplies no material.
+        BlockHitResult outlined = selectedFace();
+        boolean roofSeen = overhead != null && overhead.getSide() == Direction.DOWN
+            || outlined != null && outlined.getSide() == Direction.DOWN
+                && outlined.getPos().squaredDistanceTo(eye) < 16;
+        boolean wallSeen = ahead != null && ahead.getSide().getOffsetY() == 0
+            || outlined != null && outlined.getSide().getOffsetY() == 0
+                && outlined.getPos().squaredDistanceTo(eye) < 9;
+        return (roofSeen ? SUPPLY_ROOF : 0) | (wallSeen ? SUPPLY_WALL : 0);
+    }
+
     /** Frustum preview only; no outside-view raycast or new world observation. */
     boolean macroRetainsView(Vec3d point, Vec3d feet, float yaw, float pitch) {
         if (!hasView()) return false;
@@ -1532,16 +1557,32 @@ final class AgentBody {
     }
 
     /** One bounded traversal under the normal lava and final key vetoes, without an automatic jump. */
-    void driveDryRoute(BlockPos to, Direction bearing, boolean jump) {
+    void driveDryRoute(BlockPos from, BlockPos to, Direction bearing) {
         var player = client.player;
         Vec3d landing = Vec3d.ofBottomCenter(to);
         double dx = landing.x - player.getX(), dz = landing.z - player.getZ();
+        boolean jump = to.getY() > from.getY() && player.isOnGround() && !player.isTouchingWater()
+            && !player.isInLava() && player.getBlockPos().equals(from);
         float yaw = heading(bearing.getOffsetX(), bearing.getOffsetZ());
         turnFixed(yaw, jump ? 4 : 39);
         if (!hasView() || Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > 6) return;
         double remaining = dx * bearing.getOffsetX() + dz * bearing.getOffsetZ();
         Vec3d velocity = player.getVelocity();
-        double braking = Math.max(0, velocity.x * bearing.getOffsetX() + velocity.z * bearing.getOffsetZ()) * 2.45;
+        double forwardSpeed = Math.max(0, velocity.x * bearing.getOffsetX() + velocity.z * bearing.getOffsetZ());
+        double coastTicks = 2.45;
+        if (to.getY() < from.getY() && player.getY() > landing.y + 0.05) {
+            // A one-block drop carries forward momentum through several airborne ticks.
+            // Bleed speed on the lip, rather than already beyond the landing center.
+            double toLip = remaining - (0.5 - player.getWidth() * 0.5);
+            if (!player.isOnGround() || toLip < forwardSpeed * coastTicks) coastTicks = 6.0;
+            if (!player.isOnGround() && forwardSpeed > 0.045 && remaining + 0.05 < forwardSpeed * 3) {
+                // Counter existing momentum; release before S can drive us back off the tread.
+                // The same final lava/ownership veto applies to this ordinary key press.
+                back();
+                return;
+            }
+        }
+        double braking = forwardSpeed * coastTicks;
         dryRouteWalk = true;
         if (remaining > Math.max(0.12, braking)) {
             walkDownTo(landing);

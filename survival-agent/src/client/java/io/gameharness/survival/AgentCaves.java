@@ -152,6 +152,20 @@ final class AgentCaves {
         finish(tick, "leaving the unproved cave descent for a walked mine route");
     }
 
+    /** Release observation only; do not abandon a physical step, placement, or wet continuation. */
+    boolean cancelStationaryDrySurvey(int tick) {
+        resetOnWorldChange();
+        if (player == null || !player.isOnGround() || player.isTouchingWater() || controlsWater(tick)) return false;
+        if (active() && (phase != Phase.DRY && phase != Phase.SURVEY
+                || !player.getBlockPos().equals(stance))) return false;
+        if (!dryRoute.cancelStationarySurvey()) return false;
+        if (active()) {
+            origin = null;
+            status = "returning from the bounded cave observation to the current mine leg";
+        }
+        return true;
+    }
+
     void interruptLight(int tick) {
         if (torchTarget != null) resumeAfterLight(tick);
     }
@@ -515,8 +529,7 @@ final class AgentCaves {
         if (lane == AgentBody.DryRouteSample.FLUID || lane == AgentBody.DryRouteSample.OBSTRUCTION)
             return finish(tick, "local cave shelf refused: new visible " + lane);
         status = "following the witnessed local cave shelf";
-        body.driveDryRoute(destination, travel,
-            destination.getY() > stance.getY() && player.isOnGround() && player.getBlockPos().equals(stance));
+        body.driveDryRoute(stance, destination, travel);
         return true;
     }
 

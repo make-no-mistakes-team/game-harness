@@ -46,6 +46,16 @@ thinks, the local player can keep working. Reaching the request limit stops
 new model calls; it does not stop Minecraft. The outcome reports local
 fallback ticks separately from actions Terra chose.
 
+The player has a three-second limit on waiting solely for a plan. It can
+approach a witnessed resource or inspect the terrain while Terra is still
+answering. It cannot spend materials on a new recipe on its own. If no safe
+action is available, the player reports the obstruction. Check
+`strategy.planningWait.longestPendingWithoutWorkMs` for the actual longest
+idle interval, including blocked time. `rightCensored: true` means the final
+interval may extend beyond the last observation. A provider timeout is a
+separate limit. An audible creeper fuse can interrupt either planning or a
+drag in the crafting grid before that limit matters.
+
 Terra can also write a function that chooses what to inspect or survey.
 Before it can move the camera, the function must pass an isolated Docker worker
 check and a test in a separate Minecraft world. Terra must then select the
@@ -117,6 +127,8 @@ Use the same stream to watch an individual skill trial:
 
 | Command | What the agent has to do |
 | --- | --- |
+| `bun run play:agent --diagnostic-urgent-creeper` | React on the first client tick after hearing a real fuse while a Terra request is outstanding. Uses the connected account; up to three requests in 120 seconds. |
+| `bun run play:agent --diagnostic-urgent-craft` | Leave a real workbench drag before release, recover the carried stack, and escape the blast unharmed. No model calls. |
 | `bun run play:agent --diagnostic-descent water 180` | Place water during a fall and land without damage. |
 | `bun run play:agent --diagnostic-descent boat 240` | Place and board a boat on the ledge, then ride it down to a dry landing. |
 | `bun run play:agent --diagnostic-descent cave 180` | Enter a lit chamber and follow its descending shelves. |

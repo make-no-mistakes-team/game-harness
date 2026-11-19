@@ -1,30 +1,39 @@
 # First integration: Minecraft desktop setup and spike history
 
-## Standalone Survival Pilot
+## Minecraft Survival Agent
 
-On the `experiment/survival-pilot` branch, a deterministic Fabric client can
-play toward a resource goal or a Nether portal in a new Normal Survival world. It uses the installed
-Minecraft Java 1.21.4 client and the project's existing server download and
-EULA consent. Sign in with the official Launcher before starting. On Linux it
-also needs Xvfb, xauth, FFmpeg with x11grab and libx264, Bun, and JDK 21.
+On the `experiment/minecraft-survival-agent` branch, the deterministic Fabric
+client plays toward a resource goal or a Nether portal in a new Normal Survival
+world. It uses the installed Minecraft Java 1.21.4 client and the project's
+existing server download and EULA consent. Sign in with the official Launcher
+before starting. On Linux it also needs Xvfb, xauth, FFmpeg with x11grab and
+libx264, Bun, and JDK 21.
 
 ```sh
 # Select JDK 21 in JAVA_HOME, then run from the checkout root.
-bun run build:pilot
-bun run play:pilot diamond 1800
+bun run build:agent
+bun run play:agent diamond 1800
 ```
 
 The seconds argument sets this attempt's wall time, including startup.
 Other item goals are `wooden_pickaxe`, `stone_pickaxe`, and `iron_pickaxe`.
-For `nether_portal`, the pilot needs to build and ignite a frame and enter it.
+For `nether_portal`, the agent needs to build and light a frame and enter it.
 Finding an existing portal or merely holding ten obsidian does not qualify.
 
-To launch the same player from the desktop, open **Settings → Survival Pilot**,
+To launch the same agent from the desktop, open **Settings → Minecraft Survival Agent**,
 select a goal and click **Start in new world**. The main player view shows
-the actual game. **Stop pilot** saves and closes that run's world; **Choose
+the actual game. **Stop agent** saves and closes that run's world; **Choose
 goal** starts the setup for another fresh world. The desktop will not take
-over an ordinary pilot already running from a terminal. Neither launch path
-requires a strategic model.
+over an ordinary agent run already active in a terminal. **Deterministic
+(no model)** is the default and does not require a model login.
+
+To use Terra in a new ordinary world, choose **Terra (gpt-6.1-terra)** under
+**Agent strategy** before starting. The connected OpenAI account must offer
+that exact model. Requests count toward account usage and may send live
+game frames to OpenAI. If Terra cannot start, the app reports the failure rather
+than switching models or starting a deterministic run. When a run closes,
+the app reports a confirmed Terra action only if Minecraft supplied a
+completion receipt. This is separate from verifying the vanilla goal.
 
 The runner prints the private attempt directory. Open `screen.mp4` there to
 watch the actual client, including the inventory pointer. `outcome.json`
@@ -34,27 +43,29 @@ and a diamond picked up. The runner checks those statistics after the world
 closes; the player does not receive them.
 
 To continue at a later stage without replaying progress, keep the same official
-Launcher profile and pass the basename of a previous pilot attempt:
+Launcher profile and pass the basename of a previous agent attempt:
 
 ```sh
-bun run play:pilot nether_portal 3600 --continue-from "$RUN_BASENAME"
+bun run play:agent nether_portal 3600 --continue-from "$RUN_BASENAME"
 ```
 
-The parent must be a recorded pilot attempt with a clean server exit.
+The parent must be a recorded agent attempt with a clean server exit.
 Retry an unfinished goal or advance to a higher tier; a completed goal cannot
 count as another win just by loading its save. The runner accepts no external world path. It copies the
 saved vanilla world, including player inventory and statistics, into a new
 attempt directory before starting a new server and recording. Only the
-pilot's own observed route and confirmed workstations can carry over as
+agent's own observed route and confirmed workstations can carry over as
 navigation memory. The runner does not inspect the seed or map. The declaration and outcome mark the new attempt
 as `world.fresh: false` and name its `world.parentRun`. Saved statistics can
 corroborate progress anywhere in that chain; a continued win is not evidence
 of an uninterrupted fresh run. Omit the flag for the fresh-world benchmark.
 
-To watch as it plays, run `bun run watch:pilot` in a second terminal and open
+To watch as it plays, run `bun run watch:agent` in a second terminal and open
 `http://127.0.0.1:4379/` on the same computer. Leave the tab open between
-attempts. The read-only stream follows the pilot's private display and
+attempts. The read-only stream follows the agent's private display and
 includes its cursor; the local recording continues if you close the tab.
+To open an exported review clip from its existing playback link, run
+`bun run review:agent` on the same computer first.
 
 To test the single-bucket casting path without mining for supplies, run
 `bun run diagnose:pool [SECONDS]`. This starts a separate Normal Survival
@@ -66,17 +77,17 @@ joins and advances normally afterward.
 The starting hotbar contains one water bucket, flint and steel, a stone
 pickaxe, 64 cobblestone and 8 cooked beef. There is no diamond, obsidian,
 portal frame or mold at the start. All setup ends before the client joins;
-the same pilot handles casting, lighting and entry. At the four-block lava
-edge, water cools two frame blocks in place. The pilot pours the other eight
+the same agent handles casting, lighting and entry. At the four-block lava
+edge, water cools two frame blocks in place. The agent pours the other eight
 with the same bucket, recovers its water and lights the frame. A win requires
 all ten positions, arrival in the Nether and corroborating vanilla statistics.
 The default live view stays on ordinary runs. For the diagnostic,
-run `bun survival-pilot/watch.ts --diagnostic` and open
+run `bun run watch:agent --diagnostic` and open
 `http://127.0.0.1:4382/`, or play `screen.mp4` from the printed attempt
 directory. Diagnostic worlds cannot be used as continuation parents.
 
 To replay an incident from a closed ordinary attempt on that same diagnostic
-stream, use `bun run play:pilot nether_portal 180 --replay-incident "$RUN_BASENAME"`.
+stream, use `bun run play:agent nether_portal 180 --replay-incident "$RUN_BASENAME"`.
 This uses the same save-copy rules and player as `--continue-from`, without
 fixture setup. The declaration and outcome record `world.type: "vanilla-incident-replay"`,
 `world.fresh: false`, and `world.parentRun`. The replay is not a fresh-world
@@ -84,20 +95,20 @@ result. Stopping after observing an incident does not count as reaching the goal
 
 Use the same stream to watch an individual skill trial:
 
-| Command | What the pilot has to do |
+| Command | What the agent has to do |
 | --- | --- |
-| `bun run play:pilot --diagnostic-descent water 180` | Place water during a fall and land without damage. |
-| `bun run play:pilot --diagnostic-descent boat 240` | Place and board a boat on the ledge, then ride it down to a dry landing. |
-| `bun run play:pilot --diagnostic-descent cave 180` | Enter a lit chamber and follow its descending shelves. |
-| `bun run play:pilot --diagnostic-terrain birch 180` | Leave an unreachable birch log and harvest a reachable tree. |
-| `bun run play:pilot --diagnostic-terrain ceiling 180` | Deal with a low ceiling and reach the upper step. |
+| `bun run play:agent --diagnostic-descent water 180` | Place water during a fall and land without damage. |
+| `bun run play:agent --diagnostic-descent boat 240` | Place and board a boat on the ledge, then ride it down to a dry landing. |
+| `bun run play:agent --diagnostic-descent cave 180` | Enter a lit chamber and follow its descending shelves. |
+| `bun run play:agent --diagnostic-terrain birch 180` | Leave an unreachable birch log and harvest a reachable tree. |
+| `bun run play:agent --diagnostic-terrain ceiling 180` | Deal with a low ceiling and reach the upper step. |
 
 Only one diagnostic runs at a time. These trials prepare the terrain; the
 bucket and boat trials also supply the item. They do not test finding a cave
 or making a boat or bucket in a random world.
 
-The standalone pilot makes no model calls and does not accept free-form tasks.
-The desktop application's model-driven path is described below.
+The desktop survival form takes a preset game goal, not a free-form task.
+The separate model-driven GameHarness workflow is described below.
 
 GameHarness is a desktop harness intended for many supported games through explicit adapters. This guide covers its first implemented adapter, Minecraft Java: an owned Fabric client/server, authentic video and compact model-authored programs. Other adapters are planned, not delivered automatically. Old Mineflayer/prismarine results below are scoped history and do not certify the native replacement.
 
@@ -137,7 +148,7 @@ bun run start
 
 The exact policy image is pinned in [`src/server/sandbox.ts`](../src/server/sandbox.ts). Sandbox preparation uses `--pull=never`: a missing image makes policy isolation unavailable. **Prepare server** can retry sandbox preparation after you install the image, but does not download that image for you. There is no unsandboxed fallback.
 
-`bun run build` builds the native project, Survival Pilot and Vite renderer. The component commands are `bun run build:native`, `bun run build:pilot` and `bun run build:ui`; the native wrapper command is `sh native/minecraft/gradlew -p native/minecraft build`. It pins Gradle 8.11.1, Loom 1.9.2, Fabric Loader 0.16.10, Yarn 1.21.4+build.8 and Fabric API 0.119.4+1.21.4.
+`bun run build` builds the native project, Minecraft Survival Agent and Vite renderer. The component commands are `bun run build:native`, `bun run build:agent` and `bun run build:ui`; the native wrapper command is `sh native/minecraft/gradlew -p native/minecraft build`. It pins Gradle 8.11.1, Loom 1.9.2, Fabric Loader 0.16.10, Yarn 1.21.4+build.8 and Fabric API 0.119.4+1.21.4.
 
 `bun run start` opens Electron 45.0.0. `bun run dev` builds once and opens the same desktop; it is not a watched Vite browser server. Keep the checkout, dependencies, built renderer/native artifacts and both sandbox files available.
 

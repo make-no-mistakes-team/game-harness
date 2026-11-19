@@ -43,7 +43,8 @@ import {
 } from "./api.ts";
 import type { PerformanceSnapshot, SkillEvidencePage } from "./api.ts";
 import { NativeVideo } from "./video.ts";
-import { SurvivalPilotView } from "./survival-pilot-view.ts";
+import { SurvivalAgentView } from "./survival-agent-view.ts";
+import { TERRA_MODEL_ID } from "../../src/shared/survival-agent-ui.ts";
 import { EvidenceInspector, promotionEvidence } from "./evidence.ts";
 import { MAX_TASK_CHARACTERS, taskTextSchema } from "../../src/shared/tasks.ts";
 import { initialTaskDraft, editTaskPrompt, selectTaskChoice, taskSubmission } from "./task-draft.ts";
@@ -62,12 +63,12 @@ root.innerHTML = `
   <div id="request-error" class="notice error" role="alert" hidden></div>
   <div class="work-area" id="work-area">
     <section class="game-console" aria-label="Authentic Minecraft player video">
-      <div class="console-topline"><h2>Minecraft <span class="muted">/ player view</span></h2><span id="view-status" class="model-only" role="status">Waiting</span><span class="pilot-only" id="pilot-video-status" role="status"></span></div>
+      <div class="console-topline"><h2>Minecraft <span class="muted">/ player view</span></h2><span id="view-status" class="model-only" role="status">Waiting</span><span class="survival-agent-only" id="survival-agent-video-status" role="status"></span></div>
       <div class="viewer" id="viewer" data-state="idle"><canvas id="game-video" class="model-only" aria-label="Read-only authentic Minecraft video, including the game HUD and player hand" hidden></canvas><div class="viewer-empty model-only" id="viewer-empty"><h3 id="viewer-title">No live video</h3><p id="viewer-description">Connect the isolated Minecraft client in Settings. No simulated footage is displayed.</p><button id="viewer-settings" type="button">Open settings</button></div><p class="frame-warning model-only" id="frame-warning" hidden></p>
-        <img class="pilot-only" id="pilot-video" width="960" height="540" alt="Read-only Minecraft gameplay from the running Survival Pilot" draggable="false" hidden>
-        <div class="viewer-empty pilot-only" id="pilot-empty"><h3 id="pilot-video-message"></h3></div>
+        <img class="survival-agent-only" id="survival-agent-video" width="960" height="540" alt="Read-only gameplay from Minecraft Survival Agent" draggable="false" hidden>
+        <div class="viewer-empty survival-agent-only" id="survival-agent-empty"><h3 id="survival-agent-video-message"></h3></div>
       </div>
-      <div class="viewer-foot"><span id="video-detail" class="model-only">Waiting for the local service.</span><button id="video-reconnect" class="model-only" type="button">Reconnect video</button><span class="pilot-only" id="pilot-video-detail"></span><button id="pilot-video-retry" class="pilot-only" type="button" hidden>Reconnect video</button></div>
+      <div class="viewer-foot"><span id="video-detail" class="model-only">Waiting for the local service.</span><button id="video-reconnect" class="model-only" type="button">Reconnect video</button><span class="survival-agent-only" id="survival-agent-video-detail"></span><button id="survival-agent-video-retry" class="survival-agent-only" type="button" hidden>Reconnect video</button></div>
     </section>
     <aside class="context-panel" id="context-panel" aria-label="Current goal and program">
       <div class="context-overview model-only">
@@ -78,22 +79,25 @@ root.innerHTML = `
       </div>
       <section class="usage-summary model-only"><h2><button id="usage-open" class="section-action" type="button" aria-label="Usage details" title="Usage details">Actual usage</button></h2><dl id="usage-summary"></dl></section>
       <p id="run-error" class="error model-only" role="alert" hidden></p>
-      <div class="context-overview pilot-only">
-        <section><h2 id="pilot-goal-heading">Current goal</h2><p id="pilot-task"></p></section>
-        <section id="pilot-activity"><h2 id="pilot-action-heading">Pilot activity</h2><p id="pilot-action"></p></section>
-        <section><h2>Player</h2><p id="pilot-player"></p></section>
+      <div class="context-overview survival-agent-only">
+        <section><h2 id="survival-agent-goal-heading">Current goal</h2><p id="survival-agent-task"></p></section>
+        <section id="survival-agent-activity"><h2 id="survival-agent-action-heading">Agent activity</h2><p id="survival-agent-action"></p></section>
+        <section><h2>Player</h2><p id="survival-agent-player"></p></section>
       </div>
-      <section class="usage-summary pilot-only"><h2>Model usage</h2><p>No strategic model is used by Survival Pilot.</p></section>
+      <section class="usage-summary survival-agent-only"><h2>Strategy</h2><p id="survival-agent-model"></p><p id="survival-agent-strategy-outcome" hidden></p></section>
     </aside>
   </div>
   <section class="run-toolbar" id="run-controls" aria-label="Run controls" tabindex="-1"><div class="run-control-state model-only"><strong id="run-status" role="status">No run</strong><span id="run-hint">Configure a task in Settings.</span></div><div class="button-row model-only"><button id="new-task" type="button">Task / model</button><button id="cancel-preparation" class="danger" type="button" hidden>Cancel preparation</button><button id="start-run" class="primary" type="button">Start</button><button id="pause-run" type="button">Pause</button><button id="resume-run" class="primary" type="button" hidden>Resume</button><button id="stop-run" class="danger" type="button">Stop run</button></div>
-    <div class="run-control-state pilot-only"><strong id="pilot-phase" role="status"></strong><span id="pilot-hint"></span><span id="pilot-control-error" class="error" role="alert" hidden></span></div>
-    <div class="button-row pilot-only"><button id="pilot-check" type="button" hidden>Check status</button><button id="pilot-return" type="button" hidden>Model controls</button><button id="pilot-choose" class="primary" type="button" hidden>Choose goal</button><button id="pilot-stop" class="danger" type="button">Stop pilot</button></div>
+    <div class="run-control-state survival-agent-only"><strong id="survival-agent-phase" role="status"></strong><span id="survival-agent-hint"></span><span id="survival-agent-control-error" class="error" role="alert" hidden></span></div>
+    <div class="button-row survival-agent-only"><button id="survival-agent-check" type="button" hidden>Check status</button><button id="survival-agent-return" type="button" hidden>Model controls</button><button id="survival-agent-choose" class="primary" type="button" hidden>Choose goal</button><button id="survival-agent-stop" class="danger" type="button">Stop agent</button></div>
   </section>
   <footer><span id="readiness" class="model-only">World · unknown / Model · unknown / Isolation · unknown</span><button id="inventory-open" class="text-button model-only" type="button">Inventory</button><span class="muted">Read-only video · no manual gameplay</span></footer>
 </main>
 <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-header"><h2 id="settings-title">Settings & task</h2><button type="button" data-close="settings-dialog" aria-label="Close settings">Close</button></div><div class="dialog-body settings-grid">
-  <section aria-labelledby="pilot-heading"><h3 id="pilot-heading" tabindex="-1">Survival Pilot</h3><form id="pilot-form"><label for="pilot-goal">Pilot goal</label><div class="input-row"><select id="pilot-goal" required></select><button id="pilot-start" type="submit" class="primary" disabled>Start in new world</button></div><p class="muted">Runs without a strategic model.</p><p id="pilot-start-status" role="status" hidden></p><p id="pilot-start-error" class="error" role="alert" hidden></p><button id="pilot-start-check" type="button" hidden>Check status</button></form></section>
+  <section aria-labelledby="survival-agent-heading"><h3 id="survival-agent-heading" tabindex="-1">Minecraft Survival Agent</h3><form id="survival-agent-form">
+    <label for="survival-agent-strategy">Agent strategy</label><div class="input-row"><select id="survival-agent-strategy" required><option value="deterministic" selected>Deterministic (no model)</option><option value="terra">Terra (${TERRA_MODEL_ID})</option></select></div>
+    <p id="survival-agent-strategy-disclosure" class="muted" hidden>Terra requires a connected OpenAI account with access to ${TERRA_MODEL_ID}. Requests count toward your account usage and may send live game frames to OpenAI.</p>
+    <label for="survival-agent-goal">Agent goal</label><div class="input-row"><select id="survival-agent-goal" required></select><button id="survival-agent-start" type="submit" class="primary" disabled>Start in new world</button></div><p id="survival-agent-start-status" role="status" hidden></p><p id="survival-agent-start-error" class="error" role="alert" hidden></p><button id="survival-agent-start-check" type="button" hidden>Check status</button></form></section>
   <section><h3>Game integration</h3><p>GameHarness runs model-authored game programs. Minecraft Java 1.21.4 is the first available integration; other game adapters are not available in this build.</p></section>
   <section class="settings-task"><h3>Task and strategic model</h3><form id="task-form"><div class="form-row"><label>Automatic success check<select id="goal" required aria-describedby="goal-condition"><option value="">Waiting for checks</option></select></label><label>Strategic model<select id="model" required><option value="">Connect OpenAI first</option></select></label></div><p id="goal-condition" role="status">Custom tasks have no automatic success check.</p><div class="section-heading"><label for="task">Task</label><button id="use-goal" class="text-button" type="button">Restore preset prompt</button></div><textarea id="task" rows="3" minlength="1" maxlength="${MAX_TASK_CHARACTERS}" required placeholder="Describe what the agent should do in this world."></textarea><p id="preparation-disclosure" class="muted">Preparation uses the selected model and counts toward your account usage: up to ${PREPARED_START_LIMITS.max_requests} requests, with a ${PREPARED_START_LIMITS.duration_ms / 60000}-minute preparation limit. It starts with fresh programs; the world opens only after compilation.</p><p id="preparation-prerequisite" role="status"></p><p id="preparation-error" class="error" role="alert" hidden></p><div class="button-row"><button id="prepare-play" type="submit" class="primary" aria-describedby="preparation-disclosure preparation-prerequisite">Prepare &amp; play</button><button id="create-run" type="submit" class="primary" hidden>Create run</button><span id="create-hint" class="muted" hidden>Create saves the task; Start begins inference.</span></div></form><div id="preparation-panel" class="preparation-status" tabindex="-1" aria-labelledby="preparation-status" hidden><p id="preparation-status" role="status"></p><p id="preparation-clock" class="mono"></p><p id="preparation-requests" class="mono"></p><button id="cancel-preparation-settings" class="danger" type="button" hidden>Cancel preparation</button><details><summary>Preparation details</summary><pre id="preparation-details" tabindex="0"></pre></details></div></section>
   <section class="settings-task"><h3>Program libraries</h3><div id="working-library"><label for="working-programs">Working definitions for the next task</label><select id="working-programs"><option value="continue">Continue this session’s same-model working programs</option><option value="fresh">Fresh — omit working programs</option></select><p>Working candidates retain validated code, not arguments, observations or execution state. They are not qualified experience.</p></div><p id="library-mode">Separately, optionally load one exact evidence-backed startup bundle. Neither choice executes code; the new run still receives fresh permissions and validation.</p><label for="experience">Qualified compatible startup bundle</label><select id="experience"><option value="">No saved programs</option></select><p id="library-status" role="status">Choose a strategic model to load compatible bundles.</p><button id="library-refresh" type="button">Refresh compatible library</button><pre id="experience-detail" tabindex="0" hidden></pre></section>
@@ -265,7 +269,7 @@ const video = new NativeVideo(
     }
   },
 );
-const pilot = new SurvivalPilotView({
+const survivalAgent = new SurvivalAgentView({
   el, text, errorText,
   openSettings: settings,
   closeSettings() {
@@ -276,8 +280,8 @@ const pilot = new SurvivalPilotView({
     }
   },
   changeView(visible) {
-    const losingFocus = document.activeElement?.closest(visible ? ".model-only" : ".pilot-only");
-    document.querySelector(".workspace")!.classList.toggle("show-pilot", visible);
+    const losingFocus = document.activeElement?.closest(visible ? ".model-only" : ".survival-agent-only");
+    document.querySelector(".workspace")!.classList.toggle("show-survival-agent", visible);
     if (visible) video.disconnect();
     else if (serviceReady) video.connect();
     if (losingFocus) el("run-controls").focus({ preventScroll: true });
@@ -311,7 +315,7 @@ function active(run: RunView | null): boolean {
   return !!run && !["stopped", "completed", "failed"].includes(run.status);
 }
 function canOperate(id?: string): boolean {
-  return !pilot.locksModel && commandAvailable(serviceReady, snapshot !== null, pending, id);
+  return !survivalAgent.locksModel && commandAvailable(serviceReady, snapshot !== null, pending, id);
 }
 function buttons(): void {
   const state = snapshot,
@@ -320,11 +324,11 @@ function buttons(): void {
     hasRun = active(run);
   const preparation = state?.prepared_start ?? null;
   const startupLocked = preparedStartActive(preparation) || preparationAttempt !== null;
-  pilot.setModelConflict(startupLocked ? "Finish or cancel model preparation before starting a pilot."
-    : hasRun ? "Stop the model run before starting a pilot."
+  survivalAgent.setModelConflict(startupLocked ? "Finish or cancel model preparation before starting the agent."
+    : hasRun ? "Stop the model run before starting the agent."
     : state && (["running", "starting", "preparing"].includes(state.server.status) ||
       ["connecting", "connected"].includes(state.game.status))
-      ? "Stop the model world before starting a pilot."
+      ? "Stop the model world before starting the agent."
       : pending.size ? "Wait for the current command to finish." : null);
   const preparePath = state?.game.status !== "connected" || startupLocked;
   const cancel = preparationCancellation(preparation);
@@ -1073,7 +1077,7 @@ function render(state: AppSnapshot): void {
       : "Player dead; no active run. Connect OpenAI in Settings, create a task and Start.";
   else if (!state.auth.authenticated)
     hint = state.game.status === "disconnected"
-      ? "Choose Survival Pilot or set up a model task in Settings."
+      ? "In Settings, choose Minecraft Survival Agent or set up a model task."
       : "Connect OpenAI in Settings to run a model task.";
   if (preparationAttempt)
     hint = preparationOutcomeUnknown
@@ -1542,7 +1546,7 @@ async function command(
 async function bootstrap(): Promise<void> {
   const current = ++generation;
   stream?.close();
-  pilot.disconnect();
+  survivalAgent.disconnect();
   video.disconnect();
   serviceReady = false;
   buttons();
@@ -1552,12 +1556,12 @@ async function bootstrap(): Promise<void> {
   try {
     await openSession();
     if (current !== generation) return;
-    pilot.connect();
+    survivalAgent.connect();
     const next = await fetchState();
     if (current !== generation) return;
     serviceReady = true;
     render(next);
-    if (!pilot.visible) video.connect();
+    if (!survivalAgent.visible) video.connect();
     const source = new EventSource("/v1/events", { withCredentials: true });
     stream = source;
     source.onopen = () => {
@@ -1623,7 +1627,7 @@ async function loadJev(): Promise<void> {
 }
 function settings(): void {
   openDialog("settings-dialog");
-  pilot.check();
+  survivalAgent.check();
   if (serviceReady) {
     void loadJev();
     void loadLibrary();
@@ -2179,7 +2183,7 @@ for (const link of document.querySelectorAll<HTMLAnchorElement>(
   });
 window.addEventListener("pagehide", () => {
   ++generation;
-  pilot.disconnect();
+  survivalAgent.disconnect();
   stream?.close();
   video.disconnect();
   window.clearTimeout(preparationTimer);

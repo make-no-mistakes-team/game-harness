@@ -75,6 +75,7 @@ export const TEST_TIERS = Object.freeze({
     "tests/incremental-omission-record.test.ts", // Actual pinned actor/operator archive retrieval of whole oversized evidence records.
     "tests/program-instrumentation.test.ts", // Real inner worker protocol, not production Docker isolation.
     "tests/resident-worker.test.ts", // Actual Node supervisor/module thread and protocol; Docker is a separate smoke gate.
+    "tests/survival-macro-skills.test.ts", // Private source selection and static gates; isolated worker smoke is opt-in.
     "tests/resident-runtime.test.ts", // Real Store/SkillManager/ResidentController admission; controlled worker/native boundaries.
     "tests/resident-benchmark-lifecycle.test.ts", // Real child-process/ledger deadline and OS-close ownership; no Minecraft.
     "tests/resident-volume.test.ts", // Separate five-slot protocol/grant identities and strict original-clock/resource evidence; no native launch.

@@ -27,8 +27,8 @@ import { PreparedStart, type PreparedWorldLaunch } from "./prepared-start.ts";
 import { preparedStartRequestSchema } from "../shared/prepared-start.ts";
 import { OperatorPublication } from "./operator-publication.ts";
 import { PublicationUnavailable, isPublicationRoute } from "./operator-publication-protocol.ts";
-import { SURVIVAL_PILOT_GOALS } from "../shared/survival-pilot-ui.ts";
-import { PilotRequestFault, SurvivalPilot } from "./survival-pilot.ts";
+import { SURVIVAL_AGENT_GOALS, SURVIVAL_AGENT_STRATEGIES, type SurvivalAgentStart } from "../shared/survival-agent-ui.ts";
+import { AgentRequestFault, SurvivalAgent } from "./survival-agent.ts";
 
 export class OperatorChangeBus {
   readonly listeners = new Set<() => void>();
@@ -92,8 +92,8 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
       record: (type, summary, details) => { store.event(null, type, summary, details); },
     });
     construction.push(() => preparedStart.close());
-    const survivalPilot = new SurvivalPilot(projectRoot, directory);
-    construction.push(() => survivalPilot.close());
+    const survivalAgent = new SurvivalAgent(projectRoot, directory);
+    construction.push(() => survivalAgent.close());
     const video = new VideoStream((milliseconds) =>
       performanceMonitor.record("video_forward_ms", milliseconds),
     );
@@ -132,14 +132,14 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
       return result;
     }
 
-    function assertNoSurvivalPilot(): void {
+    function assertNoSurvivalAgent(): void {
       if (closing) throw new HttpError(503, "unavailable", "GameHarness is shutting down");
-      if (survivalPilot.busy())
-        throw new HttpError(409, "busy", "Stop Survival Pilot before starting a model-guided world or run");
+      if (survivalAgent.busy())
+        throw new HttpError(409, "busy", "Stop Minecraft Survival Agent before starting a model-guided world or run");
     }
 
     function admitModelConnection<T>(operation: () => Promise<T>): Promise<T> {
-      assertNoSurvivalPilot();
+      assertNoSurvivalAgent();
       pendingModelAdmissions++;
       const admitted = async () => {
         try { return await operation(); } finally { pendingModelAdmissions--; }
@@ -153,7 +153,7 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
           ["preparing", "starting", "running"].includes(minecraft.snapshot().status) ||
           ["connecting", "connected"].includes(game.snapshot().status) ||
           model && (!["created", "stopped", "completed", "failed"].includes(model.status) || model.operator.cleanup_error))
-        throw new HttpError(409, "busy", "Stop the model run and its Minecraft world before starting Survival Pilot");
+        throw new HttpError(409, "busy", "Stop the model run and its Minecraft world before starting Minecraft Survival Agent");
     }
 
     function assertGameOperation(generation: number): void {
@@ -299,7 +299,7 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
     function launchGameOperation(
       operation: (generation: number) => Promise<void>,
     ): void {
-      assertNoSurvivalPilot();
+      assertNoSurvivalAgent();
       if (gameOperation)
         throw new HttpError(
           409,
@@ -324,7 +324,7 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
     }
     /** Reserve before scheduling: cancellation owns this exact startup, never a previously connected world. */
     function beginPreparedWorld(): PreparedWorldLaunch {
-      assertNoSurvivalPilot();
+      assertNoSurvivalAgent();
       if (gameOperation || game.snapshot().status !== "disconnected" || minecraft.snapshot().status !== "stopped")
         throw new HttpError(409, "busy", "A new prepared startup requires an idle disconnected world");
       const generation = ++operationGeneration;
@@ -355,7 +355,10 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
     }
 
     const emptyBody = z.object({}).strict();
-    const survivalPilotBody = z.object({ goal: z.enum(SURVIVAL_PILOT_GOALS) }).strict();
+    const survivalAgentBody: z.ZodType<SurvivalAgentStart> = z.strictObject({
+      goal: z.enum(SURVIVAL_AGENT_GOALS),
+      strategy: z.enum(SURVIVAL_AGENT_STRATEGIES),
+    });
     const controlBody = z
       .object({
         command: z.enum(["start", "pause", "resume", "stop"]),
@@ -472,28 +475,28 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
             );
             if (isPublicationRoute(request.method, url.pathname))
               return await publish();
-            if (url.pathname === "/v1/survival-pilot" || url.pathname.startsWith("/v1/survival-pilot/")) {
+            if (url.pathname === "/v1/survival-agent" || url.pathname.startsWith("/v1/survival-agent/")) {
               const site = request.headers.get("sec-fetch-site");
               if (origin && origin !== `http://${request.headers.get("host")}` ||
                   site && !["same-origin", "none"].includes(site))
-                throw new HttpError(403, "forbidden", "Survival Pilot requires a same-origin request");
-              if (request.method === "GET" && url.pathname === "/v1/survival-pilot")
-                return json(survivalPilot.snapshot());
-              if (request.method === "POST" && url.pathname === "/v1/survival-pilot/start") {
-                const { goal } = await body(request, survivalPilotBody);
+                throw new HttpError(403, "forbidden", "Minecraft Survival Agent requires a same-origin request");
+              if (request.method === "GET" && url.pathname === "/v1/survival-agent")
+                return json(survivalAgent.snapshot());
+              if (request.method === "POST" && url.pathname === "/v1/survival-agent/start") {
+                const input = await body(request, survivalAgentBody);
                 assertLegacyWorldIdle();
-                return json(survivalPilot.start(goal), 202);
+                return json(survivalAgent.start(input), 202);
               }
-              if (request.method === "POST" && url.pathname === "/v1/survival-pilot/stop") {
+              if (request.method === "POST" && url.pathname === "/v1/survival-agent/stop") {
                 await body(request, emptyBody);
-                const state = survivalPilot.stop();
+                const state = survivalAgent.stop();
                 return json(state, state.phase === "stopping" ? 202 : 200);
               }
-              if (request.method === "GET" && url.pathname === "/v1/survival-pilot/video") {
+              if (request.method === "GET" && url.pathname === "/v1/survival-agent/video") {
                 const query = url.searchParams;
                 if ([...query.keys()].some((key) => key !== "run") || query.getAll("run").length > 1)
                   throw new HttpError(400, "invalid_request", "The video request accepts one run identifier");
-                const response = survivalPilot.video(request, session.expires, query.get("run"), headers);
+                const response = survivalAgent.video(request, session.expires, query.get("run"), headers);
                 httpServer.timeout(request, 0);
                 return response;
               }
@@ -832,7 +835,7 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
         } catch (error) {
           if (error instanceof PublicationUnavailable)
             return json({ error: { code: "publication_unavailable", message: error.message } }, error.status);
-          if (error instanceof HttpError || error instanceof PilotRequestFault)
+          if (error instanceof HttpError || error instanceof AgentRequestFault)
             return json(
               { error: { code: error.code, message: error.message } },
               error.status,
@@ -860,7 +863,7 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
       offFrames();
       shutdown = (async () => {
         const cleanup = await Promise.allSettled([
-          survivalPilot.close(),
+          survivalAgent.close(),
           preparedStart.close(),
           runtime.close(),
           auth.close(),

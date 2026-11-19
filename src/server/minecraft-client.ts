@@ -430,20 +430,20 @@ export class MinecraftClient {
     ];
   }
 
-  /** Stage and hash the exact pilot jar the fresh client will load. */
-  async stagePilotArtifact(artifact: string) {
+  /** Stage and hash the exact Minecraft Survival Agent JAR the fresh client will load. */
+  async stageAgentArtifact(artifact: string) {
     const mods = path.join(this.directory, "mods");
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     await mkdir(mods, { mode: 0o700 });
-    const installed = path.join(mods, "survival-pilot.jar");
+    const installed = path.join(mods, "survival-agent.jar");
     await copyFile(artifact, installed);
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(installed)) hash.update(chunk);
     return hash.digest("hex");
   }
 
-  /** Launch the standalone pilot without the native bridge or its session file. */
-  async launchPilot(
+  /** Launch the standalone agent without the native bridge or its session file. */
+  async launchAgent(
     config: {
       runtimeCache: string;
       port: number;
@@ -481,8 +481,8 @@ export class MinecraftClient {
       "-Djava.awt.headless=true",
       `-Duser.home=${this.directory}`,
       `-Djava.io.tmpdir=${tmp}`,
-      `-Dgh.pilot.dir=${config.evidenceDir}`,
-      `-Dgh.pilot.goal=${config.goal}`,
+      `-Dgh.agent.dir=${config.evidenceDir}`,
+      `-Dgh.agent.goal=${config.goal}`,
       "-cp",
       libraries.join(path.delimiter),
       path.join(this.projectRoot,

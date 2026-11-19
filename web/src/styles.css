@@ -24,8 +24,8 @@
 [hidden] {
   display: none !important;
 }
-.workspace:not(.show-pilot) .pilot-only,
-.workspace.show-pilot .model-only {
+.workspace:not(.show-survival-agent) .survival-agent-only,
+.workspace.show-survival-agent .model-only {
   display: none !important;
 }
 html,
@@ -331,14 +331,14 @@ code {
   isolation: isolate;
 }
 .viewer canvas,
-.viewer #pilot-video {
+.viewer #survival-agent-video {
   display: block;
   width: 100%;
   height: 100%;
   object-fit: contain;
   pointer-events: none;
 }
-.viewer #pilot-video {
+.viewer #survival-agent-video {
   user-select: none;
 }
 .viewer-empty {
@@ -521,7 +521,7 @@ footer > :first-child {
   flex: 1;
   min-width: 0;
 }
-.workspace.show-pilot footer > .muted {
+.workspace.show-survival-agent footer > .muted {
   display: inline;
 }
 footer button {
@@ -644,7 +644,7 @@ dialog::backdrop {
 .input-row input {
   flex: 1;
 }
-#pilot-form select {
+#survival-agent-form select {
   flex: 1;
   min-width: 0;
 }

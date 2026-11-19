@@ -6,12 +6,16 @@ import { isAbsolute } from "node:path";
 export const MACRO_CAPABILITIES_VERSION = "survival-macro/v1";
 export const MACRO_MAX_INTENT_TTL_TICKS = 1_200;
 export const MACRO_MAX_PLAN_TTL_TICKS = 7_200;
+export const MACRO_MAX_HANDOFF_TTL_TICKS = 100;
+export const MACRO_MAX_STRATEGIC_EPISODES = 3;
 
 const FILE_BYTES = {
   "active.json": 512,
+  "handoff.json": 2 * 1024,
   "observation.json": 64 * 1024,
   "intent.json": 2 * 1024,
   "receipt.json": 4 * 1024,
+  "revoked.json": 1024,
 } as const;
 const idPattern = /^[A-Za-z0-9._:-]{1,128}$/;
 const hashPattern = /^[a-f0-9]{64}$/;
@@ -56,6 +60,8 @@ export interface MacroIntent {
   readonly skillHash: string | null;
 }
 
+export type MacroHandoff = Pick<MacroIntent, "v" | "run" | "life" | "epoch" | "basisTick" | "expiresTick">;
+
 export interface MacroReceipt {
   readonly v: 1;
   readonly id: string;
@@ -66,10 +72,45 @@ export interface MacroReceipt {
   readonly detail: string;
 }
 
+export interface MacroSkillReceipt {
+  readonly tick: number;
+  readonly verb: string;
+  readonly status: "completed";
+  readonly detail: string;
+}
+
 export interface MacroSkillCandidate {
   readonly source: string;
   readonly parentGeneration: number;
   readonly verbs: readonly string[];
+}
+
+const NATIVE_REVIEW_PACKAGE = "java/io/gameharness/survival";
+const NATIVE_REVIEW_CLIENT = `survival-agent/src/client/${NATIVE_REVIEW_PACKAGE}`;
+export const NATIVE_REVIEW_PUBLIC_PATHS = [
+  `${NATIVE_REVIEW_CLIENT}/AgentCraftClick.java`,
+  `${NATIVE_REVIEW_CLIENT}/mixin/AgentHandledScreenAccess.java`,
+  `${NATIVE_REVIEW_CLIENT}/mixin/AgentMouseAccess.java`,
+] as const;
+export const NATIVE_REVIEW_NEW_SOURCE = `${NATIVE_REVIEW_CLIENT}/AgentCapabilityProposal.java`;
+export const NATIVE_REVIEW_TEST_PATH = `survival-agent/src/test/${NATIVE_REVIEW_PACKAGE}/AgentCapabilityProposalTest.java`;
+export const NATIVE_REVIEW_PATHS = [...NATIVE_REVIEW_PUBLIC_PATHS, NATIVE_REVIEW_NEW_SOURCE, NATIVE_REVIEW_TEST_PATH] as const;
+export const NATIVE_REVIEW_MAX_FILE_BYTES = 8 * 1024;
+export const NATIVE_REVIEW_MAX_BYTES = 10 * 1024;
+
+export interface MacroReviewPatch {
+  readonly baseVersion: string;
+  readonly baseSha256: string;
+  readonly scope: string;
+  readonly files: readonly { readonly path: string; readonly content: string }[];
+}
+
+export interface MacroReviewContext {
+  readonly baseVersion: string;
+  readonly baseSha256: string;
+  readonly source: readonly { readonly path: string; readonly sha256: string; readonly content: string }[];
+  readonly newSourcePath: string;
+  readonly testPath: string;
 }
 
 export interface MacroProposal {
@@ -82,8 +123,9 @@ export interface MacroProposal {
   readonly action:
     | { readonly kind: "opportunity"; readonly opportunityId: string }
     | { readonly kind: "skill"; readonly candidate: MacroSkillCandidate }
+    | { readonly kind: "tested-skill"; readonly skillHash: string }
     | { readonly kind: "selected-skill" }
-    | { readonly kind: "gap"; readonly capability: string; readonly suggestion?: string }
+    | { readonly kind: "gap"; readonly capability: string; readonly suggestion?: string; readonly reviewPatch?: MacroReviewPatch }
     | { readonly kind: "abstain" };
 }
 
@@ -112,16 +154,43 @@ export interface MacroFeedback {
   readonly detail: string;
 }
 
+export const MACRO_NOT_ISSUED_DISPOSITIONS = [
+  "stale", "native_capability_gap", "proposal_refused", "duplicate_intent_refused",
+  "skill_rejected", "skill_abstained", "skill_unavailable", "skill_promotion_refused", "unproven_skill_effect_refused",
+] as const;
+
+export type MacroEpisodeOutcome =
+  | { readonly source: "native"; readonly status: Exclude<MacroReceipt["status"], "accepted">;
+    readonly id: string; readonly tick: number; readonly verb: string; readonly summary: string; readonly detail: string }
+  | { readonly source: "host"; readonly status: "not-issued"; readonly disposition: typeof MACRO_NOT_ISSUED_DISPOSITIONS[number] }
+  | { readonly source: "host"; readonly status: "withdrawn"; readonly id: string; readonly tick: number;
+    readonly verb: string; readonly summary: string };
+
+export interface MacroStrategicEpisode {
+  /** Original model decision; native outcome IDs refer to individual intents, not opportunity IDs. */
+  readonly requestId: string;
+  readonly basis: MacroBasis;
+  readonly hypothesis: { readonly subgoal: string; readonly expected: string };
+  /** The terminal native receipt establishes only the primitive's report. */
+  readonly objectiveStatus: "not-evaluated";
+  readonly outcome: MacroEpisodeOutcome;
+}
+
 export interface MacroRequest {
   readonly observation: MacroObservation;
   readonly objective?: string;
   readonly trigger: MacroTrigger;
   readonly lastReceipt: MacroReceipt | null;
   readonly feedback?: MacroFeedback;
+  /** Same-life, same-goal history; newest first, at most MACRO_MAX_STRATEGIC_EPISODES. Never actionable. */
+  readonly strategicEpisodes?: readonly MacroStrategicEpisode[];
   readonly capabilitiesVersion: string;
   readonly skillGeneration: number | null;
   readonly skillVerbs?: readonly string[];
   readonly selectedSkillHash?: string;
+  readonly testedSkills?: readonly { readonly hash: string; readonly verb: string }[];
+  readonly nativeReview?: MacroReviewContext;
+  readonly maxSkillEffects?: number;
   readonly maxResponseBytes: number;
   readonly maxIntentTtlTicks: number;
   readonly maxPlanTtlTicks: number;
@@ -256,6 +325,16 @@ export function parseMacroIntent(value: unknown): MacroIntent {
   });
 }
 
+export function parseMacroHandoff(value: unknown): MacroHandoff {
+  const record = shape(value, "handoff", ["v", "run", "life", "epoch", "basisTick", "expiresTick"]);
+  const basisTick = whole(record.basisTick, "basisTick", 1, Number.MAX_SAFE_INTEGER - MACRO_MAX_INTENT_TTL_TICKS);
+  return {
+    v: version(record.v), run: validateMacroId(record.run, "run"), life: whole(record.life, "life", 1, 2_147_483_647),
+    epoch: whole(record.epoch, "epoch", 1), basisTick,
+    expiresTick: whole(record.expiresTick, "expiresTick", basisTick + 1, basisTick + MACRO_MAX_HANDOFF_TTL_TICKS),
+  };
+}
+
 export function parseMacroReceipt(value: unknown): MacroReceipt {
   const record = shape(value, "receipt", ["v", "id", "run", "life", "tick", "status", "detail"]);
   return Object.freeze({
@@ -266,12 +345,42 @@ export function parseMacroReceipt(value: unknown): MacroReceipt {
   });
 }
 
+export function parseMacroRevocation(value: unknown): MacroBasis {
+  const record = shape(value, "native revocation", ["v", "run", "life", "tick", "epoch"]);
+  version(record.v);
+  return basis(record);
+}
+
+export function parseMacroReviewPatch(value: unknown): MacroReviewPatch {
+  const patch = shape(value, "review patch", ["baseVersion", "baseSha256", "scope", "files"]);
+  if (typeof patch.baseVersion !== "string" || !/^[A-Za-z0-9._:/-]{1,128}$/.test(patch.baseVersion)) invalid("review base version");
+  if (typeof patch.baseSha256 !== "string" || !hashPattern.test(patch.baseSha256)) invalid("review base digest");
+  const scope = text(patch.scope, "review scope", 1024);
+  if (/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(scope)) invalid("review scope");
+  const paths = new Set<string>();
+  let totalBytes = 0;
+  const files = bounds(patch.files, "review files", NATIVE_REVIEW_PATHS.length).map(value => {
+    const file = shape(value, "review file", ["path", "content"]);
+    const path = choice(file.path, "review file path", NATIVE_REVIEW_PATHS);
+    if (paths.has(path)) invalid("duplicate review file");
+    paths.add(path);
+    const content = text(file.content, "review file content", NATIVE_REVIEW_MAX_FILE_BYTES, true);
+    // Printable ASCII and exact LF endings keep the review diff visually unambiguous.
+    if (/[^\x20-\x7e\n\t]/.test(content) || !content.endsWith("\n")) invalid("review file content");
+    totalBytes += content.length;
+    return Object.freeze({ path, content });
+  });
+  if (paths.size < 2 || !paths.has(NATIVE_REVIEW_TEST_PATH)) invalid("review code and test files");
+  if (totalBytes > NATIVE_REVIEW_MAX_BYTES) invalid("review file byte limit");
+  return Object.freeze({ baseVersion: patch.baseVersion, baseSha256: patch.baseSha256, scope, files: Object.freeze(files) });
+}
+
 export function parseMacroProposal(value: unknown): MacroProposal {
   const record = shape(value, "proposal", [
     "subgoal", "reason", "successCondition", "contingency", "alternative", "expiresTick", "action",
   ]);
   const rawAction = object(record.action, "action");
-  const kind = choice(rawAction.kind, "action kind", ["opportunity", "skill", "selected-skill", "gap", "abstain"] as const);
+  const kind = choice(rawAction.kind, "action kind", ["opportunity", "skill", "tested-skill", "selected-skill", "gap", "abstain"] as const);
   let action: MacroProposal["action"];
   switch (kind) {
     case "opportunity":
@@ -291,15 +400,21 @@ export function parseMacroProposal(value: unknown): MacroProposal {
       break;
     }
     case "gap":
-      shape(rawAction, "capability gap", ["kind", "capability"], ["suggestion"]);
+      shape(rawAction, "capability gap", ["kind", "capability"], ["suggestion", "reviewPatch"]);
       action = { kind, capability: text(rawAction.capability, "capability gap", 512),
         ...(Object.hasOwn(rawAction, "suggestion") ? { suggestion: text(rawAction.suggestion, "review suggestion", 4 * 1024, true) } : {}),
+        ...(Object.hasOwn(rawAction, "reviewPatch") ? { reviewPatch: parseMacroReviewPatch(rawAction.reviewPatch) } : {}),
       };
       break;
     case "selected-skill":
     case "abstain":
       shape(rawAction, kind, ["kind"]);
       action = { kind };
+      break;
+    case "tested-skill":
+      shape(rawAction, kind, ["kind", "skillHash"]);
+      if (typeof rawAction.skillHash !== "string" || !hashPattern.test(rawAction.skillHash)) invalid("skillHash");
+      action = { kind, skillHash: rawAction.skillHash };
       break;
   }
   return Object.freeze({
@@ -369,7 +484,7 @@ export class MacroDirectory {
     }
   }
 
-  async write(name: "active.json" | "intent.json", value: unknown): Promise<void> {
+  async write(name: "active.json" | "intent.json" | "handoff.json", value: unknown): Promise<void> {
     const content = JSON.stringify(value) + "\n";
     if (Buffer.byteLength(content) > FILE_BYTES[name]) throw new Error(`Macro IPC output exceeds cap: ${name}.`);
     const partial = `.tmp-${randomUUID()}` as const;
@@ -384,7 +499,7 @@ export class MacroDirectory {
     }
   }
 
-  async remove(name: "active.json" | "intent.json" | `.tmp-${string}`): Promise<void> {
+  async remove(name: "active.json" | "intent.json" | "handoff.json" | `.tmp-${string}`): Promise<void> {
     try { await unlink(this.entry(name)); } catch (error) { if (!missing(error)) throw error; }
   }
 
@@ -409,7 +524,8 @@ export class MacroDirectory {
           (cursor !== null && (info.dev !== cursor.device || info.ino !== cursor.inode))) {
         throw new Error("Invalid native macro receipt journal.");
       }
-      const count = Number(info.size) - offset;
+      const available = Number(info.size) - offset;
+      const count = Math.min(16 * 1024, available);
       const bytes = Buffer.allocUnsafe(count);
       let filled = 0;
       while (filled < count) {
@@ -424,8 +540,11 @@ export class MacroDirectory {
         receipts.push(parseMacroReceipt(JSON.parse(utf8.decode(bytes.subarray(start, end)))));
         start = end + 1;
       }
-      if (count - start > FILE_BYTES["receipt.json"]) throw new Error("Native macro receipt line exceeds cap.");
-      return { cursor: { device: info.dev, inode: info.ino, offset: offset + start }, receipts };
+      if ((count === available || !start) && count - start > FILE_BYTES["receipt.json"]) {
+        throw new Error("Native macro receipt line exceeds cap.");
+      }
+      return { cursor: { device: info.dev, inode: info.ino, offset: offset + start }, receipts,
+        more: count < available, partial: count === available && count > start };
     } finally {
       await file.close();
     }
@@ -441,6 +560,8 @@ export interface NativeReceiptCursor {
 interface NativeReceiptBatch {
   readonly cursor: NativeReceiptCursor;
   readonly receipts: readonly MacroReceipt[];
+  readonly more: boolean;
+  readonly partial: boolean;
 }
 
 async function withMacroDirectory<T>(directory: string, use: (ipc: MacroDirectory) => Promise<T>): Promise<T> {

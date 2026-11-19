@@ -50,10 +50,11 @@ behavior. Infrastructure milestones support that outcome; they do not replace it
 
 ## Model-run authorization
 
-On `experiment/survival-pilot`, the user authorizes any number of Luna
+On `experiment/minecraft-survival-agent`, the user authorizes any number of Luna
 (`gpt-6-luna`) and Terra (`gpt-6.1-terra`) gameplay runs. Ask before each
 `gpt-6.2-sol` run. Choose run-specific timeouts and stop on lack of progress;
-the standing tool, request, and time caps below do not govern the pilot.
+the standing tool, request, and time caps below do not apply to the Minecraft
+Survival Agent experiment.
 The aggregate artifact ceiling for this branch is 300,000,000,000 bytes,
 including pre-existing runs. These permissions do not change frozen study
 protocols, authorize deleting private material, or grant access to hidden
@@ -97,7 +98,7 @@ approved higher limits in a newly declared run.
 
 ## Manual gameplay review
 
-On `experiment/survival-pilot`, request feedback on representative footage
+On `experiment/minecraft-survival-agent`, request feedback on representative footage
 through `ask` when useful. Include the recording's absolute local path and
 a playback link in the request. A successful run is not a review gate: keep the
 survival progression moving unless the user asks to stop. The mandatory

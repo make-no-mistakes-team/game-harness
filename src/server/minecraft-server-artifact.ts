@@ -61,7 +61,7 @@ async function digest(file: string, algorithm: string, maximum: number, exactSiz
 }
 
 /** Validate or provision the public vanilla dependency without touching an existing world or replacing an existing jar. */
-export async function preparePilotServerArtifact(projectRoot: string, signal: AbortSignal): Promise<void> {
+export async function prepareAgentServerArtifact(projectRoot: string, signal: AbortSignal): Promise<void> {
   const directory = path.join(projectRoot, "local/runtime/minecraft");
   await mkdir(directory, { recursive: true, mode: 0o700 });
   await ownedDirectory(directory);

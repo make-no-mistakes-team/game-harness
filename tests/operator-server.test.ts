@@ -192,7 +192,7 @@ test("parallel applications keep per-port Origin/session isolation and remove on
   }
 });
 
-test("pilot controls enforce the local session, strict input and the independent ordinary lane owner", async () => {
+test("survival agent controls enforce the local session, strict input and the independent ordinary lane owner", async () => {
   const f = await fixture();
   const minecraftInitialize = spyOn(f.owners.minecraft, "initialize").mockRejectedValue(new Error("No legacy world in this fixture"));
   let app: Awaited<ReturnType<typeof createOperatorApplication>> | undefined;
@@ -200,35 +200,40 @@ test("pilot controls enforce the local session, strict input and the independent
     app = await createOperatorApplication({ ...f.owners, projectRoot: f.owners.directory });
     await app.initialize();
     const origin = `http://127.0.0.1:${app.server.port}`;
-    const pilot = `${origin}/v1/survival-pilot`;
+    const agent = `${origin}/v1/survival-agent`;
     const session = await fetch(`${origin}/v1/session`);
     const cookie = session.headers.get("set-cookie")!.split(";")[0]!;
     const { csrf_token: csrf } = await session.json() as { csrf_token: string };
-    const get = (suffix = "") => fetch(pilot + suffix, { headers: { cookie } });
-    const post = (suffix: string, value: unknown, token = csrf) => fetch(pilot + suffix, {
+    const get = (suffix = "") => fetch(agent + suffix, { headers: { cookie } });
+    const post = (suffix: string, value: unknown, token = csrf) => fetch(agent + suffix, {
       method: "POST", headers: { cookie, "x-csrf-token": token, "Content-Type": "application/json" },
       body: JSON.stringify(value),
     });
-    expect((await fetch(pilot)).status).toBe(401);
+    expect((await fetch(agent)).status).toBe(401);
     expect(await (await get()).json()).toEqual({
-      phase: "idle", goal: null, status: "Ready to start a new Survival world.",
-      won: null, run: null, elapsedMs: 0, health: null, food: null,
+      phase: "idle", goal: null, strategy: null, model: null, strategyOutcome: null,
+      status: "Ready to start a new Survival world.",
+      won: null, run: null, elapsedMs: 0, health: null, food: null, deaths: null,
     });
-    expect((await fetch(pilot, { headers: { cookie, "Sec-Fetch-Site": "same-site" } })).status).toBe(403);
-    expect((await post("/start", { goal: "diamond" }, "")).status).toBe(403);
-    expect((await post("/start", { goal: "continue" })).status).toBe(400);
-    expect((await post("/start", { goal: "diamond", display: ":0" })).status).toBe(400);
+    expect((await fetch(agent, { headers: { cookie, "Sec-Fetch-Site": "same-site" } })).status).toBe(403);
+    const start = { goal: "diamond", strategy: "deterministic" };
+    expect((await post("/start", start, "")).status).toBe(403);
+    expect((await post("/start", { ...start, goal: "continue" })).status).toBe(400);
+    expect((await post("/start", { goal: "diamond" })).status).toBe(400);
+    expect((await post("/start", { ...start, strategy: "auto" })).status).toBe(400);
+    expect((await post("/start", { ...start, display: ":0" })).status).toBe(400);
+    expect((await post("/start", { ...start, strategy: "terra", model: "gpt-6-luna" })).status).toBe(400);
     expect((await post("/stop", { pid: 1 })).status).toBe(400);
     expect((await get("/video?upstream=http://localhost")).status).toBe(400);
     expect((await get("/video?run=old")).status).toBe(409);
 
-    const lane = path.join(f.owners.directory, "local/survival-pilot");
+    const lane = path.join(f.owners.directory, "local/survival-agent");
     mkdirSync(lane, { recursive: true });
     const lock = path.join(lane, "owner.sqlite");
     const external = new Database(lock, { create: true });
     try {
       external.run("BEGIN IMMEDIATE");
-      const refused = await post("/start", { goal: "diamond" });
+      const refused = await post("/start", start);
       expect(refused.status).toBe(409);
       expect(await refused.json()).toMatchObject({ error: { code: "busy" } });
       expect((await post("/stop", {})).status).toBe(200);
@@ -246,10 +251,26 @@ test("pilot controls enforce the local session, strict input and the independent
     const state = f.owners.minecraft.snapshot();
     const running = spyOn(f.owners.minecraft, "snapshot").mockReturnValue({ ...state, status: "running" });
     try {
-      const refused = await post("/start", { goal: "diamond" });
+      const refused = await post("/start", { ...start, strategy: "terra" });
       expect(refused.status).toBe(409);
       expect(await refused.json()).toMatchObject({ error: { code: "busy", message: expect.stringContaining("model run") } });
     } finally { running.mockRestore(); }
+
+    // This project root has no EULA consent or agent jar. Real prerequisite checks
+    // end both requests before starting Minecraft or authorizing a provider call.
+    for (const [strategy, model] of [["deterministic", null], ["terra", "gpt-6.1-terra"]] as const) {
+      const accepted = await post("/start", { ...start, strategy });
+      expect(accepted.status).toBe(202);
+      const selected = { goal: "diamond", strategy, model, strategyOutcome: null, run: null, won: null };
+      expect(await accepted.json()).toMatchObject({ ...selected, phase: "starting" });
+      const deadline = performance.now() + 1000;
+      let final: { phase?: string };
+      do {
+        final = await (await get()).json() as { phase?: string };
+        if (final.phase !== "ended") await Bun.sleep(10);
+      } while (final.phase !== "ended" && performance.now() < deadline);
+      expect(final).toMatchObject({ ...selected, phase: "ended" });
+    }
   } finally {
     minecraftInitialize.mockRestore();
     try { if (app) await app.close(); else await f.closeUntransferred(); } finally { f.removeDirectory(); }

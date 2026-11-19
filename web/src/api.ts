@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { SURVIVAL_PILOT_GOALS, type SurvivalPilotGoal, type SurvivalPilotSnapshot } from "../../src/shared/survival-pilot-ui.ts";
+import { SURVIVAL_AGENT_GOALS, SURVIVAL_AGENT_STRATEGIES, SURVIVAL_AGENT_STRATEGY_OUTCOMES, TERRA_MODEL_ID,
+  type SurvivalAgentSnapshot, type SurvivalAgentStart } from "../../src/shared/survival-agent-ui.ts";
 import type {
   ActivityEvent,
   AppSnapshot,
@@ -529,30 +530,34 @@ export async function mutate(path: string, body: unknown = {}): Promise<void> {
   await request(path, body);
 }
 
-const pilotSnapshot: z.ZodType<SurvivalPilotSnapshot> = z.object({
+const survivalAgentSnapshot: z.ZodType<SurvivalAgentSnapshot> = z.object({
   phase: z.enum(["idle", "starting", "playing", "stopping", "ended"]),
-  goal: z.enum(SURVIVAL_PILOT_GOALS).nullable(),
+  goal: z.enum(SURVIVAL_AGENT_GOALS).nullable(),
+  strategy: z.enum(SURVIVAL_AGENT_STRATEGIES).nullable(),
+  model: z.literal(TERRA_MODEL_ID).nullable(),
+  strategyOutcome: z.enum(SURVIVAL_AGENT_STRATEGY_OUTCOMES).nullable(),
   status: z.string(), won: z.boolean().nullable(), run: nullableText,
   elapsedMs: z.number().nonnegative(), health: z.number().nullable(), food: z.number().nullable(),
+  deaths: z.number().int().nonnegative().nullable(),
 });
 
-function pilotResponse(value: unknown): SurvivalPilotSnapshot {
-  const parsed = pilotSnapshot.safeParse(value);
+function survivalAgentResponse(value: unknown): SurvivalAgentSnapshot {
+  const parsed = survivalAgentSnapshot.safeParse(value);
   if (!parsed.success)
-    throw new ApiError("Survival Pilot status could not be read. Check status before starting again.", 0, "invalid_pilot");
+    throw new ApiError("Minecraft Survival Agent status could not be read. Check status before starting again.", 0, "invalid_agent");
   return parsed.data;
 }
 
-export async function fetchSurvivalPilot(signal: AbortSignal): Promise<SurvivalPilotSnapshot> {
-  return pilotResponse(await request("/v1/survival-pilot", undefined, undefined, signal));
+export async function fetchSurvivalAgent(signal: AbortSignal): Promise<SurvivalAgentSnapshot> {
+  return survivalAgentResponse(await request("/v1/survival-agent", undefined, undefined, signal));
 }
 
-export async function startSurvivalPilot(goal: SurvivalPilotGoal): Promise<SurvivalPilotSnapshot> {
-  return pilotResponse(await request("/v1/survival-pilot/start", { goal }));
+export async function startSurvivalAgent(input: SurvivalAgentStart): Promise<SurvivalAgentSnapshot> {
+  return survivalAgentResponse(await request("/v1/survival-agent/start", input));
 }
 
-export async function stopSurvivalPilot(): Promise<SurvivalPilotSnapshot> {
-  return pilotResponse(await request("/v1/survival-pilot/stop", {}));
+export async function stopSurvivalAgent(): Promise<SurvivalAgentSnapshot> {
+  return survivalAgentResponse(await request("/v1/survival-agent/stop", {}));
 }
 
 function preparationResponse(value: unknown): PreparedStartView {

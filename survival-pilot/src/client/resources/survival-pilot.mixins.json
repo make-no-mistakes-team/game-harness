@@ -1,7 +1,0 @@
-{
-  "required": true,
-  "package": "io.gameharness.pilot.mixin",
-  "compatibilityLevel": "JAVA_21",
-  "client": ["PilotRenderMixin", "PilotHandledScreenAccess", "PilotMouseAccess", "PilotCraftScreenMixin"],
-  "injectors": { "defaultRequire": 1 }
-}

@@ -66,12 +66,21 @@ joins and advances normally afterward.
 The starting hotbar contains one water bucket, flint and steel, a stone
 pickaxe, 64 cobblestone and 8 cooked beef. There is no diamond, obsidian,
 portal frame or mold at the start. All setup ends before the client joins;
-the same pilot handles casting, lighting and entry. A win requires ten
-distinct cast frame blocks, entry into the Nether and corroborating vanilla
-statistics. The default live view stays on ordinary runs. For the diagnostic,
+the same pilot handles casting, lighting and entry. At the four-block lava
+edge, water cools two frame blocks in place. The pilot pours the other eight
+with the same bucket, recovers its water and lights the frame. A win requires
+all ten positions, arrival in the Nether and corroborating vanilla statistics.
+The default live view stays on ordinary runs. For the diagnostic,
 run `bun survival-pilot/watch.ts --diagnostic` and open
 `http://127.0.0.1:4382/`, or play `screen.mp4` from the printed attempt
 directory. Diagnostic worlds cannot be used with `--continue-from`.
+
+The same diagnostic stream can show individual descent trials. Use
+`bun run play:pilot --diagnostic-descent water 180` to test a bucket landing
+when the floor drops away, or `bun run play:pilot --diagnostic-descent cave 180`
+to test whether the pilot walks into a lit chamber and down its shelves.
+Only one diagnostic runs at a time. The terrain and supplies are prepared;
+these runs do not test finding a cave or making a bucket in a random world.
 
 The standalone pilot makes no model calls and does not accept free-form tasks.
 The desktop application's model-driven path is described below.

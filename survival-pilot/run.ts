@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
-import { access, appendFile, mkdir, mkdtemp, open, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { access, appendFile, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -19,6 +19,7 @@ const LIVE = path.join(PILOT_LOCAL, "live.json");
 const SERVER_JAR = path.join(RUNTIME, "minecraft/server-1.21.4.jar");
 const PILOT_JAR = path.join(import.meta.dir, "build/libs/survival-pilot-1.0.jar");
 const GOALS = ["wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond"] as const;
+const RUN_BASENAME = new RegExp(`^\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}\\.\\d{3}Z-(?:${GOALS.join("|")})-[A-Za-z0-9]{6}$`);
 const DEFAULT_SECONDS = 900;
 const MAX_SECONDS = Math.floor(2_147_483_647 / 1_000);
 const SIZE = "1280x720";
@@ -32,6 +33,7 @@ type Goal = (typeof GOALS)[number];
 type Exit = { code: number | null; signal: NodeJS.Signals | null };
 type Owned = { child: ChildProcess; closed: Promise<Exit>; exit?: Exit };
 type Progress = {
+  failure?: string;
   tick: number;
   goal: string;
   status: string;
@@ -43,18 +45,20 @@ type Progress = {
   z: number;
   health: number;
 };
-type Status = "won" | "died" | "startup_limit" | "wall_limit" | "heartbeat_lost" |
-  "stalled" | "goal_stalled" | "storage_limit" | "recording_limit" | "interrupted" |
-  "server_exit" | "client_exit" | "recorder_exit" | "unverified" | "failed";
+const STATUSES = ["won", "died", "startup_limit", "wall_limit", "heartbeat_lost",
+  "stalled", "goal_stalled", "storage_limit", "recording_limit", "interrupted",
+  "server_exit", "client_exit", "recorder_exit", "unverified", "failed"] as const;
+type Status = (typeof STATUSES)[number];
 
 class Stop extends Error {
   constructor(readonly status: Status, message: string) { super(message); }
 }
 
-const usage = `Usage: xvfb-run -a -s '-screen 0 ${SIZE}x24' bun survival-pilot/run.ts GOAL [SECONDS]
+const usage = `Usage: xvfb-run -a -s '-screen 0 ${SIZE}x24' bun survival-pilot/run.ts GOAL [SECONDS [--continue-from RUN_BASENAME]]
 
 GOAL: ${GOALS.join(" | ")}
 SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SECONDS}).
+--continue-from: copy a closed, recorded, non-winning pilot world for the same goal.
 
 Build survival-pilot-1.0.jar first. Requires Java 21, ffmpeg, existing local EULA
 consent, and a signed-in official Launcher with Minecraft 1.21.4 installed.
@@ -62,14 +66,15 @@ Without JAVA_HOME, the runner prefers the system OpenJDK 21 installation.
 Only a confirmed goal exits 0. Artifacts and outcome JSON go in the printed run directory.`;
 
 function parseArgs(args: string[]) {
-  const [rawGoal, rawSeconds = String(DEFAULT_SECONDS)] = args;
+  const [rawGoal, rawSeconds = String(DEFAULT_SECONDS), flag, parentRun] = args;
   const goal = GOALS.find((item) => item === rawGoal);
   const seconds = Number(rawSeconds);
-  if (!goal || args.length > 2 || !/^\d+$/.test(rawSeconds) ||
+  if (!goal || (args.length > 2 && (args.length !== 4 || flag !== "--continue-from" ||
+      !parentRun || !RUN_BASENAME.test(parentRun))) || !/^\d+$/.test(rawSeconds) ||
       !Number.isSafeInteger(seconds) || seconds < 1 || seconds > MAX_SECONDS) {
     throw new Error(usage);
   }
-  return { goal, seconds };
+  return { goal, seconds, parentRun };
 }
 
 async function isolatedDisplay() {
@@ -192,6 +197,101 @@ async function diskBytes(dir: string, signal?: AbortSignal): Promise<number> {
   return bytes;
 }
 
+async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
+  const root = path.join(RUNS, parentRun);
+  const server = path.join(root, "server");
+  const world = path.join(server, "world");
+  const invalid = () => new Error(`Cannot continue from ${parentRun}: expected a closed, recorded pilot attempt for ${goal} with a clean save and no win.`);
+  try {
+    const uid = process.getuid?.();
+    const runs = await lstat(RUNS);
+    if (!runs.isDirectory() || runs.uid !== uid) throw invalid();
+    const device = runs.dev;
+    for (const dir of [root, server, world, path.join(world, "region")]) {
+      signal.throwIfAborted();
+      const entry = await lstat(dir);
+      if (!entry.isDirectory() || entry.dev !== device || entry.uid !== uid ||
+          (dir === root && (entry.mode & 0o077))) throw invalid();
+    }
+    const regular = async (file: string) => {
+      signal.throwIfAborted();
+      const entry = await lstat(file);
+      if (!entry.isFile() || entry.nlink !== 1 || entry.dev !== device || entry.uid !== uid || !entry.size) throw invalid();
+      return entry;
+    };
+    const readRecord = async (name: string) => {
+      const file = path.join(root, name);
+      const entry = await regular(file);
+      if (entry.size > 64_000) throw invalid();
+      return JSON.parse(await readFile(file, { encoding: "utf8", flag: constants.O_RDONLY | constants.O_NOFOLLOW, signal }));
+    };
+    const declaration = await readRecord("declaration.json");
+    const outcome = await readRecord("outcome.json");
+    const time = (value: unknown) => typeof value === "string" && Number.isFinite(Date.parse(value));
+    const worldProof = declaration?.world;
+    // Older fresh attempts recorded the world only in the declaration.
+    const fresh = worldProof?.fresh === true && worldProof.seed === "random" &&
+      (!outcome?.world || outcome.world.fresh === true);
+    const continued = worldProof?.fresh === false && typeof worldProof.parentRun === "string" &&
+      RUN_BASENAME.test(worldProof.parentRun) && outcome?.world?.fresh === false &&
+      outcome.world.parentRun === worldProof.parentRun;
+    if (declaration?.schemaVersion !== 1 || declaration.goal !== goal || declaration.minecraftVersion !== "1.21.4" ||
+        typeof declaration.pilotJarSha256 !== "string" || !/^[a-f0-9]{64}$/.test(declaration.pilotJarSha256) ||
+        declaration.connection?.host !== "127.0.0.1" ||
+        declaration.connection?.auth !== "host-verified-official-launcher" || declaration.recording?.file !== "screen.mp4" ||
+        worldProof?.type !== "vanilla" || worldProof.mode !== "survival" || worldProof.difficulty !== "normal" ||
+        !(fresh || continued) ||
+        outcome?.schemaVersion !== 1 || outcome.goal !== goal || !time(declaration.startedAt) ||
+        outcome.startedAt !== declaration.startedAt || !time(outcome.finishedAt) ||
+        !STATUSES.includes(outcome.status) || outcome.status === "won" ||
+        outcome.exits?.server?.code !== 0 || outcome.exits.server.signal !== null) throw invalid();
+    // An attempt that joined must have the vanilla player save directories.
+    if (outcome.progress !== null) {
+      for (const child of ["playerdata", "stats"]) {
+        const entry = await lstat(path.join(world, child));
+        if (!entry.isDirectory() || entry.dev !== device || entry.uid !== uid) throw invalid();
+      }
+    }
+    const history = path.join(root, "history.jsonl");
+    const { size } = await regular(history);
+    const file = await open(history, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const tail = Buffer.alloc(Math.min(size, 4_096));
+      const { bytesRead } = await file.read(tail, 0, tail.length, size - tail.length);
+      const text = tail.toString("utf8", 0, bytesRead);
+      if (bytesRead !== tail.length || !text.endsWith("\n")) throw invalid();
+      const closed = JSON.parse(text.slice(text.lastIndexOf("\n", text.length - 2) + 1, -1));
+      if (closed?.event !== "closed" || closed.status !== outcome.status || !time(closed.at)) throw invalid();
+    } finally { await file.close(); }
+    await regular(path.join(root, "screen.mp4"));
+    await regular(path.join(world, "level.dat"));
+    await regular(path.join(world, "session.lock"));
+    return { world, device };
+  } catch {
+    signal.throwIfAborted();
+    throw invalid();
+  }
+}
+
+async function checkWorldTree(world: string, device: number, budget: number, signal: AbortSignal) {
+  const uid = process.getuid?.();
+  let bytes = 0;
+  async function check(file: string) {
+    signal.throwIfAborted();
+    const entry = await lstat(file);
+    if (entry.dev !== device || entry.uid !== uid ||
+        !(entry.isDirectory() || file !== world && entry.isFile() && entry.nlink === 1)) {
+      throw new Stop("failed", "Saved world must contain only owned directories and regular files with no hard links.");
+    }
+    bytes += Math.max(entry.blocks * 512, entry.size);
+    if (bytes >= budget) throw new Stop("storage_limit", "Saved world would exceed the run storage stop threshold.");
+    if (entry.isDirectory()) {
+      for (const child of await readdir(file)) await check(path.join(file, child));
+    }
+  }
+  await check(world);
+}
+
 async function readProgress(file: string): Promise<Progress | null> {
   let text: string;
   try { text = await readFile(file, "utf8"); }
@@ -264,11 +364,13 @@ function goalMilestones(goal: Goal, progress: Progress, highWater: Map<string, n
   return changes;
 }
 
-async function run(goal: Goal, seconds: number) {
+async function run(goal: Goal, seconds: number, parentRun?: string) {
   const display = await isolatedDisplay();
   const { java, ffmpeg } = await verifyInputs();
   const videoBytes = 32_000_000 + seconds * 600_000;
   const reserveBytes = videoBytes + 1_000_000_000;
+  const storageStopBytes = reserveBytes - DRAIN_HEADROOM;
+  const copyStopBytes = storageStopBytes - videoBytes;
   const controller = new AbortController();
   const signal = controller.signal;
   const abort = (status: Status, message: string) => controller.abort(new Stop(status, message));
@@ -286,6 +388,7 @@ async function run(goal: Goal, seconds: number) {
     release = await admitRun(reserveBytes);
     signal.throwIfAborted();
     await mkdir(RUNS, { recursive: true, mode: 0o700 });
+    const source = parentRun ? await savedWorld(parentRun, goal, signal) : null;
     const dir = await mkdtemp(path.join(RUNS, `${new Date().toISOString().replaceAll(":", "-")}-${goal}-`));
     console.log(dir);
     const startedAt = new Date().toISOString();
@@ -299,6 +402,10 @@ async function run(goal: Goal, seconds: number) {
     const progressFile = path.join(dir, "progress.json");
     const video = path.join(dir, "screen.mp4");
     const live = { run: path.basename(dir), ...display };
+    const world = {
+      type: "vanilla", mode: "survival", difficulty: "normal",
+      ...(parentRun ? { fresh: false, parentRun } : { fresh: true, seed: "random" }),
+    };
     let declared = false;
     let stage = "declaration";
     let server: Owned | undefined;
@@ -318,7 +425,7 @@ async function run(goal: Goal, seconds: number) {
       const port = await loopbackPort();
       await privateJson(path.join(dir, "declaration.json"), {
         schemaVersion: 1, startedAt, goal, minecraftVersion: "1.21.4", pilotJarSha256,
-        world: { type: "vanilla", mode: "survival", difficulty: "normal", fresh: true, seed: "random" },
+        world,
         connection: { host: "127.0.0.1", port, auth: "host-verified-official-launcher" },
         limits: {
           wallSeconds: seconds, startupMs: STARTUP_MS, heartbeatMs: HEARTBEAT_MS,
@@ -334,7 +441,7 @@ async function run(goal: Goal, seconds: number) {
       meter = (async () => {
         while (!signal.aborted) {
           measuredBytes = await diskBytes(dir, signal);
-          if (measuredBytes >= reserveBytes - DRAIN_HEADROOM) {
+          if (measuredBytes >= (stage === "world_copy" ? copyStopBytes : storageStopBytes)) {
             abort("storage_limit", "Run reached its storage stop threshold.");
             return;
           }
@@ -343,9 +450,29 @@ async function run(goal: Goal, seconds: number) {
       })().catch(() => {
         if (!signal.aborted) abort("failed", "Could not measure run storage.");
       });
-      stage = "server_startup";
+      stage = source ? "world_copy" : "server_startup";
       const worldDir = path.join(dir, "server");
       await mkdir(worldDir, { mode: 0o700 });
+      if (source) {
+        const destination = path.join(worldDir, "world");
+        const bytesBefore = await diskBytes(dir, startup);
+        await checkWorldTree(source.world, source.device, copyStopBytes - bytesBefore, startup);
+        startup.throwIfAborted();
+        // Reflink when supported, otherwise copy. Never follow links or share writable inodes.
+        const copier = own(spawn("cp", [
+          "--recursive", "--no-dereference", "--reflink=auto", "--preserve=mode,timestamps",
+          "--", source.world, destination,
+        ], { env, signal: startup, stdio: "ignore" }));
+        const exit = await copier.closed;
+        startup.throwIfAborted();
+        if (exit.code !== 0) throw new Stop("failed", "Could not copy the saved pilot world.");
+        await checkWorldTree(destination, source.device, copyStopBytes - bytesBefore, startup);
+        measuredBytes = await diskBytes(dir, startup);
+        if (measuredBytes >= copyStopBytes)
+          throw new Stop("storage_limit", "Saved world would exceed the run storage stop threshold.");
+        await record("world_copied", { parentRun });
+        stage = "server_startup";
+      }
       const serverTmp = path.join(worldDir, "tmp");
       await mkdir(serverTmp, { mode: 0o700 });
       await writeFile(path.join(worldDir, "eula.txt"), "eula=true\n");
@@ -438,7 +565,7 @@ async function run(goal: Goal, seconds: number) {
           if (!lastProgress || progress.tick !== lastProgress.tick) {
             tickAt = now;
             const milestones = goalMilestones(goal, progress, highWater);
-            if (Object.keys(milestones).length) {
+            if ((lastProgress || !source) && Object.keys(milestones).length) {
               goalChangedAt = now;
               await record("goal_progress", { tick: progress.tick, milestones });
             }
@@ -453,6 +580,7 @@ async function run(goal: Goal, seconds: number) {
             throw new Stop("won", `Pilot obtained ${goal}.`);
           }
           if (!progress.alive) throw new Stop("died", "The pilot died before obtaining the goal.");
+          if (typeof progress.failure === "string") throw new Stop("stalled", progress.failure);
         }
         if (client.exit) throw new Stop("client_exit", "Minecraft client exited before reporting success.");
         if (!lastProgress && startup.aborted) {
@@ -511,9 +639,10 @@ async function run(goal: Goal, seconds: number) {
           result = new Stop("storage_limit", "Final artifacts exceeded the run reservation.");
       }
       const outcome = {
-        schemaVersion: 1, status: result.status, reason: result.message, goal, startedAt,
+        schemaVersion: 1, status: result.status, reason: result.message, goal, startedAt, world,
         finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - start),
-        finalStage: stage, reservedBytes: reserveBytes, measuredBytes, progress: lastProgress, verification,
+        finalStage: stage, reservedBytes: reserveBytes, measuredBytes, progress: lastProgress,
+        verification: verification && parentRun ? { ...verification, scope: "continuation-chain" } : verification,
         exits: { server: server?.exit ?? null, client: client?.exit ?? null, recorder: recorder?.exit ?? null },
         clientDiagnostics: [...(diagnostics ?? [])],
       };
@@ -533,9 +662,9 @@ try {
   const args = process.argv.slice(2);
   if (args.length === 1 && args[0] === "--help") console.log(usage);
   else {
-    const { goal, seconds } = parseArgs(args);
+    const { goal, seconds, parentRun } = parseArgs(args);
     process.umask(0o077);
-    process.exitCode = await run(goal, seconds);
+    process.exitCode = await run(goal, seconds, parentRun);
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : "Run failed.");

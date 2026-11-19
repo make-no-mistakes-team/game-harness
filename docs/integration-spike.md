@@ -14,7 +14,7 @@ bun run build:pilot
 bun run play:pilot diamond 1800
 ```
 
-The final argument is this attempt's wall time in seconds, including startup.
+The seconds argument sets this attempt's wall time, including startup.
 Other item goals are `wooden_pickaxe`, `stone_pickaxe`, and `iron_pickaxe`.
 The runner prints the private attempt directory. Open `screen.mp4` there to
 watch the actual client, including the inventory pointer. `outcome.json`
@@ -22,6 +22,23 @@ records why the attempt ended. For a diamond win, the live inventory must
 contain a diamond and the saved vanilla statistics must show both ore mined
 and a diamond picked up. The runner checks those statistics after the world
 closes; the player does not receive them.
+
+To debug later stages without replaying progress, keep the same official
+Launcher profile and pass the basename of a previous pilot attempt:
+
+```sh
+bun run play:pilot diamond 1800 --continue-from "$RUN_BASENAME"
+```
+
+The parent must be a recorded attempt under `local/survival-pilot/runs` for
+the same goal. Its records must show a closed, non-winning attempt and a
+clean server exit. The runner accepts no external world path. It copies the
+saved vanilla world, including player inventory and statistics, into a new
+attempt directory before starting a new server and recording. It does not
+inspect the seed or map. The declaration and outcome mark the new attempt
+as `world.fresh: false` and name its `world.parentRun`. Saved statistics can
+corroborate progress anywhere in that chain; a continued win is not evidence
+of an uninterrupted fresh run. Omit the flag for the fresh-world benchmark.
 
 To watch as it plays, run `bun run watch:pilot` in a second terminal and open
 `http://127.0.0.1:4379/` on the same computer. Leave the tab open between

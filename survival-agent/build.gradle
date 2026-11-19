@@ -17,7 +17,17 @@ loom {
 java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
 tasks.withType(JavaCompile).configureEach { options.release = 21 }
 
-dependencies { testImplementation sourceSets.client.output }
+dependencies {
+    testImplementation sourceSets.client.output
+    testImplementation 'net.fabricmc:fabric-loader-junit:0.16.10'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+tasks.named('test') {
+    useJUnitPlatform()
+    // Load the named vanilla classes through Fabric's test launcher, not bare Java.
+    classpath += sourceSets.client.runtimeClasspath
+}
+
 def dryRouteGraphProof = tasks.register('dryRouteGraphProof', JavaExec) {
     group = 'verification'
     description = 'Runs the standalone observed dry-route graph behavior proofs.'

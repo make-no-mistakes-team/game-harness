@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { access, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { reviewPauseJournal } from "../survival-agent/pause-evidence.ts";
@@ -9,7 +9,7 @@ import {
 } from "../src/server/survival-macro/bootstrap.ts";
 import { composeTerraSurvival, declareTerraStrategy } from "../src/server/survival-macro/compose.ts";
 import { SurvivalMacroController } from "../src/server/survival-macro/controller.ts";
-import type { MacroObservation, MacroOpportunity } from "../src/server/survival-macro/protocol.ts";
+import { parseMacroWorkOrder, type MacroObservation, type MacroOpportunity, type MacroReceipt } from "../src/server/survival-macro/protocol.ts";
 import { TERRA_MODEL_ID } from "../src/shared/survival-agent-ui.ts";
 
 const GOAL = "stone_pickaxe";
@@ -128,6 +128,7 @@ test("stone is bound to cobblestone only when seen as an actually harvestable ex
 
 const reserveLog = { item: "minecraft:spruce_log", count: 1 };
 const boundSource = { kind: "bound_source" } as const;
+const boundPlanks = { kind: "bound_planks" } as const;
 const boundReserve = { item: boundSource, count: 1 } as const;
 const recipe = offer("recipe", "continue", "recipe:planks", { [reserveLog.item]: 1 });
 const stocked = {
@@ -135,6 +136,119 @@ const stocked = {
   requires: [{ ...reserveLog, count: 2 }],
 } as const;
 const alternatives = { ...planks, reserves: [reserveLog], branches: [stocked, plankBranch] } as const;
+
+function stockStage(item: string | typeof boundPlanks, count: number, requires: readonly unknown[],
+  allowedEffects: readonly unknown[], costCaps: readonly unknown[], reserves: readonly unknown[],
+  maxCrafts: number, maxPlacements = 0) {
+  return { requires, policy: { target: { kind: "stock", item, count }, allowedEffects, costCaps, reserves,
+    maxBreaks: 0, maxCrafts, maxPlacements } };
+}
+
+const timberProgram = {
+  kind: "first_policy", reserves: [boundReserve],
+  branches: [{
+    policy: { kind: "harvest_stock", resource: "witnessed_log", count: 4, maxBreaks: 4 }, requires: [],
+    then: [
+      stockStage(boundPlanks, 12, [{ item: boundSource, count: 4 }], [{ kind: "craft_bound_planks" }],
+        [{ item: boundSource, count: 3 }], [{ item: boundPlanks, count: 4 }], 3),
+      stockStage("minecraft:wooden_axe", 1, [{ item: boundPlanks, count: 12 }],
+        ["craft:wooden_axe", "craft:stick", "craft:crafting_table", "place:minecraft:crafting_table"],
+        [{ item: boundPlanks, count: 8 }, { item: "minecraft:stick", count: 2 }, { item: "minecraft:crafting_table", count: 1 }],
+        [], 3, 1),
+    ],
+  }],
+} as const;
+
+function openingAdvice(advice: unknown) {
+  const parsed = parseFirstPlanToolArguments(JSON.stringify({ advice }));
+  if (!parsed) throw new Error("Invalid opening fixture.");
+  return parsed;
+}
+
+test("one conditional timber program resolves exact stock and craft references for different actual species", () => {
+  const advice = openingAdvice(timberProgram);
+  for (const [source, output, visible] of [
+    ["minecraft:spruce_log", "minecraft:spruce_planks", spruce],
+    ["minecraft:birch_log", "minecraft:birch_planks", birch],
+  ] as const) {
+    expect(bindFirstPlan(request, advice, view({ opportunities: [visible] }), liveScope)).toMatchObject({
+      input: source,
+      then: [
+        { requires: [{ item: source, count: 4 }], policy: {
+          target: { item: output, count: 12 }, costCaps: [{ item: source, count: 3 }],
+          allowedEffects: [`craft:${output.split(":")[1]}`], maxCrafts: 3,
+        } },
+        { requires: [{ item: output, count: 12 }], policy: {
+          target: { item: "minecraft:wooden_axe", count: 1 },
+          reserves: expect.arrayContaining([{ item: source, count: 1 }, { item: output, count: 4 }]),
+        } },
+      ],
+    });
+  }
+  expect(bindFirstPlan(request, advice, view({ opportunities: [spruce, birch] }), liveScope)).toEqual({
+    reason: "ambiguous_material_binding",
+  });
+});
+
+test("conditional stock references resolve to coal or cobblestone, not speculative block IDs or planks", () => {
+  for (const [source, block, target] of [
+    ["minecraft:coal", "minecraft:deepslate_coal_ore", "minecraft:torch"],
+    ["minecraft:cobblestone", "minecraft:stone", "minecraft:stone_shovel"],
+  ] as const) {
+    const first = { policy: { kind: "harvest_stock", resource: source, count: 2, maxBreaks: 2 }, requires: [] };
+    const visible = view({ opportunities: [offer("face", "break", `block:${block}`)] });
+    const stage = stockStage(target, 1, [{ item: boundSource, count: 2 }], [`craft:${target.slice(10)}`],
+      [{ item: boundSource, count: 1 }, { item: "minecraft:stick", count: 2 }], [], 1);
+    const plan = openingAdvice({ kind: "first_policy", reserves: [boundReserve], branches: [{ ...first, then: [stage] }] });
+    const rich = { ...visible, inventory: { [source]: 1 } };
+    expect(bindFirstPlan(request, plan, rich, { ...liveScope, first: rich })).toMatchObject({
+      input: source, then: [{ requires: [{ item: source, count: 2 }], policy: { reserves: [{ item: source, count: 1 }],
+        costCaps: expect.arrayContaining([{ item: source, count: 1 }]) } }],
+    });
+    const nonTimberPlanks = openingAdvice({ kind: "first_policy", reserves: [],
+      branches: [{ ...first, then: [timberProgram.branches[0].then[0]] }] });
+    expect(bindFirstPlan(request, nonTimberPlanks, visible, { ...liveScope, first: visible })).toEqual({
+      reason: "invalid_conditional_program",
+    });
+  }
+});
+
+test("follow-through cannot declare a false trigger, extra stage, invented effect, or lower protected floor", () => {
+  const branch = timberProgram.branches[0];
+  const [craft, goal] = branch.then;
+  for (const then of [
+    [], [craft, goal, goal], [{ ...craft, requires: [] }],
+    [{ ...craft, requires: [{ item: boundSource, count: 0 }] }],
+    [{ ...craft, policy: { ...craft.policy, allowedEffects: ["craft:smelt_iron_ingot"] } }],
+    [{ ...craft, policy: { ...craft.policy, allowedEffects: ["break:minecraft:stone"], maxBreaks: 1 } }],
+    [{ ...craft, policy: { ...craft.policy, target: { ...craft.policy.target, pos: [0, 64, 0] } } }],
+  ]) expect(parseFirstPlanToolArguments(JSON.stringify({ advice: {
+    ...timberProgram, branches: [{ ...branch, then }],
+  } }))).toBeNull();
+
+  for (const policy of [
+    { ...goal.policy, reserves: [{ item: boundPlanks, count: 3 }] },
+    { ...goal.policy, reserves: [{ item: boundSource, count: 2 }] },
+    { ...goal.policy, maxCrafts: 64 },
+  ]) expect(bindFirstPlan(request, openingAdvice({ ...timberProgram, branches: [{ ...branch, then: [craft, { ...goal, policy }] }] }),
+    view({ opportunities: [birch] }), liveScope)).toEqual({ reason: "invalid_conditional_program" });
+});
+
+test("an ordinary opening does not gather a prefix just to remake retained gear", () => {
+  const gather = timberProgram.branches[0];
+  const [craft, finish] = gather.then;
+  const retained = { ...gather, then: [{ ...craft, policy: { ...craft.policy, reserves: [] } }, finish] };
+  const seen = view({ opportunities: [birch], inventory: { "minecraft:wooden_axe": 1 } });
+  const scope = { ...liveScope, first: seen };
+  const first = { kind: "first_policy", reserves: [], branches: [retained] };
+  expect(bindFirstPlan(request, openingAdvice(first), seen, scope)).toEqual({ reason: "opening_target_already_held" });
+  expect(bindFirstPlan(request, openingAdvice({ ...first, branches: [retained, plankBranch] }), seen, scope))
+    .toMatchObject({ branchIndex: 1 });
+  expect(bindFirstPlan({ ...request, objective: "Gather supplies as well as an axe" }, openingAdvice(first), seen, scope))
+    .toMatchObject({ branchIndex: 0 });
+  expect(bindFirstPlan(request, openingAdvice({ ...first, branches: [gather] }), seen, scope))
+    .toMatchObject({ branchIndex: 0 }); // An unfulfilled explicit floor is still work.
+});
 
 test("alternatives bind at most one prioritized branch, never weaken a missing prerequisite or borrow its effects", () => {
   const state = view({ inventory: { [reserveLog.item]: 1 }, opportunities: [spruce, recipe] });
@@ -346,8 +460,14 @@ async function fixture(infer: FirstPlanStrategist, signal?: AbortSignal, maxRequ
   async function log(name: string) {
     return (await readFile(file(name), "utf8")).trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
   }
+  async function receipt(id: string, tick: number, status: MacroReceipt["status"]) {
+    await appendFile(file("native-receipts.jsonl"), `${JSON.stringify({
+      v: 1, run, life: 1, id, tick, status, detail: status,
+    })}\n`, { mode: 0o600 });
+  }
+  const order = async () => parseMacroWorkOrder(JSON.parse(await readFile(file("work.json"), "utf8")));
   await controller.start();
-  return { controller, observe, log, file, liveCalls: () => liveCalls, close: async () => {
+  return { controller, observe, log, file, order, receipt, liveCalls: () => liveCalls, close: async () => {
     try { await controller.stop(); } finally { await rm(dir, { recursive: true, force: true }); }
   } };
 }
@@ -379,6 +499,169 @@ test("one paid startup request uses the existing quota and publishes only after 
     reply.resolve(result(null, "cancelled"));
     await f.close();
   }
+});
+
+test("one paid opening completes three ordinary jobs with exact native receipts and an adjacent personal GUI handoff", async () => {
+  const cobble = { item: "minecraft:cobblestone", count: 3 };
+  const held = { [cobble.item]: cobble.count };
+  const [gather] = timberProgram.branches;
+  const finish = stockStage(`minecraft:${GOAL}`, 1, [{ item: boundPlanks, count: 10 }, cobble],
+    [`craft:${GOAL}`, "craft:stick", "craft:crafting_table", "place:minecraft:crafting_table"],
+    [cobble, { item: "minecraft:stick", count: 2 }, { item: boundPlanks, count: 6 }, { item: "minecraft:crafting_table", count: 1 }],
+    [], 3, 1);
+  const advice = openingAdvice({ ...timberProgram, branches: [
+    { ...gather, policy: { ...gather.policy, resource: "minecraft:acacia_log" }, requires: [cobble], then: [gather.then[0], finish] },
+    { ...gather, requires: [cobble], then: [gather.then[0], finish] },
+  ] });
+  const f = await fixture(async () => result(advice), undefined, 2);
+  try {
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    await f.observe({ inventory: held, opportunities: [birch] });
+    const first = await f.order();
+    const log = "minecraft:birch_log", plank = "minecraft:birch_planks";
+    expect(first).toMatchObject({ target: { item: log, count: 4 }, allowedEffects: [`break:${log}`] });
+    await f.receipt(first.id, 6, "accepted");
+    await f.observe({ tick: 39, inventory: { ...held, [log]: 3 }, workOrder: {
+      id: first.id, state: "needs_replan", detail: "Gather active",
+      progress: { phase: "harvest", status: "Breaking", breaks: 3, crafts: 0, placements: 0,
+        lastEffect: { tick: 38, detail: "Collected a log" }, replan: "target_near" },
+    } });
+    expect(f.liveCalls()).toBe(0); // The authorized successor already answers this early replan signal.
+    await f.receipt(first.id, 40, "completed");
+    await f.controller.poll(); // The journal alone never makes projected stock live.
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    await f.observe({ tick: 40, epoch: 2, inventory: { ...held, [log]: 4 }, workOrder: {
+      id: first.id, state: "complete", detail: "Confirmed logs",
+    } });
+    const second = await f.order();
+    expect(second).toMatchObject({ id: first.nextWorkId!, expiresTick: first.expiresTick,
+      target: { item: plank, count: 12 }, allowedEffects: ["craft:birch_planks"] });
+    await f.receipt(second.id, 41, "accepted");
+    await f.receipt(second.id, 60, "completed");
+    await f.observe({ tick: 60, epoch: 3, inventory: { ...held, [log]: 1, [plank]: 12 }, quiescent: false, workOrder: {
+      id: second.id, state: "complete", detail: "Confirmed personal inventory craft",
+    } });
+    const third = await f.order();
+    expect(third).toMatchObject({ id: second.nextWorkId!, expiresTick: first.expiresTick,
+      target: { item: `minecraft:${GOAL}`, count: 1 },
+      reserves: [{ item: log, count: 1 }, { item: plank, count: 4 }],
+    });
+    expect(third.nextWorkId).toBeUndefined();
+    await f.receipt(third.id, 61, "accepted");
+    await f.receipt(third.id, 80, "completed");
+    await f.observe({ tick: 80, epoch: 4,
+      inventory: { [log]: 1, [plank]: 6, "minecraft:stick": 2, [`minecraft:${GOAL}`]: 1 },
+      workOrder: { id: third.id, state: "complete", detail: "Confirmed invocation item and stock" } });
+    expect(f.controller.status()).toMatchObject({ requests: 1, providerDispatches: 1,
+      issuedWorkOrders: 3, completedModelWorkOrders: 3, completedWorkPrograms: 1, workQueuedAfter: null,
+      completedWorkProgram: { stage: PRE_SPAWN_GOAL_ONLY, branchIndex: 1, stages: 3, invocationItemCount: 1,
+        receipt: { id: third.id, status: "completed" }, basis: { tick: 80 } },
+    });
+    expect(f.liveCalls()).toBe(0); // Spare quota is not spent just to announce an already verified result.
+    const receipts = await f.log("receipts.jsonl");
+    const [proposal] = await f.log("proposals.jsonl");
+    expect(receipts).toHaveLength(6);
+    for (const row of receipts) expect(row).toMatchObject({ stage: PRE_SPAWN_GOAL_ONLY, requestId: proposal.requestId, eligible: true });
+    expect((await f.log("history.jsonl")).find(row => row.event === "first_plan_bound")).toMatchObject({
+      branchIndex: 1, declaredStages: 3, eligiblePrefixStages: 3,
+    });
+  } finally { await f.close(); }
+});
+
+test("an arithmetically impossible suffix cannot claim completion or grant an adjacent ID", async () => {
+  const branch = timberProgram.branches[0];
+  const [craft, finish] = branch.then;
+  const advice = openingAdvice({ ...timberProgram, branches: [{ ...branch, then: [craft,
+    { ...finish, requires: [{ item: boundPlanks, count: 13 }] },
+  ] }] });
+  const f = await fixture(async () => result(advice));
+  try {
+    await f.observe({ opportunities: [birch] });
+    const first = await f.order();
+    const log = "minecraft:birch_log", plank = "minecraft:birch_planks";
+    await f.receipt(first.id, 6, "accepted");
+    await f.receipt(first.id, 20, "completed");
+    await f.observe({ tick: 20, epoch: 2, inventory: { [log]: 4 } });
+    const second = await f.order();
+    expect(second.id).toBe(first.nextWorkId!);
+    expect(second.nextWorkId).toBeUndefined();
+    await f.receipt(second.id, 21, "accepted");
+    await f.receipt(second.id, 40, "completed");
+    await f.observe({ tick: 40, epoch: 3, inventory: { [log]: 1, [plank]: 12 } });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(f.controller.status()).toMatchObject({
+      requests: 1, issuedWorkOrders: 2, completedModelWorkOrders: 2, completedWorkPrograms: 0, completedWorkProgram: null,
+    });
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({
+      event: "work_successor_discarded", stage: 3, reason: "work_resource_shortage", programSource: PRE_SPAWN_GOAL_ONLY,
+    }));
+  } finally { await f.close(); }
+});
+
+test("an unaffordable new workstation and no offered alternative leave the third stage to live planning", async () => {
+  const f = await fixture(async () => result(openingAdvice(timberProgram)), undefined, 2);
+  try {
+    await f.observe({ opportunities: [birch] });
+    const first = await f.order();
+    const log = "minecraft:birch_log", plank = "minecraft:birch_planks";
+    await f.receipt(first.id, 6, "accepted");
+    await f.receipt(first.id, 20, "completed");
+    await f.observe({ tick: 20, epoch: 2, inventory: { [log]: 4 } });
+    const second = await f.order();
+    expect(second.nextWorkId).toBeDefined(); // A live table could still make the proposed route feasible.
+    await f.receipt(second.id, 21, "accepted");
+    await f.receipt(second.id, 40, "completed");
+    await f.observe({ tick: 40, epoch: 3, inventory: { [log]: 1, [plank]: 12 }, quiescent: false, workOrder: {
+      id: second.id, state: "complete", detail: "Confirmed personal inventory craft",
+    } });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(f.controller.status()).toMatchObject({ requests: 2, issuedWorkOrders: 2, completedWorkPrograms: 0 });
+    expect(f.liveCalls()).toBe(1);
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({
+      event: "work_successor_discarded", stage: 3, afterWorkId: second.id, reason: "opening_start_not_confirmed",
+    }));
+  } finally { await f.close(); }
+});
+
+test.each([
+  ["interrupted", 4, { quiescent: true }, "predecessor_did_not_complete"],
+  ["completed", 3, { quiescent: true }, "predecessor_stock_not_confirmed"],
+  ["completed", 4, { quiescent: false }, "opening_handoff_not_confirmed"],
+  ["completed", 4, { safety: { clear: false, revision: 2 } }, "scope_or_ttl_changed"],
+  ["completed", 4, { life: 2 }, "scope_or_ttl_changed"],
+] as const)("a %s receipt, %d live logs and %j admit no conditional successor", async (status, logs, change, reason) => {
+  const f = await fixture(async () => result(openingAdvice(timberProgram)));
+  try {
+    await f.observe({ opportunities: [spruce] });
+    const first = await f.order();
+    await f.receipt(first.id, 6, "accepted");
+    await f.receipt(first.id, 20, status);
+    await f.observe({ ...change, tick: 20, epoch: 2, inventory: { "minecraft:spruce_log": logs } });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(f.controller.status()).toMatchObject({ requests: 1, issuedWorkOrders: 1, completedWorkPrograms: 0 });
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({
+      event: "work_successor_discarded", stage: 2, reason, programSource: PRE_SPAWN_GOAL_ONLY,
+    }));
+  } finally { await f.close(); }
+});
+
+test("Stop revokes a conditional successor while the latest native view is still behind its receipt", async () => {
+  const f = await fixture(async () => result(openingAdvice(timberProgram)));
+  try {
+    await f.observe({ opportunities: [birch] });
+    const first = await f.order();
+    await f.receipt(first.id, 6, "accepted");
+    await f.receipt(first.id, 20, "completed");
+    await f.controller.poll();
+    expect(f.controller.status().workQueuedAfter).toBe(first.id);
+    await f.controller.stop();
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(f.controller.status()).toMatchObject({ requests: 1, issuedWorkOrders: 1, workQueuedAfter: null,
+      completedWorkPrograms: 0 });
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({
+      event: "work_successor_discarded", stage: 2, reason: "scope_or_ttl_changed", programSource: PRE_SPAWN_GOAL_ONLY,
+    }));
+  } finally { await f.close(); }
 });
 
 test("a camera warm-up is inert and can bind a shared-reserve fallback only on the first actionable live view", async () => {

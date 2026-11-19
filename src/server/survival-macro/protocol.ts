@@ -425,7 +425,7 @@ function workPolicy(raw: Record<string, unknown>): MacroWorkPolicy {
   });
 }
 
-function workStages(value: unknown): readonly MacroWorkStage[] {
+export function parseMacroWorkStages(value: unknown): readonly MacroWorkStage[] {
   const totals = { maxBreaks: 0, maxCrafts: 0, maxPlacements: 0 };
   const totalCosts = new Map<string, number>();
   const reserves = new Map<string, number>();
@@ -693,7 +693,7 @@ export function parseMacroProposal(value: unknown): MacroProposal {
       break;
     case "work-program":
       shape(rawAction, "work program", ["kind", "stages"], ["afterWorkId"]);
-      action = { kind, stages: workStages(rawAction.stages),
+      action = { kind, stages: parseMacroWorkStages(rawAction.stages),
         ...(Object.hasOwn(rawAction, "afterWorkId") ? { afterWorkId: validateMacroId(rawAction.afterWorkId, "predecessor work id") } : {}) };
       break;
     case "revoke-work":

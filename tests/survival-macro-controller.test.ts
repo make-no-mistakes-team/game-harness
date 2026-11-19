@@ -437,6 +437,94 @@ test("A single model work program crosses two native receipts and preserves rese
   }
 });
 
+test("Resource feedback reaches an ordinary successor request while the safe gather job continues", async () => {
+  const log = "minecraft:oak_log", planks = "minecraft:oak_planks", stick = "minecraft:stick", table = "minecraft:crafting_table";
+  const reserve = { item: log, count: 1 };
+  const requests: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    if (requests.length > 1) return workReply(request, { kind: "abstain" });
+    return workReply(request, { kind: "work-program", stages: [
+      { policy: { target: { kind: "stock", item: log, count: 4 }, allowedEffects: [`break:${log}`], costCaps: [],
+        reserves: [reserve], maxBreaks: 4, maxCrafts: 0, maxPlacements: 0 }, requires: [] },
+      { policy: { target: { kind: "stock", item: planks, count: 12 }, allowedEffects: ["craft:oak_planks"],
+        costCaps: [{ item: log, count: 3 }], reserves: [reserve], maxBreaks: 0, maxCrafts: 3, maxPlacements: 0 },
+        requires: [{ item: log, count: 4 }] },
+      { policy: { target: { kind: "preset", goal: "wooden_pickaxe" },
+        allowedEffects: ["craft:stick", "craft:crafting_table", "craft:wooden_pickaxe", `place:${table}`],
+        costCaps: [{ item: planks, count: 9 }, { item: stick, count: 2 }, { item: table, count: 1 }],
+        reserves: [reserve, { item: planks, count: 4 }], maxBreaks: 0, maxCrafts: 3, maxPlacements: 1 },
+        requires: [{ item: planks, count: 12 }] },
+    ] });
+  }, "Make the pickaxe while keeping one log and four oak planks.");
+  try {
+    await f.observe(10, { inventory: { [log]: 1 } });
+    await f.actor.poll();
+    const gather = await f.order();
+    expect(gather.target).toEqual({ kind: "stock", item: log, count: 4 });
+    await f.receipt(gather.id, 11, "accepted");
+    await f.observe(110, { epoch: 2, inventory: { [log]: 3 }, workOrder: {
+      id: gather.id, state: "needs_replan", detail: "Harvest active",
+      progress: { phase: "harvest", status: "Working toward the stock target", breaks: 2, crafts: 0, placements: 0,
+        replan: "target_near", lastEffect: { tick: 108, detail: "Collected an oak log." } },
+    } });
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toMatchObject({ work: { demand: "successor", current: { id: gather.id } },
+      feedback: { kind: "work_resource_shortage", detail: expect.stringContaining("needs 13 minecraft:oak_planks") } });
+    expect(await f.order()).toEqual(gather);
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test("A delayed resource repair cannot overwrite a program that advanced while the provider was pending", async () => {
+  const log = "minecraft:oak_log", planks = "minecraft:oak_planks";
+  let sent: MacroRequest | undefined;
+  const release = Promise.withResolvers<void>();
+  const craft = { target: { kind: "stock", item: planks, count: 8 } as const, allowedEffects: ["craft:oak_planks"],
+    costCaps: [{ item: log, count: 2 }], reserves: [], maxBreaks: 0, maxCrafts: 2, maxPlacements: 0 };
+  const f = await durableFixture(async request => {
+    if (request.work?.current) {
+      sent = request;
+      await release.promise;
+      return workReply(request, { kind: "work", afterWorkId: request.work.current.id, policy: craft });
+    }
+    return workReply(request, { kind: "work-program", stages: [
+      { policy: { target: { kind: "stock", item: log, count: 4 }, allowedEffects: [`break:${log}`],
+        costCaps: [], reserves: [], maxBreaks: 4, maxCrafts: 0, maxPlacements: 0 }, requires: [] },
+      { policy: craft, requires: [{ item: log, count: 4 }] },
+      { policy: { ...craft, target: { kind: "stock", item: "minecraft:stick", count: 4 }, allowedEffects: ["craft:stick"],
+        costCaps: [{ item: planks, count: 2 }], maxCrafts: 1 }, requires: [{ item: planks, count: 12 }] },
+    ] });
+  }, "Gather supplies, then craft.");
+  try {
+    await f.observe(10, { inventory: { [log]: 1 } });
+    await f.actor.poll();
+    const gather = await f.order();
+    await f.receipt(gather.id, 11, "accepted");
+    await f.observe(110, { inventory: { [log]: 3 }, workOrder: {
+      id: gather.id, state: "needs_replan", detail: "Harvest active",
+      progress: { phase: "harvest", status: "Working toward the stock target", breaks: 2, crafts: 0, placements: 0,
+        replan: "target_near", lastEffect: { tick: 108, detail: "Collected an oak log." } },
+    } });
+    expect(sent?.work?.current?.id).toBe(gather.id);
+    await f.receipt(gather.id, 120, "completed");
+    await f.observe(120, { epoch: 2, inventory: { [log]: 4 } });
+    const active = await f.order();
+    expect(active.id).toBe(gather.nextWorkId!);
+    release.resolve();
+    await f.actor.poll();
+    expect(await f.order()).toEqual(active);
+    expect(f.actor.status()).toMatchObject({ providerDispatches: 2, issuedWorkOrders: 2, workQueuedAfter: active.id });
+    expect(await readFile(f.file("history.jsonl"), "utf8")).toContain('"reason":"overlap_successor_not_current"');
+  } finally {
+    release.resolve();
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
 test.each([
   { terminal: "interrupted", actual: 5, required: 3, reason: "predecessor_did_not_complete" },
   { terminal: "completed", actual: 4, required: 3, reason: "predecessor_stock_not_confirmed" },

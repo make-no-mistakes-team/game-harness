@@ -1,5 +1,6 @@
 package io.gameharness.survival.mixin;
 
+import java.util.Set;
 import net.minecraft.client.gui.screen.ingame.HandledScreen;
 import net.minecraft.screen.slot.Slot;
 import org.spongepowered.asm.mixin.Mixin;
@@ -11,5 +12,8 @@ import org.spongepowered.asm.mixin.gen.Invoker;
 public interface AgentHandledScreenAccess {
     @Accessor("x") int agent$x();
     @Accessor("y") int agent$y();
+    @Accessor("cursorDragging") boolean agent$cursorDragging();
+    @Accessor("cursorDragging") void agent$setCursorDragging(boolean dragging);
+    @Accessor("cursorDragSlots") Set<Slot> agent$cursorDragSlots();
     @Invoker("getSlotAt") Slot agent$slotAt(double x, double y);
 }

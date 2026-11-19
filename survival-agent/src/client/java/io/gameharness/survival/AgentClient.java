@@ -108,6 +108,7 @@ public final class AgentClient implements ClientModInitializer {
         allowRespawn = Files.isRegularFile(directory.resolve("allow-vanilla-respawn"), LinkOption.NOFOLLOW_LINKS);
         active = this;
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            if (hands != null) hands.discardLifeInputs();
             stopMacro("The client is stopping.");
             if (macro != null) macro.drain();
             if (progress != null) progress.saveMemory(true);

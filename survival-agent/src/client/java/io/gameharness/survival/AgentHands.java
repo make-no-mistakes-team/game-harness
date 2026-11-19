@@ -39,7 +39,9 @@ import org.slf4j.LoggerFactory;
 
 import static org.lwjgl.glfw.GLFW.GLFW_MOUSE_BUTTON_LEFT;
 import static org.lwjgl.glfw.GLFW.GLFW_MOUSE_BUTTON_RIGHT;
+import static org.lwjgl.glfw.GLFW.GLFW_RELEASE;
 import static org.lwjgl.glfw.GLFW.glfwGetCursorPos;
+import static org.lwjgl.glfw.GLFW.glfwGetMouseButton;
 import static org.lwjgl.glfw.GLFW.glfwSetCursorPos;
 
 final class AgentHands {
@@ -50,6 +52,8 @@ final class AgentHands {
     private static final long LEFT_CLICK_INTERVAL = 260_000_000L; // Outside vanilla's double-click window.
     private static final long POINTER_HANDOFF = 60_000_000L;
     private static final int SLOT_SIZE = 16; // Visible icon interior; vanilla separately owns the hit test.
+    private static final int GRID_SPACING = 18;
+    private static final int SCREEN_REVISION_MASK = 0x7fff;
     private static final int SMELT_TICKS = 200;
 
     private enum Job { CRAFT, SMELT, EQUIP }
@@ -114,6 +118,7 @@ final class AgentHands {
         final ItemStack cursorBefore;
         final int button;
         ItemStack slotBefore;
+        Drag drag;
         long firstEntry, lastEntry, pressWallMs, pressAt;
         double pressX, pressY, pressOffsetX, pressOffsetY, pressVx, pressVy;
         int pressRevision;
@@ -131,6 +136,20 @@ final class AgentHands {
         }
     }
 
+    /** One straight row or column of vanilla craft inputs, with an exact before-image for settlement. */
+    private static final class Drag {
+        final Slot[] slots;
+        ItemStack[] before;
+        long sequence, movedAt, settleDeadline;
+        double x, y, dx, dy, commandX, commandY, endX, endY, scaleX, scaleY, speed;
+        int entered, left, top, releaseRevision;
+        boolean down, released;
+
+        Drag(Slot[] slots) { this.slots = slots; }
+
+        Slot last() { return slots[slots.length - 1]; }
+    }
+
     private final MinecraftClient c;
     private final ArrayDeque<Step> steps = new ArrayDeque<>();
     private final double[] mouseX = new double[1], mouseY = new double[1];
@@ -140,8 +159,8 @@ final class AgentHands {
     private ClientPlayerEntity player;
     private HandledScreen<?> screen;
     private Click click;
-    private Path pointerEvidence;
-    private boolean pointerHeaderWritten;
+    private Path pointerEvidence, dragEvidence;
+    private boolean pointerHeaderWritten, dragHeaderWritten;
     private long handoffAt;
     private double handoffX, handoffY, handoffVx, handoffVy;
     private Slot lastLeftSlot;
@@ -165,7 +184,11 @@ final class AgentHands {
     AgentHands(MinecraftClient c) {
         this.c = c;
         String output = System.getProperty("gh.agent.dir", System.getenv("GH_AGENT_DIR"));
-        if (output != null) pointerEvidence = Path.of(output).resolve("gui-pointer.tsv");
+        if (output != null) {
+            Path dir = Path.of(output);
+            pointerEvidence = dir.resolve("gui-pointer.tsv");
+            dragEvidence = dir.resolve("gui-drag.tsv");
+        }
     }
 
     boolean busy() {
@@ -453,6 +476,10 @@ final class AgentHands {
 
     void frame() {
         if (click == null || !ownsScreen() || !pointerAvailable()) return;
+        if (click.drag != null && click.drag.down) {
+            if (!click.drag.released) dragFrame(System.nanoTime());
+            return;
+        }
         Slot slot = click.step.slot;
         if (slot != null && (!slot.isEnabled() || bookHidesSlots())) return;
         if (slot == null && !click.pressed && (!click.bookButton.visible || !click.bookButton.active)) return;
@@ -476,12 +503,15 @@ final class AgentHands {
             sampleCursor(window.getHandle());
             double x = mouseX[0] * scaleX, y = mouseY[0] * scaleY;
             var next = steps.peekFirst();
+            Slot nextSlot = click.drag != null ? click.drag.slots[1] : next == null ? null : next.slot;
             boolean precise = slot == null || click.step.mode == Mode.SWAP
-                    || next != null && next.slot == slot || c.options.getTouchscreen().getValue();
+                    || nextSlot == slot || c.options.getTouchscreen().getValue();
             boolean carry = !precise && handoffAt != 0 && now - handoffAt < POINTER_HANDOFF
                     && x == handoffX && y == handoffY;
             motion.plan(now, x, y, left, top, width, height, scaleX, scaleY, precise,
-                    carry ? handoffVx : 0, carry ? handoffVy : 0);
+                    carry ? handoffVx : 0, carry ? handoffVy : 0,
+                    nextSlot == null ? left + width * .5 : layout.agent$x() + nextSlot.x + SLOT_SIZE * .5,
+                    nextSlot == null ? top + height * .5 : layout.agent$y() + nextSlot.y + SLOT_SIZE * .5);
             handoffAt = 0;
             click.firstEntry = click.lastEntry = 0;
             click.inTarget = false;
@@ -523,7 +553,8 @@ final class AgentHands {
         if (changedTarget || !buttonMotion.matches(left, top, width, height, scaleX, scaleY)) {
             sampleCursor(window.getHandle());
             buttonMotion.plan(now, mouseX[0] * scaleX, mouseY[0] * scaleY,
-                    left, top, width, height, scaleX, scaleY, true, 0, 0);
+                    left, top, width, height, scaleX, scaleY, true, 0, 0,
+                    left + width * .5, top + height * .5);
         }
         if (!buttonMotion.settled) {
             buttonMotion.advance(now);
@@ -672,6 +703,7 @@ final class AgentHands {
 
     /** True only after release and the expected local effect; the next approach can then start this frame. */
     private boolean advanceClick(long now) {
+        if (click.drag != null && click.drag.down) return advanceDrag(now);
         if (!click.motion.planned || Screen.hasShiftDown()) return false;
         Slot slot = click.step.slot;
         if (slot != null && (!slot.isEnabled() || bookHidesSlots())) {
@@ -711,6 +743,14 @@ final class AgentHands {
             }
             c.setNavigationType(GuiNavigationType.MOUSE);
             if (craftOutput) craftTakeRevision = handler.getRevision();
+            if (click.drag != null) {
+                if (physicalButtonDown(window) || ((AgentHandledScreenAccess) screen).agent$cursorDragging()) {
+                    finish("another mouse gesture is already active");
+                    return false;
+                }
+                if (beginDrag(handler, window, scaleX, scaleY, x, y, now)) return false;
+                click.drag = null; // No input was sent; the original steps are still queued.
+            }
             if (pointerEvidence != null) {
                 click.pressAt = now;
                 click.pressWallMs = System.currentTimeMillis();
@@ -766,6 +806,10 @@ final class AgentHands {
             handoffVx = motion.vx;
             handoffVy = motion.vy;
         }
+        return finishGesture(now);
+    }
+
+    private boolean finishGesture(long now) {
         deadline = now + ACTION_TIMEOUT;
         if (previousFailure) {
             previousFailure = false;
@@ -773,6 +817,225 @@ final class AgentHands {
         }
         click = null;
         return true;
+    }
+
+    /** False means no button edge was dispatched; the ordinary click can still be used. */
+    private boolean beginDrag(ScreenHandler handler, Window window, double scaleX, double scaleY,
+                              double x, double y, long now) {
+        Drag drag = click.drag;
+        var layout = (AgentHandledScreenAccess) screen;
+        if (!dragInputAvailable(window)) return false;
+        ItemStack cursor = handler.getCursorStack();
+        // Vanilla admits the next slot only while carried count exceeds the current preview size.
+        // At commit it requires count >= final size. Exactly N is valid for a stroke over N cells.
+        if (cursor.getCount() < drag.slots.length) return false;
+        drag.left = layout.agent$x();
+        drag.top = layout.agent$y();
+        Slot first = drag.slots[0], last = drag.last();
+        double directionX = Integer.signum(last.x - first.x), directionY = Integer.signum(last.y - first.y);
+        drag.endX = directionX == 0 ? x : drag.left + last.x + SLOT_SIZE * .5 + directionX * 4;
+        drag.endY = directionY == 0 ? y : drag.top + last.y + SLOT_SIZE * .5 + directionY * 4;
+        for (Slot slot : drag.slots) {
+            if (!slot.isEnabled() || room(slot, cursor) < 1 || !handler.canInsertIntoSlot(slot)
+                    || !ScreenHandler.canInsertItemIntoSlot(slot, cursor, true)
+                    || drag.left + slot.x < 0 || drag.top + slot.y < 0
+                    || drag.left + slot.x + SLOT_SIZE > screen.width
+                    || drag.top + slot.y + SLOT_SIZE > screen.height) return false;
+            double laneX = directionX == 0 ? x : drag.left + slot.x + SLOT_SIZE * .5;
+            double laneY = directionY == 0 ? y : drag.top + slot.y + SLOT_SIZE * .5;
+            if (layout.agent$slotAt(laneX, laneY) != slot) return false;
+        }
+        if (layout.agent$slotAt(drag.endX, drag.endY) != last) return false;
+
+        drag.before = new ItemStack[handler.slots.size()];
+        for (int i = 0; i < drag.before.length; i++)
+            drag.before[i] = i == first.id ? click.slotBefore : handler.getSlot(i).getStack().copy();
+        drag.x = drag.commandX = x;
+        drag.y = drag.commandY = y;
+        drag.scaleX = scaleX;
+        drag.scaleY = scaleY;
+        drag.speed = Math.max(45, Math.min(125, 70 + .42 * (directionX * click.motion.vx + directionY * click.motion.vy)));
+        drag.movedAt = now;
+        drag.sequence = now; // Monotonic within this native process, even if Hands is replaced on respawn.
+        drag.down = true;
+        int revision = handler.getRevision();
+        boolean accepted = screen.mouseClicked(x, y, GLFW_MOUSE_BUTTON_RIGHT);
+        recordDrag(drag, "down", first, revision, "dispatched");
+        if (!accepted || !dragPreviewMatches(drag) || !dragStacksMatch(drag, false)) {
+            finish("vanilla did not begin the expected right drag");
+            return true;
+        }
+        for (int i = 1; i < drag.slots.length; i++) steps.removeFirst();
+        return true;
+    }
+
+    private void dragFrame(long now) {
+        Drag drag = click.drag;
+        Window window = c.getWindow();
+        if (!dragHeld(drag, window)) {
+            finish("right drag changed before move");
+            return;
+        }
+        double remainingX = drag.endX - drag.commandX, remainingY = drag.endY - drag.commandY;
+        double remaining = Math.abs(remainingX) + Math.abs(remainingY);
+        if (remaining == 0) return;
+        // Advance the single lane, not a new stop-and-start path to each cell. Cap a slow frame's
+        // move well below one cell so no required native slot entry can be skipped.
+        double elapsed = Math.min(.03, (now - drag.movedAt) * 1e-9);
+        drag.speed = Math.min(Math.min(245, 75 + remaining * 12), drag.speed + elapsed * 1800);
+        double increment = Math.min(4.5, elapsed * drag.speed);
+        if (drag.entered == 0) increment = Math.min(increment, 1.15 * Math.max(drag.scaleX, drag.scaleY));
+        drag.movedAt = now;
+        double fraction = Math.min(1, increment / remaining);
+        drag.commandX += remainingX * fraction;
+        drag.commandY += remainingY * fraction;
+        moveCursor(window, drag.commandX, drag.commandY, drag.scaleX, drag.scaleY);
+        sampleCursor(window.getHandle());
+        double x = mouseX[0] * drag.scaleX, y = mouseY[0] * drag.scaleY;
+        drag.dx = x - drag.x;
+        drag.dy = y - drag.y;
+        if (drag.dx == 0 && drag.dy == 0) return;
+        drag.x = x;
+        drag.y = y;
+        var layout = (AgentHandledScreenAccess) screen;
+        Slot actual = layout.agent$slotAt(x, y);
+        Slot next = drag.entered < drag.slots.length ? drag.slots[drag.entered] : null;
+        Slot previous = drag.entered > 0 ? drag.slots[drag.entered - 1] : null;
+        if ((actual != null && actual != previous && actual != next) || (drag.entered == 0 && actual != next)) {
+            finish("right drag would cross an unintended slot");
+            return;
+        }
+        screen.mouseDragged(x, y, GLFW_MOUSE_BUTTON_RIGHT, drag.dx, drag.dy);
+        boolean entered = actual != null && actual == next;
+        if (entered) drag.entered++;
+        if (!dragPreviewMatches(drag)) {
+            if (entered) drag.entered--;
+            finish("vanilla right drag preview changed");
+        } else if (entered) recordDrag(drag, "enter", actual, screen.getScreenHandler().getRevision(), "native preview admitted");
+    }
+
+    private boolean dragHeld(Drag drag, Window window) {
+        var layout = (AgentHandledScreenAccess) screen;
+        if (bookHidesSlots() || !dragInputAvailable(window) || layout.agent$x() != drag.left || layout.agent$y() != drag.top
+                || (double) window.getScaledWidth() / window.getWidth() != drag.scaleX
+                || (double) window.getScaledHeight() / window.getHeight() != drag.scaleY
+                || !dragPreviewMatches(drag) || !dragStacksMatch(drag, false)) return false;
+        for (Slot slot : drag.slots) if (!slot.isEnabled()) return false;
+        sampleCursor(window.getHandle());
+        return mouseX[0] * drag.scaleX == drag.x && mouseY[0] * drag.scaleY == drag.y;
+    }
+
+    private boolean dragInputAvailable(Window window) {
+        return !Screen.hasShiftDown() && !c.options.getTouchscreen().getValue() && !physicalButtonDown(window);
+    }
+
+    private static boolean physicalButtonDown(Window window) {
+        long handle = window.getHandle();
+        return glfwGetMouseButton(handle, GLFW_MOUSE_BUTTON_LEFT) != GLFW_RELEASE
+                || glfwGetMouseButton(handle, GLFW_MOUSE_BUTTON_RIGHT) != GLFW_RELEASE;
+    }
+
+    private boolean dragPreviewMatches(Drag drag) {
+        var layout = (AgentHandledScreenAccess) screen;
+        var preview = layout.agent$cursorDragSlots();
+        if (!layout.agent$cursorDragging() || preview.size() != drag.entered) return false;
+        for (int i = 0; i < drag.entered; i++) if (!preview.contains(drag.slots[i])) return false;
+        return true;
+    }
+
+    private boolean dragStacksMatch(Drag drag, boolean deposited) {
+        var handler = (AbstractCraftingScreenHandler) screen.getScreenHandler();
+        ItemStack cursor = handler.getCursorStack();
+        int remaining = click.cursorBefore.getCount() - (deposited ? drag.slots.length : 0);
+        if (cursor.getCount() != remaining || remaining != 0 && !same(click.cursorBefore, cursor)) return false;
+        if (handler.slots.size() != drag.before.length) return false;
+        Slot output = handler.getOutputSlot();
+        for (int i = 0; i < drag.before.length; i++) {
+            Slot slot = handler.getSlot(i);
+            if (deposited && slot == output) continue; // Derived server recipe preview is not ingredient custody.
+            ItemStack before = drag.before[i], actual = slot.getStack();
+            boolean target = false;
+            if (deposited) for (Slot dragged : drag.slots) {
+                if (dragged == slot) { target = true; break; }
+            }
+            if (target) {
+                if (actual.getCount() != before.getCount() + 1 || !same(actual, click.cursorBefore)) return false;
+            } else if (!ItemStack.areEqual(before, actual)) return false;
+        }
+        return true;
+    }
+
+    private boolean advanceDrag(long now) {
+        Drag drag = click.drag;
+        int revision = screen.getScreenHandler().getRevision();
+        if (!drag.released) {
+            if (!dragHeld(drag, c.getWindow())) {
+                finish("right drag changed before release");
+                return false;
+            }
+            Slot last = drag.last();
+            if (drag.entered != drag.slots.length
+                    || Math.abs(drag.x - drag.endX) > 4 || Math.abs(drag.y - drag.endY) > 4) return false;
+            if (((AgentHandledScreenAccess) screen).agent$slotAt(drag.x, drag.y) != last) {
+                finish("right drag release missed its last slot");
+                return false;
+            }
+            craftGridRevision = drag.releaseRevision = revision;
+            drag.released = true; // Never release a second time, even if the result fails to settle.
+            boolean accepted = screen.mouseReleased(drag.x, drag.y, GLFW_MOUSE_BUTTON_RIGHT);
+            recordDrag(drag, "up", last, screen.getScreenHandler().getRevision(), "dispatched");
+            if (!accepted || ((AgentHandledScreenAccess) screen).agent$cursorDragging() || !dragStacksMatch(drag, true)) {
+                finish("right drag did not deposit exactly one in each intended slot");
+                return false;
+            }
+            drag.settleDeadline = now + RESULT_TIMEOUT;
+            return false;
+        }
+        if (!dragStacksMatch(drag, true)) {
+            finish("right drag balances changed after release");
+            return false;
+        }
+        // The pinned vanilla handler sends one server result-slot revision for each changed craft input.
+        if (((revision - drag.releaseRevision) & SCREEN_REVISION_MASK) < drag.slots.length) {
+            if (now >= drag.settleDeadline) finish("right drag did not receive the expected crafting revisions");
+            return false;
+        }
+        recordDrag(drag, "settled", drag.last(), revision, "exact slot increments and cursor decrease");
+        return finishGesture(now);
+    }
+
+    private void recordDrag(Drag drag, String edge, Slot slot, int revision, String effect) {
+        if (dragEvidence == null) return;
+        var handler = screen.getScreenHandler();
+        try {
+            String header = dragHeaderWritten || Files.exists(dragEvidence) ? "" :
+                    "drag\tjob_generation\tsurface\tsync_id\tedge\tbutton\twall_ms\tslot\tx\ty\tcenter_dx\tcenter_dy"
+                    + "\tsample_dx\tsample_dy\trevision\tcursor_count\tslot_count\tentered\tplanned_slots\tslot_deltas\teffect\n";
+            String deltas = "";
+            if (edge.equals("settled")) {
+                var values = new StringBuilder();
+                for (Slot target : drag.slots) {
+                    if (!values.isEmpty()) values.append(',');
+                    values.append(target.id).append(':').append(drag.before[target.id].getCount())
+                            .append("->").append(target.getStack().getCount());
+                }
+                deltas = values.toString();
+            }
+            Files.writeString(dragEvidence, header + drag.sequence + "\t" + jobGeneration + "\t"
+                    + (screen instanceof InventoryScreen ? "inventory" : "crafting") + "\t" + handler.syncId
+                    + "\t" + edge + "\t" + GLFW_MOUSE_BUTTON_RIGHT + "\t" + System.currentTimeMillis() + "\t" + slot.id
+                    + "\t" + drag.x + "\t" + drag.y + "\t" + (drag.x - drag.left - slot.x - SLOT_SIZE * .5)
+                    + "\t" + (drag.y - drag.top - slot.y - SLOT_SIZE * .5)
+                    + "\t" + (edge.equals("enter") ? drag.dx : Double.NaN)
+                    + "\t" + (edge.equals("enter") ? drag.dy : Double.NaN) + "\t" + revision
+                    + "\t" + handler.getCursorStack().getCount() + "\t" + slot.getStack().getCount()
+                    + "\t" + drag.entered + "\t" + drag.slots.length + "\t" + deltas + "\t" + effect + "\n",
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            dragHeaderWritten = true;
+        } catch (IOException failure) {
+            LOGGER.warn("Disabling GUI drag evidence: {}", dragEvidence, failure);
+            dragEvidence = null;
+        }
     }
 
     private static boolean isResult(Step step) {
@@ -914,7 +1177,39 @@ final class AgentHands {
                 && (step.mode == Mode.TAKE || equipStack.isEmpty()))
             allowed &= ItemStack.areEqual(stack, equipStack);
         if (!allowed || !slot.isEnabled()) finish("slot not ready for gesture");
-        else click = new Click(clickMotion, step, null, cursor, stack);
+        else {
+            click = new Click(clickMotion, step, null, cursor, stack);
+            if (job == Job.CRAFT && step.mode == Mode.ONE && cursor.getCount() >= 2
+                    && !c.options.getTouchscreen().getValue())
+                click.drag = planDrag(step, cursor.getCount());
+        }
+    }
+
+    private Drag planDrag(Step first, int carried) {
+        var grid = ((AbstractCraftingScreenHandler) screen.getScreenHandler()).getInputSlots();
+        if (!grid.contains(first.slot)) return null;
+        Slot second = null, third = null, previous = first.slot;
+        int dx = 0, dy = 0, count = 1;
+        for (Step next : steps) {
+            Slot slot = next.slot;
+            if (count == 3 || count >= carried || next.item != first.item
+                    || (next.mode != Mode.ONE && !(next.mode == Mode.PUT && carried == count + 1))
+                    || !grid.contains(slot)) break;
+            int sx = slot.x - previous.x, sy = slot.y - previous.y;
+            if (count == 1) {
+                if (Math.abs(sx) + Math.abs(sy) != GRID_SPACING || sx != 0 && sy != 0) break;
+                dx = sx;
+                dy = sy;
+                second = slot;
+            } else {
+                if (sx != dx || sy != dy) break;
+                third = slot;
+            }
+            count++;
+            previous = slot;
+        }
+        return second == null ? null : new Drag(third == null
+                ? new Slot[]{first.slot, second} : new Slot[]{first.slot, second, third});
     }
 
     private boolean clickEffect(Click click, ItemStack cursor) {
@@ -1133,7 +1428,23 @@ final class AgentHands {
     }
 
     private void finish(String reason, boolean closeOwnedScreen) {
-        if (click != null) recordPointer(click, Double.NaN, Double.NaN, false, "interrupted: " + reason);
+        if (click != null) {
+            Drag drag = click.drag;
+            if (drag != null && drag.down) {
+                var layout = (AgentHandledScreenAccess) screen;
+                if (!drag.released || layout.agent$cursorDragging()) {
+                    // Right release can commit a vanilla preview even over empty space. Clear only
+                    // the initiating screen's transient preview, never send a substitute release.
+                    // No global Mouse button was set, so closing/replacing the screen cannot leak it.
+                    layout.agent$setCursorDragging(false);
+                    layout.agent$cursorDragSlots().clear();
+                }
+                Slot at = drag.slots[Math.max(0, drag.entered - 1)];
+                recordDrag(drag, "aborted", at, screen.getScreenHandler().getRevision(), reason);
+            } else {
+                recordPointer(click, Double.NaN, Double.NaN, false, "interrupted: " + reason);
+            }
+        }
         if (pendingKey != null) {
             if (closeOwnedScreen && inventoryNeeded && screen == null && c.currentScreen instanceof InventoryScreen inventory)
                 screen = inventory;

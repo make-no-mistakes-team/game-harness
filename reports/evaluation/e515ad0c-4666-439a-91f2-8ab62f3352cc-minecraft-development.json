@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "tier": "minecraft-development",
+  "development": {
+    "task": "Gather resources, survive, and defeat a hostile mob encountered in ordinary survival.",
+    "criterion": "custom",
+    "seed": "-4442472741334525685",
+    "start_description": "Known unscreened seed2 regenerated as fresh ordinary Normal Survival; fresh Luna source/context, no preset tactical code, arena, gear grants, time setting or evaluator sensing. New ordinary guard availability and transaction/context corrections, no activated policy supplied."
+  },
+  "inference_reasoning": {
+    "condition": "backend_default_unspecified",
+    "requested_effort": null,
+    "evidence": "Declaration only; actual serialization is recorded by the per-request SDK onPayload event, not inferred from motor profile."
+  },
+  "model_id": "gpt-6-luna",
+  "hypothesis_id": "named-sdk3-natural-wood-20261022",
+  "outcome": {
+    "platform_status": "unknown",
+    "agent_status": "unknown",
+    "provider_status": "ok",
+    "goal_verified": null,
+    "classification_reason": [
+      "platform_evidence_incomplete",
+      "goal_evidence_unavailable",
+      "finite_run_deadline_reached",
+      "tool_failure_requires_classification"
+    ]
+  },
+  "usage": {
+    "schema_version": 2,
+    "admissions": 39,
+    "reported_messages": 39,
+    "uncached_input": null,
+    "cache_read": null,
+    "cache_write": null,
+    "output": null,
+    "reported_subtotal": {
+      "uncached_input": 450855,
+      "cache_read": 464640,
+      "cache_write": 0,
+      "output": 5429
+    },
+    "event_coverage": "complete",
+    "consumption_coverage": "unknown",
+    "consumption_scope": "observed_logical_admissions",
+    "wire_attempts": null,
+    "subscription_cost": null
+  },
+  "verification": null,
+  "completion_claim": "custom_not_completed_unverified",
+  "evidence": "run-63622a75-fa07-4d06-8eee-56300cd070f7-evidence.json"
+}

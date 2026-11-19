@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "tier": "minecraft-development",
+  "development": {
+    "task": "Gather resources, survive, and defeat a hostile mob encountered in ordinary survival.",
+    "criterion": "custom",
+    "seed": "-4442472741334525685",
+    "start_description": "Fresh ordinary Normal Survival on one prospectively recorded uniformly random unscreened seed; fresh source/context, no arena, gear grants, time setting, prepared resources, tactical source, forced tool sequence or evaluator geometry refresh. Same targeted combat-survival task as Sol1."
+  },
+  "inference_reasoning": {
+    "condition": "backend_default_unspecified",
+    "requested_effort": null,
+    "evidence": "Declaration only; actual serialization is recorded by the per-request SDK onPayload event, not inferred from motor profile."
+  },
+  "model_id": "gpt-6.1-sol",
+  "hypothesis_id": "named-sdk3-natural-wood-20261022",
+  "outcome": {
+    "platform_status": "pass",
+    "agent_status": "unknown",
+    "provider_status": "ok",
+    "goal_verified": null,
+    "classification_reason": [
+      "goal_evidence_unavailable"
+    ]
+  },
+  "usage": {
+    "schema_version": 2,
+    "admissions": 33,
+    "reported_messages": 33,
+    "uncached_input": null,
+    "cache_read": null,
+    "cache_write": null,
+    "output": null,
+    "reported_subtotal": {
+      "uncached_input": 598254,
+      "cache_read": 409984,
+      "cache_write": 0,
+      "output": 11603
+    },
+    "event_coverage": "complete",
+    "consumption_coverage": "unknown",
+    "consumption_scope": "observed_logical_admissions",
+    "wire_attempts": null,
+    "subscription_cost": null
+  },
+  "verification": null,
+  "completion_claim": "custom_not_completed_unverified",
+  "evidence": "run-bd470c7d-1f3a-4edd-b049-dcf9f5ff8c90-evidence.json"
+}

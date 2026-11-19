@@ -114,6 +114,7 @@ final class PilotShoreCast {
     private BlockPos water;
     private Block plug;
     private Source pickup;
+    private boolean destinationSeen;
     private boolean contactSeen;
     private boolean lavaDebited;
     private int tick;
@@ -287,8 +288,7 @@ final class PilotShoreCast {
             }
             case LINTEL_CHECK -> {
                 status = "checking that the supplied water reaches the far lintel";
-                BlockPos dest = at(CASTS[cast]);
-                if (aim(cellPoint(dest)) && verifyContact(dest)) startScoop();
+                if (verifyContact(at(CASTS[cast]))) startScoop();
                 else if (tick - since >= 40) change(Phase.RECOVER_UPPER, 112);
             }
             case RECOVER_UPPER -> {
@@ -437,12 +437,21 @@ final class PilotShoreCast {
                 || !evidence.contains(new Proof(pos, "visible lava source"))) return;
         if (index < 2) passive.add(pos);
         witness(pos, "cooled by trough water");
-        if (++index == PASSIVE.length) change(Phase.SIDE_FOOTING, 105);
-        else deadline = tick + 64;
+        if (++index == PASSIVE.length) {
+            index = 0;
+            change(Phase.SIDE_FOOTING, 105);
+        } else deadline = tick + 64;
     }
 
     private void sideFooting() {
         status = "checking the low corner crossing to the obsidian standing strip";
+        if (index < 2) {
+            // The bank's lip blocks the shallow pool-floor outline at this angle.
+            // First move along the bank and onto its freshly cooled outer corner.
+            if (!move(at(CROSS[index]))) return;
+            deadline = tick + 110;
+            if (++index < 2) return;
+        }
         BlockPos pos = at(BYPASS);
         if (blockUse == null) {
             Vec3d point = Vec3d.ofCenter(pos, 0.92);
@@ -461,7 +470,7 @@ final class PilotShoreCast {
     }
 
     private void beginCrossing() {
-        index = 0;
+        index = 2;
         change(Phase.CROSS, 110);
     }
 
@@ -587,12 +596,15 @@ final class PilotShoreCast {
             return;
         }
         if (usedAt == 0 && !contactSeen) {
-            Vec3d point = cellPoint(dest);
-            expect(dest, "open or flowing-water destination before lava pour");
-            if (!aim(point)) return;
-            if (!body.clearTerrainThroughWater(point)) {
-                observe(terrain(point, REACH));
-                return;
+            if (!destinationSeen) {
+                Vec3d point = cellPoint(dest);
+                expect(dest, "open or flowing-water destination before lava pour");
+                if (!aim(point)) return;
+                if (!body.clearTerrainThroughWater(point)) {
+                    observe(terrain(point, REACH));
+                    return;
+                }
+                destinationSeen = true;
             }
             if (!verifyContact(dest)) return;
         }
@@ -602,17 +614,31 @@ final class PilotShoreCast {
 
     private boolean verifyContact(BlockPos dest) {
         expect(dest, "visible cooling water beside or above the prospective obsidian");
+        String firstWater = null;
         for (Direction side : WATER_CONTACT) {
             BlockPos pos = dest.offset(side);
-            Vec3d point = Vec3d.ofCenter(pos, 0.64);
+            Vec3d point = Vec3d.ofCenter(pos, 0.52);
             BlockHitResult hit = fluid(point, REACH);
-            if (matches(hit, pos) && state(hit).getFluidState().isIn(FluidTags.WATER)) {
+            boolean wetHit = hit != null && state(hit).getFluidState().isIn(FluidTags.WATER);
+            if (wetHit && firstWater == null) firstWater = describe(hit);
+            // A falling sheet can occlude its own ray though the actual neighbor is visibly wet.
+            // Probe lit points through water only; opaque blocks still veto the observation.
+            Vec3d low = Vec3d.ofCenter(pos, 0.08);
+            if (wetHit && matches(hit, pos)
+                    || body.visibleWaterAt(low, REACH)
+                    || body.visibleWaterAt(low.add(Vec3d.of(layout.shore.getVector()).multiply(0.29)), REACH)) {
                 contactSeen = true;
                 witness(dest, "adjacent cooling water");
                 return true;
             }
         }
-        observed = "no visible water contact";
+        // The side adjacent to a downcast can be below the picture while its solid
+        // destination is centered. Turn naturally to look at the appropriate water column.
+        Direction expected = cast < 2 ? Direction.UP
+            : cast < 4 ? layout.across().getOpposite()
+            : cast < 6 ? layout.across() : layout.shore;
+        body.aim(Vec3d.ofCenter(dest.offset(expected), 0.48));
+        observed = firstWater == null ? "no visible water contact" : "water visible but not at a contact: " + firstWater;
         return false;
     }
 
@@ -644,7 +670,14 @@ final class PilotShoreCast {
             water = null;
             return true;
         }
-        useSource(new Source(water, Vec3d.ofCenter(water, 0.70)), false);
+        Vec3d point = Vec3d.ofCenter(water, 0.70);
+        if (water.getY() > layout.edge.getY() && (tick - since) / 17 % 3 != 1) {
+            // Once the lintel is in place, look through the doorway and reach the low back
+            // of the upper source; aiming at its center can hit the new lintel instead.
+            point = Vec3d.ofCenter(water, 0.12)
+                .add(Vec3d.of(layout.shore.getVector()).multiply(0.35));
+        }
+        useSource(new Source(water, point), false);
         return false;
     }
 
@@ -653,8 +686,11 @@ final class PilotShoreCast {
         if (!aim(source.point)) return;
         BlockHitResult hit = fluid(source.point, REACH);
         observe(hit);
-        if (!matches(hit, source.pos) || !(lava ? lavaSource(state(hit)) : waterSource(state(hit)))
-                || tick < nextUse || !equipped(BUCKET)) return;
+        boolean exact = matches(hit, source.pos) && (lava ? lavaSource(state(hit)) : waterSource(state(hit)));
+        // Flowing water can obscure another water block in the perception ray. The actual
+        // bucket key is still accepted only by PilotBody's current exact SOURCE_ONLY ray.
+        if (!exact && (lava || !body.visibleWaterAt(source.point, REACH))) return;
+        if (tick < nextUse || !equipped(BUCKET)) return;
         if (usedAt == 0) {
             fullBefore = count(lava ? LAVA : WATER);
             emptyBefore = count(BUCKET);
@@ -761,19 +797,19 @@ final class PilotShoreCast {
     }
 
     private void verify() {
-        status = "checking ten compact-cast frame cells and the six dry aperture cells";
-        boolean frame = index < 10;
-        BlockPos pos = frame ? at(index < 2 ? PASSIVE[index] : CASTS[index - 2])
-            : layout.at(1 + (index - 10) % 2, (index - 10) / 2, 0);
+        status = "checking six dry doorway cells before igniting the witnessed frame";
+        // Each frame cell already has a unique, visible conversion receipt; their
+        // completed uprights can hide the feet from this stance. Vanilla ignition
+        // is the final whole-frame test. Verify that none of its aperture stayed wet.
+        BlockPos pos = layout.at(1 + index % 2, index / 2, 0);
         Vec3d point = cellPoint(pos);
-        expect(pos, frame ? "witnessed obsidian still in the frame" : "dry unobstructed aperture");
+        expect(pos, "dry unobstructed aperture");
         if (!aim(point)) return;
         BlockHitResult hit = fluid(point, REACH);
         observe(hit);
-        if (frame ? !matches(hit, pos) || !state(hit).isOf(Blocks.OBSIDIAN)
-                : matches(hit, pos) || !body.clearTerrain(point)) return;
-        witness(pos, "verified finished compact frame");
-        if (++index == 16) {
+        if (matches(hit, pos) || !body.clearTerrain(point)) return;
+        witness(pos, "verified dry doorway");
+        if (++index == 6) {
             if (poured.size() != MINIMUM_LAVA_POURS || passive.size() != 2 || !has(WATER)) {
                 block("frame does not have eight poured cells, two passive cells, and the recovered water bucket");
             } else {
@@ -857,7 +893,7 @@ final class PilotShoreCast {
         usedAt = mineAt = 0;
         pickup = null;
         blockUse = null;
-        contactSeen = lavaDebited = false;
+        destinationSeen = contactSeen = lavaDebited = false;
     }
 
     private void expect(BlockPos pos, String description) {

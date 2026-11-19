@@ -974,6 +974,15 @@ final class PilotBody {
         return hasView() && clearPoint(point, Ray.WET_TERRAIN);
     }
 
+    /** Tests a lit point seen through transparent water, never through opaque terrain or lava. */
+    boolean visibleWaterAt(Vec3d point, double distance) {
+        if (!hasView() || point.squaredDistanceTo(eye) > distance * distance
+                || !clearPoint(point, Ray.WET_TERRAIN)) return false;
+        BlockPos pos = BlockPos.ofFloored(point);
+        FluidState water = client.world.getFluidState(pos);
+        return water.isIn(FluidTags.WATER) && point.y - pos.getY() < water.getHeight();
+    }
+
     private Optional<BlockHitResult> probe(Vec3d point, double distance, Ray ray) {
         if (!hasView()) return Optional.empty();
         double max = range(distance);

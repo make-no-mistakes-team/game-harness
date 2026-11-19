@@ -23,3 +23,6 @@ __pycache__/
 /native/minecraft/.gradle/
 /native/minecraft/build/
 /native/minecraft/bin/
+/survival-pilot/.gradle/
+/survival-pilot/build/
+/survival-pilot/run/

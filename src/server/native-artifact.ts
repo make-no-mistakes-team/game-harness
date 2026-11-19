@@ -5,12 +5,14 @@ import type { Json } from "../shared/contracts.ts";
 import { jsonSchema } from "../shared/primitives.ts";
 
 export interface NativeArtifactContract { artifact_sha256: string; resource: Json }
-const RESOURCE_NAME = Buffer.from("gameharness-native-contract.json");
 const MAX_JAR_BYTES = 64 * 1024 * 1024, MAX_RESOURCE_BYTES = 1024 * 1024;
 const utf8 = new TextDecoder("utf-8", { fatal: true });
 
-/** Read only the immutable contract entry from actual JAR bytes; no extraction, sidecar, CLI or ZIP64 guessing. */
-export async function readNativeArtifactContract(artifact: string): Promise<NativeArtifactContract> {
+/** Read one JSON contract entry from actual JAR bytes; no extraction, sidecar, CLI or ZIP64 guessing. */
+export async function readNativeArtifactContract(
+  artifact: string, entry = "gameharness-native-contract.json",
+): Promise<NativeArtifactContract> {
+  const resourceName = Buffer.from(entry);
   const handle = await open(artifact, "r");
   let bytes: Buffer;
   try {
@@ -44,7 +46,7 @@ export async function readNativeArtifactContract(artifact: string): Promise<Nati
     const nameLength = bytes.readUInt16LE(cursor + 28), extraLength = bytes.readUInt16LE(cursor + 30), commentLength = bytes.readUInt16LE(cursor + 32);
     const next = cursor + 46 + nameLength + extraLength + commentLength;
     if (next > centralEnd) throw new Error("Truncated native JAR entry");
-    const matching = nameLength === RESOURCE_NAME.length && bytes.subarray(cursor + 46, cursor + 46 + nameLength).equals(RESOURCE_NAME);
+    const matching = nameLength === resourceName.length && bytes.subarray(cursor + 46, cursor + 46 + nameLength).equals(resourceName);
     if (matching) {
       if (resource !== undefined) throw new Error("Duplicate native contract resources are not authoritative");
       const flags = bytes.readUInt16LE(cursor + 8), method = bytes.readUInt16LE(cursor + 10), crc = bytes.readUInt32LE(cursor + 16);
@@ -54,8 +56,8 @@ export async function readNativeArtifactContract(artifact: string): Promise<Nati
         throw new Error("Unsupported or oversized native contract resource");
       const localNameLength = bytes.readUInt16LE(local + 26), localExtraLength = bytes.readUInt16LE(local + 28);
       const payload = local + 30 + localNameLength + localExtraLength;
-      if (payload + compressed > central || localNameLength !== RESOURCE_NAME.length ||
-        !bytes.subarray(local + 30, local + 30 + localNameLength).equals(RESOURCE_NAME) ||
+      if (payload + compressed > central || localNameLength !== resourceName.length ||
+        !bytes.subarray(local + 30, local + 30 + localNameLength).equals(resourceName) ||
         bytes.readUInt16LE(local + 6) !== flags || bytes.readUInt16LE(local + 8) !== method)
         throw new Error("Native JAR directory and local contract entry disagree");
       const encoded = bytes.subarray(payload, payload + compressed);

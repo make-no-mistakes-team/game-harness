@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { deflateRawSync } from "node:zlib";
+import { MinecraftClient } from "../src/server/minecraft-client.ts";
 import { readNativeArtifactContract } from "../src/server/native-artifact.ts";
 
 const roots: string[] = [];
@@ -66,3 +67,38 @@ test("inflated resource size is bounded before JSON parsing", async () => {
   const bytes = jar("gameharness-native-contract.json", Buffer.alloc(1048577, 32), true);
   await expect(readNativeArtifactContract(await artifact(bytes))).rejects.toThrow();
 });
+
+const oldManifest = { schemaVersion: 1, id: "survival_agent", version: "1.0" };
+const terraManifest = { ...oldManifest, custom: { "gameharness:terra_work_wire": 1 } };
+const actor = (manifest: object) => jar("fabric.mod.json", Buffer.from(JSON.stringify(manifest)), true);
+
+for (const [kind, bytes] of [
+  ["unmarked", actor(oldManifest)],
+  ["wrong work-wire version", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 2 } })],
+  ["malformed work-wire marker", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": "1" } })],
+  ["malformed JAR", Buffer.from("not a JAR")],
+  ["missing", null],
+] as const) {
+  test(`Terra staging rejects a ${kind} actor with rebuild instructions`, async () => {
+    const file = await artifact(bytes ?? Buffer.alloc(0));
+    const root = dirname(file);
+    if (bytes === null) await rm(file);
+    await writeFile(join(root, "fabric.mod.json"), JSON.stringify(terraManifest)); // A sidecar cannot admit a build.
+    const client = new MinecraftClient(root, { dataDir: root });
+    await expect(client.stageAgentArtifact(file, true)).rejects.toThrow("bun run build:agent");
+  });
+}
+
+for (const [kind, bytes, requireTerraWorkWire] of [
+  ["Terra", actor(terraManifest), true],
+  ["deterministic or pinned trial", actor(oldManifest), false],
+] as const) {
+  test(`${kind} staging hashes exactly the installed actor bytes`, async () => {
+    const file = await artifact(bytes);
+    const root = dirname(file);
+    const client = new MinecraftClient(root, { dataDir: root });
+    const hash = await client.stageAgentArtifact(file, requireTerraWorkWire);
+    expect(await readFile(join(client.directory, "mods/survival-agent.jar"))).toEqual(bytes);
+    expect(hash).toBe(createHash("sha256").update(bytes).digest("hex"));
+  });
+}

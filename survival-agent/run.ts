@@ -10,6 +10,7 @@ import { SURVIVAL_AGENT_GOALS as GOALS, type SurvivalAgentGoal as Goal } from ".
 import { JAVA, MinecraftClient, privateJson } from "../src/server/minecraft-client.ts";
 import { nativeLaunchFailure } from "../src/server/native-launch-fault.ts";
 import { osMonotonicNs } from "../src/server/os-monotonic.ts";
+import { TerraActorCompatibilityError } from "../src/server/survival-agent-artifact.ts";
 import { composeTerraSurvival, declareTerraStrategy } from "../src/server/survival-macro/compose.ts";
 import { descentFixtures, descentVariants, fixtureWorld, macroTrialWorld, provisionFixture, provisionMacroTrialWorld, terrainFixtures,
   terrainVariants, provisionUrgentThreatWorld, urgentThreatWorld, provisionUrgentCraftWorld, urgentCraftWorld,
@@ -217,7 +218,7 @@ async function isolatedDisplay() {
   }
 }
 
-async function verifyInputs(actorJar: string) {
+async function verifyInputs(actorJar: string, requiresTerraWorkWire: boolean) {
   const hasConsent = async (directory: string) => {
     const consent = await readFile(path.join(directory, "provisioning-consent.json"), "utf8")
       .then((content) => JSON.parse(content)).catch(() => null);
@@ -230,6 +231,7 @@ async function verifyInputs(actorJar: string) {
   }
   await access(SERVER_JAR, constants.R_OK);
   await access(actorJar, constants.R_OK).catch(() => {
+    if (requiresTerraWorkWire) throw new TerraActorCompatibilityError();
     throw new Error(actorJar === AGENT_JAR ? "Run `bun run build:agent` to build survival-agent-1.0.jar first." :
       "The ordinary run's pinned actor artifact is unavailable.");
   });
@@ -788,11 +790,14 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     macroOptions?: TerraOptions, macroTrial?: MacroTrialLaunch) {
   const display = await isolatedDisplay();
   const actorJar = macroTrial ? macroTrialActor(macroTrial.ordinaryDir) : AGENT_JAR;
-  const { java, ffmpeg } = await verifyInputs(actorJar);
-  const runs = diagnostic ? DIAGNOSTIC_RUNS : RUNS;
-  const liveFile = diagnostic ? DIAGNOSTIC_LIVE : LIVE;
   const urgentCraft = diagnostic === "urgent-craft";
   const urgentDiagnostic = diagnostic === "urgent-creeper" || urgentCraft;
+  const terraDeclaration = macroOptions && (!diagnostic || urgentDiagnostic)
+    ? declareTerraStrategy(macroOptions, seconds * 1_000, urgentDiagnostic ? { preparedDiagnostic: true } : undefined)
+    : undefined;
+  const { java, ffmpeg } = await verifyInputs(actorJar, terraDeclaration !== undefined);
+  const runs = diagnostic ? DIAGNOSTIC_RUNS : RUNS;
+  const liveFile = diagnostic ? DIAGNOSTIC_LIVE : LIVE;
   const fixture = diagnostic === "water" || diagnostic === "boat" || diagnostic === "cave" ||
     diagnostic === "birch" || diagnostic === "ceiling" ? diagnostic : undefined;
   const provisioned = fixture !== undefined || diagnostic === "pool" || macroTrial !== undefined || urgentDiagnostic;
@@ -858,8 +863,6 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     const video = path.join(dir, "screen.mp4");
     const live = { run: path.basename(dir), display: display.display, authority: display.authority };
     const benchmark = diagnostic ? undefined : { goal, verifier: "vanilla-survival", claimScope };
-    const terraDeclaration = macroOptions && (!diagnostic || urgentProbe)
-      ? declareTerraStrategy(macroOptions, seconds * 1_000, urgentProbe && { preparedDiagnostic: true }) : undefined;
     const nativeClient = terraDeclaration ? Promise.withResolvers<Owned | undefined>() : undefined;
     const world = macroTrial ? macroTrialWorld : urgentCraft ? urgentCraftWorld : urgentProbe ? urgentThreatWorld :
       fixture ? fixtureWorld(fixture) : diagnostic === "pool" ? poolDiagnosticWorld : {
@@ -905,7 +908,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       return hasMore;
     };
     try {
-      const agentJarSha256 = await launcher.stageAgentArtifact(actorJar);
+      const agentJarSha256 = await launcher.stageAgentArtifact(actorJar, terraDeclaration !== undefined);
       if (macroTrial) {
         if (agentJarSha256 !== macroTrial.actorJarSha256)
           throw new Stop("unverified", "The diagnostic staged a different actor from the pinned ordinary run.");
@@ -959,7 +962,6 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       if (terraDeclaration) {
         stage = "macro_startup";
         startup.throwIfAborted();
-        await chmod(macroTrialActor(dir), 0o400);
         macroAttempt = composeTerraSurvival({
           declaration: terraDeclaration, dir, projectRoot: ROOT, actorJarSha256: agentJarSha256,
           authDirectory: process.env.GAMEHARNESS_DATA_DIR ?? RUNTIME, display, ...SCREEN, ffmpeg, signal,
@@ -1210,6 +1212,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     } catch (error) {
       if (error instanceof Stop) result = error;
       else if (signal.reason instanceof Stop) result = signal.reason;
+      else if (error instanceof TerraActorCompatibilityError) result = new Stop("failed", error.message);
       else if (startupDeadline.aborted && stage !== "playing") {
         result = new Stop("startup_limit", "Minecraft did not start before the startup limit.");
       } else {

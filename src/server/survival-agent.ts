@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { hasConfirmedTerraEffect, SURVIVAL_AGENT_STRATEGY_OUTCOMES, TERRA_MODEL_ID,
   type SurvivalAgentGoal, type SurvivalAgentSnapshot, type SurvivalAgentStart } from "../shared/survival-agent-ui.ts";
 import { prepareAgentServerArtifact } from "./minecraft-server-artifact.ts";
+import { TERRA_ACTOR_REBUILD } from "./survival-agent-artifact.ts";
 import { AgentVideo, type AgentDisplay } from "./survival-agent-video.ts";
 
 const SYSTEM_PATH = "/usr/bin:/bin";
@@ -122,6 +123,7 @@ function outcomeStatus(outcome: Record<string, unknown>) {
     case "recorder_exit": return "The screen recorder exited unexpectedly. Check FFmpeg with x11grab and libx264.";
     case "unverified": return "The agent’s goal could not be verified.";
     default:
+      if (outcome.reason === TERRA_ACTOR_REBUILD) return TERRA_ACTOR_REBUILD;
       if (outcome.reason === "The official Launcher Minecraft session is unavailable. Sign in and launch Minecraft 1.21.4 with the official Launcher.")
         return LAUNCHER_REQUIRED;
       return outcome.finalStage === "client_startup" ?
@@ -136,6 +138,7 @@ function startupFailure(line: string) {
     return "A previous agent run did not confirm cleanup. Resolve that local run before starting another.";
   if (line.startsWith("Insufficient storage:"))
     return "There is not enough disk space for a new agent run. Free space and try again.";
+  if (line === TERRA_ACTOR_REBUILD) return TERRA_ACTOR_REBUILD;
   if (line === "Existing explicit Minecraft 1.21.4 EULA consent is required.") return EULA_REQUIRED;
   if (line.startsWith("xvfb-run: error:") || line.startsWith("Run this command under xvfb-run"))
     return "The isolated Minecraft display could not start. Check Xvfb and xauth.";
@@ -230,7 +233,8 @@ export class SurvivalAgent {
     if (!consents.some((consent) => consent?.eulaAccepted === true && consent.minecraftVersion === "1.21.4" &&
         consent.eulaUrl === "https://www.minecraft.net/en-us/eula")) throw new AgentLaunchFault(EULA_REQUIRED);
     if (!await isReadable(path.join(this.root, "survival-agent/build/libs/survival-agent-1.0.jar")))
-      throw new AgentLaunchFault("Build GameHarness with bun run build to install the Minecraft Survival Agent mod, then try again.");
+      throw new AgentLaunchFault(attempt.strategy === "terra" ? TERRA_ACTOR_REBUILD :
+        "Build GameHarness with bun run build to install the Minecraft Survival Agent mod, then try again.");
     const version = path.join(homedir(), ".minecraft/versions/1.21.4/1.21.4");
     if (!await isReadable(`${version}.jar`) || !await isReadable(`${version}.json`))
       throw new AgentLaunchFault(LAUNCHER_REQUIRED);

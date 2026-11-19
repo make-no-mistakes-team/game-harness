@@ -30,6 +30,7 @@ import {
 } from "./native-evaluation.ts";
 import { javaProxyArguments } from "./java-network.ts";
 import { OfficialSessionUnavailableError } from "./native-launch-fault.ts";
+import { requireTerraActorWire, TerraActorCompatibilityError } from "./survival-agent-artifact.ts";
 import {
   hasCompletedFabricInstallation,
   recordCompletedFabricInstallation,
@@ -431,12 +432,20 @@ export class MinecraftClient {
   }
 
   /** Stage and hash the exact Minecraft Survival Agent JAR the fresh client will load. */
-  async stageAgentArtifact(artifact: string) {
+  async stageAgentArtifact(artifact: string, requireTerraWorkWire = false) {
     const mods = path.join(this.directory, "mods");
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     await mkdir(mods, { mode: 0o700 });
     const installed = path.join(mods, "survival-agent.jar");
-    await copyFile(artifact, installed);
+    await copyFile(artifact, installed).catch((error: NodeJS.ErrnoException) => {
+      if (requireTerraWorkWire && (error.code === "ENOENT" || error.code === "EISDIR"))
+        throw new TerraActorCompatibilityError();
+      throw error;
+    });
+    if (requireTerraWorkWire) {
+      await chmod(installed, 0o400);
+      return requireTerraActorWire(installed);
+    }
     const hash = createHash("sha256");
     for await (const chunk of createReadStream(installed)) hash.update(chunk);
     return hash.digest("hex");

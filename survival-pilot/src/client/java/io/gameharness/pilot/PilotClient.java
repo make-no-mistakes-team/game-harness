@@ -178,6 +178,7 @@ public final class PilotClient implements ClientModInitializer {
         boolean alive = client.player.isAlive();
         boolean fleeing = false;
         if (alive) {
+            progress.observeMemoryFooting(tick);
             body.begin();
             fleeing = ears.escape(body, hands);
             if (!fleeing) {

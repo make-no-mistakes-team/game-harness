@@ -105,6 +105,7 @@ final class PilotBody {
     private Vec3d eye;
     private HitResult renderedCrosshair;
     private HitResult tickCrosshair;
+    private Vec3d threatPoint;
     private Vec3d aimPoint;
     private float aimYaw;
     private float aimPitch;
@@ -148,6 +149,7 @@ final class PilotBody {
     private boolean ownsRowKeys;
     private Entity striking;
     private LivingEntity shielding;
+    private Vec3d raisedShieldBearing;
     private Item armor;
 
     PilotBody(MinecraftClient client) {
@@ -210,6 +212,7 @@ final class PilotBody {
         supportFace = null;
         striking = null;
         shielding = null;
+        raisedShieldBearing = null;
         armor = null;
     }
 
@@ -307,12 +310,12 @@ final class PilotBody {
 
         boolean attack = false;
         boolean use = false;
-        if (shielding != null && !options.useKey.isUnbound()) {
-            double dx = shielding.getX() - player.getX();
-            double dz = shielding.getZ() - player.getZ();
-            boolean facing = dx * dx + dz * dz > 1e-6
-                && Math.abs(MathHelper.wrapDegrees(heading(dx, dz) - player.getYaw())) <= 38;
-            if (facing && shielding.isAlive()) {
+        if (raisedShieldBearing != null) {
+            // With no new view, never start using an item or inspect the old target.
+            use = !options.useKey.isUnbound() && player.isUsingItem() && player.getActiveItem().isOf(Items.SHIELD)
+                && facesShieldBearing(player, raisedShieldBearing.x, raisedShieldBearing.z);
+        } else if (shielding != null && !options.useKey.isUnbound()) {
+            if (facesShieldBearing(player, shielding.getX(), shielding.getZ()) && shielding.isAlive()) {
                 if (player.isUsingItem()) {
                     use = player.getActiveItem().isOf(Items.SHIELD);
                 } else {
@@ -775,6 +778,12 @@ final class PilotBody {
 
     boolean hasRecentView() { return hasView(); }
 
+    boolean combatViewMissing() {
+        // An old frame is not a fresh negative; an interrupted or replaced view is not reusable.
+        return ready() && observedWorld == client.world && observedPlayer == client.player
+            && tick - observedAtTick > 1;
+    }
+
     boolean shieldStartWouldUseBlock() {
         HitResult actual = currentCrosshair();
         return actual != null && actual.getType() == HitResult.Type.BLOCK;
@@ -786,6 +795,16 @@ final class PilotBody {
     }
 
     void blockAgainst(LivingEntity threat) { shielding = threat; }
+
+    void holdRaisedShieldToward(Vec3d lastSeen) {
+        raisedShieldBearing = lastSeen;
+    }
+
+    private static boolean facesShieldBearing(ClientPlayerEntity player, double x, double z) {
+        double dx = x - player.getX(), dz = z - player.getZ();
+        return dx * dx + dz * dz > 1e-6
+            && Math.abs(MathHelper.wrapDegrees(heading(dx, dz) - player.getYaw())) <= 38;
+    }
 
     boolean swapShieldToOffhand() {
         return ready() && !client.player.isUsingItem() && client.player.getMainHandStack().isOf(Items.SHIELD)
@@ -1126,18 +1145,22 @@ final class PilotBody {
     }
 
     Optional<LivingEntity> threat(double distance) {
-        return visibleEntity(LivingEntity.class, entity -> entity instanceof Monster, distance);
+        threatPoint = null;
+        return visibleEntity(LivingEntity.class, entity -> entity instanceof Monster, distance, true);
     }
 
+    Vec3d threatPoint() { return threatPoint; }
+
     Optional<ItemEntity> dropped(Predicate<ItemStack> matches, double distance) {
-        return visibleEntity(ItemEntity.class, entity -> matches.test(entity.getStack()), distance);
+        return visibleEntity(ItemEntity.class, entity -> matches.test(entity.getStack()), distance, false);
     }
 
     Optional<Entity> visibleEntity(Predicate<Entity> matches, double distance) {
-        return visibleEntity(Entity.class, matches, distance);
+        return visibleEntity(Entity.class, matches, distance, false);
     }
 
-    private <T extends Entity> Optional<T> visibleEntity(Class<T> type, Predicate<T> matches, double distance) {
+    private <T extends Entity> Optional<T> visibleEntity(Class<T> type, Predicate<T> matches, double distance,
+                                                       boolean rememberThreatPoint) {
         if (!hasView()) return Optional.empty();
         double max = range(distance);
         if (!(max > 0)) return Optional.empty();
@@ -1151,11 +1174,18 @@ final class PilotBody {
             double d = center.squaredDistanceTo(eye);
             if (d > bestDistance) continue;
             double margin = candidate.getHeight() * 0.32;
-            if ((clearPoint(center, Ray.SIGHT) || clearPoint(center.add(0, margin, 0), Ray.SIGHT)
-                    || clearPoint(center.add(0, -margin, 0), Ray.SIGHT)) && matches.test(candidate)) {
-                best = candidate;
-                bestDistance = d;
+            Vec3d visible = center;
+            if (!clearPoint(visible, Ray.SIGHT)) {
+                visible = center.add(0, margin, 0);
+                if (!clearPoint(visible, Ray.SIGHT)) {
+                    visible = center.add(0, -margin, 0);
+                    if (!clearPoint(visible, Ray.SIGHT)) continue;
+                }
             }
+            if (!matches.test(candidate)) continue;
+            best = candidate;
+            bestDistance = d;
+            if (rememberThreatPoint) threatPoint = visible;
         }
         return Optional.ofNullable(best);
     }
@@ -1209,11 +1239,16 @@ final class PilotBody {
     }
 
     private boolean litFace(BlockHitResult hit) {
+        return observedFaceLight(hit) > 0;
+    }
+
+    /** The open side of a face just returned by a camera ray, never a probe into unseen rock. */
+    int observedFaceLight(BlockHitResult hit) {
+        if (nightVision) return 15;
         Vec3d point = hit.getPos();
         Direction side = hit.getSide();
-        // The open side is where the visible surface samples light, not the block behind it.
-        return lit(point.x + 0.02 * side.getOffsetX(), point.y + 0.02 * side.getOffsetY(),
-            point.z + 0.02 * side.getOffsetZ());
+        return client.world.getLightLevel(lightPos.set(point.x + 0.02 * side.getOffsetX(),
+            point.y + 0.02 * side.getOffsetY(), point.z + 0.02 * side.getOffsetZ()));
     }
 
     private boolean lit(double x, double y, double z) {

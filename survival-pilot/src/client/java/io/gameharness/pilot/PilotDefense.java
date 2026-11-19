@@ -19,6 +19,7 @@ import net.minecraft.util.math.Vec3d;
 /** Cave kit and weapon choices use the player's inventory; combat uses only the current view. */
 final class PilotDefense {
     private static final int SHIELD_PLANKS = 6;
+    private static final int COMBAT_VIEW_GRACE = 3;
     private static final long ZOMBIE_LOOK_NANOS = 1_200_000_000L;
     private static final float ZOMBIE_LOOK_PITCH = 10;
     private static final Predicate<ItemStack> SHIELD = stack -> stack.isOf(Items.SHIELD);
@@ -70,6 +71,7 @@ final class PilotDefense {
     private LivingEntity lastThreat;
     private int engagementStarted;
     private int lastEngaged;
+    private int seenAt;
     private Vec3d aim;
     private PilotEars.ZombieCue zombieLook;
     private long zombieLookUntil;
@@ -130,6 +132,26 @@ final class PilotDefense {
     }
 
     void cancelSelection() { combatSelecting = false; }
+
+    void forgetContact() {
+        lastThreat = null;
+        aim = null;
+    }
+
+    boolean holdCombatView() {
+        if (aim == null) return false;
+        var player = client.player;
+        if (body.actionTick() - seenAt > COMBAT_VIEW_GRACE || !body.combatViewMissing()
+                || !player.isOnGround() || player.isTouchingWater() || player.hasVehicle()) {
+            forgetContact();
+            return false;
+        }
+        // Keep aiming at the observed point. Do not follow a moving entity or request an attack.
+        body.aim(aim);
+        body.holdRaisedShieldToward(aim);
+        status = "holding the last visible combat bearing";
+        return true;
+    }
 
     boolean canPrepare(int tick) {
         return tick >= calmAfter && !client.player.isUsingItem() && body.hasRecentView();
@@ -257,16 +279,8 @@ final class PilotDefense {
         if (lastThreat != threat || tick - lastEngaged > 3) engagementStarted = tick;
         lastThreat = threat;
         lastEngaged = tick;
-        aim = threat.getBoundingBox().getCenter();
-        if (!body.clearTerrain(aim)) {
-            double margin = threat.getHeight() * 0.32;
-            Vec3d upper = aim.add(0, margin, 0);
-            if (body.clearTerrain(upper)) aim = upper;
-            else {
-                Vec3d lower = aim.add(0, -margin, 0);
-                if (body.clearTerrain(lower)) aim = lower;
-            }
-        }
+        seenAt = body.actionTick();
+        aim = body.threatPoint();
         face();
 
         boolean mainShield = SHIELD.test(player.getMainHandStack());

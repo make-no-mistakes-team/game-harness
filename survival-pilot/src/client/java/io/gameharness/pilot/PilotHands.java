@@ -258,11 +258,7 @@ final class PilotHands {
         return recipe == null ? null : new CraftRequest(recipe, key);
     }
 
-    boolean smelt() {
-        return smelt(false);
-    }
-
-    boolean smelt(boolean charcoal) {
+    boolean smelt(boolean charcoal, int batchLimit) {
         if (busy() || c.player == null || c.world == null) return false;
         if (!(c.currentScreen instanceof FurnaceScreen furnace)) return report("smelt", "furnace required");
         var handler = furnace.getScreenHandler();
@@ -270,7 +266,7 @@ final class PilotHands {
         Slot input = handler.getSlot(0), fuel = handler.getSlot(1), output = handler.getOutputSlot();
         ItemStack finished = output.getStack();
         if (!finished.isEmpty()) {
-            if (!finished.isOf(Items.IRON_INGOT) && !finished.isOf(Items.CHARCOAL))
+            if (!finished.isOf(charcoal ? Items.CHARCOAL : Items.IRON_INGOT))
                 return report("smelt", "unrelated furnace output");
             if (!storageRoom(finished, null)) return report("smelt", "inventory full");
             start(Job.SMELT, "smelt", furnace);
@@ -280,7 +276,9 @@ final class PilotHands {
         }
 
         var fuels = c.world.getFuelRegistry();
-        if (!handler.isBurning() && fuel.hasStack() && fuels.getFuelTicks(fuel.getStack()) <= 0)
+        ItemStack fuelStack = fuel.getStack();
+        int installedHeat = fuels.getFuelTicks(fuelStack) * fuelStack.getCount();
+        if (!handler.isBurning() && !fuelStack.isEmpty() && installedHeat == 0)
             return report("smelt", "fuel slot occupied");
         Slot inputSource = null;
         int inputCount = input.getStack().getCount();
@@ -288,38 +286,44 @@ final class PilotHands {
             inputSource = findStorage(handler, charcoal ? stack -> stack.isIn(ItemTags.LOGS_THAT_BURN)
                     : stack -> stack.isOf(Items.RAW_IRON));
             if (inputSource == null) return report("smelt", "no input");
-            inputCount = Math.min(inputSource.getStack().getCount(), 3);
+            inputCount = Math.min(inputSource.getStack().getCount(), batchLimit);
         } else {
             ItemStack existing = input.getStack();
-            if (!existing.isOf(Items.RAW_IRON) && !existing.isIn(ItemTags.LOGS_THAT_BURN))
+            if (!(charcoal ? existing.isIn(ItemTags.LOGS_THAT_BURN) : existing.isOf(Items.RAW_IRON)))
                 return report("smelt", "unrelated furnace input");
-            if (handler.isBurning() || fuel.hasStack()) return report("smelt", "cooking");
+            if (handler.isBurning() || installedHeat > 0) return report("smelt", "cooking");
         }
 
         Slot fuelSource = null;
         int fuelCount = 0;
-        if (!handler.isBurning() && !fuel.hasStack()) {
+        int heat = installedHeat;
+        int requiredTicks = Math.min(batchLimit, inputCount) * SMELT_TICKS;
+        if (installedHeat < requiredTicks) {
             int bestRank = Integer.MAX_VALUE;
-            int bestTicks = 0;
-            int requiredTicks = Math.min(3, inputCount) * SMELT_TICKS;
+            int bestRecipes = Math.min(requiredTicks, installedHeat) / SMELT_TICKS;
             for (Slot slot : handler.slots) {
                 if (!isStorage(slot) || slot == inputSource || !slot.hasStack()) continue;
                 ItemStack stack = slot.getStack();
                 int rank = fuelRank(stack);
-                if (rank == Integer.MAX_VALUE || !fuel.canInsert(stack)) continue;
+                if (rank == Integer.MAX_VALUE) continue;
                 int ticks = fuels.getFuelTicks(stack);
                 if (ticks <= 0) continue;
-                int coverage = ticks * stack.getCount();
-                // A stack which can finish the planned batch beats one which would stall it.
-                if (coverage < requiredTicks) rank += 4;
-                if (rank > bestRank || rank == bestRank && coverage <= bestTicks) continue;
+                int quantity = Math.min(stack.getCount(), room(fuel, stack));
+                int recipes = Math.min(requiredTicks, installedHeat + ticks * quantity) / SMELT_TICKS;
+                if (recipes <= installedHeat / SMELT_TICKS
+                        || recipes < bestRecipes || recipes == bestRecipes && rank >= bestRank) continue;
                 bestRank = rank;
-                bestTicks = coverage;
+                bestRecipes = recipes;
                 fuelSource = slot;
-                fuelCount = Math.min(stack.getCount(), (requiredTicks + ticks - 1) / ticks);
+                fuelCount = Math.min(quantity, (recipes * SMELT_TICKS - installedHeat + ticks - 1) / ticks);
+                heat = installedHeat + fuelCount * ticks;
             }
-            if (fuelSource == null) return report("smelt", "no fuel");
         }
+        // Quote heat against the current slots, after any workshop crafting. Only a live
+        // burn can justify trying one item without a full 200 ticks in the fuel slot.
+        int affordable = Math.max(heat / SMELT_TICKS, handler.isBurning() ? 1 : 0);
+        if (affordable == 0) return report("smelt", "no fuel");
+        inputCount = Math.min(inputCount, affordable);
 
         start(Job.SMELT, "smelt", furnace);
         // In a cold, empty furnace, finish loading the fuel before the input can ignite it.
@@ -327,6 +331,19 @@ final class PilotHands {
         if (inputSource != null) transfer(inputSource, input, inputCount);
         planned = true;
         return true;
+    }
+
+    boolean prepareSmeltFuel(boolean reserveLog) {
+        var inventory = c.player.getInventory();
+        if (reserveLog && count(stack -> stack.isIn(ItemTags.LOGS_THAT_BURN)) <= 1) return false;
+        for (int i = 0; i < PlayerInventory.MAIN_SIZE; i++) {
+            ItemStack stack = inventory.getStack(i);
+            if (stack.isEmpty() || !stack.isIn(ItemTags.LOGS_THAT_BURN)) continue;
+            Item planks = planksFor(stack);
+            if (planks != null && c.world.getFuelRegistry().getFuelTicks(new ItemStack(planks)) > 0)
+                return craft(Registries.ITEM.getId(planks).getPath());
+        }
+        return false;
     }
 
     /** Returns true if the item is already held or an equip job was queued. */
@@ -896,7 +913,8 @@ final class PilotHands {
             pendingKey.wasPressed(); // Remove our queued key edge if vanilla has not consumed it.
             pendingKey = null;
         }
-        closeScreen();
+        if (job == Job.SMELT && reason.equals("done")) screen = null;
+        else closeScreen();
         previousFailure = !reason.equals("done") && !reason.equals("cancelled");
         report(label, reason);
         job = null;

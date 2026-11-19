@@ -320,7 +320,9 @@ async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
 }
 
 type Cell = [number, number, number];
-type PilotMemory = { version: 1; dimension: typeof OVERWORLD; trail: Cell[]; workbench?: Cell; furnace?: Cell };
+type PilotMemory = {
+  version: 1; dimension: typeof OVERWORLD; trail: Cell[]; dormant?: Cell[]; workbench?: Cell; furnace?: Cell;
+};
 
 function isCell(value: unknown): value is Cell {
   return Array.isArray(value) && value.length === 3 && value.every(Number.isInteger) &&
@@ -332,22 +334,27 @@ function adjacentCells(a: Cell, b: Cell) {
   return Math.abs(a[1] - b[1]) <= 1 && Math.abs(a[0] - b[0]) + Math.abs(a[2] - b[2]) <= 1;
 }
 
+function validTrail(trail: unknown, limit: number): trail is Cell[] {
+  if (!Array.isArray(trail) || trail.length > limit) return false;
+  const seen = new Set<string>();
+  let previous: Cell | undefined;
+  for (const cell of trail) {
+    if (!isCell(cell) || previous && !adjacentCells(previous, cell)) return false;
+    const key = cell.join(",");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    previous = cell;
+  }
+  return true;
+}
+
 function decodePilotMemory(text: string): PilotMemory | null {
   try {
     const value = JSON.parse(text);
-    if (value?.version !== 1 || value?.dimension !== OVERWORLD || !Array.isArray(value.trail) ||
-        value.trail.length > MEMORY_CELLS ||
-        Object.keys(value).some((key) => !["version", "dimension", "trail", "workbench", "furnace"].includes(key)) ||
+    if (value?.version !== 1 || value?.dimension !== OVERWORLD || !validTrail(value.trail, MEMORY_CELLS) ||
+        ("dormant" in value && !validTrail(value.dormant, MEMORY_CELLS - value.trail.length)) ||
+        Object.keys(value).some((key) => !["version", "dimension", "trail", "dormant", "workbench", "furnace"].includes(key)) ||
         ("workbench" in value && !isCell(value.workbench)) || ("furnace" in value && !isCell(value.furnace))) return null;
-    const seen = new Set<string>();
-    let previous: Cell | undefined;
-    for (const cell of value.trail) {
-      if (!isCell(cell) || previous && !adjacentCells(previous, cell)) return null;
-      const key = cell.join(",");
-      if (seen.has(key)) return null;
-      seen.add(key);
-      previous = cell;
-    }
     return value;
   } catch {
     return null;

@@ -4,12 +4,14 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.LeavesBlock;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.ingame.FurnaceScreen;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.BlockItem;
@@ -30,6 +32,7 @@ final class PilotStallGuard {
     private static final int IDLE_TICKS = 150;
     private static final int MINING_TICKS = 235;
     private static final int FURNACE_TICKS = 245;
+    private static final int FURNACE_UPDATE_TICKS = 30;
     private static final int INCIDENT_TICKS = 650;
     private static final int DRY_FOOTING_TICKS = 110;
     private static final int PROBE_TICKS = 46;
@@ -38,6 +41,7 @@ final class PilotStallGuard {
     private static final int SPIN_TICKS = 45;
     private static final float RECOVERY_TURN_LIMIT = 250;
     private static final int HISTORY = 64;
+    private static final int FLAT_RETURN_AGE = 200;
     private static final int MAX_CUTS = 2;
     private static final int STEP_TICKS = 85;
     private static final double STEP_CENTER = 0.14;
@@ -52,6 +56,9 @@ final class PilotStallGuard {
     record Report(int incidents, int attempts, int recoveries, int failures, String phase, String detail,
                   long eventSequence, int incidentTick) {}
 
+    // A vanilla-foot-contact receipt on the exact level segment, not a terrain lookup at a remembered coordinate.
+    private record FlatCrossing(BlockPos previous, BlockPos next, Vec3d previousFoot, Vec3d crossing, int tick) {}
+
     private final MinecraftClient client;
     private final PilotBody body;
     private final PilotHands hands;
@@ -59,9 +66,12 @@ final class PilotStallGuard {
     private final Predicate<BlockPos> protectedBlock;
     private final Predicate<BlockHitResult> safeSupport;
     private final Consumer<BlockPos> reached;
+    private final Function<BlockPos, String> mineHandback;
     private final BlockPos[] walked = new BlockPos[HISTORY];
+    private final FlatCrossing[] flatCrossings = new FlatCrossing[HISTORY];
     private final BlockPos[] footprints = new BlockPos[HISTORY];
     private final BlockPos[] breakHistory = new BlockPos[24];
+    private final BlockPos[] stairLights = new BlockPos[16];
     private final BlockPos[] route = new BlockPos[4];
     private final Vec3d[] travelCredits = new Vec3d[16];
     private final float[] yawWindow = new float[ANGLE_WINDOW];
@@ -80,15 +90,22 @@ final class PilotStallGuard {
     private Report report = new Report(0, 0, 0, 0, "watch", "", 0, 0);
     private int incidents, attempts, recoveries, failures, tick, incidentTick, entered, lastUseful;
     private int walkedCount, footprintCount, creditCount, brokenCount, novelCells, movedCells, retryCuts;
+    private int stairLightCount, retryRouteCells;
     private int frameBlocks, meals, mineSince, lastCrackTick, crackStage, furnaceSince, furnaceSeen;
+    private int cookInput, cookOutput;
     private long eventSequence, craftSequence, surveySequence, settledSurvey, retrySurvey;
-    private BlockPos lastGround, mining, cooking, incidentFrom;
-    private Vec3d anchor;
+    private BlockPos lastGround, mining, incidentFrom;
+    private FurnaceScreen cooking;
+    private Vec3d anchor, confirmedFoot, priorGroundFeet;
+    private int flatCrossingCount, priorGroundAge, confirmedFootAge;
+    private FlatCrossing returningOnContact;
     private float cookProgress, previousYaw, yawTravel, yawNet, recoveryYaw, glanceYaw, driveYaw;
     private int sampledAngles, previousTurn, reversals, glanceSince;
     private boolean inventoryKnown, dark, lampTried, stepTried, backtrackTried, tookControl, priorityAim;
+    private boolean cookBurning, cooked;
     private boolean glanceTried, glancing;
-    private boolean workBroke, resourceBroke;
+    private boolean mineHandedBack;
+    private boolean workBroke, resourceBroke, stairLit, surfaceStep;
     private BlockPos from, to, cut;
     private Vec3d cutAim;
     private Direction bearing;
@@ -101,7 +118,7 @@ final class PilotStallGuard {
 
     PilotStallGuard(MinecraftClient client, PilotBody body, PilotHands hands, PilotTools tools,
                     Predicate<BlockPos> protectedBlock, Predicate<BlockHitResult> safeSupport,
-                    Consumer<BlockPos> reached) {
+                    Consumer<BlockPos> reached, Function<BlockPos, String> mineHandback) {
         this.client = client;
         this.body = body;
         this.hands = hands;
@@ -109,6 +126,7 @@ final class PilotStallGuard {
         this.protectedBlock = protectedBlock;
         this.safeSupport = safeSupport;
         this.reached = reached;
+        this.mineHandback = mineHandback;
     }
 
     Report report() { return report; }
@@ -121,8 +139,35 @@ final class PilotStallGuard {
         if (sequence > surveySequence) surveySequence = sequence;
     }
 
+    /** Credit new ordinary stair lighting, not torch presses or recovery's own actions. */
+    void stairLightReceipt(BlockPos position) {
+        if (phase != Phase.WATCH && (phase != Phase.PENDING || tookControl)
+                || contains(stairLights, position)) return;
+        stairLights[stairLightCount++ % stairLights.length] = position;
+        stairLit = true;
+    }
+
+    /** A settled waypoint on an ordinary return or resume, never recovery's driven steps. */
+    void followedMineWaypoint() {
+        if (phase == Phase.RETRY) retryRouteCells++;
+    }
+
+    /** A new surface landing, reached after its support and clearance were witnessed. */
+    void reachedNewSurfaceFooting(BlockPos position) {
+        if ((phase == Phase.WATCH || phase == Phase.PENDING && !tookControl)
+                && dryGround() && position.equals(client.player.getBlockPos())) surfaceStep = true;
+    }
+
     /** Existing vanilla client player break receipt, not an attack request or an air-block guess. */
     void broken(BlockPos position, BlockState state) {
+        if (lastGround != null && inFootColumn(position, lastGround)) confirmedFoot = null;
+        for (int i = 0; i < flatCrossings.length; i++) {
+            FlatCrossing crossing = flatCrossings[i];
+            if (crossing == null || !inFootColumn(position, crossing.previous())
+                    && !inFootColumn(position, crossing.next())) continue;
+            flatCrossings[i] = null;
+            if (phase == Phase.WALK && returningOnContact == crossing) rejectWalk();
+        }
         if (phase == Phase.CUT && position.equals(cut)) {
             cutFinished = true;
             return;
@@ -135,17 +180,49 @@ final class PilotStallGuard {
             || state.isIn(BlockTags.COAL_ORES) || state.isIn(BlockTags.DIAMOND_ORES) || state.isOf(Blocks.OBSIDIAN);
     }
 
-    /** Only an observed furnace screen with relevant input and actual burning supplies this grace. */
-    void cooking(int now, BlockPos station, float fraction) {
-        if (station == null || !(fraction > 0 && fraction < 1)) return;
-        if (furnaceSince == 0) {
-            cooking = station;
-            furnaceSince = furnaceSeen = now;
+    /** A bound vanilla screen supplies the burn and recipe evidence; opening it alone proves neither. */
+    void furnaceState(int now, FurnaceScreen screen, boolean burning, float fraction, int input, int output) {
+        if (cooking != screen) {
+            cooking = screen;
+            furnaceSince = now;
+            furnaceSeen = burning && fraction > 0 ? now : 0;
             cookProgress = fraction;
-        } else if (station.equals(cooking) && fraction > cookProgress) {
-            furnaceSeen = now;
+            cookInput = input;
+            cookOutput = output;
+        } else if (input < cookInput && output > cookOutput) {
+            // A new result and consumed input prove one genuine wrap; a falling bar alone does not.
+            cooked = true;
+            furnaceSince = now;
+            furnaceSeen = burning ? now : 0;
             cookProgress = fraction;
+            cookInput = input;
+            cookOutput = output;
+        } else {
+            // Slot updates can arrive separately, so retain the previous pair until both agree.
+            cookInput = Math.max(cookInput, input);
+            cookOutput = Math.min(cookOutput, output);
+            if (!burning || !cookBurning) {
+                furnaceSince = now;
+                furnaceSeen = burning && fraction > 0 ? now : 0;
+                cookProgress = fraction;
+            } else if (fraction > cookProgress) {
+                furnaceSeen = now;
+                cookProgress = fraction;
+            }
         }
+        cookBurning = burning;
+    }
+
+    void stopCooking() {
+        cooking = null;
+        cookBurning = false;
+    }
+
+    boolean furnaceAdvancing(int now) {
+        return cookBurning && cooking != null && client.currentScreen == cooking
+            && client.player.currentScreenHandler == cooking.getScreenHandler()
+            && cooking.getScreenHandler().isBurning() && now - furnaceSince <= FURNACE_TICKS
+            && now - (furnaceSeen == 0 ? furnaceSince : furnaceSeen) <= FURNACE_UPDATE_TICKS;
     }
 
     void observe(int now, int confirmedFrameBlocks, int confirmedMeals, String activity) {
@@ -158,7 +235,18 @@ final class PilotStallGuard {
         if (grounded) {
             BlockPos cell = player.getBlockPos();
             if (!cell.equals(lastGround)) {
+                if (lastGround != null && priorGroundFeet != null && confirmedFoot != null
+                        && player.age == priorGroundAge + 1
+                        && player.age - confirmedFootAge <= 32
+                        && cell.getY() == lastGround.getY() && neighbor(lastGround, cell)
+                        && Math.abs(feet.y - cell.getY()) < 0.04
+                        && feet.squaredDistanceTo(priorGroundFeet) < 0.20
+                        && sidewaysDistance(confirmedFoot, feet, lastGround.getX() == cell.getX()) <= 0.22) {
+                    flatCrossings[flatCrossingCount++ % HISTORY] = new FlatCrossing(lastGround, cell.toImmutable(),
+                        confirmedFoot, feet, tick);
+                }
                 lastGround = cell.toImmutable();
+                confirmedFoot = null;
                 walked[walkedCount++ % HISTORY] = lastGround;
                 movedCells++;
                 if (!contains(footprints, cell)) {
@@ -166,6 +254,14 @@ final class PilotStallGuard {
                     novelCells++;
                 }
             }
+            if (Math.abs(feet.y - cell.getY()) < 0.04 && centerMargin(feet, cell) >= 0.24 && standingOn(cell)) {
+                confirmedFoot = feet;
+                confirmedFootAge = player.age;
+            }
+            priorGroundFeet = feet;
+            priorGroundAge = player.age;
+        } else {
+            priorGroundFeet = confirmedFoot = null;
         }
         var receipt = hands.lastCraftReceipt();
         long sequence = receipt == null ? 0 : receipt.sequence();
@@ -184,24 +280,27 @@ final class PilotStallGuard {
         boolean newTravel = grounded && novelCells >= 2 && distance >= 4.0;
         boolean knownTravel = grounded && movedCells >= 4 && distance >= 25.0 && awayFromCredits(feet);
         boolean wetTravel = (player.isTouchingWater() || player.hasVehicle()) && distance >= 16.0 && awayFromCredits(feet);
-        boolean effect = workBroke || crafted || framed || fed || surveyed || gain != 0;
+        boolean effect = workBroke || crafted || framed || fed || surveyed || stairLit || surfaceStep || cooked || gain != 0;
         if ((normal || phase == Phase.PENDING && !tookControl)
                 && (effect || newTravel || knownTravel || wetTravel)) {
             if (knownTravel || wetTravel) travelCredits[creditCount++ % travelCredits.length] = feet;
-            markUseful(feet, effect);
+            markUseful(feet);
             if (!normal) transition(Phase.WATCH, "ordinary play advanced before recovery took control");
         } else if (phase == Phase.RETRY) {
             // A recovery step, its dropped dirt, or walking back to the old locus is not a success.
             boolean sustained = tick - entered >= 45 && grounded && movedCells >= 3 && novelCells >= 2
                 && distance >= 10.0 && feet.squaredDistanceTo(Vec3d.ofBottomCenter(incidentFrom)) >= 12.0;
-            if (crafted || framed || resourceBroke || tick - entered >= 25 && gain == 2
-                    || tick - entered >= 45 && (sustained || retryCuts >= 3 || surveySequence - retrySurvey >= 3)) {
+            boolean continuedRoute = grounded && retryRouteCells >= 5 && movedCells >= 5 && distance >= 25.0
+                && feet.squaredDistanceTo(Vec3d.ofBottomCenter(incidentFrom)) >= 25.0;
+            if (crafted || framed || cooked || resourceBroke || tick - entered >= 25 && gain == 2
+                    || tick - entered >= 45 && (sustained || continuedRoute || retryCuts >= 3
+                        || surveySequence - retrySurvey >= 3)) {
                 recoveries++;
-                markUseful(feet, true);
+                markUseful(feet);
                 transition(Phase.WATCH, "ordinary play advanced after the recovery attempt");
             }
         }
-        workBroke = resourceBroke = false;
+        workBroke = resourceBroke = stairLit = surfaceStep = cooked = false;
         int idle = tick - lastUseful;
         if (phase != Phase.WATCH || hands.busy() && idle < 300) return;
         boolean spinning = idle >= SPIN_TICKS && distance <= 2.25 && yawTravel >= 275
@@ -256,7 +355,10 @@ final class PilotStallGuard {
     /** Feed a recoverable local skill stop before the outer client ends the run. */
     void skillBlocked(String reason) {
         if (phase == Phase.WATCH) detect(reason);
-        else if (phase == Phase.RETRY) nextAttempt(reason);
+        else if (phase == Phase.RETRY) {
+            if (mineHandedBack) fail("ordinary miner handback failed: " + reason);
+            else nextAttempt(reason);
+        }
     }
 
     /** Called only after the existing danger, hands, screen and food owners have declined this tick. */
@@ -269,6 +371,10 @@ final class PilotStallGuard {
         }
         if (phase == Phase.RETRY) {
             if (tick - entered < RETRY_TICKS || verifiedMining(entered) || verifiedFurnace()) return false;
+            if (mineHandedBack) {
+                fail("ordinary miner handback made no settled progress (" + report.detail() + ")");
+                return true;
+            }
             nextAttempt("ordinary play returned to the same local stall");
         }
         if (phase == Phase.PENDING) {
@@ -308,25 +414,30 @@ final class PilotStallGuard {
     private void resetWorld() {
         world = client.world;
         Arrays.fill(walked, null);
+        Arrays.fill(flatCrossings, null);
         Arrays.fill(footprints, null);
         Arrays.fill(travelCredits, null);
         Arrays.fill(breakHistory, null);
-        walkedCount = footprintCount = creditCount = brokenCount = 0;
+        Arrays.fill(stairLights, null);
+        walkedCount = footprintCount = creditCount = brokenCount = stairLightCount = 0;
         lastGround = null;
+        flatCrossingCount = 0;
+        returningOnContact = null;
+        priorGroundFeet = confirmedFoot = null;
         inventoryKnown = false;
         previousYaw = client.player.getYaw();
-        markUseful(client.player.getPos(), true);
+        stopCooking();
+        markUseful(client.player.getPos());
         if (phase != Phase.WATCH) transition(Phase.WATCH, "client world changed");
     }
 
-    private void markUseful(Vec3d feet, boolean receipt) {
+    private void markUseful(Vec3d feet) {
         lastUseful = tick;
         anchor = feet;
         novelCells = movedCells = 0;
         clearAngles();
         mineSince = 0;
         mining = null;
-        if (receipt) furnaceSince = 0;
     }
 
     /** Compare total owned items, not slot order, selected hotbar, damage, or in-flight GUI transfers. */
@@ -398,7 +509,7 @@ final class PilotStallGuard {
     }
 
     private boolean verifiedFurnace() {
-        return furnaceSince != 0 && tick - furnaceSince <= FURNACE_TICKS && tick - furnaceSeen <= 85;
+        return furnaceSeen != 0 && furnaceAdvancing(tick);
     }
 
     private void detect(String reason) {
@@ -414,6 +525,7 @@ final class PilotStallGuard {
         recoveryYaw = 0;
         dark = lampTried = stepTried = backtrackTried = tookControl = false;
         glanceTried = glancing = false;
+        mineHandedBack = false;
         transition(Phase.PENDING, reason + " at " + incidentFrom.toShortString());
     }
 
@@ -422,6 +534,7 @@ final class PilotStallGuard {
         bearing = client.player.getHorizontalFacing();
         routeIndex = routeLength = proof = 0;
         glancing = false;
+        returningOnContact = null;
         to = null;
         transition(Phase.SCOUT, "checking alternate visible ground from " + from.toShortString());
     }
@@ -513,6 +626,7 @@ final class PilotStallGuard {
         to = cell;
         proof = 0;
         probeSince = tick;
+        returningOnContact = null;
     }
 
     private boolean checkStance() {
@@ -525,6 +639,10 @@ final class PilotStallGuard {
             BlockHitResult support = body.terrain(point, eye.distanceTo(point) + 0.05).orElse(null);
             if (support == null) {
                 dark |= body.outlined(to.down());
+                return false;
+            }
+            if (routeLength != 0 && to.getY() == from.getY() && support.getBlockPos().equals(from.down())) {
+                // We can see the near lip, not the recorded target. This is incomplete, not contradictory.
                 return false;
             }
             if (!support.getBlockPos().equals(to.down()) || support.getSide() != Direction.UP || !fullSupport(support)) {
@@ -591,36 +709,66 @@ final class PilotStallGuard {
 
     private void backtrack() {
         if (!dryGround()) return;
-        if (!from.equals(client.player.getBlockPos()) || tick - probeSince >= PROBE_TICKS) {
-            triedStances.add(to);
-            rejectedStances.add(to);
-            boolean moved = routeIndex != 0 && from.equals(client.player.getBlockPos());
-            routeLength = routeIndex = 0;
-            to = null;
-            if (moved) retry("retreated to " + from.toShortString() + "; the next footing was not verified");
-            else transition(Phase.SCOUT, "recently traveled footing no longer proved safe");
-        } else if (checkStance()) startWalk();
+        boolean atStart = from.equals(client.player.getBlockPos());
+        if (atStart && tick - probeSince < PROBE_TICKS) {
+            if (checkStance()) startWalk();
+            return;
+        }
+        if (atStart && !rejectedStances.contains(to) && beginContactReturn()) return;
+        triedStances.add(to);
+        rejectedStances.add(to);
+        boolean moved = routeIndex != 0 && atStart;
+        routeLength = routeIndex = 0;
+        to = null;
+        if (moved) retry("retreated to " + from.toShortString() + "; the next footing was not verified");
+        else scanFromHere();
+    }
+
+    private boolean beginContactReturn() {
+        if (from.getY() != to.getY() || !standingOn(from) || !body.hasRecentView()
+                || client.options.sneakKey.isUnbound() || client.player.horizontalCollision) return false;
+        Vec3d feet = client.player.getPos();
+        for (int i = flatCrossingCount - 1; i >= Math.max(0, flatCrossingCount - HISTORY); i--) {
+            FlatCrossing known = flatCrossings[i % HISTORY];
+            if (known == null) continue;
+            if (tick - known.tick() > FLAT_RETURN_AGE) break;
+            if (!known.next().equals(from) || !known.previous().equals(to)
+                    || sidewaysFromCrossing(feet, known) > 0.26
+                    || feet.squaredDistanceTo(known.previousFoot()) > 2.56
+                    || routeChanged(known.previousFoot())) continue;
+            returningOnContact = known;
+            startWalk();
+            return true;
+        }
+        return false;
     }
 
     private void startWalk() {
         triedStances.add(to);
         attempts++;
         driveSince = 0;
-        transition(Phase.WALK, (routeLength == 0 ? "committing to visible stance " : "backtracking to ")
+        transition(Phase.WALK, (returningOnContact != null ? "crouching along a recently crossed level support to "
+            : routeLength == 0 ? "committing to visible stance " : "backtracking to ")
             + to.toShortString());
     }
 
     private void move() {
+        if (returningOnContact != null) {
+            moveOnContact();
+            return;
+        }
         var player = client.player;
         Vec3d landing = Vec3d.ofBottomCenter(to);
         Vec3d delta = landing.subtract(player.getPos());
         if (dryGround() && to.equals(player.getBlockPos()) && delta.horizontalLengthSquared() < 0.46) {
-            reached.accept(to);
-            if (routeLength != 0 && ++routeIndex < routeLength) {
-                from = to;
-                nominate(route[routeIndex]);
-                transition(Phase.BACKTRACK, "rechecking the next recorded footing");
-            } else retry("reached " + to.toShortString() + "; requiring ordinary-play progress");
+            reachedStance();
+            return;
+        }
+        if (!player.isOnGround() && !player.isTouchingWater() && to.getY() <= from.getY()
+                && player.getY() >= to.getY() - 0.04 && delta.horizontalLengthSquared() < 0.15
+                && tick - entered <= 48) {
+            // Crossing the center while still dropping reverses the target bearing.
+            // Let the already witnessed landing settle before treating it as a failed route.
             return;
         }
         float face = yaw(delta);
@@ -628,9 +776,7 @@ final class PilotStallGuard {
                 || driveSince != 0 && Math.abs(MathHelper.wrapDegrees(face - driveYaw)) > 30
                 || delta.horizontalLengthSquared() > 3.2 || body.hazardAhead(face, 1.45)
                 || player.isTouchingWater() || player.getY() < Math.min(from.getY(), to.getY()) - 0.25) {
-            rejectedStances.add(to);
-            routeLength = routeIndex = 0;
-            scanFromHere();
+            rejectWalk();
             return;
         }
         if (delta.horizontalLengthSquared() < 0.05) return;
@@ -642,6 +788,95 @@ final class PilotStallGuard {
         }
         if (to.getY() > from.getY() && player.getY() < to.getY() - 0.20 && player.isOnGround()) body.jump();
         body.walkDownTo(landing);
+    }
+
+    private void moveOnContact() {
+        var player = client.player;
+        Vec3d feet = player.getPos();
+        Vec3d landing = returningOnContact.previousFoot();
+        Vec3d delta = landing.subtract(feet);
+        if (!dryGround() || Math.abs(feet.y - landing.y) > 0.04 || player.horizontalCollision
+                || !from.equals(player.getBlockPos()) && !to.equals(player.getBlockPos())
+                || !standingOn(from) && !standingOn(to) || !body.hasRecentView()
+                || sidewaysFromCrossing(feet, returningOnContact) > 0.30
+                || tick - entered > 48 || driveSince != 0 && tick - driveSince > 22
+                || routeChanged(landing)) {
+            rejectWalk();
+            return;
+        }
+        if (to.equals(player.getBlockPos()) && standingOn(to) && delta.horizontalLengthSquared() <= 0.075) {
+            reachedStance();
+            return;
+        }
+        float face = yaw(delta);
+        if (driveSince != 0 && Math.abs(MathHelper.wrapDegrees(face - driveYaw)) > 35) {
+            rejectWalk();
+            return;
+        }
+        body.turn(face, 40);
+        body.sneak();
+        if (Math.abs(MathHelper.wrapDegrees(player.getYaw() - face)) > 8 || !player.isSneaking()) return;
+        if (driveSince == 0) {
+            driveSince = tick;
+            driveYaw = face;
+        }
+        body.walk(false); // Vanilla crouch keeps the ledge guard active; no verified descent and no jump.
+    }
+
+    private boolean routeChanged(Vec3d landing) {
+        if (body.hazardAhead(yaw(landing.subtract(client.player.getPos())), 1.45)) return true;
+        Vec3d eye = client.player.getEyePos();
+        Vec3d floor = landing.add(0, -0.07, 0);
+        BlockHitResult support = body.terrain(floor, eye.distanceTo(floor) + 0.04).orElse(null);
+        if (support != null) {
+            BlockPos cell = support.getBlockPos();
+            if (!cell.equals(from.down()) && !cell.equals(to.down()) || !fullSupport(support)) return true;
+        }
+        for (double height = 0.46; height < 1.60; height += 0.88) {
+            Vec3d clearance = landing.add(0, height, 0);
+            double range = eye.distanceTo(clearance);
+            BlockHitResult blocking = body.terrain(clearance, range).orElse(null);
+            if (blocking != null && eye.squaredDistanceTo(blocking.getPos()) < range * range - 0.005) return true;
+        }
+        return false;
+    }
+
+    private boolean standingOn(BlockPos cell) {
+        BlockPos support = client.player.supportingBlockPos.orElse(null);
+        return support != null && support.getX() == cell.getX() && support.getY() == cell.getY() - 1
+            && support.getZ() == cell.getZ();
+    }
+
+    private static boolean inFootColumn(BlockPos block, BlockPos cell) {
+        return block.getX() == cell.getX() && block.getZ() == cell.getZ()
+            && block.getY() >= cell.getY() - 1 && block.getY() <= cell.getY() + 1;
+    }
+
+    private static double centerMargin(Vec3d feet, BlockPos cell) {
+        return 0.5 - Math.max(Math.abs(feet.x - cell.getX() - 0.5), Math.abs(feet.z - cell.getZ() - 0.5));
+    }
+
+    private static double sidewaysFromCrossing(Vec3d feet, FlatCrossing known) {
+        return sidewaysDistance(feet, known.crossing(), known.previous().getX() == known.next().getX());
+    }
+
+    private static double sidewaysDistance(Vec3d first, Vec3d second, boolean traversedZ) {
+        return traversedZ ? Math.abs(first.x - second.x) : Math.abs(first.z - second.z);
+    }
+
+    private void reachedStance() {
+        returningOnContact = null;
+        reached.accept(to);
+        if (routeLength != 0 && ++routeIndex < routeLength) {
+            from = to;
+            nominate(route[routeIndex]);
+            transition(Phase.BACKTRACK, "rechecking the next recorded footing");
+        } else retry("reached " + to.toShortString() + "; requiring ordinary-play progress");
+    }
+
+    private void rejectWalk() {
+        rejectedStances.add(to);
+        scanFromHere();
     }
 
     private void light() {
@@ -793,6 +1028,21 @@ final class PilotStallGuard {
             double edge = player.getWidth() * 0.5 + STEP_CENTER + 0.01;
             body.turn(player.getYaw(), -89);
             if (player.getPitch() > -86) return;
+            Vec3d eye = player.getEyePos();
+            BlockHitResult lowCeiling = body.terrain(overhead, eye.distanceTo(overhead)).orElse(null);
+            if (lowCeiling != null && lowCeiling.getSide() == Direction.DOWN
+                    && lowCeiling.getBlockPos().getX() == from.getX() && lowCeiling.getBlockPos().getZ() == from.getZ()
+                    && lowCeiling.getPos().y < overhead.y - 0.05
+                    && client.world.getBlockState(lowCeiling.getBlockPos()).getFluidState().isEmpty()) {
+                String handback = mineHandback.apply(from);
+                if (handback == null) failStep("visible ceiling blocks the temporary step and no connected ordinary mine handback is safe");
+                else {
+                    attempts++;
+                    mineHandedBack = true;
+                    retry("visible ceiling blocks the temporary step; " + handback);
+                }
+                return;
+            }
             if (!body.clearTerrain(overhead) || !body.clearTerrain(overhead.add(-edge, 0, -edge))
                     || !body.clearTerrain(overhead.add(-edge, 0, edge))
                     || !body.clearTerrain(overhead.add(edge, 0, -edge))
@@ -863,7 +1113,7 @@ final class PilotStallGuard {
 
     private void retry(String reason) {
         anchor = client.player.getPos();
-        novelCells = movedCells = retryCuts = 0;
+        novelCells = movedCells = retryCuts = retryRouteCells = 0;
         retrySurvey = surveySequence;
         mineSince = 0;
         mining = null;

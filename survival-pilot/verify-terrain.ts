@@ -27,7 +27,7 @@ function proveBirch(events: Event[], steps: Movement[], breaks: z.infer<typeof b
   const departed = refusal && steps.find(p => p.tick >= refusal.tick && p.z > hz + 1.25 && p.grounded);
   const nearHigh = (p: Movement) => p.z < hz + 1.25;
   const highWork = steps.some(p => nearHigh(p) &&
-    (p.activity === "chopping the witnessed trunk" || p.y > sy + 0.12));
+    (p.activity.startsWith("chopping the witnessed trunk") || p.y > sy + 0.12));
   const verified = refusals.length === 1 && refusal !== undefined && refusal.tick <= 180 &&
     Math.hypot(refusal.x - hx - 0.5, refusal.z - hz - 0.5) < 4 && Math.abs(refusal.y - sy) < 0.08 &&
     !highWork && departed !== undefined && departed.tick - refusal.tick <= 160 &&

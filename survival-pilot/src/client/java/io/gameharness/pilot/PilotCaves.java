@@ -38,6 +38,7 @@ final class PilotCaves {
     }
     private record WaterLink(BlockPos lip, BlockPos source, BlockPos bottom, BlockPos shore,
                              Direction approach, Direction flank) {}
+    private record TorchTarget(BlockHitResult support, Vec3d aim, boolean lip) {}
 
     private final MinecraftClient client;
     private final PilotBody body;
@@ -48,6 +49,8 @@ final class PilotCaves {
     private final int[] quietUntil = new int[quietLips.length];
     private final BlockPos[] visited = new BlockPos[9];
     private final int[] proof = new int[3];
+    private final BlockHitResult[] dimFloors = new BlockHitResult[proof.length];
+    private TorchTarget torchTarget;
     private ClientWorld world;
     private ClientPlayerEntity player;
     private String status = "surveying for a cave opening";
@@ -57,7 +60,7 @@ final class PilotCaves {
     private int since, phaseSince, option, steps, quietCursor, cutSide, cutIndex, cuts, placed;
     private int cooldown, nextLight, lastAction, before, waterProof;
     private boolean entered, needSurvey, triedHigh, triedLight, triedPlace, triedWater, earlyHigh, centerForBearing;
-    private boolean afloat, leavingWater;
+    private boolean afloat, leavingWater, checkedLipLight;
     private BlockHitResult ore, lava, face, fill;
     private WaterLink plannedWater, waterLink;
     private BlockPos highBottom, boatFloor;
@@ -83,6 +86,10 @@ final class PilotCaves {
     BlockPos boatFloor() { return boatFloor; }
     float boatYaw() { return boatYaw; }
 
+    void interruptLight(int tick) {
+        if (torchTarget != null) resumeAfterLight(tick);
+    }
+
     /** A null ore predicate prospects for exposed lava; a null planned foot can only continue an excursion. */
     boolean step(int tick, BlockPos planned, Direction direction, Predicate<BlockState> preferredOre) {
         resetOnWorldChange();
@@ -107,13 +114,17 @@ final class PilotCaves {
         boolean inTransit = phase == Phase.DESCEND || phase == Phase.ASCEND || phase == Phase.DRIVE
             || phase == Phase.CENTER;
         boolean peeking = phase == Phase.POUR || phase == Phase.RECLAIM || phase == Phase.LOOK_DOWN
+            || phase == Phase.LIGHT && torchTarget != null && torchTarget.lip
             || phase == Phase.SURVEY && option == 0;
         if (!inTransit
             && (!player.isOnGround() || player.isTouchingWater()
                 || !(player.getBlockPos().equals(stance) || peeking && atLip(stance)))) {
             return finish(tick, "leaving cave survey after losing dry footing");
         }
-        if (!inTransit && !peeking && (tick - since > 620 || steps >= 8)) {
+        // A forward survey may straddle the lip, but it must not dispatch a
+        // ninth landing into the eight-footing visit history.
+        if (phase == Phase.SURVEY && steps == visited.length - 1
+            || !inTransit && !peeking && tick - since > 620) {
             return finish(tick, "ending the cave survey; keeping traveled supports");
         }
         return switch (phase) {
@@ -138,6 +149,7 @@ final class PilotCaves {
         world = client.world;
         player = client.player;
         origin = replayTo = null;
+        torchTarget = null;
         waterLink = null;
         entered = false;
         cooldown = nextLight = 0;
@@ -154,20 +166,47 @@ final class PilotCaves {
         Vec3d left = offset(far, side, -1.12), right = offset(far, side, 1.12);
         Vec3d up = far.add(0, 1.18, 0), down = far.add(0, -1.55, 0);
         // The rays must leave the tunnel's one-wide, two-high envelope.
-        if (!(body.clearTerrain(left) || body.clearTerrain(right) || body.clearTerrain(up)
-            || body.clearTerrain(down))) return false;
-        return boundary(far, mouth, direction) || boundary(down, mouth, direction)
-            || boundary(left, mouth, direction) || boundary(right, mouth, direction)
-            || boundary(up, mouth, direction);
+        boolean drop = body.clearTerrain(down);
+        if (!(drop || body.clearTerrain(left) || body.clearTerrain(right) || body.clearTerrain(up))) return false;
+
+        // A roof must overhang the interior lane, not the mouth or the near side of a cliff.
+        Vec3d interior = offset(far, direction, 4);
+        if (roof(up, mouth, direction)
+            || roof(interior.add(0, 1.7, 0), mouth, direction)
+            || roof(interior.add(0, 2.5, 0), mouth, direction)
+            || roof(interior.add(0, 3.6, 0), mouth, direction)) return true;
+
+        // Open-air ravines still qualify when the downward passage has opposing rock walls.
+        if (!drop) return false;
+        BlockHitResult a = ravineWall(down, mouth, direction, side.getOpposite());
+        if (a == null) return false;
+        BlockHitResult b = ravineWall(down, mouth, direction, side);
+        return b != null && Math.abs(along(a.getPos().subtract(b.getPos()), direction)) <= 3.5;
     }
 
-    private boolean boundary(Vec3d through, BlockPos mouth, Direction direction) {
-        BlockHitResult hit = body.perceive(through, 15).orElse(null);
-        if (hit == null) return false;
-        Vec3d pos = hit.getPos();
-        double beyond = (pos.x - mouth.getX() - 0.5) * direction.getOffsetX()
-            + (pos.z - mouth.getZ() - 0.5) * direction.getOffsetZ();
-        return beyond >= 0.45 && natural(state(hit));
+    private boolean roof(Vec3d through, BlockPos mouth, Direction direction) {
+        // The lit collision face can witness the roof; a dangling vine outline cannot.
+        BlockHitResult hit = body.terrain(through, 15).orElse(null);
+        if (hit == null || hit.getSide() != Direction.DOWN || !natural(state(hit))) return false;
+        Vec3d inside = hit.getPos().subtract(Vec3d.ofBottomCenter(mouth));
+        return inside.y > 2.0 && along(inside, direction) >= 1.65
+            && Math.abs(along(inside, direction.rotateYClockwise())) <= 0.8;
+    }
+
+    private BlockHitResult ravineWall(Vec3d down, BlockPos mouth, Direction direction, Direction flank) {
+        Vec3d base = Vec3d.ofBottomCenter(mouth);
+        for (int width = 2; width <= 6; width += 2) {
+            Vec3d point = offset(offset(down, direction, 2), flank, width);
+            BlockHitResult hit = body.terrain(point, 15).orElse(null);
+            if (hit == null || hit.getSide() != flank.getOpposite() || !natural(state(hit))) continue;
+            Vec3d inside = hit.getPos().subtract(base);
+            if (along(inside, direction) >= 1.65 && along(inside, flank) >= 1.25) return hit;
+        }
+        return null;
+    }
+
+    private static double along(Vec3d point, Direction direction) {
+        return point.x * direction.getOffsetX() + point.z * direction.getOffsetZ();
     }
 
     private void startSurvey(int tick) {
@@ -175,7 +214,7 @@ final class PilotCaves {
         option = 0;
         needSurvey = true;
         triedHigh = triedLight = triedPlace = triedWater = false;
-        earlyHigh = centerForBearing = false;
+        earlyHigh = centerForBearing = checkedLipLight = false;
         cutSide = 0;
         highBottom = null;
         start(Phase.SURVEY, tick);
@@ -222,7 +261,22 @@ final class PilotCaves {
             BlockPos foot = ahead.up(i - 1);
             if (seen(foot)) continue;
             proof[i] = checkStep(foot, travel, proof[i]);
-            if (proof[i] == WALKABLE) return driveTo(foot, tick);
+            if (proof[i] == WALKABLE) {
+                BlockHitResult dimFloor = dimFloors[i];
+                if (dimFloor != null && !triedLight && tick >= nextLight && hands.count(TORCH) > 2) {
+                    return lightTarget(dimFloor, floorAim(foot, travel), false, tick);
+                }
+                return driveTo(foot, tick);
+            }
+        }
+        if (option == 0 && age >= 34 && age <= SURVEY_TICKS && !checkedLipLight && !triedLight && tick >= nextLight
+            && hands.count(TORCH) > 2 && atLip(stance)) {
+            checkedLipLight = true;
+            BlockHitResult support = body.find(PilotCaves::solid, 2.9, this::dimLipFace).orElse(null);
+            if (support != null) {
+                return lightTarget(support, support.getPos().lerp(Vec3d.ofCenter(support.getBlockPos()), 0.04),
+                    true, tick);
+            }
         }
         if (age >= 28 && option == 0 && (proof[0] & FLOOR) == 0) creep(ahead);
         if (age >= SURVEY_TICKS) {
@@ -248,10 +302,38 @@ final class PilotCaves {
         start(Phase.SURVEY, tick);
     }
 
+    private boolean dimLipFace(BlockHitResult hit) {
+        Direction side = hit.getSide();
+        if (side == Direction.DOWN || body.observedFaceLight(hit) > 6) return false;
+        BlockPos support = hit.getBlockPos();
+        if (side == Direction.UP && support.equals(stance.down())) return true;
+        int height = support.getY() + side.getOffsetY() - stance.getY();
+        double x = hit.getPos().x - stance.getX() - 0.5;
+        double z = hit.getPos().z - stance.getZ() - 0.5;
+        return height >= -1 && height <= 2 && Math.abs(x) <= 1.6 && Math.abs(z) <= 1.6
+            && x * bearing.getOffsetX() + z * bearing.getOffsetZ() >= -0.25;
+    }
+
+    private boolean lightTarget(BlockHitResult support, Vec3d aim, boolean lip, int tick) {
+        torchTarget = new TorchTarget(support, aim, lip);
+        before = hands.count(TORCH);
+        triedLight = true;
+        start(Phase.LIGHT, tick);
+        return true;
+    }
+
     private int checkStep(BlockPos foot, Direction travel, int mask) {
         Vec3d base = Vec3d.ofBottomCenter(foot);
         Direction side = travel.rotateYClockwise();
-        if ((mask & FLOOR) == 0 && floor(foot, travel)) mask |= FLOOR;
+        if ((mask & FLOOR) == 0) {
+            BlockHitResult floor = floorHit(foot, travel, false);
+            if (floor != null) {
+                mask |= FLOOR;
+                if (phase == Phase.SURVEY && body.observedFaceLight(floor) <= 6) {
+                    dimFloors[foot.getY() - stance.getY() + 1] = floor;
+                }
+            }
+        }
         if ((mask & SHIN) == 0 && body.clearTerrain(base.add(0, 0.18, 0))) mask |= SHIN;
         if ((mask & HEAD) == 0 && body.clearTerrain(base.add(0, 1.82, 0))) mask |= HEAD;
         Vec3d mid = base.add(0, 0.95, 0);
@@ -274,12 +356,16 @@ final class PilotCaves {
     }
 
     private BlockHitResult floorHit(BlockPos foot, Direction approach, boolean throughWater) {
-        Vec3d point = offset(Vec3d.ofBottomCenter(foot), approach, 0.34).add(0, -0.035, 0);
+        Vec3d point = floorAim(foot, approach);
         BlockHitResult hit = throughWater
             ? body.terrainThroughWater(point, player.getEyePos().distanceTo(point) + 0.12).orElse(null)
             : terrain(point);
         return hit != null && hit.getBlockPos().equals(foot.down()) && hit.getSide() == Direction.UP
             && Math.abs(hit.getPos().y - foot.getY()) < 0.06 && solid(state(hit)) ? hit : null;
+    }
+
+    private static Vec3d floorAim(BlockPos foot, Direction approach) {
+        return offset(Vec3d.ofBottomCenter(foot), approach, 0.34).add(0, -0.035, 0);
     }
 
     private boolean waterFloor(WaterLink link) {
@@ -444,15 +530,40 @@ final class PilotCaves {
 
     private boolean light(int tick) {
         status = "placing light on a witnessed face before advancing";
-        if (hands.count(TORCH) < before) {
-            nextLight = tick + 95;
-            start(Phase.SURVEY, tick);
-            option = 0;
-            needSurvey = true;
-            triedHigh = false;
+        TorchTarget target = torchTarget;
+        if (target != null && target.lip) body.sneak();
+        if (lastAction != 0 && hands.count(TORCH) < before) {
+            resumeAfterLight(tick);
+            if (target == null || !target.lip) {
+                option = 0;
+                needSurvey = true;
+                triedHigh = false;
+            } else {
+                status = "cave lip torch placed; rechecking the same bearing";
+            }
             return true;
         }
         int age = tick - phaseSince;
+        if (target != null) {
+            status = target.lip ? "lighting the witnessed dim cave lip before rechecking footing"
+                : "lighting the dim cave ledge before stepping onto it";
+            if (age >= (target.lip ? 26 : 45) || lastAction != 0 && tick - lastAction >= 7) {
+                resumeAfterLight(tick);
+                return true;
+            }
+            if (lastAction != 0) return true;
+            body.aim(target.aim);
+            if ((target.lip && !player.isSneaking()) || !body.aligned(target.aim) || !hands.equipForUse(TORCH)) {
+                return true;
+            }
+            BlockHitResult hit = target.lip ? observe(target.aim) : terrain(target.aim);
+            if (matches(target.support, hit) && matches(hit, body.selectedFace()) && solid(state(hit))
+                && (!target.lip || dimLipFace(hit))) {
+                body.use(hit.getBlockPos(), hit.getSide());
+                lastAction = tick;
+            }
+            return true;
+        }
         if (age >= 56) return alternatives(tick);
         if (lastAction != 0 && tick - lastAction < 8) return true;
         Direction wall = switch (age / 14) {
@@ -461,9 +572,9 @@ final class PilotCaves {
             case 2 -> opening.getOpposite();
             default -> opening;
         };
-        Vec3d target = Vec3d.ofCenter(stance.offset(wall), age >= 42 ? -0.18 : 0.52);
-        body.aim(target);
-        if (!body.aligned(target) || !hands.equipForUse(TORCH)) return true;
+        Vec3d wallAim = Vec3d.ofCenter(stance.offset(wall), age >= 42 ? -0.18 : 0.52);
+        body.aim(wallAim);
+        if (!body.aligned(wallAim) || !hands.equipForUse(TORCH)) return true;
         BlockHitResult shown = body.selectedFace();
         if (shown == null || shown.getSide() == Direction.DOWN
             || shown.getPos().squaredDistanceTo(player.getEyePos()) > 2.9 * 2.9
@@ -471,6 +582,12 @@ final class PilotCaves {
         body.use(shown.getBlockPos(), shown.getSide());
         lastAction = tick;
         return true;
+    }
+
+    private void resumeAfterLight(int tick) {
+        torchTarget = null;
+        nextLight = tick + 95;
+        start(Phase.SURVEY, tick);
     }
 
     private boolean place(int tick) {
@@ -746,11 +863,13 @@ final class PilotCaves {
         this.phase = phase;
         phaseSince = tick;
         lastAction = 0;
+        Arrays.fill(dimFloors, null);
         Arrays.fill(proof, 0);
         if (phase == Phase.PLACE) face = null;
     }
 
     private boolean finish(int tick, String reason) {
+        torchTarget = null;
         status = reason;
         quietLips[quietCursor] = origin;
         quietUntil[quietCursor] = tick + 420;
@@ -854,6 +973,7 @@ final class PilotCaves {
     private static boolean natural(BlockState state) {
         return state.isIn(BlockTags.BASE_STONE_OVERWORLD) || state.isIn(BlockTags.BASE_STONE_NETHER)
             || state.isOf(Blocks.CALCITE) || state.isOf(Blocks.DRIPSTONE_BLOCK)
+            || state.isOf(Blocks.MOSS_BLOCK) || state.isOf(Blocks.CLAY)
             || state.isIn(BlockTags.IRON_ORES) || state.isIn(BlockTags.COAL_ORES) || state.isIn(BlockTags.DIAMOND_ORES)
             || state.isIn(BlockTags.GOLD_ORES) || state.isIn(BlockTags.COPPER_ORES) || state.isIn(BlockTags.REDSTONE_ORES)
             || state.isIn(BlockTags.LAPIS_ORES) || state.isIn(BlockTags.EMERALD_ORES);

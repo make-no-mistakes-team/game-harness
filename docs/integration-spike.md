@@ -82,12 +82,19 @@ fixture setup. The declaration and outcome record `world.type: "vanilla-incident
 `world.fresh: false`, and `world.parentRun`. The replay is not a fresh-world
 result. Stopping after observing an incident does not count as reaching the goal.
 
-The same diagnostic stream can show individual descent trials. Use
-`bun run play:pilot --diagnostic-descent water 180` to test a bucket landing
-when the floor drops away, or `bun run play:pilot --diagnostic-descent cave 180`
-to test whether the pilot walks into a lit chamber and down its shelves.
-Only one diagnostic runs at a time. The terrain and supplies are prepared;
-these runs do not test finding a cave or making a bucket in a random world.
+Use the same stream to watch an individual skill trial:
+
+| Command | What the pilot has to do |
+| --- | --- |
+| `bun run play:pilot --diagnostic-descent water 180` | Place water during a fall and land without damage. |
+| `bun run play:pilot --diagnostic-descent boat 240` | Place and board a boat on the ledge, then ride it down to a dry landing. |
+| `bun run play:pilot --diagnostic-descent cave 180` | Enter a lit chamber and follow its descending shelves. |
+| `bun run play:pilot --diagnostic-terrain birch 180` | Leave an unreachable birch log and harvest a reachable tree. |
+| `bun run play:pilot --diagnostic-terrain ceiling 180` | Deal with a low ceiling and reach the upper step. |
+
+Only one diagnostic runs at a time. These trials prepare the terrain; the
+bucket and boat trials also supply the item. They do not test finding a cave
+or making a boat or bucket in a random world.
 
 The standalone pilot makes no model calls and does not accept free-form tasks.
 The desktop application's model-driven path is described below.

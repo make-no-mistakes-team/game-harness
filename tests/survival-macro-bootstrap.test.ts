@@ -13,13 +13,16 @@ import type { MacroObservation, MacroOpportunity } from "../src/server/survival-
 import { TERRA_MODEL_ID } from "../src/shared/survival-agent-ui.ts";
 
 const GOAL = "stone_pickaxe";
+const plankBranch = {
+  policy: { kind: "plank_stock", source: "witnessed_timber", count: 4, maxBreaks: 1, maxCrafts: 1 },
+  requires: [],
+} as const;
 const planks = {
   kind: "first_policy",
-  policy: { kind: "plank_stock", source: "witnessed_timber", count: 4, maxBreaks: 1, maxCrafts: 1 },
-  requires: [], reserves: [],
+  branches: [plankBranch], reserves: [],
 } as const;
 
-function offer(id: string, verb: "break" | "continue", subject: string, spends = {}): MacroOpportunity {
+function offer(id: string, verb: "break" | "continue" | "collect", subject: string, spends = {}): MacroOpportunity {
   return { id, verb, summary: "Observed native opportunity", evidence: "Witnessed by the native actor",
     risk: "guarded", material: { subject, target: `target-${id}`, spends } };
 }
@@ -52,12 +55,16 @@ test("only exact bounded advisory and defer schemas are admitted", () => {
   expect(parseFirstPlanToolArguments('{"advice":{"kind":"defer"}')).toBeNull();
   for (const raw of [
     { ...planks, basis: view() },
-    { ...planks, policy: { ...planks.policy, maxCrafts: 3 } },
-    { ...planks, policy: { ...planks.policy, source: "minecraft:any_log" } },
-    { ...planks, policy: { ...planks.policy, source: "minecraft:air" } },
-    { ...planks, policy: { ...planks.policy, code: "export function act() {}" } },
+    { ...planks, branches: [] },
+    { ...planks, branches: [plankBranch, plankBranch, plankBranch, plankBranch] },
+    { ...planks, branches: [{ ...plankBranch, policy: { ...plankBranch.policy, maxCrafts: 3 } }] },
+    { ...planks, branches: [{ ...plankBranch, policy: { ...plankBranch.policy, source: "minecraft:any_log" } }] },
+    { ...planks, branches: [{ ...plankBranch, policy: { ...plankBranch.policy, source: "minecraft:air" } }] },
+    { ...planks, branches: [{ ...plankBranch, policy: { ...plankBranch.policy, code: "export function act() {}" } }] },
+    { ...planks, branches: [{ ...plankBranch, reserves: [] }] },
     { ...planks, reserves: [{ item: "minecraft:air", count: 1 }] },
-    { ...planks, requires: [{ item: "minecraft:coal", count: 1 }, { item: "minecraft:coal", count: 2 }] },
+    { ...planks, branches: [{ ...plankBranch,
+      requires: [{ item: "minecraft:coal", count: 1 }, { item: "minecraft:coal", count: 2 }] }] },
     { kind: "defer", reason: "Pretend I saw a tree" },
   ]) expect(parseFirstPlanToolArguments(JSON.stringify({ advice: raw }))).toBeNull();
 });
@@ -72,7 +79,7 @@ test("witnessed timber binds exact live species and spend; absent, mismatched or
       maxBreaks: 1, maxCrafts: 1, maxPlacements: 0,
     },
   });
-  const specific = { ...planks, policy: { ...planks.policy, source: "minecraft:oak_log" } };
+  const specific = { ...planks, branches: [{ ...plankBranch, policy: { ...plankBranch.policy, source: "minecraft:oak_log" } }] };
   expect(bindFirstPlan(request, specific, view({ opportunities: [birch] }), liveScope)).toEqual({
     reason: "no_matching_live_material",
   });
@@ -91,7 +98,8 @@ test("stock and recipe evidence must agree, and planks cannot consume protected 
     inventory: { [log]: 3 },
     opportunities: [offer("recipe", "continue", "recipe:planks", { [log]: 1 })],
   });
-  expect(bindFirstPlan(request, { ...planks, reserves: [reserve] }, observation, liveScope)).toMatchObject({
+  const scope = { ...liveScope, first: observation };
+  expect(bindFirstPlan(request, { ...planks, reserves: [reserve] }, observation, scope)).toMatchObject({
     policy: {
       target: { kind: "stock", item: "minecraft:dark_oak_planks", count: 4 },
       allowedEffects: ["craft:dark_oak_planks"], maxBreaks: 0, maxCrafts: 1,
@@ -99,22 +107,204 @@ test("stock and recipe evidence must agree, and planks cannot consume protected 
     },
   });
   expect(bindFirstPlan(request, { ...planks, reserves: [reserve] },
-    { ...observation, inventory: { [log]: 2 } }, liveScope)).toEqual({ reason: "no_matching_live_material" });
+    { ...observation, inventory: { [log]: 2 } }, scope)).toEqual({ reason: "no_matching_live_material" });
   expect(bindFirstPlan(request, planks, { ...observation, opportunities: [] }, liveScope)).toEqual({
     reason: "no_matching_live_material",
   });
 });
 
 test("stone is bound to cobblestone only when seen as an actually harvestable exact effect", () => {
-  const stone = { kind: "first_policy", policy: { kind: "harvest_stock", resource: "minecraft:cobblestone",
-    count: 2, maxBreaks: 3 }, requires: [{ item: "minecraft:wooden_pickaxe", count: 1 }], reserves: [] } as const;
+  const stone = { kind: "first_policy", branches: [{ policy: { kind: "harvest_stock", resource: "minecraft:cobblestone",
+    count: 2, maxBreaks: 3 }, requires: [{ item: "minecraft:wooden_pickaxe", count: 1 }] }], reserves: [] } as const;
   const seen = view({ inventory: { "minecraft:wooden_pickaxe": 1 },
     opportunities: [offer("face", "break", "block:minecraft:stone")] });
-  expect(bindFirstPlan(request, stone, seen, liveScope)).toMatchObject({
-    policy: { target: { kind: "stock", item: "minecraft:cobblestone", count: 1 },
-      allowedEffects: ["break:minecraft:stone"], costCaps: [], maxBreaks: 1, maxCrafts: 0, maxPlacements: 0 },
+  const scope = { ...liveScope, first: seen };
+  expect(bindFirstPlan(request, stone, seen, scope)).toMatchObject({
+    policy: { target: { kind: "stock", item: "minecraft:cobblestone", count: 2 },
+      allowedEffects: ["break:minecraft:stone"], costCaps: [], maxBreaks: 3, maxCrafts: 0, maxPlacements: 0 },
   });
-  expect(bindFirstPlan(request, stone, { ...seen, inventory: {} }, liveScope)).toEqual({ reason: "stock_prerequisite_missing" });
+  expect(bindFirstPlan(request, stone, { ...seen, inventory: {} }, scope)).toEqual({ reason: "stock_prerequisite_missing" });
+});
+
+const reserveLog = { item: "minecraft:spruce_log", count: 1 };
+const boundSource = { kind: "bound_source" } as const;
+const boundReserve = { item: boundSource, count: 1 } as const;
+const recipe = offer("recipe", "continue", "recipe:planks", { [reserveLog.item]: 1 });
+const stocked = {
+  policy: { ...plankBranch.policy, source: reserveLog.item, maxBreaks: 0 },
+  requires: [{ ...reserveLog, count: 2 }],
+} as const;
+const alternatives = { ...planks, reserves: [reserveLog], branches: [stocked, plankBranch] } as const;
+
+test("alternatives bind at most one prioritized branch, never weaken a missing prerequisite or borrow its effects", () => {
+  const state = view({ inventory: { [reserveLog.item]: 1 }, opportunities: [spruce, recipe] });
+  const scope = { ...liveScope, first: state };
+  expect(bindFirstPlan(request, { ...alternatives, branches: [stocked] }, state, scope)).toEqual({
+    reason: "stock_prerequisite_missing",
+  });
+  expect(bindFirstPlan(request, { ...alternatives, branches: [{ ...stocked, requires: [] }] }, state, scope)).toEqual({
+    reason: "no_matching_live_material",
+  });
+  expect(bindFirstPlan(request, alternatives, state, scope)).toMatchObject({
+    branchIndex: 1, requires: [], policy: {
+      target: { kind: "stock", item: "minecraft:spruce_planks", count: 4 },
+      reserves: [reserveLog], costCaps: [reserveLog], maxBreaks: 1, maxCrafts: 1,
+      allowedEffects: ["break:minecraft:spruce_log", "craft:spruce_planks"],
+    },
+  });
+  const surplus = { ...state, inventory: { [reserveLog.item]: 2 } };
+  expect(bindFirstPlan(request, alternatives, surplus, { ...scope, first: surplus })).toMatchObject({
+    branchIndex: 0, requires: stocked.requires,
+    policy: { reserves: [reserveLog], costCaps: [reserveLog], maxBreaks: 0, allowedEffects: ["craft:spruce_planks"] },
+  });
+  expect(bindFirstPlan(request, alternatives, surplus, scope, 0)).toEqual({ reason: "stock_prerequisite_missing" });
+});
+
+test("the wire can name the exact branch-bound source without guessing a species", () => {
+  const first = { ...planks, reserves: [boundReserve], branches: [{ ...plankBranch, requires: [boundReserve] }] };
+  expect(parseFirstPlanToolArguments(JSON.stringify({ advice: first }))).toEqual(first);
+  expect(parseFirstPlanToolArguments('{"advice":{"kind":"defer","category":"constraint_not_expressible"}}')).toEqual({
+    kind: "defer", category: "constraint_not_expressible",
+  });
+  for (const item of [{ kind: "all_species" }, { kind: "bound_source", species: "spruce" }, "bound_source"]) {
+    expect(parseFirstPlanToolArguments(JSON.stringify({ advice: { ...first, reserves: [{ item, count: 1 }] } }))).toBeNull();
+  }
+});
+
+test("a resolved timber predicate requires actual stock of that timber, with no spending below its resolved floor", () => {
+  const first = { ...planks, reserves: [boundReserve], branches: [{ ...plankBranch, requires: [boundReserve],
+    policy: { ...plankBranch.policy, source: "witnessed_log", maxBreaks: 0 } }] };
+  for (const [input, output] of [
+    ["minecraft:spruce_log", "minecraft:spruce_planks"], ["minecraft:birch_log", "minecraft:birch_planks"],
+  ] as const) {
+    const sample = view({ inventory: { [input]: 2 }, opportunities: [offer("recipe", "continue", "recipe:planks", { [input]: 1 })] });
+    expect(bindFirstPlan(request, first, sample, { ...liveScope, first: sample })).toMatchObject({
+      input, requires: [{ item: input, count: 1 }], policy: {
+        target: { kind: "stock", item: output, count: 4 }, reserves: [{ item: input, count: 1 }],
+        costCaps: [{ item: input, count: 1 }], maxBreaks: 0, maxCrafts: 1,
+      },
+    });
+    const noSurplus = { ...sample, inventory: { [input]: 1 } };
+    expect(bindFirstPlan(request, first, noSurplus, { ...liveScope, first: noSurplus })).toEqual({ reason: "no_matching_live_material" });
+    const later = { ...sample, tick: 6 };
+    const emptyAtFirst = { ...sample, inventory: {} };
+    expect(bindFirstPlan(request, first, later, { ...liveScope, first: emptyAtFirst })).toEqual({ reason: "stock_prerequisite_missing" });
+  }
+});
+
+const logAcquisition = { kind: "first_policy", reserves: [boundReserve], branches: [{
+  policy: { kind: "harvest_stock", resource: "witnessed_log", count: 1, maxBreaks: 1 }, requires: [],
+}] } as const;
+
+test("one real first face starts the exact bounded batch; the total target is not an amount to add", () => {
+  const input = "minecraft:birch_log";
+  const seen = view({ inventory: { [input]: 1 }, opportunities: [birch] });
+  const scope = { ...liveScope, first: seen };
+  for (const [count, maxBreaks] of [[3, 4], [2, 1], [4, 1]] as const) {
+    const plan = { ...logAcquisition, branches: [{
+      policy: { ...logAcquisition.branches[0].policy, count, maxBreaks }, requires: [],
+    }] };
+    expect(bindFirstPlan(request, plan, seen, scope)).toMatchObject({
+      input, liveTargets: [birch.material!.target],
+      policy: { target: { kind: "stock", item: input, count }, allowedEffects: [`break:${input}`],
+        costCaps: [], reserves: [{ item: input, count: 1 }], maxBreaks, maxCrafts: 0, maxPlacements: 0 },
+    });
+    expect(bindFirstPlan(request, plan, { ...seen, opportunities: [] }, scope)).toEqual({ reason: "no_matching_live_material" });
+    expect(bindFirstPlan(request, plan, { ...seen, opportunities: [
+      offer("expensive", "break", `block:${input}`, { "minecraft:wooden_pickaxe": 1 }),
+    ] }, scope)).toEqual({ reason: "no_matching_live_material" });
+  }
+});
+
+test("a pickup alone starts only pickup; mining needs both explicit permission and a real matching zero-spend face", () => {
+  const input = "minecraft:birch_log";
+  const drop = offer("pickup", "collect", `item:${input}`);
+  const seen = view({ inventory: { [input]: 1 }, opportunities: [drop] });
+  const scope = { ...liveScope, first: seen };
+  const plan = { ...logAcquisition, branches: [{
+    policy: { ...logAcquisition.branches[0].policy, resource: input, count: 3, maxBreaks: 4 }, requires: [],
+  }] };
+  expect(bindFirstPlan(request, plan, seen, scope)).toMatchObject({
+    policy: { target: { item: input, count: 3 }, allowedEffects: [], maxBreaks: 0, costCaps: [] },
+  });
+  const withFace = { ...seen, opportunities: [drop, birch] };
+  expect(bindFirstPlan(request, plan, withFace, scope)).toMatchObject({
+    policy: { target: { item: input, count: 3 }, allowedEffects: [`break:${input}`], maxBreaks: 4, costCaps: [] },
+  });
+  expect(bindFirstPlan(request, { ...plan, branches: [{ ...plan.branches[0]!, policy: {
+    ...plan.branches[0]!.policy, maxBreaks: 0,
+  } }] }, withFace, scope)).toMatchObject({
+    policy: { target: { item: input, count: 3 }, allowedEffects: [], maxBreaks: 0, costCaps: [] },
+  });
+});
+
+test("a first plank ingredient starts a bounded exact batch without granting unseen harvest or spending the reserve", () => {
+  const plan = { ...alternatives, branches: [{ ...plankBranch, policy: {
+    ...plankBranch.policy, count: 8, maxCrafts: 2, maxBreaks: 2,
+  } }] };
+  const inventory = { [reserveLog.item]: 2 };
+  const seen = view({ inventory, opportunities: [recipe] });
+  expect(bindFirstPlan(request, plan, seen, { ...liveScope, first: seen })).toMatchObject({
+    policy: { target: { item: "minecraft:spruce_planks", count: 8 }, allowedEffects: ["craft:spruce_planks"],
+      maxBreaks: 0, maxCrafts: 2, costCaps: [{ item: reserveLog.item, count: 2 }], reserves: [reserveLog] },
+  });
+  expect(bindFirstPlan(request, plan, { ...seen, opportunities: [recipe, spruce] }, { ...liveScope, first: seen })).toMatchObject({
+    policy: { allowedEffects: ["break:minecraft:spruce_log", "craft:spruce_planks"], maxBreaks: 2, maxCrafts: 2 },
+  });
+});
+
+test("a witnessed zero-spend acquisition may earn the exact retained floor from empty stock, without granting other effects", () => {
+  for (const [input, visible] of [["minecraft:spruce_log", spruce], ["minecraft:birch_log", birch]] as const) {
+    expect(bindFirstPlan(request, logAcquisition, view({ opportunities: [visible] }), liveScope)).toMatchObject({
+      input, policy: { target: { item: input, count: 1 }, reserves: [{ item: input, count: 1 }],
+        allowedEffects: [`break:${input}`], costCaps: [], maxBreaks: 1, maxCrafts: 0, maxPlacements: 0 },
+    });
+  }
+  expect(bindFirstPlan(request, logAcquisition, view({ opportunities: [spruce, birch] }), liveScope)).toEqual({
+    reason: "ambiguous_material_binding",
+  });
+  const exactAfterAmbiguity = { ...logAcquisition, branches: [
+    logAcquisition.branches[0],
+    { ...logAcquisition.branches[0], policy: { ...logAcquisition.branches[0].policy, resource: reserveLog.item } },
+  ] };
+  expect(bindFirstPlan(request, exactAfterAmbiguity, view({ opportunities: [spruce, birch] }), liveScope)).toEqual({
+    reason: "ambiguous_material_binding",
+  });
+  expect(bindFirstPlan(request, logAcquisition, view({
+    inventory: { [reserveLog.item]: 1 }, opportunities: [birch],
+  }), liveScope)).toMatchObject({
+    input: "minecraft:birch_log", policy: { reserves: [{ item: "minecraft:birch_log", count: 1 }], costCaps: [] },
+  });
+  const stripped = offer("stripped", "break", "block:minecraft:stripped_birch_log");
+  expect(bindFirstPlan(request, logAcquisition, view({ opportunities: [stripped] }), liveScope)).toEqual({
+    reason: "no_matching_live_material",
+  });
+  const two = { ...logAcquisition, reserves: [{ ...boundReserve, count: 2 }], branches: [{
+    policy: { ...logAcquisition.branches[0].policy, count: 4, maxBreaks: 4 }, requires: [],
+  }] };
+  expect(bindFirstPlan(request, two, view({ opportunities: [spruce] }), liveScope)).toEqual({ reason: "protected_stock_missing" });
+  const secondFace = offer("second-face", "break", "block:minecraft:spruce_log");
+  expect(bindFirstPlan(request, two, view({ opportunities: [spruce, secondFace] }), liveScope)).toMatchObject({
+    policy: { target: { item: "minecraft:spruce_log", count: 4 }, reserves: [{ item: "minecraft:spruce_log", count: 2 }],
+      maxBreaks: 4, costCaps: [] },
+  });
+  expect(bindFirstPlan(request, { ...logAcquisition, reserves: [boundReserve, reserveLog] },
+    view({ opportunities: [birch] }), liveScope)).toEqual({ reason: "protected_stock_missing" });
+  expect(bindFirstPlan(request, { ...planks, reserves: [boundReserve] }, view({ opportunities: [spruce] }), liveScope)).toEqual({
+    reason: "protected_stock_missing",
+  });
+});
+
+test("a non-timber bound floor names the inventory output, not the observed block", () => {
+  const coal = { kind: "first_policy", branches: [{
+    policy: { kind: "harvest_stock", resource: "minecraft:coal", count: 1, maxBreaks: 1 }, requires: [],
+  }], reserves: [boundReserve] } as const;
+  expect(bindFirstPlan(request, coal, view({ opportunities: [offer("ore", "break", "block:minecraft:deepslate_coal_ore")] }),
+    liveScope)).toMatchObject({
+    input: "minecraft:coal",
+    policy: { target: { item: "minecraft:coal", count: 1 }, reserves: [{ item: "minecraft:coal", count: 1 }],
+      allowedEffects: ["break:minecraft:deepslate_coal_ore"], costCaps: [] },
+  });
 });
 
 test("a goal-only result cannot migrate to another goal, life, or safety revision", () => {
@@ -182,13 +372,81 @@ test("one paid startup request uses the existing quota and publishes only after 
     expect(f.controller.status()).toMatchObject({ requests: 1, providerDispatches: 1, budget: "requests",
       issuedWorkOrders: 1, completedModelWorkOrders: 0 });
     expect(await f.log("proposals.jsonl")).toMatchObject([{ stage: PRE_SPAWN_GOAL_ONLY, basis: null, dispatched: true }]);
-    expect((await f.log("history.jsonl")).find(row => row.event === "first_plan_used")).toMatchObject({
+    expect((await f.log("history.jsonl")).find(row => row.event === "first_plan_bound")).toMatchObject({
       stage: PRE_SPAWN_GOAL_ONLY, basis: { tick: 5 }, timeToFirstUseMs: expect.any(Number),
     });
   } finally {
     reply.resolve(result(null, "cancelled"));
     await f.close();
   }
+});
+
+test("a camera warm-up is inert and can bind a shared-reserve fallback only on the first actionable live view", async () => {
+  const f = await fixture(async () => result(alternatives));
+  try {
+    const inventory = { [reserveLog.item]: 1 };
+    await f.observe({ inventory });
+    for (const name of ["planning.json", "intent.json", "work.json"])
+      await expect(access(f.file(name))).rejects.toThrow();
+    expect(f.liveCalls()).toBe(0);
+    await f.observe({ tick: 10, inventory, opportunities: [spruce, recipe] });
+    const order = JSON.parse(await readFile(f.file("work.json"), "utf8"));
+    expect(order).toMatchObject({ basisTick: 10, maxBreaks: 1, maxCrafts: 1, reserves: [reserveLog] });
+    expect(f.controller.status()).toMatchObject({ requests: 1, providerDispatches: 1, completedModelWorkOrders: 0 });
+    expect((await f.log("history.jsonl")).find(row => row.event === "first_plan_bound")).toMatchObject({
+      branchIndex: 1, firstBasis: { tick: 5 }, actionableBasis: { tick: 10 }, basis: { tick: 10 }, nativeAccepted: false,
+    });
+    await writeFile(f.file("native-receipts.jsonl"), ["accepted", "completed"].map((status, index) =>
+      JSON.stringify({ v: 1, run: order.run, life: 1, id: order.id, tick: 11 + index, status, detail: status })).join("\n") + "\n",
+      { mode: 0o600 });
+    await f.observe({ tick: 12, inventory: { ...inventory, "minecraft:spruce_planks": 4 } });
+    expect(f.controller.status()).toMatchObject({ completedModelWorkOrders: 1, providerDispatches: 1 });
+    expect(await f.log("receipts.jsonl")).toMatchObject([
+      { stage: PRE_SPAWN_GOAL_ONLY, eligible: true, receipt: { id: order.id, status: "accepted" } },
+      { stage: PRE_SPAWN_GOAL_ONLY, eligible: true, receipt: { id: order.id, status: "completed" } },
+    ]);
+  } finally { await f.close(); }
+});
+
+test("a too-late view cannot revive a paid advisory after its first-view window elapsed", async () => {
+  const f = await fixture(async () => result(planks), undefined, 2);
+  try {
+    await f.observe();
+    await f.observe({ tick: 16, opportunities: [spruce] });
+    expect(f.liveCalls()).toBe(1);
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect((await f.log("history.jsonl")).find(row => row.event === "first_plan_rejected")).toMatchObject({
+      firstBasis: { tick: 5 }, basis: { tick: 16 }, reason: "first_actionable_view_deadline",
+    });
+  } finally { await f.close(); }
+});
+
+test("known-false stock predicates do not keep the opening waiting for the camera", async () => {
+  const f = await fixture(async () => result({ ...alternatives, branches: [stocked] }), undefined, 2);
+  try {
+    await f.observe({ inventory: { [reserveLog.item]: 1 } });
+    expect(f.liveCalls()).toBe(1);
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect((await f.log("history.jsonl")).find(row => row.event === "first_plan_rejected")).toMatchObject({
+      firstBasis: { tick: 5 }, reason: "stock_prerequisite_missing",
+    });
+  } finally { await f.close(); }
+});
+
+test("the published native order contains only exact IDs with the bound floor intact when starting below it", async () => {
+  const f = await fixture(async () => result(logAcquisition));
+  try {
+    await f.observe({ opportunities: [birch] });
+    const order = JSON.parse(await readFile(f.file("work.json"), "utf8"));
+    expect(order).toMatchObject({
+      target: { kind: "stock", item: "minecraft:birch_log", count: 1 },
+      reserves: [{ item: "minecraft:birch_log", count: 1 }],
+      allowedEffects: ["break:minecraft:birch_log"], costCaps: [],
+      maxBreaks: 1, maxCrafts: 0, maxPlacements: 0,
+    });
+    expect(JSON.stringify(order)).not.toContain("bound_source");
+    expect(f.controller.status()).toMatchObject({ requests: 1, completedModelWorkOrders: 0 });
+  } finally { await f.close(); }
 });
 
 test("Stop while loading joins the startup call and records the charge even though no game observation existed", async () => {
@@ -246,22 +504,27 @@ test("no late startup authority is admitted after respawn; the ordinary strategi
   }
 });
 
-test("a settled plan cannot substitute another species after the first observed match changed", async () => {
-  const reply = Promise.withResolvers<FirstPlanInference>();
-  const f = await fixture(async () => reply.promise, undefined, 2);
-  try {
-    await f.observe({ opportunities: [spruce] });
-    reply.resolve(result(planks));
-    await f.observe({ tick: 6, opportunities: [birch] });
-    await expect(access(f.file("work.json"))).rejects.toThrow();
-    expect((await f.log("history.jsonl")).find(row => row.event === "first_plan_rejected")).toMatchObject({
-      reason: "fresh_binding_changed", basis: { tick: 6 }, firstBasis: { tick: 5 },
-    });
-  } finally {
-    reply.resolve(result(null, "cancelled"));
-    await f.close();
-  }
-});
+for (const [change, reason, opportunities] of [
+  ["the first face disappeared", "no_matching_live_material", []],
+  ["a different species replaced the first face", "fresh_binding_changed", [birch]],
+] as const) {
+  test(`a settled plan cannot publish stale work when ${change}`, async () => {
+    const reply = Promise.withResolvers<FirstPlanInference>();
+    const f = await fixture(async () => reply.promise, undefined, 2);
+    try {
+      await f.observe({ opportunities: [spruce] });
+      reply.resolve(result(planks));
+      await f.observe({ tick: 6, opportunities });
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      expect((await f.log("history.jsonl")).find(row => row.event === "first_plan_rejected")).toMatchObject({
+        reason, basis: { tick: 6 }, firstBasis: { tick: 5 },
+      });
+    } finally {
+      reply.resolve(result(null, "cancelled"));
+      await f.close();
+    }
+  });
+}
 
 test("deterministic and prepared diagnostic never admit a paid first plan", async () => {
   let called = false;

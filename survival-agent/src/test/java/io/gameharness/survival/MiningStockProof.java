@@ -1,5 +1,6 @@
 package io.gameharness.survival;
 
+import com.google.gson.JsonParser;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -134,6 +135,37 @@ final class MiningStockProof {
         stock.setStack(3, new ItemStack(Items.TORCH, 4));
         require(budget.missingFloor(stock) == null && budget.limit(Items.TORCH, 4) == 0,
             "only the observed output fulfills the reserve, and it cannot be spent");
+    }
+
+    @Test
+    void parsesExactZeroSpendFirstOrderWithAnUnmetTargetReserve() {
+        // Same stock payload emitted by the goal-only host binder after a live birch witness.
+        var raw = JsonParser.parseString("""
+            {"v":1,"id":"first-work","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":105,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:birch_log","count":1},
+             "allowedEffects":["break:minecraft:birch_log"],"costCaps":[],"reserves":[{"item":"minecraft:birch_log","count":1}],
+             "maxBreaks":1,"maxCrafts":0,"maxPlacements":0}
+            """).getAsJsonObject();
+        var order = AgentWorkOrder.parse(raw, "run", "constrained");
+        require(order != null && order.policy() != null, "the exact narrow order passes the native parser");
+        var policy = order.policy();
+        var budget = new AgentWorkOrder.Budget(policy);
+        var stock = new PlayerInventory(null);
+        stock.setStack(0, new ItemStack(Items.SPRUCE_LOG));
+        var seen = Blocks.BIRCH_LOG.getDefaultState();
+        require(budget.canBreak() && policy.breakAllowed(seen) && AgentWorkOrder.harvest(seen) == policy.target().item(),
+            "the witnessed source may advance this exact stock target while its floor is missing");
+        require(!policy.breakAllowed(Blocks.SPRUCE_LOG.getDefaultState()) && !policy.placeTable() && budget.craftsLeft() == 0,
+            "there is no wider species, crafting or placement privilege");
+        require(budget.missingFloor(stock).getKey() == Items.BIRCH_LOG
+                && budget.remainingCost(Items.SPRUCE_LOG) == 0 && budget.limit(Items.SPRUCE_LOG, 1) == 0,
+            "unrelated held stock cannot fulfill the floor or be spent");
+        budget.broken(Items.AIR, 0);
+        require(!budget.canBreak() && budget.missingFloor(stock) != null,
+            "a zero-spend break consumes its cap, not the floor; a break is not a confirmed pickup");
+        stock.setStack(1, new ItemStack(Items.BIRCH_LOG));
+        require(budget.missingFloor(stock) == null && budget.limit(Items.BIRCH_LOG, 1) == 0,
+            "only a confirmed exact pickup fulfills the floor and the item stays protected");
     }
 
     private static void require(boolean condition, String message) {

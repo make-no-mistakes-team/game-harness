@@ -64,6 +64,10 @@ const FEEDBACK: Readonly<Record<string, string>> = Object.freeze({
 });
 const WORK_ADMISSION_TICKS = 40;
 const WORK_REPLAN_GAP_TICKS = 80;
+// Native views are published every 5 ticks. Permit at most two follow-up
+// publications and a short wall-clock bound for the first rendered offer.
+const FIRST_ACTIONABLE_VIEW_TICKS = 10;
+const FIRST_ACTIONABLE_VIEW_MS = 600;
 
 type TrialResult =
   | { readonly status: "passed"; readonly detail: string; readonly verb: string }
@@ -170,6 +174,7 @@ interface FirstPlanning {
   readonly cancel: AbortController;
   readonly done: Promise<void>;
   first?: { readonly view: MacroObservation; readonly observedAt: number };
+  actionable?: MacroObservation;
   result?: { readonly inference: FirstPlanInference | null; readonly settledAt: number;
     readonly advice: ReturnType<typeof parseFirstPlanAdvice> };
   dispatchedAt?: number;
@@ -253,6 +258,7 @@ interface WorkJob {
   readonly source: MacroObservation;
   readonly requestId: string | null;
   health: number;
+  bootstrap?: true;
   accepted?: MacroReceipt;
   terminal?: MacroReceipt;
   withdrawn?: true;
@@ -920,11 +926,17 @@ export class SurvivalMacroController {
     const now = performance.now();
     if (observed && current) work.first ??= { view: current, observedAt: this.observedAt };
     const first = work.first?.view;
+    const inViewWindow = !!first && !!current && now - work.first!.observedAt <= FIRST_ACTIONABLE_VIEW_MS &&
+      current.tick - first.tick <= FIRST_ACTIONABLE_VIEW_TICKS;
     if (terminal || this.closing || this.config.signal?.aborted) work.rejection = terminal ?? "stop";
     else if (first && (!current || !firstPlanScopeMatches(request, first, current, this.config.run)))
       work.rejection ??= current ? "live_scope_changed" : "live_observation_stale";
     else if ((!work.result && now >= work.until) || (work.result && work.result.settledAt > work.until))
       work.rejection ??= "request_timeout";
+    else if (!work.actionable && observed && inViewWindow && current?.opportunities.length)
+      work.actionable = current;
+    if (first && !work.actionable && !inViewWindow && !work.result)
+      work.rejection ??= "first_actionable_view_deadline";
     if (work.rejection && !work.result) work.cancel.abort();
     const result = work.result;
     if (!result) return;
@@ -959,30 +971,42 @@ export class SurvivalMacroController {
       if (reason === "live_scope_changed" || reason === "live_observation_stale" || reason === "fresh_binding_changed")
         this.staleDecisions++;
       await this.disposition("first_plan_rejected", { ...scope, basis: latest ? basis(latest) : null,
-        firstBasis: first ? basis(first) : null, reason });
+        firstBasis: first ? basis(first) : null, reason,
+        ...(advice?.kind === "defer" && advice.category ? { deferCategory: advice.category } : {}) });
     };
     if (work.rejection) return reject(work.rejection);
     if (!advice || advice.kind === "defer") {
       return reject(advice ? "model_deferred" : !inference ? "provider_error" :
         inference.outcome === "completed" ? "invalid" : inference.outcome);
     }
-    if (!current || !first || !observed) return;
+    if (!current || !first) return;
     const bindingScope = {
       run: this.config.run, first, protectedReserves: this.floorScope?.life === first.life ? this.floorScope.reserves : [],
     };
-    const original = bindFirstPlan(request, advice, first, bindingScope);
+    const actionable = work.actionable;
+    if (!actionable) {
+      // Even before rendering, native inventory is real. Do not wait for an
+      // explicitly false condition, nor use a view arriving after this window.
+      const check = bindFirstPlan(request, advice, current, bindingScope);
+      if ("reason" in check && (check.reason === "stock_prerequisite_missing" || check.reason === "protected_stock_missing"))
+        return reject(check.reason);
+      if (!inViewWindow) return reject("first_actionable_view_deadline");
+      return;
+    }
+    if (!observed) return;
+    const original = bindFirstPlan(request, advice, actionable, bindingScope);
     if ("reason" in original) return reject(original.reason);
     const key = workPolicyKey(original.policy);
     let bound = original;
     let freshRejection: string | undefined;
-    const job = await this.publishWork(first, original.policy, "model", requestId, first.tick + this.limits.maxIntentTtlTicks,
-      advice.requires, undefined, fresh => {
+    const job = await this.publishWork(actionable, original.policy, "model", requestId, actionable.tick + this.limits.maxIntentTtlTicks,
+      original.requires, undefined, fresh => {
         if (this.job || performance.now() - this.observedAt > this.limits.maxObservationAgeMs) {
           freshRejection = this.job ? "native_work_incumbent" : "live_observation_stale";
           return false;
         }
-        const binding = bindFirstPlan(request, advice, fresh, bindingScope);
-        if ("reason" in binding || workPolicyKey(binding.policy) !== key) {
+        const binding = bindFirstPlan(request, advice, fresh, bindingScope, original.branchIndex);
+        if ("reason" in binding || binding.input !== original.input || workPolicyKey(binding.policy) !== key) {
           freshRejection = "reason" in binding ? binding.reason : "fresh_binding_changed";
           return false;
         }
@@ -991,10 +1015,12 @@ export class SurvivalMacroController {
       });
     if (!job) return reject(freshRejection ?? (this.closing || this.config.signal?.aborted ? "stop" :
       job === null ? "live_observation_rotating" : "fresh_work_admission_rejected"), this.view?.observation);
+    job.bootstrap = true;
     this.firstPlanning = undefined;
     const usedAt = performance.now();
-    await this.record("first_plan_used", {
-      ...scope, id: job.order.id, basis: basis(job.source), firstBasis: basis(first), input: bound.input, liveTargets: bound.liveTargets,
+    await this.record("first_plan_bound", {
+      ...scope, id: job.order.id, basis: basis(job.source), firstBasis: basis(first), actionableBasis: basis(actionable),
+      branchIndex: bound.branchIndex, branchCount: advice.branches.length, input: bound.input, liveTargets: bound.liveTargets,
       disposition: "work_order_published", nativeAccepted: false,
       timeToFirstUseMs: Math.round(usedAt - (work.dispatchedAt ?? inference?.providerStartedAtMs ?? work.startedAt)),
       firstLiveToFirstUseMs: Math.round(usedAt - work.first!.observedAt),
@@ -1347,6 +1373,7 @@ export class SurvivalMacroController {
     const priorLife = (this.view?.observation.life ?? receipt.life) > receipt.life;
     const eligible = !job.withdrawn && !priorLife;
     await this.append(this.receipts, { requestId: job.requestId, order, receipt, eligible,
+      ...(job.bootstrap ? { stage: PRE_SPAWN_GOAL_ONLY } : {}),
       ...(job.withdrawn ? { afterWithdrawal: true } : {}), ...(priorLife ? { priorLife: true } : {}) });
     if (receipt.status === "accepted") {
       job.accepted = receipt;

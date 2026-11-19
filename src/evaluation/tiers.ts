@@ -38,6 +38,7 @@ export const TEST_TIERS = Object.freeze({
     "tests/registered-adapter.test.ts",
     "tests/minecraft-adapter.test.ts", // Actual registered possession/verifier logic; no gameplay support claim.
     "tests/minecraft-craft.test.ts", // Ordered recipe quantities, partial server receipts and registered admission.
+    "tests/survival-macro-trial.test.ts", // Exact target, direction, and settlement witnesses; no game.
     "tests/adapter-scenarios.test.ts", // Independent manifest/progress uses the same registered interpreter, never Runtime's verdict.
     "tests/policy-comparison.test.ts", // Comparison policy/math; no provider or gameplay.
   ]),
@@ -76,6 +77,11 @@ export const TEST_TIERS = Object.freeze({
     "tests/program-instrumentation.test.ts", // Real inner worker protocol, not production Docker isolation.
     "tests/resident-worker.test.ts", // Actual Node supervisor/module thread and protocol; Docker is a separate smoke gate.
     "tests/survival-macro-skills.test.ts", // Private source selection and static gates; isolated worker smoke is opt-in.
+    "tests/survival-macro-controller.test.ts",
+    "tests/survival-macro-memory.test.ts",
+    "tests/survival-native-gap-review.test.ts",
+    "tests/survival-agent-lives.test.ts",
+    "tests/survival-agent-verify.test.ts",
     "tests/resident-runtime.test.ts", // Real Store/SkillManager/ResidentController admission; controlled worker/native boundaries.
     "tests/resident-benchmark-lifecycle.test.ts", // Real child-process/ledger deadline and OS-close ownership; no Minecraft.
     "tests/resident-volume.test.ts", // Separate five-slot protocol/grant identities and strict original-clock/resource evidence; no native launch.

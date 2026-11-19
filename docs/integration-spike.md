@@ -35,6 +35,26 @@ than switching models or starting a deterministic run. When a run closes,
 the app reports a confirmed Terra action only if Minecraft supplied a
 completion receipt. This is separate from verifying the vanilla goal.
 
+From the terminal, put the strategy options before the goal:
+
+```sh
+bun run play:agent --strategy terra --macro-requests 8 --task 'Choose your next subgoal from what you can see.' diamond 360
+```
+
+Here Terra can make eight requests during a 360-second attempt. While it
+thinks, the local player can keep working. Reaching the request limit stops
+new model calls; it does not stop Minecraft. The outcome reports local
+fallback ticks separately from actions Terra chose.
+
+Terra can also write a function that chooses what to inspect or survey.
+Before it can move the camera, the function must pass an isolated Docker worker
+check and a test in a separate Minecraft world. Terra must then select the
+tested version against a current observation. This permission does not cover
+walking, crafting, or changing the client. Terra can request an existing
+walk or recipe directly when the player can perform it. If it needs new client
+code, it can leave a private patch for human review; the runner never builds
+or applies the patch.
+
 The runner prints the private attempt directory. Open `screen.mp4` there to
 watch the actual client, including the inventory pointer. `outcome.json`
 records why the attempt ended. For a diamond win, the live inventory must

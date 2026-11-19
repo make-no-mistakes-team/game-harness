@@ -13,6 +13,8 @@ public final class DryRouteGraphProof {
         keepsAWitnessedAlternativeAroundACut();
         neverJoinsDisconnectedWalksByProximity();
         scansAVisualFrontierOnlyOncePerProof();
+        reconsidersNewLowerEvidenceAfterTheSelectedLook();
+        prefersAnUnvisitedViewOnTheSameShelf();
         keepsTheGoalAcrossSegmentsAndNewOffers();
         choosesStableTiesIndependentOfObservationOrder();
         distinguishesBudgetExhaustionFromNoRoute();
@@ -37,8 +39,12 @@ public final class DryRouteGraphProof {
 
         require(graph.plan(start) == MOVE && graph.next() == rise && graph.endpoint() == lower,
             "deepest useful stance first requires moving uphill and farther from it");
+        require(graph.segmentSize() == 4 && graph.segmentCell(0) == rise && graph.segmentCell(3) == lower
+            && graph.segmentCell(-1) == NO_CELL && graph.segmentCell(4) == NO_CELL,
+            "expose just the exact remaining waypoints of the current segment");
         require(graph.plan(start) == MOVE && graph.next() == rise, "another frame does not advance the plan");
         require(graph.plan(rise) == MOVE && graph.next() == bend, "continue around the bend");
+        require(graph.segmentSize() == 3 && graph.segmentCell(0) == bend, "a settled actual step advances the exposed segment");
         require(graph.plan(bend) == MOVE && graph.next() == shelf, "continue down toward the shelf");
         require(graph.plan(shelf) == MOVE && graph.next() == lower, "finish on the lower known footing");
         require(graph.plan(lower) == FRONTIER && graph.frontierBearing() == 3 && graph.next() == NO_CELL,
@@ -59,6 +65,9 @@ public final class DryRouteGraphProof {
 
         graph.observe(shelf, start);
         require(graph.plan(start) == MOVE && graph.next() == shelf, "separate ascent evidence certifies the shelf");
+        require(graph.retire(shelf, start, OBSTRUCTION) && graph.segmentSize() == 0 && graph.segmentCell(0) == NO_CELL,
+            "never expose an authorized segment after its proof changes");
+        require(graph.reopen(shelf, start, OBSTRUCTION), "restore the first return cut");
         require(graph.plan(shelf) == FRONTIER && graph.returnNext(shelf) == start, "return proof is now usable");
         require(graph.retire(shelf, start, OBSTRUCTION), "retire only the obstructed direction");
         require(graph.usable(start, shelf) && graph.retirement(shelf, start) == OBSTRUCTION,
@@ -124,6 +133,39 @@ public final class DryRouteGraphProof {
         require(graph.surveyed(home) && graph.plan(home) == NO_ROUTE, "a completed survey spends the offered views");
     }
 
+    private static void reconsidersNewLowerEvidenceAfterTheSelectedLook() {
+        var graph = new AgentRouteGraph();
+        long home = cell(0, 30, 0);
+        long lower = cell(1, 29, 0);
+        graph.reset(home);
+        graph.frontier(home, 2);
+        graph.frontier(home, 3);
+        require(graph.plan(home) == FRONTIER && graph.frontierBearing() == 2, "commit to the source look");
+        graph.frontier(home, 0);
+        observedBothWays(graph, home, lower);
+        graph.frontier(lower, 1);
+        require(graph.consumeFrontier(home, 3) && graph.plan(home) == FRONTIER && graph.frontierBearing() == 2,
+            "an unrelated look or newly offered bearing must not replace the active view");
+        require(graph.consumeFrontier(home, 2) && graph.plan(home) == MOVE && graph.next() == lower,
+            "the performed view releases its commitment so the new lower route wins over unperformed views");
+        require(graph.consumeFrontier(home, 0) && graph.plan(home) == MOVE && graph.next() == lower,
+            "consuming an unrelated view does not interrupt travel to the chosen endpoint");
+    }
+
+    private static void prefersAnUnvisitedViewOnTheSameShelf() {
+        var graph = new AgentRouteGraph();
+        long home = cell(0, 30, 0);
+        long onward = cell(1, 30, 0);
+        graph.reset(home);
+        observedBothWays(graph, home, onward);
+        graph.frontier(home, 2);
+        graph.frontier(onward, 3);
+        require(graph.plan(home) == MOVE && graph.next() == onward,
+            "prefer a genuinely new same-height perspective to another turn at the current footing");
+        require(graph.plan(onward) == FRONTIER && graph.frontierBearing() == 3,
+            "keep the committed viewpoint after knowing it was reached");
+    }
+
     private static void keepsTheGoalAcrossSegmentsAndNewOffers() {
         var graph = new AgentRouteGraph();
         long home = cell(0, 30, 0);
@@ -132,6 +174,8 @@ public final class DryRouteGraphProof {
         for (int x = 0; x < 12; x++) observedBothWays(graph, cell(x, 30, 0), cell(x + 1, 30, 0));
         graph.goal(goal, 1);
         require(graph.plan(home) == MOVE && graph.endpoint() == goal, "commit to the known goal anchor");
+        require(graph.segmentSize() == 8 && graph.segmentCell(7) == cell(8, 30, 0) && graph.segmentCell(8) == NO_CELL,
+            "a retained distant goal never exposes more than eight authorized hops");
         graph.goal(home, 2);
         for (int x = 0; x < 12; x++) {
             require(graph.plan(cell(x, 30, 0)) == MOVE

@@ -42,19 +42,33 @@ bun run play:agent --strategy terra --macro-requests 8 --task 'Choose your next 
 ```
 
 Here Terra can make eight requests during a 360-second attempt. While it
-thinks, the local player can keep working. Reaching the request limit stops
-new model calls; it does not stop Minecraft. The outcome reports local
-fallback ticks separately from actions Terra chose.
+thinks, the local player can continue an authorized job. For example, an
+order can request a stock of planks and protect the last log. The player
+chooses a visible tree, gathers the actual drops and rechecks the reserve
+before taking an output from the crafting grid. Reaching the request limit
+stops new calls; it does not grant more materials, extend a job, or end
+Minecraft. A locally selected preset alone does not count as a Terra action.
+The work-order executor currently admits gathering, crafting, and crafting
+table placement. Naming the Nether goal does not give that executor the
+deterministic player's furnace-transfer or portal-construction permissions.
 
-The player has a three-second limit on waiting solely for a plan. It can
-approach a witnessed resource or inspect the terrain while Terra is still
-answering. It cannot spend materials on a new recipe on its own. If no safe
-action is available, the player reports the obstruction. Check
+The three-second planning deadline is a diagnostic target, not a
+guarantee about the footage. If no safe, authorized action is available,
+the player reports the obstruction instead of spending resources or
+moving just to reset a timer. Check
 `strategy.planningWait.longestPendingWithoutWorkMs` for the actual longest
 idle interval, including blocked time. `rightCensored: true` means the final
 interval may extend beyond the last observation. A provider timeout is a
 separate limit. An audible creeper fuse can interrupt either planning or a
 drag in the crafting grid before that limit matters.
+
+For the rhythm of the whole run, inspect `outcome.json` → `pauseEvidence`.
+It flags long stops and clusters of shorter ones and gives their times in
+the recording. The provider overlap is reported separately: a pending
+request can coincide with useful work, a necessary wait, or idle time.
+Use those timestamps to inspect the recording at normal speed. Neither a
+moving camera nor a successful craft shows that the intervening play felt
+natural.
 
 Terra can also write a function that chooses what to inspect or survey.
 Before it can move the camera, the function must pass an isolated Docker worker

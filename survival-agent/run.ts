@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { SURVIVAL_AGENT_GOALS as GOALS, type SurvivalAgentGoal as Goal } from "../src/shared/survival-agent-ui.ts";
 import { JAVA, MinecraftClient, privateJson } from "../src/server/minecraft-client.ts";
 import { nativeLaunchFailure } from "../src/server/native-launch-fault.ts";
+import { osMonotonicNs } from "../src/server/os-monotonic.ts";
 import { composeTerraSurvival, declareTerraStrategy } from "../src/server/survival-macro/compose.ts";
 import { descentFixtures, descentVariants, fixtureWorld, macroTrialWorld, provisionFixture, provisionMacroTrialWorld, terrainFixtures,
   terrainVariants, provisionUrgentThreatWorld, urgentThreatWorld, provisionUrgentCraftWorld, urgentCraftWorld,
@@ -19,11 +20,12 @@ import { createUrgentThreatProbe, urgentThreatDeclaration, urgentThreatLimits, u
 import { FAST_DEATH_LIMIT, FAST_DEATH_WINDOW_MS, LIFE_RECEIPTS, LifeLedger, lifeReceiptReader,
   RESPAWN_MARKER, RESPAWN_TIMEOUT_MS } from "./lives.ts";
 import { admitRun } from "./storage.ts";
+import { finalPauseEvidence, PAUSE_DIAGNOSTICS } from "./pause-evidence.ts";
 import { finalPlanningEvidence } from "./planning-evidence.ts";
 import { readStrategy, type TerraOptions } from "./strategy-options.ts";
 import { monitorDescent, verifyDescent } from "./verify-descent.ts";
 import { verifyTerrain } from "./verify-terrain.ts";
-import { readSavedPlayerStats, savedDeathDelta, verifySurvival } from "./verify.ts";
+import { readSavedPlayerStats, retainsCompletedProgram, savedDeathDelta, verifySurvival, type ProgramWin } from "./verify.ts";
 import { MACRO_TRIAL_GOAL, MACRO_TRIAL_SECONDS, macroTrialActor, parseMacroTrialLaunch,
   reportMacroTrial, watchMacroTrialOwner, type MacroTrialLaunch } from "./macro-trial.ts";
 
@@ -44,6 +46,7 @@ const SCREEN = { width: 1280, height: 720 } as const;
 const SIZE = `${SCREEN.width}x${SCREEN.height}`;
 const STARTUP_MS = 120_000;
 const HEARTBEAT_MS = 20_000;
+const RUNNER_STOP_GRACE_MS = 1_500;
 const STALL_MS = 180_000;
 const GOAL_STALL_MS = 300_000;
 const DRAIN_HEADROOM = 128_000_000;
@@ -72,6 +75,7 @@ type Progress = {
   dimension?: string;
   rock_broken?: number;
   frame_blocks?: number;
+  ignited?: boolean;
   cast_frame_blocks?: number;
   tick: number;
   goal: string;
@@ -110,7 +114,7 @@ class Stop extends Error {
 
 const usage = `Minecraft Survival Agent
 
-Usage: bun run play:agent [--strategy terra [--macro-requests N] [--task TEXT]] GOAL [SECONDS [(--continue-from | --replay-incident) RUN_BASENAME]]
+Usage: bun run play:agent [--strategy terra [--macro-requests N] [--startup allow|off] [--task TEXT]] GOAL [SECONDS [(--continue-from | --replay-incident) RUN_BASENAME]]
        bun run diagnose:pool [SECONDS]
        bun run play:agent --diagnostic-descent (${descentVariants.join(" | ")}) [SECONDS]
        bun run play:agent --diagnostic-terrain (${terrainVariants.join(" | ")}) [SECONDS]
@@ -120,6 +124,7 @@ Usage: bun run play:agent [--strategy terra [--macro-requests N] [--task TEXT]] 
 GOAL: ${GOALS.join(" | ")}
 --strategy terra: use gpt-6.1-terra for this ordinary run; omitted means no model.
 --macro-requests: finite call budget for this attempt (default 8). --task adds a strategic objective without replacing the vanilla goal verifier.
+--startup off: wait for the first live observation before spending any Terra request. Ordinary Terra otherwise may plan from the task alone during loading.
 SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SECONDS}).
 --continue-from: copy a closed, recorded Survival world. Retry its goal or pursue a later one.
 --replay-incident: replay an ordinary save in the diagnostic lane; never a fresh run.
@@ -829,6 +834,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     console.log(dir);
     const startedAt = new Date().toISOString();
     const start = performance.now();
+    const runStartedNs = osMonotonicNs();
     const timer = setTimeout(() => abort("wall_limit", `Reached the ${seconds}s wall limit.`), seconds * 1_000);
     const record = (event: string, fields: Record<string, unknown> = {}) => appendFile(
       path.join(dir, "history.jsonl"),
@@ -868,10 +874,14 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     let server: Owned | undefined;
     let client: Owned | undefined;
     let recorder: Owned | undefined;
+    let recordingStartedNs: bigint | undefined;
+    let clientClosedNs: bigint | undefined;
+    let runnerStopRequestedNs: bigint | undefined;
     let diagnostics: Set<string> | undefined;
     let lastProgress: Progress | null = null;
     let lastPlanningSample: Progress | null = null;
     let claimProgress: PlayingProgress | null = null;
+    let programWin: ProgramWin | null = null;
     let goalClaim: { life: number; tick: number; wall_ms: number | null; deaths: number } | null = null;
     const statsDirectory = path.join(dir, "server/world/stats");
     let beforeStats: Awaited<ReturnType<typeof readSavedPlayerStats>> = null;
@@ -911,6 +921,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       await privateJson(path.join(dir, "declaration.json"), {
         schemaVersion: 1, startedAt, goal, minecraftVersion: "1.21.4", agentJarSha256,
         world, claimScope, deathPolicy,
+        ...(!macroTrial ? { pauseDiagnostics: PAUSE_DIAGNOSTICS } : {}),
         ...(benchmark ? { benchmark, strategy: terraDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
         ...(macroTrial ? { macroTrial: { ordinaryRun: path.basename(macroTrial.ordinaryDir), maximumIntents: 1 } } : {}),
         ...(urgentProbe ? { urgentThreat: urgentCraft ? urgentCraftDeclaration : urgentThreatDeclaration,
@@ -952,6 +963,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         macroAttempt = composeTerraSurvival({
           declaration: terraDeclaration, dir, projectRoot: ROOT, actorJarSha256: agentJarSha256,
           authDirectory: process.env.GAMEHARNESS_DATA_DIR ?? RUNTIME, display, ...SCREEN, ffmpeg, signal,
+          ...(!diagnostic && terraDeclaration.startup === "allow" ? { firstPlanGoal: goal } : {}),
           ...(urgentProbe ? { onProviderDispatch: urgentProbe.onDispatch, onProviderSettled: urgentProbe.onSettled } : {}),
           onDisplayLoss: () => abort("failed", "The run lost its private Minecraft display; Terra uploads were stopped."),
           confirmNativeExit: async () => {
@@ -1039,6 +1051,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       const ffmpegErr = await open(path.join(dir, "ffmpeg.log"), "wx", 0o600);
       try {
         startup.throwIfAborted();
+        recordingStartedNs = osMonotonicNs();
         recorder = own(spawn(ffmpeg, [
           "-hide_banner", "-loglevel", "warning", "-nostats",
           "-f", "x11grab", "-draw_mouse", "1", "-framerate", "30", "-video_size", SIZE,
@@ -1084,6 +1097,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         } : undefined,
       }, startup);
       client = own(launched.child, launched.closed);
+      void launched.closed.then(() => { clientClosedNs = osMonotonicNs(); });
       nativeClient?.resolve(client);
       if (macroTrial && client.child.pid)
         reportMacroTrial({ kind: "owned", run: macroTrial.run, displayRole: "client", pid: client.child.pid });
@@ -1147,6 +1161,19 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
             if (progress.won) throw new Stop("unverified", "The ordinary goal ended before proving the descent.");
           } else if (urgentProbe && progress.won) {
             throw new Stop("unverified", "The actor stopped at the Survival goal before the diagnostic closed.");
+          } else if (terraDeclaration?.workMode === "constrained") {
+            const completed = macroAttempt?.outcome().status?.completedWorkProgram;
+            if (completed) {
+              const witness = { run: live.run, program: completed };
+              if (retainsCompletedProgram(witness, goal, progress)) {
+                programWin = witness;
+                claimProgress = progress;
+                goalClaim = { life: ledger.life!, tick: progress.tick, wall_ms: progress.wall_ms ?? null, deaths: ledger.deaths };
+                await record("work_program_goal", { workOrderId: completed.finalOrder.id, requestId: completed.requestId,
+                  receiptTick: completed.receipt.tick, observedTick: completed.basis.tick, ...goalClaim });
+                throw new Stop("won", "The completed Terra program and live inventory confirm the Survival goal.");
+              }
+            }
           } else if (!macroTrial && progress.won && retainsGoal(goal, progress)) {
             claimProgress = progress;
             goalClaim = { life: ledger.life!, tick: progress.tick, wall_ms: progress.wall_ms ?? null, deaths: ledger.deaths };
@@ -1200,31 +1227,38 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       nativeClient?.resolve(client);
       controller.abort();
       const strategyDrain = macroAttempt?.stop();
-      // SIGTERM can prevent Fabric from writing its final observation. Revoke
-      // first; allow a few native ticks for the receipt without delaying Stop
-      // indefinitely on a hung, airborne, or disconnected client.
-      const grace = (async () => {
-        if (!macroAttempt || !client || client.exit) return;
-        const deadline = performance.now() + 750;
-        while (!client.exit && performance.now() < deadline) {
-          const sample = await finalPlanningEvidence(dir, lastPlanningSample).catch(() => null);
-          if (sample?.measured && !sample.rightCensored) return;
-          await delay(Math.max(0, Math.min(40, deadline - performance.now())));
+      // Only the run owner may request gameplay shutdown. Macro revocation
+      // alone is not a gameplay boundary. Keep the vanilla server and footage
+      // running until the exact client process exits or is drained.
+      const clientDrain = (async () => {
+        try {
+          if (client && !client.exit) {
+            const deadline = performance.now() + RUNNER_STOP_GRACE_MS;
+            const requestedAt = osMonotonicNs();
+            const published = await writeFile(path.join(dir, `runner-stop-${path.basename(dir)}`), "", {
+              mode: 0o600, flag: "wx", signal: AbortSignal.timeout(RUNNER_STOP_GRACE_MS),
+            }).then(() => true, () => false);
+            if (published) {
+              runnerStopRequestedNs = requestedAt;
+              await waitClosed(client, Math.max(0, deadline - performance.now()));
+            }
+          }
+        } finally {
+          await drain(client);
         }
       })();
-      const clientDrain = grace.then(() => drain(client));
-      const serverDrainTask = !urgentProbe ? grace.then(() => drainVanillaServer(server)) : (async () => {
+      const serverDrainTask = (async () => {
         let cleanupError: unknown;
         try {
           await clientDrain;
-          await urgentProbe.cleanUp();
+          await urgentProbe?.cleanUp();
         } catch (error) { cleanupError = error; }
         const result = await drainVanillaServer(server);
         if (cleanupError) throw cleanupError;
         return result;
       })();
       const settled = await Promise.allSettled([
-        clientDrain, serverDrainTask, grace.then(() => drain(recorder, "q\n")), meter, strategyDrain,
+        clientDrain, serverDrainTask, clientDrain.finally(() => drain(recorder, "q\n")), meter, strategyDrain,
       ]);
       if (macroTrial || urgentProbe) canReleaseDiagnostic =
         [client, server, recorder].every(owned => !owned || owned.exit !== undefined) &&
@@ -1265,7 +1299,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       } else if (result.status === "trial_closed" && (measuredBytes === null || measuredBytes > reserveBytes)) {
         result = new Stop("storage_limit", "The diagnostic's final artifacts did not fit its reservation.");
       } else if (result.status === "won" && (!lifeEvidenceReadable || !lastProgress?.alive ||
-          (!descent && !retainsGoal(goal, lastProgress)) ||
+          (!descent && !retainsGoal(goal, lastProgress)) || (programWin && !retainsCompletedProgram(programWin, goal, lastProgress)) ||
           !ledger.currentPlaying(lastProgress) || !goalClaim || ledger.life !== goalClaim.life ||
           goalClaim.deaths !== ledger.deaths || (recordedDeaths?.attempt ?? 0) > ledger.deaths)) {
         result = new Stop("unverified", "The run did not retain a live, current-life goal claim through shutdown.");
@@ -1277,7 +1311,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       } else if (result.status === "won") {
         verification = descent ? await verifyDescent(dir, descent, descentSettlement) :
           terrain ? await verifyTerrain(dir, terrain, claimProgress) :
-            await verifySurvival(statsDirectory, goal, claimProgress, diagnostic === "pool", beforeStats);
+            await verifySurvival(statsDirectory, goal, claimProgress, diagnostic === "pool", beforeStats, programWin);
         const videoExists = await stat(video).then((entry) => entry.size > 0, () => false);
         if (!verification.verified) result = new Stop("unverified", verification.reason);
         else if (!videoExists || recorder?.exit?.code !== 0)
@@ -1290,6 +1324,10 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           outcome: "no_completed_effect", status: null }), localFallbackTicks: lastProgress?.macro_fallback_ticks ?? null,
           planningWait: await finalPlanningEvidence(dir, lastPlanningSample) }
         : DETERMINISTIC_STRATEGY;
+      const pauseEvidence = !macroTrial ? await finalPauseEvidence(dir, {
+        runStartedNs, cutoffNs: clientClosedNs ?? osMonotonicNs(), recordingStartedNs, runnerStopRequestedNs,
+        providerSpans: terraDeclaration ? macroAttempt?.providerTimeline() : [],
+      }) : undefined;
       const urgentThreat = urgentProbe && await urgentProbe.verify({
         noDeath: serverSaved && lifeEvidenceReadable && recordedDeaths?.attempt === 0 && ledger.deaths === 0 &&
           !!lastProgress?.alive && ledger.currentPlaying(lastProgress),
@@ -1313,11 +1351,13 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         schemaVersion: 1, status: result.status, reason: result.message, goal, startedAt, world, claimScope, deathPolicy,
         finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - start),
         finalStage: stage, reservedBytes: reserveBytes, measuredBytes, progress: lastProgress,
+        ...(pauseEvidence ? { pauseEvidence } : {}),
         ...(benchmark ? { benchmark: { ...benchmark, confirmed: benchmarkConfirmed }, strategy } : {}),
         ...(urgentThreat ? { urgentThreat, strategy } : {}),
         lifecycle: { ...ledger.summary(), receiptFile: LIFE_RECEIPTS, evidenceReadable: lifeEvidenceReadable,
           savedDeaths: recordedDeaths && { ...recordedDeaths, agreesWithObserved: recordedDeaths.attempt === ledger.deaths },
-          goalClaim, goalBearingLives: benchmarkConfirmed && goalClaim ? [goalClaim.life] : [],
+          goalClaim, ...(programWin ? { completedWorkProgram: programWin.program } : {}),
+          goalBearingLives: benchmarkConfirmed && goalClaim ? [goalClaim.life] : [],
         },
         verification: verification && { ...verification, scope: claimScope },
         exits: { server: server?.exit ?? null, client: client?.exit ?? null, recorder: recorder?.exit ?? null },

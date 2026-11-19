@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
-import { SURVIVAL_AGENT_STRATEGY_OUTCOMES, TERRA_MODEL_ID,
+import { hasConfirmedTerraEffect, SURVIVAL_AGENT_STRATEGY_OUTCOMES, TERRA_MODEL_ID,
   type SurvivalAgentGoal, type SurvivalAgentSnapshot, type SurvivalAgentStart } from "../shared/survival-agent-ui.ts";
 import { prepareAgentServerArtifact } from "./minecraft-server-artifact.ts";
 import { AgentVideo, type AgentDisplay } from "./survival-agent-video.ts";
@@ -100,11 +100,8 @@ function terraOutcome(outcome: Record<string, unknown>): SurvivalAgentSnapshot["
   const strategy = outcome.strategy as Record<string, unknown> | null | undefined;
   if (strategy?.strategy !== "terra" || strategy.model !== TERRA_MODEL_ID) return null;
   const status = SURVIVAL_AGENT_STRATEGY_OUTCOMES.find(value => value === strategy.outcome);
-  if (status === "native_effect_completed") {
-    const count = (strategy.status as { completedReceipts?: unknown } | null)?.completedReceipts;
-    if (strategy.admission !== "admitted" || typeof count !== "number" || !Number.isSafeInteger(count) || count < 1)
-      return null;
-  }
+  if (status === "native_effect_completed" && (strategy.admission !== "admitted" || !hasConfirmedTerraEffect(strategy.status)))
+    return null;
   return status ?? null;
 }
 

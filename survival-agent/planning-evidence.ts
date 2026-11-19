@@ -10,7 +10,7 @@ const nativeSample = z.object({
     "local_in_progress", "terra_in_progress", "handoff", "urgent", "inactive", "trial_idle"]),
   macro_planning_evidence: z.string().max(1024),
   macro_wait_elapsed_ms: ms, macro_wait_max_idle_ms: ms, macro_wait_max_overshoot_ms: ms, macro_wait_total_ms: ms,
-  macro_wait_max_no_work_ms: ms, macro_planning_marker_notice_tick: count.nullable(),
+  macro_wait_max_no_work_ms: ms, macro_wait_total_no_work_ms: ms.optional(), macro_planning_marker_notice_tick: count.nullable(),
   macro_planning_marker_notice_monotonic_ns: z.string().regex(/^-?\d{1,20}$/).nullable(),
   macro_last_purposeful_tick: count.nullable(), macro_last_purposeful_action: z.string().max(512).nullable(),
   macro_blocked_count: count, macro_urgent_count: count, macro_fallback_actions: count,
@@ -27,6 +27,7 @@ export function planningWaitEvidence(sample: unknown) {
     state: v.macro_planning_state, evidence: v.macro_planning_evidence,
     currentPolicyWaitMs: v.macro_wait_elapsed_ms, longestPolicyWaitMs: v.macro_wait_max_idle_ms,
     longestPendingWithoutWorkMs: v.macro_wait_max_no_work_ms,
+    totalPendingWithoutWorkMs: v.macro_wait_total_no_work_ms ?? null,
     markerObservedTick: v.macro_planning_marker_notice_tick, markerObservedMonotonicNs: v.macro_planning_marker_notice_monotonic_ns,
     maxDeadlineOvershootMs: v.macro_wait_max_overshoot_ms, totalIdleMs: v.macro_wait_total_ms,
     lastPurposefulTick: v.macro_last_purposeful_tick, lastPurposefulAction: v.macro_last_purposeful_action,
@@ -58,6 +59,7 @@ export async function finalPlanningEvidence(runDir: string, sample: unknown) {
           last.lastPurposefulTick === evidence.lastPurposefulTick &&
           last.markerObservedMonotonicNs === evidence.markerObservedMonotonicNs &&
           last.longestPendingWithoutWorkMs === evidence.longestPendingWithoutWorkMs &&
+          last.totalPendingWithoutWorkMs === evidence.totalPendingWithoutWorkMs &&
           last.longestPolicyWaitMs === evidence.longestPolicyWaitMs &&
           last.totalIdleMs === evidence.totalIdleMs && last.blockedEpisodes === evidence.blockedEpisodes &&
           last.completedLocalActions === evidence.completedLocalActions && last.urgentInterventions === evidence.urgentInterventions;

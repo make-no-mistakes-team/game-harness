@@ -760,6 +760,29 @@ Report counts, sample sizes, medians and ranges for run-level measures. For per-
 
 ### Execution trace, review and descriptive comparison
 
+The native Survival run records a bounded private `native-pause-timeline.tsv`
+and reports `pauseEvidence` in `outcome.json`. Startup and time to first
+observed input are separate measurements; the initial gameplay pause still
+counts. The journal spans gameplay, not just the lifetime of a provider request
+or Terra authority. A request change, unavailable action, or unsupported camera
+motion does not split a pause. Advancing cracks, anchored route progress,
+witnessed GUI transactions, and task-relevant novelty can establish work.
+Witnessed stationary mechanics are visible separately and do not suppress the
+raw flags. Missing samples and unsealed tails do not count as zero.
+On a terminal run decision, the owning runner can request a normal client stop.
+Only a matching native tick seals this boundary; a hung client still takes the
+bounded process-drain path and missing evidence remains censored. Losing Terra
+authority does not request shutdown or close the gameplay journal.
+
+The declaration fixes initial review flags: any pause over 3,000 ms, more than
+one pause over 500 ms in a 20,000 ms window, or more than one pause over 1,000 ms
+in a 30,000 ms window. Compare onsets in half-open windows; durations exactly
+at the threshold do not qualify. A long pause can qualify in both windows.
+Provider overlap uses actual dispatch and observed terminal events or local
+settlement, not the network deadline or a planning marker. Overlap alone does
+not show why the player paused. Use the witnesses to review the original-speed
+footage; the flags are not a human-likeness score.
+
 The implemented bounded trace records actual API requests/results, authorized observation snapshots, instrumented JavaScript condition decisions/source locations, model-authored intent, attributed spans and explicit omissions. It is not a transcript of hidden reasoning. Branch instrumentation preserves canonical source/hash and evaluation semantics; a branch decision or `game.progress` statement does not establish why a model changed target or that an action succeeded. The [runtime trace contract](runtime-contracts.md#bounded-execution-trace-and-revision-evidence) owns record, storage and page budgets.
 
 Classify apparent pauses from measured `native_action`, `dispatch`, `receipt`, `readiness`, `sandbox`, `capability_wait`, `strategic_request`, `scheduler_handoff` and `life_recovery` spans. Preserve missing/cross-clock uncertainty and overlapping intervals. The operator's slow-camera, roughly five-second-pause and three-tree/target-switch observations are ground truth about the reported experience; without the exact run/evidence, no cause or tactical explanation is established.

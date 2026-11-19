@@ -1,14 +1,20 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { link, open, unlink, type FileHandle } from "node:fs/promises";
+import { link, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { SURVIVAL_AGENT_GOALS, type SurvivalAgentGoal } from "../../shared/survival-agent-ui.ts";
 
-export const MACRO_CAPABILITIES_VERSION = "survival-macro/v1";
+export const MACRO_CAPABILITIES_VERSION = "survival-macro/v3";
 export const MACRO_MAX_INTENT_TTL_TICKS = 1_200;
 export const MACRO_MAX_PLAN_TTL_TICKS = 7_200;
 export const MACRO_MAX_HANDOFF_TTL_TICKS = 100;
 export const MACRO_MAX_PLANNING_IDLE_MS = 3_000;
 export const MACRO_MAX_STRATEGIC_EPISODES = 3;
+export const MACRO_MAX_DIRECT_EFFECTS = 4;
+export const MACRO_MAX_DIRECT_MS = 30_000;
+export const MACRO_LOOKAHEAD_MAX_AGE_TICKS = 40;
+export const MACRO_LOOKAHEAD_MAX_CRACK = 0.65;
+export const MACRO_MAX_WORK_STAGES = 3;
 
 const FILE_BYTES = {
   "active.json": 512,
@@ -17,6 +23,7 @@ const FILE_BYTES = {
   "native-planning-final.json": 8 * 1024,
   "observation.json": 64 * 1024,
   "intent.json": 2 * 1024,
+  "work.json": 16 * 1024,
   "receipt.json": 4 * 1024,
   "revoked.json": 1024,
 } as const;
@@ -38,6 +45,12 @@ export interface MacroOpportunity {
   readonly summary: string;
   readonly risk: "read" | "low" | "guarded";
   readonly evidence: string;
+  /** Native evidence for one guarded primitive; spends bound item-count loss, not durability wear or yields. */
+  readonly material?: {
+    readonly subject: string;
+    readonly target: string;
+    readonly spends: Readonly<Record<string, number>>;
+  };
 }
 
 export interface MacroObservation extends MacroBasis {
@@ -49,6 +62,11 @@ export interface MacroObservation extends MacroBasis {
   readonly opportunities: readonly MacroOpportunity[];
   readonly recent: readonly string[];
   readonly quiescent: boolean;
+  readonly safety?: { readonly clear: boolean; readonly revision: number };
+  /** A matching accepted break had actual vanilla crack progress this tick. */
+  readonly working?: { readonly intentId: string; readonly crack: number };
+  /** Native job disposition, not evidence that movement or another effect advanced. */
+  readonly workOrder?: MacroWorkState;
 }
 
 export interface MacroIntent {
@@ -119,6 +137,98 @@ export interface MacroReviewContext {
   readonly testPath: string;
 }
 
+export type MacroStockFloor = { readonly item: string; readonly count: number };
+
+export type MacroWorkMode = "preset" | "constrained";
+export type MacroWorkTarget =
+  | { readonly kind: "stock"; readonly item: string; readonly count: number }
+  | { readonly kind: "preset"; readonly goal: SurvivalAgentGoal };
+export interface MacroWorkPolicy {
+  readonly target: MacroWorkTarget;
+  readonly allowedEffects: readonly string[];
+  readonly costCaps: readonly MacroStockFloor[];
+  readonly reserves: readonly MacroStockFloor[];
+  readonly maxBreaks: number;
+  readonly maxCrafts: number;
+  readonly maxPlacements: number;
+}
+export interface MacroWorkOrder extends MacroWorkPolicy {
+  readonly v: 1;
+  readonly id: string;
+  readonly run: string;
+  readonly life: number;
+  readonly epoch: number;
+  readonly basisTick: number;
+  readonly expiresTick: number;
+  readonly safetyRevision: number;
+  readonly origin: "preset" | "model";
+}
+export interface MacroWorkState {
+  readonly id: string;
+  readonly state: "working" | "needs_replan" | "blocked" | "complete";
+  readonly detail: string;
+  /** Observed operation and confirmed counters, not a claim of useful play each tick. */
+  readonly progress?: {
+    readonly phase: "route" | "harvest" | "collect" | "craft" | "equip" | "place" | "search" | "hold" | "complete";
+    readonly status: string;
+    readonly target?: { readonly item: string; readonly count: number; readonly required: number };
+    readonly breaks: number;
+    readonly crafts: number;
+    readonly placements: number;
+    readonly lastEffect?: { readonly tick: number; readonly detail: string };
+    readonly replan?: "target_near" | "cap_near" | "expiry_near";
+  };
+}
+export interface MacroWorkStage {
+  readonly policy: MacroWorkPolicy;
+  readonly requires: readonly MacroStockFloor[];
+}
+export interface MacroWorkDemand {
+  readonly mode: MacroWorkMode;
+  readonly demand: "first" | "renew" | "successor" | "blocked" | "outcome" | "changed";
+  readonly protectedReserves: readonly MacroStockFloor[];
+  readonly current: {
+    readonly id: string;
+    readonly origin: MacroWorkOrder["origin"];
+    readonly expiresTick: number;
+    readonly policy: MacroWorkPolicy;
+    readonly accepted: MacroReceipt | null;
+    readonly nativeState: MacroWorkState | null;
+  } | null;
+  readonly lastOutcome: {
+    readonly id: string;
+    readonly policy: MacroWorkPolicy;
+    readonly receipt: MacroReceipt;
+    readonly nativeState: MacroWorkState | null;
+  } | null;
+}
+
+export interface MacroSuccessor {
+  readonly kind: "successor";
+  readonly afterIntentId: string;
+  readonly opportunityId: string;
+  readonly requires: readonly MacroStockFloor[];
+  readonly reserves: readonly MacroStockFloor[];
+}
+
+export interface MacroLookahead {
+  readonly predecessor: { readonly intentId: string; readonly acceptedTick: number; readonly verb: string; readonly summary: string };
+  readonly witnessBasis: MacroBasis;
+  readonly candidates: readonly MacroOpportunity[];
+  readonly reserves: readonly MacroStockFloor[];
+}
+
+export interface MacroDirectAction {
+  readonly kind: "continuation";
+  readonly opportunityId: string;
+  readonly steps: readonly {
+    readonly selector: { readonly verb: string; readonly subject: string };
+    readonly maxEffects: number;
+    readonly until: MacroStockFloor | null;
+  }[];
+  readonly reserves: readonly MacroStockFloor[];
+}
+
 export interface MacroProposal {
   readonly subgoal: string;
   readonly reason: string;
@@ -128,6 +238,11 @@ export interface MacroProposal {
   readonly expiresTick: number;
   readonly action:
     | { readonly kind: "opportunity"; readonly opportunityId: string }
+    | MacroDirectAction
+    | MacroSuccessor
+    | { readonly kind: "work"; readonly policy: MacroWorkPolicy; readonly afterWorkId?: string }
+    | { readonly kind: "work-program"; readonly stages: readonly MacroWorkStage[]; readonly afterWorkId?: string }
+    | { readonly kind: "revoke-work"; readonly workOrderId: string }
     | { readonly kind: "skill"; readonly candidate: MacroSkillCandidate }
     | { readonly kind: "tested-skill"; readonly skillHash: string }
     | { readonly kind: "selected-skill" }
@@ -187,6 +302,8 @@ export interface MacroRequest {
   readonly objective?: string;
   readonly trigger: MacroTrigger;
   readonly lastReceipt: MacroReceipt | null;
+  readonly lookahead?: MacroLookahead;
+  readonly work?: MacroWorkDemand;
   readonly feedback?: MacroFeedback;
   /** Same-life, same-goal history; newest first, at most MACRO_MAX_STRATEGIC_EPISODES. Never actionable. */
   readonly strategicEpisodes?: readonly MacroStrategicEpisode[];
@@ -221,6 +338,7 @@ export interface MacroInference {
   readonly latencyMs?: number;
   readonly frameSha256?: string;
   readonly dispatched?: boolean;
+  readonly providerStartedAtMs?: number;
 }
 
 export type MacroStrategist = (request: MacroRequest, signal: AbortSignal) => Promise<MacroInference>;
@@ -249,6 +367,129 @@ function whole(value: unknown, field: string, min = 0, max = Number.MAX_SAFE_INT
 function finite(value: unknown, field: string, max: number): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > max) invalid(field);
   return value;
+}
+
+function itemKey(value: unknown, field: string): string {
+  if (typeof value !== "string" || !itemPattern.test(value) ||
+      value === "__proto__" || value === "constructor" || value === "prototype") invalid(field);
+  return value;
+}
+
+function stockFloors(value: unknown, field: string, work = false): readonly MacroStockFloor[] {
+  const floors = bounds(value, field, work ? 32 : 8).map(value => {
+    const raw = shape(value, "inventory floor", ["item", "count"]);
+    return Object.freeze({
+      item: work ? vanillaItem(raw.item, "floor item") : itemKey(raw.item, "floor item"),
+      count: whole(raw.count, "floor count", 1, work ? 2_304 : 65_535),
+    });
+  });
+  if (new Set(floors.map(floor => floor.item)).size !== floors.length) invalid(field);
+  return Object.freeze(floors);
+}
+
+function vanillaItem(value: unknown, field: string): string {
+  if (typeof value !== "string" || !/^minecraft:[a-z0-9_]{1,96}$/.test(value) || value === "minecraft:air") invalid(field);
+  return value;
+}
+
+const WORK_POLICY_KEYS = ["target", "allowedEffects", "costCaps", "reserves", "maxBreaks", "maxCrafts", "maxPlacements"] as const;
+const WORK_LIMITS = { maxBreaks: 64, maxCrafts: 64, maxPlacements: 8 } as const;
+
+export function parseMacroWorkPolicy(value: unknown): MacroWorkPolicy {
+  return workPolicy(shape(value, "work policy", WORK_POLICY_KEYS));
+}
+
+function workPolicy(raw: Record<string, unknown>): MacroWorkPolicy {
+  const target = object(raw.target, "work target");
+  const kind = choice(target.kind, "work target kind", ["stock", "preset"] as const);
+  const parsedTarget: MacroWorkTarget = kind === "stock"
+    ? { kind, item: vanillaItem(shape(target, "stock target", ["kind", "item", "count"]).item, "target item"),
+      count: whole(target.count, "target count", 1, 2_304) }
+    : { kind, goal: choice(shape(target, "preset target", ["kind", "goal"]).goal, "preset goal", SURVIVAL_AGENT_GOALS) };
+  const effects = bounds(raw.allowedEffects, "work effects", 64).map(effect => {
+    if (typeof effect !== "string" ||
+        !/^(break:minecraft:[a-z0-9_]{1,96}|craft:[a-z0-9_]{1,96}|place:minecraft:crafting_table)$/.test(effect)) invalid("work effect");
+    return effect;
+  });
+  if (new Set(effects).size !== effects.length) invalid("duplicate work effects");
+  const byItem = (left: MacroStockFloor, right: MacroStockFloor) => left.item.localeCompare(right.item);
+  return Object.freeze({
+    target: Object.freeze(parsedTarget), allowedEffects: Object.freeze(effects.sort()),
+    costCaps: Object.freeze([...stockFloors(raw.costCaps, "work cost caps", true)].sort(byItem)),
+    reserves: Object.freeze([...stockFloors(raw.reserves, "work reserves", true)].sort(byItem)),
+    maxBreaks: whole(raw.maxBreaks, "work break cap", 0, WORK_LIMITS.maxBreaks),
+    maxCrafts: whole(raw.maxCrafts, "work craft cap", 0, WORK_LIMITS.maxCrafts),
+    maxPlacements: whole(raw.maxPlacements, "work placement cap", 0, WORK_LIMITS.maxPlacements),
+  });
+}
+
+function workStages(value: unknown): readonly MacroWorkStage[] {
+  const totals = { maxBreaks: 0, maxCrafts: 0, maxPlacements: 0 };
+  const totalCosts = new Map<string, number>();
+  const reserves = new Map<string, number>();
+  const targets = new Set<string>();
+  const stages = bounds(value, "work program stages", MACRO_MAX_WORK_STAGES).map(value => {
+    const raw = shape(value, "work stage", ["policy", "requires"]);
+    const policy = parseMacroWorkPolicy(raw.policy);
+    const target = JSON.stringify(policy.target);
+    if (targets.has(target)) invalid("duplicate work program target");
+    targets.add(target);
+    for (const key of ["maxBreaks", "maxCrafts", "maxPlacements"] as const) {
+      if ((totals[key] += policy[key]) > WORK_LIMITS[key]) invalid("work program effect caps");
+    }
+    for (const { item, count } of policy.costCaps) {
+      const total = (totalCosts.get(item) ?? 0) + count;
+      if (total > 2_304) invalid("work program item cost cap");
+      totalCosts.set(item, total);
+    }
+    for (const [item, count] of reserves) {
+      if (!policy.reserves.some(floor => floor.item === item && floor.count >= count)) invalid("work program reserves regressed");
+    }
+    for (const floor of policy.reserves) reserves.set(floor.item, floor.count);
+    return Object.freeze({ policy, requires: stockFloors(raw.requires, "work stage requires", true) });
+  });
+  if (stages.length < 2) invalid("work program needs multiple stages");
+  return Object.freeze(stages);
+}
+
+function parseWorkProgress(value: unknown, tick: number): NonNullable<MacroWorkState["progress"]> {
+  const raw = shape(value, "native work progress", ["phase", "status", "breaks", "crafts", "placements"], ["target", "lastEffect", "replan"]);
+  const target = raw.target === undefined ? undefined : shape(raw.target, "native work stock", ["item", "count", "required"]);
+  const last = raw.lastEffect === undefined ? undefined : shape(raw.lastEffect, "native last work effect", ["tick", "detail"]);
+  return Object.freeze({
+    phase: choice(raw.phase, "work progress phase", ["route", "harvest", "collect", "craft", "equip", "place", "search", "hold", "complete"] as const),
+    status: text(raw.status, "work progress status", 1_024),
+    breaks: whole(raw.breaks, "confirmed work breaks", 0, WORK_LIMITS.maxBreaks),
+    crafts: whole(raw.crafts, "confirmed work crafts", 0, WORK_LIMITS.maxCrafts),
+    placements: whole(raw.placements, "confirmed work placements", 0, WORK_LIMITS.maxPlacements),
+    ...(target ? { target: Object.freeze({
+      item: vanillaItem(target.item, "native stock item"),
+      count: whole(target.count, "observed stock count", 0, 65_535),
+      required: whole(target.required, "native work target", 1, 2_304),
+    }) } : {}),
+    ...(last ? { lastEffect: Object.freeze({
+      tick: whole(last.tick, "native last work effect tick", 1, tick),
+      detail: text(last.detail, "native last work effect detail", 1_024),
+    }) } : {}),
+    ...(raw.replan !== undefined ? { replan: choice(raw.replan, "native replanning reason", ["target_near", "cap_near", "expiry_near"] as const) } : {}),
+  });
+}
+
+export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
+  const record = shape(value, "work order", [
+    "v", "id", "run", "life", "epoch", "basisTick", "expiresTick", "safetyRevision", "origin", ...WORK_POLICY_KEYS,
+  ]);
+  const origin = choice(record.origin, "work origin", ["preset", "model"] as const);
+  const policy = workPolicy(record);
+  if (origin === "preset" && (policy.target.kind !== "preset" || policy.allowedEffects.length || policy.costCaps.length ||
+      policy.maxBreaks > 32 || policy.maxCrafts > 24 || policy.maxPlacements > 2)) invalid("preset work scope");
+  const basisTick = whole(record.basisTick, "work basis tick", 1, Number.MAX_SAFE_INTEGER - MACRO_MAX_INTENT_TTL_TICKS);
+  return Object.freeze({
+    v: version(record.v), id: validateMacroId(record.id, "work id"), run: validateMacroId(record.run, "run"),
+    life: whole(record.life, "life", 1, 2_147_483_647), epoch: whole(record.epoch, "epoch", 1), basisTick,
+    expiresTick: whole(record.expiresTick, "work expiry", basisTick + 1, basisTick + MACRO_MAX_INTENT_TTL_TICKS),
+    safetyRevision: whole(record.safetyRevision, "work safety revision", 1), origin, ...policy,
+  });
 }
 
 function text(value: unknown, field: string, max: number, multiline = false): string {
@@ -287,33 +528,70 @@ function basis(record: Record<string, unknown>): MacroBasis {
 export function parseMacroObservation(value: unknown): MacroObservation {
   const record = shape(value, "observation", [
     "v", "run", "life", "tick", "epoch", "goal", "health", "food", "inventory", "opportunities", "recent", "quiescent",
-  ]);
+  ], ["safety", "working", "workOrder"]);
   const inventory = Object.create(null) as Record<string, number>;
   const entries = Object.entries(object(record.inventory, "inventory"));
   if (entries.length > 128) invalid("inventory");
   for (const [item, count] of entries) {
-    if (!itemPattern.test(item) || item === "__proto__" || item === "constructor" || item === "prototype") invalid("inventory item");
-    inventory[item] = whole(count, "inventory count", 0, 65_535);
+    inventory[itemKey(item, "inventory item")] = whole(count, "inventory count", 0, 65_535);
   }
   const ids = new Set<string>();
   const opportunities = bounds(record.opportunities, "opportunities", 64).map(value => {
-    const offer = shape(value, "opportunity", ["id", "verb", "summary", "risk", "evidence"]);
+    const offer = shape(value, "opportunity", ["id", "verb", "summary", "risk", "evidence"], ["material"]);
     const id = validateMacroId(offer.id, "opportunity id");
     if (ids.has(id)) invalid("duplicate opportunity id");
     ids.add(id);
+    const verb = validateMacroId(offer.verb, "verb");
+    const risk = choice(offer.risk, "risk", ["read", "low", "guarded"] as const);
+    let material: MacroOpportunity["material"];
+    if (Object.hasOwn(offer, "material")) {
+      const prefix = verb === "break" ? "block:" : verb === "collect" ? "item:" : verb === "continue" ? "recipe:" : null;
+      const raw = shape(offer.material, "material", ["subject", "target", "spends"]);
+      const subject = itemKey(raw.subject, "material subject");
+      if (risk !== "guarded" || !prefix || !subject.startsWith(prefix) || subject.length === prefix.length) invalid("material subject/verb");
+      const costs = Object.entries(object(raw.spends, "material spends"));
+      if (costs.length > 36) invalid("material spends");
+      const spends = Object.create(null) as Record<string, number>;
+      for (const [item, count] of costs) spends[itemKey(item, "spend item")] = whole(count, "spend count", 1, 64);
+      material = Object.freeze({ subject, target: validateMacroId(raw.target, "material target"), spends: Object.freeze(spends) });
+    }
     return Object.freeze({
-      id, verb: validateMacroId(offer.verb, "verb"), summary: text(offer.summary, "summary", 512),
-      risk: choice(offer.risk, "risk", ["read", "low", "guarded"] as const),
+      id, verb, summary: text(offer.summary, "summary", 512), risk,
       evidence: text(offer.evidence, "evidence", 512),
+      ...(material ? { material } : {}),
     });
   });
   if (typeof record.quiescent !== "boolean") invalid("quiescent");
+  let safety: MacroObservation["safety"];
+  if (Object.hasOwn(record, "safety")) {
+    const raw = shape(record.safety, "safety", ["clear", "revision"]);
+    if (typeof raw.clear !== "boolean") invalid("safety clear");
+    safety = Object.freeze({ clear: raw.clear, revision: whole(raw.revision, "safety revision", 1) });
+  }
+  let working: MacroObservation["working"];
+  if (Object.hasOwn(record, "working")) {
+    const raw = shape(record.working, "working", ["intentId", "crack"]);
+    const crack = finite(raw.crack, "working crack", 1);
+    if (crack <= 0 || crack >= 1 || !safety?.clear || record.quiescent) invalid("working observation");
+    working = Object.freeze({ intentId: validateMacroId(raw.intentId, "working intent"), crack });
+  }
+  let workOrder: MacroWorkState | undefined;
+  if (Object.hasOwn(record, "workOrder")) {
+    const raw = shape(record.workOrder, "native work state", ["id", "state", "detail"], ["progress"]);
+    workOrder = Object.freeze({
+      id: validateMacroId(raw.id, "native work id"),
+      state: choice(raw.state, "native work state", ["working", "needs_replan", "blocked", "complete"] as const),
+      detail: text(raw.detail, "native work detail", 1_024),
+      ...(raw.progress === undefined ? {} : { progress: parseWorkProgress(raw.progress, whole(record.tick, "tick", 1)) }),
+    });
+  }
   return Object.freeze({
     v: version(record.v), ...basis(record), goal: text(record.goal, "goal", 256),
     health: finite(record.health, "health", 1_024), food: whole(record.food, "food", 0, 20),
     inventory: Object.freeze(inventory), opportunities: Object.freeze(opportunities),
     recent: Object.freeze(bounds(record.recent, "recent", 32).map(entry => text(entry, "recent entry", 512))),
-    quiescent: record.quiescent,
+    quiescent: record.quiescent, ...(safety ? { safety } : {}), ...(working ? { working } : {}),
+    ...(workOrder ? { workOrder } : {}),
   });
 }
 
@@ -395,12 +673,55 @@ export function parseMacroProposal(value: unknown): MacroProposal {
     "subgoal", "reason", "successCondition", "contingency", "alternative", "expiresTick", "action",
   ]);
   const rawAction = object(record.action, "action");
-  const kind = choice(rawAction.kind, "action kind", ["opportunity", "skill", "tested-skill", "selected-skill", "gap", "abstain"] as const);
+  const kind = choice(rawAction.kind, "action kind",
+    ["opportunity", "continuation", "successor", "work", "work-program", "revoke-work", "skill", "tested-skill", "selected-skill", "gap", "abstain"] as const);
   let action: MacroProposal["action"];
   switch (kind) {
+    case "work":
+      shape(rawAction, "work action", ["kind", "policy"], ["afterWorkId"]);
+      action = { kind, policy: parseMacroWorkPolicy(rawAction.policy),
+        ...(Object.hasOwn(rawAction, "afterWorkId") ? { afterWorkId: validateMacroId(rawAction.afterWorkId, "predecessor work id") } : {}) };
+      break;
+    case "work-program":
+      shape(rawAction, "work program", ["kind", "stages"], ["afterWorkId"]);
+      action = { kind, stages: workStages(rawAction.stages),
+        ...(Object.hasOwn(rawAction, "afterWorkId") ? { afterWorkId: validateMacroId(rawAction.afterWorkId, "predecessor work id") } : {}) };
+      break;
+    case "revoke-work":
+      shape(rawAction, "revoke work action", ["kind", "workOrderId"]);
+      action = { kind, workOrderId: validateMacroId(rawAction.workOrderId, "revoked work id") };
+      break;
     case "opportunity":
       shape(rawAction, "opportunity action", ["kind", "opportunityId"]);
       action = { kind, opportunityId: validateMacroId(rawAction.opportunityId, "opportunity id") };
+      break;
+    case "continuation": {
+      shape(rawAction, "continuation action", ["kind", "opportunityId", "steps", "reserves"]);
+      const floor = (value: unknown) => {
+        const raw = shape(value, "inventory floor", ["item", "count"]);
+        return Object.freeze({ item: itemKey(raw.item, "floor item"), count: whole(raw.count, "floor count", 1, 65_535) });
+      };
+      const steps = bounds(rawAction.steps, "continuation steps", MACRO_MAX_DIRECT_EFFECTS).map(value => {
+        const step = shape(value, "continuation step", ["selector", "maxEffects", "until"]);
+        const selector = shape(step.selector, "material selector", ["verb", "subject"]);
+        return Object.freeze({
+          selector: Object.freeze({ verb: validateMacroId(selector.verb, "selector verb"), subject: itemKey(selector.subject, "selector subject") }),
+          maxEffects: whole(step.maxEffects, "step effects", 1, MACRO_MAX_DIRECT_EFFECTS),
+          until: step.until === null ? null : floor(step.until),
+        });
+      });
+      const reserves = bounds(rawAction.reserves, "continuation reserves", 8).map(floor);
+      if (!steps.length || steps.reduce((sum, step) => sum + step.maxEffects, 0) > MACRO_MAX_DIRECT_EFFECTS ||
+          new Set(reserves.map(reserve => reserve.item)).size !== reserves.length) invalid("continuation limits");
+      action = { kind, opportunityId: validateMacroId(rawAction.opportunityId, "opportunity id"),
+        steps: Object.freeze(steps), reserves: Object.freeze(reserves) };
+      break;
+    }
+    case "successor":
+      shape(rawAction, "successor action", ["kind", "afterIntentId", "opportunityId", "requires", "reserves"]);
+      action = { kind, afterIntentId: validateMacroId(rawAction.afterIntentId, "predecessor intent"),
+        opportunityId: validateMacroId(rawAction.opportunityId, "opportunity id"),
+        requires: stockFloors(rawAction.requires, "successor requires"), reserves: stockFloors(rawAction.reserves, "successor reserves") };
       break;
     case "skill": {
       shape(rawAction, "skill action", ["kind", "candidate"]);
@@ -438,6 +759,17 @@ export function parseMacroProposal(value: unknown): MacroProposal {
     contingency: text(record.contingency, "contingency", 512), alternative: text(record.alternative, "alternative", 512),
     expiresTick: whole(record.expiresTick, "proposal expiry", 1), action: Object.freeze(action),
   });
+}
+
+export function matchesMaterial(offer: MacroOpportunity, selector: MacroDirectAction["steps"][number]["selector"]): boolean {
+  return offer.risk === "guarded" && offer.verb === selector.verb && offer.material?.subject === selector.subject;
+}
+
+export function hasDirectAuthority(action: MacroDirectAction, observation: MacroObservation, capabilitiesVersion: string): boolean {
+  const first = action.steps[0];
+  return !!first && capabilitiesVersion === MACRO_CAPABILITIES_VERSION && observation.safety?.clear === true &&
+    observation.opportunities.some(offer => offer.id === action.opportunityId && matchesMaterial(offer, first.selector)) &&
+    action.steps.every(({ selector }) => observation.opportunities.some(offer => matchesMaterial(offer, selector)));
 }
 
 function missing(error: unknown): boolean {
@@ -514,7 +846,9 @@ export class MacroDirectory {
     }
   }
 
-  async write(name: "active.json" | "intent.json" | "handoff.json" | "planning.json", value: unknown): Promise<void> {
+  async write(name: "active.json" | "intent.json" | "handoff.json" | "planning.json" | "work.json", value: unknown,
+    replace?: "work-only"): Promise<void> {
+    if (replace && name !== "work.json") throw new Error("Only a durable work order may be replaced atomically.");
     const content = JSON.stringify(value) + "\n";
     if (Buffer.byteLength(content) > FILE_BYTES[name]) throw new Error(`Macro IPC output exceeds cap: ${name}.`);
     const partial = `.tmp-${randomUUID()}` as const;
@@ -522,14 +856,15 @@ export class MacroDirectory {
     const file = await open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try {
       try { await file.writeFile(content); } finally { await file.close(); }
-      // The mailbox is one pending item: never silently replace one already present.
-      await link(temporary, this.entry(name));
+      // Primitive mailboxes carry one pending item; work can transition between compatible jobs on one tick.
+      if (replace) await rename(temporary, this.entry(name));
+      else await link(temporary, this.entry(name));
     } finally {
       await this.remove(partial);
     }
   }
 
-  async remove(name: "active.json" | "intent.json" | "handoff.json" | "planning.json" | `.tmp-${string}`): Promise<void> {
+  async remove(name: "active.json" | "intent.json" | "handoff.json" | "planning.json" | "work.json" | `.tmp-${string}`): Promise<void> {
     try { await unlink(this.entry(name)); } catch (error) { if (!missing(error)) throw error; }
   }
 

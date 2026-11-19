@@ -55,7 +55,7 @@ final class AgentStallGuard {
     private static final Predicate<ItemStack> STEP = s -> s.isOf(Items.COBBLESTONE) || s.isOf(Items.COBBLED_DEEPSLATE)
         || s.isOf(Items.DIRT);
 
-    private enum Phase { WATCH, PENDING, SCOUT, BACKTRACK, WALK, LIGHT, CUT, STEP, SETTLE, RETRY,
+    private enum Phase { WATCH, PENDING, WATER, SCOUT, BACKTRACK, WALK, LIGHT, CUT, STEP, SETTLE, RETRY,
                          ASSESS, ALTERNATIVE, BLOCKED }
     private enum StepStage { CENTER, HEADROOM, SUPPORT, TORCH_BYPASS, JUMP, LAND }
     enum Alternative { WORKING, ADVANCED, ADVANCED_BUT_HELD, REPLAN, REFUSED }
@@ -70,6 +70,7 @@ final class AgentStallGuard {
     private final AgentBody body;
     private final AgentHands hands;
     private final AgentTools tools;
+    private final AgentWaterEscape water;
     private final Predicate<BlockPos> protectedBlock;
     private final Predicate<BlockHitResult> safeSupport;
     private final Consumer<BlockPos> reached;
@@ -77,6 +78,7 @@ final class AgentStallGuard {
     private final BlockPos[] walked = new BlockPos[HISTORY];
     private final FlatCrossing[] flatCrossings = new FlatCrossing[HISTORY];
     private final BlockPos[] footprints = new BlockPos[HISTORY];
+    private final BlockPos[] navigationFootings = new BlockPos[HISTORY];
     private final BlockPos[] breakHistory = new BlockPos[24];
     private final BlockPos[] stairLights = new BlockPos[16];
     private final BlockPos[] route = new BlockPos[4];
@@ -100,10 +102,13 @@ final class AgentStallGuard {
     private int incidents, attempts, recoveries, failures, tick, incidentTick, entered, lastUseful;
     private int walkedCount, footprintCount, creditCount, brokenCount, novelCells, movedCells, retryCuts;
     private int stairLightCount, retryRouteCells;
+    private int navigationFootCount;
     private int frameBlocks, meals, mineSince, lastCrackTick, crackStage, furnaceSince, furnaceSeen;
     private int cookInput, cookOutput;
     private long eventSequence, craftSequence, surveySequence, settledSurvey, retrySurvey;
+    private long navigationSurvey, settledNavigationSurvey;
     private BlockPos lastGround, mining, incidentFrom;
+    private BlockPos navigationLowCeiling;
     private FurnaceScreen cooking;
     private Vec3d anchor, confirmedFoot, priorGroundFeet;
     private int flatCrossingCount, priorGroundAge, confirmedFootAge;
@@ -113,8 +118,11 @@ final class AgentStallGuard {
     private boolean inventoryKnown, dark, lampTried, stepTried, backtrackTried, tookControl, priorityAim;
     private boolean cookBurning, cooked;
     private boolean glanceTried, glancing, explicitRefusal;
+    private boolean waterBlockedReported;
+    private int waterAttempts;
     private boolean mineHandedBack;
     private boolean workBroke, resourceBroke, stairLit, surfaceStep;
+    private boolean navigationTurn, navigationRetry, navigationArrival;
     private BlockPos from, to, cut;
     private Vec3d cutAim;
     private Direction bearing;
@@ -146,14 +154,17 @@ final class AgentStallGuard {
         this.safeSupport = safeSupport;
         this.reached = reached;
         this.mineHandback = mineHandback;
+        water = new AgentWaterEscape(client, body, hands, protectedBlock, safeSupport);
     }
 
     Report report() { return report; }
     String status() {
-        return phase == Phase.BLOCKED ? report.detail() : "stall recovery: " + report.detail();
+        return phase == Phase.BLOCKED || phase == Phase.WATER || report.detail().startsWith("water recovery:")
+            ? report.detail() : "stall recovery: " + report.detail();
     }
     boolean ownsRecovery() { return phase != Phase.WATCH && phase != Phase.RETRY; }
-    boolean waitingForEvidence() { return phase == Phase.BLOCKED || phase == Phase.ASSESS; }
+    boolean waitingForEvidence() { return phase == Phase.BLOCKED || phase == Phase.ASSESS
+        || phase == Phase.WATER && water.blocked(); }
     boolean triedStallRoute(BlockPos cell) { return drivenStances.contains(cell); }
 
     boolean caveSurveyStalled() {
@@ -184,6 +195,25 @@ final class AgentStallGuard {
     /** Caller owns deduplication: only newly camera-validated proof cells advance the sequence. */
     void surveyReceipt(long sequence) {
         if (sequence > surveySequence) surveySequence = sequence;
+    }
+
+    /** Dry route proofs can keep work live but do not establish that recovery succeeded. */
+    void navigationSurveyReceipt(long sequence) {
+        if (sequence > navigationSurvey) navigationSurvey = sequence;
+    }
+
+    void navigationWork() {
+        navigationTurn = true;
+        if (phase == Phase.RETRY) navigationRetry = true;
+    }
+
+    /** The declared navigation job proved a return connection and actually reached this footing. */
+    void navigationArrival(BlockPos from, BlockPos foot) {
+        if (!dryGround() || !foot.equals(client.player.getBlockPos()) || contains(navigationFootings, foot)) return;
+        if (!contains(navigationFootings, from))
+            navigationFootings[navigationFootCount++ % navigationFootings.length] = from;
+        navigationFootings[navigationFootCount++ % navigationFootings.length] = foot;
+        navigationArrival = true;
     }
 
     /** Credit new ordinary stair lighting, not torch presses or recovery's own actions. */
@@ -272,9 +302,10 @@ final class AgentStallGuard {
             && now - (furnaceSeen == 0 ? furnaceSince : furnaceSeen) <= FURNACE_UPDATE_TICKS;
     }
 
-    void observe(int now, int confirmedFrameBlocks, int confirmedMeals, String activity) {
+    void observe(int now, int confirmedFrameBlocks, int confirmedMeals, String activity, boolean navigationLease) {
         tick = now;
         if (world != client.world) resetWorld();
+        water.observe();
         var player = client.player;
         sampleAngles(player.getYaw());
         Vec3d feet = player.getPos();
@@ -337,18 +368,24 @@ final class AgentStallGuard {
         frameBlocks = confirmedFrameBlocks;
         boolean fed = confirmedMeals > meals;
         meals = confirmedMeals;
-        boolean surveyed = surveySequence > settledSurvey;
+        boolean surveyed = surveySequence > settledSurvey || navigationSurvey > settledNavigationSurvey;
         settledSurvey = surveySequence;
-        int gain = inventoryGain();
+        settledNavigationSurvey = navigationSurvey;
         boolean normal = phase == Phase.WATCH;
-        if (phase == Phase.RETRY && workBroke) retryCuts++;
+        boolean navigation = navigationTurn || phase == Phase.RETRY && navigationRetry;
+        int gain = inventoryGain(navigation && !normal);
+        if (phase == Phase.RETRY && workBroke && !navigation) retryCuts++;
         double distance = feet.squaredDistanceTo(anchor);
         boolean newTravel = grounded && novelCells >= 2 && distance >= 4.0;
         boolean knownTravel = grounded && movedCells >= 4 && distance >= 25.0 && awayFromCredits(feet);
-        boolean wetTravel = (player.isTouchingWater() || player.hasVehicle()) && distance >= 16.0 && awayFromCredits(feet);
+        double wetDx = feet.x - anchor.x, wetDz = feet.z - anchor.z;
+        boolean wetTravel = (player.isTouchingWater() || player.hasVehicle())
+            && wetDx * wetDx + wetDz * wetDz >= 16.0 && awayFromCredits(feet);
         boolean effect = workBroke || crafted || framed || fed || surveyed || stairLit || surfaceStep || cooked || gain != 0;
+        boolean settledWork = navigationArrival || crafted || framed || cooked || resourceBroke;
         if ((normal || phase == Phase.PENDING && !tookControl && !explicitRefusal)
-                && (effect || newTravel || knownTravel || wetTravel)) {
+                && (navigation && !normal ? settledWork || gain == 2
+                    : settledWork || effect || newTravel || knownTravel || wetTravel)) {
             if (knownTravel || wetTravel) travelCredits[creditCount++ % travelCredits.length] = feet;
             markUseful(feet);
             if (!normal) transition(Phase.WATCH, "ordinary play advanced before recovery took control");
@@ -358,8 +395,8 @@ final class AgentStallGuard {
                 && distance >= 10.0 && feet.squaredDistanceTo(Vec3d.ofBottomCenter(incidentFrom)) >= 12.0;
             boolean continuedRoute = grounded && retryRouteCells >= 5 && movedCells >= 5 && distance >= 25.0
                 && feet.squaredDistanceTo(Vec3d.ofBottomCenter(incidentFrom)) >= 25.0;
-            if (crafted || framed || cooked || resourceBroke || tick - entered >= 25 && gain == 2
-                    || tick - entered >= 45 && (sustained || continuedRoute || retryCuts >= 3
+            if (settledWork || tick - entered >= 25 && gain == 2
+                    || !navigation && tick - entered >= 45 && (sustained || continuedRoute || retryCuts >= 3
                         || surveySequence - retrySurvey >= 3)) {
                 recoveries++;
                 markUseful(feet);
@@ -367,8 +404,9 @@ final class AgentStallGuard {
             }
         }
         workBroke = resourceBroke = stairLit = surfaceStep = cooked = false;
+        navigationTurn = navigationArrival = false;
         int idle = tick - lastUseful;
-        if (phase != Phase.WATCH || hands.busy() && idle < 300) return;
+        if (phase != Phase.WATCH || navigationLease || hands.busy() && idle < 300) return;
         boolean spinning = idle >= SPIN_TICKS && distance <= 2.25 && yawTravel >= 275
             && (Math.abs(yawNet) >= 170 || reversals >= 2);
         if (!spinning && idle < IDLE_TICKS) return;
@@ -378,6 +416,49 @@ final class AgentStallGuard {
                 + "deg net, " + reversals + " reversals in " + Math.min(sampledAngles, ANGLE_WINDOW) + " ticks"
             : "no settled progress for " + idle + " ticks";
         detect(cause + " while " + activity);
+    }
+
+    /** Incidental immersion is not a failed dry stance and must not enter the dry-only assessment. */
+    boolean takeWaterTurn(boolean planned, Runnable replan, Runnable releaseAlternative) {
+        if (planned || client.player.hasVehicle()) {
+            if (phase == Phase.WATER) {
+                water.clearEpisode();
+                transition(Phase.WATCH, "releasing recovery to controlled water transit");
+            }
+            return false;
+        }
+        if (phase != Phase.WATER) {
+            if (!water.stalled()) return false;
+            if (phase == Phase.WATCH) detect("no useful horizontal movement in water");
+            if (phase == Phase.ALTERNATIVE) releaseAlternative.run();
+            tookControl = true;
+            blockedReason = null;
+            replan.run();
+            water.start();
+            waterAttempts = 0;
+            waterBlockedReported = false;
+            transition(Phase.WATER, water.status());
+        }
+        AgentWaterEscape.Result result = water.step();
+        attempts += water.attempts() - waterAttempts;
+        waterAttempts = water.attempts();
+        if (result == AgentWaterEscape.Result.LANDED) {
+            recoveries++;
+            markUseful(client.player.getPos());
+            water.clearEpisode();
+            // A wet crossing is not a walked dry edge. Ordinary work can record the new footing.
+            transition(Phase.WATCH, water.status() + "; returning control to ordinary play");
+        } else if (result == AgentWaterEscape.Result.INTERRUPTED) {
+            water.clearEpisode();
+            transition(Phase.PENDING, "water recovery released without a settled landing");
+            return false;
+        } else {
+            if (result == AgentWaterEscape.Result.BLOCKED && !waterBlockedReported) failures++;
+            waterBlockedReported = result == AgentWaterEscape.Result.BLOCKED;
+            if (!report.detail().equals(water.status()) || report.attempts() != attempts || report.failures() != failures)
+                transition(Phase.WATER, water.status());
+        }
+        return true;
     }
 
     /** Actual danger, fall or feeding behavior retains the camera; it is not a search sweep. */
@@ -438,12 +519,13 @@ final class AgentStallGuard {
 
     /** Called only after the existing danger, hands, screen and food owners have declined this tick. */
     boolean takeTurn(Runnable replan, Supplier<String> chooseAlternative, Supplier<Alternative> workAlternative,
-                     Runnable releaseAlternative) {
-        if (phase == Phase.WATCH) return false;
+                     Runnable releaseAlternative, boolean navigationLease, BlockPos witnessedLowCeiling) {
+        navigationLowCeiling = witnessedLowCeiling;
+        if (phase == Phase.WATCH || client.player.isTouchingWater() || client.player.hasVehicle()) return false;
         if (phase == Phase.ASSESS || phase == Phase.ALTERNATIVE || phase == Phase.BLOCKED)
             return assessAlternative(chooseAlternative, workAlternative, releaseAlternative);
         if (phase == Phase.RETRY && blockedReason != null) {
-            if (tick - entered < RETRY_TICKS || verifiedMining(entered) || verifiedFurnace()) return false;
+            if (tick - entered < RETRY_TICKS || navigationLease || verifiedMining(entered) || verifiedFurnace()) return false;
             assessAgain("ordinary replan did not produce settled progress");
             return true;
         }
@@ -452,7 +534,7 @@ final class AgentStallGuard {
             return true;
         }
         if (phase == Phase.RETRY) {
-            if (tick - entered < RETRY_TICKS || verifiedMining(entered) || verifiedFurnace()) return false;
+            if (tick - entered < RETRY_TICKS || navigationLease || verifiedMining(entered) || verifiedFurnace()) return false;
             if (mineHandedBack) {
                 fail("ordinary miner handback made no settled progress (" + report.detail() + ")");
                 return true;
@@ -462,11 +544,7 @@ final class AgentStallGuard {
         if (phase == Phase.PENDING) {
             if (tick == entered) return true; // Preserve the trigger in ordinary tick telemetry.
             if (!dryGround()) {
-                if (tick - entered < DRY_FOOTING_TICKS) {
-                    // Release ordinary movement long enough to settle a jump or step off a lip.
-                    // Swimming and mounted travel still need their ordinary steering to reach shore.
-                    return !client.player.isTouchingWater() && !client.player.hasVehicle();
-                }
+                if (tick - entered < DRY_FOOTING_TICKS) return true;
                 fail("no stable dry footing from which to attempt safe recovery");
                 return true;
             }
@@ -547,13 +625,17 @@ final class AgentStallGuard {
 
     private void resetWorld() {
         world = client.world;
+        water.clearEpisode();
         Arrays.fill(walked, null);
         Arrays.fill(flatCrossings, null);
         Arrays.fill(footprints, null);
+        Arrays.fill(navigationFootings, null);
         Arrays.fill(travelCredits, null);
         Arrays.fill(breakHistory, null);
         Arrays.fill(stairLights, null);
         walkedCount = footprintCount = creditCount = brokenCount = stairLightCount = 0;
+        navigationFootCount = 0;
+        navigationTurn = navigationRetry = navigationArrival = false;
         lastGround = null;
         flatCrossingCount = 0;
         returningOnContact = null;
@@ -576,7 +658,7 @@ final class AgentStallGuard {
     }
 
     /** Compare total owned items, not slot order, selected hotbar, damage, or in-flight GUI transfers. */
-    private int inventoryGain() {
+    private int inventoryGain(boolean navigation) {
         if (hands.busy() || client.currentScreen != null) return 0;
         var owned = client.player.getInventory();
         int kinds = 0;
@@ -596,7 +678,7 @@ final class AgentStallGuard {
             for (int i = 0; i < kinds; i++) {
                 int id = sampledIds[i];
                 if (inventorySample[id] <= inventory[id]) continue;
-                if (taskItem(sampledItems[i])) {
+                if (navigation ? navigationSupply(sampledItems[i]) : taskItem(sampledItems[i])) {
                     gain = 2;
                     break;
                 }
@@ -615,6 +697,11 @@ final class AgentStallGuard {
         itemKinds = kinds;
         inventoryKnown = true;
         return gain;
+    }
+
+    private static boolean navigationSupply(Item item) {
+        return item == Items.DIAMOND || item == Items.RAW_IRON || item == Items.IRON_INGOT
+            || item == Items.COAL || item == Items.CHARCOAL;
     }
 
     private static boolean taskItem(Item item) {
@@ -1115,6 +1202,10 @@ final class AgentStallGuard {
     }
 
     private void startStep(String description) {
+        if (client.player.getBlockPos().equals(navigationLowCeiling)) {
+            fail("witnessed low mine ceiling rules out a temporary pillar on this footing");
+            return;
+        }
         if (stepTried || !dryGround() || hands.count(STEP) == 0) {
             fail("no verified alternate stance, safe obstruction or usable step material at " + from.toShortString());
             return;
@@ -1358,6 +1449,7 @@ final class AgentStallGuard {
             }
         }
         novelCells = movedCells = retryCuts = retryRouteCells = 0;
+        navigationRetry = false;
         retrySurvey = surveySequence;
         mineSince = 0;
         mining = null;

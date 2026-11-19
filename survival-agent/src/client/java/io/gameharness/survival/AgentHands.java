@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.function.Predicate;
 import net.minecraft.client.MinecraftClient;
@@ -168,6 +169,8 @@ final class AgentHands {
     private CraftRequest[] crafts;
     private CraftPlan craftPlan;
     private ItemStack[] craftStorage;
+    private AgentWorkOrder.Budget craftBudget;
+    private long workEvidence;
     private int craftGridRevision, craftTakeRevision;
     private long craftSettleDeadline, craftShiftClicks;
     private CraftReceipt craftReceipt;
@@ -196,6 +199,7 @@ final class AgentHands {
     }
 
     long jobGeneration() { return jobGeneration; }
+    long workEvidence() { return workEvidence; }
 
     /** A boat cannot use mixed plank species. Only append optional boat work to
      * a workshop session when the planned plank conversions preserve one species. */
@@ -240,6 +244,92 @@ final class AgentHands {
         return craftBatch(List.of(item));
     }
 
+    static boolean workRecipe(String key) {
+        if (key.indexOf(':') >= 0) return false;
+        CraftRequest request = craftRequest(key);
+        return request != null && request.key.equals(key);
+    }
+
+    static boolean workTableRecipe(String key) {
+        CraftRequest request = craftRequest(key);
+        return request != null && request.recipe.needsTable();
+    }
+
+    static boolean workSpecificPlanks(String key) {
+        return key.endsWith("_planks") && workRecipe(key);
+    }
+
+    static int workOutputCount(String key) {
+        CraftRequest request = craftRequest(key);
+        return request.recipe == Recipe.PLANKS && key.equals("bamboo_planks") ? 2 : request.recipe.batch;
+    }
+
+    static Item workOutput(String key) {
+        CraftRequest request = craftRequest(key);
+        if (request == null) return null;
+        if (request.recipe == Recipe.PLANKS) {
+            return key.equals("planks") ? null : Registries.ITEM.get(Identifier.ofVanilla(key));
+        }
+        return request.recipe == Recipe.BOAT ? vanillaBoat(key) : request.recipe.output;
+    }
+
+    /** The same admitted vanilla ingredient rules drive procurement before the real grid plan. */
+    record WorkNeed(char token, String recipe, Item exact, int count) {
+        boolean matches(ItemStack stack) {
+            return ingredientMatches(token, stack) && (exact == null || stack.isOf(exact))
+                && (token != 'l' || planksFor(stack) != null && (recipe.equals("planks")
+                    || Registries.ITEM.getId(planksFor(stack)).getPath().equals(recipe)));
+        }
+    }
+
+    WorkNeed workNeed(String recipe, AgentWorkOrder.Budget budget) {
+        return workNeed(c.player.getInventory(), recipe, budget);
+    }
+
+    static WorkNeed workNeed(PlayerInventory inventory, String recipe, AgentWorkOrder.Budget budget) {
+        CraftRequest request = craftRequest(recipe);
+        if (request == null || budget.craftsLeft() <= 0) return null;
+        Item exact = null;
+        if (request.recipe == Recipe.BOAT) {
+            if (recipe.equals("boat")) return null;
+            String wood = recipe.equals("bamboo_raft") ? "bamboo" : recipe.substring(0, recipe.length() - "_boat".length());
+            exact = Registries.ITEM.get(Identifier.ofVanilla(wood + "_planks"));
+        }
+        int examined = 0;
+        for (String row : request.recipe.rows) for (int cell = 0; cell < row.length(); ++cell) {
+            char token = row.charAt(cell);
+            if (token == ' ') continue;
+            int bit = 1 << (token - 'a');
+            if ((examined & bit) != 0) continue;
+            examined |= bit;
+            int required = 0;
+            for (String line : request.recipe.rows) for (int i = 0; i < line.length(); ++i)
+                if (line.charAt(i) == token) ++required;
+            WorkNeed ingredient = new WorkNeed(token, recipe, exact, required);
+            int available = 0;
+            for (int i = 0; i < PlayerInventory.MAIN_SIZE && available < required; ++i) {
+                ItemStack stack = inventory.getStack(i);
+                if (stack.isEmpty() || !ingredient.matches(stack)) continue;
+                Item item = stack.getItem();
+                boolean tallied = false;
+                for (int j = 0; j < i && !tallied; ++j) tallied = inventory.getStack(j).isOf(item);
+                if (!tallied) available += budget.limit(item, AgentWorkOrder.count(inventory, item));
+            }
+            if (required > available) return new WorkNeed(token, recipe, exact, required - available);
+        }
+        return null;
+    }
+
+    boolean workCraftable(String recipe, AgentWorkOrder.Budget budget) {
+        return budget.craftsLeft() > 0 && workRecipe(recipe) && budget.policy.craftAllowed(recipe)
+            && findCraftPlan(new CraftRequest[] { craftRequest(recipe) }, 0, budget) != null;
+    }
+
+    boolean craftWork(String recipe, int executions, AgentWorkOrder.Budget budget) {
+        return executions > 0 && budget.policy.craftAllowed(recipe)
+            && craftBatch(java.util.Collections.nCopies(Math.min(executions, budget.craftsLeft()), recipe), budget);
+    }
+
     boolean stableCraftFooting() {
         var p = c.player;
         return p != null && p.isOnGround() && !p.isTouchingWater() && !p.isInLava()
@@ -247,6 +337,10 @@ final class AgentHands {
     }
 
     boolean craftBatch(List<String> recipes) {
+        return craftBatch(recipes, null);
+    }
+
+    private boolean craftBatch(List<String> recipes, AgentWorkOrder.Budget budget) {
         if (busy() || !stableCraftFooting()) return false;
         if (recipes.isEmpty()) return report("craft", "no recipes");
         var current = c.currentScreen;
@@ -267,12 +361,13 @@ final class AgentHands {
             requests[i++] = request;
         }
         CraftRequest first = requests[0];
-        if (findCraftPlan(requests, 0) == null)
+        if (findCraftPlan(requests, 0, budget) == null)
             return report("craft", "missing compatible ingredients or storage room for " + first.key);
 
         String name = requests.length == 1 ? "craft " + first.key : "craft batch (" + requests.length + ")";
         start(Job.CRAFT, name, (HandledScreen<?>) current);
         crafts = requests;
+        craftBudget = budget;
         inventoryNeeded = true;
         return true;
     }
@@ -527,11 +622,11 @@ final class AgentHands {
             }
         }
         if (!motion.settled && !click.holdTail) {
+            sampleCursor(window.getHandle());
+            double beforeX = mouseX[0] * scaleX, beforeY = mouseY[0] * scaleY;
             if (click.pressed) {
-                sampleCursor(window.getHandle());
-                double x = mouseX[0] * scaleX, y = mouseY[0] * scaleY;
                 // Do not pull a pointer that has left the target back under a held click.
-                if (!motion.inside(x, y) || !hit(click, x, y)) {
+                if (!motion.inside(beforeX, beforeY) || !hit(click, beforeX, beforeY)) {
                     click.holdTail = true;
                     return;
                 }
@@ -540,6 +635,10 @@ final class AgentHands {
             // The only motion allowed during a press is the bounded tail in this exact target.
             if (!click.pressed || motion.inside(motion.x, motion.y) && hit(click, motion.x, motion.y))
                 moveCursor(window, motion.x, motion.y, scaleX, scaleY);
+            sampleCursor(window.getHandle());
+            double afterX = mouseX[0] * scaleX, afterY = mouseY[0] * scaleY;
+            if (Math.hypot(beforeX - motion.landingX, beforeY - motion.landingY)
+                    - Math.hypot(afterX - motion.landingX, afterY - motion.landingY) >= 0.5) ++workEvidence;
         }
         sampleCursor(window.getHandle());
         observePointer(click, now, mouseX[0] * scaleX, mouseY[0] * scaleY);
@@ -747,7 +846,7 @@ final class AgentHands {
                 return false;
             }
             boolean craftOutput = job == Job.CRAFT && isResult(click.step);
-            if (craftOutput && !craftReady((AbstractCraftingScreenHandler) handler)) {
+            if (craftOutput && (!craftReady((AbstractCraftingScreenHandler) handler) || !admitCraftSpend())) {
                 finish("ingredients or storage changed before craft output");
                 return false;
             }
@@ -808,6 +907,7 @@ final class AgentHands {
             finish(book ? "recipe book did not close" : "slot gesture had no expected effect");
             return false;
         }
+        if (!book && click.step.mode != Mode.QUICK_RESULT) ++workEvidence;
         if (click.step.mode == Mode.STORE && cursor.isEmpty()) resultStored = true;
         if (!motion.settled && !click.holdTail && layoutStillMatches(click, scaleX, scaleY) && motion.inside(x, y)) {
             handoffAt = now;
@@ -921,7 +1021,10 @@ final class AgentHands {
         if (!dragPreviewMatches(drag)) {
             if (entered) drag.entered--;
             finish("vanilla right drag preview changed");
-        } else if (entered) recordDrag(drag, "enter", actual, screen.getScreenHandler().getRevision(), "native preview admitted");
+        } else {
+            if (entered || drag.dx * remainingX + drag.dy * remainingY >= 0.35 * remaining) ++workEvidence;
+            if (entered) recordDrag(drag, "enter", actual, screen.getScreenHandler().getRevision(), "native preview admitted");
+        }
     }
 
     private boolean dragHeld(Drag drag, Window window) {
@@ -1011,6 +1114,7 @@ final class AgentHands {
             return false;
         }
         recordDrag(drag, "settled", drag.last(), revision, "exact slot increments and cursor decrease");
+        ++workEvidence;
         return finishGesture(now);
     }
 
@@ -1249,7 +1353,7 @@ final class AgentHands {
 
     private boolean planNextCraft() {
         CraftRequest request = crafts[craftIndex];
-        CraftPlan plan = findCraftPlan(crafts, craftIndex);
+        CraftPlan plan = findCraftPlan(crafts, craftIndex, craftBudget);
         if (plan == null) finish("missing compatible ingredients or storage room for " + request.key);
         else if (!planCraft(plan)) finish("inventory or crafting grid changed before " + request.key);
         else {
@@ -1272,11 +1376,12 @@ final class AgentHands {
         long sequence = craftReceipt == null ? 1 : craftReceipt.sequence + 1;
         craftReceipt = new CraftReceipt(sequence, crafts[craftIndex].key, craftPlan.executions, quantity,
                 craftPlan.executions > 1 ? 1 : 0, handler.getRevision());
+        ++workEvidence;
         craftIndex += craftPlan.executions;
         craftPlan = null;
         craftStorage = null;
         craftSettleDeadline = 0;
-        if (craftIndex == crafts.length) {
+        if (craftBudget != null || craftIndex == crafts.length) {
             finish("done");
         } else {
             // The next plan must see the actual storage after this recipe, not a projected inventory.
@@ -1338,6 +1443,23 @@ final class AgentHands {
                     ? craftPlan.cells[row * width + column] : ItemStack.EMPTY;
             if (!ItemStack.areEqual(grid.get(i).getStack(), expected)) return false;
         }
+        return true;
+    }
+
+    private boolean admitCraftSpend() {
+        if (craftBudget == null) return true;
+        if (craftPlan.executions > craftBudget.craftsLeft()) return false;
+        // Grid items are escrow, not spend. craftReady checked the exact grid and storage;
+        // this is the last gate before vanilla's potentially multi-output Shift press.
+        var costs = new HashMap<Item, Integer>();
+        for (ItemStack cell : craftPlan.cells)
+            if (!cell.isEmpty()) costs.merge(cell.getItem(), cell.getCount(), Integer::sum);
+        PlayerInventory inventory = c.player.getInventory();
+        for (var cost : costs.entrySet()) {
+            int before = AgentWorkOrder.count(inventory, cost.getKey()) + cost.getValue();
+            if (craftBudget.limit(cost.getKey(), before) < cost.getValue()) return false;
+        }
+        craftBudget.crafted(costs, craftPlan.executions);
         return true;
     }
 
@@ -1473,6 +1595,7 @@ final class AgentHands {
         crafts = null;
         craftPlan = null;
         craftStorage = null;
+        craftBudget = null;
         craftSettleDeadline = 0;
         craftIndex = 0;
         equipStack = ItemStack.EMPTY;
@@ -1481,7 +1604,7 @@ final class AgentHands {
         resultDeadline = 0;
     }
 
-    private CraftPlan findCraftPlan(CraftRequest[] requests, int index) {
+    private CraftPlan findCraftPlan(CraftRequest[] requests, int index, AgentWorkOrder.Budget budget) {
         CraftRequest request = requests[index];
         int limit = Math.min(requests.length - index, 64); // Vanilla ingredient stack ceiling.
         int runs = 1;
@@ -1489,10 +1612,10 @@ final class AgentHands {
         var inventory = c.player.getInventory();
         for (int executions = runs; executions > 0; executions--) {
             if (request.recipe == Recipe.BOAT) {
-                CraftPlan plan = boatIngredients(inventory, request, executions);
+                CraftPlan plan = boatIngredients(inventory, request, executions, budget);
                 if (plan != null) return plan;
             } else {
-                CraftPlan plan = ingredients(inventory, request, executions, null, request.recipe.output);
+                CraftPlan plan = ingredients(inventory, request, executions, null, request.recipe.output, budget);
                 if (plan != null && storageRoom(plan.result, plan.result.getCount() * executions, plan.used))
                     return plan;
             }
@@ -1500,7 +1623,8 @@ final class AgentHands {
         return null;
     }
 
-    private CraftPlan boatIngredients(PlayerInventory inventory, CraftRequest request, int executions) {
+    private CraftPlan boatIngredients(PlayerInventory inventory, CraftRequest request, int executions,
+                                      AgentWorkOrder.Budget budget) {
         Item requestedBoat = request.key.equals("boat") ? null : vanillaBoat(request.key);
         for (int i = 0; i < PlayerInventory.MAIN_SIZE; i++) {
             ItemStack stack = inventory.getStack(i);
@@ -1511,14 +1635,14 @@ final class AgentHands {
             if (seen) continue;
             Item boat = boatFor(planks);
             if (boat == null || requestedBoat != null && boat != requestedBoat) continue;
-            CraftPlan plan = ingredients(inventory, request, executions, planks, boat);
+            CraftPlan plan = ingredients(inventory, request, executions, planks, boat, budget);
             if (plan != null && storageRoom(plan.result, executions, plan.used)) return plan;
         }
         return null;
     }
 
     private static CraftPlan ingredients(PlayerInventory inv, CraftRequest request, int executions,
-                                         Item exactMaterial, Item result) {
+                                         Item exactMaterial, Item result, AgentWorkOrder.Budget budget) {
         Recipe recipe = request.recipe;
         int width = recipe.rows[0].length();
         ItemStack[] cells = new ItemStack[recipe.rows.length * width];
@@ -1531,7 +1655,7 @@ final class AgentHands {
                 cells[cell] = ItemStack.EMPTY;
                 continue;
             }
-            ItemStack material = findIngredient(inv, used, ingredient, request.key, executions, exactMaterial);
+            ItemStack material = findIngredient(inv, used, ingredient, request.key, executions, exactMaterial, budget);
             if (material == null) return null;
             if (ingredient == 'l') {
                 result = planksFor(material);
@@ -1553,12 +1677,21 @@ final class AgentHands {
     }
 
     private static ItemStack findIngredient(PlayerInventory inv, int[] used, char ingredient, String key,
-                                            int quantity, Item exactMaterial) {
+                                            int quantity, Item exactMaterial, AgentWorkOrder.Budget budget) {
         for (int i = 0; i < used.length; i++) {
             ItemStack stack = inv.getStack(i);
             int amount = stack.getCount() - used[i];
             if (amount <= 0 || stack.getMaxCount() < quantity || !ingredientMatches(ingredient, stack)
                     || exactMaterial != null && !stack.isOf(exactMaterial)) continue;
+            if (budget != null) {
+                Item item = stack.getItem();
+                int current = 0, claimed = 0;
+                for (int j = 0; j < used.length; ++j) if (inv.getStack(j).isOf(item)) {
+                    current += inv.getStack(j).getCount();
+                    claimed += used[j];
+                }
+                if (budget.limit(item, current) - claimed < quantity) continue;
+            }
             if (ingredient == 'l') {
                 Item planks = planksFor(stack);
                 if (planks == null || !key.equals("planks") && !Registries.ITEM.getId(planks).getPath().equals(key))

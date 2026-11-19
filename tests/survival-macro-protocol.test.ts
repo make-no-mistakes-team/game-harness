@@ -2,7 +2,27 @@ import { expect, spyOn, test } from "bun:test";
 import { link, mkdtemp, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { MacroDirectory, MacroObservationRotating } from "../src/server/survival-macro/protocol.ts";
+import { MacroDirectory, MacroObservationRotating, parseMacroProposal } from "../src/server/survival-macro/protocol.ts";
+
+test("Work program caps apply across stages and a later job cannot lower an earlier reserve", () => {
+  const log = "minecraft:oak_log";
+  const stage = (item: string, maxBreaks: number, reserve: number, spend: number) => ({
+    policy: { target: { kind: "stock", item, count: 4 }, allowedEffects: [], maxBreaks, maxCrafts: 0, maxPlacements: 0,
+      reserves: [{ item: log, count: reserve }], costCaps: [{ item: log, count: spend }] },
+    requires: [],
+  });
+  const proposal = (...stages: ReturnType<typeof stage>[]) => ({
+    action: { kind: "work-program", stages }, expiresTick: 210,
+    subgoal: "Gain supplies", reason: "Prepare resources", successCondition: "Observe both stocks",
+    contingency: "Stop if progress is blocked", alternative: "Review the available effects",
+  });
+  const first = stage(log, 40, 2, 2_000);
+  const next = (breaks: number, reserve: number, cost: number) => stage("minecraft:oak_planks", breaks, reserve, cost);
+  expect(parseMacroProposal(proposal(first, next(24, 2, 304))).action.kind).toBe("work-program");
+  expect(() => parseMacroProposal(proposal(first, next(25, 2, 304)))).toThrow("work program effect caps");
+  expect(() => parseMacroProposal(proposal(first, next(24, 2, 305)))).toThrow("work program item cost cap");
+  expect(() => parseMacroProposal(proposal(first, next(24, 1, 304)))).toThrow("work program reserves regressed");
+});
 
 test.each([
   { count: 1, label: "A displaced observation is reopened from the canonical path" },

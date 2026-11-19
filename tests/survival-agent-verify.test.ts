@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readSavedPlayerStats, savedDeathDelta, verifySurvival } from "../survival-agent/verify.ts";
+import { readSavedPlayerStats, savedDeathDelta, verifySurvival, type ProgramWin } from "../survival-agent/verify.ts";
 
 const goal = "nether_portal";
 const player = "127d3ae0-4132-4aac-804e-54528afce41b.json";
@@ -49,6 +49,36 @@ test("the supplied kit verifies ten compact frame cells with only eight saved la
     expect(await verifySurvival(stats, goal, liveShore, true)).toMatchObject({
         verified: true, cast: true, lavaBuckets: 8, entered: true,
     });
+});
+
+test("constrained success requires both the finished program and a newly achieved vanilla goal in the same life", async () => {
+    const goal = "wooden_pickaxe", pick = "minecraft:wooden_pickaxe", log = "minecraft:birch_log";
+    const stats = await saveWorld({ "minecraft:crafted": { [pick]: 1 } });
+    const run = "ordinary", id = "last-order", life = 2;
+    const accepted = { v: 1, run, id, life, tick: 21, status: "accepted", detail: "admitted" } as const;
+    const witness: ProgramWin = { run, program: {
+        requestId: "plan-request", stages: 2, goal, invocationItemCount: 1,
+        basis: { run, life, epoch: 4, tick: 35 }, stock: [{ item: log, required: 1, observed: 1 }],
+        accepted, receipt: { ...accepted, tick: 34, status: "completed" },
+        finalOrder: { v: 1, run, id, life, epoch: 3, safetyRevision: 1, origin: "model",
+            basisTick: 20, expiresTick: 90, target: { kind: "preset", goal }, reserves: [{ item: log, count: 1 }],
+            allowedEffects: ["craft:wooden_pickaxe"], costCaps: [], maxBreaks: 0, maxCrafts: 1, maxPlacements: 0 },
+    } };
+    const p = { goal, tick: 36, life, alive: true, won: false, inventory: { [pick]: 1, [log]: 1 } };
+    expect((await verifySurvival(stats, goal, p, false, null, witness)).verified).toBe(true);
+    expect((await verifySurvival(stats, goal, p)).verified).toBe(false);
+    for (const invalid of [{ ...p, tick: 33 }, { ...p, life: 3 }, { ...p, inventory: { [pick]: 1 } }]) {
+        expect((await verifySurvival(stats, goal, invalid, false, null, witness)).verified).toBe(false);
+    }
+    for (const invalid of [
+        { ...witness, run: "other-run" },
+        { ...witness, program: { ...witness.program, invocationItemCount: 0 } },
+        { ...witness, program: { ...witness.program, receipt: { ...witness.program.receipt, id: "different" } } },
+    ]) {
+        expect((await verifySurvival(stats, goal, p, false, null, invalid)).verified).toBe(false);
+    }
+    const oldStats = await readSavedPlayerStats(stats);
+    expect((await verifySurvival(stats, goal, p, false, oldStats, witness)).verified).toBe(false);
 });
 
 test.each([

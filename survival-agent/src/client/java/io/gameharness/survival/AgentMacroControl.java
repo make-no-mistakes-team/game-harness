@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import io.gameharness.survival.mixin.AgentMiningAccess;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -13,11 +14,13 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Executors;
@@ -29,22 +32,28 @@ import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.FallingBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.ingame.CraftingScreen;
 import net.minecraft.client.gui.screen.ingame.FurnaceScreen;
+import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.enchantment.Enchantments;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
+import net.minecraft.registry.RegistryKeys;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -56,13 +65,19 @@ final class AgentMacroControl {
     private static final long PLANNING_IDLE_LIMIT_NS = 3_000_000_000L;
     // Leave time for a bounded probe and rendered camera motion, not just a turn command.
     private static final long CAMERA_DISPATCH_LEAD_NS = 600_000_000L;
+    private static final long PLAN_SETTLEMENT_GRACE_NS = 750_000_000L;
     private static final int MAX_AGE = 1_200;
     private static final int MAX_HANDOFF_AGE = 100;
+    private static final int MAX_WORK_ADMISSION_AGE = 40;
+    private static final int MAX_ROUTE_EDGES = 8;
     private static final int MAX_OFFERS = 16;
+    private static final int MAX_MATERIAL_TARGETS = 4_096;
     private static final int APPROACH_SETTLE_TICKS = 3;
     private static final double INSPECT_REACH = 16;
+    private static final double PICKUP_STANCE_SQUARED = 1.20 * 1.20;
     private static final double SETTLED_SPEED_SQUARED = 0.001225;
     private static final Direction[] CARDINAL = {Direction.SOUTH, Direction.WEST, Direction.NORTH, Direction.EAST};
+    private static final int[] WALK_PITCH_OFFSETS = {0, -4, 4, -8, 8, -12, 12, -16, 16};
     private static final Pattern TOKEN = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
     private static final Pattern HASH = Pattern.compile("(?:sha256:)?[0-9a-f]{64}");
     private static final Predicate<ItemStack> LOG = stack -> stack.isIn(ItemTags.LOGS)
@@ -76,7 +91,9 @@ final class AgentMacroControl {
     private enum Verb {
         SURVEY("survey", "read", 30), INSPECT("inspect", "read", 30), APPROACH("approach", "low", 32),
         INTERACT("interact", "guarded", 40), COLLECT("collect", "guarded", 38), BREAK("break", "guarded", 120),
-        CONTINUE("continue", "guarded", 320);
+        CONTINUE("continue", "guarded", 320), FOLLOW("follow", "guarded", 640),
+        WORK_WALK("work_walk", "guarded", 160), WORK_EQUIP("work_equip", "guarded", 120),
+        WORK_PLACE("work_place", "guarded", 80);
 
         final String id, risk;
         final int maxTicks;
@@ -88,7 +105,11 @@ final class AgentMacroControl {
     /** All world geometry and entity identities stay private to the native thread. */
     private record Floor(BlockPos pos, BlockState state, Vec3d landing) {}
     private record Face(BlockHitResult hit, BlockState state) {}
-    private record Key(Verb verb, BlockPos pos, int entity, String activity) {}
+    private record Key(Verb verb, BlockPos pos, int entity, String activity, Direction side, BlockState state) {
+        Key(Verb verb, BlockPos pos, int entity, String activity) {
+            this(verb, pos, entity, activity, null, null);
+        }
+    }
     private record Recipe(String id, Item result, Predicate<ItemStack> material, int amount, int sticks) {}
     private static final Recipe PLANKS = new Recipe("planks", null, LOG, 1, 0);
     private static final Recipe STICKS = new Recipe("stick", Items.STICK, PLANK, 2, 0);
@@ -101,12 +122,19 @@ final class AgentMacroControl {
     };
 
     private record Offer(String id, Key key, String summary, String evidence, float yaw, float pitch,
-                         Floor floor, Face face, ItemEntity drop, Item item, Recipe recipe) {}
+                         Floor floor, Face face, ItemEntity drop, Item item, Recipe recipe,
+                         AgentDryCaveRoute.Offer route) {
+        Offer(String id, Key key, String summary, String evidence, float yaw, float pitch,
+              Floor floor, Face face, ItemEntity drop, Item item, Recipe recipe) {
+            this(id, key, summary, evidence, yaw, pitch, floor, face, drop, item, recipe, null);
+        }
+    }
     private record Snapshot(long epoch, Map<String, Offer> offers) {}
     private record Intent(String id, int life, long epoch, long basis, long expires, String opportunity, String skillHash) {}
     private record Handoff(int life, long epoch, long basis, long expires) {}
     private record Planning(int life, long epoch, long basis, String id, long noticedAt) {}
-    private record Inbox(boolean active, Intent intent, Handoff handoff, Planning planning) {}
+    private record WorkMailbox(boolean present, AgentWorkOrder order) {}
+    private record Inbox(boolean active, Intent intent, Handoff handoff, Planning planning, WorkMailbox work) {}
     private record Camera(float yaw, float pitch) {}
     private record Output(String file, String value) {}
 
@@ -142,12 +170,22 @@ final class AgentMacroControl {
         final int itemCount;
         final InventoryWitness walkInventory;
         final Camera camera;
-        boolean drove, fired, broken, purposefulMotion;
-        long firedAt, pickupDisappeared, craftJob, priorCraftReceipt, settledAt;
+        final ItemStack harvestTool;
+        final Offer[] keepVisible;
+        final float pathYaw, pathPitch;
+        boolean drove, fired, broken, purposefulMotion, durable;
+        float lastCrack;
+        long firedAt, pickupDisappeared, craftJob, priorCraftReceipt, settledAt, lastMissingFrame;
+        int missingFaceFrames;
         String unexpectedPickup;
         Screen opened;
+        Vec3d destination;
+        double distanceLeft;
+        int workSlot, executions, handLoss;
+        Item tracked;
 
-        Action(Intent intent, Offer offer, MinecraftClient client, long tick, long now, long frame, int itemCount) {
+        Action(Intent intent, Offer offer, MinecraftClient client, long tick, long now, long frame, int itemCount,
+               Offer[] keepVisible, float chosenWalkPitch) {
             this.intent = intent;
             this.offer = offer;
             started = tick;
@@ -157,7 +195,14 @@ final class AgentMacroControl {
             yaw = client.player.getYaw();
             pitch = client.player.getPitch();
             this.itemCount = itemCount;
-            walkInventory = offer.key.verb == Verb.APPROACH ? new InventoryWitness(client.player.getInventory()) : null;
+            this.keepVisible = keepVisible;
+            pathYaw = offer.floor == null ? yaw : heading(offer.floor.landing.x - position.x, offer.floor.landing.z - position.z);
+            pathPitch = Float.isNaN(chosenWalkPitch) ? MathHelper.clamp(pitch, 12, 42) : chosenWalkPitch;
+            if (offer.floor != null) distanceLeft = horizontalSquared(position, offer.floor.landing);
+            if (offer.route != null) distanceLeft = horizontalSquared(position, Vec3d.ofBottomCenter(offer.route.endpoint()));
+            walkInventory = offer.key.verb == Verb.APPROACH || offer.key.verb == Verb.FOLLOW
+                ? new InventoryWitness(client.player.getInventory()) : null;
+            harvestTool = offer.key.verb == Verb.BREAK ? client.player.getMainHandStack().copy() : ItemStack.EMPTY;
             camera = switch (offer.key.verb) {
                 case SURVEY -> new Camera(offer.yaw, offer.pitch);
                 case INSPECT -> {
@@ -170,36 +215,73 @@ final class AgentMacroControl {
         }
     }
 
+    private static final class WorkSession {
+        AgentWorkOrder order;
+        final AgentWorkOrder.Budget budget;
+        final Set<BlockPos> rejected = new HashSet<>();
+        final Set<Integer> rejectedDrops = new HashSet<>();
+        long deadline;
+        BlockPos lastHarvest;
+        long lastHarvestTick;
+        Item lastHarvestItem;
+        long lastEffectTick;
+        String lastEffect;
+        int confirmedBreaks, confirmedCrafts, confirmedPlacements, startingStock;
+        float sweepStart;
+        int sweep, sweepWait;
+        String enactedPhase = "hold", enactedStatus = "No physical step has started.";
+        String phase = "working", detail = "Current local evidence admits this bounded work order.";
+
+        WorkSession(AgentWorkOrder order, AgentWorkOrder.Budget budget, long deadline) {
+            this.order = order;
+            this.budget = budget;
+            this.deadline = deadline;
+        }
+
+        boolean active() { return phase.equals("working"); }
+    }
+
     private final String run, goal;
     private final Ipc ipc;
     private final boolean activated, trial;
     private final LinkedHashMap<Long, Snapshot> snapshots = new LinkedHashMap<>();
     private final LinkedHashMap<Key, String> ids = new LinkedHashMap<>();
+    private final Map<Key, String> materialTargets = new HashMap<>();
     private final LinkedHashMap<String, Boolean> consumed = new LinkedHashMap<>();
     private final Set<Key> retiredViews = new HashSet<>();
     private final Set<BlockPos> localSteps = new HashSet<>();
     private final ArrayDeque<String> recent = new ArrayDeque<>(8);
+    private final Predicate<ItemStack> safetySpend = this::canSpendSafetyStock;
+    private List<Offer> reservedOffers = List.of();
+    private static final Offer[] NO_ANCHORS = {};
+    private long reservationEpoch, reservationUntil;
     private MinecraftClient client;
     private AgentBody body;
     private AgentHands hands;
+    private AgentProgress routeOwner;
+    private Offer routeOffer;
     private Screen shown;
     private ClientWorld world;
     private ClientPlayerEntity player;
+    private ItemStack scopedMainHand = ItemStack.EMPTY;
     private Vec3d anchor;
     private float surveyYaw;
-    private long tick, epoch, nextId, lastObservation, inventoryStamp;
+    private long tick, epoch, nextId, nextMaterialId, lastObservation, inventoryStamp, safetyRevision;
     private long fallbackTicks;
     private long fallbackActions, blockedCount, urgentCount, lastPurposefulTick;
     private long now, idleSince, waitElapsed, waitTotal, waitMaximum, waitOvershoot, nextLocalProbe;
-    private long rawNoWorkSince, rawNoWorkMax, planningNoticeTick, planningNoticeNanos;
+    private long rawNoWorkSince, rawNoWorkMax, rawNoWorkTotal, planningNoticeTick, planningNoticeNanos;
     private int life, surveyOrigin;
     private Inbox input;
     private Action action;
+    private WorkSession work;
+    private AgentPauseEpisodes.Work continuityWork;
+    private long lastHandsEvidence;
     private boolean suspended, visited, owned, hazardClear, lastHazard, quiescent, urgent, blocked, deadlineMeasured;
     private boolean urgentInput;
-    private boolean rawPending;
+    private boolean rawPending, rawWorking;
     private String planningState = "awaiting_plan", planningEvidence = "No provider decision is pending.";
-    private String activePlanningId, lastPurposefulAction, lastUrgency, blockedReason;
+    private String activePlanningId, lastPurposefulAction, lastUrgency, blockedReason, localHoldReason;
     private boolean trialUsed, revocationSeen, revocationAcknowledged;
     private String owner = "deterministic";
     private String status = "waiting for a current local plan";
@@ -210,54 +292,83 @@ final class AgentMacroControl {
         // Startup-only admission. Inactive deterministic runs allocate no channel or thread.
         if (!TOKEN.matcher(run).matches()) return null;
         boolean trial = Ipc.marked(macro, run, "trial.json");
-        boolean active = Ipc.marked(macro, run, "active.json");
-        return trial || active ? new AgentMacroControl(macro, run, goal, active, trial) : null;
+        String marker = Ipc.activeMode(macro, run);
+        return trial || marker != null ? new AgentMacroControl(macro, run, goal, marker, trial) : null;
     }
 
-    private AgentMacroControl(Path directory, String run, String goal, boolean active, boolean trial) {
+    private AgentMacroControl(Path directory, String run, String goal, String mode, boolean trial) {
         this.run = run;
         this.goal = goal;
-        this.activated = active;
+        this.activated = mode != null;
         this.trial = trial;
-        ipc = new Ipc(directory, run, active);
+        ipc = new Ipc(directory, run, mode);
     }
 
     void begin(MinecraftClient client, AgentBody body, AgentHands hands, Screen shown, long tick, int life) {
-        if (owned && this.body == body) body.pauseWork();
+        if (owned && this.body == body && ((action == null ? work == null || !work.active()
+                : !action.durable && action.offer.key.verb != Verb.BREAK)
+                || client.player != player || client.world != world)) body.pauseWork();
         suspended = owned = visited = hazardClear = false;
         this.client = client;
         this.body = body;
         this.hands = hands;
         this.shown = shown;
         this.tick = tick;
+        continuityWork = null;
         sampleClock();
         input = ipc.inbox;
         owner = engaged() ? "safety" : "deterministic";
         if (this.life != life || world != client.world || player != client.player) {
             interrupt("The player life or dimension changed.", false);
+            retireWork("needs_replan", "interrupted", "The player life or dimension changed.");
+            work = null;
             this.life = life;
             world = client.world;
             player = client.player;
             ++epoch;
+            ++safetyRevision;
             snapshots.clear();
             ids.clear();
+            materialTargets.clear();
             recent.clear();
             anchor = null;
             inventoryStamp = 0;
+            scopedMainHand = ItemStack.EMPTY;
             lastHazard = false;
             localSteps.clear();
+            reservedOffers = List.of();
+            routeOffer = null;
             activePlanningId = null;
             idleSince = now;
             nextLocalProbe = 0;
             blocked = deadlineMeasured = false;
             waitElapsed = 0;
-            rawPending = false;
+            rawPending = rawWorking = false;
+            lastHandsEvidence = hands.workEvidence();
         }
+        body.safetySpend(safetySpend());
         observePlanning();
     }
 
     boolean engaged() { return input != null && (trial || activated); }
     boolean hasAction() { return action != null; }
+    boolean hasActiveWorkOrder() { return work != null && work.active(); }
+    boolean invocationFinishAllowed() {
+        return !"constrained".equals(ipc.workMode)
+            && !hasActiveWorkOrder() && (work == null || missingWorkFloor() == null);
+    }
+    AgentPauseEpisodes.Work continuityWork() { return continuityWork; }
+    Predicate<ItemStack> safetySpend() {
+        return work == null || work.budget.policy.floors().isEmpty() ? null : safetySpend;
+    }
+
+    private boolean canSpendSafetyStock(ItemStack stack) {
+        if (work == null || stack.isEmpty()) return true;
+        Item item = stack.getItem();
+        int floor = work.budget.floor(item);
+        if (floor == 0) return true;
+        return count(item) > floor;
+    }
     String status() { return status; }
     String owner() { return owner; }
     boolean trial() { return trial; }
@@ -276,6 +387,7 @@ final class AgentMacroControl {
         event.addProperty("macro_wait_max_overshoot_ms", millis(waitOvershoot));
         event.addProperty("macro_wait_total_ms", millis(waitTotal));
         event.addProperty("macro_wait_max_no_work_ms", millis(rawNoWorkMax));
+        event.addProperty("macro_wait_total_no_work_ms", millis(rawNoWorkTotal));
         event.addProperty("macro_blocked_count", blockedCount);
         event.addProperty("macro_urgent_count", urgentCount);
         event.addProperty("macro_fallback_ticks", fallbackTicks);
@@ -307,7 +419,13 @@ final class AgentMacroControl {
             waitTotal += sample - now;
             measureIdle(sample);
         }
-        if (rawPending) rawNoWorkMax = Math.max(rawNoWorkMax, sample - rawNoWorkSince);
+        if (rawPending) {
+            if (rawWorking) rawNoWorkSince = sample;
+            else {
+                rawNoWorkTotal += sample - now;
+                rawNoWorkMax = Math.max(rawNoWorkMax, sample - rawNoWorkSince);
+            }
+        }
         now = sample;
     }
 
@@ -320,7 +438,12 @@ final class AgentMacroControl {
                 planningNoticeTick = tick;
                 planningNoticeNanos = planning.noticedAt;
                 activePlanningId = planning.id;
+                Snapshot basis = snapshots.get(planning.basis);
+                reservedOffers = basis != null && basis.epoch == epoch ? basis.offers.values().stream()
+                    .filter(AgentMacroControl::materialFace).toList() : List.of();
+                reservationEpoch = epoch;
             }
+            reservationUntil = now + PLAN_SETTLEMENT_GRACE_NS;
             if (!rawPending) rawNoWorkSince = Math.max(idleSince, planning.noticedAt);
         }
         rawPending = pending;
@@ -347,18 +470,20 @@ final class AgentMacroControl {
 
     void urgent(String detail) {
         if (!engaged()) return;
+        boolean existing = urgent;
+        urgent = true;
         interrupt("Immediate safety took control: " + detail, true);
-        if (!urgent) {
+        if (!existing) {
             ++urgentCount;
             remember("safety: " + detail);
         }
-        urgent = true;
         lastUrgency = detail;
         state("urgent", detail);
     }
 
     void safetyEffect(String detail) {
         if (!engaged()) return;
+        continuityWork = AgentPauseEpisodes.Work.SAFETY;
         remember("safety completed: " + detail);
         purposeful("safety: " + detail);
     }
@@ -372,12 +497,20 @@ final class AgentMacroControl {
         if (!input.active) {
             claim(trial ? "trial_idle" : "local_handoff");
             interrupt("The host revoked macro authority.", true);
+            retireWork("needs_replan", "interrupted", "The host revoked macro authority.");
             if (hands.busy()) hands.cancel();
             status = "macro authority is inactive";
             state("inactive", status);
             return;
         }
         sampleClock();
+        if (!trial && ipc.workMode != null) {
+            reconcileWork();
+            if (hasActiveWorkOrder()) {
+                workTick(progress);
+                return;
+            }
+        }
         boolean thinking = rawPending;
         if (thinking && action == null && !blocked) measureIdle(now);
         if (action != null) {
@@ -391,6 +524,8 @@ final class AgentMacroControl {
             } else if ((local ? now - action.startedAt >= PLANNING_IDLE_LIMIT_NS : tick > action.intent.expires)
                     || tick - action.started > action.offer.key.verb.maxTicks) {
                 interrupt(timeoutDetail(), true);
+            } else if (action.offer.route != null && (action.intent.epoch != epoch || !cursorClear())) {
+                interrupt("The dry route's dependency epoch or clean-cursor premise changed.", true);
             } else if (!grounded() || !hazardClear || !client.isWindowFocused() || client.getOverlay() != null) {
                 interrupt("Grounding, window focus, or local safety changed.", true);
             } else {
@@ -420,24 +555,28 @@ final class AgentMacroControl {
             return;
         }
         if (!pending) {
-            idle(progress, thinking);
+            if (ipc.workMode == null || trial) idle(progress, thinking);
+            else holdWork();
             return;
         }
         Offer offer = snapshots.get(intent.basis).offers.get(intent.opportunity);
         String refusal = !available() ? "No neutral, grounded, safe first-person view." :
             trial && (trialUsed || !diagnosticVerb(offer.key.verb)) ? "The diagnostic admits one isolated reader action."
+            : offer.route != null && intent.skillHash != null ? "Only a direct Terra action may follow this dry route."
             : !trial && intent.skillHash != null && offer.key.verb == Verb.APPROACH
                 ? "Reusable skills cannot approach while incidental pickup remains possible."
             : validate(offer, progress);
         if (refusal != null) {
             refuseUnseen(refusal);
-            idle(progress, thinking);
+            if (ipc.workMode == null || trial) idle(progress, thinking);
+            else holdWork();
             return;
         }
         markConsumed(intent.id);
         owner = "terra";
+        if (offer.route != null) routeOwner = progress;
         action = new Action(intent, offer, client, tick, now, body.renderedFrame(),
-            offer.item == null ? 0 : count(offer.item));
+            offer.item == null ? 0 : count(offer.item), NO_ANCHORS, Float.NaN);
         if (trial) {
             trialUsed = true;
             if (!ipc.evidence("trial-witness.json", trialWitness().toString())) {
@@ -457,6 +596,8 @@ final class AgentMacroControl {
             double distanceBefore = angle(action.yaw, action.pitch, action.camera.yaw, action.camera.pitch);
             double left = angle(player.getYaw(), player.getPitch(), action.camera.yaw, action.camera.pitch);
             witnessed = distanceBefore - left >= 5;
+        } else if (action.drove && action.offer.route != null) {
+            witnessed = horizontalSquared(action.position, player.getPos()) >= 0.16;
         } else if (action.drove) {
             Vec3d destination = action.offer.floor.landing;
             witnessed = horizontalSquared(action.position, destination) - horizontalSquared(player.getPos(), destination) >= 0.16;
@@ -514,7 +655,500 @@ final class AgentMacroControl {
     private void claim(String actualOwner) {
         owner = actualOwner;
         owned = true;
-        body.pauseWork();
+        if (!actualOwner.equals("work_order")
+                && (action == null || action.offer.key.verb != Verb.BREAK || !actualOwner.equals("terra"))) body.pauseWork();
+    }
+
+    private void reconcileWork() {
+        WorkMailbox mailbox = input.work;
+        if (hasActiveWorkOrder()) {
+            String invalid = !mailbox.present ? "The host withdrew the work order."
+                : tick >= work.order.expires() || now >= work.deadline ? "The finite work horizon expired."
+                : !hazardClear || work.order.safetyRevision() != safetyRevision ? "The safety premise changed."
+                : null;
+            if (invalid != null) {
+                interrupt(invalid, true);
+                retireWork("needs_replan", "interrupted", invalid);
+            }
+        }
+        AgentWorkOrder next = mailbox.order;
+        // A mutable echo cannot expand or interrupt the already accepted, immutable permission.
+        if (work != null && next != null && work.order.id().equals(next.id())) return;
+
+        if (next != null && !consumed.containsKey(next.id())) {
+            updateScope(true);
+            Snapshot basis = snapshots.get(next.basis());
+            boolean samePolicy = work != null && work.order.policy().equals(next.policy())
+                && next.basis() >= work.order.basis();
+            boolean compatible = hasActiveWorkOrder() && samePolicy;
+            if (next.policy() == null) {
+                markConsumed(next.id());
+                receipt(next.id(), next.life(), "refused", "The work order contains an unsupported target or effect.");
+            } else if (next.life() != life || !compatible && next.epoch() != epoch || next.basis() > tick
+                    || tick - next.basis() >= MAX_WORK_ADMISSION_AGE || tick >= next.expires()
+                    || next.safetyRevision() != safetyRevision || basis == null || basis.epoch != next.epoch()
+                    || next.policy().target().goal() != null && !next.policy().target().goal().equals(goal)) {
+                markConsumed(next.id());
+                receipt(next.id(), next.life(), "refused", "The work basis, preset goal, or safety premise changed.");
+            } else if (hazardClear && (action == null || action.durable)) {
+                long deadline = now + (next.expires() - tick) * 50_000_000L;
+                if (compatible) {
+                    // A refreshed permission never restores spent budget or resets the live actuator.
+                    receipt(work.order.id(), work.order.life(), "interrupted", "Replaced by a compatible work order.");
+                    work.order = next;
+                    work.deadline = deadline;
+                } else {
+                    if (hasActiveWorkOrder()) {
+                        interrupt("The host replaced the current work policy.", true);
+                        retireWork("needs_replan", "interrupted", "The host replaced the current work policy.");
+                    }
+                    work = new WorkSession(next, samePolicy ? work.budget : new AgentWorkOrder.Budget(next.policy()), deadline);
+                    work.sweepStart = player.getYaw();
+                    Item goalStock = goalStock(next.policy().target());
+                    work.startingStock = goalStock == null ? 0 : count(goalStock);
+                }
+                markConsumed(next.id());
+                receipt(next.id(), life, "accepted", work.detail);
+                return;
+            }
+        }
+    }
+
+    private void retireWork(String phase, String result, String detail) {
+        if (!hasActiveWorkOrder()) return;
+        work.phase = phase;
+        work.detail = detail;
+        enact(phase.equals("complete") ? "complete" : "hold", detail);
+        receipt(work.order.id(), work.order.life(), result, detail);
+    }
+
+    private void holdWork() {
+        if (work == null) {
+            status = "waiting for a current authorized work order";
+            state(rawPending ? "planning_wait" : "awaiting_plan", status);
+        } else {
+            status = work.detail;
+            state("work_" + work.phase, status);
+        }
+    }
+
+    private void workTick(AgentProgress progress) {
+        claim("work_order");
+        state("work_order_in_progress", work.detail);
+        status = work.detail;
+        if (action != null) {
+            runWorkStep(progress);
+            return;
+        }
+        if (!hazardClear || !grounded() || !client.isWindowFocused() || client.getOverlay() != null
+                || client.currentScreen != null || !cursorClear() || !body.hasRecentView() || hands.busy()) {
+            enact("hold", "Waiting for safe footing, a rendered view, and neutral controls.");
+            return;
+        }
+        var target = work.order.policy().target();
+        Item goalStock = goalStock(target);
+        boolean goalReached = goalStock != null && count(goalStock) >= goalAmount(target);
+        var missingFloor = missingWorkFloor();
+        if (goalReached && missingFloor == null) {
+            retireWork("complete", "completed", "The native inventory confirms the requested outcome and declared reserves.");
+            holdWork();
+            return;
+        }
+        if (work.lastHarvest != null && tick - work.lastHarvestTick <= 15) {
+            Item expected = work.lastHarvestItem;
+            if (workPickup(stack -> stack.isOf(expected))) {
+                work.lastHarvest = null;
+                runWorkStep(progress);
+                return;
+            }
+            Vec3d basin = Vec3d.ofBottomCenter(work.lastHarvest).subtract(player.getEyePos()).add(0, -0.65, 0);
+            body.turnFine(heading(basin.x, basin.z),
+                (float) Math.toDegrees(Math.atan2(-basin.y, Math.hypot(basin.x, basin.z))));
+            if (tick - work.lastHarvestTick <= 8) {
+                enact("search", "Checking beside the confirmed harvest for a visible drop; no pickup confirmed yet.");
+                return;
+            }
+        }
+        work.lastHarvest = null;
+        BlockHitResult tableHit = body.find(state -> state.isOf(Blocks.CRAFTING_TABLE), reach()).orElse(null);
+        if (target.item() != null) {
+            Item desired = goalReached ? missingFloor.getKey() : target.item();
+            int required = goalReached || missingFloor != null && missingFloor.getKey() == desired
+                ? Math.max(goalReached ? 0 : target.count(), missingFloor.getValue()) : target.count();
+            if (workTowardStock(desired, required - count(desired), tableHit, progress)) runWorkStep(progress);
+            else searchWork(goalReached ? "The target is present, but no permitted witnessed source can fill the outstanding "
+                + Registries.ITEM.getId(desired) + " reserve."
+                : "No witnessed drop, harvest face, or reserve-safe recipe can advance the requested stock.");
+            return;
+        }
+        if (goalReached) {
+            if (workTowardStock(missingFloor.getKey(), missingFloor.getValue() - count(missingFloor.getKey()), tableHit, progress))
+                runWorkStep(progress);
+            else searchWork("The preset result is present, but a declared reserve is not yet fulfilled.");
+            return;
+        }
+        var stage = progress.macroPresetStage(work.budget, tableHit != null);
+        if (stage.blocked() != null) {
+            retireWork("blocked", "interrupted", stage.blocked());
+            holdWork();
+        } else if (stage.recipe() != null) {
+            if (startWorkRecipe(stage.recipe(), stage.executions(), tableHit)) runWorkStep(progress);
+            else searchWork("No safe visible workstation or placement can advance the next preset recipe.");
+        } else if (workPickup(stage.pickup()) || workGather(progress, stage.gather())) {
+            runWorkStep(progress);
+        } else {
+            searchWork("No live visible source, suitable tool, or permitted route advances the next preset step.");
+        }
+    }
+
+    private boolean workTowardStock(Item desired, int quantity, BlockHitResult tableHit, AgentProgress progress) {
+        if (workPickup(stack -> stack.isOf(desired))) return true;
+        if (work.budget.policy.preset()) {
+            String recipe = Registries.ITEM.getId(desired).getPath();
+            if (AgentHands.workOutput(recipe) == desired
+                    && startStockRecipe(recipe, quantity, tableHit, progress, new HashSet<>(4))) return true;
+        }
+        for (String effect : work.budget.policy.effects()) {
+            if (!effect.startsWith("craft:")) continue;
+            String recipe = effect.substring("craft:".length());
+            if (recipe.equals("planks")) {
+                String exact = Registries.ITEM.getId(desired).getPath();
+                if (AgentHands.workSpecificPlanks(exact)) recipe = exact;
+            }
+            if (AgentHands.workOutput(recipe) == desired
+                    && startStockRecipe(recipe, quantity, tableHit, progress, new HashSet<>(4))) return true;
+        }
+        return workGather(progress, state -> AgentWorkOrder.harvest(state) == desired);
+    }
+
+    private boolean startStockRecipe(String recipe, int quantity, BlockHitResult bench, AgentProgress progress,
+                                     Set<String> visiting) {
+        if (visiting.size() >= 4 || !visiting.add(recipe)) return false;
+        try {
+            if (!work.budget.policy.craftAllowed(recipe) || work.budget.craftsLeft() == 0) return false;
+            int batch = AgentHands.workOutputCount(recipe);
+            if (hands.workCraftable(recipe, work.budget))
+                return startWorkRecipe(recipe, (quantity + batch - 1) / batch, bench);
+            var need = hands.workNeed(recipe, work.budget);
+            if (need == null) return false;
+            Predicate<ItemStack> matches = stack -> work.budget.remainingCost(stack.getItem()) > 0 && need.matches(stack);
+            if (workPickup(matches)) return true;
+            for (String effect : work.budget.policy.effects()) {
+                if (!effect.startsWith("craft:")) continue;
+                String supply = effect.substring("craft:".length());
+                if (supply.equals("planks")) {
+                    // Bind an otherwise generic recipe to exact allowed stock, not a fallback species.
+                    for (Item candidate : work.budget.policy.caps().keySet()) {
+                        String exact = Registries.ITEM.getId(candidate).getPath();
+                        if (AgentHands.workSpecificPlanks(exact) && matches.test(new ItemStack(candidate))
+                                && startStockRecipe(exact, need.count(), bench, progress, visiting)) return true;
+                    }
+                } else {
+                    Item output = AgentHands.workOutput(supply);
+                    if (output != null && matches.test(new ItemStack(output))
+                            && startStockRecipe(supply, need.count(), bench, progress, visiting)) return true;
+                }
+            }
+            return workGather(progress, state -> {
+                Item harvest = AgentWorkOrder.harvest(state);
+                return harvest != Items.AIR && matches.test(new ItemStack(harvest));
+            });
+        } finally {
+            visiting.remove(recipe);
+        }
+    }
+
+    private static Item goalStock(AgentWorkOrder.Target target) {
+        if (target.item() != null) return target.item();
+        return switch (target.goal()) {
+            case "wooden_pickaxe" -> Items.WOODEN_PICKAXE;
+            case "stone_pickaxe" -> Items.STONE_PICKAXE;
+            case "iron_pickaxe" -> Items.IRON_PICKAXE;
+            case "diamond" -> Items.DIAMOND;
+            default -> null;
+        };
+    }
+
+    private static int goalAmount(AgentWorkOrder.Target target) { return target.item() == null ? 1 : target.count(); }
+
+    private void enact(String phase, String detail) {
+        work.enactedPhase = phase;
+        work.enactedStatus = detail;
+    }
+
+    private Action startWorkStep(Verb verb, String label, Face face, ItemEntity drop, Item item, Recipe recipe) {
+        var key = face == null ? new Key(verb, null, 0, null) : faceKey(verb, face, null);
+        Offer offer = new Offer(null, key, label, "", 0, 0, null, face, drop, item, recipe);
+        action = new Action(null, offer, client, tick, now, body.renderedFrame(), item == null ? 0 : count(item),
+            NO_ANCHORS, Float.NaN);
+        action.durable = true;
+        work.detail = label;
+        enact(switch (verb) {
+            case BREAK -> "harvest";
+            case WORK_WALK -> drop == null ? "route" : "collect";
+            case CONTINUE -> "craft";
+            case WORK_EQUIP -> "equip";
+            case WORK_PLACE -> "place";
+            default -> "hold";
+        }, label);
+        status = label;
+        return action;
+    }
+
+    private boolean workPickup(Predicate<ItemStack> wanted) {
+        var seen = body.visibleEntity(entity -> entity instanceof ItemEntity drop && !work.rejectedDrops.contains(drop.getId())
+            && wanted.test(drop.getStack()) && roomFor(drop.getStack()), 8.0).orElse(null);
+        if (!(seen instanceof ItemEntity found)) return false;
+        Item item = found.getStack().getItem();
+        BlockPos cell = found.getBlockPos();
+        Vec3d destination = Vec3d.ofBottomCenter(cell);
+        startWorkStep(Verb.WORK_WALK, "Collect visible " + Registries.ITEM.getId(item), null, found, item, null);
+        action.destination = destination;
+        action.distanceLeft = horizontalSquared(player.getPos(), destination);
+        return true;
+    }
+
+    private boolean workGather(AgentProgress progress, Predicate<BlockState> matches) {
+        if (!work.budget.canBreak()) return false;
+        var found = body.find(state -> matches.test(state) && work.budget.policy.breakAllowed(state), INSPECT_REACH,
+            hit -> !work.rejected.contains(hit.getBlockPos())
+                && workResourceSafe(hit.getBlockPos(), client.world.getBlockState(hit.getBlockPos()), progress)
+                && workToolSlot(hit.getBlockPos(), client.world.getBlockState(hit.getBlockPos())) >= 0).orElse(null);
+        if (found == null) return false;
+        Face face = face(found);
+        BlockPos pos = found.getBlockPos();
+        Item item = AgentWorkOrder.harvest(face.state);
+        if (!visibleFace(face)) {
+            if (horizontalSquared(player.getPos(), Vec3d.ofCenter(pos)) < 1.0) {
+                work.rejected.add(pos);
+                return false;
+            }
+            startWorkStep(Verb.WORK_WALK, "Approach witnessed " + blockName(face), face, null, null, null);
+            action.destination = Vec3d.ofBottomCenter(pos);
+            action.distanceLeft = horizontalSquared(player.getPos(), action.destination);
+            return true;
+        }
+        int tool = workToolSlot(pos, face.state);
+        if (tool != player.getInventory().selectedSlot) {
+            int slot = tool;
+            startWorkStep(Verb.WORK_EQUIP, "Equip a suitable tool for " + blockName(face), face, null, null, null);
+            action.workSlot = slot;
+            return true;
+        }
+        startWorkStep(Verb.BREAK, "Harvest witnessed " + blockName(face), face, null, null, null);
+        action.tracked = item;
+        return true;
+    }
+
+    private boolean workResourceSafe(BlockPos pos, BlockState block, AgentProgress progress) {
+        if (!progress.macroCanBreak(pos) || pos.getY() < player.getBlockY() || !block.getFluidState().isEmpty()
+                || client.world.getBlockState(pos.up()).getBlock() instanceof FallingBlock
+                || !roomFor(new ItemStack(AgentWorkOrder.harvest(block)))) return false;
+        for (Direction side : Direction.values())
+            if (!client.world.getBlockState(pos.offset(side)).getFluidState().isEmpty()) return false;
+        return true;
+    }
+
+    private int workToolSlot(BlockPos pos, BlockState block) {
+        var inventory = player.getInventory();
+        int best = -1;
+        float speed = 0;
+        for (int i = 0; i < PlayerInventory.MAIN_SIZE; i++) {
+            ItemStack hand = inventory.getStack(i);
+            if (block.isToolRequired() && !hand.isSuitableFor(block)) continue;
+            if (!workLootCompatible(hand, block)) continue;
+            int loss = AgentMiningStock.maxLoss(hand, block, world, pos);
+            if (loss < 0 || loss > 0 && work.budget.limit(hand.getItem(), count(hand.getItem())) < loss) continue;
+            float candidate = hand.getMiningSpeedMultiplier(block);
+            if (candidate > speed || candidate == speed && i == inventory.selectedSlot) {
+                best = i;
+                speed = candidate;
+            }
+        }
+        return best;
+    }
+
+    private boolean workLootCompatible(ItemStack hand, BlockState block) {
+        return !hand.hasEnchantments() || AgentWorkOrder.harvest(block) == block.getBlock().asItem()
+            || EnchantmentHelper.getLevel(world.getRegistryManager().getOrThrow(RegistryKeys.ENCHANTMENT)
+                .getOrThrow(Enchantments.SILK_TOUCH), hand) == 0;
+    }
+
+    private Map.Entry<Item, Integer> missingWorkFloor() {
+        return work.budget.missingFloor(player.getInventory());
+    }
+
+    private boolean startWorkRecipe(String key, int executions, BlockHitResult bench) {
+        Face face = null;
+        if (AgentHands.workTableRecipe(key)) {
+            if (bench == null) return findWorkTable(key);
+            face = face(bench);
+        }
+        if (!hands.workCraftable(key, work.budget)) return false;
+        startWorkStep(Verb.CONTINUE, "Craft " + key + " within the work budget", face, null, null,
+            new Recipe(key, null, null, 0, 0));
+        action.executions = executions;
+        return true;
+    }
+
+    private boolean findWorkTable(String recipe) {
+        var known = body.find(state -> state.isOf(Blocks.CRAFTING_TABLE), INSPECT_REACH,
+            hit -> !work.rejected.contains(hit.getBlockPos())).orElse(null);
+        if (known != null && horizontalSquared(player.getPos(), Vec3d.ofCenter(known.getBlockPos())) > 1.0) {
+            startWorkStep(Verb.WORK_WALK, "Approach the witnessed crafting table", face(known), null, null, null);
+            action.destination = Vec3d.ofBottomCenter(known.getBlockPos());
+            action.distanceLeft = horizontalSquared(player.getPos(), action.destination);
+            return true;
+        }
+        if (!work.budget.canPlace() || !work.budget.policy.placeTable()) return false;
+        if (count(Items.CRAFTING_TABLE) == 0) {
+            return !recipe.equals("crafting_table") && hands.workCraftable("crafting_table", work.budget)
+                && startWorkRecipe("crafting_table", 1, null);
+        }
+        if (work.budget.limit(Items.CRAFTING_TABLE, count(Items.CRAFTING_TABLE)) < 1) return false;
+        var support = body.stationFace(null, pos -> pos.getY() == player.getBlockY()
+            && !work.rejected.contains(pos) && client.world.getBlockState(pos).isAir());
+        if (support == null || support.getSide() != Direction.UP
+                || client.world.getBlockState(support.getBlockPos()).getBlock() instanceof FallingBlock) return false;
+        startWorkStep(Verb.WORK_PLACE, "Place the authorized crafting table on visible footing",
+            face(support), null, Items.CRAFTING_TABLE, null);
+        return true;
+    }
+
+    private void searchWork(String reason) {
+        // One local discovery sweep is a bounded prerequisite, never evidence of work itself.
+        if (work.sweep >= 6) {
+            retireWork("blocked", "interrupted", reason);
+            holdWork();
+            return;
+        }
+        float yaw = work.sweepStart + 60 * (work.sweep + 1);
+        float pitch = work.sweep == 5 ? 34 : 13;
+        if (body.renderedDirection(yaw, pitch, 6) || work.sweepWait >= 26) {
+            ++work.sweep;
+            work.sweepWait = 0;
+        } else {
+            body.turnScan(yaw, pitch);
+            ++work.sweepWait;
+        }
+        status = "Checking one local view for an authorized source";
+        enact("search", reason);
+    }
+
+    private void runWorkStep(AgentProgress progress) {
+        Verb verb = action.offer.key.verb;
+        status = action.offer.summary;
+        if (tick - action.started > verb.maxTicks) {
+            interrupt(timeoutDetail(), true);
+        } else if (!hazardClear || !client.isWindowFocused() || client.getOverlay() != null
+                || client.interactionManager == null || client.interactionManager.getCurrentGameMode() != GameMode.SURVIVAL
+                || !(grounded() || verb == Verb.WORK_WALK && !player.isTouchingWater() && !player.hasVehicle())) {
+            interrupt("The work step lost its safe footing, focus or Survival controls.", true);
+        } else switch (verb) {
+            case WORK_WALK -> advanceWorkWalk(progress);
+            case WORK_EQUIP -> advanceWorkEquip();
+            case WORK_PLACE -> advanceWorkPlacement();
+            default -> step(progress);
+        }
+    }
+
+    private void advanceWorkWalk(AgentProgress progress) {
+        if (client.currentScreen != null || !cursorClear()) {
+            interrupt("A different screen replaced the working view.", false);
+            return;
+        }
+        ItemEntity drop = action.offer.drop;
+        if (drop != null) {
+            if (count(action.offer.item) > action.itemCount && drop.isRemoved()) {
+                continuityWork = AgentPauseEpisodes.Work.NOVELTY;
+                complete("Vanilla confirmed a " + (count(action.offer.item) - action.itemCount) + " item gain of "
+                    + Registries.ITEM.getId(action.offer.item) + " after collecting its witnessed drop.");
+                return;
+            }
+            if (drop.isRemoved()) {
+                if (action.pickupDisappeared == 0) action.pickupDisappeared = tick;
+                if (tick - action.pickupDisappeared > 6)
+                    interrupt("The authorized drop disappeared without an inventory gain.", true);
+                return;
+            }
+        }
+        double distance = horizontalSquared(player.getPos(), action.destination);
+        if (action.drove && distance + 0.008 < action.distanceLeft) {
+            action.distanceLeft = distance;
+            continuityWork = AgentPauseEpisodes.Work.ROUTE;
+        }
+        if (!body.hasRecentView()) return;
+        if (drop == null && (distance <= 1.35 * 1.35 || visibleFace(action.offer.face)
+                && horizontalSquared(action.position, player.getPos()) >= 0.35)) {
+            if (settled()) complete("Reached a closer safe stance for the retained witnessed target.");
+            return;
+        }
+        if (drop != null && distance < 0.15 && action.settledAt == 0) action.settledAt = tick;
+        if (drop != null && action.settledAt != 0 && tick - action.settledAt > 12) {
+            interrupt("The witnessed drop did not enter inventory at its landing.", true);
+        } else if (!progress.macroWorkWalk(action.destination)) {
+            interrupt("No safe visible lane remains toward the retained target.", true);
+        }
+    }
+
+    private void advanceWorkEquip() {
+        if (action.craftJob != 0 && action.craftJob != hands.jobGeneration()) {
+            interrupt("The work equipment job was replaced.", false);
+        } else if (hands.busy()) {
+            hands.tick();
+        } else if (action.craftJob != 0) {
+            if (action.tracked != null && player.getMainHandStack().isOf(action.tracked) || action.tracked == Items.AIR
+                    && player.getMainHandStack().isEmpty()) complete("Vanilla selected the admitted tool.");
+            else interrupt("Vanilla did not select the admitted tool.", true);
+        } else {
+            ItemStack stack = player.getInventory().getStack(action.workSlot);
+            action.tracked = stack.getItem();
+            if (hands.equipSlot(action.workSlot)) complete("The admitted tool is already selected.");
+            else if (hands.busy()) action.craftJob = hands.jobGeneration();
+            else interrupt("The intended tool cannot be selected through the current inventory.", true);
+        }
+    }
+
+    private void advanceWorkPlacement() {
+        Face support = action.offer.face;
+        BlockPos dest = support.hit.getBlockPos().up();
+        if (action.fired) {
+            if (client.world.getBlockState(dest).isOf(Blocks.CRAFTING_TABLE) && count(Items.CRAFTING_TABLE) < action.itemCount) {
+                ++work.confirmedPlacements;
+                continuityWork = AgentPauseEpisodes.Work.NOVELTY;
+                complete("Vanilla confirmed the authorized table placement and matching inventory decrement.");
+            } else if (tick - action.firedAt > 12) {
+                interrupt("Vanilla did not confirm the authorized placement.", true);
+            }
+            return;
+        }
+        if (action.craftJob != 0 && action.craftJob != hands.jobGeneration()) {
+            interrupt("The placement equipment job was replaced.", false);
+            return;
+        }
+        if (hands.busy()) {
+            hands.tick();
+            return;
+        }
+        if (!body.hasRecentView()) return;
+        if (work.budget.limit(Items.CRAFTING_TABLE, count(Items.CRAFTING_TABLE)) < 1
+                || !work.budget.canPlace() || !client.world.getBlockState(dest).isAir()
+                || !visible(support) || player.getBoundingBox().intersects(new Box(dest))) {
+            interrupt("The placement face, free space or material permission changed.", true);
+            return;
+        }
+        if (!player.getMainHandStack().isOf(Items.CRAFTING_TABLE)) {
+            hands.equipForUse(stack -> stack.isOf(Items.CRAFTING_TABLE));
+            if (hands.busy()) action.craftJob = hands.jobGeneration();
+            return;
+        }
+        body.sneak();
+        if (body.useContact(support.hit, AgentBody.Contact.PLACE,
+                player.isSneaking() ? AgentBody.Preparation.READY : AgentBody.Preparation.STANCE)) {
+            work.budget.placedTable();
+            action.fired = true;
+            action.firedAt = tick;
+        }
     }
 
     private void idle(AgentProgress progress, boolean thinking) {
@@ -539,17 +1173,18 @@ final class AgentMacroControl {
                 }
             } else if (tick >= nextLocalProbe || due && !blocked) {
                 nextLocalProbe = tick + OBSERVATION_INTERVAL;
-                Offer next = localOffer(progress, cameraReady);
-                if (next == null) {
+                LocalWork work = localOffer(progress, cameraReady);
+                if (work == null) {
                     if (due) {
-                        block("No new lit resource view or safe adjacent step toward a witnessed feature.");
+                        block(localHoldReason == null ? "No compatible new camera view or safe adjacent step." : localHoldReason);
                         return;
                     }
                 } else {
+                    Offer next = work.offer;
                     if (next.floor != null) localSteps.add(next.floor.pos);
                     claim("local_motion");
                     ++fallbackTicks;
-                    action = new Action(null, next, client, tick, now, body.renderedFrame(), 0);
+                    action = new Action(null, next, client, tick, now, body.renderedFrame(), 0, work.anchors, work.walkPitch);
                     state("local_in_progress", next.summary);
                     step(progress);
                     return;
@@ -565,13 +1200,42 @@ final class AgentMacroControl {
         }
     }
 
-    private Offer localOffer(AgentProgress progress, boolean allowCamera) {
+    private record LocalWork(Offer offer, Offer[] anchors, float walkPitch) {
+        LocalWork(Offer offer, Offer[] anchors) { this(offer, anchors, Float.NaN); }
+    }
+
+    private LocalWork localOffer(AgentProgress progress, boolean allowCamera) {
+        localHoldReason = null;
         Offer inspect = null, survey = null, step = null;
         Vec3d from = client.player.getPos();
+        var current = offers(progress);
+        // A pinned route needs the same settled source and current view until
+        // Terra chooses it. An unrelated local walk would discard that work.
+        if (routeOffer != null && offeredOnPlanningBasis(routeOffer)) {
+            localHoldReason = "A revalidated dry route is awaiting Terra; no new local action can preserve its source and view.";
+            return null;
+        }
+        Offer[] anchors = visibleAnchors(current);
+        if (anchors.length != 0) {
+            LocalWork advance = usefulMaterialApproach(current, anchors, progress);
+            if (advance != null) return advance;
+            if (allowCamera) {
+                for (Offer offer : anchors) {
+                    Offer perspective = prepareTerrainView(offer, anchors);
+                    if (perspective != null) return new LocalWork(perspective, anchors);
+                }
+                for (Offer offer : anchors) {
+                    Offer preparation = prepareView(offer, anchors);
+                    if (preparation != null) return new LocalWork(preparation, anchors);
+                }
+            }
+            localHoldReason = "A useful material face is still visible; no new local action can preserve the view.";
+            return null;
+        }
         BlockHitResult feature = body.find(AgentMacroControl::resource, INSPECT_REACH).orElse(null);
         double improvement = 0.5;
         if (localSteps.size() < 32) localSteps.add(client.player.getBlockPos().down());
-        for (Offer offer : offers(progress)) {
+        for (Offer offer : current) {
             switch (offer.key.verb) {
                 case APPROACH -> {
                     if (feature == null || feature.getPos().squaredDistanceTo(client.player.getEyePos()) <= reach() * reach()
@@ -588,7 +1252,136 @@ final class AgentMacroControl {
                 default -> { } // Never select an attack, workstation, crafting, or pickup on local authority.
             }
         }
-        return step != null ? step : inspect != null ? inspect : survey;
+        Offer next = step != null ? step : inspect != null ? inspect : survey;
+        return next == null ? null : new LocalWork(next, NO_ANCHORS);
+    }
+
+    private boolean offeredOnPlanningBasis(Offer candidate) {
+        Planning planning = input.planning;
+        if (!rawPending || planning == null || planning.epoch != epoch) return false;
+        Snapshot basis = snapshots.get(planning.basis);
+        return basis != null && basis.offers.get(candidate.id) == candidate;
+    }
+
+    private Offer[] visibleAnchors(List<Offer> current) {
+        List<Offer> preferred = reservation();
+        if (!preferred.isEmpty()) {
+            Offer[] live = current.stream().filter(offer -> materialFace(offer) && preferred.contains(offer)).toArray(Offer[]::new);
+            if (live.length != 0) return live;
+        }
+        return current.stream().filter(AgentMacroControl::materialFace).toArray(Offer[]::new);
+    }
+
+    private LocalWork usefulMaterialApproach(List<Offer> current, Offer[] anchors, AgentProgress progress) {
+        if (localSteps.size() >= 32) return null;
+        Vec3d from = player.getPos();
+        localSteps.add(player.getBlockPos().down());
+        LocalWork best = null;
+        double improvement = 0.36;
+        for (Offer target : anchors) {
+            if (target.key.verb != Verb.BREAK) continue;
+            Vec3d dropColumn = Vec3d.ofCenter(target.key.pos);
+            double startingDistance = horizontalSquared(from, dropColumn);
+            if (startingDistance <= PICKUP_STANCE_SQUARED) continue;
+            for (Offer option : current) {
+                if (option.key.verb != Verb.APPROACH || localSteps.contains(option.floor.pos)) continue;
+                Vec3d landing = option.floor.landing;
+                double gain = startingDistance - horizontalSquared(landing, dropColumn);
+                if (gain <= improvement) continue;
+                float yaw = heading(landing.x - from.x, landing.z - from.z);
+                float pitch = compatibleWalkPitch(anchors, from, landing, yaw);
+                if (Float.isNaN(pitch) || validate(option, progress) != null) continue;
+                Offer approach = new Offer(option.id, option.key, "Approach a verified stance for resource retrieval",
+                    "This witnessed dry step reduces the distance to the retained harvest face.",
+                    0, 0, option.floor, null, null, null, null);
+                best = new LocalWork(approach, anchors, pitch);
+                improvement = gain;
+            }
+        }
+        return best;
+    }
+
+    private float compatibleWalkPitch(Offer[] anchors, Vec3d from, Vec3d landing, float yaw) {
+        float current = MathHelper.clamp(player.getPitch(), 12, 42);
+        for (int offset : WALK_PITCH_OFFSETS) {
+            float pitch = current + offset;
+            if (pitch < 8 || pitch > 42) continue;
+            if (retainsAnchors(anchors, from, yaw, pitch) && retainsAnchors(anchors, landing, yaw, pitch)) return pitch;
+        }
+        return Float.NaN;
+    }
+
+    private Offer prepareTerrainView(Offer material, Offer[] anchors) {
+        if (material.key.verb != Verb.BREAK || localSteps.size() >= 32
+                || horizontalSquared(player.getPos(), Vec3d.ofCenter(material.key.pos)) <= PICKUP_STANCE_SQUARED) return null;
+        Face face = material.face;
+        Key key = faceKey(Verb.SURVEY, face, "collection_footing");
+        if (retiredViews.contains(key)) return null;
+        float yaw = player.getYaw();
+        float pitch = Math.min(42, player.getPitch() + 28);
+        for (; pitch - player.getPitch() >= 9; pitch -= 3) {
+            if (retainsAnchors(anchors, player.getPos(), yaw, pitch) && revealsFootingToward(material, yaw, pitch)) {
+                return new Offer(material.id, key, "Survey footing below the witnessed resource",
+                    "Expose nearer footing for a possible retrieval route while preserving the resource face.",
+                    yaw, pitch, null, face, null, null, null);
+            }
+        }
+        return null;
+    }
+
+    private boolean revealsFootingToward(Offer material, float yaw, float pitch) {
+        Vec3d feet = player.getPos();
+        Vec3d source = Vec3d.ofCenter(material.key.pos);
+        double distance = horizontalSquared(feet, source);
+        BlockPos standing = player.getBlockPos();
+        for (Direction direction : CARDINAL) {
+            BlockPos adjacent = standing.offset(direction);
+            if (localSteps.contains(adjacent.down())) continue;
+            Vec3d landing = Vec3d.ofBottomCenter(adjacent);
+            if (distance - horizontalSquared(landing, source) <= 0.36) continue;
+            // This is the bearing of a candidate floor patch, not a world query.
+            // A subsequent real rendered ray still has to admit the floor.
+            Vec3d patch = landing.add(0.32 * direction.getOffsetX(), 0, 0.32 * direction.getOffsetZ());
+            if (!body.macroRetainsView(patch, feet, yaw, player.getPitch())
+                    && body.macroRetainsView(patch, feet, yaw, pitch)) return true;
+        }
+        return false;
+    }
+
+    private boolean retainsAnchors(Offer[] anchors, Vec3d feet, float yaw, float pitch) {
+        Vec3d from = player.getEyePos().add(feet.subtract(player.getPos()));
+        double max = reach();
+        for (Offer anchor : anchors) {
+            if (!body.macroRetainsView(anchor.face.hit.getPos(), feet, yaw, pitch)) return false;
+            if (from.squaredDistanceTo(anchor.face.hit.getPos()) > max * max) return false;
+        }
+        return true;
+    }
+
+    private Offer prepareView(Offer material, Offer[] anchors) {
+        Face face = material.face;
+        Key key = faceKey(Verb.INSPECT, face, "contact");
+        if (retiredViews.contains(key) || body.renderedAim(face.hit.getPos(), 8)) return null;
+        Vec3d eye = player.getEyePos();
+        Vec3d bearing = face.hit.getPos().subtract(eye);
+        float yaw = heading(bearing.x, bearing.z);
+        float pitch = (float) Math.toDegrees(Math.atan2(-bearing.y, Math.hypot(bearing.x, bearing.z)));
+        if (!retainsAnchors(anchors, player.getPos(), yaw, pitch)) return null;
+        return new Offer(material.id, key, "Center the actionable " + blockName(face),
+            "Prepare the same witnessed face without touching it.", 0, 0, null, face, null, null, null);
+    }
+
+    private List<Offer> reservation() {
+        return epoch == reservationEpoch && now <= reservationUntil ? reservedOffers : List.of();
+    }
+
+    private static boolean materialFace(Offer offer) {
+        return offer.face != null && (offer.key.verb == Verb.BREAK
+            || offer.key.verb == Verb.INTERACT || offer.key.verb == Verb.CONTINUE);
+    }
+
+    private boolean liveMaterialFace(Offer offer, AgentProgress progress) {
+        return materialFace(offer) && validate(offer, progress) == null;
     }
 
     private void block(String detail) {
@@ -618,12 +1411,14 @@ final class AgentMacroControl {
             case COLLECT -> dropVisible(offer) && floorCurrent(offer.floor)
                 && dropNearLanding(offer.drop, offer.floor) && roomFor(offer.drop.getStack())
                 ? null : "The drop, adjacent footing, or inventory room changed.";
-            case BREAK -> visible(offer.face) && canBreak(offer.face, progress)
+            case BREAK -> visibleFace(offer.face) && canBreak(offer.face, progress)
                 ? null : "The resource, harvest tool, or safe reach changed.";
-            case INTERACT -> visible(offer.face) && useAvailable() ? null : "The workstation or use control changed.";
+            case INTERACT -> visibleFace(offer.face) && useAvailable() ? null : "The workstation or use control changed.";
             case CONTINUE -> ingredients(offer.recipe) && (offer.face == null
-                ? !client.options.inventoryKey.isUnbound() : visible(offer.face) && useAvailable())
+                ? !client.options.inventoryKey.isUnbound() : visibleFace(offer.face) && useAvailable())
                 ? null : "The recipe ingredients, storage, or workstation changed.";
+            case FOLLOW -> routeCurrent(offer, progress) ? null : "The exact witnessed dry segment or its source changed.";
+            case WORK_WALK, WORK_EQUIP, WORK_PLACE -> "This operation requires a native work order.";
         };
     }
 
@@ -633,6 +1428,13 @@ final class AgentMacroControl {
         if (client.currentScreen != null && offer.key.verb != Verb.INTERACT && offer.key.verb != Verb.CONTINUE) {
             interrupt("A different screen replaced the camera view.", false);
             return;
+        }
+        if (action.keepVisible.length != 0) {
+            if (!body.hasRecentView()) return;
+            for (Offer anchor : action.keepVisible) if (!liveMaterialFace(anchor, progress)) {
+                interrupt("A reserved material face no longer has a fresh legal camera witness.", true);
+                return;
+            }
         }
         switch (offer.key.verb) {
             case SURVEY -> {
@@ -651,7 +1453,8 @@ final class AgentMacroControl {
             }
             case INSPECT -> {
                 if (!body.hasRecentView()) return;
-                if (horizontalSquared(action.position, client.player.getPos()) > 0.0144 || !visible(offer.face, INSPECT_REACH))
+                boolean witnessed = "contact".equals(offer.key.activity) ? visibleFace(offer.face) : visible(offer.face, INSPECT_REACH);
+                if (horizontalSquared(action.position, client.player.getPos()) > 0.0144 || !witnessed)
                     interrupt("The inspected face left the stationary lit camera view.", true);
                 else if (body.renderedFrame() > action.startingFrame
                         && body.renderedDirection(action.camera.yaw, action.camera.pitch, 4)
@@ -661,13 +1464,97 @@ final class AgentMacroControl {
                 else body.turnFine(action.camera.yaw, action.camera.pitch);
             }
             case APPROACH, COLLECT -> walk(offer);
-            case BREAK -> {
-                if (action.broken) complete("Vanilla reported this player's break of the witnessed " + blockName(offer.face) + ".");
-                else if (!visible(offer.face) || !canBreak(offer.face, progress))
-                    interrupt("The resource face, selected harvest tool, or reach changed.", true);
-                else if (body.mine(offer.face.hit)) action.fired = true;
-            }
+            case BREAK -> breakWitnessedFace(offer.face, progress);
             case INTERACT, CONTINUE -> useOrCraft(offer);
+            case FOLLOW -> followRoute(offer, progress);
+            case WORK_WALK, WORK_EQUIP, WORK_PLACE -> throw new IllegalStateException("Expected work step dispatch");
+        }
+    }
+
+    private boolean routeCurrent(Offer offer, AgentProgress progress) {
+        return offer.route != null && player.getBlockPos().equals(offer.route.from())
+            && progress.dryRouteOffer() == offer.route;
+    }
+
+    private void followRoute(Offer offer, AgentProgress progress) {
+        String pickup = unexpectedPickup();
+        if (pickup != null) {
+            interrupt(pickup, true);
+            return;
+        }
+        Vec3d destination = Vec3d.ofBottomCenter(offer.route.endpoint());
+        double remaining = horizontalSquared(player.getPos(), destination);
+        if (action.drove && remaining + 0.008 < action.distanceLeft) {
+            continuityWork = AgentPauseEpisodes.Work.ROUTE;
+            action.distanceLeft = remaining;
+        }
+        if (action.settledAt == 0) {
+            switch (progress.followDryRoute(offer.route)) {
+                case RUNNING -> { return; }
+                case REFUSED -> {
+                    interrupt("Dry route refused: " + progress.dryRouteReason() + ".", true);
+                    return;
+                }
+                case ARRIVED -> action.settledAt = tick;
+            }
+        }
+        // The route motor has stopped. Wait for actual neutral settlement and
+        // late inventory observations without asking it to start another edge.
+        if (!player.getBlockPos().equals(offer.route.endpoint()) || !grounded()
+                || Math.abs(player.getX() - destination.x) > 0.22 || Math.abs(player.getZ() - destination.z) > 0.22
+                || Math.abs(player.getY() - destination.y) > 0.055) {
+            interrupt("The player did not remain on the authorized dry endpoint.", true);
+        } else if (settled() && tick - action.settledAt >= APPROACH_SETTLE_TICKS) {
+            complete("Settled at the authorized dry route endpoint after " + offer.route.edges() + " witnessed level edges.");
+        }
+    }
+
+    private void breakWitnessedFace(Face face, AgentProgress progress) {
+        BlockPos target = face.hit.getBlockPos();
+        boolean mayBreak = action.broken;
+        if (!mayBreak) {
+            if (action.durable) {
+                ItemStack hand = player.getMainHandStack();
+                int loss = AgentMiningStock.maxLoss(hand, face.state, world, target);
+                mayBreak = work.budget.canBreak() && work.budget.policy.breakAllowed(face.state)
+                    && workResourceSafe(target, face.state, progress)
+                    && (!face.state.isToolRequired() || hand.isSuitableFor(face.state)) && loss >= 0 && workLootCompatible(hand, face.state)
+                    && (loss == 0 || work.budget.limit(hand.getItem(), count(hand.getItem())) >= loss);
+                action.handLoss = loss;
+            } else {
+                mayBreak = canBreak(face, progress);
+            }
+        }
+        if (action.broken) {
+            continuityWork = AgentPauseEpisodes.Work.NOVELTY;
+            if (action.durable) {
+                work.lastHarvest = target;
+                work.lastHarvestItem = action.tracked;
+                work.lastHarvestTick = tick;
+            }
+            complete("Vanilla reported this player's break of the witnessed " + blockName(face) + ".");
+        } else if (!mayBreak
+                || !ItemStack.areItemsAndComponentsEqual(action.harvestTool, client.player.getMainHandStack())) {
+            interrupt("The selected harvest tool or protected footing changed.", true);
+        } else if (!body.hasRecentView()) {
+            // Only an already held crack may bridge a brief render gap. The Body
+            // still rechecks the actual exact crosshair, contact region and state.
+            if (action.fired) body.continueMine(target);
+        } else {
+            BlockHitResult live = body.macroMineWitness(face.hit, reach());
+            if (live == null) {
+                long frame = body.renderedFrame();
+                if (frame != action.lastMissingFrame) {
+                    action.lastMissingFrame = frame;
+                    if (++action.missingFaceFrames >= 3)
+                        interrupt("The admitted resource face is no longer lit, reachable, and visible.", true);
+                }
+            } else if (client.world.getBlockState(target) != face.state) {
+                interrupt("The visible resource changed without an observed own break.", true);
+            } else {
+                action.missingFaceFrames = 0;
+                body.mine(live);
+            }
         }
     }
 
@@ -683,7 +1570,10 @@ final class AgentMacroControl {
         if (collect && offer.drop.isRemoved()) {
             if (action.pickupDisappeared == 0) action.pickupDisappeared = tick;
             if (count(offer.item) > action.itemCount) {
-                if (settled()) complete("The witnessed drop disappeared and the matching inventory count increased.");
+                if (settled()) {
+                    continuityWork = AgentPauseEpisodes.Work.NOVELTY;
+                    complete("The witnessed drop disappeared and the matching inventory count increased.");
+                }
             } else if (tick - action.pickupDisappeared > 6) {
                 interrupt("The drop disappeared without a matching inventory gain.", true);
             }
@@ -701,6 +1591,10 @@ final class AgentMacroControl {
         }
         Vec3d position = player.getPos();
         double remaining = horizontalSquared(position, floor.landing);
+        if (action.drove && remaining + 0.008 < action.distanceLeft) {
+            continuityWork = AgentPauseEpisodes.Work.ROUTE;
+            action.distanceLeft = remaining;
+        }
         if (remaining <= 0.1225 && action.drove && horizontalSquared(action.position, position) >= 0.16
                 && player.getBlockPos().equals(floor.pos.up())) {
             if (!collect) {
@@ -712,8 +1606,9 @@ final class AgentMacroControl {
             return;
         }
         action.settledAt = 0;
-        float yaw = heading(floor.landing.x - position.x, floor.landing.z - position.z);
-        float pitch = MathHelper.clamp(action.pitch, 12, 42);
+        float yaw = action.keepVisible.length == 0 ? heading(floor.landing.x - position.x, floor.landing.z - position.z)
+            : action.pathYaw;
+        float pitch = action.pathPitch;
         body.macroFlatWalk(floor.landing, yaw, pitch);
     }
 
@@ -723,6 +1618,10 @@ final class AgentMacroControl {
                 interrupt("The trusted hand job was replaced.", false);
                 return;
             }
+            if (action.opened == null && client.currentScreen instanceof InventoryScreen && shown == client.currentScreen) {
+                action.opened = shown;
+                continuityWork = AgentPauseEpisodes.Work.GUI;
+            }
             if (hands.busy()) {
                 hands.tick();
                 return;
@@ -730,6 +1629,8 @@ final class AgentMacroControl {
             var result = hands.lastCraftReceipt();
             if (result != null && result.sequence() > action.priorCraftReceipt
                     && result.recipe().equals(offer.recipe.id) && result.items() > 0 && client.currentScreen == null) {
+                if (action.durable) work.confirmedCrafts += result.executions();
+                continuityWork = AgentPauseEpisodes.Work.GUI;
                 complete("Vanilla crafting confirmed " + result.items() + " output from " + offer.recipe.id + ".");
             } else interrupt("The hand job ended without a matching vanilla crafting receipt.", true);
             return;
@@ -744,6 +1645,7 @@ final class AgentMacroControl {
                 interrupt("The expected clean workstation screen did not open.", false);
             } else if (shown == screen) {
                 action.opened = screen;
+                continuityWork = AgentPauseEpisodes.Work.GUI;
                 if (offer.recipe == null) {
                     screen.close();
                     complete("The witnessed " + blockName(offer.face) + " opened its rendered vanilla screen.");
@@ -766,7 +1668,9 @@ final class AgentMacroControl {
     }
 
     private void startCraft(Offer offer) {
-        if (!cursorClear() || !ingredients(offer.recipe) || !hands.craft(offer.recipe.id)) {
+        if (!cursorClear() || !(action.durable
+                ? hands.craftWork(offer.recipe.id, action.executions, work.budget)
+                : ingredients(offer.recipe) && hands.craft(offer.recipe.id))) {
             interrupt("The current ingredients, storage, or clean crafting screen did not admit the recipe.", true);
             return;
         }
@@ -782,7 +1686,26 @@ final class AgentMacroControl {
 
     void ownBreak(BlockPos pos, BlockState state) {
         if (action != null && action.offer.key.verb == Verb.BREAK && action.fired
-                && action.offer.face.hit.getBlockPos().equals(pos) && action.offer.face.state == state) action.broken = true;
+                && action.offer.face.hit.getBlockPos().equals(pos) && action.offer.face.state == state && !action.broken) {
+            action.broken = true;
+            if (action.durable) {
+                ++work.confirmedBreaks;
+                work.budget.broken(action.harvestTool.getItem(), action.handLoss);
+            }
+        }
+    }
+
+    private float advancingCrack() {
+        if (action == null || !(action.durable || "terra".equals(owner) && action.intent != null)
+                || action.offer.key.verb != Verb.BREAK
+                || !action.fired || action.broken || !client.options.attackKey.isPressed()
+                || !client.interactionManager.isBreakingBlock() || !hazardClear || urgent) return 0;
+        if (!(client.interactionManager instanceof AgentMiningAccess mining)
+                || !action.offer.key.pos.equals(mining.agent$breakingPos())) return 0;
+        float crack = mining.agent$breakingProgress();
+        float before = action.lastCrack;
+        action.lastCrack = crack;
+        return crack > before && crack < 1 ? crack : 0;
     }
 
     void end(AgentProgress progress, String safety) {
@@ -795,13 +1718,16 @@ final class AgentMacroControl {
             urgent = urgentInput = false;
         }
         if (!input.active) {
+            rawWorking = false;
             if (activated && !revocationSeen) {
                 revocationSeen = true;
                 quiescent = false;
                 ++epoch;
+                ++safetyRevision;
                 publish(null);
             }
             if (action != null) interrupt(safety, true);
+            retireWork("needs_replan", "interrupted", "The host revoked macro authority.");
             if (activated && ipc.markerRevoked && !revocationAcknowledged && visited && owned && available()) {
                 JsonObject revoked = header(run);
                 revoked.addProperty("life", life);
@@ -816,15 +1742,28 @@ final class AgentMacroControl {
             String reason = urgent ? "Immediate safety took control: " + lastUrgency : safety;
             interrupt(reason, true);
             refuseUnseen(reason);
+            if (urgent) retireWork("needs_replan", "interrupted", reason);
         }
-        if (action != null && (action.offer.key.verb == Verb.APPROACH || action.offer.key.verb == Verb.COLLECT))
-            action.drove |= client.options.forwardKey.isPressed();
+        if (action != null && (action.offer.key.verb == Verb.APPROACH || action.offer.key.verb == Verb.COLLECT
+                || action.offer.key.verb == Verb.FOLLOW || action.offer.key.verb == Verb.WORK_WALK))
+            action.drove = client.options.forwardKey.isPressed() || !action.durable && action.drove;
+        if (action != null && action.offer.key.verb == Verb.BREAK && (action.durable || owner.equals("terra")))
+            action.fired |= client.options.attackKey.isPressed();
+        float crack = advancingCrack();
+        if (crack > 0) continuityWork = AgentPauseEpisodes.Work.CRACK;
+        long handsEvidence = hands.workEvidence();
+        if (continuityWork == null && (action != null && action.craftJob != 0 || owner.equals("safety"))
+                && handsEvidence != lastHandsEvidence) continuityWork = AgentPauseEpisodes.Work.GUI;
+        lastHandsEvidence = handsEvidence;
+        rawWorking = continuityWork != null;
+        if (rawWorking && action != null && action.durable && tick - lastPurposefulTick >= 10)
+            purposeful("work " + action.offer.key.verb.id + ": " + continuityWork.name());
         boolean due = tick - lastObservation >= OBSERVATION_INTERVAL || lastObservation == 0;
         updateScope(due);
         // Ordinary local work may continue on the very next tick. Only an observed
         // promotion barrier (or an isolated trial) advertises a held neutral window.
         quiescent = (trial || handoffCurrent(input.handoff)) && visited && owned && available();
-        if (due) publish(progress);
+        if (due) publish(progress, crack);
     }
 
     /** Death/transport shutdown leaves vanilla in charge of the old screen and cursor. */
@@ -838,9 +1777,11 @@ final class AgentMacroControl {
         quiescent = hazardClear = owned = false;
         owner = "safety";
         interrupt(reason, false);
+        retireWork("needs_replan", "interrupted", reason);
         if (client != null && player != null && client.player == player && client.world == world
                 && life != 0 && ipc.inbox.active) {
             ++epoch;
+            ++safetyRevision;
             snapshots.clear();
             publish(null);
         }
@@ -882,7 +1823,11 @@ final class AgentMacroControl {
     }
 
     private boolean observable() {
-        return visited && action == null && grounded() && hazardClear && cursorClear() && client.currentScreen == null
+        return action == null && observableWorld();
+    }
+
+    private boolean observableWorld() {
+        return visited && grounded() && hazardClear && cursorClear() && client.currentScreen == null
             && client.getOverlay() == null && client.isWindowFocused() && body.hasRecentView();
     }
 
@@ -915,6 +1860,15 @@ final class AgentMacroControl {
 
     private boolean visible(Face face, double distance) {
         return body.macroVisible(face.hit, distance) && client.world.getBlockState(face.hit.getBlockPos()) == face.state;
+    }
+
+    private boolean visibleFace(Face face) {
+        return body.macroMineWitness(face.hit, reach()) != null
+            && client.world.getBlockState(face.hit.getBlockPos()) == face.state;
+    }
+
+    private static Key faceKey(Verb verb, Face face, String activity) {
+        return new Key(verb, face.hit.getBlockPos(), 0, activity, face.hit.getSide(), face.state);
     }
 
     private double reach() { return Math.min(4.25, client.player.getBlockInteractionRange() - 0.15); }
@@ -981,16 +1935,22 @@ final class AgentMacroControl {
         if (hazardClear != lastHazard) {
             lastHazard = hazardClear;
             ++epoch;
+            ++safetyRevision;
         }
         // A currently owned recipe or pickup can change inventory as part of its effect.
         if (action == null && checkInventory) {
             var inventory = client.player.getInventory();
-            long stamp = 1;
+            long stamp = 1 + inventory.selectedSlot;
             for (int i = 0; i < inventory.size(); i++) {
                 ItemStack stack = inventory.getStack(i);
                 if (!stack.isEmpty()) stamp = stamp * 31 + System.identityHashCode(stack.getItem()) * 17L + stack.getCount() + i;
             }
-            if (stamp != inventoryStamp) {
+            // A change in the selected item's durability or components can invalidate
+            // a quoted stock-loss bound even when all inventory counts are unchanged.
+            ItemStack hand = inventory.getMainHandStack();
+            boolean toolChanged = !ItemStack.areItemsAndComponentsEqual(scopedMainHand, hand);
+            if (toolChanged) scopedMainHand = hand.copy();
+            if (stamp != inventoryStamp || toolChanged) {
                 inventoryStamp = stamp;
                 ++epoch;
             }
@@ -999,6 +1959,8 @@ final class AgentMacroControl {
 
     private List<Offer> offers(AgentProgress progress) {
         var offers = new ArrayList<Offer>(MAX_OFFERS);
+        for (Offer reserved : reservation()) if (liveMaterialFace(reserved, progress)) offers.add(reserved);
+        if (!trial) addDryRouteOffer(offers, progress);
         var player = client.player;
         float pitch = player.getPitch();
         survey(offers, "footing", surveyYaw, 42, "Survey the nearby ground", "A fixed downward camera angle from the current stance.");
@@ -1030,23 +1992,24 @@ final class AgentMacroControl {
         if (station != null) {
             Face face = face(station);
             inspect(offers, face);
-            if (useAvailable()) {
-                offer(offers, new Key(Verb.INTERACT, station.getBlockPos(), 0, null),
+            if (useAvailable() && visibleFace(face)) {
+                offer(offers, faceKey(Verb.INTERACT, face, null),
                     "Open visible " + blockName(face), "A lit workstation face is inside vanilla use reach.",
                     0, pitch, null, face, null, null, null);
                 if (face.state.isOf(Blocks.CRAFTING_TABLE)) for (Recipe recipe : BENCH_RECIPES) craftOffer(offers, recipe, face);
             }
         }
         var resource = body.find(AgentMacroControl::resource, reach(),
-            hit -> canBreak(hit.getBlockPos(), client.world.getBlockState(hit.getBlockPos()), progress)).orElse(null);
+            hit -> canBreak(hit.getBlockPos(), client.world.getBlockState(hit.getBlockPos()), progress)
+                && body.macroMineWitness(hit, reach()) != null).orElse(null);
         if (resource != null) {
             Face face = face(resource);
-            offer(offers, new Key(Verb.BREAK, resource.getBlockPos(), 0, null),
+            offer(offers, faceKey(Verb.BREAK, face, null),
                 "Break visible " + blockName(face), "A lit resource face is in reach and the selected hand can harvest it.",
                 0, pitch, null, face, null, null, null);
         }
         var resourceView = body.find(AgentMacroControl::resource, INSPECT_REACH, hit ->
-            !retiredViews.contains(new Key(Verb.INSPECT, hit.getBlockPos(), 0, null)) && !body.renderedAim(hit.getPos(), 7))
+            !retiredViews.contains(faceKey(Verb.INSPECT, face(hit), null)) && !body.renderedAim(hit.getPos(), 7))
             .orElse(null);
         if (resourceView != null) inspect(offers, face(resourceView));
         if (!client.options.inventoryKey.isUnbound()) {
@@ -1055,6 +2018,25 @@ final class AgentMacroControl {
             craftOffer(offers, BENCH, null);
         }
         return offers;
+    }
+
+    private void addDryRouteOffer(List<Offer> offers, AgentProgress progress) {
+        AgentDryCaveRoute.Offer route = progress.dryRouteOffer();
+        if (route == null || route.edges() < 1 || route.edges() > MAX_ROUTE_EDGES
+                || !route.from().equals(player.getBlockPos()) || route.from().equals(route.endpoint())
+                || route.from().equals(route.next()) || route.from().getY() != route.endpoint().getY()
+                || route.from().getY() != route.next().getY()) {
+            routeOffer = null;
+            return;
+        }
+        if (routeOffer == null || routeOffer.route != route) {
+            String id = "o-" + ++nextId;
+            String steps = route.edges() == 1 ? "1 level edge" : route.edges() + " level edges";
+            routeOffer = new Offer(id, new Key(Verb.FOLLOW, null, 0, id), "Follow a witnessed dry cave segment",
+                steps + " with a distinct endpoint and a witnessed return. Recheck each edge before moving.",
+                0, 0, null, null, null, null, null, route);
+        }
+        if (offers.size() < MAX_OFFERS) offers.add(routeOffer);
     }
 
     private Face face(BlockHitResult hit) {
@@ -1068,7 +2050,7 @@ final class AgentMacroControl {
     }
 
     private void inspect(List<Offer> offers, Face face) {
-        Key key = new Key(Verb.INSPECT, face.hit.getBlockPos(), 0, null);
+        Key key = faceKey(Verb.INSPECT, face, null);
         if (!retiredViews.contains(key) && !body.renderedAim(face.hit.getPos(), 7))
             offer(offers, key, "Center the visible " + blockName(face), "A lit face is visible away from the current crosshair.",
                 0, 0, null, face, null, null, null);
@@ -1076,7 +2058,7 @@ final class AgentMacroControl {
 
     private void craftOffer(List<Offer> offers, Recipe recipe, Face face) {
         if (ingredients(recipe) && (recipe.result == null || count(recipe.result) == 0 || recipe == STICKS)) {
-            offer(offers, new Key(Verb.CONTINUE, face == null ? null : face.hit.getBlockPos(), 0, recipe.id),
+            offer(offers, face == null ? new Key(Verb.CONTINUE, null, 0, recipe.id) : faceKey(Verb.CONTINUE, face, recipe.id),
                 "Craft " + recipe.id + (face == null ? " in the inventory grid" : " at the visible crafting table"),
                 "The visible inventory holds the ingredients for this vanilla recipe" + (face == null ? "." : "; the table is in reach."),
                 0, 0, null, face, null, null, recipe);
@@ -1085,7 +2067,8 @@ final class AgentMacroControl {
 
     private void offer(List<Offer> offers, Key key, String summary, String evidence, float yaw, float pitch, Floor floor,
                        Face face, ItemEntity drop, Item item, Recipe recipe) {
-        if (offers.size() == MAX_OFFERS) return;
+        if (offers.size() >= MAX_OFFERS) return;
+        for (Offer existing : offers) if (existing.key.equals(key)) return;
         String id = ids.get(key);
         if (id == null) {
             if (ids.size() >= 256) ids.pollFirstEntry();
@@ -1095,7 +2078,65 @@ final class AgentMacroControl {
         offers.add(new Offer(id, key, summary, evidence, yaw, pitch, floor, face, drop, item, recipe));
     }
 
+    private String materialTarget(Key key) {
+        String target = materialTargets.get(key);
+        if (target != null || materialTargets.size() >= MAX_MATERIAL_TARGETS) return target;
+        target = "m-" + ++nextMaterialId;
+        materialTargets.put(key, target);
+        return target;
+    }
+
+    /** Describes only this primitive's possible spend, never a hidden or expected drop. */
+    private JsonObject material(Offer offer, PlayerInventory inventory) {
+        String subject, target;
+        JsonObject spends;
+        switch (offer.key.verb) {
+            case BREAK -> {
+                ItemStack hand = inventory.getMainHandStack();
+                int loss = AgentMiningStock.maxLoss(hand, offer.face.state, world, offer.key.pos);
+                if (loss == AgentMiningStock.UNKNOWN) return null;
+                subject = "block:" + blockName(offer.face);
+                // Two faces of one block are not two material targets.
+                target = materialTarget(new Key(Verb.BREAK, offer.key.pos, 0, null));
+                if (target == null) return null;
+                spends = new JsonObject();
+                if (loss > 0) spends.addProperty(Registries.ITEM.getId(hand.getItem()).toString(), loss);
+            }
+            case COLLECT -> {
+                subject = "item:" + Registries.ITEM.getId(offer.item);
+                target = materialTarget(new Key(Verb.COLLECT, null, offer.key.entity, null));
+                if (target == null) return null;
+                spends = new JsonObject();
+            }
+            case CONTINUE -> {
+                Recipe recipe = offer.recipe;
+                subject = "recipe:" + recipe.id;
+                target = "recipe-" + recipe.id;
+                spends = new JsonObject();
+                // AgentHands.craft(id) submits exactly one request. Bound each eligible
+                // item even when vanilla's compatible ingredient choice is not unique.
+                for (int i = 0; i < PlayerInventory.MAIN_SIZE; ++i) {
+                    ItemStack stack = inventory.getStack(i);
+                    if (stack.isEmpty()) continue;
+                    int limit = (recipe.material.test(stack) ? recipe.amount : 0) +
+                        (stack.isOf(Items.STICK) ? recipe.sticks : 0);
+                    if (limit != 0) spends.addProperty(Registries.ITEM.getId(stack.getItem()).toString(), limit);
+                }
+            }
+            default -> { return null; }
+        }
+        JsonObject material = new JsonObject();
+        material.addProperty("subject", subject);
+        material.addProperty("target", target);
+        material.add("spends", spends);
+        return material;
+    }
+
     private void publish(AgentProgress progress) {
+        publish(progress, 0);
+    }
+
+    private void publish(AgentProgress progress, float crack) {
         lastObservation = tick;
         JsonObject value = header(run);
         value.addProperty("life", life);
@@ -1104,9 +2145,25 @@ final class AgentMacroControl {
         value.addProperty("goal", goal);
         value.addProperty("health", client.player.getHealth());
         value.addProperty("food", client.player.getHungerManager().getFoodLevel());
+        JsonObject safety = new JsonObject();
+        safety.addProperty("clear", hazardClear && !urgent);
+        safety.addProperty("revision", safetyRevision);
+        value.add("safety", safety);
+        if (crack > 0) {
+            if (action.intent != null) {
+                JsonObject working = new JsonObject();
+                working.addProperty("intentId", action.intent.id);
+                working.addProperty("crack", crack);
+                value.add("working", working);
+            }
+        }
+        if (work != null) {
+            value.add("workOrder", workObservation());
+        }
         JsonObject inventory = new JsonObject();
         var inv = client.player.getInventory();
-        for (int i = 0; i < inv.size(); i++) {
+        int slots = ipc.workMode == null ? inv.size() : PlayerInventory.MAIN_SIZE;
+        for (int i = 0; i < slots; i++) {
             ItemStack stack = inv.getStack(i);
             if (stack.isEmpty()) continue;
             String id = Registries.ITEM.getId(stack.getItem()).toString();
@@ -1115,13 +2172,24 @@ final class AgentMacroControl {
         value.add("inventory", inventory);
         JsonArray opportunities = new JsonArray();
         Map<String, Offer> witnessed = new LinkedHashMap<>();
-        if (progress != null && observable()) for (Offer offer : offers(progress)) {
+        List<Offer> visible = List.of();
+        if (progress != null && observableWorld()) {
+            if (action == null) visible = offers(progress);
+            else if (action.intent == null && action.keepVisible.length != 0) {
+                var continuing = new ArrayList<Offer>(action.keepVisible.length);
+                for (Offer anchor : action.keepVisible) if (liveMaterialFace(anchor, progress)) continuing.add(anchor);
+                visible = continuing;
+            }
+        }
+        for (Offer offer : visible) {
             JsonObject entry = new JsonObject();
             entry.addProperty("id", offer.id);
             entry.addProperty("verb", offer.key.verb.id);
             entry.addProperty("summary", offer.summary);
             entry.addProperty("evidence", offer.evidence);
             entry.addProperty("risk", offer.key.verb.risk);
+            JsonObject material = material(offer, inv);
+            if (material != null) entry.add("material", material);
             opportunities.add(entry);
             witnessed.put(offer.id, offer);
         }
@@ -1133,6 +2201,58 @@ final class AgentMacroControl {
         value.add("recent", history);
         value.addProperty("quiescent", quiescent);
         ipc.observation.set(value.toString());
+    }
+
+    private JsonObject workObservation() {
+        JsonObject state = new JsonObject();
+        JsonObject evidence = new JsonObject();
+        state.addProperty("id", work.order.id());
+        var target = work.order.policy().target();
+        Item desired = goalStock(target);
+        int required = goalAmount(target);
+        int observed = desired == null ? 0 : count(desired);
+        String replan = null;
+        if (work.active()) {
+            if (desired != null && workNearTarget(desired, observed, required)) replan = "target_near";
+            else if (work.budget.nearLimit()) replan = "cap_near";
+            else if (work.deadline - now <= 7_500_000_000L) replan = "expiry_near";
+        }
+        String description = work.enactedStatus;
+        if (work.active() && action != null && action.durable && action.craftJob != 0 && hands.busy())
+            description += "; vanilla hands: " + hands.status();
+        state.addProperty("state", replan == null ? work.phase : "needs_replan");
+        state.addProperty("detail", description);
+        evidence.addProperty("phase", work.enactedPhase);
+        evidence.addProperty("status", description);
+        evidence.addProperty("breaks", work.confirmedBreaks);
+        evidence.addProperty("crafts", work.confirmedCrafts);
+        evidence.addProperty("placements", work.confirmedPlacements);
+        if (desired != null) {
+            JsonObject stock = new JsonObject();
+            stock.addProperty("item", Registries.ITEM.getId(desired).toString());
+            stock.addProperty("count", observed);
+            stock.addProperty("required", required);
+            evidence.add("target", stock);
+        }
+        if (work.lastEffect != null) {
+            JsonObject effect = new JsonObject();
+            effect.addProperty("tick", work.lastEffectTick);
+            effect.addProperty("detail", work.lastEffect);
+            evidence.add("lastEffect", effect);
+        }
+        if (replan != null) evidence.addProperty("replan", replan);
+        state.add("progress", evidence);
+        return state;
+    }
+
+    private boolean workNearTarget(Item desired, int observed, int required) {
+        if (observed >= required || (observed > work.startingStock
+                && required - observed <= Math.max(2, (required - work.startingStock + 1) / 2))) return true;
+        if (action == null || !action.durable || action.craftJob == 0 || !hands.busy()) return false;
+        Recipe recipe = action.offer.recipe;
+        // This is a request lead, not a receipt: the server has not produced the output yet.
+        return recipe != null && AgentHands.workOutput(recipe.id) == desired
+            && required - observed <= AgentHands.workOutputCount(recipe.id);
     }
 
     private void refuseUnseen(String detail) {
@@ -1158,6 +2278,14 @@ final class AgentMacroControl {
     }
 
     private void finish(String result, String detail) {
+        if (action.offer.key.verb == Verb.BREAK && (owner.equals("terra") || action.durable)
+                && !owner.equals("safety")) body.pauseWork();
+        if (action.offer.route != null) {
+            if (routeOwner != null) routeOwner.cancelFollowDryRoute(action.offer.route);
+            routeOwner = null;
+            routeOffer = null;
+            if (!owner.equals("safety")) body.pauseWork();
+        }
         String pickup = unexpectedPickup();
         if (pickup != null) {
             result = "interrupted";
@@ -1165,11 +2293,33 @@ final class AgentMacroControl {
         }
         if ((action.offer.key.verb == Verb.SURVEY || action.offer.key.verb == Verb.INSPECT)
                 && retiredViews.size() < 256) retiredViews.add(action.offer.key);
-        if (action.intent == null) {
+        if (action.durable) {
+            remember("work " + action.offer.key.verb.id + " " + result + ": " + detail);
+            if (!result.equals("completed") && !urgent) {
+                enact("hold", detail);
+                if (action.offer.face != null) {
+                    BlockPos refused = action.offer.face.hit.getBlockPos();
+                    if (action.offer.key.verb == Verb.WORK_PLACE) refused = refused.up();
+                    work.rejected.add(refused);
+                } else if (action.offer.drop != null) work.rejectedDrops.add(action.offer.drop.getId());
+                if (action.offer.key.verb == Verb.CONTINUE)
+                    retireWork("needs_replan", "interrupted", detail);
+            } else if (result.equals("completed")) {
+                if (action.offer.key.verb == Verb.BREAK || action.offer.key.verb == Verb.CONTINUE
+                        || action.offer.key.verb == Verb.WORK_PLACE || action.offer.drop != null) {
+                    work.lastEffect = detail;
+                    work.lastEffectTick = tick;
+                }
+                enact("hold", detail);
+                work.sweep = work.sweepWait = 0;
+                work.sweepStart = player.getYaw();
+            }
+        } else if (action.intent == null) {
             remember("local_motion " + result + ": " + detail);
             if (result.equals("completed")) ++fallbackActions;
         } else receipt(action.intent, result, detail);
-        if (result.equals("completed") && !action.purposefulMotion) purposeful(detail);
+        if (result.equals("completed") && (!action.durable || continuityWork != null) && !action.purposefulMotion)
+            purposeful(detail);
         action = null;
     }
 
@@ -1177,7 +2327,8 @@ final class AgentMacroControl {
         if (action == null || action.walkInventory == null || client.player != player || client.world != world) return null;
         if (action.unexpectedPickup != null) return action.unexpectedPickup;
         Item item = action.walkInventory.gain(player.getInventory());
-        if (item != null) action.unexpectedPickup = "Unexpected inventory gain during approach: " + Registries.ITEM.getId(item) + ".";
+        if (item != null) action.unexpectedPickup = "Unexpected inventory gain during " + action.offer.key.verb.id
+            + ": " + Registries.ITEM.getId(item) + ".";
         return action.unexpectedPickup;
     }
 
@@ -1187,15 +2338,23 @@ final class AgentMacroControl {
             case APPROACH -> "The short walk did not settle on the witnessed tile before expiry.";
             case COLLECT -> "The drop did not produce a matching inventory gain before expiry.";
             case INTERACT -> "The workstation did not produce the expected rendered GUI before expiry.";
+            case FOLLOW -> "The witnessed dry route did not settle at its authorized endpoint before expiry.";
             case CONTINUE -> "The trusted recipe did not produce a matching vanilla crafting receipt before expiry.";
             case SURVEY, INSPECT -> "The camera did not render the intended pose before expiry.";
+            case WORK_WALK -> "The route did not reach its witnessed target before expiry.";
+            case WORK_EQUIP -> "The work equipment did not settle before expiry.";
+            case WORK_PLACE -> "The authorized placement did not settle before expiry.";
         };
     }
 
     private void receipt(Intent intent, String result, String detail) {
+        receipt(intent.id, intent.life, result, detail);
+    }
+
+    private void receipt(String id, int requestedLife, String result, String detail) {
         JsonObject value = header(run);
-        value.addProperty("id", intent.id);
-        value.addProperty("life", intent.life);
+        value.addProperty("id", id);
+        value.addProperty("life", requestedLife);
         value.addProperty("tick", tick);
         value.addProperty("status", result);
         value.addProperty("detail", detail);
@@ -1234,13 +2393,19 @@ final class AgentMacroControl {
     /** Single bounded worker: no filesystem access from gameplay ticks. */
     private static final class Ipc {
         private static final Set<String> MARKER_FIELDS = Set.of("v", "run");
+        private static final Set<String> WORK_MARKER_FIELDS = Set.of("v", "run", "workMode");
+        private static final String LEGACY = "";
         private static final Set<String> INTENT_FIELDS =
             Set.of("v", "id", "run", "life", "epoch", "basisTick", "expiresTick", "opportunityId", "skillHash");
         private static final Set<String> HANDOFF_FIELDS = Set.of("v", "run", "life", "epoch", "basisTick", "expiresTick");
         private static final Set<String> PLANNING_FIELDS = Set.of("v", "run", "life", "epoch", "basisTick", "id");
-        private static final Inbox OFF = new Inbox(false, null, null, null);
+        private static final WorkMailbox NO_WORK = new WorkMailbox(false, null);
+        private static final Inbox OFF = new Inbox(false, null, null, null, NO_WORK);
         private final Path directory;
-        private final String run;
+        private final String run, activeMode, workMode;
+        private final Path workFile;
+        private String workPayload;
+        private WorkMailbox workMailbox = NO_WORK;
         private final ScheduledExecutorService worker;
         private final ScheduledFuture<?> poll;
         private final AtomicReference<String> observation = new AtomicReference<>();
@@ -1248,11 +2413,14 @@ final class AgentMacroControl {
         private volatile Inbox inbox;
         private volatile boolean retired, markerRevoked;
 
-        Ipc(Path directory, String run, boolean active) {
+        Ipc(Path directory, String run, String mode) {
             this.directory = directory;
             this.run = run;
-            retired = !active;
-            inbox = active ? new Inbox(true, null, null, null) : OFF;
+            activeMode = mode;
+            workMode = mode == null || mode.equals(LEGACY) ? null : mode;
+            workFile = directory.resolve("work.json");
+            retired = mode == null;
+            inbox = !retired ? new Inbox(true, null, null, null, NO_WORK) : OFF;
             worker = Executors.newSingleThreadScheduledExecutor(task -> {
                 Thread thread = new Thread(task, "survival-agent-macro-io");
                 thread.setDaemon(true);
@@ -1289,17 +2457,28 @@ final class AgentMacroControl {
 
         private void transfer() {
             try {
-                if (!markerRevoked && !marked(directory, run, "active.json")) {
+                if (!markerRevoked && activeMode != null && !activeMode.equals(activeMode(directory, run))) {
                     markerRevoked = true;
                     retired = true;
                 }
-                Inbox next = retired ? OFF : new Inbox(true, readIntent(), readHandoff(), readPlanning(inbox.planning));
+                Inbox next = retired ? OFF : new Inbox(true, readIntent(), readHandoff(), readPlanning(inbox.planning),
+                    readWork());
                 inbox = retired ? OFF : next;
                 flush();
             } catch (RuntimeException e) {
                 retired = true;
                 inbox = OFF;
             }
+        }
+
+        private WorkMailbox readWork() {
+            if (workMode == null) return NO_WORK;
+            String payload = readText(workFile, 16 * 1024);
+            boolean present = payload != null || Files.isRegularFile(workFile, LinkOption.NOFOLLOW_LINKS);
+            if (present == workMailbox.present && Objects.equals(payload, workPayload)) return workMailbox;
+            workPayload = payload;
+            workMailbox = present ? new WorkMailbox(true, AgentWorkOrder.parse(parseJson(payload), run, workMode)) : NO_WORK;
+            return workMailbox;
         }
 
         private void flush() {
@@ -1357,6 +2536,20 @@ final class AgentMacroControl {
             }
         }
 
+        private static String activeMode(Path directory, String run) {
+            if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) return null;
+            JsonObject value = read(directory.resolve("active.json"), 512);
+            try {
+                if (value == null || number(value, "v") != 1 || !run.equals(text(value, "run"))) return null;
+                if (value.keySet().equals(MARKER_FIELDS)) return LEGACY;
+                if (!value.keySet().equals(WORK_MARKER_FIELDS)) return null;
+                String mode = text(value, "workMode");
+                return mode.equals("preset") || mode.equals("constrained") ? mode : null;
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+
         private Intent readIntent() {
             JsonObject value = read(directory.resolve("intent.json"), 2048);
             if (value == null || !value.keySet().equals(INTENT_FIELDS)) return null;
@@ -1408,13 +2601,26 @@ final class AgentMacroControl {
         }
 
         private static JsonObject read(Path path, int limit) {
+            return parseJson(readText(path, limit));
+        }
+
+        private static String readText(Path path, int limit) {
             if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) return null;
             try (var stream = Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)) {
                 byte[] data = stream.readNBytes(limit + 1);
                 if (data.length > limit) return null;
-                var parsed = JsonParser.parseString(new String(data, StandardCharsets.UTF_8));
-                return parsed.isJsonObject() ? parsed.getAsJsonObject() : null;
+                return new String(data, StandardCharsets.UTF_8);
             } catch (IOException | RuntimeException e) {
+                return null;
+            }
+        }
+
+        private static JsonObject parseJson(String text) {
+            if (text == null) return null;
+            try {
+                var parsed = JsonParser.parseString(text);
+                return parsed.isJsonObject() ? parsed.getAsJsonObject() : null;
+            } catch (RuntimeException invalid) {
                 return null;
             }
         }

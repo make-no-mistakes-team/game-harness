@@ -7,6 +7,7 @@ import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.FallingBlock;
 import net.minecraft.block.ShapeContext;
 import net.minecraft.block.SnowBlock;
 import net.minecraft.client.MinecraftClient;
@@ -59,6 +60,7 @@ final class AgentBody {
     private static final double GAIT_PITCH_TIME = 0.20;
     private static final int FOOTING_AGE = 100;
     private static final int ESCAPE_TICKS = 44;
+    private static final String SUPPORTING_FOOTPRINT = "supporting_footprint";
     private static final double[] MACRO_FLOOR_OFFSETS = {0, -0.36, 0.36};
 
     enum Contact {
@@ -136,6 +138,7 @@ final class AgentBody {
     private Vec3d previousDryFooting;
     private int previousDryFootingTick;
     private boolean lavaEmergency;
+    private Predicate<ItemStack> safetySpend;
     private int stableDryTicks;
     private Vec3d escapeLanding;
     private boolean escapePlanned;
@@ -177,7 +180,8 @@ final class AgentBody {
     private boolean backward;
     private boolean fast;
     private boolean verifiedDescent;
-    private boolean flatWalk;
+    private boolean flatWalk, dryRouteWalk;
+    private boolean wetEscapeWalk;
     private Vec3d dryLanding;
     private BlockPos stepSupport;
     private boolean surfaceStep;
@@ -206,6 +210,7 @@ final class AgentBody {
     private Entity striking;
     private LivingEntity shielding;
     private Vec3d raisedShieldBearing;
+    private float rangedShieldYaw = Float.NaN;
     private Item armor;
     private AgentFaceAim contact;
     private Contact contactMode;
@@ -237,6 +242,7 @@ final class AgentBody {
 
     void begin() {
         tick++;
+        safetySpend = null;
         raysLeft = RAY_BUDGET - MOVEMENT_RAYS;
         sampleCount = 0;
         sampleRange = 0;
@@ -280,10 +286,18 @@ final class AgentBody {
         }
     }
 
+    void safetySpend(Predicate<ItemStack> spend) { safetySpend = spend; }
+
+    private boolean canWearSafetyItem(ItemStack stack) {
+        return safetySpend == null || !stack.isDamageable() || safetySpend.test(stack);
+    }
+
     private void resetIntentions() {
         dryLanding = null;
         centerLanding = null;
         forward = backward = fast = verifiedDescent = flatWalk = jumping = sneaking = swimmingDown = eating = false;
+        dryRouteWalk = false;
+        wetEscapeWalk = false;
         reachJump = false;
         routeJumps = true;
         rowForward = rowLeft = rowRight = boatDismount = false;
@@ -291,6 +305,7 @@ final class AgentBody {
         striking = null;
         shielding = null;
         raisedShieldBearing = null;
+        rangedShieldYaw = Float.NaN;
         armor = null;
     }
 
@@ -430,7 +445,7 @@ final class AgentBody {
         boolean dive = swimmingDown && player.isTouchingWater() && player.getAir() >= 70;
         boolean crouch = sneaking || dive;
         boolean jump = jumping || !dive && (player.isSubmergedInWater()
-            || (advance || retreat) && player.isTouchingWater());
+            || !wetEscapeWalk && (advance || retreat) && player.isTouchingWater());
         boolean stepJump = false;
         Ground ground = Ground.CLEAR;
 
@@ -441,7 +456,8 @@ final class AgentBody {
             advance = hasView() && player.isOnGround() && !player.horizontalCollision
                 && distance > Math.max(0.12, 2.6 * Math.sqrt(player.getVelocity().horizontalLengthSquared()))
                 && Math.abs(MathHelper.wrapDegrees(goalYaw(player, player.getEyePos()) - player.getYaw())) <= 6;
-        } else if (controlledBoat == null && advance && player.isOnGround() && !player.isTouchingWater()) {
+        } else if (!dryRouteWalk && !wetEscapeWalk && controlledBoat == null && advance
+                && player.isOnGround() && !player.isTouchingWater()) {
             ground = terrainAhead(player);
             if (ground == Ground.EDGE) {
                 crouch |= !verifiedDescent;
@@ -456,16 +472,20 @@ final class AgentBody {
         if (raisedShieldBearing != null) {
             // With no new view, never start using an item or inspect the old target.
             use = !options.useKey.isUnbound() && player.isUsingItem() && player.getActiveItem().isOf(Items.SHIELD)
+                && canWearSafetyItem(player.getActiveItem())
                 && facesShieldBearing(player, raisedShieldBearing.x, raisedShieldBearing.z);
-        } else if (shielding != null && !options.useKey.isUnbound()) {
-            if (facesShieldBearing(player, shielding.getX(), shielding.getZ()) && shielding.isAlive()) {
+        } else if ((shielding != null || Float.isFinite(rangedShieldYaw)) && !options.useKey.isUnbound()) {
+            boolean facing = shielding != null
+                ? shielding.isAlive() && facesShieldBearing(player, shielding.getX(), shielding.getZ())
+                : Math.abs(MathHelper.wrapDegrees(rangedShieldYaw - player.getYaw())) <= 32;
+            if (facing) {
                 if (player.isUsingItem()) {
-                    use = player.getActiveItem().isOf(Items.SHIELD);
+                    use = player.getActiveItem().isOf(Items.SHIELD) && canWearSafetyItem(player.getActiveItem());
                 } else {
                     ItemStack main = player.getMainHandStack();
                     ItemStack shield = main.isOf(Items.SHIELD) ? main : player.getOffHandStack();
-                    if (shield.isOf(Items.SHIELD) && !player.getItemCooldownManager().isCoolingDown(shield)
-                            && shieldSafeMainHand(main)) {
+                    if (shield.isOf(Items.SHIELD) && canWearSafetyItem(shield) && !player.getItemCooldownManager().isCoolingDown(shield)
+                            && shieldSafeMainHand(main) && (shielding != null || hasView())) {
                         HitResult actual = currentCrosshair();
                         if (actual instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK) {
                             // Sneak past station use; do not right-click a block with an axe.
@@ -473,7 +493,10 @@ final class AgentBody {
                             use = crouch && player.isSneaking() && !main.isIn(ItemTags.AXES);
                         } else {
                             use = actual != null && (actual.getType() == HitResult.Type.MISS
-                                || actual instanceof EntityHitResult hit && hit.getEntity() == shielding);
+                                || actual instanceof EntityHitResult hit && (hit.getEntity() == shielding
+                                    || shielding == null && hit.getEntity() instanceof Monster
+                                    && renderedCrosshair instanceof EntityHitResult shown
+                                    && shown.getEntity() == hit.getEntity()));
                         }
                     }
                 }
@@ -504,6 +527,7 @@ final class AgentBody {
             } else if (striking != null) {
                 if (actual instanceof EntityHitResult hit && hit.getEntity() == striking
                         && striking.isAlive() && !player.isUsingItem()
+                        && canWearSafetyItem(player.getMainHandStack())
                         && player.getAttackCooldownProgress(0.5f) >= 0.9f) {
                     pressKey(options.attackKey);
                 }
@@ -693,6 +717,7 @@ final class AgentBody {
                 || !player.isOnGround() || player.isInLava() || player.isUsingItem()
                 || client.interactionManager == null || client.interactionManager.isBreakingBlock()) return;
         var stack = player.getMainHandStack();
+        if (safetySpend != null && !safetySpend.test(stack)) return;
         if (escapeWater != null && stack.isOf(Items.BUCKET) && player.isTouchingWater() && !player.isOnFire()
                 && escapeWaterAttempts < 3 && tick - escapeWaterTick >= 8) {
             turn(player.getYaw(), 89.5f);
@@ -1212,6 +1237,42 @@ final class AgentBody {
     void sneak() { sneaking = true; }
     void swimDown() { swimmingDown = true; }
     void holdUse() { eating = true; }
+
+    boolean miningFootingRefused(BlockPos target) {
+        return contactTick == tick && contactMode == Contact.MINE && contact != null
+            && target.equals(contact.pos) && SUPPORTING_FOOTPRINT.equals(contactStatus);
+    }
+
+    /** Only for a presently admitted mine contact, with its current visible block state. */
+    private boolean refuseSupportingMine() {
+        var player = client.player;
+        Box hull = player.getBoundingBox();
+        BlockPos pos = contact.pos;
+        double foot = hull.minY - pos.getY();
+        if (foot <= 0.0) return false;
+
+        if (rayShapeContext == null) rayShapeContext = ShapeContext.of(player);
+        VoxelShape shape = contactState.getCollisionShape(client.world, pos, rayShapeContext);
+        double allowance = 0.02;
+        boolean supports;
+        if (shape == VoxelShapes.fullCube()) {
+            // The center may be over air while only one edge of the hull rests on this block.
+            int x = pos.getX(), z = pos.getZ();
+            supports = foot >= 1.0 - 1e-7 && foot < 1.0 + allowance
+                && x + 1.0 > hull.minX + 1e-7 && x < hull.maxX - 1e-7
+                && z + 1.0 > hull.minZ + 1e-7 && z < hull.maxZ - 1e-7;
+        } else {
+            // Test the real surface, not the enclosing box of a stair, slab, or fence.
+            supports = !shape.isEmpty() && shape.getMax(Direction.Axis.Y) > foot - allowance
+                && shape.calculateMaxDistance(Direction.Axis.Y,
+                    hull.offset(-pos.getX(), -pos.getY(), -pos.getZ()), -allowance) > -allowance;
+        }
+        if (!supports) return false;
+        mining = null;
+        reportContact(SUPPORTING_FOOTPRINT);
+        return true;
+    }
+
     boolean mine(BlockHitResult witness) {
         if (!prepareContact(witness, Contact.MINE)) return false;
         boolean held = witness.getBlockPos().equals(lastHeldMine) && lastHeldMineTick == tick - 1;
@@ -1223,6 +1284,7 @@ final class AgentBody {
             reportContact(problem);
             return false;
         }
+        if (refuseSupportingMine()) return false;
         mining = contact.pos;
         return true;
     }
@@ -1239,6 +1301,7 @@ final class AgentBody {
                 || !(currentCrosshair() instanceof BlockHitResult now) || !contact.admits(now)
                 || client.world.getBlockState(target) != contactState) return false;
         contactTick = tick;
+        if (refuseSupportingMine()) return false;
         if (contactPoint != null) aimRegion(contact, contactPoint, false);
         mining = target;
         return true;
@@ -1264,8 +1327,46 @@ final class AgentBody {
             tolerance);
     }
 
+    /** Frustum preview only; no outside-view raycast or new world observation. */
+    boolean macroRetainsView(Vec3d point, Vec3d feet, float yaw, float pitch) {
+        if (!hasView()) return false;
+        var player = client.player;
+        Vec3d proposedEye = player.getEyePos().add(feet.subtract(player.getPos()));
+        Vec3d relative = point.subtract(proposedEye);
+        Vec3d forward = player.getRotationVector(pitch, yaw);
+        Vec3d horizontal = player.getRotationVector(0, yaw - 90);
+        Vec3d vertical = forward.crossProduct(horizontal);
+        Vec3d oldForward = player.getRotationVector(observedPitch, observedYaw);
+        Vec3d oldHorizontal = player.getRotationVector(0, observedYaw - 90);
+        Vec3d oldVertical = oldForward.crossProduct(oldHorizontal);
+        // Keep a little margin for interpolation. Only the current lit ray can
+        // confirm the face after the preview is actually rendered.
+        Vec3d mapped = oldForward.multiply(relative.dotProduct(forward))
+            .add(oldHorizontal.multiply(relative.dotProduct(horizontal) * 1.04))
+            .add(oldVertical.multiply(relative.dotProduct(vertical) * 1.04));
+        return inView(eye.add(mapped));
+    }
+
     boolean macroVisible(BlockHitResult witness, double reach) {
         return hasView() && matchesHit(witness, witness.getBlockPos(), reach);
+    }
+
+    /** Re-witness the same admitted face, not another face of the same block. */
+    BlockHitResult macroMineWitness(BlockHitResult witness, double reach) {
+        if (!hasView()) return null;
+        if (contact != null && contactMode == Contact.MINE && contact.sameSurface(witness)) {
+            if (contactPoint != null) {
+                BlockHitResult pinned = contactRay(contactPoint, reach);
+                if (sameBlockFace(witness, pinned)) return pinned;
+            }
+            BlockHitResult selected = selectedFace();
+            if (sameBlockFace(witness, selected)) {
+                BlockHitResult live = contactRay(selected.getPos(), reach);
+                if (sameBlockFace(witness, live)) return live;
+            }
+        }
+        BlockHitResult live = contactRay(witness.getPos(), reach);
+        return sameBlockFace(witness, live) ? live : null;
     }
 
     boolean macroLavaNear() {
@@ -1277,6 +1378,15 @@ final class AgentBody {
         return !keys.forwardKey.isPressed() && !keys.backKey.isPressed() && !keys.leftKey.isPressed()
             && !keys.rightKey.isPressed() && !keys.jumpKey.isPressed() && !keys.sprintKey.isPressed()
             && !keys.sneakKey.isPressed() && !keys.attackKey.isPressed() && !keys.useKey.isPressed();
+    }
+
+    Vec3d continuityLanding() {
+        if (!client.options.forwardKey.isPressed()) return null;
+        return dryLanding != null ? dryLanding : stepDriveTick == tick && stepSupport != null ? stepLanding : null;
+    }
+
+    BlockPos continuityMiningTarget() {
+        return lastHeldMineTick == tick && client.options.attackKey.isPressed() ? lastHeldMine : null;
     }
 
     /** Only an adjacent same-height destination whose full top is lit in this frame. */
@@ -1320,6 +1430,125 @@ final class AgentBody {
         return client.world.isSpaceEmpty(player, player.getBoundingBox().stretch(dx, 0, dz));
     }
 
+    enum DryRouteSample { CLEAR, UNKNOWN, DARK, OBSTRUCTION, FLUID }
+
+    /** A missing render or ray allocation is unknown; only a lit actual hit can close a lane. */
+    DryRouteSample dryRouteClear(Vec3d point) {
+        if (!hasView() || raysLeft <= 0 || !inView(point)) return DryRouteSample.UNKNOWN;
+        raysLeft--;
+        BlockHitResult hit = raycast(point, Ray.TERRAIN);
+        if (hit.getType() == HitResult.Type.MISS)
+            return lit(point.x, point.y, point.z) ? DryRouteSample.CLEAR : DryRouteSample.DARK;
+        if (!inView(hit.getPos())) return DryRouteSample.UNKNOWN;
+        if (!litFace(hit)) return DryRouteSample.DARK;
+        BlockState shown = client.world.getBlockState(hit.getBlockPos());
+        if (!shown.getFluidState().isEmpty()) {
+            hazards.observe(hit, AgentHazards.kind(shown), eye, eye.squaredDistanceTo(hit.getPos()), tick);
+            return DryRouteSample.FLUID;
+        }
+        return hit.getBlockPos().equals(BlockPos.ofFloored(point))
+            ? DryRouteSample.OBSTRUCTION : DryRouteSample.UNKNOWN;
+    }
+
+    BlockHitResult dryRouteFloor(Vec3d belowTop, BlockPos floor) {
+        if (!hasView() || !inView(belowTop)) return null;
+        BlockHitResult hit = visibleHit(belowTop, Ray.TERRAIN);
+        if (hit == null || !matchesDryRouteTop(hit, floor)) return null;
+        return stableDryRouteTop(floor, client.world.getBlockState(hit.getBlockPos())) ? hit : null;
+    }
+
+    enum DryRouteTop { WITNESSED, OUT_OF_VIEW, OCCLUDED, DARK, FLUID, NO_FULL_TOP }
+
+    DryRouteTop dryRouteTop(Vec3d belowTop, BlockPos floor) {
+        if (!hasView() || raysLeft <= 0 || !inView(belowTop)) return DryRouteTop.OUT_OF_VIEW;
+        raysLeft--;
+        BlockHitResult hit = raycast(belowTop, Ray.TERRAIN);
+        if (hit.getType() == HitResult.Type.MISS)
+            return lit(belowTop.x, belowTop.y, belowTop.z) ? DryRouteTop.NO_FULL_TOP : DryRouteTop.DARK;
+        if (!inView(hit.getPos())) return DryRouteTop.OUT_OF_VIEW;
+        if (!litFace(hit)) return DryRouteTop.DARK;
+        BlockState shown = client.world.getBlockState(hit.getBlockPos());
+        if (!shown.getFluidState().isEmpty()) {
+            hazards.observe(hit, AgentHazards.kind(shown), eye, eye.squaredDistanceTo(hit.getPos()), tick);
+            return DryRouteTop.FLUID;
+        }
+        if (!floor.equals(hit.getBlockPos())) return DryRouteTop.OCCLUDED;
+        return matchesDryRouteTop(hit, floor) && stableDryRouteTop(floor, shown)
+            ? DryRouteTop.WITNESSED : DryRouteTop.NO_FULL_TOP;
+    }
+
+    private static boolean matchesDryRouteTop(BlockHitResult hit, BlockPos floor) {
+        return floor.equals(hit.getBlockPos()) && hit.getSide() == Direction.UP
+            && Math.abs(hit.getPos().y - floor.getY() - 1) <= 0.035;
+    }
+
+    private boolean stableDryRouteTop(BlockPos floor, BlockState shown) {
+        return !(shown.getBlock() instanceof FallingBlock) && fullStepSupport(floor, shown);
+    }
+
+    boolean dryRouteView() { return hasView(); }
+
+    enum DryRouteVeto { CLEAR, VIEW, HAZARD, DRIFT, SWEEP, SUPPORT }
+
+    boolean dryRouteSweep(BlockPos from, BlockPos to) {
+        return dryRouteVeto(from, to) == DryRouteVeto.CLEAR;
+    }
+
+    /** A collision veto for precisely one already admitted cardinal lane, never a source of map evidence. */
+    DryRouteVeto dryRouteVeto(BlockPos from, BlockPos to) {
+        if (!hasView()) return DryRouteVeto.VIEW;
+        var player = client.player;
+        int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ(), dy = to.getY() - from.getY();
+        if (Math.abs(dx) + Math.abs(dz) != 1 || Math.abs(dy) > 1) return DryRouteVeto.DRIFT;
+        if (lavaEmergency || player.isTouchingWater() || player.isInLava()
+                || player.hasVehicle() || player.isOnFire() || player.hurtTime > 0) return DryRouteVeto.HAZARD;
+        double x = from.getX() + 0.5, y = from.getY(), z = from.getZ() + 0.5;
+        double along = (player.getX() - x) * dx + (player.getZ() - z) * dz;
+        double across = (player.getX() - x) * dz - (player.getZ() - z) * dx;
+        Vec3d velocity = player.getVelocity();
+        double drift = across + 2.45 * (velocity.x * dz - velocity.z * dx);
+        if (along < -0.27 || along > 1.27 || Math.abs(across) > 0.19
+                || Math.abs(drift) > 0.19
+                || player.getY() < Math.min(y, to.getY()) - 0.055
+                || player.getY() > Math.max(y, to.getY()) + 0.32) return DryRouteVeto.DRIFT;
+        if (hazardAhead(heading(dx, dz), Math.max(0.7, 1.4 - along))) return DryRouteVeto.HAZARD;
+        double half = player.getWidth() * 0.5 + 0.055;
+        double upper = Math.max(y, to.getY());
+        Box high = new Box(x - half, upper + 0.015, z - half, x + half, upper + 1.80, z + half);
+        double cross = Math.abs(drift) > Math.abs(across) ? drift : across;
+        Box approach = high.stretch(cross * dz, 0, -cross * dx);
+        if (!client.world.isSpaceEmpty(player, approach.stretch(dx, 0, dz))) return DryRouteVeto.SWEEP;
+        if (dy != 0) {
+            Box lowerColumn = dy > 0 ? approach : approach.offset(dx, 0, dz);
+            if (!client.world.isSpaceEmpty(player, lowerColumn.stretch(0, -1, 0))) return DryRouteVeto.SWEEP;
+        }
+        // The source's reverse support is positive grounded body contact, not an
+        // imaginary camera looking back from the destination. A change to either
+        // exact chosen contact footprint can still veto the pair.
+        Box sourceContact = new Box(high.minX, y - 0.06, high.minZ, high.maxX, y - 0.015, high.maxZ);
+        Box landingContact = sourceContact.offset(dx, dy, dz);
+        return client.world.isSpaceEmpty(player, sourceContact) || client.world.isSpaceEmpty(player, landingContact)
+            ? DryRouteVeto.SUPPORT : DryRouteVeto.CLEAR;
+    }
+
+    /** One bounded traversal under the normal lava and final key vetoes, without an automatic jump. */
+    void driveDryRoute(BlockPos to, Direction bearing, boolean jump) {
+        var player = client.player;
+        Vec3d landing = Vec3d.ofBottomCenter(to);
+        double dx = landing.x - player.getX(), dz = landing.z - player.getZ();
+        float yaw = heading(bearing.getOffsetX(), bearing.getOffsetZ());
+        turnFixed(yaw, jump ? 4 : 39);
+        if (!hasView() || Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > 6) return;
+        double remaining = dx * bearing.getOffsetX() + dz * bearing.getOffsetZ();
+        Vec3d velocity = player.getVelocity();
+        double braking = Math.max(0, velocity.x * bearing.getOffsetX() + velocity.z * bearing.getOffsetZ()) * 2.45;
+        dryRouteWalk = true;
+        if (remaining > Math.max(0.12, braking)) {
+            walkDownTo(landing);
+            if (jump) jump();
+        }
+    }
+
     /** A visible drop can veto walking. An unseen item is not evidence either way. */
     boolean macroNoVisiblePickup(Vec3d landing) {
         if (!hasView() || raysLeft <= 0) return false;
@@ -1360,6 +1589,9 @@ final class AgentBody {
     }
 
     void blockAgainst(LivingEntity threat) { shielding = threat; }
+
+    /** Face an observed bearing; vanilla use still requires a safe hand and crosshair. */
+    void guardRangedBearing(float yaw) { rangedShieldYaw = yaw; }
 
     void holdRaisedShieldToward(Vec3d lastSeen) {
         raisedShieldBearing = lastSeen;
@@ -1581,9 +1813,13 @@ final class AgentBody {
     }
 
     private boolean fullStepSupport(BlockHitResult hit) {
-        BlockState state = client.world.getBlockState(hit.getBlockPos());
+        BlockPos floor = hit.getBlockPos();
+        return fullStepSupport(floor, client.world.getBlockState(floor));
+    }
+
+    private boolean fullStepSupport(BlockPos floor, BlockState state) {
         return state.getFluidState().isEmpty() && !state.isOf(Blocks.MAGMA_BLOCK) && !state.isOf(Blocks.CACTUS)
-            && Block.isShapeFullCube(state.getCollisionShape(client.world, hit.getBlockPos()));
+            && Block.isShapeFullCube(state.getCollisionShape(client.world, floor));
     }
 
     /** Retain the backing mode through the whole walked segment; never rotate through alternate bearings. */
@@ -1845,6 +2081,73 @@ final class AgentBody {
 
     boolean clearTerrainThroughWater(Vec3d point) {
         return hasView() && clearPoint(point, Ray.WET_TERRAIN);
+    }
+
+    enum WetEscapeMedium { UNSEEN, SOLID, AIR, STILL_WATER, FLOW }
+
+    /** Classify a specific point in the rendered corridor; never read an occluded candidate cell. */
+    WetEscapeMedium wetEscapeMedium(Vec3d point) {
+        if (!hasView() || raysLeft <= 0 || !inView(point) || point.squaredDistanceTo(eye) > 14.44)
+            return WetEscapeMedium.UNSEEN;
+        raysLeft--;
+        BlockHitResult hit = raycast(point, Ray.WET_TERRAIN);
+        BlockPos cell = BlockPos.ofFloored(point);
+        if (hit.getType() != HitResult.Type.MISS) {
+            return hit.getBlockPos().equals(cell) && inView(hit.getPos()) && litFace(hit)
+                ? WetEscapeMedium.SOLID : WetEscapeMedium.UNSEEN;
+        }
+        if (!lit(point.x, point.y, point.z)) return WetEscapeMedium.UNSEEN;
+        BlockState state = client.world.getBlockState(cell);
+        if (state.isAir() || state.isOf(Blocks.TORCH) || state.isOf(Blocks.WALL_TORCH))
+            return WetEscapeMedium.AIR;
+        FluidState fluid = state.getFluidState();
+        if (!state.isOf(Blocks.WATER) || !fluid.isIn(FluidTags.WATER)) return WetEscapeMedium.SOLID;
+        if (point.y - cell.getY() >= fluid.getHeight(client.world, cell)) return WetEscapeMedium.AIR;
+        return fluid.isStill() ? WetEscapeMedium.STILL_WATER : WetEscapeMedium.FLOW;
+    }
+
+    BlockHitResult wetEscapeFloor(Vec3d belowTop) {
+        if (!hasView() || !inView(belowTop) || belowTop.squaredDistanceTo(eye) > 14.44) return null;
+        BlockHitResult hit = visibleHit(belowTop, Ray.WET_TERRAIN);
+        return hit != null && hit.getSide() == Direction.UP
+            && Math.abs(hit.getPos().y - hit.getBlockPos().getY() - 1) <= 0.025
+            && fullStepSupport(hit) && !(client.world.getBlockState(hit.getBlockPos()).getBlock() instanceof FallingBlock)
+            ? hit : null;
+    }
+
+    /** Collision is a veto on an already seen lane, not a source of candidate terrain. */
+    boolean wetEscapeSweep(Vec3d landing, double rise, double driftX, double driftZ) {
+        if (!hasView() || lavaEmergency) return false;
+        var player = client.player;
+        Vec3d feet = player.getPos();
+        double dx = landing.x - feet.x, dz = landing.z - feet.z;
+        double distance = Math.hypot(dx, dz);
+        if (distance > 2.65 || rise > 1.04 || player.hasVehicle() || player.isInLava()
+                || player.isOnFire() || hazards.lavaNear(player.getBoundingBox(), 0.27, tick)
+                || hazards.lavaRisk(player.getBoundingBox(), heading(dx, dz), distance + 0.35,
+                    Math.max(0, rise), false, tick) > 0) return false;
+        // Sample the diagonal sweep instead of accepting a centerline through a narrow corner.
+        // Don't inflate the player's width into a wall already touching one shoulder.
+        Box body = player.getBoundingBox().contract(1e-5, 0, 1e-5);
+        if (rise > 0.045 && !client.world.isSpaceEmpty(player, body.stretch(0, rise, 0))) return false;
+        Box raised = body.offset(0, Math.max(0, rise), 0);
+        int samples = Math.max(1, (int) Math.ceil(distance / 0.20));
+        for (int i = 1; i <= samples; i++) {
+            double fraction = (double) i / samples;
+            Box sweep = raised.offset(dx * fraction, 0, dz * fraction);
+            if (!client.world.isSpaceEmpty(player, sweep)
+                    || (driftX != 0 || driftZ != 0)
+                        && !client.world.isSpaceEmpty(player, sweep.offset(driftX * fraction, 0, driftZ * fraction)))
+                return false;
+        }
+        return true;
+    }
+
+    /** Stay level in a low passage. Jump only to breathe or climb a proved lip. */
+    void driveWetEscape(boolean climb) {
+        walkDown(false);
+        wetEscapeWalk = true;
+        if (climb) jump();
     }
 
     /** Tests a lit point seen through transparent water, never through opaque terrain or lava. */

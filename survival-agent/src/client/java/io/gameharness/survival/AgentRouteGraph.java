@@ -40,7 +40,7 @@ final class AgentRouteGraph {
     private int returnTopology = -1, segmentTopology;
     private boolean saturated;
 
-    private int lastStance, target, cursor, length;
+    private int lastStance, target, cursor, length, selectedBearing = -1;
     private Work work;
     private int closedAt, closedRevision = -1;
     private Status closedStatus, status = Status.NO_ROUTE;
@@ -170,6 +170,9 @@ final class AgentRouteGraph {
         if (!reached[node] || (openViews[node] & bit) == 0) return false;
         openViews[node] &= ~bit;
         revision++;
+        // A performed look completes just that job, not every pending look from this footing.
+        if (node == target && node == lastStance && status == Status.FRONTIER && bearing == selectedBearing)
+            cancelPlan();
         return true;
     }
 
@@ -183,6 +186,7 @@ final class AgentRouteGraph {
 
     int nodeCount() { return count; }
     int edgeCount() { return edges; }
+    int topologyEpoch() { return topology; }
     boolean contains(long cell) { return find(cell) != 0; }
     boolean saturated() { return saturated; }
 
@@ -213,7 +217,7 @@ final class AgentRouteGraph {
         if (target != 0) {
             if (here == target) {
                 if (work == Work.GOAL && goals[here] > 0) return status = Status.GOAL;
-                if (work == Work.FRONTIER && openViews[here] != 0) return status = Status.FRONTIER;
+                if (work == Work.FRONTIER && openViews[here] != 0) return status = selectView(here);
                 clearTarget();
             } else if (homeward[target] == 0 || work == Work.GOAL && goals[target] == 0
                 || work == Work.FRONTIER && openViews[target] == 0
@@ -229,7 +233,15 @@ final class AgentRouteGraph {
     }
 
     long next() {
-        return status == Status.MOVE && segmentTopology == topology ? cells[segment[cursor]] : NO_CELL;
+        return segmentCell(0);
+    }
+
+    int segmentSize() {
+        return status == Status.MOVE && segmentTopology == topology ? length - cursor : 0;
+    }
+
+    long segmentCell(int offset) {
+        return offset >= 0 && offset < segmentSize() ? cells[segment[cursor + offset]] : NO_CELL;
     }
 
     long endpoint() {
@@ -237,8 +249,8 @@ final class AgentRouteGraph {
     }
 
     int frontierBearing() {
-        return status == Status.FRONTIER && openViews[target] != 0
-            ? Integer.numberOfTrailingZeros(openViews[target]) : -1;
+        return status == Status.FRONTIER && (openViews[target] & viewBit(selectedBearing)) != 0
+            ? selectedBearing : -1;
     }
 
     /** Whether the last completed return search can certify this footing. */
@@ -311,7 +323,9 @@ final class AgentRouteGraph {
         if (goals[node] != goals[best]) return goals[node] > goals[best];
         int depth = y(cells[node]) - y(cells[best]);
         if (depth != 0) return depth < 0;
-        if ((openViews[node] != 0) != (openViews[best] != 0)) return openViews[node] != 0;
+        boolean hasView = openViews[node] != 0;
+        if (hasView != (openViews[best] != 0)) return hasView;
+        if (goals[node] == 0 && hasView && reached[node] != reached[best]) return !reached[node];
         if (distance[node] != distance[best]) return distance[node] < distance[best];
         return cells[node] < cells[best];
     }
@@ -321,7 +335,8 @@ final class AgentRouteGraph {
         work = purpose;
         cursor = 0;
         length = Math.min(MAX_SEGMENT, distance[end]);
-        if (here == end) return purpose == Work.GOAL ? Status.GOAL : Status.FRONTIER;
+        selectedBearing = -1;
+        if (here == end) return purpose == Work.GOAL ? Status.GOAL : selectView(here);
         int node = end;
         while (distance[node] > length) node = parent[node];
         for (int step = length - 1; step >= 0; step--) {
@@ -330,6 +345,12 @@ final class AgentRouteGraph {
         }
         segmentTopology = topology;
         return Status.MOVE;
+    }
+
+    private Status selectView(int node) {
+        if ((openViews[node] & viewBit(selectedBearing)) == 0)
+            selectedBearing = Integer.numberOfTrailingZeros(openViews[node]);
+        return Status.FRONTIER;
     }
 
     private boolean safeSuffix(int here) {
@@ -349,6 +370,7 @@ final class AgentRouteGraph {
 
     private void clearTarget() {
         target = cursor = length = 0;
+        selectedBearing = -1;
         work = null;
     }
 

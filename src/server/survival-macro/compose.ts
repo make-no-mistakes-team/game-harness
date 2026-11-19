@@ -1,13 +1,15 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createMacroTrials, MACRO_TRIAL_ADAPTER_VERSION, MACRO_TRIAL_VERBS } from "../../../survival-agent/macro-trial.ts";
-import { TERRA_MODEL_ID } from "../../shared/survival-agent-ui.ts";
+import type { ProviderPendingSpan } from "../../../survival-agent/pause-evidence.ts";
+import { hasConfirmedTerraEffect, TERRA_MODEL_ID, type SurvivalAgentGoal } from "../../shared/survival-agent-ui.ts";
+import { PRE_SPAWN_GOAL_ONLY } from "./bootstrap.ts";
 import { SurvivalMacroController } from "./controller.ts";
 import { createNativeGapReview } from "./gap-review.ts";
 import {
-  MACRO_CAPABILITIES_VERSION, MACRO_MAX_PLANNING_IDLE_MS, readMacroObservation,
+  MACRO_CAPABILITIES_VERSION, MACRO_LOOKAHEAD_MAX_CRACK, MACRO_MAX_PLANNING_IDLE_MS, readMacroObservation,
   type MacroBasis, type MacroFrame, type MacroInference, type MacroObservation,
 } from "./protocol.ts";
 import { MACRO_AUTOMATIC_SKILL_VERBS, SurvivalMacroSkills } from "./skills.ts";
@@ -27,11 +29,14 @@ export interface TrustedSurvivalDisplay {
 }
 
 export function declareTerraStrategy(
-  options: { maxRequests: number; task?: string }, wallMs: number, lane?: { preparedDiagnostic: true },
+  options: { maxRequests: number; task?: string; startup?: "allow" | "off" }, wallMs: number,
+  lane?: { preparedDiagnostic: true },
 ) {
   const preparedDiagnostic = lane?.preparedDiagnostic === true;
   return {
     strategy: "terra" as const, model: TERRA_MODEL_ID, task: options.task ?? null, preparedDiagnostic,
+    startup: preparedDiagnostic ? "off" as const : options.startup ?? "allow",
+    workMode: preparedDiagnostic ? null : options.task ? "constrained" : "preset",
     limits: { maxRequests: options.maxRequests, maxRuntimeMs: wallMs, requestTimeoutMs: REQUEST_TIMEOUT_MS,
       planningIdleMs: MACRO_MAX_PLANNING_IDLE_MS },
     frame: { source: "verified-game-display", format: "image/jpeg", maxBytes: FRAME_BYTES, timeoutMs: FRAME_TIMEOUT_MS },
@@ -41,6 +46,7 @@ export function declareTerraStrategy(
 
 interface TerraAttemptOptions {
   readonly declaration: ReturnType<typeof declareTerraStrategy>;
+  readonly firstPlanGoal?: SurvivalAgentGoal;
   readonly dir: string;
   readonly projectRoot: string;
   readonly authDirectory: string;
@@ -101,11 +107,13 @@ function oneJpeg({ dir, display, width, height, ffmpeg }: TerraAttemptOptions, s
 
 /** Owns one admitted Terra lane. The deterministic runner never calls this module. */
 export function composeTerraSurvival(options: TerraAttemptOptions) {
-  const { actorJarSha256, declaration, dir, display, projectRoot, signal, onProviderDispatch, onProviderSettled } = options;
+  const { actorJarSha256, declaration, dir, display, firstPlanGoal, projectRoot, signal, onProviderDispatch, onProviderSettled } = options;
   if (!declaration.preparedDiagnostic && (onProviderDispatch || onProviderSettled))
     throw new Error("Only a prepared diagnostic can observe Terra provider timing.");
   if (declaration.preparedDiagnostic && path.dirname(dir) !== path.join(projectRoot, "local/survival-agent/diagnostic-runs"))
     throw new Error("Prepared Terra strategy requires a diagnostic run directory.");
+  if (firstPlanGoal !== undefined && (declaration.preparedDiagnostic || declaration.startup !== "allow"))
+    throw new Error("This Terra attempt did not admit goal-only startup inference.");
   const run = path.basename(dir);
   const macroDir = path.join(dir, "macro");
   let controller: SurvivalMacroController | undefined;
@@ -113,9 +121,27 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
   let terra: TerraStrategist | undefined;
   let trials: ReturnType<typeof createMacroTrials> | undefined;
   let admission: "not_opened" | "unavailable" | "admitted" = "not_opened";
+  let authLost = false;
   let displayLost = false;
+  let closing = false;
   let drain: "not_started" | "closed" | "failed" = "not_started";
   let stopped: Promise<void> | undefined;
+  const providerSpans: ProviderPendingSpan[] = [];
+  let incompleteProviderSpans = false;
+
+  function rememberDispatch(osNs: bigint, stage: NonNullable<ProviderPendingSpan["stage"]>) {
+    if (providerSpans.at(-1)?.endNs === null || providerSpans.length >= declaration.limits.maxRequests)
+      incompleteProviderSpans = true;
+    else providerSpans.push({ startNs: osNs, endNs: null, terminalObserved: false, stage });
+  }
+
+  function rememberSettlement(osNs: bigint, terminalOsNs?: bigint) {
+    const pending = providerSpans.at(-1);
+    if (!pending || pending.endNs !== null) incompleteProviderSpans = true;
+    else providerSpans[providerSpans.length - 1] = {
+      startNs: pending.startNs, endNs: terminalOsNs ?? osNs, terminalObserved: terminalOsNs !== undefined, stage: pending.stage,
+    };
+  }
 
   function assertDisplay() {
     signal.throwIfAborted();
@@ -125,11 +151,27 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     throw new Error("The run no longer owns its private Minecraft display.");
   }
 
-  async function assertDispatch(basis: MacroBasis) {
+  async function assertDispatch(basis: MacroBasis, lookahead?: MacroObservation, work?: MacroObservation) {
     const fresh = await readMacroObservation(macroDir);
     assertDisplay();
-    return fresh?.run === basis.run && fresh.life === basis.life && fresh.epoch === basis.epoch &&
-      fresh.tick >= basis.tick && fresh.health > 0;
+    return fresh?.run === basis.run && fresh.life === basis.life && (work ? fresh.epoch >= basis.epoch : fresh.epoch === basis.epoch) &&
+      fresh.tick >= basis.tick && fresh.health > 0 &&
+      (!work || (fresh.goal === work.goal && fresh.health >= work.health && fresh.safety?.clear === true &&
+        fresh.safety.revision === work.safety?.revision)) &&
+      (!lookahead || (fresh.goal === lookahead.goal && fresh.health >= lookahead.health && fresh.safety?.clear === true &&
+        fresh.safety.revision === lookahead.safety?.revision && !!fresh.working &&
+        fresh.working.intentId === lookahead.working?.intentId && fresh.working.crack <= MACRO_LOOKAHEAD_MAX_CRACK));
+  }
+
+  async function assertFirstPlanDispatch() {
+    // An existing native publication (even one not readable right now)
+    // ends the no-observation stage. No bytes are read or sent on this path.
+    const absent = await lstat(path.join(macroDir, "observation.json")).then(() => false, error => {
+      if (error?.code === "ENOENT") return true;
+      throw error;
+    });
+    assertDisplay();
+    return absent && !closing;
   }
 
   async function samePublishedBasis(observation: MacroObservation) {
@@ -179,24 +221,34 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
       terra = await openTerraStrategist({
         strategy: "terra", authDirectory: options.authDirectory, runId: run, signal,
         requestTimeoutMs: declaration.limits.requestTimeoutMs, assertDispatch,
-        onProviderDispatch: onProviderDispatch && (({ basis, monotonicMs, wallMs }) => {
-          if (observedDispatch) return;
+        ...(firstPlanGoal !== undefined ? {
+          assertFirstPlanDispatch,
+          onFirstPlanDispatch: ({ osNs }) => rememberDispatch(osNs, PRE_SPAWN_GOAL_ONLY),
+          onFirstPlanSettled: ({ osNs, providerTerminalOsNs }) => rememberSettlement(osNs, providerTerminalOsNs),
+        } : {}),
+        onProviderDispatch: ({ basis, monotonicMs, wallMs, osNs }) => {
+          rememberDispatch(osNs, "live_observation");
+          if (!onProviderDispatch || observedDispatch) return;
           observedDispatch = true;
           onProviderDispatch({ basis, startedAtMs: monotonicMs, wallMs });
-        }),
-        onProviderSettled: onProviderSettled && (({
-          basis, monotonicMs, wallMs, outcome, providerTerminalMonotonicMs, providerTerminalWallMs,
+        },
+        onProviderSettled: ({
+          basis, monotonicMs, wallMs, osNs, outcome, providerTerminalMonotonicMs, providerTerminalWallMs, providerTerminalOsNs,
         }) => {
-          if (observedSettlement) return;
+          rememberSettlement(osNs, providerTerminalOsNs);
+          if (!onProviderSettled || observedSettlement) return;
           observedSettlement = true;
           onProviderSettled({
             basis, settledAtMs: monotonicMs, wallMs, outcome,
             ...(providerTerminalMonotonicMs !== undefined && providerTerminalWallMs !== undefined
               ? { providerTerminalAtMs: providerTerminalMonotonicMs, providerTerminalWallMs } : {}),
           });
-        }),
+        },
       });
       admission = "admitted";
+      const observeRevocation = () => { if (!closing && !signal.aborted) authLost = true; };
+      terra.authoritySignal.addEventListener("abort", observeRevocation, { once: true });
+      if (terra.authoritySignal.aborted) observeRevocation();
     } catch {
       signal.throwIfAborted();
       admission = "unavailable";
@@ -220,14 +272,19 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
       await createNativeGapReview({ runDir: dir, projectRoot, actorJarSha256, capabilityVersion: MACRO_CAPABILITIES_VERSION });
     controller = new SurvivalMacroController({
       runDir: dir, run, strategy: "terra", strategist: terra.infer, skills, trial: trials,
-      nativeReview,
-      objective: declaration.task ?? undefined, limits: declaration.limits, signal, frame: capture,
+      nativeReview, durableWork: declaration.workMode !== null,
+      objective: declaration.task ?? undefined, limits: declaration.limits,
+      ...(firstPlanGoal !== undefined ? {
+        firstPlan: { request: { goal: firstPlanGoal, objective: declaration.task?.trim() }, infer: terra.firstPlan },
+      } : {}),
+      signal: AbortSignal.any([signal, terra.authoritySignal]), frame: capture,
       confirmNativeExit: options.confirmNativeExit,
     });
     await controller.start();
   }
 
   async function close() {
+    closing = true;
     try {
       const settled = await Promise.allSettled([controller?.stop(), terra?.close()]);
       trials?.assertDrained();
@@ -246,12 +303,13 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     const status = controller?.status() ?? null;
     const providerOutcome = status?.lastProviderOutcome;
     const result = drain === "failed" ? "cleanup_failed" : displayLost ? "display_lost" :
-      admission === "unavailable" ? "provider_unavailable" : status?.state === "faulted" ? "protocol_fault" :
-      status?.completedReceipts ? "native_effect_completed" :
+      admission === "unavailable" || authLost ? "provider_unavailable" : status?.state === "faulted" ? "protocol_fault" :
+      hasConfirmedTerraEffect(status) ? "native_effect_completed" :
       providerOutcome === "refused" || providerOutcome === "provider_error" || providerOutcome === "provider_unavailable"
         ? providerOutcome : status?.budget ? "budget_limited" : "no_completed_effect";
-    return { ...declaration, admission, drain, outcome: result, status };
+    return { ...declaration, admission, authLost, drain, outcome: result, status };
   }
 
-  return { start, stop, outcome, assertDisplay };
+  const providerTimeline = () => admission === "admitted" && !incompleteProviderSpans ? providerSpans : undefined;
+  return { start, stop, outcome, assertDisplay, providerTimeline };
 }

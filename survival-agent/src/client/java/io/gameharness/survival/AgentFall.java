@@ -9,6 +9,7 @@ import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.entity.vehicle.AbstractBoatEntity;
 import net.minecraft.item.BoatItem;
+import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.tag.BlockTags;
@@ -88,7 +89,7 @@ final class AgentFall {
     int boatSuccesses() { return boatSuccesses; }
 
     /** Called after body.begin(), after danger priority and before routine progression. */
-    boolean step() {
+    boolean step(Predicate<ItemStack> spend) {
         if (client.player != player || client.world != world) {
             player = client.player;
             world = client.world;
@@ -119,15 +120,15 @@ final class AgentFall {
         }
         if (player.isOnGround() || player.isTouchingWater() || player.hasVehicle()) apex = player.getY();
         else if (Double.isFinite(apex)) apex = Math.max(apex, player.getY());
-        if (boatPhase != Boat.NONE && boatStep()) return true;
-        return waterStep();
+        if (boatPhase != Boat.NONE && boatStep(spend)) return true;
+        return waterStep(spend);
     }
 
-    private boolean waterStep() {
+    private boolean waterStep(Predicate<ItemStack> spend) {
         if (!world.getRegistryKey().equals(World.OVERWORLD) || world.getDimension().ultrawarm()
             || player.hasVehicle() || player.isInLava() || player.isClimbing()) return stopWater();
         if (water == Water.CONTACT) return checkWaterLanding();
-        if (water == Water.RECLAIM) return reclaimWater();
+        if (water == Water.RECLAIM) return reclaimWater(spend);
         if (player.isOnGround() || player.isTouchingWater() || client.currentScreen != null || hands.busy())
             return stopWater();
 
@@ -138,9 +139,9 @@ final class AgentFall {
             || fallen + -motion.y * 4 < SAFE_FALL + 0.32) return stopWater();
         if (water != Water.AIM) {
             var inventory = player.getInventory();
-            waterSlot = player.getMainHandStack().isOf(Items.WATER_BUCKET) ? inventory.selectedSlot : -1;
+            waterSlot = usable(player.getMainHandStack(), Items.WATER_BUCKET, spend) ? inventory.selectedSlot : -1;
             for (int i = 0; waterSlot < 0 && i < PlayerInventory.HOTBAR_SIZE; i++) {
-                if (inventory.getStack(i).isOf(Items.WATER_BUCKET) && !client.options.hotbarKeys[i].isUnbound()) {
+                if (usable(inventory.getStack(i), Items.WATER_BUCKET, spend) && !client.options.hotbarKeys[i].isUnbound()) {
                     waterSlot = i;
                 }
             }
@@ -148,7 +149,7 @@ final class AgentFall {
             water = Water.AIM;
             lastHotbar = tick - 4;
         }
-        if (!player.getInventory().getStack(waterSlot).isOf(Items.WATER_BUCKET)) return stopWater();
+        if (!usable(player.getInventory().getStack(waterSlot), Items.WATER_BUCKET, spend)) return stopWater();
         if (player.getInventory().selectedSlot != waterSlot && tick - lastHotbar >= 4) {
             if (!body.tapHotbar(waterSlot)) return stopWater();
             lastHotbar = tick;
@@ -225,10 +226,11 @@ final class AgentFall {
         return true;
     }
 
-    private boolean reclaimWater() {
+    private boolean reclaimWater(Predicate<ItemStack> spend) {
         if (player.getInventory().getStack(waterSlot).isOf(Items.WATER_BUCKET)) return stopWater();
         if (tick - waterSince > 15 || !player.isOnGround()
-            || !withinSquare(player.getPos(), Vec3d.ofCenter(source), 0.80)) return stopWater();
+            || !withinSquare(player.getPos(), Vec3d.ofCenter(source), 0.80)
+            || !usable(player.getMainHandStack(), Items.BUCKET, spend)) return stopWater();
         body.aimDuringFall(Vec3d.ofCenter(source));
         if (!reclaimed && body.tapFallSource(source)) reclaimed = true;
         return true;
@@ -238,6 +240,10 @@ final class AgentFall {
         if (water != Water.NONE) body.stopFallAim();
         water = Water.NONE;
         return false;
+    }
+
+    private static boolean usable(ItemStack stack, Item item, Predicate<ItemStack> spend) {
+        return stack.isOf(item) && (spend == null || spend.test(stack));
     }
 
     /**
@@ -280,7 +286,7 @@ final class AgentFall {
         return true;
     }
 
-    private boolean boatStep() {
+    private boolean boatStep(Predicate<ItemStack> spend) {
         if (player.getVehicle() instanceof AbstractBoatEntity mounted && mounted == boat) {
             body.holdBoat(boat);
             if (boatPhase == Boat.BOARD) {
@@ -341,7 +347,9 @@ final class AgentFall {
             case PLACE -> {
                 status = "boat: equipping it while standing on the witnessed takeoff";
                 body.aimFixed(launch);
-                if (hands.equipForUse(BOAT) && body.tapFallBlock(BlockPos.ofFloored(launch.add(0, -0.03, 0)),
+                Predicate<ItemStack> permitted = spend == null ? BOAT : stack -> BOAT.test(stack) && spend.test(stack);
+                if (spend != null && hands.count(permitted) == 0) return finishBoat("boat: all usable boats are reserved");
+                if (hands.equipForUse(permitted) && body.tapFallBlock(BlockPos.ofFloored(launch.add(0, -0.03, 0)),
                         player.getMainHandStack().getItem(), launch, 0.17)) {
                     boatSlot = player.getInventory().selectedSlot;
                     nextBoat(Boat.BOARD);

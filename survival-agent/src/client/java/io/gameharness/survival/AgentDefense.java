@@ -1,6 +1,8 @@
 package io.gameharness.survival;
 
 import java.util.function.Predicate;
+import net.minecraft.block.Block;
+import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.AttributeModifiersComponent;
@@ -9,10 +11,15 @@ import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.ai.RangedAttackMob;
 import net.minecraft.entity.attribute.EntityAttributes;
 import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
@@ -22,6 +29,7 @@ final class AgentDefense {
     private static final int COMBAT_VIEW_GRACE = 3;
     private static final long ZOMBIE_LOOK_NANOS = 1_200_000_000L;
     private static final float ZOMBIE_LOOK_PITCH = 10;
+    private static final long RANGED_ALERT_NANOS = 2_400_000_000L;
     private static final Predicate<ItemStack> SHIELD = stack -> stack.isOf(Items.SHIELD);
     private static final Predicate<ItemStack> INGOT = stack -> stack.isOf(Items.IRON_INGOT);
     private static final Predicate<ItemStack> STONE = stack -> stack.isIn(ItemTags.STONE_TOOL_MATERIALS);
@@ -78,6 +86,14 @@ final class AgentDefense {
     private int zombieLookAfter;
     private int zombieLookAligned;
     private float zombieLookYaw;
+    private boolean rangedAudible, rangedUnderFire, rangedCoverTried;
+    private boolean coverReceipt;
+    private float rangedYaw, rangedPitch;
+    private long rangedUntil;
+    private int rangedSelectAfter;
+    private BlockPos rangedCover;
+    private Block rangedCoverBlock;
+    private int rangedCoverUntil, rangedCoverSlot, rangedCoverCount;
 
     AgentDefense(MinecraftClient client, AgentBody body, AgentHands hands) {
         this.client = client;
@@ -97,6 +113,157 @@ final class AgentDefense {
     static boolean criticallyHurt(LivingEntity player) { return player.getHealth() <= 7; }
 
     void stopZombieLook() { zombieLook = null; }
+
+    boolean rangedActive() { return rangedUntil != 0 && System.nanoTime() - rangedUntil < 0; }
+
+    boolean observeRanged(AgentEars ears, LivingEntity visible, boolean hurt) {
+        var cue = ears.takeFreshRangedCue();
+        boolean active = rangedActive();
+        Vec3d seen = hurt && visible instanceof RangedAttackMob
+                && (visible.isHolding(Items.BOW) || visible.isHolding(Items.CROSSBOW)) ? body.threatPoint() : null;
+        if (cue == null && seen == null) {
+            if (active && hurt) rangedUnderFire = true;
+            return active;
+        }
+        if (!active) {
+            rangedAudible = cue != null;
+            rangedUnderFire = hurt;
+            rangedCoverTried = false;
+            rangedCover = null;
+        } else {
+            rangedUnderFire |= hurt || cue != null
+                && Math.abs(MathHelper.wrapDegrees(cue.yaw() - rangedYaw)) <= 45;
+        }
+        if (seen != null) {
+            Vec3d direction = seen.subtract(client.player.getEyePos());
+            rangedYaw = yaw(direction);
+            rangedPitch = (float) Math.toDegrees(Math.atan2(-direction.y, direction.horizontalLength()));
+        } else if (cue != null && (!active || hurt || Math.abs(MathHelper.wrapDegrees(cue.yaw() - rangedYaw)) <= 45)) {
+            rangedYaw = cue.yaw();
+            rangedPitch = cue.pitch();
+        } else {
+            // An opposing audio cue alone does not spin the player or pin this alert.
+            return active;
+        }
+        rangedUntil = System.nanoTime() + RANGED_ALERT_NANOS;
+        return true;
+    }
+
+    boolean rangedStep(int tick, Predicate<BlockPos> protectsRoute, Predicate<ItemStack> spend) {
+        coverReceipt = false;
+        markDanger(tick);
+        forgetContact();
+        body.prioritizeMovement();
+        var player = client.player;
+        status = rangedAudible ? "bracing after a nearby skeleton shot" : "bracing after damage near a visible archer";
+        // The fall controller has already had priority. Never add a movement key to the impulse.
+        if (!player.isOnGround() || player.isTouchingWater() || player.hasVehicle() || client.currentScreen != null)
+            return false;
+        body.sneak();
+        body.turnUrgent(rangedYaw, MathHelper.clamp(rangedPitch, -55, 65));
+        ItemStack main = player.getMainHandStack();
+        boolean offhand = SHIELD.test(player.getOffHandStack()) && canWear(player.getOffHandStack(), spend);
+        if (SHIELD.test(main) && canWear(main, spend) || offhand && AgentBody.shieldSafeMainHand(main)
+                && !(main.isIn(ItemTags.AXES) && body.shieldStartWouldUseBlock())) {
+            body.guardRangedBearing(rangedYaw);
+            if (player.isBlocking() && SHIELD.test(player.getActiveItem())) status = "blocking toward ranged fire";
+            return false;
+        }
+        if (player.isUsingItem() || !body.hasRecentView()) return false;
+        var inventory = player.getInventory();
+        int safeHand = -1, coverSlot = -1;
+        boolean heldBack = SHIELD.test(player.getOffHandStack()) && !offhand;
+        for (int slot = 0; slot < PlayerInventory.HOTBAR_SIZE; slot++) {
+            if (slot != inventory.selectedSlot && client.options.hotbarKeys[slot].isUnbound()) continue;
+            ItemStack stack = inventory.getStack(slot);
+            if (SHIELD.test(stack)) {
+                if (canWear(stack, spend)) {
+                    safeHand = slot;
+                    break;
+                }
+                heldBack = true;
+            }
+            if (offhand && safeHand < 0 && (stack.isEmpty() || stack.isIn(ItemTags.SWORDS)
+                    || stack.isIn(ItemTags.PICKAXES))) safeHand = slot;
+            if (coverMaterial(stack)) {
+                if (spend != null && !spend.test(stack)) heldBack = true;
+                else if (coverSlot < 0 || slot == inventory.selectedSlot) coverSlot = slot;
+            }
+        }
+        if (safeHand >= 0) {
+            selectRangedSlot(safeHand, tick);
+            return false;
+        }
+        boolean cover = !offhand && rangedUnderFire && tryRangedCover(tick, coverSlot, protectsRoute, spend);
+        return heldBack && !cover;
+    }
+
+    float rangedRetreatYaw() { return rangedYaw + 180; }
+    boolean confirmedCover() { return coverReceipt; }
+
+    private boolean tryRangedCover(int tick, int slot, Predicate<BlockPos> protectsRoute, Predicate<ItemStack> spend) {
+        var player = client.player;
+        if (rangedCover != null) {
+            Vec3d point = Vec3d.ofCenter(rangedCover);
+            BlockHitResult receipt = body.perceive(point, 3).orElse(null);
+            if (receipt != null && receipt.getBlockPos().equals(rangedCover)
+                    && client.world.getBlockState(receipt.getBlockPos()).isOf(rangedCoverBlock)
+                    && player.getInventory().getStack(rangedCoverSlot).getCount() < rangedCoverCount) {
+                status = "confirmed a placed block of ranged cover";
+                coverReceipt = true;
+                rangedCover = null;
+            } else if (tick < rangedCoverUntil) {
+                body.aimUrgent(point);
+                status = "waiting for the cover placement to settle";
+            } else rangedCover = null;
+            return coverReceipt || rangedCover != null;
+        }
+        // A single low block can only intercept a shot arriving from level or below.
+        if (rangedCoverTried || slot < 0 || rangedPitch < 0 || rangedPitch > 60
+                || player.getVelocity().horizontalLengthSquared() > 0.0064) return false;
+        var direction = Direction.fromHorizontalDegrees(rangedYaw);
+        if (Math.abs(MathHelper.wrapDegrees(direction.getPositiveHorizontalDegrees() - rangedYaw)) > 23) return false;
+        BlockPos cover = player.getBlockPos().offset(direction);
+        if (protectsRoute.test(cover) || player.getBoundingBox().expand(0.08).intersects(new Box(cover))) return false;
+        Vec3d point = Vec3d.ofBottomCenter(cover).add(0, -0.035, 0);
+        BlockHitResult floor = body.terrain(point, player.getEyePos().distanceTo(point) + 0.08).orElse(null);
+        if (floor == null || !floor.getBlockPos().equals(cover.down()) || floor.getSide() != Direction.UP
+                || Math.abs(floor.getPos().y - cover.getY()) > 0.05
+                || body.dryRouteClear(Vec3d.ofCenter(cover)) != AgentBody.DryRouteSample.CLEAR) return false;
+        var support = client.world.getBlockState(floor.getBlockPos());
+        if (support.isOf(Blocks.MAGMA_BLOCK) || !support.getFluidState().isEmpty()
+                || !Block.isShapeFullCube(support.getCollisionShape(client.world, floor.getBlockPos()))) return false;
+        ItemStack selected = player.getMainHandStack();
+        boolean equipped = coverMaterial(selected) && (spend == null || spend.test(selected));
+        if (!equipped) selectRangedSlot(slot, tick);
+        status = "aiming at a witnessed face for ranged cover";
+        var preparation = !equipped ? AgentBody.Preparation.EQUIPMENT
+            : player.isSneaking() ? AgentBody.Preparation.READY : AgentBody.Preparation.STANCE;
+        if (body.useContact(floor, AgentBody.Contact.PLACE, preparation)) {
+            rangedCoverTried = true;
+            rangedCover = cover;
+            rangedCoverBlock = ((BlockItem) selected.getItem()).getBlock();
+            rangedCoverUntil = tick + 10;
+            rangedCoverSlot = player.getInventory().selectedSlot;
+            rangedCoverCount = player.getMainHandStack().getCount();
+            status = "placing one block between the ledge and ranged fire";
+        }
+        return true;
+    }
+
+    private void selectRangedSlot(int slot, int tick) {
+        if (slot != client.player.getInventory().selectedSlot && tick >= rangedSelectAfter && body.tapHotbar(slot))
+            rangedSelectAfter = tick + 4;
+    }
+
+    private static boolean coverMaterial(ItemStack stack) {
+        return stack.isOf(Items.COBBLESTONE) || stack.isOf(Items.COBBLED_DEEPSLATE)
+            || stack.isOf(Items.STONE) || stack.isOf(Items.DIRT);
+    }
+
+    private static float yaw(Vec3d direction) {
+        return (float) Math.toDegrees(Math.atan2(-direction.x, direction.z));
+    }
 
     boolean checkZombieCue(AgentEars ears, int tick, boolean digging) {
         var player = client.player;
@@ -273,7 +440,7 @@ final class AgentDefense {
     }
 
     /** True if Progress should try a visible, terrain-checked approach this tick. */
-    boolean fight(LivingEntity threat, int tick) {
+    boolean fight(LivingEntity threat, int tick, Predicate<ItemStack> spend) {
         markDanger(tick);
         var player = client.player;
         if (lastThreat != threat || tick - lastEngaged > 3) engagementStarted = tick;
@@ -283,13 +450,14 @@ final class AgentDefense {
         aim = body.threatPoint();
         face();
 
-        boolean mainShield = SHIELD.test(player.getMainHandStack());
-        boolean offhand = SHIELD.test(player.getOffHandStack());
+        boolean mainShield = SHIELD.test(player.getMainHandStack()) && canWear(player.getMainHandStack(), spend);
+        boolean offhand = SHIELD.test(player.getOffHandStack()) && canWear(player.getOffHandStack(), spend);
         if (mainShield && !offhand && swapShield(tick)) return false;
-        if (!mainShield || offhand) selectWeapon(offhand);
+        if (!mainShield || offhand) selectWeapon(offhand, spend);
 
         if (body.strikeTarget(threat)) {
-            if (!combatSelecting() && player.getAttackCooldownProgress(0.5f) >= 0.9f) {
+            if (!combatSelecting() && canWear(player.getMainHandStack(), spend)
+                    && player.getAttackCooldownProgress(0.5f) >= 0.9f) {
                 // Vanilla discards attack edges in the tick that releases item use.
                 if (player.isUsingItem()) status = "releasing item use for a timed strike";
                 else {
@@ -307,6 +475,17 @@ final class AgentDefense {
             || distance > 4.4 * 4.4 || tick - engagementStarted >= 14);
     }
 
+    boolean reserveRequiresRetreat(Predicate<ItemStack> spend) {
+        if (spend == null) return false;
+        var p = client.player;
+        return !canWear(p.getMainHandStack(), spend) && (!SHIELD.test(p.getOffHandStack())
+            || !canWear(p.getOffHandStack(), spend)) && bestWeapon(PlayerInventory.HOTBAR_SIZE, true, spend) < 0;
+    }
+
+    private static boolean canWear(ItemStack stack, Predicate<ItemStack> spend) {
+        return spend == null || !stack.isDamageable() || spend.test(stack);
+    }
+
     void face() {
         body.aimUrgent(aim);
     }
@@ -319,13 +498,13 @@ final class AgentDefense {
             : shield ? "facing a visible hostile with a shield" : "facing a visible hostile";
     }
 
-    private void selectWeapon(boolean shield) {
+    private void selectWeapon(boolean shield, Predicate<ItemStack> spend) {
         if (hands.busy()) return;
         var player = client.player;
         var inventory = player.getInventory();
         ItemStack main = inventory.getMainHandStack();
         boolean allowAxe = !shield || player.isUsingItem() || !body.shieldStartWouldUseBlock();
-        int target = bestWeapon(PlayerInventory.HOTBAR_SIZE, allowAxe);
+        int target = bestWeapon(PlayerInventory.HOTBAR_SIZE, allowAxe, spend);
         if (target < 0 && shield && (!AgentBody.shieldSafeMainHand(main) || !allowAxe && main.isIn(ItemTags.AXES))) {
             for (int slot = 0; slot < PlayerInventory.HOTBAR_SIZE; slot++) {
                 if (client.options.hotbarKeys[slot].isUnbound()) continue;
@@ -344,6 +523,10 @@ final class AgentDefense {
     }
 
     private int bestWeapon(int limit, boolean allowAxe) {
+        return bestWeapon(limit, allowAxe, null);
+    }
+
+    private int bestWeapon(int limit, boolean allowAxe, Predicate<ItemStack> spend) {
         var inventory = client.player.getInventory();
         int best = -1;
         double score = 0;
@@ -351,6 +534,7 @@ final class AgentDefense {
             if (slot < PlayerInventory.HOTBAR_SIZE && slot != inventory.selectedSlot
                     && client.options.hotbarKeys[slot].isUnbound()) continue;
             ItemStack stack = inventory.getStack(slot);
+            if (!canWear(stack, spend)) continue;
             boolean sword = stack.isIn(ItemTags.SWORDS);
             if (!sword && (!allowAxe || !stack.isIn(ItemTags.AXES))) continue;
             var entries = stack.getOrDefault(DataComponentTypes.ATTRIBUTE_MODIFIERS, AttributeModifiersComponent.DEFAULT)

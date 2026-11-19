@@ -3,6 +3,7 @@ package io.gameharness.survival;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import io.gameharness.survival.mixin.AgentHandledScreenAccess;
+import io.gameharness.survival.mixin.AgentMiningAccess;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -12,6 +13,9 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFileAttributes;
+import java.nio.file.attribute.PosixFilePermission;
+import java.util.Arrays;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import net.fabricmc.api.ClientModInitializer;
@@ -41,6 +45,8 @@ import net.minecraft.world.GameMode;
 public final class AgentClient implements ClientModInitializer {
     private static final long CONTROL_TIMEOUT = 15_000_000_000L;
     private static final long RESPAWN_TIMEOUT = 30_000_000_000L;
+    private static final Set<PosixFilePermission> PRIVATE_STOP_MODE =
+        Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
 
     private enum LifePhase {
         PLAYING("playing"), DEATH_SCREEN("death_screen"), RESPAWN_REQUESTED("respawn_requested");
@@ -51,6 +57,7 @@ public final class AgentClient implements ClientModInitializer {
 
     private static AgentClient active;
     private Path directory;
+    private Path runnerStopMarker;
     private String goal;
     private ClientPlayNetworkHandler network;
     private AgentHands hands;
@@ -58,6 +65,16 @@ public final class AgentClient implements ClientModInitializer {
     private AgentProgress progress;
     private AgentEars ears;
     private AgentMacroControl macro;
+    private AgentPauseEpisodes pauses;
+    private ClientPlayerEntity continuityPlayer;
+    private BlockPos continuityMine;
+    private Vec3d continuityLanding;
+    private final Vec3d[] recentContinuityLandings = new Vec3d[16];
+    private float continuityCrack, continuityYaw, continuityPitch;
+    private double continuityX, continuityY, continuityZ, continuityRouteStart, continuityRouteBest;
+    private long continuityGui;
+    private int continuityRouteSteps, continuityLandingCursor;
+    private boolean continuityBreak, revisitingContinuityLanding, creditedContinuityLanding;
     private long tick;
     private String lastStatus = "";
     private String lastHands = "";
@@ -80,6 +97,7 @@ public final class AgentClient implements ClientModInitializer {
     private BufferedWriter looks;
     private final long lookSeed = ThreadLocalRandom.current().nextLong();
     private long craftSequence;
+    private int returnableDropSequence;
     private long stallSequence;
     private boolean allowRespawn;
     private LifePhase lifePhase = LifePhase.PLAYING;
@@ -96,7 +114,7 @@ public final class AgentClient implements ClientModInitializer {
     private int priorCaveOpenings, priorCaveSteps;
     private int priorWaterAttempts, priorWaterLandings, priorBoatAttempts, priorBoatLandings;
     private int priorMeals, priorFoodPickedUp;
-    private boolean ended;
+    private boolean ended, stoppingForRunner;
 
     private static JsonArray coordinates(Set<BlockPos> cells) {
         JsonArray result = new JsonArray(cells.size());
@@ -110,6 +128,14 @@ public final class AgentClient implements ClientModInitializer {
         return result;
     }
 
+    private static JsonArray coordinates(BlockPos pos) {
+        JsonArray xyz = new JsonArray(3);
+        xyz.add(pos.getX());
+        xyz.add(pos.getY());
+        xyz.add(pos.getZ());
+        return xyz;
+    }
+
     @Override public void onInitializeClient() {
         String output = System.getProperty("gh.agent.dir", System.getenv("GH_AGENT_DIR"));
         goal = System.getProperty("gh.agent.goal", System.getenv("GH_AGENT_GOAL"));
@@ -118,6 +144,7 @@ public final class AgentClient implements ClientModInitializer {
             throw new IllegalArgumentException("Expected an agent directory and supported survival goal");
         directory = Path.of(output).toAbsolutePath();
         if (!Files.isDirectory(directory)) throw new IllegalStateException("Missing private agent directory");
+        runnerStopMarker = directory.resolve("runner-stop-" + directory.getFileName());
         allowRespawn = Files.isRegularFile(directory.resolve("allow-vanilla-respawn"), LinkOption.NOFOLLOW_LINKS);
         active = this;
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
@@ -143,6 +170,7 @@ public final class AgentClient implements ClientModInitializer {
             if (!playing(client) || player != client.player) return;
             progress.observeOwnBreak(pos, state);
             if (macro != null) macro.ownBreak(pos, state);
+            if (pauses != null && pos.equals(continuityMine)) continuityBreak = true;
             if (state.isOf(Blocks.STONE) || state.isOf(Blocks.DEEPSLATE) || state.isOf(Blocks.TUFF) ||
                 state.isOf(Blocks.GRANITE) || state.isOf(Blocks.DIORITE) || state.isOf(Blocks.ANDESITE)) ++rockBroken;
             JsonObject hit = new JsonObject();
@@ -280,6 +308,7 @@ public final class AgentClient implements ClientModInitializer {
         network = handler;
         macro = AgentMacroControl.create(directory, goal);
         bindPolicy(client);
+        if (macro == null || !macro.trial()) pauses = new AgentPauseEpisodes(directory, tick);
         return true;
     }
 
@@ -288,6 +317,7 @@ public final class AgentClient implements ClientModInitializer {
         hands = new AgentHands(client);
         progress = new AgentProgress(client, body, hands, goal, new AgentMemory(directory));
         craftSequence = stallSequence = 0;
+        returnableDropSequence = 0;
         lastFuseCheckNs = lastFuseCheckTick = fuseTick = 0;
         fuseOrigin = null;
         fuseCursorItem = null;
@@ -312,6 +342,7 @@ public final class AgentClient implements ClientModInitializer {
     }
 
     private void stopMacro(String cause, String reason) {
+        if (pauses != null) pauses.close(cause);
         if (macro == null) return;
         macro.suspend(tick, reason);
         macro.close(cause);
@@ -323,6 +354,7 @@ public final class AgentClient implements ClientModInitializer {
             || client.player == null || !client.player.isDead()
             || (client.world != null && client.player.getWorld() != client.world)) return false;
         deadPlayer = client.player;
+        observeContinuityIdle();
         if (macro != null) macro.suspend(tick, "The player died.");
         releaseLifeInputs(client);
         ++deaths;
@@ -333,7 +365,7 @@ public final class AgentClient implements ClientModInitializer {
         if (allowRespawn) {
             respawn = new AgentRespawn();
             lifeDeadline = System.nanoTime() + CONTROL_TIMEOUT;
-        } else if (macro != null) macro.close("death_no_respawn");
+        } else stopMacro("death_no_respawn", "No respawn is authorized.");
         return true;
     }
 
@@ -440,8 +472,16 @@ public final class AgentClient implements ClientModInitializer {
     }
 
     private void drive(MinecraftClient client) {
+        if (stoppingForRunner) return;
+        if (runnerStopRequested()) {
+            stopForRunner(client);
+            return;
+        }
         if (ended || (progress == null && !start(client))) return;
-        if (tick == 0 && playing(client) && !progress.restoreMemory()) return;
+        if (tick == 0 && playing(client) && !progress.restoreMemory()) {
+            observeContinuityIdle();
+            return;
+        }
         ++tick;
         if (!sameConnection(client)) {
             releaseLifeInputs(client);
@@ -452,18 +492,23 @@ public final class AgentClient implements ClientModInitializer {
         }
         if (observeDeath(client)) return;
         if (lifePhase != LifePhase.PLAYING) {
+            observeContinuityIdle();
             recoverLife(client);
             return;
         }
         if (!playing(client) || client.interactionManager == null) {
             // World changes sometimes clear the actor while the original connection stays open.
+            observeContinuityIdle();
             if (macro != null) macro.suspend(tick, "The player left the current Survival view.");
             body.release();
             hands.discardLifeInputs();
             lastYaw = lastPitch = Float.NaN;
             return;
         }
-        if (!progress.restoreMemory()) return;
+        if (!progress.restoreMemory()) {
+            observeContinuityIdle();
+            return;
+        }
         if (client.player.isSprinting()) ++sprintTicks;
         progress.observeMemoryFooting(tick);
         body.begin();
@@ -548,6 +593,8 @@ public final class AgentClient implements ClientModInitializer {
         }
         if (macro != null) macro.end(progress, fleeing ? "A primed creeper owns emergency movement." :
             "The local safety or completion controller owns this tick.");
+        observeContinuity(client, fleeing, fuse == null ? fuseOrigin : fuse.origin(),
+            macro == null ? null : macro.continuityWork());
         boolean won = progress.won() && !hands.busy() && client.currentScreen == null && renderedScreen == null;
         if (won) {
             hands.cancel();
@@ -558,6 +605,131 @@ public final class AgentClient implements ClientModInitializer {
         progress.saveMemory(ended);
         publish(client, fleeing ? "evading a primed creeper" : progress.status(), won, null,
             false, 0);
+    }
+
+    private void observeContinuityIdle() {
+        if (pauses == null) return;
+        continuityPlayer = null;
+        pauses.sample(tick, null, false, false, false);
+    }
+
+    private boolean runnerStopRequested() {
+        if (!Files.isRegularFile(runnerStopMarker, LinkOption.NOFOLLOW_LINKS)) return false;
+        try {
+            var marker = Files.readAttributes(runnerStopMarker, PosixFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            return marker.isRegularFile() && marker.size() == 0 && marker.permissions().equals(PRIVATE_STOP_MODE)
+                && marker.owner().equals(Files.getOwner(directory, LinkOption.NOFOLLOW_LINKS))
+                && Integer.valueOf(1).equals(Files.getAttribute(runnerStopMarker, "unix:nlink", LinkOption.NOFOLLOW_LINKS));
+        } catch (IOException | UnsupportedOperationException ignored) {
+            return false;
+        }
+    }
+
+    private void stopForRunner(MinecraftClient client) {
+        stoppingForRunner = true;
+        if (!ended && pauses != null) {
+            ++tick;
+            // The previous input may have genuinely advanced through this
+            // tick. Do not reuse a prior macro classification or run policy.
+            if (playing(client) && client.interactionManager != null)
+                observeContinuity(client, false, null, null);
+            else observeContinuityIdle();
+        }
+        ended = true;
+        if (body != null) releaseLifeInputs(client);
+        if (pauses != null) pauses.close("runner_stop");
+        stopMacro("actor_exit", "The owning runner ended the attempt.");
+        client.scheduleStop();
+    }
+
+    private void observeContinuity(MinecraftClient client, boolean fleeing, Vec3d danger, AgentPauseEpisodes.Work work) {
+        if (pauses == null) return;
+        var player = client.player;
+        double x = player.getX(), y = player.getY(), z = player.getZ();
+        float yaw = player.getYaw(), pitch = player.getPitch();
+        long gui = hands.workEvidence();
+        boolean same = continuityPlayer == player;
+        boolean keys = !body.keysNeutral();
+        boolean camera = same && (Math.abs(MathHelper.wrapDegrees(yaw - continuityYaw)) > 0.03f
+            || Math.abs(pitch - continuityPitch) > 0.03f);
+        boolean guiChanged = same && gui != continuityGui;
+        if (!same) {
+            continuityMine = null;
+            continuityCrack = 0;
+            continuityLanding = null;
+            continuityRouteSteps = 0;
+            Arrays.fill(recentContinuityLandings, null);
+            continuityLandingCursor = 0;
+            continuityBreak = false;
+        }
+
+        BlockPos target = body.continuityMiningTarget();
+        if (target != null) {
+            if (!target.equals(continuityMine)) {
+                continuityMine = target;
+                continuityCrack = 0;
+            }
+            if (work != AgentPauseEpisodes.Work.CRACK && client.interactionManager.isBreakingBlock()
+                    && client.interactionManager instanceof AgentMiningAccess mining
+                    && target.equals(mining.agent$breakingPos())) {
+                float crack = mining.agent$breakingProgress();
+                if (crack > continuityCrack && crack <= 1) {
+                    continuityCrack = crack;
+                    work = AgentPauseEpisodes.Work.CRACK;
+                }
+            }
+        }
+        if (continuityBreak) {
+            continuityBreak = false;
+            continuityCrack = 0;
+            work = AgentPauseEpisodes.Work.CRACK;
+        }
+
+        Vec3d landing = body.continuityLanding();
+        if (landing == null || !same || player.horizontalCollision) {
+            continuityRouteSteps = 0;
+        } else {
+            double distance = Math.hypot(x - landing.x, z - landing.z);
+            if (!landing.equals(continuityLanding)) {
+                continuityLanding = landing;
+                continuityRouteStart = continuityRouteBest = distance;
+                continuityRouteSteps = 0;
+                creditedContinuityLanding = revisitingContinuityLanding = false;
+                for (Vec3d prior : recentContinuityLandings) {
+                    if (prior != null && prior.squaredDistanceTo(landing) < 0.09) {
+                        revisitingContinuityLanding = true;
+                        break;
+                    }
+                }
+            } else if (continuityRouteBest - distance >= 0.018) {
+                continuityRouteBest = distance;
+                ++continuityRouteSteps;
+                if (!revisitingContinuityLanding && continuityRouteSteps >= 3 && continuityRouteStart - distance >= 0.18) {
+                    if (work == null) work = AgentPauseEpisodes.Work.ROUTE;
+                    if (!creditedContinuityLanding) {
+                        recentContinuityLandings[continuityLandingCursor] = landing;
+                        continuityLandingCursor = (continuityLandingCursor + 1) % recentContinuityLandings.length;
+                        creditedContinuityLanding = true;
+                    }
+                }
+            } else {
+                continuityRouteSteps = 0;
+            }
+        }
+        if (work == null && same && fleeing && keys && danger != null
+                && danger.squaredDistanceTo(x, y, z) > danger.squaredDistanceTo(continuityX, continuityY, continuityZ) + 0.04)
+            work = AgentPauseEpisodes.Work.SAFETY;
+        if (work == null && guiChanged) work = AgentPauseEpisodes.Work.GUI;
+        if (work == null && progress.continuityMechanicalWait()) work = AgentPauseEpisodes.Work.MECHANICAL_WAIT;
+        pauses.sample(tick, work, keys || camera || guiChanged, camera,
+            macro != null && macro.planningState().equals("blocked/no_safe_action"));
+        continuityPlayer = player;
+        continuityX = x;
+        continuityY = y;
+        continuityZ = z;
+        continuityYaw = yaw;
+        continuityPitch = pitch;
+        continuityGui = gui;
     }
 
     private static double millis(long nanos) { return nanos / 1_000_000.0; }
@@ -642,9 +814,11 @@ public final class AgentClient implements ClientModInitializer {
             append("crafts.jsonl", craft + "\n");
         }
         var stall = progress.stallReport();
+        var returnableDrop = progress.returnableDrop();
+        boolean newReturnableDrop = returnableDrop != null && returnableDrop.sequence() != returnableDropSequence;
         boolean newlyBlocked = stall.eventSequence() != stallSequence && stall.phase().equals("blocked");
-        boolean changed = screenChanged || ownerChanged || planningChanged || !status.equals(lastStatus) || !handStatus.equals(lastHands) ||
-            stall.eventSequence() != stallSequence;
+        boolean changed = screenChanged || ownerChanged || planningChanged || newReturnableDrop || !status.equals(lastStatus)
+            || !handStatus.equals(lastHands) || stall.eventSequence() != stallSequence;
         if (changed || boundary || tick % 20 == 0 || ended || tick == 1) {
             JsonObject event = new JsonObject();
             event.addProperty("tick", tick);
@@ -706,6 +880,16 @@ public final class AgentClient implements ClientModInitializer {
             event.addProperty("rock_broken", rockBroken);
             event.addProperty("cave_openings", priorCaveOpenings + progress.caveOpenings());
             event.addProperty("cave_steps", priorCaveSteps + progress.caveFootsteps());
+            if (returnableDrop != null) {
+                event.addProperty("returnable_drop_sequence", returnableDrop.sequence());
+                if (newReturnableDrop) {
+                    JsonObject proof = new JsonObject();
+                    proof.add("upper", coordinates(returnableDrop.upper()));
+                    proof.add("lower", coordinates(returnableDrop.lower()));
+                    proof.addProperty("body_tick", returnableDrop.renderedTick());
+                    event.add("returnable_drop", proof);
+                }
+            }
             event.addProperty("water_drop_attempts", priorWaterAttempts + progress.fall().waterAttempts());
             event.addProperty("water_drop_landings", priorWaterLandings + progress.fall().waterSuccesses());
             event.addProperty("boat_attempts", priorBoatAttempts + progress.fall().boatAttempts());
@@ -752,6 +936,7 @@ public final class AgentClient implements ClientModInitializer {
             lastPlanningEvidence = planningEvidence;
             lastPurposefulTick = purposefulTick;
             stallSequence = stall.eventSequence();
+            if (newReturnableDrop) returnableDropSequence = returnableDrop.sequence();
             screenChanged = false;
         }
     }

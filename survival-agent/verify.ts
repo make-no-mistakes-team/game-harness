@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { lstat, readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import type { MacroStatus } from "../src/server/survival-macro/controller.ts";
 
 const SHORE_POURS = 8;
 const FRAME_BLOCKS = 10;
@@ -9,7 +10,8 @@ const FRAME_BLOCKS = 10;
 const MAX_DIAGNOSTIC_SUPPORTS = 10;
 const blockPosition = z.tuple([z.int(), z.int(), z.int()]);
 const progressSchema = z.object({
-    goal: z.string(), won: z.literal(true), alive: z.literal(true),
+    goal: z.string(), won: z.boolean(), alive: z.literal(true),
+    tick: z.int().nonnegative().optional(), life: z.int().positive().optional(),
     inventory: z.record(z.string(), z.number().int().nonnegative()),
     dimension: z.string().optional(), frame_blocks: z.int().optional(), ignited: z.boolean().optional(),
     cast_method: z.literal("shore").optional(),
@@ -21,6 +23,32 @@ const progressSchema = z.object({
 });
 const statsSchema = z.object({ stats: z.record(z.string(), z.record(z.string(), z.number().int().nonnegative())) });
 type SavedPlayerStats = z.infer<typeof statsSchema> & { file: string; netherCriterion: string | null };
+
+export type ProgramWin = { run: string; program: NonNullable<MacroStatus["completedWorkProgram"]> };
+
+/** Supplied only by the admitted host, never by the model or the progress file. */
+export function retainsCompletedProgram({ run, program }: ProgramWin, goal: string, player: {
+    goal: string; alive: boolean; tick?: number; life?: number; inventory?: Record<string, number>;
+    dimension?: string; frame_blocks?: number; ignited?: boolean;
+}) {
+    const { basis, finalOrder, accepted, receipt, stock } = program;
+    const inventory = player.inventory;
+    if (!inventory || !player.alive || player.goal !== goal || program.goal !== goal ||
+        !program.requestId || program.stages < 1 || player.tick === undefined || player.tick < basis.tick ||
+        finalOrder.origin !== "model" || basis.run !== run || finalOrder.run !== run ||
+        accepted.run !== run || receipt.run !== run || basis.life !== player.life ||
+        finalOrder.life !== basis.life || accepted.life !== basis.life || receipt.life !== basis.life ||
+        accepted.id !== finalOrder.id || receipt.id !== finalOrder.id || accepted.status !== "accepted" ||
+        receipt.status !== "completed" || accepted.tick < finalOrder.basisTick || receipt.tick < accepted.tick ||
+        receipt.tick > finalOrder.expiresTick || basis.tick < receipt.tick) return false;
+    if (stock.some(s => s.observed < s.required || (inventory[s.item] ?? 0) < s.required) ||
+        finalOrder.reserves.some(s => (inventory[s.item] ?? 0) < s.count)) return false;
+    const target = finalOrder.target;
+    if (target.kind === "stock" ? (inventory[target.item] ?? 0) < target.count : target.goal !== goal) return false;
+    return goal === "nether_portal" ? target.kind === "preset" && player.dimension === "minecraft:the_nether" &&
+        player.frame_blocks === FRAME_BLOCKS && player.ignited === true :
+        (program.invocationItemCount ?? 0) > 0 && (inventory[`minecraft:${goal}`] ?? 0) > 0;
+}
 
 function absent(error: unknown) {
     return (error as NodeJS.ErrnoException).code === "ENOENT";
@@ -89,12 +117,14 @@ function hasCompleteShoreCast(progress: z.infer<typeof progressSchema>) {
 /** Use only after the server has saved and closed the world. Never supply this
  * data to the actor. A client-predicted craft and a timed-out pickup are not wins. */
 export async function verifySurvival(statsDirectory: string, goal: string, progress: unknown, requireCast = false,
-        before: SavedPlayerStats | null = null) {
+        before: SavedPlayerStats | null = null, programWin: ProgramWin | null = null) {
     let mined = 0, crafted = 0, pickedUp = 0;
     let shoreCast = false;
     const result = (verified: boolean, reason: string) => ({ verified, reason, mined, crafted, pickedUp });
     const p = progressSchema.safeParse(progress);
-    if (!p.success || p.data.goal !== goal) return result(false, "Missing live player victory");
+    if (!p.success || p.data.goal !== goal ||
+        (programWin ? requireCast || !retainsCompletedProgram(programWin, goal, p.data) : !p.data.won))
+        return result(false, "Missing live player victory");
     if (goal === "nether_portal") {
         if (p.data.dimension !== "minecraft:the_nether" || p.data.frame_blocks !== FRAME_BLOCKS || !p.data.ignited)
             return result(false, "No observed construction, ignition and Nether arrival");

@@ -12,6 +12,17 @@ export const SURVIVAL_AGENT_STRATEGY_OUTCOMES = [
   "budget_limited", "display_lost", "protocol_fault", "cleanup_failed",
 ] as const;
 
+/** Host-selected preset work can reach the vanilla goal without a single Terra decision. */
+export function hasConfirmedTerraEffect(status: unknown): boolean {
+  if (status === null || typeof status !== "object") return false;
+  const value = status as Record<string, unknown>;
+  return positiveCount(value.completedReceipts) || positiveCount(value.completedModelWorkOrders);
+}
+
+function positiveCount(value: unknown): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
 export interface SurvivalAgentStart {
   goal: SurvivalAgentGoal;
   strategy: SurvivalAgentStrategy;

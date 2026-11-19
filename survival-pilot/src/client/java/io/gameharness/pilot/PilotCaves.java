@@ -56,7 +56,8 @@ final class PilotCaves {
     private Phase phase;
     private int since, phaseSince, option, steps, quietCursor, cutSide, cutIndex, cuts, placed;
     private int cooldown, nextLight, lastAction, before, waterProof;
-    private boolean entered, needSurvey, triedHigh, triedLight, triedPlace, triedWater, afloat, leavingWater;
+    private boolean entered, needSurvey, triedHigh, triedLight, triedPlace, triedWater, earlyHigh, centerForBearing;
+    private boolean afloat, leavingWater;
     private BlockHitResult ore, lava, face, fill;
     private WaterLink plannedWater, waterLink;
     private BlockPos highBottom, boatFloor;
@@ -105,7 +106,8 @@ final class PilotCaves {
         }
         boolean inTransit = phase == Phase.DESCEND || phase == Phase.ASCEND || phase == Phase.DRIVE
             || phase == Phase.CENTER;
-        boolean peeking = phase == Phase.POUR || phase == Phase.RECLAIM;
+        boolean peeking = phase == Phase.POUR || phase == Phase.RECLAIM || phase == Phase.LOOK_DOWN
+            || phase == Phase.SURVEY && option == 0;
         if (!inTransit
             && (!player.isOnGround() || player.isTouchingWater()
                 || !(player.getBlockPos().equals(stance) || peeking && atLip(stance)))) {
@@ -173,6 +175,7 @@ final class PilotCaves {
         option = 0;
         needSurvey = true;
         triedHigh = triedLight = triedPlace = triedWater = false;
+        earlyHigh = centerForBearing = false;
         cutSide = 0;
         highBottom = null;
         start(Phase.SURVEY, tick);
@@ -223,11 +226,26 @@ final class PilotCaves {
         }
         if (age >= 28 && option == 0 && (proof[0] & FLOOR) == 0) creep(ahead);
         if (age >= SURVEY_TICKS) {
-            option++;
-            needSurvey = option < 4;
-            start(Phase.SURVEY, tick);
+            if (option == 0 && !triedHigh && hands.count(BOAT) > 0) {
+                // Check a forward descent before walking back onto the launch deck.
+                earlyHigh = triedHigh = true;
+                start(Phase.LOOK_DOWN, tick);
+            } else {
+                nextBearing(tick);
+            }
         }
         return true;
+    }
+
+    private void nextBearing(int tick) {
+        if (!player.getBlockPos().equals(stance) && atLip(stance)) {
+            centerForBearing = true;
+            start(Phase.CENTER, tick);
+            return;
+        }
+        option++;
+        needSurvey = option < 4;
+        start(Phase.SURVEY, tick);
     }
 
     private int checkStep(BlockPos foot, Direction travel, int mask) {
@@ -348,6 +366,15 @@ final class PilotCaves {
             start(Phase.CENTER, tick);
             return true;
         }
+        if (earlyHigh) {
+            earlyHigh = false;
+            if (highBottom != null && stance.getY() - highBottom.getY() >= 4 && hands.count(BOAT) > 0) {
+                start(Phase.BOAT_VIEW, tick);
+            } else {
+                nextBearing(tick);
+            }
+            return true;
+        }
         if (!triedLight && hands.count(TORCH) > 0 && tick >= nextLight) {
             triedLight = true;
             before = hands.count(TORCH);
@@ -403,7 +430,12 @@ final class PilotCaves {
 
     private boolean center(int tick) {
         status = "returning to the dry center of the cave lip";
-        if (arrived(stance)) return alternatives(tick);
+        if (arrived(stance)) {
+            if (!centerForBearing) return alternatives(tick);
+            centerForBearing = false;
+            nextBearing(tick);
+            return true;
+        }
         if (!atLip(stance) || tick - phaseSince > 32)
             return finish(tick, "could not recenter on the last dry cave support");
         crouchToward(Vec3d.ofBottomCenter(stance), 48);
@@ -767,10 +799,9 @@ final class PilotCaves {
 
     private void creep(BlockPos toward) {
         Vec3d target = Vec3d.ofBottomCenter(toward);
-        if (player.isOnGround() && stance.equals(player.getBlockPos()) && horizontalSquared(target) > 0.52 * 0.52
-            && alignedYaw(yaw(target), 7)) {
+        if (atLip(stance) && horizontalSquared(target) > 0.46 * 0.46 && alignedYaw(yaw(target), 7)) {
             body.sneak();
-            body.walk(false);
+            if (player.isSneaking()) body.walk(false);
         }
     }
 

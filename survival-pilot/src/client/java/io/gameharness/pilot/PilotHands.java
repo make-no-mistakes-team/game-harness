@@ -54,6 +54,10 @@ final class PilotHands {
         STONE_SHOVEL(Items.STONE_SHOVEL, 1, "r", "s", "s"),
         FURNACE(Items.FURNACE, 1, "mmm", "m m", "mmm"),
         IRON_PICKAXE(Items.IRON_PICKAXE, 1, "iii", " s ", " s "),
+        IRON_SHOVEL(Items.IRON_SHOVEL, 1, "i", "s", "s"),
+        DIAMOND_PICKAXE(Items.DIAMOND_PICKAXE, 1, "ddd", " s ", " s "),
+        BUCKET(Items.BUCKET, 1, "i i", " i "),
+        FLINT_AND_STEEL(Items.FLINT_AND_STEEL, 1, "if"), // Shapeless; place both in the first row.
         STONE_SWORD(Items.STONE_SWORD, 1, "r", "r", "s"),
         TORCH(Items.TORCH, 4, "c", "s");
 
@@ -82,8 +86,8 @@ final class PilotHands {
         final Step step;
         final TexturedButtonWidget bookButton;
         final ItemStack cursorBefore;
-        final ItemStack slotBefore;
         final int button;
+        ItemStack slotBefore;
         double fromX, fromY, toX, toY;
         long moveStart, duration;
         boolean arrived, pressed;
@@ -190,6 +194,10 @@ final class PilotHands {
             case "stone_shovel" -> Recipe.STONE_SHOVEL;
             case "furnace" -> Recipe.FURNACE;
             case "iron_pickaxe" -> Recipe.IRON_PICKAXE;
+            case "iron_shovel" -> Recipe.IRON_SHOVEL;
+            case "diamond_pickaxe" -> Recipe.DIAMOND_PICKAXE;
+            case "bucket" -> Recipe.BUCKET;
+            case "flint_and_steel" -> Recipe.FLINT_AND_STEEL;
             case "stone_sword" -> Recipe.STONE_SWORD;
             case "torch", "torches" -> Recipe.TORCH;
             default -> {
@@ -265,8 +273,9 @@ final class PilotHands {
         }
 
         start(Job.SMELT, "smelt", furnace);
-        if (inputSource != null) transfer(inputSource, input, inputCount);
+        // In a cold, empty furnace, finish loading the fuel before the input can ignite it.
         if (fuelSource != null) transfer(fuelSource, fuel, fuelCount);
+        if (inputSource != null) transfer(inputSource, input, inputCount);
         planned = true;
         return true;
     }
@@ -477,9 +486,7 @@ final class PilotHands {
         }
         var handler = screen.getScreenHandler();
         if (!click.pressed) {
-            if (click.step.mode != Mode.CLEAR_BOOK
-                    && (!ItemStack.areEqual(click.cursorBefore, handler.getCursorStack())
-                    || !ItemStack.areEqual(click.slotBefore, click.step.slot.getStack()))) {
+            if (click.step.mode != Mode.CLEAR_BOOK && !clickTargetReady(handler.getCursorStack())) {
                 finish("slot changed before press");
                 return;
             }
@@ -491,6 +498,11 @@ final class PilotHands {
             }
             click.pressed = true;
         } else {
+            // Vanilla places a carried stack on release, and the furnace may have ticked since press.
+            if (isFurnacePlacement() && !clickTargetReady(handler.getCursorStack())) {
+                finish("furnace slot changed before release");
+                return;
+            }
             screen.mouseReleased(x, y, click.button);
             if (click.step.mode == Mode.CLEAR_BOOK) {
                 if (bookHidesSlots()) finish("recipe book did not close");
@@ -505,6 +517,29 @@ final class PilotHands {
             }
             click = null;
         }
+    }
+
+    private boolean isFurnacePlacement() {
+        Step step = click.step;
+        return job == Job.SMELT && (step.mode == Mode.ONE || step.mode == Mode.PUT) && !isStorage(step.slot);
+    }
+
+    private boolean clickTargetReady(ItemStack cursor) {
+        if (!ItemStack.areEqual(click.cursorBefore, cursor)) return false;
+        ItemStack slot = click.step.slot.getStack();
+        if (ItemStack.areEqual(click.slotBefore, slot)) return true;
+        if (isFurnacePlacement()) {
+            // A cooking furnace can consume fuel or input; reduced counts still leave room to place.
+            if (!slot.isEmpty() && (!same(click.slotBefore, slot)
+                    || slot.getCount() > click.slotBefore.getCount())) return false;
+        } else if (job == Job.SMELT && click.step.mode == Mode.RESULT) {
+            if (!same(click.slotBefore, slot) || slot.getCount() < click.slotBefore.getCount()
+                    || !storageRoom(slot, null)) return false;
+        } else {
+            return false;
+        }
+        click.slotBefore = slot.copy();
+        return true;
     }
 
     private void sampleCursor(long window) {
@@ -559,9 +594,13 @@ final class PilotHands {
         else click = new Click(step, null, cursor, stack);
     }
 
-    private static boolean clickEffect(Click click, ItemStack cursor) {
+    private boolean clickEffect(Click click, ItemStack cursor) {
         return switch (click.step.mode) {
-            case TAKE, RESULT -> ItemStack.areEqual(click.slotBefore, cursor);
+            case TAKE -> ItemStack.areEqual(click.slotBefore, cursor);
+            case RESULT -> job == Job.SMELT
+                    // The server can finish another item before processing the pickup.
+                    ? same(click.slotBefore, cursor) && cursor.getCount() >= click.slotBefore.getCount()
+                    : ItemStack.areEqual(click.slotBefore, cursor);
             case ONE -> cursor.getCount() == click.cursorBefore.getCount() - 1
                     && (cursor.isEmpty() || same(cursor, click.cursorBefore));
             case PUT -> cursor.isEmpty();
@@ -772,6 +811,8 @@ final class PilotHands {
             case 'r' -> stack.isIn(ItemTags.STONE_TOOL_MATERIALS);
             case 'm' -> stack.isIn(ItemTags.STONE_CRAFTING_MATERIALS);
             case 'i' -> stack.isOf(Items.IRON_INGOT);
+            case 'd' -> stack.isOf(Items.DIAMOND);
+            case 'f' -> stack.isOf(Items.FLINT);
             case 'c' -> stack.isOf(Items.COAL) || stack.isOf(Items.CHARCOAL);
             default -> false;
         };
@@ -839,6 +880,7 @@ final class PilotHands {
 
     private Slot resultDestination(ScreenHandler handler, ItemStack stack) {
         boolean preferHotbar = stack.isOf(Items.CRAFTING_TABLE) || stack.isOf(Items.FURNACE)
+                || stack.isOf(Items.BUCKET) || stack.isOf(Items.FLINT_AND_STEEL)
                 || stack.isIn(ItemTags.PICKAXES) || stack.isIn(ItemTags.SHOVELS) || stack.isIn(ItemTags.SWORDS);
         Slot best = null;
         int bestScore = 0;

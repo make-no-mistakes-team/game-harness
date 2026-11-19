@@ -97,6 +97,11 @@ approved higher limits in a newly declared run.
 
 ## Manual gameplay review
 
+On `experiment/survival-pilot`, request feedback on representative footage
+through `ask` when useful. A successful run is not a review gate: keep the
+survival progression moving unless the user asks to stop. The mandatory
+pause below applies to other branches.
+
 Request manual visual review only for gameplay runs you judge successful for
 their declared user-facing purpose. After a noticeable gameplay change produces
 such a run, show representative footage and explicitly ask for review. Pause

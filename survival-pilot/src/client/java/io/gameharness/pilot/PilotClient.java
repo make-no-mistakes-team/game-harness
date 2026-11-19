@@ -1,6 +1,7 @@
 package io.gameharness.pilot;
 
 import com.google.gson.JsonObject;
+import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
@@ -11,12 +12,14 @@ import java.nio.file.StandardOpenOption;
 import java.util.Set;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.fabricmc.fabric.api.event.client.player.ClientPlayerBlockBreakEvents;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.screen.ingame.CraftingScreen;
 import net.minecraft.client.gui.screen.ingame.InventoryScreen;
+import net.minecraft.block.Blocks;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.registry.Registries;
 import net.minecraft.util.math.MathHelper;
@@ -39,24 +42,35 @@ public final class PilotClient implements ClientModInitializer {
     private int benchOpens;
     private boolean screenChanged;
     private float lastYaw = Float.NaN;
+    private float lastPitch = Float.NaN;
     private double yawTravel;
+    private double pitchTravel;
+    private int sprintTicks;
+    private int rockBroken;
+    private BufferedWriter movement;
     private boolean ended;
 
     @Override public void onInitializeClient() {
         String output = System.getProperty("gh.pilot.dir", System.getenv("GH_PILOT_DIR"));
         goal = System.getProperty("gh.pilot.goal", System.getenv("GH_PILOT_GOAL"));
         if (output == null && goal == null) return;
-        if (output == null || goal == null || !Set.of("wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond").contains(goal))
-            throw new IllegalArgumentException("Expected a pilot directory and supported item goal");
+        if (output == null || goal == null || !Set.of("wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond", "nether_portal").contains(goal))
+            throw new IllegalArgumentException("Expected a pilot directory and supported survival goal");
         directory = Path.of(output).toAbsolutePath();
         if (!Files.isDirectory(directory)) throw new IllegalStateException("Missing private pilot directory");
         active = this;
+        ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            if (progress != null) progress.saveMemory(true);
+            closeMovement();
+        });
         ClientTickEvents.START_CLIENT_TICK.register(this::drive);
         WorldRenderEvents.START.register(context -> {
             if (progress != null && !ended) body.observeFrame(context);
         });
         ClientPlayerBlockBreakEvents.AFTER.register((world, player, pos, state) -> {
             if (progress == null || ended) return;
+            if (state.isOf(Blocks.STONE) || state.isOf(Blocks.DEEPSLATE) || state.isOf(Blocks.TUFF) ||
+                state.isOf(Blocks.GRANITE) || state.isOf(Blocks.DIORITE) || state.isOf(Blocks.ANDESITE)) ++rockBroken;
             JsonObject hit = new JsonObject();
             hit.addProperty("tick", tick);
             hit.addProperty("wall_ms", System.currentTimeMillis());
@@ -69,6 +83,30 @@ public final class PilotClient implements ClientModInitializer {
     private void append(String file, String line) {
         try { Files.writeString(directory.resolve(file), line, StandardOpenOption.CREATE, StandardOpenOption.APPEND); }
         catch (IOException e) { body.release(); ended = true; throw new UncheckedIOException(e); }
+    }
+
+    private void recordMovement(MinecraftClient client, String activity) {
+        // Sample the actual player, not the commanded angles or requested sprint key.
+        var p = client.player;
+        if (p == null) return;
+        try {
+            if (movement == null) {
+                movement = Files.newBufferedWriter(directory.resolve("movement.tsv"), StandardOpenOption.CREATE_NEW);
+                movement.write("tick\twall_ms\tx\ty\tz\tyaw\tpitch\tgrounded\tsprinting\tfood\tgui\tactivity\n");
+            }
+            movement.write(tick + "\t" + System.currentTimeMillis() + "\t" + p.getX() + "\t" + p.getY() + "\t" +
+                p.getZ() + "\t" + p.getYaw() + "\t" + p.getPitch() + "\t" + p.isOnGround() + "\t" +
+                p.isSprinting() + "\t" + p.getHungerManager().getFoodLevel() + "\t" + (client.currentScreen != null) +
+                "\t" + activity + "\n");
+            if (tick % 20 == 0) movement.flush();
+        } catch (IOException e) { throw new UncheckedIOException(e); }
+    }
+
+    private void closeMovement() {
+        if (movement == null) return;
+        try { movement.close(); }
+        catch (IOException e) { throw new UncheckedIOException(e); }
+        finally { movement = null; }
     }
 
     public static void steerFrame() {
@@ -86,15 +124,23 @@ public final class PilotClient implements ClientModInitializer {
             if (player != null && shown == null) {
                 float yaw = player.getYaw();
                 if (Float.isFinite(active.lastYaw)) active.yawTravel += Math.abs(MathHelper.wrapDegrees(yaw - active.lastYaw));
+                float pitch = player.getPitch();
+                if (Float.isFinite(active.lastPitch)) active.pitchTravel += Math.abs(pitch - active.lastPitch);
                 active.lastYaw = yaw;
-            } else active.lastYaw = Float.NaN;
+                active.lastPitch = pitch;
+            } else active.lastYaw = active.lastPitch = Float.NaN;
         }
     }
 
     private void drive(MinecraftClient client) {
         if (ended) return;
         if (client.player == null || client.world == null || client.interactionManager == null) {
-            if (progress != null) { body.release(); ended = true; }
+            // The client can briefly drop the old world during dimension travel.
+            // Release input, but let a live connection resume in its replacement world.
+            if (progress != null) {
+                body.release();
+                if (client.getNetworkHandler() == null) { closeMovement(); ended = true; }
+            }
             return;
         }
         if (progress == null) {
@@ -105,11 +151,13 @@ public final class PilotClient implements ClientModInitializer {
                 client.interactionManager.getCurrentGameMode() != GameMode.SURVIVAL) return;
             body = new PilotBody(client);
             hands = new PilotHands(client);
-            progress = new PilotProgress(client, body, hands, goal);
+            progress = new PilotProgress(client, body, hands, goal, new PilotMemory(directory));
             ears = new PilotEars(client);
             client.getSoundManager().registerListener(ears);
         }
+        if (client.player.isAlive() && !progress.restoreMemory()) return;
         ++tick;
+        if (client.player.isSprinting()) ++sprintTicks;
         boolean alive = client.player.isAlive();
         boolean fleeing = false;
         if (alive) {
@@ -123,7 +171,10 @@ public final class PilotClient implements ClientModInitializer {
         }
         boolean won = alive && progress.won() && !hands.busy() && client.currentScreen == null && renderedScreen == null;
         if (won || !alive || progress.failure() != null) { hands.cancel(); body.release(); ended = true; }
+        if (alive) progress.saveMemory(ended);
         String status = !alive ? "dead" : fleeing ? "evading a primed creeper" : progress.status();
+        if (tick % 2 == 0 || ended) recordMovement(client, status);
+        if (ended) closeMovement();
         String handStatus = hands.status();
         boolean changed = screenChanged || !status.equals(lastStatus) || !handStatus.equals(lastHands);
         if (changed || tick % 20 == 0 || ended || tick == 1) {
@@ -143,6 +194,16 @@ public final class PilotClient implements ClientModInitializer {
             event.addProperty("yaw", client.player.getYaw());
             event.addProperty("yaw_travel", yawTravel);
             event.addProperty("pitch", client.player.getPitch());
+            event.addProperty("pitch_travel", pitchTravel);
+            event.addProperty("sprinting", client.player.isSprinting());
+            event.addProperty("sprint_ticks", sprintTicks);
+            event.addProperty("rock_broken", rockBroken);
+            event.addProperty("food", client.player.getHungerManager().getFoodLevel());
+            event.addProperty("dimension", client.world.getRegistryKey().getValue().toString());
+            if (goal.equals("nether_portal")) {
+                event.addProperty("frame_blocks", progress.confirmedFrameBlocks());
+                event.addProperty("ignited", progress.ignited());
+            }
             event.addProperty("gui", client.currentScreen != null);
             event.addProperty("rendered_screen", renderedScreen == null ? "world" :
                 renderedScreen instanceof InventoryScreen ? "inventory" :

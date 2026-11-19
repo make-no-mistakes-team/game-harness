@@ -3,7 +3,7 @@
 ## Standalone Survival Pilot
 
 On the `experiment/survival-pilot` branch, a deterministic Fabric client can
-attempt an item goal in a new Normal Survival world. It uses the installed
+play toward a resource goal or a Nether portal in a new Normal Survival world. It uses the installed
 Minecraft Java 1.21.4 client and the project's existing server download and
 EULA consent. Sign in with the official Launcher before starting. On Linux it
 also needs Xvfb, xauth, FFmpeg with x11grab and libx264, Bun, and JDK 21.
@@ -16,6 +16,8 @@ bun run play:pilot diamond 1800
 
 The seconds argument sets this attempt's wall time, including startup.
 Other item goals are `wooden_pickaxe`, `stone_pickaxe`, and `iron_pickaxe`.
+For `nether_portal`, the pilot needs to build and ignite a frame and enter it.
+Finding an existing portal or merely holding ten obsidian does not qualify.
 The runner prints the private attempt directory. Open `screen.mp4` there to
 watch the actual client, including the inventory pointer. `outcome.json`
 records why the attempt ended. For a diamond win, the live inventory must
@@ -23,19 +25,20 @@ contain a diamond and the saved vanilla statistics must show both ore mined
 and a diamond picked up. The runner checks those statistics after the world
 closes; the player does not receive them.
 
-To debug later stages without replaying progress, keep the same official
+To continue at a later stage without replaying progress, keep the same official
 Launcher profile and pass the basename of a previous pilot attempt:
 
 ```sh
-bun run play:pilot diamond 1800 --continue-from "$RUN_BASENAME"
+bun run play:pilot nether_portal 3600 --continue-from "$RUN_BASENAME"
 ```
 
-The parent must be a recorded attempt under `local/survival-pilot/runs` for
-the same goal. Its records must show a closed, non-winning attempt and a
-clean server exit. The runner accepts no external world path. It copies the
+The parent must be a recorded pilot attempt with a clean server exit.
+Retry an unfinished goal or advance to a higher tier; a completed goal cannot
+count as another win just by loading its save. The runner accepts no external world path. It copies the
 saved vanilla world, including player inventory and statistics, into a new
-attempt directory before starting a new server and recording. It does not
-inspect the seed or map. The declaration and outcome mark the new attempt
+attempt directory before starting a new server and recording. Only the
+pilot's own observed route and confirmed workstations can carry over as
+navigation memory. The runner does not inspect the seed or map. The declaration and outcome mark the new attempt
 as `world.fresh: false` and name its `world.parentRun`. Saved statistics can
 corroborate progress anywhere in that chain; a continued win is not evidence
 of an uninterrupted fresh run. Omit the flag for the fresh-world benchmark.

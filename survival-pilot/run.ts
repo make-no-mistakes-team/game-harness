@@ -18,7 +18,7 @@ const RUNS = path.join(PILOT_LOCAL, "runs");
 const LIVE = path.join(PILOT_LOCAL, "live.json");
 const SERVER_JAR = path.join(RUNTIME, "minecraft/server-1.21.4.jar");
 const PILOT_JAR = path.join(import.meta.dir, "build/libs/survival-pilot-1.0.jar");
-const GOALS = ["wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond"] as const;
+const GOALS = ["wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond", "nether_portal"] as const;
 const RUN_BASENAME = new RegExp(`^\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}\\.\\d{3}Z-(?:${GOALS.join("|")})-[A-Za-z0-9]{6}$`);
 const DEFAULT_SECONDS = 900;
 const MAX_SECONDS = Math.floor(2_147_483_647 / 1_000);
@@ -28,12 +28,19 @@ const HEARTBEAT_MS = 20_000;
 const STALL_MS = 180_000;
 const GOAL_STALL_MS = 300_000;
 const DRAIN_HEADROOM = 128_000_000;
+const MEMORY_FILE = "pilot-memory.json";
+const MEMORY_BYTES = 32 * 1024;
+const MEMORY_CELLS = 1024;
+const OVERWORLD = "minecraft:overworld";
 const exec = promisify(execFile);
 type Goal = (typeof GOALS)[number];
 type Exit = { code: number | null; signal: NodeJS.Signals | null };
 type Owned = { child: ChildProcess; closed: Promise<Exit>; exit?: Exit };
 type Progress = {
   failure?: string;
+  dimension?: string;
+  rock_broken?: number;
+  frame_blocks?: number;
   tick: number;
   goal: string;
   status: string;
@@ -58,7 +65,7 @@ const usage = `Usage: xvfb-run -a -s '-screen 0 ${SIZE}x24' bun survival-pilot/r
 
 GOAL: ${GOALS.join(" | ")}
 SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SECONDS}).
---continue-from: copy a closed, recorded, non-winning pilot world for the same goal.
+--continue-from: copy a closed, recorded pilot world. Retry its goal or pursue a later one.
 
 Build survival-pilot-1.0.jar first. Requires Java 21, ffmpeg, existing local EULA
 consent, and a signed-in official Launcher with Minecraft 1.21.4 installed.
@@ -201,17 +208,19 @@ async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
   const root = path.join(RUNS, parentRun);
   const server = path.join(root, "server");
   const world = path.join(server, "world");
-  const invalid = () => new Error(`Cannot continue from ${parentRun}: expected a closed, recorded pilot attempt for ${goal} with a clean save and no win.`);
+  const invalid = () => new Error(`Cannot continue from ${parentRun}: expected a closed, recorded pilot attempt with a clean save and an eligible goal.`);
   try {
     const uid = process.getuid?.();
     const runs = await lstat(RUNS);
     if (!runs.isDirectory() || runs.uid !== uid) throw invalid();
     const device = runs.dev;
+    let rootInode = 0;
     for (const dir of [root, server, world, path.join(world, "region")]) {
       signal.throwIfAborted();
       const entry = await lstat(dir);
       if (!entry.isDirectory() || entry.dev !== device || entry.uid !== uid ||
           (dir === root && (entry.mode & 0o077))) throw invalid();
+      if (dir === root) rootInode = entry.ino;
     }
     const regular = async (file: string) => {
       signal.throwIfAborted();
@@ -235,15 +244,18 @@ async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
     const continued = worldProof?.fresh === false && typeof worldProof.parentRun === "string" &&
       RUN_BASENAME.test(worldProof.parentRun) && outcome?.world?.fresh === false &&
       outcome.world.parentRun === worldProof.parentRun;
-    if (declaration?.schemaVersion !== 1 || declaration.goal !== goal || declaration.minecraftVersion !== "1.21.4" ||
+    const parentTier = GOALS.indexOf(declaration?.goal);
+    if (declaration?.schemaVersion !== 1 || parentTier < 0 || parentTier > GOALS.indexOf(goal) ||
+        declaration.minecraftVersion !== "1.21.4" ||
         typeof declaration.pilotJarSha256 !== "string" || !/^[a-f0-9]{64}$/.test(declaration.pilotJarSha256) ||
         declaration.connection?.host !== "127.0.0.1" ||
         declaration.connection?.auth !== "host-verified-official-launcher" || declaration.recording?.file !== "screen.mp4" ||
         worldProof?.type !== "vanilla" || worldProof.mode !== "survival" || worldProof.difficulty !== "normal" ||
         !(fresh || continued) ||
-        outcome?.schemaVersion !== 1 || outcome.goal !== goal || !time(declaration.startedAt) ||
+        outcome?.schemaVersion !== 1 || outcome.goal !== declaration.goal || !time(declaration.startedAt) ||
         outcome.startedAt !== declaration.startedAt || !time(outcome.finishedAt) ||
-        !STATUSES.includes(outcome.status) || outcome.status === "won" ||
+        !STATUSES.includes(outcome.status) || (outcome.status === "won" &&
+          (goal === declaration.goal || outcome.verification?.verified !== true)) ||
         outcome.exits?.server?.code !== 0 || outcome.exits.server.signal !== null) throw invalid();
     // An attempt that joined must have the vanilla player save directories.
     if (outcome.progress !== null) {
@@ -266,10 +278,196 @@ async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
     await regular(path.join(root, "screen.mp4"));
     await regular(path.join(world, "level.dat"));
     await regular(path.join(world, "session.lock"));
-    return { world, device };
+    return { root, rootInode, device, world, progress: outcome.progress as Progress | null };
   } catch {
     signal.throwIfAborted();
     throw invalid();
+  }
+}
+
+type Cell = [number, number, number];
+type PilotMemory = { version: 1; dimension: typeof OVERWORLD; trail: Cell[]; workbench?: Cell; furnace?: Cell };
+
+function isCell(value: unknown): value is Cell {
+  return Array.isArray(value) && value.length === 3 && value.every(Number.isInteger) &&
+    Math.abs(value[0]) <= 30_000_000 && value[1] >= -64 && value[1] <= 320 &&
+    Math.abs(value[2]) <= 30_000_000;
+}
+
+function adjacentCells(a: Cell, b: Cell) {
+  return Math.abs(a[1] - b[1]) <= 1 && Math.abs(a[0] - b[0]) + Math.abs(a[2] - b[2]) <= 1;
+}
+
+function decodePilotMemory(text: string): PilotMemory | null {
+  try {
+    const value = JSON.parse(text);
+    if (value?.version !== 1 || value?.dimension !== OVERWORLD || !Array.isArray(value.trail) ||
+        value.trail.length > MEMORY_CELLS ||
+        Object.keys(value).some((key) => !["version", "dimension", "trail", "workbench", "furnace"].includes(key)) ||
+        ("workbench" in value && !isCell(value.workbench)) || ("furnace" in value && !isCell(value.furnace))) return null;
+    const seen = new Set<string>();
+    let previous: Cell | undefined;
+    for (const cell of value.trail) {
+      if (!isCell(cell) || previous && !adjacentCells(previous, cell)) return null;
+      const key = cell.join(",");
+      if (seen.has(key)) return null;
+      seen.add(key);
+      previous = cell;
+    }
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+type SavedWorld = Awaited<ReturnType<typeof savedWorld>>;
+type ReadPilotArtifact = (name: string, maxBytes: number, privateMode?: boolean) => Promise<string | undefined | null>;
+
+// undefined means absent; null means present but unsuitable. Only absence permits legacy recovery.
+async function readPilotArtifact(parent: string, device: number, name: string, maxBytes: number, signal: AbortSignal,
+    privateMode = false): Promise<string | undefined | null> {
+  signal.throwIfAborted();
+  try {
+    const file = await open(path.join(parent, name), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const entry = await file.stat();
+      if (!entry.isFile() || entry.nlink !== 1 || entry.dev !== device || entry.uid !== process.getuid?.() ||
+          entry.size < 1 || entry.size > maxBytes ||
+          (privateMode ? (entry.mode & 0o7777) !== 0o600 : Boolean(entry.mode & 0o022))) return null;
+      const buffer = Buffer.alloc(entry.size + 1);
+      let read = 0;
+      while (read < buffer.length) {
+        signal.throwIfAborted();
+        const { bytesRead } = await file.read(buffer, read, buffer.length - read, read);
+        if (!bytesRead) break;
+        read += bytesRead;
+      }
+      return read === entry.size ? buffer.toString("utf8", 0, read) : null;
+    } finally {
+      await file.close();
+    }
+  } catch (error) {
+    signal.throwIfAborted();
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : null;
+  }
+}
+
+function passageActivity(status: string) {
+  if (status === "descending a mined staircase" || /^branch mining at y=-?\d{1,3}$/.test(status)) return "outward";
+  if (status === "returning along traveled steps" || status === "climbing a traveled step" ||
+      status === "resuming a traveled mine") return "known";
+  return null;
+}
+
+function sameCell(a: Cell | undefined, b: Cell) {
+  return a?.[0] === b[0] && a[1] === b[1] && a[2] === b[2];
+}
+
+async function recoverPilotTrail(pose: Progress | null, read: ReadPilotArtifact): Promise<PilotMemory | null> {
+  if (pose?.alive !== true || pose.dimension !== OVERWORLD || !Number.isSafeInteger(pose.tick) ||
+      typeof pose.status !== "string" || !passageActivity(pose.status) ||
+      ![pose.x, pose.y, pose.z].every(Number.isFinite)) return null;
+  // Movement alone has no dimension. Refuse to join samples across any recorded dimension change.
+  const events = await read("events.jsonl", 4_000_000);
+  if (!events?.endsWith("\n")) return null;
+  let eventTick = 0;
+  try {
+    for (const line of events.slice(0, -1).split("\n")) {
+      const event = JSON.parse(line);
+      if (event?.dimension !== OVERWORLD || !Number.isSafeInteger(event.tick) ||
+          event.tick <= eventTick || (!eventTick && event.tick !== 1)) return null;
+      eventTick = event.tick;
+    }
+  } catch {
+    return null;
+  }
+  if (Math.abs(eventTick - pose.tick) > 100) return null;
+
+  const text = await read("movement.tsv", 4_000_000);
+  if (!text?.endsWith("\n")) return null;
+  const rows = text.slice(0, -1).split("\n");
+  if (rows[0] !== "tick\twall_ms\tx\ty\tz\tyaw\tpitch\tgrounded\tsprinting\tfood\tgui\tactivity") return null;
+  const trail: Cell[] = [];
+  let cursor = -1;
+  let lastTick = 0;
+  let stable = 0;
+  let previous: Cell | undefined;
+  let lastDistance = Infinity;
+  for (let i = 1; i < rows.length; i++) {
+    const fields = rows[i]?.split("\t");
+    if (!fields || fields.length !== 12) return null;
+    const tick = Number(fields[0]);
+    if (!Number.isSafeInteger(tick) || tick <= lastTick) return null;
+    if (lastTick && tick - lastTick > 4) { trail.length = 0; cursor = -1; stable = 0; }
+    lastTick = tick;
+    lastDistance = Infinity;
+    if (fields[7] === "false") { stable = 0; continue; }
+    if (fields[7] !== "true" || !fields[2] || !fields[3] || !fields[4]) return null;
+    const x = Number(fields[2]), y = Number(fields[3]), z = Number(fields[4]);
+    const cell = [Math.floor(x), Math.floor(y), Math.floor(z)];
+    if (!isCell(cell)) return null;
+    stable = sameCell(previous, cell) ? stable + 1 : 1;
+    previous = cell;
+    const activity = passageActivity(fields[11] ?? "");
+    // At staircase lips grounded may briefly describe the old support under a neighboring column.
+    if (stable < 3) continue;
+    const current = trail[cursor];
+    if (!sameCell(current, cell)) {
+      const index = trail.findIndex((p) => sameCell(p, cell));
+      if (!activity) {
+        trail.length = 0;
+        cursor = -1;
+      } else if (index >= 0 && current && adjacentCells(current, cell)) {
+        cursor = index;
+      } else if (current && adjacentCells(current, cell) && cell[0] === current[0] && cell[2] === current[2]) {
+        // Only actual walking/stair steps have legacy proof. Stop at the observed ledge.
+        continue;
+      } else if (activity === "outward") {
+        if (current && !adjacentCells(current, cell)) cursor = -1;
+        trail.length = cursor + 1;
+        if (trail.length === MEMORY_CELLS) trail.shift();
+        trail.push(cell);
+        cursor = trail.length - 1;
+      } else {
+        trail.length = 0;
+        cursor = -1;
+      }
+    }
+    if (activity && sameCell(trail[cursor], cell) &&
+        cell[0] === Math.floor(pose.x) && cell[1] === Math.floor(pose.y) && cell[2] === Math.floor(pose.z)) {
+      lastDistance = Math.hypot(x - pose.x, y - pose.y, z - pose.z);
+    }
+  }
+  if (trail.length < 2 || Math.abs(lastTick - pose.tick) > 30 || lastDistance > 0.7) return null;
+  return { version: 1, dimension: OVERWORLD, trail };
+}
+
+async function copyPilotMemory(source: SavedWorld, destination: string, signal: AbortSignal) {
+  const parent = await open(source.root, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY)
+    .catch(() => null);
+  if (!parent) return;
+  let memory: PilotMemory | null;
+  try {
+    const entry = await parent.stat();
+    if (!entry.isDirectory() || entry.ino !== source.rootInode || entry.dev !== source.device ||
+        entry.uid !== process.getuid?.() || (entry.mode & 0o077)) return;
+    // Pin the approved directory while opening its exact artifacts.
+    const root = `/proc/self/fd/${parent.fd}`;
+    const read: ReadPilotArtifact = (name, limit, privateMode) =>
+      readPilotArtifact(root, source.device, name, limit, signal, privateMode);
+    const text = await read(MEMORY_FILE, MEMORY_BYTES, true);
+    memory = text === undefined ? await recoverPilotTrail(source.progress, read) : text ? decodePilotMemory(text) : null;
+  } finally {
+    await parent.close();
+  }
+  if (!memory) return;
+  signal.throwIfAborted();
+  const file = await open(path.join(destination, MEMORY_FILE), "wx", 0o600);
+  try {
+    await file.chmod(0o600);
+    await file.writeFile(JSON.stringify(memory), { signal });
+  } finally {
+    await file.close();
   }
 }
 
@@ -351,7 +549,19 @@ function goalMilestones(goal: Goal, progress: Progress, highWater: Map<string, n
     capped("rawIron", count("raw_iron"), 3);
     capped("ironIngots", count("iron_ingot"), 3);
     capped("ironPickaxe", count("iron_pickaxe"), 1);
-    if (tier === 3) capped("diamond", count("diamond"), 1);
+    if (tier >= 3) capped("diamond", count("diamond"), tier === 3 ? 1 : 3);
+    if (progress.y <= 20 && progress.rock_broken && progress.status.startsWith("branch mining ")) {
+      // A horizontal prospecting tunnel can legitimately run longer than the stall
+      // window. Count rock actually broken, not requested digs or repeated rotations.
+      capped("prospectingBlocks", 16 * Math.floor(progress.rock_broken / 16), Number.MAX_SAFE_INTEGER);
+    }
+    if (goal === "nether_portal") {
+      capped("diamondPickaxe", count("diamond_pickaxe"), 1);
+      capped("obsidian", count("obsidian"), 10);
+      capped("bucket", count("bucket") + count("water_bucket"), 1);
+      capped("igniter", count("flint_and_steel"), 1);
+      capped("portalFrame", progress.frame_blocks ?? 0, 10);
+    }
     const depthBand = -Math.floor(Math.max(-64, progress.y) / 8);
     const best = highWater.get("minedDepthBand");
     if (best === undefined) highWater.set("minedDepthBand", depthBand);
@@ -467,6 +677,7 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
         startup.throwIfAborted();
         if (exit.code !== 0) throw new Stop("failed", "Could not copy the saved pilot world.");
         await checkWorldTree(destination, source.device, copyStopBytes - bytesBefore, startup);
+        await copyPilotMemory(source, dir, startup);
         measuredBytes = await diskBytes(dir, startup);
         if (measuredBytes >= copyStopBytes)
           throw new Stop("storage_limit", "Saved world would exceed the run storage stop threshold.");
@@ -576,8 +787,9 @@ async function run(goal: Goal, seconds: number, parentRun?: string) {
           }
           lastProgress = progress;
           signal.throwIfAborted();
-          if (progress.won && (progress.inventory[`minecraft:${goal}`] ?? 0) > 0) {
-            throw new Stop("won", `Pilot obtained ${goal}.`);
+          if (progress.won && (goal === "nether_portal" ? progress.dimension === "minecraft:the_nether" :
+              (progress.inventory[`minecraft:${goal}`] ?? 0) > 0)) {
+            throw new Stop("won", goal === "nether_portal" ? "Pilot built a portal and entered the Nether." : `Pilot obtained ${goal}.`);
           }
           if (!progress.alive) throw new Stop("died", "The pilot died before obtaining the goal.");
           if (typeof progress.failure === "string") throw new Stop("stalled", progress.failure);

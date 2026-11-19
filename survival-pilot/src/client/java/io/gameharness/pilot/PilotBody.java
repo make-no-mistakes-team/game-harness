@@ -19,6 +19,7 @@ import net.minecraft.entity.mob.Monster;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.EntityHitResult;
@@ -40,9 +41,14 @@ final class PilotBody {
     private static final int COLUMNS = 13;
     private static final int ROWS = 9;
     private static final int RAY_BUDGET = 256;
+    private static final int MOVEMENT_RAYS = 6;
     private static final double MAX_RANGE = 32;
     private static final double TURN_SPEED = 230;
     private static final double TURN_TIME = 0.085;
+    private static final double GAIT_PITCH_SPEED = 48;
+    private static final double GAIT_PITCH_ACCELERATION = 200;
+    private static final double GAIT_PITCH_TIME = 0.20;
+    private static final float[] ESCAPE_BEARINGS = {0, -45, 45, -90, 90, -135, 135, 180};
 
     private enum Ray {
         SIGHT(RaycastContext.ShapeType.OUTLINE, false),
@@ -58,7 +64,7 @@ final class PilotBody {
         }
     }
 
-    private enum Ground { CLEAR, EDGE, LAVA }
+    private enum Ground { CLEAR, EDGE }
 
     private final MinecraftClient client;
     private final Matrix4f viewProjection = new Matrix4f();
@@ -66,9 +72,20 @@ final class PilotBody {
     private final Vector4f clip = new Vector4f();
     private final BlockPos.Mutable lightPos = new BlockPos.Mutable();
     private final BlockHitResult[] samples = new BlockHitResult[COLUMNS * ROWS];
+    private final PilotHazards hazards = new PilotHazards();
 
     private ClientWorld observedWorld;
     private ClientPlayerEntity observedPlayer;
+    private ClientWorld hazardWorld;
+    private ClientPlayerEntity hazardPlayer;
+    private Vec3d dryFooting;
+    private int dryFootingTick;
+    private int lavaContactTick;
+    private Vec3d escapeFrom;
+    private int escapeSince;
+    private int escapeChoice = -1;
+    private int escapeTried;
+    private float escapeBase;
     private int observedAtTick;
     private Vec3d eye;
     private HitResult renderedCrosshair;
@@ -77,6 +94,8 @@ final class PilotBody {
     private float aimYaw;
     private float aimPitch;
     private boolean steering;
+    private boolean gaitSteering;
+    private double gaitPitchVelocity;
     private long lastFrame;
     private int tick;
     private int raysLeft;
@@ -95,6 +114,7 @@ final class PilotBody {
     private boolean ownsKeys;
     private int lastStepJump = -10;
     private BlockPos mining;
+    private BlockPos waterSource;
     private BlockPos support;
     private Direction supportFace;
     private Entity striking;
@@ -105,18 +125,39 @@ final class PilotBody {
 
     void begin() {
         tick++;
-        raysLeft = RAY_BUDGET;
+        raysLeft = RAY_BUDGET - MOVEMENT_RAYS;
         sampleCount = 0;
         sampleRange = 0;
         rayShapeContext = null;
         tickCrosshair = null;
         nightVision = client.player != null && client.player.hasStatusEffect(StatusEffects.NIGHT_VISION);
         resetIntentions();
+        if (hazardWorld != client.world || hazardPlayer != client.player) {
+            hazards.clear();
+            dryFooting = null;
+            escapeChoice = -1;
+            hazardWorld = client.world;
+            hazardPlayer = client.player;
+        }
+        if (!ready()) return;
+        var player = client.player;
+        if (player.isInLava()) lavaContactTick = tick;
+        if (!lavaEgress(player)) {
+            escapeChoice = -1;
+            if (player.isOnGround() && !player.isTouchingWater()) {
+                Vec3d feet = player.getPos();
+                if (dryFooting == null || feet.squaredDistanceTo(dryFooting) >= 0.36 || tick - dryFootingTick > 20) {
+                    dryFooting = feet;
+                    dryFootingTick = tick;
+                }
+            }
+        }
+        if (hasView()) scanFluids(PilotHazards.SIGHT_RANGE, true, false, false);
     }
 
     private void resetIntentions() {
         forward = backward = fast = verifiedDescent = jumping = sneaking = eating = false;
-        mining = support = null;
+        mining = support = waterSource = null;
         supportFace = null;
         striking = null;
     }
@@ -128,12 +169,29 @@ final class PilotBody {
         lastFrame = now;
         if (!steering || !ready() || dt <= 0) return;
         var player = client.player;
-        Vec3d origin = player.getCameraPosVec(client.getRenderTickCounter().getTickDelta(true));
+        Vec3d origin = aimPoint == null ? null
+            : player.getCameraPosVec(client.getRenderTickCounter().getTickDelta(true));
         double yaw = MathHelper.wrapDegrees(goalYaw(player, origin) - player.getYaw());
         double pitch = goalPitch(origin) - player.getPitch();
+        double response = -Math.expm1(-dt / TURN_TIME);
+        if (gaitSteering) {
+            double yawStep = MathHelper.clamp(yaw * response, -TURN_SPEED * dt, TURN_SPEED * dt);
+            double brakingSpeed = Math.sqrt(2 * GAIT_PITCH_ACCELERATION * Math.abs(pitch));
+            double speed = Math.min(GAIT_PITCH_SPEED, brakingSpeed);
+            double desired = MathHelper.clamp(pitch / GAIT_PITCH_TIME, -speed, speed);
+            double accelerationStep = GAIT_PITCH_ACCELERATION * dt;
+            double nextVelocity = gaitPitchVelocity
+                + MathHelper.clamp(desired - gaitPitchVelocity, -accelerationStep, accelerationStep);
+            double pitchStep = (gaitPitchVelocity + nextVelocity) * 0.5 * dt;
+            gaitPitchVelocity = nextVelocity;
+            if (Math.abs(yawStep) + Math.abs(pitchStep) >= 1e-5) {
+                player.changeLookDirection(yawStep / 0.15, pitchStep / 0.15);
+            }
+            return;
+        }
         double distance = Math.hypot(yaw, pitch);
         if (distance < 1e-4) return;
-        double fraction = Math.min(-Math.expm1(-dt / TURN_TIME), TURN_SPEED * dt / distance);
+        double fraction = Math.min(response, TURN_SPEED * dt / distance);
         // This is the same pose update Mouse uses, including the previous render angles.
         player.changeLookDirection(yaw * fraction / 0.15, pitch * fraction / 0.15);
     }
@@ -162,6 +220,7 @@ final class PilotBody {
 
     void finish() {
         if (!ready()) {
+            gaitPitchVelocity = 0;
             releaseKeys();
             return;
         }
@@ -172,13 +231,20 @@ final class PilotBody {
         boolean retreat = backward;
         boolean crouch = sneaking;
         boolean jump = jumping || player.isSubmergedInWater()
-            || (advance || retreat) && (player.isTouchingWater() || player.isInLava());
+            || (advance || retreat) && player.isTouchingWater();
+        Ground ground = Ground.CLEAR;
+        boolean escapingLava = lavaEgress(player);
 
-        if (advance && player.isOnGround() && !player.isTouchingWater()) {
-            Ground ground = terrainAhead(player);
-            if (ground == Ground.LAVA) {
-                advance = false;
-            } else if (ground == Ground.EDGE) {
+        if (escapingLava) {
+            float heading = lavaEscapeHeading(player);
+            float difference = Math.abs(MathHelper.wrapDegrees(heading - player.getYaw()));
+            advance = difference <= 36;
+            retreat = difference >= 144;
+            turn(retreat ? heading + 180 : heading, 24);
+            jump = player.isInLava();
+        } else if (advance && player.isOnGround() && !player.isTouchingWater()) {
+            ground = terrainAhead(player);
+            if (ground == Ground.EDGE) {
                 crouch |= !verifiedDescent;
             } else if (!crouch && player.horizontalCollision && tick - lastStepJump >= 9) {
                 // A collision is own-body feedback; no off-screen/headroom block reads.
@@ -189,7 +255,14 @@ final class PilotBody {
 
         boolean attack = false;
         boolean use = false;
-        if (mining != null || support != null || striking != null || eating) {
+        if (waterSource != null && hasView() && player.getMainHandStack().isOf(Items.BUCKET)) {
+            Vec3d from = player.getEyePos();
+            Vec3d to = from.add(player.getRotationVec(1).multiply(player.getBlockInteractionRange()));
+            BlockHitResult hit = client.world.raycast(new RaycastContext(from, to, RaycastContext.ShapeType.OUTLINE,
+                RaycastContext.FluidHandling.SOURCE_ONLY, player));
+            use = hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(waterSource)
+                && inView(hit.getPos()) && litFace(hit) && client.world.getFluidState(waterSource).isIn(FluidTags.WATER);
+        } else if (mining != null || support != null || striking != null || eating) {
             HitResult actual = currentCrosshair();
             if (support != null) {
                 use = actual instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK
@@ -209,15 +282,97 @@ final class PilotBody {
                 attack = hit.getBlockPos().equals(mining);
             }
         }
+        if (escapingLava) crouch = false;
+        boolean sprintRequested = !escapingLava && advance && fast && !crouch && ground == Ground.CLEAR;
+        if (!escapingLava && (advance || retreat)) {
+            float heading = player.getYaw() + (retreat ? 180 : 0);
+            double reach = jump ? 3.2 : sprintRequested || player.isSprinting() ? 2.35 : crouch ? 0.70 : 1.35;
+            raysLeft += MOVEMENT_RAYS;
+            sightMovementLane(player, heading, reach);
+            if (hazards.lavaRisk(player.getBoundingBox(), heading, reach, jump ? 1.1 : 0, false, tick) > 0) {
+                advance = retreat = sprintRequested = false;
+                jump = player.isSubmergedInWater();
+            }
+        } else if (!escapingLava && jump && !player.isTouchingWater()) {
+            Vec3d motion = player.getVelocity();
+            double drift = motion.horizontalLengthSquared();
+            if (drift > 0.0016
+                    && hazards.lavaRisk(player.getBoundingBox(), heading(motion.x, motion.z),
+                        Math.sqrt(drift) * 9, 1.1, false, tick) > 0) jump = false;
+        }
+        // Vanilla latches sprint when Ctrl is released. Let up on W to brake, then walk again.
+        if (!escapingLava && advance && !sprintRequested && player.isSprinting()) advance = false;
         ownsKeys = true;
         options.forwardKey.setPressed(advance);
         options.backKey.setPressed(retreat);
         options.jumpKey.setPressed(jump);
         setSticky(options.sneakKey, crouch, options.getSneakToggled().getValue());
-        setSticky(options.sprintKey, advance && fast && !crouch, options.getSprintToggled().getValue());
+        setSticky(options.sprintKey, sprintRequested, options.getSprintToggled().getValue());
         options.attackKey.setPressed(attack);
         // Held for this tick only unless requested again; vanilla enforces its use delay.
         options.useKey.setPressed(use);
+    }
+
+    private void sightMovementLane(ClientPlayerEntity player, float yaw, double reach) {
+        if (!hasView() || raysLeft <= 0) return;
+        double angle = Math.toRadians(yaw);
+        double dx = -Math.sin(angle), dz = Math.cos(angle);
+        double distance = Math.min(PilotHazards.MAX_LANE, Math.max(2.25, reach + 0.20));
+        double x = player.getX() + dx * distance, z = player.getZ() + dz * distance;
+        double halfWidth = player.getWidth() * 0.5;
+        for (int side = -1; side <= 1; side++) {
+            double sx = x + side * halfWidth * dz, sz = z - side * halfWidth * dx;
+            Vec3d shallow = new Vec3d(sx, player.getY() - 0.55, sz);
+            Vec3d belowLip = new Vec3d(sx, player.getY() - 2.5, sz);
+            if (inView(shallow)) visibleHit(shallow, Ray.FLUIDS);
+            if (inView(belowLip)) visibleHit(belowLip, Ray.FLUIDS);
+        }
+    }
+
+    private boolean lavaEgress(ClientPlayerEntity player) {
+        // Keep the exit bearing through the first jump out, not through a fresh land movement.
+        return player.isInLava() || escapeChoice >= 0 && tick - lavaContactTick <= 12
+            && player.isOnFire() && !player.isOnGround() && !player.isTouchingWater();
+    }
+
+    private float lavaEscapeHeading(ClientPlayerEntity player) {
+        Vec3d feet = player.getPos();
+        if (escapeChoice < 0) {
+            escapeTried = 0;
+            escapeBase = player.getYaw();
+            if (dryFooting != null && tick - dryFootingTick <= 80 && Math.abs(dryFooting.y - feet.y) <= 1.6) {
+                double dx = dryFooting.x - feet.x, dz = dryFooting.z - feet.z;
+                double distance = dx * dx + dz * dz;
+                if (distance > 0.04 && distance <= 36) escapeBase = heading(dx, dz);
+            }
+        } else {
+            double dx = feet.x - escapeFrom.x, dz = feet.z - escapeFrom.z;
+            if (dx * dx + dz * dz >= 0.12) {
+                escapeFrom = feet;
+                escapeSince = tick;
+            }
+            if (tick - escapeSince < 18) return escapeBase + ESCAPE_BEARINGS[escapeChoice];
+            escapeTried |= 1 << escapeChoice;
+            if (escapeTried == (1 << ESCAPE_BEARINGS.length) - 1) escapeTried = 0;
+        }
+        double best = Double.POSITIVE_INFINITY;
+        Box bounds = player.getBoundingBox();
+        for (int i = 0; i < ESCAPE_BEARINGS.length; i++) {
+            if ((escapeTried & 1 << i) != 0) continue;
+            double risk = hazards.lavaRisk(bounds, escapeBase + ESCAPE_BEARINGS[i],
+                2.65, 0.85, true, tick) + 0.0015 * Math.abs(ESCAPE_BEARINGS[i]);
+            if (risk < best) {
+                best = risk;
+                escapeChoice = i;
+            }
+        }
+        escapeFrom = feet;
+        escapeSince = tick;
+        return escapeBase + ESCAPE_BEARINGS[escapeChoice];
+    }
+
+    private static float heading(double dx, double dz) {
+        return (float) Math.toDegrees(Math.atan2(-dx, dz));
     }
 
     private HitResult currentCrosshair() {
@@ -244,9 +399,16 @@ final class PilotBody {
     void release() {
         resetIntentions();
         steering = false;
+        gaitSteering = false;
+        gaitPitchVelocity = 0;
         aimPoint = null;
         lastFrame = 0;
         clearView();
+        hazards.clear();
+        hazardWorld = null;
+        hazardPlayer = null;
+        dryFooting = escapeFrom = null;
+        escapeChoice = -1;
         releaseKeys();
     }
 
@@ -280,9 +442,22 @@ final class PilotBody {
     void aim(Vec3d point) {
         aimPoint = point;
         steering = true;
+        gaitSteering = false;
+        gaitPitchVelocity = 0;
     }
 
     void turn(float yaw, float pitch) {
+        setTurn(yaw, pitch);
+        gaitSteering = false;
+        gaitPitchVelocity = 0;
+    }
+
+    void lookAlongGait(float yaw, float pitch) {
+        setTurn(yaw, pitch);
+        gaitSteering = true;
+    }
+
+    private void setTurn(float yaw, float pitch) {
         aimPoint = null;
         aimYaw = yaw;
         aimPitch = MathHelper.clamp(pitch, -90, 90);
@@ -339,6 +514,8 @@ final class PilotBody {
         support = target;
         supportFace = face;
     }
+
+    void useWaterSource(BlockPos target) { waterSource = target; }
 
     Optional<BlockHitResult> find(Predicate<BlockState> matches, double distance) {
         if (!hasView()) return Optional.empty();
@@ -413,9 +590,58 @@ final class PilotBody {
         return probe(point, distance, Ray.FLUIDS);
     }
 
+    /** Preflight a proposed bearing against recently rendered lava, without sensing that direction blindly. */
+    boolean hazardAhead(float yaw, double distance) {
+        return ready() && hazards.lavaRisk(client.player.getBoundingBox(), yaw, distance, 0.65, false, tick) > 0;
+    }
+
+    /** A surface hit from the current rendered camera, optionally limited to a collectable source. */
+    BlockHitResult visibleFluid(boolean lava, boolean sourceOnly, double distance) {
+        if (!hasView()) return null;
+        double max = range(distance);
+        if (!(max > 0)) return null;
+        BlockHitResult near = hazards.currentFluid(lava, sourceOnly, eye, max, tick);
+        return near != null ? near : scanFluids(max, false, lava, sourceOnly);
+    }
+
+    private BlockHitResult scanFluids(double distance, boolean near, boolean lava, boolean sourceOnly) {
+        int columns = near ? 7 : 9, rows = near ? 4 : 5;
+        float uPhase = (tick & 1) == 0 ? 0.28f : 0.72f;
+        float vPhase = (tick & 2) == 0 ? 0.30f : 0.70f;
+        double nearest = distance * distance;
+        BlockHitResult best = null;
+        for (int y = 0; y < rows && raysLeft > 0; y++) {
+            float v = -0.98f + (near ? 1.48f : 1.96f) * ((y + vPhase) / rows);
+            for (int x = 0; x < columns && raysLeft > 0; x++) {
+                float u = 1.96f * ((x + uPhase) / columns) - 0.98f;
+                inverseViewProjection.transform(clip.set(u, v, 0.9f, 1));
+                double dx = clip.x / (double) clip.w, dy = clip.y / (double) clip.w, dz = clip.z / (double) clip.w;
+                double scale = distance / Math.sqrt(dx * dx + dy * dy + dz * dz);
+                Vec3d end = eye.add(dx * scale, dy * scale, dz * scale);
+                if (!inView(end)) continue;
+                BlockHitResult hit = litHit(end, Ray.FLUIDS);
+                if (hit == null) continue;
+                byte kind = PilotHazards.kind(client.world.getBlockState(hit.getBlockPos()));
+                double d = eye.squaredDistanceTo(hit.getPos());
+                hazards.observe(hit, kind, eye, d, tick);
+                if (!near && PilotHazards.matches(kind, lava, sourceOnly)) {
+                    if (d > nearest) continue;
+                    best = hit;
+                    nearest = d;
+                }
+            }
+        }
+        return best;
+    }
+
     /** A lit floor or fluid surface; no result means unknown, not proven empty. */
     Optional<BlockHitResult> terrain(Vec3d point, double distance) {
         return probe(point, distance, Ray.TERRAIN);
+    }
+
+    /** Require visible, lit clearance; an out-of-frame or unlit lane is not clear. */
+    boolean clearTerrain(Vec3d point) {
+        return hasView() && clearPoint(point, Ray.TERRAIN);
     }
 
     private Optional<BlockHitResult> probe(Vec3d point, double distance, Ray ray) {
@@ -481,8 +707,8 @@ final class PilotBody {
             double d = center.squaredDistanceTo(eye);
             if (d > bestDistance) continue;
             double margin = candidate.getHeight() * 0.32;
-            if ((clearPoint(center) || clearPoint(center.add(0, margin, 0))
-                    || clearPoint(center.add(0, -margin, 0))) && matches.test(candidate)) {
+            if ((clearPoint(center, Ray.SIGHT) || clearPoint(center.add(0, margin, 0), Ray.SIGHT)
+                    || clearPoint(center.add(0, -margin, 0), Ray.SIGHT)) && matches.test(candidate)) {
                 best = candidate;
                 bestDistance = d;
             }
@@ -490,14 +716,25 @@ final class PilotBody {
         return Optional.ofNullable(best);
     }
 
-    private boolean clearPoint(Vec3d point) {
+    private boolean clearPoint(Vec3d point, Ray ray) {
         if (raysLeft <= 0 || !inView(point)) return false;
         raysLeft--;
-        return raycast(point, Ray.SIGHT).getType() == HitResult.Type.MISS
+        return raycast(point, ray).getType() == HitResult.Type.MISS
             && lit(point.x, point.y, point.z);
     }
 
     private BlockHitResult visibleHit(Vec3d end, Ray ray) {
+        BlockHitResult hit = litHit(end, ray);
+        if (hit != null && ray != Ray.TERRAIN) {
+            double d = eye.squaredDistanceTo(hit.getPos());
+            if (d <= PilotHazards.SIGHT_RANGE * PilotHazards.SIGHT_RANGE) {
+                hazards.observe(hit, PilotHazards.kind(client.world.getBlockState(hit.getBlockPos())), eye, d, tick);
+            }
+        }
+        return hit;
+    }
+
+    private BlockHitResult litHit(Vec3d end, Ray ray) {
         if (raysLeft <= 0) return null;
         raysLeft--;
         BlockHitResult hit = raycast(end, ray);
@@ -547,25 +784,13 @@ final class PilotBody {
         double y = player.getY();
         // Restrict the ledge/shore probes to points actually inside the rendered field.
         Vec3d near = new Vec3d(player.getX() + 1.25 * x, y - 1.55, player.getZ() + 1.25 * z);
-        Vec3d far = new Vec3d(player.getX() + 2.65 * x, y - 0.38, player.getZ() + 2.65 * z);
-        if (inView(far)) {
-            BlockHitResult hit = raycast(far, Ray.TERRAIN);
-            if (visibleLava(hit, y)) return Ground.LAVA;
-        }
         if (inView(near)) {
             BlockHitResult hit = raycast(near, Ray.TERRAIN);
-            if (visibleLava(hit, y)) return Ground.LAVA;
             if (hit.getType() == HitResult.Type.MISS || !inView(hit.getPos()) || !litFace(hit)) {
                 return Ground.EDGE;
             }
         }
         return Ground.CLEAR;
-    }
-
-    private boolean visibleLava(BlockHitResult hit, double feetY) {
-        return hit.getType() == HitResult.Type.BLOCK && hit.getPos().y >= feetY - 0.85
-            && inView(hit.getPos()) && litFace(hit)
-            && client.world.getBlockState(hit.getBlockPos()).getFluidState().isIn(FluidTags.LAVA);
     }
 
     private double range(double requested) {

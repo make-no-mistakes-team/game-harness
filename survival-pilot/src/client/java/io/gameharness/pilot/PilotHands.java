@@ -50,8 +50,10 @@ final class PilotHands {
         STICK(Items.STICK, 4, "p", "p"),
         WOODEN_PICKAXE(Items.WOODEN_PICKAXE, 1, "ppp", " s ", " s "),
         WOODEN_SHOVEL(Items.WOODEN_SHOVEL, 1, "p", "s", "s"),
+        WOODEN_AXE(Items.WOODEN_AXE, 1, "pp", "ps", " s"),
         STONE_PICKAXE(Items.STONE_PICKAXE, 1, "rrr", " s ", " s "),
         STONE_SHOVEL(Items.STONE_SHOVEL, 1, "r", "s", "s"),
+        STONE_AXE(Items.STONE_AXE, 1, "rr", "rs", " s"),
         FURNACE(Items.FURNACE, 1, "mmm", "m m", "mmm"),
         IRON_PICKAXE(Items.IRON_PICKAXE, 1, "iii", " s ", " s "),
         IRON_SHOVEL(Items.IRON_SHOVEL, 1, "i", "s", "s"),
@@ -190,8 +192,10 @@ final class PilotHands {
             case "stick", "sticks" -> Recipe.STICK;
             case "wooden_pickaxe" -> Recipe.WOODEN_PICKAXE;
             case "wooden_shovel" -> Recipe.WOODEN_SHOVEL;
+            case "wooden_axe" -> Recipe.WOODEN_AXE;
             case "stone_pickaxe" -> Recipe.STONE_PICKAXE;
             case "stone_shovel" -> Recipe.STONE_SHOVEL;
+            case "stone_axe" -> Recipe.STONE_AXE;
             case "furnace" -> Recipe.FURNACE;
             case "iron_pickaxe" -> Recipe.IRON_PICKAXE;
             case "iron_shovel" -> Recipe.IRON_SHOVEL;

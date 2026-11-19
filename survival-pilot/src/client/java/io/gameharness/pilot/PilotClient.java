@@ -12,9 +12,14 @@ import java.util.Set;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+import net.fabricmc.fabric.api.event.client.player.ClientPlayerBlockBreakEvents;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.gui.screen.ingame.CraftingScreen;
+import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.registry.Registries;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.world.GameMode;
 
 /** Private run telemetry observes the player. No command, server or world-data input channel. */
@@ -29,6 +34,12 @@ public final class PilotClient implements ClientModInitializer {
     private long tick;
     private String lastStatus = "";
     private String lastHands = "";
+    private Screen renderedScreen;
+    private int personalOpens;
+    private int benchOpens;
+    private boolean screenChanged;
+    private float lastYaw = Float.NaN;
+    private double yawTravel;
     private boolean ended;
 
     @Override public void onInitializeClient() {
@@ -44,12 +55,39 @@ public final class PilotClient implements ClientModInitializer {
         WorldRenderEvents.START.register(context -> {
             if (progress != null && !ended) body.observeFrame(context);
         });
+        ClientPlayerBlockBreakEvents.AFTER.register((world, player, pos, state) -> {
+            if (progress == null || ended) return;
+            JsonObject hit = new JsonObject();
+            hit.addProperty("tick", tick);
+            hit.addProperty("wall_ms", System.currentTimeMillis());
+            hit.addProperty("block", Registries.BLOCK.getId(state.getBlock()).toString());
+            hit.addProperty("held", Registries.ITEM.getId(player.getMainHandStack().getItem()).toString());
+            append("breaks.jsonl", hit + "\n");
+        });
+    }
+
+    private void append(String file, String line) {
+        try { Files.writeString(directory.resolve(file), line, StandardOpenOption.CREATE, StandardOpenOption.APPEND); }
+        catch (IOException e) { body.release(); ended = true; throw new UncheckedIOException(e); }
     }
 
     public static void steerFrame() {
         if (active != null && active.progress != null && !active.ended) {
+            Screen shown = MinecraftClient.getInstance().currentScreen;
+            if (shown != active.renderedScreen) {
+                active.renderedScreen = shown;
+                active.screenChanged = true;
+                if (shown instanceof InventoryScreen) ++active.personalOpens;
+                else if (shown instanceof CraftingScreen) ++active.benchOpens;
+            }
             active.body.frame();
             active.hands.frame();
+            var player = MinecraftClient.getInstance().player;
+            if (player != null && shown == null) {
+                float yaw = player.getYaw();
+                if (Float.isFinite(active.lastYaw)) active.yawTravel += Math.abs(MathHelper.wrapDegrees(yaw - active.lastYaw));
+                active.lastYaw = yaw;
+            } else active.lastYaw = Float.NaN;
         }
     }
 
@@ -83,11 +121,11 @@ public final class PilotClient implements ClientModInitializer {
             }
             body.finish();
         }
-        boolean won = alive && progress.won();
-        if (won || !alive) { body.release(); ended = true; }
+        boolean won = alive && progress.won() && !hands.busy() && client.currentScreen == null && renderedScreen == null;
+        if (won || !alive) { hands.cancel(); body.release(); ended = true; }
         String status = !alive ? "dead" : fleeing ? "evading a primed creeper" : progress.status();
         String handStatus = hands.status();
-        boolean changed = !status.equals(lastStatus) || !handStatus.equals(lastHands);
+        boolean changed = screenChanged || !status.equals(lastStatus) || !handStatus.equals(lastHands);
         if (changed || tick % 20 == 0 || ended || tick == 1) {
             JsonObject event = new JsonObject();
             event.addProperty("tick", tick);
@@ -102,8 +140,14 @@ public final class PilotClient implements ClientModInitializer {
             event.addProperty("y", client.player.getY());
             event.addProperty("z", client.player.getZ());
             event.addProperty("yaw", client.player.getYaw());
+            event.addProperty("yaw_travel", yawTravel);
             event.addProperty("pitch", client.player.getPitch());
             event.addProperty("gui", client.currentScreen != null);
+            event.addProperty("rendered_screen", renderedScreen == null ? "world" :
+                renderedScreen instanceof InventoryScreen ? "inventory" :
+                renderedScreen instanceof CraftingScreen ? "crafting_table" : "other");
+            event.addProperty("personal_opens", personalOpens);
+            event.addProperty("bench_opens", benchOpens);
             JsonObject counts = new JsonObject();
             PlayerInventory inventory = client.player.getInventory();
             for (int i = 0; i < inventory.size(); ++i) {
@@ -115,8 +159,7 @@ public final class PilotClient implements ClientModInitializer {
             event.add("inventory", counts);
             String line = event + "\n";
             try {
-                if (changed || ended || tick % 100 == 0) Files.writeString(directory.resolve("events.jsonl"), line,
-                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                if (changed || ended || tick % 100 == 0) append("events.jsonl", line);
                 if (tick == 1 || tick % 20 == 0 || ended) {
                     Path part = directory.resolve("progress.tmp");
                     Files.writeString(part, line);
@@ -126,6 +169,7 @@ public final class PilotClient implements ClientModInitializer {
             } catch (IOException e) { body.release(); ended = true; throw new UncheckedIOException(e); }
             lastStatus = status;
             lastHands = handStatus;
+            screenChanged = false;
         }
     }
 }

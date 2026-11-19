@@ -37,6 +37,7 @@ final class PilotHands {
     private static final long ACTION_TIMEOUT = 15_000_000_000L;
     private static final long RESULT_TIMEOUT = 1_500_000_000L;
     private static final long KEY_TIMEOUT = 1_000_000_000L;
+    private static final long LEFT_CLICK_INTERVAL = 260_000_000L; // Outside vanilla's double-click window.
     private static final int SMELT_TICKS = 200;
 
     private enum Job { CRAFT, SMELT, EQUIP }
@@ -48,7 +49,9 @@ final class PilotHands {
         CRAFTING_TABLE(Items.CRAFTING_TABLE, 1, "pp", "pp"),
         STICK(Items.STICK, 4, "p", "p"),
         WOODEN_PICKAXE(Items.WOODEN_PICKAXE, 1, "ppp", " s ", " s "),
+        WOODEN_SHOVEL(Items.WOODEN_SHOVEL, 1, "p", "s", "s"),
         STONE_PICKAXE(Items.STONE_PICKAXE, 1, "rrr", " s ", " s "),
+        STONE_SHOVEL(Items.STONE_SHOVEL, 1, "r", "s", "s"),
         FURNACE(Items.FURNACE, 1, "mmm", "m m", "mmm"),
         IRON_PICKAXE(Items.IRON_PICKAXE, 1, "iii", " s ", " s "),
         STONE_SWORD(Items.STONE_SWORD, 1, "r", "r", "s"),
@@ -68,6 +71,8 @@ final class PilotHands {
             return rows.length > 2 || rows[0].length() > 2;
         }
     }
+
+    private record CraftRequest(Recipe recipe, String key) {}
 
     private record CraftPlan(Recipe recipe, Item result, int batch, int[] sources, int[] used) {}
 
@@ -98,10 +103,14 @@ final class PilotHands {
     private Job job;
     private HandledScreen<?> screen;
     private Click click;
-    private CraftPlan craftPlan;
-    private Predicate<ItemStack> equipItem;
+    private Slot lastLeftSlot;
+    private long nextSameLeftPress;
+    private CraftRequest[] crafts;
+    private CraftPlan firstCraftPlan;
+    private int craftIndex;
+    private ItemStack equipStack = ItemStack.EMPTY;
     private int equipSource, hotbar;
-    private boolean inventoryNeeded, planned, storeResult, previousFailure;
+    private boolean inventoryNeeded, planned, storeResult, resultStored, previousFailure;
     private KeyBinding pendingKey;
     private long deadline, keyDeadline, resultDeadline;
     private String label = "hands";
@@ -131,24 +140,13 @@ final class PilotHands {
     }
 
     boolean craft(String item) {
+        return craftBatch(List.of(item));
+    }
+
+    boolean craftBatch(List<String> recipes) {
         if (busy() || c.player == null) return false;
-        String key = item.startsWith("minecraft:") ? item.substring("minecraft:".length()) : item;
-        Recipe recipe = switch (key) {
-            case "planks" -> Recipe.PLANKS;
-            case "crafting_table" -> Recipe.CRAFTING_TABLE;
-            case "stick", "sticks" -> Recipe.STICK;
-            case "wooden_pickaxe" -> Recipe.WOODEN_PICKAXE;
-            case "stone_pickaxe" -> Recipe.STONE_PICKAXE;
-            case "furnace" -> Recipe.FURNACE;
-            case "iron_pickaxe" -> Recipe.IRON_PICKAXE;
-            case "stone_sword" -> Recipe.STONE_SWORD;
-            case "torch", "torches" -> Recipe.TORCH;
-            default -> key.endsWith("_planks") ? Recipe.PLANKS : null;
-        };
-        if (recipe == null) return report("craft", "unsupported recipe");
+        if (recipes.isEmpty()) return report("craft", "no recipes");
         var current = c.currentScreen;
-        if (recipe.needsTable() && !(current instanceof CraftingScreen))
-            return report("craft", "crafting table required");
         if (current != null && !(current instanceof InventoryScreen || current instanceof CraftingScreen))
             return report("craft", "incompatible screen");
         if (current instanceof HandledScreen<?> handled && !cleanGrid(handled))
@@ -156,15 +154,51 @@ final class PilotHands {
         if (current == null && c.options.inventoryKey.isUnbound())
             return report("craft", "inventory key unbound");
 
-        CraftPlan plan = ingredients(c.player.getInventory(), recipe, key);
-        if (plan == null) return report("craft", "missing ingredients");
+        CraftRequest[] requests = new CraftRequest[recipes.size()];
+        int i = 0;
+        for (String item : recipes) {
+            CraftRequest request = craftRequest(item);
+            if (request == null) return report("craft", "unsupported recipe " + item);
+            if (request.recipe.needsTable() && !(current instanceof CraftingScreen))
+                return report("craft", "crafting table required for " + request.key);
+            requests[i++] = request;
+        }
+        CraftRequest first = requests[0];
+        CraftPlan plan = ingredients(c.player.getInventory(), first.recipe, first.key);
+        if (plan == null) return report("craft", "missing ingredients for " + first.key);
         if (!storageRoom(new ItemStack(plan.result, plan.batch), plan.used))
             return report("craft", "inventory full");
 
-        start(Job.CRAFT, "craft " + key, (HandledScreen<?>) current);
-        craftPlan = plan;
+        String name = requests.length == 1 ? "craft " + first.key : "craft batch (" + requests.length + ")";
+        start(Job.CRAFT, name, (HandledScreen<?>) current);
+        crafts = requests;
+        firstCraftPlan = plan;
         inventoryNeeded = true;
         return true;
+    }
+
+    private static CraftRequest craftRequest(String item) {
+        if (item == null) return null;
+        String key = item.startsWith("minecraft:") ? item.substring("minecraft:".length()) : item;
+        Recipe recipe = switch (key) {
+            case "planks" -> Recipe.PLANKS;
+            case "crafting_table" -> Recipe.CRAFTING_TABLE;
+            case "stick", "sticks" -> Recipe.STICK;
+            case "wooden_pickaxe" -> Recipe.WOODEN_PICKAXE;
+            case "wooden_shovel" -> Recipe.WOODEN_SHOVEL;
+            case "stone_pickaxe" -> Recipe.STONE_PICKAXE;
+            case "stone_shovel" -> Recipe.STONE_SHOVEL;
+            case "furnace" -> Recipe.FURNACE;
+            case "iron_pickaxe" -> Recipe.IRON_PICKAXE;
+            case "stone_sword" -> Recipe.STONE_SWORD;
+            case "torch", "torches" -> Recipe.TORCH;
+            default -> {
+                Identifier id = key.endsWith("_planks") && key.indexOf(':') < 0 ? Identifier.tryParse(key) : null;
+                yield id != null && Registries.ITEM.get(id).getRegistryEntry().isIn(ItemTags.PLANKS)
+                        ? Recipe.PLANKS : null;
+            }
+        };
+        return recipe == null ? null : new CraftRequest(recipe, key);
     }
 
     boolean smelt() {
@@ -240,39 +274,54 @@ final class PilotHands {
     boolean equip(Predicate<ItemStack> item) {
         if (c.player == null) return false;
         var inv = c.player.getInventory();
-        if (!inv.getMainHandStack().isEmpty() && item.test(inv.getMainHandStack())) return true;
+        if (item.test(inv.getMainHandStack())) return true;
         if (busy()) return false;
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            if (!item.test(inv.getStack(slot))) continue;
+            int destination = equipDestination(inv, slot);
+            if (destination >= 0) return queueEquip(inv, slot, destination);
+        }
+        return report("equip", "item or usable hotbar slot unavailable");
+    }
+
+    /** False may mean pending; once a storage item moves, reevaluate the current hotbar. */
+    boolean equipSlot(int slot) {
+        if (c.player == null || slot < 0 || slot >= PlayerInventory.MAIN_SIZE) return false;
+        var inv = c.player.getInventory();
+        if (inv.selectedSlot == slot) return true;
+        if (!busy()) {
+            int destination = equipDestination(inv, slot);
+            if (destination >= 0) queueEquip(inv, slot, destination);
+            else report("equip", "slot or usable hotbar key unavailable");
+        }
+        return false;
+    }
+
+    private int equipDestination(PlayerInventory inv, int source) {
+        if (source < PlayerInventory.HOTBAR_SIZE)
+            return c.options.hotbarKeys[source].isUnbound() ? -1 : source;
+        ItemStack stack = inv.getStack(source);
+        if (stack.isEmpty()) return inv.getMainHandStack().isEmpty() ? -1 : inv.selectedSlot;
+        return hotbarDestination(inv, stack);
+    }
+
+    private boolean queueEquip(PlayerInventory inv, int source, int destination) {
         if (c.currentScreen != null && !(c.currentScreen instanceof InventoryScreen))
             return report("equip", "incompatible screen");
         var inventory = (InventoryScreen) c.currentScreen;
         if (inventory != null && !inventory.getScreenHandler().getCursorStack().isEmpty())
             return report("equip", "cursor occupied");
+        boolean transfer = source != destination;
+        if (transfer && inventory == null && c.options.inventoryKey.isUnbound())
+            return report("equip", "inventory key unbound");
 
-        for (int i = 0; i < PlayerInventory.HOTBAR_SIZE; i++) {
-            ItemStack stack = inv.getStack(i);
-            if (!stack.isEmpty() && item.test(stack) && !c.options.hotbarKeys[i].isUnbound()) {
-                start(Job.EQUIP, "equip", inventory);
-                equipItem = item;
-                hotbar = i;
-                planned = true;
-                return true;
-            }
-        }
-        for (int i = 0; i < PlayerInventory.MAIN_SIZE; i++) {
-            ItemStack stack = inv.getStack(i);
-            if (stack.isEmpty() || !item.test(stack)) continue;
-            int dest = hotbarDestination(inv, stack);
-            if (dest < 0) continue;
-            if (inventory == null && c.options.inventoryKey.isUnbound())
-                return report("equip", "inventory key unbound");
-            start(Job.EQUIP, "equip", inventory);
-            equipItem = item;
-            equipSource = i;
-            hotbar = dest;
-            inventoryNeeded = true;
-            return true;
-        }
-        return report("equip", "item or usable hotbar slot unavailable");
+        start(Job.EQUIP, "equip", inventory);
+        equipStack = inv.getStack(source).copy();
+        equipSource = source;
+        hotbar = destination;
+        inventoryNeeded = transfer;
+        planned = !transfer;
+        return true;
     }
 
     void cancel() {
@@ -346,7 +395,7 @@ final class PilotHands {
             return;
         }
         if (click != null) {
-            advanceClick();
+            advanceClick(now);
             return;
         }
 
@@ -366,8 +415,10 @@ final class PilotHands {
             return;
         }
         if (!planned) {
-            if (job == Job.CRAFT ? !planCraft() : !planEquip()) {
-                finish("inventory or crafting grid changed");
+            if (job == Job.CRAFT) {
+                if (!planNextCraft()) return;
+            } else if (!planEquip()) {
+                finish("inventory changed before equip");
                 return;
             }
             planned = true;
@@ -393,6 +444,10 @@ final class PilotHands {
         }
         if (!carried.isEmpty()) {
             finish("cursor not empty");
+        } else if (storeResult && !resultStored) {
+            finish("result not stored");
+        } else if (job == Job.CRAFT) {
+            completeCraft(now);
         } else if (job == Job.EQUIP) {
             closeScreen();
             inventoryNeeded = false;
@@ -402,8 +457,11 @@ final class PilotHands {
         }
     }
 
-    private void advanceClick() {
+    private void advanceClick(long now) {
         if (!click.arrived || Screen.hasShiftDown()) return;
+        Slot slot = click.step.slot;
+        boolean leftSlotPress = slot != null && click.button == GLFW_MOUSE_BUTTON_LEFT;
+        if (!click.pressed && leftSlotPress && slot == lastLeftSlot && now < nextSameLeftPress) return;
         var window = c.getWindow();
         sampleCursor(window.getHandle());
         double scaleX = (double) window.getScaledWidth() / window.getWidth();
@@ -427,13 +485,19 @@ final class PilotHands {
             }
             c.setNavigationType(GuiNavigationType.MOUSE);
             screen.mouseClicked(x, y, click.button);
+            if (leftSlotPress) {
+                lastLeftSlot = slot;
+                nextSameLeftPress = now + LEFT_CLICK_INTERVAL;
+            }
             click.pressed = true;
         } else {
             screen.mouseReleased(x, y, click.button);
             if (click.step.mode == Mode.CLEAR_BOOK) {
                 if (bookHidesSlots()) finish("recipe book did not close");
-            } else if (!clickEffect(click, handler.getCursorStack())) {
-                finish("slot gesture had no expected effect");
+            } else {
+                ItemStack cursor = handler.getCursorStack();
+                if (!clickEffect(click, cursor)) finish("slot gesture had no expected effect");
+                else if (click.step.mode == Mode.STORE && cursor.isEmpty()) resultStored = true;
             }
             if (busy() && previousFailure) {
                 previousFailure = false;
@@ -488,6 +552,9 @@ final class PilotHands {
                     && slot.canInsert(cursor) && slot.canTakeItems(c.player);
             case CLEAR_BOOK -> false;
         };
+        if (job == Job.EQUIP && slot.getIndex() == equipSource
+                && (step.mode == Mode.TAKE || equipStack.isEmpty()))
+            allowed &= ItemStack.areEqual(stack, equipStack);
         if (!allowed || !slot.isEnabled()) finish("slot not ready for gesture");
         else click = new Click(step, null, cursor, stack);
     }
@@ -498,15 +565,45 @@ final class PilotHands {
             case ONE -> cursor.getCount() == click.cursorBefore.getCount() - 1
                     && (cursor.isEmpty() || same(cursor, click.cursorBefore));
             case PUT -> cursor.isEmpty();
-            case STORE -> cursor.isEmpty()
-                    || same(cursor, click.cursorBefore) && cursor.getCount() < click.cursorBefore.getCount();
+            case STORE -> {
+                int transferred = click.cursorBefore.getCount() - cursor.getCount();
+                ItemStack destination = click.step.slot.getStack();
+                yield transferred > 0 && (cursor.isEmpty() || same(cursor, click.cursorBefore))
+                        && same(destination, click.cursorBefore)
+                        && destination.getCount() == click.slotBefore.getCount() + transferred;
+            }
             case SWAP -> ItemStack.areEqual(click.slotBefore, cursor)
                     && ItemStack.areEqual(click.cursorBefore, click.step.slot.getStack());
             case CLEAR_BOOK -> true;
         };
     }
 
-    private boolean planCraft() {
+    private boolean planNextCraft() {
+        CraftRequest request = crafts[craftIndex];
+        CraftPlan plan = firstCraftPlan;
+        firstCraftPlan = null;
+        if (plan == null) plan = ingredients(c.player.getInventory(), request.recipe, request.key);
+        if (plan == null) finish("missing ingredients for " + request.key);
+        else if (!planCraft(plan)) finish("inventory or crafting grid changed before " + request.key);
+        else return true;
+        return false;
+    }
+
+    private void completeCraft(long now) {
+        if (!cleanGrid(screen)) {
+            finish("crafting grid did not clear");
+        } else if (++craftIndex == crafts.length) {
+            finish("done");
+        } else {
+            // The next plan must see the actual storage after this recipe, not a projected inventory.
+            planned = storeResult = resultStored = false;
+            resultDeadline = 0;
+            deadline = now + ACTION_TIMEOUT;
+            status = label + ": " + craftIndex + "/" + crafts.length + " done; next " + crafts[craftIndex].key;
+        }
+    }
+
+    private boolean planCraft(CraftPlan craftPlan) {
         if (!cleanGrid(screen) || !storageRoom(new ItemStack(craftPlan.result, craftPlan.batch), craftPlan.used))
             return false;
         var handler = (AbstractCraftingScreenHandler) screen.getScreenHandler();
@@ -543,7 +640,12 @@ final class PilotHands {
         Slot source = storageSlot(handler, equipSource), dest = storageSlot(handler, hotbar);
         if (source == null || dest == null || !handler.getCursorStack().isEmpty()) return false;
         ItemStack tool = source.getStack(), previous = dest.getStack();
-        if (tool.isEmpty() || !equipItem.test(tool) || same(tool, previous)) return false;
+        if (!ItemStack.areEqual(tool, equipStack) || same(tool, previous)) return false;
+        if (tool.isEmpty()) {
+            if (previous.isEmpty()) return false;
+            transfer(dest, source, previous.getCount());
+            return true;
+        }
         steps.addLast(new Step(Mode.TAKE, source, tool.getItem(), tool.getCount()));
         steps.addLast(new Step(previous.isEmpty() ? Mode.PUT : Mode.SWAP, dest, tool.getItem(), 0));
         if (!previous.isEmpty()) steps.addLast(new Step(Mode.PUT, source, previous.getItem(), 0));
@@ -557,7 +659,7 @@ final class PilotHands {
         }
         var inv = c.player.getInventory();
         ItemStack target = inv.getStack(hotbar);
-        if (target.isEmpty() || !equipItem.test(target)) {
+        if (!ItemStack.areEqual(target, equipStack)) {
             finish("item not in expected hotbar slot");
         } else if (inv.selectedSlot == hotbar) {
             pendingKey = null;
@@ -623,10 +725,13 @@ final class PilotHands {
         report(label, reason);
         job = null;
         click = null;
-        craftPlan = null;
-        equipItem = null;
+        lastLeftSlot = null;
+        crafts = null;
+        firstCraftPlan = null;
+        craftIndex = 0;
+        equipStack = ItemStack.EMPTY;
         steps.clear();
-        inventoryNeeded = planned = storeResult = false;
+        inventoryNeeded = planned = storeResult = resultStored = false;
         resultDeadline = 0;
     }
 
@@ -733,6 +838,8 @@ final class PilotHands {
     }
 
     private Slot resultDestination(ScreenHandler handler, ItemStack stack) {
+        boolean preferHotbar = stack.isOf(Items.CRAFTING_TABLE) || stack.isOf(Items.FURNACE)
+                || stack.isIn(ItemTags.PICKAXES) || stack.isIn(ItemTags.SHOVELS) || stack.isIn(ItemTags.SWORDS);
         Slot best = null;
         int bestScore = 0;
         for (Slot slot : handler.slots) {
@@ -740,6 +847,8 @@ final class PilotHands {
             int available = room(slot, stack);
             if (available <= 0) continue;
             int score = available >= stack.getCount() ? (slot.hasStack() ? 1000 : 500) : available;
+            if (preferHotbar && slot.getIndex() < PlayerInventory.HOTBAR_SIZE && available >= stack.getCount())
+                score += 2000;
             if (score > bestScore) {
                 best = slot;
                 bestScore = score;

@@ -16,6 +16,7 @@ final class AgentEars implements SoundInstanceListener {
     private static final long FRESH_SHOT_NANOS = 700_000_000L;
 
     record RangedCue(float yaw, float pitch, long heardAt) {}
+    record MeleeCue(float yaw, long heardAt, boolean near) {}
 
     enum ZombieCue {
         GROAN("checking a nearby zombie groan"),
@@ -39,6 +40,7 @@ final class AgentEars implements SoundInstanceListener {
     private long zombieHeardAt;
     private float towardZombie;
     private RangedCue rangedCue;
+    private MeleeCue meleeCue;
 
     AgentEars(MinecraftClient client, Supplier<Screen> renderedScreen) {
         this.client = client;
@@ -61,12 +63,14 @@ final class AgentEars implements SoundInstanceListener {
             case "entity.zombie.hurt" -> ZombieCue.HURT;
             default -> null; // In particular, zombie steps share the generic Footsteps subtitle.
         };
-        if (!fuse && !explosion && !shot && (cue == null || escapeTicks > 0 || client.currentScreen != null
-                || !AgentDefense.criticallyHurt(client.player))) return;
+        boolean melee = escapeTicks == 0 && (cue != null || id.equals("entity.husk.ambient")
+            || id.equals("entity.husk.hurt"));
+        if (!fuse && !explosion && !shot && !melee) return;
         var ear = client.getSoundManager().getListenerTransform().position();
         double dx = ear.x - sound.getX(), dy = ear.y - sound.getY(), dz = ear.z - sound.getZ();
         double audible = Math.min(fuse ? 12 : explosion ? 32 : shot ? 14 : 6, range);
-        if (dx * dx + dy * dy + dz * dz >= audible * audible) return;
+        double distance = dx * dx + dy * dy + dz * dz;
+        if (distance >= audible * audible) return;
         if (fuse) {
             if (fuseCue == null) {
                 fuseCue = soundCue(sound);
@@ -76,6 +80,7 @@ final class AgentEars implements SoundInstanceListener {
             escapeTicks = 36;
             zombieCue = null;
             rangedCue = null;
+            meleeCue = null;
         } else if (explosion) {
             if (explosionCue == null) explosionCue = soundCue(sound);
         } else if (shot) {
@@ -84,9 +89,14 @@ final class AgentEars implements SoundInstanceListener {
             float pitch = 15f * Math.round((float) Math.toDegrees(Math.atan2(dy, horizontal)) / 15f);
             rangedCue = new RangedCue(bearing, MathHelper.clamp(pitch, -70, 70), System.nanoTime());
         } else if (dx * dx + dz * dz >= 0.09) {
-            towardZombie = coarseBearing(-dx, -dz);
-            zombieHeardAt = System.nanoTime();
-            zombieCue = cue;
+            float bearing = coarseBearing(-dx, -dz);
+            long heard = System.nanoTime();
+            meleeCue = new MeleeCue(bearing, heard, distance <= 4.5 * 4.5);
+            if (cue != null && client.currentScreen == null && AgentDefense.criticallyHurt(client.player)) {
+                towardZombie = bearing;
+                zombieHeardAt = heard;
+                zombieCue = cue;
+            }
         }
     }
 
@@ -122,6 +132,12 @@ final class AgentEars implements SoundInstanceListener {
     }
 
     float zombieBearing() { return towardZombie; }
+
+    MeleeCue recentMeleeCue() {
+        MeleeCue cue = meleeCue;
+        return cue != null && client.options.getShowSubtitles().getValue()
+            && System.nanoTime() - cue.heardAt() <= 3_000_000_000L ? cue : null;
+    }
 
     RangedCue takeFreshRangedCue() {
         RangedCue cue = rangedCue;

@@ -2,6 +2,7 @@ package io.gameharness.survival;
 
 import java.util.function.Predicate;
 import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.component.DataComponentTypes;
@@ -10,6 +11,7 @@ import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.ai.RangedAttackMob;
 import net.minecraft.entity.attribute.EntityAttributes;
+import net.minecraft.entity.mob.ZombieEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
@@ -30,6 +32,8 @@ final class AgentDefense {
     private static final long ZOMBIE_LOOK_NANOS = 1_200_000_000L;
     private static final float ZOMBIE_LOOK_PITCH = 10;
     private static final long RANGED_ALERT_NANOS = 2_400_000_000L;
+    private static final float[] MELEE_ESCAPE_TURNS = {0, -42, 42, -80, 80};
+    private static final double[] MELEE_FLOOR_ROWS = {0.42, 0.78, 1.25, 1.9, 2.55, 3.04};
     private static final Predicate<ItemStack> SHIELD = stack -> stack.isOf(Items.SHIELD);
     private static final Predicate<ItemStack> INGOT = stack -> stack.isOf(Items.IRON_INGOT);
     private static final Predicate<ItemStack> STONE = stack -> stack.isIn(ItemTags.STONE_TOOL_MATERIALS);
@@ -94,6 +98,42 @@ final class AgentDefense {
     private BlockPos rangedCover;
     private Block rangedCoverBlock;
     private int rangedCoverUntil, rangedCoverSlot, rangedCoverCount;
+    private final MeleeRecovery melee = new MeleeRecovery();
+    private Vec3d meleeStart, meleeSurveyFrom;
+    private LivingEntity meleeVisible;
+    private float meleeAway = Float.NaN;
+    private float meleeLane = Float.NaN;
+    private int meleeTurn, meleeTurnSince, meleeSamples;
+    private long meleeSound;
+    private boolean meleeFreshHit, meleeDirectionalEvidence;
+    private float meleeLookPitch;
+    private String meleeRefusal;
+    private Vec3d meleeDriveFrom;
+    private int meleeDriveTick;
+    private float meleeDriveYaw;
+    private boolean meleeDriveConfirmed;
+    private double meleeMotionBefore;
+
+    /** Holds the safety lane across missing frames, but not indefinitely without new evidence. */
+    static final class MeleeRecovery {
+        private static final int QUIET_AFTER_HIT = 32;
+        private static final int EVIDENCE_LIMIT = 64;
+        private int lastEvidence = -EVIDENCE_LIMIT;
+        private int lastHit = -QUIET_AFTER_HIT;
+        private boolean active;
+
+        static boolean canSprint(double seen, double speed, int hunger, boolean sprinting) {
+            return hunger > 6 && seen >= Math.max(sprinting ? 2.1 : 2.5, 1.4 + 3.2 * speed);
+        }
+
+        boolean observe(int tick, boolean hurt, boolean close, boolean separated) {
+            if (hurt) lastHit = tick;
+            if (hurt || close) lastEvidence = tick;
+            active = hurt || close || active && tick - lastEvidence < EVIDENCE_LIMIT
+                && (!separated || tick - lastHit < QUIET_AFTER_HIT);
+            return active;
+        }
+    }
 
     AgentDefense(MinecraftClient client, AgentBody body, AgentHands hands) {
         this.client = client;
@@ -113,6 +153,247 @@ final class AgentDefense {
     static boolean criticallyHurt(LivingEntity player) { return player.getHealth() <= 7; }
 
     void stopZombieLook() { zombieLook = null; }
+
+    boolean observeMelee(AgentEars ears, LivingEntity visible, boolean hurt, boolean healingMeal, int tick) {
+        var player = client.player;
+        meleeVisible = visible;
+        if (player.hasVehicle() || player.isTouchingWater()) {
+            melee.active = false;
+            return false;
+        }
+        Vec3d feet = player.getPos();
+        double distance = visible == null ? Double.POSITIVE_INFINITY : player.squaredDistanceTo(visible);
+        boolean closeMelee = distance <= 5.0 * 5.0
+            && (visible instanceof ZombieEntity || !(visible instanceof RangedAttackMob) && distance <= 3.4 * 3.4);
+        boolean weakKit = (hurt || closeMelee) && meleeOutmatched();
+        boolean wounded = criticallyHurt(player) || healingMeal;
+        boolean equippedDuel = closeMelee && !weakKit && !wounded;
+        var cue = ears.recentMeleeCue();
+        boolean newSound = cue != null && cue.heardAt() != meleeSound;
+        boolean hearClose = newSound && cue.near() && client.currentScreen == null
+            && System.nanoTime() - cue.heardAt() <= 550_000_000L && (melee.active || wounded || meleeOutmatched());
+        if (newSound) meleeSound = cue.heardAt();
+        boolean hit = hurt && !equippedDuel;
+        meleeFreshHit = hit;
+        boolean close = closeMelee && (weakKit || wounded) || hearClose;
+        boolean separated = meleeStart != null && feet.squaredDistanceTo(meleeStart) >= 5 * 5
+            && distance >= 6 * 6 && body.hasRecentView();
+        boolean started = !melee.active;
+        if (!melee.observe(tick, hit, close, separated)) return false;
+        if (started) {
+            meleeStart = feet;
+            meleeAway = Float.NaN;
+            meleeDirectionalEvidence = false;
+            meleeDriveFrom = null;
+            meleeDriveConfirmed = false;
+            resetMeleeSurvey(feet, tick);
+        }
+        float away = Float.NaN;
+        if (closeMelee) {
+            away = yaw(feet.subtract(visible.getPos()));
+        } else if (hit) {
+            Vec3d impulse = player.getVelocity();
+            if (impulse.horizontalLengthSquared() >= 0.0144) away = yaw(impulse);
+            else if (cue != null) away = cue.yaw() + 180;
+        } else if (hearClose && !Float.isFinite(meleeAway)) {
+            away = cue.yaw() + 180;
+        }
+        if (Float.isFinite(away) && (!meleeDirectionalEvidence
+                || hit && !Float.isFinite(meleeLane) && meleeSamples == 0 && meleeTurn == 0
+                    && turnDifference(away, meleeAway) >= 100)) {
+            meleeAway = away;
+            meleeDirectionalEvidence = true;
+            resetMeleeSurvey(feet, tick);
+        }
+        if (!Float.isFinite(meleeAway)) {
+            Vec3d walked = body.recentEmergencyFooting();
+            meleeAway = walked == null ? player.getYaw() : yaw(walked.subtract(feet));
+        }
+        return true;
+    }
+
+    private boolean meleeOutmatched() {
+        var player = client.player;
+        int weapon = bestWeapon(PlayerInventory.HOTBAR_SIZE, true);
+        if (weapon < 0) return true; // A shield without a weapon is still not a duel kit.
+        if (SHIELD.test(player.getOffHandStack()) || SHIELD.test(player.getMainHandStack()) || player.getArmor() >= 4)
+            return false;
+        ItemStack stack = player.getInventory().getStack(weapon);
+        return stack.isOf(Items.WOODEN_AXE) || stack.isOf(Items.WOODEN_SWORD) || player.getHealth() <= 10;
+    }
+
+    boolean meleeActive() { return melee.active; }
+
+    void meleeStep(int tick, Predicate<BlockState> dangerous) {
+        markDanger(tick);
+        forgetContact();
+        body.prioritizeMovement();
+        var player = client.player;
+        meleeStatus("holding after damage or close contact");
+        if (player.isTouchingWater() || player.hasVehicle() || client.currentScreen != null) return;
+        Vec3d feet = player.getPos();
+        if (meleeDriveFrom != null && tick == meleeDriveTick + 1 && client.options.forwardKey.isPressed()
+                && !client.options.forwardKey.isUnbound() && !meleeFreshHit && player.isOnGround()
+                && player.hurtTime == 0
+                && feet.subtract(meleeDriveFrom).dotProduct(Vec3d.fromPolar(0, meleeDriveYaw))
+                    > Math.max(0, meleeMotionBefore) + 0.035) {
+            meleeDriveConfirmed = true;
+        }
+        if (player.isOnGround() && feet.squaredDistanceTo(meleeSurveyFrom) >= 1.4 * 1.4) {
+            meleeSurveyFrom = feet;
+            meleeTurn = 0;
+            meleeTurnSince = tick;
+            meleeSamples = 0;
+        }
+        if (meleeTurn < MELEE_ESCAPE_TURNS.length || Float.isFinite(meleeLane)) {
+            float facing = player.getYaw();
+            Vec3d known = body.recentEmergencyFooting();
+            float knownYaw = known == null ? Float.NaN : yaw(known.subtract(feet));
+            float bearing = Float.isFinite(meleeLane) ? meleeLane
+                : turnDifference(knownYaw, meleeAway) <= 92 && meleeTurn == 0 ? knownYaw
+                : meleeAway + MELEE_ESCAPE_TURNS[Math.min(meleeTurn, MELEE_ESCAPE_TURNS.length - 1)];
+            body.turnUrgent(bearing, meleeLookPitch);
+            if (!player.isOnGround()) {
+                meleeStatus("holding after damage or close contact; lining up dry footing in the air");
+                return;
+            }
+            if (turnDifference(facing, bearing) <= 8 && Math.abs(player.getPitch() - meleeLookPitch) <= 11
+                    && body.hasRecentView()) {
+                double width = player.getWidth() * 0.5 + 0.055;
+                Vec3d lane = Vec3d.fromPolar(0, facing);
+                Vec3d landing = meleeLane(feet, lane, facing, width, dangerous);
+                if (landing != null) {
+                    meleeLane = bearing;
+                    meleeSamples = 0;
+                    meleeDriveFrom = feet;
+                    meleeDriveTick = tick;
+                    meleeDriveYaw = facing;
+                    meleeMotionBefore = player.getVelocity().dotProduct(lane);
+                    double shown = Math.sqrt(feet.squaredDistanceTo(landing));
+                    double speed = Math.sqrt(player.getVelocity().horizontalLengthSquared());
+                    body.driveEmergencyLane(landing, facing, meleeLookPitch,
+                        MeleeRecovery.canSprint(shown, speed, player.getHungerManager().getFoodLevel(), player.isSprinting()));
+                    meleeStatus(meleeDriveConfirmed ? "confirmed voluntary retreat on a witnessed dry lane"
+                        : "requesting retreat on a witnessed dry lane");
+                    return;
+                }
+                if (++meleeSamples >= 2) nextMeleeView(tick);
+                if (openHandSpaceStrike()) {
+                    meleeStatus("lining up a close defensive punch; " + meleeRefusal);
+                    return;
+                }
+                meleeStatus("checking dry retreat footing; " + meleeRefusal);
+            } else {
+                if (tick - meleeTurnSince >= 30 && body.hasRecentView()) nextMeleeView(tick);
+                meleeStatus(body.hasRecentView() ? "aligning the retreat view" : "waiting for a rendered retreat view");
+            }
+            return;
+        }
+        // No path was witnessed. Do not run blindly, back over an edge, or open inventory.
+        body.sneak();
+        LivingEntity threat = meleeVisible;
+        if (threat != null && body.hasRecentView() && body.threatPoint() != null) {
+            body.aimUrgent(body.threatPoint());
+            ItemStack main = player.getMainHandStack();
+            if (SHIELD.test(main) || SHIELD.test(player.getOffHandStack()) && AgentBody.shieldSafeMainHand(main)) {
+                body.blockAgainst(threat);
+            } else if ((main.isEmpty() || main.isIn(ItemTags.SWORDS) || main.isIn(ItemTags.AXES))
+                    && body.strikeTarget(threat) && player.getAttackCooldownProgress(0.5f) >= 0.9f) {
+                body.strike(threat);
+                meleeStatus("lining up a close defensive strike from a stationary stance");
+                return;
+            } else {
+                int weapon = bestWeapon(PlayerInventory.HOTBAR_SIZE, true);
+                if (weapon >= 0) selectRangedSlot(weapon, tick);
+            }
+        } else {
+            float toward = meleeAway + 180;
+            body.turnUrgent(toward, 17);
+            body.guardRangedBearing(toward);
+        }
+        meleeStatus("bracing; no safe dry retreat witnessed"
+            + (meleeRefusal == null ? "" : "; " + meleeRefusal));
+    }
+
+    private void meleeStatus(String action) {
+        status = (meleeFreshHit ? "melee emergency (fresh damage): " : "melee emergency: ") + action;
+    }
+
+    private boolean openHandSpaceStrike() {
+        var player = client.player;
+        if (meleeVisible == null || !player.getMainHandStack().isEmpty()
+                || SHIELD.test(player.getOffHandStack()) || !body.strikeTarget(meleeVisible)
+                || player.getAttackCooldownProgress(0.5f) < 0.9f) return false;
+        body.strike(meleeVisible);
+        return true;
+    }
+
+    private Vec3d meleeLane(Vec3d feet, Vec3d lane, float bearing, double width, Predicate<BlockState> dangerous) {
+        Vec3d end = null;
+        double witnessed = 0;
+        Direction travel = Direction.fromHorizontalDegrees(bearing);
+        double speed = Math.sqrt(client.player.getVelocity().horizontalLengthSquared());
+        for (double distance : MELEE_FLOOR_ROWS) {
+            Vec3d row = feet.add(lane.x * distance, 0, lane.z * distance);
+            String refused = meleeRow(row, lane, bearing, distance, width, travel, dangerous);
+            if (refused != null) {
+                meleeRefusal = "row " + distance + " " + refused;
+                break;
+            }
+            end = row;
+            witnessed = distance;
+        }
+        if (witnessed >= Math.max(0.42, speed * 2.65 + 0.14)) return end;
+        if (end != null) meleeRefusal = "proved floor, but too little braking distance";
+        return null;
+    }
+
+    private String meleeRow(Vec3d row, Vec3d lane, float bearing, double distance, double width,
+                            Direction travel, Predicate<BlockState> dangerous) {
+        if (body.hazardAhead(bearing, distance + 0.22)) return "known hazard";
+        Vec3d below = row.add(0, -0.035, 0);
+        var center = body.emergencyFloor(below, travel, dangerous);
+        if (center != AgentBody.DryRouteTop.WITNESSED) return "center " + center;
+        var right = body.emergencyFloor(below.add(width * lane.z, 0, -width * lane.x), travel, dangerous);
+        if (right != AgentBody.DryRouteTop.WITNESSED) return "right " + right;
+        var left = body.emergencyFloor(below.add(-width * lane.z, 0, width * lane.x), travel, dangerous);
+        if (left != AgentBody.DryRouteTop.WITNESSED) return "left " + left;
+        Vec3d clearance = row.add(0, 0.55, 0);
+        if (!body.overlandClear(clearance, dangerous)) {
+            var refusal = body.dryRouteClear(clearance);
+            return refusal == AgentBody.DryRouteSample.CLEAR ? "hazard in clearance" : "clearance " + refusal;
+        }
+        if (distance >= 1.25 && (!body.overlandClear(clearance.add(width * lane.z, 0, -width * lane.x), dangerous)
+                || !body.overlandClear(clearance.add(-width * lane.z, 0, width * lane.x), dangerous)))
+            return "side clearance not witnessed";
+        if (!body.emergencyLaneClear(row, width)) return "collision veto";
+        return null;
+    }
+
+    private void nextMeleeView(int tick) {
+        meleeSamples = 0;
+        meleeTurnSince = tick;
+        if (meleeLookPitch < 50) {
+            meleeLookPitch = 57;
+            return;
+        }
+        meleeLookPitch = 44;
+        meleeLane = Float.NaN;
+        meleeTurn++;
+    }
+
+    private void resetMeleeSurvey(Vec3d feet, int tick) {
+        meleeSurveyFrom = feet;
+        meleeLane = Float.NaN;
+        meleeTurn = 0;
+        meleeTurnSince = tick;
+        meleeLookPitch = 44;
+        meleeSamples = 0;
+    }
+
+    private static float turnDifference(float a, float b) {
+        return Math.abs(MathHelper.wrapDegrees(a - b));
+    }
 
     boolean rangedActive() { return rangedUntil != 0 && System.nanoTime() - rangedUntil < 0; }
 

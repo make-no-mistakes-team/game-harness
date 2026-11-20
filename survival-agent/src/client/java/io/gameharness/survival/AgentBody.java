@@ -124,6 +124,7 @@ final class AgentBody {
     private final Matrix4f inverseViewProjection = new Matrix4f();
     private final Vector4f clip = new Vector4f();
     private final BlockPos.Mutable lightPos = new BlockPos.Mutable();
+    private final BlockPos.Mutable overlandProbe = new BlockPos.Mutable();
     private final BlockHitResult[] samples = new BlockHitResult[COLUMNS * ROWS];
     private final AgentHazards hazards = new AgentHazards();
     private final AgentHeadroom headroom;
@@ -181,7 +182,7 @@ final class AgentBody {
     private boolean backward;
     private boolean fast;
     private boolean verifiedDescent;
-    private boolean flatWalk, dryRouteWalk;
+    private boolean flatWalk, dryRouteWalk, emergencyWalk;
     private boolean wetEscapeWalk;
     private Vec3d dryLanding;
     private BlockPos stepSupport;
@@ -297,6 +298,7 @@ final class AgentBody {
         dryLanding = null;
         centerLanding = null;
         forward = backward = fast = verifiedDescent = flatWalk = jumping = sneaking = swimmingDown = eating = false;
+        emergencyWalk = false;
         dryRouteWalk = false;
         wetEscapeWalk = false;
         reachJump = false;
@@ -451,10 +453,10 @@ final class AgentBody {
         Ground ground = Ground.CLEAR;
 
         if (flatWalk && advance) {
-            // A macro has checked the adjacent tile and sweep. Never inherit the ordinary
+            // The caller has checked a dry lane and sweep. Never inherit the ordinary
             // auto-jump, crouching advance, sprint latch, or tolerance for a lost render.
             double distance = Math.hypot(dryLanding.x - player.getX(), dryLanding.z - player.getZ());
-            advance = hasView() && player.isOnGround() && !player.horizontalCollision
+            advance = hasView() && player.isOnGround() && (emergencyWalk || !player.horizontalCollision)
                 && distance > Math.max(0.12, 2.6 * Math.sqrt(player.getVelocity().horizontalLengthSquared()))
                 && Math.abs(MathHelper.wrapDegrees(goalYaw(player, player.getEyePos()) - player.getYaw())) <= 6;
         } else if (!dryRouteWalk && !wetEscapeWalk && controlledBoat == null && advance
@@ -1516,6 +1518,92 @@ final class AgentBody {
 
     boolean dryRouteView() { return hasView(); }
 
+    /** A full, visible surface top. Falling material gets a separate under-load veto, not a cave proof. */
+    BlockState overlandTop(BlockPos floor, Direction travel, Predicate<BlockState> dangerous) {
+        if (!hasView()) return null;
+        Vec3d center = Vec3d.ofBottomCenter(floor.up()).add(0, -0.03, 0);
+        // The far part of a lower top can be seen just beyond the near lip.
+        BlockHitResult hit = visibleOverlandTop(center.add(travel.getOffsetX() * 0.34, 0,
+            travel.getOffsetZ() * 0.34), floor);
+        if (hit == null) hit = visibleOverlandTop(center, floor);
+        if (hit == null) return null;
+        BlockState material = client.world.getBlockState(floor);
+        return !dangerous.test(material) && fullStepSupport(floor, material)
+            && overlandLoadHolds(client.world, floor, material, overlandProbe) ? material : null;
+    }
+
+    private BlockHitResult visibleOverlandTop(Vec3d point, BlockPos floor) {
+        if (!inView(point)) return null;
+        BlockHitResult hit = visibleHit(point, Ray.TERRAIN);
+        return hit != null && matchesDryRouteTop(hit, floor) ? hit : null;
+    }
+
+    /** Mechanical veto on a witnessed top or actual contact only; no hidden support is offered as a foothold. */
+    static boolean overlandLoadHolds(BlockView world, BlockPos floor, BlockState material, BlockPos.Mutable below) {
+        if (!(material.getBlock() instanceof FallingBlock)) return true;
+        below.set(floor);
+        for (int depth = 0; depth < 12; depth++) {
+            BlockState bearing = world.getBlockState(below.move(Direction.DOWN));
+            if (FallingBlock.canFallThrough(bearing)) return false;
+            if (!(bearing.getBlock() instanceof FallingBlock)) return true;
+        }
+        return false;
+    }
+
+    boolean overlandClear(Vec3d point, Predicate<BlockState> dangerous) {
+        if (dryRouteClear(point) != DryRouteSample.CLEAR) return false;
+        // Only a lit, unoccluded sample can classify a collisionless hazard at this point.
+        return !dangerous.test(client.world.getBlockState(BlockPos.ofFloored(point)));
+    }
+
+    /** Recheck just the observed lane and actual source contact. Reuse the dry-route input driver below. */
+    boolean overlandLane(BlockPos from, BlockPos[] path, BlockState[] supports, int length,
+                         Direction travel, Predicate<BlockState> dangerous) {
+        if (!hasView() || lavaEmergency) return false;
+        var player = client.player;
+        if (player.isTouchingWater() || player.isInLava() || player.isOnFire() || player.hasVehicle()
+                || player.hurtTime > 0) return false;
+        BlockPos source = overlandProbe.set(from).move(Direction.DOWN);
+        BlockState takeoff = client.world.getBlockState(source);
+        if (!fullStepSupport(source, takeoff) || dangerous.test(takeoff)
+                || !overlandLoadHolds(client.world, source, takeoff, overlandProbe)) return false;
+        for (int i = 0; i < length; i++) {
+            BlockPos foot = path[i];
+            BlockPos floor = overlandProbe.set(foot).move(Direction.DOWN);
+            if (client.world.getBlockState(floor) != supports[i]
+                    || !overlandLoadHolds(client.world, floor, supports[i], overlandProbe)) return false;
+            BlockState legs = client.world.getBlockState(foot);
+            BlockState head = client.world.getBlockState(overlandProbe.set(foot).move(Direction.UP));
+            if (!legs.getFluidState().isEmpty() || !head.getFluidState().isEmpty()
+                    || dangerous.test(legs) || dangerous.test(head)) return false;
+        }
+
+        BlockPos to = path[length - 1];
+        int dx = travel.getOffsetX(), dz = travel.getOffsetZ();
+        double x = from.getX() + 0.5, z = from.getZ() + 0.5;
+        double along = (player.getX() - x) * dx + (player.getZ() - z) * dz;
+        double across = (player.getX() - x) * dz - (player.getZ() - z) * dx;
+        var velocity = player.getVelocity();
+        double drift = across + 2.45 * (velocity.x * dz - velocity.z * dx);
+        if (Math.abs(across) > 0.21 || Math.abs(drift) > 0.21 || along < -0.25 || along > length + 0.26
+                || hazardAhead(travel.getPositiveHorizontalDegrees(), Math.max(0.7, length + 0.4 - along))) return false;
+        double half = player.getWidth() * 0.5 + 0.055;
+        double cross = Math.abs(drift) > Math.abs(across) ? drift : across;
+        if (to.getY() != from.getY()) {
+            if (length != 1 || !dryRouteSweep(from, to)) return false;
+            // Clear the jump apex as well as the standing sweep, including the reverse of a descent.
+            double top = Math.max(from.getY(), to.getY());
+            Box crown = new Box(x - half, top + 1.79, z - half, x + half, top + 2.10, z + half)
+                .stretch(cross * dz, 0, -cross * dx);
+            return client.world.isSpaceEmpty(player, crown.stretch(dx, 0, dz));
+        }
+        double y = from.getY();
+        if (!player.isOnGround() || Math.abs(player.getY() - y) > 0.055) return false;
+        Box sweep = new Box(x - half, y + 0.015, z - half, x + half, y + 1.80, z + half)
+            .stretch(cross * dz, 0, -cross * dx);
+        return client.world.isSpaceEmpty(player, sweep.stretch(dx * length, 0, dz * length));
+    }
+
     enum DryRouteVeto { CLEAR, VIEW, HAZARD, DRIFT, SWEEP, SUPPORT }
 
     boolean dryRouteSweep(BlockPos from, BlockPos to) {
@@ -1654,6 +1742,42 @@ final class AgentBody {
         prioritizeMovement();
         walkDownTo(landing);
         flatWalk = true;
+    }
+
+    /** Own recent grounded contact selects a look direction, not permission to move. */
+    Vec3d recentEmergencyFooting() {
+        return tick - previousDryFootingTick <= 35 ? previousDryFooting : null;
+    }
+
+    /** Negative collision veto over an already camera-witnessed short corridor. */
+    boolean emergencyLaneClear(Vec3d landing, double halfWidth) {
+        var player = client.player;
+        double dx = landing.x - player.getX(), dz = landing.z - player.getZ();
+        if (!hasView() || !player.isOnGround() || Math.abs(landing.y - player.getY()) > 0.055
+                || dx * dx + dz * dz > 9.4) return false;
+        Box body = player.getBoundingBox().offset(0, 0.01, 0);
+        if (!client.world.isSpaceEmpty(player, body.stretch(dx, 0, dz))) return false;
+        // A first walking stride can slide off a wall; a sprint still needs room to brake.
+        if (dx * dx + dz * dz < 2.1 * 2.1) return true;
+        double margin = Math.max(0, halfWidth - player.getWidth() * 0.5);
+        return client.world.isSpaceEmpty(player, body.offset(dx, 0, dz).expand(margin, 0, margin));
+    }
+
+    DryRouteTop emergencyFloor(Vec3d point, Direction travel, Predicate<BlockState> dangerous) {
+        BlockPos floor = BlockPos.ofFloored(point);
+        DryRouteTop result = dryRouteTop(point, floor);
+        if (result == DryRouteTop.WITNESSED)
+            return dangerous.test(client.world.getBlockState(floor)) ? DryRouteTop.NO_FULL_TOP : result;
+        if (overlandTop(floor, travel, dangerous) != null) return DryRouteTop.WITNESSED;
+        return result;
+    }
+
+    /** Preserve the flat movement vetoes. No jump or backwards drive on a combat cue. */
+    void driveEmergencyLane(Vec3d landing, float yaw, float pitch, boolean sprint) {
+        turnUrgent(yaw, pitch);
+        walkDownTo(landing);
+        fast = sprint;
+        flatWalk = emergencyWalk = true;
     }
 
     boolean combatViewMissing() {

@@ -7,10 +7,13 @@ import java.util.Map;
 import java.util.Set;
 import net.minecraft.Bootstrap;
 import net.minecraft.SharedConstants;
+import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.UnbreakableComponent;
 import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.fluid.FluidState;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.DynamicRegistryManager;
@@ -23,6 +26,7 @@ import net.minecraft.resource.VanillaDataPackProvider;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.BlockView;
 import net.minecraft.world.EmptyBlockView;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -40,6 +44,29 @@ final class MiningStockProof {
             TagGroupLoader.startReload(packs, DynamicRegistryManager.of(Registries.REGISTRIES))
                 .forEach(Registry.PendingTagLoad::apply);
         }
+    }
+
+    @Test
+    void acceptsSettledSurfaceSandButNotAVanillaOverhang() {
+        var top = new BlockPos(0, 65, 0);
+        var sand = Blocks.SAND.getDefaultState();
+        var gravel = Blocks.GRAVEL.getDefaultState();
+        var stone = Blocks.STONE.getDefaultState();
+        var probe = new BlockPos.Mutable();
+        var settled = new SurfaceColumn(Map.of(top, sand, top.down(), gravel, top.down(2), stone));
+        require(AgentBody.overlandLoadHolds(settled, top, sand, probe),
+            "a visible full gravity top on a settled column is usable without cutting it");
+        var overhang = new SurfaceColumn(Map.of(top, sand, top.down(), gravel));
+        require(!AgentBody.overlandLoadHolds(overhang, top, sand, probe),
+            "sand resting on more unsupported falling material is not a safe top");
+    }
+
+    private record SurfaceColumn(Map<BlockPos, BlockState> blocks) implements BlockView {
+        @Override public BlockEntity getBlockEntity(BlockPos pos) { return null; }
+        @Override public BlockState getBlockState(BlockPos pos) { return blocks.getOrDefault(pos, Blocks.AIR.getDefaultState()); }
+        @Override public FluidState getFluidState(BlockPos pos) { return getBlockState(pos).getFluidState(); }
+        @Override public int getHeight() { return 384; }
+        @Override public int getBottomY() { return -64; }
     }
 
     @Test

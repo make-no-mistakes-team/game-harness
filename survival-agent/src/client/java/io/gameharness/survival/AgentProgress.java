@@ -68,8 +68,6 @@ final class AgentProgress {
     private static final int ORE_MEMORY_LIMIT = 18;
     private static final int TIMBER_WORK_TICKS = 190;
     private static final int TIMBER_RECENT = 24;
-    private static final float[] TIMBER_SHELF_BEARINGS = {0, -68, 68};
-    private static final int TIMBER_SHELF_LOOK_TICKS = 20;
     private static final Predicate<ItemStack> LOG = stack -> stack.isIn(ItemTags.LOGS);
     private static final Predicate<ItemStack> BURNABLE_LOG = stack -> stack.isIn(ItemTags.LOGS_THAT_BURN);
     private static final Predicate<ItemStack> PLANK = stack -> stack.isIn(ItemTags.PLANKS);
@@ -91,6 +89,7 @@ final class AgentProgress {
     private static final Predicate<BlockState> RETURNABLE_ORE = state -> state.isIn(BlockTags.DIAMOND_ORES)
         || state.isIn(BlockTags.IRON_ORES) || state.isIn(BlockTags.COAL_ORES);
     private static final Predicate<BlockState> TABLE_BLOCK = s -> s.isOf(Blocks.CRAFTING_TABLE);
+    private static final Predicate<BlockState> SUPPLY_WOOD = s -> s.isIn(BlockTags.PLANKS);
     private static final Predicate<BlockState> FURNACE_BLOCK = s -> s.isOf(Blocks.FURNACE);
     private static final Predicate<ItemStack> BOAT = stack -> stack.isIn(ItemTags.BOATS) && !stack.isIn(ItemTags.CHEST_BOATS);
     private static final Predicate<ItemStack> EMPTY_BUCKET = item(Items.BUCKET);
@@ -177,6 +176,7 @@ final class AgentProgress {
     private final AgentHands hands;
     private final AgentTools tools;
     private final AgentStallGuard stallGuard;
+    private final AgentOverlandSearch overland;
     private final Runnable stallReplan = this::replanStalledLocalWork;
     private final Supplier<String> stallChoose = this::chooseStallAlternative;
     private final Supplier<AgentStallGuard.Alternative> stallStep = this::workStallAlternative;
@@ -276,23 +276,24 @@ final class AgentProgress {
     private boolean pickupNeedsDetour;
     private boolean timberReady;
     private boolean departureKit;
+    private boolean ordinarySurfaceWork;
     private BlockHitResult timberWitness;
     private BlockPos timberLastCut;
     private final List<BlockPos> exhaustedStems = new ArrayList<>();
     private final List<BlockPos> unreachableTimber = new ArrayList<>();
     private final List<BlockPos> triedTimberFooting = new ArrayList<>();
+    private final List<BlockPos> checkedSupplyLandmarks = new ArrayList<>();
+    private final List<BlockPos> triedSupplyCuts = new ArrayList<>();
     private BlockPos timberExitFrom;
     private BlockPos timberExitTo;
     private int timberExitUntil;
     private int timberExitCheck;
     private float timberExitYaw;
     private boolean timberHigherShelf;
-    private int timberShelfLook = TIMBER_SHELF_BEARINGS.length;
-    private int timberShelfLookUntil;
-    private float timberShelfYaw;
     private BlockHitResult timberChop;
     private Vec3d timberChopPoint;
-    private boolean timberCuttingLeaves;
+    private boolean timberCuttingLeaves, timberCuttingPlanks;
+    private Predicate<ItemStack> timberDropItem = LOG;
     private int timberAttack;
     private int timberAttackWitnessTick;
     private int timberAlignUntil;
@@ -432,6 +433,7 @@ final class AgentProgress {
         tools = new AgentTools(c, hands);
         stallGuard = new AgentStallGuard(c, body, hands, tools, this::protectRecoveryBlock, this::safeSupport,
             this::recordStallFooting, this::tryStallMineHandback);
+        overland = new AgentOverlandSearch(c, body, AgentProgress::dangerous);
         caves = new AgentCaves(c, body, hands, tools, this::recordCaveFooting, this::recordDryCaveFooting);
         returnableMine = new AgentReturnableMine(c, body);
         fall = new AgentFall(c, body, hands);
@@ -553,6 +555,7 @@ final class AgentProgress {
         surfaceApproach.broken(position, state);
         returnableMine.observeBreak(position);
         supplyEgress.observeBreak(position, state);
+        overland.changed(position);
         memory.forgetOwnedWorkbench(c.world, position);
         if (c.world == oreWorld) forgetOre(position);
     }
@@ -703,12 +706,13 @@ final class AgentProgress {
     void tick(AgentEars ears, AgentMacroControl macro) {
         if (win || c.player == null || c.world == null) return;
         tick++;
+        ordinarySurfaceWork = macro == null || !macro.engaged();
         observeStairLight();
         observeFurnaceCook();
         if (portal != null) stallGuard.surveyReceipt(portal.castSurveyEvidence());
         stallGuard.navigationSurveyReceipt(caves.drySurveyEvidence());
         stallGuard.observe(tick, confirmedFrameBlocks(), mealsEaten, status,
-            returnableMine.hasProgressLease() || supplyEgress.active());
+            returnableMine.hasProgressLease() || supplyEgress.active() || overland.leased(tick));
         advance(ears, macro);
         BlockPos newCaveLight = caves.takeLightReceipt();
         if (newCaveLight != null) stallGuard.stairLightReceipt(newCaveLight);
@@ -750,7 +754,8 @@ final class AgentProgress {
             stallGuard.priorityAim();
             return;
         }
-        boolean freeFallHands = (macroEngaged || defense.rangedActive()) && !c.player.isOnGround() && !c.player.isTouchingWater()
+        boolean freeFallHands = (macroEngaged || defense.rangedActive() || defense.meleeActive())
+            && !c.player.isOnGround() && !c.player.isTouchingWater()
             && !c.player.hasVehicle() && c.player.getVelocity().y < -0.27
             && (hands.busy() || c.currentScreen instanceof HandledScreen<?>);
         if (freeFallHands) {
@@ -784,6 +789,15 @@ final class AgentProgress {
             if (defense.rangedStep(tick, protectedHeadroom, safetySpend))
                 step(forward(defense.rangedRetreatYaw()), false, false);
             if (macroEngaged && defense.confirmedCover()) macro.safetyEffect(defense.status());
+            stallGuard.priorityAim();
+            status = defense.status();
+            return;
+        }
+        if (!macroEngaged && defense.meleeActive()) {
+            interruptHands();
+            if (dropReclaim != null) dropReclaim.cancel();
+            caves.interruptLight();
+            defense.meleeStep(tick, AgentProgress::dangerous);
             stallGuard.priorityAim();
             status = defense.status();
             return;
@@ -827,6 +841,12 @@ final class AgentProgress {
         if (stallGuard.takeWaterTurn(plannedWater, stallReplan, stallRelease)) {
             body.prioritizeMovement();
             status = stallGuard.status();
+            return;
+        }
+        // Keep a declared ordinary leg through vanilla momentum. The inventory/craft stage
+        // itself correctly refuses moving footing; it cannot own the continuation here.
+        if (overland.driving()) {
+            stepOverland();
             return;
         }
         if (supplyEgress.step()) return;
@@ -1002,7 +1022,7 @@ final class AgentProgress {
         if (timberCanopy != null) rememberTimberSite(exhaustedCanopies, BlockPos.ofFloored(timberCanopy));
         timberCanopy = null;
         timberExitFrom = timberExitTo = null;
-        timberShelfLook = TIMBER_SHELF_BEARINGS.length;
+        overland.interrupt();
         if (nextFoot != null) closeDig(nextFoot);
         nextFoot = cavePeek = climbTo = gaitStep = exitStart = exitTo = null;
         approachGoal = routeLegStart = sweepOrigin = null;
@@ -3515,7 +3535,7 @@ final class AgentProgress {
         }
         timberSeekTick = tick;
         if (player.isTouchingWater()) {
-            timberShelfLook = TIMBER_SHELF_BEARINGS.length;
+            overland.interrupt();
             if (!timberSwimming) timberLookAt = tick;
             if (!returnToTimberBank()) {
                 if (tick >= timberLookAt) {
@@ -3541,21 +3561,26 @@ final class AgentProgress {
             chopTimber();
             return;
         }
-        if (tick < timberDropUntil || pickupItem == LOG) {
-            if (collect(LOG, 7)) return;
-            if (tick < timberDropUntil && hands.count(LOG) <= timberDropCount) {
+        if (tick < timberDropUntil || pickupItem == LOG || pickupItem == PLANK) {
+            var pickupWood = pickupItem == LOG || pickupItem == PLANK ? pickupItem : timberDropItem;
+            if (collect(pickupWood, 7)) return;
+            if (tick < timberDropUntil && hands.count(timberDropItem) <= timberDropCount) {
                 Vec3d cut = Vec3d.ofCenter(timberLastCut);
                 body.aim(new Vec3d(cut.x, Math.min(player.getY() + 0.32, cut.y), cut.z));
-                status = "checking the trunk base for dropped logs";
+                status = timberDropItem == LOG ? "checking the trunk base for dropped logs"
+                    : "checking the witnessed cut for dropped planks";
                 return;
             }
             timberDropUntil = 0;
         }
         if (timberWitness != null && tendTimber()) return;
-        if (collect(LOG, 7)) return;
+        if (collect(LOG, 7)) {
+            overland.interrupt();
+            return;
+        }
         BlockHitResult log = body.find(state -> state.isIn(BlockTags.LOGS), player.getBlockInteractionRange(),
             hit -> hit.getBlockPos().getY() <= player.getBlockY() + 1 && timberCandidate(hit) && timberInReach(hit)).orElse(null);
-        if (log == null && supplyEgress.seek(supplies)) return;
+        if (log == null && !overland.owns(player.getBlockPos()) && supplyEgress.seek(supplies)) return;
         if (log == null) log = body.find(state -> state.isIn(BlockTags.LOGS), 22, this::timberCandidate).orElse(null);
         if (log != null) {
             witnessTimber(log);
@@ -3563,17 +3588,62 @@ final class AgentProgress {
             return;
         }
         if (surveyTimber()) {
-            timberShelfLook = TIMBER_SHELF_BEARINGS.length;
+            overland.interrupt();
             return;
         }
-        if (searchTimberFromShelf() || startTimberReposition(player.getYaw())) return;
-        if (Float.isNaN(heading)) heading = player.getYaw();
-        status = step(forward(heading), false, false) == Walk.BLOCKED
-            ? "timber search: local routes exhausted" : "seeking timber along open ground";
+        if (!ordinarySurfaceWork) return;
+        if (!has(WOOD_PICK, 1) && !has(STONE_PICK, 1) && !has(DEEP_PICK, 1) && seekSurfaceSupply()) return;
+        stepOverland();
+    }
+
+    private boolean seekSurfaceSupply() {
+        if (collect(PLANK, 7)) {
+            overland.interrupt();
+            return true;
+        }
+        BlockHitResult plank = body.find(SUPPLY_WOOD, c.player.getBlockInteractionRange(),
+            hit -> timberInReach(hit) && !timberUnderfoot(hit.getBlockPos()) && !supportsTrail(hit.getBlockPos())
+                && !triedSupplyCuts.contains(hit.getBlockPos())).orElse(null);
+        if (plank != null) {
+            overland.interrupt();
+            rememberTimberSite(triedSupplyCuts, plank.getBlockPos());
+            beginTimberChop(plank, false);
+            return true;
+        }
+        if (overland.guiding(tick)) return false;
+        var landmark = body.find(SUPPLY_WOOD, 16,
+            hit -> !timberInReach(hit) && newSupplyLandmark(hit.getBlockPos())).orElse(null);
+        if (landmark == null && !has(table.item, 1))
+            landmark = body.find(TABLE_BLOCK, 16, hit -> newSupplyLandmark(hit.getBlockPos())).orElse(null);
+        if (landmark == null) return false;
+        BlockPos block = landmark.getBlockPos();
+        rememberTimberSite(checkedSupplyLandmarks, block);
+        if (timberInReach(landmark) && TABLE_BLOCK.test(state(landmark))) {
+            table.position = confirmStation(table, landmark);
+            status = "witnessed a workspace; checking the surroundings for wood";
+            return true;
+        }
+        overland.guide(block, tick);
+        return false;
+    }
+
+    private boolean newSupplyLandmark(BlockPos block) {
+        for (BlockPos prior : checkedSupplyLandmarks)
+            if (prior.getSquaredDistance(block) <= 16) return false;
+        return true;
+    }
+
+    private void stepOverland() {
+        overland.step(tick);
+        status = overland.status();
+        if (overland.leased(tick)) stallGuard.navigationWork();
+        var arrival = overland.takeArrival();
+        if (arrival != null) stallGuard.navigationArrival(arrival.from(), arrival.foot());
+        if (overland.takeRefusal()) localBlock = status;
     }
 
     private void witnessTimber(BlockHitResult log) {
-        timberShelfLook = TIMBER_SHELF_BEARINGS.length;
+        overland.interrupt();
         timberWitness = log;
         timberCanopy = null;
         timberLastCut = null;
@@ -4295,26 +4365,6 @@ final class AgentProgress {
         }
     }
 
-    private boolean searchTimberFromShelf() {
-        if (timberShelfLook >= TIMBER_SHELF_BEARINGS.length) return false;
-        float bearing = timberShelfYaw + TIMBER_SHELF_BEARINGS[timberShelfLook];
-        Walk route = Walk.LOOKING;
-        if (bearingDistance(c.player.getYaw(), bearing) > 12) body.turn(bearing, 7);
-        else route = step(forward(bearing), false, false);
-        if (route == Walk.MOVING) {
-            heading = bearing;
-            timberShelfLook = TIMBER_SHELF_BEARINGS.length;
-            status = "seeking timber from the new shelf";
-            return true;
-        }
-        if (route == Walk.BLOCKED || tick >= timberShelfLookUntil) {
-            timberShelfLook++;
-            timberShelfLookUntil = tick + TIMBER_SHELF_LOOK_TICKS;
-        }
-        status = "timber search: surveying from the new shelf";
-        return true;
-    }
-
     private boolean tendTimber() {
         BlockPos stem = timberWitness.getBlockPos();
         Vec3d feet = c.player.getPos();
@@ -4501,13 +4551,6 @@ final class AgentProgress {
     /** Commit to one observed landing, with at most one glance to bring the floor into view. */
     private boolean repositionForTimber() {
         if (timberExitTo != null && arrived(timberExitTo)) {
-            if (timberWitness == null && timberExitTo.getY() > timberExitFrom.getY()) {
-                // This footprint is already remembered. Survey it rather than retrying the old heading.
-                timberShelfYaw = c.player.getYaw();
-                timberShelfLook = 0;
-                timberShelfLookUntil = tick + TIMBER_SHELF_LOOK_TICKS;
-                timberLookAt = tick;
-            }
             timberExitFrom = timberExitTo = null;
             timberCanopy = null;
             timberNear = false;
@@ -4622,6 +4665,7 @@ final class AgentProgress {
         timberChop = hit;
         timberChopPoint = timberAim(hit);
         timberCuttingLeaves = leaves;
+        timberCuttingPlanks = !leaves && SUPPLY_WOOD.test(state(hit));
         timberAttack = 0;
         timberAlignUntil = tick + 34;
         timberChopUntil = tick + 110;
@@ -4644,12 +4688,15 @@ final class AgentProgress {
         timberAlignUntil = tick + 8;
         if (retainedOutline) status = timberCuttingLeaves
             ? "opening a visible passage through leaves (same outline during render gap)"
-            : "chopping the witnessed trunk (same outline during render gap)";
-        else status = timberCuttingLeaves ? "opening a visible passage through leaves" : "chopping the witnessed trunk";
+            : timberCuttingPlanks ? "chopping witnessed planks (same outline during render gap)"
+                : "chopping the witnessed trunk (same outline during render gap)";
+        else status = timberCuttingLeaves ? "opening a visible passage through leaves"
+            : timberCuttingPlanks ? "chopping witnessed planks" : "chopping the witnessed trunk";
     }
 
     private void chopTimber() {
-        status = timberCuttingLeaves ? "aligning on visible leaves" : "aligning on a reachable log";
+        status = timberCuttingLeaves ? "aligning on visible leaves"
+            : timberCuttingPlanks ? "aligning on reachable planks" : "aligning on a reachable log";
         BlockPos block = timberChop.getBlockPos();
         if (tick >= timberChopUntil || timberUnderfoot(block)) {
             timberChop = null;
@@ -4660,9 +4707,11 @@ final class AgentProgress {
         BlockHitResult hit = perceive(timberChopPoint, c.player.getEyePos().distanceTo(timberChopPoint) + 0.08);
         if (hit != null && hit.getBlockPos().equals(block)) {
             BlockState material = state(hit);
-            if (material.isIn(timberCuttingLeaves ? BlockTags.LEAVES : BlockTags.LOGS)) {
+            if (material.isIn(timberCuttingLeaves ? BlockTags.LEAVES
+                    : timberCuttingPlanks ? BlockTags.PLANKS : BlockTags.LOGS)) {
                 if (!timberInReach(hit)) {
-                    if (!timberCuttingLeaves) unavailableTimber(hit, "log face outside vanilla reach", hit.getPos().y > c.player.getEyePos().y);
+                    if (!timberCuttingLeaves && !timberCuttingPlanks)
+                        unavailableTimber(hit, "log face outside vanilla reach", hit.getPos().y > c.player.getEyePos().y);
                     else timberChop = null;
                     return;
                 }
@@ -4685,7 +4734,8 @@ final class AgentProgress {
             if (!timberCuttingLeaves) {
                 timberLastCut = block;
                 timberDropUntil = tick + 19;
-                timberDropCount = hands.count(LOG);
+                timberDropItem = timberCuttingPlanks ? PLANK : LOG;
+                timberDropCount = hands.count(timberDropItem);
             }
             timberWorkUntil = tick + TIMBER_WORK_TICKS;
             timberScan = 0;
@@ -6872,6 +6922,9 @@ final class AgentProgress {
         // Defer to the actual fall controller before issuing a ranged brace. Avoid the
         // generic damage turn/backtrack when a ranged shot is the corroborating cue.
         if (!creeper && defense.observeRanged(ears, threat, hurt)) return false;
+        if (!macroEngaged && !creeper && tick >= retreatUntil
+                && defense.observeMelee(ears, threat, hurt,
+                    c.player.getHealth() <= 10 && wantsHealingMeal(), tick)) return false;
         if (hurt && c.currentScreen instanceof HandledScreen<?>) {
             defense.forgetContact();
             interruptHands();

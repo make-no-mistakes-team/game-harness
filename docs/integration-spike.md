@@ -49,8 +49,11 @@ frame or inventory. Terra can suggest alternatives: craft from surplus wood
 if the player has it, or gather wood if there is a tree in reach. Only one
 branch can start. It must match an actual observation, even when the advice
 refers to “the log you see” rather than a particular wood species. A branch
-can include up to three jobs. Each handoff checks the previous job's receipt
-and the player's stock. If the next job assumes a table the player doesn't
+can include up to three jobs. If the opening asks for three logs and the
+player already has three, the craft can start without sending the player
+back to a tree. Existing logs earn no harvest credit. After work begins,
+each handoff checks the previous job's receipt and the player's stock.
+If the next job assumes a table the player doesn't
 have, the player can keep gathering while Terra changes the plan. Ambiguous
 advice grants no action. A rejected plan or a failed
 startup can still use that request. Pass `--startup off` before the goal

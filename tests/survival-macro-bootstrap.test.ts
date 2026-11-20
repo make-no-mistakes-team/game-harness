@@ -167,6 +167,120 @@ function openingAdvice(advice: unknown) {
   return parsed;
 }
 
+const pickRequest = { goal: "wooden_pickaxe" } as const;
+const pick = "minecraft:wooden_pickaxe";
+// The ordinary fqHNB3 reply: a three-timber acquisition checkpoint, followed by all six crafts and one placement.
+const heldTimberBranch = {
+  policy: { kind: "harvest_stock", resource: "witnessed_timber", count: 3, maxBreaks: 3 },
+  requires: [],
+  then: [stockStage(pick, 1, [{ item: boundSource, count: 3 }],
+    [{ kind: "craft_bound_planks" }, "craft:crafting_table", "place:minecraft:crafting_table", "craft:stick", "craft:wooden_pickaxe"],
+    [{ item: boundSource, count: 3 }, { item: boundPlanks, count: 9 },
+      { item: "minecraft:stick", count: 2 }, { item: "minecraft:crafting_table", count: 1 }], [], 6, 1)],
+} as const;
+const heldTimberAdvice = openingAdvice({ kind: "first_policy", branches: [heldTimberBranch], reserves: [] });
+const footing = { id: "flat", verb: "approach", risk: "low", summary: "Walk to the adjacent flat tile",
+  evidence: "Lit full top and clear dry sweep, left of center from the current view." } as const;
+
+function heldTimber(source: string, count = 3) {
+  return view({ goal: pickRequest.goal, inventory: { [source]: count }, opportunities: [
+    footing, offer("grid", "continue", "recipe:planks", { [source]: 1 }),
+  ] });
+}
+
+test.each(["oak", "birch"])("held %s timber makes the ordinary pick suffix executable without any harvest offer", species => {
+  const source = `minecraft:${species}_log`;
+  const live = heldTimber(source);
+  expect(bindFirstPlan(pickRequest, heldTimberAdvice, live, { ...liveScope, first: live })).toMatchObject({
+    input: source, stockSatisfied: [{ item: source, count: 3 }],
+    policy: { target: { item: pick, count: 1 }, maxBreaks: 0, maxCrafts: 6, maxPlacements: 1,
+      allowedEffects: [`craft:${species}_planks`, "craft:crafting_table", "craft:stick",
+        "craft:wooden_pickaxe", "place:minecraft:crafting_table"].sort(),
+    },
+  });
+});
+
+test("a held timber checkpoint cannot sum species, spend a retained floor, or replace grid and site evidence", () => {
+  const source = "minecraft:oak_log";
+  const live = heldTimber(source);
+  const bind = (sample: MacroObservation, first = sample, advice = heldTimberAdvice) =>
+    bindFirstPlan(pickRequest, advice, sample, { ...liveScope, first });
+  expect(bind({ ...live, inventory: { [source]: 2, "minecraft:birch_log": 1 } }))
+    .toEqual({ reason: "no_matching_live_material" });
+  expect(bind({ ...live, inventory: { ...live.inventory, "minecraft:birch_log": 3 } }))
+    .toEqual({ reason: "ambiguous_material_binding" });
+  expect(bind(live, { ...live, inventory: {} })).toHaveProperty("reason");
+  expect(bind({ ...live, opportunities: [footing, spruce] })).toHaveProperty("reason");
+  expect(bind({ ...live, opportunities: live.opportunities.slice(1) })).toHaveProperty("reason");
+  expect(bind(live, live, openingAdvice({ kind: "first_policy", branches: [heldTimberBranch], reserves: [boundReserve] })))
+    .toHaveProperty("reason");
+  expect(bind({ ...live, inventory: { ...live.inventory, [pick]: 1 } })).toEqual({ reason: "opening_target_already_held" });
+});
+
+test("a symbolic plank stock can prove its exact species directly from held planks, not imaginary logs", () => {
+  const plank = "minecraft:spruce_planks";
+  const branch = { ...plankBranch, then: [
+    stockStage("minecraft:stick", 4, [{ item: boundPlanks, count: 4 }], ["craft:stick"],
+      [{ item: boundPlanks, count: 2 }], [], 1),
+  ] };
+  const live = view({ inventory: { [plank]: 4 }, opportunities: [
+    offer("sticks", "continue", "recipe:stick", { [plank]: 2 }),
+  ] });
+  expect(bindFirstPlan(request, openingAdvice({ ...planks, branches: [branch] }), live, { ...liveScope, first: live }))
+    .toMatchObject({ input: plank, stockSatisfied: [{ item: plank, count: 4 }],
+      policy: { target: { item: "minecraft:stick", count: 4 }, allowedEffects: ["craft:stick"], maxBreaks: 0,
+        costCaps: [{ item: plank, count: 2 }] } });
+  expect(bindFirstPlan(request, openingAdvice({ ...planks, branches: [branch], reserves: [boundReserve] }),
+    live, { ...liveScope, first: live })).toHaveProperty("reason");
+});
+
+test("a carried table is not usable until an authorized and witnessed placement can start", () => {
+  const plank = "minecraft:oak_planks", stick = "minecraft:stick", table = "minecraft:crafting_table";
+  const costs = [{ item: plank, count: 3 }, { item: stick, count: 2 }, { item: table, count: 1 }];
+  const branch = { ...plankBranch, then: [
+    stockStage(pick, 1, [{ item: boundPlanks, count: 4 }],
+      ["craft:wooden_pickaxe", "place:minecraft:crafting_table"], costs, [], 1, 1),
+  ] };
+  const advice = openingAdvice({ ...planks, branches: [branch] });
+  const live = view({ goal: pickRequest.goal, inventory: { [plank]: 4, [stick]: 2, [table]: 1 }, opportunities: [footing] });
+  expect(bindFirstPlan(pickRequest, advice, live, { ...liveScope, first: live })).toMatchObject({
+    liveTargets: [footing.id], policy: { maxPlacements: 1, allowedEffects: ["craft:wooden_pickaxe", "place:minecraft:crafting_table"] },
+  });
+  for (const opportunities of [[], [{ ...footing, evidence: "Unwitnessed footing" }], [{
+    id: "clue", verb: "survey", risk: "read", summary: `Reacquire recent ${table}`, evidence: "Not currently witnessed.",
+  }]] as const) expect(bindFirstPlan(pickRequest, advice, { ...live, opportunities }, { ...liveScope, first: live }))
+    .toHaveProperty("reason");
+  const unpermitted = openingAdvice({ ...planks, branches: [{ ...branch, then: [
+    stockStage(pick, 1, [{ item: boundPlanks, count: 4 }], ["craft:wooden_pickaxe"], costs.slice(0, 2), [], 1),
+  ] }] });
+  expect(bindFirstPlan(pickRequest, unpermitted, live, { ...liveScope, first: live })).toHaveProperty("reason");
+  const visibleTable = view({ ...live, opportunities: [{ id: "table", verb: "interact", risk: "guarded",
+    summary: `Open visible ${table}`, evidence: "A lit workstation face is inside vanilla use reach." }] });
+  expect(bindFirstPlan(pickRequest, unpermitted, visibleTable, { ...liveScope, first: visibleTable })).toMatchObject({
+    liveTargets: ["table"], policy: { maxPlacements: 0 },
+  });
+});
+
+test("consecutive held checkpoints grant no effects and preserve the next stage's exact costs", () => {
+  const source = "minecraft:oak_log", plank = "minecraft:oak_planks";
+  const advice = openingAdvice({ kind: "first_policy", reserves: [], branches: [{
+    ...heldTimberBranch, then: [
+      stockStage(boundPlanks, 12, [{ item: boundSource, count: 3 }], [{ kind: "craft_bound_planks" }],
+        [{ item: boundSource, count: 3 }], [], 3),
+      stockStage("minecraft:stick", 4, [{ item: boundPlanks, count: 12 }], ["craft:stick"],
+        [{ item: boundPlanks, count: 2 }], [], 1),
+    ],
+  }] });
+  const live = view({ inventory: { [source]: 3, [plank]: 12 }, opportunities: [
+    offer("sticks", "continue", "recipe:stick", { [plank]: 2 }),
+  ] });
+  expect(bindFirstPlan(request, advice, live, { ...liveScope, first: live })).toMatchObject({
+    stockSatisfied: [{ item: source, count: 3 }, { item: plank, count: 12 }], then: [],
+    policy: { target: { item: "minecraft:stick", count: 4 }, allowedEffects: ["craft:stick"], maxBreaks: 0,
+      maxCrafts: 1, costCaps: [{ item: plank, count: 2 }] },
+  });
+});
+
 test("one conditional timber program resolves exact stock and craft references for different actual species", () => {
   const advice = openingAdvice(timberProgram);
   for (const [source, output, visible] of [
@@ -443,14 +557,15 @@ const result = (proposal: FirstPlanInference["proposal"], outcome: FirstPlanInfe
   ({ stage: PRE_SPAWN_GOAL_ONLY, model: TERRA_MODEL_ID, outcome, proposal, dispatched: true,
     latencyMs: 2, providerStartedAtMs: performance.now(), usage: null, costUsd: null }) satisfies FirstPlanInference;
 
-async function fixture(infer: FirstPlanStrategist, signal?: AbortSignal, maxRequests = 1, strategy: "terra" | "deterministic" = "terra") {
+async function fixture(infer: FirstPlanStrategist, signal?: AbortSignal, maxRequests = 1, strategy: "terra" | "deterministic" = "terra",
+  opening: FirstPlanRequest = { ...request, objective: "Mine a stone pickaxe" }) {
   const dir = await mkdtemp(path.join(tmpdir(), "survival-first-plan-"));
   const run = path.basename(dir);
   let liveCalls = 0;
   const controller = new SurvivalMacroController({ runDir: dir, run, strategy, signal,
-    ...(strategy === "terra" ? { durableWork: true, objective: "Mine a stone pickaxe" } : {}),
+    ...(strategy === "terra" ? { durableWork: true, objective: opening.objective } : {}),
     limits: { maxRequests, pollMs: 1000 }, confirmNativeExit: async () => true,
-    firstPlan: { request: { ...request, objective: "Mine a stone pickaxe" }, infer },
+    firstPlan: { request: opening, infer },
     strategist: async ({ observation: { run, life, epoch, tick } }) => {
       liveCalls++;
       return { basis: { run, life, epoch, tick }, outcome: "refused", model: TERRA_MODEL_ID,
@@ -505,6 +620,100 @@ test("one paid startup request uses the existing quota and publishes only after 
     reply.resolve(result(null, "cancelled"));
     await f.close();
   }
+});
+
+test("the ordinary held-log opening publishes only stage 2 and credits just its native accepted and completed receipts", async () => {
+  const f = await fixture(async () => result(heldTimberAdvice), undefined, 2, "terra", pickRequest);
+  try {
+    const source = "minecraft:oak_log";
+    // The first sample has real inventory but no rendered offers yet.
+    const live = heldTimber(source);
+    await f.observe({ ...live, opportunities: [] });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    await f.observe({ ...live, tick: 10 });
+    const [proposal] = await f.log("proposals.jsonl");
+    const work = await f.order();
+    expect(work).toMatchObject({ id: `${proposal.requestId}:2`, origin: "model", target: { item: pick, count: 1 },
+      maxBreaks: 0, maxCrafts: 6, maxPlacements: 1 });
+    expect(work.nextWorkId).toBeUndefined();
+    expect(f.controller.status()).toMatchObject({ issuedWorkOrders: 1, completedModelWorkOrders: 0, completedWorkPrograms: 0 });
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({
+      event: "first_plan_bound", requestId: proposal.requestId, firstIssuedStage: 2, declaredStages: 2,
+      stockSatisfied: [{ stage: 1, item: source, required: 3, observed: 3 }], nativeAccepted: false,
+    }));
+    await f.receipt(work.id, 11, "accepted");
+    await f.observe({ ...live, tick: 11, workOrder: { id: work.id, state: "working", detail: "Working" } });
+    expect(f.controller.status().completedWorkProgram).toBeNull();
+    await f.receipt(work.id, 30, "completed");
+    await f.controller.poll();
+    expect(f.controller.status().completedWorkProgram).toBeNull(); // The receipt alone isn't stock evidence.
+    await f.observe({ ...live, tick: 30, epoch: 2, opportunities: [], inventory: { [pick]: 1 },
+      workOrder: { id: work.id, state: "complete", detail: "Wooden pickaxe confirmed" } });
+    expect(await f.log("receipts.jsonl")).toMatchObject(["accepted", "completed"].map(status => ({
+      requestId: proposal.requestId, programStage: 2, eligible: true, receipt: { id: work.id, status },
+    })));
+    expect(f.controller.status()).toMatchObject({ requests: 1, issuedWorkOrders: 1, completedModelWorkOrders: 1,
+      completedWorkPrograms: 1, completedWorkProgram: { requestId: proposal.requestId, stages: 1, declaredStages: 2,
+        executedStages: [2], invocationItemCount: 1, receipt: { id: work.id, status: "completed" } } });
+    expect(f.liveCalls()).toBe(0);
+  } finally { await f.close(); }
+});
+
+test.each([
+  ["changed epoch", { tick: 6, epoch: 2 }, "fresh_binding_changed"],
+  ["gone grid", { tick: 6, opportunities: [footing] }, "no_matching_live_material"],
+  ["lost stock", { tick: 6, inventory: {} }, "no_matching_live_material"],
+  ["unsafe", { tick: 6, safety: { clear: false, revision: 2 } }, "live_scope_changed"],
+  ["late", { tick: 16 }, "first_actionable_view_deadline"],
+] as const)("held timber is not authority to issue the suffix after %s", async (_name, change, reason) => {
+  const reply = Promise.withResolvers<FirstPlanInference>();
+  const f = await fixture(async () => reply.promise, undefined, 1, "terra", { ...pickRequest, objective: "Make a wooden pickaxe" });
+  try {
+    const live = heldTimber("minecraft:oak_log");
+    await f.observe(live);
+    reply.resolve(result(heldTimberAdvice));
+    await f.observe({ ...live, ...change });
+    expect(f.controller.status()).toMatchObject({ issuedWorkOrders: 0, completedModelWorkOrders: 0, completedWorkPrograms: 0 });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({ event: "first_plan_rejected", reason }));
+  } finally {
+    reply.resolve(result(null, "cancelled"));
+    await f.close();
+  }
+});
+
+test("canceled held-stock handoff neither publishes nor creates model receipt credit", async () => {
+  const abort = new AbortController();
+  const reply = Promise.withResolvers<FirstPlanInference>();
+  const f = await fixture(async () => reply.promise, abort.signal, 1, "terra", pickRequest);
+  try {
+    await f.observe(heldTimber("minecraft:oak_log"));
+    abort.abort();
+    reply.resolve(result(heldTimberAdvice));
+    await f.controller.stop();
+    expect(f.controller.status()).toMatchObject({ requests: 1, issuedWorkOrders: 0, completedModelWorkOrders: 0,
+      completedWorkPrograms: 0, completedWorkProgram: null });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({ event: "first_plan_rejected", reason: "stop" }));
+  } finally {
+    reply.resolve(result(null, "cancelled"));
+    await f.close();
+  }
+});
+
+test("a fully satisfied held-stock chain has no model order, receipt or completed program", async () => {
+  const f = await fixture(async () => result(heldTimberAdvice), undefined, 1, "terra", { ...pickRequest, objective: "Make a wooden pickaxe" });
+  try {
+    const source = "minecraft:oak_log";
+    await f.observe({ ...heldTimber(source), inventory: { [source]: 3, [pick]: 1 } });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(f.controller.status()).toMatchObject({ requests: 1, issuedWorkOrders: 0, completedModelWorkOrders: 0,
+      completedWorkPrograms: 0, completedWorkProgram: null });
+    expect(await f.log("receipts.jsonl")).toEqual([]);
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({
+      event: "first_plan_rejected", reason: "opening_target_already_held",
+    }));
+  } finally { await f.close(); }
 });
 
 test("one paid opening completes three ordinary jobs with exact native receipts and an adjacent personal GUI handoff", async () => {

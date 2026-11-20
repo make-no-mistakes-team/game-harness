@@ -127,6 +127,8 @@ interface WorkJobStatus {
 interface WorkProgramCompletion {
   readonly requestId: string;
   readonly stages: number;
+  readonly declaredStages?: number;
+  readonly executedStages?: readonly number[];
   readonly goal: string;
   readonly invocationItemCount: number | null;
   readonly finalOrder: MacroWorkOrder;
@@ -290,7 +292,7 @@ interface WorkJob {
   readonly source: MacroObservation;
   readonly requestId: string | null;
   health: number;
-  bootstrap?: true;
+  bootstrap?: number;
   smeltLookedAhead?: true;
   accepted?: MacroReceipt;
   terminal?: MacroReceipt;
@@ -302,7 +304,7 @@ interface QueuedWork {
   readonly plan: Pick<Plan, "requestId" | "observation" | "correction"> & { readonly proposal: Pick<MacroProposal, "expiresTick"> };
   readonly stages: readonly MacroWorkStage[];
   readonly next: number;
-  readonly bootstrap?: { readonly branchIndex: number; readonly declaredStages: number };
+  readonly bootstrap?: { readonly branchIndex: number; readonly declaredStages: number; readonly stageOffset: number };
   readonly smeltSuccessor?: true;
 }
 
@@ -317,12 +319,12 @@ interface WorkStageIds {
   nextWorkId?: string;
 }
 
-function workStageIds(requestId: string, stages: readonly MacroWorkStage[], index: number): WorkStageIds {
+function workStageIds(requestId: string, stages: readonly MacroWorkStage[], index: number, offset = 0): WorkStageIds {
   const successor = stages[index + 1]?.policy;
   // Only the adjacent ID is announced; subsequent permissions are still unadmitted.
-  return { id: `${requestId}:${index + 1}`,
+  return { id: `${requestId}:${offset + index + 1}`,
     nextWorkId: successor && successor.maxCrafts > 0 && successor.allowedEffects.some(effect => effect.startsWith("craft:"))
-      ? `${requestId}:${index + 2}` : undefined };
+      ? `${requestId}:${offset + index + 2}` : undefined };
 }
 
 function workStatus(job: WorkJob | undefined): WorkJobStatus | null {
@@ -1099,10 +1101,13 @@ export class SurvivalMacroController {
     if (!observed) return;
     const original = bindFirstPlan(request, advice, actionable, bindingScope);
     if ("reason" in original) return reject(original.reason);
+    const stageOffset = original.stockSatisfied?.length ?? 0;
+    if (stageOffset && !inViewWindow) return reject("first_actionable_view_deadline");
     const key = workPolicyKey(original.policy);
+    const startingStock = original.stockSatisfied ? digest(original.stockSatisfied) : null;
     const expiresTick = actionable.tick + this.limits.maxIntentTtlTicks;
     const declared = original.then ? [{ policy: original.policy, requires: original.requires }, ...original.then] : undefined;
-    const stageIds = declared ? workStageIds(requestId, declared, 0) : undefined;
+    const stageIds = declared ? workStageIds(requestId, declared, 0, stageOffset) : undefined;
     let stages = declared;
     let diagnostic: VanillaWorkDiagnostic | undefined;
     let bound = original;
@@ -1113,8 +1118,20 @@ export class SurvivalMacroController {
           freshRejection = this.job ? "native_work_incumbent" : "live_observation_stale";
           return false;
         }
+        if (stageOffset) {
+          if (performance.now() - work.first!.observedAt > FIRST_ACTIONABLE_VIEW_MS ||
+              fresh.tick - first.tick > FIRST_ACTIONABLE_VIEW_TICKS) {
+            freshRejection = "first_actionable_view_deadline";
+            return false;
+          }
+          if (fresh.epoch !== actionable.epoch) {
+            freshRejection = "fresh_binding_changed";
+            return false;
+          }
+        }
         const binding = bindFirstPlan(request, advice, fresh, bindingScope, original.branchIndex);
         if ("reason" in binding || binding.input !== original.input || workPolicyKey(binding.policy) !== key ||
+            (binding.stockSatisfied ? digest(binding.stockSatisfied) : null) !== startingStock ||
             (declared && (!binding.liveTargets.some(target => original.liveTargets.includes(target)) ||
               digest(binding.then) !== digest(original.then)))) {
           freshRejection = "reason" in binding ? binding.reason : "fresh_binding_changed";
@@ -1122,7 +1139,7 @@ export class SurvivalMacroController {
         }
         bound = binding;
         return true;
-      }, stageIds, declared && (fresh => {
+      }, stageIds, declared && !stageOffset ? (fresh => {
         const checked = preflightVanillaWork(fresh, declared);
         if ("detail" in checked && checked.detail !== undefined) diagnostic = checked;
         if (checked.kind === "shortage") {
@@ -1134,13 +1151,13 @@ export class SurvivalMacroController {
           stageIds!.nextWorkId = workStageIds(requestId, stages, 0).nextWorkId;
         }
         return true;
-      }));
+      }) : undefined);
     if (!job) {
       if (diagnostic && freshRejection === "work_resource_shortage") await this.reportWorkShortage(requestId, diagnostic, this.view!.observation);
       return reject(freshRejection ?? (this.closing || this.config.signal?.aborted ? "stop" :
         job === null ? "live_observation_rotating" : "fresh_work_admission_rejected"), this.view?.observation);
     }
-    job.bootstrap = true;
+    job.bootstrap = stageOffset + 1;
     const usedAt = performance.now();
     if (diagnostic) {
       await this.reportWorkShortage(requestId, diagnostic, job.source);
@@ -1148,18 +1165,23 @@ export class SurvivalMacroController {
         await this.record("work_successor_discarded", { requestId, afterWorkId: null, stage: diagnostic.stageIndex + 1,
           programSource: PRE_SPAWN_GOAL_ONLY, reason: "work_resource_shortage", detail: diagnostic.detail });
     }
-    if (declared && stages && stages.length > 1) {
+    if (declared && stages && (stages.length > 1 || stageOffset > 0)) {
+      const declaredStages = declared.length + stageOffset;
       this.queuedWork = { after: job, plan: { requestId, observation: job.source, proposal: { expiresTick } },
-        stages, next: 1, bootstrap: { branchIndex: original.branchIndex, declaredStages: declared.length } };
+        stages, next: 1, bootstrap: { branchIndex: original.branchIndex, declaredStages, stageOffset } };
       await this.record("work_program_stage", {
-        requestId, id: job.order.id, stage: 1, stages: declared.length, programSource: PRE_SPAWN_GOAL_ONLY,
+        requestId, id: job.order.id, stage: stageOffset + 1, stages: declaredStages, programSource: PRE_SPAWN_GOAL_ONLY,
       });
     }
     this.firstPlanning = undefined;
     await this.record("first_plan_bound", {
       ...scope, id: job.order.id, basis: basis(job.source), firstBasis: basis(first), actionableBasis: basis(actionable),
       branchIndex: bound.branchIndex, branchCount: advice.branches.length, input: bound.input, liveTargets: bound.liveTargets,
-      ...(declared ? { declaredStages: declared.length, eligiblePrefixStages: stages!.length } : {}),
+      ...(declared ? { declaredStages: declared.length + stageOffset } : {}),
+      ...(bound.stockSatisfied ? { firstIssuedStage: stageOffset + 1, eligibleSuffixStages: stages!.length,
+        stockSatisfied: bound.stockSatisfied.map(({ item, count }, index) =>
+          ({ stage: index + 1, item, required: count, observed: stock(job.source, item) })) }
+        : declared ? { eligiblePrefixStages: stages!.length } : {}),
       disposition: "work_order_published", nativeAccepted: false,
       timeToFirstUseMs: Math.round(usedAt - (work.dispatchedAt ?? inference?.providerStartedAtMs ?? work.startedAt)),
       firstLiveToFirstUseMs: Math.round(usedAt - work.first!.observedAt),
@@ -1294,10 +1316,11 @@ export class SurvivalMacroController {
   }
 
   private async discardQueuedWork(queued: QueuedWork, reason: string, extra?: Record<string, unknown>): Promise<void> {
-    const { plan, after, next, bootstrap } = queued;
+    const { plan, after, next, stages, bootstrap } = queued;
     this.queuedWork = undefined;
+    const stage = bootstrap?.stageOffset ? bootstrap.stageOffset + Math.min(next + 1, stages.length) : next + 1;
     await this.record("work_successor_discarded", { requestId: plan.requestId, afterWorkId: after?.order.id ?? null,
-      stage: next + 1, reason, ...(bootstrap ? { programSource: PRE_SPAWN_GOAL_ONLY } : {}), ...extra });
+      stage, reason, ...(bootstrap ? { programSource: PRE_SPAWN_GOAL_ONLY } : {}), ...extra });
   }
 
   private async advanceQueuedWork(current: MacroObservation | undefined, runtimeExpired: boolean): Promise<void> {
@@ -1319,7 +1342,8 @@ export class SurvivalMacroController {
     else {
       if (next === stages.length) {
         this.queuedWork = undefined;
-        if (bootstrap && next !== bootstrap.declaredStages) return;
+        const stageOffset = bootstrap?.stageOffset ?? 0;
+        if (bootstrap && next + stageOffset !== bootstrap.declaredStages) return;
         this.completedWorkPrograms++;
         const target = after.policy.target;
         const checked = target.kind === "stock" ? [...after.policy.reserves, target] : after.policy.reserves;
@@ -1330,6 +1354,8 @@ export class SurvivalMacroController {
           accepted: after.accepted, receipt: terminal, basis: basis(current),
           stock: checked.map(({ item, count }) => ({ item, required: count, observed: stock(current, item) })),
           ...(bootstrap ? { stage: PRE_SPAWN_GOAL_ONLY, branchIndex: bootstrap.branchIndex } : {}),
+          ...(bootstrap && stageOffset ? { declaredStages: bootstrap.declaredStages,
+            executedStages: stages.map((_, index) => index + stageOffset + 1) } : {}),
         };
         this.completedWorkProgram = completed;
         await this.record("work_program_completed", { ...completed });
@@ -1342,7 +1368,8 @@ export class SurvivalMacroController {
   private async startWorkStage(queued: QueuedWork): Promise<void> {
     const { plan, stages, next: index, after, bootstrap } = queued;
     const { policy, requires } = stages[index]!;
-    const stage = stages.length > 1 ? workStageIds(plan.requestId, stages, index) : undefined;
+    const stageOffset = bootstrap?.stageOffset ?? 0;
+    const stage = stages.length > 1 ? workStageIds(plan.requestId, stages, index, stageOffset) : undefined;
     const afterSmelt = queued.smeltSuccessor && index === 0 ? after : null;
     let rejection = "fresh_work_admission_rejected";
     const job = await this.publishWork(plan.observation, policy, "model", plan.requestId, plan.proposal.expiresTick,
@@ -1397,9 +1424,9 @@ export class SurvivalMacroController {
     if (!job && (bootstrap || afterSmelt)) return this.discardQueuedWork(queued, rejection);
     this.queuedWork = undefined;
     if (job && (stages.length > 1 || (job.order.origin === "model" && policy.target.kind === "preset"))) {
-      if (bootstrap) job.bootstrap = true;
+      if (bootstrap) job.bootstrap = index + stageOffset + 1;
       this.queuedWork = { ...queued, after: job, next: index + 1 };
-      await this.record("work_program_stage", { requestId: plan.requestId, id: job.order.id, stage: index + 1,
+      await this.record("work_program_stage", { requestId: plan.requestId, id: job.order.id, stage: index + stageOffset + 1,
         stages: bootstrap?.declaredStages ?? stages.length, ...(bootstrap ? { programSource: PRE_SPAWN_GOAL_ONLY } : {}) });
     }
   }
@@ -1668,7 +1695,7 @@ export class SurvivalMacroController {
     const priorLife = (this.view?.observation.life ?? receipt.life) > receipt.life;
     const eligible = !job.withdrawn && !priorLife;
     await this.append(this.receipts, { requestId: job.requestId, order, receipt, eligible,
-      ...(job.bootstrap ? { stage: PRE_SPAWN_GOAL_ONLY } : {}),
+      ...(job.bootstrap ? { stage: PRE_SPAWN_GOAL_ONLY, programStage: job.bootstrap } : {}),
       ...(job.withdrawn ? { afterWithdrawal: true } : {}), ...(priorLife ? { priorLife: true } : {}) });
     if (receipt.status === "accepted") {
       job.accepted = receipt;

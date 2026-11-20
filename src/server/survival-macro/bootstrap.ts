@@ -5,7 +5,7 @@ import {
   type MacroStockFloor, type MacroWorkPolicy, type MacroWorkStage,
 } from "./protocol.ts";
 import {
-  VANILLA_HARVEST_SOURCES as harvestSources, VANILLA_TIMBER_RECIPES as timber, VANILLA_WORK_RECIPE_KEYS,
+  preflightVanillaWork, VANILLA_HARVEST_SOURCES as harvestSources, VANILLA_TIMBER_RECIPES as timber, VANILLA_WORK_RECIPE_KEYS,
 } from "./vanilla-work.ts";
 
 export const PRE_SPAWN_GOAL_ONLY = "pre_spawn_goal_only";
@@ -20,7 +20,8 @@ const BOUND_PLANKS = { kind: "bound_planks" } as const;
 const CRAFT_BOUND_PLANKS = { kind: "craft_bound_planks" } as const;
 const PLACE_TABLE = "place:minecraft:crafting_table";
 const DEFER_CATEGORIES = ["constraint_not_expressible", "needs_world_evidence", "no_supported_opening"] as const;
-const wholeLogs = [...timber.keys()].filter(item => item.endsWith("_log") && !item.startsWith("minecraft:stripped_"));
+const timberItems = [...timber.keys()];
+const wholeLogs = timberItems.filter(item => item.endsWith("_log") && !item.startsWith("minecraft:stripped_"));
 
 export interface FirstPlanRequest {
   readonly goal: SurvivalAgentGoal;
@@ -70,7 +71,7 @@ function schema(properties: Record<string, unknown>) {
 }
 const choice = (...values: string[]) => ({ type: "string", enum: values });
 const integer = { type: "integer" };
-const timberChoices = [WITNESSED_LOG, WITNESSED_TIMBER, ...timber.keys()];
+const timberChoices = [WITNESSED_LOG, WITNESSED_TIMBER, ...timberItems];
 const harvestChoices = [...timberChoices, "minecraft:cobblestone", "minecraft:coal"];
 const stageEffects = [PLACE_TABLE, ...VANILLA_WORK_RECIPE_KEYS
   .filter(key => !key.endsWith("_planks")).map(key => `craft:${key}`)];
@@ -117,7 +118,7 @@ For either policy, count is the total stock target from 1..8, not an amount to a
 Each floor is {item,count}, with a count from 1..2304. item is an exact minecraft:item ID, {"kind":"bound_source"} (the one actual timber input or harvest output), or {"kind":"bound_planks"} (the exact vanilla plank output of the actual timber, unavailable for stone or coal). These are inventory items, never block IDs, wildcards or species sums.
 Each branch's requires (0..4) are starting inventory prerequisites, true on the first native observation and at admission. Shared reserves (0..4) protect exact stock in every branch. A zero-spend first harvest may earn its exact reserve only within the target, cap and actually witnessed means. A spending first stage requires the reserves and adequate surplus. Do not put future stock into the starting requires.
 A branch may include then (1..${MACRO_MAX_WORK_STAGES - 1}) only for useful adjacent work on the same opening. Each entry has positive requires and a normal finite stock policy. requires are real inventory thresholds rechecked after the previous stage's accepted and completed native receipts. The target is total stock, which can be the invocation item when the recipes and ingredients are supported; do not target portal entry or smelting. Include only necessary exact craft effects, {"kind":"craft_bound_planks"} for the bound timber, and place:minecraft:crafting_table only if needed and capped (0..1 per stage). Later stages never grant block breaking. costCaps are explicit aggregate ingredient/placement costs for that stage, not grants to spend reserves. A stage's reserves add to the inherited reserves and can never reduce them. Put a reserve not yet held in its own producing stage; no earlier stage may spend that stock below the proposed reserve. No speculative receipt, ingredient, workstation, or stocked intermediate authorizes action.
-Check vanilla ingredients and batch yields before proposing numbers. Account for retained stock in addition to spend on the result, missing intermediate recipes, and a crafting table if not already supported. Include every required cost and effect within the caps. Reuse held gear through a real starting prerequisite instead of remaking it; a carried table is different from a placed, witnessed table. Defer if the task or floor is contradictory, universal or summed across species, or the available vocabulary cannot express it. Optionally provide one of the structured defer categories, never private reasoning.`;
+Check vanilla ingredients and batch yields before proposing numbers. Account for retained stock in addition to spend on the result, missing intermediate recipes, and a crafting table if not already supported. Include every required cost and effect within the caps. Reuse held gear through a real starting prerequisite instead of remaking it; a carried table is different from a placed, witnessed table. If a stage will make its own workstation or tools, budget their ingredients, recipes and any placement instead of requiring those finished items at stage entry. Defer if the task or floor is contradictory, universal or summed across species, or the available vocabulary cannot express it. Optionally provide one of the structured defer categories, never private reasoning.`;
 
 export function firstPlanContext({ goal, objective }: FirstPlanRequest): Context | undefined {
   if (!SURVIVAL_AGENT_GOALS.includes(goal) || (objective !== undefined &&
@@ -259,10 +260,12 @@ interface FirstPlanCandidate {
   readonly liveTargets: readonly string[];
   readonly requires: readonly MacroStockFloor[];
   readonly then?: readonly MacroWorkStage[];
+  readonly stockSatisfied?: readonly MacroStockFloor[];
 }
 
 type NoBinding = "stock_prerequisite_missing" | "protected_stock_missing" |
-  "no_matching_live_material" | "ambiguous_material_binding" | "invalid_conditional_program" | "opening_target_already_held";
+  "no_matching_live_material" | "ambiguous_material_binding" | "invalid_conditional_program" |
+  "opening_target_already_held" | "work_resource_shortage";
 type FirstPlanBinding = (FirstPlanCandidate & { readonly branchIndex: number }) | {
   readonly reason: "model_deferred" | "live_scope_changed" | NoBinding;
 };
@@ -273,8 +276,8 @@ export function bindFirstPlan(
 ): FirstPlanBinding {
   if (advice.kind === "defer") return { reason: "model_deferred" };
   if (!firstPlanScopeMatches(request, scope.first, live, scope.run)) return { reason: "live_scope_changed" };
-  const stock = (item: string) => live.inventory[item] ?? 0;
-  const holds = ({ item, count }: MacroStockFloor) => (scope.first.inventory[item] ?? 0) >= count && stock(item) >= count;
+  const holds = ({ item, count }: MacroStockFloor) =>
+    (scope.first.inventory[item] ?? 0) >= count && (live.inventory[item] ?? 0) >= count;
 
   const breaks = new Map<string, Set<string>>();
   const drops = new Map<string, Set<string>>();
@@ -301,11 +304,12 @@ export function bindFirstPlan(
   for (let branchIndex = 0; branchIndex < advice.branches.length; branchIndex++) {
     if (pinnedBranch !== undefined && pinnedBranch !== branchIndex) continue;
     const branch = advice.branches[branchIndex]!;
-    const result = bindBranch(branch, stock, holds, reserves, witnesses, request.objective === undefined);
+    const result = bindBranch(branch, live, holds, reserves, witnesses, request.objective === undefined);
     if (typeof result !== "string") return { ...result, branchIndex };
     if (result === "ambiguous_material_binding") return { reason: result };
     if (result === "invalid_conditional_program" || result === "opening_target_already_held" ||
-        reason === "stock_prerequisite_missing" || (result === "no_matching_live_material" &&
+        result === "work_resource_shortage" || reason === "stock_prerequisite_missing" || (result === "no_matching_live_material" &&
+          reason !== "work_resource_shortage" &&
           reason !== "invalid_conditional_program" && reason !== "opening_target_already_held")) reason = result;
   }
   return { reason };
@@ -361,14 +365,136 @@ function resolveStages(first: MacroWorkStage, then: readonly ConditionalStage[],
   catch { return; }
 }
 
+function withoutPlacement({ policy, requires }: MacroWorkStage): MacroWorkStage {
+  return { requires, policy: { ...policy, maxPlacements: 0,
+    allowedEffects: policy.allowedEffects.filter(effect => effect !== PLACE_TABLE) } };
+}
+
+function witnessedCraftStart(live: MacroObservation, stages: readonly MacroWorkStage[]): readonly string[] | NoBinding {
+  const { inventory, opportunities } = live;
+  // The arithmetic helper estimates a visible drop at a full stack. Only actual inventory
+  // may fund a suffix that is justified by an already-held stock condition.
+  const evidence = { inventory, opportunities: opportunities.filter(offer => offer.verb !== "collect") };
+  const possible = (work: readonly MacroWorkStage[]) => preflightVanillaWork(evidence, work).kind === "possible";
+  if (!possible(stages)) return "work_resource_shortage";
+  // A same-height, visible full top is a placement opportunity, not a
+  // workstation. The native actor must still observe and validate placement.
+  const sites = opportunities.filter(({ verb, risk, summary, evidence }) => verb === "approach" && risk === "low" &&
+    summary === "Walk to the adjacent flat tile" && evidence.startsWith("Lit full top and clear dry sweep, ") &&
+    evidence.endsWith(" from the current view."));
+  const needsSite = !possible(stages.map(withoutPlacement));
+  if (needsSite && !sites.length) return "no_matching_live_material";
+
+  const stage = stages[0]!;
+  const later = stages.slice(1);
+  const { policy } = stage;
+  const targets = new Set<string>();
+  for (const effect of policy.allowedEffects) {
+    if (!effect.startsWith("craft:")) continue;
+    const recipe = effect.slice(6);
+    const withoutEffect = { ...stage, policy: { ...policy, allowedEffects: policy.allowedEffects.filter(key => key !== effect) } };
+    // A spare, unrelated authorized recipe isn't positive evidence for the path.
+    if (possible([withoutEffect, ...later])) continue;
+    const item = `minecraft:${recipe}`;
+    const exactCraft: MacroWorkStage = { requires: stage.requires, policy: {
+      ...policy, target: { kind: "stock", item, count: (inventory[item] ?? 0) + 1 },
+      allowedEffects: [effect], maxPlacements: 0, reserves: policy.reserves.filter(floor =>
+        floor.item === item || (inventory[floor.item] ?? 0) >= floor.count),
+    } };
+    for (const { verb, risk, material } of opportunities) {
+      if (verb !== "continue" || risk !== "guarded" || !material ||
+          (material.subject !== `recipe:${recipe}` && !(recipe.endsWith("_planks") && material.subject === "recipe:planks"))) continue;
+      const costCaps = policy.costCaps.map(cap =>
+        ({ item: cap.item, count: Math.min(cap.count, material.spends[cap.item] ?? 0) })).filter(cap => cap.count > 0);
+      if (possible([{ ...exactCraft, policy: { ...exactCraft.policy, costCaps } }])) targets.add(material.target);
+    }
+    // If ingredients for the bench operation are already held, its first input may be
+    // opening a witnessed table or putting a permitted, spendable table on visible footing.
+    if (preflightVanillaWork({ inventory, opportunities: [] }, [exactCraft]).kind === "possible") continue;
+    if (possible([exactCraft])) {
+      for (const { id, verb, risk, summary } of opportunities) {
+        if (verb === "interact" && risk === "guarded" && summary === "Open visible minecraft:crafting_table") targets.add(id);
+      }
+    } else if (needsSite && policy.maxPlacements > 0 && policy.allowedEffects.includes(PLACE_TABLE) &&
+        possible([{ ...exactCraft, policy: { ...exactCraft.policy,
+          allowedEffects: [effect, PLACE_TABLE], maxPlacements: policy.maxPlacements } }])) {
+      for (const { id } of sites) targets.add(id);
+    }
+  }
+  return targets.size ? [...targets] : "no_matching_live_material";
+}
+
+function bindHeldOpening(
+  branch: FirstPlanBranch & { then: readonly ConditionalStage[] }, sources: Iterable<string>, live: MacroObservation,
+  holds: (floor: MacroStockFloor) => boolean, floors: readonly FirstPlanFloor[], skipSatisfiedOpening: boolean,
+): FirstPlanCandidate | NoBinding | undefined {
+  const { policy } = branch;
+  const symbolicPlanks = policy.kind === "plank_stock" &&
+    (policy.source === WITNESSED_TIMBER || policy.source === WITNESSED_LOG);
+  const usesSource = symbolicPlanks && [...floors, ...branch.requires, ...branch.then.flatMap(({ requires, policy }) =>
+    [...requires, policy.target, ...policy.costCaps, ...policy.reserves])]
+    .some(({ item }) => typeof item !== "string" && item.kind === BOUND_SOURCE.kind);
+  let binding: { source: string; input: string; target: MacroStockFloor; requires: MacroStockFloor[] } | undefined;
+  for (const source of sources) {
+    const recipe = timber.get(source);
+    if (policy.kind === "plank_stock" && !recipe) continue;
+    const target = { item: policy.kind === "plank_stock" ? `minecraft:${recipe}` : source, count: policy.count };
+    const requires = resolvedFloors(branch.requires, source);
+    if (!requires?.every(holds) || !holds(target) || (usesSource && !holds({ item: source, count: 1 }))) continue;
+    // Multiple timber forms can have the same plank SKU. Don't assign an
+    // imaginary raw input when the exact plank output is all the branch uses.
+    const input = symbolicPlanks && !usesSource ? target.item : source;
+    if (binding) {
+      if (binding.input !== input || binding.target.item !== target.item) return "ambiguous_material_binding";
+      continue;
+    }
+    binding = { source, input, target, requires };
+  }
+  if (!binding) return;
+  const { source, input, target, requires } = binding;
+  const reserves = resolvedFloors(floors, source);
+  if (!reserves || reserves.length > 32) return "invalid_conditional_program";
+  if (!reserves.every(holds)) return "protected_stock_missing";
+  const then = resolveStages({ requires, policy: { target: { kind: "stock", ...target }, reserves,
+    allowedEffects: [], costCaps: [], maxBreaks: 0, maxCrafts: 0, maxPlacements: 0 } }, branch.then, source);
+  if (!then) return "invalid_conditional_program";
+  const stockSatisfied = [target];
+  let index = 0;
+  for (const { policy: stage, requires } of then) {
+    const { target, reserves } = stage;
+    if (target.kind !== "stock" || (live.inventory[target.item] ?? 0) < target.count) break;
+    if (!holds(target) || !requires.every(holds)) return "stock_prerequisite_missing";
+    if (!reserves.every(holds)) return "protected_stock_missing";
+    stockSatisfied.push({ item: target.item, count: target.count });
+    index++;
+  }
+  const suffix = then.slice(index);
+  const first = suffix[0];
+  const final = suffix.at(-1)?.policy;
+  if (!first || (skipSatisfiedOpening && final?.target.kind === "stock" && holds(final.target) && final.reserves.every(holds)))
+    return "opening_target_already_held";
+  if (!first.requires.every(floor => (live.inventory[floor.item] ?? 0) >= floor.count)) return "stock_prerequisite_missing";
+  if (!first.policy.reserves.every(floor => (live.inventory[floor.item] ?? 0) >= floor.count ||
+      (first.policy.target.kind === "stock" && first.policy.target.item === floor.item && first.policy.target.count >= floor.count &&
+        !first.policy.costCaps.some(cost => cost.item === floor.item)))) return "protected_stock_missing";
+  const liveTargets = witnessedCraftStart(live, suffix);
+  if (typeof liveTargets === "string") return liveTargets;
+  return { input, liveTargets, ...first, stockSatisfied, then: suffix.slice(1) };
+}
+
 function bindBranch(
-  branch: FirstPlanBranch, stock: (item: string) => number, holds: (floor: MacroStockFloor) => boolean,
+  branch: FirstPlanBranch, live: MacroObservation, holds: (floor: MacroStockFloor) => boolean,
   floors: readonly FirstPlanFloor[], { breaks, drops, recipes }: { breaks: Witnesses; drops: Witnesses; recipes: Witnesses },
   skipSatisfiedOpening: boolean,
 ): FirstPlanCandidate | NoBinding {
   const { policy } = branch;
   const selector = policy.kind === "harvest_stock" ? policy.resource : policy.source;
-  const sources = selector === WITNESSED_LOG ? wholeLogs : selector === WITNESSED_TIMBER ? timber.keys() : [selector];
+  const sources = selector === WITNESSED_LOG ? wholeLogs : selector === WITNESSED_TIMBER ? timberItems : [selector];
+  if (branch.then) {
+    const held = bindHeldOpening({ ...branch, then: branch.then }, sources, live, holds, floors, skipSatisfiedOpening);
+    if (held !== undefined) return held;
+  }
+  const stock = (item: string) => live.inventory[item] ?? 0;
   let candidate: FirstPlanCandidate | undefined;
   let ambiguous = false;
   let reason: NoBinding = "stock_prerequisite_missing";

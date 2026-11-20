@@ -105,6 +105,7 @@ public final class AgentClient implements ClientModInitializer {
     private long craftSequence;
     private int returnableDropSequence;
     private long stallSequence;
+    private int horizonEvidenceCount;
     private boolean allowRespawn;
     private boolean initialDeathScreen;
     private LifePhase lifePhase = LifePhase.PLAYING;
@@ -201,6 +202,28 @@ public final class AgentClient implements ClientModInitializer {
     private void append(String file, String line) {
         try { Files.writeString(directory.resolve(file), line, StandardOpenOption.CREATE, StandardOpenOption.APPEND); }
         catch (IOException e) { body.release(); ended = true; throw new UncheckedIOException(e); }
+    }
+
+    private void recordHorizon(AgentVisibleHorizon.Evidence evidence) {
+        if (evidence == null || horizonEvidenceCount >= 64) return;
+        ++horizonEvidenceCount;
+        var event = new JsonObject();
+        event.addProperty("tick", tick);
+        event.addProperty("life", 1 + respawns);
+        event.addProperty("frame", evidence.frame());
+        event.addProperty("phase", evidence.phase());
+        event.addProperty("stage", evidence.stage());
+        if (evidence.terminal()) event.addProperty("terminal", true);
+        if (Double.isFinite(evidence.known())) event.addProperty("offered_ground", evidence.known());
+        if (Double.isFinite(evidence.braking())) event.addProperty("braking_distance", evidence.braking());
+        if (evidence.refusals() != 0) {
+            var failed = new JsonArray();
+            for (var refusal : AgentVisibleHorizon.Refusal.values())
+                if ((evidence.refusals() & refusal.bit) != 0) failed.add(refusal.key);
+            event.add("rejected_checks", failed);
+        }
+        // Local run journal only: never attach these reasons to progress or macro observations.
+        append("horizon.jsonl", event + "\n");
     }
 
     private void recordMovement(MinecraftClient client, ClientPlayerEntity p, String activity) {
@@ -894,6 +917,10 @@ public final class AgentClient implements ClientModInitializer {
         var returnableDrop = progress.returnableDrop();
         boolean newReturnableDrop = returnableDrop != null && returnableDrop.sequence() != returnableDropSequence;
         boolean newlyBlocked = stall.eventSequence() != stallSequence && stall.phase().equals("blocked");
+        if (macro != null) {
+            recordHorizon(body.visibleHorizon().takePreviewEvidence());
+            recordHorizon(body.visibleHorizon().takeDriveEvidence());
+        }
         JsonObject surveyTransition = macro == null ? null : macro.takeSurveyTransition(tick);
         boolean changed = screenChanged || ownerChanged || planningChanged || newReturnableDrop || !status.equals(lastStatus)
             || !handStatus.equals(lastHands) || stall.eventSequence() != stallSequence;

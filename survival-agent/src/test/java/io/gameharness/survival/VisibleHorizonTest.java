@@ -12,6 +12,7 @@ import static io.gameharness.survival.AgentVisibleHorizon.Medium.SHALLOW_WATER;
 import static io.gameharness.survival.AgentVisibleHorizon.Medium.UNKNOWN;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -86,6 +87,27 @@ final class VisibleHorizonTest {
     }
 
     @Test
+    void aVetoInsideTheProvedStoppingPrefixDoesNotSpendRaysExtendingThatBearing() {
+        var witnessed = new AgentVisibleHorizon.Support() {
+            int furthest;
+
+            @Override public AgentVisibleHorizon.Patch at(int x, int z) {
+                furthest = Math.max(furthest, x);
+                return STONE;
+            }
+
+            @Override public AgentVisibleHorizon.Refusal vetoDry(double dx, double dz, double drift, double braking) {
+                return AgentVisibleHorizon.Refusal.OBSTRUCTION;
+            }
+        };
+        var blocked = track(witnessed, 0.50, 0.50, Vec3d.ZERO);
+        assertEquals(UNKNOWN, blocked.medium());
+        assertEquals(AgentVisibleHorizon.Refusal.OBSTRUCTION, blocked.refusal());
+        assertTrue(blocked.known() > blocked.braking(), "collision is a veto despite sufficient visible support");
+        assertEquals(1, witnessed.furthest, "leave the unneeded farther terrain rays for other bearings");
+    }
+
+    @Test
     void shallowVisibleBedNeedsAnActuallyReachableDryBankAcrossTheWholeBody() {
         var crossing = track((x, z) -> z != 0 ? null : x == 1 ? QUIET_SHALLOW : x >= 0 && x <= 3 ? STONE : null,
             0.65, 0.50, Vec3d.ZERO);
@@ -96,6 +118,7 @@ final class VisibleHorizonTest {
         var noBank = track((x, z) -> z != 0 ? null : x == 0 ? STONE : x == 1 ? QUIET_SHALLOW : null,
             0.65, 0.50, Vec3d.ZERO);
         assertEquals(UNKNOWN, noBank.medium());
+        assertEquals(AgentVisibleHorizon.Refusal.DRY_BANK_NOT_RENDERED, noBank.refusal());
         var narrowBank = track((x, z) -> x >= 0 && x <= 3 && z >= 0 && z <= 1
             ? x == 1 ? QUIET_SHALLOW : x >= 2 && z == 1 ? null : STONE : null,
             0.65, 0.79, Vec3d.ZERO);
@@ -112,8 +135,11 @@ final class VisibleHorizonTest {
     @Test
     void deepWaterOutflowCausticTopsAndUnprovedHeightChangesAreNotOrdinarySupport() {
         assertNull(AgentVisibleHorizon.Patch.water(0, 1.05, Vec3d.ZERO));
+        assertEquals(AgentVisibleHorizon.Refusal.DEEP_WATER, AgentVisibleHorizon.Patch.waterRefusal(1.05, Vec3d.ZERO));
         assertNull(AgentVisibleHorizon.Patch.water(0, 0.32, new Vec3d(0.04, -0.96, 0)));
         assertNull(AgentVisibleHorizon.Patch.water(0, 0.32, new Vec3d(1, 0, 0)));
+        assertEquals(AgentVisibleHorizon.Refusal.WATER_FLOW,
+            AgentVisibleHorizon.Patch.waterRefusal(0.32, new Vec3d(1, 0, 0)));
         assertFalse(Double.isFinite(height(Blocks.LAVA)));
         assertFalse(Double.isFinite(height(Blocks.MAGMA_BLOCK)));
         for (double changedY : new double[] {-1, 0.5}) {
@@ -127,6 +153,61 @@ final class VisibleHorizonTest {
     void aWitnessedFullCanopyTopIsAsUsableAsOtherFirmGround() {
         assertEquals(1.0, height(Blocks.OAK_LEAVES));
         assertFalse(Double.isFinite(height(Blocks.OAK_FENCE)));
+    }
+
+    @Test
+    void canopyShoulderAdvancesTowardTheSameGoalWithoutWalkingAtTheGap() {
+        double top = height(Blocks.OAK_LEAVES);
+        var leaf = AgentVisibleHorizon.Patch.dry(top, 0.6);
+        AgentVisibleHorizon.Support seen = (x, z) -> x >= 0 && x <= 2 && z == 0 ? leaf : null;
+        var stance = new AgentVisibleHorizon.Stance(0.40, top, 0.62, 0.31,
+            Vec3d.ZERO, 0.10, leaf.drag(), false, BlockPos.ORIGIN);
+        double goalX = 3.1, goalZ = 1.96;
+        float direct = (float) Math.toDegrees(Math.atan2(stance.x() - goalX, goalZ - stance.z()));
+        var blocked = along(seen, stance, direct);
+        assertEquals(UNKNOWN, blocked.medium());
+        assertTrue(blocked.known() < blocked.braking());
+        assertEquals(AgentVisibleHorizon.Refusal.SURFACE_NOT_RENDERED, blocked.refusal());
+
+        Float shoulder = AgentVisibleHorizon.select(direct, Float.NaN, stance, false, Float.NaN,
+            (start, yaw, allowWade) -> {
+                // Only the gap and its near shoulder are inside this rendered approach.
+                if (yaw < -97 || yaw > -55) return null;
+                var track = along(seen, start, yaw);
+                double radians = Math.toRadians(yaw);
+                return track.medium() == DRY && track.known() > track.braking()
+                    && AgentVisibleHorizon.advancesBeyondContact(start, track, -Math.sin(radians), Math.cos(radians))
+                    ? yaw : null;
+            });
+        assertNotNull(shoulder);
+        assertTrue(shoulder < direct && shoulder > -97);
+        assertTrue(along(seen, stance, shoulder).known() > 0.7,
+            "a real supported advance, not another pulse on the starting canopy block");
+        double yaw = Math.toRadians(shoulder);
+        assertTrue(Math.hypot(goalX - stance.x() + 0.6 * Math.sin(yaw),
+            goalZ - stance.z() - 0.6 * Math.cos(yaw)) < Math.hypot(goalX - stance.x(), goalZ - stance.z()));
+
+        Float noVisibleShoulder = AgentVisibleHorizon.select(direct, Float.NaN, stance, false, Float.NaN,
+            (start, bearing, allowWade) -> Math.abs(bearing - direct) <= 4
+                && along(seen, start, bearing).medium() == DRY ? bearing : null);
+        assertNull(noVisibleShoulder, "a diagnostic gap does not license a bearing outside the render");
+    }
+
+    @Test
+    void aSafeBrakingPrefixOnTheCurrentCanopyBlockIsNotAVisibleApproach() {
+        var leaf = AgentVisibleHorizon.Patch.dry(height(Blocks.OAK_LEAVES), 0.6);
+        var stance = new AgentVisibleHorizon.Stance(0.32, leaf.y(), 0.5, 0.31,
+            Vec3d.ZERO, 0.10, leaf.drag(), false, BlockPos.ORIGIN);
+        var currentOnly = AgentVisibleHorizon.trace((x, z) -> x == 0 && z == 0 ? leaf : null, stance, 1, 0);
+        assertEquals(DRY, currentOnly.medium());
+        assertTrue(currentOnly.known() > currentOnly.braking());
+        assertFalse(AgentVisibleHorizon.advancesBeyondContact(stance, currentOnly, 1, 0));
+    }
+
+    private static AgentVisibleHorizon.Track along(AgentVisibleHorizon.Support ground,
+                                                   AgentVisibleHorizon.Stance stance, float yaw) {
+        double radians = Math.toRadians(yaw);
+        return AgentVisibleHorizon.trace(ground, stance, -Math.sin(radians), Math.cos(radians));
     }
 
     private static double height(net.minecraft.block.Block block) {

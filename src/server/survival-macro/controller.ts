@@ -14,14 +14,14 @@ import {
   MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_PLANNING_IDLE_MS, MACRO_LOOKAHEAD_MAX_AGE_TICKS, MACRO_LOOKAHEAD_MAX_CRACK,
   MacroDirectory, MacroObservationRotating, MacroValidationError,
   hasDirectAuthority, isIndependentPendingPolicy, isOpeningView, isPendingWorkVerb, liveCorrectionEvidence, macroReplyRejectionDetail,
-  matchesMaterial, openingViewMatchesPolicy, sameTravelTarget, travelHintMatchesPolicy,
+  harvestAnchorMatchesPolicy, matchesMaterial, openingViewMatchesPolicy, sameTravelTarget, travelHintMatchesPolicy,
   parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
   parseMacroProposal, parseMacroReceipt, parseMacroRevocation, parseMacroWorkOrder, sameLiveCorrectionScope, validateMacroId,
   type MacroBasis, type MacroDirectAction, type MacroFeedback, type MacroFrame, type MacroHandoff, type MacroInference, type MacroIntent,
   type MacroLookahead, type MacroObservation, type MacroOpportunity, type MacroParkedReceipt, type MacroPendingWork, type MacroPlanning,
   type MacroProposal, type MacroReceipt, type MacroReplyRejection, type MacroRequest, type MacroSkillReceipt, type MacroStockFloor,
   type MacroStrategist, type MacroSuccessor,
-  type MacroTravelAnchor, type MacroTravelHint, type MacroTrigger, type MacroWorkDemand, type MacroWorkMode, type MacroWorkOrder,
+  type MacroTravelHint, type MacroTrigger, type MacroWorkDemand, type MacroWorkMode, type MacroWorkOrder,
   type MacroWorkPolicy, type MacroWorkStage,
   type NativeReceiptCursor,
 } from "./protocol.ts";
@@ -602,9 +602,14 @@ function sameProspectOpening(left: ProspectOpening, right: ProspectOpening | und
 }
 
 type OpeningWitness = MacroOpportunity | ProspectOpening | MacroTravelHint;
+type WorkStart = Pick<MacroWorkOrder, "travelAnchor" | "harvestAnchor">;
+
+function sameTravelHint(left: MacroTravelHint, right: MacroTravelHint | undefined): boolean {
+  return left.kind === right?.kind && sameTravelTarget(left, right);
+}
 
 function sameOpeningWitness(left: OpeningWitness, right: OpeningWitness): boolean {
-  if ("windowBlocks" in left) return "windowBlocks" in right && left.kind === right.kind && sameTravelTarget(left, right);
+  if ("windowBlocks" in left) return "windowBlocks" in right && sameTravelHint(left, right);
   if ("block" in left) return "block" in right && sameProspectOpening(left, right);
   return "verb" in right && sameAffordance(left, right);
 }
@@ -625,7 +630,7 @@ function openingWorkWitness(observation: MacroObservation, policy: MacroWorkPoli
       return (offer.verb === "follow" || offer.verb === "approach") && policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT);
     }
     return offer.verb === "break" && offer.risk === "guarded" && offer.material &&
-      policy.allowedEffects.includes(`break:${witness.subject.slice("block:".length)}`) &&
+      harvestAnchorMatchesPolicy(offer.material, policy) &&
       protectsStock(policy.reserves, observation, offer) &&
       Object.entries(offer.material.spends).every(([item, count]) =>
         policy.costCaps.some(cap => cap.item === item && cap.count >= count) && stock(observation, item) >= count);
@@ -1539,8 +1544,8 @@ export class SurvivalMacroController {
     const asked = this.lastAsked?.observation;
     const travel = observation.travelHint;
     const failedOpening = previous?.failedOpeningPolicy;
-    const newTravelStart = !job && !!asked && previous?.mayRecoverOnAffordance && travel &&
-      !sameTravelTarget(travel, asked.travelHint) && (!failedOpening || !!matchingTravelHint(observation, failedOpening));
+    const newTravelStart = !!asked && previous?.mayRecoverOnAffordance && travel && this.isCurrentHandoff(observation) &&
+      !sameTravelHint(travel, asked.travelHint) && (!failedOpening || !!matchingTravelHint(observation, failedOpening));
     if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew" && !newTravelStart) return;
     const pendingCorrection = this.replyCorrection;
     const correction = pendingCorrection?.renewal
@@ -1792,15 +1797,16 @@ export class SurvivalMacroController {
     const duringWaitFor = after?.order.duringWaitFor;
     const stage = stages.length > 1 && !duringWaitFor ? workStageIds(plan.requestId, stages, index, stageOffset) : undefined;
     const afterSmelt = queued.smeltSuccessor && index === 0 ? after : null;
-    const wall = !after && pricedProspectOpening(plan.observation, policy);
-    const travel = !after && !wall && matchingTravelHint(plan.observation, policy);
+    const clue = !after ? plan.observation.travelHint : undefined;
+    const travel = clue && travelHintMatchesPolicy(clue, policy) ? clue : undefined;
+    const wall = !after && !travel && pricedProspectOpening(plan.observation, policy);
     const currentWall = wall ? (fresh: MacroObservation) =>
       this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
       sameProspectOpening(wall, pricedProspectOpening(fresh, policy)) : undefined;
     const currentTravel = travel ? (fresh: MacroObservation) => {
       const current = matchingTravelHint(fresh, policy);
       return this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
-        current?.kind === travel.kind && sameTravelTarget(travel, current);
+        sameTravelHint(travel, current);
     } : undefined;
     const currentStart = currentWall ?? currentTravel;
     let rejection = "fresh_work_admission_rejected";
@@ -1854,7 +1860,8 @@ export class SurvivalMacroController {
         }
         return true;
       }, duringWaitFor, undefined, currentStart ? (before, latest) =>
-        latest.tick - before.tick < WORK_ADMISSION_TICKS && currentStart(latest) : undefined, travel ? () => travel : undefined);
+        latest.tick - before.tick < WORK_ADMISSION_TICKS && currentStart(latest) : undefined,
+      travel ? () => ({ travelAnchor: { subject: travel.subject, target: travel.target } }) : undefined);
     if (job === null) return; // A rotating observation is not a denied program stage.
     if (!job && (bootstrap || afterSmelt || duringWaitFor)) return this.discardQueuedWork(queued, rejection);
     this.queuedWork = undefined;
@@ -1879,7 +1886,7 @@ export class SurvivalMacroController {
     duringWaitFor?: string,
     renewal?: WorkJob,
     recheck?: (basis: MacroObservation, latest: MacroObservation) => boolean,
-    approach?: (basis: MacroObservation) => MacroTravelAnchor | undefined,
+    bindStart?: (basis: MacroObservation) => WorkStart | undefined,
   ): Promise<WorkJob | null | undefined> {
     const fresh = await this.refresh();
     if (!fresh) return null;
@@ -1921,14 +1928,14 @@ export class SurvivalMacroController {
       return previous;
     }
     if (preflight && !await preflight(fresh)) return;
-    const travelAnchor = renewal?.order.travelAnchor ?? approach?.(fresh);
+    const { travelAnchor, harvestAnchor } = renewal?.order ?? bindStart?.(fresh) ?? {};
     const order = parseMacroWorkOrder({
       v: 1, id: stage?.id ?? randomUUID(), run: fresh.run, life: fresh.life, epoch: fresh.epoch, basisTick: fresh.tick,
       expiresTick: Math.min(expiresTick, fresh.tick + this.limits.maxIntentTtlTicks),
       safetyRevision: fresh.safety!.revision, origin: equivalent ? previous.order.origin : origin, ...policy,
       ...(!equivalent && stage?.nextWorkId ? { nextWorkId: stage.nextWorkId } : {}),
       ...(duringWaitFor ? { duringWaitFor } : {}),
-      ...(travelAnchor ? { travelAnchor: { subject: travelAnchor.subject, target: travelAnchor.target } } : {}),
+      ...(travelAnchor ? { travelAnchor } : {}), ...(harvestAnchor ? { harvestAnchor } : {}),
     });
     await this.record("work_order_prepared", { requestId, order, previousId: previous?.order.id ?? null, equivalent });
     if (recheck) {
@@ -3198,7 +3205,12 @@ export class SurvivalMacroController {
             sameOpeningWitness(witnessed, stillVisible);
         }, fresh => {
           const witnessed = openingWorkWitness(fresh, policy, issued.offer);
-          return witnessed && "windowBlocks" in witnessed ? witnessed : undefined;
+          if (!witnessed) return;
+          if ("windowBlocks" in witnessed) return { travelAnchor: { subject: witnessed.subject, target: witnessed.target } };
+          if (issued.offer.anchor && "material" in witnessed && witnessed.material) {
+            const { subject, target } = witnessed.material;
+            return { harvestAnchor: { subject, target } };
+          }
         });
       if (job === null) return; // Rotating observation: wait for a sample, never act on the cache.
       reason = job ? "work_issued" : "no_supported_physical_start";

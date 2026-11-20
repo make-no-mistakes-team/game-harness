@@ -671,7 +671,7 @@ final class MiningStockProof {
             "renewal does not change the separately paid obligation");
         var smelt = AgentWorkOrder.parse(ironWorkQuote(), "run", "preset");
         var freshSmelt = new AgentWorkOrder("renewed-smelt", smelt.life(), smelt.epoch(), 50, 950,
-            smelt.safetyRevision(), smelt.policy(), null, null, null);
+            smelt.safetyRevision(), smelt.policy(), null, null, null, null);
         require(!AgentMacroControl.canRenewWork(smelt, smelt, freshSmelt),
             "the paid batch is not an ordinary session");
     }
@@ -679,16 +679,17 @@ final class MiningStockProof {
     @Test
     void aScopedApproachCannotPriceCoverOrBeRetargetedByRenewal() {
         var raw = JsonParser.parseString("""
-            {"v":1,"id":"iron-leg","run":"run","life":1,"epoch":1,"basisTick":15,"expiresTick":400,
-             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:raw_iron","count":1},
-             "allowedEffects":["break:minecraft:iron_ore"],"costCaps":[],
-             "reserves":[{"item":"minecraft:stone_pickaxe","count":1}],"maxBreaks":2,"maxCrafts":0,"maxPlacements":0,
+            {"v":1,"id":"diamond-leg","run":"run","life":1,"epoch":1,"basisTick":15,"expiresTick":400,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:diamond","count":1},
+             "allowedEffects":["prospect:minecraft:diamond","break:minecraft:diamond_ore"],"costCaps":[],
+             "reserves":[{"item":"minecraft:iron_pickaxe","count":1}],"maxBreaks":2,"maxCrafts":0,"maxPlacements":0,
              "travelAnchor":{"subject":"block:minecraft:stone","target":"wall-a"}}
             """).getAsJsonObject();
         var original = AgentWorkOrder.parse(raw, "run", "constrained");
-        require(original != null && original.policy() != null && original.travelAnchor().target().equals("wall-a"),
-            "an ordinary iron request can name a specific rendered natural frontier");
-        require(original.policy().travelAnchorAllowed(original.travelAnchor().subject(), true)
+        require(original != null && original.policy() != null && original.policy().diamondProspecting()
+                && original.travelAnchor().target().equals("wall-a"),
+            "an ordinary diamond prospect can name a specific rendered natural frontier");
+        require(original.policy().travelAnchorAllowed(original.travelAnchor().subject(), AgentWorkOrder.TravelKind.CAVE_FRONTIER)
                 && !original.policy().breakAllowed(Blocks.STONE.getDefaultState()),
             "approach evidence cannot expand the allowed break set");
         raw.addProperty("id", "renew");
@@ -702,6 +703,35 @@ final class MiningStockProof {
         raw.getAsJsonObject("travelAnchor").addProperty("subject", "block:minecraft:lava");
         require(AgentWorkOrder.parse(raw, "run", "constrained").policy() == null,
             "a lava anchor is not a scoped ordinary approach");
+    }
+
+    @Test
+    void aWoodlandLandmarkCannotStandInForTheInspectedHarvest() {
+        var raw = JsonParser.parseString("""
+            {"v":1,"id":"oak-leg","run":"run","life":1,"epoch":1,"basisTick":15,"expiresTick":400,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:oak_log","count":1},
+             "allowedEffects":["break:minecraft:oak_log"],"costCaps":[],"reserves":[],
+             "maxBreaks":1,"maxCrafts":0,"maxPlacements":0,
+             "travelAnchor":{"subject":"landmark:woodland","target":"canopy-a"}}
+            """).getAsJsonObject();
+        var forest = AgentWorkOrder.parse(raw, "run", "constrained");
+        require(forest.policy() != null && forest.harvestAnchor() == null
+                && !forest.policy().breakAllowed(Blocks.OAK_LEAVES.getDefaultState()),
+            "visible canopy allows an ordinary log inquiry; foliage is not a harvest");
+        var anchor = raw.remove("travelAnchor").getAsJsonObject();
+        raw.add("harvestAnchor", anchor);
+        require(AgentWorkOrder.parse(raw, "run", "constrained").policy() == null,
+            "woodland is not a material target");
+        anchor.addProperty("subject", "block:minecraft:oak_log");
+        anchor.addProperty("target", "trunk-a");
+        var exact = AgentWorkOrder.parse(raw, "run", "constrained");
+        require(exact.policy() != null && exact.travelAnchor() == null && exact.harvestAnchor().target().equals("trunk-a"),
+            "the inspected exact log can authorize harvest without a walking window");
+        raw.addProperty("id", "renew-oak");
+        raw.addProperty("expiresTick", 450);
+        anchor.addProperty("target", "trunk-b");
+        require(!AgentMacroControl.canRenewWork(exact, exact, AgentWorkOrder.parse(raw, "run", "constrained")),
+            "a renewal cannot redirect exact harvest to another trunk");
     }
 
     @Test

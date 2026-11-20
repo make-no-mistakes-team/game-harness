@@ -17,7 +17,8 @@ import net.minecraft.util.Identifier;
 
 /** A finite, host-issued lease. Geometry, recipes and inputs are native decisions. */
 record AgentWorkOrder(String id, int life, long epoch, long basis, long expires, long safetyRevision,
-                      Policy policy, String nextWorkId, String duringWaitFor, TravelAnchor travelAnchor) {
+                      Policy policy, String nextWorkId, String duringWaitFor, TravelAnchor travelAnchor,
+                      HarvestAnchor harvestAnchor) {
     static final int MAX_TICKS = 1_200;
     static final int MAX_BREAKS = 64;
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
@@ -33,12 +34,23 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     private static final String PROSPECT_TORCH = "place:minecraft:torch";
     private static final String PROSPECT_SUPPORT = "place:minecraft:cobblestone";
     private static final String WATER_FILL = "fill:minecraft:water";
+    static final String WOODLAND_ANCHOR_SUBJECT = "landmark:woodland";
+    private static final Pattern WOODLAND_STOCK = Pattern.compile(
+        "minecraft:(oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|pale_oak)_log");
     private static final Set<String> NATURAL_FRONTIERS = Set.of(
         "block:minecraft:stone", "block:minecraft:deepslate", "block:minecraft:andesite",
         "block:minecraft:diorite", "block:minecraft:granite", "block:minecraft:tuff");
 
     record Target(Item item, int count, String goal) {}
     record TravelAnchor(String subject, String target) {}
+    record HarvestAnchor(String subject, String target) {}
+
+    enum TravelKind {
+        RESOURCE("resource"), CAVE_FRONTIER("cave_frontier"), WOODLAND_FRONTIER("woodland_frontier");
+
+        final String wireName;
+        TravelKind(String wireName) { this.wireName = wireName; }
+    }
 
     record Policy(boolean preset, Target target, Set<String> effects, Map<Item, Integer> caps,
                   Map<Item, Integer> floors, int maxBreaks, int maxCrafts, int maxPlacements) {
@@ -72,10 +84,22 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                 && !effects.contains(IRON_SMELT) && !effects.contains(FURNACE);
         }
 
-        boolean travelAnchorAllowed(String subject, boolean caveFrontier) {
-            if (preset || target.item == null || maxBreaks == 0 || smeltIron() || waterFill() || diamondProspecting()) return false;
-            if (!caveFrontier) return effects.contains("break:" + subject.substring("block:".length()));
+        boolean travelAnchorAllowed(String subject, TravelKind kind) {
+            if (preset || target.item == null || maxBreaks == 0 || smeltIron() || waterFill()) return false;
+            if (kind == TravelKind.RESOURCE) {
+                if (!subject.startsWith("block:")) return false;
+                if (diamondProspecting() && !subject.equals("block:minecraft:diamond_ore")
+                        && !subject.equals("block:minecraft:deepslate_diamond_ore")) return false;
+                return effects.contains("break:" + subject.substring("block:".length()));
+            }
+            if (kind == TravelKind.WOODLAND_FRONTIER) {
+                if (!subject.equals(WOODLAND_ANCHOR_SUBJECT)) return false;
+                String stock = Registries.ITEM.getId(target.item).toString();
+                return WOODLAND_STOCK.matcher(stock).matches() && effects.contains("break:" + stock);
+            }
             if (!NATURAL_FRONTIERS.contains(subject)) return false;
+            if (diamondProspecting())
+                return effects.contains("break:minecraft:diamond_ore") || effects.contains("break:minecraft:deepslate_diamond_ore");
             if (target.item == Items.RAW_IRON)
                 return effects.contains("break:minecraft:iron_ore") || effects.contains("break:minecraft:deepslate_iron_ore");
             if (target.item == Items.COAL)
@@ -219,7 +243,8 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     static AgentWorkOrder parse(JsonObject value, String run, String mode) {
         if (mode == null || value == null || !value.keySet().containsAll(FIELDS)
                 || value.size() != FIELDS.size() + (value.has("nextWorkId") ? 1 : 0)
-                    + (value.has("duringWaitFor") ? 1 : 0) + (value.has("travelAnchor") ? 1 : 0)) return null;
+                    + (value.has("duringWaitFor") ? 1 : 0) + (value.has("travelAnchor") ? 1 : 0)
+                    + (value.has("harvestAnchor") ? 1 : 0)) return null;
         AgentWorkOrder envelope;
         try {
             if (integer(value, "v") != 1 || !run.equals(text(value, "run"))) return null;
@@ -231,7 +256,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                     || expires <= basis || expires - basis > MAX_TICKS) return null;
             // Keep the attempted handoff distinct from withdrawing the underlying furnace lease, even if its fields fail validation.
             envelope = new AgentWorkOrder(id, (int) life, epoch, basis, expires, safety, null, null,
-                value.has("duringWaitFor") ? "" : null, null);
+                value.has("duringWaitFor") ? "" : null, null, null);
         } catch (RuntimeException invalid) {
             return null;
         }
@@ -302,16 +327,35 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                 var raw = value.getAsJsonObject("travelAnchor");
                 if (duringWaitFor != null || !raw.keySet().equals(Set.of("subject", "target"))) return envelope;
                 String subject = text(raw, "subject"), identity = text(raw, "target");
-                if (!subject.startsWith("block:") || !ITEM_ID.matcher(subject.substring("block:".length())).matches()
-                        || !ID.matcher(identity).matches() || identity.equals(".") || identity.equals("..")
-                        || !(policy.travelAnchorAllowed(subject, false) || policy.travelAnchorAllowed(subject, true))) return envelope;
+                if (!validAnchorId(identity)
+                        || !(blockAnchorSubject(subject) && (policy.travelAnchorAllowed(subject, TravelKind.RESOURCE)
+                                || policy.travelAnchorAllowed(subject, TravelKind.CAVE_FRONTIER))
+                            || policy.travelAnchorAllowed(subject, TravelKind.WOODLAND_FRONTIER))) return envelope;
                 travelAnchor = new TravelAnchor(subject, identity);
             }
+            HarvestAnchor harvestAnchor = null;
+            if (value.has("harvestAnchor")) {
+                var raw = value.getAsJsonObject("harvestAnchor");
+                if (duringWaitFor != null || nextWorkId != null || travelAnchor != null || stageSuffix(envelope.id)
+                        || !raw.keySet().equals(Set.of("subject", "target"))) return envelope;
+                String subject = text(raw, "subject"), identity = text(raw, "target");
+                if (!validAnchorId(identity) || !blockAnchorSubject(subject)
+                        || !policy.travelAnchorAllowed(subject, TravelKind.RESOURCE)) return envelope;
+                harvestAnchor = new HarvestAnchor(subject, identity);
+            }
             return new AgentWorkOrder(envelope.id, envelope.life, envelope.epoch, envelope.basis, envelope.expires,
-                envelope.safetyRevision, policy, nextWorkId, duringWaitFor, travelAnchor);
+                envelope.safetyRevision, policy, nextWorkId, duringWaitFor, travelAnchor, harvestAnchor);
         } catch (RuntimeException invalid) {
             return envelope;
         }
+    }
+
+    private static boolean blockAnchorSubject(String subject) {
+        return subject.startsWith("block:") && ITEM_ID.matcher(subject.substring("block:".length())).matches();
+    }
+
+    private static boolean validAnchorId(String identity) {
+        return ID.matcher(identity).matches() && !identity.equals(".") && !identity.equals("..");
     }
 
     private static boolean adjacentStage(String id, String next) {

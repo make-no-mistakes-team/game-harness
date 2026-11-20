@@ -154,13 +154,13 @@ same break budget. The player keeps at least one break for the source.
 Cover breaks, grounded travel, and stock pickups are confirmed separately.
 
 For ordinary travel the player needs visible support through its
-stopping distance, not a proved round trip to every waypoint. A
-`travelHint` identifies the actual visible target and how far the
-current view supports an approach. It can start a bounded job toward a
-log that is visible but still out of reach. It does not authorize a
-swing, report a pickup, or guarantee that the path continues around a
-corner. The player keeps walking through successive good views and
-brakes when the known ground runs out.
+stopping distance, not a proved round trip to every waypoint.
+`travelHint` names a visible resource or frontier and how far the
+current view supports an approach. A diamond job can approach a cave
+frontier even when no ore is visible. `woodland_frontier` points to a
+visible canopy, not a known log or a species claim. Neither cue prices
+a break or reports stock. The player checks each new view and brakes
+when the known ground runs out.
 
 The player can wade from dry footing when it can see a shallow,
 supported crossing and a dry bank. Deep or swift water, lava, unknown
@@ -171,9 +171,12 @@ does not manufacture a return route.
 When a camera check is still needed, Terra can add `openingViewId` from
 `work.openingViewIds` to one priced mining or prospecting job. The host
 issues that exact read first. After its accepted and completed receipts,
-the first later safe view must show a matching dry landing, material
-offer, or usable `prospectOpening` that was not already witnessed. Only
-then does the host issue the priced work, without another model request.
+the first later safe view must show a matching dry landing, priced
+harvest, approach window, or usable `prospectOpening` that wasn't
+available before the check. Looking at one log can bind a start to
+that log in reach or to a safe approach to it; another trunk or a
+woodland cue does not count. The host then issues the priced work
+without another model request.
 The camera receipt does not prove a route or count as physical progress. An unchanged stance
 does not gain a second bare survey from a new angle or ID; an exact new
 face or lane can still be inspected. If the job already has a usable

@@ -96,7 +96,7 @@ export interface MacroTravelAnchor {
 
 /** A visible goal and its current braking window, not a command, material effect or known return. */
 export interface MacroTravelHint extends MacroTravelAnchor {
-  readonly kind: "resource" | "cave_frontier";
+  readonly kind: "resource" | "cave_frontier" | "woodland_frontier";
   readonly footing: "dry" | "shallow_water_with_bank";
   readonly bearingDegrees: number;
   readonly windowBlocks: number;
@@ -255,6 +255,8 @@ export interface MacroWorkOrder extends MacroWorkPolicy {
   readonly duringWaitFor?: string;
   /** Host-bound starting approach only. Never a selectable ID or a grant to harvest. */
   readonly travelAnchor?: MacroTravelAnchor;
+  /** First harvest is bound to this exact in-reach material, not a route or a new break permission. */
+  readonly harvestAnchor?: MacroTravelAnchor;
 }
 export interface MacroWorkState {
   readonly id: string;
@@ -681,7 +683,7 @@ function parseWorkProgress(value: unknown, tick: number): NonNullable<MacroWorkS
 export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   const record = shape(value, "work order", [
     "v", "id", "run", "life", "epoch", "basisTick", "expiresTick", "safetyRevision", "origin", ...WORK_POLICY_KEYS,
-  ], ["nextWorkId", "duringWaitFor", "travelAnchor"]);
+  ], ["nextWorkId", "duringWaitFor", "travelAnchor", "harvestAnchor"]);
   const id = validateMacroId(record.id, "work id");
   const origin = choice(record.origin, "work origin", ["preset", "model"] as const);
   const policy = workPolicy(record);
@@ -692,10 +694,18 @@ export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   let travelAnchor: MacroTravelAnchor | undefined;
   if (Object.hasOwn(record, "travelAnchor")) {
     const raw = shape(record.travelAnchor, "work travel anchor", ["subject", "target"]);
-    travelAnchor = parseTravelAnchor(raw);
-    if (origin !== "model" || duringWaitFor || !rollingGatheringPolicy(policy) ||
-        !(policy.allowedEffects.includes(`break:${travelAnchor.subject.slice(6)}`) ||
-          frontierMatchesPolicy(travelAnchor.subject, policy))) invalid("work travel anchor scope");
+    const anchor = parseStartAnchor(raw, "travel anchor");
+    if (origin !== "model" || duringWaitFor || !travelKinds.some(kind =>
+      travelSubjectMatchesPolicy(kind, anchor.subject, policy))) invalid("work travel anchor scope");
+    travelAnchor = anchor;
+  }
+  let harvestAnchor: MacroTravelAnchor | undefined;
+  if (Object.hasOwn(record, "harvestAnchor")) {
+    const raw = shape(record.harvestAnchor, "work harvest anchor", ["subject", "target"]);
+    harvestAnchor = parseStartAnchor(raw, "harvest anchor");
+    if (origin !== "model" || duringWaitFor || nextWorkId || /:[123]$/.test(id) || travelAnchor ||
+        !harvestAnchorMatchesPolicy(harvestAnchor, policy))
+      invalid("work harvest anchor scope");
   }
   if (duringWaitFor) {
     if (origin !== "model" || nextWorkId || duringWaitFor === id || /:[123]$/.test(id)) invalid("pending ordinary order scope");
@@ -714,7 +724,7 @@ export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
     expiresTick: whole(record.expiresTick, "work expiry", basisTick + 1, basisTick + MACRO_MAX_INTENT_TTL_TICKS),
     safetyRevision: whole(record.safetyRevision, "work safety revision", 1), origin,
     ...(nextWorkId ? { nextWorkId } : {}), ...(duringWaitFor ? { duringWaitFor } : {}),
-    ...(travelAnchor ? { travelAnchor } : {}), ...policy,
+    ...(travelAnchor ? { travelAnchor } : {}), ...(harvestAnchor ? { harvestAnchor } : {}), ...policy,
   });
 }
 
@@ -759,11 +769,14 @@ function directMaterialPrefix(verb: string): string | undefined {
   }
 }
 
-function parseTravelAnchor(record: Record<string, unknown>): MacroTravelAnchor {
+const woodlandAnchorSubject = "landmark:woodland";
+const travelKinds = ["resource", "cave_frontier", "woodland_frontier"] as const;
+
+function parseStartAnchor(record: Record<string, unknown>, field: string): MacroTravelAnchor {
   const subject = record.subject;
-  if (typeof subject !== "string" || !/^block:minecraft:[a-z0-9_]{1,96}$/.test(subject))
-    invalid("travel anchor subject");
-  return Object.freeze({ subject, target: validateMacroId(record.target, "travel anchor target") });
+  if (typeof subject !== "string" || subject !== woodlandAnchorSubject && !/^block:minecraft:[a-z0-9_]{1,96}$/.test(subject))
+    invalid(`${field} subject`);
+  return Object.freeze({ subject, target: validateMacroId(record.target, `${field} target`) });
 }
 
 export function parseMacroObservation(value: unknown): MacroObservation {
@@ -915,9 +928,11 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     const raw = shape(record.travelHint, "travel hint", ["kind", "subject", "target", "footing", "bearingDegrees", "windowBlocks"]);
     if (record.stance === undefined || !safety?.clear || working || pendingWork || workOrder?.state === "working")
       invalid("travel hint scope");
-    const anchor = parseTravelAnchor(raw);
-    const kind = choice(raw.kind, "travel hint kind", ["resource", "cave_frontier"] as const);
-    if (kind === "cave_frontier" && !naturalFrontier(anchor.subject)) invalid("travel hint frontier");
+    const anchor = parseStartAnchor(raw, "travel hint");
+    const kind = choice(raw.kind, "travel hint kind", travelKinds);
+    if (kind === "woodland_frontier" ? anchor.subject !== woodlandAnchorSubject :
+        kind === "cave_frontier" ? !naturalFrontier(anchor.subject) : !resourceTravelSubject(anchor.subject))
+      invalid("travel hint subject/kind");
     const { bearingDegrees } = raw;
     if (typeof bearingDegrees !== "number" || !Number.isFinite(bearingDegrees) ||
         Math.abs(bearingDegrees) > 180) invalid("travel hint bearing");
@@ -1141,14 +1156,10 @@ export function isOpeningView(offer: MacroOpportunity): boolean {
     offer.risk === "read") || offer.verb === "inspect" && offer.risk === "read" && !!offer.anchor;
 }
 
-function gatheringPolicy(policy: MacroWorkPolicy): boolean {
+function rollingGatheringPolicy(policy: MacroWorkPolicy): boolean {
   return policy.target.kind === "stock" && policy.maxBreaks > 0 &&
     policy.allowedEffects.some(effect => effect.startsWith("break:")) &&
     !policy.allowedEffects.includes(MACRO_IRON_SMELT) && !policy.allowedEffects.includes(MACRO_WATER_FILL);
-}
-
-function rollingGatheringPolicy(policy: MacroWorkPolicy): boolean {
-  return gatheringPolicy(policy) && !policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT);
 }
 
 const earlyCaveSources: Readonly<Record<string, readonly string[]>> = {
@@ -1157,14 +1168,39 @@ const earlyCaveSources: Readonly<Record<string, readonly string[]>> = {
   "minecraft:cobbled_deepslate": ["deepslate", "cobbled_deepslate"],
   "minecraft:raw_iron": ["iron_ore", "deepslate_iron_ore"],
 };
+const diamondOreSources = ["diamond_ore", "deepslate_diamond_ore"] as const;
+const woodlandStock = /^minecraft:(?:oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|pale_oak)_log$/;
 
 function naturalFrontier(subject: string): boolean {
   return prospectRock.some(block => subject === `block:${block}`);
 }
 
 function frontierMatchesPolicy(subject: string, policy: MacroWorkPolicy): boolean {
-  return naturalFrontier(subject) && policy.target.kind === "stock" &&
-    earlyCaveSources[policy.target.item]?.some(block => policy.allowedEffects.includes(`break:minecraft:${block}`)) === true;
+  if (!naturalFrontier(subject) || policy.target.kind !== "stock") return false;
+  const sources = policy.target.item === "minecraft:diamond" && policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT)
+    ? diamondOreSources : earlyCaveSources[policy.target.item];
+  return sources?.some(block => policy.allowedEffects.includes(`break:minecraft:${block}`)) === true;
+}
+
+function resourceTravelSubject(subject: string): boolean {
+  return subject.startsWith("block:") && !subject.endsWith("_leaves");
+}
+
+function resourceMatchesPolicy(subject: string, policy: MacroWorkPolicy): boolean {
+  return resourceTravelSubject(subject) && policy.allowedEffects.includes(`break:${subject.slice(6)}`) &&
+    (!policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT) ||
+      diamondOreSources.some(block => subject === `block:minecraft:${block}`));
+}
+
+function travelSubjectMatchesPolicy(kind: MacroTravelHint["kind"], subject: string, policy: MacroWorkPolicy): boolean {
+  if (!rollingGatheringPolicy(policy)) return false;
+  switch (kind) {
+    case "cave_frontier": return frontierMatchesPolicy(subject, policy);
+    case "woodland_frontier":
+      return subject === woodlandAnchorSubject && policy.target.kind === "stock" && woodlandStock.test(policy.target.item) &&
+        policy.allowedEffects.includes(`break:${policy.target.item}`);
+    case "resource": return resourceMatchesPolicy(subject, policy);
+  }
 }
 
 export function sameTravelTarget(left: MacroTravelAnchor, right: MacroTravelAnchor | undefined): boolean {
@@ -1172,12 +1208,15 @@ export function sameTravelTarget(left: MacroTravelAnchor, right: MacroTravelAnch
 }
 
 export function travelHintMatchesPolicy(hint: MacroTravelHint, policy: MacroWorkPolicy): boolean {
-  return rollingGatheringPolicy(policy) && (hint.kind === "cave_frontier" ? frontierMatchesPolicy(hint.subject, policy) :
-    policy.allowedEffects.includes(`break:${hint.subject.slice(6)}`));
+  return travelSubjectMatchesPolicy(hint.kind, hint.subject, policy);
+}
+
+export function harvestAnchorMatchesPolicy(anchor: MacroTravelAnchor, policy: MacroWorkPolicy): boolean {
+  return travelSubjectMatchesPolicy("resource", anchor.subject, policy);
 }
 
 export function openingViewMatchesPolicy(offer: MacroOpportunity, policy: MacroWorkPolicy): boolean {
-  return isOpeningView(offer) && gatheringPolicy(policy) &&
+  return isOpeningView(offer) && rollingGatheringPolicy(policy) &&
     (!offer.anchor || (offer.anchor.subject === "route:dry" ? policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT) :
       policy.allowedEffects.includes(`break:${offer.anchor.subject.slice(6)}`) ||
       frontierMatchesPolicy(offer.anchor.subject, policy)));

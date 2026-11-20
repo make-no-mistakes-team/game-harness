@@ -71,6 +71,34 @@ test("A work approach names one target without pricing its material", () => {
     .toThrow("work travel anchor scope");
 });
 
+test("A woodland landmark supports only matching log work, never an exact harvest or a leaf break", () => {
+  const travelAnchor = { subject: "landmark:woodland", target: "canopy-a" };
+  const observation = {
+    v: 1, run: "run", life: 1, epoch: 1, tick: 20, goal: "wooden_pickaxe", health: 20, food: 20, stance: 1,
+    inventory: {}, opportunities: [], recent: [], quiescent: false, safety: { clear: true, revision: 1 },
+  };
+  const travelHint = { ...travelAnchor, kind: "woodland_frontier", footing: "dry", bearingDegrees: -8, windowBlocks: 0.7 };
+  expect(parseMacroObservation({ ...observation, travelHint })).toMatchObject({ travelHint, opportunities: [] });
+  for (const unsupported of [
+    { ...travelHint, kind: "resource" },
+    { ...travelHint, kind: "resource", subject: "block:minecraft:oak_leaves" },
+    { ...travelHint, subject: "block:minecraft:oak_log" },
+    { ...travelHint, subject: "block:minecraft:oak_leaves" },
+  ]) expect(() => parseMacroObservation({ ...observation, travelHint: unsupported })).toThrow("travel hint");
+  const order = {
+    v: 1, id: "oak-leg", run: "run", life: 1, epoch: 1, basisTick: 20, expiresTick: 100,
+    safetyRevision: 1, origin: "model", target: { kind: "stock", item: "minecraft:oak_log", count: 1 },
+    allowedEffects: ["break:minecraft:oak_log"], costCaps: [], reserves: [], maxBreaks: 1, maxCrafts: 0, maxPlacements: 0,
+  };
+  expect(parseMacroWorkOrder({ ...order, travelAnchor })).toMatchObject({ travelAnchor, allowedEffects: order.allowedEffects });
+  expect(() => parseMacroWorkOrder({ ...order, travelAnchor, allowedEffects: ["break:minecraft:birch_log"] }))
+    .toThrow("work travel anchor scope");
+  expect(() => parseMacroWorkOrder({ ...order, harvestAnchor: travelAnchor })).toThrow("work harvest anchor scope");
+  const harvestAnchor = { subject: "block:minecraft:oak_log", target: "trunk-a" };
+  expect(parseMacroWorkOrder({ ...order, harvestAnchor })).toMatchObject({ harvestAnchor });
+  expect(() => parseMacroWorkOrder({ ...order, travelAnchor, harvestAnchor })).toThrow("work harvest anchor scope");
+});
+
 test("Work program caps apply across stages and a later job cannot lower an earlier reserve", () => {
   const log = "minecraft:oak_log";
   const stage = (item: string, maxBreaks: number, reserve: number, spend: number) => ({

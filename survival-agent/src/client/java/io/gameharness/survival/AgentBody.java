@@ -1,5 +1,6 @@
 package io.gameharness.survival;
 
+import io.gameharness.survival.AgentVisibleHorizon.Refusal;
 import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -59,9 +60,11 @@ final class AgentBody {
     private static final int RAY_BUDGET = 256;
     private static final int MOVEMENT_RAYS = 6;
     private static final int HORIZON_TERRAIN_RAYS = 24;
-    private static final int HORIZON_CUE_RAYS = 16;
     private static final float[] HORIZON_CUE_U = {0, -0.30f, 0.30f, 0, -0.58f, 0.58f, -0.30f, 0.30f, 0, -0.54f, 0.54f};
     private static final float[] HORIZON_CUE_V = {0.24f, 0, 0, -0.24f, 0, 0, 0.30f, 0.30f, 0.55f, -0.32f, -0.32f};
+    private static final int HORIZON_CUE_RAYS = 1 + HORIZON_CUE_U.length;
+    private static final int HORIZON_WITNESS_RAYS = 4;
+    private static final double HORIZON_CUE_RANGE = 16;
     private static final double MAX_RANGE = 32;
     private static final double TURN_SPEED = 230;
     private static final double TURN_TIME = 0.085;
@@ -193,12 +196,12 @@ final class AgentBody {
     private long lastFrame;
     private int tick;
     private int raysLeft;
-    private int horizonTerrainRays, horizonCueRays;
+    private int horizonTerrainRays, horizonCueRays, horizonWitnessRays;
     private long horizonSightlineFrame = -1, horizonCueFrame = -1;
-    private double horizonSightlineRange, horizonCueRange;
     private BlockHitResult horizonSightlineHit;
     private int sampleCount;
     private double sampleRange;
+    private long sampleFrame = -1;
     private ShapeContext rayShapeContext;
     private boolean nightVision;
 
@@ -218,6 +221,7 @@ final class AgentBody {
     private boolean horizonForward, horizonSneak, horizonWade;
     private float horizonHeading;
     private double horizonReach;
+    private AgentVisibleHorizon.Window horizonKeyWindow;
     private Vec3d dryLanding;
     private BlockPos stepSupport;
     private boolean surfaceStep;
@@ -279,9 +283,10 @@ final class AgentBody {
     void begin() {
         tick++;
         safetySpend = null;
-        raysLeft = RAY_BUDGET - MOVEMENT_RAYS - HORIZON_TERRAIN_RAYS - HORIZON_CUE_RAYS;
+        raysLeft = RAY_BUDGET - MOVEMENT_RAYS - HORIZON_TERRAIN_RAYS - HORIZON_CUE_RAYS - HORIZON_WITNESS_RAYS;
         horizonTerrainRays = HORIZON_TERRAIN_RAYS;
         horizonCueRays = HORIZON_CUE_RAYS;
+        horizonWitnessRays = HORIZON_WITNESS_RAYS;
         sampleCount = 0;
         sampleRange = 0;
         rayShapeContext = null;
@@ -344,6 +349,7 @@ final class AgentBody {
         dryRouteWalk = false;
         wetEscapeWalk = false;
         horizonIntent = null;
+        horizonKeyWindow = null;
         horizonForward = horizonSneak = horizonWade = false;
         horizonSide = 0;
         reachJump = false;
@@ -505,6 +511,7 @@ final class AgentBody {
         boolean stepJump = false;
         Ground ground = Ground.CLEAR;
         boolean rolling = horizonIntent != null;
+        boolean horizonHazardVeto = false;
 
         if (rolling) {
             // One ordinary rolling owner; it never inherits the generic auto-jump,
@@ -616,6 +623,7 @@ final class AgentBody {
             raysLeft += MOVEMENT_RAYS;
             sightMovementLane(player, heading, reach);
             if (hazards.lavaRisk(player.getBoundingBox(), heading, reach, jump ? 1.1 : 0, false, tick) > 0) {
+                horizonHazardVeto = rolling;
                 advance = retreat = sprintRequested = false;
                 horizonSide = 0;
                 horizonWade = false;
@@ -717,6 +725,11 @@ final class AgentBody {
             horizonAppliedTick = tick;
             horizonApplied.issued = advance || horizonSide != 0;
             horizonApplied.beenDriven |= horizonApplied.issued;
+            if (horizonKeyWindow != null) {
+                if (horizonApplied.issued) horizonApplied.issuedBearing = horizonHeading;
+                visibleHorizon.reportDrive(horizonApplied.issued ? null
+                    : horizonHazardVeto ? Refusal.HAZARD : Refusal.INPUT_COASTING, horizonKeyWindow);
+            }
             horizonApplied.wadeTick = horizonWade && (horizonApplied.issued || player.isTouchingWater()) ? tick : -2;
             horizonWading |= horizonApplied.wadeTick == tick && horizonApplied.issued;
         }
@@ -1349,41 +1362,48 @@ final class AgentBody {
     /** The rendered sightline can name a distant landmark beyond vanilla's interaction reach. */
     BlockHitResult horizonSightline(double distance) {
         if (!hasView() || distance <= 0) return null;
-        double max = range(distance);
-        if (horizonSightlineFrame != frameSequence || horizonSightlineRange != max) {
+        if (horizonSightlineFrame != frameSequence) {
             if (horizonCueRays <= 0) return null;
             --horizonCueRays;
             horizonSightlineFrame = frameSequence;
-            horizonSightlineRange = max;
             horizonSightlineHit = litRay(eye.add(client.player.getRotationVector(observedPitch, observedYaw)
-                .multiply(max)), Ray.SIGHT);
+                .multiply(range(HORIZON_CUE_RANGE))), Ray.SIGHT);
         }
-        return horizonSightlineHit;
+        double max = range(distance);
+        return horizonSightlineHit != null && horizonSightlineHit.getPos().squaredDistanceTo(eye) <= max * max
+            ? horizonSightlineHit : null;
     }
 
     /** Reuse ordinary actual hits before an independent, small pass inside this render. */
     BlockHitResult horizonCue(Predicate<BlockState> matches, double distance, Predicate<BlockHitResult> eligible) {
         if (!hasView() || distance <= 0) return null;
-        BlockHitResult cached = findSampled(matches, distance, eligible).orElse(null);
-        if (cached != null) return cached;
         double max = range(distance);
-        if (horizonCueFrame != frameSequence || horizonCueRange < max && horizonCueRays > 1) {
+        if (sampleFrame == frameSequence) {
+            var cached = nearestHorizonHit(samples, sampleCount, max, matches, eligible);
+            if (cached != null) return cached;
+        }
+        if (horizonCueFrame != frameSequence) {
+            if (horizonCueRays < horizonCueSamples.length) return null;
+            horizonCueRays -= horizonCueSamples.length;
             horizonCueFrame = frameSequence;
-            horizonCueRange = max;
+            double reach = range(HORIZON_CUE_RANGE);
             for (int i = 0; i < horizonCueSamples.length; ++i) {
-                horizonCueSamples[i] = null;
-                if (horizonCueRays <= 1) continue; // Keep one exact face recheck after optional clues.
                 inverseViewProjection.transform(clip.set(HORIZON_CUE_U[i], HORIZON_CUE_V[i], 0.9f, 1));
                 double x = clip.x / (double) clip.w, y = clip.y / (double) clip.w, z = clip.z / (double) clip.w;
-                double scale = max / Math.sqrt(x * x + y * y + z * z);
-                --horizonCueRays;
+                double scale = reach / Math.sqrt(x * x + y * y + z * z);
                 horizonCueSamples[i] = litRay(eye.add(x * scale, y * scale, z * scale), Ray.SIGHT);
             }
         }
+        return nearestHorizonHit(horizonCueSamples, horizonCueSamples.length, max, matches, eligible);
+    }
+
+    private BlockHitResult nearestHorizonHit(BlockHitResult[] hits, int count, double max,
+                                             Predicate<BlockState> matches, Predicate<BlockHitResult> eligible) {
         BlockHitResult best = null;
         double nearest = max * max;
-        for (var hit : horizonCueSamples) {
-            if (hit == null) continue;
+        for (int i = 0; i < count; ++i) {
+            var hit = hits[i];
+            if (hit == null || hit.isInsideBlock()) continue;
             double squared = hit.getPos().squaredDistanceTo(eye);
             if (squared <= nearest && matches.test(client.world.getBlockState(hit.getBlockPos()))
                     && (eligible == null || eligible.test(hit))) {
@@ -1404,8 +1424,7 @@ final class AgentBody {
         final boolean allowWade;
         private int wadeTick = -2, stoppedAt = -1, precisionTicks;
         private boolean issued, beenDriven, wet;
-        private float recoveryYaw = Float.NaN;
-        private Vec3d recoveryFrom;
+        private float bearing = Float.NaN, blockedBearing = Float.NaN, issuedBearing = Float.NaN;
         private HorizonMotion motion;
         private BlockPos dryFrom, dryTo;
         private int dryContacts;
@@ -1529,6 +1548,7 @@ final class AgentBody {
     void stopHorizonTravel(HorizonTravel travel) {
         if (horizonIntent != travel) return;
         horizonIntent = null;
+        horizonKeyWindow = null;
         horizonForward = horizonSneak = horizonWade = false;
         horizonSide = 0;
         if (gaitSteering) {
@@ -1551,61 +1571,63 @@ final class AgentBody {
 
     HorizonResult driveHorizon(HorizonTravel travel, boolean keepPickupsClear, boolean targetReady) {
         if (!ready() || lavaEmergency || !client.isWindowFocused() || client.getOverlay() != null
-                || client.currentScreen != null || client.options.forwardKey.isUnbound()) return HorizonResult.BLOCKED;
+                || client.currentScreen != null || client.options.forwardKey.isUnbound())
+            return horizonBlocked(ready() ? lavaEmergency ? Refusal.HAZARD : Refusal.INPUT_UNAVAILABLE
+                : horizonViewRefusal());
         var player = client.player;
-        if (player.hasVehicle() || player.isClimbing() || player.isUsingItem() || !horizonWaterSafe(player))
-            return HorizonResult.BLOCKED;
+        if (player.hasVehicle() || player.isClimbing() || player.isUsingItem())
+            return horizonBlocked(Refusal.INPUT_UNAVAILABLE);
+        if (!horizonWaterSafe(player))
+            return horizonBlocked(player.isSubmergedInWater() || player.getAir() < 230 ? Refusal.DEEP_WATER : Refusal.HAZARD);
         Vec3d feet = player.getPos();
         double dx = travel.goal.x - feet.x, dz = travel.goal.z - feet.z;
         double distance = Math.hypot(dx, dz);
         if (travel.motion == null) travel.motion = new HorizonMotion(feet, travel.goal);
-        if (!travel.motion.valid) return HorizonResult.BLOCKED;
+        if (!travel.motion.valid) return horizonBlocked(Refusal.MOTION_INTERRUPTED);
         horizonIntent = travel;
         if (travel.moved() && player.isOnGround() && !player.isTouchingWater()
                 && (targetReady || distance <= travel.arrival && Math.abs(feet.y - travel.goal.y) < 0.65)) {
             return player.getVelocity().horizontalLengthSquared() < 0.0025 ? HorizonResult.ARRIVED : HorizonResult.SETTLING;
         }
 
-        boolean recovering = travel.recoveryFrom != null;
         if (travel.motion.contact()) {
-            if (player.isTouchingWater() || !travel.motion.takeRecovery()) return HorizonResult.BLOCKED;
-            // A real body collision, not a speculative path grid. One tangent,
-            // visible from here, that still closes on the intended landmark.
-            float direct = heading(dx, dz);
-            var edge = travel.target.hit().getSide();
-            float favored = edge.getAxis().isHorizontal()
-                && MathHelper.wrapDegrees(edge.getOpposite().getPositiveHorizontalDegrees() - direct) < 0 ? -37 : 37;
-            var alternative = visibleHorizon.window(travel.target, direct + favored);
-            if (!horizonRecoveryWindow(alternative))
-                alternative = visibleHorizon.window(travel.target, direct - favored);
-            if (!horizonRecoveryWindow(alternative)) return HorizonResult.BLOCKED;
-            travel.recoveryYaw = alternative.yaw();
-            travel.recoveryFrom = feet;
-            recovering = true;
+            // A real contact invalidates that input heading. It is not required
+            // to choose a visible shoulder, and never counts as displacement.
+            if (player.isTouchingWater() || !travel.motion.takeRecovery())
+                return horizonBlocked(Refusal.COLLISION_CONTACT);
+            travel.blockedBearing = travel.issuedBearing;
         }
-        boolean takingTangent = recovering && horizontalDistanceSquared(feet, travel.recoveryFrom) < 0.64;
-        float aim = takingTangent ? travel.recoveryYaw : heading(dx, dz);
+        float direct = heading(dx, dz);
+        if (!player.isOnGround()) {
+            // Do not correct in midair or press jump into a new or unseen lane.
+            return horizonWait(travel, Refusal.SOURCE_UNGROUNDED, null);
+        }
+        var chosen = visibleHorizon.window(travel.target, travel.allowWade, travel.bearing, travel.blockedBearing, direct);
+        if (chosen == null) {
+            lookAlongGait(Float.isFinite(travel.bearing) ? travel.bearing : direct,
+                travel.stoppedAt >= 0 && tick - travel.stoppedAt >= 3 ? 38 : 28);
+            return horizonWait(travel, null, null);
+        }
+        travel.bearing = chosen.yaw();
+        float aim = chosen.yaw();
         float turn = MathHelper.wrapDegrees(aim - player.getYaw());
         int lateral = horizonSide(turn);
         if (lateral < 0 && client.options.leftKey.isUnbound() || lateral > 0 && client.options.rightKey.isUnbound())
             lateral = 0;
         float actual = player.getYaw() + 45 * lateral;
-        boolean aligned = Math.abs(MathHelper.wrapDegrees(aim - actual)) <= 24;
-        var window = aligned && hasView() ? visibleHorizon.window(travel.target, actual) : null;
-        boolean wade = travel.allowWade && horizonWadeWindow(window);
-        boolean dry = window != null && window.medium() == AgentVisibleHorizon.Medium.DRY && !player.isTouchingWater();
-        double known = dry || wade ? window.knownDistance() : 0;
+        boolean wade = horizonWadeWindow(chosen);
         // The movement gaze stays ahead, not on every support sample. One brief
         // downward correction may expose a short floor that just left the render.
         float pitch = wade ? 24 : travel.stoppedAt >= 0 && tick - travel.stoppedAt >= 3 ? 38 : 28;
         lookAlongGait(aim, pitch);
-        if (!player.isOnGround() && !player.isTouchingWater()) {
-            // Vanilla may already be making a small safe landing. Do not issue
-            // midair correction/jump into a new or unseen lane.
-            return horizonWait(travel);
-        }
-        if (known <= 0 || player.isTouchingWater() && !wade) return horizonWait(travel);
-        if (player.isSprinting()) return HorizonResult.SETTLING;
+        float difference = MathHelper.wrapDegrees(aim - actual);
+        if (Math.abs(difference) > 24) return horizonWait(travel, Refusal.STEERING_ALIGNMENT, chosen);
+        var window = Math.abs(difference) < 0.01 ? chosen : visibleHorizon.window(travel.target, actual);
+        if (window == null) return horizonWait(travel, null, null);
+        if (window.medium() != chosen.medium() || player.isTouchingWater() && !wade)
+            return horizonWait(travel, Refusal.WATER_NOT_ALLOWED, window);
+        if (player.isSprinting()) return horizonWait(travel, Refusal.INPUT_COASTING, window);
+        double known = window.knownDistance();
         double braking = window.brakingDistance();
         boolean contactOnly = window.contactOnly();
         // A rendered frame may turn the player before vanilla consumes the
@@ -1613,13 +1635,14 @@ final class AgentBody {
         float steeringTurn = MathHelper.clamp(turn, -8, 8);
         if (Math.abs(steeringTurn) > 3) {
             var steered = visibleHorizon.window(travel.target, actual + steeringTurn);
-            if (steered == null || steered.medium() != window.medium()
-                    || wade && !horizonWadeWindow(steered)) return horizonWait(travel);
+            if (steered == null) return horizonWait(travel, null, null);
+            if (steered.medium() != window.medium() || wade && !horizonWadeWindow(steered))
+                return horizonWait(travel, Refusal.WATER_NOT_ALLOWED, steered);
             known = Math.min(known, steered.knownDistance());
             braking = Math.max(braking, steered.brakingDistance());
             contactOnly |= steered.contactOnly();
         }
-        double goal = takingTangent ? Math.min(distance, 0.9) : distance - travel.arrival + 0.06;
+        double goal = distance - travel.arrival + 0.06;
         if (wade) {
             // Never end an ordinary goal in wet footing; keep the witnessed bank
             // as a completion constraint, not as an unseen substitute destination.
@@ -1631,12 +1654,13 @@ final class AgentBody {
             pace = HorizonPace.COAST;
         if (pace == HorizonPace.COAST) {
             horizonWade = wade;
-            return horizonWait(travel);
+            return horizonWait(travel, Refusal.INPUT_COASTING, window);
         }
         double reach = Math.min(known, Math.max(braking, 0.30));
         Vec3d end = feet.add(Vec3d.fromPolar(0, actual).multiply(reach));
-        if (keepPickupsClear && !macroNoVisiblePickup(end, wade ? feet.y - 0.7 : feet.y, feet.y)
-                || hazardAhead(actual, reach)) return horizonWait(travel);
+        if (keepPickupsClear && !macroNoVisiblePickup(end, wade ? feet.y - 0.7 : feet.y, feet.y))
+            return horizonWait(travel, Refusal.PICKUP_VETO, window);
+        if (hazardAhead(actual, reach)) return horizonWait(travel, Refusal.HAZARD, window);
         // This is an intent for the actual on-foot keys, not a displacement receipt.
         prioritizeMovement();
         lookAlongGait(player.getYaw() + steeringTurn, pitch);
@@ -1644,6 +1668,7 @@ final class AgentBody {
         horizonReach = reach;
         horizonSide = lateral;
         horizonForward = true;
+        horizonKeyWindow = window;
         horizonSneak = pace == HorizonPace.SLOW;
         if (horizonSneak) ++travel.precisionTicks;
         horizonWade = wade;
@@ -1651,14 +1676,16 @@ final class AgentBody {
         return HorizonResult.MOVING;
     }
 
-    private HorizonResult horizonWait(HorizonTravel travel) {
+    private HorizonResult horizonWait(HorizonTravel travel, Refusal stage, AgentVisibleHorizon.Window window) {
         if (travel.stoppedAt < 0) travel.stoppedAt = tick;
-        return tick - travel.stoppedAt < HORIZON_WAIT_TICKS ? HorizonResult.SETTLING : HorizonResult.BLOCKED;
+        boolean blocked = tick - travel.stoppedAt >= HORIZON_WAIT_TICKS;
+        visibleHorizon.reportDrive(stage, window, blocked);
+        return blocked ? HorizonResult.BLOCKED : HorizonResult.SETTLING;
     }
 
-    private static boolean horizonRecoveryWindow(AgentVisibleHorizon.Window window) {
-        return window != null && window.medium() == AgentVisibleHorizon.Medium.DRY
-            && window.knownDistance() >= Math.max(0.65, window.brakingDistance() + 0.20);
+    private HorizonResult horizonBlocked(Refusal stage) {
+        visibleHorizon.reportDrive(stage, null, true);
+        return HorizonResult.BLOCKED;
     }
 
     void sneak() { sneaking = true; }
@@ -1781,16 +1808,34 @@ final class AgentBody {
                 frameSequence, tick, tick - observedAtTick, displacement) : null;
     }
 
+    Refusal horizonViewRefusal() {
+        return !ready() || observedWorld != client.world || observedPlayer != client.player || eye == null
+            ? Refusal.WORLD_OR_CAMERA_UNAVAILABLE : Refusal.VIEW_STALE_OR_SHIFTED;
+    }
+
+    boolean horizonBearingInView(HorizonView view, float yaw) {
+        double angle = Math.toRadians(yaw), pitch = Math.toRadians(observedPitch);
+        double horizontal = Math.cos(pitch);
+        return inView(view.eye.x - Math.sin(angle) * horizontal, view.eye.y - Math.sin(pitch),
+            view.eye.z + Math.cos(angle) * horizontal);
+    }
+
     /** A passed-in candidate is just a ray direction until its exact lit point and face are seen. */
     BlockHitResult horizonWitness(BlockHitResult witness) {
         if (witness == null || witness.getType() != HitResult.Type.BLOCK || witness.isInsideBlock()) return null;
         Vec3d point = witness.getPos();
         double distance = eye.distanceTo(point);
         if (distance < 0.05 || distance > range(MAX_RANGE) || !inView(point)) return null;
+        // All three caches contain actual lit Ray.SIGHT first hits from this exact
+        // projection, never a vanilla outline or a sample with different fluid semantics.
         if (horizonSightlineFrame == frameSequence && horizonSightlineHit == witness) return witness;
         if (horizonCueFrame == frameSequence) for (var hit : horizonCueSamples) if (hit == witness) return witness;
-        if (horizonCueRays <= 0) return null;
-        --horizonCueRays;
+        if (sampleFrame == frameSequence) for (int i = 0; i < sampleCount; ++i) if (samples[i] == witness) return witness;
+        if (horizonWitnessRays <= 0) {
+            visibleHorizon.notePreview(Refusal.TARGET_RAY_BUDGET);
+            return null;
+        }
+        --horizonWitnessRays;
         double inset = 0.022 / distance;
         var hit = litRay(point.add((point.x - eye.x) * inset, (point.y - eye.y) * inset,
             (point.z - eye.z) * inset), Ray.SIGHT);
@@ -1800,14 +1845,20 @@ final class AgentBody {
 
     AgentVisibleHorizon.Stance horizonStance(HorizonView view) {
         var player = view.player;
-        if (lavaEmergency || !player.isOnGround() || player.hasVehicle() || player.isOnFire() || player.isInLava()
-                || player.isSubmergedInWater() || player.isSwimming() || player.getAir() < 230) return null;
+        if (lavaEmergency || player.isOnFire() || player.isInLava()) return visibleHorizon.refuseStance(Refusal.HAZARD);
+        if (player.isSubmergedInWater() || player.isSwimming() || player.getAir() < 230)
+            return visibleHorizon.refuseStance(Refusal.DEEP_WATER);
+        if (!player.isOnGround() || player.hasVehicle()) return visibleHorizon.refuseStance(Refusal.SOURCE_UNGROUNDED);
         var support = player.supportingBlockPos.orElse(null);
-        if (support == null) return null;
-        var patch = horizonSurface(support, view.feet.y);
-        if (patch == null || Math.abs(patch.y() - view.feet.y) > 0.055) return null;
+        if (support == null) return visibleHorizon.refuseStance(Refusal.SOURCE_CONTACT_MISSING);
         boolean wet = player.isTouchingWater();
-        if (wet && player.getFluidHeight(FluidTags.WATER) > 0.57) return null;
+        if (wet && player.getFluidHeight(FluidTags.WATER) > 0.57) return visibleHorizon.refuseStance(Refusal.DEEP_WATER);
+        var patch = horizonSurface(support, view.feet.y);
+        if (patch.refusal() != null) return visibleHorizon.refuseStance(switch (patch.refusal()) {
+            case SURFACE_HEIGHT -> Refusal.SOURCE_SUPPORT_HEIGHT;
+            case UNSUITABLE_TOP -> Refusal.SOURCE_UNSUITABLE_SUPPORT;
+            default -> patch.refusal();
+        });
         double speed = player.getAttributeValue(EntityAttributes.MOVEMENT_SPEED);
         // Walking acceleration uses the block's slipperiness, then movement is damped.
         double ratio = 0.6 / (patch.drag() / 0.91);
@@ -1825,36 +1876,53 @@ final class AgentBody {
         double yaw = Math.toRadians(observedYaw);
         double xFar = x + 0.5 - 0.39 * Math.sin(yaw), zFar = z + 0.5 + 0.39 * Math.cos(yaw);
         AgentVisibleHorizon.Patch patch = horizonTop(x, z, xFar, view.feet.y, zFar);
-        return patch != null ? patch : horizonTop(x, z, x + 0.5, view.feet.y, z + 0.5);
+        // Once a genuine visible top was vetoed, a second point cannot make
+        // that cell safe. It can only recover a clipped or occluded ray.
+        if (patch.refusal() != Refusal.SURFACE_NOT_RENDERED) return patch;
+        return horizonTop(x, z, x + 0.5, view.feet.y, z + 0.5);
     }
 
     private AgentVisibleHorizon.Patch horizonTop(int x, int z, double scanX, double level, double scanZ) {
-        if (horizonTerrainRays <= 0 || !inView(scanX, level - 0.025, scanZ)) return null;
+        if (!inView(scanX, level - 0.025, scanZ)) return Refusal.SURFACE_NOT_RENDERED.unavailable;
+        if (horizonTerrainRays <= 0) return Refusal.SURFACE_RAY_BUDGET.unavailable;
         --horizonTerrainRays;
         var hit = litRay(new Vec3d(scanX, level - 0.025, scanZ), Ray.HORIZON_TOP);
-        if (hit == null || hit.getSide() != Direction.UP || hit.isInsideBlock()) return null;
+        if (hit == null || hit.isInsideBlock()) return Refusal.SURFACE_NOT_RENDERED.unavailable;
         BlockPos support = hit.getBlockPos();
-        if (support.getX() != x || support.getZ() != z) return null;
+        if (support.getX() != x || support.getZ() != z) return Refusal.SURFACE_NOT_RENDERED.unavailable;
+        if (hit.getSide() != Direction.UP) {
+            BlockState visible = client.world.getBlockState(support);
+            return visible.isIn(BlockTags.LEAVES) && support.getY() + 1.0 > level + 0.055
+                ? Refusal.LEAF_HEIGHT.unavailable : Refusal.SURFACE_NOT_RENDERED.unavailable;
+        }
         // The optical ray already traversed the open side of this face. Sample only it,
         // not a column beyond the top (or blocks behind an opaque intercept).
-        var patch = horizonSurface(support, hit.getPos().y);
-        return patch != null && Math.abs(patch.y() - hit.getPos().y) <= 0.055 ? patch : null;
+        if (Math.abs(hit.getPos().y - level) > 0.055)
+            return client.world.getBlockState(support).isIn(BlockTags.LEAVES)
+                ? Refusal.LEAF_HEIGHT.unavailable : Refusal.SURFACE_HEIGHT.unavailable;
+        return horizonSurface(support, hit.getPos().y);
     }
 
     private AgentVisibleHorizon.Patch horizonSurface(BlockPos floor, double contactY) {
         BlockState state = client.world.getBlockState(floor);
+        if (AgentProgress.dangerous(state) || state.isOf(Blocks.COBWEB)) return Refusal.HAZARD.unavailable;
         double top = horizonSupportTop(client.world, floor, state);
-        if (!Double.isFinite(top) || Math.abs(top - contactY) > 0.055
-                || !overlandLoadHolds(client.world, floor, state, overlandProbe)) return null;
+        if (!Double.isFinite(top) || !overlandLoadHolds(client.world, floor, state, overlandProbe))
+            return Refusal.UNSUITABLE_TOP.unavailable;
+        if (Math.abs(top - contactY) > 0.055)
+            return state.isIn(BlockTags.LEAVES) ? Refusal.LEAF_HEIGHT.unavailable : Refusal.SURFACE_HEIGHT.unavailable;
         BlockPos open = overlandProbe.set(floor.getX(), MathHelper.floor(top + 0.012), floor.getZ());
         BlockState cover = client.world.getBlockState(open);
         FluidState fluid = cover.getFluidState();
         if (fluid.isEmpty()) return AgentProgress.dangerous(cover) || cover.isOf(Blocks.COBWEB)
-            ? null : AgentVisibleHorizon.Patch.dry(top, state.getBlock().getSlipperiness());
-        if (!cover.isOf(Blocks.WATER) || !fluid.isIn(FluidTags.WATER)) return null;
+            ? Refusal.HAZARD.unavailable : AgentVisibleHorizon.Patch.dry(top, state.getBlock().getSlipperiness());
+        if (!cover.isOf(Blocks.WATER) || !fluid.isIn(FluidTags.WATER))
+            return fluid.isIn(FluidTags.LAVA) ? Refusal.HAZARD.unavailable : Refusal.FLUID_IN_SWEEP.unavailable;
         double depth = open.getY() + fluid.getHeight(client.world, open) - top;
         // Flow's mechanical force can veto an already seen water sample, not establish terrain.
-        return AgentVisibleHorizon.Patch.water(top, depth, fluid.getVelocity(client.world, open));
+        Vec3d flow = fluid.getVelocity(client.world, open);
+        var patch = AgentVisibleHorizon.Patch.water(top, depth, flow);
+        return patch != null ? patch : AgentVisibleHorizon.Patch.waterRefusal(depth, flow).unavailable;
     }
 
     static double horizonSupportTop(BlockView world, BlockPos floor, BlockState state) {
@@ -1871,11 +1939,11 @@ final class AgentBody {
     }
 
     /** Veto only: body collision and hazards in the nominated sweep never supply optical support. */
-    boolean horizonSweep(double dx, double dz, double drift, double coastDistance, double distance,
+    Refusal horizonSweep(double dx, double dz, double drift, double coastDistance, double distance,
                          AgentVisibleHorizon.Medium medium) {
         var player = client.player;
         if (hazards.lavaNear(player.getBoundingBox(), 0.20, tick)
-                || hazardAhead(heading(dx, dz), distance + 0.25)) return false;
+                || hazardAhead(heading(dx, dz), distance + 0.25)) return Refusal.HAZARD;
         Box box = player.getBoundingBox().contract(1e-5, 0, 1e-5);
         double sideX = -dz * drift, sideZ = dx * drift;
         int slices = Math.max(1, (int) Math.ceil(distance / 0.16));
@@ -1884,20 +1952,20 @@ final class AgentBody {
             double from = step * i, fraction = Math.min(1, (from + step) / coastDistance);
             Box sweep = box.offset(dx * from, 0, dz * from).stretch(dx * step, 0, dz * step)
                 .stretch(sideX * fraction, 0, sideZ * fraction);
-            if (!client.world.isSpaceEmpty(player, sweep)) return false;
+            if (!client.world.isSpaceEmpty(player, sweep)) return Refusal.OBSTRUCTION;
             int feetY = MathHelper.floor(sweep.minY + 1e-5);
             for (int x = MathHelper.floor(sweep.minX); x <= MathHelper.floor(sweep.maxX - 1e-5); ++x) {
                 for (int z = MathHelper.floor(sweep.minZ); z <= MathHelper.floor(sweep.maxZ - 1e-5); ++z) {
                     for (int y = feetY; y <= MathHelper.floor(sweep.maxY - 1e-5); ++y) {
                         BlockState state = client.world.getBlockState(overlandProbe.set(x, y, z));
-                        if (AgentProgress.dangerous(state) || state.isOf(Blocks.COBWEB)) return false;
+                        if (AgentProgress.dangerous(state) || state.isOf(Blocks.COBWEB)) return Refusal.HAZARD;
                         if (!state.getFluidState().isEmpty() && (medium != AgentVisibleHorizon.Medium.SHALLOW_WATER
-                                || y > feetY || !state.isOf(Blocks.WATER))) return false;
+                                || y > feetY || !state.isOf(Blocks.WATER))) return Refusal.FLUID_IN_SWEEP;
                     }
                 }
             }
         }
-        return true;
+        return null;
     }
 
     /** One panoramic sector from the actually rendered view, not a skylight or terrain-column query. */
@@ -3140,6 +3208,10 @@ final class AgentBody {
     }
 
     private void sampleView(double distance) {
+        if (sampleFrame != frameSequence) {
+            sampleCount = 0;
+            sampleFrame = frameSequence;
+        }
         for (int y = 0; y < ROWS && raysLeft > 0; y++) {
             for (int x = 0; x < COLUMNS && raysLeft > 0; x++) {
                 int i = y * COLUMNS + x;

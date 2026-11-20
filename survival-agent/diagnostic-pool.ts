@@ -152,10 +152,10 @@ function initialPlayerData() {
   ));
 }
 
-function offlineUuid(profileName: string) {
+export function offlineUuid(profileName: string) {
   // The launcher has already verified the official profile. Vanilla derives the
   // save filename from its name when the owned loopback server uses local auth.
-  if (!/^[A-Za-z0-9_]{1,16}$/.test(profileName)) throw new Error("Invalid diagnostic profile name.");
+  if (!/^[A-Za-z0-9_]{1,16}$/.test(profileName)) throw new Error("Invalid offline Survival profile name.");
   const bytes = createHash("md5").update(`OfflinePlayer:${profileName}`).digest();
   bytes[6] = (bytes[6]! & 0x0f) | 0x30;
   bytes[8] = (bytes[8]! & 0x3f) | 0x80;

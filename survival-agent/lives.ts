@@ -11,11 +11,12 @@ const READ_BYTES = 16_384;
 const RECOVERY_SUPPLIES = new Set(["logs", "planks", "sticks", "buildingStone", "coal", "torches", "prospectingBlocks"]);
 
 type Phase = "playing" | "death_screen" | "respawn_requested";
-type Sample = { tick: number; alive: boolean; wall_ms?: number };
+type Sample = { tick: number; alive: boolean; wall_ms?: number; initial_death_screen?: boolean };
 type Frame = Sample & { deaths: number; respawns: number; life: number; life_phase: Phase };
 type Stamp = { tick: number; wall_ms: number | null; source: "lives.jsonl" | "progress.json" };
 type Death = { life: number; death: Stamp | null; requested: Stamp | null; observed: Stamp | null };
 type DeathTime = { observedAt: number; wall_ms?: number };
+type ParentDeath = { parentRun: string; parentLife: number; parentTick: number; parentSavedDeaths: number };
 
 const validCount = (value: unknown): value is number => typeof value === "number" &&
   Number.isSafeInteger(value) && value >= 0;
@@ -36,6 +37,31 @@ function decode(sample: Sample): Frame | null {
   return { tick, wall_ms, alive, deaths, respawns, life, life_phase };
 }
 
+/** Call only for a validated closed ordinary parent. A status label alone does not prove a saved death. */
+export function closedParentDeath(parentRun: string, outcome: unknown): ParentDeath | null {
+  const { progress, lifecycle } = (outcome ?? {}) as {
+    progress?: Frame & { health?: number; gui?: boolean };
+    lifecycle?: {
+      evidenceReadable?: boolean;
+      lastDeath?: Death | null;
+      inheritedDeath?: { receipt?: Death | null };
+      savedDeaths?: { after?: number; agreesWithObserved?: boolean };
+    };
+  };
+  if (!progress || progress.alive !== false || progress.life_phase !== "death_screen" ||
+      progress.gui !== true || progress.health !== 0 || lifecycle?.evidenceReadable !== true) return null;
+  const last = lifecycle.lastDeath ?? lifecycle.inheritedDeath?.receipt;
+  const death = last?.death;
+  const saved = lifecycle.savedDeaths;
+  if (!validCount(progress.life) || !progress.life || !validCount(progress.tick) ||
+      progress.deaths !== progress.life || progress.respawns !== progress.life - 1 ||
+      !last || last.life !== progress.life || last.requested !== null || last.observed !== null ||
+      !death || death.source !== LIFE_RECEIPTS || !validCount(death.tick) || !death.tick || death.tick > progress.tick ||
+      !validCount(progress.wall_ms) || !validCount(death.wall_ms) || death.wall_ms > progress.wall_ms ||
+      !validCount(saved?.after) || !saved.after || saved.agreesWithObserved !== true) return null;
+  return { parentRun, parentLife: progress.life, parentTick: death.tick, parentSavedDeaths: saved.after };
+}
+
 /** Dedicated transition receipts fill the gaps between independently sampled progress files. */
 export class LifeLedger {
   private latest: Frame | null = null;
@@ -43,10 +69,17 @@ export class LifeLedger {
   private lastSnapshotTick = 0;
   private protocol: "counters" | "legacy-strict" | null = null;
   private pendingSince: number | null = null;
+  private parentDeath: ParentDeath | null = null;
+  private inherited = false;
   private readonly recentDeaths: DeathTime[] = [];
   private readonly details = new Map<number, Death>();
 
   constructor(private readonly allowRespawn: boolean) {}
+
+  expectInheritedDeath(proof: ParentDeath, copied: { savedDeaths: number; matchesProfile: boolean }) {
+    if (this.allowRespawn && !this.protocol && copied.matchesProfile && copied.savedDeaths === proof.parentSavedDeaths)
+      this.parentDeath = proof;
+  }
 
   private useProtocol(protocol: NonNullable<LifeLedger["protocol"]>) {
     if (this.protocol && this.protocol !== protocol) throw new Error("Agent lifecycle protocol changed during an attempt.");
@@ -73,6 +106,14 @@ export class LifeLedger {
       throw new Error("Invalid or out-of-order agent life receipt.");
     }
     this.useProtocol("counters");
+    if (this.parentDeath && !this.lastReceipt && sample.initial_death_screen === true &&
+        frame.tick === 1 && frame.deaths === 1 && frame.life_phase === "death_screen" &&
+        (!this.latest || this.latest.tick === 1 && this.latest.deaths === 1 &&
+          this.latest.life_phase === "death_screen")) {
+      this.inherited = true;
+      // An atomic progress read may have seen the same death before its receipt was read.
+      this.recentDeaths.length = 0;
+    }
     this.update(frame, now);
     this.store(frame, LIFE_RECEIPTS);
     this.lastReceipt = frame;
@@ -89,7 +130,8 @@ export class LifeLedger {
       }
       if (sequence < 0) throw new Error("Agent life counters decreased.");
     }
-    const newDeaths = Math.min(frame.deaths - (previous?.deaths ?? 0), FAST_DEATH_LIMIT);
+    const priorDeaths = Math.max(previous?.deaths ?? 0, Number(this.inherited));
+    const newDeaths = Math.min(frame.deaths - priorDeaths, FAST_DEATH_LIMIT);
     for (let i = 0; i < newDeaths; i++) {
       this.recentDeaths.push({ observedAt: now, wall_ms: frame.life_phase === "death_screen" &&
         i === newDeaths - 1 ? frame.wall_ms : undefined });
@@ -108,8 +150,9 @@ export class LifeLedger {
     // Keep outcome receipts bounded. The actor's append-only file is the complete sequence.
     if (!this.details.has(life) && this.details.size >= SUMMARY_LIMIT) {
       let oldest = Infinity;
-      for (const id of this.details.keys()) if (id !== 1) oldest = Math.min(oldest, id);
-      if (life !== 1 && life < oldest) return;
+      const firstNewLife = this.inherited ? 2 : 1;
+      for (const id of this.details.keys()) if (id > firstNewLife) oldest = Math.min(oldest, id);
+      if (life > firstNewLife && life < oldest) return;
       this.details.delete(oldest);
     }
     const record = this.details.get(life) ?? { life, death: null, requested: null, observed: null };
@@ -126,7 +169,7 @@ export class LifeLedger {
     if (newHighWater.some(name => !RECOVERY_SUPPLIES.has(name))) this.recentDeaths.length = 0;
   }
 
-  get deaths() { return this.latest?.deaths ?? 0; }
+  get deaths() { return (this.latest?.deaths ?? 0) - Number(this.inherited); }
   get life() { return this.latest?.life ?? null; }
 
   currentPlaying(sample: Sample) {
@@ -157,15 +200,23 @@ export class LifeLedger {
 
   summary() {
     const rows = [...this.details.values()].sort((a, b) => a.life - b.life);
-    const deathReceipts = rows.filter(row => row.death || row.requested || row.observed?.source === LIFE_RECEIPTS);
+    const nativeDeaths = this.latest?.deaths ?? 0;
+    const respawns = this.latest?.respawns ?? 0;
+    const firstNewLife = this.inherited ? 2 : 1;
+    const deathReceipts = rows.filter(row => row.life >= firstNewLife &&
+      (row.death || row.requested || row.observed?.source === LIFE_RECEIPTS));
+    const inheritedDeath = this.inherited ? this.details.get(1) : null;
     return {
       protocol: this.protocol,
       deaths: this.deaths,
-      respawns: this.latest?.respawns ?? 0,
+      nativeDeaths,
+      respawns,
+      respawnsAfterNewDeaths: respawns - Number(this.inherited && respawns > 0),
       life: this.life,
       life_phase: this.latest?.life_phase ?? null,
-      firstDeath: rows.find(row => row.life === 1 && row.death) ?? null,
-      lastDeath: rows.find(row => row.life === this.deaths && row.death) ?? null,
+      firstDeath: deathReceipts.find(row => row.life === firstNewLife && row.death) ?? null,
+      lastDeath: deathReceipts.find(row => row.life === nativeDeaths && row.death) ?? null,
+      inheritedDeath: inheritedDeath && this.parentDeath ? { ...this.parentDeath, receipt: inheritedDeath } : null,
       deathReceipts,
       deathsWithoutSummary: this.deaths - deathReceipts.length,
     };

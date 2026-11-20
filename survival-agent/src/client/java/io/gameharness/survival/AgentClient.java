@@ -100,6 +100,7 @@ public final class AgentClient implements ClientModInitializer {
     private int returnableDropSequence;
     private long stallSequence;
     private boolean allowRespawn;
+    private boolean initialDeathScreen;
     private LifePhase lifePhase = LifePhase.PLAYING;
     private int deaths, respawns;
     private ClientPlayerEntity deadPlayer;
@@ -306,6 +307,7 @@ public final class AgentClient implements ClientModInitializer {
             || !(handler.getConnection().getAddress() instanceof InetSocketAddress peer)
             || peer.getAddress() == null || !peer.getAddress().isLoopbackAddress()) return false;
         network = handler;
+        initialDeathScreen = client.currentScreen instanceof DeathScreen && client.player.isDead();
         macro = AgentMacroControl.create(directory, goal);
         bindPolicy(client);
         if (macro == null || !macro.trial()) pauses = new AgentPauseEpisodes(directory, tick);
@@ -460,6 +462,9 @@ public final class AgentClient implements ClientModInitializer {
         event.addProperty("wall_ms", now);
         event.addProperty("status", status);
         lifeFields(event, admittedPlayer(client));
+        // This is admission evidence, not a claim about whether this world was copied.
+        if (next == LifePhase.DEATH_SCREEN && deaths == 1 && tick == 1 && initialDeathScreen)
+            event.addProperty("initial_death_screen", true);
         append("lives.jsonl", event + "\n");
         publish(client, status, false, null, true, now);
     }

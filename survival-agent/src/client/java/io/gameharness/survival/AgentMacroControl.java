@@ -82,6 +82,7 @@ final class AgentMacroControl {
     private static final int FURNACE_CLICK_MARGIN = 120;
     private static final int FURNACE_SYNC_TICKS = 24;
     private static final int FURNACE_CUE_TICKS = 36;
+    private static final int FURNACE_DECISION_CUE_TICKS = 5;
     private static final int FURNACE_REACQUIRE_LEAD_TICKS = 28;
     private static final int FURNACE_REACQUIRE_TICKS = 64;
     private static final int WORKSHOP_SCAN_TICKS = 36;
@@ -170,6 +171,9 @@ final class AgentMacroControl {
     private static final Recipe PLANKS = new Recipe("planks", null, LOG, 1, 0);
     private static final Recipe STICKS = new Recipe("stick", Items.STICK, PLANK, 2, 0);
     private static final Recipe BENCH = new Recipe("crafting_table", Items.CRAFTING_TABLE, PLANK, 4, 0);
+    private static final Recipe BUCKET = new Recipe("bucket", Items.BUCKET, IRON, 3, 0);
+    private static final Recipe TORCH = new Recipe("torch", Items.TORCH,
+        stack -> stack.isOf(Items.COAL) || stack.isOf(Items.CHARCOAL), 1, 1);
     private static final Recipe[] BENCH_RECIPES = {
         new Recipe("wooden_pickaxe", Items.WOODEN_PICKAXE, PLANK, 3, 2),
         new Recipe("stone_pickaxe", Items.STONE_PICKAXE, STONE, 3, 2),
@@ -193,7 +197,9 @@ final class AgentMacroControl {
             this(id, key, summary, evidence, yaw, pitch, floor, face, drop, item, recipe, route, farther, null);
         }
     }
-    private record Snapshot(long epoch, Map<String, Offer> offers) {}
+    /** Cook quotes are visible to planning and independent-stock admission, never to general intents. */
+    private record PendingView(List<Offer> quotes, String routes, String sources) {}
+    private record Snapshot(long epoch, Map<String, Offer> offers, List<Offer> sideQuotes) {}
     private record Intent(String id, int life, long epoch, long basis, long expires, String opportunity, String skillHash) {}
     private record Handoff(int life, long epoch, long basis, long expires) {}
     private record Planning(int life, long epoch, long basis, String id, long noticedAt) {}
@@ -318,7 +324,7 @@ final class AgentMacroControl {
         FurnacePhase phase;
         AgentHands.IronBatch batch;
         long openedTick, outputWitness, advancedTick, burnTick, storedTick;
-        long closedFrame, watchFrame, cueFromFrame, cueUntil, reacquireUntil;
+        long closedFrame, watchFrame, cueFromFrame, cueUntil, reacquireUntil, releaseTick;
         int output, fuelRemaining, returnedStock, syncId, binding;
         float progress;
         boolean contactEntered, contactObserved, turningBack;
@@ -996,6 +1002,15 @@ final class AgentMacroControl {
             admitPendingSide(next, progress);
             return;
         }
+        if (next != null && next.duringWaitFor() == null && hasActiveWorkOrder() && work == pendingOrigin
+                && pendingEntry() != null && !work.order.id().equals(next.id())) {
+            // Only the exact park operation (or bounded side admission that parks first) can release this motor.
+            if (!consumed.containsKey(next.id())) {
+                markConsumed(next.id());
+                receipt(next.id(), next.life(), "refused", "A paid furnace cannot be replaced by ordinary work.");
+            }
+            next = work.order;
+        }
         if (hasActiveWorkOrder()) {
             if (next != null && work.order.id().equals(next.id())) work.refusedPendingReplacement = false;
             String invalid = !mailbox.present && !work.refusedPendingReplacement ? "The host withdrew the work order."
@@ -1044,7 +1059,7 @@ final class AgentMacroControl {
                 receipt(next.id(), next.life(), "refused", "The work order contains an unsupported target or effect.");
             } else if (next.life() != life || !compatible && next.epoch() != epoch || next.basis() > tick
                     || tick - next.basis() >= MAX_WORK_ADMISSION_AGE || tick >= next.expires()
-                    || next.safetyRevision() != safetyRevision || basis == null || basis.epoch != next.epoch()
+                    || next.safetyRevision() != safetyRevision || basis == null || basis.epoch != next.epoch() || basis.sideQuotes != null
                     || next.policy().target().goal() != null && !next.policy().target().goal().equals(goal)) {
                 if (continuePersonal) releasePersonalCraft(true);
                 markConsumed(next.id());
@@ -1113,9 +1128,9 @@ final class AgentMacroControl {
         return ticket != null && ticket.mayInvestigateCollection() && !pendingUncertain && pendingEstimate != null
             && pendingOrigin != null && work == pendingOrigin && work.active() && iron != null && iron.phase == FurnacePhase.WATCHING
             && AgentFurnaceWatch.releasedForSide(iron.batch, iron.burnTick, iron.closedFrame, iron.watchFrame)
-            && tick < work.order.expires() && now < work.deadline && hazardClear && !urgent
+            && !iron.turningBack && tick < work.order.expires() && now < work.deadline && hazardClear && !urgent
             && work.order.safetyRevision() == safetyRevision && ironFooting(iron.footing)
-            && releasedPendingHands();
+            && releasedPendingHands() && body.renderedDirection(player.getYaw(), player.getPitch(), 2);
     }
 
     private boolean releasedPendingHands() {
@@ -1176,7 +1191,8 @@ final class AgentMacroControl {
                 || (hasActiveWorkOrder() ? !pendingCanYield() : action != null || personalCraft != null))
             refusal = "The wait has not released one safe nearby owner for the independent action.";
         else if (budget.missingFloor(player.getInventory()) != null || count(next.policy().target().item()) >= next.policy().target().count()
-                || basis.offers.values().stream().noneMatch(offer -> pendingSideOffer(offer, budget, progress)))
+                || basis.sideQuotes == null
+                || basis.sideQuotes.stream().noneMatch(offer -> pendingSideOffer(offer, budget, progress)))
             refusal = "The independent target has no live exact local break, pickup or reserve-safe recipe in its basis.";
         else if (hasActiveWorkOrder() && !parkPending())
             refusal = "The paid furnace could not be stored as a parked obligation.";
@@ -1413,7 +1429,8 @@ final class AgentMacroControl {
                 && budget.policy.breakAllowed(offer.face.state) && AgentWorkOrder.harvest(offer.face.state) == target
                 && pendingSideFace(offer.face.hit, offer.face.state, target, budget, progress);
             case COLLECT -> offer.item == target && dropVisible(offer) && floorCurrent(offer.floor)
-                && dropNearLanding(offer.drop, offer.floor);
+                && dropNearLanding(offer.drop, offer.floor) && roomFor(offer.drop.getStack())
+                && pendingFootNearby(pendingEntry(), offer.floor.pos.up());
             case CONTINUE -> {
                 String recipe = sideRecipe(offer.recipe.id, target);
                 yield recipe != null && budget.policy.craftAllowed(recipe) && hands.workCraftable(recipe, budget)
@@ -1429,7 +1446,11 @@ final class AgentMacroControl {
         var held = player.getMainHandStack();
         int loss = AgentMiningStock.maxLoss(held, state, world, cell);
         return loss >= 0 && (loss == 0 || budget.limit(held.getItem(), count(held.getItem())) >= loss)
-            && canBreak(cell, state, progress) && workLootCompatible(held, state)
+            && pendingSourceSafe(cell, state, target, progress);
+    }
+
+    private boolean pendingSourceSafe(BlockPos cell, BlockState state, Item target, AgentProgress progress) {
+        return canBreak(cell, state, progress) && workLootCompatible(player.getMainHandStack(), state)
             && !pendingTrail.contains(cell.up()) && dryWorkBreakSafe(cell, state, target, progress);
     }
 
@@ -2779,7 +2800,7 @@ final class AgentMacroControl {
                 else if (action.prospectLight) advanceProspectLight();
                 else advanceWorkPlacement();
             }
-            case WORK_SMELT -> advanceIronWork();
+            case WORK_SMELT -> advanceIronWork(progress);
             case WORK_FILL -> advanceWaterWork();
             default -> step(progress);
         }
@@ -3672,7 +3693,7 @@ final class AgentMacroControl {
         return false;
     }
 
-    private void advanceIronWork() {
+    private void advanceIronWork(AgentProgress progress) {
         FurnaceWork iron = action.furnace;
         Face target = action.offer.face;
         BlockPos pos = target.hit.getBlockPos();
@@ -3701,7 +3722,7 @@ final class AgentMacroControl {
             }
         }
         if (iron.phase == FurnacePhase.WATCHING) {
-            advanceFurnaceWatch(iron, target);
+            advanceFurnaceWatch(iron, target, progress);
             return;
         }
         boolean reopening = iron.phase == FurnacePhase.REOPENING;
@@ -4308,7 +4329,7 @@ final class AgentMacroControl {
         ironStatus("Closed the clean furnace with vanilla Escape; remaining on the exact dry stance.");
     }
 
-    private void advanceFurnaceWatch(FurnaceWork iron, Face target) {
+    private void advanceFurnaceWatch(FurnaceWork iron, Face target, AgentProgress progress) {
         if (client.currentScreen != null || player.currentScreenHandler != player.playerScreenHandler || !cursorClear()
                 || !body.keysNeutral() || hands.busy()) {
             interrupt("A screen, cursor or other input owner interrupted the closed furnace watch.", false);
@@ -4324,11 +4345,36 @@ final class AgentMacroControl {
         if (iron.watchFrame == 0) {
             iron.watchFrame = frame;
             ironMilestone("watch_closed", "Vanilla Escape closed the clean paid furnace; a fresh first-person view confirms the stationary dry stance.");
-            if (pendingOrigin == work) {
-                pendingWorldRelease = true;
-                pendingEstimate = iron.watch;
+            if (pendingOrigin == work && pendingEntry() != null) {
+                body.pauseWork();
+                // Use an already relevant view first. A nearby earlier cue may guide one brief turn,
+                // but supplies no current evidence and must not postpone the first decision for a scan.
+                var earlier = iron.footing.equals(work.ironSceneFooting) ? work.ironScene : null;
+                if (earlier != null && currentDryRoute(progress) == null && furnaceScene(iron.footing) == null
+                        && visibleStation(Blocks.CRAFTING_TABLE) == null) {
+                    aimFurnaceCue(iron, earlier);
+                    iron.cueUntil = tick + FURNACE_DECISION_CUE_TICKS;
+                }
+                return;
             }
             startFurnaceSurvey(iron);
+        }
+        if (pendingOrigin == work && pendingEntry() != null && !pendingWorldRelease
+                && iron.watch.remainingTicks(tick) > FURNACE_REACQUIRE_LEAD_TICKS) {
+            if (iron.cue != null) {
+                if (tick <= iron.cueUntil) observeFurnaceCue(iron);
+                if (iron.cue != null && tick < iron.cueUntil) return;
+                iron.cue = null;
+                body.pauseWork();
+                iron.watchFrame = frame; // Require the first rendered view after the look settled.
+                return;
+            }
+            if (frame <= iron.watchFrame || !body.renderedDirection(player.getYaw(), player.getPitch(), 2)
+                    || !releasedPendingHands()) return;
+            pendingWorldRelease = true;
+            pendingEstimate = iron.watch;
+            iron.releaseTick = tick;
+            return;
         }
         if (iron.watch.elapsed(tick, now)) {
             iron.phase = FurnacePhase.REOPENING;
@@ -5296,7 +5342,8 @@ final class AgentMacroControl {
                 && action != null && action.durable && tick - lastPurposefulTick >= 10)
             purposeful("work " + action.offer.key.verb.id + ": " + continuityWork.name());
         boolean due = tick - lastObservation >= OBSERVATION_INTERVAL || lastObservation == 0
-            || personalCraft != null && work.completedTick == tick;
+            || personalCraft != null && work.completedTick == tick
+            || action != null && action.furnace != null && action.furnace.releaseTick == tick;
         updateScope(due);
         // Ordinary local work may continue on the very next tick. Only an observed
         // promotion barrier (or an isolated trial) advertises a held neutral window.
@@ -5666,14 +5713,7 @@ final class AgentMacroControl {
                     0, pitch, witness, null, null, null, null);
                 if (!trial && "preset".equals(ipc.workMode)) addFarFoothold(offers, witness, direction, pitch);
             }
-            var seen = body.visibleEntity(entity -> entity instanceof ItemEntity item && dropNearLanding(item, witness)
-                && !item.getStack().isEmpty() && roomFor(item.getStack()), 3.25).orElse(null);
-            if (seen instanceof ItemEntity drop) {
-                Item item = drop.getStack().getItem();
-                offer(offers, new Key(Verb.COLLECT, floor, drop.getId(), null), "Collect visible " + Registries.ITEM.getId(item),
-                    "A rendered drop is on this adjacent dry tile; the matching item fits in inventory.",
-                    0, pitch, witness, null, drop, item, null);
-            }
+            addAdjacentDrop(offers, witness, pitch);
         }
         var resource = body.find(AgentMacroControl::resource, reach(),
             hit -> canBreak(hit.getBlockPos(), client.world.getBlockState(hit.getBlockPos()), progress)
@@ -5706,6 +5746,115 @@ final class AgentMacroControl {
             craftOffer(offers, BENCH, null);
         }
         return offers;
+    }
+
+    private void addAdjacentDrop(List<Offer> offers, Floor floor, float pitch) {
+        var seen = body.visibleEntity(entity -> entity instanceof ItemEntity item && dropNearLanding(item, floor)
+            && !item.getStack().isEmpty() && roomFor(item.getStack()), 3.25).orElse(null);
+        if (seen instanceof ItemEntity drop) {
+            Item item = drop.getStack().getItem();
+            offer(offers, new Key(Verb.COLLECT, floor.pos, drop.getId(), null), "Collect visible " + Registries.ITEM.getId(item),
+                "A rendered drop is on this adjacent dry tile; the matching item fits in inventory.",
+                0, pitch, floor, null, drop, item, null);
+        }
+    }
+
+    private PendingView pendingView(AgentProgress progress, AgentPendingFurnaceMemory.Entry ticket) {
+        var quotes = new ArrayList<Offer>(MAX_OFFERS - 1); // Keep one slot for the exact deferral.
+        var routes = new StringBuilder("Current post-Escape view; travel descriptions grant no movement. ");
+        var route = currentDryRoute(progress);
+        if (route != null) {
+            routes.append("Paired cave route: ").append(dryRouteDescription(route)).append(' ')
+                .append(bearing(Vec3d.ofBottomCenter(route.next()), player.getPos(), player.getYaw()))
+                .append(", with a witnessed return and a current dry first-edge check. ");
+        } else {
+            routes.append("No current paired dry cave segment. ").append(progress.dryRouteOfferEvidence()).append(' ');
+        }
+        boolean forwards = !client.options.forwardKey.isUnbound();
+        boolean blocked = false, repeated = false, level = false;
+        if (forwards) for (Direction direction : CARDINAL) {
+            BlockPos pos = player.getBlockPos().down().offset(direction);
+            if (body.macroFloor(pos) == null) continue;
+            Floor floor = new Floor(pos, world.getBlockState(pos), Vec3d.ofBottomCenter(pos.up()));
+            if (!body.macroFlatLane(pos, floor.state, floor.landing)) {
+                blocked = true;
+                continue;
+            }
+            if (pendingFootNearby(ticket, pos.up())) addAdjacentDrop(quotes, floor, player.getPitch());
+            if (repeatedSourceFooting(pos)) repeated = true;
+            else if (!body.macroNoVisiblePickup(floor.landing)) blocked = true;
+            else {
+                routes.append("One witnessed dry level foothold ")
+                    .append(bearing(floor.landing, player.getPos(), player.getYaw())).append(". ");
+                level = true;
+            }
+        }
+        if (!forwards) routes.append("Forward is unbound. ");
+        else if (!level && !blocked && !repeated) routes.append("No distinct level foothold was witnessed. ");
+        if (blocked) routes.append("A seen tile lacked a clear dry sweep or pickup check. ");
+        if (repeated) routes.append("A seen tile was already checked without new stock. ");
+
+        var sources = new StringBuilder();
+        boolean ore = addPendingSourceQuote(quotes, progress, state -> resource(state) && !state.isIn(BlockTags.LOGS));
+        addPendingSourceQuote(quotes, progress, state -> AgentWorkOrder.resource(state)
+            && (!resource(state) || state.isIn(BlockTags.LOGS)));
+        double reach = reach();
+        if (!ore) {
+            var material = body.find(state -> resource(state) && !state.isIn(BlockTags.LOGS), reach + 1).orElse(null);
+            if (material != null) sources.append(blockName(face(material))).append(" is visible ")
+                .append(bearing(material.getPos(), player.getPos(), player.getYaw()))
+                .append(", but no safe harvest from this stance was confirmed. ");
+        }
+        var table = visibleStation(Blocks.CRAFTING_TABLE);
+        if (table != null && body.macroMineWitness(table, reach) != null) {
+            sources.append("A crafting table is in reach ")
+                .append(bearing(table.getPos(), player.getPos(), player.getYaw())).append("; not opened. ");
+            Face bench = face(table);
+            craftOffer(quotes, BUCKET, bench);
+            for (Recipe recipe : BENCH_RECIPES) craftOffer(quotes, recipe, bench);
+        }
+        if (!client.options.inventoryKey.isUnbound()) {
+            craftOffer(quotes, TORCH, null);
+            craftOffer(quotes, PLANKS, null);
+            craftOffer(quotes, STICKS, null);
+            craftOffer(quotes, BENCH, null);
+        }
+        var water = body.visibleFluid(false, true, reach);
+        if (water != null && body.waterFillWitness(water, reach)) {
+            sources.append("Plain source water is in bucket reach ")
+                .append(bearing(water.getPos(), player.getPos(), player.getYaw())).append("; none taken. ");
+        } else {
+            water = body.visibleFluid(false, false, AgentHazards.SIGHT_RANGE);
+            if (water != null && world.getBlockState(water.getBlockPos()).getFluidState().isIn(FluidTags.WATER)) {
+                sources.append("Water is visible ")
+                    .append(bearing(water.getPos(), player.getPos(), player.getYaw()))
+                    .append(", but no fillable source here was confirmed. ");
+            }
+        }
+        return new PendingView(quotes, recentSummary(routes.toString()),
+            sources.isEmpty() ? null : recentSummary("Local post-Escape targets; no stock gained. " + sources));
+    }
+
+    private boolean addPendingSourceQuote(List<Offer> quotes, AgentProgress progress, Predicate<BlockState> matches) {
+        double reach = reach();
+        ItemStack held = player.getMainHandStack();
+        var seen = body.find(matches, reach, hit -> {
+            var pos = hit.getBlockPos();
+            var state = world.getBlockState(pos);
+            Item stock = AgentWorkOrder.harvest(state);
+            return stock != Items.AIR && body.macroMineWitness(hit, reach) != null
+                && pendingSourceSafe(pos, state, stock, progress) && AgentMiningStock.maxLoss(held, state, world, pos) >= 0;
+        }).orElse(null);
+        if (seen == null) return false;
+        Face face = face(seen);
+        Item stock = AgentWorkOrder.harvest(face.state);
+        String tool = held.isEmpty() ? "empty hand" : Registries.ITEM.getId(held.getItem()).toString();
+        offer(quotes, faceKey(Verb.BREAK, face, null), "Visible local " + blockName(face) + " source",
+            "Lit dry face " + bearing(seen.getPos(), player.getPos(), player.getYaw())
+                + " in reach. The selected " + tool + " can harvest " + Registries.ITEM.getId(stock)
+                + " under a bounded stock grant after parking; a tool can wear, and no drop is yet in inventory.",
+            0, 0, null, face, null, null, null);
+        return true;
     }
 
     private void addWaterClue(List<Offer> offers) {
@@ -5776,18 +5925,24 @@ final class AgentMacroControl {
             || surfaceSearch.blockedAt.down().equals(floor));
     }
 
-    private void addDryRouteOffer(List<Offer> offers, AgentProgress progress) {
+    private AgentDryCaveRoute.Offer currentDryRoute(AgentProgress progress) {
         AgentDryCaveRoute.Offer route = progress.dryRouteOffer();
+        if (route == null || route.edges() < 1 || route.edges() > MAX_ROUTE_EDGES
+                || !route.from().equals(player.getBlockPos()) || route.from().equals(route.endpoint())
+                || route.from().equals(route.next()) || Math.abs(route.heightChange()) > 1
+                || route.heightChange() != 0 && (route.edges() != 1 || !route.next().equals(route.endpoint()))
+                || route.heightChange() == 0 && route.from().getY() != route.next().getY()) return null;
+        return route;
+    }
+
+    private void addDryRouteOffer(List<Offer> offers, AgentProgress progress) {
+        AgentDryCaveRoute.Offer route = currentDryRoute(progress);
         String evidence = progress.dryRouteOfferEvidence();
         if (!evidence.equals(dryOfferEvidence)) {
             dryOfferEvidence = evidence;
             remember("dry route: " + evidence);
         }
-        if (route == null || route.edges() < 1 || route.edges() > MAX_ROUTE_EDGES
-                || !route.from().equals(player.getBlockPos()) || route.from().equals(route.endpoint())
-                || route.from().equals(route.next()) || Math.abs(route.heightChange()) > 1
-                || route.heightChange() != 0 && (route.edges() != 1 || !route.next().equals(route.endpoint()))
-                || route.heightChange() == 0 && route.from().getY() != route.next().getY()) {
+        if (route == null) {
             routeOffer = null;
             AgentDryCaveRoute.Survey survey = progress.drySurveyOffer();
             if (survey == null) {
@@ -5974,12 +6129,14 @@ final class AgentMacroControl {
         JsonArray opportunities = new JsonArray();
         Map<String, Offer> witnessed = new LinkedHashMap<>();
         List<Offer> visible = List.of();
+        PendingView cook = null;
+        var ticket = pendingEntry();
+        boolean yieldable = pendingCanYield();
         if (progress != null && observableWorld()) {
             if (action == null) visible = offers(progress);
-            else if (pendingCanYield()) {
-                // These offers are quote evidence only while the accepted furnace still owns the motor.
-                visible = offers(progress).stream().filter(offer -> offer.key.verb == Verb.BREAK && offer.key.activity == null
-                    || offer.key.verb == Verb.COLLECT || offer.key.verb == Verb.CONTINUE).toList();
+            else if (yieldable) {
+                cook = pendingView(progress, ticket);
+                visible = cook.quotes;
             }
             else if (action.intent == null && action.keepVisible.length != 0) {
                 var continuing = new ArrayList<Offer>(action.keepVisible.length);
@@ -5987,9 +6144,7 @@ final class AgentMacroControl {
                 visible = continuing;
             }
         }
-        var ticket = pendingEntry();
         if (ticket != null && (pendingWorldRelease || pendingParked())) {
-            boolean yieldable = pendingCanYield();
             boolean parked = pendingParked();
             boolean safeReturn = progress != null && action == null && pendingCollectionPremise(ticket);
             BlockHitResult inReach = safeReturn ? livePendingFace(ticket) : null;
@@ -6031,17 +6186,22 @@ final class AgentMacroControl {
                 else if (material != null || !"read".equals(offer.key.verb.risk)) trackSurvey = false;
             }
             opportunities.add(entry);
-            witnessed.put(offer.id, offer);
+            if (cook == null || offer.key.verb == Verb.DEFER_PENDING) witnessed.put(offer.id, offer);
         }
         if (trackSurvey) observeSurveyPublication(publishedSurveys);
-        snapshots.put(tick, new Snapshot(epoch, witnessed.isEmpty() ? Map.of() : witnessed));
+        snapshots.put(tick, new Snapshot(epoch, witnessed.isEmpty() ? Map.of() : witnessed, cook == null ? null : cook.quotes));
         while (!snapshots.isEmpty() && snapshots.firstEntry().getKey() < tick - MAX_AGE) snapshots.pollFirstEntry();
         value.add("opportunities", opportunities);
         String watched = retainedFurnaceFact();
-        JsonArray history = new JsonArray(Math.min(8, recent.size() + (watched == null ? 0 : 1)));
-        int skip = watched == null ? 0 : Math.max(0, recent.size() - 7);
+        int freshFacts = (watched == null ? 0 : 1) + (cook == null ? 0 : cook.sources == null ? 1 : 2);
+        JsonArray history = new JsonArray(Math.min(8, recent.size() + freshFacts));
+        int skip = Math.max(0, recent.size() + freshFacts - 8);
         for (String event : recent) if (skip-- <= 0) history.add(event);
         if (watched != null) history.add(watched);
+        if (cook != null) {
+            history.add(cook.routes);
+            if (cook.sources != null) history.add(cook.sources);
+        }
         value.add("recent", history);
         value.addProperty("quiescent", quiescent);
         ipc.observation.set(value.toString());

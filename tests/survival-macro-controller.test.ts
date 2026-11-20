@@ -1271,6 +1271,44 @@ test.each(["single charged unit", "held mouse", "protected stock", "dead", "wron
   },
 );
 
+test.each(["invented follow", "direct stock quote", "ordinary work"] as const)(
+  "Paid-cook context reaches the strategist without admitting %s", async attempted => {
+    const route = "Current post-Escape view; travel descriptions grant no movement. Paired cave route: " +
+      "one witnessed block down ahead, with a witnessed return and a current dry first-edge check.";
+    const requests: MacroRequest[] = [];
+    const defer = { id: "park-live-batch", verb: "defer_pending", risk: "low", summary: "Defer the paid batch",
+      evidence: "Clean controls were released." } as const;
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (!request.work?.current) return workReply(request, { kind: "work", policy: ironPolicy });
+      return workReply(request, attempted === "ordinary work" ? { kind: "work", policy: sideStone } :
+        { kind: "opportunity", opportunityId: attempted === "invented follow" ? "follow-cave" : witnessedStone.id });
+    }, "Prepare a bucket, then look for diamonds.", 2);
+    try {
+      const inventory = { [ironItem]: 1, [fuelItem]: 1, "minecraft:iron_pickaxe": 1 };
+      await f.observe(10, { goal: "diamond", inventory: { ...inventory, [fuelItem]: 3, [rawIronItem]: 2, [furnaceItem]: 1 } });
+      await f.actor.poll();
+      const batch = await f.order();
+      await f.receipt(batch.id, 11, "accepted");
+      await f.observe(115, { goal: "diamond", inventory, recent: [route], opportunities: [defer, witnessedStone],
+        workOrder: { id: batch.id, state: "working", detail: "Cooking",
+          progress: { phase: "smelt", status: "Paid burn", breaks: 0, crafts: 0, placements: 1,
+            smeltBurn: { burnTick: 111, units: 2, remainingCookTicks: 395 } } },
+        pendingWork: { ...paidIron(batch.id, 395), deferOfferId: defer.id } });
+      await f.actor.poll();
+      expect(requests[1]?.work?.duringWaitFor).toBe(batch.id);
+      expect(requests[1]?.observation.recent).toContain(route);
+      expect(requests[1]?.observation.opportunities.map(({ verb }) => verb)).toEqual(["defer_pending", "break"]);
+      expect(await f.order()).toEqual(batch);
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      expect(f.actor.status()).toMatchObject({ issuedWorkOrders: 1, completedReceipts: 0 });
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
 test("Explicit deferral retires the owner only on a native park and does not count as production", async () => {
   const defer = { id: "fresh-defer", verb: "defer_pending", risk: "low", summary: "Leave the paid workshop",
     evidence: "The exact paid furnace released the controls." } as const;

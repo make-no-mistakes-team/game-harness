@@ -1,6 +1,8 @@
 package io.gameharness.survival;
 
 import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
@@ -25,6 +27,7 @@ final class AgentCaves {
     private static final double REACH = 3.9;
     private static final int SURVEY_TICKS = 42;
     private static final int MAX_DROP = 12;
+    private static final int LIGHT_RESERVE = 4, LIGHT_STANCES = 32;
     private static final Predicate<ItemStack> TORCH = stack -> stack.isOf(Items.TORCH);
     private static final Predicate<ItemStack> WATER = stack -> stack.isOf(Items.WATER_BUCKET);
     private static final Predicate<ItemStack> BUCKET = stack -> stack.isOf(Items.BUCKET);
@@ -35,11 +38,10 @@ final class AgentCaves {
     private static final int WALKABLE = FLOOR | SHIN | HEAD | LEFT | RIGHT | RETURN;
 
     private enum Phase {
-        DRY, SURVEY, DRIVE, LOOK_DOWN, FILL, POUR, RECLAIM, DESCEND, ASCEND, CENTER, PLACE, CUT, LIGHT, BOAT_VIEW
+        DRY, SURVEY, DRIVE, LOOK_DOWN, FILL, POUR, RECLAIM, DESCEND, ASCEND, CENTER, PLACE, CUT, BOAT_VIEW
     }
     private record WaterLink(BlockPos lip, BlockPos source, BlockPos bottom, BlockPos shore,
                              Direction approach, Direction flank) {}
-    private record TorchTarget(BlockHitResult support, Vec3d aim, boolean lip) {}
     record Opening(BlockPos origin, Direction bearing) {
         BlockPos mouth() { return origin.offset(bearing); }
     }
@@ -55,8 +57,10 @@ final class AgentCaves {
     private final int[] quietUntil = new int[quietLips.length];
     private final BlockPos[] visited = new BlockPos[9];
     private final int[] proof = new int[3];
-    private final BlockHitResult[] dimFloors = new BlockHitResult[proof.length];
-    private TorchTarget torchTarget;
+    private final Set<BlockPos> lightStances = new HashSet<>();
+    private final Set<BlockPos> lightFootprints = new HashSet<>();
+    private SectorLight sectorLight;
+    private BlockPos lightReceipt;
     private ClientWorld world;
     private ClientPlayerEntity player;
     private String status = "surveying for a cave opening";
@@ -64,9 +68,9 @@ final class AgentCaves {
     private Direction opening, bearing, travel;
     private Phase phase;
     private int since, phaseSince, option, steps, quietCursor, cutSide, cutIndex, cuts, placed;
-    private int cooldown, nextLight, lastAction, before, waterProof;
-    private boolean entered, needSurvey, triedHigh, triedLight, triedPlace, triedWater, earlyHigh, centerForBearing;
-    private boolean afloat, leavingWater, checkedLipLight;
+    private int cooldown, lastAction, before, waterProof;
+    private boolean entered, needSurvey, triedHigh, triedPlace, triedWater, earlyHigh, centerForBearing;
+    private boolean afloat, leavingWater, checkingLitDescent;
     private BlockHitResult ore, lava, face, fill;
     private Opening deferred;
     private WaterLink plannedWater, waterLink;
@@ -103,17 +107,29 @@ final class AgentCaves {
     float boatYaw() { return boatYaw; }
     Opening deferredOpening() { return deferred; }
     long drySurveyEvidence() { return dryRoute.surveyEvidence(); }
-    boolean routingDry() { return dryRoute.routing(); }
+    boolean routingDry() { return sectorLight != null || dryRoute.routing(); }
+    BlockPos takeLightReceipt() {
+        BlockPos confirmed = lightReceipt;
+        lightReceipt = null;
+        return confirmed;
+    }
     void observeDryContact(long tick) { dryRoute.contact(tick); }
     void changedDry(BlockPos changed) { dryRoute.changed(changed); }
     void walkedDry(BlockPos from, BlockPos to) { dryRoute.walked(from, to); }
     void witnessedDry(BlockPos from, BlockPos to) { dryRoute.witnessed(from, to); }
     AgentDryCaveRoute.Offer dryRouteOffer() { return dryRoute.offer(); }
+    AgentDryCaveRoute.Survey drySurveyOffer() { return dryRoute.surveyOffer(); }
+    boolean drySurveyCurrent(AgentDryCaveRoute.Survey offer) { return dryRoute.surveyCurrent(offer); }
+    AgentDryCaveRoute.SurveyResult surveyDryRoute(AgentDryCaveRoute.Survey offer) { return dryRoute.surveyDirect(offer); }
+    String drySurveyResult(AgentDryCaveRoute.Survey offer) { return dryRoute.surveyEvidence(offer); }
+    void cancelDrySurvey(AgentDryCaveRoute.Survey offer) { dryRoute.cancelSurvey(offer); }
+    String dryRouteOfferEvidence() { return dryRoute.offerEvidence(); }
     AgentDryCaveRoute.DirectResult followDryRoute(AgentDryCaveRoute.Offer offer, int tick) {
         return dryRoute.follow(offer, tick);
     }
     String dryRouteReason() { return dryRoute.directReason(); }
     void cancelFollowDryRoute(AgentDryCaveRoute.Offer offer) { dryRoute.cancel(offer); }
+    boolean dryRouteInFlight(AgentDryCaveRoute.Offer offer) { return dryRoute.inFlight(offer); }
 
     boolean witnessedMineOpening(BlockPos current, Direction bearing) {
         return aperture(current, current.offset(bearing), bearing)
@@ -126,6 +142,7 @@ final class AgentCaves {
         boatFloor = null;
         deferred = null;
         if (active() || player == null || world == null || direction == null) return false;
+        if (sectorLight != null) return sectorLight.step(tick);
         if (dryRoute.routing()) {
             Direction shown = dryRoute.takeApertureView(current);
             boolean chamber = shown != null && !quiet(current, tick) && aperture(current, current.offset(shown), shown);
@@ -156,6 +173,7 @@ final class AgentCaves {
     boolean cancelStationaryDrySurvey(int tick) {
         resetOnWorldChange();
         if (player == null || !player.isOnGround() || player.isTouchingWater() || controlsWater(tick)) return false;
+        if (sectorLight != null) return false;
         if (active() && (phase != Phase.DRY && phase != Phase.SURVEY
                 || !player.getBlockPos().equals(stance))) return false;
         if (!dryRoute.cancelStationarySurvey()) return false;
@@ -166,9 +184,7 @@ final class AgentCaves {
         return true;
     }
 
-    void interruptLight(int tick) {
-        if (torchTarget != null) resumeAfterLight(tick);
-    }
+    void interruptLight() { sectorLight = null; }
 
     /** A null ore predicate prospects for exposed lava; a null planned foot can only continue an excursion. */
     boolean step(int tick, BlockPos planned, Direction direction, Predicate<BlockState> preferredOre) {
@@ -177,6 +193,7 @@ final class AgentCaves {
         boatFloor = null;
         deferred = null;
         if (player == null || world == null) return false;
+        if (sectorLight != null) return active() && sectorLight.step(tick);
         if (!active()) {
             if (planned == null || direction == null || tick < cooldown || !player.isOnGround()
                 || player.isTouchingWater() || quiet(player.getBlockPos(), tick)) return false;
@@ -186,7 +203,15 @@ final class AgentCaves {
             return true;
         }
         if (phase == Phase.DRY) {
-            if (dryRoute.takeUnprovedView(player.getBlockPos(), opening)) {
+            boolean checkedOpening = dryRoute.takeUnprovedView(player.getBlockPos(), opening);
+            if (checkedOpening && checkingLitDescent) {
+                checkingLitDescent = false;
+                triedHigh = true;
+                start(Phase.LOOK_DOWN, tick);
+                status = "no adjacent returnable shelf after lighting; checking the witnessed cliff from dry footing";
+                return true;
+            }
+            if (checkedOpening) {
                 status = "checking the witnessed cave aperture for a local shelf";
             } else if (stepDry(tick, player.getBlockPos(), opening, preferredOre)) return true;
             if (ore != null || lava != null) return finish(tick, status);
@@ -198,7 +223,6 @@ final class AgentCaves {
         boolean inTransit = phase == Phase.DESCEND || phase == Phase.ASCEND || phase == Phase.CENTER
             || phase == Phase.DRIVE;
         boolean peeking = phase == Phase.POUR || phase == Phase.RECLAIM || phase == Phase.LOOK_DOWN
-            || phase == Phase.LIGHT && torchTarget != null && torchTarget.lip
             || phase == Phase.SURVEY && option == 0;
         if (!inTransit
             && (!player.isOnGround() || player.isTouchingWater()
@@ -224,7 +248,6 @@ final class AgentCaves {
             case CENTER -> center(tick);
             case PLACE -> place(tick);
             case CUT -> cut(tick);
-            case LIGHT -> light(tick);
             case BOAT_VIEW -> offerBoatFloor(tick);
         };
     }
@@ -245,10 +268,13 @@ final class AgentCaves {
         world = client.world;
         player = client.player;
         origin = replayTo = null;
-        torchTarget = null;
+        sectorLight = null;
+        lightReceipt = null;
+        lightStances.clear();
+        lightFootprints.clear();
         waterLink = null;
         entered = false;
-        cooldown = nextLight = 0;
+        cooldown = 0;
         Arrays.fill(quietLips, null);
     }
 
@@ -314,10 +340,11 @@ final class AgentCaves {
         bearing = opening;
         option = 0;
         needSurvey = true;
-        triedHigh = triedLight = triedPlace = triedWater = false;
-        earlyHigh = centerForBearing = checkedLipLight = false;
+        triedHigh = triedPlace = triedWater = false;
+        earlyHigh = centerForBearing = false;
         cutSide = 0;
         highBottom = null;
+        checkingLitDescent = false;
     }
 
     private boolean stepDry(int tick, BlockPos current, Direction prefer, Predicate<BlockState> preferredOre) {
@@ -325,6 +352,8 @@ final class AgentCaves {
         ore = dryRoute.ore();
         lava = dryRoute.lava();
         status = dryRoute.status();
+        Direction unlit = dryRoute.takeUnlitDescent(current);
+        if (unlit != null) startSectorLight(current, unlit, tick);
         return owned;
     }
 
@@ -369,22 +398,7 @@ final class AgentCaves {
             BlockPos foot = ahead.up(i - 1);
             if (seen(foot)) continue;
             proof[i] = checkStep(foot, travel, proof[i]);
-            if (proof[i] == WALKABLE) {
-                BlockHitResult dimFloor = dimFloors[i];
-                if (dimFloor != null && !triedLight && tick >= nextLight && hands.count(TORCH) > 2) {
-                    return lightTarget(dimFloor, floorAim(foot, travel), false, tick);
-                }
-                if (beginShelf(foot, tick)) return true;
-            }
-        }
-        if (option == 0 && age >= 34 && age <= SURVEY_TICKS && !checkedLipLight && !triedLight && tick >= nextLight
-            && hands.count(TORCH) > 2 && atLip(stance)) {
-            checkedLipLight = true;
-            BlockHitResult support = body.find(AgentCaves::solid, 2.9, this::dimLipFace).orElse(null);
-            if (support != null) {
-                return lightTarget(support, support.getPos().lerp(Vec3d.ofCenter(support.getBlockPos()), 0.04),
-                    true, tick);
-            }
+            if (proof[i] == WALKABLE && beginShelf(foot, tick)) return true;
         }
         if (age >= 28 && option == 0 && (proof[0] & FLOOR) == 0) creep(ahead);
         if (age >= SURVEY_TICKS) {
@@ -410,38 +424,10 @@ final class AgentCaves {
         start(Phase.SURVEY, tick);
     }
 
-    private boolean dimLipFace(BlockHitResult hit) {
-        Direction side = hit.getSide();
-        if (side == Direction.DOWN || body.observedFaceLight(hit) > 6) return false;
-        BlockPos support = hit.getBlockPos();
-        if (side == Direction.UP && support.equals(stance.down())) return true;
-        int height = support.getY() + side.getOffsetY() - stance.getY();
-        double x = hit.getPos().x - stance.getX() - 0.5;
-        double z = hit.getPos().z - stance.getZ() - 0.5;
-        return height >= -1 && height <= 2 && Math.abs(x) <= 1.6 && Math.abs(z) <= 1.6
-            && x * bearing.getOffsetX() + z * bearing.getOffsetZ() >= -0.25;
-    }
-
-    private boolean lightTarget(BlockHitResult support, Vec3d aim, boolean lip, int tick) {
-        torchTarget = new TorchTarget(support, aim, lip);
-        before = hands.count(TORCH);
-        triedLight = true;
-        start(Phase.LIGHT, tick);
-        return true;
-    }
-
     private int checkStep(BlockPos foot, Direction travel, int mask) {
         Vec3d base = Vec3d.ofBottomCenter(foot);
         Direction side = travel.rotateYClockwise();
-        if ((mask & FLOOR) == 0) {
-            BlockHitResult floor = floorHit(foot, travel, false);
-            if (floor != null) {
-                mask |= FLOOR;
-                if (phase == Phase.SURVEY && body.observedFaceLight(floor) <= 6) {
-                    dimFloors[foot.getY() - stance.getY() + 1] = floor;
-                }
-            }
-        }
+        if ((mask & FLOOR) == 0 && floor(foot, travel)) mask |= FLOOR;
         if ((mask & SHIN) == 0 && body.clearTerrain(base.add(0, 0.18, 0))) mask |= SHIN;
         if ((mask & HEAD) == 0 && body.clearTerrain(base.add(0, 1.82, 0))) mask |= HEAD;
         Vec3d mid = base.add(0, 0.95, 0);
@@ -613,12 +599,6 @@ final class AgentCaves {
             }
             return true;
         }
-        if (!triedLight && hands.count(TORCH) > 0 && tick >= nextLight) {
-            triedLight = true;
-            before = hands.count(TORCH);
-            start(Phase.LIGHT, tick);
-            return true;
-        }
         if (highBottom != null && !triedPlace && placed < 3 && hands.count(BLOCK) > 0) {
             triedPlace = true;
             travel = opening;
@@ -680,65 +660,154 @@ final class AgentCaves {
         return true;
     }
 
-    private boolean light(int tick) {
-        status = "placing light on a witnessed face before advancing";
-        TorchTarget target = torchTarget;
-        if (target != null && target.lip) body.sneak();
-        if (lastAction != 0 && hands.count(TORCH) < before) {
-            resumeAfterLight(tick);
-            dryRoute.lightChanged(stance);
-            start(Phase.DRY, tick);
-            if (target == null || !target.lip) {
-                option = 0;
-                needSurvey = true;
-                triedHigh = false;
-            } else {
-                status = "cave lip torch placed; rechecking the same bearing";
-            }
-            return true;
-        }
-        int age = tick - phaseSince;
-        if (target != null) {
-            status = target.lip ? "lighting the witnessed dim cave lip before rechecking footing"
-                : "lighting the dim cave ledge before stepping onto it";
-            if (age >= (target.lip ? 26 : 45) || lastAction != 0 && tick - lastAction >= 7) {
-                resumeAfterLight(tick);
-                return true;
-            }
-            if (lastAction != 0) return true;
-            BlockHitResult hit = target.lip ? observe(target.aim) : terrain(target.aim);
-            if (matches(target.support, hit) && solid(state(hit)) && (!target.lip || dimLipFace(hit))) {
-                body.aimContact(hit, AgentBody.Contact.PRECISE);
-                if ((!target.lip || player.isSneaking()) && hands.equipForUse(TORCH)
-                        && body.useContact(hit, AgentBody.Contact.PRECISE)) lastAction = tick;
-            } else {
-                body.aim(target.aim);
-            }
-            return true;
-        }
-        if (age >= 56) return alternatives(tick);
-        if (lastAction != 0 && tick - lastAction < 8) return true;
-        Direction wall = switch (age / 14) {
-            case 0 -> opening.rotateYClockwise();
-            case 1 -> opening.rotateYCounterclockwise();
-            case 2 -> opening.getOpposite();
-            default -> opening;
-        };
-        Vec3d wallAim = Vec3d.ofCenter(stance.offset(wall), age >= 42 ? -0.18 : 0.52);
-        body.aim(wallAim);
-        if (!body.aligned(wallAim) || !hands.equipForUse(TORCH)) return true;
-        BlockHitResult shown = body.selectedFace();
-        if (shown == null || shown.getSide() == Direction.DOWN
-            || shown.getPos().squaredDistanceTo(player.getEyePos()) > 2.9 * 2.9
-            || shown.getBlockPos().offset(shown.getSide()).equals(stance)) return true;
-        if (body.useContact(shown, AgentBody.Contact.OUTLINE)) lastAction = tick;
-        return true;
+    private void startSectorLight(BlockPos source, Direction sector, int tick) {
+        if (lightStances.size() >= LIGHT_STANCES || hands.count(TORCH) <= LIGHT_RESERVE
+                || !stableLightFooting(source) || body.hazardAhead(sector.getPositiveHorizontalDegrees(), 2.1)
+                || !lightStances.add(source)) return;
+        sectorLight = new SectorLight(source, sector, tick);
     }
 
-    private void resumeAfterLight(int tick) {
-        torchTarget = null;
-        nextLight = tick + 95;
-        start(Phase.SURVEY, tick);
+    private boolean stableLightFooting(BlockPos source) {
+        return player.isAlive() && player.isOnGround() && source.equals(player.getBlockPos())
+            && Math.abs(player.getY() - source.getY()) <= 0.055
+            && horizontalSquared(Vec3d.ofBottomCenter(source)) <= 0.23 * 0.23
+            && player.getVelocity().horizontalLengthSquared() <= 0.0081
+            && !player.isTouchingWater() && !player.isInLava() && !player.isOnFire() && player.hurtTime == 0
+            && !player.hasVehicle() && !body.lavaEmergency() && client.currentScreen == null && client.getOverlay() == null;
+    }
+
+    private final class SectorLight {
+        private static final double RANGE = 2.9;
+        private final BlockPos source;
+        private final Direction sector, flank;
+        private final int started;
+        private final Vec3d base;
+        private int lastTick, chosen, issued, stock, priorLight;
+        private Vec3d darkness, aim;
+        private BlockHitResult support;
+        private BlockPos footprint;
+
+        SectorLight(BlockPos source, Direction sector, int tick) {
+            this.source = source;
+            this.sector = sector;
+            flank = sector.rotateYClockwise();
+            started = tick;
+            lastTick = body.actionTick();
+            base = Vec3d.ofBottomCenter(source);
+        }
+
+        boolean step(int tick) {
+            int bodyTick = body.actionTick();
+            if (lastTick + 1 != bodyTick || !stableLightFooting(source)
+                    || body.hazardAhead(sector.getPositiveHorizontalDegrees(), 2.1))
+                return finishLight("cave sector light interrupted: actual dry footing or safety changed");
+            lastTick = bodyTick;
+            if (issued != 0) return confirm(tick);
+            if (hands.count(TORCH) <= LIGHT_RESERVE)
+                return finishLight("cave sector light refused: keeping return torch reserve");
+            if (support != null) return placeOnWall(tick);
+            int age = tick - started;
+            if (darkness == null) {
+                status = "checking whether the unproved cave descent is dark enough to need light";
+                if (age > 17) return finishLight("cave sector light refused: no dark downward view was witnessed");
+                Vec3d toward = offset(base, sector, 2.25);
+                look(toward, 48);
+                Vec3d near = toward.add(0, -1.15, 0);
+                Vec3d below = offset(toward, sector, 0.8).add(0, -2.3, 0);
+                if (body.dryRouteClear(near) == AgentBody.DryRouteSample.DARK) darkness = near;
+                else if (body.dryRouteClear(below) == AgentBody.DryRouteSample.DARK) darkness = below;
+                return true;
+            }
+            if (age > 41) return finishLight("cave sector light refused: no visible safe side-wall attachment");
+            status = "looking for a close side wall that can light the downward cave sector";
+            BlockHitResult visible = body.find(AgentCaves::solid, RANGE, this::usefulWall).orElse(null);
+            if (visible == null) {
+                double lateral = age < 23 ? 0 : age < 32 ? 1.25 : -1.25;
+                look(offset(offset(base, sector, 2), flank, lateral), 32);
+                return true;
+            }
+            support = visible;
+            footprint = support.getBlockPos().offset(support.getSide());
+            aim = support.getPos().lerp(Vec3d.ofCenter(support.getBlockPos()), 0.025);
+            chosen = tick;
+            return true;
+        }
+
+        private boolean usefulWall(BlockHitResult hit) {
+            Direction side = hit.getSide();
+            if (side.getAxis() != flank.getAxis() || body.observedFaceLight(hit) >= 11
+                    || hit.getPos().squaredDistanceTo(player.getEyePos()) > RANGE * RANGE) return false;
+            BlockPos slot = hit.getBlockPos().offset(side);
+            if (lightFootprints.contains(slot)) return false;
+            Vec3d delta = Vec3d.ofBottomCenter(slot).subtract(base);
+            double forward = along(delta, sector), lateral = along(delta, flank);
+            // The attachment is beside, never in, the launch/landing/jump column
+            // or any immediately neighboring cardinal foothold.
+            return forward >= 1 && forward <= 3 && Math.abs(lateral) >= 1 && Math.abs(lateral) <= 2
+                && (lateral < 0 ? side == flank : side == flank.getOpposite())
+                && delta.y >= -2 && delta.y <= 1
+                && Vec3d.ofCenter(slot).squaredDistanceTo(darkness) <= 21
+                && visibleAir(slot, side);
+        }
+
+        private boolean visibleAir(BlockPos slot, Direction side) {
+            Vec3d air = offset(Vec3d.ofCenter(slot, 0.55), side, -0.16);
+            // Identity is queried only in this already visible, lit air sample,
+            // so a non-colliding torch, vine, or fluid is not inferred to be empty.
+            return body.dryRouteClear(air) == AgentBody.DryRouteSample.CLEAR && world.getBlockState(slot).isAir();
+        }
+
+        private boolean placeOnWall(int tick) {
+            if (tick - chosen > 21) return finishLight("cave sector light refused: wall contact was not revalidated");
+            status = "placing one torch on the witnessed side wall; keeping the dry return reserve";
+            BlockHitResult hit = observe(aim);
+            if (!matches(support, hit) || !solid(state(hit)) || !usefulWall(hit)) {
+                body.aim(aim);
+                return true;
+            }
+            body.aimContact(hit, AgentBody.Contact.PRECISE);
+            if (!hands.equipForUse(TORCH)) return true;
+            stock = hands.count(TORCH);
+            if (stock <= LIGHT_RESERVE) return finishLight("cave sector light refused: keeping return torch reserve");
+            priorLight = body.observedFaceLight(hit);
+            if (body.useContact(hit, AgentBody.Contact.PRECISE)) {
+                lightFootprints.add(footprint);
+                issued = tick;
+                status = "cave sector torch use issued; waiting for item and world light receipts";
+            }
+            return true;
+        }
+
+        private boolean confirm(int tick) {
+            status = "checking actual torch consumption and new side-wall light";
+            if (tick - issued > 14) return finishLight("cave sector light unconfirmed: no matching torch and brighter wall");
+            body.aim(aim);
+            if (hands.count(TORCH) != stock - 1) return true;
+            Direction side = support.getSide();
+            BlockHitResult torch = observe(offset(Vec3d.ofCenter(footprint, 0.54), side, -0.27));
+            if (torch == null || !torch.getBlockPos().equals(footprint) || !state(torch).isOf(Blocks.WALL_TORCH))
+                torch = observe(offset(Vec3d.ofCenter(footprint, 0.39), side, -0.35));
+            if (torch == null || !torch.getBlockPos().equals(footprint) || !state(torch).isOf(Blocks.WALL_TORCH))
+                return true;
+            BlockHitResult lit = terrain(aim);
+            if (!matches(support, lit) || body.observedFaceLight(lit) <= priorLight) return true;
+            lightReceipt = footprint;
+            if (active() && source.equals(stance)) {
+                opening = sector;
+                resetLocalSurvey();
+                checkingLitDescent = true;
+                // The old refusal described a darker view. Only a fresh reobservation
+                // may now lead to the old dry shelf, cliff, water or branch-return work.
+            }
+            dryRoute.lightChanged(source, sector);
+            return finishLight("cave sector torch confirmed; reobserving the " + sector + " descent from dry footing");
+        }
+
+        private boolean finishLight(String reason) {
+            sectorLight = null;
+            status = reason;
+            return true; // Publish this one result before ordinary surveying/retreat resumes.
+        }
     }
 
     private boolean place(int tick) {
@@ -1025,13 +1094,12 @@ final class AgentCaves {
         this.phase = phase;
         phaseSince = tick;
         lastAction = 0;
-        Arrays.fill(dimFloors, null);
         Arrays.fill(proof, 0);
         if (phase == Phase.PLACE) face = null;
     }
 
     private boolean finish(int tick, String reason) {
-        torchTarget = null;
+        sectorLight = null;
         status = reason;
         quietLips[quietCursor] = origin;
         quietUntil[quietCursor] = tick + 420;

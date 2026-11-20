@@ -201,20 +201,26 @@ final class MiningStockProof {
     }
 
     @Test
-    void aSurfaceWindowNeverCutsItsStanceOrTurnsIntoADescent() {
+    void adjacentCapAndFurtherStairCutsNeverRemoveTheStandingOrReturnSupport() {
         var foot = new BlockPos(0, 72, 0);
         var cap = foot.down().east();
-        require(AgentMacroControl.prospectBearing(foot, foot.down(), Direction.UP, null, null, null) == null
-                && AgentMacroControl.prospectBearing(foot, foot.east().up(), Direction.WEST, null, null, null) == null,
+        require(AgentMacroControl.prospectBearing(foot, foot.down(), Direction.UP) == null
+                && AgentMacroControl.prospectBearing(foot, foot.east().up(), Direction.WEST) == null
+                && AgentMacroControl.prospectBearing(foot, foot.east().north().down(), Direction.UP) == null,
             "the player cannot cut underfoot or remove its headroom");
-        var bearing = AgentMacroControl.prospectBearing(foot, cap, Direction.UP, null, null, null);
-        require(bearing == Direction.EAST
-                && AgentMacroControl.prospectBearing(foot, cap.east(), Direction.WEST, foot, cap, bearing) == Direction.EAST,
-            "the second cut is a newly exposed side on the same shallow bearing");
-        require(AgentMacroControl.prospectBearing(foot, cap.down(), Direction.UP, foot, cap, bearing) == null
-                && AgentMacroControl.prospectBearing(foot, cap.north(), Direction.SOUTH, foot, cap, bearing) == null
-                && AgentMacroControl.prospectBearing(foot.east(), cap.east(), Direction.WEST, foot, cap, bearing) == null,
-            "the window cannot grow downward, around a corner, or from inside the cut");
+        var bearing = AgentMacroControl.prospectBearing(foot, cap, Direction.UP);
+        require(bearing == Direction.EAST && AgentSurfaceTread.nextFoot(foot, bearing).equals(cap),
+            "a witnessed adjacent cap proposes a one-block descent on that same bearing");
+        var next = cap.east().down();
+        require(AgentSurfaceTread.plannedCell(cap, next.up(), bearing, Direction.WEST)
+                && AgentSurfaceTread.plannedCell(cap, next, bearing, Direction.UP),
+            "after landing, only the exact adjacent lower cell and its occluding face can be cleared");
+        require(!AgentSurfaceTread.plannedCell(cap, cap.down(), bearing, Direction.UP)
+                && !AgentSurfaceTread.plannedCell(cap, foot.down(), bearing, Direction.UP)
+                && !AgentSurfaceTread.plannedCell(cap, next.down(), bearing, Direction.UP)
+                && !AgentSurfaceTread.plannedCell(cap, next, bearing, Direction.WEST)
+                && !AgentSurfaceTread.plannedCell(cap, next.north(), bearing, Direction.UP),
+            "the route cannot cut a retained support, deepen its landing, or turn into another column");
     }
 
     private static void require(boolean condition, String message) {

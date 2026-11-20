@@ -244,6 +244,22 @@ final class AgentRouteGraph {
         return offset >= 0 && offset < segmentSize() ? cells[segment[cursor + offset]] : NO_CELL;
     }
 
+    /** A direct grant can change height only on its first, separately revalidated edge. */
+    int directPrefixSize(long source, int maximum) {
+        int size = Math.min(segmentSize(), maximum);
+        if (size <= 0 || lastStance != find(source)) return 0;
+        int count = 0;
+        long from = source;
+        while (count < size) {
+            long to = segmentCell(count);
+            if (!canReturn(from) || !canReturn(to) || !usable(from, to) || !usable(to, from)) break;
+            if (y(from) != y(to)) return count == 0 ? 1 : count;
+            ++count;
+            from = to;
+        }
+        return count;
+    }
+
     long endpoint() {
         return status == Status.MOVE || status == Status.FRONTIER || status == Status.GOAL ? cells[target] : NO_CELL;
     }

@@ -10,6 +10,7 @@ public final class DryRouteGraphProof {
     public static void main(String[] args) {
         routesUpAndAwayToTheDeeperPerspective();
         distinguishesAnUntestedReverseFromARetiredReturn();
+        directGrantsIsolateAHeightChangeAndRequireAPairedEdge();
         keepsAWitnessedAlternativeAroundACut();
         neverJoinsDisconnectedWalksByProximity();
         scansAVisualFrontierOnlyOncePerProof();
@@ -76,6 +77,38 @@ public final class DryRouteGraphProof {
         require(graph.plan(shelf) == STRANDED && graph.returnNext(shelf) == NO_CELL, "a blocked cut removes return proof");
         require(graph.reopen(shelf, start, OBSTRUCTION), "matching fresh evidence reopens the return");
         require(graph.plan(shelf) == FRONTIER && graph.returnNext(shelf) == start, "return proof is restored");
+    }
+
+    private static void directGrantsIsolateAHeightChangeAndRequireAPairedEdge() {
+        var graph = new AgentRouteGraph();
+        long start = cell(0, 10, 0), shelf = cell(1, 9, 0), tread = cell(2, 9, 0);
+        long rise = cell(3, 10, 0), endpoint = cell(4, 10, 0);
+        graph.reset(start);
+        observedBothWays(graph, start, shelf);
+        observedBothWays(graph, shelf, tread);
+        observedBothWays(graph, tread, rise);
+        observedBothWays(graph, rise, endpoint);
+        graph.goal(endpoint, 100);
+
+        require(graph.plan(start) == MOVE && graph.segmentSize() == 4 && graph.directPrefixSize(start, 8) == 1,
+            "the direct drop stops on the first lower tread, not the intended far endpoint");
+        require(graph.directPrefixSize(shelf, 8) == 0 && graph.directPrefixSize(start, 0) == 0,
+            "a different live source or a zero allowance cannot reuse the grant");
+        require(graph.plan(shelf) == MOVE && graph.directPrefixSize(shelf, 8) == 1,
+            "the level prefix stops before a later, not yet directly observed ascent");
+        require(graph.plan(tread) == MOVE && graph.segmentSize() == 2 && graph.directPrefixSize(tread, 8) == 1,
+            "a first ascent likewise has exactly one edge");
+        require(graph.plan(rise) == MOVE && graph.directPrefixSize(rise, 8) == 1, "the level suffix remains usable");
+
+        // An alternate route home does not certify the reverse of the granted lower edge.
+        long homewardShelf = cell(1, 9, 1), homewardRise = cell(0, 10, 1);
+        graph.walked(shelf, homewardShelf);
+        graph.walked(homewardShelf, homewardRise);
+        graph.walked(homewardRise, start);
+        graph.retire(shelf, start, OBSTRUCTION);
+        require(graph.plan(start) == MOVE && graph.next() == shelf && graph.canReturn(shelf)
+                && graph.directPrefixSize(start, 8) == 0,
+            "ordinary connectivity through a detour is weaker than independently proving return across this direct edge");
     }
 
     private static void keepsAWitnessedAlternativeAroundACut() {

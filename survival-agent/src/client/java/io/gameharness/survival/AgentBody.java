@@ -574,8 +574,11 @@ final class AgentBody {
             double ahead = -Math.sin(yaw) * dx + Math.cos(yaw) * dz;
             double right = -Math.cos(yaw) * dx - Math.sin(yaw) * dz;
             advance = retreat = jump = sprintRequested = false;
-            crouch = true;
-            if (distance > 0.08 && distance < 0.82 &&
+            boolean adjust = distance > 0.08 && distance < 0.82 && (Math.abs(ahead) > 0.06 || Math.abs(right) > 0.06);
+            // Slow the adjustment, not the settled stance. Holding sneak after
+            // reaching the center would prevent callers from confirming standing room.
+            crouch |= adjust || player.getVelocity().horizontalLengthSquared() > 0.0016;
+            if (adjust &&
                 hazards.lavaRisk(player.getBoundingBox(), heading(dx, dz), distance + 0.12, 0, false, tick) == 0) {
                 advance = ahead > 0.06;
                 retreat = ahead < -0.06;
@@ -1519,6 +1522,39 @@ final class AgentBody {
         return dryRouteVeto(from, to) == DryRouteVeto.CLEAR;
     }
 
+    enum FootholdSpace { EMPTY, VIEW, DARK, OCCLUDED, OCCUPIED, FLUID }
+
+    /** Verify this exact adjacent build cell through a lit, unobstructed first-person ray. */
+    FootholdSpace footholdSpace(Vec3d point) {
+        if (!hasView() || raysLeft <= 0 || !inView(point)) return FootholdSpace.VIEW;
+        raysLeft--;
+        BlockHitResult hit = raycast(point, Ray.FLUIDS);
+        BlockPos cell = BlockPos.ofFloored(point);
+        if (hit.getType() != HitResult.Type.MISS) {
+            if (!inView(hit.getPos())) return FootholdSpace.VIEW;
+            if (!litFace(hit)) return FootholdSpace.DARK;
+            if (!hit.getBlockPos().equals(cell)) return FootholdSpace.OCCLUDED;
+            return client.world.getBlockState(hit.getBlockPos()).getFluidState().isEmpty()
+                ? FootholdSpace.OCCUPIED : FootholdSpace.FLUID;
+        }
+        if (!lit(point.x, point.y, point.z)) return FootholdSpace.DARK;
+        BlockState material = client.world.getBlockState(cell);
+        return !material.getFluidState().isEmpty() ? FootholdSpace.FLUID
+            : material.isAir() ? FootholdSpace.EMPTY : FootholdSpace.OCCUPIED;
+    }
+
+    /** One already-witnessed neighbor: contact must stay on the attaching face as the view settles. */
+    boolean placeFoothold(BlockHitResult anchor, BlockPos destination, Preparation preparation) {
+        if (!hasView() || anchor.getSide() == Direction.DOWN
+                || !anchor.getBlockPos().offset(anchor.getSide()).equals(destination)
+                || client.player.getBoundingBox().intersects(new Box(destination))
+                || !sameBlockFace(anchor, contactRay(anchor.getPos(), client.player.getBlockInteractionRange()))) return false;
+        var material = client.world.getBlockState(anchor.getBlockPos());
+        if (!stableDryRouteTop(anchor.getBlockPos(), material) || material.hasBlockEntity()
+                || material.isOf(Blocks.CRAFTING_TABLE) || material.isOf(Blocks.FURNACE)) return false;
+        return useContact(anchor, Contact.PRECISE, preparation);
+    }
+
     /** A collision veto for precisely one already admitted cardinal lane, never a source of map evidence. */
     DryRouteVeto dryRouteVeto(BlockPos from, BlockPos to) {
         if (!hasView()) return DryRouteVeto.VIEW;
@@ -1592,11 +1628,18 @@ final class AgentBody {
 
     /** A visible drop can veto walking. An unseen item is not evidence either way. */
     boolean macroNoVisiblePickup(Vec3d landing) {
+        return macroNoVisiblePickup(landing, landing.y, landing.y);
+    }
+
+    /** Apply the same visible-drop veto along the bounded vertical sweep as well. */
+    boolean macroNoVisiblePickup(Vec3d landing, double minimumFeetY, double maximumFeetY) {
         if (!hasView() || raysLeft <= 0) return false;
         var player = client.player;
         // The vanilla on-foot pickup envelope is 1 / 0.5 / 1 around the body.
         // Reserve an extra quarter-block for braking or a drifting drop.
         Box sweep = player.getBoundingBox().stretch(landing.x - player.getX(), 0, landing.z - player.getZ())
+            .stretch(0, Math.min(0, minimumFeetY - player.getY()), 0)
+            .stretch(0, Math.max(0, maximumFeetY - player.getY()), 0)
             .expand(1.25, 0.5, 1.25);
         for (ItemEntity item : client.world.getEntitiesByClass(ItemEntity.class, sweep,
                 candidate -> candidate.isAlive() && !candidate.isInvisibleTo(player))) {

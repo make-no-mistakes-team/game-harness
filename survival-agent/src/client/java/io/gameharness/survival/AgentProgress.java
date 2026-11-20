@@ -82,6 +82,7 @@ final class AgentProgress {
     private static final Predicate<ItemStack> DIAMOND_PICK = item(Items.DIAMOND_PICKAXE);
     private static final Predicate<ItemStack> WATER_BUCKET = item(Items.WATER_BUCKET);
     private static final Predicate<ItemStack> PORTAL_BUCKET = s -> s.isOf(Items.BUCKET) || WATER_BUCKET.test(s);
+    private static final Predicate<ItemStack> COBBLE_FOOTHOLD = item(Items.COBBLESTONE);
     private static final Predicate<ItemStack> IGNITER = item(Items.FLINT_AND_STEEL);
     private static final Predicate<ItemStack> FLINT = item(Items.FLINT);
     private static final Predicate<ItemStack> GRAVEL = item(Items.GRAVEL);
@@ -589,11 +590,18 @@ final class AgentProgress {
     ReturnableDrop returnableDrop() { return returnableDrop; }
     AgentFall fall() { return fall; }
     AgentDryCaveRoute.Offer dryRouteOffer() { return caves.dryRouteOffer(); }
+    AgentDryCaveRoute.Survey drySurveyOffer() { return caves.drySurveyOffer(); }
+    boolean drySurveyCurrent(AgentDryCaveRoute.Survey offer) { return caves.drySurveyCurrent(offer); }
+    AgentDryCaveRoute.SurveyResult surveyDryRoute(AgentDryCaveRoute.Survey offer) { return caves.surveyDryRoute(offer); }
+    String drySurveyResult(AgentDryCaveRoute.Survey offer) { return caves.drySurveyResult(offer); }
+    void cancelDrySurvey(AgentDryCaveRoute.Survey offer) { caves.cancelDrySurvey(offer); }
+    String dryRouteOfferEvidence() { return caves.dryRouteOfferEvidence(); }
     AgentDryCaveRoute.DirectResult followDryRoute(AgentDryCaveRoute.Offer offer) {
         return caves.followDryRoute(offer, tick);
     }
     String dryRouteReason() { return caves.dryRouteReason(); }
     void cancelFollowDryRoute(AgentDryCaveRoute.Offer offer) { caves.cancelFollowDryRoute(offer); }
+    boolean dryRouteInFlight(AgentDryCaveRoute.Offer offer) { return caves.dryRouteInFlight(offer); }
 
     private void recordDryCaveFooting(BlockPos from, BlockPos to) {
         int prior = trail.lastIndexOf(from);
@@ -702,6 +710,8 @@ final class AgentProgress {
         stallGuard.observe(tick, confirmedFrameBlocks(), mealsEaten, status,
             returnableMine.hasProgressLease() || supplyEgress.active());
         advance(ears, macro);
+        BlockPos newCaveLight = caves.takeLightReceipt();
+        if (newCaveLight != null) stallGuard.stairLightReceipt(newCaveLight);
         returnableMine.interruptIfSkipped();
         if (returnableMine.active() || caves.routingDry()) stallGuard.navigationWork();
         String portalBlock = portal == null ? null : portal.takeLocalStop();
@@ -736,7 +746,7 @@ final class AgentProgress {
         if ((hurt || escaping) && dropReclaim != null) dropReclaim.cancel();
         if (escaping) {
             if (macroEngaged) macro.urgent(status);
-            caves.interruptLight(tick);
+            caves.interruptLight();
             stallGuard.priorityAim();
             return;
         }
@@ -750,7 +760,7 @@ final class AgentProgress {
         int priorLandings = fall.waterSuccesses() + fall.boatSuccesses();
         if (fall.step(safetySpend)) {
             if (dropReclaim != null) dropReclaim.cancel();
-            caves.interruptLight(tick);
+            caves.interruptLight();
             defense.stopZombieLook();
             body.prioritizeMovement();
             stallGuard.priorityAim();
@@ -770,7 +780,7 @@ final class AgentProgress {
             if (macroEngaged) macro.urgent("responding to a nearby ranged threat");
             interruptHands();
             if (dropReclaim != null) dropReclaim.cancel();
-            caves.interruptLight(tick);
+            caves.interruptLight();
             if (defense.rangedStep(tick, protectedHeadroom, safetySpend))
                 step(forward(defense.rangedRetreatYaw()), false, false);
             if (macroEngaged && defense.confirmedCover()) macro.safetyEffect(defense.status());
@@ -801,7 +811,7 @@ final class AgentProgress {
             return;
         }
         if (eatOrHunt()) {
-            caves.interruptLight(tick);
+            caves.interruptLight();
             defense.stopZombieLook();
             stallGuard.priorityAim();
             return;
@@ -3575,23 +3585,28 @@ final class AgentProgress {
 
     /** The supply caller retains its job until outside, at reachable wood, or at a physical refusal. */
     private final class SupplyEgress {
-        private enum Proof { OPENING, LIP, CROWN, HEAD, FOOT, LANDING }
+        private enum Proof {
+            OPENING, LIP, CROWN, HEAD, FOOT, REVERSE_CROWN, LANDING,
+            FOOTHOLD_SPACE, FOOTHOLD_ANCHOR, FOOTHOLD_RECEIPT
+        }
 
         private static final int JOB_TICKS = 4800, LOOK_TICKS = 35, CUT_TICKS = 70;
         private static final int MAX_RISE = 48, MAX_LEVEL = 2, MAX_CUTS = 96, MAX_LANE_CUTS = 3;
+        private static final int MAX_CONNECTORS = 2, MAX_FOOTHOLDS = 2, FOOTHOLD_RESERVE = 8, ANCHOR_TICKS = 24;
         private static final float SURVEY_PITCH = -42;
         private final List<BlockPos> walked = new ArrayList<>();
         private final Predicate<BlockHitResult> reachableWood = this::reachableWood;
         private BlockPos openFoot, unknownFoot, from, to, armedCut, packedBench;
-        private Vec3d floor, alternateFloor, aim;
+        private Vec3d floor, alternateFloor, aim, buildLow, buildHigh, reverseLeft, reverseRight;
         private Direction bearing, lane;
         private Proof proof;
         private String supplies, surveyActivity, crossingActivity, blocked, firstRefusal, lastRefusal;
         private int deadline, since, view, views, openViews, roofViews, wallViews;
-        private int choice, driving, back, backEnd, rises, levels, cuts, laneCuts;
-        private int benchBefore, benchCollectUntil;
+        private int choice, flatBearings, driving, back, backEnd, rises, levels, cuts, laneCuts;
+        private int benchBefore, benchCollectUntil, connectors, builds, buildBefore, anchorChoice;
         private long revealedFrame;
         private boolean returning, walkedReturn, enclosed, surveying, sourceProved, lighting, triedLight, triedCraftLight;
+        private boolean triedLower, built;
 
         boolean active() { return from != null; }
 
@@ -3636,7 +3651,7 @@ final class AgentProgress {
             blocked = firstRefusal = lastRefusal = null;
             armedCut = packedBench = null;
             revealedFrame = -1;
-            rises = levels = cuts = 0;
+            rises = levels = cuts = connectors = builds = 0;
             sourceProved = walkedReturn = lighting = triedLight = triedCraftLight = false;
             returning = findReturn();
             enclosed = returning && trail.get(backEnd).getY() >= from.getY() + 2;
@@ -3708,7 +3723,14 @@ final class AgentProgress {
             if (body.hazardAhead(lane.getPositiveHorizontalDegrees(), 1.5))
                 return refuse("visible lava near the selected crossing");
             if (revealedFrame == body.renderedFrame()) return true;
-            return proof == Proof.LIP || proof == Proof.LANDING ? proveTop() : clearance();
+            return switch (proof) {
+                case LIP, LANDING -> proveTop();
+                case REVERSE_CROWN -> proveReverseCrown();
+                case FOOTHOLD_SPACE -> proveBuildSpace();
+                case FOOTHOLD_ANCHOR -> attachFoothold();
+                case FOOTHOLD_RECEIPT -> confirmFoothold();
+                default -> clearance();
+            };
         }
 
         private boolean tryLight() {
@@ -3787,7 +3809,7 @@ final class AgentProgress {
                 return true;
             }
             surveying = false;
-            choice = 0;
+            choice = flatBearings = 0;
             since = tick;
             enclosed |= wallsAndRoof;
             if (openViews != 0) bearing = option(Integer.numberOfTrailingZeros(openViews));
@@ -3820,6 +3842,7 @@ final class AgentProgress {
 
         private boolean choose() {
             laneCuts = 0;
+            triedLower = built = false;
             if (returning) {
                 to = trail.get(back - 1);
                 lane = directional(Vec3d.ofBottomCenter(to).subtract(Vec3d.ofBottomCenter(from)));
@@ -3831,8 +3854,11 @@ final class AgentProgress {
                 int limit = levels < MAX_LEVEL ? 8 : 4;
                 while (choice < limit) {
                     lane = option(choice);
-                    BlockPos candidate = from.offset(lane).up(choice++ < 4 ? 1 : 0);
+                    boolean flat = choice++ >= 4;
+                    if (flat && (flatBearings & 1 << lane.ordinal()) != 0) continue;
+                    BlockPos candidate = from.offset(lane).up(flat ? 0 : 1);
                     if (!walked.contains(candidate)) {
+                        if (flat) flatBearings |= 1 << lane.ordinal();
                         to = candidate;
                         break;
                     }
@@ -3883,32 +3909,172 @@ final class AgentProgress {
                         return true;
                     }
                     var veto = body.dryRouteVeto(from, to);
-                    if (veto != AgentBody.DryRouteVeto.CLEAR) return refuse(vetoReason(veto));
+                    if (veto != AgentBody.DryRouteVeto.CLEAR) {
+                        if ((veto == AgentBody.DryRouteVeto.SWEEP || veto == AgentBody.DryRouteVeto.SUPPORT)
+                                && tryFootholdAfterLower()) return true;
+                        return refuse(vetoReason(veto));
+                    }
                     driving = tick;
                     return drive();
                 }
                 case FLUID -> { return refuse("fluid covers the observed supporting top at " + support.toShortString()); }
                 case NO_FULL_TOP -> {
+                    if (!body.renderedAim(floor, 10) && tick - since < LOOK_TICKS) return true;
                     // The missed lip can be an ordinary flat stretch. Do not cut
                     // whichever block might have been underneath that empty lip.
                     BlockPos flat = to.down();
                     if (risingLip && !returning && levels < MAX_LEVEL && !walked.contains(flat)
                             && body.renderedAim(floor, 10) && body.clearTerrain(floor)) {
+                        flatBearings |= 1 << lane.ordinal();
                         to = flat;
                         setCrossing();
                         phase(Proof.FOOT);
                         return true;
                     }
+                    if (!risingLip && !returning && !built && to.getY() == from.getY()
+                            && body.renderedAim(floor, 10) && body.clearTerrain(floor)) {
+                        if (!triedLower && connectors < MAX_CONNECTORS) {
+                            BlockPos lower = to.down();
+                            if (!walked.contains(lower)) {
+                                triedLower = true;
+                                to = lower;
+                                setCrossing();
+                                phase(Proof.HEAD);
+                                return true;
+                            }
+                        }
+                        return beginFoothold();
+                    }
+                    if (tryFootholdAfterLower()) return true;
                     return refuse("no confirmed stable full top at " + support.toShortString());
                 }
                 case DARK -> {
-                    if (body.renderedAim(floor, 8) && !tryLight())
+                    if (body.renderedAim(floor, 8)) {
+                        if (tryLight()) return true;
+                        if (tryFootholdAfterLower()) return true;
                         return refuse("not enough visible light to identify the supporting top at " + support.toShortString());
+                    }
                 }
                 default -> { }
             }
-            return tick - since < LOOK_TICKS || refuse("supporting top still occluded after opening the side face at "
-                + support.toShortString());
+            return tick - since < LOOK_TICKS || tryFootholdAfterLower()
+                || refuse("supporting top still occluded after opening the side face at " + support.toShortString());
+        }
+
+        private boolean tryFootholdAfterLower() {
+            if (!triedLower || returning || to.getY() >= from.getY()) return false;
+            to = to.up();
+            setCrossing();
+            return beginFoothold();
+        }
+
+        private boolean beginFoothold() {
+            if (builds >= MAX_FOOTHOLDS || hands.count(COBBLE_FOOTHOLD) <= FOOTHOLD_RESERVE)
+                return refuse("no stable landing and no spare foothold block within the placement limit");
+            if (walked.contains(to) || protectRecoveryBlock(to.down()) || !offWorkshopPassage(to.down()))
+                return refuse("no stable landing and the proposed foothold would occupy protected footing");
+            Vec3d center = Vec3d.ofCenter(to.down());
+            buildLow = center.add(lane.getOffsetX() * 0.16, -0.20, lane.getOffsetZ() * 0.16);
+            buildHigh = center.add(-lane.getOffsetX() * 0.16, 0.31, -lane.getOffsetZ() * 0.16);
+            phase(Proof.FOOTHOLD_SPACE);
+            return true;
+        }
+
+        private boolean proveBuildSpace() {
+            body.aim(buildLow);
+            status = "supply egress: checking the empty cell for one attached foothold";
+            var low = body.footholdSpace(buildLow);
+            var high = body.footholdSpace(buildHigh);
+            if (low == AgentBody.FootholdSpace.EMPTY && high == AgentBody.FootholdSpace.EMPTY) {
+                anchorChoice = 0;
+                phase(Proof.FOOTHOLD_ANCHOR);
+                return true;
+            }
+            if (low == AgentBody.FootholdSpace.OCCUPIED || high == AgentBody.FootholdSpace.OCCUPIED
+                    || low == AgentBody.FootholdSpace.FLUID || high == AgentBody.FootholdSpace.FLUID)
+                return refuse("the foothold cell is occupied by material or fluid; will not replace it");
+            if (tick - since >= LOOK_TICKS)
+                return refuse("no lit unobstructed view of the empty foothold cell");
+            return true;
+        }
+
+        private boolean attachFoothold() {
+            if (anchorChoice >= 4) return refuse("no visible stable side or top face can attach the foothold");
+            if (c.player.getVelocity().horizontalLengthSquared() > 0.0025) return true;
+            BlockPos destination = to.down();
+            Direction offset = switch (anchorChoice) {
+                case 0 -> lane;
+                case 1 -> lane.rotateYClockwise();
+                case 2 -> lane.rotateYCounterclockwise();
+                default -> Direction.DOWN;
+            };
+            BlockPos anchor = destination.offset(offset);
+            if (aim == null) aim = offset == Direction.DOWN
+                ? Vec3d.ofCenter(anchor, 0.96).add(lane.getOffsetX() * 0.30, 0, lane.getOffsetZ() * 0.30)
+                : Vec3d.ofCenter(anchor, 0.77).add(-offset.getOffsetX() * 0.46, 0, -offset.getOffsetZ() * 0.46);
+            body.aim(aim);
+            status = "supply egress: looking for a reachable attaching face beside the empty cell";
+            BlockHitResult hit = perceive(aim, c.player.getEyePos().distanceTo(aim) + 0.10);
+            if (hit != null && hit.getBlockPos().equals(anchor) && hit.getSide() == offset.getOpposite()) {
+                // Recheck the cell while aiming at the actual support; a past air sample cannot
+                // authorize a replacement if a fluid or block has since appeared.
+                var near = body.footholdSpace(buildHigh);
+                var far = body.footholdSpace(buildLow);
+                if (near == AgentBody.FootholdSpace.OCCUPIED || far == AgentBody.FootholdSpace.OCCUPIED
+                        || near == AgentBody.FootholdSpace.FLUID || far == AgentBody.FootholdSpace.FLUID)
+                    return refuse("the empty foothold cell changed before placement");
+                if (near == AgentBody.FootholdSpace.EMPTY && far == AgentBody.FootholdSpace.EMPTY
+                        && safeSupport(hit) && !protectRecoveryBlock(destination)) {
+                    int count = hands.count(COBBLE_FOOTHOLD);
+                    if (count <= FOOTHOLD_RESERVE) return refuse("not spending the remaining foothold reserve");
+                    if (body.placeFoothold(hit, destination,
+                            AgentBody.Preparation.equipment(hands.equipForUse(COBBLE_FOOTHOLD)))) {
+                        builds++; // At most two issued use edges; a refused placement is not retried.
+                        buildBefore = count;
+                        revealedFrame = body.renderedFrame();
+                        phase(Proof.FOOTHOLD_RECEIPT);
+                        return true;
+                    }
+                }
+            }
+            if (tick - since >= ANCHOR_TICKS) {
+                anchorChoice++;
+                aim = null;
+                since = tick;
+            }
+            return true;
+        }
+
+        private boolean confirmFoothold() {
+            body.aim(floor);
+            status = "supply egress: verifying the attached foothold and inventory debit";
+            BlockPos destination = to.down();
+            BlockHitResult top = body.dryRouteFloor(floor, destination);
+            if (top == null) top = body.dryRouteFloor(alternateFloor, destination);
+            if (top != null && state(top).isOf(Blocks.COBBLESTONE) && hands.count(COBBLE_FOOTHOLD) == buildBefore - 1) {
+                built = true;
+                phase(Proof.HEAD);
+                status = "supply egress: confirmed one attached cobblestone foothold at " + destination.toShortString();
+                return true;
+            }
+            return tick - since < LOOK_TICKS || refuse("no witnessed cobblestone top and one-block debit after placement");
+        }
+
+        private boolean proveReverseCrown() {
+            if (aim == null) {
+                aim = Vec3d.ofBottomCenter(to).add(-lane.getOffsetX() * 0.26, 2.86, -lane.getOffsetZ() * 0.26);
+                reverseLeft = aim.add(lane.getOffsetZ() * 0.33, 0, -lane.getOffsetX() * 0.33);
+                reverseRight = aim.add(-lane.getOffsetZ() * 0.33, 0, lane.getOffsetX() * 0.33);
+            }
+            body.aim(aim);
+            status = "supply egress: checking the lower step's reverse jump clearance";
+            if (body.dryRouteClear(reverseLeft) == AgentBody.DryRouteSample.CLEAR
+                    && body.dryRouteClear(reverseRight) == AgentBody.DryRouteSample.CLEAR) {
+                phase(Proof.LANDING);
+                return true;
+            }
+            return tick - since < ANCHOR_TICKS || tryFootholdAfterLower()
+                || refuse("no witnessed full-width reverse jump from the lower step");
         }
 
         private boolean clearance() {
@@ -3941,16 +4107,18 @@ final class AgentProgress {
                     phase(switch (proof) {
                         case OPENING -> rise > 0 ? Proof.LIP : rise < 0 ? Proof.HEAD : Proof.FOOT;
                         case CROWN -> Proof.HEAD;
-                        case HEAD -> rise < 0 ? Proof.FOOT : Proof.LANDING;
-                        case FOOT -> Proof.LANDING;
+                        case HEAD -> rise <= 0 ? Proof.FOOT : Proof.LANDING;
+                        case FOOT -> rise < 0 ? Proof.REVERSE_CROWN : Proof.LANDING;
                         default -> throw new IllegalStateException("Not a clearance proof: " + proof);
                     });
                     return true;
                 }
                 case FLUID -> { return refuse("fluid in " + area() + " at " + cell.toShortString()); }
                 case DARK -> {
-                    if (body.renderedAim(aim, 8) && !tryLight())
+                    if (body.renderedAim(aim, 8) && !tryLight()) {
+                        if (tryFootholdAfterLower()) return true;
                         return refuse("not enough visible light to identify " + area() + " at " + cell.toShortString());
+                    }
                     return true;
                 }
                 default -> { }
@@ -3959,9 +4127,12 @@ final class AgentProgress {
             if (hit == null || !hit.getBlockPos().equals(cell)) {
                 if (armedCut != null && body.continueMine(armedCut)) return true;
                 if (tick - since < LOOK_TICKS) return true;
+                if (tryFootholdAfterLower()) return true;
                 return refuse(hit == null ? "could not witness " + area() + " at " + cell.toShortString()
                     : "occluded " + area() + " behind " + hit.getBlockPos().toShortString());
             }
+            if (triedLower && !returning && rise < 0) return tryFootholdAfterLower();
+            if (built) return refuse("freshly placed foothold still lacks visible standing clearance");
             if (tick - since >= CUT_TICKS) return refuse("no confirmed break in " + area() + " at " + cell.toShortString());
             return cutFace(cell, hit);
         }
@@ -4038,7 +4209,8 @@ final class AgentProgress {
                     status = "supply egress rise " + rises + ": " + old.toShortString()
                         + " -> " + from.toShortString() + " (settled; return connected)";
                 } else {
-                    if (!returning) levels++;
+                    if (!returning && from.getY() < old.getY()) connectors++;
+                    else if (!returning) levels++;
                     status = "supply egress: settled connected footing at " + from.toShortString();
                 }
                 walkedReturn |= returning;

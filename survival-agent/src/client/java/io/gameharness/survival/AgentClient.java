@@ -85,6 +85,7 @@ public final class AgentClient implements ClientModInitializer {
     private String lastStatus = "";
     private String lastHands = "";
     private String lastOwner = "deterministic";
+    private boolean lastTouchingWater;
     private String lastPlanningState = "";
     private String lastPlanningEvidence = "";
     private long lastPurposefulTick;
@@ -922,8 +923,9 @@ public final class AgentClient implements ClientModInitializer {
             recordHorizon(body.visibleHorizon().takeDriveEvidence());
         }
         JsonObject surveyTransition = macro == null ? null : macro.takeSurveyTransition(tick);
+        boolean touchingWater = player != null && player.isTouchingWater();
         boolean changed = screenChanged || ownerChanged || planningChanged || newReturnableDrop || !status.equals(lastStatus)
-            || !handStatus.equals(lastHands) || stall.eventSequence() != stallSequence;
+            || !handStatus.equals(lastHands) || stall.eventSequence() != stallSequence || touchingWater != lastTouchingWater;
         if (changed || surveyTransition != null || boundary || tick % 20 == 0 || ended || tick == 1) {
             JsonObject event = new JsonObject();
             event.addProperty("tick", tick);
@@ -961,6 +963,7 @@ public final class AgentClient implements ClientModInitializer {
                 event.addProperty("pitch", player.getPitch());
                 event.addProperty("sprinting", player.isSprinting());
                 event.addProperty("food", player.getHungerManager().getFoodLevel());
+                event.addProperty("touching_water", touchingWater);
                 if (macro != null) {
                     event.addProperty("macro_grounded", macro.grounded());
                     event.addProperty("macro_neutral", macro.neutral());
@@ -1041,6 +1044,7 @@ public final class AgentClient implements ClientModInitializer {
             lastStatus = status;
             lastHands = handStatus;
             lastOwner = owner;
+            lastTouchingWater = touchingWater;
             lastPlanningState = planningState;
             lastPlanningEvidence = planningEvidence;
             lastPurposefulTick = purposefulTick;

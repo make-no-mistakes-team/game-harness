@@ -11,6 +11,7 @@ import { nativeLaunchFailure } from "../src/server/native-launch-fault.ts";
 import { osMonotonicNs } from "../src/server/os-monotonic.ts";
 import { TerraActorCompatibilityError } from "../src/server/survival-agent-artifact.ts";
 import { composeTerraSurvival, declareTerraStrategy } from "../src/server/survival-macro/compose.ts";
+import type { MacroStatus } from "../src/server/survival-macro/controller.ts";
 import { descentFixtures, descentVariants, fixtureWorld, macroTrialWorld, provisionFixture, provisionMacroTrialWorld, terrainFixtures,
   terrainVariants, provisionUrgentThreatWorld, urgentThreatWorld, provisionUrgentCraftWorld, urgentCraftWorld,
   type DescentVariant, type TerrainVariant } from "./diagnostic-descent.ts";
@@ -131,7 +132,8 @@ SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SEC
 --replay-incident: replay an ordinary save in the diagnostic lane; never a fresh run.
 diagnose:pool: test casting a Nether portal in a separate, pre-provisioned diagnostic world.
 --diagnostic-descent: test a dry fall, a chosen boat descent, or connected cave shelves.
---diagnostic-terrain: test timber reach or headroom with an ordinary wooden pickaxe goal.
+--diagnostic-terrain: test timber reach, headroom, or a shallow-water approach.
+  wade-terra uses one live Terra request and a prepared diamond goal, without Survival benchmark credit.
 --diagnostic-urgent-creeper: test real Terra interruption in a prepared world, without Survival benchmark credit.
 --diagnostic-urgent-craft: test a creeper interrupting an actual crafting drag, without model or Survival benchmark credit.
 Diagnostics share one lane and cannot be continued as survival runs.
@@ -798,19 +800,23 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
   const actorJar = macroTrial ? macroTrialActor(macroTrial.ordinaryDir) : AGENT_JAR;
   const urgentCraft = diagnostic === "urgent-craft";
   const urgentDiagnostic = diagnostic === "urgent-creeper" || urgentCraft;
-  const terraDeclaration = macroOptions && (!diagnostic || urgentDiagnostic)
+  const wadeDiagnostic = diagnostic === "wade-terra";
+  const terraDeclaration = wadeDiagnostic ? declareTerraStrategy({
+    maxRequests: 1,
+    task: "Obtain one diamond with one finite stock work action on the visible diamond ore. Allow exactly one diamond-ore break and no crafting, placement, or prospecting.",
+  }, seconds * 1_000, { preparedDiagnostic: true, shallowWork: true }) :
+    macroOptions && (!diagnostic || urgentDiagnostic)
     ? declareTerraStrategy(macroOptions, seconds * 1_000, urgentDiagnostic ? { preparedDiagnostic: true } : undefined)
     : undefined;
   const { java, ffmpeg } = await verifyInputs(actorJar, terraDeclaration !== undefined);
   const runs = diagnostic ? DIAGNOSTIC_RUNS : RUNS;
   const liveFile = diagnostic ? DIAGNOSTIC_LIVE : LIVE;
-  const fixture = diagnostic === "water" || diagnostic === "boat" || diagnostic === "cave" ||
-    diagnostic === "birch" || diagnostic === "ceiling" ? diagnostic : undefined;
+  const terrain = terrainVariants.find(variant => variant === diagnostic);
+  const descent = descentVariants.find(variant => variant === diagnostic);
+  const fixture = terrain ?? descent;
   const provisioned = fixture !== undefined || diagnostic === "pool" || macroTrial !== undefined || urgentDiagnostic;
   const claimScope = macroTrial ? "prepared-skill-trial" : diagnostic === "incident-replay" ? "incident-replay" :
     provisioned ? "prepared-diagnostic" : parentRun ? "continuation-chain" : "fresh-attempt";
-  const terrain = diagnostic === "birch" || diagnostic === "ceiling" ? diagnostic : undefined;
-  const descent = diagnostic === "water" || diagnostic === "boat" || diagnostic === "cave" ? diagnostic : undefined;
   const descentMonitor = descent ? monitorDescent(descent) : null;
   const videoBytes = 32_000_000 + seconds * 600_000;
   const reserveBytes = videoBytes + 1_000_000_000;
@@ -893,6 +899,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     let lastPlanningSample: Progress | null = null;
     let claimProgress: PlayingProgress | null = null;
     let programWin: ProgramWin | null = null;
+    let wadeWork: NonNullable<MacroStatus["lastWorkOrder"]> | undefined;
     let goalClaim: { life: number; tick: number; wall_ms: number | null; deaths: number } | null = null;
     const statsDirectory = path.join(dir, "server/world/stats");
     let beforeStats: Awaited<ReturnType<typeof readSavedPlayerStats>> = null;
@@ -939,6 +946,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         ...(!macroTrial ? { pauseDiagnostics: PAUSE_DIAGNOSTICS } : {}),
         ...(benchmark ? { benchmark, strategy: terraDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
         ...(macroTrial ? { macroTrial: { ordinaryRun: path.basename(macroTrial.ordinaryDir), maximumIntents: 1 } } : {}),
+        ...(wadeDiagnostic ? { strategy: terraDeclaration } : {}),
         ...(urgentProbe ? { urgentThreat: urgentCraft ? urgentCraftDeclaration : urgentThreatDeclaration,
           strategy: terraDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
         inactivity: { unchangedMs: STALL_MS, noGoalMilestoneMs: GOAL_STALL_MS,
@@ -1209,6 +1217,19 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
             if (progress.won) throw new Stop("unverified", "The ordinary goal ended before proving the descent.");
           } else if (urgentProbe && progress.won) {
             throw new Stop("unverified", "The actor stopped at the Survival goal before the diagnostic closed.");
+          } else if (wadeDiagnostic) {
+            const status = macroAttempt?.outcome().status;
+            const work = status?.lastWorkOrder;
+            if (status && work?.requestId && work.accepted && work.terminal?.status === "completed" &&
+                work.terminal.life === ledger.life && progress.tick >= work.terminal.tick &&
+                status.issuedWorkOrders === 1 && status.completedModelWorkOrders === 1 && status.providerDispatches === 1 &&
+                retainsGoal(goal, progress)) {
+              wadeWork = work;
+              claimProgress = progress;
+              goalClaim = { life: ledger.life!, tick: progress.tick, wall_ms: progress.wall_ms ?? null, deaths: ledger.deaths };
+              await record("wade_stock_goal", { workOrderId: work.id, receiptTick: work.terminal.tick, ...goalClaim });
+              throw new Stop("won", "One native stock order completed and the player retained the diamond.");
+            }
           } else if (terraDeclaration?.workMode === "constrained") {
             const completed = macroAttempt?.outcome().status?.completedWorkProgram;
             if (completed) {
@@ -1384,9 +1405,12 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         ReturnType<typeof verifyTerrain>> | null = null;
       if (result.status === "won" && !serverSaved) {
         result = new Stop("server_exit", "The vanilla server did not stop cleanly after the goal.");
+      } else if (result.status === "won" && wadeDiagnostic &&
+          (client?.exit?.code !== 0 || client.exit.signal !== null)) {
+        result = new Stop("client_exit", "The client did not close cleanly after the shallow-water proof.");
       } else if (result.status === "won") {
         verification = descent ? await verifyDescent(dir, descent, descentSettlement) :
-          terrain ? await verifyTerrain(dir, terrain, claimProgress) :
+          terrain ? await verifyTerrain(dir, terrain, claimProgress, wadeWork) :
             await verifySurvival(statsDirectory, goal, claimProgress, diagnostic === "pool", beforeStats, programWin);
         const videoExists = await stat(video).then((entry) => entry.size > 0, () => false);
         if (!verification.verified) result = new Stop("unverified", verification.reason);
@@ -1422,7 +1446,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       }
       const benchmarkConfirmed = result.status === "won";
       if (benchmarkConfirmed && "outcome" in strategy && strategy.outcome !== "native_effect_completed")
-        result = new Stop("failed", "The vanilla benchmark was verified, but no Terra-issued effect was confirmed.");
+        result = new Stop("failed", "The vanilla goal was verified, but no Terra-issued effect was confirmed.");
       const outcome = {
         schemaVersion: 1, status: result.status, reason: result.message, goal, startedAt, world, claimScope, deathPolicy,
         finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - start),
@@ -1431,6 +1455,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         ...(operatorStop ? { operatorStop: { serverSaved: saveEvidence } } : {}),
         ...(pauseEvidence ? { pauseEvidence } : {}),
         ...(benchmark ? { benchmark: { ...benchmark, confirmed: benchmarkConfirmed }, strategy } : {}),
+        ...(wadeDiagnostic ? { strategy } : {}),
         ...(urgentThreat ? { urgentThreat, strategy } : {}),
         lifecycle: { ...life, receiptFile: LIFE_RECEIPTS, evidenceReadable: lifeEvidenceReadable,
           savedDeaths: recordedDeaths && { ...recordedDeaths, agreesWithObserved: recordedDeaths.attempt === ledger.deaths },

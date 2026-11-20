@@ -323,10 +323,18 @@ Use the same stream to watch an individual skill trial:
 | `bun run play:agent --diagnostic-descent cave 180` | Enter a lit chamber and follow its descending shelves. |
 | `bun run play:agent --diagnostic-terrain birch 180` | Leave an unreachable birch log and harvest a reachable tree. |
 | `bun run play:agent --diagnostic-terrain ceiling 180` | Deal with a low ceiling and reach the upper step. |
+| `bun run play:agent --diagnostic-terrain wade-terra 180` | Cross a prepared shallow channel and collect a real diamond through one live Terra stock order. |
 
 Only one diagnostic runs at a time. These trials prepare the terrain; the
 bucket and boat trials also supply the item. They do not test finding a cave
 or making a boat or bucket in a random world.
+
+The wade diagnostic uses the connected account for at most one live Terra
+request. It supplies an iron pickaxe, not the diamond. The verifier requires
+native horizon input, a grounded crossing with actual water contact to a
+new dry bank, then a diamond ore break and pickup corroborated by vanilla
+statistics after clean closure. The diagnostic does not exercise a deep-water
+refusal in-game and does not count as ordinary 1× Survival proof.
 
 The desktop survival form takes a preset game goal, not a free-form task.
 The separate model-driven GameHarness workflow is described below.

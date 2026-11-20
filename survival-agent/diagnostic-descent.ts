@@ -8,7 +8,7 @@ import type { SurvivalAgentGoal } from "../src/shared/survival-agent-ui.ts";
 
 export const descentVariants = ["water", "boat", "cave"] as const;
 export type DescentVariant = (typeof descentVariants)[number];
-export const terrainVariants = ["birch", "ceiling"] as const;
+export const terrainVariants = ["birch", "ceiling", "wade-terra"] as const;
 export type TerrainVariant = (typeof terrainVariants)[number];
 type FixtureVariant = DescentVariant | TerrainVariant;
 type Cell = readonly [number, number, number];
@@ -77,6 +77,17 @@ export const terrainFixtures = {
     pitch: 6,
     kit: [],
     terrain: { obstruction: [0, 66, 0], step: [0, 64, 1], exit: [0, 65, 3], stem: [0, 65, 8] },
+  },
+  "wade-terra": {
+    goal: "diamond",
+    start: [0.5, 64, 0.60],
+    pitch: 21,
+    kit: [["iron_pickaxe", 1]],
+    terrain: {
+      inletX: 4, channelZ: 1, bedY: 63, centralWaterLevel: 4,
+      ore: [0, 64, 6],
+      route: "Level stone bed between two dry banks; no dry route through the side walls.",
+    },
   },
 } as const satisfies Record<TerrainVariant, Fixture>;
 
@@ -203,7 +214,43 @@ function birch([x, y, z]: Cell, height: number): Command[] {
   ];
 }
 
-function terrain(variant: TerrainVariant): Command[] {
+async function wadeTerrain(console: (steps: Command[], allowMismatch?: boolean) => Promise<string[]>,
+    signal: AbortSignal): Promise<Command[]> {
+  const { inletX, channelZ: z, bedY, centralWaterLevel, ore } = terrainFixtures["wade-terra"].terrain;
+  const y = bedY + 1;
+  const wallSign = "oak_wall_sign[facing=east,waterlogged=false]";
+  await console([
+    fill([-inletX - 1, bedY, -4], [inletX + 1, bedY, 8], "stone"),
+    ...[-1, 1].map(x => fill([x, y, -4], [x, y + 2, 8], "stone")),
+    ...[-4, 8].map(bank => fill([0, y, bank], [0, y + 2, bank], "stone")),
+    ...[z - 1, z + 1].flatMap(bank => [
+      fill([-inletX, y, bank], [-1, y, bank], "stone"),
+      fill([1, y, bank], [inletX, y, bank], "stone"),
+      set([0, y, bank], wallSign),
+    ]),
+    ...[-inletX - 1, inletX + 1].map(x => set([x, y, z], "stone")),
+    fill([-1, y, z], [1, y, z], "air replace minecraft:stone"),
+    set(ore, "diamond_ore"),
+    ...[-inletX, inletX].map(x => set([x, y, z], "water[level=0]")),
+  ]);
+  // The center is four horizontal spreads from each inlet on one solid bed.
+  // Equal neighboring levels cancel the lateral flow; the non-waterlogged wall
+  // signs stop the thin flow at each dry bank without blocking the corridor.
+  const settled = [
+    ...span(-inletX, inletX).map(x => inspect([x, y, z], `water[level=${centralWaterLevel - Math.abs(x)}]`)),
+    inspect([0, bedY, z], "stone"),
+    inspect([0, y + 1, z], "air"),
+    ...[z - 1, z + 1].flatMap(bank => [inspect([0, bedY, bank], "stone"), inspect([0, y, bank], wallSign)]),
+    inspect(ore, "diamond_ore"),
+  ];
+  for (let retry = 0; retry < 12; ++retry) {
+    await delay(250, undefined, { signal });
+    if (!(await console(settled, true)).length) return [];
+  }
+  throw new Error("Vanilla did not settle the shallow-water channel and both dry banks before join.");
+}
+
+function terrain(variant: Exclude<TerrainVariant, "wade-terra">): Command[] {
   if (variant === "birch") {
     const { upperStem: high, alternateStem: alternate } = terrainFixtures.birch.terrain;
     return [
@@ -415,7 +462,8 @@ export async function provisionFixture(variant: FixtureVariant, server: ChildPro
     ["gamerule doMobSpawning false", /^Gamerule doMobSpawning is now set to: false$/],
   ]);
   const steps = variant === "water" ? await waterTerrain(console, signal) :
-    variant === "boat" || variant === "cave" ? chamber(variant) : terrain(variant);
+    variant === "boat" || variant === "cave" ? chamber(variant) :
+      variant === "wade-terra" ? await wadeTerrain(console, signal) : terrain(variant);
   await console([...steps, [`time set ${DAY_TICK}`, new RegExp(`^Set the time to ${DAY_TICK}$`)]]);
   await writePreparedPlayer(serverDir, profile, fixtures[variant], signal);
 }

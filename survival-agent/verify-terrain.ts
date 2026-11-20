@@ -1,8 +1,10 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import type { MacroStatus } from "../src/server/survival-macro/controller.ts";
+import { parseMacroReceipt, parseMacroWorkOrder } from "../src/server/survival-macro/protocol.ts";
 import { terrainFixtures, type TerrainVariant } from "./diagnostic-descent.ts";
-import { verifySurvival } from "./verify.ts";
+import { readSavedPlayerStats, verifySurvival } from "./verify.ts";
 
 const sample = z.object({ tick: z.int().positive(), wall_ms: z.number(),
   x: z.number(), y: z.number(), z: z.number() });
@@ -10,12 +12,17 @@ const event = sample.extend({
   status: z.string(), health: z.number(), alive: z.boolean(),
   short_jumps: z.int().nonnegative(), headroom_cleared: z.int().nonnegative(),
   headroom_bypasses: z.int().nonnegative(), headroom_action: z.string(),
+  touching_water: z.boolean().optional(), macro_grounded: z.boolean().optional(), control_owner: z.string().optional(),
   inventory: z.record(z.string(), z.int().nonnegative()),
 });
 const movement = sample.extend({ grounded: z.boolean(), activity: z.string() });
 const blockBreak = z.object({ tick: z.int().positive(), wall_ms: z.number(), block: z.string(), held: z.string() });
 type Event = z.infer<typeof event>;
 type Movement = z.infer<typeof movement>;
+type WadeWork = NonNullable<MacroStatus["lastWorkOrder"]>;
+const driveEvidence = z.object({ tick: z.int().positive(), phase: z.string(), stage: z.string(),
+  offered_ground: z.number().optional(), braking_distance: z.number().optional() });
+const workEvidence = z.object({ requestId: z.string(), order: z.unknown(), receipt: z.unknown(), eligible: z.literal(true) });
 
 function proveBirch(events: Event[], steps: Movement[], breaks: z.infer<typeof blockBreak>[]) {
   const { terrain: { upperStem: [hx, , hz], alternateStem: [ax, , az] }, start: [, sy] } = terrainFixtures.birch;
@@ -68,9 +75,67 @@ function proveCeiling(events: Event[], steps: Movement[], breaks: z.infer<typeof
     bypasses: totals?.headroom_bypasses };
 }
 
+async function proveWade(directory: string, events: Event[], steps: Movement[], breaks: z.infer<typeof blockBreak>[],
+    work: WadeWork | undefined) {
+  const { accepted, terminal: receipt } = work ?? {};
+  if (!accepted || !receipt || receipt.status !== "completed")
+    return { verified: false, reason: "Missing the single completed native stock order." };
+  const { start: [sx, sy, sz], terrain: { channelZ } } = terrainFixtures["wade-terra"];
+  const records = (await readFile(path.join(directory, "macro/receipts.jsonl"), "utf8")).trimEnd().split("\n")
+    .map(line => workEvidence.parse(JSON.parse(line)));
+  const finalOrder = parseMacroWorkOrder(records[0]?.order);
+  const exactOrder = records.length === 2 && records.every((row, index) => {
+    const sample = parseMacroReceipt(row.receipt);
+    const expected = index === 0 ? accepted : receipt;
+    return row.requestId === work?.requestId && sample.id === expected.id && sample.status === expected.status &&
+      sample.run === expected.run && sample.life === expected.life && sample.tick === expected.tick;
+  }) && accepted.status === "accepted" && finalOrder.id === accepted.id && finalOrder.run === path.basename(directory) &&
+    finalOrder.origin === "model" &&
+    finalOrder.travelAnchor?.subject === "block:minecraft:diamond_ore" &&
+    finalOrder.target.kind === "stock" && finalOrder.target.item === "minecraft:diamond" && finalOrder.target.count === 1 &&
+    finalOrder.allowedEffects.length === 1 && finalOrder.allowedEffects[0] === "break:minecraft:diamond_ore" &&
+    finalOrder.maxBreaks === 1 && finalOrder.maxCrafts === 0 && finalOrder.maxPlacements === 0;
+  const inLane = (p: Event | Movement) => Math.abs(p.x - sx) < 0.2 && Math.abs(p.y - sy) < 0.08;
+  const owns = (p: Event) => p.control_owner === "work_order";
+  const dry = events.find(p => p.tick <= accepted.tick && inLane(p) && Math.abs(p.z - sz) < 0.09 &&
+    p.touching_water === false && p.macro_grounded === true && !(p.inventory["minecraft:diamond"] ?? 0));
+  const wet = events.find(p => p.tick > accepted.tick && owns(p) && inLane(p) && p.touching_water === true &&
+    p.z >= channelZ - 0.31 && p.z < channelZ + 1);
+  const bank = wet && events.find(p => p.tick > wet.tick && owns(p) && inLane(p) && p.z >= channelZ + 1.27 &&
+    p.touching_water === false && p.macro_grounded === true);
+  const crossing = wet && bank && steps.filter(p => p.tick >= wet.tick && p.tick <= bank.tick);
+  const controlled = crossing && crossing.length >= 2 && crossing.every(p => inLane(p) && p.grounded) &&
+    crossing.some(p => p.z >= channelZ + 0.25 && p.z <= channelZ + 0.75);
+  const cut = breaks.length === 1 && breaks[0]?.block === "minecraft:diamond_ore" ? breaks[0] : undefined;
+  const pickedUp = cut && events.find(p => p.tick >= cut.tick && p.tick <= receipt.tick && owns(p) &&
+    p.touching_water === false && p.macro_grounded === true && (p.inventory["minecraft:diamond"] ?? 0) === 1);
+  const issued = (await readFile(path.join(directory, "horizon.jsonl"), "utf8")).trimEnd().split("\n")
+    .map(line => driveEvidence.parse(JSON.parse(line))).find(p => p.phase === "drive" && p.stage === "issued" &&
+      p.tick >= accepted.tick && wet && p.tick <= wet.tick && p.offered_ground !== undefined &&
+      p.braking_distance !== undefined && p.offered_ground >= p.braking_distance);
+  const verified = !!(exactOrder && dry && issued && wet && bank && controlled && cut && cut.tick > bank.tick && pickedUp);
+  return { verified, reason: verified
+    ? "An ordinary stock order drove a level dry-to-wet-to-dry crossing, then mined and collected one diamond."
+    : "The trace did not prove one anchored ordinary order, a level wade to a new dry bank, and a subsequent pickup.",
+    orderId: finalOrder.id, dry, issued, wet, bank, cut, pickedUp };
+}
+
+async function verifyWadeStock(statsDirectory: string, progress: unknown) {
+  const live = z.object({ goal: z.literal("diamond"), alive: z.literal(true),
+    inventory: z.record(z.string(), z.int().nonnegative()) }).safeParse(progress);
+  const saved = await readSavedPlayerStats(statsDirectory).catch(() => null);
+  const mined = saved?.stats["minecraft:mined"]?.["minecraft:diamond_ore"] ?? 0;
+  const pickedUp = saved?.stats["minecraft:picked_up"]?.["minecraft:diamond"] ?? 0;
+  const verified = live.success && live.data.inventory["minecraft:diamond"] === 1 && mined === 1 && pickedUp === 1;
+  return { verified, mined, pickedUp, reason: verified ? "Vanilla statistics corroborate the retained diamond." :
+    "Missing one retained diamond, one saved diamond ore break, or one saved diamond pickup." };
+}
+
 /** Verify the incident, not just the ordinary goal. All observations stay outside the actor. */
-export async function verifyTerrain(directory: string, variant: TerrainVariant, progress: unknown) {
-  const goal = await verifySurvival(path.join(directory, "server/world/stats"), terrainFixtures[variant].goal, progress);
+export async function verifyTerrain(directory: string, variant: TerrainVariant, progress: unknown, wadeWork?: WadeWork) {
+  const stats = path.join(directory, "server/world/stats");
+  const goal = variant === "wade-terra" ? await verifyWadeStock(stats, progress) :
+    await verifySurvival(stats, terrainFixtures[variant].goal, progress);
   const failed = (reason: string) => ({ verified: false, reason, diagnostic: variant, goal });
   if (!goal.verified) return failed(goal.reason);
   try {
@@ -90,8 +155,9 @@ export async function verifyTerrain(directory: string, variant: TerrainVariant, 
     if (!events.length || events.some(p => !p.alive || p.health !== 20))
       return failed("Missing damage-free event history.");
     return { diagnostic: variant, goal,
-      ...(variant === "birch" ? proveBirch(events, steps, breaks) : proveCeiling(events, steps, breaks)) };
+      ...(variant === "wade-terra" ? await proveWade(directory, events, steps, breaks, wadeWork) :
+        variant === "birch" ? proveBirch(events, steps, breaks) : proveCeiling(events, steps, breaks)) };
   } catch {
-    return failed("Terrain events or movement were unavailable or unreadable.");
+    return failed("Terrain proof artifacts were missing or unreadable.");
   }
 }

@@ -105,8 +105,10 @@ export interface SurvivalMacroConfig {
   readonly run: string;
   readonly strategy: "deterministic" | "terra";
   readonly objective?: string;
-  /** Only ordinary, explicitly admitted Terra uses outcome-level jobs. */
+  /** Outcome-level jobs require explicitly admitted Terra. */
   readonly durableWork?: boolean;
+  /** A prepared run can wait for its required rendered evidence before its first paid decision. */
+  readonly initialWorkView?: (observation: MacroObservation) => boolean;
   readonly strategist?: MacroStrategist;
   readonly firstPlan?: { readonly request: FirstPlanRequest; readonly infer: FirstPlanStrategist };
   readonly skills?: SurvivalMacroSkills;
@@ -1149,6 +1151,7 @@ export class SurvivalMacroController {
     // terminal tick. Do not spend a decision on a pre-effect view plus its outcome.
     if (!this.job && current.tick <= this.handoffAfterTick && !(this.workMode && current.pendingWork?.parked)) return;
     if (this.workMode) {
+      if (this.requests === 0 && this.config.initialWorkView && !this.config.initialWorkView(current)) return;
       await this.scheduleWork(this.view!);
       return;
     }

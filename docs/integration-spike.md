@@ -42,30 +42,41 @@ bun run play:agent --strategy terra --macro-requests 8 --task 'Choose your next 
 ```
 
 When you select Terra, one of those requests may run during world loading.
-It receives the task and a description of available actions, without a game
-frame or an assumed inventory. The player cannot use the conditional plan
-until a real observation satisfies its requirements. A rejected plan or a
-failed startup can still use that request. Pass `--startup off` before the
-goal to wait for the first observation before making a paid call.
+It receives the task and a description of available actions, but no game
+frame or inventory. Terra can suggest alternatives: craft from surplus wood
+if the player has it, or gather wood if there is a tree in reach. Only one
+branch can start. It must match an actual observation, even when the advice
+refers to “the log you see” rather than a particular wood species. A branch
+can include up to three jobs. Each handoff checks the previous job's receipt
+and the player's stock. If the next job assumes a table the player doesn't
+have, the player can keep gathering while Terra changes the plan. Ambiguous
+advice grants no action. A rejected plan or a failed
+startup can still use that request. Pass `--startup off` before the goal
+to wait for the first observation before making a paid call.
 
 Here Terra can make eight requests during a 360-second attempt. While it
 thinks, the local player can continue an authorized job. For example, an
 order can request a stock of planks and protect the last log. The player
 chooses a visible tree, gathers the actual drops and rechecks the reserve
-before taking an output from the crafting grid. Reaching the request limit
+before taking an output from the crafting grid. Consecutive personal
+recipes can share one open inventory, including across two approved jobs.
+The player closes it when the next step needs the world, such as placing
+the crafting table. Reaching the request limit
 stops new calls; it does not grant more materials, extend a job, or end
 Minecraft. A locally selected preset alone does not count as a Terra action.
 The work-order executor currently admits gathering, crafting, and crafting
 table placement. Naming the Nether goal does not give that executor the
 deterministic player's furnace-transfer or portal-construction permissions.
 
-When an early stone, coal, or iron source is not in view, an authorized
-work order can look from up to five distinct dry, level footholds. It may
-also open a shallow window through at most two visible cover blocks while
-staying on solid ground. Ordinary tool presets allow dry soil and common
-rock as cover when a relevant source is needed. For a custom job, each
-cover type needs its own exact break permission and counts against the
-same break budget. Breaking cover confirms neither a source nor a pickup.
+When an early stone, coal, or iron source is not in view, Terra can choose
+a witnessed dry approach or an exact adjacent soil cap. A cap offer is one
+break; it does not authorize descent or additional cuts. A work order can
+check up to five new level footholds or attempt a short staircase of at most
+three one-block descents. Before moving, it checks each lit landing, dry
+clearance, and reverse climb. Ordinary tool presets allow dry soil and
+common rock as cover. A custom work order needs an exact break permission
+for each cover type, charged against the same break budget. Cover, grounded
+travel, and collected stock are confirmed separately.
 
 The three-second planning deadline is a diagnostic target, not a
 guarantee about the footage. If no safe, authorized action is available,

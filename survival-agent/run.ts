@@ -14,10 +14,10 @@ import { composeTerraSurvival, declareTerraStrategy } from "../src/server/surviv
 import { descentFixtures, descentVariants, fixtureWorld, macroTrialWorld, provisionFixture, provisionMacroTrialWorld, terrainFixtures,
   terrainVariants, provisionUrgentThreatWorld, urgentThreatWorld, provisionUrgentCraftWorld, urgentCraftWorld,
   type DescentVariant, type TerrainVariant } from "./diagnostic-descent.ts";
-import { poolDiagnosticServerProperties, poolDiagnosticWorld, provisionPoolDiagnostic } from "./diagnostic-pool.ts";
+import { offlineUuid, poolDiagnosticServerProperties, poolDiagnosticWorld, provisionPoolDiagnostic } from "./diagnostic-pool.ts";
 import { createUrgentThreatProbe, urgentThreatDeclaration, urgentThreatLimits, urgentCraftDeclaration,
   urgentCraftLimits } from "./diagnostic-urgent.ts";
-import { FAST_DEATH_LIMIT, FAST_DEATH_WINDOW_MS, LIFE_RECEIPTS, LifeLedger, lifeReceiptReader,
+import { closedParentDeath, FAST_DEATH_LIMIT, FAST_DEATH_WINDOW_MS, LIFE_RECEIPTS, LifeLedger, lifeReceiptReader,
   RESPAWN_MARKER, RESPAWN_TIMEOUT_MS } from "./lives.ts";
 import { admitRun, diskBytes } from "./storage.ts";
 import { finalPauseEvidence, PAUSE_DIAGNOSTICS } from "./pause-evidence.ts";
@@ -28,6 +28,7 @@ import { verifyTerrain } from "./verify-terrain.ts";
 import { readSavedPlayerStats, retainsCompletedProgram, savedDeathDelta, verifySurvival, type ProgramWin } from "./verify.ts";
 import { MACRO_TRIAL_GOAL, MACRO_TRIAL_SECONDS, macroTrialActor, parseMacroTrialLaunch,
   reportMacroTrial, watchMacroTrialOwner, type MacroTrialLaunch } from "./macro-trial.ts";
+import { openOperatorStop, serverSaveEvidence } from "./operator-stop.ts";
 
 const ROOT = path.resolve(import.meta.dir, "..");
 const RUNTIME = path.join(ROOT, "local/runtime");
@@ -139,6 +140,7 @@ Prepared diagnostic proofs require no deaths.
 Build with \`bun run build:agent\` first. Requires Java 21, ffmpeg, existing local
 EULA consent, and a signed-in official Launcher with Minecraft 1.21.4 installed.
 Without JAVA_HOME, the runner prefers the system OpenJDK 21 installation.
+To stop a specific active ordinary run: bun survival-agent/operator-stop.ts RUN_BASENAME.
 Only a verified result exits 0. Artifacts and outcome JSON go in the printed run directory.`;
 
 type Diagnostic = "pool" | "incident-replay" | "macro-trial" | "urgent-creeper" | "urgent-craft" | DescentVariant | TerrainVariant;
@@ -439,6 +441,7 @@ async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
         outcome.startedAt !== declaration.startedAt || !time(outcome.finishedAt) ||
         !STATUSES.includes(outcome.status) || (outcome.status === "won" &&
           (goal === declaration.goal || outcome.verification?.verified !== true)) ||
+        (outcome.operatorStop !== undefined && outcome.operatorStop?.serverSaved !== true) ||
         outcome.exits?.server?.code !== 0 || outcome.exits.server.signal !== null) throw invalid();
     // An attempt that joined must have the vanilla player save directories.
     if (outcome.progress !== null) {
@@ -462,7 +465,8 @@ async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
     await regular(path.join(world, "level.dat"));
     await regular(path.join(world, "session.lock"));
     const hadDeath = outcome.status === "died" || (outcome.lifecycle?.deaths ?? 0) > 0;
-    return { root, rootInode, device, world, historic, progress: hadDeath ? null : outcome.progress as Progress | null };
+    return { root, rootInode, device, world, historic, progress: hadDeath ? null : outcome.progress as Progress | null,
+      parentDeath: closedParentDeath(parentRun, outcome) };
   } catch {
     signal.throwIfAborted();
     throw invalid();
@@ -819,7 +823,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
   });
   for (const { name, listener } of interrupts) process.on(name, listener);
   let release: (() => void) | undefined;
-  let canReleaseDiagnostic = true;
+  let canRelease = true;
   try {
     release = diagnostic ? await admitRun(reserveBytes, "diagnostic") : await admitRun(reserveBytes);
     signal.throwIfAborted();
@@ -851,6 +855,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         fastDeathLimit: FAST_DEATH_LIMIT, fastDeathWindowMs: FAST_DEATH_WINDOW_MS,
         resetsOn: "new objective high-water milestone, not recovery supplies or generic digging",
       }),
+      ...(source ? { inheritedInitialScreen: "closed parent, matching saved player and first native DeathScreen required" } : {}),
     };
     const video = path.join(dir, "screen.mp4");
     const live = { run: path.basename(dir), display: display.display, authority: display.authority };
@@ -883,6 +888,9 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     let descentSettlement: { firstTick: number; settledTick: number } | null = null;
     let measuredBytes: number | null = null;
     let meter: Promise<void> | undefined;
+    let stopChannel: Awaited<ReturnType<typeof openOperatorStop>> | undefined;
+    let stopWatch: Promise<void> | undefined;
+    let operatorStop: Stop | undefined;
     let result = new Stop("failed", "Run ended without a recorded outcome.");
     const startupDeadline = AbortSignal.timeout(STARTUP_MS);
     const startup = AbortSignal.any([signal, startupDeadline]);
@@ -899,6 +907,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       }
       return hasMore;
     };
+    canRelease = false;
     try {
       const agentJarSha256 = await launcher.stageAgentArtifact(actorJar, terraDeclaration !== undefined);
       if (macroTrial) {
@@ -933,7 +942,21 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         recording: { file: "screen.mp4", size: SIZE, fps: 30, codec: "h264", cursor: true, audio: false },
       });
       declared = true;
-      await privateJson(liveFile, { ...live, active: true });
+      if (!diagnostic) stopChannel = await openOperatorStop(dir);
+      await privateJson(liveFile, { ...live, active: true, ...(stopChannel ? { operatorStop: stopChannel.scope } : {}) });
+      if (stopChannel) {
+        const channel = stopChannel;
+        stopWatch = (async () => {
+          while (!signal.aborted) {
+            if (await channel.requested() && !signal.aborted) {
+              operatorStop = new Stop("interrupted", "Stopped by operator.");
+              controller.abort(operatorStop);
+              return;
+            }
+            await delay(250, undefined, { signal }).catch(() => {});
+          }
+        })();
+      }
       console.log(diagnostic
         ? "Diagnostic live view: http://127.0.0.1:4382/ (start with `bun run watch:agent --diagnostic` if needed)"
         : "Live view: http://127.0.0.1:4379/ (start with `bun run watch:agent` if needed)");
@@ -1021,7 +1044,6 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           cwd: worldDir, env: { ...env, HOME: worldDir, TMPDIR: serverTmp },
           detached: true, stdio: ["pipe", "pipe", serverErr.fd],
         }));
-        if (macroTrial || urgentProbe) canReleaseDiagnostic = false;
         if (macroTrial && server.child.pid)
           reportMacroTrial({ kind: "owned", run: macroTrial.run, displayRole: "server", pid: server.child.pid });
         let pending = "";
@@ -1075,6 +1097,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         if (size >= videoBytes - 64_000) abort("recording_limit", "Recording reached its byte limit.");
         else abort("recorder_exit", "The screen recorder exited unexpectedly.");
       });
+      const parentDeath = source?.parentDeath;
       const launched = await launcher.launchAgent({
         runtimeCache: RUNTIME, port, goal, evidenceDir: dir, ...display,
         beforeConnect: provisioned ? async (profileName) => {
@@ -1088,6 +1111,13 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           else await provisionPoolDiagnostic(runningServer.child, worldDir, profileName, startup);
           await record("diagnostic_sealed");
           stage = "client_startup";
+        } : parentDeath ? async (profileName) => {
+          const baseline = savedDeathDelta(null, beforeStats);
+          if (baseline && /^[A-Za-z0-9_]{1,16}$/.test(profileName)) {
+            ledger.expectInheritedDeath(parentDeath, {
+              savedDeaths: baseline.after, matchesProfile: beforeStats?.file === `${offlineUuid(profileName)}.json`,
+            });
+          }
         } : undefined,
       }, startup);
       client = own(launched.child, launched.closed);
@@ -1202,7 +1232,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       }
       signal.throwIfAborted();
     } catch (error) {
-      if (error instanceof Stop) result = error;
+      if (operatorStop) result = operatorStop;
+      else if (error instanceof Stop) result = error;
       else if (signal.reason instanceof Stop) result = signal.reason;
       else if (error instanceof TerraActorCompatibilityError) result = new Stop("failed", error.message);
       else if (startupDeadline.aborted && stage !== "playing") {
@@ -1254,21 +1285,29 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       })();
       const settled = await Promise.allSettled([
         clientDrain, serverDrainTask, clientDrain.finally(() => drain(recorder, "q\n")), meter, strategyDrain,
+        Promise.resolve(stopWatch).finally(() => stopChannel?.close()),
+        operatorStop && record("operator_stop_accepted", { run: live.run }),
       ]);
-      if (macroTrial || urgentProbe) canReleaseDiagnostic =
-        [client, server, recorder].every(owned => !owned || owned.exit !== undefined) &&
+      const drained = [client, server, recorder].every(owned => !owned || owned.exit !== undefined) &&
         settled.every(step => step.status === "fulfilled");
-      const serverDrain = settled[1].status === "fulfilled" ? settled[1].value : null;
-      if (serverDrain) await record("server_drained", serverDrain).catch(() => {});
+      let serverDrain = settled[1].status === "fulfilled" ? settled[1].value : null;
       if (settled[4].status === "rejected") {
         result = new Stop("failed", "The Terra controller, provider, skills, or trial did not drain cleanly.");
-      } else if (settled.some((step) => step.status === "rejected")) {
+      } else if (!drained) {
         result = new Stop("failed", "An owned process could not be drained cleanly.");
       }
+      if (serverDrain) await record("server_drained", serverDrain).catch(() => {
+        if (operatorStop) serverDrain = null;
+        if (result === operatorStop) result = new Stop("failed", "Could not record the vanilla server drain.");
+      });
+      let liveClosed = !declared;
       if (declared) {
-        await privateJson(liveFile, { ...live, active: false }).catch(() => {
+        try {
+          await privateJson(liveFile, { ...live, active: false });
+          liveClosed = true;
+        } catch {
           result = new Stop("failed", "Could not mark the live view inactive.");
-        });
+        }
       }
       try { measuredBytes = await diskBytes(dir); }
       catch (error) {
@@ -1292,8 +1331,10 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           await record("life_evidence_unreadable").catch(() => {});
         }
       }
-      const serverSaved = server?.exit?.code === 0 && server.exit.signal === null &&
-        serverDrain?.dimensionsSaved === true && serverDrain.escalation === null;
+      const saveEvidence = serverSaveEvidence(server, serverDrain);
+      const serverSaved = saveEvidence === true;
+      if (operatorStop && result === operatorStop && saveEvidence === false)
+        result = new Stop("server_exit", "Operator stop could not confirm a clean vanilla server save.");
       const recordedDeaths = serverSaved ? savedDeathDelta(beforeStats,
         await readSavedPlayerStats(statsDirectory).catch(() => null)) : null;
       if (provisioned && (ledger.deaths > 0 || (recordedDeaths?.attempt ?? 0) > 0)) {
@@ -1353,6 +1394,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         schemaVersion: 1, status: result.status, reason: result.message, goal, startedAt, world, claimScope, deathPolicy,
         finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - start),
         finalStage: stage, reservedBytes: reserveBytes, measuredBytes, progress: lastProgress,
+        ...(operatorStop ? { operatorStop: { serverSaved: saveEvidence } } : {}),
         ...(pauseEvidence ? { pauseEvidence } : {}),
         ...(benchmark ? { benchmark: { ...benchmark, confirmed: benchmarkConfirmed }, strategy } : {}),
         ...(urgentThreat ? { urgentThreat, strategy } : {}),
@@ -1367,10 +1409,11 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       };
       await privateJson(path.join(dir, "outcome.json"), outcome);
       await record("closed", { status: outcome.status });
+      canRelease = drained && liveClosed;
       if (macroTrial && trialJarSha256) {
         reportMacroTrial({
           kind: "closed", run: macroTrial.run, actorJarSha256: trialJarSha256, serverSaved,
-          drained: canReleaseDiagnostic,
+          drained: canRelease,
           status: result.status,
           recordingClosed: recorder?.exit?.code === 0 && await stat(video).then(entry => entry.size > 0, () => false),
           deaths: Math.max(ledger.deaths, recordedDeaths?.attempt ?? 0),
@@ -1386,7 +1429,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       result.status === "won" || result.status === "trial_closed" || result.status === "urgent_closed" ? 0 : 1;
   } finally {
     try {
-      if (canReleaseDiagnostic) {
+      if (canRelease) {
         release?.();
         if (macroTrial) reportMacroTrial({ kind: "released", run: macroTrial.run });
       }

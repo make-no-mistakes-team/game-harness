@@ -155,6 +155,21 @@ includes its cursor; the local recording continues if you close the tab.
 To open an exported review clip from its existing playback link, run
 `bun run review:agent` on the same computer first.
 
+To stop an ordinary run from a second terminal or a progress watch, pass the
+basename of that attempt's printed directory:
+
+```sh
+bun survival-agent/operator-stop.ts "$RUN_BASENAME"
+```
+
+Keep the launcher and its display running. The command only publishes the
+request; `operator_stop_accepted` in `history.jsonl` is the runner's receipt.
+Wait for the launcher to exit. A clean operator stop exits 1 and records
+`closed` with status `interrupted`. If a server had started, confirm
+`operatorStop.serverSaved: true` in `outcome.json` and `dimensionsSaved: true`
+with no escalation in the `server_drained` event before treating the stop
+as a clean save. Without those records, cleanup or saving is unconfirmed.
+
 To test the single-bucket casting path without mining for supplies, run
 `bun run diagnose:pool [SECONDS]`. This starts a separate Normal Survival
 world on a flat plains map. The player starts facing south on a dry stone

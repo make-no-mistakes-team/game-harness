@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { requestOperatorStop } from "../../survival-agent/operator-stop.ts";
 import { hasConfirmedTerraEffect, SURVIVAL_AGENT_STRATEGY_OUTCOMES, TERRA_MODEL_ID,
   type SurvivalAgentGoal, type SurvivalAgentSnapshot, type SurvivalAgentStart } from "../shared/survival-agent-ui.ts";
 import { prepareAgentServerArtifact } from "./minecraft-server-artifact.ts";
@@ -209,7 +210,7 @@ export class SurvivalAgent {
   private assertOrdinaryLaneAvailable() {
     // Probe the same SQLite write lock the CLI holds. The child still owns the
     // authoritative atomic admission, including races after this early check.
-    const lock = path.join(path.dirname(this.runs), "owner.sqlite");
+    const lock = path.join(this.root, "local/survival-pilot/owner.sqlite");
     if (!existsSync(lock)) return;
     let owner: Database | undefined;
     try {
@@ -294,7 +295,6 @@ export class SurvivalAgent {
     const child = spawn(tools.wrapper, ["-a", "-f", authority, "-s", `-screen 0 1280x720x24 -nolisten tcp -auth ${authority}`, ...command], {
       cwd: this.root, env, detached: true, stdio: ["ignore", "pipe", "pipe"],
     });
-    const launched = performance.now();
     const wrapper = child.pid;
     const basename = new RegExp(`^\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}\\.\\d{3}Z-${attempt.goal}-[A-Za-z0-9]{6}$`);
     let exit: { code: number | null } | undefined;
@@ -319,32 +319,28 @@ export class SurvivalAgent {
     }
     child.on("error", () => { startupStatus ??= "Could not launch the local Xvfb display."; });
     child.once("close", (code) => { exit = { code }; });
-    let supervisor: ReturnType<typeof readProcess>, termSent = false, wrapperCancelled = false;
+    let stopPublished = false;
     let xvfb: ReturnType<typeof readProcess>;
     while (!exit) {
-      if (wrapper !== undefined && child.exitCode === null && child.signalCode === null) {
-        if (!supervisor || !attempt.display) {
-          for (const pid of children(wrapper)) {
-            const proc = readProcess(pid);
-            if (!proc || proc.parent !== wrapper || proc.group !== wrapper) continue;
-            const args = argv(pid);
-            if (args.length === command.length && command.every((arg, index) => args[index] === arg)) supervisor = proc;
-            else if (!attempt.display) {
-              const verified = await this.verifyDisplay(proc, args, tools, authority);
-              if (verified) {
-                xvfb = proc;
-                attempt.display = verified;
-              }
-            }
+      if (!attempt.display && wrapper !== undefined && child.exitCode === null && child.signalCode === null) {
+        for (const pid of children(wrapper)) {
+          const proc = readProcess(pid);
+          if (!proc || proc.parent !== wrapper || proc.group !== wrapper) continue;
+          const verified = await this.verifyDisplay(proc, argv(pid), tools, authority);
+          if (verified) {
+            xvfb = proc;
+            attempt.display = verified;
+            break;
           }
         }
-        // Keep xvfb-run and its display alive until the supervisor joins its
-        // detached Java and recorder children. Signal the supervisor itself.
-        if (supervisor && attempt.stop.signal.aborted && !termSent &&
-            readProcess(supervisor.pid)?.started === supervisor.started) termSent = cleanSignal(supervisor.pid, "SIGTERM");
-        if (!supervisor && !attempt.view.run && !wrapperCancelled && performance.now() - launched >= 15_000) {
-          startupStatus ??= "The isolated Minecraft display did not start in time. Check Xvfb and xauth.";
-          wrapperCancelled = cleanSignal(-wrapper, "SIGTERM"); // No supervisor reported an owned run.
+      }
+      if (attempt.stop.signal.aborted && !stopPublished && attempt.display?.live()) {
+        // The private display binds the manager to its own run, even if the
+        // run directory has not appeared in the wrapper's output.
+        const run = await requestOperatorStop(path.dirname(this.runs), attempt.display).catch(() => null);
+        if (run) {
+          attempt.view.run = run;
+          stopPublished = true;
         }
       }
       if (attempt.view.run) agentVitals(attempt.view, await readJson(path.join(this.runs, attempt.view.run, "progress.json")));
@@ -379,8 +375,7 @@ export class SurvivalAgent {
         return outcome.status === "won" && !attempt.view.won ? "The agent’s goal could not be verified." : outcomeStatus(outcome);
       }
     }
-    return startupStatus ?? (attempt.stop.signal.aborted ? "Agent stopped." :
-      "Minecraft did not report a closed agent outcome. Check Xvfb and the local Minecraft installation.");
+    return startupStatus ?? "Minecraft did not report a closed agent outcome. Check Xvfb and the local Minecraft installation.";
   }
 
   private async verifyDisplay(proc: NonNullable<ReturnType<typeof readProcess>>, args: string[],

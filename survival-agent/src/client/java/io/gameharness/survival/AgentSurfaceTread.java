@@ -77,6 +77,30 @@ final class AgentSurfaceTread {
             && to.getX() - from.getX() == travel.getOffsetX() && to.getZ() - from.getZ() == travel.getOffsetZ();
     }
 
+    /** A seen floor is expendable only while a different usable exit or a walked return survives. */
+    static int spareLevelFloorChoices(int candidates, int usableExits, boolean walkedReturn) {
+        if (walkedReturn || Integer.bitCount(usableExits) > 1) return candidates;
+        return usableExits == 0 ? 0 : candidates & ~usableExits;
+    }
+
+    /** Recheck known terrain before cutting; this cannot supply a new route witness. */
+    static boolean retainedLaneClear(MinecraftClient client, BlockPos from, BlockPos to, Direction travel) {
+        if (!cardinalTread(from, to, travel) || !reverseClear(client, from, to, travel)) return false;
+        if (from.getY() != to.getY()) {
+            BlockPos lower = from.getY() < to.getY() ? from : to;
+            if (!client.world.getBlockState(lower).getCollisionShape(client.world, lower).isEmpty()) return false;
+        }
+        return client.world.isSpaceEmpty(client.player, retainedTreadSweep(from, to, client.player.getWidth()));
+    }
+
+    static Box retainedTreadSweep(BlockPos from, BlockPos to, double width) {
+        double half = width * 0.5 + 0.055;
+        double y = Math.max(from.getY(), to.getY());
+        return new Box(Math.min(from.getX(), to.getX()) + 0.5 - half, y + 0.015,
+            Math.min(from.getZ(), to.getZ()) + 0.5 - half, Math.max(from.getX(), to.getX()) + 0.5 + half,
+            y + 1.80, Math.max(from.getZ(), to.getZ()) + 0.5 + half);
+    }
+
     /** Aim just inside the opening: farther top samples can hit the near roof before crossing the lip. */
     static Vec3d innerTop(BlockPos cell, Direction down) {
         return Vec3d.ofBottomCenter(cell.up()).add(0.12 * down.getOffsetX(), -0.035, 0.12 * down.getOffsetZ());

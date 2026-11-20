@@ -159,6 +159,10 @@ original footing until a fresh view shows the new cobblestone top and
 inventory shows the matching debit. Nearby fluid can veto the placement.
 If the player cannot confirm the empty space, the refusal identifies the
 bearing and what blocked the lower and upper sight lines.
+On a flat shelf the player can cut an unused adjacent floor block to start
+a downward tread, provided another usable exit or the walked return path
+remains intact. It stays on the original block until it can see the
+landing and check the way back.
 The report distinguishes placement, grounded arrival, and the lowest
 footing reached. Only a diamond in inventory counts as a pickup.
 

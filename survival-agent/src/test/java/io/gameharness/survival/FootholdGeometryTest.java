@@ -1,5 +1,6 @@
 package io.gameharness.survival;
 
+import java.util.Set;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
@@ -7,6 +8,7 @@ import net.minecraft.util.math.Vec3d;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class FootholdGeometryTest {
@@ -44,5 +46,52 @@ final class FootholdGeometryTest {
             assertTrue(occludingWall.raycast(eye, point).isPresent(), "the intervening full block occludes the ray");
             assertTrue(occupiedCell.raycast(eye, point).isPresent(), "a full block in the sampled cell is hit");
         }
+    }
+
+    @Test
+    void aFlatDryShelfCanSpareOneAdjacentFloorForAStair() {
+        var foot = new BlockPos(0, 30, 0);
+        var east = foot.east();
+        var west = foot.west();
+        int eastFloor = 1 << Direction.EAST.ordinal();
+        int westExit = 1 << Direction.WEST.ordinal();
+        var fullTops = Set.of(foot.down(), east.down(), west.down());
+        assertEquals(east.down(), AgentSurfaceTread.nextFoot(foot, Direction.EAST));
+        assertTrue(fullTops.contains(foot.down()), "the player keeps their own footing");
+        assertEquals(westExit, usableDryExits(foot, Set.of(foot.down(), west.down())),
+            "removing the east floor leaves a genuinely walkable west exit");
+
+        assertEquals(eastFloor, AgentSurfaceTread.spareLevelFloorChoices(eastFloor, usableDryExits(foot, fullTops), false));
+        assertEquals(eastFloor, AgentSurfaceTread.spareLevelFloorChoices(eastFloor, eastFloor, true),
+            "an intact walked reverse path also leaves a way out");
+    }
+
+    @Test
+    void cannotCutTheOnlyDryEscapeWhenAnIntactLookingSideFloorHasABlockedSweep() {
+        var foot = new BlockPos(0, 30, 0);
+        var north = foot.north();
+        var east = foot.east();
+        var lowRoof = new Box(north.up());
+        var fullTops = Set.of(foot.down(), east.down(), north.down());
+        int eastFloor = 1 << Direction.EAST.ordinal();
+        int usable = usableDryExits(foot, fullTops, lowRoof);
+        assertEquals(eastFloor, usable, "west and south drop away; north has a top but no lane");
+        assertEquals(0, usableDryExits(foot, Set.of(foot.down(), north.down()), lowRoof),
+            "removing the east floor would leave no walkable exit");
+        assertEquals(0, AgentSurfaceTread.spareLevelFloorChoices(eastFloor, usable, false),
+            "there is also no walked way back");
+    }
+
+    private static int usableDryExits(BlockPos foot, Set<BlockPos> fullTops, Box... obstructions) {
+        int exits = 0;
+        for (Direction direction : Direction.Type.HORIZONTAL) {
+            BlockPos to = foot.offset(direction);
+            if (!fullTops.contains(to.down())) continue;
+            Box sweep = AgentSurfaceTread.retainedTreadSweep(foot, to, 0.6);
+            boolean blocked = false;
+            for (Box obstruction : obstructions) blocked |= sweep.intersects(obstruction);
+            if (!blocked) exits |= 1 << direction.ordinal();
+        }
+        return exits;
     }
 }

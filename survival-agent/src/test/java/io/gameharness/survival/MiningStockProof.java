@@ -410,6 +410,60 @@ final class MiningStockProof {
     }
 
     @Test
+    void pendingSideWaitRequiresRealBurnAndAFrameAfterEscape() {
+        var single = new AgentHands.IronBatch(1, Items.COAL, 1, 1600);
+        var pair = new AgentHands.IronBatch(2, Items.COAL, 1, 1600);
+        require(!AgentFurnaceWatch.releasedForSide(single, 20, 10, 11),
+            "the paid single-item GUI grants no side-work handoff");
+        require(!AgentFurnaceWatch.releasedForSide(pair, 0, 10, 11)
+                && !AgentFurnaceWatch.releasedForSide(pair, 20, 10, 10)
+                && AgentFurnaceWatch.releasedForSide(pair, 20, 10, 11),
+            "only ignition followed by a fresh in-world observation establishes a real release");
+    }
+
+    @Test
+    void independentWorkDoesNotBorrowTheSmeltRecipeOrSpendItsFloors() {
+        var request = JsonParser.parseString("""
+            {"v":1,"id":"independent","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":125,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:cobblestone","count":2},
+             "allowedEffects":["break:minecraft:stone"],"costCaps":[],"reserves":[],
+             "maxBreaks":1,"maxCrafts":0,"maxPlacements":0,"duringWaitFor":"9d0ad30c-b85c-4261-baff-f071c8e5ebc1"}
+            """).getAsJsonObject();
+        var order = AgentWorkOrder.parse(request, "run", "constrained");
+        require(order.policy() != null && order.duringWaitFor().equals("9d0ad30c-b85c-4261-baff-f071c8e5ebc1")
+                && order.policy().breakAllowed(Blocks.STONE.getDefaultState()) && !order.policy().smeltIron(),
+            "the separate live grant can authorize one exact local stone break but cannot reload or place a furnace");
+        var budget = new AgentWorkOrder.Budget(order.policy(), Map.of(Items.OAK_PLANKS, 3));
+        var stock = new PlayerInventory(null);
+        stock.setStack(0, new ItemStack(Items.OAK_PLANKS, 3));
+        require(budget.limit(Items.OAK_PLANKS, 3) == 0 && budget.missingFloor(stock) == null
+                && budget.breaksLeft() == 1, "side work inherits protected carried floors, not the original effect caps");
+        request.addProperty("maxPlacements", 1);
+        require(AgentWorkOrder.parse(request, "run", "constrained").policy() == null,
+            "no implicit placement can happen while handing off from a paid wait");
+    }
+
+    @Test
+    void parkedCollectionRequiresFreshSlotsAndUsesTheInventoryAfterIndependentWork() {
+        var batch = new AgentHands.IronBatch(2, Items.OAK_PLANKS, 2, 300);
+        var empty = ItemStack.EMPTY;
+        var output = new ItemStack(Items.IRON_INGOT, 2);
+        require(AgentFurnaceWatch.pendingReopenProblem(6, 6, true, 1, batch, 0, 1, empty, empty, output) != null
+                && AgentFurnaceWatch.pendingReopenProblem(6, 7, true, 0, batch, 0, 1, empty, empty, output) != null
+                && AgentFurnaceWatch.pendingReopenProblem(6, 7, true, 1, batch, 0, 1, empty, empty, output) == null,
+            "only a new independently synchronized vanilla handler proves the paid output");
+        var withdrawal = new AgentFurnaceWatch.Withdrawal();
+        require(withdrawal.begin(new AgentFurnaceWatch.Stock(5, 2, 4)),
+            "physical collection starts from current stock, not from the stale paid inventory before side work");
+        require(!withdrawal.confirms(new AgentFurnaceWatch.Stock(5, 2, 4), batch)
+                && !withdrawal.confirms(new AgentFurnaceWatch.Stock(4, 2, 6), batch)
+                && withdrawal.confirms(new AgentFurnaceWatch.Stock(5, 2, 6), batch),
+            "only the exact two ingot gain with unchanged currently carried input and fuel confirms withdrawal");
+        require(!withdrawal.begin(new AgentFurnaceWatch.Stock(5, 2, 6)),
+            "the accepted withdrawal edge cannot be issued again even after its actual stock gain");
+    }
+
+    @Test
     void exactFurnaceWatchUsesNewVanillaSyncThenCollectsOnlyThePaidOutput() {
         var block = new BlockPos(3, 18, -7);
         var batch = new AgentHands.IronBatch(2, Items.OAK_PLANKS, 2, 300);

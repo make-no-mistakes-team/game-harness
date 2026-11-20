@@ -77,7 +77,7 @@ async function durableFixture(strategist: MacroStrategist, objective?: string, m
     await actor.poll();
   }
   const order = async () => JSON.parse(await readFile(file("work.json"), "utf8"));
-  function receipt(id: string, tick: number, status: "accepted" | "completed" | "interrupted" | "refused") {
+  function receipt(id: string, tick: number, status: "accepted" | "parked" | "completed" | "interrupted" | "refused") {
     return writeFile(file("native-receipts.jsonl"), `${JSON.stringify({
       v: 1, id, run, life: 1, tick, status, detail: `native job ${status}`,
     })}\n`, { flag: "a", mode: 0o600 });
@@ -335,9 +335,25 @@ test.each(["invalid", "malformed", "abstain", "gap", "incomplete"] as const)(
       await f.observe(10, bucketStock);
       await f.observe(100, bucketStock);
       await f.observe(200, bucketStock);
-      await f.observe(300, { ...bucketStock, opportunities: [{ ...bucketStock.opportunities[0], id: "o-8" }] });
-      expect(requests).toHaveLength(outcome === "invalid" || outcome === "abstain" || outcome === "malformed" ? 2 : 1);
-      if (outcome === "abstain") expect(requests[1]?.feedback).toBeUndefined(); // Native offer change, not schema repair.
+      const sameTable = { ...bucketStock.opportunities[0], id: "o-8" };
+      await f.observe(300, { ...bucketStock, opportunities: [sameTable] });
+      expect(requests).toHaveLength(outcome === "invalid" || outcome === "malformed" ? 2 : 1);
+      if (outcome === "abstain") {
+        await f.observe(350, { ...bucketStock, opportunities: [sameTable, { id: "camera-only", verb: "survey", risk: "read",
+          summary: "Turn away from the workstation", evidence: "The camera can turn in place." }] });
+        expect(requests).toHaveLength(1);
+        const recipe = { id: "o-9", verb: "continue", risk: "guarded", summary: "Craft a bucket at the visible table",
+          evidence: "The inventory has the ingredients and the table is in reach.",
+          material: { subject: "recipe:bucket", target: "bucket-recipe", spends: { "minecraft:iron_ingot": 3 } } } as const;
+        await f.observe(400, { ...bucketStock, opportunities: [sameTable, recipe] });
+        expect(requests).toHaveLength(2);
+        expect(requests[1]).toMatchObject({ observation: { tick: 400, opportunities: [sameTable, recipe] } });
+        expect(requests[1]?.feedback).toBeUndefined(); // Newly actionable recipe, not schema repair.
+        await f.observe(500, { ...bucketStock, opportunities: [
+          { ...sameTable, id: "o-10" }, { ...recipe, id: "o-11" },
+        ] });
+        expect(requests).toHaveLength(2);
+      }
       if (outcome === "malformed") {
         expect(requests[1]?.feedback?.detail).toContain("Invalid survival macro field: proposal.");
         expect(await readFile(f.file("proposals.jsonl"), "utf8")).not.toContain("raw-private-provider-content");
@@ -842,6 +858,14 @@ const ironPolicy = {
   reserves: [{ item: fuelItem, count: 1 }], maxBreaks: 0, maxCrafts: 2, maxPlacements: 1,
 } as const;
 
+function paidIron(id: string, remainingTicks: number): NonNullable<MacroObservation["pendingWork"]> {
+  return {
+    id, kind: "iron-smelting", goal: "diamond", invested: [{ item: rawIronItem, count: 2 }, { item: fuelItem, count: 2 }],
+    output: { item: ironItem, count: 2 }, location: "Dry stance beside the visible stone workshop.",
+    state: "estimated", remainingTicks, yieldable: true, parked: false,
+  };
+}
+
 test.each(["preset", "constrained"] as const)("A regular %s strategist can quote one iron batch; cooking is not completion", async mode => {
   const inventory = { [ironItem]: 1, [rawIronItem]: 2, [fuelItem]: 3, [furnaceItem]: 1 };
   const live = { goal: "diamond", inventory };
@@ -932,7 +956,8 @@ test.each(["bucket", "abstain", "wrong predecessor", "replacement", "revocation"
       expect(requests).toHaveLength(1);
       const burn = { burnTick: 111, units: 2, remainingCookTicks: result === "short cook" ? 30 : 395 };
       const burning = { ...loading, progress: { ...loading.progress, smeltBurn: burn } };
-      await f.observe(115, { goal: live.goal, inventory: deposited, workOrder: burning });
+      const paid = paidIron(batch.id, burn.remainingCookTicks);
+      await f.observe(115, { goal: live.goal, inventory: deposited, workOrder: burning, pendingWork: paid });
       if (result === "no budget" || result === "short cook") {
         expect(requests).toHaveLength(1);
         expect(await f.order()).toEqual(batch);
@@ -945,13 +970,13 @@ test.each(["bucket", "abstain", "wrong predecessor", "replacement", "revocation"
       } });
       expect(overlapSignal?.aborted).toBe(false);
       if (result !== "late" && result !== "interrupted" && result !== "blocked" && result !== "new life") release.resolve();
-      await f.observe(225, { goal: live.goal, inventory: deposited, workOrder: {
+      await f.observe(225, { goal: live.goal, inventory: deposited, pendingWork: { ...paid, remainingTicks: 285 }, workOrder: {
         ...burning, progress: { ...burning.progress, smeltBurn: { ...burn, remainingCookTicks: 285 } },
       } });
       const shouldQueue = ["bucket", "missing ingots", "missing station", "expired"].includes(result);
       expect(f.actor.status()).toMatchObject({ workQueuedAfter: shouldQueue ? batch.id : null,
         issuedWorkOrders: 1, completedModelWorkOrders: 0 });
-      await f.observe(335, { goal: live.goal, inventory: deposited, workOrder: {
+      await f.observe(335, { goal: live.goal, inventory: deposited, pendingWork: { ...paid, remainingTicks: 175 }, workOrder: {
         ...burning, progress: { ...burning.progress, smeltBurn: { ...burn, remainingCookTicks: 175 } },
       } });
       expect(requests).toHaveLength(2);
@@ -996,6 +1021,219 @@ test.each(["bucket", "abstain", "wrong predecessor", "replacement", "revocation"
       }
     } finally {
       release.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+const sideStone = {
+  target: { kind: "stock", item: "minecraft:cobblestone", count: 3 },
+  allowedEffects: ["break:minecraft:stone"], costCaps: [], reserves: ironPolicy.reserves,
+  maxBreaks: 3, maxCrafts: 0, maxPlacements: 0,
+} as const;
+const witnessedStone = {
+  id: "stone-face", verb: "break", risk: "guarded", summary: "Break visible stone beside the furnace",
+  evidence: "Dry reach from the current rendered stance.",
+  material: { subject: "block:minecraft:stone", target: "one-visible-stone", spends: {} },
+} as const;
+const returnOffer = {
+  id: "fresh-furnace-return", verb: "collect_pending", risk: "guarded", summary: "Recheck the paid furnace",
+  evidence: "A witnessed dry return to this station is still reachable.",
+} as const;
+
+test.each(["prequoted", "fallback"] as const)("A %s side grant produces stock during cooking, then leaves collection to a fresh return", async approach => {
+  const requests: MacroRequest[] = [];
+  const releaseOldReturn = Promise.withResolvers<void>();
+  const goal = "diamond";
+  const held = { [ironItem]: 1, [fuelItem]: 1, "minecraft:iron_pickaxe": 1 };
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    if (requests.length === 1) return workReply(request, { kind: "work", policy: ironPolicy,
+      ...(approach === "prequoted" ? { duringWait: { policy: sideStone, maxTicks: 600 } } : {}) });
+    if (request.work?.duringWaitFor)
+      return workReply(request, { kind: "work", policy: sideStone, duringWaitFor: request.work.duringWaitFor });
+    if (request.observation.tick === 550) await releaseOldReturn.promise;
+    return workReply(request, request.observation.pendingWork?.collectOfferId
+      ? { kind: "collect-pending", pendingWorkId: request.observation.pendingWork.id } : { kind: "abstain" });
+  }, "Find diamond and keep one plank for the workshop.", 6);
+  try {
+    await f.observe(10, { goal, inventory: { ...held, [fuelItem]: 3, [rawIronItem]: 2, [furnaceItem]: 1 },
+      opportunities: [witnessedStone] });
+    await f.actor.poll();
+    const batch = await f.order();
+    await f.receipt(batch.id, 11, "accepted");
+    const burning = {
+      id: batch.id, state: "working", detail: "Furnace is cooking two paid inputs",
+      progress: { phase: "smelt", status: "Rising vanilla cook bar", breaks: 0, crafts: 0, placements: 1,
+        smeltBurn: { burnTick: 111, units: 2, remainingCookTicks: 395 } },
+    } as const;
+    await f.observe(112, { goal, inventory: held, workOrder: burning });
+    expect(requests).toHaveLength(1);
+    expect((await f.order()).id).toBe(batch.id);
+    const ticket = paidIron(batch.id, 395);
+    await f.observe(115, { goal, inventory: held, workOrder: burning, pendingWork: ticket, opportunities: [witnessedStone] });
+    await f.actor.poll();
+    const side = await f.order();
+    expect(side).toMatchObject({ duringWaitFor: batch.id, basisTick: 115, target: sideStone.target });
+    expect(side.id).not.toBe(batch.id);
+    expect(requests).toHaveLength(approach === "prequoted" ? 1 : 2);
+    expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 0 });
+
+    await f.receipt(batch.id, 116, "parked");
+    await f.receipt(side.id, 116, "accepted");
+    const sideState = { id: side.id, state: "working", detail: "Nearby stone",
+      progress: { phase: "harvest", status: "Confirmed stone pickup", breaks: 1, crafts: 0, placements: 0,
+        lastEffect: { tick: 170, detail: "One cobblestone collected while the furnace still cooks." } } } as const;
+    const parked = { ...ticket, parked: true, yieldable: false };
+    await f.observe(170, { goal, inventory: { ...held, "minecraft:cobblestone": 1 }, workOrder: sideState,
+      pendingWork: { ...parked, remainingTicks: 336 } });
+    expect(f.actor.status()).toMatchObject({ workOrder: { id: side.id, accepted: { status: "accepted" } }, completedModelWorkOrders: 0 });
+    const due = { ...parked, state: "unknown", remainingTicks: 0 } as const;
+    await f.observe(507, { goal, inventory: { ...held, "minecraft:cobblestone": 2 }, workOrder: sideState, pendingWork: due });
+    expect((await f.order()).id).toBe(side.id);
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+
+    await f.receipt(side.id, 550, "completed");
+    const stocked = { ...held, "minecraft:cobblestone": 3 };
+    await f.observe(550, { goal, inventory: stocked, quiescent: true, opportunities: [returnOffer],
+      pendingWork: { ...due, collectOfferId: returnOffer.id } });
+    expect(f.actor.status().completedModelWorkOrders).toBe(1);
+    await f.observe(551, { goal, inventory: stocked, quiescent: true, pendingWork: due });
+    releaseOldReturn.resolve();
+    await f.actor.poll();
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    const laterOffer = { ...returnOffer, id: "returned-furnace-after-recheck" };
+    await f.observe(1150, { goal, inventory: stocked, quiescent: true, opportunities: [laterOffer],
+      pendingWork: { ...due, collectOfferId: laterOffer.id } });
+    await f.actor.poll();
+    const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+    expect(intent).toMatchObject({ opportunityId: laterOffer.id, basisTick: 1150, skillHash: null });
+    await f.receipt(intent.id, 1151, "accepted");
+    await f.receipt(batch.id, 1160, "completed"); // Parked production can settle after its original order expiry.
+    await f.receipt(intent.id, 1160, "completed");
+    await f.observe(1160, { goal, inventory: { ...stocked, [ironItem]: 3 } });
+    expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 2, completedReceipts: 1 });
+  } finally {
+    releaseOldReturn.resolve();
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test.each(["single charged unit", "held mouse", "protected stock", "dead", "wrong ticket"] as const)(
+  "A side policy cannot take control through %s", async premise => {
+    const one = premise === "single charged unit";
+    const reserve = premise === "protected stock";
+    const smelt = one ? { ...ironPolicy, target: { ...ironPolicy.target, count: 2 }, maxCrafts: 1 } : ironPolicy;
+    const seen: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      seen.push(request);
+      if (seen.length === 1) return workReply(request, { kind: "work", policy: smelt });
+      return workReply(request, { kind: "work", policy: sideStone,
+        duringWaitFor: premise === "wrong ticket" ? "wrong-batch" : request.work?.current?.id ?? "missing-batch" });
+    }, "Find diamond and reserve one oak plank.", 3);
+    try {
+      const held = { [ironItem]: 1, [fuelItem]: reserve ? 0 : 1, "minecraft:iron_pickaxe": 1 };
+      await f.observe(10, { goal: "diamond", inventory: { ...held, [fuelItem]: 3, [rawIronItem]: 2, [furnaceItem]: 1 } });
+      await f.actor.poll();
+      const batch = await f.order();
+      await f.receipt(batch.id, 11, "accepted");
+      const state = { id: batch.id, state: "working", detail: "Cooking",
+        progress: { phase: "smelt", status: "Paid burn", breaks: 0, crafts: 0, placements: 1,
+          smeltBurn: { burnTick: 111, units: one ? 1 : 2, remainingCookTicks: one ? 195 : 395 } } } as const;
+      await f.observe(115, { goal: "diamond", inventory: held, workOrder: state,
+        ...(one || premise === "held mouse" || premise === "dead" ? {} : { pendingWork: paidIron(batch.id, 395) }),
+        ...(premise === "held mouse" ? { working: { intentId: "held-break", crack: 0.5 } } : {}),
+        ...(premise === "dead" ? { health: 0 } : {}), opportunities: [witnessedStone] });
+      await f.actor.poll();
+      expect(seen[1]?.work?.duringWaitFor).toBe(reserve || premise === "wrong ticket" ? batch.id : undefined);
+      expect(f.actor.status().issuedWorkOrders).toBe(1);
+      if (premise !== "dead") expect((await f.order()).id).toBe(batch.id);
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test("Explicit deferral retires the owner only on a native park and does not count as production", async () => {
+  const defer = { id: "fresh-defer", verb: "defer_pending", risk: "low", summary: "Leave the paid workshop",
+    evidence: "The exact paid furnace released the controls." } as const;
+  const requests: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    if (request.observation.pendingWork?.parked) return workReply(request, { kind: "abstain" });
+    if (!request.work?.current) return workReply(request, { kind: "work", policy: ironPolicy });
+    return workReply(request, { kind: "defer-pending", pendingWorkId: request.work.current.id });
+  }, "Keep one plank and return to the furnace after pause.", 6);
+  try {
+    const held = { [ironItem]: 1, [fuelItem]: 1, "minecraft:iron_pickaxe": 1 };
+    await f.observe(10, { goal: "diamond", inventory: { ...held, [fuelItem]: 3, [rawIronItem]: 2, [furnaceItem]: 1 } });
+    await f.actor.poll();
+    const batch = await f.order();
+    await f.receipt(batch.id, 11, "accepted");
+    const ticket = paidIron(batch.id, 395);
+    await f.observe(115, { goal: "diamond", inventory: held, workOrder: { id: batch.id, state: "working", detail: "Cooking",
+      progress: { phase: "smelt", status: "Paid burn", breaks: 0, crafts: 0, placements: 1,
+        smeltBurn: { burnTick: 111, units: 2, remainingCookTicks: 395 } } },
+      pendingWork: { ...ticket, deferOfferId: defer.id }, opportunities: [defer] });
+    await f.actor.poll();
+    const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+    expect(intent.opportunityId).toBe(defer.id);
+    expect((await f.order()).id).toBe(batch.id);
+    await f.receipt(batch.id, 116, "parked");
+    await f.receipt(intent.id, 116, "accepted");
+    await f.receipt(intent.id, 116, "completed");
+    const parked = { ...ticket, parked: true, yieldable: false };
+    const atWorkshop = { goal: "diamond", inventory: held, quiescent: true,
+      workOrder: { id: batch.id, state: "parked", detail: "Paid output remains in the station." } } as const;
+    await f.observe(116, { ...atWorkshop, pendingWork: parked });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(f.actor.status()).toMatchObject({ workOrder: null, completedModelWorkOrders: 0, completedReceipts: 0 });
+    await f.observe(210, { ...atWorkshop, pendingWork: { ...parked, remainingTicks: 300 } });
+    await f.actor.poll();
+    expect(requests).toHaveLength(3); // One request on the native park, not a periodic timer.
+    await f.observe(300, { ...atWorkshop, pendingWork: { ...parked, remainingTicks: 210 } });
+    await f.observe(400, { ...atWorkshop, pendingWork: { ...parked, remainingTicks: 110 } });
+    expect(requests).toHaveLength(3);
+    await f.observe(520, { ...atWorkshop, opportunities: [returnOffer],
+      pendingWork: { ...parked, state: "unknown", remainingTicks: 0, collectOfferId: returnOffer.id } });
+    expect(requests).toHaveLength(4);
+    expect(requests[3]?.observation.pendingWork?.collectOfferId).toBe(returnOffer.id);
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test.each(["ordinary opportunity", "duplicate production", "remembered description only"] as const)(
+  "A remembered ticket grants no authority through %s", async attempted => {
+    const seen: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      seen.push(request);
+      return workReply(request, attempted === "ordinary opportunity" ? { kind: "opportunity", opportunityId: returnOffer.id } :
+        attempted === "duplicate production" ? { kind: "work", policy: ironPolicy } :
+          { kind: "collect-pending", pendingWorkId: "old-paid-batch" });
+    }, "Keep one plank and recover only genuinely located resources.", 4);
+    try {
+      const returns = attempted !== "remembered description only";
+      const live = { goal: "diamond", quiescent: true,
+        inventory: { [ironItem]: 1, [fuelItem]: 3, [rawIronItem]: 2, [furnaceItem]: 1 },
+        pendingWork: { ...paidIron("old-paid-batch", 0), historical: true, state: "unknown",
+          parked: true, yieldable: false, ...(returns ? { collectOfferId: returnOffer.id } : {}) },
+        opportunities: returns ? [returnOffer] : [],
+      } as const;
+      await f.observe(10, live);
+      await f.actor.poll();
+      await f.observe(150, live);
+      await f.actor.poll();
+      expect(seen).toHaveLength(1);
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      expect(f.actor.status()).toMatchObject({ completedReceipts: 0, completedModelWorkOrders: 0 });
+    } finally {
       await f.actor.stop();
       await f.clean();
     }

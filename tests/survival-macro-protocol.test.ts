@@ -92,6 +92,42 @@ test("Iron smelting and furnace placement require an exact, single live stock po
   expect(() => withBurn("smelt", { ...burn, remainingCookTicks: 401 })).toThrow();
 });
 
+test("Pending stock is not inventory or a permission to spend, replace, or renew production", () => {
+  const ticket = {
+    id: "paid-batch", kind: "iron-smelting", goal: "diamond", invested: [
+      { item: "minecraft:raw_iron", count: 2 }, { item: "minecraft:coal", count: 1 },
+    ], output: { item: "minecraft:iron_ingot", count: 2 }, location: "Dry workshop", state: "estimated",
+    remainingTicks: 350, parked: false, yieldable: true,
+  };
+  const sample = {
+    v: 1, tick: 60, life: 1, epoch: 1, run: "run", goal: "diamond", health: 20, food: 20,
+    quiescent: false, inventory: { "minecraft:iron_ingot": 1 }, opportunities: [], recent: [],
+    safety: { clear: true, revision: 1 }, workOrder: { id: ticket.id, state: "working", detail: "Cooking" },
+    pendingWork: ticket,
+  };
+  expect(parseMacroObservation(sample)).toMatchObject({
+    inventory: { "minecraft:iron_ingot": 1 }, pendingWork: { output: ticket.output, invested: ticket.invested },
+  });
+  expect(() => parseMacroObservation({ ...sample, pendingWork: { ...ticket, collectOfferId: "made-up" } })).toThrow("pending work opportunity");
+  expect(() => parseMacroObservation({ ...sample, working: { intentId: "held-mouse", crack: 0.2 } })).toThrow("pending work scope");
+  expect(() => parseMacroObservation({ ...sample, pendingWork: { ...ticket, historical: true } })).toThrow("pending work scope");
+  const side = {
+    target: { kind: "stock", item: "minecraft:cobblestone", count: 2 }, allowedEffects: ["break:minecraft:stone"],
+    costCaps: [], reserves: [], maxBreaks: 2, maxCrafts: 0, maxPlacements: 0,
+  };
+  const order = { v: 1, id: "side-stock", run: "run", life: 1, epoch: 1, safetyRevision: 1,
+    basisTick: 60, expiresTick: 660, origin: "model", duringWaitFor: ticket.id, ...side };
+  expect(parseMacroWorkOrder(order).duringWaitFor).toBe(ticket.id);
+  expect(() => parseMacroWorkOrder({ ...order, expiresTick: 661 })).toThrow("work expiry");
+  expect(() => parseMacroWorkOrder({ ...order, maxPlacements: 1 })).toThrow("local pending side policy");
+  const proposal = { subgoal: "Build useful cave stock", reason: "Visible stone", successCondition: "Two real cobblestone",
+    contingency: "Stop on risk", alternative: "Wait for the kitchen", expiresTick: 660 };
+  expect(() => parseMacroProposal({ ...proposal, action: { kind: "work", policy: side,
+    duringWaitFor: ticket.id, afterWorkId: ticket.id } })).toThrow("exclusive work relationship");
+  expect(() => parseMacroProposal({ ...proposal, action: { kind: "skill", candidate: { source: "pass", parentGeneration: 0,
+    verbs: ["survey"], duringWaitFor: ticket.id } } })).toThrow();
+});
+
 test("Deep diamond work is explicit, standalone, and does not imply cover or torches", () => {
   const explore = "prospect:minecraft:diamond", ore = "break:minecraft:deepslate_diamond_ore";
   const torch = "place:minecraft:torch";

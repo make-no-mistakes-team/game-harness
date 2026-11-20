@@ -639,6 +639,11 @@ final class AgentProgress {
         caves.witnessedDry(to, from);
     }
 
+    /** One remembered edge only; the scoped actor must re-witness its dry lane before movement. */
+    BlockPos macroPendingStep(BlockPos from, BlockPos stationFoot) {
+        return memory.pendingFlatStep(c.world, trail, from, stationFoot);
+    }
+
     private void recordDryCaveFooting(BlockPos from, BlockPos to) {
         int prior = trail.lastIndexOf(from);
         if (prior < 0) {

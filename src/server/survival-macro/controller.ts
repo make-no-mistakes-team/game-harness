@@ -8,16 +8,16 @@ import {
   type FirstPlanInference, type FirstPlanRequest, type FirstPlanStrategist,
 } from "./bootstrap.ts";
 import {
-  MACRO_CAPABILITIES_VERSION, MACRO_IRON_SMELT, MACRO_WATER_CLUE, MACRO_WATER_FILL,
-  MACRO_SMELT_OVERLAP_MIN_COOK_TICKS,
+  MACRO_CAPABILITIES_VERSION, MACRO_COLLECT_PENDING, MACRO_DEFER_PENDING, MACRO_IRON_SMELT, MACRO_WATER_CLUE, MACRO_WATER_FILL,
+  MACRO_PENDING_SIDE_MAX_TICKS, MACRO_SMELT_OVERLAP_MIN_COOK_TICKS,
   MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_PLANNING_IDLE_MS, MACRO_LOOKAHEAD_MAX_AGE_TICKS, MACRO_LOOKAHEAD_MAX_CRACK,
   MacroDirectory, MacroObservationRotating, MacroValidationError,
-  hasDirectAuthority, liveCorrectionEvidence, macroReplyRejectionDetail, matchesMaterial,
+  hasDirectAuthority, isPendingWorkVerb, liveCorrectionEvidence, macroReplyRejectionDetail, matchesMaterial,
   parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
   parseMacroProposal, parseMacroReceipt, parseMacroRevocation, parseMacroWorkOrder, sameLiveCorrectionScope, validateMacroId,
   type MacroBasis, type MacroDirectAction, type MacroFeedback, type MacroFrame, type MacroHandoff, type MacroInference, type MacroIntent,
-  type MacroLookahead, type MacroObservation, type MacroOpportunity, type MacroPlanning,
+  type MacroLookahead, type MacroObservation, type MacroOpportunity, type MacroParkedReceipt, type MacroPlanning,
   type MacroProposal, type MacroReceipt, type MacroReplyRejection, type MacroRequest, type MacroSkillReceipt, type MacroStockFloor,
   type MacroStrategist, type MacroSuccessor,
   type MacroTrigger, type MacroWorkDemand, type MacroWorkMode, type MacroWorkOrder, type MacroWorkPolicy, type MacroWorkStage,
@@ -294,6 +294,10 @@ interface WorkJob {
   health: number;
   bootstrap?: number;
   smeltLookedAhead?: true;
+  pendingPurpose?: Pick<MacroProposal, "subgoal" | "reason">;
+  preparedSide?: NonNullable<Extract<MacroProposal["action"], { kind: "work" }>["duringWait"]>;
+  sidePublished?: true;
+  parked?: MacroParkedReceipt;
   accepted?: MacroReceipt;
   terminal?: MacroReceipt;
   withdrawn?: true;
@@ -306,6 +310,8 @@ interface QueuedWork {
   readonly next: number;
   readonly bootstrap?: { readonly branchIndex: number; readonly declaredStages: number; readonly stageOffset: number };
   readonly smeltSuccessor?: true;
+  readonly pendingPurpose?: WorkJob["pendingPurpose"];
+  readonly preparedSide?: WorkJob["preparedSide"];
 }
 
 interface WorkOverlap {
@@ -423,8 +429,16 @@ function sameBasis(left: MacroBasis | undefined, right: MacroBasis): boolean {
 }
 
 function sameOffer(left: MacroOpportunity | undefined, right: MacroOpportunity | undefined): left is MacroOpportunity {
-  return !!left && !!right && left.id === right.id && left.verb === right.verb && left.summary === right.summary &&
+  return !!left && !!right && left.id === right.id && sameAffordance(left, right);
+}
+
+function sameAffordance(left: MacroOpportunity, right: MacroOpportunity): boolean {
+  return left.verb === right.verb && left.summary === right.summary &&
     left.risk === right.risk && left.evidence === right.evidence && sameMaterial(left.material, right.material);
+}
+
+function workAffordance(offer: MacroOpportunity): boolean {
+  return offer.risk !== "read" || offer.material !== undefined;
 }
 
 function sameMaterial(left: MacroOpportunity["material"], right: MacroOpportunity["material"]): boolean {
@@ -544,9 +558,24 @@ function offeredOpeningStart(observation: MacroObservation, policy: MacroWorkPol
   });
 }
 
+function witnessedSideStart(observation: MacroObservation, policy: MacroWorkPolicy): boolean {
+  if (confirmsWorkStock(observation, policy) || !hasStock(observation, policy.reserves) || policy.costCaps.some(({ item, count }) =>
+    stock(observation, item) - count < (policy.reserves.find(floor => floor.item === item)?.count ?? 0))) return false;
+  if (offeredOpeningStart(observation, policy)) return true;
+  if (policy.maxBreaks && observation.opportunities.some(offer => offer.risk === "guarded" && offer.verb === "break" &&
+      offer.material?.subject.startsWith("block:") &&
+      policy.allowedEffects.includes(`break:${offer.material.subject.slice("block:".length)}`) &&
+      protectsStock(policy.reserves, observation, offer))) return true;
+  return policy.maxCrafts > 0 && policy.target.kind === "stock" &&
+    policy.allowedEffects.includes(`craft:${policy.target.item.slice("minecraft:".length)}`) &&
+    preflightVanillaWork(observation, [{ policy, requires: [] }]).kind === "possible";
+}
+
 function workEvidence(observation: MacroObservation, lastReceipt: MacroReceipt | null): string {
+  const pending = observation.pendingWork;
   return digest([observation.run, observation.life, observation.goal, observation.safety,
     lastReceipt?.life === observation.life ? lastReceipt.id : null,
+    pending ? [pending.id, pending.state, pending.parked, pending.yieldable, !!pending.collectOfferId, !!pending.deferOfferId] : null,
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b))]);
 }
 
@@ -627,9 +656,10 @@ export class SurvivalMacroController {
   private newestJob?: WorkJob;
   private lastAcceptedJob?: WorkJob;
   private lastJobOutcome?: WorkJob;
-  private workQuery?: { readonly key: string; tick: number; readonly evidence: string; abstained?: true };
+  private workQuery?: { readonly key: string; tick: number; readonly evidence: string; mayRecoverOnAffordance?: true };
   private readonly workHandoffQueries = new Set<string>();
   private readonly workOverlapRequests = new Set<string>();
+  private returnWitnessRevision = 0;
   private floorScope?: { readonly life: number; readonly reserves: readonly MacroStockFloor[] };
   private completedWorkOrders = 0;
   private completedModelWorkOrders = 0;
@@ -853,6 +883,7 @@ export class SurvivalMacroController {
       }
     }
     if (this.pending && (runtimeExpired || !current || !scope(this.pending.scope, current) || !alive(current) ||
+      (isPendingWorkVerb(this.pending.offer.verb) && !workScope(this.pending.scope, current)) ||
       current.tick > this.pending.intent.expiresTick)) {
       await this.withdraw(runtimeExpired ? "runtime_wall_limit" : "native_scope_or_ttl_changed");
     }
@@ -885,7 +916,7 @@ export class SurvivalMacroController {
         (this.busy.kind === "inference"
           ? work.context.correction ? (!!observed && !this.replyCorrectionApplies(work.context.correction, current)) :
             work.context.lookahead ? lookaheadStale : work.context.workDemand ?
-              !workScope(work.context.observation, current) || !this.smeltOverlapCurrent(work.context, current) :
+              !workScope(work.context.observation, current) || !this.pendingDecisionCurrent(work.context, current) :
             !sameGoalAndLife(work.context.observation, current) || !alive(current)
           : !samePlayableScope(work.context.observation, current) || current.tick >= this.busy.plan.proposal.expiresTick));
       if (runtimeExpired || stale || (!work.result && now >= work.until)) {
@@ -948,7 +979,7 @@ export class SurvivalMacroController {
     if (!this.job && finished?.stage === PRE_SPAWN_GOAL_ONLY && finished.basis.life === current.life &&
         finished.goal === current.goal && (finished.invocationItemCount ?? 0) > 0 &&
         stock(current, `minecraft:${current.goal}`) > 0) return;
-    if (this.workMode === "preset" && !this.bootstrappedWork && !this.job && this.config.strategist &&
+    if (this.workMode === "preset" && !this.bootstrappedWork && !this.job && !current.pendingWork && this.config.strategist &&
         !this.unavailable && alive(current) && current.safety?.clear === true) {
       this.bootstrappedWork = true;
       const goal = SURVIVAL_AGENT_GOALS.find(goal => goal === current.goal);
@@ -960,6 +991,9 @@ export class SurvivalMacroController {
       }, "preset", null, current.tick + this.limits.maxIntentTtlTicks);
       if (this.job) return;
     }
+    // A chosen contingent side needs no second provider request and may run
+    // even after the request budget is exhausted.
+    if (this.workMode && await this.tryPreparedSide(current)) return;
     if (this.requests >= this.limits.maxRequests) {
       if (!this.budget) {
         this.budget = "requests";
@@ -1192,6 +1226,7 @@ export class SurvivalMacroController {
     const { observation } = view;
     if (!this.config.strategist || this.unavailable || !alive(observation) || observation.safety?.clear !== true) return;
     const job = this.job;
+    if (job?.order.duringWaitFor) return; // Finite single owner: no overlap or renewal of a side leg.
     const complete = this.completedWorkProgram;
     if (!job && complete?.finalOrder.target.kind === "preset" &&
         complete.basis.life === observation.life && complete.goal === observation.goal) return;
@@ -1202,6 +1237,9 @@ export class SurvivalMacroController {
       // A paid batch cannot be renewed or replaced. Only an observed cook can
       // open a one-shot, contingent successor query while this batch runs.
       const burn = nativeState?.progress?.smeltBurn;
+      // A paid multi-unit batch publishes its offers only after clean Esc.
+      // Don't spend the fallback request on an earlier occupied GUI view.
+      if (burn && burn.units > 1 && !observation.pendingWork) return;
       const wallTicks = (this.startedAt! + this.limits.maxRuntimeMs - performance.now()) / 50;
       if (queue || job.order.origin !== "model" || !job.accepted || job.terminal || job.withdrawn || job.smeltLookedAhead ||
           nativeState?.state !== "working" || !burn || burn.burnTick <= job.accepted.tick ||
@@ -1247,7 +1285,7 @@ export class SurvivalMacroController {
     if (previous && job && !needsRenewal && !nextCourse && !overlap) return;
     const outcome = this.lastJobOutcome && sameGoalAndLife(this.lastJobOutcome.source, observation) ? this.lastJobOutcome : undefined;
     const outcomeState = outcome && outcome.order.id === observation.workOrder?.id ? observation.workOrder : null;
-    const evidence = workEvidence(observation, this.lastReceipt);
+    const evidence = digest([workEvidence(observation, this.lastReceipt), this.returnWitnessRevision]);
 
     let demand: MacroWorkDemand["demand"];
     let key: string;
@@ -1274,33 +1312,71 @@ export class SurvivalMacroController {
     if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew") return;
     const correction = !job ? this.replyCorrection : undefined;
     const unchanged = previous && (key === previous.key || (!job && demand === "changed" && previous.evidence === evidence));
-    // A durable demand can stay unchanged while an abstention's premise gains
-    // a witnessed option or a neutral handoff. Use the live view after settlement.
+    // An idle abstention can recover on a genuinely new actionable witness or
+    // neutral handoff, not when the same affordance is issued a different ID.
     if (unchanged && !correction) {
       const asked = this.lastAsked?.observation;
-      if (job || !previous.abstained || !asked ||
+      if (job || !previous.mayRecoverOnAffordance || !asked ||
           (!(observation.quiescent && !asked.quiescent) && !observation.opportunities.some(offer =>
-            !sameOffer(offer, asked.opportunities.find(prior => prior.id === offer.id))))) return;
+            workAffordance(offer) && !asked.opportunities.some(prior => sameAffordance(offer, prior))))) return;
     }
-    const handoffQuery = !job && (observation.quiescent || observation.opportunities.length > 0)
-      ? digest([evidence, observation.quiescent, orderedOpportunities(observation)]) : null;
+    const handoffQuery = !job && (observation.quiescent || observation.opportunities.some(workAffordance))
+      ? digest([evidence, liveCorrectionEvidence({ ...observation, opportunities: observation.opportunities.filter(workAffordance) })]) : null;
     if (unchanged && !correction && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
     if (handoffQuery) this.workHandoffQueries.add(handoffQuery);
     if (!correction) this.workQuery = { key, tick: observation.tick, evidence };
     if (overlap?.smeltBurnTick !== undefined) overlap.incumbent.smeltLookedAhead = true;
     else if (overlap && owner) this.workOverlapRequests.add(owner);
+    const ticket = observation.pendingWork;
+    const purpose = ticket && this.jobs.get(ticket.id)?.pendingPurpose;
     const workDemand: MacroWorkDemand = {
       mode: this.workMode!, demand,
       protectedReserves: this.floorScope?.life === observation.life ? this.floorScope.reserves : [],
       current: job ? { id: job.order.id, origin: job.order.origin, policy: job.policy,
         expiresTick: job.order.expiresTick, accepted: job.accepted ?? null, nativeState } : null,
+      ...(job && this.sideWindow(job, observation) ? { duringWaitFor: job.order.id } : {}),
+      ...(purpose ? { pendingPurpose: { id: ticket!.id, ...purpose } } : {}),
       lastOutcome: outcome?.terminal ? { id: outcome.order.id, policy: outcome.policy,
         receipt: outcome.terminal, nativeState: outcomeState } : null,
     };
     await this.begin(view, { workDemand, workOverlap: overlap, correction });
   }
 
-  private smeltOverlapCurrent(context: Decision, current: MacroObservation): boolean {
+  private sideWindow(job: WorkJob, observation: MacroObservation): boolean {
+    const ticket = observation.pendingWork;
+    const burn = observation.workOrder?.progress?.smeltBurn;
+    return this.job === job && !this.previousJob && !this.pending && !this.queuedWork &&
+      !!job.accepted && !job.terminal && !job.withdrawn && !job.parked && !job.sidePublished &&
+      job.policy.allowedEffects.includes(MACRO_IRON_SMELT) &&
+      !!ticket?.yieldable && !ticket.parked && !ticket.historical && ticket.id === job.order.id &&
+      ticket.goal === observation.goal && ticket.state === "estimated" &&
+      observation.workOrder?.id === job.order.id && observation.workOrder.state === "working" &&
+      !!burn && burn.burnTick > job.accepted.tick && ticket.output.count === burn.units && burn.units <= job.policy.maxCrafts &&
+      (ticket.remainingTicks ?? 0) > 0 && observation.tick < job.order.expiresTick &&
+      performance.now() - this.observedAt <= this.limits.maxObservationAgeMs &&
+      workScope(job.source, observation, job.health);
+  }
+
+  private async tryPreparedSide(current: MacroObservation): Promise<boolean> {
+    const job = this.job;
+    const side = job?.preparedSide;
+    if (!job || !side || !job.requestId || !this.sideWindow(job, current)) return false;
+    if (!witnessedSideStart(current, side.policy)) return false;
+    const admitted = await this.publishPendingSide(job, current, job.requestId, side.policy, current.tick + side.maxTicks);
+    if (admitted !== null) job.preparedSide = undefined;
+    return admitted !== undefined;
+  }
+
+  private publishPendingSide(job: WorkJob, witness: MacroObservation, requestId: string,
+    policy: MacroWorkPolicy, expiresTick: number): Promise<WorkJob | null | undefined> {
+    return this.publishWork(witness, policy, "model", requestId, expiresTick, [], undefined,
+      fresh => this.sideWindow(job, fresh) && witnessedSideStart(fresh, policy), undefined, undefined, job.order.id);
+  }
+
+  private pendingDecisionCurrent(context: Decision, current: MacroObservation): boolean {
+    const witness = context.observation.pendingWork;
+    if (witness?.collectOfferId &&
+        (current.pendingWork?.id !== witness.id || current.pendingWork.collectOfferId !== witness.collectOfferId)) return false;
     const overlap = context.workOverlap;
     if (overlap?.smeltBurnTick === undefined) return true;
     const { incumbent } = overlap;
@@ -1423,6 +1499,10 @@ export class SurvivalMacroController {
     if (job === null) return; // A rotating observation is not a denied program stage.
     if (!job && (bootstrap || afterSmelt)) return this.discardQueuedWork(queued, rejection);
     this.queuedWork = undefined;
+    if (job) {
+      if (queued.preparedSide) job.preparedSide = queued.preparedSide;
+      if (queued.pendingPurpose) job.pendingPurpose = queued.pendingPurpose;
+    }
     if (job && (stages.length > 1 || (job.order.origin === "model" && policy.target.kind === "preset"))) {
       if (bootstrap) job.bootstrap = index + stageOffset + 1;
       this.queuedWork = { ...queued, after: job, next: index + 1 };
@@ -1437,6 +1517,7 @@ export class SurvivalMacroController {
     admitFresh?: (observation: MacroObservation) => boolean,
     stage?: WorkStageIds,
     preflight?: (observation: MacroObservation) => boolean | Promise<boolean>,
+    duringWaitFor?: string,
   ): Promise<WorkJob | null | undefined> {
     const fresh = await this.refresh();
     if (!fresh) return null;
@@ -1447,9 +1528,14 @@ export class SurvivalMacroController {
       return;
     }
     const previous = this.job;
-    if (previous?.policy.allowedEffects.includes(MACRO_IRON_SMELT) || previous?.policy.allowedEffects.includes(MACRO_WATER_FILL)) {
+    if (!duringWaitFor && (previous?.policy.allowedEffects.includes(MACRO_IRON_SMELT) ||
+        previous?.policy.allowedEffects.includes(MACRO_WATER_FILL) || previous?.order.duringWaitFor)) {
       if (requestId) await this.disposition("proposal_refused", { requestId, reason: previous.policy.allowedEffects.includes(MACRO_WATER_FILL)
         ? "Wait for the finite bucket work order to settle." : "Wait for the finite iron work order to settle." });
+      return;
+    }
+    if (policy.allowedEffects.includes(MACRO_IRON_SMELT) && fresh.pendingWork) {
+      if (requestId) await this.disposition("proposal_refused", { requestId, reason: "One pending production obligation is already outstanding." });
       return;
     }
     const equivalent = !!previous && workPolicyKey(previous.policy) === workPolicyKey(policy);
@@ -1470,13 +1556,16 @@ export class SurvivalMacroController {
     if (preflight && !await preflight(fresh)) return;
     const order = parseMacroWorkOrder({
       v: 1, id: stage?.id ?? randomUUID(), run: fresh.run, life: fresh.life, epoch: fresh.epoch, basisTick: fresh.tick,
-      expiresTick: Math.min(expiresTick, fresh.tick + this.limits.maxIntentTtlTicks),
+      expiresTick: Math.min(expiresTick, fresh.tick + this.limits.maxIntentTtlTicks,
+        duringWaitFor ? fresh.tick + MACRO_PENDING_SIDE_MAX_TICKS : Infinity),
       safetyRevision: fresh.safety!.revision, origin: equivalent ? previous.order.origin : origin, ...policy,
       ...(!equivalent && stage?.nextWorkId ? { nextWorkId: stage.nextWorkId } : {}),
+      ...(duringWaitFor ? { duringWaitFor } : {}),
     });
     await this.record("work_order_prepared", { requestId, order, previousId: previous?.order.id ?? null, equivalent });
     if (this.closing || this.config.signal?.aborted) return;
     await this.ipc!.write("work.json", order, previous ? "work-only" : undefined);
+    if (duringWaitFor && previous) previous.sidePublished = true;
     if (previous?.accepted) this.previousJob = previous;
     this.job = this.newestJob = { order, policy, requestId, source: fresh, health: fresh.health };
     this.jobs.set(order.id, this.job);
@@ -1488,7 +1577,7 @@ export class SurvivalMacroController {
   private async restorePreviousWork(candidate: WorkJob, current: MacroObservation, reason: string): Promise<boolean> {
     const previous = this.previousJob;
     const native = current.workOrder;
-    if (this.closing || !previous || this.job !== candidate || candidate.accepted ||
+    if (this.closing || !previous || this.job !== candidate || candidate.accepted || previous.parked ||
         previous.withdrawn || previous.terminal || current.tick >= previous.order.expiresTick ||
         !workScope(previous.source, current, previous.health)) return false;
     // An unconfirmed candidate is safe to roll back only when admission has
@@ -1551,6 +1640,9 @@ export class SurvivalMacroController {
     if (complete && (complete.basis.life !== observation.life || complete.goal !== observation.goal || !alive(observation) ||
         observation.safety?.clear !== true || complete.finalOrder.safetyRevision !== observation.safety.revision ||
         !confirmsWorkStock(observation, complete.finalOrder))) this.completedWorkProgram = null;
+    if (observation.pendingWork?.collectOfferId &&
+        (before?.pendingWork?.id !== observation.pendingWork.id || !before.pendingWork.collectOfferId))
+      this.returnWitnessRevision++;
     const evidence = evidenceKey(observation);
     this.observedAt = performance.now();
     this.view = {
@@ -1597,9 +1689,12 @@ export class SurvivalMacroController {
 
   private async readReceipts(closing = false): Promise<void> {
     const ipc = this.ipc!;
-    const maxBytes = Math.min(Number.MAX_SAFE_INTEGER, (2 * (this.issued.size + this.jobs.size) + 2) * 4_097);
+    const maxBytes = Math.min(Number.MAX_SAFE_INTEGER, (2 * this.issued.size + 3 * this.jobs.size + 2) * 4_097);
     let batch = await ipc.readNativeReceiptLines(this.journal, maxBytes);
-    const fallback = batch ? null : await ipc.read("receipt.json", parseMacroReceipt);
+    const fallback = batch ? null : await ipc.read("receipt.json", value => {
+      // A park has to be journaled alongside acceptance and terminal settlement.
+      return (value as { status?: unknown } | null)?.status === "parked" ? null : parseMacroReceipt(value);
+    });
     // Native publishes the append-only receipt before the corresponding latest file.
     if (fallback) batch = await ipc.readNativeReceiptLines(this.journal, maxBytes);
     if (batch) {
@@ -1619,8 +1714,26 @@ export class SurvivalMacroController {
     await this.receive(receipt);
   }
 
-  private async receive(receipt: MacroReceipt): Promise<void> {
+  private async receive(receipt: MacroReceipt | MacroParkedReceipt): Promise<void> {
     const job = this.jobs.get(receipt.id);
+    if (receipt.status === "parked") {
+      if (!job || !job.policy.allowedEffects.includes(MACRO_IRON_SMELT) || !job.accepted ||
+          receipt.run !== job.order.run || receipt.life !== job.order.life || receipt.tick < job.accepted.tick ||
+          receipt.tick > job.order.expiresTick ||
+          (job.parked ? digest(job.parked) !== digest(receipt) : !!job.terminal))
+        throw new Error("Native park receipt does not match its admitted production job.");
+      if (job.parked) return;
+      job.parked = receipt;
+      const eligible = !job.withdrawn && (this.view?.observation.life ?? receipt.life) === receipt.life;
+      await this.append(this.receipts, { requestId: job.requestId, order: job.order, receipt, eligible });
+      if (this.job === job) {
+        await this.ipc!.remove("work.json");
+        this.job = undefined;
+        this.handoffAfterTick = Math.max(this.handoffAfterTick, receipt.tick - 1);
+      }
+      if (this.previousJob === job) this.previousJob = undefined;
+      return;
+    }
     if (job) {
       await this.receiveWork(job, receipt);
       return;
@@ -1650,7 +1763,7 @@ export class SurvivalMacroController {
     record.terminal = receipt;
     if (eligible) this.episodeMemory.terminal(record.requestId, record.offer, receipt);
     this.terminalReceipts++;
-    if (receipt.status === "completed") {
+    if (receipt.status === "completed" && record.offer.verb !== MACRO_DEFER_PENDING) {
       if (eligible) this.completedReceipts++;
       else this.lateCompletedReceipts++;
     }
@@ -1686,7 +1799,8 @@ export class SurvivalMacroController {
     const { order } = job;
     const prior = receipt.status === "accepted" ? job.accepted : job.terminal;
     if (receipt.run !== order.run || receipt.life !== order.life || receipt.tick < order.basisTick ||
-        ((receipt.status === "accepted" || receipt.status === "completed") && receipt.tick > order.expiresTick) ||
+        ((receipt.status === "accepted" || (receipt.status === "completed" && !job.parked)) && receipt.tick > order.expiresTick) ||
+        (job.parked && receipt.tick < job.parked.tick) ||
         (prior ? digest(prior) !== digest(receipt) : job.terminal ||
           (job.accepted && receipt.tick < job.accepted.tick) || (receipt.status === "completed" && !job.accepted))) {
       throw new Error("Native work receipt does not match its admitted job.");
@@ -1698,6 +1812,8 @@ export class SurvivalMacroController {
       ...(job.bootstrap ? { stage: PRE_SPAWN_GOAL_ONLY, programStage: job.bootstrap } : {}),
       ...(job.withdrawn ? { afterWithdrawal: true } : {}), ...(priorLife ? { priorLife: true } : {}) });
     if (receipt.status === "accepted") {
+      if (order.duringWaitFor && !this.jobs.get(order.duringWaitFor)?.parked)
+        throw new Error("Native side work was accepted without parking its production predecessor.");
       job.accepted = receipt;
       if (eligible) {
         this.lastAcceptedJob = job;
@@ -1835,7 +1951,7 @@ export class SurvivalMacroController {
       work: this.work({ requestId, observation, generation, testedSkills, selectedSkillHash,
         lookahead, workDemand, workOverlap, replyKey, correction }, this.limits.requestTimeoutMs, async signal => {
         if (lookahead) return this.config.strategist!(request, signal);
-        if (workDemand?.current) return this.config.strategist!({ ...request,
+        if (workDemand?.current && (!workDemand.duringWaitFor || !this.config.frame)) return this.config.strategist!({ ...request,
           strategicEpisodes: this.episodeMemory.forObservation(observation) }, signal);
         let sample: MacroFrame | undefined;
         try {
@@ -1849,7 +1965,7 @@ export class SurvivalMacroController {
         }
         // Authoring source and the in-memory history projection are not copied to the request log.
         const input = {
-          ...request, nativeReview: this.config.nativeReview?.context,
+          ...request, nativeReview: workDemand?.current ? undefined : this.config.nativeReview?.context,
           strategicEpisodes: this.episodeMemory.forObservation(observation),
         };
         if (!sample) return this.config.strategist!(input, signal);
@@ -1952,7 +2068,7 @@ export class SurvivalMacroController {
     const context = busy.work.context;
     const stale = runtimeExpired || !current || (context.correction && !this.replyCorrectionApplies(context.correction, current)) ||
       (context.lookahead ? !lookaheadScope(context.lookahead, current) :
-      context.workDemand ? !workScope(context.observation, current) || !this.smeltOverlapCurrent(context, current) :
+      context.workDemand ? !workScope(context.observation, current) || !this.pendingDecisionCurrent(context, current) :
         !samePlayableScope(context.observation, current)) ||
       (busy.kind !== "inference" && current.tick >= busy.plan.proposal.expiresTick);
     const late = result.settledAt > busy.work.until || busy.work.cancel.signal.aborted;
@@ -2114,15 +2230,17 @@ export class SurvivalMacroController {
     if (!proposal || !current || this.closing) return;
     const smeltOverlap = context.workOverlap?.smeltBurnTick !== undefined;
     if (smeltOverlap && proposal.action.kind !== "abstain" && proposal.action.kind !== "work" &&
-        proposal.action.kind !== "work-program") {
+        proposal.action.kind !== "work-program" && proposal.action.kind !== "defer-pending") {
       if (disposition === "proposed") await this.record("work_successor_discarded", { requestId: context.requestId,
         afterWorkId: context.workOverlap!.incumbent.order.id, reason: "overlap_requires_bound_successor" });
       return;
     }
-    // An otherwise valid abstention may have outlived its old view. It still
-    // authorized no effect, and must not suppress a newly witnessed decision.
-    if (proposal.action.kind === "abstain" && context.workDemand && this.workQuery &&
-        model && basisMatches && ttlValid && !runtimeExpired && !late) this.workQuery.abstained = true;
+    // The incumbent's planned wait (including a blocking furnace cook) is
+    // one-shot. Idle abstention is different: even an expired reply authorized
+    // nothing and must not hide a newly actionable witness. Explicit deferral
+    // instead advances on the native park/return transitions, not this flag.
+    if (proposal.action.kind === "abstain" && context.workDemand?.current === null && this.workQuery &&
+        model && basisMatches && ttlValid && !runtimeExpired && !late) this.workQuery.mayRecoverOnAffordance = true;
     if (disposition !== "proposed") {
       // The provider chose a pure function, not a durable live command. A
       // stale movement premise may still yield bounded independent testing,
@@ -2141,12 +2259,34 @@ export class SurvivalMacroController {
       return;
     }
     const action = proposal.action;
+    if (action.kind === "collect-pending" || action.kind === "defer-pending") {
+      const ticket = context.observation.pendingWork;
+      if (!context.workDemand || ticket?.id !== action.pendingWorkId) {
+        await this.disposition("proposal_refused", { requestId: context.requestId, reason: "Pending action requires the live observed ticket." });
+        return;
+      }
+      const offerId = action.kind === "collect-pending" ? ticket.collectOfferId : ticket.deferOfferId;
+      if (!offerId) {
+        await this.disposition("proposal_refused", { requestId: context.requestId, reason: "The pending action had no fresh native offer." });
+        return;
+      }
+      await this.issue({ ...context, proposal }, context.observation, offerId);
+      return;
+    }
     if (action.kind === "work" || action.kind === "work-program" || action.kind === "revoke-work") {
       if (!context.workDemand) {
         await this.disposition("proposal_refused", { requestId: context.requestId, reason: "Durable work was not offered." });
         return;
       }
       const overlap = context.workOverlap;
+      if (action.kind === "work" && action.duringWaitFor) {
+        const job = overlap?.incumbent;
+        const admitted = job && action.duringWaitFor === context.workDemand.duringWaitFor &&
+          await this.publishPendingSide(job, original, context.requestId, action.policy, proposal.expiresTick);
+        if (!admitted) await this.disposition("proposal_refused", { requestId: context.requestId,
+          reason: "Independent work requires the same free-hands ticket and a fresh local path using only held stock." });
+        return;
+      }
       if (overlap) {
         const { incumbent, queue } = overlap;
         const sameIncumbent = this.job === incumbent || (!this.job && incumbent.terminal?.status === "completed");
@@ -2193,7 +2333,10 @@ export class SurvivalMacroController {
       }
       await this.previewWorkResources(context.requestId, current, stages);
       await this.preemptQueuedWork(context.requestId);
-      this.queuedWork = { after: null, plan, stages, next: 0 };
+      this.queuedWork = { after: null, plan, stages, next: 0,
+        ...(action.kind === "work" && action.policy.allowedEffects.includes(MACRO_IRON_SMELT)
+          ? { pendingPurpose: { subgoal: proposal.subgoal, reason: proposal.reason } } : {}),
+        ...(action.kind === "work" && action.duringWait ? { preparedSide: action.duringWait } : {}) };
       return;
     }
     if (context.workDemand?.current && action.kind !== "abstain" && action.kind !== "gap") {
@@ -2590,22 +2733,44 @@ export class SurvivalMacroController {
       await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "A water clue grants no primitive or skill action." });
       return false;
     }
+    const action = plan.proposal.action;
+    const pendingAction = action.kind === "collect-pending" || action.kind === "defer-pending" ? action : undefined;
+    if (isPendingWorkVerb(before.verb) !== !!pendingAction || (pendingAction && authority)) {
+      await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "Pending station use needs explicit ticket authorization." });
+      return false;
+    }
+    const usableHandoff = (observation: MacroObservation) => {
+      if (!pendingAction) return this.isCurrentHandoff(observation);
+      const ticket = observation.pendingWork;
+      const ticketOwner = ticket && this.jobs.get(ticket.id);
+      if (ticket?.id !== pendingAction.pendingWorkId || !workScope(witnessed, observation) ||
+          observation.working || this.queuedWork || this.closing) return false;
+      if (pendingAction.kind === "defer-pending")
+        return before.verb === MACRO_DEFER_PENDING && ticket.deferOfferId === opportunityId && !!ticketOwner &&
+          this.sideWindow(ticketOwner, observation);
+      return before.verb === MACRO_COLLECT_PENDING && ticket.collectOfferId === opportunityId && ticket.parked &&
+        (ticket.historical || (ticketOwner?.order.life === observation.life &&
+          (!!ticketOwner.parked || (!!ticketOwner.accepted && ticketOwner.terminal?.status === "interrupted")))) &&
+        this.isCurrentHandoff(observation);
+    };
     const reserves = this.floorScope?.life === current.life ? this.floorScope.reserves : [];
-    if (before.risk === "guarded" && (this.workMode === "constrained" ||
+    if (!pendingAction && before.risk === "guarded" && (this.workMode === "constrained" ||
         (reserves.length && !protectsStock(reserves, current, before)))) {
       await this.disposition("proposal_refused", { requestId: plan.requestId,
         reason: "This material effect is not authorized by the constrained policy or would break a protected reserve." });
       return false;
     }
     const after = current.opportunities.find(offer => offer.id === opportunityId);
-    if (!this.isCurrentHandoff(current) || !samePlayableScope(witnessed, current) || current.tick >= plan.proposal.expiresTick ||
+    if (!usableHandoff(current) || !samePlayableScope(witnessed, current) || current.tick >= plan.proposal.expiresTick ||
         !sameOffer(before, after) || (selection && after?.risk === "guarded") ||
         (direct && (!directScope(direct, current) || !directConditions(direct, current) || !protectsStock(direct.action.reserves, current, after!))) ||
         (conditional && (current.working || !successorScope(conditional, current) || !successorStock(conditional, current, after!)))) {
       await this.rejectStale(plan, "opportunity_no_longer_witnessed");
       return false;
     }
-    const key = digest([current.life, current.epoch, current.goal, after]);
+    const key = pendingAction
+      ? digest([current.life, pendingAction.kind, pendingAction.pendingWorkId, after?.evidence])
+      : digest([current.life, current.epoch, current.goal, after]);
     const segmentKey = digest(after);
     if (this.effectKeys.has(key) || selection?.continuation?.seen.has(segmentKey)) {
       await this.disposition("duplicate_intent_refused", { requestId: plan.requestId, opportunityId });
@@ -2625,9 +2790,9 @@ export class SurvivalMacroController {
         preconditions: conditional.action.requires, originalWitness: conditional.lookahead.evidence.witnessBasis } : {}) });
     const refreshed = await this.refresh();
     if (!refreshed && (direct || conditional)) return null;
-    if (!refreshed || !this.isCurrentHandoff(refreshed) || !samePlayableScope(current, refreshed) || refreshed.tick >= intent.expiresTick ||
+    if (!refreshed || !usableHandoff(refreshed) || !samePlayableScope(current, refreshed) || refreshed.tick >= intent.expiresTick ||
         !sameOffer(after, refreshed.opportunities.find(offer => offer.id === opportunityId)) ||
-        (before.risk === "guarded" && reserves.length > 0 && !protectsStock(reserves, refreshed, after!)) ||
+        (!pendingAction && before.risk === "guarded" && reserves.length > 0 && !protectsStock(reserves, refreshed, after!)) ||
         (direct && (!directScope(direct, refreshed) || !directConditions(direct, refreshed) || !protectsStock(direct.action.reserves, refreshed, after!))) ||
         (conditional && (refreshed.working || !successorScope(conditional, refreshed) || !successorStock(conditional, refreshed, after!))) ||
         (selection && (!selection.offer || !this.isSelectedSkill(selection.hash, selection.generation) ||
@@ -2643,6 +2808,7 @@ export class SurvivalMacroController {
     this.issued.set(intent.id, macro);
     this.effectKeys.add(key);
     await this.ipc!.write("intent.json", intent);
+    if (pendingAction) this.episodeMemory.chosen(plan.requestId, witnessed, plan.proposal.subgoal, plan.proposal.successCondition);
     if (conditional) this.episodeMemory.chosen(plan.requestId, witnessed, plan.proposal.subgoal, plan.proposal.successCondition);
     this.episodeMemory.issued(plan.requestId);
     this.publishedIntents++;

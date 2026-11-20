@@ -17,6 +17,14 @@ export const MACRO_LOOKAHEAD_MAX_AGE_TICKS = 40;
 export const MACRO_LOOKAHEAD_MAX_CRACK = 0.65;
 export const MACRO_MAX_WORK_STAGES = 3;
 export const MACRO_SMELT_OVERLAP_MIN_COOK_TICKS = 80;
+export const MACRO_PENDING_SIDE_MAX_TICKS = 600;
+export const MACRO_PENDING_SIDE_MAX_EFFECTS = 4;
+export const MACRO_COLLECT_PENDING = "collect_pending";
+export const MACRO_DEFER_PENDING = "defer_pending";
+
+export function isPendingWorkVerb(verb: string): boolean {
+  return verb === MACRO_COLLECT_PENDING || verb === MACRO_DEFER_PENDING;
+}
 
 export const MACRO_IRON_SMELT = "smelt:minecraft:iron_ingot";
 export const MACRO_FURNACE_PLACEMENT = "place:minecraft:furnace";
@@ -90,6 +98,8 @@ export interface MacroObservation extends MacroBasis {
   readonly working?: { readonly intentId: string; readonly crack: number };
   /** Native job disposition, not evidence that movement or another effect advanced. */
   readonly workOrder?: MacroWorkState;
+  /** A process in the world, not inventory, a completed effect or a permission. */
+  readonly pendingWork?: MacroPendingWork;
 }
 
 export interface MacroIntent {
@@ -118,6 +128,9 @@ export interface MacroReceipt {
   readonly status: "accepted" | "completed" | "refused" | "interrupted";
   readonly detail: string;
 }
+
+export type MacroParkedReceipt = Omit<MacroReceipt, "status"> & { readonly status: "parked" };
+type NativeMacroReceipt = MacroReceipt | MacroParkedReceipt;
 
 export interface MacroSkillReceipt {
   readonly tick: number;
@@ -162,6 +175,22 @@ export interface MacroReviewContext {
 
 export type MacroStockFloor = { readonly item: string; readonly count: number };
 
+export interface MacroPendingWork {
+  readonly id: string;
+  readonly kind: "iron-smelting";
+  readonly goal: string;
+  readonly invested: readonly MacroStockFloor[];
+  readonly output: MacroStockFloor;
+  readonly location: string;
+  readonly state: "estimated" | "unknown" | "collectible" | "blocked";
+  readonly remainingTicks?: number;
+  readonly yieldable: boolean;
+  readonly parked: boolean;
+  readonly collectOfferId?: string;
+  readonly deferOfferId?: string;
+  readonly historical?: true;
+}
+
 export type MacroWorkMode = "preset" | "constrained";
 export type MacroWorkTarget =
   | { readonly kind: "stock"; readonly item: string; readonly count: number }
@@ -188,10 +217,12 @@ export interface MacroWorkOrder extends MacroWorkPolicy {
   readonly origin: "preset" | "model";
   /** May retain a clean personal screen for this exact, not-yet-admitted program stage. */
   readonly nextWorkId?: string;
+  /** One separately metered local stock job, admitted only after native hands release. */
+  readonly duringWaitFor?: string;
 }
 export interface MacroWorkState {
   readonly id: string;
-  readonly state: "working" | "needs_replan" | "blocked" | "complete";
+  readonly state: "working" | "needs_replan" | "blocked" | "parked" | "complete";
   readonly detail: string;
   /** Observed operation and confirmed counters, not a claim of useful play each tick. */
   readonly progress?: {
@@ -223,6 +254,10 @@ export interface MacroWorkDemand {
     readonly accepted: MacroReceipt | null;
     readonly nativeState: MacroWorkState | null;
   } | null;
+  /** The one native ticket this decision may use for independent work. */
+  readonly duringWaitFor?: string;
+  /** The original model's stated reason, not evidence or a dependent authorization. */
+  readonly pendingPurpose?: { readonly id: string; readonly subgoal: string; readonly reason: string };
   readonly lastOutcome: {
     readonly id: string;
     readonly policy: MacroWorkPolicy;
@@ -268,9 +303,11 @@ export interface MacroProposal {
     | { readonly kind: "opportunity"; readonly opportunityId: string }
     | MacroDirectAction
     | MacroSuccessor
-    | { readonly kind: "work"; readonly policy: MacroWorkPolicy; readonly afterWorkId?: string }
+    | { readonly kind: "work"; readonly policy: MacroWorkPolicy; readonly afterWorkId?: string; readonly duringWaitFor?: string;
+        readonly duringWait?: { readonly policy: MacroWorkPolicy; readonly maxTicks: number } }
     | { readonly kind: "work-program"; readonly stages: readonly MacroWorkStage[]; readonly afterWorkId?: string }
     | { readonly kind: "revoke-work"; readonly workOrderId: string }
+    | { readonly kind: "collect-pending" | "defer-pending"; readonly pendingWorkId: string }
     | { readonly kind: "skill"; readonly candidate: MacroSkillCandidate }
     | { readonly kind: "tested-skill"; readonly skillHash: string }
     | { readonly kind: "selected-skill" }
@@ -510,6 +547,16 @@ function singleLiveWork(policy: MacroWorkPolicy) {
     policy.allowedEffects.includes(MACRO_WATER_FILL);
 }
 
+function pendingSidePolicy(policy: MacroWorkPolicy): MacroWorkPolicy {
+  const { target, maxBreaks, maxCrafts, maxPlacements, allowedEffects } = policy;
+  if (target.kind !== "stock" || maxPlacements || maxBreaks + maxCrafts < 1 ||
+      maxBreaks + maxCrafts > MACRO_PENDING_SIDE_MAX_EFFECTS || !allowedEffects.length ||
+      !allowedEffects.every(effect => (maxBreaks > 0 && effect.startsWith("break:")) ||
+        (maxCrafts > 0 && effect.startsWith("craft:"))))
+    invalid("finite local pending side policy");
+  return policy;
+}
+
 export function parseMacroWorkStages(value: unknown): readonly MacroWorkStage[] {
   const totals = { maxBreaks: 0, maxCrafts: 0, maxPlacements: 0 };
   const totalCosts = new Map<string, number>();
@@ -575,13 +622,18 @@ function parseWorkProgress(value: unknown, tick: number): NonNullable<MacroWorkS
 export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   const record = shape(value, "work order", [
     "v", "id", "run", "life", "epoch", "basisTick", "expiresTick", "safetyRevision", "origin", ...WORK_POLICY_KEYS,
-  ], ["nextWorkId"]);
+  ], ["nextWorkId", "duringWaitFor"]);
   const id = validateMacroId(record.id, "work id");
   const origin = choice(record.origin, "work origin", ["preset", "model"] as const);
   const policy = workPolicy(record);
   if (origin === "preset" && (policy.target.kind !== "preset" || policy.allowedEffects.length || policy.costCaps.length ||
       policy.maxBreaks > 32 || policy.maxCrafts > 24 || policy.maxPlacements > 2)) invalid("preset work scope");
   const nextWorkId = Object.hasOwn(record, "nextWorkId") ? validateMacroId(record.nextWorkId, "next work id") : undefined;
+  const duringWaitFor = Object.hasOwn(record, "duringWaitFor") ? validateMacroId(record.duringWaitFor, "pending side ticket id") : undefined;
+  if (duringWaitFor) {
+    if (origin !== "model" || nextWorkId || duringWaitFor === id || /:[123]$/.test(id)) invalid("pending side order scope");
+    pendingSidePolicy(policy);
+  }
   if (singleLiveWork(policy) && (nextWorkId || /:[123]$/.test(id)))
     invalid("this effect requires a single live work order");
   if (nextWorkId) {
@@ -592,9 +644,10 @@ export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   return Object.freeze({
     v: version(record.v), id, run: validateMacroId(record.run, "run"),
     life: whole(record.life, "life", 1, 2_147_483_647), epoch: whole(record.epoch, "epoch", 1), basisTick,
-    expiresTick: whole(record.expiresTick, "work expiry", basisTick + 1, basisTick + MACRO_MAX_INTENT_TTL_TICKS),
+    expiresTick: whole(record.expiresTick, "work expiry", basisTick + 1,
+      basisTick + (duringWaitFor ? MACRO_PENDING_SIDE_MAX_TICKS : MACRO_MAX_INTENT_TTL_TICKS)),
     safetyRevision: whole(record.safetyRevision, "work safety revision", 1), origin,
-    ...(nextWorkId ? { nextWorkId } : {}), ...policy,
+    ...(nextWorkId ? { nextWorkId } : {}), ...(duringWaitFor ? { duringWaitFor } : {}), ...policy,
   });
 }
 
@@ -642,7 +695,7 @@ function directMaterialPrefix(verb: string): string | undefined {
 export function parseMacroObservation(value: unknown): MacroObservation {
   const record = shape(value, "observation", [
     "v", "run", "life", "tick", "epoch", "goal", "health", "food", "inventory", "opportunities", "recent", "quiescent",
-  ], ["safety", "working", "workOrder"]);
+  ], ["safety", "working", "workOrder", "pendingWork"]);
   const inventory = Object.create(null) as Record<string, number>;
   const entries = Object.entries(object(record.inventory, "inventory"));
   if (entries.length > 128) invalid("inventory");
@@ -698,9 +751,45 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     const raw = shape(record.workOrder, "native work state", ["id", "state", "detail"], ["progress"]);
     workOrder = Object.freeze({
       id: validateMacroId(raw.id, "native work id"),
-      state: choice(raw.state, "native work state", ["working", "needs_replan", "blocked", "complete"] as const),
+      state: choice(raw.state, "native work state", ["working", "needs_replan", "blocked", "parked", "complete"] as const),
       detail: text(raw.detail, "native work detail", 1_024),
       ...(raw.progress === undefined ? {} : { progress: parseWorkProgress(raw.progress, whole(record.tick, "tick", 1)) }),
+    });
+  }
+  let pendingWork: MacroPendingWork | undefined;
+  if (Object.hasOwn(record, "pendingWork")) {
+    const raw = shape(record.pendingWork, "native pending work", ["id", "kind", "goal", "invested", "output", "location",
+      "state", "yieldable", "parked"], ["remainingTicks", "collectOfferId", "deferOfferId", "historical"]);
+    const id = validateMacroId(raw.id, "pending work id");
+    const kind = choice(raw.kind, "pending production kind", ["iron-smelting"] as const);
+    const goal = text(raw.goal, "pending parent goal", 256);
+    const invested = stockFloors(raw.invested, "pending invested stock", true);
+    const output = stockFloors([raw.output], "pending output", true)[0]!;
+    const state = choice(raw.state, "pending work state", ["estimated", "unknown", "collectible", "blocked"] as const);
+    const { yieldable, parked, historical } = raw;
+    const fuel = invested.find(({ item }) => MACRO_IRON_FUEL_TICKS.has(item));
+    if (typeof yieldable !== "boolean" || typeof parked !== "boolean" || (historical !== undefined && historical !== true) ||
+        (historical && (!parked || yieldable)) || invested.length !== 2 || !fuel ||
+        !invested.some(({ item, count }) => item === "minecraft:raw_iron" && count === output.count) ||
+        output.item !== "minecraft:iron_ingot" || output.count > WORK_LIMITS.maxCrafts ||
+        fuel.count * MACRO_IRON_FUEL_TICKS.get(fuel.item)! < output.count * 200 ||
+        (yieldable && (output.count < 2 || state === "blocked" || !safety?.clear || working ||
+          (!parked && workOrder?.id !== id)))) invalid("native pending work scope");
+    const offer = (value: unknown, verb: string) => {
+      if (value === undefined) return;
+      const id = validateMacroId(value, `${verb} opportunity id`);
+      if (!opportunities.some(offer => offer.id === id && offer.verb === verb && offer.risk !== "read") ||
+          !safety?.clear || working || state === "blocked") invalid(`${verb} pending work opportunity`);
+      return id;
+    };
+    const collectOfferId = offer(raw.collectOfferId, MACRO_COLLECT_PENDING);
+    const deferOfferId = offer(raw.deferOfferId, MACRO_DEFER_PENDING);
+    if ((collectOfferId && !parked) || (deferOfferId && (parked || !yieldable))) invalid("pending work operation");
+    pendingWork = Object.freeze({
+      id, kind, goal, invested, output, state, location: text(raw.location, "pending location clue", 512), yieldable, parked,
+      ...(raw.remainingTicks !== undefined ? { remainingTicks: whole(raw.remainingTicks, "estimated remaining ticks", 0, output.count * 200) } : {}),
+      ...(collectOfferId ? { collectOfferId } : {}), ...(deferOfferId ? { deferOfferId } : {}),
+      ...(historical ? { historical } : {}),
     });
   }
   return Object.freeze({
@@ -709,7 +798,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     inventory: Object.freeze(inventory), opportunities: Object.freeze(opportunities),
     recent: Object.freeze(bounds(record.recent, "recent", 32).map(entry => text(entry, "recent entry", 512))),
     quiescent: record.quiescent, ...(safety ? { safety } : {}), ...(working ? { working } : {}),
-    ...(workOrder ? { workOrder } : {}),
+    ...(workOrder ? { workOrder } : {}), ...(pendingWork ? { pendingWork } : {}),
   });
 }
 
@@ -747,11 +836,17 @@ export function parseMacroPlanning(value: unknown): MacroPlanning {
 }
 
 export function parseMacroReceipt(value: unknown): MacroReceipt {
+  const receipt = parseNativeReceipt(value);
+  if (receipt.status === "parked") invalid("primitive receipt status");
+  return receipt;
+}
+
+function parseNativeReceipt(value: unknown): NativeMacroReceipt {
   const record = shape(value, "receipt", ["v", "id", "run", "life", "tick", "status", "detail"]);
   return Object.freeze({
     v: version(record.v), id: validateMacroId(record.id, "receipt id"), run: validateMacroId(record.run, "run"),
     life: whole(record.life, "life", 1, 2_147_483_647), tick: whole(record.tick, "tick", 1),
-    status: choice(record.status, "receipt status", ["accepted", "completed", "refused", "interrupted"] as const),
+    status: choice(record.status, "receipt status", ["accepted", "completed", "refused", "interrupted", "parked"] as const),
     detail: text(record.detail, "receipt detail", 1_024),
   });
 }
@@ -792,14 +887,25 @@ export function parseMacroProposal(value: unknown): MacroProposal {
   ]);
   const rawAction = object(record.action, "action");
   const kind = choice(rawAction.kind, "action kind",
-    ["opportunity", "continuation", "successor", "work", "work-program", "revoke-work", "skill", "tested-skill", "selected-skill", "gap", "abstain"] as const);
+    ["opportunity", "continuation", "successor", "work", "work-program", "revoke-work", "collect-pending", "defer-pending",
+      "skill", "tested-skill", "selected-skill", "gap", "abstain"] as const);
   let action: MacroProposal["action"];
   switch (kind) {
-    case "work":
-      shape(rawAction, "work action", ["kind", "policy"], ["afterWorkId"]);
-      action = { kind, policy: parseMacroWorkPolicy(rawAction.policy),
-        ...(Object.hasOwn(rawAction, "afterWorkId") ? { afterWorkId: validateMacroId(rawAction.afterWorkId, "predecessor work id") } : {}) };
+    case "work": {
+      shape(rawAction, "work action", ["kind", "policy"], ["afterWorkId", "duringWaitFor", "duringWait"]);
+      const policy = parseMacroWorkPolicy(rawAction.policy);
+      const afterWorkId = Object.hasOwn(rawAction, "afterWorkId") ? validateMacroId(rawAction.afterWorkId, "predecessor work id") : undefined;
+      const duringWaitFor = Object.hasOwn(rawAction, "duringWaitFor") ? validateMacroId(rawAction.duringWaitFor, "pending side ticket id") : undefined;
+      const contingent = Object.hasOwn(rawAction, "duringWait") ? shape(rawAction.duringWait, "quoted pending side policy", ["policy", "maxTicks"]) : undefined;
+      if (Number(!!afterWorkId) + Number(!!duringWaitFor) + Number(!!contingent) > 1 ||
+          (contingent && !policy.allowedEffects.includes(MACRO_IRON_SMELT))) invalid("exclusive work relationship");
+      action = { kind, policy: duringWaitFor ? pendingSidePolicy(policy) : policy,
+        ...(afterWorkId ? { afterWorkId } : {}),
+        ...(duringWaitFor ? { duringWaitFor } : {}),
+        ...(contingent ? { duringWait: Object.freeze({ policy: pendingSidePolicy(parseMacroWorkPolicy(contingent.policy)),
+          maxTicks: whole(contingent.maxTicks, "quoted pending side ticks", 1, MACRO_PENDING_SIDE_MAX_TICKS) }) } : {}) };
       break;
+    }
     case "work-program":
       shape(rawAction, "work program", ["kind", "stages"], ["afterWorkId"]);
       action = { kind, stages: parseMacroWorkStages(rawAction.stages),
@@ -808,6 +914,11 @@ export function parseMacroProposal(value: unknown): MacroProposal {
     case "revoke-work":
       shape(rawAction, "revoke work action", ["kind", "workOrderId"]);
       action = { kind, workOrderId: validateMacroId(rawAction.workOrderId, "revoked work id") };
+      break;
+    case "collect-pending":
+    case "defer-pending":
+      shape(rawAction, "pending work action", ["kind", "pendingWorkId"]);
+      action = { kind, pendingWorkId: validateMacroId(rawAction.pendingWorkId, "pending work id") };
       break;
     case "opportunity":
       shape(rawAction, "opportunity action", ["kind", "opportunityId"]);
@@ -905,7 +1016,9 @@ export function liveCorrectionEvidence(observation: MacroObservation): string {
   // A new heartbeat or a reissued opaque ID is not a new opportunity.
   const offers = observation.opportunities.map(({ verb, summary, risk, evidence, material }) =>
     JSON.stringify([verb, summary, risk, evidence, material])).sort();
+  const pending = observation.pendingWork;
   return JSON.stringify([observation.quiescent, offers,
+    pending ? [pending.id, pending.state, pending.parked, pending.yieldable, !!pending.collectOfferId, !!pending.deferOfferId] : null,
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b))]);
 }
 
@@ -1035,11 +1148,11 @@ export class MacroDirectory {
         if (bytesRead === 0) throw new Error("Native macro receipt journal was truncated.");
         filled += bytesRead;
       }
-      const receipts: MacroReceipt[] = [];
+      const receipts: NativeMacroReceipt[] = [];
       let start = 0;
       for (let end = bytes.indexOf(0x0a); end >= 0; end = bytes.indexOf(0x0a, start)) {
         if (end === start || end - start > FILE_BYTES["receipt.json"]) throw new Error("Invalid native macro receipt line.");
-        receipts.push(parseMacroReceipt(JSON.parse(utf8.decode(bytes.subarray(start, end)))));
+        receipts.push(parseNativeReceipt(JSON.parse(utf8.decode(bytes.subarray(start, end)))));
         start = end + 1;
       }
       if ((count === available || !start) && count - start > FILE_BYTES["receipt.json"]) {
@@ -1061,7 +1174,7 @@ export interface NativeReceiptCursor {
 
 interface NativeReceiptBatch {
   readonly cursor: NativeReceiptCursor;
-  readonly receipts: readonly MacroReceipt[];
+  readonly receipts: readonly NativeMacroReceipt[];
   readonly more: boolean;
   readonly partial: boolean;
 }

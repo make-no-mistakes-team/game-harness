@@ -85,22 +85,22 @@ the smelted units; the furnace batch uses that budget before collection.
 The player reports loading, burning, and collection separately. Only the
 matching completion receipt and live ingot stock establish the result.
 
-For one raw iron, the player can stay at the furnace screen and wait for
-the ingot. For a larger batch in its own workshop, it can close the screen
-after ignition, check its surroundings, and reopen the same furnace to
-collect the output. The distinction is the number of items actually loaded,
-not how many are left when the player next looks. A threat can interrupt
-either case.
+For one raw iron, the player can wait at the open furnace until the ingot
+is ready. Count the items loaded at the start: a batch of two is still a
+batch of two after the first ingot cooks. A nearby threat takes priority.
 
-Once the furnace confirms loading and the cook bar advances, Terra can use
-one request to plan the next job while the batch cooks. The proposal names
-the batch in `afterWorkId`. It cannot replace, renew, or reload the batch.
-For example, Terra can propose a bucket while two ingots cook and the player
-holds one. The bucket job can start only after the matching completion
-receipt and a fresh check of all three ingots, the reserves, the crafting
-table, safety, and the proposal's expiry. The timeline still counts cooking
-as a game-mechanical wait. A short cook can finish without a background
-request, and a reply that arrives after the batch ends grants nothing.
+A longer batch can free the player's hands. Suppose the player needs a
+bucket for cave travel. If there is useful work nearby, Terra can send the
+player to gather a needed resource while the iron cooks (`duringWaitFor`).
+This job needs its own budget and a reachable source or recipe. If the
+bucket is the next thing the player needs and there is nothing worth doing
+at the worksite, waiting is fine.
+
+Terra can also leave the batch for later. The player remembers the furnace
+and what went into it. Elapsed time does not put ingots in the inventory:
+the player must return, open the same furnace and take its output. A bucket
+job proposed during the cook (`afterWorkId`) waits for collection and a
+fresh check of all three ingots, the protected stock and the crafting table.
 
 Goal-only startup, built-in presets, generated skills, direct opportunities,
 and work programs cannot grant furnace transfers. A completed smelt does not

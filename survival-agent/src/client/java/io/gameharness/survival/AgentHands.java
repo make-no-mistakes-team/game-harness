@@ -542,6 +542,10 @@ final class AgentHands {
         return c.currentScreen == null && c.player.currentScreenHandler == c.player.playerScreenHandler;
     }
 
+    boolean releasedForPendingWork() {
+        return !busy() && !holdsWorkInventory() && !Screen.hasShiftDown() && !physicalButtonDown(c.getWindow());
+    }
+
     private boolean canWorkFurnace(FurnaceScreen furnace) {
         return !busy() && !holdsWorkInventory() && stableCraftFooting() && c.currentScreen == furnace
             && c.player.currentScreenHandler == furnace.getScreenHandler()

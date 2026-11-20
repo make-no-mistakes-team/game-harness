@@ -14,8 +14,9 @@ import { episodeMatchesBasis } from "./episode-memory.ts";
 import {
   MACRO_CAPABILITIES_VERSION, MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_STRATEGIC_EPISODES, MACRO_MAX_WORK_STAGES, MacroObservationRotating, MacroValidationError,
-  hasDirectAuthority, parseMacroProposal, validateMacroId,
+  hasDirectAuthority, isPendingWorkVerb, parseMacroProposal, validateMacroId,
   MACRO_DIAMOND_PROSPECT, MACRO_FURNACE_PLACEMENT, MACRO_IRON_SMELT, MACRO_LIVE_EFFECT_PATTERN,
+  MACRO_PENDING_SIDE_MAX_EFFECTS, MACRO_PENDING_SIDE_MAX_TICKS,
   MACRO_PROGRAM_EFFECT_PATTERN, MACRO_PROSPECT_SUPPORT, MACRO_PROSPECT_TORCH, MACRO_WATER_CLUE, MACRO_WATER_FILL, MACRO_WATER_SOURCE,
   NATIVE_REVIEW_MAX_BYTES, NATIVE_REVIEW_MAX_FILE_BYTES, NATIVE_REVIEW_PATHS,
   type MacroBasis, type MacroFrame, type MacroInference, type MacroProposal, type MacroReplyRejection, type MacroRequest, type MacroStrategist,
@@ -47,7 +48,15 @@ Report a gap only if the observations and available skills do not supply the nee
 
 const FURNACE_PROMPT = `For carried raw iron, a single live action kind "work" can target {kind:"stock",item:"minecraft:iron_ingot",count} with ${MACRO_IRON_SMELT}. Count total ingots, including those already held. Budget one minecraft:raw_iron per new ingot and the exact item and count of one supported fuel for a cold batch: a coal or charcoal supplies 1600 ticks, an exact flammable plank (including bamboo planks, not crimson or warped) 300, and a stick 100. Each ingot cooks for 200 ticks. Round fuel up for the whole batch, leave time for setup and collection, and protect raw iron and fuel floors. Do not rely on previous furnace heat, mix fuel items, or plan on acquiring missing raw iron or fuel in that job.
 If you need a new station, explicitly name ${MACRO_FURNACE_PLACEMENT}, budget one minecraft:furnace, and count its placement. Include craft:furnace and the exact stone costs if not carrying a spare; if the player needs a new crafting table, quote its effects and costs separately. maxCrafts includes every craft and each smelted unit, which is reserved before loading. maxPlacements includes both stations if needed. An existing furnace must be in reach from dry footing and pass a visible empty/cold check; a carried furnace is not a placed station.
-Only this single live iron stock policy grants furnace transfers. Do not use furnace effects in work-program, a preset target, a continuation, or a generated skill. A pending batch cannot be replaced, revoked, renewed, or reloaded. If a successor demand shows work.current.nativeState.progress.smeltBurn, the exact paid batch has started cooking. Its units are contingent output, not carried ingots. The raw iron and fuel were already removed from inventory; do not debit them again. Propose only work or work-program with afterWorkId set to this batch's ID, or abstain. For example, if one ingot is carried and two are cooking, a bucket recipe can be proposed conditional on collecting all three and finding a usable table. The host will recheck actual stock, reserves, the station and safety before admission. Smelting iron is not a bucket craft, diamond pickup, or Nether entry.`;
+Only this single live iron stock policy grants furnace transfers. Do not revoke, renew or reload a paid batch. A single charged item can finish in its GUI. No independent work starts during a click, item use or other occupied input.
+
+A pendingWork ticket describes the paid production, its parent goal, exact inputs already spent, a local return clue and uncollected output. If work.pendingPurpose is present, it recalls why the batch was wanted, not an authorization for the next job. Output is NOT inventory, even after the ETA; do not debit inputs twice or spend what is still in the furnace. Estimated or unknown means no output proof. A fresh collection offer, even if the state is unknown, means the actor can recheck the actual station, not a guaranteed pickup. Do not resubmit production while the ticket is outstanding. A historical ticket from an explicitly continued world is descriptive only; never reuse old work, action IDs, or inferred stock.
+
+When work.duringWaitFor is present, decide what the player should physically do *now*. In your reason, name what actually needs the uncollected output and consider one local part of the larger objective that does not. Preparing a later recipe alone leaves the player standing at the furnace. If a needed ingredient can be prepared from carried stock, or a useful visible resource gathered with a held tool, quote that independent job as kind "work" with duringWaitFor set to the ticket. For a genuinely blocking wait, abstain or use work/work-program with afterWorkId equal to the batch ID; say why leaving offers no useful or safe progress. The dependent job cannot start until actual collection and a fresh inventory check. Don't gather surplus, turn the camera for show, or leave the cave just to fill time.
+
+You may prequote an independently useful duringWait:{policy,maxTicks} on the original multi-unit smelt. It runs only after confirmed burn, clean Escape and fresh native admission. Both forms allow at most ${MACRO_PENDING_SIDE_MAX_EFFECTS} exact breaks and crafts combined, no placement, and up to ${MACRO_PENDING_SIDE_MAX_TICKS} ticks. Use only genuinely held stock and protect all floors. A useful job can last longer than the cook.
+
+If it is worth deliberately leaving the released furnace for later parent-goal work, use "defer-pending" with the exact pendingWorkId only while deferOfferId is present. Deferral is not a material effect. Once parked, continue with context-compatible goal work without losing the return path. Choose "collect-pending" with pendingWorkId when collectOfferId is fresh and the dependency matters; if plenty of time remains, avoid reopening early just to stare at a cook bar. The native actor returns along a witnessed route and visibly checks this exact furnace before taking anything. Never use these offers as ordinary opportunities, a continuation or a skill. If the return cannot be freshly verified, keep the obligation visible and change course without claiming stock. Smelting iron is not a bucket craft, diamond pickup, or Nether entry.`;
 
 const DIAMOND_PROMPT = `With an iron-tier harvesting tool and dry cave footing, choose a single live work action targeting minecraft:diamond stock with ${MACRO_DIAMOND_PROSPECT} to seek ore that is not yet visible. The player can inspect and follow a witnessed lower shelf with a proved return, or cut a cardinal staircase one tread at a time. Name exact permitted ore break effects (break:minecraft:diamond_ore and/or break:minecraft:deepslate_diamond_ore). This prospecting effect grants no cover breaks: if allowed, name each exact natural cover separately (such as minecraft:stone, minecraft:deepslate, minecraft:diorite, minecraft:andesite, minecraft:granite, or minecraft:tuff with the break: prefix). An ore-only job does not cut rock. New descending clearance can take four cover breaks per tread plus an obstructed anchor ceiling; keep at least one break for ore. If light is needed and allowed, include ${MACRO_PROSPECT_TORCH}, maxPlacements, exact carried torch cost, and the required torch floor. No light, block or tool stock is spent implicitly. Mining can wear a pickaxe even when no item-count loss is allowed; preserve usable tools and slots for genuine drops.
 If the descent lanes fail, the same job can follow a witnessed dry level foothold or upper shelf, or open two exact, permitted foot/head cells toward a side wall. It can backtrack only over retained dry, revalidated edges. If permitted, ${MACRO_PROSPECT_SUPPORT} allows one use per exact adjacent support cell that the native camera proves empty, dry and attachable, with clear forward and reverse space. Add the exact minecraft:cobblestone cost cap and protect its reserve. Blocks and torches share maxPlacements. A screenshot of water or an opening does not prove an attachable dry cell; the player will not redirect water or step into an unverified gap. Read actual Y, reached treads, support placement/debit, separate landings, and the exact refusal in native progress. Use a substantial bounded horizon; a compatible renewal adds time without restoring spent caps. On a terminal productive leg, decide whether to grant a new finite leg, resupply, or change route. None of these movements counts as diamond stock. Do not use prospecting or its placements in work-program, preset work, a continuation or a generated skill.`;
@@ -88,6 +97,12 @@ const workPolicy = (pattern: string) => strictObject({
   maxBreaks: integer, maxCrafts: integer, maxPlacements: integer,
 });
 const singleWorkPolicy = workPolicy(MACRO_LIVE_EFFECT_PATTERN);
+const pendingSidePolicy = strictObject({
+  ...singleWorkPolicy.properties,
+  target: action("stock", { item: string, count: integer }),
+  allowedEffects: { type: "array", items: { type: "string", pattern: "^(break:minecraft:[a-z0-9_]{1,96}|craft:[a-z0-9_]{1,96})$" } },
+  maxPlacements: { type: "integer", enum: [0] },
+});
 const workStages = { type: "array", minItems: 2, maxItems: MACRO_MAX_WORK_STAGES,
   items: strictObject({ policy: workPolicy(MACRO_PROGRAM_EFFECT_PATTERN), requires: { type: "array", items: floor } }),
 };
@@ -96,9 +111,10 @@ function smeltSuccessorId(work?: MacroRequest["work"]): string | undefined {
       work.current.nativeState?.progress?.smeltBurn)
     return work.current.id;
 }
-const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroRequest["work"]): Tool => {
+const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroRequest["work"], pending?: MacroRequest["observation"]["pendingWork"]): Tool => {
   const smeltId = smeltSuccessorId(work);
   const afterWorkId = smeltId ? { type: "string", enum: [smeltId] } : string;
+  const ticketId = (id: string) => ({ type: "string", enum: [id] });
   const otherActions = smeltId ? [] : [
     ...(work ? [action("work", { policy: singleWorkPolicy }), action("work-program", { stages: workStages })] : []),
     ...(work?.current ? [action("revoke-work", { workOrderId: string })] : [
@@ -127,6 +143,14 @@ const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroReques
       action: { anyOf: [
         ...(work?.current?.accepted ? [action("work", { policy: singleWorkPolicy, afterWorkId }),
           action("work-program", { stages: workStages, afterWorkId })] : []),
+        ...(work && !smeltId && !pending ? [action("work", { policy: singleWorkPolicy, duringWait: strictObject({
+          policy: pendingSidePolicy, maxTicks: integer,
+        }) })] : []),
+        ...(work?.duringWaitFor ? [action("work", { policy: pendingSidePolicy, duringWaitFor: ticketId(work.duringWaitFor) })] : []),
+        ...(work?.duringWaitFor && pending?.deferOfferId && pending.id === work.duringWaitFor
+          ? [action("defer-pending", { pendingWorkId: ticketId(pending.id) })] : []),
+        ...(work && !work.current && pending?.collectOfferId
+          ? [action("collect-pending", { pendingWorkId: ticketId(pending.id) })] : []),
         ...otherActions,
         action("abstain"),
       ] },
@@ -257,7 +281,7 @@ function contextFor(request: MacroRequest, basis: MacroBasis, image?: ImageConte
     ...(feedback ? { feedback: { kind: feedback.kind, detail: feedback.detail } } : {}),
     goal: observation.goal, objective, health: observation.health, food: observation.food,
     inventory: observation.inventory, recent: observation.recent, quiescent: observation.quiescent,
-    safety: observation.safety,
+    safety: observation.safety, pendingWork: observation.pendingWork,
     opportunities: observation.opportunities.map(({ id, verb, summary, risk, evidence, material }) =>
       ({ id, verb, summary, risk, evidence, material })),
     ...(image && frame ? { frame: { tick: frame.tick, width: frame.width, height: frame.height } } : {}),
@@ -269,7 +293,7 @@ function contextFor(request: MacroRequest, basis: MacroBasis, image?: ImageConte
       role: "user", timestamp: Date.now(),
       content: image ? [{ type: "text", text }, image] : text,
     }],
-    tools: [lookahead ? lookaheadTool : work ? proposalTool(!!nativeReview, direct, work) :
+    tools: [lookahead ? lookaheadTool : work ? proposalTool(!!nativeReview, direct, work, observation.pendingWork) :
       proposalTools[nativeReview ? 1 : 0]![direct ? 1 : 0]!],
   };
 }
@@ -384,10 +408,19 @@ function proposalFor(raw: string | undefined, request: MacroRequest, basis: Macr
   }
   if (action.kind === "successor") return "successor";
   const smeltId = smeltSuccessorId(request.work);
+  const pending = request.observation.pendingWork;
+  if (action.kind === "collect-pending" || action.kind === "defer-pending") {
+    if (!request.work || pending?.id !== action.pendingWorkId) return "wrong_work_id";
+    return (action.kind === "collect-pending" ? !request.work.current && !!pending.collectOfferId :
+      request.work.duringWaitFor === pending.id && !!pending.deferOfferId) ? proposal : "missing_opportunity";
+  }
+  if (action.kind === "work" && action.duringWaitFor)
+    return action.duringWaitFor === request.work?.duringWaitFor ? proposal : "wrong_work_id";
   if (smeltId && action.kind !== "abstain" &&
       ((action.kind !== "work" && action.kind !== "work-program") || action.afterWorkId !== smeltId)) return "wrong_work_id";
   if (action.kind === "work" || action.kind === "work-program") {
     if (!request.work) return "work_unavailable";
+    if (action.kind === "work" && pending && action.policy.allowedEffects.includes(MACRO_IRON_SMELT)) return "active_work";
     if (action.afterWorkId &&
         (request.work.current?.id !== action.afterWorkId || !request.work.current.accepted)) return "wrong_work_id";
     const targets = action.kind === "work" ? [action.policy.target] : action.stages.map(stage => stage.policy.target);
@@ -397,7 +430,7 @@ function proposalFor(raw: string | undefined, request: MacroRequest, basis: Macr
   if (request.work?.current && action.kind !== "gap" && action.kind !== "abstain") return "active_work";
   if (action.kind === "opportunity") {
     const offer = request.observation.opportunities.find(offer => offer.id === action.opportunityId);
-    if (!offer) return "missing_opportunity";
+    if (!offer || isPendingWorkVerb(offer.verb)) return "missing_opportunity";
     if (request.work?.mode === "constrained" && offer.risk === "guarded") return "guarded_opportunity";
   }
   if (action.kind === "continuation" && (request.work?.mode === "constrained" ||

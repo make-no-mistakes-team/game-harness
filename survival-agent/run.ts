@@ -21,6 +21,7 @@ import { closedParentDeath, FAST_DEATH_LIMIT, FAST_DEATH_WINDOW_MS, LIFE_RECEIPT
   RESPAWN_MARKER, RESPAWN_TIMEOUT_MS } from "./lives.ts";
 import { admitRun, diskBytes } from "./storage.ts";
 import { finalPauseEvidence, PAUSE_DIAGNOSTICS } from "./pause-evidence.ts";
+import { preparePendingFurnace, readPendingFurnaceParent, sealPendingFurnace } from "./pending-furnace.ts";
 import { finalPlanningEvidence } from "./planning-evidence.ts";
 import { readStrategy, type TerraOptions } from "./strategy-options.ts";
 import { monitorDescent, verifyDescent } from "./verify-descent.ts";
@@ -465,8 +466,13 @@ async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
     await regular(path.join(world, "level.dat"));
     await regular(path.join(world, "session.lock"));
     const hadDeath = outcome.status === "died" || (outcome.lifecycle?.deaths ?? 0) > 0;
+    const pendingSeal = !historic && !hadDeath && outcome.lifecycle?.evidenceReadable === true &&
+      outcome.lifecycle.nativeDeaths === 0 && outcome.lifecycle.savedDeaths?.attempt === 0 &&
+      outcome.lifecycle.savedDeaths?.agreesWithObserved === true && outcome.lifecycle.life === 1 &&
+      outcome.progress?.alive === true && outcome.progress.life === 1 && outcome.progress.life_phase === "playing" &&
+      outcome.exits?.client?.code === 0 && outcome.exits.client.signal === null ? outcome.pendingFurnace : undefined;
     return { root, rootInode, device, world, historic, progress: hadDeath ? null : outcome.progress as Progress | null,
-      parentDeath: closedParentDeath(parentRun, outcome) };
+      parentDeath: closedParentDeath(parentRun, outcome), pendingSeal };
   } catch {
     signal.throwIfAborted();
     throw invalid();
@@ -641,24 +647,28 @@ async function recoverAgentTrail(pose: Progress | null, read: ReadAgentArtifact)
   return { version: 1, dimension: OVERWORLD, trail };
 }
 
-async function copyAgentMemory(source: SavedWorld, destination: string, signal: AbortSignal) {
+async function pinSavedRun(source: SavedWorld, signal: AbortSignal) {
   const parent = await open(source.root, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY)
     .catch(() => null);
   if (!parent) return;
-  let memory: AgentMemory | null;
+  let keep = false;
   try {
     const entry = await parent.stat();
     if (!entry.isDirectory() || entry.ino !== source.rootInode || entry.dev !== source.device ||
         entry.uid !== process.getuid?.() || (entry.mode & 0o077)) return;
-    // Pin the approved directory while opening its exact artifacts.
     const root = `/proc/self/fd/${parent.fd}`;
     const read: ReadAgentArtifact = (name, limit, privateMode) =>
       readAgentArtifact(root, source.device, name, limit, signal, privateMode);
-    const text = await read(source.historic ? HISTORIC_MEMORY_FILE : MEMORY_FILE, MEMORY_BYTES, true);
-    memory = text === undefined ? await recoverAgentTrail(source.progress, read) : text ? decodeAgentMemory(text) : null;
+    keep = true;
+    return { read, world: path.join(root, "server/world"), close: () => parent.close() };
   } finally {
-    await parent.close();
+    if (!keep) await parent.close();
   }
+}
+
+async function copyAgentMemory(source: SavedWorld, destination: string, read: ReadAgentArtifact, signal: AbortSignal) {
+  const text = await read(source.historic ? HISTORIC_MEMORY_FILE : MEMORY_FILE, MEMORY_BYTES, true);
+  const memory = text === undefined ? await recoverAgentTrail(source.progress, read) : text ? decodeAgentMemory(text) : null;
   if (!memory) return;
   signal.throwIfAborted();
   const file = await open(path.join(destination, MEMORY_FILE), "wx", 0o600);
@@ -832,6 +842,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     const dir = macroTrial ? path.join(runs, macroTrial.run) :
       await mkdtemp(path.join(runs, `${new Date().toISOString().replaceAll(":", "-")}-${goal}-`));
     if (macroTrial) await mkdir(dir, { mode: 0o700 });
+    const runDevice = (await lstat(dir)).dev;
     console.log(dir);
     const startedAt = new Date().toISOString();
     const start = performance.now();
@@ -1001,21 +1012,32 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       stage = source ? "world_copy" : "server_startup";
       const worldDir = path.join(dir, "server");
       await mkdir(worldDir, { mode: 0o700 });
+      const worldDevice = (await lstat(worldDir)).dev;
+      const destination = path.join(worldDir, "world");
       if (source) {
-        const destination = path.join(worldDir, "world");
         const bytesBefore = await diskBytes(dir, startup);
         await checkWorldTree(source.world, source.device, copyStopBytes - bytesBefore, startup);
-        startup.throwIfAborted();
-        // Reflink when supported, otherwise copy. Never follow links or share writable inodes.
-        const copier = own(spawn("cp", [
-          "--recursive", "--no-dereference", "--reflink=auto", "--preserve=mode,timestamps",
-          "--", source.world, destination,
-        ], { env, signal: startup, stdio: "ignore" }));
-        const exit = await copier.closed;
-        startup.throwIfAborted();
-        if (exit.code !== 0) throw new Stop("failed", "Could not copy the saved Survival world.");
-        await checkWorldTree(destination, (await lstat(worldDir)).dev, copyStopBytes - bytesBefore, startup);
-        await copyAgentMemory(source, dir, startup);
+        const pinned = await pinSavedRun(source, startup);
+        try {
+          const pendingSource = !diagnostic && parentRun && !source.historic && pinned ? {
+            run: parentRun, world: pinned.world, device: source.device, read: pinned.read,
+            seal: source.pendingSeal, signal: startup,
+          } : undefined;
+          const pendingParent = pendingSource && await readPendingFurnaceParent(pendingSource);
+          startup.throwIfAborted();
+          // Reflink when supported, otherwise copy. Never follow links or share writable inodes.
+          const copier = own(spawn("cp", [
+            "--recursive", "--no-dereference", "--reflink=auto", "--preserve=mode,timestamps",
+            "--", source.world, destination,
+          ], { env, signal: startup, stdio: "ignore" }));
+          const exit = await copier.closed;
+          startup.throwIfAborted();
+          if (exit.code !== 0) throw new Stop("failed", "Could not copy the saved Survival world.");
+          await checkWorldTree(destination, worldDevice, copyStopBytes - bytesBefore, startup);
+          if (pinned) await copyAgentMemory(source, dir, pinned.read, startup);
+          if (!diagnostic) await preparePendingFurnace(dir, live.run, { world: destination, device: worldDevice, signal: startup },
+            pendingSource, pendingParent);
+        } finally { await pinned?.close(); }
         beforeStats = await readSavedPlayerStats(statsDirectory);
         startup.throwIfAborted();
         measuredBytes = await diskBytes(dir, startup);
@@ -1023,6 +1045,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           throw new Stop("storage_limit", "Saved world would exceed the run storage stop threshold.");
         await record("world_copied", { parentRun });
         stage = "server_startup";
+      } else if (!diagnostic) {
+        await preparePendingFurnace(dir, live.run, { world: destination, device: worldDevice, signal: startup });
       }
       const serverTmp = path.join(worldDir, "tmp");
       await mkdir(serverTmp, { mode: 0o700 });
@@ -1335,8 +1359,17 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       const serverSaved = saveEvidence === true;
       if (operatorStop && result === operatorStop && saveEvidence === false)
         result = new Stop("server_exit", "Operator stop could not confirm a clean vanilla server save.");
-      const recordedDeaths = serverSaved ? savedDeathDelta(beforeStats,
-        await readSavedPlayerStats(statsDirectory).catch(() => null)) : null;
+      const finalStats = serverSaved ? await readSavedPlayerStats(statsDirectory).catch(() => null) : null;
+      const recordedDeaths = savedDeathDelta(beforeStats, finalStats);
+      const life = ledger.summary();
+      const saveSignal = new AbortController().signal;
+      const pendingFurnace = !diagnostic && drained && liveClosed && runnerStopRequestedNs !== undefined &&
+        client?.exit?.code === 0 && client.exit.signal === null && finalStats && recordedDeaths?.attempt === 0 &&
+        lifeEvidenceReadable && life.nativeDeaths === 0 && life.life === 1 && lastProgress?.alive &&
+        ledger.currentPlaying(lastProgress) ? await sealPendingFurnace({
+          run: live.run, world: path.dirname(statsDirectory), device: runDevice,
+          read: (name, limit, privateMode) => readAgentArtifact(dir, runDevice, name, limit, saveSignal, privateMode),
+        }, { owner: finalStats.file.slice(0, -5), life: life.life, progressTick: lastProgress.tick }) : undefined;
       if (provisioned && (ledger.deaths > 0 || (recordedDeaths?.attempt ?? 0) > 0)) {
         result = new Stop("died", `The agent died during the prepared ${diagnostic} proof.`);
       } else if (result.status === "trial_closed" && (measuredBytes === null || measuredBytes > reserveBytes)) {
@@ -1394,11 +1427,12 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         schemaVersion: 1, status: result.status, reason: result.message, goal, startedAt, world, claimScope, deathPolicy,
         finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - start),
         finalStage: stage, reservedBytes: reserveBytes, measuredBytes, progress: lastProgress,
+        ...(pendingFurnace ? { pendingFurnace } : {}),
         ...(operatorStop ? { operatorStop: { serverSaved: saveEvidence } } : {}),
         ...(pauseEvidence ? { pauseEvidence } : {}),
         ...(benchmark ? { benchmark: { ...benchmark, confirmed: benchmarkConfirmed }, strategy } : {}),
         ...(urgentThreat ? { urgentThreat, strategy } : {}),
-        lifecycle: { ...ledger.summary(), receiptFile: LIFE_RECEIPTS, evidenceReadable: lifeEvidenceReadable,
+        lifecycle: { ...life, receiptFile: LIFE_RECEIPTS, evidenceReadable: lifeEvidenceReadable,
           savedDeaths: recordedDeaths && { ...recordedDeaths, agreesWithObserved: recordedDeaths.attempt === ledger.deaths },
           goalClaim, ...(programWin ? { completedWorkProgram: programWin.program } : {}),
           goalBearingLives: benchmarkConfirmed && goalClaim ? [goalClaim.life] : [],

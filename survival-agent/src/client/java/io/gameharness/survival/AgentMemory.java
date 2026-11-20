@@ -90,6 +90,27 @@ final class AgentMemory {
         return position != null && eye.squaredDistanceTo(Vec3d.ofCenter(position)) <= 20.25;
     }
 
+    BlockPos pendingFlatStep(ClientWorld world, List<BlockPos> trail, BlockPos from, BlockPos to) {
+        if (world == null || world != overworld || from.equals(to)) return null;
+        BlockPos step = flatStep(trail, from, to);
+        if (step == null) step = flatStep(parentTrail, from, to);
+        return step == null ? flatStep(dormant, from, to) : step;
+    }
+
+    private static BlockPos flatStep(List<BlockPos> route, BlockPos from, BlockPos to) {
+        int start = route.lastIndexOf(from), end = route.lastIndexOf(to);
+        if (start < 0 || end < 0 || Math.abs(end - start) > 8) return null;
+        int direction = Integer.signum(end - start);
+        BlockPos previous = from;
+        for (int i = start + direction; direction > 0 ? i <= end : i >= end; i += direction) {
+            BlockPos next = route.get(i);
+            if (next.getY() != previous.getY() ||
+                    Math.abs(next.getX() - previous.getX()) + Math.abs(next.getZ() - previous.getZ()) != 1) return null;
+            previous = next;
+        }
+        return route.get(start + direction);
+    }
+
     Rejoin rejoin(ClientWorld world, BlockPos standing, List<BlockPos> trail, boolean routing) {
         if (world != overworld || parentTrail.isEmpty() && dormant.isEmpty()) return null;
         if (standing.equals(detachedAt)) return null;

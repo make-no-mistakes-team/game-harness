@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -128,7 +129,8 @@ final class AgentMacroControl {
         WORK_WALK("work_walk", "guarded", 160), WORK_EQUIP("work_equip", "guarded", 120),
         WORK_PLACE("work_place", "guarded", 80), WORK_TREAD("work_tread", "guarded", AgentSurfaceTread.ACTION_TICKS),
         WORK_SMELT("work_smelt", "guarded", AgentWorkOrder.MAX_TICKS),
-        WATER_CLUE("fill_water", "read", 0), WORK_FILL("work_fill", "guarded", 72);
+        WATER_CLUE("fill_water", "read", 0), WORK_FILL("work_fill", "guarded", 72),
+        COLLECT_PENDING("collect_pending", "guarded", 200), DEFER_PENDING("defer_pending", "low", 0);
 
         final String id, risk;
         final int maxTicks;
@@ -254,6 +256,7 @@ final class AgentMacroControl {
         int workSlot, executions, handLoss, stairStock;
         Item tracked;
         FurnaceWork furnace;
+        PendingCollection pendingCollection;
         boolean waterUseEntered, waterUseReceipt, workshopFaceLost;
 
         Action(Intent intent, Offer offer, MinecraftClient client, long tick, long now, long frame, int itemCount,
@@ -292,6 +295,22 @@ final class AgentMacroControl {
     private enum FurnaceCue { WORKBENCH, WATER, DRY_FOOTHOLD, MATERIAL }
     private record FurnaceLook(FurnaceCue kind, BlockHitResult hit) {}
     private record FurnaceFact(FurnaceLook look, Vec3d stance, long tick, String detail, boolean rechecked) {}
+
+    private static final class PendingCollection {
+        final AgentPendingFurnaceMemory.Entry entry;
+        final AgentFurnaceWatch.Withdrawal withdrawal = new AgentFurnaceWatch.Withdrawal();
+        final InventoryWitness returnInventory;
+        BlockPos landing, footing;
+        BlockHitResult face;
+        Vec3d stance;
+        long settleAt, storedAt;
+        int walked;
+
+        PendingCollection(AgentPendingFurnaceMemory.Entry entry, PlayerInventory inventory) {
+            this.entry = entry;
+            returnInventory = new InventoryWitness(inventory);
+        }
+    }
 
     private static final class FurnaceWork {
         final BlockPos footing;
@@ -350,9 +369,13 @@ final class AgentMacroControl {
         String lastEffect;
         BlockPos placedFurnace;
         boolean collectedIron;
+        boolean refusedPendingReplacement;
         BlockPos ironSceneFooting;
         FurnaceLook ironScene;
         Offer waterClue;
+        Face pendingSideSource;
+        long pendingSideAimUntil;
+        boolean pendingSideWalked;
         IronWorkshop ironWorkshop;
         String sourceBlock;
         boolean lowerHarvest;
@@ -486,6 +509,7 @@ final class AgentMacroControl {
     }
 
     private final String run, goal;
+    private final AgentPendingFurnaceMemory pendingFurnaceMemory;
     private final Ipc ipc;
     private final boolean activated, trial;
     private final LinkedHashMap<Long, Snapshot> snapshots = new LinkedHashMap<>();
@@ -523,6 +547,12 @@ final class AgentMacroControl {
     private Inbox input;
     private Action action;
     private WorkSession work;
+    private WorkSession pendingOrigin;
+    private Face pendingFace;
+    private AgentFurnaceWatch pendingEstimate;
+    private final ArrayList<BlockPos> pendingTrail = new ArrayList<>(MAX_ROUTE_EDGES + 1);
+    private long pendingTileSeen;
+    private boolean pendingUncertain, pendingWorldRelease;
     private TimberHarvest timberHarvest;
     private PersonalStation personalTable, personalFurnace;
     private StationPlacement stationPlacement;
@@ -543,19 +573,21 @@ final class AgentMacroControl {
     private String owner = "deterministic";
     private String status = "waiting for a current local plan";
 
-    static AgentMacroControl create(Path directory, String goal) {
+    static AgentMacroControl create(Path directory, String goal, AgentPendingFurnaceMemory pendingFurnaceMemory) {
         Path macro = directory.resolve("macro");
         String run = directory.getFileName().toString();
         // Startup-only admission. Inactive deterministic runs allocate no channel or thread.
         if (!TOKEN.matcher(run).matches()) return null;
         boolean trial = Ipc.marked(macro, run, "trial.json");
         String marker = Ipc.activeMode(macro, run);
-        return trial || marker != null ? new AgentMacroControl(macro, run, goal, marker, trial) : null;
+        return trial || marker != null ? new AgentMacroControl(macro, run, goal, marker, trial, pendingFurnaceMemory) : null;
     }
 
-    private AgentMacroControl(Path directory, String run, String goal, String mode, boolean trial) {
+    private AgentMacroControl(Path directory, String run, String goal, String mode, boolean trial,
+                              AgentPendingFurnaceMemory pendingFurnaceMemory) {
         this.run = run;
         this.goal = goal;
+        this.pendingFurnaceMemory = pendingFurnaceMemory;
         this.activated = mode != null;
         this.trial = trial;
         ipc = new Ipc(directory, run, mode);
@@ -576,6 +608,7 @@ final class AgentMacroControl {
         input = ipc.inbox;
         owner = engaged() ? "safety" : "deterministic";
         if (this.life != life || world != client.world || player != client.player) {
+            if (this.life != 0) invalidatePending("The player life, connection or dimension changed.");
             interrupt("The player life or dimension changed.", false);
             retireWork("needs_replan", "interrupted", "The player life or dimension changed.");
             work = null;
@@ -628,13 +661,13 @@ final class AgentMacroControl {
     }
     AgentPauseEpisodes.Work continuityWork() { return continuityWork; }
     Predicate<ItemStack> safetySpend() {
-        return work == null || work.budget.policy.floors().isEmpty() ? null : safetySpend;
+        return (work == null || work.budget.floors.isEmpty()) && pendingFloors().isEmpty() ? null : safetySpend;
     }
 
     private boolean canSpendSafetyStock(ItemStack stack) {
-        if (work == null || stack.isEmpty()) return true;
+        if (stack.isEmpty()) return true;
         Item item = stack.getItem();
-        int floor = work.budget.floor(item);
+        int floor = Math.max(work == null ? 0 : work.budget.floor(item), pendingFloors().getOrDefault(item, 0));
         if (floor == 0) return true;
         return count(item) > floor;
     }
@@ -774,10 +807,13 @@ final class AgentMacroControl {
         }
         sampleClock();
         witnessStationPlacement();
+        observePendingFooting();
+        if (pendingEntry() != null && !AgentClient.ownsSinglePlayerFurnaceWorld(client, player))
+            invalidatePending("Actor-only furnace access no longer holds.");
         // An accepted direct intent owns the input path even when its tick is
         // neutral (e.g. one missing route render). No work-order branch may steal it.
         if (!trial && ipc.workMode != null && (action == null || action.intent == null || action.durable)) {
-            reconcileWork();
+            if (!tryDeferPending()) reconcileWork(progress);
             if (hasActiveWorkOrder()) {
                 workTick(progress);
                 return;
@@ -840,6 +876,8 @@ final class AgentMacroControl {
         Offer offer = snapshots.get(intent.basis).offers.get(intent.opportunity);
         String refusal = !available() ? "No neutral, grounded, safe first-person view." :
             trial && (trialUsed || !diagnosticVerb(offer.key.verb)) ? "The diagnostic admits one isolated reader action."
+            : offer.key.verb == Verb.COLLECT_PENDING && (intent.skillHash != null || tick - intent.basis >= MAX_WORK_ADMISSION_AGE)
+                ? "Collection requires a fresh, direct instruction for the exact pending ticket."
             : SURFACE_CAP.equals(offer.key.activity) && intent.skillHash != null ? "A generated skill cannot cut cover."
             : (offer.route != null || offer.drySurvey != null) && intent.skillHash != null
                 ? "Only a direct Terra intent may survey or follow this dry route."
@@ -857,6 +895,13 @@ final class AgentMacroControl {
         if (offer.route != null || offer.drySurvey != null) routeOwner = progress;
         action = new Action(intent, offer, client, tick, now, body.renderedFrame(),
             offer.item == null ? 0 : count(offer.item), NO_ANCHORS, Float.NaN);
+        if (offer.key.verb == Verb.COLLECT_PENDING) {
+            action.pendingCollection = new PendingCollection(pendingEntry(), player.getInventory());
+            if (offer.face != null) {
+                action.pendingCollection.footing = player.getBlockPos().down();
+                action.pendingCollection.stance = player.getPos();
+            }
+        }
         if (offer.key.verb == Verb.STATION_REACQUIRE) personalStation(offer.face.state.getBlock()).attempted = true;
         action.prospectCover = SURFACE_CAP.equals(offer.key.activity);
         if (trial) {
@@ -941,13 +986,22 @@ final class AgentMacroControl {
                 && (action == null || action.offer.key.verb != Verb.BREAK || !actualOwner.equals("terra"))) body.pauseWork();
     }
 
-    private void reconcileWork() {
+    private void reconcileWork(AgentProgress progress) {
         WorkMailbox mailbox = input.work;
+        AgentWorkOrder next = mailbox.order;
+        if (next != null && next.duringWaitFor() != null && !consumed.containsKey(next.id())) {
+            admitPendingSide(next, progress);
+            return;
+        }
         if (hasActiveWorkOrder()) {
-            String invalid = !mailbox.present ? "The host withdrew the work order."
+            if (next != null && work.order.id().equals(next.id())) work.refusedPendingReplacement = false;
+            String invalid = !mailbox.present && !work.refusedPendingReplacement ? "The host withdrew the work order."
                 : (work.budget.policy.smeltIron() || work.budget.policy.waterFill())
                     && (mailbox.order == null || !work.order.id().equals(mailbox.order.id()))
+                    && !(work.refusedPendingReplacement && (!mailbox.present || next != null && next.duringWaitFor() != null))
                     ? "The host replaced the exact furnace or bucket work order."
+                : work.order.duringWaitFor() != null && (next == null || !work.order.id().equals(next.id()))
+                    ? "The host replaced the independent side order."
                 : tick >= work.order.expires() || now >= work.deadline ? "The finite work horizon expired."
                 : !hazardClear || work.order.safetyRevision() != safetyRevision ? "The safety premise changed."
                 : null;
@@ -956,7 +1010,6 @@ final class AgentMacroControl {
                 retireWork("needs_replan", "interrupted", invalid);
             }
         }
-        AgentWorkOrder next = mailbox.order;
         boolean continuePersonal = false;
         if (personalCraft != null) {
             boolean finished = work.phase.equals("complete");
@@ -999,6 +1052,9 @@ final class AgentMacroControl {
             } else if (next.policy().waterFill() && tick <= waterReceiptUntil) {
                 markConsumed(next.id());
                 receipt(next.id(), next.life(), "refused", "The previous source-water use is still inside its receipt window.");
+            } else if (next.policy().smeltIron() && (pendingEntry() != null || pendingOrigin != null)) {
+                markConsumed(next.id());
+                receipt(next.id(), next.life(), "refused", "One paid furnace obligation is still outstanding; no second batch is admitted.");
             } else if (hazardClear && (action == null || action.durable
                     && (compatible || !action.diamondRoute || action.offer.key.verb == Verb.DRY_SURVEY))) {
                 long deadline = now + (next.expires() - tick) * 50_000_000L;
@@ -1014,7 +1070,8 @@ final class AgentMacroControl {
                     }
                     boolean newDiamondBatch = samePolicy && next.policy().diamondProspecting() && !work.active()
                         && deepTreads() > work.startingDeepTreads;
-                    work = new WorkSession(next, samePolicy && !newDiamondBatch ? work.budget : new AgentWorkOrder.Budget(next.policy()),
+                    work = new WorkSession(next, samePolicy && !newDiamondBatch && work.order.duringWaitFor() == null
+                        ? work.budget : new AgentWorkOrder.Budget(next.policy(), pendingFloors()),
                         surfaceSearch, deadline);
                     work.waterClue = water;
                     work.startingDeepTreads = deepTreads();
@@ -1037,6 +1094,105 @@ final class AgentMacroControl {
             && now < work.deadline && tick < personalCraft.untilTick && now < personalCraft.untilNanos
             && hazardClear && work.order.safetyRevision() == safetyRevision && grounded()
             && body.keysNeutral() && shown == client.currentScreen && hands.workInventoryReady();
+    }
+
+    private AgentPendingFurnaceMemory.Entry pendingEntry() {
+        return trial || ipc.workMode == null ? null : pendingFurnaceMemory.current();
+    }
+
+    private Map<Item, Integer> pendingFloors() {
+        return pendingOrigin == null ? Map.of() : pendingOrigin.budget.floors;
+    }
+
+    private boolean pendingCanYield() {
+        var iron = action == null ? null : action.furnace;
+        var ticket = pendingEntry();
+        return ticket != null && ticket.mayInvestigateCollection() && !pendingUncertain && pendingEstimate != null
+            && pendingOrigin != null && work == pendingOrigin && work.active() && iron != null && iron.phase == FurnacePhase.WATCHING
+            && AgentFurnaceWatch.releasedForSide(iron.batch, iron.burnTick, iron.closedFrame, iron.watchFrame)
+            && tick < work.order.expires() && now < work.deadline && hazardClear && !urgent
+            && work.order.safetyRevision() == safetyRevision && ironFooting(iron.footing)
+            && releasedPendingHands();
+    }
+
+    private boolean releasedPendingHands() {
+        return observableWorld() && cursorClear() && player.currentScreenHandler == player.playerScreenHandler
+            && body.keysNeutral() && hands.releasedForPendingWork() && useAvailable()
+            && !player.isSprinting() && !player.isSneaking();
+    }
+
+    private boolean tryDeferPending() {
+        Intent intent = input.intent;
+        if (intent == null || consumed.containsKey(intent.id)) return false;
+        Snapshot basis = snapshots.get(intent.basis);
+        Offer offer = basis == null ? null : basis.offers.get(intent.opportunity);
+        if (offer == null || offer.key.verb != Verb.DEFER_PENDING) return false;
+        updateScope(true);
+        String refusal = intentScope(intent);
+        if (refusal == null && (intent.skillHash != null || tick - intent.basis >= MAX_WORK_ADMISSION_AGE
+                || !pendingCanYield() || !pendingEntry().ticket().toString().equals(offer.key.activity)))
+            refusal = "Deferral requires a current, clean, released wait and the exact ticket.";
+        if (refusal == null && !parkPending())
+            refusal = "The paid furnace could not be stored as a parked obligation.";
+        markConsumed(intent.id);
+        if (refusal != null) {
+            receipt(intent, "refused", refusal);
+            return false;
+        }
+        receipt(intent, "accepted", "The fresh witnessed pending ticket and released controls match.");
+        receipt(intent, "completed", "The paid batch was deferred without claiming ingots or advancing its target.");
+        return true;
+    }
+
+    private boolean parkPending() {
+        if (!pendingCanYield() || !pendingFurnaceMemory.park(pendingEntry().ticket(), tick, body.renderedFrame())) return false;
+        String detail = "The paid iron batch is parked at its witnessed furnace; no ingot was credited to inventory.";
+        ironMilestone("parked", detail);
+        body.pauseWork();
+        action = null;
+        retireWork("parked", "parked", detail);
+        continuityWork = null;
+        return true;
+    }
+
+    private void admitPendingSide(AgentWorkOrder next, AgentProgress progress) {
+        updateScope(true);
+        Snapshot basis = snapshots.get(next.basis());
+        var entry = pendingEntry();
+        String refusal = null;
+        var budget = next.policy() == null ? null : new AgentWorkOrder.Budget(next.policy(), pendingFloors());
+        if (budget == null || entry == null || !entry.ticket().toString().equals(next.duringWaitFor())
+                || !entry.mayInvestigateCollection() || entry.historical() || pendingUncertain)
+            refusal = "There is no exact, yieldable paid multi-unit ticket for this independent work.";
+        else if (next.life() != life || next.epoch() != epoch || basis == null || basis.epoch != epoch
+                || next.basis() > tick || tick - next.basis() >= MAX_WORK_ADMISSION_AGE || tick >= next.expires()
+                || next.safetyRevision() != safetyRevision || !hazardClear || urgent)
+            refusal = "The independent work basis or safety premise changed.";
+        else if (!releasedPendingHands() || !ironFooting(player.getBlockPos().down())
+                || !pendingFootNearby(entry, player.getBlockPos())
+                || (hasActiveWorkOrder() ? !pendingCanYield() : action != null || personalCraft != null))
+            refusal = "The wait has not released one safe nearby owner for the independent action.";
+        else if (budget.missingFloor(player.getInventory()) != null || count(next.policy().target().item()) >= next.policy().target().count()
+                || basis.offers.values().stream().noneMatch(offer -> pendingSideOffer(offer, budget, progress)))
+            refusal = "The independent target has no live exact local break, pickup or reserve-safe recipe in its basis.";
+        else if (hasActiveWorkOrder() && !parkPending())
+            refusal = "The paid furnace could not be stored as a parked obligation.";
+        markConsumed(next.id());
+        if (refusal != null) {
+            if (hasActiveWorkOrder() && work.budget.policy.smeltIron()) work.refusedPendingReplacement = true;
+            receipt(next.id(), next.life(), "refused", refusal);
+            return;
+        }
+        var evidence = header(run);
+        evidence.addProperty("id", next.id());
+        evidence.addProperty("pendingWorkId", entry.ticket().toString());
+        evidence.addProperty("milestone", "side_admitted");
+        evidence.addProperty("life", life);
+        evidence.addProperty("tick", tick);
+        if (!ipc.evidence("furnace-" + next.id() + "-side_admitted.json", evidence.toString())) return;
+        work = new WorkSession(next, budget, new SourceSearch(), now + (next.expires() - tick) * 50_000_000L);
+        work.startingStock = count(next.policy().target().item());
+        receipt(next.id(), life, "accepted", "Independent nearby work owns the released controls; the furnace remains parked.");
     }
 
     private boolean confirmsWorkStock() {
@@ -1074,6 +1230,10 @@ final class AgentMacroControl {
         status = work.detail;
         if (action != null) {
             runWorkStep(progress);
+            return;
+        }
+        if (work.order.duringWaitFor() != null) {
+            pendingSideTick(progress);
             return;
         }
         if (work.budget.policy.waterFill()) {
@@ -1233,6 +1393,151 @@ final class AgentMacroControl {
                     && startStockRecipe(recipe, quantity, tableHit, progress, new HashSet<>(4))) return true;
         }
         return personalCraft == null && workGather(progress, state -> AgentWorkOrder.harvest(state) == desired);
+    }
+
+    private String sideRecipe(String recipe, Item desired) {
+        if (recipe.equals("planks")) {
+            String exact = Registries.ITEM.getId(desired).getPath();
+            if (AgentHands.workSpecificPlanks(exact)) recipe = exact;
+        }
+        return AgentHands.workOutput(recipe) == desired ? recipe : null;
+    }
+
+    private boolean pendingSideOffer(Offer offer, AgentWorkOrder.Budget budget, AgentProgress progress) {
+        var target = budget.policy.target().item();
+        return switch (offer.key.verb) {
+            case BREAK -> budget.canBreak() && offer.key.activity == null && visibleFace(offer.face)
+                && budget.policy.breakAllowed(offer.face.state) && AgentWorkOrder.harvest(offer.face.state) == target
+                && pendingSideFace(offer.face.hit, offer.face.state, target, budget, progress);
+            case COLLECT -> offer.item == target && dropVisible(offer) && floorCurrent(offer.floor)
+                && dropNearLanding(offer.drop, offer.floor);
+            case CONTINUE -> {
+                String recipe = sideRecipe(offer.recipe.id, target);
+                yield recipe != null && budget.policy.craftAllowed(recipe) && hands.workCraftable(recipe, budget)
+                    && (offer.face == null ? !client.options.inventoryKey.isUnbound() : visibleFace(offer.face) && useAvailable());
+            }
+            default -> false;
+        };
+    }
+
+    private boolean pendingSideFace(BlockHitResult hit, BlockState state, Item target, AgentWorkOrder.Budget budget,
+                                    AgentProgress progress) {
+        BlockPos cell = hit.getBlockPos();
+        var held = player.getMainHandStack();
+        int loss = AgentMiningStock.maxLoss(held, state, world, cell);
+        return loss >= 0 && (loss == 0 || budget.limit(held.getItem(), count(held.getItem())) >= loss)
+            && canBreak(cell, state, progress) && workLootCompatible(held, state)
+            && !pendingTrail.contains(cell.up()) && dryWorkBreakSafe(cell, state, target, progress);
+    }
+
+    /** The stock grant may approach its own already visible face by one safe, rechecked level hop. */
+    private boolean approachPendingSource(AgentPendingFurnaceMemory.Entry entry, Item target, AgentProgress progress) {
+        if (work.pendingSideWalked || client.options.forwardKey.isUnbound()) return false;
+        double reach = reach();
+        var source = body.find(state -> work.budget.policy.breakAllowed(state) && AgentWorkOrder.harvest(state) == target,
+            reach + 1, hit -> !work.rejected.contains(hit.getBlockPos()) && pendingSideFace(hit,
+                world.getBlockState(hit.getBlockPos()), target, work.budget, progress)).orElse(null);
+        if (source == null) return false;
+        var eye = player.getEyePos();
+        var foot = player.getBlockPos();
+        for (Direction direction : CARDINAL) {
+            var next = foot.offset(direction);
+            if (!pendingFootNearby(entry, next) || source.getBlockPos().equals(next)) continue;
+            BlockPos support = next.down();
+            Vec3d landing = Vec3d.ofBottomCenter(next);
+            if (eye.add(landing.x - player.getX(), 0, landing.z - player.getZ()).squaredDistanceTo(source.getPos()) > reach * reach
+                    || body.macroFloor(support) == null || !watchedDryLane(support)) continue;
+            var witness = new Floor(support, world.getBlockState(support), landing);
+            var offer = new Offer(null, new Key(Verb.APPROACH, support, 0, work.order.duringWaitFor()),
+                "Approach the authorized visible stock source by one dry witnessed foothold", "",
+                0, 34, witness, null, null, null, null);
+            action = new Action(null, offer, client, tick, now, body.renderedFrame(), 0, NO_ANCHORS, 34);
+            action.durable = true;
+            work.pendingSideWalked = true;
+            work.pendingSideSource = face(source);
+            work.pendingSideAimUntil = tick + Verb.APPROACH.maxTicks + 24;
+            return true;
+        }
+        return false;
+    }
+
+    private void pendingSideTick(AgentProgress progress) {
+        var entry = pendingEntry();
+        var target = work.order.policy().target();
+        if (confirmsWorkStock()) {
+            work.completedTick = tick;
+            if (work.lastEffect == null)
+                retireWork("needs_replan", "interrupted", "The stock is already present, but no independent physical effect was proved.");
+            else retireWork("complete", "completed", "The independent work reached its actual inventory target and reserves.");
+            return;
+        }
+        if (entry == null || !entry.mayInvestigateCollection() || pendingUncertain || !hazardClear || urgent
+                || !pendingFootNearby(entry, player.getBlockPos()) || missingWorkFloor() != null) {
+            retireWork("needs_replan", "interrupted", "The independent work lost its nearby furnace, safety or reserve premise.");
+            return;
+        }
+        if (!releasedPendingHands() || !ironFooting(player.getBlockPos().down())) return;
+        Item desired = target.item();
+        var drop = body.visibleEntity(entity -> entity instanceof ItemEntity item && item.getStack().isOf(desired)
+            && cardinallyAdjacent(player.getBlockPos(), item.getBlockPos()) && roomFor(item.getStack())
+            && !work.rejectedDrops.contains(item.getId()), 3.25).orElse(null);
+        if (drop instanceof ItemEntity found) {
+            BlockPos floor = found.getBlockPos().down();
+            var witness = new Floor(floor, world.getBlockState(floor), Vec3d.ofBottomCenter(floor.up()));
+            if (pendingFootNearby(entry, floor.up()) && floorCurrent(witness) && dropNearLanding(found, witness)) {
+                var key = new Key(Verb.COLLECT, floor, found.getId(), work.order.duringWaitFor());
+                var offer = new Offer(null, key, "Collect the independent work's nearby " + Registries.ITEM.getId(desired),
+                    "", 0, 28, witness, null, found, desired, null);
+                action = new Action(null, offer, client, tick, now, body.renderedFrame(), count(desired), NO_ANCHORS, 28);
+                action.durable = true;
+                runWorkStep(progress);
+                return;
+            }
+        }
+        if (work.lastHarvest != null && tick - work.lastHarvestTick <= 14) {
+            body.aim(Vec3d.ofBottomCenter(work.lastHarvest).add(0, -0.4, 0));
+            enact("collect", "Checking for the drop from the independent work's own vanilla break.");
+            return;
+        }
+        work.lastHarvest = null;
+        if (work.budget.craftsLeft() > 0) {
+            for (String effect : work.budget.policy.effects()) {
+                if (!effect.startsWith("craft:")) continue;
+                String recipe = sideRecipe(effect.substring(6), desired);
+                if (recipe == null) continue;
+                BlockHitResult bench = AgentHands.workTableRecipe(recipe) ? visibleStation(Blocks.CRAFTING_TABLE) : null;
+                if (bench == null && AgentHands.workTableRecipe(recipe)) continue;
+                int countPerRecipe = AgentHands.workOutputCount(recipe);
+                if (startWorkRecipe(recipe, (target.count() - count(desired) + countPerRecipe - 1) / countPerRecipe, bench)) {
+                    runWorkStep(progress);
+                    return;
+                }
+            }
+        }
+        if (work.budget.canBreak()) {
+            if (work.pendingSideSource != null && tick < work.pendingSideAimUntil) {
+                var source = work.pendingSideSource;
+                var live = body.macroMineWitness(source.hit, reach());
+                if (live == null) {
+                    body.aim(source.hit.getPos());
+                    enact("search", "Reacquiring the authorized visible source from the one dry approach tile.");
+                    return;
+                }
+                work.pendingSideSource = null;
+            }
+            var hit = body.find(state -> work.budget.policy.breakAllowed(state) && AgentWorkOrder.harvest(state) == desired,
+                reach(), seen -> !work.rejected.contains(seen.getBlockPos()) && body.macroMineWitness(seen, reach()) != null
+                    && pendingSideFace(seen, world.getBlockState(seen.getBlockPos()), desired, work.budget, progress)).orElse(null);
+            if (hit != null && startWorkBreak(face(hit), desired, false)) {
+                runWorkStep(progress);
+                return;
+            }
+            if (approachPendingSource(entry, desired, progress)) {
+                runWorkStep(progress);
+                return;
+            }
+        }
+        retireWork("blocked", "interrupted", "No permitted local action remains; the paid result stays parked at its own furnace.");
     }
 
     private boolean startStockRecipe(String recipe, int quantity, BlockHitResult bench, AgentProgress progress,
@@ -3505,7 +3810,15 @@ final class AgentMacroControl {
         if (iron.phase == FurnacePhase.RETURNING) {
             boolean restored = hands.status().equals("smelt: done") && cursorClear() && raw.isEmpty()
                 && count(Items.RAW_IRON) == iron.returnedStock;
-            if (restored) ironMilestone("returned", "The paid raw iron left in the cold input slot was returned to inventory.");
+            if (restored) {
+                ironMilestone("returned", "The paid raw iron left in the cold input slot was returned to inventory.");
+                var ticket = pendingEntry();
+                if (pendingOrigin == work) {
+                    if (output.isEmpty() && (ticket == null || pendingFurnaceMemory.end(ticket.ticket(),
+                            AgentPendingFurnaceMemory.State.CANCELLED, tick, body.renderedFrame()))) clearPendingLocal();
+                    else invalidatePending("The original paid recipe no longer has a conserved batch to withdraw.");
+                }
+            }
             interrupt(restored ? "The furnace stalled; the remaining raw iron was returned."
                 : "The furnace stalled and the raw iron return did not settle.", true);
             return;
@@ -3523,6 +3836,11 @@ final class AgentMacroControl {
             rememberStation(target);
             ironMilestone("collected", "Collected " + batch.units() + " furnace-produced iron ingot(s); actual inventory has "
                 + count(Items.IRON_INGOT) + ".");
+            var ticket = pendingEntry();
+            if (pendingOrigin == work) {
+                if (ticket != null) finishPendingMemory(ticket);
+                else clearPendingLocal();
+            }
             furnace.close();
             body.pauseWork();
             continuityWork = AgentPauseEpisodes.Work.GUI;
@@ -3544,6 +3862,8 @@ final class AgentMacroControl {
             iron.phase = FurnacePhase.LOADED;
             iron.advancedTick = tick;
             iron.progress = handler.getCookProgress();
+            iron.output = output.getCount();
+            rememberPending(iron, target);
             ironMilestone("loaded", "Loaded " + batch.units() + " raw iron and " + batch.fuelCount() + " "
                 + Registries.ITEM.getId(batch.fuel()) + "; no ingot stock has been collected.");
             return;
@@ -3605,6 +3925,17 @@ final class AgentMacroControl {
     }
 
     boolean allowScopedFurnaceUse() {
+        if (action != null && action.pendingCollection != null) {
+            var collect = action.pendingCollection;
+            if (!action.fired || action.opened != null) return true;
+            var iron = action.furnace;
+            if (iron == null || action.firedAt != tick || iron.contactEntered) return false;
+            iron.contactEntered = true;
+            return client.currentScreen == null && client.crosshairTarget instanceof BlockHitResult hit && sameFurnaceContact(iron, hit)
+                && player.currentScreenHandler == player.playerScreenHandler && cursorClear() && useAvailable()
+                && hands.releasedForPendingWork() && pendingContactCurrent(collect) && input.active
+                && input.intent != null && input.intent.equals(action.intent);
+        }
         var iron = action == null ? null : action.furnace;
         if (iron == null || !action.fired || action.opened != null) return true;
         if (action.firedAt != tick || iron.contactEntered) return false;
@@ -3643,16 +3974,315 @@ final class AgentMacroControl {
         if (watch != null && world == updatedWorld && watch.pos.equals(pos)
                 && (!state.isOf(Blocks.FURNACE) || state.get(AbstractFurnaceBlock.FACING) != watch.facing))
             watch.invalidate();
+        var ticket = pendingEntry();
+        if (ticket != null && ticket.mayInvestigateCollection() && world == updatedWorld && ticket.pos().equals(pos)
+                && (!state.isOf(Blocks.FURNACE) || state.get(AbstractFurnaceBlock.FACING) != ticket.facing())) {
+            pendingFurnaceMemory.end(ticket.ticket(), AgentPendingFurnaceMemory.State.DISAPPEARED, tick, body.renderedFrame());
+            invalidatePending("The witnessed furnace was removed or changed facing.");
+        }
     }
 
     void observeFurnaceChunk(ClientWorld updatedWorld, ChunkPos chunk) {
         var watch = action == null || action.furnace == null ? null : action.furnace.watch;
         if (watch != null && world == updatedWorld && chunk.x == (watch.pos.getX() >> 4) && chunk.z == (watch.pos.getZ() >> 4))
             watch.invalidate();
+        var ticket = pendingEntry();
+        if (ticket != null && world == updatedWorld && chunk.x == (ticket.pos().getX() >> 4) && chunk.z == (ticket.pos().getZ() >> 4))
+            pendingEstimate = null; // A chunk transition does not prove that the furnace kept ticking.
     }
 
     private AgentFurnaceWatch.Stock ironStock(AgentHands.IronBatch batch) {
         return new AgentFurnaceWatch.Stock(count(Items.RAW_IRON), count(batch.fuel()), count(Items.IRON_INGOT));
+    }
+
+    private void rememberPending(FurnaceWork iron, Face target) {
+        if (!AgentClient.ownsSinglePlayerFurnaceWorld(client, player)) return;
+        pendingOrigin = work;
+        UUID id;
+        try {
+            id = UUID.fromString(work.order.id());
+        } catch (IllegalArgumentException invalid) {
+            return; // Older readers did not require an order UUID and have no ticket handoff.
+        }
+        if (pendingFurnaceMemory.pay(id, world.getRegistryKey().getValue().toString(), target.hit.getBlockPos(),
+                target.state.get(AbstractFurnaceBlock.FACING), iron.footing.up(), iron.batch, iron.syncId,
+                iron.output, iron.fuelRemaining, tick, body.renderedFrame())) {
+            pendingFace = target;
+            pendingTrail.clear();
+            pendingTrail.add(iron.footing.up());
+            pendingTileSeen = tick;
+            pendingUncertain = pendingWorldRelease = false;
+        }
+    }
+
+    private void finishPendingMemory(AgentPendingFurnaceMemory.Entry ticket) {
+        if (!pendingFurnaceMemory.end(ticket.ticket(), AgentPendingFurnaceMemory.State.COLLECTED, tick, body.renderedFrame())) {
+            pendingUncertain = true;
+            remember("The proved collection could not retire its durable ticket; no second withdrawal is authorized.");
+            return;
+        }
+        clearPendingLocal();
+    }
+
+    private void clearPendingLocal() {
+        pendingOrigin = null;
+        pendingFace = null;
+        pendingEstimate = null;
+        pendingTrail.clear();
+        pendingUncertain = pendingWorldRelease = false;
+    }
+
+    private void invalidatePending(String reason) {
+        var ticket = pendingEntry();
+        if (ticket == null || pendingUncertain) return;
+        pendingUncertain = true;
+        if (ticket.mayInvestigateCollection())
+            pendingFurnaceMemory.discontinuity(tick, body == null ? 0 : body.renderedFrame());
+        if (pendingOrigin != null && pendingOrigin.phase.equals("parked")) {
+            pendingOrigin.phase = "needs_replan";
+            pendingOrigin.detail = reason;
+            receipt(pendingOrigin.order.id(), pendingOrigin.order.life(), "interrupted", reason + " No ingots were credited.");
+        }
+    }
+
+    private static boolean pendingFootNearby(AgentPendingFurnaceMemory.Entry ticket, BlockPos foot) {
+        BlockPos origin = ticket.footing();
+        return origin.getY() == foot.getY()
+            && Math.abs(origin.getX() - foot.getX()) + Math.abs(origin.getZ() - foot.getZ()) <= MAX_ROUTE_EDGES;
+    }
+
+    private void observePendingFooting() {
+        var ticket = pendingEntry();
+        if (ticket == null || pendingFace == null || !grounded() || !hazardClear) return;
+        BlockPos foot = player.getBlockPos();
+        if (!pendingFootNearby(ticket, foot)) return;
+        if (pendingTrail.isEmpty()) pendingTrail.add(ticket.footing());
+        int prior = pendingTrail.indexOf(foot);
+        if (prior >= 0) {
+            if (prior == pendingTrail.size() - 1 || cardinallyAdjacent(pendingTrail.getLast(), foot) && tick - pendingTileSeen <= 4) {
+                pendingTrail.subList(prior + 1, pendingTrail.size()).clear();
+                pendingTileSeen = tick;
+            }
+        } else if (pendingTrail.size() <= MAX_ROUTE_EDGES && tick - pendingTileSeen <= 4
+                && cardinallyAdjacent(pendingTrail.getLast(), foot) && body.hasRecentView() && dryWorkshopSupport(foot.down())) {
+            pendingTrail.add(foot.toImmutable());
+            pendingTileSeen = tick;
+        }
+    }
+
+    private BlockPos pendingPrevious(AgentProgress progress, BlockPos from, BlockPos goalFoot) {
+        int index = pendingTrail.indexOf(from);
+        BlockPos next = index > 0 ? pendingTrail.get(index - 1) : progress.macroPendingStep(from, goalFoot);
+        return next != null && cardinallyAdjacent(from, next) ? next : null;
+    }
+
+    private boolean pendingParked() {
+        return pendingOrigin == null || !pendingOrigin.active();
+    }
+
+    private boolean pendingCollectionPremise(AgentPendingFurnaceMemory.Entry ticket) {
+        return ticket != null && pendingParked() && !hasActiveWorkOrder() && ticket.mayInvestigateCollection()
+            && !pendingUncertain && hazardClear && !urgent && releasedPendingHands() && ironFooting(player.getBlockPos().down())
+            && world.getRegistryKey().getValue().toString().equals(ticket.dimension())
+            && AgentClient.ownsSinglePlayerFurnaceWorld(client, player);
+    }
+
+    private boolean pendingReturnKnown(AgentProgress progress, AgentPendingFurnaceMemory.Entry ticket) {
+        BlockPos foot = player.getBlockPos();
+        return pendingFootNearby(ticket, foot) && (ticket.footing().equals(foot) || !client.options.forwardKey.isUnbound()
+            && pendingPrevious(progress, foot, ticket.footing()) != null);
+    }
+
+    private boolean pendingContactCurrent(PendingCollection collect) {
+        var current = pendingEntry();
+        return current != null && current.ticket().equals(collect.entry.ticket()) && current.mayInvestigateCollection()
+            && !pendingUncertain && pendingParked() && world == client.world && player == client.player
+            && world.getRegistryKey().getValue().toString().equals(current.dimension())
+            && AgentClient.ownsSinglePlayerFurnaceWorld(client, player)
+            && grounded() && hazardClear && !urgent && client.getCameraEntity() == player
+            && client.options.getPerspective().isFirstPerson() && collect.footing != null && ironFooting(collect.footing)
+            && collect.stance != null && horizontalSquared(player.getPos(), collect.stance) <= 0.04
+            && (collect.face == null || player.getEyePos().squaredDistanceTo(collect.face.getPos()) <= reach() * reach()
+                && matchingPendingStation(current));
+    }
+
+    private boolean matchingPendingStation(AgentPendingFurnaceMemory.Entry ticket) {
+        var state = world.getBlockState(ticket.pos());
+        return state.isOf(Blocks.FURNACE) && state.get(AbstractFurnaceBlock.FACING) == ticket.facing();
+    }
+
+    private BlockHitResult livePendingFace(AgentPendingFurnaceMemory.Entry ticket) {
+        return body.find(state -> state.isOf(Blocks.FURNACE) && state.get(AbstractFurnaceBlock.FACING) == ticket.facing(),
+            reach(), hit -> hit.getBlockPos().equals(ticket.pos()) && body.macroMineWitness(hit, reach()) != null).orElse(null);
+    }
+
+    private void advancePendingCollection(AgentProgress progress) {
+        var collect = action.pendingCollection;
+        var entry = collect.entry;
+        if (pendingUncertain || pendingEntry() == null || !pendingEntry().mayInvestigateCollection()) {
+            interrupt("The original station continuity cannot authorize this withdrawal.", true);
+            return;
+        }
+        if (!collect.withdrawal.issued() && collect.returnInventory.gain(player.getInventory()) != null) {
+            interrupt("Unexpected inventory gain during the station return; no output withdrawal was authorized.", true);
+            return;
+        }
+        if (collect.footing == null && (!entry.footing().equals(player.getBlockPos()) || collect.landing != null)) {
+            if (client.currentScreen != null || !cursorClear() || !body.hasRecentView()) return;
+            if (collect.landing == null && collect.walked < MAX_ROUTE_EDGES)
+                collect.landing = pendingPrevious(progress, player.getBlockPos(), entry.footing());
+            if (collect.landing == null) {
+                interrupt("No connected observed dry return to the paid furnace is available from here.", true);
+                return;
+            }
+            BlockPos landing = collect.landing;
+            Vec3d center = Vec3d.ofBottomCenter(landing);
+            if (landing.equals(player.getBlockPos()) && horizontalSquared(player.getPos(), center) <= 0.1225) {
+                if (!settled()) collect.settleAt = 0;
+                else if (collect.settleAt == 0) collect.settleAt = tick;
+                else if (tick - collect.settleAt >= APPROACH_SETTLE_TICKS) {
+                    collect.landing = null;
+                    collect.settleAt = 0;
+                    ++collect.walked;
+                }
+                return;
+            }
+            BlockPos floor = landing.down();
+            double dx = center.x - player.getX(), dz = center.z - player.getZ();
+            float yaw = heading(dx, dz);
+            if (body.macroFloor(floor) != null && watchedDryLane(floor)) {
+                body.macroFlatWalk(center, yaw, 38);
+                continuityWork = AgentPauseEpisodes.Work.ROUTE;
+            } else body.turnFine(yaw, 46);
+            return;
+        }
+        if (collect.footing == null) {
+            if (!ironFooting(entry.footing().down())) return;
+            collect.footing = entry.footing().down();
+            collect.stance = player.getPos();
+        }
+        if (!pendingContactCurrent(collect)) {
+            interrupt("The return stance, live connection or first-person reach no longer matches the paid furnace.", true);
+            return;
+        }
+        if (action.opened == null) {
+            if (action.fired) {
+                if (action.furnace.contactObserved && client.currentScreen instanceof FurnaceScreen furnace) {
+                    action.opened = furnace;
+                    action.furnace.openedTick = tick;
+                } else if (client.currentScreen != null || tick - action.firedAt > FURNACE_SYNC_TICKS) {
+                    interrupt("No exact vanilla furnace screen followed the authorized contact.", false);
+                }
+                return;
+            }
+            if (client.currentScreen != null || !cursorClear() || !useAvailable() || !body.hasRecentView()
+                    || body.renderedFrame() <= action.startingFrame || !hands.releasedForPendingWork()) return;
+            BlockHitResult live = livePendingFace(entry);
+            if (live == null) {
+                Face witness = action.offer.face != null ? action.offer.face : pendingFace;
+                Vec3d aim = witness == null ? Vec3d.ofCenter(entry.pos()) : witness.hit.getPos();
+                body.aim(aim);
+                return;
+            }
+            collect.face = live;
+            if (action.furnace == null) action.furnace = new FurnaceWork(collect.footing);
+            contactFurnace(action.furnace, live);
+            return;
+        }
+        var furnace = (FurnaceScreen) action.opened;
+        var handler = furnace.getScreenHandler();
+        if (client.currentScreen != furnace || player.currentScreenHandler != handler) {
+            interrupt("The exact reopened handler changed before storing the paid result.", true);
+            return;
+        }
+        var sync = (AgentFurnaceSync) handler;
+        if (shown != furnace || !sync.agent$furnaceContentsSynced() || tick - action.furnace.openedTick < 2) {
+            if (tick - action.furnace.openedTick > FURNACE_SYNC_TICKS)
+                interrupt("Vanilla did not render and freshly synchronize the reopened station.", true);
+            return;
+        }
+        var raw = handler.getSlot(0).getStack();
+        var fuel = handler.getSlot(1).getStack();
+        var output = handler.getOutputSlot().getStack();
+        var batch = entry.batch();
+        if (collect.withdrawal.issued()) {
+            if (action.craftJob != hands.jobGeneration()) {
+                interrupt("The exact output withdrawal hand job was replaced.", true);
+            } else if (hands.busy()) {
+                hands.tick();
+            } else if (!hands.status().equals("smelt: done") || !cursorClear() || !raw.isEmpty() || !fuel.isEmpty()
+                    || !output.isEmpty() || !collect.withdrawal.confirms(ironStock(batch), batch)) {
+                interrupt("No exact inventory gain relative to the fresh collection baseline was proved.", true);
+            } else if (collect.storedAt == 0) {
+                collect.storedAt = tick;
+            } else if (tick - collect.storedAt >= 3) {
+                completePendingCollection(collect, furnace);
+            }
+            return;
+        }
+        // Vanilla sync ids are connection-local and may repeat in a new continuation.
+        String mismatch = AgentFurnaceWatch.pendingReopenProblem(entry.historical() ? -1 : entry.syncId(), handler.syncId,
+            sync.agent$furnaceContentsSynced(), sync.agent$furnaceOutputUpdates(), batch, entry.minimumOutput(),
+            entry.maximumFuel(), raw, fuel, output);
+        if (mismatch != null) {
+            if (handler.syncId != entry.syncId() || entry.historical()) invalidatePending(mismatch);
+            interrupt(mismatch, true);
+        } else if (!cursorClear() || !AgentFurnaceWatch.exactResult(batch.units(), 0, sync.agent$furnaceOutputUpdates(), raw, fuel, output)) {
+            if (!cursorClear()) interrupt("The freshly synchronized furnace cursor was not clear.", false);
+            else if (hands.closeWorkFurnaceWithEscape(furnace)) {
+                action.opened = null;
+                finish("interrupted", "The exact furnace was rechecked, but no complete result was present. The paid batch is still pending.");
+            } else interrupt("Could not cleanly close the still-pending furnace after rechecking the result.", true);
+        } else {
+            var from = ironStock(batch);
+            if (!hands.collectWorkIron(furnace, batch.units(), 0) || !collect.withdrawal.begin(from)) {
+                interrupt(hands.status(), true);
+                return;
+            }
+            action.craftJob = hands.jobGeneration();
+        }
+    }
+
+    private void completePendingCollection(PendingCollection collect, FurnaceScreen furnace) {
+        var origin = pendingOrigin;
+        var entry = collect.entry;
+        int units = entry.batch().units();
+        String detail = "Collected " + units + " furnace-produced iron ingot(s) into actual vanilla inventory.";
+        var evidence = header(run);
+        evidence.addProperty("id", entry.ticket().toString());
+        evidence.addProperty("life", life);
+        evidence.addProperty("tick", tick);
+        evidence.addProperty("milestone", "collected");
+        evidence.addProperty("cookMode", "pending_work");
+        evidence.addProperty("chargedUnits", units);
+        evidence.addProperty("chargedFuel", entry.batch().fuelCount());
+        evidence.addProperty("fuelItem", Registries.ITEM.getId(entry.batch().fuel()).toString());
+        evidence.addProperty("originalSyncId", entry.syncId());
+        var handler = furnace.getScreenHandler();
+        evidence.addProperty("syncId", handler.syncId);
+        evidence.addProperty("slotOutputUpdates", ((AgentFurnaceSync) handler).agent$furnaceOutputUpdates());
+        evidence.add("beforeStock", ironReceiptStock(collect.withdrawal.baseline()));
+        evidence.add("carriedStock", ironReceiptStock(ironStock(entry.batch())));
+        ipc.evidence("furnace-" + entry.ticket() + "-collected.json", evidence.toString());
+        finishPendingMemory(entry);
+        if (origin != null && origin.phase.equals("parked")) {
+            origin.confirmedCrafts += units;
+            origin.collectedIron = true;
+            origin.lastEffect = detail;
+            origin.lastEffectTick = origin.completedTick = tick;
+            boolean targetMet = count(Items.IRON_INGOT) >= goalAmount(origin.order.policy().target())
+                && origin.budget.missingFloor(player.getInventory()) == null;
+            origin.phase = targetMet ? "complete" : "needs_replan";
+            origin.detail = detail;
+            origin.enactedPhase = targetMet ? "complete" : "hold";
+            origin.enactedStatus = detail;
+            receipt(origin.order.id(), origin.order.life(), targetMet ? "completed" : "interrupted",
+                targetMet ? detail : detail + " The original stock target or reserve is still unmet.");
+        }
+        rememberStation(face(collect.face));
+        furnace.close();
+        continuityWork = AgentPauseEpisodes.Work.GUI;
+        complete(detail);
     }
 
     private void startFurnaceWatch(FurnaceWork iron, FurnaceScreen furnace, Face target) {
@@ -3691,6 +4321,10 @@ final class AgentMacroControl {
         if (iron.watchFrame == 0) {
             iron.watchFrame = frame;
             ironMilestone("watch_closed", "Vanilla Escape closed the clean paid furnace; a fresh first-person view confirms the stationary dry stance.");
+            if (pendingOrigin == work) {
+                pendingWorldRelease = true;
+                pendingEstimate = iron.watch;
+            }
             startFurnaceSurvey(iron);
         }
         if (iron.watch.elapsed(tick, now)) {
@@ -4177,6 +4811,14 @@ final class AgentMacroControl {
                 ? !client.options.inventoryKey.isUnbound() : visibleFace(offer.face) && useAvailable())
                 ? null : "The recipe ingredients, storage, or workstation changed.";
             case FOLLOW -> routeCurrent(offer, progress) ? null : "The exact witnessed dry segment or its source changed.";
+            case COLLECT_PENDING -> {
+                var ticket = pendingEntry();
+                yield pendingCollectionPremise(ticket) && ticket.ticket().toString().equals(offer.key.activity)
+                    && (offer.face == null ? pendingReturnKnown(progress, ticket)
+                        : body.macroMineWitness(offer.face.hit, reach()) != null && matchingPendingStation(ticket))
+                    ? null : "The exact paid ticket, safe station return or clean controls changed.";
+            }
+            case DEFER_PENDING -> "Only the exact released furnace watch can be deferred.";
             case WATER_CLUE -> "The source-water clue grants no primitive action.";
             case WORK_WALK, WORK_EQUIP, WORK_PLACE, WORK_TREAD, WORK_SMELT, WORK_FILL -> "This operation requires a native work order.";
         };
@@ -4185,7 +4827,8 @@ final class AgentMacroControl {
     private void step(AgentProgress progress) {
         Offer offer = action.offer;
         status = offer.summary;
-        if (client.currentScreen != null && offer.key.verb != Verb.INTERACT && offer.key.verb != Verb.CONTINUE) {
+        if (client.currentScreen != null && offer.key.verb != Verb.INTERACT && offer.key.verb != Verb.CONTINUE
+                && offer.key.verb != Verb.COLLECT_PENDING) {
             interrupt("A different screen replaced the camera view.", false);
             return;
         }
@@ -4228,8 +4871,9 @@ final class AgentMacroControl {
             case APPROACH, COLLECT -> walk(offer);
             case BREAK -> breakWitnessedFace(offer.face, progress);
             case INTERACT, CONTINUE -> useOrCraft(offer);
+            case COLLECT_PENDING -> advancePendingCollection(progress);
             case FOLLOW -> followRoute(offer, progress);
-            case WATER_CLUE, WORK_WALK, WORK_EQUIP, WORK_PLACE, WORK_TREAD, WORK_SMELT, WORK_FILL ->
+            case WATER_CLUE, DEFER_PENDING, WORK_WALK, WORK_EQUIP, WORK_PLACE, WORK_TREAD, WORK_SMELT, WORK_FILL ->
                 throw new IllegalStateException("Expected work step dispatch");
         }
     }
@@ -4682,6 +5326,7 @@ final class AgentMacroControl {
 
     void closeFurnaceForStop() {
         if (action == null || action.furnace == null || client.player != player || client.world != world) return;
+        invalidateUnprovedWithdrawal();
         closeOwnedWorkScreen(hands.holdsWorkInventory());
     }
 
@@ -5309,11 +5954,41 @@ final class AgentMacroControl {
         List<Offer> visible = List.of();
         if (progress != null && observableWorld()) {
             if (action == null) visible = offers(progress);
+            else if (pendingCanYield()) {
+                // These offers are quote evidence only while the accepted furnace still owns the motor.
+                visible = offers(progress).stream().filter(offer -> offer.key.verb == Verb.BREAK && offer.key.activity == null
+                    || offer.key.verb == Verb.COLLECT || offer.key.verb == Verb.CONTINUE).toList();
+            }
             else if (action.intent == null && action.keepVisible.length != 0) {
                 var continuing = new ArrayList<Offer>(action.keepVisible.length);
                 for (Offer anchor : action.keepVisible) if (liveMaterialFace(anchor, progress)) continuing.add(anchor);
                 visible = continuing;
             }
+        }
+        var ticket = pendingEntry();
+        if (ticket != null && (pendingWorldRelease || pendingParked())) {
+            boolean yieldable = pendingCanYield();
+            boolean parked = pendingParked();
+            boolean safeReturn = progress != null && action == null && pendingCollectionPremise(ticket);
+            BlockHitResult inReach = safeReturn ? livePendingFace(ticket) : null;
+            boolean collectible = safeReturn && (inReach != null || pendingReturnKnown(progress, ticket));
+            Offer pendingOffer = null;
+            if (yieldable || collectible) {
+                var list = new ArrayList<Offer>(visible.size() + 1);
+                Verb verb = yieldable ? Verb.DEFER_PENDING : Verb.COLLECT_PENDING;
+                offer(list, new Key(verb, null, 0, ticket.ticket().toString()),
+                    yieldable ? "Defer the paid furnace batch" : "Return to the paid furnace and recheck its result",
+                    yieldable ? "The exact paid multi-unit batch released clean controls; leaving it does not grant any stock."
+                        : "A nearby return is remembered. Vanilla face, handler and exact output must all revalidate before withdrawal.",
+                    0, 0, null, inReach == null ? null : face(inReach), null, null, null);
+                pendingOffer = list.getFirst();
+                for (Offer offer : visible) {
+                    if (list.size() == MAX_OFFERS) break;
+                    list.add(offer);
+                }
+                visible = list;
+            }
+            value.add("pendingWork", pendingObservation(ticket, yieldable, parked, safeReturn && !collectible, pendingOffer));
         }
         for (Offer offer : visible) {
             JsonObject entry = new JsonObject();
@@ -5338,6 +6013,49 @@ final class AgentMacroControl {
         value.add("recent", history);
         value.addProperty("quiescent", quiescent);
         ipc.observation.set(value.toString());
+    }
+
+    private JsonObject pendingObservation(AgentPendingFurnaceMemory.Entry ticket, boolean yieldable, boolean parked,
+                                          boolean unreachableHere, Offer offer) {
+        var value = new JsonObject();
+        value.addProperty("id", ticket.ticket().toString());
+        value.addProperty("kind", "iron-smelting");
+        value.addProperty("goal", goal);
+        var invested = new JsonArray(2);
+        invested.add(pendingStock(Items.RAW_IRON, ticket.batch().units()));
+        invested.add(pendingStock(ticket.batch().fuel(), ticket.batch().fuelCount()));
+        value.add("invested", invested);
+        value.add("output", pendingStock(Items.IRON_INGOT, ticket.batch().units()));
+        String location = "The witnessed furnace at the dry workshop";
+        if (world.getRegistryKey().getValue().toString().equals(ticket.dimension())) {
+            Vec3d station = Vec3d.ofCenter(ticket.pos());
+            Vec3d relative = station.subtract(player.getPos());
+            if (relative.horizontalLengthSquared() > 0.25) {
+                float offset = MathHelper.wrapDegrees(heading(relative.x, relative.z) - player.getYaw());
+                String direction = Math.abs(offset) > 145 ? "behind" : Math.abs(offset) < 25 ? "ahead" : offset < 0 ? "left" : "right";
+                location += ", last seen " + direction + " of this facing";
+            }
+            if (ticket.footing().getY() != player.getBlockY())
+                location += ticket.footing().getY() > player.getBlockY() ? " and above this level" : " and below this level";
+        }
+        if (unreachableHere) location += "; no connected safe local return is currently witnessed";
+        value.addProperty("location", location);
+        boolean blocked = unreachableHere || pendingUncertain || !ticket.mayInvestigateCollection();
+        int remaining = pendingEstimate == null ? 0 : pendingEstimate.remainingTicks(tick);
+        value.addProperty("state", blocked ? "blocked" : remaining > 0 ? "estimated" : "unknown");
+        if (!blocked && remaining > 0) value.addProperty("remainingTicks", remaining);
+        value.addProperty("yieldable", yieldable);
+        value.addProperty("parked", parked);
+        if (ticket.historical() && parked) value.addProperty("historical", true);
+        if (offer != null) value.addProperty(yieldable ? "deferOfferId" : "collectOfferId", offer.id);
+        return value;
+    }
+
+    private static JsonObject pendingStock(Item item, int count) {
+        var value = new JsonObject();
+        value.addProperty("item", Registries.ITEM.getId(item).toString());
+        value.addProperty("count", count);
+        return value;
     }
 
     private JsonObject workObservation() {
@@ -5433,12 +6151,19 @@ final class AgentMacroControl {
         if (action == null) return;
         clearUnconsumedWaterUse();
         clearUnconsumedFurnaceUse();
+        invalidateUnprovedWithdrawal();
         if (action.offer.key.verb == Verb.WORK_SMELT && action.furnace.phase != null) {
             if (!urgent && owner.equals("work_order")) body.pauseWork();
             detail += " The accepted batch is not reloaded; any uncollected contents stay in the furnace.";
         }
         if (closeOwned) closeOwnedWorkScreen(retained);
         finish("interrupted", detail);
+    }
+
+    private void invalidateUnprovedWithdrawal() {
+        if (action.pendingCollection != null && action.pendingCollection.withdrawal.issued()
+                || action.furnace != null && action.furnace.phase == FurnacePhase.COLLECTING)
+            invalidatePending("Output withdrawal was interrupted before its exact proof; it cannot be repeated.");
     }
 
     private void closeOwnedWorkScreen(boolean retained) {
@@ -5564,7 +6289,8 @@ final class AgentMacroControl {
             case WORK_PLACE -> "The authorized placement did not settle before expiry.";
             case WORK_SMELT -> "The finite smelting action expired before it could store the authorized output.";
             case WORK_FILL -> "The finite bucket fill expired before the exact source and inventory swap could be confirmed.";
-            case WATER_CLUE -> throw new IllegalStateException("A water clue cannot run.");
+            case COLLECT_PENDING -> "The bounded station return or fresh result proof did not settle; no output was credited.";
+            case WATER_CLUE, DEFER_PENDING -> throw new IllegalStateException("A read-only clue cannot hold the controls.");
         };
     }
 

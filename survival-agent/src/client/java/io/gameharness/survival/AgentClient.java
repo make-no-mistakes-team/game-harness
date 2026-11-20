@@ -70,6 +70,7 @@ public final class AgentClient implements ClientModInitializer {
     private AgentProgress progress;
     private AgentEars ears;
     private AgentMacroControl macro;
+    private AgentPendingFurnaceMemory pendingFurnaceMemory;
     private AgentPauseEpisodes pauses;
     private ClientPlayerEntity continuityPlayer;
     private BlockPos continuityMine;
@@ -262,8 +263,13 @@ public final class AgentClient implements ClientModInitializer {
     }
 
     static boolean ownsSinglePlayerFurnaceWorld(MinecraftClient client, ClientPlayerEntity player) {
-        if (active == null || !active.ownedSinglePlayer || !active.playing(client)
-                || client.player != player || player.networkHandler.getPlayerList().size() != 1
+        return active != null && active.playing(client) && active.soleFurnaceActor(client, player);
+    }
+
+    private boolean soleFurnaceActor(MinecraftClient client, ClientPlayerEntity player) {
+        if (!ownedSinglePlayer || !sameConnection(client) || player == null || !player.isAlive()
+                || client.world == null || player.getWorld() != client.world || client.player != player
+                || !survival(client) || player.networkHandler.getPlayerList().size() != 1
                 || player.networkHandler.getPlayerListEntry(player.getUuid()) == null) return false;
         for (var other : client.world.getPlayers()) if (other != player) return false;
         return true;
@@ -355,7 +361,9 @@ public final class AgentClient implements ClientModInitializer {
         ownedSinglePlayer = peer.getPort() == Integer.getInteger("gh.agent.ownedSinglePlayerPort", -1);
         network = handler;
         initialDeathScreen = client.currentScreen instanceof DeathScreen && client.player.isDead();
-        macro = AgentMacroControl.create(directory, goal);
+        pendingFurnaceMemory = new AgentPendingFurnaceMemory(directory);
+        if (ownedSinglePlayer) pendingFurnaceMemory.bind(client.player.getUuid(), 1, tick, 0);
+        macro = AgentMacroControl.create(directory, goal, pendingFurnaceMemory);
         bindPolicy(client);
         if (macro == null || !macro.trial()) pauses = new AgentPauseEpisodes(directory, tick);
         return true;
@@ -404,10 +412,11 @@ public final class AgentClient implements ClientModInitializer {
             || (client.world != null && client.player.getWorld() != client.world)) return false;
         deadPlayer = client.player;
         observeContinuityIdle();
+        if (tick == 0) tick = 1;
+        pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
         if (macro != null) macro.suspend(tick, "The player died.");
         releaseLifeInputs(client);
         ++deaths;
-        if (tick == 0) tick = 1;
         ended = !allowRespawn;
         transition(client, LifePhase.DEATH_SCREEN, "dead");
         progress.saveMemory(true);
@@ -446,6 +455,7 @@ public final class AgentClient implements ClientModInitializer {
             accumulateLifeCounters();
             bindPolicy(client);
             ++respawns;
+            if (ownedSinglePlayer) pendingFurnaceMemory.bind(client.player.getUuid(), 1 + respawns, tick, body.renderedFrame());
             deadPlayer = null;
             transition(client, LifePhase.PLAYING, "resumed Survival after respawn");
             progress.afterRespawn();
@@ -536,6 +546,7 @@ public final class AgentClient implements ClientModInitializer {
         }
         ++tick;
         if (!sameConnection(client)) {
+            pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
             releaseLifeInputs(client);
             stopMacro("connection_closed", "The admitted loopback connection closed.");
             if (lifePhase != LifePhase.PLAYING) failLife(client, "Connection closed before respawn completed.");
@@ -551,12 +562,15 @@ public final class AgentClient implements ClientModInitializer {
         if (!playing(client) || client.interactionManager == null) {
             // World changes sometimes clear the actor while the original connection stays open.
             observeContinuityIdle();
+            pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
             if (macro != null) macro.suspend(tick, "The player left the current Survival view.");
             body.release();
             hands.discardLifeInputs();
             lastYaw = lastPitch = Float.NaN;
             return;
         }
+        if (pendingFurnaceMemory.current() != null && !soleFurnaceActor(client, client.player))
+            pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
         if (!progress.restoreMemory()) {
             observeContinuityIdle();
             return;
@@ -695,6 +709,9 @@ public final class AgentClient implements ClientModInitializer {
         }
         if (pauses != null) pauses.close("runner_stop");
         stopMacro("actor_exit", "The owning runner ended the attempt.");
+        if (body != null && pendingFurnaceMemory != null && lifePhase == LifePhase.PLAYING &&
+                soleFurnaceActor(client, client.player))
+            pendingFurnaceMemory.runnerClose(tick, body.renderedFrame());
         client.scheduleStop();
     }
 

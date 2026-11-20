@@ -302,6 +302,8 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     assertDisplay();
     const burn = work?.workOrder?.progress?.smeltBurn;
     const activeBurn = fresh?.workOrder?.progress?.smeltBurn;
+    const ticket = work?.pendingWork;
+    const activeTicket = fresh?.pendingWork;
     return fresh?.run === basis.run && fresh.life === basis.life && (work ? fresh.epoch >= basis.epoch : fresh.epoch === basis.epoch) &&
       fresh.tick >= basis.tick && fresh.health > 0 &&
       (!correction || (sameLiveCorrectionScope(correction, fresh) && liveCorrectionEvidence(correction) === liveCorrectionEvidence(fresh))) &&
@@ -310,6 +312,10 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
       (!burn || (fresh.workOrder?.id === work?.workOrder?.id && fresh.workOrder?.state === "working" &&
         activeBurn?.burnTick === burn.burnTick && activeBurn.units === burn.units &&
         activeBurn.remainingCookTicks >= MACRO_SMELT_OVERLAP_MIN_COOK_TICKS)) &&
+      (!ticket || (activeTicket?.id === ticket.id && activeTicket.parked === ticket.parked &&
+        (!ticket.yieldable || activeTicket.yieldable) &&
+        (!ticket.collectOfferId || ticket.collectOfferId === activeTicket.collectOfferId) &&
+        (!ticket.deferOfferId || ticket.deferOfferId === activeTicket.deferOfferId))) &&
       (!lookahead || (fresh.goal === lookahead.goal && fresh.health >= lookahead.health && fresh.safety?.clear === true &&
         fresh.safety.revision === lookahead.safety?.revision && !!fresh.working &&
         fresh.working.intentId === lookahead.working?.intentId && fresh.working.crack <= MACRO_LOOKAHEAD_MAX_CRACK));

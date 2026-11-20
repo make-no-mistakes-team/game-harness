@@ -149,6 +149,8 @@ its reserve only after witnessing an empty, dry adjacent cell, a reachable
 attaching face, and clear forward and reverse space. It stays on the
 original footing until a fresh view shows the new cobblestone top and
 inventory shows the matching debit. Nearby fluid can veto the placement.
+If the player cannot confirm the empty space, the refusal identifies the
+bearing and what blocked the lower and upper sight lines.
 The report distinguishes placement, grounded arrival, and the lowest
 footing reached. Only a diamond in inventory counts as a pickup.
 

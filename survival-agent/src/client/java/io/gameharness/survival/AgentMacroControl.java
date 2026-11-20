@@ -428,6 +428,7 @@ final class AgentMacroControl {
         int anchorIndex, countBefore;
         long faceUntil;
         boolean spaceSeen;
+        String lastUnprovedSpace;
 
         ProspectSupport(BlockPos from, BlockPos to, Direction bearing) {
             this.from = from;
@@ -438,6 +439,11 @@ final class AgentMacroControl {
             high = AgentBody.footholdInterior(cell, bearing, true);
             floor = Vec3d.ofBottomCenter(to).add(bearing.getOffsetX() * 0.27, -0.032, bearing.getOffsetZ() * 0.27);
             alternateFloor = Vec3d.ofBottomCenter(to).add(bearing.getOffsetX() * 0.14, -0.032, bearing.getOffsetZ() * 0.14);
+        }
+
+        String sampleDetail(AgentBody.FootholdSpace low, AgentBody.FootholdSpace high) {
+            return " Support cell " + bearing + " at Y offset " + (cell.getY() - from.getY())
+                + " from feet: low=" + low + ", high=" + high + ".";
         }
 
         Direction anchorOffset() {
@@ -3072,16 +3078,20 @@ final class AgentMacroControl {
             var high = body.footholdSpace(build.high);
             if (low == AgentBody.FootholdSpace.FLUID || high == AgentBody.FootholdSpace.FLUID
                     || low == AgentBody.FootholdSpace.OCCUPIED || high == AgentBody.FootholdSpace.OCCUPIED) {
-                interrupt("The exact support cell contains visible fluid or material; no replacement was attempted.", true);
+                interrupt("The exact support cell contains visible fluid or material; no replacement was attempted."
+                    + build.sampleDetail(low, high), true);
             } else if (low == AgentBody.FootholdSpace.EMPTY && high == AgentBody.FootholdSpace.EMPTY) {
                 build.spaceSeen = true;
             } else if (tick - action.started > 24) {
-                interrupt("Two lit samples could not verify the same support cell as empty and dry.", true);
+                interrupt("Two lit samples could not verify the same support cell as empty and dry."
+                    + build.sampleDetail(low, high), true);
             }
             return;
         }
         if (build.anchorIndex >= 4) {
-            interrupt("No reachable, lit stable side or floor face could attach the single support.", true);
+            interrupt(build.lastUnprovedSpace == null
+                ? "No reachable, lit stable side or floor face could attach the single support."
+                : "No attachment kept both empty-space witnesses in view. Last failed recheck:" + build.lastUnprovedSpace, true);
             return;
         }
         Direction offset = build.anchorOffset();
@@ -3102,16 +3112,18 @@ final class AgentMacroControl {
         var high = body.footholdSpace(build.high);
         if (low == AgentBody.FootholdSpace.FLUID || high == AgentBody.FootholdSpace.FLUID
                 || low == AgentBody.FootholdSpace.OCCUPIED || high == AgentBody.FootholdSpace.OCCUPIED) {
-            interrupt("The witnessed empty support cell changed before use.", true);
+            interrupt("The witnessed empty support cell changed before use." + build.sampleDetail(low, high), true);
             return;
         }
         if (low != AgentBody.FootholdSpace.EMPTY || high != AgentBody.FootholdSpace.EMPTY) {
             if (tick >= build.faceUntil) {
+                build.lastUnprovedSpace = build.sampleDetail(low, high);
                 ++build.anchorIndex;
                 build.faceUntil = 0;
             }
             return;
         }
+        build.lastUnprovedSpace = null;
         // Neighbor fluid can veto an already witnessed candidate. It never identifies a placeable cell.
         for (Direction side : Direction.values()) {
             if (!world.getBlockState(build.cell.offset(side)).getFluidState().isEmpty()) {

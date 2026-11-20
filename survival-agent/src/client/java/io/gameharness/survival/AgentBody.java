@@ -1642,7 +1642,8 @@ final class AgentBody {
     enum FootholdSpace { EMPTY, VIEW, DARK, OCCLUDED, OCCUPIED, FLUID }
 
     static Vec3d footholdInterior(BlockPos cell, Direction bearing, boolean high) {
-        double along = high ? -0.16 : 0.16;
+        // Keep both rays beyond the retained lip on a one-block descent, including while sneaking.
+        double along = 0.28;
         return Vec3d.ofCenter(cell).add(bearing.getOffsetX() * along, high ? 0.31 : -0.20, bearing.getOffsetZ() * along);
     }
 

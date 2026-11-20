@@ -13,7 +13,7 @@ import {
 import { createNativeGapReview } from "./gap-review.ts";
 import {
   MACRO_CAPABILITIES_VERSION, MACRO_LOOKAHEAD_MAX_CRACK, MACRO_MAX_PLANNING_IDLE_MS, MACRO_SMELT_OVERLAP_MIN_COOK_TICKS,
-  liveCorrectionEvidence, readMacroObservation, sameLiveCorrectionScope,
+  liveCorrectionEvidence, readMacroObservation, sameLiveCorrectionScope, sameTravelTarget,
   type MacroBasis, type MacroInference, type MacroObservation,
 } from "./protocol.ts";
 import { MACRO_AUTOMATIC_SKILL_VERBS, SurvivalMacroSkills } from "./skills.ts";
@@ -304,6 +304,7 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     const activeBurn = fresh?.workOrder?.progress?.smeltBurn;
     const ticket = work?.pendingWork;
     const activeTicket = fresh?.pendingWork;
+    const travel = work?.travelHint;
     const independent = ticket?.parked && !ticket.worksite && (work?.workOrder?.state === "working" || work?.workOrder?.state === "needs_replan")
       ? work.workOrder : undefined;
     return fresh?.run === basis.run && fresh.life === basis.life && (work ? fresh.epoch >= basis.epoch : fresh.epoch === basis.epoch) &&
@@ -311,6 +312,8 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
       (!correction || (sameLiveCorrectionScope(correction, fresh) && liveCorrectionEvidence(correction) === liveCorrectionEvidence(fresh))) &&
       (!work || (fresh.goal === work.goal && fresh.health >= work.health && fresh.safety?.clear === true &&
         fresh.safety.revision === work.safety?.revision)) &&
+      (!travel || (fresh.stance === work?.stance && fresh.epoch === basis.epoch &&
+        fresh.travelHint?.kind === travel.kind && sameTravelTarget(travel, fresh.travelHint))) &&
       (!burn || (fresh.workOrder?.id === work?.workOrder?.id && fresh.workOrder?.state === "working" &&
         activeBurn?.burnTick === burn.burnTick && activeBurn.units === burn.units &&
         (ticket?.yieldable || activeBurn.remainingCookTicks >= MACRO_SMELT_OVERLAP_MIN_COOK_TICKS))) &&

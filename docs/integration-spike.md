@@ -153,11 +153,20 @@ needs an exact break permission for each cover type, charged against the
 same break budget. The player keeps at least one break for the source.
 Cover breaks, grounded travel, and stock pickups are confirmed separately.
 
-On a straight, dry shelf the player can see several landings in one
-forward view and hold the movement key between them. It brakes at the
-end of the visible strip, before a changed tread, or for a turn or climb.
-An open-looking passage still needs a lit floor, body clearance and a way
-back. If a lip hides the landing, one targeted look may resolve it.
+For ordinary travel the player needs visible support through its
+stopping distance, not a proved round trip to every waypoint. A
+`travelHint` identifies the actual visible target and how far the
+current view supports an approach. It can start a bounded job toward a
+log that is visible but still out of reach. It does not authorize a
+swing, report a pickup, or guarantee that the path continues around a
+corner. The player keeps walking through successive good views and
+brakes when the known ground runs out.
+
+The player can wade from dry footing when it can see a shallow,
+supported crossing and a dry bank. Deep or swift water, lava, unknown
+drops, and jumps do not qualify. A trip back to a paid furnace still
+uses rechecked, actually walked legs; exploring a few steps forward
+does not manufacture a return route.
 
 When a camera check is still needed, Terra can add `openingViewId` from
 `work.openingViewIds` to one priced mining or prospecting job. The host

@@ -58,6 +58,10 @@ final class AgentBody {
     private static final int ROWS = 9;
     private static final int RAY_BUDGET = 256;
     private static final int MOVEMENT_RAYS = 6;
+    private static final int HORIZON_TERRAIN_RAYS = 24;
+    private static final int HORIZON_CUE_RAYS = 16;
+    private static final float[] HORIZON_CUE_U = {0, -0.30f, 0.30f, 0, -0.58f, 0.58f, -0.30f, 0.30f, 0, -0.54f, 0.54f};
+    private static final float[] HORIZON_CUE_V = {0.24f, 0, 0, -0.24f, 0, 0, 0.30f, 0.30f, 0.55f, -0.32f, -0.32f};
     private static final double MAX_RANGE = 32;
     private static final double TURN_SPEED = 230;
     private static final double TURN_TIME = 0.085;
@@ -112,7 +116,8 @@ final class AgentBody {
         SIGHT(RaycastContext.ShapeType.OUTLINE, false),
         FLUIDS(RaycastContext.ShapeType.OUTLINE, true),
         TERRAIN(RaycastContext.ShapeType.COLLIDER, true),
-        WET_TERRAIN(RaycastContext.ShapeType.COLLIDER, false);
+        WET_TERRAIN(RaycastContext.ShapeType.COLLIDER, false),
+        HORIZON_TOP(RaycastContext.ShapeType.OUTLINE, false);
 
         final RaycastContext.ShapeType shape;
         final boolean allFluids;
@@ -137,8 +142,10 @@ final class AgentBody {
     };
     private final BlockPos.Mutable overlandProbe = new BlockPos.Mutable();
     private final BlockHitResult[] samples = new BlockHitResult[COLUMNS * ROWS];
+    private final BlockHitResult[] horizonCueSamples = new BlockHitResult[HORIZON_CUE_U.length];
     private final AgentHazards hazards = new AgentHazards();
     private final AgentHeadroom headroom;
+    private final AgentVisibleHorizon visibleHorizon = new AgentVisibleHorizon(this);
     private final Consumer<ContactEvidence> contactEvidence;
     private final AgentLookMotor lookMotor;
     private final AgentThreatView<LivingEntity> threats = new AgentThreatView<>();
@@ -186,6 +193,10 @@ final class AgentBody {
     private long lastFrame;
     private int tick;
     private int raysLeft;
+    private int horizonTerrainRays, horizonCueRays;
+    private long horizonSightlineFrame = -1, horizonCueFrame = -1;
+    private double horizonSightlineRange, horizonCueRange;
+    private BlockHitResult horizonSightlineHit;
     private int sampleCount;
     private double sampleRange;
     private ShapeContext rayShapeContext;
@@ -198,6 +209,15 @@ final class AgentBody {
     private boolean verifiedDescent;
     private boolean flatWalk, dryRouteWalk, emergencyWalk;
     private boolean wetEscapeWalk;
+    private static final int HORIZON_WAIT_TICKS = 8;
+    private HorizonTravel horizonIntent, horizonApplied;
+    private Vec3d horizonAppliedFrom;
+    private boolean horizonAppliedDry, horizonWading;
+    private int horizonAppliedTick = -2;
+    private int horizonSide;
+    private boolean horizonForward, horizonSneak, horizonWade;
+    private float horizonHeading;
+    private double horizonReach;
     private Vec3d dryLanding;
     private BlockPos stepSupport;
     private boolean surfaceStep;
@@ -259,7 +279,9 @@ final class AgentBody {
     void begin() {
         tick++;
         safetySpend = null;
-        raysLeft = RAY_BUDGET - MOVEMENT_RAYS;
+        raysLeft = RAY_BUDGET - MOVEMENT_RAYS - HORIZON_TERRAIN_RAYS - HORIZON_CUE_RAYS;
+        horizonTerrainRays = HORIZON_TERRAIN_RAYS;
+        horizonCueRays = HORIZON_CUE_RAYS;
         sampleCount = 0;
         sampleRange = 0;
         rayShapeContext = null;
@@ -273,6 +295,8 @@ final class AgentBody {
             stepSupport = null;
             dryFooting = previousDryFooting = null;
             lavaEmergency = false;
+            horizonApplied = null;
+            horizonWading = false;
             hazardWorld = client.world;
             hazardPlayer = client.player;
         }
@@ -284,6 +308,9 @@ final class AgentBody {
             return;
         }
         var player = client.player;
+        if (horizonApplied != null && horizonAppliedTick == tick - 1) observeHorizonTravel(player);
+        if (!player.isTouchingWater() && (horizonApplied == null || horizonApplied.wadeTick < tick - 1))
+            horizonWading = false;
         if (hasView()) scanFluids(AgentHazards.SIGHT_RANGE, true, false, false);
         boolean dry = player.isOnGround() && !player.isInLava() && !player.isTouchingWater()
             && !player.isOnFire() && !player.hasVehicle() && !hazards.lavaNear(player.getBoundingBox(), 0.12, tick);
@@ -316,6 +343,9 @@ final class AgentBody {
         emergencyWalk = false;
         dryRouteWalk = false;
         wetEscapeWalk = false;
+        horizonIntent = null;
+        horizonForward = horizonSneak = horizonWade = false;
+        horizonSide = 0;
         reachJump = false;
         routeJumps = true;
         rowForward = rowLeft = rowRight = boatDismount = false;
@@ -474,8 +504,15 @@ final class AgentBody {
             || !wetEscapeWalk && (advance || retreat) && player.isTouchingWater());
         boolean stepJump = false;
         Ground ground = Ground.CLEAR;
+        boolean rolling = horizonIntent != null;
 
-        if (flatWalk && advance) {
+        if (rolling) {
+            // One ordinary rolling owner; it never inherits the generic auto-jump,
+            // sprint, or swim controls even if its current command is neutral.
+            advance = horizonForward;
+            retreat = jump = false;
+            crouch = horizonSneak;
+        } else if (flatWalk && advance) {
             // The caller has checked a dry lane and sweep. Never inherit the ordinary
             // auto-jump, crouching advance, sprint latch, or tolerance for a lost render.
             double distance = Math.hypot(dryLanding.x - player.getX(), dryLanding.z - player.getZ());
@@ -562,10 +599,11 @@ final class AgentBody {
                 attack = mining.equals(contact.pos) && contact.admits(hit);
             }
         }
-        boolean sprintRequested = advance && fast && !crouch && ground == Ground.CLEAR;
-        if (advance || retreat) {
-            float heading = player.getYaw() + (retreat ? 180 : 0);
-            double reach = jump ? 3.2 : sprintRequested || player.isSprinting() ? 2.35 : crouch ? 0.70 : 1.35;
+        boolean sprintRequested = !rolling && advance && fast && !crouch && ground == Ground.CLEAR;
+        if (advance || retreat || rolling && horizonSide != 0) {
+            float heading = rolling ? horizonHeading : player.getYaw() + (retreat ? 180 : 0);
+            double reach = rolling ? horizonReach
+                : jump ? 3.2 : sprintRequested || player.isSprinting() ? 2.35 : crouch ? 0.70 : 1.35;
             if (dryLanding != null && advance && !jump && !sprintRequested && !player.isSprinting() && player.isOnGround()) {
                 double dx = dryLanding.x - player.getX(), dz = dryLanding.z - player.getZ();
                 double distance = Math.hypot(dx, dz);
@@ -579,7 +617,9 @@ final class AgentBody {
             sightMovementLane(player, heading, reach);
             if (hazards.lavaRisk(player.getBoundingBox(), heading, reach, jump ? 1.1 : 0, false, tick) > 0) {
                 advance = retreat = sprintRequested = false;
-                jump = !dive && player.isSubmergedInWater();
+                horizonSide = 0;
+                horizonWade = false;
+                jump = !rolling && !dive && player.isSubmergedInWater();
             }
         } else if (jump && !player.isTouchingWater()) {
             Vec3d motion = player.getVelocity();
@@ -589,7 +629,10 @@ final class AgentBody {
                         Math.sqrt(drift) * 9, 1.1, false, tick) > 0) jump = false;
         }
         // Vanilla latches sprint when Ctrl is released. Let up on W to brake, then walk again.
-        if (advance && !sprintRequested && player.isSprinting()) advance = false;
+        if ((advance || rolling) && !sprintRequested && player.isSprinting()) {
+            advance = false;
+            horizonSide = 0;
+        }
         boolean centerKeys = centerLanding != null && controlledBoat == null
             && player.isOnGround() && !player.isTouchingWater() && player.getVehicle() == null;
         boolean centerLeft = false, centerRight = false;
@@ -622,6 +665,10 @@ final class AgentBody {
             options.leftKey.setPressed(dry && rowLeft);
             options.rightKey.setPressed(dry && rowRight);
             ownsRowKeys = true;
+        } else if (rolling) {
+            options.leftKey.setPressed(horizonSide < 0);
+            options.rightKey.setPressed(horizonSide > 0);
+            ownsRowKeys = true;
         } else if (centerKeys) {
             options.leftKey.setPressed(centerLeft);
             options.rightKey.setPressed(centerRight);
@@ -632,8 +679,12 @@ final class AgentBody {
         // A second forward press can start vanilla sprint even with the sprint key up.
         // A paced approach can coast at the lip; don't turn its next pulse into a double-tap.
         if (advance && !options.forwardKey.isPressed()) {
-            if ((flatWalk || dryRouteWalk) && !sprintRequested && tick - lastForwardPress < 8) {
+            if ((flatWalk || dryRouteWalk || rolling && !crouch) && !sprintRequested && tick - lastForwardPress < 8) {
                 advance = false;
+                if (rolling) {
+                    horizonSide = 0;
+                    releaseRowKeys();
+                }
                 jump = false;
             } else lastForwardPress = tick;
         }
@@ -659,6 +710,16 @@ final class AgentBody {
         } else if (mining != null) reportContact("vetoed");
         // Held for this tick only unless requested again; vanilla enforces its use delay.
         options.useKey.setPressed(use);
+        if (rolling) {
+            horizonApplied = horizonIntent;
+            horizonAppliedFrom = player.getPos();
+            horizonAppliedDry = player.isOnGround() && !player.isTouchingWater() && !horizonWade;
+            horizonAppliedTick = tick;
+            horizonApplied.issued = advance || horizonSide != 0;
+            horizonApplied.beenDriven |= horizonApplied.issued;
+            horizonApplied.wadeTick = horizonWade && (horizonApplied.issued || player.isTouchingWater()) ? tick : -2;
+            horizonWading |= horizonApplied.wadeTick == tick && horizonApplied.issued;
+        }
     }
 
     private void sightMovementLane(ClientPlayerEntity player, float yaw, double reach) {
@@ -845,6 +906,8 @@ final class AgentBody {
         hazardPlayer = null;
         dryFooting = previousDryFooting = escapeLanding = null;
         lavaEmergency = false;
+        horizonApplied = null;
+        horizonWading = false;
         releaseKeys();
     }
 
@@ -1281,6 +1344,323 @@ final class AgentBody {
     AgentHeadroom.Report headroomReport() { return headroom.report(); }
     void observeHeadroomBreak(BlockPos position) { headroom.broken(position); }
 
+    AgentVisibleHorizon visibleHorizon() { return visibleHorizon; }
+
+    /** The rendered sightline can name a distant landmark beyond vanilla's interaction reach. */
+    BlockHitResult horizonSightline(double distance) {
+        if (!hasView() || distance <= 0) return null;
+        double max = range(distance);
+        if (horizonSightlineFrame != frameSequence || horizonSightlineRange != max) {
+            if (horizonCueRays <= 0) return null;
+            --horizonCueRays;
+            horizonSightlineFrame = frameSequence;
+            horizonSightlineRange = max;
+            horizonSightlineHit = litRay(eye.add(client.player.getRotationVector(observedPitch, observedYaw)
+                .multiply(max)), Ray.SIGHT);
+        }
+        return horizonSightlineHit;
+    }
+
+    /** Reuse ordinary actual hits before an independent, small pass inside this render. */
+    BlockHitResult horizonCue(Predicate<BlockState> matches, double distance, Predicate<BlockHitResult> eligible) {
+        if (!hasView() || distance <= 0) return null;
+        BlockHitResult cached = findSampled(matches, distance, eligible).orElse(null);
+        if (cached != null) return cached;
+        double max = range(distance);
+        if (horizonCueFrame != frameSequence || horizonCueRange < max && horizonCueRays > 1) {
+            horizonCueFrame = frameSequence;
+            horizonCueRange = max;
+            for (int i = 0; i < horizonCueSamples.length; ++i) {
+                horizonCueSamples[i] = null;
+                if (horizonCueRays <= 1) continue; // Keep one exact face recheck after optional clues.
+                inverseViewProjection.transform(clip.set(HORIZON_CUE_U[i], HORIZON_CUE_V[i], 0.9f, 1));
+                double x = clip.x / (double) clip.w, y = clip.y / (double) clip.w, z = clip.z / (double) clip.w;
+                double scale = max / Math.sqrt(x * x + y * y + z * z);
+                --horizonCueRays;
+                horizonCueSamples[i] = litRay(eye.add(x * scale, y * scale, z * scale), Ray.SIGHT);
+            }
+        }
+        BlockHitResult best = null;
+        double nearest = max * max;
+        for (var hit : horizonCueSamples) {
+            if (hit == null) continue;
+            double squared = hit.getPos().squaredDistanceTo(eye);
+            if (squared <= nearest && matches.test(client.world.getBlockState(hit.getBlockPos()))
+                    && (eligible == null || eligible.test(hit))) {
+                nearest = squared;
+                best = hit;
+            }
+        }
+        return best;
+    }
+
+    enum HorizonResult { MOVING, SETTLING, ARRIVED, BLOCKED }
+
+    /** One short approach to an independently rendered cue; there is no queue of virtual waypoints. */
+    static final class HorizonTravel {
+        final AgentVisibleHorizon.Target target;
+        final Vec3d goal;
+        final double arrival;
+        final boolean allowWade;
+        private int wadeTick = -2, stoppedAt = -1, precisionTicks;
+        private boolean issued, beenDriven, wet;
+        private float recoveryYaw = Float.NaN;
+        private Vec3d recoveryFrom;
+        private HorizonMotion motion;
+        private BlockPos dryFrom, dryTo;
+        private int dryContacts;
+
+        HorizonTravel(AgentVisibleHorizon.Target target, Vec3d goal, double arrival, boolean allowWade) {
+            this.target = target;
+            this.goal = goal;
+            this.arrival = arrival;
+            this.allowWade = allowWade;
+        }
+
+        boolean moved() { return motion != null && motion.moved(); }
+        boolean progressed() { return motion != null && motion.progressed; }
+        boolean waded() { return wet; }
+    }
+
+    /** Forward input and camera rotation aren't receipts; sample displacement after vanilla consumed the keys. */
+    static final class HorizonMotion {
+        private final Vec3d origin, goal;
+        private double nearest;
+        private boolean valid = true, moved, progressed, recovered;
+        private boolean contact;
+
+        HorizonMotion(Vec3d origin, Vec3d goal) {
+            this.origin = origin;
+            this.goal = goal;
+            nearest = horizontalDistanceSquared(origin, goal);
+        }
+
+        boolean observe(Vec3d from, Vec3d feet, boolean issued, boolean contact, boolean uninterrupted) {
+            double displacement = horizontalDistanceSquared(from, feet);
+            progressed = false;
+            if (!uninterrupted || displacement > 0.31 || Math.abs(feet.y - from.y) > 0.65) valid = false;
+            if (!valid) return false;
+            double remaining = horizontalDistanceSquared(feet, goal);
+            if (displacement > 0.0004 && (issued || moved) && remaining < nearest) {
+                nearest = remaining;
+                moved |= horizontalDistanceSquared(feet, origin) >= 0.16
+                    && (MathHelper.floor(feet.x) != MathHelper.floor(origin.x)
+                        || MathHelper.floor(feet.z) != MathHelper.floor(origin.z));
+                progressed = moved;
+            }
+            if (issued) this.contact = displacement < 0.0009 && contact;
+            return true;
+        }
+
+        boolean moved() { return valid && moved; }
+        boolean contact() { return contact; }
+
+        boolean takeRecovery() {
+            if (!contact() || recovered) return false;
+            recovered = true;
+            contact = false;
+            return true;
+        }
+    }
+
+    private void observeHorizonTravel(ClientPlayerEntity player) {
+        HorizonTravel travel = horizonApplied;
+        Vec3d feet = player.getPos();
+        Vec3d from = horizonAppliedFrom;
+        boolean continuous = travel.motion.observe(from, feet, travel.issued, player.horizontalCollision,
+            player.hurtTime == 0 && !player.hasVehicle() && !player.isOnFire() && !player.isInLava());
+        travel.wet |= player.isTouchingWater();
+        if (!continuous || !travel.beenDriven || !horizonAppliedDry || !player.isOnGround() || player.isTouchingWater()) {
+            travel.dryContacts = 0;
+            travel.dryFrom = travel.dryTo = null;
+        } else if (horizontalDistanceSquared(feet, from) > 0.0004) {
+            ++travel.dryContacts;
+            BlockPos previous = BlockPos.ofFloored(from);
+            BlockPos current = player.getBlockPos();
+            // Do not split a diagonal, synthesize a reverse, or connect either bank over a wet leg.
+            if (!previous.equals(current)) {
+                boolean adjacent = previous.getY() == current.getY()
+                    && Math.abs(previous.getX() - current.getX()) + Math.abs(previous.getZ() - current.getZ()) == 1;
+                travel.dryFrom = adjacent ? previous : null;
+                travel.dryTo = adjacent ? current : null;
+            }
+            if (travel.dryFrom != null && current.equals(travel.dryTo) && travel.dryContacts >= 3) {
+                int dx = current.getX() - travel.dryFrom.getX(), dz = current.getZ() - travel.dryFrom.getZ();
+                double within = (feet.x - current.getX() - 0.5) * dx + (feet.z - current.getZ() - 0.5) * dz;
+                if (within >= -0.29) {
+                    recordWalkedLeg(travel.dryFrom, current);
+                    travel.dryFrom = travel.dryTo = null;
+                }
+            }
+        }
+    }
+
+    private static double horizontalDistanceSquared(Vec3d first, Vec3d second) {
+        double x = first.x - second.x, z = first.z - second.z;
+        return x * x + z * z;
+    }
+
+    /** A recent, physically issued wade may hold water control only with a currently witnessed bank. */
+    boolean horizonControlsWater() {
+        if (!horizonWaterInFlight() || horizonApplied == null || horizonApplied.wadeTick != tick - 1
+                || !horizonWaterSafe(client.player)) return false;
+        var window = visibleHorizon.window(horizonApplied.target, horizonHeading);
+        return horizonWadeWindow(window);
+    }
+
+    boolean horizonWaterInFlight() {
+        return horizonWading && ready() && client.player.isTouchingWater();
+    }
+
+    private static boolean horizonWaterSafe(ClientPlayerEntity player) {
+        return !player.isSubmergedInWater() && player.getAir() >= 230 && !player.isOnFire()
+            && !player.isInLava() && player.hurtTime == 0;
+    }
+
+    static boolean horizonWadeWindow(AgentVisibleHorizon.Window window) {
+        return window != null && window.medium() == AgentVisibleHorizon.Medium.SHALLOW_WATER
+            && window.dryBank() != null && window.knownDistance() >= window.brakingDistance();
+    }
+
+    boolean horizonSafetyAllows(HorizonTravel travel) {
+        return ready() && (!client.player.isTouchingWater() || horizonApplied == travel && horizonControlsWater());
+    }
+
+    void stopHorizonTravel(HorizonTravel travel) {
+        if (horizonIntent != travel) return;
+        horizonIntent = null;
+        horizonForward = horizonSneak = horizonWade = false;
+        horizonSide = 0;
+        if (gaitSteering) {
+            gaitSteering = steering = false;
+            gaitPitchVelocity = 0;
+        }
+    }
+
+    private static int horizonSide(float turn) {
+        return turn < -23 ? -1 : turn > 23 ? 1 : 0;
+    }
+
+    enum HorizonPace { COAST, SLOW, WALK }
+
+    static HorizonPace horizonPace(double known, double braking, double goal, boolean wet, boolean contactOnly) {
+        if (known < braking || goal <= Math.max(0.055, braking - 0.14)) return HorizonPace.COAST;
+        if (!wet && !contactOnly && known < braking + 0.20) return HorizonPace.SLOW;
+        return HorizonPace.WALK;
+    }
+
+    HorizonResult driveHorizon(HorizonTravel travel, boolean keepPickupsClear, boolean targetReady) {
+        if (!ready() || lavaEmergency || !client.isWindowFocused() || client.getOverlay() != null
+                || client.currentScreen != null || client.options.forwardKey.isUnbound()) return HorizonResult.BLOCKED;
+        var player = client.player;
+        if (player.hasVehicle() || player.isClimbing() || player.isUsingItem() || !horizonWaterSafe(player))
+            return HorizonResult.BLOCKED;
+        Vec3d feet = player.getPos();
+        double dx = travel.goal.x - feet.x, dz = travel.goal.z - feet.z;
+        double distance = Math.hypot(dx, dz);
+        if (travel.motion == null) travel.motion = new HorizonMotion(feet, travel.goal);
+        if (!travel.motion.valid) return HorizonResult.BLOCKED;
+        horizonIntent = travel;
+        if (travel.moved() && player.isOnGround() && !player.isTouchingWater()
+                && (targetReady || distance <= travel.arrival && Math.abs(feet.y - travel.goal.y) < 0.65)) {
+            return player.getVelocity().horizontalLengthSquared() < 0.0025 ? HorizonResult.ARRIVED : HorizonResult.SETTLING;
+        }
+
+        boolean recovering = travel.recoveryFrom != null;
+        if (travel.motion.contact()) {
+            if (player.isTouchingWater() || !travel.motion.takeRecovery()) return HorizonResult.BLOCKED;
+            // A real body collision, not a speculative path grid. One tangent,
+            // visible from here, that still closes on the intended landmark.
+            float direct = heading(dx, dz);
+            var edge = travel.target.hit().getSide();
+            float favored = edge.getAxis().isHorizontal()
+                && MathHelper.wrapDegrees(edge.getOpposite().getPositiveHorizontalDegrees() - direct) < 0 ? -37 : 37;
+            var alternative = visibleHorizon.window(travel.target, direct + favored);
+            if (!horizonRecoveryWindow(alternative))
+                alternative = visibleHorizon.window(travel.target, direct - favored);
+            if (!horizonRecoveryWindow(alternative)) return HorizonResult.BLOCKED;
+            travel.recoveryYaw = alternative.yaw();
+            travel.recoveryFrom = feet;
+            recovering = true;
+        }
+        boolean takingTangent = recovering && horizontalDistanceSquared(feet, travel.recoveryFrom) < 0.64;
+        float aim = takingTangent ? travel.recoveryYaw : heading(dx, dz);
+        float turn = MathHelper.wrapDegrees(aim - player.getYaw());
+        int lateral = horizonSide(turn);
+        if (lateral < 0 && client.options.leftKey.isUnbound() || lateral > 0 && client.options.rightKey.isUnbound())
+            lateral = 0;
+        float actual = player.getYaw() + 45 * lateral;
+        boolean aligned = Math.abs(MathHelper.wrapDegrees(aim - actual)) <= 24;
+        var window = aligned && hasView() ? visibleHorizon.window(travel.target, actual) : null;
+        boolean wade = travel.allowWade && horizonWadeWindow(window);
+        boolean dry = window != null && window.medium() == AgentVisibleHorizon.Medium.DRY && !player.isTouchingWater();
+        double known = dry || wade ? window.knownDistance() : 0;
+        // The movement gaze stays ahead, not on every support sample. One brief
+        // downward correction may expose a short floor that just left the render.
+        float pitch = wade ? 24 : travel.stoppedAt >= 0 && tick - travel.stoppedAt >= 3 ? 38 : 28;
+        lookAlongGait(aim, pitch);
+        if (!player.isOnGround() && !player.isTouchingWater()) {
+            // Vanilla may already be making a small safe landing. Do not issue
+            // midair correction/jump into a new or unseen lane.
+            return horizonWait(travel);
+        }
+        if (known <= 0 || player.isTouchingWater() && !wade) return horizonWait(travel);
+        if (player.isSprinting()) return HorizonResult.SETTLING;
+        double braking = window.brakingDistance();
+        boolean contactOnly = window.contactOnly();
+        // A rendered frame may turn the player before vanilla consumes the
+        // held keys. Check the other end of that small steering arc as well.
+        float steeringTurn = MathHelper.clamp(turn, -8, 8);
+        if (Math.abs(steeringTurn) > 3) {
+            var steered = visibleHorizon.window(travel.target, actual + steeringTurn);
+            if (steered == null || steered.medium() != window.medium()
+                    || wade && !horizonWadeWindow(steered)) return horizonWait(travel);
+            known = Math.min(known, steered.knownDistance());
+            braking = Math.max(braking, steered.brakingDistance());
+            contactOnly |= steered.contactOnly();
+        }
+        double goal = takingTangent ? Math.min(distance, 0.9) : distance - travel.arrival + 0.06;
+        if (wade) {
+            // Never end an ordinary goal in wet footing; keep the witnessed bank
+            // as a completion constraint, not as an unseen substitute destination.
+            Vec3d bank = window.dryBank();
+            goal = Math.max(goal, Math.hypot(bank.x - feet.x, bank.z - feet.z));
+        }
+        var pace = horizonPace(known, braking, goal, wade, contactOnly);
+        if (pace == HorizonPace.SLOW && (travel.precisionTicks >= 3 || client.options.sneakKey.isUnbound()))
+            pace = HorizonPace.COAST;
+        if (pace == HorizonPace.COAST) {
+            horizonWade = wade;
+            return horizonWait(travel);
+        }
+        double reach = Math.min(known, Math.max(braking, 0.30));
+        Vec3d end = feet.add(Vec3d.fromPolar(0, actual).multiply(reach));
+        if (keepPickupsClear && !macroNoVisiblePickup(end, wade ? feet.y - 0.7 : feet.y, feet.y)
+                || hazardAhead(actual, reach)) return horizonWait(travel);
+        // This is an intent for the actual on-foot keys, not a displacement receipt.
+        prioritizeMovement();
+        lookAlongGait(player.getYaw() + steeringTurn, pitch);
+        horizonHeading = actual;
+        horizonReach = reach;
+        horizonSide = lateral;
+        horizonForward = true;
+        horizonSneak = pace == HorizonPace.SLOW;
+        if (horizonSneak) ++travel.precisionTicks;
+        horizonWade = wade;
+        travel.stoppedAt = -1;
+        return HorizonResult.MOVING;
+    }
+
+    private HorizonResult horizonWait(HorizonTravel travel) {
+        if (travel.stoppedAt < 0) travel.stoppedAt = tick;
+        return tick - travel.stoppedAt < HORIZON_WAIT_TICKS ? HorizonResult.SETTLING : HorizonResult.BLOCKED;
+    }
+
+    private static boolean horizonRecoveryWindow(AgentVisibleHorizon.Window window) {
+        return window != null && window.medium() == AgentVisibleHorizon.Medium.DRY
+            && window.knownDistance() >= Math.max(0.65, window.brakingDistance() + 0.20);
+    }
+
     void sneak() { sneaking = true; }
     void swimDown() { swimmingDown = true; }
     void holdUse() { eating = true; }
@@ -1387,6 +1767,137 @@ final class AgentBody {
         return hasView() && renderedDirection(heading(point.x - eye.x, point.z - eye.z),
             (float) Math.toDegrees(Math.atan2(eye.y - point.y, Math.hypot(point.x - eye.x, point.z - eye.z))),
             tolerance);
+    }
+
+    record HorizonView(ClientWorld world, ClientPlayerEntity player, Vec3d eye, Vec3d feet,
+                       Vec3d velocity, long frame, int tick, int ageTicks, double displacement) {}
+
+    HorizonView horizonView() {
+        if (!hasView() || System.nanoTime() - observedAtNanos > 160_000_000L) return null;
+        var player = client.player;
+        double displacement = eye.distanceTo(player.getEyePos());
+        return displacement <= 0.36
+            ? new HorizonView(client.world, player, eye, player.getPos(), player.getVelocity(),
+                frameSequence, tick, tick - observedAtTick, displacement) : null;
+    }
+
+    /** A passed-in candidate is just a ray direction until its exact lit point and face are seen. */
+    BlockHitResult horizonWitness(BlockHitResult witness) {
+        if (witness == null || witness.getType() != HitResult.Type.BLOCK || witness.isInsideBlock()) return null;
+        Vec3d point = witness.getPos();
+        double distance = eye.distanceTo(point);
+        if (distance < 0.05 || distance > range(MAX_RANGE) || !inView(point)) return null;
+        if (horizonSightlineFrame == frameSequence && horizonSightlineHit == witness) return witness;
+        if (horizonCueFrame == frameSequence) for (var hit : horizonCueSamples) if (hit == witness) return witness;
+        if (horizonCueRays <= 0) return null;
+        --horizonCueRays;
+        double inset = 0.022 / distance;
+        var hit = litRay(point.add((point.x - eye.x) * inset, (point.y - eye.y) * inset,
+            (point.z - eye.z) * inset), Ray.SIGHT);
+        return sameBlockFace(witness, hit) && !hit.isInsideBlock()
+            && point.squaredDistanceTo(hit.getPos()) < 0.0064 ? hit : null;
+    }
+
+    AgentVisibleHorizon.Stance horizonStance(HorizonView view) {
+        var player = view.player;
+        if (lavaEmergency || !player.isOnGround() || player.hasVehicle() || player.isOnFire() || player.isInLava()
+                || player.isSubmergedInWater() || player.isSwimming() || player.getAir() < 230) return null;
+        var support = player.supportingBlockPos.orElse(null);
+        if (support == null) return null;
+        var patch = horizonSurface(support, view.feet.y);
+        if (patch == null || Math.abs(patch.y() - view.feet.y) > 0.055) return null;
+        boolean wet = player.isTouchingWater();
+        if (wet && player.getFluidHeight(FluidTags.WATER) > 0.57) return null;
+        double speed = player.getAttributeValue(EntityAttributes.MOVEMENT_SPEED);
+        // Walking acceleration uses the block's slipperiness, then movement is damped.
+        double ratio = 0.6 / (patch.drag() / 0.91);
+        double acceleration = wet ? Math.max(0.022, speed) : speed * ratio * ratio * ratio;
+        return new AgentVisibleHorizon.Stance(view.feet.x, view.feet.y, view.feet.z,
+            player.getWidth() * 0.5 + 0.012, view.velocity, acceleration,
+            wet ? Math.max(0.8, patch.drag()) : patch.drag(), wet, support);
+    }
+
+    /** Only the source's actual grounded contact bypasses an optical top hit. */
+    AgentVisibleHorizon.Patch horizonPatch(HorizonView view, int x, int z) {
+        BlockPos contact = view.player.supportingBlockPos.orElse(null);
+        if (contact != null && contact.getX() == x && contact.getZ() == z)
+            return horizonSurface(contact, view.feet.y);
+        double yaw = Math.toRadians(observedYaw);
+        double xFar = x + 0.5 - 0.39 * Math.sin(yaw), zFar = z + 0.5 + 0.39 * Math.cos(yaw);
+        AgentVisibleHorizon.Patch patch = horizonTop(x, z, xFar, view.feet.y, zFar);
+        return patch != null ? patch : horizonTop(x, z, x + 0.5, view.feet.y, z + 0.5);
+    }
+
+    private AgentVisibleHorizon.Patch horizonTop(int x, int z, double scanX, double level, double scanZ) {
+        if (horizonTerrainRays <= 0 || !inView(scanX, level - 0.025, scanZ)) return null;
+        --horizonTerrainRays;
+        var hit = litRay(new Vec3d(scanX, level - 0.025, scanZ), Ray.HORIZON_TOP);
+        if (hit == null || hit.getSide() != Direction.UP || hit.isInsideBlock()) return null;
+        BlockPos support = hit.getBlockPos();
+        if (support.getX() != x || support.getZ() != z) return null;
+        // The optical ray already traversed the open side of this face. Sample only it,
+        // not a column beyond the top (or blocks behind an opaque intercept).
+        var patch = horizonSurface(support, hit.getPos().y);
+        return patch != null && Math.abs(patch.y() - hit.getPos().y) <= 0.055 ? patch : null;
+    }
+
+    private AgentVisibleHorizon.Patch horizonSurface(BlockPos floor, double contactY) {
+        BlockState state = client.world.getBlockState(floor);
+        double top = horizonSupportTop(client.world, floor, state);
+        if (!Double.isFinite(top) || Math.abs(top - contactY) > 0.055
+                || !overlandLoadHolds(client.world, floor, state, overlandProbe)) return null;
+        BlockPos open = overlandProbe.set(floor.getX(), MathHelper.floor(top + 0.012), floor.getZ());
+        BlockState cover = client.world.getBlockState(open);
+        FluidState fluid = cover.getFluidState();
+        if (fluid.isEmpty()) return AgentProgress.dangerous(cover) || cover.isOf(Blocks.COBWEB)
+            ? null : AgentVisibleHorizon.Patch.dry(top, state.getBlock().getSlipperiness());
+        if (!cover.isOf(Blocks.WATER) || !fluid.isIn(FluidTags.WATER)) return null;
+        double depth = open.getY() + fluid.getHeight(client.world, open) - top;
+        // Flow's mechanical force can veto an already seen water sample, not establish terrain.
+        return AgentVisibleHorizon.Patch.water(top, depth, fluid.getVelocity(client.world, open));
+    }
+
+    static double horizonSupportTop(BlockView world, BlockPos floor, BlockState state) {
+        if (AgentProgress.dangerous(state) || !state.getFluidState().isEmpty() || state.isOf(Blocks.COBWEB))
+            return Double.NaN;
+        VoxelShape shape = state.getCollisionShape(world, floor);
+        if (shape.isEmpty()) return Double.NaN;
+        if (Block.isShapeFullCube(shape)) return floor.getY() + 1;
+        var boxes = shape.getBoundingBoxes();
+        if (boxes.size() != 1) return Double.NaN;
+        Box top = boxes.getFirst();
+        return top.minX == 0 && top.minZ == 0 && top.maxX == 1 && top.maxZ == 1
+            && top.maxY > 0 && top.maxY <= 1 ? floor.getY() + top.maxY : Double.NaN;
+    }
+
+    /** Veto only: body collision and hazards in the nominated sweep never supply optical support. */
+    boolean horizonSweep(double dx, double dz, double drift, double coastDistance, double distance,
+                         AgentVisibleHorizon.Medium medium) {
+        var player = client.player;
+        if (hazards.lavaNear(player.getBoundingBox(), 0.20, tick)
+                || hazardAhead(heading(dx, dz), distance + 0.25)) return false;
+        Box box = player.getBoundingBox().contract(1e-5, 0, 1e-5);
+        double sideX = -dz * drift, sideZ = dx * drift;
+        int slices = Math.max(1, (int) Math.ceil(distance / 0.16));
+        double step = distance / slices;
+        for (int i = 0; i < slices; ++i) {
+            double from = step * i, fraction = Math.min(1, (from + step) / coastDistance);
+            Box sweep = box.offset(dx * from, 0, dz * from).stretch(dx * step, 0, dz * step)
+                .stretch(sideX * fraction, 0, sideZ * fraction);
+            if (!client.world.isSpaceEmpty(player, sweep)) return false;
+            int feetY = MathHelper.floor(sweep.minY + 1e-5);
+            for (int x = MathHelper.floor(sweep.minX); x <= MathHelper.floor(sweep.maxX - 1e-5); ++x) {
+                for (int z = MathHelper.floor(sweep.minZ); z <= MathHelper.floor(sweep.maxZ - 1e-5); ++z) {
+                    for (int y = feetY; y <= MathHelper.floor(sweep.maxY - 1e-5); ++y) {
+                        BlockState state = client.world.getBlockState(overlandProbe.set(x, y, z));
+                        if (AgentProgress.dangerous(state) || state.isOf(Blocks.COBWEB)) return false;
+                        if (!state.getFluidState().isEmpty() && (medium != AgentVisibleHorizon.Medium.SHALLOW_WATER
+                                || y > feetY || !state.isOf(Blocks.WATER))) return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     /** One panoramic sector from the actually rendered view, not a skylight or terrain-column query. */
@@ -2946,6 +3457,10 @@ final class AgentBody {
     private BlockHitResult litHit(Vec3d end, Ray ray) {
         if (raysLeft <= 0) return null;
         raysLeft--;
+        return litRay(end, ray);
+    }
+
+    private BlockHitResult litRay(Vec3d end, Ray ray) {
         BlockHitResult hit = raycast(end, ray);
         return hit.getType() == HitResult.Type.BLOCK && inView(hit.getPos()) && litFace(hit) ? hit : null;
     }
@@ -2959,6 +3474,14 @@ final class AgentBody {
         // Water is transparent; lava is not. Stop within the same vanilla ray traversal.
         return client.world.raycast(new RaycastContext(eye, end, ray.shape,
                 RaycastContext.FluidHandling.NONE, rayShapeContext) {
+            @Override
+            public VoxelShape getBlockShape(BlockState state, BlockView world, BlockPos pos) {
+                // These sparse crossed plants do not hide the surface behind them.
+                if (ray == Ray.HORIZON_TOP && (state.isOf(Blocks.SHORT_GRASS) || state.isOf(Blocks.TALL_GRASS)
+                        || state.isOf(Blocks.FERN) || state.isOf(Blocks.LARGE_FERN))) return VoxelShapes.empty();
+                return super.getBlockShape(state, world, pos);
+            }
+
             @Override
             public VoxelShape getFluidShape(FluidState state, BlockView world, BlockPos pos) {
                 return state.isIn(FluidTags.LAVA) ? state.getShape(world, pos) : VoxelShapes.empty();

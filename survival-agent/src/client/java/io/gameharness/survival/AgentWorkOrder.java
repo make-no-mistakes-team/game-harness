@@ -17,7 +17,7 @@ import net.minecraft.util.Identifier;
 
 /** A finite, host-issued lease. Geometry, recipes and inputs are native decisions. */
 record AgentWorkOrder(String id, int life, long epoch, long basis, long expires, long safetyRevision,
-                      Policy policy, String nextWorkId, String duringWaitFor) {
+                      Policy policy, String nextWorkId, String duringWaitFor, TravelAnchor travelAnchor) {
     static final int MAX_TICKS = 1_200;
     static final int MAX_BREAKS = 64;
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
@@ -33,8 +33,12 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     private static final String PROSPECT_TORCH = "place:minecraft:torch";
     private static final String PROSPECT_SUPPORT = "place:minecraft:cobblestone";
     private static final String WATER_FILL = "fill:minecraft:water";
+    private static final Set<String> NATURAL_FRONTIERS = Set.of(
+        "block:minecraft:stone", "block:minecraft:deepslate", "block:minecraft:andesite",
+        "block:minecraft:diorite", "block:minecraft:granite", "block:minecraft:tuff");
 
     record Target(Item item, int count, String goal) {}
+    record TravelAnchor(String subject, String target) {}
 
     record Policy(boolean preset, Target target, Set<String> effects, Map<Item, Integer> caps,
                   Map<Item, Integer> floors, int maxBreaks, int maxCrafts, int maxPlacements) {
@@ -66,6 +70,20 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         boolean pendingOrdinary() {
             return !preset && target.item != null && target.item != Items.IRON_INGOT
                 && !effects.contains(IRON_SMELT) && !effects.contains(FURNACE);
+        }
+
+        boolean travelAnchorAllowed(String subject, boolean caveFrontier) {
+            if (preset || target.item == null || maxBreaks == 0 || smeltIron() || waterFill() || diamondProspecting()) return false;
+            if (!caveFrontier) return effects.contains("break:" + subject.substring("block:".length()));
+            if (!NATURAL_FRONTIERS.contains(subject)) return false;
+            if (target.item == Items.RAW_IRON)
+                return effects.contains("break:minecraft:iron_ore") || effects.contains("break:minecraft:deepslate_iron_ore");
+            if (target.item == Items.COAL)
+                return effects.contains("break:minecraft:coal_ore") || effects.contains("break:minecraft:deepslate_coal_ore");
+            if (target.item == Items.COBBLESTONE)
+                return effects.contains("break:minecraft:stone") || effects.contains("break:minecraft:cobblestone");
+            return target.item == Items.COBBLED_DEEPSLATE
+                && (effects.contains("break:minecraft:deepslate") || effects.contains("break:minecraft:cobbled_deepslate"));
         }
     }
 
@@ -201,7 +219,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     static AgentWorkOrder parse(JsonObject value, String run, String mode) {
         if (mode == null || value == null || !value.keySet().containsAll(FIELDS)
                 || value.size() != FIELDS.size() + (value.has("nextWorkId") ? 1 : 0)
-                    + (value.has("duringWaitFor") ? 1 : 0)) return null;
+                    + (value.has("duringWaitFor") ? 1 : 0) + (value.has("travelAnchor") ? 1 : 0)) return null;
         AgentWorkOrder envelope;
         try {
             if (integer(value, "v") != 1 || !run.equals(text(value, "run"))) return null;
@@ -213,7 +231,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                     || expires <= basis || expires - basis > MAX_TICKS) return null;
             // Keep the attempted handoff distinct from withdrawing the underlying furnace lease, even if its fields fail validation.
             envelope = new AgentWorkOrder(id, (int) life, epoch, basis, expires, safety, null, null,
-                value.has("duringWaitFor") ? "" : null);
+                value.has("duringWaitFor") ? "" : null, null);
         } catch (RuntimeException invalid) {
             return null;
         }
@@ -279,8 +297,18 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
             if (effects.contains(WATER_FILL) && (!policy.waterFill() || effects.size() != 1 || desired.count != 1
                     || policy.maxBreaks != 0 || policy.maxCrafts != 0 || policy.maxPlacements != 0
                     || caps.size() != 1 || caps.getOrDefault(Items.BUCKET, 0) != 1)) return envelope;
+            TravelAnchor travelAnchor = null;
+            if (value.has("travelAnchor")) {
+                var raw = value.getAsJsonObject("travelAnchor");
+                if (duringWaitFor != null || !raw.keySet().equals(Set.of("subject", "target"))) return envelope;
+                String subject = text(raw, "subject"), identity = text(raw, "target");
+                if (!subject.startsWith("block:") || !ITEM_ID.matcher(subject.substring("block:".length())).matches()
+                        || !ID.matcher(identity).matches() || identity.equals(".") || identity.equals("..")
+                        || !(policy.travelAnchorAllowed(subject, false) || policy.travelAnchorAllowed(subject, true))) return envelope;
+                travelAnchor = new TravelAnchor(subject, identity);
+            }
             return new AgentWorkOrder(envelope.id, envelope.life, envelope.epoch, envelope.basis, envelope.expires,
-                envelope.safetyRevision, policy, nextWorkId, duringWaitFor);
+                envelope.safetyRevision, policy, nextWorkId, duringWaitFor, travelAnchor);
         } catch (RuntimeException invalid) {
             return envelope;
         }

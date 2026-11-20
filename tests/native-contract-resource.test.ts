@@ -69,7 +69,7 @@ test("inflated resource size is bounded before JSON parsing", async () => {
 });
 
 const oldManifest = { schemaVersion: 1, id: "survival_agent", version: "1.0" };
-const terraManifest = { ...oldManifest, custom: { "gameharness:terra_work_wire": 7 } };
+const terraManifest = { ...oldManifest, custom: { "gameharness:terra_work_wire": 8 } };
 const actor = (manifest: object) => jar("fabric.mod.json", Buffer.from(JSON.stringify(manifest)), true);
 
 for (const [kind, bytes] of [
@@ -80,8 +80,9 @@ for (const [kind, bytes] of [
   ["pre-attached-support work-wire version 4", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 4 } })],
   ["pre-pending-production work-wire version 5", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 5 } })],
   ["pre-ordinary-pending work-wire version 6", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 6 } })],
-  ["wrong future work-wire version", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 8 } })],
-  ["malformed work-wire marker", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": "7" } })],
+  ["pre-scoped-travel work-wire version 7", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 7 } })],
+  ["wrong future work-wire version", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 9 } })],
+  ["malformed work-wire marker", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": "8" } })],
   ["malformed JAR", Buffer.from("not a JAR")],
   ["missing", null],
 ] as const) {

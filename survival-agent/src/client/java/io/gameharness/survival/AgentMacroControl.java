@@ -201,7 +201,7 @@ final class AgentMacroControl {
         }
     }
     private record Snapshot(long epoch, Map<String, Offer> offers, String pendingTicket, boolean releasedWait,
-                            AgentWorkOrder activeWork) {}
+                            AgentWorkOrder activeWork, AgentWorkOrder.TravelAnchor travelAnchor) {}
     private record Intent(String id, int life, long epoch, long basis, long expires, String opportunity, String skillHash) {}
     private record Handoff(int life, long epoch, long basis, long expires) {}
     private record Planning(int life, long epoch, long basis, String id, long noticedAt) {}
@@ -247,14 +247,14 @@ final class AgentMacroControl {
         final Vec3d position;
         final float yaw, pitch;
         final int itemCount;
-        final InventoryWitness walkInventory;
+        InventoryWitness walkInventory;
         final AgentWalkedRoute.Motion walkMotion;
         final Camera camera;
         final ItemStack harvestTool;
         final Offer[] keepVisible;
         final float pathYaw, pathPitch;
         boolean drove, fired, broken, purposefulMotion, durable, tableInReach, prospectCover;
-        boolean diamondRoute, prospectLight, retryDiamondInset;
+        boolean diamondRoute, prospectLight, retryDiamondInset, horizonFrontier, scopedSourceLane;
         float lastCrack;
         long firedAt, placementFrame, pickupDisappeared, craftJob, priorCraftReceipt, settledAt, lastMissingFrame;
         long workshopFaceUntil;
@@ -262,6 +262,7 @@ final class AgentMacroControl {
         String unexpectedPickup;
         Screen opened;
         Vec3d destination, walkFrom;
+        AgentBody.HorizonTravel horizonTravel;
         boolean secondHop;
         boolean timberWalk;
         long timberDropSeen;
@@ -416,6 +417,7 @@ final class AgentMacroControl {
         BlockPos placedFurnace;
         boolean collectedIron;
         boolean refusedPendingReplacement;
+        boolean travelAnchorUsed;
         BlockPos ironSceneFooting;
         FurnaceLook ironScene;
         Offer waterClue;
@@ -1218,6 +1220,13 @@ final class AgentMacroControl {
     }
 
     private void observePurposefulMotion() {
+        if (action.horizonTravel != null) {
+            if (!action.purposefulMotion && action.horizonTravel.moved()) {
+                action.purposefulMotion = true;
+                purposeful("terra: " + action.offer.summary);
+            }
+            return;
+        }
         if (action.purposefulMotion || !action.drove) return;
         boolean witnessed;
         if (action.offer.route != null) {
@@ -1290,6 +1299,7 @@ final class AgentMacroControl {
 
     static boolean canRenewWork(AgentWorkOrder witnessed, AgentWorkOrder active, AgentWorkOrder next) {
         return witnessed != null && witnessed == active && sameWorkGrant(witnessed, next)
+            && Objects.equals(witnessed.travelAnchor(), next.travelAnchor())
             && next.expires() > witnessed.expires() && !witnessed.policy().smeltIron() && !witnessed.policy().waterFill();
     }
 
@@ -1362,6 +1372,9 @@ final class AgentMacroControl {
                 if (continuePersonal) releasePersonalCraft(true);
                 markConsumed(next.id());
                 receipt(next.id(), next.life(), "refused", "The work basis, preset goal, or safety premise changed.");
+            } else if (!compatible && next.travelAnchor() != null && !currentTravelAnchor(next, basis, progress)) {
+                markConsumed(next.id());
+                receipt(next.id(), next.life(), "refused", "The exact visible approach or its braking window changed.");
             } else if (!independent && (paidMotor || basis.releasedWait)) {
                 markConsumed(next.id());
                 receipt(next.id(), next.life(), "refused", "A released paid furnace requires a new work order tied to the exact ticket.");
@@ -1817,7 +1830,7 @@ final class AgentMacroControl {
     }
 
     private boolean workPickup(Predicate<ItemStack> wanted) {
-        if (!work.sourceSearch.stairs.isEmpty()) return false; // No unproved drop chase from a lower tread.
+        if (!work.sourceSearch.stairs.isEmpty() || travelAnchorOutstanding()) return false;
         var seen = body.visibleEntity(entity -> entity instanceof ItemEntity drop && !work.rejectedDrops.contains(drop.getId())
             && (!deepWork() || drop.getBlockPos().getY() == player.getBlockY())
             && !dropInProspectOpening(drop) && wanted.test(drop.getStack()) && roomFor(drop.getStack()), 8.0).orElse(null);
@@ -1838,7 +1851,7 @@ final class AgentMacroControl {
     }
 
     private boolean collectOwnTimber() {
-        if (timberHarvest == null) return false;
+        if (timberHarvest == null || travelAnchorOutstanding()) return false;
         TimberHarvest cut = timberHarvest;
         Item target = work.order.policy().target().item();
         if (tick - cut.tick > 48 || count(cut.item) > cut.stock || !work.sourceSearch.stairs.isEmpty()
@@ -1896,7 +1909,8 @@ final class AgentMacroControl {
             BlockPos pos = hit.getBlockPos();
             if (work.rejected.contains(pos)) return false;
             BlockState state = world.getBlockState(pos);
-            return workResourceSafe(hit, state, progress) && workToolSlot(pos, state) >= 0;
+            return scopedSourceHit(hit) && workResourceSafe(hit, state, progress)
+                && workToolSlot(pos, state) >= 0 && roomFor(new ItemStack(AgentWorkOrder.harvest(state)));
         };
         double reach = reach();
         if (diamond && diamondRoute.cutting) {
@@ -1917,7 +1931,7 @@ final class AgentMacroControl {
             }
             work.sourceLook = null; // A dated bearing never authorizes attack; find the vanilla contact again below.
         }
-        if (work.sourceSearch.stairs.isEmpty() && workGatherTimber(wanted, eligible)) return true;
+        if (work.sourceSearch.stairs.isEmpty() && workGatherTimber(wanted, eligible, progress)) return true;
         var found = body.find(wanted, reach, hit -> eligible.test(hit) && body.macroMineWitness(hit, reach) != null).orElse(null);
         if (found != null) {
             Face face = face(found);
@@ -1928,32 +1942,25 @@ final class AgentMacroControl {
                 hit -> {
                     BlockPos pos = hit.getBlockPos();
                     BlockState state = world.getBlockState(pos);
-                    return !work.rejected.contains(pos) && !work.sourceSearch.footholds.contains(pos)
+                    return scopedSourceHit(hit) && !work.rejected.contains(pos) && !work.sourceSearch.footholds.contains(pos)
                         && dryWorkBreakSafe(pos, state, AgentWorkOrder.harvest(state), progress)
-                        && workToolSlot(pos, state) >= 0;
+                        && workToolSlot(pos, state) >= 0 && roomFor(new ItemStack(AgentWorkOrder.harvest(state)));
                 }).orElse(null)
             : null;
-        if (!deepWork() && work.sourceSearch.stairs.isEmpty() && startSourceCaveStep(progress, found)) return true;
         if (diamond) return prospectForDiamond(progress, found);
         if (found != null) {
-            BlockPos pos = found.getBlockPos();
-            if (pos.getY() >= player.getBlockY()) {
-                if (!deepWork() && work.sourceSearch.steps < MAX_SOURCE_FOOTHOLDS
-                        && startSourceFoothold(player.getBlockPos(), work.sourceSearch, found.getPos())) {
-                    rememberSourceBearing(found);
-                    return true;
-                }
-                Vec3d destination = Vec3d.ofBottomCenter(pos);
-                if (horizontalSquared(player.getPos(), destination) > 1.35 * 1.35) {
-                    Face face = face(found);
-                    startWorkStep(Verb.WORK_WALK, "Approach witnessed " + blockName(face), face, null, null, null);
-                    action.destination = destination;
-                    action.distanceLeft = horizontalSquared(player.getPos(), destination);
-                    rememberSourceBearing(found);
-                    return true;
-                }
-            }
+            var grade = sourceCaveLane(progress, found, true);
+            if (grade != null) return startSourceCaveLane(progress, found, grade);
         }
+        if (found != null && startHorizonSource(found, false)) return true;
+        if (!travelAnchorOutstanding() && found != null && found.getBlockPos().getY() < player.getBlockY()
+                && startSourceCaveStep(progress, found)) return true;
+        if (earlySourceAvailable(wanted)) {
+            var frontier = ordinaryFrontier();
+            if (frontier != null && startHorizonSource(frontier, true)) return true;
+        }
+        if (travelAnchorOutstanding()) return false;
+        if (!deepWork() && work.sourceSearch.stairs.isEmpty() && startSourceCaveStep(progress, found)) return true;
         return prospectForSource(progress, wanted);
     }
 
@@ -1961,22 +1968,38 @@ final class AgentMacroControl {
         var search = work.sourceSearch;
         var from = player.getBlockPos();
         if (!settled() || !dryProspectStance(from) || search.steps >= MAX_SOURCE_FOOTHOLDS) return false;
-        var route = currentDryRoute(progress);
-        if (route != null && route.edges() <= MAX_SOURCE_FOOTHOLDS - search.steps
-                && workTicksLeft() > AgentSurfaceTread.returnTicks(route.edges())
-                && (source == null || routeTowardSource(from, route.endpoint(), source))
-                && !search.footholds.contains(route.endpoint().down())
-                && search.attempted.add(route.endpoint().down())) {
-            search.steps += route.edges();
-            search.footholds.add(from.down());
-            startWorkCaveStep(Verb.FOLLOW, "Follow the witnessed reversible dry lane for source work", progress, route, null, false);
-            if (source != null) rememberSourceBearing(source);
-            return true;
-        }
+        var route = sourceCaveLane(progress, source, false);
+        if (route != null) return startSourceCaveLane(progress, source, route);
         var survey = progress.drySurveyOffer();
         if (survey == null || source != null && source.getBlockPos().getY() >= from.getY()
                 || !work.caveSurveys.add(from.toImmutable())) return false;
         startWorkCaveStep(Verb.DRY_SURVEY, "Verify the witnessed lower lane without movement or spending", progress, null, survey, false);
+        return true;
+    }
+
+    private AgentDryCaveRoute.Offer sourceCaveLane(AgentProgress progress, BlockHitResult source, boolean oneGrade) {
+        var search = work.sourceSearch;
+        var from = player.getBlockPos();
+        if (deepWork() || !search.stairs.isEmpty() || !settled() || !dryProspectStance(from)) return null;
+        var route = currentDryRoute(progress);
+        return route != null && (!oneGrade || route.edges() == 1 && Math.abs(route.heightChange()) == 1)
+            && route.edges() <= MAX_SOURCE_FOOTHOLDS - search.steps
+            && workTicksLeft() > AgentSurfaceTread.returnTicks(route.edges())
+            && (source == null || routeTowardSource(from, route.endpoint(), source))
+            && !search.footholds.contains(route.endpoint().down()) && !search.attempted.contains(route.endpoint().down())
+            ? route : null;
+    }
+
+    private boolean startSourceCaveLane(AgentProgress progress, BlockHitResult source, AgentDryCaveRoute.Offer route) {
+        var search = work.sourceSearch;
+        search.steps += route.edges();
+        search.attempted.add(route.endpoint().down());
+        search.footholds.add(route.from().down());
+        startWorkCaveStep(Verb.FOLLOW, "Follow the witnessed reversible dry lane for source work", progress, route, null, false);
+        if (source != null) {
+            action.scopedSourceLane = travelAnchorOutstanding();
+            rememberSourceBearing(source);
+        }
         return true;
     }
 
@@ -1992,7 +2015,109 @@ final class AgentMacroControl {
         work.sourceLookUntil = tick + action.offer.key.verb.maxTicks + 20;
     }
 
-    private boolean workGatherTimber(Predicate<BlockState> wanted, Predicate<BlockHitResult> eligible) {
+    record OrdinaryTravelTarget(AgentVisibleHorizon.Target target, boolean caveFrontier) {}
+
+    /** Travel preview only: current tools/authorization are rechecked in workGather, not inferred by publishing this. */
+    OrdinaryTravelTarget ordinaryTravelTarget(AgentProgress progress) {
+        if (!(grounded() || body.horizonWaterInFlight() && player.isOnGround())
+                || !body.hasRecentView() || hasActiveWorkOrder() && deepWork()) return null;
+        var selected = body.visibleHorizon().target(body.horizonSightline(INSPECT_REACH));
+        if (selected != null && ordinaryGoalHit(selected.hit())) {
+            var pos = selected.hit().getBlockPos();
+            var state = world.getBlockState(pos);
+            boolean frontier = frontierGrade(selected.hit()) && naturalFrontier(state);
+            if (frontier || (earlyTravelMaterial(state) || timberBlock(state)) && progress.macroCanBreak(pos))
+                return new OrdinaryTravelTarget(selected, frontier);
+        }
+        var target = body.visibleHorizon().find(state -> timberBlock(state) || earlyTravelMaterial(state) && !naturalFrontier(state),
+            INSPECT_REACH,
+            hit -> ordinaryGoalHit(hit) && progress.macroCanBreak(hit.getBlockPos()));
+        if (target != null) return new OrdinaryTravelTarget(target, false);
+        BlockHitResult frontier = ordinaryFrontier();
+        if (frontier != null) {
+            target = body.visibleHorizon().target(frontier);
+            if (target != null) return new OrdinaryTravelTarget(target, true);
+        }
+        target = body.visibleHorizon().find(AgentMacroControl::earlyTravelMaterial, INSPECT_REACH,
+            hit -> ordinaryGoalHit(hit) && progress.macroCanBreak(hit.getBlockPos()));
+        return target == null ? null : new OrdinaryTravelTarget(target, false);
+    }
+
+    private static boolean earlyTravelMaterial(BlockState state) {
+        Item drop = AgentWorkOrder.harvest(state);
+        return drop == Items.COAL || drop == Items.RAW_IRON || drop == Items.COBBLESTONE || drop == Items.COBBLED_DEEPSLATE;
+    }
+
+    private boolean ordinaryGoalHit(BlockHitResult hit) {
+        BlockPos pos = hit.getBlockPos();
+        int grade = pos.getY() - player.getBlockY();
+        return hit.getSide().getAxis().isHorizontal()
+            && (grade >= 0 || grade >= -2 && timberBlock(world.getBlockState(pos))) && grade <= 3
+            && horizontalSquared(player.getPos(), hit.getPos()) > 0.85 * 0.85;
+    }
+
+    private static boolean naturalFrontier(BlockState state) {
+        return state.isOf(Blocks.STONE) || state.isOf(Blocks.DEEPSLATE) || state.isOf(Blocks.ANDESITE)
+            || state.isOf(Blocks.DIORITE) || state.isOf(Blocks.GRANITE) || state.isOf(Blocks.TUFF);
+    }
+
+    private BlockHitResult ordinaryFrontier() {
+        // A rock face beyond the current stance is a genuine cave observation,
+        // unlike a near arbitrary patch or a workstation in the same view.
+        if (player.getBlockY() > 56) return null;
+        return body.find(AgentMacroControl::naturalFrontier, INSPECT_REACH, hit -> {
+            var pos = hit.getBlockPos();
+            if (!frontierGrade(hit) || work != null && (work.rejected.contains(pos)
+                    || work.sourceSearch.attempted.contains(pos))) return false;
+            return ordinaryGoalHit(hit) && scopedSourceHit(hit);
+        }).orElse(null);
+    }
+
+    private boolean frontierGrade(BlockHitResult hit) {
+        return player.getBlockY() <= 56 && horizontalSquared(player.getPos(), hit.getPos()) >= 2.25
+            && Math.abs(MathHelper.wrapDegrees(heading(hit.getPos().x - player.getX(),
+                hit.getPos().z - player.getZ()) - player.getYaw())) <= 55;
+    }
+
+    private boolean travelAnchorOutstanding() {
+        return work != null && work.active() && work.order.travelAnchor() != null && !work.travelAnchorUsed;
+    }
+
+    private boolean matchingTravelAnchor(AgentVisibleHorizon.Target target) {
+        return !travelAnchorOutstanding() || work.order.travelAnchor().equals(renderedTravelAnchor(target));
+    }
+
+    private boolean scopedSourceHit(BlockHitResult hit) {
+        if (!travelAnchorOutstanding()) return true;
+        var target = body.visibleHorizon().target(hit);
+        return target != null && matchingTravelAnchor(target);
+    }
+
+    private boolean startHorizonSource(BlockHitResult hit, boolean frontier) {
+        var search = work.sourceSearch;
+        var cell = hit.getBlockPos();
+        if (deepWork() || !search.stairs.isEmpty() || search.steps >= MAX_SOURCE_FOOTHOLDS
+                || search.attempted.contains(cell) || !ordinaryGoalHit(hit)
+                || client.options.forwardKey.isUnbound()) return false;
+        var target = body.visibleHorizon().target(hit);
+        if (target == null || !matchingTravelAnchor(target)) return false;
+        Face cue = face(hit);
+        String label = frontier ? "Walk toward the witnessed cave frontier"
+            : "Walk toward witnessed " + blockName(cue);
+        startWorkStep(Verb.WORK_WALK, label, cue, null, null, null);
+        Vec3d point = target.point();
+        action.horizonTravel = new AgentBody.HorizonTravel(target, new Vec3d(point.x, player.getY(), point.z),
+            frontier ? 0.77 : 0.96, true);
+        action.horizonFrontier = frontier;
+        action.walkInventory = new InventoryWitness(player.getInventory());
+        search.footholds.add(player.getBlockPos().down());
+        search.attempted.add(cell);
+        ++search.steps;
+        return true;
+    }
+
+    private boolean workGatherTimber(Predicate<BlockState> wanted, Predicate<BlockHitResult> eligible,
+                                     AgentProgress progress) {
         rememberTimberView();
         Predicate<BlockState> timber = state -> timberBlock(state) && wanted.test(state);
         int floor = player.getBlockY();
@@ -2020,9 +2145,10 @@ final class AgentMacroControl {
             BlockHitResult seen = body.find(timber, TIMBER_RECALL_RANGE, hit -> hit.getSide().getAxis().isHorizontal()
                 && hit.getBlockPos().getY() <= floor + 2 && !insideTimberClearance(hit.getBlockPos(), player.getPos())
                 && timberColumn(hit.getBlockPos()) != skip && !work.timberApproaches.contains(timberColumn(hit.getBlockPos()))
-                && eligible.test(hit)).orElse(null);
+                && !work.rejected.contains(hit.getBlockPos()) && ordinaryGoalHit(hit) && scopedSourceHit(hit)
+                && timberApproachUseful(hit, progress)).orElse(null);
             if (seen == null) break;
-            if (approachTimber(face(seen))) {
+            if (startHorizonSource(seen, false)) {
                 work.timberApproaches.add(timberColumn(seen.getBlockPos()));
                 work.timberLook = null;
                 return true;
@@ -2063,6 +2189,14 @@ final class AgentMacroControl {
         return true;
     }
 
+    private boolean timberApproachUseful(BlockHitResult hit, AgentProgress progress) {
+        var pos = hit.getBlockPos();
+        var state = world.getBlockState(pos);
+        var item = AgentWorkOrder.harvest(state);
+        return dryWorkBreakSafe(pos, state, item, progress) && workToolSlot(pos, state) >= 0
+            && roomFor(new ItemStack(item));
+    }
+
     private void startTimberLook(TimberSight candidate) {
         work.timberLook = candidate;
         work.timberLookUsed = true;
@@ -2091,32 +2225,6 @@ final class AgentMacroControl {
             }
             return false; // Gather only camera-admitted candidates, not an action.
         });
-    }
-
-    private boolean approachTimber(Face tree) {
-        BlockPos trunk = tree.hit.getBlockPos();
-        Vec3d observed = tree.hit.getPos();
-        Vec3d feet = player.getPos();
-        double eyeHeight = player.getEyePos().y - feet.y;
-        double range = reach();
-        BlockHitResult support = body.find(state -> !timberBlock(state) && !station(state) && !state.isIn(BlockTags.LEAVES), 6,
-            hit -> {
-                BlockPos cell = hit.getBlockPos();
-                Vec3d stand = Vec3d.ofBottomCenter(cell.up());
-                double walk = horizontalSquared(feet, stand);
-                return hit.getSide() == Direction.UP && cell.getY() == player.getBlockY() - 1
-                    && walk >= 0.6 && walk <= 16 && horizontalSquared(stand, observed) <= 6.25
-                    && !insideTimberClearance(trunk, stand)
-                    && stand.add(0, eyeHeight, 0).squaredDistanceTo(observed) < range * range
-                    && body.dryRouteFloor(hit.getPos().add(0, -0.035, 0), cell) != null;
-            }).orElse(null);
-        if (support == null) return false;
-        Vec3d destination = Vec3d.ofBottomCenter(support.getBlockPos().up());
-        startWorkStep(Verb.WORK_WALK, "Walk to visible footing beside witnessed " + blockName(tree), tree, null, null, null);
-        action.destination = destination;
-        action.distanceLeft = horizontalSquared(feet, destination);
-        action.timberWalk = true;
-        return true;
     }
 
     private static boolean insideTimberClearance(BlockPos trunk, Vec3d stance) {
@@ -2148,6 +2256,7 @@ final class AgentMacroControl {
             : diamondCover ? "Clear one witnessed diamond prospecting cell of "
             : lip ? "Clear a witnessed return lip of " : cover ? "Open a shallow window through witnessed " : "Harvest witnessed ";
         startWorkStep(Verb.BREAK, label + blockName(face), face, null, null, null);
+        if (travelAnchorOutstanding() && scopedSourceHit(face.hit)) work.travelAnchorUsed = true;
         action.tracked = item;
         action.prospectCover = cover;
         action.diamondRoute = diamondCover;
@@ -3067,18 +3176,18 @@ final class AgentMacroControl {
         return true;
     }
 
+    private boolean earlySourceAvailable(Predicate<BlockState> wanted) {
+        for (BlockState source : EARLY_SOURCES) {
+            if (wanted.test(source) && workToolSlot(player.getBlockPos(), source) >= 0
+                    && roomFor(new ItemStack(AgentWorkOrder.harvest(source)))) return true;
+        }
+        return false;
+    }
+
     private boolean prospectForSource(AgentProgress progress, Predicate<BlockState> wanted) {
         BlockPos foot = player.getBlockPos();
-        boolean availableSource = false;
-        for (BlockState source : EARLY_SOURCES) {
-            if (wanted.test(source) && workToolSlot(foot, source) >= 0
-                    && roomFor(new ItemStack(AgentWorkOrder.harvest(source)))) {
-                availableSource = true;
-                break;
-            }
-        }
         var search = work.sourceSearch;
-        if (!availableSource) {
+        if (!earlySourceAvailable(wanted)) {
             if (!search.stairs.isEmpty()) work.sourceBlock = "The job has no suitable allowed source tool or inventory space.";
             return false;
         }
@@ -3101,7 +3210,6 @@ final class AgentMacroControl {
         if (search.lastCover != null && foot.equals(search.cutFrom)) {
             return openSurfaceTread(foot, search.lastCover, search, tick);
         }
-        if (search.steps < MAX_SOURCE_FOOTHOLDS && startSourceFoothold(foot, search, null)) return true;
         if (search.firstCover != null) {
             work.sourceBlock = "The one shallow window is elsewhere, and no unvisited dry foothold is in view.";
             return false;
@@ -3303,50 +3411,6 @@ final class AgentMacroControl {
     private boolean prospectBodyUsable() {
         return player.getHealth() > player.getMaxHealth() / 2 && player.getHungerManager().getFoodLevel() > 6
             && !client.options.forwardKey.isUnbound() && !client.options.jumpKey.isUnbound();
-    }
-
-    private boolean startSourceFoothold(BlockPos foot, SourceSearch search, Vec3d source) {
-        if (client.options.forwardKey.isUnbound()) return false;
-        search.footholds.add(foot.down());
-        Vec3d goal = source;
-        double priorDistance = goal == null ? 0 : horizontalSquared(player.getPos(), goal);
-        // An exposed bank takes precedence over unchanged flat ground on the current bearing.
-        if (source == null) {
-            BlockHitResult bank = body.find(state -> AgentWorkOrder.prospectCoverDrop(state) != Items.AIR, 8,
-                hit -> hit.getSide().getAxis().isHorizontal() && hit.getBlockPos().getY() >= foot.getY()).orElse(null);
-            if (bank != null) source = bank.getPos();
-        }
-        float yaw = player.getYaw();
-        if (source != null) {
-            Vec3d delta = source.subtract(player.getPos());
-            yaw = heading(delta.x, delta.z);
-        }
-        Floor best = null;
-        float bestTurn = Float.POSITIVE_INFINITY;
-        for (Direction direction : CARDINAL) {
-            BlockPos floor = foot.down().offset(direction);
-            if (search.footholds.contains(floor) || search.attempted.contains(floor) || body.macroFloor(floor) == null) continue;
-            Vec3d landing = Vec3d.ofBottomCenter(floor.up());
-            if (goal != null && horizontalSquared(landing, goal) + 0.16 >= priorDistance) continue;
-            BlockState support = world.getBlockState(floor);
-            if (support.getBlock() instanceof FallingBlock || !body.macroFlatLane(floor, support, landing)
-                    || !body.macroNoVisiblePickup(landing)) continue;
-            float turn = Math.abs(MathHelper.wrapDegrees(direction.getPositiveHorizontalDegrees() - yaw));
-            if (turn >= bestTurn) continue;
-            best = new Floor(floor, support, landing);
-            bestTurn = turn;
-        }
-        if (best == null) return false;
-        search.attempted.add(best.pos);
-        ++search.steps;
-        String label = "Walk to a distinct witnessed dry foothold for source evidence";
-        Offer approach = new Offer(null, new Key(Verb.APPROACH, best.pos, 0, null), label, "", 0, 0,
-            best, null, null, null, null);
-        action = new Action(null, approach, client, tick, now, body.renderedFrame(), 0, NO_ANCHORS, 42);
-        action.durable = true;
-        status = work.detail = label;
-        enact("route", label);
-        return true;
     }
 
     private float sourceFootingYaw(BlockPos foot) {
@@ -3621,7 +3685,8 @@ final class AgentMacroControl {
             interrupt(timeoutDetail(), true);
         } else if (!hazardClear || !client.isWindowFocused() || client.getOverlay() != null
                 || client.interactionManager == null || client.interactionManager.getCurrentGameMode() != GameMode.SURVIVAL
-                || !(grounded() || (verb == Verb.WORK_WALK || verb == Verb.WORK_TREAD
+                || !(grounded() || action.horizonTravel != null && body.horizonSafetyAllows(action.horizonTravel)
+                    || (verb == Verb.WORK_WALK || verb == Verb.WORK_TREAD
                         || verb == Verb.FOLLOW && progress.dryRouteInFlight(action.offer.route))
                     && !player.isTouchingWater() && !player.hasVehicle())) {
             interrupt("The work step lost its safe footing, focus or Survival controls.", true);
@@ -3762,6 +3827,10 @@ final class AgentMacroControl {
             interrupt("A different screen replaced the working view.", false);
             return;
         }
+        if (action.horizonTravel != null) {
+            advanceHorizonWork(progress);
+            return;
+        }
         ItemEntity drop = action.offer.drop;
         if (drop != null) {
             if (count(action.offer.item) > action.itemCount && drop.isRemoved()) {
@@ -3785,24 +3854,6 @@ final class AgentMacroControl {
             continuityWork = AgentPauseEpisodes.Work.ROUTE;
         }
         if (!body.hasRecentView()) return;
-        if (action.timberWalk && drop == null) {
-            var target = work.order.policy().target();
-            Item stock = goalStock(target);
-            boolean stockReady = stock != null && count(stock) >= goalAmount(target) && missingWorkFloor() == null;
-            boolean ready = horizontalSquared(action.position, player.getPos()) >= 0.36 && visibleFace(action.offer.face);
-            if (stockReady || ready || distance <= 0.16 && Math.abs(player.getY() - action.destination.y) <= 0.12) {
-                if (grounded() && settled()) {
-                    if (!stockReady && !ready && !work.timberLookUsed)
-                        startTimberLook(new TimberSight(action.offer.face, tick));
-                    complete(stockReady ? "Vanilla inventory reached the authorized stock while walking."
-                        : "Reached dry footing beside the witnessed trunk, outside its occupied cell.");
-                }
-                return;
-            }
-            if (!progress.macroWorkWalk(action.destination, pendingEntry() != null))
-                interrupt("No safe visible lane remains to the retained timber stance.", true);
-            return;
-        }
         if (drop == null && horizontalSquared(action.position, player.getPos()) >= 0.16
                 && (distance <= 1.35 * 1.35 || visibleFace(action.offer.face))) {
             if (settled()) complete("Reached a closer safe stance for the retained witnessed target.");
@@ -3817,6 +3868,47 @@ final class AgentMacroControl {
             body.aim(action.destination.add(0, 0.10, 0));
         } else if (!progress.macroWorkWalk(action.destination, pendingEntry() != null)) {
             interrupt("No safe visible lane remains toward the retained target.", true);
+        }
+    }
+
+    private void advanceHorizonWork(AgentProgress progress) {
+        String pickup = unexpectedPickup();
+        if (pickup != null) {
+            interrupt(pickup, true);
+            return;
+        }
+        var travel = action.horizonTravel;
+        var cue = action.offer.face;
+        boolean ready = !action.horizonFrontier && travel.moved() && grounded() && visibleFace(cue);
+        if (travel.moved()) work.travelAnchorUsed = true;
+        if (travel.progressed()) continuityWork = AgentPauseEpisodes.Work.ROUTE;
+        switch (body.driveHorizon(travel, true, ready)) {
+            case MOVING, SETTLING -> { }
+            case ARRIVED -> {
+                if (!settled() || !grounded()) return;
+                work.sourceSearch.footholds.add(player.getBlockPos().down());
+                work.sourceSearch.freshAfter = body.renderedFrame();
+                if (!action.horizonFrontier && !ready) rememberSourceBearing(cue.hit);
+                complete(travel.waded() ? "Crossed the witnessed shallows and settled on dry footing."
+                    : action.horizonFrontier ? "Walked to a closer dry stance for the witnessed cave frontier."
+                    : "Walked to a closer dry stance for the witnessed resource; no harvest yet.");
+            }
+            case BLOCKED -> {
+                var grade = sourceCaveLane(progress, cue.hit, true);
+                if (grade != null) {
+                    // Only an already offered, goalward one-block route may take over.
+                    // Ending this rolling leg is not a receipt for traversing that grade.
+                    interrupt("Rolling travel yielded to the existing witnessed one-block lane.", true);
+                    work.rejected.remove(cue.hit.getBlockPos());
+                    startSourceCaveLane(progress, cue.hit, grade);
+                    return;
+                }
+                if (travel.moved() && settled() && grounded()) {
+                    work.sourceSearch.footholds.add(player.getBlockPos().down());
+                    work.sourceSearch.freshAfter = body.renderedFrame();
+                }
+                interrupt("Stopped short of the witnessed target; no supported braking window or safe correction remains.", true);
+            }
         }
     }
 
@@ -5980,6 +6072,11 @@ final class AgentMacroControl {
     }
 
     private void walk(Offer offer) {
+        if (offer.key.verb == Verb.APPROACH && !action.durable && !trial && offer.farther == null
+                && !walkedRoutes.recoveringWalk()) {
+            walkHorizonApproach(offer.floor);
+            return;
+        }
         var player = client.player;
         Floor floor = action.secondHop ? offer.farther : offer.floor;
         boolean collect = offer.drop != null;
@@ -6056,6 +6153,36 @@ final class AgentMacroControl {
             : action.pathYaw;
         float pitch = action.pathPitch;
         body.macroFlatWalk(floor.landing, yaw, pitch);
+    }
+
+    private void walkHorizonApproach(Floor floor) {
+        String pickup = unexpectedPickup();
+        if (pickup != null) {
+            interrupt(pickup, true);
+            return;
+        }
+        if (!body.hasRecentView()) return;
+        if (action.horizonTravel == null) {
+            var target = body.visibleHorizon().target(body.macroFloor(floor.pos));
+            if (target == null || world.getBlockState(floor.pos) != floor.state) {
+                interrupt("The exact offered dry footing is no longer visible.", true);
+                return;
+            }
+            action.horizonTravel = new AgentBody.HorizonTravel(target, floor.landing, 0.27, false);
+        }
+        if (action.horizonTravel.progressed()) continuityWork = AgentPauseEpisodes.Work.ROUTE;
+        boolean within = player.getBlockPos().equals(floor.pos.up())
+            && horizontalSquared(player.getPos(), floor.landing) <= 0.1225
+            && world.getBlockState(floor.pos) == floor.state;
+        switch (body.driveHorizon(action.horizonTravel, true, within)) {
+            case MOVING, SETTLING -> { }
+            case ARRIVED -> {
+                if (settled() && grounded() && within)
+                    complete("Reached the witnessed dry footing after actual continuous walking.");
+                else if (!within) interrupt("Stopped without settling on the exact offered dry footing.", true);
+            }
+            case BLOCKED -> interrupt("The visible braking window did not support another step toward the offered footing.", true);
+        }
     }
 
     private void recordApproachLeg(Floor floor) {
@@ -6284,8 +6411,11 @@ final class AgentMacroControl {
     }
 
     private boolean idlePublicationPremise() {
-        return !trial && visited && owned && "terra_idle".equals(owner) && !rawWorking && !urgent && hazardClear
-            && !hasActiveWorkOrder() && personalCraft == null && pendingEntry() == null
+        return owned && "terra_idle".equals(owner) && !rawWorking && neutralWorkView();
+    }
+
+    private boolean neutralWorkView() {
+        return !trial && visited && !urgent && hazardClear && !hasActiveWorkOrder() && personalCraft == null && pendingEntry() == null
             && player != null && player == client.player && world != null && world == client.world && player.isAlive()
             && grounded() && settled() && neutral() && cursorClear() && player.currentScreenHandler == player.playerScreenHandler
             && !player.isUsingItem() && !player.isSprinting() && !player.isSneaking() && !client.interactionManager.isBreakingBlock()
@@ -7050,6 +7180,47 @@ final class AgentMacroControl {
         return clue;
     }
 
+    // Projection only. The ordinary work owner chooses the target and drives the body.
+    private record TravelWitness(AgentWorkOrder.TravelAnchor anchor, boolean caveFrontier,
+                                 AgentVisibleHorizon.Window window) {}
+
+    private AgentWorkOrder.TravelAnchor renderedTravelAnchor(AgentVisibleHorizon.Target target) {
+        BlockPos pos = target.hit().getBlockPos();
+        String identity = materialTarget(new Key(Verb.BREAK, pos, 0, null));
+        return identity == null ? null : new AgentWorkOrder.TravelAnchor(
+            "block:" + Registries.BLOCK.getId(world.getBlockState(pos).getBlock()), identity);
+    }
+
+    private TravelWitness travelWitness(AgentProgress progress) {
+        if (progress == null || ipc.workMode == null || surveyOrigin <= 0) return null;
+        var nominated = ordinaryTravelTarget(progress);
+        if (nominated == null) return null;
+        var window = body.visibleHorizon().window(nominated.target());
+        if (window == null || window.knownDistance() <= 0 || window.knownDistance() < window.brakingDistance()
+                || window.medium() == AgentVisibleHorizon.Medium.UNKNOWN
+                || window.medium() == AgentVisibleHorizon.Medium.SHALLOW_WATER && window.dryBank() == null) return null;
+        var anchor = renderedTravelAnchor(nominated.target());
+        return anchor == null ? null : new TravelWitness(anchor, nominated.caveFrontier(), window);
+    }
+
+    private boolean currentTravelAnchor(AgentWorkOrder next, Snapshot basis, AgentProgress progress) {
+        if (!next.travelAnchor().equals(basis.travelAnchor) || !neutralWorkView()) return false;
+        var live = travelWitness(progress);
+        return live != null && next.travelAnchor().equals(live.anchor)
+            && next.policy().travelAnchorAllowed(live.anchor.subject(), live.caveFrontier);
+    }
+
+    private JsonObject travelObservation(TravelWitness witness) {
+        var value = new JsonObject();
+        value.addProperty("kind", witness.caveFrontier ? "cave_frontier" : "resource");
+        value.addProperty("subject", witness.anchor.subject());
+        value.addProperty("target", witness.anchor.target());
+        value.addProperty("footing", witness.window.medium() == AgentVisibleHorizon.Medium.DRY ? "dry" : "shallow_water_with_bank");
+        value.addProperty("bearingDegrees", MathHelper.wrapDegrees(witness.window.yaw() - player.getYaw()));
+        value.addProperty("windowBlocks", witness.window.knownDistance());
+        return value;
+    }
+
     private void publish(AgentProgress progress) {
         publish(progress, 0);
     }
@@ -7095,6 +7266,9 @@ final class AgentMacroControl {
         List<Offer> visible = List.of();
         String caveSource = null;
         var ticket = pendingEntry();
+        boolean idleView = idlePublicationPremise();
+        var travel = idleView ? travelWitness(progress) : null;
+        if (travel != null) value.add("travelHint", travelObservation(travel));
         boolean yieldable = pendingCanYield();
         boolean parked = ticket != null && pendingParked();
         boolean parkedWorld = parked && progress != null && parkedViewReady();
@@ -7113,7 +7287,7 @@ final class AgentMacroControl {
             if (action == null || yieldable) {
                 visible = offers(progress);
                 if (parked || yieldable) caveSource = visibleCaveSource();
-                if (ipc.workMode != null && surveyOrigin > 0 && idlePublicationPremise()) {
+                if (ipc.workMode != null && surveyOrigin > 0 && idleView) {
                     JsonObject clue = prospectOpening(progress, inv);
                     if (clue != null) value.add("prospectOpening", clue);
                 }
@@ -7185,7 +7359,8 @@ final class AgentMacroControl {
         }
         if (trackSurvey) observeSurveyPublication(publishedSurveys);
         snapshots.put(tick, new Snapshot(epoch, witnessed.isEmpty() ? Map.of() : witnessed,
-            ticket == null ? null : ticket.ticket().toString(), yieldable, hasActiveWorkOrder() ? work.order : null));
+            ticket == null ? null : ticket.ticket().toString(), yieldable, hasActiveWorkOrder() ? work.order : null,
+            travel == null ? null : travel.anchor));
         while (!snapshots.isEmpty() && snapshots.firstEntry().getKey() < tick - MAX_AGE) snapshots.pollFirstEntry();
         value.add("opportunities", opportunities);
         String watched = retainedFurnaceFact();
@@ -7198,7 +7373,7 @@ final class AgentMacroControl {
         value.add("recent", history);
         value.addProperty("quiescent", quiescent);
         idlePublishedPos = null;
-        if (!visible.isEmpty() && idlePublicationPremise() && body.hasRecentView()) {
+        if ((!visible.isEmpty() || travel != null) && idleView && body.hasRecentView()) {
             idlePublishedPos = player.getPos();
             idlePublishedYaw = player.getYaw();
             idlePublishedPitch = player.getPitch();
@@ -7402,6 +7577,7 @@ final class AgentMacroControl {
     }
 
     private void finish(String result, String detail) {
+        if (action.horizonTravel != null) body.stopHorizonTravel(action.horizonTravel);
         if (action.prospectSupport != null && action.prospectSupport.steered && owner.equals("work_order")) {
             body.pauseWork();
             if (hazardClear && !urgent && client.currentScreen == null && grounded()
@@ -7503,6 +7679,7 @@ final class AgentMacroControl {
                             && !action.workshopFaceLost)
                     retireWork("needs_replan", "interrupted", detail);
             } else if (result.equals("completed")) {
+                if (action.scopedSourceLane) work.travelAnchorUsed = true;
                 if (workshopWalk) work.ironWorkshop.arrived(action.offer.floor.pos.up());
                 if (action.offer.key.verb == Verb.APPROACH || action.prospectCover)
                     work.sourceSearch.freshAfter = body.renderedFrame();

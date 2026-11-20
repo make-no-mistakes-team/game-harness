@@ -671,9 +671,37 @@ final class MiningStockProof {
             "renewal does not change the separately paid obligation");
         var smelt = AgentWorkOrder.parse(ironWorkQuote(), "run", "preset");
         var freshSmelt = new AgentWorkOrder("renewed-smelt", smelt.life(), smelt.epoch(), 50, 950,
-            smelt.safetyRevision(), smelt.policy(), null, null);
+            smelt.safetyRevision(), smelt.policy(), null, null, null);
         require(!AgentMacroControl.canRenewWork(smelt, smelt, freshSmelt),
             "the paid batch is not an ordinary session");
+    }
+
+    @Test
+    void aScopedApproachCannotPriceCoverOrBeRetargetedByRenewal() {
+        var raw = JsonParser.parseString("""
+            {"v":1,"id":"iron-leg","run":"run","life":1,"epoch":1,"basisTick":15,"expiresTick":400,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:raw_iron","count":1},
+             "allowedEffects":["break:minecraft:iron_ore"],"costCaps":[],
+             "reserves":[{"item":"minecraft:stone_pickaxe","count":1}],"maxBreaks":2,"maxCrafts":0,"maxPlacements":0,
+             "travelAnchor":{"subject":"block:minecraft:stone","target":"wall-a"}}
+            """).getAsJsonObject();
+        var original = AgentWorkOrder.parse(raw, "run", "constrained");
+        require(original != null && original.policy() != null && original.travelAnchor().target().equals("wall-a"),
+            "an ordinary iron request can name a specific rendered natural frontier");
+        require(original.policy().travelAnchorAllowed(original.travelAnchor().subject(), true)
+                && !original.policy().breakAllowed(Blocks.STONE.getDefaultState()),
+            "approach evidence cannot expand the allowed break set");
+        raw.addProperty("id", "renew");
+        raw.addProperty("basisTick", 40);
+        raw.addProperty("expiresTick", 450);
+        require(AgentMacroControl.canRenewWork(original, original, AgentWorkOrder.parse(raw, "run", "constrained")),
+            "an exact ordinary approach can retain its original grant and spent budget");
+        raw.getAsJsonObject("travelAnchor").addProperty("target", "wall-b");
+        require(!AgentMacroControl.canRenewWork(original, original, AgentWorkOrder.parse(raw, "run", "constrained")),
+            "a new target needs a new physical admission, never a renewal");
+        raw.getAsJsonObject("travelAnchor").addProperty("subject", "block:minecraft:lava");
+        require(AgentWorkOrder.parse(raw, "run", "constrained").policy() == null,
+            "a lava anchor is not a scoped ordinary approach");
     }
 
     @Test

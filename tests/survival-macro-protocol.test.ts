@@ -33,6 +33,44 @@ test("A prospect opening is a bounded dry wall clue, never a material opportunit
     safety: { clear: false, revision: 2 } })).toThrow("prospect opening scope");
 });
 
+test("Only supported near-term footing can carry a travel clue, never native input", () => {
+  const observation = {
+    v: 1, run: "run", life: 1, epoch: 1, tick: 20, goal: "diamond", health: 20, food: 20, stance: 1,
+    inventory: {}, opportunities: [], recent: [], quiescent: false, safety: { clear: true, revision: 1 },
+  };
+  const travelHint = { kind: "resource", subject: "block:minecraft:iron_ore", target: "vein-a",
+    footing: "shallow_water_with_bank", bearingDegrees: -8, windowBlocks: 0.7 } as const;
+  const live = parseMacroObservation({ ...observation, travelHint });
+  expect(live.travelHint).toEqual(travelHint);
+  expect(live.opportunities).toEqual([]);
+  expect(hasDirectAuthority({ kind: "continuation", opportunityId: travelHint.target, reserves: [],
+    steps: [{ selector: { verb: "break", subject: travelHint.subject }, maxEffects: 1, until: null }],
+  }, live, MACRO_CAPABILITIES_VERSION)).toBe(false);
+  for (const unsupported of [
+    { ...travelHint, footing: "deep_water" }, { ...travelHint, footing: "drop" }, { ...travelHint, footing: "unseen" },
+    { ...travelHint, windowBlocks: 0 }, { ...travelHint, windowBlocks: 80 }, { ...travelHint, opportunityId: "walk" },
+    { ...travelHint, kind: "cave_frontier" }, { ...travelHint, bearingDegrees: 181 },
+  ]) expect(() => parseMacroObservation({ ...observation, travelHint: unsupported })).toThrow("travel hint");
+  expect(() => parseMacroObservation({ ...observation, travelHint,
+    safety: { clear: false, revision: 2 } })).toThrow("travel hint scope");
+});
+
+test("A work approach names one target without pricing its material", () => {
+  const travelAnchor = { subject: "block:minecraft:stone", target: "wall-a" };
+  const order = {
+    v: 1, id: "iron-leg", run: "run", life: 1, epoch: 1, basisTick: 10, expiresTick: 100,
+    safetyRevision: 1, origin: "model", target: { kind: "stock", item: "minecraft:raw_iron", count: 1 },
+    allowedEffects: ["break:minecraft:iron_ore"], costCaps: [], reserves: [], maxBreaks: 2, maxCrafts: 0, maxPlacements: 0,
+    travelAnchor,
+  };
+  expect(parseMacroWorkOrder(order)).toMatchObject({ travelAnchor, allowedEffects: ["break:minecraft:iron_ore"] });
+  expect(() => parseMacroWorkOrder({ ...order, maxBreaks: 0 })).toThrow("work travel anchor scope");
+  expect(() => parseMacroWorkOrder({ ...order, duringWaitFor: "paid-iron" })).toThrow("work travel anchor scope");
+  expect(() => parseMacroWorkOrder({ ...order, travelAnchor: { ...travelAnchor, target: "../ore" } })).toThrow("travel anchor target");
+  expect(() => parseMacroWorkOrder({ ...order, travelAnchor: { ...travelAnchor, subject: "block:minecraft:oak_log" } }))
+    .toThrow("work travel anchor scope");
+});
+
 test("Work program caps apply across stages and a later job cannot lower an earlier reserve", () => {
   const log = "minecraft:oak_log";
   const stage = (item: string, maxBreaks: number, reserve: number, spend: number) => ({

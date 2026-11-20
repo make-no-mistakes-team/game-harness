@@ -389,6 +389,108 @@ const wallPolicy = { ...cavePolicy, allowedEffects: [...cavePolicy.allowedEffect
   reserves: [...cavePolicy.reserves, { item: "minecraft:raw_iron", count: 2 }] } as const;
 const wallState = { ...caveState, inventory: { ...caveState.inventory, "minecraft:raw_iron": 2 } } as const;
 
+const visibleTimber = { kind: "resource", subject: "block:minecraft:oak_log", target: "log-a",
+  footing: "dry", bearingDegrees: -12, windowBlocks: 0.9 } as const;
+const timberPolicy = { target: { kind: "stock", item: "minecraft:oak_log", count: 1 },
+  allowedEffects: ["break:minecraft:oak_log"], costCaps: [], reserves: [], maxBreaks: 2, maxCrafts: 0, maxPlacements: 0 } as const;
+
+test.each(["direct", "opening", "wake", "other log", "lost runway", "unsafe", "unanchored look",
+  "witness disappears", "clue used as ID", "yaw jitter"] as const)("A current approach can start only its scoped timber work (%s)", async condition => {
+  const requests: MacroRequest[] = [];
+  const reply = Promise.withResolvers<void>();
+  const freshReply = Promise.withResolvers<void>();
+  const direct = condition === "direct" || condition === "witness disappears" || condition === "clue used as ID" || condition === "yaw jitter";
+  const idle = condition === "wake" || condition === "yaw jitter";
+  const wrongOpening = condition === "other log" || condition === "unanchored look";
+  const view = condition === "unanchored look" ? caveSurvey : {
+    id: "inspect-log", verb: "inspect", risk: "read", summary: "Center the visible oak log",
+    evidence: "The visible log is next to the edge of the frame.", anchor: { subject: visibleTimber.subject, target: visibleTimber.target },
+  } as const;
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    if (idle && requests.length === 1) return workReply(request, { kind: "abstain" });
+    if (wrongOpening && requests.length > 1) {
+      await freshReply.promise;
+      return workReply(request, { kind: "work", policy: timberPolicy });
+    }
+    await reply.promise;
+    if (condition === "clue used as ID") return workReply(request, { kind: "opportunity", opportunityId: visibleTimber.target });
+    return workReply(request, { kind: "work", policy: timberPolicy,
+      ...(direct || condition === "wake" ? {} : { openingViewId: view.id }) });
+  }, "Collect oak logs from the visible tree.", idle || wrongOpening || condition === "lost runway" ? 2 : 1);
+  try {
+    await f.observe(16, { stance: 2, ...(direct ? { travelHint: visibleTimber } :
+      { opportunities: condition === "wake" ? [] : [view] }) });
+    if (idle) {
+      await f.actor.poll();
+      await f.observe(condition === "yaw jitter" ? 116 : 21, { stance: 2, travelHint: { ...visibleTimber, bearingDegrees: 2 } });
+    }
+    reply.resolve();
+    if (condition === "witness disappears") await f.observe(21, { stance: 2 });
+    else await f.actor.poll();
+    if (!direct && condition !== "wake") {
+      const travelHint = condition === "other log" ? { ...visibleTimber, target: "log-b" } : visibleTimber;
+      const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      await f.receipt(intent.id, 21, "accepted");
+      await f.receipt(intent.id, 26, "completed");
+      await f.observe(26, { stance: 2 });
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      await f.observe(31, { stance: 2, ...(condition === "unsafe" ? { safety: { clear: false, revision: 2 } } :
+        condition === "lost runway" ? {} : { travelHint }) });
+      if (condition === "lost runway") await f.observe(116, { stance: 2 });
+      if (wrongOpening) {
+        await f.observe(116, { stance: 2, travelHint });
+        expect(requests[1]).toMatchObject({ observation: { tick: 116, travelHint },
+          feedback: { kind: "opening_view_unconfirmed" }, lastReceipt: { id: intent.id, status: "completed" } });
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+        await expect(access(f.file("intent.json"))).rejects.toThrow();
+        freshReply.resolve();
+        await f.actor.poll();
+        expect(await f.order()).toMatchObject({ origin: "model", ...timberPolicy, basisTick: 116,
+          travelAnchor: { subject: travelHint.subject, target: travelHint.target } });
+      }
+    }
+    if (condition === "direct" || condition === "opening" || condition === "wake") {
+      expect(await f.order()).toMatchObject({ origin: "model", ...timberPolicy,
+        basisTick: condition === "direct" ? 16 : condition === "wake" ? 21 : 31,
+        travelAnchor: { subject: visibleTimber.subject, target: visibleTimber.target } });
+      expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 0, completedReceipts: 0 });
+    } else if (!wrongOpening) await expect(access(f.file("work.json"))).rejects.toThrow();
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    expect(requests).toHaveLength(condition === "wake" || wrongOpening ? 2 : 1);
+  } finally {
+    reply.resolve();
+    freshReply.resolve();
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test("An iron leg can begin at an exact visible cave frontier without granting a cover break", async () => {
+  const reply = Promise.withResolvers<void>();
+  const travelHint = { ...visibleTimber, kind: "cave_frontier", footing: "shallow_water_with_bank",
+    subject: "block:minecraft:stone", target: "frontier-a" } as const;
+  const policy = { ...timberPolicy, target: { kind: "stock", item: "minecraft:raw_iron", count: 1 },
+    allowedEffects: ["break:minecraft:iron_ore"], reserves: [{ item: "minecraft:stone_pickaxe", count: 1 }] } as const;
+  const f = await durableFixture(async request => {
+    await reply.promise;
+    expect(request.observation.travelHint).toEqual(travelHint);
+    return workReply(request, { kind: "work", policy });
+  }, "Find raw iron and keep the stone pickaxe.", 1);
+  try {
+    await f.observe(16, { stance: 4, inventory: { "minecraft:stone_pickaxe": 1 }, travelHint });
+    reply.resolve();
+    await f.actor.poll();
+    expect(await f.order()).toMatchObject({ ...policy, basisTick: 16,
+      travelAnchor: { subject: travelHint.subject, target: travelHint.target } });
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+  } finally {
+    reply.resolve();
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
 test.each(["wall", "priced loss", "unknown", "wrong rock", "not allowed", "ore only", "short quota", "lost tool", "lost floor",
   "unpriced loss", "loss crosses floor", "different ore anchor", "changed stance"] as const)(
   "Only a matching fresh wall can open a quoted excavation (%s)", async condition => {

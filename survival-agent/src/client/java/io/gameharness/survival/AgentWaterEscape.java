@@ -56,7 +56,7 @@ final class AgentWaterEscape {
     private int sector, proofAt, actionAt, gainAt, lipAt, attempts, drives, dryLossAt, itemBefore, evidenceCount;
     private float firstYaw;
     private double driftX, driftZ, bestDistance, originalDistance;
-    private boolean lowView, edited, useIssued, confirmedPlug, undoFinished, sawFrame, renderedScan;
+    private boolean lowView, edited, useIssued, confirmedPlug, undoFinished, sawFrame, renderedScan, allowEdits;
     private Lane target, pocket;
     private Plug plug, observedPlug;
     private Block placedBlock;
@@ -123,10 +123,11 @@ final class AgentWaterEscape {
         wetAnchor = null;
     }
 
-    void start() {
+    void start(boolean allowEdits) {
         tried.clear();
         attempts = drives = 0;
         edited = false;
+        this.allowEdits = allowEdits;
         origin = player.getPos();
         began = body.actionTick();
         beginDrift(began);
@@ -394,7 +395,7 @@ final class AgentWaterEscape {
     }
 
     private Plug findPlug(Vec3d feet, BlockPos base) {
-        if (hands.count(FILL) == 0) return null;
+        if (!allowEdits || hands.count(FILL) == 0) return null;
         for (int dy = 0; dy <= 1; dy++) {
             BlockPos cell = base.up(dy);
             Vec3d water = Vec3d.ofCenter(cell, 0.095);

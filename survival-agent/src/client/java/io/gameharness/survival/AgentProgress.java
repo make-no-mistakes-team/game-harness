@@ -397,6 +397,8 @@ final class AgentProgress {
     private int sprintClearFrom;
     private int sprintClearTick = -10;
     private Vec3d approachGoal;
+    private AgentBody.HorizonTravel ordinaryApproach;
+    private int ordinaryApproachTick;
     private int approachDeadline;
     private double approachNearest;
     private int retreatUntil;
@@ -838,6 +840,18 @@ final class AgentProgress {
             status = defense.status();
             return;
         }
+        // Higher danger/fall/defense owners have already declined. Merely
+        // touching water does not cancel an actual, still-witnessed shallow
+        // crossing. Losing that exact envelope transfers to water safety now.
+        boolean shallowInFlight = body.horizonWaterInFlight();
+        boolean plannedShallows = shallowInFlight && body.horizonControlsWater();
+        if ((shallowInFlight || stallGuard.controlsWaterRecovery()) && stallGuard.takeWaterTurn(plannedShallows
+                || !macroEngaged && caves.controlsWater(tick), shallowInFlight && !plannedShallows, stallReplan, stallRelease)) {
+            body.prioritizeMovement();
+            status = stallGuard.status();
+            if (macroEngaged) macro.urgent(status);
+            return;
+        }
         if (macroEngaged) {
             if (!hands.busy() && c.currentScreen == null && defense.checkZombieCue(ears, tick,
                     nextFoot != null || c.options.attackKey.isPressed() && c.interactionManager.isBreakingBlock())) {
@@ -873,8 +887,14 @@ final class AgentProgress {
             status = defense.status();
             return;
         }
-        boolean plannedWater = caves.controlsWater(tick);
-        if (stallGuard.takeWaterTurn(plannedWater, stallReplan, stallRelease)) {
+        if (plannedShallows && ordinaryApproach != null && ordinaryApproachTick == tick - 1) {
+            ordinaryApproachTick = tick;
+            if (body.driveHorizon(ordinaryApproach, false, false) != AgentBody.HorizonResult.BLOCKED) {
+                status = "wading toward the witnessed dry bank";
+                return;
+            }
+        }
+        if (stallGuard.takeWaterTurn(caves.controlsWater(tick) || plannedShallows, false, stallReplan, stallRelease)) {
             body.prioritizeMovement();
             status = stallGuard.status();
             return;
@@ -3607,7 +3627,7 @@ final class AgentProgress {
         if (timberCanopy != null) {
             if (tick < timberCanopyUntil) {
                 if (!timberCanopyPeeking && horizontalDistance(feet, timberCanopy) > 1.8
-                    && approach(new Vec3d(timberCanopy.x, feet.y, timberCanopy.z), false, false) != Walk.BLOCKED) {
+                    && approachOrdinary(perceive(timberCanopy, SEARCH), timberCanopy, 1.65, true) != Walk.BLOCKED) {
                     status = "approaching a visible tree canopy";
                     return true;
                 }
@@ -4529,7 +4549,7 @@ final class AgentProgress {
             status = "approaching the witnessed trunk";
             if (distance <= 5.3 && timberApproachSince == 0) timberApproachSince = tick;
             if ((timberApproachSince == 0 || tick - timberApproachSince < 48)
-                && approach(base, false, false) != Walk.BLOCKED) return true;
+                && approachOrdinary(timberWitness, base, 2.10, true) != Walk.BLOCKED) return true;
             if (distance > 5.3)
                 return startTimberReposition(yaw(base.subtract(feet))) || finishTimber("timber target exhausted: approach blocked");
         }
@@ -4949,7 +4969,7 @@ final class AgentProgress {
         }
         if (distance > REACH - 0.35) {
             status = "approaching " + resource.label;
-            if (approach(targetPoint, false, false) == Walk.BLOCKED) abandonTarget();
+            if (approachOrdinary(perceive(targetPoint, SEARCH), targetPoint, 0.92, true) == Walk.BLOCKED) abandonTarget();
             return;
         }
         body.aim(targetPoint);
@@ -4964,7 +4984,7 @@ final class AgentProgress {
                 target = null;
             } else if (horizontalDistance(c.player.getPos(), targetPoint) > 0.72) {
                 // A ramp changes the viewing angle; walk around the masking near face before giving up.
-                if (approach(targetPoint, false, false) == Walk.BLOCKED) abandonTarget();
+                if (approachOrdinary(perceive(targetPoint, SEARCH), targetPoint, 0.62, true) == Walk.BLOCKED) abandonTarget();
             } else {
                 abandonTarget();
             }
@@ -7604,6 +7624,32 @@ final class AgentProgress {
     }
 
     /** Advance toward the target along a lane selected from the present view. */
+    private Walk approachOrdinary(BlockHitResult witness, Vec3d point, double arrival, boolean wade) {
+        Vec3d feet = c.player.getPos();
+        boolean continuing = ordinaryApproach != null && ordinaryApproachTick == tick - 1
+            && horizontalDistance(point, ordinaryApproach.goal) < 0.55;
+        if (!continuing) {
+            var cue = witness == null ? null : body.visibleHorizon().target(witness);
+            if (cue == null || horizontalDistance(cue.point(), point) > 0.85) return Walk.BLOCKED;
+            // Use the ray's bearing, not the stored block center or an unseen adjacent stance.
+            ordinaryApproach = new AgentBody.HorizonTravel(cue, new Vec3d(cue.point().x, feet.y, cue.point().z),
+                arrival, wade);
+        }
+        ordinaryApproachTick = tick;
+        return switch (body.driveHorizon(ordinaryApproach, false, false)) {
+            case MOVING -> {
+                rememberMotion();
+                yield Walk.MOVING;
+            }
+            case SETTLING -> Walk.LOOKING;
+            case ARRIVED, BLOCKED -> {
+                body.stopHorizonTravel(ordinaryApproach);
+                ordinaryApproach = null;
+                yield Walk.BLOCKED;
+            }
+        };
+    }
+
     private Walk approach(Vec3d point, boolean sprint, boolean allowWater) {
         return approach(point, sprint, allowWater, false);
     }

@@ -5,6 +5,7 @@ import java.util.BitSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import net.minecraft.block.Block;
@@ -620,14 +621,15 @@ final class AgentProgress {
     ReturnableDrop returnableDrop() { return returnableDrop; }
     AgentFall fall() { return fall; }
     AgentDryCaveRoute.Offer dryRouteOffer() { return caves.dryRouteOffer(); }
+    AgentDryCaveRoute.LevelPassage dryLevelPassage(BlockPos from, BlockPos to) { return caves.dryLevelPassage(from, to); }
     AgentDryCaveRoute.Survey drySurveyOffer() { return caves.drySurveyOffer(); }
     boolean drySurveyCurrent(AgentDryCaveRoute.Survey offer) { return caves.drySurveyCurrent(offer); }
     AgentDryCaveRoute.SurveyResult surveyDryRoute(AgentDryCaveRoute.Survey offer) { return caves.surveyDryRoute(offer); }
     String drySurveyResult(AgentDryCaveRoute.Survey offer) { return caves.drySurveyResult(offer); }
     void cancelDrySurvey(AgentDryCaveRoute.Survey offer) { caves.cancelDrySurvey(offer); }
     String dryRouteOfferEvidence() { return caves.dryRouteOfferEvidence(); }
-    AgentDryCaveRoute.DirectResult followDryRoute(AgentDryCaveRoute.Offer offer) {
-        return caves.followDryRoute(offer, tick);
+    AgentDryCaveRoute.DirectResult followDryRoute(AgentDryCaveRoute.Offer offer, Consumer<AgentSurfaceTread.Edge> landed) {
+        return caves.followDryRoute(offer, tick, landed);
     }
     String dryRouteReason() { return caves.dryRouteReason(); }
     void cancelFollowDryRoute(AgentDryCaveRoute.Offer offer) { caves.cancelFollowDryRoute(offer); }

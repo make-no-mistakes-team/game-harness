@@ -118,14 +118,16 @@ final class AgentCaves {
     void walkedDry(BlockPos from, BlockPos to) { dryRoute.walked(from, to); }
     void witnessedDry(BlockPos from, BlockPos to) { dryRoute.witnessed(from, to); }
     AgentDryCaveRoute.Offer dryRouteOffer() { return dryRoute.offer(); }
+    AgentDryCaveRoute.LevelPassage dryLevelPassage(BlockPos from, BlockPos to) { return dryRoute.levelPassage(from, to); }
     AgentDryCaveRoute.Survey drySurveyOffer() { return dryRoute.surveyOffer(); }
     boolean drySurveyCurrent(AgentDryCaveRoute.Survey offer) { return dryRoute.surveyCurrent(offer); }
     AgentDryCaveRoute.SurveyResult surveyDryRoute(AgentDryCaveRoute.Survey offer) { return dryRoute.surveyDirect(offer); }
     String drySurveyResult(AgentDryCaveRoute.Survey offer) { return dryRoute.surveyEvidence(offer); }
     void cancelDrySurvey(AgentDryCaveRoute.Survey offer) { dryRoute.cancelSurvey(offer); }
     String dryRouteOfferEvidence() { return dryRoute.offerEvidence(); }
-    AgentDryCaveRoute.DirectResult followDryRoute(AgentDryCaveRoute.Offer offer, int tick) {
-        return dryRoute.follow(offer, tick);
+    AgentDryCaveRoute.DirectResult followDryRoute(AgentDryCaveRoute.Offer offer, int tick,
+                                                  Consumer<AgentSurfaceTread.Edge> landed) {
+        return dryRoute.follow(offer, tick, landed);
     }
     String dryRouteReason() { return dryRoute.directReason(); }
     void cancelFollowDryRoute(AgentDryCaveRoute.Offer offer) { dryRoute.cancel(offer); }
@@ -392,9 +394,11 @@ final class AgentCaves {
         };
         status = "checking lit cave ledges for a walkable step";
         BlockPos ahead = stance.offset(travel);
+        if (!seen(ahead) && beginShelf(ahead, tick)) return true;
         look(Vec3d.ofBottomCenter(ahead), age < 12 ? -28 : age < 23 ? 13 : 61);
-        // Floor and headroom often come into frame at different pitches; proofs are local to this stance.
+        // Only the vertical alternatives still need positive upper and takeoff witnesses.
         for (int i = 0; i < proof.length; i++) {
+            if (i == 1) continue;
             BlockPos foot = ahead.up(i - 1);
             if (seen(foot)) continue;
             proof[i] = checkStep(foot, travel, proof[i]);
@@ -468,9 +472,12 @@ final class AgentCaves {
 
     /** Established local shelf work uses the same chosen dry sweep and motor as graph movement. */
     private boolean beginShelf(BlockPos foot, int tick) {
-        if (!player.isOnGround() || !player.getBlockPos().equals(stance)
-                || body.dryRouteFloor(floorAim(foot, travel), foot.down()) == null
-                || !body.dryRouteSweep(stance, foot)) return false;
+        if (!player.isOnGround() || !player.getBlockPos().equals(stance)) return false;
+        if (stance.getY() == foot.getY()) {
+            if (dryRoute.levelPassage(stance, foot) != AgentDryCaveRoute.LevelPassage.WITNESSED
+                    || !body.walkedLaneDry(stance, foot, travel)) return false;
+        } else if (body.dryRouteFloor(floorAim(foot, travel), foot.down()) == null) return false;
+        if (!body.dryRouteSweep(stance, foot)) return false;
         destination = foot;
         shelfLast = player.getPos();
         shelfMoves = 0;
@@ -483,6 +490,8 @@ final class AgentCaves {
         if (shelfMotorTick + 1 != body.actionTick())
             return finish(tick, "local cave shelf interrupted; reobserve before moving");
         shelfMotorTick = body.actionTick();
+        if (stance.getY() == destination.getY() && !body.walkedLaneDry(stance, destination, travel))
+            return finish(tick, "local cave shelf refused: the exact level lane is no longer dry");
         Vec3d feet = player.getPos();
         if (feet.squaredDistanceTo(shelfLast) > 0.31)
             return finish(tick, "local cave shelf refused: actual body path was not contiguous");

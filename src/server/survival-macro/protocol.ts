@@ -76,6 +76,8 @@ export interface MacroOpportunity {
   readonly summary: string;
   readonly risk: "read" | "low" | "guarded";
   readonly evidence: string;
+  /** Stable identity of a rendered local clue, independent of the offer ID or camera bearing. */
+  readonly anchor?: { readonly subject: string; readonly target: string };
   /** Native evidence for a guarded primitive or a read-only water clue; spends bound item-count loss. */
   readonly material?: {
     readonly subject: string;
@@ -83,6 +85,9 @@ export interface MacroOpportunity {
     readonly spends: Readonly<Record<string, number>>;
   };
 }
+
+const prospectRock = ["minecraft:stone", "minecraft:deepslate", "minecraft:andesite",
+  "minecraft:diorite", "minecraft:granite", "minecraft:tuff"] as const;
 
 export interface MacroObservation extends MacroBasis {
   readonly v: 1;
@@ -93,6 +98,8 @@ export interface MacroObservation extends MacroBasis {
   readonly opportunities: readonly MacroOpportunity[];
   readonly recent: readonly string[];
   readonly quiescent: boolean;
+  /** Native stance generation; camera turns and inventory changes do not advance it. */
+  readonly stance?: number;
   readonly safety?: { readonly clear: boolean; readonly revision: number };
   /** A matching accepted break had actual vanilla crack progress this tick. */
   readonly working?: { readonly intentId: string; readonly crack: number };
@@ -100,6 +107,13 @@ export interface MacroObservation extends MacroBasis {
   readonly workOrder?: MacroWorkState;
   /** A process in the world, not inventory, a completed effect or a permission. */
   readonly pendingWork?: MacroPendingWork;
+  /** A reachable dry natural wall contact, not a selectable opportunity or a proved passage. */
+  readonly prospectOpening?: {
+    readonly block: (typeof prospectRock)[number];
+    readonly target: string;
+    readonly tool: string;
+    readonly maxToolLoss: 0 | 1;
+  };
 }
 
 export interface MacroIntent {
@@ -268,6 +282,8 @@ export interface MacroWorkDemand {
   readonly parkedWorksite?: "settled" | "view-unavailable";
   /** Accepted production dependency, not spendable stock. Absent for historical tickets. */
   readonly pendingPredecessor?: { readonly id: string; readonly queuedTarget?: MacroWorkTarget };
+  /** Available camera-only openings for a single ordinary work policy. */
+  readonly openingViewIds?: readonly string[];
   /** The original model's stated reason, not evidence or a dependent authorization. */
   readonly pendingPurpose?: { readonly id: string; readonly subgoal: string; readonly reason: string };
   readonly lastOutcome: {
@@ -315,7 +331,8 @@ export interface MacroProposal {
     | { readonly kind: "opportunity"; readonly opportunityId: string }
     | MacroDirectAction
     | MacroSuccessor
-    | { readonly kind: "work"; readonly policy: MacroWorkPolicy; readonly afterWorkId?: string; readonly duringWaitFor?: string;
+    | { readonly kind: "work"; readonly policy: MacroWorkPolicy; readonly openingViewId?: string;
+        readonly afterWorkId?: string; readonly duringWaitFor?: string;
         readonly duringWait?: { readonly policy: MacroWorkPolicy; readonly maxTicks: number } }
     | { readonly kind: "work-program"; readonly stages: readonly MacroWorkStage[]; readonly afterWorkId?: string }
     | { readonly kind: "renew-work"; readonly workOrderId: string }
@@ -420,6 +437,7 @@ const replyRejections = {
   wrong_preset_goal: "A preset work target must equal the live invocation goal.",
   active_work: "An active job admits work policies, a scoped revoke, a genuine gap, or abstention; not a primitive or skill.",
   missing_opportunity: "Select an exact opportunityId offered in the current observation.",
+  opening_view: "Use an offered openingViewId only for a camera check relevant to the quoted physical job; otherwise use ordinary work without it.",
   guarded_opportunity: "Constrained work mode does not admit guarded primitives. Use a bounded work policy with explicit costs and reserves for supported effects.",
   continuation: "A continuation needs direct authority and currently witnessed material selectors. Constrained mode does not admit continuations.",
   candidate: "A skill candidate must use the offered skillGeneration and only admitted skillVerbs.",
@@ -719,7 +737,7 @@ function directMaterialPrefix(verb: string): string | undefined {
 export function parseMacroObservation(value: unknown): MacroObservation {
   const record = shape(value, "observation", [
     "v", "run", "life", "tick", "epoch", "goal", "health", "food", "inventory", "opportunities", "recent", "quiescent",
-  ], ["safety", "working", "workOrder", "pendingWork"]);
+  ], ["safety", "working", "workOrder", "pendingWork", "stance", "prospectOpening"]);
   const inventory = Object.create(null) as Record<string, number>;
   const entries = Object.entries(object(record.inventory, "inventory"));
   if (entries.length > 128) invalid("inventory");
@@ -728,7 +746,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
   }
   const ids = new Set<string>();
   const opportunities = bounds(record.opportunities, "opportunities", 64).map(value => {
-    const offer = shape(value, "opportunity", ["id", "verb", "summary", "risk", "evidence"], ["material"]);
+    const offer = shape(value, "opportunity", ["id", "verb", "summary", "risk", "evidence"], ["material", "anchor"]);
     const id = validateMacroId(offer.id, "opportunity id");
     if (ids.has(id)) invalid("duplicate opportunity id");
     ids.add(id);
@@ -736,6 +754,17 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     const risk = choice(offer.risk, "risk", ["read", "low", "guarded"] as const);
     const waterClue = verb === MACRO_WATER_CLUE;
     if (waterClue && risk !== "read") invalid("water clue risk");
+    let anchor: MacroOpportunity["anchor"];
+    if (Object.hasOwn(offer, "anchor")) {
+      const raw = shape(offer.anchor, "rendered anchor", ["subject", "target"]);
+      const subject = itemKey(raw.subject, "rendered anchor subject");
+      const valid = verb === "inspect" && risk === "read" || verb === "survey" && risk === "read"
+        ? subject.startsWith("block:minecraft:")
+        : (verb === "survey" && risk === "guarded" || verb === "follow" && risk === "guarded" ||
+            verb === "approach" && risk === "low") && subject === "route:dry";
+      if (!valid) invalid("rendered anchor subject/verb");
+      anchor = Object.freeze({ subject, target: validateMacroId(raw.target, "rendered anchor target") });
+    }
     let material: MacroOpportunity["material"];
     if (Object.hasOwn(offer, "material")) {
       const prefix = directMaterialPrefix(verb);
@@ -753,6 +782,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     return Object.freeze({
       id, verb, summary: text(offer.summary, "summary", 512), risk,
       evidence: text(offer.evidence, "evidence", 512),
+      ...(anchor ? { anchor } : {}),
       ...(material ? { material } : {}),
     });
   });
@@ -834,13 +864,29 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     invalid("unscoped low-risk dry follow");
   if (opportunities.some(offer => offer.verb === "survey" && offer.risk === "low"))
     invalid("unscoped low-risk cave survey");
+  let prospectOpening: MacroObservation["prospectOpening"];
+  if (Object.hasOwn(record, "prospectOpening")) {
+    const raw = shape(record.prospectOpening, "prospect opening", ["block", "target", "tool", "maxToolLoss"]);
+    if (record.stance === undefined || !safety?.clear || working || pendingWork || workOrder?.state === "working")
+      invalid("prospect opening scope");
+    const { maxToolLoss } = raw;
+    if (maxToolLoss !== 0 && maxToolLoss !== 1) invalid("prospect opening tool loss");
+    prospectOpening = Object.freeze({
+      block: choice(raw.block, "prospect opening rock", prospectRock),
+      target: validateMacroId(raw.target, "prospect opening target"),
+      tool: vanillaItem(raw.tool, "prospect opening tool"),
+      maxToolLoss,
+    });
+  }
   return Object.freeze({
     v: version(record.v), ...basis(record), goal: text(record.goal, "goal", 256),
     health: finite(record.health, "health", 1_024), food: whole(record.food, "food", 0, 20),
     inventory: Object.freeze(inventory), opportunities: Object.freeze(opportunities),
     recent: Object.freeze(bounds(record.recent, "recent", 32).map(entry => text(entry, "recent entry", 512))),
     quiescent: record.quiescent, ...(safety ? { safety } : {}), ...(working ? { working } : {}),
+    ...(prospectOpening ? { prospectOpening } : {}),
     ...(workOrder ? { workOrder } : {}), ...(pendingWork ? { pendingWork } : {}),
+    ...(Object.hasOwn(record, "stance") ? { stance: whole(record.stance, "stance", 1) } : {}),
   });
 }
 
@@ -934,14 +980,16 @@ export function parseMacroProposal(value: unknown): MacroProposal {
   let action: MacroProposal["action"];
   switch (kind) {
     case "work": {
-      shape(rawAction, "work action", ["kind", "policy"], ["afterWorkId", "duringWaitFor", "duringWait"]);
+      shape(rawAction, "work action", ["kind", "policy"], ["afterWorkId", "duringWaitFor", "duringWait", "openingViewId"]);
       const policy = parseMacroWorkPolicy(rawAction.policy);
       const afterWorkId = Object.hasOwn(rawAction, "afterWorkId") ? validateMacroId(rawAction.afterWorkId, "predecessor work id") : undefined;
       const duringWaitFor = Object.hasOwn(rawAction, "duringWaitFor") ? validateMacroId(rawAction.duringWaitFor, "pending ticket id") : undefined;
       const contingent = Object.hasOwn(rawAction, "duringWait") ? shape(rawAction.duringWait, "quoted pending side policy", ["policy", "maxTicks"]) : undefined;
-      if (Number(!!afterWorkId) + Number(!!duringWaitFor) + Number(!!contingent) > 1 ||
+      const openingViewId = Object.hasOwn(rawAction, "openingViewId") ? validateMacroId(rawAction.openingViewId, "opening view id") : undefined;
+      if (Number(!!afterWorkId) + Number(!!duringWaitFor) + Number(!!contingent) + Number(!!openingViewId) > 1 ||
           (contingent && !policy.allowedEffects.includes(MACRO_IRON_SMELT))) invalid("exclusive work relationship");
       action = { kind, policy: duringWaitFor ? pendingOrdinaryPolicy(policy) : policy,
+        ...(openingViewId ? { openingViewId } : {}),
         ...(afterWorkId ? { afterWorkId } : {}),
         ...(duringWaitFor ? { duringWaitFor } : {}),
         ...(contingent ? { duringWait: Object.freeze({ policy: pendingSidePolicy(parseMacroWorkPolicy(contingent.policy)),
@@ -1040,6 +1088,19 @@ export function matchesMaterial(offer: MacroOpportunity, selector: MacroDirectAc
   return offer.risk === "guarded" && offer.verb === selector.verb && offer.material?.subject === selector.subject;
 }
 
+export function isOpeningView(offer: MacroOpportunity): boolean {
+  return offer.verb === "survey" && (offer.anchor ? offer.risk === "guarded" && offer.anchor.subject === "route:dry" :
+    offer.risk === "read") || offer.verb === "inspect" && offer.risk === "read" && !!offer.anchor;
+}
+
+export function openingViewMatchesPolicy(offer: MacroOpportunity, policy: MacroWorkPolicy): boolean {
+  return isOpeningView(offer) && policy.target.kind === "stock" && policy.maxBreaks > 0 &&
+    policy.allowedEffects.some(effect => effect.startsWith("break:")) &&
+    !policy.allowedEffects.includes(MACRO_IRON_SMELT) && !policy.allowedEffects.includes(MACRO_WATER_FILL) &&
+    (!offer.anchor || (offer.anchor.subject === "route:dry" ? policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT) :
+      policy.allowedEffects.includes(`break:${offer.anchor.subject.slice("block:".length)}`)));
+}
+
 export function hasDirectAuthority(action: MacroDirectAction, observation: MacroObservation, capabilitiesVersion: string): boolean {
   const first = action.steps[0];
   return !!first && capabilitiesVersion === MACRO_CAPABILITIES_VERSION && observation.safety?.clear === true &&
@@ -1057,10 +1118,10 @@ export function sameLiveCorrectionScope(source: MacroObservation, current: Macro
 
 export function liveCorrectionEvidence(observation: MacroObservation): string {
   // A new heartbeat or a reissued opaque ID is not a new opportunity.
-  const offers = observation.opportunities.map(({ verb, summary, risk, evidence, material }) =>
-    JSON.stringify([verb, summary, risk, evidence, material])).sort();
+  const offers = observation.opportunities.map(({ verb, summary, risk, evidence, material, anchor }) =>
+    JSON.stringify(anchor ? [verb, risk, anchor, material] : [verb, summary, risk, evidence, material])).sort();
   const pending = observation.pendingWork;
-  return JSON.stringify([observation.quiescent, offers,
+  return JSON.stringify([observation.quiescent, offers, observation.prospectOpening ?? null,
     pending ? [pending.id, pending.state, pending.parked, pending.yieldable, !!pending.collectOfferId, !!pending.deferOfferId] : null,
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b))]);
 }

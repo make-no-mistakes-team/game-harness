@@ -2,6 +2,7 @@ package io.gameharness.survival;
 
 import java.util.Optional;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
 import net.minecraft.block.Block;
@@ -17,8 +18,10 @@ import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityPose;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.attribute.EntityAttributes;
 import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.mob.EndermanEntity;
 import net.minecraft.entity.mob.Monster;
@@ -127,6 +130,11 @@ final class AgentBody {
     private final Matrix4f inverseViewProjection = new Matrix4f();
     private final Vector4f clip = new Vector4f();
     private final BlockPos.Mutable lightPos = new BlockPos.Mutable();
+    private final AgentDryCaveRoute.ProbeView caveProbeView = new AgentDryCaveRoute.ProbeView() {
+        @Override public DryRouteTop top(Vec3d point, BlockPos support) { return dryCaveTop(point, support); }
+        @Override public DryRouteSample space(Vec3d point) { return dryCaveSpace(point); }
+        @Override public BlockState state(BlockPos pos) { return client.world.getBlockState(pos); }
+    };
     private final BlockPos.Mutable overlandProbe = new BlockPos.Mutable();
     private final BlockHitResult[] samples = new BlockHitResult[COLUMNS * ROWS];
     private final AgentHazards hazards = new AgentHazards();
@@ -1559,8 +1567,9 @@ final class AgentBody {
             ? DryRouteTop.WITNESSED : distinguishUnsuitable ? DryRouteTop.UNSUITABLE_TOP : DryRouteTop.NO_FULL_TOP;
     }
 
-    private static boolean matchesDryRouteTop(BlockHitResult hit, BlockPos floor) {
-        return floor.equals(hit.getBlockPos()) && hit.getSide() == Direction.UP
+    static boolean matchesDryRouteTop(BlockHitResult hit, BlockPos floor) {
+        return hit != null && hit.getType() == HitResult.Type.BLOCK
+            && floor.equals(hit.getBlockPos()) && hit.getSide() == Direction.UP
             && Math.abs(hit.getPos().y - floor.getY() - 1) <= 0.035;
     }
 
@@ -1569,6 +1578,41 @@ final class AgentBody {
     }
 
     boolean dryRouteView() { return hasView(); }
+
+    boolean dryRoutePointInView(Vec3d point) { return hasView() && inView(point); }
+
+    /** Allow one new row (at most eight rays) without spending the near-edge reserve. */
+    boolean dryRouteHorizonRoom() { return raysLeft >= 16; }
+
+    boolean dryRouteRaysSpent() { return raysLeft <= 0; }
+
+    AgentDryCaveRoute.ProbeView dryCaveProbeView() { return caveProbeView; }
+
+    private DryRouteTop dryCaveTop(Vec3d point, BlockPos floor) {
+        DryRouteTop top = dryRouteTop(point, floor);
+        return top == DryRouteTop.WITNESSED && dryCaveDanger(client.world.getBlockState(floor))
+            ? DryRouteTop.UNSUITABLE_TOP : top;
+    }
+
+    DryRouteSample dryCaveSpace(Vec3d point) {
+        DryRouteSample sample = dryRouteClear(point);
+        // Only a lit, unoccluded ray supplies an endpoint to classify.
+        return sample == DryRouteSample.CLEAR && dryCaveDanger(client.world.getBlockState(BlockPos.ofFloored(point)))
+            ? DryRouteSample.OBSTRUCTION : sample;
+    }
+
+    BlockState dryCaveContact(BlockPos foot) {
+        var player = client.player;
+        if (player == null || !player.isOnGround() || !player.getBlockPos().equals(foot)
+                || Math.abs(player.getY() - foot.getY()) > 0.055) return null;
+        BlockPos floor = foot.down();
+        BlockState state = client.world.getBlockState(floor);
+        return !dryCaveDanger(state) && stableDryRouteTop(floor, state) ? state : null;
+    }
+
+    static boolean dryCaveDanger(BlockState state) {
+        return !state.getFluidState().isEmpty() || AgentProgress.dangerous(state) || state.isOf(Blocks.COBWEB);
+    }
 
     /** A full, visible surface top. Falling material gets a separate under-load veto, not a cave proof. */
     BlockState overlandTop(BlockPos floor, Direction travel, Predicate<BlockState> dangerous) {
@@ -1664,7 +1708,7 @@ final class AgentBody {
 
     void trackWalkedRoutes(AgentWalkedRoute routes) { walkedRoutes = routes; }
 
-    /** Called by an ordinary actuator on actual settled arrival, never from idle position samples. */
+    /** Called by an ordinary actuator on actual grounded arrival, never from idle position samples. */
     void recordWalkedLeg(BlockPos from, BlockPos to) {
         if (walkedRoutes == null || !hasView() || lavaEmergency || macroLavaNear()) return;
         var player = client.player;
@@ -1673,8 +1717,11 @@ final class AgentBody {
                 || Math.abs(player.getY() - to.getY()) > 0.055) return;
         int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ();
         Direction travel = dx == 0 ? dz > 0 ? Direction.SOUTH : Direction.NORTH : dx > 0 ? Direction.EAST : Direction.WEST;
-        if (walkedLaneDry(from, to, travel) && AgentSurfaceTread.retainedLaneClear(client, from, to, travel))
-            walkedRoutes.landed(from.asLong(), to.asLong());
+        if (walkedLaneDry(from, to, travel) && AgentSurfaceTread.retainedLaneClear(client, from, to, travel)) {
+            if (walkedRoutes.recoveringWalk())
+                walkedRoutes.landed(from, client.world.getBlockState(from.down()), to, client.world.getBlockState(to.down()), travel);
+            else walkedRoutes.landed(from.asLong(), to.asLong());
+        }
     }
 
     /** A veto on two already-attested columns, not a source of new navigation targets. */
@@ -1686,10 +1733,9 @@ final class AgentBody {
     private boolean walkedColumnDry(BlockPos foot, boolean stair) {
         var probe = walkedProbe.set(foot.getX(), foot.getY() - 1, foot.getZ());
         BlockState support = client.world.getBlockState(probe);
-        if (!stableDryRouteTop(probe, support) || AgentProgress.dangerous(support)) return false;
+        if (!stableDryRouteTop(probe, support) || dryCaveDanger(support)) return false;
         for (int y = 0; y <= (stair ? 2 : 1); y++) {
-            BlockState state = client.world.getBlockState(probe.move(Direction.UP));
-            if (!state.getFluidState().isEmpty() || AgentProgress.dangerous(state)) return false;
+            if (dryCaveDanger(client.world.getBlockState(probe.move(Direction.UP)))) return false;
         }
         return true;
     }
@@ -1706,6 +1752,66 @@ final class AgentBody {
         return offset == Direction.DOWN
             ? Vec3d.ofCenter(anchor, 0.96).add(bearing.getOffsetX() * 0.30, 0, bearing.getOffsetZ() * 0.30)
             : Vec3d.ofCenter(anchor, 0.77).add(-offset.getOffsetX() * 0.46, 0, -offset.getOffsetZ() * 0.46);
+    }
+
+    // Reserve both air samples, the four attachment rays, and the normal contact rechecks.
+    boolean footholdRaysAvailable() { return raysLeft >= 14; }
+
+    private static Direction footholdOffset(int index, Direction bearing) {
+        return switch (index) {
+            case 0 -> bearing;
+            case 1 -> bearing.rotateYClockwise();
+            case 2 -> bearing.rotateYCounterclockwise();
+            default -> Direction.DOWN;
+        };
+    }
+
+    static boolean footholdFaceInEnvelope(BlockHitResult hit, BlockPos cell, Direction bearing) {
+        return hit != null && hit.getType() == HitResult.Type.BLOCK && !hit.isInsideBlock()
+            && hit.getSide() != Direction.DOWN && hit.getSide() != bearing
+            && hit.getBlockPos().offset(hit.getSide()).equals(cell);
+    }
+
+    /** Read all four eligible contacts from this render; candidate ray points never become camera goals. */
+    BlockHitResult visibleFootholdAttachment(BlockPos cell, Direction bearing, Vec3d low, Vec3d high, double reach) {
+        if (!hasView() || client.player.getBoundingBox().intersects(new Box(cell))) return null;
+        var selected = selectedFace();
+        var player = client.player;
+        var look = player.getRotationVector(observedPitch, observedYaw);
+        BlockHitResult best = null;
+        double bestAlignment = -1;
+        if (footholdFaceInEnvelope(selected, cell, bearing)
+                && selected.getPos().squaredDistanceTo(eye) <= reach * reach
+                && footholdAttachment(selected, cell) && framesFoothold(selected.getPos(), low, high)) {
+            best = selected;
+            bestAlignment = look.dotProduct(selected.getPos().subtract(eye).normalize());
+        }
+        for (int i = 0; i < 4; i++) {
+            Direction offset = footholdOffset(i, bearing);
+            BlockPos anchor = cell.offset(offset);
+            Vec3d point = footholdAttachmentAim(anchor, offset, bearing);
+            if (!inView(point)) continue;
+            BlockHitResult hit = visibleHit(point, Ray.FLUIDS);
+            if (hit == null || !hit.getBlockPos().equals(anchor) || hit.getSide() != offset.getOpposite()
+                    || hit.isInsideBlock() || hit.getPos().squaredDistanceTo(eye) > reach * reach
+                    || !stableFootholdAnchor(anchor) || !framesFoothold(hit.getPos(), low, high)) continue;
+            double alignment = look.dotProduct(hit.getPos().subtract(eye).normalize());
+            if (alignment > bestAlignment) {
+                best = hit;
+                bestAlignment = alignment;
+            }
+        }
+        return best;
+    }
+
+    private boolean framesFoothold(Vec3d contact, Vec3d low, Vec3d high) {
+        // Projection only. The two fresh rays must still prove dry air after making this turn.
+        Vec3d eye = client.player.getEyePos();
+        double x = contact.x - eye.x, y = contact.y - eye.y, z = contact.z - eye.z;
+        float yaw = heading(x, z);
+        float pitch = (float) -Math.toDegrees(Math.atan2(y, Math.hypot(x, z)));
+        Vec3d feet = client.player.getPos();
+        return macroRetainsView(low, feet, yaw, pitch) && macroRetainsView(high, feet, yaw, pitch);
     }
 
     /** Verify this exact adjacent build cell through a lit, unobstructed first-person ray. */
@@ -1738,8 +1844,12 @@ final class AgentBody {
                 || !anchor.getBlockPos().offset(anchor.getSide()).equals(destination)
                 || client.player.getBoundingBox().intersects(new Box(destination))
                 || !sameBlockFace(anchor, contactRay(anchor.getPos(), client.player.getBlockInteractionRange()))) return false;
-        var material = client.world.getBlockState(anchor.getBlockPos());
-        return stableDryRouteTop(anchor.getBlockPos(), material) && !material.hasBlockEntity()
+        return stableFootholdAnchor(anchor.getBlockPos());
+    }
+
+    private boolean stableFootholdAnchor(BlockPos anchor) {
+        var material = client.world.getBlockState(anchor);
+        return stableDryRouteTop(anchor, material) && !material.hasBlockEntity()
             && !material.isOf(Blocks.CRAFTING_TABLE) && !material.isOf(Blocks.FURNACE);
     }
 
@@ -1754,6 +1864,23 @@ final class AgentBody {
     }
 
     private DryRouteVeto dryRouteVeto(BlockPos from, BlockPos to, boolean requireLandingSupport) {
+        return dryRouteVeto(from, to, requireLandingSupport, 0.27);
+    }
+
+    /** Negative-only preflight on the already witnessed level row after the current landing. */
+    boolean dryRouteContinuationClear(BlockPos from, BlockPos to, Direction bearing,
+                                      BlockState source, BlockState landing) {
+        var player = client.player;
+        return from.getY() == to.getY() && player.isOnGround() && player.getPose() == EntityPose.STANDING
+            && !player.isSprinting() && !player.horizontalCollision
+            && player.getAttributeValue(EntityAttributes.MOVEMENT_SPEED) <= 0.10f
+            && player.getVelocity().horizontalLengthSquared() <= 0.018
+            && normalDryTraction(source) && normalDryTraction(landing)
+            && walkedLaneDry(from, to, bearing)
+            && dryRouteVeto(from, to, true, 1.27) == DryRouteVeto.CLEAR;
+    }
+
+    private DryRouteVeto dryRouteVeto(BlockPos from, BlockPos to, boolean requireLandingSupport, double beforeSource) {
         if (!hasView()) return DryRouteVeto.VIEW;
         var player = client.player;
         int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ(), dy = to.getY() - from.getY();
@@ -1765,7 +1892,7 @@ final class AgentBody {
         double across = (player.getX() - x) * dz - (player.getZ() - z) * dx;
         Vec3d velocity = player.getVelocity();
         double drift = across + 2.45 * (velocity.x * dz - velocity.z * dx);
-        if (along < -0.27 || along > 1.27 || Math.abs(across) > 0.19
+        if (along < -beforeSource || along > 1.27 || Math.abs(across) > 0.19
                 || Math.abs(drift) > 0.19
                 || player.getY() < Math.min(y, to.getY()) - 0.055
                 || player.getY() > Math.max(y, to.getY()) + 0.32) return DryRouteVeto.DRIFT;
@@ -1789,19 +1916,40 @@ final class AgentBody {
             ? DryRouteVeto.SUPPORT : DryRouteVeto.CLEAR;
     }
 
+    // A level walking view includes both the far half of the next tread and its headroom.
+    static final float LEVEL_ROUTE_PITCH = 20;
+
     /** One bounded traversal under the normal lava and final key vetoes, without an automatic jump. */
     void driveDryRoute(BlockPos from, BlockPos to, Direction bearing) {
+        driveDryRoute(from, to, bearing, false);
+    }
+
+    /** Keep W through a level waypoint only when the straight successor has already passed its guards. */
+    void driveDryRoute(BlockPos from, BlockPos to, Direction bearing, boolean carry) {
         var player = client.player;
         Vec3d landing = Vec3d.ofBottomCenter(to);
         double dx = landing.x - player.getX(), dz = landing.z - player.getZ();
         boolean jump = to.getY() > from.getY() && player.isOnGround() && !player.isTouchingWater()
             && !player.isInLava() && player.getBlockPos().equals(from);
         float yaw = heading(bearing.getOffsetX(), bearing.getOffsetZ());
-        turnFixed(yaw, jump ? 4 : 39);
+        boolean level = to.getY() == from.getY();
+        turnFixed(yaw, level ? LEVEL_ROUTE_PITCH : jump ? 4 : 39);
         if (!hasView() || Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > 6) return;
         double remaining = dx * bearing.getOffsetX() + dz * bearing.getOffsetZ();
         Vec3d velocity = player.getVelocity();
         double forwardSpeed = Math.max(0, velocity.x * bearing.getOffsetX() + velocity.z * bearing.getOffsetZ());
+        dryRouteWalk = true;
+        if (level) {
+            if (!player.isOnGround()) return;
+            float sourceGrip = client.world.getBlockState(walkedProbe.set(from).move(Direction.DOWN)).getBlock().getSlipperiness();
+            float landingGrip = client.world.getBlockState(walkedProbe.set(to).move(Direction.DOWN)).getBlock().getSlipperiness();
+            switch (dryLevelInput(remaining, forwardSpeed, 0.91 * Math.max(sourceGrip, landingGrip), carry)) {
+                case FORWARD -> walkDownTo(carry ? landing.add(bearing.getOffsetX(), 0, bearing.getOffsetZ()) : landing);
+                case BRAKE -> back();
+                case COAST -> { }
+            }
+            return;
+        }
         double coastTicks = 2.45;
         if (to.getY() < from.getY() && player.getY() > landing.y + 0.05) {
             // A one-block drop carries forward momentum through several airborne ticks.
@@ -1816,12 +1964,26 @@ final class AgentBody {
             }
         }
         double braking = forwardSpeed * coastTicks;
-        dryRouteWalk = true;
         if (remaining > Math.max(0.12, braking)) {
             walkDownTo(landing);
             if (jump) jump();
         }
     }
+
+    enum DryLevelInput { FORWARD, COAST, BRAKE }
+
+    static boolean normalDryTraction(BlockState support) { return support.getBlock().getSlipperiness() == 0.6f; }
+
+    static DryLevelInput dryLevelInput(double remaining, double forwardSpeed, double drag, boolean carry) {
+        if (carry) return DryLevelInput.FORWARD;
+        // Stored vanilla velocity is post-friction. The geometric series bounds the
+        // remaining neutral travel, including the upcoming movement tick.
+        double coast = forwardSpeed / (1 - drag);
+        if (forwardSpeed > 0.065 && coast > remaining + 0.16) return DryLevelInput.BRAKE;
+        return remaining > Math.max(0.12, coast + 0.025) ? DryLevelInput.FORWARD : DryLevelInput.COAST;
+    }
+
+    static boolean dryStrideContact(double remaining) { return Math.abs(remaining) <= 0.22; }
 
     /** A visible drop can veto walking. An unseen item is not evidence either way. */
     boolean macroNoVisiblePickup(Vec3d landing) {
@@ -2217,6 +2379,25 @@ final class AgentBody {
         return true;
     }
 
+    /** The body already occupies this exact full top. Check only the short inward sweep, without changing its gaze. */
+    boolean centerOnGroundedSupport(BlockPos foot, BlockState known) {
+        var player = client.player;
+        if (known == null || !hasView() || lavaEmergency || player.isInLava() || player.isOnFire()
+                || player.isTouchingWater() || player.isSprinting()
+                || player.hasVehicle() || player.getAbilities().flying || player.hurtTime != 0
+                || !sameSurveySupport(foot.down(), player.getPos()) || dryCaveContact(foot) != known
+                || !normalDryTraction(known)) return false;
+        if (dryCaveDanger(client.world.getBlockState(foot)) || dryCaveDanger(client.world.getBlockState(foot.up())))
+            return false;
+        Vec3d center = Vec3d.ofBottomCenter(foot);
+        double dx = center.x - player.getX(), dz = center.z - player.getZ();
+        double length = Math.hypot(dx, dz);
+        if (hazardAhead(heading(dx, dz), length + 0.12)
+                || !client.world.isSpaceEmpty(player, player.getBoundingBox().stretch(dx, 0, dz))) return false;
+        centerLanding = center;
+        return true;
+    }
+
     static boolean sameSurveySupport(BlockPos support, Vec3d feet) {
         double x = feet.x - support.getX(), z = feet.z - support.getZ();
         return x >= 0 && x < 1 && z >= 0 && z < 1 && Math.abs(feet.y - support.getY() - 1) <= 0.055;
@@ -2325,6 +2506,18 @@ final class AgentBody {
         }).orElse(null);
     }
 
+    /** A positively rendered cave feature for steering only, never a support or a clearance grant. */
+    BlockHitResult dryProspectLandmark(BlockPos foot, Predicate<BlockState> ore, Predicate<BlockHitResult> eligible) {
+        return find(state -> naturalCaveFloor(state) || ore.test(state), 6, hit -> {
+            BlockPos pos = hit.getBlockPos();
+            if (Math.abs(pos.getY() - foot.getY()) > 2 || pos.equals(foot.down()) || !eligible.test(hit)) return false;
+            BlockState state = client.world.getBlockState(pos);
+            if (!ore.test(state) && (!matchesDryRouteTop(hit, pos) || !stableDryRouteTop(pos, state))) return false;
+            // General visible block samples look through water. A departure cue must not.
+            return sameBlockFace(hit, perceive(hit.getPos(), 6).orElse(null));
+        }).orElse(null);
+    }
+
     private static boolean naturalCaveFloor(BlockState state) {
         return state.isIn(BlockTags.BASE_STONE_OVERWORLD) || state.isIn(BlockTags.BASE_STONE_NETHER)
             || state.isIn(BlockTags.DIRT) || state.isOf(Blocks.CALCITE) || state.isOf(Blocks.DRIPSTONE_BLOCK);
@@ -2340,6 +2533,43 @@ final class AgentBody {
 
     /** Reject positions among already admitted camera hits, before choosing the nearest match. */
     Optional<BlockHitResult> find(Predicate<BlockState> matches, double distance, Predicate<BlockHitResult> eligible) {
+        return find(matches, distance, eligible, true);
+    }
+
+    /** Use the rendered crosshair and existing samples without starting a new view scan. */
+    Optional<BlockHitResult> findSampled(Predicate<BlockState> matches, double distance, Predicate<BlockHitResult> eligible) {
+        return find(matches, distance, eligible, false);
+    }
+
+    /** Recheck at most one existing sample per adjacent wall cell, with fluids opaque. */
+    <T> T sampledLevelWall(BlockPos foot, double reach, Function<BlockHitResult, T> usable) {
+        if (!hasView() || raysLeft <= 0 || reach <= 0) return null;
+        double max = reach * reach;
+        Vec3d playerEye = client.player.getEyePos();
+        int checked = 0;
+        for (int i = -1; i < sampleCount && raysLeft > 0; ++i) {
+            var hit = i < 0 ? renderedCrosshair instanceof BlockHitResult block ? block : null : samples[i];
+            if (hit == null || hit.getType() != HitResult.Type.BLOCK || hit.isInsideBlock()) continue;
+            BlockPos cell = hit.getBlockPos();
+            Direction bearing = AgentSurfaceTread.prospectLevelBearing(foot, cell);
+            if (bearing == null || hit.getSide() != bearing.getOpposite()) continue;
+            int bit = 1 << (2 * bearing.ordinal() + cell.getY() - foot.getY());
+            if ((checked & bit) != 0) continue;
+            Vec3d point = hit.getPos();
+            double distance = point.squaredDistanceTo(eye);
+            if (distance <= 0.0001 || distance > max || point.squaredDistanceTo(playerEye) > max || !inView(point)) continue;
+            checked |= bit;
+            double inset = 0.02 / Math.sqrt(distance);
+            var live = litHit(point.add((point.x - eye.x) * inset, (point.y - eye.y) * inset, (point.z - eye.z) * inset), Ray.FLUIDS);
+            if (!sameBlockFace(hit, live) || live.isInsideBlock()) continue;
+            T result = usable.apply(live);
+            if (result != null) return result;
+        }
+        return null;
+    }
+
+    private Optional<BlockHitResult> find(Predicate<BlockState> matches, double distance, Predicate<BlockHitResult> eligible,
+                                          boolean sampleMore) {
         if (!hasView()) return Optional.empty();
         double max = range(distance);
         if (!(max > 0)) return Optional.empty();
@@ -2348,7 +2578,7 @@ final class AgentBody {
             if (matches.test(client.world.getBlockState(target.getBlockPos())) && (eligible == null || eligible.test(target)))
                 return Optional.of(target);
         }
-        if (max > sampleRange && raysLeft > 0) sampleView(Math.min(range(MAX_RANGE), Math.max(max, 12)));
+        if (sampleMore && max > sampleRange && raysLeft > 0) sampleView(Math.min(range(MAX_RANGE), Math.max(max, 12)));
         BlockHitResult best = null;
         double bestDistance = max * max;
         for (int i = 0; i < sampleCount; i++) {

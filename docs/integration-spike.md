@@ -153,9 +153,33 @@ needs an exact break permission for each cover type, charged against the
 same break budget. The player keeps at least one break for the source.
 Cover breaks, grounded travel, and stock pickups are confirmed separately.
 
+On a straight, dry shelf the player can see several landings in one
+forward view and hold the movement key between them. It brakes at the
+end of the visible strip, before a changed tread, or for a turn or climb.
+An open-looking passage still needs a lit floor, body clearance and a way
+back. If a lip hides the landing, one targeted look may resolve it.
+
+When a camera check is still needed, Terra can add `openingViewId` from
+`work.openingViewIds` to one priced mining or prospecting job. The host
+issues that exact read first. After its accepted and completed receipts,
+the first later safe view must show a matching dry landing, material
+offer, or usable `prospectOpening` that was not already witnessed. Only
+then does the host issue the priced work, without another model request.
+The camera receipt does not prove a route or count as physical progress. An unchanged stance
+does not gain a second bare survey from a new angle or ID; an exact new
+face or lane can still be inspected. If the job already has a usable
+witness, Terra should send `work` without an opening view. If an exact
+opening clue disappears before the read starts, the host allows one new
+decision when the matching physical offer or a distinct usable alternative
+is in view. It does not replay the read or start the old job.
+
 A diamond order that names only ore can mine an exposed vein. To look for
 one below the current footing, Terra must also request
-`prospect:minecraft:diamond` and name the cover it may break. A torch costs
+`prospect:minecraft:diamond` and name the cover it may break. A
+`prospectOpening` can show where to start mining even when a dry rock wall
+blocks the walking lane. The clue names one reachable wall face, its
+tool, and possible item loss. It cannot be selected as an opportunity
+and proves no future landing or ore. A torch costs
 one carried torch and requires its own placement permission. The optional
 `place:minecraft:cobblestone` effect needs an exact cobblestone cost cap
 and shares `maxPlacements` with torches. The player spends one block above
@@ -167,15 +191,19 @@ If the player cannot confirm the empty space, the refusal identifies the
 bearing and what blocked the lower and upper sight lines.
 On a flat shelf the player can cut an unused adjacent floor block to start
 a downward tread, provided another usable exit or the walked return path
-remains intact. It stays on the original block until it can see the
-landing and check the way back.
+remains intact. Above Y=16, the player prefers a proved natural descent.
+In an ordinary tunnel it can clear the visible front wall, then cut the
+newly exposed floor from separate footing. It waits to see a lit, dry
+landing with room to jump back before stepping down. After reaching the
+lower block, it can continue in the same direction.
 The report distinguishes placement, grounded arrival, and the lowest
 footing reached. Only a diamond in inventory counts as a pickup.
 
 The three-second planning deadline is a diagnostic target, not a
 guarantee about the footage. If no safe, authorized action is available,
-the player reports the obstruction instead of spending resources or
-moving just to reset a timer. Check
+the player reports the obstruction. The idle deadline never chooses
+a camera turn. A requested look can produce an observation receipt, but
+turning toward a block does not reset the physical-progress clock. Check
 `strategy.planningWait.longestPendingWithoutWorkMs` for the actual longest
 idle interval, including blocked time. `rightCensored: true` means the final
 interval may extend beyond the last observation. A provider timeout is a

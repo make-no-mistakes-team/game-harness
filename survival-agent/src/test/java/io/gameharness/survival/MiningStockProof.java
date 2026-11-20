@@ -6,8 +6,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import net.minecraft.Bootstrap;
-import net.minecraft.SharedConstants;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.FluidBlock;
@@ -18,13 +16,6 @@ import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
-import net.minecraft.registry.DynamicRegistryManager;
-import net.minecraft.registry.Registry;
-import net.minecraft.registry.Registries;
-import net.minecraft.registry.tag.TagGroupLoader;
-import net.minecraft.resource.LifecycledResourceManagerImpl;
-import net.minecraft.resource.ResourceType;
-import net.minecraft.resource.VanillaDataPackProvider;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
@@ -33,6 +24,8 @@ import net.minecraft.world.BlockView;
 import net.minecraft.world.EmptyBlockView;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /** Exercises actual vanilla stacks and block states without starting a client or world. */
 final class MiningStockProof {
@@ -50,15 +43,7 @@ final class MiningStockProof {
 
     @BeforeAll
     static void initializeVanilla() {
-        SharedConstants.createGameVersion();
-        Bootstrap.initialize();
-        // Fabric defers registry freezing until after mod initialization in a game launch.
-        Registries.bootstrap();
-        try (var packs = new LifecycledResourceManagerImpl(ResourceType.SERVER_DATA,
-                List.of(VanillaDataPackProvider.createDefaultPack()))) {
-            TagGroupLoader.startReload(packs, DynamicRegistryManager.of(Registries.REGISTRIES))
-                .forEach(Registry.PendingTagLoad::apply);
-        }
+        VanillaTestResources.initialize();
     }
 
     @Test
@@ -493,6 +478,71 @@ final class MiningStockProof {
             "only the exact two ingot gain with unchanged currently carried input and fuel confirms withdrawal");
         require(!withdrawal.begin(new AgentFurnaceWatch.Stock(5, 2, 6)),
             "the accepted withdrawal edge cannot be issued again even after its actual stock gain");
+    }
+
+    @Test
+    void explicitPaidRecallWaitsForTheSecondSynchronizedIngotBeforeOneWithdrawal() {
+        var batch = new AgentHands.IronBatch(2, Items.OAK_PLANKS, 2, 300);
+        var raw = new ItemStack(Items.RAW_IRON);
+        var one = new ItemStack(Items.IRON_INGOT);
+        var pair = new ItemStack(Items.IRON_INGOT, 2);
+        var empty = ItemStack.EMPTY;
+        var result = new AgentFurnaceWatch.PendingResult(6, 0, 1);
+
+        assertEquals(AgentFurnaceWatch.Recall.WAIT, result.observe(680, 1152, 7, true, 1,
+            batch, raw, empty, one, true, 0.685f, 0.8f));
+        assertEquals(63, result.remainingTicks());
+        assertEquals(AgentFurnaceWatch.Recall.WAIT, result.observe(708, 1152, 7, true, 1,
+            batch, raw, empty, one, true, 0.825f, 0.7f));
+        assertEquals(AgentFurnaceWatch.Recall.WAIT, result.observe(743, 1152, 7, true, 1,
+            batch, empty, empty, pair, true, 0, 0.6f));
+        assertEquals(AgentFurnaceWatch.Recall.READY, result.observe(744, 1152, 7, true, 2,
+            batch, empty, empty, pair, true, 0, 0.6f));
+        assertEquals(1, result.afterOutputUpdate());
+
+        require(!AgentFurnaceWatch.exactResult(batch.units(), result.afterOutputUpdate(), 2, empty, empty, one)
+                && AgentFurnaceWatch.exactResult(batch.units(), result.afterOutputUpdate(), 2, empty, empty, pair),
+            "the vanilla hand action must still recheck the exact updated pair, not a now-altered result");
+        var withdrawal = new AgentFurnaceWatch.Withdrawal();
+        require(withdrawal.begin(new AgentFurnaceWatch.Stock(0, 2, 1))
+                && !withdrawal.confirms(new AgentFurnaceWatch.Stock(0, 2, 2), batch)
+                && withdrawal.confirms(new AgentFurnaceWatch.Stock(0, 2, 3), batch)
+                && !withdrawal.begin(new AgentFurnaceWatch.Stock(0, 2, 3)),
+            "only the exact two-ingot gain can confirm the one authorized withdrawal");
+    }
+
+    @Test
+    void paidRecallCannotWaitOrWithdrawFromUnsyncedAlteredColdOrStalledSlots() {
+        var batch = new AgentHands.IronBatch(2, Items.OAK_PLANKS, 2, 300);
+        var raw = new ItemStack(Items.RAW_IRON);
+        var one = new ItemStack(Items.IRON_INGOT);
+        var empty = ItemStack.EMPTY;
+        var result = new AgentFurnaceWatch.PendingResult(6, 0, 1);
+        assertEquals(AgentFurnaceWatch.Recall.BINDING_CHANGED, result.observe(680, 1152, 6, true, 1,
+            batch, raw, empty, one, true, 0.685f, 0.8f));
+        assertEquals(AgentFurnaceWatch.Recall.BINDING_CHANGED, result.observe(680, 1152, 7, false, 1,
+            batch, raw, empty, one, true, 0.685f, 0.8f));
+        assertEquals(AgentFurnaceWatch.Recall.PENDING, result.observe(680, 1152, 7, true, 1,
+            batch, raw, empty, one, false, 0.685f, 0));
+        assertEquals(0, result.remainingTicks());
+        assertEquals(AgentFurnaceWatch.Recall.PENDING, result.observe(680, 1152, 7, true, 1,
+            batch, raw, empty, one, true, 0.685f, 0.05f));
+        assertEquals(0, result.remainingTicks());
+        assertEquals(AgentFurnaceWatch.Recall.PENDING, result.observe(680, 1152, 7, true, 1,
+            batch, raw, empty, one, true, 0, 0.8f));
+        assertEquals(0, result.remainingTicks());
+        assertEquals(AgentFurnaceWatch.Recall.PENDING, result.observe(680, 1152, 7, true, 1,
+            batch, raw, empty, one, true, 0.2f, 0.8f));
+        assertEquals(160, result.remainingTicks());
+        assertEquals(AgentFurnaceWatch.Recall.WAIT, result.observe(680, 1152, 7, true, 1,
+            batch, raw, empty, one, true, 0.685f, 0.8f));
+        assertEquals(AgentFurnaceWatch.Recall.BINDING_CHANGED, result.observe(681, 1152, 8, true, 2,
+            batch, empty, empty, new ItemStack(Items.IRON_INGOT, 2), true, 0, 0.8f));
+        assertEquals(AgentFurnaceWatch.Recall.STOCK_CHANGED, result.observe(681, 1152, 7, true, 2,
+            batch, new ItemStack(Items.RAW_IRON, 2), empty, empty, true, 0.69f, 0.8f));
+        assertEquals(AgentFurnaceWatch.Recall.PENDING, result.observe(705, 1152, 7, true, 1,
+            batch, raw, empty, one, true, 0.685f, 0.8f));
+        assertEquals(0, result.remainingTicks());
     }
 
     @Test

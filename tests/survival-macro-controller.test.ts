@@ -374,6 +374,270 @@ test.each(["invalid", "malformed", "abstain", "gap", "incomplete"] as const)(
   },
 );
 
+const caveSurvey = { id: "left", verb: "survey", risk: "read", summary: "Survey left from this stance",
+  evidence: "A bounded first-person turn over nearby terrain." } as const;
+const caveFooting = { id: "dry-floor", verb: "approach", risk: "low", summary: "Walk to the adjacent flat tile",
+  evidence: "Lit full top and clear dry sweep.", anchor: { target: "floor-1", subject: "route:dry" } } as const;
+const cavePolicy = { target: { kind: "stock", item: "minecraft:diamond", count: 1 },
+  allowedEffects: ["prospect:minecraft:diamond", "break:minecraft:diamond_ore"],
+  reserves: [{ item: "minecraft:iron_pickaxe", count: 1 }], costCaps: [],
+  maxBreaks: 8, maxCrafts: 0, maxPlacements: 0 } as const;
+const caveState = { goal: "diamond", stance: 2, inventory: { "minecraft:iron_pickaxe": 1 } } as const;
+
+const wall = { block: "minecraft:stone", target: "wall-a", tool: "minecraft:iron_pickaxe", maxToolLoss: 0 } as const;
+const wallPolicy = { ...cavePolicy, allowedEffects: [...cavePolicy.allowedEffects, "break:minecraft:stone"],
+  reserves: [...cavePolicy.reserves, { item: "minecraft:raw_iron", count: 2 }] } as const;
+const wallState = { ...caveState, inventory: { ...caveState.inventory, "minecraft:raw_iron": 2 } } as const;
+
+test.each(["wall", "priced loss", "unknown", "wrong rock", "not allowed", "ore only", "short quota", "lost tool", "lost floor",
+  "unpriced loss", "loss crosses floor", "different ore anchor", "changed stance"] as const)(
+  "Only a matching fresh wall can open a quoted excavation (%s)", async condition => {
+    const requests: MacroRequest[] = [];
+    const reply = Promise.withResolvers<void>();
+    const view = condition === "different ore anchor" ? { ...caveSurvey, verb: "inspect",
+      anchor: { subject: "block:minecraft:diamond_ore", target: wall.target } } as const : caveSurvey;
+    const policy = condition === "not allowed" ? cavePolicy :
+      condition === "ore only" ? { ...wallPolicy, allowedEffects: ["break:minecraft:diamond_ore", "break:minecraft:stone"] } :
+      condition === "short quota" ? { ...wallPolicy, maxBreaks: 1 } :
+      condition === "loss crosses floor" || condition === "priced loss" ?
+        { ...wallPolicy, costCaps: [{ item: wall.tool, count: 1 }] } : wallPolicy;
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      await reply.promise;
+      return workReply(request, { kind: "work", policy, openingViewId: view.id });
+    }, "Prospect for diamond on dry footing.", 1);
+    try {
+      await f.observe(16, { ...wallState, opportunities: [view] });
+      expect(requests[0]?.observation.prospectOpening).toBeUndefined();
+      expect(requests[0]?.work?.openingViewIds).toEqual([view.id]);
+      reply.resolve();
+      await f.actor.poll();
+      const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      await f.receipt(intent.id, 21, "accepted");
+      await f.receipt(intent.id, 26, "completed");
+      await f.observe(26, { ...wallState, prospectOpening: wall });
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      await f.observe(31, { ...wallState, opportunities: [],
+        recent: ["The surrounding stone may contain diamond ore."],
+        prospectOpening: condition === "unknown" ? undefined : condition === "wrong rock" ?
+          { ...wall, block: "minecraft:granite" } :
+          condition === "unpriced loss" || condition === "loss crosses floor" || condition === "priced loss" ?
+            { ...wall, maxToolLoss: 1 } : wall,
+        ...(condition === "lost tool" ? { inventory: { "minecraft:raw_iron": 2 } } :
+          condition === "lost floor" ? { inventory: caveState.inventory } :
+          condition === "priced loss" ? { inventory: { ...wallState.inventory, [wall.tool]: 2 } } :
+          condition === "changed stance" ? { stance: 3 } : {}),
+      });
+      if (condition === "wall" || condition === "priced loss") expect(await f.order()).toMatchObject({ basisTick: 31, origin: "model",
+        target: policy.target, maxBreaks: policy.maxBreaks });
+      else await expect(access(f.file("work.json"))).rejects.toThrow();
+      expect(requests).toHaveLength(1);
+      expect(f.actor.status()).toMatchObject({ completedReceipts: 0, completedModelWorkOrders: 0 });
+    } finally {
+      reply.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test.each(["live", "disappeared", "different cell"] as const)(
+  "An already witnessed excavation starts as ordinary work without camera input (%s)", async condition => {
+    const reply = Promise.withResolvers<void>();
+    const f = await durableFixture(async request => {
+      expect(request.observation.prospectOpening).toEqual(wall);
+      expect(request.observation.opportunities).not.toContainEqual(expect.objectContaining({ id: wall.target }));
+      await reply.promise;
+      return workReply(request, { kind: "work", policy: wallPolicy });
+    }, "Prospect for diamond on dry footing.", 1);
+    try {
+      await f.observe(16, { ...wallState, opportunities: [caveSurvey], prospectOpening: wall });
+      reply.resolve();
+      await f.observe(21, { ...wallState, opportunities: [caveSurvey],
+        prospectOpening: condition === "disappeared" ? undefined : condition === "different cell" ? { ...wall, target: "wall-b" } : wall });
+      if (condition === "live") expect(await f.order()).toMatchObject({ basisTick: 21, origin: "model" });
+      else await expect(access(f.file("work.json"))).rejects.toThrow();
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      expect(f.actor.status()).toMatchObject({ requests: 1, completedReceipts: 0 });
+    } finally {
+      reply.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test.each(["fresh route", "camera only", "failed", "no acceptance", "lost view", "hurt", "displaced", "expired",
+  "stop", "paid transition", "reserve lost", "invented", "physical ID", "already justified", "unrelated face",
+  "new ore face", "wrong post-view face", "paired lower lane", "wrong lower lane"] as const)(
+  "An opening view can start its priced work without a second request (%s)", async condition => {
+    const requests: MacroRequest[] = [];
+    const reply = Promise.withResolvers<void>();
+    const face = { id: "face", verb: "inspect", risk: "read", summary: "Center diamond ore", evidence: "Lit visible face",
+      anchor: { subject: "block:minecraft:diamond_ore", target: "ore-a" } } as const;
+    const ore = { id: "break-ore", verb: "break", risk: "guarded", summary: "Break visible diamond ore", evidence: "In reach",
+      material: { subject: "block:minecraft:diamond_ore", target: "ore-a", spends: {} } } as const;
+    const lower = { id: "lower-look", verb: "survey", risk: "guarded", summary: "Inspect the lower lane", evidence: "A lit lower face",
+      anchor: { subject: "route:dry", target: "lower-a" } } as const;
+    const lowerCase = condition === "paired lower lane" || condition === "wrong lower lane";
+    const followed = { id: "lower-route", verb: "follow", risk: "guarded", summary: "Follow the dry lower lane",
+      evidence: "One edge with a witnessed return", anchor: { ...lower.anchor,
+        target: condition === "paired lower lane" ? "lower-a" : "lower-b" } } as const;
+    const view = condition === "unrelated face" ? { ...face, anchor: { ...face.anchor, subject: "block:minecraft:copper_ore" } } :
+      condition === "new ore face" || condition === "wrong post-view face" ? face : lowerCase ? lower : caveSurvey;
+    const initial = condition === "physical ID" || condition === "already justified" ? [view, caveFooting] : [view];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      await reply.promise;
+      return workReply(request, { kind: "work", policy: cavePolicy,
+        openingViewId: condition === "invented" ? "invented" : condition === "physical ID" ? caveFooting.id : view.id }, 1100);
+    }, lowerCase ? "Prospect for diamond while preserving the iron pickaxe." : undefined, 1);
+    try {
+      if (!lowerCase) {
+        await f.observe(10, caveState);
+        const preset = await f.order();
+        await f.receipt(preset.id, 12, "accepted");
+        await f.receipt(preset.id, 13, "interrupted");
+      }
+      await f.observe(16, { ...caveState, opportunities: initial });
+      expect(requests[0]?.work?.openingViewIds).toEqual([view.id]);
+      reply.resolve();
+      if (condition === "lost view") await f.observe(20, { ...caveState, opportunities: [{ ...view, id: "reissued" }] });
+      else await f.actor.poll();
+      if (["invented", "physical ID", "lost view", "already justified", "unrelated face"].includes(condition)) {
+        await expect(access(f.file("intent.json"))).rejects.toThrow();
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+        return;
+      }
+      const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      expect(intent).toMatchObject({ basisTick: 16, opportunityId: view.id, skillHash: null });
+      if (condition !== "no acceptance") await f.receipt(intent.id, 21, "accepted");
+      await f.receipt(intent.id, 26, condition === "failed" ? "interrupted" : "completed");
+      await f.observe(26, { ...caveState, opportunities: [caveFooting] });
+      await expect(access(f.file("work.json"))).rejects.toThrow(); // Receipt tick is not a later view.
+      expect(f.actor.status()).toMatchObject({ completedReceipts: 0, completedModelWorkOrders: 0 });
+      const opportunities = condition === "camera only" ? [{ ...view, id: "right", summary: "Survey right" }] :
+        condition === "new ore face" ? [ore] : condition === "wrong post-view face" ?
+          [{ ...ore, material: { ...ore.material, target: "other-ore" } }] : lowerCase ? [followed] : [caveFooting];
+      if (condition === "stop") await f.actor.stop();
+      await f.observe(condition === "expired" ? 1116 : 31, { ...caveState, opportunities,
+        ...(condition === "hurt" ? { health: 19 } : condition === "displaced" ? { stance: 3 } :
+          condition === "reserve lost" ? { inventory: {} } : condition === "paid transition" ? {
+            pendingWork: { ...paidIron("owed-iron", 20), yieldable: false, parked: true, historical: true },
+          } : {}) });
+      if (condition === "fresh route" || condition === "new ore face" || condition === "paired lower lane") {
+        const { allowedEffects, ...quoted } = cavePolicy;
+        const order = await f.order();
+        expect(order).toMatchObject({ basisTick: 31, expiresTick: 1116, origin: "model", ...quoted });
+        expect(new Set(order.allowedEffects)).toEqual(new Set(allowedEffects));
+      } else await expect(access(f.file("work.json"))).rejects.toThrow();
+      expect(requests).toHaveLength(1);
+    } finally {
+      reply.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test.each(["exact ore", "distinct approach", "reissued look", "different ore", "changed epoch", "expired recovery"] as const)(
+  "A lost ore opening can make one fresh decision on a real alternative (%s)", async condition => {
+    const requests: MacroRequest[] = [];
+    const first = Promise.withResolvers<void>();
+    const second = Promise.withResolvers<void>();
+    const anchor = { subject: "block:minecraft:iron_ore", target: "ore-a" };
+    const inspect = { id: "ore-view", verb: "inspect", risk: "read", summary: "Center the visible iron ore",
+      evidence: "A lit iron face is visible away from the crosshair.", anchor } as const;
+    const ore = { id: "ore-break", verb: "break", risk: "guarded", summary: "Break visible iron ore",
+      evidence: "The lit face is now in harvest reach.", material: { ...anchor, spends: {} } } as const;
+    const policy = { ...cavePolicy, target: { kind: "stock", item: "minecraft:raw_iron", count: 1 },
+      allowedEffects: ["break:minecraft:iron_ore"], maxBreaks: 1 } as const;
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1) {
+        await first.promise;
+        return workReply(request, { kind: "work", policy, openingViewId: inspect.id });
+      }
+      await second.promise;
+      return workReply(request, condition === "distinct approach" ? { kind: "opportunity", opportunityId: caveFooting.id } :
+        { kind: "work", policy });
+    }, "Find diamond; preserve the iron pickaxe.", 5);
+    try {
+      await f.observe(1015, { ...caveState, opportunities: [inspect] });
+      first.resolve();
+      await f.observe(1105, { ...caveState, opportunities: [caveSurvey] });
+      expect(f.actor.status()).toMatchObject({ staleDecisions: 1, issued: 0, issuedWorkOrders: 0 });
+      const recoveryTick = condition === "expired recovery" ? 1205 : 1110;
+      const candidate = condition === "reissued look" ? { ...inspect, id: "rekeyed" } :
+        condition === "different ore" ? { ...ore, material: { ...ore.material, target: "ore-b" } } :
+        condition === "distinct approach" ? caveFooting : ore;
+      const scope = condition === "changed epoch" ? { ...caveState, epoch: 2 } : caveState;
+      await f.observe(recoveryTick, { ...scope, opportunities: [candidate] });
+      const recovers = condition === "exact ore" || condition === "distinct approach";
+      expect(requests).toHaveLength(recovers ? 2 : 1);
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      if (recovers) {
+        expect(requests[1]).toMatchObject({ observation: { tick: recoveryTick, opportunities: [candidate] },
+          lastReceipt: null, feedback: { kind: "failed_intent", detail: expect.stringContaining("No camera read or work started") } });
+        second.resolve();
+        if (condition === "exact ore") {
+          await f.actor.poll();
+          expect(await f.order()).toMatchObject({ basisTick: recoveryTick, origin: "model", ...policy });
+          return;
+        }
+        // Lose the recovery action before it reaches the mailbox as well.
+        await f.observe(1195, scope);
+        expect(f.actor.status()).toMatchObject({ staleDecisions: 2, issued: 0, issuedWorkOrders: 0 });
+      }
+      await f.observe(recoveryTick + 100, { ...scope, opportunities: [ore, caveFooting] });
+      expect(requests).toHaveLength(recovers ? 2 : 1);
+    } finally {
+      first.resolve();
+      second.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test("A spent unanchored survey stays unavailable after waiting and rekeying, but a new exact face is usable", async () => {
+  const requests: MacroRequest[] = [];
+  const opposite = { ...caveSurvey, id: "right-new-id", summary: "Survey right from this stance" };
+  const clue = { id: "coal", verb: "inspect", risk: "read", summary: "Center a visible coal face", evidence: "Lit material",
+    anchor: { subject: "block:minecraft:coal_ore", target: "coal-face" } } as const;
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    return workReply(request, { kind: "opportunity",
+      opportunityId: requests.length === 1 ? caveSurvey.id : requests.length === 2 ? opposite.id : clue.id });
+  }, undefined, 5);
+  try {
+    await f.observe(10, caveState);
+    const preset = await f.order();
+    await f.receipt(preset.id, 12, "accepted");
+    await f.receipt(preset.id, 13, "interrupted");
+    await f.observe(16, { ...caveState, opportunities: [caveSurvey] });
+    await f.actor.poll();
+    const first = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+    await f.receipt(first.id, 20, "accepted");
+    await f.receipt(first.id, 24, "completed");
+    await f.observe(200, { ...caveState, epoch: 2, opportunities: [opposite] });
+    await f.actor.poll();
+    expect(requests[1]?.observation.opportunities).toEqual([]);
+    expect(f.actor.status().issued).toBe(1);
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    await f.observe(300, { ...caveState, epoch: 2, opportunities: [{ ...opposite, id: "another-id" }] });
+    expect(requests).toHaveLength(2);
+    await f.observe(305, { ...caveState, epoch: 2, opportunities: [opposite, clue] });
+    await f.actor.poll();
+    expect(requests[2]?.observation.opportunities).toEqual([clue]);
+    expect(parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8"))).opportunityId).toBe(clue.id);
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
 // Canopy trace: the last survey completed at 1092; the tick-1096 request
 // chose o-17 and was refused before issuance in the same life/epoch. The
 // refusal did not record its full live view; replay with a witnessed approach.
@@ -1531,6 +1795,88 @@ test.each(["cave now", "ready but independent", "richer route", "blocked", "dela
         expect(requests).toHaveLength(expected);
       }
       await expect(access(f.file("intent.json"))).rejects.toThrow();
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test.each(["finished on return", "witnessed burn end", "hazard", "death"] as const)(
+  "An explicit paid recall does not poll or credit cook time: %s", async branch => {
+    const goal = "diamond";
+    const requests: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1) return workReply(request, { kind: "work", policy: ironPolicy,
+        duringWait: { policy: sideStone, maxTicks: 600 } });
+      const ticket = request.observation.pendingWork;
+      return workReply(request, ticket?.collectOfferId
+        ? { kind: "collect-pending", pendingWorkId: ticket.id } : { kind: "abstain" });
+    }, "Use the paid ingots to make a bucket.", 5);
+    try {
+      const held = { [ironItem]: 1, [fuelItem]: 1, "minecraft:iron_pickaxe": 1 };
+      await f.observe(10, { goal, inventory: { ...held, [fuelItem]: 3, [rawIronItem]: 2, [furnaceItem]: 1 } });
+      await f.actor.poll();
+      const batch = await f.order();
+      await f.receipt(batch.id, 11, "accepted");
+      const ticket = paidIron(batch.id, 395);
+      await f.observe(115, { goal, inventory: held, pendingWork: ticket, opportunities: [witnessedStone],
+        workOrder: { id: batch.id, state: "working", detail: "Paid burn",
+          progress: { phase: "smelt", status: "Cooking both paid units", breaks: 0, crafts: 0, placements: 1,
+            smeltBurn: { burnTick: 111, units: 2, remainingCookTicks: 395 } } } });
+      await f.actor.poll();
+      const side = await f.order();
+      await f.receipt(batch.id, 116, "parked");
+      await f.receipt(side.id, 116, "accepted");
+      await f.receipt(side.id, 450, "interrupted");
+      const parked = { ...ticket, parked: true, yieldable: false };
+      const recall = { ...parked, remainingTicks: 63, worksite: parkedStation, collectOfferId: returnOffer.id };
+      const idle = { goal, inventory: held, quiescent: true, opportunities: [returnOffer], pendingWork: recall };
+      await f.observe(455, idle);
+      await f.actor.poll();
+      const first = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      await f.receipt(first.id, 456, "accepted");
+      const inScreen = { goal, inventory: held, pendingWork: { ...parked, remainingTicks: 40 } };
+      await f.observe(480, inScreen);
+      await f.actor.poll();
+      expect(requests).toHaveLength(2);
+      expect(f.actor.status()).toMatchObject({ issued: 1, completedReceipts: 0, completedModelWorkOrders: 0 });
+      if (branch === "hazard" || branch === "death") {
+        await f.observe(484, branch === "hazard"
+          ? { ...inScreen, epoch: 2, safety: { revision: 2, clear: false } }
+          : { goal, epoch: 2, life: 2, health: 0, inventory: {} });
+        await f.actor.poll();
+        await expect(access(f.file("intent.json"))).rejects.toThrow();
+        expect(requests).toHaveLength(2);
+        expect(f.actor.status()).toMatchObject({ issued: 1, completedReceipts: 0, completedModelWorkOrders: 0 });
+        return;
+      }
+      if (branch === "finished on return") {
+        await f.receipt(batch.id, 520, "completed");
+        await f.receipt(first.id, 520, "completed");
+        await f.observe(520, { goal, epoch: 2, inventory: { ...held, [ironItem]: 3 } });
+        expect(f.actor.status()).toMatchObject({ issued: 1, completedReceipts: 1, completedModelWorkOrders: 1 });
+        return;
+      }
+      await f.receipt(first.id, 483, "interrupted", "Fresh conserved slots were not close enough. The paid batch is still pending.");
+      await f.observe(484, { ...idle, pendingWork: { ...recall, remainingTicks: 160 } });
+      await f.observe(700, { ...idle, pendingWork: { ...recall, state: "unknown", remainingTicks: 0 } });
+      expect(requests).toHaveLength(2);
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      const recheck = { ...returnOffer, evidence: `${returnOffer.evidence} The exact furnace was seen unlit after the last burning recheck; output is unproved.` };
+      await f.observe(800, { ...idle, opportunities: [recheck], pendingWork: { ...recall, state: "unknown", remainingTicks: 0 } });
+      await f.actor.poll();
+      const fresh = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      expect(fresh).toMatchObject({ basisTick: 800, opportunityId: first.opportunityId, skillHash: null });
+      expect(fresh.id).not.toBe(first.id);
+      expect(requests).toHaveLength(3);
+      await f.receipt(fresh.id, 801, "accepted");
+      await f.receipt(fresh.id, 804, "interrupted");
+      await f.observe(850, { ...idle, opportunities: [recheck], pendingWork: { ...recall, state: "unknown", remainingTicks: 0 } });
+      expect(requests).toHaveLength(3);
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      expect(f.actor.status()).toMatchObject({ issued: 2, completedReceipts: 0, completedModelWorkOrders: 0 });
     } finally {
       await f.actor.stop();
       await f.clean();

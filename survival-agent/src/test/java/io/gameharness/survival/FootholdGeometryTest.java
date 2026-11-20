@@ -1,8 +1,11 @@
 package io.gameharness.survival;
 
+import com.google.gson.JsonParser;
 import java.util.Set;
-import net.minecraft.Bootstrap;
-import net.minecraft.SharedConstants;
+import net.minecraft.block.Blocks;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
@@ -18,8 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 final class FootholdGeometryTest {
     @BeforeAll
     static void initializeVanilla() {
-        SharedConstants.createGameVersion();
-        Bootstrap.initialize();
+        VanillaTestResources.initialize();
     }
 
     @Test
@@ -102,6 +104,74 @@ final class FootholdGeometryTest {
             assertTrue(occludingWall.raycast(eye, point).isPresent(), "the intervening full block occludes the ray");
             assertTrue(occupiedCell.raycast(eye, point).isPresent(), "a full block in the sampled cell is hit");
         }
+    }
+
+    @Test
+    void oneWitnessedAttachmentCanPayForExactlyOneNewLitTop() {
+        var from = new BlockPos(0, 30, 0);
+        var build = new AgentMacroControl.ProspectSupport(from, from.east().down(), Direction.EAST);
+        var anchor = build.cell.east();
+        var face = new BlockHitResult(Vec3d.ofCenter(anchor).add(-0.5, 0, 0), Direction.WEST, anchor, false);
+        var eye = Vec3d.ofBottomCenter(from).add(0, 1.62, 0);
+        assertTrue(new Box(from.down()).raycast(eye, face.getPos()).isEmpty());
+        assertTrue(face.getPos().squaredDistanceTo(eye) < 4 * 4);
+        assertTrue(AgentBody.footholdFaceInEnvelope(face, build.cell, Direction.EAST));
+        build.pin(face, Blocks.STONE.getDefaultState(), 30);
+        assertEquals(AgentMacroControl.ProspectSupport.View.READY,
+            build.view(AgentBody.FootholdSpace.EMPTY, AgentBody.FootholdSpace.EMPTY, true));
+
+        var raw = JsonParser.parseString("""
+            {"v":1,"id":"support-check","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":120,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:diamond","count":1},
+             "allowedEffects":["break:minecraft:diamond_ore","prospect:minecraft:diamond","place:minecraft:cobblestone"],
+             "maxBreaks":1,"maxCrafts":0,"maxPlacements":1,"costCaps":[{"item":"minecraft:cobblestone","count":1}],
+             "reserves":[{"item":"minecraft:cobblestone","count":1}]}
+            """).getAsJsonObject();
+        var budget = new AgentWorkOrder.Budget(AgentWorkOrder.parse(raw, "run", "constrained").policy());
+        var stock = new PlayerInventory(null);
+        stock.setStack(0, new ItemStack(Items.COBBLESTONE, 2));
+        assertTrue(budget.canPlaceProspectSupport(stock));
+        var top = new BlockHitResult(Vec3d.ofBottomCenter(build.to), Direction.UP, build.cell, false);
+        var cobble = Blocks.COBBLESTONE.getDefaultState();
+        assertFalse(build.confirms(12, top, cobble, 1), "a visible floor is not an issued support");
+        build.issued(32, 12, 2, budget);
+        assertFalse(budget.canPlaceProspectSupport(stock), "issuing consumes the grant before vanilla acknowledges it");
+        assertFalse(build.confirms(12, top, cobble, 1), "the old render cannot prove the new top");
+        assertFalse(build.confirms(13, null, cobble, 1), "a debit alone proves no footing");
+        assertFalse(build.confirms(13, top, cobble, 2), "a matching top alone proves no placement");
+        var nearbyOrdinaryFloor = new BlockHitResult(Vec3d.ofBottomCenter(from.east()), Direction.UP, from.east().down(), false);
+        assertFalse(build.confirms(13, nearbyOrdinaryFloor, cobble, 1), "the normal floor a full block higher is not the stair top");
+        assertTrue(build.confirms(13, top, cobble, 1));
+    }
+
+    @Test
+    void onlyAKnownContactMayResolveAClippedAirPairAndNeitherSampleMayBeGuessed() {
+        var from = new BlockPos(0, 30, 0);
+        var build = new AgentMacroControl.ProspectSupport(from, from.east(), Direction.EAST);
+        var empty = AgentBody.FootholdSpace.EMPTY;
+        var clipped = AgentBody.FootholdSpace.VIEW;
+        var refused = AgentMacroControl.ProspectSupport.View.REFUSED;
+        assertEquals(refused, build.view(empty, empty, false), "dry air without a witnessed face gives no aim");
+        assertEquals(refused, build.view(empty, clipped, false), "a missing attachment cannot start a search sweep");
+        var wrongFace = new BlockHitResult(Vec3d.ofBottomCenter(from.east()), Direction.UP, from.east().down(), false);
+        assertFalse(AgentBody.footholdFaceInEnvelope(wrongFace, build.cell, Direction.EAST),
+            "an ordinary level floor is not an anchor for replacing itself");
+        var anchor = build.cell.south();
+        var seen = new BlockHitResult(Vec3d.ofCenter(anchor).add(0, 0, -0.5), Direction.NORTH, anchor, false);
+        var miss = BlockHitResult.createMissed(seen.getPos(), seen.getSide(), anchor);
+        assertFalse(AgentBody.footholdFaceInEnvelope(miss, build.cell, Direction.EAST),
+            "an inferred direction on a missed ray is not a witnessed face");
+        build.pin(seen, Blocks.STONE.getDefaultState(), 30);
+        assertEquals(AgentMacroControl.ProspectSupport.View.ALIGN, build.view(empty, clipped, false));
+        assertEquals(refused, build.view(empty, clipped, true), "one alignment that still cannot see both probes ends the attempt");
+        for (var veto : new AgentBody.FootholdSpace[]{AgentBody.FootholdSpace.OCCLUDED, AgentBody.FootholdSpace.DARK,
+                AgentBody.FootholdSpace.OCCUPIED, AgentBody.FootholdSpace.FLUID}) {
+            assertEquals(refused, build.view(empty, veto, false));
+            assertEquals(refused, build.view(veto, empty, false));
+        }
+        build.seekingContact = true;
+        assertEquals(refused, build.view(empty, clipped, false), "contact that clips either proof isn't re-aimed");
+        assertFalse(build.confirms(40, wrongFace, Blocks.COBBLESTONE.getDefaultState(), 0));
     }
 
     @Test

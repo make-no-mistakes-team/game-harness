@@ -8,12 +8,13 @@ import {
   type FirstPlanInference, type FirstPlanRequest, type FirstPlanStrategist,
 } from "./bootstrap.ts";
 import {
-  MACRO_CAPABILITIES_VERSION, MACRO_COLLECT_PENDING, MACRO_DEFER_PENDING, MACRO_IRON_SMELT, MACRO_WATER_CLUE, MACRO_WATER_FILL,
+  MACRO_CAPABILITIES_VERSION, MACRO_COLLECT_PENDING, MACRO_DEFER_PENDING, MACRO_DIAMOND_PROSPECT, MACRO_IRON_SMELT, MACRO_WATER_CLUE, MACRO_WATER_FILL,
   MACRO_SMELT_OVERLAP_MIN_COOK_TICKS,
   MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_PLANNING_IDLE_MS, MACRO_LOOKAHEAD_MAX_AGE_TICKS, MACRO_LOOKAHEAD_MAX_CRACK,
   MacroDirectory, MacroObservationRotating, MacroValidationError,
-  hasDirectAuthority, isIndependentPendingPolicy, isPendingWorkVerb, liveCorrectionEvidence, macroReplyRejectionDetail, matchesMaterial,
+  hasDirectAuthority, isIndependentPendingPolicy, isOpeningView, isPendingWorkVerb, liveCorrectionEvidence, macroReplyRejectionDetail,
+  matchesMaterial, openingViewMatchesPolicy,
   parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
   parseMacroProposal, parseMacroReceipt, parseMacroRevocation, parseMacroWorkOrder, sameLiveCorrectionScope, validateMacroId,
   type MacroBasis, type MacroDirectAction, type MacroFeedback, type MacroFrame, type MacroHandoff, type MacroInference, type MacroIntent,
@@ -213,7 +214,7 @@ interface IntentRecoveryScope {
 
 type IntentRecovery = IntentRecoveryScope & (
   | { readonly kind: "restored-survey"; gapSeen?: true }
-  | { readonly kind: "alternative" }
+  | { readonly kind: "alternative"; readonly opening?: { readonly source: MacroObservation; readonly policy: MacroWorkPolicy } }
 );
 
 interface FirstPlanning {
@@ -269,6 +270,12 @@ interface Plan extends Decision {
   readonly proposal: MacroProposal;
 }
 
+interface OpeningView {
+  readonly plan: Plan;
+  readonly policy: MacroWorkPolicy;
+  readonly issued: Issued;
+}
+
 interface SkillCheck {
   readonly hash: string;
   readonly shadow: MacroSkillProposal | null;
@@ -303,6 +310,7 @@ interface Issued {
   readonly intent: MacroIntent;
   readonly scope: MacroObservation;
   readonly offer: MacroOpportunity;
+  readonly openingWorkView?: true;
   readonly reserves?: readonly MacroStockFloor[];
   readonly priorTargets?: ReadonlySet<string>;
   withdrawn?: true;
@@ -460,6 +468,8 @@ function sameOffer(left: MacroOpportunity | undefined, right: MacroOpportunity |
 }
 
 function sameAffordance(left: Omit<MacroOpportunity, "id">, right: MacroOpportunity): boolean {
+  if (left.anchor || right.anchor) return left.verb === right.verb && left.risk === right.risk &&
+    left.anchor?.subject === right.anchor?.subject && left.anchor?.target === right.anchor?.target;
   return left.verb === right.verb && left.summary === right.summary &&
     left.risk === right.risk && left.evidence === right.evidence && sameMaterial(left.material, right.material);
 }
@@ -469,7 +479,7 @@ function offersAffordance(observation: MacroObservation, offer: Omit<MacroOpport
 }
 
 function workAffordance(offer: MacroOpportunity): boolean {
-  return offer.risk !== "read" || offer.material !== undefined;
+  return offer.risk !== "read" || offer.material !== undefined || !!offer.anchor && isOpeningView(offer);
 }
 
 function meaningfulPrimitive(offer: MacroOpportunity): boolean {
@@ -478,6 +488,10 @@ function meaningfulPrimitive(offer: MacroOpportunity): boolean {
 }
 
 function primitiveEffectKey(observation: MacroObservation, offer: MacroOpportunity): string {
+  if (isOpeningView(offer)) {
+    // Left, right and down are one unanchored read of this stance.
+    return digest(["view", observation.life, observation.goal, observation.stance, observation.safety?.revision, offer.anchor]);
+  }
   return digest([observation.life, observation.epoch, observation.goal, offer]);
 }
 
@@ -547,7 +561,7 @@ function evidenceKey(observation: MacroObservation): string {
   return digest([
     observation.life, observation.epoch, observation.goal, guardBand(observation.health), guardBand(observation.food),
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b)),
-    orderedOpportunities(observation), observation.quiescent,
+    orderedOpportunities(observation), observation.quiescent, observation.prospectOpening,
     [...new Set(observation.recent)].sort(),
   ]);
 }
@@ -559,6 +573,54 @@ function alive(observation: MacroObservation): boolean {
 function workScope(initial: MacroObservation, current: MacroObservation, health = initial.health): boolean {
   return sameGoalAndLife(initial, current) && alive(current) && current.health >= health &&
     current.safety?.clear === true && current.safety.revision === initial.safety?.revision;
+}
+
+function sameOpeningStance(source: MacroObservation, current: MacroObservation): boolean {
+  return source.stance !== undefined && source.stance === current.stance && scope(source, current) &&
+    workScope(source, current) && !current.pendingWork && !current.working;
+}
+
+type ProspectOpening = NonNullable<MacroObservation["prospectOpening"]>;
+
+function pricedProspectOpening(observation: MacroObservation, policy: MacroWorkPolicy): ProspectOpening | undefined {
+  const clue = observation.prospectOpening;
+  const { target, allowedEffects, costCaps, reserves, maxBreaks } = policy;
+  if (!clue || target.kind !== "stock" || target.item !== "minecraft:diamond" || maxBreaks < 2 ||
+      !allowedEffects.includes(MACRO_DIAMOND_PROSPECT) || !allowedEffects.includes(`break:${clue.block}`) ||
+      !hasStock(observation, reserves)) return;
+  const carriedTool = stock(observation, clue.tool);
+  const floor = reserves.find(({ item }) => item === clue.tool)?.count ?? 0;
+  if (carriedTool < 1 || carriedTool - clue.maxToolLoss < floor ||
+      clue.maxToolLoss > (costCaps.find(({ item }) => item === clue.tool)?.count ?? 0)) return;
+  return clue;
+}
+
+function sameProspectOpening(left: ProspectOpening, right: ProspectOpening | undefined): boolean {
+  return right !== undefined && left.target === right.target && left.block === right.block &&
+    left.tool === right.tool && left.maxToolLoss === right.maxToolLoss;
+}
+
+function sameOpeningWitness(left: MacroOpportunity | ProspectOpening, right: MacroOpportunity | ProspectOpening): boolean {
+  if ("block" in left) return "block" in right && sameProspectOpening(left, right);
+  return "verb" in right && sameAffordance(left, right);
+}
+
+function openingWorkWitness(observation: MacroObservation, policy: MacroWorkPolicy, view: Pick<MacroOpportunity, "anchor">) {
+  const { anchor } = view;
+  const clue = pricedProspectOpening(observation, policy);
+  if (clue && (!anchor || (anchor.target === clue.target && anchor.subject === `block:${clue.block}`))) return clue;
+  return observation.opportunities.find(offer => {
+    const witness = offer.material ?? offer.anchor;
+    if (!witness || (anchor && (witness.target !== anchor.target || witness.subject !== anchor.subject))) return false;
+    if (witness.subject === "route:dry") {
+      return (offer.verb === "follow" || offer.verb === "approach") && policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT);
+    }
+    return offer.verb === "break" && offer.risk === "guarded" && offer.material &&
+      policy.allowedEffects.includes(`break:${witness.subject.slice("block:".length)}`) &&
+      protectsStock(policy.reserves, observation, offer) &&
+      Object.entries(offer.material.spends).every(([item, count]) =>
+        policy.costCaps.some(cap => cap.item === item && cap.count >= count) && stock(observation, item) >= count);
+  });
 }
 
 function workPolicyKey(policy: MacroWorkPolicy): string {
@@ -613,7 +675,7 @@ function witnessedSideStart(observation: MacroObservation, policy: MacroWorkPoli
 
 function workEvidence(observation: MacroObservation, lastReceipt: MacroReceipt | null): string {
   const pending = observation.pendingWork;
-  return digest([observation.run, observation.life, observation.goal, observation.safety,
+  return digest([observation.run, observation.life, observation.goal, observation.stance, observation.safety,
     lastReceipt?.life === observation.life ? lastReceipt.id : null,
     pending ? [pending.id, pending.state, pending.parked, pending.yieldable, !!pending.collectOfferId, !!pending.deferOfferId] : null,
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b))]);
@@ -723,6 +785,7 @@ export class SurvivalMacroController {
   private direct?: DirectContinuation;
   private conditional?: Conditional;
   private lease?: { readonly value: MacroHandoff; readonly plan: Plan };
+  private openingView?: OpeningView;
   private planning?: { readonly notice: MacroPlanning; readonly startedAt: number };
   private busy?: Busy;
   private ready?: Ready;
@@ -992,6 +1055,10 @@ export class SurvivalMacroController {
     // above can still enforce timeouts; retain a settled result for the retry.
     if (!observed && current && !runtimeExpired) return;
     if (this.busy?.work.result) await this.settle(current, runtimeExpired);
+    if (this.openingView) {
+      await this.advanceOpeningView(current, runtimeExpired);
+      return;
+    }
     if (this.pendingSuccessor) await this.advancePendingSuccessor(current, runtimeExpired);
     if (this.queuedWork) await this.advanceQueuedWork(current, runtimeExpired);
     if (this.replyCorrection && (!current || !this.replyCorrectionApplies(this.replyCorrection, current))) {
@@ -1291,6 +1358,19 @@ export class SurvivalMacroController {
     const recovery = this.intentRecovery;
     if (recovery?.kind !== "alternative" || current.tick - recovery.basis.tick < WORK_REPLAN_GAP_TICKS ||
         current.working || !this.isCurrentHandoff(current) || !this.intentRecoveryCurrent(recovery, current, evidence)) return;
+    const opening = recovery.opening;
+    if (opening) {
+      if (!this.openingHandoff(opening.source, current, opening.policy)) return;
+      if (openingWorkWitness(current, opening.policy, recovery.offer)) return recovery;
+      if (current.opportunities.some(offer => {
+        if (sameAffordance(recovery.offer, offer) || this.effectKeys.has(primitiveEffectKey(current, offer))) return false;
+        return (offer.verb === "approach" && offer.risk === "low" && offer.anchor?.subject === "route:dry") ||
+          (offer.verb === "follow" && offer.risk === "guarded" && offer.anchor?.subject === "route:dry" &&
+            (this.workMode === "preset" || opening.policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT))) ||
+          (!!offer.anchor && openingViewMatchesPolicy(offer, opening.policy));
+      })) return recovery;
+      return;
+    }
     const ticket = current.pendingWork;
     const reserves = this.floorScope?.life === current.life ? this.floorScope.reserves : [];
     if (ticket?.parked) {
@@ -1457,10 +1537,12 @@ export class SurvivalMacroController {
     if (unchanged && !correction && !reconsideration) {
       const asked = this.lastAsked?.observation;
       if (job || !previous.mayRecoverOnAffordance || !asked ||
-          (!(observation.quiescent && !asked.quiescent) && !observation.opportunities.some(offer =>
+          (!(observation.quiescent && !asked.quiescent) &&
+            !(observation.prospectOpening && !sameProspectOpening(observation.prospectOpening, asked.prospectOpening)) &&
+            !observation.opportunities.some(offer =>
             workAffordance(offer) && !offersAffordance(asked, offer)))) return;
     }
-    const handoffQuery = !job && (observation.quiescent || observation.opportunities.some(workAffordance))
+    const handoffQuery = !job && (observation.quiescent || observation.prospectOpening || observation.opportunities.some(workAffordance))
       ? digest([evidence, liveCorrectionEvidence({ ...observation, opportunities: observation.opportunities.filter(workAffordance) })]) : null;
     if (unchanged && !correction && !reconsideration && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
     if (handoffQuery) this.workHandoffQueries.add(handoffQuery);
@@ -1508,13 +1590,14 @@ export class SurvivalMacroController {
     if (!this.config.strategist || this.unavailable) return;
     const outcome = this.lastJobOutcome;
     const terminal = outcome?.terminal && sameGoalAndLife(outcome.source, observation) ? outcome.terminal : undefined;
-    const key = ticket.worksite ? digest([observation.safety.revision, ticket.state === "blocked", ticket.returnClue, !!ticket.collectOfferId,
+    const collect = ticket.collectOfferId ? observation.opportunities.find(offer => offer.id === ticket.collectOfferId) : undefined;
+    const key = ticket.worksite ? digest([observation.safety.revision, ticket.state === "blocked", ticket.returnClue, collect?.evidence ?? null,
       terminal ? [workPolicyKey(outcome!.policy), terminal.status, terminal.detail] : null,
       Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b)),
       observation.opportunities.filter(meaningfulPrimitive)
         .map(({ verb, risk, summary, material }) => digest([verb, risk, summary, material])).sort()]) : "no-view";
-    // ETA and opaque offer IDs do not cause rethinking. Allow one new decision
-    // if a selected but unissued recall actually lost and regained its witness.
+    // ETA and opaque offer IDs do not cause rethinking. An actual change in station evidence can.
+    // A selected but unissued recall can also be reconsidered once if it lost and regained its witness.
     const retry = window.recallLost && !!ticket.collectOfferId && !window.seen.has(`${key}:recall-rechecked`);
     const correction = ticket.worksite ? this.replyCorrection : undefined;
     const reconsideration = !correction ? this.alternativeRecovery(observation) : undefined;
@@ -1686,6 +1769,10 @@ export class SurvivalMacroController {
     const duringWaitFor = after?.order.duringWaitFor;
     const stage = stages.length > 1 && !duringWaitFor ? workStageIds(plan.requestId, stages, index, stageOffset) : undefined;
     const afterSmelt = queued.smeltSuccessor && index === 0 ? after : null;
+    const wall = !after && pricedProspectOpening(plan.observation, policy);
+    const currentWall = wall ? (fresh: MacroObservation) =>
+      this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
+      sameProspectOpening(wall, pricedProspectOpening(fresh, policy)) : undefined;
     let rejection = "fresh_work_admission_rejected";
     const job = await this.publishWork(plan.observation, policy, "model", plan.requestId, plan.proposal.expiresTick,
       requires, after?.policy, afterSmelt ? fresh => !this.job && fresh.tick >= afterSmelt.terminal!.tick &&
@@ -1711,7 +1798,7 @@ export class SurvivalMacroController {
           return false;
         }
         return true;
-      } : undefined, stage, async fresh => {
+      } : currentWall, stage, async fresh => {
         if (index === 0 && plan.correction && !this.sameReplyContext(plan.correction, fresh)) {
           await this.rejectStale(plan, "correction_context_changed_before_work_admission");
           return false;
@@ -1736,7 +1823,8 @@ export class SurvivalMacroController {
           return false;
         }
         return true;
-      }, duringWaitFor);
+      }, duringWaitFor, undefined, currentWall ? (before, latest) =>
+        latest.tick - before.tick < WORK_ADMISSION_TICKS && currentWall(latest) : undefined);
     if (job === null) return; // A rotating observation is not a denied program stage.
     if (!job && (bootstrap || afterSmelt || duringWaitFor)) return this.discardQueuedWork(queued, rejection);
     this.queuedWork = undefined;
@@ -1760,6 +1848,7 @@ export class SurvivalMacroController {
     preflight?: (observation: MacroObservation) => boolean | Promise<boolean>,
     duringWaitFor?: string,
     renewal?: WorkJob,
+    recheck?: (basis: MacroObservation, latest: MacroObservation) => boolean,
   ): Promise<WorkJob | null | undefined> {
     const fresh = await this.refresh();
     if (!fresh) return null;
@@ -1809,6 +1898,10 @@ export class SurvivalMacroController {
       ...(duringWaitFor ? { duringWaitFor } : {}),
     });
     await this.record("work_order_prepared", { requestId, order, previousId: previous?.order.id ?? null, equivalent });
+    if (recheck) {
+      const latest = await this.refresh();
+      if (!latest || !recheck(fresh, latest)) return;
+    }
     if (this.closing || this.config.signal?.aborted) return;
     await this.ipc!.write("work.json", order, previous ? "work-only" : undefined);
     if (duringWaitFor === previous?.order.id && previous) previous.independentPublished = true;
@@ -2025,7 +2118,7 @@ export class SurvivalMacroController {
         record.scope.pendingWork) this.collectedTickets.add(`${receipt.life}:${record.scope.pendingWork.id}`);
     if (eligible) this.episodeMemory.terminal(record.requestId, record.offer, receipt);
     this.terminalReceipts++;
-    if (receipt.status === "completed" && record.offer.verb !== MACRO_DEFER_PENDING) {
+    if (receipt.status === "completed" && !record.openingWorkView && record.offer.verb !== MACRO_DEFER_PENDING) {
       if (eligible) this.completedReceipts++;
       else this.lateCompletedReceipts++;
     }
@@ -2172,6 +2265,20 @@ export class SurvivalMacroController {
   ): Promise<void> {
     const trigger = this.trigger(view);
     const observation = view.observation;
+    let disclosed = observation;
+    if (workDemand && !lookahead) {
+      const lostOpening = reconsideration?.kind === "alternative" && reconsideration.opening ? reconsideration.offer : undefined;
+      const opportunities = observation.opportunities.filter(offer =>
+        (!lostOpening || !sameAffordance(lostOpening, offer)) &&
+        (!isOpeningView(offer) || !this.effectKeys.has(primitiveEffectKey(observation, offer))));
+      if (opportunities.length !== observation.opportunities.length) disclosed = { ...observation, opportunities };
+      if (workDemand.current === null && !workDemand.parkedWorksite && !observation.pendingWork && !observation.working &&
+          observation.stance !== undefined && observation.safety?.clear === true &&
+          !this.queuedWork && !this.pendingSuccessor && this.isCurrentHandoff(observation)) {
+        const openingViewIds = opportunities.filter(isOpeningView).map(({ id }) => id);
+        if (openingViewIds.length) workDemand = { ...workDemand, openingViewIds };
+      }
+    }
     const observedAt = this.observedAt;
     const requestId = randomUUID();
     const skills = lookahead || workDemand?.current ? undefined : this.config.skills;
@@ -2183,7 +2290,7 @@ export class SurvivalMacroController {
     const testedSkills = this.availableCandidates(selection?.generation);
     const generation = selection && (selectedSkillHash || skillVerbs?.length || testedSkills.length) ? selection.generation : null;
     const request: MacroRequest = {
-      observation, objective: this.objective, trigger, capabilitiesVersion: this.capabilitiesVersion,
+      observation: disclosed, objective: this.objective, trigger, capabilitiesVersion: this.capabilitiesVersion,
       skillGeneration: generation, skillVerbs, selectedSkillHash, testedSkills,
       maxSkillEffects: this.limits.maxSkillEffects,
       maxResponseBytes: this.limits.maxResponseBytes, maxIntentTtlTicks: this.limits.maxIntentTtlTicks,
@@ -2191,7 +2298,9 @@ export class SurvivalMacroController {
       lastReceipt: this.lastReceipt?.life === observation.life ? this.lastReceipt : null,
       feedback: reconsideration?.kind === "alternative" ? {
         kind: "failed_intent",
-        detail: "The previous chosen opportunity lost its witness before issuance. No effect was applied. Choose only from the current observation, or abstain.",
+        detail: reconsideration.opening
+          ? "The opening view lost its witness before issuance. No camera read or work started. If the fresh physical clue already supports the job, use ordinary work without an opening view. Otherwise choose a distinct supported alternative or abstain."
+          : "The previous chosen opportunity lost its witness before issuance. No effect was applied. Choose only from the current observation, or abstain.",
       } : correction?.feedback ?? this.currentFeedback(observation),
       ...(lookahead ? { lookahead: lookahead.evidence } : {}),
       ...(workDemand ? { work: workDemand } : {}),
@@ -2626,6 +2735,20 @@ export class SurvivalMacroController {
         await this.disposition("proposal_refused", { requestId: context.requestId, reason: "Work preset does not match the live goal." });
         return;
       }
+      if (action.kind === "work" && action.openingViewId) {
+        const offer = original.opportunities.find(offer => offer.id === action.openingViewId);
+        if (!context.workDemand.openingViewIds?.includes(action.openingViewId) || !offer ||
+            !openingViewMatchesPolicy(offer, action.policy) || openingWorkWitness(original, action.policy, offer)) {
+          await this.disposition("proposal_refused", { requestId: plan.requestId,
+            reason: "The opening view was not offered, is unrelated to this job, or the job already has a current witness." });
+          return;
+        }
+        this.episodeMemory.chosen(plan.requestId, original, proposal.subgoal, proposal.successCondition);
+        if (await this.issue(plan, original, offer.id) && this.pending) {
+          this.openingView = { plan, policy: action.policy, issued: this.pending };
+        }
+        return;
+      }
       if (action.afterWorkId) {
         const after = this.jobs.get(action.afterWorkId);
         const paidPredecessor = after && (context.workDemand.pendingPredecessor?.id === after.order.id || smeltOverlap &&
@@ -3005,6 +3128,59 @@ export class SurvivalMacroController {
       issued: direct.issued, completed: direct.completed, maxEffects: direct.maxEffects });
   }
 
+  private openingHandoff(source: MacroObservation, fresh: MacroObservation, policy: MacroWorkPolicy): boolean {
+    const inherited = this.floorScope?.life === fresh.life ? this.floorScope.reserves : [];
+    return this.isCurrentHandoff(fresh) && sameOpeningStance(source, fresh) && !this.queuedWork && !this.pendingSuccessor &&
+      !this.direct && !this.segment && !this.conditional && !this.lease && hasStock(fresh, policy.reserves) &&
+      !confirmsWorkStock(fresh, policy) &&
+      inherited.every(floor => policy.reserves.some(kept => kept.item === floor.item && kept.count >= floor.count));
+  }
+
+  private async advanceOpeningView(current: MacroObservation | undefined, runtimeExpired: boolean): Promise<void> {
+    const { plan, policy, issued } = this.openingView!;
+    const receipt = issued.terminal;
+    let reason: string;
+    if (runtimeExpired || !current || this.closing || !sameOpeningStance(issued.scope, current) ||
+        current.tick >= plan.proposal.expiresTick || issued.withdrawn) {
+      if (this.pending === issued) await this.withdraw("opening_view_scope_lost");
+      reason = "opening_view_scope_lost";
+    } else if (!receipt || current.tick <= receipt.tick) return;
+    else if (!issued.accepted || receipt.status !== "completed") reason = "opening_view_not_completed";
+    else {
+      const admits = (fresh: MacroObservation) => fresh.tick > receipt.tick && fresh.tick < plan.proposal.expiresTick &&
+        this.openingHandoff(issued.scope, fresh, policy) && openingWorkWitness(fresh, policy, issued.offer);
+      const job = await this.publishWork(issued.scope, policy, "model", plan.requestId, plan.proposal.expiresTick,
+        [], undefined, fresh => !!admits(fresh), undefined, async fresh => {
+          const check = preflightVanillaWork(fresh, [{ policy, requires: [] }]);
+          if (check.kind !== "shortage") return true;
+          await this.reportWorkShortage(plan.requestId, check, fresh);
+          return false;
+        }, undefined, undefined, (before, latest) => {
+          const witnessed = openingWorkWitness(before, policy, issued.offer);
+          const stillVisible = admits(latest);
+          return !!witnessed && !!stillVisible && latest.tick - before.tick < WORK_ADMISSION_TICKS &&
+            sameOpeningWitness(witnessed, stillVisible);
+        });
+      if (job === null) return; // Rotating observation: wait for a sample, never act on the cache.
+      reason = job ? "work_issued" : "no_supported_physical_start";
+      if (!job && this.currentFeedback(current)?.kind !== "work_resource_shortage") this.feedback = {
+        observation: current, value: { kind: "opening_view_unconfirmed",
+          detail: "The completed camera check did not establish a current start for the quoted job. No work was authorized." },
+      };
+    }
+    await this.finishOpeningView(reason);
+  }
+
+  private async finishOpeningView(reason: string): Promise<void> {
+    const opening = this.openingView;
+    if (!opening) return;
+    this.openingView = undefined;
+    if (reason !== "work_issued" && this.workQuery) this.workQuery.mayRecoverOnAffordance = true;
+    await this.record("opening_view_finished", { requestId: opening.plan.requestId, intentId: opening.issued.intent.id,
+      terminalTick: opening.issued.terminal?.tick ?? null, reason,
+      workOrderId: reason === "work_issued" ? this.job?.order.id : null });
+  }
+
   private async advanceLookahead(current: MacroObservation): Promise<void> {
     const conditional = this.conditional!;
     const { lookahead, offer, plan, action } = conditional;
@@ -3063,19 +3239,27 @@ export class SurvivalMacroController {
   }
 
   private rememberFailedIntent(plan: Plan, witnessed: MacroObservation, lost: MacroOpportunity, current: MacroObservation): void {
-    if (plan.reconsideration || plan.proposal.action.kind !== "opportunity" || plan.workDemand?.current !== null ||
+    const action = plan.proposal.action;
+    const opening = action.kind === "work" && action.openingViewId === lost.id && !!lost.anchor &&
+      openingViewMatchesPolicy(lost, action.policy) ? { source: witnessed, policy: action.policy } : undefined;
+    if (plan.reconsideration || (!opening && action.kind !== "opportunity") || plan.workDemand?.current !== null ||
         this.queuedWork || witnessed.working || current.working || !this.isCurrentHandoff(current) ||
         !scope(witnessed, current) || !workScope(witnessed, current) || witnessed.health !== current.health ||
-        current.tick >= plan.proposal.expiresTick || current.opportunities.some(offer => offer.id === lost.id)) return;
-    if (offersAffordance(current, lost)) return;
+        current.tick >= plan.proposal.expiresTick) return;
+    const stillOffered = current.opportunities.some(offer => sameOffer(lost, offer));
+    if (opening) {
+      if (!this.openingHandoff(witnessed, current, opening.policy) ||
+          (stillOffered && !openingWorkWitness(current, opening.policy, lost))) return;
+    } else if (current.opportunities.some(offer => offer.id === lost.id) || offersAffordance(current, lost)) return;
     const evidence = this.workQueryEvidence(current);
     const shared = { requestId: plan.requestId, basis: basis(witnessed), health: current.health, offer: lost, evidence };
-    if (lost.risk !== "guarded" && meaningfulPrimitive(lost) &&
+    if ((opening || lost.risk !== "guarded" && meaningfulPrimitive(lost)) &&
         workEvidence(witnessed, this.lastReceipt) === workEvidence(current, this.lastReceipt)) {
       // Spend one recovery per unchanged work premise, independent of which
       // opaque ID or camera bearing happened to fail.
       const key = digest(["alternative", current.epoch, evidence]);
       if (!this.recoveredIntents.has(key)) this.intentRecovery = { ...shared, kind: "alternative", key,
+        ...(opening ? { opening } : {}),
         expiresTick: Math.min(plan.proposal.expiresTick, current.tick + ALTERNATIVE_RECOVERY_TICKS),
         until: performance.now() + ALTERNATIVE_RECOVERY_MS };
     } else if (lost.verb === "survey" && !workAffordance(lost) && evidence === this.workQuery?.evidence) {
@@ -3104,17 +3288,25 @@ export class SurvivalMacroController {
       await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "Opportunity was never offered on its basis." });
       return false;
     }
+    const recovery = plan.reconsideration;
+    if (recovery?.kind === "alternative" && recovery.opening && sameAffordance(recovery.offer, before)) {
+      await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "The refused opening view is not a distinct recovery action." });
+      return false;
+    }
     if (before.verb === MACRO_WATER_CLUE) {
       await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "A water clue grants no primitive or skill action." });
       return false;
     }
     const action = plan.proposal.action;
     const pendingAction = action.kind === "collect-pending" || action.kind === "defer-pending" ? action : undefined;
+    const openingPolicy = action.kind === "work" && action.openingViewId === opportunityId ? action.policy : undefined;
     if (isPendingWorkVerb(before.verb) !== !!pendingAction || (pendingAction && authority)) {
       await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "Pending station use needs explicit ticket authorization." });
       return false;
     }
     const usableHandoff = (observation: MacroObservation) => {
+      if (openingPolicy) return this.openingHandoff(witnessed, observation, openingPolicy) &&
+        !openingWorkWitness(observation, openingPolicy, before);
       if (!pendingAction) return this.isCurrentHandoff(observation);
       const ticket = observation.pendingWork;
       const ticketOwner = ticket && this.jobs.get(ticket.id);
@@ -3128,7 +3320,7 @@ export class SurvivalMacroController {
         this.isCurrentHandoff(observation);
     };
     const reserves = this.floorScope?.life === current.life ? this.floorScope.reserves : [];
-    if (!pendingAction && before.risk === "guarded" && (this.workMode === "constrained" ||
+    if (!pendingAction && !openingPolicy && before.risk === "guarded" && (this.workMode === "constrained" ||
         (reserves.length && !protectsStock(reserves, current, before)))) {
       await this.disposition("proposal_refused", { requestId: plan.requestId,
         reason: "This material effect is not authorized by the constrained policy or would break a protected reserve." });
@@ -3148,6 +3340,7 @@ export class SurvivalMacroController {
       : primitiveEffectKey(current, after);
     const segmentKey = digest(after);
     if (this.effectKeys.has(key) || selection?.continuation?.seen.has(segmentKey)) {
+      if (this.workQuery && isOpeningView(after)) this.workQuery.mayRecoverOnAffordance = true;
       await this.disposition("duplicate_intent_refused", { requestId: plan.requestId, opportunityId });
       return false;
     }
@@ -3159,6 +3352,7 @@ export class SurvivalMacroController {
       skillHash: selection?.hash ?? null,
     });
     await this.record("intent_prepared", { requestId: plan.requestId, intent, witnessed: before,
+      ...(openingPolicy ? { authority: "opening-view" } : {}),
       ...(direct ? { authority: "direct-continuation", stage: direct.stage + 1,
         selector: direct.action.steps[direct.stage]!.selector, reserves: direct.action.reserves } : {}),
       ...(conditional ? { authority: "conditional-successor", predecessorId: conditional.action.afterIntentId,
@@ -3167,7 +3361,7 @@ export class SurvivalMacroController {
     if (!refreshed && (direct || conditional)) return null;
     if (!refreshed || !usableHandoff(refreshed) || !samePlayableScope(current, refreshed) || refreshed.tick >= intent.expiresTick ||
         !sameOffer(after, refreshed.opportunities.find(offer => offer.id === opportunityId)) ||
-        (!pendingAction && before.risk === "guarded" && reserves.length > 0 && !protectsStock(reserves, refreshed, after!)) ||
+        (!pendingAction && !openingPolicy && before.risk === "guarded" && reserves.length > 0 && !protectsStock(reserves, refreshed, after!)) ||
         (direct && (!directScope(direct, refreshed) || !directConditions(direct, refreshed) || !protectsStock(direct.action.reserves, refreshed, after!))) ||
         (conditional && (refreshed.working || !successorScope(conditional, refreshed) || !successorStock(conditional, refreshed, after!))) ||
         (selection && (!selection.offer || !this.isSelectedSkill(selection.hash, selection.generation) ||
@@ -3177,6 +3371,7 @@ export class SurvivalMacroController {
       return false;
     }
     const macro: Issued = { requestId: plan.requestId, intent, scope: refreshed, offer: after!,
+      ...(openingPolicy ? { openingWorkView: true } : {}),
       ...(direct ? { reserves: direct.action.reserves, priorTargets: direct.usedTargets } : {}),
       ...(conditional ? { lookedAhead: true } : {}),
     };
@@ -3303,6 +3498,7 @@ export class SurvivalMacroController {
     try { await this.endPlanning("revoked"); } catch (error) { errors.push(error); }
     if (this.pendingSuccessor) await this.advancePendingSuccessor(undefined, true);
     if (this.queuedWork) await this.advanceQueuedWork(undefined, true);
+    await this.finishOpeningView("authority_revoked");
     if (errors.length) throw new AggregateError(errors, "Could not remove all native macro authority files.");
   }
 

@@ -2,7 +2,36 @@ import { expect, spyOn, test } from "bun:test";
 import { link, mkdtemp, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { MacroDirectory, MacroObservationRotating, parseMacroObservation, parseMacroProposal, parseMacroWorkOrder } from "../src/server/survival-macro/protocol.ts";
+import {
+  MACRO_CAPABILITIES_VERSION, MacroDirectory, MacroObservationRotating, hasDirectAuthority,
+  parseMacroObservation, parseMacroProposal, parseMacroWorkOrder,
+} from "../src/server/survival-macro/protocol.ts";
+
+test("A prospect opening is a bounded dry wall clue, never a material opportunity", () => {
+  const observation = {
+    v: 1, run: "run", life: 1, epoch: 1, tick: 20, goal: "diamond", health: 20, food: 20, stance: 1,
+    inventory: { "minecraft:iron_pickaxe": 1 }, opportunities: [], recent: [], quiescent: false,
+    safety: { clear: true, revision: 1 },
+  };
+  const prospectOpening = { block: "minecraft:stone", target: "wall-a", tool: "minecraft:iron_pickaxe", maxToolLoss: 0 } as const;
+  expect(parseMacroObservation(observation).prospectOpening).toBeUndefined();
+  const live = parseMacroObservation({ ...observation, prospectOpening });
+  expect(live.prospectOpening).toEqual(prospectOpening);
+  expect(live.opportunities).toEqual([]);
+  expect(hasDirectAuthority({
+    kind: "continuation", opportunityId: prospectOpening.target, reserves: [],
+    steps: [{ selector: { verb: "break", subject: "block:minecraft:stone" }, maxEffects: 1, until: null }],
+  }, live, MACRO_CAPABILITIES_VERSION)).toBe(false);
+  for (const invalid of [
+    { ...prospectOpening, block: "minecraft:water" },
+    { ...prospectOpening, block: "minecraft:furnace" },
+    { ...prospectOpening, block: "minecraft:diamond_ore" },
+    { ...prospectOpening, maxToolLoss: 2 },
+    { ...prospectOpening, verb: "break" },
+  ]) expect(() => parseMacroObservation({ ...observation, prospectOpening: invalid })).toThrow("prospect opening");
+  expect(() => parseMacroObservation({ ...observation, prospectOpening,
+    safety: { clear: false, revision: 2 } })).toThrow("prospect opening scope");
+});
 
 test("Work program caps apply across stages and a later job cannot lower an earlier reserve", () => {
   const log = "minecraft:oak_log";
@@ -150,6 +179,12 @@ test("Pending stock is not inventory or a permission to spend, replace, or renew
     contingency: "Stop on risk", alternative: "Wait for the kitchen", expiresTick: 660 };
   expect(() => parseMacroProposal({ ...proposal, action: { kind: "work", policy: side,
     duringWaitFor: ticket.id, afterWorkId: ticket.id } })).toThrow("exclusive work relationship");
+  expect(parseMacroProposal({ ...proposal, action: { kind: "work", policy: side, openingViewId: "cave-view" } })
+    .action).toMatchObject({ openingViewId: "cave-view" });
+  for (const relationship of [{ duringWaitFor: ticket.id }, { afterWorkId: ticket.id }]) {
+    expect(() => parseMacroProposal({ ...proposal, action: { kind: "work", policy: side,
+      openingViewId: "cave-view", ...relationship } })).toThrow("exclusive work relationship");
+  }
   expect(() => parseMacroProposal({ ...proposal, action: { kind: "skill", candidate: { source: "pass", parentGeneration: 0,
     verbs: ["survey"], duringWaitFor: ticket.id } } })).toThrow();
 });

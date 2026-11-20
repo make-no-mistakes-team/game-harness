@@ -698,6 +698,11 @@ final class AgentHands {
         return false;
     }
 
+    boolean canEquipSlot(PlayerInventory inventory, int slot) {
+        return slot == inventory.selectedSlot || (slot < PlayerInventory.HOTBAR_SIZE
+            || !c.options.inventoryKey.isUnbound()) && equipDestination(inventory, slot) >= 0;
+    }
+
     private int equipDestination(PlayerInventory inv, int source) {
         if (source < PlayerInventory.HOTBAR_SIZE)
             return c.options.hotbarKeys[source].isUnbound() ? -1 : source;

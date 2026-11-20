@@ -1,8 +1,11 @@
 package io.gameharness.survival;
 
 import io.gameharness.survival.AgentRouteGraph.Retirement;
-import java.util.EnumSet;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
@@ -16,9 +19,10 @@ import net.minecraft.util.math.Vec3d;
 
 /** Observes from the real cave stance; only Body can drive the next selected edge. */
 final class AgentDryCaveRoute {
-    private static final int VIEW_TICKS = 51, DRIVE_TICKS = 23;
+    private static final int VIEW_TICKS = 18, DRIVE_TICKS = 23;
     private static final int OFFER_FRESH_TICKS = 24, OFFER_MAX_TICKS = 1200;
-    private static final int FORWARD = 0x7f, RETURN = 0x180, COMPLETE = FORWARD | RETURN;
+    private static final int STRIP_EDGES = 4, WITNESS_TICKS = 30, PROBE_CACHE_SIZE = 48;
+    private static final int SURVEY_LANES = 512;
     record Offer(BlockPos from, BlockPos next, BlockPos endpoint, int edges) {
         int heightChange() { return endpoint.getY() - from.getY(); }
     }
@@ -26,62 +30,76 @@ final class AgentDryCaveRoute {
         private final BlockPos from, to;
         private final Direction bearing;
         private final BlockHitResult witness;
+        private final float pitch;
 
-        private Survey(BlockPos from, BlockPos to, Direction bearing, BlockHitResult witness) {
+        private Survey(BlockPos from, BlockPos to, Direction bearing, BlockHitResult witness, float pitch) {
             this.from = from;
             this.to = to;
             this.bearing = bearing;
             this.witness = witness;
+            this.pitch = pitch;
         }
+
+        Direction bearing() { return bearing; }
+        BlockPos target() { return to; }
     }
+    private record SurveyLane(BlockPos from, Direction bearing) {}
     enum SurveyResult { RUNNING, PAIRED, UNPROVED, REFUSED }
     enum DirectResult { RUNNING, ARRIVED, REFUSED }
+    enum LevelPassage { WITNESSED, UNPROVED, HAZARD }
 
     private final MinecraftClient client;
     private final AgentBody body;
     private final BiConsumer<BlockPos, BlockPos> reached;
     private final AgentRouteGraph graph = new AgentRouteGraph();
+    private final AgentWalkedRoute.Motion driveMotion = new AgentWalkedRoute.Motion();
+    private final BlockPos.Mutable driveSupport = new BlockPos.Mutable();
     private final Probe[] candidates = new Probe[3];
-    private final Probe[] passive = new Probe[3];
+    private final Probe[] probes = new Probe[PROBE_CACHE_SIZE];
+    private final Map<SurveyLane, Survey> examinedLips = new HashMap<>();
+    private final ProbeView probeView;
     private final Predicate<BlockState> drySurveyBlock = state -> !state.isAir() && state.getFluidState().isEmpty();
     private final Predicate<BlockHitResult> drySurveyFace = this::visibleLowerFace;
-    private final long[] offeredHops = new long[8];
+    private final long[] offeredHops = new long[STRIP_EDGES];
     private ClientWorld world;
     private ClientPlayerEntity player;
     private Direction basis, bearing, unprovedBearing, lightBearing;
     private BlockPos anchor, contact, viewAt, endpoint, limitedAt, unprovedAt, lightAt;
     private Direction contactBearing;
-    private Vec3d lastFeet, lastDriveFeet;
+    private Vec3d lastFeet;
     private long lastContactTick, lastPoseTick, surveyEvidence;
-    private int viewIndex, viewAdmissions, completedViewTick = -1000, since, lastTurn, centerSince, movingContacts;
+    private int viewIndex, since, lastTurn, centerSince, probeCursor;
     private int missingDriveViews;
     private int missingDirectViews;
     private Probe edge;
-    private boolean moving, looked, apertureChecked, yieldRefusal;
+    private BlockState driveSource, driveLanding;
+    private long plannedAhead = AgentRouteGraph.NO_CELL;
+    private boolean moving, apertureChecked, yieldRefusal;
     private BlockHitResult ore, lava;
     private Offer offered, direct;
-    private Vec3d offeredFeet, passiveFeet;
-    private BlockPos passiveAt;
-    private Direction passiveBearing;
-    private int passiveSince, offeredAt, offeredSeen, offeredTopology, offeredCount, directHop;
+    private Consumer<AgentSurfaceTread.Edge> directLanded;
+    private boolean stopDirectAfterArrival;
+    private Vec3d offeredFeet;
+    private int offeredAt, offeredSeen, offeredTopology, offeredCount, directHop;
+    private int offerReadAt = -1, surveyReadAt = -1;
+    private long offerReadFrame = -1, surveyReadFrame = -1;
     private String activity = "dry route idle";
     private String directReason = "no active dry route";
     private String offerEvidence = "No dry-route observation";
     private Survey surveyOffered, surveyActive;
-    private BlockPos surveyedBearingsAt;
-    private final EnumSet<Direction> surveyedBearings = EnumSet.noneOf(Direction.class);
     private Probe surveyProbe, surveyed;
-    private Vec3d surveyFeet;
+    private Vec3d surveyFeet, surveyOfferedFeet;
     private BlockPos surveySource;
     private Direction surveyBearing;
-    private int surveyOfferedAt, surveyStarted, surveyLastTick, surveyedAt;
+    private int surveyOfferedAt, surveyStarted, surveyLastTick, surveyViewedAt, surveyedAt;
     private long surveyFrame;
-    private boolean surveySampled;
+    private boolean surveyGeometryChanged;
 
     AgentDryCaveRoute(MinecraftClient client, AgentBody body, BiConsumer<BlockPos, BlockPos> reached) {
         this.client = client;
         this.body = body;
         this.reached = reached;
+        probeView = body.dryCaveProbeView();
     }
 
     String status() { return activity; }
@@ -106,7 +124,7 @@ final class AgentDryCaveRoute {
 
     Direction takeApertureView(BlockPos source) {
         if (apertureChecked || !source.equals(viewAt)
-                || !body.renderedDirection(bearing.getPositiveHorizontalDegrees(), 10, 5)) return null;
+                || !body.dryRouteView() || player.getHorizontalFacing() != bearing) return null;
         apertureChecked = true;
         return bearing;
     }
@@ -127,105 +145,100 @@ final class AgentDryCaveRoute {
         if (direct != null || surveyActive != null) return noOffer("The dry-route actor already owns a scoped operation.");
         if (player == null || !dry()) {
             offered = null;
-            passiveAt = null;
             return noOffer("No live dry first-person stance.");
         }
         BlockPos current = player.getBlockPos();
-        if (!offerStance(current)) {
-            offered = null;
-            passiveAt = null;
-            return noOffer("The grounded pose is outside the dry route stance envelope.");
-        }
-        if (offered != null && (!offerFresh(now) || !sameOfferSource(current))) {
-            offered = null;
-            passiveAt = null;
-        }
         if (!body.dryRouteView()) return noOffer("No recent rendered first-person view.");
         Direction facing = player.getHorizontalFacing();
         if (!directSourceContact(current, facing)) {
             offered = null;
-            passiveAt = null;
             return noOffer("The grounded pose is outside the facing lane's support envelope.");
         }
-        if (!current.equals(passiveAt) || facing != passiveBearing || player.getPos().squaredDistanceTo(passiveFeet) > 0.01
-                || offered == null && now - passiveSince > VIEW_TICKS) {
-            offered = null;
-            passiveAt = current;
-            passiveFeet = player.getPos();
-            passiveBearing = facing;
-            passiveSince = now;
-            for (int i = 0; i < passive.length; i++)
-                passive[i] = new Probe(current, current.offset(facing).up(i - 1), facing);
+        if (offered != null && (!offerFresh(now) || !sameOfferSource(current))) offered = null;
+        if (surveyed != null && (now - surveyedAt > WITNESS_TICKS
+                || !surveyed.from.equals(current) || surveyed.bearing != facing)) surveyed = null;
+        long frame = body.renderedFrame();
+        if (now == offerReadAt && frame == offerReadFrame) return offered;
+        offerReadAt = now;
+        offerReadFrame = frame;
+        int level = sampleStrip(current, facing);
+        Probe down = selectedProbe(current, current.offset(facing).down());
+        Probe up = selectedProbe(current, current.offset(facing).up());
+        // A straight multi-edge lane is already the longest observed run in this
+        // bearing. On a split at one edge keep the route graph's existing work priority.
+        if (level < 2 || surveyed == down) {
+            observePair(down, null, 0);
+            if (level == 0 && !paired(down)) observePair(up, null, 0);
         }
-        for (Probe probe : passive) {
-            probe.sample(true);
-            if (!probe.complete() || !probe.liveFloor) continue;
-            if (anchor == null) startGraph(current, facing);
-            if (admit(current, probe.to) | admit(probe.to, current)) register(probe.to);
-        }
-        if (surveyed != null) {
-            if (now - surveyedAt > OFFER_MAX_TICKS || !surveyed.from.equals(current)
-                    || surveyed.bearing != facing || player.getPos().squaredDistanceTo(surveyFeet) > 0.01) {
-                surveyed = null;
-            } else {
-                surveyed.sample(true);
-                if (surveyed.complete() && surveyed.liveFloor
-                        && graph.usable(current.asLong(), surveyed.to.asLong())
-                        && graph.usable(surveyed.to.asLong(), current.asLong())) {
-                    graph.plan(current.asLong()); // Refresh independent homeward proof for this exact pair.
-                    if (graph.canReturn(current.asLong()) && graph.canReturn(surveyed.to.asLong())
-                            && body.dryRouteVeto(current, surveyed.to) == AgentBody.DryRouteVeto.CLEAR
-                            && directPickupClear(surveyed)) {
-                        long hop = surveyed.to.asLong();
-                        return rememberOffer(current, now, 1, hop);
-                    }
+        if (anchor != null) {
+            AgentRouteGraph.Status plan = graph.plan(current.asLong());
+            if (graph.canReturn(current.asLong())) {
+                if (surveyed == down && canOffer(down)) return rememberOffer(current, down.to, now, 1);
+                if (level < 2 && plan == AgentRouteGraph.Status.MOVE) {
+                    long first = graph.next();
+                    if (first == down.to.asLong() && canOffer(down)) return rememberOffer(current, down.to, now, 1);
+                    if (first == up.to.asLong() && canOffer(up)) return rememberOffer(current, up.to, now, 1);
                 }
+                Probe first = selectedProbe(current, current.offset(facing));
+                if (level > 0 && canOffer(first)) {
+                    int count = 1;
+                    for (; count < level; count++) {
+                        BlockPos from = current.offset(facing, count);
+                        Probe next = selectedProbe(from, from.offset(facing));
+                        if (!paired(next) || !graph.canReturn(next.to.asLong()) || !directPickupClear(next)) break;
+                    }
+                    return rememberOffer(current, current.offset(facing, count), now, count);
+                }
+                if (canOffer(down)) return rememberOffer(current, down.to, now, 1);
+                if (canOffer(up)) return rememberOffer(current, up.to, now, 1);
             }
         }
-        if (anchor == null || graph.plan(current.asLong()) != AgentRouteGraph.Status.MOVE) {
-            offered = null;
-            return noOffer("No committed paired route. Lower edge: " + passive[0].evidence() + ".");
-        }
-        int count = graph.directPrefixSize(current.asLong(), offeredHops.length);
-        if (count == 0) {
-            offered = null;
-            return noOffer("The selected route has no supported direct prefix.");
-        }
-        long first = graph.segmentCell(0);
-        Probe firstProbe = surveyed != null && surveyed.to.asLong() == first ? surveyed : null;
-        for (Probe probe : passive) if (probe.to.asLong() == first && (firstProbe == null || !firstProbe.liveFloor)) {
-            if (firstProbe == null || probe.complete()) firstProbe = probe;
-        }
-        if (firstProbe == null || !firstProbe.complete() || !firstProbe.liveFloor
-                || firstProbe.to.getY() > current.getY() && client.options.jumpKey.isUnbound()) {
-            offered = null;
-            return noOffer(firstProbe == null ? "The committed first edge is outside this camera lane."
-                : "The committed first edge lacks a current paired witness: " + firstProbe.evidence() + ".");
-        }
-        AgentBody.DryRouteVeto veto = body.dryRouteVeto(firstProbe.from, firstProbe.to);
-        if (veto != AgentBody.DryRouteVeto.CLEAR || !directPickupClear(firstProbe)) {
-            offered = null;
-            return noOffer(veto == AgentBody.DryRouteVeto.CLEAR ? "Visible pickup or incomplete pickup clearance."
-                : "The current sweep refused the first edge: " + veto + ".");
-        }
-        return rememberOffer(current, now, count, AgentRouteGraph.NO_CELL);
+        offered = null;
+        return noOffer("No witnessed forward strip with a proved return. Level: "
+            + selectedProbe(current, current.offset(facing)).evidence() + "; lower: " + down.evidence() + ".");
     }
 
-    private Offer rememberOffer(BlockPos current, int now, int count, long selectedHop) {
-        boolean exact = selectedHop != AgentRouteGraph.NO_CELL;
-        boolean same = offerFresh(now) && count == offeredCount;
-        for (int i = 0; same && i < count; i++) same = (exact ? selectedHop : graph.segmentCell(i)) == offeredHops[i];
-        if (!same) {
-            for (int i = 0; i < count; i++) offeredHops[i] = exact ? selectedHop : graph.segmentCell(i);
-            offered = new Offer(current, BlockPos.fromLong(offeredHops[0]),
-                BlockPos.fromLong(offeredHops[count - 1]), count);
+    private boolean canOffer(Probe probe) {
+        return paired(probe) && graph.canReturn(probe.to.asLong())
+            && (probe.to.getY() <= probe.from.getY() || !client.options.jumpKey.isUnbound())
+            && negativeTransitVetoesClear(probe)
+            && body.dryRouteVeto(probe.from, probe.to) == AgentBody.DryRouteVeto.CLEAR && directPickupClear(probe);
+    }
+
+    private boolean negativeTransitVetoesClear(Probe probe) {
+        // Only called after positive paired evidence. Neither veto adds terrain to the graph.
+        int now = body.actionTick();
+        if (probe.lastTransitCheck != now) {
+            probe.lastTransitCheck = now;
+            probe.transitClear = body.walkedLaneDry(probe.from, probe.to, probe.bearing)
+                && AgentSurfaceTread.retainedLaneClear(client, probe.from, probe.to, probe.bearing);
+        }
+        return probe.transitClear;
+    }
+
+    /** Visible lower passage only. The caller must still veto the exact dry standing sweep. */
+    LevelPassage levelPassage(BlockPos from, BlockPos to) {
+        ensureLife();
+        if (player == null || !dry() || !body.dryRouteView() || !settled(from, 0.27)
+                || from.getY() != to.getY() || !cardinal(from, to)) return LevelPassage.UNPROVED;
+        Probe probe = selectedProbe(from, to);
+        sampleEdge(probe);
+        if (probe.failure == Retirement.HAZARD) return LevelPassage.HAZARD;
+        return probe.complete(body.actionTick()) ? LevelPassage.WITNESSED : LevelPassage.UNPROVED;
+    }
+
+    private Offer rememberOffer(BlockPos current, BlockPos end, int now, int count) {
+        if (!offerFresh(now) || !end.equals(offered.endpoint) || count != offeredCount) {
+            Direction forward = bearing(current, end);
+            for (int i = 0; i < count; i++) offeredHops[i] = count == 1 ? end.asLong() : current.offset(forward, i + 1).asLong();
+            offered = new Offer(current, count == 1 ? end : current.offset(forward), end, count);
             offeredCount = count;
             offeredFeet = player.getPos();
             offeredAt = now;
             offeredTopology = graph.topologyEpoch();
         }
         offeredSeen = now;
-        offerEvidence = "The first directed edge, its return, and the current dry sweep are witnessed.";
+        offerEvidence = "Witnessed " + count + " paired dry " + (count == 1 ? "edge." : "edges in one forward strip.");
         return offered;
     }
 
@@ -236,28 +249,52 @@ final class AgentDryCaveRoute {
 
     Survey surveyOffer() {
         ensureLife();
-        if (player == null || direct != null || surveyActive != null || !dry() || !body.dryRouteView()) return null;
+        if (player == null || direct != null || surveyActive != null || !dry() || !body.dryRouteView()) return noSurvey();
         BlockPos from = player.getBlockPos();
         Direction bearing = player.getHorizontalFacing();
-        if (!directSourceContact(from, bearing)) return null;
+        if (!directSourceContact(from, bearing)) return noSurvey();
         BlockPos to = from.offset(bearing).down();
-        if (!from.equals(surveyedBearingsAt)) {
-            surveyedBearingsAt = from;
-            surveyedBearings.clear();
-        }
-        if (surveyedBearings.contains(bearing)) return null;
+        if (examinedLips.size() >= SURVEY_LANES || examinedLips.containsKey(new SurveyLane(from, bearing))) return noSurvey();
+        int now = body.actionTick();
+        long frame = body.renderedFrame();
+        if (now == surveyReadAt && frame == surveyReadFrame && from.equals(surveySource) && bearing == surveyBearing)
+            return surveyOfferedAt == now ? surveyOffered : null;
+        surveyReadAt = now;
+        surveyReadFrame = frame;
         surveySource = from;
         surveyBearing = bearing;
+        Probe probe = selectedProbe(from, to);
+        sampleEdge(probe);
+        Vec3d missing = probe.lowerGlance(now);
+        if (missing == null || body.dryRoutePointInView(missing)) return noSurvey();
         BlockHitResult lower = body.find(drySurveyBlock, 4, drySurveyFace).orElse(null);
-        if (lower == null) return null;
-        int now = body.actionTick();
-        if (surveyOffered == null || now - surveyOfferedAt >= OFFER_MAX_TICKS || !surveyOffered.from.equals(from)
+        if (lower == null) return noSurvey();
+        if (surveyOffered == null || !surveyOffered.from.equals(from)
                 || !surveyOffered.to.equals(to)
+                || player.getPos().squaredDistanceTo(surveyOfferedFeet) > 0.01
                 || !liveSurveyCue(surveyOffered.witness)) {
-            surveyOffered = new Survey(from, to, bearing, lower);
-            surveyOfferedAt = now;
+            Vec3d delta = missing.subtract(player.getEyePos());
+            // Include the missing low witness near the center of one ordinary
+            // downward glance, with room left for the already visible upper lane.
+            float pitch = (float) Math.toDegrees(Math.atan2(-delta.y, delta.horizontalLength())) - 13;
+            pitch = Math.min(54f, Math.max(27f, pitch));
+            Vec3d feet = player.getPos();
+            float yaw = bearing.getPositiveHorizontalDegrees();
+            for (int i = 0; i < probe.points.length; i++) {
+                Vec3d point = probe.points[i];
+                if (point != null && !probe.fresh(i, now) && !body.macroRetainsView(point, feet, yaw, pitch))
+                    return noSurvey();
+            }
+            surveyOffered = new Survey(from, to, bearing, lower, pitch);
+            surveyOfferedFeet = feet;
         }
+        surveyOfferedAt = now;
         return surveyOffered;
+    }
+
+    private Survey noSurvey() {
+        surveyOffered = null;
+        return null;
     }
 
     private boolean visibleLowerFace(BlockHitResult hit) {
@@ -277,10 +314,12 @@ final class AgentDryCaveRoute {
 
     boolean surveyCurrent(Survey authorization) {
         return authorization != null && authorization == surveyOffered && direct == null && surveyActive == null
-            && player != null && dry() && body.actionTick() - surveyOfferedAt < OFFER_MAX_TICKS
+            && player != null && dry() && body.dryRouteView()
+            && body.actionTick() - surveyOfferedAt <= OFFER_FRESH_TICKS
             && player.getHorizontalFacing() == authorization.bearing
             && directSourceContact(authorization.from, authorization.bearing)
-            && liveSurveyCue(authorization.witness);
+            && player.getPos().squaredDistanceTo(surveyOfferedFeet) <= 0.01
+            && surveyOffer() == authorization;
     }
 
     SurveyResult surveyDirect(Survey authorization) {
@@ -288,50 +327,48 @@ final class AgentDryCaveRoute {
         if (surveyActive == null) {
             if (!surveyCurrent(authorization)) return SurveyResult.REFUSED;
             surveyActive = authorization;
-            surveyedBearings.add(authorization.bearing);
-            surveyProbe = new Probe(authorization.from, authorization.to, authorization.bearing);
+            examinedLips.put(new SurveyLane(authorization.from, authorization.bearing), authorization);
+            surveyOffered = null; // No authorization can be replayed after an attempt.
+            surveyProbe = selectedProbe(authorization.from, authorization.to);
             surveyFeet = player.getPos();
-            surveyStarted = now;
-            surveyFrame = body.renderedFrame();
-            surveySampled = false;
+            surveyStarted = surveyViewedAt = now;
+            surveyFrame = -1;
+            surveyGeometryChanged = false;
         } else if (surveyActive != authorization || now != surveyLastTick + 1 || !dry()
+                || player.getHorizontalFacing() != authorization.bearing
                 || !directSourceContact(authorization.from, authorization.bearing)
                 || player.getPos().squaredDistanceTo(surveyFeet) > 0.01) {
             return SurveyResult.REFUSED;
         }
         surveyLastTick = now;
+        if (surveyGeometryChanged) return SurveyResult.UNPROVED;
         int age = now - surveyStarted;
         if (body.dryRouteView() && body.renderedFrame() > surveyFrame) {
             surveyFrame = body.renderedFrame();
-            surveyProbe.sample(true);
-            surveySampled = true;
-            if (surveyProbe.complete() && surveyProbe.liveFloor) {
-                if (anchor == null) startGraph(authorization.from, authorization.bearing);
-                if (admit(authorization.from, authorization.to) | admit(authorization.to, authorization.from))
-                    register(authorization.to);
-                if (graph.usable(authorization.from.asLong(), authorization.to.asLong())
-                        && graph.usable(authorization.to.asLong(), authorization.from.asLong())) {
-                    surveyed = surveyProbe;
-                    surveyedAt = now;
-                    return SurveyResult.PAIRED;
-                }
+            surveyViewedAt = now;
+            observePair(surveyProbe, null, 0);
+            if (surveyGeometryChanged) return SurveyResult.UNPROVED;
+            if (paired(surveyProbe) && graph.refreshReturn(authorization.from.asLong())
+                    && graph.canReturn(authorization.to.asLong())) {
+                surveyed = surveyProbe;
+                surveyedAt = now;
+                offerReadAt = -1;
+                return SurveyResult.PAIRED;
             }
+            if (surveyProbe.failure != null || surveyProbe.floorEvidence == AgentBody.DryRouteTop.NO_FULL_TOP
+                    || body.renderedDirection(
+                    authorization.bearing.getPositiveHorizontalDegrees(), authorization.pitch, 5))
+                return SurveyResult.UNPROVED;
         }
-        if (age >= VIEW_TICKS) return surveySampled ? SurveyResult.UNPROVED : SurveyResult.REFUSED;
-        if (body.dryRouteView()) {
-            float pitch = switch (age / 11) {
-                case 0 -> 68;   // Acquire the lower tread.
-                case 1 -> 31;   // Check shin, width and entry.
-                case 2 -> -32;  // Check inverse takeoff/headroom.
-                default -> 64;  // Finish with a fresh floor, not a memorized view.
-            };
-            body.turnFixed(authorization.bearing.getPositiveHorizontalDegrees(), pitch);
-        }
+        if (now - surveyViewedAt > 2) return SurveyResult.REFUSED;
+        if (age >= VIEW_TICKS) return surveyFrame >= 0 ? SurveyResult.UNPROVED : SurveyResult.REFUSED;
+        if (body.dryRouteView()) body.turnFixed(authorization.bearing.getPositiveHorizontalDegrees(), authorization.pitch);
         return SurveyResult.RUNNING;
     }
 
     String surveyEvidence(Survey authorization) {
-        return authorization == surveyActive && surveyProbe != null ? surveyProbe.evidence() : "view unavailable";
+        if (authorization != surveyActive || surveyProbe == null) return "view unavailable";
+        return surveyGeometryChanged ? "the exact lip geometry changed during the glance" : surveyProbe.evidence();
     }
 
     void cancelSurvey(Survey authorization) {
@@ -358,7 +395,7 @@ final class AgentDryCaveRoute {
         return source.equals(offered.from) && player.getPos().squaredDistanceTo(offeredFeet) <= 0.01;
     }
 
-    DirectResult follow(Offer authorization, int tick) {
+    DirectResult follow(Offer authorization, int tick, Consumer<AgentSurfaceTread.Edge> landed) {
         ensureLife();
         if (authorization == null || player == null || !dry())
             return directRefusal("safe dry first-person control is no longer available");
@@ -405,14 +442,19 @@ final class AgentDryCaveRoute {
                     missingDirectViews = 0;
                 }
             }
-            if (graph.topologyEpoch() != offeredTopology) {
+            if (!stopDirectAfterArrival && graph.topologyEpoch() != offeredTopology) {
                 long from = directHop == 0 ? direct.from.asLong() : offeredHops[directHop - 1];
-                if (!graph.revalidateDirectSuffix(from, offeredHops, directHop, offeredCount))
-                    return directRefusal("the pinned directed route or its proved return changed");
+                if (!graph.revalidateDirectSuffix(from, offeredHops, directHop, offeredCount)) {
+                    if (!moving || edge == null || !paired(edge) || !graph.refreshReturn(edge.to.asLong()))
+                        return directRefusal("the pinned directed route or its proved return changed");
+                    // Losing a later row must not cut off an otherwise safe current landing.
+                    stopDirectAfterArrival = true;
+                }
                 offeredTopology = graph.topologyEpoch();
             }
         }
         lastTurn = now;
+        directLanded = landed;
         if (edge == null) {
             BlockPos from = directHop == 0 ? direct.from : BlockPos.fromLong(offeredHops[directHop - 1]);
             BlockPos to = BlockPos.fromLong(offeredHops[directHop]);
@@ -420,12 +462,11 @@ final class AgentDryCaveRoute {
                     : !settled(from, 0.22)) return directRefusal("did not remain on the authorized support");
             if (!graph.revalidateDirectSuffix(from.asLong(), offeredHops, directHop, offeredCount))
                 return directRefusal("the exact next edge or its proved return path changed");
-            edge = new Probe(from, to, bearing(from, to));
+            edge = selectedProbe(from, to);
             since = tick;
             activity = "dry route selected: authorized return-connected segment to " + at(endpoint)
                 + "; next " + at(from) + " -> " + at(to);
             directReason = "checking the authorized next edge";
-            return DirectResult.RUNNING;
         }
         if (moving) drive(tick);
         else {
@@ -433,12 +474,13 @@ final class AgentDryCaveRoute {
                 return directRefusal("actual source changed while revalidating the selected edge");
             validate(tick, player.getBlockPos());
         }
-        if (yieldRefusal || edge == null && (!player.isOnGround()
-                || !player.getBlockPos().equals(BlockPos.fromLong(offeredHops[directHop])))) {
+        if (yieldRefusal) {
             clearDirect();
             return DirectResult.REFUSED;
         }
-        if (edge == null && ++directHop == offeredCount) {
+        if (edge == null && stopDirectAfterArrival)
+            return directRefusal("settled on the last verified support; the pinned next leg changed");
+        if (directHop == offeredCount) {
             directReason = "settled on the authorized segment endpoint";
             clearDirect();
             return DirectResult.ARRIVED;
@@ -455,6 +497,8 @@ final class AgentDryCaveRoute {
 
     private void clearDirect() {
         direct = offered = null;
+        directLanded = null;
+        stopDirectAfterArrival = false;
         yieldRefusal = false;
         interrupt();
     }
@@ -486,8 +530,10 @@ final class AgentDryCaveRoute {
                 || !offerStance(offered.from) || !sameOfferSource(offered.from))) {
             // Moving away and back between refresh calls must not revive an old offer.
             offered = null;
-            passiveAt = null;
         }
+        if (surveyOffered != null && (player == null || !dry() || !offerStance(surveyOffered.from)
+                || player.getPos().squaredDistanceTo(surveyOfferedFeet) > 0.01)) surveyOffered = null;
+        if (surveyed != null && (player == null || !dry() || !player.getBlockPos().equals(surveyed.from))) surveyed = null;
         if (anchor == null || player == null) return;
         Vec3d feet = player.getPos();
         if (!dry() || tick != lastPoseTick + 1 || lastFeet == null
@@ -535,13 +581,21 @@ final class AgentDryCaveRoute {
 
     void changed(BlockPos changed) {
         if (world != client.world || player != client.player) return;
-        if (passiveAt != null) for (Probe probe : passive) if (probe.touches(changed)) probe.reset();
+        invalidateObservation(changed);
+        if (moving && edge != null && edge.touches(changed))
+            refuse(Retirement.OBSTRUCTION, "geometry changed during the selected sweep");
+    }
+
+    private void invalidateObservation(BlockPos changed) {
+        offerReadAt = surveyReadAt = -1;
+        for (Probe probe : probes) if (probe != null && probe.touches(changed)) probe.reset();
         if (surveyed != null && surveyed.touches(changed)) surveyed = null;
-        if (surveyProbe != null && surveyProbe.touches(changed)) surveyProbe.reset();
         if (surveyOffered != null && (touches(surveyOffered.from, surveyOffered.to, changed)
                 || surveyOffered.witness.getBlockPos().equals(changed))) surveyOffered = null;
-        if (surveyedBearingsAt != null) surveyedBearings.removeIf(direction ->
-            touches(surveyedBearingsAt, surveyedBearingsAt.offset(direction).down(), changed));
+        if (surveyActive != null && (touches(surveyActive.from, surveyActive.to, changed)
+                || surveyActive.witness.getBlockPos().equals(changed))) surveyGeometryChanged = true;
+        examinedLips.values().removeIf(survey -> touches(survey.from, survey.to, changed)
+            || survey.witness.getBlockPos().equals(changed));
         if (anchor == null) return;
         for (int i = 0; i < 4; i++) {
             Direction forward = direction(i);
@@ -551,12 +605,6 @@ final class AgentDryCaveRoute {
                 changeAt(here.offset(forward.getOpposite()), i, forward, changed);
             }
         }
-        if (edge != null && edge.touches(changed)) {
-            if (moving) refuse(Retirement.OBSTRUCTION, "geometry changed during the selected sweep");
-            else edge.reset();
-        }
-        if (viewAt != null || completedViewTick >= 0)
-            for (Probe candidate : candidates) if (candidate.touches(changed)) candidate.reset();
     }
 
     private void changeAt(BlockPos from, int index, Direction forward, BlockPos change) {
@@ -577,7 +625,8 @@ final class AgentDryCaveRoute {
     }
 
     void lightChanged(BlockPos foot, Direction sector) {
-        if (foot.equals(surveyedBearingsAt)) surveyedBearings.remove(sector);
+        offerReadAt = surveyReadAt = -1;
+        examinedLips.remove(new SurveyLane(foot, sector));
         if (anchor == null) return;
         for (int i = 0; i < 4; i++) {
             if (direction(i) != sector) continue;
@@ -619,8 +668,16 @@ final class AgentDryCaveRoute {
             startGraph(current, prefer);
             register(anchor);
         }
-        if (viewAt != null) return survey(tick, current, preferredOre);
+        if (viewAt != null) return survey(current, preferredOre);
         if (edge != null) return validate(tick, current);
+        Direction facing = player.getHorizontalFacing();
+        if (body.dryRouteView()) {
+            if (sampleStrip(current, facing) == 0) {
+                Probe down = selectedProbe(current, current.offset(facing).down());
+                if (observePair(down, null, 0) == null)
+                    observePair(selectedProbe(current, current.offset(facing).up()), null, 0);
+            }
+        }
         long cell = current.asLong();
         AgentRouteGraph.Status result = graph.plan(cell);
         if (result != AgentRouteGraph.Status.LIMIT) limitedAt = null;
@@ -628,15 +685,19 @@ final class AgentDryCaveRoute {
             case MOVE -> {
                 BlockPos next = BlockPos.fromLong(graph.next());
                 endpoint = BlockPos.fromLong(graph.endpoint());
-                edge = selectedProbe(current, next, tick);
+                edge = selectedProbe(current, next);
+                plannedAhead = graph.segmentCell(1);
                 since = tick;
                 activity = "dry route selected: " + (endpoint.getY() < current.getY() ? "lower" : "unexamined")
                     + " return-connected frontier " + at(endpoint)
                     + "; next " + at(current) + " -> " + at(next);
-                yield true;
+                yield validate(tick, current);
             }
             case FRONTIER -> {
-                startView(tick, current, graph.frontierBearing());
+                int index = graph.frontierBearing();
+                if (!body.dryRouteView() || index < 0 || direction(index) != facing)
+                    yield noRoute("the next unwitnessed frontier is outside the current bearing");
+                startView(current, index);
                 yield true;
             }
             case NO_ROUTE -> noRoute("no unexamined return-connected frontier");
@@ -660,84 +721,159 @@ final class AgentDryCaveRoute {
         return false;
     }
 
-    private void startView(int tick, BlockPos current, int index) {
+    private void startView(BlockPos current, int index) {
         viewAt = current;
         unprovedAt = lightAt = null;
-        completedViewTick = -1000;
         viewIndex = index;
-        viewAdmissions = 0;
-        since = tick;
         bearing = direction(index);
-        looked = apertureChecked = false;
-        for (int i = 0; i < candidates.length; i++) candidates[i] = new Probe(current, current.offset(bearing).up(i - 1), bearing);
-        activity = "dry route next lawful view: " + at(current) + " looking " + bearing;
+        apertureChecked = false;
+        activity = "dry route reading the current " + bearing + " view from " + at(current);
     }
 
-    private boolean survey(int tick, BlockPos current, Predicate<BlockState> preferredOre) {
-        if (!current.equals(viewAt)) {
+    private boolean survey(BlockPos current, Predicate<BlockState> preferredOre) {
+        if (!current.equals(viewAt) || !body.dryRouteView() || player.getHorizontalFacing() != bearing) {
             interrupt();
-            return noRoute("actual view source moved");
+            return noRoute("the source or its rendered bearing changed before observation");
         }
-        int age = tick - since;
-        look(bearing, age);
-        if (!looked && body.renderedDirection(bearing.getPositiveHorizontalDegrees(), 10, 20)) {
-            looked = true;
-            if (preferredOre == null) lava = body.visibleFluid(true, true, 14);
-            else ore = body.find(preferredOre, 12, hit -> !hit.getBlockPos().equals(current.down())
-                && player.getEyePos().squaredDistanceTo(hit.getPos()) <= 3.9 * 3.9).orElse(null);
-            if (ore != null || lava != null) {
-                graph.consumeFrontier(current.asLong(), viewIndex);
-                clearView();
-                activity = "dry route view exposed reachable objective work";
-                return false;
-            }
-        }
-        boolean pending = false, proved = false;
-        for (Probe candidate : candidates) {
-            candidate.sample();
-            if (candidate.complete()) {
-                proved = true;
-                if (admit(candidate.from, candidate.to) | admit(candidate.to, candidate.from)) {
-                    register(candidate.to);
-                    surveyEvidence++;
-                    viewAdmissions++;
-                }
-            } else if (candidate.failure != Retirement.OBSTRUCTION && candidate.failure != Retirement.HAZARD) {
-                pending = true;
-            }
-        }
-        if (viewAdmissions == 0 && age < VIEW_TICKS && (pending || !looked)) return true;
-        for (Probe candidate : candidates) {
-            if (!candidate.complete() && candidate.failure != null)
-                graph.retire(candidate.from.asLong(), candidate.to.asLong(), candidate.failure);
-        }
+        if (preferredOre == null) lava = body.visibleFluid(true, true, 14);
+        else ore = body.find(preferredOre, 12, hit -> !hit.getBlockPos().equals(current.down())
+            && player.getEyePos().squaredDistanceTo(hit.getPos()) <= 3.9 * 3.9).orElse(null);
         graph.consumeFrontier(current.asLong(), viewIndex);
+        clearView();
+        if (ore != null || lava != null) {
+            activity = "dry route view exposed reachable objective work";
+            return false;
+        }
+        boolean proved = false;
+        for (int i = 0; i < candidates.length; i++) {
+            Probe candidate = selectedProbe(current, current.offset(bearing).up(i - 1));
+            candidates[i] = candidate;
+            proved |= observePair(candidate, null, 0) != null;
+        }
         if (!proved) {
             unprovedAt = current;
             unprovedBearing = bearing;
             Probe drop = candidates[0];
             if (drop.failure != Retirement.HAZARD && drop.failure != Retirement.OBSTRUCTION
                     && (drop.floorEvidence == AgentBody.DryRouteTop.DARK
-                        || drop.floorEvidence == AgentBody.DryRouteTop.NO_FULL_TOP && (drop.mask & 4) != 0)) {
+                        || drop.floorEvidence == AgentBody.DryRouteTop.NO_FULL_TOP && drop.hasHeadroom(body.actionTick()))) {
                 lightAt = current;
                 lightBearing = bearing;
             }
         }
-        activity = "dry route view result: " + at(current) + " " + bearing + "; admitted=" + viewAdmissions
+        activity = "dry route view result: " + at(current) + " " + bearing
             + "; down=" + candidates[0].evidence() + "; level=" + candidates[1].evidence()
             + "; up=" + candidates[2].evidence();
-        completedViewTick = tick;
-        clearView();
         return true;
     }
 
-    private Probe selectedProbe(BlockPos from, BlockPos to, int tick) {
-        if (tick - completedViewTick <= 2) {
-            for (Probe candidate : candidates) {
-                if (candidate.from.equals(from) && candidate.to.equals(to) && candidate.complete()) return candidate;
-            }
+    private Probe selectedProbe(BlockPos from, BlockPos to) {
+        Probe found = findProbe(from, to);
+        if (found != null) return found;
+        while (probes[probeCursor] != null
+                && (probes[probeCursor] == edge || probes[probeCursor] == surveyProbe || probes[probeCursor] == surveyed)) {
+            probeCursor = (probeCursor + 1) % probes.length;
         }
-        return new Probe(from, to, bearing(from, to));
+        Probe probe = new Probe(from, to, bearing(from, to));
+        probes[probeCursor] = probe;
+        probeCursor = (probeCursor + 1) % probes.length;
+        return probe;
+    }
+
+    private Probe findProbe(BlockPos from, BlockPos to) {
+        for (Probe probe : probes) if (probe != null && probe.from.equals(from) && probe.to.equals(to)) return probe;
+        return null;
+    }
+
+    /** Sample a near-to-far cardinal run from the same render; stop at the first unknown edge. */
+    private int sampleStrip(BlockPos source, Direction forward) {
+        if (!body.dryRouteView()) return 0;
+        int now = body.actionTick();
+        int count = 0, sourceTick = 0;
+        BlockState sourceState = null;
+        BlockPos from = source;
+        for (; count < STRIP_EDGES; count++) {
+            Probe probe = selectedProbe(from, from.offset(forward));
+            Probe proof;
+            if (count == 0 || body.dryRouteHorizonRoom()) {
+                proof = observePair(probe, sourceState, sourceTick);
+            } else {
+                // Reserve live rays for the imminent sweep and pickup checks.
+                // A still-current pair can remain in the strip without a new cast.
+                proof = currentProof(probe);
+                if (proof != null && (!graph.usable(probe.from.asLong(), probe.to.asLong())
+                        || !graph.usable(probe.to.asLong(), probe.from.asLong()) || !negativeTransitVetoesClear(probe))) {
+                    proof = null;
+                }
+            }
+            if (proof == null) break;
+            if (proof == probe) {
+                sourceState = probe.floorState(now);
+                sourceTick = probe.seen[Probe.FLOOR];
+            } else {
+                sourceState = proof.states[Probe.SOURCE];
+                sourceTick = proof.seen[Probe.SOURCE];
+            }
+            from = probe.to;
+        }
+        return count;
+    }
+
+    private Probe observePair(Probe probe, BlockState sourceState, int sourceTick) {
+        sampleEdge(probe, sourceState, sourceTick);
+        Probe proof = currentProof(probe);
+        if (proof != null && !negativeTransitVetoesClear(probe)) probe.failure = Retirement.OBSTRUCTION;
+        long from = probe.from.asLong(), to = probe.to.asLong();
+        if (probe.failure != null) {
+            graph.retire(from, to, probe.failure);
+            graph.retire(to, from, probe.failure);
+            return null;
+        }
+        if (proof == null) return null;
+        if (anchor == null) startGraph(probe.from, probe.bearing);
+        if (admit(probe.from, probe.to) | admit(probe.to, probe.from)) {
+            register(probe.to);
+            surveyEvidence++;
+        }
+        return graph.usable(from, to) && graph.usable(to, from) ? proof : null;
+    }
+
+    private void sampleEdge(Probe probe) { sampleEdge(probe, null, 0); }
+
+    private void sampleEdge(Probe probe, BlockState sourceState, int sourceTick) {
+        if (!body.dryRouteView()) return;
+        int now = body.actionTick();
+        unchanged(probe, now);
+        if (sourceState == null && settled(probe.from, 0.27) && player.getPose() == EntityPose.STANDING) {
+            sourceState = body.dryCaveContact(probe.from);
+            sourceTick = now;
+        }
+        probe.sample(probeView, now, body.renderedFrame(), sourceState, sourceTick);
+    }
+
+    /** The inverse of a geometry-proved pair is evidence, not an assumed reverse walk. */
+    private Probe currentProof(Probe probe) {
+        int now = body.actionTick();
+        if (probe.failure != null) return null;
+        Probe proof = probe.complete(now) ? probe : findProbe(probe.to, probe.from);
+        if (proof == null || !proof.complete(now)) return null;
+        return unchanged(proof, now) ? proof : null;
+    }
+
+    private boolean unchanged(Probe probe, int now) {
+        if (probe.lastStateCheck == now) return true;
+        BlockPos altered = probe.changedWitness(probeView);
+        if (altered != null) {
+            invalidateObservation(altered);
+            return false;
+        }
+        probe.lastStateCheck = now;
+        return true;
+    }
+
+    private boolean paired(Probe probe) {
+        return currentProof(probe) != null && graph.usable(probe.from.asLong(), probe.to.asLong())
+            && graph.usable(probe.to.asLong(), probe.from.asLong());
     }
 
     private boolean validate(int tick, BlockPos current) {
@@ -749,26 +885,23 @@ final class AgentDryCaveRoute {
             interrupt();
             return noRoute("actual source changed before the selected edge");
         }
-        int age = tick - since;
-        edge.sample(direct != null && directHop == 0 && directSourceContact(edge.from, edge.bearing));
+        sampleEdge(edge);
         if (edge.failure == Retirement.OBSTRUCTION || edge.failure == Retirement.HAZARD) {
             refuse(edge.failure, "current camera blocks the selected edge: " + edge.evidence());
-        } else if (edge.complete() && edge.liveFloor) {
+        } else if (body.dryRouteView() && paired(edge)) {
             if (!sweepRefused() && allowsDirectMovement()) {
                 moving = true;
                 since = tick;
-                lastDriveFeet = player.getPos();
-                movingContacts = 0;
                 missingDriveViews = 0;
                 if (direct != null) directReason = "traversing the revalidated authorized edge";
                 activity = "dry route revalidated " + at(edge.from) + " -> " + at(edge.to)
                     + "; held frontier " + at(endpoint);
-                body.driveDryRoute(edge.from, edge.to, edge.bearing);
+                advanceDrive(tick);
             }
-        } else if (age >= VIEW_TICKS) {
+        } else if (body.dryRouteView() || tick - since >= 2) {
             refuse(edge.failure == Retirement.LIGHT ? Retirement.LIGHT : Retirement.OBSERVATION,
                 "fresh lit forward/return evidence unavailable: " + edge.evidence());
-        } else look(edge.bearing, age);
+        }
         return true;
     }
 
@@ -787,34 +920,105 @@ final class AgentDryCaveRoute {
         }
         missingDriveViews = 0;
         if (sweepRefused()) return true;
-        if (movingContacts >= 3 && settled(edge.to, 0.22) && player.getVelocity().horizontalLengthSquared() <= 0.016) {
-            BlockPos arrived = edge.to;
-            walked(edge.from, arrived);
-            reached.accept(edge.from, arrived);
-            activity = "dry route settled arrival " + at(arrived) + "; committed frontier " + at(endpoint);
-            edge = null;
-            moving = false;
-            return true;
-        }
         if (tick - since > DRIVE_TICKS) {
             refuse(Retirement.EXECUTION, "traversal did not settle on the selected support");
         } else {
-            // Positive forward/return proofs preceded this short sweep. Visible geometry can still veto.
-            edge.sample();
-            if (edge.failure == Retirement.OBSTRUCTION || edge.failure == Retirement.HAZARD)
-                refuse(edge.failure, "new visible obstruction during traversal");
-            else if (allowsDirectMovement()) body.driveDryRoute(edge.from, edge.to, edge.bearing);
+            sampleEdge(edge);
+            if (edge.failure != null || !paired(edge))
+                refuse(edge.failure == null ? Retirement.OBSERVATION : edge.failure,
+                    "the forward and reverse corridor lost its witness");
+            else if (allowsDirectMovement()) advanceDrive(tick);
         }
         return true;
     }
 
+    private void advanceDrive(int tick) {
+        BlockState source = driveFooting(edge.from), landing = driveFooting(edge.to);
+        if (driveSource == null) {
+            driveSource = source;
+            driveLanding = landing;
+            startDriveMotion();
+        }
+        if (driveSource != source || driveLanding != landing || !body.walkedLaneDry(edge.from, edge.to, edge.bearing)
+                || !AgentSurfaceTread.reverseClear(client, edge.from, edge.to, edge.bearing)) {
+            refuse(Retirement.OBSTRUCTION, "the exact support or reverse clearance changed during traversal");
+            return;
+        }
+        Probe next = continuation();
+        if (!graph.usable(edge.from.asLong(), edge.to.asLong()) || !graph.usable(edge.to.asLong(), edge.from.asLong())) {
+            refuse(Retirement.OBSERVATION, "the selected edge lost its witness while looking ahead");
+            return;
+        }
+        double remaining = (edge.to.getX() + 0.5 - player.getX()) * edge.bearing.getOffsetX()
+            + (edge.to.getZ() + 0.5 - player.getZ()) * edge.bearing.getOffsetZ();
+        boolean atWaypoint = settled(edge.to, 0.22);
+        if (atWaypoint && !driveMotion.traversed()) {
+            refuse(Retirement.EXECUTION, "ground contact lacks a contiguous traversal");
+            return;
+        }
+        if (atWaypoint && (next != null && AgentBody.dryStrideContact(remaining)
+                || player.getVelocity().horizontalLengthSquared() <= 0.0025)) finishDrive(tick, next);
+        else body.driveDryRoute(edge.from, edge.to, edge.bearing, next != null);
+    }
+
+    private Probe continuation() {
+        if (edge.from.getY() != edge.to.getY() || !AgentBody.normalDryTraction(driveSource)
+                || !player.isOnGround() || stopDirectAfterArrival) return null;
+        long target = direct != null
+            ? directHop + 1 < offeredCount ? offeredHops[directHop + 1] : AgentRouteGraph.NO_CELL
+            : plannedAhead;
+        if (target == AgentRouteGraph.NO_CELL) return null;
+        BlockPos nextFoot = edge.to.offset(edge.bearing);
+        if (nextFoot.asLong() != target) return null;
+        // Only a pinned successor can receive input, even if this view exposes more of the cave.
+        sampleStrip(player.getBlockPos(), edge.bearing);
+        Probe next = selectedProbe(edge.to, nextFoot);
+        if (!paired(next) || !graph.refreshReturn(target)
+                || direct != null && !graph.revalidateDirectSuffix(edge.to.asLong(), offeredHops, directHop + 1, offeredCount)
+                || !body.dryRouteContinuationClear(next.from, next.to, next.bearing, driveLanding,
+                    driveFooting(next.to))
+                || direct != null && !directPickupClear(next)) return null;
+        return next;
+    }
+
+    private void finishDrive(int tick, Probe next) {
+        Probe arrived = edge;
+        walked(arrived.from, arrived.to);
+        reached.accept(arrived.from, arrived.to);
+        if (direct != null) {
+            if (directLanded != null)
+                directLanded.accept(new AgentSurfaceTread.Edge(arrived.from, driveSource, arrived.to, driveLanding, arrived.bearing));
+            ++directHop;
+        }
+        activity = "dry route " + (next != null ? "grounded stride through " : "settled arrival ")
+            + at(arrived.to) + "; committed frontier " + at(endpoint);
+        edge = next;
+        moving = next != null;
+        driveSource = null;
+        if (next == null) return;
+        if (direct == null) {
+            plannedAhead = graph.plan(arrived.to.asLong()) == AgentRouteGraph.Status.MOVE && graph.next() == next.to.asLong()
+                ? graph.segmentCell(1) : AgentRouteGraph.NO_CELL;
+        }
+        since = tick;
+        startDriveMotion();
+        // The successor is already validated for this input. Sample its own successor
+        // on the next tick, while still well inside the newly selected lane.
+        driveSource = driveLanding;
+        driveLanding = driveFooting(next.to);
+        body.driveDryRoute(next.from, next.to, next.bearing);
+    }
+
+    private BlockState driveFooting(BlockPos foot) {
+        return world.getBlockState(driveSupport.set(foot).move(Direction.DOWN));
+    }
+
+    private void startDriveMotion() {
+        driveMotion.start(player.getX(), player.getY(), player.getZ());
+    }
+
     private boolean observeDriveMotion() {
-        Vec3d feet = player.getPos();
-        if (feet.squaredDistanceTo(lastDriveFeet) > 0.31) return false;
-        double dx = feet.x - lastDriveFeet.x, dz = feet.z - lastDriveFeet.z;
-        if (dx * dx + dz * dz > 0.0004) movingContacts++;
-        lastDriveFeet = feet;
-        return true;
+        return driveMotion.observe(player.getX(), player.getY(), player.getZ());
     }
 
     private boolean sweepRefused() {
@@ -835,6 +1039,7 @@ final class AgentDryCaveRoute {
         activity = "dry route refused [" + reason + "] " + at(edge.from) + " -> " + at(edge.to) + ": " + why;
         edge = null;
         moving = false;
+        driveSource = null;
         yieldRefusal = true;
         graph.cancelPlan();
     }
@@ -845,6 +1050,7 @@ final class AgentDryCaveRoute {
         activity = "dry route refused: " + directReason;
         edge = null;
         moving = false;
+        driveSource = null;
         yieldRefusal = true;
         return false;
     }
@@ -873,12 +1079,15 @@ final class AgentDryCaveRoute {
         anchor = contact = null;
         lastFeet = null;
         limitedAt = null;
-        passiveAt = null;
+        offerReadAt = surveyReadAt = -1;
+        Arrays.fill(probes, null);
+        probeCursor = 0;
         unprovedAt = lightAt = null;
         direct = offered = null;
+        directLanded = null;
+        stopDirectAfterArrival = false;
         surveyOffered = surveyActive = null;
-        surveyedBearingsAt = null;
-        surveyedBearings.clear();
+        examinedLips.clear();
         surveyProbe = surveyed = null;
         yieldRefusal = false;
         interrupt();
@@ -893,10 +1102,11 @@ final class AgentDryCaveRoute {
     private void interrupt() {
         if (anchor != null) graph.cancelPlan();
         clearView();
-        completedViewTick = -1000;
         edge = null;
         endpoint = null;
         moving = false;
+        driveSource = null;
+        plannedAhead = AgentRouteGraph.NO_CELL;
         centerSince = 0;
     }
 
@@ -934,14 +1144,6 @@ final class AgentDryCaveRoute {
             && Math.abs(from.getY() - to.getY()) <= 1;
     }
 
-    private void look(Direction direction, int age) {
-        body.turnFixed(direction.getPositiveHorizontalDegrees(), probePitch(age));
-    }
-
-    private static float probePitch(int age) {
-        return age < 14 ? 10 : age < 24 ? -58 : age < 32 ? 31 : age < 43 ? 68 : 46;
-    }
-
     private static String at(BlockPos foot) { return foot.toShortString(); }
 
     private static boolean touches(BlockPos from, BlockPos to, BlockPos changed) {
@@ -951,107 +1153,164 @@ final class AgentDryCaveRoute {
             && y >= Math.min(from.getY(), to.getY()) - 1 && y <= Math.max(from.getY(), to.getY()) + 2;
     }
 
-    private final class Probe {
+    interface ProbeView {
+        AgentBody.DryRouteTop top(Vec3d point, BlockPos support);
+        AgentBody.DryRouteSample space(Vec3d point);
+        /** Used only to record a positive ray/contact or to invalidate previously admitted evidence. */
+        BlockState state(BlockPos pos);
+    }
+
+    static final class Probe {
+        private static final int FLOOR = 0, SOURCE = 1, SHIN = 2, HEAD = 3, LEFT = 4, RIGHT = 5,
+            ENTRY_LOW = 6, ENTRY_HIGH = 7, TAKEOFF = 8, SAMPLE_COUNT = 9;
+        private static final String[] AREAS = {"footing", "return footing", "lower clearance", "headroom",
+            "left width", "right width", "low entry", "high entry", "reverse takeoff"};
         private final BlockPos from, to;
         private final Direction bearing;
-        private final Vec3d floor, alternateFloor;
-        private final BlockPos support;
-        private final Vec3d[] clearance;
-        private int mask, blocked, wet, dark;
-        private boolean liveFloor;
+        private final Vec3d[] points;
+        private final Vec3d alternateFloor;
+        private final BlockPos[] observedCells = new BlockPos[SAMPLE_COUNT];
+        private final BlockState[] states = new BlockState[SAMPLE_COUNT];
+        private final int[] seen = new int[SAMPLE_COUNT];
+        private final AgentBody.DryRouteSample[] spaces = new AgentBody.DryRouteSample[SAMPLE_COUNT];
+        private long lastFrame = -1;
+        private int lastSample, lastStateCheck = -1, lastTransitCheck = -1;
+        private boolean transitClear;
         private Retirement failure;
         private AgentBody.DryRouteTop floorEvidence = AgentBody.DryRouteTop.OUT_OF_VIEW;
 
-        private Probe(BlockPos from, BlockPos to, Direction bearing) {
+        Probe(BlockPos from, BlockPos to, Direction bearing) {
             this.from = from;
             this.to = to;
             this.bearing = bearing;
-            support = to.down();
             Vec3d source = Vec3d.ofBottomCenter(from), landing = Vec3d.ofBottomCenter(to);
             double x = bearing.getOffsetX(), z = bearing.getOffsetZ();
             double rise = landing.y - source.y, upper = Math.max(landing.y, source.y);
-            floor = landing.add(x * 0.36, -0.025, z * 0.36);
             alternateFloor = landing.add(x * 0.15, -0.025, z * 0.15);
-            Vec3d entry = new Vec3d(landing.x - x * 0.38, upper, landing.z - z * 0.38);
+            Vec3d entry = new Vec3d(landing.x - x * 0.27, upper, landing.z - z * 0.27);
             Vec3d lower = rise < 0 ? landing : source;
-            double lowerAhead = rise < 0 ? -0.27 : 0.37;
-            clearance = new Vec3d[] {landing.add(0, 0.16, 0), landing.add(0, 1.76, 0),
+            double lowerAhead = rise < 0 ? -0.27 : 0.45;
+            // A slightly downward walking view contains the far half of the
+            // adjacent tread and its lower clearance; it need not center either.
+            points = new Vec3d[] {landing.add(x * 0.46, -0.025, z * 0.46), null,
+                landing.add(x * 0.45, 0.22, z * 0.45), landing.add(0, 1.76, 0),
                 landing.add(z * 0.34, 0.94, -x * 0.34), landing.add(-z * 0.34, 0.94, x * 0.34),
-                entry.add(z * 0.34, 0.86, -x * 0.34), entry.add(-z * 0.34, 1.70, x * 0.34),
+                entry.add(z * 0.34, 0.94, -x * 0.34), entry.add(-z * 0.34, 1.70, x * 0.34),
                 rise == 0 ? null : lower.add(x * lowerAhead, 2.76, z * lowerAhead)};
+            observedCells[FLOOR] = to.down();
+            observedCells[SOURCE] = from.down();
+            for (int i = SHIN; i < SAMPLE_COUNT; i++)
+                if (points[i] != null) observedCells[i] = BlockPos.ofFloored(points[i]);
         }
 
-        private void reset() {
-            mask = blocked = wet = dark = 0;
+        void reset() {
+            Arrays.fill(states, null);
+            Arrays.fill(spaces, null);
+            lastFrame = -1;
+            lastStateCheck = lastTransitCheck = -1;
             floorEvidence = AgentBody.DryRouteTop.OUT_OF_VIEW;
             failure = null;
         }
 
-        private boolean complete() { return mask == COMPLETE; }
+        boolean complete(int now) {
+            if (failure != null) return false;
+            for (int i = 0; i < SAMPLE_COUNT; i++)
+                if (required(i) && !fresh(i, now)) return false;
+            return true;
+        }
+
+        private boolean required(int sample) {
+            // Level travel must still pass the exact standing sweep both ways.
+            // Only stairs need positive visual evidence of the upper clearance.
+            return observedCells[sample] != null
+                && (from.getY() != to.getY() || (sample != HEAD && sample != ENTRY_HIGH));
+        }
+
+        boolean hasHeadroom(int now) { return fresh(HEAD, now); }
+        boolean visiblyRefused() { return failure != null; }
+
+        private boolean fresh(int sample, int now) {
+            return states[sample] != null && now - seen[sample] <= WITNESS_TICKS;
+        }
+
         private boolean touches(BlockPos changed) { return AgentDryCaveRoute.touches(from, to, changed); }
 
-        private void sample() { sample(false); }
+        BlockState floorState(int now) { return fresh(FLOOR, now) ? states[FLOOR] : null; }
+        int floorSeenAt() { return seen[FLOOR]; }
 
-        private void sample(boolean directSource) {
-            AgentBody.DryRouteTop top = body.dryRouteTop(floor, support);
-            if (top != AgentBody.DryRouteTop.WITNESSED) {
-                AgentBody.DryRouteTop other = body.dryRouteTop(alternateFloor, support);
+        BlockPos changedWitness(ProbeView view) {
+            for (int i = 0; i < SAMPLE_COUNT; i++)
+                if (states[i] != null && view.state(observedCells[i]) != states[i]) return observedCells[i];
+            return null;
+        }
+
+        void sample(ProbeView view, int now, long frame, BlockState sourceState, int sourceTick) {
+            lastSample = now;
+            // Actual contact or the previous pair's observed landing is a
+            // separate reverse top witness. Propagating it cannot refresh its age.
+            if (sourceState != null && (states[SOURCE] == null || sourceTick >= seen[SOURCE])) {
+                states[SOURCE] = sourceState;
+                seen[SOURCE] = sourceTick;
+            }
+            if (frame == lastFrame) return;
+            lastFrame = frame;
+            BlockPos support = observedCells[FLOOR];
+            AgentBody.DryRouteTop top = view.top(points[FLOOR], support);
+            if (top != AgentBody.DryRouteTop.WITNESSED && top != AgentBody.DryRouteTop.FLUID) {
+                AgentBody.DryRouteTop other = view.top(alternateFloor, support);
                 if (other == AgentBody.DryRouteTop.WITNESSED || top == AgentBody.DryRouteTop.OUT_OF_VIEW
                         || other == AgentBody.DryRouteTop.FLUID) top = other;
             }
-            liveFloor = top == AgentBody.DryRouteTop.WITNESSED;
             if (top != AgentBody.DryRouteTop.OUT_OF_VIEW) floorEvidence = top;
-            if (liveFloor) mask |= 1;
-            else if (top == AgentBody.DryRouteTop.NO_FULL_TOP || top == AgentBody.DryRouteTop.FLUID) mask &= ~1;
-            // Actual stable source contact is independent evidence for the reverse landing.
-            // It does not certify any unseen tile or the inverse takeoff/headroom.
-            if (directSource || settled(from, 0.18) && player.getPose() == EntityPose.STANDING
-                    && player.getVelocity().horizontalLengthSquared() < 0.0121) mask |= 0x80;
-            for (int i = 0; i < clearance.length; i++) {
-                Vec3d point = clearance[i];
-                int bit = i < 6 ? 2 << i : 0x100;
-                if (point == null) {
-                    mask |= bit;
-                    continue;
-                }
-                switch (body.dryRouteClear(point)) {
-                    case CLEAR -> {
-                        mask |= bit;
-                        blocked &= ~bit;
-                        wet &= ~bit;
-                        dark &= ~bit;
-                    }
-                    case FLUID -> { mask &= ~bit; wet |= bit; }
-                    case OBSTRUCTION -> {
-                        mask &= ~bit;
-                        blocked |= bit;
-                    }
-                    case DARK -> { mask &= ~bit; dark |= bit; }
-                    case UNKNOWN -> { }
-                }
+            switch (top) {
+                case WITNESSED -> witness(FLOOR, view, now);
+                case FLUID, NO_FULL_TOP, DARK, UNSUITABLE_TOP -> states[FLOOR] = null;
+                default -> { } // Occlusion doesn't add or extend evidence.
             }
-            failure = wet != 0 || floorEvidence == AgentBody.DryRouteTop.FLUID ? Retirement.HAZARD
-                : blocked != 0 ? Retirement.OBSTRUCTION
-                : dark != 0 || (mask & 1) == 0 && floorEvidence == AgentBody.DryRouteTop.DARK ? Retirement.LIGHT : null;
+            failure = switch (floorEvidence) {
+                case FLUID, UNSUITABLE_TOP -> Retirement.HAZARD;
+                case DARK -> Retirement.LIGHT;
+                default -> null;
+            };
+            for (int i = SHIN; i < SAMPLE_COUNT; i++) {
+                if (points[i] == null) continue;
+                AgentBody.DryRouteSample sample = view.space(points[i]);
+                if (sample != AgentBody.DryRouteSample.UNKNOWN) spaces[i] = sample;
+                if (sample == AgentBody.DryRouteSample.CLEAR) witness(i, view, now);
+                else if (sample != AgentBody.DryRouteSample.UNKNOWN) states[i] = null;
+                if (spaces[i] == AgentBody.DryRouteSample.FLUID) failure = Retirement.HAZARD;
+                else if (spaces[i] == AgentBody.DryRouteSample.OBSTRUCTION && failure != Retirement.HAZARD)
+                    failure = Retirement.OBSTRUCTION;
+                else if (spaces[i] == AgentBody.DryRouteSample.DARK && failure == null)
+                    failure = Retirement.LIGHT;
+            }
         }
 
-        private String evidence() {
-            if (complete()) return liveFloor ? "forward and return witnessed"
-                : "forward and return witnessed; top not currently in view";
+        private void witness(int sample, ProbeView view, int now) {
+            states[sample] = view.state(observedCells[sample]);
+            seen[sample] = now;
+        }
+
+        private Vec3d lowerGlance(int now) {
+            if (failure != null || !fresh(SOURCE, now) || !fresh(HEAD, now) || !fresh(TAKEOFF, now)) return null;
+            if (!fresh(FLOOR, now) && floorEvidence == AgentBody.DryRouteTop.OUT_OF_VIEW) return points[FLOOR];
+            if (!fresh(SHIN, now) && spaces[SHIN] == null) return points[SHIN];
+            return null;
+        }
+
+        String evidence() {
+            if (complete(lastSample)) return "forward and return witnessed";
             StringBuilder gaps = new StringBuilder();
-            if ((mask & 1) == 0) gaps.append("top:").append(floorEvidence).append(' ');
-            if ((mask & 2) == 0) appendGap(gaps, "shin", 2);
-            if ((mask & 4) == 0) appendGap(gaps, "head", 4);
-            if ((mask & 24) != 24) appendGap(gaps, "width", 24);
-            if ((mask & 96) != 96) appendGap(gaps, "entry", 96);
-            if ((mask & 0x80) == 0) gaps.append("reverse-standing-contact:unproved ");
-            if ((mask & 0x100) == 0) appendGap(gaps, "takeoff-headroom", 0x100);
-            return gaps.toString().stripTrailing();
-        }
-
-        private void appendGap(StringBuilder gaps, String area, int bits) {
-            gaps.append(area).append(':').append((wet & bits) != 0 ? "fluid" : (blocked & bits) != 0 ? "blocked"
-                : (dark & bits) != 0 ? "dark" : "unwitnessed").append(' ');
+            for (int i = 0; i < SAMPLE_COUNT; i++) {
+                if (observedCells[i] == null || fresh(i, lastSample)
+                        || !required(i) && (spaces[i] == null || spaces[i] == AgentBody.DryRouteSample.CLEAR)) continue;
+                if (!gaps.isEmpty()) gaps.append(", ");
+                gaps.append(AREAS[i]).append(':');
+                if (states[i] != null) gaps.append("expired");
+                else if (i == FLOOR) gaps.append(floorEvidence);
+                else gaps.append(spaces[i] == null ? "unwitnessed" : spaces[i]);
+            }
+            return gaps.isEmpty() ? "exact transit veto: " + failure : gaps.toString();
         }
     }
 }

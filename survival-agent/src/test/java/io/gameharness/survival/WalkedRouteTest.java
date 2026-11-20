@@ -4,9 +4,22 @@ import static io.gameharness.survival.AgentRouteGraph.NO_CELL;
 import static io.gameharness.survival.AgentRouteGraph.cell;
 import static org.junit.jupiter.api.Assertions.*;
 
+import net.minecraft.Bootstrap;
+import net.minecraft.SharedConstants;
+import net.minecraft.block.Blocks;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 final class WalkedRouteTest {
+    @BeforeAll
+    static void initializeVanilla() {
+        SharedConstants.createGameVersion();
+        Bootstrap.initialize();
+    }
+
     @Test
     void canRecallOutOfSightThroughPreplacementLegsAndHeightChanges() {
         var route = new AgentWalkedRoute();
@@ -118,5 +131,197 @@ final class WalkedRouteTest {
         motion.observe(1.25, 31.1, 0.5);
         assertTrue(motion.observe(1.5, 31, 0.5));
         assertTrue(motion.traversed());
+    }
+
+    @Test
+    void successiveProvedProspectStepsKeepTheirHeadingWithoutSpendingALook() {
+        var route = new AgentMacroControl.DiamondRoute();
+        var start = new BlockPos(0, 31, 0);
+        route.arrive(start, Blocks.STONE.getDefaultState(), Direction.EAST);
+        for (int i = 0; i < 2; i++) {
+            var leg = dryLeg(start.offset(Direction.EAST, i), start.offset(Direction.EAST, i + 1), Direction.EAST);
+            var offer = new AgentDryCaveRoute.Offer(leg.upper(), leg.lower(), leg.lower(), 1);
+            assertEquals(Direction.EAST, route.naturalBearing(offer, floor -> false));
+            assertFalse(route.glanced, "already witnessed travel does not spend a stationary look");
+            route.advance(leg);
+            assertEquals(Direction.EAST, route.preferred);
+        }
+        assertEquals(start.east(2), route.foot);
+        assertEquals(2, route.spine.size(), "each actual crossing retains a separate physical return");
+    }
+
+    @Test
+    void prospectPrefixRequiresEachIntermediateSupportToBeAvailable() {
+        var route = new AgentMacroControl.DiamondRoute();
+        var start = new BlockPos(0, 31, 0);
+        route.arrive(start, Blocks.STONE.getDefaultState(), Direction.EAST);
+        var offer = new AgentDryCaveRoute.Offer(start, start.east(), start.east(3), 3);
+        assertEquals(Direction.EAST, route.naturalBearing(offer, floor -> false));
+        assertNull(route.naturalBearing(offer, start.east(2).down()::equals),
+            "a witnessed endpoint cannot authorize bypassing an unconfirmed landing in the middle");
+    }
+
+    @Test
+    void renewingAtTheSameProspectFootingCannotRepeatAnUnprovedOrUnsafeLane() {
+        var route = new AgentMacroControl.DiamondRoute();
+        var start = new BlockPos(0, 31, 0);
+        var floor = Blocks.STONE.getDefaultState();
+        var down = start.east().down();
+        var offer = new AgentDryCaveRoute.Offer(start, down, down, 1);
+        route.arrive(start, floor, Direction.EAST);
+        route.glanced = true;
+        route.refuseCurrent("The lower lane did not prove safe.");
+        route.arrive(start, floor, Direction.NORTH);
+        assertNull(route.naturalBearing(offer, cell -> false));
+        assertTrue(route.glanced, "policy renewal isn't a new physical look opportunity");
+        var level = start.east();
+        assertEquals(Direction.EAST, route.naturalBearing(new AgentDryCaveRoute.Offer(start, level, level, 1),
+            cell -> false), "a different, proved same-level lane can still be considered");
+    }
+
+    @Test
+    void refusedDiamondReturnCanStartAgainAfterASeparateCompletedWalkWithoutAdoptingTheBrokenSpine() {
+        var walked = new AgentWalkedRoute();
+        var route = new AgentMacroControl.DiamondRoute();
+        var failure = dryLeg(new BlockPos(0, 32, 0), new BlockPos(1, 31, 0), Direction.EAST);
+        route.arrive(failure.upper(), failure.upperSupport(), Direction.EAST);
+        route.advance(failure);
+        route.treads = 3;
+        route.interruptedAt(failure.lower(), failure);
+
+        // The prospective job that already held the controls cannot later acquire a new witness.
+        long previousGrant = walked.recovery().proof();
+        var exactReturn = dryLeg(new BlockPos(2, 30, 0), new BlockPos(2, 31, 1), Direction.SOUTH);
+        Object recall = new Object();
+        begin(walked, recall, exactReturn.upper());
+        land(walked, exactReturn);
+        assertFalse(reanchor(route, walked, previousGrant, exactReturn.lower()));
+        finish(walked, recall, true, exactReturn.lower());
+        assertFalse(reanchor(route, walked, previousGrant, exactReturn.lower()));
+
+        long freshGrant = walked.recovery().proof();
+        assertTrue(reanchor(route, walked, freshGrant, exactReturn.lower()));
+        assertEquals(exactReturn.lower(), route.foot);
+        assertEquals(exactReturn, route.rootExit);
+        assertNull(route.unjoined);
+        assertTrue(route.spine.isEmpty());
+        assertTrue(route.supports.contains(failure.upper().down()));
+        assertTrue(route.supports.contains(failure.lower().down()));
+        assertTrue(route.supports.contains(exactReturn.upper().down()));
+        assertEquals(3, route.treads);
+    }
+
+    @Test
+    void independentlyRetracedPathRejoinsOnlyTheCurrentPrefixAndCanLandAtTheDisplacedCell() {
+        var walked = new AgentWalkedRoute();
+        var route = new AgentMacroControl.DiamondRoute();
+        var root = new BlockPos(0, 31, 0);
+        var intersection = root.east();
+        var wrongReverse = dryLeg(intersection, intersection.east(), Direction.EAST);
+        var oldPrefix = dryLeg(root, intersection, Direction.EAST);
+        route.arrive(root, oldPrefix.upperSupport(), Direction.EAST);
+        route.advance(oldPrefix);
+        route.advance(wrongReverse);
+        route.interruptedAt(wrongReverse.lower(), wrongReverse);
+
+        // Both ordinary actions succeeded. Rejoining can keep root->intersection, not the failed edge.
+        var detour = dryLeg(intersection, intersection.south(), Direction.SOUTH);
+        var home = dryLeg(detour.lower(), detour.lower().east(), Direction.EAST);
+        var arrival = dryLeg(home.lower(), wrongReverse.lower(), Direction.NORTH);
+        Object first = new Object();
+        begin(walked, first, intersection);
+        land(walked, detour);
+        land(walked, home);
+        finish(walked, first, true, home.lower());
+        Object last = new Object();
+        begin(walked, last, home.lower());
+        land(walked, arrival);
+        finish(walked, last, true, arrival.lower());
+        assertTrue(reanchor(route, walked, walked.recovery().proof(), wrongReverse.lower()));
+        assertEquals(4, route.spine.size());
+        route.returnOne();
+        assertEquals(home.lower(), route.foot);
+        route.returnOne();
+        assertEquals(detour.lower(), route.foot);
+        route.returnOne();
+        assertEquals(intersection, route.foot);
+        route.returnOne();
+        assertEquals(root, route.foot);
+    }
+
+    @Test
+    void stationaryRecallAbortedTravelAndRestoredOrDiscontinuousLinksCannotMintAProspectGrant() {
+        var walked = new AgentWalkedRoute();
+        var from = new BlockPos(0, 31, 0);
+        var leg = dryLeg(from, from.east(), Direction.EAST);
+        Object look = new Object(), abort = new Object(), teleport = new Object();
+        begin(walked, look, from);
+        walked.recovery().finish(look, true, from, leg.upperSupport(), Vec3d.ofBottomCenter(from).add(0.1, 0, 0));
+        assertEquals(0, walked.recovery().proof());
+
+        begin(walked, abort, from);
+        land(walked, leg);
+        finish(walked, abort, false, leg.lower());
+        assertEquals(0, walked.recovery().proof());
+
+        walked.restore(new AgentWalkedRoute.Breadcrumbs(new int[] {1, 31, 0},
+            new int[][] {{0, 31, 0, 1, 31, 0}}));
+        begin(walked, teleport, from);
+        land(walked, dryLeg(from, from.east().south(), Direction.EAST));
+        finish(walked, teleport, true, from.east().south());
+        assertEquals(0, walked.recovery().proof());
+        assertEquals(leg.lower().asLong(), walked.next(from.asLong()));
+    }
+
+    @Test
+    void aDryArrivalStillNeedsTheSameSupportAndALiveReverseLane() {
+        var walked = new AgentWalkedRoute();
+        var route = new AgentMacroControl.DiamondRoute();
+        var leg = dryLeg(new BlockPos(0, 31, 0), new BlockPos(1, 31, 0), Direction.EAST);
+        var foot = leg.lower();
+        var feet = Vec3d.ofBottomCenter(foot);
+        route.arrive(leg.upper(), leg.upperSupport(), Direction.EAST);
+        route.interruptedAt(leg.upper(), null);
+        Object action = new Object();
+        begin(walked, action, leg.upper());
+        land(walked, leg);
+        finish(walked, action, true, foot);
+        long witness = walked.recovery().proof();
+        var path = walked.recovery().path(witness, foot, leg.lowerSupport(), feet);
+        assertFalse(route.reanchor(foot, leg.lowerSupport(), Direction.EAST, path, edge -> false, edge -> true));
+        assertFalse(route.reanchor(foot, leg.lowerSupport(), Direction.EAST, path, edge -> true, edge -> false));
+        assertTrue(walked.recovery().path(witness, foot, Blocks.DEEPSLATE.getDefaultState(), feet).isEmpty());
+        assertFalse(reanchor(route, walked, witness, foot)); // Restoring the old block cannot restore the receipt.
+
+        begin(walked, action, leg.upper());
+        land(walked, leg);
+        finish(walked, action, true, foot);
+        witness = walked.recovery().proof();
+        walked.recovery().observe(foot.down(), null, feet.add(0, -1, 0));
+        assertFalse(reanchor(route, walked, witness, foot)); // Neither can falling, then being moved back.
+        assertNotNull(route.unjoined);
+    }
+
+    private static AgentSurfaceTread.Edge dryLeg(BlockPos from, BlockPos to, Direction travel) {
+        var stone = Blocks.STONE.getDefaultState();
+        return new AgentSurfaceTread.Edge(from, stone, to, stone, travel);
+    }
+
+    private static void begin(AgentWalkedRoute walked, Object action, BlockPos from) {
+        walked.recovery().begin(action, from, Blocks.STONE.getDefaultState(), Vec3d.ofBottomCenter(from));
+    }
+
+    private static void land(AgentWalkedRoute walked, AgentSurfaceTread.Edge leg) {
+        walked.landed(leg.upper(), leg.upperSupport(), leg.lower(), leg.lowerSupport(), leg.down());
+    }
+
+    private static void finish(AgentWalkedRoute walked, Object action, boolean success, BlockPos foot) {
+        walked.recovery().finish(action, success, foot, Blocks.STONE.getDefaultState(), Vec3d.ofBottomCenter(foot));
+    }
+
+    private static boolean reanchor(AgentMacroControl.DiamondRoute route, AgentWalkedRoute walked, long grant, BlockPos foot) {
+        var support = Blocks.STONE.getDefaultState();
+        return route.reanchor(foot, support, Direction.EAST,
+            walked.recovery().path(grant, foot, support, Vec3d.ofBottomCenter(foot)), edge -> true, edge -> true);
     }
 }

@@ -81,6 +81,69 @@ final class AgentFurnaceWatch {
         return null;
     }
 
+    static final int PENDING_WAIT_TICKS = 100;
+    private static final int PENDING_PROGRESS_GRACE_TICKS = 24;
+
+    enum Recall { BINDING_CHANGED, STOCK_CHANGED, PENDING, WAIT, READY }
+
+    /** Only one short wait on the explicitly reopened handler; elapsed time never proves output. */
+    static final class PendingResult {
+        private final int originalSyncId;
+        private int handlerId = -1;
+        private int output, fuel, progress, remaining;
+        private long outputWitness, advancedAt, deadline;
+
+        PendingResult(int originalSyncId, int minimumOutput, int maximumFuel) {
+            this.originalSyncId = originalSyncId;
+            output = minimumOutput;
+            fuel = maximumFuel;
+        }
+
+        Recall observe(long tick, long until, int syncId, boolean synced, long updates, AgentHands.IronBatch batch,
+                ItemStack raw, ItemStack fuel, ItemStack output, boolean burning, float cooking, float heat) {
+            if (syncId == originalSyncId || (handlerId != -1 && syncId != handlerId) || !synced || updates <= 0)
+                return Recall.BINDING_CHANGED;
+            if (!matches(batch, this.output, this.fuel, raw, fuel, output)) return Recall.STOCK_CHANGED;
+            handlerId = syncId;
+            this.output = output.getCount();
+            this.fuel = fuel.getCount();
+            if (deadline != 0 && tick >= deadline) {
+                remaining = 0;
+                return Recall.PENDING;
+            }
+            if (exactResult(batch.units(), outputWitness, updates, raw, fuel, output)) return Recall.READY;
+            // Slot synchronization can lag its property updates, but not past the original wait's bound.
+            if (raw.isEmpty()) {
+                remaining = 0;
+                return deadline != 0 && fuel.isEmpty() ? Recall.WAIT : Recall.PENDING;
+            }
+
+            int cooked = Math.round(cooking * AgentHands.SMELT_TICKS);
+            int left = raw.getCount() * AgentHands.SMELT_TICKS - cooked;
+            // Vanilla spends its current burn tick before advancing the cook bar.
+            long heatLeft = Math.round(heat * batch.fuelTicks()) + (long) this.fuel * batch.fuelTicks();
+            remaining = burning && heat > 0 && cooked > 0 && cooked < AgentHands.SMELT_TICKS && heatLeft > left ? left : 0;
+            if (deadline == 0) {
+                long stop = tick + remaining + PENDING_PROGRESS_GRACE_TICKS;
+                if (remaining == 0 || remaining > PENDING_WAIT_TICKS || stop > until) return Recall.PENDING;
+                outputWitness = updates;
+                advancedAt = tick;
+                deadline = stop;
+            } else {
+                if (cooked > progress) advancedAt = tick;
+                if (cooked < progress || tick - advancedAt > PENDING_PROGRESS_GRACE_TICKS) remaining = 0;
+                if (remaining == 0) return Recall.PENDING;
+            }
+            progress = cooked;
+            return Recall.WAIT;
+        }
+
+        long afterOutputUpdate() { return outputWitness; }
+        int remainingTicks() { return remaining; }
+        int minimumOutput() { return output; }
+        int maximumFuel() { return fuel; }
+    }
+
     /** The withdrawal edge is one-shot even if the subsequent inventory receipt is interrupted. */
     static final class Withdrawal {
         private Stock before;

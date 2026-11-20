@@ -4,6 +4,13 @@ import static io.gameharness.survival.AgentRouteGraph.NO_CELL;
 import static io.gameharness.survival.AgentRouteGraph.cell;
 import static io.gameharness.survival.AgentRouteGraph.y;
 
+import java.util.ArrayList;
+import java.util.List;
+import net.minecraft.block.BlockState;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
+
 /** Bounded memory of completed, reversible dry legs. A next cell is a clue, never an input grant. */
 final class AgentWalkedRoute {
     // At most two new nodes per retained edge plus an isolated anchor; fits AgentRouteGraph.
@@ -39,7 +46,75 @@ final class AgentWalkedRoute {
         boolean traversed() { return contiguous && contacts >= 3; }
     }
 
+    /** Live receipts from separately owned walks only; restored breadcrumbs cannot fill this path. */
+    static final class Recovery {
+        private final ArrayList<AgentSurfaceTread.Edge> path = new ArrayList<>();
+        private Object owner;
+        private BlockPos next;
+        private BlockState support;
+        private Vec3d stance;
+        private long revision;
+        private boolean walked, invalid;
+
+        void begin(Object action, BlockPos from, BlockState exactSupport, Vec3d feet) {
+            if (owner == action) return;
+            if (owner != null) clear();
+            observe(from, exactSupport, feet);
+            owner = action;
+            next = from;
+            support = exactSupport;
+            walked = false;
+            invalid = exactSupport == null;
+        }
+
+        void landed(AgentSurfaceTread.Edge leg) {
+            if (owner == null || invalid) return;
+            if (!leg.upper().equals(next) || leg.upperSupport() != support || leg.lowerSupport() == null
+                    || !AgentSurfaceTread.cardinalTread(leg.upper(), leg.lower(), leg.down())) {
+                invalid = true;
+                return;
+            }
+            if (path.size() == LIVE_EDGES) path.removeFirst();
+            path.add(leg);
+            next = leg.lower();
+            support = leg.lowerSupport();
+            walked = true;
+        }
+
+        void finish(Object action, boolean success, BlockPos foot, BlockState exactSupport, Vec3d feet) {
+            if (owner != action) return;
+            owner = null;
+            if (!success || invalid || !foot.equals(next) || exactSupport != support) clear();
+            else if (walked) {
+                stance = feet;
+                ++revision;
+            } else observe(foot, exactSupport, feet);
+        }
+
+        void observe(BlockPos foot, BlockState exactSupport, Vec3d feet) {
+            if (owner == null && stance != null && (exactSupport == null || exactSupport != path.getLast().lowerSupport()
+                    || !foot.equals(path.getLast().lower()) || feet.squaredDistanceTo(stance) > 0.0144)) clear();
+        }
+
+        long proof() { return owner == null && stance != null ? revision : 0; }
+
+        List<AgentSurfaceTread.Edge> path(long proof, BlockPos foot, BlockState exactSupport, Vec3d feet) {
+            observe(foot, exactSupport, feet);
+            return proof != 0 && proof == proof() ? path : List.of();
+        }
+
+        boolean observing() { return owner == null && stance != null; }
+
+        void clear() {
+            path.clear();
+            owner = next = null;
+            support = null;
+            stance = null;
+        }
+    }
+
     private final AgentRouteGraph graph = new AgentRouteGraph();
+    private final Recovery recovery = new Recovery();
     private final long[] starts = new long[LIVE_EDGES];
     private final long[] ends = new long[LIVE_EDGES];
     private int count, oldest;
@@ -50,6 +125,16 @@ final class AgentWalkedRoute {
         count = oldest = 0;
         anchor = NO_CELL;
         rebuild = true;
+        recovery.clear();
+    }
+
+    Recovery recovery() { return recovery; }
+
+    boolean recoveringWalk() { return recovery.owner != null; }
+
+    void landed(BlockPos from, BlockState source, BlockPos to, BlockState landing, Direction travel) {
+        landed(from.asLong(), to.asLong());
+        if (recovery.owner != null) recovery.landed(new AgentSurfaceTread.Edge(from, source, to, landing, travel));
     }
 
     long anchor() { return anchor; }

@@ -237,6 +237,7 @@ final class AgentStallGuard {
 
     /** Existing vanilla client player break receipt, not an attack request or an air-block guess. */
     void broken(BlockPos position, BlockState state) {
+        water.broken(position, state);
         if (lastGround != null && inFootColumn(position, lastGround)) confirmedFoot = null;
         for (int i = 0; i < flatCrossings.length; i++) {
             FlatCrossing crossing = flatCrossings[i];

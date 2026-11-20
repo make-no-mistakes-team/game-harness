@@ -2227,6 +2227,15 @@ final class AgentBody {
         return true;
     }
 
+    /** A vertical swim stroke beside a witnessed lip must also fit before any forward input. */
+    boolean wetEscapeRise(double rise) {
+        var player = client.player;
+        return hasView() && !lavaEmergency && player.isTouchingWater() && !player.hasVehicle()
+            && !hazards.lavaNear(player.getBoundingBox(), 0.32, tick)
+            && client.world.isSpaceEmpty(player, player.getBoundingBox().contract(1e-5, 0, 1e-5)
+                .stretch(0, Math.max(0.16, rise + 0.05), 0));
+    }
+
     /** Stay level in a low passage. Jump only to breathe or climb a proved lip. */
     void driveWetEscape(boolean climb) {
         walkDown(false);

@@ -38,6 +38,7 @@ import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
@@ -278,6 +279,7 @@ final class AgentProgress {
     private boolean departureKit;
     private boolean ordinarySurfaceWork;
     private BlockHitResult timberWitness;
+    private final Predicate<BlockHitResult> reachableTrunk = hit -> timberCandidate(hit) && timberInReach(hit);
     private BlockPos timberLastCut;
     private final List<BlockPos> exhaustedStems = new ArrayList<>();
     private final List<BlockPos> unreachableTimber = new ArrayList<>();
@@ -3578,10 +3580,9 @@ final class AgentProgress {
             overland.interrupt();
             return;
         }
-        BlockHitResult log = body.find(state -> state.isIn(BlockTags.LOGS), player.getBlockInteractionRange(),
-            hit -> hit.getBlockPos().getY() <= player.getBlockY() + 1 && timberCandidate(hit) && timberInReach(hit)).orElse(null);
-        if (log == null && !overland.owns(player.getBlockPos()) && supplyEgress.seek(supplies)) return;
-        if (log == null) log = body.find(state -> state.isIn(BlockTags.LOGS), 22, this::timberCandidate).orElse(null);
+        if (startReachableTimber(true)) return;
+        if (!overland.owns(player.getBlockPos()) && supplyEgress.seek(supplies)) return;
+        BlockHitResult log = body.find(state -> state.isIn(BlockTags.LOGS), 22, this::timberCandidate).orElse(null);
         if (log != null) {
             witnessTimber(log);
             tendTimber();
@@ -3653,6 +3654,24 @@ final class AgentProgress {
         approachGoal = null;
     }
 
+    private boolean startReachableTimber(boolean searchView) {
+        if (!dryFieldFooting()) return false;
+        double reach = c.player.getBlockInteractionRange();
+        BlockHitResult wood = null;
+        if (c.crosshairTarget instanceof BlockHitResult pointed && pointed.getType() == HitResult.Type.BLOCK
+                && state(pointed).isIn(BlockTags.LOGS) && reachableTrunk.test(pointed))
+            wood = body.macroMineWitness(pointed, reach);
+        if (wood == null && searchView)
+            wood = body.find(state -> state.isIn(BlockTags.LOGS), reach, reachableTrunk).orElse(null);
+        if (wood == null) return false;
+        // The exposed face is in real interaction range from here, including the underside
+        // of a canopy trunk. There is no reason to look for its base or a higher foothold.
+        witnessTimber(wood);
+        beginTimberChop(wood, false);
+        status = "preparing to cut the reachable log from this footing";
+        return true;
+    }
+
     /** The supply caller retains its job until outside, at reachable wood, or at a physical refusal. */
     private final class SupplyEgress {
         private enum Proof {
@@ -3665,7 +3684,6 @@ final class AgentProgress {
         private static final int MAX_CONNECTORS = 2, MAX_FOOTHOLDS = 2, FOOTHOLD_RESERVE = 8, ANCHOR_TICKS = 24;
         private static final float SURVEY_PITCH = -42;
         private final List<BlockPos> walked = new ArrayList<>();
-        private final Predicate<BlockHitResult> reachableWood = this::reachableWood;
         private BlockPos openFoot, unknownFoot, from, to, armedCut, packedBench;
         private Vec3d floor, alternateFloor, aim, buildLow, buildHigh, reverseLeft, reverseRight;
         private Direction bearing, lane;
@@ -3849,6 +3867,7 @@ final class AgentProgress {
             body.turn(yaw, pitch);
             status = surveyActivity;
             boolean aligned = body.renderedDirection(yaw, pitch, 8);
+            if (startReachableTimber(aligned)) return ready("reachable timber from connected footing");
             if (!aligned && age < 3 * LOOK_TICKS) return true;
             int scene = body.supplyPerspective(yaw);
             int bit = 1 << view;
@@ -3861,13 +3880,6 @@ final class AgentProgress {
                 headingUntil = tick + 125;
                 approachGoal = null;
                 return ready("confirmed open ground");
-            }
-            BlockHitResult wood = aligned ? body.find(state -> state.isIn(BlockTags.LOGS), REACH, reachableWood)
-                .orElse(null) : null;
-            if (wood != null) {
-                // A visible, reachable lower trunk can be worked from this settled stance.
-                witnessTimber(wood);
-                return ready("reachable timber from connected footing");
             }
             // A single open sector may be the mouth of a shaft. Corroborate it across bearings.
             if (views == 1 && openViews != 0) views = 4;
@@ -3894,11 +3906,6 @@ final class AgentProgress {
                 return ready("no enclosure observed; continuing ordinary timber traversal");
             }
             return true;
-        }
-
-        private boolean reachableWood(BlockHitResult face) {
-            return face.getBlockPos().getY() <= from.getY() + 1 && timberCandidate(face) && timberInReach(face)
-                && horizontalDistance(c.player.getPos(), face.getPos()) <= 2.8;
         }
 
         private Direction option(int index) {

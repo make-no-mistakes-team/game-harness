@@ -111,6 +111,22 @@ test("Pending stock is not inventory or a permission to spend, replace, or renew
   expect(() => parseMacroObservation({ ...sample, pendingWork: { ...ticket, collectOfferId: "made-up" } })).toThrow("pending work opportunity");
   expect(() => parseMacroObservation({ ...sample, working: { intentId: "held-mouse", crack: 0.2 } })).toThrow("pending work scope");
   expect(() => parseMacroObservation({ ...sample, pendingWork: { ...ticket, historical: true } })).toThrow("pending work scope");
+  const cave = { id: "dry-cave-edge", verb: "follow", risk: "low", summary: "One returnable cave edge", evidence: "Dry both ways." };
+  const recall = { id: "fresh-recall", verb: "collect_pending", risk: "guarded", summary: "Recall exact furnace", evidence: "Same workshop trail." };
+  const worksite = { routes: "Paired level edge ahead; no movement yet.", choice: {
+    kind: "dry-follow", opportunityId: cave.id, target: "observed-edge-a",
+  } } as const;
+  const parked = { ...sample, workOrder: { ...sample.workOrder, state: "complete" },
+    pendingWork: { ...ticket, parked: true, yieldable: false, collectOfferId: recall.id, worksite },
+    opportunities: [recall, cave] };
+  expect(parseMacroObservation(parked).pendingWork?.worksite).toEqual(worksite);
+  expect(() => parseMacroObservation({ ...parked, pendingWork: { ...parked.pendingWork, worksite: undefined } }))
+    .toThrow("unscoped low-risk dry follow");
+  expect(() => parseMacroObservation({ ...parked, pendingWork: { ...parked.pendingWork, collectOfferId: undefined } }))
+    .toThrow("parked cave opportunity");
+  expect(() => parseMacroObservation({ ...parked, opportunities: [recall, { ...cave, risk: "guarded" }] }))
+    .toThrow("parked cave opportunity");
+  expect(() => parseMacroObservation({ ...parked, workOrder: sample.workOrder })).toThrow("parked worksite scope");
   const side = {
     target: { kind: "stock", item: "minecraft:cobblestone", count: 2 }, allowedEffects: ["break:minecraft:stone"],
     costCaps: [], reserves: [], maxBreaks: 2, maxCrafts: 0, maxPlacements: 0,

@@ -102,6 +102,11 @@ This job needs its own budget and a reachable source or recipe. If the
 bucket is the next thing the player needs and there is nothing worth doing
 at the worksite, waiting is fine.
 
+Finishing a short craft leaves time to scout. From a fresh view, Terra
+can check a specific cave opening or take a witnessed dry, level step with
+a way back to the furnace. A remembered opening can guide a look, but it
+doesn't establish that the ground ahead is safe to cross.
+
 Terra can also leave the batch for later. The player remembers the furnace
 and what went into it. Elapsed time does not put ingots in the inventory:
 the player must return, open the same furnace and take its output. A bucket

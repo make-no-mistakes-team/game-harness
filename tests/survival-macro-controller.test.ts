@@ -1154,6 +1154,97 @@ const returnOffer = {
   id: "fresh-furnace-return", verb: "collect_pending", risk: "guarded", summary: "Recheck the paid furnace",
   evidence: "A witnessed dry return to this station is still reachable.",
 } as const;
+const parkedCaveOffer = {
+  id: "fresh-cave-edge", verb: "follow", risk: "low", summary: "Follow one paired dry cave edge",
+  evidence: "The lit lane connects back to the paid furnace; no pickup or spend.",
+} as const;
+const parkedCave = {
+  routes: "One paired dry level edge ahead. The witnessed workshop return remains connected.",
+  choice: { kind: "dry-follow", opportunityId: parkedCaveOffer.id, target: "local-cave-edge" },
+} as const;
+const parkedStation = { routes: "Settled dry workshop; no cave edge was verified in this view." } as const;
+
+test.each(["cave now", "ready but independent", "richer route", "blocked", "delayed view"] as const)(
+  "A completed side order waits for its settled parked worksite and does not poll the furnace countdown: %s", async course => {
+    const requests: MacroRequest[] = [];
+    const goal = "diamond", ironPick = "minecraft:iron_pickaxe";
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1)
+        return workReply(request, { kind: "work", policy: ironPolicy, duringWait: { policy: sideStone, maxTicks: 600 } });
+      const choice = request.observation.pendingWork?.worksite?.choice;
+      if (choice && (course === "cave now" || course === "ready but independent"))
+        return workReply(request, { kind: "opportunity", opportunityId: choice.opportunityId });
+      return workReply(request, { kind: "abstain" });
+    }, "Prepare a bucket and continue cave work when safe.", 6);
+    try {
+      const held = { [ironItem]: 1, [fuelItem]: 1, [ironPick]: 1 };
+      await f.observe(10, { goal, inventory: { ...held, [fuelItem]: 3, [rawIronItem]: 2, [furnaceItem]: 1 } });
+      await f.actor.poll();
+      const batch = await f.order();
+      await f.receipt(batch.id, 11, "accepted");
+      const ticket = paidIron(batch.id, 395);
+      await f.observe(115, { goal, inventory: held, pendingWork: ticket, opportunities: [witnessedStone],
+        workOrder: { id: batch.id, state: "working", detail: "Paid burn",
+          progress: { phase: "smelt", status: "Cooking two paid units", breaks: 0, crafts: 0, placements: 1,
+            smeltBurn: { burnTick: 111, units: 2, remainingCookTicks: 395 } } } });
+      await f.actor.poll();
+      const side = await f.order();
+      await f.receipt(batch.id, 116, "parked");
+      await f.receipt(side.id, 116, "accepted");
+      await f.receipt(side.id, 452, "completed");
+      const heldAfterSide = { ...held, "minecraft:cobblestone": 3 };
+      const parked = { ...ticket, parked: true, yieldable: false, remainingTicks: 370 };
+      await f.observe(453, { goal, inventory: heldAfterSide, pendingWork: parked });
+      await f.actor.poll();
+      expect(requests).toHaveLength(1); // Inventory closure is not an idle world.
+      if (course === "delayed view") {
+        await f.observe(480, { goal, inventory: heldAfterSide, pendingWork: { ...parked, remainingTicks: 340 } });
+        await f.actor.poll();
+        expect(requests[1]?.work?.parkedWorksite).toBe("view-unavailable");
+        await f.observe(495, { goal, inventory: heldAfterSide, pendingWork: { ...parked, remainingTicks: 330 } });
+        expect(requests).toHaveLength(2);
+      }
+      const blocked = course === "blocked";
+      const explore = course === "cave now" || course === "ready but independent";
+      const local = { ...parked, ...(blocked ? { state: "blocked" as const } : { collectOfferId: returnOffer.id }),
+        ...(course === "ready but independent" ? { state: "unknown" as const, remainingTicks: 0 } : {}),
+        worksite: explore ? parkedCave :
+          { routes: blocked ? "Water blocks the lane; no connected dry return is witnessed." : "No cave edge is yet witnessed." } };
+      const world = { goal, inventory: heldAfterSide, pendingWork: local,
+        opportunities: blocked ? [] : explore ? [returnOffer, parkedCaveOffer] : [returnOffer] };
+      const worldTick = course === "delayed view" ? 500 : 458;
+      await f.observe(worldTick, world);
+      await f.actor.poll();
+      expect(requests.at(-1)?.observation.tick).toBe(worldTick);
+      expect(requests.at(-1)?.work?.parkedWorksite).toBe("settled");
+      expect(requests.at(-1)?.observation.inventory[ironItem]).toBe(1);
+      if (explore) {
+        const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+        expect(intent).toMatchObject({ opportunityId: parkedCaveOffer.id, basisTick: worldTick, skillHash: null });
+        return;
+      }
+      let expected = requests.length;
+      await f.observe(worldTick + 5, { ...world, pendingWork: { ...local, remainingTicks: 360 } });
+      expect(requests).toHaveLength(expected);
+      if (course === "richer route") {
+        await f.observe(worldTick + 10, { ...world, pendingWork: { ...local, remainingTicks: 355, worksite: parkedCave },
+          opportunities: [returnOffer, parkedCaveOffer] });
+        await f.actor.poll();
+        expect(requests).toHaveLength(++expected);
+        const renewed = { ...parkedCaveOffer, id: "same-edge-new-opaque-id" };
+        await f.observe(worldTick + 15, { ...world, opportunities: [returnOffer, renewed],
+          pendingWork: { ...local, remainingTicks: 350,
+            worksite: { ...parkedCave, choice: { ...parkedCave.choice, opportunityId: renewed.id } } } });
+        expect(requests).toHaveLength(expected);
+      }
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
 
 test.each(["prequoted", "fallback"] as const)("A %s side grant produces stock during cooking, then leaves collection to a fresh return", async approach => {
   const requests: MacroRequest[] = [];
@@ -1210,7 +1301,7 @@ test.each(["prequoted", "fallback"] as const)("A %s side grant produces stock du
     await f.receipt(side.id, 550, "completed");
     const stocked = { ...held, "minecraft:cobblestone": 3 };
     await f.observe(550, { goal, inventory: stocked, quiescent: true, opportunities: [returnOffer],
-      pendingWork: { ...due, collectOfferId: returnOffer.id } });
+      pendingWork: { ...due, collectOfferId: returnOffer.id, worksite: parkedStation } });
     expect(f.actor.status().completedModelWorkOrders).toBe(1);
     await f.observe(551, { goal, inventory: stocked, quiescent: true, pendingWork: due });
     releaseOldReturn.resolve();
@@ -1218,7 +1309,7 @@ test.each(["prequoted", "fallback"] as const)("A %s side grant produces stock du
     await expect(access(f.file("intent.json"))).rejects.toThrow();
     const laterOffer = { ...returnOffer, id: "returned-furnace-after-recheck" };
     await f.observe(1150, { goal, inventory: stocked, quiescent: true, opportunities: [laterOffer],
-      pendingWork: { ...due, collectOfferId: laterOffer.id } });
+      pendingWork: { ...due, collectOfferId: laterOffer.id, worksite: parkedStation } });
     await f.actor.poll();
     const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
     expect(intent).toMatchObject({ opportunityId: laterOffer.id, basisTick: 1150, skillHash: null });
@@ -1337,7 +1428,7 @@ test("Explicit deferral retires the owner only on a native park and does not cou
     await f.receipt(batch.id, 116, "parked");
     await f.receipt(intent.id, 116, "accepted");
     await f.receipt(intent.id, 116, "completed");
-    const parked = { ...ticket, parked: true, yieldable: false };
+    const parked = { ...ticket, parked: true, yieldable: false, worksite: parkedStation };
     const atWorkshop = { goal: "diamond", inventory: held, quiescent: true,
       workOrder: { id: batch.id, state: "parked", detail: "Paid output remains in the station." } } as const;
     await f.observe(116, { ...atWorkshop, pendingWork: parked });
@@ -1373,7 +1464,7 @@ test.each(["ordinary opportunity", "duplicate production", "remembered descripti
       const live = { goal: "diamond", quiescent: true,
         inventory: { [ironItem]: 1, [fuelItem]: 3, [rawIronItem]: 2, [furnaceItem]: 1 },
         pendingWork: { ...paidIron("old-paid-batch", 0), historical: true, state: "unknown",
-          parked: true, yieldable: false, ...(returns ? { collectOfferId: returnOffer.id } : {}) },
+          parked: true, yieldable: false, worksite: parkedStation, ...(returns ? { collectOfferId: returnOffer.id } : {}) },
         opportunities: returns ? [returnOffer] : [],
       } as const;
       await f.observe(10, live);

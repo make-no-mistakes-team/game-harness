@@ -189,6 +189,16 @@ export interface MacroPendingWork {
   readonly collectOfferId?: string;
   readonly deferOfferId?: string;
   readonly historical?: true;
+  /** Present only on a settled, current world view after the parked controls are released. */
+  readonly worksite?: {
+    readonly routes: string;
+    readonly choice?: {
+      readonly kind: "dry-follow" | "dry-approach" | "inspect-cave";
+      readonly opportunityId: string;
+      /** A stable local witness identity, not an opportunity ID or a world position. */
+      readonly target: string;
+    };
+  };
 }
 
 export type MacroWorkMode = "preset" | "constrained";
@@ -256,6 +266,8 @@ export interface MacroWorkDemand {
   } | null;
   /** The one native ticket this decision may use for independent work. */
   readonly duringWaitFor?: string;
+  /** A parked decision uses fresh local facts, or explicitly reports a bounded view wait. */
+  readonly parkedWorksite?: "settled" | "view-unavailable";
   /** The original model's stated reason, not evidence or a dependent authorization. */
   readonly pendingPurpose?: { readonly id: string; readonly subgoal: string; readonly reason: string };
   readonly lastOutcome: {
@@ -759,7 +771,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
   let pendingWork: MacroPendingWork | undefined;
   if (Object.hasOwn(record, "pendingWork")) {
     const raw = shape(record.pendingWork, "native pending work", ["id", "kind", "goal", "invested", "output", "location",
-      "state", "yieldable", "parked"], ["remainingTicks", "collectOfferId", "deferOfferId", "historical"]);
+      "state", "yieldable", "parked"], ["remainingTicks", "collectOfferId", "deferOfferId", "historical", "worksite"]);
     const id = validateMacroId(raw.id, "pending work id");
     const kind = choice(raw.kind, "pending production kind", ["iron-smelting"] as const);
     const goal = text(raw.goal, "pending parent goal", 256);
@@ -785,13 +797,34 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     const collectOfferId = offer(raw.collectOfferId, MACRO_COLLECT_PENDING);
     const deferOfferId = offer(raw.deferOfferId, MACRO_DEFER_PENDING);
     if ((collectOfferId && !parked) || (deferOfferId && (parked || !yieldable))) invalid("pending work operation");
+    let worksite: MacroPendingWork["worksite"];
+    if (raw.worksite !== undefined) {
+      if (!parked || yieldable || working || !safety?.clear || workOrder?.state === "working") invalid("parked worksite scope");
+      const local = shape(raw.worksite, "parked worksite", ["routes"], ["choice"]);
+      let caveChoice: NonNullable<MacroPendingWork["worksite"]>["choice"];
+      if (local.choice !== undefined) {
+        const quoted = shape(local.choice, "parked cave choice", ["kind", "opportunityId", "target"]);
+        const kind = choice(quoted.kind, "parked cave choice kind", ["dry-follow", "dry-approach", "inspect-cave"] as const);
+        const opportunityId = validateMacroId(quoted.opportunityId, "parked cave opportunity id");
+        const verb = kind === "dry-follow" ? "follow" : kind === "dry-approach" ? "approach" : "survey";
+        if (!collectOfferId || historical || !opportunities.some(offer => offer.id === opportunityId &&
+            offer.verb === verb && offer.risk === "low" && !offer.material)) invalid("parked cave opportunity");
+        caveChoice = Object.freeze({ kind, opportunityId, target: validateMacroId(quoted.target, "parked cave target") });
+      }
+      worksite = Object.freeze({ routes: text(local.routes, "parked worksite routes", 512),
+        ...(caveChoice ? { choice: caveChoice } : {}) });
+    }
     pendingWork = Object.freeze({
       id, kind, goal, invested, output, state, location: text(raw.location, "pending location clue", 512), yieldable, parked,
       ...(raw.remainingTicks !== undefined ? { remainingTicks: whole(raw.remainingTicks, "estimated remaining ticks", 0, output.count * 200) } : {}),
       ...(collectOfferId ? { collectOfferId } : {}), ...(deferOfferId ? { deferOfferId } : {}),
       ...(historical ? { historical } : {}),
+      ...(worksite ? { worksite } : {}),
     });
   }
+  if (opportunities.some(offer => offer.verb === "follow" && offer.risk === "low" &&
+      (pendingWork?.worksite?.choice?.kind !== "dry-follow" || pendingWork.worksite.choice.opportunityId !== offer.id)))
+    invalid("unscoped low-risk dry follow");
   return Object.freeze({
     v: version(record.v), ...basis(record), goal: text(record.goal, "goal", 256),
     health: finite(record.health, "health", 1_024), food: whole(record.food, "food", 0, 20),

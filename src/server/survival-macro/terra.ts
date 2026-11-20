@@ -58,6 +58,10 @@ You may prequote an independently useful duringWait:{policy,maxTicks} on the ori
 
 If it is worth deliberately leaving the released furnace for later parent-goal work, use "defer-pending" with the exact pendingWorkId only while deferOfferId is present. Deferral is not a material effect. Once parked, continue with context-compatible goal work without losing the return path. Choose "collect-pending" with pendingWorkId when collectOfferId is fresh and the dependency matters; if plenty of time remains, avoid reopening early just to stare at a cook bar. The native actor returns along a witnessed route and visibly checks this exact furnace before taking anything. Never use these offers as ordinary opportunities, a continuation or a skill. If the return cannot be freshly verified, keep the obligation visible and change course without claiming stock. Smelting iron is not a bucket craft, diamond pickup, or Nether entry.`;
 
+const PARKED_CAVE_PROMPT = `This is a new live decision for a parked ticket, not another decision about the finished side job. Prefer useful local cave progress toward the parent goal whenever it is compatible with the user's objective, safe now, and leaves a credible return to this exact furnace. The later bucket recipe needs iron; a dry cave advance or checking a specific cave branch does not. A fresh collectOfferId or elapsed estimate is not a deadline or a command to return. Choose collect-pending when the uncollected output is necessary for the next useful step, not merely because a later recipe needs it.
+
+Read pendingWork.worksite and the fresh world opportunities before relying on the earlier pendingPurpose. worksite.choice, if present, names one exact ordinary "opportunity" you can choose in constrained mode. A dry-follow or dry-approach is one local returnable leg with no spend; name what the distinct foothold would let you investigate. An inspect-cave checks one specific witnessed lower lane or rechecks a dated cave cue from the same dry stance; it cannot move, mine, fill water, or prove a route in advance. If it reveals a fresh dry edge, the next decision can take it. Do not substitute a generic survey, more side crafting, or an unrestricted prospecting order for the local leg. Do not quote IDs from older views or assume a clear path beyond this leg. If the lane is unsafe, no worthwhile local step is witnessed, or the next useful step actually needs the result, explain why and wait or select the fresh exact collection offer. With parkedWorksite "view-unavailable", report the missing usable view or abstain; there is no live action on that basis.`;
+
 const DIAMOND_PROMPT = `With an iron-tier harvesting tool and dry cave footing, choose a single live work action targeting minecraft:diamond stock with ${MACRO_DIAMOND_PROSPECT} to seek ore that is not yet visible. The player can inspect and follow a witnessed lower shelf with a proved return, or cut a cardinal staircase one tread at a time. Name exact permitted ore break effects (break:minecraft:diamond_ore and/or break:minecraft:deepslate_diamond_ore). This prospecting effect grants no cover breaks: if allowed, name each exact natural cover separately (such as minecraft:stone, minecraft:deepslate, minecraft:diorite, minecraft:andesite, minecraft:granite, or minecraft:tuff with the break: prefix). An ore-only job does not cut rock. New descending clearance can take four cover breaks per tread plus an obstructed anchor ceiling; keep at least one break for ore. If light is needed and allowed, include ${MACRO_PROSPECT_TORCH}, maxPlacements, exact carried torch cost, and the required torch floor. No light, block or tool stock is spent implicitly. Mining can wear a pickaxe even when no item-count loss is allowed; preserve usable tools and slots for genuine drops.
 If the descent lanes fail, the same job can follow a witnessed dry level foothold or upper shelf, or open two exact, permitted foot/head cells toward a side wall. It can backtrack only over retained dry, revalidated edges. If permitted, ${MACRO_PROSPECT_SUPPORT} allows one use per exact adjacent support cell that the native camera proves empty, dry and attachable, with clear forward and reverse space. Add the exact minecraft:cobblestone cost cap and protect its reserve. Blocks and torches share maxPlacements. A screenshot of water or an opening does not prove an attachable dry cell; the player will not redirect water or step into an unverified gap. Read actual Y, reached treads, support placement/debit, separate landings, and the exact refusal in native progress. Use a substantial bounded horizon; a compatible renewal adds time without restoring spent caps. On a terminal productive leg, decide whether to grant a new finite leg, resupply, or change route. None of these movements counts as diamond stock. Do not use prospecting or its placements in work-program, preset work, a continuation or a generated skill.`;
 
@@ -118,6 +122,7 @@ const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroReques
   const smeltId = smeltSuccessorId(work);
   const afterWorkId = smeltId ? { type: "string", enum: [smeltId] } : string;
   const ticketId = (id: string) => ({ type: "string", enum: [id] });
+  const noParkedView = work?.parkedWorksite === "view-unavailable";
   const otherActions = smeltId ? [] : [
     ...(work ? [action("work", { policy: singleWorkPolicy }), action("work-program", { stages: workStages })] : []),
     ...(work?.current ? [action("revoke-work", { workOrderId: string })] : [
@@ -144,7 +149,7 @@ const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroReques
     parameters: strictObject({
       subgoal: string, reason: string, successCondition: string, contingency: string, alternative: string,
       expiresTick: integer,
-      action: { anyOf: [
+      action: { anyOf: noParkedView ? [action("gap", { capability: string }), action("abstain")] : [
         ...(work?.current?.accepted ? [action("work", { policy: singleWorkPolicy, afterWorkId }),
           action("work-program", { stages: workStages, afterWorkId })] : []),
         ...(work && !smeltId && !pending ? [action("work", { policy: singleWorkPolicy, duringWait: strictObject({
@@ -292,7 +297,8 @@ function contextFor(request: MacroRequest, basis: MacroBasis, image?: ImageConte
   });
   if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) return;
   return {
-    systemPrompt: work && !lookahead ? [PROMPT, FURNACE_PROMPT, DIAMOND_PROMPT, WATER_PROMPT] : [PROMPT],
+    systemPrompt: work && !lookahead ? [PROMPT, FURNACE_PROMPT, DIAMOND_PROMPT, WATER_PROMPT,
+      ...(work.parkedWorksite ? [PARKED_CAVE_PROMPT] : [])] : [PROMPT],
     messages: [{
       role: "user", timestamp: Date.now(),
       content: image ? [{ type: "text", text }, image] : text,
@@ -411,6 +417,8 @@ function proposalFor(raw: string | undefined, request: MacroRequest, basis: Macr
       request.lookahead.candidates.some(offer => offer.id === action.opportunityId)) ? proposal : "successor";
   }
   if (action.kind === "successor") return "successor";
+  if (request.work?.parkedWorksite === "view-unavailable" && action.kind !== "gap" && action.kind !== "abstain")
+    return "missing_opportunity";
   const smeltId = smeltSuccessorId(request.work);
   const pending = request.observation.pendingWork;
   if (action.kind === "collect-pending" || action.kind === "defer-pending") {

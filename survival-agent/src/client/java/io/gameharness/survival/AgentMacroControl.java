@@ -90,6 +90,7 @@ final class AgentMacroControl {
     private static final int WORKSHOP_SUPPORTS = 8;
     private static final String IRON_WORKSHOP_STEP = "iron_workshop";
     private static final int MAX_ROUTE_EDGES = 8;
+    private static final String PARKED_CAVE = "parked_cave";
     private static final int MAX_OFFERS = 16;
     private static final int MAX_MATERIAL_TARGETS = 4_096;
     private static final int APPROACH_SETTLE_TICKS = 3;
@@ -199,6 +200,7 @@ final class AgentMacroControl {
     }
     /** Cook quotes are visible to planning and independent-stock admission, never to general intents. */
     private record PendingView(List<Offer> quotes, String routes, String sources) {}
+    private record ParkedCaveChoice(Offer offer, String kind, String target) {}
     private record Snapshot(long epoch, Map<String, Offer> offers, List<Offer> sideQuotes) {}
     private record Intent(String id, int life, long epoch, long basis, long expires, String opportunity, String skillHash) {}
     private record Handoff(int life, long epoch, long basis, long expires) {}
@@ -379,6 +381,7 @@ final class AgentMacroControl {
         boolean refusedPendingReplacement;
         BlockPos ironSceneFooting;
         FurnaceLook ironScene;
+        long ironSceneTick;
         Offer waterClue;
         Face pendingSideSource;
         long pendingSideAimUntil;
@@ -565,6 +568,10 @@ final class AgentMacroControl {
     private Face pendingFace;
     private AgentFurnaceWatch pendingEstimate;
     private final ArrayList<BlockPos> pendingTrail = new ArrayList<>(MAX_ROUTE_EDGES + 1);
+    private final Set<BlockPos> parkedCaveLandings = new HashSet<>(MAX_ROUTE_EDGES + 1);
+    private final Set<Key> parkedCaveChecks = new HashSet<>();
+    private long parkedViewAfterFrame = -1;
+    private boolean parkedViewPublished;
     private long pendingTileSeen;
     private boolean pendingUncertain, pendingWorldRelease;
     private TimberHarvest timberHarvest;
@@ -852,6 +859,8 @@ final class AgentMacroControl {
             } else if ((local ? now - action.startedAt >= PLANNING_IDLE_LIMIT_NS : tick > action.intent.expires)
                     || tick - action.started > action.offer.key.verb.maxTicks) {
                 interrupt(timeoutDetail(), true);
+            } else if (PARKED_CAVE.equals(action.offer.key.activity) && (pendingEntry() == null || pendingUncertain || !cursorClear())) {
+                interrupt("The exact parked furnace obligation or clean controls changed.", true);
             } else if (action.offer.route != null && (action.intent.epoch != epoch || !cursorClear())) {
                 interrupt("The dry route's dependency epoch or clean-cursor premise changed.", true);
             } else if ((!grounded() && !progress.dryRouteInFlight(action.offer.route))
@@ -894,6 +903,8 @@ final class AgentMacroControl {
             : offer.key.verb == Verb.COLLECT_PENDING && (intent.skillHash != null || tick - intent.basis >= MAX_WORK_ADMISSION_AGE)
                 ? "Collection requires a fresh, direct instruction for the exact pending ticket."
             : SURFACE_CAP.equals(offer.key.activity) && intent.skillHash != null ? "A generated skill cannot cut cover."
+            : PARKED_CAVE.equals(offer.key.activity) && (intent.skillHash != null || tick - intent.basis >= MAX_WORK_ADMISSION_AGE)
+                ? "This local cave option requires a fresh direct model decision."
             : (offer.route != null || offer.drySurvey != null) && intent.skillHash != null
                 ? "Only a direct Terra intent may survey or follow this dry route."
             : !trial && intent.skillHash != null && offer.key.verb == Verb.APPROACH
@@ -1174,6 +1185,7 @@ final class AgentMacroControl {
         ironMilestone("parked", detail);
         body.pauseWork();
         action = null;
+        requireFreshParkedView();
         retireWork("parked", "parked", detail);
         continuityWork = null;
         return true;
@@ -1233,6 +1245,7 @@ final class AgentMacroControl {
 
     private void retireWork(String phase, String result, String detail) {
         if (!hasActiveWorkOrder()) return;
+        if (work.order.duringWaitFor() != null) requireFreshParkedView();
         work.phase = phase;
         work.detail = detail;
         enact(phase.equals("complete") ? "complete" : "hold", detail);
@@ -3631,6 +3644,7 @@ final class AgentMacroControl {
             // Retain the actual approach view before placement or contact turns toward the workshop.
             work.ironSceneFooting = footing;
             work.ironScene = furnaceScene(footing);
+            work.ironSceneTick = tick;
         }
         var witnessed = body.find(state -> state.isOf(Blocks.FURNACE) && !state.get(AbstractFurnaceBlock.LIT), reach(),
             hit -> hit.getBlockPos().equals(work.placedFurnace) && hit.getBlockPos().getY() >= player.getBlockY()).orElse(null);
@@ -4065,6 +4079,10 @@ final class AgentMacroControl {
         pendingFace = null;
         pendingEstimate = null;
         pendingTrail.clear();
+        parkedCaveLandings.clear();
+        parkedCaveChecks.clear();
+        parkedViewAfterFrame = -1;
+        parkedViewPublished = false;
         pendingUncertain = pendingWorldRelease = false;
     }
 
@@ -4114,6 +4132,17 @@ final class AgentMacroControl {
 
     private boolean pendingParked() {
         return pendingOrigin == null || !pendingOrigin.active();
+    }
+
+    private void requireFreshParkedView() {
+        parkedViewAfterFrame = body.renderedFrame();
+        parkedViewPublished = false;
+    }
+
+    private boolean parkedViewReady() {
+        return action == null && !hasActiveWorkOrder() && personalCraft == null && !urgent && settled()
+            && body.renderedFrame() > parkedViewAfterFrame && releasedPendingHands()
+            && body.renderedDirection(player.getYaw(), player.getPitch(), 2);
     }
 
     private boolean pendingCollectionPremise(AgentPendingFurnaceMemory.Entry ticket) {
@@ -4411,7 +4440,14 @@ final class AgentMacroControl {
 
     private void startFurnaceSurvey(FurnaceWork iron) {
         iron.scene = iron.footing.equals(work.ironSceneFooting) ? work.ironScene : null;
-        if (iron.scene == null) iron.scene = furnaceScene(iron.footing);
+        if (iron.scene == null) {
+            iron.scene = furnaceScene(iron.footing);
+            if (iron.scene != null) {
+                work.ironScene = iron.scene;
+                work.ironSceneFooting = iron.footing;
+                work.ironSceneTick = tick;
+            }
+        }
         if (iron.scene == null) {
             ironStatus("No distinct cave cue was witnessed; waiting on the original dry stance without turning to a known bench.");
             return;
@@ -4841,6 +4877,22 @@ final class AgentMacroControl {
 
     private String validate(Offer offer, AgentProgress progress) {
         var player = client.player;
+        if (PARKED_CAVE.equals(offer.key.activity)) {
+            var ticket = pendingEntry();
+            if (!parkedViewReady() || !pendingCollectionPremise(ticket) || ticket.historical()
+                    || !pendingReturnKnown(progress, ticket)
+                    || pendingOrigin != null && pendingOrigin.budget.missingFloor(player.getInventory()) != null)
+                return "The parked furnace, connected return, or protected stock changed.";
+            if (offer.key.verb == Verb.SURVEY) {
+                var scene = parkedCaveScene();
+                return scene != null && scene.hit.getBlockPos().equals(offer.key.pos) && !parkedCaveChecks.contains(offer.key)
+                    && !body.renderedAim(scene.hit.getPos(), 9) ? null : "The dated cave cue was already checked or lost.";
+            }
+            if (offer.key.verb == Verb.DRY_SURVEY && parkedCaveChecks.contains(offer.key))
+                return "The exact lower lane was already checked from this stance.";
+            if ((offer.key.verb == Verb.FOLLOW || offer.key.verb == Verb.APPROACH) && !parkedCaveLanding(ticket, offer.key.pos))
+                return "The exact dry leg no longer has a connected workshop return.";
+        }
         return switch (offer.key.verb) {
             case SURVEY -> repeatedSourceView() || retiredViews.contains(offer.key) || offer.key.entity != surveyOrigin || anchor == null
                 || horizontalSquared(anchor, player.getPos()) > 0.64
@@ -4904,6 +4956,10 @@ final class AgentMacroControl {
             case DRY_SURVEY -> surveyDryRoute(offer, progress);
             case STATION_REACQUIRE -> advanceStationRecall();
             case SURVEY -> {
+                if (PARKED_CAVE.equals(offer.key.activity)) {
+                    recheckParkedCaveCue();
+                    return;
+                }
                 var player = client.player;
                 if (horizontalSquared(action.position, player.getPos()) > 0.12) {
                     interrupt("The survey lost its stationary stance.", true);
@@ -4936,6 +4992,19 @@ final class AgentMacroControl {
             case FOLLOW -> followRoute(offer, progress);
             case WATER_CLUE, DEFER_PENDING, WORK_WALK, WORK_EQUIP, WORK_PLACE, WORK_TREAD, WORK_SMELT, WORK_FILL ->
                 throw new IllegalStateException("Expected work step dispatch");
+        }
+    }
+
+    private void recheckParkedCaveCue() {
+        var scene = parkedCaveScene();
+        if (scene == null || horizontalSquared(action.position, player.getPos()) > 0.0144) {
+            interrupt("The dated cave cue lost its original dry stance.", true);
+        } else if (body.hasRecentView()) {
+            if (body.renderedFrame() > action.startingFrame && body.renderedAim(scene.hit.getPos(), 9)) {
+                String witnessed = furnaceCueFact(scene);
+                if (witnessed == null) interrupt("The previously seen cave cue did not revalidate; no route was proved.", true);
+                else complete(witnessed + " No cave edge was traversed.");
+            } else body.aim(scene.hit.getPos());
         }
     }
 
@@ -5355,7 +5424,8 @@ final class AgentMacroControl {
             purposeful("work " + action.offer.key.verb.id + ": " + continuityWork.name());
         boolean due = tick - lastObservation >= OBSERVATION_INTERVAL || lastObservation == 0
             || personalCraft != null && work.completedTick == tick
-            || action != null && action.furnace != null && action.furnace.releaseTick == tick;
+            || action != null && action.furnace != null && action.furnace.releaseTick == tick
+            || !parkedViewPublished && pendingParked() && pendingEntry() != null && parkedViewReady();
         updateScope(due);
         // Ordinary local work may continue on the very next tick. Only an observed
         // promotion barrier (or an isolated trial) advertises a held neutral window.
@@ -5847,6 +5917,109 @@ final class AgentMacroControl {
             sources.isEmpty() ? null : recentSummary("Local post-Escape targets; no stock gained. " + sources));
     }
 
+    private FurnaceLook parkedCaveScene() {
+        return pendingOrigin != null && pendingOrigin.ironScene != null
+            && tick - pendingOrigin.ironSceneTick <= AgentWorkOrder.MAX_TICKS
+            && player.getBlockPos().down().equals(pendingOrigin.ironSceneFooting)
+            ? pendingOrigin.ironScene : null;
+    }
+
+    private boolean parkedCaveLanding(AgentPendingFurnaceMemory.Entry ticket, BlockPos landing) {
+        BlockPos from = player.getBlockPos();
+        return !client.options.forwardKey.isUnbound() && cardinallyAdjacent(from, landing)
+            && pendingFootNearby(ticket, landing) && pendingTrail.size() <= MAX_ROUTE_EDGES
+            && (pendingTrail.isEmpty() ? from.equals(ticket.footing()) : from.equals(pendingTrail.getLast()))
+            && !pendingTrail.contains(landing) && !parkedCaveLandings.contains(landing)
+            && body.dryRouteVeto(from, landing) == AgentBody.DryRouteVeto.CLEAR
+            && body.dryRouteVeto(landing, from) == AgentBody.DryRouteVeto.CLEAR;
+    }
+
+    private ParkedCaveChoice parkedCaveChoice(List<Offer> visible, AgentPendingFurnaceMemory.Entry ticket, AgentProgress progress) {
+        // Use the just-published route and floor witnesses, not a second source/terrain scan.
+        if (ticket.historical() || !pendingReturnKnown(progress, ticket)) return null;
+        var scene = parkedCaveScene();
+        var foot = player.getBlockPos();
+        Offer approach = null, lowerSurvey = null;
+        var route = routeOffer == null ? null : routeOffer.route;
+        Vec3d cue = scene == null ? null : scene.hit.getPos();
+        for (Offer offer : visible) {
+            if (offer.route != null && offer.route.edges() == 1 && offer.route.heightChange() == 0
+                    && parkedCaveLanding(ticket, offer.route.endpoint())) {
+                return parkedCaveQuote(offer, offer.route.endpoint(), "dry-follow", "Follow one witnessed dry cave edge",
+                    "A paired level lane with a distinct endpoint and a connected workshop return. Recheck the exact edge; no spend.");
+            }
+            if (offer.drySurvey != null) lowerSurvey = offer;
+            if (offer.key.verb == Verb.APPROACH && offer.farther == null && approach == null) {
+                BlockPos next = offer.floor.pos.up();
+                boolean caveBearing = route != null && next.equals(route.next())
+                    || cue != null && (cue.x - foot.getX() - 0.5) * (next.getX() - foot.getX())
+                        + (cue.z - foot.getZ() - 0.5) * (next.getZ() - foot.getZ()) > 0.5;
+                if (caveBearing && parkedCaveLanding(ticket, next)) approach = offer;
+            }
+        }
+        if (approach != null) {
+            return parkedCaveQuote(approach, approach.floor.pos.up(), "dry-approach",
+                "Approach the witnessed cave-side foothold",
+                approach.evidence + " One dry step into the cave bearing with a connected workshop return; no spend.");
+        }
+        if (lowerSurvey != null) {
+            BlockPos lower = foot.offset(player.getHorizontalFacing()).down();
+            var quote = parkedCaveQuote(lowerSurvey, lower, "inspect-cave", lowerSurvey.summary, lowerSurvey.evidence);
+            if (quote != null && !parkedCaveChecks.contains(quote.offer.key)) return quote;
+        }
+        if (scene != null && !body.renderedAim(scene.hit.getPos(), 9)) {
+            Vec3d delta = scene.hit.getPos().subtract(player.getEyePos());
+            float yaw = heading(delta.x, delta.z);
+            float pitch = (float) Math.toDegrees(Math.atan2(-delta.y, Math.hypot(delta.x, delta.z)));
+            var old = new Offer(null, new Key(Verb.SURVEY, null, 0, null), "", "", yaw, pitch,
+                null, null, null, null, null);
+            var quote = parkedCaveQuote(old, scene.hit.getBlockPos(), "inspect-cave",
+                "Recheck the earlier cave-side witness from the workshop",
+                "Seen at tick " + pendingOrigin.ironSceneTick + ", not a live route. Check this specific cave bearing again from dry footing; no movement or spend.");
+            if (quote != null && !parkedCaveChecks.contains(quote.offer.key)) return quote;
+        }
+        return null;
+    }
+
+    private ParkedCaveChoice parkedCaveQuote(Offer original, BlockPos target, String kind, String summary, String evidence) {
+        Key key = new Key(original.key.verb, target, 0, PARKED_CAVE);
+        String localTarget = materialTarget(key);
+        return localTarget == null ? null : new ParkedCaveChoice(new Offer(offerId(key), key, summary, evidence,
+            original.yaw, original.pitch, original.floor, original.face, null, null, null,
+            original.route, null, original.drySurvey), kind, localTarget);
+    }
+
+    private JsonObject parkedWorksite(AgentProgress progress, boolean collectible, ParkedCaveChoice choice) {
+        var local = new JsonObject();
+        var routes = new StringBuilder(progress.dryRouteOfferEvidence()).append(' ');
+        if (routeOffer != null && (routeOffer.route.edges() != 1 || routeOffer.route.heightChange() != 0))
+            routes.append("The observed route is ").append(dryRouteDescription(routeOffer.route))
+                .append("; furnace recall is limited to connected level footing. ");
+        if (!collectible) routes.append("No exact collection or connected workshop return is available now. ");
+        var earlier = parkedCaveScene();
+        if (earlier != null && (choice == null || choice.offer.key.verb != Verb.SURVEY)) {
+            routes.append("A ").append(switch (earlier.kind) {
+                case WATER -> "water cue";
+                case DRY_FOOTHOLD -> "dry foothold";
+                case MATERIAL -> "material face";
+                case WORKBENCH -> "workstation";
+            }).append(" was seen ").append(bearing(earlier.hit.getPos(), player.getPos(), player.getYaw()))
+                .append(" at tick ").append(pendingOrigin.ironSceneTick).append("; that earlier view is not a live route. ");
+        }
+        if (choice == null) {
+            routes.append("No distinct returnable cave leg or unchecked cave cue is offered from this stance. ");
+        } else {
+            routes.append(choice.offer.evidence).append(' ');
+            var option = new JsonObject();
+            option.addProperty("kind", choice.kind);
+            option.addProperty("opportunityId", choice.offer.id);
+            option.addProperty("target", choice.target);
+            local.add("choice", option);
+        }
+        local.addProperty("routes", recentSummary(routes.toString()));
+        return local;
+    }
+
     private boolean addPendingSourceQuote(List<Offer> quotes, AgentProgress progress, Predicate<BlockState> matches) {
         double reach = reach();
         ItemStack held = player.getMainHandStack();
@@ -6144,8 +6317,10 @@ final class AgentMacroControl {
         PendingView cook = null;
         var ticket = pendingEntry();
         boolean yieldable = pendingCanYield();
+        boolean parked = ticket != null && pendingParked();
+        boolean parkedWorld = parked && progress != null && parkedViewReady();
         if (progress != null && observableWorld()) {
-            if (action == null) visible = offers(progress);
+            if (action == null && (!parked || parkedWorld)) visible = offers(progress);
             else if (yieldable) {
                 cook = pendingView(progress, ticket);
                 visible = cook.quotes;
@@ -6157,27 +6332,37 @@ final class AgentMacroControl {
             }
         }
         if (ticket != null && (pendingWorldRelease || pendingParked())) {
-            boolean parked = pendingParked();
-            boolean safeReturn = progress != null && action == null && pendingCollectionPremise(ticket);
+            boolean safeReturn = parkedWorld && pendingCollectionPremise(ticket);
             BlockHitResult inReach = safeReturn ? livePendingFace(ticket) : null;
             boolean collectible = safeReturn && (inReach != null || pendingReturnKnown(progress, ticket));
+            ParkedCaveChoice cave = collectible ? parkedCaveChoice(visible, ticket, progress) : null;
             Offer pendingOffer = null;
-            if (yieldable || collectible) {
-                var list = new ArrayList<Offer>(visible.size() + 1);
-                Verb verb = yieldable ? Verb.DEFER_PENDING : Verb.COLLECT_PENDING;
-                offer(list, new Key(verb, null, 0, ticket.ticket().toString()),
-                    yieldable ? "Defer the paid furnace batch" : "Return to the paid furnace and recheck its result",
-                    yieldable ? "The exact paid multi-unit batch released clean controls; leaving it does not grant any stock."
-                        : "A nearby return is remembered. Vanilla face, handler and exact output must all revalidate before withdrawal.",
-                    0, 0, null, inReach == null ? null : face(inReach), null, null, null);
-                pendingOffer = list.getFirst();
+            if (yieldable || parkedWorld) {
+                var list = new ArrayList<Offer>(Math.min(MAX_OFFERS, visible.size() + 2));
+                if (yieldable || collectible) {
+                    Verb verb = yieldable ? Verb.DEFER_PENDING : Verb.COLLECT_PENDING;
+                    offer(list, new Key(verb, null, 0, ticket.ticket().toString()),
+                        yieldable ? "Defer the paid furnace batch" : "Return to the paid furnace and recheck its result",
+                        yieldable ? "The exact paid multi-unit batch released clean controls; leaving it does not grant any stock."
+                            : "A nearby return is remembered. Vanilla face, handler and exact output must all revalidate before withdrawal.",
+                        0, 0, null, inReach == null ? null : face(inReach), null, null, null);
+                    pendingOffer = list.getFirst();
+                }
+                if (cave != null) list.add(cave.offer);
                 for (Offer offer : visible) {
                     if (list.size() == MAX_OFFERS) break;
+                    if (parkedWorld && !ticket.historical() && (offer.key.verb == Verb.APPROACH
+                            || offer.key.verb == Verb.FOLLOW || offer.key.verb == Verb.DRY_SURVEY)) continue;
                     list.add(offer);
                 }
                 visible = list;
             }
-            value.add("pendingWork", pendingObservation(ticket, yieldable, parked, safeReturn && !collectible, pendingOffer));
+            JsonObject pending = pendingObservation(ticket, yieldable, parked, safeReturn && !collectible, pendingOffer);
+            if (parkedWorld) {
+                pending.add("worksite", parkedWorksite(progress, collectible, cave));
+                parkedViewPublished = true;
+            }
+            value.add("pendingWork", pending);
         }
         // An unvisited idle publication can itself explain why a survey disappeared.
         boolean trackSurvey = progress != null && !trial && surveyEvidence.enabled()
@@ -6190,11 +6375,13 @@ final class AgentMacroControl {
             entry.addProperty("verb", offer.key.verb.id);
             entry.addProperty("summary", offer.summary);
             entry.addProperty("evidence", offer.evidence);
-            entry.addProperty("risk", offer.key.verb.risk);
+            boolean cave = PARKED_CAVE.equals(offer.key.activity);
+            entry.addProperty("risk", cave ? "low" : offer.key.verb.risk);
             JsonObject material = material(offer, inv);
             if (material != null) entry.add("material", material);
             if (trackSurvey) {
-                if (offer.key.verb == Verb.SURVEY) publishedSurveys |= Survey.mask(offer.key.activity);
+                if (cave) trackSurvey = false;
+                else if (offer.key.verb == Verb.SURVEY) publishedSurveys |= Survey.mask(offer.key.activity);
                 else if (material != null || !"read".equals(offer.key.verb.risk)) trackSurvey = false;
             }
             opportunities.add(entry);
@@ -6427,6 +6614,11 @@ final class AgentMacroControl {
             detail = pickup;
         }
         Verb verb = action.offer.key.verb;
+        if (PARKED_CAVE.equals(action.offer.key.activity)) {
+            if (verb == Verb.SURVEY || verb == Verb.DRY_SURVEY) parkedCaveChecks.add(action.offer.key);
+            else if (result.equals("completed")) parkedCaveLandings.add(action.offer.key.pos);
+            requireFreshParkedView();
+        }
         if (!result.equals("completed") && action.offer.face != null
                 && (verb == Verb.STATION_REACQUIRE || verb == Verb.INTERACT || verb == Verb.CONTINUE || verb == Verb.WORK_SMELT)) {
             Face face = action.offer.face;

@@ -9,6 +9,10 @@ import net.minecraft.util.math.Vec3d;
 
 /** One verified cardinal stair edge, shared by descent and reversal of that exact edge. */
 final class AgentSurfaceTread {
+    private static final int PROOF_TICKS = 65;
+    private static final int DRIVE_TICKS = 54;
+    // Includes the successful boundary ticks and a fresh post-landing frame.
+    static final int ACTION_TICKS = PROOF_TICKS + DRIVE_TICKS + 4;
     record Edge(BlockPos upper, BlockState upperSupport, BlockPos lower, BlockState lowerSupport, Direction down) {}
     enum Result { CHECKING, MOVING, LANDED, REFUSED }
 
@@ -37,10 +41,26 @@ final class AgentSurfaceTread {
         return foot.offset(down).down();
     }
 
+    static long returnTicks(int edges) { return (long) edges * ACTION_TICKS; }
+
+    static boolean canExtend(long ticksLeft, int retainedEdges) {
+        return ticksLeft > ACTION_TICKS + returnTicks(retainedEdges + 1);
+    }
+
     static boolean plannedCell(BlockPos foot, BlockPos cell, Direction down, Direction face) {
         if (down == null || !down.getAxis().isHorizontal()) return false;
         BlockPos next = nextFoot(foot, down);
         return cell.equals(next.up()) && face == down.getOpposite() || cell.equals(next) && face == Direction.UP;
+    }
+
+    static boolean returnLip(BlockPos foot, BlockPos cell, Direction down, Direction face) {
+        return down != null && down.getAxis().isHorizontal() && face == down.getOpposite()
+            && cell.equals(nextFoot(foot, down).up(2));
+    }
+
+    /** Aim just inside the opening: farther top samples can hit the near roof before crossing the lip. */
+    static Vec3d innerTop(BlockPos cell, Direction down) {
+        return Vec3d.ofBottomCenter(cell.up()).add(0.12 * down.getOffsetX(), -0.035, 0.12 * down.getOffsetZ());
     }
 
     Result step(MinecraftClient client, AgentBody body, long tick) {
@@ -52,7 +72,7 @@ final class AgentSurfaceTread {
                 || world.getBlockState(edge.lower.down()) != edge.lowerSupport) return Result.REFUSED;
         if (!body.hasRecentView()) return drivingSince < 0 ? Result.CHECKING : Result.MOVING;
         if (drivingSince < 0) {
-            if (tick - started > 65 || !player.isOnGround() || !player.getBlockPos().equals(from)) return Result.REFUSED;
+            if (tick - started > PROOF_TICKS || !player.isOnGround() || !player.getBlockPos().equals(from)) return Result.REFUSED;
             if (!centered(player.getPos(), from, 0.17)) {
                 body.centerOnSupport(from.down());
                 return Result.CHECKING;
@@ -75,7 +95,7 @@ final class AgentSurfaceTread {
         if (player.isOnGround() && player.getBlockPos().equals(to) && centered(player.getPos(), to, 0.23)
                 && Math.abs(player.getY() - to.getY()) <= 0.055
                 && player.getVelocity().horizontalLengthSquared() <= 0.0025) return Result.LANDED;
-        if (tick - drivingSince > 54 || player.getY() < Math.min(from.getY(), to.getY()) - 0.055) return Result.REFUSED;
+        if (tick - drivingSince > DRIVE_TICKS || player.getY() < Math.min(from.getY(), to.getY()) - 0.055) return Result.REFUSED;
         if (!reverseClear(client) || !body.dryRouteSweep(from, to)) return tick - drivingSince < 5 ? Result.CHECKING : Result.REFUSED;
         body.driveDryRoute(from, to, travel);
         return Result.MOVING;

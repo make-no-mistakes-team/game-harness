@@ -1,5 +1,6 @@
 package io.gameharness.survival;
 
+import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import java.util.List;
 import java.util.Map;
@@ -21,6 +22,7 @@ import net.minecraft.resource.ResourceType;
 import net.minecraft.resource.VanillaDataPackProvider;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.EmptyBlockView;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -201,6 +203,113 @@ final class MiningStockProof {
     }
 
     @Test
+    void admitsOnlyAnExplicitStandaloneIronWorkQuote() {
+        var raw = ironWorkQuote();
+        for (String mode : List.of("preset", "constrained")) {
+            var policy = AgentWorkOrder.parse(raw, "run", mode).policy();
+            require(policy.smeltIron() && policy.placeFurnace() && !policy.placeTable() && !policy.craftAllowed("furnace"),
+                "a live iron quote names exactly its smelt and placement, not a bench or recipe");
+        }
+        var alternate = raw.deepCopy();
+        alternate.getAsJsonObject("target").addProperty("item", "minecraft:copper_ingot");
+        require(AgentWorkOrder.parse(alternate, "run", "preset").policy() == null, "not a generic smelting authority");
+        alternate = raw.deepCopy();
+        alternate.addProperty("id", "any-program:3");
+        require(AgentWorkOrder.parse(alternate, "run", "preset").policy() == null, "not a linked program stage");
+        alternate = raw.deepCopy();
+        alternate.addProperty("origin", "preset");
+        require(AgentWorkOrder.parse(alternate, "run", "preset").policy() == null, "not preset-origin startup work");
+        alternate = raw.deepCopy();
+        alternate.getAsJsonArray("allowedEffects").remove(0);
+        require(AgentWorkOrder.parse(alternate, "run", "constrained").policy() == null, "placement cannot stand alone");
+        alternate = raw.deepCopy();
+        alternate.getAsJsonArray("allowedEffects").remove(1);
+        var policy = AgentWorkOrder.parse(alternate, "run", "constrained").policy();
+        require(policy.smeltIron() && !policy.placeFurnace(), "using an empty screen cannot implicitly place a block");
+    }
+
+    @Test
+    void exactFuelAndRawIronAreReservedTogetherBeforeTheFirstClick() {
+        var budget = new AgentWorkOrder.Budget(AgentWorkOrder.parse(ironWorkQuote(), "run", "constrained").policy());
+        var inventory = new PlayerInventory(null);
+        inventory.setStack(0, new ItemStack(Items.RAW_IRON, 2));
+        inventory.setStack(1, new ItemStack(Items.RAW_IRON, 1));
+        inventory.setStack(2, new ItemStack(Items.OAK_PLANKS, 6));
+        inventory.setStack(3, new ItemStack(Items.COAL, 64));
+        inventory.setStack(4, new ItemStack(Items.IRON_INGOT, 1));
+        require(!budget.reserveIronSmelt(inventory, 2, Items.COAL, 1, 1600),
+            "available but uncapped coal cannot be burned");
+        inventory.setStack(1, ItemStack.EMPTY);
+        require(!budget.reserveIronSmelt(inventory, 2, Items.OAK_PLANKS, 2, 300),
+            "two raw cannot be committed while one is reserved from two carried");
+        inventory.setStack(1, new ItemStack(Items.RAW_IRON));
+        require(!budget.reserveIronSmelt(inventory, 2, Items.OAK_PLANKS, 3, 300),
+            "more fuel than the exact bound is not reserved");
+        require(budget.craftsLeft() == 3 && budget.remainingCost(Items.RAW_IRON) == 3,
+            "a failed reservation must not charge any ingredient or execution");
+        var batch = AgentHands.quoteIron(inventory, budget, 2, item -> item == Items.OAK_PLANKS ? 300 : 1600);
+        require(batch != null && batch.units() == 2 && batch.fuel() == Items.OAK_PLANKS && batch.fuelCount() == 2,
+            "two recipes use two exact planks, not the stack or the uncapped coal");
+        require(budget.reserveIronSmelt(inventory, batch.units(), batch.fuel(), batch.fuelCount(), batch.fuelTicks()),
+            "sufficient input and minimal exact fuel are admitted together");
+        require(budget.craftsLeft() == 1 && budget.remainingCost(Items.RAW_IRON) == 1
+                && budget.remainingCost(Items.OAK_PLANKS) == 0,
+            "each smelt counts as one execution and both item costs are charged before the click");
+        require(AgentHands.quoteIron(inventory, budget, 2, item -> 300) == null,
+            "an unconfirmed or retried transfer never restores its conservative spend");
+    }
+
+    @Test
+    void furnaceRecipeAndEverySmeltConsumeTheSameExecutionBudget() {
+        var raw = ironWorkQuote();
+        raw.getAsJsonArray("allowedEffects").add("craft:furnace");
+        raw.addProperty("maxCrafts", 2);
+        var policy = AgentWorkOrder.parse(raw, "run", "preset").policy();
+        var budget = new AgentWorkOrder.Budget(policy);
+        var inventory = new PlayerInventory(null);
+        inventory.setStack(0, new ItemStack(Items.RAW_IRON, 3));
+        inventory.setStack(1, new ItemStack(Items.OAK_PLANKS, 6));
+        budget.crafted(Map.of(), 1);
+        var batch = AgentHands.quoteIron(inventory, budget, 3, item -> 300);
+        require(batch != null && batch.units() == 1 && batch.fuelCount() == 1,
+            "a preceding workstation craft leaves only one smelting execution");
+        require(AgentHands.ironFuelNeeded(2, 100) == 4 && AgentHands.ironFuelNeeded(3, 300) == 2,
+            "exact full heat determines required sticks or planks");
+    }
+
+    @Test
+    void ironFuelAndFurnacePlacementRespectTheirSeparateExactFloors() {
+        var budget = new AgentWorkOrder.Budget(AgentWorkOrder.parse(ironWorkQuote(), "run", "preset").policy());
+        var inventory = new PlayerInventory(null);
+        inventory.setStack(0, new ItemStack(Items.RAW_IRON, 3));
+        inventory.setStack(1, new ItemStack(Items.OAK_PLANKS, 5));
+        inventory.setStack(2, new ItemStack(Items.FURNACE, 1));
+        var batch = AgentHands.quoteIron(inventory, budget, 2, item -> 300);
+        require(batch != null && batch.units() == 1 && batch.fuelCount() == 1,
+            "one plank above the floor cooks only one ingot; no reserve is silently spent");
+        require(!budget.canPlaceFurnace(inventory), "the reserved furnace is not available for placement");
+        inventory.setStack(2, new ItemStack(Items.FURNACE, 2));
+        require(budget.canPlaceFurnace(inventory), "one carried furnace can be spent while preserving the exact floor");
+        budget.placedFurnace();
+        require(!budget.canPlaceFurnace(inventory) && budget.placementsLeft() == 2
+                && budget.remainingCost(Items.FURNACE) == 1 && budget.craftsLeft() == 3,
+            "one furnace already used its single placement even when the wider job still has placement and item budget");
+    }
+
+    private static JsonObject ironWorkQuote() {
+        return JsonParser.parseString("""
+            {"v":1,"id":"iron-work","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":905,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:iron_ingot","count":3},
+             "allowedEffects":["smelt:minecraft:iron_ingot","place:minecraft:furnace"],
+             "costCaps":[{"item":"minecraft:raw_iron","count":3},{"item":"minecraft:oak_planks","count":2},
+                         {"item":"minecraft:furnace","count":2}],
+             "reserves":[{"item":"minecraft:raw_iron","count":1},{"item":"minecraft:oak_planks","count":4},
+                         {"item":"minecraft:furnace","count":1}],
+             "maxBreaks":0,"maxCrafts":3,"maxPlacements":3}
+            """).getAsJsonObject();
+    }
+
+    @Test
     void adjacentCapAndFurtherStairCutsNeverRemoveTheStandingOrReturnSupport() {
         var foot = new BlockPos(0, 72, 0);
         var cap = foot.down().east();
@@ -221,6 +330,45 @@ final class MiningStockProof {
                 && !AgentSurfaceTread.plannedCell(cap, next, bearing, Direction.WEST)
                 && !AgentSurfaceTread.plannedCell(cap, next.north(), bearing, Direction.UP),
             "the route cannot cut a retained support, deepen its landing, or turn into another column");
+    }
+
+    @Test
+    void stairAcquiresTheInnerTopWithoutAimingThroughTheReturnLip() {
+        var upper = new BlockPos(0, 70, 0);
+        var next = AgentSurfaceTread.nextFoot(upper, Direction.EAST);
+        var eye = new Vec3d(0.55, 71.62, 0.58);
+        var inner = AgentSurfaceTread.innerTop(next, Direction.EAST);
+        double entryHeight = eye.lerp(inner, (1 - eye.x) / (inner.x - eye.x)).y;
+        require(entryHeight > 70 && entryHeight < 71, "the inner ray crosses the open cell below the close lip");
+        require(AgentSurfaceTread.returnLip(upper, next.up(2), Direction.EAST, Direction.WEST),
+            "the near face of the one exact return lip is actionable");
+        require(!AgentSurfaceTread.returnLip(upper, upper.up(), Direction.EAST, Direction.DOWN)
+                && !AgentSurfaceTread.returnLip(upper, next.up(3), Direction.EAST, Direction.WEST)
+                && !AgentSurfaceTread.returnLip(upper, next.up(2), Direction.EAST, Direction.NORTH)
+                && !AgentSurfaceTread.returnLip(upper, next.down(), Direction.EAST, Direction.UP),
+            "neither overhead at the stance, a higher roof, the wrong side, nor a support is a return lip");
+    }
+
+    @Test
+    void deepCoverUsesTheAdmittedRoleBudgetNotAnInternalFiveCutLimit() {
+        var preset = new AgentWorkOrder.Policy(true, new AgentWorkOrder.Target(null, 0, "stone_pickaxe"),
+            Set.of(), Map.of(), Map.of(), 32, 0, 0);
+        var budget = new AgentWorkOrder.Budget(preset);
+        for (int i = 0; i < 5; i++) budget.broken(Items.AIR, 0);
+        require(budget.breaksLeft() == 27 && budget.canCutCover(),
+            "five real cover breaks leave the rest of the admitted preset grant available");
+        for (int i = 0; i < 26; i++) budget.broken(Items.AIR, 0);
+        require(budget.breaksLeft() == 1 && !budget.canCutCover() && budget.canBreak(),
+            "the source break is retained when the actual grant gets low");
+    }
+
+    @Test
+    void eachNewTreadMustLeaveTimeForEveryRetainedReverseEdge() {
+        int currentDepth = 4;
+        long returnReserve = AgentSurfaceTread.returnTicks(currentDepth + 1);
+        require(AgentSurfaceTread.canExtend(returnReserve + AgentSurfaceTread.ACTION_TICKS + 1, currentDepth)
+                && !AgentSurfaceTread.canExtend(returnReserve + AgentSurfaceTread.ACTION_TICKS, currentDepth),
+            "extension beyond three treads depends on the remaining lease, including the new return edge");
     }
 
     private static void require(boolean condition, String message) {

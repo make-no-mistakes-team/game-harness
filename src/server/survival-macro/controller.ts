@@ -8,7 +8,7 @@ import {
   type FirstPlanInference, type FirstPlanRequest, type FirstPlanStrategist,
 } from "./bootstrap.ts";
 import {
-  MACRO_CAPABILITIES_VERSION, MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
+  MACRO_CAPABILITIES_VERSION, MACRO_IRON_SMELT, MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_PLANNING_IDLE_MS, MACRO_LOOKAHEAD_MAX_AGE_TICKS, MACRO_LOOKAHEAD_MAX_CRACK,
   MacroDirectory, MacroObservationRotating,
   hasDirectAuthority, matchesMaterial, parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
@@ -1135,6 +1135,8 @@ export class SurvivalMacroController {
     if (!job && complete?.finalOrder.target.kind === "preset" &&
         complete.basis.life === observation.life && complete.goal === observation.goal) return;
     if (this.previousJob) return; // A published candidate has not settled; the incumbent remains authoritative.
+    // A furnace lease can deposit ingredients before output exists. Wait for its terminal receipt instead of renewing it.
+    if (job?.policy.allowedEffects.includes(MACRO_IRON_SMELT)) return;
     const nativeState = job && observation.workOrder?.id === job.order.id ? observation.workOrder : null;
     const previous = this.workQuery;
     const replan = nativeState?.progress?.replan;
@@ -1341,6 +1343,10 @@ export class SurvivalMacroController {
       return;
     }
     const previous = this.job;
+    if (previous?.policy.allowedEffects.includes(MACRO_IRON_SMELT)) {
+      if (requestId) await this.disposition("proposal_refused", { requestId, reason: "Wait for the finite iron work order to settle." });
+      return;
+    }
     const equivalent = !!previous && workPolicyKey(previous.policy) === workPolicyKey(policy);
     const { target, reserves } = policy;
     const inherited = this.floorScope?.life === fresh.life ? this.floorScope.reserves : [];

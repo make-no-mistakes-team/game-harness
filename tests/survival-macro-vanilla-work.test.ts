@@ -126,3 +126,79 @@ test("Check non-wood recipes, but leave unmodeled effects and ambiguous allocati
   ];
   expect(check({ [oak]: 5, [birch]: 2 }, mixedPlan, tableOffer)).toMatchObject({ kind: "unknown" });
 });
+
+const rawIron = "minecraft:raw_iron";
+const ingot = "minecraft:iron_ingot";
+const furnace = "minecraft:furnace";
+const coal = "minecraft:coal", charcoal = "minecraft:charcoal";
+const smelt = `smelt:${ingot}`, placeFurnace = `place:${furnace}`;
+const ironStage = (overrides: Partial<MacroWorkPolicy> = {}) => stage({
+  target: stock(ingot, 3), allowedEffects: [smelt, placeFurnace],
+  costCaps: [floor(rawIron, 2), floor(oak, 2), floor(furnace, 1)],
+  maxCrafts: 2, maxPlacements: 1, ...overrides,
+});
+const caveStock = { [ingot]: 1, [rawIron]: 2, [oak]: 2, [furnace]: 1 };
+
+test("Two held raw iron and two exact planks can provision two ingots at a newly placed furnace", () => {
+  expect(check(caveStock, [ironStage()])).toEqual({ kind: "possible" });
+  expect(check(caveStock, [ironStage({ maxCrafts: 1 })])).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("2 smelted units"),
+  });
+  expect(check(caveStock, [ironStage({ allowedEffects: [], maxCrafts: 0 })]).kind).not.toBe("possible");
+  expect(check(caveStock, [ironStage({ allowedEffects: [smelt], maxPlacements: 0 })])).toMatchObject({
+    kind: "unknown", detail: expect.stringContaining("no furnace placement is permitted"),
+  });
+});
+
+test("Smelting cannot consume protected raw iron, exact fuel, or a protected furnace", () => {
+  expect(check(caveStock, [ironStage({ reserves: [floor(rawIron, 1)] })])).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("needs 3 minecraft:raw_iron at entry (2 to spend and 1 to retain)"),
+  });
+  expect(check(caveStock, [ironStage({ reserves: [floor(oak, 1)] })])).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("only 300 ticks"),
+  });
+  expect(check({ ...caveStock, [coal]: 1, [birch]: 5 }, [ironStage({ costCaps: [
+    floor(rawIron, 2), floor(oak, 1), floor(coal, 1), floor(furnace, 1),
+  ], reserves: [floor(coal, 1)] })])).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("only 300 ticks"),
+  });
+  expect(check(caveStock, [ironStage({ reserves: [floor(furnace, 1)] })])).toMatchObject({
+    kind: "unknown", detail: expect.stringContaining("needs 2 minecraft:furnace at entry (1 to spend and 1 to retain)"),
+  });
+});
+
+test("Fuel arithmetic uses a cold start, exact counts and homogeneous batches", () => {
+  const plan = (fuel: readonly MacroStockFloor[]) => ironStage({
+    costCaps: [floor(rawIron, 2), floor(furnace, 1), ...fuel],
+  });
+  const furnaceOffer: MacroObservation["opportunities"] = [{
+    id: "furnace-dry", verb: "interact", risk: "guarded", summary: `Open visible ${furnace}`,
+    evidence: "A lit workstation face is inside vanilla use reach.",
+  }];
+  expect(check({ ...caveStock, [charcoal]: 1 }, [plan([floor(charcoal, 1)])])).toEqual({ kind: "possible" });
+  expect(check({ ...caveStock, [stick]: 4 }, [plan([floor(stick, 4)])])).toEqual({ kind: "possible" });
+  expect(check({ ...caveStock, [stick]: 3 }, [plan([floor(stick, 4)])], furnaceOffer)).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("only 300 ticks"),
+  });
+  expect(check({ ...caveStock, [birch]: 1 }, [plan([floor(oak, 1), floor(birch, 1)])])).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("a single held fuel"),
+  });
+});
+
+test("Crafting missing furnace equipment shares the smelt quote's craft and placement caps", () => {
+  const cobble = "minecraft:cobblestone";
+  const plans = (maxCrafts: number, maxPlacements: number) => [ironStage({
+    allowedEffects: [smelt, placeFurnace, "craft:furnace", tablePlacement],
+    costCaps: [floor(rawIron, 2), floor(oak, 2), floor(furnace, 1), floor(table, 1), floor(cobble, 8)],
+    maxCrafts, maxPlacements,
+  })];
+  const ready = { [ingot]: 1, [rawIron]: 2, [oak]: 2, [table]: 1, [cobble]: 8 };
+  expect(check(ready, plans(3, 2))).toEqual({ kind: "possible" });
+  expect(check(ready, plans(3, 1), tableOffer)).toEqual({ kind: "possible" });
+  expect(check(ready, plans(3, 1))).toMatchObject({
+    kind: "unknown", detail: expect.stringContaining("no placement is permitted"),
+  });
+  expect(check(ready, plans(2, 2))).toMatchObject({
+    kind: "unknown", detail: expect.stringContaining("maxCrafts is 2"),
+  });
+});

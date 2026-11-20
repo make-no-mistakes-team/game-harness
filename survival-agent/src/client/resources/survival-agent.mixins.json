@@ -2,6 +2,6 @@
   "required": true,
   "package": "io.gameharness.survival.mixin",
   "compatibilityLevel": "JAVA_21",
-  "client": ["AgentRenderMixin", "AgentHandledScreenAccess", "AgentMouseAccess", "AgentCraftScreenMixin", "AgentMiningAccess"],
+  "client": ["AgentRenderMixin", "AgentHandledScreenAccess", "AgentMouseAccess", "AgentCraftScreenMixin", "AgentMiningAccess", "AgentFurnaceSyncMixin"],
   "injectors": { "defaultRequire": 1 }
 }

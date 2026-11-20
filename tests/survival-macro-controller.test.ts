@@ -478,6 +478,82 @@ test("Resource feedback reaches an ordinary successor request while the safe gat
   }
 });
 
+const ironItem = "minecraft:iron_ingot", rawIronItem = "minecraft:raw_iron";
+const fuelItem = "minecraft:oak_planks", furnaceItem = "minecraft:furnace";
+const ironPolicy = {
+  target: { kind: "stock", item: ironItem, count: 3 }, allowedEffects: [`smelt:${ironItem}`, `place:${furnaceItem}`],
+  costCaps: [{ item: rawIronItem, count: 2 }, { item: fuelItem, count: 2 }, { item: furnaceItem, count: 1 }],
+  reserves: [{ item: fuelItem, count: 1 }], maxBreaks: 0, maxCrafts: 2, maxPlacements: 1,
+} as const;
+
+test.each(["preset", "constrained"] as const)("A regular %s strategist can quote one iron batch; cooking is not completion", async mode => {
+  const inventory = { [ironItem]: 1, [rawIronItem]: 2, [fuelItem]: 3, [furnaceItem]: 1 };
+  const live = { goal: "diamond", inventory };
+  let observedMode: string | undefined;
+  let openingId: string | undefined;
+  let requests = 0;
+  const f = await durableFixture(async request => {
+    if (++requests > 1) return workReply(request, { kind: "abstain" });
+    observedMode = request.work?.mode;
+    return workReply(request, { kind: "work", policy: ironPolicy });
+  }, mode === "constrained" ? "Find diamonds, keeping at least one oak plank." : undefined);
+  try {
+    await f.observe(10, live);
+    if (mode === "preset") {
+      const opening = await f.order();
+      openingId = opening.id;
+      expect(opening).toMatchObject({ target: { kind: "preset", goal: "diamond" }, origin: "preset",
+        allowedEffects: [], costCaps: [], maxBreaks: 32, maxCrafts: 24, maxPlacements: 2 });
+      await f.receipt(opening.id, 11, "accepted");
+      await f.observe(11, { ...live, workOrder: { id: opening.id, state: "working", detail: "Opening underway" } });
+    }
+    await f.actor.poll();
+    const work = await f.order();
+    expect(observedMode).toBe(mode);
+    expect(work).toMatchObject({ origin: "model", target: ironPolicy.target, maxCrafts: 2, maxPlacements: 1,
+      allowedEffects: [`place:${furnaceItem}`, `smelt:${ironItem}`], reserves: ironPolicy.reserves });
+    expect(work.nextWorkId).toBeUndefined();
+    if (openingId) await f.receipt(openingId, 12, "interrupted");
+    await f.receipt(work.id, 12, "accepted");
+    const cooking = { goal: live.goal, inventory: { [ironItem]: 1, [fuelItem]: 1 }, workOrder: {
+      id: work.id, state: "working", detail: "Batch loaded",
+      progress: { phase: "smelt", status: "Cooking two raw iron", breaks: 0, crafts: 0, placements: 1 },
+    } } as const;
+    await f.observe(13, cooking);
+    await f.observe(work.expiresTick - 2, cooking);
+    expect(requests).toBe(1);
+    expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 0, completedWorkPrograms: 0 });
+    expect(await f.order()).toEqual(work);
+    await f.receipt(work.id, work.expiresTick - 1, "completed");
+    await f.observe(work.expiresTick - 1, { goal: live.goal, inventory: { [ironItem]: 3, [fuelItem]: 1 } });
+    expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 1, completedWorkPrograms: 0 });
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test.each([
+  [rawIronItem, "needs 3 minecraft:raw_iron"],
+  [fuelItem, "only 300 ticks"],
+])("Fresh protected %s makes the proposed smelt unaffordable", async (item, detail) => {
+  const f = await durableFixture(async request => workReply(request, { kind: "work",
+    policy: { ...ironPolicy, reserves: [{ item, count: 1 }] },
+  }), `Find diamonds without spending the last ${item}.`, 1);
+  try {
+    await f.observe(10, { goal: "diamond", inventory: { [ironItem]: 1, [rawIronItem]: 2, [fuelItem]: 2, [furnaceItem]: 1 } });
+    await f.actor.poll();
+    expect(f.actor.status().issuedWorkOrders).toBe(0);
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    const history = await readFile(f.file("history.jsonl"), "utf8");
+    expect(history).toContain('"event":"work_resource_shortage"');
+    expect(history).toContain(detail);
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
 test("A delayed resource repair cannot overwrite a program that advanced while the provider was pending", async () => {
   const log = "minecraft:oak_log", planks = "minecraft:oak_planks";
   let sent: MacroRequest | undefined;

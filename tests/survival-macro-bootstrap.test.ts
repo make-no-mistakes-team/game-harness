@@ -47,6 +47,8 @@ test("goal-only context cannot serialize a player, frame, observation, source fi
   expect(context?.messages[0]?.content).toBe('{"goal":"stone_pickaxe","objective":"Keep one spruce log"}');
   expect(JSON.stringify(context)).not.toContain("private-");
   expect(context?.tools?.map(tool => tool.name)).toEqual(["propose_survival_first_plan"]);
+  expect(JSON.stringify(context?.tools)).not.toContain("smelt:minecraft:iron_ingot");
+  expect(JSON.stringify(context?.tools)).not.toContain("place:minecraft:furnace");
 });
 
 test("only exact bounded advisory and defer schemas are admitted", () => {
@@ -220,6 +222,10 @@ test("follow-through cannot declare a false trigger, extra stage, invented effec
     [], [craft, goal, goal], [{ ...craft, requires: [] }],
     [{ ...craft, requires: [{ item: boundSource, count: 0 }] }],
     [{ ...craft, policy: { ...craft.policy, allowedEffects: ["craft:smelt_iron_ingot"] } }],
+    [stockStage("minecraft:iron_ingot", 2, [{ item: "minecraft:raw_iron", count: 2 }],
+      ["smelt:minecraft:iron_ingot", "place:minecraft:furnace"], [
+        { item: "minecraft:raw_iron", count: 2 }, { item: "minecraft:coal", count: 1 }, { item: "minecraft:furnace", count: 1 },
+      ], [], 2, 1)],
     [{ ...craft, policy: { ...craft.policy, allowedEffects: ["break:minecraft:stone"], maxBreaks: 1 } }],
     [{ ...craft, policy: { ...craft.policy, target: { ...craft.policy.target, pos: [0, 64, 0] } } }],
   ]) expect(parseFirstPlanToolArguments(JSON.stringify({ advice: {

@@ -64,19 +64,37 @@ The player closes it when the next step needs the world, such as placing
 the crafting table. Reaching the request limit
 stops new calls; it does not grant more materials, extend a job, or end
 Minecraft. A locally selected preset alone does not count as a Terra action.
-The work-order executor currently admits gathering, crafting, and crafting
-table placement. Naming the Nether goal does not give that executor the
-deterministic player's furnace-transfer or portal-construction permissions.
+
+Once Terra sees carried raw iron and fuel, it can quote one live stock job
+with `smelt:minecraft:iron_ingot`. The target is the total number of ingots
+to hold. The policy names exact raw iron and fuel costs and preserves the
+declared stock floors. Two raw iron need two oak planks, four sticks, or one
+coal or charcoal in a cold furnace. A visible furnace is usable only after
+the player opens it and checks that it is empty and cold.
+
+To place a furnace, the job must separately allow `place:minecraft:furnace`,
+budget one furnace, and leave room in `maxPlacements`. If the player also
+needs to craft the furnace or make or place a crafting table, the job needs
+those effects and costs too. `maxCrafts` covers both recipe executions and
+the smelted units; the furnace batch uses that budget before collection.
+The player reports loading, burning, and collection separately. Only the
+matching completion receipt and live ingot stock establish the result.
+
+Goal-only startup, built-in presets, generated skills, direct opportunities,
+and work programs cannot grant furnace transfers. A completed smelt does not
+establish a diamond pickup, bucket craft, or Nether entry.
 
 When an early stone, coal, or iron source is not in view, Terra can choose
 a witnessed dry approach or an exact adjacent soil cap. A cap offer is one
 break; it does not authorize descent or additional cuts. A work order can
-check up to five new level footholds or attempt a short staircase of at most
-three one-block descents. Before moving, it checks each lit landing, dry
-clearance, and reverse climb. Ordinary tool presets allow dry soil and
-common rock as cover. A custom work order needs an exact break permission
-for each cover type, charged against the same break budget. Cover, grounded
-travel, and collected stock are confirmed separately.
+check up to five new level footholds or descend a staircase one verified
+tread at a time. Depth depends on the admitted break budget, the time
+needed to return, and the player's physical condition. The player checks
+each lit landing, dry clearance, and reverse climb before moving. Ordinary
+tool presets allow dry soil and common rock as cover. A custom work order
+needs an exact break permission for each cover type, charged against the
+same break budget. The player keeps at least one break for the source.
+Cover breaks, grounded travel, and stock pickups are confirmed separately.
 
 The three-second planning deadline is a diagnostic target, not a
 guarantee about the footage. If no safe, authorized action is available,

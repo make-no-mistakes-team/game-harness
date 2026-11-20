@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.function.Predicate;
+import java.util.function.ToIntFunction;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.navigation.GuiNavigationType;
 import net.minecraft.client.gui.screen.Screen;
@@ -55,7 +56,7 @@ final class AgentHands {
     private static final int SLOT_SIZE = 16; // Visible icon interior; vanilla separately owns the hit test.
     private static final int GRID_SPACING = 18;
     private static final int SCREEN_REVISION_MASK = 0x7fff;
-    private static final int SMELT_TICKS = 200;
+    static final int SMELT_TICKS = 200;
 
     private enum Job { CRAFT, SMELT, EQUIP }
 
@@ -109,6 +110,8 @@ final class AgentHands {
                              List<Portion> portions, int[] used) {}
 
     record CraftReceipt(long sequence, String recipe, int executions, int items, int shiftClicks, int revision) {}
+
+    record IronBatch(int units, Item fuel, int fuelCount, int fuelTicks) {}
 
     private record Step(Mode mode, Slot slot, Item item, int count) {}
 
@@ -170,6 +173,10 @@ final class AgentHands {
     private CraftPlan craftPlan;
     private ItemStack[] craftStorage;
     private AgentWorkOrder.Budget craftBudget;
+    private IronBatch boundedIron;
+    private AgentWorkOrder.Budget smeltBudget;
+    private boolean scopedSmelt;
+    private int ironDeposited, fuelDeposited;
     private long workEvidence;
     private int craftGridRevision, craftTakeRevision;
     private long craftSettleDeadline, craftShiftClicks;
@@ -435,6 +442,120 @@ final class AgentHands {
         return recipe == null ? null : new CraftRequest(recipe, key);
     }
 
+    static boolean workSmeltFuel(Item item) {
+        return fuelRank(item) != Integer.MAX_VALUE;
+    }
+
+    static int ironFuelNeeded(int units, int fuelTicks) {
+        return Math.ceilDiv(units * SMELT_TICKS, fuelTicks);
+    }
+
+    static IronBatch quoteIron(PlayerInventory inventory, AgentWorkOrder.Budget budget, int wanted,
+                              ToIntFunction<Item> fuelValue) {
+        if (!budget.policy.smeltIron()) return null;
+        int available = Math.min(Math.min(wanted, budget.craftsLeft()),
+            budget.limit(Items.RAW_IRON, AgentWorkOrder.count(inventory, Items.RAW_IRON)));
+        if (available <= 0) return null;
+        IronBatch best = null;
+        for (Item item : budget.policy.caps().keySet()) {
+            if (!workSmeltFuel(item)) continue;
+            int stock = Math.min(64, budget.limit(item, AgentWorkOrder.count(inventory, item)));
+            if (stock == 0) continue;
+            int heat = fuelValue.applyAsInt(item);
+            if (heat <= 0) continue;
+            int units = (int) Math.min(available, (long) heat * stock / SMELT_TICKS);
+            if (units == 0) continue;
+            int fuelCount = ironFuelNeeded(units, heat);
+            if (best == null || units > best.units || units == best.units
+                    && (fuelCount < best.fuelCount || fuelCount == best.fuelCount
+                        && Registries.ITEM.getId(item).compareTo(Registries.ITEM.getId(best.fuel)) < 0))
+                best = new IronBatch(units, item, fuelCount, heat);
+        }
+        return best;
+    }
+
+    IronBatch quoteIron(AgentWorkOrder.Budget budget, int wanted) {
+        var fuels = c.world.getFuelRegistry();
+        return quoteIron(c.player.getInventory(), budget, wanted, item -> fuels.getFuelTicks(new ItemStack(item)));
+    }
+
+    boolean loadWorkIron(FurnaceScreen furnace, IronBatch batch, AgentWorkOrder.Budget budget) {
+        if (!canWorkFurnace(furnace)) return report("smelt", "no exact clean furnace screen");
+        var handler = furnace.getScreenHandler();
+        Slot input = handler.getSlot(0), fuel = handler.getSlot(1);
+        if (input.hasStack() || fuel.hasStack() || handler.getOutputSlot().hasStack() || handler.isBurning()
+                || !((AgentFurnaceSync) handler).agent$furnaceContentsSynced())
+            return report("smelt", "furnace was not confirmed empty and cold");
+        if (!storageRoom(new ItemStack(Items.IRON_INGOT), batch.units, null))
+            return report("smelt", "no safe ingot storage");
+        if (c.world.getFuelRegistry().getFuelTicks(new ItemStack(batch.fuel)) != batch.fuelTicks
+                || !budget.reserveIronSmelt(c.player.getInventory(), batch.units, batch.fuel, batch.fuelCount, batch.fuelTicks))
+            return report("smelt", "the exact input, fuel or execution budget changed");
+
+        start(Job.SMELT, "smelt", furnace);
+        boundedIron = batch;
+        smeltBudget = budget;
+        scopedSmelt = true;
+        // Finish all fuel gestures while cold; raw iron is the only thing that may start the burn.
+        if (!queueFurnaceTransfers(handler, fuel, batch.fuel, batch.fuelCount)
+                || !queueFurnaceTransfers(handler, input, Items.RAW_IRON, batch.units)) {
+            finish("the bounded source stacks changed");
+            return false;
+        }
+        planned = true;
+        return true;
+    }
+
+    boolean collectWorkIron(FurnaceScreen furnace, int units, long afterOutputSync) {
+        if (!canWorkFurnace(furnace)) return report("smelt", "no exact clean furnace screen");
+        var handler = furnace.getScreenHandler();
+        Slot output = handler.getOutputSlot();
+        ItemStack finished = output.getStack();
+        if (handler.getSlot(0).hasStack() || handler.getSlot(1).hasStack()
+                || ((AgentFurnaceSync) handler).agent$furnaceOutputUpdates() <= afterOutputSync
+                || !finished.isOf(Items.IRON_INGOT) || finished.getCount() != units)
+            return report("smelt", "the witnessed result changed");
+        return collectSmelt(furnace, output, units);
+    }
+
+    boolean returnWorkIron(FurnaceScreen furnace, int units) {
+        if (!canWorkFurnace(furnace)) return report("smelt", "no exact clean furnace screen");
+        var handler = furnace.getScreenHandler();
+        Slot input = handler.getSlot(0);
+        if (handler.isBurning() || !input.getStack().isOf(Items.RAW_IRON) || input.getStack().getCount() != units)
+            return report("smelt", "the cold input no longer matches the paid raw iron");
+        return collectSmelt(furnace, input, units);
+    }
+
+    private boolean canWorkFurnace(FurnaceScreen furnace) {
+        return !busy() && !holdsWorkInventory() && stableCraftFooting() && c.currentScreen == furnace
+            && c.player.currentScreenHandler == furnace.getScreenHandler()
+            && furnace.getScreenHandler().getCursorStack().isEmpty()
+            && pointerAvailable() && !Screen.hasShiftDown() && !physicalButtonDown(c.getWindow())
+            && !((AgentHandledScreenAccess) furnace).agent$cursorDragging();
+    }
+
+    private boolean queueFurnaceTransfers(ScreenHandler handler, Slot target, Item item, int remaining) {
+        for (Slot slot : handler.slots) {
+            if (!isStorage(slot) || !slot.getStack().isOf(item)) continue;
+            int amount = Math.min(remaining, slot.getStack().getCount());
+            transfer(slot, target, amount, true);
+            remaining -= amount;
+            if (remaining == 0) return true;
+        }
+        return false;
+    }
+
+    private boolean collectSmelt(FurnaceScreen furnace, Slot output, int exactUnits) {
+        ItemStack finished = output.getStack();
+        if (!storageRoom(finished, null)) return report("smelt", "inventory full");
+        start(Job.SMELT, "smelt", furnace);
+        scopedSmelt = exactUnits > 0;
+        steps.addLast(new Step(Mode.RESULT, output, finished.getItem(), exactUnits));
+        planned = storeResult = true;
+        return true;
+    }
+
     boolean smelt(boolean charcoal, int batchLimit) {
         if (busy() || c.player == null || c.world == null) return false;
         if (!(c.currentScreen instanceof FurnaceScreen furnace)) return report("smelt", "furnace required");
@@ -445,11 +566,7 @@ final class AgentHands {
         if (!finished.isEmpty()) {
             if (!finished.isOf(charcoal ? Items.CHARCOAL : Items.IRON_INGOT))
                 return report("smelt", "unrelated furnace output");
-            if (!storageRoom(finished, null)) return report("smelt", "inventory full");
-            start(Job.SMELT, "smelt", furnace);
-            steps.addLast(new Step(Mode.RESULT, output, finished.getItem(), 0));
-            planned = storeResult = true;
-            return true;
+            return collectSmelt(furnace, output, 0);
         }
 
         var fuels = c.world.getFuelRegistry();
@@ -481,7 +598,7 @@ final class AgentHands {
             for (Slot slot : handler.slots) {
                 if (!isStorage(slot) || slot == inputSource || !slot.hasStack()) continue;
                 ItemStack stack = slot.getStack();
-                int rank = fuelRank(stack);
+                int rank = fuelRank(stack.getItem());
                 if (rank == Integer.MAX_VALUE) continue;
                 int ticks = fuels.getFuelTicks(stack);
                 if (ticks <= 0) continue;
@@ -504,8 +621,8 @@ final class AgentHands {
 
         start(Job.SMELT, "smelt", furnace);
         // In a cold, empty furnace, finish loading the fuel before the input can ignite it.
-        if (fuelSource != null) transfer(fuelSource, fuel, fuelCount);
-        if (inputSource != null) transfer(inputSource, input, inputCount);
+        if (fuelSource != null) transfer(fuelSource, fuel, fuelCount, false);
+        if (inputSource != null) transfer(inputSource, input, inputCount, false);
         planned = true;
         return true;
     }
@@ -769,6 +886,10 @@ final class AgentHands {
             finish("window not available");
             return;
         }
+        if (scopedSmelt && (Screen.hasShiftDown() || physicalButtonDown(c.getWindow()))) {
+            finish("another input gesture took the furnace pointer");
+            return;
+        }
         if (click != null) {
             if (!advanceClick(now) || !busy()) return;
             if (!ownsScreen()) {
@@ -868,7 +989,8 @@ final class AgentHands {
                 if (motion.settled) motion.reset();
                 return false;
             }
-            if (click.step.mode != Mode.CLEAR_BOOK && !clickTargetReady(handler.getCursorStack())) {
+            if (click.step.mode != Mode.CLEAR_BOOK && (!clickTargetReady(handler.getCursorStack())
+                    || !boundedFurnaceDeposit(handler.getCursorStack()))) {
                 finish("slot changed before press");
                 return false;
             }
@@ -918,7 +1040,8 @@ final class AgentHands {
         }
 
         // Vanilla places a carried stack on release, and the furnace may have ticked since press.
-        if (isFurnacePlacement() && !clickTargetReady(handler.getCursorStack())) {
+        if (isFurnacePlacement() && (!clickTargetReady(handler.getCursorStack())
+                || !boundedFurnaceDeposit(handler.getCursorStack()))) {
             finish("furnace slot changed before release");
             return false;
         }
@@ -933,6 +1056,11 @@ final class AgentHands {
         if (!effect) {
             finish(book ? "recipe book did not close" : "slot gesture had no expected effect");
             return false;
+        }
+        if (boundedIron != null && isFurnacePlacement()) {
+            int deposited = click.cursorBefore.getCount() - cursor.getCount();
+            if (slot.id == 0) ironDeposited += deposited;
+            else fuelDeposited += deposited;
         }
         if (!book && click.step.mode != Mode.QUICK_RESULT) ++workEvidence;
         if (click.step.mode == Mode.STORE && cursor.isEmpty()) resultStored = true;
@@ -1188,6 +1316,24 @@ final class AgentHands {
         return job == Job.SMELT && (step.mode == Mode.ONE || step.mode == Mode.PUT) && !isStorage(step.slot);
     }
 
+    private boolean boundedFurnaceDeposit(ItemStack cursor) {
+        if (boundedIron == null || !isFurnacePlacement()) return true;
+        var handler = screen.getScreenHandler();
+        ItemStack input = handler.getSlot(0).getStack(), fuel = handler.getSlot(1).getStack();
+        ItemStack output = handler.getSlot(2).getStack();
+        if ((!input.isEmpty() && !input.isOf(Items.RAW_IRON))
+                || (!fuel.isEmpty() && !fuel.isOf(boundedIron.fuel))
+                || (!output.isEmpty() && !output.isOf(Items.IRON_INGOT))
+                || input.getCount() + output.getCount() != ironDeposited
+                || fuel.getCount() > fuelDeposited) return false;
+        boolean raw = click.step.slot.id == 0;
+        Item item = raw ? Items.RAW_IRON : boundedIron.fuel;
+        int remaining = raw ? boundedIron.units - ironDeposited : boundedIron.fuelCount - fuelDeposited;
+        int amount = click.step.mode == Mode.ONE ? 1 : cursor.getCount();
+        return cursor.isOf(item) && amount <= remaining
+            && AgentWorkOrder.count(player.getInventory(), item) + cursor.getCount() - amount >= smeltBudget.floor(item);
+    }
+
     private boolean clickTargetReady(ItemStack cursor) {
         if (!ItemStack.areEqual(click.cursorBefore, cursor)) return false;
         ItemStack slot = click.step.slot.getStack();
@@ -1196,7 +1342,7 @@ final class AgentHands {
             // A cooking furnace can consume fuel or input; reduced counts still leave room to place.
             if (!slot.isEmpty() && (!same(click.slotBefore, slot)
                     || slot.getCount() > click.slotBefore.getCount())) return false;
-        } else if (job == Job.SMELT && click.step.mode == Mode.RESULT) {
+        } else if (job == Job.SMELT && click.step.mode == Mode.RESULT && click.step.count == 0) {
             if (!same(click.slotBefore, slot) || slot.getCount() < click.slotBefore.getCount()
                     || !storageRoom(slot, null)) return false;
         } else {
@@ -1357,7 +1503,7 @@ final class AgentHands {
         return switch (click.step.mode) {
             case TAKE -> ItemStack.areEqual(click.slotBefore, cursor);
             case HALF -> same(click.slotBefore, cursor) && cursor.getCount() == (click.slotBefore.getCount() + 1) / 2;
-            case RESULT -> job == Job.SMELT
+            case RESULT -> job == Job.SMELT && click.step.count == 0
                     // The server can finish another item before processing the pickup.
                     ? same(click.slotBefore, cursor) && cursor.getCount() >= click.slotBefore.getCount()
                     : ItemStack.areEqual(click.slotBefore, cursor);
@@ -1512,7 +1658,7 @@ final class AgentHands {
         if (!ItemStack.areEqual(tool, equipStack) || same(tool, previous)) return false;
         if (tool.isEmpty()) {
             if (previous.isEmpty()) return false;
-            transfer(dest, source, previous.getCount());
+            transfer(dest, source, previous.getCount(), false);
             return true;
         }
         steps.addLast(new Step(Mode.TAKE, source, tool.getItem(), tool.getCount()));
@@ -1550,9 +1696,14 @@ final class AgentHands {
         KeyBinding.onKeyPressed(InputUtil.fromTranslationKey(binding.getBoundKeyTranslationKey()));
     }
 
-    private void transfer(Slot source, Slot target, int amount) {
+    private void transfer(Slot source, Slot target, int amount, boolean bounded) {
         ItemStack stack = source.getStack();
         Item item = stack.getItem();
+        if (bounded && amount < stack.getCount() && amount == (stack.getCount() + 1) / 2) {
+            steps.addLast(new Step(Mode.HALF, source, item, stack.getCount()));
+            steps.addLast(new Step(Mode.PUT, target, item, 0));
+            return;
+        }
         steps.addLast(new Step(Mode.TAKE, source, item, stack.getCount()));
         if (stack.getCount() == amount) {
             steps.addLast(new Step(Mode.PUT, target, item, 0));
@@ -1630,6 +1781,10 @@ final class AgentHands {
         craftPlan = null;
         craftStorage = null;
         craftBudget = null;
+        boundedIron = null;
+        smeltBudget = null;
+        scopedSmelt = false;
+        ironDeposited = fuelDeposited = 0;
         craftSettleDeadline = 0;
         craftIndex = 0;
         equipStack = ItemStack.EMPTY;
@@ -1792,11 +1947,11 @@ final class AgentHands {
         return true;
     }
 
-    private static int fuelRank(ItemStack stack) {
-        if (stack.isOf(Items.COAL)) return 0;
-        if (stack.isOf(Items.CHARCOAL)) return 1;
-        if (stack.isIn(ItemTags.PLANKS)) return 2;
-        if (stack.isOf(Items.STICK)) return 3;
+    private static int fuelRank(Item item) {
+        if (item == Items.COAL) return 0;
+        if (item == Items.CHARCOAL) return 1;
+        if (item != null && item.getRegistryEntry().isIn(ItemTags.PLANKS)) return 2;
+        if (item == Items.STICK) return 3;
         return Integer.MAX_VALUE;
     }
 

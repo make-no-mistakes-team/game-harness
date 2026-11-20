@@ -56,10 +56,8 @@ test("skill admission quarantines ambient code and cannot extend automatic game 
       expect(f.skills.status(hash)).toBe("quarantined");
       expect(f.skills.promote(hash, 0, syntheticOrdinary)).toBe(false);
     }
-    expect(() => f.skills.draft({ source: safeSelector, parentGeneration: 0, verbs: ["break"] }))
-      .toThrow("capability scope");
-    expect(() => f.skills.draft({ source: safeSelector, parentGeneration: 0, verbs: ["approach"] }))
-      .toThrow("capability scope");
+    for (const verb of ["break", "approach", "smelt", "smelt:minecraft:iron_ingot", "place:minecraft:furnace"])
+      expect(() => f.skills.draft({ source: safeSelector, parentGeneration: 0, verbs: [verb] })).toThrow("capability scope");
     expect(await f.skills.select(syntheticOrdinary)).toBeNull();
   } finally { await f.close(); }
 });

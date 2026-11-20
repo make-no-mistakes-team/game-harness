@@ -1,8 +1,15 @@
-import type { MacroObservation, MacroStockFloor, MacroWorkPolicy, MacroWorkStage } from "./protocol.ts";
+import {
+  MACRO_FURNACE_PLACEMENT, MACRO_IRON_FUEL_TICKS, MACRO_IRON_SMELT,
+  type MacroObservation, type MacroStockFloor, type MacroWorkPolicy, type MacroWorkStage,
+} from "./protocol.ts";
 
 const vanilla = (name: string) => `minecraft:${name}`;
 const TABLE = vanilla("crafting_table");
 const STICK = vanilla("stick");
+const FURNACE = vanilla("furnace");
+const RAW_IRON = vanilla("raw_iron");
+const IRON_INGOT = vanilla("iron_ingot");
+const IRON_COOK_TICKS = 200;
 
 // Public vanilla 1.21.4 facts, shared with opening binding. These say nothing about the player's world.
 export const VANILLA_TIMBER_RECIPES: ReadonlyMap<string, string> = new Map(
@@ -115,8 +122,10 @@ interface Path {
   readonly pickups: Stock;
   readonly reserves: Stock;
   readonly existingTable: boolean;
+  readonly existingFurnace: boolean;
   placedTable: boolean;
   firstBench?: number;
+  firstFurnace?: number;
   /** Acquisition is conditional; choice means a different material allocation may change the answer. */
   prospective: boolean;
   choice: boolean;
@@ -132,6 +141,7 @@ class StageArithmetic {
   private readonly unknownRecipe: boolean;
   private breaks = 0;
   private crafts = 0;
+  private placements = 0;
   problem?: string;
   uncertain = false;
 
@@ -213,6 +223,7 @@ class StageArithmetic {
     }
     const facts = this.recipeFor(item);
     if (!facts) {
+      if (item === IRON_INGOT && this.allowed.has(MACRO_IRON_SMELT)) return this.smeltIron(missing);
       // Explicit pickup-only stock work can have a native source outside the bounded offer list.
       if (this.unknownBreak || this.unknownRecipe || harvestYield === 0) this.uncertain = true;
       return this.fail(`needs ${count} ${item}, but only ${count - missing} are accounted for by stock and the named effects`);
@@ -227,18 +238,51 @@ class StageArithmetic {
     return true;
   }
 
+  private smeltIron(units: number): boolean {
+    if (this.crafts + units > this.policy.maxCrafts) return this.fail(
+      `needs ${this.crafts + units} recipe executions, including ${units} smelted units, but maxCrafts is ${this.policy.maxCrafts}`);
+    this.crafts += units;
+    if (!this.spend([RAW_IRON], units, true)) return false;
+    const requiredTicks = units * IRON_COOK_TICKS;
+    let bestFuelTicks = 0;
+    let fuel: string | undefined;
+    let fuelCost = 0;
+    for (const [item, ticks] of MACRO_IRON_FUEL_TICKS) {
+      const available = Math.max(0, Math.min(64, get(this.caps, item) - get(this.spent, item),
+        get(this.path.stock, item) - get(this.path.reserves, item)));
+      bestFuelTicks = Math.max(bestFuelTicks, available * ticks);
+      const needed = Math.ceil(requiredTicks / ticks);
+      if (needed > available) continue;
+      if (fuel) this.path.choice = true;
+      if (!fuel || needed < fuelCost || needed === fuelCost && item < fuel) {
+        fuel = item;
+        fuelCost = needed;
+      }
+    }
+    if (!fuel) return this.fail(`needs ${requiredTicks} ticks of cold-start heat, but only ${bestFuelTicks} ticks are available from a single held fuel within the exact costCaps and above reserves`);
+    if (!this.spend([fuel], fuelCost, true)) return false;
+    this.path.firstFurnace ??= this.index;
+    if (!this.path.existingFurnace && !this.placeStation(FURNACE, MACRO_FURNACE_PLACEMENT, "furnace")) return false;
+    change(this.path.stock, IRON_INGOT, units);
+    return true;
+  }
+
   private table(): boolean {
     this.path.firstBench ??= this.index;
     if (this.path.existingTable || this.path.placedTable) return true;
-    if (this.policy.maxPlacements === 0 || !this.allowed.has(`place:${TABLE}`)) {
-      return this.fail("needs a usable crafting table, but no placement is permitted");
-    }
-    if (!this.spend([TABLE], 1)) return false;
+    if (!this.placeStation(TABLE, `place:${TABLE}`, "crafting table")) return false;
     this.path.placedTable = true;
     return true;
   }
 
-  private spend(items: readonly string[], count: number): boolean {
+  private placeStation(item: string, effect: string, label: "crafting table" | "furnace"): boolean {
+    if (this.placements >= this.policy.maxPlacements || !this.allowed.has(effect))
+      return this.fail(`needs a usable ${label}, but no ${label === "furnace" ? "furnace " : ""}placement is permitted`);
+    this.placements++;
+    return this.spend([item], 1);
+  }
+
+  private spend(items: readonly string[], count: number, heldOnly = false): boolean {
     const capped = items.filter(item => get(this.caps, item) > 0);
     const relevant = capped.length ? capped : items;
     let budget = 0, held = 0, reserve = 0, used = 0;
@@ -253,7 +297,7 @@ class StageArithmetic {
       `needs to spend ${used + count} ${name}, but the matching costCaps permit only ${used + budget}`);
     const candidates = capped.filter(item =>
       get(this.caps, item) > get(this.spent, item) &&
-      (get(this.path.stock, item) > get(this.path.reserves, item) || this.hasSource(item)));
+      (get(this.path.stock, item) > get(this.path.reserves, item) || !heldOnly && this.hasSource(item)));
     if (candidates.length > 1) this.path.choice = true;
     let remaining = count;
     for (const item of candidates) {
@@ -268,18 +312,20 @@ class StageArithmetic {
       if (remaining === 0) return true;
     }
     // More than one obtainable ingredient makes a failed allocation inconclusive.
-    for (const item of candidates) {
-      const allowance = get(this.caps, item) - get(this.spent, item);
-      if (allowance <= 0 || !this.hasSource(item)) continue;
-      const floor = get(this.path.reserves, item);
-      const debit = Math.min(remaining, allowance);
-      if (!this.obtain(item, floor + debit)) return false;
-      change(this.path.stock, item, -debit);
-      change(this.spent, item, debit);
-      remaining -= debit;
-      if (remaining === 0) return true;
+    if (!heldOnly) {
+      for (const item of candidates) {
+        const allowance = get(this.caps, item) - get(this.spent, item);
+        if (allowance <= 0 || !this.hasSource(item)) continue;
+        const floor = get(this.path.reserves, item);
+        const debit = Math.min(remaining, allowance);
+        if (!this.obtain(item, floor + debit)) return false;
+        change(this.path.stock, item, -debit);
+        change(this.spent, item, debit);
+        remaining -= debit;
+        if (remaining === 0) return true;
+      }
+      if (this.unknownBreak || this.unknownRecipe) this.uncertain = true;
     }
-    if (this.unknownBreak || this.unknownRecipe) this.uncertain = true;
     if (relevant.length === 1) {
       const item = name;
       const produced = held + used - get(this.start, item);
@@ -291,9 +337,10 @@ class StageArithmetic {
   }
 }
 
-function project(inventory: MacroObservation["inventory"], pickups: Stock, stages: readonly MacroWorkStage[], existingTable: boolean) {
+function project(inventory: MacroObservation["inventory"], pickups: Stock, stages: readonly MacroWorkStage[],
+  existingTable: boolean, existingFurnace: boolean) {
   const path: Path = { stock: new Map(Object.entries(inventory)), pickups: new Map(pickups), reserves: new Map(),
-    existingTable, placedTable: false, prospective: false, choice: false };
+    existingTable, existingFurnace, placedTable: false, prospective: false, choice: false };
   for (let index = 0; index < stages.length; index++) {
     const { policy, requires } = stages[index]!;
     const stage = new StageArithmetic(path, policy, index);
@@ -328,7 +375,7 @@ export function preflightVanillaWork(
       change(pickups, material.subject.slice(5), 64); // The native offer does not include stack size.
     }
   }
-  const existing = project(inventory, pickups, stages, true);
+  const existing = project(inventory, pickups, stages, true, true);
   if (existing.incomplete) {
     const diagnostic = existing.diagnostic;
     if (!diagnostic) return { kind: "unknown" };
@@ -336,15 +383,18 @@ export function preflightVanillaWork(
       (existing.uncertain ? " A different supported source or material allocation could change this." : "");
     return { kind: existing.uncertain ? "unknown" : "shortage", stageIndex: diagnostic.stageIndex, detail };
   }
-  // Not seeing a usable table is not evidence of its absence. Separately check the
-  // placement route so the planner can fix its arithmetic without ruling out reuse.
-  if (existing.path.firstBench !== undefined && !(tableInReach && existing.path.firstBench === 0)) {
-    const placed = project(inventory, pickups, stages, false);
+  // A furnace interaction offer does not establish empty slots or cold heat.
+  // Quote new placement separately; unknown station access never supplies stock.
+  const { firstBench, firstFurnace } = existing.path;
+  const tableWitnessed = tableInReach && (firstBench ?? firstFurnace) === 0;
+  if (firstFurnace !== undefined || firstBench !== undefined && !tableWitnessed) {
+    const placed = project(inventory, pickups, stages, tableWitnessed, firstFurnace === undefined);
     if (placed.incomplete) {
       const diagnostic = placed.diagnostic;
       if (!diagnostic) return { kind: "unknown" };
+      const station = firstFurnace === undefined ? "table" : "furnace";
       return { kind: "unknown", stageIndex: diagnostic.stageIndex,
-        detail: `Stage ${diagnostic.stageIndex + 1} with new table placement ${diagnostic.detail}. A live usable table could avoid that cost.` };
+        detail: `Stage ${diagnostic.stageIndex + 1} with new ${station} placement ${diagnostic.detail}. A live usable ${station} could avoid that cost.` };
     }
     if (placed.path.prospective) return { kind: "unknown" };
   }

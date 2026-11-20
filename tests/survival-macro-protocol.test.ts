@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { link, mkdtemp, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { MacroDirectory, MacroObservationRotating, parseMacroProposal, parseMacroWorkOrder } from "../src/server/survival-macro/protocol.ts";
+import { MacroDirectory, MacroObservationRotating, parseMacroObservation, parseMacroProposal, parseMacroWorkOrder } from "../src/server/survival-macro/protocol.ts";
 
 test("Work program caps apply across stages and a later job cannot lower an earlier reserve", () => {
   const log = "minecraft:oak_log";
@@ -35,6 +35,50 @@ test("A personal crafting handoff can name only the immediate stage of the origi
   expect(() => parseMacroWorkOrder({ ...order, nextWorkId: "program:3" })).toThrow("work successor scope");
   expect(() => parseMacroWorkOrder({ ...order, nextWorkId: "different:2" })).toThrow("work successor scope");
   expect(() => parseMacroWorkOrder({ ...order, origin: "preset", nextWorkId: "program:2" })).toThrow("work successor scope");
+});
+
+test("Iron smelting and furnace placement require an exact, single live stock policy", () => {
+  const smelt = "smelt:minecraft:iron_ingot", place = "place:minecraft:furnace";
+  const target = { kind: "stock", item: "minecraft:iron_ingot", count: 3 };
+  const rawIron = { item: "minecraft:raw_iron", count: 2 };
+  const fuel = { item: "minecraft:oak_planks", count: 2 };
+  const furnace = { item: "minecraft:furnace", count: 1 };
+  const policy = { target, allowedEffects: [smelt, place], costCaps: [rawIron, fuel, furnace],
+    reserves: [], maxBreaks: 0, maxCrafts: 2, maxPlacements: 1 };
+  const order = { ...policy, v: 1, id: "work-iron", run: "run", life: 1, epoch: 1, basisTick: 10,
+    expiresTick: 1000, safetyRevision: 1, origin: "model" };
+  const proposal = (action: unknown) => ({ action, subgoal: "Refine iron", reason: "Raw iron is carried",
+    successCondition: "Three ingots in inventory", contingency: "Stop if the furnace site is unsafe",
+    alternative: "Keep the raw iron", expiresTick: 1000 });
+  expect(parseMacroProposal(proposal({ kind: "work", policy })).action).toMatchObject({ kind: "work", policy: { target } });
+  expect(parseMacroWorkOrder(order)).toMatchObject({
+    allowedEffects: [place, smelt], costCaps: [furnace, fuel, rawIron], maxCrafts: 2, maxPlacements: 1,
+  });
+  expect(parseMacroWorkOrder({ ...order, allowedEffects: [smelt], costCaps: [rawIron, fuel], maxPlacements: 0 }).maxPlacements).toBe(0);
+  for (const invalid of [
+    { ...order, origin: "preset" }, { ...order, id: "program:3" }, { ...order, nextWorkId: "program:2" },
+    { ...order, target: { kind: "preset", goal: "iron_pickaxe" } },
+    { ...order, target: { kind: "stock", item: "minecraft:bucket", count: 1 } },
+    { ...order, allowedEffects: [place] }, { ...order, allowedEffects: ["smelt:minecraft:gold_ingot", place] },
+    { ...order, costCaps: [fuel, furnace] }, { ...order, costCaps: [rawIron, furnace] },
+    { ...order, costCaps: [rawIron, { item: "minecraft:warped_planks", count: 2 }, furnace] },
+    { ...order, costCaps: [rawIron, fuel] }, { ...order, maxCrafts: 0 }, { ...order, maxPlacements: 0 },
+  ]) expect(() => parseMacroWorkOrder(invalid)).toThrow();
+  expect(() => parseMacroProposal(proposal({ kind: "work-program", stages: [
+    { policy, requires: [] },
+    { policy: { target: { kind: "stock", item: "minecraft:bucket", count: 1 }, allowedEffects: ["craft:bucket"],
+      costCaps: [{ item: "minecraft:iron_ingot", count: 3 }], reserves: [], maxBreaks: 0, maxCrafts: 1, maxPlacements: 0 }, requires: [] },
+  ] }))).toThrow("single live work policy");
+
+  const progress = { phase: "smelt", status: "Cooking 2 raw iron", breaks: 0, crafts: 0, placements: 1,
+    target: { item: target.item, count: 1, required: target.count } };
+  expect(parseMacroObservation({
+    v: 1, run: "run", life: 1, epoch: 1, tick: 20, goal: "diamond", health: 20, food: 20,
+    inventory: { [target.item]: 1 }, opportunities: [], recent: [], quiescent: false,
+    workOrder: { id: order.id, state: "working", detail: "Waiting for furnace output", progress },
+  }).workOrder).toMatchObject({
+    state: "working", progress: { phase: "smelt", crafts: 0, target: { count: 1, required: 3 } },
+  });
 });
 
 test.each([

@@ -16,6 +16,21 @@ export const MACRO_LOOKAHEAD_MAX_AGE_TICKS = 40;
 export const MACRO_LOOKAHEAD_MAX_CRACK = 0.65;
 export const MACRO_MAX_WORK_STAGES = 3;
 
+export const MACRO_IRON_SMELT = "smelt:minecraft:iron_ingot";
+export const MACRO_FURNACE_PLACEMENT = "place:minecraft:furnace";
+const workEffects = "break:minecraft:[a-z0-9_]{1,96}|craft:[a-z0-9_]{1,96}|place:minecraft:crafting_table";
+export const MACRO_PROGRAM_EFFECT_PATTERN = `^(${workEffects})$`;
+export const MACRO_LIVE_EFFECT_PATTERN = `^(${workEffects}|${MACRO_IRON_SMELT}|${MACRO_FURNACE_PLACEMENT})$`;
+const liveEffect = new RegExp(MACRO_LIVE_EFFECT_PATTERN);
+
+// Vanilla 1.21.4 durations for the exact fuels the bounded iron work supports.
+// Neither these durations nor a readable station count as observed furnace heat.
+export const MACRO_IRON_FUEL_TICKS: ReadonlyMap<string, number> = new Map([
+  ["minecraft:coal", 1_600], ["minecraft:charcoal", 1_600], ["minecraft:stick", 100],
+  ...["oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "pale_oak", "bamboo"]
+    .map(species => [`minecraft:${species}_planks`, 300] as const),
+]);
+
 const FILE_BYTES = {
   "active.json": 512,
   "handoff.json": 2 * 1024,
@@ -149,6 +164,7 @@ export interface MacroWorkPolicy {
   readonly costCaps: readonly MacroStockFloor[];
   readonly reserves: readonly MacroStockFloor[];
   readonly maxBreaks: number;
+  /** Recipe executions plus smelted units; a pending furnace batch uses this budget before collection. */
   readonly maxCrafts: number;
   readonly maxPlacements: number;
 }
@@ -171,7 +187,7 @@ export interface MacroWorkState {
   readonly detail: string;
   /** Observed operation and confirmed counters, not a claim of useful play each tick. */
   readonly progress?: {
-    readonly phase: "route" | "harvest" | "collect" | "craft" | "equip" | "place" | "search" | "hold" | "complete";
+    readonly phase: "route" | "harvest" | "collect" | "craft" | "smelt" | "equip" | "place" | "search" | "hold" | "complete";
     readonly status: string;
     readonly target?: { readonly item: string; readonly count: number; readonly required: number };
     readonly breaks: number;
@@ -409,20 +425,27 @@ function workPolicy(raw: Record<string, unknown>): MacroWorkPolicy {
       count: whole(target.count, "target count", 1, 2_304) }
     : { kind, goal: choice(shape(target, "preset target", ["kind", "goal"]).goal, "preset goal", SURVIVAL_AGENT_GOALS) };
   const effects = bounds(raw.allowedEffects, "work effects", 64).map(effect => {
-    if (typeof effect !== "string" ||
-        !/^(break:minecraft:[a-z0-9_]{1,96}|craft:[a-z0-9_]{1,96}|place:minecraft:crafting_table)$/.test(effect)) invalid("work effect");
+    if (typeof effect !== "string" || effect.trim() !== effect || !liveEffect.test(effect)) invalid("work effect");
     return effect;
   });
   if (new Set(effects).size !== effects.length) invalid("duplicate work effects");
   const byItem = (left: MacroStockFloor, right: MacroStockFloor) => left.item.localeCompare(right.item);
-  return Object.freeze({
+  const policy = {
     target: Object.freeze(parsedTarget), allowedEffects: Object.freeze(effects.sort()),
     costCaps: Object.freeze([...stockFloors(raw.costCaps, "work cost caps", true)].sort(byItem)),
     reserves: Object.freeze([...stockFloors(raw.reserves, "work reserves", true)].sort(byItem)),
     maxBreaks: whole(raw.maxBreaks, "work break cap", 0, WORK_LIMITS.maxBreaks),
     maxCrafts: whole(raw.maxCrafts, "work craft cap", 0, WORK_LIMITS.maxCrafts),
     maxPlacements: whole(raw.maxPlacements, "work placement cap", 0, WORK_LIMITS.maxPlacements),
-  });
+  };
+  const smelting = effects.includes(MACRO_IRON_SMELT);
+  const placingFurnace = effects.includes(MACRO_FURNACE_PLACEMENT);
+  if (smelting && (parsedTarget.kind !== "stock" || parsedTarget.item !== "minecraft:iron_ingot" ||
+      !policy.maxCrafts || !policy.costCaps.some(({ item }) => item === "minecraft:raw_iron") ||
+      !policy.costCaps.some(({ item }) => MACRO_IRON_FUEL_TICKS.has(item)))) invalid("iron smelt scope or costs");
+  if (placingFurnace && (!smelting || !policy.maxPlacements ||
+      !policy.costCaps.some(({ item }) => item === "minecraft:furnace"))) invalid("furnace placement scope or cost");
+  return Object.freeze(policy);
 }
 
 export function parseMacroWorkStages(value: unknown): readonly MacroWorkStage[] {
@@ -433,6 +456,7 @@ export function parseMacroWorkStages(value: unknown): readonly MacroWorkStage[] 
   const stages = bounds(value, "work program stages", MACRO_MAX_WORK_STAGES).map(value => {
     const raw = shape(value, "work stage", ["policy", "requires"]);
     const policy = parseMacroWorkPolicy(raw.policy);
+    if (policy.allowedEffects.includes(MACRO_IRON_SMELT)) invalid("smelting requires a single live work policy");
     const target = JSON.stringify(policy.target);
     if (targets.has(target)) invalid("duplicate work program target");
     targets.add(target);
@@ -459,7 +483,7 @@ function parseWorkProgress(value: unknown, tick: number): NonNullable<MacroWorkS
   const target = raw.target === undefined ? undefined : shape(raw.target, "native work stock", ["item", "count", "required"]);
   const last = raw.lastEffect === undefined ? undefined : shape(raw.lastEffect, "native last work effect", ["tick", "detail"]);
   return Object.freeze({
-    phase: choice(raw.phase, "work progress phase", ["route", "harvest", "collect", "craft", "equip", "place", "search", "hold", "complete"] as const),
+    phase: choice(raw.phase, "work progress phase", ["route", "harvest", "collect", "craft", "smelt", "equip", "place", "search", "hold", "complete"] as const),
     status: text(raw.status, "work progress status", 1_024),
     breaks: whole(raw.breaks, "confirmed work breaks", 0, WORK_LIMITS.maxBreaks),
     crafts: whole(raw.crafts, "confirmed work crafts", 0, WORK_LIMITS.maxCrafts),
@@ -487,6 +511,8 @@ export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   if (origin === "preset" && (policy.target.kind !== "preset" || policy.allowedEffects.length || policy.costCaps.length ||
       policy.maxBreaks > 32 || policy.maxCrafts > 24 || policy.maxPlacements > 2)) invalid("preset work scope");
   const nextWorkId = Object.hasOwn(record, "nextWorkId") ? validateMacroId(record.nextWorkId, "next work id") : undefined;
+  if (policy.allowedEffects.includes(MACRO_IRON_SMELT) && (nextWorkId || /:[123]$/.test(id)))
+    invalid("smelting requires a single live work order");
   if (nextWorkId) {
     const stage = /^(.+):([12])$/.exec(id);
     if (origin !== "model" || !stage || nextWorkId !== `${stage[1]}:${Number(stage[2]) + 1}`) invalid("work successor scope");

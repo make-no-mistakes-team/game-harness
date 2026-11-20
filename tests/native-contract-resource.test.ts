@@ -69,13 +69,14 @@ test("inflated resource size is bounded before JSON parsing", async () => {
 });
 
 const oldManifest = { schemaVersion: 1, id: "survival_agent", version: "1.0" };
-const terraManifest = { ...oldManifest, custom: { "gameharness:terra_work_wire": 1 } };
+const terraManifest = { ...oldManifest, custom: { "gameharness:terra_work_wire": 2 } };
 const actor = (manifest: object) => jar("fabric.mod.json", Buffer.from(JSON.stringify(manifest)), true);
 
 for (const [kind, bytes] of [
   ["unmarked", actor(oldManifest)],
-  ["wrong work-wire version", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 2 } })],
-  ["malformed work-wire marker", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": "1" } })],
+  ["pre-furnace work-wire version 1", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 1 } })],
+  ["wrong future work-wire version", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 3 } })],
+  ["malformed work-wire marker", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": "2" } })],
   ["malformed JAR", Buffer.from("not a JAR")],
   ["missing", null],
 ] as const) {

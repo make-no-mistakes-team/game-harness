@@ -19,6 +19,7 @@ import net.minecraft.util.Identifier;
 record AgentWorkOrder(String id, int life, long epoch, long basis, long expires, long safetyRevision,
                       Policy policy, String nextWorkId) {
     static final int MAX_TICKS = 1_200;
+    static final int MAX_BREAKS = 64;
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
     private static final Pattern ITEM_ID = Pattern.compile("minecraft:[a-z0-9_]{1,96}");
     private static final Set<String> FIELDS = Set.of("v", "id", "run", "life", "epoch", "basisTick", "expiresTick",
@@ -26,6 +27,8 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         "maxBreaks", "maxCrafts", "maxPlacements");
     private static final Set<String> GOALS = Set.of("wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond", "nether_portal");
     private static final String TABLE = "place:minecraft:crafting_table";
+    private static final String FURNACE = "place:minecraft:furnace";
+    private static final String IRON_SMELT = "smelt:minecraft:iron_ingot";
 
     record Target(Item item, int count, String goal) {}
 
@@ -50,6 +53,8 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                 || AgentHands.workSpecificPlanks(recipe) && effects.contains("craft:planks");
         }
         boolean placeTable() { return preset || effects.contains(TABLE); }
+        boolean smeltIron() { return !preset && target.item == Items.IRON_INGOT && effects.contains(IRON_SMELT); }
+        boolean placeFurnace() { return smeltIron() && effects.contains(FURNACE); }
     }
 
     /** Charges actual effects, or their conservative bound at the irreversible edge. */
@@ -57,11 +62,14 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         final Policy policy;
         private final Map<Item, Integer> spent = new HashMap<>();
         private int breaks, crafts, placements;
+        private boolean furnacePlaced;
 
         Budget(Policy policy) { this.policy = policy; }
-        boolean canBreak() { return breaks < policy.maxBreaks; }
-        boolean canCutCover() { return policy.maxBreaks - breaks > 1; }
-        boolean canPlace() { return placements < policy.maxPlacements; }
+        int breaksLeft() { return policy.maxBreaks - breaks; }
+        boolean canBreak() { return breaksLeft() > 0; }
+        boolean canCutCover() { return breaksLeft() > 1; }
+        boolean canPlace() { return placementsLeft() > 0; }
+        int placementsLeft() { return policy.maxPlacements - placements; }
         int craftsLeft() { return policy.maxCrafts - crafts; }
         boolean nearLimit() {
             return breaks > 0 && policy.maxBreaks - breaks <= 2
@@ -95,6 +103,30 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
 
         void broken(Item tool, int loss) { ++breaks; charge(tool, loss); }
         void placedTable() { ++placements; charge(Items.CRAFTING_TABLE, 1); }
+
+        boolean canPlaceFurnace(PlayerInventory inventory) {
+            return policy.placeFurnace() && !furnacePlaced && canPlace()
+                && limit(Items.FURNACE, count(inventory, Items.FURNACE)) >= 1;
+        }
+
+        void placedFurnace() {
+            furnacePlaced = true;
+            ++placements;
+            charge(Items.FURNACE, 1);
+        }
+
+        boolean reserveIronSmelt(PlayerInventory inventory, int units, Item fuel, int fuelCount, int fuelTicks) {
+            if (!policy.smeltIron() || units <= 0 || units > craftsLeft()
+                    || units > Math.max(policy.target.count, floor(Items.IRON_INGOT)) - count(inventory, Items.IRON_INGOT)
+                    || !AgentHands.workSmeltFuel(fuel) || fuelTicks <= 0
+                    || fuelCount != AgentHands.ironFuelNeeded(units, fuelTicks)
+                    || units > limit(Items.RAW_IRON, count(inventory, Items.RAW_IRON))
+                    || fuelCount > limit(fuel, count(inventory, fuel))) return false;
+            crafts += units;
+            charge(Items.RAW_IRON, units);
+            charge(fuel, fuelCount);
+            return true;
+        }
 
         void crafted(Map<Item, Integer> costs, int executions) {
             crafts += executions;
@@ -152,9 +184,19 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
             Map<Item, Integer> floors = stock(value, "reserves");
             if (preset && !caps.isEmpty()) return envelope;
             Policy policy = new Policy(preset, desired, Set.copyOf(effects), caps, floors,
-                bounded(value, "maxBreaks", 0, preset ? 32 : 64),
+                bounded(value, "maxBreaks", 0, preset ? 32 : MAX_BREAKS),
                 bounded(value, "maxCrafts", 0, preset ? 24 : 64),
                 bounded(value, "maxPlacements", 0, preset ? 2 : 8));
+            if (effects.contains(IRON_SMELT) || effects.contains(FURNACE)) {
+                int end = envelope.id.length() - 1;
+                boolean linkedStage = end >= 1 && envelope.id.charAt(end - 1) == ':'
+                    && envelope.id.charAt(end) >= '1' && envelope.id.charAt(end) <= '3';
+                if ((!mode.equals("preset") && !mode.equals("constrained")) || nextWorkId != null || linkedStage
+                        || !policy.smeltIron() || policy.maxCrafts == 0 || !caps.containsKey(Items.RAW_IRON)
+                        || caps.keySet().stream().noneMatch(AgentHands::workSmeltFuel)
+                        || effects.contains(FURNACE) && (policy.maxPlacements == 0 || !caps.containsKey(Items.FURNACE)))
+                    return envelope;
+            }
             return new AgentWorkOrder(envelope.id, envelope.life, envelope.epoch, envelope.basis, envelope.expires,
                 envelope.safetyRevision, policy, nextWorkId);
         } catch (RuntimeException invalid) {
@@ -171,7 +213,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
 
     private static boolean validEffect(String effect) {
         if (effect.startsWith("craft:")) return AgentHands.workRecipe(effect.substring("craft:".length()));
-        if (effect.equals(TABLE)) return true;
+        if (effect.equals(TABLE) || effect.equals(IRON_SMELT) || effect.equals(FURNACE)) return true;
         if (!effect.startsWith("break:")) return false;
         String id = effect.substring("break:".length());
         if (!ITEM_ID.matcher(id).matches()) return false;

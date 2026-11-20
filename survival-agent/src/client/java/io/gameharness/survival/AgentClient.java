@@ -642,6 +642,7 @@ public final class AgentClient implements ClientModInitializer {
         }
         ended = true;
         if (body != null) {
+            if (macro != null) macro.closeFurnaceForStop();
             hands.releaseWorkInventory(true);
             releaseLifeInputs(client);
         }

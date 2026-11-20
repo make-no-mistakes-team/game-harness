@@ -53,6 +53,17 @@ test("Only supported near-term footing can carry a travel clue, never native inp
   ]) expect(() => parseMacroObservation({ ...observation, travelHint: unsupported })).toThrow("travel hint");
   expect(() => parseMacroObservation({ ...observation, travelHint,
     safety: { clear: false, revision: 2 } })).toThrow("travel hint scope");
+
+  const { windowBlocks, ...approach } = travelHint;
+  const grade = { ...approach, footing: "one_block_grade", heightChange: 1 } as const;
+  expect(parseMacroObservation({ ...observation, travelHint: grade }).travelHint).toEqual(grade);
+  expect(parseMacroObservation({ ...observation, travelHint: { ...grade, heightChange: -1 } }).travelHint)
+    .toEqual({ ...grade, heightChange: -1 });
+  for (const unsupported of [
+    { ...approach, footing: "one_block_grade" }, { ...grade, windowBlocks },
+    { ...grade, heightChange: 0 }, { ...grade, heightChange: 2 }, { ...grade, heightChange: -2 },
+    { ...travelHint, heightChange: 1 }, { ...grade, footing: "side_only" },
+  ]) expect(() => parseMacroObservation({ ...observation, travelHint: unsupported })).toThrow("travel hint");
 });
 
 test("A work approach names one target without pricing its material", () => {

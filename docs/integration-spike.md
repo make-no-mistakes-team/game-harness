@@ -162,6 +162,16 @@ visible canopy, not a known log or a species claim. Neither cue prices
 a break or reports stock. The player checks each new view and brakes
 when the known ground runs out.
 
+After an actual timber approach stops, `timberObstruction` can identify
+one rendered leaf in reach and the retained tree or woodland direction
+it blocks. A reachable log or verified dry lane takes priority. To clear
+the obstruction, an ordinary work order must name that exact leaf break
+and leave enough breaks for the requested wood. The player stops if the
+new view shows no usable continuation. An exact vanilla break receipt
+charges the leaf against the shared cap; it does not credit timber,
+movement, or a route. Leaves supporting the player or a retained return
+are not eligible.
+
 The player can wade from dry footing when it can see a shallow,
 supported crossing and a dry bank. Deep or swift water, lava, unknown
 drops, and jumps do not qualify. A trip back to a paid furnace still

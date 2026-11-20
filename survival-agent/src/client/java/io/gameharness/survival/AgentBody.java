@@ -1,6 +1,7 @@
 package io.gameharness.survival;
 
 import io.gameharness.survival.AgentVisibleHorizon.Refusal;
+import java.util.Arrays;
 import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -60,6 +61,7 @@ final class AgentBody {
     private static final int RAY_BUDGET = 256;
     private static final int MOVEMENT_RAYS = 6;
     private static final int HORIZON_TERRAIN_RAYS = 24;
+    private static final int HORIZON_GRADE_RAYS = 9;
     private static final float[] HORIZON_CUE_U = {0, -0.30f, 0.30f, 0, -0.58f, 0.58f, -0.30f, 0.30f, 0, -0.54f, 0.54f};
     private static final float[] HORIZON_CUE_V = {0.24f, 0, 0, -0.24f, 0, 0, 0.30f, 0.30f, 0.55f, -0.32f, -0.32f};
     private static final int HORIZON_CUE_RAYS = 1 + HORIZON_CUE_U.length;
@@ -196,7 +198,11 @@ final class AgentBody {
     private long lastFrame;
     private int tick;
     private int raysLeft;
-    private int horizonTerrainRays, horizonCueRays, horizonWitnessRays;
+    private int horizonTerrainRays, horizonGradeRays, horizonCueRays, horizonWitnessRays;
+    private final OrdinaryGrade[] horizonGrades = new OrdinaryGrade[Direction.values().length];
+    private final BlockHitResult[] horizonGradeSides = new BlockHitResult[horizonGrades.length];
+    private final BlockHitResult[] horizonRiserTops = new BlockHitResult[horizonGrades.length];
+    private int horizonGradeChecked;
     private long horizonSightlineFrame = -1, horizonCueFrame = -1;
     private BlockHitResult horizonSightlineHit;
     private int sampleCount;
@@ -215,7 +221,8 @@ final class AgentBody {
     private static final int HORIZON_WAIT_TICKS = 8;
     private HorizonTravel horizonIntent, horizonApplied;
     private Vec3d horizonAppliedFrom;
-    private boolean horizonAppliedDry, horizonWading;
+    private boolean horizonAppliedDry, horizonAppliedPulse, horizonWading;
+    private BlockPos horizonPulseContact;
     private int horizonAppliedTick = -2;
     private int horizonSide;
     private boolean horizonForward, horizonSneak, horizonWade;
@@ -283,8 +290,14 @@ final class AgentBody {
     void begin() {
         tick++;
         safetySpend = null;
-        raysLeft = RAY_BUDGET - MOVEMENT_RAYS - HORIZON_TERRAIN_RAYS - HORIZON_CUE_RAYS - HORIZON_WITNESS_RAYS;
+        raysLeft = RAY_BUDGET - MOVEMENT_RAYS - HORIZON_TERRAIN_RAYS - HORIZON_GRADE_RAYS
+            - HORIZON_CUE_RAYS - HORIZON_WITNESS_RAYS;
         horizonTerrainRays = HORIZON_TERRAIN_RAYS;
+        horizonGradeRays = HORIZON_GRADE_RAYS;
+        horizonGradeChecked = 0;
+        Arrays.fill(horizonGrades, null);
+        Arrays.fill(horizonGradeSides, null);
+        Arrays.fill(horizonRiserTops, null);
         horizonCueRays = HORIZON_CUE_RAYS;
         horizonWitnessRays = HORIZON_WITNESS_RAYS;
         sampleCount = 0;
@@ -301,6 +314,7 @@ final class AgentBody {
             dryFooting = previousDryFooting = null;
             lavaEmergency = false;
             horizonApplied = null;
+            horizonPulseContact = null;
             horizonWading = false;
             hazardWorld = client.world;
             hazardPlayer = client.player;
@@ -721,12 +735,19 @@ final class AgentBody {
         if (rolling) {
             horizonApplied = horizonIntent;
             horizonAppliedFrom = player.getPos();
-            horizonAppliedDry = player.isOnGround() && !player.isTouchingWater() && !horizonWade;
+            horizonAppliedPulse = horizonKeyWindow != null && horizonKeyWindow.contactOnly();
+            horizonAppliedDry = player.isOnGround() && !player.isTouchingWater() && !horizonWade && !horizonAppliedPulse;
             horizonAppliedTick = tick;
             horizonApplied.issued = advance || horizonSide != 0;
-            horizonApplied.beenDriven |= horizonApplied.issued;
+            horizonApplied.beenDriven |= horizonApplied.issued && !horizonAppliedPulse;
             if (horizonKeyWindow != null) {
-                if (horizonApplied.issued) horizonApplied.issuedBearing = horizonHeading;
+                if (horizonApplied.issued) {
+                    horizonApplied.issuedBearing = horizonHeading;
+                    if (horizonAppliedPulse) {
+                        horizonApplied.pulse.markIssued(horizonKeyWindow.frame());
+                        horizonPulseContact = player.supportingBlockPos.orElse(null);
+                    }
+                }
                 visibleHorizon.reportDrive(horizonApplied.issued ? null
                     : horizonHazardVeto ? Refusal.HAZARD : Refusal.INPUT_COASTING, horizonKeyWindow);
             }
@@ -1359,6 +1380,10 @@ final class AgentBody {
 
     AgentVisibleHorizon visibleHorizon() { return visibleHorizon; }
 
+    boolean horizonPulseAvailable(BlockPos contact) {
+        return contact != null && !contact.equals(horizonPulseContact);
+    }
+
     /** The rendered sightline can name a distant landmark beyond vanilla's interaction reach. */
     BlockHitResult horizonSightline(double distance) {
         if (!hasView() || distance <= 0) return null;
@@ -1422,6 +1447,7 @@ final class AgentBody {
         final Vec3d goal;
         final double arrival;
         final boolean allowWade;
+        private final AgentVisibleHorizon.ContactPulse pulse;
         private int wadeTick = -2, stoppedAt = -1, precisionTicks;
         private boolean issued, beenDriven, wet;
         private float bearing = Float.NaN, blockedBearing = Float.NaN, issuedBearing = Float.NaN;
@@ -1430,15 +1456,21 @@ final class AgentBody {
         private int dryContacts;
 
         HorizonTravel(AgentVisibleHorizon.Target target, Vec3d goal, double arrival, boolean allowWade) {
+            this(target, goal, arrival, allowWade, false);
+        }
+
+        HorizonTravel(AgentVisibleHorizon.Target target, Vec3d goal, double arrival, boolean allowWade, boolean allowPulse) {
             this.target = target;
             this.goal = goal;
             this.arrival = arrival;
             this.allowWade = allowWade;
+            pulse = allowPulse ? new AgentVisibleHorizon.ContactPulse() : null;
         }
 
         boolean moved() { return motion != null && motion.moved(); }
         boolean progressed() { return motion != null && motion.progressed; }
         boolean waded() { return wet; }
+        boolean pulseIssued() { return pulse != null && pulse.used(); }
     }
 
     /** Forward input and camera rotation aren't receipts; sample displacement after vanilla consumed the keys. */
@@ -1486,7 +1518,7 @@ final class AgentBody {
         HorizonTravel travel = horizonApplied;
         Vec3d feet = player.getPos();
         Vec3d from = horizonAppliedFrom;
-        boolean continuous = travel.motion.observe(from, feet, travel.issued, player.horizontalCollision,
+        boolean continuous = travel.motion.observe(from, feet, travel.issued && !horizonAppliedPulse, player.horizontalCollision,
             player.hurtTime == 0 && !player.hasVehicle() && !player.isOnFire() && !player.isInLava());
         travel.wet |= player.isTouchingWater();
         if (!continuous || !travel.beenDriven || !horizonAppliedDry || !player.isOnGround() || player.isTouchingWater()) {
@@ -1602,7 +1634,8 @@ final class AgentBody {
             // Do not correct in midair or press jump into a new or unseen lane.
             return horizonWait(travel, Refusal.SOURCE_UNGROUNDED, null);
         }
-        var chosen = visibleHorizon.window(travel.target, travel.allowWade, travel.bearing, travel.blockedBearing, direct);
+        var chosen = visibleHorizon.workWindow(travel.target, travel.allowWade, travel.bearing, travel.blockedBearing,
+            direct, travel.pulse, !travel.beenDriven && !targetReady && distance > travel.arrival);
         if (chosen == null) {
             lookAlongGait(Float.isFinite(travel.bearing) ? travel.bearing : direct,
                 travel.stoppedAt >= 0 && tick - travel.stoppedAt >= 3 ? 38 : 28);
@@ -1622,7 +1655,9 @@ final class AgentBody {
         lookAlongGait(aim, pitch);
         float difference = MathHelper.wrapDegrees(aim - actual);
         if (Math.abs(difference) > 24) return horizonWait(travel, Refusal.STEERING_ALIGNMENT, chosen);
-        var window = Math.abs(difference) < 0.01 ? chosen : visibleHorizon.window(travel.target, actual);
+        boolean local = chosen.contactOnly();
+        var window = Math.abs(difference) < 0.01 ? chosen : local ? visibleHorizon.contactWindow(travel.target, actual)
+            : visibleHorizon.window(travel.target, actual);
         if (window == null) return horizonWait(travel, null, null);
         if (window.medium() != chosen.medium() || player.isTouchingWater() && !wade)
             return horizonWait(travel, Refusal.WATER_NOT_ALLOWED, window);
@@ -1633,8 +1668,9 @@ final class AgentBody {
         // A rendered frame may turn the player before vanilla consumes the
         // held keys. Check the other end of that small steering arc as well.
         float steeringTurn = MathHelper.clamp(turn, -8, 8);
-        if (Math.abs(steeringTurn) > 3) {
-            var steered = visibleHorizon.window(travel.target, actual + steeringTurn);
+        if (Math.abs(steeringTurn) > (local ? 0.01 : 3)) {
+            var steered = local ? visibleHorizon.contactWindow(travel.target, actual + steeringTurn)
+                : visibleHorizon.window(travel.target, actual + steeringTurn);
             if (steered == null) return horizonWait(travel, null, null);
             if (steered.medium() != window.medium() || wade && !horizonWadeWindow(steered))
                 return horizonWait(travel, Refusal.WATER_NOT_ALLOWED, steered);
@@ -1891,16 +1927,118 @@ final class AgentBody {
         BlockPos support = hit.getBlockPos();
         if (support.getX() != x || support.getZ() != z) return Refusal.SURFACE_NOT_RENDERED.unavailable;
         if (hit.getSide() != Direction.UP) {
+            if (hit.getSide().getAxis().isHorizontal()) {
+                Direction bearing = hit.getSide().getOpposite();
+                if (AgentSurfaceTread.ordinaryRiseSide(client.player.getBlockPos(), bearing, hit))
+                    horizonGradeSides[bearing.ordinal()] = hit;
+            }
             BlockState visible = client.world.getBlockState(support);
             return visible.isIn(BlockTags.LEAVES) && support.getY() + 1.0 > level + 0.055
                 ? Refusal.LEAF_HEIGHT.unavailable : Refusal.SURFACE_NOT_RENDERED.unavailable;
         }
         // The optical ray already traversed the open side of this face. Sample only it,
         // not a column beyond the top (or blocks behind an opaque intercept).
-        if (Math.abs(hit.getPos().y - level) > 0.055)
+        if (Math.abs(hit.getPos().y - level) > 0.055) {
+            var from = client.player.getBlockPos();
+            Direction bearing = AgentSurfaceTread.prospectLevelBearing(from, support);
+            if (bearing != null && support.getY() == from.getY() && matchesDryRouteTop(hit, support))
+                horizonRiserTops[bearing.ordinal()] = hit;
             return client.world.getBlockState(support).isIn(BlockTags.LEAVES)
                 ? Refusal.LEAF_HEIGHT.unavailable : Refusal.SURFACE_HEIGHT.unavailable;
+        }
         return horizonSurface(support, hit.getPos().y);
+    }
+
+    record OrdinaryGrade(BlockPos from, Direction bearing, BlockPos floor, BlockState source,
+                         BlockState surface, long frame, AgentSurfaceTread.Edge edge) {
+        BlockPos to() { return floor.up(); }
+        boolean lookOnly() { return edge == null; }
+        Vec3d topAim() {
+            return Vec3d.ofBottomCenter(to()).add(0.42 * bearing.getOffsetX(), -0.025, 0.42 * bearing.getOffsetZ());
+        }
+    }
+
+    /** One goalward adjacent column, not a search for hidden higher or lower supports. */
+    OrdinaryGrade ordinaryGrade(Vec3d goal) {
+        var view = horizonView();
+        if (view == null) return null;
+        var player = view.player;
+        BlockPos from = player.getBlockPos();
+        double dx = goal.x - view.feet.x, dz = goal.z - view.feet.z;
+        Direction bearing = Math.abs(dx) >= Math.abs(dz) ? dx > 0 ? Direction.EAST : Direction.WEST
+            : dz > 0 ? Direction.SOUTH : Direction.NORTH;
+        BlockPos beside = from.offset(bearing);
+        Vec3d next = Vec3d.ofBottomCenter(beside);
+        double before = Math.hypot(dx, dz);
+        if (before - Math.hypot(goal.x - next.x, goal.z - next.z) < 0.32) return null;
+        BlockState source = ordinaryGradeSource(from, bearing);
+        if (source == null) return null;
+        int bit = 1 << bearing.ordinal();
+        if ((horizonGradeChecked & bit) != 0) return horizonGrades[bearing.ordinal()];
+        horizonGradeChecked |= bit;
+
+        // Sample only the two exact +/- 1 landing heights. Missing support at
+        // level is not evidence of a descent. A riser side is only a look cue.
+        var upper = ordinaryGradeTopHit(beside, bearing);
+        var grade = upper == null ? ordinaryGradeTop(from, bearing, source, ordinaryGradeTopHit(beside.down(2), bearing))
+            : ordinaryGradeTop(from, bearing, source, upper);
+        if (grade == null && upper == null) {
+            var side = horizonGradeSides[bearing.ordinal()];
+            if (side == null) side = ordinaryGradeRay(Vec3d.ofCenter(beside, 0.15));
+            if (AgentSurfaceTread.ordinaryRiseSide(from, bearing, side)) {
+                BlockState seen = client.world.getBlockState(beside);
+                if (stableDryRouteTop(beside, seen) && !dryCaveDanger(seen))
+                    grade = new OrdinaryGrade(from, bearing, beside, source, seen, view.frame, null);
+            }
+        }
+        horizonGrades[bearing.ordinal()] = grade;
+        return grade;
+    }
+
+    /** After the one look, only the exact same previously seen obstacle can become the landing. */
+    OrdinaryGrade ordinaryGradeAfterLook(OrdinaryGrade cue) {
+        var view = horizonView();
+        if (view == null || view.frame <= cue.frame || ordinaryGradeSource(cue.from, cue.bearing) != cue.source)
+            return null;
+        var proved = ordinaryGradeTop(cue.from, cue.bearing, cue.source, ordinaryGradeTopHit(cue.floor, cue.bearing));
+        return proved != null && proved.surface == cue.surface ? proved : null;
+    }
+
+    private BlockState ordinaryGradeSource(BlockPos from, Direction bearing) {
+        var player = client.player;
+        if (!from.down().equals(player.supportingBlockPos.orElse(null))
+                || player.getPose() != EntityPose.STANDING || player.isSprinting() || player.isUsingItem()
+                || player.isTouchingWater() || player.isClimbing() || player.getAbilities().flying
+                || player.hasStatusEffect(StatusEffects.JUMP_BOOST) || player.hasStatusEffect(StatusEffects.SLOW_FALLING)
+                || !drySurveyLaneCentered(from, player.getX(), player.getZ(), bearing)
+                || player.getVelocity().horizontalLengthSquared() > 0.0025
+                || client.options.forwardKey.isUnbound() || client.options.jumpKey.isUnbound()) return null;
+        return dryCaveContact(from);
+    }
+
+    private BlockHitResult ordinaryGradeTopHit(BlockPos floor, Direction bearing) {
+        var hit = horizonRiserTops[bearing.ordinal()];
+        if (hit == null || !hit.getBlockPos().equals(floor))
+            hit = ordinaryGradeRay(Vec3d.ofBottomCenter(floor.up()).add(0.42 * bearing.getOffsetX(), -0.025,
+                0.42 * bearing.getOffsetZ()));
+        return matchesDryRouteTop(hit, floor) && !hit.isInsideBlock() ? hit : null;
+    }
+
+    private OrdinaryGrade ordinaryGradeTop(BlockPos from, Direction bearing, BlockState source, BlockHitResult hit) {
+        if (hit == null) return null;
+        BlockPos floor = hit.getBlockPos(), to = floor.up();
+        BlockState surface = client.world.getBlockState(floor);
+        if (!stableDryRouteTop(floor, surface)) return null;
+        var edge = AgentSurfaceTread.witnessedGradeEdge(from, source, bearing, hit, surface,
+            walkedLaneDry(from, to, bearing) && AgentSurfaceTread.reverseClear(client, from, to, bearing)
+                && ordinaryGradeSweep(from, to));
+        return edge == null ? null : new OrdinaryGrade(from, bearing, floor, source, surface, frameSequence, edge);
+    }
+
+    private BlockHitResult ordinaryGradeRay(Vec3d point) {
+        if (horizonGradeRays <= 0 || !inView(point)) return null;
+        --horizonGradeRays;
+        return litRay(point, Ray.TERRAIN);
     }
 
     private AgentVisibleHorizon.Patch horizonSurface(BlockPos floor, double contactY) {
@@ -2285,6 +2423,10 @@ final class AgentBody {
         return dryRouteVeto(from, to) == DryRouteVeto.CLEAR;
     }
 
+    boolean ordinaryGradeSweep(BlockPos from, BlockPos to) {
+        return dryRouteVeto(from, to, true, 0.27, true) == DryRouteVeto.CLEAR;
+    }
+
     void trackWalkedRoutes(AgentWalkedRoute routes) { walkedRoutes = routes; }
 
     /** Called by an ordinary actuator on actual grounded arrival, never from idle position samples. */
@@ -2460,6 +2602,11 @@ final class AgentBody {
     }
 
     private DryRouteVeto dryRouteVeto(BlockPos from, BlockPos to, boolean requireLandingSupport, double beforeSource) {
+        return dryRouteVeto(from, to, requireLandingSupport, beforeSource, false);
+    }
+
+    private DryRouteVeto dryRouteVeto(BlockPos from, BlockPos to, boolean requireLandingSupport,
+                                      double beforeSource, boolean ordinaryGrade) {
         if (!hasView()) return DryRouteVeto.VIEW;
         var player = client.player;
         int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ(), dy = to.getY() - from.getY();
@@ -2481,10 +2628,20 @@ final class AgentBody {
         Box high = new Box(x - half, upper + 0.015, z - half, x + half, upper + 1.80, z + half);
         double cross = Math.abs(drift) > Math.abs(across) ? drift : across;
         Box approach = high.stretch(cross * dz, 0, -cross * dx);
-        if (!client.world.isSpaceEmpty(player, approach.stretch(dx, 0, dz))) return DryRouteVeto.SWEEP;
+        Box sweep = approach.stretch(dx, 0, dz);
+        if (ordinaryGrade) {
+            if (Math.abs(dy) != 1 || player.isSprinting() || player.isUsingItem() || player.isClimbing()
+                    || player.getAbilities().flying || player.hasStatusEffect(StatusEffects.JUMP_BOOST)
+                    || player.hasStatusEffect(StatusEffects.SLOW_FALLING)) return DryRouteVeto.SWEEP;
+            sweep = sweep.stretch(0, 0.30, 0); // include vanilla jump apex, even with lateral drift
+            if (!dryGradeVolume(sweep)) return DryRouteVeto.HAZARD;
+        }
+        if (!client.world.isSpaceEmpty(player, sweep)) return DryRouteVeto.SWEEP;
         if (dy != 0) {
             Box lowerColumn = dy > 0 ? approach : approach.offset(dx, 0, dz);
-            if (!client.world.isSpaceEmpty(player, lowerColumn.stretch(0, -1, 0))) return DryRouteVeto.SWEEP;
+            Box lowerSweep = lowerColumn.stretch(0, -1, 0);
+            if (ordinaryGrade && !dryGradeVolume(lowerSweep)) return DryRouteVeto.HAZARD;
+            if (!client.world.isSpaceEmpty(player, lowerSweep)) return DryRouteVeto.SWEEP;
         }
         // The source's reverse support is positive grounded body contact, not an
         // imaginary camera looking back from the destination. A change to either
@@ -2493,6 +2650,15 @@ final class AgentBody {
         Box landingContact = sourceContact.offset(dx, dy, dz);
         return client.world.isSpaceEmpty(player, sourceContact) || requireLandingSupport && client.world.isSpaceEmpty(player, landingContact)
             ? DryRouteVeto.SUPPORT : DryRouteVeto.CLEAR;
+    }
+
+    /** Negative-only hazard check on the swept body volume of two already witnessed contacts. */
+    private boolean dryGradeVolume(Box sweep) {
+        for (int x = MathHelper.floor(sweep.minX); x <= MathHelper.floor(sweep.maxX - 1e-5); x++)
+            for (int z = MathHelper.floor(sweep.minZ); z <= MathHelper.floor(sweep.maxZ - 1e-5); z++)
+                for (int y = MathHelper.floor(sweep.minY); y <= MathHelper.floor(sweep.maxY - 1e-5); y++)
+                    if (dryCaveDanger(client.world.getBlockState(walkedProbe.set(x, y, z)))) return false;
+        return true;
     }
 
     // A level walking view includes both the far half of the next tread and its headroom.

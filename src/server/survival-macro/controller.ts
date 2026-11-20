@@ -564,7 +564,7 @@ function evidenceKey(observation: MacroObservation): string {
   return digest([
     observation.life, observation.epoch, observation.goal, guardBand(observation.health), guardBand(observation.food),
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b)),
-    orderedOpportunities(observation), observation.quiescent, observation.prospectOpening,
+    orderedOpportunities(observation), observation.quiescent, observation.prospectOpening, observation.timberObstruction,
     [...new Set(observation.recent)].sort(),
   ]);
 }
@@ -603,15 +603,34 @@ function sameProspectOpening(left: ProspectOpening, right: ProspectOpening | und
     left.tool === right.tool && left.maxToolLoss === right.maxToolLoss;
 }
 
+type TimberObstruction = NonNullable<MacroObservation["timberObstruction"]>;
+
+function sameTimberObstruction(left: TimberObstruction, right: TimberObstruction | undefined): boolean {
+  return !!right && left.target === right.target && left.block === right.block && left.timber === right.timber &&
+    sameTravelTarget(left.toward, right.toward);
+}
+
+function pricedTimberObstruction(observation: MacroObservation, policy: MacroWorkPolicy): TimberObstruction | undefined {
+  const clue = observation.timberObstruction;
+  const { target, allowedEffects, maxBreaks, reserves } = policy;
+  if (!clue || target.kind !== "stock" || target.item !== clue.timber || !hasStock(observation, reserves) ||
+      !allowedEffects.includes(`break:${clue.block}`) || !allowedEffects.includes(`break:${clue.timber}`)) return;
+  const missing = target.count - stock(observation, target.item);
+  if (missing > 0 && maxBreaks > missing) return clue;
+}
+
 type OpeningWitness = MacroOpportunity | ProspectOpening | MacroTravelHint;
 type WorkStart = Pick<MacroWorkOrder, "travelAnchor" | "harvestAnchor">;
 
 function sameTravelHint(left: MacroTravelHint, right: MacroTravelHint | undefined): boolean {
-  return left.kind === right?.kind && sameTravelTarget(left, right);
+  return left.kind === right?.kind && sameTravelTarget(left, right) &&
+    (left.footing === "one_block_grade"
+      ? right.footing === left.footing && left.heightChange === right.heightChange
+      : right.footing !== "one_block_grade");
 }
 
 function sameOpeningWitness(left: OpeningWitness, right: OpeningWitness): boolean {
-  if ("windowBlocks" in left) return "windowBlocks" in right && sameTravelHint(left, right);
+  if ("footing" in left) return "footing" in right && sameTravelHint(left, right);
   if ("block" in left) return "block" in right && sameProspectOpening(left, right);
   return "verb" in right && sameAffordance(left, right);
 }
@@ -700,6 +719,7 @@ function workEvidence(observation: MacroObservation, lastReceipt: MacroReceipt |
   return digest([observation.run, observation.life, observation.goal, observation.stance, observation.safety,
     lastReceipt?.life === observation.life ? lastReceipt.id : null,
     pending ? [pending.id, pending.state, pending.parked, pending.yieldable, !!pending.collectOfferId, !!pending.deferOfferId] : null,
+    observation.timberObstruction,
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b))]);
 }
 
@@ -1546,10 +1566,15 @@ export class SurvivalMacroController {
     }
     const asked = this.lastAsked?.observation;
     const travel = observation.travelHint;
+    const obstruction = !job && !travel ? observation.timberObstruction : undefined;
+    const obstructionQuery = obstruction ? digest(["timber obstruction", observation.life, observation.stance,
+      observation.safety?.revision, obstruction, stock(observation, obstruction.timber)]) : null;
+    const newObstruction = obstruction && !!asked && !sameTimberObstruction(obstruction, asked.timberObstruction);
     const failedOpening = previous?.failedOpeningPolicy;
     const newTravelStart = !!asked && previous?.mayRecoverOnAffordance && travel && this.isCurrentHandoff(observation) &&
       !sameTravelHint(travel, asked.travelHint) && (!failedOpening || !!matchingTravelHint(observation, failedOpening));
-    if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew" && !newTravelStart) return;
+    if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew" &&
+        !newTravelStart && !newObstruction) return;
     const pendingCorrection = this.replyCorrection;
     const correction = pendingCorrection?.renewal
       ? demand === "renew" && pendingCorrection.renewal === job && observation.tick > pendingCorrection.observation.tick
@@ -1562,21 +1587,24 @@ export class SurvivalMacroController {
         this.isCurrentHandoff(observation) && this.intentRecoveryCurrent(recovery, observation, evidence) &&
         offersAffordance(observation, recovery.offer) ? recovery : this.alternativeRecovery(observation, evidence)
     ) : undefined;
+    if (obstructionQuery && this.workHandoffQueries.has(obstructionQuery) && !correction) return;
     // An idle abstention can recover on a genuinely new actionable witness or
     // neutral handoff, not when the same affordance is issued a different ID.
     if (unchanged && !correction && !reconsideration) {
       if (job || !previous.mayRecoverOnAffordance || !asked ||
           (!(observation.quiescent && !asked.quiescent) &&
             !(observation.prospectOpening && !sameProspectOpening(observation.prospectOpening, asked.prospectOpening)) &&
+            !newObstruction &&
             !newTravelStart &&
             !observation.opportunities.some(offer =>
             workAffordance(offer) && !offersAffordance(asked, offer)))) return;
     }
-    const handoffQuery = !job && (observation.quiescent || observation.prospectOpening || observation.travelHint ||
+    const handoffQuery = !job && (observation.quiescent || observation.prospectOpening || observation.travelHint || obstruction ||
       observation.opportunities.some(workAffordance))
       ? digest([evidence, liveCorrectionEvidence({ ...observation, opportunities: observation.opportunities.filter(workAffordance) })]) : null;
     if (unchanged && !correction && !reconsideration && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
     if (handoffQuery) this.workHandoffQueries.add(handoffQuery);
+    if (obstructionQuery) this.workHandoffQueries.add(obstructionQuery);
     if (!correction) this.workQuery = { key, tick: observation.tick, evidence };
     if (overlap?.smeltBurnTick !== undefined) overlap.incumbent.smeltLookedAhead = true;
     else if (overlap && owner) this.workOverlapRequests.add(owner);
@@ -1803,6 +1831,14 @@ export class SurvivalMacroController {
     const clue = !after ? plan.observation.travelHint : undefined;
     const travel = clue && travelHintMatchesPolicy(clue, policy) ? clue : undefined;
     const wall = !after && !travel && pricedProspectOpening(plan.observation, policy);
+    const timberClue = !after && !travel && !wall ? plan.observation.timberObstruction : undefined;
+    const timber = timberClue ? pricedTimberObstruction(plan.observation, policy) : undefined;
+    if (timberClue && !timber && policy.target.kind === "stock" && policy.target.item === timberClue.timber) {
+      this.queuedWork = undefined;
+      await this.disposition("proposal_refused", { requestId: plan.requestId,
+        reason: "The witnessed timber obstruction requires its exact leaf break plus enough breaks for the remaining timber stock." });
+      return;
+    }
     const currentWall = wall ? (fresh: MacroObservation) =>
       this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
       sameProspectOpening(wall, pricedProspectOpening(fresh, policy)) : undefined;
@@ -1811,7 +1847,10 @@ export class SurvivalMacroController {
       return this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
         sameTravelHint(travel, current);
     } : undefined;
-    const currentStart = currentWall ?? currentTravel;
+    const currentTimber = timber ? (fresh: MacroObservation) =>
+      this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
+      sameTimberObstruction(timber, pricedTimberObstruction(fresh, policy)) : undefined;
+    const currentStart = currentWall ?? currentTravel ?? currentTimber;
     let rejection = "fresh_work_admission_rejected";
     const job = await this.publishWork(plan.observation, policy, "model", plan.requestId, plan.proposal.expiresTick,
       requires, after?.policy, afterSmelt ? fresh => !this.job && fresh.tick >= afterSmelt.terminal!.tick &&
@@ -1864,7 +1903,8 @@ export class SurvivalMacroController {
         return true;
       }, duringWaitFor, undefined, currentStart ? (before, latest) =>
         latest.tick - before.tick < WORK_ADMISSION_TICKS && currentStart(latest) : undefined,
-      travel ? () => ({ travelAnchor: { subject: travel.subject, target: travel.target } }) : undefined);
+      travel ? () => ({ travelAnchor: { subject: travel.subject, target: travel.target } }) :
+        timber ? () => ({ travelAnchor: timber.toward }) : undefined);
     if (job === null) return; // A rotating observation is not a denied program stage.
     if (!job && (bootstrap || afterSmelt || duringWaitFor)) return this.discardQueuedWork(queued, rejection);
     this.queuedWork = undefined;
@@ -3209,7 +3249,7 @@ export class SurvivalMacroController {
         }, fresh => {
           const witnessed = openingWorkWitness(fresh, policy, issued.offer);
           if (!witnessed) return;
-          if ("windowBlocks" in witnessed) return { travelAnchor: { subject: witnessed.subject, target: witnessed.target } };
+          if ("footing" in witnessed) return { travelAnchor: { subject: witnessed.subject, target: witnessed.target } };
           if (issued.offer.anchor && "material" in witnessed && witnessed.material) {
             const { subject, target } = witnessed.material;
             return { harvestAnchor: { subject, target } };

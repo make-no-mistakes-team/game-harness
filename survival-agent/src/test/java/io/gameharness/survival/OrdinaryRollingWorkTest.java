@@ -16,6 +16,7 @@ import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.EmptyBlockView;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -83,11 +84,66 @@ final class OrdinaryRollingWorkTest {
     }
 
     @Test
+    void aPreparatoryLeafCostsOneBreakAndLeavesTheExactWoodGrantIntact() {
+        var oak = Blocks.OAK_LEAVES.getDefaultState();
+        var birch = Blocks.BIRCH_LEAVES.getDefaultState();
+        var policy = order("oak_log", "\"break:minecraft:oak_log\",\"break:minecraft:oak_leaves\"", "").policy();
+        assertNotNull(policy);
+        assertTrue(policy.timberClearAllowed(oak));
+        assertFalse(policy.timberClearAllowed(birch));
+        assertFalse(policy.breakAllowed(oak), "leaves remain outside ordinary stock gathering");
+        assertFalse(policy.travelAnchorAllowed("block:minecraft:oak_leaves", RESOURCE));
+        assertFalse(AgentWorkOrder.resource(oak));
+        assertFalse(order("oak_log", "\"break:minecraft:oak_log\"", "").policy().timberClearAllowed(oak));
+        var budget = new AgentWorkOrder.Budget(policy);
+        assertTrue(budget.canOpenTimber(1));
+        assertFalse(budget.canOpenTimber(budget.breaksLeft()), "the missing log stock takes priority");
+        budget.broken(net.minecraft.item.Items.AIR, 0);
+        assertTrue(budget.canBreak());
+        assertTrue(policy.breakAllowed(Blocks.OAK_LOG.getDefaultState()));
+    }
+
+    @Test
+    void onlyAForwardReachableSideOrHeadLeafCanBeTheObstruction() {
+        var tree = new Vec3d(4, 0.5, 0.5);
+        assertTrue(AgentMacroControl.timberObstructionGeometry(FEET, tree, hit(1, 1, Direction.WEST), EYE_Y, REACH));
+        assertTrue(AgentMacroControl.timberObstructionGeometry(FEET, tree, hit(1, 0, Direction.WEST), EYE_Y, REACH));
+        assertFalse(AgentMacroControl.timberObstructionGeometry(FEET, tree, hit(0, 1, Direction.WEST), EYE_Y, REACH));
+        assertFalse(AgentMacroControl.timberObstructionGeometry(FEET, tree, hit(1, -1, Direction.WEST), EYE_Y, REACH));
+        assertFalse(AgentMacroControl.timberObstructionGeometry(FEET, tree, hit(-1, 1, Direction.EAST), EYE_Y, REACH));
+        assertFalse(AgentMacroControl.timberObstructionGeometry(FEET, tree, hit(1, 1, Direction.WEST), EYE_Y, 0.4));
+    }
+
+    @Test
+    void aLeafOpeningDoesNotTurnWaterACliffOrTheCanopyIntoDryFooting() {
+        var world = EmptyBlockView.INSTANCE;
+        var floor = new BlockPos(1, -1, 0);
+        assertTrue(AgentMacroControl.timberSolidDryFloor(world, floor, Blocks.GRASS_BLOCK.getDefaultState()));
+        assertFalse(AgentMacroControl.timberSolidDryFloor(world, floor, Blocks.WATER.getDefaultState()));
+        assertFalse(AgentMacroControl.timberSolidDryFloor(world, floor, Blocks.AIR.getDefaultState()));
+        assertFalse(AgentMacroControl.timberSolidDryFloor(world, floor, Blocks.OAK_LEAVES.getDefaultState()));
+        assertFalse(AgentMacroControl.timberSolidDryFloor(world, floor, Blocks.CRAFTING_TABLE.getDefaultState()));
+    }
+
+    @Test
     void aRealBrakingAdvanceMayRecheckTheSameOakButSidewaysJitterCannot() {
         Vec3d goal = new Vec3d(6.5, 0, 0.5);
         assertTrue(AgentMacroControl.improvedHorizonStance(FEET, FEET.add(3.23, 0, 0), goal));
         assertFalse(AgentMacroControl.improvedHorizonStance(FEET, FEET.add(0.12, 0, 0), goal));
         assertFalse(AgentMacroControl.improvedHorizonStance(FEET, FEET.add(0.10, 0, 1.2), goal));
+    }
+
+    @Test
+    void onlyTheUnanchoredPricedJobMayUseAContactPulse() {
+        var ordinary = order("oak_log", "\"break:minecraft:oak_log\"", "");
+        var anchored = order("oak_log", "\"break:minecraft:oak_log\"",
+            ",\"travelAnchor\":{\"subject\":\"block:minecraft:oak_log\",\"target\":\"trunk-a\"}");
+        var pulse = new AgentVisibleHorizon.Window(null, -90, 0.34, 0.295,
+            AgentVisibleHorizon.Medium.DRY, 1, 0, 0, null, true);
+        assertTrue(AgentMacroControl.rollingWorkAdmits(ordinary, false, null, RESOURCE, false, pulse));
+        assertFalse(AgentMacroControl.rollingWorkAdmits(anchored, true, OAK, RESOURCE, false, pulse));
+        assertFalse(AgentMacroControl.rollingWorkAdmits(anchored, false, null, RESOURCE, false, pulse),
+            "using the exact anchor once does not retroactively authorize a contact pulse");
     }
 
     @Test

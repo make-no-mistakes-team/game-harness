@@ -391,11 +391,70 @@ const wallState = { ...caveState, inventory: { ...caveState.inventory, "minecraf
 
 const visibleTimber = { kind: "resource", subject: "block:minecraft:oak_log", target: "log-a",
   footing: "dry", bearingDegrees: -12, windowBlocks: 0.9 } as const;
+const timberRiser = { kind: "resource", subject: visibleTimber.subject, target: visibleTimber.target,
+  footing: "one_block_grade", bearingDegrees: -12, heightChange: 1 } as const;
 const visibleWoodland = { ...visibleTimber, kind: "woodland_frontier", subject: "landmark:woodland", target: "canopy-a" } as const;
 const timberPolicy = { target: { kind: "stock", item: "minecraft:oak_log", count: 1 },
   allowedEffects: ["break:minecraft:oak_log"], costCaps: [], reserves: [], maxBreaks: 2, maxCrafts: 0, maxPlacements: 0 } as const;
 
-test.each(["direct", "opening", "changed grade", "woodland instead", "exact harvest", "unpriced harvest",
+const oakObstruction = { block: "minecraft:oak_leaves", target: "leaf-a",
+  toward: { subject: visibleTimber.subject, target: visibleTimber.target }, timber: "minecraft:oak_log" } as const;
+
+test.each(["priced", "no leaf grant", "wrong leaf", "no log allowance", "changed leaf", "changed tree", "abstain"] as const)(
+  "A timber obstruction can bind one ordinary stock replan, not a leaf action (%s)", async condition => {
+    const reply = Promise.withResolvers<void>();
+    const requests: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1) return workReply(request, { kind: "work", policy: timberPolicy });
+      await reply.promise;
+      if (condition === "abstain") return workReply(request, { kind: "abstain" });
+      const effect = condition === "wrong leaf" ? "break:minecraft:birch_leaves" : "break:minecraft:oak_leaves";
+      return workReply(request, { kind: "work", policy: { ...timberPolicy,
+        allowedEffects: condition === "no leaf grant" ? timberPolicy.allowedEffects : [...timberPolicy.allowedEffects, effect],
+        maxBreaks: condition === "no log allowance" ? 1 : 2,
+      } });
+    }, "Gather oak logs; one visibly blocking leaf may be removed if needed.", 4);
+    try {
+      await f.observe(16, { stance: 2, travelHint: visibleTimber });
+      await f.actor.poll();
+      const earlier = await f.order();
+      await f.receipt(earlier.id, 18, "accepted");
+      await f.observe(18, { stance: 2, workOrder: { id: earlier.id, state: "working", detail: "Walking toward the witnessed oak." } });
+      await f.receipt(earlier.id, 100, "interrupted", "The witnessed leaf needs one explicit preparatory break.");
+      const blocked = { stance: 3, timberObstruction: oakObstruction,
+        workOrder: { id: earlier.id, state: "blocked", detail: "The witnessed leaf needs one explicit preparatory break." } } as const;
+      await f.observe(101, blocked);
+      expect(requests[1]?.observation.timberObstruction).toEqual(oakObstruction);
+      if (condition === "changed leaf" || condition === "changed tree") {
+        const timberObstruction = condition === "changed leaf" ? { ...oakObstruction, target: "leaf-b" }
+          : { ...oakObstruction, toward: { ...oakObstruction.toward, target: "log-b" } };
+        await f.observe(102, { ...blocked, timberObstruction });
+      }
+      reply.resolve();
+      await f.actor.poll();
+      if (condition === "priced") {
+        const order = await f.order();
+        expect(order).toMatchObject({ maxBreaks: 2, travelAnchor: oakObstruction.toward });
+        expect(new Set(order.allowedEffects)).toEqual(new Set(["break:minecraft:oak_log", "break:minecraft:oak_leaves"]));
+      } else {
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+      }
+      if (condition === "abstain" || condition === "no leaf grant") {
+        await f.observe(250, { ...blocked, opportunities: [{ ...caveSurvey, id: "new-id-same-survey" }] });
+        expect(requests).toHaveLength(2);
+      }
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      expect(f.actor.status().completedReceipts).toBe(0);
+    } finally {
+      reply.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test.each(["direct", "opening", "wade", "one-block step", "woodland instead", "exact harvest", "unpriced harvest",
   "wake", "other log", "lost runway", "unsafe", "unanchored look",
   "witness disappears", "clue used as ID", "yaw jitter"] as const)("A timber job starts only on its scoped live evidence (%s)", async condition => {
   const requests: MacroRequest[] = [];
@@ -440,7 +499,8 @@ test.each(["direct", "opening", "changed grade", "woodland instead", "exact harv
     if (!direct && condition !== "wake") {
       const travelHint = condition === "other log" ? { ...visibleTimber, target: "log-b" } :
         condition === "woodland instead" ? { ...visibleWoodland, target: visibleTimber.target } :
-        condition === "changed grade" ? { ...visibleTimber, footing: "shallow_water_with_bank" as const } : visibleTimber;
+        condition === "wade" ? { ...visibleTimber, footing: "shallow_water_with_bank" as const } :
+        condition === "one-block step" ? timberRiser : visibleTimber;
       const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
       await f.receipt(intent.id, 21, "accepted");
       await f.receipt(intent.id, 26, "completed");
@@ -462,7 +522,8 @@ test.each(["direct", "opening", "changed grade", "woodland instead", "exact harv
           travelAnchor: { subject: travelHint.subject, target: travelHint.target } });
       }
     }
-    if (condition === "direct" || condition === "opening" || condition === "changed grade" || condition === "wake") {
+    if (condition === "direct" || condition === "opening" || condition === "wade"
+        || condition === "one-block step" || condition === "wake") {
       expect(await f.order()).toMatchObject({ origin: "model", ...timberPolicy,
         basisTick: condition === "direct" ? 16 : condition === "wake" ? 21 : 31,
         travelAnchor: { subject: visibleTimber.subject, target: visibleTimber.target } });
@@ -478,6 +539,39 @@ test.each(["direct", "opening", "changed grade", "woodland instead", "exact harv
   } finally {
     reply.resolve();
     freshReply.resolve();
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test("A witnessed timber step starts one bounded job, but landing does not count as pickup", async () => {
+  const requests: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    return workReply(request, { kind: "work", policy: timberPolicy });
+  }, "Approach the visible tree and collect one oak log.", 1);
+  try {
+    await f.observe(16, { stance: 2, travelHint: timberRiser });
+    await f.actor.poll();
+    const order = await f.order();
+    expect(order).toMatchObject({ ...timberPolicy, travelAnchor: { subject: timberRiser.subject, target: timberRiser.target } });
+    await f.receipt(order.id, 17, "accepted");
+    const workOrder = { id: order.id, state: "working", detail: "Landed on the witnessed step; no harvest yet.",
+      progress: { phase: "route", status: "Landed", breaks: 0, crafts: 0, placements: 0 } } as const;
+    await f.observe(35, { stance: 3, workOrder });
+    expect(await f.order()).toEqual(order);
+    expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 0, completedReceipts: 0 });
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    await f.observe(48, { stance: 3, workOrder: { ...workOrder, detail: "Cut the witnessed oak; waiting for its drop.",
+      progress: { ...workOrder.progress, phase: "collect", status: "Waiting for pickup", breaks: 1 } } });
+    expect(await f.order()).toEqual(order);
+    expect(f.actor.status().completedModelWorkOrders).toBe(0);
+    await f.receipt(order.id, 52, "completed");
+    await f.observe(52, { stance: 3, inventory: { [timberPolicy.target.item]: 1 },
+      workOrder: { id: order.id, state: "complete", detail: "Vanilla inventory confirms the pickup." } });
+    expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 1, providerDispatches: 1 });
+    expect(requests).toHaveLength(1);
+  } finally {
     await f.actor.stop();
     await f.clean();
   }

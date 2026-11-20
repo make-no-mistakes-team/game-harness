@@ -58,6 +58,10 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
             return resource(state) && (preset || namedBreak(state));
         }
 
+        boolean timberClearAllowed(BlockState state) {
+            return timberLeaf(state) && namedBreak(state);
+        }
+
         boolean prospectCoverAllowed(BlockState state) {
             return prospectCoverDrop(state) != Items.AIR && (preset
                 ? !target.goal.equals("wooden_pickaxe")
@@ -87,15 +91,14 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         boolean travelAnchorAllowed(String subject, TravelKind kind) {
             if (preset || target.item == null || maxBreaks == 0 || smeltIron() || waterFill()) return false;
             if (kind == TravelKind.RESOURCE) {
-                if (!subject.startsWith("block:")) return false;
+                if (!subject.startsWith("block:") || subject.endsWith("_leaves")) return false;
                 if (diamondProspecting() && !subject.equals("block:minecraft:diamond_ore")
                         && !subject.equals("block:minecraft:deepslate_diamond_ore")) return false;
                 return effects.contains("break:" + subject.substring("block:".length()));
             }
             if (kind == TravelKind.WOODLAND_FRONTIER) {
                 if (!subject.equals(WOODLAND_ANCHOR_SUBJECT)) return false;
-                String stock = Registries.ITEM.getId(target.item).toString();
-                return WOODLAND_STOCK.matcher(stock).matches() && effects.contains("break:" + stock);
+                return woodlandLog(target.item) && effects.contains("break:" + Registries.ITEM.getId(target.item));
             }
             if (!NATURAL_FRONTIERS.contains(subject)) return false;
             if (diamondProspecting())
@@ -133,6 +136,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         int breaksLeft() { return policy.maxBreaks - breaks; }
         boolean canBreak() { return breaksLeft() > 0; }
         boolean canCutCover() { return breaksLeft() > 1; }
+        boolean canOpenTimber(int requiredLogs) { return requiredLogs > 0 && breaksLeft() > requiredLogs; }
         boolean canPlace() { return placementsLeft() > 0; }
         int placementsLeft() { return policy.maxPlacements - placements; }
         int craftsLeft() { return policy.maxCrafts - crafts; }
@@ -379,7 +383,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         String id = effect.substring("break:".length());
         if (!ITEM_ID.matcher(id).matches()) return false;
         BlockState state = Registries.BLOCK.get(Identifier.of(id)).getDefaultState();
-        return resource(state) || prospectCoverDrop(state) != Items.AIR;
+        return resource(state) || timberLeaf(state) || prospectCoverDrop(state) != Items.AIR;
     }
 
     private static Map<Item, Integer> stock(JsonObject value, String field) {
@@ -430,6 +434,15 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     }
 
     static boolean resource(BlockState state) { return harvest(state) != Items.AIR; }
+
+    static boolean timberLeaf(BlockState state) {
+        return state.isOf(Blocks.OAK_LEAVES) || state.isOf(Blocks.SPRUCE_LEAVES) || state.isOf(Blocks.BIRCH_LEAVES)
+            || state.isOf(Blocks.JUNGLE_LEAVES) || state.isOf(Blocks.ACACIA_LEAVES) || state.isOf(Blocks.DARK_OAK_LEAVES)
+            || state.isOf(Blocks.MANGROVE_LEAVES) || state.isOf(Blocks.CHERRY_LEAVES) || state.isOf(Blocks.PALE_OAK_LEAVES)
+            || state.isOf(Blocks.AZALEA_LEAVES) || state.isOf(Blocks.FLOWERING_AZALEA_LEAVES);
+    }
+
+    static boolean woodlandLog(Item item) { return WOODLAND_STOCK.matcher(Registries.ITEM.getId(item).toString()).matches(); }
 
     /** Small, dry surface-cut allowlist. Turf is admitted as cover, not as an exact stock source. */
     static Item prospectCoverDrop(BlockState state) {

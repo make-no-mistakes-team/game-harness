@@ -88,19 +88,21 @@ export interface MacroOpportunity {
 
 const prospectRock = ["minecraft:stone", "minecraft:deepslate", "minecraft:andesite",
   "minecraft:diorite", "minecraft:granite", "minecraft:tuff"] as const;
+const timberObstructionLeaf = /^minecraft:(?:oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|pale_oak|azalea|flowering_azalea)_leaves$/;
 
 export interface MacroTravelAnchor {
   readonly subject: string;
   readonly target: string;
 }
 
-/** A visible goal and its current braking window, not a command, material effect or known return. */
-export interface MacroTravelHint extends MacroTravelAnchor {
+/** A visible goal and its current physical approach evidence, never material authority. */
+export type MacroTravelHint = MacroTravelAnchor & {
   readonly kind: "resource" | "cave_frontier" | "woodland_frontier";
-  readonly footing: "dry" | "shallow_water_with_bank";
   readonly bearingDegrees: number;
-  readonly windowBlocks: number;
-}
+} & (
+  | { readonly footing: "dry" | "shallow_water_with_bank"; readonly windowBlocks: number }
+  | { readonly footing: "one_block_grade"; readonly heightChange: -1 | 1 }
+);
 
 export interface MacroObservation extends MacroBasis {
   readonly v: 1;
@@ -126,6 +128,13 @@ export interface MacroObservation extends MacroBasis {
     readonly target: string;
     readonly tool: string;
     readonly maxToolLoss: 0 | 1;
+  };
+  /** One reachable leaf in the way of an earlier physical approach; not stock, a route or an opportunity ID. */
+  readonly timberObstruction?: {
+    readonly block: string;
+    readonly target: string;
+    readonly toward: MacroTravelAnchor;
+    readonly timber: string;
   };
   readonly travelHint?: MacroTravelHint;
 }
@@ -782,7 +791,7 @@ function parseStartAnchor(record: Record<string, unknown>, field: string): Macro
 export function parseMacroObservation(value: unknown): MacroObservation {
   const record = shape(value, "observation", [
     "v", "run", "life", "tick", "epoch", "goal", "health", "food", "inventory", "opportunities", "recent", "quiescent",
-  ], ["safety", "working", "workOrder", "pendingWork", "stance", "prospectOpening", "travelHint"]);
+  ], ["safety", "working", "workOrder", "pendingWork", "stance", "prospectOpening", "timberObstruction", "travelHint"]);
   const inventory = Object.create(null) as Record<string, number>;
   const entries = Object.entries(object(record.inventory, "inventory"));
   if (entries.length > 128) invalid("inventory");
@@ -923,9 +932,24 @@ export function parseMacroObservation(value: unknown): MacroObservation {
       maxToolLoss,
     });
   }
+  let timberObstruction: MacroObservation["timberObstruction"];
+  if (Object.hasOwn(record, "timberObstruction")) {
+    const raw = shape(record.timberObstruction, "timber obstruction", ["block", "target", "toward", "timber"]);
+    if (record.stance === undefined || !safety?.clear || working || pendingWork || workOrder?.state !== "blocked")
+      invalid("timber obstruction scope");
+    const block = vanillaItem(raw.block, "timber obstruction block");
+    const timber = vanillaItem(raw.timber, "timber obstruction stock");
+    const target = validateMacroId(raw.target, "timber obstruction target");
+    const toward = parseStartAnchor(shape(raw.toward, "timber direction", ["subject", "target"]), "timber direction");
+    if (!timberObstructionLeaf.test(block) || !woodlandStock.test(timber) || target === toward.target ||
+        (toward.subject !== woodlandAnchorSubject && toward.subject !== `block:${timber}`))
+      invalid("timber obstruction association");
+    timberObstruction = Object.freeze({ block, target, toward, timber });
+  }
   let travelHint: MacroTravelHint | undefined;
   if (Object.hasOwn(record, "travelHint")) {
-    const raw = shape(record.travelHint, "travel hint", ["kind", "subject", "target", "footing", "bearingDegrees", "windowBlocks"]);
+    const raw = shape(record.travelHint, "travel hint",
+      ["kind", "subject", "target", "footing", "bearingDegrees"], ["windowBlocks", "heightChange"]);
     if (record.stance === undefined || !safety?.clear || working || pendingWork || workOrder?.state === "working")
       invalid("travel hint scope");
     const anchor = parseStartAnchor(raw, "travel hint");
@@ -936,10 +960,17 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     const { bearingDegrees } = raw;
     if (typeof bearingDegrees !== "number" || !Number.isFinite(bearingDegrees) ||
         Math.abs(bearingDegrees) > 180) invalid("travel hint bearing");
-    const windowBlocks = finite(raw.windowBlocks, "travel hint window", 3);
-    if (windowBlocks <= 0) invalid("travel hint window");
-    travelHint = Object.freeze({ ...anchor, kind, bearingDegrees, windowBlocks,
-      footing: choice(raw.footing, "travel hint footing", ["dry", "shallow_water_with_bank"] as const) });
+    const footing = choice(raw.footing, "travel hint footing", ["dry", "shallow_water_with_bank", "one_block_grade"] as const);
+    if (footing === "one_block_grade") {
+      const { heightChange } = raw;
+      if (Object.hasOwn(raw, "windowBlocks") || (heightChange !== -1 && heightChange !== 1))
+        invalid("travel hint grade");
+      travelHint = Object.freeze({ ...anchor, kind, bearingDegrees, footing, heightChange });
+    } else {
+      const windowBlocks = finite(raw.windowBlocks, "travel hint window", 3);
+      if (windowBlocks <= 0 || Object.hasOwn(raw, "heightChange")) invalid("travel hint window");
+      travelHint = Object.freeze({ ...anchor, kind, bearingDegrees, footing, windowBlocks });
+    }
   }
   return Object.freeze({
     v: version(record.v), ...basis(record), goal: text(record.goal, "goal", 256),
@@ -948,6 +979,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     recent: Object.freeze(bounds(record.recent, "recent", 32).map(entry => text(entry, "recent entry", 512))),
     quiescent: record.quiescent, ...(safety ? { safety } : {}), ...(working ? { working } : {}),
     ...(prospectOpening ? { prospectOpening } : {}), ...(travelHint ? { travelHint } : {}),
+    ...(timberObstruction ? { timberObstruction } : {}),
     ...(workOrder ? { workOrder } : {}), ...(pendingWork ? { pendingWork } : {}),
     ...(Object.hasOwn(record, "stance") ? { stance: whole(record.stance, "stance", 1) } : {}),
   });
@@ -1234,7 +1266,7 @@ export function sameLiveCorrectionScope(source: MacroObservation, current: Macro
     source.epoch === current.epoch && current.health > 0 && current.health >= source.health &&
     current.safety?.clear !== false && current.safety?.revision === source.safety?.revision &&
     !current.working && current.workOrder?.state !== "working" && current.workOrder?.state !== "needs_replan" &&
-    (current.quiescent || current.opportunities.length > 0 || !!current.travelHint);
+    (current.quiescent || current.opportunities.length > 0 || !!current.travelHint || !!current.timberObstruction);
 }
 
 export function liveCorrectionEvidence(observation: MacroObservation): string {
@@ -1243,8 +1275,9 @@ export function liveCorrectionEvidence(observation: MacroObservation): string {
     JSON.stringify(anchor ? [verb, risk, anchor, material] : [verb, summary, risk, evidence, material])).sort();
   const pending = observation.pendingWork;
   const travel = observation.travelHint;
-  return JSON.stringify([observation.quiescent, offers, observation.prospectOpening ?? null,
-    travel ? [travel.kind, travel.subject, travel.target, travel.footing] : null,
+  return JSON.stringify([observation.quiescent, offers, observation.prospectOpening ?? null, observation.timberObstruction ?? null,
+    travel ? [travel.kind, travel.subject, travel.target, travel.footing,
+      travel.footing === "one_block_grade" ? travel.heightChange : null] : null,
     pending ? [pending.id, pending.state, pending.parked, pending.yieldable, !!pending.collectOfferId, !!pending.deferOfferId] : null,
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b))]);
 }

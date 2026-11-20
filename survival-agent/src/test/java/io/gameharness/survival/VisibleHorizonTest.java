@@ -44,6 +44,9 @@ final class VisibleHorizonTest {
         assertTrue(pulse.known() < 0.35);
         assertNull(AgentVisibleHorizon.contactTrace(dry(0.72, 0.50, Vec3d.ZERO), 1, 0));
         assertNull(AgentVisibleHorizon.contactTrace(dry(0.50, 0.50, new Vec3d(0.06, 0, 0)), 1, 0));
+        var ice = new AgentVisibleHorizon.Stance(0.50, 0, 0.50, 0.31, Vec3d.ZERO,
+            0.024, 0.91 * 0.98, false, BlockPos.ORIGIN);
+        assertNull(AgentVisibleHorizon.contactTrace(ice, 1, 0), "low momentum does not authorize an ice pulse");
 
         double diagonal = Math.sqrt(0.5);
         var atTheTrailingCorner = dry(0.13, 0.13, Vec3d.ZERO);

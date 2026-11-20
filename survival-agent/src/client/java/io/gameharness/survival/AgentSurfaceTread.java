@@ -2,6 +2,8 @@ package io.gameharness.survival;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
@@ -11,6 +13,7 @@ import net.minecraft.util.math.Vec3d;
 final class AgentSurfaceTread {
     private static final int PROOF_TICKS = 65;
     private static final int DRIVE_TICKS = 54;
+    static final int ORDINARY_GRADE_TICKS = DRIVE_TICKS + 2;
     // Includes the successful boundary ticks and a fresh post-landing frame.
     static final int ACTION_TICKS = PROOF_TICKS + DRIVE_TICKS + 4;
     record Edge(BlockPos upper, BlockState upperSupport, BlockPos lower, BlockState lowerSupport, Direction down) {}
@@ -22,7 +25,7 @@ final class AgentSurfaceTread {
     private final Direction travel;
     private final Vec3d center, floorAim, nearFloorAim, chestAim, headAim;
     private final BlockPos sourceSupport, landingSupport;
-    private final boolean isolated, witnessedOutbound;
+    private final boolean isolated, witnessedOutbound, ordinaryGrade;
     private final AgentDryCaveRoute.Probe levelProbe;
     private final AgentWalkedRoute.Motion motion = new AgentWalkedRoute.Motion();
     private final long started;
@@ -31,20 +34,45 @@ final class AgentSurfaceTread {
     private AgentSurfaceTread ahead;
 
     AgentSurfaceTread(Edge edge, boolean returning, long started) {
-        this(edge, returning, started, false, false);
+        this(edge, returning, started, false, false, false);
     }
 
     /** The ordinary prospect just re-witnessed this landing and both passage samples. */
     static AgentSurfaceTread witnessedOutbound(Edge edge, long tick) {
-        return new AgentSurfaceTread(edge, false, tick, false, true);
+        return new AgentSurfaceTread(edge, false, tick, false, true, false);
     }
 
-    private AgentSurfaceTread(Edge edge, boolean returning, long started, boolean isolated, boolean witnessedOutbound) {
+    static boolean ordinaryRiseSide(BlockPos from, Direction travel, BlockHitResult hit) {
+        return hit != null && hit.getType() == HitResult.Type.BLOCK && !hit.isInsideBlock()
+            && travel.getAxis().isHorizontal() && hit.getSide() == travel.getOpposite()
+            && hit.getBlockPos().equals(from.offset(travel));
+    }
+
+    /** The caller supplies a freshly lit, full stable top and a mechanically cleared sweep. */
+    static Edge witnessedGradeEdge(BlockPos from, BlockState source, Direction travel, BlockHitResult hit,
+                                   BlockState landing, boolean clearance) {
+        if (!clearance || hit == null || hit.isInsideBlock() || source == null || landing == null
+                || AgentBody.dryCaveDanger(source) || AgentBody.dryCaveDanger(landing)) return null;
+        BlockPos floor = hit.getBlockPos(), to = floor.up();
+        int grade = to.getY() - from.getY();
+        if (Math.abs(grade) != 1 || !cardinalTread(from, to, travel) || !AgentBody.matchesDryRouteTop(hit, floor))
+            return null;
+        return grade > 0 ? new Edge(to, landing, from, source, travel.getOpposite())
+            : new Edge(from, source, to, landing, travel);
+    }
+
+    static AgentSurfaceTread ordinaryGrade(Edge edge, BlockPos from, long tick) {
+        return new AgentSurfaceTread(edge, edge.lower.equals(from), tick, false, true, true);
+    }
+
+    private AgentSurfaceTread(Edge edge, boolean returning, long started, boolean isolated,
+                              boolean witnessedOutbound, boolean ordinaryGrade) {
         this.edge = edge;
         this.returning = returning;
         this.started = started;
         this.isolated = isolated;
         this.witnessedOutbound = witnessedOutbound;
+        this.ordinaryGrade = ordinaryGrade;
         from = returning ? edge.lower : edge.upper;
         to = returning ? edge.upper : edge.lower;
         travel = returning ? edge.down.getOpposite() : edge.down;
@@ -69,7 +97,7 @@ final class AgentSurfaceTread {
         BlockPos upper = up ? to : from, lower = up ? from : to;
         var edge = new Edge(upper, client.world.getBlockState(upper.down()),
             lower, client.world.getBlockState(lower.down()), up ? travel.getOpposite() : travel);
-        return new AgentSurfaceTread(edge, up, tick, true, false);
+        return new AgentSurfaceTread(edge, up, tick, true, false, false);
     }
 
     boolean inFlight() { return drivingSince >= 0; }
@@ -178,7 +206,7 @@ final class AgentSurfaceTread {
         if (drivingSince >= 0 && !motion.observe(player.getX(), player.getY(), player.getZ())) return Result.REFUSED;
         if (drivingSince < 0 ? tick - started > PROOF_TICKS : tick - drivingSince > DRIVE_TICKS) return Result.REFUSED;
         if (!body.hasRecentView()) return drivingSince < 0 ? Result.CHECKING : Result.MOVING;
-        if (isolated && !body.macroNoVisiblePickup(center, Math.min(from.getY(), to.getY()),
+        if ((isolated || ordinaryGrade) && !body.macroNoVisiblePickup(center, Math.min(from.getY(), to.getY()),
                 Math.max(from.getY(), to.getY()) + 0.32)) return Result.REFUSED;
         if (drivingSince < 0) {
             if (!player.isOnGround() || !player.getBlockPos().equals(from)) return Result.REFUSED;
@@ -198,7 +226,7 @@ final class AgentSurfaceTread {
         boolean level = from.getY() == to.getY();
         if (player.getY() < Math.min(from.getY(), to.getY()) - 0.055) return Result.REFUSED;
         if (!level && !reverseClear(client, edge.upper, edge.lower, edge.down)
-                || !body.dryRouteSweep(from, to))
+                || !(ordinaryGrade ? body.ordinaryGradeSweep(from, to) : body.dryRouteSweep(from, to)))
             return drivingSince >= 0 && tick - drivingSince < 5 ? Result.CHECKING : Result.REFUSED;
         if (drivingSince < 0) beginDrive(player.getPos(), tick);
         boolean carry = successor != null && canCarry(client, body, successor, tick);

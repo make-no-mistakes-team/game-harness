@@ -2,6 +2,8 @@ package io.gameharness.survival;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import net.minecraft.util.math.Vec3d;
@@ -87,6 +89,26 @@ final class HorizonMotionTest {
     void contactOnlyPrefixUsesOrdinaryInputAndCoastsWhenTheMarginVanishes() {
         assertEquals(AgentBody.HorizonPace.WALK, AgentBody.horizonPace(0.39, 0.37, 5, false, true));
         assertEquals(AgentBody.HorizonPace.COAST, AgentBody.horizonPace(0.32, 0.37, 5, false, true));
+    }
+
+    @Test
+    void opticalTravelWinsThenOneAuthorizedPulseCanCoastIntoNewOpticalSupport() {
+        var pulse = new AgentVisibleHorizon.ContactPulse();
+        var dry = AgentVisibleHorizon.Medium.DRY;
+        var optical = window(dry, 1.12, 0.30, null);
+        var contact = new AgentVisibleHorizon.Window(null, -90, 0.34, 0.30,
+            dry, 1, 0, 0, null, true);
+
+        assertSame(optical, pulse.choose(optical, contact, -90, Float.NaN,
+            (candidate, yaw, allowWade) -> { throw new AssertionError("don't probe contact when optical can advance"); }));
+        assertSame(contact, pulse.choose(null, contact, -90, Float.NaN, (candidate, yaw, allowWade) -> candidate));
+        pulse.markIssued(contact.frame());
+        assertTrue(pulse.used());
+        assertFalse(pulse.canJoin(contact.frame()));
+        assertTrue(pulse.canJoin(contact.frame() + 1));
+        for (int frame = 2; frame < 8; ++frame)
+            assertNull(pulse.choose(null, contact, -90, Float.NaN, (candidate, yaw, allowWade) -> candidate));
+        assertSame(optical, pulse.choose(optical, contact, -90, Float.NaN, (candidate, yaw, allowWade) -> candidate));
     }
 
     private static AgentVisibleHorizon.Window window(AgentVisibleHorizon.Medium medium,

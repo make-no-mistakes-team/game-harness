@@ -18,6 +18,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -140,6 +141,49 @@ final class DryCaveViewTest {
         fullView.blocks.put(to.down(), stone);
         step.sample(fullView, 31, 2, stone, 31);
         assertTrue(step.complete(31), step::evidence);
+    }
+
+    @Test
+    void anOrdinaryLeafRiserNeedsItsActualFullTopAndTheExistingReverseJumpEnvelope() {
+        var floor = SOURCE.east();
+        var rise = floor.up();
+        var stone = Blocks.STONE.getDefaultState();
+        var leaves = Blocks.OAK_LEAVES.getDefaultState();
+        var view = new ForwardView(35);
+        view.blocks.put(floor, leaves);
+        var side = view.firstTerrainHit(Vec3d.ofCenter(floor, 0.15));
+        assertTrue(AgentSurfaceTread.ordinaryRiseSide(SOURCE, Direction.EAST, side));
+        assertNull(AgentSurfaceTread.witnessedGradeEdge(SOURCE, stone, Direction.EAST, side, leaves, true));
+
+        var top = view.firstTerrainHit(Vec3d.ofBottomCenter(rise).add(0.42, -0.025, 0));
+        var crown = AgentSurfaceTread.reverseJumpHeadroom(rise, 0.6).stretch(-1, 0, 0);
+        var edge = AgentSurfaceTread.witnessedGradeEdge(SOURCE, stone, Direction.EAST, top, leaves, view.sweepClear(crown));
+        assertNotNull(edge);
+        var tread = AgentSurfaceTread.ordinaryGrade(edge, SOURCE, 30);
+        assertEquals(SOURCE, tread.from);
+        assertEquals(rise, tread.to);
+        assertTrue(tread.returning, "a rise uses the existing reverse-jump motor");
+        view.blocks.put(rise.up(2), stone);
+        assertNull(AgentSurfaceTread.witnessedGradeEdge(SOURCE, stone, Direction.EAST, top, leaves, view.sweepClear(crown)),
+            "even a visible landing does not excuse a low ceiling");
+
+        var downward = new ForwardView(43);
+        downward.blocks.remove(floor.down());
+        var oneLower = floor.down(2);
+        downward.blocks.put(oneLower, stone);
+        var lowerTop = downward.firstTerrainHit(Vec3d.ofBottomCenter(oneLower.up()).add(0.42, -0.025, 0));
+        var descent = AgentSurfaceTread.witnessedGradeEdge(SOURCE, stone, Direction.EAST, lowerTop, stone, true);
+        assertNotNull(descent);
+        assertFalse(AgentSurfaceTread.ordinaryGrade(descent, SOURCE, 30).returning);
+
+        downward.blocks.remove(oneLower);
+        var floorTwoDown = floor.down(3);
+        downward.blocks.put(floorTwoDown, stone);
+        var deepTop = downward.firstTerrainHit(Vec3d.ofBottomCenter(floorTwoDown.up()).add(0.42, -0.025, 0));
+        assertTrue(AgentBody.matchesDryRouteTop(deepTop, floorTwoDown));
+        assertNull(AgentSurfaceTread.witnessedGradeEdge(SOURCE, stone, Direction.EAST, deepTop, stone, true));
+        assertNull(AgentSurfaceTread.witnessedGradeEdge(SOURCE, stone, Direction.EAST, top,
+            leaves.with(net.minecraft.state.property.Properties.WATERLOGGED, true), true));
     }
 
     @Test
@@ -558,6 +602,16 @@ final class DryCaveViewTest {
                 }
             }
             return nearest;
+        }
+
+        private BlockHitResult firstTerrainHit(Vec3d point) {
+            if (!visible(point)) return null;
+            BlockPos cell = firstHit(point);
+            if (cell == null) return null;
+            Vec3d hit = new Box(cell).raycast(eye, point).orElseThrow();
+            if (!visible(hit)) return null;
+            Direction side = Math.abs(hit.y - cell.getY() - 1) < 1e-5 ? Direction.UP : Direction.WEST;
+            return new BlockHitResult(hit, side, cell, false);
         }
     }
 }

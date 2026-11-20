@@ -20,7 +20,8 @@ final class AgentVisibleHorizon {
         SURFACE_NOT_RENDERED, SURFACE_RAY_BUDGET, SURFACE_HEIGHT, LEAF_HEIGHT, UNSUITABLE_TOP,
         NO_NEW_SUPPORT, BRAKING_DISTANCE, DRY_BANK_NOT_RENDERED, WATER_NOT_ALLOWED,
         OBSTRUCTION, HAZARD, DEEP_WATER, WATER_FLOW, FLUID_IN_SWEEP,
-        INPUT_UNAVAILABLE, STEERING_ALIGNMENT, INPUT_COASTING, COLLISION_CONTACT, MOTION_INTERRUPTED, PICKUP_VETO;
+        INPUT_UNAVAILABLE, STEERING_ALIGNMENT, INPUT_COASTING, COLLISION_CONTACT, MOTION_INTERRUPTED, PICKUP_VETO,
+        CONTACT_PULSE_SPENT;
 
         final Patch unavailable = new Patch(Medium.UNKNOWN, 0, 0, this);
         final String key = name().toLowerCase(Locale.ROOT);
@@ -41,6 +42,7 @@ final class AgentVisibleHorizon {
     private static final double WATER_DRAG = 0.8;
     private static final double CONTACT_CORE = 0.18;
     private static final double CONTACT_LIMIT = 0.34;
+    private static final double CONTACT_MAX_DRAG = 0.91 * 0.6;
     private static final float TANGENT = 27;
     private static final float MAX_TANGENT = 39;
 
@@ -99,8 +101,22 @@ final class AgentVisibleHorizon {
         W check(C context, float yaw, boolean allowWade);
     }
 
+    /** One walk tick; neither inspecting another frame nor checking an arc consumes it. */
+    static final class ContactPulse {
+        private long issuedFrame = -1;
+
+        <C, W> W choose(W optical, C context, float direct, float blocked, BearingCheck<C, W> contact) {
+            return optical != null || used() ? optical : tryBearing(direct, blocked, context, false, contact);
+        }
+
+        void markIssued(long frame) { issuedFrame = frame; }
+        boolean used() { return issuedFrame >= 0; }
+        boolean canJoin(long frame) { return frame > issuedFrame; }
+    }
+
     private final AgentBody body;
     private final BearingCheck<Target, Window> checkedWindow = this::checkedWindow;
+    private final BearingCheck<Target, Window> checkedContact = (target, yaw, dry) -> checkedContactWindow(target, yaw);
     private final PatchCache patches = new PatchCache();
     private final BlockHitResult[] witnesses = new BlockHitResult[8];
     private final Target[] targets = new Target[witnesses.length];
@@ -173,9 +189,11 @@ final class AgentVisibleHorizon {
         }
     }
 
-    void reportPreview() {
+    void reportPreview(boolean grade) {
         previewing = false;
-        if (previewWindow != null && previewRefusal != Refusal.ANCHOR_UNAVAILABLE) {
+        if (grade) {
+            preview.report("offered_one_block_grade", body.renderedFrame(), Double.NaN, Double.NaN, previewRefusals, false);
+        } else if (previewWindow != null && previewRefusal != Refusal.ANCHOR_UNAVAILABLE) {
             preview.report(previewTangent ? "offered_tangent" : "offered_direct",
                 previewWindow.frame, previewWindow.knownDistance, previewWindow.brakingDistance, previewRefusals, false);
         } else {
@@ -194,7 +212,8 @@ final class AgentVisibleHorizon {
         long details = failedSelection ? refusals : 0;
         double offered = window == null ? failedSelection ? known : Double.NaN : window.knownDistance;
         double stopping = window == null ? failedSelection ? braking : Double.NaN : window.brakingDistance;
-        drive.report(stage == null ? "issued" : stage.key, body.renderedFrame(), offered, stopping,
+        drive.report(stage == null ? window.contactOnly ? "contact_pulse_issued" : "issued" : stage.key,
+            body.renderedFrame(), offered, stopping,
             stage == null ? 0 : details | stage.bit, terminal);
     }
 
@@ -236,8 +255,7 @@ final class AgentVisibleHorizon {
 
     Window window(Target target, boolean allowWade) {
         if (!prepare(target)) return null;
-        Vec3d feet = memoView.feet(), point = target.point();
-        float direct = (float) Math.toDegrees(Math.atan2(feet.x - point.x, point.z - feet.z));
+        float direct = currentBearing(target);
         Window window = select(direct, Float.NaN, target, allowWade, Float.NaN, checkedWindow);
         if (window != null && previewing) {
             previewWindow = window;
@@ -246,12 +264,29 @@ final class AgentVisibleHorizon {
         return window;
     }
 
-    Window window(Target target, boolean allowWade, float previous, float blocked, float direct) {
-        return prepare(target) ? select(direct, previous, target, allowWade, blocked, checkedWindow) : null;
+    Window workWindow(Target target, boolean allowWade, float previous, float blocked, float direct,
+                      ContactPulse pulse, boolean allowNewPulse) {
+        if (!prepare(target)) return null;
+        if (pulse != null && !pulse.canJoin(memoView.frame())) return reject(Refusal.CONTACT_PULSE_SPENT, null);
+        Window optical = select(direct, previous, target, allowWade, blocked, checkedWindow);
+        return pulse == null || !allowNewPulse ? optical : pulse.choose(optical, target, direct, blocked, checkedContact);
     }
 
     Window window(Target target, float yaw) {
         return prepare(target) ? checkedWindow(target, yaw, true) : null;
+    }
+
+    Window contactWindow(Target target) {
+        return prepare(target) ? checkedContactWindow(target, currentBearing(target)) : null;
+    }
+
+    Window contactWindow(Target target, float yaw) {
+        return prepare(target) ? checkedContactWindow(target, yaw) : null;
+    }
+
+    private float currentBearing(Target target) {
+        Vec3d feet = memoView.feet(), point = target.point();
+        return (float) Math.toDegrees(Math.atan2(feet.x - point.x, point.z - feet.z));
     }
 
     static <C, W> W select(float direct, float previous, C context, boolean allowWade, float blocked,
@@ -359,6 +394,26 @@ final class AgentVisibleHorizon {
             view.ageTicks(), view.displacement(), bank, false);
     }
 
+    private Window checkedContactWindow(Target target, float yaw) {
+        var view = memoView;
+        var stance = memoStance;
+        if (!body.horizonPulseAvailable(stance.contact)) return reject(Refusal.CONTACT_PULSE_SPENT, null);
+        if (!Float.isFinite(yaw) || !body.horizonBearingInView(view, yaw))
+            return reject(Refusal.OUTSIDE_RENDERED_BEARING, null);
+        double radians = Math.toRadians(yaw);
+        double dx = -Math.sin(radians), dz = Math.cos(radians);
+        if (dx * (target.point().x - stance.x) + dz * (target.point().z - stance.z) <= 0.05)
+            return reject(Refusal.NO_GOAL_GRADE_OR_MATERIAL_FACE, null);
+        Track local = contactTrace(stance, dx, dz);
+        if (local == null) return reject(stance.wet ? Refusal.WATER_NOT_ALLOWED : Refusal.BRAKING_DISTANCE, null);
+        if (target.frame() != view.frame() && target(target.hit()) == null)
+            return reject(Refusal.TARGET_NOT_RENDERED, null);
+        Refusal veto = body.horizonSweep(dx, dz, local.sideDrift, local.braking - MARGIN, local.braking, Medium.DRY);
+        if (veto != null) return reject(veto, local);
+        return new Window(target, yaw, local.known, local.braking, Medium.DRY, view.frame(),
+            view.ageTicks(), view.displacement(), null, true);
+    }
+
     static boolean advancesBeyondContact(Stance stance, Track track, double dx, double dz) {
         double distance = track.known - MARGIN;
         int x = MathHelper.floor(stance.x), z = MathHelper.floor(stance.z);
@@ -399,7 +454,7 @@ final class AgentVisibleHorizon {
      * rest of the body still participates in the collision and fluid veto.
      */
     static Track contactTrace(Stance stance, double dx, double dz) {
-        if (stance.wet || stance.contact == null) return null;
+        if (stance.wet || stance.contact == null || stance.drag > CONTACT_MAX_DRAG) return null;
         double along = stance.velocity.x * dx + stance.velocity.z * dz;
         if (along < -0.01) return null;
         double coast = 1 / (1 - stance.drag);
@@ -410,7 +465,7 @@ final class AgentVisibleHorizon {
         double known = Math.min(CONTACT_LIMIT, Math.min(
             contactLimit(stance.x, dx, -dz * side, stance.contact.getX(), radius),
             contactLimit(stance.z, dz, dx * side, stance.contact.getZ(), radius)));
-        return known >= braking ? new Track(known, braking, Medium.DRY, 0, side, null) : null;
+        return known > braking ? new Track(known, braking, Medium.DRY, 0, side, null) : null;
     }
 
     private static double contactLimit(double origin, double axis, double drift, int tile, double radius) {

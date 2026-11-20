@@ -1,20 +1,27 @@
-import { expect, test } from "bun:test";
-import { access, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
+import { access, mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { SurvivalMacroController } from "../src/server/survival-macro/controller.ts";
+import { createTrustedFrameCapture } from "../src/server/survival-macro/compose.ts";
+import { SurvivalMacroController, type SurvivalMacroConfig } from "../src/server/survival-macro/controller.ts";
 import { hasConfirmedTerraEffect } from "../src/shared/survival-agent-ui.ts";
 import {
-  parseMacroIntent, parseMacroPlanning, type MacroBasis, type MacroIntent, type MacroObservation, type MacroOpportunity,
+  MacroDirectory, MacroObservationRotating, parseMacroIntent, parseMacroPlanning,
+  type MacroBasis, type MacroInference, type MacroIntent, type MacroObservation, type MacroOpportunity,
   type MacroProposal, type MacroRequest, type MacroStrategist,
 } from "../src/server/survival-macro/protocol.ts";
 
-async function fixture(confirmNativeExit?: () => Promise<boolean>, strategist?: MacroStrategist, maxRequests = 1) {
+async function fixture(
+  confirmNativeExit?: () => Promise<boolean>, strategist?: MacroStrategist, maxRequests = 1,
+  frameFor?: (dir: string) => SurvivalMacroConfig["frame"],
+) {
   const dir = await mkdtemp(path.join(tmpdir(), "survival-macro-controller-"));
   const run = path.basename(dir);
   const actor = new SurvivalMacroController({
     runDir: dir, run, strategy: "terra", confirmNativeExit, limits: { maxRequests, pollMs: 1_000, maxObservationAgeMs: 10_000 },
+    frame: frameFor?.(dir),
     strategist: strategist ?? (async ({ observation: { run, life, tick, epoch } }) => ({
       basis: { run, life, tick, epoch }, model: "test-strategist", outcome: "completed",
       costUsd: null, usage: null, dispatched: false,
@@ -90,6 +97,312 @@ function workReply(request: MacroRequest, action: MacroProposal["action"], ttl =
     },
   };
 }
+
+const captureJpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAAf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AH//Z", "base64");
+const captureHash = createHash("sha256").update(captureJpeg).digest("hex");
+
+test.each(["stable", "unavailable", "newer tick", "new life", "display lost", "not dispatched"] as const)(
+  "A live camera request with %s admits only an owned, exact-basis frame",
+  async condition => {
+    let owned = true;
+    let shots = 0;
+    let beforeBytes: (() => Promise<void>) | undefined;
+    const requests: MacroRequest[] = [];
+    const f = await fixture(async () => true, async request => {
+      requests.push(request);
+      // The private archive must already exist when the strategist receives bytes.
+      const files = await readdir(archive);
+      if (request.frame) expect(await readFile(path.join(archive, files[0]!))).toEqual(captureJpeg);
+      return {
+        ...workReply(request, { kind: "abstain" }),
+        dispatched: condition !== "not dispatched",
+        frameSha256: condition !== "not dispatched" && request.frame ? captureHash : undefined,
+      };
+    }, 1, dir => createTrustedFrameCapture({
+      dir, width: 1, height: 1, signal: new AbortController().signal,
+      assertDisplay: () => { if (!owned) throw new Error("Private display no longer owned."); },
+      readJpeg: async () => {
+        shots++;
+        await beforeBytes?.();
+        return condition === "unavailable" ? { cause: "unavailable", failure: "empty_output" } : { bytes: captureJpeg };
+      },
+    }));
+    const archive = f.file("../macro-frames");
+    beforeBytes = async () => {
+      if (condition === "newer tick") await f.publish("observation.json", f.observation(11));
+      if (condition === "new life") await f.publish("observation.json", f.observation(11, 2, 6));
+      if (condition === "display lost") owned = false;
+    };
+    try {
+      await mkdir(archive, { mode: 0o700 });
+      await f.publish("observation.json", f.observation(10));
+      const until = performance.now() + 1_000;
+      do {
+        await f.actor.poll();
+        const status = f.actor.status();
+        if (status.state === "faulted" || (status.requests && !status.unreportedDispatches)) break;
+        await delay(10);
+      } while (performance.now() < until);
+      expect(shots).toBe(1);
+      expect(f.actor.status().state).not.toBe("faulted");
+      expect(f.actor.status()).toMatchObject({ requests: 1, unreportedDispatches: 0 });
+      await f.actor.stop();
+      const proposals = (await readFile(f.file("proposals.jsonl"), "utf8")).split("\n").filter(Boolean).map(line => JSON.parse(line));
+      expect(proposals).toHaveLength(1);
+      expect(proposals[0].frameSha256).toBe(condition === "stable" ? captureHash : null);
+      if (condition === "new life") {
+        expect(proposals[0]).toMatchObject({ basis: { life: 1, epoch: 5, tick: 10 },
+          dispatched: false, disposition: "stale", proposal: null });
+      }
+      if (condition === "new life" || condition === "display lost") expect(requests).toHaveLength(0);
+      else expect(requests).toHaveLength(1);
+      if (condition === "stable" || condition === "not dispatched") {
+        expect(requests[0]?.frame).toMatchObject({ run: f.run, life: 1, epoch: 5, tick: 10, data: captureJpeg });
+        expect(requests[0]?.frame?.artifact).toBeUndefined();
+      } else {
+        expect(requests[0]?.frame).toBeUndefined();
+      }
+      expect(await readdir(archive)).toHaveLength(condition === "stable" ? 1 : 0);
+      if (condition === "newer tick" || condition === "unavailable") {
+        const history = (await readFile(f.file("history.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+        expect(history).toContainEqual(expect.objectContaining({
+          event: "request_frame_omitted", cause: condition === "newer tick" ? "basis_changed" : "unavailable",
+          ...(condition === "unavailable" ? { failure: "empty_output" } : {}),
+        }));
+        expect(requests[0]?.observation.tick).toBe(10);
+      }
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+const xvfbTools = Object.fromEntries(["xvfb-run", "Xvfb", "xauth", "xsetroot", "scrot", "ffmpeg"]
+  .map(name => [name, Bun.which(name, { PATH: "/usr/bin:/bin" })]));
+const scrotVersion = xvfbTools.scrot && /\bscrot version (\d+)\.(\d+)\b/.exec(
+  Bun.spawnSync([xvfbTools.scrot, "--version"], { stderr: "ignore" }).stdout.toString(),
+);
+
+test.skipIf(!Object.values(xvfbTools).every(Boolean) || !scrotVersion ||
+  !(+scrotVersion[1]! > 1 || (+scrotVersion[1]! === 1 && +scrotVersion[2]! >= 10)))(
+  "Production scrot archives the real pixels of an owned private Xvfb",
+  async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "private-frame-xvfb-"));
+    try {
+      const authority = path.join(dir, "Xauthority");
+      await writeFile(authority, "", { flag: "wx", mode: 0o600 });
+      const worker = Bun.spawn([
+        xvfbTools["xvfb-run"]!, "-a", "-f", authority,
+        "-s", `-screen 0 1280x720x24 -nolisten tcp -noreset -auth ${authority}`,
+        process.execPath, "--no-env-file", path.join(import.meta.dir, "helpers/survival-frame-xvfb.fixture.ts"),
+        xvfbTools.Xvfb!, xvfbTools.xsetroot!, xvfbTools.ffmpeg!,
+      ], { cwd: dir, env: { PATH: "/usr/bin:/bin", HOME: dir, LANG: "C.UTF-8" }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+      const [exit, stdout, stderr] = await Promise.all([
+        worker.exited, new Response(worker.stdout).text(), new Response(worker.stderr).text(),
+      ]);
+      expect({ exit, stdout: stdout.trim(), stderr }).toEqual({ exit: 0, stdout: "owned-visual-frame", stderr: "" });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+const bucketStock = {
+  inventory: { "minecraft:iron_ingot": 3, "minecraft:iron_pickaxe": 1 },
+  opportunities: [{ id: "o-7", verb: "interact", risk: "guarded",
+    summary: "Open visible minecraft:crafting_table", evidence: "A lit workstation face is inside vanilla use reach." }],
+} as const;
+
+function invalidBucketReply(request: MacroRequest): MacroInference {
+  return { ...workReply(request, { kind: "abstain" }), outcome: "invalid", proposal: null, invalidReply: "guarded_opportunity" };
+}
+
+test("An invalid constrained reply gets one fresh correction to craft a bucket at the witnessed table", async () => {
+  const requests: MacroRequest[] = [];
+  const reserves = [{ item: "minecraft:iron_pickaxe", count: 1 }];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    if (requests.length === 1) return workReply(request, { kind: "work", policy: { ...ironPolicy, reserves } });
+    if (requests.length === 2) return invalidBucketReply(request);
+    return workReply(request, { kind: "work", policy: {
+      target: { kind: "stock", item: "minecraft:bucket", count: 1 },
+      allowedEffects: ["craft:bucket"],
+      costCaps: [{ item: "minecraft:iron_ingot", count: 3 }],
+      reserves,
+      maxBreaks: 0, maxCrafts: 1, maxPlacements: 0,
+    } });
+  }, "Prepare a bucket without spending the iron pickaxe.", 3);
+  try {
+    await f.observe(100, { goal: "diamond", inventory: {
+      [ironItem]: 1, [rawIronItem]: 2, [fuelItem]: 2, [furnaceItem]: 1, "minecraft:iron_pickaxe": 1,
+    } });
+    await f.actor.poll();
+    const furnace = await f.order();
+    await f.receipt(furnace.id, 104, "accepted");
+    await f.receipt(furnace.id, 749, "completed");
+    const table = { ...bucketStock, goal: "diamond", workOrder: {
+      id: furnace.id, state: "complete", detail: "Collected the two furnace-produced iron ingots.",
+    } } satisfies Partial<MacroObservation>;
+
+    await f.observe(1136, table);
+    await f.actor.poll();
+    await f.observe(1215, table);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.work).toMatchObject({ demand: "outcome", current: null });
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+
+    await f.observe(1216, table);
+    expect(requests).toHaveLength(3);
+    expect(requests[2]).toMatchObject({
+      observation: { tick: 1216, ...bucketStock },
+      feedback: { kind: "invalid_reply", detail: expect.stringContaining("guarded") },
+      work: { demand: "outcome", current: null, lastOutcome: { receipt: { id: furnace.id, tick: 749, status: "completed" } } },
+      lastReceipt: null,
+    });
+    await f.actor.poll();
+    expect(await f.order()).toMatchObject({
+      basisTick: 1216, target: { item: "minecraft:bucket", count: 1 }, allowedEffects: ["craft:bucket"],
+      reserves: [{ item: "minecraft:iron_pickaxe", count: 1 }],
+    });
+    expect(f.actor.status()).toMatchObject({ requests: 3, providerDispatches: 3, completedWorkOrders: 1 });
+    expect(await readFile(f.file("proposals.jsonl"), "utf8")).toContain('"proposal":null');
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test.each(["invalid", "malformed", "abstain", "gap", "incomplete"] as const)(
+  "A repeated %s reply cannot spin queries on unchanged native stock",
+  async outcome => {
+    const requests: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (outcome === "abstain") return workReply(request, { kind: "abstain" });
+      if (outcome === "gap") return workReply(request, { kind: "gap", capability: "No useful supported action" });
+      if (outcome === "incomplete") return { ...invalidBucketReply(request), invalidReply: undefined };
+      if (outcome === "malformed") return {
+        ...workReply(request, { kind: "abstain" }), proposal: { action: "raw-private-provider-content" },
+      };
+      return invalidBucketReply(request);
+    }, "Prepare a bucket.", 8);
+    try {
+      await f.observe(10, bucketStock);
+      await f.observe(100, bucketStock);
+      await f.observe(200, bucketStock);
+      await f.observe(300, { ...bucketStock, opportunities: [{ ...bucketStock.opportunities[0], id: "o-8" }] });
+      expect(requests).toHaveLength(outcome === "invalid" || outcome === "abstain" || outcome === "malformed" ? 2 : 1);
+      if (outcome === "abstain") expect(requests[1]?.feedback).toBeUndefined(); // Native offer change, not schema repair.
+      if (outcome === "malformed") {
+        expect(requests[1]?.feedback?.detail).toContain("Invalid survival macro field: proposal.");
+        expect(await readFile(f.file("proposals.jsonl"), "utf8")).not.toContain("raw-private-provider-content");
+        expect(await readFile(f.file("history.jsonl"), "utf8")).not.toContain("raw-private-provider-content");
+      }
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test.each([
+  { opportunities: [] },
+  { safety: { clear: false, revision: 2 } },
+  { life: 2, epoch: 2, health: 0 },
+] satisfies Partial<MacroObservation>[])("A closed table decision (%j) cannot reuse invalid-reply feedback", async closed => {
+  const requests: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    return invalidBucketReply(request);
+  }, "Prepare a bucket.", 8);
+  try {
+    await f.observe(10, bucketStock);
+    await f.actor.poll();
+    await f.observe(90, { ...bucketStock, ...closed });
+    await f.observe(190, { ...bucketStock, ...closed });
+    expect(requests).toHaveLength(1);
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test.each(["stop", "request budget"] as const)("Invalid reply correction cannot bypass %s", async fence => {
+  const f = await durableFixture(async request => invalidBucketReply(request), "Prepare a bucket.", fence === "stop" ? 4 : 1);
+  try {
+    await f.observe(10, bucketStock);
+    await f.actor.poll();
+    if (fence === "stop") await f.actor.stop();
+    else await f.observe(100, bucketStock);
+    expect(f.actor.status()).toMatchObject({ requests: 1, providerDispatches: 1, issued: 0, issuedWorkOrders: 0 });
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test("An invalid policy reply does not use a correction to replace accepted native work", async () => {
+  const f = await durableFixture(async request => invalidBucketReply(request), undefined, 4);
+  try {
+    await f.observe(10);
+    const incumbent = await f.order();
+    await f.receipt(incumbent.id, 11, "accepted");
+    const working = { id: incumbent.id, state: "working", detail: "A native lease is still underway." } as const;
+    await f.observe(12, { ...bucketStock, workOrder: working });
+    await f.observe(100, { ...bucketStock, workOrder: working });
+    await f.observe(200, { ...bucketStock, workOrder: working });
+    expect(f.actor.status()).toMatchObject({ requests: 1, providerDispatches: 1, issued: 0, issuedWorkOrders: 1 });
+    expect(await f.order()).toEqual(incumbent);
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test("Rotated observation IPC defers both settlement and an uncharged correction preflight", async () => {
+  const requests: MacroRequest[] = [];
+  let rotateDispatch = true;
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    if (requests.length === 1) return invalidBucketReply(request);
+    if (rotateDispatch) {
+      rotateDispatch = false;
+      return { ...invalidBucketReply(request), dispatched: false, outcome: "stale", invalidReply: undefined, observationRotating: true };
+    }
+    return workReply(request, { kind: "abstain" });
+  }, "Prepare a bucket.", 2);
+  const read = MacroDirectory.prototype.read;
+  let rotatePoll = false;
+  const mocked = spyOn(MacroDirectory.prototype, "read").mockImplementation(function (this: MacroDirectory, name, parse) {
+    if (name === "observation.json" && rotatePoll) {
+      rotatePoll = false;
+      return Promise.reject(new MacroObservationRotating());
+    }
+    return read.call(this, name, parse);
+  } as typeof read);
+  try {
+    await f.observe(10, bucketStock);
+    rotatePoll = true;
+    await f.observe(100, bucketStock);
+    expect(requests).toHaveLength(1);
+    await f.actor.poll();
+    expect(requests).toHaveLength(2);
+    await f.observe(101, bucketStock);
+    await f.observe(102, bucketStock);
+    expect(requests.map(request => request.observation.tick)).toEqual([10, 100, 101]);
+    expect(f.actor.status()).toMatchObject({ requests: 2, providerDispatches: 2, unreportedDispatches: 0 });
+  } finally {
+    mocked.mockRestore();
+    await f.actor.stop();
+    await f.clean();
+  }
+});
 
 test("An admitted preset works during a paid request and an equivalent authorization leaves the job untouched", async () => {
   const request = Promise.withResolvers<MacroRequest>();

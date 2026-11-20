@@ -7,7 +7,9 @@ client plays toward a resource goal or a Nether portal in a new Normal Survival
 world. It uses the installed Minecraft Java 1.21.4 client and the project's
 existing server download and EULA consent. Sign in with the official Launcher
 before starting. On Linux it also needs Xvfb, xauth, FFmpeg with x11grab and
-libx264, Bun, and JDK 21.
+libx264, Bun, and JDK 21. Terra uses `scrot` 1.10 or newer from `/usr/bin` or
+`/bin` for faster request-time screenshots when available; otherwise it uses
+FFmpeg. The run recorder still requires FFmpeg.
 
 ```sh
 # Select JDK 21 in JAVA_HOME, then run from the checkout root.

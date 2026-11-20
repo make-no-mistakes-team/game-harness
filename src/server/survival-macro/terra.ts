@@ -13,10 +13,11 @@ import {
 import { episodeMatchesBasis } from "./episode-memory.ts";
 import {
   MACRO_CAPABILITIES_VERSION, MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
-  MACRO_MAX_STRATEGIC_EPISODES, MACRO_MAX_WORK_STAGES, hasDirectAuthority, parseMacroProposal, validateMacroId,
+  MACRO_MAX_STRATEGIC_EPISODES, MACRO_MAX_WORK_STAGES, MacroObservationRotating, MacroValidationError,
+  hasDirectAuthority, parseMacroProposal, validateMacroId,
   MACRO_FURNACE_PLACEMENT, MACRO_IRON_SMELT, MACRO_LIVE_EFFECT_PATTERN, MACRO_PROGRAM_EFFECT_PATTERN,
   NATIVE_REVIEW_MAX_BYTES, NATIVE_REVIEW_MAX_FILE_BYTES, NATIVE_REVIEW_PATHS,
-  type MacroBasis, type MacroFrame, type MacroInference, type MacroRequest, type MacroStrategist,
+  type MacroBasis, type MacroFrame, type MacroInference, type MacroProposal, type MacroReplyRejection, type MacroRequest, type MacroStrategist,
 } from "./protocol.ts";
 
 const PROVIDER = "openai-codex";
@@ -150,7 +151,7 @@ export interface TerraOptions {
   readonly signal: AbortSignal;
   readonly requestTimeoutMs: number;
   readonly assertDispatch?: (basis: MacroBasis, lookaheadBasis?: MacroRequest["observation"],
-    workBasis?: MacroRequest["observation"]) => boolean | void | Promise<boolean | void>;
+    workBasis?: MacroRequest["observation"], correctionBasis?: MacroRequest["observation"]) => boolean | void | Promise<boolean | void>;
   readonly onProviderDispatch?: (event: TerraProviderMoment & { readonly basis: MacroBasis }) => void;
   readonly onProviderSettled?: (event: TerraProviderMoment & Partial<TerraProviderTerminal> & {
     readonly basis: MacroBasis;
@@ -181,14 +182,15 @@ function sameBasis(a: MacroBasis, b: MacroBasis): boolean {
 }
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-function frameDimensions(bytes: Buffer, mimeType: MacroFrame["mimeType"]): readonly [number, number] | undefined {
+export function frameDimensions(bytes: Buffer, mimeType: MacroFrame["mimeType"]): readonly [number, number] | undefined {
   if (mimeType === "image/png") {
     if (bytes.length >= 33 && bytes.subarray(0, 8).equals(PNG_SIGNATURE) &&
         bytes.readUInt32BE(8) === 13 && bytes.toString("ascii", 12, 16) === "IHDR")
       return [bytes.readUInt32BE(16), bytes.readUInt32BE(20)];
     return;
   }
-  if (mimeType !== "image/jpeg" || bytes.length < 12 || bytes.readUInt16BE(0) !== 0xffd8) return;
+  if (mimeType !== "image/jpeg" || bytes.length < 12 || bytes.readUInt16BE(0) !== 0xffd8 ||
+      bytes.readUInt16BE(bytes.length - 2) !== 0xffd9) return;
   for (let offset = 2; offset + 4 <= bytes.length;) {
     if (bytes[offset++] !== 0xff) return;
     while (offset < bytes.length && bytes[offset] === 0xff) offset++;
@@ -342,63 +344,74 @@ function usageFor(message: AssistantMessage, reported?: { input: number; output:
     ? { input, output, cacheRead, cacheWrite, totalTokens } : null;
 }
 
-function proposalFor(raw: string | undefined, request: MacroRequest, basis: MacroBasis): MacroInference["proposal"] {
-  if (!raw || Buffer.byteLength(raw) > request.maxResponseBytes) return null;
+function proposalFor(raw: string | undefined, request: MacroRequest, basis: MacroBasis): MacroProposal | MacroReplyRejection {
+  if (!raw) return "missing_arguments";
+  if (Buffer.byteLength(raw) > request.maxResponseBytes) return "argument_bytes";
+  // The SDK can repair partial tool JSON for display. Only exact terminal
+  // wire arguments can produce a gameplay proposal.
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { return "argument_json"; }
+  let proposal: MacroProposal;
   try {
-    // The SDK can repair partial tool JSON for display. Only exact terminal
-    // wire arguments can produce a gameplay proposal.
-    const proposal = parseMacroProposal(JSON.parse(raw));
-    const action = proposal.action;
-    const maxTtl = action.kind === "skill" ? request.maxPlanTtlTicks : request.maxIntentTtlTicks;
-    if (proposal.expiresTick <= basis.tick || proposal.expiresTick - basis.tick > maxTtl) return null;
-    if (request.lookahead) {
-      return action.kind === "abstain" || (action.kind === "successor" &&
-        action.afterIntentId === request.lookahead.predecessor.intentId &&
-        request.lookahead.candidates.some(offer => offer.id === action.opportunityId)) ? proposal : null;
-    }
-    if (action.kind === "successor") return null;
-    if (action.kind === "work" || action.kind === "work-program") {
-      if (!request.work || (action.afterWorkId &&
-          (request.work.current?.id !== action.afterWorkId || !request.work.current.accepted))) return null;
-      const targets = action.kind === "work" ? [action.policy.target] : action.stages.map(stage => stage.policy.target);
-      return targets.every(target => target.kind !== "preset" || target.goal === request.observation.goal) ? proposal : null;
-    }
-    if (action.kind === "revoke-work") return request.work?.current?.id === action.workOrderId ? proposal : null;
-    if (request.work?.current && action.kind !== "gap" && action.kind !== "abstain") return null;
-    if (action.kind === "opportunity" && !request.observation.opportunities.some(offer => offer.id === action.opportunityId &&
-        (request.work?.mode !== "constrained" || offer.risk !== "guarded"))) return null;
-    if (action.kind === "continuation" && (request.work?.mode === "constrained" ||
-        !hasDirectAuthority(action, request.observation, request.capabilitiesVersion))) return null;
-    if (action.kind === "skill" && (action.candidate.parentGeneration !== request.skillGeneration ||
-        !action.candidate.verbs.every(verb => request.skillVerbs?.includes(verb)))) return null;
-    if (action.kind === "selected-skill" && !request.selectedSkillHash) return null;
-    if (action.kind === "gap" && action.reviewPatch && !request.nativeReview) return null;
-    if (action.kind === "tested-skill") {
-      const skill = request.testedSkills?.find(({ hash }) => hash === action.skillHash);
-      if (!skill || !request.observation.opportunities.some(offer =>
-        offer.verb === skill.verb && (offer.risk === "read" || offer.risk === "low"))) return null;
-    }
-    return proposal;
-  } catch {
-    return null;
+    proposal = parseMacroProposal(value);
+  } catch (error) {
+    return error instanceof MacroValidationError ? error : "schema";
   }
+  const { action } = proposal;
+  const maxTtl = action.kind === "skill" ? request.maxPlanTtlTicks : request.maxIntentTtlTicks;
+  if (proposal.expiresTick <= basis.tick || proposal.expiresTick - basis.tick > maxTtl) return "expiry";
+  if (request.lookahead) {
+    return action.kind === "abstain" || (action.kind === "successor" &&
+      action.afterIntentId === request.lookahead.predecessor.intentId &&
+      request.lookahead.candidates.some(offer => offer.id === action.opportunityId)) ? proposal : "successor";
+  }
+  if (action.kind === "successor") return "successor";
+  if (action.kind === "work" || action.kind === "work-program") {
+    if (!request.work) return "work_unavailable";
+    if (action.afterWorkId &&
+        (request.work.current?.id !== action.afterWorkId || !request.work.current.accepted)) return "wrong_work_id";
+    const targets = action.kind === "work" ? [action.policy.target] : action.stages.map(stage => stage.policy.target);
+    return targets.every(target => target.kind !== "preset" || target.goal === request.observation.goal) ? proposal : "wrong_preset_goal";
+  }
+  if (action.kind === "revoke-work") return request.work?.current?.id === action.workOrderId ? proposal : "wrong_work_id";
+  if (request.work?.current && action.kind !== "gap" && action.kind !== "abstain") return "active_work";
+  if (action.kind === "opportunity") {
+    const offer = request.observation.opportunities.find(offer => offer.id === action.opportunityId);
+    if (!offer) return "missing_opportunity";
+    if (request.work?.mode === "constrained" && offer.risk === "guarded") return "guarded_opportunity";
+  }
+  if (action.kind === "continuation" && (request.work?.mode === "constrained" ||
+      !hasDirectAuthority(action, request.observation, request.capabilitiesVersion))) return "continuation";
+  if (action.kind === "skill" && (action.candidate.parentGeneration !== request.skillGeneration ||
+      !action.candidate.verbs.every(verb => request.skillVerbs?.includes(verb)))) return "candidate";
+  if (action.kind === "selected-skill" && !request.selectedSkillHash) return "selected_skill";
+  if (action.kind === "gap" && action.reviewPatch && !request.nativeReview) return "review_patch";
+  if (action.kind === "tested-skill") {
+    const skill = request.testedSkills?.find(({ hash }) => hash === action.skillHash);
+    if (!skill || !request.observation.opportunities.some(offer =>
+      offer.verb === skill.verb && (offer.risk === "read" || offer.risk === "low"))) return "tested_skill";
+  }
+  return proposal;
 }
 
 type Exchange<T> = Omit<FirstPlanInference, "stage" | "proposal"> & { readonly proposal: T | null };
 
-async function exchange<T>(
+async function exchange<T extends object>(
   session: SelectedAccountInferenceSession, options: TerraOptions, context: Context, scope: AbortSignal, started: number,
-  decode: (raw: string | undefined) => T | null, checkDispatch?: () => boolean | void | Promise<boolean | void>,
+  decode: (raw: string | undefined) => T | MacroReplyRejection | null, checkDispatch?: () => boolean | void | Promise<boolean | void>,
   onDispatch?: (startedAtMs: number) => void, markTerminal?: () => void,
 ): Promise<Exchange<T>> {
   const toolName = context.tools![0]!.name;
   let dispatched = false;
   let providerStartedAtMs: number | undefined;
   let preflightStale = false;
+  let observationRotating = false;
   let usage: MacroInference["usage"] = null;
-  const finish = (outcome: MacroInference["outcome"], proposal: T | null = null): Exchange<T> => ({
+  const finish = (outcome: MacroInference["outcome"], proposal: T | null = null, invalidReply?: MacroReplyRejection): Exchange<T> => ({
     proposal, model: TERRA_MODEL_ID, usage, costUsd: null, outcome, dispatched,
     latencyMs: performance.now() - started, providerStartedAtMs,
+    ...(invalidReply !== undefined ? { invalidReply } : {}),
+    ...(observationRotating && !dispatched ? { observationRotating: true } : {}),
   });
   if (scope.aborted) return finish("cancelled");
   const requestAbort = new AbortController();
@@ -413,7 +426,18 @@ async function exchange<T>(
       reasoning: session.thinkingLevel, hideThinkingSummary: true, toolChoice: "required", cacheRetention: "none",
       fetch: async (input, init) => {
         signal.throwIfAborted();
-        if (await checkDispatch?.() === false) {
+        if (preflightStale) throw new Error("The Terra request is no longer eligible to dispatch.");
+        let eligible;
+        try {
+          eligible = await checkDispatch?.();
+        } catch (error) {
+          if (error instanceof MacroObservationRotating) {
+            preflightStale = true;
+            observationRotating = true;
+          }
+          throw error;
+        }
+        if (eligible === false) {
           preflightStale = true;
           throw new Error("The Terra request is no longer eligible to dispatch.");
         }
@@ -456,11 +480,13 @@ async function exchange<T>(
     if (signal.aborted || message.stopReason === "aborted") return finish("cancelled");
     if (message.stopReason === "error") return finish(dispatched ? "provider_error" : "provider_unavailable");
     if (evidence.refused) return finish("refused");
-    const calls = message.content.filter(block => block.type === "toolCall");
-    if (!evidence.completed || message.stopReason !== "toolUse" || message.provider !== PROVIDER ||
-        message.api !== API || message.model !== TERRA_MODEL_ID || calls.length !== 1 || calls[0]?.name !== toolName)
+    if (!evidence.completed || message.provider !== PROVIDER || message.api !== API || message.model !== TERRA_MODEL_ID)
       return finish("invalid");
+    const calls = message.content.filter(block => block.type === "toolCall");
+    if (message.stopReason !== "toolUse" || calls.length !== 1 || calls[0]?.name !== toolName)
+      return finish("invalid", null, "required_tool");
     const proposal = decode(evidence.toolArguments);
+    if (typeof proposal === "string" || proposal instanceof MacroValidationError) return finish("invalid", null, proposal);
     return proposal ? finish("completed", proposal) : finish("invalid");
   } catch {
     // Provider/resolver errors can contain authorization material. Never
@@ -501,9 +527,9 @@ async function infer(
   if (request.frame && !frame) return finish("invalid");
   const context = contextFor(request, basis, frame?.image);
   if (!context) return finish("invalid");
-  const result = await exchange(session, options, context, scope, started, raw => proposalFor(raw, request, basis),
+  const result = await exchange<MacroProposal>(session, options, context, scope, started, raw => proposalFor(raw, request, basis),
     () => options.assertDispatch?.(basis, request.lookahead ? request.observation : undefined,
-      request.work ? request.observation : undefined),
+      request.work ? request.observation : undefined, request.feedback?.kind === "invalid_reply" ? request.observation : undefined),
     options.onProviderDispatch && (() => options.onProviderDispatch!({ ...providerMoment(), basis: { ...basis } })), markTerminal);
   return { ...result, basis, ...(result.dispatched && frame ? { frameSha256: frame.sha256 } : {}) };
 }

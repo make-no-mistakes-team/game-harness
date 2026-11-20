@@ -346,6 +346,37 @@ export interface MacroUsage {
   readonly totalTokens: number;
 }
 
+const replyRejections = {
+  required_tool: "Return exactly one call to the supplied proposal tool.",
+  missing_arguments: "The proposal tool call had no complete arguments.",
+  argument_bytes: "The proposal tool arguments exceed maxResponseBytes. Shorten the proposal.",
+  argument_json: "The proposal tool arguments must be a complete JSON object.",
+  schema: "The proposal does not match the supplied tool schema.",
+  expiry: "Use an absolute expiresTick after basis.tick and within this action's TTL limit.",
+  successor: "A conditional successor must name the offered predecessor and a candidate from this lookahead.",
+  work_unavailable: "A work policy requires an offered work context.",
+  wrong_work_id: "Use the exact applicable work ID from this request; a successor needs a matching accepted job.",
+  wrong_preset_goal: "A preset work target must equal the live invocation goal.",
+  active_work: "An active job admits work policies, a scoped revoke, a genuine gap, or abstention; not a primitive or skill.",
+  missing_opportunity: "Select an exact opportunityId offered in the current observation.",
+  guarded_opportunity: "Constrained work mode does not admit guarded primitives. Use a bounded work policy with explicit costs and reserves for supported effects.",
+  continuation: "A continuation needs direct authority and currently witnessed material selectors. Constrained mode does not admit continuations.",
+  candidate: "A skill candidate must use the offered skillGeneration and only admitted skillVerbs.",
+  selected_skill: "A selected-skill proposal requires selectedSkillHash in the request.",
+  tested_skill: "Use an offered testedSkills hash with a matching current read or low-risk opportunity.",
+  review_patch: "A review patch requires nativeReview context. Report a genuine gap without a patch if that context is missing.",
+} as const;
+
+export class MacroValidationError extends Error {
+  constructor(field: string) { super(`Invalid survival macro field: ${field}.`); }
+}
+
+export type MacroReplyRejection = keyof typeof replyRejections | MacroValidationError;
+
+export function macroReplyRejectionDetail(rejection: MacroReplyRejection): string {
+  return rejection instanceof MacroValidationError ? rejection.message : replyRejections[rejection];
+}
+
 export interface MacroInference {
   readonly proposal: unknown;
   readonly model: string;
@@ -357,12 +388,16 @@ export interface MacroInference {
   readonly frameSha256?: string;
   readonly dispatched?: boolean;
   readonly providerStartedAtMs?: number;
+  /** Host validation only, and set only for a transport-completed invalid reply. */
+  readonly invalidReply?: MacroReplyRejection;
+  /** The dispatch preflight could not sample the observation. No provider request was sent. */
+  readonly observationRotating?: true;
 }
 
 export type MacroStrategist = (request: MacroRequest, signal: AbortSignal) => Promise<MacroInference>;
 
 function invalid(field: string): never {
-  throw new Error(`Invalid survival macro field: ${field}.`);
+  throw new MacroValidationError(field);
 }
 
 function object(value: unknown, field: string): Record<string, unknown> {
@@ -807,6 +842,22 @@ export function hasDirectAuthority(action: MacroDirectAction, observation: Macro
     action.steps.every(({ selector }) => observation.opportunities.some(offer => matchesMaterial(offer, selector)));
 }
 
+export function sameLiveCorrectionScope(source: MacroObservation, current: MacroObservation): boolean {
+  return source.run === current.run && source.life === current.life && source.goal === current.goal &&
+    source.epoch === current.epoch && current.health > 0 && current.health >= source.health &&
+    current.safety?.clear !== false && current.safety?.revision === source.safety?.revision &&
+    !current.working && current.workOrder?.state !== "working" && current.workOrder?.state !== "needs_replan" &&
+    (current.quiescent || current.opportunities.length > 0);
+}
+
+export function liveCorrectionEvidence(observation: MacroObservation): string {
+  // A new heartbeat or a reissued opaque ID is not a new opportunity.
+  const offers = observation.opportunities.map(({ verb, summary, risk, evidence, material }) =>
+    JSON.stringify([verb, summary, risk, evidence, material])).sort();
+  return JSON.stringify([observation.quiescent, offers,
+    Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b))]);
+}
+
 function missing(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
 }
@@ -969,11 +1020,11 @@ async function withMacroDirectory<T>(directory: string, use: (ipc: MacroDirector
   try { return await use(ipc); } finally { await ipc.close(); }
 }
 
-export function readMacroObservation(directory: string): Promise<MacroObservation | null> {
+export function readMacroObservation(directory: string, preserveRotation = false): Promise<MacroObservation | null> {
   return withMacroDirectory(directory, async ipc => {
     try { return await ipc.read("observation.json", parseMacroObservation); }
     catch (error) {
-      if (error instanceof MacroObservationRotating) return null;
+      if (!preserveRotation && error instanceof MacroObservationRotating) return null;
       throw error;
     }
   });

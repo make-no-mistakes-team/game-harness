@@ -10,12 +10,13 @@ import {
 import {
   MACRO_CAPABILITIES_VERSION, MACRO_IRON_SMELT, MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_PLANNING_IDLE_MS, MACRO_LOOKAHEAD_MAX_AGE_TICKS, MACRO_LOOKAHEAD_MAX_CRACK,
-  MacroDirectory, MacroObservationRotating,
-  hasDirectAuthority, matchesMaterial, parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
-  parseMacroProposal, parseMacroReceipt, parseMacroRevocation, parseMacroWorkOrder, validateMacroId,
+  MacroDirectory, MacroObservationRotating, MacroValidationError,
+  hasDirectAuthority, liveCorrectionEvidence, macroReplyRejectionDetail, matchesMaterial,
+  parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
+  parseMacroProposal, parseMacroReceipt, parseMacroRevocation, parseMacroWorkOrder, sameLiveCorrectionScope, validateMacroId,
   type MacroBasis, type MacroDirectAction, type MacroFeedback, type MacroFrame, type MacroHandoff, type MacroInference, type MacroIntent,
   type MacroLookahead, type MacroObservation, type MacroOpportunity, type MacroPlanning,
-  type MacroProposal, type MacroReceipt, type MacroRequest, type MacroSkillReceipt, type MacroStockFloor,
+  type MacroProposal, type MacroReceipt, type MacroReplyRejection, type MacroRequest, type MacroSkillReceipt, type MacroStockFloor,
   type MacroStrategist, type MacroSuccessor,
   type MacroTrigger, type MacroWorkDemand, type MacroWorkMode, type MacroWorkOrder, type MacroWorkPolicy, type MacroWorkStage,
   type NativeReceiptCursor,
@@ -77,6 +78,17 @@ export interface MacroTrialRunner {
   run(hash: string, skills: SurvivalMacroSkills, signal: AbortSignal): Promise<TrialResult>;
 }
 
+export type DisplayCaptureFailure = "spawn_failed" | "process_failed" | "timeout" | "io_error" |
+  "empty_output" | "output_too_large" | "invalid_image" | "unexpected_dimensions";
+
+export type UnavailableFrame = {
+  readonly cause: "unavailable";
+  readonly failure: DisplayCaptureFailure;
+  readonly adapter?: "scrot" | "ffmpeg";
+};
+
+type FrameCapture = MacroFrame | UnavailableFrame | { readonly cause: "basis_changed" };
+
 export interface SurvivalMacroConfig {
   readonly runDir: string;
   readonly run: string;
@@ -95,7 +107,7 @@ export interface SurvivalMacroConfig {
   /** Trusted supervisor joins the exact launched Java child; no PID guesses. */
   readonly confirmNativeExit?: () => Promise<boolean>;
   /** Optional trusted display capture; no path, credential or ownership supplied to the model. */
-  readonly frame?: (observation: MacroObservation, signal: AbortSignal, requestId: string) => Promise<MacroFrame | undefined>;
+  readonly frame?: (observation: MacroObservation, signal: AbortSignal, requestId: string) => Promise<FrameCapture>;
 }
 
 type MacroState = "new" | "deterministic" | "waiting" | "inferring" | "testing-skill" | "awaiting-handoff" |
@@ -169,6 +181,13 @@ interface View {
   readonly query: string;
 }
 
+interface ReplyCorrection {
+  readonly requestId: string;
+  readonly observation: MacroObservation;
+  readonly key: string;
+  readonly feedback: MacroFeedback;
+}
+
 interface FirstPlanning {
   readonly requestId: string;
   readonly request: FirstPlanRequest;
@@ -192,7 +211,7 @@ interface Work<T> {
   readonly until: number;
   readonly done: Promise<void>;
   result?: { readonly ok: true; readonly value: T; readonly settledAt: number } |
-    { readonly ok: false; readonly detail: string; readonly settledAt: number; readonly preflight?: "stale" | "invalid" };
+    { readonly ok: false; readonly detail: string; readonly settledAt: number; readonly preflight?: "stale" | "invalid" | "rotation" };
 }
 
 interface Decision {
@@ -204,10 +223,17 @@ interface Decision {
   readonly lookahead?: Lookahead;
   readonly workDemand?: MacroWorkDemand;
   readonly workOverlap?: WorkOverlap;
+  readonly replyKey?: string;
+  readonly correction?: ReplyCorrection;
 }
 
 class FrameRejected extends Error {
-  constructor(readonly disposition: "stale" | "invalid", message: string) { super(message); }
+  constructor(readonly disposition: "stale" | "invalid" | "rotation", message: string) { super(message); }
+}
+
+async function discardFrame(frame: MacroFrame): Promise<void> {
+  try { await frame.artifact?.discard?.(); }
+  catch { throw new FrameRejected("invalid", "The archived display capture could not be withdrawn."); }
 }
 
 interface Plan extends Decision {
@@ -270,7 +296,7 @@ interface WorkJob {
 
 interface QueuedWork {
   readonly after: WorkJob | null;
-  readonly plan: Pick<Plan, "requestId" | "observation"> & { readonly proposal: Pick<MacroProposal, "expiresTick"> };
+  readonly plan: Pick<Plan, "requestId" | "observation" | "correction"> & { readonly proposal: Pick<MacroProposal, "expiresTick"> };
   readonly stages: readonly MacroWorkStage[];
   readonly next: number;
   readonly bootstrap?: { readonly branchIndex: number; readonly declaredStages: number };
@@ -557,6 +583,8 @@ export class SurvivalMacroController {
   private view?: View;
   private lastAsked?: View;
   private heldQuery?: string;
+  private replyCorrection?: ReplyCorrection;
+  private readonly correctedContexts = new Set<string>();
   private feedback?: { readonly observation: MacroObservation; readonly value: MacroFeedback;
     readonly requestId?: string; readonly workStageIndex?: number };
   private lastReceipt: MacroReceipt | null = null;
@@ -592,7 +620,7 @@ export class SurvivalMacroController {
   private newestJob?: WorkJob;
   private lastAcceptedJob?: WorkJob;
   private lastJobOutcome?: WorkJob;
-  private workQuery?: { readonly key: string; readonly tick: number; readonly evidence: string; abstained?: true };
+  private workQuery?: { readonly key: string; tick: number; readonly evidence: string; abstained?: true };
   private readonly workHandoffQueries = new Set<string>();
   private readonly workOverlapRequests = new Set<string>();
   private floorScope?: { readonly life: number; readonly reserves: readonly MacroStockFloor[] };
@@ -848,7 +876,8 @@ export class SurvivalMacroController {
       // cancel it merely because the player moved or the old action expired.
       const stale = this.busy.kind !== "trial" && (!current ||
         (this.busy.kind === "inference"
-          ? work.context.lookahead ? lookaheadStale : work.context.workDemand ? !workScope(work.context.observation, current) :
+          ? work.context.correction ? (!!observed && !this.replyCorrectionApplies(work.context.correction, current)) :
+            work.context.lookahead ? lookaheadStale : work.context.workDemand ? !workScope(work.context.observation, current) :
             !sameGoalAndLife(work.context.observation, current) || !alive(current)
           : !samePlayableScope(work.context.observation, current) || current.tick >= this.busy.plan.proposal.expiresTick));
       if (runtimeExpired || stale || (!work.result && now >= work.until)) {
@@ -871,6 +900,9 @@ export class SurvivalMacroController {
     if (!observed && current && !runtimeExpired) return;
     if (this.busy?.work.result) await this.settle(current, runtimeExpired);
     if (this.queuedWork) await this.advanceQueuedWork(current, runtimeExpired);
+    if (this.replyCorrection && (!current || !this.replyCorrectionApplies(this.replyCorrection, current))) {
+      this.replyCorrection = undefined;
+    }
     if (runtimeExpired) {
       if (this.budget !== "wall-time") {
         this.budget = "wall-time";
@@ -937,14 +969,15 @@ export class SurvivalMacroController {
     if (!this.config.strategist || !alive(current) || current.safety?.clear === false ||
         (!current.quiescent && !current.opportunities.length)) return;
     const latest = this.view!;
-    if (this.queryKeys.has(latest.query)) {
+    const correction = this.replyCorrection;
+    if (!correction && this.queryKeys.has(latest.query)) {
       if (this.heldQuery !== latest.query && latest.query === this.lastAsked?.query && now - latest.changedAt >= this.limits.stuckAfterMs) {
         this.heldQuery = latest.query;
         await this.record("replan_held", { basis: basis(current), reason: "No new native or admission evidence." });
       }
       return;
     }
-    await this.begin(latest);
+    await this.begin(latest, { correction });
   }
 
   private get renewLeadTicks(): number {
@@ -1200,10 +1233,11 @@ export class SurvivalMacroController {
       key = evidence;
     }
     if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew") return;
+    const correction = !job ? this.replyCorrection : undefined;
     const unchanged = previous && (key === previous.key || (!job && demand === "changed" && previous.evidence === evidence));
     // A durable demand can stay unchanged while an abstention's premise gains
     // a witnessed option or a neutral handoff. Use the live view after settlement.
-    if (unchanged) {
+    if (unchanged && !correction) {
       const asked = this.lastAsked?.observation;
       if (job || !previous.abstained || !asked ||
           (!(observation.quiescent && !asked.quiescent) && !observation.opportunities.some(offer =>
@@ -1211,18 +1245,19 @@ export class SurvivalMacroController {
     }
     const handoffQuery = !job && (observation.quiescent || observation.opportunities.length > 0)
       ? digest([evidence, observation.quiescent, orderedOpportunities(observation)]) : null;
-    if (unchanged && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
+    if (unchanged && !correction && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
     if (handoffQuery) this.workHandoffQueries.add(handoffQuery);
-    this.workQuery = { key, tick: observation.tick, evidence };
+    if (!correction) this.workQuery = { key, tick: observation.tick, evidence };
     if (overlap && owner) this.workOverlapRequests.add(owner);
-    await this.begin(view, undefined, {
+    const workDemand: MacroWorkDemand = {
       mode: this.workMode!, demand,
       protectedReserves: this.floorScope?.life === observation.life ? this.floorScope.reserves : [],
       current: job ? { id: job.order.id, origin: job.order.origin, policy: job.policy,
         expiresTick: job.order.expiresTick, accepted: job.accepted ?? null, nativeState } : null,
       lastOutcome: outcome?.terminal ? { id: outcome.order.id, policy: outcome.policy,
         receipt: outcome.terminal, nativeState: outcomeState } : null,
-    }, overlap);
+    };
+    await this.begin(view, { workDemand, workOverlap: overlap, correction });
   }
 
   private async preemptQueuedWork(requestId: string): Promise<void> {
@@ -1300,6 +1335,10 @@ export class SurvivalMacroController {
         }
         return true;
       } : undefined, stage, async fresh => {
+        if (index === 0 && plan.correction && !this.sameReplyContext(plan.correction, fresh)) {
+          await this.rejectStale(plan, "correction_context_changed_before_work_admission");
+          return false;
+        }
         const checked = preflightVanillaWork(fresh, [stages[index]!]);
         if (checked.kind === "shortage") {
           if (bootstrap) rejection = "work_resource_shortage";
@@ -1472,6 +1511,22 @@ export class SurvivalMacroController {
     const feedback = this.feedback;
     if (feedback && (feedback.value.kind === "work_resource_shortage"
       ? sameGoalAndLife(feedback.observation, observation) : scope(feedback.observation, observation))) return feedback.value;
+  }
+
+  private liveReplyKey(observation: MacroObservation): string {
+    const { run, life, epoch, goal, safety, food } = observation;
+    return digest([run, life, epoch, goal, safety, guardBand(food), liveCorrectionEvidence(observation),
+      this.lastReceipt?.life === life ? this.lastReceipt.id : null, this.lastJobOutcome?.terminal?.id,
+      this.config.skills?.selection().generation, this.floorScope?.reserves]);
+  }
+
+  private replyCorrectionApplies(correction: ReplyCorrection, current: MacroObservation): boolean {
+    return !this.job && !this.previousJob && !this.queuedWork && !this.pending && !this.direct && !this.segment &&
+      !this.conditional && !this.lease && this.sameReplyContext(correction, current);
+  }
+
+  private sameReplyContext(correction: ReplyCorrection, current: MacroObservation): boolean {
+    return sameLiveCorrectionScope(correction.observation, current) && this.liveReplyKey(current) === correction.key;
   }
 
   private async readReceipts(closing = false): Promise<void> {
@@ -1653,11 +1708,14 @@ export class SurvivalMacroController {
       predecessor: { intentId: origin.intent.id, acceptedTick: origin.accepted.tick, verb: origin.offer.verb, summary: origin.offer.summary },
       witnessBasis: basis(origin.scope), candidates, reserves,
     };
-    await this.begin(view, { origin, evidence, workingBasis: observation, health: observation.health,
-      lastWorkingTick: observation.tick, lastWorkingSeenAt: this.observedAt });
+    await this.begin(view, { lookahead: { origin, evidence, workingBasis: observation, health: observation.health,
+      lastWorkingTick: observation.tick, lastWorkingSeenAt: this.observedAt } });
   }
 
-  private async begin(view: View, lookahead?: Lookahead, workDemand?: MacroWorkDemand, workOverlap?: WorkOverlap): Promise<void> {
+  private async begin(
+    view: View, { lookahead, workDemand, workOverlap, correction }:
+      Pick<Decision, "lookahead" | "workDemand" | "workOverlap" | "correction">,
+  ): Promise<void> {
     const trigger = this.trigger(view);
     const observation = view.observation;
     const observedAt = this.observedAt;
@@ -1677,7 +1735,7 @@ export class SurvivalMacroController {
       maxResponseBytes: this.limits.maxResponseBytes, maxIntentTtlTicks: this.limits.maxIntentTtlTicks,
       maxPlanTtlTicks: this.limits.maxPlanTtlTicks,
       lastReceipt: this.lastReceipt?.life === observation.life ? this.lastReceipt : null,
-      feedback: this.currentFeedback(observation),
+      feedback: correction?.feedback ?? this.currentFeedback(observation),
       ...(lookahead ? { lookahead: lookahead.evidence } : {}),
       ...(workDemand ? { work: workDemand } : {}),
     };
@@ -1685,7 +1743,10 @@ export class SurvivalMacroController {
       this.queryKeys.add(view.query);
       this.lastAsked = view;
     }
-    await this.record("request", { requestId, evidenceKey: view.evidence, request });
+    const replyKey = !correction && !lookahead && !workDemand?.current && !this.job && !this.queuedWork &&
+      sameLiveCorrectionScope(observation, observation) ? this.liveReplyKey(observation) : undefined;
+    await this.record("request", { requestId, evidenceKey: view.evidence, request,
+      ...(correction ? { correctionOf: correction.requestId } : {}) });
     if (this.closing || performance.now() - this.startedAt! >= this.limits.maxRuntimeMs) {
       await this.disposition("request_not_dispatched", { requestId, reason: this.closing ? "stop" : "runtime_wall_limit" });
       return;
@@ -1702,88 +1763,105 @@ export class SurvivalMacroController {
     }
     this.requests++;
     this.unreportedDispatches++;
+    if (correction) this.replyCorrection = undefined;
     this.busy = {
       kind: "inference",
-      work: this.work({ requestId, observation, generation, testedSkills, selectedSkillHash, lookahead, workDemand, workOverlap }, this.limits.requestTimeoutMs, async signal => {
+      work: this.work({ requestId, observation, generation, testedSkills, selectedSkillHash,
+        lookahead, workDemand, workOverlap, replyKey, correction }, this.limits.requestTimeoutMs, async signal => {
         if (lookahead) return this.config.strategist!(request, signal);
         if (workDemand?.current) return this.config.strategist!({ ...request,
           strategicEpisodes: this.episodeMemory.forObservation(observation) }, signal);
-        let frame: MacroFrame | undefined;
+        let sample: MacroFrame | undefined;
         try {
-          frame = await this.capture(observation, observedAt, requestId, signal, !!workDemand);
+          sample = await this.capture(observation, observedAt, requestId, signal, !!workDemand, correction);
           signal.throwIfAborted();
         } catch (error) {
+          if (sample) await discardFrame(sample);
           if (error instanceof FrameRejected) throw error;
+          if (error instanceof MacroObservationRotating) throw new FrameRejected("rotation", error.message);
           throw new FrameRejected(signal.aborted ? "stale" : "invalid", "The request stopped before provider dispatch.");
         }
         // Authoring source and the in-memory history projection are not copied to the request log.
-        return this.config.strategist!({
-          ...request, frame, nativeReview: this.config.nativeReview?.context,
+        const input = {
+          ...request, nativeReview: this.config.nativeReview?.context,
           strategicEpisodes: this.episodeMemory.forObservation(observation),
-        }, signal);
+        };
+        if (!sample) return this.config.strategist!(input, signal);
+        const { artifact, ...frame } = sample;
+        let sent = false;
+        try {
+          const result = await this.config.strategist!({ ...input, frame }, signal);
+          sent = result.dispatched === true && result.frameSha256 === artifact?.sha256;
+          return result;
+        } finally {
+          if (!sent) await discardFrame(sample);
+        }
       }),
     };
   }
 
   private async capture(
-    observation: MacroObservation, observedAt: number, requestId: string, signal: AbortSignal, durable: boolean,
+    observation: MacroObservation, observedAt: number, requestId: string, signal: AbortSignal, durable: boolean, correction?: ReplyCorrection,
   ): Promise<MacroFrame | undefined> {
     if (!this.config.frame) return;
-    let sample: MacroFrame | undefined;
+    let sample: FrameCapture;
     try { sample = await this.config.frame(observation, signal, requestId); }
-    catch { throw new FrameRejected("invalid", "The trusted display capture did not settle."); }
-    signal.throwIfAborted();
+    catch (error) {
+      if (correction && error instanceof MacroObservationRotating) throw error;
+      throw new FrameRejected(signal.aborted ? "stale" : "invalid", "The trusted display capture did not settle.");
+    }
     const ipc = this.ipc!;
     const checkScope = async () => {
       let latest: MacroObservation | null;
       try { latest = await ipc.read("observation.json", parseMacroObservation); }
       catch (error) {
-        if (!(error instanceof MacroObservationRotating)) throw error;
+        if (correction || !(error instanceof MacroObservationRotating)) throw error;
         latest = null;
       }
-      if (!latest || !(durable ? workScope(observation, latest) : samePlayableScope(observation, latest)) || latest.tick < observation.tick ||
+      if (!latest || !(durable ? workScope(observation, latest) : samePlayableScope(observation, latest)) ||
+          (correction && !this.sameReplyContext(correction, latest)) || latest.tick < observation.tick ||
           performance.now() - observedAt > this.limits.maxObservationAgeMs) {
         throw new FrameRejected("stale", "The observation scope or freshness changed during display capture.");
       }
       return latest;
     };
-    if (!sample) {
-      await this.record("request_frame_omitted", { requestId, reason: "No verified image matched the request basis." });
+    if ("cause" in sample) {
+      signal.throwIfAborted();
+      await this.record("request_frame_omitted", { requestId, basis: basis(observation), ...sample,
+        reason: sample.cause === "unavailable" ? "The display capture did not produce an admissible image." :
+          "The published observation changed during display capture." });
       await checkScope();
       return;
     }
-    if (sample.source !== "verified-game-display" || !(sample.data instanceof Uint8Array) ||
-        sample.data.length < 1 || sample.data.length > 2 * 1024 * 1024 ||
-        !Number.isSafeInteger(sample.width) || !Number.isSafeInteger(sample.height) ||
-        sample.width < 1 || sample.height < 1 || sample.width > 2_048 || sample.height > 2_048 ||
-        (sample.mimeType !== "image/jpeg" && sample.mimeType !== "image/png")) {
-      throw new FrameRejected("invalid", "The display capture exceeded its admitted shape.");
-    }
-    const sha256 = createHash("sha256").update(sample.data).digest("hex");
-    const extension = sample.mimeType === "image/jpeg" ? "jpg" : "png";
-    const { artifact, ...frame } = sample;
-    const relativePath = artifact?.relativePath ?? null;
-    if (artifact && (relativePath !== `macro-frames/${requestId}.${extension}` || artifact.sha256 !== sha256)) {
-      throw new FrameRejected("invalid", "The display capture archive did not match its request or bytes.");
-    }
-    const discard = async () => {
-      try { await artifact?.discard?.(); }
-      catch { throw new FrameRejected("invalid", "The archived display capture could not be withdrawn."); }
-    };
     try {
       signal.throwIfAborted();
+      if (sample.source !== "verified-game-display" || !(sample.data instanceof Uint8Array) ||
+          sample.data.length < 1 || sample.data.length > 2 * 1024 * 1024 ||
+          !Number.isSafeInteger(sample.width) || !Number.isSafeInteger(sample.height) ||
+          sample.width < 1 || sample.height < 1 || sample.width > 2_048 || sample.height > 2_048 ||
+          (sample.mimeType !== "image/jpeg" && sample.mimeType !== "image/png")) {
+        throw new FrameRejected("invalid", "The display capture exceeded its admitted shape.");
+      }
+      const sha256 = createHash("sha256").update(sample.data).digest("hex");
+      const extension = sample.mimeType === "image/jpeg" ? "jpg" : "png";
+      const { artifact } = sample;
+      const relativePath = artifact?.relativePath ?? null;
+      if (artifact && (relativePath !== `macro-frames/${requestId}.${extension}` || artifact.sha256 !== sha256)) {
+        throw new FrameRejected("invalid", "The display capture archive did not match its request or bytes.");
+      }
       if (!sameBasis(sample, observation)) throw new FrameRejected("stale", "The display capture used a stale observation basis.");
       await this.record("request_frame", { requestId, basis: basis(observation), sha256, relativePath,
         bytes: sample.data.length, width: sample.width, height: sample.height, mimeType: sample.mimeType });
       const latest = await checkScope();
       signal.throwIfAborted();
-      if (sameBasis(latest, observation)) return frame;
+      if (sameBasis(latest, observation)) return sample;
     } catch (error) {
-      await discard();
+      await discardFrame(sample);
       throw error;
     }
-    await discard();
-    await this.record("request_frame_omitted", { requestId, reason: "A newer tick arrived before dispatch; retained the original observation only." });
+    await discardFrame(sample);
+    await this.record("request_frame_omitted", { requestId, basis: basis(observation), cause: "basis_changed",
+      reason: "A newer tick arrived before dispatch; retained the original observation only." });
     await checkScope();
   }
 
@@ -1806,7 +1884,8 @@ export class SurvivalMacroController {
     this.busy = undefined;
     const result = busy.work.result!;
     const context = busy.work.context;
-    const stale = runtimeExpired || !current || (context.lookahead ? !lookaheadScope(context.lookahead, current) :
+    const stale = runtimeExpired || !current || (context.correction && !this.replyCorrectionApplies(context.correction, current)) ||
+      (context.lookahead ? !lookaheadScope(context.lookahead, current) :
       context.workDemand ? !workScope(context.observation, current) : !samePlayableScope(context.observation, current)) ||
       (busy.kind !== "inference" && current.tick >= busy.plan.proposal.expiresTick);
     const late = result.settledAt > busy.work.until || busy.work.cancel.signal.aborted;
@@ -1880,33 +1959,55 @@ export class SurvivalMacroController {
       this.lastProviderOutcome = inference.outcome;
       this.lastProviderLatencyMs = positiveFinite(inference.latencyMs);
     }
-    let reason: string | null = result.ok ? null : result.detail;
+    let rejection: MacroReplyRejection | undefined = inference?.outcome === "invalid" ? inference.invalidReply : undefined;
     if (inference?.outcome === "completed") {
       try {
         proposal = parseMacroProposal(inference.proposal);
         if (Buffer.byteLength(JSON.stringify(proposal)) > this.limits.maxResponseBytes) {
-          throw new Error("Survival macro plan exceeds the response byte cap.");
+          proposal = null;
+          rejection = "argument_bytes";
         }
       } catch (error) {
         proposal = null;
-        reason = describe(error);
+        rejection = error instanceof MacroValidationError ? error : "schema";
       }
     }
     const original = context.observation;
     const basisMatches = sameBasis(inference?.basis, original);
     const ttlValid = !!proposal && proposal.expiresTick > original.tick &&
       proposal.expiresTick - original.tick <= (proposal.action.kind === "skill" ? this.limits.maxPlanTtlTicks : this.limits.maxIntentTtlTicks);
-    const expired = !!proposal && !!current && current.tick >= proposal.expiresTick;
+    if (proposal && !ttlValid) rejection = "expiry";
+    const expired = !!proposal && ttlValid && !!current && current.tick >= proposal.expiresTick;
     const preflight = result.ok ? undefined : result.preflight;
-    const disposition = stale || expired || (!!inference && !basisMatches) || inference?.outcome === "stale" || preflight === "stale" ? "stale" :
+    const rotation = !!context.correction && (preflight === "rotation" || (inference?.observationRotating && inference.dispatched === false));
+    const disposition = rotation ? "deferred_rotation" :
+      stale || expired || (!!inference && !basisMatches) || inference?.outcome === "stale" || preflight === "stale" ? "stale" :
       late ? "timed_out" : preflight === "invalid" ? "invalid" : !inference ? "provider_error" : inference.outcome !== "completed" ? inference.outcome :
       !proposal || !ttlValid || !model ? "invalid" : "proposed";
+    const reason = rotation ? "A rotating observation deferred the correction before provider dispatch." :
+      rejection ? macroReplyRejectionDetail(rejection) : result.ok ? null : result.detail;
+    const correction = context.correction;
+    if (correction) {
+      if (rotation) {
+        // A displaced inode is not a decision or a dispatched request.
+        this.requests--;
+        if (!this.closing && !stale && !late) this.replyCorrection = correction;
+      } else {
+        this.correctedContexts.add(correction.key);
+        if (this.workQuery) this.workQuery.tick = original.tick;
+      }
+    } else if (disposition === "invalid" && reason && rejection && inference?.dispatched === true && current &&
+        !this.closing && context.replyKey && !this.correctedContexts.has(context.replyKey)) {
+      const pending = { requestId: context.requestId, observation: original, key: context.replyKey,
+        feedback: { kind: "invalid_reply", detail: `The previous tool reply was invalid. No effect was authorized. ${reason}` } };
+      if (this.replyCorrectionApplies(pending, current)) this.replyCorrection = pending;
+    }
     if (disposition === "stale") this.staleDecisions++;
     this.unavailable = disposition === "provider_unavailable";
     this.lastDisposition = disposition;
     // Keep candidate contents only in private review storage, not the run trace.
-    const hadReviewPatch = proposal?.action.kind === "gap" && !!proposal.action.reviewPatch;
-    const recordedProposal: MacroProposal | null = proposal?.action.kind === "gap" && hadReviewPatch
+    const hadReviewPatch = !rejection && disposition !== "invalid" && proposal?.action.kind === "gap" && !!proposal.action.reviewPatch;
+    const recordedProposal: MacroProposal | null = rejection || disposition === "invalid" ? null : proposal?.action.kind === "gap" && hadReviewPatch
       ? { ...proposal, action: { kind: "gap", capability: proposal.action.capability, suggestion: proposal.action.suggestion } }
       : proposal;
     await this.append(this.proposals, {
@@ -1916,6 +2017,7 @@ export class SurvivalMacroController {
       latencyMs: Math.round(result.settledAt - startedAt), providerLatencyMs: positiveFinite(inference?.latencyMs),
       frameSha256: inference?.frameSha256 && /^[a-f0-9]{64}$/.test(inference.frameSha256) ? inference.frameSha256 : null,
       disposition, reason, proposal: recordedProposal,
+      ...(correction ? { correctionOf: correction.requestId } : {}),
       ...(context.lookahead ? { conditionalOn: context.lookahead.origin.intent.id } : {}),
       ...(context.workDemand ? {
         workDemand: context.workDemand.demand,
@@ -1951,7 +2053,7 @@ export class SurvivalMacroController {
       // The provider chose a pure function, not a durable live command. A
       // stale movement premise may still yield bounded independent testing,
       // but never promotion or reissue from this old request.
-      if (disposition === "stale" && !runtimeExpired && !late && model && ttlValid && basisMatches &&
+      if (!correction && disposition === "stale" && !runtimeExpired && !late && model && ttlValid && basisMatches &&
           sameGoalAndLife(context.observation, current) && alive(current)) {
         if (proposal.action.kind !== "abstain") {
           this.episodeMemory.chosen(context.requestId, original, proposal.subgoal, proposal.successCondition);
@@ -2491,7 +2593,7 @@ export class SurvivalMacroController {
     return true;
   }
 
-  private async rejectStale(context: Decision, reason: string): Promise<void> {
+  private async rejectStale(context: Pick<Decision, "requestId">, reason: string): Promise<void> {
     this.staleDecisions++;
     await this.disposition("stale", { requestId: context.requestId, reason });
   }

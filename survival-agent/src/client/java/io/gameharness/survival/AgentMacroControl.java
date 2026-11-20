@@ -76,6 +76,10 @@ final class AgentMacroControl {
     private static final long PERSONAL_HANDOFF_NS = 600_000_000L;
     private static final int FURNACE_CLICK_MARGIN = 120;
     private static final int FURNACE_SYNC_TICKS = 24;
+    private static final int WORKSHOP_SCAN_TICKS = 36;
+    private static final int WORKSHOP_AIM_TICKS = 16;
+    private static final int WORKSHOP_SUPPORTS = 8;
+    private static final String IRON_WORKSHOP_STEP = "iron_workshop";
     private static final int MAX_ROUTE_EDGES = 8;
     private static final int MAX_OFFERS = 16;
     private static final int MAX_MATERIAL_TARGETS = 4_096;
@@ -229,6 +233,7 @@ final class AgentMacroControl {
         boolean diamondRoute, prospectLight;
         float lastCrack;
         long firedAt, placementFrame, pickupDisappeared, craftJob, priorCraftReceipt, settledAt, lastMissingFrame;
+        long workshopFaceUntil;
         int missingFaceFrames;
         String unexpectedPickup;
         Screen opened;
@@ -243,7 +248,7 @@ final class AgentMacroControl {
         int workSlot, executions, handLoss, stairStock;
         Item tracked;
         FurnaceWork furnace;
-        boolean waterUseEntered, waterUseReceipt;
+        boolean waterUseEntered, waterUseReceipt, workshopFaceLost;
 
         Action(Intent intent, Offer offer, MinecraftClient client, long tick, long now, long frame, int itemCount,
                Offer[] keepVisible, float chosenWalkPitch) {
@@ -290,6 +295,28 @@ final class AgentMacroControl {
         FurnaceWork(BlockPos footing) { this.footing = footing; }
     }
 
+    private static final class IronWorkshop {
+        final List<Face> supports = new ArrayList<>(WORKSHOP_SUPPORTS);
+        final Set<BlockPos> refusedHere = new HashSet<>();
+        BlockPos foot, placedTable;
+        Face table, tableSite, furnaceSite, recipeSupport, aiming, alternateGuide;
+        Floor alternate;
+        BlockHitResult alternateTop;
+        long scanStarted, aimUntil, openingUntil, alternateUntil;
+        float scanYaw;
+        boolean walked, furnaceCrafted;
+
+        IronWorkshop(BlockPos foot) { this.foot = foot; }
+
+        void arrived(BlockPos landing) {
+            foot = landing;
+            supports.clear();
+            refusedHere.clear();
+            tableSite = furnaceSite = recipeSupport = aiming = null;
+            scanStarted = 0;
+        }
+    }
+
     private static final class WorkSession {
         AgentWorkOrder order;
         final AgentWorkOrder.Budget budget;
@@ -309,8 +336,7 @@ final class AgentMacroControl {
         BlockPos placedFurnace;
         boolean collectedIron;
         Offer waterClue;
-        long ironSiteLookUntil;
-        float ironSiteYaw;
+        IronWorkshop ironWorkshop;
         String sourceBlock;
         boolean lowerHarvest;
         int confirmedBreaks, confirmedCrafts, confirmedPlacements, startingStock, startingDeepTreads;
@@ -2827,6 +2853,7 @@ final class AgentMacroControl {
         BlockPos dest = support.hit.getBlockPos().up();
         Item item = action.offer.item;
         boolean furnace = item == Items.FURNACE;
+        IronWorkshop shop = work.ironWorkshop;
         Block station = furnace ? Blocks.FURNACE : Blocks.CRAFTING_TABLE;
         if (action.fired) {
             if (client.world.getBlockState(dest).isOf(station) && count(item) == action.itemCount - 1) {
@@ -2838,6 +2865,11 @@ final class AgentMacroControl {
                 if (furnace) {
                     work.placedFurnace = dest;
                     work.sourceSearch.freshAfter = body.renderedFrame();
+                    workshopMilestone("placement_confirmed", "Vanilla confirmed the furnace and its exact stock decrement.");
+                }
+                if (shop != null) {
+                    if (!furnace) shop.placedTable = dest;
+                    shop.openingUntil = tick + WORKSHOP_AIM_TICKS;
                 }
                 complete("Vanilla confirmed the authorized " + (furnace ? "furnace" : "table")
                     + " placement and matching inventory decrement.");
@@ -2855,14 +2887,32 @@ final class AgentMacroControl {
             return;
         }
         if (!body.hasRecentView()) return;
-        if ((furnace ? !work.budget.canPlaceFurnace(player.getInventory()) || !furnaceSite(dest)
-                    || !ironFooting(player.getBlockPos().down())
-                : work.budget.limit(item, count(item)) < 1)
-                || !work.budget.canPlace() || !client.world.getBlockState(dest).isAir()
-                || !visible(support) || player.getBoundingBox().intersects(new Box(dest))) {
-            interrupt("The placement face, free space or material permission changed.", true);
+        if (!work.budget.canPlace() || (furnace ? !work.budget.canPlaceFurnace(player.getInventory())
+                : work.budget.limit(item, count(item)) < 1) || !cursorClear()
+                || shop != null && (!shop.foot.equals(player.getBlockPos()) || !ironFooting(shop.foot.down())
+                    || client.options.useKey.isUnbound() || player.isUsingItem() || client.interactionManager.isBreakingBlock())) {
+            interrupt("The placement footing, cursor, control or material permission changed.", true);
             return;
         }
+        boolean space = shop == null
+            ? world.getBlockState(dest).isAir() && !player.getBoundingBox().intersects(new Box(dest))
+            : workshopSite(dest);
+        if (!space || world.getBlockState(support.hit.getBlockPos()) != support.state || !visible(support)) {
+            if (shop != null && space && world.getBlockState(support.hit.getBlockPos()) == support.state) {
+                if (action.workshopFaceUntil == 0) action.workshopFaceUntil = tick + WORKSHOP_AIM_TICKS;
+                if (tick < action.workshopFaceUntil) {
+                    body.aim(support.hit.getPos());
+                    return;
+                }
+            }
+            if (shop != null) {
+                action.workshopFaceLost = true;
+                shop.refusedHere.add(dest);
+            }
+            interrupt("The placement face or clear site could not be re-witnessed before issuing any use.", true);
+            return;
+        }
+        action.workshopFaceUntil = 0;
         if (!player.getMainHandStack().isOf(item)) {
             hands.equipForUse(stack -> stack.isOf(item));
             if (hands.busy()) action.craftJob = hands.jobGeneration();
@@ -2877,7 +2927,19 @@ final class AgentMacroControl {
             action.fired = true;
             action.firedAt = tick;
             action.placementFrame = body.renderedFrame();
+            if (furnace) workshopMilestone("placement_issued", "Issued one vanilla use on the re-witnessed dry furnace support.");
         }
+    }
+
+    private void workshopMilestone(String milestone, String detail) {
+        var value = header(run);
+        value.addProperty("id", work.order.id());
+        value.addProperty("life", life);
+        value.addProperty("tick", tick);
+        value.addProperty("wall_ms", System.currentTimeMillis());
+        value.addProperty("milestone", milestone);
+        value.addProperty("detail", detail);
+        ipc.evidence("furnace-" + work.order.id() + "-" + milestone + ".json", value.toString());
     }
 
     private BlockHitResult stationSupport(Predicate<BlockPos> lawful) {
@@ -2919,19 +2981,252 @@ final class AgentMacroControl {
             && world.getBlockState(dest).isAir() && dryWorkshopSupport(dest.down());
     }
 
+    /** These checks can veto a sighted site; they do not supply a new site. */
+    private boolean workshopSite(BlockPos dest) {
+        if (!furnaceSite(dest) || body.macroLavaNear()
+                || !world.getBlockState(dest.up()).isAir()
+                || player.getBoundingBox().intersects(new Box(dest))) return false;
+        BlockState floor = world.getBlockState(dest.down());
+        if (floor.isOf(Blocks.MAGMA_BLOCK) || floor.isOf(Blocks.CACTUS)) return false;
+        for (Direction side : CARDINAL)
+            if (!world.getBlockState(dest.offset(side)).getFluidState().isEmpty()) return false;
+        return true;
+    }
+
     private int ironTimeLimit() {
         long remaining = Math.min(work.order.expires() - tick, (work.deadline - now) / 50_000_000L);
         return (int) Math.max(0, (remaining - FURNACE_CLICK_MARGIN) / AgentHands.SMELT_TICKS);
     }
 
-    private boolean inspectIronSites() {
-        if (work.ironSiteLookUntil == 0) {
-            work.ironSiteLookUntil = tick + 24;
-            work.ironSiteYaw = player.getYaw();
+    private static BlockPos workshopCell(Face support) { return support.hit.getBlockPos().up(); }
+
+    private boolean workshopSupportCurrent(IronWorkshop shop, Face support) {
+        return support != null && !shop.refusedHere.contains(workshopCell(support))
+            && world.getBlockState(support.hit.getBlockPos()) == support.state && workshopSite(workshopCell(support))
+            && player.getEyePos().squaredDistanceTo(support.hit.getPos()) <= reach() * reach();
+    }
+
+    private static boolean workshopSightline(Vec3d eye, Face site, Face table) {
+        return table == null || new Box(workshopCell(site)).raycast(eye, table.hit.getPos()).isEmpty();
+    }
+
+    private static boolean workshopPair(Vec3d eye, Face bench, Face furnace) {
+        BlockPos a = workshopCell(bench), b = workshopCell(furnace);
+        if (a.equals(b)) return false;
+        Box tableBox = new Box(a);
+        return tableBox.raycast(eye, furnace.hit.getPos()).isEmpty()
+            && tableBox.raycast(eye, Vec3d.ofCenter(b)).isEmpty()
+            && new Box(b).raycast(eye, Vec3d.ofCenter(a)).isEmpty();
+    }
+
+    private BlockHitResult liveWorkshopFace(Face seen) {
+        return world.getBlockState(seen.hit.getBlockPos()) == seen.state
+            ? body.macroMineWitness(seen.hit, reach()) : null;
+    }
+
+    private boolean aimWorkshopFace(IronWorkshop shop, Face seen) {
+        if (shop.aiming != seen) {
+            shop.aiming = seen;
+            shop.aimUntil = tick + WORKSHOP_AIM_TICKS;
         }
-        if (tick >= work.ironSiteLookUntil) return false;
-        body.turnFine(work.ironSiteYaw, 55);
-        ironStatus("Checking the nearby dry support from the current footing; no movement was authorized.");
+        if (tick >= shop.aimUntil) return false;
+        body.aim(seen.hit.getPos());
+        ironStatus("Rechecking the exact previously witnessed workshop face before any vanilla use.");
+        return true;
+    }
+
+    private void observeIronSupports(IronWorkshop shop) {
+        if (shop.supports.size() >= WORKSHOP_SUPPORTS) return;
+        BlockHitResult seen = stationSupport(pos -> {
+            if (shop.refusedHere.contains(pos) || !workshopSite(pos)) return false;
+            for (Face support : shop.supports) if (workshopCell(support).equals(pos)) return false;
+            return true;
+        });
+        if (seen != null && player.getEyePos().squaredDistanceTo(seen.getPos()) <= reach() * reach())
+            shop.supports.add(face(seen));
+    }
+
+    private boolean readyWorkshopPair(IronWorkshop shop, boolean benchNeeded) {
+        Face bench = shop.tableSite, furnace = shop.furnaceSite;
+        Vec3d eye = player.getEyePos();
+        if (workshopSupportCurrent(shop, furnace)
+                && (benchNeeded ? workshopSupportCurrent(shop, bench) && workshopPair(eye, bench, furnace)
+                    : workshopSightline(eye, furnace, shop.table))) return true;
+        shop.tableSite = shop.furnaceSite = null;
+        for (Face candidate : shop.supports) {
+            if (!workshopSupportCurrent(shop, candidate)) continue;
+            if (!benchNeeded) {
+                if (!workshopSightline(eye, candidate, shop.table)) continue;
+                shop.furnaceSite = candidate;
+                return true;
+            }
+            for (Face other : shop.supports) {
+                if (!workshopSupportCurrent(shop, other) || !workshopPair(eye, other, candidate)) continue;
+                shop.tableSite = other;
+                shop.furnaceSite = candidate;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void observeWorkshopAlternate(IronWorkshop shop) {
+        if (shop.walked || client.options.forwardKey.isUnbound() || shop.supports.isEmpty()) return;
+        if (shop.alternate != null) {
+            if (world.getBlockState(shop.alternateGuide.hit.getBlockPos()) == shop.alternateGuide.state
+                    && workshopSite(workshopCell(shop.alternateGuide))) return;
+            shop.alternate = null;
+            shop.alternateUntil = 0;
+        }
+        Vec3d eye = player.getEyePos();
+        double reachSquared = reach() * reach();
+        for (Direction direction : CARDINAL) {
+            BlockPos floor = shop.foot.offset(direction).down();
+            Vec3d landing = Vec3d.ofBottomCenter(floor.up());
+            Vec3d fromThere = landing.add(0, eye.y - player.getY(), 0);
+            if (shop.table != null && fromThere.squaredDistanceTo(shop.table.hit.getPos()) > reachSquared) continue;
+            Face guide = null;
+            for (Face support : shop.supports) {
+                if (workshopCell(support).equals(floor.up())
+                        || world.getBlockState(support.hit.getBlockPos()) != support.state
+                        || !workshopSite(workshopCell(support)) || !workshopSightline(fromThere, support, shop.table)
+                        || fromThere.squaredDistanceTo(support.hit.getPos()) >= Math.min(reachSquared,
+                            eye.squaredDistanceTo(support.hit.getPos()))) continue;
+                guide = support;
+                break;
+            }
+            if (guide == null) continue;
+            BlockHitResult top = body.macroFloor(floor);
+            if (top == null) continue;
+            BlockState state = world.getBlockState(floor);
+            if (!dryWorkshopSupport(floor) || !world.getBlockState(floor.up()).isAir()
+                    || !world.getBlockState(floor.up(2)).isAir() || !body.macroFlatLane(floor, state, landing)
+                    || !body.macroNoVisiblePickup(landing)) continue;
+            shop.alternate = new Floor(floor, state, landing);
+            shop.alternateTop = top;
+            shop.alternateGuide = guide;
+            return;
+        }
+    }
+
+    private boolean useWorkshopAlternate(IronWorkshop shop) {
+        Floor floor = shop.alternate;
+        if (floor == null || shop.walked || client.options.forwardKey.isUnbound()
+                || !cardinallyAdjacent(shop.foot.down(), floor.pos)
+                || world.getBlockState(shop.alternateGuide.hit.getBlockPos()) != shop.alternateGuide.state
+                || !workshopSite(workshopCell(shop.alternateGuide))
+                || workTicksLeft() <= FURNACE_CLICK_MARGIN + AgentHands.SMELT_TICKS + WORKSHOP_SCAN_TICKS)
+            return false;
+        if (!floorCurrent(floor) || !body.macroNoVisiblePickup(floor.landing)
+                || !world.getBlockState(floor.pos.up()).isAir() || !world.getBlockState(floor.pos.up(2)).isAir()) {
+            if (shop.alternateUntil == 0) shop.alternateUntil = tick + WORKSHOP_AIM_TICKS;
+            if (tick >= shop.alternateUntil) return false;
+            body.aim(shop.alternateTop.getPos());
+            ironStatus("Rechecking the already witnessed adjacent dry workshop foothold.");
+            return true;
+        }
+        String label = "Walk one witnessed dry level tile to bring the known workshop support closer";
+        var offer = new Offer(null, new Key(Verb.APPROACH, floor.pos, 0, IRON_WORKSHOP_STEP),
+            label, "", 0, 0, floor, null, null, null, null);
+        action = new Action(null, offer, client, tick, now, body.renderedFrame(), 0, NO_ANCHORS, 42);
+        action.durable = true;
+        shop.walked = true;
+        status = work.detail = label;
+        enact("route", label);
+        return true;
+    }
+
+    private boolean inspectIronSites(IronWorkshop shop) {
+        if (shop.walked && shop.scanStarted == 0 && workshopSupportCurrent(shop, shop.alternateGuide)
+                && liveWorkshopFace(shop.alternateGuide) == null && aimWorkshopFace(shop, shop.alternateGuide)) return true;
+        observeWorkshopAlternate(shop);
+        if (shop.scanStarted == 0) {
+            shop.scanStarted = tick;
+            shop.scanYaw = player.getYaw();
+        }
+        long elapsed = tick - shop.scanStarted;
+        if (elapsed >= WORKSHOP_SCAN_TICKS) return useWorkshopAlternate(shop);
+        // Only a bounded arc around this stance. All candidates come from rendered views.
+        body.turnFine(shop.scanYaw + (elapsed < 7 ? 0 : elapsed < 18 ? -68 : 68), 60);
+        ironStatus("Checking the nearby dry workshop supports from the current footing.");
+        return true;
+    }
+
+    private boolean prepareIronRecipe(IronWorkshop shop, BlockHitResult table, AgentProgress progress) {
+        if (table != null && (shop.placedTable == null || table.getBlockPos().equals(shop.placedTable)))
+            shop.table = face(table);
+        else table = null;
+        if (shop.table != null && world.getBlockState(shop.table.hit.getBlockPos()) != shop.table.state)
+            shop.table = null;
+        boolean benchNeeded = shop.table == null;
+        observeIronSupports(shop);
+        if (!readyWorkshopPair(shop, benchNeeded)) {
+            if (!inspectIronSites(shop))
+                searchWork("No witnessed, reachable pair of dry workstation sites; the furnace recipe was left untouched.");
+            return true;
+        }
+        if (!benchNeeded) {
+            if (shop.recipeSupport != shop.furnaceSite) {
+                if (liveWorkshopFace(shop.furnaceSite) == null) {
+                    if (!aimWorkshopFace(shop, shop.furnaceSite))
+                        shop.refusedHere.add(workshopCell(shop.furnaceSite));
+                    return true;
+                }
+                shop.recipeSupport = shop.furnaceSite;
+            }
+            BlockHitResult current = table != null ? table : liveWorkshopFace(shop.table);
+            if (current != null && startWorkRecipe("furnace", 1, current)) {
+                observeWorkshopAlternate(shop);
+                return true;
+            }
+            if (current == null && aimWorkshopFace(shop, shop.table)) return true;
+            searchWork("The planned dry workshop lost its usable crafting table before the furnace recipe.");
+            return true;
+        }
+        if (work.budget.limit(Items.CRAFTING_TABLE, count(Items.CRAFTING_TABLE)) == 0) {
+            if (!startStockRecipe("crafting_table", 1, null, progress, new HashSet<>(4)))
+                searchWork("The planned workshop still lacks a reserve-safe crafting table or its approved ingredients.");
+            return true;
+        }
+        BlockHitResult support = liveWorkshopFace(shop.tableSite);
+        if (support != null) {
+            startWorkStep(Verb.WORK_PLACE, "Place the authorized table without blocking the witnessed furnace site",
+                face(support), null, Items.CRAFTING_TABLE, null);
+        } else if (!aimWorkshopFace(shop, shop.tableSite)) {
+            shop.refusedHere.add(workshopCell(shop.tableSite));
+        }
+        return true;
+    }
+
+    private boolean placeIronFurnace(IronWorkshop shop) {
+        Face planned = shop.furnaceSite;
+        BlockHitResult support = workshopSupportCurrent(shop, planned) ? liveWorkshopFace(planned) : null;
+        if (support == null) {
+            var eye = player.getEyePos();
+            support = stationSupport(pos -> !shop.refusedHere.contains(pos) && workshopSite(pos)
+                && (shop.table == null || new Box(pos).raycast(eye, shop.table.hit.getPos()).isEmpty()));
+        }
+        if (support != null && player.getEyePos().squaredDistanceTo(support.getPos()) <= reach() * reach()) {
+            startWorkStep(Verb.WORK_PLACE, "Place one authorized furnace on witnessed dry support",
+                face(support), null, Items.FURNACE, null);
+            return true;
+        }
+        observeIronSupports(shop);
+        if (readyWorkshopPair(shop, false)) {
+            if (aimWorkshopFace(shop, shop.furnaceSite)) return true;
+            shop.refusedHere.add(workshopCell(shop.furnaceSite));
+        }
+        if (inspectIronSites(shop)) return true;
+        searchWork("No reachable dry furnace support remained after the bounded local workshop check.");
+        return false;
+    }
+
+    private boolean aimPlacedWorkshopStation(IronWorkshop shop, BlockPos pos, Block block) {
+        Vec3d point = Vec3d.ofCenter(pos);
+        if (tick >= shop.openingUntil || !world.getBlockState(pos).isOf(block)
+                || player.getEyePos().squaredDistanceTo(point) > (reach() + 0.55) * (reach() + 0.55)) return false;
+        body.aim(point);
+        ironStatus("Reacquiring the freshly placed workshop station from a rendered view.");
         return true;
     }
 
@@ -2949,6 +3244,10 @@ final class AgentMacroControl {
         if (work.collectedIron) {
             searchWork("The witnessed furnace batch was collected, but actual iron stock still needs " + needed
                 + "; this lease does not reload the furnace.");
+            return false;
+        }
+        if (work.ironWorkshop != null && !work.ironWorkshop.foot.equals(player.getBlockPos())) {
+            searchWork("The work order lost its verified workshop footing.");
             return false;
         }
         if (!settled() && dryWorkshopSupport(footing)) {
@@ -2988,21 +3287,20 @@ final class AgentMacroControl {
                 && personalFurnace.face.hit.getBlockPos().getY() >= player.getBlockY()
                 && visibleStation(Blocks.FURNACE, personalFurnace.face.hit.getBlockPos()) == null
                 && startStationRecall(personalFurnace)) return true;
+        IronWorkshop shop = work.ironWorkshop != null ? work.ironWorkshop : new IronWorkshop(player.getBlockPos());
         if (work.placedFurnace != null) {
+            if (aimPlacedWorkshopStation(shop, work.placedFurnace, Blocks.FURNACE)) return true;
             searchWork("The one placed furnace is not currently witnessed cold and reachable from the dry stance.");
         } else if (!work.budget.policy.placeFurnace()) {
             searchWork("No cold furnace is witnessed in reach; place:minecraft:furnace was not authorized.");
         } else if (!work.budget.canPlace() || work.budget.remainingCost(Items.FURNACE) == 0) {
             searchWork("No furnace placement or minecraft:furnace cost remains in the work budget.");
         } else if (work.budget.canPlaceFurnace(player.getInventory())) {
-            var support = stationSupport(this::furnaceSite);
-            if (support != null) {
-                startWorkStep(Verb.WORK_PLACE, "Place one authorized furnace on witnessed dry support",
-                    face(support), null, Items.FURNACE, null);
-                return true;
-            }
-            if (!inspectIronSites())
-                searchWork("No free, reachable same-level furnace site on witnessed full dry support.");
+            work.ironWorkshop = shop;
+            if (table != null && shop.table == null) shop.table = face(table);
+            return placeIronFurnace(shop);
+        } else if (shop.furnaceCrafted) {
+            searchWork("The already crafted furnace is no longer placeable above its reserve; no second furnace was crafted.");
         } else if (count(Items.FURNACE) < work.budget.floor(Items.FURNACE)) {
             searchWork("The carried furnace stock is below its declared reserve; crafting one furnace would not leave one to place.");
         } else if (!work.budget.policy.craftAllowed("furnace")) {
@@ -3011,23 +3309,31 @@ final class AgentMacroControl {
             searchWork("Crafting a furnace and smelting its first iron need two shared recipe executions.");
         } else {
             if (table != null && table.getBlockPos().getY() < player.getBlockY()) table = null;
-            if (table == null && stationRecallReady(personalTable)
+            if (table != null && shop.placedTable != null && !shop.placedTable.equals(table.getBlockPos()))
+                table = visibleStation(Blocks.CRAFTING_TABLE, shop.placedTable);
+            if (shop.table != null && !sameStation(shop.table)) shop.table = null;
+            boolean benchNeeded = table == null && shop.table == null;
+            if (benchNeeded && stationRecallReady(personalTable)
                     && personalTable.face.hit.getBlockPos().getY() >= player.getBlockY()
                     && hands.workCraftable("furnace", work.budget) && startStationRecall(personalTable)) return true;
-            if (table == null && (!work.budget.policy.placeTable() || work.budget.placementsLeft() < 2
+            if (benchNeeded && shop.placedTable != null) {
+                if (aimPlacedWorkshopStation(shop, shop.placedTable, Blocks.CRAFTING_TABLE)) return true;
+                searchWork("The one placed crafting table is not witnessed in reach; no second table was spent.");
+            } else if (benchNeeded && (!work.budget.policy.placeTable() || work.budget.placementsLeft() < 2
                     || work.budget.remainingCost(Items.CRAFTING_TABLE) == 0)) {
                 searchWork("No crafting table is witnessed in reach; both the table and furnace need their own placement permissions and costs.");
-            } else if (table == null && count(Items.CRAFTING_TABLE) < work.budget.floor(Items.CRAFTING_TABLE)) {
+            } else if (benchNeeded && count(Items.CRAFTING_TABLE) < work.budget.floor(Items.CRAFTING_TABLE)) {
                 searchWork("The carried crafting-table stock is below its reserve; one new table would not leave one to place.");
-            } else if (table == null && count(Items.CRAFTING_TABLE) <= work.budget.floor(Items.CRAFTING_TABLE)
+            } else if (benchNeeded && count(Items.CRAFTING_TABLE) <= work.budget.floor(Items.CRAFTING_TABLE)
                     && (!work.budget.policy.craftAllowed("crafting_table") || work.budget.craftsLeft() < 3)) {
                 searchWork("No crafting table is available above its reserve; an explicit table recipe and a third shared execution are needed.");
+            } else if (hands.workCraftable("furnace", work.budget)) {
+                work.ironWorkshop = shop;
+                return prepareIronRecipe(shop, table, progress);
             } else if (startStockRecipe("furnace", 1, table, progress, new HashSet<>(4))) {
                 return true;
-            } else if (hands.workNeed("furnace", work.budget) != null) {
-                searchWork("Crafting the furnace lacks reserve-safe stone ingredients under the declared costs and visible procurement rights.");
-            } else if (table != null || !inspectIronSites()) {
-                searchWork("No reserve-safe crafting table and dry placement site or inventory room could support the furnace recipe.");
+            } else {
+                searchWork("Crafting the furnace lacks reserve-safe stone ingredients, a suitable work screen or output room.");
             }
         }
         return false;
@@ -3740,6 +4046,11 @@ final class AgentMacroControl {
             return;
         }
         if (!body.hasRecentView()) return; // Do not issue another movement tick from a missing frame.
+        if (IRON_WORKSHOP_STEP.equals(offer.key.activity) && (!world.getBlockState(floor.pos.up()).isAir()
+                || !world.getBlockState(floor.pos.up(2)).isAir())) {
+            interrupt("The witnessed dry workshop destination is no longer empty.", true);
+            return;
+        }
         if (!collect && tick != action.started && !body.macroNoVisiblePickup(floor.landing)) {
             interrupt("A visible pickup overlaps the walking lane, or the view cannot check it.", true);
             return;
@@ -3812,6 +4123,13 @@ final class AgentMacroControl {
                 }
                 if (action.durable) work.confirmedCrafts += result.executions();
                 if (offer.face != null) rememberStation(offer.face);
+                if (action.durable && work.ironWorkshop != null && offer.recipe.id.equals("furnace")) {
+                    work.ironWorkshop.furnaceCrafted = true;
+                    work.ironWorkshop.scanStarted = 0;
+                    work.ironWorkshop.aiming = null;
+                    work.sourceSearch.freshAfter = body.renderedFrame();
+                    workshopMilestone("crafted", "Vanilla confirmed one furnace stored; placement is not yet issued.");
+                }
                 continuityWork = AgentPauseEpisodes.Work.GUI;
                 complete("Vanilla crafting confirmed " + result.items() + " output from " + offer.recipe.id + ".");
             } else interrupt("The hand job ended without a matching vanilla crafting receipt.", true);
@@ -4791,6 +5109,7 @@ final class AgentMacroControl {
         }
         if (action.durable) {
             remember("work " + action.offer.key.verb.id + " " + result + ": " + detail);
+            boolean workshopWalk = verb == Verb.APPROACH && IRON_WORKSHOP_STEP.equals(action.offer.key.activity);
             boolean deepTravel = action.diamondRoute && (action.offer.key.verb == Verb.WORK_TREAD || action.offer.key.verb == Verb.FOLLOW);
             if (deepTravel && !result.equals("completed")) {
                 BlockPos from = action.tread != null ? action.tread.from : action.offer.route.from();
@@ -4816,16 +5135,18 @@ final class AgentMacroControl {
                         retireWork("blocked", "interrupted", detail);
                     }
                 }
-                if (action.offer.face != null && verb != Verb.STATION_REACQUIRE) {
+                if (action.offer.face != null && verb != Verb.STATION_REACQUIRE && !action.workshopFaceLost) {
                     BlockPos refused = action.offer.face.hit.getBlockPos();
                     if (action.offer.key.verb == Verb.WORK_PLACE) refused = refused.up();
                     work.rejected.add(refused);
                 } else if (action.offer.drop != null) work.rejectedDrops.add(action.offer.drop.getId());
-                if (action.offer.key.verb == Verb.CONTINUE || action.offer.key.verb == Verb.WORK_SMELT
+                if (workshopWalk || action.offer.key.verb == Verb.CONTINUE || action.offer.key.verb == Verb.WORK_SMELT
                         || action.offer.key.verb == Verb.WORK_FILL
-                        || action.offer.key.verb == Verb.WORK_PLACE && action.offer.item == Items.FURNACE)
+                        || action.offer.key.verb == Verb.WORK_PLACE && action.offer.item == Items.FURNACE
+                            && !action.workshopFaceLost)
                     retireWork("needs_replan", "interrupted", detail);
             } else if (result.equals("completed")) {
+                if (workshopWalk) work.ironWorkshop.arrived(action.offer.floor.pos.up());
                 if (action.offer.key.verb == Verb.APPROACH || action.prospectCover)
                     work.sourceSearch.freshAfter = body.renderedFrame();
                 if (action.offer.key.verb == Verb.BREAK || action.offer.key.verb == Verb.CONTINUE

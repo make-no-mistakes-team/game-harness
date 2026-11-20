@@ -20,6 +20,7 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.effect.StatusEffects;
+import net.minecraft.entity.mob.EndermanEntity;
 import net.minecraft.entity.mob.Monster;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.item.BlockItem;
@@ -132,6 +133,7 @@ final class AgentBody {
     private final AgentHeadroom headroom;
     private final Consumer<ContactEvidence> contactEvidence;
     private final AgentLookMotor lookMotor;
+    private final AgentThreatView<LivingEntity> threats = new AgentThreatView<>();
 
     private ClientWorld observedWorld;
     private ClientPlayerEntity observedPlayer;
@@ -162,7 +164,6 @@ final class AgentBody {
     private long frameSequence;
     private HitResult renderedCrosshair;
     private HitResult tickCrosshair;
-    private Vec3d threatPoint;
     private Vec3d aimPoint;
     private float aimYaw;
     private float aimPitch;
@@ -255,6 +256,7 @@ final class AgentBody {
         sampleRange = 0;
         rayShapeContext = null;
         tickCrosshair = null;
+        threats.begin(0);
         nightVision = client.player != null && client.player.hasStatusEffect(StatusEffects.NIGHT_VISION);
         resetIntentions();
         if (hazardWorld != client.world || hazardPlayer != client.player) {
@@ -333,17 +335,24 @@ final class AgentBody {
         double dt = Math.min(elapsed, 0.05);
         if (lastFrame != 0 && now - lastFrame > 150_000_000L) lookMotor.stop(now);
         lastFrame = now;
-        if (!steering || !ready()) {
+        boolean avoidEyes = threats.hasGazeRisk() && !fallSteering && !lavaEmergency && hasView();
+        if ((!steering && !avoidEyes) || !ready()) {
             lookMotor.stop(now);
             return;
         }
         if (dt <= 0) return;
         var player = client.player;
-        Vec3d origin = aimPoint == null ? null
+        Vec3d origin = aimPoint == null && !avoidEyes ? null
             : player.getCameraPosVec(client.getRenderTickCounter().getTickDelta(true));
         float yawBefore = player.getYaw(), pitchBefore = player.getPitch();
-        float targetYaw = goalYaw(player, origin), targetPitch = goalPitch(origin);
-        if (!gaitSteering && !fallSteering && !fixedSteering && !lavaEmergency) {
+        float targetYaw = steering ? goalYaw(player, origin) : yawBefore;
+        float targetPitch = steering ? goalPitch(origin) : pitchBefore;
+        if (avoidEyes) targetPitch = threats.lookPitch(origin, yawBefore, targetYaw, targetPitch);
+        if (!steering && targetPitch == pitchBefore) {
+            lookMotor.stop(now);
+            return;
+        }
+        if (steering && !gaitSteering && !fallSteering && !fixedSteering && !lavaEmergency) {
             lookMotor.step(lookContext, lookTarget, yawBefore, pitchBefore, targetYaw, targetPitch, dt, now, tick);
             if (lookMotor.yawStep() != 0 || lookMotor.pitchStep() != 0) {
                 player.changeLookDirection(lookMotor.yawStep() / 0.15, lookMotor.pitchStep() / 0.15);
@@ -355,7 +364,7 @@ final class AgentBody {
         double yaw = MathHelper.wrapDegrees(targetYaw - yawBefore);
         double pitch = targetPitch - pitchBefore;
         double response = -Math.expm1(-dt / TURN_TIME);
-        if (gaitSteering) {
+        if (steering && gaitSteering) {
             double yawStep = MathHelper.clamp(yaw * response, -TURN_SPEED * dt, TURN_SPEED * dt);
             double brakingSpeed = Math.sqrt(2 * GAIT_PITCH_ACCELERATION * Math.abs(pitch));
             double speed = Math.min(GAIT_PITCH_SPEED, brakingSpeed);
@@ -380,8 +389,8 @@ final class AgentBody {
                 : Math.min(response, TURN_SPEED * dt / distance);
             player.changeLookDirection(yaw * fraction / 0.15, pitch * fraction / 0.15);
         }
-        AgentLookMotor.Context context = fallSteering ? AgentLookMotor.Context.FALL
-            : lavaEmergency ? AgentLookMotor.Context.URGENT : lookContext;
+        AgentLookMotor.Context context = !steering ? AgentLookMotor.Context.NORMAL
+            : fallSteering ? AgentLookMotor.Context.FALL : lavaEmergency ? AgentLookMotor.Context.URGENT : lookContext;
         recordProtectedLook(context, targetYaw, targetPitch, yawBefore, pitchBefore, distance, elapsed, now);
     }
 
@@ -428,6 +437,7 @@ final class AgentBody {
         eye = null;
         renderedCrosshair = null;
         observedAtNanos = 0;
+        threats.begin(0);
         clearContact();
     }
 
@@ -503,6 +513,7 @@ final class AgentBody {
                             use = actual != null && (actual.getType() == HitResult.Type.MISS
                                 || actual instanceof EntityHitResult hit && (hit.getEntity() == shielding
                                     || shielding == null && hit.getEntity() instanceof Monster
+                                    && mayContact(hit.getEntity())
                                     && renderedCrosshair instanceof EntityHitResult shown
                                     && shown.getEntity() == hit.getEntity()));
                         }
@@ -533,7 +544,7 @@ final class AgentBody {
                         && !(player.getMainHandStack().getItem() instanceof BlockItem);
                 crouch |= actual != null && actual.getType() == HitResult.Type.BLOCK;
             } else if (striking != null) {
-                if (actual instanceof EntityHitResult hit && hit.getEntity() == striking
+                if (strikeContact(striking, actual)
                         && striking.isAlive() && !player.isUsingItem()
                         && canWearSafetyItem(player.getMainHandStack())
                         && player.getAttackCooldownProgress(0.5f) >= 0.9f) {
@@ -1337,7 +1348,17 @@ final class AgentBody {
     void strike(Entity target) { striking = target; }
 
     boolean strikeTarget(Entity target) {
-        return hasView() && currentCrosshair() instanceof EntityHitResult hit && hit.getEntity() == target;
+        return hasView() && strikeContact(target, currentCrosshair());
+    }
+
+    private boolean strikeContact(Entity target, HitResult actual) {
+        return actual instanceof EntityHitResult hit && hit.getEntity() == target
+            && (!(target instanceof EndermanEntity enderman) || hasView()
+                && threats.canStrikeEnderman(enderman, hit.getPos().y, enderman.getEyeY(), enderman.getHeight()));
+    }
+
+    private boolean mayContact(Entity target) {
+        return !(target instanceof EndermanEntity enderman) || hasView() && threats.canContactEnderman(enderman);
     }
 
     boolean hasRecentView() { return hasView(); }
@@ -1884,7 +1905,9 @@ final class AgentBody {
             || stack.isIn(ItemTags.AXES) || stack.isIn(ItemTags.PICKAXES);
     }
 
-    void blockAgainst(LivingEntity threat) { shielding = threat; }
+    void blockAgainst(LivingEntity threat) {
+        if (mayContact(threat)) shielding = threat;
+    }
 
     /** Face an observed bearing; vanilla use still requires a safe hand and crosshair. */
     void guardRangedBearing(float yaw) { rangedShieldYaw = yaw; }
@@ -2586,30 +2609,59 @@ final class AgentBody {
     }
 
     Optional<LivingEntity> threat(double distance) {
-        threatPoint = null;
-        return visibleEntity(LivingEntity.class, entity -> entity instanceof Monster, distance, true);
+        if (!hasView()) return Optional.empty();
+        double max = range(distance);
+        threats.begin(max * max);
+        if (!(max > 0)) return Optional.empty();
+        for (LivingEntity candidate : client.world.getEntitiesByClass(LivingEntity.class, entityArea(max),
+                entity -> entity instanceof Monster && availableEntity(entity))) {
+            if (raysLeft <= 0) break;
+            Vec3d center = candidate.getBoundingBox().getCenter();
+            double d = center.squaredDistanceTo(eye);
+            if (candidate instanceof EndermanEntity enderman) {
+                if (d <= max * max) observeEnderman(enderman, center, d);
+            } else if (threats.couldSelect(d)) {
+                Vec3d visible = visibleEntityPoint(candidate, center);
+                if (visible != null) threats.observeHostile(candidate, visible, d);
+            }
+        }
+        return Optional.ofNullable(threats.target());
     }
 
-    Vec3d threatPoint() { return threatPoint; }
+    private void observeEnderman(EndermanEntity enderman, Vec3d center, double distanceSquared) {
+        Vec3d body = clearPoint(center, Ray.SIGHT) ? center : null;
+        if (body == null) {
+            Vec3d legs = center.add(0, -enderman.getHeight() * 0.32, 0);
+            if (clearPoint(legs, Ray.SIGHT)) body = legs;
+        }
+        Vec3d eyes = enderman.getEyePos();
+        boolean clearEyes = clearSight(eyes, Ray.SIGHT);
+        // The emissive eyes are visible in darkness when the face is turned our way.
+        boolean shownEyes = clearEyes && (body != null || lit(eyes.x, eyes.y, eyes.z)
+            || Math.abs(MathHelper.wrapDegrees(heading(eye.x - eyes.x, eye.z - eyes.z)
+                - enderman.getHeadYaw())) < 75);
+        if (body == null && !shownEyes) return;
+        // Exactly the synced flag that drives the vanilla renderer's angry head and shake.
+        threats.observeEnderman(enderman, body, shownEyes ? eyes : null, distanceSquared, enderman.isAngry());
+    }
+
+    Vec3d threatPoint() { return threats.aim(); }
 
     Optional<ItemEntity> dropped(Predicate<ItemStack> matches, double distance) {
-        return visibleEntity(ItemEntity.class, entity -> matches.test(entity.getStack()), distance, false);
+        return visibleEntity(ItemEntity.class, entity -> matches.test(entity.getStack()), distance);
     }
 
     Optional<Entity> visibleEntity(Predicate<Entity> matches, double distance) {
-        return visibleEntity(Entity.class, matches, distance, false);
+        return visibleEntity(Entity.class, matches, distance);
     }
 
-    private <T extends Entity> Optional<T> visibleEntity(Class<T> type, Predicate<T> matches, double distance,
-                                                       boolean rememberThreatPoint) {
+    private <T extends Entity> Optional<T> visibleEntity(Class<T> type, Predicate<T> matches, double distance) {
         if (!hasView()) return Optional.empty();
         double max = range(distance);
         if (!(max > 0)) return Optional.empty();
         double bestDistance = max * max;
         T best = null;
-        Box area = new Box(eye.x - max, eye.y - max, eye.z - max, eye.x + max, eye.y + max, eye.z + max);
-        for (T candidate : client.world.getEntitiesByClass(type, area,
-                entity -> entity != client.player && entity.isAlive() && !entity.isInvisibleTo(client.player))) {
+        for (T candidate : client.world.getEntitiesByClass(type, entityArea(max), this::availableEntity)) {
             if (raysLeft <= 0) break;
             Vec3d center = candidate.getBoundingBox().getCenter();
             double d = center.squaredDistanceTo(eye);
@@ -2619,9 +2671,16 @@ final class AgentBody {
             if (!matches.test(candidate)) continue;
             best = candidate;
             bestDistance = d;
-            if (rememberThreatPoint) threatPoint = visible;
         }
         return Optional.ofNullable(best);
+    }
+
+    private Box entityArea(double max) {
+        return new Box(eye.x - max, eye.y - max, eye.z - max, eye.x + max, eye.y + max, eye.z + max);
+    }
+
+    private boolean availableEntity(Entity entity) {
+        return entity != client.player && entity.isAlive() && !entity.isInvisibleTo(client.player);
     }
 
     private Vec3d visibleEntityPoint(Entity candidate, Vec3d center) {
@@ -2634,10 +2693,13 @@ final class AgentBody {
     }
 
     private boolean clearPoint(Vec3d point, Ray ray) {
+        return clearSight(point, ray) && lit(point.x, point.y, point.z);
+    }
+
+    private boolean clearSight(Vec3d point, Ray ray) {
         if (raysLeft <= 0 || !inView(point)) return false;
         raysLeft--;
-        return raycast(point, ray).getType() == HitResult.Type.MISS
-            && lit(point.x, point.y, point.z);
+        return raycast(point, ray).getType() == HitResult.Type.MISS;
     }
 
     private BlockHitResult visibleHit(Vec3d end, Ray ray) {

@@ -7112,8 +7112,9 @@ final class AgentProgress {
             return false;
         }
         float health = c.player.getHealth();
+        boolean avoidEndermanDuel = defense.retreatFromEnderman(threat, safetySpend);
         boolean flee = threat != null && (creeper || health <= 7 || health <= 10 && wantsHealingMeal()
-            || defense.reserveRequiresRetreat(safetySpend));
+            || avoidEndermanDuel || defense.reserveRequiresRetreat(safetySpend));
         if (flee && tick >= retreatUntil - 10) {
             retreatYaw = yaw(c.player.getPos().subtract(threat.getPos()));
             retreatUntil = tick + 15;
@@ -7123,7 +7124,8 @@ final class AgentProgress {
             defense.forgetContact();
             defense.markDanger(tick);
             interruptHands();
-            status = creeper ? "backing off a creeper" : flee ? "retreating while hurt" : "clearing room after danger";
+            status = creeper ? "backing off a creeper" : avoidEndermanDuel ? "backing off an angry Enderman"
+                : flee ? "retreating while hurt" : "clearing room after danger";
             if (step(forward(retreatYaw), true, true) == Walk.BLOCKED) retreatYaw += 65;
             return true;
         }

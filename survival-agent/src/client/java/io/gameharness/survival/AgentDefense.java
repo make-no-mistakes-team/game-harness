@@ -11,6 +11,7 @@ import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.ai.RangedAttackMob;
 import net.minecraft.entity.attribute.EntityAttributes;
+import net.minecraft.entity.mob.EndermanEntity;
 import net.minecraft.entity.mob.ZombieEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.BlockItem;
@@ -213,10 +214,20 @@ final class AgentDefense {
     }
 
     private boolean meleeOutmatched() {
+        return meleeOutmatched(null);
+    }
+
+    boolean retreatFromEnderman(LivingEntity threat, Predicate<ItemStack> spend) {
+        return threat instanceof EndermanEntity && (body.threatPoint() == null || meleeOutmatched(spend));
+    }
+
+    private boolean meleeOutmatched(Predicate<ItemStack> spend) {
         var player = client.player;
-        int weapon = bestWeapon(PlayerInventory.HOTBAR_SIZE, true);
+        int weapon = bestWeapon(PlayerInventory.HOTBAR_SIZE, true, spend);
         if (weapon < 0) return true; // A shield without a weapon is still not a duel kit.
-        if (SHIELD.test(player.getOffHandStack()) || SHIELD.test(player.getMainHandStack()) || player.getArmor() >= 4)
+        ItemStack main = player.getMainHandStack(), offhand = player.getOffHandStack();
+        if (SHIELD.test(offhand) && canWear(offhand, spend) || SHIELD.test(main) && canWear(main, spend)
+                || player.getArmor() >= 4)
             return false;
         ItemStack stack = player.getInventory().getStack(weapon);
         return stack.isOf(Items.WOODEN_AXE) || stack.isOf(Items.WOODEN_SWORD) || player.getHealth() <= 10;
@@ -752,7 +763,9 @@ final class AgentDefense {
         }
         guard(threat, mainShield || offhand);
         double distance = player.squaredDistanceTo(threat);
-        return distance > 2.65 * 2.65 && (threat instanceof RangedAttackMob || !mainShield && !offhand
+        // Let an angry Enderman close on our footing rather than following its teleports.
+        return !(threat instanceof EndermanEntity) && distance > 2.65 * 2.65
+            && (threat instanceof RangedAttackMob || !mainShield && !offhand
             || distance > 4.4 * 4.4 || tick - engagementStarted >= 14);
     }
 

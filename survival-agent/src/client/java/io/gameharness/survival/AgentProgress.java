@@ -639,12 +639,8 @@ final class AgentProgress {
         caves.witnessedDry(to, from);
     }
 
-    /** One remembered edge only; the scoped actor must re-witness its dry lane before movement. */
-    BlockPos macroPendingStep(BlockPos from, BlockPos stationFoot) {
-        return memory.pendingFlatStep(c.world, trail, from, stationFoot);
-    }
-
     private void recordDryCaveFooting(BlockPos from, BlockPos to) {
+        body.recordWalkedLeg(from, to);
         int prior = trail.lastIndexOf(from);
         if (prior < 0) {
             // Do not join a new real edge onto a historical neighbor. Keep that
@@ -1372,7 +1368,7 @@ final class AgentProgress {
     }
 
     /** Existing visible-lane navigation, with water entries and recovery edits disabled. */
-    boolean macroWorkWalk(Vec3d point) { return approach(point, false, false) != Walk.BLOCKED; }
+    boolean macroWorkWalk(Vec3d point, boolean levelOnly) { return approach(point, false, false, levelOnly) != Walk.BLOCKED; }
 
     private void recordStallFooting(BlockPos reached) {
         if (returnIndex >= 0) {
@@ -4414,6 +4410,7 @@ final class AgentProgress {
                 walked.add(from);
                 caves.walkedDry(old, from);
                 caves.witnessedDry(from, old);
+                body.recordWalkedLeg(old, from);
                 if (from.getY() > old.getY()) {
                     rises++;
                     stallGuard.navigationArrival(old, from);
@@ -5902,6 +5899,7 @@ final class AgentProgress {
         if (!trail.isEmpty() && from.equals(trail.getLast())) appendGrounded(to, true);
         caves.walkedDry(from, to);
         caves.witnessedDry(to, from);
+        body.recordWalkedLeg(from, to);
         stallGuard.navigationArrival(from, to);
         digDirection = bearing;
     }
@@ -7592,13 +7590,21 @@ final class AgentProgress {
     }
 
     private Walk walkToward(Vec3d point, boolean sprint, boolean allowWater) {
+        return walkToward(point, sprint, allowWater, false);
+    }
+
+    private Walk walkToward(Vec3d point, boolean sprint, boolean allowWater, boolean levelOnly) {
         Vec3d horizontal = point.subtract(c.player.getPos()).multiply(1, 0, 1);
         if (horizontal.horizontalLengthSquared() < 0.015) return Walk.BLOCKED;
-        return step(horizontal.normalize(), sprint, allowWater);
+        return step(horizontal.normalize(), sprint, allowWater, levelOnly);
     }
 
     /** Advance toward the target along a lane selected from the present view. */
     private Walk approach(Vec3d point, boolean sprint, boolean allowWater) {
+        return approach(point, sprint, allowWater, false);
+    }
+
+    private Walk approach(Vec3d point, boolean sprint, boolean allowWater, boolean levelOnly) {
         Vec3d feet = c.player.getPos();
         double distance = feet.distanceTo(point);
         if (approachGoal == null || horizontalDistance(point, approachGoal) > 1.15) {
@@ -7612,12 +7618,16 @@ final class AgentProgress {
         }
         if (tick >= approachDeadline) return Walk.BLOCKED;
         double sprintDistance = c.player.isSprinting() ? 4 : 5.5;
-        return walkToward(point, horizontalDistance(feet, point) > sprintDistance
-            || sprint && distance > sprintDistance, allowWater);
+        return walkToward(point, !levelOnly && (horizontalDistance(feet, point) > sprintDistance
+            || sprint && distance > sprintDistance), allowWater, levelOnly);
     }
 
     /** Fix the gaze on a short route ahead; keep movement contingent on freshly observed footing. */
     private Walk step(Vec3d horizontal, boolean sprint, boolean allowWater) {
+        return step(horizontal, sprint, allowWater, false);
+    }
+
+    private Walk step(Vec3d horizontal, boolean sprint, boolean allowWater, boolean levelOnly) {
         Vec3d feet = c.player.getPos();
         float requested = yaw(horizontal);
         boolean landingInProgress = !c.player.isOnGround() && !c.player.isTouchingWater()
@@ -7677,7 +7687,7 @@ final class AgentProgress {
                     case WATER -> 1;
                     default -> -1;
                 };
-                if (quality < 0) continue;
+                if (quality < 0 || levelOnly && ground != Footing.LEVEL) continue;
                 double score = quality - 0.045 * bearingDistance(bearing, facing)
                     - 0.020 * Math.abs(offset);
                 if (supportAhead(feet, other, 3.6, 2.15, 1.65) != null) score += 1.5;
@@ -7731,7 +7741,7 @@ final class AgentProgress {
             routeLanding = null;
         }
         boolean needsFooting = actual == Footing.UNKNOWN || actual == Footing.EDGE;
-        if (needsFooting && !landingInProgress && turn <= 5 && body.continueSurfaceStep(facing)) {
+        if (!levelOnly && needsFooting && !landingInProgress && turn <= 5 && body.continueSurfaceStep(facing)) {
             rememberMotion();
             body.lookAlongGait(routeYaw, inspectingFooting ? INSPECT_PITCH : cruisePitch);
             return Walk.MOVING;
@@ -7746,6 +7756,9 @@ final class AgentProgress {
             inspectingFooting = false;
         }
         body.lookAlongGait(routeYaw, inspectingFooting ? INSPECT_PITCH : cruisePitch);
+        // A separate witnessed route or tread owns any level change while a return is owed.
+        if (levelOnly && actual != Footing.LEVEL)
+            return turn > 5 || needsFooting && poorFootTicks < 25 ? Walk.LOOKING : Walk.BLOCKED;
         if (actual == Footing.BLOCKED && (landingInProgress || turn > 5)) return Walk.LOOKING;
         if (actual == Footing.BLOCKED) return Walk.BLOCKED;
         if (actual == Footing.UNKNOWN) {
@@ -7976,7 +7989,7 @@ final class AgentProgress {
             && !state.isIn(BlockTags.CLIMBABLE);
     }
 
-    private static boolean dangerous(BlockState state) {
+    static boolean dangerous(BlockState state) {
         return state.getFluidState().isIn(FluidTags.LAVA) || state.isOf(Blocks.FIRE)
             || state.isOf(Blocks.SOUL_FIRE) || state.isOf(Blocks.MAGMA_BLOCK) || state.isOf(Blocks.CACTUS)
             || state.isOf(Blocks.SWEET_BERRY_BUSH) || state.isOf(Blocks.CAMPFIRE) || state.isOf(Blocks.SOUL_CAMPFIRE)

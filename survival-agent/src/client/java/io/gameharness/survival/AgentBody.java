@@ -138,6 +138,8 @@ final class AgentBody {
     private ClientWorld hazardWorld;
     private ClientPlayerEntity hazardPlayer;
     private Vec3d dryFooting;
+    private AgentWalkedRoute walkedRoutes;
+    private final BlockPos.Mutable walkedProbe = new BlockPos.Mutable();
     private int dryFootingTick;
     private Vec3d previousDryFooting;
     private int previousDryFootingTick;
@@ -1639,6 +1641,38 @@ final class AgentBody {
         return dryRouteVeto(from, to) == DryRouteVeto.CLEAR;
     }
 
+    void trackWalkedRoutes(AgentWalkedRoute routes) { walkedRoutes = routes; }
+
+    /** Called by an ordinary actuator on actual settled arrival, never from idle position samples. */
+    void recordWalkedLeg(BlockPos from, BlockPos to) {
+        if (walkedRoutes == null || !hasView() || lavaEmergency || macroLavaNear()) return;
+        var player = client.player;
+        if (!player.isOnGround() || player.isTouchingWater() || player.isOnFire() || player.hasVehicle()
+                || player.hurtTime != 0 || player.getAbilities().flying || player.isSpectator() || !player.getBlockPos().equals(to)
+                || Math.abs(player.getY() - to.getY()) > 0.055) return;
+        int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ();
+        Direction travel = dx == 0 ? dz > 0 ? Direction.SOUTH : Direction.NORTH : dx > 0 ? Direction.EAST : Direction.WEST;
+        if (walkedLaneDry(from, to, travel) && AgentSurfaceTread.retainedLaneClear(client, from, to, travel))
+            walkedRoutes.landed(from.asLong(), to.asLong());
+    }
+
+    /** A veto on two already-attested columns, not a source of new navigation targets. */
+    boolean walkedLaneDry(BlockPos from, BlockPos to, Direction travel) {
+        return AgentSurfaceTread.cardinalTread(from, to, travel) && walkedColumnDry(from, from.getY() != to.getY())
+            && walkedColumnDry(to, from.getY() != to.getY());
+    }
+
+    private boolean walkedColumnDry(BlockPos foot, boolean stair) {
+        var probe = walkedProbe.set(foot.getX(), foot.getY() - 1, foot.getZ());
+        BlockState support = client.world.getBlockState(probe);
+        if (!stableDryRouteTop(probe, support) || AgentProgress.dangerous(support)) return false;
+        for (int y = 0; y <= (stair ? 2 : 1); y++) {
+            BlockState state = client.world.getBlockState(probe.move(Direction.UP));
+            if (!state.getFluidState().isEmpty() || AgentProgress.dangerous(state)) return false;
+        }
+        return true;
+    }
+
     enum FootholdSpace { EMPTY, VIEW, DARK, OCCLUDED, OCCUPIED, FLUID }
 
     static Vec3d footholdInterior(BlockPos cell, Direction bearing, boolean high) {
@@ -2146,7 +2180,7 @@ final class AgentBody {
     /** Shift laterally toward the center of this same, freshly sighted full top.
      * A fractional edge position need not force a jump or a 180-degree turn. */
     boolean centerOnSupport(BlockPos support) {
-        if (!hasView() || !client.player.isOnGround() || !support.equals(client.player.getBlockPos().down()))
+        if (!hasView() || !client.player.isOnGround() || !sameSurveySupport(support, client.player.getPos()))
             return false;
         Vec3d center = Vec3d.ofBottomCenter(support.up());
         Vec3d point = center.add(0, -0.025, 0);
@@ -2172,28 +2206,6 @@ final class AgentBody {
         double across = x * facing.getOffsetZ() - z * facing.getOffsetX();
         // Leave margin inside the exact Body sweep.
         return Math.abs(along) <= 0.25 && Math.abs(across) <= 0.17;
-    }
-
-    /** Grounded contact is a witness of this exact underfoot block, not of any adjacent tile. */
-    boolean localSurveySupport(BlockPos support, BlockState witnessed, Vec3d center) {
-        if (!hasView() || lavaEmergency || !matchesStep(support, center)) return false;
-        var player = client.player;
-        var options = client.options;
-        if (!player.isOnGround() || player.isTouchingWater() || player.hasVehicle() || player.horizontalCollision
-                || options.forwardKey.isUnbound() || options.backKey.isUnbound() || options.leftKey.isUnbound()
-                || options.rightKey.isUnbound() || options.sneakKey.isUnbound()
-                || !sameSurveySupport(support, player.getPos()) || client.world.getBlockState(support) != witnessed
-                || !stableDryRouteTop(support, witnessed) || !client.world.getFluidState(support.up()).isEmpty()) return false;
-        double dx = center.x - player.getX(), dz = center.z - player.getZ();
-        return !hazardAhead(heading(dx, dz), Math.hypot(dx, dz) + 0.12)
-            && client.world.isSpaceEmpty(player, player.getBoundingBox().stretch(dx, 0, dz));
-    }
-
-    /** The same centering motor, with a revalidated grounded support instead of a camera turn down. */
-    boolean centerOnSupport(BlockPos support, BlockState witnessed, Vec3d center) {
-        if (!localSurveySupport(support, witnessed, center)) return false;
-        centerLanding = center;
-        return true;
     }
 
     int actionTick() { return tick; }

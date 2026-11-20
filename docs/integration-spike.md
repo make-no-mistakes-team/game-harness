@@ -95,29 +95,25 @@ For one raw iron, the player can wait at the open furnace until the ingot
 is ready. Count the items loaded at the start: a batch of two is still a
 batch of two after the first ingot cooks. A nearby threat takes priority.
 
-A longer batch can free the player's hands. Suppose the player needs a
-bucket for cave travel. If there is useful work nearby, Terra can send the
-player to gather a needed resource while the iron cooks (`duringWaitFor`).
-This job needs its own budget and a reachable source or recipe. If the
-bucket is the next thing the player needs and there is nothing worth doing
-at the worksite, waiting is fine.
+A longer batch can free the player's hands. Suppose a bucket needs two
+more ingots, but the player can already prospect the next cave section.
+Terra can leave the iron cooking and start ordinary work with its own
+effect and material budgets (`duringWaitFor`). The player can leave sight
+of the furnace or change level. Finishing the cook does not interrupt
+that job. If nothing useful is safe without the bucket, waiting is fine.
 
-Finishing a short craft leaves time to scout. From a fresh view, Terra
-can check a specific cave opening or take a witnessed dry, level step with
-a way back to the furnace. A remembered opening can guide a look, but it
-doesn't establish that the ground ahead is safe to cross.
-If the player is standing at the edge of its own dry block, it can first
-center on that block and look at the ground toward the opening. This
-adjustment does not count as travel.
+The player remembers the paid furnace and the dry route it actually
+walked, including steps taken before setting up the workshop. When the
+ingots are needed, a collection request follows a few remembered steps at
+a time, checking each one against current terrain. A flooded or broken
+step can postpone pickup. An ordinary continuation of a clean save can
+retain these clues and protected stock floors, but not an executable
+command.
 
-Terra can also leave the batch for later. The player remembers the furnace
-and what went into it. Elapsed time does not put ingots in the inventory:
-the player must return, open the same furnace and take its output. A bucket
-job proposed during the cook (`afterWorkId`) waits for collection and a
-fresh check of all three ingots, the protected stock and the crafting table.
-An ordinary continuation of a clean save can remember a paid batch. The
-old job does not resume: the player needs a new collection offer in the
-copied world before it can take anything.
+Only opening the same furnace and taking its output puts the iron in
+inventory. A bucket job proposed with `afterWorkId` must still wait for
+collection and a fresh check of all three ingots, the protected stock
+and the crafting table.
 
 Goal-only startup, built-in presets, generated skills, direct opportunities,
 and work programs cannot grant furnace transfers. A completed smelt does not

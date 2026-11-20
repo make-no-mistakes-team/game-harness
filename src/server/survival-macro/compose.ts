@@ -304,6 +304,8 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     const activeBurn = fresh?.workOrder?.progress?.smeltBurn;
     const ticket = work?.pendingWork;
     const activeTicket = fresh?.pendingWork;
+    const independent = ticket?.parked && !ticket.worksite && (work?.workOrder?.state === "working" || work?.workOrder?.state === "needs_replan")
+      ? work.workOrder : undefined;
     return fresh?.run === basis.run && fresh.life === basis.life && (work ? fresh.epoch >= basis.epoch : fresh.epoch === basis.epoch) &&
       fresh.tick >= basis.tick && fresh.health > 0 &&
       (!correction || (sameLiveCorrectionScope(correction, fresh) && liveCorrectionEvidence(correction) === liveCorrectionEvidence(fresh))) &&
@@ -311,11 +313,11 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
         fresh.safety.revision === work.safety?.revision)) &&
       (!burn || (fresh.workOrder?.id === work?.workOrder?.id && fresh.workOrder?.state === "working" &&
         activeBurn?.burnTick === burn.burnTick && activeBurn.units === burn.units &&
-        activeBurn.remainingCookTicks >= MACRO_SMELT_OVERLAP_MIN_COOK_TICKS)) &&
+        (ticket?.yieldable || activeBurn.remainingCookTicks >= MACRO_SMELT_OVERLAP_MIN_COOK_TICKS))) &&
       (!ticket || (activeTicket?.id === ticket.id && activeTicket.parked === ticket.parked &&
-        (!ticket.yieldable || activeTicket.yieldable) &&
-        (!ticket.collectOfferId || ticket.collectOfferId === activeTicket.collectOfferId) &&
-        (!ticket.deferOfferId || ticket.deferOfferId === activeTicket.deferOfferId))) &&
+        (!ticket.yieldable || activeTicket.yieldable))) &&
+      (!independent || (fresh.workOrder?.id === independent.id &&
+        (fresh.workOrder.state === "working" || fresh.workOrder.state === "needs_replan"))) &&
       (!lookahead || (fresh.goal === lookahead.goal && fresh.health >= lookahead.health && fresh.safety?.clear === true &&
         fresh.safety.revision === lookahead.safety?.revision && !!fresh.working &&
         fresh.working.intentId === lookahead.working?.intentId && fresh.working.crack <= MACRO_LOOKAHEAD_MAX_CRACK));

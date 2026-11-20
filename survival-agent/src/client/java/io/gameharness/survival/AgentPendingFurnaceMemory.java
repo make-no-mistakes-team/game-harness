@@ -16,10 +16,13 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import net.minecraft.item.Item;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.util.Identifier;
@@ -32,15 +35,17 @@ final class AgentPendingFurnaceMemory {
     private enum Basis { LIVE, RESUME, CLUE }
     private record Scope(int v, String run, String world, String resume) {}
     private record Stamp(String run, int life, long tick, long frame) {}
-    private record Close(int v, Stamp stamp, String id, String record) {}
+    private record Close(int v, Stamp stamp, String id, String record, AgentWalkedRoute.Breadcrumbs breadcrumbs) {}
+    private record Floor(String item, int count) {}
     private record Wire(int v, String run, String world, String owner, String id, String originId, String originWorld,
                         String dimension, int[] pos, int[] footing, String facing, String raw, int units, String fuel,
                         int fuelCount, int fuelTicks, String output, int syncId, int minimumOutput, int maximumFuel,
-                        String basis, String state, Stamp paid, Stamp parked, Stamp lost, Stamp gone, Stamp ended) {
+                        String basis, String state, Stamp paid, Stamp parked, Stamp lost, Stamp gone, Stamp ended,
+                        Floor[] floors, AgentWalkedRoute.Breadcrumbs breadcrumbs) {
         Wire with(Basis basis, State state, Stamp parked, Stamp lost, Stamp gone, Stamp ended) {
             return new Wire(v, run, world, owner, id, originId, originWorld, dimension, pos, footing, facing,
                 raw, units, fuel, fuelCount, fuelTicks, output, syncId, minimumOutput, maximumFuel,
-                key(basis), key(state), paid, parked, lost, gone, ended);
+                key(basis), key(state), paid, parked, lost, gone, ended, floors, null);
         }
 
         Stamp latest() {
@@ -53,6 +58,7 @@ final class AgentPendingFurnaceMemory {
         private final AgentHands.IronBatch batch;
         private final BlockPos pos, footing;
         private final Direction facing;
+        private final Map<Item, Integer> floors;
         private final UUID ticket;
         private final State state;
         private final Basis basis;
@@ -66,6 +72,7 @@ final class AgentPendingFurnaceMemory {
             ticket = UUID.fromString(row.id);
             state = State.valueOf(row.state.toUpperCase(Locale.ROOT));
             basis = Basis.valueOf(row.basis.toUpperCase(Locale.ROOT));
+            floors = readFloors(row.floors);
         }
 
         UUID ticket() { return ticket; }
@@ -78,14 +85,18 @@ final class AgentPendingFurnaceMemory {
         int maximumFuel() { return row.maximumFuel; }
         int syncId() { return row.syncId; }
         State state() { return state; }
+        Map<Item, Integer> floors() { return floors; }
+        AgentWalkedRoute.Breadcrumbs breadcrumbs() { return basis == Basis.RESUME ? row.breadcrumbs : null; }
         boolean historical() { return basis != Basis.LIVE; }
         boolean mayInvestigateCollection() { return basis != Basis.CLUE && (state == State.PAID || state == State.PARKED); }
     }
 
     private static final Gson JSON = new Gson();
-    private static final int BYTES = 4_096;
+    // 32 longest vanilla reserve IDs plus 36 signed coordinate pairs, with stamp/header room.
+    private static final int BYTES = 8_192;
     private static final long MAX_NUMBER = 9_007_199_254_740_991L;
     private static final Pattern HASH = Pattern.compile("[a-f0-9]{64}");
+    private static final Pattern VANILLA_ITEM = Pattern.compile("minecraft:[a-z0-9_]{1,96}");
     private static final Set<PosixFilePermission> PRIVATE_MODE = PosixFilePermissions.fromString("rw-------");
     private static final Set<String> DIMENSIONS = Set.of("minecraft:overworld", "minecraft:the_nether", "minecraft:the_end");
     private static final String SCOPE = "pending-furnace-scope.json";
@@ -144,6 +155,9 @@ final class AgentPendingFurnaceMemory {
                     restored.footing, restored.facing) || !validSync(row.syncId) || restored.state == State.COLLECTED ||
                     restored.state == State.CANCELLED || restored.state == State.DISAPPEARED && restored.basis != Basis.CLUE)
                 throw new IllegalArgumentException();
+            if (row.breadcrumbs != null && (restored.basis != Basis.RESUME ||
+                    !AgentWalkedRoute.validBreadcrumbs(row.breadcrumbs, restored.pos.getX(), restored.pos.getY(), restored.pos.getZ())))
+                throw new IllegalArgumentException();
             entry = restored;
             committedText = text;
             if (life != 1) discontinuity(tick, frame);
@@ -159,22 +173,34 @@ final class AgentPendingFurnaceMemory {
     }
 
     boolean pay(UUID ticket, String dimension, BlockPos pos, Direction facing, BlockPos footing,
-                AgentHands.IronBatch batch, int syncId, int visibleOutput, int visibleFuel, long tick, long frame) {
+                AgentHands.IronBatch batch, int syncId, int visibleOutput, int visibleFuel, Map<Item, Integer> floors,
+                long tick, long frame) {
         Stamp stamp = stamp(tick, frame);
         if (stamp == null || frame == 0 || ticket == null || !validSync(syncId) ||
-                !validBatch(batch, visibleOutput, visibleFuel) || !validStation(dimension, pos, footing, facing)) return false;
+                !validBatch(batch, visibleOutput, visibleFuel) || !validStation(dimension, pos, footing, facing)
+                || floors == null || floors.size() > 32) return false;
         if (entry != null) {
             if (entry.ticket.equals(ticket))
                 return entry.state == State.PAID && entry.basis == Basis.LIVE && stamp.equals(entry.row.paid)
                     && entry.pos.equals(pos) && entry.footing.equals(footing) && entry.dimension().equals(dimension)
                     && entry.facing == facing && entry.batch.equals(batch) && entry.syncId() == syncId
-                    && entry.minimumOutput() == visibleOutput && entry.maximumFuel() == visibleFuel;
+                    && entry.minimumOutput() == visibleOutput && entry.maximumFuel() == visibleFuel
+                    && entry.floors.equals(floors);
             if (current() != null || !atOrAfter(stamp, entry.row.latest())) return false;
+        }
+        Floor[] restrictions = new Floor[floors.size()];
+        int i = 0;
+        for (var floor : floors.entrySet()) {
+            if (floor.getKey() == null || floor.getKey() == Items.AIR || floor.getValue() == null
+                    || floor.getValue() < 1 || floor.getValue() > 2_304) return false;
+            String item = Registries.ITEM.getId(floor.getKey()).toString();
+            if (!VANILLA_ITEM.matcher(item).matches()) return false;
+            restrictions[i++] = new Floor(item, floor.getValue());
         }
         return store(new Wire(1, scope.run, scope.world, owner.toString(), ticket.toString(), ticket.toString(), scope.world,
             dimension, cell(pos), cell(footing), key(facing), RAW, batch.units(), Registries.ITEM.getId(batch.fuel()).toString(),
             batch.fuelCount(), batch.fuelTicks(), OUTPUT, syncId, visibleOutput, visibleFuel, "live", "paid",
-            stamp, null, null, null, null), batch);
+            stamp, null, null, null, null, restrictions, null), batch);
     }
 
     boolean park(UUID ticket, long tick, long frame) {
@@ -206,14 +232,16 @@ final class AgentPendingFurnaceMemory {
         store(entry.row.with(Basis.CLUE, entry.state, entry.row.parked, stamp, null, null), entry.batch);
     }
 
-    void runnerClose(long tick, long frame) {
+    void runnerClose(long tick, long frame, AgentWalkedRoute.Breadcrumbs breadcrumbs) {
         Stamp stamp = stamp(tick, frame);
         if (current() == null || !entry.mayInvestigateCollection() || stamp == null || life != 1 ||
                 !atOrAfter(stamp, entry.row.latest())) return;
         try {
             String text = read(RECORD);
             if (!text.equals(committedText)) return;
-            atomic(CLOSE, JSON.toJson(new Close(1, stamp, entry.row.id, digest(text))));
+            if (!AgentWalkedRoute.validBreadcrumbs(breadcrumbs, entry.pos.getX(), entry.pos.getY(), entry.pos.getZ()))
+                breadcrumbs = null;
+            atomic(CLOSE, JSON.toJson(new Close(1, stamp, entry.row.id, digest(text), breadcrumbs)));
         } catch (IOException ignored) { /* The runner treats missing close evidence as a clue. */ }
     }
 
@@ -295,6 +323,21 @@ final class AgentPendingFurnaceMemory {
     }
 
     private static boolean validSync(int syncId) { return syncId >= 1 && syncId <= 255; }
+
+    private static Map<Item, Integer> readFloors(Floor[] floors) {
+        if (floors == null || floors.length == 0) return Map.of();
+        if (floors.length > 32) throw new IllegalArgumentException();
+        Map<Item, Integer> restrictions = new HashMap<>();
+        for (Floor floor : floors) {
+            if (floor == null || floor.item == null || !VANILLA_ITEM.matcher(floor.item).matches()
+                    || floor.count < 1 || floor.count > 2_304) throw new IllegalArgumentException();
+            Identifier id = Identifier.tryParse(floor.item);
+            if (id == null || !Registries.ITEM.containsId(id)) throw new IllegalArgumentException();
+            Item item = Registries.ITEM.get(id);
+            if (item == Items.AIR || restrictions.put(item, floor.count) != null) throw new IllegalArgumentException();
+        }
+        return Map.copyOf(restrictions);
+    }
     private static boolean validCell(BlockPos pos) {
         return pos != null && pos.getX() >= -30_000_000 && pos.getX() <= 30_000_000 && pos.getY() >= -64
             && pos.getY() <= 320 && pos.getZ() >= -30_000_000 && pos.getZ() <= 30_000_000;

@@ -14,7 +14,7 @@ import { episodeMatchesBasis } from "./episode-memory.ts";
 import {
   MACRO_CAPABILITIES_VERSION, MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_STRATEGIC_EPISODES, MACRO_MAX_WORK_STAGES, MacroObservationRotating, MacroValidationError,
-  hasDirectAuthority, isPendingWorkVerb, parseMacroProposal, validateMacroId,
+  hasDirectAuthority, isIndependentPendingPolicy, isPendingWorkVerb, parseMacroProposal, validateMacroId,
   MACRO_DIAMOND_PROSPECT, MACRO_FURNACE_PLACEMENT, MACRO_IRON_SMELT, MACRO_LIVE_EFFECT_PATTERN,
   MACRO_PENDING_SIDE_MAX_EFFECTS, MACRO_PENDING_SIDE_MAX_TICKS,
   MACRO_PROGRAM_EFFECT_PATTERN, MACRO_PROSPECT_SUPPORT, MACRO_PROSPECT_TORCH, MACRO_WATER_CLUE, MACRO_WATER_FILL, MACRO_WATER_SOURCE,
@@ -52,17 +52,17 @@ Only this single live iron stock policy grants furnace transfers. Do not revoke,
 
 A pendingWork ticket records the paid inputs, the furnace's last known location and the output still owed. work.pendingPurpose can explain why those materials were needed. Even after the estimated finish, output isn't inventory. Don't submit the batch twice. On returning to a saved world, historical means the payment came from the previous session. If today's observation contains a fresh collectOfferId and the output is needed, use collect-pending with today's pendingWork.id. This authorizes a physical recheck, not a guaranteed pickup. Never reuse an old command or open a furnace with a generic opportunity to collect the batch.
 
-When work.duringWaitFor is present, decide what the player should physically do *now*. In your reason, name what actually needs the uncollected output and consider one local part of the larger objective that does not. Preparing a later recipe alone leaves the player standing at the furnace. If a needed ingredient can be prepared from carried stock, or a useful visible resource gathered with a held tool, quote that independent job as kind "work" with duringWaitFor set to the ticket. For a genuinely blocking wait, abstain or use work/work-program with afterWorkId equal to the batch ID; say why leaving offers no useful or safe progress. The dependent job cannot start until actual collection and a fresh inventory check. Don't gather surplus, turn the camera for show, or leave the cave just to fill time.
+When work.duringWaitFor is present, plan the next useful part of the parent goal as you would if the player were not standing next to a furnace. Separate what actually needs the uncollected iron from what can advance now. Prefer a concrete, useful independent work order over a token craft or waiting: for example, approach and mine genuinely visible iron beyond break reach, or work the next safe returnable cave section with the right held tool. Name the useful witness and what would make you stop. A pre-rendered direct harvest or already walked outbound edge is not necessary: let ordinary native work witness and check each step. Leave sight of the furnace or change level when it serves the objective and the route is reversible; no new or lost path, unsafe footing, tool risk, or stock sacrifice merely to beat the cook estimate.
 
-If recent says "Cave stance setup available after explicitly parking", the off-center position is blocking the route check. It does not prove that the cave has no useful route. Use defer-pending when checking that specific cue would help the parent goal. A fresh parked view may offer one same-block stance adjustment and cue recheck; neither deferral nor the setup crosses a tile.
+Return kind "work" with the exact duringWaitFor ticket and an ordinary bounded stock policy for this independent leg. That one reply authorizes parking the paid process and separately trying the new job through normal admission. It grants no mining, crafting or placement beyond the exact allowedEffects, caps and reserves; do not target the batch's iron_ingot output or start another smelt. Use adequate ordinary time/effect bounds for a useful milestone; a worthwhile leg may outlast the cook. Repeat the same policy with duringWaitFor to renew a useful leg without restoring spent caps. At its next safe boundary, use the outcome and current view to choose the next leg, wait, or return for output that is now needed.
 
-You may prequote an independently useful duringWait:{policy,maxTicks} on the original multi-unit smelt. It runs only after confirmed burn, clean Escape and fresh native admission. Both forms allow at most ${MACRO_PENDING_SIDE_MAX_EFFECTS} exact breaks and crafts combined, no placement, and up to ${MACRO_PENDING_SIDE_MAX_TICKS} ticks. Use only genuinely held stock and protect all floors. A useful job can last longer than the cook.
+Return clues describe current evidence: local_face means a current exact station face, walked_route means a retained, checked route back, possibly out of sight or on another level. A location string is only a mention; a return clue is not an action or a guarantee that the route will stay safe. Only a fresh collectOfferId at an idle boundary authorizes collect-pending. If an active leg now needs the output, let it settle or revoke the exact obsolete work order, then use the next safe view. Do not collect merely because a timer elapsed; do not open the furnace to fill time.
 
-If it is worth deliberately leaving the released furnace for later parent-goal work, use "defer-pending" with the exact pendingWorkId only while deferOfferId is present. Deferral is not a material effect. Once parked, continue with context-compatible goal work without losing the return path. Choose "collect-pending" with pendingWorkId when collectOfferId is fresh and the dependency matters; if plenty of time remains, avoid reopening early just to stare at a cook bar. The native actor returns along a witnessed route and visibly checks this exact furnace before taking anything. Never use these offers as ordinary opportunities, a continuation or a skill. If the return cannot be freshly verified, keep the obligation visible and change course without claiming stock. Smelting iron is not a bucket craft, diamond pickup, or Nether entry.`;
+If the next useful step truly depends on the output or the independent path cannot be made safe, abstain or queue the dependent work/work-program with afterWorkId from work.pendingPredecessor or the accepted cooking job. Say what blocks progress. A queue owns no player input, does not collect, and cannot start without physical settlement and a fresh stock check. A historical ticket has no in-run predecessor: authorize only fresh ordinary work, with current stock and its retained reserve restrictions.
 
-const PARKED_CAVE_PROMPT = `This is a new live decision for a parked ticket, not another decision about the finished side job. Prefer useful local cave progress toward the parent goal whenever it is compatible with the user's objective, safe now, and leaves a credible return to this exact furnace. The later bucket recipe needs iron; a dry cave advance or checking a specific cave branch does not. A fresh collectOfferId or elapsed estimate is not a deadline or a command to return. Choose collect-pending when the uncollected output is necessary for the next useful step, not merely because a later recipe needs it.
+You may prequote duringWait:{policy,maxTicks} on the original multi-unit smelt only for independently useful work with a predictable, local start. This optional shortcut gets one validation on the first clean post-Escape view. It allows at most ${MACRO_PENDING_SIDE_MAX_EFFECTS} exact breaks and crafts combined, no placements, and up to ${MACRO_PENDING_SIDE_MAX_TICKS} ticks. It cannot use ingredients not already held above protected floors. Those smaller limits apply only to the prequote, not a live duringWaitFor order.
 
-Read pendingWork.worksite and the fresh world opportunities before relying on the earlier pendingPurpose. worksite.choice, if present, names one exact ordinary "opportunity" you can choose in constrained mode. A dry-follow or dry-approach is one local returnable leg with no spend; name what the distinct foothold would let you investigate. A setup-cave-stance centers on the same dry block once and rechecks a specific cave cue. Its completion proves only the setup, not an excursion, a route, or stock. An inspect-cave checks one specific witnessed lower lane or rechecks a dated cave cue without moving. After either check, choose a fresh dry edge only if one is offered. A historical ticket does not import a route or grant an action; use only today's exact choices with a fresh station return. Do not substitute a generic survey, more side crafting, or an unrestricted prospecting order for the local leg. If no worthwhile safe step is witnessed, or the next useful step needs the output, explain why and wait or select the fresh exact collection offer. With parkedWorksite "view-unavailable", report the missing usable view or abstain.`;
+Use defer-pending only if deliberately parking without starting another job is useful, and only while deferOfferId is fresh. Neither deferral nor a location description grants travel. With parkedWorksite "view-unavailable", report the missing view or abstain. Smelting iron is not a bucket craft, diamond pickup, or Nether entry.`;
 
 const DIAMOND_PROMPT = `With an iron-tier harvesting tool and dry cave footing, choose a single live work action targeting minecraft:diamond stock with ${MACRO_DIAMOND_PROSPECT} to seek ore that is not yet visible. The player can inspect and follow a witnessed lower shelf with a proved return, or cut a cardinal staircase one tread at a time. Name exact permitted ore break effects (break:minecraft:diamond_ore and/or break:minecraft:deepslate_diamond_ore). This prospecting effect grants no cover breaks: if allowed, name each exact natural cover separately (such as minecraft:stone, minecraft:deepslate, minecraft:diorite, minecraft:andesite, minecraft:granite, or minecraft:tuff with the break: prefix). An ore-only job does not cut rock. New descending clearance can take four cover breaks per tread plus an obstructed anchor ceiling; keep at least one break for ore. If light is needed and allowed, include ${MACRO_PROSPECT_TORCH}, maxPlacements, exact carried torch cost, and the required torch floor. No light, block or tool stock is spent implicitly. Mining can wear a pickaxe even when no item-count loss is allowed; preserve usable tools and slots for genuine drops.
 If the descent lanes fail, the same job can follow a witnessed dry level foothold or upper shelf, or open two exact, permitted foot/head cells toward a side wall. It can backtrack only over retained dry, revalidated edges. If permitted, ${MACRO_PROSPECT_SUPPORT} allows one use per exact adjacent support cell that the native camera proves empty, dry and attachable, with clear forward and reverse space. Add the exact minecraft:cobblestone cost cap and protect its reserve. Blocks and torches share maxPlacements. A screenshot of water or an opening does not prove an attachable dry cell; the player will not redirect water or step into an unverified gap. Read actual Y, reached treads, support placement/debit, separate landings, and the exact refusal in native progress. Use a substantial bounded horizon; a compatible renewal adds time without restoring spent caps. On a terminal productive leg, decide whether to grant a new finite leg, resupply, or change route. None of these movements counts as diamond stock. Do not use prospecting or its placements in work-program, preset work, a continuation or a generated skill.`;
@@ -103,9 +103,12 @@ const workPolicy = (pattern: string) => strictObject({
   maxBreaks: integer, maxCrafts: integer, maxPlacements: integer,
 });
 const singleWorkPolicy = workPolicy(MACRO_LIVE_EFFECT_PATTERN);
-const pendingSidePolicy = strictObject({
+const independentWorkPolicy = strictObject({
   ...singleWorkPolicy.properties,
   target: action("stock", { item: string, count: integer }),
+});
+const pendingSidePolicy = strictObject({
+  ...independentWorkPolicy.properties,
   allowedEffects: { type: "array", items: { type: "string", pattern: "^(break:minecraft:[a-z0-9_]{1,96}|craft:[a-z0-9_]{1,96})$" } },
   maxPlacements: { type: "integer", enum: [0] },
 });
@@ -120,13 +123,16 @@ function smeltSuccessorId(work?: MacroRequest["work"]): string | undefined {
 const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroRequest["work"], observation?: MacroRequest["observation"]): Tool => {
   const pending = observation?.pendingWork;
   const selectable = work?.current ? undefined : observation?.opportunities.filter(offer =>
-    !isPendingWorkVerb(offer.verb) && (work?.mode !== "constrained" || offer.risk !== "guarded")).map(offer => offer.id);
+    !isPendingWorkVerb(offer.verb) && offer.verb !== MACRO_WATER_CLUE &&
+    (work?.mode !== "constrained" || offer.risk !== "guarded")).map(offer => offer.id);
   const smeltId = smeltSuccessorId(work);
-  const afterWorkId = smeltId ? { type: "string", enum: [smeltId] } : string;
+  const predecessorIds = [...new Set([work?.current?.accepted ? work.current.id : undefined,
+    work?.pendingPredecessor?.id].filter((id): id is string => id !== undefined))];
+  const afterWorkId = { type: "string", enum: predecessorIds };
   const ticketId = (id: string) => ({ type: "string", enum: [id] });
   const noParkedView = work?.parkedWorksite === "view-unavailable";
   const otherActions = smeltId ? [] : [
-    ...(work ? [action("work", { policy: singleWorkPolicy }), action("work-program", { stages: workStages })] : []),
+    ...(work && !work.duringWaitFor ? [action("work", { policy: singleWorkPolicy }), action("work-program", { stages: workStages })] : []),
     ...(work?.current ? [action("revoke-work", { workOrderId: string })] : [
       ...(selectable?.length === 0 ? [] :
         [action("opportunity", { opportunityId: selectable ? { type: "string", enum: selectable } : string })]),
@@ -152,12 +158,12 @@ const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroReques
       subgoal: string, reason: string, successCondition: string, contingency: string, alternative: string,
       expiresTick: integer,
       action: { anyOf: noParkedView ? [action("gap", { capability: string }), action("abstain")] : [
-        ...(work?.current?.accepted ? [action("work", { policy: singleWorkPolicy, afterWorkId }),
+        ...(predecessorIds.length ? [action("work", { policy: singleWorkPolicy, afterWorkId }),
           action("work-program", { stages: workStages, afterWorkId })] : []),
         ...(work && !smeltId && !pending ? [action("work", { policy: singleWorkPolicy, duringWait: strictObject({
           policy: pendingSidePolicy, maxTicks: integer,
         }) })] : []),
-        ...(work?.duringWaitFor ? [action("work", { policy: pendingSidePolicy, duringWaitFor: ticketId(work.duringWaitFor) })] : []),
+        ...(work?.duringWaitFor ? [action("work", { policy: independentWorkPolicy, duringWaitFor: ticketId(work.duringWaitFor) })] : []),
         ...(work?.duringWaitFor && pending?.deferOfferId && pending.id === work.duringWaitFor
           ? [action("defer-pending", { pendingWorkId: ticketId(pending.id) })] : []),
         ...(work && !work.current && pending?.collectOfferId
@@ -299,8 +305,7 @@ function contextFor(request: MacroRequest, basis: MacroBasis, image?: ImageConte
   });
   if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) return;
   return {
-    systemPrompt: work && !lookahead ? [PROMPT, FURNACE_PROMPT, DIAMOND_PROMPT, WATER_PROMPT,
-      ...(work.parkedWorksite ? [PARKED_CAVE_PROMPT] : [])] : [PROMPT],
+    systemPrompt: work && !lookahead ? [PROMPT, FURNACE_PROMPT, DIAMOND_PROMPT, WATER_PROMPT] : [PROMPT],
     messages: [{
       role: "user", timestamp: Date.now(),
       content: image ? [{ type: "text", text }, image] : text,
@@ -435,8 +440,13 @@ function proposalFor(raw: string | undefined, request: MacroRequest, basis: Macr
   if (action.kind === "work" || action.kind === "work-program") {
     if (!request.work) return "work_unavailable";
     if (action.kind === "work" && pending && action.policy.allowedEffects.includes(MACRO_IRON_SMELT)) return "active_work";
-    if (action.afterWorkId &&
+    if (action.afterWorkId && request.work.pendingPredecessor?.id !== action.afterWorkId &&
         (request.work.current?.id !== action.afterWorkId || !request.work.current.accepted)) return "wrong_work_id";
+    if (!action.afterWorkId && request.work.duringWaitFor) return "wrong_work_id";
+    if (action.afterWorkId && request.work.duringWaitFor && pending?.parked &&
+        action.afterWorkId === request.work.current?.id &&
+        (action.kind === "work" ? !isIndependentPendingPolicy(action.policy) :
+          action.stages.some(({ policy }) => !isIndependentPendingPolicy(policy)))) return "active_work";
     const targets = action.kind === "work" ? [action.policy.target] : action.stages.map(stage => stage.policy.target);
     return targets.every(target => target.kind !== "preset" || target.goal === request.observation.goal) ? proposal : "wrong_preset_goal";
   }

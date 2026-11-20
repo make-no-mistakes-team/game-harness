@@ -422,25 +422,57 @@ final class MiningStockProof {
     }
 
     @Test
-    void independentWorkDoesNotBorrowTheSmeltRecipeOrSpendItsFloors() {
+    void paidWaitUsesOrdinaryHorizonEffectsAndIndependentCostsWithoutBorrowingTheBatch() {
         var request = JsonParser.parseString("""
-            {"v":1,"id":"independent","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":125,
-             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:cobblestone","count":2},
-             "allowedEffects":["break:minecraft:stone"],"costCaps":[],"reserves":[],
-             "maxBreaks":1,"maxCrafts":0,"maxPlacements":0,"duringWaitFor":"9d0ad30c-b85c-4261-baff-f071c8e5ebc1"}
+            {"v":1,"id":"independent","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":1205,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:raw_iron","count":6},
+             "allowedEffects":["break:minecraft:iron_ore","break:minecraft:deepslate_iron_ore"],
+             "costCaps":[{"item":"minecraft:stone_pickaxe","count":1}],"reserves":[],
+             "maxBreaks":6,"maxCrafts":0,"maxPlacements":0,"duringWaitFor":"9d0ad30c-b85c-4261-baff-f071c8e5ebc1"}
             """).getAsJsonObject();
         var order = AgentWorkOrder.parse(request, "run", "constrained");
         require(order.policy() != null && order.duringWaitFor().equals("9d0ad30c-b85c-4261-baff-f071c8e5ebc1")
-                && order.policy().breakAllowed(Blocks.STONE.getDefaultState()) && !order.policy().smeltIron(),
-            "the separate live grant can authorize one exact local stone break but cannot reload or place a furnace");
-        var budget = new AgentWorkOrder.Budget(order.policy(), Map.of(Items.OAK_PLANKS, 3));
+                && order.policy().breakAllowed(Blocks.IRON_ORE.getDefaultState())
+                && order.policy().breakAllowed(Blocks.DEEPSLATE_IRON_ORE.getDefaultState())
+                && !order.policy().breakAllowed(Blocks.STONE.getDefaultState()),
+            "ordinary raw-iron work authorizes its exact ore types across the normal horizon, not unrelated stone");
+        var budget = new AgentWorkOrder.Budget(order.policy(), Map.of(Items.OAK_PLANKS, 3, Items.STONE_PICKAXE, 1));
         var stock = new PlayerInventory(null);
         stock.setStack(0, new ItemStack(Items.OAK_PLANKS, 3));
-        require(budget.limit(Items.OAK_PLANKS, 3) == 0 && budget.missingFloor(stock) == null
-                && budget.breaksLeft() == 1, "side work inherits protected carried floors, not the original effect caps");
-        request.addProperty("maxPlacements", 1);
+        stock.setStack(1, new ItemStack(Items.STONE_PICKAXE));
+        stock.setStack(2, new ItemStack(Items.RAW_IRON, 6));
+        require(budget.limit(Items.OAK_PLANKS, 3) == 0 && budget.limit(Items.STONE_PICKAXE, 1) == 0
+                && budget.limit(Items.RAW_IRON, 6) == 0 && budget.missingFloor(stock) == null
+                && budget.breaksLeft() == 6,
+            "the new job honors inherited floors despite its own caps and receives no smelt-input cap");
+        request.getAsJsonObject("target").addProperty("item", "minecraft:iron_ingot");
         require(AgentWorkOrder.parse(request, "run", "constrained").policy() == null,
-            "no implicit placement can happen while handing off from a paid wait");
+            "the pending output is not a stock target for ordinary handoff work");
+        request.getAsJsonObject("target").addProperty("item", "minecraft:raw_iron");
+        request.getAsJsonArray("allowedEffects").add("smelt:minecraft:iron_ingot");
+        require(AgentWorkOrder.parse(request, "run", "constrained").policy() == null,
+            "no quoted work lease can inherit or duplicate smelt authority");
+    }
+
+    @Test
+    void paidWaitCanQuoteOneOrdinaryPlankExecutionFromExactlyOneCarriedLog() {
+        var request = JsonParser.parseString("""
+            {"v":1,"id":"planks","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":125,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:oak_planks","count":4},
+             "allowedEffects":["craft:planks"],"costCaps":[{"item":"minecraft:oak_log","count":1}],"reserves":[],
+             "maxBreaks":0,"maxCrafts":1,"maxPlacements":0,"duringWaitFor":"9d0ad30c-b85c-4261-baff-f071c8e5ebc1"}
+            """).getAsJsonObject();
+        var policy = AgentWorkOrder.parse(request, "run", "constrained").policy();
+        var stock = new PlayerInventory(null);
+        stock.setStack(0, new ItemStack(Items.OAK_LOG, 2));
+        var budget = new AgentWorkOrder.Budget(policy, Map.of(Items.OAK_LOG, 1));
+        require(policy.craftAllowed("oak_planks") && !policy.craftAllowed("stick")
+                && AgentHands.workOutputCount("oak_planks") == 4
+                && AgentHands.workNeed(stock, "oak_planks", budget) == null,
+            "one stocked log above the inherited floor can be consumed by the ordinary exact plank recipe");
+        stock.setStack(0, new ItemStack(Items.OAK_LOG));
+        require(AgentHands.workNeed(stock, "oak_planks", budget) != null,
+            "the last log cannot be borrowed from the paid job's protected reserve");
     }
 
     @Test

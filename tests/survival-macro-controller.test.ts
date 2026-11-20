@@ -1119,7 +1119,7 @@ test.each(["preset", "constrained"] as const)("A regular %s strategist can quote
 });
 
 test.each(["bucket", "abstain", "wrong predecessor", "replacement", "revocation", "missing ingots", "missing station",
-  "interrupted", "blocked", "new life", "late", "expired", "short cook", "no budget"] as const)(
+  "interrupted", "blocked", "new life", "late", "expired", "no budget"] as const)(
   "A paid iron batch allows only a fresh bound successor: %s", async result => {
     const bucket = "minecraft:bucket";
     const live = { goal: "diamond", inventory: { [ironItem]: 1, [rawIronItem]: 4, [fuelItem]: 5, [furnaceItem]: 1 } };
@@ -1159,11 +1159,11 @@ test.each(["bucket", "abstain", "wrong predecessor", "replacement", "revocation"
         ...loading, detail: "Vanilla furnace cooking advanced", // Free text alone cannot trigger a request.
       } });
       expect(requests).toHaveLength(1);
-      const burn = { burnTick: 111, units: 2, remainingCookTicks: result === "short cook" ? 30 : 395 };
+      const burn = { burnTick: 111, units: 2, remainingCookTicks: 395 };
       const burning = { ...loading, progress: { ...loading.progress, smeltBurn: burn } };
       const paid = paidIron(batch.id, burn.remainingCookTicks);
       await f.observe(115, { goal: live.goal, inventory: deposited, workOrder: burning, pendingWork: paid });
-      if (result === "no budget" || result === "short cook") {
+      if (result === "no budget") {
         expect(requests).toHaveLength(1);
         expect(await f.order()).toEqual(batch);
         return;
@@ -1247,14 +1247,113 @@ const returnOffer = {
   evidence: "A witnessed dry return to this station is still reachable.",
 } as const;
 const parkedCaveOffer = {
-  id: "fresh-cave-edge", verb: "follow", risk: "low", summary: "Follow one paired dry cave edge",
+  id: "fresh-cave-edge", verb: "approach", risk: "low", summary: "Approach visible ore on a dry shelf",
   evidence: "The lit lane connects back to the paid furnace; no pickup or spend.",
 } as const;
 const parkedCave = {
   routes: "One paired dry level edge ahead. The witnessed workshop return remains connected.",
-  choice: { kind: "dry-follow", opportunityId: parkedCaveOffer.id, target: "local-cave-edge" },
 } as const;
 const parkedStation = { routes: "Settled dry workshop; no cave edge was verified in this view." } as const;
+
+test("Ordinary cave work can outlast cooking and renew without spending the queued batch output", async () => {
+  const requests: MacroRequest[] = [];
+  const goal = "diamond";
+  const iron = "minecraft:raw_iron";
+  const route = {
+    id: "visible-ore-approach", verb: "approach", risk: "low",
+    summary: "Approach a returnable shelf with visible iron", evidence: "Ore visible beyond direct break reach.",
+  } as const;
+  const mining = {
+    target: { kind: "stock", item: iron, count: 6 },
+    allowedEffects: ["break:minecraft:iron_ore", "break:minecraft:stone"],
+    maxBreaks: 12, maxCrafts: 0, maxPlacements: 0, costCaps: [], reserves: ironPolicy.reserves,
+  } as const;
+  const bucket = {
+    target: { kind: "stock", item: "minecraft:bucket", count: 1 },
+    allowedEffects: ["craft:bucket"], costCaps: [{ item: ironItem, count: 3 }], reserves: ironPolicy.reserves,
+    maxBreaks: 0, maxCrafts: 1, maxPlacements: 0,
+  } as const;
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    const ticket = request.observation.pendingWork;
+    if (requests.length === 1) return workReply(request, { kind: "work", policy: ironPolicy });
+    if (request.observation.tick === 540 && request.work?.pendingPredecessor)
+      return workReply(request, { kind: "work", policy: bucket, afterWorkId: request.work.pendingPredecessor.id });
+    if (request.work?.duringWaitFor && request.work.current)
+      return workReply(request, { kind: "work", policy: mining, duringWaitFor: request.work.duringWaitFor });
+    if (ticket?.collectOfferId) return workReply(request, { kind: "collect-pending", pendingWorkId: ticket.id });
+    return workReply(request, { kind: "abstain" });
+  }, "Mine the visible cave and make a bucket only when the paid iron is held.", 8);
+  try {
+    const held = { [ironItem]: 1, [fuelItem]: 1, "minecraft:stone_pickaxe": 1, "minecraft:crafting_table": 1 };
+    await f.observe(10, { goal, inventory: { ...held, [fuelItem]: 3, [iron]: 2, [furnaceItem]: 1 } });
+    await f.actor.poll();
+    const batch = await f.order();
+    await f.receipt(batch.id, 11, "accepted");
+    const ticket = paidIron(batch.id, 30);
+    const cooking = { id: batch.id, state: "working", detail: "Paid",
+      progress: { phase: "smelt", status: "Two paid units cooking", breaks: 0, crafts: 0, placements: 1,
+        smeltBurn: { burnTick: 111, units: 2, remainingCookTicks: 30 } } } as const;
+    await f.observe(114, { goal, inventory: held, workOrder: cooking });
+    expect(requests).toHaveLength(1);
+    await f.observe(115, { goal, inventory: held, workOrder: cooking, pendingWork: ticket, opportunities: [route] });
+    await f.actor.poll();
+    const leg = await f.order();
+    expect(leg).toMatchObject({ duringWaitFor: batch.id, maxBreaks: 12, expiresTick: 1215 });
+    expect(requests[1]?.observation.opportunities).toEqual([route]);
+    await f.receipt(batch.id, 116, "parked");
+    await f.receipt(leg.id, 116, "accepted");
+    const parked = { ...ticket, parked: true, yieldable: false, returnClue: "walked_route" } as const;
+    const routing = { id: leg.id, state: "working", detail: "One dry level down, along walked return",
+      progress: { phase: "route", status: "Approaching visible ore", breaks: 0, crafts: 0, placements: 0 } } as const;
+    await f.observe(500, { goal, epoch: 2, inventory: held, pendingWork: { ...parked, remainingTicks: 12 }, workOrder: routing });
+    await f.observe(520, { goal, epoch: 2, inventory: held, pendingWork: { ...parked, state: "unknown", remainingTicks: 0 }, workOrder: routing });
+    expect(requests).toHaveLength(2);
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    const gatheredSome = { ...held, [iron]: 4 };
+    await f.observe(540, { goal, epoch: 2, inventory: gatheredSome, pendingWork: { ...parked, state: "unknown", remainingTicks: 0 },
+      workOrder: { ...routing, progress: { ...routing.progress, phase: "collect", breaks: 4, replan: "target_near",
+        lastEffect: { tick: 540, detail: "Four raw iron gathered from visible ore." } } } });
+    await f.actor.poll();
+    expect(f.actor.status()).toMatchObject({ workQueuedAfter: batch.id, issuedWorkOrders: 2 });
+    expect((await f.order()).id).toBe(leg.id);
+    await f.observe(1140, { goal, epoch: 2, inventory: gatheredSome, pendingWork: parked, workOrder: routing });
+    await f.actor.poll();
+    const renewal = await f.order();
+    expect(renewal).toMatchObject({ duringWaitFor: batch.id, maxBreaks: 12, basisTick: 1140 });
+    expect(renewal.id).not.toBe(leg.id);
+    expect(requests[3]?.work).toMatchObject({ demand: "renew", pendingPredecessor: { id: batch.id, queuedTarget: bucket.target } });
+    expect(requests[3]?.observation.pendingWork?.returnClue).toBe("walked_route");
+    expect(requests[3]?.observation.inventory[ironItem]).toBe(1);
+    await f.receipt(leg.id, 1141, "interrupted");
+    await f.receipt(renewal.id, 1141, "accepted");
+    const mined = { ...held, [iron]: 6 };
+    await f.receipt(renewal.id, 1230, "completed");
+    const recall = { ...parked, state: "unknown", remainingTicks: 0, collectOfferId: returnOffer.id, worksite: parkedStation } as const;
+    await f.observe(1230, { goal, epoch: 3, inventory: mined, pendingWork: recall, opportunities: [returnOffer], quiescent: true });
+    await f.actor.poll();
+    const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+    expect(intent.opportunityId).toBe(returnOffer.id);
+    await f.receipt(intent.id, 1231, "accepted");
+    await f.observe(1235, { goal, epoch: 3, inventory: mined, pendingWork: { ...parked, state: "unknown", remainingTicks: 0 } });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(requests).toHaveLength(5);
+    expect(f.actor.status()).toMatchObject({ issuedWorkOrders: 3, issued: 1, completedModelWorkOrders: 1, workQueuedAfter: batch.id });
+    await f.receipt(batch.id, 1240, "completed");
+    await f.observe(1240, { goal, epoch: 3, inventory: { ...mined, [ironItem]: 3 } });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    await f.receipt(intent.id, 1240, "completed");
+    await f.observe(1241, { goal, epoch: 3, inventory: { ...mined, [ironItem]: 3 }, opportunities: [{
+      id: "reachable-workbench", verb: "interact", risk: "guarded", summary: "Open visible minecraft:crafting_table",
+      evidence: "A lit workstation face is inside vanilla use reach.",
+    }] });
+    expect(await f.order()).toMatchObject({ basisTick: 1241, target: bucket.target });
+    expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 2, completedReceipts: 1 });
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
 
 test.each(["cave now", "ready but independent", "richer route", "blocked", "delayed view"] as const)(
   "A completed side order waits for its settled parked worksite and does not poll the furnace countdown: %s", async course => {
@@ -1264,9 +1363,9 @@ test.each(["cave now", "ready but independent", "richer route", "blocked", "dela
       requests.push(request);
       if (requests.length === 1)
         return workReply(request, { kind: "work", policy: ironPolicy, duringWait: { policy: sideStone, maxTicks: 600 } });
-      const choice = request.observation.pendingWork?.worksite?.choice;
+      const choice = request.observation.opportunities.find(offer => offer.id === parkedCaveOffer.id);
       if (choice && (course === "cave now" || course === "ready but independent"))
-        return workReply(request, { kind: "opportunity", opportunityId: choice.opportunityId });
+        return workReply(request, { kind: "opportunity", opportunityId: choice.id });
       return workReply(request, { kind: "abstain" });
     }, "Prepare a bucket and continue cave work when safe.", 6);
     try {
@@ -1320,14 +1419,13 @@ test.each(["cave now", "ready but independent", "richer route", "blocked", "dela
       await f.observe(worldTick + 5, { ...world, pendingWork: { ...local, remainingTicks: 360 } });
       expect(requests).toHaveLength(expected);
       if (course === "richer route") {
-        await f.observe(worldTick + 10, { ...world, pendingWork: { ...local, remainingTicks: 355, worksite: parkedCave },
+        await f.observe(worldTick + 80, { ...world, pendingWork: { ...local, remainingTicks: 355, worksite: parkedCave },
           opportunities: [returnOffer, parkedCaveOffer] });
         await f.actor.poll();
         expect(requests).toHaveLength(++expected);
         const renewed = { ...parkedCaveOffer, id: "same-edge-new-opaque-id" };
-        await f.observe(worldTick + 15, { ...world, opportunities: [returnOffer, renewed],
-          pendingWork: { ...local, remainingTicks: 350,
-            worksite: { ...parkedCave, choice: { ...parkedCave.choice, opportunityId: renewed.id } } } });
+        await f.observe(worldTick + 85, { ...world, opportunities: [returnOffer, renewed],
+          pendingWork: { ...local, remainingTicks: 350, worksite: parkedCave } });
         expect(requests).toHaveLength(expected);
       }
       await expect(access(f.file("intent.json"))).rejects.toThrow();
@@ -1347,7 +1445,7 @@ test.each(["prequoted", "fallback"] as const)("A %s side grant produces stock du
     requests.push(request);
     if (requests.length === 1) return workReply(request, { kind: "work", policy: ironPolicy,
       ...(approach === "prequoted" ? { duringWait: { policy: sideStone, maxTicks: 600 } } : {}) });
-    if (request.work?.duringWaitFor)
+    if (request.work?.duringWaitFor && request.work.current?.id === request.work.duringWaitFor)
       return workReply(request, { kind: "work", policy: sideStone, duringWaitFor: request.work.duringWaitFor });
     if (request.observation.tick === 550) await releaseOldReturn.promise;
     return workReply(request, request.observation.pendingWork?.collectOfferId
@@ -1417,6 +1515,73 @@ test.each(["prequoted", "fallback"] as const)("A %s side grant produces stock du
   }
 });
 
+test("An optional local quote cannot wake on a later view after missing the first clean release", async () => {
+  const requests: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    return workReply(request, requests.length === 1
+      ? { kind: "work", policy: ironPolicy, duringWait: { policy: sideStone, maxTicks: 600 } }
+      : { kind: "abstain" });
+  }, "Find diamonds and keep one plank.", 4);
+  try {
+    const goal = "diamond";
+    const inventory = { [ironItem]: 1, [fuelItem]: 1 };
+    await f.observe(10, { goal, inventory: { ...inventory, [fuelItem]: 3, [rawIronItem]: 2, [furnaceItem]: 1 } });
+    await f.actor.poll();
+    const batch = await f.order();
+    await f.receipt(batch.id, 11, "accepted");
+    const workOrder = { id: batch.id, state: "working", detail: "Paid", progress: {
+      phase: "smelt", status: "Cooking", breaks: 0, crafts: 0, placements: 1,
+      smeltBurn: { burnTick: 111, remainingCookTicks: 395, units: 2 },
+    } } as const;
+    const pendingWork = paidIron(batch.id, 395);
+    await f.observe(115, { goal, inventory, pendingWork, workOrder });
+    await f.actor.poll();
+    expect(requests[1]?.work?.duringWaitFor).toBe(batch.id);
+    await f.observe(125, { goal, inventory, pendingWork, workOrder, opportunities: [witnessedStone] });
+    await f.actor.poll();
+    expect(requests).toHaveLength(2);
+    expect(await f.order()).toEqual(batch);
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test("A late independent reply cannot replace the paid job after safety changes", async () => {
+  const reply = Promise.withResolvers<void>();
+  const seen: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    seen.push(request);
+    if (seen.length === 1) return workReply(request, { kind: "work", policy: ironPolicy });
+    await reply.promise;
+    return workReply(request, { kind: "work", policy: sideStone, duringWaitFor: request.work!.duringWaitFor! });
+  }, "Mine a safe cave shelf and keep the reserve plank.", 3);
+  try {
+    const goal = "diamond", held = { [ironItem]: 1, [fuelItem]: 1 };
+    await f.observe(10, { goal, inventory: { ...held, [fuelItem]: 3, [rawIronItem]: 2, [furnaceItem]: 1 } });
+    await f.actor.poll();
+    const batch = await f.order();
+    await f.receipt(batch.id, 11, "accepted");
+    const workOrder = { id: batch.id, state: "working", detail: "Cooking two paid units", progress: {
+      phase: "smelt", status: "Cooking", breaks: 0, crafts: 0, placements: 1,
+      smeltBurn: { burnTick: 111, remainingCookTicks: 395, units: 2 },
+    } } as const;
+    await f.observe(115, { goal, inventory: held, workOrder, pendingWork: paidIron(batch.id, 395) });
+    expect(seen[1]?.work?.duringWaitFor).toBe(batch.id);
+    await f.observe(116, { goal, epoch: 2, inventory: held, workOrder, safety: { clear: false, revision: 2 } });
+    reply.resolve();
+    await f.actor.poll();
+    expect(f.actor.status()).toMatchObject({ issuedWorkOrders: 1, issued: 0 });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+  } finally {
+    reply.resolve();
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
 test.each(["single charged unit", "held mouse", "protected stock", "dead", "wrong ticket"] as const)(
   "A side policy cannot take control through %s", async premise => {
     const one = premise === "single charged unit";
@@ -1453,6 +1618,31 @@ test.each(["single charged unit", "held mouse", "protected stock", "dead", "wron
     }
   },
 );
+
+test.each([true, false])("Historical work stays untagged and preserves remembered reserves: %s", async keepFloor => {
+  const requests: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    return workReply(request, { kind: "work", policy: { ...sideStone, reserves: keepFloor ? ironPolicy.reserves : [] } });
+  }, "Continue toward diamonds.", 2);
+  try {
+    const old = { ...paidIron("old-paid-batch", 0), historical: true, state: "unknown", parked: true, yieldable: false,
+      protectedReserves: ironPolicy.reserves, worksite: parkedStation } as const;
+    await f.observe(10, { goal: "diamond", quiescent: true, inventory: { [fuelItem]: 1, "minecraft:stone_pickaxe": 1 },
+      pendingWork: old, opportunities: [witnessedStone] });
+    await f.actor.poll();
+    expect(requests[0]?.work?.protectedReserves).toEqual(ironPolicy.reserves);
+    expect(requests[0]?.work?.duringWaitFor).toBeUndefined();
+    expect(requests[0]?.work?.pendingPredecessor).toBeUndefined();
+    if (keepFloor) {
+      expect(await f.order()).toMatchObject({ target: sideStone.target, reserves: ironPolicy.reserves });
+      expect((await f.order()).duringWaitFor).toBeUndefined();
+    } else await expect(access(f.file("work.json"))).rejects.toThrow();
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
 
 test.each(["invented follow", "direct stock quote", "ordinary work"] as const)(
   "Paid-cook context reaches the strategist without admitting %s", async attempted => {
@@ -1492,21 +1682,15 @@ test.each(["invented follow", "direct stock quote", "ordinary work"] as const)(
   },
 );
 
-test.each(["wait", "setup then edge"] as const)(
+test.each(["wait", "fresh approach"] as const)(
   "Explicit deferral retires the owner only on a native park and does not count as production: %s", async course => {
   const defer = { id: "fresh-defer", verb: "defer_pending", risk: "low", summary: "Leave the paid workshop",
     evidence: "The exact paid furnace released the controls." } as const;
-  const setup = { id: "same-dry-block", verb: "survey", risk: "low", summary: "Center on the same dry block",
-    evidence: "Off center facing visible cave water; recheck on this block without crossing a tile." } as const;
-  const setupSite = { routes: setup.evidence, choice: {
-    kind: "setup-cave-stance", opportunityId: setup.id, target: "workshop-support",
-  } } as const;
-  const setupHint = "Cave stance setup available after explicitly parking this paid batch: recheck visible cave water.";
   const requests: MacroRequest[] = [];
   const f = await durableFixture(async request => {
     requests.push(request);
-    const choice = request.observation.pendingWork?.worksite?.choice;
-    if (choice) return workReply(request, { kind: "opportunity", opportunityId: choice.opportunityId });
+    if (request.observation.opportunities.some(({ id }) => id === parkedCaveOffer.id))
+      return workReply(request, { kind: "opportunity", opportunityId: parkedCaveOffer.id });
     if (request.observation.pendingWork?.parked) return workReply(request, { kind: "abstain" });
     if (!request.work?.current) return workReply(request, { kind: "work", policy: ironPolicy });
     return workReply(request, { kind: "defer-pending", pendingWorkId: request.work.current.id });
@@ -1521,7 +1705,6 @@ test.each(["wait", "setup then edge"] as const)(
     await f.observe(115, { goal: "diamond", inventory: held, workOrder: { id: batch.id, state: "working", detail: "Cooking",
       progress: { phase: "smelt", status: "Paid burn", breaks: 0, crafts: 0, placements: 1,
         smeltBurn: { burnTick: 111, units: 2, remainingCookTicks: 395 } } },
-      recent: course === "setup then edge" ? [setupHint] : [],
       pendingWork: { ...ticket, deferOfferId: defer.id }, opportunities: [defer] });
     await f.actor.poll();
     const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
@@ -1533,27 +1716,19 @@ test.each(["wait", "setup then edge"] as const)(
     const parked = { ...ticket, parked: true, yieldable: false, worksite: parkedStation };
     const atWorkshop = { goal: "diamond", inventory: held, quiescent: true,
       workOrder: { id: batch.id, state: "parked", detail: "Paid output remains in the station." } } as const;
-    if (course === "setup then edge") {
-      expect(requests[1]?.observation.recent).toContain(setupHint);
+    if (course === "fresh approach") {
       expect(requests[1]?.observation.opportunities.map(({ id }) => id)).toEqual([defer.id]);
       const recoverable = { ...parked, collectOfferId: returnOffer.id };
-      await f.observe(117, { ...atWorkshop, opportunities: [returnOffer, setup],
-        pendingWork: { ...recoverable, worksite: setupSite } });
+      await f.observe(117, { ...atWorkshop, pendingWork: { ...parked, worksite: undefined } });
       await f.actor.poll();
-      const stance = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
-      expect(stance).toMatchObject({ opportunityId: setup.id, basisTick: 117, skillHash: null });
-      await f.receipt(stance.id, 118, "accepted");
-      await f.receipt(stance.id, 125, "completed");
-      await f.observe(125, { ...atWorkshop, pendingWork: { ...parked, worksite: undefined } });
-      await f.actor.poll();
-      expect(requests).toHaveLength(3); // A receipt alone creates no crossing authority.
+      expect(requests).toHaveLength(2); // A park receipt alone creates no crossing authority.
       await expect(access(f.file("intent.json"))).rejects.toThrow();
       await f.observe(126, { ...atWorkshop, opportunities: [returnOffer, parkedCaveOffer],
         pendingWork: { ...recoverable, worksite: parkedCave } });
       await f.actor.poll();
       const edge = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
       expect(edge).toMatchObject({ opportunityId: parkedCaveOffer.id, basisTick: 126, skillHash: null });
-      expect(requests).toHaveLength(4);
+      expect(requests).toHaveLength(3);
       expect(f.actor.status().completedModelWorkOrders).toBe(0);
       return;
     }

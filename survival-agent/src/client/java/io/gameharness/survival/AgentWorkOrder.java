@@ -20,8 +20,6 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                       Policy policy, String nextWorkId, String duringWaitFor) {
     static final int MAX_TICKS = 1_200;
     static final int MAX_BREAKS = 64;
-    private static final int MAX_SIDE_TICKS = 600;
-    private static final int MAX_SIDE_EFFECTS = 4;
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
     private static final Pattern ITEM_ID = Pattern.compile("minecraft:[a-z0-9_]{1,96}");
     private static final Set<String> FIELDS = Set.of("v", "id", "run", "life", "epoch", "basisTick", "expiresTick",
@@ -65,11 +63,9 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         boolean placeProspectTorch() { return diamondProspecting() && effects.contains(PROSPECT_TORCH); }
         boolean placeProspectSupport() { return diamondProspecting() && effects.contains(PROSPECT_SUPPORT); }
         boolean waterFill() { return !preset && target.item == Items.WATER_BUCKET && effects.contains(WATER_FILL); }
-        boolean pendingSide() {
-            return !preset && target.item != null && maxPlacements == 0 && !effects.isEmpty()
-                && maxBreaks + maxCrafts > 0 && maxBreaks + maxCrafts <= MAX_SIDE_EFFECTS
-                && effects.stream().allMatch(effect -> maxBreaks > 0 && effect.startsWith("break:")
-                    || maxCrafts > 0 && effect.startsWith("craft:"));
+        boolean pendingOrdinary() {
+            return !preset && target.item != null && target.item != Items.IRON_INGOT
+                && !effects.contains(IRON_SMELT) && !effects.contains(FURNACE);
         }
     }
 
@@ -230,8 +226,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                     || !adjacentStage(envelope.id, nextWorkId))) return envelope;
             String duringWaitFor = value.has("duringWaitFor") ? text(value, "duringWaitFor") : null;
             if (duringWaitFor != null && (preset || nextWorkId != null || envelope.id.equals(duringWaitFor)
-                    || !ID.matcher(duringWaitFor).matches() || envelope.expires - envelope.basis > MAX_SIDE_TICKS
-                    || stageSuffix(envelope.id))) return envelope;
+                    || !ID.matcher(duringWaitFor).matches() || stageSuffix(envelope.id))) return envelope;
             JsonObject target = value.getAsJsonObject("target");
             Target desired;
             switch (text(target, "kind")) {
@@ -262,7 +257,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                 bounded(value, "maxBreaks", 0, preset ? 32 : MAX_BREAKS),
                 bounded(value, "maxCrafts", 0, preset ? 24 : 64),
                 bounded(value, "maxPlacements", 0, preset ? 2 : 8));
-            if (duringWaitFor != null && !policy.pendingSide()) return envelope;
+            if (duringWaitFor != null && !policy.pendingOrdinary()) return envelope;
             if (effects.contains(IRON_SMELT) || effects.contains(FURNACE) || effects.contains(DIAMOND_PROSPECT)
                     || effects.contains(WATER_FILL)) {
                 if ((!mode.equals("preset") && !mode.equals("constrained")) || nextWorkId != null || stageSuffix(envelope.id))

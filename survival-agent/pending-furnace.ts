@@ -8,13 +8,23 @@ export const PENDING_FURNACE_SCOPE = "pending-furnace-scope.json";
 const RECORD = "pending-furnace.json";
 const NATIVE_CLOSE = "pending-furnace-close.json";
 const TEMP = "pending-furnace.tmp";
-const BYTES = 4_096;
+// 32 longest vanilla reserve IDs plus 36 signed coordinate pairs, with stamp/header room.
+const BYTES = 8_192;
 const run = z.string().regex(new RegExp(`^\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}\\.\\d{3}Z-(?:${GOALS.join("|")})-[A-Za-z0-9]{6}$`));
 const uuid = z.string().regex(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
 const hash = z.string().regex(/^[0-9a-f]{64}$/);
 const stamp = z.strictObject({ run, life: z.int().min(1), tick: z.int().min(1), frame: z.int().min(0) });
-const cell = z.tuple([z.int().min(-30_000_000).max(30_000_000), z.int().min(-64).max(320),
-  z.int().min(-30_000_000).max(30_000_000)]);
+const horizontal = z.int().min(-30_000_000).max(30_000_000);
+const height = z.int().min(-64).max(320);
+const cell = z.tuple([horizontal, height, horizontal]);
+const breadcrumbs = z.strictObject({
+  footing: cell,
+  edges: z.array(z.tuple([horizontal, height, horizontal, horizontal, height, horizontal])).min(1).max(36),
+});
+const floors = z.array(z.strictObject({
+  item: z.string().regex(/^minecraft:[a-z0-9_]{1,96}$/).refine(item => item !== "minecraft:air"),
+  count: z.int().min(1).max(2_304),
+})).max(32).refine(items => new Set(items.map(floor => floor.item)).size === items.length);
 const snapshot = z.strictObject({
   v: z.literal(1), run, world: uuid, owner: uuid, id: uuid, originId: uuid, originWorld: uuid,
   dimension: z.enum(["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"]),
@@ -27,10 +37,11 @@ const snapshot = z.strictObject({
   basis: z.enum(["live", "resume", "clue"]),
   state: z.enum(["paid", "parked", "collected", "cancelled", "disappeared"]),
   paid: stamp, parked: stamp.optional(), lost: stamp.optional(), gone: stamp.optional(), ended: stamp.optional(),
+  floors: floors.optional(), breadcrumbs: breadcrumbs.optional(),
 });
 const scope = z.strictObject({ v: z.literal(1), run, world: uuid, resume: hash.optional() });
-const close = z.strictObject({ v: z.literal(1), stamp, id: uuid, record: hash });
-const seal = z.strictObject({ record: hash, source: hash, copy: hash });
+const close = z.strictObject({ v: z.literal(1), stamp, id: uuid, record: hash, breadcrumbs: breadcrumbs.optional() });
+const seal = z.strictObject({ record: hash, source: hash, copy: hash, route: hash.optional() });
 
 type Snapshot = z.infer<typeof snapshot>;
 type Stamp = z.infer<typeof stamp>;
@@ -49,13 +60,30 @@ const active = (row: Snapshot) => row.state === "paid" || row.state === "parked"
 const atOrAfter = (a: Stamp, b: Stamp) => a.run !== b.run || a.life > b.life && a.tick >= b.tick ||
   a.life === b.life && a.tick >= b.tick && a.frame >= b.frame;
 
+function validBreadcrumbs(route: z.infer<typeof breadcrumbs>, [sx, sy, sz]: z.infer<typeof cell>) {
+  const [fx, fy, fz] = route.footing;
+  if (Math.abs(fx - sx) > 6 || Math.abs(fy - sy) > 6 || Math.abs(fz - sz) > 6) return false;
+  let previous: string | undefined;
+  const visited = new Set<string>();
+  for (const [ax, ay, az, bx, by, bz] of route.edges) {
+    const from = `${ax},${ay},${az}`, to = `${bx},${by},${bz}`;
+    if (previous !== undefined && previous !== from ||
+        Math.abs(ax - bx) + Math.abs(az - bz) !== 1 || Math.abs(ay - by) > 1) return false;
+    visited.add(from);
+    if (visited.has(to)) return false;
+    previous = to;
+  }
+  return previous === `${fx},${fy},${fz}`;
+}
+
 function readSnapshot(text: string | null | undefined, current: Scope) {
   const row = parse(snapshot, text);
   if (!row || !text || row.run !== current.run || row.world !== current.world ||
       row.fuelCount !== Math.ceil(row.units * 200 / row.fuelTicks) ||
       row.minimumOutput > row.units || row.maximumFuel > row.fuelCount || row.paid.frame < 1 ||
       Math.abs(row.pos[0] - row.footing[0]) > 6 || Math.abs(row.pos[1] - row.footing[1]) > 6 ||
-      Math.abs(row.pos[2] - row.footing[2]) > 6) return;
+      Math.abs(row.pos[2] - row.footing[2]) > 6 ||
+      row.breadcrumbs && (row.basis !== "resume" || !validBreadcrumbs(row.breadcrumbs, row.pos))) return;
   const own = row.paid.run === row.run;
   if (own !== (row.originId === row.id && row.originWorld === row.world) ||
       (row.basis === "live" && (!own || row.lost || row.gone)) ||
@@ -133,7 +161,12 @@ export async function readPendingFurnaceParent(source: Source) {
   const authority = active(row) && row.basis !== "clue" && temporary === undefined && parsed.success &&
     parsed.data.record === digest(text) ? parsed.data : undefined;
   const saved = authority && await saveStamp(source, row);
-  return { row, seal: saved?.source === authority?.source && saved?.copy === authority?.copy ? authority : undefined };
+  const proven = saved?.source === authority?.source && saved?.copy === authority?.copy ? authority : undefined;
+  const closeText = proven?.route && await source.read(NATIVE_CLOSE, BYTES, true);
+  const receipt = closeText && digest(closeText) === proven?.route ? parse(close, closeText) : undefined;
+  const route = receipt && receipt.record === proven?.record && receipt.id === row.id &&
+    receipt.breadcrumbs && validBreadcrumbs(receipt.breadcrumbs, row.pos) ? receipt.breadcrumbs : undefined;
+  return { row, seal: proven, breadcrumbs: route };
 }
 
 /** A child receives only data plus a freshly scoped observation ID, never a parent command. */
@@ -148,7 +181,8 @@ export async function preparePendingFurnace(directory: string, run: string, chil
     // across the copy, and the copied files must match its sealed save metadata.
     if (!parent.seal || latest?.row.id === parent.row.id) {
       const proven = parent.seal && latest?.seal?.source === parent.seal.source && childStamp?.copy === parent.seal.copy;
-      const row: Snapshot = { ...parent.row, run, world: current.world, id: randomUUID(), basis: proven ? "resume" : "clue" };
+      const row: Snapshot = { ...parent.row, run, world: current.world, id: randomUUID(), basis: proven ? "resume" : "clue",
+        floors: proven ? parent.row.floors : undefined, breadcrumbs: proven ? latest?.breadcrumbs : undefined };
       const text = JSON.stringify(row);
       current.resume = digest(text);
       await put(directory, RECORD, text);
@@ -172,5 +206,6 @@ export async function sealPendingFurnace(source: Omit<Source, "seal">,
       receipt.stamp.run !== source.run || receipt.stamp.tick < evidence.progressTick || receipt.id !== row.id ||
       !atOrAfter(receipt.stamp, row.parked ?? row.paid) || receipt.record !== digest(text)) return;
   const saved = await saveStamp(source, row);
-  return saved && { record: receipt.record, ...saved };
+  return saved && { record: receipt.record, ...saved,
+    ...(closeText && receipt.breadcrumbs && validBreadcrumbs(receipt.breadcrumbs, row.pos) ? { route: digest(closeText) } : {}) };
 }

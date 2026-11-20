@@ -32,7 +32,7 @@ async function fixture<T>(fn: (f: {
   child: (suffix: string, alteredFile?: string) => Promise<{
     run: string; dir: string; save: { world: string; device: number };
   }>;
-  rewrite: (row: Record<string, unknown>) => Promise<void>;
+  rewrite: (row: Record<string, unknown>, breadcrumbs?: unknown) => Promise<void>;
   dir: string;
 }) => Promise<T>) {
   const base = await mkdtemp(path.join(tmpdir(), "pending-furnace-"));
@@ -50,11 +50,11 @@ async function fixture<T>(fn: (f: {
       if (error.code !== "ENOENT") throw error;
       return undefined;
     });
-    const rewrite = async (row: Record<string, unknown>) => {
+    const rewrite = async (row: Record<string, unknown>, breadcrumbs?: unknown) => {
       const text = JSON.stringify(row);
       await write(dir, record, text);
       await write(dir, close, JSON.stringify({ v: 1, stamp: receipt(117, 340), id,
-        record: createHash("sha256").update(text).digest("hex") }));
+        record: createHash("sha256").update(text).digest("hex"), breadcrumbs }));
     };
     await write(dir, PENDING_FURNACE_SCOPE, JSON.stringify({ v: 1, run: parentRun, world: worldId }));
     await rewrite(snapshot);
@@ -130,4 +130,51 @@ test("the runner rejects malformed paid stamps and never seals a different playe
     expect(await readPendingFurnaceParent(source)).toBeUndefined();
     await rewrite({ ...snapshot, fuelCount: 2 });
     expect(await sealPendingFurnace(source, evidence)).toBeUndefined();
+  }));
+
+const route = {
+  footing: [-2, 28, 513],
+  edges: [[-3, 27, 514, -3, 27, 513], [-3, 27, 513, -2, 28, 513]],
+} satisfies NonNullable<Awaited<ReturnType<typeof readPendingFurnaceParent>>>["breadcrumbs"];
+const floors = [{ item: "minecraft:cobblestone", count: 3 }, { item: "minecraft:iron_pickaxe", count: 1 }];
+
+test("a sealed same-lineage continuation carries private walked clues and restriction-only floors", () =>
+  fixture(async ({ source, child, rewrite }) => {
+    await rewrite({ ...snapshot, floors }, route);
+    const withRoute = { ...source, seal: await sealPendingFurnace(source, evidence) };
+    const parent = await readPendingFurnaceParent(withRoute);
+    expect(parent?.breadcrumbs).toEqual(route);
+    const restored = await child("Walked");
+    await preparePendingFurnace(restored.dir, restored.run, restored.save, withRoute, parent);
+    expect(await readJson(restored.dir, record)).toMatchObject({
+      basis: "resume", originId: id, breadcrumbs: route, floors, paid: snapshot.paid,
+    });
+
+    const changed = await child("NoWalk", "region/r.-1.1.mca");
+    await preparePendingFurnace(changed.dir, changed.run, changed.save, withRoute, parent);
+    const clue = await readJson(changed.dir, record);
+    expect(clue).toMatchObject({ basis: "clue", originId: id });
+    expect(clue).not.toHaveProperty("breadcrumbs");
+    expect(clue).not.toHaveProperty("floors");
+  }));
+
+test("editing close breadcrumbs cannot mint a route or erase the paid obligation", () =>
+  fixture(async ({ source, child, rewrite }) => {
+    await rewrite({ ...snapshot, floors }, route);
+    const sealed = { ...source, seal: await sealPendingFurnace(source, evidence) };
+    const before = await readPendingFurnaceParent(sealed);
+    await rewrite({ ...snapshot, floors }, { ...route, edges: [[-4, 27, 513, -2, 28, 513]] });
+    const copy = await child("RouteX");
+    await preparePendingFurnace(copy.dir, copy.run, copy.save, sealed, before);
+    const restored = await readJson(copy.dir, record);
+    expect(restored).toMatchObject({ basis: "resume", originId: id, floors });
+    expect(restored).not.toHaveProperty("breadcrumbs");
+  }));
+
+test("malformed or duplicate reserve floors cannot be imported", () =>
+  fixture(async ({ source, rewrite }) => {
+    await rewrite({ ...snapshot, floors: [floors[0], floors[0]] });
+    expect(await sealPendingFurnace(source, evidence)).toBeUndefined();
+    await rewrite({ ...snapshot, floors: [{ item: "minecraft:air", count: 1 }] });
+    expect(await readPendingFurnaceParent(source)).toBeUndefined();
   }));

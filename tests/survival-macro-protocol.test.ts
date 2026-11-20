@@ -111,43 +111,31 @@ test("Pending stock is not inventory or a permission to spend, replace, or renew
   expect(() => parseMacroObservation({ ...sample, pendingWork: { ...ticket, collectOfferId: "made-up" } })).toThrow("pending work opportunity");
   expect(() => parseMacroObservation({ ...sample, working: { intentId: "held-mouse", crack: 0.2 } })).toThrow("pending work scope");
   expect(() => parseMacroObservation({ ...sample, pendingWork: { ...ticket, historical: true } })).toThrow("pending work scope");
-  const cave = { id: "dry-cave-edge", verb: "follow", risk: "low", summary: "One returnable cave edge", evidence: "Dry both ways." };
+  const cave = { id: "dry-cave-edge", verb: "follow", risk: "guarded", summary: "One returnable cave edge", evidence: "Dry both ways." };
   const recall = { id: "fresh-recall", verb: "collect_pending", risk: "guarded", summary: "Recall exact furnace", evidence: "Same workshop trail." };
-  const worksite = { routes: "Paired level edge ahead; no movement yet.", choice: {
-    kind: "dry-follow", opportunityId: cave.id, target: "observed-edge-a",
-  } } as const;
+  const worksite = { routes: "Paired level edge ahead; no movement yet." };
+  const protectedReserves = [{ item: "minecraft:oak_planks", count: 1 }];
   const parked = { ...sample, workOrder: { ...sample.workOrder, state: "complete" },
-    pendingWork: { ...ticket, parked: true, yieldable: false, collectOfferId: recall.id, worksite },
+    pendingWork: { ...ticket, parked: true, yieldable: false, collectOfferId: recall.id, worksite,
+      returnClue: "walked_route", protectedReserves },
     opportunities: [recall, cave] };
-  expect(parseMacroObservation(parked).pendingWork?.worksite).toEqual(worksite);
-  expect(() => parseMacroObservation({ ...parked, pendingWork: { ...parked.pendingWork, worksite: undefined } }))
+  expect(parseMacroObservation(parked).pendingWork).toMatchObject({ worksite, returnClue: "walked_route", protectedReserves });
+  expect(() => parseMacroObservation({ ...parked, opportunities: [recall, { ...cave, risk: "low" }] }))
     .toThrow("unscoped low-risk dry follow");
-  expect(() => parseMacroObservation({ ...parked, pendingWork: { ...parked.pendingWork, collectOfferId: undefined } }))
-    .toThrow("parked cave opportunity");
-  expect(() => parseMacroObservation({ ...parked, opportunities: [recall, { ...cave, risk: "guarded" }] }))
-    .toThrow("parked cave opportunity");
-  expect(() => parseMacroObservation({ ...parked, workOrder: sample.workOrder })).toThrow("parked worksite scope");
-  const setup = { id: "same-block-setup", verb: "survey", risk: "low", summary: "Center on the same dry block",
-    evidence: "Off center facing cave water; recheck once without crossing any tile." };
-  const setupSite = { routes: setup.evidence, choice: {
-    kind: "setup-cave-stance", opportunityId: setup.id, target: "local-workshop-support",
-  } } as const;
-  const restored = { ...parked, opportunities: [recall, setup],
-    pendingWork: { ...parked.pendingWork, worksite: setupSite, historical: true } };
-  expect(parseMacroObservation(restored).pendingWork?.worksite).toEqual(setupSite);
-  expect(() => parseMacroObservation({ ...restored, pendingWork: { ...restored.pendingWork, collectOfferId: undefined } }))
-    .toThrow("parked cave opportunity");
-  expect(() => parseMacroObservation({ ...restored, pendingWork: { ...restored.pendingWork, worksite: undefined } }))
-    .toThrow("unscoped low-risk cave survey");
+  expect(() => parseMacroObservation({ ...parked, workOrder: sample.workOrder })).toThrow("pending work operation");
+  const moving = { ...parked, workOrder: { ...sample.workOrder, id: "ordinary-job" }, opportunities: [],
+    pendingWork: { ...parked.pendingWork, worksite: undefined, collectOfferId: undefined } };
+  expect(parseMacroObservation(moving).pendingWork).toMatchObject({ returnClue: "walked_route" });
+  expect(parseMacroObservation(moving).pendingWork?.collectOfferId).toBeUndefined();
   const side = {
-    target: { kind: "stock", item: "minecraft:cobblestone", count: 2 }, allowedEffects: ["break:minecraft:stone"],
-    costCaps: [], reserves: [], maxBreaks: 2, maxCrafts: 0, maxPlacements: 0,
+    target: { kind: "stock", item: "minecraft:cobblestone", count: 12 }, allowedEffects: ["break:minecraft:stone", "place:minecraft:crafting_table"],
+    costCaps: [{ item: "minecraft:crafting_table", count: 1 }], reserves: [], maxBreaks: 12, maxCrafts: 0, maxPlacements: 1,
   };
   const order = { v: 1, id: "side-stock", run: "run", life: 1, epoch: 1, safetyRevision: 1,
-    basisTick: 60, expiresTick: 660, origin: "model", duringWaitFor: ticket.id, ...side };
+    basisTick: 60, expiresTick: 1260, origin: "model", duringWaitFor: ticket.id, ...side };
   expect(parseMacroWorkOrder(order).duringWaitFor).toBe(ticket.id);
-  expect(() => parseMacroWorkOrder({ ...order, expiresTick: 661 })).toThrow("work expiry");
-  expect(() => parseMacroWorkOrder({ ...order, maxPlacements: 1 })).toThrow("local pending side policy");
+  expect(() => parseMacroWorkOrder({ ...order, expiresTick: 1261 })).toThrow("work expiry");
+  expect(() => parseMacroWorkOrder({ ...order, target: { ...side.target, item: ticket.output.item } })).toThrow("independent pending work");
   const proposal = { subgoal: "Build useful cave stock", reason: "Visible stone", successCondition: "Two real cobblestone",
     contingency: "Stop on risk", alternative: "Wait for the kitchen", expiresTick: 660 };
   expect(() => parseMacroProposal({ ...proposal, action: { kind: "work", policy: side,

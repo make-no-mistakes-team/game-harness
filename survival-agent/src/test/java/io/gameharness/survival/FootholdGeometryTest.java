@@ -1,11 +1,14 @@
 package io.gameharness.survival;
 
 import java.util.Set;
+import net.minecraft.Bootstrap;
+import net.minecraft.SharedConstants;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -13,6 +16,27 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class FootholdGeometryTest {
+    @BeforeAll
+    static void initializeVanilla() {
+        SharedConstants.createGameVersion();
+        Bootstrap.initialize();
+    }
+
+    @Test
+    void ordinarySourceBearingCanSelectLowerAndUpperPairedShelvesButNotAFalseApproach() {
+        var from = new BlockPos(0, 30, 0);
+        var lowerOre = new BlockHitResult(new Vec3d(3, 29.5, 0.5), Direction.WEST, new BlockPos(3, 29, 0), false);
+        var upperOre = new BlockHitResult(new Vec3d(3, 31.5, 0.5), Direction.WEST, new BlockPos(3, 31, 0), false);
+        assertTrue(AgentMacroControl.routeTowardSource(from, from.east().down(), lowerOre));
+        assertTrue(AgentMacroControl.routeTowardSource(from, from.east().up(), upperOre));
+        assertFalse(AgentMacroControl.routeTowardSource(from, from.east().up(), lowerOre),
+            "a route above the lower source does not solve ordinary safe harvest geometry");
+        assertFalse(AgentMacroControl.routeTowardSource(from, from.west().up(), upperOre),
+            "a real route heading away is not a witnessed approach toward this source");
+        assertFalse(AgentMacroControl.routeTowardSource(from, from, upperOre),
+            "a same-block camera adjustment is not travel");
+    }
+
     @Test
     void witnessedDryOpeningBeatsAnUpperWaterCueWithoutAuthorizingTravel() {
         var foot = new BlockPos(0, 32, 0);
@@ -28,7 +52,7 @@ final class FootholdGeometryTest {
     }
 
     @Test
-    void workshopOffsetVetoesCrossingWithoutVetoingSameSupportSetup() {
+    void offCenterStanceVetoesCrossingButAllowsSameSupportPositioning() {
         var foot = new BlockPos(-275, 32, -572);
         var actual = new Vec3d(-274.846, 32, -571.477); // 0.346 blocks off center in the workshop.
         var center = Vec3d.ofBottomCenter(foot);

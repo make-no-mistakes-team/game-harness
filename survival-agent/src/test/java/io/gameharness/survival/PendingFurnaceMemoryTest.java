@@ -2,9 +2,13 @@ package io.gameharness.survival;
 
 import com.google.gson.JsonParser;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.security.MessageDigest;
+import java.util.HexFormat;
+import java.util.Map;
 import java.util.UUID;
 import net.minecraft.Bootstrap;
 import net.minecraft.SharedConstants;
@@ -44,7 +48,7 @@ final class PendingFurnaceMemoryTest {
     private static boolean pay(AgentPendingFurnaceMemory memory, UUID id, long tick) {
         return memory.pay(id, "minecraft:overworld", new BlockPos(-1, 28, 513), Direction.NORTH,
             new BlockPos(-2, 28, 513), new AgentHands.IronBatch(2, Items.COAL, 1, 1600), 3, 0, 1,
-            tick, 82);
+            Map.of(Items.COBBLESTONE, 3), tick, 82);
     }
 
     @Test
@@ -57,6 +61,7 @@ final class PendingFurnaceMemoryTest {
         assertFalse(pay(memory, OTHER, 25));
         assertTrue(memory.park(TICKET, 40, 130));
         assertTrue(memory.park(TICKET, 41, 140));
+        assertEquals(Map.of(Items.COBBLESTONE, 3), memory.current().floors());
         assertTrue(memory.end(TICKET, AgentPendingFurnaceMemory.State.COLLECTED, 400, 1500));
         assertTrue(memory.end(TICKET, AgentPendingFurnaceMemory.State.COLLECTED, 400, 1500));
         assertNull(memory.current());
@@ -80,11 +85,67 @@ final class PendingFurnaceMemoryTest {
         assertFalse(memory.end(TICKET, AgentPendingFurnaceMemory.State.COLLECTED, 501, 4));
         assertTrue(memory.end(TICKET, AgentPendingFurnaceMemory.State.DISAPPEARED, 502, 6));
         assertEquals(AgentPendingFurnaceMemory.State.DISAPPEARED, memory.current().state());
-        memory.runnerClose(505, 9);
+        memory.runnerClose(505, 9, new AgentWalkedRoute.Breadcrumbs(new int[] {-2, 28, 513},
+            new int[][] {{-3, 27, 513, -2, 28, 513}}));
         assertFalse(Files.exists(dir.resolve("pending-furnace-close.json")));
         var row = JsonParser.parseString(Files.readString(dir.resolve("pending-furnace.json"))).getAsJsonObject();
         assertEquals("disappeared", row.get("state").getAsString());
         assertEquals(500, row.getAsJsonObject("lost").get("tick").getAsLong());
         assertEquals(502, row.getAsJsonObject("gone").get("tick").getAsLong());
+    }
+
+    @Test
+    void cleanAwayCloseBindsWalkedCluesToTheUnchangedPaidTicket() throws IOException {
+        Path dir = runDirectory();
+        var memory = new AgentPendingFurnaceMemory(dir);
+        assertTrue(memory.bind(OWNER, 1, 1, 1));
+        assertTrue(pay(memory, TICKET, 25));
+        assertTrue(memory.park(TICKET, 40, 130));
+        String paid = Files.readString(dir.resolve("pending-furnace.json"));
+        memory.runnerClose(120, 330, new AgentWalkedRoute.Breadcrumbs(new int[] {-2, 28, 513},
+            new int[][] {{-3, 27, 514, -3, 27, 513}, {-3, 27, 513, -2, 28, 513}}));
+        assertEquals(paid, Files.readString(dir.resolve("pending-furnace.json")));
+        var close = JsonParser.parseString(Files.readString(dir.resolve("pending-furnace-close.json"))).getAsJsonObject();
+        assertEquals(TICKET.toString(), close.get("id").getAsString());
+        assertEquals(2, close.getAsJsonObject("breadcrumbs").getAsJsonArray("edges").size());
+        assertEquals(Map.of(Items.COBBLESTONE, 3), memory.current().floors());
+    }
+
+    @Test
+    void onlyAProvedSameOwnerResumeExposesRestoredWalkedClues() throws Exception {
+        Path parent = runDirectory();
+        var original = new AgentPendingFurnaceMemory(parent);
+        assertTrue(original.bind(OWNER, 1, 1, 1));
+        assertTrue(pay(original, TICKET, 25));
+        original.runnerClose(120, 330, new AgentWalkedRoute.Breadcrumbs(new int[] {-2, 28, 513},
+            new int[][] {{-3, 27, 513, -2, 28, 513}}));
+        var row = JsonParser.parseString(Files.readString(parent.resolve("pending-furnace.json"))).getAsJsonObject();
+        var close = JsonParser.parseString(Files.readString(parent.resolve("pending-furnace-close.json"))).getAsJsonObject();
+        String childRun = "2026-11-20T07-00-30.012Z-diamond-Ab123Z";
+        String childWorld = "00000000-0000-4000-8000-000000000010";
+        row.addProperty("run", childRun);
+        row.addProperty("world", childWorld);
+        row.addProperty("id", OTHER.toString());
+        row.addProperty("basis", "resume");
+        row.add("breadcrumbs", close.getAsJsonObject("breadcrumbs"));
+        Path child = Files.createDirectory(temporary.resolve(childRun));
+        var privateMode = PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"));
+        String text = row.toString();
+        String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8)));
+        Files.writeString(Files.createFile(child.resolve("pending-furnace.json"), privateMode), text);
+        Files.writeString(Files.createFile(child.resolve("pending-furnace-scope.json"), privateMode), """
+            {"v":1,"run":"%s","world":"%s","resume":"%s"}
+            """.formatted(childRun, childWorld, hash));
+
+        var foreign = new AgentPendingFurnaceMemory(child);
+        assertFalse(foreign.bind(OTHER, 1, 1, 1));
+        assertNull(foreign.current());
+        var nativeResume = new AgentPendingFurnaceMemory(child);
+        assertTrue(nativeResume.bind(OWNER, 1, 1, 1));
+        assertEquals(OTHER, nativeResume.current().ticket());
+        assertEquals(Map.of(Items.COBBLESTONE, 3), nativeResume.current().floors());
+        var route = new AgentWalkedRoute();
+        route.restore(nativeResume.current().breadcrumbs());
+        assertEquals(new BlockPos(-2, 28, 513).asLong(), route.next(new BlockPos(-3, 27, 513).asLong()));
     }
 }

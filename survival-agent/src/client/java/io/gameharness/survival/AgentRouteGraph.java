@@ -296,6 +296,10 @@ final class AgentRouteGraph {
         return returnTopology == topology && homeward[find(current)] != 0;
     }
 
+    boolean refreshReturn(long current) {
+        return anchor != 0 && proveReturn(MAX_NODES) >= 0 && canReturn(current);
+    }
+
     /** After planning, the next attested hop back toward the anchor, not a movement command. */
     long returnNext(long current) {
         if (returnTopology != topology) return NO_CELL;
@@ -468,7 +472,9 @@ final class AgentRouteGraph {
         return -1;
     }
 
-    private static int y(long cell) { return (int) (cell << 52 >> 52); }
+    static boolean cardinalStep(long from, long to) { return slot(from, to) >= 0; }
+
+    static int y(long cell) { return (int) (cell << 52 >> 52); }
     private static int opposite(int slot) { return ((slot / 3) ^ 1) * 3 + 2 - slot % 3; }
     private static int viewBit(int bearing) { return bearing >= 0 && bearing < SLOTS ? 1 << bearing : 0; }
 }

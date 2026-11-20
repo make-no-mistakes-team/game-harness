@@ -702,8 +702,12 @@ public final class AgentClient implements ClientModInitializer {
             else observeContinuityIdle();
         }
         ended = true;
+        AgentWalkedRoute.Breadcrumbs pendingBreadcrumbs = null;
         if (body != null) {
-            if (macro != null) macro.closeFurnaceForStop();
+            if (macro != null) {
+                macro.closeFurnaceForStop();
+                pendingBreadcrumbs = macro.pendingCloseBreadcrumbs();
+            }
             hands.releaseWorkInventory(true);
             releaseLifeInputs(client);
         }
@@ -711,7 +715,7 @@ public final class AgentClient implements ClientModInitializer {
         stopMacro("actor_exit", "The owning runner ended the attempt.");
         if (body != null && pendingFurnaceMemory != null && lifePhase == LifePhase.PLAYING &&
                 soleFurnaceActor(client, client.player))
-            pendingFurnaceMemory.runnerClose(tick, body.renderedFrame());
+            pendingFurnaceMemory.runnerClose(tick, body.renderedFrame(), pendingBreadcrumbs);
         client.scheduleStop();
     }
 

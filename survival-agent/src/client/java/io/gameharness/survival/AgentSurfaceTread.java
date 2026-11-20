@@ -20,22 +20,54 @@ final class AgentSurfaceTread {
     final boolean returning;
     final BlockPos from, to;
     private final Direction travel;
-    private final Vec3d floorAim, nearFloorAim, chestAim;
+    private final Vec3d center, floorAim, nearFloorAim, chestAim, headAim;
+    private final BlockPos sourceSupport, landingSupport;
+    private final boolean isolated;
+    private final AgentWalkedRoute.Motion motion = new AgentWalkedRoute.Motion();
     private final long started;
     private long drivingSince = -1;
-    private boolean floorSeen;
+    private boolean floorSeen, chestSeen;
 
     AgentSurfaceTread(Edge edge, boolean returning, long started) {
+        this(edge, returning, started, false);
+    }
+
+    private AgentSurfaceTread(Edge edge, boolean returning, long started, boolean isolated) {
         this.edge = edge;
         this.returning = returning;
         this.started = started;
+        this.isolated = isolated;
         from = returning ? edge.lower : edge.upper;
         to = returning ? edge.upper : edge.lower;
         travel = returning ? edge.down.getOpposite() : edge.down;
-        Vec3d center = Vec3d.ofBottomCenter(to);
+        sourceSupport = from.down();
+        landingSupport = to.down();
+        center = Vec3d.ofBottomCenter(to);
         floorAim = center.add(0.28 * travel.getOffsetX(), -0.032, 0.28 * travel.getOffsetZ());
         nearFloorAim = center.add(-0.22 * travel.getOffsetX(), -0.032, -0.22 * travel.getOffsetZ());
         chestAim = center.add(0.07 * travel.getOffsetX(), 1.32, 0.07 * travel.getOffsetZ());
+        headAim = isolated ? center.add(0.12 * travel.getOffsetX(), 1.76, 0.12 * travel.getOffsetZ()) : chestAim;
+    }
+
+    /** Build only from the next already walked edge; ordinary tread proof still precedes any input. */
+    static AgentSurfaceTread recall(MinecraftClient client, BlockPos from, BlockPos to, long tick) {
+        int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ();
+        Direction travel = dx == 0 ? dz > 0 ? Direction.SOUTH : Direction.NORTH : dx > 0 ? Direction.EAST : Direction.WEST;
+        if (client.options.forwardKey.isUnbound() || to.getY() > from.getY() && client.options.jumpKey.isUnbound()
+                || !cardinalTread(from, to, travel)) return null;
+        boolean up = to.getY() > from.getY();
+        BlockPos upper = up ? to : from, lower = up ? from : to;
+        var edge = new Edge(upper, client.world.getBlockState(upper.down()),
+            lower, client.world.getBlockState(lower.down()), up ? travel.getOpposite() : travel);
+        return new AgentSurfaceTread(edge, up, tick, true);
+    }
+
+    boolean inFlight() { return drivingSince >= 0; }
+
+    boolean rememberedLaneChanged(MinecraftClient client, AgentBody body) {
+        return !body.walkedLaneDry(from, to, travel) || !retainedLaneClear(client, from, to, travel)
+            || client.world.getBlockState(sourceSupport) != (returning ? edge.lowerSupport : edge.upperSupport)
+            || client.world.getBlockState(landingSupport) != (returning ? edge.upperSupport : edge.lowerSupport);
     }
 
     static BlockPos nextFoot(BlockPos foot, Direction down) {
@@ -111,34 +143,46 @@ final class AgentSurfaceTread {
         var world = client.world;
         if (player.isTouchingWater() || player.isInLava() || player.isOnFire() || player.hasVehicle()
                 || player.hurtTime != 0 || !cardinalTread(edge.upper, edge.lower, edge.down)
-                || world.getBlockState(edge.upper.down()) != edge.upperSupport
-                || world.getBlockState(edge.lower.down()) != edge.lowerSupport) return Result.REFUSED;
+                || world.getBlockState(sourceSupport) != (returning ? edge.lowerSupport : edge.upperSupport)
+                || world.getBlockState(landingSupport) != (returning ? edge.upperSupport : edge.lowerSupport)
+                || isolated && !body.walkedLaneDry(from, to, travel)) return Result.REFUSED;
+        if (drivingSince >= 0 && !motion.observe(player.getX(), player.getY(), player.getZ())) return Result.REFUSED;
+        if (drivingSince < 0 ? tick - started > PROOF_TICKS : tick - drivingSince > DRIVE_TICKS) return Result.REFUSED;
         if (!body.hasRecentView()) return drivingSince < 0 ? Result.CHECKING : Result.MOVING;
+        if (isolated && !body.macroNoVisiblePickup(center, Math.min(from.getY(), to.getY()),
+                Math.max(from.getY(), to.getY()) + 0.32)) return Result.REFUSED;
         if (drivingSince < 0) {
-            if (tick - started > PROOF_TICKS || !player.isOnGround() || !player.getBlockPos().equals(from)) return Result.REFUSED;
+            if (!player.isOnGround() || !player.getBlockPos().equals(from)) return Result.REFUSED;
             if (!centered(player.getPos(), from, 0.17)) {
-                body.centerOnSupport(from.down());
+                body.centerOnSupport(sourceSupport);
                 return Result.CHECKING;
             }
             if (player.getVelocity().horizontalLengthSquared() > 0.0025) return Result.CHECKING;
             if (!floorSeen) {
-                if (body.dryRouteFloor(floorAim, to.down()) == null && body.dryRouteFloor(nearFloorAim, to.down()) == null) {
+                if (body.dryRouteFloor(floorAim, landingSupport) == null && body.dryRouteFloor(nearFloorAim, landingSupport) == null) {
                     body.aim(floorAim);
                     return Result.CHECKING;
                 }
                 floorSeen = true;
             }
-            if (body.dryRouteClear(chestAim) != AgentBody.DryRouteSample.CLEAR) {
+            if (!chestSeen && body.dryRouteClear(chestAim) != AgentBody.DryRouteSample.CLEAR) {
                 body.aim(chestAim);
+                return Result.CHECKING;
+            }
+            chestSeen = true;
+            if (isolated && body.dryRouteClear(headAim) != AgentBody.DryRouteSample.CLEAR) {
+                body.aim(headAim);
                 return Result.CHECKING;
             }
             if (!reverseClear(client, edge.upper, edge.lower, edge.down) || !body.dryRouteSweep(from, to)) return Result.REFUSED;
             drivingSince = tick;
+            motion.start(player.getX(), player.getY(), player.getZ());
         }
         if (player.isOnGround() && player.getBlockPos().equals(to) && centered(player.getPos(), to, 0.23)
                 && Math.abs(player.getY() - to.getY()) <= 0.055
-                && player.getVelocity().horizontalLengthSquared() <= 0.0025) return Result.LANDED;
-        if (tick - drivingSince > DRIVE_TICKS || player.getY() < Math.min(from.getY(), to.getY()) - 0.055) return Result.REFUSED;
+                && player.getVelocity().horizontalLengthSquared() <= 0.0025)
+            return motion.traversed() ? Result.LANDED : Result.REFUSED;
+        if (player.getY() < Math.min(from.getY(), to.getY()) - 0.055) return Result.REFUSED;
         if (!reverseClear(client, edge.upper, edge.lower, edge.down) || !body.dryRouteSweep(from, to))
             return tick - drivingSince < 5 ? Result.CHECKING : Result.REFUSED;
         body.driveDryRoute(from, to, travel);

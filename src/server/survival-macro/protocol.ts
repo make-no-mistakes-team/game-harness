@@ -189,16 +189,12 @@ export interface MacroPendingWork {
   readonly collectOfferId?: string;
   readonly deferOfferId?: string;
   readonly historical?: true;
+  /** A currently supported connection, not permission to recall while another job owns input. */
+  readonly returnClue?: "local_face" | "walked_route";
+  /** Remembered restrictions, never remembered inventory or authority. */
+  readonly protectedReserves?: readonly MacroStockFloor[];
   /** Present only on a settled, current world view after the parked controls are released. */
-  readonly worksite?: {
-    readonly routes: string;
-    readonly choice?: {
-      readonly kind: "dry-follow" | "dry-approach" | "inspect-cave" | "setup-cave-stance";
-      readonly opportunityId: string;
-      /** A stable local witness identity, not an opportunity ID or a world position. */
-      readonly target: string;
-    };
-  };
+  readonly worksite?: { readonly routes: string };
 }
 
 export type MacroWorkMode = "preset" | "constrained";
@@ -227,7 +223,7 @@ export interface MacroWorkOrder extends MacroWorkPolicy {
   readonly origin: "preset" | "model";
   /** May retain a clean personal screen for this exact, not-yet-admitted program stage. */
   readonly nextWorkId?: string;
-  /** One separately metered local stock job, admitted only after native hands release. */
+  /** Separately metered ordinary work while this paid ticket remains outstanding. */
   readonly duringWaitFor?: string;
 }
 export interface MacroWorkState {
@@ -268,6 +264,8 @@ export interface MacroWorkDemand {
   readonly duringWaitFor?: string;
   /** A parked decision uses fresh local facts, or explicitly reports a bounded view wait. */
   readonly parkedWorksite?: "settled" | "view-unavailable";
+  /** Accepted production dependency, not spendable stock. Absent for historical tickets. */
+  readonly pendingPredecessor?: { readonly id: string; readonly queuedTarget?: MacroWorkTarget };
   /** The original model's stated reason, not evidence or a dependent authorization. */
   readonly pendingPurpose?: { readonly id: string; readonly subgoal: string; readonly reason: string };
   readonly lastOutcome: {
@@ -560,12 +558,23 @@ function singleLiveWork(policy: MacroWorkPolicy) {
 }
 
 function pendingSidePolicy(policy: MacroWorkPolicy): MacroWorkPolicy {
+  pendingOrdinaryPolicy(policy);
   const { target, maxBreaks, maxCrafts, maxPlacements, allowedEffects } = policy;
   if (target.kind !== "stock" || maxPlacements || maxBreaks + maxCrafts < 1 ||
       maxBreaks + maxCrafts > MACRO_PENDING_SIDE_MAX_EFFECTS || !allowedEffects.length ||
       !allowedEffects.every(effect => (maxBreaks > 0 && effect.startsWith("break:")) ||
         (maxCrafts > 0 && effect.startsWith("craft:"))))
     invalid("finite local pending side policy");
+  return policy;
+}
+
+export function isIndependentPendingPolicy(policy: MacroWorkPolicy): boolean {
+  return policy.target.kind === "stock" && policy.target.item !== "minecraft:iron_ingot" &&
+    !policy.allowedEffects.includes(MACRO_IRON_SMELT);
+}
+
+function pendingOrdinaryPolicy(policy: MacroWorkPolicy): MacroWorkPolicy {
+  if (!isIndependentPendingPolicy(policy)) invalid("independent pending work policy");
   return policy;
 }
 
@@ -641,10 +650,10 @@ export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   if (origin === "preset" && (policy.target.kind !== "preset" || policy.allowedEffects.length || policy.costCaps.length ||
       policy.maxBreaks > 32 || policy.maxCrafts > 24 || policy.maxPlacements > 2)) invalid("preset work scope");
   const nextWorkId = Object.hasOwn(record, "nextWorkId") ? validateMacroId(record.nextWorkId, "next work id") : undefined;
-  const duringWaitFor = Object.hasOwn(record, "duringWaitFor") ? validateMacroId(record.duringWaitFor, "pending side ticket id") : undefined;
+  const duringWaitFor = Object.hasOwn(record, "duringWaitFor") ? validateMacroId(record.duringWaitFor, "pending ticket id") : undefined;
   if (duringWaitFor) {
-    if (origin !== "model" || nextWorkId || duringWaitFor === id || /:[123]$/.test(id)) invalid("pending side order scope");
-    pendingSidePolicy(policy);
+    if (origin !== "model" || nextWorkId || duringWaitFor === id || /:[123]$/.test(id)) invalid("pending ordinary order scope");
+    pendingOrdinaryPolicy(policy);
   }
   if (singleLiveWork(policy) && (nextWorkId || /:[123]$/.test(id)))
     invalid("this effect requires a single live work order");
@@ -656,8 +665,7 @@ export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   return Object.freeze({
     v: version(record.v), id, run: validateMacroId(record.run, "run"),
     life: whole(record.life, "life", 1, 2_147_483_647), epoch: whole(record.epoch, "epoch", 1), basisTick,
-    expiresTick: whole(record.expiresTick, "work expiry", basisTick + 1,
-      basisTick + (duringWaitFor ? MACRO_PENDING_SIDE_MAX_TICKS : MACRO_MAX_INTENT_TTL_TICKS)),
+    expiresTick: whole(record.expiresTick, "work expiry", basisTick + 1, basisTick + MACRO_MAX_INTENT_TTL_TICKS),
     safetyRevision: whole(record.safetyRevision, "work safety revision", 1), origin,
     ...(nextWorkId ? { nextWorkId } : {}), ...(duringWaitFor ? { duringWaitFor } : {}), ...policy,
   });
@@ -771,7 +779,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
   let pendingWork: MacroPendingWork | undefined;
   if (Object.hasOwn(record, "pendingWork")) {
     const raw = shape(record.pendingWork, "native pending work", ["id", "kind", "goal", "invested", "output", "location",
-      "state", "yieldable", "parked"], ["remainingTicks", "collectOfferId", "deferOfferId", "historical", "worksite"]);
+      "state", "yieldable", "parked"], ["remainingTicks", "collectOfferId", "deferOfferId", "historical", "returnClue", "protectedReserves", "worksite"]);
     const id = validateMacroId(raw.id, "pending work id");
     const kind = choice(raw.kind, "pending production kind", ["iron-smelting"] as const);
     const goal = text(raw.goal, "pending parent goal", 256);
@@ -796,39 +804,31 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     };
     const collectOfferId = offer(raw.collectOfferId, MACRO_COLLECT_PENDING);
     const deferOfferId = offer(raw.deferOfferId, MACRO_DEFER_PENDING);
-    if ((collectOfferId && !parked) || (deferOfferId && (parked || !yieldable))) invalid("pending work operation");
+    if ((collectOfferId && (!parked || workOrder?.state === "working" || workOrder?.state === "needs_replan" && !raw.worksite)) ||
+        (deferOfferId && (parked || !yieldable))) invalid("pending work operation");
+    const returnClue = raw.returnClue === undefined ? undefined :
+      choice(raw.returnClue, "pending return clue", ["local_face", "walked_route"] as const);
+    const protectedReserves = raw.protectedReserves === undefined ? undefined :
+      stockFloors(raw.protectedReserves, "pending protected reserves", true);
     let worksite: MacroPendingWork["worksite"];
     if (raw.worksite !== undefined) {
       if (!parked || yieldable || working || !safety?.clear || workOrder?.state === "working") invalid("parked worksite scope");
-      const local = shape(raw.worksite, "parked worksite", ["routes"], ["choice"]);
-      let caveChoice: NonNullable<MacroPendingWork["worksite"]>["choice"];
-      if (local.choice !== undefined) {
-        const quoted = shape(local.choice, "parked cave choice", ["kind", "opportunityId", "target"]);
-        const kind = choice(quoted.kind, "parked cave choice kind",
-          ["dry-follow", "dry-approach", "inspect-cave", "setup-cave-stance"] as const);
-        const opportunityId = validateMacroId(quoted.opportunityId, "parked cave opportunity id");
-        const verb = kind === "dry-follow" ? "follow" : kind === "dry-approach" ? "approach" : "survey";
-        if (!collectOfferId || output.count < 2 || !opportunities.some(offer => offer.id === opportunityId &&
-            offer.verb === verb && offer.risk === "low" && !offer.material)) invalid("parked cave opportunity");
-        caveChoice = Object.freeze({ kind, opportunityId, target: validateMacroId(quoted.target, "parked cave target") });
-      }
-      worksite = Object.freeze({ routes: text(local.routes, "parked worksite routes", 512),
-        ...(caveChoice ? { choice: caveChoice } : {}) });
+      const local = shape(raw.worksite, "parked worksite", ["routes"]);
+      worksite = Object.freeze({ routes: text(local.routes, "parked worksite routes", 512) });
     }
     pendingWork = Object.freeze({
       id, kind, goal, invested, output, state, location: text(raw.location, "pending location clue", 512), yieldable, parked,
       ...(raw.remainingTicks !== undefined ? { remainingTicks: whole(raw.remainingTicks, "estimated remaining ticks", 0, output.count * 200) } : {}),
       ...(collectOfferId ? { collectOfferId } : {}), ...(deferOfferId ? { deferOfferId } : {}),
       ...(historical ? { historical } : {}),
+      ...(returnClue ? { returnClue } : {}),
+      ...(protectedReserves?.length ? { protectedReserves } : {}),
       ...(worksite ? { worksite } : {}),
     });
   }
-  if (opportunities.some(offer => offer.verb === "follow" && offer.risk === "low" &&
-      (pendingWork?.worksite?.choice?.kind !== "dry-follow" || pendingWork.worksite.choice.opportunityId !== offer.id)))
+  if (opportunities.some(offer => offer.verb === "follow" && offer.risk === "low"))
     invalid("unscoped low-risk dry follow");
-  const caveSurvey = pendingWork?.worksite?.choice;
-  if (opportunities.some(offer => offer.verb === "survey" && offer.risk === "low" &&
-      (caveSurvey?.opportunityId !== offer.id || (caveSurvey.kind !== "inspect-cave" && caveSurvey.kind !== "setup-cave-stance"))))
+  if (opportunities.some(offer => offer.verb === "survey" && offer.risk === "low"))
     invalid("unscoped low-risk cave survey");
   return Object.freeze({
     v: version(record.v), ...basis(record), goal: text(record.goal, "goal", 256),
@@ -933,11 +933,11 @@ export function parseMacroProposal(value: unknown): MacroProposal {
       shape(rawAction, "work action", ["kind", "policy"], ["afterWorkId", "duringWaitFor", "duringWait"]);
       const policy = parseMacroWorkPolicy(rawAction.policy);
       const afterWorkId = Object.hasOwn(rawAction, "afterWorkId") ? validateMacroId(rawAction.afterWorkId, "predecessor work id") : undefined;
-      const duringWaitFor = Object.hasOwn(rawAction, "duringWaitFor") ? validateMacroId(rawAction.duringWaitFor, "pending side ticket id") : undefined;
+      const duringWaitFor = Object.hasOwn(rawAction, "duringWaitFor") ? validateMacroId(rawAction.duringWaitFor, "pending ticket id") : undefined;
       const contingent = Object.hasOwn(rawAction, "duringWait") ? shape(rawAction.duringWait, "quoted pending side policy", ["policy", "maxTicks"]) : undefined;
       if (Number(!!afterWorkId) + Number(!!duringWaitFor) + Number(!!contingent) > 1 ||
           (contingent && !policy.allowedEffects.includes(MACRO_IRON_SMELT))) invalid("exclusive work relationship");
-      action = { kind, policy: duringWaitFor ? pendingSidePolicy(policy) : policy,
+      action = { kind, policy: duringWaitFor ? pendingOrdinaryPolicy(policy) : policy,
         ...(afterWorkId ? { afterWorkId } : {}),
         ...(duringWaitFor ? { duringWaitFor } : {}),
         ...(contingent ? { duringWait: Object.freeze({ policy: pendingSidePolicy(parseMacroWorkPolicy(contingent.policy)),

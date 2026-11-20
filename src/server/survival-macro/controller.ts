@@ -8,7 +8,9 @@ import {
   type FirstPlanInference, type FirstPlanRequest, type FirstPlanStrategist,
 } from "./bootstrap.ts";
 import {
-  MACRO_CAPABILITIES_VERSION, MACRO_IRON_SMELT, MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
+  MACRO_CAPABILITIES_VERSION, MACRO_IRON_SMELT, MACRO_WATER_CLUE, MACRO_WATER_FILL,
+  MACRO_SMELT_OVERLAP_MIN_COOK_TICKS,
+  MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_PLANNING_IDLE_MS, MACRO_LOOKAHEAD_MAX_AGE_TICKS, MACRO_LOOKAHEAD_MAX_CRACK,
   MacroDirectory, MacroObservationRotating, MacroValidationError,
   hasDirectAuthority, liveCorrectionEvidence, macroReplyRejectionDetail, matchesMaterial,
@@ -289,6 +291,7 @@ interface WorkJob {
   readonly requestId: string | null;
   health: number;
   bootstrap?: true;
+  smeltLookedAhead?: true;
   accepted?: MacroReceipt;
   terminal?: MacroReceipt;
   withdrawn?: true;
@@ -300,11 +303,13 @@ interface QueuedWork {
   readonly stages: readonly MacroWorkStage[];
   readonly next: number;
   readonly bootstrap?: { readonly branchIndex: number; readonly declaredStages: number };
+  readonly smeltSuccessor?: true;
 }
 
 interface WorkOverlap {
   readonly incumbent: WorkJob;
   readonly queue: QueuedWork | undefined;
+  readonly smeltBurnTick?: number;
 }
 
 interface WorkStageIds {
@@ -877,7 +882,8 @@ export class SurvivalMacroController {
       const stale = this.busy.kind !== "trial" && (!current ||
         (this.busy.kind === "inference"
           ? work.context.correction ? (!!observed && !this.replyCorrectionApplies(work.context.correction, current)) :
-            work.context.lookahead ? lookaheadStale : work.context.workDemand ? !workScope(work.context.observation, current) :
+            work.context.lookahead ? lookaheadStale : work.context.workDemand ?
+              !workScope(work.context.observation, current) || !this.smeltOverlapCurrent(work.context, current) :
             !sameGoalAndLife(work.context.observation, current) || !alive(current)
           : !samePlayableScope(work.context.observation, current) || current.tick >= this.busy.plan.proposal.expiresTick));
       if (runtimeExpired || stale || (!work.result && now >= work.until)) {
@@ -1168,9 +1174,19 @@ export class SurvivalMacroController {
     if (!job && complete?.finalOrder.target.kind === "preset" &&
         complete.basis.life === observation.life && complete.goal === observation.goal) return;
     if (this.previousJob) return; // A published candidate has not settled; the incumbent remains authoritative.
-    // A furnace lease can deposit ingredients before output exists. Wait for its terminal receipt instead of renewing it.
-    if (job?.policy.allowedEffects.includes(MACRO_IRON_SMELT)) return;
     const nativeState = job && observation.workOrder?.id === job.order.id ? observation.workOrder : null;
+    let overlap: WorkOverlap | undefined;
+    if (job?.policy.allowedEffects.includes(MACRO_IRON_SMELT)) {
+      // A paid batch cannot be renewed or replaced. Only an observed cook can
+      // open a one-shot, contingent successor query while this batch runs.
+      const burn = nativeState?.progress?.smeltBurn;
+      const wallTicks = (this.startedAt! + this.limits.maxRuntimeMs - performance.now()) / 50;
+      if (queue || job.order.origin !== "model" || !job.accepted || job.terminal || job.withdrawn || job.smeltLookedAhead ||
+          nativeState?.state !== "working" || !burn || burn.burnTick <= job.accepted.tick ||
+          burn.units > job.policy.maxCrafts || burn.remainingCookTicks < MACRO_SMELT_OVERLAP_MIN_COOK_TICKS ||
+          burn.remainingCookTicks >= Math.min(job.order.expiresTick - observation.tick, this.limits.maxIntentTtlTicks, wallTicks)) return;
+      overlap = { incumbent: job, queue, smeltBurnTick: burn.burnTick };
+    }
     const previous = this.workQuery;
     const replan = nativeState?.progress?.replan;
     const needsRenewal = !!job && (replan === "expiry_near" || job.order.expiresTick - observation.tick <= this.renewLeadTicks);
@@ -1188,7 +1204,7 @@ export class SurvivalMacroController {
     const repair = shortagePending && gathering && (progressedStock || productive && phase !== "route");
     const openingTail = !!queue?.bootstrap && queue.next === queue.stages.length && productive && replan === "target_near" &&
       target?.kind === "stock" && target.item !== `minecraft:${observation.goal}` && stock(observation, `minecraft:${observation.goal}`) === 0;
-    const overlap = owner && !this.workOverlapRequests.has(owner) && job?.accepted && !job.terminal && !job.withdrawn &&
+    overlap ??= owner && !this.workOverlapRequests.has(owner) && job?.accepted && !job.terminal && !job.withdrawn &&
       (!queue || queue.after === job) && (nativeState?.state === "working" || nativeState?.state === "needs_replan") &&
       (repair || openingTail) ? { incumbent: job, queue } : undefined;
     // A queued path already supplies the next course unless new evidence makes
@@ -1215,7 +1231,8 @@ export class SurvivalMacroController {
     let key: string;
     if (overlap) {
       demand = "successor";
-      key = `queued-successor:${owner}:${overlap.incumbent.order.id}`;
+      key = overlap.smeltBurnTick === undefined ? `queued-successor:${owner}:${overlap.incumbent.order.id}` :
+        `smelt-successor:${overlap.incumbent.order.id}`;
     } else if (!previous) {
       demand = "first";
       key = needsRenewal ? `renew:${job!.order.id}` : `first:${observation.life}`;
@@ -1248,7 +1265,8 @@ export class SurvivalMacroController {
     if (unchanged && !correction && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
     if (handoffQuery) this.workHandoffQueries.add(handoffQuery);
     if (!correction) this.workQuery = { key, tick: observation.tick, evidence };
-    if (overlap && owner) this.workOverlapRequests.add(owner);
+    if (overlap?.smeltBurnTick !== undefined) overlap.incumbent.smeltLookedAhead = true;
+    else if (overlap && owner) this.workOverlapRequests.add(owner);
     const workDemand: MacroWorkDemand = {
       mode: this.workMode!, demand,
       protectedReserves: this.floorScope?.life === observation.life ? this.floorScope.reserves : [],
@@ -1258,6 +1276,16 @@ export class SurvivalMacroController {
         receipt: outcome.terminal, nativeState: outcomeState } : null,
     };
     await this.begin(view, { workDemand, workOverlap: overlap, correction });
+  }
+
+  private smeltOverlapCurrent(context: Decision, current: MacroObservation): boolean {
+    const overlap = context.workOverlap;
+    if (overlap?.smeltBurnTick === undefined) return true;
+    const { incumbent } = overlap;
+    const nativeState = current.workOrder;
+    return this.job === incumbent && !incumbent.withdrawn && !incumbent.terminal && this.queuedWork === overlap.queue &&
+      nativeState?.id === incumbent.order.id && nativeState.state === "working" &&
+      nativeState.progress?.smeltBurn?.burnTick === overlap.smeltBurnTick;
   }
 
   private async preemptQueuedWork(requestId: string): Promise<void> {
@@ -1282,7 +1310,9 @@ export class SurvivalMacroController {
     else if (!after) {
       await this.startWorkStage(queued);
       return;
-    } else if (!terminal || current.tick < terminal.tick) return;
+    } else if (queued.smeltSuccessor && next === 0 && !terminal && current.workOrder?.id === after.order.id &&
+        current.workOrder.state === "blocked") reason = "predecessor_blocked";
+    else if (!terminal || current.tick < terminal.tick) return;
     else if (terminal.status !== "completed" || !after.accepted || this.job) reason = "predecessor_did_not_complete";
     else if (!confirmsWorkStock(current, after.policy)) reason = "predecessor_stock_not_confirmed";
     else if (bootstrap && !openingHandoff(after, current)) reason = "opening_handoff_not_confirmed";
@@ -1313,9 +1343,12 @@ export class SurvivalMacroController {
     const { plan, stages, next: index, after, bootstrap } = queued;
     const { policy, requires } = stages[index]!;
     const stage = stages.length > 1 ? workStageIds(plan.requestId, stages, index) : undefined;
+    const afterSmelt = queued.smeltSuccessor && index === 0 ? after : null;
     let rejection = "fresh_work_admission_rejected";
     const job = await this.publishWork(plan.observation, policy, "model", plan.requestId, plan.proposal.expiresTick,
-      requires, after?.policy, bootstrap && after ? fresh => {
+      requires, after?.policy, afterSmelt ? fresh => !this.job && fresh.tick >= afterSmelt.terminal!.tick &&
+        workScope(afterSmelt.source, fresh, afterSmelt.health) && performance.now() - this.observedAt <= this.limits.maxObservationAgeMs :
+        bootstrap && after ? fresh => {
         if (this.job || !openingHandoff(after, fresh) || !workScope(after.source, fresh, after.health) ||
             performance.now() - this.observedAt > this.limits.maxObservationAgeMs) {
           rejection = "opening_handoff_not_confirmed";
@@ -1340,6 +1373,11 @@ export class SurvivalMacroController {
           return false;
         }
         const checked = preflightVanillaWork(fresh, [stages[index]!]);
+        if (afterSmelt && checked.kind !== "possible") {
+          rejection = "smelt_successor_live_path_not_confirmed";
+          if (checked.detail !== undefined) await this.reportWorkShortage(plan.requestId, checked, fresh);
+          return false;
+        }
         if (checked.kind === "shortage") {
           if (bootstrap) rejection = "work_resource_shortage";
           await this.reportWorkShortage(plan.requestId, checked, fresh);
@@ -1356,7 +1394,7 @@ export class SurvivalMacroController {
         return true;
       });
     if (job === null) return; // A rotating observation is not a denied program stage.
-    if (!job && bootstrap) return this.discardQueuedWork(queued, rejection);
+    if (!job && (bootstrap || afterSmelt)) return this.discardQueuedWork(queued, rejection);
     this.queuedWork = undefined;
     if (job && (stages.length > 1 || (job.order.origin === "model" && policy.target.kind === "preset"))) {
       if (bootstrap) job.bootstrap = true;
@@ -1382,8 +1420,9 @@ export class SurvivalMacroController {
       return;
     }
     const previous = this.job;
-    if (previous?.policy.allowedEffects.includes(MACRO_IRON_SMELT)) {
-      if (requestId) await this.disposition("proposal_refused", { requestId, reason: "Wait for the finite iron work order to settle." });
+    if (previous?.policy.allowedEffects.includes(MACRO_IRON_SMELT) || previous?.policy.allowedEffects.includes(MACRO_WATER_FILL)) {
+      if (requestId) await this.disposition("proposal_refused", { requestId, reason: previous.policy.allowedEffects.includes(MACRO_WATER_FILL)
+        ? "Wait for the finite bucket work order to settle." : "Wait for the finite iron work order to settle." });
       return;
     }
     const equivalent = !!previous && workPolicyKey(previous.policy) === workPolicyKey(policy);
@@ -1886,7 +1925,8 @@ export class SurvivalMacroController {
     const context = busy.work.context;
     const stale = runtimeExpired || !current || (context.correction && !this.replyCorrectionApplies(context.correction, current)) ||
       (context.lookahead ? !lookaheadScope(context.lookahead, current) :
-      context.workDemand ? !workScope(context.observation, current) : !samePlayableScope(context.observation, current)) ||
+      context.workDemand ? !workScope(context.observation, current) || !this.smeltOverlapCurrent(context, current) :
+        !samePlayableScope(context.observation, current)) ||
       (busy.kind !== "inference" && current.tick >= busy.plan.proposal.expiresTick);
     const late = result.settledAt > busy.work.until || busy.work.cancel.signal.aborted;
     if (busy.kind === "inference") {
@@ -2045,6 +2085,13 @@ export class SurvivalMacroController {
       return;
     }
     if (!proposal || !current || this.closing) return;
+    const smeltOverlap = context.workOverlap?.smeltBurnTick !== undefined;
+    if (smeltOverlap && proposal.action.kind !== "abstain" && proposal.action.kind !== "work" &&
+        proposal.action.kind !== "work-program") {
+      if (disposition === "proposed") await this.record("work_successor_discarded", { requestId: context.requestId,
+        afterWorkId: context.workOverlap!.incumbent.order.id, reason: "overlap_requires_bound_successor" });
+      return;
+    }
     // An otherwise valid abstention may have outlived its old view. It still
     // authorized no effect, and must not suppress a newly witnessed decision.
     if (proposal.action.kind === "abstain" && context.workDemand && this.workQuery &&
@@ -2106,11 +2153,14 @@ export class SurvivalMacroController {
         const completed = after.terminal && current.tick >= after.terminal.tick;
         // An accepted model job can supply a conditional projection; its outcome is
         // not stock. The built-in preset may take paths outside the explicit recipe policy.
-        if (completed || after.order.origin === "model") {
+        if (smeltOverlap) {
+          const burn = current.workOrder?.progress?.smeltBurn;
+          if (burn?.remainingCookTicks) await this.previewWorkResources(context.requestId, current, stages, undefined, burn.units);
+        } else if (completed || after.order.origin === "model") {
           await this.previewWorkResources(context.requestId, current, stages, completed ? undefined : after.policy);
         }
         await this.preemptQueuedWork(context.requestId);
-        this.queuedWork = { after, plan, stages, next: 0 };
+        this.queuedWork = { after, plan, stages, next: 0, ...(smeltOverlap ? { smeltSuccessor: true } : {}) };
         await this.record("work_successor_queued", { requestId: context.requestId, afterWorkId: after.order.id, stages: stages.length });
         return;
       }
@@ -2509,6 +2559,10 @@ export class SurvivalMacroController {
       await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "Opportunity was never offered on its basis." });
       return false;
     }
+    if (before.verb === MACRO_WATER_CLUE) {
+      await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "A water clue grants no primitive or skill action." });
+      return false;
+    }
     const reserves = this.floorScope?.life === current.life ? this.floorScope.reserves : [];
     if (before.risk === "guarded" && (this.workMode === "constrained" ||
         (reserves.length && !protectsStock(reserves, current, before)))) {
@@ -2619,10 +2673,16 @@ export class SurvivalMacroController {
   }
 
   private async previewWorkResources(
-    requestId: string, observation: MacroObservation, stages: readonly MacroWorkStage[], prior?: MacroWorkPolicy,
+    requestId: string, observation: MacroObservation, stages: readonly MacroWorkStage[], prior?: MacroWorkPolicy, paidSmeltUnits?: number,
   ): Promise<void> {
-    const check = preflightVanillaWork(observation, prior ? [{ policy: prior, requires: [] }, ...stages] : stages);
-    if (check.kind !== "possible" && check.detail !== undefined) {
+    // This private preview projects only this batch's output. Its input and fuel
+    // are already out of the observed inventory. Live admission never uses it.
+    const preview = paidSmeltUnits ? {
+      inventory: { ...observation.inventory, "minecraft:iron_ingot": stock(observation, "minecraft:iron_ingot") + paidSmeltUnits },
+      opportunities: observation.opportunities,
+    } : observation;
+    const check = preflightVanillaWork(preview, prior ? [{ policy: prior, requires: [] }, ...stages] : stages);
+    if (check.kind !== "possible" && (!paidSmeltUnits || check.kind === "shortage") && check.detail !== undefined) {
       const stageIndex = check.stageIndex - (prior ? 1 : 0);
       if (stageIndex >= 0) await this.reportWorkShortage(requestId, {
         stageIndex, detail: prior ? check.detail.replace(/^Stage \d+/, `Stage ${stageIndex + 1}`) : check.detail,

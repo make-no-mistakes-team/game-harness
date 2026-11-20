@@ -181,6 +181,7 @@ final class AgentBody {
     private boolean forward;
     private boolean backward;
     private boolean fast;
+    private int lastForwardPress = -8;
     private boolean verifiedDescent;
     private boolean flatWalk, dryRouteWalk, emergencyWalk;
     private boolean wetEscapeWalk;
@@ -604,6 +605,14 @@ final class AgentBody {
             ownsRowKeys = true;
         } else {
             releaseRowKeys();
+        }
+        // A second forward press can start vanilla sprint even with the sprint key up.
+        // A paced approach can coast at the lip; don't turn its next pulse into a double-tap.
+        if (advance && !options.forwardKey.isPressed()) {
+            if ((flatWalk || dryRouteWalk) && !sprintRequested && tick - lastForwardPress < 8) {
+                advance = false;
+                jump = false;
+            } else lastForwardPress = tick;
         }
         // Sample only an input about to reach vanilla, after movement and lava vetoes.
         if (routeJumps && jump && (advance || reachJump) && !fast && !crouch
@@ -1487,9 +1496,13 @@ final class AgentBody {
         return stableDryRouteTop(floor, client.world.getBlockState(hit.getBlockPos())) ? hit : null;
     }
 
-    enum DryRouteTop { WITNESSED, OUT_OF_VIEW, OCCLUDED, DARK, FLUID, NO_FULL_TOP }
+    enum DryRouteTop { WITNESSED, OUT_OF_VIEW, OCCLUDED, DARK, FLUID, NO_FULL_TOP, UNSUITABLE_TOP }
 
     DryRouteTop dryRouteTop(Vec3d belowTop, BlockPos floor) {
+        return dryRouteTop(belowTop, floor, false);
+    }
+
+    DryRouteTop dryRouteTop(Vec3d belowTop, BlockPos floor, boolean distinguishUnsuitable) {
         if (!hasView() || raysLeft <= 0 || !inView(belowTop)) return DryRouteTop.OUT_OF_VIEW;
         raysLeft--;
         BlockHitResult hit = raycast(belowTop, Ray.TERRAIN);
@@ -1504,7 +1517,7 @@ final class AgentBody {
         }
         if (!floor.equals(hit.getBlockPos())) return DryRouteTop.OCCLUDED;
         return matchesDryRouteTop(hit, floor) && stableDryRouteTop(floor, shown)
-            ? DryRouteTop.WITNESSED : DryRouteTop.NO_FULL_TOP;
+            ? DryRouteTop.WITNESSED : distinguishUnsuitable ? DryRouteTop.UNSUITABLE_TOP : DryRouteTop.NO_FULL_TOP;
     }
 
     private static boolean matchesDryRouteTop(BlockHitResult hit, BlockPos floor) {
@@ -1612,6 +1625,17 @@ final class AgentBody {
 
     enum FootholdSpace { EMPTY, VIEW, DARK, OCCLUDED, OCCUPIED, FLUID }
 
+    static Vec3d footholdInterior(BlockPos cell, Direction bearing, boolean high) {
+        double along = high ? -0.16 : 0.16;
+        return Vec3d.ofCenter(cell).add(bearing.getOffsetX() * along, high ? 0.31 : -0.20, bearing.getOffsetZ() * along);
+    }
+
+    static Vec3d footholdAttachmentAim(BlockPos anchor, Direction offset, Direction bearing) {
+        return offset == Direction.DOWN
+            ? Vec3d.ofCenter(anchor, 0.96).add(bearing.getOffsetX() * 0.30, 0, bearing.getOffsetZ() * 0.30)
+            : Vec3d.ofCenter(anchor, 0.77).add(-offset.getOffsetX() * 0.46, 0, -offset.getOffsetZ() * 0.46);
+    }
+
     /** Verify this exact adjacent build cell through a lit, unobstructed first-person ray. */
     FootholdSpace footholdSpace(Vec3d point) {
         if (!hasView() || raysLeft <= 0 || !inView(point)) return FootholdSpace.VIEW;
@@ -1633,18 +1657,31 @@ final class AgentBody {
 
     /** One already-witnessed neighbor: contact must stay on the attaching face as the view settles. */
     boolean placeFoothold(BlockHitResult anchor, BlockPos destination, Preparation preparation) {
+        return footholdAttachment(anchor, destination)
+            && useContact(anchor, Contact.PRECISE, preparation);
+    }
+
+    boolean footholdAttachment(BlockHitResult anchor, BlockPos destination) {
         if (!hasView() || anchor.getSide() == Direction.DOWN
                 || !anchor.getBlockPos().offset(anchor.getSide()).equals(destination)
                 || client.player.getBoundingBox().intersects(new Box(destination))
                 || !sameBlockFace(anchor, contactRay(anchor.getPos(), client.player.getBlockInteractionRange()))) return false;
         var material = client.world.getBlockState(anchor.getBlockPos());
-        if (!stableDryRouteTop(anchor.getBlockPos(), material) || material.hasBlockEntity()
-                || material.isOf(Blocks.CRAFTING_TABLE) || material.isOf(Blocks.FURNACE)) return false;
-        return useContact(anchor, Contact.PRECISE, preparation);
+        return stableDryRouteTop(anchor.getBlockPos(), material) && !material.hasBlockEntity()
+            && !material.isOf(Blocks.CRAFTING_TABLE) && !material.isOf(Blocks.FURNACE);
     }
 
     /** A collision veto for precisely one already admitted cardinal lane, never a source of map evidence. */
     DryRouteVeto dryRouteVeto(BlockPos from, BlockPos to) {
+        return dryRouteVeto(from, to, true);
+    }
+
+    /** The landing has been witnessed empty. Only the full cube to be placed may supply its missing support. */
+    boolean dryRouteBuildClear(BlockPos from, BlockPos to) {
+        return dryRouteVeto(from, to, false) == DryRouteVeto.CLEAR;
+    }
+
+    private DryRouteVeto dryRouteVeto(BlockPos from, BlockPos to, boolean requireLandingSupport) {
         if (!hasView()) return DryRouteVeto.VIEW;
         var player = client.player;
         int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ(), dy = to.getY() - from.getY();
@@ -1676,7 +1713,7 @@ final class AgentBody {
         // exact chosen contact footprint can still veto the pair.
         Box sourceContact = new Box(high.minX, y - 0.06, high.minZ, high.maxX, y - 0.015, high.maxZ);
         Box landingContact = sourceContact.offset(dx, dy, dz);
-        return client.world.isSpaceEmpty(player, sourceContact) || client.world.isSpaceEmpty(player, landingContact)
+        return client.world.isSpaceEmpty(player, sourceContact) || requireLandingSupport && client.world.isSpaceEmpty(player, landingContact)
             ? DryRouteVeto.SUPPORT : DryRouteVeto.CLEAR;
     }
 
@@ -1821,6 +1858,48 @@ final class AgentBody {
     boolean useWaterSource(BlockPos target, Vec3d witness, Preparation preparation) {
         return useSource(target, witness, false, preparation);
     }
+
+    static boolean exactWaterSource(BlockState state) {
+        return state.isOf(Blocks.WATER) && state.getFluidState().isStill();
+    }
+
+    private static boolean sameSourceFace(BlockHitResult hit, BlockHitResult witness) {
+        return hit != null && hit.getType() == HitResult.Type.BLOCK && hit.getBlockPos().equals(witness.getBlockPos())
+            && hit.getSide() == witness.getSide();
+    }
+
+    /** A fresh rendered hit must see exposed water and agree with the vanilla bucket ray. */
+    boolean waterFillWitness(BlockHitResult witness, double reach) {
+        if (!hasView() || eye.squaredDistanceTo(witness.getPos()) > reach * reach
+                || !exactWaterSource(client.world.getBlockState(witness.getBlockPos()))) return false;
+        Vec3d end = witness.getPos().add(witness.getPos().subtract(eye).normalize().multiply(0.025));
+        return sameSourceFace(litHit(end, Ray.FLUIDS), witness)
+            && sameSourceFace(visibleSourceRay(witness.getPos(), reach), witness);
+    }
+
+    /** The queued native edge is checked again after vanilla updates its crosshair. */
+    boolean scopedWaterUseCurrent(BlockHitResult witness) {
+        if (!fallUseReady() || !client.player.getMainHandStack().isOf(Items.BUCKET)
+                || !client.player.getOffHandStack().isEmpty() || sourceContact == null
+                || !exactWaterSource(client.world.getBlockState(witness.getBlockPos()))) return false;
+        HitResult selected = client.crosshairTarget;
+        if (selected == null || selected.getType() == HitResult.Type.ENTITY) return false;
+        if (selected.getType() == HitResult.Type.BLOCK) {
+            // The normal block use precedes item use. Only allow inert blocks behind the water.
+            Block block = client.world.getBlockState(((BlockHitResult) selected).getBlockPos()).getBlock();
+            if (block != Blocks.WATER && block.getClass() != Block.class
+                    && block.getClass() != net.minecraft.block.PillarBlock.class) return false;
+        }
+        BlockHitResult exposed = itemRay(RaycastContext.FluidHandling.ANY);
+        BlockHitResult source = itemRay(RaycastContext.FluidHandling.SOURCE_ONLY);
+        return sameSourceFace(exposed, witness) && sameSourceFace(source, witness) && sourceContact.admits(source);
+    }
+
+    void confirmedWaterUse(BlockHitResult witness) {
+        emitContact("scoop_water", "accepted", witness.getBlockPos(), witness.getSide(),
+            Double.NaN, Double.NaN, -1, -1);
+    }
+
     boolean useLavaSource(BlockPos target, Vec3d witness, Preparation preparation) {
         return useSource(target, witness, true, preparation);
     }

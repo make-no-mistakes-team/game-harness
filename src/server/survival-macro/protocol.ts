@@ -2,9 +2,10 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { link, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import actorManifest from "../../../survival-agent/src/main/resources/fabric.mod.json";
 import { SURVIVAL_AGENT_GOALS, type SurvivalAgentGoal } from "../../shared/survival-agent-ui.ts";
 
-export const MACRO_CAPABILITIES_VERSION = "survival-macro/v3";
+export const MACRO_CAPABILITIES_VERSION = `survival-macro/v${actorManifest.custom["gameharness:terra_work_wire"]}`;
 export const MACRO_MAX_INTENT_TTL_TICKS = 1_200;
 export const MACRO_MAX_PLAN_TTL_TICKS = 7_200;
 export const MACRO_MAX_HANDOFF_TTL_TICKS = 100;
@@ -15,12 +16,19 @@ export const MACRO_MAX_DIRECT_MS = 30_000;
 export const MACRO_LOOKAHEAD_MAX_AGE_TICKS = 40;
 export const MACRO_LOOKAHEAD_MAX_CRACK = 0.65;
 export const MACRO_MAX_WORK_STAGES = 3;
+export const MACRO_SMELT_OVERLAP_MIN_COOK_TICKS = 80;
 
 export const MACRO_IRON_SMELT = "smelt:minecraft:iron_ingot";
 export const MACRO_FURNACE_PLACEMENT = "place:minecraft:furnace";
+export const MACRO_DIAMOND_PROSPECT = "prospect:minecraft:diamond";
+export const MACRO_PROSPECT_TORCH = "place:minecraft:torch";
+export const MACRO_PROSPECT_SUPPORT = "place:minecraft:cobblestone";
+export const MACRO_WATER_FILL = "fill:minecraft:water";
+export const MACRO_WATER_CLUE = "fill_water";
+export const MACRO_WATER_SOURCE = "fluid:minecraft:water_source";
 const workEffects = "break:minecraft:[a-z0-9_]{1,96}|craft:[a-z0-9_]{1,96}|place:minecraft:crafting_table";
 export const MACRO_PROGRAM_EFFECT_PATTERN = `^(${workEffects})$`;
-export const MACRO_LIVE_EFFECT_PATTERN = `^(${workEffects}|${MACRO_IRON_SMELT}|${MACRO_FURNACE_PLACEMENT})$`;
+export const MACRO_LIVE_EFFECT_PATTERN = `^(${workEffects}|${MACRO_IRON_SMELT}|${MACRO_FURNACE_PLACEMENT}|${MACRO_DIAMOND_PROSPECT}|${MACRO_PROSPECT_TORCH}|${MACRO_PROSPECT_SUPPORT}|${MACRO_WATER_FILL})$`;
 const liveEffect = new RegExp(MACRO_LIVE_EFFECT_PATTERN);
 
 // Vanilla 1.21.4 durations for the exact fuels the bounded iron work supports.
@@ -60,7 +68,7 @@ export interface MacroOpportunity {
   readonly summary: string;
   readonly risk: "read" | "low" | "guarded";
   readonly evidence: string;
-  /** Native evidence for one guarded primitive; spends bound item-count loss, not durability wear or yields. */
+  /** Native evidence for a guarded primitive or a read-only water clue; spends bound item-count loss. */
   readonly material?: {
     readonly subject: string;
     readonly target: string;
@@ -187,7 +195,7 @@ export interface MacroWorkState {
   readonly detail: string;
   /** Observed operation and confirmed counters, not a claim of useful play each tick. */
   readonly progress?: {
-    readonly phase: "route" | "harvest" | "collect" | "craft" | "smelt" | "equip" | "place" | "search" | "hold" | "complete";
+    readonly phase: "route" | "harvest" | "collect" | "craft" | "smelt" | "fill" | "equip" | "place" | "search" | "hold" | "complete";
     readonly status: string;
     readonly target?: { readonly item: string; readonly count: number; readonly required: number };
     readonly breaks: number;
@@ -195,6 +203,8 @@ export interface MacroWorkState {
     readonly placements: number;
     readonly lastEffect?: { readonly tick: number; readonly detail: string };
     readonly replan?: "target_near" | "cap_near" | "expiry_near";
+    /** Paid inputs settled and the exact vanilla furnace showed a rising cook bar. Not inventory. */
+    readonly smeltBurn?: { readonly burnTick: number; readonly units: number; readonly remainingCookTicks: number };
   };
 }
 export interface MacroWorkStage {
@@ -475,12 +485,29 @@ function workPolicy(raw: Record<string, unknown>): MacroWorkPolicy {
   };
   const smelting = effects.includes(MACRO_IRON_SMELT);
   const placingFurnace = effects.includes(MACRO_FURNACE_PLACEMENT);
+  const prospecting = effects.includes(MACRO_DIAMOND_PROSPECT);
   if (smelting && (parsedTarget.kind !== "stock" || parsedTarget.item !== "minecraft:iron_ingot" ||
       !policy.maxCrafts || !policy.costCaps.some(({ item }) => item === "minecraft:raw_iron") ||
       !policy.costCaps.some(({ item }) => MACRO_IRON_FUEL_TICKS.has(item)))) invalid("iron smelt scope or costs");
   if (placingFurnace && (!smelting || !policy.maxPlacements ||
       !policy.costCaps.some(({ item }) => item === "minecraft:furnace"))) invalid("furnace placement scope or cost");
+  if (prospecting && (parsedTarget.kind !== "stock" || parsedTarget.item !== "minecraft:diamond" ||
+      !policy.maxBreaks || !effects.some(effect => effect === "break:minecraft:diamond_ore" ||
+        effect === "break:minecraft:deepslate_diamond_ore"))) invalid("diamond prospect scope");
+  if (effects.includes(MACRO_PROSPECT_TORCH) && (!prospecting || !policy.maxPlacements ||
+      !policy.costCaps.some(({ item }) => item === "minecraft:torch"))) invalid("prospect torch scope or cost");
+  if (effects.includes(MACRO_PROSPECT_SUPPORT) && (!prospecting || !policy.maxPlacements ||
+      !policy.costCaps.some(({ item }) => item === "minecraft:cobblestone"))) invalid("prospect support scope or cost");
+  if (effects.includes(MACRO_WATER_FILL) && (effects.length !== 1 || parsedTarget.kind !== "stock" ||
+      parsedTarget.item !== "minecraft:water_bucket" || parsedTarget.count !== 1 ||
+      policy.maxBreaks || policy.maxCrafts || policy.maxPlacements || policy.costCaps.length !== 1 ||
+      policy.costCaps[0]!.item !== "minecraft:bucket" || policy.costCaps[0]!.count !== 1)) invalid("water fill scope or cost");
   return Object.freeze(policy);
+}
+
+function singleLiveWork(policy: MacroWorkPolicy) {
+  return policy.allowedEffects.includes(MACRO_IRON_SMELT) || policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT) ||
+    policy.allowedEffects.includes(MACRO_WATER_FILL);
 }
 
 export function parseMacroWorkStages(value: unknown): readonly MacroWorkStage[] {
@@ -491,7 +518,7 @@ export function parseMacroWorkStages(value: unknown): readonly MacroWorkStage[] 
   const stages = bounds(value, "work program stages", MACRO_MAX_WORK_STAGES).map(value => {
     const raw = shape(value, "work stage", ["policy", "requires"]);
     const policy = parseMacroWorkPolicy(raw.policy);
-    if (policy.allowedEffects.includes(MACRO_IRON_SMELT)) invalid("smelting requires a single live work policy");
+    if (singleLiveWork(policy)) invalid("this effect requires a single live work policy");
     const target = JSON.stringify(policy.target);
     if (targets.has(target)) invalid("duplicate work program target");
     targets.add(target);
@@ -514,11 +541,15 @@ export function parseMacroWorkStages(value: unknown): readonly MacroWorkStage[] 
 }
 
 function parseWorkProgress(value: unknown, tick: number): NonNullable<MacroWorkState["progress"]> {
-  const raw = shape(value, "native work progress", ["phase", "status", "breaks", "crafts", "placements"], ["target", "lastEffect", "replan"]);
+  const raw = shape(value, "native work progress", ["phase", "status", "breaks", "crafts", "placements"],
+    ["target", "lastEffect", "replan", "smeltBurn"]);
   const target = raw.target === undefined ? undefined : shape(raw.target, "native work stock", ["item", "count", "required"]);
   const last = raw.lastEffect === undefined ? undefined : shape(raw.lastEffect, "native last work effect", ["tick", "detail"]);
+  const burn = raw.smeltBurn === undefined ? undefined : shape(raw.smeltBurn, "native furnace burn", ["burnTick", "units", "remainingCookTicks"]);
+  if (burn && raw.phase !== "smelt") invalid("native furnace burn requires smelt progress");
+  const units = burn ? whole(burn.units, "native furnace batch size", 1, WORK_LIMITS.maxCrafts) : 0;
   return Object.freeze({
-    phase: choice(raw.phase, "work progress phase", ["route", "harvest", "collect", "craft", "smelt", "equip", "place", "search", "hold", "complete"] as const),
+    phase: choice(raw.phase, "work progress phase", ["route", "harvest", "collect", "craft", "smelt", "fill", "equip", "place", "search", "hold", "complete"] as const),
     status: text(raw.status, "work progress status", 1_024),
     breaks: whole(raw.breaks, "confirmed work breaks", 0, WORK_LIMITS.maxBreaks),
     crafts: whole(raw.crafts, "confirmed work crafts", 0, WORK_LIMITS.maxCrafts),
@@ -533,6 +564,11 @@ function parseWorkProgress(value: unknown, tick: number): NonNullable<MacroWorkS
       detail: text(last.detail, "native last work effect detail", 1_024),
     }) } : {}),
     ...(raw.replan !== undefined ? { replan: choice(raw.replan, "native replanning reason", ["target_near", "cap_near", "expiry_near"] as const) } : {}),
+    ...(burn ? { smeltBurn: Object.freeze({
+      burnTick: whole(burn.burnTick, "native furnace cook edge tick", 1, tick),
+      units,
+      remainingCookTicks: whole(burn.remainingCookTicks, "native remaining cook ticks", 0, units * 200),
+    }) } : {}),
   });
 }
 
@@ -546,8 +582,8 @@ export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   if (origin === "preset" && (policy.target.kind !== "preset" || policy.allowedEffects.length || policy.costCaps.length ||
       policy.maxBreaks > 32 || policy.maxCrafts > 24 || policy.maxPlacements > 2)) invalid("preset work scope");
   const nextWorkId = Object.hasOwn(record, "nextWorkId") ? validateMacroId(record.nextWorkId, "next work id") : undefined;
-  if (policy.allowedEffects.includes(MACRO_IRON_SMELT) && (nextWorkId || /:[123]$/.test(id)))
-    invalid("smelting requires a single live work order");
+  if (singleLiveWork(policy) && (nextWorkId || /:[123]$/.test(id)))
+    invalid("this effect requires a single live work order");
   if (nextWorkId) {
     const stage = /^(.+):([12])$/.exec(id);
     if (origin !== "model" || !stage || nextWorkId !== `${stage[1]}:${Number(stage[2]) + 1}`) invalid("work successor scope");
@@ -595,6 +631,14 @@ function basis(record: Record<string, unknown>): MacroBasis {
   };
 }
 
+function directMaterialPrefix(verb: string): string | undefined {
+  switch (verb) {
+    case "break": return "block:";
+    case "collect": return "item:";
+    case "continue": return "recipe:";
+  }
+}
+
 export function parseMacroObservation(value: unknown): MacroObservation {
   const record = shape(value, "observation", [
     "v", "run", "life", "tick", "epoch", "goal", "health", "food", "inventory", "opportunities", "recent", "quiescent",
@@ -613,13 +657,17 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     ids.add(id);
     const verb = validateMacroId(offer.verb, "verb");
     const risk = choice(offer.risk, "risk", ["read", "low", "guarded"] as const);
+    const waterClue = verb === MACRO_WATER_CLUE;
+    if (waterClue && risk !== "read") invalid("water clue risk");
     let material: MacroOpportunity["material"];
     if (Object.hasOwn(offer, "material")) {
-      const prefix = verb === "break" ? "block:" : verb === "collect" ? "item:" : verb === "continue" ? "recipe:" : null;
+      const prefix = directMaterialPrefix(verb);
       const raw = shape(offer.material, "material", ["subject", "target", "spends"]);
       const subject = itemKey(raw.subject, "material subject");
-      if (risk !== "guarded" || !prefix || !subject.startsWith(prefix) || subject.length === prefix.length) invalid("material subject/verb");
       const costs = Object.entries(object(raw.spends, "material spends"));
+      if (waterClue ? subject !== MACRO_WATER_SOURCE || costs.length !== 1 ||
+          costs[0]![0] !== "minecraft:bucket" || costs[0]![1] !== 1 :
+          risk !== "guarded" || !prefix || !subject.startsWith(prefix) || subject.length === prefix.length) invalid("material subject/verb");
       if (costs.length > 36) invalid("material spends");
       const spends = Object.create(null) as Record<string, number>;
       for (const [item, count] of costs) spends[itemKey(item, "spend item")] = whole(count, "spend count", 1, 64);
@@ -774,8 +822,11 @@ export function parseMacroProposal(value: unknown): MacroProposal {
       const steps = bounds(rawAction.steps, "continuation steps", MACRO_MAX_DIRECT_EFFECTS).map(value => {
         const step = shape(value, "continuation step", ["selector", "maxEffects", "until"]);
         const selector = shape(step.selector, "material selector", ["verb", "subject"]);
+        const verb = validateMacroId(selector.verb, "selector verb"), subject = itemKey(selector.subject, "selector subject");
+        const prefix = directMaterialPrefix(verb);
+        if (!prefix || !subject.startsWith(prefix) || subject.length === prefix.length) invalid("material selector");
         return Object.freeze({
-          selector: Object.freeze({ verb: validateMacroId(selector.verb, "selector verb"), subject: itemKey(selector.subject, "selector subject") }),
+          selector: Object.freeze({ verb, subject }),
           maxEffects: whole(step.maxEffects, "step effects", 1, MACRO_MAX_DIRECT_EFFECTS),
           until: step.until === null ? null : floor(step.until),
         });

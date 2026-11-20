@@ -82,9 +82,34 @@ the smelted units; the furnace batch uses that budget before collection.
 The player reports loading, burning, and collection separately. Only the
 matching completion receipt and live ingot stock establish the result.
 
+Once the furnace confirms loading and the cook bar advances, Terra can use
+one request to plan the next job while the batch cooks. The proposal names
+the batch in `afterWorkId`. It cannot replace, renew, or reload the batch.
+For example, Terra can propose a bucket while two ingots cook and the player
+holds one. The bucket job can start only after the matching completion
+receipt and a fresh check of all three ingots, the reserves, the crafting
+table, safety, and the proposal's expiry. The timeline still counts cooking
+as a game-mechanical wait. A short cook can finish without a background
+request, and a reply that arrives after the batch ends grants nothing.
+
 Goal-only startup, built-in presets, generated skills, direct opportunities,
 and work programs cannot grant furnace transfers. A completed smelt does not
 establish a diamond pickup, bucket craft, or Nether entry.
+
+Filling an empty bucket is a separate live Terra job. It targets one
+`minecraft:water_bucket`, permits only `fill:minecraft:water`, and budgets one
+`minecraft:bucket` above any empty-bucket reserve. The break, craft, and
+placement caps must all be zero. The `fill_water` clue reports a lit, exposed
+source in reach from dry footing. A flow-only clue, such as a waterfall
+without a visible source, grants no fill.
+
+The player stays on that footing, equips the empty bucket in the main hand,
+and leaves the off hand empty. It checks the same source before one use.
+The job completes only after vanilla accepts the use and inventory shows one
+empty bucket replaced by one water bucket with the declared reserves intact.
+No startup plan, work program, direct action, or generated skill can select
+the clue or grant the fill. Pouring, collecting lava, placing filler, and
+casting a portal remain outside this permission.
 
 When an early stone, coal, or iron source is not in view, Terra can choose
 a witnessed dry approach or an exact adjacent soil cap. A cap offer is one
@@ -97,6 +122,19 @@ tool presets allow dry soil and common rock as cover. A custom work order
 needs an exact break permission for each cover type, charged against the
 same break budget. The player keeps at least one break for the source.
 Cover breaks, grounded travel, and stock pickups are confirmed separately.
+
+A diamond order that names only ore can mine an exposed vein. To look for
+one below the current footing, Terra must also request
+`prospect:minecraft:diamond` and name the cover it may break. A torch costs
+one carried torch and requires its own placement permission. The optional
+`place:minecraft:cobblestone` effect needs an exact cobblestone cost cap
+and shares `maxPlacements` with torches. The player spends one block above
+its reserve only after witnessing an empty, dry adjacent cell, a reachable
+attaching face, and clear forward and reverse space. It stays on the
+original footing until a fresh view shows the new cobblestone top and
+inventory shows the matching debit. Nearby fluid can veto the placement.
+The report distinguishes placement, grounded arrival, and the lowest
+footing reached. Only a diamond in inventory counts as a pickup.
 
 The three-second planning deadline is a diagnostic target, not a
 guarantee about the footage. If no safe, authorized action is available,

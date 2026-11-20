@@ -157,6 +157,9 @@ public final class AgentClient implements ClientModInitializer {
             closeMovement();
         });
         ClientTickEvents.START_CLIENT_TICK.register(this::drive);
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            if (macro != null) macro.clearUnconsumedWaterUse();
+        });
         ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
             if (screen instanceof DeathScreen deathScreen) {
                 ScreenEvents.afterRender(screen).register((shown, context, mouseX, mouseY, tickDelta) ->
@@ -221,6 +224,14 @@ public final class AgentClient implements ClientModInitializer {
                 "\t" + finiteSample(hit.u()) + "\t" + finiteSample(hit.v()) + "\t" + finiteSample(hit.degreesPerSecond()) +
                 "\t" + hit.dwellTicks() + "\t" + hit.dwellMs() + "\n");
         } catch (IOException e) { throw new UncheckedIOException(e); }
+    }
+
+    public static boolean allowScopedWaterUse() {
+        return active == null || active.macro == null || active.macro.allowScopedWaterUse();
+    }
+
+    public static void confirmScopedWaterUse() {
+        if (active != null && active.macro != null) active.macro.confirmScopedWaterUse();
     }
 
     private static String finiteSample(double value) {

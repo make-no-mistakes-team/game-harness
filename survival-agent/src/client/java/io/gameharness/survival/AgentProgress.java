@@ -608,6 +608,12 @@ final class AgentProgress {
     void cancelFollowDryRoute(AgentDryCaveRoute.Offer offer) { caves.cancelFollowDryRoute(offer); }
     boolean dryRouteInFlight(AgentDryCaveRoute.Offer offer) { return caves.dryRouteInFlight(offer); }
 
+    /** A scoped tread landed after the native body proved its exact reverse clearance; no autonomous mining credit. */
+    void recordMacroDryTread(BlockPos from, BlockPos to) {
+        caves.walkedDry(from, to);
+        caves.witnessedDry(to, from);
+    }
+
     private void recordDryCaveFooting(BlockPos from, BlockPos to) {
         int prior = trail.lastIndexOf(from);
         if (prior < 0) {
@@ -2337,9 +2343,18 @@ final class AgentProgress {
         }
 
         if (!departure && torches >= 3) return false;
-        if (!departure && activeTrail() <= 1 && surveyLocalLight()) return true;
         if (canMakeTorch && recallOre(Resource.COAL, range, activeTrail())) return true;
         if (!localFurnace && prepareCharcoalAtKnownFurnace()) return true;
+        // No coal or nearby stove. If the player already has the wood for charcoal,
+        // a workbench, fuel and sticks, the missing ingredient is furnace stone.
+        // The charcoal job keeps the ordinary stone miner active across ticks.
+        if (!localFurnace && torches <= 2 && has(BURNABLE_LOG, 1)
+            && affordsWood(localTableWood() + 4 + furnacePlanks(1), 3)) {
+            int missingStone = 8 - hands.count(STONE);
+            if (missingStone > 0 && pickUses(STONE_PICK) + pickUses(WOOD_PICK) >= missingStone
+                && prepareCharcoal()) return true;
+        }
+        if (!departure && activeTrail() <= 1 && surveyLocalLight()) return true;
         seekExpeditionSupplies(canMakeTorch ? "light" : "wood and light");
         return true;
     }
@@ -4050,9 +4065,8 @@ final class AgentProgress {
                 return refuse("no stable landing and no spare foothold block within the placement limit");
             if (walked.contains(to) || protectRecoveryBlock(to.down()) || !offWorkshopPassage(to.down()))
                 return refuse("no stable landing and the proposed foothold would occupy protected footing");
-            Vec3d center = Vec3d.ofCenter(to.down());
-            buildLow = center.add(lane.getOffsetX() * 0.16, -0.20, lane.getOffsetZ() * 0.16);
-            buildHigh = center.add(-lane.getOffsetX() * 0.16, 0.31, -lane.getOffsetZ() * 0.16);
+            buildLow = AgentBody.footholdInterior(to.down(), lane, false);
+            buildHigh = AgentBody.footholdInterior(to.down(), lane, true);
             phase(Proof.FOOTHOLD_SPACE);
             return true;
         }
@@ -4086,9 +4100,7 @@ final class AgentProgress {
                 default -> Direction.DOWN;
             };
             BlockPos anchor = destination.offset(offset);
-            if (aim == null) aim = offset == Direction.DOWN
-                ? Vec3d.ofCenter(anchor, 0.96).add(lane.getOffsetX() * 0.30, 0, lane.getOffsetZ() * 0.30)
-                : Vec3d.ofCenter(anchor, 0.77).add(-offset.getOffsetX() * 0.46, 0, -offset.getOffsetZ() * 0.46);
+            if (aim == null) aim = AgentBody.footholdAttachmentAim(anchor, offset, lane);
             body.aim(aim);
             status = "supply egress: looking for a reachable attaching face beside the empty cell";
             BlockHitResult hit = perceive(aim, c.player.getEyePos().distanceTo(aim) + 0.10);
@@ -6028,6 +6040,8 @@ final class AgentProgress {
             }
             if (returnable) return returnableClearance(point);
             if (!body.aligned(point)) return Dig.LOOKING;
+            if (climbTo != null && body.dryRouteClear(point) == AgentBody.DryRouteSample.DARK)
+                return Dig.DARK;
             if (body.clearTerrain(point)) return Dig.CLEAR;
             BlockHitResult outline = body.selectedFace();
             if (outline != null && (outline.getBlockPos().equals(position)
@@ -6136,7 +6150,7 @@ final class AgentProgress {
         // In darkness the rendered outline still proves a real face; let vanilla decide if it accepts a torch.
         if (hit == null && forced && body.aligned(point)) hit = shown;
         if (hit != null && hit.getSide() != Direction.DOWN && (visibleSupport || forced && shown == hit)
-            && (nextFoot == null || !hit.getBlockPos().offset(hit.getSide()).equals(nextFoot))) {
+            && torchSiteOutsideStep(hit)) {
             AgentBody.Contact mode = visibleSupport ? AgentBody.Contact.PRECISE : AgentBody.Contact.OUTLINE;
             body.aimContact(hit, mode);
             if (!hands.equipForUse(TORCH)) return true;
@@ -6148,6 +6162,12 @@ final class AgentProgress {
             torchAttempt = tick;
         }
         return true;
+    }
+
+    private boolean torchSiteOutsideStep(BlockHitResult hit) {
+        BlockPos placed = hit.getBlockPos().offset(hit.getSide());
+        if (placed.equals(nextFoot)) return false;
+        return returnIndex < 0 || !placed.equals(trail.get(returnIndex));
     }
 
     private void blockedTunnel() {

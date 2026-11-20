@@ -28,6 +28,17 @@ const pickStage = (plankItem = oak) => stage({
 const check = (inventory: MacroObservation["inventory"], stages: readonly MacroWorkStage[],
   opportunities: MacroObservation["opportunities"] = []) => preflightVanillaWork({ inventory, opportunities }, stages);
 
+test("An optional attached support neither spends a stock floor nor certifies a cave route", () => {
+  const cobble = "minecraft:cobblestone";
+  const policy = stage({ target: stock("minecraft:diamond", 1),
+    allowedEffects: ["prospect:minecraft:diamond", "break:minecraft:diamond_ore", `place:${cobble}`],
+    maxBreaks: 12, maxPlacements: 1, costCaps: [floor(cobble, 1)], reserves: [floor(cobble, 4)] });
+  expect(check({ [cobble]: 4 }, [policy])).toMatchObject({
+    kind: "unknown", detail: expect.stringContaining("4 held, 4 reserved"),
+  });
+  expect(check({ [cobble]: 5 }, [policy])).toEqual({ kind: "unknown" });
+});
+
 test("A new bench needs thirteen planks including the reserve, but a witnessed usable bench changes the calculation", () => {
   const stages = [pickStage()];
   expect(check({ [oak]: 12 }, stages)).toMatchObject({
@@ -75,6 +86,34 @@ test("The post-smelt bucket quote distinguishes a recent table clue from a usabl
   expect(check(inventory, [policy], tableOffer)).toEqual({ kind: "possible" });
   expect(check({ ...inventory, [table]: 1 }, [policy], clue).kind).toBe("unknown");
   expect(check({ ...inventory, [iron]: 2 }, [policy], clue).kind).toBe("shortage");
+});
+
+test("Filling needs a witnessed source and exactly one empty bucket above the declared floors", () => {
+  const bucket = "minecraft:bucket", pickaxe = "minecraft:iron_pickaxe", filled = "minecraft:water_bucket";
+  const fill = stage({ target: stock(filled, 1), allowedEffects: ["fill:minecraft:water"],
+    costCaps: [floor(bucket, 1)], reserves: [floor(pickaxe, 1), floor(bucket, 1), floor(filled, 1)] });
+  const source = { id: "o-source", verb: "fill_water", risk: "read", summary: "Witnessed source water in bucket reach",
+    evidence: "The source is lit and within reach from dry footing.",
+    material: { subject: "fluid:minecraft:water_source", target: "m-source", spends: { [bucket]: 1 } } } as const;
+  const { material, ...readOnly } = source;
+  const flowing = { ...readOnly, summary: "Flowing water without a reachable source" };
+  const inventory = { [bucket]: 2, [pickaxe]: 1 };
+  expect(check(inventory, [fill], [source])).toEqual({ kind: "unknown" }); // A possible fill, not awarded stock.
+  expect(check(inventory, [fill], [flowing])).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("sees flowing water but no witnessed source"),
+  });
+  expect(check(inventory, [fill])).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("has no witnessed source water in reach"),
+  });
+  expect(check({ ...inventory, [bucket]: 1 }, [fill], [source])).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("needs 2 minecraft:bucket at entry (1 to spend and 1 to retain)"),
+  });
+  expect(check({ [bucket]: 2 }, [fill], [source])).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("cannot preserve the 1 minecraft:iron_pickaxe reserve"),
+  });
+  expect(check({ ...inventory, [filled]: 1 }, [fill], [source])).toMatchObject({
+    kind: "shortage", detail: expect.stringContaining("no fill is needed"),
+  });
 });
 
 test("Account for production batches across stages without making reachable future timber into observed stock", () => {

@@ -29,6 +29,10 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     private static final String TABLE = "place:minecraft:crafting_table";
     private static final String FURNACE = "place:minecraft:furnace";
     private static final String IRON_SMELT = "smelt:minecraft:iron_ingot";
+    private static final String DIAMOND_PROSPECT = "prospect:minecraft:diamond";
+    private static final String PROSPECT_TORCH = "place:minecraft:torch";
+    private static final String PROSPECT_SUPPORT = "place:minecraft:cobblestone";
+    private static final String WATER_FILL = "fill:minecraft:water";
 
     record Target(Item item, int count, String goal) {}
 
@@ -55,6 +59,10 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         boolean placeTable() { return preset || effects.contains(TABLE); }
         boolean smeltIron() { return !preset && target.item == Items.IRON_INGOT && effects.contains(IRON_SMELT); }
         boolean placeFurnace() { return smeltIron() && effects.contains(FURNACE); }
+        boolean diamondProspecting() { return !preset && target.item == Items.DIAMOND && effects.contains(DIAMOND_PROSPECT); }
+        boolean placeProspectTorch() { return diamondProspecting() && effects.contains(PROSPECT_TORCH); }
+        boolean placeProspectSupport() { return diamondProspecting() && effects.contains(PROSPECT_SUPPORT); }
+        boolean waterFill() { return !preset && target.item == Items.WATER_BUCKET && effects.contains(WATER_FILL); }
     }
 
     /** Charges actual effects, or their conservative bound at the irreversible edge. */
@@ -104,6 +112,24 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         void broken(Item tool, int loss) { ++breaks; charge(tool, loss); }
         void placedTable() { ++placements; charge(Items.CRAFTING_TABLE, 1); }
 
+        boolean canPlaceProspectTorch(PlayerInventory inventory) {
+            return policy.placeProspectTorch() && canPlace() && limit(Items.TORCH, count(inventory, Items.TORCH)) >= 1;
+        }
+
+        void placedProspectTorch() {
+            ++placements;
+            charge(Items.TORCH, 1);
+        }
+
+        boolean canPlaceProspectSupport(PlayerInventory inventory) {
+            return policy.placeProspectSupport() && canPlace() && limit(Items.COBBLESTONE, count(inventory, Items.COBBLESTONE)) >= 1;
+        }
+
+        void placedProspectSupport() {
+            ++placements;
+            charge(Items.COBBLESTONE, 1);
+        }
+
         boolean canPlaceFurnace(PlayerInventory inventory) {
             return policy.placeFurnace() && !furnacePlaced && canPlace()
                 && limit(Items.FURNACE, count(inventory, Items.FURNACE)) >= 1;
@@ -113,6 +139,29 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
             furnacePlaced = true;
             ++placements;
             charge(Items.FURNACE, 1);
+        }
+
+        boolean canFillWater(PlayerInventory inventory) {
+            return policy.waterFill() && remainingCost(Items.BUCKET) == 1 && waterFillStockSafe(inventory);
+        }
+
+        boolean waterFillStockSafe(PlayerInventory inventory) {
+            if (count(inventory, Items.WATER_BUCKET) != 0 || count(inventory, Items.BUCKET) <= floor(Items.BUCKET))
+                return false;
+            for (var floor : policy.floors.entrySet()) {
+                Item item = floor.getKey();
+                if (item == Items.BUCKET) continue;
+                if ((item == Items.WATER_BUCKET ? 1 : count(inventory, item)) < floor.getValue()) return false;
+            }
+            return true;
+        }
+
+        void issuedWaterFill() { charge(Items.BUCKET, 1); }
+
+        boolean confirmsWaterFill(PlayerInventory inventory, int emptyBefore, boolean sourceUseReceipt) {
+            return policy.waterFill() && remainingCost(Items.BUCKET) == 0 && sourceUseReceipt
+                && count(inventory, Items.BUCKET) == emptyBefore - 1 && count(inventory, Items.WATER_BUCKET) == 1
+                && missingFloor(inventory) == null;
         }
 
         boolean reserveIronSmelt(PlayerInventory inventory, int units, Item fuel, int fuelCount, int fuelTicks) {
@@ -187,16 +236,30 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                 bounded(value, "maxBreaks", 0, preset ? 32 : MAX_BREAKS),
                 bounded(value, "maxCrafts", 0, preset ? 24 : 64),
                 bounded(value, "maxPlacements", 0, preset ? 2 : 8));
-            if (effects.contains(IRON_SMELT) || effects.contains(FURNACE)) {
+            if (effects.contains(IRON_SMELT) || effects.contains(FURNACE) || effects.contains(DIAMOND_PROSPECT)
+                    || effects.contains(WATER_FILL)) {
                 int end = envelope.id.length() - 1;
                 boolean linkedStage = end >= 1 && envelope.id.charAt(end - 1) == ':'
                     && envelope.id.charAt(end) >= '1' && envelope.id.charAt(end) <= '3';
-                if ((!mode.equals("preset") && !mode.equals("constrained")) || nextWorkId != null || linkedStage
-                        || !policy.smeltIron() || policy.maxCrafts == 0 || !caps.containsKey(Items.RAW_IRON)
+                if ((!mode.equals("preset") && !mode.equals("constrained")) || nextWorkId != null || linkedStage)
+                    return envelope;
+            }
+            if (effects.contains(IRON_SMELT) || effects.contains(FURNACE)) {
+                if (!policy.smeltIron() || policy.maxCrafts == 0 || !caps.containsKey(Items.RAW_IRON)
                         || caps.keySet().stream().noneMatch(AgentHands::workSmeltFuel)
                         || effects.contains(FURNACE) && (policy.maxPlacements == 0 || !caps.containsKey(Items.FURNACE)))
                     return envelope;
             }
+            if (effects.contains(DIAMOND_PROSPECT) && (!policy.diamondProspecting() || policy.maxBreaks == 0
+                    || !policy.breakAllowed(Blocks.DIAMOND_ORE.getDefaultState())
+                        && !policy.breakAllowed(Blocks.DEEPSLATE_DIAMOND_ORE.getDefaultState()))) return envelope;
+            if (effects.contains(PROSPECT_TORCH) && (!policy.placeProspectTorch() || policy.maxPlacements == 0
+                    || !caps.containsKey(Items.TORCH))) return envelope;
+            if (effects.contains(PROSPECT_SUPPORT) && (!policy.placeProspectSupport() || policy.maxPlacements == 0
+                    || !caps.containsKey(Items.COBBLESTONE))) return envelope;
+            if (effects.contains(WATER_FILL) && (!policy.waterFill() || effects.size() != 1 || desired.count != 1
+                    || policy.maxBreaks != 0 || policy.maxCrafts != 0 || policy.maxPlacements != 0
+                    || caps.size() != 1 || caps.getOrDefault(Items.BUCKET, 0) != 1)) return envelope;
             return new AgentWorkOrder(envelope.id, envelope.life, envelope.epoch, envelope.basis, envelope.expires,
                 envelope.safetyRevision, policy, nextWorkId);
         } catch (RuntimeException invalid) {
@@ -213,7 +276,9 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
 
     private static boolean validEffect(String effect) {
         if (effect.startsWith("craft:")) return AgentHands.workRecipe(effect.substring("craft:".length()));
-        if (effect.equals(TABLE) || effect.equals(IRON_SMELT) || effect.equals(FURNACE)) return true;
+        if (effect.equals(TABLE) || effect.equals(IRON_SMELT) || effect.equals(FURNACE)
+                || effect.equals(DIAMOND_PROSPECT) || effect.equals(PROSPECT_TORCH)
+                || effect.equals(PROSPECT_SUPPORT) || effect.equals(WATER_FILL)) return true;
         if (!effect.startsWith("break:")) return false;
         String id = effect.substring("break:".length());
         if (!ITEM_ID.matcher(id).matches()) return false;

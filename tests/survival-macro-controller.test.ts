@@ -218,6 +218,49 @@ function invalidBucketReply(request: MacroRequest): MacroInference {
   return { ...workReply(request, { kind: "abstain" }), outcome: "invalid", proposal: null, invalidReply: "guarded_opportunity" };
 }
 
+test.each(["exact source", "only flow", "reserved bucket", "select clue"] as const)(
+  "Live bucket fill admission with %s",
+  async condition => {
+    const bucket = "minecraft:bucket", pickaxe = "minecraft:iron_pickaxe";
+    const waterBucket = "minecraft:water_bucket", id = "o-water";
+    const reserves = condition === "reserved bucket" ? [{ item: pickaxe, count: 1 }, { item: bucket, count: 1 }]
+      : [{ item: pickaxe, count: 1 }];
+    const f = await durableFixture(async request => workReply(request, condition === "select clue"
+      ? { kind: "opportunity", opportunityId: id }
+      : { kind: "work", policy: {
+        target: { kind: "stock", item: waterBucket, count: 1 }, allowedEffects: ["fill:minecraft:water"],
+        costCaps: [{ item: bucket, count: 1 }], reserves, maxBreaks: 0, maxCrafts: 0, maxPlacements: 0,
+      } }), "Fill the bucket only from a reachable source without losing the pickaxe.", 1);
+    try {
+      await f.observe(20, {
+        goal: "diamond", quiescent: true, inventory: { [bucket]: 1, [pickaxe]: 1 },
+        opportunities: [{ id, verb: "fill_water", risk: "read",
+          summary: condition === "only flow" ? "Flowing water without a reachable source" : "Witnessed source water in bucket reach",
+          evidence: "Rendered from dry footing",
+          ...(condition === "only flow" ? {} : { material: {
+            subject: "fluid:minecraft:water_source", target: "m-water", spends: { [bucket]: 1 },
+          } }),
+        }],
+      });
+      await f.actor.poll();
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      if (condition === "exact source") {
+        expect(await f.order()).toMatchObject({ origin: "model", basisTick: 20,
+          target: { item: waterBucket, count: 1 }, allowedEffects: ["fill:minecraft:water"], reserves });
+        expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 0 });
+      } else {
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+        expect(await readFile(f.file("history.jsonl"), "utf8")).toContain(condition === "only flow"
+          ? "flowing water but no witnessed source" : condition === "reserved bucket"
+            ? "2 minecraft:bucket at entry" : "A water clue grants no primitive");
+      }
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
 test("An invalid constrained reply gets one fresh correction to craft a bucket at the witnessed table", async () => {
   const requests: MacroRequest[] = [];
   const reserves = [{ item: "minecraft:iron_pickaxe", count: 1 }];
@@ -845,6 +888,119 @@ test.each(["preset", "constrained"] as const)("A regular %s strategist can quote
     await f.clean();
   }
 });
+
+test.each(["bucket", "abstain", "wrong predecessor", "replacement", "revocation", "missing ingots", "missing station",
+  "interrupted", "blocked", "new life", "late", "expired", "short cook", "no budget"] as const)(
+  "A paid iron batch allows only a fresh bound successor: %s", async result => {
+    const bucket = "minecraft:bucket";
+    const live = { goal: "diamond", inventory: { [ironItem]: 1, [rawIronItem]: 4, [fuelItem]: 5, [furnaceItem]: 1 } };
+    const deposited = { [ironItem]: 1, [rawIronItem]: 2, [fuelItem]: 3 };
+    const table = [{ id: "table", verb: "interact", risk: "guarded", summary: "Open visible minecraft:crafting_table",
+      evidence: "A lit workstation face is inside vanilla use reach." }] as const;
+    const policy = { target: { kind: "stock", item: bucket, count: 1 }, allowedEffects: ["craft:bucket"],
+      costCaps: [{ item: ironItem, count: 3 }], reserves: ironPolicy.reserves,
+      maxBreaks: 0, maxCrafts: 1, maxPlacements: 0 } as const;
+    const release = Promise.withResolvers<void>();
+    const requests: MacroRequest[] = [];
+    let overlapSignal: AbortSignal | undefined;
+    const f = await durableFixture(async (request, signal) => {
+      requests.push(request);
+      if (requests.length === 1) return workReply(request, { kind: "work", policy: ironPolicy });
+      if (!request.work?.current) return workReply(request, { kind: "abstain" });
+      overlapSignal = signal;
+      await release.promise;
+      const id = request.work.current.id;
+      if (result === "abstain") return workReply(request, { kind: "abstain" });
+      if (result === "revocation") return workReply(request, { kind: "revoke-work", workOrderId: id });
+      if (result === "replacement") return workReply(request, { kind: "work", policy });
+      return workReply(request, { kind: "work-program", afterWorkId: result === "wrong predecessor" ? "other-id" : id, stages: [
+        { policy, requires: [{ item: ironItem, count: 3 }, { item: rawIronItem, count: 2 }, { item: fuelItem, count: 3 }] },
+        { policy: { ...policy, target: { kind: "stock", item: "minecraft:stick", count: 4 }, allowedEffects: ["craft:stick"],
+          costCaps: [{ item: fuelItem, count: 2 }] }, requires: [{ item: bucket, count: 1 }] },
+      ] }, result === "expired" ? 300 : 1100);
+    }, "Make a bucket while keeping one plank.", result === "no budget" ? 1 : 3);
+    try {
+      await f.observe(10, live);
+      await f.actor.poll();
+      const batch = await f.order();
+      await f.receipt(batch.id, 11, "accepted");
+      const loading = { id: batch.id, state: "working", detail: "A paid batch is loading",
+        progress: { phase: "smelt", status: "Loading", breaks: 0, crafts: 0, placements: 1 } } as const;
+      await f.observe(110, { goal: live.goal, inventory: deposited, workOrder: {
+        ...loading, detail: "Vanilla furnace cooking advanced", // Free text alone cannot trigger a request.
+      } });
+      expect(requests).toHaveLength(1);
+      const burn = { burnTick: 111, units: 2, remainingCookTicks: result === "short cook" ? 30 : 395 };
+      const burning = { ...loading, progress: { ...loading.progress, smeltBurn: burn } };
+      await f.observe(115, { goal: live.goal, inventory: deposited, workOrder: burning });
+      if (result === "no budget" || result === "short cook") {
+        expect(requests).toHaveLength(1);
+        expect(await f.order()).toEqual(batch);
+        return;
+      }
+      expect(requests).toHaveLength(2);
+      expect(requests[1]).toMatchObject({ observation: { inventory: deposited }, work: {
+        demand: "successor", current: { id: batch.id, origin: "model", accepted: { tick: 11 },
+          nativeState: { progress: { crafts: 0, smeltBurn: burn } } },
+      } });
+      expect(overlapSignal?.aborted).toBe(false);
+      if (result !== "late" && result !== "interrupted" && result !== "blocked" && result !== "new life") release.resolve();
+      await f.observe(225, { goal: live.goal, inventory: deposited, workOrder: {
+        ...burning, progress: { ...burning.progress, smeltBurn: { ...burn, remainingCookTicks: 285 } },
+      } });
+      const shouldQueue = ["bucket", "missing ingots", "missing station", "expired"].includes(result);
+      expect(f.actor.status()).toMatchObject({ workQueuedAfter: shouldQueue ? batch.id : null,
+        issuedWorkOrders: 1, completedModelWorkOrders: 0 });
+      await f.observe(335, { goal: live.goal, inventory: deposited, workOrder: {
+        ...burning, progress: { ...burning.progress, smeltBurn: { ...burn, remainingCookTicks: 175 } },
+      } });
+      expect(requests).toHaveLength(2);
+      expect(await f.order()).toEqual(batch);
+      if (result === "blocked" || result === "new life") {
+        await f.observe(340, { goal: live.goal, inventory: deposited, workOrder: result === "blocked" ? {
+          ...loading, state: "blocked",
+        } : undefined, ...(result === "new life" ? { life: 2, epoch: 2 } : {}) });
+        expect(overlapSignal?.aborted).toBe(true);
+        release.resolve();
+        await f.actor.poll();
+        expect(f.actor.status()).toMatchObject({ issuedWorkOrders: 1, workQueuedAfter: null });
+        if (result === "blocked") expect(await f.order()).toEqual(batch);
+        return;
+      }
+
+      const completeTick = 530;
+      if (result === "interrupted") await f.receipt(batch.id, completeTick, "interrupted");
+      else await f.receipt(batch.id, completeTick, "completed");
+      // Reading the journal before the corresponding inventory sample cannot start the craft.
+      await f.observe(completeTick - 1, { goal: live.goal, inventory: deposited, workOrder: {
+        ...burning, progress: { ...burning.progress, smeltBurn: { ...burn, remainingCookTicks: 0 } },
+      } });
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      if (result === "late" || result === "interrupted") {
+        expect(overlapSignal?.aborted).toBe(true);
+        release.resolve();
+      }
+      await f.observe(completeTick, { goal: live.goal, epoch: 2,
+        inventory: { ...deposited, ...(result === "missing ingots" ? { [ironItem]: 2, "minecraft:copper_ingot": 1 } : { [ironItem]: 3 }) },
+        opportunities: result === "missing station" ? [] : table,
+        workOrder: { id: batch.id, state: "complete", detail: "Vanilla confirmed inventory" },
+      });
+      if (result === "bucket") {
+        expect(await f.order()).toMatchObject({ basisTick: completeTick, origin: "model", target: policy.target });
+        expect(f.actor.status()).toMatchObject({ issuedWorkOrders: 2, completedModelWorkOrders: 1 });
+        expect(requests).toHaveLength(2);
+        expect(await readFile(f.file("history.jsonl"), "utf8")).not.toContain('"event":"work_resource_shortage"');
+      } else {
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+        expect(f.actor.status().issuedWorkOrders).toBe(1);
+      }
+    } finally {
+      release.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
 
 test.each([
   [rawIronItem, "needs 3 minecraft:raw_iron"],

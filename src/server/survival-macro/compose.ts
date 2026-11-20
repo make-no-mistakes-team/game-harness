@@ -12,7 +12,7 @@ import {
 } from "./controller.ts";
 import { createNativeGapReview } from "./gap-review.ts";
 import {
-  MACRO_CAPABILITIES_VERSION, MACRO_LOOKAHEAD_MAX_CRACK, MACRO_MAX_PLANNING_IDLE_MS,
+  MACRO_CAPABILITIES_VERSION, MACRO_LOOKAHEAD_MAX_CRACK, MACRO_MAX_PLANNING_IDLE_MS, MACRO_SMELT_OVERLAP_MIN_COOK_TICKS,
   liveCorrectionEvidence, readMacroObservation, sameLiveCorrectionScope,
   type MacroBasis, type MacroInference, type MacroObservation,
 } from "./protocol.ts";
@@ -300,11 +300,16 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
   async function assertDispatch(basis: MacroBasis, lookahead?: MacroObservation, work?: MacroObservation, correction?: MacroObservation) {
     const fresh = await readMacroObservation(macroDir, !!correction);
     assertDisplay();
+    const burn = work?.workOrder?.progress?.smeltBurn;
+    const activeBurn = fresh?.workOrder?.progress?.smeltBurn;
     return fresh?.run === basis.run && fresh.life === basis.life && (work ? fresh.epoch >= basis.epoch : fresh.epoch === basis.epoch) &&
       fresh.tick >= basis.tick && fresh.health > 0 &&
       (!correction || (sameLiveCorrectionScope(correction, fresh) && liveCorrectionEvidence(correction) === liveCorrectionEvidence(fresh))) &&
       (!work || (fresh.goal === work.goal && fresh.health >= work.health && fresh.safety?.clear === true &&
         fresh.safety.revision === work.safety?.revision)) &&
+      (!burn || (fresh.workOrder?.id === work?.workOrder?.id && fresh.workOrder?.state === "working" &&
+        activeBurn?.burnTick === burn.burnTick && activeBurn.units === burn.units &&
+        activeBurn.remainingCookTicks >= MACRO_SMELT_OVERLAP_MIN_COOK_TICKS)) &&
       (!lookahead || (fresh.goal === lookahead.goal && fresh.health >= lookahead.health && fresh.safety?.clear === true &&
         fresh.safety.revision === lookahead.safety?.revision && !!fresh.working &&
         fresh.working.intentId === lookahead.working?.intentId && fresh.working.crack <= MACRO_LOOKAHEAD_MAX_CRACK));

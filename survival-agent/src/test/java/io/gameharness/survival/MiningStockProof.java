@@ -9,6 +9,7 @@ import net.minecraft.Bootstrap;
 import net.minecraft.SharedConstants;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.FluidBlock;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.UnbreakableComponent;
@@ -23,6 +24,7 @@ import net.minecraft.registry.tag.TagGroupLoader;
 import net.minecraft.resource.LifecycledResourceManagerImpl;
 import net.minecraft.resource.ResourceType;
 import net.minecraft.resource.VanillaDataPackProvider;
+import net.minecraft.state.property.Properties;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
@@ -230,6 +232,85 @@ final class MiningStockProof {
     }
 
     @Test
+    void diamondDescentDoesNotBroadenOreOnlyWorkOrCutEitherSupport() {
+        var raw = JsonParser.parseString("""
+            {"v":1,"id":"diamond-leg","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":1205,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:diamond","count":1},
+             "allowedEffects":["break:minecraft:deepslate_diamond_ore"],
+             "costCaps":[],"reserves":[],"maxBreaks":8,"maxCrafts":0,"maxPlacements":0}
+            """).getAsJsonObject();
+        var stone = Blocks.STONE.getDefaultState();
+        var oreOnly = AgentWorkOrder.parse(raw, "run", "constrained").policy();
+        require(!oreOnly.diamondProspecting() && !oreOnly.prospectCoverAllowed(stone),
+            "ore-only work is not permission for deep alterations");
+        raw.getAsJsonArray("allowedEffects").add("prospect:minecraft:diamond");
+        var dark = AgentWorkOrder.parse(raw, "run", "constrained").policy();
+        require(dark.diamondProspecting() && !dark.prospectCoverAllowed(stone) && !dark.placeProspectTorch(),
+            "method permission does not imply any block effect");
+        raw.getAsJsonArray("allowedEffects").add("break:minecraft:stone");
+        raw.getAsJsonArray("allowedEffects").add("place:minecraft:torch");
+        raw.getAsJsonArray("costCaps").add(JsonParser.parseString("""
+            {"item":"minecraft:torch","count":1}
+            """));
+        raw.getAsJsonArray("reserves").add(JsonParser.parseString("""
+            {"item":"minecraft:torch","count":2}
+            """));
+        raw.addProperty("maxPlacements", 1);
+        var policy = AgentWorkOrder.parse(raw, "run", "constrained").policy();
+        var budget = new AgentWorkOrder.Budget(policy);
+        var stock = new PlayerInventory(null);
+        stock.setStack(0, new ItemStack(Items.TORCH, 2));
+        require(policy.prospectCoverAllowed(stone) && !policy.prospectCoverAllowed(Blocks.DEEPSLATE.getDefaultState())
+            && !budget.canPlaceProspectTorch(stock), "stone is exact and two protected torches are not a spendable light");
+        stock.setStack(0, new ItemStack(Items.TORCH, 3));
+        require(budget.canPlaceProspectTorch(stock), "one carried torch above the floor fits this policy");
+        budget.placedProspectTorch();
+        require(!budget.canPlaceProspectTorch(stock), "one issued light consumes both placement and exact cost");
+        require(!budget.canPlaceProspectSupport(stock), "light never implies placement of cobblestone");
+        raw.getAsJsonArray("allowedEffects").add("place:minecraft:cobblestone");
+        require(AgentWorkOrder.parse(raw, "run", "constrained").policy() == null,
+            "the support effect without its exact cost is invalid");
+        var cobble = JsonParser.parseString("""
+            {"item":"minecraft:cobblestone","count":1}
+            """).getAsJsonObject();
+        raw.getAsJsonArray("costCaps").add(cobble);
+        raw.getAsJsonArray("reserves").add(cobble.deepCopy());
+        var lightOrSupport = new AgentWorkOrder.Budget(AgentWorkOrder.parse(raw, "run", "constrained").policy());
+        stock.setStack(1, new ItemStack(Items.COBBLESTONE));
+        require(!lightOrSupport.canPlaceProspectSupport(stock), "the last reserved cobble cannot be placed");
+        stock.setStack(1, new ItemStack(Items.COBBLESTONE, 2));
+        require(lightOrSupport.canPlaceProspectSupport(stock), "one eligible block fits the declared cost and floor");
+        lightOrSupport.placedProspectSupport();
+        require(!lightOrSupport.canPlaceProspectTorch(stock) && !lightOrSupport.canPlaceProspectSupport(stock),
+            "one issued block consumes the shared placement and its own cost but is not a confirmed crossing");
+        raw.addProperty("id", "program:3");
+        require(AgentWorkOrder.parse(raw, "run", "constrained").policy() == null, "no program stage can select the route");
+
+        for (int y : new int[]{32, 0, -58}) {
+            var from = new BlockPos(8, y, -3);
+            var lower = AgentSurfaceTread.nextFoot(from, Direction.EAST);
+            require(lower.getY() == y - 1 && lower.getX() == from.getX() + 1,
+                "the planned descent is cardinal and one block deep at each actual depth");
+            require(AgentSurfaceTread.prospectCell(from, lower, Direction.EAST)
+                && AgentSurfaceTread.prospectCell(from, lower.up(3), Direction.EAST)
+                && !AgentSurfaceTread.prospectCell(from, from.down(), Direction.EAST)
+                && !AgentSurfaceTread.prospectCell(from, lower.down(), Direction.EAST),
+                "only body and jump-clearance cells can be cut, never either support");
+            var beside = from.east();
+            require(AgentSurfaceTread.cardinalTread(from, beside, Direction.EAST)
+                && AgentSurfaceTread.cardinalTread(from, beside.up(), Direction.EAST)
+                && !AgentSurfaceTread.cardinalTread(from, from.down(), Direction.EAST)
+                && !AgentSurfaceTread.cardinalTread(from, beside.down(2), Direction.EAST),
+                "level recovery still cannot imply a vertical or two-block drop");
+            require(AgentSurfaceTread.prospectLevelCell(from, beside, Direction.EAST)
+                && AgentSurfaceTread.prospectLevelCell(from, beside.up(), Direction.EAST)
+                && !AgentSurfaceTread.prospectLevelCell(from, beside.up(2), Direction.EAST)
+                && !AgentSurfaceTread.prospectLevelCell(from, beside.down(), Direction.EAST),
+                "horizontal excavation is strictly two-high and cannot cut its landing or roof");
+        }
+    }
+
+    @Test
     void admitsOnlyAnExplicitStandaloneIronWorkQuote() {
         var raw = ironWorkQuote();
         for (String mode : List.of("preset", "constrained")) {
@@ -334,6 +415,67 @@ final class MiningStockProof {
                          {"item":"minecraft:furnace","count":1}],
              "maxBreaks":0,"maxCrafts":3,"maxPlacements":3}
             """).getAsJsonObject();
+    }
+
+    @Test
+    void onlyAnExposedSourceWaterBlockCanBeConsideredForTheFill() {
+        var water = Blocks.WATER.getDefaultState();
+        require(AgentBody.exactWaterSource(water), "ordinary still water is eligible");
+        require(!AgentBody.exactWaterSource(water.with(FluidBlock.LEVEL, 1)),
+            "flowing water is not bucketable stock");
+        require(!AgentBody.exactWaterSource(water.with(FluidBlock.LEVEL, 8)),
+            "falling water is not bucketable stock");
+        require(!AgentBody.exactWaterSource(Blocks.OAK_STAIRS.getDefaultState().with(Properties.WATERLOGGED, true)),
+            "a waterlogged block is not a plain water source");
+        require(!AgentBody.exactWaterSource(Blocks.LAVA.getDefaultState()), "still lava is outside the effect");
+    }
+
+    @Test
+    void waterWorkUsesOneUnreservedBucketAndRequiresAReceiptAndExactSwap() {
+        var raw = JsonParser.parseString("""
+            {"v":1,"id":"water-work","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":105,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:water_bucket","count":1},
+             "allowedEffects":["fill:minecraft:water"],"costCaps":[{"item":"minecraft:bucket","count":1}],
+             "reserves":[{"item":"minecraft:bucket","count":1},{"item":"minecraft:iron_pickaxe","count":1}],
+             "maxBreaks":0,"maxCrafts":0,"maxPlacements":0}
+            """).getAsJsonObject();
+        var policy = AgentWorkOrder.parse(raw, "run", "constrained").policy();
+        require(policy.waterFill() && !policy.placeTable() && !policy.placeFurnace() && !policy.craftAllowed("bucket"),
+            "only source water may be filled; no placement or crafting is inherited");
+        var inventory = new PlayerInventory(null);
+        var budget = new AgentWorkOrder.Budget(policy);
+        inventory.setStack(0, new ItemStack(Items.BUCKET, 2));
+        require(!budget.canFillWater(inventory), "a missing unrelated floor also blocks the fill");
+        inventory.setStack(0, new ItemStack(Items.BUCKET, 1));
+        inventory.setStack(1, new ItemStack(Items.IRON_PICKAXE));
+        require(!budget.canFillWater(inventory), "one reserved empty bucket is not spendable");
+        inventory.setStack(0, new ItemStack(Items.BUCKET, 2));
+        require(budget.canFillWater(inventory), "a second carried bucket is spendable");
+        budget.issuedWaterFill();
+        require(!budget.canFillWater(inventory) && !budget.confirmsWaterFill(inventory, 2, true),
+            "the lease cannot issue twice while vanilla inventory is delayed");
+        inventory.setStack(2, new ItemStack(Items.WATER_BUCKET));
+        require(!budget.confirmsWaterFill(inventory, 2, true), "a gain alone is not the required swap");
+        inventory.setStack(0, new ItemStack(Items.BUCKET));
+        require(!budget.confirmsWaterFill(inventory, 2, false), "the swap alone is not a source-use receipt");
+        require(budget.confirmsWaterFill(inventory, 2, true), "one receipt, one swap, and intact floors confirm the work");
+        inventory.setStack(1, ItemStack.EMPTY);
+        require(!budget.confirmsWaterFill(inventory, 2, true), "no completion after a declared floor is lost");
+
+        for (String effect : List.of("fill:minecraft:lava", "pour:minecraft:water", "place:minecraft:water")) {
+            var variant = raw.deepCopy();
+            variant.getAsJsonArray("allowedEffects").set(0, new com.google.gson.JsonPrimitive(effect));
+            require(AgentWorkOrder.parse(variant, "run", "preset").policy() == null, "unsupported fluid effect: " + effect);
+        }
+        var program = raw.deepCopy();
+        program.addProperty("id", "program:1");
+        program.addProperty("nextWorkId", "program:2");
+        require(AgentWorkOrder.parse(program, "run", "preset").policy() == null, "no program can authorize bucket filling");
+        var twoBuckets = raw.deepCopy();
+        twoBuckets.getAsJsonObject("target").addProperty("count", 2);
+        require(AgentWorkOrder.parse(twoBuckets, "run", "preset").policy() == null, "one lease fills only one bucket");
+        raw.getAsJsonArray("costCaps").get(0).getAsJsonObject().addProperty("count", 2);
+        require(AgentWorkOrder.parse(raw, "run", "preset").policy() == null, "the only bucket cap is one");
     }
 
     @Test

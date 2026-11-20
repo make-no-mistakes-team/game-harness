@@ -9,8 +9,7 @@ export class TerraActorCompatibilityError extends Error {
 }
 
 const WORK_WIRE = "gameharness:terra_work_wire";
-// Version 2 retains staged crafting and adds the guarded model-origin iron furnace order and progress phase.
-// Bump the manifest value when host work orders start requiring new actor behavior.
+// The manifest is the authority for both staging and the macro capability version.
 const workWireVersion = actorManifest.custom[WORK_WIRE];
 
 export async function requireTerraActorWire(stagedJar: string): Promise<string> {

@@ -72,13 +72,112 @@ test("Iron smelting and furnace placement require an exact, single live stock po
 
   const progress = { phase: "smelt", status: "Cooking 2 raw iron", breaks: 0, crafts: 0, placements: 1,
     target: { item: target.item, count: 1, required: target.count } };
-  expect(parseMacroObservation({
+  const observation = {
     v: 1, run: "run", life: 1, epoch: 1, tick: 20, goal: "diamond", health: 20, food: 20,
     inventory: { [target.item]: 1 }, opportunities: [], recent: [], quiescent: false,
     workOrder: { id: order.id, state: "working", detail: "Waiting for furnace output", progress },
-  }).workOrder).toMatchObject({
+  };
+  expect(parseMacroObservation(observation).workOrder).toMatchObject({
     state: "working", progress: { phase: "smelt", crafts: 0, target: { count: 1, required: 3 } },
   });
+  const burn = { burnTick: 19, units: 2, remainingCookTicks: 398 };
+  const withBurn = (phase: string, cue: typeof burn) => parseMacroObservation({
+    ...observation, workOrder: { ...observation.workOrder, progress: { ...progress, phase, smeltBurn: cue } },
+  });
+  expect(withBurn("smelt", burn)).toMatchObject({
+    inventory: { [target.item]: 1 }, workOrder: { progress: { smeltBurn: burn } },
+  });
+  expect(() => withBurn("hold", burn)).toThrow();
+  expect(() => withBurn("smelt", { ...burn, burnTick: 21 })).toThrow();
+  expect(() => withBurn("smelt", { ...burn, remainingCookTicks: 401 })).toThrow();
+});
+
+test("Deep diamond work is explicit, standalone, and does not imply cover or torches", () => {
+  const explore = "prospect:minecraft:diamond", ore = "break:minecraft:deepslate_diamond_ore";
+  const torch = "place:minecraft:torch";
+  const policy = { target: { kind: "stock", item: "minecraft:diamond", count: 1 },
+    allowedEffects: [explore, ore], maxBreaks: 8, maxCrafts: 0, maxPlacements: 0, costCaps: [], reserves: [] };
+  const order = { ...policy, v: 1, id: "diamond-leg", run: "run", life: 1, epoch: 1, basisTick: 10,
+    expiresTick: 1210, safetyRevision: 1, origin: "model" };
+  const proposal = (action: unknown) => ({ action, subgoal: "Explore for diamond", reason: "Dry cave",
+    successCondition: "Diamond held", contingency: "Stop at unsafe rock", alternative: "Inspect a lower shelf", expiresTick: 1210 });
+  expect(parseMacroProposal(proposal({ kind: "work", policy })).action).toMatchObject({ kind: "work",
+    policy: { allowedEffects: [ore, explore] } });
+  expect(parseMacroWorkOrder({ ...order, allowedEffects: [ore] }).allowedEffects).toEqual([ore]);
+  expect(parseMacroWorkOrder(order).allowedEffects).toEqual([ore, explore]);
+  expect(parseMacroWorkOrder({ ...order, allowedEffects: [explore, ore, torch], maxPlacements: 1,
+    costCaps: [{ item: "minecraft:torch", count: 1 }] }).maxPlacements).toBe(1);
+  const cobble = "place:minecraft:cobblestone";
+  const support = { ...order, allowedEffects: [explore, ore, cobble], maxPlacements: 1,
+    costCaps: [{ item: "minecraft:cobblestone", count: 1 }], reserves: [{ item: "minecraft:cobblestone", count: 2 }] };
+  expect(parseMacroWorkOrder(support)).toMatchObject({ maxPlacements: 1, allowedEffects: [ore, cobble, explore] });
+  for (const invalid of [
+    { ...order, origin: "preset" }, { ...order, id: "work:3" }, { ...order, allowedEffects: [explore] },
+    { ...order, target: { kind: "stock", item: "minecraft:iron_ingot", count: 1 } },
+    { ...order, allowedEffects: [ore, torch] }, { ...order, maxBreaks: 0 },
+    { ...order, allowedEffects: [explore, ore, torch], maxPlacements: 1 },
+    { ...support, allowedEffects: [ore, cobble] }, { ...support, costCaps: [{ item: "minecraft:torch", count: 1 }] },
+    { ...support, maxPlacements: 0 }, { ...support, id: "work:2" },
+  ]) expect(() => parseMacroWorkOrder(invalid)).toThrow();
+  expect(() => parseMacroProposal(proposal({
+    kind: "work-program", stages: [{ policy, requires: [] }, {
+      policy: { ...policy, target: { kind: "stock", item: "minecraft:torch", count: 4 }, allowedEffects: [] }, requires: [],
+    }],
+  }))).toThrow("single live work policy");
+});
+
+test("Only a single exact live order can fill a water bucket", () => {
+  const target = { kind: "stock", item: "minecraft:water_bucket", count: 1 };
+  const costCaps = [{ item: "minecraft:bucket", count: 1 }];
+  const policy = { target, allowedEffects: ["fill:minecraft:water"], costCaps,
+    reserves: [{ item: "minecraft:iron_pickaxe", count: 1 }], maxBreaks: 0, maxCrafts: 0, maxPlacements: 0 };
+  const order = { ...policy, v: 1, id: "water-work", run: "run", life: 1, epoch: 1, basisTick: 10,
+    expiresTick: 100, safetyRevision: 1, origin: "model" };
+  const proposal = (action: unknown) => ({ action, subgoal: "Fill the empty bucket", reason: "A reachable source is witnessed",
+    successCondition: "Matching use and inventory swap", contingency: "Stop if the source changes",
+    alternative: "Keep the empty bucket", expiresTick: 100 });
+  expect(parseMacroWorkOrder(order)).toMatchObject(policy);
+  expect(parseMacroProposal(proposal({ kind: "work", policy })).action.kind).toBe("work");
+  for (const invalid of [
+    { origin: "preset" }, { id: "work:3" }, { id: "work:1", nextWorkId: "work:2" },
+    { target: { ...target, count: 2 } }, { target: { ...target, item: "minecraft:lava_bucket" } },
+    { allowedEffects: ["fill:minecraft:lava"] }, { allowedEffects: ["pour:minecraft:water"] },
+    { allowedEffects: ["place:minecraft:water"] }, { allowedEffects: [...policy.allowedEffects, "craft:bucket"] },
+    { costCaps: [] }, { costCaps: [{ ...costCaps[0], count: 2 }] },
+    { costCaps: [{ item: "minecraft:water_bucket", count: 1 }] },
+    { costCaps: [...costCaps, { item: "minecraft:dirt", count: 1 }] },
+    { maxBreaks: 1 }, { maxCrafts: 1 }, { maxPlacements: 1 },
+  ]) expect(() => parseMacroWorkOrder({ ...order, ...invalid })).toThrow();
+  expect(() => parseMacroProposal(proposal({ kind: "work-program", stages: [
+    { policy, requires: [] },
+    { policy: { ...policy, target: { ...target, item: "minecraft:bucket" }, allowedEffects: [], costCaps: [] }, requires: [] },
+  ] }))).toThrow("single live work policy");
+  expect(() => parseMacroProposal(proposal({ kind: "continuation", opportunityId: "o-water", reserves: [], steps: [
+    { selector: { verb: "fill_water", subject: "fluid:minecraft:water_source" }, maxEffects: 1, until: null },
+  ] }))).toThrow();
+});
+
+test("A water offer is read-only and names only the exact witnessed source and bucket spend", () => {
+  const clue = { id: "o-water", verb: "fill_water", risk: "read", summary: "Witnessed source water in bucket reach",
+    evidence: "A lit source-water surface is visible from this dry stance." };
+  const material = { subject: "fluid:minecraft:water_source", target: "m-water", spends: { "minecraft:bucket": 1 } };
+  const observation = (offer: unknown) => ({
+    v: 1, run: "run", life: 1, epoch: 1, tick: 20, goal: "diamond", health: 20, food: 20,
+    inventory: { "minecraft:bucket": 1 }, opportunities: [offer], recent: [], quiescent: true,
+  });
+  expect(parseMacroObservation(observation({ ...clue, material })).opportunities[0]).toMatchObject({
+    verb: "fill_water", risk: "read", material: { subject: "fluid:minecraft:water_source", spends: { "minecraft:bucket": 1 } },
+  });
+  expect(parseMacroObservation(observation({ ...clue, summary: "Flowing water without a reachable source" }))
+    .opportunities[0]?.material).toBeUndefined();
+  for (const offer of [
+    { ...clue, risk: "guarded", material }, { ...clue, risk: "low" },
+    { ...clue, material: { ...material, subject: "fluid:minecraft:lava_source" } },
+    { ...clue, material: { ...material, subject: "fluid:minecraft:flowing_water" } },
+    { ...clue, material: { ...material, spends: {} } },
+    { ...clue, material: { ...material, spends: { "minecraft:bucket": 2 } } },
+    { ...clue, material: { ...material, spends: { "minecraft:lava_bucket": 1 } } },
+  ]) expect(() => parseMacroObservation(observation(offer))).toThrow();
 });
 
 test.each([

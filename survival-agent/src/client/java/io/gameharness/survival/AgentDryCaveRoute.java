@@ -367,9 +367,10 @@ final class AgentDryCaveRoute {
         ensureLife();
         if (authorization == null || player == null || !dry())
             return directRefusal("safe dry first-person control is no longer available");
-        if (player.isSprinting() || client.options.forwardKey.isUnbound()
+        if (player.isSprinting()) return directRefusal("vanilla sprint is active on a walk-only edge");
+        if (client.options.forwardKey.isUnbound()
                 || authorization.heightChange() > 0 && client.options.jumpKey.isUnbound())
-            return directRefusal("the authorized non-sprinting movement control changed");
+            return directRefusal("the forward or required jump key is unbound");
         int now = body.actionTick();
         if (direct == null) {
             if (!body.dryRouteView() || authorization != offered || !offerFresh(now) || !offerStance(authorization.from)

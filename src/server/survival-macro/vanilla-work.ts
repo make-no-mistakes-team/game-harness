@@ -1,5 +1,6 @@
 import {
-  MACRO_FURNACE_PLACEMENT, MACRO_IRON_FUEL_TICKS, MACRO_IRON_SMELT,
+  MACRO_FURNACE_PLACEMENT, MACRO_IRON_FUEL_TICKS, MACRO_IRON_SMELT, MACRO_PROSPECT_SUPPORT,
+  MACRO_WATER_CLUE, MACRO_WATER_FILL, MACRO_WATER_SOURCE,
   type MacroObservation, type MacroStockFloor, type MacroWorkPolicy, type MacroWorkStage,
 } from "./protocol.ts";
 
@@ -8,7 +9,10 @@ const TABLE = vanilla("crafting_table");
 const STICK = vanilla("stick");
 const FURNACE = vanilla("furnace");
 const RAW_IRON = vanilla("raw_iron");
+const COBBLESTONE = vanilla("cobblestone");
 const IRON_INGOT = vanilla("iron_ingot");
+const BUCKET = vanilla("bucket");
+const WATER_BUCKET = vanilla("water_bucket");
 const IRON_COOK_TICKS = 200;
 
 // Public vanilla 1.21.4 facts, shared with opening binding. These say nothing about the player's world.
@@ -164,12 +168,26 @@ class StageArithmetic {
     this.unknownRecipe = unknownRecipe;
   }
 
-  check(requires: readonly MacroStockFloor[]): boolean {
+  check(requires: readonly MacroStockFloor[], water: "source" | "flowing" | undefined): boolean {
     for (const { item, count } of requires) {
       const held = get(this.path.stock, item);
       if (held < count) return this.fail(`requires ${count} ${item} at entry, but only ${held} are accounted for`);
     }
     for (const floor of this.policy.reserves) floorAtLeast(this.path.reserves, floor);
+    if (this.allowed.has(MACRO_WATER_FILL)) {
+      if (get(this.path.stock, WATER_BUCKET) !== 0) return this.fail(`already holds a ${WATER_BUCKET}; no fill is needed`);
+      for (const [item, required] of this.path.reserves) {
+        const held = get(this.path.stock, item);
+        if (held + (item === WATER_BUCKET ? 1 : 0) < required)
+          return this.fail(`cannot preserve the ${required} ${item} reserve with ${held} currently held`);
+      }
+      if (!this.spend([BUCKET], 1, true)) return false;
+      if (!water) return this.fail("has no witnessed source water in reach from dry footing");
+      if (water === "flowing") return this.fail("sees flowing water but no witnessed source in reach from dry footing");
+      change(this.path.stock, WATER_BUCKET, 1);
+      this.path.prospective = true;
+      return true;
+    }
     const { target } = this.policy;
     if (target.kind === "preset" && target.goal === "nether_portal") {
       this.uncertain = true; // A constructed world feature is not inventory arithmetic.
@@ -338,13 +356,13 @@ class StageArithmetic {
 }
 
 function project(inventory: MacroObservation["inventory"], pickups: Stock, stages: readonly MacroWorkStage[],
-  existingTable: boolean, existingFurnace: boolean) {
+  existingTable: boolean, existingFurnace: boolean, water: "source" | "flowing" | undefined) {
   const path: Path = { stock: new Map(Object.entries(inventory)), pickups: new Map(pickups), reserves: new Map(),
     existingTable, existingFurnace, placedTable: false, prospective: false, choice: false };
   for (let index = 0; index < stages.length; index++) {
     const { policy, requires } = stages[index]!;
     const stage = new StageArithmetic(path, policy, index);
-    if (!stage.check(requires)) {
+    if (!stage.check(requires, index === 0 ? water : undefined)) {
       const diagnostic = stage.problem === undefined ? undefined
         : { stageIndex: index, detail: stage.problem };
       return { path, diagnostic, incomplete: true, uncertain: stage.uncertain || path.choice };
@@ -365,7 +383,13 @@ export function preflightVanillaWork(
   const targets = new Set<string>();
   let tableInReach = false;
   let recentTable = false, recentFurnace = false;
+  let water: "source" | "flowing" | undefined;
   for (const { verb, risk, summary, evidence, material } of opportunities) {
+    if (verb === MACRO_WATER_CLUE && risk === "read") {
+      if (material?.subject === MACRO_WATER_SOURCE && material.spends[BUCKET] === 1 &&
+          Object.keys(material.spends).length === 1) water = "source";
+      else if (!water && !material) water = "flowing";
+    }
     // The native interact offer only names a table when a usable face is in vanilla reach.
     if (verb === "interact" && risk === "guarded" && summary === `Open visible ${TABLE}`) tableInReach = true;
     if (verb === "continue" && risk === "guarded" && material?.subject.startsWith("recipe:") &&
@@ -380,7 +404,7 @@ export function preflightVanillaWork(
       change(pickups, material.subject.slice(5), 64); // The native offer does not include stack size.
     }
   }
-  const existing = project(inventory, pickups, stages, true, true);
+  const existing = project(inventory, pickups, stages, true, true, water);
   if (existing.incomplete) {
     const diagnostic = existing.diagnostic;
     if (!diagnostic) return { kind: "unknown" };
@@ -388,12 +412,26 @@ export function preflightVanillaWork(
       (existing.uncertain ? " A different supported source or material allocation could change this." : "");
     return { kind: existing.uncertain ? "unknown" : "shortage", stageIndex: diagnostic.stageIndex, detail };
   }
+  // This branch is optional: a native witness can bypass it, and later harvesting may supply blocks.
+  // Never debit a prospective placement or promote a guessed landing into an effect.
+  const supportStage = stages.findIndex(({ policy }) => policy.allowedEffects.includes(MACRO_PROSPECT_SUPPORT));
+  if (supportStage >= 0) {
+    const { policy } = stages[supportStage]!;
+    const held = inventory[COBBLESTONE] ?? 0;
+    const reserve = policy.reserves.find(({ item }) => item === COBBLESTONE)?.count ?? 0;
+    const cap = policy.costCaps.find(({ item }) => item === COBBLESTONE)?.count ?? 0;
+    const spendable = Math.max(0, Math.min(held - reserve, cap, policy.maxPlacements));
+    if (spendable === 0) return { kind: "unknown", stageIndex: supportStage,
+      detail: `Stage ${supportStage + 1} has no currently spendable ${COBBLESTONE} for an attached support ` +
+        `(${held} held, ${reserve} reserved; the exact item cost and shared placements also apply). ` +
+        "An already supported route or later collected stock could avoid this shortage." };
+  }
   // A furnace interaction offer does not establish empty slots or cold heat.
   // Quote new placement separately; unknown station access never supplies stock.
   const { firstBench, firstFurnace } = existing.path;
   const tableWitnessed = tableInReach && (firstBench ?? firstFurnace) === 0;
   if (firstFurnace !== undefined || firstBench !== undefined && !tableWitnessed) {
-    const placed = project(inventory, pickups, stages, tableWitnessed, firstFurnace === undefined);
+    const placed = project(inventory, pickups, stages, tableWitnessed, firstFurnace === undefined, water);
     if (placed.incomplete) {
       const diagnostic = placed.diagnostic;
       if (!diagnostic) return { kind: "unknown" };

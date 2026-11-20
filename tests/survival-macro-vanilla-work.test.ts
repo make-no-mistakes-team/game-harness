@@ -57,6 +57,26 @@ test("Real carried equipment removes crafting spend, but a carried table is stil
   expect(check({ "minecraft:wooden_pickaxe": 1, [table]: 1 }, protectedTable)).toEqual({ kind: "possible" });
 });
 
+test("The post-smelt bucket quote distinguishes a recent table clue from a usable or carried table", () => {
+  const iron = "minecraft:iron_ingot", pickaxe = "minecraft:iron_pickaxe";
+  const inventory = { [iron]: 3, [pickaxe]: 1 };
+  const policy = stage({ target: stock("minecraft:bucket", 1), allowedEffects: ["craft:bucket"],
+    maxCrafts: 1, costCaps: [floor(iron, 3)], reserves: [floor(pickaxe, 1)] });
+  const clue: MacroObservation["opportunities"] = [{
+    id: "o-2", verb: "survey", risk: "read", summary: `Reacquire recent ${table}`,
+    evidence: "Turn in place toward the last witnessed face; this does not confirm access or open a screen.",
+  }];
+  expect(check(inventory, [policy], clue)).toMatchObject({
+    kind: "unknown", detail: expect.stringContaining("No crafting table is currently witnessed in reach."),
+  });
+  expect(check(inventory, [policy], clue)).toMatchObject({
+    kind: "unknown", detail: expect.stringContaining("A recent table clue permits a camera check, not access."),
+  });
+  expect(check(inventory, [policy], tableOffer)).toEqual({ kind: "possible" });
+  expect(check({ ...inventory, [table]: 1 }, [policy], clue).kind).toBe("unknown");
+  expect(check({ ...inventory, [iron]: 2 }, [policy], clue).kind).toBe("shortage");
+});
+
 test("Account for production batches across stages without making reachable future timber into observed stock", () => {
   const program = (logs: number, planks: number, crafts: number, requiredPlanks = planks) => [
     stage({ target: stock(log, logs), allowedEffects: [`break:${log}`], maxBreaks: logs, reserves: [floor(log, 1)] }),

@@ -86,6 +86,9 @@ final class AgentMacroControl {
     private static final double TIMBER_RECALL_RANGE = 9;
     private static final int TIMBER_RECALL_TICKS = 220;
     private static final int TIMBER_RECALL_LIMIT = 16;
+    private static final int STATION_RECALL_TICKS = 900;
+    private static final long STATION_RECALL_NS = 45_000_000_000L;
+    private static final double STATION_RECALL_STANCE_SQUARED = 0.75 * 0.75;
     private static final double PICKUP_STANCE_SQUARED = 1.20 * 1.20;
     private static final double SETTLED_SPEED_SQUARED = 0.001225;
     private static final Direction[] CARDINAL = {Direction.SOUTH, Direction.WEST, Direction.NORTH, Direction.EAST};
@@ -108,6 +111,7 @@ final class AgentMacroControl {
 
     private enum Verb {
         SURVEY("survey", "read", 30), DRY_SURVEY("survey", "guarded", 56),
+        STATION_REACQUIRE("survey", "read", 40),
         INSPECT("inspect", "read", 30), APPROACH("approach", "low", 65),
         INTERACT("interact", "guarded", 40), COLLECT("collect", "guarded", 38), BREAK("break", "guarded", 120),
         CONTINUE("continue", "guarded", 320), FOLLOW("follow", "guarded", 640),
@@ -125,6 +129,22 @@ final class AgentMacroControl {
     /** All world geometry and entity identities stay private to the native thread. */
     private record Floor(BlockPos pos, BlockState state, Vec3d landing) {}
     private record Face(BlockHitResult hit, BlockState state) {}
+    private record StationPlacement(BlockPos pos, BlockState state, Vec3d stance, long framedAfter, long until) {}
+    private static final class PersonalStation {
+        final Face face;
+        final Vec3d stance;
+        final long tick, time;
+        final int sequence;
+        boolean attempted;
+
+        PersonalStation(Face face, Vec3d stance, long tick, long time, int sequence) {
+            this.face = face;
+            this.stance = stance;
+            this.tick = tick;
+            this.time = time;
+            this.sequence = sequence;
+        }
+    }
     private record TimberSight(Face face, long seen) {}
     private record TimberHarvest(BlockPos block, BlockState state, Vec3d stance, Item item, int stock, long tick) {}
     private record Key(Verb verb, BlockPos pos, int entity, String activity, Direction side, BlockState state) {
@@ -206,7 +226,7 @@ final class AgentMacroControl {
         final float pathYaw, pathPitch;
         boolean drove, fired, broken, purposefulMotion, durable, tableInReach, prospectCover;
         float lastCrack;
-        long firedAt, pickupDisappeared, craftJob, priorCraftReceipt, settledAt, lastMissingFrame;
+        long firedAt, placementFrame, pickupDisappeared, craftJob, priorCraftReceipt, settledAt, lastMissingFrame;
         int missingFaceFrames;
         String unexpectedPickup;
         Screen opened;
@@ -243,7 +263,7 @@ final class AgentMacroControl {
             harvestTool = offer.key.verb == Verb.BREAK ? client.player.getMainHandStack().copy() : ItemStack.EMPTY;
             camera = switch (offer.key.verb) {
                 case SURVEY -> new Camera(offer.yaw, offer.pitch);
-                case INSPECT -> {
+                case INSPECT, STATION_REACQUIRE -> {
                     Vec3d point = offer.face.hit.getPos().subtract(client.player.getEyePos());
                     yield new Camera(heading(point.x, point.z), (float) Math.toDegrees(
                         Math.atan2(-point.y, Math.hypot(point.x, point.z))));
@@ -357,6 +377,9 @@ final class AgentMacroControl {
     private Action action;
     private WorkSession work;
     private TimberHarvest timberHarvest;
+    private PersonalStation personalTable, personalFurnace;
+    private StationPlacement stationPlacement;
+    private int stationSequence;
     private long timberFrame = -1;
     private SourceSearch surfaceSearch = new SourceSearch();
     private PersonalCraft personalCraft;
@@ -409,6 +432,8 @@ final class AgentMacroControl {
             work = null;
             timberSights.clear();
             timberHarvest = null;
+            personalTable = personalFurnace = null;
+            stationPlacement = null;
             timberFrame = -1;
             surfaceSearch = new SourceSearch();
             this.life = life;
@@ -436,6 +461,8 @@ final class AgentMacroControl {
             rawPending = rawWorking = false;
             lastHandsEvidence = hands.workEvidence();
         }
+        if (personalTable != null && !stationClueCurrent(personalTable)) personalTable = null;
+        if (personalFurnace != null && !stationClueCurrent(personalFurnace)) personalFurnace = null;
         body.safetySpend(safetySpend());
         observePlanning();
     }
@@ -594,6 +621,7 @@ final class AgentMacroControl {
             return;
         }
         sampleClock();
+        witnessStationPlacement();
         // An accepted direct intent owns the input path even when its tick is
         // neutral (e.g. one missing route render). No work-order branch may steal it.
         if (!trial && ipc.workMode != null && (action == null || action.intent == null || action.durable)) {
@@ -677,6 +705,7 @@ final class AgentMacroControl {
         if (offer.route != null || offer.drySurvey != null) routeOwner = progress;
         action = new Action(intent, offer, client, tick, now, body.renderedFrame(),
             offer.item == null ? 0 : count(offer.item), NO_ANCHORS, Float.NaN);
+        if (offer.key.verb == Verb.STATION_REACQUIRE) personalStation(offer.face.state.getBlock()).attempted = true;
         action.prospectCover = SURFACE_CAP.equals(offer.key.activity);
         if (trial) {
             trialUsed = true;
@@ -961,7 +990,7 @@ final class AgentMacroControl {
             }
         }
         work.lastHarvest = null;
-        BlockHitResult tableHit = personal ? null : body.find(state -> state.isOf(Blocks.CRAFTING_TABLE), reach()).orElse(null);
+        BlockHitResult tableHit = personal ? null : visibleStation(Blocks.CRAFTING_TABLE);
         if (target.item() != null) {
             Item desired = goalReached ? missingFloor.getKey() : target.item();
             int required = goalReached || missingFloor != null && missingFloor.getKey() == desired
@@ -983,7 +1012,9 @@ final class AgentMacroControl {
             else searchWork("The preset result is present, but a declared reserve is not yet fulfilled.");
             return;
         }
-        var stage = progress.macroPresetStage(work.budget, personal ? personalCraft.tableInReach : tableHit != null);
+        // A clue can select a bench recipe for consideration, never supply its live face.
+        var stage = progress.macroPresetStage(work.budget, personal ? personalCraft.tableInReach
+            : tableHit != null || stationRecallReady(personalTable));
         if (personal) {
             if (stage.recipe() != null && startWorkRecipe(stage.recipe(), stage.executions(), null)) runWorkStep(progress);
             else releasePersonalCraft(true);
@@ -1086,6 +1117,7 @@ final class AgentMacroControl {
             case WORK_TREAD -> "route";
             case WORK_WALK -> drop == null ? "route" : "collect";
             case CONTINUE -> "craft";
+            case STATION_REACQUIRE -> "search";
             case WORK_EQUIP -> "equip";
             case WORK_PLACE -> "place";
             case WORK_SMELT -> "smelt";
@@ -1727,6 +1759,7 @@ final class AgentMacroControl {
     }
 
     private boolean findWorkTable(String recipe) {
+        if (startStationRecall(personalTable)) return true;
         var known = work.budget.policy.smeltIron() ? null : body.find(state -> state.isOf(Blocks.CRAFTING_TABLE), INSPECT_REACH,
             hit -> !work.rejected.contains(hit.getBlockPos())).orElse(null);
         if (known != null && horizontalSquared(player.getPos(), Vec3d.ofCenter(known.getBlockPos())) > 1.0) {
@@ -1742,11 +1775,10 @@ final class AgentMacroControl {
                 && startWorkRecipe("crafting_table", 1, null);
         }
         if (work.budget.limit(Items.CRAFTING_TABLE, tables) < 1) return false;
-        var support = body.stationFace(null, pos -> pos.getY() == player.getBlockY()
+        var support = stationSupport(pos -> pos.getY() == player.getBlockY()
             && !work.rejected.contains(pos) && client.world.getBlockState(pos).isAir()
             && (!work.budget.policy.smeltIron() || furnaceSite(pos)));
-        if (support == null || support.getSide() != Direction.UP
-                || client.world.getBlockState(support.getBlockPos()).getBlock() instanceof FallingBlock) return false;
+        if (support == null) return false;
         startWorkStep(Verb.WORK_PLACE, "Place the authorized crafting table on visible footing",
             face(support), null, Items.CRAFTING_TABLE, null);
         return true;
@@ -1969,8 +2001,10 @@ final class AgentMacroControl {
         boolean furnace = item == Items.FURNACE;
         Block station = furnace ? Blocks.FURNACE : Blocks.CRAFTING_TABLE;
         if (action.fired) {
-            if (client.world.getBlockState(dest).isOf(station) && (furnace
-                    ? count(item) == action.itemCount - 1 : count(item) < action.itemCount)) {
+            if (client.world.getBlockState(dest).isOf(station) && count(item) == action.itemCount - 1) {
+                stationPlacement = new StationPlacement(dest, world.getBlockState(dest), player.getPos(),
+                    action.placementFrame, tick + 5);
+                witnessStationPlacement();
                 ++work.confirmedPlacements;
                 continuityWork = AgentPauseEpisodes.Work.NOVELTY;
                 if (furnace) {
@@ -2014,7 +2048,29 @@ final class AgentMacroControl {
             else work.budget.placedTable();
             action.fired = true;
             action.firedAt = tick;
+            action.placementFrame = body.renderedFrame();
         }
+    }
+
+    private BlockHitResult stationSupport(Predicate<BlockPos> lawful) {
+        Predicate<BlockPos> site = pos -> lawful.test(pos)
+            && !(world.getBlockState(pos.down()).getBlock() instanceof FallingBlock);
+        if (personalTable != null || personalFurnace != null) {
+            Vec3d eye = player.getEyePos();
+            var preferred = body.stationFace(null, pos -> {
+                if (!site.test(pos)) return false;
+                Box placement = new Box(pos);
+                return !blocksStationFace(placement, eye, personalTable)
+                    && !blocksStationFace(placement, eye, personalFurnace);
+            }, true);
+            if (preferred != null) return preferred;
+        }
+        return body.stationFace(null, site, true);
+    }
+
+    private static boolean blocksStationFace(Box placement, Vec3d eye, PersonalStation known) {
+        // Test only the proposed full block against a previously witnessed sightline.
+        return known != null && placement.raycast(eye, known.face.hit.getPos()).isPresent();
     }
 
     private boolean dryWorkshopSupport(BlockPos floor) {
@@ -2085,6 +2141,12 @@ final class AgentMacroControl {
         }
         var witnessed = body.find(state -> state.isOf(Blocks.FURNACE) && !state.get(AbstractFurnaceBlock.LIT), reach(),
             hit -> hit.getBlockPos().equals(work.placedFurnace) && hit.getBlockPos().getY() >= player.getBlockY()).orElse(null);
+        if (witnessed == null && personalFurnace != null && personalFurnace.attempted) {
+            var live = visibleStation(Blocks.FURNACE, personalFurnace.face.hit.getBlockPos());
+            if (live != null && live.getBlockPos().getY() >= player.getBlockY()
+                    && !work.rejected.contains(live.getBlockPos())
+                    && !world.getBlockState(live.getBlockPos()).get(AbstractFurnaceBlock.LIT)) witnessed = live;
+        }
         if (witnessed == null)
             witnessed = body.find(state -> state.isOf(Blocks.FURNACE) && !state.get(AbstractFurnaceBlock.LIT), reach(),
                 hit -> !work.rejected.contains(hit.getBlockPos()) && hit.getBlockPos().getY() >= player.getBlockY()).orElse(null);
@@ -2094,6 +2156,10 @@ final class AgentMacroControl {
             action.furnace = new FurnaceWork(footing);
             return true;
         }
+        if (stationRecallReady(personalFurnace)
+                && personalFurnace.face.hit.getBlockPos().getY() >= player.getBlockY()
+                && visibleStation(Blocks.FURNACE, personalFurnace.face.hit.getBlockPos()) == null
+                && startStationRecall(personalFurnace)) return true;
         if (work.placedFurnace != null) {
             searchWork("The one placed furnace is not currently witnessed cold and reachable from the dry stance.");
         } else if (!work.budget.policy.placeFurnace()) {
@@ -2101,8 +2167,8 @@ final class AgentMacroControl {
         } else if (!work.budget.canPlace() || work.budget.remainingCost(Items.FURNACE) == 0) {
             searchWork("No furnace placement or minecraft:furnace cost remains in the work budget.");
         } else if (work.budget.canPlaceFurnace(player.getInventory())) {
-            var support = body.stationFace(null, this::furnaceSite);
-            if (support != null && support.getSide() == Direction.UP) {
+            var support = stationSupport(this::furnaceSite);
+            if (support != null) {
                 startWorkStep(Verb.WORK_PLACE, "Place one authorized furnace on witnessed dry support",
                     face(support), null, Items.FURNACE, null);
                 return true;
@@ -2117,6 +2183,9 @@ final class AgentMacroControl {
             searchWork("Crafting a furnace and smelting its first iron need two shared recipe executions.");
         } else {
             if (table != null && table.getBlockPos().getY() < player.getBlockY()) table = null;
+            if (table == null && stationRecallReady(personalTable)
+                    && personalTable.face.hit.getBlockPos().getY() >= player.getBlockY()
+                    && hands.workCraftable("furnace", work.budget) && startStationRecall(personalTable)) return true;
             if (table == null && (!work.budget.policy.placeTable() || work.budget.placementsLeft() < 2
                     || work.budget.remainingCost(Items.CRAFTING_TABLE) == 0)) {
                 searchWork("No crafting table is witnessed in reach; both the table and furnace need their own placement permissions and costs.");
@@ -2191,6 +2260,7 @@ final class AgentMacroControl {
                 interrupt("The witnessed furnace is not newly empty and cold; none of its contents were touched.", true);
                 return;
             }
+            rememberStation(target);
             int required = Math.max(work.budget.policy.target().count(), work.budget.floor(Items.IRON_INGOT));
             int shortfall = required - count(Items.IRON_INGOT);
             if (shortfall <= 0) {
@@ -2244,6 +2314,7 @@ final class AgentMacroControl {
             if (tick - iron.storedTick < 3) return;
             work.confirmedCrafts += batch.units();
             work.collectedIron = true;
+            rememberStation(target);
             ironMilestone("collected", "Collected " + batch.units() + " furnace-produced iron ingot(s); actual inventory has "
                 + count(Items.IRON_INGOT) + ".");
             furnace.close();
@@ -2582,6 +2653,12 @@ final class AgentMacroControl {
                 || horizontalSquared(anchor, player.getPos()) > 0.64
                 || angle(player.getYaw(), player.getPitch(), offer.yaw, offer.pitch) < 5
                 ? "The bounded survey is already done or its origin changed." : null;
+            case STATION_REACQUIRE -> {
+                var clue = personalStation(offer.face.state.getBlock());
+                yield !stationRecallReady(clue) || clue.sequence != offer.key.entity
+                    || visibleStation(offer.face.state.getBlock()) != null
+                    ? "The recent workstation clue is used, already visible, or no longer local." : null;
+            }
             case DRY_SURVEY -> progress.drySurveyCurrent(offer.drySurvey)
                 ? null : "The exact visible lower face or its standing source changed.";
             case INSPECT -> retiredViews.contains(offer.key) || !visible(offer.face, INSPECT_REACH)
@@ -2622,6 +2699,7 @@ final class AgentMacroControl {
         }
         switch (offer.key.verb) {
             case DRY_SURVEY -> surveyDryRoute(offer, progress);
+            case STATION_REACQUIRE -> advanceStationRecall();
             case SURVEY -> {
                 var player = client.player;
                 if (horizontalSquared(action.position, player.getPos()) > 0.12) {
@@ -2874,6 +2952,7 @@ final class AgentMacroControl {
                     else releasePersonalCraft(true);
                 }
                 if (action.durable) work.confirmedCrafts += result.executions();
+                if (offer.face != null) rememberStation(offer.face);
                 continuityWork = AgentPauseEpisodes.Work.GUI;
                 complete("Vanilla crafting confirmed " + result.items() + " output from " + offer.recipe.id + ".");
             } else interrupt("The hand job ended without a matching vanilla crafting receipt.", true);
@@ -2889,6 +2968,7 @@ final class AgentMacroControl {
                 interrupt("The expected clean workstation screen did not open.", false);
             } else if (shown == screen) {
                 action.opened = screen;
+                rememberStation(offer.face);
                 continuityWork = AgentPauseEpisodes.Work.GUI;
                 if (offer.recipe == null) {
                     screen.close();
@@ -2929,6 +3009,9 @@ final class AgentMacroControl {
     }
 
     void ownBreak(BlockPos pos, BlockState state) {
+        forgetStationAt(personalTable, pos);
+        forgetStationAt(personalFurnace, pos);
+        if (stationPlacement != null && stationPlacement.pos.equals(pos)) stationPlacement = null;
         if (action != null && action.offer.key.verb == Verb.BREAK && action.fired
                 && action.offer.face.hit.getBlockPos().equals(pos) && action.offer.face.state == state && !action.broken) {
             action.broken = true;
@@ -3037,6 +3120,8 @@ final class AgentMacroControl {
         if (suspended) return;
         suspended = true;
         this.tick = tick;
+        personalTable = personalFurnace = null;
+        stationPlacement = null;
         sampleClock();
         rawPending = false;
         state("inactive", reason);
@@ -3190,6 +3275,109 @@ final class AgentMacroControl {
     private static boolean station(BlockState state) { return state.isOf(Blocks.CRAFTING_TABLE) || state.isOf(Blocks.FURNACE); }
     private static String blockName(Face face) { return Registries.BLOCK.getId(face.state.getBlock()).toString(); }
 
+    private PersonalStation personalStation(Block block) {
+        return block == Blocks.CRAFTING_TABLE ? personalTable : block == Blocks.FURNACE ? personalFurnace : null;
+    }
+
+    private void forgetStationAt(PersonalStation clue, BlockPos pos) {
+        if (clue != null && clue.face.hit.getBlockPos().equals(pos)) {
+            if (clue == personalTable) personalTable = null;
+            else personalFurnace = null;
+        }
+    }
+
+    private boolean sameStation(Face face) {
+        var current = world.getBlockState(face.hit.getBlockPos());
+        if (face.state.isOf(Blocks.FURNACE)) return current.isOf(Blocks.FURNACE)
+            && current.get(AbstractFurnaceBlock.FACING) == face.state.get(AbstractFurnaceBlock.FACING);
+        return face.state.isOf(Blocks.CRAFTING_TABLE) && current == face.state;
+    }
+
+    private void rememberStation(Face face) {
+        if (trial || !sameStation(face)) return;
+        if (stationPlacement != null && stationPlacement.pos.equals(face.hit.getBlockPos())) stationPlacement = null;
+        var clue = new PersonalStation(face, player.getPos(), tick, now, ++stationSequence);
+        if (face.state.isOf(Blocks.CRAFTING_TABLE)) personalTable = clue;
+        else personalFurnace = clue;
+    }
+
+    private void witnessStationPlacement() {
+        var placement = stationPlacement;
+        if (placement == null) return;
+        if (tick > placement.until || player.getPos().squaredDistanceTo(placement.stance) > 0.0144
+                || world.getBlockState(placement.pos) != placement.state) {
+            stationPlacement = null;
+            return;
+        }
+        // A placement receipt does not establish a rendered face. This only checks
+        // subsequent live views and does not hold the work order open.
+        if (observableWorld() && body.renderedFrame() > placement.framedAfter) {
+            var seen = visibleStation(placement.state.getBlock(), placement.pos);
+            if (seen != null) rememberStation(face(seen));
+        }
+    }
+
+    private boolean stationClueCurrent(PersonalStation clue) {
+        return tick - clue.tick < STATION_RECALL_TICKS && now - clue.time < STATION_RECALL_NS
+            && player.getPos().squaredDistanceTo(clue.stance) <= STATION_RECALL_STANCE_SQUARED
+            && sameStation(clue.face);
+    }
+
+    private BlockHitResult visibleStation(Block block) {
+        return visibleStation(block, null);
+    }
+
+    private BlockHitResult visibleStation(Block block, BlockPos exact) {
+        var clue = personalStation(block);
+        if (clue != null && clue.attempted && (exact == null || exact.equals(clue.face.hit.getBlockPos()))) {
+            var live = body.macroMineWitness(clue.face.hit, reach());
+            if (live != null) return live;
+        }
+        return body.find(state -> state.isOf(block), reach(),
+            exact == null ? null : hit -> exact.equals(hit.getBlockPos())).orElse(null);
+    }
+
+    private boolean stationRecallReady(PersonalStation clue) {
+        if (clue == null || clue.attempted || !stationClueCurrent(clue) || !settled() || !useAvailable()
+                || !body.keysNeutral()) return false;
+        double reach = reach();
+        return player.getEyePos().squaredDistanceTo(clue.face.hit.getPos()) <= reach * reach;
+    }
+
+    private boolean startStationRecall(PersonalStation clue) {
+        if (!stationRecallReady(clue)) return false;
+        clue.attempted = true;
+        startWorkStep(Verb.STATION_REACQUIRE, "Reacquire recent " + blockName(clue.face), clue.face, null, null, null);
+        return true;
+    }
+
+    private void advanceStationRecall() {
+        Face remembered = action.offer.face;
+        if (!cursorClear() || !body.keysNeutral() || !settled() || !useAvailable()
+                || action.position.squaredDistanceTo(player.getPos()) > 0.0144
+                || personalStation(remembered.state.getBlock()) == null || !sameStation(remembered)) {
+            interrupt("The recent workstation clue or stationary stance was lost; nothing was used.", true);
+            return;
+        }
+        if (!body.hasRecentView()) return;
+        long frame = body.renderedFrame();
+        if (frame > action.startingFrame && body.renderedAim(remembered.hit.getPos(), 4)) {
+            if (body.macroMineWitness(remembered.hit, reach()) != null) {
+                complete("A fresh first-person view confirmed " + blockName(remembered)
+                    + " in reach; no screen, item use or movement was authorized.");
+                return;
+            }
+            if (action.lastMissingFrame != frame) {
+                action.lastMissingFrame = frame;
+                if (++action.missingFaceFrames >= 3) {
+                    interrupt("The aimed first-person view could not re-witness the recent workstation face.", true);
+                    return;
+                }
+            }
+        }
+        body.turnScan(action.camera.yaw, action.camera.pitch);
+    }
+
     private boolean ingredients(Recipe recipe) {
         return hands.count(recipe.material) >= recipe.amount && (recipe.sticks == 0 || hands.count(STICK) >= recipe.sticks);
     }
@@ -3256,6 +3444,8 @@ final class AgentMacroControl {
         if (!trial) addDryRouteOffer(offers, progress);
         var player = client.player;
         float pitch = player.getPitch();
+        addStationOffer(offers, Blocks.CRAFTING_TABLE);
+        addStationOffer(offers, Blocks.FURNACE);
         if (!repeatedSourceView()) {
             survey(offers, "footing", surveyYaw, 42, "Survey the nearby ground", "A fixed downward camera angle from the current stance.");
             survey(offers, "left", surveyYaw - 55, 31, "Survey left from this stance", "A bounded first-person turn over nearby terrain.");
@@ -3282,17 +3472,6 @@ final class AgentMacroControl {
                 offer(offers, new Key(Verb.COLLECT, floor, drop.getId(), null), "Collect visible " + Registries.ITEM.getId(item),
                     "A rendered drop is on this adjacent dry tile; the matching item fits in inventory.",
                     0, pitch, witness, null, drop, item, null);
-            }
-        }
-        var station = body.find(AgentMacroControl::station, reach()).orElse(null);
-        if (station != null) {
-            Face face = face(station);
-            inspect(offers, face);
-            if (useAvailable() && visibleFace(face)) {
-                offer(offers, faceKey(Verb.INTERACT, face, null),
-                    "Open visible " + blockName(face), "A lit workstation face is inside vanilla use reach.",
-                    0, pitch, null, face, null, null, null);
-                if (face.state.isOf(Blocks.CRAFTING_TABLE)) for (Recipe recipe : BENCH_RECIPES) craftOffer(offers, recipe, face);
             }
         }
         var resource = body.find(AgentMacroControl::resource, reach(),
@@ -3326,6 +3505,28 @@ final class AgentMacroControl {
             craftOffer(offers, BENCH, null);
         }
         return offers;
+    }
+
+    private void addStationOffer(List<Offer> offers, Block block) {
+        BlockHitResult seen = visibleStation(block);
+        if (seen != null) {
+            Face face = face(seen);
+            inspect(offers, face);
+            if (useAvailable() && visibleFace(face)) {
+                offer(offers, faceKey(Verb.INTERACT, face, null),
+                    "Open visible " + blockName(face), "A lit workstation face is inside vanilla use reach.",
+                    0, 0, null, face, null, null, null);
+                if (block == Blocks.CRAFTING_TABLE) for (Recipe recipe : BENCH_RECIPES) craftOffer(offers, recipe, face);
+            }
+        } else {
+            var clue = personalStation(block);
+            if (!stationRecallReady(clue)) return;
+            var key = new Key(Verb.STATION_REACQUIRE, clue.face.hit.getBlockPos(), clue.sequence, null);
+            offer(offers, key, "Reacquire recent " + blockName(clue.face),
+                "Turn in place once toward a workstation face from a recent confirmed placement or use. "
+                + "The camera must confirm the face again; no contact or spending is authorized.",
+                0, 0, null, clue.face, null, null, null);
+        }
     }
 
     private boolean repeatedSourceView() {
@@ -3665,6 +3866,12 @@ final class AgentMacroControl {
             result = "interrupted";
             detail = pickup;
         }
+        Verb verb = action.offer.key.verb;
+        if (!result.equals("completed") && action.offer.face != null
+                && (verb == Verb.STATION_REACQUIRE || verb == Verb.INTERACT || verb == Verb.CONTINUE || verb == Verb.WORK_SMELT)) {
+            Face face = action.offer.face;
+            forgetStationAt(personalStation(face.state.getBlock()), face.hit.getBlockPos());
+        }
         if ((action.offer.key.verb == Verb.SURVEY || action.offer.key.verb == Verb.INSPECT)
                 && retiredViews.size() < 256) retiredViews.add(action.offer.key);
         if (result.equals("completed") && action.offer.key.verb == Verb.APPROACH && (action.durable || repeatedSourceView())) {
@@ -3683,7 +3890,7 @@ final class AgentMacroControl {
                         retireWork("blocked", "interrupted", detail);
                     }
                 }
-                if (action.offer.face != null) {
+                if (action.offer.face != null && verb != Verb.STATION_REACQUIRE) {
                     BlockPos refused = action.offer.face.hit.getBlockPos();
                     if (action.offer.key.verb == Verb.WORK_PLACE) refused = refused.up();
                     work.rejected.add(refused);
@@ -3730,6 +3937,7 @@ final class AgentMacroControl {
             case DRY_SURVEY -> "The stationary dry-edge survey expired before it could report its rendered evidence.";
             case CONTINUE -> "The trusted recipe did not produce a matching vanilla crafting receipt before expiry.";
             case SURVEY, INSPECT -> "The camera did not render the intended pose before expiry.";
+            case STATION_REACQUIRE -> "The camera did not re-witness the exact recent workstation face before expiry.";
             case WORK_WALK -> "The route did not reach its witnessed target before expiry.";
             case WORK_TREAD -> "The surface stair did not settle on its exact proved support before expiry.";
             case WORK_EQUIP -> "The work equipment did not settle before expiry.";

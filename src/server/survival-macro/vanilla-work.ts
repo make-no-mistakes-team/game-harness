@@ -364,12 +364,17 @@ export function preflightVanillaWork(
   const pickups: Stock = new Map();
   const targets = new Set<string>();
   let tableInReach = false;
+  let recentTable = false, recentFurnace = false;
   for (const { verb, risk, summary, evidence, material } of opportunities) {
     // The native interact offer only names a table when a usable face is in vanilla reach.
     if (verb === "interact" && risk === "guarded" && summary === `Open visible ${TABLE}`) tableInReach = true;
     if (verb === "continue" && risk === "guarded" && material?.subject.startsWith("recipe:") &&
         RECIPES.get(material.subject.slice(7))?.bench &&
         evidence.endsWith("; the table is in reach.")) tableInReach = true;
+    if (verb === "survey" && risk === "read") {
+      if (summary === `Reacquire recent ${TABLE}`) recentTable = true;
+      if (summary === `Reacquire recent ${FURNACE}`) recentFurnace = true;
+    }
     if (verb === "collect" && risk === "guarded" && material?.subject.startsWith("item:") && !targets.has(material.target)) {
       targets.add(material.target);
       change(pickups, material.subject.slice(5), 64); // The native offer does not include stack size.
@@ -392,9 +397,16 @@ export function preflightVanillaWork(
     if (placed.incomplete) {
       const diagnostic = placed.diagnostic;
       if (!diagnostic) return { kind: "unknown" };
-      const station = firstFurnace === undefined ? "table" : "furnace";
+      const tableEvidence = firstBench === undefined || tableWitnessed ? "" : firstBench === 0
+        ? " No crafting table is currently witnessed in reach."
+        : " Crafting-table access is not witnessed for the later stage.";
+      const clue = firstBench === 0 && !tableWitnessed && recentTable
+        ? " A recent table clue permits a camera check, not access." : "";
+      const furnaceClue = firstFurnace === 0 && recentFurnace
+        ? " A recent furnace clue permits a camera check, not access or a cold, empty furnace." : "";
       return { kind: "unknown", stageIndex: diagnostic.stageIndex,
-        detail: `Stage ${diagnostic.stageIndex + 1} with new ${station} placement ${diagnostic.detail}. A live usable ${station} could avoid that cost.` };
+        detail: `Stage ${diagnostic.stageIndex + 1} on the new-station placement path ${diagnostic.detail}.` +
+          tableEvidence + " A usable station in the world could avoid its placement cost." + clue + furnaceClue };
     }
     if (placed.path.prospective) return { kind: "unknown" };
   }

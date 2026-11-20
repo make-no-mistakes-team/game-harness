@@ -2179,6 +2179,10 @@ final class AgentBody {
     }
 
     BlockHitResult stationFace(BlockPos rejected, Predicate<BlockPos> usableSite) {
+        return stationFace(rejected, usableSite, false);
+    }
+
+    BlockHitResult stationFace(BlockPos rejected, Predicate<BlockPos> usableSite, boolean topOnly) {
         if (!hasView()) return null;
         if (sampleCount == 0) sampleView(4.25);
         BlockHitResult best = null;
@@ -2186,7 +2190,7 @@ final class AgentBody {
         var player = client.player;
         for (int i = -1; i < sampleCount; i++) {
             var hit = i < 0 ? selectedFace() : samples[i];
-            if (hit == null || hit.getSide() == Direction.DOWN) continue;
+            if (hit == null || (topOnly ? hit.getSide() != Direction.UP : hit.getSide() == Direction.DOWN)) continue;
             var dest = hit.getBlockPos().offset(hit.getSide());
             int dy = dest.getY() - player.getBlockY();
             if (dy < -1 || dy > 1 || dest.equals(rejected) || player.getBoundingBox().intersects(new Box(dest))) continue;

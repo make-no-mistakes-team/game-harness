@@ -82,6 +82,13 @@ the smelted units; the furnace batch uses that budget before collection.
 The player reports loading, burning, and collection separately. Only the
 matching completion receipt and live ingot stock establish the result.
 
+For one raw iron, the player can stay at the furnace screen and wait for
+the ingot. For a larger batch in its own workshop, it can close the screen
+after ignition, check its surroundings, and reopen the same furnace to
+collect the output. The distinction is the number of items actually loaded,
+not how many are left when the player next looks. A threat can interrupt
+either case.
+
 Once the furnace confirms loading and the cook bar advances, Terra can use
 one request to plan the next job while the batch cooks. The proposal names
 the batch in `afterWorkId`. It cannot replace, renew, or reload the batch.

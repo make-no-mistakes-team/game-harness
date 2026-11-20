@@ -53,10 +53,13 @@ import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.registry.tag.BlockTags;
+import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -76,6 +79,9 @@ final class AgentMacroControl {
     private static final long PERSONAL_HANDOFF_NS = 600_000_000L;
     private static final int FURNACE_CLICK_MARGIN = 120;
     private static final int FURNACE_SYNC_TICKS = 24;
+    private static final int FURNACE_CUE_TICKS = 36;
+    private static final int FURNACE_REACQUIRE_LEAD_TICKS = 28;
+    private static final int FURNACE_REACQUIRE_TICKS = 64;
     private static final int WORKSHOP_SCAN_TICKS = 36;
     private static final int WORKSHOP_AIM_TICKS = 16;
     private static final int WORKSHOP_SUPPORTS = 8;
@@ -282,15 +288,24 @@ final class AgentMacroControl {
         }
     }
 
-    private enum FurnacePhase { LOADING, LOADED, BURNING, COLLECTING, RETURNING }
+    private enum FurnacePhase { LOADING, LOADED, BURNING, WATCHING, REOPENING, COLLECTING, RETURNING }
+    private enum FurnaceCue { WORKBENCH, WATER, DRY_FOOTHOLD, MATERIAL }
+    private record FurnaceLook(FurnaceCue kind, BlockHitResult hit) {}
+    private record FurnaceFact(FurnaceLook look, Vec3d stance, long tick, String detail, boolean rechecked) {}
 
     private static final class FurnaceWork {
         final BlockPos footing;
         FurnacePhase phase;
         AgentHands.IronBatch batch;
         long openedTick, outputWitness, advancedTick, burnTick, storedTick;
-        int rawBefore, fuelBefore, ingotsBefore, output, fuelRemaining, returnedStock;
+        long closedFrame, watchFrame, cueFromFrame, cueUntil, reacquireUntil;
+        int output, fuelRemaining, returnedStock, syncId, binding;
         float progress;
+        boolean contactEntered, contactObserved, turningBack;
+        BlockHitResult contact;
+        FurnaceLook cue, scene;
+        AgentFurnaceWatch.Stock before, paid;
+        AgentFurnaceWatch watch;
 
         FurnaceWork(BlockPos footing) { this.footing = footing; }
     }
@@ -335,6 +350,8 @@ final class AgentMacroControl {
         String lastEffect;
         BlockPos placedFurnace;
         boolean collectedIron;
+        BlockPos ironSceneFooting;
+        FurnaceLook ironScene;
         Offer waterClue;
         IronWorkshop ironWorkshop;
         String sourceBlock;
@@ -479,6 +496,7 @@ final class AgentMacroControl {
     private final Set<BlockPos> localSteps = new HashSet<>();
     private final LinkedHashMap<BlockPos, TimberSight> timberSights = new LinkedHashMap<>();
     private final ArrayDeque<String> recent = new ArrayDeque<>(8);
+    private FurnaceFact furnaceFact;
     private final Predicate<ItemStack> safetySpend = this::canSpendSafetyStock;
     private List<Offer> reservedOffers = List.of();
     private static final Offer[] NO_ANCHORS = {};
@@ -565,6 +583,7 @@ final class AgentMacroControl {
             timberSights.clear();
             timberHarvest = null;
             personalTable = personalFurnace = null;
+            furnaceFact = null;
             stationPlacement = null;
             timberFrame = -1;
             surfaceSearch = new SourceSearch();
@@ -2431,7 +2450,7 @@ final class AgentMacroControl {
             action.opened = client.currentScreen;
             personalCraft = null; // The new Hands job takes over this exact screen below.
         }
-        status = action.offer.summary;
+        status = verb == Verb.WORK_SMELT && action.furnace.phase != null ? work.detail : action.offer.summary;
         if (tick - action.started > verb.maxTicks) {
             interrupt(timeoutDetail(), true);
         } else if (!hazardClear || !client.isWindowFocused() || client.getOverlay() != null
@@ -3262,9 +3281,15 @@ final class AgentMacroControl {
             searchWork("The vanilla use key is unbound; a furnace cannot be opened or placed.");
             return false;
         }
-        if (hands.quoteIron(work.budget, Math.min(needed, ironTimeLimit())) == null) {
+        var quote = hands.quoteIron(work.budget, Math.min(needed, ironTimeLimit()));
+        if (quote == null) {
             searchWork(ironSupplyShortfall());
             return false;
+        }
+        if (AgentFurnaceWatch.required(quote) && !footing.equals(work.ironSceneFooting)) {
+            // Retain the actual approach view before placement or contact turns toward the workshop.
+            work.ironSceneFooting = footing;
+            work.ironScene = furnaceScene(footing);
         }
         var witnessed = body.find(state -> state.isOf(Blocks.FURNACE) && !state.get(AbstractFurnaceBlock.LIT), reach(),
             hit -> hit.getBlockPos().equals(work.placedFurnace) && hit.getBlockPos().getY() >= player.getBlockY()).orElse(null);
@@ -3346,29 +3371,62 @@ final class AgentMacroControl {
         BlockState state = world.getBlockState(pos);
         if (!ironFooting(iron.footing) || horizontalSquared(action.position, player.getPos()) > 0.04
                 || player.getEyePos().squaredDistanceTo(target.hit.getPos()) > reach() * reach()
-                || !state.isOf(Blocks.FURNACE)
-                || state.get(AbstractFurnaceBlock.FACING) != target.state.get(AbstractFurnaceBlock.FACING)) {
-            interrupt("The exact furnace reach or stable stationary dry footing was lost.", true);
+                || client.getCameraEntity() != player || !client.options.getPerspective().isFirstPerson()) {
+            interrupt("The furnace work lost its exact reach, first-person view or stationary dry footing.", true);
             return;
         }
+        if (!state.isOf(Blocks.FURNACE)
+                || state.get(AbstractFurnaceBlock.FACING) != target.state.get(AbstractFurnaceBlock.FACING)) {
+            interrupt("The exact furnace block or facing changed.", true);
+            return;
+        }
+        if (iron.phase != null && action.craftJob != hands.jobGeneration()) {
+            interrupt("The authorized furnace hand job was replaced.", true);
+            return;
+        }
+        if (iron.watch != null) {
+            String lost = iron.watch.accessProblem(pos, state.get(AbstractFurnaceBlock.FACING),
+                AgentClient.ownsSinglePlayerFurnaceWorld(client, player));
+            if (lost != null) {
+                interrupt(lost, true);
+                return;
+            }
+        }
+        if (iron.phase == FurnacePhase.WATCHING) {
+            advanceFurnaceWatch(iron, target);
+            return;
+        }
+        boolean reopening = iron.phase == FurnacePhase.REOPENING;
         Screen screen = client.currentScreen;
         if (action.opened == null) {
             if (screen == null) {
                 if (action.fired) {
-                    if (tick - action.firedAt > FURNACE_SYNC_TICKS)
-                        interrupt("Vanilla did not open the witnessed furnace.", true);
+                    if (tick > action.firedAt && !iron.contactObserved)
+                        interrupt("The queued vanilla use did not confirm contact with the exact furnace face.", true);
+                    else if (tick - action.firedAt > FURNACE_SYNC_TICKS)
+                        interrupt(reopening ? "Vanilla did not reopen the exact witnessed furnace."
+                            : "Vanilla did not open the witnessed furnace.", true);
+                } else if (reopening) {
+                    if (tick >= iron.reacquireUntil) {
+                        interrupt("No fresh first-person contact could reacquire the exact furnace in time.", true);
+                    } else if (body.renderedFrame() > iron.closedFrame && body.hasRecentView()) {
+                        if (!cursorClear() || player.currentScreenHandler != player.playerScreenHandler) {
+                            interrupt("The clean personal cursor or handler changed before furnace reacquisition.", false);
+                        } else {
+                            BlockHitResult live = body.macroMineWitness(target.hit, reach());
+                            if (live != null && useAvailable()) contactFurnace(iron, live);
+                            else body.aim(target.hit.getPos());
+                        }
+                    }
                 } else if (body.hasRecentView()) {
                     if (!cursorClear() || !visible(target) || state.get(AbstractFurnaceBlock.LIT))
                         interrupt("The witnessed furnace face or its cold clean entry premise changed.", true);
-                    else if (useAvailable() && body.useContact(target.hit, AgentBody.Contact.INTERACT)) {
-                        action.fired = true;
-                        action.firedAt = tick;
-                    }
+                    else if (useAvailable()) contactFurnace(iron, target.hit);
                 }
                 return;
             }
-            if (!action.fired || !(screen instanceof FurnaceScreen)) {
-                interrupt("A furnace screen did not open from the authorized vanilla contact.", false);
+            if (!action.fired || !iron.contactObserved || !(screen instanceof FurnaceScreen)) {
+                interrupt("The screen was not opened by the authorized vanilla contact with this furnace.", false);
                 return;
             }
             action.opened = screen;
@@ -3388,6 +3446,23 @@ final class AgentMacroControl {
         }
         ItemStack raw = handler.getSlot(0).getStack(), fuel = handler.getSlot(1).getStack();
         ItemStack output = handler.getOutputSlot().getStack();
+        if (reopening) {
+            String mismatch = iron.watch.reopenProblem(handler.syncId, sync.agent$furnaceContentsSynced(),
+                sync.agent$furnaceOutputUpdates(), count(Items.RAW_IRON), count(iron.batch.fuel()), count(Items.IRON_INGOT),
+                raw, fuel, output);
+            if (mismatch != null || !cursorClear()) {
+                interrupt(mismatch != null ? mismatch : "The newly synchronized furnace cursor was not clear.", true);
+                return;
+            }
+            // The initial vanilla full sync here witnesses this handler's output, not a stale
+            // per-handler update counter or the cook timer. The old handler is no longer read.
+            iron.syncId = handler.syncId;
+            iron.outputWitness = 0;
+            iron.advancedTick = tick;
+            iron.phase = FurnacePhase.BURNING;
+            ironMilestone("reopened", "Reopened the exact watched furnace with a fresh vanilla slot sync: "
+                + raw.getCount() + " raw iron, " + fuel.getCount() + " fuel and " + output.getCount() + " ingots.");
+        }
         if (iron.phase == null) {
             if (!cursorClear() || !raw.isEmpty() || !fuel.isEmpty() || !output.isEmpty()
                     || handler.isBurning() || state.get(AbstractFurnaceBlock.LIT)) {
@@ -3407,8 +3482,9 @@ final class AgentMacroControl {
                 interrupt(ironSupplyShortfall(), true);
                 return;
             }
-            iron.rawBefore = count(Items.RAW_IRON);
-            iron.fuelBefore = count(batch.fuel());
+            iron.before = ironStock(batch);
+            iron.syncId = handler.syncId;
+            iron.binding = stationSequence;
             iron.outputWitness = sync.agent$furnaceOutputUpdates();
             if (!hands.loadWorkIron(furnace, batch, work.budget)) {
                 interrupt(hands.status(), true);
@@ -3419,10 +3495,6 @@ final class AgentMacroControl {
             action.craftJob = hands.jobGeneration();
             iron.phase = FurnacePhase.LOADING;
             ironStatus("Loading bounded raw iron and " + Registries.ITEM.getId(batch.fuel()) + " through vanilla slot clicks.");
-            return;
-        }
-        if (action.craftJob != hands.jobGeneration()) {
-            interrupt("The authorized furnace hand job was replaced.", true);
             return;
         }
         if (hands.busy()) {
@@ -3440,7 +3512,7 @@ final class AgentMacroControl {
         }
         if (iron.phase == FurnacePhase.COLLECTING) {
             if (!hands.status().equals("smelt: done") || !cursorClear() || !raw.isEmpty() || !fuel.isEmpty()
-                    || !output.isEmpty() || count(Items.IRON_INGOT) != iron.ingotsBefore + batch.units()) {
+                    || !output.isEmpty() || !ironStock(batch).collectedFrom(iron.paid, batch)) {
                 interrupt("The authorized result was not observed stored as exact vanilla inventory stock.", true);
                 return;
             }
@@ -3452,25 +3524,23 @@ final class AgentMacroControl {
             ironMilestone("collected", "Collected " + batch.units() + " furnace-produced iron ingot(s); actual inventory has "
                 + count(Items.IRON_INGOT) + ".");
             furnace.close();
+            body.pauseWork();
             continuityWork = AgentPauseEpisodes.Work.GUI;
             complete(work.lastEffect);
             return;
         }
-        if (!cursorClear() || !raw.isEmpty() && !raw.isOf(Items.RAW_IRON)
-                || !fuel.isEmpty() && !fuel.isOf(batch.fuel()) || !output.isEmpty() && !output.isOf(Items.IRON_INGOT)
-                || raw.getCount() + output.getCount() != batch.units() || output.getCount() < iron.output
-                || fuel.getCount() > iron.fuelRemaining) {
+        if (!cursorClear() || !AgentFurnaceWatch.matches(batch, iron.output, iron.fuelRemaining, raw, fuel, output)) {
             interrupt("The current furnace slots no longer attest only this work's paid inputs and output.", true);
             return;
         }
         iron.fuelRemaining = fuel.getCount();
         if (iron.phase == FurnacePhase.LOADING) {
-            if (!hands.status().equals("smelt: done")
-                    || count(Items.RAW_IRON) != iron.rawBefore - batch.units()
-                    || count(batch.fuel()) != iron.fuelBefore - batch.fuelCount()) {
+            var paid = ironStock(batch);
+            if (!hands.status().equals("smelt: done") || !paid.paidFrom(iron.before, batch)) {
                 interrupt("The raw iron and exact fuel did not settle after their bounded slot clicks.", true);
                 return;
             }
+            iron.paid = paid;
             iron.phase = FurnacePhase.LOADED;
             iron.advancedTick = tick;
             iron.progress = handler.getCookProgress();
@@ -3480,26 +3550,36 @@ final class AgentMacroControl {
         }
         float cooking = handler.getCookProgress();
         boolean advanced = handler.isBurning() && cooking > iron.progress;
-        if (advanced && iron.burnTick == 0) iron.burnTick = tick;
         boolean produced = output.getCount() > iron.output && sync.agent$furnaceOutputUpdates() > iron.outputWitness;
         if (advanced || produced) {
             iron.advancedTick = tick;
-            if (iron.phase == FurnacePhase.LOADED) {
-                iron.phase = FurnacePhase.BURNING;
-                ironMilestone("burning", "Vanilla furnace cooking advanced; waiting for the paid batch, not inventory credit.");
-            }
+        }
+        if (iron.phase == FurnacePhase.LOADED && advanced && state.get(AbstractFurnaceBlock.LIT)) {
+            iron.phase = FurnacePhase.BURNING;
+            iron.burnTick = tick;
+            ironMilestone("burning", AgentFurnaceWatch.required(batch)
+                ? "Vanilla confirmed the paid multi-unit batch is burning; preparing to watch a nearby cue from the dry stance."
+                : "Vanilla confirmed the paid single-unit batch is burning; waiting on this screen for its exact result.");
         }
         iron.progress = cooking;
         iron.output = output.getCount();
+        if (iron.phase == FurnacePhase.BURNING && iron.watch == null && AgentFurnaceWatch.required(batch)
+                && handler.isBurning() && state.get(AbstractFurnaceBlock.LIT) && output.getCount() < batch.units()) {
+            startFurnaceWatch(iron, furnace, target);
+            return;
+        }
         if (iron.phase == FurnacePhase.BURNING && output.getCount() == batch.units()
                 && sync.agent$furnaceOutputUpdates() > iron.outputWitness) {
+            if ((AgentFurnaceWatch.required(batch) && iron.watch == null) || !ironStock(batch).equals(iron.paid)) {
+                interrupt("The paid furnace access or carried stock was not conserved before collection.", true);
+                return;
+            }
             if (!hands.collectWorkIron(furnace, batch.units(), iron.outputWitness)) {
                 interrupt(hands.status(), true);
                 return;
             }
             iron.phase = FurnacePhase.COLLECTING;
             action.craftJob = hands.jobGeneration();
-            iron.ingotsBefore = count(Items.IRON_INGOT);
             ironMilestone("collecting", "Vanilla produced " + batch.units() + " iron ingot(s) in the owned furnace; collecting by slot clicks.");
         } else if (tick - iron.advancedTick > FURNACE_SYNC_TICKS) {
             if (!raw.isEmpty() && !handler.isBurning() && hands.returnWorkIron(furnace, raw.getCount())) {
@@ -3516,6 +3596,255 @@ final class AgentMacroControl {
         }
     }
 
+    private void contactFurnace(FurnaceWork iron, BlockHitResult hit) {
+        if (body.useContact(hit, AgentBody.Contact.INTERACT)) {
+            iron.contact = hit;
+            action.fired = true;
+            action.firedAt = tick;
+        }
+    }
+
+    boolean allowScopedFurnaceUse() {
+        var iron = action == null ? null : action.furnace;
+        if (iron == null || !action.fired || action.opened != null) return true;
+        if (action.firedAt != tick || iron.contactEntered) return false;
+        iron.contactEntered = true;
+        return client.player == player && client.world == world && client.currentScreen == null
+            && client.crosshairTarget instanceof BlockHitResult hit && sameFurnaceContact(iron, hit)
+            && sameStation(action.offer.face) && work != null && work.active() && input.active && !urgent
+            && System.nanoTime() < work.deadline && ironFooting(iron.footing) && cursorClear() && useAvailable()
+            && (iron.watch == null || iron.watch.accessProblem(hit.getBlockPos(),
+                action.offer.face.state.get(AbstractFurnaceBlock.FACING),
+                AgentClient.ownsSinglePlayerFurnaceWorld(client, player)) == null);
+    }
+
+    void confirmScopedFurnaceUse(ClientPlayerEntity actor, BlockHitResult hit) {
+        var iron = action == null ? null : action.furnace;
+        if (iron != null && actor == player && action.fired && action.firedAt == tick
+                && iron.contactEntered && sameFurnaceContact(iron, hit))
+            iron.contactObserved = true;
+    }
+
+    void clearUnconsumedFurnaceUse() {
+        var iron = action == null ? null : action.furnace;
+        if (iron != null && action.fired && action.firedAt == tick && !iron.contactEntered) {
+            iron.contactEntered = true;
+            client.options.useKey.wasPressed();
+        }
+    }
+
+    private static boolean sameFurnaceContact(FurnaceWork iron, BlockHitResult hit) {
+        return iron.contact != null && hit.getType() == HitResult.Type.BLOCK
+            && iron.contact.getBlockPos().equals(hit.getBlockPos()) && iron.contact.getSide() == hit.getSide();
+    }
+
+    void observeFurnaceBlock(ClientWorld updatedWorld, BlockPos pos, BlockState state) {
+        var watch = action == null || action.furnace == null ? null : action.furnace.watch;
+        if (watch != null && world == updatedWorld && watch.pos.equals(pos)
+                && (!state.isOf(Blocks.FURNACE) || state.get(AbstractFurnaceBlock.FACING) != watch.facing))
+            watch.invalidate();
+    }
+
+    void observeFurnaceChunk(ClientWorld updatedWorld, ChunkPos chunk) {
+        var watch = action == null || action.furnace == null ? null : action.furnace.watch;
+        if (watch != null && world == updatedWorld && chunk.x == (watch.pos.getX() >> 4) && chunk.z == (watch.pos.getZ() >> 4))
+            watch.invalidate();
+    }
+
+    private AgentFurnaceWatch.Stock ironStock(AgentHands.IronBatch batch) {
+        return new AgentFurnaceWatch.Stock(count(Items.RAW_IRON), count(batch.fuel()), count(Items.IRON_INGOT));
+    }
+
+    private void startFurnaceWatch(FurnaceWork iron, FurnaceScreen furnace, Face target) {
+        if (!AgentClient.ownsSinglePlayerFurnaceWorld(client, player)) {
+            interrupt("Cannot leave the paid furnace: this connection and visible roster do not prove actor-only access.", true);
+            return;
+        }
+        if (!ironStock(iron.batch).equals(iron.paid) || !hands.closeWorkFurnaceWithEscape(furnace)) {
+            interrupt("The paid stock, clean hand releases or vanilla Escape close did not settle; no watch began.", true);
+            return;
+        }
+        iron.watch = new AgentFurnaceWatch(target.hit.getBlockPos(), target.state.get(AbstractFurnaceBlock.FACING),
+            iron.syncId, iron.paid, iron.batch, iron.output, iron.fuelRemaining, iron.progress, tick, now);
+        iron.closedFrame = body.renderedFrame();
+        iron.cueUntil = tick + FURNACE_CUE_TICKS;
+        iron.phase = FurnacePhase.WATCHING;
+        action.opened = null;
+        action.fired = iron.contactEntered = iron.contactObserved = false;
+        iron.contact = null;
+        ironStatus("Closed the clean furnace with vanilla Escape; remaining on the exact dry stance.");
+    }
+
+    private void advanceFurnaceWatch(FurnaceWork iron, Face target) {
+        if (client.currentScreen != null || player.currentScreenHandler != player.playerScreenHandler || !cursorClear()
+                || !body.keysNeutral() || hands.busy()) {
+            interrupt("A screen, cursor or other input owner interrupted the closed furnace watch.", false);
+            return;
+        }
+        continuityWork = AgentPauseEpisodes.Work.MECHANICAL_WAIT;
+        long frame = body.renderedFrame();
+        if (frame <= iron.closedFrame || !body.hasRecentView()) {
+            if (tick > iron.cueUntil && iron.watchFrame == 0)
+                interrupt("No fresh rendered in-world view confirmed the vanilla Escape close.", true);
+            return;
+        }
+        if (iron.watchFrame == 0) {
+            iron.watchFrame = frame;
+            ironMilestone("watch_closed", "Vanilla Escape closed the clean paid furnace; a fresh first-person view confirms the stationary dry stance.");
+            startFurnaceSurvey(iron);
+        }
+        if (iron.watch.elapsed(tick, now)) {
+            iron.phase = FurnacePhase.REOPENING;
+            iron.reacquireUntil = tick + FURNACE_REACQUIRE_TICKS;
+            ironStatus("The paid batch's vanilla cook time elapsed; re-witnessing the same furnace, not assuming output.");
+        } else if (iron.watch.remainingTicks(tick) <= FURNACE_REACQUIRE_LEAD_TICKS) {
+            if (!iron.turningBack) {
+                iron.turningBack = true;
+                ironStatus("Turning back toward the exact furnace while the paid cook time finishes.");
+            }
+            body.aim(target.hit.getPos());
+        } else if (iron.cue != null) {
+            if (tick <= iron.cueUntil) observeFurnaceCue(iron);
+            else if (iron.cue.kind == FurnaceCue.WORKBENCH) aimFurnaceCue(iron, iron.scene);
+            else {
+                iron.cue = null;
+                body.pauseWork();
+                ironStatus("The earlier cave cue could not be confirmed; waiting without movement on the original dry stance.");
+            }
+        }
+    }
+
+    private void startFurnaceSurvey(FurnaceWork iron) {
+        iron.scene = iron.footing.equals(work.ironSceneFooting) ? work.ironScene : null;
+        if (iron.scene == null) iron.scene = furnaceScene(iron.footing);
+        if (iron.scene == null) {
+            ironStatus("No distinct cave cue was witnessed; waiting on the original dry stance without turning to a known bench.");
+            return;
+        }
+        var table = visibleStation(Blocks.CRAFTING_TABLE);
+        if (table == null && personalTable != null && stationClueCurrent(personalTable)
+                && player.getEyePos().squaredDistanceTo(personalTable.face.hit.getPos()) <= reach() * reach())
+            table = personalTable.face.hit;
+        aimFurnaceCue(iron, table == null ? iron.scene : new FurnaceLook(FurnaceCue.WORKBENCH, table));
+    }
+
+    /** Select from the current frustum only. Choosing a cue never turns the camera or finds a hidden destination. */
+    private FurnaceLook furnaceScene(BlockPos footing) {
+        var water = body.visibleFluid(false, false, AgentHazards.SIGHT_RANGE);
+        if (water != null) return new FurnaceLook(FurnaceCue.WATER, water);
+        var floor = watchedDryFoothold(footing);
+        if (floor != null) return new FurnaceLook(FurnaceCue.DRY_FOOTHOLD, floor);
+        var ore = body.find(state -> state.isIn(BlockTags.DIAMOND_ORES) || state.isIn(BlockTags.IRON_ORES)
+            || state.isIn(BlockTags.COAL_ORES), reach(), hit -> !hit.getBlockPos().equals(footing)).orElse(null);
+        return ore == null ? null : new FurnaceLook(FurnaceCue.MATERIAL, ore);
+    }
+
+    private BlockHitResult watchedDryFoothold(BlockPos footing) {
+        for (Direction direction : CARDINAL) {
+            BlockPos next = footing.offset(direction);
+            BlockHitResult floor = body.macroFloor(next);
+            if (floor != null && watchedDryLane(next)) return floor;
+        }
+        return null;
+    }
+
+    private boolean watchedDryLane(BlockPos pos) {
+        Vec3d landing = Vec3d.ofBottomCenter(pos.up());
+        return body.macroFlatLane(pos, world.getBlockState(pos), landing) && body.macroNoVisiblePickup(landing);
+    }
+
+    private void aimFurnaceCue(FurnaceWork iron, FurnaceLook cue) {
+        iron.cue = cue;
+        iron.cueFromFrame = body.renderedFrame();
+        iron.cueUntil = tick + FURNACE_CUE_TICKS;
+        ironStatus(switch (cue.kind) {
+            case WORKBENCH -> "Rechecking the nearby table for a possible next recipe while the paid batch cooks.";
+            case WATER -> "Checking the witnessed cave water for a bucket source and watching the dry boundary.";
+            case DRY_FOOTHOLD -> "Checking a witnessed cave-side foothold and its dry approach.";
+            case MATERIAL -> "Checking a witnessed ore face in reach without using the pickaxe.";
+        });
+        body.aim(cue.hit.getPos());
+    }
+
+    private String furnaceCueFact(FurnaceLook cue) {
+        BlockPos pos = cue.hit.getBlockPos();
+        return switch (cue.kind) {
+            case WORKBENCH -> {
+                var table = body.macroMineWitness(cue.hit, reach());
+                if (table == null || !world.getBlockState(pos).isOf(Blocks.CRAFTING_TABLE)) yield null;
+                rememberStation(face(table));
+                yield "Re-witnessed the crafting table in reach for a possible next recipe; no item or movement used.";
+            }
+            case WATER -> {
+                var water = body.terrain(cue.hit.getPos(), AgentHazards.SIGHT_RANGE).orElse(null);
+                if (water == null || !water.getBlockPos().equals(pos))
+                    water = body.visibleFluid(false, false, AgentHazards.SIGHT_RANGE);
+                if (water == null || !water.getBlockPos().equals(pos)
+                        || !world.getBlockState(pos).getFluidState().isIn(FluidTags.WATER)) yield null;
+                var shore = watchedDryFoothold(player.getBlockPos().down());
+                String route = shore == null ? "" : " A lit dry adjacent approach is "
+                    + bearing(shore.getPos(), player.getPos(), player.getYaw()) + " while facing the water.";
+                var source = body.visibleFluid(false, true, reach());
+                String fluid = source != null && body.waterFillWitness(source, reach())
+                    ? "A plain water source is visible in bucket reach from the dry furnace stance; no water taken."
+                    : AgentBody.exactWaterSource(world.getBlockState(pos))
+                        ? "The cave water source is visible, but a valid bucket contact was not confirmed from this dry stance."
+                        : "The nearby cave water is flowing; no fillable source was witnessed from the dry furnace stance.";
+                yield fluid + route;
+            }
+            case DRY_FOOTHOLD -> body.macroFloor(pos) != null && watchedDryLane(pos)
+                ? "The adjacent cave-side tile has a lit full top and a clear, dry approach without visible pickups; no move made." : null;
+            case MATERIAL -> {
+                var ore = body.macroMineWitness(cue.hit, reach());
+                if (ore == null || !resource(world.getBlockState(pos))) yield null;
+                yield blockName(face(ore)) + " is visible in reach from the original cave stance; it was not mined.";
+            }
+        };
+    }
+
+    private void observeFurnaceCue(FurnaceWork iron) {
+        FurnaceLook cue = iron.cue;
+        if (body.renderedFrame() <= iron.cueFromFrame || !body.renderedAim(cue.hit.getPos(), 9)) {
+            body.aim(cue.hit.getPos());
+            return;
+        }
+        String detail = furnaceCueFact(cue);
+        if (detail == null) {
+            body.aim(cue.hit.getPos());
+            return;
+        }
+        body.pauseWork();
+        continuityWork = AgentPauseEpisodes.Work.NOVELTY;
+        purposeful("Furnace watch: " + detail);
+        if (cue.kind == FurnaceCue.WORKBENCH) {
+            ironMilestone("watch_cue", detail);
+            aimFurnaceCue(iron, iron.scene);
+        } else {
+            furnaceFact = new FurnaceFact(cue, player.getPos(), tick, detail, false);
+            ironMilestone("watch_fact", detail);
+            iron.cue = null;
+            ironStatus("Keeping watch toward the witnessed cave cue from dry footing while the paid batch finishes.");
+        }
+    }
+
+    /** Keep the read-only clue across the cook and recipe receipts; ordinary offers still require live sight. */
+    private String retainedFurnaceFact() {
+        var fact = furnaceFact;
+        if (fact == null) return null;
+        if (tick - fact.tick >= AgentWorkOrder.MAX_TICKS + STATION_RECALL_TICKS
+                || horizontalSquared(fact.stance, player.getPos()) > 0.04
+                || Math.abs(fact.stance.y - player.getY()) > 0.06) {
+            furnaceFact = null;
+            return null;
+        }
+        if (!fact.rechecked && action == null && observableWorld() && body.renderedAim(fact.look.hit.getPos(), 18)) {
+            String current = furnaceCueFact(fact.look);
+            if (current != null) furnaceFact = fact = new FurnaceFact(fact.look, fact.stance, fact.tick, current, true);
+        }
+        return (fact.rechecked ? "Rechecked furnace-watch clue" : "Furnace watch from this stance")
+            + " (fresh view required before acting): " + fact.detail;
+    }
+
     private void ironStatus(String detail) {
         work.detail = status = detail;
         enact("smelt", detail);
@@ -3527,14 +3856,46 @@ final class AgentMacroControl {
             work.lastEffectTick = tick;
             work.lastEffect = detail;
         }
+        FurnaceWork iron = action.furnace;
         var value = header(run);
         value.addProperty("id", work.order.id());
         value.addProperty("life", life);
         value.addProperty("tick", tick);
         value.addProperty("milestone", milestone);
-        value.addProperty("syncId", ((FurnaceScreen) action.opened).getScreenHandler().syncId);
+        value.addProperty("furnaceBinding", iron.binding);
+        value.addProperty("syncId", iron.syncId);
+        value.addProperty("chargedUnits", iron.batch.units());
+        value.addProperty("chargedFuel", iron.batch.fuelCount());
+        value.addProperty("fuelItem", Registries.ITEM.getId(iron.batch.fuel()).toString());
+        value.addProperty("cookMode", AgentFurnaceWatch.required(iron.batch) ? "world_watch" : "gui_single_unit");
+        value.add("beforeStock", ironReceiptStock(iron.before));
+        value.add("carriedStock", ironReceiptStock(ironStock(iron.batch)));
+        if (iron.watch != null) {
+            value.addProperty("originalSyncId", iron.watch.syncId);
+            if (iron.watchFrame != 0) value.addProperty("worldFrame", iron.watchFrame);
+        }
+        if (milestone.equals("watch_cue") || milestone.equals("watch_fact")) {
+            value.addProperty("cue", iron.cue.kind.name().toLowerCase(java.util.Locale.ROOT));
+            value.addProperty("cueFrame", body.renderedFrame());
+        }
+        if (action.opened instanceof FurnaceScreen furnace) {
+            var handler = furnace.getScreenHandler();
+            value.addProperty("slotRevision", handler.getRevision());
+            value.addProperty("slotOutputUpdates", ((AgentFurnaceSync) handler).agent$furnaceOutputUpdates());
+            value.addProperty("slotRaw", handler.getSlot(0).getStack().getCount());
+            value.addProperty("slotFuel", handler.getSlot(1).getStack().getCount());
+            value.addProperty("slotOutput", handler.getOutputSlot().getStack().getCount());
+        }
         value.addProperty("detail", detail);
         ipc.evidence("furnace-" + work.order.id() + "-" + milestone + ".json", value.toString());
+    }
+
+    private static JsonObject ironReceiptStock(AgentFurnaceWatch.Stock stock) {
+        var value = new JsonObject();
+        value.addProperty("raw", stock.raw());
+        value.addProperty("fuel", stock.fuel());
+        value.addProperty("ingots", stock.ingots());
+        return value;
     }
 
     private void idle(AgentProgress progress, boolean thinking) {
@@ -4969,8 +5330,11 @@ final class AgentMacroControl {
         snapshots.put(tick, new Snapshot(epoch, witnessed.isEmpty() ? Map.of() : witnessed));
         while (!snapshots.isEmpty() && snapshots.firstEntry().getKey() < tick - MAX_AGE) snapshots.pollFirstEntry();
         value.add("opportunities", opportunities);
-        JsonArray history = new JsonArray(recent.size());
-        for (String event : recent) history.add(event);
+        String watched = retainedFurnaceFact();
+        JsonArray history = new JsonArray(Math.min(8, recent.size() + (watched == null ? 0 : 1)));
+        int skip = watched == null ? 0 : Math.max(0, recent.size() - 7);
+        for (String event : recent) if (skip-- <= 0) history.add(event);
+        if (watched != null) history.add(watched);
         value.add("recent", history);
         value.addProperty("quiescent", quiescent);
         ipc.observation.set(value.toString());
@@ -5021,13 +5385,18 @@ final class AgentMacroControl {
         }
         if (replan != null) evidence.addProperty("replan", replan);
         var iron = action == null ? null : action.furnace;
-        if (work.active() && iron != null && iron.burnTick != 0
-                && (iron.phase == FurnacePhase.BURNING || iron.phase == FurnacePhase.COLLECTING)) {
+        if (work.active() && iron != null && iron.burnTick != 0 && (iron.phase == FurnacePhase.BURNING
+                || iron.phase == FurnacePhase.WATCHING || iron.phase == FurnacePhase.REOPENING
+                || iron.phase == FurnacePhase.COLLECTING)) {
             var burn = new JsonObject();
             burn.addProperty("burnTick", iron.burnTick);
             burn.addProperty("units", iron.batch.units());
-            int remaining = iron.phase == FurnacePhase.COLLECTING ? 0 : Math.max(0,
-                (iron.batch.units() - iron.output) * AgentHands.SMELT_TICKS - Math.round(iron.progress * AgentHands.SMELT_TICKS));
+            int remaining = switch (iron.phase) {
+                case WATCHING, REOPENING -> iron.watch.remainingTicks(tick);
+                case COLLECTING -> 0;
+                default -> Math.max(0,
+                    (iron.batch.units() - iron.output) * AgentHands.SMELT_TICKS - Math.round(iron.progress * AgentHands.SMELT_TICKS));
+            };
             burn.addProperty("remainingCookTicks", remaining);
             evidence.add("smeltBurn", burn);
         }
@@ -5063,7 +5432,9 @@ final class AgentMacroControl {
         releasePersonalCraft(closeOwned);
         if (action == null) return;
         clearUnconsumedWaterUse();
+        clearUnconsumedFurnaceUse();
         if (action.offer.key.verb == Verb.WORK_SMELT && action.furnace.phase != null) {
+            if (!urgent && owner.equals("work_order")) body.pauseWork();
             detail += " The accepted batch is not reloaded; any uncollected contents stay in the furnace.";
         }
         if (closeOwned) closeOwnedWorkScreen(retained);
@@ -5214,7 +5585,21 @@ final class AgentMacroControl {
 
     private void remember(String event) {
         if (recent.size() == 8) recent.removeFirst();
-        recent.addLast(event);
+        recent.addLast(recentSummary(event));
+    }
+
+    // The observation allows 512 UTF-8 bytes; the receipt journal retains the full detail.
+    static String recentSummary(String event) {
+        if (event.length() <= 512 / 3) return event;
+        int bytes = 0, prefix = 0;
+        for (int i = 0; i < event.length();) {
+            int cp = event.codePointAt(i);
+            i += Character.charCount(cp);
+            bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+            if (bytes <= 509) prefix = i;
+            if (bytes > 512) return event.substring(0, prefix) + "...";
+        }
+        return event;
     }
 
     private static JsonObject header(String run) {

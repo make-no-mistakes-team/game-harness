@@ -19,11 +19,13 @@ import java.util.Arrays;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientChunkEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
 import net.fabricmc.fabric.api.event.client.player.ClientPlayerBlockBreakEvents;
+import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.DeathScreen;
@@ -32,14 +34,17 @@ import net.minecraft.client.gui.screen.ingame.CraftingScreen;
 import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.registry.Registries;
 import net.minecraft.screen.AbstractCraftingScreenHandler;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.GameMode;
+import net.minecraft.world.chunk.WorldChunk;
 
 /** Private run telemetry observes the player. No command, server or world-data input channel. */
 public final class AgentClient implements ClientModInitializer {
@@ -116,6 +121,7 @@ public final class AgentClient implements ClientModInitializer {
     private int priorWaterAttempts, priorWaterLandings, priorBoatAttempts, priorBoatLandings;
     private int priorMeals, priorFoodPickedUp;
     private boolean ended, stoppingForRunner;
+    private boolean ownedSinglePlayer;
 
     private static JsonArray coordinates(Set<BlockPos> cells) {
         JsonArray result = new JsonArray(cells.size());
@@ -158,8 +164,13 @@ public final class AgentClient implements ClientModInitializer {
         });
         ClientTickEvents.START_CLIENT_TICK.register(this::drive);
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            if (macro != null) macro.clearUnconsumedWaterUse();
+            if (macro != null) {
+                macro.clearUnconsumedWaterUse();
+                macro.clearUnconsumedFurnaceUse();
+            }
         });
+        ClientChunkEvents.CHUNK_LOAD.register(this::observeFurnaceChunk);
+        ClientChunkEvents.CHUNK_UNLOAD.register(this::observeFurnaceChunk);
         ScreenEvents.AFTER_INIT.register((client, screen, width, height) -> {
             if (screen instanceof DeathScreen deathScreen) {
                 ScreenEvents.afterRender(screen).register((shown, context, mouseX, mouseY, tickDelta) ->
@@ -232,6 +243,30 @@ public final class AgentClient implements ClientModInitializer {
 
     public static void confirmScopedWaterUse() {
         if (active != null && active.macro != null) active.macro.confirmScopedWaterUse();
+    }
+
+    public static boolean allowScopedFurnaceUse() {
+        return active == null || active.macro == null || active.macro.allowScopedFurnaceUse();
+    }
+
+    public static void confirmScopedFurnaceUse(ClientPlayerEntity player, BlockHitResult hit) {
+        if (active != null && active.macro != null) active.macro.confirmScopedFurnaceUse(player, hit);
+    }
+
+    public static void observeFurnaceBlock(ClientWorld world, BlockPos pos, BlockState state) {
+        if (active != null && active.macro != null) active.macro.observeFurnaceBlock(world, pos, state);
+    }
+
+    private void observeFurnaceChunk(ClientWorld world, WorldChunk chunk) {
+        if (macro != null) macro.observeFurnaceChunk(world, chunk.getPos());
+    }
+
+    static boolean ownsSinglePlayerFurnaceWorld(MinecraftClient client, ClientPlayerEntity player) {
+        if (active == null || !active.ownedSinglePlayer || !active.playing(client)
+                || client.player != player || player.networkHandler.getPlayerList().size() != 1
+                || player.networkHandler.getPlayerListEntry(player.getUuid()) == null) return false;
+        for (var other : client.world.getPlayers()) if (other != player) return false;
+        return true;
     }
 
     private static String finiteSample(double value) {
@@ -317,6 +352,7 @@ public final class AgentClient implements ClientModInitializer {
         if (handler == null || !handler.getConnection().isOpen()
             || !(handler.getConnection().getAddress() instanceof InetSocketAddress peer)
             || peer.getAddress() == null || !peer.getAddress().isLoopbackAddress()) return false;
+        ownedSinglePlayer = peer.getPort() == Integer.getInteger("gh.agent.ownedSinglePlayerPort", -1);
         network = handler;
         initialDeathScreen = client.currentScreen instanceof DeathScreen && client.player.isDead();
         macro = AgentMacroControl.create(directory, goal);

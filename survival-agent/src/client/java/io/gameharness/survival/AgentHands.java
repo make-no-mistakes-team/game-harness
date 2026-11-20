@@ -1,6 +1,7 @@
 package io.gameharness.survival;
 
 import io.gameharness.survival.mixin.AgentHandledScreenAccess;
+import io.gameharness.survival.mixin.AgentKeyboardAccess;
 import io.gameharness.survival.mixin.AgentMouseAccess;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -41,8 +42,12 @@ import org.slf4j.LoggerFactory;
 
 import static org.lwjgl.glfw.GLFW.GLFW_MOUSE_BUTTON_LEFT;
 import static org.lwjgl.glfw.GLFW.GLFW_MOUSE_BUTTON_RIGHT;
+import static org.lwjgl.glfw.GLFW.GLFW_KEY_ESCAPE;
+import static org.lwjgl.glfw.GLFW.GLFW_PRESS;
 import static org.lwjgl.glfw.GLFW.GLFW_RELEASE;
 import static org.lwjgl.glfw.GLFW.glfwGetCursorPos;
+import static org.lwjgl.glfw.GLFW.glfwGetKey;
+import static org.lwjgl.glfw.GLFW.glfwGetKeyScancode;
 import static org.lwjgl.glfw.GLFW.glfwGetMouseButton;
 import static org.lwjgl.glfw.GLFW.glfwSetCursorPos;
 
@@ -510,10 +515,9 @@ final class AgentHands {
         if (!canWorkFurnace(furnace)) return report("smelt", "no exact clean furnace screen");
         var handler = furnace.getScreenHandler();
         Slot output = handler.getOutputSlot();
-        ItemStack finished = output.getStack();
-        if (handler.getSlot(0).hasStack() || handler.getSlot(1).hasStack()
-                || ((AgentFurnaceSync) handler).agent$furnaceOutputUpdates() <= afterOutputSync
-                || !finished.isOf(Items.IRON_INGOT) || finished.getCount() != units)
+        if (!AgentFurnaceWatch.exactResult(units, afterOutputSync,
+                ((AgentFurnaceSync) handler).agent$furnaceOutputUpdates(),
+                handler.getSlot(0).getStack(), handler.getSlot(1).getStack(), output.getStack()))
             return report("smelt", "the witnessed result changed");
         return collectSmelt(furnace, output, units);
     }
@@ -525,6 +529,17 @@ final class AgentHands {
         if (handler.isBurning() || !input.getStack().isOf(Items.RAW_IRON) || input.getStack().getCount() != units)
             return report("smelt", "the cold input no longer matches the paid raw iron");
         return collectSmelt(furnace, input, units);
+    }
+
+    boolean closeWorkFurnaceWithEscape(FurnaceScreen furnace) {
+        if (!canWorkFurnace(furnace) || !c.isWindowFocused() || c.getOverlay() != null) return false;
+        long window = c.getWindow().getHandle();
+        if (glfwGetKey(window, GLFW_KEY_ESCAPE) != GLFW_RELEASE) return false;
+        var keyboard = (AgentKeyboardAccess) c.keyboard;
+        int scan = glfwGetKeyScancode(GLFW_KEY_ESCAPE);
+        keyboard.agent$onKey(window, GLFW_KEY_ESCAPE, scan, GLFW_PRESS, 0);
+        keyboard.agent$onKey(window, GLFW_KEY_ESCAPE, scan, GLFW_RELEASE, 0);
+        return c.currentScreen == null && c.player.currentScreenHandler == c.player.playerScreenHandler;
     }
 
     private boolean canWorkFurnace(FurnaceScreen furnace) {

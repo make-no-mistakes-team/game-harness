@@ -2,6 +2,7 @@ package io.gameharness.survival;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -35,6 +36,18 @@ import org.junit.jupiter.api.Test;
 
 /** Exercises actual vanilla stacks and block states without starting a client or world. */
 final class MiningStockProof {
+    @Test
+    void longProspectRefusalFitsTheNextModelObservation() {
+        String prefix = "interrupted: The rendered landing had no dry support. ";
+        String summary = AgentMacroControl.recentSummary(prefix + "No reachable side face. ".repeat(24));
+        org.junit.jupiter.api.Assertions.assertTrue(summary.startsWith(prefix) && summary.endsWith("..."));
+        org.junit.jupiter.api.Assertions.assertEquals(512, summary.getBytes(StandardCharsets.UTF_8).length);
+        String exact = "a".repeat(508) + "\uD83C\uDF0D";
+        org.junit.jupiter.api.Assertions.assertEquals(exact, AgentMacroControl.recentSummary(exact));
+        org.junit.jupiter.api.Assertions.assertEquals("a".repeat(508) + "...",
+            AgentMacroControl.recentSummary(exact + "x"));
+    }
+
     @BeforeAll
     static void initializeVanilla() {
         SharedConstants.createGameVersion();
@@ -383,6 +396,82 @@ final class MiningStockProof {
             "a preceding workstation craft leaves only one smelting execution");
         require(AgentHands.ironFuelNeeded(2, 100) == 4 && AgentHands.ironFuelNeeded(3, 300) == 2,
             "exact full heat determines required sticks or planks");
+    }
+
+    @Test
+    void onlyMultiUnitPaidBatchesLeaveTheFurnaceScreenEvenIfOneUnitRemains() {
+        var single = new AgentHands.IronBatch(1, Items.COAL, 1, 1600);
+        var pair = new AgentHands.IronBatch(2, Items.COAL, 1, 1600);
+        require(!AgentFurnaceWatch.required(single), "one charged unit normally stays in the GUI");
+        var watch = new AgentFurnaceWatch(BlockPos.ORIGIN, Direction.NORTH, 6,
+            new AgentFurnaceWatch.Stock(1, 2, 1), pair, 1, 0, 0.5f, 20, 1_000_000_000L);
+        require(AgentFurnaceWatch.required(pair) && watch.remainingTicks(20) == 100,
+            "one remaining in a paid pair still requires a world watch");
+    }
+
+    @Test
+    void exactFurnaceWatchUsesNewVanillaSyncThenCollectsOnlyThePaidOutput() {
+        var block = new BlockPos(3, 18, -7);
+        var batch = new AgentHands.IronBatch(2, Items.OAK_PLANKS, 2, 300);
+        var before = new AgentFurnaceWatch.Stock(3, 6, 1);
+        var paid = new AgentFurnaceWatch.Stock(1, 4, 1);
+        var raw = new ItemStack(Items.RAW_IRON, 2);
+        var fuel = new ItemStack(Items.OAK_PLANKS);
+        var output = new ItemStack(Items.IRON_INGOT, 2);
+        var empty = ItemStack.EMPTY;
+        require(paid.paidFrom(before, batch)
+            && AgentFurnaceWatch.matches(batch, 0, 2, raw, fuel, empty),
+            "one paid load conserves the two raw inputs, two planks and one existing ingot");
+        var watch = new AgentFurnaceWatch(block, Direction.NORTH, 6, paid, batch, 0, 1, 0.05f, 20, 1_000_000_000L);
+        require(watch.accessProblem(block, Direction.NORTH, true) == null, "the original loaded block is admissible");
+        require(!watch.elapsed(409, 25_000_000_000L) && !watch.elapsed(410, 20_499_999_999L)
+                && watch.elapsed(410, 20_500_000_000L),
+            "both 390 native ticks and 19.5 seconds must have elapsed since close");
+        require(!AgentFurnaceWatch.exactResult(2, 0, 1, raw, fuel, empty),
+            "a finished timer is not an ingot receipt");
+        require(watch.reopenProblem(7, true, 1, 1, 4, 1, empty, empty, output) == null
+                && AgentFurnaceWatch.exactResult(2, 0, 1, empty, empty, output),
+            "only the new independently synchronized complete output can be taken");
+        require(new AgentFurnaceWatch.Stock(1, 4, 3).collectedFrom(paid, batch),
+            "both paid inputs become exactly two ingots, preserving raw and fuel reserves");
+        require(!new AgentFurnaceWatch.Stock(1, 4, 4).collectedFrom(paid, batch)
+                && !new AgentFurnaceWatch.Stock(1, 2, 3).collectedFrom(paid, batch)
+                && !new AgentFurnaceWatch.Stock(0, 4, 3).collectedFrom(paid, batch),
+            "extra output, extra fuel payment or extra raw payment refuses completion");
+    }
+
+    @Test
+    void reopenedFurnaceRefusesMisboundReplacedUnsyncedOrChangedContents() {
+        var block = new BlockPos(3, 18, -7);
+        var batch = new AgentHands.IronBatch(2, Items.COAL, 1, 1600);
+        var watch = new AgentFurnaceWatch(block, Direction.NORTH, 6,
+            new AgentFurnaceWatch.Stock(1, 2, 1), batch, 1, 0, 0.5f, 20, 1_000_000_000L);
+        var pair = new ItemStack(Items.IRON_INGOT, 2);
+        var empty = ItemStack.EMPTY;
+        require(watch.accessProblem(block.east(), Direction.NORTH, true) != null
+                && watch.accessProblem(block, Direction.SOUTH, true) != null
+                && watch.accessProblem(block, Direction.NORTH, false) != null,
+            "a neighboring furnace, changed facing or nonexclusive access cannot use the paid claim");
+        require(watch.reopenProblem(6, true, 2, 1, 2, 1, empty, empty, pair) != null
+                && watch.reopenProblem(7, false, 1, 1, 2, 1, empty, empty, pair) != null
+                && watch.reopenProblem(7, true, 0, 1, 2, 1, empty, empty, pair) != null,
+            "an old, unsynced or unobserved handler never proves output");
+        require(watch.reopenProblem(7, true, 1, 1, 2, 2, empty, empty, pair) != null
+                && watch.reopenProblem(7, true, 1, 2, 2, 1, empty, empty, pair) != null
+                && watch.reopenProblem(7, true, 1, 1, 1, 1, empty, empty, pair) != null,
+            "none of the three bounded stock values can change while closed");
+        require(watch.reopenProblem(7, true, 1, 1, 2, 1, empty, empty, new ItemStack(Items.IRON_INGOT, 3)) != null
+                && watch.reopenProblem(7, true, 1, 1, 2, 1, empty, new ItemStack(Items.COAL), pair) != null
+                && watch.reopenProblem(7, true, 1, 1, 2, 1, new ItemStack(Items.RAW_IRON, 2), empty, empty) != null,
+            "new output, excess fuel or regressed slots must not be treated as the paid batch");
+        require(watch.reopenProblem(7, true, 1, 1, 2, 1, new ItemStack(Items.RAW_IRON), empty,
+                new ItemStack(Items.IRON_INGOT)) == null
+                && !AgentFurnaceWatch.exactResult(2, 0, 1, new ItemStack(Items.RAW_IRON), empty, pair),
+            "matching but unfinished output stays uncollected");
+        watch.invalidate();
+        require(watch.accessProblem(block, Direction.NORTH, true) != null
+                && watch.reopenProblem(7, true, 1, 1, 2, 1, empty, empty, pair) != null,
+            "once replaced or unloaded, matching visible appearance and output cannot reauthorize this work");
     }
 
     @Test

@@ -492,6 +492,8 @@ export class MinecraftClient {
       `-Djava.io.tmpdir=${tmp}`,
       `-Dgh.agent.dir=${config.evidenceDir}`,
       `-Dgh.agent.goal=${config.goal}`,
+      // launchAgent's sole caller starts this exact loopback server with max-players=1.
+      `-Dgh.agent.ownedSinglePlayerPort=${config.port}`,
       "-cp",
       libraries.join(path.delimiter),
       path.join(this.projectRoot,

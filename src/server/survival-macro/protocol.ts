@@ -193,7 +193,7 @@ export interface MacroPendingWork {
   readonly worksite?: {
     readonly routes: string;
     readonly choice?: {
-      readonly kind: "dry-follow" | "dry-approach" | "inspect-cave";
+      readonly kind: "dry-follow" | "dry-approach" | "inspect-cave" | "setup-cave-stance";
       readonly opportunityId: string;
       /** A stable local witness identity, not an opportunity ID or a world position. */
       readonly target: string;
@@ -804,10 +804,11 @@ export function parseMacroObservation(value: unknown): MacroObservation {
       let caveChoice: NonNullable<MacroPendingWork["worksite"]>["choice"];
       if (local.choice !== undefined) {
         const quoted = shape(local.choice, "parked cave choice", ["kind", "opportunityId", "target"]);
-        const kind = choice(quoted.kind, "parked cave choice kind", ["dry-follow", "dry-approach", "inspect-cave"] as const);
+        const kind = choice(quoted.kind, "parked cave choice kind",
+          ["dry-follow", "dry-approach", "inspect-cave", "setup-cave-stance"] as const);
         const opportunityId = validateMacroId(quoted.opportunityId, "parked cave opportunity id");
         const verb = kind === "dry-follow" ? "follow" : kind === "dry-approach" ? "approach" : "survey";
-        if (!collectOfferId || historical || !opportunities.some(offer => offer.id === opportunityId &&
+        if (!collectOfferId || output.count < 2 || !opportunities.some(offer => offer.id === opportunityId &&
             offer.verb === verb && offer.risk === "low" && !offer.material)) invalid("parked cave opportunity");
         caveChoice = Object.freeze({ kind, opportunityId, target: validateMacroId(quoted.target, "parked cave target") });
       }
@@ -825,6 +826,10 @@ export function parseMacroObservation(value: unknown): MacroObservation {
   if (opportunities.some(offer => offer.verb === "follow" && offer.risk === "low" &&
       (pendingWork?.worksite?.choice?.kind !== "dry-follow" || pendingWork.worksite.choice.opportunityId !== offer.id)))
     invalid("unscoped low-risk dry follow");
+  const caveSurvey = pendingWork?.worksite?.choice;
+  if (opportunities.some(offer => offer.verb === "survey" && offer.risk === "low" &&
+      (caveSurvey?.opportunityId !== offer.id || (caveSurvey.kind !== "inspect-cave" && caveSurvey.kind !== "setup-cave-stance"))))
+    invalid("unscoped low-risk cave survey");
   return Object.freeze({
     v: version(record.v), ...basis(record), goal: text(record.goal, "goal", 256),
     health: finite(record.health, "health", 1_024), food: whole(record.food, "food", 0, 20),

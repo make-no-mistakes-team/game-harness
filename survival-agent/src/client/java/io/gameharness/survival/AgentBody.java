@@ -2160,6 +2160,42 @@ final class AgentBody {
         return true;
     }
 
+    static boolean sameSurveySupport(BlockPos support, Vec3d feet) {
+        double x = feet.x - support.getX(), z = feet.z - support.getZ();
+        return x >= 0 && x < 1 && z >= 0 && z < 1 && Math.abs(feet.y - support.getY() - 1) <= 0.055;
+    }
+
+    static boolean drySurveyLaneCentered(BlockPos foot, double x, double z, Direction facing) {
+        x -= foot.getX() + 0.5;
+        z -= foot.getZ() + 0.5;
+        double along = x * facing.getOffsetX() + z * facing.getOffsetZ();
+        double across = x * facing.getOffsetZ() - z * facing.getOffsetX();
+        // Leave margin inside the exact Body sweep.
+        return Math.abs(along) <= 0.25 && Math.abs(across) <= 0.17;
+    }
+
+    /** Grounded contact is a witness of this exact underfoot block, not of any adjacent tile. */
+    boolean localSurveySupport(BlockPos support, BlockState witnessed, Vec3d center) {
+        if (!hasView() || lavaEmergency || !matchesStep(support, center)) return false;
+        var player = client.player;
+        var options = client.options;
+        if (!player.isOnGround() || player.isTouchingWater() || player.hasVehicle() || player.horizontalCollision
+                || options.forwardKey.isUnbound() || options.backKey.isUnbound() || options.leftKey.isUnbound()
+                || options.rightKey.isUnbound() || options.sneakKey.isUnbound()
+                || !sameSurveySupport(support, player.getPos()) || client.world.getBlockState(support) != witnessed
+                || !stableDryRouteTop(support, witnessed) || !client.world.getFluidState(support.up()).isEmpty()) return false;
+        double dx = center.x - player.getX(), dz = center.z - player.getZ();
+        return !hazardAhead(heading(dx, dz), Math.hypot(dx, dz) + 0.12)
+            && client.world.isSpaceEmpty(player, player.getBoundingBox().stretch(dx, 0, dz));
+    }
+
+    /** The same centering motor, with a revalidated grounded support instead of a camera turn down. */
+    boolean centerOnSupport(BlockPos support, BlockState witnessed, Vec3d center) {
+        if (!localSurveySupport(support, witnessed, center)) return false;
+        centerLanding = center;
+        return true;
+    }
+
     int actionTick() { return tick; }
 
     boolean tapHotbar(int slot) {
@@ -2241,6 +2277,30 @@ final class AgentBody {
 
     Optional<BlockHitResult> find(Predicate<BlockState> matches, double distance) {
         return find(matches, distance, null);
+    }
+
+    /** Read a natural top in the rendered frustum as a look landmark, not a landing or a path. */
+    BlockHitResult caveFloorLandmark(BlockPos footing) {
+        return find(AgentBody::naturalCaveFloor, 6, hit -> {
+            BlockPos pos = hit.getBlockPos();
+            Vec3d point = hit.getPos();
+            double dx = point.x - footing.getX() - 0.5, dz = point.z - footing.getZ() - 0.5;
+            return Math.abs(pos.getY() - footing.getY()) <= 1 && dx * dx + dz * dz >= 1.21
+                && matchesDryRouteTop(hit, pos) && stableDryRouteTop(pos, client.world.getBlockState(pos));
+        }).orElse(null);
+    }
+
+    private static boolean naturalCaveFloor(BlockState state) {
+        return state.isIn(BlockTags.BASE_STONE_OVERWORLD) || state.isIn(BlockTags.BASE_STONE_NETHER)
+            || state.isIn(BlockTags.DIRT) || state.isOf(Blocks.CALCITE) || state.isOf(Blocks.DRIPSTONE_BLOCK);
+    }
+
+    boolean caveFloorLandmarkCurrent(BlockHitResult witness) {
+        var hit = perceive(witness.getPos(), 6).orElse(null);
+        BlockPos pos = witness.getBlockPos();
+        if (hit == null || !matchesDryRouteTop(hit, pos)) return false;
+        BlockState state = client.world.getBlockState(pos);
+        return naturalCaveFloor(state) && stableDryRouteTop(pos, state);
     }
 
     /** Reject positions among already admitted camera hits, before choosing the nearest match. */

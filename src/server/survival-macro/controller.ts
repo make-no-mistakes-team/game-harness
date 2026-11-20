@@ -17,7 +17,7 @@ import {
   parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
   parseMacroProposal, parseMacroReceipt, parseMacroRevocation, parseMacroWorkOrder, sameLiveCorrectionScope, validateMacroId,
   type MacroBasis, type MacroDirectAction, type MacroFeedback, type MacroFrame, type MacroHandoff, type MacroInference, type MacroIntent,
-  type MacroLookahead, type MacroObservation, type MacroOpportunity, type MacroParkedReceipt, type MacroPlanning,
+  type MacroLookahead, type MacroObservation, type MacroOpportunity, type MacroParkedReceipt, type MacroPendingWork, type MacroPlanning,
   type MacroProposal, type MacroReceipt, type MacroReplyRejection, type MacroRequest, type MacroSkillReceipt, type MacroStockFloor,
   type MacroStrategist, type MacroSuccessor,
   type MacroTrigger, type MacroWorkDemand, type MacroWorkMode, type MacroWorkOrder, type MacroWorkPolicy, type MacroWorkStage,
@@ -72,6 +72,8 @@ const PARKED_VIEW_WAIT_TICKS = 20;
 const PARKED_VIEW_WAIT_MS = 1_200;
 const SURVEY_RECOVERY_TICKS = 600;
 const SURVEY_RECOVERY_MS = 30_000;
+const ALTERNATIVE_RECOVERY_TICKS = WORK_REPLAN_GAP_TICKS + 20;
+const ALTERNATIVE_RECOVERY_MS = 5_000;
 // Native views are published every 5 ticks. Permit at most two follow-up
 // publications and a short wall-clock bound for the first rendered offer.
 const FIRST_ACTIONABLE_VIEW_TICKS = 10;
@@ -196,7 +198,8 @@ interface ReplyCorrection {
   readonly feedback: MacroFeedback;
 }
 
-interface SurveyRecovery {
+interface IntentRecoveryScope {
+  readonly requestId: string;
   readonly basis: MacroBasis;
   readonly health: number;
   readonly evidence: string;
@@ -204,8 +207,13 @@ interface SurveyRecovery {
   readonly key: string;
   readonly expiresTick: number;
   readonly until: number;
-  gapSeen?: true;
 }
+
+type CaveChoice = NonNullable<NonNullable<MacroPendingWork["worksite"]>["choice"]>;
+type IntentRecovery = IntentRecoveryScope & (
+  | { readonly kind: "restored-survey"; gapSeen?: true }
+  | { readonly kind: "alternative"; readonly caveChoice?: CaveChoice }
+);
 
 interface FirstPlanning {
   readonly requestId: string;
@@ -244,6 +252,7 @@ interface Decision {
   readonly workOverlap?: WorkOverlap;
   readonly replyKey?: string;
   readonly correction?: ReplyCorrection;
+  readonly reconsideration?: IntentRecovery;
 }
 
 class FrameRejected extends Error {
@@ -458,6 +467,15 @@ function offersAffordance(observation: MacroObservation, offer: Omit<MacroOpport
 
 function workAffordance(offer: MacroOpportunity): boolean {
   return offer.risk !== "read" || offer.material !== undefined;
+}
+
+function meaningfulPrimitive(offer: MacroOpportunity): boolean {
+  return !isPendingWorkVerb(offer.verb) && offer.verb !== MACRO_WATER_CLUE &&
+    (workAffordance(offer) || offer.verb === "inspect");
+}
+
+function primitiveEffectKey(observation: MacroObservation, offer: MacroOpportunity): string {
+  return digest([observation.life, observation.epoch, observation.goal, offer]);
 }
 
 function sameMaterial(left: MacroOpportunity["material"], right: MacroOpportunity["material"]): boolean {
@@ -676,15 +694,14 @@ export class SurvivalMacroController {
   private lastAcceptedJob?: WorkJob;
   private lastJobOutcome?: WorkJob;
   private workQuery?: {
-    readonly key: string; tick: number; readonly evidence: string;
-    readonly surveyReconsideration?: true; mayRecoverOnAffordance?: true;
+    readonly key: string; tick: number; readonly evidence: string; mayRecoverOnAffordance?: true;
   };
   private parkedWorkQueries?: {
     readonly id: string; readonly life: number; readonly tick: number; readonly since: number;
     readonly seen: Set<string>; settled?: true; reported?: true;
   };
-  private surveyRecovery?: SurveyRecovery;
-  private readonly recoveredSurveys = new Set<string>();
+  private intentRecovery?: IntentRecovery;
+  private readonly recoveredIntents = new Set<string>();
   private readonly workHandoffQueries = new Set<string>();
   private readonly workOverlapRequests = new Set<string>();
   private returnWitnessRevision = 0;
@@ -868,8 +885,8 @@ export class SurvivalMacroController {
     const view = this.view;
     const current = view && now - this.observedAt <= this.limits.maxObservationAgeMs ? view.observation : undefined;
     const runtimeExpired = now - this.startedAt! >= this.limits.maxRuntimeMs;
-    if (this.surveyRecovery && (runtimeExpired || !current || this.pending || this.job || this.queuedWork ||
-        !this.surveyRecoveryCurrent(this.surveyRecovery, current))) this.surveyRecovery = undefined;
+    if (this.intentRecovery && (runtimeExpired || !current || this.pending || this.job || this.queuedWork ||
+        !this.intentRecoveryCurrent(this.intentRecovery, current))) this.intentRecovery = undefined;
     if (this.firstPlanning) {
       await this.advanceFirstPlan(current, !!observed, runtimeExpired ? "runtime_wall_limit" : undefined);
       // A single provider slot is shared across both stages, even while abort
@@ -1256,10 +1273,41 @@ export class SurvivalMacroController {
     return digest([workEvidence(observation, this.lastReceipt), this.returnWitnessRevision]);
   }
 
-  private surveyRecoveryCurrent(recovery: SurveyRecovery, current: MacroObservation, evidence = this.workQueryEvidence(current)): boolean {
+  private intentRecoveryCurrent(recovery: IntentRecovery, current: MacroObservation, evidence = this.workQueryEvidence(current)): boolean {
     return current.tick < recovery.expiresTick && performance.now() < recovery.until &&
       current.run === recovery.basis.run && current.life === recovery.basis.life && current.epoch === recovery.basis.epoch &&
       current.health === recovery.health && current.safety?.clear === true && evidence === recovery.evidence;
+  }
+
+  private alternativeRecovery(current: MacroObservation, evidence?: string): Extract<IntentRecovery, { kind: "alternative" }> | undefined {
+    const recovery = this.intentRecovery;
+    if (recovery?.kind !== "alternative" || current.tick - recovery.basis.tick < WORK_REPLAN_GAP_TICKS ||
+        current.working || !this.isCurrentHandoff(current) || !this.intentRecoveryCurrent(recovery, current, evidence)) return;
+    const ticket = current.pendingWork;
+    const reserves = this.floorScope?.life === current.life ? this.floorScope.reserves : [];
+    if (ticket?.parked) {
+      if (!ticket.worksite) return;
+      const collect = ticket.collectOfferId && current.opportunities.find(offer => offer.id === ticket.collectOfferId);
+      if (collect && this.parkedCollectionOwned(ticket, current.life) &&
+          !this.effectKeys.has(digest([current.life, "collect-pending", ticket.id, collect.evidence]))) return recovery;
+    }
+    const cave = ticket?.worksite?.choice;
+    if (current.opportunities.some(offer => {
+      if (!meaningfulPrimitive(offer) || this.effectKeys.has(primitiveEffectKey(current, offer))) return false;
+      if (offer.risk === "guarded" && (this.workMode === "constrained" ||
+          (reserves.length > 0 && !protectsStock(reserves, current, offer)))) return false;
+      if (cave?.opportunityId === offer.id) {
+        const failed = recovery.caveChoice;
+        return hasStock(current, reserves) && (failed?.kind !== cave.kind || failed.target !== cave.target);
+      }
+      return !sameAffordance(recovery.offer, offer);
+    })) return recovery;
+  }
+
+  private parkedCollectionOwned(ticket: MacroPendingWork, life: number): boolean {
+    const owner = this.jobs.get(ticket.id);
+    return ticket.historical || (owner?.order.life === life &&
+      (!!owner.parked || (!!owner.accepted && owner.terminal?.status === "interrupted")));
   }
 
   private async scheduleWork(view: View, queue?: QueuedWork): Promise<void> {
@@ -1358,13 +1406,15 @@ export class SurvivalMacroController {
     if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew") return;
     const correction = !job ? this.replyCorrection : undefined;
     const unchanged = previous && (key === previous.key || (!job && demand === "changed" && previous.evidence === evidence));
-    const recovery = this.surveyRecovery;
-    const reconsiderSurvey = recovery?.gapSeen && !correction && !queue && !observation.working &&
-      this.isCurrentHandoff(observation) && this.surveyRecoveryCurrent(recovery, observation, evidence) &&
-      offersAffordance(observation, recovery.offer);
+    const recovery = this.intentRecovery;
+    const reconsideration = !job && !correction && !queue ? (
+      recovery?.kind === "restored-survey" && recovery.gapSeen && !observation.working &&
+        this.isCurrentHandoff(observation) && this.intentRecoveryCurrent(recovery, observation, evidence) &&
+        offersAffordance(observation, recovery.offer) ? recovery : this.alternativeRecovery(observation, evidence)
+    ) : undefined;
     // An idle abstention can recover on a genuinely new actionable witness or
     // neutral handoff, not when the same affordance is issued a different ID.
-    if (unchanged && !correction && !reconsiderSurvey) {
+    if (unchanged && !correction && !reconsideration) {
       const asked = this.lastAsked?.observation;
       if (job || !previous.mayRecoverOnAffordance || !asked ||
           (!(observation.quiescent && !asked.quiescent) && !observation.opportunities.some(offer =>
@@ -1372,13 +1422,9 @@ export class SurvivalMacroController {
     }
     const handoffQuery = !job && (observation.quiescent || observation.opportunities.some(workAffordance))
       ? digest([evidence, liveCorrectionEvidence({ ...observation, opportunities: observation.opportunities.filter(workAffordance) })]) : null;
-    if (unchanged && !correction && !reconsiderSurvey && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
+    if (unchanged && !correction && !reconsideration && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
     if (handoffQuery) this.workHandoffQueries.add(handoffQuery);
-    if (reconsiderSurvey) {
-      this.recoveredSurveys.add(recovery.key);
-      this.surveyRecovery = undefined;
-    }
-    if (!correction) this.workQuery = { key, tick: observation.tick, evidence, surveyReconsideration: reconsiderSurvey || undefined };
+    if (!correction) this.workQuery = { key, tick: observation.tick, evidence };
     if (overlap?.smeltBurnTick !== undefined) overlap.incumbent.smeltLookedAhead = true;
     else if (overlap && owner) this.workOverlapRequests.add(owner);
     const purpose = ticket && this.jobs.get(ticket.id)?.pendingPurpose;
@@ -1392,7 +1438,7 @@ export class SurvivalMacroController {
       lastOutcome: outcome?.terminal ? { id: outcome.order.id, policy: outcome.policy,
         receipt: outcome.terminal, nativeState: outcomeState } : null,
     };
-    await this.begin(view, { workDemand, workOverlap: overlap, correction });
+    await this.begin(view, { workDemand, workOverlap: overlap, correction, reconsideration });
   }
 
   private async scheduleParkedWork(view: View, ticket: NonNullable<MacroObservation["pendingWork"]>): Promise<void> {
@@ -1422,13 +1468,14 @@ export class SurvivalMacroController {
     // Neither a countdown nor a reissued ID is a changed route. A real choice may appear
     // immediately after the first settled view or the one bounded unavailable-view decision.
     const correction = ticket.worksite ? this.replyCorrection : undefined;
-    if (!correction && window.seen.has(key)) return;
+    const reconsideration = !correction ? this.alternativeRecovery(observation) : undefined;
+    if (!correction && !reconsideration && window.seen.has(key)) return;
     window.seen.add(key);
     if (ticket.worksite) window.settled = true;
     const owner = this.jobs.get(ticket.id);
     const outcome = this.lastJobOutcome;
     const terminal = outcome?.terminal && sameGoalAndLife(outcome.source, observation) ? outcome.terminal : undefined;
-    await this.begin(view, { correction, workDemand: {
+    await this.begin(view, { correction, reconsideration, workDemand: {
       mode: this.workMode!, demand: !ticket.worksite || ticket.state === "blocked" ? "blocked" : terminal ? "outcome" : "changed",
       protectedReserves: this.floorScope?.life === observation.life ? this.floorScope.reserves : [],
       current: null, parkedWorksite: ticket.worksite ? "settled" : "view-unavailable",
@@ -1994,8 +2041,8 @@ export class SurvivalMacroController {
   }
 
   private async begin(
-    view: View, { lookahead, workDemand, workOverlap, correction }:
-      Pick<Decision, "lookahead" | "workDemand" | "workOverlap" | "correction">,
+    view: View, { lookahead, workDemand, workOverlap, correction, reconsideration }:
+      Pick<Decision, "lookahead" | "workDemand" | "workOverlap" | "correction" | "reconsideration">,
   ): Promise<void> {
     const trigger = this.trigger(view);
     const observation = view.observation;
@@ -2016,7 +2063,10 @@ export class SurvivalMacroController {
       maxResponseBytes: this.limits.maxResponseBytes, maxIntentTtlTicks: this.limits.maxIntentTtlTicks,
       maxPlanTtlTicks: this.limits.maxPlanTtlTicks,
       lastReceipt: this.lastReceipt?.life === observation.life ? this.lastReceipt : null,
-      feedback: correction?.feedback ?? this.currentFeedback(observation),
+      feedback: reconsideration?.kind === "alternative" ? {
+        kind: "failed_intent",
+        detail: "The previous chosen opportunity lost its witness before issuance. No effect was applied. Choose only from the current observation, or abstain.",
+      } : correction?.feedback ?? this.currentFeedback(observation),
       ...(lookahead ? { lookahead: lookahead.evidence } : {}),
       ...(workDemand ? { work: workDemand } : {}),
     };
@@ -2024,10 +2074,11 @@ export class SurvivalMacroController {
       this.queryKeys.add(view.query);
       this.lastAsked = view;
     }
-    const replyKey = !correction && !lookahead && !workDemand?.current && !this.job && !this.queuedWork &&
+    const replyKey = !correction && !reconsideration && !lookahead && !workDemand?.current && !this.job && !this.queuedWork &&
       sameLiveCorrectionScope(observation, observation) ? this.liveReplyKey(observation) : undefined;
     await this.record("request", { requestId, evidenceKey: view.evidence, request,
-      ...(correction ? { correctionOf: correction.requestId } : {}) });
+      ...(correction ? { correctionOf: correction.requestId } : {}),
+      ...(reconsideration ? { reconsiderationOf: reconsideration.requestId, reconsideration: reconsideration.kind } : {}) });
     if (this.closing || performance.now() - this.startedAt! >= this.limits.maxRuntimeMs) {
       await this.disposition("request_not_dispatched", { requestId, reason: this.closing ? "stop" : "runtime_wall_limit" });
       return;
@@ -2045,10 +2096,14 @@ export class SurvivalMacroController {
     this.requests++;
     this.unreportedDispatches++;
     if (correction) this.replyCorrection = undefined;
+    if (reconsideration) this.recoveredIntents.add(reconsideration.key);
+    // A newer decision supersedes a failed primitive. Only a restored survey
+    // can carry its allowance through one subsequent model-reported gap.
+    if (reconsideration || this.intentRecovery?.kind === "alternative") this.intentRecovery = undefined;
     this.busy = {
       kind: "inference",
       work: this.work({ requestId, observation, generation, testedSkills, selectedSkillHash,
-        lookahead, workDemand, workOverlap, replyKey, correction }, this.limits.requestTimeoutMs, async signal => {
+        lookahead, workDemand, workOverlap, replyKey, correction, reconsideration }, this.limits.requestTimeoutMs, async signal => {
         if (lookahead) return this.config.strategist!(request, signal);
         if (workDemand?.parkedWorksite === "view-unavailable" ||
             workDemand?.current && (!workDemand.duringWaitFor || !this.config.frame)) return this.config.strategist!({ ...request,
@@ -2269,17 +2324,17 @@ export class SurvivalMacroController {
       !proposal || !ttlValid || !model ? "invalid" : "proposed";
     const reason = rotation ? "A rotating observation deferred the correction before provider dispatch." :
       rejection ? macroReplyRejectionDetail(rejection) : result.ok ? null : result.detail;
-    const recovery = this.surveyRecovery;
-    if (recovery) {
+    const recovery = this.intentRecovery;
+    if (recovery?.kind === "restored-survey") {
       // Only the next valid, idle gap can confirm the interruption. The
       // failed choice and absence on both views supply the link, not gap text.
       if (!recovery.gapSeen && disposition === "proposed" && proposal?.action.kind === "gap" &&
           context.workDemand?.current === null && current && this.isCurrentHandoff(current) &&
           !original.working && !current.working && original.tick > recovery.basis.tick &&
-          this.surveyRecoveryCurrent(recovery, original) && this.surveyRecoveryCurrent(recovery, current) &&
+          this.intentRecoveryCurrent(recovery, original) && this.intentRecoveryCurrent(recovery, current) &&
           !offersAffordance(original, recovery.offer) && !offersAffordance(current, recovery.offer)) {
         recovery.gapSeen = true;
-      } else this.surveyRecovery = undefined;
+      } else this.intentRecovery = undefined;
     }
     const correction = context.correction;
     if (correction) {
@@ -2351,7 +2406,8 @@ export class SurvivalMacroController {
     // one-shot. Idle abstention is different: even an expired reply authorized
     // nothing and must not hide a newly actionable witness. Explicit deferral
     // instead advances on the native park/return transitions, not this flag.
-    if (proposal.action.kind === "abstain" && context.workDemand?.current === null && !context.workDemand.parkedWorksite && this.workQuery &&
+    if (proposal.action.kind === "abstain" && !context.reconsideration && context.workDemand?.current === null &&
+        !context.workDemand.parkedWorksite && this.workQuery &&
         model && basisMatches && ttlValid && !runtimeExpired && !late) this.workQuery.mayRecoverOnAffordance = true;
     if (disposition !== "proposed") {
       // The provider chose a pure function, not a durable live command. A
@@ -2830,6 +2886,36 @@ export class SurvivalMacroController {
     this.lease = undefined;
   }
 
+  private rememberFailedIntent(plan: Plan, witnessed: MacroObservation, lost: MacroOpportunity, current: MacroObservation): void {
+    if (plan.reconsideration || plan.proposal.action.kind !== "opportunity" || plan.workDemand?.current !== null ||
+        this.queuedWork || witnessed.working || current.working || !this.isCurrentHandoff(current) ||
+        !scope(witnessed, current) || !workScope(witnessed, current) || witnessed.health !== current.health ||
+        current.tick >= plan.proposal.expiresTick || current.opportunities.some(offer => offer.id === lost.id)) return;
+    const oldChoice = witnessed.pendingWork?.worksite?.choice;
+    const caveChoice = oldChoice?.opportunityId === lost.id ? oldChoice : undefined;
+    const currentChoice = current.pendingWork?.worksite?.choice;
+    if (caveChoice && caveChoice.kind === currentChoice?.kind && caveChoice.target === currentChoice.target) return;
+    if (!caveChoice && offersAffordance(current, lost)) return;
+    const evidence = this.workQueryEvidence(current);
+    const shared = { requestId: plan.requestId, basis: basis(witnessed), health: current.health, offer: lost, evidence };
+    if (lost.risk !== "guarded" && meaningfulPrimitive(lost) &&
+        workEvidence(witnessed, this.lastReceipt) === workEvidence(current, this.lastReceipt)) {
+      // Spend one recovery per unchanged work premise, independent of which
+      // opaque ID or camera bearing happened to fail.
+      const key = digest(["alternative", current.epoch, evidence]);
+      if (!this.recoveredIntents.has(key)) this.intentRecovery = { ...shared, kind: "alternative", key, caveChoice,
+        expiresTick: Math.min(plan.proposal.expiresTick, current.tick + ALTERNATIVE_RECOVERY_TICKS),
+        until: performance.now() + ALTERNATIVE_RECOVERY_MS };
+    } else if (lost.verb === "survey" && !workAffordance(lost) && evidence === this.workQuery?.evidence) {
+      // A pure camera survey needs its own model-reported gap and the exact
+      // affordance restored; losing it does not justify an alternate by itself.
+      const key = digest(["restored-survey", current.epoch, current.health, evidence, lost.verb, lost.summary, lost.evidence]);
+      if (!this.recoveredIntents.has(key)) this.intentRecovery = { ...shared, kind: "restored-survey", key,
+        expiresTick: Math.min(plan.proposal.expiresTick, current.tick + SURVEY_RECOVERY_TICKS),
+        until: performance.now() + SURVEY_RECOVERY_MS };
+    }
+  }
+
   private async issue(plan: Plan, witnessed: MacroObservation, opportunityId: string,
     authority?: Selection | DirectContinuation | Conditional): Promise<boolean | null> {
     const direct = authority && "usedTargets" in authority ? authority : undefined;
@@ -2877,8 +2963,7 @@ export class SurvivalMacroController {
         return before.verb === MACRO_DEFER_PENDING && ticket.deferOfferId === opportunityId && !!ticketOwner &&
           this.sideWindow(ticketOwner, observation);
       return before.verb === MACRO_COLLECT_PENDING && ticket.collectOfferId === opportunityId && ticket.parked &&
-        (ticket.historical || (ticketOwner?.order.life === observation.life &&
-          (!!ticketOwner.parked || (!!ticketOwner.accepted && ticketOwner.terminal?.status === "interrupted")))) &&
+        this.parkedCollectionOwned(ticket, observation.life) &&
         this.isCurrentHandoff(observation);
     };
     const reserves = this.floorScope?.life === current.life ? this.floorScope.reserves : [];
@@ -2890,28 +2975,16 @@ export class SurvivalMacroController {
     }
     const after = current.opportunities.find(offer => offer.id === opportunityId);
     if (!usableHandoff(current) || !samePlayableScope(witnessed, current) || current.tick >= plan.proposal.expiresTick ||
-        !sameOffer(before, after) || (selection && after?.risk === "guarded") ||
-        (direct && (!directScope(direct, current) || !directConditions(direct, current) || !protectsStock(direct.action.reserves, current, after!))) ||
-        (conditional && (current.working || !successorScope(conditional, current) || !successorStock(conditional, current, after!)))) {
-      if (!authority && action.kind === "opportunity" && plan.workDemand?.current === null &&
-          before.verb === "survey" && !workAffordance(before) && usableHandoff(current) && !current.working &&
-          scope(witnessed, current) && workScope(witnessed, current) && current.health === witnessed.health &&
-          current.tick < plan.proposal.expiresTick && !offersAffordance(current, before)) {
-        const evidence = this.workQueryEvidence(current);
-        const offer = { verb: before.verb, risk: before.risk, summary: before.summary, evidence: before.evidence };
-        const key = digest([current.epoch, current.health, evidence, offer]);
-        if (evidence === this.workQuery?.evidence && !this.workQuery.surveyReconsideration && !this.recoveredSurveys.has(key)) {
-          this.surveyRecovery = { basis: basis(witnessed), health: current.health, offer, evidence, key,
-            expiresTick: Math.min(plan.proposal.expiresTick, current.tick + SURVEY_RECOVERY_TICKS),
-            until: performance.now() + SURVEY_RECOVERY_MS };
-        }
-      }
+        !after || !sameOffer(before, after) || (selection && after.risk === "guarded") ||
+        (direct && (!directScope(direct, current) || !directConditions(direct, current) || !protectsStock(direct.action.reserves, current, after))) ||
+        (conditional && (current.working || !successorScope(conditional, current) || !successorStock(conditional, current, after)))) {
+      if (!authority) this.rememberFailedIntent(plan, witnessed, before, current);
       await this.rejectStale(plan, "opportunity_no_longer_witnessed");
       return false;
     }
     const key = pendingAction
       ? digest([current.life, pendingAction.kind, pendingAction.pendingWorkId, after?.evidence])
-      : digest([current.life, current.epoch, current.goal, after]);
+      : primitiveEffectKey(current, after);
     const segmentKey = digest(after);
     if (this.effectKeys.has(key) || selection?.continuation?.seen.has(segmentKey)) {
       await this.disposition("duplicate_intent_refused", { requestId: plan.requestId, opportunityId });
@@ -2938,6 +3011,7 @@ export class SurvivalMacroController {
         (conditional && (refreshed.working || !successorScope(conditional, refreshed) || !successorStock(conditional, refreshed, after!))) ||
         (selection && (!selection.offer || !this.isSelectedSkill(selection.hash, selection.generation) ||
           !this.config.skills!.matchesSelection(selection.offer, refreshed, selection.continuation?.receipts)))) {
+      if (!authority && refreshed) this.rememberFailedIntent(plan, witnessed, before, refreshed);
       await this.rejectStale(plan, "intent_basis_changed_at_publication");
       return false;
     }
@@ -3054,7 +3128,7 @@ export class SurvivalMacroController {
   private async revoke(): Promise<void> {
     const ipc = this.ipc;
     if (!ipc) return;
-    this.surveyRecovery = undefined;
+    this.intentRecovery = undefined;
     if (this.pending) this.pending.withdrawn = true;
     const errors: unknown[] = [];
     try { await ipc.remove("active.json"); this.markerLive = false; } catch (error) { errors.push(error); }

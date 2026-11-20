@@ -368,6 +368,98 @@ test.each(["invalid", "malformed", "abstain", "gap", "incomplete"] as const)(
   },
 );
 
+// Canopy trace: the last survey completed at 1092; the tick-1096 request
+// chose o-17 and was refused before issuance in the same life/epoch. The
+// refusal did not record its full live view; replay with a witnessed approach.
+test.each(["alternate", "alternate lost", "rekeyed inspect", "only survey", "abstain", "expired", "death", "unsafe"] as const)(
+  "A lost canopy inspect only reopens the decision for a live alternative (%s)",
+  async condition => {
+    const inspect = { id: "o-17", verb: "inspect", risk: "read", summary: "Center the visible minecraft:dark_oak_log",
+      evidence: "A lit face is visible away from the current crosshair." } as const;
+    const left = { id: "o-15", verb: "approach", risk: "low", summary: "Walk to the adjacent flat tile",
+      evidence: "Lit full top and clear dry sweep, left of center from the current view." } as const;
+    const right = { ...left, id: "o-14", evidence: "Lit full top and clear dry sweep, right of center from the current view." };
+    const survey = { id: "o-12", verb: "survey", risk: "read", summary: "Survey left from this stance",
+      evidence: "A bounded first-person turn over nearby terrain." } as const;
+    const opening = Promise.withResolvers<void>();
+    const first = Promise.withResolvers<void>();
+    const second = Promise.withResolvers<void>();
+    const requests: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (request.observation.tick === 986) {
+        await opening.promise;
+        return workReply(request, { kind: "opportunity", opportunityId: survey.id }, 300);
+      }
+      if (request.observation.tick === 1096) {
+        await first.promise;
+        return workReply(request, condition === "abstain" ? { kind: "abstain" } :
+          { kind: "opportunity", opportunityId: inspect.id }, 300);
+      }
+      await second.promise;
+      return workReply(request, { kind: "opportunity", opportunityId: left.id }, 300);
+    }, undefined, 8);
+    try {
+      await f.observe(11);
+      const job = await f.order();
+      await f.receipt(job.id, 15, "accepted");
+      await f.receipt(job.id, 15, "interrupted");
+      const state = { epoch: 3, safety: { clear: true, revision: 2 },
+        workOrder: { id: job.id, state: "blocked", detail: "No live source" } } as const;
+      await f.observe(986, { ...state, opportunities: [survey] });
+      opening.resolve();
+      await f.observe(1076, { ...state, opportunities: [survey] });
+      const surveyed = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      await f.receipt(surveyed.id, 1081, "accepted");
+      await f.receipt(surveyed.id, 1092, "completed");
+      await f.observe(1096, { ...state, opportunities: [left, right, inspect] });
+      expect(requests).toHaveLength(2);
+      expect(requests[1]?.lastReceipt).toMatchObject({ id: surveyed.id, tick: 1092, status: "completed" });
+      first.resolve();
+      const refusalTick = condition === "expired" ? 1396 : 1186;
+      const recovery = condition === "alternate" || condition === "alternate lost";
+      const remaining = condition === "rekeyed inspect" ? [left, right, { ...inspect, id: "o-20" }] :
+        condition === "only survey" ? [survey] : [left, right];
+      const fault = condition === "death" ? { health: 0, epoch: 4, safety: { clear: false, revision: 3 } } :
+        condition === "unsafe" ? { epoch: 4, safety: { clear: false, revision: 3 } } : {};
+      await f.observe(refusalTick, { ...state, ...fault, opportunities: remaining });
+      await f.actor.poll();
+      expect(requests).toHaveLength(recovery ? 3 : 2);
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      if (recovery) {
+        expect(await readFile(f.file("history.jsonl"), "utf8")).toContain('"reason":"opportunity_no_longer_witnessed"');
+        expect(requests[2]).toMatchObject({ observation: { tick: refusalTick, opportunities: [left, right] },
+          feedback: { kind: "failed_intent" }, work: { current: null } });
+        expect(f.actor.status()).toMatchObject({ issued: 1, staleDecisions: 1 });
+        second.resolve();
+        if (condition === "alternate") {
+          await f.actor.poll();
+          expect(parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")))).toMatchObject({
+            basisTick: refusalTick, opportunityId: left.id, skillHash: null,
+          });
+          return;
+        }
+        await f.observe(refusalTick + 5, { ...state, opportunities: [right] });
+        expect(f.actor.status()).toMatchObject({ issued: 1, staleDecisions: 2 });
+      }
+      for (const offset of [90, 170]) {
+        await f.observe(refusalTick + offset, { ...state, ...fault });
+        await f.observe(refusalTick + offset + 5, { ...state, ...fault,
+          opportunities: remaining.map(offer => ({ ...offer, id: `${offer.id}-${offset}` })),
+        });
+      }
+      expect(requests).toHaveLength(recovery ? 3 : 2);
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+    } finally {
+      opening.resolve();
+      first.resolve();
+      second.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
 test.each([
   "same survey", "duplicate loss", "different angle", "never returned", "expired", "new life", "changed epoch",
   "changed safety", "changed health", "changed stock", "abstained", "unprimed gap", "stale gap",
@@ -1400,12 +1492,21 @@ test.each(["invented follow", "direct stock quote", "ordinary work"] as const)(
   },
 );
 
-test("Explicit deferral retires the owner only on a native park and does not count as production", async () => {
+test.each(["wait", "setup then edge"] as const)(
+  "Explicit deferral retires the owner only on a native park and does not count as production: %s", async course => {
   const defer = { id: "fresh-defer", verb: "defer_pending", risk: "low", summary: "Leave the paid workshop",
     evidence: "The exact paid furnace released the controls." } as const;
+  const setup = { id: "same-dry-block", verb: "survey", risk: "low", summary: "Center on the same dry block",
+    evidence: "Off center facing visible cave water; recheck on this block without crossing a tile." } as const;
+  const setupSite = { routes: setup.evidence, choice: {
+    kind: "setup-cave-stance", opportunityId: setup.id, target: "workshop-support",
+  } } as const;
+  const setupHint = "Cave stance setup available after explicitly parking this paid batch: recheck visible cave water.";
   const requests: MacroRequest[] = [];
   const f = await durableFixture(async request => {
     requests.push(request);
+    const choice = request.observation.pendingWork?.worksite?.choice;
+    if (choice) return workReply(request, { kind: "opportunity", opportunityId: choice.opportunityId });
     if (request.observation.pendingWork?.parked) return workReply(request, { kind: "abstain" });
     if (!request.work?.current) return workReply(request, { kind: "work", policy: ironPolicy });
     return workReply(request, { kind: "defer-pending", pendingWorkId: request.work.current.id });
@@ -1420,6 +1521,7 @@ test("Explicit deferral retires the owner only on a native park and does not cou
     await f.observe(115, { goal: "diamond", inventory: held, workOrder: { id: batch.id, state: "working", detail: "Cooking",
       progress: { phase: "smelt", status: "Paid burn", breaks: 0, crafts: 0, placements: 1,
         smeltBurn: { burnTick: 111, units: 2, remainingCookTicks: 395 } } },
+      recent: course === "setup then edge" ? [setupHint] : [],
       pendingWork: { ...ticket, deferOfferId: defer.id }, opportunities: [defer] });
     await f.actor.poll();
     const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
@@ -1431,6 +1533,30 @@ test("Explicit deferral retires the owner only on a native park and does not cou
     const parked = { ...ticket, parked: true, yieldable: false, worksite: parkedStation };
     const atWorkshop = { goal: "diamond", inventory: held, quiescent: true,
       workOrder: { id: batch.id, state: "parked", detail: "Paid output remains in the station." } } as const;
+    if (course === "setup then edge") {
+      expect(requests[1]?.observation.recent).toContain(setupHint);
+      expect(requests[1]?.observation.opportunities.map(({ id }) => id)).toEqual([defer.id]);
+      const recoverable = { ...parked, collectOfferId: returnOffer.id };
+      await f.observe(117, { ...atWorkshop, opportunities: [returnOffer, setup],
+        pendingWork: { ...recoverable, worksite: setupSite } });
+      await f.actor.poll();
+      const stance = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      expect(stance).toMatchObject({ opportunityId: setup.id, basisTick: 117, skillHash: null });
+      await f.receipt(stance.id, 118, "accepted");
+      await f.receipt(stance.id, 125, "completed");
+      await f.observe(125, { ...atWorkshop, pendingWork: { ...parked, worksite: undefined } });
+      await f.actor.poll();
+      expect(requests).toHaveLength(3); // A receipt alone creates no crossing authority.
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      await f.observe(126, { ...atWorkshop, opportunities: [returnOffer, parkedCaveOffer],
+        pendingWork: { ...recoverable, worksite: parkedCave } });
+      await f.actor.poll();
+      const edge = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      expect(edge).toMatchObject({ opportunityId: parkedCaveOffer.id, basisTick: 126, skillHash: null });
+      expect(requests).toHaveLength(4);
+      expect(f.actor.status().completedModelWorkOrders).toBe(0);
+      return;
+    }
     await f.observe(116, { ...atWorkshop, pendingWork: parked });
     await expect(access(f.file("work.json"))).rejects.toThrow();
     expect(f.actor.status()).toMatchObject({ workOrder: null, completedModelWorkOrders: 0, completedReceipts: 0 });

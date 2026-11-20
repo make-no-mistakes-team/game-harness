@@ -1,6 +1,7 @@
 package io.gameharness.survival;
 
 import java.util.Set;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
@@ -12,6 +13,37 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class FootholdGeometryTest {
+    @Test
+    void witnessedDryOpeningBeatsAnUpperWaterCueWithoutAuthorizingTravel() {
+        var foot = new BlockPos(0, 32, 0);
+        var opening = new BlockHitResult(new Vec3d(3.3, 32, 0.6), Direction.UP, new BlockPos(3, 31, 0), false);
+        var upperWater = new BlockHitResult(new Vec3d(0.5, 33.6, -1.2), Direction.SOUTH, new BlockPos(0, 33, -2), false);
+        var dry = new AgentMacroControl.FurnaceLook(AgentMacroControl.FurnaceCue.OPENING, opening);
+        var water = new AgentMacroControl.FurnaceLook(AgentMacroControl.FurnaceCue.WATER, upperWater);
+        assertEquals(dry, AgentMacroControl.FurnaceLook.prefer(water, dry));
+        assertEquals(dry, AgentMacroControl.FurnaceLook.prefer(dry, water));
+        assertEquals(38.0f, dry.lookPitch(new Vec3d(0.5, 33.62, 0.5)));
+        assertFalse(AgentBody.drySurveyLaneCentered(foot, 0.88, 0.5, Direction.EAST),
+            "the distant ground landmark supplies a bearing, not a departure or an adjacent landing");
+    }
+
+    @Test
+    void workshopOffsetVetoesCrossingWithoutVetoingSameSupportSetup() {
+        var foot = new BlockPos(-275, 32, -572);
+        var actual = new Vec3d(-274.846, 32, -571.477); // 0.346 blocks off center in the workshop.
+        var center = Vec3d.ofBottomCenter(foot);
+        assertTrue(AgentBody.sameSurveySupport(foot.down(), actual));
+        for (Direction bearing : Direction.Type.HORIZONTAL) {
+            assertFalse(AgentBody.drySurveyLaneCentered(foot, actual.x, actual.z, bearing),
+                "no cave edge may leave this stance before local setup");
+            assertTrue(AgentBody.drySurveyLaneCentered(foot, center.x, center.z, bearing));
+            assertFalse(AgentBody.sameSurveySupport(foot.down(), center.add(
+                bearing.getOffsetX() * 0.51, 0, bearing.getOffsetZ() * 0.51)),
+                "same-block positioning cannot follow the body onto the next tile");
+        }
+        assertFalse(AgentBody.sameSurveySupport(foot.down(), actual.add(0, -0.5, 0)));
+    }
+
     @Test
     void canWitnessTwoSeparatedPointsBelowTheRetainedLedgeFromOrdinaryFooting() {
         var foot = new BlockPos(0, 30, 0);

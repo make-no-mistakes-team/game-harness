@@ -106,6 +106,9 @@ Finishing a short craft leaves time to scout. From a fresh view, Terra
 can check a specific cave opening or take a witnessed dry, level step with
 a way back to the furnace. A remembered opening can guide a look, but it
 doesn't establish that the ground ahead is safe to cross.
+If the player is standing at the edge of its own dry block, it can first
+center on that block and look at the ground toward the opening. This
+adjustment does not count as travel.
 
 Terra can also leave the batch for later. The player remembers the furnace
 and what went into it. Elapsed time does not put ingots in the inventory:

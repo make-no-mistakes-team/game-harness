@@ -351,12 +351,7 @@ final class AgentDryCaveRoute {
     }
 
     private boolean directSourceContact(BlockPos source, Direction facing) {
-        if (!offerStance(source)) return false;
-        double x = player.getX() - source.getX() - 0.5, z = player.getZ() - source.getZ() - 0.5;
-        double along = x * facing.getOffsetX() + z * facing.getOffsetZ();
-        double across = x * facing.getOffsetZ() - z * facing.getOffsetX();
-        // Admit ordinary grounded offsets, but leave margin inside Body's exact sweep.
-        return Math.abs(along) <= 0.25 && Math.abs(across) <= 0.17;
+        return offerStance(source) && AgentBody.drySurveyLaneCentered(source, player.getX(), player.getZ(), facing);
     }
 
     private boolean sameOfferSource(BlockPos source) {

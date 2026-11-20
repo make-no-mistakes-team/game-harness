@@ -127,6 +127,18 @@ test("Pending stock is not inventory or a permission to spend, replace, or renew
   expect(() => parseMacroObservation({ ...parked, opportunities: [recall, { ...cave, risk: "guarded" }] }))
     .toThrow("parked cave opportunity");
   expect(() => parseMacroObservation({ ...parked, workOrder: sample.workOrder })).toThrow("parked worksite scope");
+  const setup = { id: "same-block-setup", verb: "survey", risk: "low", summary: "Center on the same dry block",
+    evidence: "Off center facing cave water; recheck once without crossing any tile." };
+  const setupSite = { routes: setup.evidence, choice: {
+    kind: "setup-cave-stance", opportunityId: setup.id, target: "local-workshop-support",
+  } } as const;
+  const restored = { ...parked, opportunities: [recall, setup],
+    pendingWork: { ...parked.pendingWork, worksite: setupSite, historical: true } };
+  expect(parseMacroObservation(restored).pendingWork?.worksite).toEqual(setupSite);
+  expect(() => parseMacroObservation({ ...restored, pendingWork: { ...restored.pendingWork, collectOfferId: undefined } }))
+    .toThrow("parked cave opportunity");
+  expect(() => parseMacroObservation({ ...restored, pendingWork: { ...restored.pendingWork, worksite: undefined } }))
+    .toThrow("unscoped low-risk cave survey");
   const side = {
     target: { kind: "stock", item: "minecraft:cobblestone", count: 2 }, allowedEffects: ["break:minecraft:stone"],
     costCaps: [], reserves: [], maxBreaks: 2, maxCrafts: 0, maxPlacements: 0,

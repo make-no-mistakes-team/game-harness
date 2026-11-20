@@ -198,7 +198,8 @@ final class AgentMacroControl {
             this(id, key, summary, evidence, yaw, pitch, floor, face, drop, item, recipe, route, farther, null);
         }
     }
-    private record Snapshot(long epoch, Map<String, Offer> offers, String pendingTicket, boolean releasedWait) {}
+    private record Snapshot(long epoch, Map<String, Offer> offers, String pendingTicket, boolean releasedWait,
+                            AgentWorkOrder activeWork) {}
     private record Intent(String id, int life, long epoch, long basis, long expires, String opportunity, String skillHash) {}
     private record Handoff(int life, long epoch, long basis, long expires) {}
     private record Planning(int life, long epoch, long basis, String id, long noticedAt) {}
@@ -1041,6 +1042,16 @@ final class AgentMacroControl {
                 && (action == null || action.offer.key.verb != Verb.BREAK || !actualOwner.equals("terra"))) body.pauseWork();
     }
 
+    private static boolean sameWorkGrant(AgentWorkOrder previous, AgentWorkOrder next) {
+        return previous.policy().equals(next.policy()) && Objects.equals(previous.duringWaitFor(), next.duringWaitFor())
+            && next.basis() >= previous.basis();
+    }
+
+    static boolean canRenewWork(AgentWorkOrder witnessed, AgentWorkOrder active, AgentWorkOrder next) {
+        return witnessed != null && witnessed == active && sameWorkGrant(witnessed, next)
+            && next.expires() > witnessed.expires() && !witnessed.policy().smeltIron() && !witnessed.policy().waterFill();
+    }
+
     private void reconcileWork(AgentProgress progress) {
         WorkMailbox mailbox = input.work;
         AgentWorkOrder next = mailbox.order;
@@ -1066,31 +1077,32 @@ final class AgentMacroControl {
                 work.refusedPendingReplacement = true;
             }
         }
+        // A mutable echo cannot expand the already accepted, immutable permission.
+        boolean sameMailbox = next != null && work != null && work.order.id().equals(next.id());
+        boolean candidate = next != null && !sameMailbox && !consumed.containsKey(next.id());
+        Snapshot basis = candidate ? snapshots.get(next.basis()) : null;
+        AgentWorkOrder witnessed = basis == null ? null : basis.activeWork;
+        boolean compatible = canRenewWork(witnessed, hasActiveWorkOrder() ? work.order : null, next);
         boolean continuePersonal = false;
+        boolean renewPersonal = false;
         if (personalCraft != null) {
             boolean finished = work.phase.equals("complete");
             if (!personalCraftCurrent() || finished && !confirmsWorkStock()) {
                 releasePersonalCraft(true);
             } else {
-                boolean sameMailbox = next != null && work.order.id().equals(next.id());
+                renewPersonal = compatible;
                 continuePersonal = finished && next != null && next.id().equals(work.order.nextWorkId())
                     && next.basis() >= work.completedTick && !consumed.containsKey(next.id());
                 // The host normally removes the completed mailbox before publishing its successor.
-                if (!continuePersonal && !sameMailbox && (mailbox.present || !finished)) releasePersonalCraft(true);
+                if (!continuePersonal && !renewPersonal && !sameMailbox && (mailbox.present || !finished)) releasePersonalCraft(true);
             }
         }
-        // A mutable echo cannot expand or interrupt the already accepted, immutable permission.
-        if (work != null && next != null && work.order.id().equals(next.id())) return;
-
-        if (next != null && !consumed.containsKey(next.id())) {
+        if (candidate) {
             updateScope(true);
-            Snapshot basis = snapshots.get(next.basis());
             Offer water = next.policy() != null && next.policy().waterFill() && basis != null
                 ? basis.offers.values().stream().filter(offer -> offer.key.verb == Verb.WATER_CLUE && offer.face != null)
                     .findFirst().orElse(null) : null;
-            boolean samePolicy = work != null && work.order.policy().equals(next.policy())
-                && Objects.equals(work.order.duringWaitFor(), next.duringWaitFor()) && next.basis() >= work.order.basis();
-            boolean compatible = hasActiveWorkOrder() && samePolicy;
+            boolean samePolicy = work != null && sameWorkGrant(work.order, next);
             boolean independent = next.duringWaitFor() != null;
             boolean inFlight = action != null && (action.tread != null && !grounded()
                 || action.offer.route != null && progress.dryRouteInFlight(action.offer.route));
@@ -1098,6 +1110,10 @@ final class AgentMacroControl {
                 if (continuePersonal) releasePersonalCraft(true);
                 markConsumed(next.id());
                 receipt(next.id(), next.life(), "refused", "The work order contains an unsupported target or effect.");
+            } else if (witnessed != null && sameWorkGrant(witnessed, next) && !compatible) {
+                // A lease refresh arriving after retirement cannot start a fresh motor or budget.
+                markConsumed(next.id());
+                receipt(next.id(), next.life(), "refused", "The witnessed ordinary work order can no longer be renewed.");
             } else if (next.life() != life || !compatible && next.epoch() != epoch || next.basis() > tick
                     || tick - next.basis() >= MAX_WORK_ADMISSION_AGE || tick >= next.expires()
                     || next.safetyRevision() != safetyRevision || basis == null || basis.epoch != next.epoch()
@@ -1158,7 +1174,7 @@ final class AgentMacroControl {
                     Item goalStock = goalStock(next.policy().target());
                     work.startingStock = goalStock == null ? 0 : count(goalStock);
                 }
-                if (continuePersonal) personalCraft = new PersonalCraft(next, personalCraft.untilTick,
+                if (continuePersonal || renewPersonal) personalCraft = new PersonalCraft(next, personalCraft.untilTick,
                     personalCraft.untilNanos, personalCraft.tableInReach);
                 markConsumed(next.id());
                 receipt(next.id(), life, "accepted", independent
@@ -6384,7 +6400,7 @@ final class AgentMacroControl {
         }
         if (trackSurvey) observeSurveyPublication(publishedSurveys);
         snapshots.put(tick, new Snapshot(epoch, witnessed.isEmpty() ? Map.of() : witnessed,
-            ticket == null ? null : ticket.ticket().toString(), yieldable));
+            ticket == null ? null : ticket.ticket().toString(), yieldable, hasActiveWorkOrder() ? work.order : null));
         while (!snapshots.isEmpty() && snapshots.firstEntry().getKey() < tick - MAX_AGE) snapshots.pollFirstEntry();
         value.add("opportunities", opportunities);
         String watched = retainedFurnaceFact();

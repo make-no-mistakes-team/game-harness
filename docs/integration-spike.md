@@ -115,6 +115,13 @@ inventory. A bucket job proposed with `afterWorkId` must still wait for
 collection and a fresh check of all three ingots, the protected stock
 and the crafting table.
 
+At a `renew` demand, Terra can extend the accepted ordinary job with
+`renew-work`, its exact work order ID, and a later bounded expiry. The
+player keeps the same action and spent budget. This can extend a cave leg
+while the furnace stays parked; it cannot extend the paid batch or a bucket
+fill. Use `afterWorkId` for a different objective that needs the predecessor
+to finish, not for the stock target that completion would already satisfy.
+
 Goal-only startup, built-in presets, generated skills, direct opportunities,
 and work programs cannot grant furnace transfers. A completed smelt does not
 establish a diamond pickup, bucket craft, or Nether entry.

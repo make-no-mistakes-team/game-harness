@@ -77,9 +77,10 @@ async function durableFixture(strategist: MacroStrategist, objective?: string, m
     await actor.poll();
   }
   const order = async () => JSON.parse(await readFile(file("work.json"), "utf8"));
-  function receipt(id: string, tick: number, status: "accepted" | "parked" | "completed" | "interrupted" | "refused") {
+  function receipt(id: string, tick: number, status: "accepted" | "parked" | "completed" | "interrupted" | "refused",
+    detail = `native job ${status}`) {
     return writeFile(file("native-receipts.jsonl"), `${JSON.stringify({
-      v: 1, id, run, life: 1, tick, status, detail: `native job ${status}`,
+      v: 1, id, run, life: 1, tick, status, detail,
     })}\n`, { flag: "a", mode: 0o600 });
   }
   await actor.start();
@@ -230,7 +231,7 @@ test.each(["exact source", "only flow", "reserved bucket", "select clue"] as con
       : { kind: "work", policy: {
         target: { kind: "stock", item: waterBucket, count: 1 }, allowedEffects: ["fill:minecraft:water"],
         costCaps: [{ item: bucket, count: 1 }], reserves, maxBreaks: 0, maxCrafts: 0, maxPlacements: 0,
-      } }), "Fill the bucket only from a reachable source without losing the pickaxe.", 1);
+      } }), "Fill the bucket only from a reachable source without losing the pickaxe.", condition === "exact source" ? 2 : 1);
     try {
       await f.observe(20, {
         goal: "diamond", quiescent: true, inventory: { [bucket]: 1, [pickaxe]: 1 },
@@ -245,9 +246,14 @@ test.each(["exact source", "only flow", "reserved bucket", "select clue"] as con
       await f.actor.poll();
       await expect(access(f.file("intent.json"))).rejects.toThrow();
       if (condition === "exact source") {
-        expect(await f.order()).toMatchObject({ origin: "model", basisTick: 20,
+        const fill = await f.order();
+        expect(fill).toMatchObject({ origin: "model", basisTick: 20,
           target: { item: waterBucket, count: 1 }, allowedEffects: ["fill:minecraft:water"], reserves });
-        expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 0 });
+        await f.receipt(fill.id, 21, "accepted");
+        await f.observe(fill.expiresTick - 30, { goal: "diamond", inventory: { [bucket]: 1, [pickaxe]: 1 },
+          workOrder: { id: fill.id, state: "working", detail: "Awaiting the exact vanilla bucket swap" } });
+        expect(await f.order()).toEqual(fill);
+        expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 0, providerDispatches: 1 });
       } else {
         await expect(access(f.file("work.json"))).rejects.toThrow();
         expect(await readFile(f.file("history.jsonl"), "utf8")).toContain(condition === "only flow"
@@ -799,6 +805,7 @@ test("Renewal replaces the lease before exhaustion and revoke waits for the real
     demands.push(demand);
     return workReply(request, demands.length === 3
       ? { kind: "revoke-work", workOrderId: demand.current!.id }
+      : demand.renewal ? { kind: "renew-work", workOrderId: demand.renewal.workOrderId }
       : { kind: "work", policy: demand.current!.policy });
   }, undefined, 3);
   try {
@@ -815,7 +822,7 @@ test("Renewal replaces the lease before exhaustion and revoke waits for the real
     expect(renewed.id).not.toBe(first.id);
     expect(renewed.expiresTick).toBeGreaterThan(first.expiresTick);
     expect(demands.map(demand => demand.demand)).toEqual(["first", "renew"]);
-    await f.receipt(first.id, 1121, "interrupted");
+    await f.receipt(first.id, 1121, "interrupted", "Replaced by a compatible work order.");
     await f.receipt(renewed.id, 1121, "accepted");
     await f.observe(1121, { workOrder: working(renewed.id), epoch: 3 });
     expect(f.actor.status()).toMatchObject({ issuedWorkOrders: 2, unresolvedWorkOrders: 1 });
@@ -835,6 +842,100 @@ test("Renewal replaces the lease before exhaustion and revoke waits for the real
     await f.clean();
   }
 });
+
+test.each(["renew", "repeated policy", "repeated successor", "late reply", "wrong ID", "unchanged expiry",
+  "native refusal", "late receipt", "incompatible receipt"] as const)(
+  "The zWuI7n prospect keeps its existing grant across a renewal decision: %s", async choice => {
+    const policy = {
+      target: { kind: "stock", item: "minecraft:diamond", count: 1 },
+      allowedEffects: ["prospect:minecraft:diamond", "break:minecraft:deepslate_diamond_ore",
+        "break:minecraft:deepslate", "place:minecraft:torch", "place:minecraft:cobblestone"],
+      costCaps: [{ item: "minecraft:torch", count: 3 }, { item: "minecraft:cobblestone", count: 2 }],
+      reserves: [{ item: "minecraft:iron_pickaxe", count: 1 }],
+      maxBreaks: 40, maxCrafts: 0, maxPlacements: 4,
+    } as const;
+    const requests: MacroRequest[] = [];
+    const reply = Promise.withResolvers<void>();
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1) return workReply(request, { kind: "work", policy }, 1200);
+      await reply.promise;
+      const id = request.work!.current!.id;
+      if (choice === "repeated policy") return workReply(request, { kind: "work", policy });
+      if (choice === "repeated successor") return workReply(request, { kind: "work", afterWorkId: id,
+        policy: { ...policy, maxBreaks: 41 } });
+      return workReply(request, { kind: "renew-work", workOrderId: choice === "wrong ID" ? "unaccepted-order" : id },
+        choice === "unchanged expiry" ? 740 : 1100);
+    }, "Continue the returnable prospect while preserving the iron pickaxe.", 4);
+    const world = { goal: "diamond", inventory: { "minecraft:iron_pickaxe": 1, "minecraft:torch": 2, "minecraft:cobblestone": 1 } };
+    try {
+      await f.observe(2187, world);
+      await f.actor.poll();
+      const original = await f.order();
+      expect(original.expiresTick).toBe(3387);
+      await f.receipt(original.id, 2188, "accepted");
+      const progress = { phase: "route", status: "Following a returnable shelf",
+        breaks: 12, crafts: 0, placements: 2, replan: "expiry_near" } as const;
+      const workOrder = { id: original.id, state: "needs_replan", detail: "Prospect running", progress } as const;
+      await f.observe(2647, { ...world, workOrder });
+      expect(requests[1]?.work).toMatchObject({
+        demand: "renew", renewal: { workOrderId: original.id },
+        current: { accepted: { tick: 2188 }, expiresTick: 3387, nativeState: { progress } },
+      });
+
+      // 8.1 seconds at 20 ticks/s; movement may change the observation epoch.
+      await f.observe(choice === "late reply" ? 3387 : 2809, { ...world, epoch: 2, workOrder });
+      reply.resolve();
+      await f.actor.poll();
+      if (choice === "late reply") {
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+        expect(f.actor.status().issuedWorkOrders).toBe(1);
+      } else if (choice === "repeated policy" || choice === "repeated successor" || choice === "wrong ID" || choice === "unchanged expiry") {
+        expect(await f.order()).toEqual(original);
+        expect(f.actor.status().workQueuedAfter).toBeNull();
+        if (choice === "repeated successor") {
+          await f.observe(2810, { ...world, epoch: 2, workOrder });
+          await f.actor.poll();
+          expect(requests[2]?.work).toMatchObject({ demand: "renew", renewal: { workOrderId: original.id } });
+          expect(requests[2]?.feedback?.detail).toContain("renew-work");
+          await f.observe(2860, { ...world, epoch: 2, workOrder });
+          expect(requests).toHaveLength(3);
+          expect(f.actor.status().workQueuedAfter).toBeNull();
+        }
+      } else {
+        const renewed = await f.order();
+        expect(renewed).toEqual({ ...original, id: renewed.id, basisTick: 2809, epoch: 2, expiresTick: 3747 });
+        expect(renewed.id).not.toBe(original.id);
+        expect(f.actor.status().workOrder?.id).toBe(original.id); // Publication is not native acceptance.
+        if (choice === "native refusal") {
+          await f.receipt(renewed.id, 2810, "refused");
+          await f.observe(2810, { ...world, epoch: 2, workOrder });
+          expect(await f.order()).toEqual(original);
+          return;
+        }
+        const acceptedAt = choice === "late receipt" ? 3387 : 2810;
+        await f.receipt(original.id, acceptedAt, "interrupted", choice === "incompatible receipt"
+          ? "The finite work horizon expired." : "Replaced by a compatible work order.");
+        await f.receipt(renewed.id, acceptedAt, "accepted");
+        await f.observe(3388, { ...world, epoch: 2, workOrder: { ...workOrder, id: renewed.id,
+          state: "working", progress: { ...progress, replan: undefined } } });
+        if (choice === "late receipt" || choice === "incompatible receipt") {
+          await expect(access(f.file("work.json"))).rejects.toThrow();
+          expect(f.actor.status().lastWorkOrder?.id).toBe(original.id);
+          const receipts = await readFile(f.file("receipts.jsonl"), "utf8");
+          expect(receipts).toContain('"invalidRenewal":true');
+          return;
+        }
+        expect(f.actor.status().workOrder).toMatchObject({ id: renewed.id, accepted: { tick: 2810 } });
+        expect(f.actor.status()).toMatchObject({ issuedWorkOrders: 2, completedWorkOrders: 0, providerDispatches: 2 });
+      }
+    } finally {
+      reply.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
 
 test("Request exhaustion does not invent a successor or interrupt compatible admitted work", async () => {
   const f = await durableFixture(async request => workReply(request, { kind: "abstain" }), undefined, 1);
@@ -1279,6 +1380,7 @@ test("Ordinary cave work can outlast cooking and renew without spending the queu
     if (requests.length === 1) return workReply(request, { kind: "work", policy: ironPolicy });
     if (request.observation.tick === 540 && request.work?.pendingPredecessor)
       return workReply(request, { kind: "work", policy: bucket, afterWorkId: request.work.pendingPredecessor.id });
+    if (request.work?.renewal) return workReply(request, { kind: "renew-work", workOrderId: request.work.renewal.workOrderId });
     if (request.work?.duringWaitFor && request.work.current)
       return workReply(request, { kind: "work", policy: mining, duringWaitFor: request.work.duringWaitFor });
     if (ticket?.collectOfferId) return workReply(request, { kind: "collect-pending", pendingWorkId: ticket.id });
@@ -1325,7 +1427,7 @@ test("Ordinary cave work can outlast cooking and renew without spending the queu
     expect(requests[3]?.work).toMatchObject({ demand: "renew", pendingPredecessor: { id: batch.id, queuedTarget: bucket.target } });
     expect(requests[3]?.observation.pendingWork?.returnClue).toBe("walked_route");
     expect(requests[3]?.observation.inventory[ironItem]).toBe(1);
-    await f.receipt(leg.id, 1141, "interrupted");
+    await f.receipt(leg.id, 1141, "interrupted", "Replaced by a compatible work order.");
     await f.receipt(renewal.id, 1141, "accepted");
     const mined = { ...held, [iron]: 6 };
     await f.receipt(renewal.id, 1230, "completed");

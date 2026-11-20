@@ -24,6 +24,16 @@ test("Work program caps apply across stages and a later job cannot lower an earl
   expect(() => parseMacroProposal(proposal(first, next(24, 1, 304)))).toThrow("work program reserves regressed");
 });
 
+test("Renewal accepts only an exact job ID and the proposal's finite expiry", () => {
+  const lease = { action: { kind: "renew-work", workOrderId: "active-job" }, expiresTick: 300,
+    subgoal: "Finish the prospect", reason: "Dry path remains", successCondition: "One diamond is held",
+    contingency: "Stop at water", alternative: "Return to the furnace" } as const;
+  expect(parseMacroProposal(lease).action).toEqual(lease.action);
+  for (const field of ["policy", "afterWorkId", "duringWaitFor", "maxPlacements", "expiresTick"])
+    expect(() => parseMacroProposal({ ...lease, action: { ...lease.action, [field]: 1 } })).toThrow("renew-work");
+  expect(() => parseMacroProposal({ ...lease, expiresTick: Infinity })).toThrow("proposal expiry");
+});
+
 test("A personal crafting handoff can name only the immediate stage of the original program", () => {
   const order = {
     v: 1, id: "program:1", run: "run", life: 1, epoch: 1, basisTick: 10, expiresTick: 100, safetyRevision: 1, origin: "model",

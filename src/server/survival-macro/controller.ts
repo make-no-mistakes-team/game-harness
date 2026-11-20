@@ -68,6 +68,7 @@ const FEEDBACK: Readonly<Record<string, string>> = Object.freeze({
 });
 const WORK_ADMISSION_TICKS = 40;
 const WORK_REPLAN_GAP_TICKS = 80;
+const COMPATIBLE_WORK_RECEIPT = "Replaced by a compatible work order.";
 const PARKED_VIEW_WAIT_TICKS = 20;
 const PARKED_VIEW_WAIT_MS = 1_200;
 const SURVEY_RECOVERY_TICKS = 600;
@@ -196,6 +197,7 @@ interface ReplyCorrection {
   readonly observation: MacroObservation;
   readonly key: string;
   readonly feedback: MacroFeedback;
+  readonly renewal?: WorkJob;
 }
 
 interface IntentRecoveryScope {
@@ -315,6 +317,7 @@ interface WorkJob {
   readonly source: MacroObservation;
   readonly requestId: string | null;
   health: number;
+  readonly renews?: WorkJob;
   bootstrap?: number;
   smeltLookedAhead?: true;
   pendingPurpose?: Pick<MacroProposal, "subgoal" | "reason">;
@@ -898,7 +901,8 @@ export class SurvivalMacroController {
     }
     const job = this.job;
     if (job) {
-      if (runtimeExpired || !current || !workScope(job.source, current, job.health) || current.tick >= job.order.expiresTick) {
+      if (runtimeExpired || !current || !workScope(job.source, current, job.health) || current.tick >= job.order.expiresTick ||
+          (job.renews && !job.accepted && current.tick >= job.renews.order.expiresTick)) {
         if (runtimeExpired || !current || !await this.restorePreviousWork(job, current, "candidate_scope_safety_or_ttl_changed")) {
           await this.withdrawWork(runtimeExpired ? "runtime_wall_limit" : "work_scope_safety_or_ttl_changed");
         }
@@ -1329,6 +1333,17 @@ export class SurvivalMacroController {
       workScope(incumbent.source, observation, incumbent.health);
   }
 
+  private canRenewWork(job: WorkJob, observation: MacroObservation): boolean {
+    const native = observation.workOrder;
+    const { order, policy } = job;
+    return this.job === job && !this.previousJob && !!job.accepted && job.accepted.tick <= observation.tick &&
+      !job.terminal && !job.withdrawn && !job.parked && observation.tick < order.expiresTick &&
+      native?.id === order.id && (native.state === "working" || native.state === "needs_replan") &&
+      workScope(job.source, observation, job.health) &&
+      !policy.allowedEffects.includes(MACRO_IRON_SMELT) && !policy.allowedEffects.includes(MACRO_WATER_FILL) &&
+      (!order.duringWaitFor || this.parkedOrdinaryWindow(order.duringWaitFor, observation, job));
+  }
+
   private async scheduleWork(view: View, queue?: QueuedWork): Promise<void> {
     const { observation } = view;
     const job = this.job;
@@ -1363,7 +1378,8 @@ export class SurvivalMacroController {
     }
     const previous = this.workQuery;
     const replan = nativeState?.progress?.replan;
-    const needsRenewal = !!job && (replan === "expiry_near" || job.order.expiresTick - observation.tick <= this.renewLeadTicks);
+    const needsRenewal = !!job && this.canRenewWork(job, observation) &&
+      (replan === "expiry_near" || job.order.expiresTick - observation.tick <= this.renewLeadTicks);
     const target = job?.policy.target;
     const lastEffect = nativeState?.progress?.lastEffect;
     const productive = !!lastEffect && observation.tick - lastEffect.tick <= 120;
@@ -1381,8 +1397,8 @@ export class SurvivalMacroController {
     overlap ??= owner && !this.workOverlapRequests.has(owner) && job?.accepted && !job.terminal && !job.withdrawn &&
       (!queue || queue.after === job) && (nativeState?.state === "working" || nativeState?.state === "needs_replan") &&
       (repair || openingTail) ? { incumbent: job, queue } : undefined;
-    // A queued path already supplies the next course unless new evidence makes
-    // that path doubtful, or the last productive opening job has no goal result.
+    // Programs already supply the next course and share one fixed expiry.
+    // Only query over a queued path for the existing overlap decisions.
     if ((queue || shortagePending) && !overlap) return;
     let nearStockTarget = false;
     if (job?.accepted && target?.kind === "stock") {
@@ -1407,12 +1423,12 @@ export class SurvivalMacroController {
       demand = "successor";
       key = overlap.smeltBurnTick === undefined ? `queued-successor:${owner}:${overlap.incumbent.order.id}` :
         `smelt-successor:${overlap.incumbent.order.id}`;
-    } else if (!previous) {
-      demand = "first";
-      key = needsRenewal ? `renew:${job!.order.id}` : `first:${observation.life}`;
     } else if (needsRenewal) {
       demand = "renew";
       key = `renew:${job!.order.id}`;
+    } else if (!previous) {
+      demand = "first";
+      key = `first:${observation.life}`;
     } else if (nextCourse) {
       demand = "successor";
       key = `successor:${job!.order.id}`;
@@ -1424,7 +1440,11 @@ export class SurvivalMacroController {
       key = evidence;
     }
     if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew") return;
-    const correction = !job ? this.replyCorrection : undefined;
+    const pendingCorrection = this.replyCorrection;
+    const correction = pendingCorrection?.renewal
+      ? demand === "renew" && pendingCorrection.renewal === job && observation.tick > pendingCorrection.observation.tick
+        ? pendingCorrection : undefined
+      : !job ? pendingCorrection : undefined;
     const unchanged = previous && (key === previous.key || (!job && demand === "changed" && previous.evidence === evidence));
     const recovery = this.intentRecovery;
     const reconsideration = !job && !correction && !queue ? (
@@ -1456,6 +1476,7 @@ export class SurvivalMacroController {
       protectedReserves: this.floorScope?.life === observation.life ? this.floorScope.reserves : [],
       current: job ? { id: job.order.id, origin: job.order.origin, policy: job.policy,
         expiresTick: job.order.expiresTick, accepted: job.accepted ?? null, nativeState } : null,
+      ...(demand === "renew" && job ? { renewal: { workOrderId: job.order.id } } : {}),
       ...(duringWaitFor ? { duringWaitFor } : {}),
       ...(pendingPredecessor ? { pendingPredecessor } : {}),
       ...(purpose ? { pendingPurpose: { id: ticket!.id, ...purpose } } : {}),
@@ -1738,6 +1759,7 @@ export class SurvivalMacroController {
     stage?: WorkStageIds,
     preflight?: (observation: MacroObservation) => boolean | Promise<boolean>,
     duringWaitFor?: string,
+    renewal?: WorkJob,
   ): Promise<WorkJob | null | undefined> {
     const fresh = await this.refresh();
     if (!fresh) return null;
@@ -1763,7 +1785,8 @@ export class SurvivalMacroController {
       if (requestId) await this.disposition("proposal_refused", { requestId, reason: "One pending production obligation is already outstanding." });
       return;
     }
-    const equivalent = !!previous && workPolicyKey(previous.policy) === workPolicyKey(policy);
+    const equivalent = !!previous && previous.order.duringWaitFor === duringWaitFor &&
+      (previous.policy === policy || workPolicyKey(previous.policy) === workPolicyKey(policy));
     const { target, reserves } = policy;
     const inherited = this.floorScope?.life === fresh.life ? this.floorScope.reserves : [];
     const reduced = inherited.some(({ item, count }) => (reserves.find(floor => floor.item === item)?.count ?? 0) < count);
@@ -1773,8 +1796,7 @@ export class SurvivalMacroController {
       if (requestId) await this.disposition("proposal_refused", { requestId, reason: "Live stock or target does not support the proposed work policy." });
       return;
     }
-    if (equivalent && (previous.order.expiresTick >= expiresTick ||
-        previous.order.expiresTick - fresh.tick > this.renewLeadTicks)) {
+    if (equivalent && !renewal) {
       await this.record("work_order_retained", { requestId, id: previous.order.id, expiresTick: previous.order.expiresTick });
       return previous;
     }
@@ -1791,7 +1813,8 @@ export class SurvivalMacroController {
     await this.ipc!.write("work.json", order, previous ? "work-only" : undefined);
     if (duringWaitFor === previous?.order.id && previous) previous.independentPublished = true;
     if (previous?.accepted) this.previousJob = previous;
-    this.job = this.newestJob = { order, policy, requestId, source: fresh, health: fresh.health };
+    this.job = this.newestJob = { order, policy, requestId, source: renewal?.source ?? fresh, health: fresh.health,
+      ...(renewal ? { renews: renewal } : {}) };
     this.jobs.set(order.id, this.job);
     await this.disposition(previous ? equivalent ? "work_order_renewal_proposed" : "work_order_replacement_proposed" : "work_order_issued",
       { requestId, id: order.id, previousId: previous?.order.id ?? null, origin: order.origin });
@@ -1913,11 +1936,14 @@ export class SurvivalMacroController {
   }
 
   private replyCorrectionApplies(correction: ReplyCorrection, current: MacroObservation): boolean {
+    if (correction.renewal) return this.sameReplyContext(correction, current);
     return !this.job && !this.previousJob && !this.queuedWork && !this.pending && !this.direct && !this.segment &&
       !this.conditional && !this.lease && this.sameReplyContext(correction, current);
   }
 
   private sameReplyContext(correction: ReplyCorrection, current: MacroObservation): boolean {
+    if (correction.renewal) return this.canRenewWork(correction.renewal, current) &&
+      workScope(correction.observation, current);
     return sameLiveCorrectionScope(correction.observation, current) && this.liveReplyKey(current) === correction.key;
   }
 
@@ -2043,9 +2069,15 @@ export class SurvivalMacroController {
     }
     if (prior) return;
     const priorLife = (this.view?.observation.life ?? receipt.life) > receipt.life;
-    const eligible = !job.withdrawn && !priorLife;
+    const incumbent = job.renews;
+    const invalidRenewal = receipt.status === "accepted" && incumbent && (
+      receipt.tick >= incumbent.order.expiresTick || receipt.tick - order.basisTick >= WORK_ADMISSION_TICKS ||
+      incumbent.terminal?.status !== "interrupted" ||
+      incumbent.terminal.tick !== receipt.tick || incumbent.terminal.detail !== COMPATIBLE_WORK_RECEIPT);
+    const eligible = !job.withdrawn && !priorLife && !invalidRenewal;
     await this.append(this.receipts, { requestId: job.requestId, order, receipt, eligible,
       ...(job.bootstrap ? { stage: PRE_SPAWN_GOAL_ONLY, programStage: job.bootstrap } : {}),
+      ...(invalidRenewal ? { invalidRenewal: true } : {}),
       ...(job.withdrawn ? { afterWithdrawal: true } : {}), ...(priorLife ? { priorLife: true } : {}) });
     if (receipt.status === "accepted") {
       if (order.duringWaitFor && !this.jobs.get(order.duringWaitFor)?.parked)
@@ -2055,6 +2087,10 @@ export class SurvivalMacroController {
         this.lastAcceptedJob = job;
         this.completedWorkProgram = null;
         this.retainFloors(job.order.life, job.policy.reserves);
+      }
+      if (invalidRenewal && this.job === job) {
+        await this.withdrawWork("native_renewal_not_compatible", job.requestId ?? undefined);
+        return;
       }
       if (this.job === job) this.previousJob = undefined;
       return;
@@ -2522,6 +2558,20 @@ export class SurvivalMacroController {
         reason: "A parked worksite with no current world view grants no live action." });
       return;
     }
+    if (action.kind === "renew-work") {
+      const job = this.job;
+      if (context.workDemand?.demand === "renew" && context.workDemand.renewal?.workOrderId === action.workOrderId &&
+          job?.order.id === action.workOrderId && proposal.expiresTick > job.order.expiresTick &&
+          this.canRenewWork(job, current)) {
+        const renewed = await this.publishWork(original, job.policy, job.order.origin, context.requestId, proposal.expiresTick,
+          [], undefined, fresh => this.canRenewWork(job, fresh) && this.pendingDecisionCurrent(context, fresh),
+          undefined, undefined, job.order.duringWaitFor, job);
+        if (renewed) return;
+      }
+      await this.disposition("proposal_refused", { requestId: context.requestId,
+        reason: "Renewal requires the same offered ordinary job to still be active and a later finite expiry." });
+      return;
+    }
     if (action.kind === "collect-pending" || action.kind === "defer-pending") {
       const ticket = context.observation.pendingWork;
       if (!context.workDemand || ticket?.id !== action.pendingWorkId) {
@@ -2584,6 +2634,21 @@ export class SurvivalMacroController {
             !context.workDemand.current.accepted)) ||
             (after.terminal ? after.terminal.status !== "completed" : paidPredecessor ? !after.parked && this.job !== after : this.job !== after)) {
           await this.disposition("proposal_refused", { requestId: context.requestId, reason: "Successor requires the same accepted work job." });
+          return;
+        }
+        const previousTarget = after.policy.target;
+        const nextTarget = stages[0]!.policy.target;
+        if (previousTarget.kind === "stock" && nextTarget.kind === "stock" &&
+            nextTarget.item === previousTarget.item && nextTarget.count === previousTarget.count) {
+          const reason = "That stock target would already be satisfied after the predecessor completes.";
+          await this.disposition("proposal_refused", { requestId: context.requestId, reason });
+          const key = `renew:${after.order.id}`;
+          if (!context.correction && !this.correctedContexts.has(key) && context.workDemand.renewal?.workOrderId === after.order.id &&
+              this.canRenewWork(after, current) && after.order.expiresTick - current.tick > WORK_ADMISSION_TICKS) {
+            this.replyCorrection = { requestId: context.requestId, observation: original, key,
+              renewal: after,
+              feedback: { kind: "invalid_reply", detail: `${reason} No work was queued. Use renew-work to continue the same job, select a different objective, or abstain.` } };
+          }
           return;
         }
         if (!paidPredecessor && after.order.duringWaitFor && stages.some(({ policy }) => !isIndependentPendingPolicy(policy))) {

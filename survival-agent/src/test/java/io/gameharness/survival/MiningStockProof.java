@@ -593,6 +593,40 @@ final class MiningStockProof {
     }
 
     @Test
+    void leaseRefreshRequiresTheExactStillActiveOrdinarySession() {
+        var raw = JsonParser.parseString("""
+            {"v":1,"id":"prospect","run":"run","life":1,"epoch":1,"basisTick":2187,"expiresTick":3387,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:diamond","count":1},
+             "allowedEffects":["prospect:minecraft:diamond","break:minecraft:deepslate_diamond_ore","place:minecraft:torch"],
+             "costCaps":[{"item":"minecraft:torch","count":3}],"reserves":[{"item":"minecraft:iron_pickaxe","count":1}],
+             "maxBreaks":40,"maxCrafts":0,"maxPlacements":3,"duringWaitFor":"paid-furnace"}
+            """).getAsJsonObject();
+        var original = AgentWorkOrder.parse(raw, "run", "constrained");
+        raw.addProperty("id", "renewed");
+        raw.addProperty("basisTick", 2809);
+        raw.addProperty("expiresTick", 3747);
+        var renewed = AgentWorkOrder.parse(raw, "run", "constrained");
+        require(AgentMacroControl.canRenewWork(original, original, renewed),
+            "an exact lease refresh uses the witnessed active session");
+        require(!AgentMacroControl.canRenewWork(original, null, renewed),
+            "arrival after the original retired must not turn time into a new session");
+        require(!AgentMacroControl.canRenewWork(original, renewed, renewed),
+            "another active order with the same policy does not own the witnessed session");
+        raw.addProperty("maxPlacements", 4);
+        require(!AgentMacroControl.canRenewWork(original, original, AgentWorkOrder.parse(raw, "run", "constrained")),
+            "renewal does not increase placement permission");
+        raw.addProperty("maxPlacements", 3);
+        raw.addProperty("duringWaitFor", "another-furnace");
+        require(!AgentMacroControl.canRenewWork(original, original, AgentWorkOrder.parse(raw, "run", "constrained")),
+            "renewal does not change the separately paid obligation");
+        var smelt = AgentWorkOrder.parse(ironWorkQuote(), "run", "preset");
+        var freshSmelt = new AgentWorkOrder("renewed-smelt", smelt.life(), smelt.epoch(), 50, 950,
+            smelt.safetyRevision(), smelt.policy(), null, null);
+        require(!AgentMacroControl.canRenewWork(smelt, smelt, freshSmelt),
+            "the paid batch is not an ordinary session");
+    }
+
+    @Test
     void onlyAnExposedSourceWaterBlockCanBeConsideredForTheFill() {
         var water = Blocks.WATER.getDefaultState();
         require(AgentBody.exactWaterSource(water), "ordinary still water is eligible");

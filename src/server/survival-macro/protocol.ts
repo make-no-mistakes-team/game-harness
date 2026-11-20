@@ -260,6 +260,8 @@ export interface MacroWorkDemand {
     readonly accepted: MacroReceipt | null;
     readonly nativeState: MacroWorkState | null;
   } | null;
+  /** Time-only authority for this accepted ordinary job, offered only on a renew demand. */
+  readonly renewal?: { readonly workOrderId: string };
   /** The one native ticket this decision may use for independent work. */
   readonly duringWaitFor?: string;
   /** A parked decision uses fresh local facts, or explicitly reports a bounded view wait. */
@@ -316,6 +318,7 @@ export interface MacroProposal {
     | { readonly kind: "work"; readonly policy: MacroWorkPolicy; readonly afterWorkId?: string; readonly duringWaitFor?: string;
         readonly duringWait?: { readonly policy: MacroWorkPolicy; readonly maxTicks: number } }
     | { readonly kind: "work-program"; readonly stages: readonly MacroWorkStage[]; readonly afterWorkId?: string }
+    | { readonly kind: "renew-work"; readonly workOrderId: string }
     | { readonly kind: "revoke-work"; readonly workOrderId: string }
     | { readonly kind: "collect-pending" | "defer-pending"; readonly pendingWorkId: string }
     | { readonly kind: "skill"; readonly candidate: MacroSkillCandidate }
@@ -413,6 +416,7 @@ const replyRejections = {
   successor: "A conditional successor must name the offered predecessor and a candidate from this lookahead.",
   work_unavailable: "A work policy requires an offered work context.",
   wrong_work_id: "Use the exact applicable work ID from this request; a successor needs a matching accepted job.",
+  renewal_expiry: "Set expiresTick after the current work expiry and within maxIntentTtlTicks of basis.tick.",
   wrong_preset_goal: "A preset work target must equal the live invocation goal.",
   active_work: "An active job admits work policies, a scoped revoke, a genuine gap, or abstention; not a primitive or skill.",
   missing_opportunity: "Select an exact opportunityId offered in the current observation.",
@@ -925,7 +929,7 @@ export function parseMacroProposal(value: unknown): MacroProposal {
   ]);
   const rawAction = object(record.action, "action");
   const kind = choice(rawAction.kind, "action kind",
-    ["opportunity", "continuation", "successor", "work", "work-program", "revoke-work", "collect-pending", "defer-pending",
+    ["opportunity", "continuation", "successor", "work", "work-program", "renew-work", "revoke-work", "collect-pending", "defer-pending",
       "skill", "tested-skill", "selected-skill", "gap", "abstain"] as const);
   let action: MacroProposal["action"];
   switch (kind) {
@@ -949,9 +953,10 @@ export function parseMacroProposal(value: unknown): MacroProposal {
       action = { kind, stages: parseMacroWorkStages(rawAction.stages),
         ...(Object.hasOwn(rawAction, "afterWorkId") ? { afterWorkId: validateMacroId(rawAction.afterWorkId, "predecessor work id") } : {}) };
       break;
+    case "renew-work":
     case "revoke-work":
-      shape(rawAction, "revoke work action", ["kind", "workOrderId"]);
-      action = { kind, workOrderId: validateMacroId(rawAction.workOrderId, "revoked work id") };
+      shape(rawAction, kind, ["kind", "workOrderId"]);
+      action = { kind, workOrderId: validateMacroId(rawAction.workOrderId, "work order id") };
       break;
     case "collect-pending":
     case "defer-pending":

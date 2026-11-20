@@ -890,9 +890,10 @@ public final class AgentClient implements ClientModInitializer {
         var returnableDrop = progress.returnableDrop();
         boolean newReturnableDrop = returnableDrop != null && returnableDrop.sequence() != returnableDropSequence;
         boolean newlyBlocked = stall.eventSequence() != stallSequence && stall.phase().equals("blocked");
+        JsonObject surveyTransition = macro == null ? null : macro.takeSurveyTransition(tick);
         boolean changed = screenChanged || ownerChanged || planningChanged || newReturnableDrop || !status.equals(lastStatus)
             || !handStatus.equals(lastHands) || stall.eventSequence() != stallSequence;
-        if (changed || boundary || tick % 20 == 0 || ended || tick == 1) {
+        if (changed || surveyTransition != null || boundary || tick % 20 == 0 || ended || tick == 1) {
             JsonObject event = new JsonObject();
             event.addProperty("tick", tick);
             event.addProperty("wall_ms", boundary ? wallMs : System.currentTimeMillis());
@@ -992,10 +993,14 @@ public final class AgentClient implements ClientModInitializer {
             event.addProperty("rendered_screen", screenKind(renderedScreen));
             event.addProperty("personal_opens", personalOpens);
             event.addProperty("bench_opens", benchOpens);
-            String line = event + "\n";
+            boolean updateProgress = tick == 1 || tick % 20 == 0 || boundary || ended || newlyBlocked || ownerChanged || planningChanged;
+            String line = surveyTransition == null || updateProgress ? event + "\n" : null;
             try {
-                if (changed || boundary || ended || tick % 100 == 0) append("events.jsonl", line);
-                if (tick == 1 || tick % 20 == 0 || boundary || ended || newlyBlocked || ownerChanged || planningChanged) {
+                if (surveyTransition != null) {
+                    event.add("macro_survey_transition", surveyTransition);
+                    append("events.jsonl", event + "\n");
+                } else if (changed || boundary || ended || tick % 100 == 0) append("events.jsonl", line);
+                if (updateProgress) {
                     Path part = directory.resolve("progress.tmp");
                     Files.writeString(part, line);
                     Files.move(part, directory.resolve("progress.json"), StandardCopyOption.ATOMIC_MOVE,

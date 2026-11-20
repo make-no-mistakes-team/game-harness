@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import io.gameharness.survival.AgentSurveyEvidence.Survey;
 import io.gameharness.survival.mixin.AgentMiningAccess;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.io.IOException;
@@ -520,6 +521,7 @@ final class AgentMacroControl {
     private final Set<BlockPos> localSteps = new HashSet<>();
     private final LinkedHashMap<BlockPos, TimberSight> timberSights = new LinkedHashMap<>();
     private final ArrayDeque<String> recent = new ArrayDeque<>(8);
+    private final AgentSurveyEvidence surveyEvidence = new AgentSurveyEvidence();
     private FurnaceFact furnaceFact;
     private final Predicate<ItemStack> safetySpend = this::canSpendSafetyStock;
     private List<Offer> reservedOffers = List.of();
@@ -678,6 +680,7 @@ final class AgentMacroControl {
     String planningEvidence() { return planningEvidence; }
     long lastPurposefulTick() { return lastPurposefulTick; }
     long planningIdleDeadlineNanos() { return idleSince + PLANNING_IDLE_LIMIT_NS; }
+    JsonObject takeSurveyTransition(long tick) { return surveyEvidence.take(tick); }
 
     private static double millis(long nanos) { return nanos / 1_000_000.0; }
 
@@ -5372,8 +5375,18 @@ final class AgentMacroControl {
     }
 
     private boolean observableWorld() {
-        return visited && grounded() && hazardClear && cursorClear() && client.currentScreen == null
-            && client.getOverlay() == null && client.isWindowFocused() && body.hasRecentView();
+        return worldViewBlocker() == null;
+    }
+
+    private String worldViewBlocker() {
+        if (!visited) return "not_visited";
+        if (!grounded()) return "not_grounded";
+        if (!hazardClear) return "safety";
+        if (!cursorClear()) return "cursor";
+        if (client.currentScreen != null) return "screen";
+        if (client.getOverlay() != null) return "overlay";
+        if (!client.isWindowFocused()) return "focus";
+        return body.hasRecentView() ? null : "render";
     }
 
     private boolean settled() {
@@ -5635,9 +5648,9 @@ final class AgentMacroControl {
         addStationOffer(offers, Blocks.CRAFTING_TABLE);
         addStationOffer(offers, Blocks.FURNACE);
         if (!repeatedSourceView()) {
-            survey(offers, "footing", surveyYaw, 42, "Survey the nearby ground", "A fixed downward camera angle from the current stance.");
-            survey(offers, "left", surveyYaw - 55, 31, "Survey left from this stance", "A bounded first-person turn over nearby terrain.");
-            survey(offers, "right", surveyYaw + 55, 31, "Survey right from this stance", "A bounded first-person turn over nearby terrain.");
+            survey(offers, Survey.FOOTING, "Survey the nearby ground", "A fixed downward camera angle from the current stance.");
+            survey(offers, Survey.LEFT, "Survey left from this stance", "A bounded first-person turn over nearby terrain.");
+            survey(offers, Survey.RIGHT, "Survey right from this stance", "A bounded first-person turn over nearby terrain.");
         }
 
         BlockPos standing = player.getBlockPos().down();
@@ -5811,10 +5824,19 @@ final class AgentMacroControl {
         return new Face(hit, client.world.getBlockState(hit.getBlockPos()));
     }
 
-    private void survey(List<Offer> offers, String id, float yaw, float pitch, String title, String evidence) {
-        Key key = new Key(Verb.SURVEY, null, surveyOrigin, id);
-        if (!retiredViews.contains(key) && angle(client.player.getYaw(), client.player.getPitch(), yaw, pitch) >= 7)
-            offer(offers, key, title, evidence, yaw, pitch, null, null, null, null, null);
+    private Key surveyKey(Survey survey) {
+        return new Key(Verb.SURVEY, null, surveyOrigin, survey.id);
+    }
+
+    private boolean surveyDifferentAngle(float yaw, float pitch) {
+        return angle(client.player.getYaw(), client.player.getPitch(), yaw, pitch) >= 7;
+    }
+
+    private void survey(List<Offer> offers, Survey survey, String title, String evidence) {
+        Key key = surveyKey(survey);
+        float yaw = survey.yaw(surveyYaw);
+        if (!retiredViews.contains(key) && surveyDifferentAngle(yaw, survey.pitch))
+            offer(offers, key, title, evidence, yaw, survey.pitch, null, null, null, null, null);
     }
 
     private void inspect(List<Offer> offers, Face face) {
@@ -5990,6 +6012,11 @@ final class AgentMacroControl {
             }
             value.add("pendingWork", pendingObservation(ticket, yieldable, parked, safeReturn && !collectible, pendingOffer));
         }
+        // An unvisited idle publication can itself explain why a survey disappeared.
+        boolean trackSurvey = progress != null && !trial && surveyEvidence.enabled()
+            && action == null && !hasActiveWorkOrder() && !rawWorking && !hands.busy() && !hands.holdsWorkInventory()
+            && (!visited || "terra_idle".equals(owner));
+        int publishedSurveys = 0;
         for (Offer offer : visible) {
             JsonObject entry = new JsonObject();
             entry.addProperty("id", offer.id);
@@ -5999,9 +6026,14 @@ final class AgentMacroControl {
             entry.addProperty("risk", offer.key.verb.risk);
             JsonObject material = material(offer, inv);
             if (material != null) entry.add("material", material);
+            if (trackSurvey) {
+                if (offer.key.verb == Verb.SURVEY) publishedSurveys |= Survey.mask(offer.key.activity);
+                else if (material != null || !"read".equals(offer.key.verb.risk)) trackSurvey = false;
+            }
             opportunities.add(entry);
             witnessed.put(offer.id, offer);
         }
+        if (trackSurvey) observeSurveyPublication(publishedSurveys);
         snapshots.put(tick, new Snapshot(epoch, witnessed.isEmpty() ? Map.of() : witnessed));
         while (!snapshots.isEmpty() && snapshots.firstEntry().getKey() < tick - MAX_AGE) snapshots.pollFirstEntry();
         value.add("opportunities", opportunities);
@@ -6013,6 +6045,37 @@ final class AgentMacroControl {
         value.add("recent", history);
         value.addProperty("quiescent", quiescent);
         ipc.observation.set(value.toString());
+    }
+
+    private void observeSurveyPublication(int published) {
+        JsonObject transition = surveyEvidence.observe(tick, life, surveyOrigin, published);
+        if (transition == null) return;
+        transition.addProperty("epoch", epoch);
+        transition.addProperty("safety_revision", safetyRevision);
+        int age = body.renderedViewAgeTicks();
+        if (age >= 0) {
+            transition.addProperty("render_frame", body.renderedFrame());
+            transition.addProperty("render_age_ticks", age);
+        }
+        int lost = surveyEvidence.lost();
+        if (lost == 0) return;
+
+        String common = surveyEvidence.originChanged() ? "origin_changed" : worldViewBlocker();
+        if ("render".equals(common)) {
+            if (client.isPaused()) common = "paused";
+            else if (client.getCameraEntity() != player || !client.options.getPerspective().isFirstPerson()) common = "camera";
+            else if (age < 0) common = "no_render";
+            else if (age > 1) common = "stale_render";
+        }
+        if (common == null && repeatedSourceView()) common = "repeated";
+        JsonObject losses = new JsonObject();
+        for (Survey survey : Survey.SLOTS) {
+            if ((lost & survey.bit) == 0) continue;
+            String reason = common != null ? common : retiredViews.contains(surveyKey(survey)) ? "retired"
+                : !surveyDifferentAngle(survey.yaw(surveyYaw), survey.pitch) ? "camera_angle" : "offer_limit";
+            losses.addProperty(survey.id, reason);
+        }
+        transition.add("lost", losses);
     }
 
     private JsonObject pendingObservation(AgentPendingFurnaceMemory.Entry ticket, boolean yieldable, boolean parked,

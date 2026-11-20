@@ -1342,6 +1342,11 @@ final class AgentBody {
 
     long renderedFrame() { return frameSequence; }
 
+    int renderedViewAgeTicks() {
+        return observedAtNanos != 0 && observedWorld == client.world && observedPlayer == client.player
+            ? tick - observedAtTick : -1;
+    }
+
     boolean renderedDirection(float yaw, float pitch, float tolerance) {
         return hasView() && Math.abs(MathHelper.wrapDegrees(observedYaw - yaw)) <= tolerance
             && Math.abs(observedPitch - pitch) <= tolerance;

@@ -50,7 +50,7 @@ const FURNACE_PROMPT = `For carried raw iron, a single live action kind "work" c
 If you need a new station, explicitly name ${MACRO_FURNACE_PLACEMENT}, budget one minecraft:furnace, and count its placement. Include craft:furnace and the exact stone costs if not carrying a spare; if the player needs a new crafting table, quote its effects and costs separately. maxCrafts includes every craft and each smelted unit, which is reserved before loading. maxPlacements includes both stations if needed. An existing furnace must be in reach from dry footing and pass a visible empty/cold check; a carried furnace is not a placed station.
 Only this single live iron stock policy grants furnace transfers. Do not revoke, renew or reload a paid batch. A single charged item can finish in its GUI. No independent work starts during a click, item use or other occupied input.
 
-A pendingWork ticket describes the paid production, its parent goal, exact inputs already spent, a local return clue and uncollected output. If work.pendingPurpose is present, it recalls why the batch was wanted, not an authorization for the next job. Output is NOT inventory, even after the ETA; do not debit inputs twice or spend what is still in the furnace. Estimated or unknown means no output proof. A fresh collection offer, even if the state is unknown, means the actor can recheck the actual station, not a guaranteed pickup. Do not resubmit production while the ticket is outstanding. A historical ticket from an explicitly continued world is descriptive only; never reuse old work, action IDs, or inferred stock.
+A pendingWork ticket records the paid inputs, the furnace's last known location and the output still owed. work.pendingPurpose can explain why those materials were needed. Even after the estimated finish, output isn't inventory. Don't submit the batch twice. On returning to a saved world, historical means the payment came from the previous session. If today's observation contains a fresh collectOfferId and the output is needed, use collect-pending with today's pendingWork.id. This authorizes a physical recheck, not a guaranteed pickup. Never reuse an old command or open a furnace with a generic opportunity to collect the batch.
 
 When work.duringWaitFor is present, decide what the player should physically do *now*. In your reason, name what actually needs the uncollected output and consider one local part of the larger objective that does not. Preparing a later recipe alone leaves the player standing at the furnace. If a needed ingredient can be prepared from carried stock, or a useful visible resource gathered with a held tool, quote that independent job as kind "work" with duringWaitFor set to the ticket. For a genuinely blocking wait, abstain or use work/work-program with afterWorkId equal to the batch ID; say why leaving offers no useful or safe progress. The dependent job cannot start until actual collection and a fresh inventory check. Don't gather surplus, turn the camera for show, or leave the cave just to fill time.
 
@@ -111,14 +111,18 @@ function smeltSuccessorId(work?: MacroRequest["work"]): string | undefined {
       work.current.nativeState?.progress?.smeltBurn)
     return work.current.id;
 }
-const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroRequest["work"], pending?: MacroRequest["observation"]["pendingWork"]): Tool => {
+const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroRequest["work"], observation?: MacroRequest["observation"]): Tool => {
+  const pending = observation?.pendingWork;
+  const selectable = work?.current ? undefined : observation?.opportunities.filter(offer =>
+    !isPendingWorkVerb(offer.verb) && (work?.mode !== "constrained" || offer.risk !== "guarded")).map(offer => offer.id);
   const smeltId = smeltSuccessorId(work);
   const afterWorkId = smeltId ? { type: "string", enum: [smeltId] } : string;
   const ticketId = (id: string) => ({ type: "string", enum: [id] });
   const otherActions = smeltId ? [] : [
     ...(work ? [action("work", { policy: singleWorkPolicy }), action("work-program", { stages: workStages })] : []),
     ...(work?.current ? [action("revoke-work", { workOrderId: string })] : [
-      action("opportunity", { opportunityId: string }),
+      ...(selectable?.length === 0 ? [] :
+        [action("opportunity", { opportunityId: selectable ? { type: "string", enum: selectable } : string })]),
       ...(direct ? [continuation] : []),
       action("skill", { candidate: strictObject({
         source: string, parentGeneration: integer, verbs: { type: "array", items: string },
@@ -293,7 +297,7 @@ function contextFor(request: MacroRequest, basis: MacroBasis, image?: ImageConte
       role: "user", timestamp: Date.now(),
       content: image ? [{ type: "text", text }, image] : text,
     }],
-    tools: [lookahead ? lookaheadTool : work ? proposalTool(!!nativeReview, direct, work, observation.pendingWork) :
+    tools: [lookahead ? lookaheadTool : work ? proposalTool(!!nativeReview, direct, work, observation) :
       proposalTools[nativeReview ? 1 : 0]![direct ? 1 : 0]!],
   };
 }

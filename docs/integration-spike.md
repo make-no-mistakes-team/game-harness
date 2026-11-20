@@ -107,6 +107,9 @@ and what went into it. Elapsed time does not put ingots in the inventory:
 the player must return, open the same furnace and take its output. A bucket
 job proposed during the cook (`afterWorkId`) waits for collection and a
 fresh check of all three ingots, the protected stock and the crafting table.
+An ordinary continuation of a clean save can remember a paid batch. The
+old job does not resume: the player needs a new collection offer in the
+copied world before it can take anything.
 
 Goal-only startup, built-in presets, generated skills, direct opportunities,
 and work programs cannot grant furnace transfers. A completed smelt does not

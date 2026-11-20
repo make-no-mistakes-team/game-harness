@@ -422,7 +422,8 @@ final class AgentStallGuard {
     /** Incidental immersion is not a failed dry stance and must not enter the dry-only assessment. */
     boolean controlsWaterRecovery() { return phase == Phase.WATER; }
 
-    boolean takeWaterTurn(boolean planned, boolean lostShallows, Runnable replan, Runnable releaseAlternative) {
+    boolean takeWaterTurn(boolean planned, AgentVisibleHorizon.Refusal lostShallows, Runnable replan,
+                          Runnable releaseAlternative) {
         if (planned || client.player.hasVehicle()) {
             if (phase == Phase.WATER) {
                 water.clearEpisode();
@@ -431,15 +432,15 @@ final class AgentStallGuard {
             return false;
         }
         if (phase != Phase.WATER) {
-            if (!lostShallows && !water.stalled()) return false;
-            if (phase == Phase.WATCH) detect(lostShallows
-                ? "the witnessed shallow crossing lost its dry bank or braking window"
+            if (lostShallows == null && !water.stalled()) return false;
+            if (phase == Phase.WATCH) detect(lostShallows != null
+                ? "the witnessed shallow crossing was preempted: " + lostShallows.key
                 : "no useful horizontal movement in water");
             if (phase == Phase.ALTERNATIVE) releaseAlternative.run();
             tookControl = true;
             blockedReason = null;
             replan.run();
-            water.start(!lostShallows);
+            water.start(lostShallows == null);
             waterAttempts = 0;
             waterBlockedReported = false;
             transition(Phase.WATER, water.status());

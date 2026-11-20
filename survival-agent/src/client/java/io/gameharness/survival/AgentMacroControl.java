@@ -115,7 +115,7 @@ final class AgentMacroControl {
     private static final long STATION_RECALL_NS = 45_000_000_000L;
     private static final double STATION_RECALL_STANCE_SQUARED = 0.75 * 0.75;
     private static final double PICKUP_STANCE_SQUARED = 1.20 * 1.20;
-    private static final double SETTLED_SPEED_SQUARED = 0.001225;
+    static final double SETTLED_SPEED_SQUARED = 0.001225;
     private static final Direction[] CARDINAL = {Direction.SOUTH, Direction.WEST, Direction.NORTH, Direction.EAST};
     private static final int[] WALK_PITCH_OFFSETS = {0, -4, 4, -8, 8, -12, 12, -16, 16};
     private static final Pattern TOKEN = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
@@ -4381,8 +4381,9 @@ final class AgentMacroControl {
             case ARRIVED -> {
                 if (!settled() || !grounded()) return;
                 recordHorizonLanding();
+                if (travel.waded()) work.horizonAttempts.remove(cue.hit.getBlockPos());
                 if (kind == RESOURCE && !ready) rememberSourceBearing(cue.hit);
-                complete(travel.waded() ? "Crossed the witnessed shallows and settled on dry footing."
+                complete(travel.waded() ? "Settled on the witnessed dry bank; rechecking the same work order without harvest credit."
                     : switch (kind) {
                         case CAVE_FRONTIER -> "Walked to a closer dry stance for the witnessed cave frontier.";
                         case WOODLAND_FRONTIER -> "Reached a closer dry stance at the witnessed woodland; no harvest yet.";

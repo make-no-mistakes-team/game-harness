@@ -221,7 +221,14 @@ final class AgentBody {
     private static final int HORIZON_WAIT_TICKS = 8;
     private HorizonTravel horizonIntent, horizonApplied;
     private Vec3d horizonAppliedFrom;
-    private boolean horizonAppliedDry, horizonAppliedPulse, horizonWading;
+    private boolean horizonAppliedDry, horizonAppliedPulse;
+    private AgentShallowTransit horizonCrossing;
+    private HorizonTravel horizonCrossingOwner;
+    private AgentShallowTransit.Pose horizonCrossingPose;
+    private HorizonView horizonCrossingView;
+    private int horizonCrossingChecked = -1;
+    private Refusal horizonWaterLoss;
+    private int horizonWaterLostAt = -2;
     private BlockPos horizonPulseContact;
     private int horizonAppliedTick = -2;
     private int horizonSide;
@@ -315,7 +322,8 @@ final class AgentBody {
             lavaEmergency = false;
             horizonApplied = null;
             horizonPulseContact = null;
-            horizonWading = false;
+            interruptHorizonWade(Refusal.WORLD_OR_CAMERA_UNAVAILABLE);
+            horizonWaterLoss = null;
             hazardWorld = client.world;
             hazardPlayer = client.player;
         }
@@ -328,8 +336,6 @@ final class AgentBody {
         }
         var player = client.player;
         if (horizonApplied != null && horizonAppliedTick == tick - 1) observeHorizonTravel(player);
-        if (!player.isTouchingWater() && (horizonApplied == null || horizonApplied.wadeTick < tick - 1))
-            horizonWading = false;
         if (hasView()) scanFluids(AgentHazards.SIGHT_RANGE, true, false, false);
         boolean dry = player.isOnGround() && !player.isInLava() && !player.isTouchingWater()
             && !player.isOnFire() && !player.hasVehicle() && !hazards.lavaNear(player.getBoundingBox(), 0.12, tick);
@@ -501,6 +507,7 @@ final class AgentBody {
 
     void finish() {
         if (!ready()) {
+            interruptHorizonWade(Refusal.INPUT_UNAVAILABLE);
             gaitPitchVelocity = 0;
             stepSupport = null;
             releaseKeys();
@@ -526,6 +533,8 @@ final class AgentBody {
         Ground ground = Ground.CLEAR;
         boolean rolling = horizonIntent != null;
         boolean horizonHazardVeto = false;
+        if (horizonCrossing != null && horizonCrossingOwner != horizonIntent)
+            interruptHorizonWade(Refusal.INPUT_UNAVAILABLE);
 
         if (rolling) {
             // One ordinary rolling owner; it never inherits the generic auto-jump,
@@ -751,8 +760,25 @@ final class AgentBody {
                 visibleHorizon.reportDrive(horizonApplied.issued ? null
                     : horizonHazardVeto ? Refusal.HAZARD : Refusal.INPUT_COASTING, horizonKeyWindow);
             }
-            horizonApplied.wadeTick = horizonWade && (horizonApplied.issued || player.isTouchingWater()) ? tick : -2;
-            horizonWading |= horizonApplied.wadeTick == tick && horizonApplied.issued;
+            if (horizonHazardVeto) interruptHorizonWade(Refusal.HAZARD);
+            if (horizonWade && horizonApplied.issued && !horizonApplied.wadeStarted && horizonKeyWindow != null
+                    && !player.isTouchingWater()) {
+                horizonApplied.wadeStarted = true;
+                var view = horizonView();
+                var pose = horizonWadePose(player, horizonApplied, view);
+                horizonCrossing = visibleHorizon.issueWade(pose, horizonKeyWindow);
+                if (horizonCrossing != null) {
+                    horizonCrossingOwner = horizonApplied;
+                    horizonWaterLoss = null;
+                    visibleHorizon.reportWade("issued", null);
+                } else {
+                    // An issued key without a retained optical bank cannot receive planned-water priority.
+                    horizonWaterLoss = pose.safety() != null ? pose.safety()
+                        : view == null ? horizonViewRefusal() : Refusal.DRY_BANK_NOT_RENDERED;
+                    horizonWaterLostAt = tick;
+                    visibleHorizon.reportWade(null, horizonWaterLoss);
+                }
+            }
         }
     }
 
@@ -941,7 +967,8 @@ final class AgentBody {
         dryFooting = previousDryFooting = escapeLanding = null;
         lavaEmergency = false;
         horizonApplied = null;
-        horizonWading = false;
+        interruptHorizonWade(Refusal.WORLD_OR_CAMERA_UNAVAILABLE);
+        horizonWaterLoss = null;
         releaseKeys();
     }
 
@@ -1448,8 +1475,8 @@ final class AgentBody {
         final double arrival;
         final boolean allowWade;
         private final AgentVisibleHorizon.ContactPulse pulse;
-        private int wadeTick = -2, stoppedAt = -1, precisionTicks;
-        private boolean issued, beenDriven, wet;
+        private int stoppedAt = -1, precisionTicks;
+        private boolean issued, beenDriven, wet, wadeStarted;
         private float bearing = Float.NaN, blockedBearing = Float.NaN, issuedBearing = Float.NaN;
         private HorizonMotion motion;
         private BlockPos dryFrom, dryTo;
@@ -1551,17 +1578,107 @@ final class AgentBody {
         return x * x + z * z;
     }
 
-    /** A recent, physically issued wade may hold water control only with a currently witnessed bank. */
+    /** The issued lane can own a brief neutral turn without permission to drive on an old frame. */
     boolean horizonControlsWater() {
-        if (!horizonWaterInFlight() || horizonApplied == null || horizonApplied.wadeTick != tick - 1
-                || !horizonWaterSafe(client.player)) return false;
-        var window = visibleHorizon.window(horizonApplied.target, horizonHeading);
-        return horizonWadeWindow(window);
+        if (horizonCrossing != null) checkHorizonWade(horizonCrossingOwner);
+        return horizonCrossing != null && ready() && client.player.isTouchingWater();
     }
 
     boolean horizonWaterInFlight() {
-        return horizonWading && ready() && client.player.isTouchingWater();
+        return client.player != null && client.player.isTouchingWater()
+            && (horizonCrossing != null || horizonWaterLoss != null && horizonWaterLostAt >= tick - 1);
     }
+
+    boolean horizonWadeOwns(HorizonTravel travel) {
+        return travel != null && horizonCrossing != null && horizonCrossingOwner == travel;
+    }
+
+    Refusal horizonWaterLoss() {
+        return horizonWaterInFlight() ? horizonWaterLoss : null;
+    }
+
+    void interruptHorizonWade(Refusal reason) {
+        if (horizonCrossing == null) return;
+        horizonCrossing = null;
+        horizonCrossingOwner = null;
+        horizonCrossingPose = null;
+        horizonCrossingView = null;
+        horizonWaterLoss = reason;
+        horizonWaterLostAt = tick;
+        visibleHorizon.reportWade(null, reason);
+    }
+
+    private AgentShallowTransit.Pose horizonWadePose(ClientPlayerEntity player, HorizonTravel travel, HorizonView view) {
+        BlockPos support = player.supportingBlockPos.orElse(null);
+        Vec3d feet = player.getPos();
+        Refusal unsafe = !ready() || !client.isWindowFocused() || client.getOverlay() != null
+            || client.options.forwardKey.isUnbound() || player.hasVehicle() || player.isClimbing() || player.isUsingItem()
+            ? Refusal.INPUT_UNAVAILABLE
+            : player.isSubmergedInWater() || player.isSwimming() || player.getAir() < 230
+                || player.getFluidHeight(FluidTags.WATER) > 0.56 ? Refusal.DEEP_WATER
+            : player.isInLava() || player.isOnFire() || lavaEmergency || macroLavaNear() ? Refusal.HAZARD
+            : player.hurtTime != 0 ? Refusal.WADE_HEALTH_CHANGED
+            : player.isSprinting() || player.hasStatusEffect(StatusEffects.DOLPHINS_GRACE) ? Refusal.WADE_DRIFT
+            : !player.isOnGround() || support == null ? Refusal.SOURCE_UNGROUNDED
+            : travel.motion != null && !travel.motion.valid ? Refusal.MOTION_INTERRUPTED
+            : travel.motion != null && travel.motion.contact() ? Refusal.COLLISION_CONTACT
+            : visibleHorizon.wadeTargetRefusal(travel.target, tick, feet);
+        double efficiency = player.isTouchingWater()
+            ? player.getAttributeValue(EntityAttributes.WATER_MOVEMENT_EFFICIENCY) : 0;
+        double dryAcceleration = player.getAttributeValue(EntityAttributes.MOVEMENT_SPEED);
+        double acceleration = MathHelper.lerp(efficiency, 0.024, Math.max(0.024, dryAcceleration));
+        double waterDrag = MathHelper.lerp(efficiency, 0.8, 0.546);
+        return new AgentShallowTransit.Pose(client.world, player, travel, tick, view == null ? -1 : view.frame(),
+            feet, player.getVelocity(), support, player.getWidth() * 0.5,
+            player.isTouchingWater(), player.getHealth(), unsafe, dryAcceleration, acceleration, waterDrag);
+    }
+
+    private void checkHorizonWade(HorizonTravel travel) {
+        if (horizonCrossingChecked == tick || horizonCrossing == null) return;
+        horizonCrossingChecked = tick;
+        if (client.player == null || horizonAppliedTick != tick - 1 || horizonApplied != travel) {
+            interruptHorizonWade(Refusal.INPUT_UNAVAILABLE);
+            return;
+        }
+        horizonCrossingView = horizonView();
+        horizonCrossingPose = horizonWadePose(client.player, travel, horizonCrossingView);
+        boolean firstWet = horizonCrossingPose.wet() && !horizonCrossing.touchedWater();
+        var turn = horizonCrossing.check(horizonCrossingPose, wadeChecks);
+        if (turn == AgentShallowTransit.Turn.RECOVER) interruptHorizonWade(horizonCrossing.reason());
+        else if (firstWet) visibleHorizon.reportWade("body_contact", null);
+    }
+
+    private final AgentShallowTransit.Checks wadeChecks = new AgentShallowTransit.Checks() {
+        @Override public AgentVisibleHorizon.Patch physical(int x, int z, AgentVisibleHorizon.Patch seen) {
+            // Veto only: inspect the exact formerly witnessed support, at its proved height.
+            return horizonSurface(seen.floor(), seen.y());
+        }
+
+        @Override public Refusal optical(int x, int z, AgentVisibleHorizon.Patch seen) {
+            var view = horizonCrossingView;
+            var patch = visibleHorizon.wadePatch(view, x, z);
+            if (seen.sameSupport(patch)) return null;
+            if (patch.refusal() != Refusal.SURFACE_NOT_RENDERED) return patch.refusal() == null
+                ? seen.medium() == AgentVisibleHorizon.Medium.DRY ? Refusal.WADE_BANK_CHANGED : Refusal.WADE_BED_CHANGED
+                : patch.refusal();
+            // A near proved top can drop below the camera during overlap.
+            // Only a projection clip permits using its just-checked physical
+            // state. An in-frame occlusion/lost hit is a failed witness.
+            double nearestX = MathHelper.clamp(view.feet().x, x, x + 1);
+            double nearestZ = MathHelper.clamp(view.feet().z, z, z + 1);
+            double near = Math.hypot(nearestX - view.feet().x, nearestZ - view.feet().z);
+            double angle = Math.toRadians(observedYaw), level = seen.y() - 0.025;
+            boolean clipped = !inView(x + 0.5, level, z + 0.5)
+                && !inView(x + 0.5 - 0.39 * Math.sin(angle), level, z + 0.5 + 0.39 * Math.cos(angle));
+            if (clipped && near <= horizonCrossingPose.radius() + 0.34) return null;
+            return seen.medium() == AgentVisibleHorizon.Medium.DRY
+                ? Refusal.DRY_BANK_NOT_RENDERED : Refusal.SURFACE_NOT_RENDERED;
+        }
+
+        @Override public Refusal sweep(double dx, double dz, double drift, double coastDistance, double reach) {
+            return horizonSweep(dx, dz, drift, coastDistance, reach, AgentVisibleHorizon.Medium.SHALLOW_WATER);
+        }
+    };
 
     private static boolean horizonWaterSafe(ClientPlayerEntity player) {
         return !player.isSubmergedInWater() && player.getAir() >= 230 && !player.isOnFire()
@@ -1574,10 +1691,11 @@ final class AgentBody {
     }
 
     boolean horizonSafetyAllows(HorizonTravel travel) {
-        return ready() && (!client.player.isTouchingWater() || horizonApplied == travel && horizonControlsWater());
+        return ready() && (!client.player.isTouchingWater() || horizonWadeOwns(travel) && horizonControlsWater());
     }
 
     void stopHorizonTravel(HorizonTravel travel) {
+        if (horizonWadeOwns(travel)) interruptHorizonWade(Refusal.INPUT_UNAVAILABLE);
         if (horizonIntent != travel) return;
         horizonIntent = null;
         horizonKeyWindow = null;
@@ -1611,6 +1729,12 @@ final class AgentBody {
             return horizonBlocked(Refusal.INPUT_UNAVAILABLE);
         if (!horizonWaterSafe(player))
             return horizonBlocked(player.isSubmergedInWater() || player.getAir() < 230 ? Refusal.DEEP_WATER : Refusal.HAZARD);
+        if (horizonWadeOwns(travel)) {
+            checkHorizonWade(travel);
+            if (horizonWadeOwns(travel)) return driveHorizonWade(travel, keepPickupsClear);
+        }
+        if (travel.wadeStarted || player.isTouchingWater())
+            return horizonBlocked(horizonWaterLoss == null ? Refusal.WATER_NOT_ALLOWED : horizonWaterLoss);
         Vec3d feet = player.getPos();
         double dx = travel.goal.x - feet.x, dz = travel.goal.z - feet.z;
         double distance = Math.hypot(dx, dz);
@@ -1709,6 +1833,46 @@ final class AgentBody {
         if (horizonSneak) ++travel.precisionTicks;
         horizonWade = wade;
         travel.stoppedAt = -1;
+        return HorizonResult.MOVING;
+    }
+
+    private HorizonResult driveHorizonWade(HorizonTravel travel, boolean keepPickupsClear) {
+        var crossing = horizonCrossing;
+        if (crossing.turn() == AgentShallowTransit.Turn.LANDED) {
+            horizonCrossing = null;
+            horizonCrossingOwner = null;
+            horizonCrossingPose = null;
+            horizonCrossingView = null;
+            visibleHorizon.reportWade("landed", null);
+            return HorizonResult.ARRIVED;
+        }
+        horizonIntent = travel;
+        horizonWade = true;
+        Vec3d feet = horizonCrossingPose.feet(), bank = crossing.bank();
+        float aim = heading(bank.x - feet.x, bank.z - feet.z);
+        float yaw = client.player.getYaw();
+        float turn = MathHelper.wrapDegrees(aim - yaw);
+        // Gaze can follow the fixed bank through the transition; never steer
+        // toward another bank or rely on a stale image for another keypress.
+        lookAlongGait(aim, 32);
+        if (crossing.turn() == AgentShallowTransit.Turn.COAST || Math.abs(turn) > 9) return HorizonResult.SETTLING;
+        float steering = MathHelper.clamp(turn, -8, 8);
+        Refusal veto = crossing.inputVeto(horizonCrossingPose, wadeChecks, yaw);
+        if (veto == null && Math.abs(steering) > 0.01)
+            veto = crossing.inputVeto(horizonCrossingPose, wadeChecks, yaw + steering);
+        if (veto == Refusal.WADE_DRIFT) return HorizonResult.SETTLING; // neutral braking still fits
+        double reach = crossing.inputReach();
+        Vec3d end = feet.add(Vec3d.fromPolar(0, yaw).multiply(reach));
+        if (veto == null && keepPickupsClear && !macroNoVisiblePickup(end, feet.y - 0.7, feet.y))
+            veto = Refusal.PICKUP_VETO;
+        if (veto != null) {
+            interruptHorizonWade(veto);
+            return horizonBlocked(veto);
+        }
+        prioritizeMovement();
+        horizonHeading = yaw;
+        horizonReach = reach;
+        horizonForward = true;
         return HorizonResult.MOVING;
     }
 
@@ -2053,14 +2217,14 @@ final class AgentBody {
         BlockState cover = client.world.getBlockState(open);
         FluidState fluid = cover.getFluidState();
         if (fluid.isEmpty()) return AgentProgress.dangerous(cover) || cover.isOf(Blocks.COBWEB)
-            ? Refusal.HAZARD.unavailable : AgentVisibleHorizon.Patch.dry(top, state.getBlock().getSlipperiness());
+            ? Refusal.HAZARD.unavailable : AgentVisibleHorizon.Patch.dry(top, state.getBlock().getSlipperiness(), floor, state);
         if (!cover.isOf(Blocks.WATER) || !fluid.isIn(FluidTags.WATER))
             return fluid.isIn(FluidTags.LAVA) ? Refusal.HAZARD.unavailable : Refusal.FLUID_IN_SWEEP.unavailable;
         double depth = open.getY() + fluid.getHeight(client.world, open) - top;
         // Flow's mechanical force can veto an already seen water sample, not establish terrain.
         Vec3d flow = fluid.getVelocity(client.world, open);
-        var patch = AgentVisibleHorizon.Patch.water(top, depth, flow);
-        return patch != null ? patch : AgentVisibleHorizon.Patch.waterRefusal(depth, flow).unavailable;
+        Refusal veto = AgentVisibleHorizon.Patch.waterRefusal(depth, flow);
+        return veto == null ? AgentVisibleHorizon.Patch.water(top, floor, state) : veto.unavailable;
     }
 
     static double horizonSupportTop(BlockView world, BlockPos floor, BlockState state) {

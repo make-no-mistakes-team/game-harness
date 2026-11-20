@@ -784,9 +784,12 @@ final class AgentProgress {
         float health = c.player.getHealth();
         boolean hurt = health < previousHealth;
         previousHealth = health;
+        if (hurt) body.interruptHorizonWade(AgentVisibleHorizon.Refusal.WADE_HEALTH_CHANGED);
         boolean escaping = escapeDanger(ears, hurt, macroEngaged, safetySpend);
         if ((hurt || escaping) && dropReclaim != null) dropReclaim.cancel();
         if (escaping) {
+            body.interruptHorizonWade(c.player.isTouchingWater() && c.player.getAir() < 70 ? AgentVisibleHorizon.Refusal.DEEP_WATER
+                : AgentVisibleHorizon.Refusal.HAZARD);
             if (macroEngaged) macro.urgent(status);
             caves.interruptLight();
             stallGuard.priorityAim();
@@ -802,6 +805,7 @@ final class AgentProgress {
         }
         int priorLandings = fall.waterSuccesses() + fall.boatSuccesses();
         if (fall.step(safetySpend)) {
+            body.interruptHorizonWade(AgentVisibleHorizon.Refusal.SOURCE_UNGROUNDED);
             if (dropReclaim != null) dropReclaim.cancel();
             caves.interruptLight();
             defense.stopZombieLook();
@@ -820,6 +824,7 @@ final class AgentProgress {
         }
         if (defense.rangedActive()) {
             // Macro cancellation can release body commands, so settle ownership before bracing.
+            body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
             if (macroEngaged) macro.urgent("responding to a nearby ranged threat");
             interruptHands();
             if (dropReclaim != null) dropReclaim.cancel();
@@ -832,6 +837,7 @@ final class AgentProgress {
             return;
         }
         if (!macroEngaged && defense.meleeActive()) {
+            body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
             interruptHands();
             if (dropReclaim != null) dropReclaim.cancel();
             caves.interruptLight();
@@ -843,10 +849,11 @@ final class AgentProgress {
         // Higher danger/fall/defense owners have already declined. Merely
         // touching water does not cancel an actual, still-witnessed shallow
         // crossing. Losing that exact envelope transfers to water safety now.
-        boolean shallowInFlight = body.horizonWaterInFlight();
-        boolean plannedShallows = shallowInFlight && body.horizonControlsWater();
-        if ((shallowInFlight || stallGuard.controlsWaterRecovery()) && stallGuard.takeWaterTurn(plannedShallows
-                || !macroEngaged && caves.controlsWater(tick), shallowInFlight && !plannedShallows, stallReplan, stallRelease)) {
+        boolean plannedShallows = body.horizonControlsWater();
+        var lostShallows = body.horizonWaterLoss();
+        if ((plannedShallows || lostShallows != null || stallGuard.controlsWaterRecovery())
+                && stallGuard.takeWaterTurn(plannedShallows || lostShallows == null && !macroEngaged && caves.controlsWater(tick),
+                    lostShallows, stallReplan, stallRelease)) {
             body.prioritizeMovement();
             status = stallGuard.status();
             if (macroEngaged) macro.urgent(status);
@@ -855,6 +862,7 @@ final class AgentProgress {
         if (macroEngaged) {
             if (!hands.busy() && c.currentScreen == null && defense.checkZombieCue(ears, tick,
                     nextFoot != null || c.options.attackKey.isPressed() && c.interactionManager.isBreakingBlock())) {
+                body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
                 body.prioritizeMovement();
                 stallGuard.priorityAim();
                 status = defense.status();
@@ -882,19 +890,24 @@ final class AgentProgress {
         }
         if (defense.checkZombieCue(ears, tick, nextFoot != null || returnableMine.active()
                 || c.options.attackKey.isPressed() && c.interactionManager.isBreakingBlock())) {
+            body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
             body.prioritizeMovement();
             stallGuard.priorityAim();
             status = defense.status();
             return;
         }
-        if (plannedShallows && ordinaryApproach != null && ordinaryApproachTick == tick - 1) {
+        if (body.horizonWadeOwns(ordinaryApproach) && ordinaryApproachTick == tick - 1) {
             ordinaryApproachTick = tick;
-            if (body.driveHorizon(ordinaryApproach, false, false) != AgentBody.HorizonResult.BLOCKED) {
+            var transit = body.driveHorizon(ordinaryApproach, false, false);
+            if (transit == AgentBody.HorizonResult.MOVING || transit == AgentBody.HorizonResult.SETTLING) {
                 status = "wading toward the witnessed dry bank";
                 return;
             }
+            ordinaryApproach = null;
+            lostShallows = body.horizonWaterLoss();
         }
-        if (stallGuard.takeWaterTurn(caves.controlsWater(tick) || plannedShallows, false, stallReplan, stallRelease)) {
+        if (stallGuard.takeWaterTurn(lostShallows == null && (caves.controlsWater(tick) || plannedShallows),
+                lostShallows, stallReplan, stallRelease)) {
             body.prioritizeMovement();
             status = stallGuard.status();
             return;

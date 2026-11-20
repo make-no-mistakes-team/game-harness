@@ -173,8 +173,13 @@ movement, or a route. Leaves supporting the player or a retained return
 are not eligible.
 
 The player can wade from dry footing when it can see a shallow,
-supported crossing and a dry bank. Deep or swift water, lava, unknown
-drops, and jumps do not qualify. A trip back to a paid furnace still
+supported crossing and a dry bank. First contact with the water does not
+cancel the job: the player checks the same bed and bank through the
+crossing. One stale frame allows coasting, not another forward input.
+If the bank disappears or the current changes enough to make the crossing
+unsafe, water recovery takes over. Reaching the bank does not count as
+collecting the resource. Deep or swift water, lava, unknown drops, and
+jumps do not qualify. A trip back to a paid furnace still
 uses rechecked, actually walked legs; exploring a few steps forward
 does not manufacture a return route.
 

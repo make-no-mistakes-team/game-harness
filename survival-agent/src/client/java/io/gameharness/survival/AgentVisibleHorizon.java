@@ -21,7 +21,8 @@ final class AgentVisibleHorizon {
         NO_NEW_SUPPORT, BRAKING_DISTANCE, DRY_BANK_NOT_RENDERED, WATER_NOT_ALLOWED,
         OBSTRUCTION, HAZARD, DEEP_WATER, WATER_FLOW, FLUID_IN_SWEEP,
         INPUT_UNAVAILABLE, STEERING_ALIGNMENT, INPUT_COASTING, COLLISION_CONTACT, MOTION_INTERRUPTED, PICKUP_VETO,
-        CONTACT_PULSE_SPENT;
+        CONTACT_PULSE_SPENT,
+        WADE_BANK_CHANGED, WADE_BED_CHANGED, WADE_DRIFT, WADE_HEALTH_CHANGED, WADE_BOUND_EXCEEDED;
 
         final Patch unavailable = new Patch(Medium.UNKNOWN, 0, 0, this);
         final String key = name().toLowerCase(Locale.ROOT);
@@ -66,13 +67,30 @@ final class AgentVisibleHorizon {
     record Window(Target target, float yaw, double knownDistance, double brakingDistance,
                   Medium medium, long frame, int ageTicks, double displacement, Vec3d dryBank, boolean contactOnly) {}
 
-    record Patch(Medium medium, double y, double drag, Refusal refusal) {
+    record Patch(Medium medium, double y, double drag, Refusal refusal, BlockPos floor, BlockState state) {
+        Patch(Medium medium, double y, double drag, Refusal refusal) {
+            this(medium, y, drag, refusal, null, null);
+        }
+
         static Patch dry(double y, double slipperiness) {
-            return new Patch(Medium.DRY, y, 0.91 * slipperiness, null);
+            return dry(y, slipperiness, null, null);
+        }
+
+        static Patch dry(double y, double slipperiness, BlockPos floor, BlockState state) {
+            return new Patch(Medium.DRY, y, 0.91 * slipperiness, null, floor, state);
         }
 
         static Patch water(double y, double depth, Vec3d flow) {
-            return waterRefusal(depth, flow) == null ? new Patch(Medium.SHALLOW_WATER, y, WATER_DRAG, null) : null;
+            return waterRefusal(depth, flow) == null ? water(y, null, null) : null;
+        }
+
+        static Patch water(double y, BlockPos floor, BlockState state) {
+            return new Patch(Medium.SHALLOW_WATER, y, WATER_DRAG, null, floor, state);
+        }
+
+        boolean sameSupport(Patch actual) {
+            return actual != null && actual.refusal == null && actual.medium == medium && actual.y == y
+                && actual.drag == drag && actual.state == state;
         }
 
         static Refusal waterRefusal(double depth, Vec3d flow) {
@@ -136,6 +154,7 @@ final class AgentVisibleHorizon {
     private Window previewWindow;
     private boolean previewTangent;
     private final Transition preview = new Transition("preview"), drive = new Transition("drive");
+    private final Transition wade = new Transition("wade");
 
     AgentVisibleHorizon(AgentBody body) {
         this.body = body;
@@ -219,6 +238,36 @@ final class AgentVisibleHorizon {
 
     Evidence takePreviewEvidence() { return preview.take(); }
     Evidence takeDriveEvidence() { return drive.take(); }
+    Evidence takeWadeEvidence() { return wade.take(); }
+
+    void reportWade(String stage, Refusal reason) {
+        wade.report(reason == null ? stage : reason.key, body.renderedFrame(), Double.NaN, Double.NaN,
+            reason == null ? 0 : reason.bit, reason != null);
+    }
+
+    Refusal wadeTargetRefusal(Target target, int tick, Vec3d feet) {
+        if (target == null || tick - target.view.tick() > TARGET_TICKS
+                || feet.squaredDistanceTo(target.view.feet()) > TARGET_TRAVEL * TARGET_TRAVEL)
+            return Refusal.TARGET_EXPIRED;
+        return null;
+    }
+
+    AgentShallowTransit issueWade(AgentShallowTransit.Pose pose, Window window) {
+        if (!AgentBody.horizonWadeWindow(window) || memoView == null || memoView.frame() != window.frame()
+                || memoView.tick() != pose.tick() || memoStance == null) return null;
+        for (int i = 0; i < trackCount; ++i) {
+            if (bearings[i] != window.yaw()) continue;
+            var track = tracks[i];
+            return AgentShallowTransit.issue(true, pose, window.dryBank(), track.sideDrift(),
+                track.braking() - MARGIN, patches::seen);
+        }
+        return null;
+    }
+
+    Patch wadePatch(AgentBody.HorizonView view, int x, int z) {
+        useView(view);
+        return patches.at(x, z);
+    }
 
     Target target(BlockHitResult witness) {
         if (witness == null) return null;
@@ -582,6 +631,12 @@ final class AgentVisibleHorizon {
         void reset(AgentBody.HorizonView view) {
             this.view = view;
             size = 0;
+        }
+
+        Patch seen(int x, int z) {
+            long key = BlockPos.asLong(x, 0, z);
+            for (int i = 0; i < size; ++i) if (keys[i] == key) return data[i];
+            return null;
         }
 
         @Override public Patch at(int x, int z) {

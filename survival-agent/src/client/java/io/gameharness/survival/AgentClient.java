@@ -106,7 +106,7 @@ public final class AgentClient implements ClientModInitializer {
     private long craftSequence;
     private int returnableDropSequence;
     private long stallSequence;
-    private int horizonEvidenceCount;
+    private int horizonEvidenceCount, wadeEvidenceCount;
     private boolean allowRespawn;
     private boolean initialDeathScreen;
     private LifePhase lifePhase = LifePhase.PLAYING;
@@ -206,8 +206,14 @@ public final class AgentClient implements ClientModInitializer {
     }
 
     private void recordHorizon(AgentVisibleHorizon.Evidence evidence) {
-        if (evidence == null || horizonEvidenceCount >= 64) return;
-        ++horizonEvidenceCount;
+        if (evidence == null) return;
+        if (evidence.phase().equals("wade")) {
+            if (wadeEvidenceCount >= 32) return;
+            ++wadeEvidenceCount;
+        } else {
+            if (horizonEvidenceCount >= 64) return;
+            ++horizonEvidenceCount;
+        }
         var event = new JsonObject();
         event.addProperty("tick", tick);
         event.addProperty("life", 1 + respawns);
@@ -625,6 +631,7 @@ public final class AgentClient implements ClientModInitializer {
         String planningAtCheck = fuse == null || macro == null ? null : macro.planningState();
         long planningDeadlineNs = fuse == null || macro == null ? 0 : macro.planningIdleDeadlineNanos();
         boolean fleeing = ears.escape(body, hands);
+        if (fleeing) body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
         if (fleeing && macro != null) macro.urgent("evading a primed creeper");
         if (!fleeing) {
             if (macro == null || !macro.engaged()) hands.tick();
@@ -922,6 +929,7 @@ public final class AgentClient implements ClientModInitializer {
             recordHorizon(body.visibleHorizon().takePreviewEvidence());
             recordHorizon(body.visibleHorizon().takeDriveEvidence());
         }
+        recordHorizon(body.visibleHorizon().takeWadeEvidence());
         JsonObject surveyTransition = macro == null ? null : macro.takeSurveyTransition(tick);
         boolean touchingWater = player != null && player.isTouchingWater();
         boolean changed = screenChanged || ownerChanged || planningChanged || newReturnableDrop || !status.equals(lastStatus)

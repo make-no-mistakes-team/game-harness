@@ -141,13 +141,21 @@ final class AgentProgress {
     enum Dig { LOOKING, CLEAR, BLOCKED, DARK, LIP, RESOURCE }
     private enum Firing { NONE, IRON, CHARCOAL }
     private enum Forage { ANIMAL, BERRIES, DROP }
+    private enum WorkshopView {
+        CURRENT, GROUND, FIRST_WALL, FIRST_FLOOR, SECOND_WALL, SECOND_FLOOR, EXHAUSTED;
+
+        private static final WorkshopView[] ORDER = values();
+        private WorkshopView next() { return ORDER[ordinal() + 1]; }
+    }
+    private static final Predicate<ItemStack> STATION_OPENING_HAND = stack -> stack.isEmpty()
+        || WOOD_PICK.test(stack) || STONE_PICK.test(stack) || DEEP_PICK.test(stack);
 
     private record OreSight(Resource resource, BlockPos block, Vec3d point, BlockPos stance, Vec3d feet,
                             double rangeSquared) {}
 
     private record TableReturn(BlockPos workshop, int planks, int sticks) {}
 
-    private static final class Station {
+    private final class Station {
         final Block block;
         final Predicate<ItemStack> item;
         final String recipe;
@@ -159,16 +167,34 @@ final class AgentProgress {
         int openAttempts;
         int memoryProbe;
         BlockPos lastUse;
+        final Set<BlockPos> rejected = new HashSet<>();
+        final Predicate<BlockPos> availableSite = this::availableSite;
         BlockHitResult face;
-        BlockPos rejected, niche, alternateNiche, underfoot;
-        boolean packablePlacement;
-        int siteSince, stageSince, stage;
-        int lampBefore, lampUsed;
+        BlockPos stance, cut, provedPlacement;
+        Direction lane;
+        boolean packablePlacement, outlinePlacement, outlineTried;
+        WorkshopView view;
+        int siteSince, viewSince, faceSince;
+        String siteRefusal;
 
         Station(Block block, Item item, String recipe) {
             this.block = block;
             this.item = AgentProgress.item(item);
             this.recipe = recipe;
+        }
+
+        private boolean availableSite(BlockPos dest) {
+            return !rejected.contains(dest) && workshopPlacementSite(dest);
+        }
+
+        private void resetSite() {
+            stance = cut = null;
+            face = null;
+            siteRefusal = null;
+            rejected.clear();
+            view = WorkshopView.CURRENT;
+            siteSince = viewSince = faceSince = 0;
+            outlineTried = false;
         }
     }
 
@@ -218,7 +244,6 @@ final class AgentProgress {
     private final Predicate<ItemStack> goalItem;
     private final Station table = new Station(Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE, "crafting_table");
     private final Station furnace = new Station(Blocks.FURNACE, Items.FURNACE, "furnace");
-    private final Predicate<BlockPos> workshopSide = this::offWorkshopPassage;
     private final FieldBench fieldBench = new FieldBench();
     private final FieldWood fieldWood = new FieldWood();
     private DropReclaim dropReclaim;
@@ -325,7 +350,7 @@ final class AgentProgress {
     private float sweepHeading;
     private int sweepIndex;
     private String localBlock;
-    private Station localBlockStation, stallStation;
+    private Station localBlockStation, stallStation, workshopReturn;
     private BlockPos stallStationPosition;
     private BlockPos exitStart;
     private BlockPos exitFrom;
@@ -858,7 +883,8 @@ final class AgentProgress {
             return;
         }
         if (supplyEgress.step()) return;
-        if (!returnableMine.settling() && !stallGuard.ownsRecovery() && body.repairHeadroom(tools, protectedHeadroom)) {
+        if (workshopReturn == null && !returnableMine.settling() && !stallGuard.ownsRecovery()
+                && body.repairHeadroom(tools, protectedHeadroom)) {
             status = body.headroomReport().reason();
             return;
         }
@@ -1165,9 +1191,8 @@ final class AgentProgress {
         if (other == null) return null;
         station.position = confirmStation(station, other);
         if (station == furnace) furnaceWitness = station.position;
-        station.face = null;
+        station.resetSite();
         station.lastUse = null;
-        station.siteSince = station.stageSince = station.stage = 0;
         station.placed = station.approachUntil = station.openAttempts = 0;
         stallOreTried.add(station.position);
         stallWork = () -> AgentStallGuard.Alternative.REPLAN;
@@ -1518,8 +1543,13 @@ final class AgentProgress {
             fieldBench.confirmCraft();
             return false;
         }
-        if (c.currentScreen instanceof CraftingScreen && tableRecipe != null) {
-            BlockPos used = confirmStationUse(table);
+        if (c.currentScreen instanceof CraftingScreen screen && tableRecipe != null) {
+            BlockPos used = c.player.currentScreenHandler == screen.getScreenHandler()
+                ? confirmStationUse(table) : null;
+            if (used == null) {
+                c.currentScreen.close();
+                return true;
+            }
             table.openAttempts = 0;
             String recipe = tableRecipe;
             String extra = tableExtra;
@@ -2216,6 +2246,7 @@ final class AgentProgress {
 
     private boolean ensureTable(int planks, int sticks, boolean shore) {
         if (table.position == null) {
+            if (!shore && !has(table.item, 1) && collect(table.item, 6)) return false;
             BlockPos hint = memory.station(c.world, false);
             if (hint != null && !hint.equals(failedTableReturn)) {
                 double distance = c.player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(hint));
@@ -2225,7 +2256,6 @@ final class AgentProgress {
             }
         }
         if (table.position != null || has(table.item, 1)) return ensureWood(planks, sticks);
-        if (!shore && collect(table.item, 6)) return false;
         if (shore ? affordsWood(planks + 4, sticks) : ensureWood(planks + 4, sticks)) {
             status = "preparing a crafting table";
             List<String> recipes = woodBatch(planks + 4, sticks);
@@ -2251,9 +2281,8 @@ final class AgentProgress {
     private void releaseTablePosition() {
         fieldBench.leave();
         table.position = table.lastUse = null;
-        table.face = null;
-        table.niche = table.alternateNiche = table.underfoot = table.rejected = null;
-        table.siteSince = table.stageSince = table.stage = table.approachUntil = 0;
+        table.resetSite();
+        table.approachUntil = 0;
         table.openAttempts = 0;
     }
 
@@ -2459,8 +2488,7 @@ final class AgentProgress {
                 && (bench < 0 || activeTrail() - bench > 12))) {
                 // Leave the distant furnace in observation memory and use a local replacement.
                 furnace.position = furnaceWitness = null;
-                furnace.face = null;
-                furnace.siteSince = furnace.stageSince = furnace.stage = 0;
+                furnace.resetSite();
             } else if (bench >= 0) {
                 startReturn(bench, true);
                 return;
@@ -2516,6 +2544,12 @@ final class AgentProgress {
         BlockPos position = station.lastUse;
         station.lastUse = null;
         if (position == null || !position.equals(station.position) || tick - station.opened > 10) return null;
+        if (station.placed != 0) {
+            // An unlit native outline identifies a surface, not its block type. Only
+            // the stock debit and this fresh matching screen complete that receipt.
+            if (!station.outlinePlacement || has(station.item, station.placementCount)) return null;
+            confirmStationPlacement(station, null);
+        }
         memory.confirm(c.world, station == furnace, position);
         return position;
     }
@@ -2557,25 +2591,7 @@ final class AgentProgress {
             Vec3d center = Vec3d.ofCenter(station.position);
             double distance = c.player.getEyePos().distanceTo(center);
             if (station.placed != 0) {
-                if (!has(station.item, station.placementCount)) {
-                    if (station == table) fieldBench.placementConsumed(station.position, station.packablePlacement);
-                    if (station == furnace) furnaceWitness = station.position;
-                    station.placed = 0;
-                    station.underfoot = null;
-                    station.siteSince = station.stageSince = station.stage = station.lampUsed = 0;
-                    station.niche = station.rejected = null;
-                } else if (tick - station.placed > 14) {
-                    station.rejected = station.position;
-                    station.underfoot = station.position = null;
-                    station.placed = 0;
-                    return;
-                } else {
-                    BlockHitResult placed = perceive(center, REACH);
-                    if (placed != null && placed.getBlockPos().equals(station.position)
-                            && state(placed).isOf(station.block))
-                        body.useContact(placed, AgentBody.Contact.INTERACT, AgentBody.Preparation.RECEIPT);
-                    return;
-                }
+                if (!observeStationPlacement(station, center)) return;
             }
             if (seen == null && station == table)
                 seen = body.find(TABLE_BLOCK, REACH, hit -> hit.getBlockPos().equals(station.position)).orElse(null);
@@ -2595,16 +2611,9 @@ final class AgentProgress {
                 seen = body.find(FURNACE_BLOCK, REACH, hit -> hit.getBlockPos().equals(station.position)).orElse(null);
             if (seen != null) {
                 confirmStation(station, seen);
-                AgentBody.Preparation readiness = station.opened != 0 && tick - station.opened <= 7
-                    ? AgentBody.Preparation.RECEIPT : AgentBody.Preparation.READY;
-                if (body.useContact(seen, AgentBody.Contact.INTERACT, readiness)) {
-                    station.opened = tick;
-                    station.lastUse = seen.getBlockPos();
-                    station.openAttempts++;
-                }
-                if (station.openAttempts > 8) {
-                    blockStation(station, "vanilla " + station.recipe + " interaction did not open its screen");
-                }
+                openStation(station, seen, AgentBody.Contact.INTERACT);
+            } else if (station.position.equals(station.provedPlacement) && openOutlinedStation(station, center)) {
+                return;
             } else {
                 body.aim(center);
                 if (!body.aligned(center)) return;
@@ -2628,10 +2637,72 @@ final class AgentProgress {
         placeStation(station);
     }
 
+    private boolean observeStationPlacement(Station station, Vec3d center) {
+        status = "checking placement of " + station.recipe;
+        if (has(station.item, station.placementCount)) {
+            if (tick - station.placed > 14) {
+                station.rejected.add(station.position);
+                station.position = null;
+                station.siteRefusal = "vanilla did not debit the item at the selected face";
+                station.placed = 0;
+            }
+            return false;
+        }
+        BlockHitResult placed = perceive(center, REACH);
+        if (stationHit(station, placed) && state(placed).isOf(station.block)) {
+            confirmStationPlacement(station, placed);
+            return true;
+        }
+        if (tick - station.placed > 52) {
+            blockStation(station, "stock debited but no block and fresh opening receipt for " + station.recipe
+                + " at " + station.position.toShortString());
+        } else if (!station.outlinePlacement || !openOutlinedStation(station, center)) {
+            body.aim(center);
+        }
+        return false;
+    }
+
+    private void confirmStationPlacement(Station station, BlockHitResult visible) {
+        station.provedPlacement = station.position;
+        station.placed = 0;
+        station.resetSite();
+        if (station == table) fieldBench.placementConsumed(station.position, station.packablePlacement);
+        if (visible != null) confirmStation(station, visible);
+    }
+
+    private boolean openOutlinedStation(Station station, Vec3d center) {
+        if (!hands.stableCraftFooting() || !STATION_OPENING_HAND.test(c.player.getOffHandStack())
+                && !c.player.getOffHandStack().isOf(Items.SHIELD)) return false;
+        BlockHitResult outline = body.selectedFace();
+        if (!stationHit(station, outline) || !nearOutline(outline)) return false;
+        body.aim(center);
+        if (!hands.equipForUse(STATION_OPENING_HAND)) return true;
+        openStation(station, outline, AgentBody.Contact.OUTLINE);
+        return true;
+    }
+
+    private static boolean stationHit(Station station, BlockHitResult hit) {
+        return hit != null && station.position.equals(hit.getBlockPos());
+    }
+
+    private void openStation(Station station, BlockHitResult hit, AgentBody.Contact mode) {
+        AgentBody.Preparation readiness = station.opened != 0 && tick - station.opened <= 7
+            ? AgentBody.Preparation.RECEIPT : c.player.isSneaking()
+                ? AgentBody.Preparation.STANCE : AgentBody.Preparation.READY;
+        if (body.useContact(hit, mode, readiness)) {
+            station.opened = tick;
+            station.lastUse = hit.getBlockPos();
+            station.openAttempts++;
+        }
+        if (station.openAttempts > 8)
+            blockStation(station, "vanilla " + station.recipe + " interaction did not open its screen");
+    }
+
     private void forgetStation(Station station) {
         memory.forget(c.world, station == furnace, station.position);
         if (station == furnace && station.position.equals(furnaceWitness)) furnaceWitness = null;
         if (station == table && !fieldBench.removed) fieldBench.leave();
+        if (station.position.equals(station.provedPlacement)) station.provedPlacement = null;
         station.position = null;
         station.lastUse = null;
     }
@@ -2642,129 +2713,179 @@ final class AgentProgress {
     }
 
     private void placeStation(Station station) {
-        if (station.siteSince == 0) station.siteSince = station.stageSince = tick;
-        if (tick - station.siteSince > 245) {
-            blockStation(station, "no reachable placement face for " + station.recipe);
+        if (!hands.stableCraftFooting() || !has(station.item, 1)) return;
+        BlockPos standing = c.player.getBlockPos();
+        if (!standing.equals(station.stance)) {
+            station.resetSite();
+            station.stance = standing;
+            station.siteSince = station.viewSince = tick;
+            station.lane = c.player.getHorizontalFacing();
+            int index = trail.lastIndexOf(standing);
+            if (index > 0) {
+                BlockPos prior = trail.get(index - 1);
+                if (adjacent(prior, standing) && !sameStem(prior, standing))
+                    station.lane = directional(Vec3d.ofBottomCenter(standing).subtract(Vec3d.ofBottomCenter(prior)));
+            }
+        }
+        if (station.face != null) {
+            useWorkshopFace(station);
             return;
         }
-        // Once excavation or pillar placement starts it owns the gesture.
-        // Rescanning mid-jump used to select a different face during the few
-        // ticks in which the destination was clear of the player's body.
-        if (station.stage == 0 && station.face == null)
-            station.face = body.stationFace(station.rejected, workshopSide);
-        if (station.face != null) {
-            var face = station.face;
-            body.sneak();
-            boolean ready = body.aimContact(face, AgentBody.Contact.PLACE);
-            if (c.player.getBoundingBox().intersects(new Box(face.getBlockPos().offset(face.getSide())))) {
-                body.vetoContact("collision_veto");
-                station.rejected = face.getBlockPos().offset(face.getSide());
-                station.face = null;
+        if (station.view == WorkshopView.EXHAUSTED || tick - station.siteSince >= 122) {
+            retraceWorkshop(station);
+            return;
+        }
+        if (station.view == WorkshopView.CURRENT) {
+            if (!body.hasRecentView()) return;
+            if (!selectWorkshopFace(station, body.stationFace(null, station.availableSite), null))
+                nextWorkshopView(station);
+            return;
+        }
+        boolean ground = station.view == WorkshopView.GROUND;
+        boolean wall = station.view == WorkshopView.FIRST_WALL || station.view == WorkshopView.SECOND_WALL;
+        Direction side = station.view == WorkshopView.SECOND_WALL || station.view == WorkshopView.SECOND_FLOOR
+            ? station.lane.rotateYCounterclockwise() : station.lane.rotateYClockwise();
+        BlockPos niche = ground ? null : standing.offset(side).up();
+        Vec3d aim = ground ? c.player.getPos().add(station.lane.getOffsetX(), -0.15, station.lane.getOffsetZ())
+            : Vec3d.ofCenter(niche, wall ? 0.50 : -0.045);
+        status = "checking " + (ground ? "ground" : wall ? "a side recess" : "a recess floor") + " for " + station.recipe;
+        body.aim(aim);
+        int age = tick - station.viewSince;
+        if (body.renderedAim(aim, 8) && body.aligned(aim)) {
+            BlockHitResult outline = body.selectedFace();
+            if (selectWorkshopFace(station, outline, niche)
+                    || ground && selectWorkshopFace(station, body.stationFace(null, station.availableSite), null)) return;
+            if (wall && age < 46 && cutWorkshopNiche(station, outline, niche)) return;
+            if (station.siteRefusal == null)
+                station.siteRefusal = "no lit support or close outline into an off-route recess";
+            if (age >= 8) nextWorkshopView(station);
+        } else if (age >= 36) {
+            nextWorkshopView(station);
+        }
+    }
+
+    private void nextWorkshopView(Station station) {
+        station.view = station.view.next();
+        station.viewSince = tick;
+    }
+
+    private boolean selectWorkshopFace(Station station, BlockHitResult hit, BlockPos recess) {
+        if (hit == null || hit.isInsideBlock() || hit.getSide() == Direction.DOWN) return false;
+        BlockPos dest = hit.getBlockPos().offset(hit.getSide());
+        if (recess != null && !dest.equals(recess)) {
+            if (station.siteRefusal == null && hit.getBlockPos().equals(recess))
+                station.siteRefusal = "the view stopped at the recess wall, not on a support across it";
+            return false;
+        }
+        if (!station.availableSite(dest) || c.player.getBoundingBox().intersects(new Box(dest))) {
+            if (station.siteRefusal == null)
+                station.siteRefusal = "the selected destination was protected, occupied or on the walked lane";
+            return false;
+        }
+        boolean lit = body.observedFaceLight(hit) > 0;
+        if (lit ? !safeSupport(hit) : recess == null || station.outlineTried || !nearOutline(hit)) return false;
+        station.face = hit;
+        station.faceSince = tick;
+        station.outlinePlacement = !lit;
+        return true;
+    }
+
+    private boolean nearOutline(BlockHitResult hit) {
+        if (hit.isInsideBlock() || hit.getPos().squaredDistanceTo(c.player.getEyePos()) > 2.35 * 2.35) return false;
+        Direction side = hit.getSide();
+        Vec3d pos = hit.getPos();
+        BlockPos support = hit.getBlockPos(), dest = support.offset(side);
+        // This fixes only the cell across the selected outer face. It proves no
+        // empty volume, clearance, or block behind that vanilla ray.
+        boolean outerFace = switch (side.getAxis()) {
+            case X -> Math.abs(pos.x - Math.max(support.getX(), dest.getX())) < 0.015;
+            case Y -> Math.abs(pos.y - Math.max(support.getY(), dest.getY())) < 0.015;
+            case Z -> Math.abs(pos.z - Math.max(support.getZ(), dest.getZ())) < 0.015;
+        };
+        return outerFace && BlockPos.ofFloored(pos.lerp(c.player.getEyePos(), 0.04)).equals(dest);
+    }
+
+    private void useWorkshopFace(Station station) {
+        BlockHitResult face = station.face;
+        BlockPos dest = face.getBlockPos().offset(face.getSide());
+        if (!station.availableSite(dest) || c.player.getBoundingBox().intersects(new Box(dest))) {
+            rejectWorkshopFace(station, dest, "the candidate would obstruct the player or walked lane");
+            return;
+        }
+        BlockHitResult current = body.selectedFace();
+        if (station.outlinePlacement && (current == null || !current.getBlockPos().equals(face.getBlockPos())
+                || current.getSide() != face.getSide() || !nearOutline(current))) {
+            body.aim(face.getPos());
+            if (tick - station.faceSince >= 35)
+                rejectWorkshopFace(station, dest, "the close native outline no longer selected the support");
+            return;
+        }
+        status = "placing " + station.recipe + (station.outlinePlacement ? " on a close outlined face" : " on a visible face");
+        body.sneak();
+        AgentBody.Preparation ready = AgentBody.Preparation.equipment(hands.equipForUse(station.item));
+        if (ready == AgentBody.Preparation.READY && !c.player.isSneaking()) ready = AgentBody.Preparation.STANCE;
+        if (ready == AgentBody.Preparation.READY && !body.canPlaceStationAcross(face)) {
+            if (current != null && current.getBlockPos().equals(face.getBlockPos())
+                    && current.getSide() == face.getSide()) {
+                rejectWorkshopFace(station, dest, "vanilla would replace the selected block rather than place beside it");
                 return;
             }
-            AgentBody.Preparation readiness = AgentBody.Preparation.equipment(hands.equipForUse(station.item));
-            if (readiness == AgentBody.Preparation.READY && !c.player.isSneaking())
-                readiness = AgentBody.Preparation.STANCE;
-            if (ready) {
-                pressPlace(station, face, AgentBody.Contact.PLACE, readiness);
-            } else if (body.aligned(face.getPos())) {
-                BlockHitResult seen = perceive(inward(face), REACH);
-                if (seen != null && seen.getBlockPos().equals(face.getBlockPos()) && seen.getSide() == face.getSide())
-                    return;
-                station.rejected = face.getBlockPos().offset(face.getSide());
-                station.face = null;
-            }
+            ready = AgentBody.Preparation.STANCE;
+        }
+        AgentBody.Contact mode = station.outlinePlacement ? AgentBody.Contact.OUTLINE : AgentBody.Contact.PLACE;
+        if (pressPlace(station, face, mode, ready)) return;
+        if (tick - station.faceSince >= 35)
+            rejectWorkshopFace(station, dest, "could not settle native contact on the selected face");
+    }
+
+    private void rejectWorkshopFace(Station station, BlockPos dest, String reason) {
+        station.rejected.add(dest);
+        station.face = null;
+        station.siteRefusal = reason;
+    }
+
+    private boolean cutWorkshopNiche(Station station, BlockHitResult hit, BlockPos niche) {
+        if (hit == null || !hit.getBlockPos().equals(niche) || body.observedFaceLight(hit) == 0
+                || !station.availableSite(niche)
+                || station.cut != null && !station.cut.equals(niche)) return false;
+        BlockState shown = state(hit);
+        if (!(shown.isIn(BlockTags.BASE_STONE_OVERWORLD) || shown.isIn(BlockTags.DIRT))
+                || !safeSupport(hit) || shown.getBlock() instanceof net.minecraft.block.FallingBlock
+                || !tools.canHarvest(shown)) return false;
+        status = "cutting one visible recess for " + station.recipe;
+        body.aimContact(hit, AgentBody.Contact.MINE);
+        if (readyForMine(shown) && body.mine(hit)) station.cut = niche;
+        return !body.miningFootingRefused(niche);
+    }
+
+    private void retraceWorkshop(Station station) {
+        String reason = station.siteRefusal != null ? station.siteRefusal : "no grounded placement face was witnessed";
+        int index = activeTrail() - 1;
+        if (index <= 0 || !station.stance.equals(trail.get(index))) {
+            blockStation(station, "cannot place " + station.recipe + ": " + reason + "; no earlier connected footing");
             return;
         }
-        if (station.stage == 0) {
-            // In open terrain look at the ground once; never rotate around an empty set of faces.
-            body.turn(c.player.getYaw(), 27);
-            if (tick - station.stageSince < 10) return;
-            station.stage = 1;
-            station.stageSince = tick;
-            BlockPos standing = c.player.getBlockPos();
-            int index = trail.lastIndexOf(standing);
-            Direction lane = c.player.getHorizontalFacing();
-            if (index > 0) {
-                BlockPos last = trail.get(index - 1);
-                if (adjacent(last, standing) && !sameStem(last, standing))
-                    lane = directional(Vec3d.ofBottomCenter(standing).subtract(Vec3d.ofBottomCenter(last)));
-            }
-            station.niche = standing.offset(lane.rotateYClockwise()).up();
-            station.alternateNiche = index > 0 ? standing.offset(lane.rotateYCounterclockwise()).up() : null;
+        BlockPos prior = trail.get(index - 1);
+        if (!adjacent(station.stance, prior) || sameStem(station.stance, prior)) {
+            blockStation(station, "cannot place " + station.recipe + ": " + reason + "; previous footing is not a dry step");
+            return;
         }
-        if (station.stage == 1) {
-            // Light the opposite wall, leaving the intended workshop recess free.
-            Vec3d reflected = c.player.getEyePos().multiply(2).subtract(Vec3d.ofCenter(station.niche));
-            if (has(TORCH, 1) && tick - station.stageSince <= 45) {
-                if (station.lampUsed == 0) {
-                    body.aim(reflected);
-                    AgentBody.Preparation readiness = AgentBody.Preparation.equipment(hands.equipForUse(TORCH));
-                    if (!body.aligned(reflected)) return;
-                    var face = body.selectedFace();
-                    if (face != null && face.getSide() != Direction.DOWN) {
-                        if (body.useContact(face, AgentBody.Contact.OUTLINE, readiness)) {
-                            station.lampBefore = hands.count(TORCH);
-                            station.lampUsed = tick;
-                        }
-                        return;
-                    }
-                } else if (has(TORCH, station.lampBefore) && tick - station.lampUsed < 8) return;
-            }
-            station.stage = 2;
-            station.stageSince = tick;
+        startReturn(index - 1, true);
+        workshopReturn = station;
+        status = "repositioning " + station.recipe + " to walked footing " + prior.toShortString() + ": " + reason;
+    }
+
+    private boolean workshopPlacementSite(BlockPos destination) {
+        if (occupiesStep(destination, c.player.getBlockPos()) || occupiesStep(destination, nextFoot)
+                || protectRecoveryBlock(destination)) return false;
+        for (int i = trail.size() - 1; i >= 0; i--) {
+            BlockPos foot = trail.get(i);
+            if (occupiesStep(destination, foot)) return false;
+            if (destination.getY() == foot.getY() + 2 && sameStem(destination, foot)
+                    && (i > 0 && trail.get(i - 1).getY() > foot.getY()
+                        || i + 1 < trail.size() && trail.get(i + 1).getY() > foot.getY())) return false;
         }
-        if (station.stage == 2) {
-            // Cut one bench-sized recess in an observed wall when the passage is only one block wide.
-            status = "making room for " + station.recipe;
-            Dig result = offWorkshopPassage(station.niche) && !protectRecoveryBlock(station.niche)
-                && tick - station.siteSince < 172 ? clear(station.niche) : Dig.BLOCKED;
-            if (result == Dig.LOOKING && tick - station.stageSince < 76) return;
-            if (result != Dig.CLEAR && tryOtherWorkshopSide(station)) return;
-            station.stage = result == Dig.CLEAR ? 3 : 4;
-            station.stageSince = tick;
-        }
-        if (station.stage == 3) {
-            status = "placing " + station.recipe + " in the recess";
-            AgentBody.Preparation readiness = AgentBody.Preparation.equipment(hands.equipForUse(station.item));
-            boolean floor = tick - station.stageSince >= 14;
-            Vec3d center = Vec3d.ofCenter(station.niche);
-            Vec3d aim = floor ? center.add(0, -0.52, 0) : center;
-            var hit = perceive(aim, REACH);
-            if (hit != null && hit.getBlockPos().offset(hit.getSide()).equals(station.niche)
-                    && offWorkshopPassage(station.niche)) {
-                if (pressPlace(station, hit, AgentBody.Contact.PLACE, readiness)) return;
-            } else {
-                body.aim(aim);
-            }
-            if (tick - station.stageSince < 32 && tick - station.siteSince < 172) return;
-            if (tryOtherWorkshopSide(station)) return;
-            station.stage = 4;
-            station.stageSince = tick;
-        }
-        if (station.stage == 4) {
-            Dig headroom = clear(c.player.getBlockPos().up(2));
-            if (headroom == Dig.LOOKING && tick - station.stageSince < 45) return;
-            station.stage = 5;
-        }
-        // A shaft may have no side face outside our body. Vanilla permits jump-placing on the
-        // floor we stand on; the real player must rise completely above the destination first.
-        AgentBody.Preparation readiness = AgentBody.Preparation.equipment(hands.equipForUse(station.item));
-        if (station.underfoot == null) {
-            if (!c.player.isOnGround()) return;
-            station.underfoot = c.player.getBlockPos().down();
-        }
-        var base = station.underfoot;
-        status = "lining up jump placement of " + station.recipe;
-        body.turnFixed(c.player.getYaw(), 90);
-        var actual = body.selectedFace();
-        if (actual == null || actual.getSide() != Direction.UP || !actual.getBlockPos().equals(base)) return;
-        status = "jump-placing " + station.recipe;
-        if (c.player.getBoundingBox().intersects(new Box(base.up()))) {
-            if (readiness == AgentBody.Preparation.READY) body.jump();
-        }
-        else pressPlace(station, actual, body.observedFaceLight(actual) > 0
-            ? AgentBody.Contact.PRECISE : AgentBody.Contact.OUTLINE, readiness);
+        return true;
     }
 
     private boolean offWorkshopPassage(BlockPos destination) {
@@ -2780,18 +2901,11 @@ final class AgentProgress {
             && block.getY() >= foot.getY() && block.getY() <= foot.getY() + 1;
     }
 
-    private boolean tryOtherWorkshopSide(Station station) {
-        if (station.alternateNiche == null || tick - station.siteSince >= 172) return false;
-        station.niche = station.alternateNiche;
-        station.alternateNiche = null;
-        station.stage = 2;
-        station.stageSince = tick;
-        return true;
-    }
-
     private boolean pressPlace(Station station, BlockHitResult support, AgentBody.Contact mode,
                                AgentBody.Preparation readiness) {
         BlockPos dest = support.getBlockPos().offset(support.getSide());
+        int before = readiness == AgentBody.Preparation.READY ? hands.count(station.item) : 0;
+        if (readiness == AgentBody.Preparation.READY && before <= 0) return false;
         if (c.player.getBoundingBox().intersects(new Box(dest)) || !body.useContact(support, mode, readiness))
             return false;
         if (station == table) {
@@ -2804,10 +2918,13 @@ final class AgentProgress {
                 && safeSupport(floor);
         }
         station.face = null;
+        station.outlineTried |= station.outlinePlacement;
         station.position = dest;
         station.placed = tick;
-        station.placementCount = hands.count(station.item);
+        station.placementCount = before;
         station.approachUntil = station.openAttempts = 0;
+        station.opened = 0;
+        station.lastUse = null;
         approachGoal = null;
         return true;
     }
@@ -6326,6 +6443,7 @@ final class AgentProgress {
         int last = activeTrail() - 1;
         if (last < index) return;
         tableReturn = null;
+        workshopReturn = null;
         returnIndex = last;
         returnTo = index;
         returnDetour = null;
@@ -6359,13 +6477,32 @@ final class AgentProgress {
                 return;
             }
         }
-        if (tick - returnAge > 165) {
+        if (workshopReturn == null && tick - returnAge > 165) {
             if (!replaceTableAfterFailedReturn())
                 startExitRecovery(directional(Vec3d.ofBottomCenter(next).subtract(c.player.getPos())));
             return;
         }
         BlockPos current = returnDetour != null ? returnDetour
             : returnIndex + 1 < trail.size() ? trail.get(returnIndex + 1) : c.player.getBlockPos();
+        if (workshopReturn != null) {
+            Station station = workshopReturn;
+            status = "retracing walked footing for " + station.recipe;
+            boolean wet = c.player.isTouchingWater();
+            boolean expired = tick - returnAge > 55;
+            if (!wet && !expired && driveKnownStep(current, next) != Walk.BLOCKED) return;
+            String reason = wet ? "the retreat became wet" : expired ? "the retrace did not settle in time"
+                : gaitStepProof ? "the witnessed landing could not be reached safely"
+                    : "the recorded tread had no visible safe support";
+            workshopReturn = null;
+            returnIndex = -1;
+            body.prioritizeMovement();
+            int reached = trail.lastIndexOf(c.player.getBlockPos());
+            resumeIndex = reached >= 0 && reached + 1 < trail.size() ? reached + 1 : -1;
+            resumeStep = -1;
+            blockStation(station, "cannot reposition " + station.recipe + " toward " + next.toShortString()
+                + ": " + reason);
+            return;
+        }
         if (caves.followWater(current, next, tick)) {
             status = caves.status();
             return;
@@ -6407,6 +6544,7 @@ final class AgentProgress {
         int index = returnIndex;
         returnIndex = -1;
         tableReturn = null;
+        workshopReturn = null;
         gaitStep = null;
         if (keepTrail) {
             resumeIndex = index + 1;
@@ -6644,7 +6782,8 @@ final class AgentProgress {
         if (!gaitStepProof) {
             Vec3d inward = landing.subtract(start);
             Vec3d point = landing.add(inward.x * 0.30, -0.08, inward.z * 0.30);
-            BlockHitResult support = terrain(point, 3.4);
+            BlockHitResult support = workshopReturn == null ? terrain(point, 3.4)
+                : body.dryRouteFloor(point, to.down());
             if (support == null || !support.getBlockPos().equals(to.down()) || !safeSupport(support)) {
                 if (tick - gaitStepSince < 16) return Walk.LOOKING;
                 gaitStepBlocked = true;

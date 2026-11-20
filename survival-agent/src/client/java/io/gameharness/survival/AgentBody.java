@@ -25,11 +25,13 @@ import net.minecraft.fluid.FluidState;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.BoatItem;
 import net.minecraft.item.Item;
+import net.minecraft.item.ItemPlacementContext;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.util.Hand;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.EntityHitResult;
 import net.minecraft.util.hit.HitResult;
@@ -793,6 +795,15 @@ final class AgentBody {
         return hasView() && renderedCrosshair instanceof BlockHitResult hit && hit.getType() == HitResult.Type.BLOCK
             && currentCrosshair() instanceof BlockHitResult now && now.getType() == HitResult.Type.BLOCK
             && now.getBlockPos().equals(hit.getBlockPos()) && now.getSide() == hit.getSide() ? now : null;
+    }
+
+    /** A motor veto on the selected support only. Never probe or expose the destination's state. */
+    boolean canPlaceStationAcross(BlockHitResult support) {
+        BlockHitResult now = selectedFace();
+        if (!sameBlockFace(support, now) || now.isInsideBlock()) return false;
+        var player = client.player;
+        var placement = new ItemPlacementContext(player, Hand.MAIN_HAND, player.getMainHandStack(), now);
+        return placement.getBlockPos().equals(now.getBlockPos().offset(now.getSide()));
     }
 
     void release() {

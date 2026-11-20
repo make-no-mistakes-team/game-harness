@@ -1,11 +1,10 @@
 #!/usr/bin/env bun
-import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { constants, lstatSync, readFileSync } from "node:fs";
 import { access, appendFile, chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { promisify } from "node:util";
 import { SURVIVAL_AGENT_GOALS as GOALS, type SurvivalAgentGoal as Goal } from "../src/shared/survival-agent-ui.ts";
 import { JAVA, MinecraftClient, privateJson } from "../src/server/minecraft-client.ts";
 import { nativeLaunchFailure } from "../src/server/native-launch-fault.ts";
@@ -20,7 +19,7 @@ import { createUrgentThreatProbe, urgentThreatDeclaration, urgentThreatLimits, u
   urgentCraftLimits } from "./diagnostic-urgent.ts";
 import { FAST_DEATH_LIMIT, FAST_DEATH_WINDOW_MS, LIFE_RECEIPTS, LifeLedger, lifeReceiptReader,
   RESPAWN_MARKER, RESPAWN_TIMEOUT_MS } from "./lives.ts";
-import { admitRun } from "./storage.ts";
+import { admitRun, diskBytes } from "./storage.ts";
 import { finalPauseEvidence, PAUSE_DIAGNOSTICS } from "./pause-evidence.ts";
 import { finalPlanningEvidence } from "./planning-evidence.ts";
 import { readStrategy, type TerraOptions } from "./strategy-options.ts";
@@ -66,7 +65,6 @@ const OVERWORLD = "minecraft:overworld";
 const DETERMINISTIC_STRATEGY = {
   strategy: "deterministic", model: null, task: null, limits: { maxRequests: 0, maxRuntimeMs: 0, requestTimeoutMs: 0 },
 } as const;
-const exec = promisify(execFile);
 type Exit = { code: number | null; signal: NodeJS.Signals | null };
 type Owned = { child: ChildProcess; closed: Promise<Exit>; exit?: Exit };
 type Progress = {
@@ -372,15 +370,6 @@ async function drainVanillaServer(owned: Owned | undefined) {
     }
   }
   return { shutdownMs: elapsedMs(), escalation, phases, dimensionsSaved: seen.has("dimensions_saved") };
-}
-
-async function diskBytes(dir: string, signal?: AbortSignal): Promise<number> {
-  const { stdout } = await exec("du", ["-s", "-B1", "--", dir], {
-    signal, timeout: 5_000, maxBuffer: 8_192,
-  });
-  const bytes = Number(stdout.split("\t", 1)[0]);
-  if (!Number.isSafeInteger(bytes) || bytes < 0) throw new Error("Could not measure run storage.");
-  return bytes;
 }
 
 async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
@@ -959,8 +948,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           }
           await delay(1_000, undefined, { signal });
         }
-      })().catch(() => {
-        if (!signal.aborted) abort("failed", "Could not measure run storage.");
+      })().catch((error: unknown) => {
+        if (!signal.aborted) abort("failed", error instanceof Error ? error.message : "Could not measure run storage.");
       });
       if (terraDeclaration) {
         stage = "macro_startup";
@@ -1281,7 +1270,14 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           result = new Stop("failed", "Could not mark the live view inactive.");
         });
       }
-      measuredBytes = await diskBytes(dir).catch(() => measuredBytes);
+      try { measuredBytes = await diskBytes(dir); }
+      catch (error) {
+        const reason = error instanceof Error ? error.message : "Could not measure final run storage.";
+        measuredBytes = null;
+        if (result.status === "won" || result.status === "trial_closed" || result.status === "urgent_closed")
+          result = new Stop("failed", reason);
+        await record("final_storage_unreadable", { reason }).catch(() => {});
+      }
       let lifeEvidenceReadable = !client;
       if (client?.exit) {
         try {

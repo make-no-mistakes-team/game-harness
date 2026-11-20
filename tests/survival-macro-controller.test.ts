@@ -369,6 +369,119 @@ test.each(["invalid", "malformed", "abstain", "gap", "incomplete"] as const)(
 );
 
 test.each([
+  "same survey", "duplicate loss", "different angle", "never returned", "expired", "new life", "changed epoch",
+  "changed safety", "changed health", "changed stock", "abstained", "unprimed gap", "stale gap",
+] as const)("A lost stationary survey is reconsidered at most once (%s)", async condition => {
+  const firstReply = Promise.withResolvers<void>();
+  const gapReply = Promise.withResolvers<void>();
+  const freshReply = Promise.withResolvers<void>();
+  const requests: MacroRequest[] = [];
+  const survey = { id: "o-1", verb: "survey", risk: "read", summary: "Survey the nearby ground",
+    evidence: "A fixed downward camera angle from the current stance." } as const;
+  const returned = { ...survey, id: "o-4" };
+  const reconsider = condition === "same survey" || condition === "duplicate loss";
+  const gap = { kind: "gap", capability: "The current view offers no usable action." } as const;
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    if (requests.length === 1 && condition !== "unprimed gap") {
+      await firstReply.promise;
+      return workReply(request, { kind: "opportunity", opportunityId: survey.id }, 600);
+    }
+    if (requests.length === 2 && condition === "abstained") return workReply(request, { kind: "abstain" });
+    if (requests.length === 2 && condition === "stale gap") {
+      await gapReply.promise;
+      return workReply(request, gap, 5);
+    }
+    if (requests.length === 3 && reconsider) {
+      await freshReply.promise;
+      return workReply(request, { kind: "opportunity", opportunityId: returned.id });
+    }
+    return workReply(request, gap);
+  }, undefined, 8);
+  try {
+    await f.observe(11);
+    const job = await f.order();
+    await f.receipt(job.id, 15, "accepted");
+    await f.receipt(job.id, 15, "interrupted");
+    const workOrder = { id: job.id, state: "blocked", detail: "No live source" } as const;
+    await f.observe(16, { workOrder, opportunities: [survey] });
+    expect(requests).toHaveLength(1);
+    firstReply.resolve();
+    await f.observe(106, { workOrder });
+    if (condition === "stale gap") {
+      gapReply.resolve();
+      await f.observe(111, { workOrder });
+    }
+    await f.actor.poll();
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toMatchObject({ observation: { tick: 106, opportunities: [] }, work: { demand: "blocked", current: null } });
+    expect(f.actor.status()).toMatchObject({
+      issued: 0, staleDecisions: condition === "unprimed gap" ? 0 : condition === "stale gap" ? 2 : 1,
+      lastDisposition: condition === "abstained" ? "abstained" : condition === "stale gap" ? "stale" : "native_capability_gap",
+    });
+    if (condition !== "unprimed gap") {
+      expect(await readFile(f.file("history.jsonl"), "utf8")).toContain('"reason":"opportunity_no_longer_witnessed"');
+    }
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+
+    const scopeChange: Partial<MacroObservation> = condition === "new life" ? { life: 2, epoch: 2 } :
+      condition === "changed epoch" ? { epoch: 2 } :
+      condition === "changed safety" ? { safety: { clear: true, revision: 2 }, epoch: 2 } :
+      condition === "changed health" ? { health: 19 } :
+      condition === "changed stock" ? { inventory: { "minecraft:stick": 1 } } : {};
+    const normalReplan = condition === "new life" || condition === "changed safety" || condition === "changed stock";
+    const alreadyAsked = normalReplan ? 3 : 2;
+    await f.observe(185, { workOrder, ...scopeChange });
+    await f.observe(186, { workOrder, ...scopeChange });
+    await f.actor.poll();
+    expect(requests).toHaveLength(alreadyAsked);
+    if (normalReplan) expect(requests[2]?.observation.opportunities).toEqual([]);
+
+    const returnTick = condition === "expired" ? 620 : 266;
+    const liveOffer = condition === "different angle" ? { ...returned, summary: "Survey left from this stance" } : returned;
+    const visible = condition === "never returned" ? [] : [liveOffer];
+    // A transient health change must invalidate rather than on/off switch the allowance.
+    const state = { workOrder, ...(condition !== "changed health" ? scopeChange : {}) };
+    await f.observe(returnTick, { ...state, opportunities: visible });
+    expect(requests).toHaveLength(reconsider ? 3 : alreadyAsked);
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    if (reconsider) {
+      expect(requests[2]).toMatchObject({ observation: { tick: returnTick, opportunities: [returned] },
+        work: { demand: "blocked", current: null }, feedback: { kind: "native_capability_gap" } });
+      if (condition === "duplicate loss") {
+        freshReply.resolve();
+        await f.observe(returnTick + 5, state);
+        expect(f.actor.status()).toMatchObject({ staleDecisions: 2, issued: 0 });
+      } else {
+        freshReply.resolve();
+        await f.actor.poll();
+        const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+        expect(intent).toMatchObject({ basisTick: returnTick, opportunityId: returned.id, skillHash: null });
+        await f.receipt(intent.id, returnTick + 1, "accepted");
+        await f.receipt(intent.id, returnTick + 2, "completed");
+        await f.observe(returnTick + 80, state);
+        await f.actor.poll();
+        expect(requests).toHaveLength(4); // A native receipt, not camera churn, warrants this ordinary gap.
+        expect(requests[3]).toMatchObject({ lastReceipt: { id: intent.id, status: "completed" } });
+      }
+    }
+    const count = requests.length;
+    for (const tick of [returnTick + 160, returnTick + 240]) {
+      await f.observe(tick, state);
+      await f.observe(tick + 5, { ...state, opportunities: visible.map(offer => ({ ...offer, id: `o-${tick}` })) });
+      expect(requests).toHaveLength(count);
+    }
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+  } finally {
+    firstReply.resolve();
+    gapReply.resolve();
+    freshReply.resolve();
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test.each([
   { opportunities: [] },
   { safety: { clear: false, revision: 2 } },
   { life: 2, epoch: 2, health: 0 },

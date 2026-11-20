@@ -68,6 +68,8 @@ const FEEDBACK: Readonly<Record<string, string>> = Object.freeze({
 });
 const WORK_ADMISSION_TICKS = 40;
 const WORK_REPLAN_GAP_TICKS = 80;
+const SURVEY_RECOVERY_TICKS = 600;
+const SURVEY_RECOVERY_MS = 30_000;
 // Native views are published every 5 ticks. Permit at most two follow-up
 // publications and a short wall-clock bound for the first rendered offer.
 const FIRST_ACTIONABLE_VIEW_TICKS = 10;
@@ -190,6 +192,17 @@ interface ReplyCorrection {
   readonly observation: MacroObservation;
   readonly key: string;
   readonly feedback: MacroFeedback;
+}
+
+interface SurveyRecovery {
+  readonly basis: MacroBasis;
+  readonly health: number;
+  readonly evidence: string;
+  readonly offer: Omit<MacroOpportunity, "id">;
+  readonly key: string;
+  readonly expiresTick: number;
+  readonly until: number;
+  gapSeen?: true;
 }
 
 interface FirstPlanning {
@@ -432,9 +445,13 @@ function sameOffer(left: MacroOpportunity | undefined, right: MacroOpportunity |
   return !!left && !!right && left.id === right.id && sameAffordance(left, right);
 }
 
-function sameAffordance(left: MacroOpportunity, right: MacroOpportunity): boolean {
+function sameAffordance(left: Omit<MacroOpportunity, "id">, right: MacroOpportunity): boolean {
   return left.verb === right.verb && left.summary === right.summary &&
     left.risk === right.risk && left.evidence === right.evidence && sameMaterial(left.material, right.material);
+}
+
+function offersAffordance(observation: MacroObservation, offer: Omit<MacroOpportunity, "id">): boolean {
+  return observation.opportunities.some(current => sameAffordance(offer, current));
 }
 
 function workAffordance(offer: MacroOpportunity): boolean {
@@ -656,7 +673,12 @@ export class SurvivalMacroController {
   private newestJob?: WorkJob;
   private lastAcceptedJob?: WorkJob;
   private lastJobOutcome?: WorkJob;
-  private workQuery?: { readonly key: string; tick: number; readonly evidence: string; mayRecoverOnAffordance?: true };
+  private workQuery?: {
+    readonly key: string; tick: number; readonly evidence: string;
+    readonly surveyReconsideration?: true; mayRecoverOnAffordance?: true;
+  };
+  private surveyRecovery?: SurveyRecovery;
+  private readonly recoveredSurveys = new Set<string>();
   private readonly workHandoffQueries = new Set<string>();
   private readonly workOverlapRequests = new Set<string>();
   private returnWitnessRevision = 0;
@@ -840,6 +862,8 @@ export class SurvivalMacroController {
     const view = this.view;
     const current = view && now - this.observedAt <= this.limits.maxObservationAgeMs ? view.observation : undefined;
     const runtimeExpired = now - this.startedAt! >= this.limits.maxRuntimeMs;
+    if (this.surveyRecovery && (runtimeExpired || !current || this.pending || this.job || this.queuedWork ||
+        !this.surveyRecoveryCurrent(this.surveyRecovery, current))) this.surveyRecovery = undefined;
     if (this.firstPlanning) {
       await this.advanceFirstPlan(current, !!observed, runtimeExpired ? "runtime_wall_limit" : undefined);
       // A single provider slot is shared across both stages, even while abort
@@ -1222,6 +1246,16 @@ export class SurvivalMacroController {
     });
   }
 
+  private workQueryEvidence(observation: MacroObservation): string {
+    return digest([workEvidence(observation, this.lastReceipt), this.returnWitnessRevision]);
+  }
+
+  private surveyRecoveryCurrent(recovery: SurveyRecovery, current: MacroObservation, evidence = this.workQueryEvidence(current)): boolean {
+    return current.tick < recovery.expiresTick && performance.now() < recovery.until &&
+      current.run === recovery.basis.run && current.life === recovery.basis.life && current.epoch === recovery.basis.epoch &&
+      current.health === recovery.health && current.safety?.clear === true && evidence === recovery.evidence;
+  }
+
   private async scheduleWork(view: View, queue?: QueuedWork): Promise<void> {
     const { observation } = view;
     if (!this.config.strategist || this.unavailable || !alive(observation) || observation.safety?.clear !== true) return;
@@ -1285,7 +1319,7 @@ export class SurvivalMacroController {
     if (previous && job && !needsRenewal && !nextCourse && !overlap) return;
     const outcome = this.lastJobOutcome && sameGoalAndLife(this.lastJobOutcome.source, observation) ? this.lastJobOutcome : undefined;
     const outcomeState = outcome && outcome.order.id === observation.workOrder?.id ? observation.workOrder : null;
-    const evidence = digest([workEvidence(observation, this.lastReceipt), this.returnWitnessRevision]);
+    const evidence = this.workQueryEvidence(observation);
 
     let demand: MacroWorkDemand["demand"];
     let key: string;
@@ -1312,19 +1346,27 @@ export class SurvivalMacroController {
     if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew") return;
     const correction = !job ? this.replyCorrection : undefined;
     const unchanged = previous && (key === previous.key || (!job && demand === "changed" && previous.evidence === evidence));
+    const recovery = this.surveyRecovery;
+    const reconsiderSurvey = recovery?.gapSeen && !correction && !queue && !observation.working &&
+      this.isCurrentHandoff(observation) && this.surveyRecoveryCurrent(recovery, observation, evidence) &&
+      offersAffordance(observation, recovery.offer);
     // An idle abstention can recover on a genuinely new actionable witness or
     // neutral handoff, not when the same affordance is issued a different ID.
-    if (unchanged && !correction) {
+    if (unchanged && !correction && !reconsiderSurvey) {
       const asked = this.lastAsked?.observation;
       if (job || !previous.mayRecoverOnAffordance || !asked ||
           (!(observation.quiescent && !asked.quiescent) && !observation.opportunities.some(offer =>
-            workAffordance(offer) && !asked.opportunities.some(prior => sameAffordance(offer, prior))))) return;
+            workAffordance(offer) && !offersAffordance(asked, offer)))) return;
     }
     const handoffQuery = !job && (observation.quiescent || observation.opportunities.some(workAffordance))
       ? digest([evidence, liveCorrectionEvidence({ ...observation, opportunities: observation.opportunities.filter(workAffordance) })]) : null;
-    if (unchanged && !correction && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
+    if (unchanged && !correction && !reconsiderSurvey && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
     if (handoffQuery) this.workHandoffQueries.add(handoffQuery);
-    if (!correction) this.workQuery = { key, tick: observation.tick, evidence };
+    if (reconsiderSurvey) {
+      this.recoveredSurveys.add(recovery.key);
+      this.surveyRecovery = undefined;
+    }
+    if (!correction) this.workQuery = { key, tick: observation.tick, evidence, surveyReconsideration: reconsiderSurvey || undefined };
     if (overlap?.smeltBurnTick !== undefined) overlap.incumbent.smeltLookedAhead = true;
     else if (overlap && owner) this.workOverlapRequests.add(owner);
     const ticket = observation.pendingWork;
@@ -2169,6 +2211,18 @@ export class SurvivalMacroController {
       !proposal || !ttlValid || !model ? "invalid" : "proposed";
     const reason = rotation ? "A rotating observation deferred the correction before provider dispatch." :
       rejection ? macroReplyRejectionDetail(rejection) : result.ok ? null : result.detail;
+    const recovery = this.surveyRecovery;
+    if (recovery) {
+      // Only the next valid, idle gap can confirm the interruption. The
+      // failed choice and absence on both views supply the link, not gap text.
+      if (!recovery.gapSeen && disposition === "proposed" && proposal?.action.kind === "gap" &&
+          context.workDemand?.current === null && current && this.isCurrentHandoff(current) &&
+          !original.working && !current.working && original.tick > recovery.basis.tick &&
+          this.surveyRecoveryCurrent(recovery, original) && this.surveyRecoveryCurrent(recovery, current) &&
+          !offersAffordance(original, recovery.offer) && !offersAffordance(current, recovery.offer)) {
+        recovery.gapSeen = true;
+      } else this.surveyRecovery = undefined;
+    }
     const correction = context.correction;
     if (correction) {
       if (rotation) {
@@ -2765,6 +2819,19 @@ export class SurvivalMacroController {
         !sameOffer(before, after) || (selection && after?.risk === "guarded") ||
         (direct && (!directScope(direct, current) || !directConditions(direct, current) || !protectsStock(direct.action.reserves, current, after!))) ||
         (conditional && (current.working || !successorScope(conditional, current) || !successorStock(conditional, current, after!)))) {
+      if (!authority && action.kind === "opportunity" && plan.workDemand?.current === null &&
+          before.verb === "survey" && !workAffordance(before) && usableHandoff(current) && !current.working &&
+          scope(witnessed, current) && workScope(witnessed, current) && current.health === witnessed.health &&
+          current.tick < plan.proposal.expiresTick && !offersAffordance(current, before)) {
+        const evidence = this.workQueryEvidence(current);
+        const offer = { verb: before.verb, risk: before.risk, summary: before.summary, evidence: before.evidence };
+        const key = digest([current.epoch, current.health, evidence, offer]);
+        if (evidence === this.workQuery?.evidence && !this.workQuery.surveyReconsideration && !this.recoveredSurveys.has(key)) {
+          this.surveyRecovery = { basis: basis(witnessed), health: current.health, offer, evidence, key,
+            expiresTick: Math.min(plan.proposal.expiresTick, current.tick + SURVEY_RECOVERY_TICKS),
+            until: performance.now() + SURVEY_RECOVERY_MS };
+        }
+      }
       await this.rejectStale(plan, "opportunity_no_longer_witnessed");
       return false;
     }
@@ -2913,6 +2980,7 @@ export class SurvivalMacroController {
   private async revoke(): Promise<void> {
     const ipc = this.ipc;
     if (!ipc) return;
+    this.surveyRecovery = undefined;
     if (this.pending) this.pending.withdrawn = true;
     const errors: unknown[] = [];
     try { await ipc.remove("active.json"); this.markerLive = false; } catch (error) { errors.push(error); }

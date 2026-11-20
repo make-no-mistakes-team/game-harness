@@ -70,6 +70,10 @@ the crafting table. Reaching the request limit
 stops new calls; it does not grant more materials, extend a job, or end
 Minecraft. A locally selected preset alone does not count as a Terra action.
 
+If a requested survey disappears before the player turns, Terra can report
+the missing view. Its return under the same safe conditions permits one
+fresh decision. The player never executes the old turn on a stale view.
+
 Once Terra sees carried raw iron and fuel, it can quote one live stock job
 with `smelt:minecraft:iron_ingot`. The target is the total number of ingots
 to hold. The policy names exact raw iron and fuel costs and preserves the

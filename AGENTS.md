@@ -52,9 +52,10 @@ behavior. Infrastructure milestones support that outcome; they do not replace it
 
 On `experiment/minecraft-survival-agent`, the user authorizes any number of Luna
 (`gpt-6-luna`) and Terra (`gpt-6.1-terra`) gameplay runs. Ask before each
-`gpt-6.2-sol` run. Choose run-specific timeouts and stop on lack of progress;
-the standing tool, request, and time caps below do not apply to the Minecraft
-Survival Agent experiment.
+`gpt-6.2-sol` run. Choose time, request and tool budgets for the work at hand;
+larger or longer runs need no further approval. Use progress checks to catch
+loops. The standing caps and budget-increase approval rule below do not
+apply to this experiment.
 The aggregate artifact ceiling for this branch is 300,000,000,000 bytes,
 including pre-existing runs. These permissions do not change frozen study
 protocols, authorize deleting private material, or grant access to hidden

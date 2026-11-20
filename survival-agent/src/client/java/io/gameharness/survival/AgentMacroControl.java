@@ -594,7 +594,9 @@ final class AgentMacroControl {
             return;
         }
         sampleClock();
-        if (!trial && ipc.workMode != null) {
+        // An accepted direct intent owns the input path even when its tick is
+        // neutral (e.g. one missing route render). No work-order branch may steal it.
+        if (!trial && ipc.workMode != null && (action == null || action.intent == null || action.durable)) {
             reconcileWork();
             if (hasActiveWorkOrder()) {
                 workTick(progress);
@@ -2683,7 +2685,10 @@ final class AgentMacroControl {
         }
         if (action.settledAt == 0) {
             switch (progress.followDryRoute(offer.route)) {
-                case RUNNING -> { return; }
+                case RUNNING -> {
+                    status = progress.dryRouteReason();
+                    return;
+                }
                 case REFUSED -> {
                     interrupt("Dry route refused: " + progress.dryRouteReason() + ".", true);
                     return;

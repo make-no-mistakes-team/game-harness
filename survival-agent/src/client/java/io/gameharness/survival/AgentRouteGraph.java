@@ -260,6 +260,28 @@ final class AgentRouteGraph {
         return count;
     }
 
+    /** Refresh only the granted suffix, never select alternate hops for its owner. */
+    boolean revalidateDirectSuffix(long source, long[] hops, int start, int end) {
+        if (start < 0 || end > hops.length || start >= end || anchor == 0 || proveReturn(MAX_NODES) < 0) return false;
+        for (int i = start; i < end; ++i) {
+            long to = hops[i];
+            if (!canReturn(source) || !canReturn(to) || !usable(source, to) || !usable(to, source)) return false;
+            source = to;
+        }
+        return true;
+    }
+
+    /** A missed render is neutral only if the current tick still belongs to the exact lease. */
+    enum DirectTurn {
+        DRIVE, HOLD, LOST_OWNER, LOST_VIEW;
+
+        static DirectTurn classify(boolean sameLease, int previousTick, int tick, boolean freshView, int missedViews) {
+            if (!sameLease || tick != previousTick + 1) return LOST_OWNER;
+            if (freshView) return DRIVE;
+            return missedViews < 2 ? HOLD : LOST_VIEW;
+        }
+    }
+
     long endpoint() {
         return status == Status.MOVE || status == Status.FRONTIER || status == Status.GOAL ? cells[target] : NO_CELL;
     }

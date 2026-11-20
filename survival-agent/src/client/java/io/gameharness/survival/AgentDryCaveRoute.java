@@ -55,6 +55,7 @@ final class AgentDryCaveRoute {
     private long lastContactTick, lastPoseTick, surveyEvidence;
     private int viewIndex, viewAdmissions, completedViewTick = -1000, since, lastTurn, centerSince, movingContacts;
     private int missingDriveViews;
+    private int missingDirectViews;
     private Probe edge;
     private boolean moving, looked, apertureChecked, yieldRefusal;
     private BlockHitResult ore, lava;
@@ -364,11 +365,14 @@ final class AgentDryCaveRoute {
 
     DirectResult follow(Offer authorization, int tick) {
         ensureLife();
-        if (authorization == null || player == null || !dry() || !body.dryRouteView())
-            return directRefusal("safe first-person control or rendered view unavailable");
+        if (authorization == null || player == null || !dry())
+            return directRefusal("safe dry first-person control is no longer available");
+        if (player.isSprinting() || client.options.forwardKey.isUnbound()
+                || authorization.heightChange() > 0 && client.options.jumpKey.isUnbound())
+            return directRefusal("the authorized non-sprinting movement control changed");
         int now = body.actionTick();
         if (direct == null) {
-            if (authorization != offered || !offerFresh(now) || !offerStance(authorization.from)
+            if (!body.dryRouteView() || authorization != offered || !offerFresh(now) || !offerStance(authorization.from)
                     || !sameOfferSource(authorization.from)
                     || authorization.heightChange() > 0 && client.options.jumpKey.isUnbound()
                     || !directSourceContact(authorization.from, bearing(authorization.from, authorization.next)))
@@ -376,23 +380,49 @@ final class AgentDryCaveRoute {
             interrupt();
             direct = authorization;
             directHop = 0;
+            missingDirectViews = 0;
             yieldRefusal = false;
             endpoint = authorization.endpoint;
-        } else if (authorization != direct || lastTurn + 1 != now || graph.topologyEpoch() != offeredTopology) {
-            return directRefusal("selected route ownership was interrupted");
+        } else {
+            if (yieldRefusal) return directRefusal(directReason);
+            switch (AgentRouteGraph.DirectTurn.classify(authorization == direct, lastTurn, now,
+                    body.dryRouteView(), missingDirectViews)) {
+                case LOST_OWNER -> {
+                    return directRefusal("the exact route lease or native control owner changed");
+                }
+                case LOST_VIEW -> {
+                    return directRefusal("the selected dry sweep lost its rendered view");
+                }
+                case HOLD -> {
+                    int limit = moving ? DRIVE_TICKS : VIEW_TICKS;
+                    if (tick - since > limit) return directRefusal("the authorized route deadline expired during a neutral render hold");
+                    if (moving && !observeDriveMotion())
+                        return directRefusal("actual body path broke continuity during a neutral render hold");
+                    ++missingDirectViews;
+                    lastTurn = now;
+                    activity = directReason = "Dry route holding neutral for its next rendered view.";
+                    return DirectResult.RUNNING;
+                }
+                case DRIVE -> {
+                    if (missingDirectViews != 0) directReason = moving ? "traversing the revalidated authorized edge"
+                        : "checking the authorized next edge";
+                    missingDirectViews = 0;
+                }
+            }
+            if (graph.topologyEpoch() != offeredTopology) {
+                long from = directHop == 0 ? direct.from.asLong() : offeredHops[directHop - 1];
+                if (!graph.revalidateDirectSuffix(from, offeredHops, directHop, offeredCount))
+                    return directRefusal("the pinned directed route or its proved return changed");
+                offeredTopology = graph.topologyEpoch();
+            }
         }
-        if (player.isSprinting() || client.options.forwardKey.isUnbound()
-                || authorization.heightChange() > 0 && client.options.jumpKey.isUnbound())
-            return directRefusal("the authorized non-sprinting movement control changed");
         lastTurn = now;
         if (edge == null) {
             BlockPos from = directHop == 0 ? direct.from : BlockPos.fromLong(offeredHops[directHop - 1]);
             BlockPos to = BlockPos.fromLong(offeredHops[directHop]);
             if (directHop == 0 ? !sameOfferSource(from) || !directSourceContact(from, bearing(from, to))
                     : !settled(from, 0.22)) return directRefusal("did not remain on the authorized support");
-            graph.plan(from.asLong());
-            if (!graph.canReturn(from.asLong()) || !graph.canReturn(to.asLong())
-                    || !graph.usable(from.asLong(), to.asLong()) || !graph.usable(to.asLong(), from.asLong()))
+            if (!graph.revalidateDirectSuffix(from.asLong(), offeredHops, directHop, offeredCount))
                 return directRefusal("the exact next edge or its proved return path changed");
             edge = new Probe(from, to, bearing(from, to));
             since = tick;
@@ -747,14 +777,10 @@ final class AgentDryCaveRoute {
     }
 
     private boolean drive(int tick) {
-        Vec3d feet = player.getPos();
-        if (feet.squaredDistanceTo(lastDriveFeet) > 0.31) {
+        if (!observeDriveMotion()) {
             refuse(Retirement.EXECUTION, "actual body path stopped being contiguous");
             return true;
         }
-        double dx = feet.x - lastDriveFeet.x, dz = feet.z - lastDriveFeet.z;
-        if (dx * dx + dz * dz > 0.0004) movingContacts++;
-        lastDriveFeet = feet;
         if (!body.dryRouteView()) {
             // Inputs are cleared each tick. A missed render can interrupt the stride
             // without proving that a previously seen shelf has disappeared.
@@ -783,6 +809,15 @@ final class AgentDryCaveRoute {
                 refuse(edge.failure, "new visible obstruction during traversal");
             else if (allowsDirectMovement()) body.driveDryRoute(edge.from, edge.to, edge.bearing);
         }
+        return true;
+    }
+
+    private boolean observeDriveMotion() {
+        Vec3d feet = player.getPos();
+        if (feet.squaredDistanceTo(lastDriveFeet) > 0.31) return false;
+        double dx = feet.x - lastDriveFeet.x, dz = feet.z - lastDriveFeet.z;
+        if (dx * dx + dz * dz > 0.0004) movingContacts++;
+        lastDriveFeet = feet;
         return true;
     }
 

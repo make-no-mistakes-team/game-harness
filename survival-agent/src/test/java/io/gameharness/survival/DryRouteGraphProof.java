@@ -11,6 +11,8 @@ public final class DryRouteGraphProof {
         routesUpAndAwayToTheDeeperPerspective();
         distinguishesAnUntestedReverseFromARetiredReturn();
         directGrantsIsolateAHeightChangeAndRequireAPairedEdge();
+        directLeaseKeepsANeutralRenderTickButRejectsLostOwnership();
+        directLeaseRechecksExactRouteAfterTopologyChanges();
         keepsAWitnessedAlternativeAroundACut();
         neverJoinsDisconnectedWalksByProximity();
         scansAVisualFrontierOnlyOncePerProof();
@@ -109,6 +111,35 @@ public final class DryRouteGraphProof {
         require(graph.plan(start) == MOVE && graph.next() == shelf && graph.canReturn(shelf)
                 && graph.directPrefixSize(start, 8) == 0,
             "ordinary connectivity through a detour is weaker than independently proving return across this direct edge");
+    }
+
+    private static void directLeaseKeepsANeutralRenderTickButRejectsLostOwnership() {
+        var drive = AgentRouteGraph.DirectTurn.DRIVE;
+        var hold = AgentRouteGraph.DirectTurn.HOLD;
+        var lostView = AgentRouteGraph.DirectTurn.LOST_VIEW;
+        var lostOwner = AgentRouteGraph.DirectTurn.LOST_OWNER;
+        require(AgentRouteGraph.DirectTurn.classify(true, 673, 674, true, 0) == drive, "fresh granted view drives");
+        require(AgentRouteGraph.DirectTurn.classify(true, 674, 675, false, 0) == hold, "the same lease records a neutral tick");
+        require(AgentRouteGraph.DirectTurn.classify(true, 675, 676, true, 1) == drive, "resume only on fresh view");
+        require(AgentRouteGraph.DirectTurn.classify(true, 675, 676, false, 1) == hold, "one more neutral tick is bounded");
+        require(AgentRouteGraph.DirectTurn.classify(true, 676, 677, false, 2) == lostView, "persistent missing view retires the lease");
+        require(AgentRouteGraph.DirectTurn.classify(false, 674, 675, true, 0) == lostOwner, "new owner cannot inherit");
+        require(AgentRouteGraph.DirectTurn.classify(true, 674, 676, true, 0) == lostOwner,
+            "an unobserved dispatch tick is not proof of neutral ownership");
+    }
+
+    private static void directLeaseRechecksExactRouteAfterTopologyChanges() {
+        var graph = new AgentRouteGraph();
+        long source = cell(0, 10, 0), shelf = cell(1, 9, 0), floor = cell(2, 9, 0), aside = cell(0, 10, 1);
+        graph.reset(source);
+        observedBothWays(graph, source, shelf);
+        observedBothWays(graph, shelf, floor);
+        long[] granted = {shelf, floor};
+        require(graph.revalidateDirectSuffix(source, granted, 0, 2), "initial exact pair and return are proved");
+        observedBothWays(graph, source, aside);
+        require(graph.revalidateDirectSuffix(source, granted, 0, 2), "a newly witnessed neighbor does not revoke the pinned route");
+        graph.retire(floor, shelf, HAZARD);
+        require(!graph.revalidateDirectSuffix(source, granted, 0, 2), "retired reverse cannot be replaced by another hop");
     }
 
     private static void keepsAWitnessedAlternativeAroundACut() {

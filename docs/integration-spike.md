@@ -46,10 +46,11 @@ click, spend an item, or make the player stop. A native acknowledgment
 means the player used the suggested method, not that it found the resource.
 The player gathers missing supplies before asking how to mine an ore.
 On a supply trip, connected dry ground under a canopy can be a usable
-exit; seeing open sky is not required. If a low ceiling rules out a
-climb, the player can still collect a reachable resource or leave over
-a different, visibly supported level path. A fall or lava blocks that
-handoff until the emergency is over. When the player equips a torch
+exit; seeing open sky is not required. If a ceiling rules out one climb,
+the player can still collect a reachable resource or take another
+visible exit. It prefers level ground; a one-block rise also needs a
+confirmed landing and room to jump. A fall or lava blocks that handoff
+until the emergency is over. When the player equips a torch
 to light a mine tread, the mine stays active through that inventory
 transaction. Equipping it alone does not count as lighting the tread.
 The player can approach a low ore seam by a checked stair or light a

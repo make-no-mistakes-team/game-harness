@@ -1,12 +1,27 @@
 package io.gameharness.survival;
 
+import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class AgentStallGuardTest {
+    @BeforeAll
+    static void initializeVanilla() {
+        VanillaTestResources.initialize();
+    }
+
     @Test
     void firstSweepCanFinishWithoutInterruptingTheWitnessedWorkItJustFound() {
         assertFalse(AgentStallGuard.stalledByTurning(64, 0, 350, 341, 0));
@@ -109,5 +124,77 @@ final class AgentStallGuardTest {
         assertTrue(exits.canCross(foot, east));
         exits.changed(foot.up(2));
         assertTrue(exits.canCross(foot, pillar));
+    }
+
+    @Test
+    void witnessedGrassLipStillAdmitsTheOrdinaryTreadAfterThePillarAndAnotherRiseFailed() {
+        var exits = new AgentStallGuard.Departures();
+        var hollow = new BlockPos(0, 64, 0);
+        exits.stoodOn(hollow);
+        exits.reject(hollow, hollow.up());
+        exits.reject(hollow, hollow.west().up());
+
+        var grade = riseFromTop(hollow, Direction.EAST, Blocks.GRASS_BLOCK.getDefaultState(), true);
+        var tread = exits.riseTread(grade, 60);
+        assertNotNull(tread);
+        assertEquals(hollow, tread.from);
+        assertEquals(hollow.east().up(), tread.to);
+        assertTrue(tread.returning, "the rise uses the ordinary reverse-jump tread, not the pillar");
+    }
+
+    @Test
+    void aSideOrAnObstructedOrWetTopCannotStartTheHollowExit() {
+        var exits = new AgentStallGuard.Departures();
+        var hollow = new BlockPos(0, 64, 0);
+        var floor = hollow.east();
+        var dirt = Blocks.DIRT.getDefaultState();
+        var grass = Blocks.GRASS_BLOCK.getDefaultState();
+        var side = new BlockHitResult(Vec3d.ofCenter(floor).add(-0.5, 0, 0), Direction.WEST, floor, false);
+        assertTrue(AgentSurfaceTread.ordinaryRiseSide(hollow, Direction.EAST, side));
+        var cue = new AgentBody.OrdinaryGrade(hollow, Direction.EAST, floor, dirt, grass, 40, null);
+        assertNull(exits.riseTread(cue, 41), "the side is only a look cue");
+
+        var crown = AgentSurfaceTread.reverseJumpSweep(floor.up(), hollow, Direction.WEST, 0.6);
+        var roof = new Box(hollow.up(3));
+        assertTrue(crown.intersects(roof), "the visible top alone would not clear this roof");
+        assertNull(exits.riseTread(riseFromTop(hollow, Direction.EAST, grass, !crown.intersects(roof)), 60));
+        assertNull(exits.riseTread(riseFromTop(hollow, Direction.EAST, Blocks.WATER.getDefaultState(), true), 60));
+    }
+
+    @Test
+    void freshTopProofDoesNotRetryTheRefusedRiseOrReturnToRecentlyStoodOnFooting() {
+        var exits = new AgentStallGuard.Departures();
+        var hollow = new BlockPos(0, 64, 0);
+        var grass = Blocks.GRASS_BLOCK.getDefaultState();
+        exits.reject(hollow, hollow.east().up());
+        exits.stoodOn(hollow.north().up());
+
+        assertNull(exits.riseTread(riseFromTop(hollow, Direction.EAST, grass, true), 60));
+        assertNull(exits.riseTread(riseFromTop(hollow, Direction.NORTH, grass, true), 60));
+        assertNotNull(exits.riseTread(riseFromTop(hollow, Direction.SOUTH, grass, true), 60));
+    }
+
+    @Test
+    void evenAProvedOrdinaryDescentIsNotAHollowExit() {
+        var exits = new AgentStallGuard.Departures();
+        var foot = new BlockPos(0, 64, 0);
+        var floor = foot.east().down(2);
+        var grade = gradeFromTop(foot, Direction.EAST, floor, Blocks.GRASS_BLOCK.getDefaultState(), true);
+
+        assertFalse(grade.lookOnly());
+        assertNull(exits.riseTread(grade, 60));
+    }
+
+    private static AgentBody.OrdinaryGrade riseFromTop(BlockPos from, Direction direction, BlockState surface,
+                                                       boolean clearance) {
+        return gradeFromTop(from, direction, from.offset(direction), surface, clearance);
+    }
+
+    private static AgentBody.OrdinaryGrade gradeFromTop(BlockPos from, Direction direction, BlockPos floor,
+                                                        BlockState surface, boolean clearance) {
+        var source = Blocks.DIRT.getDefaultState();
+        var top = new BlockHitResult(Vec3d.ofBottomCenter(floor.up()), Direction.UP, floor, false);
+        var edge = AgentSurfaceTread.witnessedGradeEdge(from, source, direction, top, surface, clearance);
+        return new AgentBody.OrdinaryGrade(from, direction, floor, source, surface, 55, edge);
     }
 }

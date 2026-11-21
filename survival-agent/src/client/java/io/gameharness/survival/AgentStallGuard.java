@@ -108,6 +108,16 @@ final class AgentStallGuard {
 
         boolean newLanding(BlockPos foot) { return !contains(stood, foot); }
 
+        boolean canRise(BlockPos from, BlockPos to) {
+            return to.getY() == from.getY() + 1 && neighbor(from, to)
+                && newLanding(to) && canCross(from, to);
+        }
+
+        AgentSurfaceTread riseTread(AgentBody.OrdinaryGrade grade, long tick) {
+            if (grade == null || grade.lookOnly() || !canRise(grade.from(), grade.to())) return null;
+            return AgentSurfaceTread.ordinaryGrade(grade.edge(), grade.from(), tick);
+        }
+
         void stoodOn(BlockPos foot) {
             if (newLanding(foot)) stood[contacts++ % stood.length] = foot.toImmutable();
         }
@@ -216,6 +226,8 @@ final class AgentStallGuard {
     private Vec3d lastAssessedFeet;
     private BlockPos departureFrom, surveyFoot;
     private Direction departureBearing, surveyBearing;
+    private AgentBody.OrdinaryGrade surveyRise, departureRise;
+    private AgentSurfaceTread departureTread;
     private int departureLength, surveySector, surveySince, surveyViews, ordinarySetupUntil;
     private long surveyFrame;
     private boolean replanOnAssessment, safeIdle;
@@ -575,6 +587,8 @@ final class AgentStallGuard {
         clearAngles();
         if (phase == Phase.STEP && (stepStage == StepStage.JUMP || stepStage == StepStage.LAND))
             interruptStep("safety behavior interrupted the temporary jump or placement");
+        else if (phase == Phase.DEPART && departureRise != null)
+            transition(Phase.ASSESS, "safety behavior interrupted the witnessed rise; waiting for dry contact");
     }
 
     private void sampleAngles(float yaw) {
@@ -631,7 +645,12 @@ final class AgentStallGuard {
     boolean takeTurn(Runnable replan, Supplier<String> chooseAlternative, Supplier<Alternative> workAlternative,
                      Runnable releaseAlternative, boolean mineRetryLease, BlockPos witnessedLowCeiling) {
         navigationLowCeiling = witnessedLowCeiling;
-        if (phase == Phase.WATCH || client.player.isTouchingWater() || client.player.hasVehicle()) return false;
+        if (phase == Phase.WATCH) return false;
+        if (client.player.isTouchingWater() || client.player.hasVehicle()) {
+            if (phase == Phase.DEPART && departureRise != null)
+                transition(Phase.ASSESS, "left dry contact during the witnessed rise");
+            return false;
+        }
         if (phase == Phase.ASSESS || phase == Phase.DEPART || phase == Phase.ALTERNATIVE || phase == Phase.BLOCKED) {
             if (replanOnAssessment) {
                 replanOnAssessment = false;
@@ -725,13 +744,15 @@ final class AgentStallGuard {
         BlockPos foot = client.player.getBlockPos();
         if (!foot.equals(surveyFoot)) {
             surveyFoot = foot.toImmutable();
+            surveyRise = null;
             departures.stoodOn(foot);
             setSurveyBearing(client.player.getHorizontalFacing());
             surveySector = departures.beginSurvey(foot) ? 0 : 4;
             if (offerAlternative(choose)) return true;
         }
         if (surveySector >= 4) {
-            if (offerAlternative(choose) || offerDeparture(client.player.getHorizontalFacing())) return true;
+            if (offerAlternative(choose) || offerDeparture(client.player.getHorizontalFacing())
+                    || offerRiseDeparture()) return true;
             idleAtAssessment(true, "no distinct witnessed work or safe departure");
             return true;
         }
@@ -776,6 +797,7 @@ final class AgentStallGuard {
                 beginDeparture(surveyBearing, length);
                 return;
             }
+            rememberRise(surveyBearing);
         }
         if (surveyViews >= DEPARTURE_VIEWS || tick - surveySince >= DEPARTURE_LOOK_TICKS) {
             surveySector++;
@@ -814,6 +836,35 @@ final class AgentStallGuard {
         return 0;
     }
 
+    private void rememberRise(Direction direction) {
+        if (surveyRise != null && !surveyRise.lookOnly()) return;
+        BlockPos floor = surveyFoot.offset(direction);
+        if (!departures.canRise(surveyFoot, floor.up())) return;
+        var grade = body.ordinaryGrade(Vec3d.ofBottomCenter(floor));
+        if (grade != null && grade.from().equals(surveyFoot) && grade.bearing() == direction && grade.floor().equals(floor)
+                && (surveyRise == null || !grade.lookOnly())) surveyRise = grade;
+    }
+
+    private boolean offerRiseDeparture() {
+        // Spend at most one retained fallback, only after the usual survey has offered its level lanes.
+        var cue = surveyRise;
+        surveyRise = null;
+        if (cue == null || !departures.canRise(cue.from(), cue.to())) return false;
+        departureRise = cue;
+        if (cue.frame() != body.renderedFrame() || !startRise(cue))
+            transition(Phase.DEPART, "checking the top and jump clearance of the witnessed adjacent rise");
+        return true;
+    }
+
+    private boolean startRise(AgentBody.OrdinaryGrade grade) {
+        departureTread = departures.riseTread(grade, tick);
+        if (departureTread == null) return false;
+        attempts++;
+        transition(Phase.DEPART, "leaving the refused maneuver along a witnessed one-block rise to "
+            + departureTread.to.toShortString());
+        return true;
+    }
+
     private void beginDeparture(Direction direction, int length) {
         departureFrom = surveyFoot;
         departureBearing = direction;
@@ -824,6 +875,10 @@ final class AgentStallGuard {
     }
 
     private void depart() {
+        if (departureRise != null) {
+            departRise();
+            return;
+        }
         var player = client.player;
         BlockPos foot = player.getBlockPos();
         BlockPos ending = departurePath[departureLength - 1];
@@ -857,6 +912,42 @@ final class AgentStallGuard {
         assessAgain("level departure no longer has a safe stopping lane");
     }
 
+    private void departRise() {
+        var player = client.player;
+        if (departureTread == null) {
+            var cue = departureRise;
+            if (!cue.from().equals(player.getBlockPos()) || quietSupport() == null) {
+                assessAgain("lost settled takeoff contact before the witnessed rise");
+                return;
+            }
+            Vec3d top = cue.topAim();
+            if (body.renderedFrame() > cue.frame() && body.renderedAim(top, 8)) {
+                if (!startRise(body.ordinaryGradeAfterLook(cue))) {
+                    assessAgain("the retained rise did not show a full dry top with safe jump clearance");
+                    return;
+                }
+            } else {
+                if (tick - entered < DEPARTURE_LOOK_TICKS) body.aim(top);
+                else assessAgain("the one look did not produce a fresh view of the witnessed rise");
+                return;
+            }
+        }
+        var tread = departureTread;
+        switch (tread.step(client, body, tick)) {
+            case CHECKING, MOVING -> { }
+            case REFUSED -> assessAgain("witnessed rise stopped: " + tread.refusal());
+            case LANDED -> {
+                if (!safeDryContact() || !standingOn(tread.to)) {
+                    assessAgain("witnessed rise did not settle onto its exact dry support");
+                    return;
+                }
+                body.pauseWork();
+                reached.accept(tread.to);
+                retry("settled on different witnessed footing after a one-block rise; returning to ordinary play");
+            }
+        }
+    }
+
     private void assessAgain(String reason) {
         body.pauseWork();
         alternativeCheckAt = tick;
@@ -877,6 +968,8 @@ final class AgentStallGuard {
         water.clearEpisode();
         departures.clear();
         surveyFoot = null;
+        surveyRise = departureRise = null;
+        departureTread = null;
         replanOnAssessment = false;
         Arrays.fill(walked, null);
         Arrays.fill(flatCrossings, null);
@@ -1760,6 +1853,13 @@ final class AgentStallGuard {
     }
 
     private void transition(Phase next, String detail) {
+        if (phase == Phase.DEPART && next != Phase.DEPART) {
+            // Even if the player is still airborne, retire only the exact driven rise.
+            if (next != Phase.RETRY && departureTread != null && departureTread.inFlight())
+                departures.reject(departureTread.from, departureTread.to);
+            departureRise = null;
+            departureTread = null;
+        }
         phase = next;
         if (next == Phase.WATCH) blockedReason = null;
         entered = tick;

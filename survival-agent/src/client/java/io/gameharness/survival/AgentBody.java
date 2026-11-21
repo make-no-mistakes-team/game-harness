@@ -4732,8 +4732,12 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return visibleEntity(ItemEntity.class, entity -> matches.test(entity.getStack()), distance);
     }
 
+    Optional<ItemEntity> dropped(Predicate<ItemStack> matches, double distance, Predicate<ItemEntity> eligible) {
+        return visibleEntity(ItemEntity.class, entity -> eligible.test(entity) && matches.test(entity.getStack()), distance);
+    }
+
     boolean seesDrop(ItemEntity drop, double distance) {
-        if (!hasView() || !availableEntity(drop)) return false;
+        if (!hasView() || drop.getWorld() != client.world || !availableEntity(drop)) return false;
         Vec3d center = drop.getBoundingBox().getCenter();
         double max = range(distance);
         return center.squaredDistanceTo(eye) <= max * max && visibleEntityPoint(drop, center) != null;

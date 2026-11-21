@@ -86,6 +86,33 @@ final class AgentPickupTest {
     }
 
     @Test
+    void airborneOreAtTheLipKeepsItsOwnBoundedAttemptWithoutGivingPickupCredit() {
+        var feet = new Vec3d(-19.504, 57, 15.300);
+        var airborne = new Vec3d(-20.9, 57.3, 16.7);
+        var attempt = new AgentPickup.Pursuit(2372, 0, feet, airborne, false, false);
+        attempt.observe(2374, feet, airborne.add(0.1, 0, 0), false);
+        attempt.observe(2380, feet.add(0, 0, 0.21), airborne.add(0.2, -0.7, 0.15), false);
+        assertTrue(attempt.settling(2380));
+        assertFalse(attempt.stockGained(0));
+        assertTrue(attempt.canReacquire(2392));
+        assertFalse(attempt.canReacquire(2393));
+        assertFalse(attempt.settling(2404), "a stationary ungrounded item cannot hold work forever");
+        attempt.observe(2381, feet, airborne.add(0.2, -1.3, 0.15), true);
+        assertFalse(attempt.settling(2381), "a grounded lower item now needs a witnessed approach");
+        assertTrue(attempt.stockGained(1));
+        assertTrue(attempt.expired(2553), "repeated movement cannot extend the absolute pursuit");
+    }
+
+    @Test
+    void aLowerDropCanBeCollectedFromALevelAlternativeWithoutDescending() {
+        var from = new BlockPos(0, 61, 0);
+        var player = PLAYER.offset(0.5, 61, 0.5);
+        var drop = item(1.75, 60.5, 0.5);
+        assertEquals(new AgentPickup.Access(from.east(), Direction.EAST),
+            AgentPickup.dryAccess(player, drop, from, (step, bearing) -> step.equals(from.east())));
+    }
+
+    @Test
     void aSameLevelDropCanUseAnAlternateWitnessedTreadRatherThanTheUnprovedDirectBearing() {
         var from = new BlockPos(0, 61, 0);
         var player = PLAYER.offset(0.5, 61, 0.5);

@@ -11,9 +11,46 @@ import net.minecraft.util.math.Vec3d;
 /** A loose item can request foot input, never a camera target. */
 final class AgentPickup {
     private static final int PASSIVE_GRACE_TICKS = 12;
+    private static final int QUIET_TICKS = 24;
+    private static final double MOVED_SQUARED = 0.0064;
     private static final Direction[] CARDINAL = {Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
 
     record Access(BlockPos foot, Direction bearing) {}
+
+    /** Timed evidence for one exact sighting; only matching player stock is a receipt. */
+    static final class Pursuit {
+        private final int started, stock, unseenLimit, duration;
+        private int seen, changed;
+        private Vec3d feet, item;
+        private boolean grounded;
+
+        Pursuit(int tick, int stock, Vec3d feet, Vec3d item, boolean grounded, boolean timber) {
+            this.stock = stock;
+            this.feet = feet;
+            this.item = item;
+            this.grounded = grounded;
+            started = seen = changed = tick;
+            unseenLimit = timber ? 26 : 12;
+            duration = timber ? 70 : 180;
+        }
+
+        void observe(int tick, Vec3d feet, Vec3d item, boolean grounded) {
+            seen = tick;
+            if (this.grounded == grounded && this.item.squaredDistanceTo(item) <= MOVED_SQUARED
+                    && this.feet.squaredDistanceTo(feet) <= MOVED_SQUARED) return;
+            changed = tick;
+            this.grounded = grounded;
+            this.item = item;
+            this.feet = feet;
+        }
+
+        boolean stockGained(int count) { return count > stock; }
+        boolean canReacquire(int tick) { return tick - seen <= unseenLimit; }
+        boolean expired(int tick) { return tick - started > duration; }
+        long quiet(int tick) { return tick - changed; }
+        boolean quietExpired(int tick) { return quiet(tick) >= QUIET_TICKS; }
+        boolean settling(int tick) { return !grounded && !quietExpired(tick) && !expired(tick); }
+    }
 
     enum Scope {
         LOCAL, EXACT_ENTITY, MATCHING_STOCK;
@@ -61,16 +98,19 @@ final class AgentPickup {
         double px = (player.minX + player.maxX) * 0.5, pz = (player.minZ + player.maxZ) * 0.5;
         double dx = (drop.minX + drop.maxX) * 0.5 - px, dz = (drop.minZ + drop.maxZ) * 0.5 - pz;
         double dy = drop.minY - player.minY;
-        int grade = dy < -0.35 ? -1 : 0;
         Access best = null;
         double bestDistance = dx * dx + dy * dy + dz * dz - 0.04;
         for (Direction bearing : CARDINAL) {
-            BlockPos foot = from.offset(bearing).up(grade);
-            double x = foot.getX() + 0.5 - px, y = foot.getY() - player.minY, z = foot.getZ() + 0.5 - pz;
-            double distance = (dx - x) * (dx - x) + (dy - y) * (dy - y) + (dz - z) * (dz - z);
-            if (distance >= bestDistance || !passiveOverlap(player.offset(x, y, z), drop) || !witnessed.test(foot, bearing)) continue;
-            best = new Access(foot, bearing);
-            bestDistance = distance;
+            BlockPos level = from.offset(bearing);
+            for (int grade = 0; grade >= (dy < -0.35 ? -1 : 0); --grade) {
+                BlockPos foot = grade == 0 ? level : level.down();
+                double x = foot.getX() + 0.5 - px, y = foot.getY() - player.minY, z = foot.getZ() + 0.5 - pz;
+                double distance = (dx - x) * (dx - x) + (dy - y) * (dy - y) + (dz - z) * (dz - z);
+                if (distance >= bestDistance || !passiveOverlap(player.offset(x, y, z), drop)
+                        || !witnessed.test(foot, bearing)) continue;
+                best = new Access(foot, bearing);
+                bestDistance = distance;
+            }
         }
         return best;
     }

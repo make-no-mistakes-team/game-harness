@@ -933,6 +933,77 @@ test.each(["first scene", "cave alternative", "surface instead of cave", "empty 
     }
   });
 
+test.each(["revised quote", "still underpriced", "unmet first-stage stock"] as const)(
+  "A refused surface entry gets one new paid correction on unchanged evidence (%s)", async response => {
+    const requests: MacroRequest[] = [];
+    const correction = Promise.withResolvers<void>();
+    const underpriced = { ...surfacePolicy, maxBreaks: 3 };
+    const revised = { ...surfacePolicy, maxBreaks: 4 };
+    const scene = { ...grassyWorksite, surfaceOpening };
+    const original: MacroProposal["action"] = response === "unmet first-stage stock" ? {
+      kind: "work-program", stages: [
+        { policy: revised, requires: [{ item: "minecraft:iron_ingot", count: 1 }] },
+        { requires: [], policy: { target: { kind: "stock", item: "minecraft:stick", count: 6 },
+          allowedEffects: ["craft:stick"], costCaps: [{ item: "minecraft:oak_planks", count: 2 }],
+          reserves: revised.reserves, maxBreaks: 0, maxCrafts: 1, maxPlacements: 0 } },
+      ],
+    } : { kind: "work", policy: underpriced };
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1) return workReply(request, original);
+      await correction.promise;
+      return workReply(request, { kind: "work", policy: response === "still underpriced" ? underpriced : revised });
+    }, "Obtain a diamond in Survival.", 4);
+    try {
+      await f.observe(133, scene);
+      await f.actor.poll();
+      expect(f.actor.status()).toMatchObject({ lastDisposition: "proposal_refused", providerDispatches: 1,
+        issued: 0, issuedWorkOrders: 0 });
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+
+      await f.observe(213, scene);
+      await f.actor.poll();
+      expect(requests).toHaveLength(2);
+      expect(requests[1]).toMatchObject({
+        observation: { tick: 213, surfaceOpening, inventory: scene.inventory },
+        work: { current: null, lastOutcome: null }, lastReceipt: null,
+        feedback: { kind: "invalid_reply" },
+      });
+      expect(requests[1]?.feedback?.detail).toContain("No work was issued");
+      if (response === "unmet first-stage stock") {
+        expect(requests[1]?.feedback?.detail).toContain("requires 1 minecraft:iron_ingot at entry, but only 0 are carried");
+      }
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      correction.resolve();
+      await f.actor.poll();
+      const proposals = (await readFile(f.file("proposals.jsonl"), "utf8")).trimEnd().split("\n").map(line => JSON.parse(line));
+      expect(proposals).toHaveLength(2);
+      expect(proposals[1]).toMatchObject({ basis: { tick: 213 }, correctionOf: proposals[0].requestId, dispatched: true });
+      expect(proposals[1].requestId).not.toBe(proposals[0].requestId);
+      const history = (await readFile(f.file("history.jsonl"), "utf8")).trimEnd().split("\n").map(line => JSON.parse(line));
+      expect(history.some(event => event.event === "work_order_prepared" && event.requestId === proposals[0].requestId)).toBe(false);
+
+      if (response !== "still underpriced") {
+        expect(await f.order()).toMatchObject({ origin: "model", basisTick: 213, surfaceAnchor, ...revised });
+      } else {
+        await f.observe(293, scene);
+        await f.observe(373, { ...scene, opportunities: scene.opportunities.map(offer => ({ ...offer, id: `rekeyed-${offer.id}` })) });
+        await f.actor.poll();
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+      }
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      expect(requests).toHaveLength(2);
+      expect(f.actor.status()).toMatchObject({ providerDispatches: 2, issued: 0, completedModelWorkOrders: 0,
+        issuedWorkOrders: response === "still underpriced" ? 0 : 1 });
+    } finally {
+      correction.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
 test.each(["fresh cap", "receipt alone", "unrelated trunk", "unlicensed cap"] as const)(
   "A paid camera check can bind an early-stock job only after a fresh, matching physical cap (%s)", async condition => {
     const quote = Promise.withResolvers<void>();

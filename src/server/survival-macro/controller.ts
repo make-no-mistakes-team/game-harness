@@ -2292,22 +2292,31 @@ export class SurvivalMacroController {
     const afterSmelt = queued.smeltSuccessor && index === 0 ? after : null;
     const clue = !after ? plan.observation.travelHint : undefined;
     const approach = clue && travelHintMatchesPolicy(clue, policy) ? clue : undefined;
+    const mayCorrectSurface = index === 0 && !after && !bootstrap && !plan.postLook &&
+      !plan.observation.pendingWork && !this.config.preparedStockReady;
+    const unpricedSurfaceReason = "Surface entry needs a witnessed exact opening and a fully priced ordinary stock job, either alone or as the first stage.";
     let surface: SurfaceWitness | undefined;
+    let unpricedSurface: SurfaceWitness | undefined;
     if (!after && approach?.kind !== "resource" && this.workMode === "constrained" && !this.job &&
         hasSurfaceCoverEffect(policy) && !offeredOpeningStart(plan.observation, policy)) {
       const witness = openingWorkWitness(plan.observation, policy, {});
       if (witness && "surfaceOpening" in witness && (!stage || (index === 0 && stageOffset === 0))) {
         surface = witness;
       } else if (!approach && (!witness || "surfaceOpening" in witness)) {
-        this.queuedWork = undefined;
-        await this.disposition("proposal_refused", { requestId: plan.requestId,
-          reason: "Surface entry needs a witnessed exact opening and a fully priced ordinary stock job, either alone or as the first stage." });
-        return;
+        const opening = plan.observation.surfaceOpening;
+        if (mayCorrectSurface && opening) {
+          unpricedSurface = { surfaceOpening: opening };
+        } else {
+          this.queuedWork = undefined;
+          await this.disposition("proposal_refused", { requestId: plan.requestId, reason: unpricedSurfaceReason });
+          return;
+        }
       }
     }
+    const surfaceEntry = surface ?? unpricedSurface;
     const travel = surface ? undefined : approach;
-    const wall = !after && !travel && !surface ? pricedProspectOpening(plan.observation, policy) : undefined;
-    const timberClue = !after && !travel && !wall && !surface ? plan.observation.timberObstruction : undefined;
+    const wall = !after && !travel && !surfaceEntry ? pricedProspectOpening(plan.observation, policy) : undefined;
+    const timberClue = !after && !travel && !wall && !surfaceEntry ? plan.observation.timberObstruction : undefined;
     const timber = timberClue ? pricedTimberObstruction(plan.observation, policy) : undefined;
     if (timberClue && !timber && policy.target.kind === "stock" && policy.target.item === timberClue.timber) {
       this.queuedWork = undefined;
@@ -2322,7 +2331,12 @@ export class SurvivalMacroController {
       return false;
     };
     let travelRefusal: { observation: MacroObservation; reason: string } | undefined;
-    const physical = travel ?? wall ?? timber ?? surface;
+    let surfaceRefusal: { observation: MacroObservation; reason: string } | undefined;
+    const refuseSurface = (observation: MacroObservation, reason: string) => {
+      surfaceRefusal = { observation, reason };
+      return false;
+    };
+    const physical = travel ?? wall ?? timber ?? surfaceEntry;
     const currentStart = food ? (fresh: MacroObservation) => {
       const current = foodWorkWitness(fresh, policy);
       return (this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
@@ -2331,9 +2345,20 @@ export class SurvivalMacroController {
     } : physical ? (fresh: MacroObservation) => {
       if (!this.isCurrentHandoff(fresh) || !sameOpeningStance(plan.observation, fresh) ||
           fresh.tick >= plan.proposal.expiresTick) return withoutStart(fresh, "physical_work_scope_or_ttl_changed");
-      if ("surfaceOpening" in physical)
-        return sameOpeningCut(physical.surfaceOpening, pricedSurfaceOpening(fresh, policy)) ||
-          withoutStart(fresh, "surface_opening_no_longer_witnessed_or_priced");
+      if ("surfaceOpening" in physical) {
+        if (!sameOpeningCut(physical.surfaceOpening, unpricedSurface ? fresh.surfaceOpening : pricedSurfaceOpening(fresh, policy)))
+          return withoutStart(fresh, "surface_opening_no_longer_witnessed_or_priced");
+        if (unpricedSurface) return refuseSurface(fresh, unpricedSurfaceReason);
+        if (mayCorrectSurface) {
+          const missing = requires.find(({ item, count }) => stock(fresh, item) < count);
+          if (missing) {
+            const { item, count } = missing;
+            if (stock(plan.observation, item) >= count) return withoutStart(fresh, "surface_entry_stock_changed_before_work_admission");
+            return refuseSurface(fresh, `The first surface stage requires ${count} ${item} at entry, but only ${stock(fresh, item)} are carried.`);
+          }
+        }
+        return true;
+      }
       if (!("footing" in physical)) return "timber" in physical
         ? sameTimberObstruction(physical, pricedTimberObstruction(fresh, policy)) ||
           withoutStart(fresh, "timber_obstruction_no_longer_witnessed_or_priced")
@@ -2399,6 +2424,7 @@ export class SurvivalMacroController {
         if (checked.kind === "shortage") {
           if (bootstrap) rejection = "work_resource_shortage";
           await this.reportWorkShortage(plan.requestId, checked, fresh);
+          if (surface && mayCorrectSurface) return refuseSurface(fresh, checked.detail);
           return false;
         }
         if (bootstrap && !offeredOpeningStart(fresh, policy) &&
@@ -2413,6 +2439,8 @@ export class SurvivalMacroController {
       }, duringWaitFor, undefined, currentStart || plan.postLook ? (before, latest) => {
         if (latest.tick - before.tick >= WORK_ADMISSION_TICKS)
           return withoutStart(latest, "physical_work_admission_basis_aged");
+        if (surface && plan.correction && !this.sameReplyContext(plan.correction, latest))
+          return withoutStart(latest, "correction_context_changed_before_work_admission");
         return (!plan.postLook || sameOpeningStance(plan.observation, latest) && postLookWorkStart(latest, policy)) &&
           (currentStart?.(latest) ?? true);
       } : undefined,
@@ -2439,6 +2467,14 @@ export class SurvivalMacroController {
       return;
     }
     this.queuedWork = undefined;
+    if (!job && surfaceRefusal) {
+      const { observation, reason } = surfaceRefusal;
+      await this.disposition("proposal_refused", { requestId: plan.requestId, basis: basis(observation), reason }, null);
+      if (!this.pendingSuccessor) this.offerReplyCorrection(plan, observation, { kind: "invalid_reply",
+        detail: `${reason} No work was issued. Price the exact cover break in addition to the remaining stock, ` +
+          "price any witnessed tool loss without lowering work.protectedReserves, and require only stock carried at entry. " +
+          "Choose a currently witnessed alternative or abstain if the start cannot be met." });
+    }
     if (!job && travelRefusal) {
       const { observation, reason } = travelRefusal;
       // This is not a lost opportunity ID. Keep the concrete reason on this decision and its bounded correction only.

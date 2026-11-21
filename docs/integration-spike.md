@@ -91,9 +91,11 @@ the smelted units; the furnace batch uses that budget before collection.
 The player reports loading, burning, and collection separately. Only the
 matching completion receipt and live ingot stock establish the result.
 
-For one raw iron, the player can wait at the open furnace until the ingot
-is ready. Count the items loaded at the start: a batch of two is still a
-batch of two after the first ingot cooks. A nearby threat takes priority.
+If the player loads exactly one item, waiting at the open furnace is
+fine. This is a rule about quantity, not the recipe: one piece of raw
+food would qualify just as one raw iron does. Terra's furnace work
+currently supports raw iron only. Count the original load, not what is
+left in the input slot. A nearby threat still takes priority.
 
 A longer batch can free the player's hands. Suppose a bucket needs two
 more ingots, but the player can already prospect the next cave section.
